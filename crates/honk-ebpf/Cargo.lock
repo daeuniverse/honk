@@ -57,8 +57,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eace5970943931fea46a8cbdca208a8f6a9e0413d85a5a6c4e168f0b909570bc"
 dependencies = [
  "aya-build",
- "aya-ebpf-bindings",
- "aya-ebpf-cty",
+ "aya-ebpf-bindings 0.2.0",
+ "aya-ebpf-cty 0.3.0",
  "aya-ebpf-macros",
  "rustversion",
 ]
@@ -70,7 +70,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf1f19286ebbda6673099b68d049034838f08e4939cef66c998a8d3e62825d76"
 dependencies = [
  "aya-build",
- "aya-ebpf-cty",
+ "aya-ebpf-cty 0.3.0",
+]
+
+[[package]]
+name = "aya-ebpf-bindings"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f524fa99b4f6a4304d6f69a8f2591a716bfe3d82ca6b21e56561c262b6777a4"
+dependencies = [
+ "aya-build",
+ "aya-ebpf-cty 0.4.0",
 ]
 
 [[package]]
@@ -78,6 +88,15 @@ name = "aya-ebpf-cty"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0884264bc8a51a49fed03df8feada3a21d703cf501dae33c28bdba5d2313ef33"
+dependencies = [
+ "aya-build",
+]
+
+[[package]]
+name = "aya-ebpf-cty"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b5264d5e8093e23c4ec11bfddf9c5d29adb70bd22d0af684af65dd25616d517"
 dependencies = [
  "aya-build",
 ]
@@ -269,8 +288,8 @@ name = "honk-ebpf"
 version = "0.0.1-alpha"
 dependencies = [
  "aya-ebpf",
- "aya-ebpf-bindings",
- "aya-ebpf-cty",
+ "aya-ebpf-bindings 0.3.0",
+ "aya-ebpf-cty 0.3.0",
  "aya-log-ebpf",
  "honk-ebpf-common",
  "network-types",
@@ -281,7 +300,7 @@ name = "honk-ebpf-common"
 version = "0.1.0"
 dependencies = [
  "aya",
- "aya-ebpf-bindings",
+ "aya-ebpf-bindings 0.3.0",
  "network-types",
 ]
 

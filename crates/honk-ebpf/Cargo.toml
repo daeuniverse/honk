@@ -7,7 +7,7 @@ license = "GPL-3.0-only"
 
 [dependencies]
 aya-ebpf = "0.2"
-aya-ebpf-bindings = "0.2"
+aya-ebpf-bindings = "0.3"
 aya-ebpf-cty = "0.3"
 aya-log-ebpf = { version = "0.2", optional = true }
 honk-ebpf-common = { path = "../honk-ebpf-common" }
