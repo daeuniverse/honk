@@ -50,6 +50,11 @@ fn test_group_policy_serde_rejects_legacy_honk() {
 fn test_protocol_identity_goldens() {
     let cases = [
         (
+            "vless-ws",
+            "vless://00000000-0000-4000-8000-000000000001@ws.example:443?type=ws&path=%2Fws#ws",
+            "ff344bcb-482a-5b1d-b435-f75734608c61",
+        ),
+        (
             "ss",
             "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#ss",
             "e4a92538-53a2-5f83-85cd-b5d11f90361b",
