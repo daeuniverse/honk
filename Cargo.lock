@@ -338,12 +338,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "66e644424fada9fff4fdc63848db1732fb69b626e8328202ef55c03df1f4d939"
 dependencies = [
  "assert_matches",
- "aya-obj",
+ "aya-obj 0.3.0",
  "bitflags",
  "hashbrown 0.17.1",
  "libc",
  "log",
- "object",
+ "object 0.39.1",
  "once_cell",
  "scopeguard",
  "thiserror",
@@ -409,7 +409,19 @@ checksum = "8c76b9c75d9cdc155ff8f6a06d61e873f67bf47be8cfa92a3b5aaea43f4b4077"
 dependencies = [
  "bytes",
  "log",
- "object",
+ "object 0.39.1",
+ "thiserror",
+]
+
+[[package]]
+name = "aya-obj"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "66254e485eda05c8ab20b83fb55ea4bde22a8436981f435e35cffa5e6aa6196d"
+dependencies = [
+ "bytes",
+ "log",
+ "object 0.40.0",
  "thiserror",
 ]
 
@@ -1581,7 +1593,7 @@ dependencies = [
  "aya",
  "aya-ebpf-bindings",
  "aya-log",
- "aya-obj",
+ "aya-obj 0.6.0",
  "base64 0.23.1",
  "boring",
  "brotli",
@@ -2584,6 +2596,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "object"
+version = "0.40.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd229a0361b9d0d4396176e02d65897f487eebeab7caa6d443855ee152ca0b9c"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "oid-registry"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2864,7 +2885,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -65,7 +65,7 @@ hyper-util = { version = "0.1", features = [
 
 # eBPF / Aya
 aya = "0.14"
-aya-obj = "0.3"
+aya-obj = "0.6"
 aya-log = "0.3"
 aya-ebpf = "0.2"
 aya-ebpf-bindings = "0.2"
