@@ -115,7 +115,7 @@ percent-encoding = "2"
 aho-corasick = "1"
 
 # Persistence (state database)
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+rusqlite = { version = "0.41", features = ["bundled", "blob"] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }
