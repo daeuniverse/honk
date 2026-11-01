@@ -264,6 +264,18 @@ fn structured_node_failure_retains_its_semantic_field() {
     )
     .unwrap();
     let mut value = serde_json::to_value(node).unwrap();
+    let mut invalid_transport = value.clone();
+    invalid_transport["transport"] = serde_json::json!("PRIVATE_INVALID");
+    let mut invalid_headers = value.clone();
+    invalid_headers["transport"] = serde_json::json!("ws");
+    invalid_headers["ws_headers"] = serde_json::json!({"Host": "PRIVATE_INVALID"});
+    let mut conflicting_headers = value.clone();
+    conflicting_headers["transport"] = serde_json::json!("ws");
+    conflicting_headers["ws_headers"] =
+        serde_json::json!({"X-Test": "PRIVATE_INVALID", "x-test": "different"});
+    let mut xhttp_headers = value.clone();
+    xhttp_headers["transport"] = serde_json::json!("xhttp");
+    xhttp_headers["xhttp"] = serde_json::json!({"headers": {"Host": "PRIVATE_INVALID"}});
     value["flow"] = serde_json::json!("PRIVATE_INVALID");
     let alias_conflict = serde_json::json!({
         "name": "tuic",
@@ -278,6 +290,10 @@ fn structured_node_failure_retains_its_semantic_field() {
     for (node, setting) in [
         (value, "nodes[1].flow"),
         (alias_conflict, "nodes[1].tuic_uuid"),
+        (invalid_transport, "nodes[1].transport"),
+        (invalid_headers, "nodes[1].ws_headers"),
+        (conflicting_headers, "nodes[1].ws_headers"),
+        (xhttp_headers, "nodes[1].xhttp"),
     ] {
         let body = serde_json::json!({"nodes": [node]}).to_string();
         let mut diagnostics = Vec::new();

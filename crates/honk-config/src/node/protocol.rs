@@ -96,16 +96,18 @@ impl StreamTransportOptions {
         self.transport == "xhttp"
     }
 
-    pub fn normalize(&mut self) -> Result<(), &'static str> {
-        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)?;
+    pub fn normalize(&mut self) -> Result<(), (&'static str, &'static str)> {
+        let kind = crate::options::vocab::xhttp_stream_transport(&self.transport)
+            .map_err(|message| ("transport", message))?;
         if kind == "xhttp" {
             self.transport = "xhttp".into();
             self.xhttp
                 .get_or_insert_with(Default::default)
-                .normalize()?;
+                .normalize()
+                .map_err(|message| ("xhttp", message))?;
         }
-        headers::normalize(&mut self.ws_headers)?;
-        self.check().map_err(|(_, message)| message)
+        headers::normalize(&mut self.ws_headers).map_err(|message| ("ws_headers", message))?;
+        self.check()
     }
 
     /// Headers tungstenite writes or verifies itself, plus ones that would

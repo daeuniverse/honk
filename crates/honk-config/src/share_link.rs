@@ -91,15 +91,16 @@ impl Node {
             );
             emit(diagnostic);
         })?;
-        node.normalize_stream_transport().map_err(|message| {
-            DetailedConfigError::new(
-                ErrorCategory::Validation,
-                "invalid-config-value",
-                source.clone(),
-                SettingPath::new("nodes").field("xhttp"),
-                message,
-            )
-        })?;
+        node.normalize_stream_transport()
+            .map_err(|(field, message)| {
+                DetailedConfigError::new(
+                    ErrorCategory::Validation,
+                    "invalid-config-value",
+                    source.clone(),
+                    SettingPath::new("nodes").field(field),
+                    message,
+                )
+            })?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
         }

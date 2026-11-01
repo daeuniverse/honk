@@ -112,7 +112,7 @@ impl Node {
 
     /// Canonicalize stream transports at every adapter boundary before
     /// deriving identity.
-    pub fn normalize_stream_transport(&mut self) -> Result<(), &'static str> {
+    pub fn normalize_stream_transport(&mut self) -> Result<(), (&'static str, &'static str)> {
         if let Some(transport) = self.transport_mut() {
             transport.normalize()?;
         }
@@ -122,7 +122,8 @@ impl Node {
             if tls.alpn.is_empty() {
                 tls.alpn.push("h2".into());
             }
-            tls.check_xhttp_alpn()?;
+            tls.check_xhttp_alpn()
+                .map_err(|message| ("tls_alpn", message))?;
         }
         Ok(())
     }

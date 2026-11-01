@@ -704,7 +704,9 @@ impl FlatNode {
             updated_at: flat.updated_at,
         };
         node.normalize_stream_transport()
-            .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
+            .map_err(|(field, message)| {
+                semantic_error(source, setting.clone().field(field), message)
+            })?;
         node.validate_detailed_at(source, setting)?;
         if let Some(config) = node.vless_mut() {
             config.normalize();

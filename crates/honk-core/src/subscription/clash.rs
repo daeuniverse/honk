@@ -726,7 +726,8 @@ pub(super) fn parse_clash_proxy(
     apply_stream(mapping, &mut node, udp)?;
     apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
     apply_quic(mapping, &mut node, tuic_default_alpn)?;
-    node.normalize_stream_transport()?;
+    node.normalize_stream_transport()
+        .map_err(|(_, message)| message)?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }
