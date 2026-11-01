@@ -68,7 +68,8 @@ fn udp_flows_from_l2_clients_keep_their_listener() {
     }
 }
 
-/// Writes each frame from `link_header` (0 bare IP, 14 Ethernet) into an `_l3`-bound device.
+/// Writes each frame with the last `link_header` bytes of its Ethernet header kept
+/// (0 bare IP, 14 full Ethernet) into an `_l3`-bound device.
 fn assert_l3_link_flows_keep_their_listener(
     fixture: &mut NetworkFixture,
     device: &mut std::fs::File,
