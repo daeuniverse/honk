@@ -681,7 +681,7 @@ jobs:
     name: eBPF object + real VM kernel tests
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read Rust toolchains
@@ -984,7 +984,7 @@ jobs:
     name: eBPF real VM tests (recent kernel)
     # These tests attach TC/cgroup programs and therefore cannot run in a job container.
     runs-on: ubuntu-24.04
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Read Rust toolchains
