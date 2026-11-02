@@ -4,7 +4,7 @@
 
 **An experimental transparent-proxy engine for Linux, written in Rust.**
 
-**[Documentation](doc/README.md)** / **[Web UI demo](https://demo.daeuniverse.org/)** / **[Releases](https://github.com/daeuniverse/honk/releases)**
+**[Documentation](https://daeuniverse.org/honk/)** / **[Web UI demo](https://demo.daeuniverse.org/)** / **[Releases](https://github.com/daeuniverse/honk/releases)**
 
 English / [简体中文](README.zh.md)
 
@@ -38,7 +38,7 @@ Download an archive for your platform from [Releases](https://github.com/daeuniv
 
 Every build comes as a static musl binary; `full` also comes linked against glibc (`gnu`). Archives with `stock` in the name use the system allocator instead of mimalloc. Each release's Downloads section lists checksums and provenance.
 
-For OpenWrt, use the [daeuniverse package feed](https://openwrt.daeuniverse.org/en/).
+Packages for Debian, Ubuntu, Fedora, openSUSE and Arch Linux are covered in the [installation guide](https://daeuniverse.org/honk/installation/). For OpenWrt, use the [daeuniverse package feed](https://daeuniverse.org/openwrt/).
 
 For source builds, follow [Build from source](doc/en/how-to-start.md#build-from-source). Release binaries embed eBPF; plain `cargo build --release` does not enable the real datapath.
 
@@ -51,11 +51,11 @@ honk works with two kinds of web UI:
 - [doona](https://github.com/Zakkaus/doona) uses the native API, which adds observations, diagnostics and configuration editing. doona lite is a lighter preview edition. Try the [demo](https://demo.daeuniverse.org/) or the [lite demo](https://demo.daeuniverse.org/lite/).
 - Clash dashboards such as [zashboard](https://github.com/Zephyruso/zashboard) use the Clash-compatible API.
 
-![doona Activity page with traffic charts and status cards](https://doona.daeuniverse.org/screenshots/en/activity-light.webp)
+![doona Activity page with traffic charts and status cards](https://daeuniverse.org/doona/screenshots/en/activity-light.webp)
 
-![doona lite Nodes page](https://doona.daeuniverse.org/images/lite-nodes-light.webp)
+![doona lite Nodes page](https://daeuniverse.org/doona/images/lite-nodes-light.webp)
 
-For doona, enable `experimental.native_api` and set `ui: 'embedded'` in a `full` build, or `ui: 'embedded-lite'` for doona lite; the [doona quick start](https://doona.daeuniverse.org/en/quick-start.html) walks through it. A `native-api` build can serve a separately [installed doona](https://doona.daeuniverse.org/en/install.html) from its directory instead. For a Clash dashboard, set `experimental.clash_api`; honk downloads zashboard on first start. The [experimental settings](doc/en/reference/experimental.md) list every field of both.
+For doona, enable `experimental.native_api` and set `ui: 'embedded'` in a `full` build, or `ui: 'embedded-lite'` for doona lite; the [doona quick start](https://daeuniverse.org/doona/quick-start) walks through it. A `native-api` build can serve a separately [installed doona](https://daeuniverse.org/doona/install) from its directory instead. For a Clash dashboard, set `experimental.clash_api`; honk downloads zashboard on first start. The [experimental settings](doc/en/reference/experimental.md) list every field of both.
 
 ## Documentation
 
