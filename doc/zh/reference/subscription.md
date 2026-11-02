@@ -243,7 +243,7 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | TUIC | UUID/密码、拥塞控制、ALPN、接收窗口、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 
-显式关闭的功能块按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`。节点模型无法保留显式 UDP 限制时会拒绝导入。
+显式关闭的功能块按禁用处理，不会误判为启用未支持功能。原生支持 UDP 的协议接受 `udp: true`；VMess 没有 UDP 路径，该声明会被忽略，节点仍按 TCP 导入。节点模型无法保留显式 UDP 限制时会拒绝导入。
 
 TUIC 允许省略密码或使用空密码。Hysteria2 和 Juicity 接受与运行时固定选择一致的 `h3` ALPN。
 

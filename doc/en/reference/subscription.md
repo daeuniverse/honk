@@ -243,7 +243,7 @@ Supported spelling aliases normalize before node identity is derived.
 | TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
 | AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
 
-Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols. An explicit UDP restriction is rejected where the node model cannot preserve it.
+Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, and ignored on VMess, which has no UDP path, so the node still imports for TCP. An explicit UDP restriction is rejected where the node model cannot preserve it.
 
 TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
 

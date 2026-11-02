@@ -214,24 +214,12 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     }
 
     let udp = yaml_bool_alias(mapping, &["udp"])?;
-    let udp_capable = matches!(
-        protocol,
-        NodeProtocol::SS
-            | NodeProtocol::Trojan
-            | NodeProtocol::VLess
-            | NodeProtocol::Socks5
-            | NodeProtocol::Hysteria2
-            | NodeProtocol::Tuic
-            | NodeProtocol::Juicity
-            | NodeProtocol::AnyTLS
-    );
+    // VMess has no UDP path: `udp: true` there is a capability claim honk
+    // cannot honor, not a restriction, so the node still imports for TCP.
     let udp_restrictable = matches!(
         protocol,
         NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
     );
-    if udp == Some(true) && !udp_capable {
-        return Err("UDP capability is unsupported for this protocol");
-    }
     if udp == Some(false) && !udp_restrictable {
         return Err("UDP restriction is unsupported for this protocol");
     }
@@ -440,7 +428,9 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
             let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
             match &mut node.outbound {
                 OutboundConfig::Trojan(config) => config.network = Some(network),
-                OutboundConfig::Vmess(config) => config.network = Some(network),
+                // VMess has no UDP path, so only an explicit restriction is
+                // representable; `udp: true` keeps the TCP node as-is.
+                OutboundConfig::Vmess(config) if !udp => config.network = Some(network),
                 OutboundConfig::Vless(config) => config.network = Some(network),
                 _ => {}
             }

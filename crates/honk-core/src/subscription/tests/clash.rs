@@ -32,6 +32,28 @@ proxies:
 }
 
 #[test]
+fn clash_vmess_udp_claim_imports_the_tcp_node() {
+    let yaml = r#"proxies:
+  - {name: udp-claim, type: vmess, server: vmess.example, port: 443, uuid: 11111111-1111-4111-8111-111111111111, cipher: auto, network: ws, ws-opts: {path: /}, udp: true}
+  - {name: tcp-only, type: vmess, server: vmess.example, port: 443, uuid: 22222222-2222-4222-8222-222222222222, cipher: auto, udp: false}
+"#;
+    let nodes = parse_clash_subscription(yaml, None).unwrap();
+    assert_eq!(
+        nodes
+            .iter()
+            .map(|node| node.name.as_str())
+            .collect::<Vec<_>>(),
+        ["udp-claim", "tcp-only"]
+    );
+    assert_eq!(nodes[0].vmess().unwrap().network, None);
+    assert_eq!(nodes[1].vmess().unwrap().network.as_deref(), Some("tcp"));
+    assert!(!(honk_outbound::descriptor::descriptor(
+        NodeProtocol::VMess
+    )
+    .supports_udp)(&nodes[0]));
+}
+
+#[test]
 fn tuic_alpn_defaults_follow_the_subscription_dialect() {
     for (alpn, clash_expected, other_expected) in [
         (None, Some("h3"), None),
