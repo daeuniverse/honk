@@ -298,9 +298,9 @@ async fn refuses_without(lab: &Lab, missing: Missing) -> anyhow::Result<()> {
     }
     let _backend = lab.handle.ebpf.write().await;
     match removed {
-        Removed::Handoff(saved) => handoff_map()?.insert(key, saved, 1)?,
+        Removed::Handoff(saved) => handoff_map()?.insert(&key, &saved, 1)?,
         Removed::Redirect(saved) => {
-            redirect_map()?.insert(RedirectTuple::from_tuples(&key), saved, 1)?
+            redirect_map()?.insert(&RedirectTuple::from_tuples(&key), &saved, 1)?
         }
     }
     Ok(())

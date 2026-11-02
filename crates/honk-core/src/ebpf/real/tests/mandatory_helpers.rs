@@ -122,7 +122,7 @@ fn mandatory_programs_call_no_probe_read_helper() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut bpf = EbpfLoader::new()
-        .btf(Some(&kernel_btf))
+        .btf(&kernel_btf)
         .override_global("PARAM", &param, true)
         .override_global("IPV6_SOCKETS_AVAILABLE", &1u8, true)
         // A zero cookie is frozen read-only data: the verifier prunes the whole callback body.

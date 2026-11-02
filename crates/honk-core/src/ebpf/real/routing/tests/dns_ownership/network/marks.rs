@@ -27,7 +27,8 @@ fn retire_udp_incarnation(
 
 fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {
     load_classifier(backend, "wan_egress_l2");
-    aya::programs::tc::qdisc_add_clsact(interface).unwrap();
+    let interface = std::ffi::CString::new(interface).unwrap();
+    aya::programs::tc::qdisc_add_clsact(&interface).unwrap();
     let program: &mut SchedClassifier = backend
         .bpf_mut()
         .unwrap()
@@ -35,7 +36,7 @@ fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {
         .unwrap()
         .try_into()
         .unwrap();
-    program.attach(interface, TcAttachType::Egress).unwrap();
+    program.attach(&interface, TcAttachType::Egress).unwrap();
 }
 
 // The main table blackholes these destinations. Only the rule-mark table
@@ -515,7 +516,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
                         .unwrap(),
                 )
                 .unwrap()
-                .insert(&client, identity, 0)
+                .insert(&client, &identity, 0)
                 .unwrap();
                 let policy = |mark| {
                     let must = if must { "must, " } else { "" };

@@ -363,12 +363,12 @@ fn publish_retirement_flow(
 ) -> anyhow::Result<()> {
     backend
         .hash_map_mut::<TuplesKey, FlowMapValue<ConnState>>("CONN_STATE_MAP")?
-        .insert(key, FlowMapValue::new(*state), 1 | 4)?;
+        .insert(key, &FlowMapValue::new(*state), 1 | 4)?;
     backend
         .hash_map_mut::<TuplesKey, FlowMapValue<RoutingHandoffEntry>>("ROUTING_HANDOFF_MAP")?
         .insert(
             key,
-            FlowMapValue::new(RoutingHandoffEntry {
+            &FlowMapValue::new(RoutingHandoffEntry {
                 incarnation: state.incarnation,
                 result: RoutingResult {
                     decision_token: state.decision_token,
@@ -381,8 +381,8 @@ fn publish_retirement_flow(
     backend
         .hash_map_mut::<RedirectTuple, FlowMapValue<RedirectEntry>>("REDIRECT_TRACK")?
         .insert(
-            RedirectTuple::from_tuples(key),
-            FlowMapValue::new(RedirectEntry {
+            &RedirectTuple::from_tuples(key),
+            &FlowMapValue::new(RedirectEntry {
                 incarnation: state.incarnation,
                 decision_token: state.decision_token,
                 ..Default::default()

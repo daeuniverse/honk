@@ -622,7 +622,7 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         (1, 0, DNS_ROUTE_GENERATION_MAX + 1),
     ] {
         let mut sequence = AyaArray::<_, u64>::create(entries, flags).unwrap();
-        sequence.set(0, value, 0).unwrap();
+        sequence.set(0, &value, 0).unwrap();
         sequence.map().pin(&pin).unwrap();
         let id = sequence.map().info().unwrap().id();
         assert!(
@@ -716,7 +716,7 @@ async fn pname_is_ready_before_first_packet() {
                 .unwrap(),
         )
         .unwrap()
-        .insert(&socket, retained, 0)
+        .insert(&socket, &retained, 0)
         .unwrap();
         let duplicate = socket.try_clone().expect("duplicate socket FD");
         drop(socket);
@@ -879,7 +879,7 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let old_descriptor = root.get(&0, 0).unwrap();
         let mut foreign_descriptor = AyaArray::<_, RoutingPolicyDescriptor>::create(1, 0).unwrap();
         foreign_descriptor
-            .set(0, old_descriptor.get(&0, 0).unwrap(), 0)
+            .set(0, &old_descriptor.get(&0, 0).unwrap(), 0)
             .unwrap();
         let root = backend
             .bpf_mut()
