@@ -39,7 +39,7 @@ pub(super) async fn mutate_conn(
     let mut conns = conn_map()?;
     let mut state = conns.get(key, MAP_LOCK)?.value;
     change(&mut state);
-    conns.insert(*key, FlowMapValue::new(state), 2 | MAP_LOCK)?;
+    conns.insert(key, &FlowMapValue::new(state), 2 | MAP_LOCK)?;
     Ok(())
 }
 
@@ -52,7 +52,7 @@ pub(super) async fn mutate_handoff(
     let mut handoffs = handoff_map()?;
     let mut entry = handoffs.get(key, MAP_LOCK)?.value;
     change(&mut entry);
-    handoffs.insert(*key, FlowMapValue::new(entry), 2 | MAP_LOCK)?;
+    handoffs.insert(key, &FlowMapValue::new(entry), 2 | MAP_LOCK)?;
     Ok(())
 }
 

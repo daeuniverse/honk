@@ -24,9 +24,11 @@ fn fill_hash_map<K: Pod, V: Pod>(
     let mut map = HashMap::<_, K, FlowMapValue<V>>::try_from(map).unwrap();
     let value = FlowMapValue::new(*value);
     for index in 0..AUX_MAP_CAPACITY {
-        map.insert(key(index), value, 1 | 4).unwrap();
+        map.insert(&key(index), &value, 1 | 4).unwrap();
     }
-    let error = map.insert(key(AUX_MAP_CAPACITY), value, 1 | 4).unwrap_err();
+    let error = map
+        .insert(&key(AUX_MAP_CAPACITY), &value, 1 | 4)
+        .unwrap_err();
     assert!(
         matches!(
             &error,

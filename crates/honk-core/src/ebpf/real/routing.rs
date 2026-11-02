@@ -354,7 +354,7 @@ fn create_maps(
 ) -> anyhow::Result<RoutingMaps> {
     let mut domain = RoutingDomain::create(DOMAIN_MAP_CAPACITY, BPF_F_NO_PREALLOC)?;
     for (key, value) in domain_entries {
-        domain.insert(key.data, value, 0)?;
+        domain.insert(&key.data, value, 0)?;
     }
     Ok(RoutingMaps {
         destination_v4: create_lpm(&facts.destination_v4)?,
@@ -448,7 +448,7 @@ impl RealEbpfBackend {
             .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
             .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
         // The process singleton lock serializes reservations across backend lifetimes.
-        self.routing_generation_sequence.set(0, generation, 0)?;
+        self.routing_generation_sequence.set(0, &generation, 0)?;
         Ok(generation)
     }
 
@@ -457,7 +457,7 @@ impl RealEbpfBackend {
         value: RoutingPolicyDescriptor,
     ) -> anyhow::Result<RoutingDescriptor> {
         let mut descriptor = RoutingDescriptor::create(1, 0)?;
-        descriptor.set(0, value, 0)?;
+        descriptor.set(0, &value, 0)?;
         let root = self
             .bpf_mut()?
             .map_mut(ROUTING_POLICY_ROOT_NAME)

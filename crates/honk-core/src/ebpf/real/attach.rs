@@ -115,7 +115,7 @@ impl RealEbpfBackend {
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut loader = EbpfLoader::new();
         loader
-            .btf(Some(&kernel_btf))
+            .btf(&kernel_btf)
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
@@ -392,8 +392,10 @@ impl RealEbpfBackend {
             Err(aya::programs::ProgramError::AlreadyLoaded) => {}
             Err(e) => return Err(anyhow::anyhow!("load '{}': {}", prog, e)),
         }
+        let name = std::ffi::CString::new(iface)
+            .map_err(|e| anyhow::anyhow!("interface name '{}': {}", iface, e))?;
         let id = p
-            .attach(iface, dir)
+            .attach(name.as_c_str(), dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
         debug!(
             "attached '{}' to {} ({:?}) link_id={:?}",

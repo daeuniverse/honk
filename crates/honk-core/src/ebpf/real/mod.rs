@@ -300,7 +300,7 @@ impl RealEbpfBackend {
         self.hash_map_mut::<K, FlowMapValue<V>>(name)?
             .insert(
                 key,
-                FlowMapValue::new(*value),
+                &FlowMapValue::new(*value),
                 aya_obj::generated::BPF_F_LOCK as u64,
             )
             .map_err(|error| anyhow::anyhow!("map '{name}' locked insert: {error}"))
@@ -572,7 +572,7 @@ impl EbpfBackend for RealEbpfBackend {
         for (current, update) in value.bitmap.iter_mut().zip(bitmap.bitmap) {
             *current |= update;
         }
-        map.insert(ip_key.data, value, 0)
+        map.insert(&ip_key.data, &value, 0)
             .map_err(|error| anyhow::anyhow!("active domain map insert: {error}"))
     }
 
@@ -581,7 +581,7 @@ impl EbpfBackend for RealEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> Result<(), super::DomainRouteWriteError> {
-        match self.active_domain_mut()?.insert(ip_key.data, *bitmap, 0) {
+        match self.active_domain_mut()?.insert(&ip_key.data, bitmap, 0) {
             Ok(()) => Ok(()),
             Err(MapError::SyscallError(error))
                 if matches!(

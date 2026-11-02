@@ -62,8 +62,8 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
                     "RETIRE_FENCE",
                 )?)?;
                 fences.insert(
-                    key,
-                    RetirementFence {
+                    &key,
+                    &RetirementFence {
                         owner: 900,
                         decision_token: token,
                         padding: 0,

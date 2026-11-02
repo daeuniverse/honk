@@ -224,7 +224,7 @@ fn set_array<V: Pod>(backend: &mut RealEbpfBackend, name: &str, index: u32, valu
     let map = backend.bpf_mut().unwrap().map_mut(name).unwrap();
     Array::<_, V>::try_from(map)
         .unwrap()
-        .set(index, value, 0)
+        .set(index, &value, 0)
         .unwrap();
 }
 

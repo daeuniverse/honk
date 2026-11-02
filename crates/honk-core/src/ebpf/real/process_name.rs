@@ -47,7 +47,7 @@ fn probe_pair(
     let mm_arg_start_offset = offsets.map(|value| value.mm_arg_start).unwrap_or_default();
     let mut loader = EbpfLoader::new();
     loader
-        .btf(Some(kernel_btf))
+        .btf(kernel_btf)
         .override_global("PARAM", &param, true)
         .override_global("TASK_MM_OFFSET", &task_mm_offset, true)
         .override_global("MM_ARG_START_OFFSET", &mm_arg_start_offset, true);
