@@ -257,5 +257,5 @@ fn conntrack_output() -> Option<*mut ConnState> {
 
 #[inline(always)]
 pub fn tcp_live_pinned(incarnation: u64) -> bool {
-    incarnation != 0 && TCP_LIVE_PINS.get_ptr(incarnation).is_some()
+    incarnation != 0 && TCP_LIVE_PINS.get_ptr(&incarnation).is_some()
 }

@@ -3,7 +3,6 @@
 
 use core::num::NonZeroU64;
 
-use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::__sk_buff,
     helpers::{bpf_ktime_get_ns, bpf_spin_lock, bpf_spin_unlock},
@@ -58,7 +57,7 @@ fn publish_syn(
     direction: u32,
     scratch: &mut UdpDecisionScratch,
 ) -> Option<NonZeroU64> {
-    let tc = TcContext::new(ctx);
+    let tc = crate::ctx::tc_context(ctx)?;
     let prefix = tc.load::<[u8; 2]>(ETH_HLEN as usize).ok()?;
     let (tcp_offset, dscp) = if prefix[0] >> 4 == 4 && key.src_ip.is_v4_mapped() {
         let ihl = usize::from(prefix[0] & 15) * 4;

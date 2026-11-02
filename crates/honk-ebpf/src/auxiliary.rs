@@ -2,6 +2,7 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use crate::ctx::raw_skb;
 use crate::{
     maps::{PARAM, UDP_DECISION_SCRATCH_MAP},
     transport::ETH_HLEN,
@@ -531,18 +532,18 @@ pub fn prep_redirect_to_control_plane(
             let mut tail = [0u8; 8];
             tail[6..].copy_from_slice(&(ctx.skb.protocol() as u16).to_ne_bytes());
             let ret =
-                unsafe { bpf_skb_change_head(ctx.skb.skb, mem::size_of::<EthHdr>() as u32, 0) };
+                unsafe { bpf_skb_change_head(raw_skb(ctx), mem::size_of::<EthHdr>() as u32, 0) };
             if ret != 0 {
                 return ret as i32;
             }
             unsafe {
-                bpf_skb_store_bytes(ctx.skb.skb, 6, tail.as_ptr() as *const _, 8, 0);
+                bpf_skb_store_bytes(raw_skb(ctx), 6, tail.as_ptr() as *const _, 8, 0);
             }
         }
 
         unsafe {
             bpf_skb_store_bytes(
-                ctx.skb.skb,
+                raw_skb(ctx),
                 0, // offsetof(struct ethhdr, h_dest)
                 param.dae0peer_mac.as_ptr() as *const _,
                 6,
@@ -579,7 +580,7 @@ pub fn prep_redirect_to_control_plane(
     let redirect_entry = &mut scratch.redirect;
     unsafe { core::ptr::write_bytes(redirect_entry, 0, 1) };
 
-    redirect_entry.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    redirect_entry.ifindex = unsafe { (*raw_skb(ctx)).ifindex };
     redirect_entry.from_wan = from_wan;
     redirect_entry.last_seen_ns = now;
     // Record the final outbound so dae0_ingress can attribute replies.

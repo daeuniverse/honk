@@ -3,6 +3,7 @@
 //! `SkLookupContext` programs). All helpers release the lookup's implicit
 //! socket reference, which the verifier requires.
 
+use crate::ctx::raw_skb;
 use core::ffi::{c_long, c_void};
 
 use aya_ebpf::{Global, programs::TcContext};
@@ -48,7 +49,7 @@ pub(crate) fn sk_assign_released(
     sk: *const bpf_sock,
     flags: u64,
 ) -> Result<(), c_long> {
-    let ret = unsafe { bpf_sk_assign(ctx.skb.skb as *mut c_void, sk as *mut c_void, flags) };
+    let ret = unsafe { bpf_sk_assign(raw_skb(ctx) as *mut c_void, sk as *mut c_void, flags) };
     let _: c_long = unsafe { bpf_sk_release(sk as *mut _) };
     if ret == 0 { Ok(()) } else { Err(ret as c_long) }
 }
@@ -71,7 +72,7 @@ pub(crate) fn probe_udp_socket(
     tuple_size: u32,
     netns_id: u64,
 ) -> Option<SkProbe> {
-    let sk = unsafe { bpf_sk_lookup_udp(ctx.skb.skb as *mut _, tuple, tuple_size, netns_id, 0) };
+    let sk = unsafe { bpf_sk_lookup_udp(raw_skb(ctx) as *mut _, tuple, tuple_size, netns_id, 0) };
     if sk.is_null() {
         return None;
     }
