@@ -246,7 +246,7 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend
         .routing_generation_sequence
-        .set(0, DNS_ROUTE_GENERATION_MAX - 1, 0)
+        .set(0, &(DNS_ROUTE_GENERATION_MAX - 1), 0)
         .unwrap();
     backend.publish_routing_plan(&old, &[]).unwrap();
     assert_eq!(

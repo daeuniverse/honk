@@ -183,13 +183,13 @@ fn skb_context(input: SkbInput) -> __sk_buff {
 fn set_array<V: Pod>(bpf: &mut Ebpf, name: &str, index: u32, value: V) -> Result<(), MapError> {
     let map = bpf.map_mut(name).expect("array map present");
     let mut array = Array::<_, V>::try_from(map).expect("array map type/layout");
-    array.set(index, value, 0)
+    array.set(index, &value, 0)
 }
 
 fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError> {
     let map = bpf.map_mut(name).expect("hash map present");
     let mut hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
-    hash.insert(key, FlowMapValue::new(value), 4)
+    hash.insert(&key, &FlowMapValue::new(value), 4)
 }
 
 fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
@@ -926,7 +926,7 @@ fn ndp_redirect_l3_on_real_tun() {
         let mut incoming = tun("honk-in", "fd43::1/64");
         std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1").unwrap();
         let mut fixture = Fixture::load();
-        aya::programs::tc::qdisc_add_clsact("honk-out").unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"honk-out").unwrap();
         let program: &mut SchedClassifier = fixture
             .bpf
             .program_mut("lan_egress_l3")
@@ -934,7 +934,7 @@ fn ndp_redirect_l3_on_real_tun() {
             .try_into()
             .unwrap();
         let link = program
-            .attach("honk-out", aya::programs::TcAttachType::Egress)
+            .attach(c"honk-out", aya::programs::TcAttachType::Egress)
             .unwrap();
         let socket = socket2::Socket::new(
             socket2::Domain::IPV6,
@@ -994,7 +994,7 @@ fn ndp_redirect_l3_on_real_tun() {
             .try_into()
             .unwrap();
         let link = program
-            .attach("honk-out", aya::programs::TcAttachType::Egress)
+            .attach(c"honk-out", aya::programs::TcAttachType::Egress)
             .unwrap();
         message[0] = 137;
         match socket.send_to(&message, &SocketAddr::new(destination.into(), 0).into()) {

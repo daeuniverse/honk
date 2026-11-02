@@ -5,6 +5,7 @@
 //! to that publication. Neither reads kernel memory, so both load on kernels that lack
 //! CONFIG_BPF_EVENTS and in-kernel BTF.
 
+use crate::ctx::raw_skb;
 use crate::flow::{handoff_incarnation, handoff_snapshot, redirect_incarnation};
 use crate::maps::{
     CONN_STATE_MAP, CONNTRACK_ARGS_MAP, PARAM, TCP_SOCKET_BINDING, increment_bpf_stat,
@@ -177,7 +178,7 @@ pub fn native_syn_owner(ctx: &TcContext, tuples: &TuplesKey, isn: u32) -> u64 {
         }
         mem::size_of::<bpf_sock_tuple__bindgen_ty_1__bindgen_ty_2>() as u32
     };
-    let sk = unsafe { bpf_skc_lookup_tcp(ctx.skb.skb.cast(), tuple, size, nsid as u64, 0) };
+    let sk = unsafe { bpf_skc_lookup_tcp(raw_skb(ctx).cast(), tuple, size, nsid as u64, 0) };
     if sk.is_null() {
         return SYN_OWNER_ABSENT;
     }

@@ -156,7 +156,7 @@ impl NetworkFixture {
         load_classifier(&mut backend, "lan_ingress_l2");
         load_classifier(&mut backend, "dae0peer_ingress");
         load_classifier(&mut backend, "dae0_ingress");
-        aya::programs::tc::qdisc_add_clsact("hrlan0").unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"hrlan0").unwrap();
         let program: &mut SchedClassifier = backend
             .bpf_mut()
             .unwrap()
@@ -164,8 +164,8 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrlan0", TcAttachType::Ingress).unwrap();
-        aya::programs::tc::qdisc_add_clsact("hrdae0").unwrap();
+        program.attach(c"hrlan0", TcAttachType::Ingress).unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"hrdae0").unwrap();
         let program: &mut SchedClassifier = backend
             .bpf_mut()
             .unwrap()
@@ -173,9 +173,9 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrdae0", TcAttachType::Ingress).unwrap();
+        program.attach(c"hrdae0", TcAttachType::Ingress).unwrap();
         in_netns(&daens_ns, || {
-            aya::programs::tc::qdisc_add_clsact("hrpeer0").unwrap();
+            aya::programs::tc::qdisc_add_clsact(c"hrpeer0").unwrap();
             let program: &mut SchedClassifier = backend
                 .bpf_mut()
                 .unwrap()
@@ -183,7 +183,7 @@ impl NetworkFixture {
                 .unwrap()
                 .try_into()
                 .unwrap();
-            program.attach("hrpeer0", TcAttachType::Ingress).unwrap();
+            program.attach(c"hrpeer0", TcAttachType::Ingress).unwrap();
             let lookup: &mut aya::programs::SkLookup = backend
                 .bpf_mut()
                 .unwrap()
@@ -236,7 +236,8 @@ impl NetworkFixture {
     fn l3_link(&mut self, name: &str, flags: libc::c_int, link_type: Option<u16>) -> std::fs::File {
         let device = tun(name, flags, link_type);
         load_classifier(&mut self.backend, "lan_ingress_l3");
-        aya::programs::tc::qdisc_add_clsact(name).unwrap();
+        let cname = std::ffi::CString::new(name).unwrap();
+        aya::programs::tc::qdisc_add_clsact(&cname).unwrap();
         let program: &mut SchedClassifier = self
             .backend
             .bpf_mut()
@@ -245,7 +246,7 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach(name, TcAttachType::Ingress).unwrap();
+        program.attach(&cname, TcAttachType::Ingress).unwrap();
         device
     }
 

@@ -399,7 +399,7 @@ fn marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
             let listeners = TproxyListeners::new();
             listeners.publish(&mut backend).unwrap();
             load_classifier(&mut backend, "lan_ingress_l2");
-            aya::programs::tc::qdisc_add_clsact("lo").unwrap();
+            aya::programs::tc::qdisc_add_clsact(c"lo").unwrap();
             let program: &mut SchedClassifier = backend
                 .bpf_mut()
                 .unwrap()
@@ -407,7 +407,7 @@ fn marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
                 .unwrap()
                 .try_into()
                 .unwrap();
-            program.attach("lo", TcAttachType::Ingress).unwrap();
+            program.attach(c"lo", TcAttachType::Ingress).unwrap();
             backend
                 .set_datapath_flags(honk_ebpf_common::DATAPATH_FLAG_OFFLOAD_RULE_DIRECT)
                 .unwrap();

@@ -6,10 +6,10 @@ edition = "2024"
 license = "GPL-3.0-only"
 
 [dependencies]
-aya-ebpf = "0.2"
-aya-ebpf-bindings = "0.2"
-aya-ebpf-cty = "0.3"
-aya-log-ebpf = { version = "0.2", optional = true }
+aya-ebpf = "0.3"
+aya-ebpf-bindings = "0.3"
+aya-ebpf-cty = "0.4"
+aya-log-ebpf = { version = "0.3", optional = true }
 honk-ebpf-common = { path = "../honk-ebpf-common" }
 network-types = "0.2.0"
 

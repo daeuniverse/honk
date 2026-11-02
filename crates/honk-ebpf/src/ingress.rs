@@ -7,6 +7,7 @@
 //! replies from that listener back onto the original LAN interface so the
 //! three-way handshake can complete without involving host IP forwarding.
 
+use crate::ctx::{raw_skb, tc_context};
 use core::{
     ffi::{c_long, c_void},
     mem, ptr,
@@ -101,9 +102,9 @@ fn redirect_lan_packet_to_control_plane(
         ctx.skb
             .set_mark(TPROXY_MARK | (pkt.listener_l4proto as u32));
         unsafe {
-            (*ctx.skb.skb).cb[0] = TPROXY_MARK;
-            (*ctx.skb.skb).cb[1] = pkt.listener_l4proto as u32;
-            (*ctx.skb.skb).cb[2] = dns_route_mark;
+            (*raw_skb(ctx)).cb[0] = TPROXY_MARK;
+            (*raw_skb(ctx)).cb[1] = pkt.listener_l4proto as u32;
+            (*raw_skb(ctx)).cb[2] = dns_route_mark;
             let syn =
                 pkt.l4proto == IPPROTO_TCP && crate::contrack::is_new_tcp_connection(&pkt.tcph);
             // Values first, then stores at fixed offsets: branch-local stores
@@ -115,8 +116,8 @@ fn redirect_lan_packet_to_control_plane(
             } else {
                 (0, 0)
             };
-            (*ctx.skb.skb).cb[3] = cb3;
-            (*ctx.skb.skb).cb[4] = cb4;
+            (*raw_skb(ctx)).cb[3] = cb3;
+            (*raw_skb(ctx)).cb[4] = cb4;
         }
     }
 
@@ -173,7 +174,7 @@ fn redirect_lan_packet_to_control_plane(
         let scratch = unsafe { &mut *scratch };
         scratch.redirect_key = redirect_tuple;
         unsafe { ptr::write_bytes(&mut scratch.redirect, 0, 1) };
-        scratch.redirect.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+        scratch.redirect.ifindex = unsafe { (*raw_skb(ctx)).ifindex };
         scratch.redirect.smac.copy_from_slice(&pkt.ethh.src_addr);
         scratch.redirect.dmac.copy_from_slice(&pkt.ethh.dst_addr);
         scratch.redirect.last_seen_ns = now;
@@ -198,7 +199,7 @@ fn redirect_lan_packet_to_control_plane(
         // Keep all pieces in the host for native reassembly. TC cb is not
         // netfilter metadata; the offset-zero skb mark carries DNS authority.
         ctx.skb.set_mark(dns_route_mark);
-        unsafe { (*ctx.skb.skb).priority = trace_id };
+        unsafe { (*raw_skb(ctx)).priority = trace_id };
         return Err(TC_ACT_OK);
     }
 
@@ -226,7 +227,7 @@ fn client_reply_entry(pkt: &ParsedPacket, mut key: RedirectTuple) -> Option<Redi
     key.dst_ip = In6Addr::zero();
     key.dst_port = 0;
     CLIENT_REPLY_TRACK
-        .get_ptr(key)
+        .get_ptr(&key)
         .map(|entry| unsafe { *entry })
 }
 
@@ -266,7 +267,7 @@ fn stage_udp_decision(
     let now = unsafe { bpf_ktime_get_ns() };
     scratch.redirect_key = RedirectTuple::from_tuples(&pkt.tuples.five);
 
-    scratch.redirect.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    scratch.redirect.ifindex = unsafe { (*raw_skb(ctx)).ifindex };
     scratch.redirect.smac.copy_from_slice(&pkt.ethh.src_addr);
     scratch.redirect.dmac.copy_from_slice(&pkt.ethh.dst_addr);
     scratch.redirect.last_seen_ns = now;
@@ -422,7 +423,7 @@ fn cached_udp_decision(
 #[inline(always)]
 fn pass_through_classified(ctx: &TcContext) -> Verdict {
     ctx.skb
-        .set_mark(unsafe { (*ctx.skb.skb).mark } | CLASSIFIED_MARK);
+        .set_mark(unsafe { (*raw_skb(ctx)).mark } | CLASSIFIED_MARK);
     Err(TC_ACT_OK)
 }
 
@@ -441,9 +442,9 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     fib.l4_protocol = pkt.l4proto;
     fib.sport = pkt.tuples.five.src_port.to_be();
     fib.dport = pkt.tuples.five.dst_port.to_be();
-    fib.ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    fib.ifindex = unsafe { (*raw_skb(ctx)).ifindex };
     unsafe {
-        fib.__bindgen_anon_1.tot_len = (*ctx.skb.skb).len as u16;
+        fib.__bindgen_anon_1.tot_len = (*raw_skb(ctx)).len as u16;
         if fib.family == AF_INET {
             fib.__bindgen_anon_2.tos = pkt.tuples.dscp << 2;
         }
@@ -457,7 +458,7 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     }
     let result = unsafe {
         bpf_fib_lookup(
-            ctx.skb.skb as *mut c_void,
+            raw_skb(ctx) as *mut c_void,
             &mut fib,
             mem::size_of::<BpfFibLookup>() as i32,
             0,
@@ -486,7 +487,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     }
     // Bridge master/slave double attachment must not reclassify either an
     // already-final packet or a held packet carrying its unique queue token.
-    if unsafe { (*ctx.skb.skb).mark } & (CLASSIFIED_MARK | NFQUEUE_PENDING_MARK) != 0 {
+    if unsafe { (*raw_skb(ctx)).mark } & (CLASSIFIED_MARK | NFQUEUE_PENDING_MARK) != 0 {
         return Err(TC_ACT_OK);
     }
 
@@ -513,7 +514,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_TCP || pkt.l4proto == IPPROTO_UDP {
         // An originated socket must also survive an explicitly LAN-bound lo.
         let bypass_mark = PARAM.load().dae_socket_mark;
-        if bypass_mark != 0 && unsafe { (*ctx.skb.skb).mark } == bypass_mark {
+        if bypass_mark != 0 && unsafe { (*raw_skb(ctx)).mark } == bypass_mark {
             return pass_through_classified(ctx);
         }
     }
@@ -638,7 +639,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         AuxPrep::Refresh
     };
 
-    let protocol = unsafe { (*ctx.skb.skb).protocol as u16 };
+    let protocol = unsafe { (*raw_skb(ctx)).protocol as u16 };
     let ip_version = if protocol == ETH_P_IP.to_be() {
         IpVersionType::V4 as u8
     } else {
@@ -904,7 +905,7 @@ fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     if pkt.l4proto == IPPROTO_UDP && pkt.tuples.five.dst_port == 53 && pkt.is_fragmented != 0 {
         // Non-host Ethernet traffic may be bridged without inet prerouting, even before
         // an interface watcher has installed the destination port's egress fence.
-        if link_h_len != 0 && unsafe { (*ctx.skb.skb).pkt_type } != 0 {
+        if link_h_len != 0 && unsafe { (*raw_skb(ctx)).pkt_type } != 0 {
             return Err(TC_ACT_SHOT);
         }
         // Re-read readiness before publication; the kernel grace barrier drains this invocation.
@@ -992,17 +993,17 @@ fn do_tproxy_wan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
 #[inline(never)]
 fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     // This private link accepts only same-skb handoffs from the LAN/WAN classifiers.
-    let cb0 = unsafe { (*ctx.skb.skb).cb[0] };
+    let cb0 = unsafe { (*raw_skb(ctx)).cb[0] };
     if cb0 != TPROXY_MARK {
         return Err(TC_ACT_SHOT);
     }
 
     // TCP must resolve established/TIME_WAIT owners before sk_lookup selects a listener.
-    let listener_l4proto = (unsafe { (*ctx.skb.skb).cb[1] }) as u8;
+    let listener_l4proto = (unsafe { (*raw_skb(ctx)).cb[1] }) as u8;
     if listener_l4proto != 0 && listener_l4proto != IPPROTO_UDP {
         return Err(TC_ACT_SHOT);
     }
-    let route_mark = unsafe { (*ctx.skb.skb).cb[2] };
+    let route_mark = unsafe { (*raw_skb(ctx)).cb[2] };
     let mark = if route_mark == 0 {
         TPROXY_MARK
     } else {
@@ -1014,28 +1015,28 @@ fn do_tproxy_dae0peer_ingress(ctx: &TcContext) -> Verdict {
     };
     if listener_l4proto == IPPROTO_UDP {
         ctx.set_mark(mark);
-        unsafe { (*ctx.skb.skb).priority = (*ctx.skb.skb).cb[3] };
+        unsafe { (*raw_skb(ctx)).priority = (*raw_skb(ctx)).cb[3] };
     } else {
         // Restore only after the namespace crossing has scrubbed link metadata.
-        let low = unsafe { (*ctx.skb.skb).cb[3] };
-        let high = unsafe { (*ctx.skb.skb).cb[4] };
+        let low = unsafe { (*raw_skb(ctx)).cb[3] };
+        let high = unsafe { (*raw_skb(ctx)).cb[4] };
         if high & 0xff000000 != 0 {
             return Err(TC_ACT_SHOT);
         }
         ctx.set_mark(TPROXY_MARK | (low & 0x00ffffff));
-        unsafe { (*ctx.skb.skb).priority = (low >> 24) | (high << 8) };
+        unsafe { (*raw_skb(ctx)).priority = (low >> 24) | (high << 8) };
     }
     // Redirected frames may still carry the original destination MAC.
     let _ = ctx.change_type(0);
     if listener_l4proto == IPPROTO_UDP {
         // Without the redirect site's marker the packet reaches sk_lookup unassigned.
-        let marker = unsafe { (*ctx.skb.skb).cb[4] };
+        let marker = unsafe { (*raw_skb(ctx)).cb[4] };
         let key = udp_assign_key(ctx, marker);
         // BPF_PROG_TEST_RUN never runs at TC ingress, so assignment cannot take
         // effect there; fixtures read the chosen map key back from cb[4].
         #[cfg(feature = "routing-test")]
         unsafe {
-            (*ctx.skb.skb).cb[4] = key.unwrap_or(0)
+            (*raw_skb(ctx)).cb[4] = key.unwrap_or(0)
         };
         if let Some(key) = key {
             let map_ptr = ptr::from_ref(&LISTEN_SOCKET_MAP).cast::<c_void>();
@@ -1057,7 +1058,7 @@ fn udp_assign_key(ctx: &TcContext, marker: u32) -> Option<u32> {
     if index >= UDP_LISTENER_COUNT {
         return None;
     }
-    let is_v6 = unsafe { (*ctx.skb.skb).protocol as u16 } == ETH_P_IPV6.to_be();
+    let is_v6 = unsafe { (*raw_skb(ctx)).protocol as u16 } == ETH_P_IPV6.to_be();
     Some(if is_v6 {
         KEY_UDP6_BASE + index
     } else {
@@ -1116,14 +1117,14 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
     let from_wan = entry.from_wan;
     unsafe {
         bpf_skb_store_bytes(
-            ctx.skb.skb,
+            raw_skb(ctx),
             mem::offset_of!(EthHdr, src_addr) as u32,
             smac.as_ptr() as *const _,
             6,
             0,
         );
         bpf_skb_store_bytes(
-            ctx.skb.skb,
+            raw_skb(ctx),
             mem::offset_of!(EthHdr, dst_addr) as u32,
             dmac.as_ptr() as *const _,
             6,
@@ -1143,13 +1144,18 @@ fn do_tproxy_dae0_ingress(ctx: &TcContext) -> Verdict {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    crate::fragment::record(flatten(do_tproxy_lan_ingress(&TcContext::new(ctx), 14)))
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
+    crate::fragment::record(flatten(do_tproxy_lan_ingress(&ctx, 14)))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    let ctx = TcContext::new(ctx);
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
     let link_h_len = crate::transport::l3_link_h_len(&ctx);
     crate::fragment::record(flatten(do_tproxy_lan_ingress(&ctx, link_h_len)))
 }
@@ -1157,13 +1163,18 @@ pub fn lan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_ingress_l2(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_wan_ingress(&TcContext::new(ctx), 14))
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
+    flatten(do_tproxy_wan_ingress(&ctx, 14))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
-    let ctx = TcContext::new(ctx);
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
     flatten(do_tproxy_wan_ingress(
         &ctx,
         crate::transport::l3_link_h_len(&ctx),
@@ -1173,11 +1184,17 @@ pub fn wan_ingress_l3(ctx: *mut __sk_buff) -> i32 {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0peer_ingress(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_dae0peer_ingress(&TcContext::new(ctx)))
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
+    flatten(do_tproxy_dae0peer_ingress(&ctx))
 }
 
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn dae0_ingress(ctx: *mut __sk_buff) -> i32 {
-    flatten(do_tproxy_dae0_ingress(&TcContext::new(ctx)))
+    let Some(ctx) = tc_context(ctx) else {
+        return TC_ACT_SHOT as i32;
+    };
+    flatten(do_tproxy_dae0_ingress(&ctx))
 }

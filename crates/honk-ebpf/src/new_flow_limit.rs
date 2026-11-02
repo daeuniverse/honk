@@ -25,7 +25,7 @@ pub fn try_acquire(src: &In6Addr) -> bool {
     let second = (unsafe { bpf_ktime_get_ns() } / 1_000_000_000) as u32;
     let Some(window) = NEW_FLOW_RATE.get_ptr_mut(src) else {
         // A failed insert only leaves this attempt uncounted.
-        let _ = NEW_FLOW_RATE.insert(src, NewFlowWindow { second, count: 1 }, 0);
+        let _ = NEW_FLOW_RATE.insert(src, &NewFlowWindow { second, count: 1 }, 0);
         return true;
     };
     let window = unsafe { &mut *window };

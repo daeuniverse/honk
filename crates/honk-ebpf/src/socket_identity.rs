@@ -1,5 +1,6 @@
 //! Immutable first-captured process identity, reclaimed with the socket object.
 
+use crate::ctx::raw_skb;
 use aya_ebpf::programs::TcContext;
 use aya_ebpf_bindings::{
     bindings::BPF_SK_STORAGE_GET_F_CREATE,
@@ -64,7 +65,7 @@ pub(crate) unsafe fn capture(socket: *mut c_void, argv0: bool) {
 /// Borrow only the identity of the actual skb socket; never allocate in TC.
 #[inline(always)]
 pub(crate) fn lookup(ctx: &TcContext) -> Option<&SocketIdentity> {
-    let socket = unsafe { (*ctx.skb.skb).__bindgen_anon_2.sk };
+    let socket = unsafe { (*raw_skb(ctx)).__bindgen_anon_2.sk };
     if socket.is_null() {
         return None;
     }

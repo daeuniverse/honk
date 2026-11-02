@@ -315,7 +315,7 @@ fn conn_capacity_native_passes_continue_tcx_without_clearing_marks() {
                     9,
                     IPPROTO_UDP,
                 );
-                map.insert(key, FlowMapValue::new(ConnState::default()), 1 | 4)
+                map.insert(&key, &FlowMapValue::new(ConnState::default()), 1 | 4)
                     .unwrap();
             }
         }
