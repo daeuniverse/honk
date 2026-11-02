@@ -231,6 +231,7 @@ size observations are historical, not a maintained target allowlist.
 Configuration contracts (settings, dialect, `honk-tool`): `.agents/rules/configuration.md`. Deployment and security-sensitive paths: `.agents/rules/deployment.md`, `.agents/rules/security.md`.
 
 Shared eBPF/`honk-core` constants and `#[repr(C)]` structs in `#![no_std]`; `aya` is non-BPF-only for `Pod` impls. **Layouts and map key sizes must agree**: change types/constants together in [this crate](crates/honk-ebpf-common), `honk-ebpf`, and `honk-core` map writers.
+Keep `Pod` payloads recursively free of implicit padding; reserved bytes must be explicit fields. Only audited concrete `FlowMapValue` payloads implement `Pod`, and object BTF admission must include the reserved fields without moving existing offsets.
 
 - Choose commands for the owning crate: workspace `cargo` skips `honk-ebpf`, which has separate `Cargo.lock` and nightly-only target.
 - Change eBPF map layouts, state transitions, marks and statistics keys together in `honk-ebpf-common`, `honk-ebpf`, `honk-core` and their `honk-nfqueue`/`honk-tool` consumers; preserve the `UDP_DECISION_SEQUENCE` ABI and cross-restart token uniqueness.

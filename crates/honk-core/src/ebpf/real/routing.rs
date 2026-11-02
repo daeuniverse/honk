@@ -144,6 +144,7 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     let output_fields = [
         ("decision", offset_of!(KernelRouteOutput, decision)),
         ("flags", offset_of!(KernelRouteOutput, flags)),
+        ("padding", offset_of!(KernelRouteOutput, padding)),
         ("generation", offset_of!(KernelRouteOutput, generation)),
         ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
         ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
@@ -163,6 +164,15 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
         let member = output + 12 + index * 12;
         if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
             return None;
+        }
+        if name == "padding" {
+            let padding = btf.resolve_modifiers(read(member + 4)?)?;
+            if btf.kind(padding)? != 3
+                || read(padding + 20)? != 4
+                || !btf.unsigned_integer_width(read(padding + 12)?, 1)
+            {
+                return None;
+            }
         }
         if name == "input" {
             let input = btf.resolve_composite(read(member + 4)?)?;

@@ -186,19 +186,28 @@ fn set_array<V: Pod>(bpf: &mut Ebpf, name: &str, index: u32, value: V) -> Result
     array.set(index, &value, 0)
 }
 
-fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError> {
+fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError>
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map_mut(name).expect("hash map present");
     let mut hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     hash.insert(&key, &FlowMapValue::new(value), 4)
 }
 
-fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
+fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map(name).expect("hash map present");
     let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     hash.keys().map(Result::unwrap).count()
 }
 
-fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V> {
+fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V>
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map(name).expect("hash map present");
     let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     match hash.get(&key, 4) {

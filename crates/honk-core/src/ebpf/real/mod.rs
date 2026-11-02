@@ -280,7 +280,10 @@ impl RealEbpfBackend {
         &self,
         name: &str,
         key: &K,
-    ) -> anyhow::Result<Option<V>> {
+    ) -> anyhow::Result<Option<V>>
+    where
+        FlowMapValue<V>: Pod,
+    {
         match self
             .hash_map::<K, FlowMapValue<V>>(name)?
             .get(key, aya_obj::generated::BPF_F_LOCK as u64)
@@ -296,7 +299,10 @@ impl RealEbpfBackend {
         name: &str,
         key: &K,
         value: &V,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         self.hash_map_mut::<K, FlowMapValue<V>>(name)?
             .insert(
                 key,
@@ -311,7 +317,10 @@ impl RealEbpfBackend {
         name: &str,
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         self.flow_scan_from(
             name,
             chunk_size,
@@ -326,7 +335,10 @@ impl RealEbpfBackend {
         chunk_size: usize,
         cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut ChunkVisitor<'_, K, V>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
         if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
             self.bpf()?,

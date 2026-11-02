@@ -30,6 +30,20 @@ const _: () = assert!(core::mem::size_of::<ReceiveTracePacket>() == 16);
 const _: () = assert!(core::mem::size_of::<ReceiveTraceBatch>() == 176);
 const _: () = assert!(core::mem::offset_of!(ReceiveTraceBatch, packets) == 48);
 
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<ReceiveTracePacket>() == 4 * 4);
+    assert!(
+        size_of::<ReceiveTraceBatch>()
+            == 8 + 8
+                + 4 * 4
+                + size_of::<ReceiveTracePacket>()
+                + size_of::<[ReceiveTracePacket; RECEIVE_TRACE_BATCH_SIZE]>()
+    );
+};
+
+// SAFETY: Packet and batch leaves are only integers. The field-size sums
+// include candidate and every packet, excluding implicit and nested padding.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for ReceiveTracePacket {}
 #[cfg(not(target_arch = "bpf"))]

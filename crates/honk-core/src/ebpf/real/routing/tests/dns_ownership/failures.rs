@@ -19,7 +19,9 @@ fn fill_hash_map<K: Pod, V: Pod>(
     name: &str,
     key: impl Fn(u32) -> K,
     value: &V,
-) {
+) where
+    FlowMapValue<V>: Pod,
+{
     let map = backend.bpf_mut().unwrap().map_mut(name).unwrap();
     let mut map = HashMap::<_, K, FlowMapValue<V>>::try_from(map).unwrap();
     let value = FlowMapValue::new(*value);
