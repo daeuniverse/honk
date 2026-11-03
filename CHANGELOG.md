@@ -6,6 +6,39 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.1.0-beta.5] - 2026-11-03
+
+### Added
+
+- Formal releases attach `.deb`, `.rpm` and Arch Linux packages for `x86_64` and `aarch64`, which install `honk-core`, `honk-core.service` and an example configuration. (#417)
+
+### Changed
+
+- Full builds embed doona 0.1.0-rc.5 with both editions.
+- Add reloadable `global.shutdown_wait_connections` (default `false`). Set `true` to retain the previous five-second connection grace; mandatory cleanup and native HTTP shutdown are unchanged. (#410)
+
+### Fixed
+
+- AnyTLS nodes with `min_idle_session` above one now keep that many idle sessions open. The pool janitor previously reused the idle session it already had and never dialed the rest ([#260](https://github.com/daeuniverse/honk/issues/260)). (#405)
+- Clash subscriptions that pin a server certificate with `fingerprint` now import it as `tls_pin_sha256` instead of failing the TLS handshake. (#420)
+- Clash and Clash-compatible subscriptions keep VMess nodes whose `udp: true` claim honk cannot honor; the node now imports for TCP instead of being dropped. (#443)
+- Clash and sing-box subscriptions import WebSocket upgrade headers other than `Host`, so nodes that require `ws-opts.headers.User-Agent` are no longer dropped. The headers participate in node identity and are sent on the upgrade. (#421)
+- Direct and supplied-TCP WebSocket dials enforce the same header limits and reserved-name rules as subscription admission, before network I/O. (#421)
+- sing-box keeps empty WebSocket header strings and rejects invalid or conflicting claims instead of silently dropping them. (#421)
+- Structured node errors retain the actual transport or header field instead of being mislabeled as XHTTP errors. (#421)
+- Clash WebSocket Host extraction retains its first-usable scalar and lazy fallback behavior while additional headers remain strictly checked. (#421)
+- Subscription stream-normalization failures retain their canonical field alongside the original entry index, preserving transport context without exposing supplied header names or values. (#421)
+- A TCP health-check cooldown no longer skips a node's due UDP probe, and an emergency TCP probe no longer clears UDP cooldowns. (#408)
+- Health-check cycles skip worker creation when both TCP and UDP probes are cooling down. (#408)
+- When NFQUEUE is unavailable at startup, configuration writes and reloads are no longer refused because `global.nfqueue_enable` needs a restart; the reloaded configuration keeps NFQUEUE disabled. (#407)
+- A subscription that shares a node with another subscription now loads its other nodes; the shared node stays with the subscription that published it first. (#406)
+- Retry failed subscription fetches with exponential backoff instead of waiting for the full refresh interval. (#412)
+- Traffic on L3-typed interfaces whose driver still sends Ethernet frames (for example RAWIP cellular modems) is intercepted again. (#427)
+
+### Security
+
+- AES-GCM no longer uses a `ctutils` release whose mask generation and `u128` comparisons are not constant-time (RUSTSEC-2026-0385); `ctutils` is now 0.4.7. (#441)
+
 ## [0.1.0-beta.4] - 2026-10-30
 
 ### Added
@@ -85,7 +118,8 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...HEAD
+[0.1.0-beta.5]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.2...v0.1.0-beta.3
 [0.1.0-beta.2]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.1...v0.1.0-beta.2
