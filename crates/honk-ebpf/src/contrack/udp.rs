@@ -39,7 +39,7 @@ pub fn claim_udp_preparing(key: &TuplesKey, mac: &[u8; 6]) -> Option<u64> {
     state.mac.copy_from_slice(mac);
 
     if CONN_STATE_MAP
-        .insert(key, FlowMapValue::new(state), BPF_NOEXIST as u64)
+        .insert(key, &FlowMapValue::new(state), BPF_NOEXIST as u64)
         .is_ok()
     {
         occupancy_add(OCCUPANCY_INSERTS);

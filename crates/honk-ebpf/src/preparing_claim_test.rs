@@ -83,7 +83,7 @@ pub fn preparing_claim_interleaving_test(ctx: *mut __sk_buff) -> c_long {
         scratch.redirect.decision_token = token;
         scratch.redirect_key = honk_ebpf_common::RedirectTuple::from_tuples(key);
         if ROUTING_HANDOFF_MAP
-            .insert(key, FlowMapValue::new(scratch.handoff), BPF_NOEXIST as u64)
+            .insert(key, &FlowMapValue::new(scratch.handoff), BPF_NOEXIST as u64)
             .is_err()
         {
             return TC_ACT_SHOT;
@@ -92,7 +92,7 @@ pub fn preparing_claim_interleaving_test(ctx: *mut __sk_buff) -> c_long {
         if REDIRECT_TRACK
             .insert(
                 &scratch.redirect_key,
-                FlowMapValue::new(scratch.redirect),
+                &FlowMapValue::new(scratch.redirect),
                 BPF_NOEXIST as u64,
             )
             .is_err()

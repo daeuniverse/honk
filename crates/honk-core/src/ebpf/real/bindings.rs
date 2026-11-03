@@ -5,10 +5,9 @@
 //! a [`BindingCommit`] without any lock held: it creates links by interface
 //! index, updates a link in place when the program changes, and proves a
 //! retained link is still on the namespace-local chain with `BPF_PROG_QUERY`
-//! (a link FD alone survives its device being deleted or moved). Aya cannot do
-//! this: `SchedClassifier::attach` resolves the name itself and
-//! `attach_to_link` consumes the old link on failure. Every `unsafe` syscall of
-//! the module is here.
+//! (a link FD alone survives its device being deleted or moved). Aya's
+//! `attach_to_link` neither checks the expected old program nor preserves the
+//! old link on failure. Every `unsafe` syscall of the module is here.
 
 use std::collections::HashMap;
 use std::ffi::c_long;

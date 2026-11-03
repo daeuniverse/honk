@@ -410,6 +410,7 @@ impl RoutingMeta {
 // and field byte-offsets must match the bit-encoding in build_routing_meta().
 const _RT_META_SIZE: () = assert!(core::mem::size_of::<RoutingMeta>() == 8);
 const _RT_META_RAW_SIZE: () = assert!(core::mem::size_of::<u64>() == 8);
+const _: () = assert!(core::mem::size_of::<RoutingMetaData>() == 1 + 4 + 1 + 1 + 1);
 
 impl Default for RoutingMeta {
     fn default() -> Self {
@@ -634,6 +635,19 @@ pub struct OutboundStats {
     pub _pad: u32,
 }
 
+// All fields of the userspace Pod types below are integer scalars/arrays.
+// Address and routing unions are checked separately; sums count explicit pads.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<DaeParam>() == 5 * 4 + 6 + 2 + 1 + 1 + 2 + 4 + 4 + 4);
+    assert!(size_of::<LpmKey>() == 4 + size_of::<[u32; 4]>());
+    assert!(size_of::<OutboundStatsCounters>() == 4 * 8);
+    assert!(size_of::<RedirectTuple>() == 16 + 16 + 2 + 2 + 1 + 3);
+    assert!(size_of::<RedirectEntry>() == 8 + 6 + 6 + 1 + 1 + 2 + 4 + 4 + 8);
+};
+
+// SAFETY: Integer leaves admit every bit pattern; the recursive field-size
+// checks exclude implicit padding in both these structs and their unions.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RedirectTuple {}
 #[cfg(not(target_arch = "bpf"))]

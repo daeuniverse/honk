@@ -18,6 +18,7 @@ fn locked_flow_snapshots_are_coherent_during_native_in_place_updates() -> anyhow
     where
         K: aya::Pod + Send + Sync,
         V: aya::Pod + Send + Sync + std::fmt::Debug,
+        FlowMapValue<V>: aya::Pod,
     {
         backend.flow_insert(name, &key, &values[0])?;
         let map = backend.hash_map::<K, FlowMapValue<V>>(name)?;
@@ -30,7 +31,7 @@ fn locked_flow_snapshots_are_coherent_during_native_in_place_updates() -> anyhow
             let thread = scope.spawn(move || -> anyhow::Result<()> {
                 writer_start.wait();
                 for index in 0..8192 {
-                    writer.insert(key, FlowMapValue::new(values[index % 2]), 2 | 4)?;
+                    writer.insert(&key, &FlowMapValue::new(values[index % 2]), 2 | 4)?;
                 }
                 Ok(())
             });

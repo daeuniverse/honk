@@ -274,7 +274,7 @@ fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
         assert_eq!(keys.len(), 1);
         let mut aged = map.get(&keys[0], 0).unwrap();
         aged.ktime_ns = monotonic_ns() - FRAGMENT_TTL_NS - 1_000_000_000;
-        map.insert(keys[0], aged, 0).unwrap();
+        map.insert(&keys[0], &aged, 0).unwrap();
         assert_eq!(verdict(&backend, "lan_ingress_l2", &later), TC_ACT_OK);
     });
 }

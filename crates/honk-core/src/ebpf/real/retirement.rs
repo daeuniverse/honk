@@ -395,7 +395,7 @@ impl RealEbpfBackend {
             .hash_map_mut::<TuplesKey, FlowMapValue<ConnState>>("CONN_STATE_MAP")?
             .insert(
                 key,
-                FlowMapValue::new(plan.state),
+                &FlowMapValue::new(plan.state),
                 (aya_obj::generated::BPF_EXIST | aya_obj::generated::BPF_F_LOCK) as u64,
             ) {
             Ok(()) => Ok(UdpDecisionCommitResult::Applied),

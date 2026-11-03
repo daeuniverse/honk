@@ -144,6 +144,7 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     let output_fields = [
         ("decision", offset_of!(KernelRouteOutput, decision)),
         ("flags", offset_of!(KernelRouteOutput, flags)),
+        ("padding", offset_of!(KernelRouteOutput, padding)),
         ("generation", offset_of!(KernelRouteOutput, generation)),
         ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
         ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
@@ -163,6 +164,15 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
         let member = output + 12 + index * 12;
         if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
             return None;
+        }
+        if name == "padding" {
+            let padding = btf.resolve_modifiers(read(member + 4)?)?;
+            if btf.kind(padding)? != 3
+                || read(padding + 20)? != 4
+                || !btf.unsigned_integer_width(read(padding + 12)?, 1)
+            {
+                return None;
+            }
         }
         if name == "input" {
             let input = btf.resolve_composite(read(member + 4)?)?;
@@ -354,7 +364,7 @@ fn create_maps(
 ) -> anyhow::Result<RoutingMaps> {
     let mut domain = RoutingDomain::create(DOMAIN_MAP_CAPACITY, BPF_F_NO_PREALLOC)?;
     for (key, value) in domain_entries {
-        domain.insert(key.data, value, 0)?;
+        domain.insert(&key.data, value, 0)?;
     }
     Ok(RoutingMaps {
         destination_v4: create_lpm(&facts.destination_v4)?,
@@ -448,7 +458,7 @@ impl RealEbpfBackend {
             .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
             .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
         // The process singleton lock serializes reservations across backend lifetimes.
-        self.routing_generation_sequence.set(0, generation, 0)?;
+        self.routing_generation_sequence.set(0, &generation, 0)?;
         Ok(generation)
     }
 
@@ -457,7 +467,7 @@ impl RealEbpfBackend {
         value: RoutingPolicyDescriptor,
     ) -> anyhow::Result<RoutingDescriptor> {
         let mut descriptor = RoutingDescriptor::create(1, 0)?;
-        descriptor.set(0, value, 0)?;
+        descriptor.set(0, &value, 0)?;
         let root = self
             .bpf_mut()?
             .map_mut(ROUTING_POLICY_ROOT_NAME)

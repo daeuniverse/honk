@@ -1,3 +1,4 @@
+use crate::ctx::raw_skb;
 use crate::maps::PARSE_CTX_MAP;
 use aya_ebpf::{
     bindings::{__be16, __be32, bpf_hdr_start_off::BPF_HDR_START_NET},
@@ -122,7 +123,7 @@ pub fn l3_link_h_len(ctx: &TcContext) -> u32 {
 // #[inline(never)]: keeps the probe buffer out of the classifiers' combined stack.
 #[inline(never)]
 fn network_header_at_eth_hlen(ctx: &TcContext, head: u32) -> u32 {
-    let skb = ctx.skb.skb as *const _;
+    let skb = raw_skb(ctx) as *const _;
     let offset = head - ETH_HLEN - 1;
     let mut bytes = [0u8; 2];
     let to = bytes.as_mut_ptr() as *mut _;
@@ -140,7 +141,7 @@ fn network_header_at_eth_hlen(ctx: &TcContext, head: u32) -> u32 {
 /// must classify it instead. VID 0 priority tags are delivered normally.
 #[inline(always)]
 pub fn is_vlan_tagged(ctx: &TcContext, link_h_len: u32) -> bool {
-    link_h_len == ETH_HLEN && unsafe { (*ctx.skb.skb).vlan_tci } & VLAN_VID_MASK != 0
+    link_h_len == ETH_HLEN && unsafe { (*raw_skb(ctx)).vlan_tci } & VLAN_VID_MASK != 0
 }
 
 /// Destinations that must never enter routing/conntrack: L2
@@ -172,7 +173,7 @@ pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPa
         return false;
     }
 
-    let skb = ctx.skb.skb as *mut _;
+    let skb = raw_skb(ctx) as *mut _;
     let mut offset = link_h_len;
     let mut nexthdr = IPPROTO_UDP;
 
@@ -265,7 +266,7 @@ trait ParseTransportExt {
 impl ParseTransportExt for ParseTransportCtx {
     #[inline(always)]
     fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long> {
-        let skb_ptr = ctx.skb.skb as *mut _;
+        let skb_ptr = raw_skb(ctx) as *mut _;
         let mut offset = 0u32;
         let mut ret: c_long;
 

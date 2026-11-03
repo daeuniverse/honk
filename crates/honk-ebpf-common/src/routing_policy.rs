@@ -151,6 +151,7 @@ fn unresolved_direct_handoff_keeps_sniffing_authority() {
 pub struct KernelRouteOutput {
     pub decision: RoutingDecision,
     pub flags: u32,
+    pub padding: [u8; 4],
     pub generation: u64,
     pub policy_id: u32,
     pub fact_state: u32,
@@ -217,6 +218,7 @@ fn all_direct_mode_matches_userspace_override() {
 pub struct RoutingTestResult {
     pub status: i32,
     pub decision: RoutingDecision,
+    pub padding: [u8; 4],
     pub trace: KernelRouteOutput,
 }
 
@@ -238,11 +240,13 @@ const _: () = assert!(core::mem::size_of::<RoutingTestResult>() == 304);
 const _: () = assert!(core::mem::align_of::<RoutingTestResult>() == 8);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, status) == 0);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, decision) == 4);
+const _: () = assert!(core::mem::offset_of!(RoutingTestResult, padding) == 28);
 const _: () = assert!(core::mem::offset_of!(RoutingTestResult, trace) == 32);
 const _: () = assert!(core::mem::size_of::<KernelRouteOutput>() == 272);
 const _: () = assert!(core::mem::align_of::<KernelRouteOutput>() == 8);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, decision) == 0);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, flags) == 24);
+const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, padding) == 28);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, generation) == 32);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, policy_id) == 40);
 const _: () = assert!(core::mem::offset_of!(KernelRouteOutput, fact_state) == 44);
@@ -283,6 +287,37 @@ const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, generation)
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, domain_map_id) == 16);
 const _: () = assert!(core::mem::offset_of!(RoutingPolicyDescriptor, trace_policy) == 20);
 
+// These sums cover every field, including nested payloads and explicit padding.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<RoutingInput>() == 16 + 16 + 16 + ROUTING_PROCESS_MAX_LEN + 8 * 4);
+    assert!(size_of::<RoutingDecision>() == 6 * 4);
+    assert!(size_of::<RoutingPolicyDescriptor>() == 4 + 4 + 8 + 4 + 4);
+    assert!(
+        size_of::<RoutingTestResult>()
+            == 4 + size_of::<RoutingDecision>() + 4 + size_of::<KernelRouteOutput>()
+    );
+    assert!(
+        size_of::<KernelRouteOutput>()
+            == size_of::<RoutingDecision>()
+                + 4
+                + 4
+                + 8
+                + 4
+                + 4
+                + size_of::<RoutingInput>()
+                + size_of::<crate::DomainRouting>()
+                + size_of::<[u32; ROUTE_TRACE_WORDS]>()
+    );
+    assert!(
+        size_of::<KernelRouteWitness>()
+            == size_of::<KernelRouteOutput>() + size_of::<crate::TuplesKey>() + 4 + 4 + 8
+    );
+};
+
+// SAFETY: The recursive field-size sums exclude implicit padding. All leaves
+// are integer scalars/arrays (including flags and decisions), never Rust enums,
+// bools, pointers or references, so every byte pattern is a valid value.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RoutingInput {}
 #[cfg(not(target_arch = "bpf"))]

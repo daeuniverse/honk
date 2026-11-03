@@ -102,7 +102,7 @@ impl ReceiveTrace {
         let offsets = detect(&data)
             .ok_or_else(|| anyhow::anyhow!("receive trace BTF offsets unavailable"))?;
         let mut loader = EbpfLoader::new();
-        loader.btf(Some(&kernel_btf));
+        loader.btf(&kernel_btf);
         offsets.configure(&mut loader);
         let bpf = loader.load(crate::DEFAULT_BPF_OBJECT)?;
         drop(loader);
@@ -186,7 +186,7 @@ impl ReceiveTrace {
             return Err(io::Error::other("invalid owned UDP socket cookie"));
         }
         let mut map = handle(self.map.map())?;
-        map.insert(cookie, ReceiveTraceBatch::default(), 1)
+        map.insert(&cookie, &ReceiveTraceBatch::default(), 1)
             .map_err(io::Error::other)?;
         Ok(ReceiveRegistration {
             _trace: self.clone(),
@@ -224,8 +224,8 @@ impl ReceiveRegistration {
         self.armed = self
             .map
             .insert(
-                self.cookie,
-                ReceiveTraceBatch {
+                &self.cookie,
+                &ReceiveTraceBatch {
                     epoch,
                     active: 1,
                     ..Default::default()
@@ -425,7 +425,7 @@ mod tests {
                 3 => batch.depth = 1,
                 _ => batch.lost = 1,
             }
-            registration.map.insert(cookie, batch, 2)?;
+            registration.map.insert(&cookie, &batch, 2)?;
             let result = registration.finish(3);
             if loss == 0 {
                 let packets = result.expect("located candidate hole retains other slots");
@@ -462,7 +462,7 @@ mod tests {
         assert!(registration.begin(receiver.as_raw_fd()));
         let mut marked = trace.map.get(&cookie, 0)?;
         marked.packets[RECEIVE_TRACE_BATCH_SIZE - 1].priority = 99;
-        registration.map.insert(cookie, marked, 2)?;
+        registration.map.insert(&cookie, &marked, 2)?;
         // Would-block receives skip `finish`; neither they nor `begin` may touch the map.
         for _ in 0..2 {
             assert!(registration.begin(receiver.as_raw_fd()));

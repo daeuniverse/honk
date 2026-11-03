@@ -72,7 +72,10 @@ impl TcpPublisher {
         }
         // Zero is exclusion only, never fresh-publication authority. Cached
         // SYNs neither allocate an incarnation nor gain replacement permission.
-        if let Err(error) = TCP_PUBLISHING.insert(key, 0, BPF_NOEXIST as u64) {
+        // Pass a stack value: with `&0`, which Rust promotes to a static, the
+        // netns SYN-follow test never saw the fresh incarnation published.
+        let zero = 0u64;
+        if let Err(error) = TCP_PUBLISHING.insert(key, &zero, BPF_NOEXIST as u64) {
             // A concurrent same-tuple SYN is ordinary exclusion, not saturation.
             if error != -crate::errno::EEXIST {
                 increment_bpf_stat(BpfStatsKey::TcpPublisherClaimFailure);
@@ -367,7 +370,7 @@ fn publish_fresh_tcp(
     } else if expected_incarnation != 0 {
         return core::ptr::null_mut();
     } else if CONN_STATE_MAP
-        .insert(key, FlowMapValue::new(*new_state), BPF_NOEXIST as u64)
+        .insert(key, &FlowMapValue::new(*new_state), BPF_NOEXIST as u64)
         .is_ok()
     {
         occupancy_add(OCCUPANCY_INSERTS);

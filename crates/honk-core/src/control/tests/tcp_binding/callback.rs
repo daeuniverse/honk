@@ -112,11 +112,11 @@ pub(super) fn foreign_twin(family: &str) -> anyhow::Result<()> {
             let _backend = lab.handle.ebpf.write().await;
             let mut conn = published.conn;
             conn.tcp_syn_isn = syn_isn(&syn, target.is_ipv6())?;
-            conn_map()?.insert(twin, FlowMapValue::new(conn), 1)?;
-            handoff_map()?.insert(twin, FlowMapValue::new(published.handoff), 1)?;
+            conn_map()?.insert(&twin, &FlowMapValue::new(conn), 1)?;
+            handoff_map()?.insert(&twin, &FlowMapValue::new(published.handoff), 1)?;
             redirect_map()?.insert(
-                RedirectTuple::from_tuples(&twin),
-                FlowMapValue::new(published.redirect),
+                &RedirectTuple::from_tuples(&twin),
+                &FlowMapValue::new(published.redirect),
                 1,
             )?;
         }

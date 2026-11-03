@@ -32,8 +32,14 @@ impl<T: Default> Default for FlowMapValue<T> {
     }
 }
 
+// SAFETY: Only these payloads have an audited padding-free wrapper layout.
+// A generic T: Pod could require alignment greater than the eight-byte prefix.
 #[cfg(not(target_arch = "bpf"))]
-unsafe impl<T: aya::Pod> aya::Pod for FlowMapValue<T> {}
+unsafe impl aya::Pod for FlowMapValue<ConnState> {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FlowMapValue<crate::RedirectEntry> {}
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for FlowMapValue<crate::RoutingHandoffEntry> {}
 
 /// Connection-state payload stored inside [`FlowMapValue`] in CONN_STATE_MAP.
 /// Used by both eBPF programs (for conntrack/lifecycle) and userspace janitor
@@ -337,6 +343,49 @@ pub struct ParseTransportCtx {
     pub frag_id: u32, // IPv4 identification or IPv6 fragment identification, host order
 }
 
+// Every field is counted, including explicit padding and the lock's u32 value.
+const _: () = {
+    use aya_ebpf_bindings::bindings::bpf_spin_lock;
+    use core::mem::size_of;
+    assert!(size_of::<bpf_spin_lock>() == size_of::<u32>());
+    assert!(
+        size_of::<ConnState>()
+            == 1 + 1
+                + 2
+                + 4
+                + 8
+                + size_of::<RoutingMeta>()
+                + 6
+                + 2
+                + TASK_COMM_LEN
+                + 4
+                + 4
+                + 8
+                + 4
+                + 4
+    );
+    assert!(size_of::<UdpDecisionSequence>() == size_of::<bpf_spin_lock>() + 4 + 4);
+    assert!(size_of::<FlowIncarnationSequence>() == size_of::<bpf_spin_lock>() + 4 + 8);
+    assert!(size_of::<RetirementFence>() == 8 + 4 + 4);
+    assert!(size_of::<FragmentKey>() == 16 + 16 + 4 + 1 + 3);
+    assert!(size_of::<FragmentVerdict>() == 4 + 4 + 8);
+    assert!(
+        size_of::<FlowMapValue<ConnState>>()
+            == size_of::<bpf_spin_lock>() + 4 + size_of::<ConnState>()
+    );
+    assert!(
+        size_of::<FlowMapValue<crate::RedirectEntry>>()
+            == size_of::<bpf_spin_lock>() + 4 + size_of::<crate::RedirectEntry>()
+    );
+    assert!(
+        size_of::<FlowMapValue<crate::RoutingHandoffEntry>>()
+            == size_of::<bpf_spin_lock>() + 4 + size_of::<crate::RoutingHandoffEntry>()
+    );
+};
+
+// SAFETY: The sums above exclude implicit padding. RoutingMeta and In6Addr
+// recursively contain only full-width integer variants; all other leaves are
+// integer scalars/arrays. State and flag fields are integers, not Rust enums.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for ConnState {}
 #[cfg(not(target_arch = "bpf"))]

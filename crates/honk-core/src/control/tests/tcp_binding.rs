@@ -720,7 +720,7 @@ fn accepted(family: &str) -> anyhow::Result<()> {
             )?)?;
             sequence.set(
                 0,
-                FlowIncarnationSequence {
+                &FlowIncarnationSequence {
                     next: FIRST_PUBLISHED_INCARNATION - 1,
                     ..Default::default()
                 },
@@ -933,8 +933,8 @@ async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Resu
     let mut next = conns.get(key, aya_obj::generated::BPF_F_LOCK as u64)?.value;
     next.incarnation += 1;
     conns.insert(
-        *key,
-        FlowMapValue::new(next),
+        key,
+        &FlowMapValue::new(next),
         2 | aya_obj::generated::BPF_F_LOCK as u64,
     )?;
     let mut handoff = handoffs
@@ -942,8 +942,8 @@ async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Resu
         .value;
     handoff.incarnation = next.incarnation;
     handoffs.insert(
-        *key,
-        FlowMapValue::new(handoff),
+        key,
+        &FlowMapValue::new(handoff),
         2 | aya_obj::generated::BPF_F_LOCK as u64,
     )?;
     let redirect_key = RedirectTuple::from_tuples(key);

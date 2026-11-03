@@ -11,6 +11,16 @@ pub union In6Addr {
     pub u6_addr64: [u64; 2],
 }
 
+// Each union variant initializes all 16 bytes; integer aliases admit all bits.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<In6Addr>() == 16);
+    assert!(size_of::<[__u8; 16]>() == size_of::<In6Addr>());
+    assert!(size_of::<[__be16; 8]>() == size_of::<In6Addr>());
+    assert!(size_of::<[__be32; 4]>() == size_of::<In6Addr>());
+    assert!(size_of::<[u64; 2]>() == size_of::<In6Addr>());
+};
+
 impl In6Addr {
     /// The all-zeros address `::`.
     pub const fn zero() -> Self {

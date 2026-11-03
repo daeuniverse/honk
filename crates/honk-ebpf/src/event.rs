@@ -85,7 +85,7 @@ pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incar
     } else {
         let _ = FLOW_EXPIRY_HINT.insert(
             key,
-            FlowExpiryHint {
+            &FlowExpiryHint {
                 incarnation,
                 last_hint_ns: now,
             },

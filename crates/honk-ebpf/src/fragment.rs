@@ -31,7 +31,7 @@ fn key(pkt: &ParsedPacket) -> FragmentKey {
 // which already sits near the 512-byte BPF stack limit.
 #[inline(never)]
 pub fn condemned(pkt: &ParsedPacket) -> bool {
-    FRAG_VERDICT.get_ptr(key(pkt)).is_some_and(|recorded| {
+    FRAG_VERDICT.get_ptr(&key(pkt)).is_some_and(|recorded| {
         let age = unsafe { bpf_ktime_get_ns() }.wrapping_sub(unsafe { (*recorded).ktime_ns });
         age <= FRAGMENT_VERDICT_TTL_NS
     })
@@ -50,7 +50,7 @@ pub fn record(verdict: i32) -> i32 {
         return verdict;
     }
     if verdict != TC_ACT_SHOT as i32 && verdict != TC_ACT_REDIRECT as i32 {
-        let _ = FRAG_VERDICT.remove(key(pkt));
+        let _ = FRAG_VERDICT.remove(&key(pkt));
         return verdict;
     }
     if pkt.tuples.five.l4proto == IPPROTO_UDP
@@ -63,6 +63,6 @@ pub fn record(verdict: i32) -> i32 {
         padding: 0,
         ktime_ns: unsafe { bpf_ktime_get_ns() },
     };
-    let _ = FRAG_VERDICT.insert(key(pkt), value, 0);
+    let _ = FRAG_VERDICT.insert(&key(pkt), &value, 0);
     verdict
 }

@@ -1,4 +1,4 @@
-//! Raw extensions for BPF map commands that Aya 0.14 does not expose.
+//! Raw extensions for BPF map commands that Aya does not expose.
 //!
 //! Ordinary map reads, writes, deletes, iteration, and per-CPU access use
 //! Aya's typed map APIs in `real::mod`. This module owns the atomic commands,
