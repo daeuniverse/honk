@@ -1058,8 +1058,8 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 
 | `.github/ci/pins.env` 中的固定项 | 值 |
 | --- | --- |
-| doona 版本 | `0.1.0-rc.4` |
-| 提交 | `58dfe2e2d1bccb1c0363895adb27eb4bfa1e932d` |
+| doona 版本 | `0.1.0-rc.5` |
+| 提交 | `6102778700c6cd15908cf2a76be7121d0355da21` |
 | 压缩包校验和 | `DOONA_SHA256`、`DOONA_LITE_SHA256` |
 
 在仓库根目录执行 `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。脚本依次执行：
@@ -1081,7 +1081,7 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 - 从 [doona 发布页](https://github.com/Zakkaus/doona/releases)下载 `doona-<version>.tar.gz` 与 `doona-fonts-<version>.tar.gz`，解压到同一目录，并让 `ui` 指向该目录。
 - 安装 `doona` 与 `doona-fonts` 软件包，并设置 `ui: /usr/share/doona`。
 
-两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.4`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.4)。发布流程将 `doona-source-0.1.0-rc.4.tar.gz` 附加到正式标签发布与滚动 Debug 发布。该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.4 | gzip -n`（GNU gzip）。
+两种版本共用的 GPL-3.0-only 源码是 doona 标签 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。发布流程将 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式标签发布与滚动 Debug 发布。该包由 `ci/fetch-doona.sh --source` 生成：先确认标签仍指向固定提交，再执行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`（GNU gzip）。
 
 再分发 `native-ui` 二进制时，须保留声明，并按 GPL-3.0 第 6 条允许的方式提供对应源码。
 
