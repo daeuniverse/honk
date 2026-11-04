@@ -579,6 +579,109 @@ async fn a_failed_direct_download_names_no_node() {
     );
 }
 
+/// A rejecting answer, such as an expired token, is staged by its status,
+/// through a node or direct, and keeps the status in its message.
+#[tokio::test]
+async fn a_rejected_status_is_staged_with_the_node_it_went_through() {
+    for (status, stage) in [
+        ("403 Forbidden", "http_status_rejected"),
+        ("404 Not Found", "http_not_found"),
+        ("503 Service Unavailable", "http_status_rejected"),
+    ] {
+        let (address, _) = serve(move |_| {
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        })
+        .await;
+        for (detour, rules, via) in [
+            (
+                "",
+                "proxy",
+                Some(Via {
+                    node: "tunnel".into(),
+                    group: Some("proxy".into()),
+                }),
+            ),
+            ("", "direct", None),
+            ("direct", "proxy", None),
+        ] {
+            let (routing, _) = routing(rules);
+            let error = manager(routing)
+                .fetch(&subscription(address, detour))
+                .await
+                .unwrap_err();
+            assert_eq!(failure_code(&error), "fetch_failed", "{error:#}");
+            assert_eq!(
+                error.to_string(),
+                format!("subscription server answered HTTP {status}")
+            );
+            assert_eq!(
+                failure_stage(&error),
+                Some(FetchFailure { stage, via }),
+                "{status} via {detour:?} {rules}"
+            );
+        }
+    }
+}
+
+/// The direct client's connection refusal is staged, and an unusable URL is not.
+#[tokio::test]
+async fn a_direct_connection_refusal_is_staged_and_an_invalid_url_is_not() {
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let (outbounds, _) = routing("proxy");
+    let error = manager(outbounds)
+        .fetch(&subscription(closed, "direct"))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "subscription 'own-provider': download failed: connection_failed"
+    );
+    assert_eq!(
+        failure_stage(&error),
+        Some(FetchFailure {
+            stage: "connection_failed",
+            via: None,
+        })
+    );
+    let (outbounds, _) = routing("proxy");
+    let mut invalid = subscription(closed, "direct");
+    invalid.url = "ftp://127.0.0.1/sub".into();
+    let error = manager(outbounds).fetch(&invalid).await.unwrap_err();
+    assert_eq!(failure_stage(&error), None, "{error:#}");
+}
+
+#[test]
+fn direct_errors_map_to_the_stage_their_cause_names() {
+    use std::io::{Error, ErrorKind};
+    let stage = |error: Error| super::super::direct_stage(&anyhow::Error::new(error));
+    assert_eq!(
+        stage(Error::from(ErrorKind::ConnectionRefused)),
+        Some("connection_failed")
+    );
+    assert_eq!(
+        stage(Error::from(ErrorKind::TimedOut)),
+        Some("download_timeout")
+    );
+    assert_eq!(
+        stage(Error::new(ErrorKind::NotFound, "no DNS addresses")),
+        Some("resolution_failed")
+    );
+    assert_eq!(
+        stage(Error::other(
+            tokio_rustls::rustls::Error::HandshakeNotComplete
+        )),
+        Some("tls_failed")
+    );
+    assert_eq!(stage(Error::from(ErrorKind::InvalidInput)), None);
+    assert_eq!(
+        super::super::direct_stage(&anyhow::anyhow!("bad URL")),
+        None
+    );
+}
+
 /// A body that is no subscription is told apart from a failed download.
 #[tokio::test]
 async fn an_unusable_body_is_a_parse_failure_not_a_download_failure() {

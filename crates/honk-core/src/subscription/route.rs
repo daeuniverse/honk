@@ -34,6 +34,28 @@ pub(crate) struct DownloadFailed {
     subscription: String,
     stage: &'static str,
     via: Option<Via>,
+    /// The rejecting answer, for the stages that come from a status.
+    status: Option<http::StatusCode>,
+}
+
+impl DownloadFailed {
+    /// The server answered with a client or server error, as an expired
+    /// subscription token does. Geodata stages the same statuses alike.
+    pub(crate) fn status(
+        subscription: &Subscription,
+        status: http::StatusCode,
+        via: Option<Via>,
+    ) -> Self {
+        Self {
+            subscription: subscription.name.clone(),
+            stage: match status {
+                http::StatusCode::NOT_FOUND => "http_not_found",
+                _ => "http_status_rejected",
+            },
+            via,
+            status: Some(status),
+        }
+    }
 }
 
 impl std::fmt::Display for DownloadFailed {
@@ -42,7 +64,11 @@ impl std::fmt::Display for DownloadFailed {
             subscription,
             stage,
             via,
+            status,
         } = self;
+        if let Some(status) = status {
+            return write!(f, "subscription server answered HTTP {status}");
+        }
         match (*stage, via) {
             ("asset_too_large", _) => write!(
                 f,
@@ -107,6 +133,9 @@ pub(crate) fn failure_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
+/// A hop's answer and the node that carried it, or the stage it failed at and the node.
+type Attempt = Result<(Reply, Option<Via>), (&'static str, Option<Via>)>;
+
 /// Where each request of a subscription fetch goes.
 pub(super) enum Hop<'a> {
     /// Straight to the host on the marked client, outside routing.
@@ -129,9 +158,9 @@ impl Hop<'_> {
         url: &reqwest::Url,
         headers: &http::HeaderMap,
         deadline: Instant,
-    ) -> anyhow::Result<Reply> {
+    ) -> anyhow::Result<(Reply, Option<Via>)> {
         let max_bytes = super::MAX_SUBSCRIPTION_BYTES;
-        let reply: Result<Reply, (&'static str, Option<Via>)> = match self {
+        let reply: Attempt = match self {
             Self::Direct(client) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
@@ -140,11 +169,13 @@ impl Hop<'_> {
                         Ok(response) => {
                             marked_http::read(response, wants_body, deadline.into(), max_bytes)
                                 .await
+                                .map(|reply| (reply, None))
                                 .map_err(|error| (error.stage, None))
                         }
-                        // A failure without a stage keeps its own message.
-                        Err(error) => match error.downcast_ref::<marked_http::Error>() {
-                            Some(failed) => Err((failed.stage, None)),
+                        // A failure that fits no stage, such as an invalid URL,
+                        // keeps its own message.
+                        Err(error) => match direct_stage(&error) {
+                            Some(stage) => Err((stage, None)),
                             None => return Err(error),
                         },
                     },
@@ -170,7 +201,7 @@ impl Hop<'_> {
                     )
                     .await;
                 match fetched {
-                    Ok((reply, _)) => Ok(reply),
+                    Ok((reply, _, via)) => Ok((reply, via)),
                     Err(Failed::Stage(stage, via)) => Err((stage, via)),
                     Err(Failed::Route(error)) => {
                         return Err(match error.downcast_ref::<NoUsableNode>() {
@@ -189,9 +220,33 @@ impl Hop<'_> {
                 subscription: subscription.name.clone(),
                 stage,
                 via,
+                status: None,
             })
         })
     }
+}
+
+/// The stage of an error the direct client returns without one, from what it
+/// wraps: a timed-out socket, a TLS failure inside the handshake's io error, a
+/// lookup that found no address, or else any other connect error. Nothing
+/// else (an invalid URL, an unsupported scheme) names a stage.
+fn direct_stage(error: &anyhow::Error) -> Option<&'static str> {
+    if let Some(failed) = error.downcast_ref::<marked_http::Error>() {
+        return Some(failed.stage);
+    }
+    let io = error.downcast_ref::<std::io::Error>()?;
+    if io
+        .get_ref()
+        .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
+    {
+        return Some("tls_failed");
+    }
+    Some(match io.kind() {
+        std::io::ErrorKind::TimedOut => "download_timeout",
+        std::io::ErrorKind::NotFound => "resolution_failed",
+        std::io::ErrorKind::InvalidInput => return None,
+        _ => "connection_failed",
+    })
 }
 
 /// The body of every answer that is neither followed nor failed.

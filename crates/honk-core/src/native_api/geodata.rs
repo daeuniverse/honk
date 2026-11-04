@@ -649,6 +649,7 @@ async fn exchange(
         Some((outbounds, detour)) => outbounds
             .fetch(detour, DETOUR_SETTING, PURPOSE, &request, &mut None)
             .await
+            .map(|(reply, group, _)| (reply, group))
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",
                 Failed::Stage(stage, _) => stage,

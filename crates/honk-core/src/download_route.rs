@@ -361,7 +361,7 @@ impl From<&'static str> for Failed {
 impl Outbounds<'_> {
     /// Makes `request` through `detour`: straight to its host, or through the
     /// node the detour or the routing rules choose, whose tunnel is closed
-    /// after. Also returns the group the route went through. `setting` and
+    /// after. Also returns the group and the node the route went through. `setting` and
     /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
     /// deadline's `headers`. `original` is the first admitted Score business of
     /// a redirect chain; later hops of the chain continue it instead of
@@ -373,9 +373,9 @@ impl Outbounds<'_> {
         purpose: &str,
         request: &Request<'_>,
         original: &mut Option<ScoreContinuation>,
-    ) -> Result<(Reply, Option<String>), Failed> {
+    ) -> Result<(Reply, Option<String>, Option<Via>), Failed> {
         let (detour, strict_resolver) = match detour {
-            Detour::Direct => return Ok((fetch_direct(request).await?, None)),
+            Detour::Direct => return Ok((fetch_direct(request).await?, None, None)),
             Detour::Routing => (None, None),
             Detour::Group(group) => (Some(group), request.bootstrap),
         };
@@ -421,8 +421,11 @@ impl Outbounds<'_> {
         if let Some(business) = business {
             business.finish(settlement(&reply));
         }
-        let reply = reply.map_err(|stage| Failed::Stage(stage, via))?;
-        Ok((reply, decision.group))
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(stage) => return Err(Failed::Stage(stage, via)),
+        };
+        Ok((reply, decision.group, via))
     }
 
     async fn fetch_through(
