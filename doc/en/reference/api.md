@@ -821,7 +821,7 @@ Name/type/expiry selection happens before snapshot byte admission and cloning. U
 
 Every page also carries `usage {entries, entry_capacity}` for the whole runtime cache at snapshot time, ignoring the filters. `entry_capacity` is `max_cache_size` after clamping to 1–100,000. Both values are decimal strings, taken while every shard is locked, and later pages of one snapshot repeat them.
 
-Eviction is per shard, so one hot shard can evict while the totals still show headroom. `usage.entries` also counts expired and non-exact slots that `total` excludes.
+Eviction is per shard and also bounded by cached answer bytes, so a shard can evict while the totals still show headroom. `usage.entries` also counts expired and non-exact slots that `total` excludes.
 
 `DELETE /dns/cache/{entry_id}` takes no body/query and returns `{deleted}`. `DELETE /dns/cache?name=...&type=A` takes no body and returns `{matched,deleted}` (omit types to select all types for that name). `POST /dns/cache/flush` accepts an empty body or JSON `{}` and returns `{matched,deleted}`.
 

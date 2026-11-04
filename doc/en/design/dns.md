@@ -206,7 +206,7 @@ Configured ECS is a generation-pinned named-upstream transport policy, not ingre
 
 | Mechanism | Invariant |
 | --- | --- |
-| Capacity | At most 16 LRU shards divide `max_cache_size` exactly. Each shard is bounded by entry count only; `max_cache_size` is clamped to 100,000. |
+| Capacity | At most 16 LRU shards divide `max_cache_size` exactly (clamped to 1–100,000). Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`; individual answers over 65,535 bytes are not cached. |
 | Positive TTL | `fixed_domain_ttl` has first priority; zero disables caching for that domain. Otherwise nonzero `optimistic_cache_ttl` overrides the answer minimum TTL. With neither override, a positive NOERROR response uses the minimum of all walked non-OPT record TTLs, including zero; zero supersedes the exact slot without caching. The selected nonzero TTL is also written into cached records. Failure rcodes keep their existing TTL extraction. |
 | Negative TTL | NXDOMAIN uses `min(SOA TTL, SOA MINIMUM, 300)` seconds; missing SOA or zero lifetime supersedes the exact slot without retaining the response. SERVFAIL still defaults to 60 seconds and clamps the SOA-derived lifetime to `1..=300`. `fixed_domain_ttl: 0` prevents caching for every response code without superseding an existing entry. |
 | NODATA TTL | NOERROR with `ANCOUNT=0` retains its full wire in the positive slot. A nonzero `fixed_domain_ttl` overrides SOA and the cap; otherwise lifetime is `min(SOA TTL, SOA MINIMUM, 300)`, with missing SOA or zero superseding the exact slot without caching. `optimistic_cache_ttl` does not apply. NODATA remains stale-eligible; stale rewriting changes SOA TTL, not MINIMUM. |
