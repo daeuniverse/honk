@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
+use super::route::FetchFailure;
 use super::{SubscriptionManager, SubscriptionStore, SubscriptionUserinfo};
 use crate::control::ControlCommand;
 use crate::control::ReloadOutcome;
@@ -25,7 +26,7 @@ pub(crate) struct SubscriptionMergeReply {
     pub(crate) rejection: Option<&'static str>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ProviderLoad {
     pub(crate) updated_at: Option<SystemTime>,
     pub(crate) userinfo: SubscriptionUserinfo,
@@ -33,6 +34,8 @@ pub(crate) struct ProviderLoad {
     pub(crate) error: Option<&'static str>,
     /// The configuration diagnostic code behind a `publication_rejected` error.
     pub(crate) rejection: Option<&'static str>,
+    /// Where the last fetch failed, kept until a fetch succeeds.
+    pub(crate) fetch: Option<FetchFailure>,
 }
 
 /// Why the supervisor refused an explicit provider refresh.
@@ -270,6 +273,8 @@ async fn fetch_once(
 struct Flight {
     authorized: AuthorizedSubscription,
     userinfo: SubscriptionUserinfo,
+    /// Where the fetch failed, for the provider status.
+    failure: Option<FetchFailure>,
     #[cfg(feature = "native-api")]
     operation: Option<Box<dyn RefreshReport>>,
 }
@@ -323,6 +328,7 @@ impl SupervisorState {
             Flight {
                 authorized: provider.authorized.clone(),
                 userinfo: SubscriptionUserinfo::default(),
+                failure: None,
                 #[cfg(feature = "native-api")]
                 operation: None,
             },
@@ -452,9 +458,10 @@ impl SupervisorState {
                     matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                         .then_some("publication_degraded");
                 observed.load.rejection = None;
-                observed.load
+                observed.load.fetch = None;
+                observed.load.clone()
             }
-            (Err("supervisor_stopped"), Some(observed)) => observed.load,
+            (Err("supervisor_stopped"), Some(observed)) => observed.load.clone(),
             (_, Some(observed)) => {
                 observed.load.error = Some(
                     result
@@ -464,7 +471,8 @@ impl SupervisorState {
                         .unwrap_or("publication_rejected"),
                 );
                 observed.load.rejection = result.as_ref().ok().and_then(|reply| reply.rejection);
-                observed.load
+                observed.load.fetch = flight.failure;
+                observed.load.clone()
             }
             (Ok(reply), None) if reply.outcome.accepted() => ProviderLoad {
                 updated_at: Some(SystemTime::now()),
@@ -473,6 +481,7 @@ impl SupervisorState {
                 error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                     .then_some("publication_degraded"),
                 rejection: None,
+                fetch: None,
             },
             _ => ProviderLoad::default(),
         };
@@ -537,6 +546,9 @@ impl SupervisorState {
                         "Subscription refresh retry failed; keeping active nodes"
                     );
                 }
+                if let Some(flight) = self.flights.get_mut(&id) {
+                    flight.failure = super::failure_stage(&error);
+                }
                 self.finish(id, Err(super::failure_code(&error)));
             }
             None => self.finish(id, Err("supervisor_stopped")),
@@ -572,6 +584,7 @@ impl SupervisorState {
             Flight {
                 authorized: provider.authorized.clone(),
                 userinfo: SubscriptionUserinfo::default(),
+                failure: None,
                 operation: Some(operation),
             },
         );
@@ -805,7 +818,7 @@ impl SubscriptionSupervisorHandle {
             .read()
             .get(&subscription.id)
             .filter(|observed| same_worker_spec(&observed.subscription, subscription))
-            .map(|observed| observed.load)
+            .map(|observed| observed.load.clone())
             .unwrap_or_default()
     }
 

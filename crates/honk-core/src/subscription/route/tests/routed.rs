@@ -15,8 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
-use super::super::failure_code;
-use crate::download_route::SharedOutbounds;
+use super::super::{FetchFailure, failure_code, failure_stage};
+use crate::download_route::{SharedOutbounds, Via};
 use crate::routing::Router;
 use crate::subscription::SubscriptionManager;
 #[cfg(feature = "native-api")]
@@ -70,9 +70,10 @@ async fn server() -> (SocketAddr, Heads) {
     serve(|_| ok()).await
 }
 
-/// A tunnel that connects to the target itself.
+/// A tunnel that connects to the target itself, or refuses to when `refuse`.
 struct Tunnel {
     dials: Arc<AtomicUsize>,
+    refuse: bool,
 }
 
 #[async_trait::async_trait]
@@ -85,6 +86,7 @@ impl TcpOutbound for Tunnel {
         _connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
         self.dials.fetch_add(1, Ordering::SeqCst);
+        anyhow::ensure!(!self.refuse, "node unreachable");
         Ok(ProxyStream {
             stream: Box::new(tokio::net::TcpStream::connect(target).await?),
             target_addr: target,
@@ -97,6 +99,11 @@ impl TcpOutbound for Tunnel {
 /// none, like a group of nodes a subscription has not delivered yet. The rules
 /// send loopback traffic to `target`.
 fn routing(target: &str) -> (SharedOutbounds, Arc<AtomicUsize>) {
+    routing_via(target, false)
+}
+
+/// As [`routing`], with a node that cannot connect when `refuse`.
+fn routing_via(target: &str, refuse: bool) -> (SharedOutbounds, Arc<AtomicUsize>) {
     let mut node = Node {
         name: "tunnel".into(),
         outbound: OutboundConfig::from_protocol(NodeProtocol::Socks5),
@@ -137,6 +144,7 @@ fn routing(target: &str) -> (SharedOutbounds, Arc<AtomicUsize>) {
         NodeProtocol::Socks5,
         Arc::new(Tunnel {
             dials: Arc::clone(&dials),
+            refuse,
         }),
     ));
     let routing = SharedOutbounds {
@@ -263,6 +271,7 @@ fn scored_routing() -> (SharedOutbounds, Arc<AtomicUsize>, [Node; 2]) {
         NodeProtocol::Socks5,
         Arc::new(Tunnel {
             dials: Arc::clone(&dials),
+            refuse: false,
         }),
     ));
     let routing = SharedOutbounds {
@@ -506,10 +515,135 @@ async fn cached_content_keeps_working_while_the_route_cannot_carry_the_fetch() {
     .await
     .unwrap();
     assert_eq!(load.error, Some("route_unavailable"));
+    assert_eq!(load.fetch, None);
     assert!(load.cached, "the restored nodes stay in service");
     assert!(requests.lock().is_empty(), "never fetched direct");
     let cached = store.load_nodes(&sub).await.unwrap().unwrap();
     assert_eq!(cached.len(), 1);
+    supervisor.shutdown().await.unwrap();
+}
+
+/// A download that fails names the node and group it went through, so the log
+/// and the provider status point at the outbound to fix.
+#[tokio::test]
+async fn a_failed_routed_download_names_the_node_and_group() {
+    let (address, requests) = server().await;
+    let (routing, dials) = routing_via("proxy", true);
+    let error = manager(routing)
+        .fetch(&subscription(address, ""))
+        .await
+        .unwrap_err();
+    assert_eq!(dials.load(Ordering::SeqCst), 1);
+    assert_eq!(failure_code(&error), "fetch_failed", "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "subscription 'own-provider': download through node 'tunnel' of group 'proxy' failed: connection_failed; set route: direct for this subscription to fetch it outside routing"
+    );
+    assert_eq!(
+        failure_stage(&error),
+        Some(FetchFailure {
+            stage: "connection_failed",
+            via: Some(Via {
+                node: "tunnel".into(),
+                group: Some("proxy".into()),
+            }),
+        })
+    );
+    assert!(requests.lock().is_empty(), "never fetched direct");
+}
+
+/// A download the rules send straight to its host has no node to name.
+#[tokio::test]
+async fn a_failed_direct_download_names_no_node() {
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+    let (routing, dials) = routing("direct");
+    let error = manager(routing)
+        .fetch(&subscription(closed, ""))
+        .await
+        .unwrap_err();
+    assert_eq!(dials.load(Ordering::SeqCst), 0);
+    assert_eq!(failure_code(&error), "fetch_failed", "{error:#}");
+    assert_eq!(
+        error.to_string(),
+        "subscription 'own-provider': download failed: connection_failed"
+    );
+    assert_eq!(
+        failure_stage(&error),
+        Some(FetchFailure {
+            stage: "connection_failed",
+            via: None,
+        })
+    );
+}
+
+/// A body that is no subscription is told apart from a failed download.
+#[tokio::test]
+async fn an_unusable_body_is_a_parse_failure_not_a_download_failure() {
+    let (address, _) =
+        serve(|_| "HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\ninvalid body")
+            .await;
+    for detour in ["direct", ""] {
+        let (routing, _) = routing("direct");
+        let error = manager(routing)
+            .fetch(&subscription(address, detour))
+            .await
+            .unwrap_err();
+        assert_eq!(failure_code(&error), "fetch_failed", "{error:#}");
+        assert_eq!(
+            failure_stage(&error),
+            Some(FetchFailure {
+                stage: "parse_failed",
+                via: None,
+            }),
+            "{error:#}"
+        );
+    }
+}
+
+/// A failure the supervisor observes carries the stage and node to the
+/// provider status, and a route with no usable node carries none.
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn the_supervisor_records_where_a_fetch_failed() {
+    let (address, _) = server().await;
+    let mut config = Config {
+        subscriptions: vec![subscription(address, "")],
+        ..Default::default()
+    };
+    let sub = config.subscriptions[0].clone();
+    let mut supervisor = SubscriptionSupervisor::prepare(&mut config, None, Vec::new())
+        .await
+        .unwrap();
+    let (routing, _) = routing_via("proxy", true);
+    supervisor.route_through(routing);
+    let (merge_tx, _merges) = tokio::sync::mpsc::channel(4);
+    supervisor.start(merge_tx);
+    let handle = supervisor.handle();
+    let load = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let load = handle.observation(&sub);
+            if load.error.is_some() {
+                return load;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(load.error, Some("fetch_failed"));
+    assert_eq!(
+        load.fetch,
+        Some(FetchFailure {
+            stage: "connection_failed",
+            via: Some(Via {
+                node: "tunnel".into(),
+                group: Some("proxy".into()),
+            }),
+        })
+    );
     supervisor.shutdown().await.unwrap();
 }
 

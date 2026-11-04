@@ -823,7 +823,7 @@ action 为 `upstream` 或 `requery` 时，`upstream` 为引擎使用的小写名
 
 真实失败且无节点才是 error，保留旧/缓存节点时为 stale。订阅条目还带有 `download`，即由 `download_detour` 决定的拉取路由，结构与 geodata 路由相同：`route` 为 `routing`、`direct` 或 `group`，`group_id` 为该组在 `GET /groups` 中的 ID，其他路由或组已不存在时为 null。文件与内联条目为 null。
 
-拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
+拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。`fetch_failed` 的 `details` 给出失败阶段 `stage`（例如 `connection_failed`、`download_timeout`、`tls_failed`、`parse_failed`）、承载下载的节点 `node` 和选中该节点的组 `group_id`；未经节点或组时 `node`、`group_id` 为 `null`。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
 
 失败的 refresh 操作带相同的 details。列表 `limit` 默认 100、范围 1–1000，快照上限 8 份/30 秒/4 MiB，容量不足时返回 `503 snapshot_unavailable` 并带 `Retry-After`。游标无法识别时同样返回 `410 snapshot_expired`，带不同过滤器或 `limit` 的已识别游标返回 `400 invalid_request`。
 

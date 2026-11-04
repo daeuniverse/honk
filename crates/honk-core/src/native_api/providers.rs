@@ -26,7 +26,7 @@ use super::{
 use crate::{
     control::ReloadOutcome,
     subscription::{
-        ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
+        FetchFailure, ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
         SubscriptionSupervisorHandle,
     },
 };
@@ -70,6 +70,10 @@ struct ProviderError {
     code: &'static str,
     message: &'static str,
     details: Option<Value>,
+    /// The group a failed download went through, until `routed` swaps it for
+    /// its id in `details`.
+    #[serde(skip)]
+    group: Option<String>,
 }
 
 /// The message for a failure code that says more than the generic one.
@@ -85,6 +89,16 @@ fn error_message(code: &str) -> Option<&'static str> {
 /// Names the configuration diagnostic that rejected a publication.
 fn rejection_details(rejection: Option<&'static str>) -> Option<Value> {
     rejection.map(|code| json!({"diagnostic_code": code}))
+}
+
+/// Names the stage a fetch failed at and the node that carried it. `group_id`
+/// stays null until `Provider::routed` can look the group up.
+fn fetch_details(failure: &FetchFailure) -> Value {
+    json!({
+        "stage": failure.stage,
+        "node": failure.via.as_ref().map(|via| &via.node),
+        "group_id": null,
+    })
 }
 
 impl Provider {
@@ -142,7 +156,12 @@ impl Provider {
                 message: error_message(code).unwrap_or(
                     "Provider loading or runtime publication did not complete successfully.",
                 ),
-                details: rejection_details(load.rejection),
+                details: load
+                    .fetch
+                    .as_ref()
+                    .map(fetch_details)
+                    .or_else(|| rejection_details(load.rejection)),
+                group: load.fetch.and_then(|fetch| fetch.via?.group),
             }),
             download: None,
         }
@@ -154,6 +173,12 @@ impl Provider {
         subscription: &Subscription,
         group_id: impl Fn(&str) -> Option<String>,
     ) -> Self {
+        if let Some(error) = self.last_error.as_mut()
+            && let Some(group) = error.group.take()
+            && let Some(Value::Object(details)) = error.details.as_mut()
+        {
+            details.insert("group_id".into(), json!(group_id(&group)));
+        }
         self.download = Some(
             super::geodata::Route::from_detour(&subscription.download_detour)
                 .unwrap_or_default()
@@ -173,6 +198,14 @@ impl Provider {
         };
         for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
             *value = secrets.mask(value).0;
+        }
+        if let Some(Value::Object(details)) = self
+            .last_error
+            .as_mut()
+            .and_then(|error| error.details.as_mut())
+            && let Some(Value::String(node)) = details.get_mut("node")
+        {
+            *node = secrets.mask(node).0;
         }
         self
     }

@@ -6,7 +6,7 @@ use honk_config::subscription::Subscription;
 use honk_outbound::group::ScoreContinuation;
 use tokio::time::Instant;
 
-use crate::download_route::{Detour, Failed, NoUsableNode, Request};
+use crate::download_route::{Detour, Failed, NoUsableNode, Request, Via};
 use crate::marked_http::{self, Reply};
 
 pub(crate) type Routing = crate::download_route::SharedOutbounds;
@@ -25,6 +25,77 @@ pub(crate) fn direct(subscription: &Subscription) -> bool {
 pub(crate) struct RouteUnavailable {
     subscription: String,
     outbound: String,
+}
+
+/// The download failed at `stage`, through `via` when a node carried it. The
+/// message names the outbound, so the log shows which node to look at.
+#[derive(Debug)]
+pub(crate) struct DownloadFailed {
+    subscription: String,
+    stage: &'static str,
+    via: Option<Via>,
+}
+
+impl std::fmt::Display for DownloadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            subscription,
+            stage,
+            via,
+        } = self;
+        match (*stage, via) {
+            ("asset_too_large", _) => write!(
+                f,
+                "subscription body exceeds {} bytes",
+                super::MAX_SUBSCRIPTION_BYTES
+            ),
+            ("route_blocked", _) => {
+                f.write_str("routing sends the subscription download to 'block'")
+            }
+            (_, None) => write!(f, "subscription '{subscription}': download failed: {stage}"),
+            (_, Some(Via { node, group })) => {
+                write!(
+                    f,
+                    "subscription '{subscription}': download through node '{node}'"
+                )?;
+                if let Some(group) = group {
+                    write!(f, " of group '{group}'")?;
+                }
+                write!(
+                    f,
+                    " failed: {stage}; set route: direct for this subscription to fetch it outside routing"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for DownloadFailed {}
+
+/// Where and why a fetch failed, for the provider status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FetchFailure {
+    pub(crate) stage: &'static str,
+    pub(crate) via: Option<Via>,
+}
+
+/// The stage a failed fetch stopped at: a download stage, or `parse_failed`
+/// when the body arrived but is not a usable subscription. Content errors are
+/// the only `DetailedConfigError`s a fetch returns. `None` for failures that
+/// name no stage, such as an invalid URL.
+pub(crate) fn failure_stage(error: &anyhow::Error) -> Option<FetchFailure> {
+    if let Some(failed) = error.downcast_ref::<DownloadFailed>() {
+        return Some(FetchFailure {
+            stage: failed.stage,
+            via: failed.via.clone(),
+        });
+    }
+    error
+        .downcast_ref::<honk_config::error::DetailedConfigError>()
+        .map(|_| FetchFailure {
+            stage: "parse_failed",
+            via: None,
+        })
 }
 
 /// The provider status code for a failed fetch.
@@ -60,16 +131,23 @@ impl Hop<'_> {
         deadline: Instant,
     ) -> anyhow::Result<Reply> {
         let max_bytes = super::MAX_SUBSCRIPTION_BYTES;
-        let reply = match self {
+        let reply: Result<Reply, (&'static str, Option<Via>)> = match self {
             Self::Direct(client) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
-                    Err(_) => Err("download_timeout"),
-                    Ok(response) => {
-                        marked_http::read(response?, wants_body, deadline.into(), max_bytes)
-                            .await
-                            .map_err(|error| error.stage)
-                    }
+                    Err(_) => Err(("download_timeout", None)),
+                    Ok(response) => match response {
+                        Ok(response) => {
+                            marked_http::read(response, wants_body, deadline.into(), max_bytes)
+                                .await
+                                .map_err(|error| (error.stage, None))
+                        }
+                        // A failure without a stage keeps its own message.
+                        Err(error) => match error.downcast_ref::<marked_http::Error>() {
+                            Some(failed) => Err((failed.stage, None)),
+                            None => return Err(error),
+                        },
+                    },
                 }
             }
             Self::Routed { routing, original } => {
@@ -93,7 +171,7 @@ impl Hop<'_> {
                     .await;
                 match fetched {
                     Ok((reply, _)) => Ok(reply),
-                    Err(Failed::Stage(stage)) => Err(stage),
+                    Err(Failed::Stage(stage, via)) => Err((stage, via)),
                     Err(Failed::Route(error)) => {
                         return Err(match error.downcast_ref::<NoUsableNode>() {
                             Some(unusable) => anyhow::Error::new(RouteUnavailable {
@@ -106,12 +184,12 @@ impl Hop<'_> {
                 }
             }
         };
-        reply.map_err(|stage| match stage {
-            "asset_too_large" => anyhow::anyhow!("subscription body exceeds {max_bytes} bytes"),
-            "route_blocked" => {
-                anyhow::anyhow!("routing sends the subscription download to 'block'")
-            }
-            stage => anyhow::anyhow!("subscription download failed: {stage}"),
+        reply.map_err(|(stage, via)| {
+            anyhow::Error::new(DownloadFailed {
+                subscription: subscription.name.clone(),
+                stage,
+                via,
+            })
         })
     }
 }

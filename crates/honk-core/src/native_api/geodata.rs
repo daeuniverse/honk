@@ -651,7 +651,7 @@ async fn exchange(
             .await
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",
-                Failed::Stage(stage) => stage,
+                Failed::Stage(stage, _) => stage,
             })?,
     };
     match reply.status {

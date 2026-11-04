@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     control::{ControlCommand, ControlPlane},
     dns::DnsResolver,
+    download_route::Via,
     ebpf::mock::MockEbpfBackend,
     native_api::NativeServer,
     routing::Router,
@@ -416,6 +417,10 @@ async fn failed_initial_fetch_is_error_without_fabricated_success_time() {
     assert_eq!(provider["node_count"], 0);
     assert!(provider["updated_at"].is_null());
     assert_eq!(provider["last_error"]["code"], "fetch_failed");
+    assert_eq!(
+        provider["last_error"]["details"],
+        json!({"stage": "parse_failed", "node": null, "group_id": null})
+    );
     fixture.stop().await;
     origin.stop().await;
 }
@@ -667,6 +672,92 @@ fn provider_rows_report_the_download_route_like_geodata() {
     );
 }
 
+/// The provider list for one subscription whose last fetch failed as `fetch`.
+fn failed_fetch(config: &Config, name: &str, fetch: Option<FetchFailure>) -> Value {
+    let mut config = config.clone();
+    config.subscriptions.push(Subscription {
+        name: name.into(),
+        url: "https://example.test/sub".into(),
+        ..Default::default()
+    });
+    let subscription = config.subscriptions.last().unwrap();
+    let load = ProviderLoad {
+        error: Some("fetch_failed"),
+        fetch,
+        ..Default::default()
+    };
+    let group_id = |name: &str| (name == "proxy").then(|| "group-proxy".to_owned());
+    serde_json::to_value(
+        Provider::observed(subscription, load, 0)
+            .routed(subscription, group_id)
+            .mask_listener_secrets(&config, None),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
+    let config = Config::default();
+    let through = |node: &str, group: Option<&str>| FetchFailure {
+        stage: "connection_failed",
+        via: Some(Via {
+            node: node.into(),
+            group: group.map(str::to_owned),
+        }),
+    };
+    let row = failed_fetch(&config, "p", Some(through("hk-1", Some("proxy"))));
+    assert_eq!(row["last_error"]["code"], "fetch_failed");
+    assert_eq!(
+        row["last_error"]["details"],
+        json!({"stage": "connection_failed", "node": "hk-1", "group_id": "group-proxy"})
+    );
+    // A group the catalog does not know, and a node chosen without a group.
+    for group in [Some("gone"), None] {
+        let row = failed_fetch(&config, "p", Some(through("hk-1", group)));
+        assert_eq!(
+            row["last_error"]["details"],
+            json!({"stage": "connection_failed", "node": "hk-1", "group_id": null})
+        );
+    }
+    let direct = FetchFailure {
+        stage: "download_timeout",
+        via: None,
+    };
+    assert_eq!(
+        failed_fetch(&config, "p", Some(direct))["last_error"]["details"],
+        json!({"stage": "download_timeout", "node": null, "group_id": null})
+    );
+    let parse = FetchFailure {
+        stage: "parse_failed",
+        via: None,
+    };
+    assert_eq!(
+        failed_fetch(&config, "p", Some(parse))["last_error"]["details"]["stage"],
+        "parse_failed"
+    );
+    // A failure that names no stage reports none.
+    assert_eq!(
+        failed_fetch(&config, "p", None)["last_error"]["details"],
+        Value::Null
+    );
+}
+
+#[test]
+fn a_failed_fetch_masks_listener_values_in_the_node_name() {
+    let mut config = Config::default();
+    config.experimental.native_api.secret = "native-listener-token".into();
+    let fetch = FetchFailure {
+        stage: "connection_failed",
+        via: Some(Via {
+            node: "node-native-listener-token".into(),
+            group: None,
+        }),
+    };
+    let row = failed_fetch(&config, "p", Some(fetch));
+    assert_eq!(row["last_error"]["details"]["node"], "node-<redacted>");
+    assert!(!row.to_string().contains("native-listener-token"));
+}
+
 #[tokio::test]
 async fn refresh_results_keep_full_urls_except_listener_values() {
     let mut origin = Origin::new().await;
@@ -843,6 +934,7 @@ fn retained_bytes_charge_the_owned_route_and_error_json() {
         code: "rejected",
         message: "rejected",
         details: Some(json!({"diagnostic_code": "d".repeat(100)})),
+        group: None,
     });
     assert!(owned.retained_bytes() >= bare.retained_bytes() + 64 + 100);
 }

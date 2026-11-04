@@ -335,17 +335,26 @@ pub(crate) struct Request<'a> {
     pub(crate) bootstrap: Option<&'a str>,
 }
 
+/// The outbound a download went through: the node that carried it, and the
+/// group that chose the node when one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Via {
+    pub(crate) node: String,
+    pub(crate) group: Option<String>,
+}
+
 /// Why a routed download failed.
 pub(crate) enum Failed {
     /// The detour names no outbound, or the chosen one has no usable node.
     Route(anyhow::Error),
-    /// The stage that failed.
-    Stage(&'static str),
+    /// The stage that failed, and the outbound it went through; `None` before
+    /// a node was chosen and for direct downloads.
+    Stage(&'static str, Option<Via>),
 }
 
 impl From<&'static str> for Failed {
     fn from(stage: &'static str) -> Self {
-        Self::Stage(stage)
+        Self::Stage(stage, None)
     }
 }
 
@@ -401,6 +410,10 @@ impl Outbounds<'_> {
             decision.group.as_deref(),
             purpose,
         )?;
+        let via = node.as_ref().map(|node| Via {
+            node: node.name.clone(),
+            group: decision.group.clone(),
+        });
         let reply = match node {
             None => fetch_direct(request).await,
             Some(node) => self.fetch_through(&node, purpose, request).await,
@@ -408,7 +421,7 @@ impl Outbounds<'_> {
         if let Some(business) = business {
             business.finish(settlement(&reply));
         }
-        let reply = reply?;
+        let reply = reply.map_err(|stage| Failed::Stage(stage, via))?;
         Ok((reply, decision.group))
     }
 

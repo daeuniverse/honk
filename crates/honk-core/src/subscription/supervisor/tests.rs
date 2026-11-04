@@ -59,7 +59,7 @@ fn rejected_publication_ends_pending_fetch_backoff() {
     assert!(
         next_deadline(&state.providers[&id]).unwrap() >= rejected_at + Duration::from_secs(86400)
     );
-    let load = state.observations.read()[&id].load;
+    let load = state.observations.read()[&id].load.clone();
     assert_eq!(load.error, Some("publication_rejected"));
     assert_eq!(load.rejection, Some("duplicate-node-id"));
 }
@@ -360,6 +360,7 @@ async fn shutdown_joins_fetches_and_keeps_the_accepted_load() {
         cached: true,
         error: Some("cache_load_failed"),
         rejection: None,
+        fetch: None,
     };
     state.start_pending(MAX_ACTIVE_FETCHES);
     let mut sockets = Vec::new();
@@ -382,7 +383,9 @@ async fn shutdown_joins_fetches_and_keeps_the_accepted_load() {
             std::io::ErrorKind::UnexpectedEof
         );
     }
-    let load = state.observations.read()[&periodic.subscription.id].load;
+    let load = state.observations.read()[&periodic.subscription.id]
+        .load
+        .clone();
     assert_eq!(load.updated_at, Some(accepted_at));
     assert!(load.cached);
     assert_eq!(load.error, Some("cache_load_failed"));
@@ -800,7 +803,7 @@ fn node_names(config: &Config) -> Vec<&str> {
 }
 
 fn assert_rejected(state: &SupervisorState, id: uuid::Uuid) {
-    let load = state.observations.read()[&id].load;
+    let load = state.observations.read()[&id].load.clone();
     assert_eq!(load.error, Some("publication_rejected"));
     assert_eq!(load.rejection, Some("duplicate-node-id"));
 }
@@ -878,7 +881,9 @@ async fn startup_drops_provider_nodes_another_provider_published() {
         config.validate_assembled().unwrap();
         assert_eq!(node_names(&config), expected);
         for provider in [&first, &second] {
-            let load = state.observations.read()[&provider.subscription.id].load;
+            let load = state.observations.read()[&provider.subscription.id]
+                .load
+                .clone();
             assert!(load.updated_at.is_some() && load.cached);
             assert_eq!((load.error, load.rejection), (None, None));
         }
@@ -945,6 +950,7 @@ async fn startup_fetch_replaces_the_providers_own_nodes() {
         cached: true,
         error: Some("publication_rejected"),
         rejection: Some("duplicate-node-id"),
+        fetch: None,
     };
 
     state.prepare_startup(&mut config, Vec::new()).await;
@@ -952,7 +958,9 @@ async fn startup_fetch_replaces_the_providers_own_nodes() {
     server.await.unwrap();
     config.validate_assembled().unwrap();
     assert_eq!(node_names(&config), ["kept", "new"]);
-    let load = state.observations.read()[&provider.subscription.id].load;
+    let load = state.observations.read()[&provider.subscription.id]
+        .load
+        .clone();
     assert!(load.updated_at.is_some());
     assert!(!load.cached);
     assert_eq!((load.error, load.rejection), (None, None));
