@@ -19,6 +19,16 @@ for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown
   done
 done
 
+# riscv64 ships the static full build only.
+for suffix in '' -stock; do
+  check "dist/honk-core-$prefix-riscv64gc-unknown-linux-musl$suffix-full.tar.gz"
+done
+
+# One VM image per architecture.
+for arch in x86_64 aarch64 riscv64; do
+  check "dist/honk-vm-$prefix-$arch.tar.gz"
+done
+
 # Lean variants ship for the static gateway targets only.
 for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
   for suffix in '' -stock; do

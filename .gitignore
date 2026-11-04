@@ -19,6 +19,7 @@ dist/
 *.o
 /sys/fs/bpf/
 crates/honk-ebpf/target/
+install/vm/init/target/
 crates/honk-ebpf/log/
 
 # OS

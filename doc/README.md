@@ -48,6 +48,7 @@ Per-release configuration changes that affect an existing configuration. One fil
 | ---------- | --------- | ------ |
 | DNS canary and rollback runbook | [en/operations/dns-rollout.md](./en/operations/dns-rollout.md) | [zh/operations/dns-rollout.md](./zh/operations/dns-rollout.md) |
 | Long connections and keepalive / 长连接与保活 | [en/operations/long-connections.md](./en/operations/long-connections.md) | [zh/operations/long-connections.md](./zh/operations/long-connections.md) |
+| VM image / VM 镜像 | [en/operations/vm-image.md](./en/operations/vm-image.md) | [zh/operations/vm-image.md](./zh/operations/vm-image.md) |
 
 ## Design / 设计
 

@@ -104,6 +104,8 @@ jobs:
           - {target: aarch64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
           - {target: aarch64-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
           - {target: aarch64-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
+          - {target: riscv64gc-unknown-linux-musl, suffix: "", variant: full, name_suffix: "-full"}
+          - {target: riscv64gc-unknown-linux-musl, suffix: "-stock", variant: full, name_suffix: "-full"}
           # Lean variants apply to the static gateway builds only; the gnu
           # artifacts stay full. Every name carries its variant suffix.
           - {target: x86_64-unknown-linux-musl, suffix: "", variant: clash-api, name_suffix: "-clash-api"}
@@ -294,9 +296,89 @@ jobs:
           path: ${{ env.ARTIFACT_NAME }}.tar.gz
           retention-days: 1
 
+  # The VM image wraps the static mimalloc full build of each architecture.
+  vm:
+    name: VM image ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {arch: x86_64, target: x86_64-unknown-linux-musl, qemu: qemu-system-x86}
+          - {arch: aarch64, target: aarch64-unknown-linux-musl, qemu: qemu-system-arm}
+          - {arch: riscv64, target: riscv64gc-unknown-linux-musl, qemu: qemu-system-misc opensbi}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Resolve artifact name
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/debug.* ]]; then
+            prefix=debug
+          else
+            prefix=${GITHUB_REF_NAME//\//-}
+          fi
+          echo "PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=honk-vm-$prefix-${{ matrix.arch }}" >> "$GITHUB_ENV"
+
+      - name: Read Rust toolchain
+        id: toolchain
+        run: echo "stable=$(grep -oP '^channel\s*=\s*\"\K[^\"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: ${{ steps.toolchain.outputs.stable }}
+          target: ${{ matrix.target }}
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: 0.14.1
+
+      - name: Install kernel build and QEMU dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm flex bison bc dwarves libelf-dev libssl-dev zstd \
+            dosfstools mtools fdisk ca-certificates ${{ matrix.qemu }}
+
+      - name: Download the musl full build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: honk-core-${{ matrix.target }}-full
+          path: honk-core
+
+      # The tarball keeps the honk-core archive's LICENSE, README and doona notices.
+      - name: Build VM image
+        run: |
+          set -euo pipefail
+          tar -xzf "honk-core/honk-core-$PREFIX-${{ matrix.target }}-full.tar.gz" -C honk-core
+          core="honk-core/honk-core-$PREFIX-${{ matrix.target }}-full"
+          install/vm/build.sh ${{ matrix.arch }} "$core/honk-core" "dist/$ARTIFACT_NAME"
+          cp -r "$core"/. "dist/$ARTIFACT_NAME/"
+          rm "dist/$ARTIFACT_NAME/honk-core"
+          tar -czf "$ARTIFACT_NAME.tar.gz" -C dist "$ARTIFACT_NAME"
+
+      # Hosted x86_64 runners expose KVM; the other architectures boot under TCG.
+      - name: Enable KVM
+        if: matrix.arch == 'x86_64'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot the VM image until the API answers
+        run: bash .github/ci/vm-smoke.sh "dist/$ARTIFACT_NAME"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: honk-vm-${{ matrix.arch }}
+          path: ${{ env.ARTIFACT_NAME }}.tar.gz
+          retention-days: 1
+
   release:
     name: GitHub Release
-    needs: [test, build]
+    needs: [test, build, vm]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

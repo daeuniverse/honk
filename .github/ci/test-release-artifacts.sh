@@ -14,6 +14,12 @@ create_set() {
       printf 'artifact\n' > "dist/honk-core-$prefix-$target$suffix-full.tar.gz"
     done
   done
+  for suffix in '' -stock; do
+    printf 'artifact\n' > "dist/honk-core-$prefix-riscv64gc-unknown-linux-musl$suffix-full.tar.gz"
+  done
+  for arch in x86_64 aarch64 riscv64; do
+    printf 'artifact\n' > "dist/honk-vm-$prefix-$arch.tar.gz"
+  done
   for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
     for suffix in '' -stock; do
       printf 'artifact\n' > "dist/honk-core-$prefix-$target$suffix-clash-api.tar.gz"
@@ -32,12 +38,18 @@ expect_rejection() {
   fi
 }
 
-# Debug builds and formal tags share the sixteen-archive set; only the name prefix differs.
+# Debug builds and formal tags share the twenty-one-archive set; only the name prefix differs.
 for prefix in debug v0.1.0-rc.1; do
   create_set "$prefix"
   bash "$ci_dir/check-release-artifacts.sh" "$prefix"
 
   artifact=dist/honk-core-$prefix-aarch64-unknown-linux-musl-stock-native-api.tar.gz
+  mv "$artifact" saved.tar.gz
+  expect_rejection "$prefix"
+  mv saved.tar.gz "$artifact"
+  bash "$ci_dir/check-release-artifacts.sh" "$prefix"
+
+  artifact=dist/honk-vm-$prefix-riscv64.tar.gz
   mv "$artifact" saved.tar.gz
   expect_rejection "$prefix"
   mv saved.tar.gz "$artifact"

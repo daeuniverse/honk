@@ -11,15 +11,25 @@ for path in "$dist"/*.tar.gz; do
   file=${path##*/}
   case $file in
     honk-core-*) ;;
+    honk-vm-*)
+      if [[ ! $file =~ -(x86_64|aarch64|riscv64)\.tar\.gz$ ]]; then
+        printf '::error::Unrecognised VM archive name: %s\n' "$file" >&2
+        exit 1
+      fi
+      vm="QEMU VM image (kernel, shell-free initrd, \`run.sh\`) for ${BASH_REMATCH[1]}"
+      [[ ${BASH_REMATCH[1]} != x86_64 ]] || vm+=', plus a UEFI disk for bhyve'
+      others+=("| \`$file\` | $vm |")
+      continue
+      ;;
     doona-source-*) others+=("| \`$file\` | Corresponding source of both embedded doona UI editions (GPL-3.0 section 6) |"); continue ;;
     *) printf '::error::Unknown release archive: %s\n' "$file" >&2; exit 1 ;;
   esac
 
-  if [[ ! $file =~ -(x86_64|aarch64)-unknown-linux-(gnu|musl)(-stock)?-(full|clash-api|native-api)\.tar\.gz$ ]]; then
+  if [[ ! $file =~ -(x86_64|aarch64|riscv64gc)-unknown-linux-(gnu|musl)(-stock)?-(full|clash-api|native-api)\.tar\.gz$ ]]; then
     printf '::error::Unrecognised honk-core archive name: %s\n' "$file" >&2
     exit 1
   fi
-  arch=${BASH_REMATCH[1]}
+  arch=${BASH_REMATCH[1]/riscv64gc/riscv64}
   libc=${BASH_REMATCH[2]}
   alloc=mimalloc alloc_rank=1
   [[ -n ${BASH_REMATCH[3]} ]] && alloc=stockalloc alloc_rank=2

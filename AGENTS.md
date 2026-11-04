@@ -44,6 +44,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 ├── config.min.dae            # Minimal example (good for --mock-ebpf dev)
 ├── example.dae               # Annotated example (Chinese comments)
 ├── doc/                      # en/ + zh/ doc trees: guide, design/, reference/, operations/; migration/{en,zh}/<tag>.md
+├── install/                  # nfpm/systemd packaging; vm/: VM image (build.sh, kernel/ fragments, run scripts, init/ = honk-vm-init PID 1, EXCLUDED from workspace, own Cargo.lock)
 ├── ci/                       # zigcc/zigcxx: zig cc/c++ wrappers for cross builds (strip CMake's clang-style --target from boring-sys ASM rules + rustc's aarch64 errata linker args; used by build-musl and the release workflow); zig-bindgen-env: derive BINDGEN_EXTRA_CLANG_ARGS from `zig cc -E -v` for cross bindgen
 ├── .github/workflows/        # release.yml: tag-triggered test + cross-build + GitHub Release
 └── crates/

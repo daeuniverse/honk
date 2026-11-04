@@ -1,0 +1,10 @@
+# Used only when no configuration reaches the VM. It exposes no API, so a VM
+# started without a configuration never serves a known secret.
+global {
+    wan_interface: eth0
+    data_dir: '/var/lib/honk'
+    log_level: info
+    auto_config_kernel_parameter: true
+}
+node { }
+routing { fallback: direct }
