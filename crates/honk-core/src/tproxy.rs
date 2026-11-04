@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use anyhow::Context as _;
 use tracing::{debug, info, warn};
 
+pub(crate) mod process;
 #[cfg(test)]
 mod tests;
 

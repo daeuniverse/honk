@@ -226,6 +226,24 @@ impl ControlPlaneHandle {
         if !route_with_domain {
             routing_conn_info.domain = None;
         }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        if handoff.is_none()
+            && routing_conn_info.process_name.is_none()
+            && crate::tproxy::host_transparent()
+            && self.router.read().await.uses_process_name()
+        {
+            let (protocol, client, server) = (
+                routing_conn_info.protocol,
+                std::net::SocketAddr::new(routing_conn_info.src_ip, routing_conn_info.src_port),
+                std::net::SocketAddr::new(routing_conn_info.dst_ip, routing_conn_info.dst_port),
+            );
+            routing_conn_info.process_name = tokio::task::spawn_blocking(move || {
+                crate::tproxy::process::owner_name(protocol, client, server)
+            })
+            .await
+            .ok()
+            .flatten();
+        }
         #[cfg(feature = "native-api")]
         let mut native_route = (record_route
             && handoff.is_some_and(|handoff| {

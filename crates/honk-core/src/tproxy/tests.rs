@@ -172,3 +172,52 @@ fn wan_auto_diverts_every_output_interface() {
     global.wan_interface.clear();
     assert_eq!(Settings::from_config(&global).host, HostScope::None);
 }
+
+mod process_table {
+    use super::super::process::{SocketEntry, find_entry};
+    use std::net::SocketAddr;
+
+    const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+   0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 111 1 0 100 0 0 10 0\n\
+   1: 0F02000A:C350 22D8B85D:01BB 01 00000000:00000000 00:00000000 00000000 10123        0 222 1 0 20 4 30 10 -1\n";
+    const UDP6: &str = "  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n\
+   7: 00000000000000000000000000000000:D431 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000 10050        0 333 2 0 0\n\
+   8: 0000000000000000FFFF00000F02000A:0035 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 0 2 0 0\n";
+
+    fn address(text: &str) -> SocketAddr {
+        text.parse().unwrap()
+    }
+
+    #[test]
+    fn connected_tcp_matches_both_ends() {
+        let client = address("10.0.2.15:50000");
+        let server = address("93.184.216.34:443");
+        assert_eq!(
+            find_entry(TCP, client, Some(server)),
+            Some(SocketEntry {
+                uid: 10123,
+                inode: 222
+            })
+        );
+        assert_eq!(
+            find_entry(TCP, client, Some(address("93.184.216.34:80"))),
+            None
+        );
+    }
+
+    #[test]
+    fn wildcard_udp_matches_by_port_and_mapped_addresses_canonicalize() {
+        assert_eq!(
+            find_entry(UDP6, address("10.0.2.15:54321"), None),
+            Some(SocketEntry {
+                uid: 10050,
+                inode: 333
+            })
+        );
+        assert_eq!(
+            find_entry(UDP6, address("10.0.2.15:53"), None),
+            None,
+            "inode zero has no owner to find"
+        );
+    }
+}
