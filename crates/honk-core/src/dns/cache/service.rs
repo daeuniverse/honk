@@ -42,7 +42,7 @@ pub(crate) enum CacheSlot {
 /// of any size occupies one entry.
 const CACHE_BYTES_PER_ENTRY: usize = 1024;
 /// Largest cacheable answer: a DNS message's size limit. Every shard budget is
-/// at least this, so an admitted answer can never evict its whole shard.
+/// at least this, so every admitted answer fits by itself.
 pub(super) const MAX_ANSWER_BYTES: usize = u16::MAX as usize;
 
 /// One LRU shard bounded by both entry count and retained answer bytes.
