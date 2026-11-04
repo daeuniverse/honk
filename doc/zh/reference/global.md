@@ -11,7 +11,8 @@
 | `tproxy_port` | `tproxy_port` | `12345` | 同时写入用户态监听器和 eBPF 数据路径的 TCP/UDP 透明监听端口；修改后需重启。 |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
+| `datapath` | `datapath` | `auto` | 拦截数据路径：`ebpf`、`tproxy` 或 `auto`。`auto` 在内核可加载 eBPF 数据路径时选择 eBPF，否则选择 TPROXY；Android 始终选择 TPROXY；不带 `ebpf` feature 的构建保留 mock 后端。修改需重启。见[数据路径选择](#数据路径选择)。 |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`；Android 上为 `0x400000`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
 | `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
@@ -57,6 +58,12 @@ HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：I
 
 请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
 
+## 数据路径选择
+
+`datapath: ebpf` 加载编译型 eBPF 数据路径；内核无法承载（早于 Linux 6.12）或运行于 Android 时启动失败。`datapath: tproxy` 改为安装 [netfilter TPROXY 数据路径](../design/tproxy.md)：iptables `mangle` 规则加一条 fwmark 策略路由，所有流量在用户态完成路由。默认的 `auto` 在 eBPF 数据路径不可用时记录 warning 并选择 TPROXY。`--mock-ebpf` 优先于三者。
+
+TPROXY 没有内核 offload、NFQUEUE 暂存或内核侧 `must` 决策；直连流量由 honk 在用户态中继。`process_name` 规则仅对本机发起的流量匹配属主进程的 `comm`；`mac` 与 `dscp` 条件永不匹配。
+
 ## 关闭
 
 仅设为 `shutdown_wait_connections: true`，且正常关闭、数据路径健康并存在活动 runtime epoch 时，才给已接受连接最多五秒自然结束，再关闭并 join 剩余连接。其他情况跳过宽限等待，不区分长短连接。
@@ -68,6 +75,8 @@ HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：I
 ## 套接字 mark
 
 `so_mark_from_dae: 0` 或省略该项时，保留历史实际 mark `0x100`。
+Android 构建默认改为 `0x400000`：netd 依据 fwmark 低 16 位选择网络，`0x100`
+会指向不存在的网络，使 honk 自身的套接字无法路由；bit 22 不在 netd 的字段之内。
 非零值会在 connect/send 之前原样应用，包括代理承载连接、bootstrap/DNS、
 健康检查、订阅与 UI 下载。数据路径按配置值精确匹配旁路；仅含有 `0x100`
 这一位并不能免于拦截。透明监听套接字使用相同 mark 供内核识别；

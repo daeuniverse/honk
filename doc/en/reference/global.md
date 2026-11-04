@@ -11,7 +11,8 @@ The dae parser accepts compatibility-only keys and stores them in `GlobalConfig`
 | `tproxy_port` | `tproxy_port` | `12345` | TCP and UDP transparent-listener port programmed into the userspace listeners and eBPF datapath. A change requires restart. |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | Compatibility switch intended to prevent re-interception of the transparent port. The current runtime does not read it. |
 | `pprof_port` | `pprof_port` | `0` | Compatibility pprof HTTP port; `0` means disabled. honk currently starts no pprof server and does not read this field. |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0` (effective `0x100`) | Process-wide `SO_MARK` for honk-originated sockets and exact datapath bypass. A nonzero value replaces `0x100`, not ORs with it; changing the setting requires restart. Bits `0xc8000000` are reserved and rejected. See [Socket marks](#socket-marks). |
+| `datapath` | `datapath` | `auto` | Interception datapath: `ebpf`, `tproxy` or `auto`. `auto` selects eBPF when the kernel can load it and TPROXY otherwise; Android always selects TPROXY; builds without the `ebpf` feature keep the mock backend. Restart-required. See [Datapath selection](#datapath-selection). |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0` (effective `0x100`; `0x400000` on Android) | Process-wide `SO_MARK` for honk-originated sockets and exact datapath bypass. A nonzero value replaces `0x100`, not ORs with it; changing the setting requires restart. Bits `0xc8000000` are reserved and rejected. See [Socket marks](#socket-marks). |
 | `log_level` | `log_level` | `"info"` | Startup log filter. A valid `RUST_LOG` takes precedence, followed by `--debug`, then this value. A SIGHUP change is restart-required; a native API `log.level` PATCH replaces the filter until the next activation. `info` covers runtime state (startup, reloads, health, subscriptions); the per-connection routing lines (`TCP connection`, `UDP connection`, eBPF offload) are `debug`, so a router's syslog is not flooded by traffic. To audit routing decisions, run with `debug` or read `/logs?level=debug` from the API. |
 | `log_file` | `log_file` | `""` | Optional append-only log path. Empty disables file output; a relative path resolves below `data_dir`. Console logging remains enabled. SIGHUP requires restart only when the resolved effective destination changes; `--log-file` shadows this value. |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | Compatibility key; the current startup path does not read it. Unresolved `auto` interfaces already remain pending without blocking startup. |
@@ -57,6 +58,12 @@ HTTP health checks and URLTest send a credential-free authority in `Host`: IPv6 
 
 The configured request path and query retain their original dot segments and percent-encoding. URLs with surplus authority slashes, backslashes, or embedded ASCII whitespace/control characters are rejected before building a request; rejected URLs are not echoed in the health-check warning.
 
+## Datapath selection
+
+`datapath: ebpf` loads the compiled eBPF datapath and fails startup on a kernel that cannot host it (Linux older than 6.12) or on Android. `datapath: tproxy` installs the [netfilter TPROXY datapath](../design/tproxy.md) instead: iptables `mangle` rules and one fwmark policy rule, with every flow routed in userspace. `auto` (the default) logs a warning and selects TPROXY when the eBPF datapath is unavailable. `--mock-ebpf` overrides all three.
+
+TPROXY has no kernel offload, NFQUEUE staging or kernel-side `must` decisions; direct flows are relayed through honk. `process_name` rules match the owning process's `comm` for host-originated traffic only; `mac` and `dscp` conditions never match.
+
 ## Shutdown
 
 Setting `shutdown_wait_connections: true` gives accepted connections up to five seconds to finish on ordinary, healthy shutdown with an active runtime epoch; remaining connections are then closed and joined. Other cases skip this grace. It does not distinguish short and long connections.
@@ -68,6 +75,9 @@ This is neither graceful restart nor a total exit deadline: [owned cleanup and b
 ## Socket marks
 
 `so_mark_from_dae: 0` (or omission) retains the historical effective mark `0x100`.
+Android builds default to `0x400000` instead: netd selects the network from the
+fwmark's low 16 bits, so `0x100` would name a nonexistent network and make
+honk's own sockets unroutable; bit 22 lies outside netd's fields.
 A nonzero value is applied exactly before connect/send, including proxy carriers,
 bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath
 bypass compares this exact configured value: merely containing bit `0x100` is not

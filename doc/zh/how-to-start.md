@@ -15,7 +15,7 @@ uname -r
 ```
 
 - 仅支持 Linux；真实透明代理必须以 `root` 运行。
-- 编译式路由及其 map-in-map 同步发布保证要求 Linux `6.12+`。旧内核会在附着前被拒绝。
+- eBPF 数据路径的编译式路由及其 map-in-map 同步发布保证要求 Linux `6.12+`。默认的 `datapath: auto` 下，更早的内核（最低 4.14）改用 [netfilter TPROXY 数据路径](design/tproxy.md)；`datapath: ebpf` 会在附着前拒绝它们。
 - `netkit` 不是必需项；内核不支持时 honk 自动回退到 veth。
 
 `lan_interface` 用于代理从局域网进入网关的流量，`wan_interface` 用于代理网关本机发起的流量：

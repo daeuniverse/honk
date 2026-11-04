@@ -15,7 +15,7 @@ uname -r
 ```
 
 - Only Linux is supported. The real transparent datapath must run as `root`.
-- Linux `6.12+` is required for compiled routing and its synchronous map-in-map publication guarantee. Older kernels are rejected before attachment.
+- The eBPF datapath requires Linux `6.12+` for compiled routing and its synchronous map-in-map publication guarantee. With the default `datapath: auto`, older kernels (down to 4.14) use the [netfilter TPROXY datapath](design/tproxy.md) instead; `datapath: ebpf` rejects them before attachment.
 - `netkit` is optional. honk falls back to veth when the kernel does not support it.
 
 `lan_interface` intercepts traffic entering the gateway from the LAN. `wan_interface` intercepts traffic originated by the gateway itself:
