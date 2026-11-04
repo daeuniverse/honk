@@ -8,7 +8,11 @@ impl EbpfBackend for MockEbpfBackend {
         if let Some(observation) = &self.datapath_observation_fixture {
             return observation.clone();
         }
-        ebpf::DatapathObservation::unknown(ebpf::DatapathKind::Mock)
+        ebpf::DatapathObservation::unknown(if self.tproxy {
+            ebpf::DatapathKind::Tproxy
+        } else {
+            ebpf::DatapathKind::Mock
+        })
     }
 
     #[cfg(test)]
@@ -547,6 +551,14 @@ impl EbpfBackend for MockEbpfBackend {
             .is_ok()
         {
             return Err(ebpf::TcpChildProofPending.into());
+        }
+        // TPROXY flows have no kernel record; userspace routes them all.
+        if self.tproxy {
+            return Ok(ebpf::TcpAdoption {
+                incarnation: 0,
+                handoff: None,
+                pin: ebpf::TcpPin::Model,
+            });
         }
         let current = self
             .conn_state_lookup(tuples)?

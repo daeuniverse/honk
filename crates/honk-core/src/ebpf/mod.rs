@@ -289,6 +289,8 @@ pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
 pub enum DatapathKind {
     Real,
     Mock,
+    /// Netfilter TPROXY interception over the in-memory model backend.
+    Tproxy,
     Unknown,
 }
 

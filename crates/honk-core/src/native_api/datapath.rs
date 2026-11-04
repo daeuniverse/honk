@@ -121,15 +121,17 @@ pub(super) fn summary(
     let kind = match observation.kind {
         DatapathKind::Real => "ebpf",
         DatapathKind::Mock => "mock",
+        DatapathKind::Tproxy => "tproxy",
         DatapathKind::Unknown => "unknown",
     };
     if observation.kind != DatapathKind::Real {
         return DatapathSummary {
             kind,
-            state: if observation.kind == DatapathKind::Mock {
-                "disabled"
-            } else {
-                "unknown"
+            state: match observation.kind {
+                DatapathKind::Mock => "disabled",
+                DatapathKind::Tproxy if healthy => "active",
+                DatapathKind::Tproxy => "degraded",
+                _ => "unknown",
             },
             visibility: "none",
             ebpf: None,

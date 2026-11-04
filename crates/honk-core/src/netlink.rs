@@ -24,7 +24,6 @@ use nix::sys::time::TimeVal;
 #[cfg(feature = "ebpf")]
 mod netns_id;
 
-#[cfg(feature = "ebpf")]
 pub(crate) fn ipv6_socket_available() -> std::io::Result<bool> {
     match socket2::Socket::new(
         socket2::Domain::IPV6,
@@ -59,6 +58,7 @@ pub(crate) const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
+const RTM_DELROUTE: u16 = 25;
 const RTM_DELRULE: u16 = 33;
 const RTM_NEWRULE: u16 = 32;
 const RTM_NEWNEIGH: u16 = 28;
@@ -89,6 +89,7 @@ const RTA_TABLE: u16 = 15;
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
 
+const FRA_PRIORITY: u16 = 6;
 const FRA_FWMARK: u16 = 10;
 const FRA_TABLE: u16 = 15;
 const FRA_FWMASK: u16 = 16;
@@ -100,6 +101,7 @@ const RTPROT_STATIC: u8 = 4;
 const RT_SCOPE_LINK: u8 = 253;
 const RT_SCOPE_UNIVERSE: u8 = 0;
 const RT_SCOPE_HOST: u8 = 254;
+const RT_SCOPE_NOWHERE: u8 = 255;
 const FR_ACT_TO_TBL: u8 = 1;
 
 #[repr(C)]
@@ -526,7 +528,41 @@ impl NlSock {
         )
     }
 
-    /// Add/delete a fwmark → table rule.
+    /// Delete the route `add_route` would install with the same key.
+    pub(crate) fn del_route(
+        &mut self,
+        family: u8,
+        table: u32,
+        route_type: u8,
+        dst: Option<(&[u8], u8)>,
+    ) -> io::Result<()> {
+        let header = RtMsg {
+            rtm_family: family,
+            rtm_dst_len: dst.map(|(_, p)| p).unwrap_or(0),
+            rtm_src_len: 0,
+            rtm_tos: 0,
+            rtm_table: if table <= 255 { table as u8 } else { 0 },
+            rtm_protocol: 0,
+            rtm_scope: RT_SCOPE_NOWHERE,
+            rtm_type: route_type,
+            rtm_flags: 0,
+        };
+        let mut attrs: Vec<(u16, Attr)> = Vec::new();
+        if table > 255 {
+            attrs.push((RTA_TABLE, Attr::U32(table)));
+        }
+        if let Some((net, _)) = dst {
+            attrs.push((RTA_DST, Attr::Bytes(net.to_vec())));
+        }
+        self.request(
+            RTM_DELROUTE,
+            NLM_F_REQUEST | NLM_F_ACK,
+            pod_bytes(&header),
+            &attrs,
+        )
+    }
+
+    /// Add/delete a fwmark → table rule; `priority` None lets the kernel pick.
     fn rule_fwmark(
         &mut self,
         add: bool,
@@ -534,6 +570,7 @@ impl NlSock {
         fwmark: u32,
         fwmask: u32,
         table: u32,
+        priority: Option<u32>,
     ) -> io::Result<()> {
         // fib_rule_hdr: family, dst_len, src_len, tos, table, res1, res2,
         // action, flags(u32)
@@ -558,6 +595,9 @@ impl NlSock {
         if table > 255 {
             attrs.push((FRA_TABLE, Attr::U32(table)));
         }
+        if let Some(priority) = priority {
+            attrs.push((FRA_PRIORITY, Attr::U32(priority)));
+        }
         let (ty, flags) = if add {
             (RTM_NEWRULE, NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE)
         } else {
@@ -573,7 +613,29 @@ impl NlSock {
         fwmask: u32,
         table: u32,
     ) -> io::Result<()> {
-        self.rule_fwmark(true, family, fwmark, fwmask, table)
+        self.rule_fwmark(true, family, fwmark, fwmask, table, None)
+    }
+
+    pub(crate) fn add_rule_fwmark_priority(
+        &mut self,
+        family: u8,
+        fwmark: u32,
+        fwmask: u32,
+        table: u32,
+        priority: u32,
+    ) -> io::Result<()> {
+        self.rule_fwmark(true, family, fwmark, fwmask, table, Some(priority))
+    }
+
+    pub(crate) fn del_rule_fwmark_priority(
+        &mut self,
+        family: u8,
+        fwmark: u32,
+        fwmask: u32,
+        table: u32,
+        priority: u32,
+    ) -> io::Result<()> {
+        self.rule_fwmark(false, family, fwmark, fwmask, table, Some(priority))
     }
 
     pub(crate) fn del_rule_fwmark(
@@ -583,7 +645,7 @@ impl NlSock {
         fwmask: u32,
         table: u32,
     ) -> io::Result<()> {
-        self.rule_fwmark(false, family, fwmark, fwmask, table)
+        self.rule_fwmark(false, family, fwmark, fwmask, table, None)
     }
 
     /// Replace a static neighbour entry (IP → MAC, permanent).

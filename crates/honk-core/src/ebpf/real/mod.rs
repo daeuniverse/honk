@@ -41,6 +41,21 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
     }
 }
 
+/// Oldest kernel the eBPF datapath loads on.
+pub(crate) const MIN_KERNEL: (u32, u32, u32) = (6, 12, 0);
+
+/// Why the running kernel cannot host the eBPF datapath, or `None` if it can.
+pub(crate) fn kernel_unsupported_reason() -> Option<String> {
+    match kernel_version() {
+        None => Some("the kernel version is unknown".to_owned()),
+        Some(version) if version < MIN_KERNEL => Some(format!(
+            "Linux {}.{}.{} is older than {}.{}",
+            version.0, version.1, version.2, MIN_KERNEL.0, MIN_KERNEL.1
+        )),
+        Some(_) => None,
+    }
+}
+
 /// Real eBPF backend backed by Aya and kernel BPF maps.
 ///
 /// Aya owns ordinary map operations; raw extensions provide batch reads/writes

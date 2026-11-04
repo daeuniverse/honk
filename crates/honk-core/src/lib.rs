@@ -25,7 +25,10 @@ mod marked_http;
 pub mod mode;
 #[cfg(feature = "native-api")]
 pub mod native_api;
-#[cfg(feature = "ebpf")]
+// The TPROXY datapath needs only rules and routes, so builds without eBPF
+// keep the rest of the client unused.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(crate) mod netlink;
 #[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
 pub(crate) mod observe;
@@ -37,6 +40,8 @@ pub mod state;
 pub mod stats;
 pub mod subscription;
 mod sysctl;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub(crate) mod tproxy;
 
 #[cfg(test)]
 pub(crate) mod test_support {
@@ -545,6 +550,58 @@ fn instance_lock(mock_mode: bool) -> anyhow::Result<Option<nix::fcntl::Flock<std
     .map(Some)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DatapathChoice {
+    Mock,
+    Ebpf,
+    Tproxy,
+}
+
+/// Resolve `global.datapath` against the build, platform and running kernel.
+fn select_datapath(
+    mock_ebpf: bool,
+    requested: honk_config::types::DatapathMode,
+) -> anyhow::Result<DatapathChoice> {
+    use honk_config::types::DatapathMode;
+    if mock_ebpf {
+        return Ok(DatapathChoice::Mock);
+    }
+    match requested {
+        DatapathMode::Tproxy => {
+            anyhow::ensure!(
+                cfg!(any(target_os = "linux", target_os = "android")),
+                "the TPROXY datapath needs Linux netfilter"
+            );
+            Ok(DatapathChoice::Tproxy)
+        }
+        DatapathMode::Ebpf => {
+            anyhow::ensure!(
+                !cfg!(target_os = "android"),
+                "the eBPF datapath would replace netd's root-cgroup programs on Android; use datapath: tproxy"
+            );
+            anyhow::ensure!(
+                cfg!(feature = "ebpf"),
+                "honk-core was built without the ebpf feature; use datapath: tproxy"
+            );
+            Ok(DatapathChoice::Ebpf)
+        }
+        DatapathMode::Auto if cfg!(target_os = "android") => Ok(DatapathChoice::Tproxy),
+        DatapathMode::Auto => {
+            #[cfg(feature = "ebpf")]
+            {
+                if let Some(reason) = ebpf::real::kernel_unsupported_reason() {
+                    warn!(%reason, "eBPF datapath unavailable; selecting the TPROXY datapath");
+                    return Ok(DatapathChoice::Tproxy);
+                }
+                Ok(DatapathChoice::Ebpf)
+            }
+            // Builds without eBPF keep their unprivileged development default.
+            #[cfg(not(feature = "ebpf"))]
+            Ok(DatapathChoice::Mock)
+        }
+    }
+}
+
 /// Returns whether NFQUEUE was requested but disabled because it is unavailable.
 fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) -> bool {
     if !config.global.nfqueue_enable {
@@ -552,7 +609,7 @@ fn prepare_nfqueue_startup(config: &mut Config, mock_mode: bool) -> bool {
     }
 
     let reason = if mock_mode {
-        Some("the mock eBPF backend was selected".to_string())
+        Some("the eBPF datapath was not selected".to_string())
     } else {
         #[cfg(not(feature = "ebpf"))]
         {
@@ -778,7 +835,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     );
     let mock_mode = cli.mock_ebpf || cfg!(not(feature = "ebpf"));
     // Everything else in `run` drops before it.
-    let _instance_lock = instance_lock(mock_mode)?;
+    let mut _instance_lock = instance_lock(mock_mode)?;
     #[cfg(feature = "native-api")]
     let mut database = None;
     let startup = (|| -> anyhow::Result<_> {
@@ -1062,11 +1119,17 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
+    let datapath = select_datapath(cli.mock_ebpf, config.global.datapath)?;
+    if datapath == DatapathChoice::Tproxy && _instance_lock.is_none() {
+        _instance_lock = instance_lock(false)?;
+    }
+    // From here `mock_mode` means "no eBPF datapath".
+    let mock_mode = datapath != DatapathChoice::Ebpf;
     let nfqueue_unavailable = prepare_nfqueue_startup(&mut config, mock_mode);
 
     #[cfg(feature = "ebpf")]
     let _dae0_guard;
-    if !mock_mode {
+    if datapath != DatapathChoice::Mock {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
         // Raise the ceiling so the 8 MiB SO_RCVBUF/SO_SNDBUF requests in
@@ -1084,7 +1147,19 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut interface_handoff = None;
-    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let tproxy_settings =
+        (datapath == DatapathChoice::Tproxy).then(|| tproxy::Settings::from_config(&config.global));
+    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if datapath == DatapathChoice::Tproxy {
+        #[cfg(feature = "ebpf")]
+        {
+            _dae0_guard = None;
+        }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        tproxy::enable_host_transparent();
+        info!("Using the netfilter TPROXY datapath");
+        Box::new(ebpf::mock::MockEbpfBackend::tproxy())
+    } else if datapath == DatapathChoice::Mock {
         #[cfg(feature = "ebpf")]
         {
             _dae0_guard = None;
@@ -1603,7 +1678,20 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         info!("honk-core is running.");
     }
+    // Rules divert only once the listeners they target can exist; removal
+    // follows the control plane so a stopping process drops, never leaks.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let tproxy_datapath = match tproxy_settings {
+        Some(settings) => Some(tproxy::TproxyDatapath::install(settings)?),
+        None => None,
+    };
     let control_result = control_plane.run().await;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(installed) = tproxy_datapath
+        && let Err(error) = installed.remove()
+    {
+        warn!(%error, "TPROXY datapath removal was incomplete");
+    }
     #[cfg(feature = "native-api")]
     native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
 

@@ -98,6 +98,8 @@ pub struct MockTelemetryFaults {
 /// In-memory transactional routing backend used by control-plane tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
+    /// Serves the netfilter TPROXY datapath rather than tests or `--mock-ebpf`.
+    tproxy: bool,
     /// Only the generation selected by the stable root remains resident.
     routing_generation: Option<MockRoutingGeneration>,
     active_slot: u32,
@@ -199,6 +201,15 @@ impl MockEbpfBackend {
     /// Create a new mock backend.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The model backend behind the netfilter TPROXY datapath: no kernel
+    /// state exists, so every flow takes the userspace-routing handoff path.
+    pub fn tproxy() -> Self {
+        Self {
+            tproxy: true,
+            ..Self::default()
+        }
     }
 
     pub fn capture_route_witness(&mut self, mut witness: KernelRouteWitness) -> u32 {

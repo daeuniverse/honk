@@ -55,6 +55,9 @@ pub(super) fn bind_tproxy_tcp(
             build_tproxy_tcp(addr, true)
         });
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    return build_tproxy_tcp(addr, crate::tproxy::host_transparent());
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     build_tproxy_tcp(addr, false)
 }
 
@@ -180,8 +183,12 @@ pub(super) fn bind_tproxy_udp_listeners(
                 .collect()
         });
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let transparent = crate::tproxy::host_transparent();
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let transparent = false;
     (0..count)
-        .map(|_| build_tproxy_udp(addr, true, false))
+        .map(|_| build_tproxy_udp(addr, true, transparent))
         .collect()
 }
 
@@ -248,7 +255,11 @@ fn build_tproxy_udp(
     {
         if transparent {
             set_ip_transparent(&socket, addr.is_ipv6())?;
-            set_so_recvmark(&socket)?;
+            // Only the eBPF datapath carries routes in packet marks; TPROXY
+            // marks carry nothing, and SO_RCVMARK needs Linux 5.19.
+            if !crate::tproxy::host_transparent() {
+                set_so_recvmark(&socket)?;
+            }
             if addr.is_ipv4() {
                 nix::sys::socket::setsockopt(
                     &socket,
@@ -382,6 +393,15 @@ fn into_io_error(e: anyhow::Error) -> io::Error {
         .unwrap_or_else(|e| io::Error::other(e.to_string()))
 }
 
+/// Host-netns replies would otherwise meet the OUTPUT diversion again.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_host_reply_mark(socket: &Socket) -> io::Result<()> {
+    if crate::tproxy::host_transparent() {
+        set_so_mark(socket, honk_outbound::util::bypass_mark())?;
+    }
+    Ok(())
+}
+
 fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     let domain = if original_dst.is_ipv4() {
         Domain::IPV4
@@ -393,7 +413,10 @@ fn build_udp_reply_socket(original_dst: SocketAddr) -> io::Result<UdpSocket> {
     socket.set_reuse_address(true)?;
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    set_ip_transparent(&socket, original_dst.is_ipv6())?;
+    {
+        set_ip_transparent(&socket, original_dst.is_ipv6())?;
+        set_host_reply_mark(&socket)?;
+    }
 
     socket.bind(&original_dst.into())?;
     UdpSocket::from_std(socket.into())
@@ -471,6 +494,7 @@ fn build_dns_reply_socket(is_v6: bool) -> io::Result<UdpSocket> {
     }
 
     set_ip_transparent(&socket, is_v6)?;
+    set_host_reply_mark(&socket)?;
 
     let bind_addr = if is_v6 {
         SocketAddr::new(
