@@ -149,6 +149,9 @@ pub(crate) fn restart_required_changes(
     if old_global.nfqueue_enable != new_global.nfqueue_enable {
         changed.push(field!("global.nfqueue_enable"));
     }
+    if old_global.datapath != new_global.datapath {
+        changed.push(field!("global.datapath"));
+    }
 
     let old_api = &current.experimental.clash_api;
     let new_api = &candidate.experimental.clash_api;

@@ -90,6 +90,9 @@ pub struct GlobalConfig {
     /// This process-scoped setting requires the real eBPF backend and a restart.
     #[serde(default = "crate::types::default_true")]
     pub nfqueue_enable: bool,
+    /// Interception datapath; restart-required.
+    #[serde(default)]
+    pub datapath: crate::types::DatapathMode,
     /// Root for generated state and relative runtime-supplied assets.
     #[serde(default = "default_data_dir")]
     pub data_dir: String,
@@ -395,6 +398,7 @@ impl Default for GlobalConfig {
             wan_interface: vec![],
             auto_config_kernel_parameter: false,
             nfqueue_enable: true,
+            datapath: crate::types::DatapathMode::Auto,
             data_dir: default_data_dir(),
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),

@@ -92,6 +92,33 @@ impl std::str::FromStr for DialMode {
     }
 }
 
+/// Transparent-interception datapath (`global.datapath`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatapathMode {
+    /// The eBPF datapath when the running kernel supports it, else TPROXY.
+    /// Android always selects TPROXY: netd owns the root-cgroup BPF hooks.
+    #[default]
+    Auto,
+    /// The eBPF datapath; startup fails on a kernel that cannot load it.
+    Ebpf,
+    /// Netfilter TPROXY rules and policy routing with userspace routing.
+    Tproxy,
+}
+
+impl std::str::FromStr for DatapathMode {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "auto" => Ok(Self::Auto),
+            "ebpf" => Ok(Self::Ebpf),
+            "tproxy" => Ok(Self::Tproxy),
+            _ => Err(()),
+        }
+    }
+}
+
 /// Subscription type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

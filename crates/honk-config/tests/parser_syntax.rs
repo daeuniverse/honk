@@ -149,6 +149,36 @@ mod scalar_syntax {
     }
 
     #[test]
+    fn datapath_selects_a_known_mode_and_rejects_others() {
+        use honk_config::types::DatapathMode;
+        let parse = |body: &str| {
+            parse_dae_config_with_detailed_diagnostics(
+                &format!("global {{\n{body}\n}}\n"),
+                &mut Vec::new(),
+            )
+        };
+        assert_eq!(parse("").unwrap().global.datapath, DatapathMode::Auto);
+        for (spelling, mode) in [
+            ("auto", DatapathMode::Auto),
+            ("ebpf", DatapathMode::Ebpf),
+            ("'TPROXY'", DatapathMode::Tproxy),
+        ] {
+            assert_eq!(
+                parse(&format!(" datapath: {spelling}"))
+                    .unwrap()
+                    .global
+                    .datapath,
+                mode
+            );
+        }
+        let error = parse(" datapath: nftables").unwrap_err();
+        assert!(
+            error.to_string().contains("auto, ebpf or tproxy"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn nfqueue_boolean_remains_strict() {
         let mut diagnostics = Vec::new();
         let result = parse_dae_config_with_detailed_diagnostics(

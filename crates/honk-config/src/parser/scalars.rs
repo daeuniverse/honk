@@ -87,6 +87,7 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "check_tolerance",
     "dial_mode",
     "nfqueue_enable",
+    "datapath",
     "allow_insecure",
     "sniffing_timeout",
     "tls_implementation",
@@ -420,6 +421,16 @@ pub(super) fn parse_global_section(
                 "invalid-config-value",
                 "global.nfqueue_enable",
                 "expected true/false, yes/no, 1/0 or on/off",
+            )
+        })?;
+    }
+    if let Some(value) = settings.get("datapath") {
+        cfg.datapath = value.unquote().raw().parse().map_err(|()| {
+            scalar_error(
+                *value,
+                "invalid-config-value",
+                "global.datapath",
+                "expected auto, ebpf or tproxy",
             )
         })?;
     }
