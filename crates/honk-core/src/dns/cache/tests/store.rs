@@ -69,19 +69,40 @@ fn test_lru_eviction() {
 }
 
 #[test]
-fn only_the_entry_count_limits_large_answers() {
-    let mut cache = DnsCache::new(32);
+fn byte_budget_evicts_within_the_shard_and_refuses_oversized_answers() {
+    // 100 entries leave each shard its 65,535-byte floor: one maximum-size answer.
+    let mut cache = DnsCache::new(100);
     let keys: Vec<String> = (0..1000)
-        .map(|index| format!("large-same-shard-{index}:1"))
+        .map(|index| format!("bytes-{index}:1"))
         .filter(|key| cache.shard_index(key) == 0)
         .take(2)
         .collect();
+    cache.put(keys[0].clone(), vec![0; 60_000], 300);
 
-    for key in &keys {
-        cache.put(key.clone(), vec![0; 70_000], 300);
+    cache.put(keys[1].clone(), vec![0; 70_000], 300);
+    assert!(cache.get(&keys[1]).is_none());
+    assert!(
+        cache.get(&keys[0]).is_some(),
+        "an oversized answer must not flush its shard"
+    );
+
+    cache.put(keys[1].clone(), vec![0; 60_000], 300);
+    assert!(
+        cache.get(&keys[0]).is_none(),
+        "LRU answer evicted for bytes"
+    );
+    assert_eq!(cache.retained_bytes(), 60_000);
+}
+
+#[test]
+fn entry_count_eviction_releases_answer_bytes() {
+    let mut cache = DnsCache::new(100);
+    for index in 0..2_000 {
+        cache.put(format!("churn-{index}:1"), vec![0; 500], 300);
     }
 
-    assert!(keys.iter().all(|key| cache.get(key).is_some()));
+    assert_eq!(cache.len(), 100);
+    assert_eq!(cache.retained_bytes(), 100 * 500);
 }
 
 #[test]
@@ -127,7 +148,7 @@ fn test_clear() {
 
     cache.clear();
     assert!(cache.is_empty());
-    assert_eq!(cache.len(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
 }
 
 #[test]

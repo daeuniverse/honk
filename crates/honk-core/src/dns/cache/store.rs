@@ -1,7 +1,6 @@
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use super::service::remove_positive;
 use super::{
     CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, NegativeEntry,
     PublicationEpoch, lock,
@@ -68,13 +67,7 @@ impl DnsCacheService {
         };
 
         if clear_negative {
-            let remove_slot = shard.peek_mut(&key).is_some_and(|value| {
-                value.negative = None;
-                value.positive.is_none()
-            });
-            if remove_slot {
-                shard.pop(&key);
-            }
+            shard.drop_negative(&key);
         }
 
         let result = if let Some((rcode, expires_at, revision)) = negative {
@@ -86,7 +79,7 @@ impl DnsCacheService {
         } else {
             let (positive, clear_positive) = positive;
             if clear_positive {
-                remove_positive(&mut shard, &key);
+                shard.drop_positive(&key);
             }
             positive.unwrap_or(ExactLookup::Miss)
         };
@@ -131,7 +124,7 @@ impl DnsCacheService {
             None => (None, false),
         };
         if clear_positive {
-            remove_positive(&mut shard, key);
+            shard.drop_positive(key);
         }
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);
@@ -260,7 +253,9 @@ impl DnsCacheService {
         strict_reusable: bool,
         refreshing: Option<u64>,
     ) -> Option<u64> {
-        if crate::dns::response::is_truncated(&response) {
+        if response.len() > super::service::MAX_ANSWER_BYTES
+            || crate::dns::response::is_truncated(&response)
+        {
             return None;
         }
         let ttl = min_ttl.max(1);
@@ -333,8 +328,7 @@ impl DnsCacheService {
         let key = CacheSlot::Exact(key.clone());
         let index = self.shard_index(&key);
         lock(&self.shards[index])
-            .get_mut(&key)
-            .and_then(|value| value.positive.as_mut())
+            .positive_mut(&key)
             .expect("positive cache fixture")
             .expires_at = Instant::now() - Duration::from_secs(1);
     }
@@ -348,10 +342,11 @@ impl DnsCacheService {
             rcode,
         };
         let mut shard = lock(&self.shards[index]);
-        if let Some(value) = shard.get_mut(&key) {
-            value.negative = Some(negative);
-        } else {
-            let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = shard.peek(&key).map_or_else(
+            || self.next_revision.fetch_add(1, Ordering::Relaxed),
+            |value| value.revision,
+        );
+        if !shard.set_negative_with_revision(&key, negative, revision) {
             shard.put(key, CacheValue::negative(negative, revision));
         }
     }
@@ -424,13 +419,10 @@ impl DnsCacheService {
             return None;
         }
         if refreshing.is_some() && rcode == 3 {
-            remove_positive(&mut shard, &key);
+            shard.drop_positive(&key);
         }
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
-        if let Some(value) = shard.get_mut(&key) {
-            value.negative = Some(negative);
-            value.revision = revision;
-        } else {
+        if !shard.set_negative_with_revision(&key, negative, revision) {
             shard.put(key, CacheValue::negative(negative, revision));
         }
         Some(revision)
@@ -516,13 +508,7 @@ impl DnsCacheService {
             None => (None, false),
         };
         if clear_negative {
-            let remove_slot = shard.peek_mut(key).is_some_and(|value| {
-                value.negative = None;
-                value.positive.is_none()
-            });
-            if remove_slot {
-                shard.pop(key);
-            }
+            shard.drop_negative(key);
         }
         if result.is_some() {
             self.counters.hits.fetch_add(1, Ordering::Relaxed);

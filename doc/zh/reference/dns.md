@@ -15,7 +15,7 @@
 | `optimistic_cache` | `true` | 启用正、负缓存的读取与写入。 |
 | `optimistic_cache_ttl` | `600` 秒 | 固定正应答的缓存和报文 TTL，不适用于 NODATA；`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用的 TTL；非零值替换每个非 OPT RR 的 TTL，`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL。 |
-| `max_cache_size` | `10000` | 缓存最大条目数，最大 100,000。 |
+| `max_cache_size` | `10000` | 缓存最大条目数，最大 100,000；同时决定下文的分片字节预算。 |
 | `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答和 NODATA 的 TTL；`0` 禁止缓存所有响应码的应答，包括负应答。 |
 
 标量值占据该物理行的剩余部分，只在键后的冒号处分隔，因此裸写的 IPv6 地址和 `client_subnet: auto(9.9.9.9)` 保持完整。解析器只移除一对包围整个值的匹配引号。已开启的标量引号必须在同一行闭合，否则配置失败。
@@ -216,7 +216,7 @@ NXDOMAIN 和 SERVFAIL 应答直接返回，不经过应答路由，也不应用�
 | `optimistic_cache` | `true` | 启用缓存读取与发布。 |
 | `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的记录 TTL，不适用于 NODATA。`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用此 TTL；非零值替换每个非 OPT RR 的 TTL。`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL；此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。非零值时，即使不存在正 TTL，outcome TTL 仍为配置值。 |
-| `max_cache_size` | `10000` | 条目上限，也是缓存唯一的上限：任意大小的应答都只占一个条目。大于 100,000 的值钳制为 100,000，`0` 钳制为一个条目，两者均会告警。 |
+| `max_cache_size` | `10000` | 条目上限，由最多 16 个分片分摊。每个分片的应答字节预算为 `max(条目容量 × 1 KiB, 65,535 字节)`；按 LRU 淘汰直到两个上限都满足。单条超过 65,535 字节的应答不缓存。大于 100,000 的值钳制为 100,000，`0` 钳制为一个条目，两者均会告警。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存所有响应码的应答，包括 NXDOMAIN 和 SERVFAIL。 |
 
 Request 路由先于缓存查询执行。缓存与后台刷新的标识使用选中的上游或精确 `asis` 目的地址，不使用原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。
