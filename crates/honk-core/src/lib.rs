@@ -393,7 +393,11 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_os = "android"))]
 const INSTANCE_LOCK_PATH: &str = "/run/honk-core.lock";
+/// Android has no `/run`; `/dev` is the boot-scoped tmpfs root can write.
+#[cfg(target_os = "android")]
+const INSTANCE_LOCK_PATH: &str = "/dev/honk-core.lock";
 
 fn publish_instance_pid(file: &mut std::fs::File) -> anyhow::Result<()> {
     use std::io::Write;

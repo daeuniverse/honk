@@ -76,7 +76,7 @@ use std::net::SocketAddr;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 use std::sync::Mutex;
 use std::time::Duration;
 #[cfg(feature = "ebpf")]

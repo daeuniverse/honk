@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 #[ignore = "requires root and an isolated network namespace"]
 fn marked_downloads_netns() {
@@ -137,7 +137,10 @@ fn marked_downloads_netns() {
     });
 }
 
-#[cfg(all(target_os = "linux", feature = "native-api"))]
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    feature = "native-api"
+))]
 fn direct_routing() -> crate::download_route::SharedOutbounds {
     use std::sync::Arc;
     let config = honk_config::Config::default();

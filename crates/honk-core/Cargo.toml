@@ -94,7 +94,6 @@ lru.workspace = true
 libc.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
-libsystemd.workspace = true
 nix.workspace = true
 sha2.workspace = true
 aes-gcm.workspace = true
@@ -112,6 +111,10 @@ flate2 = { workspace = true, optional = true }
 
 # External UI auto-download (clash-api)
 zip = { workspace = true, optional = true }
+
+# sd_notify only; bionic lacks the POSIX message-queue API libsystemd binds.
+[target.'cfg(target_os = "linux")'.dependencies]
+libsystemd.workspace = true
 
 [features]
 default = ["clash-api", "mimalloc", "rprx"]

@@ -6,7 +6,7 @@ use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_q
 #[cfg(feature = "native-api")]
 pub(super) mod reload_harness;
 pub(super) mod support;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 use support::KernelUdpReplySocketFactory;
 use support::{
     FailingUdpTestReplySocketFactory, UdpTestHandler, UdpTestMode, addr, assert_udp_outbound,
@@ -16,21 +16,21 @@ use support::{
 };
 
 mod admission;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
 mod health;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod nfqueue_retirement;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod tcp_binding;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod tcp_tuple_reuse;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod udp_fullcone;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 mod vlan_frames;
 
 #[tokio::test]
@@ -4761,7 +4761,7 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
     removal_task.await.unwrap();
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 fn fresh_test_netns() -> std::os::fd::OwnedFd {
     std::thread::spawn(|| {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).expect("unshare test netns");
@@ -4773,7 +4773,7 @@ fn fresh_test_netns() -> std::os::fd::OwnedFd {
     .expect("create test netns")
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     let current = std::fs::File::open("/proc/thread-self/ns/net").expect("open current netns");
     nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).expect("enter test netns");
@@ -4785,10 +4785,10 @@ fn in_test_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 const NETNS_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 fn wait_for_test_address(address: std::net::IpAddr) {
     let std::net::IpAddr::V6(address) = address else {
         return;
@@ -4817,7 +4817,7 @@ fn wait_for_test_address(address: std::net::IpAddr) {
     }
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 fn configure_test_edge(
     netns: &std::os::fd::OwnedFd,
     interface: &str,
@@ -4894,7 +4894,7 @@ fn configure_test_edge(
     })
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 #[test]
 #[ignore = "requires root, bpffs, nftables, and eBPF TC support"]
 fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {

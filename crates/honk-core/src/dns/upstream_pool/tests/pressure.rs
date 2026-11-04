@@ -245,7 +245,7 @@ async fn borrowed_udp_completion_releases_blocked_query() {
     .await;
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn receive_task_last_arc_releases_blocked_creator() {
     stall_guard(async {

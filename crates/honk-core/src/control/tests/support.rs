@@ -16,11 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 pub(super) mod netns;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 pub(super) mod shared_udp;
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 pub(super) mod wire;
 
 pub(in crate::control) struct TestRetirement {

@@ -34,14 +34,14 @@ pub fn bypass_mark() -> u32 {
 /// local tests) get EPERM, where we log once and continue unmarked — the
 /// bypass is irrelevant there because no eBPF datapath is loaded.
 /// Non-EPERM errors are real failures and propagate.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
     set_mark_result_best_effort(socket.set_mark(mark))
 }
 
 /// Apply the best-effort `SO_MARK` error contract to an already attempted
 /// mark operation. This is also the deterministic injection seam for callers.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -61,7 +61,7 @@ pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
 /// inside a server's idle-kill window (AnyTLS servers drop idle sessions
 /// around 30s): with a 60s first probe, warm mux sessions silently became
 /// corpses that only a real flow would discover (mihomo #1891).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn apply_tcp_keepalive(socket: &socket2::Socket) -> io::Result<()> {
     let keepalive = socket2::TcpKeepalive::new()
         .with_time(Duration::from_secs(15))
@@ -83,7 +83,7 @@ fn new_tcp_socket(addr: &SocketAddr, mark: Option<u32>) -> io::Result<socket2::S
     socket.set_nonblocking(true)?;
     socket.set_tcp_nodelay(true)?;
     socket.set_keepalive(true)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Some(mark) = mark {
             set_mark_best_effort(&socket, mark)?;
@@ -243,7 +243,7 @@ pub(crate) fn marked_udp_socket_with_mark(
     };
     let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     set_mark_best_effort(&socket, mark)?;
     // QUIC throughput is buffer-bound: the default 208 KiB rmem caps a
     // ~1ms-RTT path at ~2 Gbps (quic-go sets ~7 MiB and lands dae at ~3
@@ -251,7 +251,7 @@ pub(crate) fn marked_udp_socket_with_mark(
     // raises rmem_max/wmem_max at startup when auto-config is enabled.
     // Best-effort: sockets that don't need it (DNS queries) waste nothing
     // because buffers grow on demand.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         const QUIC_SOCK_BUF: usize = 8 << 20;
         let _ = socket.set_recv_buffer_size(QUIC_SOCK_BUF);

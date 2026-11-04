@@ -135,9 +135,8 @@ where
             return Ok(addrs);
         }
     }
-    let server = system_nameserver().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, "no numeric system DNS nameserver")
-    })?;
+    let server = system_nameserver()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, NO_SYSTEM_NAMESERVER))?;
     let resolver = BootstrapResolver {
         server,
         use_tcp: false,
@@ -314,6 +313,12 @@ fn answers_query(query: &[u8], resp: &[u8]) -> bool {
             .is_some_and(|n| n.eq_ignore_ascii_case(name))
         && resp.get(12 + name.len()..query.len()) == Some(type_class)
 }
+
+#[cfg(not(target_os = "android"))]
+const NO_SYSTEM_NAMESERVER: &str = "no numeric system DNS nameserver";
+/// Android resolves through netd and ships no `/etc/resolv.conf`.
+#[cfg(target_os = "android")]
+const NO_SYSTEM_NAMESERVER: &str = "no numeric system DNS nameserver (Android has no /etc/resolv.conf; set global.bootstrap_resolver)";
 
 /// First nameserver from /etc/resolv.conf (UDP, port 53). Used for record
 /// lookups (e.g. ECH discovery) when no `bootstrap_resolver` is configured.

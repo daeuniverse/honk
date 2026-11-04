@@ -1,4 +1,4 @@
-#![cfg(all(feature = "ebpf", target_os = "linux"))]
+#![cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};

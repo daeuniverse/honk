@@ -19,7 +19,7 @@ use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, oneshot};
 use super::budget::{DnsSocketBudget, IdlePressureRelease};
 use super::owned_task::OwnedTask;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod error_queue;
 
 const MAX_PENDING: usize = 1024;
@@ -78,7 +78,7 @@ struct Pending {
 
 enum Received {
     Datagram(usize),
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     ErrorQuote(usize, Option<io::Error>),
 }
 
@@ -227,9 +227,9 @@ impl UdpPool {
         };
         let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, None)?;
         socket.set_nonblocking(true)?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         honk_outbound::util::set_mark_best_effort(&socket, honk_outbound::util::bypass_mark())?;
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         error_queue::enable(&socket, address.is_ipv6())?;
         let unspecified = if address.is_ipv4() {
             IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -392,18 +392,18 @@ impl UdpPool {
 
     async fn receive_loop(pool: Weak<Self>, socket: Arc<SocketOwner>, budget: DnsSocketBudget) {
         let mut buffer = vec![0; 65535];
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let mut quote = [0; 512];
         loop {
             let receive = async {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
                     tokio::select! {
                         datagram = error_queue::receive_datagram(&socket, &mut buffer) => datagram.map(Received::Datagram),
                         error = error_queue::receive(&socket, &mut quote) => error.map(|(length, error)| Received::ErrorQuote(length, error)),
                     }
                 }
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
                 {
                     socket.recv(&mut buffer).await.map(Received::Datagram)
                 }
@@ -426,7 +426,7 @@ impl UdpPool {
                         let _ = pending.reply.send(Ok(response));
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 Ok(Received::ErrorQuote(length, error)) => {
                     if let Some(error) = error
                         && let Some(pending) =
@@ -610,7 +610,7 @@ mod tests {
         responder.await.unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn refused_peer_fails_promptly_and_recovers_without_socket_replacement() {
         for bind in ["127.0.0.1:0", "[::1]:0"] {
@@ -657,7 +657,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn packet_error_does_not_fail_another_pending_query() {
         tokio::time::timeout(Duration::from_secs(5), async {

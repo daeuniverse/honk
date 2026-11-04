@@ -16,7 +16,11 @@ pub(crate) enum Component {
     IfaceWatch,
     PnameRouting,
     #[cfg_attr(
-        not(all(feature = "native-api", feature = "ebpf", target_os = "linux")),
+        not(all(
+            feature = "native-api",
+            feature = "ebpf",
+            any(target_os = "linux", target_os = "android")
+        )),
         allow(dead_code)
     )]
     UdpTrace,
@@ -116,7 +120,11 @@ impl Degradations {
 
     #[cfg(any(
         test,
-        all(feature = "native-api", feature = "ebpf", target_os = "linux")
+        all(
+            feature = "native-api",
+            feature = "ebpf",
+            any(target_os = "linux", target_os = "android")
+        )
     ))]
     pub(crate) fn get(&self, component: Component) -> Option<Issue> {
         self.entries.lock()[component as usize]

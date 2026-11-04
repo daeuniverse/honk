@@ -74,14 +74,14 @@ pub(super) async fn accept_tcp_with_admission(
 
 const TCP_ADMISSION_SCALE_INTERVAL: Duration = Duration::from_secs(1);
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn open_fd_count() -> Option<usize> {
     // ponytail: one procfs scan per second avoids a platform-specific fd broker.
     let count = std::fs::read_dir("/proc/self/fd").ok()?.count();
     Some(count.saturating_sub(1))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn open_fd_count() -> Option<usize> {
     None
 }

@@ -2,7 +2,7 @@ use super::*;
 use crate::control::sockets;
 use crate::control::tests::support::{addr, bytes_of};
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn udp_listener_enables_reuse_port_before_bind() {
     use std::os::fd::AsRawFd;
@@ -30,7 +30,7 @@ fn udp_listener_enables_reuse_port_before_bind() {
     second.bind(&addr).unwrap();
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test]
 async fn udp_receive_batch_preserves_order_metadata_and_cancellation() {
     let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
@@ -111,7 +111,7 @@ async fn udp_receive_batch_preserves_order_metadata_and_cancellation() {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test]
 async fn udp_receive_batch_rejects_truncated_slot_without_losing_next_packet() {
     let socket = sockets::bind_tproxy_udp_listeners(SocketAddr::from(([127, 0, 0, 1], 0)), 1)
@@ -624,7 +624,11 @@ fn optional_priority_cmsg_cannot_reject_or_relabel_packet_marks() {
     }
 }
 
-#[cfg(all(feature = "ebpf", feature = "native-api", target_os = "linux"))]
+#[cfg(all(
+    feature = "ebpf",
+    feature = "native-api",
+    any(target_os = "linux", target_os = "android")
+))]
 #[test]
 #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
 fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Result<()> {
@@ -736,7 +740,7 @@ fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Resul
     .expect("receive trace namespace thread")
 }
 
-#[cfg(all(feature = "ebpf", target_os = "linux"))]
+#[cfg(all(feature = "ebpf", any(target_os = "linux", target_os = "android")))]
 #[test]
 #[ignore = "requires an isolated root network namespace; run via just test-netns"]
 fn netns_transparent_udp_batches_preserve_queued_packet_marks() -> anyhow::Result<()> {
@@ -822,7 +826,7 @@ fn reply_send_errors_about_the_destination_keep_the_socket() {
 
 /// A client that vanishes without FIN/RST must not pin its relay forever:
 /// accepted sockets are probed and a silent peer is cut within hours.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn accepted_client_sockets_detect_a_vanished_peer() {
     let listener = sockets::bind_tproxy_tcp(SocketAddr::from(([127, 0, 0, 1], 0)), 0).unwrap();

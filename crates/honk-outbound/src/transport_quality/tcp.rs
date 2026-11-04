@@ -195,18 +195,79 @@ fn unknown_sample(at: Instant) -> CarrierSample {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "linux")]
+use libc::tcp_info as TcpInfo;
+
+/// Prefix of the uapi `struct tcp_info`, which bionic's `libc` bindings omit.
+/// The kernel copies at most the supplied length and reports it, so fields past
+/// this prefix are simply absent; `sample_from_info` checks every offset.
+#[cfg(target_os = "android")]
+#[repr(C)]
+struct TcpInfo {
+    tcpi_state: u8,
+    tcpi_ca_state: u8,
+    tcpi_retransmits: u8,
+    tcpi_probes: u8,
+    tcpi_backoff: u8,
+    tcpi_options: u8,
+    tcpi_snd_rcv_wscale: u8,
+    tcpi_rate_flags: u8,
+    tcpi_rto: u32,
+    tcpi_ato: u32,
+    tcpi_snd_mss: u32,
+    tcpi_rcv_mss: u32,
+    tcpi_unacked: u32,
+    tcpi_sacked: u32,
+    tcpi_lost: u32,
+    tcpi_retrans: u32,
+    tcpi_fackets: u32,
+    tcpi_last_data_sent: u32,
+    tcpi_last_ack_sent: u32,
+    tcpi_last_data_recv: u32,
+    tcpi_last_ack_recv: u32,
+    tcpi_pmtu: u32,
+    tcpi_rcv_ssthresh: u32,
+    tcpi_rtt: u32,
+    tcpi_rttvar: u32,
+    tcpi_snd_ssthresh: u32,
+    tcpi_snd_cwnd: u32,
+    tcpi_advmss: u32,
+    tcpi_reordering: u32,
+    tcpi_rcv_rtt: u32,
+    tcpi_rcv_space: u32,
+    tcpi_total_retrans: u32,
+    tcpi_pacing_rate: u64,
+    tcpi_max_pacing_rate: u64,
+    tcpi_bytes_acked: u64,
+    tcpi_bytes_received: u64,
+    tcpi_segs_out: u32,
+    tcpi_segs_in: u32,
+    tcpi_notsent_bytes: u32,
+    tcpi_min_rtt: u32,
+    tcpi_data_segs_in: u32,
+    tcpi_data_segs_out: u32,
+    tcpi_delivery_rate: u64,
+    tcpi_busy_time: u64,
+    tcpi_rwnd_limited: u64,
+    tcpi_sndbuf_limited: u64,
+    tcpi_delivered: u32,
+    tcpi_delivered_ce: u32,
+    tcpi_bytes_sent: u64,
+    tcpi_bytes_retrans: u64,
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn read_sample(_socket: &TcpStream, at: Instant) -> CarrierSample {
     unknown_sample(at)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_sample(socket: &TcpStream, at: Instant) -> CarrierSample {
     use std::os::fd::{AsFd, AsRawFd};
 
     // SAFETY: tcp_info is a C integer-only struct with a valid zero value. The
     // borrowed fd cannot outlive this synchronous call or race owner teardown.
-    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut info: TcpInfo = unsafe { std::mem::zeroed() };
     let mut length = std::mem::size_of_val(&info) as libc::socklen_t;
     let fd = socket.as_fd();
     // SAFETY: both writable pointers cover their declared sizes, getsockopt
@@ -216,7 +277,7 @@ fn read_sample(socket: &TcpStream, at: Instant) -> CarrierSample {
             fd.as_raw_fd(),
             libc::IPPROTO_TCP,
             libc::TCP_INFO,
-            (&mut info as *mut libc::tcp_info).cast(),
+            (&mut info as *mut TcpInfo).cast(),
             &mut length,
         )
     };
@@ -226,14 +287,12 @@ fn read_sample(socket: &TcpStream, at: Instant) -> CarrierSample {
     sample_from_info(&info, length as usize, at)
 }
 
-#[cfg(target_os = "linux")]
-fn sample_from_info(info: &libc::tcp_info, length: usize, at: Instant) -> CarrierSample {
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sample_from_info(info: &TcpInfo, length: usize, at: Instant) -> CarrierSample {
     macro_rules! field {
         ($field:ident) => {
-            (length
-                >= std::mem::offset_of!(libc::tcp_info, $field)
-                    + std::mem::size_of_val(&info.$field))
-            .then_some(u64::from(info.$field))
+            (length >= std::mem::offset_of!(TcpInfo, $field) + std::mem::size_of_val(&info.$field))
+                .then_some(u64::from(info.$field))
         };
     }
     // Linux TCP_ESTABLISHED is 1; libc does not export the state enum.
@@ -257,5 +316,5 @@ fn sample_from_info(info: &libc::tcp_info, length: usize, at: Instant) -> Carrie
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "android")))]
 mod tests;

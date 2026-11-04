@@ -24,7 +24,7 @@ fn test_router() -> Arc<DnsRouter> {
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn asis_socket_tolerates_only_permission_denied_mark_failure() {
     // Given
@@ -42,7 +42,7 @@ fn asis_socket_tolerates_only_permission_denied_mark_failure() {
     assert!(socket.is_ok());
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 fn asis_socket_propagates_non_permission_mark_failure_as_typed_error() {
     // Given

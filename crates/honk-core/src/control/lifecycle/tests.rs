@@ -311,7 +311,11 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
     Ok(())
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(
+    feature = "native-api",
+    feature = "ebpf",
+    any(target_os = "linux", target_os = "android")
+))]
 #[tokio::test]
 async fn a_socket_without_any_receive_trace_is_untraced() {
     use std::os::fd::{FromRawFd, IntoRawFd};
@@ -330,7 +334,11 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     );
 }
 
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(
+    feature = "native-api",
+    feature = "ebpf",
+    any(target_os = "linux", target_os = "android")
+))]
 #[test]
 fn udp_trace_is_reported_until_a_listener_generation_traces() {
     let degradations = crate::degradations::Degradations::default();

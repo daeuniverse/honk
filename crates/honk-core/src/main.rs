@@ -7,7 +7,7 @@ use honk_core::Cli;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-#[cfg(all(feature = "mimalloc", target_os = "linux"))]
+#[cfg(all(feature = "mimalloc", any(target_os = "linux", target_os = "android")))]
 fn disable_transparent_huge_pages() -> std::io::Result<()> {
     // SAFETY: prctl receives fixed integer arguments and no pointers.
     let result = unsafe {
@@ -239,7 +239,7 @@ where
 fn main() -> anyhow::Result<()> {
     #[cfg(feature = "mimalloc")]
     tune_allocator();
-    #[cfg(all(feature = "mimalloc", target_os = "linux"))]
+    #[cfg(all(feature = "mimalloc", any(target_os = "linux", target_os = "android")))]
     disable_transparent_huge_pages()?;
 
     let mut builder = tokio::runtime::Builder::new_multi_thread();

@@ -163,15 +163,23 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
-    /// Process socket mark; zero retains the historical bypass mark.
+    /// Process socket mark; zero selects [`DEFAULT_SO_MARK`].
     pub fn effective_so_mark(&self) -> u32 {
         if self.so_mark_from_dae == 0 {
-            0x100
+            DEFAULT_SO_MARK
         } else {
             self.so_mark_from_dae
         }
     }
 }
+
+/// The historical bypass mark.
+#[cfg(not(target_os = "android"))]
+pub const DEFAULT_SO_MARK: u32 = 0x100;
+/// netd routes by the fwmark's low 16 bits (network ID) and owns bits up to
+/// 21; this unused bit keeps honk's sockets on the default network.
+#[cfg(target_os = "android")]
+pub const DEFAULT_SO_MARK: u32 = 0x0040_0000;
 
 fn default_tproxy_port() -> u16 {
     12345

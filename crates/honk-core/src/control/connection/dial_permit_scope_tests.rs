@@ -420,7 +420,7 @@ async fn marked_direct_dial_skips_bare_pool_and_rejects_retired_completion() {
     );
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test]
 #[ignore = "requires Linux CAP_NET_ADMIN or CAP_NET_RAW for real SO_MARK"]
 async fn direct_race_preserves_per_flow_marks() {

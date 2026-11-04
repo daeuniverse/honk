@@ -58,6 +58,17 @@ build-musl-native:
     cargo build --release -p honk-core --no-default-features --features "ebpf,native-api,rprx,mimalloc" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
 
+# Android build for root shells (Magisk, KernelSU).
+# Needs ANDROID_NDK_HOME (NDK r26+) and `rustup target add <target>`;
+# targets: aarch64-linux-android, x86_64-linux-android.
+build-android target="aarch64-linux-android" features="clash-api,mimalloc,rprx,native-api":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    eval "$({{justfile_directory()}}/ci/android/env.sh {{target}})"
+    cargo build --release -p honk-core --no-default-features --features "{{features}}" --target {{target}}
+    cargo build --release -p honk-tool --target {{target}}
+    echo "Binaries: target/{{target}}/release/honk-core target/{{target}}/release/honk-tool"
+
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)
 # NOTE: an environment RUSTFLAGS overrides crates/honk-ebpf/.cargo/config.toml
 # rustflags (--btf, debuginfo) — the object then silently loses its .BTF

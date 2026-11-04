@@ -874,7 +874,7 @@ async fn send_one(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub(super) fn monotonic_nanos() -> i64 {
     // Queue expiry is second-scale; the coarse clock keeps receive-batch stamping cheap.
     let mut ts = libc::timespec {
@@ -890,7 +890,7 @@ pub(super) fn monotonic_nanos() -> i64 {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 pub(super) fn monotonic_nanos() -> i64 {
     fallback_monotonic_nanos()
 }

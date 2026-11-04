@@ -358,7 +358,11 @@ impl ControlPlane {
                     self.diagnostics.clone(),
                 )?);
             }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-api",
+                feature = "ebpf",
+                any(target_os = "linux", target_os = "android")
+            ))]
             let record_flows = self.native.is_some()
                 && self
                     .config
@@ -367,9 +371,17 @@ impl ControlPlane {
                     .experimental
                     .native_api
                     .record_flows;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-api",
+                feature = "ebpf",
+                any(target_os = "linux", target_os = "android")
+            ))]
             let mut trace_error = None;
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-api",
+                feature = "ebpf",
+                any(target_os = "linux", target_os = "android")
+            ))]
             let mut trace_unavailable = [false; 2];
             let state = UdpLoopState::new(self, daens_netns_exists());
             for (socket, family) in epoch
@@ -382,9 +394,17 @@ impl ControlPlane {
                 let state = state.clone();
                 let socket = Arc::clone(socket);
                 let batch = sockets::UdpRecvBatch::new()?;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                #[cfg(all(
+                    feature = "native-api",
+                    feature = "ebpf",
+                    any(target_os = "linux", target_os = "android")
+                ))]
                 let mut batch = batch;
-                #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+                #[cfg(all(
+                    feature = "native-api",
+                    feature = "ebpf",
+                    any(target_os = "linux", target_os = "android")
+                ))]
                 if record_flows
                     && let Err(error) = enable_receive_trace(&self.ebpf, &mut batch, &socket).await
                 {
@@ -405,9 +425,17 @@ impl ControlPlane {
                     }
                 });
             }
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-api",
+                feature = "ebpf",
+                any(target_os = "linux", target_os = "android")
+            ))]
             let trace_degraded = record_udp_trace(&self.degradations, trace_unavailable);
-            #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+            #[cfg(all(
+                feature = "native-api",
+                feature = "ebpf",
+                any(target_os = "linux", target_os = "android")
+            ))]
             if trace_degraded && let Some(error) = &trace_error {
                 warn!(
                     %error,
@@ -551,7 +579,11 @@ impl ControlPlane {
 
 /// Whether `socket` records kernel UDP receive traces: `SO_RCVPRIORITY` where
 /// the kernel has it, otherwise the eBPF receive trace.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(
+    feature = "native-api",
+    feature = "ebpf",
+    any(target_os = "linux", target_os = "android")
+))]
 async fn enable_receive_trace(
     ebpf: &RwLock<Box<dyn EbpfBackend>>,
     batch: &mut sockets::UdpRecvBatch,
@@ -565,7 +597,11 @@ async fn enable_receive_trace(
 }
 
 /// Kernel UDP receive tracing is only needed while flows are recorded.
-#[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
+#[cfg(all(
+    feature = "native-api",
+    feature = "ebpf",
+    any(target_os = "linux", target_os = "android")
+))]
 fn record_udp_trace(
     degradations: &crate::degradations::Degradations,
     unavailable: [bool; 2],
