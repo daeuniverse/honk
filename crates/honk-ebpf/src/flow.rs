@@ -25,6 +25,24 @@ pub unsafe fn copy_payload<T: Copy>(dst: *mut T, src: *const T) {
     }
 }
 
+/// Zero a fixed-size, eight-byte-aligned payload without emitting memset: the
+/// out-of-line memset subprogram costs a 32-byte frame before Linux 6.6.
+#[inline(always)]
+pub unsafe fn zero_payload<T: Copy>(dst: *mut T) {
+    const {
+        assert!(core::mem::size_of::<T>() % 8 == 0);
+    }
+    const {
+        assert!(core::mem::align_of::<T>() >= 8);
+    }
+    let dst = dst.cast::<u64>();
+    let mut i = 0;
+    while i < core::mem::size_of::<T>() / 8 {
+        unsafe { dst.add(i).write_volatile(0) };
+        i += 1;
+    }
+}
+
 /// The projection runs under the value lock: volatile field reads only, no call or helper.
 #[inline(always)]
 unsafe fn locked_read<T, R>(ptr: *mut FlowMapValue<T>, project: impl FnOnce(*const T) -> R) -> R {

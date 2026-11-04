@@ -21,7 +21,7 @@ pub fn send_dae_event(
         return -1;
     };
     let e: &mut DaeEvent = unsafe {
-        reservation.as_mut_ptr().write_bytes(0, 1);
+        crate::flow::zero_payload(reservation.as_mut_ptr());
         reservation.assume_init_mut()
     };
 
@@ -53,6 +53,17 @@ pub fn send_dae_event(
 /// never silences the tuple for the next second.
 #[inline(never)]
 pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incarnation: u64) {
+    send_flow_expired_inline(key, incarnation);
+}
+
+/// [`send_flow_expired`] for callers already three BPF frames deep: kernels
+/// before 6.6 round every frame to 32 bytes, and one more frame there would
+/// exceed the 512-byte combined stack.
+#[inline(always)]
+pub fn send_flow_expired_inline(
+    key: &honk_ebpf_common::redirect_need::TuplesKey,
+    incarnation: u64,
+) {
     let now = unsafe { bpf_ktime_get_ns() };
     if let Some(previous) = FLOW_EXPIRY_HINT.get_ptr(key) {
         let previous = unsafe { &*previous };
@@ -66,15 +77,23 @@ pub fn send_flow_expired(key: &honk_ebpf_common::redirect_need::TuplesKey, incar
         return;
     };
     let event: &mut DaeEvent = unsafe {
-        reservation.as_mut_ptr().write_bytes(0, 1);
+        crate::flow::zero_payload(reservation.as_mut_ptr());
         reservation.assume_init_mut()
     };
     event.timestamp = now;
     event.type_ = honk_ebpf_common::event::DaeEventType::FlowExpired as u32;
     event.incarnation = incarnation;
     event.l4proto = key.l4proto;
-    event.sip = unsafe { key.src_ip.u6_addr32 };
-    event.dip = unsafe { key.dst_ip.u6_addr32 };
+    // Element stores: an array copy may become a memmove subprogram call.
+    let (sip, dip) = unsafe { (&key.src_ip.u6_addr32, &key.dst_ip.u6_addr32) };
+    let mut i = 0;
+    while i < 4 {
+        unsafe {
+            event.sip.as_mut_ptr().add(i).write_volatile(sip[i]);
+            event.dip.as_mut_ptr().add(i).write_volatile(dip[i]);
+        }
+        i += 1;
+    }
     event.sport = key.src_port;
     event.dport = key.dst_port;
     reservation.submit(0);

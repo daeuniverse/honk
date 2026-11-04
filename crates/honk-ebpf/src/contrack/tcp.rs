@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     auxiliary::auxiliary_expired,
-    event::{send_dae_event, send_flow_expired},
+    event::{send_dae_event, send_flow_expired_inline},
     maps::{
         CONN_STATE_MAP, CONNTRACK_ARGS_MAP, TCP_PUBLISHING, increment_bpf_stat, tuple_retiring,
     },
@@ -304,7 +304,7 @@ fn observe_tcp(
     let incarnation = unsafe { (*output).incarnation };
     if expired {
         if !tcp_live_pinned(incarnation) {
-            send_flow_expired(key, incarnation);
+            send_flow_expired_inline(key, incarnation);
             return core::ptr::null_mut();
         }
         unsafe { bpf_spin_lock(&mut (*ptr).lock) };
@@ -340,8 +340,8 @@ fn publish_fresh_tcp(
     {
         return core::ptr::null_mut();
     }
+    unsafe { crate::flow::zero_payload(output) };
     let new_state = unsafe { &mut *output };
-    *new_state = unsafe { core::mem::zeroed() };
     new_state.incarnation = incarnation;
     new_state.tcp_syn_isn = args.tcp_syn_isn;
     new_state.state = TcpState::TcpStateActive as u8;

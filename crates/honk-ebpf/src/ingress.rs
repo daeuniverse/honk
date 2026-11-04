@@ -467,9 +467,10 @@ fn wildcard_socket_destination_is_local(ctx: &TcContext, pkt: &ParsedPacket) -> 
     result == BPF_FIB_LKUP_RET_NOT_FWDED as c_long
 }
 
-// #[inline(never)]: shared by lan_ingress_l2/l3. 5-level call chain
-// with 256B baseline stays under the 512B BPF stack limit.
-#[inline(never)]
+// Inlined into lan_ingress_l2/l3, each loaded as its own program: a separate
+// frame under a stackless entry costs 32 bytes on kernels before 6.6, which
+// round every frame to 32, and the deepest chain must stay within 512 bytes.
+#[inline(always)]
 fn do_tproxy_lan_ingress(ctx: &TcContext, link_h_len: u32) -> Verdict {
     let scratch_key: u32 = 0;
     let pkt = match PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) {

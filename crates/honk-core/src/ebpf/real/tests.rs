@@ -7,6 +7,7 @@ mod mandatory_helpers;
 mod raw_bpf;
 mod retirement;
 mod socket_identity;
+mod stack_depth;
 
 /// Number of bpf links this process currently holds open. Every link fd
 /// shows a `link_type:` line in its /proc/self/fdinfo entry.
