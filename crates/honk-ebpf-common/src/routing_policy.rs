@@ -481,7 +481,13 @@ unsafe fn write_name_byte(output: &mut [u8; ROUTING_PROCESS_MAX_LEN], offset: us
     // Linux 6.12 does not bound BPF_MOD results; check before deriving the pointer.
     let offset = unsafe { core::ptr::read_volatile(&offset) };
     if offset < ROUTING_PROCESS_MAX_LEN {
-        unsafe { *output.as_mut_ptr().add(offset) = byte };
+        // Verifiers before Linux 6.8 still walk branches whose bounds already
+        // contradict (umin > umax) and reject the pointer they form. A mask
+        // rebuilds valid bounds from the known bits; the value is unchanged.
+        let index = unsafe { core::ptr::read_volatile(&offset) } & 63;
+        if index < ROUTING_PROCESS_MAX_LEN {
+            unsafe { *output.as_mut_ptr().add(index) = byte };
+        }
     }
 }
 
