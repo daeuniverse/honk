@@ -327,10 +327,9 @@ impl DnsCacheService {
     pub(crate) fn expire_positive_exact_for_test(&self, key: &CacheKey) {
         let key = CacheSlot::Exact(key.clone());
         let index = self.shard_index(&key);
-        lock(&self.shards[index])
-            .positive_mut(&key)
-            .expect("positive cache fixture")
-            .expires_at = Instant::now() - Duration::from_secs(1);
+        *lock(&self.shards[index])
+            .positive_expiry_mut(&key)
+            .expect("positive cache fixture") = Instant::now() - Duration::from_secs(1);
     }
 
     #[cfg(test)]
@@ -346,9 +345,7 @@ impl DnsCacheService {
             || self.next_revision.fetch_add(1, Ordering::Relaxed),
             |value| value.revision,
         );
-        if !shard.set_negative_with_revision(&key, negative, revision) {
-            shard.put(key, CacheValue::negative(negative, revision));
-        }
+        shard.put_negative(key, negative, revision);
     }
 
     #[cfg(test)]
@@ -422,9 +419,7 @@ impl DnsCacheService {
             shard.drop_positive(&key);
         }
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
-        if !shard.set_negative_with_revision(&key, negative, revision) {
-            shard.put(key, CacheValue::negative(negative, revision));
-        }
+        shard.put_negative(key, negative, revision);
         Some(revision)
     }
 

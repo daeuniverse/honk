@@ -150,28 +150,26 @@ impl CacheShard {
         }
     }
 
-    /// Replace a slot's negative answer and revision, keeping its positive
-    /// answer. Returns `false` when the slot is absent.
-    pub(super) fn set_negative_with_revision(
-        &mut self,
-        key: &CacheSlot,
-        negative: NegativeEntry,
-        revision: u64,
-    ) -> bool {
-        match self.entries.get_mut(key) {
-            Some(value) => {
-                value.negative = Some(negative);
-                value.revision = revision;
-                true
-            }
-            None => false,
+    /// Set a slot's negative answer and revision, preserving its positive answer.
+    pub(super) fn put_negative(&mut self, key: CacheSlot, negative: NegativeEntry, revision: u64) {
+        if let Some(value) = self.entries.get_mut(&key) {
+            value.negative = Some(negative);
+            value.revision = revision;
+        } else {
+            self.put(key, CacheValue::negative(negative, revision));
         }
     }
 
-    /// Mutable positive entry, for tests that age a fixture in place.
     #[cfg(test)]
-    pub(super) fn positive_mut(&mut self, key: &CacheSlot) -> Option<&mut super::CachedEntry> {
-        self.entries.get_mut(key)?.positive.as_mut()
+    pub(super) fn positive_expiry_mut(
+        &mut self,
+        key: &CacheSlot,
+    ) -> Option<&mut std::time::Instant> {
+        self.entries
+            .get_mut(key)?
+            .positive
+            .as_mut()
+            .map(|entry| &mut entry.expires_at)
     }
 }
 
