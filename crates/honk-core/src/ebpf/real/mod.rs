@@ -530,6 +530,10 @@ impl EbpfBackend for RealEbpfBackend {
         self.bindings.commit(commit)
     }
 
+    fn load_tc_programs(&mut self, programs: &[super::interface::TcProgram]) -> anyhow::Result<()> {
+        RealEbpfBackend::load_tc_programs(self, programs)
+    }
+
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
         anyhow::ensure!(
             !ready || !self.retirement_failed,

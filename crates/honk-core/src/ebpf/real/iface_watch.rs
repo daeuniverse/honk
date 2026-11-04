@@ -456,7 +456,21 @@ impl Watch {
                 }
             }
 
-            let snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let mut snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let missing = snapshot
+                .as_ref()
+                .map(|held| missing_programs(held, &plan))
+                .unwrap_or_default();
+            if !missing.is_empty() {
+                // First use of a variant: its verifier run holds the write lock.
+                let mut ebpf = self.ebpf.write().await;
+                if let Err(error) =
+                    crate::control::nfqueue::blocking_section(|| ebpf.load_tc_programs(&missing))
+                {
+                    warn!("load TC programs for the interface plan: {error:#}");
+                }
+                snapshot = ebpf.interface_binding_snapshot();
+            }
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
@@ -559,6 +573,18 @@ impl Watch {
             None => Ok(changed),
         }
     }
+}
+
+fn missing_programs(held: &BindingSnapshot, plan: &InterfacePlan) -> Vec<interface::TcProgram> {
+    let mut missing: Vec<_> = plan
+        .bindings
+        .iter()
+        .map(|binding| binding.program)
+        .filter(|program| !held.programs.iter().any(|(loaded, _)| loaded == program))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn log_commit(commit: &interface::BindingCommit) {

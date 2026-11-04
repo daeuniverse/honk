@@ -32,7 +32,7 @@ pub(crate) enum Direction {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum TcProgram {
+pub enum TcProgram {
     LanIngressL2,
     LanIngressL3,
     LanEgressL2,
@@ -66,6 +66,14 @@ impl TcProgram {
             Self::WanEgressL2 => "wan_egress_l2",
             Self::WanEgressL3 => "wan_egress_l3",
         }
+    }
+
+    /// Exposes the compiled-routing slots, so it needs the routing extension.
+    pub fn routes(self) -> bool {
+        matches!(
+            self,
+            Self::LanIngressL2 | Self::LanIngressL3 | Self::WanEgressL2 | Self::WanEgressL3
+        )
     }
 
     fn select(lan: bool, direction: Direction, l2: bool) -> Self {
@@ -318,6 +326,25 @@ pub(crate) fn read_topology(need_default_route: bool) -> anyhow::Result<Topology
         links,
         default_route,
     })
+}
+
+/// The TC variants verified at startup: what `plan` binds now. Routing
+/// publication verifies its extension against a loaded routing target, so one
+/// is added when the plan binds none. Any other variant is loaded when a later
+/// plan first needs it.
+pub(crate) fn initial_programs(plan: &InterfacePlan, lan_configured: bool) -> Vec<TcProgram> {
+    let mut programs: Vec<TcProgram> = TcProgram::ALL
+        .into_iter()
+        .filter(|program| plan.bindings.iter().any(|b| b.program == *program))
+        .collect();
+    if !programs.iter().any(|program| program.routes()) {
+        programs.push(if lan_configured {
+            TcProgram::LanIngressL2
+        } else {
+            TcProgram::WanEgressL2
+        });
+    }
+    programs
 }
 
 pub(crate) fn any_auto(lan: &[String], wan: &[String]) -> bool {

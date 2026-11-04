@@ -177,6 +177,7 @@ fn unavailable_cgroup_capture_refuses_startup() {
             12345,
             &dae0_setup,
             0,
+            &crate::ebpf::interface::TcProgram::ALL,
         ));
         assert!(
             result.is_err(),
@@ -252,8 +253,15 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
     let links_before = held_bpf_link_count();
     let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
 
-    let result =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0).await;
+    let result = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await;
     assert!(
         result.is_err(),
         "startup allowed an occupied root sock_ops slot"

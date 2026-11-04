@@ -210,7 +210,7 @@ IPv4/IPv6 仍分别构造 key、
 
 每个相关 TC 程序暴露两个真正保留的、非内联、BTF-global 函数：
 `honk_route_slot0` 和 `honk_route_slot1`。未安装槽返回错误，不实现第二套 fallback
-路由器。后端在放行前加载 LAN/WAN L2/L3 路由目标；八个 TC variant 已在 `load` 时预加载，目标直接复用，也覆盖之后才绑定到接口的 variant。
+路由器。后端在放行前把策略挂到每个已加载的 LAN/WAN L2/L3 路由目标上。启动时至少加载一个目标；之后为接口计划加载的目标在可被绑定前先挂上当前代的扩展，之后的每次发布也会挂到它上面。
 
 `ROUTING_POLICY_ROOT` 是单项 map-in-map，指向不可变的
 `RoutingPolicyDescriptor`。descriptor 标识 slot、policy generation、feature bits

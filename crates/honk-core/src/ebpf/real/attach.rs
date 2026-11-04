@@ -21,13 +21,16 @@ impl Drop for StartupPins<'_> {
 impl RealEbpfBackend {
     /// `local_ip` is the IPv4 (`u32::from_ne_bytes` of the octets) of the first
     /// resolved LAN, else WAN, interface; 0 when it has none. No configured
-    /// interface is attached here: `bind_interfaces` does that.
+    /// interface is attached here: `bind_interfaces` does that. Only the TC
+    /// variants in `programs` are verified now; see
+    /// [`crate::ebpf::interface::initial_programs`].
     pub async fn load(
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
         dae0: &crate::daens::Dae0Setup,
         local_ip: u32,
+        programs: &[crate::ebpf::interface::TcProgram],
     ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
@@ -276,10 +279,7 @@ impl RealEbpfBackend {
                 .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
         }
 
-        // Every TC variant is loaded up front, so reconciling interfaces later
-        // never runs the verifier. Before `EbpfLogger::init`, which holds the
-        // AYA_LOGS map fd the loads need.
-        let bindings = bindings::InterfaceBindings::preload(&mut bpf)?;
+        let bindings = bindings::InterfaceBindings::preload(&mut bpf, programs)?;
 
         info!("eBPF loaded and attached");
 

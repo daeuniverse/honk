@@ -98,9 +98,16 @@ pub(crate) fn in_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -
 /// outlive the backend.
 async fn load_bare(pin_root: &Path) -> (crate::daens::Dae0Guard, RealEbpfBackend) {
     let (dae0, setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
-    let backend = RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, pin_root, 12345, &setup, 0)
-        .await
-        .expect("backend load");
+    let backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        pin_root,
+        12345,
+        &setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend load");
     (dae0, backend)
 }
 
@@ -389,6 +396,77 @@ async fn bare_load_holds_no_tracing_links() {
     std::fs::remove_dir(&pin_root).expect("remove test pin root");
 }
 
+/// Startup verifies only the initial variants. A variant first needed later
+/// is loaded then and carries the active routing extension before it becomes
+/// bindable; the next publication attaches to it as well.
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn routing_target_loaded_on_first_use_gets_the_active_extension() {
+    use crate::ebpf::interface::TcProgram;
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-first-use-test-{}", std::process::id()));
+    let (_dae0, setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &setup,
+        0,
+        &[TcProgram::WanEgressL2],
+    )
+    .await
+    .expect("backend load");
+    let loaded = |backend: &RealEbpfBackend| -> Vec<TcProgram> {
+        TcProgram::ALL
+            .into_iter()
+            .filter(|program| {
+                backend
+                    .bpf()
+                    .unwrap()
+                    .program(program.name())
+                    .unwrap()
+                    .info()
+                    .is_ok()
+            })
+            .collect()
+    };
+    assert_eq!(loaded(&backend), [TcProgram::WanEgressL2]);
+    let router = crate::routing::Router::new(&[], "direct").unwrap();
+    let routing = crate::control::routing_matcher::RoutingPushPlan::compile(
+        &router,
+        &std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]),
+        honk_config::types::DialMode::Ip,
+    )
+    .unwrap();
+    backend
+        .publish_routing_plan(&routing, &[])
+        .expect("publish routing");
+    assert_eq!(held_tracing_link_count().unwrap(), 1);
+
+    backend
+        .load_tc_programs(&[TcProgram::WanEgressL3])
+        .expect("load on first use");
+    assert_eq!(
+        loaded(&backend),
+        [TcProgram::WanEgressL2, TcProgram::WanEgressL3]
+    );
+    assert_eq!(held_tracing_link_count().unwrap(), 2);
+    backend
+        .publish_routing_plan(&routing, &[])
+        .expect("republish routing");
+    assert_eq!(held_tracing_link_count().unwrap(), 2);
+
+    backend.detach_hooks().expect("detach hooks");
+    backend.cleanup().await.expect("cleanup");
+    for name in [
+        UDP_DECISION_SEQUENCE_MAP,
+        routing::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
+    std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
 #[cfg(feature = "native-api")]
 #[tokio::test]
 #[ignore = "requires root; run via just test-netns"]
@@ -507,10 +585,16 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
     let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
-    let mut backend =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-            .await
-            .expect("backend load");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend load");
     let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("initial sequence map info")
         .id();
@@ -526,10 +610,16 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     backend.detach_hooks().expect("detach hooks");
     backend.cleanup().await.expect("cleanup");
 
-    let mut reloaded =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-            .await
-            .expect("backend reload");
+    let mut reloaded = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend reload");
     assert_eq!(
         aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
             .expect("reloaded sequence map info")
@@ -626,9 +716,16 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         sequence.map().pin(&pin).unwrap();
         let id = sequence.map().info().unwrap().id();
         assert!(
-            RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-                .await
-                .is_err()
+            RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                &dae0_setup,
+                0,
+                &crate::ebpf::interface::TcProgram::ALL
+            )
+            .await
+            .is_err()
         );
         assert_eq!(aya::maps::MapInfo::from_pin(&pin).unwrap().id(), id);
         assert_eq!(sequence.get(&0, 0).unwrap(), value);
@@ -814,7 +911,8 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         )
         .unwrap();
         let before = backend.observe_datapath();
-        assert_eq!(before.programs, DatapathCheck::Absent);
+        // The fixture, like startup, already holds its routing targets.
+        assert_eq!(before.programs, DatapathCheck::Verified);
         assert_eq!(before.hooks, DatapathCheck::Absent);
         assert_eq!(before.routing, DatapathCheck::Absent);
         assert_eq!(before.admission, Some(false));

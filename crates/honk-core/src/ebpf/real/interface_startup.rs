@@ -38,8 +38,15 @@ pub(crate) async fn start_interfaces(
     })?;
     let mut plan = interface::plan(lan, wan, &topology);
     write_sysctls(&mut state, &plan, &topology);
-    let mut backend =
-        RealEbpfBackend::load(obj, pin_root, tproxy_port, dae0, interface::local_ip(&plan)).await?;
+    let mut backend = RealEbpfBackend::load(
+        obj,
+        pin_root,
+        tproxy_port,
+        dae0,
+        interface::local_ip(&plan),
+        &interface::initial_programs(&plan, !lan.is_empty()),
+    )
+    .await?;
 
     let mut report = backend.bind_interfaces(&plan, &topology);
     if report.topology_changed {

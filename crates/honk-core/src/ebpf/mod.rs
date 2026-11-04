@@ -571,6 +571,13 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
+    /// Load TC programs not loaded yet (a verifier run each). Blocking; on
+    /// error the bindings that need a missing program fail in apply.
+    #[cfg(feature = "ebpf")]
+    fn load_tc_programs(&mut self, _programs: &[interface::TcProgram]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
     #[cfg(feature = "ebpf")]

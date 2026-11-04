@@ -15,7 +15,9 @@ use crate::ebpf::interface::{
     plan as plan_interfaces, read_topology,
 };
 use crate::netlink::NlSock;
-use aya_obj::generated::{BPF_F_AFTER, bpf_attach_type, bpf_attr, bpf_cmd, bpf_prog_type};
+use aya_obj::generated::{
+    BPF_F_AFTER, bpf_attach_type, bpf_attr, bpf_cmd, bpf_prog_info, bpf_prog_type,
+};
 use std::collections::BTreeMap;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -132,7 +134,7 @@ impl Lab {
             DaeParam::default(),
         )
         .expect("load embedded production object");
-        // Preloads the eight TC variants and binds nothing.
+        // Loads every TC variant and binds nothing.
         backend.bind_test_interfaces(&[], &[]);
         Self {
             backend,
@@ -288,14 +290,36 @@ fn assert_truthful(held: &[Held], programs: &BTreeMap<TcProgram, u32>) {
     }
 }
 
+/// Kernel ID of each TC program the owner holds, read from its own FDs: a
+/// variant loaded on first use has no ID before then.
+fn held_program_ids(snapshot: &BindingSnapshot) -> BTreeMap<TcProgram, u32> {
+    snapshot
+        .programs
+        .iter()
+        .map(|(program, fd)| {
+            let mut info: bpf_prog_info = unsafe { std::mem::zeroed() };
+            let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
+            attr.info.bpf_fd = fd.as_raw_fd() as u32;
+            attr.info.info_len = size_of::<bpf_prog_info>() as u32;
+            attr.info.info = (&mut info as *mut bpf_prog_info) as u64;
+            unsafe {
+                super::super::syscall::bpf_syscall(
+                    bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as std::ffi::c_long,
+                    &mut attr,
+                )
+            }
+            .unwrap();
+            (*program, info.id)
+        })
+        .collect()
+}
+
 /// `held_of` for a backend behind the daemon's lock, proven against the kernel.
-async fn kernel_held(
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
-    programs: &BTreeMap<TcProgram, u32>,
-) -> Vec<Held> {
+async fn kernel_held(ebpf: &RwLock<Box<dyn EbpfBackend>>) -> Vec<Held> {
     let snapshot = ebpf.read().await.interface_binding_snapshot().unwrap();
+    let programs = held_program_ids(&snapshot);
     let held = held_of(snapshot);
-    assert_truthful(&held, programs);
+    assert_truthful(&held, &programs);
     held
 }
 

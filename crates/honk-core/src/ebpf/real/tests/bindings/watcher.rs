@@ -41,7 +41,6 @@ fn up_pair(netlink: &mut NlSock, name: &str, peer: &str) -> u32 {
 fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
     private_netns(|| {
         let lab = Lab::new();
-        let programs = program_ids(&lab.backend);
         let Lab {
             backend,
             mut netlink,
@@ -69,7 +68,7 @@ fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
                 // The device appears: bound as LAN (`auto` WAN has no route yet).
                 let first = up_pair(&mut netlink, LAN, PEER);
                 assert!(watch.reconcile(true).await.expect("bind on appearance"));
-                let held = owned_of(&kernel_held(&ebpf, &programs).await);
+                let held = owned_of(&kernel_held(&ebpf).await);
                 assert_eq!(
                     held.len(),
                     2,
@@ -114,7 +113,7 @@ fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
                     "the route table read follows this thread's netns"
                 );
                 assert!(watch.reconcile(false).await.expect("reprogram in place"));
-                let moved = owned_of(&kernel_held(&ebpf, &programs).await);
+                let moved = owned_of(&kernel_held(&ebpf).await);
                 assert_eq!(
                     moved,
                     Owned::from([
@@ -146,7 +145,7 @@ fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
                 // The device disappears: every binding is released and closed.
                 netlink.del_link(first).unwrap();
                 assert!(watch.reconcile(true).await.expect("release on deletion"));
-                assert!(kernel_held(&ebpf, &programs).await.is_empty());
+                assert!(kernel_held(&ebpf).await.is_empty());
                 assert_eq!(
                     held_bpf_link_count(),
                     baseline,

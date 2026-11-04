@@ -1,5 +1,6 @@
 use super::*;
 use crate::ebpf::DomainRouteWriteError;
+use crate::ebpf::interface::TcProgram;
 use crate::ebpf::maps::DOMAIN_MAP_CAPACITY;
 use aya::maps::{ArrayOfMaps as AyaArrayOfMaps, IterableMap};
 use aya::programs::{ProgramError, ProgramFd, SchedClassifier};
@@ -13,12 +14,6 @@ use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::fd::{FromRawFd, OwnedFd};
 
-const ROUTING_TARGETS: [&str; 4] = [
-    "lan_ingress_l2",
-    "lan_ingress_l3",
-    "wan_egress_l2",
-    "wan_egress_l3",
-];
 const FACT_MAP_CAPACITY: u32 = 2_048_000;
 const BPF_F_NO_PREALLOC: u32 = 1;
 const VERIFIER_LOG_SIZE: usize = 1 << 20;
@@ -40,8 +35,8 @@ pub(super) struct RoutingGeneration {
     #[cfg(feature = "native-api")]
     pub(super) fingerprint: [u8; 32],
     _btf: OwnedFd,
-    _program: OwnedFd,
-    _links: Vec<OwnedFd>,
+    program: OwnedFd,
+    links: Vec<OwnedFd>,
 }
 
 struct RoutingMaps {
@@ -490,38 +485,62 @@ impl RealEbpfBackend {
     }
 
     fn routing_targets(&mut self, slot_name: &str) -> anyhow::Result<Vec<Target>> {
-        let bpf = self.bpf_mut()?;
-        let mut names = ROUTING_TARGETS.to_vec();
-        if bpf.program("routing_test").is_some() {
+        // An unloaded variant is not bindable; it gets the active extension when
+        // it is first loaded (`extend_routing_target`).
+        let mut names: Vec<&str> = TcProgram::ALL
+            .into_iter()
+            .filter(|program| program.routes() && self.bindings.has(*program))
+            .map(TcProgram::name)
+            .collect();
+        if self.bpf_mut()?.program("routing_test").is_some() {
             names.push("routing_test");
         }
-        let mut result = Vec::with_capacity(names.len());
-        for name in names {
-            let program: &mut SchedClassifier = bpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("routing target '{name}' not found"))?
-                .try_into()?;
-            match program.load() {
-                Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-                Err(error) => return Err(anyhow::anyhow!("load routing target '{name}': {error}")),
-            }
-            let info = program.info()?;
-            let btf_id = info
-                .btf_id()
-                .ok_or_else(|| anyhow::anyhow!("routing target '{name}' has no BTF"))?;
-            let fd = program.fd()?.try_clone()?;
-            let kernel_btf = btf_fd_by_id(btf_id)?;
-            let bytes = btf_bytes(&kernel_btf)?;
-            validate_routing_decision_abi(&bytes, slot_name)?;
-            let btf = Btf::parse(&bytes, Default::default())?;
-            let function_id = btf.id_by_type_name_kind(slot_name, BtfKind::Func)?;
-            result.push(Target {
-                fd,
-                function_id,
-                btf,
-            });
+        names
+            .into_iter()
+            .map(|name| self.routing_target(name, slot_name))
+            .collect()
+    }
+
+    fn routing_target(&mut self, name: &str, slot_name: &str) -> anyhow::Result<Target> {
+        let program: &mut SchedClassifier = self
+            .bpf_mut()?
+            .program_mut(name)
+            .ok_or_else(|| anyhow::anyhow!("routing target '{name}' not found"))?
+            .try_into()?;
+        match program.load() {
+            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+            Err(error) => return Err(anyhow::anyhow!("load routing target '{name}': {error}")),
         }
-        Ok(result)
+        let info = program.info()?;
+        let btf_id = info
+            .btf_id()
+            .ok_or_else(|| anyhow::anyhow!("routing target '{name}' has no BTF"))?;
+        let fd = program.fd()?.try_clone()?;
+        let kernel_btf = btf_fd_by_id(btf_id)?;
+        let bytes = btf_bytes(&kernel_btf)?;
+        validate_routing_decision_abi(&bytes, slot_name)?;
+        let btf = Btf::parse(&bytes, Default::default())?;
+        let function_id = btf.id_by_type_name_kind(slot_name, BtfKind::Func)?;
+        Ok(Target {
+            fd,
+            function_id,
+            btf,
+        })
+    }
+
+    /// Attach the active generation's extension to a routing target loaded
+    /// after that generation was published. Without an active generation the
+    /// next publication covers it.
+    pub(super) fn extend_routing_target(&mut self, program: TcProgram) -> anyhow::Result<()> {
+        if self.routing_generation.is_none() {
+            return Ok(());
+        }
+        let slot_name = ROUTING_SLOT_NAMES[self.routing_slot as usize];
+        let target = self.routing_target(program.name(), slot_name)?;
+        let generation = self.routing_generation.as_mut().unwrap();
+        let link = attach_extension(&generation.program, &target)?;
+        generation.links.push(link);
+        Ok(())
     }
 
     pub(super) fn publish_compiled_routing(
@@ -575,8 +594,8 @@ impl RealEbpfBackend {
             #[cfg(feature = "native-api")]
             fingerprint: plan.fingerprint,
             _btf: btf,
-            _program: program,
-            _links: links,
+            program,
+            links,
         };
         let previous = self.routing_generation.replace(candidate);
         self.routing_slot = slot;
@@ -621,11 +640,17 @@ impl RealEbpfBackend {
         layout::validate_loaded_maps(&bpf)?;
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
         let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
+        // Like startup, keep routing targets loaded so publication has targets.
+        let routing_targets: Vec<_> = TcProgram::ALL
+            .into_iter()
+            .filter(|program| program.routes())
+            .collect();
+        let bindings = bindings::InterfaceBindings::preload(&mut bpf, &routing_targets)?;
         Ok(Self {
             bpf: Some(bpf),
             pin_root: PathBuf::new(),
             pinned_maps: Vec::new(),
-            bindings: Default::default(),
+            bindings,
             cgroup_sock_links: Vec::new(),
             cgroup_sock_addr_links: Vec::new(),
             pname_mode: process_name::PnameCaptureMode::Argv0,
@@ -693,9 +718,7 @@ impl RealEbpfBackend {
                 .collect::<Vec<_>>()
         };
         let (lan, wan) = (owned(lan), owned(wan));
-        if self.bindings.programs().is_empty() {
-            self.bindings = bindings::InterfaceBindings::preload(self.bpf_mut().unwrap()).unwrap();
-        }
+        self.load_tc_programs(&TcProgram::ALL).unwrap();
         let (topology, plan) = crate::ebpf::interface::read_and_plan(&lan, &wan).unwrap();
         let report = self.bind_interfaces(&plan, &topology);
         assert!(report.failed.is_empty(), "bind failed: {:?}", report.failed);

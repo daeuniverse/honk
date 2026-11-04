@@ -62,9 +62,15 @@ fn kernel_btf_override_controls_startup() {
             assert!(!pin_root.exists());
             let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
             let before = held_bpf_link_count();
-            let result =
-                RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-                    .await;
+            let result = RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                &dae0_setup,
+                0,
+                &crate::ebpf::interface::TcProgram::ALL,
+            )
+            .await;
             let mut backend = match result {
                 Ok(backend) => backend,
                 Err(error) => {

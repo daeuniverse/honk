@@ -69,7 +69,7 @@ Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追�
 
 ### 接口协调
 
-唯一的 `InterfaceBindings` 持有者保存预加载的程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时先打开 rtnetlink 订阅，再读取一次拓扑快照（被打断的 link dump 会重试，最多三次），推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。配置项的行为契约见[网卡语义](../reference/global.md#网卡语义)。启动仅在以下情况失败：无法读取拓扑（打断的 dump 之外的任何错误立即失败），存在 `auto` 项时无法读取默认路由，八个 TC 变体中任何一个无法预加载（即使它属于未使用的程序族），或内部 link（`dae0`/`dae0peer`、cgroup、`sk_lookup`）失败；为零的 `dae0`/`dae0peer` ifindex 或全零的 `dae0peer` MAC 同样视为失败。启动序列是一个与真实 eBPF VM 测试共用的函数，并在数据路径准入或 READY 前完成。
+唯一的 `InterfaceBindings` 持有者保存已加载的 TC 程序 FD，并为每个自有 `(ifindex, direction)` 保存一个由 FD 持有的 TCX link。启动时先打开 rtnetlink 订阅，再读取一次拓扑快照（被打断的 link dump 会重试，最多三次），推导计划，解析 `local_ip`，加载 BPF 对象，然后绑定。配置项的行为契约见[网卡语义](../reference/global.md#网卡语义)。启动仅在以下情况失败：无法读取拓扑（打断的 dump 之外的任何错误立即失败），存在 `auto` 项时无法读取默认路由，启动集合中的 TC 变体无法加载（启动计划绑定的变体；若其中没有路由目标，再加上 `lan_ingress_l2`，未配置 LAN 时为 `wan_egress_l2`），或内部 link（`dae0`/`dae0peer`、cgroup、`sk_lookup`）失败；为零的 `dae0`/`dae0peer` ifindex 或全零的 `dae0peer` MAC 同样视为失败。启动序列是一个与真实 eBPF VM 测试共用的函数，并在数据路径准入或 READY 前完成。之后某个计划首次需要的变体（例如 `auto` 切换到 PPP 或 WireGuard 设备）由该轮 reconcile 在持有后端写锁时完成 verifier 加载，并先挂上当前路由扩展；加载失败时只有需要它的绑定失败。
 
 仅当某项为 `auto` 时才读取 `/proc/thread-self/net/route`；读取错误并不表示“没有默认路由”（启动时致命；之后属于 reconcile 失败，保持现有绑定）。
 
