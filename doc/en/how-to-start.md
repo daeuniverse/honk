@@ -110,7 +110,7 @@ The musl packages are static binaries intended for gateways.
 
 | Allocator variant | Release label | Intended use |
 | --- | --- | --- |
-| No `-stock` suffix: mimalloc | `mimalloc` | Prioritize throughput. |
+| No `-stock` suffix: jemalloc | `jemalloc` | Prioritize throughput. |
 | `-stock`: system allocator | `stockalloc` | Small devices where the RSS high-water mark matters more. |
 
 Each release's Downloads section lists every archive with its `{allocator}-{API}-{arch}-{libc}` label.

@@ -121,7 +121,7 @@ flowchart TB
 
 ## Build features and mock mode
 
-`honk-core` defaults to `clash-api`, `mimalloc`, and `rprx`; real eBPF is opt-in.
+`honk-core` defaults to `clash-api`, `jemalloc`, and `rprx`; real eBPF is opt-in.
 
 | Feature | Default | Effect |
 | --- | --- | --- |
@@ -129,7 +129,7 @@ flowchart TB
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
 | `native-api` | no | Independent HTTP/1.1 native observations, opt-in accepted-source administration and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
 | `native-ui` | no | Includes `native-api` and embeds assets from the pinned doona distribution for `ui: embedded`; `ui: embedded-lite` selects the lighter doona lite edition (preview) with the same feature requirement. No runtime extraction, download or frontend build. |
-| `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio, and sets mimalloc's purge delay to 100 ms unless `MIMALLOC_PURGE_DELAY` says otherwise. |
+| `jemalloc` | yes | Pulls in `tikv-jemallocator` and installs jemalloc as the `honk-core` binary allocator; the crate builds jemalloc from C source. On Linux, startup disables transparent huge pages for the process before starting Tokio. Runtime options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`, because the crate prefixes jemalloc symbols with `_rjem_`. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
 `mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process; the config file is unchanged.

@@ -36,7 +36,7 @@ Download an archive for your platform from [Releases](https://github.com/daeuniv
 | `native-api` | Yes | No | No |
 | `clash-api` | No | Yes | No |
 
-Every build comes as a static musl binary; `full` also comes linked against glibc (`gnu`). Archives with `stock` in the name use the system allocator instead of mimalloc. Each release's Downloads section lists checksums and provenance.
+Every build comes as a static musl binary; `full` also comes linked against glibc (`gnu`). Archives with `stock` in the name use the system allocator instead of jemalloc. Each release's Downloads section lists checksums and provenance.
 
 Packages for Debian, Ubuntu, Fedora, openSUSE and Arch Linux are covered in the [installation guide](https://daeuniverse.org/honk/installation/). For OpenWrt, use the [daeuniverse package feed](https://daeuniverse.org/openwrt/).
 

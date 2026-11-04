@@ -110,7 +110,7 @@ musl 包是静态二进制，适合网关部署。
 
 | 内存分配器变体 | 发布标签 | 适用场景 |
 | --- | --- | --- |
-| 无 `-stock` 后缀：mimalloc | `mimalloc` | 优先考虑吞吐。 |
+| 无 `-stock` 后缀：jemalloc | `jemalloc` | 优先考虑吞吐。 |
 | `-stock`：系统内存分配器 | `stockalloc` | 更关注 RSS 峰值的小内存设备。 |
 
 每个发布版本的 Downloads 一节按 `{allocator}-{API}-{arch}-{libc}` 标签列出全部归档。

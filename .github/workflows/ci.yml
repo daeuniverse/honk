@@ -938,7 +938,7 @@ jobs:
           bpf-linker --version
       - run: cargo check -p honk-core --features ebpf,native-api --tests
       # The release native-api-only artifact drops the default-on clash-api.
-      - run: cargo check -p honk-core --no-default-features --features ebpf,native-api,rprx,mimalloc
+      - run: cargo check -p honk-core --no-default-features --features ebpf,native-api,rprx,jemalloc
       - name: Write eBPF compile-guard CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -1529,7 +1529,7 @@ jobs:
           # Zig supplies the CRT; Rust's self-contained CRT would duplicate _start.
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS='-C link-self-contained=no'
           export BINDGEN_EXTRA_CLANG_ARGS="$(ci/zig-bindgen-env "$ZIGCC_TARGET")"
-          cargo build --release -p honk-core --no-default-features --features clash-api,ebpf,rprx,mimalloc --target x86_64-unknown-linux-musl
+          cargo build --release -p honk-core --no-default-features --features clash-api,ebpf,rprx,jemalloc --target x86_64-unknown-linux-musl
           cargo build --release -p honk-tool --target x86_64-unknown-linux-musl
       - name: Start the musl toolbox
         working-directory: target/x86_64-unknown-linux-musl/release

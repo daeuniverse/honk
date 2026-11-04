@@ -36,12 +36,12 @@ mod backend;
 #[path = "udp_io/source.rs"]
 mod source;
 
-#[cfg(feature = "mimalloc")]
-type Backing = mimalloc::MiMalloc;
-#[cfg(not(feature = "mimalloc"))]
+#[cfg(feature = "jemalloc")]
+type Backing = tikv_jemallocator::Jemalloc;
+#[cfg(not(feature = "jemalloc"))]
 type Backing = std::alloc::System;
 
-/// The shipped allocator (mimalloc by default) plus relaxed event counters.
+/// The shipped allocator (jemalloc by default) plus relaxed event counters.
 struct Counting(Backing);
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);

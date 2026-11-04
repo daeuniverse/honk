@@ -21,7 +21,7 @@ for path in "$dist"/*.tar.gz; do
   fi
   arch=${BASH_REMATCH[1]}
   libc=${BASH_REMATCH[2]}
-  alloc=mimalloc alloc_rank=1
+  alloc=jemalloc alloc_rank=1
   [[ -n ${BASH_REMATCH[3]} ]] && alloc=stockalloc alloc_rank=2
   case ${BASH_REMATCH[4]} in
     full) api=fullapi api_rank=1 ;;
@@ -45,7 +45,7 @@ for path in "$dist"/*.deb "$dist"/*.rpm "$dist"/*.pkg.tar.zst; do
     rpm) kind='Fedora and RHEL' ;;
     *) kind='Arch Linux' ;;
   esac
-  others+=("| \`$file\` | $kind package of \`mimalloc-fullapi-${BASH_REMATCH[1]}-musl\` |")
+  others+=("| \`$file\` | $kind package of \`jemalloc-fullapi-${BASH_REMATCH[1]}-musl\` |")
 done
 
 if (( ${#rows[@]} == 0 )); then
@@ -58,7 +58,7 @@ cat <<'EOF'
 
 Each build is named `{allocator}-{API}-{arch}-{libc}`:
 
-- `mimalloc` favours throughput; `stockalloc` uses the system allocator and keeps the memory peak lower on small devices.
+- `jemalloc` favours throughput; `stockalloc` uses the system allocator and keeps the memory peak lower on small devices.
 - `fullapi` has the Clash API, the native API and both embedded doona UI editions; `ui: embedded-lite` selects the lighter doona lite edition (preview). `clashapi` has the Clash API only; `nativeapi` has the native API only, without the UI.
 - `musl` builds are static and suit gateways.
 

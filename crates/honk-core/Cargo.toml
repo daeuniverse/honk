@@ -60,13 +60,11 @@ bytes.workspace = true
 pin-project-lite.workspace = true
 
 # musl's stock malloc is slow under contention (visible as ~8% malloc+lock
-# time in perf); the `mimalloc` feature (default on) makes it the shipped
+# time in perf); the `jemalloc` feature (default on) makes it the shipped
 # binary's allocator. Build without default features for a stock-malloc
-# binary.
-mimalloc = { version = "0.1", optional = true }
-# Same sys crate instance as mimalloc's (cargo feature unification), used by
-# the Tokio worker idle hook to collect each owning heap.
-libmimalloc-sys = { version = "0.1.49", features = ["extended"], optional = true }
+# binary. The crate compiles jemalloc from C source with the `cc` crate, so
+# the zig wrappers cover the musl cross builds.
+tikv-jemallocator = { version = "0.7", optional = true }
 
 # Encoding
 base64.workspace = true
@@ -114,7 +112,7 @@ flate2 = { workspace = true, optional = true }
 zip = { workspace = true, optional = true }
 
 [features]
-default = ["clash-api", "mimalloc", "rprx"]
+default = ["clash-api", "jemalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 6.12+)
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
@@ -122,8 +120,8 @@ clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
 native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
 # Embed pinned doona from HONK_DOONA_DIR and doona lite from its -lite sibling.
 native-ui = ["native-api", "dep:brotli", "dep:flate2"]
-# Route the shipped binary's allocations through mimalloc (see main.rs)
-mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
+# Route the shipped binary's allocations through jemalloc (see main.rs)
+jemalloc = ["dep:tikv-jemallocator"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
 dns-bench = []
