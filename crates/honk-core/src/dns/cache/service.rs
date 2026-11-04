@@ -99,6 +99,7 @@ impl CacheShard {
         self.entries.iter()
     }
 
+    #[inline(always)]
     pub(super) fn pop(&mut self, key: &CacheSlot) -> Option<CacheValue> {
         let value = self.entries.pop(key)?;
         self.retained -= value.response_bytes();
@@ -113,6 +114,7 @@ impl CacheShard {
     /// Insert a value, then evict least-recently-used entries until the shard
     /// fits its byte budget. `push`, unlike `put`, also returns the entry an
     /// entry-count eviction displaced, so its bytes are released.
+    #[inline(always)]
     pub(super) fn put(&mut self, key: CacheSlot, value: CacheValue) {
         self.retained += value.response_bytes();
         if let Some((_, displaced)) = self.entries.push(key, value) {
