@@ -58,5 +58,5 @@ Every publication, formal or Debug, also uploads one `SHA256SUMS` covering all p
 - **Publish:** the maintainer replaces the Highlights comment with three to five bullets, keeps the generated entries and PR references unchanged (fix a wrong entry in `CHANGELOG.md` instead), checks the assets against the build, then publishes with `gh release edit <tag> --repo daeuniverse/honk --draft=false` or **Publish release** in the web UI.
 - **doona:** after publishing, attach this release's builds to the doona release named in `.github/ci/pins.env` and update that release's Pairing section, as doona's [release versions](https://github.com/Zakkaus/doona/blob/main/CONTRIBUTING.md#release-versions) describe.
 
-- **Deployment:** after tagging, use the canonical musl mimalloc gateway tarball. Note development/manual `scp` deployments in the PR/issue of record when they differ from release artifacts.
+- **Deployment:** after tagging, use the canonical musl jemalloc gateway tarball. Note development/manual `scp` deployments in the PR/issue of record when they differ from release artifacts.
 

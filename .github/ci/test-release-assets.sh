@@ -21,11 +21,11 @@ expect_line() {
     exit 1
   fi
 }
-expect_line '| `honk-core-v1.2.3-x86_64-unknown-linux-gnu-full.tar.gz` | `mimalloc-fullapi-x86_64-gnu` |'
+expect_line '| `honk-core-v1.2.3-x86_64-unknown-linux-gnu-full.tar.gz` | `jemalloc-fullapi-x86_64-gnu` |'
 expect_line '| `honk-core-v1.2.3-aarch64-unknown-linux-musl-stock-native-api.tar.gz` | `stockalloc-nativeapi-aarch64-musl` |'
-expect_line '| `honk-core-debug-x86_64-unknown-linux-musl-clash-api.tar.gz` | `mimalloc-clashapi-x86_64-musl` |'
-expect_line '| `honk-core-v1.2.3-x86_64.deb` | Debian and Ubuntu package of `mimalloc-fullapi-x86_64-musl` |'
-expect_line '| `honk-core-v1.2.3-aarch64.pkg.tar.zst` | Arch Linux package of `mimalloc-fullapi-aarch64-musl` |'
+expect_line '| `honk-core-debug-x86_64-unknown-linux-musl-clash-api.tar.gz` | `jemalloc-clashapi-x86_64-musl` |'
+expect_line '| `honk-core-v1.2.3-x86_64.deb` | Debian and Ubuntu package of `jemalloc-fullapi-x86_64-musl` |'
+expect_line '| `honk-core-v1.2.3-aarch64.pkg.tar.zst` | Arch Linux package of `jemalloc-fullapi-aarch64-musl` |'
 
 # A name the table cannot classify fails the release instead of shipping an unexplained file.
 touch "$work/dist/honk-core-v1.2.3-riscv64-unknown-linux-musl-full.tar.gz"

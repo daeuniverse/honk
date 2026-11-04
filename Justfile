@@ -18,7 +18,7 @@ build-core:
     cargo build --release -p honk-core --features "ebpf"
 
 # Build honk-core for VyOS/Debian (static musl, portable)
-# The features argument adds to the crate defaults (clash-api,mimalloc,rprx),
+# The features argument adds to the crate defaults (clash-api,jemalloc,rprx),
 # so `just build-musl ebpf` is the clash-api-only shape; use build-musl-native
 # for the exact native-api-only feature set.
 # Uses zig cc/c++ as the musl toolchain (ci/zigcc, ci/zigcxx): boring-sys
@@ -55,7 +55,7 @@ build-musl-native:
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER={{justfile_directory()}}/ci/zigcc \
     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS="-C link-self-contained=no" \
     BINDGEN_EXTRA_CLANG_ARGS="$({{justfile_directory()}}/ci/zig-bindgen-env x86_64-linux-musl)" \
-    cargo build --release -p honk-core --no-default-features --features "ebpf,native-api,rprx,mimalloc" --target x86_64-unknown-linux-musl
+    cargo build --release -p honk-core --no-default-features --features "ebpf,native-api,rprx,jemalloc" --target x86_64-unknown-linux-musl
     @echo "Binary: target/x86_64-unknown-linux-musl/release/honk-core"
 
 # Build eBPF object standalone (optional; honk-core build.rs auto-builds it)

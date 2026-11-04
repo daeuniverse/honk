@@ -94,7 +94,7 @@ jobs:
       matrix:
         include:
           # Full: Clash API + native API + embedded doona UI. Both arches ship
-          # two binaries: mimalloc (default, faster QUIC) and stock malloc
+          # two binaries: jemalloc (default, faster QUIC) and stock malloc
           # (lower RSS high-water on small gateways).
           - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
           - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
@@ -220,7 +220,7 @@ jobs:
           esac
           features="ebpf,rprx,$features"
           if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
-            features+=,mimalloc
+            features+=,jemalloc
           fi
           echo "FEATURES=$features" >> "$GITHUB_ENV"
 
