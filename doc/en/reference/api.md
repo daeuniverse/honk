@@ -923,7 +923,7 @@ File and inline rows report null for `download`.
 
 A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For `fetch_failed`, `details` names the failing `stage` (such as `connection_failed`, `download_timeout`, `tls_failed` or `parse_failed`), the `node` that carried the download, and the `group_id` that chose it; `node` and `group_id` are `null` when no node or group was involved. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
 
-A failed refresh operation carries the same details.
+A refresh operation that fails on a rejected publication carries the same `details.diagnostic_code`; the fetch `stage`, `node` and `group_id` appear only in the provider's `last_error`.
 
 `POST /providers/{id}/refresh` takes an empty body and optional `Idempotency-Key`, returning a 202 operation. Success requires actual revision-authorized runtime publication, not just fetch or cache write. Disconnecting HTTP does not cancel admitted work.
 

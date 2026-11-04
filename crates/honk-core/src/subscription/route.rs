@@ -36,9 +36,22 @@ pub(crate) struct DownloadFailed {
     via: Option<Via>,
     /// The rejecting answer, for the stages that come from a status.
     status: Option<http::StatusCode>,
+    /// The io error behind a direct failure. Only its own text is kept: the
+    /// error types around a request name its URL, which carries the token.
+    cause: Option<String>,
 }
 
 impl DownloadFailed {
+    fn new(subscription: &Subscription, stage: &'static str, via: Option<Via>) -> Self {
+        Self {
+            subscription: subscription.name.clone(),
+            stage,
+            via,
+            status: None,
+            cause: None,
+        }
+    }
+
     /// The server answered with a client or server error, as an expired
     /// subscription token does. Geodata stages the same statuses alike.
     pub(crate) fn status(
@@ -47,13 +60,12 @@ impl DownloadFailed {
         via: Option<Via>,
     ) -> Self {
         Self {
-            subscription: subscription.name.clone(),
-            stage: match status {
-                http::StatusCode::NOT_FOUND => "http_not_found",
-                _ => "http_status_rejected",
-            },
-            via,
             status: Some(status),
+            ..Self::new(
+                subscription,
+                crate::download_route::status_stage(status),
+                via,
+            )
         }
     }
 }
@@ -65,32 +77,37 @@ impl std::fmt::Display for DownloadFailed {
             stage,
             via,
             status,
+            cause,
         } = self;
-        if let Some(status) = status {
-            return write!(f, "subscription server answered HTTP {status}");
-        }
-        match (*stage, via) {
-            ("asset_too_large", _) => write!(
-                f,
-                "subscription body exceeds {} bytes",
-                super::MAX_SUBSCRIPTION_BYTES
-            ),
-            ("route_blocked", _) => {
-                f.write_str("routing sends the subscription download to 'block'")
+        match *stage {
+            "asset_too_large" => {
+                return write!(
+                    f,
+                    "subscription body exceeds {} bytes",
+                    super::MAX_SUBSCRIPTION_BYTES
+                );
             }
-            (_, None) => write!(f, "subscription '{subscription}': download failed: {stage}"),
-            (_, Some(Via { node, group })) => {
-                write!(
-                    f,
-                    "subscription '{subscription}': download through node '{node}'"
-                )?;
-                if let Some(group) = group {
-                    write!(f, " of group '{group}'")?;
+            "route_blocked" => {
+                return f.write_str("routing sends the subscription download to 'block'");
+            }
+            _ => {}
+        }
+        write!(f, "subscription '{subscription}': ")?;
+        match (status, via) {
+            (Some(status), None) => write!(f, "server answered HTTP {status}"),
+            (None, None) => {
+                write!(f, "download failed: {stage}")?;
+                match cause {
+                    Some(cause) => write!(f, " ({cause})"),
+                    None => Ok(()),
                 }
-                write!(
-                    f,
-                    " failed: {stage}; set route: direct for this subscription to fetch it outside routing"
-                )
+            }
+            (status, Some(via)) => {
+                match status {
+                    Some(status) => write!(f, "server answered HTTP {status} through {via}")?,
+                    None => write!(f, "download through {via} failed: {stage}")?,
+                }
+                f.write_str("; set route: direct for this subscription to fetch it outside routing")
             }
         }
     }
@@ -133,8 +150,8 @@ pub(crate) fn failure_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
-/// A hop's answer and the node that carried it, or the stage it failed at and the node.
-type Attempt = Result<(Reply, Option<Via>), (&'static str, Option<Via>)>;
+/// A hop's answer and the node that carried it, or why it failed.
+type Attempt = Result<(Reply, Option<Via>), DownloadFailed>;
 
 /// Where each request of a subscription fetch goes.
 pub(super) enum Hop<'a> {
@@ -164,18 +181,23 @@ impl Hop<'_> {
             Self::Direct(client) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
-                    Err(_) => Err(("download_timeout", None)),
+                    Err(_) => Err(DownloadFailed::new(subscription, "download_timeout", None)),
                     Ok(response) => match response {
                         Ok(response) => {
                             marked_http::read(response, wants_body, deadline.into(), max_bytes)
                                 .await
                                 .map(|reply| (reply, None))
-                                .map_err(|error| (error.stage, None))
+                                .map_err(|error| {
+                                    DownloadFailed::new(subscription, error.stage, None)
+                                })
                         }
                         // A failure that fits no stage, such as an invalid URL,
                         // keeps its own message.
                         Err(error) => match direct_stage(&error) {
-                            Some(stage) => Err((stage, None)),
+                            Some((stage, cause)) => Err(DownloadFailed {
+                                cause,
+                                ..DownloadFailed::new(subscription, stage, None)
+                            }),
                             None => return Err(error),
                         },
                     },
@@ -202,7 +224,9 @@ impl Hop<'_> {
                     .await;
                 match fetched {
                     Ok((reply, _, via)) => Ok((reply, via)),
-                    Err(Failed::Stage(stage, via)) => Err((stage, via)),
+                    Err(Failed::Stage(stage, via)) => {
+                        Err(DownloadFailed::new(subscription, stage, via))
+                    }
                     Err(Failed::Route(error)) => {
                         return Err(match error.downcast_ref::<NoUsableNode>() {
                             Some(unusable) => anyhow::Error::new(RouteUnavailable {
@@ -215,38 +239,34 @@ impl Hop<'_> {
                 }
             }
         };
-        reply.map_err(|(stage, via)| {
-            anyhow::Error::new(DownloadFailed {
-                subscription: subscription.name.clone(),
-                stage,
-                via,
-                status: None,
-            })
-        })
+        reply.map_err(anyhow::Error::new)
     }
 }
 
 /// The stage of an error the direct client returns without one, from what it
 /// wraps: a timed-out socket, a TLS failure inside the handshake's io error, a
-/// lookup that found no address, or else any other connect error. Nothing
-/// else (an invalid URL, an unsupported scheme) names a stage.
-fn direct_stage(error: &anyhow::Error) -> Option<&'static str> {
+/// lookup that found no address, or else any other connect error. With the
+/// io error's own text, the one cause that is safe to log. Nothing else (an
+/// invalid URL, an unsupported scheme) names a stage.
+fn direct_stage(error: &anyhow::Error) -> Option<(&'static str, Option<String>)> {
     if let Some(failed) = error.downcast_ref::<marked_http::Error>() {
-        return Some(failed.stage);
+        return Some((failed.stage, None));
     }
     let io = error.downcast_ref::<std::io::Error>()?;
-    if io
+    let stage = if io
         .get_ref()
         .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
     {
-        return Some("tls_failed");
-    }
-    Some(match io.kind() {
-        std::io::ErrorKind::TimedOut => "download_timeout",
-        std::io::ErrorKind::NotFound => "resolution_failed",
-        std::io::ErrorKind::InvalidInput => return None,
-        _ => "connection_failed",
-    })
+        "tls_failed"
+    } else {
+        match io.kind() {
+            std::io::ErrorKind::TimedOut => "download_timeout",
+            std::io::ErrorKind::NotFound => "resolution_failed",
+            std::io::ErrorKind::InvalidInput => return None,
+            _ => "connection_failed",
+        }
+    };
+    Some((stage, Some(io.to_string())))
 }
 
 /// The body of every answer that is neither followed nor failed.

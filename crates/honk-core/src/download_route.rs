@@ -335,12 +335,31 @@ pub(crate) struct Request<'a> {
     pub(crate) bootstrap: Option<&'a str>,
 }
 
+/// The stage of a download the server answered with `status`: a 404 is told
+/// apart because it is what a removed file or an expired link gives.
+pub(crate) fn status_stage(status: http::StatusCode) -> &'static str {
+    match status {
+        http::StatusCode::NOT_FOUND => "http_not_found",
+        _ => "http_status_rejected",
+    }
+}
+
 /// The outbound a download went through: the node that carried it, and the
 /// group that chose the node when one did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Via {
     pub(crate) node: String,
     pub(crate) group: Option<String>,
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node '{}'", self.node)?;
+        match &self.group {
+            Some(group) => write!(f, " of group '{group}'"),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Why a routed download failed.

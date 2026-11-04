@@ -658,10 +658,7 @@ async fn exchange(
     match reply.status {
         StatusCode::OK => Ok((reply.body, group)),
         status => Err(Failure {
-            code: match status {
-                StatusCode::NOT_FOUND => "http_not_found",
-                _ => "http_status_rejected",
-            },
+            code: download_route::status_stage(status),
             status: Some(status.as_u16()),
         }),
     }

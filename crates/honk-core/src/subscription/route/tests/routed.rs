@@ -610,10 +610,13 @@ async fn a_rejected_status_is_staged_with_the_node_it_went_through() {
                 .await
                 .unwrap_err();
             assert_eq!(failure_code(&error), "fetch_failed", "{error:#}");
-            assert_eq!(
-                error.to_string(),
-                format!("subscription server answered HTTP {status}")
-            );
+            let expected = match &via {
+                Some(_) => format!(
+                    "subscription 'own-provider': server answered HTTP {status} through node 'tunnel' of group 'proxy'; set route: direct for this subscription to fetch it outside routing"
+                ),
+                None => format!("subscription 'own-provider': server answered HTTP {status}"),
+            };
+            assert_eq!(error.to_string(), expected);
             assert_eq!(
                 failure_stage(&error),
                 Some(FetchFailure { stage, via }),
@@ -635,10 +638,13 @@ async fn a_direct_connection_refusal_is_staged_and_an_invalid_url_is_not() {
         .fetch(&subscription(closed, "direct"))
         .await
         .unwrap_err();
+    // The io error's text is kept, and the URL with its token is not.
+    let message = error.to_string();
     assert_eq!(
-        error.to_string(),
-        "subscription 'own-provider': download failed: connection_failed"
+        message,
+        "subscription 'own-provider': download failed: connection_failed (Connection refused (os error 111))"
     );
+    assert!(!message.contains(&closed.to_string()) && !message.contains("http"));
     assert_eq!(
         failure_stage(&error),
         Some(FetchFailure {
@@ -656,24 +662,26 @@ async fn a_direct_connection_refusal_is_staged_and_an_invalid_url_is_not() {
 #[test]
 fn direct_errors_map_to_the_stage_their_cause_names() {
     use std::io::{Error, ErrorKind};
+    use tokio_rustls::rustls::{CertificateError, Error as TlsError};
     let stage = |error: Error| super::super::direct_stage(&anyhow::Error::new(error));
+    let named = |stage: &'static str, cause: &str| Some((stage, Some(cause.to_owned())));
     assert_eq!(
-        stage(Error::from(ErrorKind::ConnectionRefused)),
-        Some("connection_failed")
-    );
-    assert_eq!(
-        stage(Error::from(ErrorKind::TimedOut)),
+        stage(Error::from(ErrorKind::TimedOut)).map(|found| found.0),
         Some("download_timeout")
     );
     assert_eq!(
         stage(Error::new(ErrorKind::NotFound, "no DNS addresses")),
-        Some("resolution_failed")
+        named("resolution_failed", "no DNS addresses")
     );
     assert_eq!(
-        stage(Error::other(
-            tokio_rustls::rustls::Error::HandshakeNotComplete
-        )),
-        Some("tls_failed")
+        stage(Error::other(TlsError::InvalidCertificate(
+            CertificateError::UnknownIssuer
+        ))),
+        named("tls_failed", "invalid peer certificate: UnknownIssuer")
+    );
+    assert_eq!(
+        stage(Error::new(ErrorKind::ConnectionReset, "reset")).map(|found| found.0),
+        Some("connection_failed")
     );
     assert_eq!(stage(Error::from(ErrorKind::InvalidInput)), None);
     assert_eq!(
