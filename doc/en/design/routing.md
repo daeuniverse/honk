@@ -270,8 +270,10 @@ Every relevant, loaded TC program exposes two non-inlined, distinct BTF-global
 functions, `honk_route_slot0` and `honk_route_slot1`. Uninstalled functions return
 an error and contain no fallback rule engine. The backend attaches the policy to every
 loaded LAN/WAN L2/L3 routing target before admitting traffic. Startup loads at least one
-target; a target loaded later for an interface plan receives the active generation's
-extension before it can be bound, and every later publication attaches to it too.
+target. Verification of later targets runs outside the backend lock and retains both
+slots' target metadata. Commit attaches the generation active at commit time, even if
+a different policy was published during verification, before making a target bindable.
+Every later publication includes committed targets without acquiring the verifier's lock.
 
 `ROUTING_POLICY_ROOT` is a one-entry map-in-map pointing at an immutable
 `RoutingPolicyDescriptor`. The descriptor identifies the slot, policy generation,

@@ -1,3 +1,3 @@
 Changed
 
-- Startup verifies only the TC programs the configured interfaces bind (plus one routing target), so a WAN-only Ethernet host no longer loads the LAN or L3 variants. A variant first needed later, such as `auto` moving to a PPP or WireGuard device, is verified by that reconcile.
+- Startup verifies only the TC programs the configured interfaces bind (plus one routing target), so a WAN-only Ethernet host no longer loads the LAN or L3 variants. Later variants are verified outside the shared backend lock and become bindable only after receiving the current routing generation; a failed variant does not block independent variants. Logging and event-consumer cancellation preserve the original map FDs required by deferred loads.

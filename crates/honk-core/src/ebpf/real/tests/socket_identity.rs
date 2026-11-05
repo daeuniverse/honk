@@ -29,9 +29,9 @@ async fn allocation_failure_allows_create_connect_and_send_without_identity() {
                 netlink.set_link_up(loopback, true).unwrap();
                 let mut storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
                     backend
-                        .bpf_mut()
+                        .maps_mut()
                         .unwrap()
-                        .map_mut("SOCKET_IDENTITY")
+                        .get_mut("SOCKET_IDENTITY")
                         .unwrap(),
                 )
                 .unwrap();

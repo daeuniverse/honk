@@ -141,7 +141,11 @@ impl RealEbpfBackend {
         let mut bpf = loader.load(obj)?;
         layout::validate_loaded_maps(&bpf)?;
         layout::validate_socket_identity(&bpf)?;
-        syscall::validate_loaded_udp_decision_sequence(&bpf)?;
+        syscall::validate_udp_decision_sequence_fd(syscall::map_raw_fd(
+            bpf.map(UDP_DECISION_SEQUENCE_MAP)
+                .ok_or_else(|| anyhow::anyhow!("UDP decision sequence map unavailable"))?,
+        ))?;
+        let retained_maps = programs::retain_consumer_maps(&mut bpf)?;
         for name in [
             "COOKIE_PID_MAP",
             "UDP_DECISION_EPOCH",
@@ -275,18 +279,22 @@ impl RealEbpfBackend {
         // proxy-bound traffic. Skipping entries here marks every outbound
         // dead, so an insert error aborts startup.
         for index in 0..honk_ebpf_common::MAX_OUTBOUNDS * 6 {
-            set_array_value(&mut bpf, "OUTBOUND_CONNECTIVITY_MAP", index, &1u64)
-                .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
+            set_array_value(
+                bpf.map_mut("OUTBOUND_CONNECTIVITY_MAP")
+                    .ok_or_else(|| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP unavailable"))?,
+                "OUTBOUND_CONNECTIVITY_MAP",
+                index,
+                &1u64,
+            )
+            .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
         }
 
         let bindings = bindings::InterfaceBindings::preload(&mut bpf, programs)?;
 
         info!("eBPF loaded and attached");
 
-        // aya-log must be initialized *after* programs are loaded, otherwise the
-        // AYA_LOGS map fd taken by the logger is not valid during BPF_PROG_LOAD.
-        //
-        // Wait on the ringbuf fd with AsyncFd (official aya-log 0.3 pattern).
+        // Consumer handles are duplicates; the loader retains the original relocation FDs.
+        // Wait on the ringbuf fd with AsyncFd (official aya-log 0.4 pattern).
         // A fixed-interval flush was waking every 100ms even when empty and
         // could burn a full core under high eBPF log volume via spawn_blocking.
         let log_flush_handle = match aya_log::EbpfLogger::init(&mut bpf) {
@@ -333,9 +341,20 @@ impl RealEbpfBackend {
         let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
         let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
         let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
+        #[cfg(test)]
+        let routing_test_targets = routing::prepare_test_target(&mut bpf)?;
+        let (programs, maps) = programs::ProgramLoader::new(
+            bpf,
+            retained_maps,
+            #[cfg(feature = "native-api")]
+            receive_trace_offsets.is_some(),
+        )?;
 
         Ok(Self {
-            bpf: Some(bpf),
+            maps: Some(maps),
+            programs: Some(programs),
+            #[cfg(test)]
+            routing_test_targets,
             pin_root: pin_root.to_path_buf(),
             pinned_maps: std::mem::take(&mut pinned_maps.names),
             bindings,
@@ -365,12 +384,6 @@ impl RealEbpfBackend {
             next_trace_policy: 0,
             #[cfg(feature = "native-api")]
             trace_dictionaries: Default::default(),
-            #[cfg(feature = "native-api")]
-            receive_trace: None,
-            #[cfg(feature = "native-api")]
-            receive_trace_available: receive_trace_offsets.is_some(),
-            #[cfg(feature = "native-api")]
-            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
             aux_deletes: Default::default(),
         })

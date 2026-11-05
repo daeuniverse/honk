@@ -12,6 +12,86 @@ use honk_ebpf_common::{
 };
 use std::os::fd::{AsFd, AsRawFd};
 
+#[tokio::test]
+#[ignore = "requires root; run via just test-netns"]
+async fn deferred_target_extension_failure_stays_unbindable_and_retries() {
+    use crate::ebpf::interface::TcProgram;
+    use std::path::Path;
+
+    let pin_root =
+        Path::new("/sys/fs/bpf").join(format!("honk-extension-retry-test-{}", std::process::id()));
+    let (_dae0, setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &setup,
+        0,
+        &[TcProgram::WanEgressL2],
+    )
+    .await
+    .expect("backend load");
+    let ids = std::collections::HashMap::from([("direct".into(), 0), ("block".into(), 1)]);
+    let direct =
+        RoutingPushPlan::compile(&Router::new(&[], "direct").unwrap(), &ids, DialMode::Ip).unwrap();
+    let block =
+        RoutingPushPlan::compile(&Router::new(&[], "block").unwrap(), &ids, DialMode::Ip).unwrap();
+    backend
+        .publish_routing_plan(&direct, &[])
+        .expect("initial generation");
+    let variant = TcProgram::WanEgressL3;
+    let prepare = backend.prepare_tc_programs(&[variant]).unwrap();
+    let mut batch = tokio::task::spawn_blocking(prepare).await.unwrap();
+    let mut prepared = batch.pop().unwrap().1.unwrap();
+    prepared.routing.as_mut().unwrap()[backend.active_routing_slot().unwrap() as usize]
+        .function_id = u32::MAX;
+    let error = backend
+        .commit_tc_programs(vec![(variant, Ok(prepared))])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("BPF_LINK_CREATE EXT"),
+        "{error:#}"
+    );
+    assert!(
+        backend
+            .interface_binding_snapshot()
+            .unwrap()
+            .programs
+            .iter()
+            .all(|(program, _)| *program != variant)
+    );
+    backend
+        .publish_routing_plan(&block, &[])
+        .expect("new generation after failure");
+    let prepare = backend.prepare_tc_programs(&[variant]).unwrap();
+    let batch = tokio::task::spawn_blocking(prepare).await.unwrap();
+    backend
+        .commit_tc_programs(batch)
+        .expect("retry previously verified variant");
+    assert_eq!(
+        backend
+            .interface_binding_snapshot()
+            .unwrap()
+            .programs
+            .iter()
+            .filter(|(program, _)| *program == variant)
+            .count(),
+        1
+    );
+    backend
+        .publish_routing_plan(&direct, &[])
+        .expect("publication includes retried target once");
+    backend.cleanup().await.expect("backend cleanup");
+    drop(backend);
+    for name in [
+        crate::ebpf::UDP_DECISION_SEQUENCE_MAP,
+        super::super::ROUTING_GENERATION_SEQUENCE_MAP,
+    ] {
+        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+    }
+    std::fs::remove_dir(&pin_root).expect("remove test pin root");
+}
+
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn publication_failure_recovery_and_frozen_root() {
@@ -118,7 +198,7 @@ fn publication_failure_recovery_and_frozen_root() {
     assert_eq!(backend.active_routing_slot().unwrap(), old_slot);
     let inactive_slot = old_slot ^ 1;
     let inactive_name = ROUTING_SLOT_NAMES[inactive_slot as usize];
-    let targets = backend.routing_targets(inactive_name).unwrap();
+    let targets = backend.routing_targets(inactive_slot as usize).unwrap();
     let maps = create_maps(&recovery.facts, &[]).unwrap();
     let bytecode =
         crate::control::routing_matcher::codegen::emit_routing_program(&recovery, maps.fds())
@@ -169,7 +249,9 @@ fn publication_failure_recovery_and_frozen_root() {
         RoutingPushPlan::compile(&root_candidate_router, &ids, DialMode::Ip).unwrap();
     let root_candidate_slot = recovered_slot ^ 1;
     let root_candidate_name = ROUTING_SLOT_NAMES[root_candidate_slot as usize];
-    let root_candidate_targets = backend.routing_targets(root_candidate_name).unwrap();
+    let root_candidate_targets = backend
+        .routing_targets(root_candidate_slot as usize)
+        .unwrap();
 
     freeze_root(&backend);
 
@@ -287,9 +369,9 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
 
 fn freeze_root(backend: &RealEbpfBackend) {
     let aya::maps::Map::ArrayOfMaps(root) = backend
-        .bpf()
+        .maps()
         .unwrap()
-        .map(ROUTING_POLICY_ROOT_NAME)
+        .get(ROUTING_POLICY_ROOT_NAME)
         .unwrap()
     else {
         panic!("routing root is not an array of maps");
@@ -301,9 +383,9 @@ fn freeze_root(backend: &RealEbpfBackend) {
 
 fn published_descriptor(backend: &RealEbpfBackend) -> honk_ebpf_common::RoutingPolicyDescriptor {
     let root = backend
-        .bpf()
+        .maps()
         .unwrap()
-        .map(ROUTING_POLICY_ROOT_NAME)
+        .get(ROUTING_POLICY_ROOT_NAME)
         .unwrap();
     let root =
         aya::maps::ArrayOfMaps::<_, super::super::RoutingDescriptor>::try_from(root).unwrap();

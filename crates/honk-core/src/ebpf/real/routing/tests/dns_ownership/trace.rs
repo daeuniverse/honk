@@ -3,7 +3,7 @@ use crate::ebpf::{RetireCounts, RetireKind, UdpDecisionCommitResult, retire_fixt
 use honk_ebpf_common::DATAPATH_FLAG_TRACE_ENABLED;
 
 fn witness(backend: &RealEbpfBackend, id: u32) -> KernelRouteWitness {
-    let map = backend.bpf().unwrap().map("ROUTE_TRACE_MAP").unwrap();
+    let map = backend.maps().unwrap().get("ROUTE_TRACE_MAP").unwrap();
     HashMap::<_, u32, KernelRouteWitness>::try_from(map)
         .unwrap()
         .get(&id, 0)
@@ -264,7 +264,7 @@ fn staged_udp_witness_uses_exact_token_and_generation() {
             // A staged first packet already records its client, token-free.
             let mut client = RedirectTuple::from_tuples(&key);
             (client.dst_ip, client.dst_port) = (In6Addr::zero(), 0);
-            let map = backend.bpf().unwrap().map("CLIENT_REPLY_TRACK").unwrap();
+            let map = backend.maps().unwrap().get("CLIENT_REPLY_TRACK").unwrap();
             let record: RedirectEntry = HashMap::try_from(map).unwrap().get(&client, 0).unwrap();
             assert_eq!(record.decision_token, 0);
             assert_eq!(
@@ -310,9 +310,9 @@ fn tcp_replacement_keeps_ambiguity_after_prior_sidecar_loss() {
         let old = witness(&backend, first.trace_id);
         assert_eq!(old.output.flags & ROUTE_TRACE_AMBIGUOUS, 0);
         let map = backend
-            .bpf_mut()
+            .maps_mut()
             .unwrap()
-            .map_mut("ROUTE_TRACE_MAP")
+            .get_mut("ROUTE_TRACE_MAP")
             .unwrap();
         HashMap::<_, u32, KernelRouteWitness>::try_from(map)
             .unwrap()
@@ -382,7 +382,7 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
             );
             references.push((key, handoff(&backend, &key)));
         }
-        let map = backend.bpf().unwrap().map("ROUTE_TRACE_MAP").unwrap();
+        let map = backend.maps().unwrap().get("ROUTE_TRACE_MAP").unwrap();
         let map = HashMap::<_, u32, KernelRouteWitness>::try_from(map).unwrap();
         let (key, original) = references
             .iter()
@@ -407,7 +407,7 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
         );
         let restored = handoff(&backend, key);
         assert_eq!(restored.trace_id, original.trace_id);
-        let map = backend.bpf().unwrap().map("ROUTE_TRACE_MAP").unwrap();
+        let map = backend.maps().unwrap().get("ROUTE_TRACE_MAP").unwrap();
         let map = HashMap::<_, u32, KernelRouteWitness>::try_from(map).unwrap();
         assert!(map.get(&restored.trace_id, 0).is_err());
         assert_eq!(restored.result.outbound, original.result.outbound);

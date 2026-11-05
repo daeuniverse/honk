@@ -1,9 +1,10 @@
 use super::*;
 use crate::ebpf::DomainRouteWriteError;
+#[cfg(test)]
 use crate::ebpf::interface::TcProgram;
 use crate::ebpf::maps::DOMAIN_MAP_CAPACITY;
 use aya::maps::{ArrayOfMaps as AyaArrayOfMaps, IterableMap};
-use aya::programs::{ProgramError, ProgramFd, SchedClassifier};
+use aya::programs::{ProgramFd, SchedClassifier};
 #[cfg(test)]
 use aya::programs::{TestRun, TestRunOptions};
 use aya_obj::btf::{Btf, BtfKind};
@@ -48,10 +49,52 @@ struct RoutingMaps {
     domain: RoutingDomain,
 }
 
-struct Target {
+pub(super) struct Target {
     fd: ProgramFd,
     function_id: u32,
     btf: Btf,
+}
+
+impl Target {
+    fn try_clone(&self) -> anyhow::Result<Self> {
+        Ok(Self {
+            fd: self.fd.try_clone()?,
+            function_id: self.function_id,
+            btf: self.btf.clone(),
+        })
+    }
+}
+
+pub(super) fn prepare_targets(program: &SchedClassifier) -> anyhow::Result<[Target; 2]> {
+    let info = program.info()?;
+    let btf_id = info
+        .btf_id()
+        .ok_or_else(|| anyhow::anyhow!("routing target has no BTF"))?;
+    let kernel_btf = btf_fd_by_id(btf_id)?;
+    let bytes = btf_bytes(&kernel_btf)?;
+    let btf = Btf::parse(&bytes, Default::default())?;
+    let target = |slot_name: &str| -> anyhow::Result<Target> {
+        validate_routing_decision_abi(&bytes, slot_name)?;
+        Ok(Target {
+            fd: program.fd()?.try_clone()?,
+            function_id: btf.id_by_type_name_kind(slot_name, BtfKind::Func)?,
+            btf: btf.clone(),
+        })
+    };
+    Ok([
+        target(ROUTING_SLOT_NAMES[0])?,
+        target(ROUTING_SLOT_NAMES[1])?,
+    ])
+}
+
+#[cfg(test)]
+pub(super) fn prepare_test_target(bpf: &mut Ebpf) -> anyhow::Result<Option<[Target; 2]>> {
+    let Some(program) = bpf.program_mut("routing_test") else {
+        return Ok(None);
+    };
+    let program: &mut SchedClassifier = program.try_into()?;
+    program.load()?;
+    prepare_targets(program).map(Some)
 }
 
 fn bpf_syscall(cmd: bpf_cmd, attr: &mut bpf_attr) -> io::Result<i64> {
@@ -418,8 +461,8 @@ pub(super) fn open_routing_generation_sequence(
 impl RealEbpfBackend {
     pub(super) fn observed_routing_generation(&self) -> anyhow::Result<Option<u64>> {
         let root = self
-            .bpf()?
-            .map(ROUTING_POLICY_ROOT_NAME)
+            .maps()?
+            .get(ROUTING_POLICY_ROOT_NAME)
             .ok_or_else(|| anyhow::anyhow!("routing root unavailable"))?;
         let root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
         let descriptor = match root.get(&0, 0) {
@@ -464,8 +507,8 @@ impl RealEbpfBackend {
         let mut descriptor = RoutingDescriptor::create(1, 0)?;
         descriptor.set(0, &value, 0)?;
         let root = self
-            .bpf_mut()?
-            .map_mut(ROUTING_POLICY_ROOT_NAME)
+            .maps_mut()?
+            .get_mut(ROUTING_POLICY_ROOT_NAME)
             .ok_or_else(|| anyhow::anyhow!("map '{ROUTING_POLICY_ROOT_NAME}' not found"))?;
         let mut root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
         root.set(0, &descriptor, 0)?;
@@ -484,61 +527,30 @@ impl RealEbpfBackend {
         Ok(())
     }
 
-    fn routing_targets(&mut self, slot_name: &str) -> anyhow::Result<Vec<Target>> {
-        // An unloaded variant is not bindable; it gets the active extension when
-        // it is first loaded (`extend_routing_target`).
-        let mut names: Vec<&str> = TcProgram::ALL
-            .into_iter()
-            .filter(|program| program.routes() && self.bindings.has(*program))
-            .map(TcProgram::name)
-            .collect();
-        if self.bpf_mut()?.program("routing_test").is_some() {
-            names.push("routing_test");
-        }
-        names
-            .into_iter()
-            .map(|name| self.routing_target(name, slot_name))
-            .collect()
+    fn routing_targets(&self, slot: usize) -> anyhow::Result<Vec<Target>> {
+        let targets = self.bindings.routing_targets(slot);
+        #[cfg(test)]
+        let targets = targets.chain(
+            self.routing_test_targets
+                .as_ref()
+                .map(|targets| &targets[slot]),
+        );
+        targets.map(Target::try_clone).collect()
     }
 
-    fn routing_target(&mut self, name: &str, slot_name: &str) -> anyhow::Result<Target> {
-        let program: &mut SchedClassifier = self
-            .bpf_mut()?
-            .program_mut(name)
-            .ok_or_else(|| anyhow::anyhow!("routing target '{name}' not found"))?
-            .try_into()?;
-        match program.load() {
-            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-            Err(error) => return Err(anyhow::anyhow!("load routing target '{name}': {error}")),
-        }
-        let info = program.info()?;
-        let btf_id = info
-            .btf_id()
-            .ok_or_else(|| anyhow::anyhow!("routing target '{name}' has no BTF"))?;
-        let fd = program.fd()?.try_clone()?;
-        let kernel_btf = btf_fd_by_id(btf_id)?;
-        let bytes = btf_bytes(&kernel_btf)?;
-        validate_routing_decision_abi(&bytes, slot_name)?;
-        let btf = Btf::parse(&bytes, Default::default())?;
-        let function_id = btf.id_by_type_name_kind(slot_name, BtfKind::Func)?;
-        Ok(Target {
-            fd,
-            function_id,
-            btf,
-        })
-    }
-
-    /// Attach the active generation's extension to a routing target loaded
-    /// after that generation was published. Without an active generation the
-    /// next publication covers it.
-    pub(super) fn extend_routing_target(&mut self, program: TcProgram) -> anyhow::Result<()> {
-        if self.routing_generation.is_none() {
+    /// The active generation is read only at commit, after off-lock verification.
+    pub(super) fn extend_routing_target(
+        &mut self,
+        prepared: &super::bindings::PreparedTcProgram,
+    ) -> anyhow::Result<()> {
+        let Some(targets) = prepared.routing.as_ref() else {
             return Ok(());
-        }
-        let slot_name = ROUTING_SLOT_NAMES[self.routing_slot as usize];
-        let target = self.routing_target(program.name(), slot_name)?;
-        let generation = self.routing_generation.as_mut().unwrap();
-        let link = attach_extension(&generation.program, &target)?;
+        };
+        let Some(generation) = self.routing_generation.as_mut() else {
+            return Ok(());
+        };
+        let target = &targets[self.routing_slot as usize];
+        let link = attach_extension(&generation.program, target)?;
         generation.links.push(link);
         Ok(())
     }
@@ -562,7 +574,7 @@ impl RealEbpfBackend {
         );
         let slot = active ^ 1;
         let slot_name = ROUTING_SLOT_NAMES[slot as usize];
-        let targets = self.routing_targets(slot_name)?;
+        let targets = self.routing_targets(slot as usize)?;
         let maps = create_maps(&plan.facts, learned_domains)?;
         let bytecode =
             crate::control::routing_matcher::codegen::emit_routing_program(plan, maps.fds())?;
@@ -622,9 +634,18 @@ impl RealEbpfBackend {
     /// Load the production object without attaching any network or cgroup hook.
     /// The resulting backend can publish a real generated policy and exercise
     /// the optional `routing_test` classifier with `BPF_PROG_TEST_RUN`.
-    pub(crate) fn load_routing_test_fixture(
+    pub(crate) fn load_routing_test_fixture(obj: &[u8], param: DaeParam) -> anyhow::Result<Self> {
+        let programs: Vec<_> = TcProgram::ALL
+            .into_iter()
+            .filter(|program| program.routes())
+            .collect();
+        Self::load_routing_test_fixture_with_programs(obj, param, &programs)
+    }
+
+    pub(crate) fn load_routing_test_fixture_with_programs(
         obj: &[u8],
         mut param: DaeParam,
+        programs: &[TcProgram],
     ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
@@ -638,16 +659,21 @@ impl RealEbpfBackend {
         loader.override_global("PARAM", &param, true);
         let mut bpf = loader.load(obj)?;
         layout::validate_loaded_maps(&bpf)?;
+        let retained_maps = programs::retain_consumer_maps(&mut bpf)?;
         let retirement_grace_inner = retirement::init_retirement_grace(&mut bpf)?;
         let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
-        // Like startup, keep routing targets loaded so publication has targets.
-        let routing_targets: Vec<_> = TcProgram::ALL
-            .into_iter()
-            .filter(|program| program.routes())
-            .collect();
-        let bindings = bindings::InterfaceBindings::preload(&mut bpf, &routing_targets)?;
+        let bindings = bindings::InterfaceBindings::preload(&mut bpf, programs)?;
+        let routing_test_targets = prepare_test_target(&mut bpf)?;
+        let (programs, maps) = programs::ProgramLoader::new(
+            bpf,
+            retained_maps,
+            #[cfg(feature = "native-api")]
+            false,
+        )?;
         Ok(Self {
-            bpf: Some(bpf),
+            maps: Some(maps),
+            programs: Some(programs),
+            routing_test_targets,
             pin_root: PathBuf::new(),
             pinned_maps: Vec::new(),
             bindings,
@@ -676,12 +702,6 @@ impl RealEbpfBackend {
             next_trace_policy: 0,
             #[cfg(feature = "native-api")]
             trace_dictionaries: Default::default(),
-            #[cfg(feature = "native-api")]
-            receive_trace: None,
-            #[cfg(feature = "native-api")]
-            receive_trace_available: false,
-            #[cfg(feature = "native-api")]
-            receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,
             aux_deletes: Default::default(),
         })
@@ -733,8 +753,8 @@ impl RealEbpfBackend {
         self.array_set("ROUTING_TEST_INPUT", 0, input)?;
         let packet = [0u8; 64];
         {
-            let program: &SchedClassifier = self
-                .bpf()?
+            let object = self.bpf()?;
+            let program: &SchedClassifier = object
                 .program("routing_test")
                 .ok_or_else(|| anyhow::anyhow!("routing-test program is absent"))?
                 .try_into()?;

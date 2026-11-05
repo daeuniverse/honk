@@ -78,9 +78,9 @@ pub(super) fn remove_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow:
         })
 }
 
-fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
+pub(super) fn map_data(map: &aya::maps::Map) -> &AyaMapData {
     use aya::maps::Map;
-    let data: &aya::maps::MapData = match map {
+    match map {
         Map::Array(d)
         | Map::ArrayOfMaps(d)
         | Map::BloomFilter(d)
@@ -111,12 +111,15 @@ fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
         | Map::StackTraceMap(d)
         | Map::Unsupported(d)
         | Map::XskMap(d) => d,
-    };
-    data.fd().as_fd().as_raw_fd()
+    }
 }
 
-pub(super) fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
-    bpf.map(name)
+pub(super) fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
+    map_data(map).fd().as_fd().as_raw_fd()
+}
+
+pub(super) fn map_fd(bpf: &super::programs::KernelMaps, name: &str) -> anyhow::Result<RawFd> {
+    bpf.get(name)
         .map(map_raw_fd)
         .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
 }
@@ -218,7 +221,7 @@ fn validate_udp_decision_sequence_value(sequence: UdpDecisionSequence) -> anyhow
     Ok(())
 }
 
-fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
+pub(super) fn validate_udp_decision_sequence_fd(fd: RawFd) -> anyhow::Result<UdpDecisionSequence> {
     let info = raw_map_info(fd)?;
     validate_udp_decision_sequence_info(&info)?;
     let sequence = locked_udp_decision_sequence(fd)?;
@@ -232,16 +235,23 @@ pub fn validate_pinned_udp_decision_sequence(path: &Path) -> anyhow::Result<()> 
     validate_udp_decision_sequence_fd(map.fd().as_fd().as_raw_fd()).map(|_| ())
 }
 
-pub fn validate_loaded_udp_decision_sequence(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
+pub fn validate_loaded_udp_decision_sequence(
+    bpf: &super::programs::KernelMaps,
+) -> anyhow::Result<UdpDecisionSequence> {
     validate_udp_decision_sequence_fd(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
 }
 
 #[cfg(test)]
-pub(super) fn read_udp_decision_sequence_locked(bpf: &Ebpf) -> anyhow::Result<UdpDecisionSequence> {
+pub(super) fn read_udp_decision_sequence_locked(
+    bpf: &super::programs::KernelMaps,
+) -> anyhow::Result<UdpDecisionSequence> {
     locked_udp_decision_sequence(map_fd(bpf, super::super::UDP_DECISION_SEQUENCE_MAP)?)
 }
 
-pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow::Result<()> {
+pub fn reset_udp_decision_sequence_locked(
+    bpf: &super::programs::KernelMaps,
+    generation: u32,
+) -> anyhow::Result<()> {
     let value = UdpDecisionSequence {
         next: generation << honk_ebpf_common::UDP_DECISION_GENERATION_SHIFT,
         ..Default::default()
@@ -254,7 +264,7 @@ pub fn reset_udp_decision_sequence_locked(bpf: &Ebpf, generation: u32) -> anyhow
 
 #[cfg(test)]
 pub(super) fn write_udp_decision_sequence_locked(
-    bpf: &Ebpf,
+    bpf: &super::programs::KernelMaps,
     value: &UdpDecisionSequence,
 ) -> anyhow::Result<()> {
     update_locked_udp_decision_sequence(
@@ -272,7 +282,10 @@ pub(super) fn validate_map_layout(
     entries: u32,
     flags: u32,
 ) -> anyhow::Result<()> {
-    let info = raw_map_info(map_fd(bpf, name)?)?;
+    let map = bpf
+        .map(name)
+        .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))?;
+    let info = raw_map_info(map_raw_fd(map))?;
     anyhow::ensure!(
         info.type_ == type_ as u32
             && info.key_size == key
@@ -291,7 +304,7 @@ pub(super) fn validate_map_layout(
 
 /// Streaming lookup-batch variant that keeps memory bounded to one chunk.
 pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
-    bpf: &Ebpf,
+    bpf: &super::programs::KernelMaps,
     cap: &BatchCapability,
     map: &str,
     visit: &mut BatchVisitor<'_, K, V>,
@@ -300,7 +313,7 @@ pub fn bpf_lookup_batch_scan_cb<K: Pod, V: Pod>(
 }
 
 pub(super) fn bpf_lookup_batch_scan_cb_flags<K: Pod, V: Pod>(
-    bpf: &Ebpf,
+    bpf: &super::programs::KernelMaps,
     cap: &BatchCapability,
     map: &str,
     elem_flags: u64,

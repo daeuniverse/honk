@@ -17,14 +17,9 @@ fn age_udp_conn(backend: &mut RealEbpfBackend, key: &TuplesKey, age_s: u64) -> C
 fn idle_udp_handoff_renews_only_its_matching_owner_without_an_expiry_hint() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
-        let mut ring = RingBuf::try_from(
-            backend
-                .bpf_mut()
-                .unwrap()
-                .take_map("EVENT_RINGBUF")
-                .unwrap(),
-        )
-        .unwrap();
+        let mut ring =
+            RingBuf::try_from(backend.maps_mut().unwrap().remove("EVENT_RINGBUF").unwrap())
+                .unwrap();
         for (src, dst) in PEERS {
             for (direction, side) in ["lan_ingress_l2", "wan_egress_l2"].into_iter().enumerate() {
                 let key = tuple(src, dst, 45800 + direction as u16 * 100, 443, IPPROTO_UDP);

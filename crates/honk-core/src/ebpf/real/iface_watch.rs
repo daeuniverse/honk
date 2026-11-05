@@ -4,8 +4,9 @@
 //! the TCX bindings once and reconcile them against the backend's single
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
-//! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write). Without a usable event
+//! with no backend lock held. Verification also runs off-lock; only current-generation
+//! extension installation, bindability publication and link commits require the write
+//! lock. Without a usable event
 //! subscription the same loop runs on the ticker alone.
 
 use nix::errno::Errno;
@@ -462,14 +463,25 @@ impl Watch {
                 .map(|held| missing_programs(held, &plan))
                 .unwrap_or_default();
             if !missing.is_empty() {
-                // First use of a variant: its verifier run holds the write lock.
-                let mut ebpf = self.ebpf.write().await;
-                if let Err(error) =
-                    crate::control::nfqueue::blocking_section(|| ebpf.load_tc_programs(&missing))
-                {
-                    warn!("load TC programs for the interface plan: {error:#}");
+                let prepare = self.ebpf.read().await.prepare_tc_programs(&missing);
+                match prepare {
+                    Ok(Some(prepare)) => {
+                        let prepared = tokio::task::spawn_blocking(prepare).await;
+                        let batch = match prepared {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                return Err(self.step_failed(ReconcileStep::Join, error.into()));
+                            }
+                        };
+                        let mut ebpf = self.ebpf.write().await;
+                        if let Err(error) = ebpf.commit_tc_programs(batch) {
+                            warn!("load TC programs for the interface plan: {error:#}");
+                        }
+                        snapshot = ebpf.interface_binding_snapshot();
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("prepare TC programs for the interface plan: {error:#}"),
                 }
-                snapshot = ebpf.interface_binding_snapshot();
             }
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,

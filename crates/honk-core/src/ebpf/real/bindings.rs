@@ -23,6 +23,7 @@ use aya_obj::generated::{
     BPF_F_AFTER, BPF_F_REPLACE, bpf_attach_type, bpf_attr, bpf_cmd, bpf_link_info,
 };
 
+use super::routing::Target;
 use super::syscall::bpf_syscall;
 use crate::ebpf::interface::{
     ApplyReport, Binding, BindingCommit, BindingSnapshot, Direction, InterfacePlan, TcProgram,
@@ -38,9 +39,36 @@ const CHAIN_CAPACITY: usize = 64;
 
 type Key = (NonZeroU32, Direction);
 
+/// A verified TC variant that has not yet been published for binding.
+pub struct PreparedTcProgram {
+    pub(super) program: TcProgram,
+    pub(super) fd: OwnedFd,
+    pub(super) routing: Option<[Target; 2]>,
+}
+
+impl PreparedTcProgram {
+    pub(super) fn load(bpf: &mut Ebpf, program: TcProgram) -> anyhow::Result<Self> {
+        let fd = load(bpf, program)?;
+        let routing = if program.routes() {
+            let classifier: &SchedClassifier = bpf
+                .program(program.name())
+                .expect("loaded TC program")
+                .try_into()?;
+            Some(super::routing::prepare_targets(classifier)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            program,
+            fd,
+            routing,
+        })
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct InterfaceBindings {
-    programs: Vec<(TcProgram, OwnedFd)>,
+    programs: Vec<PreparedTcProgram>,
     owned: Vec<(Binding, u32, OwnedFd)>,
 }
 
@@ -50,18 +78,23 @@ impl InterfaceBindings {
     pub(super) fn preload(bpf: &mut Ebpf, programs: &[TcProgram]) -> anyhow::Result<Self> {
         let mut bindings = Self::default();
         for program in programs {
-            let fd = load(bpf, *program)?;
-            bindings.add(*program, fd);
+            bindings.add(PreparedTcProgram::load(bpf, *program)?);
         }
         Ok(bindings)
     }
 
     /// Make a loaded variant bindable. A routing target must already carry the
     /// active routing extension.
-    pub(super) fn add(&mut self, program: TcProgram, fd: OwnedFd) {
-        if !self.has(program) {
-            self.programs.push((program, fd));
+    pub(super) fn add(&mut self, prepared: PreparedTcProgram) {
+        if !self.has(prepared.program) {
+            self.programs.push(prepared);
         }
+    }
+
+    pub(super) fn routing_targets(&self, slot: usize) -> impl Iterator<Item = &Target> {
+        self.programs
+            .iter()
+            .filter_map(move |program| program.routing.as_ref().map(|targets| &targets[slot]))
     }
 
     pub(super) fn owned(&self) -> &[(Binding, u32, OwnedFd)] {
@@ -69,7 +102,7 @@ impl InterfaceBindings {
     }
 
     pub(super) fn has(&self, program: TcProgram) -> bool {
-        self.programs.iter().any(|(held, _)| *held == program)
+        self.programs.iter().any(|held| held.program == program)
     }
 
     /// Variants `plan` binds that are not loaded yet.
@@ -88,7 +121,7 @@ impl InterfaceBindings {
             programs: self
                 .programs
                 .iter()
-                .map(|(program, fd)| Ok((*program, dup(fd)?)))
+                .map(|prepared| Ok((prepared.program, dup(&prepared.fd)?)))
                 .collect::<anyhow::Result<_>>()?,
             owned: self
                 .owned
@@ -533,28 +566,55 @@ pub(super) fn query_chain(ifindex: u32, direction: Direction) -> io::Result<Chai
     unreachable!("the second attempt returns")
 }
 
-impl super::RealEbpfBackend {
-    /// Load the given variants that are not loaded yet. A routing target gets
-    /// the active routing extension before it becomes bindable. On error the
-    /// variants loaded so far stay.
-    pub(crate) fn load_tc_programs(&mut self, programs: &[TcProgram]) -> anyhow::Result<()> {
-        for &program in programs {
-            if self.bindings.has(program) {
-                continue;
-            }
-            let started = std::time::Instant::now();
-            let fd = load(self.bpf_mut()?, program)?;
-            if program.routes() {
-                self.extend_routing_target(program)?;
-            }
-            self.bindings.add(program, fd);
-            tracing::info!(
-                program = program.name(),
-                elapsed = ?started.elapsed(),
-                "loaded TC program on first use"
-            );
+pub(super) fn commit_program_batch(
+    batch: super::programs::TcProgramBatch,
+    mut publish: impl FnMut(PreparedTcProgram) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let mut first_error = None;
+    for (_, result) in batch {
+        if let Err(error) = result.and_then(&mut publish) {
+            first_error.get_or_insert(error);
         }
-        Ok(())
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+impl super::RealEbpfBackend {
+    /// Verify without sharing the backend, as used by startup and real-kernel fixtures.
+    pub(crate) fn load_tc_programs(&mut self, programs: &[TcProgram]) -> anyhow::Result<()> {
+        let prepare = self.prepare_tc_programs(programs)?;
+        self.commit_tc_programs(prepare())
+    }
+
+    pub(super) fn prepare_tc_programs(
+        &self,
+        programs: &[TcProgram],
+    ) -> anyhow::Result<super::programs::TcProgramPreparation> {
+        let missing = programs
+            .iter()
+            .copied()
+            .filter(|program| !self.bindings.has(*program))
+            .collect();
+        Ok(self
+            .programs
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("eBPF object not loaded"))?
+            .prepare(missing))
+    }
+
+    pub(super) fn commit_tc_programs(
+        &mut self,
+        batch: super::programs::TcProgramBatch,
+    ) -> anyhow::Result<()> {
+        commit_program_batch(batch, |prepared| {
+            let program = prepared.program;
+            if !self.bindings.has(program) {
+                self.extend_routing_target(&prepared)?;
+                self.bindings.add(prepared);
+                tracing::info!(program = program.name(), "loaded TC program on first use");
+            }
+            Ok(())
+        })
     }
 
     /// Startup bind, before the backend is shared, using the watcher's apply.

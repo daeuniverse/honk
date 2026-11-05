@@ -398,9 +398,9 @@ fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
                 );
                 let sequence = Array::<_, FlowIncarnationSequence>::try_from(
                     backend
-                        .bpf()
+                        .maps()
                         .unwrap()
-                        .map("FLOW_INCARNATION_SEQUENCE")
+                        .get("FLOW_INCARNATION_SEQUENCE")
                         .unwrap(),
                 )
                 .unwrap()
@@ -437,14 +437,9 @@ fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership()
         let (src, dst) = PEERS[0];
         for side in ["lan_ingress_l2", "wan_egress_l2"] {
             let (mut backend, _, _listeners) = proxy_fixture();
-            let mut ring = RingBuf::try_from(
-                backend
-                    .bpf_mut()
-                    .unwrap()
-                    .take_map("EVENT_RINGBUF")
-                    .unwrap(),
-            )
-            .unwrap();
+            let mut ring =
+                RingBuf::try_from(backend.maps_mut().unwrap().remove("EVENT_RINGBUF").unwrap())
+                    .unwrap();
             let mut keys = [TuplesKey::default(); 3];
             let mut owners = [0; 3];
             for index in 0..3 {
@@ -611,7 +606,7 @@ fn assert_claim_fence(backend: &RealEbpfBackend, key: &TuplesKey) {
         })
     );
     assert_eq!(
-        Array::<_, u32>::try_from(backend.bpf().unwrap().map("RETIRE_ACTIVE").unwrap())
+        Array::<_, u32>::try_from(backend.maps().unwrap().get("RETIRE_ACTIVE").unwrap())
             .unwrap()
             .get(&0, 0)
             .unwrap(),
