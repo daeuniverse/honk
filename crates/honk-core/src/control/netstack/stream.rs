@@ -19,6 +19,7 @@ pub struct FlowIo {
     peer: SocketAddr,
     dscp: u8,
     open: bool,
+    routing: Option<crate::control::packet_endpoint::EndpointAdmission>,
 }
 
 impl FlowIo {
@@ -30,6 +31,7 @@ impl FlowIo {
             peer: syn.client,
             dscp: syn.dscp,
             open: true,
+            routing: None,
         }
     }
 
@@ -47,6 +49,21 @@ impl FlowIo {
     }
     pub fn flow_id(&self) -> FlowId {
         self.id
+    }
+
+    pub(in crate::control) fn set_routing(
+        &mut self,
+        routing: Option<crate::control::packet_endpoint::EndpointAdmission>,
+    ) {
+        self.routing = routing;
+    }
+
+    pub(in crate::control) fn take_routing(
+        &mut self,
+    ) -> Option<crate::control::connection::routing::PacketRoutingSnapshot> {
+        self.routing
+            .take()
+            .map(crate::control::packet_endpoint::EndpointAdmission::into_snapshot)
     }
 
     pub fn reserve_memory(&self, bytes: usize) -> io::Result<MemoryReservation> {

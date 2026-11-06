@@ -2,10 +2,12 @@ mod assets;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod cursor;
+mod datapath;
 mod diagnostics;
 mod dns;
 mod entries;
 mod experimental;
+mod firewall;
 mod groups;
 pub mod lexer;
 mod routing;
@@ -676,6 +678,9 @@ fn parse_documents(
             Some(Root::Global) => config.global = parse_global_section(segments, diagnostics)?,
             Some(Root::Dns) => config.dns = dns::parse_section(segments, diagnostics)?,
             Some(Root::Routing) => config.routing = routing::parse_section(segments, diagnostics)?,
+            Some(Root::Datapath) => {
+                config.datapath = Some(datapath::parse_section(segments, diagnostics)?)
+            }
             Some(Root::Node) => config.nodes = parse_node_section(segments, diagnostics)?,
             Some(Root::Group) => {}
             Some(Root::Subscription) => {

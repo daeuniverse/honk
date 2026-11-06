@@ -245,6 +245,9 @@ impl super::ControlPlane {
             .flat_map(|(_, connections)| connections)
             .map(|connection| self.connection_tracker.start_close(connection).wait())
             .collect();
+        // Exact close requests retain their owners; no publication lock belongs
+        // to a downstream transport/CQ acknowledgement.
+        drop(_reload);
         #[cfg(feature = "native-api")]
         let mut interrupted = false;
         let mut uncertain = false;

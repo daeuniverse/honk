@@ -10,6 +10,8 @@ pub mod ipv4;
 pub mod ipv6;
 pub mod tcp;
 pub mod udp;
+mod view;
+pub use view::PacketView;
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_TCP: u8 = 6;
@@ -45,6 +47,17 @@ pub fn parse_ip(pkt: &[u8]) -> Result<IpPacket, ParseError> {
         4 => ipv4::parse(pkt),
         6 => ipv6::parse(pkt),
         _ => Err(ParseError::Unsupported),
+    }
+}
+
+/// Inspect IP addresses, including fragments, without granting transport checksum validity.
+pub fn packet_addresses(packet: &[u8]) -> Result<(IpAddr, IpAddr), ParseError> {
+    match parse_ip(packet) {
+        Ok(ip) => Ok((ip.src, ip.dst)),
+        Err(ParseError::Fragment) => {
+            frag::parse(packet).map(|fragment| (fragment.src, fragment.dst))
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -153,6 +166,23 @@ mod tests {
         assert_eq!(parse_ip(&[0x65]), Err(ParseError::Malformed));
         assert_eq!(parse_ip(&[0x05; 40]), Err(ParseError::Unsupported));
         assert_eq!(parse_ip(&[0xF0; 40]), Err(ParseError::Unsupported));
+    }
+
+    #[test]
+    fn fragment_addresses_do_not_require_a_transport_header() {
+        let source = v4(192, 0, 2, 1);
+        let destination = v4(192, 0, 2, 2);
+        let mut packet = [0; 28];
+        emit_ip_header(&mut packet, source, destination, PROTO_UDP, 8).unwrap();
+        assert_eq!(packet_addresses(&packet), Ok((source, destination)));
+        packet[6] = 0x20;
+        packet[10..12].fill(0);
+        let sum = checksum::checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&sum.to_be_bytes());
+        assert_eq!(parse_ip(&packet), Err(ParseError::Fragment));
+        assert_eq!(packet_addresses(&packet), Ok((source, destination)));
+        packet[12] ^= 1;
+        assert_eq!(packet_addresses(&packet), Err(ParseError::Checksum));
     }
 
     #[test]

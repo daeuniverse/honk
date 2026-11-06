@@ -14,12 +14,15 @@
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 
+#[cfg(feature = "ebpf")]
+use nix::sys::socket::recvfrom;
 use nix::sys::socket::{
-    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, recvfrom,
-    send, setsockopt, socket, sockopt,
+    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, send,
+    setsockopt, socket, sockopt,
 };
 use nix::sys::time::TimeVal;
 
+pub(crate) mod fib;
 #[cfg(feature = "ebpf")]
 mod netns_id;
 
@@ -43,11 +46,14 @@ const AF_INET6: i32 = libc::AF_INET6;
 
 const NLM_F_REQUEST: u16 = 0x01;
 const NLM_F_ACK: u16 = 0x04;
+#[cfg(feature = "ebpf")]
 const NLM_F_EXCL: u16 = 0x200;
 const NLM_F_CREATE: u16 = 0x400;
+#[cfg(feature = "ebpf")]
 const NLM_F_REPLACE: u16 = 0x100;
 const NLM_F_DUMP_INTR: u16 = 0x10;
 
+#[cfg(feature = "ebpf")]
 const NLMSG_ERROR: u16 = 2;
 
 const RTM_NEWLINK: u16 = 16;
@@ -55,6 +61,7 @@ const RTM_DELLINK: u16 = 17;
 const RTM_NEWADDR: u16 = 20;
 const RTM_DELADDR: u16 = 21;
 const RTM_NEWROUTE: u16 = 24;
+#[cfg(feature = "ebpf")]
 const RTM_DELRULE: u16 = 33;
 const RTM_NEWRULE: u16 = 32;
 const RTM_NEWNEIGH: u16 = 28;
@@ -63,14 +70,21 @@ const ARPHRD_ETHER: u16 = 1;
 const IFF_UP: u32 = 0x1;
 
 const IFLA_ADDRESS: u16 = 1;
+#[cfg(feature = "ebpf")]
 const IFLA_IFNAME: u16 = 3;
 const IFLA_LINKINFO: u16 = 18;
+#[cfg(feature = "ebpf")]
 const IFLA_NET_NS_FD: u16 = 28;
 const IFLA_INFO_KIND: u16 = 1;
+#[cfg(feature = "ebpf")]
 const IFLA_INFO_DATA: u16 = 2;
+#[cfg(feature = "ebpf")]
 const VETH_INFO_PEER: u16 = 1;
+#[cfg(feature = "ebpf")]
 const IFLA_NETKIT_PEER_INFO: u16 = 1;
+#[cfg(feature = "ebpf")]
 const IFLA_NETKIT_MODE: u16 = 5;
+#[cfg(feature = "ebpf")]
 const NETKIT_L2: u32 = 0;
 
 const IFA_ADDRESS: u16 = 1;
@@ -79,24 +93,35 @@ const IFA_LOCAL: u16 = 2;
 const RTA_DST: u16 = 1;
 const RTA_GATEWAY: u16 = 5;
 const RTA_OIF: u16 = 4;
+#[cfg(feature = "ebpf")]
 const RTA_TABLE: u16 = 15;
 
 const NDA_DST: u16 = 1;
 const NDA_LLADDR: u16 = 2;
 
+#[cfg(feature = "ebpf")]
 const FRA_FWMARK: u16 = 10;
+#[cfg(feature = "ebpf")]
 const FRA_TABLE: u16 = 15;
+#[cfg(feature = "ebpf")]
 const FRA_FWMASK: u16 = 16;
 
+#[cfg(feature = "ebpf")]
 const NUD_PERMANENT: u16 = 0x80;
 const RTN_UNICAST: u8 = 1;
 const RTN_LOCAL: u8 = 2;
+#[cfg(feature = "ebpf")]
 const RTPROT_STATIC: u8 = 4;
+#[cfg(feature = "ebpf")]
 const RT_SCOPE_LINK: u8 = 253;
+#[cfg(feature = "ebpf")]
 const RT_SCOPE_UNIVERSE: u8 = 0;
+#[cfg(feature = "ebpf")]
 const RT_SCOPE_HOST: u8 = 254;
+#[cfg(feature = "ebpf")]
 const FR_ACT_TO_TBL: u8 = 1;
 
+#[cfg(feature = "ebpf")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IfInfoMsg {
@@ -108,6 +133,7 @@ struct IfInfoMsg {
     ifi_change: u32,
 }
 
+#[cfg(feature = "ebpf")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct IfAddrMsg {
@@ -118,6 +144,7 @@ struct IfAddrMsg {
     ifa_index: u32,
 }
 
+#[cfg(feature = "ebpf")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RtMsg {
@@ -132,6 +159,7 @@ struct RtMsg {
     rtm_flags: u32,
 }
 
+#[cfg(feature = "ebpf")]
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NdMsg {
@@ -154,7 +182,9 @@ fn align(len: usize) -> usize {
 enum Attr {
     U32(u32),
     Bytes(Vec<u8>),
+    #[cfg(feature = "ebpf")]
     Str(String),
+    #[cfg(feature = "ebpf")]
     Nested(Vec<(u16, Attr)>),
 }
 
@@ -162,10 +192,12 @@ fn attr_payload(attr: &Attr, out: &mut Vec<u8>) {
     match attr {
         Attr::U32(v) => out.extend_from_slice(&v.to_ne_bytes()),
         Attr::Bytes(b) => out.extend_from_slice(b),
+        #[cfg(feature = "ebpf")]
         Attr::Str(s) => {
             out.extend_from_slice(s.as_bytes());
             out.push(0);
         }
+        #[cfg(feature = "ebpf")]
         Attr::Nested(children) => {
             for (ty, child) in children {
                 put_attr(out, *ty, child);
@@ -186,11 +218,13 @@ fn put_attr(buf: &mut Vec<u8>, rta_type: u16, attr: &Attr) {
     }
 }
 
+#[cfg(feature = "ebpf")]
 fn pod_bytes<T>(v: &T) -> &[u8] {
     // SAFETY: used only with #[repr(C)] POD message headers defined above.
     unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }
 }
 
+#[cfg(feature = "ebpf")]
 fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     IfInfoMsg {
         ifi_family: 0,
@@ -202,12 +236,14 @@ fn ifinfo(ifindex: i32, flags: u32, change: u32) -> IfInfoMsg {
     }
 }
 
+#[cfg(feature = "ebpf")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinkPairKind {
     Netkit,
     Veth,
 }
 
+#[cfg(feature = "ebpf")]
 fn netkit_unavailable(error: &io::Error) -> bool {
     error.raw_os_error() == Some(libc::EOPNOTSUPP)
 }
@@ -232,6 +268,7 @@ impl NlSock {
         Ok(Self { fd, seq: 0 })
     }
 
+    #[cfg(feature = "ebpf")]
     /// Receive one datagram. The length is probed with MSG_PEEK|MSG_TRUNC
     /// before consuming: reading an oversize datagram straight away would
     /// silently drop its truncated remainder and make the next datagram
@@ -281,6 +318,7 @@ impl NlSock {
         }
     }
 
+    #[cfg(feature = "ebpf")]
     /// Send one request and wait for the kernel ack (NLMSG_ERROR with
     /// error 0).
     fn request(
@@ -340,6 +378,7 @@ impl NlSock {
         }
     }
 
+    #[cfg(feature = "ebpf")]
     /// Create an L2 netkit pair when supported, otherwise a veth pair.
     pub(crate) fn add_link_pair(&mut self, name: &str, peer: &str) -> io::Result<LinkPairKind> {
         match self.add_netkit_pair(name, peer) {
@@ -352,6 +391,7 @@ impl NlSock {
         }
     }
 
+    #[cfg(feature = "ebpf")]
     fn add_netkit_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
         let mut peer_payload = pod_bytes(&ifinfo(0, 0, 0)).to_vec();
@@ -381,6 +421,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
     /// Create a veth pair (`name` ↔ `peer_name`).
     pub(crate) fn add_veth_pair(&mut self, name: &str, peer: &str) -> io::Result<()> {
         let header = ifinfo(0, 0, 0);
@@ -408,6 +449,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
     /// Bring a link up (or down).
     pub(crate) fn set_link_up(&mut self, ifindex: u32, up: bool) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, if up { IFF_UP } else { 0 }, IFF_UP);
@@ -419,6 +461,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
     /// Move a link into the namespace held by `ns_fd`.
     pub(crate) fn set_link_netns_fd(&mut self, ifindex: u32, ns_fd: &OwnedFd) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -434,6 +477,7 @@ impl NlSock {
         r
     }
 
+    #[cfg(feature = "ebpf")]
     /// Delete a link by index.
     pub(crate) fn del_link(&mut self, ifindex: u32) -> io::Result<()> {
         let header = ifinfo(ifindex as i32, 0, 0);
@@ -445,6 +489,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
     /// Add (or remove) an address on an interface.
     pub(crate) fn addr_op(
         &mut self,
@@ -476,6 +521,7 @@ impl NlSock {
         self.request(ty, flags, pod_bytes(&header), &attrs)
     }
 
+    #[cfg(feature = "ebpf")]
     /// Add a route. `dst` is (network, prefix) or None for default.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_route(
@@ -521,6 +567,7 @@ impl NlSock {
         )
     }
 
+    #[cfg(feature = "ebpf")]
     /// Add/delete a fwmark → table rule.
     fn rule_fwmark(
         &mut self,
@@ -561,6 +608,7 @@ impl NlSock {
         self.request(ty, flags, &header, &attrs)
     }
 
+    #[cfg(feature = "ebpf")]
     pub(crate) fn add_rule_fwmark(
         &mut self,
         family: u8,
@@ -571,6 +619,7 @@ impl NlSock {
         self.rule_fwmark(true, family, fwmark, fwmask, table)
     }
 
+    #[cfg(feature = "ebpf")]
     pub(crate) fn del_rule_fwmark(
         &mut self,
         family: u8,
@@ -581,6 +630,7 @@ impl NlSock {
         self.rule_fwmark(false, family, fwmark, fwmask, table)
     }
 
+    #[cfg(feature = "ebpf")]
     /// Replace a static neighbour entry (IP → MAC, permanent).
     pub(crate) fn neigh_replace(
         &mut self,
@@ -612,15 +662,24 @@ impl NlSock {
 }
 
 /// Address families and route enums re-exported for call sites.
+#[cfg(feature = "ebpf")]
 pub(crate) const FAM_V4: u8 = AF_INET as u8;
+#[cfg(feature = "ebpf")]
 pub(crate) const FAM_V6: u8 = AF_INET6 as u8;
+#[cfg(feature = "ebpf")]
 pub(crate) const ROUTE_UNICAST: u8 = RTN_UNICAST;
+#[cfg(feature = "ebpf")]
 pub(crate) const ROUTE_LOCAL: u8 = RTN_LOCAL;
+#[cfg(feature = "ebpf")]
 pub(crate) const PROTO_STATIC: u8 = RTPROT_STATIC;
+#[cfg(feature = "ebpf")]
 pub(crate) const SCOPE_LINK: u8 = RT_SCOPE_LINK;
+#[cfg(feature = "ebpf")]
 pub(crate) const SCOPE_UNIVERSE: u8 = RT_SCOPE_UNIVERSE;
+#[cfg(feature = "ebpf")]
 pub(crate) const SCOPE_HOST: u8 = RT_SCOPE_HOST;
 
+#[cfg(feature = "ebpf")]
 /// Read an interface's ifindex in the mounted sysfs view, not a scoped setns view.
 pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/ifindex"))?;
@@ -629,6 +688,7 @@ pub(crate) fn ifindex_of(name: &str) -> io::Result<u32> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
+#[cfg(feature = "ebpf")]
 /// Read an interface's MAC from /sys (namespace-relative).
 pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     let s = std::fs::read_to_string(format!("/sys/class/net/{name}/address"))?;
@@ -644,6 +704,7 @@ pub(crate) fn mac_of(name: &str) -> io::Result<[u8; 6]> {
     Ok(mac)
 }
 
+#[cfg(feature = "ebpf")]
 impl NlSock {
     /// Look up a link by name (RTM_GETLINK dump, filtered client-side).
     /// Works in any namespace — unlike /sys, which is view-per-mount and
@@ -766,5 +827,5 @@ impl NlSock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "ebpf"))]
 mod tests;

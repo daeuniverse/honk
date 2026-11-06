@@ -6,6 +6,7 @@ members = [
     "crates/honk-ebpf-common",
     "crates/honk-netstack",
     "crates/honk-datapath",
+    "crates/honk-xsk",
     "crates/honk-nfqueue",
     "crates/honk-outbound",
     "crates/honk-core",
@@ -26,6 +27,7 @@ honk-config = { path = "crates/honk-config" }
 honk-ebpf-common = { path = "crates/honk-ebpf-common" }
 honk-netstack = { path = "crates/honk-netstack" }
 honk-datapath = { path = "crates/honk-datapath" }
+honk-xsk = { path = "crates/honk-xsk" }
 honk-nfqueue = { path = "crates/honk-nfqueue" }
 honk-outbound = { path = "crates/honk-outbound" }
 

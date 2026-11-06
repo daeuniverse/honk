@@ -1784,6 +1784,7 @@ dependencies = [
  "honk-netstack",
  "honk-nfqueue",
  "honk-outbound",
+ "honk-xsk",
  "http",
  "hyper",
  "hyper-util",
@@ -1942,6 +1943,17 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "honk-xsk"
+version = "0.1.0"
+dependencies = [
+ "aya-obj",
+ "honk-datapath",
+ "honk-ebpf-common",
+ "honk-netstack",
+ "libc",
 ]
 
 [[package]]

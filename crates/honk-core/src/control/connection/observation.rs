@@ -43,6 +43,19 @@ pub(super) struct RouteObservation {
 }
 
 impl RouteObservation {
+    pub(in crate::control) fn retained_bytes(&self) -> usize {
+        self.rule_id.as_ref().map_or(0, String::capacity)
+            + self.rule_expression.as_ref().map_or(0, String::capacity)
+            + self.evaluation_id.capacity()
+            + self.input.as_ref().map_or(0, RouteInput::heap_bytes)
+            + self.rules.capacity() * size_of::<RuleEvaluation>()
+            + self
+                .rules
+                .iter()
+                .map(RuleEvaluation::heap_bytes)
+                .sum::<usize>()
+    }
+
     pub(super) fn kernel() -> Self {
         Self {
             generation: None,

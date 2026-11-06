@@ -358,7 +358,7 @@ fn prepare_and_replace(
     {
         return Err(failure("source_conflict", &writes));
     }
-    let requirements = GeoRequirements::for_traffic(&loaded.config.routing.rules).union(
+    let requirements = GeoRequirements::for_forwarding(&loaded.config).union(
         &crate::dns::routing::DnsRouter::geo_requirements(&loaded.config.dns),
     );
     let mut captured = offline::capture_for_coordinator(

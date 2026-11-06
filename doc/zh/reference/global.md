@@ -173,6 +173,52 @@ global {
 }
 ```
 
+## 捕获后端选择
+
+省略 `datapath` 会保持现有 TC 后端。完整 XDP 是 Linux 上的显式选择，
+不是 TC 或原生续送不可用时的自动回退：
+
+```dae
+global {
+    nfqueue_enable: false
+    dial_mode: ip
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        lan0: lan
+        wan0: wan
+    }
+}
+```
+
+`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）或
+`endpoint`（Direct TCP 终止后中继）。接口角色是可信的 LAN/WAN 入站分区，
+不是执行方式；必须绑定发现的全部 RX 队列。XDP 不可同时配置
+`global.lan_interface` 或 `global.wan_interface`。
+后端、Direct 方式、有效 AF_XDP 绑定模式及接口/分区变更需要重启；受支持的
+防火墙/NAT 规则沿用事务式发布。未知字段及原生续送、非零标记续送请求会被拒绝，
+不会被静默忽略。
+接口条目只能是 `名称: lan` 或 `名称: wan`；携带子块（包括空子块）会被拒绝，
+不会忽略其中的设置。
+
+`xsk_mode` 接受 `copy` 或 `zerocopy`，省略时保持 `copy`。`zerocopy` 对全部选中
+RX 队列强制启用该模式，绝不重试或回退到 Copy。在首次挂载之前，对全部设备
+检查 zero-copy/segment 能力通告和完整包 frame 承诺；成功 bind 后还必须与
+内核 `XDP_OPTIONS_ZEROCOPY` 回读一致。queue 日志报告实际观察到的模式。
+省略与显式 `copy` 在 reload 时等价；切换到或离开 `zerocopy` 必须重启。
+TC 拒绝显式 `xsk_mode`。
+
+Core Direct 要求 `dial_mode: ip`，且不允许需要域名/嗅探的谓词。XDP Endpoint
+不会伪造进程或逐流 MAC 事实。部署必须预先配置并通过独立验证的 bypass-mark
+路由表，将守护进程自身的套接字流量隔离到未捕获的上联；上述示例本身不构成
+拓扑证明。设备、VLAN、散布/聚集、保留内存、固定丢弃保护及原生内核准入限制，
+请参阅[完整 XDP 启动与限制](../design/datapath.md)。
+Core 当前的带输入上下文 FIB 契约会拒绝非零 IPv6 flow label，以及无法保持语义的
+路由器专用扩展头/options 执行。Endpoint 支持 IPv6 并不证明这些数据包组合在
+Core 中具有等价执行授权。
+
 ## 相关文档
 
 - [配置指南](../configuration.md)

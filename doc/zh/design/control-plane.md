@@ -45,6 +45,8 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查时会记录 warning 并关闭；服务准入后的失败仍为 fatal。
 
+配置为 XDP 的守护进程复用同一 mode/flags coordinator，但会在 packet scope 准入或 capture ready 之前以禁用 NFQUEUE 的状态初始化软件 flags。初始化保持恢复后的 mode 不变；发布失败时，通过 packet supervisor 的 joined cleanup 拒绝启动。该路径不启动 TC listener 或 NFQUEUE helper，显式非 XDP packet embedding 仍保留独立生命周期。
+
 对象准入会在进程名 probe 或任何 Aya loader 运行前拒绝隐式 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径均由 core 显式提供，避免 loader 创建的别名逃出启动回滚。
 
 真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。
@@ -342,6 +344,10 @@ TCP copy 成功读取与 splice 成功写入实时累加既有逐出站 atomics�
 Accepted 源在真实 no-op 或 commit 时随原有 config 发布屏障更新，遵循上述包含 datapath flags publication 的锁序及订阅 revision fence。拒绝 reload 保留旧快照/代次但不回滚已写文件；提交后 degraded 保留新快照/代次并令 operation 失败。API operation 的真实结果投影到 GET、`runtime.last_reload` 与 `operation.updated`，SIGHUP 本身不创建 API operation。注释变更可更新 source hash/config revision 而不推进 runtime generation，有效组成员变更影响 revision，健康变化不影响。
 
 Selector 写入由同一 control/reload owner 序列化，TCP/UDP 分开保存，both 原子发布；Clash 写 both、读 TCP 投影。精确连接关闭绑定 TCP UUID 或 UDP token/generation/source view，等待实际 transport 与 backend/driver 退役，而非只删除 tracker 记录。同一 owner 的重复关闭共用完成结果与失败，不存在或已被替换的 owner 才是 Gone。组中断按捕获的组路径与网络关闭旧 owner，在同步 guard 外等待。组 PATCH 使用 parser span 和原源码协调器，写前及 reload lock 下都检查 accepted revision，独立检查 hash 与依赖。Provider 并发发布可使已写文件不能激活，必须保留 written/committed 区分。自动策略的分网络 pin/clear 已开放，pin 成员只属于当前 GroupManager。
+
+Selector 在 reload guard 内捕获发布 revision、选择结果和精确连接 owner，随后先
+释放该 guard，再等待 transport/driver 关闭完成。control command 仍保持串行并
+报告其捕获结果；不能让 CQ 持有的关闭等待同时占住退出所需的发布锁。
 
 主文件创建/删除复用相同协调器、parser span、revision fence 与 reload reply，但等真实激活后才返回 201/200。订阅 supervisor 持有绑定身份的初次拉取延迟，所有离线准入都携带这些排除项和有效运行时数据目录。Geodata 先暂存并验证所有资产，再经 FD 相对替换；临时不可变 `SourceUpdate.geo_sources` 同时进入 reload 的两条路径，发布后不再由 accepted 源元数据保留。Router/DnsRouter 保留实际加载字节的元数据，观测按 router-before-config 锁序且不重读磁盘；部分文件替换与提交后降级如实报告，不承诺回滚。
 

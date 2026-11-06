@@ -7,14 +7,18 @@ test -x "$HONK_CORE_TEST_BIN"
 test -x "$HONK_DATAPATH_TEST_BIN"
 test -x "$HONK_NFQUEUE_TEST_BIN"
 test -x "$HONK_OUTBOUND_TEST_BIN"
+test -x "$HONK_XSK_TEST_BIN"
+test -x "$HONK_XDP_DAEMON"
 
 cd "$repo"
 test "$(id -u)" -eq 0
+read -r cmdline </proc/cmdline
+[[ " $cmdline " == *' virtme.'* ]]
 kernel=$(uname -r)
 printf 'Guest uname -r: %s\n' "$kernel" >> "${GITHUB_STEP_SUMMARY:?}"
 test "$kernel" = "${HONK_CI_EXPECTED_KERNEL:?}"
 test -d "/lib/modules/$kernel"
-modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue
+modprobe -a tun sch_ingress cls_bpf nf_tables nfnetlink_queue nft_queue veth 8021q
 test -e /sys/fs/cgroup/cgroup.controllers
 test -r "${HONK_ROUTING_TEST_OBJECT:?}"
 if ! mountpoint -q /sys/fs/bpf; then
@@ -70,3 +74,6 @@ mark_test=proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_dir
 test "$("$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --list --format terse)" = "$mark_test: test"
 "$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-outbound-socket-marks.log"
+HONK_XDP_CORE_TEST_BIN="$HONK_CORE_TEST_BIN" HONK_XDP_XSK_TEST_BIN="$HONK_XSK_TEST_BIN" HONK_XDP_ARTIFACT_ROOT="$log_dir" \
+  bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
+  2>&1 | tee "$log_dir/honk-xdp-daemon.log"

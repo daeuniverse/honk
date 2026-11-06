@@ -259,7 +259,7 @@ fn capture_inner(
     })?;
 
     let dns_requirements = DnsRouter::geo_requirements(&config.dns);
-    let requirements = GeoRequirements::for_traffic(&config.routing.rules).union(&dns_requirements);
+    let requirements = GeoRequirements::for_forwarding(&config).union(&dns_requirements);
     let data_dir = capture.data_dir.clone();
     let geo = match geo_override {
         Some(geo) => geo.clone(),

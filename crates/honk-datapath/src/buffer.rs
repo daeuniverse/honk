@@ -365,6 +365,20 @@ impl<O: Copy> FrameLedger<O> {
         Ok(())
     }
 
+    /// Validate RX geometry and ownership without acquiring a lease or spending RX credit.
+    /// `false` means this valid frame still awaits observed FILL consumer publication.
+    pub fn rx_ready(&self, address: u64, length: usize) -> Result<bool, LedgerError> {
+        let (index, headroom) = self.address_parts(address)?;
+        if length == 0 || length > self.config.frame_size - headroom {
+            return Err(LedgerError::InvalidLength);
+        }
+        match self.slots[index].phase {
+            Phase::FillPosted => Ok(false),
+            Phase::FillConsumed => Ok(true),
+            _ => Err(LedgerError::WrongState),
+        }
+    }
+
     /// Accept one actual backend RX descriptor, including any data headroom within its slot.
     /// Observe its FILL consumption first. On error, retain the RX entry.
     pub fn receive_rx(&mut self, address: u64, length: usize) -> Result<FrameLease, LedgerError> {
@@ -937,6 +951,52 @@ mod tests {
         let rx = ledger.receive_rx(reused.address(), 64).unwrap();
         ledger.relinquish_rx(rx).unwrap();
         assert_eq!(ledger.consume_fill(0), Ok(()));
+        assert!(ledger.drain_state().is_drained());
+    }
+
+    #[test]
+    fn rx_readiness_defers_only_valid_posted_frames_without_taking_ownership() {
+        let mut ledger = ledger();
+        let fill = ledger.reserve_fill().unwrap();
+        let tx = ledger.reserve_tx(TxClass::Bulk).unwrap();
+        assert_eq!(
+            ledger.rx_ready(fill.address(), 64),
+            Err(LedgerError::WrongState)
+        );
+        assert_eq!(
+            ledger.rx_ready(tx.address(), 64),
+            Err(LedgerError::WrongState)
+        );
+        assert_eq!(
+            ledger.rx_ready(config().base_address, 64),
+            Err(LedgerError::WrongState)
+        );
+        ledger.submit_fill(fill).unwrap();
+        let address = fill.address() + 128;
+        let capacity = fill.capacity() - 128;
+        let before = ledger.drain_state();
+        assert_eq!(ledger.rx_ready(address, capacity), Ok(false));
+        for length in [0, capacity + 1, usize::MAX] {
+            assert_eq!(
+                ledger.rx_ready(address, length),
+                Err(LedgerError::InvalidLength)
+            );
+        }
+        assert_eq!(
+            ledger.rx_ready(u64::MAX, 1),
+            Err(LedgerError::InvalidAddress)
+        );
+        assert_eq!(ledger.drain_state(), before);
+        assert_eq!(ledger.receive_rx(address, 64), Err(LedgerError::WrongState));
+        ledger.consume_fill(1).unwrap();
+        let before = ledger.drain_state();
+        assert_eq!(ledger.rx_ready(address, capacity), Ok(true));
+        assert_eq!(ledger.drain_state(), before);
+        let rx = ledger.receive_rx(address, capacity).unwrap();
+        assert_eq!(ledger.rx_ready(address, 1), Err(LedgerError::WrongState));
+        ledger.relinquish_rx(rx).unwrap();
+        assert_eq!(ledger.rx_ready(address, 1), Err(LedgerError::WrongState));
+        ledger.cancel_tx(tx).unwrap();
         assert!(ledger.drain_state().is_drained());
     }
 

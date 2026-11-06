@@ -19,13 +19,14 @@ pub enum Root {
     Dns,
     Experimental,
     Assets,
+    Datapath,
 }
 
 /// Names the valid roots; the ignored header itself may carry operator text.
-const UNKNOWN_BLOCK: &str = "unknown top-level block ignored; expected include, global, node, group, subscription, routing, dns, experimental or assets";
+const UNKNOWN_BLOCK: &str = "unknown top-level block ignored; expected include, global, node, group, subscription, routing, dns, experimental, assets or datapath";
 
 impl Root {
-    pub const ALL: [Root; 9] = [
+    pub const ALL: [Root; 10] = [
         Root::Include,
         Root::Global,
         Root::Node,
@@ -35,6 +36,7 @@ impl Root {
         Root::Dns,
         Root::Experimental,
         Root::Assets,
+        Root::Datapath,
     ];
 
     pub fn parse(name: &str) -> Option<Root> {
@@ -59,6 +61,7 @@ impl Root {
             Root::Dns => "dns",
             Root::Experimental => "experimental",
             Root::Assets => "assets",
+            Root::Datapath => "datapath",
         }
     }
 }

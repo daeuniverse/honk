@@ -79,14 +79,6 @@ pub enum MockRoutingPublicationWrite {
     Root(u32),
 }
 
-#[derive(Debug, Clone)]
-struct MockRoutingGeneration {
-    fingerprint: [u8; 32],
-    rule_count: usize,
-    facts: crate::control::routing_matcher::RoutingFactMaps,
-    domain: HashMap<[u32; 4], DomainRouting>,
-}
-
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub struct MockTelemetryFaults {
@@ -98,13 +90,7 @@ pub struct MockTelemetryFaults {
 /// In-memory transactional routing backend used by control-plane tests.
 #[derive(Debug, Default)]
 pub struct MockEbpfBackend {
-    /// Only the generation selected by the stable root remains resident.
-    routing_generation: Option<MockRoutingGeneration>,
-    active_slot: u32,
-    descriptor: RoutingPolicyDescriptor,
-    next_generation: u64,
-    next_domain_map_id: u32,
-    next_trace_policy: u32,
+    policy: super::policy_state::PolicyState,
     #[cfg(feature = "native-api")]
     trace_dictionaries: crate::observe::flows::kernel::KernelTraceDictionaries,
     pub route_witnesses: HashMap<u32, KernelRouteWitness>,
@@ -141,8 +127,6 @@ pub struct MockEbpfBackend {
     pub commit_trace: std::sync::Arc<parking_lot::Mutex<Vec<(u32, UdpDecisionTransition)>>>,
     #[cfg(test)]
     pub retire_fault_after: Option<usize>,
-    /// Outbound alive bitmap: (outbound*6 + domain*2 + ipver) → 0|1
-    pub outbound_alive: HashMap<u32, u32>,
     /// BPF statistics overflow counters
     pub bpf_stats: HashMap<u32, u64>,
     #[cfg(test)]
@@ -382,7 +366,7 @@ impl MockEbpfBackend {
     }
 
     pub fn routing_snapshot(&self) -> MockRoutingSnapshot {
-        let generation = self.routing_generation.as_ref();
+        let generation = self.policy.routing_generation.as_ref();
         let (fingerprint, rule_count, facts, mut domain) =
             generation.map_or(([0; 32], 0, None, Vec::new()), |generation| {
                 let domain = generation
@@ -417,8 +401,8 @@ impl MockEbpfBackend {
             },
         );
         MockRoutingSnapshot {
-            active_slot: self.active_slot,
-            descriptor: self.descriptor,
+            active_slot: self.policy.active_slot,
+            descriptor: self.policy.descriptor,
             plan_fingerprint: fingerprint,
             rule_count,
             destination_v4,
@@ -428,16 +412,6 @@ impl MockEbpfBackend {
             mac,
             domain,
         }
-    }
-
-    fn take_routing_fault(&mut self, phase: RoutingPushPhase) -> anyhow::Result<()> {
-        if let Some((configured, remaining)) = self.routing_fault
-            && configured == phase
-        {
-            self.routing_fault = (remaining > 1).then_some((configured, remaining - 1));
-            anyhow::bail!("injected routing push failure at {phase:?}");
-        }
-        Ok(())
     }
 
     #[cfg(test)]

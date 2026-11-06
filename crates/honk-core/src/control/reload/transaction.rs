@@ -232,8 +232,36 @@ impl ControlPlane {
             warn!(%error, "reload rejected: invalid subscription ids");
             return Ok(ReloadOutcome::Rejected);
         }
+        #[cfg(target_os = "linux")]
+        if self
+            .core_forward_users
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            && let Err(error) = super::super::core_forward::validate_config(&new_config)
+        {
+            warn!(%error, "reload rejected: active routed-only consumer");
+            return Ok(ReloadOutcome::Rejected);
+        }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        let same_datapath_setup = match (&current_config.datapath, &new_config.datapath) {
+            (None, None) => true,
+            (Some(current), Some(candidate)) => current.same_device_setup(candidate),
+            (None, Some(candidate)) | (Some(candidate), None) => {
+                candidate.backend == honk_config::datapath::Backend::Tc
+            }
+        };
+        if !same_datapath_setup {
+            warn!(
+                "reload rejected: datapath backend, Direct profile, binding mode and interface setup require restart"
+            );
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::xdp::validate_config(&new_config) {
+            warn!(%error, "reload rejected: unsupported XDP policy facts or execution profile");
+            return Ok(ReloadOutcome::Rejected);
+        }
         #[cfg(feature = "native-api")]
         let prepared_sources = sources.and_then(|sources| {
             self.configuration
@@ -267,6 +295,7 @@ impl ControlPlane {
         let supplied_geo_sources = sources.and_then(|sources| sources.geo_sources.as_ref());
         if config_unchanged && self.is_datapath_healthy() {
             let traffic_geo = current_router.geo_requirements();
+            let forwarding_geo = crate::routing::GeoRequirements::for_forwarding(&new_config);
             let dns_geo = current_dns_router.geo_requirements_snapshot();
             #[cfg(feature = "native-api")]
             let probed_geo_sources;
@@ -275,12 +304,15 @@ impl ControlPlane {
                 Some(sources) => sources,
                 None => {
                     probed_geo_sources =
-                        crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+                        crate::routing::GeoSourceSet::probe_union(&forwarding_geo, dns_geo);
                     &probed_geo_sources
                 }
             };
             #[cfg(not(feature = "native-api"))]
-            let geo_probe = crate::routing::GeoSourceSet::probe_union(traffic_geo, dns_geo);
+            let probed_geo_sources =
+                crate::routing::GeoSourceSet::probe_union(&forwarding_geo, dns_geo);
+            #[cfg(not(feature = "native-api"))]
+            let geo_probe = &probed_geo_sources;
             let traffic_geo_fingerprint = geo_probe.fingerprint_for(traffic_geo);
             let dns_geo_fingerprint = geo_probe.fingerprint_for(dns_geo);
             let hosts_fingerprint =
@@ -294,6 +326,7 @@ impl ControlPlane {
                 };
             if current_router.geo_fingerprint() == traffic_geo_fingerprint
                 && current_dns_router.geo_fingerprint() == dns_geo_fingerprint
+                && current_router.firewall_matches(&new_config, geo_probe)
                 && current_dns_forwarder.policy_id().is_some_and(|policy| {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
@@ -390,6 +423,7 @@ impl ControlPlane {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let traffic_geo = crate::routing::GeoRequirements::for_traffic(&new_config.routing.rules);
+        let forwarding_geo = crate::routing::GeoRequirements::for_forwarding(&new_config);
         let dns_geo = crate::dns::routing::DnsRouter::geo_requirements(&new_config.dns);
         #[cfg(feature = "native-api")]
         let loaded_geo_sources;
@@ -398,12 +432,12 @@ impl ControlPlane {
             Some(sources) => sources,
             None => {
                 loaded_geo_sources =
-                    crate::routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
+                    crate::routing::GeoSourceSet::load(&forwarding_geo.union(&dns_geo));
                 &loaded_geo_sources
             }
         };
         #[cfg(not(feature = "native-api"))]
-        let geo_requirements = traffic_geo.union(&dns_geo);
+        let geo_requirements = forwarding_geo.union(&dns_geo);
         #[cfg(not(feature = "native-api"))]
         let geo_sources = &crate::routing::GeoSourceSet::load(&geo_requirements);
         let traffic_geo_fingerprint = geo_sources.fingerprint_for(&traffic_geo);
@@ -423,8 +457,8 @@ impl ControlPlane {
         // the DNS router rebuilds.
         let mut shared = crate::routing::SharedMatchers::default();
         shared.offer(current_router.ip_matchers());
-        let new_router = if reuse_routing_state {
-            current_router
+        let mut new_router = if reuse_routing_state {
+            current_router.clone()
         } else {
             match Router::from_config_sharing(&new_config.routing, geo_sources, &mut shared) {
                 Ok(router) => router,
@@ -435,6 +469,24 @@ impl ControlPlane {
                 }
             }
         };
+        if let Err(error) =
+            new_router.bind_firewall(&new_config, Some(&current_router), geo_sources, &mut shared)
+        {
+            warn!(%error, "Failed to prepare forwarding firewall policy");
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if self
+            .core_forward_mixed_users
+            .load(std::sync::atomic::Ordering::Acquire)
+            != 0
+            && let Err(error) = super::super::core_forward::validate_mixed(&new_config, &new_router)
+        {
+            warn!(%error, "reload rejected: active mixed Core/Endpoint consumer");
+            self.stop_reload_rejection_if_healthy(drain);
+            return Ok(ReloadOutcome::Rejected);
+        }
         let pinned_router = Arc::new(new_router.clone());
         let new_has_direct_marks = new_router.has_direct_marks();
         let old_group_manager = self.group_manager.read().clone();

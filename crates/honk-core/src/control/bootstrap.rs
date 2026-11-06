@@ -300,6 +300,10 @@ impl ControlPlane {
             #[cfg(feature = "clash-api")]
             ui_download: Arc::new(tokio::sync::Mutex::new(None)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),
+            #[cfg(target_os = "linux")]
+            core_forward_users: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            #[cfg(target_os = "linux")]
+            core_forward_mixed_users: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(feature = "reload-bench-counters")]
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]

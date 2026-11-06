@@ -48,6 +48,10 @@ pub(in crate::control) struct SourceScope {
 }
 
 impl SourceScope {
+    pub(super) fn owns_client(&self, domain: ScopeId, address: IpAddr) -> bool {
+        self.domain == domain && self.client.ip() == address
+    }
+
     pub(super) fn new(
         domain: ScopeId,
         runtime: &Arc<NodeRuntime>,

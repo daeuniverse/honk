@@ -28,6 +28,14 @@ impl Fragment<'_> {
         self.src.is_ipv6()
     }
 
+    pub fn ecn(&self) -> u8 {
+        if self.is_v6() {
+            (self.head[1] >> 4) & 3
+        } else {
+            self.head[1] & 3
+        }
+    }
+
     /// Largest fragmentable length that still fits the 16-bit length field behind `head`.
     pub fn max_total(&self) -> usize {
         if self.is_v6() {
@@ -128,7 +136,7 @@ pub fn reassembled_len(head_len: usize, v6: bool, data_len: usize) -> Option<usi
 }
 
 /// Seals a decoded fragment header and its complete payload into one exact-sized owned packet.
-pub fn seal_packet(head: &[u8], v6: bool, data: &[u8]) -> Option<Box<[u8]>> {
+pub fn seal_packet(head: &[u8], v6: bool, data: &[u8], ce: bool) -> Option<Box<[u8]>> {
     let total = reassembled_len(head.len(), v6, data.len())?;
     let keep = total - data.len();
     let nh_off = if v6 {
@@ -140,9 +148,15 @@ pub fn seal_packet(head: &[u8], v6: bool, data: &[u8]) -> Option<Box<[u8]>> {
     };
     let mut packet: Box<[u8]> = head[..keep].iter().chain(data).copied().collect();
     if v6 {
+        if ce {
+            packet[1] |= 3 << 4;
+        }
         packet[nh_off] = head[keep];
         packet[4..6].copy_from_slice(&((total - ipv6::HEADER_LEN) as u16).to_be_bytes());
     } else {
+        if ce {
+            packet[1] |= 3;
+        }
         packet[2..4].copy_from_slice(&(total as u16).to_be_bytes());
         packet[6..8].fill(0);
         packet[10..12].fill(0);

@@ -134,6 +134,10 @@ impl UdpTx {
         !self.queue.is_empty()
     }
 
+    pub(crate) fn retains_destination(&self, address: IpAddr) -> bool {
+        self.queue.iter().any(|pending| pending.dst == address)
+    }
+
     /// Writes the datagram (or its first fragment) to `out`. Errors consume nothing.
     pub(crate) fn send_from(
         &mut self,

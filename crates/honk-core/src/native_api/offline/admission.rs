@@ -8,7 +8,7 @@ impl CapturedConfig {
     }
 
     pub(crate) fn with_geo(mut self, geo: GeoSourceSet) -> Result<Self, DetailedConfigError> {
-        let requirements = GeoRequirements::for_traffic(&self.config.routing.rules)
+        let requirements = GeoRequirements::for_forwarding(&self.config)
             .union(&DnsRouter::geo_requirements(&self.config.dns));
         let source = &self.sources[0].source;
         self.dependencies.retain(|dependency| !dependency.asset);
@@ -34,22 +34,42 @@ impl CapturedConfig {
             dependency_root,
         } = self;
         let source = &sources[0].source;
+        #[cfg(target_os = "linux")]
+        crate::xdp::validate_config(&config).map_err(|_| {
+            error(
+                source,
+                "datapath",
+                "invalid-datapath-config",
+                "datapath policy is unsupported by its execution profile",
+            )
+        })?;
         let dns_requirements = DnsRouter::geo_requirements(&config.dns);
-        let requirements =
-            GeoRequirements::for_traffic(&config.routing.rules).union(&dns_requirements);
+        let requirements = GeoRequirements::for_forwarding(&config).union(&dns_requirements);
         geo.validate(&requirements)
             .map_err(|cause| dependency_error(source, "routing", cause))?;
         let hosts = hosts
             .parse()
             .map_err(|cause| dependency_error(source, "dns", cause))?;
-        let router = Router::from_config_with_geo_sources(&config.routing, &geo).map_err(|_| {
-            error(
-                source,
-                "routing",
-                "invalid-routing-config",
-                "routing configuration cannot be compiled",
-            )
-        })?;
+        let mut shared = crate::routing::SharedMatchers::default();
+        let mut router =
+            Router::from_config_sharing(&config.routing, &geo, &mut shared).map_err(|_| {
+                error(
+                    source,
+                    "routing",
+                    "invalid-routing-config",
+                    "routing configuration cannot be compiled",
+                )
+            })?;
+        router
+            .bind_firewall(&config, None, &geo, &mut shared)
+            .map_err(|_| {
+                error(
+                    source,
+                    "datapath.firewall",
+                    "invalid-firewall-config",
+                    "forwarding firewall configuration cannot be compiled",
+                )
+            })?;
         ControlPlane::compile_routing_plan(&config, &router).map_err(|_| {
             error(
                 source,
@@ -138,7 +158,7 @@ impl ValidatedConfig {
                 }
             }
         }
-        let requirements = GeoRequirements::for_traffic(&self.config.routing.rules)
+        let requirements = GeoRequirements::for_forwarding(&self.config)
             .union(&DnsRouter::geo_requirements(&self.config.dns));
         let mut dependencies = if let Some(geo) = &self.geo_sources {
             geo_dependencies(geo, &requirements)?

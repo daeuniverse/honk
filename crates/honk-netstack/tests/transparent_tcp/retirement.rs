@@ -48,13 +48,23 @@ fn application_close_and_compaction_do_not_retire_the_protocol_owner() {
     c.stack.handle_timeout(idle);
     assert_eq!(c.stack.tcp_state(c.id), Some(TcpState::Established));
     assert!(c.stack.tcp_retained(c.id));
+    assert!(c.stack.retains_tcp(c.peer.client, c.peer.dst));
+    assert!(c.stack.retains_source(c.peer.client.ip()));
+    assert!(!c.stack.retains_tcp(c.peer.dst, c.peer.client));
     c.t0 = idle;
     let (closed, _, _) = enter_time_wait(&mut c);
     c.stack
         .handle_timeout(closed + Duration::from_secs(60) - Duration::from_nanos(1));
     assert!(c.stack.tcp_retained(c.id));
+    assert!(
+        c.stack.retains_tcp(c.peer.client, c.peer.dst),
+        "compact TIME_WAIT retains Endpoint execution"
+    );
+    assert!(c.stack.retains_source(c.peer.client.ip()));
     c.stack.handle_timeout(closed + Duration::from_secs(60));
     assert!(!c.stack.tcp_retained(c.id));
+    assert!(!c.stack.retains_tcp(c.peer.client, c.peer.dst));
+    assert!(!c.stack.retains_source(c.peer.client.ip()));
 }
 
 #[test]
@@ -158,10 +168,20 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         let mut stack = Stack::new(transparent(), now);
         let mut peer = Peer::new(CLIENT, DST, 1000);
         peer.syn(&mut stack, now, 1460);
+        assert!(
+            stack.retains_tcp(peer.client, peer.dst),
+            "queued SYN owns execution before poll_accept"
+        );
+        assert!(stack.retains_source(peer.client.ip()));
         let old = info_of(&mut stack).id;
         stack.tcp_refuse(old, how);
         assert_eq!(stack.tcp_state(old), None);
         assert_eq!(stack.tcp_retained(old), how != Refuse::Drop);
+        assert_eq!(
+            stack.retains_tcp(peer.client, peer.dst),
+            how != Refuse::Drop
+        );
+        assert_eq!(stack.retains_source(peer.client.ip()), how != Refuse::Drop);
         peer.seq += 100;
         peer.syn(&mut stack, now, 1460);
         let new = info_of(&mut stack).id;
@@ -184,6 +204,8 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         assert!(stack.tcp_retained(new));
         stack.tcp_refuse(new, Refuse::Drop);
         assert!(!stack.tcp_retained(new));
+        assert!(!stack.retains_tcp(peer.client, peer.dst));
+        assert!(!stack.retains_source(peer.client.ip()));
     }
 }
 

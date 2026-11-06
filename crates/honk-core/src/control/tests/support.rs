@@ -647,7 +647,7 @@ pub(in crate::control) fn canonical_socks5(
     node
 }
 
-pub(in crate::control) fn control_plane(config: Config) -> ControlPlane {
+pub(crate) fn control_plane(config: Config) -> ControlPlane {
     ControlPlane::new(
         config,
         Box::new(MockEbpfBackend::new()),
@@ -657,6 +657,10 @@ pub(in crate::control) fn control_plane(config: Config) -> ControlPlane {
         test_dns_forwarder(),
     )
     .expect("test control plane")
+}
+
+pub(crate) fn tcp_slots(plane: &ControlPlane) -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(&plane.concurrency_limit)
 }
 
 pub(in crate::control) fn test_dns_forwarder() -> Arc<dns::forwarder::DnsForwarder> {

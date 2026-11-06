@@ -446,11 +446,12 @@ impl Drop for TcpFlowGuard {
     }
 }
 
-pub(super) struct ModeDecision {
-    pub(super) name: String,
-    pub(super) constraint: crate::control::reload::OutboundConstraint,
+#[derive(Clone, Debug)]
+pub(in crate::control) struct ModeDecision {
+    pub(in crate::control) name: String,
+    pub(in crate::control) constraint: crate::control::reload::OutboundConstraint,
     #[cfg(feature = "native-api")]
-    pub(super) group_id: Option<String>,
+    pub(in crate::control) group_id: Option<String>,
 }
 
 impl ControlPlaneHandle {
@@ -612,61 +613,86 @@ impl ControlPlaneHandle {
 
     /// Preserve exact native target identity until the selected generation is pinned.
     async fn mode_override(&self, outbound_name: String, must: bool) -> ModeDecision {
-        let mut result = ModeDecision {
-            name: outbound_name,
-            constraint: Default::default(),
-            #[cfg(feature = "native-api")]
-            group_id: None,
-        };
-        let Some(mode_state) = &self.mode_state else {
-            return result;
-        };
-        if must || result.name == "block" {
-            return result;
-        }
-        let state = mode_state.read().clone();
-        #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
-        if state.is_native() {
-            let config = self.config.read().await;
-            let state = mode_state.read().clone();
-            let Some(native) = &self.native else {
-                result.name = "block".into();
-                return result;
+        if must || outbound_name == "block" || self.mode_state.is_none() {
+            return ModeDecision {
+                name: outbound_name,
+                constraint: Default::default(),
+                #[cfg(feature = "native-api")]
+                group_id: None,
             };
-            let catalog = native.catalog.snapshot();
-            match state.native_override(&result.name, must, &config, &catalog.groups) {
-                crate::mode::ModeOverride::Unchanged => {}
-                crate::mode::ModeOverride::Direct => result.name = "direct".into(),
-                crate::mode::ModeOverride::Block => result.name = "block".into(),
-                crate::mode::ModeOverride::Node(id) => {
-                    result.name = config
-                        .nodes
-                        .iter()
-                        .find(|node| node.id == id)
-                        .expect("validated mode target")
-                        .name
-                        .clone();
-                    result.constraint = crate::control::reload::OutboundConstraint::Node(id);
-                }
-                crate::mode::ModeOverride::Group(name) => {
-                    result.group_id = catalog.groups.get(&name).cloned();
-                    result.name = name;
-                }
-            }
-            return result;
         }
-        let selection = state.global_selection();
-        let selection_resolvable = if state.is_global() && !selection.is_empty() {
-            let config = self.config.read().await;
-            matches!(selection, "direct" | "block")
-                || config.groups.iter().any(|group| group.name == selection)
-                || config.nodes.iter().any(|node| node.name == selection)
-        } else {
-            false
-        };
-        result.name = state.override_outbound(&result.name, false, selection_resolvable);
-        result
+        let config = self.config.read().await;
+        let state = self.mode_state.as_ref().map(|state| state.read());
+        mode_decision(
+            state.as_deref(),
+            &config,
+            #[cfg(feature = "native-api")]
+            self.native
+                .as_ref()
+                .map(|native| native.catalog.snapshot())
+                .as_deref(),
+            outbound_name,
+            must,
+        )
     }
+}
+
+pub(in crate::control) fn mode_decision(
+    state: Option<&crate::mode::ModeState>,
+    config: &honk_config::Config,
+    #[cfg(feature = "native-api")] catalog: Option<&crate::observe::catalog::CatalogIdentity>,
+    outbound: String,
+    must: bool,
+) -> ModeDecision {
+    let mut result = ModeDecision {
+        name: outbound,
+        constraint: Default::default(),
+        #[cfg(feature = "native-api")]
+        group_id: None,
+    };
+    let Some(state) = state else {
+        return result;
+    };
+    if must || result.name == "block" {
+        return result;
+    }
+    #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+    if state.is_native() {
+        let Some(catalog) = catalog else {
+            result.name = "block".into();
+            return result;
+        };
+        match state.native_override(&result.name, must, config, &catalog.groups) {
+            crate::mode::ModeOverride::Unchanged => {}
+            crate::mode::ModeOverride::Direct => result.name = "direct".into(),
+            crate::mode::ModeOverride::Block => result.name = "block".into(),
+            crate::mode::ModeOverride::Node(id) => {
+                result.name = config
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .expect("validated mode target")
+                    .name
+                    .clone();
+                result.constraint = crate::control::reload::OutboundConstraint::Node(id);
+            }
+            crate::mode::ModeOverride::Group(name) => {
+                result.group_id = catalog.groups.get(&name).cloned();
+                result.name = name;
+            }
+        }
+        return result;
+    }
+    #[cfg(feature = "native-api")]
+    let _ = catalog;
+    let selection = state.global_selection();
+    let resolvable = state.is_global()
+        && !selection.is_empty()
+        && (matches!(selection, "direct" | "block")
+            || config.groups.iter().any(|group| group.name == selection)
+            || config.nodes.iter().any(|node| node.name == selection));
+    result.name = state.override_outbound(&result.name, must, resolvable);
+    result
 }
 
 #[cfg(test)]

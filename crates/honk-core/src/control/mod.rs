@@ -4,6 +4,8 @@ mod bootstrap;
 mod cache;
 pub(crate) mod client;
 mod connection;
+#[cfg(target_os = "linux")]
+pub mod core_forward;
 pub mod dns_control;
 mod dns_listener;
 pub mod drain;
@@ -34,7 +36,7 @@ mod runtime;
 mod shutdown;
 mod task_registry;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 use udp_ingress::{
     UdpLoopState, UdpSlowPathWork, begin_udp_slow_path, dispatch_udp_slow_path,
@@ -221,6 +223,10 @@ pub struct ControlPlane {
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+    #[cfg(target_os = "linux")]
+    core_forward_users: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(target_os = "linux")]
+    core_forward_mixed_users: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
     #[cfg(test)]

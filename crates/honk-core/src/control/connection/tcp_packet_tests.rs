@@ -252,6 +252,52 @@ async fn packet_tcp_routes_real_loopback_and_keeps_close_until_output_release() 
 }
 
 #[tokio::test]
+async fn admitted_packet_tcp_keeps_route_and_mode_after_publication() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let upstream = TcpListener::bind("127.0.0.1:0").await?;
+        let (mut wire, mut flow) = Wire::connect(upstream.local_addr()?)?;
+        let mut plane = plane(config())?;
+        let mode = Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
+            "Rule", "block",
+        )));
+        plane.set_mode_state(Arc::clone(&mode));
+        let handle = plane.spawn_handle();
+        let mut snapshot = handle
+            .prepare_packet_routing_snapshot(
+                flow.peer_addr(),
+                flow.local_addr(),
+                "tcp",
+                flow.dscp(),
+                #[cfg(feature = "native-api")]
+                false,
+            )
+            .await?;
+        snapshot.admission_final = true;
+        flow.set_routing(Some(
+            crate::control::packet_endpoint::EndpointAdmission::new(snapshot, &wire.budget)?,
+        ));
+        let mut next = config();
+        next.routing.default_outbound = "block".into();
+        *handle.router.write().await = Router::from_config(&next.routing)?;
+        *handle.config.write().await = Arc::new(next);
+        *mode.write() = crate::mode::ModeState::new("Global", "block");
+        let worker = handle.clone();
+        let serving = tokio::spawn(async move { worker.serve_packet_connection(flow).await });
+        let (mut server, _) =
+            tokio::time::timeout(Duration::from_secs(5), upstream.accept()).await??;
+        wire.send(b"admitted");
+        let mut bytes = [0; 8];
+        server.read_exact(&mut bytes).await?;
+        assert_eq!(&bytes, b"admitted");
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        wire.finish().await;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
 async fn packet_tcp_sniffing_preserves_domain_plus_and_initial_must() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};

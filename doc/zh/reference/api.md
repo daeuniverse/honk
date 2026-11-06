@@ -232,6 +232,10 @@ PUT 与校验请求体含未知字段（包括 `secrets_redacted`）时返回 `4
 
 因为 reload 会拒绝修改需重启设置的候选配置，而已写入的文件不回滚，磁盘 hash 会与 accepted hash 不一致，后续写入都返回 412，所以协调器在写入前拒绝。Group PATCH、节点与 provider 编辑、数据库模式的 import 与 revision 激活同样适用；`full` 模式校验以 warning 报告这些诊断。需重启的设置应在配置文件中修改，然后重启 honk。
 
+完整准入同样在文件或数据库耐久修改前检查所选 XDP 执行策略。后端、Direct profile、
+接口身份及有效 XSK 模式变化要求重启；省略与显式 Copy 等价。防火墙/NAT 策略仍可
+热重载。这里验证策略，不冒充物理设备能力检查。
+
 协调器在副作用前预留 operation，串行处理 API 新写入和 SIGHUP，SIGHUP 也先入队再读盘。单源 overlay 完整校验后，采用目录 FD、拒绝符号链接的普通文件检查、独占临时文件、保留 mode、文件 fsync、目标与完整依赖集复查、原子 rename、目录 fsync。外部编辑器不受协调器约束，最后检查到 rename 之间仍有竞争窗口；UI 保存期间不要并行手工改同一文件。Rename 后若目录 fsync 失败，503 明确携带 `written:true,durability_confirmed:false`，不带 `Retry-After`：可见内容已经改变，不表示未写或回滚。写入后 reload 无法入队时同样返回 `written:true`，不带 `Retry-After`。
 
 `POST /api/v1/config/sources` 新建一个源文件。能力中的 `config.create` 仅在 `config.writable` 为 true 时为 true；配置不可用或不可写时的响应与 PUT 相同；配置可写但 `config.create` 为 false 时返回 `404 capability_not_supported`。Body 为 `{"path":"config.d/proxies.dae","content":"..."}`。`path` 相对入口目录，只含普通路径段，以 `.dae` 结尾，不超过 1024 字节且不含控制字符；父目录必须位于入口根目录内，经符号链接指向根目录外同样拒绝。不满足时返回 `400 invalid_request`。路径已存在于磁盘或属于已接受的源时返回 `409 state_conflict`，不覆盖。候选配置执行与 PUT 相同的完整校验、凭据检查与需重启设置检查，且新文件必须由某个 include 模式加载；否则 422 携带归属主文件、位置为 null 的 `source-not-included` 错误诊断。文件经临时文件与禁止覆盖的 rename 写入，使用入口文件的 mode；数据库模式改为把新源记录到新 revision。Reload 失败时新建的文件保留在原处，因为删除它会与该路径的其他编辑者竞争。每个失败的新建 operation 都报告 `written`（文件创建后为 `true`）与 `committed`（`false`、`true` 或 `null`）。大小限制、`Idempotency-Key` 以及 413、415、429、503 响应与 PUT 相同。

@@ -121,6 +121,7 @@ pub(super) fn summary(
     let kind = match observation.kind {
         DatapathKind::Real => "ebpf",
         DatapathKind::Mock => "mock",
+        DatapathKind::XdpUserspace => "userspace",
         DatapathKind::Unknown => "unknown",
     };
     if observation.kind != DatapathKind::Real {
@@ -280,7 +281,7 @@ pub(super) async fn get(
 }
 
 pub(super) fn capability() -> Value {
-    json!({"available": true, "kinds": ["ebpf", "mock"], "details": ["attachments", "maps"]})
+    json!({"available": true, "kinds": ["ebpf", "userspace", "mock"], "details": ["attachments", "maps"]})
 }
 
 #[cfg(test)]

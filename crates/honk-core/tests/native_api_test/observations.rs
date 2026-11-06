@@ -229,6 +229,54 @@ async fn native_events_replay_actual_commits_after_ready_and_reject_changed_filt
 }
 
 #[tokio::test]
+async fn native_userspace_backend_matches_datapath_contract_without_kernel_claims() {
+    use honk_core::ebpf::userspace::UserspaceBackend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let app = TestApp::new(|_| {}).await;
+    let admission = Arc::new(AtomicBool::new(false));
+    *app.control.ebpf_handle().write().await =
+        Box::new(UserspaceBackend::new(Arc::clone(&admission)));
+    let capabilities = response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;
+    assert!(
+        capabilities["resources"]["datapath"]["kinds"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("userspace"))
+    );
+
+    for admitted in [false, true] {
+        admission.store(admitted, Ordering::Release);
+        for query in ["", "?detail=summary", "?detail=full"] {
+            let runtime = response_json(
+                app.get(&format!("/api/v1/runtime{query}"))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let datapath = response_json(
+                app.get(&format!("/api/v1/datapath{query}"))
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                runtime["datapath"],
+                json!({"kind":"userspace", "state":"unknown", "visibility":"none", "ebpf":null})
+            );
+            for field in ["kind", "state", "visibility", "ebpf"] {
+                assert_eq!(datapath[field], runtime["datapath"][field]);
+            }
+            assert_eq!(datapath["errors"], json!([]));
+            assert_eq!(admission.load(Ordering::Acquire), admitted);
+        }
+    }
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn native_catalog_capabilities_and_recording_disable_are_honest() {
     let app = TestApp::new(|config| config.experimental.native_api.record_flows = false).await;
     let capabilities = response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;

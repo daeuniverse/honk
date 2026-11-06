@@ -41,6 +41,12 @@ pub struct MemoryReservation {
 }
 
 impl MemoryReservation {
+    /// Adopts an existing charge without charging again. The caller must relinquish exactly
+    /// these previously charged bytes from its own accounting without refunding the budget.
+    pub(crate) fn from_charged(budget: Arc<MemoryBudget>, bytes: usize) -> Self {
+        Self { budget, bytes }
+    }
+
     pub fn bytes(&self) -> usize {
         self.bytes
     }

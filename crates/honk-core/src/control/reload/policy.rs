@@ -51,6 +51,15 @@ pub(crate) fn restart_required_changes(
     candidate_log_file: Option<&Path>,
 ) -> Vec<RestartField> {
     let mut changed = Vec::new();
+    let default_datapath = honk_config::datapath::DatapathConfig::default();
+    if !current
+        .datapath
+        .as_ref()
+        .unwrap_or(&default_datapath)
+        .same_device_setup(candidate.datapath.as_ref().unwrap_or(&default_datapath))
+    {
+        changed.push(field!("datapath"));
+    }
     let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
         (Ok(current), Ok(candidate)) => current != candidate,
         _ => current.dns.bind != candidate.dns.bind,

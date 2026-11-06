@@ -35,7 +35,15 @@ fn owned(stack: &mut Stack, now: Instant, original: &[u8], id: u32) -> OwnedPack
             other => panic!("unexpected reassembly outcome: {other:?}"),
         }
     }
-    result.expect("all fragments must complete")
+    let packet = result.expect("all fragments must complete");
+    assert_eq!(
+        packet.ipv6_fragment(),
+        ip.src.is_ipv6().then_some(Ipv6Fragment {
+            id,
+            max_size: 48 + ip.payload.len().min(1000),
+        })
+    );
+    packet
 }
 
 #[test]

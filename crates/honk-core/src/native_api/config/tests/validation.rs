@@ -326,3 +326,242 @@ async fn failed_reload_keeps_the_error_rows_when_warnings_overflow_details() {
     fixture.assert_last_reload(&terminal).await;
     fixture.shutdown().await;
 }
+
+#[cfg(target_os = "linux")]
+const XDP: &str = "\ndatapath {\n backend: xdp\n direct: core\n interface {\n eth0: lan\n }\n}\n";
+
+#[cfg(target_os = "linux")]
+async fn xdp_fixture(database: bool) -> Fixture {
+    let setup = |_: &Path, sources: &mut HashMap<&'static str, String>| {
+        sources.get_mut("main.dae").unwrap().push_str(XDP);
+    };
+    if database {
+        Fixture::new_db_custom(Access::Admin, setup).await
+    } else {
+        Fixture::new_custom(Access::Admin, false, setup).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn xdp_policy_rejection_preserves_files_database_and_runtime() {
+    for database in [false, true] {
+        let fixture = xdp_fixture(database).await;
+        let original = &fixture.originals["main.dae"];
+        let before = fixture.get(CONFIG).await;
+        let main = source(&before, original);
+        let tree = fixture.path(if database { "etc" } else { "" });
+        let before_disk = disk(&tree);
+        let before_rules = fixture.get("/api/v1/rules").await;
+        let before_revisions = if database {
+            Some(fixture.get("/api/v1/x-honk/config/revisions").await)
+        } else {
+            None
+        };
+        let mut candidates: Vec<_> = [
+            "dport(443) -> direct(mark: 512)",
+            "pname(browser) -> direct",
+            "!pname(browser) -> direct",
+            "mac(02:00:00:00:00:01) -> direct",
+            "!mac(02:00:00:00:00:01) -> direct",
+            "domain(example.com) -> direct",
+            "!domain(example.com) -> direct",
+        ]
+        .into_iter()
+        .map(|rule| original.replace("fallback: direct", &format!("{rule}\n fallback: direct")))
+        .collect();
+        candidates.extend([
+            original.replace("fallback: direct", "fallback: direct(mark: 512)"),
+            original.replace("dial_mode: ip", "dial_mode: domain"),
+            original.replace("nfqueue_enable: false", "nfqueue_enable: true"),
+            original.replace("dial_mode: ip", "dial_mode: ip\n lan_interface: eth9"),
+            original.replace("dial_mode: ip", "dial_mode: ip\n wan_interface: eth9"),
+        ]);
+        for (index, candidate) in candidates.iter().enumerate() {
+            let syntax = ok(fixture.validate("syntax", candidate).send().await.unwrap()).await;
+            assert_eq!(syntax["valid"], true, "{syntax}");
+            let full = ok(fixture.validate("full", candidate).send().await.unwrap()).await;
+            assert_eq!(full["valid"], false, "{full}");
+            assert!(full["diagnostics"].as_array().unwrap().iter().any(|row| {
+                row["code"] == "invalid-datapath-config" && row["source_id"] == "candidate"
+            }));
+            let failure = error(
+                fixture.replace(main, candidate).send().await.unwrap(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_value",
+            )
+            .await;
+            assert!(
+                failure["error"]["details"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| {
+                        row["code"] == "invalid-datapath-config" && row["source_id"] == main["id"]
+                    })
+            );
+            assert_eq!(disk(&tree), before_disk);
+            assert_eq!(fixture.get(CONFIG).await, before);
+            assert_eq!(fixture.get("/api/v1/rules").await, before_rules);
+            if let Some(revisions) = &before_revisions {
+                assert_eq!(
+                    fixture.get("/api/v1/x-honk/config/revisions").await,
+                    *revisions
+                );
+                std::fs::write(tree.join("main.dae"), candidate).unwrap();
+                let import_disk = disk(&tree);
+                error(
+                    fixture
+                        .request(Method::POST, "/api/v1/x-honk/config/import")
+                        .header("idempotency-key", format!("xdp-policy-{index}"))
+                        .json(&json!({"replace":true}))
+                        .send()
+                        .await
+                        .unwrap(),
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unsupported_value",
+                )
+                .await;
+                assert_eq!(disk(&tree), import_disk);
+                assert_eq!(
+                    fixture.get("/api/v1/x-honk/config/revisions").await,
+                    *revisions
+                );
+                assert_eq!(fixture.database.as_ref().unwrap().head(), Ok(Some(1)));
+                assert_eq!(fixture.get(CONFIG).await, before);
+                assert_eq!(fixture.get("/api/v1/rules").await, before_rules);
+                std::fs::write(tree.join("main.dae"), original).unwrap();
+            }
+            assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+        }
+        let endpoint = original
+            .replace("direct: core", "direct: endpoint")
+            .replace("dial_mode: ip", "dial_mode: domain")
+            .replace(
+                "fallback: direct",
+                "domain(example.com) -> direct\n fallback: direct",
+            );
+        let full = ok(fixture.validate("full", &endpoint).send().await.unwrap()).await;
+        assert_eq!(full["valid"], true, "{full}");
+        assert_eq!(fixture.get(CONFIG).await, before);
+        assert_eq!(disk(&tree), before_disk);
+        assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+        fixture.shutdown().await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn xdp_device_changes_reject_before_persistence_but_effective_copy_and_policy_commit() {
+    for database in [false, true] {
+        let fixture = xdp_fixture(database).await;
+        let original = &fixture.originals["main.dae"];
+        let before = fixture.get(CONFIG).await;
+        let main = source(&before, original);
+        let tree = fixture.path(if database { "etc" } else { "" });
+        let before_disk = disk(&tree);
+        let before_rules = fixture.get("/api/v1/rules").await;
+        for candidate in [
+            original.replace(XDP, ""),
+            original.replace("direct: core", "direct: endpoint"),
+            original.replace("eth0: lan", "eth1: lan"),
+            original.replace("eth0: lan", "eth0: wan"),
+            original.replace("direct: core", "direct: core\n xsk_mode: zerocopy"),
+        ] {
+            let full = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
+            assert_eq!(full["valid"], true, "{full}");
+            assert!(full["diagnostics"].as_array().unwrap().iter().any(|row| {
+                row["code"] == "restart-required"
+                    && row["level"] == "warning"
+                    && row["source_id"] == "candidate"
+            }));
+            let failure = error(
+                fixture.replace(main, &candidate).send().await.unwrap(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "unsupported_value",
+            )
+            .await;
+            assert!(
+                failure["error"]["details"]["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| {
+                        row["code"] == "restart-required"
+                            && row["level"] == "error"
+                            && row["source_id"] == main["id"]
+                    })
+            );
+            assert_eq!(disk(&tree), before_disk);
+            assert_eq!(fixture.get(CONFIG).await, before);
+            assert_eq!(fixture.get("/api/v1/rules").await, before_rules);
+            assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+            if let Some(store) = &fixture.database {
+                assert_eq!(store.head(), Ok(Some(1)));
+                assert_eq!(
+                    fixture.get("/api/v1/x-honk/config/revisions").await["revisions"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+        }
+        let copy = original.replace("direct: core", "direct: core\n xsk_mode: copy");
+        let policy = copy.replace("\n xsk_mode: copy", "\n firewall {\n original {\n default: allow\n }\n forward {\n default: drop\n }\n }")
+            .replace("fallback: direct", "fallback: block");
+        for (index, candidate) in [copy, policy].iter().enumerate() {
+            let full = ok(fixture.validate("full", candidate).send().await.unwrap()).await;
+            assert_eq!(full["valid"], true, "{full}");
+            assert!(
+                !full["diagnostics"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row["code"] == "restart-required")
+            );
+            let current = fixture.get(CONFIG).await;
+            let current_main = current["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == main["id"])
+                .unwrap();
+            let operation = accepted(
+                fixture
+                    .replace(current_main, candidate)
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let terminal = fixture.terminal(&operation).await;
+            assert_eq!(terminal["status"], "succeeded", "{terminal}");
+            let after = fixture.get(CONFIG).await;
+            assert_ne!(after["revision"], current["revision"]);
+            assert_eq!(source(&after, candidate)["id"], main["id"]);
+            if let Some(store) = &fixture.database {
+                assert_eq!(store.head(), Ok(Some(index as i64 + 2)));
+                assert_eq!(
+                    std::fs::read_to_string(tree.join("main.dae")).unwrap(),
+                    *original
+                );
+            } else {
+                assert_eq!(
+                    std::fs::read_to_string(tree.join("main.dae")).unwrap(),
+                    *candidate
+                );
+            }
+        }
+        let trace = ok(fixture
+            .request(Method::POST, "/api/v1/routing/trace")
+            .json(&json!({"input":{"network":"tcp","dst_ip":"198.51.100.20","dst_port":443}}))
+            .send()
+            .await
+            .unwrap())
+        .await;
+        assert_eq!(trace["evaluations"][0]["outbound"], "block");
+        assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
+        fixture.shutdown().await;
+    }
+}

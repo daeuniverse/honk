@@ -1,6 +1,6 @@
 # Userspace network stack and WireGuard tunnel
 
-`honk-netstack` is a sans-I/O IPv4/IPv6 TCP/UDP stack. `Mode::Endpoint` remains the default WireGuard client behavior. `Mode::Transparent` provides passive TCP, stateless UDP, bounded reassembly and ICMP generation. Core's explicit packet-endpoint embedding now consumes it; no daemon capture/backend configuration selects it, and no AF_XDP/TUN/native-continuation capability follows from this API. Unless stated otherwise, this page describes unchanged Endpoint behavior. Like the other userspace subsystems, this code is largely AI-authored and requires maintainer review.
+`honk-netstack` is a sans-I/O IPv4/IPv6 TCP/UDP stack. `Mode::Endpoint` remains the default WireGuard client behavior. `Mode::Transparent` provides passive TCP, stateless UDP, bounded reassembly and ICMP generation. Core's packet-endpoint embedding and the explicitly configured [XDP daemon backend](./datapath.md#full-xdp-startup) consume it; the Stack API itself grants no capture or native-continuation authority. Unless stated otherwise, this page describes unchanged Endpoint behavior. Like the other userspace subsystems, this code is largely AI-authored and requires maintainer review.
 
 The outbound-side behavior (registry, flows, failure provenance) is summarized from the stack's point of view below and specified in [Outbound design](./outbound.md#wireguard-tunnel). Node fields and share links are in the [node reference](../reference/nodes.md).
 
@@ -15,7 +15,7 @@ flowchart LR
 
 - `honk-netstack` depends only on `blake3` and `thiserror`, is `publish = false`, and forbids `unsafe`. Outbound, datapath and core depend on it; it knows nothing about nodes, Tokio or sockets. `smoltcp` is a pinned development-only baseline.
 - It never reads a clock, an environment variable or a configuration file. The caller supplies `Instant`s, the interface addresses and MTU, a 32-byte private secret and the memory limits (`Config`). Defaults: MTU 1420, 4096 flows, 256 MiB memory, 8 MiB receive and 6 MiB send buffer per flow, `Mode::Endpoint`; the transparent-mode fields are listed under [Configuration and counters](#configuration-and-counters).
-- `wire` is public (IPv4/IPv6/TCP/UDP/ICMP codecs and the checksum) because the integration tests build packets with it. Everything else is private.
+- `wire` exposes IPv4/IPv6/TCP/UDP/ICMP codecs and checksums. `transit` narrowly exposes the existing funded reassembler and suppressed/rate-limited ICMP generator for routers; it never creates a TCP or UDP endpoint.
 
 ## Programming model
 
@@ -25,6 +25,7 @@ The stack is driven by exactly one owner through `&mut Stack`. It has no locks o
 | --- | --- |
 | `receive(now, packet) -> Rx` | Borrows one complete IP packet and verifies its checksums (`RxMeta::VERIFY`). Retained TCP bytes are copied into stack-owned rings. UDP returns `Rx::Datagram` (Endpoint) or `Rx::Transparent` (transparent mode): **the returned range is valid only until the caller reuses or recycles the input buffer**. `Rx::TransparentOwned` owns a reassembled packet. `Rx::Dropped(reason)` is counted. |
 | `receive_with(now, packet, RxMeta) -> Rx` | Adds trusted TCP/UDP checksum provenance and/or GRO/USO metadata in transparent mode. Endpoint mode drops any metadata other than `RxMeta::VERIFY` as `Unsupported`; WireGuard cannot skip verification. See [Checksum trust](#checksum-trust) and [Segmentation offload](#segmentation-offload). |
+| `receive_with_source(now, packet, callback) -> (Rx, Option<ValidatedSource>)` | Verifies through the same parser/reassembler/checksum path. Only the current completed TCP/UDP packet yields `{src, dst, protocol, tcp_flags}`; TCP flags are verified header facts, not admission evidence. The callback runs before protocol state mutation/UDP dispatch; false drops as `NotForUs`. The returned receipt is a validity fact even when refused, **not** handshake, delivery or kernel accepted-child proof. Incomplete/invalid fragments and bad checksums yield no receipt. |
 | `poll_transmit(now, out) -> Option<usize>` | Writes one complete IP packet to `out[..n]`. A too-small `out` returns `None` without losing the packet. `None` also means nothing is currently allowed by cwnd, rwnd or pacing. |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | Same scheduler with optional TCP segmentation offload in transparent mode; returns `len`, `gso`, `csum` and the original known-TCP `flow` handle, or `None` for stateless/unknown-flow output. Endpoint mode ignores offload capabilities. `poll_transmit` is the plain-packet wrapper with `TxCaps::NONE` and discards metadata. |
 | `poll_control_transmit(now, out)` | Shares the TCP emitter without TCP/UDP payload. Preserves ordinary readiness, DRR and payload TLP work while emitting eligible ACK/RST/SYN/FIN/probes, TIME_WAIT ACKs and ICMP. Reserve control frame/descriptor credit before calling. |
@@ -63,6 +64,7 @@ Each flow exposes the minimum of its RTO/persist, delayed-ACK, tail-loss-probe, 
 - In Endpoint mode a packet for an address that is not the configured local address of its family is `NotForUs`. A family without a local address cannot be used at all (`NoLocalAddress`). Transparent mode accepts any unicast destination instead (see [Scope and addressing](#scope-and-addressing)).
 - Drop reasons are counted per reason in `StackStats`: `Malformed`, `Checksum`, `Fragment`, `NotForUs`, `NoFlow`, `Unsupported`, and in transparent mode `HalfOpen` and `Capacity`. (`Stale` is defined but never produced.)
 - **Ordinary receive verifies checksums in both modes** (IPv4 header, TCP, UDP, ICMP) before changing flow state. IPv4 UDP checksum zero means none; IPv6 UDP zero is invalid on the verification path. Only transparent `receive_with` can trust the driver's TCP/UDP `Csum::Valid`/`Partial`; IPv4 headers, ICMP and reassembled datagrams are still verified. Endpoint mode rejects such metadata, so WireGuard always verifies its inner packets: it authenticates the tunnel peer, not the sender's inner checksum. Full transmit output copies the payload and then computes its checksum using native-endian accumulation lanes; offloaded output carries a partial checksum instead (see [Checksum trust](#checksum-trust)).
+- UDP verification uses its declared length, which may be shorter than the IP payload. Trailing IP bytes are not UDP data or part of its checksum; Core forwarding preserves those IP bytes. Contiguous and scatter/gather validation use the same boundary.
 - **ICMP is consumed in both modes and emitted only in transparent mode.** A packet-too-big (RFC 1191/8201) or destination-unreachable message is honored only for a TCP flow of the message's own address family whose quoted sequence is inside the outstanding window; PTB lowers the flow's path MTU (never raises it) and makes every now-oversize segment sendable again, including one already retransmitted at the old size, unreachable on a `SYN_SENT` flow fails the connect with `Unreachable`. Legacy PTB without an MTU uses the RFC 1191 plateau table. ICMP echo and all other ICMP are ignored. In Endpoint mode the stack never generates ICMP; generation is described in [ICMP generation](#icmp-generation).
 - **UDP in Endpoint mode** has no receive queue and no send queue. A datagram for an unbound port is `NoFlow` (no ICMP error). `udp_send` serializes directly into the caller's buffer as one IP packet; a datagram larger than the MTU is `TooLarge`. Transparent UDP is stateless and is described in [Transparent UDP](#transparent-udp).
 
@@ -127,7 +129,17 @@ Payload storage is a pool of chunks organized in two rings per TCP flow (send, r
 
 `control::packet_endpoint::PacketEndpoints` consumes an unstarted control plane and explicit scopes sharing one budget. Its supervisor joins scope, TCP, UDP and retirement work; cancelling a shutdown waiter does not cancel admitted cleanup. TCP uses the existing routing/dial/Score path with copy relay, not kernel adoption or splice. UDP reuses the one endpoint/source pool and captured packet reply sender, with no reply FD. Endpoint/source/foreign-reply/sniffer keys include scope; packet retirement cannot mutate coincident kernel state. DNS still follows traffic policy before controller admission, and must/Block remain final.
 
-Startup opens scope admission before reporting readiness and native `Running`; a startup error waits for supervisor cleanup before returning. Shutdown keeps the first UDP drain result, so forced cancellation is not reported as graceful success. A five-second cleanup warning does not release ownership or impose a hard completion deadline. Entry metadata remains charged through exact retirement, and task allocation/buffer credit through join; completed UDP tasks are reaped before charging the next ingress copy. Health callbacks observe the UDP pool without extending its lifetime.
+`PacketScope::receive_with_source` invokes the source callback under the existing
+output mutex; it must not re-enter the scope or block on I/O. A device can install
+the current packet's reverse L2 association before any output consumer proceeds,
+or refuse a conflicting association before protocol state changes. `PacketEndpoints`
+threads that exact receipt without inspecting `poll_accept`, which may dequeue an
+older pending SYN. UDP queue/capacity errors remain unchanged: a callback can report
+valid source facts even when subsequent UDP work has no capacity. Existing receive
+APIs use a compile-time reporting-disabled path, with no reporting allocation or
+mutable cross-call “last packet” state.
+
+Startup opens scope admission before reporting Endpoint supervisor readiness; non-XDP embeddings retain native `Running` at that commit. An explicit XDP owner calls `PacketEndpoints::capture_ready()` only after every real capture gate has activated; the same supervisor defers native `Running` until that notification. A startup error waits for supervisor cleanup before returning. Shutdown keeps the first UDP drain result, so forced cancellation is not reported as graceful success. A five-second cleanup warning does not release ownership or impose a hard completion deadline. Entry metadata remains charged through exact retirement, and task allocation/buffer credit through join; completed UDP tasks are reaped before charging the next ingress copy. Health callbacks observe the UDP pool without extending its lifetime.
 
 A connection-task panic terminates only that TCP flow, not other packet service. TCP task admission reaps completed work and explicitly resets a genuinely refused flow. Periodic UDP maintenance also returns joined task credit during idle periods. Closing ingress waits for already-reserved producer permits and disposes their late messages before joining scope owners; receiver closure alone is not proof that no `FlowIo` can still arrive.
 
@@ -137,10 +149,230 @@ Packet TCP write shutdown waits for handshake completion instead of turning temp
 
 The supplied budget accounts packet storage/reservations, not whole-process RSS or every pre-existing outbound runtime allocation. Kernel socket buffers remain separate. This embedding is an explicit Endpoint path, **not** native forwarding, capture metadata validation, a production backend publication gate or a performance result.
 
+### Experimental AF_XDP consumer
+
+`honk-xsk` provides Linux XDP link/program and AF_XDP ring primitives. The
+`honk-core` example `xsk_endpoint` connects them to `PacketEndpoints`; it is not
+a daemon backend or a production configuration option. Its frozen fixture uses
+one IPv4 TCP or UDP tuple, one discovered queue, untagged Ethernet and MTU 1500.
+DISCOVER drops test traffic; DATA redirects with a DROP fallback. Fragments and
+IPv4 options are dropped across the declared address/protocol domain, which
+must be exclusive to the experiment. Direct remains a real socket relay, not
+native continuation. PF0 requires zero-copy; explicit copy mode is restricted
+to the `dut0` virtual-interface fixture in a virtme guest, never an automatic fallback.
+
+The device owner observes FILL consumption before RX, consumes borrowed IP bytes
+before recycling the frame, and retains each core output lease through its actual
+CQ return. `PacketScope::poll_output_class` lets control output pass queued bulk
+when only control credit is available, preserving order within each class.
+Ethernet padding is excluded from received IP slices and funded separately on TX.
+Core shutdown runs concurrently with device draining; CQ returns resources, not
+proof of peer delivery. The supervisor must retain the native link and stop the
+independent upstream before detaching, including on consumer failure.
+
+UMEM mappings and their budget charges remain retained until process exit.
+Neither socket close nor empty rings prove deferred pool release or DMA quiescence;
+this is not a production release fence or a zero-resident in-process close.
+Hardware zero-copy, full X0 acceptance, TC A/B, multi-queue, SG/offload and native
+continuation require separate execution evidence.
+
+### Explicit routed-only CoreForward
+
+`honk-datapath::forward::CoreForward` is a safe, sans-I/O transit owner, not
+`Stack::receive` or a Direct socket relay. `honk-core::control::core_forward::RoutedCore`
+joins it to the canonical Router and the existing router/config publication barrier.
+The routed-only fixture selects `execution: "routed-only"` and `nat: false`; the
+daemon selects `MixedEndpoints` and may enable the separately compiled firewall/NAT.
+Native continuation, required kernel firewall/qdisc processing and skb classification
+remain unsupported requirements. Routed-only policy uses `dial_mode: ip` and unmarked
+`direct`/`block` actions. Incompatible reloads preserve the previous generation.
+
+`ControlPlane::core_forward_policy(Execution)` returns a narrow registered
+`RoutingAuthority` before `PacketEndpoints` consumes the plane; both retain the
+same published router/config, never separate policy owners. The explicit
+`MixedEndpoints` profile admits only IP-mode policy without domain, process-name,
+MAC or mark dependencies. Its ordinary final Direct action is Core transit;
+non-must DNS53 and group actions return the original funded packet to Endpoint,
+while Block remains terminal. Policies needing unresolved TCP/domain facts must
+select Endpoint instead of silently turning configured Core Direct into a relay.
+
+Core and Endpoint share the existing Rule/Global/Direct mode override, including
+typed native targets and final must/Block precedence. A Core `PolicyGeneration`
+captures both routing generation and the nonwrapping mode revision; submission
+holds the router/config/mode readers through the actual writer. A mode ABA change
+cannot revive queued output, and rejected output is disposed without replay.
+Ordinary Global decisions on the borrowed cached path return Cold rather than
+inventing an Endpoint handoff without owning its decision. An existing unbound
+Core transport keeps its execution owner across traffic-class changes and exact
+registered reverse ingress, but that retention never overrides a current Block.
+Firewall bindings retain their independent security/address authority. Route/mode
+changes do not replay admitted transit bytes through a fresh Stack.
+
+`Decision::Endpoint` carries an accounted `EndpointAdmission` containing the
+actual routed action, config, group/runtime handles and effective mode decision.
+The capture consumer passes it to `PacketEndpoints::receive_admitted_with_source`.
+UDP queues that same authority with its datagram. TCP binds it under the scope
+mutex to the new `FlowId` returned by `Stack::receive_with_tcp_admission`, before
+output wakes; retransmits retain the original authority and `poll_accept` only
+transfers its exact stored incarnation. Delayed dispatch does not reroute under a
+new config or reapply a newer mode. Pending snapshots retain budget charges until
+consumption or exact flow disposal; there is no cross-call last-packet snapshot.
+
+The capture consumer checks `PacketEndpoints::retains(scope, source, destination,
+protocol)` before selecting Core, including on completed reassembly. This is
+read-only classification, not checksum validation. Existing Stack TCP tuples,
+TIME_WAIT, flow-owned controls and queued/exported packet-runtime outputs retain
+Endpoint execution. ICMP errors are classified by their quoted TCP owner before
+Core selection; Stack still validates checksum, family and outstanding sequence.
+Ordinary non-53 UDP reserves its Initializing owner before publishing on a separate
+bounded initializer channel. Runtime-mutating commands drain cancelled leases from
+that channel while awaiting reload; unrelated TCP and DNS work retain their FIFO.
+Initializing, Ready and Retiring entries retain their scoped tuple, so mode changes
+cannot create a second Core owner.
+
+Controller DNS53 remains per-query, not a transport flow: each queued/admitted
+query retains its captured decision while a later must/direct query may select
+Core. Raw/group/must DNS53 that actually reserves a UDP transport instead uses
+that pool entry's normal retained ownership. Controller queries are not collapsed
+into one transport lease or represented by another conntrack table.
+
+Reply-path retention also includes pending DNS work, shared-source receiver tails,
+Stack controls/fragments and queued/exported output. The source callback may inspect
+pending CPU output under its existing scope mutex; it must not re-enter that scope.
+Exported packets snapshot their complete VLAN TCI rather than rereading a later peer
+priority. Normal command replies remain real outcomes; fatal device failure closes
+external acknowledgements independently of retained in-flight work and CQ resources.
+Losing an accepted reload's supervisor handoff remains fail-closed, not successful
+HTTP request cancellation or a reason to silently replay configuration work.
+
+
+One Core owner covers the namespace/routing domain and all registered logical
+ingresses. All queues of one logical ingress share its existing reassembler;
+input identity retains actual logical ifindex and attachment rather than just a
+shared ScopeId. The flow directory and memory budget are shared across inputs.
+`Packet::rewrite` retains funded storage and forbids submission after a failed
+translation/checksum validation. It refreshes tuple metadata only on success.
+
+The cached path accepts borrowed `wire::PacketView` segments and uses the shared
+IP/transport codecs and streaming checksum. Only bounded headers are staged.
+`ForwardView` and owned `ForwardPacket` share one writer: the adapter reserves the
+entire TX chain first, then `write_next_segments` copies directly into those
+segments, including caller-supplied L2 framing. A borrowed-path CQ lease retains
+the slow-flow owner without allocating a full staging Packet. Cold FIB waits or
+fragment storage may retain a funded copy; no hot-path convenience linearization
+or second reassembler is introduced. The frozen example below remains untagged
+IPv4; SG device evidence belongs to the full-XDP consumer, not this fixture.
+
+Ingress carries separate scope, actual socket namespace cookie, logical ifindex,
+attachment identity and mark provenance. Unknown marks are refused, not converted
+to zero. `BeforeSkb` explicitly selects a deployment with no required skb classifiers.
+The namespace-bound provider subscribes before bounded route/rule/link/address/
+neighbor/nexthop/netconf dumps. It sends real input `RTM_GETROUTE` requests with
+`RTA_IIF`, source/destination, TOS, protocol, ports and the proven mark, leaving
+transit UID absent. The kernel executes RPDB; no rules are mirrored. Link MTU,
+kernel forwarding permission and usable neighbor MACs come from kernel replies;
+missing neighbors request native ARP/ND through `NTF_USE`, never a fabricated MAC.
+Notifications invalidate all route leases. ENOBUFS, truncated/malformed messages,
+interrupted dumps, late replies or synchronization-bound exhaustion close the
+provider. A one-second lease horizon also forces resynchronization; no indefinite
+authorization cache exists. Cold misses perform bounded synchronous work and must
+run on a dedicated owner, not the packet hot path. Submission rechecks the provider
+and policy generation under the existing publication readers.
+Multicast notifications are identified by `NETLINK_PKTINFO` rather than a zero
+sequence number. Valid blackhole results drop only their packet, as do routes through
+an unavailable logical link and encapsulated or multipath execution that Core cannot
+perform; these refusals do not desynchronize the provider. A lost route lease
+retries or suppresses only the dependent work. Duplicate IPv6 preferred-source
+attributes are accepted only when they agree. Address epochs are independent of
+route/neighbor refresh, so routine resynchronization does not revoke MASQUERADE.
+
+
+Both IP families validate packet/transport checksums before flow admission, reuse
+the funded reassembler, preserve original TCP/UDP/ICMP bytes and decrement TTL/hop
+limit exactly once in the materialized output. IPv4 without DF is fragmented for
+the egress MTU; IPv4 DF and ordinary IPv6 produce fragmentation-needed/PTB.
+Completed IPv6 reassembly retains its original fragment ID and maximum received
+fragment size. If that maximum fits the egress, Core restores aligned fragments,
+using the Linux minimum-1280 target capped by egress MTU; otherwise it emits PTB.
+Unfragmented IPv6 never acquires fragmentation provenance.
+TTL errors use code 0, while exposed reassembly-timeout quotes use code 1. ICMP uses a real local
+router address, shared suppression/rate limits and a separate native local-output
+route query. LocalInput is distinct and dropped by the example. Core TCP execution
+is retained for 7440 seconds idle, UDP for 120 seconds, other traffic for 60 seconds,
+and longer while output leases remain. Unverified FIN/RST cannot shorten that
+protection. An expired non-SYN TCP packet cannot create a fresh Endpoint or a forged
+reverse reset; a fresh initial SYN may create a new incarnation. FIB changes never
+promote Core owners to native forwarding. Queued packets have a two-second deadline.
+
+Route authority and MTU are available before forward-neighbor resolution, so a
+known hop-limit or oversized-packet error does not wait for that unused neighbor.
+Generated errors still require their own local-output route and return neighbor,
+with a same-family transit-unicast `RTA_PREFSRC` from the synchronized local-address
+snapshot. Invalid or absent source proof suppresses only that error. Input FIB
+prohibit can authorize AdminProhibited, but LocalInput/blackhole do not grant
+forwarding authority. TCP RST and ICMP errors cannot trigger another refusal.
+
+The device timer drains `poll_reassembly_error(now, out)` using funded control
+storage of at least 1280 bytes. It returns `GeneratedError` with the real return
+route, policy generation and emitted length; keep that owner through CQ or
+explicit local disposal, not merely until submission. Exported timeout quotes
+retain only matching scoped NAT/native-history domains, never a global reclamation
+freeze. One unresolved neighbor quote can wait two seconds on its original deadline;
+up to 64 suppressed/denied quotes retire per call. A firewall-enabled timeout requires
+actual quoted ports, a trusted
+ingress role and an original-chain Allow; a truncated quote never creates or
+refreshes conntrack state. Input unicast/source FIB proof precedes the separate
+local-output return lookup. Core quotes retain up to 20 **contiguous** upper-layer
+bytes so TCP RST flags are known; holes are never quoted as zeroes, and missing
+flags suppress the error. Ordinary Stack timeout quotes remain eight bytes.
+
+Core execution rejects router-processed IPv4 options, unsupported IPv6 extension
+semantics, nonzero IPv6 flow labels, bridge/VRF/bond execution and route encapsulation.
+These checks run after disposition but before FIB/NAT/Reject work; Endpoint does not
+inherit Core-only restrictions. Linux 6.12's [IPv6 getroute implementation](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/route.c#L6030-L6095)
+cannot represent a nonzero input flow label, so Core never queries a different flow.
+Plain Ethernet and up to two configured 802.1Q/802.1ad VLAN layers retain logical
+iif and physical egress separately. Unsupported VLAN QoS/binding semantics and
+unrecoverable RX stripping fail admission. The narrow example remains untagged;
+the daemon is the general device consumer, not evidence of X1 or DMA release.
+
+#### Isolated-VM smoke entry (not executed here)
+
+Build `cargo build -p honk-core --example xsk_core_forward` and run the resulting
+binary **only in a fresh network namespace in the provisioned virtme guest** as
+`xsk_core_forward run.json`. The external supervisor owns a client–DUT–server
+topology, addresses, forwarding sysctls, routes, two single-RX-queue veths named
+`dut0`/`dut1`, and both independent TCP/UDP peers. Use MTU 1500, untagged Ethernet,
+no required firewall/qdisc/NAT semantics, and ordinary unmarked input routes.
+It must retain duplicate FDs for both emitted `attached` links before sending the
+plain line `armed`. Only `ready` permits peer traffic. Stop both generators before
+`close`; require `closed`, CQ counts drained and end-to-end peer evidence before
+`exit`. On failure, stop peers before releasing the retained links or destroying
+the namespace. UMEM remains charged until process exit, as for `xsk_endpoint`.
+
+The strict JSON supplies `requirements` (all six fields above), `policy` (a dae
+file), `root_netns_inode` (the supervisor's root namespace), `devices` (exactly two
+objects with `ifname`, `ifindex`, six-byte integer arrays `mac`/`peer_mac`),
+`client`/`service` (`IPv4:port`), `protocol` (`tcp` or `udp`), and `budget_bytes`
+(for example 67108864). The consumer uses real XSK RX/TX and the native FIB in
+both directions; MockEbpfBackend only avoids starting the unrelated TC relay.
+
+Required evidence: independent payload exchange and preserved tuple, one TTL
+decrement, correct Ethernet next-hop, TTL=1 ICMP, smaller egress MTU with DF on/off,
+empty-neighbor ARP resolution, route/rule/link/address/MTU/neighbor changes while
+output is queued, unsupported deployment rejection, previous-generation retention
+on incompatible reload, and fail-closed receive-loss/dump/late-response injection.
+Pure regressions are `cargo test -p honk-datapath --test forward`; also run
+`cargo test -p honk-core core_forward`, `cargo test -p honk-core netlink::fib`,
+`cargo test -p honk-netstack`, `just outbound-ci`, and the isolated real-kernel gate.
+The fixture's IPv4-only capture does not verify IPv6 device ingress/egress.
+
+
+
 
 ## Transparent termination
 
-`Config::mode = Mode::Transparent { exclude }` makes the stack the TCP/UDP endpoint of the client's destination. Packet scripts, simulation, fuzzing and the core embedding exercise it; the daemon still has no transparent capture backend. WireGuard continues to use default `Mode::Endpoint`. The same memory, congestion, recovery and single-owner rules apply. No transparent-mode performance gate or throughput number is claimed.
+`Config::mode = Mode::Transparent { exclude }` makes the stack the TCP/UDP endpoint of the client's destination. Packet scripts, simulation, fuzzing, the core embedding and the explicit XDP daemon consume it. WireGuard continues to use default `Mode::Endpoint`. The same memory, congestion, recovery and single-owner rules apply. No transparent-mode performance gate or throughput number is claimed.
 
 ### Scope and addressing
 
@@ -190,6 +422,8 @@ Transparent mode reassembles IPv4 and IPv6 fragments of any protocol; Endpoint m
 
 - `FragmentLimits` (`Config::fragment_limits`) defaults: `max_entries` 64, `max_bytes` 4 MiB (retained capacities of payload storage, fragment 0's saved headers, the range table and queued timeout quotes, plus 256 B of fixed bookkeeping per datagram), `max_holes` 32, `timeout` 30 s counted from a datagram's first fragment.
 - An overlapping fragment (an exact duplicate too) kills the datagram (RFC 5722, RFC 8200 section 4.5): the buffer is freed at once and a bufferless tombstone absorbs the remaining fragments (`Fragment`) until the timeout. More than `max_holes` gaps, or inconsistent lengths, kill it as well. Empty fragments, a non-final fragment whose length is not a multiple of 8 and a datagram beyond 64 KiB are `Malformed`. An atomic fragment is delivered as a whole datagram (RFC 6946).
+- Reassembly preserves CE from any fragment and rejects mixtures of Not-ECT with ECN-capable fragments into the ordinary tombstone. Fragment zero supplies DSCP and, without CE, the ECN codepoint; IPv6 flow labels remain unchanged. Atomic IPv6 fragments retain their own header independently.
+- `Transit::reassemble` enforces the original reassembly deadline on receive even if the caller has not polled its timer. A fragment at or after that deadline cannot complete the old datagram; retained timeout quotes keep their own ownership.
 - When the table or `max_bytes` is exhausted the oldest datagram is evicted silently, so a flood of first fragments cannot starve a burst that completes.
 - A timeout answers with ICMP Time Exceeded (IPv4 type 11 code 1, IPv6 type 3 code 1) only if fragment 0 arrived; the quote is the saved headers plus up to 8 bytes, truncated before queueing to 548 bytes (IPv4) or 1232 bytes (IPv6). At most 16 such errors wait for `poll_transmit`; `poll_timeout` and `handle_timeout` cover the reassembly deadlines.
 - **Shared budget.** Reassembly bytes are charged to `Config::shared_budget` (not to the stack's own `memory_limit`; without a budget only `FragmentLimits` bound them). A refused charge evicts the oldest datagram and retries; when nothing is left to evict the fragment is dropped, as `DropReason::Capacity` if it would start a datagram, or by killing the datagram (`Fragment`) if it is the only one left and cannot grow. Completion, eviction, kill and stack drop refund storage; expiry transfers the retained quote's actual capacity charge to the pending queue until it is sent, suppressed, rate limited or dropped. A short output buffer keeps that charge. A fragment flood can therefore occupy up to `FragmentLimits::max_bytes` of the shared budget, and new flows are admitted against the same budget: size it with that headroom, or SYNs are dropped as `Capacity` during the flood.
@@ -254,7 +488,7 @@ Errors are generated only by transparent-mode paths: `Refuse::IcmpUnreachable`/`
 
 Everything below is absent from `crates/honk-netstack/src` or from the repository today; the list is the boundary of this page's claims.
 
-- The drivers: a TUN driver (`honk-tun`) and an AF_XDP driver (`honk-xsk`). No crate by those names exists.
+- TUN, netmap and Windows backends are outside the current implementation. The configured Linux XDP daemon exists, but implementation is not production or hardware acceptance.
 - The eBPF/TC side: the classifier delivery bit, steering of flows to the stack, the delivery state that must outlive TIME_WAIT ([Close semantics](#close-semantics)), and proxying of non-first fragments at the TC layer.
 - ICMP proxying: relaying echo or errors between the client and a real upstream. The stack only consumes ICMP for outstanding TCP sequences and generates the errors listed above.
 - Any performance gate or measured number for transparent mode.
@@ -288,12 +522,12 @@ The driver lives in `honk-outbound/src/proxy/wireguard/`; [Outbound design](./ou
 
 | Area | Limit |
 | --- | --- |
-| IP | Endpoint mode: no fragmentation or reassembly (fragments are dropped, oversize UDP is `TooLarge`) and no ICMP generation. Transparent mode reassembles within `FragmentLimits` and fragments UDP replies up to 64 KiB. No ECN; no IPv4 options on transmit. |
-| TCP | Listen/accept only in transparent mode; no daemon capture backend. Accepted-flow keepalive is opt-in; no urgent-data API, TCP Fast Open or PLPMTUD; CUBIC only. Unknown TCP options are ignored; malformed option lengths stop parsing. |
+| IP | Endpoint mode: no fragmentation or reassembly (fragments are dropped, oversize UDP is `TooLarge`) and no ICMP generation. Transparent mode reassembles within `FragmentLimits`, preserving IP ECN, and fragments UDP replies up to 64 KiB. No IPv4 options on transmit. |
+| TCP | Listen/accept only in transparent mode, used by the explicit XDP daemon. Accepted-flow keepalive is opt-in; no urgent-data API, TCP Fast Open, ECN negotiation or PLPMTUD; CUBIC only. Unknown TCP options are ignored; malformed option lengths stop parsing. |
 | Receive | At most 32 out-of-order ranges per flow; ACK stretching limited by the 64-packet receive batch. |
 | Scale | An idle established flow costs about 1.4 KiB of heap (no chunks); per tunnel 4096 flows, each admitted flow reserving a floor of about 33 KiB from the process budget (the share: 256 MiB by default, one eighth of RAM within 64 MiB..4 GiB in honk) that all tunnel stacks draw from together, so about 2,000 / 8,000 / 32,000 floor-only flows fit at 64 MiB / 256 MiB / 1 GiB; live tunnels are bounded by their fixed cost, `share / 4 MiB` within 1..128; `max_flows` counts UDP associations; one lock and one owner task per tunnel, so one tunnel is limited to one core. |
 | WireGuard | Exactly one peer per tunnel; no inbound connections; IPv4 and IPv6 each need a configured tunnel address; the endpoint name is re-resolved only on the next acquire after a handshake attempt timed out, and the endpoint set is fixed while a session exists; one tunnel per (key pair, endpoint) per control plane (runtime-less dials share a separate process-wide registry), at most `share / 4 MiB` (1..128) tunnels live per registry (see Scale); nodes that share a key pair and endpoint must share every tunnel setting or they replace each other, and a hostname and an IP literal of one endpoint are separate tunnels; inner MTU at most 65472 so an outer datagram fits one UDP payload. |
-| Transparent | Explicit core packet embedding only; no configured TUN/AF_XDP/eBPF capture path or native continuation. The roughly 9 KiB progress floor is not total accepted/idle commitment. GRO/TSO/USO device integration and lab performance remain unverified. |
+| Transparent | Core packet embedding and the configured Linux XDP backend; no TUN/netmap/Windows backend or native continuation. The roughly 9 KiB progress floor is not total accepted/idle commitment. GRO/TSO/USO device integration and lab performance remain unverified. |
 | Verification | No interop run against non-Linux TCP implementations, no ARM run and no `test-routing`/`test-netns` VM gate. The design thresholds were measured on one x86-64 4-vCPU VM against kernel WireGuard + kernel TCP (not the design's same-engine TUN arm, with an extra loopback relay hop on the honk side): G1–G4 pass, G5 download fairness passes on the median, and G5 idle memory (about 4 KiB per flow including driver and relay state) misses its 1 KiB target; evidence lives on the `bench` branch under `bench/netstack/results/`. |
 
 ## Design validation (P1)

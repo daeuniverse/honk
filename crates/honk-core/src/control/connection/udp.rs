@@ -400,7 +400,13 @@ impl ControlPlaneHandle {
         #[cfg(feature = "ebpf")]
         let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
         let matched_rule = route.matched_rule.take();
-        let mode_decision = self.apply_mode_override(&mut route).await;
+        let mode_decision = if let Some(snapshot) = &packet_routing {
+            let mode = snapshot.mode.clone();
+            route.apply_final_outbound(Some(mode.name.clone()));
+            mode
+        } else {
+            self.apply_mode_override(&mut route).await
+        };
         let outbound_name = mode_decision.name;
         let mode_constraint = mode_decision.constraint;
         let target_domain = if matches!(
@@ -512,18 +518,22 @@ impl ControlPlaneHandle {
                 &*current_config
             };
             #[cfg(feature = "native-api")]
-            let mode_constraint = if mode_decision.group_id.as_ref().is_some_and(|expected| {
-                self.native
-                    .as_ref()
-                    .and_then(|native| {
-                        native
-                            .catalog
-                            .snapshot()
-                            .groups
-                            .get(&outbound_name)
-                            .cloned()
+            let pinned_native = packet_routing.as_ref().map_or_else(
+                || {
+                    self.native.as_ref().map(|native| {
+                        (
+                            self.diagnostics.read().generation,
+                            native.catalog.snapshot(),
+                        )
                     })
+                },
+                |snapshot| snapshot.native.clone(),
+            );
+            #[cfg(feature = "native-api")]
+            let mode_constraint = if mode_decision.group_id.as_ref().is_some_and(|expected| {
+                pinned_native
                     .as_ref()
+                    .and_then(|(_, catalog)| catalog.groups.get(&outbound_name))
                     != Some(expected)
             }) {
                 crate::control::reload::OutboundConstraint::Unavailable
@@ -532,13 +542,9 @@ impl ControlPlaneHandle {
             };
             #[cfg(feature = "native-api")]
             if observation.is_recording()
-                && let Some(native) = &self.native
+                && let Some((generation, catalog)) = &pinned_native
             {
-                observation.pin_selection(
-                    self.diagnostics.read().generation,
-                    &native.catalog.snapshot(),
-                    config,
-                );
+                observation.pin_selection(*generation, catalog, config);
             }
             let current_group;
             let gm = if let Some(snapshot) = &packet_routing {
@@ -578,7 +584,7 @@ impl ControlPlaneHandle {
             let close_group_ids: std::collections::HashMap<String, String> =
                 if self.connection_tracker.is_enabled() {
                     #[cfg(feature = "native-api")]
-                    let catalog = self.native.as_ref().map(|native| native.catalog.snapshot());
+                    let catalog = pinned_native.as_ref().map(|(_, catalog)| catalog);
                     selection_chains
                         .iter()
                         .flatten()

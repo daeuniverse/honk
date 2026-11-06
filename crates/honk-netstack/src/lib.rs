@@ -28,6 +28,20 @@
 //! also offer ordinary pulls for payload progress. Unused control-only queues allocate nothing.
 //! RACK bookkeeping pressure defers only its flow; other funded output remains eligible.
 //!
+//! [`Stack::receive_with_source`] reports a [`ValidatedSource`] only for the current completed,
+//! checksum-verified TCP/UDP packet, including shared reassembly completion. Its callback can
+//! install reverse delivery facts before protocol state mutation; false refuses the packet.
+//! This receipt is not handshake or kernel accepted-child proof. Ordinary receive APIs use a
+//! reporting-disabled specialization and retain their behavior without reporting allocation.
+//! [`Stack::receive_with_tcp_admission`] additionally returns only the passive [`FlowId`]
+//! created by that receive, so an embedding can bind admitted policy before any accept dequeue.
+//! [`Stack::retains_tcp`] classifies existing scoped transport ownership through pending
+//! opens, TIME_WAIT and flow-owned controls; adapters must additionally retain their own
+//! queued/exported output leases. It neither validates input nor mutates protocol state.
+//! [`Stack::retains_source`] also covers stateless controls, UDP fragments and reassembly
+//! replies for peer-path reclamation. [`Stack::retains_source_output`] distinguishes
+//! pending replies from an idle live flow; exported output remains the adapter's duty.
+//!
 //! Reads drain buffered data before EOF or a sticky terminal error. Shutdown closes only
 //! the write half; close releases the handle immediately and finishes the protocol in
 //! the background. Closing with unread data sends RST. TIME_WAIT retains unread data
@@ -140,6 +154,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod transit;
 pub mod wire;
 
 mod accept;
@@ -164,7 +179,7 @@ pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, Transmit, TxCaps, TxCsum};
 pub use stack::{
     BindError, Config, ConnectError, ConstructionError, DropReason, FlowId, Ready, Rx, Stack,
-    StackStats, StreamError, UdpError,
+    StackStats, StreamError, UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

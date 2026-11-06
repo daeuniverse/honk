@@ -160,6 +160,9 @@ futures-util = "0.3"
 stats_alloc = "0.1.10"
 jsonschema = { version = "0.59", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+honk-xsk.workspace = true
+
 [[bench]]
 name = "dns"
 harness = false

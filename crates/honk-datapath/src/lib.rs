@@ -6,6 +6,8 @@
 #![forbid(unsafe_code)]
 
 pub mod buffer;
+pub mod firewall;
+pub mod forward;
 mod scope;
 
 pub use scope::ScopeId;

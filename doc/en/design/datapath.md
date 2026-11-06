@@ -2,6 +2,112 @@
 
 The kernel datapath intercepts traffic. [Control plane](./control-plane.md) describes the userspace path; [NFQUEUE](./nfqueue.md) describes held-first-packet UDP.
 
+## Full-XDP startup
+
+The default remains TC when `datapath` is absent. Full-XDP is an explicit daemon backend, not the XSK fixture or a TC/NFQUEUE/TUN fallback:
+
+```dae
+global {
+    dial_mode: ip
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        dut0: lan
+        dut1: wan
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+Use `direct: endpoint` to terminate Direct TCP/UDP through the existing packet Endpoint and outbound relay; `direct: core` preserves transit through the Core forwarding owner and input-context kernel FIB. `lan`/`wan` (`Lan`/`Wan` in the model) describe interface roles, not execution profiles. XDP selection requires `backend: xdp` and an explicit Direct profile; invalid admission is rejected before kernel attachment. Do not combine this selection with the TC `global.lan_interface`/`wan_interface` settings. All RX queues of every selected interface are opened, with one ring owner per queue and one routing-domain owner across ports/queues. Backend, profile and device changes require restart; firewall/NAT policy uses transactional generation publication, retaining the previous policy on rejected updates.
+
+Before startup, provision an exact effective-bypass-mark RPDB rule before `main`, selecting a dedicated table with a default route for every enabled source-address family through an **uncaptured** uplink. `so_mark_from_dae` supplies that mark (the example uses `0x100`); it is not `CLASSIFIED_MARK` and cannot restore an original captured skb. Captured Ethernet ports must be unnumbered, including IPv6 link-local addresses. Core transit routes and neighbors belong in the kernel routing domain. Stock native continuation, nonzero native rule marks, unsupported socket/process predicates and native local/wildcard-listener assumptions are not silently translated to Core or Endpoint: a FIB Local result alone is not local-socket authority. DNS53 still follows canonical policy.
+
+The marked-table preflight proves **output-route isolation**, not the remote network's
+asymmetric return path. Own unconnected UDP, fragmented replies, IPv4 options and
+IPv6 extension-header replies do not receive the connected-socket native exemption;
+if they arrive on a captured port, the selected packet policy still applies. Keep
+their return path on the uncaptured uplink: this unsupported topology is not made
+equivalent by XDP socket-lookup helpers. Wildcard lookup alone cannot distinguish
+transit from LocalInput. Route/address/link/rule notification loss or change closes
+capture; this is not an atomic kernel route-mutation fence.
+
+Endpoint reply identities use a shared 4096-entry table keyed by logical scope and
+source IP. Reclamation considers only entries no longer retained by protocol state,
+TIME_WAIT, initializer/source receivers, DNS work or queued/exported output. A live
+owner's identity cannot be replaced by a conflicting MAC/VLAN claim; an unknown RST
+cannot learn or poison a peer. Quiescent conflicts retain their 60-second hold even
+under table pressure. Full tables of retained owners reject new peers rather than
+stealing a reply path. Complete VLAN TCI is captured with exported output, including
+TX-credit waits. Firewall/NAT predicates requiring unavailable original MAC/process
+provenance are rejected before capture admission.
+
+Every captured logical realm must have MTU at least 1280, including Core profiles
+that may hand traffic to Endpoint; incompatible realms reject before attachment.
+Captured ingress uses one of two contracts selected before attachment. A physical
+device with verified RX VLAN stripping disabled and no recovered-tag requirement
+uses wire-only decoding: ingress device/queue authority comes from its owned XSK,
+and inline L2 facts come from the received bytes; no metadata prefix is read or
+fabricated. The metadata-required path keeps the 32-byte v2 producer record and
+uses the real device-bound `bpf_xdp_metadata_rx_vlan_tag` kfunc, resolved through
+kernel BTF. Veth requires this path because local RX-off flags do not constrain
+its peer's TX tag insertion. One recovered tag plus inline tags may total at most
+two; missing/malformed metadata never triggers a fallback to wire-only mode.
+Minimum-frame padding permits four additional bytes per **inline** VLAN tag.
+
+Device facts and the topology subscription are revalidated before readiness.
+Generic `data_meta` capability is not advertised: a required metadata-adjustment
+failure drops the frame and is counted separately from captures; the runtime
+samples that counter at most once per second and fails capture closed when it
+observes a failure, without claiming a hard one-second bound or arbitrary-driver
+preflight proof. Device-bound programs require real-ingress verification, not
+`BPF_PROG_TEST_RUN`.
+
+L2 group addresses cannot grant unicast IP a native socket exemption. Existing
+native ARP/ND and IP special-address handling remains; directed broadcasts come
+from at most 64 exact local-table `RTN_BROADCAST` routes, never suffix guesses.
+
+The daemon defaults to AF_XDP Copy; `datapath.xsk_mode: zerocopy` requests forced
+ZeroCopy for every selected queue. Every RX queue must have a corresponding TX
+queue; shared preflight checks device/frame commitments before any guard attaches.
+Queue admission then rechecks device
+facts and verifies the actual bind result; a late failure retains fail-closed
+guard custody rather than retrying Copy. Mode changes require restart.
+
+
+Start a freshly built real daemon with `honk-core -c config.dae --bpf-pin-root <private-bpffs-directory>`, without `--mock-ebpf`. Readiness is `XDP datapath ready`. The XDP path creates neither TC hooks, NFQUEUE, `dae0` nor `daens`. Software checksums remain the default.
+
+SG/multi-buffer capability advertisement and successful binding are not runtime
+proof of jumbo traffic. The manual veth smoke exercises MTU 1500 and 9000 in Copy
+mode: each UDP reply must arrive as one complete datagram, and the jumbo cases
+also require complete, unfragmented IP packets larger than 4096 bytes in both
+directions at the client interface. Physical-NIC zero-copy, jumbo performance
+and DMA release still need their own evidence.
+
+XDP owns canonical in-memory routing, domain and health publication, not a Mock or TC backend. The native API reports datapath kind `userspace` without claiming hardware counters or program/attachment inventory; actual capture admission comes from the runtime's shared gate. Kernel witness recording and TC/listener/token APIs are unsupported. Software flag publication remains canonical; only native UDP staging and witness admission are skipped for this backend.
+
+Fixed aggregate counters distinguish queue/credit/capacity refusals from native-ID
+history precision loss and successful peer reclamation. Only actual refusal
+episodes emit a warning; recurring pressure is summarized at debug level rather
+than logged per packet.
+At debug level, the same sampler reports each queue's kernel socket statistics,
+ring indices and port counters at most once per second. Read errors stay explicit;
+empty-ring encounters and wakeup errors are not additive packet-loss counts.
+
+Stop traffic sources before removing custody. Normal shutdown reports `XDP admission closed; UMEM retained until process exit`; the netdev XDP attachment remains a fail-closed guard, with `guard`/`data` program pins under `<bpf-pin-root>/xdp-<ifindex>/`. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Startup refuses an interface that still has an XDP attachment. After stopping sources and verifying the attached program ID belongs to this instance's guard, remove that attachment (`ip link set dev <interface> xdp off`), then only its owned pins. There is no automatic zero-resident hot reopen: retained UMEM remains charged against the process-lifetime **512 MiB** ceiling; close and empty rings are not DMA-release evidence.
+
+`.github/ci/xdp-daemon-smoke.sh` runs inside the complete floor/recent disposable-VM gate with prebuilt matching daemon, Core and XSK test executables; it remains directly runnable in a provisioned guest. It requires guest root, Linux 6.12+, namespaces, AF_XDP/native-XDP veth, bpffs, iproute2, nft, ethtool and Python 3, and performs no builds/installations/downloads. Every Core/VLAN/jumbo scenario combines actual capture counters and peer payload checks with a private native-forwarding drop fence. Shutdown compares the attached program to the owned guard ID and tests selected traffic refusal against a same-path positive baseline before owned detach. The gate also covers asymmetric queues, native control traffic, padded VLAN frames and an omitted-datapath real TC startup/traffic/reload cycle. Passing these virtual scenarios is not physical-NIC, all-queue/RSS or performance certification.
+
+The smoke keeps daemon state on its private `/run` tmpfs, then archives it after
+shutdown. Its guest cgroup2 mount lives outside `/sys`, so `ip netns exec` cannot
+hide the hierarchy when remounting sysfs for the TC regression.
+
 ## Namespace and hook architecture
 
 The ordinary proxy path redirects packets through an isolated network namespace instead of relying on a host-side TPROXY rule:
@@ -265,6 +371,109 @@ Per-outbound traffic counters are per CPU. TX packets and bytes are counted at `
 The backend API uses `TuplesKey`/`ConnState`, bounded map scans, and conditional retirement. Legacy `ConnTuple` CRUD, string IP/domain routes, cached parameter setters, and backend statistics adapters are removed. Load-time `DaeParam` globals, generation-owned IP/MAC/domain fact maps, `StatsManager`, and pinned `OUTBOUND_STATS` remain the authoritative paths.
 
 `just test-netns` includes production TC packet regressions: exact reverse-tuple RX accounting, cached-route health/readiness, and locally generated ICMPv6 Redirect suppression on LAN and WAN egress. L2 cases use `BPF_PROG_TEST_RUN`; L3 uses actual TUN interfaces in an isolated network namespace, including forwarded and hook-detached controls.
+
+## Core forwarding firewall and IPv4 NAT
+
+The optional [typed firewall/NAT configuration](../reference/routing.md#core-forwarding-firewall-and-ipv4-nat)
+extends the existing CoreForward owner; it is not another executor or an nftables
+configuration importer. The ordered stages are captured domain/interface identity,
+existing original/reply binding, original-fact firewall and DNAT, real input FIB,
+translated-fact forwarding firewall, SNAT, then the existing TTL/MTU/checksum and
+device-output path. Canonical traffic conditions compile through the same compiler
+and matcher, while allow/drop/reject and translation remain typed actions.
+
+One bounded table reserves original and DNAT aliases under the exact logical ingress
+identity; equal private tuples on different LAN/VLAN interfaces may coexist. Fully
+translated reply aliases and the public address/port allocator remain shared in the
+namespace/scope domain. Each direction pins its actual ifindex and attachment
+incarnation; arriving on the wrong interface cannot borrow a grant. TCP admission
+starts with SYN and requires the matching SYN-ACK sequence/acknowledgement and final
+ACK before establishment. Established owners retain the observed handshake proofs:
+matching SYN/SYN-ACK retransmissions, including prior SYN data and simultaneous
+open, remain admissible, but a new SYN sequence cannot take over the tuple. UDP
+reverse ownership is exact-peer, not a wildcard external-port grant. The first
+packet's receive timestamp fences older queued input; idle freshness also follows
+receive events, while current processing time drives expiration and capacity cleanup.
+IPv6 uses the same firewall owner without address translation. IPv4 NAT addresses
+must satisfy the transit unicast validator, excluding `0.0.0.0/8` and `240.0.0.0/4`
+as well as loopback, multicast and limited broadcast addresses.
+
+Established TCP bindings use a 7440-second idle horizon and UDP bindings 120 seconds;
+opening/closing proof states retain their 30-second horizon. FIN/RST flags alone
+cannot shorten established protection without receive-window authority. Current
+traffic Block precedes mutable lookup: a refused packet neither renews a binding
+nor allocates a translated IPv4 ID.
+
+Table storage and each binding's Arc metadata are charged before allocation;
+packet rewrites use the Core owner's already-funded bytes. Port searches skip
+candidate-dependent self-alias collisions; a collision or exhausted pool publishes
+no aliases. Expiry, policy revocation and MASQUERADE
+address removal close admission immediately, but output leases keep the binding,
+ports and charges alive until actual resource return. Route-only edits preserve the
+security epoch; firewall/NAT or relevant captured GeoIP changes advance it before
+publication, and removing/re-enabling the feature never resets it. Failed candidates
+retain the prior compiled sidecar. A route refresh does not migrate an owner.
+The runtime table has 1024 entries (the pure API permits at most 4096) and uses linear
+lookup/allocation; this is deliberately not a fast-path/offload claim.
+
+NAT assigns distinct IPv4 IDs to translated DF-clear datagrams, including packets
+that only fragment downstream; DF-set atomic traffic avoids this allocation.
+The funded global identity directory holds `min(binding_capacity × 64, 65536)`
+datagrams (65536 in the daemon), retaining binding/quote authority through output
+and CQ ownership. Reuse waits 120 seconds after observing the final owner return.
+This uses the conventional RFC 6864 maximum datagram lifetime, not a guarantee
+against arbitrary longer remote fragment queues or network delays. Exhaustion
+drops the affected packet without reusing a live ID. The conservative global pool
+can limit sustained DF-clear translation to roughly 546 datagrams/s even before
+additional hold time; it is not a high-rate NAT performance claim.
+
+Core also records non-authorizing native IPv4 ID history before any firewall/NAT
+policy is enabled. Both native-before-NAT and NAT-before-native share the output
+reassembly domain: unchanged IDs are remembered, and a plain packet is remapped
+only if its ID collides with retained translated output. These output/quote leases
+carry no conntrack grant and survive CQ, policy changes and first NAT enable.
+Authorization uses received wire facts; restoring a retained native quote's ID
+occurs only at the final forwarding frontier, never before lookup or a neighbor
+wait. ICMP echo identity remains part of quote matching.
+
+Exact native history has a separate `min(capacity × 64, 65536)` row bound; repeated
+raw IDs reuse history without spending the managed-ID pool. At exact-history or
+budget exhaustion, pre-funded per-ID counters conservatively retain the unknown
+ID globally instead of dropping ordinary plain forwarding or imposing the
+translated-packet rate ceiling on it. Overflow exclusion lasts final owner return
+plus 120 seconds and the bounded Core reassembly horizon (currently 30 seconds);
+completed quotes acquire independent retention before expiry or queueing. Domain
+precision decreases only at saturation. A required translation with no provably
+safe ID is still refused; no live identity is reused.
+
+History and actual conntrack/managed-ID storage are separately funded; the latter
+is allocated only when needed. The overflow owner retains 65536 atomic reference
+counts and retirement ticks plus bounded bitmaps through its last output/quote
+guard. Dynamic identity records own their reservations, so table Drop cannot
+refund memory still held by an exported lease. These are logical bounds, not
+whole-process RSS or high-rate NAT performance claims.
+
+Fragments use the existing reassembler, never a parallel NAT reassembler or
+invented non-first-fragment ports. Live/completing reassemblies and exported
+timeout quotes retain only their possible scoped address/protocol domains;
+tombstones and unrelated fragments cannot reset all identity retirement clocks.
+Translation occurs only after complete packet/checksum validation;
+subsequent fragmentation stays with CoreForward. Known admitted IPv4 ICMP error
+quotes restore inner addresses, ports, original ID and available checksum fields,
+including eight-byte TCP quotes without a checksum field. Non-first fragment
+quotes use retained ID authority and never interpret payload bytes as ports.
+IPv4 UDP zero checksums remain zero. Unknown/truncated quotes and unsupported
+quoted extension layouts fail closed. Related IPv6 errors do not imply IPv6 NAT.
+
+Focused unprivileged regressions live in `honk-datapath::firewall::tests`,
+`honk-core::routing::firewall::tests`, and `honk-config/tests/firewall.rs`.
+After the integration owner builds the test artifacts, these are no-build smoke
+entries: run the existing datapath test executable with `firewall::tests`, the
+existing core test executable with `routing::firewall::tests`, and the config
+`firewall` integration-test executable directly. No host interfaces, BPF load or
+network namespaces are needed. Source implementation and these packet tests do
+not establish device/hardware, real-kernel or performance validation; the full
+cross-backend validation matrix remains separate.
 
 ## Related docs
 

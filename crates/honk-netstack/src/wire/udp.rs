@@ -7,11 +7,19 @@ use super::{PROTO_UDP, ParseError, emit_ip_header};
 const HEADER_LEN: usize = 8;
 
 pub fn parse(dgram: &[u8]) -> Result<(u16, u16, Range<usize>), ParseError> {
+    parse_prefix(dgram, dgram.len())
+}
+
+/// Parse the UDP header without requiring contiguous payload storage.
+pub fn parse_prefix(
+    dgram: &[u8],
+    datagram_len: usize,
+) -> Result<(u16, u16, Range<usize>), ParseError> {
     if dgram.len() < HEADER_LEN {
         return Err(ParseError::Malformed);
     }
     let len = usize::from(u16::from_be_bytes([dgram[4], dgram[5]]));
-    if len < HEADER_LEN || len > dgram.len() {
+    if len < HEADER_LEN || len > datagram_len {
         return Err(ParseError::Malformed);
     }
     Ok((

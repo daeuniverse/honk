@@ -1,6 +1,6 @@
 # 用户态网络栈与 WireGuard 隧道
 
-`honk-netstack` 是 sans-I/O 的 IPv4/IPv6 TCP/UDP 栈。`Mode::Endpoint` 仍是 WireGuard 的默认客户端行为；`Mode::Transparent` 提供被动 TCP、无状态 UDP、有界重组和 ICMP 生成。core 已有显式 packet-endpoint 嵌入入口，但 daemon 尚无配置选用的抓包后端；此 API 不代表 AF_XDP/TUN 或原生续行能力。除非另有说明，本页描述未改变的 Endpoint 行为。与其他用户态子系统一样，这些代码主要由 AI 编写，仍须维护者审查。
+`honk-netstack` 是 sans-I/O 的 IPv4/IPv6 TCP/UDP 栈。`Mode::Endpoint` 仍是 WireGuard 的默认客户端行为；`Mode::Transparent` 提供被动 TCP、无状态 UDP、有界重组和 ICMP 生成。core packet-endpoint 嵌入和显式配置的 [XDP daemon 后端](./datapath.md#full-xdp-启动)使用它；Stack API 本身不授予抓包或原生续行权威。除非另有说明，本页描述未改变的 Endpoint 行为。与其他用户态子系统一样，这些代码主要由 AI 编写，仍须维护者审查。
 
 出站侧的行为（注册表、流、失败归因）在下文从栈的角度概述，规范见[出站设计](./outbound.md#wireguard-隧道)。节点字段和分享链接见[节点参考](../reference/nodes.md)。
 
@@ -15,7 +15,7 @@ flowchart LR
 
 - `honk-netstack` 只依赖 `blake3` 和 `thiserror`，`publish = false`，禁止 `unsafe`。outbound、datapath 和 core 依赖它；它不知道节点、Tokio 或 socket。固定版本 `smoltcp` 仅作为开发测试基线。
 - 它从不读取时钟、环境变量或配置文件。调用方提供 `Instant`、接口地址和 MTU、32 字节私有 secret 以及内存上限（`Config`）。默认值：MTU 1420、4096 个流、256 MiB 内存、每流 8 MiB 接收缓冲和 6 MiB 发送缓冲、`Mode::Endpoint`；透明模式的字段见[配置与计数器](#配置与计数器)。
-- `wire` 模块是公开的（IPv4/IPv6/TCP/UDP/ICMP 编解码和校验和），因为集成测试用它构造报文；其余均为私有。
+- `wire` 公开 IPv4/IPv6/TCP/UDP/ICMP 编解码和校验和；`transit` 仅为路由器暴露已有的预算计费重组器和带抑制/限速的 ICMP 生成器，不创建 TCP/UDP 端点。
 
 ## 编程模型
 
@@ -25,6 +25,7 @@ flowchart LR
 | --- | --- |
 | `receive(now, packet) -> Rx` | 借用一个完整 IP 包并验证校验和（`RxMeta::VERIFY`）。需要保留的 TCP 字节会复制进栈自有的环。UDP 返回 `Rx::Datagram`（Endpoint）或 `Rx::Transparent`（透明模式）：**返回的范围只在调用方复用或回收输入 buffer 之前有效**。`Rx::TransparentOwned` 自带重组后的包。`Rx::Dropped(reason)` 会被计数。 |
 | `receive_with(now, packet, RxMeta) -> Rx` | 在透明模式下附带可信的 TCP/UDP 校验和来源和/或 GRO/USO 元数据。Endpoint 模式将 `RxMeta::VERIFY` 之外的元数据以 `Unsupported` 丢弃；WireGuard 不能跳过验证。见[校验和信任](#校验和信任)和[分段卸载](#分段卸载)。 |
+| `receive_with_source(now, packet, callback) -> (Rx, Option<ValidatedSource>)` | 复用同一 parser/reassembler/checksum 路径，仅当前完成验证的 TCP/UDP 包返回 `{src, dst, protocol, tcp_flags}`；TCP flags 是已校验的首部事实，不是准入证明。callback 先于协议状态变更/UDP 分发执行；false 以 `NotForUs` 丢弃。即使被拒绝，receipt 仍只是有效性事实，**不是**握手、交付或内核 accepted-child 证明。未完成/无效分片、坏校验和均无 receipt。 |
 | `poll_transmit(now, out) -> Option<usize>` | 把一个完整 IP 包写入 `out[..n]`。`out` 过小时返回 `None` 且不丢包。`None` 也表示 cwnd、rwnd 或 pacing 当前不允许发送。 |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | 同一调度器，在透明模式下可选用 TCP 分段卸载；返回 `len`、`gso`、`csum` 和已知 TCP 输出的原始 `flow` 句柄，无状态或未知流输出的 `flow` 为 `None`。Endpoint 模式忽略卸载能力。`poll_transmit` 是使用 `TxCaps::NONE` 的普通包封装，会丢弃这些元数据。 |
 | `poll_control_transmit(now, out)` | 复用 TCP emitter，但不发送 TCP/UDP 载荷；保留普通 readiness、DRR 和载荷 TLP 义务，允许符合协议条件的 ACK/RST/SYN/FIN/探测、TIME_WAIT ACK 和 ICMP。调用前须取得控制 frame/descriptor credit。 |
@@ -63,6 +64,7 @@ RACK 记账扩容无法获得预算时，只延后该流：保留待重传义务
 - Endpoint 模式下，目的地址不是本族已配置本地地址的包为 `NotForUs`。没有本地地址的地址族完全不可用（`NoLocalAddress`）。透明模式改为接受任意单播目的地址（见[范围与寻址](#范围与寻址)）。
 - `StackStats` 按原因计数丢包：`Malformed`、`Checksum`、`Fragment`、`NotForUs`、`NoFlow`、`Unsupported`，透明模式下还有 `HalfOpen` 和 `Capacity`。（`Stale` 已定义但从未产生。）
 - **普通接收在两种模式下都验证校验和**（IPv4 头、TCP、UDP、ICMP），且发生在流状态变化之前。IPv4 UDP 校验和为 0 表示没有；IPv6 UDP 为 0 在验证路径上无效。只有透明模式的 `receive_with` 才能信任 driver 的 TCP/UDP `Csum::Valid`/`Partial`；IPv4 头、ICMP 和重组后的数据报仍然验证。Endpoint 模式拒绝此类元数据，所以 WireGuard 总会验证内层包：它认证的是隧道对端，而不是发送方的 inner 校验和。完整发送输出先复制载荷，再使用本机字节序的并行累加道计算校验和；卸载输出改为携带部分校验和（见[校验和信任](#校验和信任)）。
+- UDP 按其声明长度校验，该长度可以小于 IP payload；尾随的 IP 字节不属于 UDP 数据或校验和，但 Core 转发仍保留这些 IP 字节。连续与 scatter/gather 输入使用同一边界。
 - **ICMP 在两种模式下都会被消费，只有透明模式才发送。** packet-too-big（RFC 1191/8201）或 destination-unreachable 仅在报文地址族与流一致、且被引用的 TCP 序号落在未确认窗口内时才生效：PTB 降低该流的路径 MTU（只减不增），并让所有变得过大的段重新可发，包括已按旧尺寸重传过的段；`SYN_SENT` 流收到 unreachable 时 connect 以 `Unreachable` 失败。不带 MTU 的旧式 PTB 使用 RFC 1191 plateau 表。ICMP echo 和其他 ICMP 一律忽略。Endpoint 模式下栈从不生成 ICMP；生成见 [ICMP 生成](#icmp-生成)。
 - **Endpoint 模式的 UDP** 没有接收队列，也没有发送队列。发往未绑定端口的数据报为 `NoFlow`（不发 ICMP 错误）。`udp_send` 直接把一个 IP 包序列化进调用方的 buffer；超过 MTU 的数据报返回 `TooLarge`。透明 UDP 是无状态的，见[透明 UDP](#透明-udp)。
 
@@ -127,7 +129,15 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
-启动先打开 scope 准入，再报告就绪及 native `Running`；启动失败须等待 supervisor 清理后才返回。关闭保留第一次 UDP 排空结果，不能把强制取消报告为优雅成功。清理超过五秒只告警，不释放所有权，也不承诺硬性完成期限。条目元数据计费保留到精确退休完成，任务分配及 buffer credit 保留到 join；下一次入口复制计费前先回收已完成的 UDP 任务。健康回调只观察 UDP pool，不延长其生命周期。
+`PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
+不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出
+消费者继续；关联冲突则在协议状态变更前拒绝。`PacketEndpoints` 传递这个精确
+receipt，不从 `poll_accept` 推导来源，因为它可能取出更早的 pending SYN。
+UDP queue/capacity 错误保持不变：callback 能报告有效来源事实，但随后的 UDP work
+仍可能因容量不足失败。旧 receive API 使用编译期禁用 reporting 的路径，没有
+reporting 分配，也不维护跨调用的“上一个包”状态。
+
+启动先打开 scope 准入，再报告 Endpoint supervisor 就绪；非 XDP 嵌入仍在该提交点发布 native `Running`。显式 XDP owner 只有在全部真实 capture gate 激活后才调用 `PacketEndpoints::capture_ready()`，同一个 supervisor 等到该通知才发布 native `Running`。启动失败须等待 supervisor 清理后才返回。关闭保留第一次 UDP 排空结果，不能把强制取消报告为优雅成功。清理超过五秒只告警，不释放所有权，也不承诺硬性完成期限。条目元数据计费保留到精确退休完成，任务分配及 buffer credit 保留到 join；下一次入口复制计费前先回收已完成的 UDP 任务。健康回调只观察 UDP pool，不延长其生命周期。
 
 单个连接任务 panic 只终止该 TCP 流，不停止其他 packet 服务。TCP 任务接纳先回收已完成工作，确实无法接纳时显式 reset 该流。周期 UDP 维护也会在空闲期间 join 已完成任务并返还 credit。关闭入口后仍须等待此前预留的 producer permit，处置其迟到消息，再 join scope owner；只关闭 receiver 不能证明此后不会再收到 `FlowIo`。
 
@@ -137,10 +147,190 @@ Packet TCP 写半关闭会等待握手完成，不把暂时的 `WouldBlock` 变�
 
 所给预算统计 packet 存储/预留，不是全进程 RSS，也不代表既有 outbound runtime 的全部分配均已计入；内核 socket buffer 另算。该入口是显式 Endpoint 路径，**不是**原生转发、抓包 metadata 校验、生产后端发布门禁或性能结果。
 
+### 实验性 AF_XDP 消费端
+
+`honk-xsk` 提供 Linux XDP link/program 与 AF_XDP ring 原语；`honk-core`
+的 `xsk_endpoint` example 将其接入 `PacketEndpoints`，不是 daemon 后端或生产配置项。
+固定 fixture 只覆盖一个 IPv4 TCP 或 UDP tuple、一个实测发现的队列、无 VLAN 的以太网及 MTU 1500。
+DISCOVER 丢弃测试流量，DATA 的 redirect 失败动作也是 DROP。分片及 IPv4 options
+在声明的地址/protocol 域内统一丢弃，因此该域必须由实验独占。
+Direct 仍是实际 socket relay，不是原生续行。PF0 强制 zero-copy；显式 copy 模式
+仅允许 virtme guest 中的 `dut0` 虚拟接口 fixture，绝不自动回退。
+
+设备 owner 先观察 FILL 消费再接纳 RX，消费借用的 IP 字节后才回收 frame，
+并将每个 core output lease 保留到实际 CQ 归还。
+`PacketScope::poll_output_class` 在只有控制 credit 时允许控制输出越过排队的 bulk，
+保留各类别内部顺序。RX 的 IP slice 排除以太网 padding，TX padding 单独计入 frame。
+core 关闭与设备排空并行进行；CQ 是资源归还，不证明对端收到。
+supervisor 必须保留 native link，并在 detach 前停止独立上游，消费者失败时也一样。
+
+UMEM 映射和预算计费一直保留到进程退出。socket close 或 ring 为空均不能证明
+延迟 pool 释放或 DMA 静止；这不是生产释放栅栏，也不承诺进程内关闭后零常驻。
+硬件 zero-copy、完整 X0 验收、TC A/B、多队列、SG/offload 和原生续行仍须分别提供执行证据。
+
+### 显式 routed-only CoreForward
+
+`honk-datapath::forward::CoreForward` 是安全的 sans-I/O transit owner，不经过
+`Stack::receive`，也不是 Direct socket relay。Linux 的
+`honk-core::control::core_forward::RoutedCore` 复用 canonical Router 和已有的
+router/config 发布屏障。routed-only fixture 使用 `execution: "routed-only"` 和
+`nat: false`；daemon 使用 `MixedEndpoints`，可启用独立编译的 firewall/NAT。
+原生续行、必须经过内核 firewall/qdisc 及 skb classification 的要求仍不支持。
+routed-only 策略只允许 `dial_mode: ip`、无 mark 的 `direct`/`block`；
+不兼容 reload 保留原 generation。
+
+`ControlPlane::core_forward_policy(Execution)` 在 `PacketEndpoints` 消费 plane 前
+返回窄化的注册 `RoutingAuthority`；两者保留同一已发布 router/config，不另建策略
+owner。显式 `MixedEndpoints` profile 仅接纳 IP 模式且不依赖 domain、pname、MAC
+或 mark 的策略。普通最终 Direct 动作进入 Core；非 must DNS53 和 group 动作把
+原计费包交给 Endpoint，Block 仍终结。需要未决 TCP/domain 事实的策略应显式选择
+Endpoint，不能把要求 Core 的 Direct 静默降成 relay。
+
+Core 和 Endpoint 复用既有 Rule/Global/Direct mode override，包括 native typed
+target 和 must/Block 终端优先级。Core 的 `PolicyGeneration` 同时捕获 routing
+generation 与不回绕的 mode revision；submit 把 router/config/mode 读锁持有到
+实际 writer 完成。mode 的 ABA 变化不能重新授权排队输出，拒绝后只处置、不重放。
+借用缓存路径对普通 Global 判决返回 Cold，不在没有判决所有权时发出 Endpoint
+handoff。Core transport 跨 traffic-class 变化和精确 reverse ingress 保留执行
+owner，但保留关系不能覆盖当前 Block。firewall binding 保留独立的
+security/address authority；路由或 mode 变化不会把已准入的 transit 字节
+重放进新建 Stack。
+
+`Decision::Endpoint` 携带计费的 `EndpointAdmission`，保存实际路由 action、config、
+group/runtime handle 和生效 mode 判决。capture consumer 将其传给
+`PacketEndpoints::receive_admitted_with_source`。UDP 随 datagram 排队同一个 authority；
+TCP 在 scope 互斥锁内将其绑定到 `Stack::receive_with_tcp_admission` 返回的当前
+新建 `FlowId`，先绑定再唤醒输出。重传保留原 authority，`poll_accept` 只移交已经
+绑定的精确 incarnation。延迟 dispatch 不按新 config 重路由，也不重新应用新 mode。
+pending snapshot 的预算计费保留到消费或精确流处置，没有跨调用的“上一个包”快照。
+
+capture consumer 在选择 Core 前（包含重组完成时）查询
+`PacketEndpoints::retains(scope, source, destination, protocol)`。这只是只读分类，
+不替代 checksum 校验。既有 Stack TCP tuple、TIME_WAIT、flow-owned control 和
+packet runtime 排队/已导出的输出均保留 Endpoint 执行权。ICMP 错误在 Core 选择前
+按引用的 TCP owner 分派，checksum、family 和未确认序号仍由 Stack 验证。
+普通非 53 UDP 先预留 Initializing owner，再发布到独立有界 initializer channel；
+runtime-mutating command 等待 reload 时清理被取消的 lease，其他 TCP/DNS 工作
+保留原 FIFO。Initializing、Ready 和 Retiring 都保留 scoped tuple，mode 变化
+不能同时建立第二个 Core owner。
+
+控制器 DNS53 仍按 query 接纳，不是 transport flow：排队/已接纳 query 保留各自
+捕获的判决，后续新的 must/direct query 可以选择 Core。实际预留 UDP transport 的
+raw/group/must DNS53 则使用既有 pool entry 的正常保留所有权。不会把控制器 query
+合并成一个 transport lease，也不添加另一张 conntrack 表。
+
+回复路径保留还覆盖待处理 DNS、shared-source receiver 尾部、Stack control/分片及
+排队/已导出输出。source callback 在既有 scope mutex 内检查 CPU 待发输出，不能
+重入该 scope。已导出的包保存完整 VLAN TCI，不再读取后来的 peer priority。
+正常 command 回复仍是真实结果；致命设备错误时，对外回执可先终止，但在途工作与
+CQ 资源继续被持有。已接受 reload 丢失 supervisor handoff 仍须 fail-closed，不能
+与普通 HTTP 请求断连混淆，也不能据此重放配置工作。
+
+
+一个 Core owner 覆盖整个 namespace/routing domain 和注册的所有逻辑 ingress。
+同一逻辑入口的所有队列共用已有重组器；输入 identity 保留真实 logical ifindex 和
+attachment，不只依靠共同 ScopeId。flow directory 和内存预算跨入口共享。
+`Packet::rewrite` 保留原存储计费，转换或校验失败后禁止提交，仅成功时刷新 tuple。
+
+缓存路径接受借用的 `wire::PacketView` segments，复用 IP/传输 codec 和流式校验和，
+仅暂存有界首部。`ForwardView` 与计费 `ForwardPacket` 共用同一 writer：adapter
+先预留整个 TX chain，再通过 `write_next_segments` 直接写入这些 segments，包括
+调用方提供的真实 L2 framing。借用路径的 CQ lease 只保留 slow-flow owner，不分配
+完整 staging Packet。冷 FIB 等待或分片存储可以保留必要计费副本；没有热路径便利性
+线性化或第二套重组器。下方固定 example 仍限无 VLAN IPv4；SG 设备证据属于 full-XDP
+消费者，不能由此 fixture 代替。
+
+Ingress 分别携带 scope、实际 socket namespace cookie、逻辑 ifindex、attachment
+identity 和 mark provenance。未知 mark 拒绝，绝不代换为零；`BeforeSkb` 显式声明
+部署不依赖 skb classifier。namespace-bound provider 在有界 route/rule/link/address/
+neighbor/nexthop/netconf dump 前先订阅，真正发送包含 `RTA_IIF`、源/目的地址、TOS、
+protocol、ports、已证明 mark 的 input `RTM_GETROUTE`，transit 不伪造 UID。RPDB
+由内核执行，不镜像规则；MTU、forwarding 开关和 neighbor MAC 来自真实回复。
+缺 neighbor 时通过 `NTF_USE` 请求内核 ARP/ND，绝不编造 MAC。事件使全部 route
+lease 失效；ENOBUFS、截断/畸形消息、dump interruption、迟到回复或同步上限耗尽
+均关闭 provider。一秒 lease 上限也触发重新同步，授权不无限缓存。冷 miss 的有界
+同步 netlink 工作必须由独立 owner 执行，不属于逐包热路径。实际提交时在既有发布
+读锁下同时复核 FIB 和策略 generation。
+组播通知以 `NETLINK_PKTINFO` 判别，不假定 sequence 为零。合法 blackhole
+仅丢弃当前包；经不可用逻辑链路的路由，以及 Core 无法执行的封装或多路径路由，同样
+只丢弃匹配的包，不会使 provider 失同步。route lease 丢失只重试或抑制相应工作。IPv6 重复 preferred-source
+属性必须一致。地址 epoch 与 route/neighbor 刷新独立，普通重新同步不会撤销
+MASQUERADE binding。
+
+
+两种 IP 地址族都在 flow admission 前验证包与传输校验和，复用已计费重组器，
+保留原 TCP/UDP/ICMP 字节，仅在物化输出时把 TTL/hop limit 减一。IPv4 无 DF 时按
+出口 MTU 分片；IPv4 DF 和普通 IPv6 返回 fragmentation-needed/PTB。
+完成的 IPv6 重组保留原 fragment ID 与最大接收分片长度；该长度不超过出口
+MTU 时恢复对齐分片，目标大小遵循 Linux 至少 1280、再受出口 MTU 限制的边界，
+否则返回 PTB。未分片的 IPv6 不能凭空获得分片权威。TTL 错误是 code 0，
+公开的重组超时 quote 是 code 1；ICMP 使用路由器真实本地地址、共用抑制/限速以及
+独立的内核 local-output route query。LocalInput 不等于转发许可，example 将其丢弃。
+Core TCP 执行保留到空闲 7440 秒，UDP 为 120 秒，其他流量 60 秒；有输出 lease
+时继续持有。未经窗口验证的 FIN/RST 不能缩短保护。过期后的非 SYN TCP 包不能
+创建新 Endpoint 或伪造反向 RST；新 initial SYN 可创建新 incarnation。
+FIB 变化不升级成原生转发，排队包截止时间仍为两秒。
+
+转发邻居未解析时仍可取得路由权威和 MTU，已知 hop-limit/超 MTU 错误不等待
+这个不需要的邻居。生成错误仍需独立 local-output 路由、回程邻居，以及同步本地
+地址 snapshot 中同族且满足 transit 单播条件的 `RTA_PREFSRC`；无效或缺失的源
+证明仅抑制该错误。input FIB prohibit 可授权 AdminProhibited，LocalInput/blackhole
+则不授予转发权。TCP RST 与 ICMP error 不触发另一份 refusal。
+
+设备 timer 使用至少 1280 字节的已计费控制输出存储调用
+`poll_reassembly_error(now, out)`。返回 `GeneratedError` 携带真实返回 route、策略
+generation 和输出长度；此 owner 必须保留到 CQ 或显式本地丢弃，而不是仅到提交。
+已导出 timeout quote 只保留匹配的 scoped NAT/native-history 域，不全局冻结回收。
+未解析 neighbor 至多占一个 quote 等待槽，保留原始两秒 deadline；每次最多退役
+64 个受抑制或策略拒绝的 quote。启用 firewall 时，timeout 必须有实际引用的
+ports、可信 ingress role 和 original-chain Allow；截断 quote
+绝不创建或续期 conntrack。真实 input unicast/source FIB 证明先于独立 local-output
+返回查询。Core 引用至多 20 字节**连续已收到的**传输首部以保留 TCP RST flags，
+不会把 hole 的零填充值当作真实字节；缺少 flags 时抑制错误。普通 Stack 的超时
+quote 仍保持八字节。
+
+Core 执行拒绝需路由器处理的 IPv4 options、不支持的 IPv6 extension 语义、
+非零 IPv6 flow label、bridge/VRF/bond 执行和 route encapsulation。
+限制在处置判决之后、FIB/NAT/Reject 工作之前检查；Endpoint 不继承 Core 专用
+限制。Linux 6.12 的 [IPv6 getroute 实现](https://github.com/torvalds/linux/blob/v6.12/net/ipv6/route.c#L6030-L6095)
+不能表达非零输入 flow label，Core 不会偷偷查询另一条 flow。普通以太网和至多
+两层已配置 802.1Q/802.1ad VLAN 分开保留 logical iif 与 physical egress；
+不支持的 VLAN QoS/binding 语义或无法恢复的 RX stripping 在准入时拒绝。
+窄化 example 仍是无标签 fixture；daemon 才是通用设备消费者，不代表 X1 或 DMA 释放验收。
+
+#### 隔离 VM smoke 入口（此处未执行）
+
+构建 `cargo build -p honk-core --example xsk_core_forward`，仅在已配置 virtme guest
+的新 network namespace 中运行 `xsk_core_forward run.json`。外部 supervisor 独占
+client–DUT–server 拓扑、地址、forwarding sysctl、路由、两个单 RX queue veth
+`dut0`/`dut1` 及独立 TCP/UDP peers。MTU 为 1500、无 VLAN，不依赖 firewall/qdisc/
+NAT，使用普通无 mark input route。收到两条 `attached` 后，必须保留两份 link FD
+副本再发送纯文本行 `armed`；只有 `ready` 后才能发送流量。先停止两侧 generator，
+再发 `close`；要求 `closed`、CQ 排空及独立对端的端到端证据，最后发 `exit`。
+失败时也必须先停 peers，再释放 link 或销毁 namespace。UMEM 与 `xsk_endpoint`
+一样计费至进程退出。
+
+严格 JSON 字段为 `requirements`（上述六项）、`policy`（dae 文件）、
+`root_netns_inode`（supervisor 根 namespace）、`devices`（恰好两个对象，包含
+`ifname`、`ifindex`、六字节整数数组 `mac`/`peer_mac`）、`client`/`service`
+（`IPv4:port`）、`protocol`（`tcp` 或 `udp`）、`budget_bytes`（如 67108864）。
+双向路径均使用真实 XSK RX/TX 和内核 FIB；MockEbpfBackend 仅用于不启动无关 TC relay。
+
+必需证据：独立 payload 交换、原 tuple 保持、TTL 恰好减一、正确 Ethernet next-hop、
+TTL=1 ICMP、较小出口 MTU 的 DF 开/关、空 neighbor 下 ARP 解析、输出排队期间
+route/rule/link/address/MTU/neighbor 变化、不支持部署拒绝、不兼容 reload 保留原
+generation，以及 receive loss/dump/迟到回复注入后 fail-closed。
+纯回归为 `cargo test -p honk-datapath --test forward`；还需
+`cargo test -p honk-core core_forward`、`cargo test -p honk-core netlink::fib`、
+`cargo test -p honk-netstack`、`just outbound-ci` 和隔离真实内核 gate。
+fixture 只抓 IPv4，不能作为 IPv6 设备收发验证。
+
+
+
 
 ## 透明终结
 
-`Config::mode = Mode::Transparent { exclude }` 让栈成为客户端目的地址的 TCP/UDP 端点。报文脚本、模拟器、fuzz 和 core 嵌入入口使用它；daemon 仍无透明抓包后端，WireGuard 仍采用默认 `Mode::Endpoint`。相同的内存、拥塞控制、恢复和单 owner 规则继续适用；不声称透明模式性能门禁或吞吐数字。
+`Config::mode = Mode::Transparent { exclude }` 让栈成为客户端目的地址的 TCP/UDP 端点。报文脚本、模拟器、fuzz、core 嵌入与显式 XDP daemon 使用它，WireGuard 仍采用默认 `Mode::Endpoint`。相同的内存、拥塞控制、恢复和单 owner 规则继续适用；不声称透明模式性能门禁或吞吐数字。
 
 ### 范围与寻址
 
@@ -190,6 +380,8 @@ Packet TCP 写半关闭会等待握手完成，不把暂时的 `WouldBlock` 变�
 
 - `FragmentLimits`（`Config::fragment_limits`）默认值：`max_entries` 64，`max_bytes` 4 MiB（载荷存储、分片 0 保存的头部、区间表和排队的超时引用报文的实际保留容量，另加每个数据报 256 B 的固定簿记开销），`max_holes` 32，`timeout` 30 秒，从数据报的第一个分片起算。
 - 重叠分片（包括完全相同的重复分片）会终结该数据报（RFC 5722、RFC 8200 第 4.5 节）：buffer 立即释放，一个无 buffer 的墓碑吸收其余分片（`Fragment`）直到超时。空洞多于 `max_holes`，或长度不一致，同样终结数据报。空分片、长度不是 8 的倍数的非末尾分片，以及超过 64 KiB 的数据报为 `Malformed`。原子分片作为完整数据报交付（RFC 6946）。
+- 重组保留任意分片上的 CE；Not-ECT 与具备 ECN 能力的分片混合时，按普通终结路径留下墓碑。DSCP 及没有 CE 时的 ECN codepoint 取自分片零，IPv6 flow label 不变；原子 IPv6 分片独立保留自己的首部。
+- `Transit::reassemble` 在接收时也执行原始重组 deadline，即使调用者尚未轮询 timer。恰在或超过 deadline 的片不能完成旧数据报；已保留的超时 quote 独立持有其资源。
 - 表或 `max_bytes` 耗尽时，最旧的数据报被静默驱逐，因此洪泛的首分片无法饿死能够完成的突发。
 - 超时仅当分片 0 已到达时才回 ICMP Time Exceeded（IPv4 type 11 code 1，IPv6 type 3 code 1）；引用内容是保存的头部加至多 8 字节，在入队前截断到 548 字节（IPv4）或 1232 字节（IPv6）。最多 16 个这样的错误等待 `poll_transmit`；`poll_timeout` 和 `handle_timeout` 覆盖重组 deadline。
 - **共享预算。** 重组字节计入 `Config::shared_budget`（不计入栈自己的 `memory_limit`；没有预算时只受 `FragmentLimits` 限制）。计费被拒绝时驱逐最旧的数据报并重试；没有可驱逐的数据报时丢弃该分片：若它会开启新数据报，丢弃为 `DropReason::Capacity`；若是唯一剩下的现有数据报无法增长，则终结该数据报（`Fragment`）。完成、驱逐、终结和栈被丢弃时退还存储费用；超时则将保留引用报文的实际容量费用转移给待发队列，直到发出、被抑制、被限速或丢弃。输出 buffer 过小时费用继续保留。因此，分片洪泛最多可占用共享预算中的 `FragmentLimits::max_bytes`，而新流也是按同一个预算接纳的：请为此留出余量，否则洪泛期间 SYN 会以 `Capacity` 被丢弃。
@@ -254,7 +446,7 @@ Packet TCP 写半关闭会等待握手完成，不把暂时的 `WouldBlock` 变�
 
 以下内容目前不在 `crates/honk-netstack/src` 中，或不在仓库中；这份清单就是本页论断的边界。
 
-- Driver：TUN driver（`honk-tun`）和 AF_XDP driver（`honk-xsk`）。不存在这些名字的 crate。
+- TUN、netmap 和 Windows 后端不在当前实现范围。Linux XDP daemon 已有配置入口，但实现不代表生产或硬件验收通过。
 - eBPF/TC 一侧：classifier 的投递位、把流导向栈的 steering、必须比 TIME_WAIT 活得更久的投递状态（[关闭语义](#关闭语义)），以及在 TC 层代理非首分片。
 - ICMP 代理：在客户端与真实上游之间转发 echo 或错误。栈只会针对未确认的 TCP 序号消费 ICMP，并生成上文列出的错误。
 - 透明模式的任何性能门槛或实测数字。
@@ -288,12 +480,12 @@ driver 位于 `honk-outbound/src/proxy/wireguard/`；规范在[出站设计](./o
 
 | 范围 | 限制 |
 | --- | --- |
-| IP | Endpoint 模式：无分片与重组（分片被丢弃，超长 UDP 为 `TooLarge`），不生成 ICMP。透明模式在 `FragmentLimits` 内重组，并对 UDP 回复分片，至多 64 KiB。无 ECN；发送不带 IPv4 选项。 |
-| TCP | listen/accept 仅在透明模式；无 daemon 抓包后端。accepted-flow keepalive 可选；无 urgent-data API、TCP Fast Open、PLPMTUD，仅 CUBIC。未知 TCP options 被忽略，格式错误的长度终止 option 解析。 |
+| IP | Endpoint 模式：无分片与重组（分片被丢弃，超长 UDP 为 `TooLarge`），不生成 ICMP。透明模式在 `FragmentLimits` 内重组并保留 IP ECN，对 UDP 回复分片，至多 64 KiB。发送不带 IPv4 选项。 |
+| TCP | listen/accept 仅在透明模式，由显式 XDP daemon 使用。accepted-flow keepalive 可选；无 urgent-data API、TCP Fast Open、ECN 协商或 PLPMTUD，仅 CUBIC。未知 TCP options 被忽略，格式错误的长度终止 option 解析。 |
 | 接收 | 每流最多 32 个乱序区间；ACK 拉伸受 64 包接收批次限制。 |
 | 规模 | 空闲的已建立流约占 1.4 KiB 堆（无 chunk）；每条隧道 4096 个流，每条被接纳的流从进程预算预留约 33 KiB 的 floor；预算即份额（默认 256 MiB，honk 取内存的 1/8，限制在 64 MiB..4 GiB），所有隧道的栈共同使用，64 MiB / 256 MiB / 1 GiB 下仅 floor 约可容纳 2,000 / 8,000 / 32,000 条流；活动隧道数由其固定开销限制，`share / 4 MiB`，夹在 1..128；`max_flows` 统计 UDP 关联；每条隧道一把锁、一个 owner 任务，因此单条隧道受限于一个核。 |
 | WireGuard | 每条隧道恰好一个 peer；无入站连接；IPv4 与 IPv6 各自需要配置隧道地址；endpoint 域名只在握手尝试超时之后的下一次获取时重新解析，已有会话时端点集合不变；每个 control plane 每个（密钥对，端点）只有一条隧道（不带 runtime 的拨号共用一个单独的进程级 registry），每个 registry 的活动隧道最多 `share / 4 MiB` 条（1..128，见规模）；共享密钥对与端点的节点必须所有隧道设置一致，否则互相替换，主机名与 IP 字面量写法的同一端点是不同的隧道；内层 MTU 至多 65472，使外层数据报装得进一个 UDP 载荷。 |
-| 透明 | 只有显式 core packet 嵌入；无已配置的 TUN/AF_XDP/eBPF 抓包路径或原生续行。约 9 KiB 进展保底不是 accepted/idle 总承诺。GRO/TSO/USO 设备集成和实验室性能尚未验证。 |
+| 透明 | core packet 嵌入及已配置的 Linux XDP 后端；无 TUN/netmap/Windows 后端或原生续行。约 9 KiB 进展保底不是 accepted/idle 总承诺。GRO/TSO/USO 设备集成和实验室性能尚未验证。 |
 | 验证 | 没有对非 Linux TCP 实现的互通测试，没有 ARM 实测，也没有跑 `test-routing`/`test-netns` 虚拟机门槛。设计阈值在一台 x86-64 4-vCPU 虚拟机上以内核 WireGuard + 内核 TCP 为对照实测（不是设计里的同一外层引擎 + TUN 对照臂，且 honk 一侧多一跳本地中继）：G1–G4 通过，G5 下行公平性按中位数通过，G5 空闲内存（含驱动与中继状态约每流 4 KiB）未达到 1 KiB 目标；证据在 `bench` 分支的 `bench/netstack/results/` 下。 |
 
 ## 设计验证（P1）

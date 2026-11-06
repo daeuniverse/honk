@@ -140,7 +140,7 @@ pub(crate) struct RouteInput {
 }
 
 impl RouteInput {
-    fn heap_bytes(&self) -> usize {
+    pub(crate) fn heap_bytes(&self) -> usize {
         optional_bytes([&self.domain, &self.pname, &self.src_mac])
             + self.domain_rule_ids.as_ref().map_or(0, |ids| {
                 ids.capacity() * size_of::<String>()

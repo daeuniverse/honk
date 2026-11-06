@@ -9,12 +9,17 @@ const DF: u16 = 0x4000;
 const MF: u16 = 0x2000;
 
 pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
+    parse_prefix(pkt, pkt.len())
+}
+
+/// Parse a complete IPv4 header while payload bytes remain in separate device segments.
+pub fn parse_prefix(pkt: &[u8], packet_len: usize) -> Result<IpPacket, ParseError> {
     if pkt.len() < HEADER_LEN || pkt[0] >> 4 != 4 {
         return Err(ParseError::Malformed);
     }
     let ihl = usize::from(pkt[0] & 0x0F) * 4;
     let total = usize::from(u16::from_be_bytes([pkt[2], pkt[3]]));
-    if ihl < HEADER_LEN || pkt.len() < ihl || total < ihl || total > pkt.len() {
+    if ihl < HEADER_LEN || pkt.len() < ihl || total < ihl || total > packet_len {
         return Err(ParseError::Malformed);
     }
     if checksum(&pkt[..ihl]) != 0 {

@@ -7,6 +7,71 @@ pub(super) enum CommandAction {
     Shutdown,
 }
 
+type Reply<T> = (
+    tokio::sync::oneshot::Sender<T>,
+    tokio::sync::oneshot::Receiver<T>,
+);
+
+pub(super) enum CommandReply {
+    Reload(Reply<ReloadReply>),
+    Subscription(Reply<crate::subscription::SubscriptionMergeReply>),
+    #[cfg(any(feature = "native-api", feature = "clash-api"))]
+    Selector(
+        Reply<Result<super::super::client::SelectionResult, super::super::client::ControlError>>,
+    ),
+    #[cfg(all(feature = "native-api", feature = "clash-api"))]
+    Mode(Reply<Result<crate::mode::ModeState, super::super::client::ControlError>>),
+}
+
+pub(super) fn separate_reply(command: &mut ControlCommand) -> Option<CommandReply> {
+    fn replace<T>(sender: &mut tokio::sync::oneshot::Sender<T>) -> Reply<T> {
+        let (internal, receiver) = tokio::sync::oneshot::channel();
+        (std::mem::replace(sender, internal), receiver)
+    }
+    Some(match command {
+        ControlCommand::ReloadConfig { result, .. } => CommandReply::Reload(replace(result)),
+        ControlCommand::MergeSubscription { result, .. } => {
+            CommandReply::Subscription(replace(result))
+        }
+        #[cfg(any(feature = "native-api", feature = "clash-api"))]
+        ControlCommand::SetSelector { reply, .. } => CommandReply::Selector(replace(reply)),
+        #[cfg(all(feature = "native-api", feature = "clash-api"))]
+        ControlCommand::SetRuntimeMode { reply, .. } => CommandReply::Mode(replace(reply)),
+        ControlCommand::NetworkChanged | ControlCommand::Shutdown => return None,
+    })
+}
+
+impl CommandReply {
+    pub(super) fn forward(self) -> bool {
+        fn forward<T>((sender, mut receiver): Reply<T>) {
+            if let Ok(result) = receiver.try_recv() {
+                let _ = sender.send(result);
+            }
+        }
+        match self {
+            Self::Reload((sender, mut receiver)) => {
+                let Ok(reply) = receiver.try_recv() else {
+                    return false;
+                };
+                let accepted = reply.outcome.accepted();
+                if sender.send(reply).is_err() && accepted {
+                    tracing::error!("packet reload lost its supervisor handoff");
+                    return false;
+                }
+            }
+            Self::Subscription(reply) => forward(reply),
+            #[cfg(any(feature = "native-api", feature = "clash-api"))]
+            Self::Selector(reply) => forward(reply),
+            #[cfg(all(feature = "native-api", feature = "clash-api"))]
+            Self::Mode(reply) => forward(reply),
+        }
+        true
+    }
+}
+
+pub(super) const COMMAND_MEMORY: usize =
+    size_of::<ReloadReply>() + size_of::<crate::subscription::SubscriptionMergeReply>() + 1024;
+
 pub(super) async fn start(plane: &mut ControlPlane) -> OwnedTasks {
     plane.configure_health_loop().await;
     plane.start_userspace_maintenance().await

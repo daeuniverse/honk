@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 pub(in crate::control) use source::UplinkStall;
 use std::collections::HashSet;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -909,10 +909,24 @@ impl UdpEndpointPool {
         self.endpoints.is_empty()
     }
 
-    #[cfg(test)]
-    pub(super) fn contains(&self, scope: ScopeId, client: SocketAddr, dst: SocketAddr) -> bool {
+    pub(in crate::control) fn contains(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        dst: SocketAddr,
+    ) -> bool {
         self.endpoints
             .contains_key(&EndpointKey::new(scope, client, dst))
+    }
+
+    pub(in crate::control) fn retains_source(&self, scope: ScopeId, address: IpAddr) -> bool {
+        self.endpoints
+            .iter()
+            .any(|entry| entry.key().scope == scope && entry.key().client_ip() == address)
+            || self
+                .sources
+                .iter()
+                .any(|entry| entry.key().owns_client(scope, address))
     }
 
     #[cfg(test)]

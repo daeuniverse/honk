@@ -54,6 +54,8 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     #[serde(default)]
     pub assets: crate::assets::AssetsConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datapath: Option<crate::datapath::DatapathConfig>,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -734,6 +736,16 @@ impl Config {
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         self.experimental.native_api.validate_detailed(source)?;
+        if let Some(datapath) = &self.datapath {
+            datapath.validate().map_err(|_| {
+                config_validation_error(
+                    source,
+                    SettingPath::new("datapath"),
+                    "invalid-datapath-config",
+                    "invalid or unsupported datapath execution configuration",
+                )
+            })?;
+        }
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();

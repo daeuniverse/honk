@@ -278,10 +278,7 @@ fn parse_routing_rule(
             );
     }
     let (outbound, must, mark) = parse_outbound(right, ordinal)?;
-    let mut condition = RoutingCondition::default();
-    for matcher in left.split("&&").filter(|matcher| !matcher.is_empty()) {
-        parse_route_matcher(&mut condition, matcher, ordinal)?;
-    }
+    let condition = parse_condition(left, ordinal)?;
     let complex =
         must || mark != 0 || left.find("&&").is_some() || condition.needs_complex_display();
     let rule = RoutingRule {
@@ -293,6 +290,35 @@ fn parse_routing_rule(
         mark,
     };
     Ok(Some((rule, complex.then(|| statement.display()))))
+}
+
+pub(super) fn parse_condition(
+    expression: Expression<'_, '_, '_>,
+    ordinal: usize,
+) -> Result<RoutingCondition, DetailedConfigError> {
+    parse_condition_inner(expression, ordinal, false)
+}
+
+pub(super) fn parse_condition_strict(
+    expression: Expression<'_, '_, '_>,
+    ordinal: usize,
+) -> Result<RoutingCondition, DetailedConfigError> {
+    parse_condition_inner(expression, ordinal, true).map_err(|mut error| {
+        error.diagnostic.setting = SettingPath::new("datapath");
+        error
+    })
+}
+
+fn parse_condition_inner(
+    expression: Expression<'_, '_, '_>,
+    ordinal: usize,
+    strict: bool,
+) -> Result<RoutingCondition, DetailedConfigError> {
+    let mut condition = RoutingCondition::default();
+    for matcher in expression.split("&&").filter(|matcher| !matcher.is_empty()) {
+        parse_route_matcher(&mut condition, matcher, ordinal, strict)?;
+    }
+    Ok(condition)
 }
 
 fn parse_outbound(
@@ -369,6 +395,7 @@ fn parse_route_matcher(
     condition: &mut RoutingCondition,
     matcher: Expression<'_, '_, '_>,
     ordinal: usize,
+    strict: bool,
 ) -> Result<(), DetailedConfigError> {
     let negated = matcher.starts_with("!");
     let matcher = if negated {
@@ -396,7 +423,7 @@ fn parse_route_matcher(
         "mac",
         "dscp",
     ] {
-        if let Some(args) = parse_call(matcher, name, ordinal)? {
+        if let Some(args) = parse_call(matcher, name, ordinal, strict)? {
             match name {
                 "dip" => parse_ip_args(&args, &mut target),
                 "domain" => parse_domain_args(&args, &mut target),
@@ -452,6 +479,7 @@ fn parse_call<'p, 'd, 'a>(
     matcher: Expression<'p, 'd, 'a>,
     name: &str,
     ordinal: usize,
+    strict: bool,
 ) -> Result<Option<Vec<Expression<'p, 'd, 'a>>>, DetailedConfigError> {
     if !matcher.parts().next().is_some_and(|part| {
         part.raw()
@@ -475,13 +503,25 @@ fn parse_call<'p, 'd, 'a>(
         }
         return Ok(None);
     }
-    Ok(Some(
-        call.sub(call.span.start + 1, position)
-            .split(",")
-            .map(Expression::unquote)
-            .filter(|value| !value.is_empty())
-            .collect(),
-    ))
+    let mut args = Vec::new();
+    for argument in call
+        .sub(call.span.start + 1, position)
+        .split(",")
+        .map(Expression::unquote)
+    {
+        if argument.is_empty() {
+            if strict {
+                return Err(matcher.error(
+                    "empty-matcher-argument",
+                    "firewall and NAT matchers require non-empty arguments and list elements",
+                    ordinal,
+                ));
+            }
+        } else {
+            args.push(argument);
+        }
+    }
+    Ok(Some(args))
 }
 
 fn parse_domain_args(

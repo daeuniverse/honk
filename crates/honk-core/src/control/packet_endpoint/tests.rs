@@ -3,6 +3,7 @@ use super::*;
 use honk_netstack::{Config as StackConfig, ExcludeSet, Mode, wire};
 use std::time::Duration;
 
+mod source;
 mod startup;
 mod udp;
 
@@ -112,6 +113,101 @@ async fn established_tcp(scope: &PacketScope, destination: SocketAddr) -> (FlowI
         Rx::Consumed
     );
     (flow, header.seq.wrapping_add(1))
+}
+
+#[tokio::test]
+async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, _owner) = scope(&budget);
+    let (plane, _health) = local_plane().await;
+    let handle = plane.spawn_handle();
+    let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
+    let first: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+    let second: SocketAddr = "192.0.2.10:41001".parse().unwrap();
+    let syn = |source: SocketAddr| {
+        let mut packet = vec![0; 128];
+        let len = wire::tcp::emit_packet(
+            &mut packet,
+            source.ip(),
+            destination.ip(),
+            &wire::tcp::Header {
+                src_port: source.port(),
+                dst_port: destination.port(),
+                seq: 100,
+                ack: 0,
+                flags: wire::tcp::SYN,
+                window: 4096,
+                urgent: 0,
+                options: wire::tcp::Options::default(),
+            },
+            [&[], &[]],
+        )
+        .unwrap();
+        packet.truncate(len);
+        packet
+    };
+    let first_snapshot = handle
+        .prepare_packet_routing_snapshot(
+            first,
+            destination,
+            "tcp",
+            0,
+            #[cfg(feature = "native-api")]
+            false,
+        )
+        .await
+        .unwrap();
+    let original = first_snapshot.config.clone();
+    let mut first_admission = Some(EndpointAdmission::new(first_snapshot, &budget).unwrap());
+    let now = Instant::now();
+    assert_eq!(
+        scope
+            .receive_admitted_with_source(&syn(first), now, &mut first_admission, false, |_, _| {
+                true
+            })
+            .0,
+        Rx::Consumed
+    );
+    assert!(first_admission.is_none());
+    let mut next = (*original).clone();
+    next.global.connect_timeout_ms += 1;
+    *handle.config.write().await = Arc::new(next);
+    let second_snapshot = handle
+        .prepare_packet_routing_snapshot(
+            second,
+            destination,
+            "tcp",
+            0,
+            #[cfg(feature = "native-api")]
+            false,
+        )
+        .await
+        .unwrap();
+    let newer = second_snapshot.config.clone();
+    let mut second_admission = Some(EndpointAdmission::new(second_snapshot, &budget).unwrap());
+    scope.receive_admitted_with_source(&syn(first), now, &mut second_admission, false, |_, _| true);
+    assert!(
+        second_admission.is_some(),
+        "a SYN retransmit cannot replace first admission"
+    );
+    scope
+        .receive_admitted_with_source(&syn(second), now, &mut second_admission, false, |_, _| true);
+    assert!(second_admission.is_none());
+    let (_, mut first_flow) = scope.poll_accept().unwrap();
+    let (_, mut second_flow) = scope.poll_accept().unwrap();
+    assert_eq!(
+        (first_flow.peer_addr(), second_flow.peer_addr()),
+        (first, second)
+    );
+    assert!(Arc::ptr_eq(
+        &first_flow.take_routing().unwrap().config,
+        &original
+    ));
+    assert!(Arc::ptr_eq(
+        &second_flow.take_routing().unwrap().config,
+        &newer
+    ));
+    scope.shutdown(true);
 }
 
 #[tokio::test]

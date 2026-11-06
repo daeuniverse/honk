@@ -150,6 +150,54 @@ pub enum Rx {
     Dropped(DropReason),
 }
 
+/// Current packet header/checksum provenance, never handshake or accepted-child authority.
+/// A fragmented input produces this only on its successfully validated completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedSource {
+    pub src: SocketAddr,
+    pub dst: SocketAddr,
+    pub protocol: u8,
+    /// Verified header flags for TCP; never protocol admission evidence.
+    pub tcp_flags: Option<u8>,
+}
+
+pub(crate) struct SourceReport<F> {
+    source: Option<ValidatedSource>,
+    tcp_admission: Option<FlowId>,
+    accept: F,
+}
+
+impl<F: FnMut(ValidatedSource) -> bool> SourceReport<F> {
+    fn new(accept: F) -> Self {
+        Self {
+            source: None,
+            tcp_admission: None,
+            accept,
+        }
+    }
+
+    pub(crate) fn record<const REPORT: bool>(
+        &mut self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        protocol: u8,
+        tcp_flags: Option<u8>,
+    ) -> bool {
+        if REPORT {
+            let source = ValidatedSource {
+                src,
+                dst,
+                protocol,
+                tcp_flags,
+            };
+            self.source = Some(source);
+            (self.accept)(source)
+        } else {
+            true
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DropReason {
@@ -439,7 +487,40 @@ impl Stack {
     pub fn receive(&mut self, now: Instant, packet: &[u8]) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
-        self.receive_packet(now, packet, RxMeta::VERIFY)
+        self.receive_packet::<false>(
+            now,
+            packet,
+            RxMeta::VERIFY,
+            &mut SourceReport::new(|_| true),
+        )
+    }
+
+    /// Reports only this input's completed, checksum-verified TCP/UDP identity. The
+    /// callback runs before protocol state mutation/UDP dispatch; false refuses this
+    /// packet as NotForUs. A receipt is still a validity fact, not admission evidence.
+    pub fn receive_with_source(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        on_source: impl FnMut(ValidatedSource) -> bool,
+    ) -> (Rx, Option<ValidatedSource>) {
+        let (rx, source, _) = self.receive_with_tcp_admission(now, packet, on_source);
+        (rx, source)
+    }
+
+    /// Also returns the new passive incarnation created by this exact receive, never
+    /// a later accept-queue occupant. Retransmits and existing-flow input return None.
+    pub fn receive_with_tcp_admission(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        on_source: impl FnMut(ValidatedSource) -> bool,
+    ) -> (Rx, Option<ValidatedSource>, Option<FlowId>) {
+        self.now = now;
+        self.counters.rx_packets += 1;
+        let mut report = SourceReport::new(on_source);
+        let rx = self.receive_packet::<true>(now, packet, RxMeta::VERIFY, &mut report);
+        (rx, report.source, report.tcp_admission)
     }
 
     /// Receives one IP packet with what the driver knows about it: a trusted L4 checksum
@@ -460,10 +541,16 @@ impl Stack {
         if meta != RxMeta::VERIFY && !self.transparent() {
             return self.drop_packet(DropReason::Unsupported);
         }
-        self.receive_packet(now, packet, meta)
+        self.receive_packet::<false>(now, packet, meta, &mut SourceReport::new(|_| true))
     }
 
-    fn receive_packet(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
+    fn receive_packet<const REPORT: bool>(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        meta: RxMeta,
+        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
+    ) -> Rx {
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
             Err(ParseError::Fragment) if self.transparent() => {
@@ -484,7 +571,13 @@ impl Stack {
                     // and its checksum is verified: no fragment's metadata vouches for the rest.
                     Push::Complete(r) => {
                         let rx = match wire::parse_ip(&r.packet) {
-                            Ok(ip) => self.receive_ip(now, ip, &r.packet, RxMeta::VERIFY),
+                            Ok(ip) => self.receive_ip::<REPORT>(
+                                now,
+                                ip,
+                                &r.packet,
+                                RxMeta::VERIFY,
+                                report,
+                            ),
                             Err(e) => self.drop_packet(e.into()),
                         };
                         r.wrap(rx)
@@ -493,19 +586,33 @@ impl Stack {
             }
             Err(e) => return self.drop_packet(e.into()),
         };
-        self.receive_ip(now, ip, packet, meta)
+        self.receive_ip::<REPORT>(now, ip, packet, meta, report)
     }
 
-    fn receive_ip(&mut self, now: Instant, ip: wire::IpPacket, packet: &[u8], meta: RxMeta) -> Rx {
+    fn receive_ip<const REPORT: bool>(
+        &mut self,
+        now: Instant,
+        ip: wire::IpPacket,
+        packet: &[u8],
+        meta: RxMeta,
+        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
+    ) -> Rx {
         if let Some(reason) = self.refuses(ip.src, ip.dst) {
             return self.drop_packet(reason);
         }
         match ip.proto {
-            wire::PROTO_TCP => self.receive_tcp(now, &ip, packet, meta),
+            wire::PROTO_TCP => self.receive_tcp::<REPORT>(now, &ip, packet, meta, report),
             wire::PROTO_UDP if self.transparent() => {
-                crate::udp_t::receive_transparent(self, &ip, packet, meta)
+                let rx = crate::udp_t::receive_transparent(self, &ip, packet, meta);
+                if let Rx::Transparent { src, dst, .. } | Rx::TransparentSplit { src, dst, .. } =
+                    &rx
+                    && !report.record::<REPORT>(*src, *dst, wire::PROTO_UDP, None)
+                {
+                    return self.drop_packet(DropReason::NotForUs);
+                }
+                rx
             }
-            wire::PROTO_UDP => self.receive_udp(&ip, packet),
+            wire::PROTO_UDP => self.receive_udp::<REPORT>(&ip, packet, report),
             wire::PROTO_ICMP | wire::PROTO_ICMPV6 if meta.gso.is_some() => {
                 self.drop_packet(DropReason::Malformed)
             }
@@ -514,12 +621,13 @@ impl Stack {
         }
     }
 
-    fn receive_tcp(
+    fn receive_tcp<const REPORT: bool>(
         &mut self,
         now: Instant,
         ip: &wire::IpPacket,
         packet: &[u8],
         meta: RxMeta,
+        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
     ) -> Rx {
         let seg = &packet[ip.payload.clone()];
         let (h, off) = match wire::tcp::parse(seg) {
@@ -532,6 +640,14 @@ impl Stack {
         };
         if verify && !wire::tcp::verify_checksum(ip.src, ip.dst, seg) {
             return self.drop_packet(DropReason::Checksum);
+        }
+        if !report.record::<REPORT>(
+            SocketAddr::new(ip.src, h.src_port),
+            SocketAddr::new(ip.dst, h.dst_port),
+            wire::PROTO_TCP,
+            Some(h.flags),
+        ) {
+            return self.drop_packet(DropReason::NotForUs);
         }
         let tuple = FourTuple {
             local: SocketAddr::new(ip.dst, h.dst_port),
@@ -602,6 +718,12 @@ impl Stack {
         if self.transparent()
             && let Some(rx) = self.passive_open(now, tuple, &h, ip.dscp, reopen)
         {
+            if REPORT && matches!(rx, Rx::Consumed) {
+                report.tcp_admission = self.table.tcp.get(&tuple).map(|&index| FlowId {
+                    idx: index,
+                    generation: self.table.slots[index as usize].generation,
+                });
+            }
             return rx;
         }
         if h.flags & wire::tcp::RST == 0 {
@@ -1111,6 +1233,57 @@ impl Stack {
                 _ => false,
             })
             || self.controls.iter().any(|control| control.flow == Some(id))
+    }
+
+    /// Read-only execution ownership through pending TCP, TIME_WAIT and flow-owned
+    /// control output. This is not packet validation or admission authority.
+    pub fn retains_tcp(&self, source: SocketAddr, destination: SocketAddr) -> bool {
+        let tuple = FourTuple {
+            local: destination,
+            remote: source,
+        };
+        self.table.tcp.contains_key(&tuple)
+            || self.table.timewait.contains_key(&tuple)
+            || self
+                .controls
+                .iter()
+                .any(|control| control.flow.is_some() && control.tuple == tuple)
+    }
+
+    /// Whether this peer still owns protocol state or an unpulled reply. Packets already
+    /// exported to an adapter and its application work need separate retention there.
+    pub fn retains_source(&self, address: IpAddr) -> bool {
+        self.table
+            .tcp
+            .keys()
+            .chain(self.table.timewait.keys())
+            .any(|tuple| tuple.remote.ip() == address)
+            || self
+                .controls
+                .iter()
+                .any(|control| control.tuple.remote.ip() == address)
+            || self.udp_tx.retains_destination(address)
+            || self
+                .reasm
+                .obligations()
+                .any(|(source, _, _)| source == address)
+    }
+
+    /// Reply materialization still pending inside the Stack, before adapter ownership.
+    pub fn retains_source_output(&self, address: IpAddr) -> bool {
+        self.table.slots.iter().any(|slot| match &slot.flow {
+            Some(Flow::Tcp(t)) => t.tuple.remote.ip() == address && (slot.on_tx || slot.on_control),
+            Some(Flow::TimeWait(t)) => t.tuple.remote.ip() == address && t.ack_due,
+            _ => false,
+        }) || self
+            .controls
+            .iter()
+            .any(|control| control.tuple.remote.ip() == address)
+            || self.udp_tx.retains_destination(address)
+            || self
+                .reasm
+                .obligations()
+                .any(|(source, _, _)| source == address)
     }
     pub fn tcp_stats(&self, id: FlowId) -> Option<TcpStats> {
         match self.table.get(id)? {

@@ -110,7 +110,11 @@ impl NativeRuntime {
     }
 
     /// Stops the coordinator, publishes a failed run, then stops the listener.
-    pub(crate) async fn shutdown(native: Option<Self>, control_plane: &ControlPlane, failed: bool) {
+    pub(crate) async fn shutdown(
+        native: Option<Self>,
+        control_plane: Option<&ControlPlane>,
+        failed: bool,
+    ) {
         let (server, stop_configuration) = match native {
             Some(native) => (Some(native.server), native.stop_configuration),
             None => (None, None),
@@ -118,7 +122,7 @@ impl NativeRuntime {
         if let Some(stop) = stop_configuration {
             stop.await;
         }
-        if failed {
+        if failed && let Some(control_plane) = control_plane {
             control_plane.publish_phase(EnginePhase::Failed);
         }
         if let Some(server) = server {

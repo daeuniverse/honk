@@ -1,0 +1,427 @@
+//! Reassembly timeout control output on the same Core/FIB/policy owner.
+
+use super::{
+    Disposition, FirewallVerdict, PolicyGeneration, Resolution, RoutedCore, disposition,
+    mode_decision, route_action,
+};
+use honk_datapath::{
+    firewall::{FragmentLease, Tuple},
+    forward::{Ingress, Route, RouteQuery},
+};
+use honk_netstack::{
+    MemoryBudget, MemoryReservation, OwnedPacket,
+    transit::{self, Quote},
+};
+use std::{
+    io,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+pub(super) struct Outputs {
+    pending: AtomicUsize,
+    _charge: MemoryReservation,
+}
+impl Outputs {
+    pub(super) fn new(budget: &Arc<MemoryBudget>) -> anyhow::Result<Arc<Self>> {
+        let charge = budget
+            .reserve(size_of::<Self>() + 32)
+            .ok_or_else(|| anyhow::anyhow!("reassembly output accounting budget exhausted"))?;
+        Ok(Arc::new(Self {
+            pending: AtomicUsize::new(0),
+            _charge: charge,
+        }))
+    }
+    pub(super) fn pending(&self) -> usize {
+        self.pending.load(Ordering::Acquire)
+    }
+    fn begin(&self) -> anyhow::Result<()> {
+        self.pending
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map_err(|_| anyhow::anyhow!("reassembly output ownership exhausted"))?;
+        Ok(())
+    }
+    fn finish(&self) {
+        let previous = self.pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0, "reassembly output ownership underflow");
+    }
+}
+
+pub(super) struct Pending {
+    ingress: Ingress,
+    quote: OwnedPacket,
+    deadline: Instant,
+    retry_at: Instant,
+    fragment: Option<FragmentLease>,
+}
+
+/// `out[..len]` was materialized by poll_reassembly_error. Keep its funded byte storage
+/// separately until submission, and retain this owner through actual CQ or explicit disposal.
+/// The quote/output obligation prevents NAT alias reclamation while this owner is live.
+pub struct GeneratedError {
+    pub ingress: Ingress,
+    pub route: Route,
+    pub generation: PolicyGeneration,
+    pub len: usize,
+    _quote: OwnedPacket,
+    _fragment: Option<FragmentLease>,
+    outputs: Arc<Outputs>,
+}
+impl Drop for GeneratedError {
+    fn drop(&mut self) {
+        self.outputs.finish();
+    }
+}
+
+impl RoutedCore {
+    /// Requires funded control-output storage of at least 1280 bytes. Suppressed/denied
+    /// quotes are retired in bounded batches; one unresolved neighbor quote may wait for
+    /// two seconds, never renewing its deadline. No conntrack grant is inferred from a quote.
+    pub async fn poll_reassembly_error(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+    ) -> anyhow::Result<Option<GeneratedError>> {
+        anyhow::ensure!(
+            out.len() >= 1280,
+            "reassembly error output requires 1280 bytes"
+        );
+        let now = now.max(Instant::now());
+        self.retire(now);
+        for _ in 0..64 {
+            let pending = match self.pending_reassembly_error.take() {
+                Some(pending) => pending,
+                None => {
+                    let Some((ingress, quote)) = self.core.poll_expired_quote() else {
+                        return Ok(None);
+                    };
+                    let fragment = match transit::quote_metadata(&quote) {
+                        Some(metadata) => {
+                            match self.firewall.retain_fragment(
+                                honk_datapath::forward::FragmentObligation {
+                                    ingress,
+                                    source: metadata.source,
+                                    destination: metadata.destination,
+                                    protocol: metadata.protocol,
+                                },
+                            ) {
+                                Ok(fragment) => fragment,
+                                Err(error) => {
+                                    self.counters.nat(&error);
+                                    continue;
+                                }
+                            }
+                        }
+                        _ => None,
+                    };
+                    Pending {
+                        fragment,
+                        ingress,
+                        quote,
+                        deadline: now + Duration::from_secs(2),
+                        retry_at: now,
+                    }
+                }
+            };
+            if !self.authority.admitting() || Instant::now() >= pending.deadline {
+                continue;
+            }
+            if now < pending.retry_at {
+                self.pending_reassembly_error = Some(pending);
+                return Ok(None);
+            }
+            let Some(metadata) = transit::quote_metadata(&pending.quote) else {
+                continue;
+            };
+            let Some(query) = timeout_query(pending.ingress, metadata) else {
+                continue;
+            };
+            let generation = {
+                let router = self.authority.0.router.read().await;
+                let config = self.authority.0.config.read().await;
+                let mode_state = self
+                    .authority
+                    .0
+                    .mode_state
+                    .as_ref()
+                    .map(|state| state.read());
+                let Some(action) = route_action(&router, query, None) else {
+                    continue;
+                };
+                let mode = mode_decision(
+                    mode_state.as_deref(),
+                    &config,
+                    #[cfg(feature = "native-api")]
+                    self.authority
+                        .0
+                        .native
+                        .as_ref()
+                        .map(|native| native.catalog.snapshot())
+                        .as_deref(),
+                    action.outbound.clone(),
+                    action.must,
+                );
+                let marked =
+                    action.outbound == "direct" && mode.name == "direct" && action.mark.is_some();
+                if disposition(
+                    &mode.name,
+                    action.must,
+                    marked,
+                    query,
+                    self.authority.0.execution,
+                    self.core.retains(query),
+                ) != Disposition::Core
+                {
+                    continue;
+                }
+                if let Some(policy) = router.firewall_policy() {
+                    let (Some((source_port, destination_port)), Some((_, role))) = (
+                        metadata.ports,
+                        self.ingress_roles
+                            .iter()
+                            .find(|(identity, _)| *identity == pending.ingress),
+                    ) else {
+                        continue;
+                    };
+                    let tuple = Tuple {
+                        source: metadata.source,
+                        destination: metadata.destination,
+                        protocol: metadata.protocol,
+                        source_port,
+                        destination_port,
+                    };
+                    if policy.original(tuple, metadata.traffic_class, *role)
+                        != FirewallVerdict::Allow
+                    {
+                        continue;
+                    }
+                }
+                self.authority.generation(mode_state.as_deref())
+            };
+            if !self.fib.current(self.fib.generation())? {
+                self.routes.clear();
+                self.fib.synchronize()?;
+            }
+            // Input route proof also rejects directed broadcast/local input and validates
+            // the real source/interface context; output lookup alone is not that proof.
+            match self.fib.lookup(query) {
+                Ok(Resolution::Forward(_) | Resolution::NeighborPending(_)) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_reassembly_neighbor(pending);
+                    return Ok(None);
+                }
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let route = match self.fib.lookup_error(query) {
+                Ok(Resolution::Forward(route)) => route,
+                Ok(Resolution::NeighborPending(_)) => {
+                    self.wait_reassembly_neighbor(pending);
+                    return Ok(None);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.wait_reassembly_neighbor(pending);
+                    return Ok(None);
+                }
+                Ok(_) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !self.fib.current(route.generation)? {
+                self.wait_reassembly_neighbor(pending);
+                return Ok(None);
+            }
+            let Some(source) = self.fib.error_source(route) else {
+                continue;
+            };
+            let limit = out.len().min(route.mtu as usize);
+            let overhead = if source.is_ipv4() { 28 } else { 48 };
+            if limit < overhead + metadata.header_len + 8 {
+                continue;
+            }
+            let emitted_at = Instant::now();
+            if emitted_at >= pending.deadline || !self.authority.admitting() {
+                continue;
+            }
+            let Some(len) = self.core.reassembly_error(
+                pending.ingress,
+                emitted_at,
+                source,
+                &pending.quote,
+                &mut out[..limit],
+            )?
+            else {
+                continue;
+            };
+            self.reassembly_outputs.begin()?;
+            return Ok(Some(GeneratedError {
+                ingress: pending.ingress,
+                route,
+                generation,
+                len,
+                _quote: pending.quote,
+                _fragment: pending.fragment,
+                outputs: Arc::clone(&self.reassembly_outputs),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn wait_reassembly_neighbor(&mut self, mut pending: Pending) {
+        let now = Instant::now();
+        if now < pending.deadline {
+            // ponytail: one funded control wait; separate neighbors only if HOL matters.
+            pending.retry_at = now + Duration::from_millis(10);
+            self.pending_reassembly_error = Some(pending);
+        }
+    }
+}
+
+fn timeout_query(ingress: Ingress, quote: Quote) -> Option<RouteQuery> {
+    if !transit::unicast(quote.source) || !transit::unicast(quote.destination) {
+        return None;
+    }
+    Some(RouteQuery {
+        ingress,
+        source: quote.source,
+        destination: quote.destination,
+        traffic_class: quote.traffic_class,
+        protocol: quote.protocol,
+        ports: quote.ports,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timeout_query_uses_retained_first_fragment_context_in_both_families() {
+        use honk_netstack::wire;
+        let ingress = Ingress {
+            scope: honk_datapath::ScopeId::HOST,
+            namespace: 19,
+            ifindex: 7,
+            attachment: 13,
+            mark: honk_datapath::forward::MarkProvenance::BeforeSkb,
+        };
+        for ipv6 in [false, true] {
+            let source = if ipv6 {
+                "[fd00::1]:40000"
+            } else {
+                "192.0.2.1:40000"
+            }
+            .parse()
+            .unwrap();
+            let destination = if ipv6 {
+                "[fd00::2]:41000"
+            } else {
+                "192.0.2.2:41000"
+            }
+            .parse()
+            .unwrap();
+            let mut whole = [0; 128];
+            wire::udp::emit_packet(&mut whole, source, destination, &[0x5a; 32]).unwrap();
+            let quote = if ipv6 {
+                let mut fragment = whole[..40].to_vec();
+                fragment[0] = 0x6b;
+                fragment[1] = 0x80;
+                fragment[6] = 44;
+                fragment[4..6].copy_from_slice(&32u16.to_be_bytes());
+                fragment.extend_from_slice(&[17, 0, 0, 1, 0, 0, 0, 9]);
+                fragment.extend_from_slice(&whole[40..60]);
+                fragment
+            } else {
+                let mut fragment = whole[..40].to_vec();
+                fragment[1] = 0xb8;
+                fragment[2..4].copy_from_slice(&44u16.to_be_bytes());
+                fragment[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+                fragment[10..12].fill(0);
+                let checksum = wire::checksum::checksum(&fragment[..20]);
+                fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+                fragment
+            };
+            let metadata = transit::quote_metadata(&quote).unwrap();
+            assert_eq!(metadata.header_len, if ipv6 { 48 } else { 20 });
+            let query = timeout_query(ingress, metadata).unwrap();
+            assert_eq!(query.ingress, ingress);
+            assert_eq!(
+                (query.source, query.destination),
+                (source.ip(), destination.ip())
+            );
+            assert_eq!(
+                (query.traffic_class, query.protocol, query.ports),
+                (0xb8, 17, Some((40000, 41000)))
+            );
+        }
+    }
+
+    #[test]
+    fn timeout_quote_never_turns_missing_tcp_flags_into_zero() {
+        use honk_netstack::{FragmentLimits, wire};
+        let now = Instant::now();
+        let source = "192.0.2.1".parse().unwrap();
+        let destination = "192.0.2.2".parse().unwrap();
+        let mut whole = [0; 44];
+        wire::emit_ip_header(&mut whole, source, destination, 6, 24).unwrap();
+        whole[20..22].copy_from_slice(&40000u16.to_be_bytes());
+        whole[22..24].copy_from_slice(&41000u16.to_be_bytes());
+        whole[32] = 0x50;
+        whole[33] = 4;
+        let mut checksum = wire::checksum::Checksum::pseudo(source, destination, 6, 24);
+        checksum.add(&whole[20..]);
+        whole[36..38].copy_from_slice(&checksum.finish().to_be_bytes());
+        assert!(
+            transit::quote_metadata(&whole).is_none(),
+            "known RST must not elicit a refusal"
+        );
+        whole[33] = 2;
+        assert!(
+            transit::quote_metadata(&whole[..28]).is_none(),
+            "missing flags are unknown, not non-RST"
+        );
+        let fragment = |offset: usize, more: bool| {
+            let mut bytes = whole[..20].to_vec();
+            bytes.extend_from_slice(&whole[20 + offset..28 + offset]);
+            bytes[2..4].copy_from_slice(&28u16.to_be_bytes());
+            bytes[6..8].copy_from_slice(
+                &((offset / 8) as u16 | if more { 0x2000 } else { 0 }).to_be_bytes(),
+            );
+            bytes[10..12].fill(0);
+            let checksum = wire::checksum::checksum(&bytes[..20]);
+            bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+            bytes
+        };
+        let budget = MemoryBudget::new(1 << 20);
+        let mut reassembly =
+            transit::Transit::new(budget.clone(), FragmentLimits::default()).unwrap();
+        assert!(
+            reassembly
+                .reassemble(now, &fragment(0, true))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reassembly
+                .reassemble(now, &fragment(16, false))
+                .unwrap()
+                .is_none()
+        );
+        reassembly.expire(now + Duration::from_secs(31));
+        let quote = reassembly.poll_expired_quote().unwrap();
+        assert_eq!(
+            quote.len(),
+            28,
+            "do not quote zero-filled bytes from the hole at offset8"
+        );
+        assert!(transit::quote_metadata(&quote).is_none());
+        drop(reassembly);
+        assert!(budget.used() > 0);
+        drop(quote);
+        assert_eq!(budget.used(), 0);
+    }
+}

@@ -179,6 +179,54 @@ global {
 }
 ```
 
+## Capture backend selection
+
+Omitting `datapath` preserves the existing TC backend. Full-XDP is an explicit Linux
+selection, not a fallback when TC or native continuation is unavailable:
+
+```dae
+global {
+    nfqueue_enable: false
+    dial_mode: ip
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        lan0: lan
+        wan0: wan
+    }
+}
+```
+
+`direct` must be `core` (final Direct packets use CoreForward) or `endpoint`
+(Direct TCP terminates and relays). Interface roles are trusted ingress LAN/WAN
+zones, not execution dispositions; every discovered RX queue is required.
+Do not also set `global.lan_interface` or `global.wan_interface` for XDP.
+The backend, Direct profile, effective AF_XDP binding mode, and interface/zone setup
+require restart. Supported firewall/NAT rules use transactional policy publication.
+Unknown settings and native/marked continuation requests are rejected, not ignored.
+Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
+including empty nested blocks, are rejected rather than ignored.
+
+`xsk_mode` accepts `copy` or `zerocopy`; omission keeps `copy`. `zerocopy` forces
+that mode for every selected RX queue, with no Copy retry or fallback. Advertised
+zero-copy/segment capability and complete-packet frame commitments are checked
+for all devices before the first attachment; every successful bind must also
+agree with the kernel's `XDP_OPTIONS_ZEROCOPY` readback. Queue logs report that
+observed mode. Omitted and explicit `copy` are equivalent for reload; changing
+to or from `zerocopy` requires restart. TC rejects an explicit `xsk_mode`.
+
+Core Direct requires `dial_mode: ip` and no domain/sniff predicates. XDP Endpoint
+routing does not invent process or per-flow MAC facts. A pre-existing, independently
+validated bypass-mark routing table must isolate daemon socket traffic onto
+uncaptured uplinks; this example alone does not establish that topology.
+Core's input-context FIB contract currently rejects nonzero IPv6 flow labels and
+router-specific extension/options execution that it cannot preserve. Endpoint IPv6
+support does not establish equivalent Core authority for those packet combinations.
+See [Full-XDP startup and limitations](../design/datapath.md) for device, VLAN,
+scatter/gather, retained-memory, pinned-guard, and stock-kernel admission boundaries.
+
 ## Related docs
 
 - [Configuration guide](../configuration.md)

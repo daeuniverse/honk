@@ -564,3 +564,119 @@ async fn fragmented_packet_udp_reaches_real_outbound_and_returns_every_byte() {
     .await
     .expect("owned reassembly must traverse the actual UDP dispatcher");
 }
+
+#[tokio::test]
+async fn admitted_udp_keeps_route_and_mode_after_publication() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, scope_owner) = scope(&budget);
+        let (mut plane, _health) = local_plane().await;
+        let mode = Arc::new(parking_lot::RwLock::new(crate::mode::ModeState::new(
+            "Rule", "block",
+        )));
+        plane.set_mode_state(Arc::clone(&mode));
+        let handle = plane.spawn_handle();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = "192.0.2.10:41000".parse().unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let mut snapshot = handle
+            .prepare_packet_routing_snapshot(
+                source,
+                destination,
+                "udp",
+                0,
+                #[cfg(feature = "native-api")]
+                false,
+            )
+            .await
+            .unwrap();
+        snapshot.admission_final = true;
+        let admission = EndpointAdmission::new(snapshot, &budget).unwrap();
+        let mut next = (**handle.config.read().await).clone();
+        next.routing.default_outbound = "block".into();
+        *handle.router.write().await = crate::routing::Router::from_config(&next.routing).unwrap();
+        *handle.config.write().await = Arc::new(next);
+        *mode.write() = crate::mode::ModeState::new("Global", "block");
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
+            .await
+            .unwrap();
+        let owner = tokio::spawn(owner.run());
+        let mut packet = [0; 128];
+        let length = wire::udp::emit_packet(&mut packet, source, destination, b"admitted").unwrap();
+        endpoints
+            .receive_admitted_with_source(
+                scope.scope(),
+                &packet[..length],
+                Instant::now(),
+                admission,
+                false,
+                |_, _| true,
+            )
+            .unwrap();
+        assert!(
+            endpoints.retains(scope.scope(), source, destination, 17),
+            "ordinary UDP owns execution before any async dispatch"
+        );
+        assert!(!endpoints.retains(ScopeId::HOST, source, destination, 17));
+        assert!(!endpoints.retains(scope.scope(), destination, source, 17));
+        let mut bytes = [0; 32];
+        let (length, _) = upstream.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], b"admitted");
+        endpoints.shutdown().await.unwrap();
+        assert!(
+            !endpoints.retains(scope.scope(), source, destination, 17),
+            "joined retirement releases tuple ownership"
+        );
+        owner.await.unwrap().unwrap();
+    })
+    .await
+    .expect("delayed UDP must retain its admitted execution");
+}
+
+#[tokio::test]
+async fn queued_udp_owner_is_exactly_retired_on_close_and_not_created_on_queue_refusal() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, scope_owner) = scope(&budget);
+        let (plane, _health) = local_plane().await;
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
+            .await
+            .unwrap();
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let source = "192.0.2.10:41000".parse().unwrap();
+        let mut packet = [0; 128];
+        let length = wire::udp::emit_packet(&mut packet, source, destination, b"queued").unwrap();
+        let producers: Vec<_> = (0..INGRESS_CAPACITY)
+            .map(|_| endpoints.sender.try_reserve().unwrap())
+            .collect();
+        let mut validated = false;
+        let error = endpoints
+            .receive_with_source(
+                scope.scope(),
+                &packet[..length],
+                Instant::now(),
+                false,
+                |_, _| {
+                    validated = true;
+                    true
+                },
+            )
+            .unwrap_err();
+        assert!(validated);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(!endpoints.retains(scope.scope(), source, destination, 17));
+        drop(producers);
+        endpoints
+            .receive(scope.scope(), &packet[..length], Instant::now())
+            .unwrap();
+        assert!(endpoints.retains(scope.scope(), source, destination, 17));
+        endpoints.close();
+        assert!(endpoints.retains(scope.scope(), source, destination, 17));
+        endpoints.shutdown().await.unwrap();
+        assert!(!endpoints.retains(scope.scope(), source, destination, 17));
+        owner.run().await.unwrap();
+    })
+    .await
+    .expect("closing queued UDP joins the original lease retirement");
+}

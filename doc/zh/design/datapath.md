@@ -2,6 +2,94 @@
 
 内核侧拦截见本页；用户态路径见[控制平面](./control-plane.md)，持有首包的 UDP 路径见 [NFQUEUE](./nfqueue.md)。
 
+## Full-XDP 启动
+
+未配置 `datapath` 时仍默认使用 TC。Full-XDP 是显式选择的真实 daemon 后端，不是 XSK fixture，也不会回退到 TC/NFQUEUE/TUN：
+
+```dae
+global {
+    dial_mode: ip
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+}
+datapath {
+    backend: xdp
+    direct: core
+    interface {
+        dut0: lan
+        dut1: wan
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+`direct: endpoint` 通过现有 packet Endpoint 终止 Direct TCP/UDP，再使用 outbound relay；`direct: core` 则通过 Core forwarding owner 与带输入上下文的内核 FIB 保留 transit 语义。`lan`/`wan`（模型中的 `Lan`/`Wan`）是接口角色，不是执行模式。选择 XDP 必须指定 `backend: xdp` 与显式 Direct profile；无效配置在内核挂载前拒绝。不要同时使用 TC 的 `global.lan_interface`/`wan_interface`。所有选中接口的全部 RX 队列均打开，每队列一个 ring owner，跨端口/队列共享一个 routing-domain owner。后端、profile 与设备变化要求重启；firewall/NAT 规则通过事务式 generation 发布，拒绝更新时保留原有效策略。
+
+启动前必须准备与有效 bypass mark 精确匹配、优先于 `main` 的 RPDB rule，指向专用表；对每个已启用源地址族，该表都须有经过**未捕获** uplink 的默认路由。`so_mark_from_dae` 指定此 mark（示例为 `0x100`）；它不是 `CLASSIFIED_MARK`，也不能恢复已捕获的原始 skb。捕获的以太网端口必须完全无地址，包括 IPv6 link-local。Core transit 路由及邻居由内核 routing domain 管理。stock 内核 native continuation、非零 native rule mark、不支持的 socket/process 条件及 native local/wildcard listener 假设不会被悄悄替换成 Core 或 Endpoint；仅有 FIB Local 结果不足以证明本地 socket 归属。DNS53 仍走规范策略。
+
+mark 专用表预检只证明**出站路由隔离**，不能证明远端网络不会非对称回程。
+自身未连接 UDP、分片、IPv4 options 和 IPv6 扩展头回复不会获得 connected-socket
+原生豁免；若进入捕获端口，仍按所选 packet policy 处理。必须把自身回程放在未捕获
+uplink；XDP socket-lookup helper 不会让这种不支持的拓扑自动等价。wildcard 查询
+不能区分 transit 与 LocalInput。路由/地址/链路/rule 通知丢失或变化会关闭捕获，
+但这不是内核路由修改的原子屏障。
+
+Endpoint 回复身份以逻辑 scope 和源 IP 为键，共用 4096 项表。只有不再被协议状态、
+TIME_WAIT、initializer/source receiver、DNS 工作及排队/已导出输出持有的条目才可
+回收。冲突的 MAC/VLAN 声明不能替换活跃 owner，陌生 RST 不能学习或毒化 peer；
+静默条目的冲突仍保留 60 秒，表满也不能绕过。若全表均被持有则拒绝新 peer，不抢占
+回复路径。完整 VLAN TCI 随输出导出并保留到 TX credit 等待之后。需要不可用原始
+MAC/process 来源事实的 firewall/NAT 谓词在捕获准入前拒绝。
+
+所有捕获逻辑域的 MTU 都必须至少为 1280，包括可能 handoff 给 Endpoint 的 Core
+profile；不兼容逻辑域在挂载前拒绝。捕获入口在挂载前选择两种合同之一：已验证关闭
+RX VLAN stripping、且不需要恢复标签的物理设备使用 wire-only 解码，由自有 XSK
+提供设备/队列权威，并从实际字节解析 inline L2；不读取或伪造 metadata 前缀。
+需要 metadata 的路径保留 32 字节 v2 producer 记录，通过真实 device-bound
+`bpf_xdp_metadata_rx_vlan_tag` kfunc 获取标签，函数 ID 由内核 BTF 解析。
+veth 必须使用该路径，因为本地关闭 RX stripping 不能限制对端 TX 插入标签。
+恢复的一层加 inline 标签最多两层；缺失或畸形 metadata 不会触发 wire-only 回退。
+最小帧填充上限仅按每层 **inline** VLAN 增加四字节。
+
+就绪前会重新核对设备事实与 topology 订阅。内核没有通用 `data_meta` 能力通告；
+必须的 metadata 调整失败时丢包，并与 capture 分开计数。runtime 至多每秒采样一次，
+观察到失败后关闭捕获，不承诺一秒硬上限，也不把它称为任意驱动的启动前能力证明。
+device-bound 程序必须以真实入站验证，不能使用 `BPF_PROG_TEST_RUN`。
+
+L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和 IP 特殊地址
+处理保留；定向广播取自最多 64 条精确的本地表 `RTN_BROADCAST` 路由，不猜后缀。
+
+daemon 默认使用 AF_XDP Copy；`datapath.xsk_mode: zerocopy` 对所有选中队列
+要求强制 ZeroCopy。每条 RX 队列必须有对应 TX 队列；共用预检在挂载任何 guard
+前检查设备/frame 承诺。实际队列准入仍复核设备事实及 bind 回读。较晚失败时保留
+fail-closed guard，
+不重试 Copy；模式变化要求重启。
+
+
+使用新构建的真实 daemon：`honk-core -c config.dae --bpf-pin-root <私有-bpffs-目录>`，不要传 `--mock-ebpf`。就绪日志为 `XDP datapath ready`。XDP 路径不创建 TC hook、NFQUEUE、`dae0` 或 `daens`。默认使用软件校验和。
+
+SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 veth smoke
+在 Copy 模式覆盖 MTU 1500 和 9000：每次 UDP 回复必须是单个完整数据报，
+jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096 字节、完整且
+未分片的 IP 包。物理 NIC zero-copy、jumbo 性能与 DMA 释放仍需各自证据。
+
+XDP 拥有规范的内存内 routing、domain 与 health 发布，而非 Mock 或 TC 后端。native API 报告的 datapath kind 为 `userspace`，不声称拥有硬件计数器或 program/attachment 清单；实际 capture admission 由 runtime 共享 gate 提供。kernel witness recording 与 TC/listener/token API 不受支持。软件 flags 仍走规范发布流程；该后端仅跳过 native UDP staging 与 witness admission。
+
+固定聚合计数区分队列/credit/容量拒绝、native-ID 历史精度下降及成功 peer 回收。
+只有实际拒绝 episode 会告警，持续压力以 debug 汇总，不逐包写日志。
+debug 级别下，同一 sampler 至多每秒报告一次各队列的内核 socket 统计、ring
+索引与 port 计数；读取错误保持显式，空 ring 遭遇次数和 wakeup 错误不能相加
+当成丢包数。
+
+移除 custody 前先停止流量源。正常关闭报告 `XDP admission closed; UMEM retained until process exit`；netdev 上的 XDP 挂载作为 fail-closed guard 保留，`guard`/`data` program pin 位于 `<bpf-pin-root>/xdp-<ifindex>/`。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。接口仍有 XDP 挂载时启动会拒绝。停源并确认当前程序 ID 属于本实例 guard 后，先移除该挂载（`ip link set dev <接口> xdp off`），再只删除其自有 pin。不存在自动零驻留热重开：保留 UMEM 仍计入进程生命周期 **512 MiB** 上限；close 或空 ring 不证明 DMA 释放。
+
+`.github/ci/xdp-daemon-smoke.sh` 已由完整 floor/recent disposable-VM gate 使用匹配的预构建 daemon、Core 和 XSK 测试程序执行，也可在已准备好的 guest 中直接运行。它要求 guest root、Linux 6.12+、namespace、AF_XDP/native-XDP veth、bpffs、iproute2、nft、ethtool 与 Python 3，不构建、安装或下载。每个 Core/VLAN/jumbo 场景同时验证真实 capture 计数、对端载荷及私有 native-forwarding 丢弃围栏；关闭后核对自有 guard 程序 ID，并用同路径正向基线对照受选流量的拒绝，之后才移除自有挂载。门禁还覆盖不对称队列、原生控制流量、带填充 VLAN 帧，以及省略 datapath 的真实 TC 启动/流量/reload。虚拟场景通过不等于物理 NIC、逐队列/RSS 或性能认证。
+
+smoke 将 daemon 状态保存在私有 `/run` tmpfs，关闭后再归档。guest cgroup2
+挂载放在 `/sys` 之外，避免 `ip netns exec` 为 TC 回归重挂 sysfs 时隐藏该层级。
+
 ## 网络命名空间与挂钩架构
 
 普通代理路径通过隔离的网络命名空间重定向数据包，而不依赖主机侧 TPROXY 规则：
@@ -271,6 +359,83 @@ Removal worker 每批最多处理 1,024 项 TCP/UDP/过期请求，使用 [NFQUE
 Backend API 使用 `TuplesKey`/`ConnState`、有界 map 扫描和条件退役。旧 `ConnTuple` CRUD、字符串 IP/域名路由、参数缓存 setter 与 backend 统计适配器已删除；加载时配置的 `DaeParam` global、带 generation fence 的 IP/规则位投影、`StatsManager` 和 pinned `OUTBOUND_STATS` 仍是正式路径。
 
 `just test-netns` 包含生产 TC 报文回归：完整反向 tuple 的 RX 计数、缓存路由的健康/就绪政策，以及 LAN 与 WAN egress 的本机 ICMPv6 Redirect 抑制。L2 使用 `BPF_PROG_TEST_RUN`；L3 使用隔离网络命名空间内的真实 TUN 接口，并验证转发报文与卸载 hook 后的对照行为。
+
+## Core 转发防火墙与 IPv4 NAT
+
+可选的[强类型防火墙/NAT 配置](../reference/routing.md#core-转发防火墙与-ipv4-nat)
+扩展现有 CoreForward owner，不是第二套执行器，也不反向解析 nftables。
+阶段顺序是捕获域/接口身份、已有原始/回复 binding、原始事实防火墙与 DNAT、
+真实输入 FIB、转换后事实转发防火墙、SNAT，然后复用 TTL/MTU/校验和及设备
+输出路径。条件沿用规范流量编译器与 matcher，allow/drop/reject 与转换动作
+则保留独立的强类型语义。
+
+一个有界表按精确逻辑入口身份保留原始与 DNAT alias；不同 LAN/VLAN 接口可
+并存相同私网元组。完整转换后的反向 alias 与公网地址/端口分配器仍在
+namespace/scope 域内共享。各方向绑定真实 ifindex 与 attachment incarnation，
+错误接口不能借用许可。TCP 由 SYN 开始准入，必须观察匹配序号及
+确认号的 SYN-ACK 和最终 ACK 才进入 established。已建立 owner 保留实际观察到的
+握手证明，允许匹配的 SYN/SYN-ACK 重传（包括既有 SYN 数据与同时打开），但新
+SYN 序号不能接管元组。UDP 反向所有权限定精确对端，不把公网端口作为通配许可。
+首包接收时间隔离更早的排队输入；空闲新鲜度同样依据接收事件，而当前处理时间
+驱动超时与容量清理。IPv6 使用同一防火墙 owner，但不做地址转换。IPv4 NAT
+地址必须满足 transit 单播校验，除回环、多播和有限广播外，也拒绝
+`0.0.0.0/8` 与 `240.0.0.0/4`。
+
+已建立 TCP binding 的空闲期限为 7440 秒，UDP 为 120 秒；握手/关闭证明状态保留
+30 秒期限。没有接收窗口权威时，FIN/RST 标志本身不能缩短 established 保护。
+当前 traffic Block 先于可变 lookup：被拒包既不续期 binding，也不分配转换 ID。
+
+表存储与每个 binding 的 Arc 元数据在分配前计费；改包使用 Core 已计费的
+原始缓冲区。端口搜索跳过依赖候选端口的自身 alias 冲突；冲突或端口池耗尽
+不发布任何部分 alias。超时、策略撤销及 MASQUERADE
+地址移除立即关闭准入，但输出 lease 在真实资源归还前继续保留 binding、端口
+与费用。仅修改流量路由不改变安全 epoch；防火墙/NAT 或相关捕获 GeoIP 变化
+在发布前推进 epoch，移除再启用也不会将其重置。失败候选保留原编译 sidecar。
+路由刷新不会迁移 owner。runtime 慢表为 1024 项（纯 API 最多允许 4096 项），
+使用线性查询/分配；这不构成 fast-path、卸载或性能验证声明。
+
+NAT 为转换后的 DF-clear IPv4 数据报分配不同 ID，包括只会在下游分片的包；
+DF-set atomic 流量不需要这项分配。全局计费身份目录最多保留
+`min(binding_capacity × 64, 65536)` 个数据报（daemon 为 65536），输出及 CQ
+owner 保留 binding/quote 权威。观察到最后一个 owner 归还后，还要隔离 120 秒
+才能复用。这采用 RFC 6864 的惯例最大数据报寿命，不保证任意更长的远端分片
+队列或网络延迟。耗尽只拒绝当前包，不复用活跃 ID；保守的全局池即使不计额外
+持有时间，也可能把持续 DF-clear 转换限制在约 546 个数据报/秒，不能宣称高吞吐 NAT。
+
+Core 在尚未启用 firewall/NAT 策略时就记录不授予权限的原生 IPv4 ID 历史，覆盖
+普通包先于 NAT、NAT 先于普通包两种顺序。未改写 ID 被记住，只有与保留转换输出
+碰撞的普通包才重映射 ID。输出/quote lease 不代表 conntrack grant，并跨 CQ、
+策略变更及首次启用 NAT 保留。授权始终使用收到的 wire facts；原生 quote 的 ID
+只在最终转发前恢复，不在 lookup 或邻居等待前修复。ICMP echo 标识仍参与匹配。
+
+精确原生历史另有 `min(capacity × 64, 65536)` 项上限，不占用 managed-ID 池；
+重复原始 ID 复用历史。目录或预算耗尽时，预先计费的逐 ID 计数器仅把未知 ID
+保守地在全域保留，不丢普通转发，也不把转换数据报的速率上限强加给普通流量。
+overflow 等待最后 owner 归还，再等待 120 秒加 Core 有界重组期限（当前 30 秒）；
+完成的 quote 在任何过期或排队前取得独立保留。这只在饱和时降低域区分精度；
+确实需要转换但没有可证明安全 ID 的包仍被拒绝，不复用活跃身份。
+
+历史与实际 conntrack/managed-ID 存储分别计费，后者按需分配。overflow owner
+包含 65536 项原子引用计数/退休时刻及有界 bitmap，保留至最后输出/quote guard
+归还。动态身份记录持有独立 reservation，table 丢弃也不会提前退还导出 lease
+仍占用的内存。这些是逻辑内存边界，不是进程 RSS 或高吞吐 NAT 认证。
+
+分片复用现有重组器，不新建 NAT 重组器，也不虚构非首片端口。存活/正在完成的
+重组及导出的 timeout quote 只保留其可能关联的 scoped 地址/协议域；tombstone
+和不相关分片不能重置全表身份退休时钟。仅在完整包及校验和验证后转换，
+之后的分片仍由 CoreForward 处理。
+已准入 IPv4 ICMP 错误引用会还原内层地址、端口、原 ID 及实际存在的校验和字段；
+仅含八字节 TCP 首部的引用不会读取不存在的校验和。非首片引用使用保留的 ID
+权威，绝不把载荷当作端口。IPv4 UDP 零校验和保持零；未知/截断引用及不支持
+的引用扩展布局 fail-closed，IPv6 related 错误不代表支持 IPv6 NAT。
+
+必要的非特权回归位于 `honk-datapath::firewall::tests`、
+`honk-core::routing::firewall::tests` 和 `honk-config/tests/firewall.rs`。
+集成 owner 生成测试产物后，无需重新构建的 smoke 入口为：直接运行现有
+datapath 测试可执行文件并传入 `firewall::tests`，运行 core 测试可执行文件并
+传入 `routing::firewall::tests`，以及直接运行 config 的 `firewall` 集成测试
+可执行文件。无需操作主机接口、加载 BPF 或创建网络命名空间。源码实现及这些
+报文测试不证明设备/硬件、真实内核或性能已验证；完整跨后端验证矩阵仍属独立阶段。
 
 ## 相关文档
 

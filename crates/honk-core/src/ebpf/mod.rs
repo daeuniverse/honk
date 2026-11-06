@@ -3,8 +3,10 @@
 pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
+mod policy_state;
 pub mod probe;
 mod retirement;
+pub mod userspace;
 pub use retirement::*;
 #[cfg(feature = "ebpf")]
 pub mod real;
@@ -333,6 +335,7 @@ pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
 pub enum DatapathKind {
     Real,
     Mock,
+    XdpUserspace,
     Unknown,
 }
 

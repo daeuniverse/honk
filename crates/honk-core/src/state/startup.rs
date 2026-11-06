@@ -315,6 +315,27 @@ mod state_claim_tests {
     async fn a_native_bind_failure_rolls_back_started_owners_before_returning() {
         use std::os::unix::fs::PermissionsExt as _;
 
+        const CHILD: &str = "HONK_NATIVE_BIND_ROLLBACK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "state::startup::state_claim_tests::a_native_bind_failure_rolls_back_started_owners_before_returning",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let directory = tempfile::tempdir().unwrap();
         let data_dir = directory.path().join("data");
         std::fs::create_dir(&data_dir).unwrap();

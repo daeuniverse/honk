@@ -113,7 +113,12 @@ pub(crate) async fn capture_assets(
     let router = traffic_router.read().await;
     let config = config.read().await;
     let mut assets = router.geo_assets().to_vec();
-    for asset in dns.geo_assets() {
+    for asset in router
+        .firewall_policy()
+        .into_iter()
+        .flat_map(|policy| policy.geo_assets().iter().cloned())
+        .chain(dns.geo_assets())
+    {
         if let Some(previous) = assets
             .iter_mut()
             .find(|previous| previous.kind == asset.kind)
@@ -257,7 +262,7 @@ pub(crate) fn project(
 ) -> GeoData {
     let secrets = sources.secrets_with(active);
     let status = geodata.map(|geodata| {
-        let requirements = GeoRequirements::for_traffic(&active.routing.rules).union(
+        let requirements = GeoRequirements::for_forwarding(active).union(
             &crate::dns::routing::DnsRouter::geo_requirements(&active.dns),
         );
         let mut status = geodata.status_json(timestamp);

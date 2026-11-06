@@ -72,6 +72,15 @@ impl ControlPlaneHandle {
         };
         drop(backend);
         Ok(PacketRoutingSnapshot {
+            mode: super::handoff::ModeDecision {
+                name: decision.outbound.clone(),
+                constraint: Default::default(),
+                #[cfg(feature = "native-api")]
+                group_id: None,
+            },
+            mode_state: None,
+            admission_final: true,
+            memory: None,
             decision,
             config: Arc::clone(&config),
             group_manager: self.group_manager.read().clone(),
@@ -140,10 +149,14 @@ impl ControlPlaneHandle {
 
     async fn serve_tcp_input(
         &self,
-        input: TcpInput,
+        mut input: TcpInput,
         client_addr: SocketAddr,
         original_dst: SocketAddr,
     ) -> anyhow::Result<()> {
+        let admitted_route = match &mut input {
+            TcpInput::Packet(stream) => stream.take_routing(),
+            TcpInput::Kernel(_) => None,
+        };
         let packet_dscp = match &input {
             TcpInput::Packet(stream) => Some(stream.dscp()),
             TcpInput::Kernel(_) => None,
@@ -197,17 +210,20 @@ impl ControlPlaneHandle {
                 observation.routing_started();
 
                 let pinned_route = if !flow.is_kernel() {
-                    Some(
-                        self.prepare_packet_routing_snapshot(
-                            client_addr,
-                            original_dst,
-                            "tcp",
-                            packet_dscp.expect("packet stream carries admitted DSCP"),
-                            #[cfg(feature = "native-api")]
-                            observation.is_recording(),
-                        )
-                        .await?,
-                    )
+                    Some(match admitted_route {
+                        Some(snapshot) => snapshot,
+                        None => {
+                            self.prepare_packet_routing_snapshot(
+                                client_addr,
+                                original_dst,
+                                "tcp",
+                                packet_dscp.expect("packet stream carries admitted DSCP"),
+                                #[cfg(feature = "native-api")]
+                                observation.is_recording(),
+                            )
+                            .await?
+                        }
+                    })
                 } else if original_dst.port() == 53 {
                     let handoff = handoff.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("transparent TCP DNS has no routing handoff")
@@ -228,9 +244,9 @@ impl ControlPlaneHandle {
                     None
                 };
                 if original_dst.port() == 53
-                    && !pinned_route.as_ref().is_some_and(|route| {
-                        route.decision.must || route.decision.outbound == "block"
-                    })
+                    && !pinned_route
+                        .as_ref()
+                        .is_some_and(|route| route.decision.must || route.mode.name == "block")
                     && !handoff
                         .as_ref()
                         .is_some_and(|handoff| handoff.outbound == OutboundIndex::Block as u8)
@@ -354,6 +370,8 @@ impl ControlPlaneHandle {
                 let mut pinned_native = pinned_route
                     .as_ref()
                     .and_then(|snapshot| snapshot.native.clone());
+                let mut admitted_mode = None;
+                let mut _routing_memory = None;
                 let (mut route, pinned_generation) = if let Some(mut snapshot) = pinned_route {
                     if !flow.is_kernel() {
                         self.route_packet_with_sniffed(
@@ -366,6 +384,8 @@ impl ControlPlaneHandle {
                         )
                         .await?;
                     }
+                    admitted_mode = Some(snapshot.mode);
+                    _routing_memory = snapshot.memory;
                     (
                         snapshot.decision,
                         Some((snapshot.config, snapshot.group_manager, snapshot.runtime)),
@@ -387,7 +407,12 @@ impl ControlPlaneHandle {
                 observation.routed(&mut route);
                 let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
                 let matched_rule = route.matched_rule.take();
-                let mode_decision = self.apply_mode_override(&mut route).await;
+                let mode_decision = if let Some(mode) = admitted_mode {
+                    route.apply_final_outbound(Some(mode.name.clone()));
+                    mode
+                } else {
+                    self.apply_mode_override(&mut route).await
+                };
                 let outbound_name = mode_decision.name;
                 let mode_constraint = mode_decision.constraint;
                 observation.mode_applied(&outbound_name);

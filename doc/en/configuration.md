@@ -7,6 +7,7 @@ honk uses a dialect of dae configuration syntax; the [dialect reference](./refer
 | Section | Purpose | Reference |
 | --- | --- | --- |
 | `global` | Select interfaces, dial behavior, health checks, and runtime paths. | [Global reference](./reference/global.md) |
+| `datapath` | Explicitly select Linux XDP capture and Direct execution, with optional Core firewall/NAT. Omission preserves TC. | [Capture backend selection](./reference/global.md#capture-backend-selection), [firewall/NAT](./reference/routing.md#core-forwarding-firewall-and-ipv4-nat) |
 | `node` | Declare static proxy nodes as share links. | [Node reference](./reference/nodes.md) |
 | `group` | Select among nodes and nested groups. | [Group reference](./reference/groups.md) |
 | `routing` | Apply ordered traffic rules and a fallback outbound. | [Routing reference](./reference/routing.md) |
@@ -27,7 +28,7 @@ honk injects the built-in outbounds `direct` and `block` at startup. They may be
 - Second-based durations accept bare seconds or `ms`, `s`, `m`, and `h` suffixes. Millisecond settings such as `check_tolerance` accept bare milliseconds, `ms`, or `s`.
 - An unquoted token-head `#` starts a comment; hashes inside bare values remain data. Entry readers also accept a glued `#` after a closing link quote or subscription `(UA)` suffix, with `legacy-glued-hash`; put whitespace before comments. Token-head comment braces never close blocks.
 - Braces inside matching single or double quotes are data. An unmatched closing `}` is ignored with a diagnostic; an unclosed block rejects the document. Detailed diagnostics carry physical line numbers where the current reader provides them; error text never echoes arbitrary input.
-- Unknown scalar keys are diagnosed and ignored. Unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains; unknown outer experimental settings and unsupported legacy NFQUEUE content are errors.
+- In lenient sections, unknown scalar keys are diagnosed and ignored, and unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains. Unknown outer `experimental` settings and unsupported legacy NFQUEUE content are errors. The `datapath` extension is strict: unknown settings/blocks, duplicate settings/subblocks, invalid values, and unsupported firewall/NAT compositions reject the configuration; they are not ignored. See the [dialect reference](./reference/dialect.md#sections-and-includes).
 
 ### Splitting a configuration with `include {}`
 
@@ -47,6 +48,8 @@ Only top-level `include` accepts an opener on a later line, with a `legacy-inclu
 Every relative include, including one in a nested included file, resolves against the directory containing the entry config passed to `--config`. The loader canonicalizes the entry directory and every match; an absolute path or symlink target outside that directory is rejected. Loading the same canonical file twice, directly or through a cycle, is also rejected.
 
 The entry file's own sections merge first regardless of where its `include` block appears, followed by each included file and its descendants. Later scalar keys override earlier values. Collection entries such as nodes, subscriptions, groups, DNS upstreams, fixed TTLs, and routing rules append in merge order.
+
+The strict `datapath` section is an exception to scalar override merging: its `backend`, `direct`, `xsk_mode`, `interface`, `firewall`, and `nat` declarations may each occur at most once across all merged sections, including included files. Duplicate declarations reject the configuration rather than overriding or appending.
 
 ## Runtime data directory
 

@@ -5,7 +5,7 @@ use crate::control::udp_endpoint::UdpEndpoint;
 use crate::dns::query::{IngressProfile, is_exact_dns_query, validate_exact_dns_query};
 #[cfg(feature = "native-api")]
 pub(super) mod reload_harness;
-pub(super) mod support;
+pub(crate) mod support;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 use support::KernelUdpReplySocketFactory;
 use support::{

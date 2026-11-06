@@ -8,6 +8,7 @@ use std::{net::IpAddr, sync::Arc};
 
 mod domain;
 mod fingerprint;
+pub(crate) mod firewall;
 mod geo;
 mod ir;
 #[cfg(any(feature = "ebpf", test))]
@@ -194,9 +195,76 @@ pub struct Router {
     domain_matchers: Arc<[DomainMatcher]>,
     direct_marks: Arc<[u32]>,
     policy_fingerprint: [u8; 32],
+    firewall: Option<Arc<firewall::FirewallPolicy>>,
+    security_epoch: u64,
 }
 
 impl Router {
+    /// Prepare under the existing configuration transaction, before this Router is
+    /// pinned/published. Traffic route changes do not revoke unchanged security state.
+    pub(crate) fn bind_firewall(
+        &mut self,
+        config: &honk_config::Config,
+        previous: Option<&Router>,
+        sources: &GeoSourceSet,
+        shared: &mut SharedMatchers,
+    ) -> anyhow::Result<()> {
+        if let Some(datapath) = &config.datapath {
+            datapath.validate()?;
+        }
+        let configured = config.datapath.as_ref().and_then(|datapath| {
+            datapath
+                .firewall
+                .as_ref()
+                .map(|firewall| (firewall, &datapath.nat))
+        });
+        let old = previous.and_then(|router| router.firewall.as_ref());
+        let unchanged = previous.map_or(configured.is_none(), |router| {
+            router.firewall_matches(config, sources)
+        });
+        let epoch = previous.map_or(0, |router| router.security_epoch);
+        if unchanged {
+            self.firewall = old.cloned();
+            self.security_epoch = epoch;
+            return Ok(());
+        }
+        let epoch = epoch
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("firewall security epoch exhausted"))?;
+        let candidate = configured
+            .map(|(firewall, nat)| {
+                firewall::FirewallPolicy::compile(firewall, nat, sources, shared).map(Arc::new)
+            })
+            .transpose()?;
+        self.firewall = candidate;
+        self.security_epoch = epoch;
+        Ok(())
+    }
+
+    pub(crate) fn firewall_policy(&self) -> Option<&Arc<firewall::FirewallPolicy>> {
+        self.firewall.as_ref()
+    }
+    pub(crate) fn security_epoch(&self) -> u64 {
+        self.security_epoch
+    }
+    pub(crate) fn firewall_matches(
+        &self,
+        config: &honk_config::Config,
+        sources: &GeoSourceSet,
+    ) -> bool {
+        let configured = config.datapath.as_ref().and_then(|datapath| {
+            datapath
+                .firewall
+                .as_ref()
+                .map(|firewall| (firewall, &datapath.nat))
+        });
+        match (configured, &self.firewall) {
+            (None, None) => true,
+            (Some((firewall, nat)), Some(policy)) => policy.matches(firewall, nat, sources),
+            _ => false,
+        }
+    }
+
     /// Ad-hoc rule set; its fallback carries no configured `must` or mark.
     pub fn new(rules: &[RoutingRule], plain_fallback: &str) -> anyhow::Result<Self> {
         let sources = GeoSourceSet::load(&GeoRequirements::for_traffic(rules));
@@ -255,7 +323,14 @@ impl Router {
         for (source_index, rule) in rules.iter().enumerate() {
             let mut conditions = Vec::new();
             for not in [false, true] {
-                append_conditions(&mut conditions, not, rule, &assets, &mut registry, shared)?;
+                append_conditions(
+                    &mut conditions,
+                    not,
+                    &rule.condition,
+                    &assets,
+                    &mut registry,
+                    shared,
+                )?;
             }
 
             let outbound = rule.outbound.as_str().to_owned();
@@ -344,6 +419,8 @@ impl Router {
             domain_matchers: registry.matchers.into(),
             direct_marks: direct_marks.into(),
             policy_fingerprint,
+            firewall: None,
+            security_epoch: 0,
         })
     }
 
@@ -489,7 +566,7 @@ impl Router {
         route: &CompiledRoute,
         conn: &ConnectionInfo,
         domain_bitmap: Option<&DomainRouting>,
-        mut observe: impl FnMut(usize, bool),
+        observe: impl FnMut(usize, bool),
     ) -> bool {
         let input = PredicateInput {
             domain: conn.domain.as_deref(),
@@ -502,6 +579,23 @@ impl Router {
             mac: conn.mac.as_deref(),
             dscp: conn.dscp,
         };
+        self.matches_input(route, input, domain_bitmap, observe)
+    }
+
+    pub(crate) fn route_input(&self, input: PredicateInput<'_>) -> &RouteAction {
+        self.routes
+            .iter()
+            .find(|route| self.matches_input(route, input, None, |_, _| {}))
+            .map_or_else(|| self.fallback(), |route| &route.action)
+    }
+
+    fn matches_input(
+        &self,
+        route: &CompiledRoute,
+        input: PredicateInput<'_>,
+        domain_bitmap: Option<&DomainRouting>,
+        mut observe: impl FnMut(usize, bool),
+    ) -> bool {
         !route.conditions.is_empty()
             && route
                 .conditions
@@ -606,7 +700,7 @@ pub struct RouteMatch<'a> {
 fn append_conditions(
     conditions: &mut Vec<CompiledCondition>,
     not: bool,
-    rule: &RoutingRule,
+    condition: &honk_config::routing::RoutingCondition,
     assets: &GeoAssets,
     registry: &mut DomainRegistry,
     shared: &mut SharedMatchers,
@@ -614,9 +708,9 @@ fn append_conditions(
     macro_rules! field {
         ($name:ident) => {
             if not {
-                &rule.condition.not.$name
+                &condition.not.$name
             } else {
-                &rule.condition.$name
+                &condition.$name
             }
         };
     }

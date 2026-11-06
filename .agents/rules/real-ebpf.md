@@ -5,7 +5,7 @@ Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
+- `ebpf` — aya real TC backend + `honk-nfqueue`, requires Linux kernel 6.12+; the default TC path otherwise uses `MockEbpfBackend`. Explicit XDP selection uses its userspace policy backend and real XDP/AF_XDP adapter independently of this feature. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds the pinned doona build and fails without an absolute `HONK_DOONA_DIR` (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded`) is not needed.
@@ -61,8 +61,7 @@ its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
 The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
 TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
-native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher and SO_MARK socket checks. Exact nonempty
-selections in the guest gate must remain intact.
+native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher and SO_MARK socket checks. Exact nonempty selections remain intact. The same guest gate then runs the matching real daemon's XDP/native-control/guard smoke and omitted-datapath TC startup/reload, with Core/XSK ignored cases restricted to its owned private namespace.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,

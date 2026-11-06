@@ -20,7 +20,7 @@ Its configuration syntax and TC datapath derive from dae and remain dae-compatib
 
 ## Crate map
 
-The root workspace contains eight crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
+The root workspace contains nine crates. `honk-ebpf` is a separate Cargo project because it targets `bpfel-unknown-none`; it is excluded from the workspace and keeps its own `Cargo.lock`.
 
 | Crate | Workspace | Responsibility |
 | --- | --- | --- |
@@ -28,7 +28,8 @@ The root workspace contains eight crates. `honk-ebpf` is a separate Cargo projec
 | `honk-ebpf-common` | member | `no_std`, `#[repr(C)]` constants and ABI types shared by kernel programs and userspace map writers. |
 | `honk-nfqueue` | member | Raw `NETLINK_NETFILTER` queue `320`, verdict ownership, and the owned nftables transaction. |
 | `honk-netstack` | member | Sans-I/O IPv4/IPv6 TCP/UDP stack used as the inner network of the WireGuard tunnel; depends only on `blake3` and `thiserror`. See [Userspace network stack](./netstack.md). |
-| `honk-datapath` | member | Scoped identities and bounded frame/descriptor ownership used by core's explicit packet Endpoint embedding; no capture/backend configuration. |
+| `honk-datapath` | member | Scoped frame ownership, pure Core transit and stateful firewall/NAT; canonical policy and platform FIB authority remain in core/adapters. |
+| `honk-xsk` | member | Linux XDP/AF_XDP primitives used by the configured daemon and explicit experimental consumers; no deferred-DMA release fence or hardware acceptance claim. |
 | `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the always-compiled Score scorer. |
 | `honk-core` | member | Engine library and binary: eBPF/NFQUEUE runtime, control plane, DNS, routing, relay, and Clash API. |
 | `honk-tool` | member | CLI toolbox for subscription/node probing, datapath diagnostics, pinned-map inspection, and geo-asset queries. |
@@ -135,7 +136,7 @@ flowchart TB
 | `mimalloc` | yes | Pulls in `mimalloc` and `libmimalloc-sys` and installs mimalloc as the `honk-core` binary allocator. On Linux, startup disables transparent huge pages for the process before starting Tokio, and sets mimalloc's purge delay to 100 ms unless `MIMALLOC_PURGE_DELAY` says otherwise. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
-`mock-ebpf` is not a Cargo feature. A build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested, startup logs a warning and disables NFQUEUE staging for that process; the config file is unchanged.
+`mock-ebpf` is not a Cargo feature. For the default TC path, a build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested there, startup warns and disables NFQUEUE staging for that process without changing the file. Explicit XDP selection instead uses its userspace policy backend and real XDP/AF_XDP adapter independently of the `ebpf` feature; it is not mock capture.
 
 When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy, not inherited host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 

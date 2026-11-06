@@ -20,24 +20,91 @@ pub(in crate::control) struct RoutingDecision {
 }
 
 pub(in crate::control) struct PacketRoutingSnapshot {
+    pub(in crate::control) mode: super::handoff::ModeDecision,
+    pub(in crate::control) mode_state: Option<crate::mode::ModeState>,
+    pub(in crate::control) admission_final: bool,
     pub(in crate::control) decision: RoutingDecision,
     pub(in crate::control) config: Arc<Config>,
     pub(in crate::control) group_manager: Arc<honk_outbound::group::GroupManager>,
     pub(in crate::control) runtime: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
     #[cfg(feature = "native-api")]
     pub(in crate::control) native: Option<(u64, Arc<crate::observe::catalog::CatalogIdentity>)>,
+    pub(in crate::control) memory: Option<honk_netstack::MemoryReservation>,
 }
 
 impl PacketRoutingSnapshot {
     pub(in crate::control) fn final_before_sniff(&self) -> bool {
-        self.decision.must || self.decision.outbound == "block"
+        self.admission_final
+            || self.decision.must
+            || self.decision.outbound == "block"
+            || self.mode.name == "block"
     }
 }
 
 impl RoutingDecision {
+    pub(in crate::control) fn from_router(
+        router: &crate::routing::Router,
+        input: &ConnectionInfo,
+        #[cfg(feature = "native-api")] native: Option<(&crate::observe::Observation, u64)>,
+    ) -> Self {
+        #[cfg(feature = "native-api")]
+        let mut native_route = None;
+        #[cfg(feature = "native-api")]
+        let matched = if let Some((native, generation)) = native {
+            let observed =
+                router.route_full_observed(input, None, crate::observe::flows::MAX_RULE_VALUES);
+            let rules = crate::observe::rules::observed_rule_evaluations(
+                &native.instance_id,
+                generation,
+                router,
+                &observed.rules,
+            );
+            native_route = Some(super::observation::RouteObservation::userspace(
+                &native.instance_id,
+                generation,
+                input,
+                router,
+                observed.matched.as_ref(),
+                rules,
+                observed.truncated,
+            ));
+            observed.matched
+        } else {
+            router.route_full(input)
+        };
+        #[cfg(not(feature = "native-api"))]
+        let matched = router.route_full(input);
+        let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
+        Self {
+            outbound: action.outbound.clone(),
+            must: action.must,
+            mark: action.mark,
+            matched_rule: matched
+                .map(|hit| (hit.rule_type.to_owned(), hit.rule_payload.to_owned())),
+            reroute_by_sniffed_domain: false,
+            #[cfg(feature = "native-api")]
+            native_route,
+        }
+    }
+
+    pub(in crate::control) fn retained_bytes(&self) -> usize {
+        let bytes = self.outbound.capacity()
+            + self
+                .matched_rule
+                .as_ref()
+                .map_or(0, |(kind, payload)| kind.capacity() + payload.capacity());
+        #[cfg(feature = "native-api")]
+        let bytes = bytes
+            + self
+                .native_route
+                .as_ref()
+                .map_or(0, |route| route.retained_bytes());
+        bytes
+    }
+
     /// Installs a mode override's replacement outbound, if any. A rule mark
     /// survives only on a routed `direct` flow that remains `direct`.
-    pub(super) fn apply_final_outbound(&mut self, replacement: Option<String>) {
+    pub(in crate::control) fn apply_final_outbound(&mut self, replacement: Option<String>) {
         let routed_direct = self.outbound == "direct";
         if let Some(outbound) = replacement {
             self.outbound = outbound;
@@ -227,18 +294,33 @@ impl ControlPlaneHandle {
             Arc::ptr_eq(&config, &current),
             "packet routing generation changed"
         );
+        let mode_state = self.mode_state.as_ref().map(|state| state.read().clone());
+        #[cfg(feature = "native-api")]
+        let native = self.native.as_ref().map(|native| {
+            (
+                self.diagnostics.read().generation,
+                native.catalog.snapshot(),
+            )
+        });
+        let mode = super::handoff::mode_decision(
+            mode_state.as_ref(),
+            &config,
+            #[cfg(feature = "native-api")]
+            native.as_ref().map(|(_, catalog)| &**catalog),
+            decision.outbound.clone(),
+            decision.must,
+        );
         Ok(PacketRoutingSnapshot {
+            mode,
+            mode_state,
+            admission_final: false,
+            memory: None,
             decision,
             config,
             group_manager: self.group_manager.read().clone(),
             runtime: self.runtime_registry.read().clone(),
             #[cfg(feature = "native-api")]
-            native: self.native.as_ref().map(|native| {
-                (
-                    self.diagnostics.read().generation,
-                    native.catalog.snapshot(),
-                )
-            }),
+            native,
         })
     }
 
@@ -272,6 +354,14 @@ impl ControlPlaneHandle {
         anyhow::ensure!(
             Arc::ptr_eq(&snapshot.config, &*self.config.read().await),
             "packet routing generation changed during sniffing"
+        );
+        snapshot.mode = super::handoff::mode_decision(
+            snapshot.mode_state.as_ref(),
+            &snapshot.config,
+            #[cfg(feature = "native-api")]
+            snapshot.native.as_ref().map(|(_, catalog)| &**catalog),
+            snapshot.decision.outbound.clone(),
+            snapshot.decision.must,
         );
         Ok(())
     }
@@ -326,45 +416,31 @@ impl ControlPlaneHandle {
         let (userspace_outbound, userspace_must, userspace_mark, matched_rule) = {
             let router = self.router.read().await;
             #[cfg(feature = "native-api")]
-            let matched = if record_route
-                && native_route.is_none()
-                && let Some(native) = &self.native
-            {
-                let _config = self.config.read().await;
-                let generation = self.diagnostics.read().generation;
-                let observed = router.route_full_observed(
-                    &routing_conn_info,
-                    None,
-                    crate::observe::flows::MAX_RULE_VALUES,
-                );
-                let rules = crate::observe::rules::observed_rule_evaluations(
-                    &native.instance_id,
-                    generation,
-                    &router,
-                    &observed.rules,
-                );
-                native_route = Some(super::observation::RouteObservation::userspace(
-                    &native.instance_id,
-                    generation,
-                    &routing_conn_info,
-                    &router,
-                    observed.matched.as_ref(),
-                    rules,
-                    observed.truncated,
-                ));
-                observed.matched
+            let native = self
+                .native
+                .as_deref()
+                .filter(|_| record_route && native_route.is_none());
+            #[cfg(feature = "native-api")]
+            let _config = if native.is_some() {
+                Some(self.config.read().await)
             } else {
-                router.route_full(&routing_conn_info)
+                None
             };
-            #[cfg(not(feature = "native-api"))]
-            let matched = router.route_full(&routing_conn_info);
-            // First matching rule's action, else the configured fallback action.
-            let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
+            let decision = RoutingDecision::from_router(
+                &router,
+                &routing_conn_info,
+                #[cfg(feature = "native-api")]
+                native.map(|native| (native, self.diagnostics.read().generation)),
+            );
+            #[cfg(feature = "native-api")]
+            if native_route.is_none() {
+                native_route = decision.native_route;
+            }
             (
-                action.outbound.clone(),
-                action.must,
-                action.mark,
-                matched.map(|hit| (hit.rule_type.to_string(), hit.rule_payload.to_string())),
+                decision.outbound,
+                decision.must,
+                decision.mark,
+                decision.matched_rule,
             )
         };
         let (outbound, must, mark) = match handoff {

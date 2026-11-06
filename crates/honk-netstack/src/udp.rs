@@ -56,7 +56,12 @@ impl Stack {
         }
     }
 
-    pub(crate) fn receive_udp(&mut self, ip: &IpPacket, packet: &[u8]) -> Rx {
+    pub(crate) fn receive_udp<const REPORT: bool>(
+        &mut self,
+        ip: &IpPacket,
+        packet: &[u8],
+        report: &mut crate::stack::SourceReport<impl FnMut(crate::ValidatedSource) -> bool>,
+    ) -> Rx {
         let dgram = &packet[ip.payload.clone()];
         let (src, dst, payload) = match wire::udp::parse(dgram) {
             Ok(v) => v,
@@ -64,6 +69,14 @@ impl Stack {
         };
         if !wire::udp::verify_checksum(ip.src, ip.dst, dgram) {
             return self.drop_packet(DropReason::Checksum);
+        }
+        if !report.record::<REPORT>(
+            SocketAddr::new(ip.src, src),
+            SocketAddr::new(ip.dst, dst),
+            wire::PROTO_UDP,
+            None,
+        ) {
+            return self.drop_packet(DropReason::NotForUs);
         }
         let Some(&index) = self.table.udp.get(&dst) else {
             return self.drop_packet(DropReason::NoFlow);

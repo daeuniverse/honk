@@ -25,7 +25,7 @@ mod marked_http;
 pub mod mode;
 #[cfg(feature = "native-api")]
 pub mod native_api;
-#[cfg(feature = "ebpf")]
+#[cfg(target_os = "linux")]
 pub(crate) mod netlink;
 #[cfg_attr(not(feature = "native-api"), path = "observe/inert.rs")]
 pub(crate) mod observe;
@@ -37,6 +37,8 @@ pub mod state;
 pub mod stats;
 pub mod subscription;
 mod sysctl;
+#[cfg(target_os = "linux")]
+pub(crate) mod xdp;
 
 pub use honk_outbound::alive as outbound;
 pub use honk_outbound::group;
@@ -911,6 +913,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             return Err(error);
         }
     };
+    let xdp_mode = config
+        .datapath
+        .as_ref()
+        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Xdp);
+    anyhow::ensure!(
+        !xdp_mode || !cli.mock_ebpf,
+        "XDP cannot be selected with --mock-ebpf"
+    );
+    #[cfg(not(target_os = "linux"))]
+    anyhow::ensure!(!xdp_mode, "XDP requires Linux");
+    #[cfg(target_os = "linux")]
+    if xdp_mode {
+        xdp::validate_config(&config)?;
+    }
+    let tc_mode = !mock_mode && !xdp_mode;
+    let _xdp_instance_lock = if xdp_mode && mock_mode {
+        instance_lock(false)?
+    } else {
+        None
+    };
+    let xdp_admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Console, optional file, and Clash API output use independent layers.
     // With no `/logs` subscription, the API layer contributes no callsite interest.
@@ -1076,7 +1099,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "ebpf")]
     let configured_ifaces = configured_interfaces(&config);
     #[cfg(feature = "ebpf")]
-    if !mock_mode
+    if tc_mode
         && detect_default_interface().is_none()
         && config
             .global
@@ -1093,7 +1116,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
-    prepare_nfqueue_startup(&mut config, mock_mode);
+    if !xdp_mode {
+        prepare_nfqueue_startup(&mut config, mock_mode);
+    }
 
     // Create the dae0 link pair before eBPF load so PARAM.dae0_ifindex is correct.
     // dae0peer stays in the host namespace during the dae0 attach, then moves
@@ -1102,7 +1127,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let _dae0_guard: Option<daens::Dae0Guard>;
     #[cfg(not(feature = "ebpf"))]
     let _dae0_guard: Option<()>;
-    if !mock_mode {
+    if tc_mode {
         // QUIC socket headroom: the default 208 KiB rmem/wmem caps a
         // ~1ms-RTT QUIC path at ~2 Gbps (setsockopt is clamped to 2×max).
         // Raise the ceiling so the 8 MiB SO_RCVBUF/SO_SNDBUF requests in
@@ -1140,7 +1165,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut attached_ifaces: ebpf::real::AttachedMap = Default::default();
-    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if cli.mock_ebpf {
+    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if xdp_mode {
+        Box::new(ebpf::userspace::UserspaceBackend::new(Arc::clone(
+            &xdp_admission,
+        )))
+    } else if cli.mock_ebpf {
         info!("Using mock eBPF backend");
         Box::new(ebpf::mock::MockEbpfBackend::new())
     } else {
@@ -1267,7 +1296,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "ebpf")]
     let mut ebpf_backend = ebpf_backend;
 
-    if !mock_mode {
+    if tc_mode {
         #[cfg(feature = "ebpf")]
         {
             // Attach dae0_ingress on dae0 (host namespace) first, while
@@ -1303,7 +1332,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ebpf_backend.attach_dae0peer_ingress()?;
             info!("dae0peer_ingress attached in daens");
         }
-    } else {
+    } else if !xdp_mode {
         info!("Skipping real interface binding (mock mode)");
     }
 
@@ -1314,12 +1343,12 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // Accepted connections are handled on host-netns worker threads, and
     // replies to the client egress dae0peer and take the host dae0_ingress
     // rewrite path. Direct traffic bypasses userspace.
-    if !mock_mode {
+    if tc_mode {
         info!(
             "Using eBPF TC redirect datapath (tproxy_mark=0x{:x})",
             config.global.tproxy_mark
         );
-    } else {
+    } else if !xdp_mode {
         info!("Skipping eBPF datapath setup (mock mode)");
     }
 
@@ -1329,11 +1358,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .effective_client_subnet()
         .map_err(anyhow::Error::new)?;
 
-    let traffic_geo = routing::GeoRequirements::for_traffic(&config.routing.rules);
+    let traffic_geo = routing::GeoRequirements::for_forwarding(&config);
     let dns_geo = dns::routing::DnsRouter::geo_requirements(&config.dns);
     let geo_sources = routing::GeoSourceSet::load(&traffic_geo.union(&dns_geo));
     let mut shared = routing::SharedMatchers::default();
-    let router = routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
+    let mut router =
+        routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
+    router.bind_firewall(&config, None, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
     ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
 
@@ -1426,7 +1457,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .await;
     control_plane.set_log_file_override(cli.log_file.clone(), log_file_path);
     #[cfg(feature = "ebpf")]
-    let iface_watcher = if !cli.mock_ebpf {
+    let iface_watcher = if tc_mode {
         ebpf::real::IfaceWatcher::spawn(
             control_plane.ebpf_handle(),
             control_plane.config_handle(),
@@ -1592,7 +1623,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    info!("Starting control plane listeners and accept loop");
+    info!(
+        backend = if xdp_mode { "xdp" } else { "tc" },
+        "Starting selected datapath owner"
+    );
 
     let cmd_tx = control_plane.command_sender();
 
@@ -1730,9 +1764,22 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         info!("honk-core is running.");
     }
-    let control_result = control_plane.run().await;
+    let (control_plane, control_result) = if xdp_mode {
+        #[cfg(target_os = "linux")]
+        {
+            xdp::run(control_plane, &cli.bpf_pin_root, xdp_admission).await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unreachable!("XDP admission requires Linux")
+        }
+    } else {
+        let result = control_plane.run().await;
+        (Some(control_plane), result)
+    };
     #[cfg(feature = "native-api")]
-    native_api::NativeRuntime::shutdown(native, &control_plane, control_result.is_err()).await;
+    native_api::NativeRuntime::shutdown(native, control_plane.as_ref(), control_result.is_err())
+        .await;
 
     // Signal systemd that we're stopping (Type=notify)
     #[cfg(target_os = "linux")]
@@ -1743,6 +1790,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let _ = sig_handle.await;
     let _ = sighup_handle.await;
     let subscription_result = subscription_supervisor.shutdown().await;
+    drop(control_plane);
     info!("honk-core stopped");
 
     control_result?;

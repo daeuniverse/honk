@@ -8,10 +8,12 @@
 pub mod assets;
 pub mod check;
 pub mod config;
+pub mod datapath;
 pub mod diagnostic;
 pub mod dns;
 pub mod error;
 pub mod experimental;
+pub mod firewall;
 pub mod group;
 pub mod node;
 pub mod options;

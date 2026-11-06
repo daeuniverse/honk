@@ -974,6 +974,10 @@ async fn shared_source_keeps_last_endpoint_slot_until_receiver_exits() {
     drop(endpoint);
     f.wait_until("retired view to leave the pool", || f.pool.is_empty())
         .await;
+    assert!(
+        f.pool
+            .retains_source(honk_datapath::ScopeId::HOST, client.ip())
+    );
     assert_eq!(f.pool.endpoint_slots.available_permits(), 0);
     let slow = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
@@ -1000,6 +1004,10 @@ async fn shared_source_keeps_last_endpoint_slot_until_receiver_exits() {
         "slot outlived the transport"
     );
     assert_eq!(received(&f.client).await, (b"foreign".to_vec(), c));
+    assert!(
+        !f.pool
+            .retains_source(honk_datapath::ScopeId::HOST, client.ip())
+    );
     let slow = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     assert!(matches!(
         f.pool.reserve_or_enqueue(

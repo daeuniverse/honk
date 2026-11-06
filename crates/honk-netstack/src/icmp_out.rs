@@ -33,6 +33,8 @@ pub(crate) enum Reject {
     AdminProhibited,
     /// Fragment reassembly timeout: v4 11/1, v6 3/1.
     TimeExceeded,
+    /// Transit TTL/hop-limit exhaustion: v4 11/0, v6 3/0.
+    HopLimitExceeded,
     /// Frag-needed (v4 3/4) / Packet Too Big (v6 2/0); exempt from rate limits.
     PacketTooBig { mtu: u32 },
 }
@@ -127,6 +129,17 @@ impl IcmpOut {
         quoted: &[u8],
         out: &mut [u8],
     ) -> IcmpEmit {
+        self.emit_from(now, kind, quoted, None, out)
+    }
+
+    pub(crate) fn emit_from(
+        &mut self,
+        now: Instant,
+        kind: Reject,
+        quoted: &[u8],
+        source: Option<IpAddr>,
+        out: &mut [u8],
+    ) -> IcmpEmit {
         let Some(orig) = inspect(quoted) else {
             self.suppressed += 1;
             return IcmpEmit::Suppressed;
@@ -150,6 +163,8 @@ impl IcmpOut {
             (Reject::AdminProhibited, true) => ((1, V6_ADMIN_PROHIBITED), [0; 4]),
             (Reject::TimeExceeded, false) => ((11, 1), [0; 4]),
             (Reject::TimeExceeded, true) => ((3, 1), [0; 4]),
+            (Reject::HopLimitExceeded, false) => ((11, 0), [0; 4]),
+            (Reject::HopLimitExceeded, true) => ((3, 0), [0; 4]),
             (Reject::PacketTooBig { mtu }, false) => {
                 let [hi, lo] = u16::try_from(mtu).unwrap_or(u16::MAX).to_be_bytes();
                 ((3, 4), [0, 0, hi, lo])
@@ -160,7 +175,14 @@ impl IcmpOut {
             self.rate_limited += 1;
             return IcmpEmit::RateLimited;
         }
-        match emit_error(out, orig.dst, orig.src, (ty, code), rest, quote) {
+        match emit_error(
+            out,
+            source.unwrap_or(orig.dst),
+            orig.src,
+            (ty, code),
+            rest,
+            quote,
+        ) {
             Some(n) => {
                 self.sent += 1;
                 IcmpEmit::Sent(n)
@@ -271,6 +293,9 @@ impl Original<'_> {
         if self.non_first_fragment || special(self.src) || special(self.dst) {
             return true;
         }
+        if self.proto == wire::PROTO_TCP && self.l4.get(13).is_some_and(|flags| flags & 4 != 0) {
+            return true;
+        }
         match (self.proto, self.l4.first()) {
             // RFC 1122 §3.2.2: never answer an ICMP error. Types beyond the table Linux knows
             // are treated as errors too.
@@ -331,6 +356,37 @@ fn inspect(pkt: &[u8]) -> Option<Original<'_>> {
         }
         _ => None,
     }
+}
+
+pub(crate) fn quote_metadata(packet: &[u8]) -> Option<crate::transit::Quote> {
+    let original = inspect(packet)?;
+    if original.suppressed()
+        || original.l4.len() < 8
+        || (original.proto == wire::PROTO_TCP && original.l4.len() < 14)
+    {
+        return None;
+    }
+    let ports = match original.proto {
+        wire::PROTO_TCP | wire::PROTO_UDP => Some((
+            u16::from_be_bytes(original.l4[..2].try_into().ok()?),
+            u16::from_be_bytes(original.l4[2..4].try_into().ok()?),
+        )),
+        wire::PROTO_ICMP if original.src.is_ipv4() => None,
+        wire::PROTO_ICMPV6 if original.src.is_ipv6() => None,
+        _ => return None,
+    };
+    Some(crate::transit::Quote {
+        source: original.src,
+        destination: original.dst,
+        protocol: original.proto,
+        ports,
+        traffic_class: if original.src.is_ipv4() {
+            packet[1]
+        } else {
+            (packet[0] & 15) << 4 | packet[1] >> 4
+        },
+        header_len: packet.len() - original.l4.len(),
+    })
 }
 
 #[cfg(test)]

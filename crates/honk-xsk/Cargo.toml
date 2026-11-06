@@ -1,0 +1,13 @@
+[package]
+name = "honk-xsk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc.workspace = true
+aya-obj.workspace = true
+honk-ebpf-common.workspace = true
+honk-datapath.workspace = true
+honk-netstack.workspace = true

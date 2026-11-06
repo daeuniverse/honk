@@ -14,9 +14,11 @@ log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/$lane"
 mkdir -p "$kernel_dir" "$log_dir"
 
 {
+  cargo build -p honk-core --features ebpf,native-api --bin honk-core --message-format=json
   cargo test -p honk-core --features ebpf,native-api --lib --test ebpf_datapath_test --no-run --message-format=json
   cargo test -p honk-nfqueue --lib --no-run --message-format=json
   cargo test -p honk-outbound --lib --no-run --message-format=json
+  cargo test -p honk-xsk --lib --no-run --message-format=json
 } | jq -sr '
   def executable($name):
     [.[] | select(.reason == "compiler-artifact" and .target.name == $name and .executable != null) | .executable]
@@ -24,7 +26,9 @@ mkdir -p "$kernel_dir" "$log_dir"
   "HONK_CORE_TEST_BIN=" + (executable("honk_core") | @sh),
   "HONK_DATAPATH_TEST_BIN=" + (executable("ebpf_datapath_test") | @sh),
   "HONK_NFQUEUE_TEST_BIN=" + (executable("honk_nfqueue") | @sh),
-  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh)
+  "HONK_OUTBOUND_TEST_BIN=" + (executable("honk_outbound") | @sh),
+  "HONK_XSK_TEST_BIN=" + (executable("honk_xsk") | @sh),
+  "HONK_XDP_DAEMON=" + (executable("honk-core") | @sh)
 ' > "$GITHUB_WORKSPACE/target/kernel-test-bins.env"
 
 if ! test -f "$kernel_dir/$image"; then

@@ -10,6 +10,19 @@ pub(crate) struct GeoRequirements {
 }
 
 impl GeoRequirements {
+    pub(crate) fn for_forwarding(config: &honk_config::Config) -> Self {
+        let mut requirements = Self::for_traffic(&config.routing.rules);
+        if let Some(datapath) = &config.datapath
+            && let Some(firewall) = &datapath.firewall
+        {
+            requirements = requirements.union(&super::firewall::FirewallPolicy::requirements(
+                firewall,
+                &datapath.nat,
+            ));
+        }
+        requirements
+    }
+
     pub(crate) fn for_traffic(rules: &[RoutingRule]) -> Self {
         let mut requirements = Self::default();
         for rule in rules {
@@ -572,6 +585,16 @@ impl GeoAssets {
             }
         }
         out
+    }
+
+    pub(crate) fn has_geoip(&self, code: &str) -> bool {
+        let code = code.trim();
+        code.eq_ignore_ascii_case("private")
+            || self.geoip.as_ref().is_some_and(|index| {
+                index
+                    .get(&code.to_lowercase())
+                    .is_some_and(|nets| !nets.is_empty())
+            })
     }
 
     /// Expand geoip codes into CIDR nets. `private` is built in and never

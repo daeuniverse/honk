@@ -82,6 +82,33 @@ fn udp_nfqueue_toggle_requires_restart() {
 }
 
 #[test]
+fn datapath_restart_identity_uses_effective_setup_not_policy() {
+    use honk_config::datapath::{DatapathConfig, XskMode};
+
+    let current = Config::default();
+    let mut candidate = current.clone();
+    candidate.datapath = Some(DatapathConfig::default());
+    assert!(restart_required_changes(&current, &candidate).is_empty());
+    assert!(restart_required_changes(&candidate, &current).is_empty());
+
+    let mut xdp = honk_config::parser::parse_dae_config(
+        "datapath {\n backend: xdp\n direct: core\n interface {\n eth0: lan\n }\n }",
+    )
+    .unwrap();
+    assert_eq!(restart_required_changes(&current, &xdp), ["datapath"]);
+    assert_eq!(restart_required_changes(&xdp, &current), ["datapath"]);
+    candidate = xdp.clone();
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::Copy);
+    assert!(restart_required_changes(&xdp, &candidate).is_empty());
+    assert!(restart_required_changes(&candidate, &xdp).is_empty());
+
+    xdp.datapath.as_mut().unwrap().firewall = Some(Default::default());
+    assert!(restart_required_changes(&candidate, &xdp).is_empty());
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::ZeroCopy);
+    assert_eq!(restart_required_changes(&xdp, &candidate), ["datapath"]);
+}
+
+#[test]
 fn native_api_settings_require_restart() {
     let current = Config::default();
     for (field, value) in [
@@ -725,6 +752,29 @@ async fn test_cp_with_backend(backend: MockEbpfBackend, nfqueue: bool) -> Contro
         .await
         .unwrap();
     control_plane
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn core_forward_rejects_marked_reload_before_policy_publication() {
+    let cp = test_cp().await;
+    let before = cp.config.read().await.clone();
+    let generation = cp.diagnostics.read().generation;
+    let plan = cp.active_routing_plan.read().clone();
+    cp.core_forward_users
+        .store(1, std::sync::atomic::Ordering::Release);
+    let mut candidate = before.as_ref().clone();
+    candidate.global.dial_mode = "ip".into();
+    candidate.routing.default_mark = 0x42;
+    candidate.routing.default_must = true;
+    assert!(matches!(
+        cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected
+    ));
+    assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+    assert!(Arc::ptr_eq(&plan, &cp.active_routing_plan.read()));
+    assert_eq!(cp.diagnostics.read().generation, generation);
 }
 
 #[cfg(feature = "native-api")]

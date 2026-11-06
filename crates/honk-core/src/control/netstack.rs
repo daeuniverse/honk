@@ -7,7 +7,7 @@
 use std::fmt;
 use std::future::poll_fn;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -65,12 +65,21 @@ struct Shared {
     budget: Arc<MemoryBudget>,
     inner: Mutex<Inner>,
     owner_wake: Notify,
+    #[cfg(all(test, feature = "native-api"))]
+    startup_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     // Includes the Arc allocation, mutex/notify, slots, queues and frame pointer array.
     _metadata: MemoryReservation,
 }
 
 struct FlowSlot {
     id: FlowId,
+    client: SocketAddr,
+    destination: SocketAddr,
     app_open: bool,
     close_pending: bool,
     retiring: bool,
@@ -78,6 +87,8 @@ struct FlowSlot {
     rx: Option<Waker>,
     tx: Option<Waker>,
     callback: Option<RetirementCallback>,
+    accepted: bool,
+    routing: Option<super::packet_endpoint::EndpointAdmission>,
 }
 
 struct RetirementCallback {
@@ -96,6 +107,8 @@ struct Inner {
     stack: Option<Stack>,
     ledger: FrameLedger<Option<FlowId>>,
     frames: Box<[Option<Box<[u8]>>]>,
+    output_peers: Box<[Option<IpAddr>]>,
+    source_work: Box<[Option<(IpAddr, usize)>]>,
     queue: Box<[Option<Queued>]>,
     head: usize,
     queued: usize,
@@ -104,6 +117,7 @@ struct Inner {
     slots: Box<[Option<FlowSlot>]>,
     pending_closes: usize,
     closed_apps: usize,
+    pending_routing: usize,
     waiters: Box<[Option<Waker>]>,
     output_waker: Option<Waker>,
     closing: bool,
@@ -163,6 +177,8 @@ impl PacketScope {
             .checked_add(2 * size_of::<usize>())
             .and_then(|n| n.checked_add(aliases.checked_mul(size_of::<Option<FlowSlot>>())?))
             .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<Box<[u8]>>>())?))
+            .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<IpAddr>>())?))
+            .and_then(|n| n.checked_add(aliases.checked_mul(size_of::<Option<(IpAddr, usize)>>())?))
             .and_then(|n| n.checked_add(tx_frames.checked_mul(size_of::<Option<Queued>>())?))
             .and_then(|n| {
                 n.checked_add(limits.max_waiters.checked_mul(size_of::<Option<Waker>>())?)
@@ -186,6 +202,8 @@ impl PacketScope {
                 stack: Some(stack),
                 ledger,
                 frames,
+                output_peers: (0..frame_count).map(|_| None).collect(),
+                source_work: (0..aliases).map(|_| None).collect(),
                 queue: (0..tx_frames).map(|_| None).collect(),
                 head: 0,
                 queued: 0,
@@ -194,6 +212,7 @@ impl PacketScope {
                 slots: (0..aliases).map(|_| None).collect(),
                 pending_closes: 0,
                 closed_apps: 0,
+                pending_routing: 0,
                 waiters: (0..limits.max_waiters).map(|_| None).collect(),
                 output_waker: None,
                 closing: false,
@@ -202,6 +221,8 @@ impl PacketScope {
                 _storage: storage,
             }),
             owner_wake: Notify::new(),
+            #[cfg(all(test, feature = "native-api"))]
+            startup_pause: Mutex::new(None),
             _metadata: metadata,
         });
         let scope = Self(shared);
@@ -236,6 +257,24 @@ impl PacketScope {
         })
     }
 
+    #[cfg(all(test, feature = "native-api"))]
+    pub(in crate::control) fn pause_startup(
+        &self,
+        entered: tokio::sync::oneshot::Sender<()>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.0.startup_pause.lock() = Some((entered, release));
+    }
+
+    #[cfg(all(test, feature = "native-api"))]
+    pub(in crate::control) async fn startup_checkpoint(&self) {
+        let pause = self.0.startup_pause.lock().take();
+        if let Some((entered, release)) = pause {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+
     pub fn scope(&self) -> ScopeId {
         self.0.scope
     }
@@ -253,30 +292,177 @@ impl PacketScope {
         })
     }
 
+    /// The callback runs under the scope's existing output mutex, before protocol
+    /// mutation/output wakes. It must not re-enter this scope or block on I/O.
+    /// With `check_output`, the callback's second argument reports older unexported
+    /// replies under that same mutex; false skips the reclamation-only scan.
+    pub fn receive_with_source(
+        &self,
+        packet: &[u8],
+        now: Instant,
+        check_output: bool,
+        mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
+    ) -> (Rx, Option<honk_netstack::ValidatedSource>) {
+        self.0.with(|inner| {
+            let pending = check_output && inner.pending_source_output(packet);
+            match &mut inner.stack {
+                Some(stack) => {
+                    stack.receive_with_source(now, packet, |source| on_source(source, pending))
+                }
+                None => (Rx::Dropped(DropReason::Stale), None),
+            }
+        })
+    }
+
+    pub(in crate::control) fn retains_tcp(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+    ) -> bool {
+        let inner = self.0.inner.lock();
+        inner
+            .stack
+            .as_ref()
+            .is_some_and(|stack| stack.retains_tcp(source, destination))
+            || inner
+                .slots
+                .iter()
+                .flatten()
+                .any(|slot| slot.client == source && slot.destination == destination)
+    }
+
+    pub(crate) fn retains_source(&self, address: IpAddr) -> bool {
+        let inner = self.0.inner.lock();
+        inner
+            .stack
+            .as_ref()
+            .is_some_and(|stack| stack.retains_source(address))
+            || inner
+                .slots
+                .iter()
+                .flatten()
+                .any(|slot| slot.client.ip() == address)
+            || inner.output_peers.contains(&Some(address))
+            || inner
+                .source_work
+                .iter()
+                .flatten()
+                .any(|(peer, _)| *peer == address)
+    }
+
+    pub(in crate::control) fn hold_source(&self, address: IpAddr) -> io::Result<SourceWork> {
+        let mut inner = self.0.inner.lock();
+        if inner.closing || inner.finished {
+            return Err(closed());
+        }
+        let index = inner
+            .source_work
+            .iter()
+            .position(|entry| entry.is_some_and(|(peer, _)| peer == address))
+            .or_else(|| inner.source_work.iter().position(Option::is_none))
+            .ok_or_else(capacity)?;
+        let entry = inner.source_work[index].get_or_insert((address, 0));
+        entry.1 = entry.1.checked_add(1).ok_or_else(capacity)?;
+        Ok(SourceWork {
+            scope: self.clone(),
+            index,
+        })
+    }
+
+    pub(in crate::control) fn receive_admitted_with_source(
+        &self,
+        packet: &[u8],
+        now: Instant,
+        admission: &mut Option<super::packet_endpoint::EndpointAdmission>,
+        check_output: bool,
+        mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
+    ) -> (Rx, Option<honk_netstack::ValidatedSource>) {
+        self.0.with(|inner| {
+            let pending = check_output && inner.pending_source_output(packet);
+            let Some(stack) = &mut inner.stack else {
+                return (Rx::Dropped(DropReason::Stale), None);
+            };
+            let (rx, source, admitted) =
+                stack.receive_with_tcp_admission(now, packet, |source| on_source(source, pending));
+            if let Some(id) = admitted {
+                if let Some(vacant) = inner.slots.iter().position(Option::is_none) {
+                    let source = source.expect("new TCP admission has a validated tuple");
+                    inner.slots[vacant] = Some(FlowSlot {
+                        id,
+                        client: source.src,
+                        destination: source.dst,
+                        app_open: true,
+                        close_pending: false,
+                        retiring: false,
+                        outputs: 0,
+                        rx: None,
+                        tx: None,
+                        callback: None,
+                        accepted: false,
+                        routing: admission.take(),
+                    });
+                    inner.pending_routing += 1;
+                } else {
+                    stack.tcp_refuse(id, honk_netstack::Refuse::Drop);
+                }
+            }
+            (rx, source)
+        })
+    }
+
     /// Accepts with an immediate SYN-ACK. This is not kernel accepted-child evidence.
     pub fn poll_accept(&self) -> Option<(SynInfo, FlowIo)> {
         self.0.with(|inner| {
             if inner.closing {
                 return None;
             }
-            let vacant = inner.slots.iter().position(Option::is_none)?;
+            let vacant = inner.slots.iter().position(Option::is_none);
+            if vacant.is_none() && inner.pending_routing == 0 {
+                return None;
+            }
             let stack = inner.stack.as_mut()?;
             let syn = stack.poll_accept()?;
+            if vacant.is_none() && !inner.slots.iter().flatten().any(|slot| slot.id == syn.id) {
+                stack.tcp_refuse(syn.id, honk_netstack::Refuse::Drop);
+                return None;
+            }
             if stack.tcp_accept(syn.id, AcceptOpts::default()).is_err() {
                 stack.tcp_abort(syn.id);
                 return None;
             }
-            inner.slots[vacant] = Some(FlowSlot {
-                id: syn.id,
-                app_open: true,
-                close_pending: false,
-                retiring: false,
-                outputs: 0,
-                rx: None,
-                tx: None,
-                callback: None,
-            });
-            Some((syn, FlowIo::new(self.clone(), syn)))
+            let routing = if let Some(slot) = inner
+                .slots
+                .iter_mut()
+                .flatten()
+                .find(|slot| slot.id == syn.id)
+            {
+                slot.accepted = true;
+                inner.pending_routing -= 1;
+                slot.routing.take()
+            } else {
+                let Some(vacant) = vacant else {
+                    stack.tcp_abort(syn.id);
+                    return None;
+                };
+                inner.slots[vacant] = Some(FlowSlot {
+                    id: syn.id,
+                    client: syn.client,
+                    destination: syn.original_dst,
+                    app_open: true,
+                    close_pending: false,
+                    retiring: false,
+                    outputs: 0,
+                    rx: None,
+                    tx: None,
+                    callback: None,
+                    accepted: true,
+                    routing: None,
+                });
+                None
+            };
+            let mut flow = FlowIo::new(self.clone(), syn);
+            flow.set_routing(routing);
+            Some((syn, flow))
         })
     }
 
@@ -319,8 +505,25 @@ impl PacketScope {
 
     /// One L3 output consumer per scope. Retain the lease through actual I/O completion.
     pub fn poll_output(&self, cx: &mut Context<'_>) -> Poll<Option<OutputLease>> {
+        self.poll_output_from(cx, None)
+    }
+
+    /// Oldest queued output of `class`, so a device without bulk credit can still drain control.
+    pub fn poll_output_class(
+        &self,
+        cx: &mut Context<'_>,
+        class: TxClass,
+    ) -> Poll<Option<OutputLease>> {
+        self.poll_output_from(cx, Some(class))
+    }
+
+    fn poll_output_from(
+        &self,
+        cx: &mut Context<'_>,
+        class: Option<TxClass>,
+    ) -> Poll<Option<OutputLease>> {
         self.0.with(|inner| {
-            if let Some(queued) = inner.pop() {
+            if let Some(queued) = inner.pop(class) {
                 let index = inner.index(queued.lease);
                 let bytes = inner.frames[index]
                     .take()
@@ -341,6 +544,14 @@ impl PacketScope {
 
     pub async fn next_output(&self) -> Option<OutputLease> {
         poll_fn(|cx| self.poll_output(cx)).await
+    }
+
+    /// No live TCP/TIME_WAIT/control protocol state and no flow slot; exported leases may remain.
+    pub fn is_protocol_quiescent(&self) -> bool {
+        self.0.with(|inner| {
+            inner.stack.as_ref().is_none_or(Stack::is_quiescent)
+                && inner.slots.iter().all(Option::is_none)
+        })
     }
 
     pub fn stats(&self) -> Option<StackStats> {
@@ -423,6 +634,20 @@ impl Drop for RetirementCompletion<'_> {
 }
 
 impl Inner {
+    fn pending_source_output(&self, packet: &[u8]) -> bool {
+        let Ok((address, _)) = honk_netstack::wire::packet_addresses(packet) else {
+            return false;
+        };
+        self.stack
+            .as_ref()
+            .is_some_and(|stack| stack.retains_source_output(address))
+            || self
+                .queue
+                .iter()
+                .flatten()
+                .any(|queued| self.output_peers[self.index(queued.lease)] == Some(address))
+    }
+
     // ponytail: bounded linear owner lookup; use a fixed index if measured flow counts need it.
     fn slot(&mut self, id: FlowId) -> Option<&mut FlowSlot> {
         self.slots.iter_mut().flatten().find(|slot| slot.id == id)
@@ -445,17 +670,34 @@ impl Inner {
         }
     }
 
-    fn pop(&mut self) -> Option<Queued> {
-        if self.queued == 0 {
-            return None;
+    // ponytail: O(queued) shift, bounded by the scope's TX frames; per-class rings if measured.
+    fn pop(&mut self, class: Option<TxClass>) -> Option<Queued> {
+        let len = self.queue.len();
+        let at = (0..self.queued).find(|&i| {
+            class.is_none_or(|class| {
+                self.queue[(self.head + i) % len].is_some_and(|queued| queued.class == class)
+            })
+        })?;
+        let queued = self.queue[(self.head + at) % len].take();
+        for i in (0..at).rev() {
+            self.queue[(self.head + i + 1) % len] = self.queue[(self.head + i) % len].take();
         }
-        let queued = self.queue[self.head].take();
-        self.head = (self.head + 1) % self.queue.len();
+        self.head = (self.head + 1) % len;
         self.queued -= 1;
         queued
     }
 
     fn publish(&mut self, lease: FrameLease, tx: Transmit, class: TxClass) {
+        let index = self.index(lease);
+        self.output_peers[index] = Some(
+            honk_netstack::wire::packet_addresses(
+                &self.frames[index]
+                    .as_ref()
+                    .expect("reserved output storage")[..tx.len],
+            )
+            .expect("stack output has IP addresses")
+            .1,
+        );
         self.ledger
             .submit_tx(lease, tx.len, tx.flow)
             .expect("reserved complete output frame");
@@ -468,6 +710,8 @@ impl Inner {
     }
 
     fn release(&mut self, queued: Queued) {
+        let index = self.index(queued.lease);
+        self.output_peers[index] = None;
         let owner = self
             .ledger
             .release_tx(queued.lease)
@@ -544,6 +788,22 @@ impl Inner {
     }
 
     fn events(&mut self) {
+        if self.pending_routing != 0 {
+            for slot in self.slots.iter_mut().flatten() {
+                if !slot.accepted
+                    && slot.app_open
+                    && !self
+                        .stack
+                        .as_ref()
+                        .is_some_and(|stack| stack.tcp_retained(slot.id))
+                {
+                    slot.app_open = false;
+                    slot.routing.take();
+                    self.closed_apps += 1;
+                    self.pending_routing -= 1;
+                }
+            }
+        }
         while let Some((id, ready)) = self.stack.as_mut().and_then(Stack::poll_event) {
             if let Some(slot) = self.slot(id) {
                 if (ready.contains(Ready::READABLE)
@@ -574,7 +834,7 @@ impl Inner {
         self.aborted = true;
         // Dropping the stack is explicit protocol disposal, never a fabricated device return.
         self.stack = None;
-        while let Some(queued) = self.pop() {
+        while let Some(queued) = self.pop(None) {
             self.release(queued);
         }
         for slot in self.slots.iter_mut().flatten() {
@@ -597,6 +857,7 @@ impl Inner {
             && protocol_empty
             && self.slots.iter().all(Option::is_none)
             && self.queued == 0
+            && self.source_work.iter().all(Option::is_none)
             && self.ledger.outstanding_tx().next().is_none()
         {
             self.finished = true;
@@ -731,6 +992,26 @@ impl Drop for OutputLease {
                 inner.release(queued);
             });
         }
+    }
+}
+
+pub(in crate::control) struct SourceWork {
+    scope: PacketScope,
+    index: usize,
+}
+
+impl Drop for SourceWork {
+    fn drop(&mut self) {
+        self.scope.0.with(|inner| {
+            let count = &mut inner.source_work[self.index]
+                .as_mut()
+                .expect("retained source work")
+                .1;
+            *count -= 1;
+            if *count == 0 {
+                inner.source_work[self.index] = None;
+            }
+        });
     }
 }
 

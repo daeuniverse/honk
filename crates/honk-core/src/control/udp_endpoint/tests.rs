@@ -1184,6 +1184,7 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
     let dst = make_addr("8.8.8.8", 443);
     let (removed_tx, mut removed_rx) = mpsc::channel(4);
     pool.set_remove_sink(removed_tx);
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst));
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match pool.reserve_owned_or_enqueue(
         honk_datapath::ScopeId::HOST,
@@ -1199,8 +1200,16 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         _ => panic!("staged payload must initialize"),
     };
     let generation = lease.generation();
+    assert!(
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst),
+        "Initializing already owns Endpoint execution"
+    );
     assert!(pool.retire_staged_identity(honk_datapath::ScopeId::HOST, client, dst, 77, generation));
     assert!(!lease.still_initializing());
+    assert!(
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst),
+        "Retiring must not migrate to Core"
+    );
     assert!(matches!(
         pool.reserve_or_enqueue(
             honk_datapath::ScopeId::HOST,
@@ -1236,6 +1245,7 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         UdpFlowOwner::new(77, None).unwrap(),
         generation
     ));
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst));
 
     let replacement = match pool.reserve_or_enqueue(
         honk_datapath::ScopeId::HOST,

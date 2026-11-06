@@ -86,14 +86,26 @@ jobs:
               - '.github/workflows/ci.yml'
             ebpf:
               - 'crates/honk-ebpf*/**'
+              - 'crates/honk-xsk/**'
+              - 'crates/honk-datapath/**'
+              - 'crates/honk-netstack/**'
+              - 'crates/honk-core/src/xdp.rs'
+              - 'crates/honk-core/src/lib.rs'
+              - 'crates/honk-core/src/netlink/**'
+              - 'crates/honk-core/src/control/core_forward.rs'
+              - 'crates/honk-core/src/control/core_forward/**'
+              - 'crates/honk-core/src/control/packet_endpoint.rs'
+              - 'crates/honk-core/src/control/packet_endpoint/**'
+              - 'crates/honk-core/src/control/netstack.rs'
+              - 'crates/honk-core/src/control/netstack/**'
+              - 'crates/honk-core/src/control/reload/**'
               - 'crates/honk-core/src/ebpf/**'
               - 'crates/honk-core/src/control/routing_matcher/**'
               - 'crates/honk-core/src/control/routing_matcher.rs'
               - 'crates/honk-core/src/control/tests.rs'
               - 'crates/honk-core/src/control/tests/**'
               - 'crates/honk-core/src/routing/**'
-              - 'crates/honk-config/src/routing.rs'
-              - 'crates/honk-config/src/parser/routing.rs'
+              - 'crates/honk-config/**'
               - 'crates/honk-core/build.rs'
               - 'crates/honk-core/tests/**'
               - 'crates/honk-outbound/src/util.rs'
@@ -697,7 +709,7 @@ jobs:
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
       - name: Configure KVM
@@ -1001,7 +1013,7 @@ jobs:
           sudo grep -lE 'dl\.google\.com|packages\.microsoft\.com' /etc/apt/sources.list.d/* | xargs -r sudo rm -f || true
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
-            busybox-static clang cmake coreutils file iproute2 iptables jq kbd kmod \
+            busybox-static clang cmake coreutils ethtool file iproute2 iptables jq kbd kmod nftables \
             libbpf-dev libclang-dev libvirt-clients llvm pkg-config python3-argcomplete \
             python3-requests python3-venv qemu-kvm rsync udev util-linux virtiofsd zstd
       - name: Configure KVM

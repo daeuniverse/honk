@@ -211,6 +211,75 @@ routing {
 
 这里 `proxy`、`hk` 和 `resilient` 都是组名。
 
+## Core 转发防火墙与 IPv4 NAT
+
+这些是 `datapath` 的强类型动作，不是 `routing` 的出站名称。要求
+`backend: xdp`、`direct: core` 以及显式配置的 `lan`/`wan` 接口；不会改变
+现有 TC、Endpoint 中继或原生转发行为。
+
+```dae
+datapath {
+    backend: xdp
+    direct: core
+    interface { lan0: lan
+                wan0: wan }
+    firewall {
+        original {
+            lan: sip(10.0.0.0/24) && l4proto(tcp,udp) -> allow
+            default: drop
+        }
+        forward {
+            lan: ipversion(4,6) -> allow
+            default: drop
+        }
+    }
+    nat {
+        prerouting {
+            dip(198.51.100.1) && dport(8080) -> dnat(10.0.0.8:80)
+        }
+        postrouting {
+            sip(10.0.0.0/24) -> masquerade(40000-49999)
+        }
+    }
+}
+```
+
+`original` 匹配 DNAT 前的原始包；`forward` 与 `postrouting` 匹配 DNAT 后、
+SNAT 前的目标。规则按声明顺序复用普通路由条件。可选的 `lan:`/`wan:` 前缀
+匹配可信捕获接口角色，绝不通过源地址猜测区域；没有前缀表示有意匹配两类
+接口。本路径没有域名、进程、MAC 权威，因此这些条件及其否定形式均拒绝配置。
+结构化防火墙/NAT 条件同样拒绝未知字段，包括 `not` 内的字段：规范字段名为
+`source_ip`，不是 `source_ips`。即使其他匹配条件有效，拼写错误也会报错；
+传统流量路由对未知字段的容忍行为保持不变。
+防火墙/NAT 匹配器调用要求非空参数，逗号分隔的元素也不能为空；`sip()` 或
+`!pname()` 之类的空调用不会消失后扩大规则范围。规则链内的嵌套块会报错，
+不会仅警告后忽略。
+
+两个防火墙链默认都是 `drop`。`allow` 准入双向 owner，`drop` 静默丢弃；
+`reject` 请求限速的管理禁止 ICMP，对符合条件的 TCP 也采用 ICMP 而不是 RST。
+共享拒绝路径对 RST、ICMP 错误、组播及不合格分片抑制回应，并要求可信源地址
+与返回路由。管理拒绝要求有效 input-FIB 权威，包括实际 prohibit 结果；定向广播、
+LocalInput 或权威缺失不授予许可。转发邻居缺失不会抑制已有返回路径和权威的
+TTL/MTU 拒绝。DNAT 后拒绝引用原始元组，不泄露私网转换目标。单独 ACK 不证明已建立；
+UDP 回复必须命中已准入的精确对端与反向接口身份。已准入 owner 仅在未过期、
+且防火墙/NAT 撤销 epoch 仍有效时跳过新流规则。
+保留 owner 不能覆盖当前流量路由的 `block`，包括 mode 改变或安全 epoch 未变的
+纯路由 reload。
+被 Block 的包不分配新的转换 ID，也不续期已有 binding。
+
+`dnat(IPv4)` 保留目标端口，`dnat(IPv4:port)` 替换目标端口；`snat(IPv4)`
+保留源端口，发生冲突则失败；`snat(IPv4,first-last)` 分配唯一源端口。
+`masquerade()` 使用 1024–65535，`masquerade(first-last)` 限定端口池，且必须
+使用由内核为真实出接口选出的可信本地 IPv4 源地址。独立、限定出接口的源选择
+查询可为无地址捕获端口选择已配置的本地路由地址，但绝不替代真实输入 FIB。
+源地址/链路 incarnation 变化撤销 MASQUERADE，普通路由/邻居刷新不会撤销。
+组合 DNAT 与 SNAT 支持 hairpin。
+NAT 必须显式启用防火墙。IPv6 支持防火墙/路由，不支持地址转换；IPv6 包选中
+NAT 动作时 fail-closed。端口耗尽、出接口地址歧义或不支持的组合不会回退为
+Endpoint、原生转发或其他后端。
+
+详见[所有权、分片和证据边界](../design/datapath.md#core-转发防火墙与-ipv4-nat)。
+
 ## 相关文档
 
 - [路由设计](../design/routing.md)

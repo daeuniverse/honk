@@ -22,12 +22,17 @@ pub(crate) fn addrs(pkt: &[u8]) -> (Ipv6Addr, Ipv6Addr) {
 }
 
 pub fn parse(pkt: &[u8]) -> Result<IpPacket, ParseError> {
+    parse_prefix(pkt, pkt.len())
+}
+
+/// Parse a bounded header prefix; extension headers must be wholly present in `pkt`.
+pub fn parse_prefix(pkt: &[u8], packet_len: usize) -> Result<IpPacket, ParseError> {
     if pkt.len() < HEADER_LEN || pkt[0] >> 4 != 6 {
         return Err(ParseError::Malformed);
     }
     let payload_len = usize::from(u16::from_be_bytes([pkt[4], pkt[5]]));
     let end = HEADER_LEN + payload_len;
-    if end > pkt.len() {
+    if end > packet_len {
         return Err(ParseError::Malformed);
     }
     if payload_len == 0 && pkt[6] == HOP_BY_HOP {
@@ -83,11 +88,11 @@ pub(crate) fn walk_ext_headers(
         match next {
             HOP_BY_HOP | ROUTING | DEST_OPTS => {
                 seen += 1;
-                if seen > MAX_EXT_HEADERS || off + 2 > end {
+                if seen > MAX_EXT_HEADERS || off + 2 > end || off + 2 > pkt.len() {
                     return Err(ParseError::Malformed);
                 }
                 let len = (usize::from(pkt[off + 1]) + 1) * 8;
-                if off + len > end {
+                if off + len > end || off + len > pkt.len() {
                     return Err(ParseError::Malformed);
                 }
                 // RFC 8200 §4.4: a host must discard a routing header with segments left.

@@ -49,14 +49,28 @@ impl Default for FragmentLimits {
     }
 }
 
+/// Fragmentation provenance retained only for a completed IPv6 datagram.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ipv6Fragment {
+    pub id: u32,
+    /// Largest received fragment, including IPv6/extension/Fragment headers, without padding.
+    pub max_size: usize,
+}
+
 /// Reassembled bytes whose capacity charge follows their lifetime, including beyond Stack drop.
 #[derive(Debug)]
 pub struct OwnedPacket {
     bytes: Box<[u8]>,
+    ipv6_fragment: Option<Ipv6Fragment>,
     _reservation: Option<MemoryReservation>,
 }
 
 impl OwnedPacket {
+    /// Original IPv6 fragmentation facts; timeout quotes and IPv4 completions have none.
+    pub fn ipv6_fragment(&self) -> Option<Ipv6Fragment> {
+        self.ipv6_fragment
+    }
+
     /// Whether these retained bytes are funded by this exact shared budget.
     pub fn charged_to(&self, budget: &Arc<MemoryBudget>) -> bool {
         self._reservation
@@ -76,6 +90,12 @@ impl Deref for OwnedPacket {
 impl AsRef<[u8]> for OwnedPacket {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
+    }
+}
+
+impl AsMut<[u8]> for OwnedPacket {
+    fn as_mut(&mut self) -> &mut [u8] {
+        &mut self.bytes
     }
 }
 
@@ -148,6 +168,9 @@ struct Live {
     total: Option<usize>,
     /// Fragment 0's headers as received.
     head: Vec<u8>,
+    max_fragment_size: usize,
+    /// Bitset of received ECN codepoints, independent of fragment arrival order.
+    ecn: u8,
 }
 
 impl Live {
@@ -177,6 +200,7 @@ struct Entry {
 
 pub(crate) struct Reassembler {
     limits: FragmentLimits,
+    transit_quotes: bool,
     /// Oldest first.
     entries: Vec<Entry>,
     bytes: usize,
@@ -199,7 +223,7 @@ impl Reassembler {
             .checked_add(
                 usize::from(u16::MAX)
                     .checked_mul(2)?
-                    .checked_add(crate::icmp_out::quote_limit(true) + QUOTE_L4)?,
+                    .checked_add(crate::icmp_out::quote_limit(true) + 20)?,
             )
     }
 }
@@ -219,9 +243,15 @@ impl Drop for Reassembler {
 }
 
 impl Reassembler {
+    pub(crate) fn for_transit(mut self) -> Self {
+        self.transit_quotes = true;
+        self
+    }
+
     pub(crate) fn new(limits: FragmentLimits) -> Reassembler {
         Reassembler {
             limits,
+            transit_quotes: false,
             entries: Vec::new(),
             bytes: 0,
             budget: None,
@@ -273,7 +303,11 @@ impl Reassembler {
         }
         if !f.more && f.offset == 0 {
             // RFC 6946: an atomic fragment is a whole datagram carrying a useless header.
-            return self.finish(f.head, f.data, f.is_v6());
+            let provenance = f.is_v6().then_some(Ipv6Fragment {
+                id: f.id,
+                max_size: f.head.len() + f.data.len(),
+            });
+            return self.finish(f.head, f.data, provenance, false);
         }
         let key = Key {
             src: f.src,
@@ -304,6 +338,8 @@ impl Reassembler {
                         ranges: Vec::new(),
                         total: None,
                         head: Vec::new(),
+                        max_fragment_size: 0,
+                        ecn: 0,
                     }),
                     charged: ENTRY_OVERHEAD,
                 });
@@ -327,7 +363,10 @@ impl Reassembler {
         let overlaps = live.ranges.get(at).is_some_and(|r| r.0 < end);
         let beyond_total = live.total.is_some_and(|t| end > t || (!f.more && end != t));
         let before_data = !f.more && live.ranges.last().is_some_and(|r| r.1 > end);
-        if overlaps || beyond_total || before_data {
+        let ecn = live.ecn | (1 << f.ecn());
+        // RFC 3168 §5.3; like Linux, reject every Not-ECT/ECN-capable mixture.
+        let invalid_ecn = ecn & 1 != 0 && ecn != 1;
+        if overlaps || beyond_total || before_data || invalid_ecn {
             if overlaps {
                 self.stats.overlaps += 1;
             } else {
@@ -348,6 +387,8 @@ impl Reassembler {
             ranges,
             total,
             head: Vec::new(),
+            max_fragment_size: 0,
+            ecn,
         };
         if holes.holes() > self.limits.max_holes {
             self.stats.invalid += 1;
@@ -397,6 +438,8 @@ impl Reassembler {
         live.data[f.offset..end].copy_from_slice(f.data);
         live.ranges = holes.ranges;
         live.total = total;
+        live.max_fragment_size = live.max_fragment_size.max(f.head.len() + f.data.len());
+        live.ecn = ecn;
         if f.offset == 0 {
             live.head = f.head.to_vec();
         }
@@ -412,7 +455,11 @@ impl Reassembler {
             let entry = self.entries.remove(idx);
             let charged = entry.charged;
             let live = entry.live.expect("live entry");
-            let result = self.finish(&live.head, &live.data, f.is_v6());
+            let provenance = f.is_v6().then_some(Ipv6Fragment {
+                id: entry.key.id,
+                max_size: live.max_fragment_size,
+            });
+            let result = self.finish(&live.head, &live.data, provenance, live.ecn & (1 << 3) != 0);
             drop(live);
             self.shrink(charged);
             return Ok(Some(result));
@@ -420,7 +467,14 @@ impl Reassembler {
         Ok(None)
     }
 
-    fn finish(&mut self, head: &[u8], data: &[u8], v6: bool) -> Push {
+    fn finish(
+        &mut self,
+        head: &[u8],
+        data: &[u8],
+        ipv6_fragment: Option<Ipv6Fragment>,
+        ce: bool,
+    ) -> Push {
+        let v6 = ipv6_fragment.is_some();
         let Some(len) = frag::reassembled_len(head.len(), v6, data.len()) else {
             self.stats.invalid += 1;
             return Push::Dropped(DropReason::Fragment);
@@ -432,7 +486,7 @@ impl Reassembler {
             },
             None => None,
         };
-        let Some(bytes) = frag::seal_packet(head, v6, data) else {
+        let Some(bytes) = frag::seal_packet(head, v6, data, ce) else {
             self.stats.invalid += 1;
             return Push::Dropped(DropReason::Fragment);
         };
@@ -441,6 +495,7 @@ impl Reassembler {
         Push::Complete(Reassembled {
             packet: OwnedPacket {
                 bytes,
+                ipv6_fragment,
                 _reservation: reservation,
             },
         })
@@ -479,6 +534,17 @@ impl Reassembler {
         self.entries.is_empty() && self.expired.is_empty()
     }
 
+    pub(crate) fn obligations(&self) -> impl Iterator<Item = (IpAddr, IpAddr, u8)> + Clone + '_ {
+        self.entries
+            .iter()
+            .filter(|entry| entry.live.is_some())
+            .map(|entry| (entry.key.src, entry.key.dst, entry.key.proto))
+            .chain(self.expired.iter().filter_map(|quote| {
+                crate::icmp_out::quote_metadata(quote)
+                    .map(|quote| (quote.source, quote.destination, quote.protocol))
+            }))
+    }
+
     /// Drops datagrams older than the timeout; those with fragment 0 queue an ICMP quote.
     pub(crate) fn expire(&mut self, now: Instant) {
         let timeout = self.limits.timeout;
@@ -496,8 +562,14 @@ impl Reassembler {
                 && self.expired.len() < MAX_PENDING_ICMP
             {
                 let cap = crate::icmp_out::quote_limit(entry.key.src.is_ipv6());
-                let l4 = QUOTE_L4
+                let prefix = live
+                    .ranges
+                    .first()
+                    .filter(|range| range.0 == 0)
+                    .map_or(0, |range| range.1);
+                let l4 = (if self.transit_quotes { 20 } else { QUOTE_L4 })
                     .min(live.data.len())
+                    .min(prefix)
                     .min(cap.saturating_sub(live.head.len()));
                 let mut quote = live.head;
                 quote.truncate(cap);
@@ -508,6 +580,22 @@ impl Reassembler {
             }
             self.shrink(entry.charged - retained);
         }
+    }
+
+    /// Transfers a queued quote's existing charge; exporting it needs no extra budget headroom.
+    pub(crate) fn take_expired(&mut self) -> Option<OwnedPacket> {
+        let quote = self.expired.pop_front()?;
+        let charged = quote.capacity();
+        let reservation = self
+            .budget
+            .as_ref()
+            .map(|budget| MemoryReservation::from_charged(Arc::clone(budget), charged));
+        self.bytes -= charged;
+        Some(OwnedPacket {
+            bytes: quote.into_boxed_slice(),
+            ipv6_fragment: None,
+            _reservation: reservation,
+        })
     }
 
     /// Emits queued Time Exceeded errors, one packet per call.
@@ -546,6 +634,7 @@ impl Reassembler {
     /// Recounts the charge and checks the limits and range invariants.
     #[cfg(any(test, feature = "fuzz-checks"))]
     pub(crate) fn check(&self) {
+        assert!(std::mem::size_of::<Entry>() <= ENTRY_OVERHEAD);
         assert!(self.entries.len() <= self.limits.max_entries);
         assert!(self.bytes <= self.limits.max_bytes);
         assert!(self.expired.len() <= MAX_PENDING_ICMP);
@@ -555,6 +644,7 @@ impl Reassembler {
             assert_eq!(e.charged, expect);
             sum += e.charged;
             if let Some(l) = &e.live {
+                assert!(l.ecn != 0 && l.ecn <= 15 && (l.ecn == 1 || l.ecn & 1 == 0));
                 assert!(l.holes() <= self.limits.max_holes);
                 assert!(l.ranges.windows(2).all(|w| w[0].1 < w[1].0));
                 assert_eq!(l.ranges.last().map_or(0, |r| r.1), l.data.len());
@@ -595,6 +685,7 @@ mod tests {
     use crate::wire::{self, ipv4, ipv6, udp};
     use std::net::SocketAddr;
 
+    mod ecn;
     mod expiry;
     mod ownership;
 

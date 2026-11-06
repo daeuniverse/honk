@@ -238,6 +238,7 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
     let client = "10.0.0.2:40000".parse().unwrap();
     let (mut io, server_seq) = handshake(&scope, now, client, 100);
     let old = io.flow_id();
+    let destination = io.local_addr();
     let retired = Arc::new(AtomicUsize::new(0));
     let callback_scope = scope.clone();
     let observed = Arc::clone(&retired);
@@ -276,6 +277,10 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
     assert_ne!(decode(&reset).0.flags & tcp::RST, 0);
     reset.release();
     assert_eq!(retired.load(Ordering::SeqCst), 0);
+    assert!(
+        scope.retains_tcp(client, destination),
+        "exported output retains Endpoint execution after app close"
+    );
     {
         let pending = retirement.wait();
         let mut pending = pin!(pending);
@@ -302,6 +307,54 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
             .flatten()
             .any(|slot| slot.id == new_io.flow_id())
     );
+}
+
+#[tokio::test]
+async fn class_selective_output_passes_wrapped_distinct_bulk_in_order() {
+    let now = Instant::now();
+    let budget = MemoryBudget::new(32 << 20);
+    let mut limits = limits();
+    limits.bulk_frames = 3;
+    let (scope, _owner) = PacketScope::new(config(), budget, limits, now).unwrap();
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let (mut io, server_seq) = handshake(&scope, now, client, 100);
+    let sender = scope.datagram_sender("203.0.113.9:53".parse().unwrap());
+    for _ in 0..2 {
+        sender.send_to(b"prime", client).await.unwrap();
+        output(&scope).release();
+    }
+    assert_eq!(scope.0.inner.lock().head, 3);
+    for (index, payload) in [b"first".as_slice(), b"second".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_write(&mut context(), payload),
+            Poll::Ready(Ok(n)) if n == payload.len()
+        ));
+        scope.drive(now + Duration::from_millis(index as u64));
+    }
+    assert_eq!(
+        scope.receive(&segment(client, 101, server_seq, tcp::ACK, b"data"), now),
+        Rx::Consumed
+    );
+    scope.drive(now + Duration::from_millis(50));
+    let Poll::Ready(Some(ack)) = scope.poll_output_class(&mut context(), TxClass::Control) else {
+        panic!("control output stranded behind wrapped bulk");
+    };
+    assert_eq!(decode(&ack).0.ack, 105);
+    assert!(
+        scope
+            .poll_output_class(&mut context(), TxClass::Control)
+            .is_pending()
+    );
+    for payload in [b"first".as_slice(), b"second".as_slice()] {
+        let bulk = output(&scope);
+        assert_eq!(bulk.class(), TxClass::Bulk);
+        assert_eq!(decode(&bulk).1, payload);
+        bulk.release();
+    }
+    assert!(scope.poll_output(&mut context()).is_pending());
 }
 
 #[test]
@@ -448,6 +501,7 @@ async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_on
     let sender = scope.datagram_sender(source);
     assert_eq!(sender.send_to(b"first", client).await.unwrap(), 5);
     let held = output(&scope);
+    assert!(scope.retains_source(client.ip()));
     let original_bytes = held.packet().to_vec();
     {
         let blocked = sender.send_to(b"cancelled", client);
@@ -457,6 +511,7 @@ async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_on
     assert!(scope.0.inner.lock().waiters.iter().all(Option::is_none));
     assert_eq!(held.packet(), original_bytes);
     held.release();
+    assert!(!scope.retains_source(client.ip()));
     let payload = vec![73; 4000];
     let before = budget.used();
     assert_eq!(
@@ -464,6 +519,7 @@ async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_on
         payload.len()
     );
     assert!(budget.used() > before);
+    assert!(scope.retains_source(client.ip()));
     let receiver_budget = MemoryBudget::new(32 << 20);
     let (receiver, receiver_owner) =
         PacketScope::new(config(), receiver_budget, limits(), now).unwrap();
@@ -475,6 +531,7 @@ async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_on
             Poll::Pending => break,
             Poll::Ready(None) => panic!("scope closed unexpectedly"),
         };
+        assert!(scope.retains_source(client.ip()));
         if let Rx::TransparentOwned {
             src,
             dst,
@@ -490,8 +547,12 @@ async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_on
             completed += 1;
         }
         packet.release();
+        if completed == 0 {
+            assert!(scope.retains_source(client.ip()));
+        }
     }
     assert_eq!(completed, 1);
+    assert!(!scope.retains_source(client.ip()));
     scope.shutdown(true);
     receiver.shutdown(true);
     owner.run().await;
@@ -688,4 +749,42 @@ async fn owner_join_and_retirement_wait_include_in_progress_core_callback() {
     consumer.join().unwrap();
     retirement.wait().await.unwrap();
     owners.join_next().await.unwrap().unwrap();
+}
+
+#[test]
+fn validated_source_callback_holds_the_output_mutex_before_control_output() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+    let mut observed = None;
+    let (rx, receipt) = scope.receive_with_source(
+        &segment(client, 100, 700, tcp::ACK, &[]),
+        now,
+        false,
+        |source, _| {
+            assert!(
+                scope.0.inner.try_lock().is_none(),
+                "an output consumer must not pass the receipt callback"
+            );
+            observed = Some(source);
+            true
+        },
+    );
+    let expected = honk_netstack::ValidatedSource {
+        src: client,
+        dst: "203.0.113.9:443".parse().unwrap(),
+        protocol: wire::PROTO_TCP,
+        tcp_flags: Some(tcp::ACK),
+    };
+    assert_eq!(observed, Some(expected));
+    assert_eq!(receipt, Some(expected));
+    assert_eq!(
+        rx,
+        Rx::Dropped(DropReason::NoFlow),
+        "receipt is not accepted-child or handshake evidence"
+    );
+    scope.drive(now);
+    let reset = output(&scope);
+    assert_eq!(decode(&reset).0.flags, tcp::RST);
+    reset.release();
 }

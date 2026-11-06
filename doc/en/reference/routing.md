@@ -219,6 +219,84 @@ routing {
 
 `proxy`, `hk`, and `resilient` are group names.
 
+## Core forwarding firewall and IPv4 NAT
+
+These typed actions belong to `datapath`, not `routing` outbound names. They require
+`backend: xdp`, `direct: core`, and explicitly configured `lan`/`wan` interfaces.
+They never change the existing TC backend, Endpoint relay, or native forwarding.
+
+```dae
+datapath {
+    backend: xdp
+    direct: core
+    interface { lan0: lan
+                wan0: wan }
+    firewall {
+        original {
+            lan: sip(10.0.0.0/24) && l4proto(tcp,udp) -> allow
+            default: drop
+        }
+        forward {
+            lan: ipversion(4,6) -> allow
+            default: drop
+        }
+    }
+    nat {
+        prerouting {
+            dip(198.51.100.1) && dport(8080) -> dnat(10.0.0.8:80)
+        }
+        postrouting {
+            sip(10.0.0.0/24) -> masquerade(40000-49999)
+        }
+    }
+}
+```
+
+`original` sees the original packet before DNAT; `forward` and `postrouting` see
+the DNAT-translated destination, before SNAT. Rules keep declaration order and
+reuse ordinary routing conditions. The optional `lan:`/`wan:` prefix selects the
+trusted capture-interface role, never a guessed source-address zone; no prefix
+deliberately matches either role. Domain, process and MAC predicates (including
+negations) are rejected because this path does not possess those authorities.
+Structured firewall/NAT conditions also reject unknown fields, including inside
+`not`: use the canonical `source_ip`, not `source_ips`. A typo is an error even
+when another matcher is valid; legacy traffic-routing field tolerance is unchanged.
+Firewall/NAT matcher calls require nonempty arguments and nonempty comma-separated
+elements. Empty calls such as `sip()` or `!pname()` cannot disappear into a broader
+rule. Nested blocks inside a rule chain are errors, not warning-only omissions.
+
+Both firewall chains default to `drop`. `allow` admits a new bidirectional owner;
+`drop` is silent; `reject` requests rate-limited administrative ICMP, including
+for eligible TCP (not a TCP reset). The shared refusal path suppresses responses
+to RST, ICMP errors, multicast and ineligible fragments and requires an authorized
+source and return route. Administrative rejection requires eligible input-FIB
+authority, including an actual prohibit result; directed-broadcast, LocalInput and
+unavailable authority do not grant it. A missing forward neighbor does not suppress
+an otherwise authorized TTL/MTU refusal when its return path is available.
+A rejection after DNAT quotes the original tuple, not the private translated target.
+A lone ACK is not established; UDP replies require the exact
+admitted peer and reverse interface identity. Current admitted owners bypass
+new-flow rules only until expiry or an explicit firewall/NAT revocation epoch.
+Retention never overrides the current traffic-routing `block` decision, including
+after a mode change or a route-only reload with an unchanged security epoch.
+Blocked packets allocate no new translated ID and do not renew an existing binding.
+
+`dnat(IPv4)` preserves the destination port; `dnat(IPv4:port)` replaces it.
+`snat(IPv4)` preserves the source port or fails on collision;
+`snat(IPv4,first-last)` allocates a unique source port. `masquerade()` uses
+1024–65535; `masquerade(first-last)` restricts that pool and requires one
+authoritative kernel-selected local IPv4 source for the actual egress. A separate,
+egress-constrained source-selection query may select a routed local address for an
+unnumbered capture port; it never replaces the real input-FIB decision. Source
+address/link incarnation changes revoke MASQUERADE, while ordinary route/neighbor
+refreshes do not. Combining DNAT and SNAT supports hairpin forwarding.
+NAT requires an explicit firewall. IPv6 supports firewall/routing,
+not translation; an IPv6 packet selecting a NAT action fails closed.
+Port exhaustion, ambiguous egress addresses and unsupported compositions do not
+fall back to Endpoint, native forwarding, or another backend.
+
+See [ownership, fragments and evidence limits](../design/datapath.md#core-forwarding-firewall-and-ipv4-nat).
+
 ## Related docs
 
 - [Routing design](../design/routing.md)
