@@ -754,6 +754,23 @@ mod tests {
         assert_eq!(body["lifecycle"]["state"], "running");
     }
 
+    /// The documented API shape of an interface binding degradation.
+    #[cfg(feature = "ebpf")]
+    #[tokio::test]
+    async fn runtime_projects_the_interface_binding_degradation() {
+        let state = state().await;
+        state.observation.attach_for_test();
+        crate::ebpf::interface::status::publish(
+            &state.observation.degradations,
+            Some(crate::ebpf::interface::status::EntryState::Unsupported),
+        );
+        let body = runtime_body(&state).await;
+        let entry = &body["degradations"][0];
+        assert_eq!(entry["component"], "interface_binding");
+        assert_eq!(entry["code"], "interface_binding_incomplete");
+        assert_eq!(entry["details"]["reason"], "unsupported_type");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn native_snapshot_fences_generation_and_health() {
         let state = state().await;

@@ -68,42 +68,62 @@ fn udp_flows_from_l2_clients_keep_their_listener() {
     }
 }
 
+/// Writes each frame with the last `link_header` bytes of its Ethernet header kept
+/// (0 bare IP, 14 full Ethernet) into an `_l3`-bound device.
+fn assert_l3_link_flows_keep_their_listener(
+    fixture: &mut NetworkFixture,
+    device: &mut std::fs::File,
+    link_header: usize,
+) {
+    let group = fixture.udp_group();
+    for (source, destination) in [
+        (
+            "10.82.0.2".parse::<IpAddr>().unwrap(),
+            "198.51.100.53".parse::<IpAddr>().unwrap(),
+        ),
+        (
+            "fd83::2".parse().unwrap(),
+            "2001:db8:81::53".parse().unwrap(),
+        ),
+    ] {
+        let mut used = [false; udp_group::LISTENERS];
+        for flow in 0..FLOWS {
+            let port = 45000 + flow * 7;
+            let bytes = packet(source, destination, IPPROTO_UDP, port, 53, DSCP_RAW_MUST, 0);
+            for _ in 0..DATAGRAMS {
+                device.write_all(&bytes[14 - link_header..]).unwrap();
+            }
+            assert_flow_on_lookup_listener(
+                fixture,
+                &group,
+                SocketAddr::new(source, port),
+                SocketAddr::new(destination, 53),
+                &mut used,
+            );
+        }
+        assert!(
+            used.iter().filter(|used| **used).count() >= 2,
+            "{destination}: flows did not spread over the listeners"
+        );
+    }
+}
+
 #[test]
 #[ignore = "requires root, Linux with TUN, SO_RCVMARK, HONK_ROUTING_TEST_OBJECT, redirect_peer, veth/netkit, and isolated netns support"]
 fn udp_flows_from_l3_tun_keep_their_listener() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(1);
         let mut tun = fixture.l3_tun();
-        let group = fixture.udp_group();
-        for (source, destination) in [
-            (
-                "10.82.0.2".parse::<IpAddr>().unwrap(),
-                "198.51.100.53".parse::<IpAddr>().unwrap(),
-            ),
-            (
-                "fd83::2".parse().unwrap(),
-                "2001:db8:81::53".parse().unwrap(),
-            ),
-        ] {
-            let mut used = [false; udp_group::LISTENERS];
-            for flow in 0..FLOWS {
-                let port = 45000 + flow * 7;
-                let bytes = packet(source, destination, IPPROTO_UDP, port, 53, DSCP_RAW_MUST, 0);
-                for _ in 0..DATAGRAMS {
-                    tun.write_all(&bytes[14..]).unwrap();
-                }
-                assert_flow_on_lookup_listener(
-                    &fixture,
-                    &group,
-                    SocketAddr::new(source, port),
-                    SocketAddr::new(destination, 53),
-                    &mut used,
-                );
-            }
-            assert!(
-                used.iter().filter(|used| **used).count() >= 2,
-                "{destination}: flows did not spread over the listeners"
-            );
-        }
+        assert_l3_link_flows_keep_their_listener(&mut fixture, &mut tun, 0);
+    });
+}
+
+#[test]
+#[ignore = "requires root, Linux with TUN, SO_RCVMARK, HONK_ROUTING_TEST_OBJECT, redirect_peer, veth/netkit, and isolated netns support"]
+fn udp_flows_from_rawip_typed_ethernet_link_keep_their_listener() {
+    isolated(|| {
+        let mut fixture = NetworkFixture::new(1);
+        let mut tap = fixture.rawip_tap();
+        assert_l3_link_flows_keep_their_listener(&mut fixture, &mut tap, 14);
     });
 }

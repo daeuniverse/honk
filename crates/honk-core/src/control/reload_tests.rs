@@ -81,6 +81,26 @@ fn udp_nfqueue_toggle_requires_restart() {
     );
 }
 
+/// Lazy binding only reconciles one fixed list of entries: changing either
+/// list is never applied by a reload.
+#[test]
+fn lan_and_wan_interface_changes_stay_restart_required() {
+    let current = Config::default();
+    let mut lan = current.clone();
+    lan.global.lan_interface = vec!["eth1".to_string()];
+    assert_eq!(
+        restart_required_changes(&current, &lan),
+        vec!["global.lan_interface"]
+    );
+    let mut wan = current.clone();
+    wan.global.wan_interface = vec!["auto".to_string(), "eth2".to_string()];
+    assert_eq!(
+        restart_required_changes(&current, &wan),
+        vec!["global.wan_interface"]
+    );
+    assert!(restart_required_changes(&lan, &lan.clone()).is_empty());
+}
+
 #[test]
 fn datapath_restart_identity_uses_effective_setup_not_policy() {
     use honk_config::datapath::{DatapathConfig, XskMode};
@@ -234,6 +254,65 @@ fn log_file_change_requires_restart() {
 }
 
 #[test]
+fn nfqueue_disabled_at_startup_is_not_a_restart_only_change() {
+    let mut current = Config::default();
+    current.global.nfqueue_enable = false;
+    let mut candidate = current.clone();
+    candidate.global.nfqueue_enable = true;
+    let log_files = super::LogFiles::default();
+    let downgrades = super::StartupDowngrades::default();
+    let changed = |current: &Config, candidate: &Config, downgrades| {
+        super::restart_required_fields(current, candidate, &log_files, downgrades)
+            .into_iter()
+            .map(|field| field.path)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        changed(&current, &candidate, &downgrades),
+        ["global.nfqueue_enable"]
+    );
+    assert_eq!(
+        changed(&candidate, &current, &downgrades),
+        ["global.nfqueue_enable"]
+    );
+
+    downgrades.record_nfqueue_unavailable();
+    assert!(changed(&current, &candidate, &downgrades).is_empty());
+    candidate.global.log_level = "debug".into();
+    assert_eq!(
+        changed(&current, &candidate, &downgrades),
+        ["global.log_level"]
+    );
+}
+
+#[tokio::test]
+async fn reload_after_nfqueue_startup_downgrade_installs_it_disabled() {
+    let cp = test_cp().await;
+    Arc::make_mut(&mut *cp.config_handle().write().await)
+        .global
+        .nfqueue_enable = false;
+    let mut candidate = cp.config_handle().read().await.as_ref().clone();
+    candidate.global.nfqueue_enable = true;
+    candidate.global.check_tolerance_ms += 1;
+    assert!(
+        !cp.reload_runtime_config(candidate.clone(), Default::default())
+            .await
+    );
+
+    cp.startup_downgrades().record_nfqueue_unavailable();
+    assert!(
+        cp.reload_runtime_config(candidate.clone(), Default::default())
+            .await
+    );
+    let active = cp.config_handle().read().await.clone();
+    assert!(!active.global.nfqueue_enable);
+    assert_eq!(
+        active.global.check_tolerance_ms,
+        candidate.global.check_tolerance_ms
+    );
+}
+
+#[test]
 fn restart_fields_resolve_the_candidate_log_file_through_the_cli_override() {
     let mut current = Config::default();
     current.global.log_file = "old.log".into();
@@ -244,7 +323,7 @@ fn restart_fields_resolve_the_candidate_log_file_through_the_cli_override() {
         effective: crate::resolved_log_file_path(&current, None),
     };
     assert_eq!(
-        super::restart_required_fields(&current, &replacement, &plain),
+        super::restart_required_fields(&current, &replacement, &plain, &Default::default()),
         vec![super::reload::RestartField {
             path: "global.log_file",
             message: "Changing global.log_file requires restarting honk",
@@ -255,7 +334,10 @@ fn restart_fields_resolve_the_candidate_log_file_through_the_cli_override() {
         effective: crate::resolved_log_file_path(&current, Some(&cli_override)),
         cli_override: Some(cli_override),
     };
-    assert!(super::restart_required_fields(&current, &replacement, &overridden).is_empty());
+    assert!(
+        super::restart_required_fields(&current, &replacement, &overridden, &Default::default())
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1066,6 +1148,7 @@ async fn first_subscription_publication_invalidates_source_revision() {
             honk_config::paths::data_dir().to_path_buf(),
             cp.config_handle(),
             cp.log_files(),
+            cp.startup_downgrades(),
             cp.diagnostics_handle(),
             cp.command_sender(),
             subscriptions.handle(),

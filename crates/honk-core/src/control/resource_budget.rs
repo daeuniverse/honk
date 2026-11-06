@@ -1,6 +1,8 @@
 //! Immutable process-wide descriptor partitioning for the control plane.
 
+use crate::control::dns_control::MAX_UDP_CLIENT_QUERIES;
 use crate::control::udp_endpoint::{MAX_ENDPOINTS, MAX_REPLY_SOCKETS_PER_ENDPOINT};
+use crate::dns::transport::DEFAULT_DNS_SOCKET_LIMIT;
 use crate::pool::MAX_TOTAL_ENTRIES;
 
 pub(crate) const MAX_EFFECTIVE_NOFILE: usize = 1_048_576;
@@ -8,7 +10,8 @@ const MAX_FIXED_RESERVE: usize = 256;
 const MAX_ACTIVE_TCP_FLOWS: usize = 16_384;
 const MAX_TRANSIENT_DIALS: usize = 1_024;
 const MAX_UDP_SLOW_PATH: usize = 256;
-const MAX_DNS_SLOW_PATH: usize = 256;
+// Sizing allowance for the boxed upstream future and multiple maximum-size wire copies.
+const DNS_UDP_QUERY_MEMORY_BYTES: u64 = 256 * 1024;
 const MAX_VLESS_CARRIERS: usize = 8_192;
 // About twice a measured Shadowsocks shared source (~35 KiB).
 const UDP_ENDPOINT_MEMORY_BYTES: u64 = 64 * 1024;
@@ -32,7 +35,8 @@ pub(crate) struct ResourceBudget {
     pub vless_carriers: usize,
     pub udp_endpoints: usize,
     pub udp_slow_path: usize,
-    pub dns_slow_path: usize,
+    pub dns_sockets: usize,
+    pub dns_udp_queries: usize,
     /// Bytes every WireGuard tunnel's netstack may hold together (see `honk_outbound`).
     pub wireguard_memory: u64,
 }
@@ -64,12 +68,16 @@ impl ResourceBudget {
                 .min(after_tcp_pool)
         };
         let after_dials = after_tcp_pool.saturating_sub(transient_dials);
+        let dns_sockets = transient_dials
+            .min(DEFAULT_DNS_SOCKET_LIMIT)
+            .min(after_dials);
+        let after_dns = after_dials.saturating_sub(dns_sockets);
         let vless_carriers = if cfg!(feature = "rprx") {
-            (after_dials / 8).min(MAX_VLESS_CARRIERS)
+            (after_dns / 8).min(MAX_VLESS_CARRIERS)
         } else {
             0
         };
-        let udp_endpoints = (after_dials.saturating_sub(vless_carriers)
+        let udp_endpoints = (after_dns.saturating_sub(vless_carriers)
             / UDP_ENDPOINT_DESCRIPTOR_COST)
             .min(MAX_ENDPOINTS);
 
@@ -82,19 +90,23 @@ impl ResourceBudget {
             vless_carriers,
             udp_endpoints,
             udp_slow_path: udp_endpoints.min(MAX_UDP_SLOW_PATH),
-            dns_slow_path: transient_dials.min(MAX_DNS_SLOW_PATH),
+            dns_sockets,
+            dns_udp_queries: MAX_UDP_CLIENT_QUERIES,
             wireguard_memory: WIREGUARD_MEMORY_DEFAULT,
         }
     }
 
-    /// Caps UDP endpoints at a quarter of RAM, budgeting `UDP_ENDPOINT_MEMORY_BYTES` each.
+    /// Caps UDP endpoints and DNS clients independently at a quarter of RAM each.
     pub(crate) fn with_memory(mut self, total_bytes: u64) -> Self {
         let cap = total_bytes / 4 / UDP_ENDPOINT_MEMORY_BYTES;
         self.udp_endpoints = self
             .udp_endpoints
             .min(usize::try_from(cap).unwrap_or(usize::MAX));
         self.udp_slow_path = self.udp_endpoints.min(MAX_UDP_SLOW_PATH);
-        // Tunnel netstacks are sized from RAM like the UDP endpoints above.
+        let dns_cap = total_bytes / 4 / DNS_UDP_QUERY_MEMORY_BYTES;
+        self.dns_udp_queries = self
+            .dns_udp_queries
+            .min(usize::try_from(dns_cap).unwrap_or(usize::MAX));
         self.wireguard_memory = (total_bytes / 8).clamp(WIREGUARD_MEMORY_MIN, WIREGUARD_MEMORY_MAX);
         self
     }
@@ -111,6 +123,7 @@ impl ResourceBudget {
         let non_tcp_budget = self
             .tcp_pool_entries
             .saturating_add(self.transient_dials)
+            .saturating_add(self.dns_sockets)
             .saturating_add(self.vless_carriers)
             .saturating_add(
                 self.udp_endpoints
@@ -137,6 +150,7 @@ impl ResourceBudget {
             )
             .saturating_add(self.tcp_pool_entries)
             .saturating_add(self.transient_dials)
+            .saturating_add(self.dns_sockets)
             .saturating_add(self.vless_carriers)
             .saturating_add(
                 self.udp_endpoints
@@ -171,7 +185,8 @@ mod tests {
             assert!(budget.vless_carriers <= MAX_VLESS_CARRIERS);
             assert!(budget.udp_endpoints <= MAX_ENDPOINTS);
             assert!(budget.udp_slow_path <= budget.udp_endpoints);
-            assert!(budget.dns_slow_path <= budget.transient_dials);
+            assert!(budget.dns_sockets <= DEFAULT_DNS_SOCKET_LIMIT);
+            assert!(budget.dns_udp_queries <= MAX_UDP_CLIENT_QUERIES);
         }
     }
 
@@ -218,6 +233,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dns_client_admission_is_memory_sized_not_descriptor_sized() {
+        const MIB: u64 = 1024 * 1024;
+        for (memory, clients) in [
+            (0, 0),
+            (128 * MIB, 128),
+            (256 * MIB, 256),
+            (1536 * MIB, 1536),
+            (16384 * MIB, 1536),
+        ] {
+            for nofile in [64, 1024, MAX_EFFECTIVE_NOFILE] {
+                let budget = ResourceBudget::for_nofile(nofile).with_memory(memory);
+                assert_eq!(budget.dns_udp_queries, clients);
+                assert!(budget.dns_udp_queries < 2048);
+                assert!(budget.dns_udp_queries as u64 * DNS_UDP_QUERY_MEMORY_BYTES <= memory / 4);
+            }
+        }
+    }
+
     #[cfg(not(feature = "rprx"))]
     #[test]
     fn udp_endpoints_reclaim_disabled_vless_partition() {
@@ -227,7 +261,8 @@ mod tests {
                 - budget.fixed_reserve
                 - budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
                 - budget.tcp_pool_entries
-                - budget.transient_dials;
+                - budget.transient_dials
+                - budget.dns_sockets;
             assert_eq!(
                 budget.udp_endpoints,
                 available / UDP_ENDPOINT_DESCRIPTOR_COST
@@ -243,6 +278,7 @@ mod tests {
                 + budget.active_tcp_flows * TCP_FLOW_DESCRIPTOR_COST
                 + budget.tcp_pool_entries
                 + budget.transient_dials
+                + budget.dns_sockets
                 + budget.vless_carriers;
             let endpoint_descriptors = budget.udp_endpoints * (2 + MAX_REPLY_SOCKETS_PER_ENDPOINT);
 
@@ -258,6 +294,7 @@ mod tests {
         let fully_reserved_fds = tcp_only_fds
             + budget.tcp_pool_entries
             + budget.transient_dials
+            + budget.dns_sockets
             + budget.vless_carriers
             + budget.udp_endpoints * UDP_ENDPOINT_DESCRIPTOR_COST;
 

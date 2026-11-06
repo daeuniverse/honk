@@ -282,7 +282,8 @@ while len(completed) < 4:
                 assert data == payload
                 conn.sendall(data)
         if nat and family == socket.AF_INET:
-            assert 40000 <= peer[1] <= 40003, peer
+            first_port = 40000 if mode == 'snat' else 40004
+            assert first_port <= peer[1] <= first_port + 3, peer
         completed.add((family, kind))
         print(mode, family, kind, peer, 'payload verified', flush=True)
 PY
@@ -419,7 +420,8 @@ write_config() {
     local file=$1 backend=$2 direct=$3 security= action= binding=
     if [[ -n ${5:-} ]]; then binding="xsk_mode: $5"; fi
     if [[ ${4:-} == snat || ${4:-} == masquerade ]]; then
-        if [[ $4 == snat ]]; then action='snat(203.0.113.1,40000-40003)'; else action='masquerade(40000-40003)'; fi
+        # Separate daemon profiles must not reuse the peer's retained TIME_WAIT tuple.
+        if [[ $4 == snat ]]; then action='snat(203.0.113.1,40000-40003)'; else action='masquerade(40004-40007)'; fi
         security="firewall {
         original { default: allow }
         forward { default: allow }
@@ -630,6 +632,9 @@ PY
     wait "$server_pid"
     server_pid=
     for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+    if [[ $profile == snat || $profile == masquerade ]]; then
+        ip netns exec server cat /proc/net/tcp >"$work/$profile.server-tcp.txt"
+    fi
     if [[ $profile == core || $profile == core-vlan ]]; then
         if [[ $profile == core-vlan ]]; then export HONK_XDP_INLINE_QINQ=1; fi
         python3 "$HONK_XDP_PROBE" check | tee "$work/$profile.native-boundary.log"

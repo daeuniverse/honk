@@ -1,6 +1,7 @@
 use super::*;
 
 mod attachment;
+mod bindings;
 mod btf_source;
 mod mandatory_helpers;
 mod raw_bpf;
@@ -39,6 +40,68 @@ fn cgroup_attached_prog_count(cgroup_fd: RawFd) -> u32 {
         }
     }
     total
+}
+
+/// Run `test` on a fresh thread in private mount and network namespaces with
+/// an isolated `/run`; a panic in `test` is re-raised on the caller.
+fn private_netns(test: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(move || {
+        nix::sched::unshare(
+            nix::sched::CloneFlags::CLONE_NEWNS | nix::sched::CloneFlags::CLONE_NEWNET,
+        )
+        .expect("create private test namespaces");
+        nix::mount::mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .expect("make test mounts private");
+        nix::mount::mount(
+            Some("tmpfs"),
+            "/run",
+            Some("tmpfs"),
+            nix::mount::MsFlags::empty(),
+            None::<&str>,
+        )
+        .expect("isolate test runtime directory");
+        test();
+    })
+    .join()
+    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+}
+
+pub(crate) fn fresh_netns() -> std::os::fd::OwnedFd {
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        std::fs::File::open("/proc/thread-self/ns/net")
+            .map(std::os::fd::OwnedFd::from)
+            .unwrap()
+    })
+    .join()
+    .unwrap()
+}
+
+pub(crate) fn in_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -> T {
+    let current = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
+    nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+    nix::sched::setns(&current, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+    match result {
+        Ok(value) => value,
+        Err(panic) => std::panic::resume_unwind(panic),
+    }
+}
+
+/// Production object loaded against a fresh test dae0 pair. The guard must
+/// outlive the backend.
+async fn load_bare(pin_root: &Path) -> (crate::daens::Dae0Guard, RealEbpfBackend) {
+    let (dae0, setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
+    let backend = RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, pin_root, 12345, &setup, 0)
+        .await
+        .expect("backend load");
+    (dae0, backend)
 }
 
 #[test]
@@ -126,150 +189,142 @@ fn missing_dae0peer_attach_failure_is_propagated() {
     .expect("peer attach regression thread");
 }
 
-/// Regression test: every link aya hands us (TC, cgroup sock/sock_addr)
-/// stays owned by the backend until its interface is forgotten or global
-/// shutdown. Forgetting a startup WAN must release its TCX links so the
-/// watcher can bind the same interface again without `EEXIST`.
-#[tokio::test]
+/// All configured TCX and cgroup links stay owned until unbind or shutdown.
+#[test]
 #[ignore = "requires root; run via just test-netns"]
-async fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
-    use std::os::fd::AsRawFd;
-    let cgroup_path = detect_cgroup_path().expect("required cgroup2 mount");
-    let cgroup_file = std::fs::File::open(&cgroup_path).unwrap();
-    let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-link-test-{}", std::process::id()));
-    // Other agents (systemd, …) may legitimately hold root-cgroup programs;
-    // only the delta belongs to this backend.
-    let baseline = cgroup_attached_prog_count(cgroup_file.as_raw_fd());
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        None,
-        "lo",
-        false,
-    )
-    .await
-    .expect("backend load");
-    syscall::reset_udp_decision_sequence_locked(backend.bpf().unwrap(), 2)
-        .expect("locked sequence reset");
-    assert_eq!(
-        backend
-            .udp_decision_sequence_status()
-            .expect("sequence status after reset"),
-        UdpDecisionSequenceStatus {
-            next: 0,
-            generation: 2,
-        }
-    );
+fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
+    std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+        let mut netlink = crate::netlink::NlSock::new().unwrap();
+        netlink
+            .add_veth_pair("lifecycle-wan", "lifecycle-peer")
+            .unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cgroup_path = detect_cgroup_path().expect("required cgroup2 mount");
+            let cgroup_file = std::fs::File::open(&cgroup_path).unwrap();
+            let pin_root =
+                Path::new("/sys/fs/bpf").join(format!("honk-link-test-{}", std::process::id()));
+            // Other agents (systemd, …) may legitimately hold root-cgroup programs;
+            // only the delta belongs to this backend.
+            let baseline = cgroup_attached_prog_count(cgroup_file.as_raw_fd());
+            let (_dae0, mut backend) = load_bare(&pin_root).await;
+            backend.bind_test_interfaces(&[], &["lifecycle-wan"]);
+            syscall::reset_udp_decision_sequence_locked(backend.bpf().unwrap(), 2)
+                .expect("locked sequence reset");
+            assert_eq!(
+                backend
+                    .udp_decision_sequence_status()
+                    .expect("sequence status after reset"),
+                UdpDecisionSequenceStatus {
+                    next: 0,
+                    generation: 2,
+                }
+            );
 
-    let staged_key = TuplesKey {
-        l4proto: libc::IPPROTO_UDP as u8,
-        ..TuplesKey::default()
-    };
-    backend
-        .udp_conn_state_store(
-            &staged_key,
-            &ConnState {
-                state: UdpDecisionState::Pending as u8,
-                decision_token: 42,
-                incarnation: 42,
-                ..ConnState::default()
-            },
-        )
-        .expect("seed newer staged token");
-    let (_, result) = crate::ebpf::retire_fixture(
-        &mut backend,
-        staged_key,
-        RetireKind::Udp {
-            token: 41,
-            incarnation: Some(41),
-            pending_only: false,
-        },
-    );
-    assert_eq!(result, UdpDecisionCommitResult::Superseded);
-    assert_eq!(
-        backend
-            .conn_state_lookup(&staged_key)
-            .expect("newer staged lookup")
-            .expect("newer staged state retained")
-            .decision_token,
-        42,
-        "stale cleanup must not overwrite or delete the newer token"
-    );
-    assert!(
-        backend
-            .hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, &staged_key)
-            .expect("retirement fence lookup")
-            .is_none(),
-        "completed stale cleanup must release its exact fence"
-    );
-    crate::ebpf::retire_fixture(
-        &mut backend,
-        staged_key,
-        RetireKind::Udp {
-            token: 42,
-            incarnation: Some(42),
-            pending_only: false,
-        },
-    );
+            let staged_key = TuplesKey {
+                l4proto: libc::IPPROTO_UDP as u8,
+                ..TuplesKey::default()
+            };
+            backend
+                .udp_conn_state_store(
+                    &staged_key,
+                    &ConnState {
+                        state: UdpDecisionState::Pending as u8,
+                        decision_token: 42,
+                        incarnation: 42,
+                        ..ConnState::default()
+                    },
+                )
+                .expect("seed newer staged token");
+            let (_, result) = crate::ebpf::retire_fixture(
+                &mut backend,
+                staged_key,
+                RetireKind::Udp {
+                    token: 41,
+                    incarnation: Some(41),
+                    pending_only: false,
+                },
+            );
+            assert_eq!(result, UdpDecisionCommitResult::Superseded);
+            assert_eq!(
+                backend
+                    .conn_state_lookup(&staged_key)
+                    .expect("newer staged lookup")
+                    .expect("newer staged state retained")
+                    .decision_token,
+                42,
+                "stale cleanup must not overwrite or delete the newer token"
+            );
+            assert!(
+                backend
+                    .hash_lookup::<_, RetirementFence>(RETIRE_FENCE_MAP, &staged_key)
+                    .expect("retirement fence lookup")
+                    .is_none(),
+                "completed stale cleanup must release its exact fence"
+            );
+            crate::ebpf::retire_fixture(
+                &mut backend,
+                staged_key,
+                RetireKind::Udp {
+                    token: 42,
+                    incarnation: Some(42),
+                    pending_only: false,
+                },
+            );
 
-    // Five cgroup identity links + the sock_ops child-proof link + wan_ingress/wan_egress on lo.
-    let held = held_bpf_link_count();
-    assert!(
-        held >= 8,
-        "expected >= 8 held bpf links after load, got {held}"
-    );
-    assert_eq!(
-        cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
-        baseline + 6,
-        "all 5 cgroup capture programs and the sock_ops proof must stay attached after load"
-    );
+            // Five cgroup identity links, sock_ops child proof and the two WAN TCX links.
+            let held = held_bpf_link_count();
+            assert!(
+                held >= 8,
+                "expected >= 8 held bpf links after load, got {held}"
+            );
+            assert_eq!(
+                cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
+                baseline + 6,
+                "all 5 cgroup capture programs and the sock_ops proof must stay attached after load"
+            );
 
-    let lo_ifindex = std::fs::read_to_string("/sys/class/net/lo/ifindex")
-        .expect("lo ifindex")
-        .trim()
-        .parse()
-        .expect("numeric lo ifindex");
-    backend.forget_dynamic_interface(lo_ifindex);
-    let hooks = backend
-        .attach_dynamic_interface("lo", crate::ebpf::IfaceRole::Wan, false)
-        .expect("primary WAN rebind");
-    assert_eq!(
-        hooks,
-        crate::ebpf::DynamicHooks {
-            ingress: true,
-            egress: true,
-        }
-    );
-    assert_eq!(
-        held_bpf_link_count(),
-        held,
-        "rebind must replace, not stack, the two WAN TCX links"
-    );
+            backend.bind_test_interfaces(&[], &[]);
+            assert_eq!(held_bpf_link_count(), held - 2);
+            backend.bind_test_interfaces(&[], &["lifecycle-wan"]);
+            assert_eq!(backend.owned_bindings().count(), 2);
+            assert_eq!(
+                held_bpf_link_count(),
+                held,
+                "rebind must replace, not stack, the two WAN TCX links"
+            );
 
-    backend.detach_hooks().expect("detach_hooks");
-    assert_eq!(
-        held_bpf_link_count(),
-        0,
-        "detach_hooks must release every link"
-    );
-    assert_eq!(
-        cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
-        baseline,
-        "detach_hooks must detach the cgroup programs"
-    );
-    backend.cleanup().await.expect("cleanup");
-    for name in [
-        UDP_DECISION_SEQUENCE_MAP,
-        routing::ROUTING_GENERATION_SEQUENCE_MAP,
-    ] {
-        assert!(
-            pin_root.join(name).exists(),
-            "ordinary cleanup must preserve {name}"
-        );
-        std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
-    }
-    std::fs::remove_dir(&pin_root).expect("remove test pin root");
+            backend.detach_hooks().expect("detach_hooks");
+            assert_eq!(
+                held_bpf_link_count(),
+                0,
+                "detach_hooks must release every link"
+            );
+            assert_eq!(
+                cgroup_attached_prog_count(cgroup_file.as_raw_fd()),
+                baseline,
+                "detach_hooks must detach the cgroup programs"
+            );
+            backend.cleanup().await.expect("cleanup");
+            for name in [
+                UDP_DECISION_SEQUENCE_MAP,
+                routing::ROUTING_GENERATION_SEQUENCE_MAP,
+            ] {
+                assert!(
+                    pin_root.join(name).exists(),
+                    "ordinary cleanup must preserve {name}"
+                );
+                std::fs::remove_file(pin_root.join(name)).expect("remove test allocator pin");
+            }
+            std::fs::remove_dir(&pin_root).expect("remove test pin root");
+        });
+    })
+    .join()
+    .expect("link lifecycle namespace thread");
 }
 
 /// Counts tracing links held by this process. Unlike `held_bpf_link_count`, only a vanished
@@ -302,16 +357,22 @@ async fn bare_load_holds_no_tracing_links() {
         0,
         "tracing links already held before load"
     );
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        None,
-        "lo",
-        false,
-    )
-    .await
-    .expect("backend load");
+    let (_dae0, mut backend) = load_bare(&pin_root).await;
+    for program in crate::ebpf::interface::TcProgram::ALL {
+        let info = backend
+            .bpf()
+            .unwrap()
+            .program(program.name())
+            .unwrap()
+            .info()
+            .unwrap_or_else(|error| panic!("{} was not preloaded: {error}", program.name()));
+        assert_ne!(info.id(), 0);
+    }
+    assert_eq!(
+        backend.owned_bindings().count(),
+        0,
+        "load must not attach configured interfaces"
+    );
     assert_eq!(
         held_tracing_link_count().expect("count tracing links after load"),
         0,
@@ -378,16 +439,7 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
             .unwrap();
     }
 
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        None,
-        "lo",
-        false,
-    )
-    .await
-    .expect("backend load");
+    let (_dae0, mut backend) = load_bare(&pin_root).await;
     for name in obsolete {
         assert!(!pin_root.join(name).try_exists().unwrap(), "{name}");
     }
@@ -454,16 +506,11 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
 async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        None,
-        "lo",
-        false,
-    )
-    .await
-    .expect("backend load");
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
+    let mut backend =
+        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
+            .await
+            .expect("backend load");
     let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("initial sequence map info")
         .id();
@@ -479,16 +526,10 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     backend.detach_hooks().expect("detach hooks");
     backend.cleanup().await.expect("cleanup");
 
-    let mut reloaded = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        None,
-        "lo",
-        false,
-    )
-    .await
-    .expect("backend reload");
+    let mut reloaded =
+        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
+            .await
+            .expect("backend reload");
     assert_eq!(
         aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
             .expect("reloaded sequence map info")
@@ -573,6 +614,7 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         std::process::id()
     ));
     std::fs::create_dir_all(&pin_root).unwrap();
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
     let pin = pin_root.join(routing::ROUTING_GENERATION_SEQUENCE_MAP);
     for (entries, flags, value) in [
         (2, 0, 17),
@@ -580,20 +622,13 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         (1, 0, DNS_ROUTE_GENERATION_MAX + 1),
     ] {
         let mut sequence = AyaArray::<_, u64>::create(entries, flags).unwrap();
-        sequence.set(0, value, 0).unwrap();
+        sequence.set(0, &value, 0).unwrap();
         sequence.map().pin(&pin).unwrap();
         let id = sequence.map().info().unwrap().id();
         assert!(
-            RealEbpfBackend::load(
-                crate::DEFAULT_BPF_OBJECT,
-                &pin_root,
-                12345,
-                None,
-                "lo",
-                false
-            )
-            .await
-            .is_err()
+            RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
+                .await
+                .is_err()
         );
         assert_eq!(aya::maps::MapInfo::from_pin(&pin).unwrap().id(), id);
         assert_eq!(sequence.get(&0, 0).unwrap(), value);
@@ -614,16 +649,7 @@ async fn pname_is_ready_before_first_packet() {
     let pin_root = Path::new("/sys/fs/bpf").join(format!("honk-pname-test-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&pin_root);
     std::fs::create_dir_all(&pin_root).expect("create test pin root");
-    let mut backend = RealEbpfBackend::load(
-        crate::DEFAULT_BPF_OBJECT,
-        &pin_root,
-        12345,
-        Some("lo"),
-        "lo",
-        true,
-    )
-    .await
-    .expect("load backend for pname test");
+    let (_dae0, mut backend) = load_bare(&pin_root).await;
 
     let worker = std::thread::Builder::new()
         .name("worker-thread".into())
@@ -690,7 +716,7 @@ async fn pname_is_ready_before_first_packet() {
                 .unwrap(),
         )
         .unwrap()
-        .insert(&socket, retained, 0)
+        .insert(&socket, &retained, 0)
         .unwrap();
         let duplicate = socket.try_clone().expect("duplicate socket FD");
         drop(socket);
@@ -779,6 +805,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let mut netlink = crate::netlink::NlSock::new().unwrap();
         let (loopback, _) = netlink.get_link("lo").unwrap();
         netlink.set_link_up(loopback, true).unwrap();
+        netlink
+            .add_veth_pair("observe-veth", "observe-peer")
+            .unwrap();
         let mut backend = RealEbpfBackend::load_routing_test_fixture(
             crate::DEFAULT_BPF_OBJECT,
             DaeParam::default(),
@@ -790,7 +819,7 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         assert_eq!(before.routing, DatapathCheck::Absent);
         assert_eq!(before.admission, Some(false));
 
-        backend.attach_lan("lo", false).unwrap();
+        backend.bind_test_interfaces(&["observe-veth"], &[]);
         let router = crate::routing::Router::new(&[], "direct").unwrap();
         let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
             &router,
@@ -823,12 +852,12 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         );
         assert_eq!(checked.admission, Some(true));
         assert_eq!(checked.listeners_published, Some(true));
-        // Both lo hooks are verified, but the fixture's required dae0 and
+        // Both veth hooks are verified, but the fixture's required dae0 and
         // daens hooks are not, so no attached claim is made.
         assert_eq!(checked.hooks, DatapathCheck::Unknown);
         assert_eq!(checked.attachments.len(), 2);
         assert!(checked.attachments.iter().all(|attachment| {
-            attachment.interface == "lo" && attachment.state == DatapathCheck::Verified
+            attachment.interface == "observe-veth" && attachment.state == DatapathCheck::Verified
         }));
         let capacity = backend
             .hash_map::<TuplesKey, honk_ebpf_common::FlowMapValue<ConnState>>("CONN_STATE_MAP")
@@ -850,7 +879,7 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let old_descriptor = root.get(&0, 0).unwrap();
         let mut foreign_descriptor = AyaArray::<_, RoutingPolicyDescriptor>::create(1, 0).unwrap();
         foreign_descriptor
-            .set(0, old_descriptor.get(&0, 0).unwrap(), 0)
+            .set(0, &old_descriptor.get(&0, 0).unwrap(), 0)
             .unwrap();
         let root = backend
             .bpf_mut()

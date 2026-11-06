@@ -451,11 +451,14 @@ async fn spawn_https_dns(
     (addr, count)
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn discover_ech_config_caches_positive_and_negative() {
     use std::sync::atomic::Ordering as AOrd;
-    let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
+    if crate::bootstrap::run_global_test_in_child(
+        "tls::tests::discover_ech_config_caches_positive_and_negative",
+    ) {
+        return;
+    }
 
     // Positive: two lookups for the same name cost one DNS query.
     let (addr, count) = spawn_https_dns(Some(b"\x00\x01ech-bytes".to_vec()), 120).await;
@@ -488,11 +491,12 @@ async fn discover_ech_config_caches_positive_and_negative() {
 
 /// End-to-end: `ech_enabled` with no static config discovers the
 /// ECHConfigList via DNS and completes a real ECH handshake.
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn ech_discovery_end_to_end() {
     static ECH_CONFIG_LIST: &[u8] = include_bytes!("../../tests/fixtures/echconfiglist");
-    let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
+    if crate::bootstrap::run_global_test_in_child("tls::tests::ech_discovery_end_to_end") {
+        return;
+    }
 
     let (addr, _count) = spawn_https_dns(Some(ECH_CONFIG_LIST.to_vec()), 300).await;
     crate::bootstrap::set_global(crate::bootstrap::BootstrapResolver::parse(&format!(

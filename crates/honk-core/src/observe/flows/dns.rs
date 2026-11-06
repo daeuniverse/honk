@@ -547,6 +547,10 @@ fn with_lookup<T>(capture: impl FnOnce(&LookupState) -> T) -> Option<T> {
         .flatten()
 }
 
+pub(crate) fn cache_entry_demanded() -> bool {
+    with_lookup(|_| ()).is_some()
+}
+
 fn authority() -> Option<(FlowObserver, Arc<DnsRecorder>)> {
     let observer = flow_observation::current()?;
     let Some(api) = DNS_API.try_with(Weak::upgrade).ok().flatten() else {

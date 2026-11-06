@@ -40,10 +40,10 @@ for field in ("wall_ns", "cpu_ns", "allocations", "bytes_allocated"):
     ratio = new / old if old else float("inf")
     ratios[field] = ratio
     rows.append(f"| {field} | {old} | {new} | {ratio:.3f}x |")
-    if old and new > old * 1.20:
+    if field in ("allocations", "bytes_allocated") and old and new > old * 1.20:
         failures.append(f"candidate {field} regressed by more than 20% ({ratio:.3f}x)")
 
-report = "\n".join(["## Identical reload benchmark", "", *rows, "", *(["PASS"] if not failures else ["FAIL", *[f"- {failure}" for failure in failures]])])
+report = "\n".join(["## Identical reload benchmark", "", "Wall/CPU ratios are advisory on shared runners; allocation growth, no-op counters and the one-second wall time limit still gate.", "", *rows, "", *(["PASS"] if not failures else ["FAIL", *[f"- {failure}" for failure in failures]])])
 print(report)
 if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
     with Path(summary).open("a") as output:

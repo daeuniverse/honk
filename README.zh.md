@@ -1,90 +1,92 @@
+<div align="center">
+
 # honk
 
-[English](./README.md) | 中文
+**用 Rust 编写的实验性 Linux 透明代理引擎。**
 
-<a id="chinese"></a>
+**[文档](https://daeuniverse.org/zh-CN/honk/)** / **[网页界面示范](https://demo.daeuniverse.org/)** / **[下载](https://github.com/daeuniverse/honk/releases)**
 
-honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据面和配置语法受 [dae](https://github.com/daeuniverse/dae) 启发；出站组、多协议拨号器和 Clash 兼容 API 沿用 [sing-box](https://github.com/SagerNet/sing-box) 的设计思路。honk 是独立实现，并非任一项目的逐行移植。
+[English](README.md) / 简体中文
+
+[功能概览](#功能概览) / [安装](#安装) / [网页界面](#网页界面) / [报告问题](#报告问题)
+
+</div>
 
 > **早期 alpha，不建议用于生产。** 可能发生破坏性变更，部分功能尚未完成，真实环境验证仍然有限。
 
+honk 的 eBPF 数据面和配置语法参考 dae 的设计，出站组与 Clash API 参考 sing-box 的设计。它是独立实现，并非任一项目的移植。
+
 ## 功能概览
 
-- 透明 TCP/UDP：通过 TC eBPF、`dae0`/`daens` 和 Linux 6.12+ 上的编译路由处理 LAN 转发及本机发起的流量。
-- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS、单 peer WireGuard（基于内置 `honk-netstack` TCP/UDP 栈的用户态隧道），以及内建的 `direct` 和 `block`。Trojan/VMess/VLESS 支持 H2 XHTTP profile（`packet-up`、`stream-up`、`stream-one`）；VMess 仍仅支持 TCP。各协议限制见[节点参考](doc/zh/reference/nodes.md)和[网络栈设计](doc/zh/design/netstack.md)。
-- 组策略：Selector、URLTest、LoadBalance、Fallback 和 Score。Score 使用业务观测与有界验证，通过 `policy: score` 选择；省略策略仍为 Selector。详见[组参考](doc/zh/reference/groups.md#score-策略)。
+- 透明 TCP/UDP：通过 TC eBPF、`dae0`/`daens` 和编译路由处理 LAN 转发及本机发起的流量。显式配置的 [XDP 后端](doc/zh/design/datapath.md#full-xdp-启动)提供 Endpoint/Core 执行，可选用 Core 防火墙/NAT，不会自动回退。
+- 出站：SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess、VLESS、基于内置 sans-I/O `honk-netstack` TCP/UDP 栈的单 peer WireGuard，以及 `direct` 和 `block`。Trojan/VMess/VLESS 支持 H2 XHTTP（`packet-up`、`stream-up`、`stream-one`）；VMess 仅支持 TCP。详见[协议限制](doc/zh/reference/nodes.md)和[网络栈设计](doc/zh/design/netstack.md)。
+- 组策略：Selector（默认）、URLTest、LoadBalance、Fallback 和 Score。Score 使用业务观测与有界验证，详见[组策略参考](doc/zh/reference/groups.md#score-策略)。
 - DNS：支持 UDP、TCP、DoT、DoH、DoQ、DoH3 上游，可经节点或组出站，并提供路由和缓存。
 - 配置与控制：dae 语法、订阅、重载、Clash 兼容 REST/WebSocket API，以及 `honk-tool` CLI 工具箱。
 
-已实现不等于完成 review，见 [Review 状态](#review-状态)。不提供 FakeIP 引擎、完整 mihomo 兼容性或 Windows/macOS 数据面。
+不提供 FakeIP 引擎、完整 mihomo 兼容性或 Windows/macOS 数据面。
 
-## 开始使用
+## 安装
 
-真实透明代理需要 **root、Linux 6.12+、所需内核选项和 bpffs**。首次部署会修改网络 hook、命名空间和 sysctl；须保留带外管理通道。
+从 [Releases](https://github.com/daeuniverse/honk/releases) 下载适合目标平台的归档。发布物支持 x86_64 与 aarch64 Linux，一般用途建议选择 `full`。
 
-1. 按[启动指南](doc/zh/how-to-start.md)检查内核、安装程序、准备 direct-only 配置并验证连通性。
-2. 从 [Releases](https://github.com/daeuniverse/honk/releases) 下载匹配的二进制，每个 release 的 Downloads 一节说明各个归档，可用 `SHA256SUMS` 校验；或按指南准备源码构建依赖。发布二进制内嵌 eBPF 对象；源码构建需要启用 `ebpf` feature。仅运行 `cargo build --release` **不会**启用真实数据面。
-3. 按[配置指南](doc/zh/configuration.md)添加节点、组、路由和 DNS。仓库提供[完整示例](config.dae)和[最小开发示例](config.min.dae)；使用前须调整接口和节点地址。
+| 构建 | 原生 API | Clash API | 内嵌 doona 与 doona lite |
+| --- | --- | --- | --- |
+| `full` | 是 | 是 | 是 |
+| `native-api` | 是 | 否 | 否 |
+| `clash-api` | 否 | 是 | 否 |
 
-[文档索引](doc/README.md)汇总双语指南、参考和子系统设计。实现细节可从[架构概览](doc/zh/design/overview.md)、[节点参考](doc/zh/reference/nodes.md)或 [API 参考](doc/zh/reference/api.md)开始。
+各构建均提供静态链接的 musl 版本，`full` 另提供链接 glibc 的 `gnu` 版本。名称含 `stock` 的归档使用系统分配器而非 jemalloc。每个版本的 Downloads 一节列出校验和及构建来源证明。
 
-## 运行与升级注意事项
+Debian、Ubuntu、Fedora、openSUSE 和 Arch Linux 的软件包安装见[安装指南](https://daeuniverse.org/zh-CN/honk/installation/)。OpenWrt 用户可使用 [daeuniverse 软件源](https://daeuniverse.org/zh-CN/openwrt/)。
 
-- **UDP NFQUEUE 默认开启：**它在 conntrack/NAT 前保留仍有歧义的 LAN 转发首包。设置 `global.nfqueue_enable: false` 可关闭；修改后需要重启。Mock 模式、不带 `ebpf` 的构建或队列不可用时，会记录 warning 并在本进程禁用暂存。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`；同一网络命名空间中的防火墙管理器不得修改它们。详见 [NFQUEUE 设计](doc/zh/design/nfqueue.md)。
-- **VLESS 升级：**`vless_mode` 已删除，所有 VLESS 节点 ID 都会重新派生。升级前须迁移静态链接及缓存/provider 内容，离线升级尤其需要提前迁移。仍可用的按名称保存的 Selector 选择和持久化延迟样本应保留。UDP 权限、packet encoding 和多路复用是独立设置。详见[迁移指南](doc/zh/reference/nodes.md#从-vless_mode-迁移)和 [VLESS 设计](doc/zh/design/outbound.md#vless-wire-契约)。
+自行编译请按[从源码构建](doc/zh/how-to-start.md#从源码构建)准备。发布二进制内嵌 eBPF；仅执行 `cargo build --release` 不会启用真实数据面。
 
-## 可选原生观测 API
+按[启动指南](doc/zh/how-to-start.md)检查内核、安装程序并验证连通性。首次部署会修改网络 hook、命名空间和 sysctl，须保留带外管理通道。
 
-以 `--features native-api` 构建（full 与 `-native-api` 发布产物已包含）并配置 `experimental.native_api`，可在 `127.0.0.1:9527` 独立观测用户态连接与记录流、节点与组健康、出站计数、RSS/cgroup、历史、事件、结构化安全日志、DNS 与 provider 状态。支持有界探测、路由模拟、精确连接关闭与缓存失效、provider refresh、分网络 Selector 控制与临时设置。除显式启用的匿名 loopback 访问外，均要求 bearer secret 或密码登录。可托管可信目录，或以 `--features native-ui` 和 `ui: embedded` 使用固定版本的 doona，运行时不下载 UI。
+## 网页界面
 
-`.dae` 仍是唯一配置权威。启动时捕获的源支持元数据读取、离线校验、授权源 PUT 和受限组 PATCH。主文件节点/provider 的创建与删除在实际激活后才返回成功，geodata 更新 operation 激活已验证的内容。编辑已有条目继续使用源 PUT；`--store db` 将已接受的源记录为状态数据库中的 revision。凭据源只读，返回正文时遮蔽 listener secret 值。启用原生 API 时，与 Clash 共用非持久化模式；成功的显式激活（含 no-op）重置 Rule 与设置，provider/network refresh 保留它们。原生 runtime mode、暂停/恢复与完整内核 flow 观测仍未开放。详见[原生 API 参考](doc/zh/reference/api.md#原生-api)。
+honk 可配合以下两类网页界面使用：
+
+- [doona](https://github.com/Zakkaus/doona)：基于原生 API，提供运行观测、诊断与配置编辑功能。doona lite 为其轻量预览版。在线演示见[标准版](https://demo.daeuniverse.org/)与 [lite 版](https://demo.daeuniverse.org/lite/)。
+- Clash 面板：基于 Clash 兼容 API，例如 [zashboard](https://github.com/Zephyruso/zashboard)。
+
+![doona 活动页的流量图表与状态卡片](https://daeuniverse.org/doona/screenshots/zh-CN/activity-light.webp)
+
+![doona lite 节点页](https://daeuniverse.org/doona/images/lite-nodes-light.webp)
+
+使用 `full` 构建时，在 `experimental.native_api` 中将 `ui` 设为 `'embedded'` 即可启用 doona，设为 `'embedded-lite'` 则启用 doona lite。`native-api` 构建可将 `ui` 设为另行[安装的 doona](https://daeuniverse.org/zh-CN/doona/install) 所在目录。配置步骤见 [doona 快速入门](https://daeuniverse.org/zh-CN/doona/quick-start)。启用 Clash 面板需配置 `experimental.clash_api`，honk 首次启动时自动下载 zashboard。各设置项的说明见 [experimental 设置](doc/zh/reference/experimental.md)。
+
+## 文档
+
+[文档索引](doc/README.md)汇总中英文配置指南、原生与 Clash API 参考、子系统设计及运维指南。
 
 ## 版本与兼容性
 
-- 自 `v0.1.0` 起，发布遵循 [SemVer](https://semver.org/lang/zh-CN/)；带 `-alpha.N`、`-beta.N` 或 `-rc.N` 后缀的 tag 为预发布。`1.0` 之前，次版本可能改变配置或行为，其发布说明会列出升级前需要处理的事项。
-- 运行要求：root 权限与 Linux 6.12+，并启用[启动指南](doc/zh/how-to-start.md)列出的内核选项；架构为 `x86_64` 或 `aarch64`，gnu 或 musl。
-- 配置使用 dae 语法，见[配置指南](doc/zh/configuration.md)。
-- 原生 API 固定在 `/api/v1` 下，仍需通过 `experimental.native_api` 显式启用；`1.0` 之前可能在次版本中变化。`GET /api/v1/version` 返回契约标识。
-- 每个 release 的 Downloads 一节列出全部归档，并附带 `SHA256SUMS` 与构建来源证明。安全问题请按[安全策略](.github/SECURITY.md)私下报告。
+- 自 `v0.1.0` 起，发布遵循 [SemVer](https://semver.org/lang/zh-CN/)；带 `-alpha.N`、`-beta.N` 或 `-rc.N` 后缀的标签为预发布。`1.0` 之前，次版本可能改变配置或行为，升级前应阅读发布说明。
+- 透明代理需要 root 权限、Linux 6.12+、所需内核选项和 bpffs。详见上方链接的启动指南。
+- 配置使用 [dae 语法](doc/zh/configuration.md)。修改已有部署前，请查阅 [NFQUEUE 运行说明](doc/zh/design/nfqueue.md)和 [VLESS 迁移指南](doc/zh/reference/nodes.md#从-vless_mode-迁移)。
+- 原生 API 使用 `/api/v1`，其契约在 `1.0` 之前可能随次版本变化。`GET /api/v1/version` 返回契约标识。
 
 ## 开发
 
-工作区包含配置、共享 eBPF 类型、NFQUEUE、出站、核心和工具 crate。`crates/honk-ebpf` 中的内核程序单独构建。构建依赖和命令见[启动指南](doc/zh/how-to-start.md#从源码构建)与 [Justfile](Justfile)。
+工作区包含配置、共享 eBPF 类型、NFQUEUE、netstack、datapath、XSK、出站、核心和工具 crate；`crates/honk-ebpf` 单独构建。详见 [Justfile](Justfile) 与[贡献政策](CONTRIBUTING.md)。
 
 无 root 的用户态开发可使用 [mock 模式](doc/zh/how-to-start.md#无-root-开发)。`--mock-ebpf` 不会拦截流量，不能代替数据面测试。
 
-### Debug 构建
+滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)提供来自 `main` 的最新 `debug.*` 测试构建。它们使用 release profile，并非 Cargo debug profile；保留期限与发布流程见[发布规则](.agents/rules/release.md)。
 
-两次发布之间，维护者会从 `main` 发布 `debug.*` 构建：供测试的 release profile 二进制，并非 Cargo debug profile 构建。滚动的 [Debug 预发布](https://github.com/daeuniverse/honk/releases/tag/debug)始终是最新一次构建，不会标为 Latest；每个 debug tag 都保留各自的 release：最新的九个其他 tag，加上重跑刚更新的那个 tag。与正式版一样，它们附带 `SHA256SUMS`、构建来源证明与 Downloads 一节。发布细节见[发布规则](.agents/rules/release.md)。
+## 报告问题
 
-## Review 状态
+代理、路由和 DNS 问题请提交至 [honk issues](https://github.com/daeuniverse/honk/issues)；网页界面问题请提交至 [doona issues](https://github.com/Zakkaus/doona/issues)。
 
-多数用户态子系统主要由 AI 编写，维护者只完成了部分 review，主要关注 eBPF。以下复选框表示**维护者 review 状态，而非功能是否可用**：
+安全漏洞请按 [SECURITY.md](.github/SECURITY.md) 报告。
 
-- [x] eBPF 路由、map 与语义
-- [x] 控制面
-- [x] AnyTLS / Shadowsocks（含 2022）/ SOCKS5
-- [x] RPRX（VLESS / XTLS / XHTTP / WSS / REALITY），不含 XHTTP
-- [ ] WireGuard / `honk-netstack`（新的用户态 TCP/UDP 栈，完全由 AI 编写）
-- [ ] Trojan-GFW（需要 UoT 实现）
-- [x] DNS 逻辑
-- [ ] 配置解析器（dae 扩展）
-- [x] 重载逻辑
-- [x] 工具
-
-在所有当前尚未 review 的代码完成 review，并处理所有未经验证的 AI 生成实现前，不会发布 `test.1` release tag。
-
-### TODO
-
-- [ ] 评估 AF_XDP 与 XDP 路径以进一步提升性能
-- [ ] 在 Clash 兼容 API 之外添加 honk 专用 REST API
-- [ ] 添加入站支持
-
-其他工作见 [Issues](https://github.com/daeuniverse/honk/issues) 和 [Discussions](https://github.com/daeuniverse/honk/discussions)。
+多数用户态子系统主要由 AI 编写，维护者只完成了部分审查，主要关注 eBPF。WireGuard、`honk-netstack` 和显式 XDP/Core 路径仍须维护者审查。自动化检查不能替代[人工审查与 AI 使用披露要求](CONTRIBUTING.md#5-responsibility-for-ai-assisted-work)。
 
 ## 致谢
 
-- [dae](https://github.com/daeuniverse/dae) / [daed-rs](https://github.com/daeuniverse/daed-rs)：eBPF 透明代理谱系
+- [dae](https://github.com/daeuniverse/dae) / daed-rs：eBPF 透明代理谱系
 - [sing-box](https://github.com/SagerNet/sing-box)：出站组与 Clash API 模式
 - [daeuniverse/outbound](https://github.com/daeuniverse/outbound)：协议参考
 - [juicity-rs](https://github.com/juicity/juicity-rs)（Markson Pigeonzilla Plus）：Juicity 协议参考、wire 格式对齐及真实互通测试
@@ -92,9 +94,17 @@ honk 是用 Rust 编写的实验性 Linux 透明代理引擎。其 eBPF 数据�
 
 ## 许可证
 
+[GPL-3.0-only](LICENSE)。
+
 ```text
 SPDX-License-Identifier: GPL-3.0-only
 Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 ```
 
 仅用于开发的 [dae 解析器 oracle](tools/dae-parse/README.md)链接了 dae（AGPL-3.0-only）。它不随发布物分发，也不链接进 `honk-core`。
+
+## TODO
+
+- [ ] 在真实硬件上测量 AF_XDP/XDP 性能；后端已经实现不代表已通过硬件、ARM 或性能验收
+- [ ] 添加入站支持
+- [ ] 探索 macOS 与 Windows 支持；数据面基于 Linux eBPF，这两个平台需要另一种接管流量的方式

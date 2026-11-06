@@ -26,13 +26,13 @@ honk-core [OPTIONS] [COMMAND]
 
 Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
-The CLI and Clash API share a build-time version: release builds use the GitHub tag name; local Git builds use `git describe --tags --always --match 'v*'` (the tag, or the nearest tag plus commit distance and hash). Without usable Git metadata, the Cargo package version is used. Git is not required at runtime.
+The CLI and Clash API share a build-time version: release builds use the GitHub tag name. Local Git builds use `git describe --tags --always --match 'v*'` (the tag, or the nearest tag plus commit distance and hash). Without usable Git metadata, the Cargo package version is used. Git is not required at runtime.
 
 Use matching `honk-core`, `honk-tool`, and BPF object versions; incompatible objects and pinned handoff layouts are rejected under the [datapath ABI contract](../design/datapath.md#map-inventory).
 
 ### Log-level precedence
 
-The source comment records the intended order as `--debug` → `RUST_LOG` → `global.log_level` → `info`. The current executable first chooses the debug/config default and then calls `EnvFilter::try_from_default_env()`, so a valid `RUST_LOG` currently wins:
+A valid `RUST_LOG` currently wins over the other log-level settings. The executable chooses the debug/config default, then calls `EnvFilter::try_from_default_env()`. The source comment instead describes the intended order as `--debug` → `RUST_LOG` → `global.log_level` → `info`:
 
 | Current priority | Source | Behavior |
 | --- | --- | --- |
@@ -76,11 +76,9 @@ An exhausted [compiled-routing publication counter](../design/routing.md#synchro
 | `RUST_LOG` | Both binaries | Tracing filter. It has the effective `honk-core` precedence described above; `honk-tool` otherwise defaults to `warn`. |
 | `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Highest-precedence dashboard ZIP URL; overrides `assets.ui.url` when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
-| `HONK_QUIC_GSO=0|1` | QUIC outbounds | Forces UDP GSO off/on. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
-| `HONK_QUIC_BBR=v1|v3` | QUIC outbounds | Selects the controller behind the `bbr` congestion setting: TUIC `congestion_control: bbr`, Juicity, and Hysteria2 without an upload rate. `v3` is BBRv3. `v1` is quinn's original BBR, which ignores loss; quinn-proto 0.11.16+ receivers can abort its uploads on high-BDP paths with `too many gaps in stream buffer`. The default is `v3`; other values warn and keep the default. |
-| `HONK_MI_COLLECT_SECS` | `honk-core` with `mimalloc` | Per-owner idle collection interval. A periodic rendezvous wakes persistently parked owners only while every other worker is idle; forced collection remains in each owner's park hook. Default `60`; `0` disables both the hook and rendezvous; an invalid value falls back to `60`. |
-| `MIMALLOC_PURGE_DELAY` | `honk-core` with `mimalloc` | mimalloc's own purge delay in milliseconds: how long freed pages stay committed before they are returned to the OS. honk starts with `100` (mimalloc v3's default is `1000`), which lowers RSS under connection, probe and DNS churn without a measurable bulk-relay throughput or CPU change; any value set in the environment takes precedence, including an unparsable one, which leaves mimalloc's `1000`. `0` purges immediately (lowest RSS, slightly more CPU) and `-1` never purges. |
-| `TOKIO_WORKER_THREADS` | `honk-core` | Tokio's own worker count. `honk-core` builds a default multi-thread runtime, so it follows the core count. It must be a positive integer: `0` or a non-number makes Tokio panic at startup. Every worker keeps its own allocator heap, so a lower value reduces RSS on many-core gateways (lab, 120 connections plus DNS on a 4-core host: about 85 MiB with 16 workers, 66 MiB with 8 and 60 MiB with 4, CPU within noise). The relay path runs on these workers; size the value to the traffic. |
+| `HONK_QUIC_GSO=0\|1` | QUIC outbounds | Forces UDP GSO off/on. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
+| `HONK_QUIC_BBR=v1\|v3` | QUIC outbounds | Selects the controller behind the `bbr` congestion setting: TUIC `congestion_control: bbr`, Juicity, and Hysteria2 without an upload rate. `v3` is BBRv3. `v1` is quinn's original BBR, which ignores loss; quinn-proto 0.11.16+ receivers can abort its uploads on high-BDP paths with `too many gaps in stream buffer`. The default is `v3`; other values warn and keep the default. |
+| `TOKIO_WORKER_THREADS` | `honk-core` | Tokio's own worker count. `honk-core` builds a default multi-thread runtime, so it follows the core count. It must be a positive integer: `0` or a non-number makes Tokio panic at startup. Every worker keeps its own allocator heap, so a lower value reduces RSS on many-core gateways. In a lab measurement with 120 connections plus DNS on a 4-core host, RSS was about 85 MiB with 16 workers, 66 MiB with 8, and 60 MiB with 4. CPU differences were within noise. The relay path runs on these workers; size the value to the traffic. |
 | `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF shared by process-name routing and native UDP receive tracing. The file must match the running kernel. An explicit unreadable or invalid override refuses real-backend startup rather than falling back to another file. TCP ownership proof reads no kernel structures and does not depend on it. |
 | `DAE_LOCATION_ASSET` | Geo loading in both binaries | Directory checked first for `geoip.dat` and `geosite.dat`. |
 
@@ -134,7 +132,7 @@ The current `just build-musl` and `just deploy-vyos` recipes build and deploy on
 | `geosite` | List, inspect, and reverse-search `geosite.dat`. |
 | `geoip` | List, inspect, and longest-prefix search `geoip.dat`. |
 
-The binary provides `-h`/`--help` and `-v`/`--version`, with help on every command family and action. Its build version matches `honk-core`.
+The binary provides `-h`/`--help` and `-v`/`--version`. Each command family and action has its own help. The build version matches `honk-core`.
 
 ### `sub`
 
@@ -161,25 +159,64 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | `--v4-target IP:PORT` | `1.1.1.1:443` | Explicit IPv4 address for the v4 connectivity probe. |
 | `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | Explicit IPv6 address for the v6 connectivity probe. |
 
-Remote subscriptions and local files share the engine's automatic format detection: encoded/raw share links, Clash YAML/JSON, SIP008, sing-box JSON, and supported Surge/Surfboard/Loon/Quantumult X records. Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
+Remote subscriptions and local files share the engine's automatic format detection:
 
-For each node, the command reports server address families, full proxied IPv4 and IPv6 exchanges, proxied URLTest latency, a DNS query through the packet handler, and a real QUIC handshake through that handler. VLESS rows carry this redacted shape, with no endpoint, UUID, REALITY key, SNI, or URL query:
+- Encoded or raw share links.
+- Clash YAML/JSON, SIP008, and sing-box JSON.
+- Supported Surge/Surfboard/Loon/Quantumult X records.
+
+Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
+
+For each node, the command reports:
+
+- Server address families.
+- Full proxied IPv4 and IPv6 exchanges.
+- Proxied URLTest latency.
+- A DNS query through the packet handler.
+- A real QUIC handshake through that handler.
+
+VLESS rows use this redacted format, without the endpoint, UUID, REALITY key, SNI, or URL query:
 
 ```text
 vless/{plain|tls|reality}/{tcp|ws|grpc|xhttp}[/vision]/tcp={plain|h2mux|mux-cool}/{udp-fallback=auto|native|xudp|uot-v2|udp=disabled}[/padding=true|false][/mux=TCP:UDP:POLICY]
 ```
 
-`tcp=` reports the effective TCP path. `udp-fallback=` reports the normalized fallback field even when H2MUX or Xray mux currently owns the target UDP path; `udp=disabled` means packet dialing is forbidden. `padding=` is present only for H2MUX. For Xray mux, `TCP` is the effective per-carrier TCP logical-child concurrency (`0` means disabled), `UDP` is `protocol`, `shared`, or the per-carrier logical-child concurrency of a separate UDP pool, and `POLICY` is `reject`, `skip`, or `allow` for UDP/443. Example shapes include `vless/tls/tcp/tcp=plain/udp-fallback=native`, `vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true`, and `vless/tls/tcp/vision/tcp=plain/udp-fallback=auto/mux=0:8:allow`.
+| VLESS output field | Meaning |
+| --- | --- |
+| `tcp=` | Effective TCP path. |
+| `udp-fallback=` | Normalized fallback, even when H2MUX or Xray mux owns the target UDP path. |
+| `udp=disabled` | Packet dialing is forbidden. |
+| `padding=` | Present only for H2MUX. |
+| Xray mux `TCP` | Effective logical-child concurrency per TCP carrier; `0` means disabled. |
+| Xray mux `UDP` | `protocol`, `shared`, or the logical-child concurrency per carrier in a separate UDP pool. |
+| Xray mux `POLICY` | UDP/443 policy: `reject`, `skip`, or `allow`. |
+
+Example shapes:
+
+- `vless/tls/tcp/tcp=plain/udp-fallback=native`
+- `vless/reality/grpc/tcp=h2mux/udp-fallback=auto/padding=true`
+- `vless/tls/tcp/vision/tcp=plain/udp-fallback=auto/mux=0:8:allow`
 
 `xhttp` identifies the H2 XHTTP transport; the row does not expose its path, HTTP host, extra headers or padding contents. The transport's mode and supported parameter profile are documented in the [node reference](./nodes.md#xhttp-over-h2).
 
-Probe eligibility is `supported`, `invalid-uuid`, `invalid-reality`, `invalid-config`, `unsupported-transport`, `unsupported-flow`, or `vision-without-tls`/`vision-non-tcp`; invalid and intentionally unsupported entries remain visible but perform no network work. Vision may use TCP only with an eligible direct carrier, while UDP-only Xray mux remains valid. VLESS Encryption can combine with Vision; only unencrypted Vision additionally requires TLS 1.3 or REALITY on raw TCP.
+| Probe eligibility | Network work |
+| --- | --- |
+| `supported` | Eligible for probes. |
+| `invalid-uuid`, `invalid-reality`, `invalid-config` | Entry remains visible but performs no network work. |
+| `unsupported-transport`, `unsupported-flow`, `vision-without-tls`, `vision-non-tcp` | Entry remains visible but performs no network work. |
+
+Vision TCP requires an eligible direct carrier; UDP-only Xray mux remains valid. VLESS Encryption can combine with Vision. Only unencrypted Vision additionally requires TLS 1.3 or REALITY on raw TCP.
 
 `n/a` means a probe was not applicable, for example because packet dialing is disabled or UDP/443 policy rejects that target. A local carrier-capacity refusal is an attempted terminal failure and appears as `FAIL(...)`, not `n/a`; it remains neutral to remote endpoint health. The shared global file-descriptor budget can admit fewer physical VLESS carriers than the per-node mux limits request.
 
 UDP DNS target resolution, packet-transport setup, send, and receive share one `--timeout` budget. A resolution failure or timeout is reported only in the DNS column; TCP, URLTest, and QUIC probes continue. Unsupported UDP nodes skip this resolution, and a failed hostname is never replaced with another target.
 
-Each non-QUIC column of a node is capped separately at `--timeout` plus one second. URLTest and the family probes give dial, target TLS and each exchange their own `--timeout`, so a slow cold carrier setup can reach that cap; the column then reports `timeout` (or `n/a` where UDP policy rejects the target) while the other columns keep their results. The QUIC column allows two additional seconds for joined teardown; cleanup time is not a latency sample.
+| Probe column | Time limit |
+| --- | --- |
+| Each non-QUIC column | `--timeout` plus one second, independently per column. |
+| QUIC | Two additional seconds for joined teardown. Cleanup time is not a latency sample. |
+
+URLTest and family probes give dial, target TLS, and each exchange their own `--timeout`. Slow cold-carrier setup can therefore reach the column cap. That column reports `timeout`, or `n/a` when UDP policy rejects the target. Other columns retain their results.
 
 UDP DNS hostname targets use a shared asynchronous resolver with the first numeric nameserver in `/etc/resolv.conf` (UDP port `53`) and `/etc/hosts` when present, rather than blocking NSS lookup. This path does not apply NSS plugins or resolver search suffixes. An unavailable resolver is a DNS-column `resolve` failure, not a fallback to a public resolver; literal targets need no resolver.
 
@@ -241,7 +278,20 @@ honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark
 | `--pin-root PATH` | `/sys/fs/bpf` | Root used for pinned-map presence and statistics reads. |
 | `--tproxy-mark VALUE` | `134217728` (`0x08000000`) | Expected fwmark in the `daens` policy rule. |
 
-The check is read-only. It looks for an engine process (`honk-core`, `honk`, or `dae`), `/var/run/netns/daens`, `/sys/class/net/dae0`, the fwmark rule inside `daens`, required pinned maps, readable occupancy/overflow statistics, and a successful HTTP response from `<api>/version`. The API check prints `[ok]` with the body for a 2xx status, or `[FAIL]` with the status text for a non-2xx status. Standard output ends with `diagnose: all checks passed` or `diagnose: N issue(s) found`. Failed checks cause exit status `1` and an error message with the issue count; all checks passing gives exit status `0`.
+The check is read-only and inspects:
+
+- an engine process named `honk-core`, `honk`, or `dae`;
+- `/var/run/netns/daens` and `/sys/class/net/dae0`;
+- the fwmark rule inside `daens`;
+- required pinned maps and readable occupancy/overflow statistics;
+- a successful HTTP response from `<api>/version`.
+
+| Result | Output |
+| --- | --- |
+| API returns 2xx | `[ok]` followed by the response body. |
+| API returns non-2xx | `[FAIL]` followed by the status text. |
+| All checks pass | Standard output ends with `diagnose: all checks passed`; exit status `0`. |
+| A check fails | Standard output ends with `diagnose: N issue(s) found`; exit status `1` and an error message containing the issue count. |
 
 The statistics check has the same possible-CPU file and pinned-map layout prerequisites as `bpf stats`. A preparation failure prints `[FAIL] map stats read`, contributes to the issue count, and causes a nonzero exit.
 
@@ -266,7 +316,19 @@ honk-tool geoip [--file PATH] lookup <ip>
 | `geoip lookup <ip>` | Return every code/CIDR tie at the longest matching prefix. |
 | `--file PATH` | Global per-family override for the corresponding `.dat` file. |
 
-Without `--file`, the tool searches the first existing regular file in this order: `$DAE_LOCATION_ASSET/<name>.dat`, `/var/lib/honk/<name>.dat`, legacy `/var/share/honk/<name>.dat`, `./<name>.dat`, `/usr/local/share/honk/<name>.dat`, `/usr/share/honk/<name>.dat`, `/usr/local/share/dae/<name>.dat`, `/usr/share/dae/<name>.dat`, then `/etc/dae/<name>.dat`. Unlike `honk-core`, the tool does not load a config to discover a custom `global.data_dir`. Output is one record per line and handles a closed downstream pipe without a panic.
+Without `--file`, the tool selects the first existing regular file in this order:
+
+1. `$DAE_LOCATION_ASSET/<name>.dat`
+2. `/var/lib/honk/<name>.dat`
+3. `/var/share/honk/<name>.dat` (legacy root)
+4. `./<name>.dat`
+5. `/usr/local/share/honk/<name>.dat`
+6. `/usr/share/honk/<name>.dat`
+7. `/usr/local/share/dae/<name>.dat`
+8. `/usr/share/dae/<name>.dat`
+9. `/etc/dae/<name>.dat`
+
+Unlike `honk-core`, the tool does not load a config to discover a custom `global.data_dir`. Output is one record per line. A closed downstream pipe does not cause a panic.
 
 ## Related docs
 

@@ -20,7 +20,7 @@ use tokio_rustls::rustls::{self, ServerConfig};
 use crate::dns::endpoint::DnsEndpoint;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query, parse_dns_question};
 use crate::dns::routing::DnsRouter;
-use crate::dns::transport::{DialContext, DohClient, DotPool, ProxyDial, TcpPool};
+use crate::dns::transport::{DialContext, ProxyDial, TcpPool};
 use crate::dns::upstream_pool::UpstreamPool;
 use crate::dns::{DnsResolver, cache::DnsCache};
 use crate::proxy::{PacketOutbound, PacketTransport, ProtocolEntry, ProxyStream, TcpOutbound};
@@ -198,6 +198,7 @@ impl Drop for PacketWorkerTeardown {
 struct TestPacketHandler {
     active: Arc<AtomicUsize>,
     runtime_dials: Arc<AtomicUsize>,
+    protocol: NodeProtocol,
     fault: Option<Arc<PacketWorkerFault>>,
 }
 
@@ -252,7 +253,7 @@ impl PacketOutbound for TestPacketHandler {
         _target_domain: Option<&str>,
         _connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
-        assert_eq!(runtime.node.protocol(), NodeProtocol::Socks5);
+        assert_eq!(runtime.node.protocol(), self.protocol);
         self.runtime_dials.fetch_add(1, Ordering::SeqCst);
         self.open(target).await
     }
@@ -265,11 +266,12 @@ pub(super) struct ProxiedQuicFixture {
 }
 
 pub(super) fn proxied_quic_fixture(endpoint: DnsEndpoint) -> ProxiedQuicFixture {
-    proxied_quic_fixture_with_fault(endpoint, None)
+    proxied_quic_fixture_for_protocol(endpoint, NodeProtocol::Socks5, None)
 }
 
-fn proxied_quic_fixture_with_fault(
+fn proxied_quic_fixture_for_protocol(
     endpoint: DnsEndpoint,
+    protocol: NodeProtocol,
     fault: Option<Arc<PacketWorkerFault>>,
 ) -> ProxiedQuicFixture {
     let active = Arc::new(AtomicUsize::new(0));
@@ -277,16 +279,16 @@ fn proxied_quic_fixture_with_fault(
     let handler = Arc::new(TestPacketHandler {
         active: Arc::clone(&active),
         runtime_dials: Arc::clone(&runtime_dials),
+        protocol,
         fault,
     });
     let mut registry = crate::proxy::ProxyRegistry::new();
     registry.register(
-        ProtocolEntry::new(NodeProtocol::Socks5, Arc::clone(&handler))
-            .with_packet(Arc::clone(&handler)),
+        ProtocolEntry::new(protocol, Arc::clone(&handler)).with_packet(Arc::clone(&handler)),
     );
     let mut node = Node {
         name: "packet-proxy".into(),
-        outbound: honk_config::node::OutboundConfig::from_protocol(NodeProtocol::Socks5),
+        outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
         address: "127.0.0.1:1".into(),
         host: "127.0.0.1".into(),
         port: 1,
@@ -302,6 +304,7 @@ fn proxied_quic_fixture_with_fault(
             endpoint,
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: Some(ProxyDial {
                 registry: Arc::new(registry),
                 generation: Some(generation),
@@ -467,6 +470,7 @@ async fn tcp_pool_reuses_connection() {
         endpoint: ep,
         query_timeout: Duration::from_secs(2),
         dial_timeout: Duration::from_secs(2),
+        socket_budget: Default::default(),
         proxy: None,
     });
     let q = build_dns_query("example.com", 1);
@@ -479,7 +483,7 @@ async fn tcp_pool_reuses_connection() {
 }
 
 #[tokio::test]
-async fn dot_pool_roundtrip() {
+async fn tls_length_prefixed_framing_roundtrip() {
     let (server_cfg, roots) = self_signed_server_config();
     let acceptor = TlsAcceptor::from(Arc::new(server_cfg));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -491,13 +495,6 @@ async fn dot_pool_roundtrip() {
         serve_length_prefixed_dns(&mut tls).await;
     });
 
-    let ep = DnsEndpoint::parse(
-        &format!("{}:{}", addr.ip(), addr.port()),
-        DnsProtocol::Tls,
-        Some("localhost"),
-    )
-    .unwrap();
-
     // Build client with roots trusting our self-signed cert.
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider.into())
@@ -507,8 +504,6 @@ async fn dot_pool_roundtrip() {
         .with_no_client_auth();
     client_cfg.alpn_protocols = vec![b"dot".to_vec()];
 
-    // Use low-level dial + exchange through a one-off TLS stream to avoid
-    // changing DotPool's public API; still validates endpoint + framing path.
     let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
     let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
     let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
@@ -520,21 +515,11 @@ async fn dot_pool_roundtrip() {
             .unwrap();
     assert!(resp.len() >= 12);
     assert_eq!(&resp[0..2], &q[0..2]);
-    let _ = (
-        ep,
-        DotPool::new(DialContext {
-            endpoint: DnsEndpoint::parse("127.0.0.1:1", DnsProtocol::Tls, Some("localhost"))
-                .unwrap(),
-            query_timeout: Duration::from_secs(1),
-            dial_timeout: Duration::from_secs(1),
-            proxy: None,
-        }),
-    );
     server.await.unwrap();
 }
 
 #[tokio::test]
-async fn doh_post_over_h2_roundtrip() {
+async fn h2_post_dns_roundtrip() {
     // Minimal H2 server: accept TLS with h2 ALPN, speak one POST response.
     let (mut server_cfg, roots) = self_signed_server_config();
     server_cfg.alpn_protocols = vec![b"h2".to_vec()];
@@ -574,14 +559,6 @@ async fn doh_post_over_h2_roundtrip() {
         while conn.accept().await.is_some() {}
     });
 
-    let ep = DnsEndpoint::parse(
-        &format!("localhost:{}/dns-query", addr.port()),
-        DnsProtocol::Https,
-        Some("localhost"),
-    )
-    .unwrap();
-
-    // Custom DohClient-equivalent with trusted roots.
     let provider = rustls::crypto::aws_lc_rs::default_provider();
     let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider.into())
         .with_safe_default_protocol_versions()
@@ -619,20 +596,6 @@ async fn doh_post_over_h2_roundtrip() {
     }
     crate::dns::transport::restore_dns_id(&mut buf, orig);
     assert!(buf.len() >= 12);
-    let _ = (
-        ep,
-        DohClient::new(DialContext {
-            endpoint: DnsEndpoint::parse(
-                "127.0.0.1/dns-query",
-                DnsProtocol::Https,
-                Some("localhost"),
-            )
-            .unwrap(),
-            query_timeout: Duration::from_secs(1),
-            dial_timeout: Duration::from_secs(1),
-            proxy: None,
-        }),
-    );
     server.abort();
 }
 
@@ -901,31 +864,4 @@ async fn live_google_doh_request_path() {
     assert!(fd2 < Duration::from_millis(50), "cache hit should be µs–ms");
 
     eprintln!("=== path OK ===\n");
-}
-
-#[tokio::test]
-async fn doq_doh3_clients_construct() {
-    let ep = DnsEndpoint::parse("127.0.0.1", DnsProtocol::Quic, Some("localhost")).unwrap();
-    assert!(
-        crate::dns::transport::DoqClient::new(DialContext {
-            endpoint: ep,
-            query_timeout: Duration::from_secs(1),
-            dial_timeout: Duration::from_secs(2),
-            proxy: None,
-        })
-        .await
-        .is_ok()
-    );
-    let ep3 =
-        DnsEndpoint::parse("127.0.0.1/dns-query", DnsProtocol::H3, Some("localhost")).unwrap();
-    assert!(
-        crate::dns::transport::Doh3Client::new(DialContext {
-            endpoint: ep3,
-            query_timeout: Duration::from_secs(1),
-            dial_timeout: Duration::from_secs(2),
-            proxy: None,
-        })
-        .await
-        .is_ok()
-    );
 }

@@ -21,7 +21,7 @@ use tokio::task::{JoinHandle, JoinSet};
 const PASSWORD: &str = "shared-source-test-password";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SharedUdpMode {
+pub(in crate::control::tests) enum SharedUdpMode {
     Shadowsocks,
     Socks5,
     Trojan,
@@ -29,24 +29,27 @@ pub(super) enum SharedUdpMode {
 
 /// One client datagram as the server relayed it to its destination.
 #[derive(Debug)]
-pub(super) struct SharedUdpPacket {
+pub(in crate::control::tests) struct SharedUdpPacket {
     /// Serial of the client association (UDP source for SS, control TCP
     /// connection for SOCKS5/Trojan): equal values mean one association.
-    pub(super) association: u64,
-    pub(super) target: SocketAddr,
+    pub(in crate::control::tests) association: u64,
+    pub(in crate::control::tests) target: SocketAddr,
     /// The association's single egress socket, the address peers see.
-    pub(super) mapping: SocketAddr,
-    pub(super) payload: Vec<u8>,
+    pub(in crate::control::tests) mapping: SocketAddr,
+    pub(in crate::control::tests) payload: Vec<u8>,
 }
 
-pub(super) struct SharedUdpPeer {
-    pub(super) node: Node,
-    pub(super) packets: UnboundedReceiver<SharedUdpPacket>,
+pub(in crate::control::tests) struct SharedUdpPeer {
+    pub(in crate::control::tests) node: Node,
+    pub(in crate::control::tests) packets: UnboundedReceiver<SharedUdpPacket>,
     task: JoinHandle<anyhow::Result<()>>,
 }
 
 impl SharedUdpPeer {
-    pub(super) async fn start(mode: SharedUdpMode, bind: SocketAddr) -> anyhow::Result<Self> {
+    pub(in crate::control::tests) async fn start(
+        mode: SharedUdpMode,
+        bind: SocketAddr,
+    ) -> anyhow::Result<Self> {
         let (events, packets) = unbounded_channel();
         let (address, task) = match mode {
             SharedUdpMode::Shadowsocks => {
@@ -95,7 +98,7 @@ impl SharedUdpPeer {
 
     /// A peer failure (bad frame, auth mismatch) surfaces here instead of as a
     /// silent hang; a healthy peer is simply stopped.
-    pub(super) async fn close(self) -> anyhow::Result<()> {
+    pub(in crate::control::tests) async fn close(self) -> anyhow::Result<()> {
         if self.task.is_finished() {
             return self.task.await?;
         }

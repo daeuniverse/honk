@@ -83,6 +83,7 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
         .await
         .expect("bind fallback TCP endpoint");
     let original_dst = tcp.local_addr().expect("fallback endpoint address");
+    let budget = crate::dns::transport::DnsSocketBudget::new(1);
     let udp = tokio::net::UdpSocket::bind(original_dst)
         .await
         .expect("bind UDP endpoint on TCP port");
@@ -104,6 +105,7 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
     let query = make_a_query();
 
     let response = asis_test_forwarder()
+        .with_socket_budget(budget.clone())
         .resolve_with_context_and_profile(
             &query,
             DnsRequestMeta::new(None, Some(original_dst)),
@@ -122,6 +124,47 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
     assert_eq!(udp_query, query);
     assert_eq!(tcp_query, query);
     assert_eq!(&response[response.len() - 4..], &[203, 0, 113, 11]);
+    assert_eq!(budget.available_sockets(), 1);
+}
+
+#[tokio::test]
+async fn asis_socket_capacity_is_terminal_for_both_ingress_transports() {
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = tcp.local_addr().unwrap();
+    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+    let query = make_a_query();
+    for ingress in [
+        IngressProfile::Tcp,
+        IngressProfile::Udp {
+            advertised_size: 1232,
+        },
+    ] {
+        let forwarder = asis_test_forwarder()
+            .with_socket_budget(crate::dns::transport::DnsSocketBudget::new(0))
+            .with_timeouts(Duration::from_secs(1), Duration::from_millis(10));
+        let error = forwarder
+            .resolve_with_context_and_profile(
+                &query,
+                DnsRequestMeta::new(None, Some(address)),
+                ingress,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+    }
+    let mut wire = [0; 512];
+    assert_eq!(
+        udp.try_recv_from(&mut wire).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), tcp.accept())
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -256,8 +299,10 @@ async fn udp_asis_honors_configured_query_timeout() {
         let _ = release_rx.await;
     });
     let query = make_a_query();
-    let forwarder =
-        asis_test_forwarder().with_timeouts(Duration::from_millis(37), Duration::from_secs(10));
+    let budget = crate::dns::transport::DnsSocketBudget::new(1);
+    let forwarder = asis_test_forwarder()
+        .with_socket_budget(budget.clone())
+        .with_timeouts(Duration::from_millis(37), Duration::from_secs(10));
     let started = tokio::time::Instant::now();
     let mut running = tokio::spawn(async move {
         forwarder
@@ -271,6 +316,7 @@ async fn udp_asis_honors_configured_query_timeout() {
             .await
     });
     received_rx.await.expect("timeout probe reached endpoint");
+    assert_eq!(budget.available_sockets(), 0);
 
     let completed = tokio::time::timeout(Duration::from_millis(250), &mut running).await;
     let elapsed = started.elapsed();
@@ -286,6 +332,7 @@ async fn udp_asis_honors_configured_query_timeout() {
 
     assert!(elapsed >= Duration::from_millis(30));
     assert!(error.to_string().contains("timeout"));
+    assert_eq!(budget.available_sockets(), 1);
 }
 
 struct RecordingNodataUpstream {

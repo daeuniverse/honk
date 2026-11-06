@@ -2364,6 +2364,19 @@ async fn stats_exposes_udp_metrics() {
         assert!(body["quic"][key].is_u64(), "missing QUIC stat {key}");
     }
 
+    for (section, field) in [
+        ("socketAdmission", "refused"),
+        ("socketAdmission", "timeouts"),
+        ("proxyAdmission", "timeouts"),
+        ("pressure", "retiredUdpPools"),
+        ("pressure", "retiredTransports"),
+    ] {
+        assert!(
+            body["dns"][section][field].is_u64(),
+            "missing DNS stat {section}.{field}"
+        );
+    }
+
     let tcp = &body["tcp"];
     assert!(tcp["activeFlows"].is_u64());
     assert!(tcp["limit"].is_u64());

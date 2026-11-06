@@ -45,6 +45,30 @@ global {
     }
 
     #[test]
+    fn shutdown_wait_connections_requires_a_boolean() {
+        for (input, expected) in [
+            ("global {}", false),
+            ("global { shutdown_wait_connections: true }", true),
+            ("global { shutdown_wait_connections: false }", false),
+        ] {
+            let mut diagnostics = Vec::new();
+            let config = parse_dae_config_with_diagnostics(input, &mut diagnostics).unwrap();
+            assert_eq!(config.global.shutdown_wait_connections, expected);
+            assert!(diagnostics.is_empty());
+        }
+        for value in ["tru", "t", "", "5s"] {
+            let input = format!("global {{ shutdown_wait_connections: {value} }}");
+            let error = parse_dae_config_with_detailed_diagnostics(&input, &mut Vec::new())
+                .expect_err("invalid shutdown policy must not silently disable waiting");
+            assert_eq!(error.diagnostic.code, "invalid-config-value");
+            assert_eq!(
+                error.diagnostic.setting.to_string(),
+                "global.shutdown_wait_connections"
+            );
+        }
+    }
+
+    #[test]
     fn test_millisecond_durations_keep_the_default_and_return_diagnostics() {
         for (value, expected) in [("50ms", 50), ("0ms", 0), ("0.5s", 500), ("50", 50)] {
             let input = format!(

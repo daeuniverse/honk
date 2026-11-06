@@ -7,14 +7,22 @@ async fn same_generation_interleaving_converges_exact_mock_value() {
         let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 30));
         projection.submit(
             snapshot(1, 1, 2),
-            positive("a.test", &[ip], Duration::from_secs(30)),
+            positive(
+                "a.test",
+                &[ip],
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
         );
         receiver.try_recv().expect("initial wake");
         projection.clear_worker_wake();
         worker::flush_for_test_after_snapshot(&projection, &ebpf, || {
             projection.submit(
                 snapshot(1, 1, 2),
-                positive("b.test", &[ip], Duration::from_secs(30)),
+                positive(
+                    "b.test",
+                    &[ip],
+                    tokio::time::Instant::now() + Duration::from_secs(30),
+                ),
             );
         })
         .await;
@@ -37,7 +45,11 @@ async fn generation_change_before_backend_write_skips_stale_batch() {
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 32));
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[ip], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[ip],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     receiver.try_recv().expect("initial wake");
     projection.clear_worker_wake();
@@ -65,7 +77,10 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
     let mut state = DesiredState::new(snapshot(1, 1, 2), 10_000);
     let mut backend = backend_for_test(&snapshot(1, 1, 2));
     let key = maps::ip_addr_to_lpm_key(ip);
-    state.observe(positive("a.test", &[ip], Duration::from_secs(30)), now);
+    state.observe(
+        positive("a.test", &[ip], now + Duration::from_secs(30)),
+        now,
+    );
     let initial = state.batch(now);
     backend
         .set_domain_ip_bitmap(&key, &initial.sets[0].bitmap)
@@ -74,7 +89,10 @@ async fn stale_remove_is_repaired_by_new_same_generation_owner() {
 
     state.observe(clear_v4("a.test"), now);
     let stale_remove = state.batch(now);
-    state.observe(positive("b.test", &[ip], Duration::from_secs(30)), now);
+    state.observe(
+        positive("b.test", &[ip], now + Duration::from_secs(30)),
+        now,
+    );
     backend.remove_domain_ip_bitmap(&key).expect("stale remove");
     assert!(!state.commit_success(&[], &stale_remove.removes));
 
@@ -97,7 +115,11 @@ async fn wake_overflow_is_harmless_and_latest_state_converges() {
     for _ in 0..32 {
         projection.submit(
             snapshot(1, 1, 2),
-            positive("a.test", &[ip], Duration::from_secs(30)),
+            positive(
+                "a.test",
+                &[ip],
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
         );
     }
     assert!(projection.counters().wake_coalesced > 0);
@@ -115,11 +137,19 @@ async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
 
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[first], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[first],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[first], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[first],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     assert_eq!(projection.counters().wake_coalesced, 1);
     receiver.try_recv().expect("initial wake");
@@ -127,7 +157,11 @@ async fn wake_gate_reopens_before_snapshot_and_coalesces_duplicates() {
 
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[second], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[second],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     receiver.try_recv().expect("post-snapshot wake");
     assert!(receiver.try_recv().is_err());
@@ -145,7 +179,11 @@ async fn set_and_map_full_failures_keep_dirty_until_retry() {
             .expect("fault injection");
         projection.submit(
             snapshot(1, 1, 2),
-            positive("a.test", &[ip], Duration::from_secs(30)),
+            positive(
+                "a.test",
+                &[ip],
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
         );
         worker::flush_for_test(&projection, &ebpf).await;
         assert!(ebpf.read().await.projection_map_snapshot().is_empty());
@@ -168,7 +206,11 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
     let new_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 4));
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[old_ip], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[old_ip],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     worker::flush_for_test(&projection, &ebpf).await;
     ebpf.write().await.clear_projection_write_log();
@@ -178,7 +220,11 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
         .expect("fault injection");
     projection.submit(
         snapshot(1, 1, 2),
-        positive("a.test", &[new_ip], Duration::from_secs(30)),
+        positive(
+            "a.test",
+            &[new_ip],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
     );
     worker::flush_for_test(&projection, &ebpf).await;
     assert_eq!(
@@ -206,7 +252,14 @@ async fn spawned_worker_converges_mock_map_after_transient_failure() {
         .expect("fault injection");
     let projection = RoutingProjection::spawn(Arc::clone(&ebpf), Arc::clone(&current));
     let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-    projection.submit(current, positive("a.test", &[ip], Duration::from_secs(30)));
+    projection.submit(
+        current,
+        positive(
+            "a.test",
+            &[ip],
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
+    );
     tokio::task::yield_now().await;
     assert!(ebpf.read().await.projection_map_snapshot().is_empty());
     tokio::time::advance(Duration::from_millis(100)).await;
@@ -235,7 +288,14 @@ async fn one_observation_drains_multiple_batches_without_another_wake() {
     let ips = (0..600u32)
         .map(|ip| IpAddr::V4(Ipv4Addr::from(0xc0000200 + ip)))
         .collect::<Vec<_>>();
-    projection.submit(current, positive("a.test", &ips, Duration::from_secs(300)));
+    projection.submit(
+        current,
+        positive(
+            "a.test",
+            &ips,
+            tokio::time::Instant::now() + Duration::from_secs(300),
+        ),
+    );
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if ebpf.read().await.projection_map_snapshot().len() == ips.len() {
@@ -263,7 +323,14 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
         let new = snapshot(2, 4, 8);
         let (projection, _receiver, ebpf) = projection_for_test(Arc::clone(&old));
         let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 91));
-        projection.submit(old, positive("a.test", &[ip], Duration::from_secs(30)));
+        projection.submit(
+            old,
+            positive(
+                "a.test",
+                &[ip],
+                tokio::time::Instant::now() + Duration::from_secs(30),
+            ),
+        );
 
         let mut backend = ebpf.write().await;
         let publication = projection.prepare_snapshot_publication();
@@ -311,7 +378,7 @@ async fn shutdown_timeout_aborts_wedged_worker() {
         positive(
             "a.test",
             &[IpAddr::V4(Ipv4Addr::new(203, 0, 113, 40))],
-            Duration::from_secs(30),
+            tokio::time::Instant::now() + Duration::from_secs(30),
         ),
     );
 

@@ -105,6 +105,7 @@ struct SlotInner<T> {
     state: SlotState<T>,
     generation: u64,
     last_failure: Option<BuildFailure>,
+    idle_retiring: bool,
 }
 
 pub(crate) struct LifecycleSlot<T> {
@@ -112,6 +113,16 @@ pub(crate) struct LifecycleSlot<T> {
     changed: Notify,
     init_count: AtomicUsize,
     close_count: AtomicUsize,
+}
+
+struct IdleRetirementGuard<T> {
+    slot: Arc<LifecycleSlot<T>>,
+}
+
+impl<T> Drop for IdleRetirementGuard<T> {
+    fn drop(&mut self) {
+        self.slot.inner.lock().idle_retiring = false;
+    }
 }
 
 impl<T> Default for LifecycleSlot<T> {
@@ -127,6 +138,7 @@ impl<T> LifecycleSlot<T> {
                 state: SlotState::Closed,
                 generation: 0,
                 last_failure: None,
+                idle_retiring: false,
             }),
             changed: Notify::new(),
             init_count: AtomicUsize::new(0),
@@ -236,6 +248,53 @@ impl<T> LifecycleSlot<T> {
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.close_observed(None, close).await;
+    }
+
+    pub(crate) fn retire_idle<F, Fut>(
+        self: &Arc<Self>,
+        close: F,
+    ) -> Option<impl Future<Output = ()> + Send + 'static>
+    where
+        T: Send + Sync + 'static,
+        F: FnOnce(Arc<T>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (value, teardown) = {
+            let mut inner = self.inner.lock();
+            if inner.idle_retiring {
+                return None;
+            }
+            match &inner.state {
+                SlotState::Ready(value) if Arc::strong_count(value) == 1 => {
+                    let value = Arc::clone(value);
+                    let resource = Arc::clone(&value);
+                    let teardown = async move { close(resource).await }.boxed().shared();
+                    inner.state = SlotState::Closing {
+                        value: Arc::clone(&value),
+                        teardown: teardown.clone(),
+                    };
+                    inner.idle_retiring = true;
+                    crate::stats::record_dns_event(
+                        crate::stats::DnsStatEvent::PressureRetiredTransport,
+                    );
+                    (value, teardown)
+                }
+                SlotState::Closing { value, teardown } => {
+                    let retiring = (Arc::clone(value), teardown.clone());
+                    inner.idle_retiring = true;
+                    retiring
+                }
+                SlotState::Building { .. } | SlotState::Ready(_) | SlotState::Closed => {
+                    return None;
+                }
+            }
+        };
+        let guard = IdleRetirementGuard {
+            slot: Arc::clone(self),
+        };
+        Some(async move {
+            guard.slot.finish_close(value, teardown).await;
+        })
     }
 
     pub(crate) async fn retire<F, Fut>(&self, observed: &Arc<T>, close: F)

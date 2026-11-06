@@ -63,6 +63,113 @@ fn uri_rejections_keep_safe_reason_fields_during_admission() {
     }
 }
 
+#[test]
+fn structured_stream_rejections_keep_semantic_fields_and_siblings() {
+    let overflow = (0..65)
+        .map(|index| (format!("x-{index}"), serde_json::json!("PRIVATE_VALUE")))
+        .collect::<serde_json::Map<_, _>>();
+    let clash = serde_json::json!({
+        "name": "PRIVATE_NAME", "type": "vless", "server": "private.example", "port": 443,
+        "uuid": "11111111-1111-4111-8111-111111111111", "tls": true, "network": "xhttp"
+    });
+    let mut too_many = clash.clone();
+    too_many["xhttp-opts"] = serde_json::json!({"headers": overflow});
+    let mut managed = clash.clone();
+    managed["xhttp-opts"] = serde_json::json!({"headers": {"Host": "PRIVATE_VALUE"}});
+    let mut ws = clash;
+    ws["network"] = serde_json::json!("ws");
+    ws["ws-opts"] = serde_json::json!({"headers": {"Connection": "PRIVATE_VALUE"}});
+    let sing_box = serde_json::json!({
+        "tag": "PRIVATE_NAME", "type": "vless", "server": "private.example", "server_port": 443,
+        "uuid": "11111111-1111-4111-8111-111111111111", "transport": {"type": "ws"}
+    });
+    let mut shared_error = sing_box.clone();
+    shared_error["transport"]["headers"] = serde_json::json!({"Connection": ""});
+    let mut adapter_error = sing_box.clone();
+    adapter_error["transport"]["headers"] = serde_json::json!({"X-Private": false});
+    let mut unsupported_adapter = sing_box;
+    unsupported_adapter["detour"] = serde_json::json!("PRIVATE_DETOUR");
+    for (root, rejected, fields, neighbor) in [
+        (
+            "proxies",
+            vec![too_many, managed, ws],
+            [Some("xhttp"), Some("xhttp"), Some("ws_headers")],
+            serde_json::json!({"name": "neighbor", "type": "socks5", "server": "127.0.0.1", "port": 1080}),
+        ),
+        (
+            "outbounds",
+            vec![shared_error, adapter_error, unsupported_adapter],
+            [Some("ws_headers"), None, None],
+            serde_json::json!({"tag": "neighbor", "type": "socks", "server": "127.0.0.1", "server_port": 1080}),
+        ),
+    ] {
+        for (with_neighbor, copies) in [(true, 1), (false, 1), (true, 50), (false, 50)] {
+            let mut entries = (0..copies)
+                .flat_map(|_| rejected.iter().cloned())
+                .collect::<Vec<_>>();
+            let rejected_count = entries.len();
+            let retained_count = rejected_count.min(128);
+            let omitted = rejected_count - retained_count;
+            let diagnostic_count = retained_count + usize::from(omitted != 0);
+            if with_neighbor {
+                entries.push(neighbor.clone());
+            }
+            let body = serde_json::json!({(root): entries}).to_string();
+            let mut diagnostics = Vec::new();
+            let result = parse_subscription_content_with_diagnostics(
+                &Subscription::default(),
+                &body,
+                &mut diagnostics,
+            );
+            if with_neighbor {
+                let nodes = result.unwrap();
+                assert_eq!(
+                    nodes
+                        .iter()
+                        .map(|node| node.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["neighbor"]
+                );
+                assert_eq!(diagnostics.len(), diagnostic_count);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().diagnostic.code,
+                    "empty-subscription-body"
+                );
+                assert_eq!(diagnostics.len(), diagnostic_count + 1);
+                assert_eq!(diagnostics.iter().filter(|item| item.terminal).count(), 1);
+            }
+            if omitted != 0 {
+                let summary = &diagnostics[retained_count];
+                assert_eq!(summary.code, "subscription-diagnostics-truncated");
+                assert_eq!(summary.value, SafeValue::Ordinal(omitted));
+                assert!(!summary.terminal);
+            }
+            for index in 0..retained_count {
+                let field = fields[index % fields.len()];
+                let diagnostic = &diagnostics[index];
+                let ordinal = index + 1;
+                let mut setting = format!("{root}[{ordinal}]");
+                if let Some(field) = field {
+                    setting.push('.');
+                    setting.push_str(field);
+                }
+                assert_eq!(diagnostic.setting.to_string(), setting);
+                assert_eq!(diagnostic.code, "malformed-subscription-entry");
+                assert_eq!(diagnostic.severity, Severity::Warning);
+                assert_eq!(diagnostic.entry_index, Some(ordinal));
+                assert_eq!(diagnostic.line, None);
+                assert_eq!(diagnostic.value, SafeValue::Ordinal(ordinal));
+                assert!(!diagnostic.terminal);
+                assert!(diagnostic.source.same_source(&diagnostics[0].source));
+                let rendered = format!("{diagnostic:?} {:?}", diagnostic.to_legacy());
+                assert!(!rendered.contains("PRIVATE_"));
+                assert!(!rendered.contains("private.example"));
+            }
+        }
+    }
+}
+
 fn assert_c17_original_indices(
     sub_type: SubscriptionType,
     fixture: &str,

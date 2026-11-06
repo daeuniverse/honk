@@ -13,16 +13,15 @@ use super::framing::{
     force_dns_id_zero, read_length_prefixed, restore_dns_id, write_length_prefixed,
 };
 use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
-use super::quic::with_packet_cause;
+use super::quic::{QuicEndpoint, with_packet_cause};
 use super::{
     DialContext, SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint,
 };
 
-/// One physical DoQ connection. Proxied connections retain their packet-backed
-/// endpoint here until the pooled connection is explicitly closed.
+/// One physical DoQ connection and its socket/driver owner.
 struct DoqConnection {
     connection: Connection,
-    endpoint: Option<honk_outbound::quic::PacketTransportEndpoint>,
+    endpoint: QuicEndpoint,
     _metrics: honk_outbound::quic::QuicConnectionMonitor,
 }
 
@@ -30,9 +29,7 @@ impl DoqConnection {
     async fn close(self: Arc<Self>, timeout: Duration) {
         self.connection.close(0_u32.into(), b"shutdown");
         let _ = tokio::time::timeout(timeout, self.connection.closed()).await;
-        if let Some(endpoint) = &self.endpoint {
-            endpoint.close(timeout).await;
-        }
+        self.endpoint.close(timeout).await;
     }
 }
 
@@ -86,10 +83,10 @@ impl DoqClient {
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
-        let io_error = |error| with_packet_cause(conn.endpoint.as_ref(), error);
+        let io_error = |error| with_packet_cause(conn.endpoint.packet(), error);
         tokio::time::timeout(self.dial.query_timeout, async {
             let (mut send, mut recv) = conn.connection.open_bi().await.map_err(|error| {
-                with_packet_cause(conn.endpoint.as_ref(), error.into()).context("DoQ open_bi")
+                with_packet_cause(conn.endpoint.packet(), error.into()).context("DoQ open_bi")
             })?;
 
             let mut wire = raw_query.to_vec();
@@ -98,7 +95,7 @@ impl DoqClient {
                 .await
                 .map_err(io_error)?;
             send.finish().map_err(|error| {
-                with_packet_cause(conn.endpoint.as_ref(), error.into()).context("DoQ finish send")
+                with_packet_cause(conn.endpoint.packet(), error.into()).context("DoQ finish send")
             })?;
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
@@ -138,6 +135,8 @@ impl DoqClient {
                     honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted,
                 );
                 self.retire_connection(&connection).await;
+                // Closed Quinn handles still retain their socket and admission credit.
+                drop(connection);
                 let (connection, reused) = self.connection.acquire(|| self.dial()).await?;
                 if reused {
                     super::lifecycle::attached();
@@ -189,7 +188,7 @@ impl DoqClient {
         self.connection
             .close(move |connection| connection.close(timeout))
             .await;
-        self.quic_ep.close(self.dial.query_timeout).await;
+        self.quic_ep.close().await;
     }
 }
 
@@ -202,8 +201,90 @@ mod tests {
 
     use crate::dns::forwarder::build_dns_query;
     use crate::dns::transport::tests_proto::{
-        ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, spawn_doq_server,
+        ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, quic_server_endpoint,
+        spawn_doq_server,
     };
+
+    #[tokio::test]
+    async fn direct_doq_redials_peer_closed_connection_with_one_socket_credit() {
+        direct_doq_redial_with_one_socket_credit(true).await;
+    }
+
+    #[tokio::test]
+    async fn direct_doq_retries_failed_stream_with_one_socket_credit() {
+        direct_doq_redial_with_one_socket_credit(false).await;
+    }
+
+    async fn direct_doq_redial_with_one_socket_credit(peer_close: bool) {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            let (endpoint, address) = quic_server_endpoint(b"doq");
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let connection = endpoint.accept().await.unwrap().await.unwrap();
+                    let (mut send, mut recv) = connection.accept_bi().await.unwrap();
+                    let mut response = read_length_prefixed(&mut recv, Duration::from_secs(2))
+                        .await
+                        .unwrap();
+                    if attempt == 0 && !peer_close {
+                        send.reset(7_u32.into()).unwrap();
+                        connection.closed().await;
+                        continue;
+                    }
+                    response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                    write_length_prefixed(&mut send, &response).await.unwrap();
+                    send.finish().unwrap();
+                    if attempt == 0 {
+                        let _ = send.stopped().await;
+                        connection.close(7_u32.into(), b"peer rotation");
+                    } else {
+                        connection.closed().await;
+                    }
+                }
+            });
+            let budget = super::super::DnsSocketBudget::new(1);
+            let client = Arc::new(DoqClient {
+                dial: DialContext {
+                    endpoint: crate::dns::endpoint::DnsEndpoint::parse(
+                        &address.to_string(),
+                        DnsProtocol::Quic,
+                        Some("localhost"),
+                    )
+                    .unwrap(),
+                    query_timeout: Duration::from_secs(1),
+                    dial_timeout: Duration::from_secs(2),
+                    socket_budget: budget.clone(),
+                    proxy: None,
+                },
+                quic_config: insecure_quic_config(b"doq").await,
+                quic_ep: SharedQuicEndpoint::new(),
+                connection: LifecycleSlot::new(),
+            });
+            let query = build_dns_query("redial.example", 1);
+            if peer_close {
+                let response = client.exchange(&query, None).await.unwrap();
+                assert!(super::super::is_valid_response(&query, &response));
+                assert_eq!(budget.available_sockets(), 0);
+                let (observed, _) = client.connection.acquire(|| client.dial()).await.unwrap();
+                observed.connection.closed().await;
+                drop(observed);
+            }
+
+            let response = client.exchange(&query, None).await.unwrap();
+            assert!(super::super::is_valid_response(&query, &response));
+            assert_eq!(client.connection.init_count(), 2);
+            assert_eq!(budget.available_sockets(), 0);
+            client.close().await;
+            server.await.unwrap();
+            drop(
+                budget
+                    .acquire_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+            );
+        })
+        .await
+        .expect("one-credit DoQ redial must release the retired socket before admission");
+    }
 
     #[tokio::test]
     async fn proxied_doq_reuses_and_closes_packet_endpoint() {

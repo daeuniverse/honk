@@ -1,9 +1,9 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(
-    all(not(test), not(feature = "dns-bench")),
+    all(not(test), not(feature = "dns-bench"), not(feature = "clash-api")),
     expect(
         dead_code,
-        reason = "the internal snapshot intentionally has no public endpoint"
+        reason = "DNS statistics are exposed only with the Clash API"
     )
 )]
 pub(crate) struct DnsStatsSnapshot {
@@ -22,6 +22,11 @@ pub(crate) struct DnsStatsSnapshot {
     pub(crate) runtime_forced_close: u64,
     pub(crate) transport_init: u64,
     pub(crate) transport_reset: u64,
+    pub(crate) socket_admission_refused: u64,
+    pub(crate) socket_admission_timeout: u64,
+    pub(crate) proxy_admission_timeout: u64,
+    pub(crate) pressure_retired_udp_pool: u64,
+    pub(crate) pressure_retired_transport: u64,
     pub(crate) projection_stale_generation: u64,
     pub(crate) projection_write_failure: u64,
     pub(crate) projection_retry: u64,
@@ -72,6 +77,21 @@ impl DnsStatsSnapshot {
                 .saturating_sub(earlier.runtime_forced_close),
             transport_init: self.transport_init.saturating_sub(earlier.transport_init),
             transport_reset: self.transport_reset.saturating_sub(earlier.transport_reset),
+            socket_admission_refused: self
+                .socket_admission_refused
+                .saturating_sub(earlier.socket_admission_refused),
+            socket_admission_timeout: self
+                .socket_admission_timeout
+                .saturating_sub(earlier.socket_admission_timeout),
+            proxy_admission_timeout: self
+                .proxy_admission_timeout
+                .saturating_sub(earlier.proxy_admission_timeout),
+            pressure_retired_udp_pool: self
+                .pressure_retired_udp_pool
+                .saturating_sub(earlier.pressure_retired_udp_pool),
+            pressure_retired_transport: self
+                .pressure_retired_transport
+                .saturating_sub(earlier.pressure_retired_transport),
             projection_stale_generation: self
                 .projection_stale_generation
                 .saturating_sub(earlier.projection_stale_generation),

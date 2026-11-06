@@ -745,10 +745,13 @@ async fn socks5_udp_association_uses_control_peer_for_unspecified_bnd_addr() {
     );
 }
 
-#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn socks5_udp_transport_resolves_domain_bnd_addr() {
-    let _lock = crate::bootstrap::GLOBAL_TEST_LOCK.lock().unwrap();
+    if crate::bootstrap::run_global_test_in_child(
+        "proxy::socks5::tests::socks5_udp_transport_resolves_domain_bnd_addr",
+    ) {
+        return;
+    }
     let resolver = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let resolver_addr = resolver.local_addr().unwrap();
     let (query_tx, query_rx) = oneshot::channel();

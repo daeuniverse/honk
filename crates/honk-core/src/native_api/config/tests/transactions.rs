@@ -401,6 +401,45 @@ async fn restart_only_change_is_refused_before_writing() {
 }
 
 #[tokio::test]
+async fn nfqueue_disabled_at_startup_is_written_and_stays_disabled() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    fixture.startup_downgrades.record_nfqueue_unavailable();
+    let path = fixture.path("main.dae");
+    for request in ["nfqueue_enable: true", ""] {
+        let before = fixture.get(CONFIG).await;
+        let main = source(&before, &std::fs::read_to_string(&path).unwrap()).clone();
+        let candidate = fixture.originals["main.dae"]
+            .replace("nfqueue_enable: false", request)
+            .replace("fallback: direct", "fallback: block");
+        let checked = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
+        assert_eq!(checked["valid"], true, "{checked}");
+        restart_rows(&checked["diagnostics"], "candidate", "warning", &[]);
+        let operation = accepted(fixture.replace(&main, &candidate).send().await.unwrap()).await;
+        assert_eq!(fixture.terminal(&operation).await["status"], "succeeded");
+        let written = fixture.get(CONFIG).await;
+        assert_eq!(source(&written, &candidate)["content"], candidate);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), candidate);
+        let active = fixture.active.read().await.clone();
+        assert!(!active.global.nfqueue_enable);
+        assert_eq!(active.routing.default_outbound, "block");
+        if request.is_empty() {
+            assert_eq!(written["generation_id"], before["generation_id"]);
+        }
+        for _ in 0..2 {
+            reload(&fixture).await;
+            assert_eq!(
+                fixture.get(CONFIG).await["generation_id"],
+                written["generation_id"]
+            );
+            let active = fixture.active.read().await.clone();
+            assert!(!active.global.nfqueue_enable);
+            assert_eq!(active.routing.default_outbound, "block");
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn dependency_change_before_rename_rejects_without_overwriting_external_content() {
     let fixture = Fixture::new(Access::Admin, false).await;
     let before = fixture.get(CONFIG).await;

@@ -75,7 +75,7 @@ predicate ID within one policy.
 
 ### Source organization
 
-- [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
+- [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/):
   userspace `Router`, priority-ordered compiled routes, `route_action`, and the
   `BinaryLpmTrie`/geo-asset helpers. `domain.rs` owns the domain matchers,
   `GeositeMatcher`, and the build-local interner. `geo.rs` parses
@@ -85,11 +85,11 @@ predicate ID within one policy.
   Startup uses one captured Geo source set for both traffic and DNS compilation
   and drops it after both routers are built; compiled matchers and fingerprints
   remain owned by the routers.
-- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs) —
+- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs):
   compiles the IR into `RoutingPushPlan` and has no map side effects.
   [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)
   owns generation maps, extension loading, target attachment, and publication.
-- [`crates/honk-ebpf/src/route.rs`](../../../crates/honk-ebpf/src/route.rs) —
+- [`crates/honk-ebpf/src/route.rs`](../../../crates/honk-ebpf/src/route.rs):
   static root/slot facade and fixed-ABI dispatch; it contains no interpreter or
   fallback rule engine. Static TC callers retain packet parsing and enforcement
   around this synchronous call.
@@ -269,8 +269,8 @@ It preserves the real function prototype and uses instruction-slot offsets for
 Every relevant, loaded TC program exposes two non-inlined, distinct BTF-global
 functions, `honk_route_slot0` and `honk_route_slot1`. Uninstalled functions return
 an error and contain no fallback rule engine. The backend loads the LAN/WAN L2/L3
-routing targets before admitting traffic, including variants that may be attached
-to an interface later.
+routing targets before admitting traffic; all eight TC variants are already preloaded at
+`load`, so the targets reuse them and cover variants bound to an interface later.
 
 `ROUTING_POLICY_ROOT` is a one-entry map-in-map pointing at an immutable
 `RoutingPolicyDescriptor`. The descriptor identifies the slot, policy generation,

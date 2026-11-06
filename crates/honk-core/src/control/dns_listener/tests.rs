@@ -230,14 +230,19 @@ fn standalone_listener_capacities_and_profiles_are_exact() {
 
 #[test]
 fn dual_bind_failure_releases_first_transport_atomically() {
-    let occupied_tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let address = occupied_tcp.local_addr().unwrap();
-    let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
+    // Another test's ephemeral UDP client can take the probed port; a leak
+    // fails every attempt, a collision almost never repeats.
+    for _ in 0..8 {
+        let occupied_tcp = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let address = occupied_tcp.local_addr().unwrap();
+        let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
 
-    assert!(BoundDnsListener::bind(&endpoint).is_err());
-    let udp = std::net::UdpSocket::bind(address)
-        .expect("failed dual bind must release its first UDP socket");
-    drop(udp);
+        assert!(BoundDnsListener::bind(&endpoint).is_err());
+        if std::net::UdpSocket::bind(address).is_ok() {
+            return;
+        }
+    }
+    panic!("failed dual bind must release its first UDP socket");
 }
 
 #[test]
@@ -635,7 +640,6 @@ async fn listener_queries_acquire_the_newly_published_runtime() {
             routing_projection: projection,
             outbound_runtime: None,
             transport: Arc::new(TestRuntimeTransport),
-            udp_query_limit: 256,
         },
     ));
 
@@ -658,4 +662,45 @@ async fn supervisor_panic_is_a_listener_shutdown_failure() {
     assert_eq!(drain.active_count(), 0);
     BoundDnsListener::bind(&DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap())
         .expect("failed shutdown must still join healthy supervisors");
+}
+
+#[tokio::test]
+async fn query_start_spawns_only_unfinished_work_and_retains_panics() {
+    let (phase_tx, phase) = watch::channel(ListenerPhase::Running);
+    let mut children = JoinSet::new();
+    let mut failure = None;
+
+    start_query(&mut children, &phase, &mut failure, Box::pin(async {})).await;
+    assert!(children.is_empty(), "a ready answer needs no child task");
+
+    let (release, wait) = tokio::sync::oneshot::channel::<()>();
+    let pending = Box::pin(async move {
+        let _ = wait.await;
+    });
+    start_query(&mut children, &phase, &mut failure, pending).await;
+    assert_eq!(children.len(), 1, "unfinished work must stay joined");
+    release.send(()).unwrap();
+    children.join_next().await.unwrap().unwrap();
+
+    phase_tx.send(ListenerPhase::Abort).unwrap();
+    let guard = Arc::new(());
+    let held = Arc::clone(&guard);
+    let stalled = Box::pin(async move {
+        let _held = held;
+        std::future::pending::<()>().await;
+    });
+    start_query(&mut children, &phase, &mut failure, stalled).await;
+    assert!(children.is_empty());
+    assert_eq!(
+        Arc::strong_count(&guard),
+        1,
+        "aborted unfinished work must release what it owns"
+    );
+
+    assert!(failure.is_none());
+    let panicking = Box::pin(async {
+        panic!("standalone query failed");
+    });
+    start_query(&mut children, &phase, &mut failure, panicking).await;
+    assert!(failure.is_some(), "a query panic must fail teardown");
 }

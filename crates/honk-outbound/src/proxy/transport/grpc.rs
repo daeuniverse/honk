@@ -42,7 +42,7 @@ pub(super) async fn wrap_grpc(
     let uri = http::Uri::builder()
         .scheme(scheme)
         .authority(authority)
-        .path_and_query(format!("/{service}/Tun"))
+        .path_and_query(format!("/{}/Tun", super::encode_uri_path(service)))
         .build()?;
     let request = http::Request::builder()
         .method(http::Method::POST)

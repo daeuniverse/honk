@@ -1642,7 +1642,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-04"
-source = { file = "doc/en/how-to-start.md", fence = 4 }
+source = { file = "doc/en/how-to-start.md", fence = 7 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1867,6 +1867,18 @@ unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
 
 [[case]]
+id = "honk-doc-en-reference-subscription-02"
+source = { file = "doc/en/reference/subscription.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "Per-subscription route blocks are a honk extension."
+
+[[case]]
 id = "honk-doc-zh-configuration-01"
 source = { file = "doc/zh/configuration.md", fence = 1 }
 wrap = ""
@@ -1959,7 +1971,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-04"
-source = { file = "doc/zh/how-to-start.md", fence = 4 }
+source = { file = "doc/zh/how-to-start.md", fence = 7 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2182,6 +2194,18 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'subscription{primary:'https://example.com/sub''https://example.com/no_tag_link'detailed:'https://example.org/sub'{'"
+
+[[case]]
+id = "honk-doc-zh-reference-subscription-02"
+source = { file = "doc/zh/reference/subscription.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "Per-subscription route blocks are a honk extension."
 
 [[case]]
 id = "dae-docs-en-README-194-195"

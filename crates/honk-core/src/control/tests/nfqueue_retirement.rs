@@ -19,14 +19,14 @@ use tokio::sync::RwLock;
 fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Result<()> {
     std::thread::spawn(|| -> anyhow::Result<()> {
         let (_client, _server) = build_lab("192.0.2.1".parse()?, "198.51.100.1".parse()?)?;
-        let _dae0 = crate::daens::create_dae0_link()?;
+        let (_dae0, dae0_setup) = crate::daens::create_dae0_link()?;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
             .block_on(async {
                 let root = Path::new("/sys/fs/bpf/nfqueue-reconstruction");
                 let mut backend =
-                    RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, root, 12345, None, "", false)
+                    RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, root, 12345, &dae0_setup, 0)
                         .await?;
                 let key = TuplesKey {
                     src_ip: In6Addr::from_ipv4_bytes([192, 0, 2, 10]),
@@ -62,8 +62,8 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
                     "RETIRE_FENCE",
                 )?)?;
                 fences.insert(
-                    key,
-                    RetirementFence {
+                    &key,
+                    &RetirementFence {
                         owner: 900,
                         decision_token: token,
                         padding: 0,

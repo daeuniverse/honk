@@ -282,6 +282,10 @@ impl DnsForwarder {
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis UDP dial");
         crate::observe::flows::dns::transport("udp", "udp");
+        let _permit = self
+            .socket_budget
+            .acquire_until(tokio::time::Instant::now() + self.dial_timeout)
+            .await?;
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(destination),
             honk_outbound::runtime::flow_observation::ResolutionLocation::OriginalIp,
@@ -343,10 +347,12 @@ impl DnsForwarder {
     ) -> anyhow::Result<Vec<u8>> {
         debug!(%destination, "DNS forwarder: asis TCP dial");
         crate::observe::flows::dns::transport("tcp", "tcp");
+        let deadline = tokio::time::Instant::now() + self.dial_timeout;
+        let _permit = self.socket_budget.acquire_until(deadline).await?;
         let mut stream = honk_outbound::util::connect_marked_addr(
             destination,
             Some(honk_outbound::util::bypass_mark()),
-            self.dial_timeout,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await
         .context("asis TCP connect")?;

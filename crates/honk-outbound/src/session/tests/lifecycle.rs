@@ -593,6 +593,37 @@ async fn janitor_preserves_and_replenishes_warm_carriers_while_old_streams_drain
     pool.shutdown();
 }
 
+#[tokio::test(start_paused = true)]
+async fn janitor_dials_past_an_idle_session_to_reach_the_floor() {
+    let pool = Arc::new(pool(SessionPoolConfig {
+        janitor_interval: Duration::from_secs(1),
+        ..Default::default()
+    }));
+    pool.insert(&TestSession::new());
+    let dials = Arc::new(AtomicUsize::new(0));
+    pool.ensure_janitor(2, Duration::from_secs(60), {
+        let dials = Arc::clone(&dials);
+        move || {
+            let dials = Arc::clone(&dials);
+            async move {
+                dials.fetch_add(1, Ordering::Relaxed);
+                Ok(TestSession::new())
+            }
+        }
+    });
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(dials.load(Ordering::Relaxed), 1);
+    assert_eq!(pool.live_session_count(), 2);
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        dials.load(Ordering::Relaxed),
+        1,
+        "a met floor dials nothing"
+    );
+    pool.shutdown();
+}
+
 /// v2 max-age: past the jittered deadline the session drains (no new
 /// channels) and the janitor closes it once empty.
 #[tokio::test(start_paused = true)]

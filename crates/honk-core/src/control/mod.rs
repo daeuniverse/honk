@@ -99,10 +99,10 @@ pub use client::ControlClient;
 pub(crate) use commands::{ControlCommand, ReloadOutcome, ReloadReply};
 use connection::*;
 use probers::*;
-pub(crate) use reload::LogFiles;
 #[cfg(feature = "native-api")]
 pub(crate) use reload::restart_required_fields;
 use reload::*;
+pub(crate) use reload::{LogFiles, StartupDowngrades};
 pub(crate) use resource_budget::{MAX_EFFECTIVE_NOFILE, ResourceBudget};
 use sockets::*;
 #[cfg(all(test, feature = "native-api"))]
@@ -142,6 +142,7 @@ pub struct ControlPlane {
     /// Reuse decisions must observe the generation they eventually replace.
     reload_lock: tokio::sync::Mutex<()>,
     log_files: LogFiles,
+    startup_downgrades: StartupDowngrades,
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
@@ -182,6 +183,7 @@ pub struct ControlPlane {
     /// shared with the alive set's outbound resolver; rebuilt on reload.
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
+    dns_socket_budget: crate::dns::transport::DnsSocketBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.
@@ -325,6 +327,9 @@ impl ControlPlane {
     #[cfg(feature = "native-api")]
     pub(crate) fn log_files(&self) -> LogFiles {
         self.log_files.clone()
+    }
+    pub(crate) fn startup_downgrades(&self) -> StartupDowngrades {
+        self.startup_downgrades.clone()
     }
 
     pub(crate) async fn install_startup_diagnostics(

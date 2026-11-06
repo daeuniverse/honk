@@ -1,6 +1,7 @@
 use super::driver::UdpDriverHandle;
 use super::*;
 use crate::control::tests::support::{QuicStreamHold, QuicUdpMode, QuicUdpPacket, QuicUdpPeer};
+use crate::test_support::run_exact_in_child;
 use honk_outbound::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 use honk_outbound::group::{
     GroupManager, ScoreSelectionContext, ScoreVerificationState, SelectionNetwork,
@@ -20,30 +21,7 @@ const TEST_ENDPOINTS: usize = 16;
 const TEST_PACKET_SIZE: usize = 256;
 
 // QUIC counters are process-wide; a module mutex cannot isolate other suites.
-fn run_metrics_in_child(name: &str) -> bool {
-    const CHILD: &str = "HONK_QUIC_SOURCE_METRICS_CHILD";
-    let name = format!("control::udp_endpoint::source_quic_tests::{name}");
-    if std::env::var(CHILD).as_deref() == Ok(name.as_str()) {
-        return false;
-    }
-    let executable = std::env::current_exe().unwrap();
-    let listed = std::process::Command::new(&executable)
-        .args(["--exact", &name, "--list", "--format", "terse"])
-        .output()
-        .unwrap();
-    assert!(listed.status.success());
-    assert_eq!(
-        String::from_utf8(listed.stdout).unwrap().trim(),
-        format!("{name}: test")
-    );
-    let status = std::process::Command::new(executable)
-        .args(["--exact", &name, "--test-threads=1", "--nocapture"])
-        .env(CHILD, &name)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    true
-}
+const CHILD: &str = "HONK_QUIC_SOURCE_METRICS_CHILD";
 
 #[derive(Debug)]
 pub(super) struct BoundReplies(pub(super) HashMap<(ScopeId, SocketAddr), std::net::UdpSocket>);
@@ -321,7 +299,10 @@ pub(super) async fn no_reply(socket: &UdpSocket) {
 
 #[tokio::test]
 async fn quic_source_send_outcomes_preserve_siblings() {
-    if run_metrics_in_child("quic_source_send_outcomes_preserve_siblings") {
+    if run_exact_in_child(
+        CHILD,
+        "control::udp_endpoint::source_quic_tests::quic_source_send_outcomes_preserve_siblings",
+    ) {
         return;
     }
     for mode in MODES {
@@ -491,7 +472,10 @@ async fn tuic_source_accepts_first_and_later_empty_payloads() {
 
 #[tokio::test]
 async fn quic_source_stream_io_timeout_and_retirement_settle_once() {
-    if run_metrics_in_child("quic_source_stream_io_timeout_and_retirement_settle_once") {
+    if run_exact_in_child(
+        CHILD,
+        "control::udp_endpoint::source_quic_tests::quic_source_stream_io_timeout_and_retirement_settle_once",
+    ) {
         return;
     }
     for retire in [false, true] {

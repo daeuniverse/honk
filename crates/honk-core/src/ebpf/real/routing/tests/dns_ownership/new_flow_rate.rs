@@ -1,7 +1,5 @@
 use super::*;
 use honk_ebpf_common::conn::BpfStatsKey;
-use nix::sched::{CpuSet, sched_setaffinity};
-use nix::unistd::Pid;
 
 /// The documented per-CPU budget (doc/en/design/datapath.md), deliberately not
 /// imported from production so a drifting value fails these tests.
@@ -14,14 +12,6 @@ fn monotonic_ns() -> u64 {
         0
     );
     time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
-}
-
-/// The budget is per CPU and per second: stay on one CPU.
-fn pin_to_current_cpu() {
-    let cpu = unsafe { libc::sched_getcpu() } as usize;
-    let mut set = CpuSet::new();
-    set.set(cpu).unwrap();
-    sched_setaffinity(Pid::from_raw(0), &set).unwrap();
 }
 
 /// Start a burst early in a second so it cannot straddle the window boundary.

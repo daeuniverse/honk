@@ -18,7 +18,7 @@ use super::DialContext;
 use super::framing::force_dns_id_zero;
 use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::owned_task::OwnedTask;
-use super::quic::with_packet_cause;
+use super::quic::{QuicEndpoint, with_packet_cause};
 use super::{
     DnsMessageBody, SharedQuicEndpoint, build_doh_request, check_doh_status, dns_quic_config,
     doh_content_length, exchange_with_retry, finish_doh_response, quic_connect_endpoint,
@@ -29,7 +29,7 @@ type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
 struct H3Session {
     sender: Mutex<Option<H3Sender>>,
     connection: quinn::Connection,
-    endpoint: Option<honk_outbound::quic::PacketTransportEndpoint>,
+    endpoint: QuicEndpoint,
     _metrics: honk_outbound::quic::QuicConnectionMonitor,
     driver: OwnedTask,
 }
@@ -39,20 +39,13 @@ impl H3Session {
         self.sender.lock().await.take();
         self.connection.close(0_u32.into(), b"shutdown");
         self.driver.shutdown(timeout).await;
-        if let Some(endpoint) = &self.endpoint {
-            endpoint.close(timeout).await;
-        }
+        self.endpoint.close(timeout).await;
     }
 }
 
-async fn close_failed_connection(
-    connection: &quinn::Connection,
-    endpoint: &Option<honk_outbound::quic::PacketTransportEndpoint>,
-) {
+async fn close_failed_connection(connection: &quinn::Connection, endpoint: &QuicEndpoint) {
     connection.close(0_u32.into(), b"DoH3 setup failed");
-    if let Some(endpoint) = endpoint {
-        endpoint.close(Duration::ZERO).await;
-    }
+    endpoint.close(Duration::ZERO).await;
 }
 
 /// DoH3 client for one upstream.
@@ -121,22 +114,22 @@ impl Doh3Client {
 
             let request = build_doh_request(&self.dial.endpoint, None, "DoH3")?;
             let mut stream = sender.send_request(request).await.map_err(|error| {
-                with_packet_cause(session.endpoint.as_ref(), error.into())
+                with_packet_cause(session.endpoint.packet(), error.into())
                     .context("DoH3 send_request")
             })?;
 
             stream.send_data(Bytes::from(wire)).await.map_err(|error| {
-                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 send_data")
+                with_packet_cause(session.endpoint.packet(), error.into()).context("DoH3 send_data")
             })?;
             stream.finish().await.map_err(|error| {
-                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 finish")
+                with_packet_cause(session.endpoint.packet(), error.into()).context("DoH3 finish")
             })?;
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
             }
 
             let response = stream.recv_response().await.map_err(|error| {
-                with_packet_cause(session.endpoint.as_ref(), error.into())
+                with_packet_cause(session.endpoint.packet(), error.into())
                     .context("DoH3 recv_response")
             })?;
 
@@ -144,7 +137,7 @@ impl Doh3Client {
             let content_length = doh_content_length("DoH3", response.headers())?;
             let mut buf = DnsMessageBody::new("DoH3", content_length)?;
             while let Some(mut bytes) = stream.recv_data().await.map_err(|error| {
-                with_packet_cause(session.endpoint.as_ref(), error.into()).context("DoH3 recv_data")
+                with_packet_cause(session.endpoint.packet(), error.into()).context("DoH3 recv_data")
             })? {
                 while bytes.has_remaining() {
                     let chunk = bytes.chunk();
@@ -200,7 +193,7 @@ impl Doh3Client {
                         self.retire_session(&session).await;
                     }
                     Some(reason) => {
-                        let error = with_packet_cause(session.endpoint.as_ref(), reason.into())
+                        let error = with_packet_cause(session.endpoint.packet(), reason.into())
                             .context("DoH3 connection closed");
                         return Err(SessionFailure::new(session, error).into());
                     }
@@ -231,7 +224,7 @@ impl Doh3Client {
         let (mut driver, sender) = match h3 {
             Ok(Ok(result)) => result,
             Ok(Err(error)) => {
-                let error = with_packet_cause(endpoint.as_ref(), error.into())
+                let error = with_packet_cause(endpoint.packet(), error.into())
                     .context("DoH3 h3::client::new");
                 close_failed_connection(&conn, &endpoint).await;
                 return Err(error);
@@ -281,7 +274,7 @@ impl Doh3Client {
         self.session
             .close(move |session| session.close(timeout))
             .await;
-        self.quic_ep.close(self.dial.query_timeout).await;
+        self.quic_ep.close().await;
     }
 }
 
@@ -302,6 +295,70 @@ mod tests {
     use crate::dns::transport::tests_proto::{
         ProxiedQuicFixture, insecure_quic_config, proxied_quic_fixture, quic_server_endpoint,
     };
+
+    #[tokio::test]
+    async fn direct_doh3_retries_failed_session_with_one_socket_credit() {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            let (endpoint, address) = quic_server_endpoint(b"h3");
+            let query = build_dns_query("redial.example", 1);
+            let mut answer = query.clone();
+            answer[..2].fill(0);
+            answer[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+            let server = tokio::spawn(async move {
+                let mut queries = Vec::new();
+                for (status, body) in [(503, Vec::new()), (200, answer)] {
+                    let connection = endpoint.accept().await.unwrap().await.unwrap();
+                    let mut h3 = h3::server::builder()
+                        .build(h3_quinn::Connection::new(connection.clone()))
+                        .await
+                        .unwrap();
+                    queries.push(respond_h3(&mut h3, status, body).await);
+                    connection.closed().await;
+                }
+                queries
+            });
+            let budget = super::super::DnsSocketBudget::new(1);
+            let active_tasks = Arc::new(AtomicUsize::new(0));
+            let client = Arc::new(Doh3Client {
+                dial: super::DialContext {
+                    endpoint: crate::dns::endpoint::DnsEndpoint::parse(
+                        &format!("{address}/dns-query"),
+                        DnsProtocol::H3,
+                        Some("localhost"),
+                    )
+                    .unwrap(),
+                    query_timeout: Duration::from_secs(1),
+                    dial_timeout: Duration::from_secs(2),
+                    socket_budget: budget.clone(),
+                    proxy: None,
+                },
+                quic_config: insecure_quic_config(b"h3").await,
+                quic_ep: SharedQuicEndpoint::new(),
+                session: LifecycleSlot::new(),
+                active_tasks: Arc::clone(&active_tasks),
+            });
+
+            let response = client.exchange(&query, None).await.unwrap();
+            assert!(is_valid_response(&query, &response));
+            assert_eq!(&response[..2], &query[..2]);
+            assert_eq!(client.session.init_count(), 2);
+            assert_eq!(budget.available_sockets(), 0);
+            client.close().await;
+            assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+            let queries = server.await.unwrap();
+            let mut wire_query = query;
+            wire_query[..2].fill(0);
+            assert_eq!(queries, [wire_query.clone(), wire_query]);
+            drop(
+                budget
+                    .acquire_until(tokio::time::Instant::now() + Duration::from_secs(1))
+                    .await
+                    .unwrap(),
+            );
+        })
+        .await
+        .expect("one-credit DoH3 retry must release the retired socket before admission");
+    }
 
     #[test]
     fn h3_body_rejects_hostile_multichunk_response_before_append() {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::ebpf::real::tests::fresh_netns;
+pub(super) use crate::ebpf::real::tests::in_netns;
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use udp_group::{UdpGroup, lookup_cookie};
@@ -154,7 +156,7 @@ impl NetworkFixture {
         load_classifier(&mut backend, "lan_ingress_l2");
         load_classifier(&mut backend, "dae0peer_ingress");
         load_classifier(&mut backend, "dae0_ingress");
-        aya::programs::tc::qdisc_add_clsact("hrlan0").unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"hrlan0").unwrap();
         let program: &mut SchedClassifier = backend
             .bpf_mut()
             .unwrap()
@@ -162,8 +164,8 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrlan0", TcAttachType::Ingress).unwrap();
-        aya::programs::tc::qdisc_add_clsact("hrdae0").unwrap();
+        program.attach(c"hrlan0", TcAttachType::Ingress).unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"hrdae0").unwrap();
         let program: &mut SchedClassifier = backend
             .bpf_mut()
             .unwrap()
@@ -171,9 +173,9 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrdae0", TcAttachType::Ingress).unwrap();
+        program.attach(c"hrdae0", TcAttachType::Ingress).unwrap();
         in_netns(&daens_ns, || {
-            aya::programs::tc::qdisc_add_clsact("hrpeer0").unwrap();
+            aya::programs::tc::qdisc_add_clsact(c"hrpeer0").unwrap();
             let program: &mut SchedClassifier = backend
                 .bpf_mut()
                 .unwrap()
@@ -181,7 +183,7 @@ impl NetworkFixture {
                 .unwrap()
                 .try_into()
                 .unwrap();
-            program.attach("hrpeer0", TcAttachType::Ingress).unwrap();
+            program.attach(c"hrpeer0", TcAttachType::Ingress).unwrap();
             let lookup: &mut aya::programs::SkLookup = backend
                 .bpf_mut()
                 .unwrap()
@@ -223,9 +225,19 @@ impl NetworkFixture {
     }
 
     pub(super) fn l3_tun(&mut self) -> std::fs::File {
-        let tun = tun("hrtun0");
+        self.l3_link("hrtun0", libc::IFF_TUN, None)
+    }
+
+    /// A TAP retyped to RAWIP: an `_l3` link whose frames keep Ethernet headers.
+    pub(super) fn rawip_tap(&mut self) -> std::fs::File {
+        self.l3_link("hrtap0", libc::IFF_TAP, Some(519))
+    }
+
+    fn l3_link(&mut self, name: &str, flags: libc::c_int, link_type: Option<u16>) -> std::fs::File {
+        let device = tun(name, flags, link_type);
         load_classifier(&mut self.backend, "lan_ingress_l3");
-        aya::programs::tc::qdisc_add_clsact("hrtun0").unwrap();
+        let cname = std::ffi::CString::new(name).unwrap();
+        aya::programs::tc::qdisc_add_clsact(&cname).unwrap();
         let program: &mut SchedClassifier = self
             .backend
             .bpf_mut()
@@ -234,8 +246,8 @@ impl NetworkFixture {
             .unwrap()
             .try_into()
             .unwrap();
-        program.attach("hrtun0", TcAttachType::Ingress).unwrap();
-        tun
+        program.attach(&cname, TcAttachType::Ingress).unwrap();
+        device
     }
 
     /// Replaces the daens UDP listeners with distinct sockets per family.
@@ -256,28 +268,6 @@ impl NetworkFixture {
         assert_udp_empty(&self.listeners.udp6);
         assert_tcp_empty(&self.listeners.tcp4);
         assert_tcp_empty(&self.listeners.tcp6);
-    }
-}
-
-fn fresh_netns() -> OwnedFd {
-    std::thread::spawn(|| {
-        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-        std::fs::File::open("/proc/thread-self/ns/net")
-            .map(OwnedFd::from)
-            .unwrap()
-    })
-    .join()
-    .unwrap()
-}
-
-pub(super) fn in_netns<T>(netns: &OwnedFd, f: impl FnOnce() -> T) -> T {
-    let current = std::fs::File::open("/proc/thread-self/ns/net").unwrap();
-    nix::sched::setns(netns, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
-    nix::sched::setns(&current, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-    match result {
-        Ok(value) => value,
-        Err(panic) => std::panic::resume_unwind(panic),
     }
 }
 
@@ -503,7 +493,7 @@ fn add_default_routes(netns: &OwnedFd, name: &str, v4_gateway: [u8; 4], v6_gatew
     });
 }
 
-fn tun(name: &str) -> std::fs::File {
+fn tun(name: &str, flags: libc::c_int, link_type: Option<u16>) -> std::fs::File {
     use std::os::unix::fs::OpenOptionsExt;
 
     let file = std::fs::OpenOptions::new()
@@ -516,13 +506,28 @@ fn tun(name: &str) -> std::fs::File {
     for (byte, value) in request.ifr_name.iter_mut().zip(name.bytes()) {
         *byte = value as libc::c_char;
     }
-    request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+    request.ifr_ifru.ifru_flags = (flags | libc::IFF_NO_PI) as libc::c_short;
     assert_eq!(
         unsafe { libc::ioctl(file.as_raw_fd(), libc::TUNSETIFF, &mut request) },
         0,
         "create TUN: {}",
         std::io::Error::last_os_error()
     );
+    if let Some(link_type) = link_type {
+        // The device is still down; TUNSETLINK takes the ARPHRD value itself.
+        assert_eq!(
+            unsafe {
+                libc::ioctl(
+                    file.as_raw_fd(),
+                    libc::TUNSETLINK,
+                    libc::c_ulong::from(link_type),
+                )
+            },
+            0,
+            "retype {name}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     let mut netlink = crate::netlink::NlSock::new().unwrap();
     let ifindex = nix::net::if_::if_nametoindex(name).unwrap();
     netlink.set_link_up(ifindex, true).unwrap();

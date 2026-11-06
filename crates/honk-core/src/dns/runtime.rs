@@ -102,7 +102,6 @@ pub(crate) use super::projection::RoutingProjectionSnapshot;
 
 pub(crate) struct DnsRuntimeParts {
     pub(crate) generation: RuntimeGeneration,
-    pub(crate) udp_query_limit: usize,
     pub(crate) forwarder: Arc<DnsForwarder>,
     pub(crate) routing_projection: Arc<RoutingProjectionSnapshot>,
     /// Defers reusable-state retirement of the traffic registry until this
@@ -115,7 +114,6 @@ pub(crate) struct DnsRuntimeParts {
 pub(crate) struct DnsRuntime {
     parts: DnsRuntimeParts,
     query_limit: Arc<Semaphore>,
-    udp_query_limit: Arc<Semaphore>,
     state: AtomicU8,
     leases: AtomicUsize,
     lease_released: Notify,
@@ -135,7 +133,6 @@ impl DnsRuntime {
     pub(crate) fn new(parts: DnsRuntimeParts) -> Arc<Self> {
         Arc::new(Self {
             query_limit: Arc::new(Semaphore::new(MAX_CONCURRENT_QUERIES)),
-            udp_query_limit: Arc::new(Semaphore::new(parts.udp_query_limit)),
             parts,
             state: AtomicU8::new(RuntimeState::Active as u8),
             leases: AtomicUsize::new(0),
@@ -180,10 +177,6 @@ impl DnsRuntime {
 
     pub(crate) fn try_acquire_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
         Arc::clone(&self.query_limit).try_acquire_owned()
-    }
-
-    pub(crate) fn try_acquire_udp_query(&self) -> Result<OwnedSemaphorePermit, TryAcquireError> {
-        Arc::clone(&self.udp_query_limit).try_acquire_owned()
     }
 
     pub(crate) fn forwarder(&self) -> &Arc<DnsForwarder> {
@@ -370,6 +363,11 @@ impl RuntimeLease {
         &self,
         operation: std::pin::Pin<&mut impl Future<Output = T>>,
     ) -> Result<T, RuntimeCancelled> {
+        // A retired runtime never polls new work; checking the flag first keeps
+        // that contract while the select below polls the operation first.
+        if self.runtime.cancellation_requested.load(Ordering::Acquire) {
+            return Err(self.cancelled().await);
+        }
         #[cfg(feature = "native-api")]
         let observer = honk_outbound::runtime::flow_observation::current().map(|observer| {
             let mut context = observer.context();
@@ -403,17 +401,18 @@ impl RuntimeLease {
                 operation.await
             }
         };
+        // Ready cache hits must not register a cancellation waiter; the
+        // post-result check keeps cancellation winning a completion race.
         tokio::select! {
             biased;
-            error = self.cancelled() => Err(error),
             result = operation => {
-                // Cancellation can be published after select polls its first branch.
                 if self.runtime.cancellation_requested.load(Ordering::Acquire) {
                     Err(self.cancelled().await)
                 } else {
                     Ok(result)
                 }
             },
+            error = self.cancelled() => Err(error),
         }
     }
 

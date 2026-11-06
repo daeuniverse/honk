@@ -183,22 +183,31 @@ fn skb_context(input: SkbInput) -> __sk_buff {
 fn set_array<V: Pod>(bpf: &mut Ebpf, name: &str, index: u32, value: V) -> Result<(), MapError> {
     let map = bpf.map_mut(name).expect("array map present");
     let mut array = Array::<_, V>::try_from(map).expect("array map type/layout");
-    array.set(index, value, 0)
+    array.set(index, &value, 0)
 }
 
-fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError> {
+fn put_hash<K: Pod, V: Pod>(bpf: &mut Ebpf, name: &str, key: K, value: V) -> Result<(), MapError>
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map_mut(name).expect("hash map present");
     let mut hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
-    hash.insert(key, FlowMapValue::new(value), 4)
+    hash.insert(&key, &FlowMapValue::new(value), 4)
 }
 
-fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize {
+fn hash_count<K: Pod, V: Pod>(bpf: &Ebpf, name: &str) -> usize
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map(name).expect("hash map present");
     let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     hash.keys().map(Result::unwrap).count()
 }
 
-fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V> {
+fn get_hash<K: Pod, V: Pod>(bpf: &Ebpf, name: &str, key: K) -> Option<V>
+where
+    FlowMapValue<V>: Pod,
+{
     let map = bpf.map(name).expect("hash map present");
     let hash = HashMap::<_, K, FlowMapValue<V>>::try_from(map).expect("flow map type/layout");
     match hash.get(&key, 4) {
@@ -833,6 +842,26 @@ fn cached_wan_tcp_survives_a_dead_outbound() {
 }
 
 #[test]
+#[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
+fn wan_egress_l3_redirects_an_ethernet_frame_without_a_second_header() {
+    // Test-run frames are Ethernet, like a device retyped to an L3 link type.
+    let mut fixture = Fixture::load();
+    let key = tuple([10, 0, 0, 3], [198, 51, 100, 3], 42001, 443, IPPROTO_TCP);
+    put_hash(
+        &mut fixture.bpf,
+        "CONN_STATE_MAP",
+        key,
+        cached_state(TEST_OUTBOUND, 0, 0, false, false),
+    )
+    .unwrap();
+    let packet = tcp_packet([10, 0, 0, 3], [198, 51, 100, 3], 42001, 443, 0x10, 7);
+    let run = fixture.run("wan_egress_l3", &packet, SkbInput::default());
+    assert_eq!(run.return_value, TC_ACT_REDIRECT);
+    assert_eq!(run.data_size_out as usize, packet.len());
+    assert_eq!(run.data[14..], packet[14..]);
+}
+
+#[test]
 #[ignore = "requires root, bpffs, TUN, iproute2, and an isolated network namespace"]
 fn ndp_redirect_l3_on_real_tun() {
     std::thread::spawn(|| {
@@ -906,7 +935,7 @@ fn ndp_redirect_l3_on_real_tun() {
         let mut incoming = tun("honk-in", "fd43::1/64");
         std::fs::write("/proc/sys/net/ipv6/conf/all/forwarding", "1").unwrap();
         let mut fixture = Fixture::load();
-        aya::programs::tc::qdisc_add_clsact("honk-out").unwrap();
+        aya::programs::tc::qdisc_add_clsact(c"honk-out").unwrap();
         let program: &mut SchedClassifier = fixture
             .bpf
             .program_mut("lan_egress_l3")
@@ -914,7 +943,7 @@ fn ndp_redirect_l3_on_real_tun() {
             .try_into()
             .unwrap();
         let link = program
-            .attach("honk-out", aya::programs::TcAttachType::Egress)
+            .attach(c"honk-out", aya::programs::TcAttachType::Egress)
             .unwrap();
         let socket = socket2::Socket::new(
             socket2::Domain::IPV6,
@@ -974,7 +1003,7 @@ fn ndp_redirect_l3_on_real_tun() {
             .try_into()
             .unwrap();
         let link = program
-            .attach("honk-out", aya::programs::TcAttachType::Egress)
+            .attach(c"honk-out", aya::programs::TcAttachType::Egress)
             .unwrap();
         message[0] = 137;
         match socket.send_to(&message, &SocketAddr::new(destination.into(), 0).into()) {

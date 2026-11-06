@@ -1,9 +1,10 @@
+use crate::ctx::raw_skb;
 use crate::maps::PARSE_CTX_MAP;
 use aya_ebpf::{
-    bindings::{__be16, __be32},
+    bindings::{__be16, __be32, bpf_hdr_start_off::BPF_HDR_START_NET},
     programs::TcContext,
 };
-use aya_ebpf_bindings::helpers::bpf_skb_load_bytes;
+use aya_ebpf_bindings::helpers::{bpf_skb_load_bytes, bpf_skb_load_bytes_relative};
 use core::{ffi::c_long, mem, ptr};
 use honk_ebpf_common::{Tuples, conn::ParseTransportCtx, dae_ip::In6Addr};
 use network_types::{
@@ -21,6 +22,7 @@ pub const PARSE_FRAGMENT: i32 = 2;
 /// causing unnecessary slow-path fallback.
 pub const HEADER_PULL_SIZE: u32 = 256;
 pub const ETH_HLEN: u32 = 14;
+pub const VLAN_VID_MASK: u32 = 0x0fff;
 pub const ETH_P_IP: u16 = 0x0800;
 pub const ETH_P_IPV6: u16 = 0x86DD;
 pub const IPPROTO_NONE: u8 = 59;
@@ -92,6 +94,56 @@ pub const PASS_UNSUPPORTED: c_long = 1;
 /// Parsed ICMPv6 Redirect; egress suppresses it when locally originated.
 pub const PASS_NDP_REDIRECT: c_long = 3;
 
+/// Link-header length for a program bound to a link whose type declares none.
+/// A device set up as Ethernet and then retyped (e.g. to `ARPHRD_RAWIP`) still
+/// carries an Ethernet header, so trust the kernel's network-header position,
+/// never packet contents alone.
+#[inline(always)]
+pub fn l3_link_h_len(ctx: &TcContext) -> u32 {
+    let (data, data_end) = (ctx.data(), ctx.data_end());
+    let head = (data_end - data) as u32;
+    // ponytail: a linear head outside 15..=65550 bytes keeps bare-IP parsing; pull first if such Ethernet frames appear.
+    if !(ETH_HLEN + 1..=ETH_HLEN + 1 + 0xffff).contains(&head)
+        || data + mem::size_of::<EthHdr>() > data_end
+    {
+        return 0;
+    }
+    // An AF_PACKET reservation of 14 bytes (e.g. on an L3 bond) can still hold bare IP,
+    // so bytes 12-13 must match the protocol. Checked first: a packet read rejects
+    // ordinary bare IP without a call or helper.
+    if unsafe { (*(data as *const EthHdr)).ether_type } != ctx.skb.protocol() as u16 {
+        return 0;
+    }
+    network_header_at_eth_hlen(ctx, head)
+}
+
+// The helper reads only up to the linear tail, so at one offset a 1-byte read
+// succeeds iff the network header is at most 14 bytes in and a 2-byte read
+// fails iff it is at least 14 bytes in.
+// #[inline(never)]: keeps the probe buffer out of the classifiers' combined stack.
+#[inline(never)]
+fn network_header_at_eth_hlen(ctx: &TcContext, head: u32) -> u32 {
+    let skb = raw_skb(ctx) as *const _;
+    let offset = head - ETH_HLEN - 1;
+    let mut bytes = [0u8; 2];
+    let to = bytes.as_mut_ptr() as *mut _;
+    if unsafe { bpf_skb_load_bytes_relative(skb, offset, to, 1, BPF_HDR_START_NET) } != 0
+        || unsafe { bpf_skb_load_bytes_relative(skb, offset, to, 2, BPF_HDR_START_NET) } == 0
+    {
+        return 0;
+    }
+    ETH_HLEN
+}
+
+/// True when an Ethernet frame still carries a non-zero-VID tag (hwaccel
+/// `vlan_tci`, cleared by `vlan_do_receive` before the VLAN device's own TC).
+/// Redirecting it into daens would drop it as OTHERHOST, so the VLAN device
+/// must classify it instead. VID 0 priority tags are delivered normally.
+#[inline(always)]
+pub fn is_vlan_tagged(ctx: &TcContext, link_h_len: u32) -> bool {
+    link_h_len == ETH_HLEN && unsafe { (*raw_skb(ctx)).vlan_tci } & VLAN_VID_MASK != 0
+}
+
 /// Destinations that must never enter routing/conntrack: L2
 /// broadcast/multicast, IPv4 limited broadcast + multicast + 0.0.0.0, IPv6
 /// multicast. DHCP, mDNS, SSDP and LLMNR ride these — routing them through
@@ -121,7 +173,7 @@ pub fn udp_has_quic_long_header(ctx: &TcContext, link_h_len: u32, pkt: &ParsedPa
         return false;
     }
 
-    let skb = ctx.skb.skb as *mut _;
+    let skb = raw_skb(ctx) as *mut _;
     let mut offset = link_h_len;
     let mut nexthdr = IPPROTO_UDP;
 
@@ -214,7 +266,7 @@ trait ParseTransportExt {
 impl ParseTransportExt for ParseTransportCtx {
     #[inline(always)]
     fn parse_slow(&mut self, ctx: &TcContext, link_h_len: u32) -> Result<(), c_long> {
-        let skb_ptr = ctx.skb.skb as *mut _;
+        let skb_ptr = raw_skb(ctx) as *mut _;
         let mut offset = 0u32;
         let mut ret: c_long;
 

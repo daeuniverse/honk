@@ -333,6 +333,96 @@ async fn direct_tcp_dial_rejects_ignored_alpn() {
 }
 
 #[tokio::test]
+async fn raw_websocket_dials_reject_invalid_headers_before_io() {
+    use futures_util::FutureExt;
+    use honk_config::types::NodeProtocol;
+    use honk_outbound::proxy::ProxyRegistry;
+    use tokio::io::AsyncReadExt;
+
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    for protocol in [
+        NodeProtocol::Trojan,
+        #[cfg(feature = "rprx")]
+        NodeProtocol::VMess,
+        #[cfg(feature = "rprx")]
+        NodeProtocol::VLess,
+    ] {
+        for headers in [
+            [("host".into(), "override.example".into())].into(),
+            [("x-test".into(), "\t".into())].into(),
+            [("x-test".into(), "a".repeat(16 * 1024))].into(),
+            (0..65).map(|i| (format!("x-{i}"), "v".into())).collect(),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let mut candidate = Node {
+                host: address.ip().to_string(),
+                address: address.to_string(),
+                port: address.port(),
+                outbound: OutboundConfig::from_protocol(protocol),
+                ..Default::default()
+            };
+            match &mut candidate.outbound {
+                OutboundConfig::Trojan(config) => config.password = Some("secret".into()),
+                OutboundConfig::Vmess(config) => {
+                    config.uuid = Some("00000000-0000-4000-8000-000000000001".into())
+                }
+                OutboundConfig::Vless(config) => {
+                    config.uuid = Some("00000000-0000-4000-8000-000000000001".into())
+                }
+                _ => unreachable!(),
+            }
+            candidate.transport_mut().unwrap().transport = "ws".into();
+            candidate.validate_protocol().unwrap();
+            candidate.transport_mut().unwrap().ws_headers = headers;
+            let deadline = std::time::Duration::from_secs(1);
+            let error =
+                tokio::time::timeout(deadline, registry.dial(&candidate, address, None, deadline))
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ConfigError>(),
+                Some(ConfigError::Validation(_))
+            ));
+            assert!(
+                listener.accept().now_or_never().is_none(),
+                "invalid headers opened a connection"
+            );
+
+            let (tcp, peer) =
+                tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
+            let (mut peer, _) = peer.unwrap();
+            let error = tokio::time::timeout(
+                deadline,
+                registry.find(protocol).unwrap().tcp.dial_with_tcp(
+                    &candidate,
+                    address,
+                    None,
+                    tcp.unwrap(),
+                    deadline,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(matches!(
+                error.downcast_ref::<ConfigError>(),
+                Some(ConfigError::Validation(_))
+            ));
+            assert_eq!(
+                tokio::time::timeout(deadline, peer.read(&mut [0; 1]))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "invalid headers sent bytes on a supplied connection"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn direct_quic_config_rejects_tcp_alpn() {
     let mut quic_node = Node::from_share_link("hy2://secret@example.com:443").unwrap();
     quic_node.tls_mut().unwrap().alpn = vec!["h2".into()];

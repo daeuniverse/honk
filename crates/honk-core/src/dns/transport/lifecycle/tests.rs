@@ -17,6 +17,8 @@ use crate::dns::routing::DnsRouter;
 use crate::dns::upstream_pool::UpstreamPool;
 use crate::routing::Router;
 
+mod idle_retirement;
+
 #[tokio::test]
 async fn acquisition_initializes_once_when_128_callers_race() {
     let before = crate::stats::dns_snapshot();

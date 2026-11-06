@@ -12,7 +12,7 @@ use quinn::{ClientConfig, Endpoint, VarInt};
 #[cfg(test)]
 use tokio::sync::Mutex;
 
-use super::endpoint::endpoint_config_with_mtu;
+use super::endpoint::{OwnedTaskRuntime, endpoint_config_with_mtu};
 use super::metrics::{
     record_transport_rx_drop, record_transport_tx_drop, record_transport_tx_would_block,
 };
@@ -512,53 +512,6 @@ impl quinn::AsyncUdpSocket for TransportQuinnSocket {
     }
 }
 
-#[derive(Debug)]
-struct PacketTransportRuntime {
-    inner: Arc<dyn quinn::Runtime>,
-    tasks: std::sync::Weak<crate::runtime::TaskOwner>,
-    parent: Option<std::sync::Weak<crate::runtime::TaskOwner>>,
-}
-
-impl quinn::Runtime for PacketTransportRuntime {
-    fn new_timer(&self, deadline: Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {
-        self.inner.new_timer(deadline)
-    }
-
-    fn spawn(&self, future: Pin<Box<dyn Future<Output = ()> + Send>>) {
-        let Some(tasks) = self.tasks.upgrade() else {
-            return;
-        };
-        let (start, started) = tokio::sync::oneshot::channel();
-        let Ok(task) = crate::runtime::spawn_joinable(Some(&tasks), async move {
-            if started.await.is_ok() {
-                future.await;
-            }
-        }) else {
-            return;
-        };
-        if self.parent.as_ref().is_some_and(|parent| {
-            parent
-                .upgrade()
-                .is_none_or(|parent| !parent.retain_joinable(task.clone()))
-        }) {
-            task.abort();
-            return;
-        }
-        let _ = start.send(());
-    }
-
-    fn wrap_udp_socket(
-        &self,
-        socket: std::net::UdpSocket,
-    ) -> io::Result<Arc<dyn quinn::AsyncUdpSocket>> {
-        self.inner.wrap_udp_socket(socket)
-    }
-
-    fn now(&self) -> Instant {
-        self.inner.now()
-    }
-}
-
 /// Owns a client-only quinn endpoint, its drivers, and the bounded
 /// [`PacketTransport`] adapter workers that drive it.
 #[derive(Debug)]
@@ -625,14 +578,8 @@ pub fn packet_transport_endpoint_with_metrics(
             "PacketTransport relay address does not match the QUIC peer",
         ));
     }
-    let runtime = quinn::default_runtime()
-        .ok_or_else(|| io::Error::other("no async runtime available for QUIC"))?;
     let drivers = Arc::new(crate::runtime::TaskOwner::production());
-    let runtime = Arc::new(PacketTransportRuntime {
-        inner: runtime,
-        tasks: Arc::downgrade(&drivers),
-        parent: owner.map(Arc::downgrade),
-    });
+    let runtime = OwnedTaskRuntime::new(&drivers, owner)?;
     let config = endpoint_config_with_mtu(1252)?;
     let (socket, sender, receiver) =
         TransportQuinnSocket::prepare(transport, remote, metrics_enabled);

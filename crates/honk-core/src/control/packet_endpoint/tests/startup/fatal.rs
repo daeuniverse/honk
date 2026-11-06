@@ -55,6 +55,7 @@ async fn fatal_selector_releases_real_config_and_subscription_shutdown_before_cq
         let coordinator = service.start(
             crate::native_api::store::SourceStore::File(entry.into()), None,
             directory.path().to_path_buf(), Arc::clone(&active_config), plane.log_files(),
+            plane.startup_downgrades(),
             plane.diagnostics_handle(), commands.clone(), subscription_handle.clone(),
         ).await;
         let (endpoints, mut owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 4).await.unwrap();

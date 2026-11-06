@@ -596,8 +596,11 @@ fn normalize_ws_transport(mut transport: Mapping, proxy: &mut Mapping) -> Result
                 {
                     return Err("duplicate sing-box WebSocket Host headers");
                 }
-            } else if active(&value) {
-                return Err("unsupported sing-box WebSocket header");
+            } else if !value.is_null() {
+                if !value.is_string() {
+                    return Err("sing-box WebSocket header values must be strings");
+                }
+                normalized.insert(Value::String(key.into()), value);
             }
         }
         if !normalized.is_empty() {

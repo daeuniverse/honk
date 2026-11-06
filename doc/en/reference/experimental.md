@@ -1,6 +1,6 @@
 # Experimental Configuration Reference
 
-`experimental { ... }` contains the current nested sections.
+`experimental { ... }` configures the APIs and persistent runtime state.
 
 ## Section overview
 
@@ -14,7 +14,9 @@
 
 ## `native_api`
 
-Requires the opt-in `native-api` Cargo feature (build with `--features native-api` or `native-ui`; the full and `-native-api` release artifacts include it). It does not require `clash-api`, and the listener is disabled by default. Enabling it without that feature fails startup. All effective fields require restart: SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans, and empty security-list members are errors.
+Requires the opt-in `native-api` Cargo feature: build with `--features native-api` or `native-ui`, or use a full or `-native-api` release. It does not require `clash-api`. The listener is disabled by default; enabling it without the feature fails startup.
+
+All effective fields require restart. SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans and empty security-list members are errors.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -25,7 +27,7 @@ Requires the opt-in `native-api` Cargo feature (build with `--features native-ap
 | `allow_anonymous_loopback` | `false` | Permit credential-free requests only when `secret` is empty, `password_auth` is false and the actual listening IP is loopback. |
 | `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
-| `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` with the default-off `native-ui` feature. No startup download, extraction or frontend build. |
+| `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` / `embedded-lite` with the default-off `native-ui` feature. `embedded-lite` is the lighter doona lite edition (preview). No startup download, extraction or frontend build. |
 | `record_flows` | `true` | Permit bounded userspace flow recording under flow diagnostic demand or an explicit runtime pin. `false` prohibits recording, including runtime pins; configuration changes require restart. |
 | `record_traffic` | `true` | Keep up to 600 traffic samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current counters remain available. |
 | `record_memory` | `true` | Keep up to 600 memory samples for 600 seconds, even without clients. `false` disables history and releases its buffer on restart; current readings remain available. |
@@ -53,23 +55,41 @@ Nonempty native secrets must be visible ASCII without whitespace or commas, matc
 
 Use an unpredictable token of at least 16 bytes. In token mode, an enabled non-loopback listener (including a wildcard bind) with a secret shorter than 16 bytes emits one WARN at startup activation and each accepted configuration reactivation. It records only structured `listen` and `secret_length` fields, never the secret, and does not reject the configuration. Loopback-only listeners and password mode do not emit this advisory. This is separate from the under-eight-byte masking warning described above.
 
-Authentication mode is restart-required. A nonempty `secret` selects the existing static-token mode. An empty `secret` with `password_auth: true` selects password mode. An empty `secret` with explicit anonymous loopback and an actual loopback bind selects the existing development mode. An enabled listener with none of these fails validation. Password mode requires an empty `secret` and is rejected with `allow_anonymous_loopback`; `config_write: true` likewise requires token or password mode.
+Choose one authentication mode; changing it requires restart:
+
+- Static token: set a nonempty `secret`.
+- Password login: leave `secret` empty and set `password_auth: true`. Do not combine this with `allow_anonymous_loopback`.
+- Local development without credentials: leave `secret` empty, keep `password_auth` false, explicitly enable anonymous loopback and bind to an actual loopback address.
+
+An enabled listener with none of these modes fails validation. `config_write: true` requires token or password mode.
 
 Replace the example secret. For local credential-free development, omit `secret` and explicitly set `allow_anonymous_loopback: true`; never publish that anonymous listener through a reverse proxy. Plain HTTP with a token on a non-loopback network is not a secure deployment. Terminate TLS at a trusted proxy.
 
-Default Host acceptance is the concrete listening authority; loopback also accepts `localhost`, `127.0.0.1`, and `[::1]` at that port. A wildcard bind accepts any IP-literal Host, and `localhost`, at the listening port, since those name the listener itself on whichever interface the request arrived; DNS names are still not authorized, because only a name can be rebound. Only directly corresponding plain-HTTP origins are automatically allowed; on a wildcard bind that origin must name the request's own Host, so a page served from another address at the same port needs `allow_origins`. A TLS proxy preserving `Host: panel.example` needs `allowed_hosts: 'panel.example'` and `allow_origins: 'https://panel.example'`; if it preserves `Host: panel.example:443`, add `allowed_hosts: 'panel.example', 'panel.example:443'`. Forwarded headers do not grant authorization.
+Host and Origin checks apply independently of authentication:
+
+- By default, Host must name the concrete listening authority. Loopback also accepts `localhost`, `127.0.0.1` and `[::1]` at that port.
+- A wildcard bind accepts any IP-literal Host, and `localhost`, at the listening port: these name the listener itself on whichever interface received the request. DNS names still need authorization because a name can be rebound.
+- Only directly corresponding plain-HTTP origins are automatically allowed. On a wildcard bind, the origin must name the request's own Host; a page served from another address at the same port needs `allow_origins`.
+- A TLS proxy preserving `Host: panel.example` needs `allowed_hosts: 'panel.example'` and `allow_origins: 'https://panel.example'`. If it preserves `Host: panel.example:443`, add `allowed_hosts: 'panel.example', 'panel.example:443'`.
+
+Forwarded headers do not grant authorization.
 
 Lists use individually quoted comma-separated entries, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api).
 
-For a single binary, use a full release build or `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, and set `ui: embedded`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
+For a single binary, use a full release build or `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, and set `ui: embedded` or `ui: embedded-lite`; `native-ui` includes `native-api` without requiring Clash. Without `native-ui`, enabled embedded hosting fails startup. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. Asset/source identities, corresponding-source distribution and the management contract are documented in the [API reference](./api.md#embedded-doona-provenance).
 
 File-configured geodata sources are administrator-controlled, restart-required and cannot be changed through source writes. With a state db, downloads can also use authenticated URL overrides or built-in sources. Userinfo, fragments, redirects and content encoding are rejected. Direct hostname sources require `global.bootstrap_resolver`; no system-DNS fallback is used. `assets.geodata.route` or the stored route can send downloads through the routing rules or a group instead, and a route that cannot carry a request never falls back to direct. Updates use the applicable configured, stored or built-in sources. The [management contract](./api.md#managed-entries-and-geodata) distinguishes network limits, verified-byte activation and partial durable replacement from rollback.
 
 Traffic and memory histories share the existing one-second sampler; missing samples/measurements remain gaps/nulls rather than zero-filled or interpolated points. Memory is actual process RSS and available cgroup-v2 data, not kernel accounting. File settings remain restart-required. `PATCH /api/v1/runtime/settings` can transiently adjust the supported log/DNS-log/flow limits and native log level, but cannot enable a disabled recorder. Accepted explicit activation, including no-op, restores configured values; provider/network refresh preserves overrides.
 
-Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup; programmatic configs and compatibility serde loaders do not supply one. Configuration reads expose accepted content, masking only declared listener-secret values, including duplicate/overridden values and their other occurrences. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. Credential-bearing sources stay read-only and retain original-byte hashes. Source `path` stays entry-directory-relative; `absolute_path` exposes the canonical absolute path. Move credentials to a dedicated read-only include locally if the main source must be editable. The API cannot change/move API credentials or alter native settings; those require a local edit and restart.
+Configuration metadata, validation and reload operations require a genuine `.dae` source snapshot captured at startup. Programmatic configs and compatibility serde loaders do not supply one.
+
+- Reads return accepted content and mask only declared listener-secret values, including duplicate/overridden values and their other occurrences. Admitted anonymous loopback requests read the same data as bearer-authenticated requests.
+- Credential-bearing sources stay read-only and retain original-byte hashes.
+- Source `path` stays entry-directory-relative; `absolute_path` exposes the canonical absolute path.
+- To make the main source editable, move credentials to a dedicated read-only include locally, then restart. The API cannot change or move API credentials or alter native settings; those require a local edit and restart.
 
 With `config_write: true`, all accepted noncredential includes are writable; ordinary `include` glob and no-match semantics remain unchanged. Save by opaque source ID with RFC 9110 `If-Match` over disk-content SHA-256 (strong tags, lists/multiple field lines or `*`; weak tags never match), then follow the real reload operation. A successful write is not activation success, and externally uncoordinated editors can still race the final check/rename window. Restricted Group PATCH uses the same source transaction but requires the accepted group/config ETag, checked before writing and again before activation; that revision is not the disk hash. See [source safety and failure semantics](./api.md#accepted-configuration-and-reload-operations).
 
@@ -125,13 +145,30 @@ Upgrade note: omitting `cache_file.enabled` now keeps Selector choices and delay
 
 Unless `enabled` is `false`, honk keeps per-network Selector choices and each node's last real delay sample in the state db, like mihomo's `store-selected`. Only `enabled: true` also restores and persists the Clash mode and the Clash GLOBAL selection, and only with native API disabled; with native disabled and no restored mode, a restart starts in `default_mode`, while native enabled always starts in `Rule`. Delay samples are written as one batch every minute; restoration discards zero samples and samples older than 24 hours. Liveness is not restored.
 
-If the state db is corrupt and neither `--store db` nor `native_api.password_auth` is set, honk moves `honk.db` and `honk.db-wal` aside as `honk.db.corrupt` and `honk.db.corrupt-wal` once it holds the instance lock, and starts a new file. If `honk.db.corrupt` already exists, it keeps both files and runs without persistence until one is removed. In the same case a state db that is unavailable, unsafe (not a private file owned by the honk user) or locked by `honk-core admin reset` also leaves honk running without persistence, with a warning. For an unsafe path the `persistence_unavailable` degradation adds `rule` (`not_owner`, `group_or_other_bits`, `not_directory`, `not_file`, `symlink` or `identity_changed`) beside `reason`; the log names the path and how to fix it. A db from a newer honk or another program refuses startup in every mode, because moving it aside would destroy data only that program can read.
+When neither `--store db` nor `native_api.password_auth` is set, database failures have these outcomes:
+
+- Corrupt database: after taking the instance lock, honk moves `honk.db` and `honk.db-wal` to `honk.db.corrupt` and `honk.db.corrupt-wal`, then starts a new file.
+- Existing `honk.db.corrupt`: honk keeps both files and runs without persistence until one is removed.
+- Unavailable, unsafe or reset-locked database: honk warns and runs without persistence. An unsafe database is not a private file owned by the honk user; a reset lock belongs to `honk-core admin reset`.
+
+For an unsafe path, the `persistence_unavailable` degradation adds `rule` beside `reason`: `not_owner`, `group_or_other_bits`, `not_directory`, `not_file`, `symlink` or `identity_changed`. The log names the path and how to fix it.
+
+A database from a newer honk or another program refuses startup in every mode. Moving it aside would destroy data only that program can read.
 
 ### Limits
 
 A maintenance tick runs every 60 seconds. A Selector choice is kept only for a Selector group in the configuration, and a delay sample only for a configured node; a row whose group or node is missing at two consecutive ticks is deleted, so a reload that briefly drops one keeps its row. Delay samples older than 24 hours and expired DNS rows are deleted at each tick, and each tick returns up to 1 MiB of freed pages to the filesystem. At most 4,096 DNS rows are kept; after each batch the earliest expiry is evicted first.
 
-At startup, if honk opens the state db (because `--store db`, `password_auth`, `store_subscribe` or `cache_file` needs it), `enabled: false` empties the Selector, delay, Clash-state and DNS tables; an unset `enabled` empties the Clash-state and DNS tables; `store_dns: false` empties the DNS table; and an enabled native API or a disabled Clash API empties the Clash-state table. Startup without a state db leaves the file unchanged.
+If startup opens the state db because `--store db`, `password_auth`, `store_subscribe` or `cache_file` needs it, these settings clear stored cache state:
+
+| Startup setting | Tables emptied |
+| --- | --- |
+| `enabled: false` | Selector, delay, Clash-state and DNS |
+| `enabled` unset | Clash-state and DNS |
+| `store_dns: false` | DNS |
+| Native API enabled or Clash API disabled | Clash-state |
+
+Startup without a state db leaves the file unchanged.
 
 The state db file is capped at 112 MiB. Cache writes keep 24 MiB of it free for configuration revisions and subscription bodies: when a batch would leave more than 88 MiB in use, the writer first deletes DNS rows down to 2,048, and rolls the batch back if that is not enough; skipped DNS entries are counted as `budget_skipped`, not as written. The legacy `cache.db` import obeys the same budget: a copy that would pass it is not committed, and the next start tries again.
 

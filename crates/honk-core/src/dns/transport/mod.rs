@@ -12,6 +12,7 @@
 //! control-plane DNS. Hostnames resolve via `honk_outbound::bootstrap`.
 
 mod body;
+mod budget;
 mod dial;
 mod doh;
 mod doh3;
@@ -42,6 +43,11 @@ fn is_valid_response(query: &[u8], response: &[u8]) -> bool {
         .is_ok_and(|query| crate::dns::response::ResponseTemplate::check(&query, response).is_ok())
 }
 
+pub(crate) use budget::DEFAULT_DNS_SOCKET_LIMIT;
+pub use budget::DnsSocketBudget;
+pub(crate) use budget::IdlePressureRelease;
+#[cfg(test)]
+pub(crate) use budget::MAX_EXTRA_UDP_SOCKETS;
 pub use dial::{DialContext, ProxyDial};
 pub use doh::DohClient;
 pub use doh3::Doh3Client;
@@ -52,3 +58,4 @@ pub(crate) use framing::{read_length_prefixed_into, write_length_prefixed};
 pub(crate) use lifecycle::LifecycleSlot;
 pub use tcp_pool::TcpPool;
 pub use udp_pool::UdpPool;
+pub(crate) use udp_pool::UdpPoolCapacity;

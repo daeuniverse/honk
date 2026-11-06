@@ -130,6 +130,99 @@ async fn test_prefer_ipv4_returns_aaaa_when_no_a() {
 }
 
 #[tokio::test]
+async fn cached_prefer_expiry_excludes_sibling_wait() {
+    use crate::dns::cache::{CacheKey, ExactLookup, OperationKind};
+    use crate::dns::planner::{RequestScope, UpstreamTag};
+    use crate::dns::query::QueryContext;
+
+    let query = build_dns_query("example.com", 28);
+    let upstream = Arc::new(GatedUpstream {
+        response: nodata_response("example.com", 1, None),
+        call_count: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+        .with_strategy(DnsStrategy::PreferIpv4);
+    let key = CacheKey::new(
+        &QueryContext::parse(&query).expect("query"),
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let cache = forwarder.cache_service().await;
+    cache.put_exact(key.clone(), make_aaaa_response(TEST_V6, 300), 300, None);
+    let ExactLookup::Positive { entry, .. } = cache.lookup_exact(&key, true) else {
+        panic!("positive cache entry");
+    };
+
+    let (outcome, remaining_after_wait) = tokio::join!(forwarder.resolve_outcome(&query), async {
+        upstream.entered.notified().await;
+        // Cache entries use the real clock, not Tokio's paused clock.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = entry.remaining_ttl();
+        upstream.release.notify_one();
+        remaining
+    });
+    let outcome = outcome.expect("cached non-preferred answer");
+    assert_eq!(outcome.provenance(), Provenance::Cache);
+    assert_eq!(outcome.response_class(), ResponseClass::Positive);
+    assert!(outcome.expiry().is_cacheable());
+    assert!(
+        outcome.expiry().ttl() <= remaining_after_wait,
+        "cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",
+        outcome.expiry().ttl(),
+    );
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn cached_negative_prefer_expiry_excludes_sibling_wait() {
+    use crate::dns::cache::{CacheKey, OperationKind};
+    use crate::dns::planner::{RequestScope, UpstreamTag};
+    use crate::dns::query::QueryContext;
+
+    let query = build_dns_query("example.com", 28);
+    let upstream = Arc::new(GatedUpstream {
+        response: nodata_response("example.com", 1, None),
+        call_count: AtomicUsize::new(0),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+        .with_strategy(DnsStrategy::PreferIpv4);
+    let key = CacheKey::new(
+        &QueryContext::parse(&query).expect("query"),
+        None,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let cache = forwarder.cache_service().await;
+    cache.put_negative_exact(key.clone(), 300, 3);
+
+    let (outcome, remaining_after_wait) = tokio::join!(forwarder.resolve_outcome(&query), async {
+        upstream.entered.notified().await;
+        // Negative hits round up to whole seconds; cross that rounding boundary.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let hit = cache
+            .negative_hit_exact(&key)
+            .expect("negative cache entry");
+        upstream.release.notify_one();
+        hit.remaining_ttl
+    });
+    let outcome = outcome.expect("cached non-preferred negative answer");
+    assert_eq!(outcome.provenance(), Provenance::Cache);
+    assert_eq!(outcome.response_class(), ResponseClass::Nxdomain);
+    assert!(outcome.expiry().is_cacheable());
+    assert!(
+        outcome.expiry().ttl() <= remaining_after_wait,
+        "negative cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",
+        outcome.expiry().ttl(),
+    );
+    assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn test_prefer_ipv4_never_probes_for_a_queries() {
     let mock = qtype_mock(
         make_a_response([10, 0, 0, 1], 300),

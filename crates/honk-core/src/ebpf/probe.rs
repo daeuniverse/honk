@@ -1,6 +1,6 @@
 //! Runtime capability probing for batched `bpf()` map commands.
 //!
-//! aya 0.14 does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+), so
+//! Aya does not expose `BPF_MAP_LOOKUP_BATCH` (Linux 5.6+), so
 //! `ebpf::map_snapshot` issues it as a raw syscall. Availability is detected at runtime instead of
 //! relying on kernel version parsing. On capability failure the storage adapter
 //! either selects its proven-safe fallback or returns an explicit unsupported

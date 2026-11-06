@@ -676,11 +676,7 @@ async fn endpoint_close_retains_quinn_driver_panic_in_both_owners() {
         let drivers = Arc::new(crate::runtime::TaskOwner::production());
         let panicked = Arc::new(tokio::sync::Notify::new());
         let runtime = Arc::new(PanicDriverRuntime {
-            inner: Arc::new(PacketTransportRuntime {
-                inner: quinn::default_runtime().unwrap(),
-                tasks: Arc::downgrade(&drivers),
-                parent: Some(Arc::downgrade(&parent)),
-            }),
+            inner: OwnedTaskRuntime::new(&drivers, Some(&parent)).unwrap(),
             panicked: Arc::clone(&panicked),
         });
         let (socket, sender, receiver) = TransportQuinnSocket::prepare(

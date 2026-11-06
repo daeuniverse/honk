@@ -36,8 +36,6 @@ pub struct UdpDecisionScratch {
 #[unsafe(no_mangle)]
 pub static PARAM: Global<DaeParam> = Global::new(DaeParam::DEFAULT);
 
-/// WAN interface ifindex used by the egress program to identify locally-
-/// generated packets that the bonding driver forwards onto the bond master.
 #[unsafe(no_mangle)]
 pub static WAN_IFINDEX: Global<u32> = Global::new(0);
 

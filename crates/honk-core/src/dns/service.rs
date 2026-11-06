@@ -54,12 +54,19 @@ impl OperationToken {
         }
         let operation = self.observer.scope(operation);
         tokio::pin!(operation);
+        // Operation first avoids a watch waiter per ready query; a flush
+        // published before completion was observed still cancels it.
         tokio::select! {
             biased;
+            result = &mut operation => match self.updates.has_changed() {
+                Ok(false) => Ok(result),
+                Ok(true) | Err(_) => Err(OperationCancelled {
+                    generation: self.generation,
+                }),
+            },
             _ = self.updates.changed() => Err(OperationCancelled {
                 generation: self.generation,
             }),
-            result = &mut operation => Ok(result),
         }
     }
 }
@@ -174,6 +181,17 @@ impl DnsService {
         match self.backend.as_ref() {
             DnsServiceBackend::Runtime(provider) => Some(Arc::clone(provider)),
             DnsServiceBackend::Standalone(_) => None,
+        }
+    }
+
+    pub(crate) fn try_acquire_runtime(
+        &self,
+    ) -> Result<RuntimeLease, super::runtime::DnsUnavailable> {
+        match self.backend.as_ref() {
+            DnsServiceBackend::Runtime(provider) => provider.try_acquire(),
+            DnsServiceBackend::Standalone(_) => {
+                unreachable!("runtime admission requires a runtime DNS service")
+            }
         }
     }
 

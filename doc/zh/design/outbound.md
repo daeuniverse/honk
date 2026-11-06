@@ -1,6 +1,6 @@
 # 出站与代理栈
 
-本文描述从选定叶节点到向代理服务器或目标端发送协议字节的路径。
+出站栈从选定叶节点建立传输，向代理服务器或目标端发送协议字节。
 
 ## 范围
 
@@ -25,8 +25,8 @@ UDP 对象。
 
 ## 实现模块归属
 
-公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径仍受支持；实现拆为较
-小的普通 Rust 模块：
+公开的 `proxy::*`、`quic::*` 与 `quic_boring::*` import 路径仍受支持；
+实现按职责拆分为普通 Rust 模块：
 
 | 范围 | 实现模块 |
 | --- | --- |
@@ -220,8 +220,8 @@ registry 构建 replacement。只有完整节点配置相等时 runtime 才能�
 退役 generation 首先对新工作变成 terminal。未迁移的 AnyTLS 与 VLESS
 pool 进入 draining：不再接收新逻辑 stream，但现有 stream 保留 carrier
 直到结束。QUIC flow 拥有连接 clone，因此 terminal generation 检查会
-拒绝新工作，而当前 flow 自然完成。只有进程级 flow drain 之后，进程
-shutdown 才强制关闭剩余 pool 与 QUIC client。
+拒绝新工作，而当前 flow 自然完成。进程 shutdown 在可选的
+[业务连接宽限等待](../reference/global.md#关闭)之后强制关闭剩余 pool 与 QUIC client。
 
 standalone probe 等无 generation 调用方使用 `EphemeralRuntimeGuard`。
 AnyTLS 或 VLESS stream 与 packet transport 在整个生命周期内保留 guard。
@@ -238,7 +238,7 @@ pool 不会在调用方 abort 后残留。Single XUDP 也使用 VLESS runtime �
 
 先获取 generation gate，防止低限额 generation 在等待时占住进程容量。
 replacement 可以立即采用新的 generation 局部限额，而旧的进行中工作
-继续占用共享进程 gate。已经热 session 上的逻辑 stream 不再执行物理拨号。
+继续占用共享进程 gate。已预热 session 上的逻辑 stream 不再执行物理拨号。
 
 Session pool 的自主 replacement dial 只绑定已发布 owner 的 admission。reload
 发布时原子地重新绑定迁移的 pool；迟到的 speculative commit 不能恢复前任
@@ -265,8 +265,9 @@ permit 仍持有时的 H2 driver 终止。Session 在发布或 detached attach �
 pool 通知；手动清理已关闭 carrier 时也会广播容量变化。
 
 VLESS 物理 carrier 还持有不可变进程级 VLESS-carrier gate 的一个 permit。
-启动资源预算在计算 UDP endpoint 前先分出 `min(after_dials / 8, 8192)`；零值
-保持为零。重载流量与 DNS runtime fork 共用同一个 gate。permit 随实际 carrier
+启动资源预算先扣除 DNS socket 分区，再在计算 UDP endpoint 前分出
+`min(after_dns / 8, 8192)`；零值保持为零。重载流量与 DNS runtime fork 共用
+同一个 gate。permit 随实际 carrier
 I/O 经 provisional、active、draining 与 idle 状态一直保留到 task teardown，
 因此权威描述符边界来自它，而不是各节点 pool cap 的总和。
 
@@ -367,12 +368,9 @@ Basic Authorization header，显式配置的 Authorization 优先。同源重定
 重定向 URL 的 userinfo 不会提供新凭据。响应体上限及 HTTP(S) 环境代理连接
 仍受各自下载边界约束。
 
-带 mark UDP socket 为 `SO_RCVBUF` 与 `SO_SNDBUF` 分别请求 8 MiB。Linux
-可能 clamp，并以配置 sysctl 记账值的两倍报告；core 在启动时提高对应上限。
-
 `bootstrap.rs` 避免代理主机名解析依赖 honk 自己拦截的 DNS 路径。节点
 拨号点经 `connect_marked` 或 QUIC 建立调用 `bootstrap::resolve`，绝不
-直接调用裸 `lookup_host`。配置的 bootstrap resolver 通过带 bypass mark
+直接调用裸 `lookup_host`，否则代理主机名解析会与 honk 自己拦截的 DNS 路径形成死锁。配置的 bootstrap resolver 通过带 bypass mark
 的 UDP/TCP 查询；失败时回退 `/etc/hosts` 及 `/etc/resolv.conf` 中第一个
 数字 nameserver，DNS socket 同样带 mark，不调用 libc NSS 或追加搜索后缀。
 A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机查询 ID 及原问题
@@ -608,7 +606,7 @@ datagram 时成立：一串未 admit 的超时若没有被任何 admit 的 datag
 source 的所有目的地，而不会接在残帧后面。若该写入是被其 view 自身的退役所取消，
 这次退役是中性取消，不向节点记入健康或 Score；因超时造成的撕裂仍是传输失败。
 原生 UDP 的大小拒绝（`EMSGSIZE`）是类型化的本地
-`InvalidSize` 拒绝，不终止任何东西。最后一个 view 的 endpoint permit 保留到
+`InvalidSize` 拒绝，不触发终止处理。最后一个 view 的 endpoint permit 保留到
 source receiver 退出或另一个 view 绑定，使退役中的 source 不超出描述符分区；这
 意味着饱和的 pool 在短时间内可能拒绝新 endpoint。core 的 send gate 是唯一的外层
 锁：后端只在其下持有自己的叶子锁，且不回调 core。
@@ -665,19 +663,20 @@ carrier permit，直至实际 I/O task teardown。
 该 pool 的多余 carrier，已有子流仍可继续完成。
 只有 Active carrier 计入可复用的 warm/standby 下限。携带活动子流的 Draining
 carrier 独立保留，不能挤掉空闲 replacement；idle 回收和解除保留的删除过程
-均对 pool 进行线性遍历。
+均线性遍历 pool。
 
 文件描述符分区在进程启动时固定，并在 reload 与 DNS fork 间共享。启用 `rprx`
-时，即使初始配置没有 VLESS 节点，也会在划分 UDP endpoint 定额前预留
-`min(after_dials / 8, 8192)` 个 carrier slot；原生 VLESS UDP、UoT 与 Single XUDP
-也使用此 gate。关闭 `rprx` 时不预留 carrier，相关余量保留给 UDP endpoint。
+时，先扣除 DNS socket 分区，再在划分 UDP endpoint 定额前预留
+`min(after_dns / 8, 8192)` 个 carrier slot，即使初始配置没有 VLESS 节点；
+原生 VLESS UDP、UoT 与 Single XUDP 也使用此 gate。关闭 `rprx` 时不预留
+carrier，相关余量保留给 UDP endpoint。
 耗尽后立即返回 typed Capacity 拒绝，不排队等待。
 
 | 生效 `nofile` | 不预留 carrier 时的 UDP endpoint 上限 | 预留后的上限 | 减少 |
 | ---: | ---: | ---: | ---: |
-| 1,024 | 50 | 44 | 12.00% |
-| 4,096 | 216 | 189 | 12.50% |
-| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,024 | 45 | 39 | 13.33% |
+| 4,096 | 192 | 168 | 12.50% |
+| 65,536 | 4,563 | 3,992 | 12.51% |
 | 1,048,576 | 32,768 | 32,768 | 0%（已达 endpoint 封顶） |
 
 这些是按描述符推导的上限，并非预分配 endpoint 内存；启动时还按
@@ -758,7 +757,7 @@ TUIC、Juicity 与 Hysteria2 使用 quinn 0.11。`src/quic.rs` 负责 transport
 - QUIC transport-parameter 交换。
 
 Header protection 感知 packet-number 长度。接收时先 unmask 第一字节，再推导一到
-四字节的 packet-number 长度；仅仅 mask 或 unmask 相应数量的字节。若将所有 packet
+四字节的 packet-number 长度；只 mask 或 unmask 相应数量的字节。若将所有 packet
 number 视为四字节，就会破坏短 packet number 后面的 payload；与存在相同错误的对端
 互测时，错误会相互抵消。
 
@@ -961,7 +960,7 @@ IPv4 `0`、IPv6 `1`、域名 `2`（不同于 request 地址的 SOCKS5 编号）�
 服务端可用同一个未 connect 的 socket 承载它们。`recv_packet` 在消耗 frame 之前先解码地址：
 数值源地址直接返回（IPv4-mapped IPv6 归一为 IPv4），打开时捕获的域名加端口投影回捕获的 target，
 其他任何域名 frame 都被整体丢弃（释放其头部与 payload 的全部 credit，不做域名解析）；
-未知 ATYP 是终止错误。发送时每个 datagram 只写入拨号域名，其他名字以数值目标发出。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
+未知 ATYP 是终止错误。发送时，逐包目的地址只有与拨号域名相同才写为域名，其他目的地址使用数值形式。每条 flow 的首次发送等待物理 flush（`confirmed`），稳态发送只入队，
 `admitted` 在 frame 入 session writer 队列时设置。队列与 credit 上限仍是单个 transport 的上限，
 因此队列饱和或 EOF 会退役共享该 SID 的所有目的地。域名目标流（`RewriteTo`）仍按原始目的地各自成 scope。
 

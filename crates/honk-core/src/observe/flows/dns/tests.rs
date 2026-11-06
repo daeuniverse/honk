@@ -159,12 +159,12 @@ async fn source_policy_cache_and_verification_ignore_dns_log_toggle() {
         rows.iter()
             .any(|row| row["purpose"] == "domain_verification"
                 && row["status"] == "succeeded"
-                && row["addresses"][0] == "192.0.2.17")
+                && row["addresses"][0] == "192.0.2.17"
+                && row["cache_entry_id"].is_string())
     );
-    assert!(
-        rows.iter()
-            .any(|row| row["source"] == "cache" && row["cache"] == "hit")
-    );
+    assert!(rows.iter().any(|row| row["source"] == "cache"
+        && row["cache"] == "hit"
+        && row["cache_entry_id"].is_string()));
     assert!(rows.iter().any(|row| row["status"] == "rejected"
         && row["qtype"] == "AAAA"
         && row["cache"] == "bypass"));

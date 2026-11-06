@@ -1,6 +1,6 @@
 # 架构概览
 
-`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎；本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
+`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎。本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
 
 其配置语法和 TC 数据路径源自 dae，并在文档声明的范围内保持 dae 兼容；出站 Handler、组与 Clash API 则采用 sing-box 风格的设计。`honk` 是独立实现，现已与两者显著分化。
 
@@ -64,7 +64,7 @@ flowchart LR
 
 解析器和分享链接的数据接口保留安全诊断，不自行记录日志。标量值、名称、链接和原始错误内容不对外输出，但保留固定错误原因和 `dns.hosts_file` → `dns.use_host` 等迁移说明。组、过滤器、订阅和条目使用原始序号定位。详细 dae 诊断共用只含元数据的来源表，保留 include 父来源关联及可取得的物理行号；只有最外层加载尝试追加终止错误。
 
-`src/node/validation.rs` 负责集合准入与共享检查；`src/node/vless.rs` 独占规范 `VlessConfig` 的 normalization、path selection 与组合校验；`src/node/wireguard.rs` 持有单 peer WireGuard key、地址/路由规范化与身份材料；`src/node/protocol.rs` 持有其余协议配置及共享 TLS/stream/QUIC options。详细 loader 保留类型化 cause 与原始 one-based 节点坐标。
+`src/node/validation.rs` 负责集合准入与共享检查；`src/node/vless.rs` 独占规范 `VlessConfig` 的规范化、路径选择与组合校验；`src/node/wireguard.rs` 持有单 peer WireGuard 密钥、地址/路由规范化与身份材料；`src/node/protocol.rs` 持有其余协议配置及共享 TLS/stream/QUIC 选项。详细加载接口保留类型化错误原因与从一开始计数的原始节点坐标。
 
 `src/parser/mod.rs` 负责文件级 `include` 和有序顶层分派。`lexer.rs` 与 `cursor.rs` 保留引用源文本的词法单元、注释范围及有界片段，`read.rs` 提供共享的标量与表达式读取接口；各节由 `scalars.rs`、`experimental.rs`、`entries.rs`、`groups.rs`、`dns.rs` 和 `routing.rs` 读取。包含文件的 glob 模式以入口文件所在目录为基准解析；匹配文件的规范化路径不得超出入口目录。重复包含和循环包含均被拒绝。允许忽略未知内容的读取器整块跳过未知嵌套块，不应用其子项；节点和订阅的兼容包装块仍会遍历，`experimental` 外层和 NFQUEUE 错误仍会终止解析。
 
@@ -74,7 +74,7 @@ flowchart LR
 
 遍历语法区分单行条目和多行表达式；括号保护状态仅随实际返回的表达式语句跨越同源分段，在来源边界重置。已建立索引的起始花括号保留其块头和子树归属。订阅原始字段独立于结构块头视图保留完整起始词法单元的字节。
 
-`src/share_link.rs` 是唯一的 `Node::from_share_link` 解析器；`src/share_link/options.rs` 把 URI 报文编码与独立的多路复用控制项归入规范协议模型，先执行规范化与校验，再派生身份，不保留第二套 VLESS mode 模型。`src/node/wire.rs` 是唯一的 flat serde adapter；VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容 artifact 而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与 identity 派生，因此规范 cutover 可以改变 VLESS `Node.id`，但不改变 VMess 行为或 identity。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
+`src/share_link.rs` 是唯一的 `Node::from_share_link` 解析器；`src/share_link/options.rs` 把 URI 报文编码与独立的多路复用控制项归入规范协议模型，先执行规范化与校验，再派生身份，不保留第二套 VLESS 模式模型。`src/node/wire.rs` 是唯一的扁平 serde 适配器；VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与身份派生，因此规范模型切换可以改变 VLESS `Node.id`，但不改变 VMess 行为或身份。行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 
 - `src/experimental.rs` — `ExperimentalConfig` { `clash_api: ClashApiConfig`, `cache_file: CacheFileConfig` }。dae parser 显式允许当前两个嵌套节，旧 `udp_nfqueue` 仅作为迁移输入：发出告警，仅在未配置 `global.nfqueue_enable` 时将 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
 - `src/subscription.rs`、`src/types.rs`（`NodeProtocol` 有 12 个变体，Direct/Block 留给内建节点；`DialMode` 为 ip/domain/domain+/domain++；另有 `SubscriptionType`、`DnsProtocol` 与共享 `default_true`/`parse_duration_secs` helper）、`src/error.rs`（`ConfigError`）。
@@ -126,7 +126,7 @@ flowchart TB
 - **Token 校验终态：** 暂存 UDP token 必须在 skb mark、内核状态、handoff、redirect track、用户态 verdict 状态、lease/endpoint 和后端转换间一致。Direct 遵循 Arm → 全部带标记 verdict → Activate；proxy 在唯一的规范拨号/发送路径之前发布最终状态。
 - **`must`/`block` 终结性：** Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
 - **失活出站 fail-closed：** `lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为用户态最后尝试；UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 豁免该健康检查丢包，但仍遵循用户的终局 `must` 结果。
-- **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不会自动生成接口规则。WAN egress 仍旁路目的地址匹配 `PARAM.local_ip` 的流量，但不保证一般管理访问可达；接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
+- **显式本地路由：** 网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不会自动生成接口规则。WAN egress 仍旁路目的地址匹配 `PARAM.local_ip` 的流量，但不保证一般管理访问可达。`PARAM.local_ip` 是启动时的快照：选择第一个已解析、存在且具有可绑定规范根接口的 LAN 项（否则 WAN），跳过被拒绝的根接口，再取该根接口的第一个 IPv4 地址。规范化遵循接口计划器：bond/bridge 成员使用其规范 master，`vrf`/`openvswitch` 成员保持自身。无可选根接口或所选根接口没有 IPv4 地址时，该值为 0，该旁路保持关闭。之后的接口或地址变化不会更新快照；LAN 缺席时选中的 WAN 地址也会在整个进程生命周期内保持不变。接口观察仍用于拓扑/ECS/健康，非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
 - **组 OR 连通性：** 一个组的 eBPF alive slot 是全部叶子成员状态的 OR，并包含上述单叶 TCP 最后尝试例外。多叶节点组中的单个成员失活不得使整个组 fail-closed。
 - **Score 隔离与原因：** 健康过滤与业务目标地址族保持独立。首次选择的 utility 仍为启发式；健康晋升比较有界、按需求确定大小的评估集内所有合格挑战者与固定现任，依据共同目标／时间证据，而非无关聚合／setup 均值。可选试用共享保留的组／网络／地址族预算，由原始业务开始赚取，时间流逝不产生额度；试用不取得已提交现任身份。真实连败保留退避和三连败排除。精确与聚合证据各有 4,096 项 LRU；比较存储最多 512 个 cell、1 MiB 逻辑分配，不是进程 RSS。重叠计数不相加。reload 保留已准入业务结果，同时撤销近期可用性与探测基线。公开摘要和计数始终限定范围，不导出原始目标键，详见[组设计](./groups.md#score-评分与生命周期)。
 - **Score 按需反馈：** setup/首响应与有界分方向进展可在终态前发布，不增加 Beta 完成。业务、配置健康与预热分别承担不同作用；任意手动 delay 测量不变成业务可靠性或配置基线。Score TCP 建立失败可在原 deadline 内通过不同的合格叶节点恢复一次，不打开新 final、不越过 Selector、不重放负载。
@@ -135,15 +135,15 @@ flowchart TB
 
 ## 构建 feature 与 mock 模式
 
-`honk-core` 默认启用 `clash-api`、`mimalloc` 和 `rprx`；真实 eBPF 需显式启用。
+`honk-core` 默认启用 `clash-api`、`jemalloc` 和 `rprx`；真实 eBPF 需显式启用。
 
 | Feature | 默认 | 作用 |
 | --- | --- | --- |
 | `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 6.12+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
 | `native-api` | 否 | 独立的 HTTP/1.1 原生观测、可选历史、受控源管理/reload API 与本地目录 UI；持有有界连接并负责其生命周期，严格校验 bearer/Host/Origin，不依赖 Clash。 |
-| `native-ui` | 否 | 隐含 `native-api`，为 `ui: embedded` 内嵌固定版本的 doona 发行资产；运行时不解压、不下载、不构建前端。 |
-| `mimalloc` | 是 | 引入 `mimalloc` 与 `libmimalloc-sys`，并将 mimalloc 安装为 `honk-core` 二进制的 allocator。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页，并把 mimalloc 的 purge 延迟设为 100 ms（除非 `MIMALLOC_PURGE_DELAY` 另有设置）。 |
+| `native-ui` | 否 | 隐含 `native-api`，为 `ui: embedded` 内嵌固定版本的 doona 发行资产；`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要该特性。运行时不解压、不下载、不构建前端。 |
+| `jemalloc` | 是 | 引入 `tikv-jemallocator`，并将 jemalloc 安装为 `honk-core` 二进制的 allocator；该 crate 从 C 源码构建 jemalloc。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。运行期选项使用 `_RJEM_MALLOC_CONF` 而非 `MALLOC_CONF`：crate 以 `_rjem_` 前缀构建 jemalloc，环境变量名同样被加上该前缀。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
 `mock-ebpf` 不是 Cargo feature。默认 TC 路径在不带 `ebpf` 的构建中使用 `MockEbpfBackend`，`--mock-ebpf` 显式选择无特权开发路径；若该路径请求 `global.nfqueue_enable = true`，启动会告警并仅在本进程关闭 NFQUEUE 暂存，文件不变。显式选择 XDP 则使用其 userspace policy backend 与真实 XDP/AF_XDP adapter，不依赖 `ebpf` feature，也不是 mock capture。
@@ -152,8 +152,8 @@ flowchart TB
 
 ## 作者与分工说明
 
-- 项目维护者主要负责 eBPF 数据路径的人工设计、实现 review 与验证，包括 `honk-ebpf`、`honk-ebpf-common` 以及 `honk-core` 中的挂载/map 路径。
-- 其余多数用户态子系统主要由 AI 辅助编写，包括配置解析器、出站 Handler、组与健康检查、用户态 DNS、Clash API 及大量控制面衔接代码。维护者做了部分代码 review，并非逐行负责。
+- 项目维护者主要负责 eBPF 数据路径的人工设计、实现审查与验证，包括 `honk-ebpf`、`honk-ebpf-common` 以及 `honk-core` 中的挂载/map 路径。
+- 其余多数用户态子系统主要由 AI 辅助编写，包括配置解析器、出站 Handler、组与健康检查、用户态 DNS、Clash API 及大量控制面衔接代码。维护者做了部分代码审查，并非逐行负责。
 
 ## 相关文档
 

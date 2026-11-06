@@ -1,0 +1,21 @@
+services:
+  honk:
+    image: ghcr.io/daeuniverse/honk:${HONK_VERSION:?set HONK_VERSION to a release version without v, such as 0.1.0-beta.4}
+    build:
+      context: .
+      args:
+        HONK_VERSION: ${HONK_VERSION}
+    privileged: true
+    network_mode: host
+    pid: host
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - /sys:/sys
+      - /etc/honk:/etc/honk
+      - /var/lib/honk:/var/lib/honk
+      - type: bind
+        source: /run/honk-core.lock
+        target: /run/honk-core.lock
+        bind:
+          create_host_path: false

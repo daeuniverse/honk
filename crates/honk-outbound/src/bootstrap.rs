@@ -74,10 +74,38 @@ pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
 ///
 /// Generation-owned callers use this path so a later [`set_global`] cannot
 /// change the resolver selected by an in-flight or lazily initialized dial.
-pub async fn resolve_with(
+pub fn resolve_with<'a>(
+    resolver: Option<BootstrapResolver>,
+    host: &'a str,
+) -> impl Future<Output = io::Result<Vec<IpAddr>>> + Send + use<'a> {
+    resolve_with_inner(resolver, host, None, || std::future::ready(Ok(())))
+}
+
+/// Resolve with socket admission only around configured or system DNS queries.
+/// Local answers need no guard; admission errors never trigger resolver fallback.
+pub fn resolve_with_admission<'a, Admit, Admission, Guard>(
+    resolver: Option<BootstrapResolver>,
+    host: &'a str,
+    deadline: tokio::time::Instant,
+    admit: Admit,
+) -> impl Future<Output = io::Result<Vec<IpAddr>>> + use<'a, Admit, Admission, Guard>
+where
+    Admit: FnMut() -> Admission,
+    Admission: Future<Output = io::Result<Guard>>,
+{
+    resolve_with_inner(resolver, host, Some(deadline), admit)
+}
+
+async fn resolve_with_inner<Admit, Admission, Guard>(
     resolver: Option<BootstrapResolver>,
     host: &str,
-) -> io::Result<Vec<IpAddr>> {
+    deadline: Option<tokio::time::Instant>,
+    mut admit: Admit,
+) -> io::Result<Vec<IpAddr>>
+where
+    Admit: FnMut() -> Admission,
+    Admission: Future<Output = io::Result<Guard>>,
+{
     let host = host.trim_start_matches('[').trim_end_matches(']');
     if let Some(ip) = crate::runtime::pinned_server_address(host) {
         return Ok(vec![ip]);
@@ -86,18 +114,16 @@ pub async fn resolve_with(
         return Ok(vec![ip]);
     }
     if let Some(resolver) = resolver {
-        match resolver.query(host).await {
+        let result = {
+            let _guard = admit().await?;
+            resolver.query_with_deadline(host, deadline).await
+        };
+        match result {
             Ok(ips) if !ips.is_empty() => return Ok(ips),
             Ok(_) => tracing::debug!("bootstrap resolver returned no records for '{}'", host),
             Err(e) => tracing::debug!("bootstrap resolution of '{}' failed: {}", host, e),
         }
     }
-    resolve_system(host).await
-}
-
-/// `/etc/hosts`, then bypass-marked queries to the first numeric system nameserver.
-/// A hosts answer is observed as its own lookup; each nameserver query observes itself.
-async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
     if let Ok(contents) = tokio::fs::read_to_string("/etc/hosts").await {
         let addrs = hosts_addresses(&contents, host);
         if !addrs.is_empty() {
@@ -116,7 +142,8 @@ async fn resolve_system(host: &str) -> io::Result<Vec<IpAddr>> {
         server,
         use_tcp: false,
     };
-    let addrs = resolver.query(host).await?;
+    let _guard = admit().await?;
+    let addrs = resolver.query_with_deadline(host, deadline).await?;
     if addrs.is_empty() {
         return Err(io::Error::new(io::ErrorKind::NotFound, "no DNS addresses"));
     }
@@ -148,6 +175,24 @@ fn hosts_addresses(contents: &str, host: &str) -> Vec<IpAddr> {
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl BootstrapResolver {
+    async fn query_with_deadline(
+        &self,
+        host: &str,
+        deadline: Option<tokio::time::Instant>,
+    ) -> io::Result<Vec<IpAddr>> {
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.query(host))
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "bootstrap DNS resolution timed out",
+                    )
+                })?,
+            None => self.query(host).await,
+        }
+    }
+
     /// Query A and AAAA records for `host` directly from the configured
     /// server over bypass-marked sockets, without a system-resolver fallback.
     pub async fn query(&self, host: &str) -> io::Result<Vec<IpAddr>> {
@@ -609,7 +654,30 @@ impl Drop for LookupObservation {
 }
 
 #[cfg(test)]
-pub(crate) static GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn run_global_test_in_child(name: &str) -> bool {
+    const CHILD: &str = "HONK_GLOBAL_BOOTSTRAP_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        return false;
+    }
+    // Ordinary resolver consumers do not take a test mutex around the global.
+    let executable = std::env::current_exe().unwrap();
+    let listed = std::process::Command::new(&executable)
+        .args(["--exact", name, "--list", "--format", "terse"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert_eq!(
+        String::from_utf8(listed.stdout).unwrap().trim(),
+        format!("{name}: test")
+    );
+    let status = std::process::Command::new(executable)
+        .args(["--exact", name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    true
+}
 
 #[cfg(test)]
 mod tests;

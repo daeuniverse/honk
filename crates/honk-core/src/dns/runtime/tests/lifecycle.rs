@@ -30,7 +30,6 @@ fn wire_runtime(
     (
         DnsRuntime::new(DnsRuntimeParts {
             generation: RuntimeGeneration::new(generation),
-            udp_query_limit: 256,
             forwarder,
             routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
             outbound_runtime: None,

@@ -14,7 +14,7 @@ use super::super::{
 };
 use super::*;
 use crate::configuration::{Activation, ActivationRequest};
-use crate::control::{ControlCommand, LogFiles};
+use crate::control::{ControlCommand, LogFiles, StartupDowngrades};
 use crate::subscription::SubscriptionSupervisorHandle;
 use honk_config::parser::LoadedConfig;
 use tokio::sync::watch;
@@ -33,6 +33,7 @@ struct Worker {
     source_managed: bool,
     active: Arc<tokio::sync::RwLock<Arc<Config>>>,
     log_files: LogFiles,
+    startup_downgrades: StartupDowngrades,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     subscriptions: SubscriptionSupervisorHandle,
     activation: Activation,
@@ -48,6 +49,7 @@ impl ConfigService {
         data_dir: PathBuf,
         active: Arc<tokio::sync::RwLock<Arc<Config>>>,
         log_files: LogFiles,
+        startup_downgrades: StartupDowngrades,
         diagnostics: crate::config_diagnostics::SharedDiagnostics,
         commands: mpsc::Sender<ControlCommand>,
         subscriptions: SubscriptionSupervisorHandle,
@@ -74,6 +76,7 @@ impl ConfigService {
                 source_managed: initial.is_some(),
                 active,
                 log_files,
+                startup_downgrades,
                 diagnostics,
                 activation: Activation::new(commands, subscriptions.clone()),
                 subscriptions,

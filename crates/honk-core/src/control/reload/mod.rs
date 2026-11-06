@@ -12,7 +12,7 @@ pub(in crate::control) use fingerprint::{
     declaring_sources_replaced, dns_routing_state_reusable, effective_config_unchanged,
     routing_state_reusable, subscription_nodes_unchanged,
 };
-pub(crate) use policy::{LogFiles, restart_required_fields};
+pub(crate) use policy::{LogFiles, StartupDowngrades, restart_required_fields};
 #[cfg(test)]
 pub(in crate::control) use policy::{RestartField, restart_required_changes};
 #[cfg(feature = "native-api")]

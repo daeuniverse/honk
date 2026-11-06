@@ -129,7 +129,9 @@ pub(super) async fn run(context: &ExecutionContext<'_>) -> Result<DnsOutcome, Dn
         (EffectiveExpiry::do_not_cache(), None)
     };
     #[cfg(feature = "native-api")]
-    let entry_id = if let Some(revision) = _revision {
+    let entry_id = if cache::entry_id_demanded(context)
+        && let Some(revision) = _revision
+    {
         context
             .forwarder
             .cache_service()
@@ -188,11 +190,15 @@ async fn stale_outcome(
         return Ok(None);
     };
     #[cfg(feature = "native-api")]
-    let entry_id = context
-        .forwarder
-        .cache_service()
-        .await
-        .entry_id_for_revision(&context.cache_key, _revision);
+    let entry_id = if cache::entry_id_demanded(context) {
+        context
+            .forwarder
+            .cache_service()
+            .await
+            .entry_id_for_revision(&context.cache_key, _revision)
+    } else {
+        None
+    };
     #[cfg(feature = "native-api")]
     crate::observe::flows::dns::cache_entry(entry_id.as_deref());
     let stale = context

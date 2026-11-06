@@ -72,7 +72,6 @@ async fn family_preparation(refusal: bool, response_code: u8) {
     let generation = provider.current_generation().get() + 1;
     provider.publish(DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
             generation,

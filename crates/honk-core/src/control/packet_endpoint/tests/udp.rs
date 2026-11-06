@@ -311,7 +311,7 @@ async fn nonfinal_raw_udp53_keeps_sniffing_but_cannot_alias_a_must_route() {
 #[tokio::test]
 async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
     tokio::time::timeout(Duration::from_secs(20), async {
-        for disposition in ["controller", "block", "must"] {
+        for disposition in ["controller", "block", "must", "quota", "runtime_capacity"] {
             let mut proxy = Peer::start("dns-raw").await;
             let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut config = config(&[&proxy]);
@@ -355,6 +355,30 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
             }
             let (plane, _health) = plane(config).await;
             let backend = Arc::clone(&plane.ebpf);
+            let stats = Arc::clone(&plane.stats);
+            let drain = Arc::clone(&plane.drain_tracker);
+            #[cfg(feature = "native-api")]
+            let dns_api = {
+                let api = Arc::new(crate::native_api::dns::DnsApi::new(
+                    "packet-dns".into(),
+                    true,
+                    std::sync::Weak::new(),
+                ));
+                plane
+                    .dns_controller
+                    .dns_service()
+                    .attach_observer(Arc::downgrade(&api.recorder));
+                api
+            };
+            let held_queries: Vec<_> = match disposition {
+                "quota" => (0..crate::control::dns_control::MAX_UDP_CLIENT_QUERIES)
+                    .map(|_| plane.dns_controller.try_admit_query(true).unwrap())
+                    .collect(),
+                "runtime_capacity" => (0..2048)
+                    .map(|_| plane.dns_controller.try_admit_query(false).unwrap())
+                    .collect(),
+                _ => Vec::new(),
+            };
             let budget = MemoryBudget::new(32 << 20);
             let (scope, scope_owner) = scope(&budget);
             let (endpoints, owner) =
@@ -374,6 +398,9 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
             if disposition == "controller" {
                 let mut response = [0; 1024];
                 let (length, sender) = dns.recv_from(&mut response).await.unwrap();
+                assert_eq!(stats.udp_snapshot().slow_permit_accepted, 1);
+                assert_eq!(drain.active_count(), 1);
+                assert!(endpoints.retains_source(scope.scope(), source.ip()));
                 assert_eq!(
                     crate::dns::forwarder::parse_dns_question(&response[..length]),
                     Some(("a.com".to_owned(), 1)),
@@ -407,6 +434,10 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                     }
                 }
                 reply(&scope, source, destination, &query).await;
+            } else if disposition == "runtime_capacity" {
+                let received = reply_payload(&scope, source, destination).await;
+                assert_eq!(&received[..2], &query[..2]);
+                assert_eq!(received[3] & 0x0f, 5);
             } else {
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), scope.next_output())
@@ -416,8 +447,39 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
             }
             assert!(dns.try_recv_from(&mut [0; 1024]).is_err());
             assert!(backend.read().await.projection_map_snapshot().is_empty());
+            assert_eq!(
+                stats.udp_snapshot().slow_permit_accepted,
+                u64::from(matches!(
+                    disposition,
+                    "controller" | "must" | "runtime_capacity"
+                ))
+            );
+            assert_eq!(
+                stats.udp_snapshot().slow_permit_rejected,
+                u64::from(disposition == "quota")
+            );
+            drop(held_queries);
             endpoints.shutdown().await.unwrap();
             owner.run().await.unwrap();
+            #[cfg(feature = "native-api")]
+            if matches!(disposition, "controller" | "runtime_capacity") {
+                let response = dns_api.log_page_for_test();
+                let bytes = axum::body::to_bytes(response.into_body(), 262144)
+                    .await
+                    .unwrap();
+                let log: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(log["total"], 1);
+                assert_eq!(log["records"][0]["src"], source.to_string());
+                assert_eq!(
+                    log["records"][0]["status"],
+                    if disposition == "controller" {
+                        "NOERROR"
+                    } else {
+                        "REFUSED"
+                    }
+                );
+            }
+            assert_eq!(drain.active_count(), 0);
             proxy.close().await;
         }
     })

@@ -106,7 +106,6 @@ fn runtime_with_outbound(
     );
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime,
@@ -135,7 +134,6 @@ fn runtime_with_bootstrap_pool(generation: u64, pool: Arc<LazyBootstrapPool>) ->
     );
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(generation, router)),
         outbound_runtime: None,
@@ -404,7 +402,6 @@ fn prefetch_runtime(transport: Arc<BlockingTransport>) -> Arc<DnsRuntime> {
     ));
     DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(1),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(1, router)),
         outbound_runtime: None,

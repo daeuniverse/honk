@@ -12,9 +12,9 @@ global {
 }
 ```
 
-修改该设置必须重启进程；reload 会拒绝该变更。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建、固定队列前置检查失败，或数据路径准入前的队列/规则/健康检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。持久化 token generation 恢复失败仍为 fatal，因为分配器状态已无法确定。真实模式会先取得单实例锁，再执行该前置检查，因此正常交接会等待旧队列所有者，不会误降级；保留的 nftables table 会在绑定队列后由安装阶段回收。服务准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。进程级配置项见[全局配置参考](../reference/global.md)。
+修改该设置通常必须重启进程；除实际记录了数据路径准入前的启动降级外，reload 会拒绝开关变更（例外详见[全局配置参考](../reference/global.md)）。降级后 reload 不会重试启用。启动阶段 NFQUEUE 采用 best-effort：mock 模式、不带 `ebpf` 的构建、固定队列前置检查失败，或数据路径准入前的队列/规则/健康检查失败时记录 warning，仅在本进程关闭暂存且不改写配置文件。持久化 token generation 恢复失败仍为 fatal，因为分配器状态已无法确定。真实模式会先取得单实例锁，再执行该前置检查，因此正常交接会等待旧队列所有者，不会误降级；保留的 nftables table 会在绑定队列后由安装阶段回收。服务准入后，listener、queue、watchdog、verdict、cleanup 和 retirement 的失败仍为 fatal。
 
-该 hook 的范围刻意保持狭窄：
+该 hook 按流量类型和状态决定是否暂存：
 
 | 流量或状态 | 行为 |
 | --- | --- |
@@ -100,7 +100,7 @@ Proxy 不会创建第二条路由路径。它复用普通透明 UDP 使用的同
 
 `PendingUdpVerdicts` 持有 joined pump，每批最多处理 1,024 个终态请求，按后端写锁 → correlator cell 取锁，并在释放后端锁后交接 endpoint 给内核。同步后端工作在多线程 runtime 上用 `block_in_place`，在 current-thread runtime 上内联执行。Pump 在调用方取消后仍持有 direct/block lease；在出队、取得后端锁后、grace 后及每项执行前复验原始 deadline，过期请求不修改 conn。取消等待已 Arm Direct 在同一期限内完成。
 
-Watchdog 独立检查被持有的 cell，并强制执行硬持有上限。Token、endpoint generation 或后端状态不匹配时会丢包，且不会修改更新的 incarnation。Verdict 失败或 Direct 已 Arm 后的任何失败都会使进程 fatal，因为用户空间已无法安全判断内核接受了哪些原始包。
+Watchdog 独立检查持有的 cell，并强制执行硬持有上限。Token、endpoint generation 或后端状态不匹配时会丢包，且不会修改更新的 incarnation。Verdict 失败或 Direct 已 Arm 后的任何失败都会使进程 fatal，因为用户空间已无法安全判断内核接受了哪些原始包。
 
 ## 栅栏与生命周期
 
@@ -119,7 +119,7 @@ Listener、queue、watchdog、cleanup、verdict 或 retirement 生命周期中�
 
 Retirement 发布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入 `RETIRE_FENCE[tuple]`，分别保留操作 owner 与 decision token。成功重装 `RETIRE_GRACE_ROOT` 的同一 inner map 会排空 fence 前的 non-sleepable 读者；之后后端复验 incarnation、token、state 与辅助项所有权才删除。Batch 对 fence 去重，保留每个请求的结果、部分删除计数及操作/释放错误；释放时检查精确 owner，未解决的所有权禁止准入。初始 `ArmDirect`/`ActivateProxy`/`Block` commit 共用该协议，每批一次 grace。只有 `ActivateDirect` 在原生锁下原地更新不可变 `DirectArmed`（`BPF_EXIST | BPF_F_LOCK`），不取 fence/grace：后端写锁排除其他写者，内核从不续期 `Pending`/`DirectArmed` 时间戳。
 
-WAN 与 LAN 用户态 UDP 即使 token 为零也共用 fence：endpoint 保留准入 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。先回收匹配辅助项再回收 conn，过期清理也相同；保留外来元数据，拒绝缺失/已被取代的所有权。用户态 [endpoint 退役](./control-plane.md#tcp-中继与-conn-state-所有权)要求实际删除 conn 的证据。
+WAN 与 LAN 用户态 UDP 即使 token 为零也共用 fence：endpoint 保留准入 incarnation，WAN ownership bit 区分带 mark 的 direct/must 与原生直连。先回收匹配辅助项再回收 conn，过期清理也相同；保留外来元数据，所有权缺失或已被替代时拒绝。用户态 [endpoint 退役](./control-plane.md#tcp-中继与-conn-state-所有权)要求实际删除 conn 的证据。
 
 内核 producer 在成功发布前失败时，记录捕获 incarnation 和实际已分配 token 的终态 `Aborted`（尚未分配则为零），不删除 tuple 项，也不把已完成的 Pending/native/proxy/block 改成 Aborted。Preparing 与 Aborted follower 都不能续期时间戳；Aborted 不得激活或转发，立即满足精确 fenced hint/janitor 清理条件。全部物理 tuple 回收仍共用后端协议。
 

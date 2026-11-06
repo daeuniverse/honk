@@ -19,6 +19,8 @@ use tokio::net::{TcpStream, UdpSocket};
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub(super) mod netns;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
+pub(super) mod shared_udp;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub(super) mod wire;
 
 pub(in crate::control) struct TestRetirement {

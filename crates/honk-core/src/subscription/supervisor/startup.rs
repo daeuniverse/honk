@@ -23,16 +23,16 @@ impl SupervisorState {
             {
                 Ok(Some(nodes)) => {
                     honk_config::diagnostic::report_detailed_diagnostics(&diagnostics);
-                    let count = nodes.len();
-                    if !self.add_startup_nodes(
+                    let Some(count) = self.add_startup_nodes(
                         &mut config.nodes,
+                        &config.subscriptions,
                         subscription,
                         nodes,
                         true,
                         SubscriptionUserinfo::default(),
-                    ) {
+                    ) else {
                         continue;
-                    }
+                    };
                     crate::config_diagnostics::declare_provider_diagnostics(
                         subscription,
                         &mut diagnostics,
@@ -107,8 +107,7 @@ impl SupervisorState {
                         let subscription = authorized.subscription;
                         match result {
                             Some(Ok((nodes, userinfo))) => {
-                                let count = nodes.len();
-                                if self.add_startup_nodes(&mut config.nodes, &subscription, nodes, false, userinfo) {
+                                if let Some(count) = self.add_startup_nodes(&mut config.nodes, &config.subscriptions, &subscription, nodes, false, userinfo) {
                                     startup_diagnostics
                                         .replace_provider(subscription.id, diagnostics);
                                     info!(
@@ -156,17 +155,21 @@ impl SupervisorState {
         startup_diagnostics
     }
 
-    /// Replaces the provider's nodes unless one of the new IDs is already
-    /// taken, which a runtime publication would reject as well. The check
-    /// runs before removal, so a rejection keeps the nodes accepted earlier.
+    /// Replaces the provider's nodes, less those another provider published
+    /// first, unless one of the remaining IDs is already taken, which a
+    /// runtime publication would reject as well. The check runs before
+    /// removal, so a rejection keeps the nodes accepted earlier. Returns the
+    /// number of nodes published.
     fn add_startup_nodes(
         &self,
         current: &mut Vec<Node>,
+        subscriptions: &[Subscription],
         subscription: &Subscription,
-        nodes: Vec<Node>,
+        mut nodes: Vec<Node>,
         cached: bool,
         userinfo: SubscriptionUserinfo,
-    ) -> bool {
+    ) -> Option<usize> {
+        super::drop_nodes_published_elsewhere(current, subscriptions, subscription.id, &mut nodes);
         let mut ids: HashSet<_> = current
             .iter()
             .filter(|node| node.subscription_id != Some(subscription.id))
@@ -181,8 +184,9 @@ impl SupervisorState {
             );
             load.error = Some("publication_rejected");
             load.rejection = Some("duplicate-node-id");
-            return false;
+            return None;
         }
+        let count = nodes.len();
         current.retain(|node| node.subscription_id != Some(subscription.id));
         current.extend(nodes);
         *load = ProviderLoad {
@@ -192,13 +196,18 @@ impl SupervisorState {
             error: None,
             rejection: None,
         };
-        true
+        Some(count)
     }
 
-    fn fail_startup_load(&self, id: uuid::Uuid, error: &'static str) {
-        let mut observations = self.observations.write();
-        let load = &mut observations.get_mut(&id).unwrap().load;
-        load.error = Some(error);
-        load.rejection = None;
+    fn fail_startup_load(&mut self, id: uuid::Uuid, error: &'static str) {
+        {
+            let mut observations = self.observations.write();
+            let load = &mut observations.get_mut(&id).unwrap().load;
+            load.error = Some(error);
+            load.rejection = None;
+        }
+        if let Some(provider) = self.providers.get_mut(&id) {
+            provider.finished(Instant::now(), Some(error));
+        }
     }
 }

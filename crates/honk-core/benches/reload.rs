@@ -30,9 +30,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
-#[cfg(all(feature = "mimalloc", not(feature = "reload-alloc-bench")))]
+#[cfg(all(feature = "jemalloc", not(feature = "reload-alloc-bench")))]
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 async fn reload(control_plane: &ControlPlane, config: Config) -> bool {
     control_plane

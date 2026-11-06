@@ -316,13 +316,7 @@ fn fragmented_dns_preserves_native_must_block_and_queue_readiness() {
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
 fn fragmented_dns_parser_state_does_not_capture_following_unfragmented_packets() {
     isolated(|| {
-        let allowed = nix::sched::sched_getaffinity(nix::unistd::Pid::from_raw(0)).unwrap();
-        let cpu = (0..nix::sched::CpuSet::count())
-            .find(|cpu| allowed.is_set(*cpu).unwrap())
-            .unwrap();
-        let mut pinned = nix::sched::CpuSet::new();
-        pinned.set(cpu).unwrap();
-        nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &pinned).unwrap();
+        pin_to_current_cpu();
         let (mut backend, _, _listeners) = publish(&dns_ordering_rules());
         backend
             .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY)

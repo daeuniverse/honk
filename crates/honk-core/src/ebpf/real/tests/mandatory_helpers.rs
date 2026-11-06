@@ -33,6 +33,7 @@ fn program_info(fd: RawFd, info: &mut bpf_prog_info) -> anyhow::Result<()> {
     attr.info.info_len = core::mem::size_of::<bpf_prog_info>() as u32;
     attr.info.info = info as *mut bpf_prog_info as u64;
     unsafe { syscall::bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
+        .map(|_| ())
         .map_err(|errno| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD failed with errno {errno}"))
 }
 
@@ -121,7 +122,7 @@ fn mandatory_programs_call_no_probe_read_helper() -> anyhow::Result<()> {
         ..Default::default()
     };
     let mut bpf = EbpfLoader::new()
-        .btf(Some(&kernel_btf))
+        .btf(&kernel_btf)
         .override_global("PARAM", &param, true)
         .override_global("IPV6_SOCKETS_AVAILABLE", &1u8, true)
         // A zero cookie is frozen read-only data: the verifier prunes the whole callback body.

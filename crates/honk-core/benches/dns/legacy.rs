@@ -207,6 +207,7 @@ pub(super) fn bench_tcp_pool_exchange(c: &mut Criterion) {
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
             proxy: None,
+            socket_budget: Default::default(),
         })
     });
 

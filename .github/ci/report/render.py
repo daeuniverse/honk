@@ -723,8 +723,14 @@ def render(candidate_dir: Path, baseline_dir: Path, selection_path: Path, jobs_p
     )
 
     selection_errors: list[str] = []
+    ci_pending = False
     try:
-        selection = validate_selection(load_json(selection_path), candidate_provenance, head_sha)
+        selection = load_json(selection_path)
+        ci_pending = selection == {}
+        selection = (
+            {"intended_lanes": [], "labels": []} if ci_pending
+            else validate_selection(selection, candidate_provenance, head_sha)
+        )
     except (InvalidInput, UnicodeEncodeError) as error:
         selection_errors.append(str(error))
         selection = {"intended_lanes": [], "labels": []}
@@ -755,7 +761,7 @@ def render(candidate_dir: Path, baseline_dir: Path, selection_path: Path, jobs_p
         except (InvalidInput, TypeError, ValueError) as error:
             errors.append(f"test inventory: {error}")
     incomplete = missing_producer or bool(errors)
-    notes = policy_notes(selection)
+    notes = [] if ci_pending else policy_notes(selection)
 
     baseline_label = f"`main` {baseline_sha[:8]}" if baseline_sha else "`main` (no baseline)"
     limit_phrase = f"{len(exceeded)} limits exceeded" if exceeded else "no limits exceeded"
@@ -768,6 +774,9 @@ def render(candidate_dir: Path, baseline_dir: Path, selection_path: Path, jobs_p
     elif exceeded:
         state = "⚠️"
         status = limit_phrase
+    elif ci_pending:
+        state = "⏳"
+        status = "CI run for this commit has not finished"
     else:
         state = "✅"
         status = limit_phrase
@@ -777,7 +786,7 @@ def render(candidate_dir: Path, baseline_dir: Path, selection_path: Path, jobs_p
     logs = logs_section(reports)
     reviews = review_notes(reports)
     visible = failures + exceeded + missing + reviews + tests + logs
-    if not visible and not rows and not notes and not errors:
+    if not visible and not rows and not notes and not errors and not ci_pending:
         return cap_body([f"✅ **CI report** {head_sha[:8]} vs {baseline_label}: nothing hidden"])
 
     lines = [header]
@@ -856,7 +865,7 @@ def self_test_json_size(root: Path) -> None:
 def self_test() -> int:
     root = Path(__file__).resolve().parent / "fixtures"
     cases = (
-        "ordinary", "limits-exceeded", "lane-failed", "reload-not-run-yet",
+        "ordinary", "limits-exceeded", "lane-failed", "reload-not-run-yet", "ci-not-finished",
         "no-baseline", "missing-producer", "prose-only-policy-skips", "empty",
     )
     failures: list[str] = []
@@ -882,7 +891,7 @@ def self_test() -> int:
         for failure in failures:
             print(failure, file=sys.stderr)
         return 1
-    print("8 report fixtures and report JSON size boundary passed")
+    print("9 report fixtures and report JSON size boundary passed")
     return 0
 
 

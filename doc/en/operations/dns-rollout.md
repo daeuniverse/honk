@@ -2,10 +2,10 @@
 
 Use this runbook to deploy the DNS subsystem described in [DNS design](../design/dns.md).
 
-This checklist is deployment-only. It was not executed in the local
-development environment because real eBPF load/attach, network namespace
-changes, transparent sockets, and routing-map publication require an isolated,
-explicitly authorized Linux host with root access.
+This deployment checklist has not been executed in the local development
+environment. Real eBPF load/attach, network namespace changes, transparent
+sockets, and routing-map publication require an isolated, explicitly authorized
+Linux host with root access.
 
 ## Prerequisites
 

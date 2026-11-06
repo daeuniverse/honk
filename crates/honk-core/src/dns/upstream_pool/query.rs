@@ -7,10 +7,20 @@ use tracing::debug;
 
 use super::UpstreamPool;
 use super::admission::AdmissionPermit;
-use super::entries::UpstreamEntry;
+use super::entries::{UdpFamily, UpstreamEntry};
 use super::routing::DnsDialRoute;
 use crate::dns::ecs::EcsQuery;
 use crate::dns::forwarder::DnsUpstreamPool;
+use crate::dns::transport::{IdlePressureRelease, UdpPool, UdpPoolCapacity};
+
+struct UdpRetirementDrain<'a>(&'a UpstreamPool);
+
+impl Drop for UdpRetirementDrain<'_> {
+    fn drop(&mut self) {
+        self.0.drain_retired_transports(false);
+        self.0.socket_budget.reclaim_idle_if_waiting();
+    }
+}
 
 fn udp_attempt_addresses(
     addresses: &[SocketAddr],
@@ -54,60 +64,192 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
         address: SocketAddr,
-    ) -> anyhow::Result<Arc<crate::dns::transport::UdpPool>> {
-        let family = if address.is_ipv6() { 1 } else { 0 };
-        if let Some((cached_address, pool)) = entry.udp.lock().pools[family].as_ref()
-            && *cached_address == address
-            && !pool.is_stopped()
-        {
-            if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
-                observer.publish(
-                    honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
-                        server_addr: Some(address),
-                        resolution_location:
-                            honk_outbound::runtime::flow_observation::ResolutionLocation::Local,
-                    },
-                );
-            }
-            return Ok(Arc::clone(pool));
-        }
-        let candidate = crate::dns::transport::UdpPool::new_tracked(
-            address,
-            self.dns_query_timeout,
-            Arc::clone(&self.active_transport_tasks),
-        );
-        let candidate = candidate.await?;
-        let (pool, unused) = {
-            let mut state = entry.udp.lock();
-            if let Some((cached_address, pool)) = state.pools[family].as_ref()
-                && *cached_address == address
-                && !pool.is_stopped()
-            {
-                (Arc::clone(pool), Some(candidate))
-            } else {
-                if state
-                    .current
-                    .is_some_and(|current| current.is_ipv6() == address.is_ipv6())
-                {
-                    state.current = None;
-                }
-                let _ = state.pools[family].replace((address, Arc::clone(&candidate)));
-                (candidate, None)
-            }
+    ) -> anyhow::Result<Arc<UdpPool>> {
+        self.select_udp_pool(entry, address, &[], false).await
+    }
+
+    pub(super) async fn select_udp_pool(
+        &self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        attempted: &[Option<Arc<UdpPool>>],
+        expand: bool,
+    ) -> anyhow::Result<Arc<UdpPool>> {
+        let family = usize::from(address.is_ipv6());
+        let choose = || {
+            let state = entry.udp.lock();
+            let Some(pools) = state.pools[family]
+                .as_ref()
+                .filter(|pools| pools.address == address)
+            else {
+                return (None, Some(0));
+            };
+            let best = pools
+                .shards
+                .iter()
+                .flatten()
+                .filter(|pool| !pool.is_stopped())
+                .filter(|pool| {
+                    !attempted
+                        .iter()
+                        .flatten()
+                        .any(|previous| Arc::ptr_eq(previous, pool))
+                })
+                .map(|pool| (pool, pool.pending_count()))
+                .min_by_key(|(_, pending)| *pending);
+            let vacant = pools
+                .shards
+                .iter()
+                .position(|pool| pool.as_ref().is_none_or(|pool| pool.is_stopped()));
+            let primary_missing = pools.shards[0]
+                .as_ref()
+                .is_none_or(|pool| pool.is_stopped());
+            let grow = primary_missing
+                || expand
+                || best
+                    .as_ref()
+                    .is_none_or(|(_, pending)| *pending > super::UDP_SHARD_EXPANSION_PENDING);
+            (
+                best.map(|(pool, _)| Arc::clone(pool)),
+                vacant.filter(|_| grow),
+            )
         };
-        if let Some(unused) = unused {
-            unused.close().await;
-            if let Some(observer) = honk_outbound::runtime::flow_observation::current() {
-                observer.publish(
-                    honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
-                        server_addr: Some(address),
-                        resolution_location:
-                            honk_outbound::runtime::flow_observation::ResolutionLocation::Local,
-                    },
-                );
+        let (pool, reused) = async {
+            let (cached, slot) = choose();
+            if slot.is_none() {
+                return cached
+                    .map(|pool| (pool, true))
+                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
             }
+            let deadline = tokio::time::Instant::now() + self.dns_dial_timeout;
+            let _creation = tokio::time::timeout_at(deadline, entry.udp_creation[family].lock())
+                .await
+                .map_err(|_| {
+                    anyhow::Error::new(honk_outbound::proxy::PacketRejection::Capacity)
+                        .context("UDP DNS shard creation timed out")
+                })?;
+            let (cached, slot) = choose();
+            let Some(slot) = slot else {
+                return cached
+                    .map(|pool| (pool, true))
+                    .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
+            };
+            let (retired_family, retired_shard) = {
+                let mut state = entry.udp.lock();
+                let retired_family = if state.pools[family]
+                    .as_ref()
+                    .is_some_and(|pools| pools.address != address)
+                {
+                    state.current = state
+                        .current
+                        .filter(|current| current.is_ipv6() != address.is_ipv6());
+                    state.pools[family].take()
+                } else {
+                    None
+                };
+                let pools = state.pools[family].get_or_insert_with(|| UdpFamily {
+                    address,
+                    shards: std::array::from_fn(|_| None),
+                });
+                (retired_family, pools.shards[slot].take())
+            };
+            let mut replaced = retired_family
+                .into_iter()
+                .flat_map(|family| family.shards.into_iter().flatten())
+                .collect::<Vec<_>>();
+            replaced.extend(retired_shard);
+            self.retire_udp_pools(replaced);
+            let extra = if slot == 0 {
+                None
+            } else {
+                let Some(extra) = self.socket_budget.try_extra_udp() else {
+                    return cached
+                        .map(|pool| (pool, true))
+                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
+                };
+                Some(extra)
+            };
+            let permit = if slot == 0 {
+                match self.socket_budget.acquire_until(deadline).await {
+                    Ok(permit) => permit,
+                    Err(error) => return cached.map(|pool| (pool, true)).ok_or(error),
+                }
+            } else {
+                let Some(permit) = self.socket_budget.try_acquire() else {
+                    return cached
+                        .map(|pool| (pool, true))
+                        .ok_or_else(|| anyhow::Error::new(UdpPoolCapacity::SHARDS));
+                };
+                permit
+            };
+            let candidate = UdpPool::new_budgeted(
+                address,
+                self.dns_query_timeout,
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                permit,
+                extra,
+                &self.socket_budget,
+                Arc::clone(&self.active_transport_tasks),
+            )
+            .await;
+            let candidate = match candidate {
+                Ok(candidate) => candidate,
+                Err(error) => return cached.map(|pool| (pool, true)).ok_or(error),
+            };
+            entry.udp.lock().pools[family]
+                .as_mut()
+                .expect("UDP family remains reserved during creation")
+                .shards[slot] = Some(Arc::clone(&candidate));
+            Ok((candidate, false))
+        }
+        .await?;
+        if reused && let Some(observer) = honk_outbound::runtime::flow_observation::current() {
+            observer.publish(
+                honk_outbound::runtime::flow_observation::FlowEvent::TransportAttached {
+                    server_addr: Some(address),
+                    resolution_location:
+                        honk_outbound::runtime::flow_observation::ResolutionLocation::Local,
+                },
+            );
         }
         Ok(pool)
+    }
+
+    async fn exchange_udp_shards(
+        &self,
+        entry: &UpstreamEntry,
+        address: SocketAddr,
+        query: &[u8],
+    ) -> anyhow::Result<Vec<u8>> {
+        // Drop all exchange/attempt pool references before checking retired owners.
+        let _retirement = UdpRetirementDrain(self);
+        let mut attempted: [Option<Arc<UdpPool>>; super::MAX_UDP_SHARDS] =
+            std::array::from_fn(|_| None);
+        let mut last_capacity = None;
+        for attempt in 0..super::MAX_UDP_SHARDS {
+            let selected = if attempt == 0 {
+                self.udp_pool(entry, address).await
+            } else {
+                self.select_udp_pool(entry, address, &attempted[..attempt], true)
+                    .await
+            };
+            let pool = match selected {
+                Ok(pool) => pool,
+                Err(error) if error.is::<UdpPoolCapacity>() => {
+                    return Err(last_capacity.unwrap_or(error));
+                }
+                Err(error) => return Err(error),
+            };
+            match pool.exchange(query, None).await {
+                Ok(response) => return Ok(response),
+                Err(error) if error.is::<UdpPoolCapacity>() => {
+                    attempted[attempt] = Some(pool);
+                    last_capacity = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(last_capacity.expect("every UDP shard rejected registration"))
     }
 
     async fn admit_query(&self) -> anyhow::Result<AdmissionPermit<'_>> {
@@ -145,9 +287,7 @@ impl UpstreamPool {
             crate::observe::flows::dns::transport("udp", "udp");
             let response = {
                 let query = async {
-                    self.udp_pool(entry, address)
-                        .await?
-                        .exchange(effective_query, None)
+                    self.exchange_udp_shards(entry, address, effective_query)
                         .await
                 };
                 crate::observe::scope_pin!(query);
@@ -164,20 +304,52 @@ impl UpstreamPool {
         exchange.await
     }
 
-    pub(super) async fn resolve_udp_addrs(
+    pub(super) async fn resolve_addrs(
+        &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Vec<SocketAddr>> {
-        entry.endpoint.resolve_addrs().await
+        entry
+            .endpoint
+            .resolve_addrs_budgeted(
+                &self.socket_budget,
+                tokio::time::Instant::now() + self.dns_dial_timeout,
+            )
+            .await
+    }
+
+    /// Boxed so a direct UDP query, which normally reuses its current
+    /// address, does not reserve the resolver's state in its future.
+    async fn resolve_observed_addrs(
+        &self,
+        entry: &UpstreamEntry,
+    ) -> (
+        anyhow::Result<Vec<SocketAddr>>,
+        Option<honk_outbound::runtime::flow_observation::LookupSelection>,
+    ) {
+        Box::pin(async {
+            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
+                self.resolve_addrs(entry),
+            );
+            crate::observe::scope_pin!(resolve);
+            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await
+        })
+        .await
     }
 
     #[cfg(test)]
-    pub(super) async fn resolve_udp_addr(entry: &UpstreamEntry) -> anyhow::Result<SocketAddr> {
-        Self::resolve_udp_addrs(entry)
+    pub(super) async fn resolve_upstream_addr(
+        &self,
+        entry: &UpstreamEntry,
+    ) -> anyhow::Result<SocketAddr> {
+        self.resolve_addrs(entry)
             .await?
             .into_iter()
             .next()
             .ok_or_else(|| anyhow::anyhow!("DNS upstream resolved to no addresses"))
     }
+
+    /// Boxed so a direct UDP query, which takes this path only for a TC
+    /// fallback, does not reserve transport dial state in its future.
     async fn exchange_routed(
         &self,
         entry: &UpstreamEntry,
@@ -185,18 +357,22 @@ impl UpstreamPool {
         raw_query: &[u8],
         business: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        match self
-            .get_transport(entry, route.node.as_ref(), route.target)
-            .await
-        {
-            Ok(transport) => transport.exchange(raw_query, business).await,
-            Err(error) => {
-                if let Some(business) = business {
-                    business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+        Box::pin(async move {
+            let _release = IdlePressureRelease(&self.socket_budget);
+            match self
+                .get_transport(entry, route.node.as_ref(), route.target)
+                .await
+            {
+                Ok(transport) => transport.exchange(raw_query, business).await,
+                Err(error) => {
+                    if let Some(business) = business {
+                        business.finish(honk_outbound::group::ScoreOutcome::from_error(&error));
+                    }
+                    Err(error)
                 }
-                Err(error)
             }
-        }
+        })
+        .await
     }
 
     async fn query_udp_via_proxy(
@@ -261,9 +437,7 @@ impl UpstreamPool {
             );
             let exchange = async {
                 crate::observe::flows::dns::tcp_fallback();
-                self.get_transport(entry, None, route.target)
-                    .await?
-                    .exchange(effective_query, None)
+                self.exchange_routed(entry, route, effective_query, None)
                     .await
             };
             crate::observe::scope_pin!(exchange);
@@ -296,12 +470,7 @@ impl UpstreamPool {
         let has_traffic_router =
             self.traffic_router_snapshot.read().is_some() || self.traffic_router.read().is_some();
         let initial_route = if current.is_none() && entry.outbound.is_none() && has_traffic_router {
-            let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-                Self::resolve_udp_addrs(entry),
-            );
-            crate::observe::scope_pin!(resolve);
-            let (targets, witness) =
-                crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+            let (targets, witness) = self.resolve_observed_addrs(entry).await;
             let target = targets?
                 .into_iter()
                 .next()
@@ -358,12 +527,7 @@ impl UpstreamPool {
             None
         };
 
-        let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-            Self::resolve_udp_addrs(entry),
-        );
-        crate::observe::scope_pin!(resolve);
-        let (addresses, witness) =
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+        let (addresses, witness) = self.resolve_observed_addrs(entry).await;
         let addresses = addresses?;
         let (first, first_error, retry) = if let Some((failed_address, first_error)) = failed {
             let [first, retry] = udp_attempt_addresses(&addresses, Some(failed_address))
@@ -484,12 +648,7 @@ impl UpstreamPool {
             return self.query_datagram(upstream_name, entry, raw_query).await;
         }
 
-        let resolve = honk_outbound::runtime::flow_observation::observe_resolution(
-            entry.endpoint.resolve_addrs(),
-        );
-        crate::observe::scope_pin!(resolve);
-        let (targets, witness) =
-            crate::observe::flows::dns::scope_purpose("proxy_server", resolve).await;
+        let (targets, witness) = self.resolve_observed_addrs(entry).await;
         let targets = targets?;
         let mut last_error = None;
         let mut first_error = None;

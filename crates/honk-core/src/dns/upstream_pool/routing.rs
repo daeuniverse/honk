@@ -180,7 +180,7 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<DnsDialRoute> {
-        let target = Self::resolve_udp_addr(entry).await?;
+        let target = self.resolve_upstream_addr(entry).await?;
         self.resolve_dial_route_for_address(entry, target, None)
             .await
     }

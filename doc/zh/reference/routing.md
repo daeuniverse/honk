@@ -12,11 +12,11 @@ fallback: outbound[(must)] | direct(mark: value[, must])
 
 - 规则按 `priority` 升序执行，数值越小越先匹配；同优先级保持稳定的源码顺序。dae 解析器按源码顺序分配 `0, 1, ...`，流量规则及其顺序完全由用户配置决定。
 - `default:` 是 `fallback:` 的别名。没有规则最终确定结果时使用 fallback 目标；省略时默认为 `direct`。
-- 同一个 matcher 内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
+- 同一个匹配器内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
 - 匹配器的括号参数列表可以在同一源文件内跨物理行，语句一直延续到右括号和 `-> outbound`。被包含的文件不能补全另一文件中未完成的调用。
 - 成对的单引号或双引号保留内部的全部字节，包括空白、`#`、花括号、`,`、`)`、`&&` 和 `->`。引号只在词法单元开头，或紧接引号外的 `(`、`,` 时开启；带前缀的参数可把加引号的值写成独立词法单元，例如 `domain(full: 'example.com')`。反斜杠保留原样，不作转义解码。已开启的引号必须在同一物理行闭合，否则配置以 `unterminated-quote` 错误失败。
-- 前缀 `!` 只对紧随其后的单个 matcher 取反。规则仅在正向条件匹配且所有取反 matcher 都未命中时匹配。
-- 对取反的域名或 geosite matcher，未知或尚未嗅探到的域名视为“不是 x”，因此不会否决该规则。
+- 前缀 `!` 只对紧随其后的单个匹配器取反。规则仅在正向条件匹配且所有取反匹配器都未命中时匹配。
+- 对取反的域名或 geosite 匹配器，未知或尚未嗅探到的域名视为“不是 x”，因此不会否决该规则。
 - 未知的非空匹配器、匹配器名称与左括号之间的空格、调用后的多余文本均使配置校验失败，并产生带位置的诊断。合取中不支持的非空条件不会被单独丢弃。空流量条件和空参数的既有行为保持不变。
 - 引号外、词法单元开头的 `#` 才开始注释；紧贴前文的 `#` 是数据。`domain(x) -> proxy#c` 指向字面名称 `proxy#c`，并产生 `legacy-glued-hash` 警告。注释请写成 `-> proxy # comment`。第一个引号外的箭头分隔动作，后续箭头保留在目标名称中，并产生 `legacy-arrow-target` 警告。
 
@@ -47,7 +47,7 @@ routing {
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 
-domain pattern/suffix/keyword/regex 与 `geosite` 都是同一条件内的备选，
+domain 模式、后缀、关键字、正则表达式与 `geosite` 都是同一条件内的备选，
 因此 `domain(geosite: netflix, suffix: imgur.com)` 命中任一即可。同一规则中
 多个 `domain(...)` 调用写入相同字段，同样互为备选。
 
@@ -74,7 +74,7 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不
 | `group(must)` | 通过该组的原始 TCP relay / UDP `PacketTransport` 转发，跳过 honk DNS 的 hosts、缓存、请求/响应策略和投影。 |
 | 非 `must` 的 `direct`、组或 `block` | 有效 DNS 查询仍归 DNS 控制器处理；Clash 模式直连 offload 不会剥夺接管权限。 |
 
-畸形的非 `must` UDP53 payload 保留通用 UDP 回退，不进入 `DnsController`；控制器一行不表示所有端口 53 payload 都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)。LAN 本地 socket 优先接收仅适用于非 53 目的端口，按 transport 分别判断；通配监听仍需完整 FIB 返回 `NOT_FWDED`，非 DNS TCP 纯 SYN 仍跳过探测。透明 LAN 与原生/loopback 交付的区别见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
+畸形的非 `must` UDP53 负载保留通用 UDP 回退，不进入 `DnsController`；表中的控制器行为不表示所有端口 53 负载都是 DNS。路由元数据准入遵循[控制面的 TCP/UDP 区分](../design/control-plane.md#透明代理入口)。LAN 本地套接字优先接收仅适用于非 53 目的端口，按传输分别判断；通配监听仍需完整 FIB 返回 `NOT_FWDED`，非 DNS TCP 纯 SYN 仍跳过探测。透明 LAN 与原生/回环交付的区别见[DNS 所有权状态机](../design/dns.md#dns-所有权状态机)。
 
 准入与策略规模限制见 [LAN 单源新流预算](../design/datapath.md#单源新流限制)和[编译策略容量](../design/routing.md#受限原生后端)。
 
@@ -176,7 +176,7 @@ LAN/WAN 网卡地址，其 TCP/UDP 目的端口 `1–65535`（排除 `53`）均�
 
 健康检查把出站标记为死亡后，eBPF 数据面通常会用 `TC_ACT_SHOT` 丢弃路由到该出站的新流，绝不会静默泄漏到 `direct`。未配置 `final` 且只有一个唯一叶节点的 TCP 组会让同一代理继续作为最后尝试，使真实流量可以证明恢复。UDP 和全部叶节点失活的多叶节点组仍保持 fail-closed；但含有 `direct`/`block` 内建成员的组永不失活：内建节点永远不会被判定死亡，因此 group-OR 槽保持开放。TCP 和 UDP 的目的端口 `53` 均豁免该健康检查丢包；没有终局用户 `must` 结果时，DNS 仍可到达控制面。
 
-要让网关能承受节点故障：
+为应对节点故障，配置以下路径：
 
 - 添加 `dip(geoip: private) -> direct(must)`，使私有网络流量不依赖代理健康状态；它也会绕过 LAN 私网 DNS，希望保留接管时需显式加上 `&& !dport(53)`。
 - 让 `fallback:` 指向至少包含两个节点的 [`fallback` 策略组](./groups.md)，而不是单个节点。

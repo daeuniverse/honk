@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Fetch the doona release pinned in .github/ci/pins.env for the native-ui feature.
 #
-#   ci/fetch-doona.sh [DIR]            extract the program files into DIR (default
-#                                      target/doona-<version>) and print its absolute
-#                                      path, for HONK_DOONA_DIR
+#   ci/fetch-doona.sh [DIR]            extract standard into DIR (default
+#                                      target/doona-<version>), lite into DIR-lite;
+#                                      print only the absolute standard path for HONK_DOONA_DIR
 #   ci/fetch-doona.sh --source OUTDIR  write OUTDIR/doona-source-<version>.tar.gz,
-#                                      the corresponding source of that release
+#                                      the corresponding source of both editions
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -32,24 +32,30 @@ if [[ "${1:-}" == "--source" ]]; then
 fi
 
 dir=${1:-$root/target/doona-$DOONA_VERSION}
-curl -fsSL --retry 3 -o "$tmp/doona.tar.gz" \
-  "$repo/releases/download/v$DOONA_VERSION/doona-$DOONA_VERSION.tar.gz"
-echo "$DOONA_SHA256  $tmp/doona.tar.gz" | sha256sum -c --quiet -
-mkdir "$tmp/doona"
-tar -xzf "$tmp/doona.tar.gz" -C "$tmp/doona"
-# Fonts ship in the separate doona-fonts package and are not embedded.
-rm -rf "$tmp/doona/fonts"
-# The embedded UI and each release tarball must carry every notice it needs.
-missing=()
-for file in LICENSE NOTICE THIRD-PARTY-NOTICES.txt \
-  $(grep -o 'LICENSES/[A-Za-z0-9.+-]*\.txt' "$tmp/doona/NOTICE" 2>/dev/null | sort -u); do
-  [[ -f "$tmp/doona/$file" ]] || missing+=("$file")
+dir=$(realpath -m "$dir")
+for edition in doona doona-lite; do
+  checksum=$DOONA_SHA256
+  [[ "$edition" != doona-lite ]] || checksum=$DOONA_LITE_SHA256
+  curl -fsSL --retry 3 -o "$tmp/$edition.tar.gz" \
+    "$repo/releases/download/v$DOONA_VERSION/$edition-$DOONA_VERSION.tar.gz"
+  echo "$checksum  $tmp/$edition.tar.gz" | sha256sum -c --quiet -
+  mkdir "$tmp/$edition"
+  tar -xzf "$tmp/$edition.tar.gz" -C "$tmp/$edition"
+  # Fonts ship in the separate doona-fonts package and are not embedded.
+  rm -rf "$tmp/$edition/fonts"
+  # Each embedded edition and release tarball must carry every notice it needs.
+  missing=()
+  for file in LICENSE NOTICE THIRD-PARTY-NOTICES.txt \
+    $(grep -o 'LICENSES/[A-Za-z0-9.+-]*\.txt' "$tmp/$edition/NOTICE" 2>/dev/null | sort -u); do
+    [[ -f "$tmp/$edition/$file" ]] || missing+=("$file")
+  done
+  if (( ${#missing[@]} )); then
+    echo "$edition $DOONA_VERSION archive lacks required notices: ${missing[*]}" >&2
+    exit 1
+  fi
 done
-if (( ${#missing[@]} )); then
-  echo "doona $DOONA_VERSION archive lacks required notices: ${missing[*]}" >&2
-  exit 1
-fi
-rm -rf "$dir"
 mkdir -p "$(dirname "$dir")"
+rm -rf "$dir" "$dir-lite"
 mv "$tmp/doona" "$dir"
-cd "$dir" && pwd
+mv "$tmp/doona-lite" "$dir-lite"
+printf '%s\n' "$dir"

@@ -141,10 +141,11 @@ pub struct MockEbpfBackend {
     /// Every mode-policy write, shared so tests can inspect boxed backends.
     pub datapath_flags_writes: std::sync::Arc<parking_lot::Mutex<Vec<u32>>>,
     pub detach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    pub dynamic_attach_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    #[cfg(test)]
-    pub dynamic_attach_fault: bool,
-    pub dynamic_forget_calls: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Interface-binding commits received; reload and merge must leave it at 0.
+    pub binding_commits: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Bindings recorded by commits (no real links: `/dev/null` stand-in fds).
+    #[cfg(feature = "ebpf")]
+    pub(crate) bound_interfaces: Vec<(crate::ebpf::interface::Binding, u32, std::os::fd::OwnedFd)>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
     routing_map_writes: std::sync::Arc<std::sync::atomic::AtomicU64>,

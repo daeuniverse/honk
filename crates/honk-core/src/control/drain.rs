@@ -1,8 +1,4 @@
-//! Graceful shutdown and connection draining for the control plane.
-//!
-//! On SIGTERM, BPF hooks must be detached immediately to restore
-//! network connectivity. Existing connections are given a grace
-//! period to drain before forced termination.
+//! Accepted-flow admission and optional shutdown draining.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;

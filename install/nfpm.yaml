@@ -1,0 +1,64 @@
+# Linux packages built from a release's static musl full build by
+# .github/ci/build-packages.sh. It sets every ${...} below and runs
+# nfpm inside the extracted archive, next to copies of the files below.
+name: honk-core
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: none
+release: "1"
+maintainer: daeuniverse <dae@v2raya.org>
+# dpkg and rpm take the first line as the summary and the rest as the long
+# description; pacman allows one line, so build-packages.sh passes only that.
+description: ${PKG_DESCRIPTION}
+section: net
+priority: optional
+changelog: ./changelog.yml
+homepage: https://github.com/daeuniverse/honk
+license: GPL-3.0-only
+scripts:
+  postinstall: ./package-after-install.sh
+  preremove: ./package-before-remove.sh
+  postremove: ./package-after-remove.sh
+# pacman runs post_install only on a fresh install.
+archlinux:
+  scripts:
+    postupgrade: ./package-after-install.sh
+# The daeuniverse apt and dnf repository shipped this binary as package honk, so
+# honk-core takes its place there. Arch's honk is an unrelated ActivityPub server.
+overrides:
+  deb:
+    conflicts: [honk]
+    replaces: [honk]
+  rpm:
+    conflicts: [honk]
+    replaces: [honk]
+# build-packages.sh appends each embedded doona edition's notices as further entries.
+contents:
+  - src: ./honk-core
+    dst: /usr/bin/honk-core
+    file_info:
+      mode: 0755
+  - src: ./honk-core.service
+    dst: /usr/lib/systemd/system/honk-core.service
+    file_info:
+      mode: 0644
+  - src: ./config.dae
+    dst: /etc/honk/example.dae
+    type: config|noreplace
+    file_info:
+      mode: 0644
+  # Debian keeps the license in the copyright file; rpm and pacman in /usr/share/licenses.
+  - src: ./copyright
+    dst: /usr/share/doc/honk-core/copyright
+    packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/honk-core/LICENSE
+    type: license
+    packager: rpm
+  - src: ./LICENSE
+    dst: /usr/share/licenses/honk-core/LICENSE
+    packager: archlinux
+  - src: ./README.md
+    dst: /usr/share/doc/honk-core/README.md
+    type: doc

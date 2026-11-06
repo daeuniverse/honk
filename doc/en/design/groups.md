@@ -14,7 +14,7 @@ The scope is `GroupManager`, `AliveDialerSet`, the always-compiled Score scorer,
 
 A reload builds a complete replacement `GroupManager`, migrates surviving per-network Selector member identities via `migrate_selector_choices_from`, installs interrupt, warm-up and persistence callbacks before publication, and swaps the inner `Arc`. A removed node is not retargeted to a same-named replacement. Native/Clash selection writes serialize with this publication, so they cannot acknowledge a write to an already-replaced manager. Readers see either complete manager.
 
-Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged, regardless of insertion, deletion or reordering. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
+Shared reload normalization in `control/reload/fingerprint.rs` preserves each configured group's UUID and `created_at` when its name is unchanged. Insertion, deletion and reordering do not affect this identity. A rename creates a new group rather than transferring the old identity; a programmatic rename carrying the old UUID receives a fresh one. This applies to SIGHUP, explicit activation and provider/runtime reloads, including no-op comparison, with or without native observation.
 
 The `src/group/` facade and its internals are split by responsibility:
 
@@ -224,6 +224,8 @@ Authoritative single-node and cold URLTest plans share one absolute transport-pr
 Go dae's TCP=1 let transient probe loss eject URLTest incumbents before selection, bypassing tolerance hysteresis.
 
 Probe and traffic failures have separate counters. Probe failures apply exponential cooldown from 5 seconds to 300 seconds. A separate `min(5s, check_interval)` recovery scheduler considers only dead domain/family states whose cooldown is due; deep-backoff states continue at the 300-second cadence rather than stopping permanently.
+
+Periodic checks gate TCP on `Tcp`/IPv4 and the shared UDP probe on `DataUdp`/IPv4; TCP cooldown does not suppress a due UDP probe. Nodes with both gates cooling at dispatch do not create a worker and are reconsidered by later cycles. TCP-only emergency probes clear only the node's TCP IPv4/IPv6 cooldowns, preserving both UDP domains' cooldowns.
 
 A dead state normally needs two consecutive probe successes to recover. `notify_network_change` clears stale cooldowns after a relevant link, address, or route change, primes dead states, and triggers probes so one fresh success can verify recovery. Newly registered nodes receive a 60-second grace period during which non-forced failures are recorded but do not count toward death. Probe history retains 100 entries per node, domain, and address family.
 

@@ -411,6 +411,13 @@ fn a_failed_download_settles_as_failure_not_cancellation() {
 /// the request names its own resolver, whose failure leaves the family unknown.
 #[tokio::test]
 async fn a_forced_group_with_a_strict_resolver_never_falls_back_to_system_dns() {
+    // The bootstrap resolver is process-global; isolate it from parallel core tests.
+    if crate::test_support::run_exact_in_child(
+        "HONK_STRICT_RESOLVER_ROUTE_CHILD",
+        "subscription::route::tests::routed::a_forced_group_with_a_strict_resolver_never_falls_back_to_system_dns",
+    ) {
+        return;
+    }
     honk_outbound::bootstrap::set_global(None);
     let (routing, _, _) = scored_routing();
     let family = |route| match route {

@@ -8,6 +8,32 @@ pub(crate) struct LogFiles {
     pub(crate) effective: Option<PathBuf>,
 }
 
+/// Settings this process turned off at startup because the host cannot honour
+/// them. Reload candidates get the same downgrade, so a value the process could
+/// never apply neither reads as a restart-only change nor reaches the active
+/// configuration.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StartupDowngrades {
+    nfqueue: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StartupDowngrades {
+    pub(crate) fn record_nfqueue_unavailable(&self) {
+        self.nfqueue
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn nfqueue_unavailable(&self) -> bool {
+        self.nfqueue.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn apply(&self, config: &mut Config) {
+        if self.nfqueue_unavailable() {
+            config.global.nfqueue_enable = false;
+        }
+    }
+}
+
 /// A restart-only setting that differs, with a safe message naming it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RestartField {
@@ -31,15 +57,20 @@ pub(crate) fn restart_required_fields(
     current: &Config,
     candidate: &Config,
     log_files: &LogFiles,
+    downgrades: &StartupDowngrades,
 ) -> Vec<RestartField> {
     let candidate_log_file =
         crate::resolved_log_file_path(candidate, log_files.cli_override.as_deref());
-    restart_required_changes(
+    let mut changed = restart_required_changes(
         current,
         candidate,
         log_files.effective.as_deref(),
         candidate_log_file.as_deref(),
-    )
+    );
+    if downgrades.nfqueue_unavailable() {
+        changed.retain(|field| *field != field!("global.nfqueue_enable"));
+    }
+    changed
 }
 
 /// Fields whose current consumers are process-scoped and therefore cannot be

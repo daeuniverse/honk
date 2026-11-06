@@ -57,15 +57,6 @@ impl ControlPlane {
         mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
-        if nodes.is_empty() {
-            return Ok(ReloadOutcome::Noop {
-                generation: self
-                    .dns_controller
-                    .runtime_provider()
-                    .current_generation()
-                    .get(),
-            });
-        }
         honk_config::node::validate_node_collection(&nodes)?;
         if let Some(index) = nodes.iter().position(|node| {
             node.subscription_id
@@ -80,6 +71,21 @@ impl ControlPlane {
         }
         let config_guard = self.config.read().await;
         let current = Arc::clone(&config_guard);
+        crate::subscription::drop_nodes_published_elsewhere(
+            &current.nodes,
+            &current.subscriptions,
+            subscription_id,
+            &mut nodes,
+        );
+        if nodes.is_empty() {
+            return Ok(ReloadOutcome::Noop {
+                generation: self
+                    .dns_controller
+                    .runtime_provider()
+                    .current_generation()
+                    .get(),
+            });
+        }
         let incoming_len = nodes.len();
         let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
         new_config.validate_assembled()?;

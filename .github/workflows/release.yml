@@ -43,7 +43,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: ${{ steps.toolchain.outputs.stable }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -94,7 +94,7 @@ jobs:
       matrix:
         include:
           # Full: Clash API + native API + embedded doona UI. Both arches ship
-          # two binaries: mimalloc (default, faster QUIC) and stock malloc
+          # two binaries: jemalloc (default, faster QUIC) and stock malloc
           # (lower RSS high-water on small gateways).
           - {target: x86_64-unknown-linux-gnu, suffix: "", variant: full, name_suffix: "-full"}
           - {target: x86_64-unknown-linux-gnu, suffix: "-stock", variant: full, name_suffix: "-full"}
@@ -149,7 +149,7 @@ jobs:
         with:
           toolchain: ${{ steps.toolchain.outputs.ebpf }}
           components: rust-src, llvm-tools
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}${{ matrix.suffix }}${{ matrix.name_suffix }}
           cache-on-failure: true
@@ -220,7 +220,7 @@ jobs:
           esac
           features="ebpf,rprx,$features"
           if [[ "${{ matrix.suffix }}" != "-stock" ]]; then
-            features+=,mimalloc
+            features+=,jemalloc
           fi
           echo "FEATURES=$features" >> "$GITHUB_ENV"
 
@@ -262,17 +262,19 @@ jobs:
           mkdir -p "dist/$name"
           cp "target/${{ matrix.target }}/release/honk-core" "dist/$name/"
           cp LICENSE README.md "dist/$name/"
-          # The embedded doona UI keeps its notices and the licences of the icons
-          # and fonts it bundles; lean variants do not embed it and carry no doona
-          # directory. Both projects are GPL-3.0-only, so the top-level LICENSE
-          # covers doona too, and the build stops if doona's text ever differs.
+          # Both editions keep their own notices. Their GPL-3.0-only license must
+          # match the top-level LICENSE; lean variants embed neither edition.
           if [[ "${{ matrix.variant }}" == full ]]; then
-            if ! cmp -s LICENSE "$HONK_DOONA_DIR/LICENSE"; then
-              echo "::error::doona's LICENSE differs from honk's; ship it under doona/ again"
-              exit 1
-            fi
-            mkdir "dist/$name/doona"
-            cp -r "$HONK_DOONA_DIR"/{LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/doona/"
+            for edition in doona doona-lite; do
+              ui_dir="$HONK_DOONA_DIR"
+              [[ "$edition" != doona-lite ]] || ui_dir="${HONK_DOONA_DIR%/}-lite"
+              if ! cmp -s LICENSE "$ui_dir/LICENSE"; then
+                echo "::error::$edition's LICENSE differs from honk's; ship it under $edition/ again"
+                exit 1
+              fi
+              mkdir "dist/$name/$edition"
+              cp -r "$ui_dir"/{LICENSES,NOTICE,THIRD-PARTY-NOTICES.txt} "dist/$name/$edition/"
+            done
           fi
           tar -czf "$name.tar.gz" -C dist "$name"
 
@@ -314,7 +316,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           path: release-source
-          # The formal notes list the commits since the previous v* tag.
+          # The comparison link needs the previous v* tag.
           fetch-depth: 0
 
       # Retrying only this job after the one-day artifact retention would otherwise publish a partial set.
@@ -326,16 +328,30 @@ jobs:
             bash release-source/.github/ci/check-release-artifacts.sh "$GITHUB_REF_NAME"
           fi
 
-      # GPL-3.0 section 6: the binaries embed doona, so its corresponding
-      # source is published next to them.
+      # GPL-3.0 section 6: both embedded editions share this corresponding source.
       - name: Add doona corresponding source
         run: bash release-source/ci/fetch-doona.sh --source dist
+
+      # Formal releases also package the static musl full builds for dpkg, rpm and pacman.
+      - name: Build Linux packages
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: release-source
+        run: |
+          set -euo pipefail
+          source .github/ci/pins.env
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/nfpm.tar.gz" \
+            "https://github.com/goreleaser/nfpm/releases/download/v$NFPM_VERSION/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "$NFPM_SHA256  $RUNNER_TEMP/nfpm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/nfpm.tar.gz" -C "$RUNNER_TEMP" nfpm
+          PATH="$RUNNER_TEMP:$PATH" bash .github/ci/build-packages.sh ../dist "$GITHUB_REF_NAME"
 
       # One checksum file covers every published archive, formal and Debug alike; the
       # attestation lets `gh attestation verify` tie each archive to this workflow run.
       - name: Write SHA256SUMS
         working-directory: dist
-        run: sha256sum -- *.tar.gz > SHA256SUMS
+        run: |
+          shopt -s nullglob
+          sha256sum -- *.tar.gz *.deb *.rpm *.pkg.tar.zst > SHA256SUMS
 
       # Every release body explains each archive as {allocator}-{API}-{arch}-{libc}.
       - name: Write release notes
@@ -349,11 +365,8 @@ jobs:
 
       - name: Write formal release notes
         if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME") > notes-formal.md
-          printf '\n' | cat - assets.md >> notes-formal.md
+          (cd release-source && bash .github/ci/release-notes.sh "$GITHUB_REF_NAME" ../assets.md) > notes-formal.md
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -368,6 +381,9 @@ jobs:
         with:
           files: |
             dist/*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/*.pkg.tar.zst
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           prerelease: ${{ contains(github.ref_name, '-') }}

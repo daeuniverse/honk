@@ -352,10 +352,10 @@ impl AliveDialerSet {
 
     /// Run health check cycle with concurrent probing.
     ///
-    /// Uses a `JoinSet` with a semaphore to limit concurrency (default 10,
-    /// matching sing-box). Nodes in backoff are skipped; the recovery runner
-    /// revisits due dead nodes between full cycles. Emergency probes triggered
-    /// via `trigger_probe` use their own bounded worker set.
+    /// A semaphore limits concurrent probing (default 10, matching sing-box).
+    /// TCP backoff does not gate the shared UDP probe; nodes with neither path
+    /// due at dispatch are skipped. Recovery revisits due dead states between
+    /// full cycles; emergency TCP probes use their own bounded worker set.
     pub async fn run_health_check_cycle_concurrent(
         self: &Arc<Self>,
         timeout: Duration,
@@ -390,23 +390,21 @@ impl AliveDialerSet {
                 tracing::trace!("Skipping health check for '{}' (URLTest groups idle)", id);
                 continue;
             }
-            let idx = alive_index(ProbeDomain::Tcp, IpVersion::V4);
-            let state = self.read_state(id, idx);
             // Stopped nodes are probed too — on their slow max_cooldown
             // cadence — so recovery stays reachable (see `should_probe`).
-            if Instant::now() < state.cooldown_until {
+            let tcp_due = self.should_probe(id, ProbeDomain::Tcp, IpVersion::V4);
+            if !tcp_due && !self.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
                 continue;
             }
             let this = self.clone();
             let permit = semaphore.clone();
             join_set.spawn(async move {
                 let _p = permit.acquire().await;
-                this.probe_node(id, timeout).await;
-                // UDP data-path probe (Go: UdpCheck) after the TCP probe,
-                // gated on the UDP domain's own backoff so a chronically
-                // broken UDP path backs off exponentially (and eventually
-                // stops) instead of re-probing every cycle. No-op without
-                // an installed UdpProber.
+                if tcp_due {
+                    this.probe_node(id, timeout).await;
+                }
+                // Keep UDP backoff independent of TCP, including after waiting
+                // for the TCP probe. Deep backoff retains its capped cadence.
                 if this.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4) {
                     this.probe_node_udp_registered(id, timeout, Some(registration))
                         .await;
@@ -534,9 +532,12 @@ impl AliveDialerSet {
                         if let Some(id) = node {
                             {
                                 let mut states = this.states.write();
+                                // The emergency probe runs TCP only; UDP
+                                // backoff stays with the UDP domains.
                                 if let Some(entry) = states.get_mut(&id) {
-                                    for state in entry {
-                                        state.cooldown_until = Instant::now();
+                                    for ipver in [IpVersion::V4, IpVersion::V6] {
+                                        entry[alive_index(ProbeDomain::Tcp, ipver)]
+                                            .cooldown_until = Instant::now();
                                     }
                                 }
                             }

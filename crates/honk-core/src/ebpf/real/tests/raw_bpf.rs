@@ -16,7 +16,7 @@ pub(super) fn insn(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
     raw
 }
 
-/// `BPF_PROG_LOAD` of hand-assembled instructions; `bpf_syscall` discards the returned fd.
+/// `BPF_PROG_LOAD` of hand-assembled instructions.
 pub(super) fn load_program(
     prog_type: bpf_prog_type,
     insns: &[[u8; 8]],
@@ -27,16 +27,7 @@ pub(super) fn load_program(
     attr.__bindgen_anon_3.insn_cnt = (insns.len() / 8) as u32;
     attr.__bindgen_anon_3.insns = insns.as_ptr() as u64;
     attr.__bindgen_anon_3.license = c"GPL".as_ptr() as u64;
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_bpf,
-            BPF_PROG_LOAD as libc::c_long,
-            &mut attr as *mut bpf_attr,
-            core::mem::size_of::<bpf_attr>(),
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let fd = unsafe { super::syscall::bpf_syscall(BPF_PROG_LOAD as libc::c_long, &mut attr) }
+        .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }

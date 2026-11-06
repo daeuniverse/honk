@@ -17,7 +17,7 @@ mod validation;
 use super::ConfigService;
 use super::coordinator::ConfigCoordinator;
 use crate::configuration::SourceUpdate;
-use crate::control::{ControlCommand, ControlPlane, ReloadBehavior};
+use crate::control::{ControlCommand, ControlPlane, ReloadBehavior, StartupDowngrades};
 use crate::dns::DnsResolver;
 use crate::dns::cache::DnsCache;
 use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool};
@@ -86,6 +86,8 @@ struct Fixture {
     database: Option<Arc<DbStore>>,
     /// A [`ReloadBehavior`] stored as `u8`.
     reject_reloads: Arc<AtomicU8>,
+    startup_downgrades: StartupDowngrades,
+    active: Arc<tokio::sync::RwLock<Arc<honk_config::Config>>>,
 }
 
 impl Fixture {
@@ -254,6 +256,7 @@ impl Fixture {
                 directory.path().join("state"),
                 control_plane.config_handle(),
                 control_plane.log_files(),
+                control_plane.startup_downgrades(),
                 control_plane.diagnostics_handle(),
                 commands.clone(),
                 subscriptions.handle(),
@@ -269,6 +272,8 @@ impl Fixture {
         } else {
             (None, None)
         };
+        let startup_downgrades = control_plane.startup_downgrades();
+        let active = control_plane.config_handle();
         let mut control = JoinSet::new();
         control.spawn(async move {
             control_plane
@@ -295,6 +300,8 @@ impl Fixture {
             gates,
             database,
             reject_reloads,
+            startup_downgrades,
+            active,
         }
     }
 

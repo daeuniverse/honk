@@ -284,7 +284,7 @@ async fn diagnostic_bypass_ignores_negative_without_replacing_it_or_joining_flig
     );
     assert_eq!(answer.cache_entry_id(), None);
     assert!(
-        matches!(cache.lookup_exact(&key, true), crate::dns::cache::ExactLookup::Negative {hit, revision: current} if hit.rcode == 3 && current == revision)
+        matches!(cache.lookup_exact(&key, true), crate::dns::cache::ExactLookup::Negative {rcode: 3, revision: current, ..} if current == revision)
     );
     assert_eq!(calls.try_recv().unwrap(), 1);
     assert!(calls.try_recv().is_err());

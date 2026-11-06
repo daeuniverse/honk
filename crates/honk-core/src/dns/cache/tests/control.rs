@@ -18,7 +18,8 @@ fn key(name: &str, kind: u16, ingress: IngressProfile, scope: &str) -> CacheKey 
 
 #[tokio::test]
 async fn exact_ids_follow_incarnations_not_keys_or_cache_instances() {
-    let service = DnsCache::new(1).service();
+    let cache = DnsCache::new(1);
+    let service = cache.service();
     let key = key("example.com", 1, IngressProfile::Internal, "default");
     let response = make_test_response([192, 0, 2, 1], 300);
     let revision = service
@@ -67,6 +68,7 @@ async fn exact_ids_follow_incarnations_not_keys_or_cache_instances() {
             .deleted,
         1
     );
+    assert_eq!(cache.retained_bytes(), 0);
     assert_eq!(
         service
             .invalidate(CacheInvalidation::Id(replacement.clone()))
@@ -239,13 +241,15 @@ fn inspection_selection_uses_the_same_instant_as_negative_precedence() {
 
 #[tokio::test]
 async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants() {
-    let service = DnsCache::new(128).service();
+    let cache = DnsCache::new(128);
+    let service = cache.service();
     let first = key("Example.COM", 1, IngressProfile::Internal, "default");
     let second = key("example.com", 1, IngressProfile::Tcp, "other");
     let other_type = key("example.com", 28, IngressProfile::Internal, "default");
     let unrelated = key("other.example", 1, IngressProfile::Internal, "default");
     let old_epoch = service.publication_epoch();
     let response = make_test_response([192, 0, 2, 1], 300);
+    let response_bytes = response.len();
     for key in [&first, &second, &other_type, &unrelated] {
         service.put_exact(key.clone(), response.clone(), 300, None);
     }
@@ -265,6 +269,7 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
     assert!(service.entry_id(&second).is_none());
     assert!(service.entry_id(&other_type).is_some());
     assert!(service.entry_id(&unrelated).is_some());
+    assert_eq!(cache.retained_bytes(), 2 * response_bytes);
     assert!(
         service
             .put_exact_if_current(old_epoch, first.clone(), response.clone(), 300, None)
@@ -281,6 +286,7 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
         response.clone(),
         300
     ));
+    assert_eq!(cache.retained_bytes(), 2 * response_bytes);
     assert!(
         service
             .put_exact_if_current(
@@ -292,6 +298,7 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
             )
             .is_some()
     );
+    assert_eq!(cache.retained_bytes(), 3 * response_bytes);
     assert_eq!(
         service
             .invalidate(CacheInvalidation::All)
@@ -301,6 +308,7 @@ async fn name_invalidation_fences_foreground_refresh_and_restore_across_variants
         3
     );
     assert!(service.is_empty());
+    assert_eq!(cache.retained_bytes(), 0);
 }
 
 #[test]

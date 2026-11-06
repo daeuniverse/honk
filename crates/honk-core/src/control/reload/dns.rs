@@ -99,6 +99,7 @@ impl ControlPlane {
                 ),
                 config.dns.strategy,
             )?
+            .with_socket_budget(self.dns_socket_budget.clone())
             .with_client_subnet(config.dns.effective_client_subnet()?)
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -116,6 +117,7 @@ impl ControlPlane {
                 self.dns_controller.cache().await,
                 dns_router,
             )
+            .with_socket_budget(self.dns_socket_budget.clone())
             .with_configured_upstreams(&config.dns)
             .with_timeouts(
                 std::time::Duration::from_millis(config.global.dns_resolve_timeout_ms),
@@ -227,5 +229,98 @@ mod tests {
             .find_map(|cause| cause.downcast_ref::<std::io::Error>())
             .expect("preparation must preserve the file I/O error");
         assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[tokio::test]
+    async fn rebuilt_dns_generation_keeps_the_startup_socket_partition() {
+        use crate::dns::forwarder::{DnsForwarder, DnsUpstreamPool, build_dns_query};
+        use crate::dns::transport::DnsSocketBudget;
+        use crate::dns::upstream_pool::UpstreamPool;
+        use std::time::Duration;
+
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = server.local_addr().unwrap();
+        let responder = tokio::spawn(async move {
+            let mut wire = [0; 512];
+            loop {
+                let (length, peer) = server.recv_from(&mut wire).await.unwrap();
+                wire[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
+                server.send_to(&wire[..length], peer).await.unwrap();
+            }
+        });
+        let mut config = Config::default();
+        config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "default".into(),
+            address: address.to_string(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+        let dns_router =
+            Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&config.dns).unwrap());
+        let budget = DnsSocketBudget::new(1);
+        let initial_pool = Arc::new(
+            UpstreamPool::new(&config.dns.upstream, Arc::clone(&dns_router))
+                .unwrap()
+                .with_socket_budget(budget.clone()),
+        );
+        let forwarder = Arc::new(
+            DnsForwarder::new(
+                initial_pool.clone(),
+                Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(
+                    16,
+                ))),
+                Arc::clone(&dns_router),
+            )
+            .with_socket_budget(budget.clone()),
+        );
+        let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
+        let control = ControlPlane::new_with_upstream_pool(
+            config.clone(),
+            Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+            router.clone(),
+            Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
+            forwarder,
+            Arc::clone(&initial_pool),
+        )
+        .unwrap();
+        let query = build_dns_query("reload-budget.test", 1);
+        initial_pool.query("default", &query).await.unwrap();
+        assert_eq!(budget.available_sockets(), 0);
+        let hosts = HostsSourceSet::load(&config.dns).unwrap().parse().unwrap();
+        let policy = PolicyId::from_config_with_artifacts(
+            &config.dns,
+            &hosts.fingerprint(),
+            &dns_router.geo_fingerprint(),
+        )
+        .unwrap();
+        let (_forwarder, rebuilt) = control
+            .build_dns_forwarder(
+                &config,
+                Arc::new(router),
+                Arc::new(GroupManager::new(&config.groups, &config.nodes)),
+                Arc::new(
+                    honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
+                ),
+                policy,
+                dns_router,
+                hosts,
+            )
+            .await
+            .unwrap();
+        let mut blocked = Box::pin(rebuilt.query("default", &query));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        drop(blocked);
+        assert_eq!(budget.available_sockets(), 0);
+        initial_pool.close().await;
+        tokio::time::timeout(Duration::from_secs(1), rebuilt.query("default", &query))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(budget.available_sockets(), 0);
+        rebuilt.close().await;
+        assert_eq!(budget.available_sockets(), 1);
+        responder.abort();
+        let _ = responder.await;
     }
 }

@@ -16,6 +16,8 @@ use support::{
 };
 
 mod admission;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod bond_binding;
 mod diagnostics;
 mod dns_tcp_ownership;
 mod dns_udp_ownership;
@@ -28,6 +30,8 @@ mod tcp_binding;
 mod tcp_tuple_reuse;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 mod udp_fullcone;
+#[cfg(all(feature = "ebpf", target_os = "linux"))]
+mod vlan_frames;
 
 #[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
@@ -149,6 +153,7 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
         crate::mode::ModeState::new("Rule", "Proxy"),
     )));
     control.start_datapath_flags_coordinator().unwrap();
+    let downgrades = control.startup_downgrades();
 
     let mut enabled = true;
     control
@@ -167,6 +172,31 @@ async fn nfqueue_startup_degradation_clears_config_and_effective_flag() {
     assert_eq!(
         published & (DATAPATH_FLAG_NFQ_ENABLED | DATAPATH_FLAG_NFQ_READY),
         0
+    );
+
+    let current = control.config_handle().read().await.clone();
+    let mut candidate = current.as_ref().clone();
+    candidate.global.nfqueue_enable = true;
+    candidate.global.check_tolerance_ms += 1;
+    assert!(
+        super::reload::restart_required_fields(
+            &current,
+            &candidate,
+            &control.log_files,
+            &downgrades,
+        )
+        .is_empty()
+    );
+    assert!(
+        control
+            .reload_runtime_config(candidate.clone(), Default::default())
+            .await
+    );
+    let active = control.config_handle().read().await.clone();
+    assert!(!active.global.nfqueue_enable);
+    assert_eq!(
+        active.global.check_tolerance_ms,
+        candidate.global.check_tolerance_ms
     );
 }
 
@@ -4524,8 +4554,7 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
     use std::sync::atomic::Ordering;
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
     let detach = backend.detach_calls.clone();
-    let dyn_attach = backend.dynamic_attach_calls.clone();
-    let dyn_forget = backend.dynamic_forget_calls.clone();
+    let commits = backend.binding_commits.clone();
     let mut cp = link_lifecycle_cp(backend);
     cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new("Rule", "Proxy"),
@@ -4550,25 +4579,30 @@ async fn reload_and_merge_never_touch_ebpf_hooks() {
         0,
         "reload/merge must never detach datapath hooks"
     );
-    assert_eq!(dyn_attach.load(Ordering::Relaxed), 0);
-    assert_eq!(dyn_forget.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        commits.load(Ordering::Relaxed),
+        0,
+        "reload/merge must never reconcile interface bindings"
+    );
     cp.datapath_flags.as_ref().unwrap().disable().await.unwrap();
 }
 
-/// Shutdown before an epoch exists must still detach the hooks and return in
-/// bounded time, even with a flow that never finishes.
-#[tokio::test]
+/// Startup rollback skips connection grace even when waiting is enabled.
+#[tokio::test(start_paused = true)]
 async fn shutdown_detaches_hooks_and_stays_bounded_with_stuck_flow() {
     use std::sync::atomic::Ordering;
     let backend = crate::ebpf::mock::MockEbpfBackend::new();
     let detach = backend.detach_calls.clone();
     let mut cp = link_lifecycle_cp(backend);
+    Arc::make_mut(&mut *cp.config.write().await)
+        .global
+        .shutdown_wait_connections = true;
 
     cp.drain_tracker.increment();
 
-    tokio::time::timeout(Duration::from_secs(30), cp.shutdown_runtime(None, None))
+    tokio::time::timeout(Duration::from_secs(1), cp.shutdown_runtime(None, None))
         .await
-        .expect("shutdown must stay bounded with a stuck flow")
+        .expect("shutdown without an epoch must skip connection grace")
         .unwrap();
     assert!(
         detach.load(Ordering::Relaxed) >= 1,
@@ -4936,6 +4970,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         }
         netlink.add_veth_pair("honk-lan0", "honk-c0")?;
         netlink.add_veth_pair("honk-wan0", "honk-s0")?;
+        let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair()?;
         let (lan, _) = netlink.get_link("honk-lan0")?;
         let (client_peer, _) = netlink.get_link("honk-c0")?;
         let (wan, _) = netlink.get_link("honk-wan0")?;
@@ -4973,15 +5008,17 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
         runtime.block_on(async move {
             let pin_root = std::path::Path::new("/sys/fs/bpf")
                 .join(format!("honk-nfq-e2e-{}", std::process::id()));
+            let local_ip =
+                crate::ebpf::real::RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
             let mut backend = crate::ebpf::real::RealEbpfBackend::load(
                 crate::DEFAULT_BPF_OBJECT,
                 &pin_root,
                 12345,
-                Some("honk-lan0"),
-                "honk-wan0",
-                false,
+                &dae0_setup,
+                local_ip,
             )
             .await?;
+            backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
             let tcp_listener = TcpListener::bind("0.0.0.0:0").await?;
             let udp_listener = UdpSocket::bind("0.0.0.0:0").await?;
             let udp_fds = vec![udp_listener.as_raw_fd(); 4];
@@ -5144,7 +5181,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                 anyhow::ensure!(direct_stats.direct_accepted == 1);
                 anyhow::ensure!(direct_stats.proxy_copied == 0);
                 // This sentinel uses legacy TC filters; production attaches only TCX links.
-                aya::programs::tc::qdisc_add_clsact("honk-wan0")?;
+                aya::programs::tc::qdisc_add_clsact(c"honk-wan0")?;
                 let tc_status = std::process::Command::new("tc")
                     .args([
                         "filter",

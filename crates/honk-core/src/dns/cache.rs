@@ -110,6 +110,15 @@ mod compatibility {
         pub(crate) fn positive_entries_for_test(&self) -> Vec<CachedEntry> {
             self.service.positive_entries_for_test()
         }
+
+        #[cfg(test)]
+        pub(crate) fn retained_bytes(&self) -> usize {
+            self.service
+                .shards
+                .iter()
+                .map(|shard| super::lock(shard).retained())
+                .sum()
+        }
     }
 }
 mod counters {
@@ -152,7 +161,6 @@ mod key;
 mod maintenance {
     use std::time::Instant;
 
-    use super::service::remove_positive;
     use super::{CacheSlot, CachedEntry, DnsCacheService, lock};
 
     impl DnsCacheService {
@@ -160,13 +168,7 @@ mod maintenance {
             let key = CacheSlot::Legacy(key.to_owned());
             let index = self.shard_index(&key);
             let mut shard = lock(&self.shards[index]);
-            let remove_slot = shard.get_mut(&key).is_some_and(|value| {
-                value.negative = None;
-                value.positive.is_none()
-            });
-            if remove_slot {
-                shard.pop(&key);
-            }
+            shard.drop_negative(&key);
         }
 
         pub fn purge_expired_negatives(&self) {
@@ -181,13 +183,7 @@ mod maintenance {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in expired {
-                    let remove_slot = shard.get_mut(&key).is_some_and(|value| {
-                        value.negative = None;
-                        value.positive.is_none()
-                    });
-                    if remove_slot {
-                        shard.pop(&key);
-                    }
+                    shard.drop_negative(&key);
                 }
             }
         }
@@ -209,7 +205,7 @@ mod maintenance {
                     .map(|(key, _)| key.clone())
                     .collect();
                 for key in expired {
-                    remove_positive(&mut shard, &key);
+                    shard.drop_positive(&key);
                 }
             }
             self.purge_expired_negatives();
@@ -326,7 +322,6 @@ mod storage {
             }
         }
 
-        #[cfg(any(feature = "native-api", test))]
         pub(super) fn response_bytes(&self) -> usize {
             self.positive
                 .as_ref()
@@ -343,10 +338,12 @@ mod storage {
 
         /// Returns the remaining TTL in seconds (0 if expired).
         pub fn remaining_ttl_secs(&self) -> u64 {
-            self.expires_at
-                .checked_duration_since(Instant::now())
-                .map(|duration| duration.as_secs())
-                .unwrap_or(0)
+            self.remaining_ttl().as_secs()
+        }
+
+        /// Returns the exact remaining lifetime (zero if expired).
+        pub fn remaining_ttl(&self) -> std::time::Duration {
+            self.expires_at.saturating_duration_since(Instant::now())
         }
 
         /// Returns `true` once the entry is too old even for serve-stale use

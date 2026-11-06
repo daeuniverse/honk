@@ -120,11 +120,11 @@ pub(super) fn projection_controller(
         )),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
-        udp_query_limit: 16,
     });
     let controller = DnsController::new_with_runtime(
         Arc::new(crate::dns::runtime::DnsServiceProvider::new(runtime)),
         Arc::clone(&ebpf),
+        16,
     );
     (controller, ebpf)
 }
@@ -219,7 +219,6 @@ pub(super) async fn publish_snapshot_forwarder(
         routing_projection: Arc::clone(current.routing_projection()),
         outbound_runtime: None,
         transport: Arc::new(NoopRuntimeTransport),
-        udp_query_limit: 256,
     });
     drop(current);
     provider.publish(runtime);

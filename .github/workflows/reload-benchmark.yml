@@ -11,15 +11,22 @@ on:
       - "crates/honk-nfqueue/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
       - ".github/workflows/reload-benchmark.yml"
-      - ".github/ci/**"
+      - ".github/ci/pins.env"
       - "ci/compare-reload-benchmark.py"
+      - "ci/test-compare-reload-benchmark.py"
   schedule:
     - cron: "23 4 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.event_name == 'pull_request' && format('ci-{0}-pr-{1}', github.workflow, github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   compare-main:
@@ -105,7 +112,7 @@ jobs:
               assert text.count(call) == 1, "reload benchmark adapter changed"
               harness.write_text(text.replace(call, "reload_runtime_config(config)"))
           PY
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
@@ -131,6 +138,8 @@ jobs:
             cargo bench -p honk-core --bench reload --no-default-features \
               --features reload-bench-counters,reload-alloc-bench -- --noplot 2>&1 \
             | tee ../candidate-reload.log
+      - name: Test reload benchmark comparison
+        run: python3 candidate/ci/test-compare-reload-benchmark.py
       - name: Compare candidate with main
         env:
           HONK_RELOAD_BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}

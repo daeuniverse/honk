@@ -348,20 +348,25 @@ struct Lab {
 }
 
 impl Lab {
-    async fn boot(net: Net, kind: Kind) -> anyhow::Result<(Self, Option<TestRetirement>)> {
+    async fn boot(
+        net: Net,
+        kind: Kind,
+        dae0: &daens::Dae0Setup,
+    ) -> anyhow::Result<(Self, Option<TestRetirement>)> {
         let object = std::env::var_os("HONK_TEST_BPF_OBJECT")
             .map(std::fs::read)
             .transpose()?;
         let config = lab_config(&udp_test_node());
+        let local_ip = RealEbpfBackend::test_local_ip(&["honk-lan0"], &["honk-wan0"]);
         let mut backend = RealEbpfBackend::load(
             object.as_deref().unwrap_or(crate::DEFAULT_BPF_OBJECT),
             Path::new(ROOT),
             config.global.tproxy_port,
-            Some("honk-lan0"),
-            "honk-wan0",
-            false,
+            dae0,
+            local_ip,
         )
         .await?;
+        backend.bind_test_interfaces(&["honk-lan0"], &["honk-wan0"]);
         backend.attach_dae0_programs()?;
         daens::setup_daens_namespace(config.global.tproxy_mark, config.global.tproxy_port)?;
         backend.attach_sk_lookup()?;
@@ -480,12 +485,12 @@ fn run_child(
     case: impl AsyncFnOnce(&Lab) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let net = Net::build(family, kind)?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, dae0_setup) = daens::create_dae0_link()?;
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
         .block_on(async {
-            let (lab, retirement) = Lab::boot(net, kind).await?;
+            let (lab, retirement) = Lab::boot(net, kind, &dae0_setup).await?;
             let result = case(&lab).await;
             lab.finish(retirement, result).await
         })
@@ -494,7 +499,7 @@ fn run_child(
 
 fn namespace(family: &str) -> anyhow::Result<()> {
     let _net = Net::build(family, Kind::Proxy)?;
-    let _dae0 = daens::create_dae0_link()?;
+    let (_dae0, _) = daens::create_dae0_link()?;
     daens::setup_daens_namespace(honk_ebpf_common::TPROXY_MARK, 12345)?;
     daens::with_daens_netns("verify handshake shortcut settings", || {
         for name in ["tcp_syncookies", "tcp_migrate_req", "tcp_fastopen"] {
@@ -715,7 +720,7 @@ fn accepted(family: &str) -> anyhow::Result<()> {
             )?)?;
             sequence.set(
                 0,
-                FlowIncarnationSequence {
+                &FlowIncarnationSequence {
                     next: FIRST_PUBLISHED_INCARNATION - 1,
                     ..Default::default()
                 },
@@ -928,8 +933,8 @@ async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Resu
     let mut next = conns.get(key, aya_obj::generated::BPF_F_LOCK as u64)?.value;
     next.incarnation += 1;
     conns.insert(
-        *key,
-        FlowMapValue::new(next),
+        key,
+        &FlowMapValue::new(next),
         2 | aya_obj::generated::BPF_F_LOCK as u64,
     )?;
     let mut handoff = handoffs
@@ -937,8 +942,8 @@ async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Resu
         .value;
     handoff.incarnation = next.incarnation;
     handoffs.insert(
-        *key,
-        FlowMapValue::new(handoff),
+        key,
+        &FlowMapValue::new(handoff),
         2 | aya_obj::generated::BPF_F_LOCK as u64,
     )?;
     let redirect_key = RedirectTuple::from_tuples(key);

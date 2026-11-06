@@ -177,6 +177,7 @@ fn expired_exact_negative_preserves_the_stale_positive() {
     service.put_exact(key.clone(), response.clone(), 300, None);
     service.put_negative_exact(key.clone(), 60, 2);
     assert_eq!(service.len(), 1);
+    assert_eq!(cache.retained_bytes(), response.len());
     assert_eq!(service.get_exact(&key).unwrap().response.as_ref(), response);
     assert_eq!(
         service.negative_hit_exact(&key).map(|hit| hit.rcode),
@@ -196,6 +197,9 @@ fn expired_exact_negative_preserves_the_stale_positive() {
             .as_ref(),
         response
     );
+    assert_eq!(cache.retained_bytes(), response.len());
+    service.purge_expired();
+    assert_eq!(cache.retained_bytes(), 0);
 }
 
 #[test]
@@ -242,7 +246,7 @@ fn combined_exact_lookup_preserves_precedence_and_counts_once() {
     let before = service.counters();
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 2
+        ExactLookup::Negative { rcode: 2, .. }
     ));
     let after_negative = service.counters();
     assert_eq!(after_negative.hits, before.hits + 1);
@@ -302,7 +306,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
     for _ in 0..3 {
         assert!(matches!(
             service.lookup_exact(&negative, true),
-            ExactLookup::Negative { hit, .. } if hit.rcode == 3
+            ExactLookup::Negative { rcode: 3, .. }
         ));
     }
 
@@ -310,7 +314,7 @@ fn exact_negative_hit_promotes_before_same_shard_eviction() {
 
     assert!(matches!(
         service.lookup_exact(&negative, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
     assert!(matches!(
         service.lookup_exact(&positive, true),
@@ -343,23 +347,21 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
         ExactLookup::Positive { revision, .. } => revision,
         _ => panic!("positive fixture"),
     };
-    let replacement = make_test_response([192, 0, 2, 2], 300);
+    let mut replacement = make_test_response([192, 0, 2, 2], 300);
+    replacement.resize(4096, 0);
     service.put_exact(key.clone(), replacement.clone(), 300, None);
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
         ExactLookup::Positive { entry, .. } if entry.response.as_ref() == replacement.as_slice()
     ));
+    assert_eq!(cache.retained_bytes(), replacement.len());
 
     let cache = DnsCache::new(4);
     let service = cache.service();
     let epoch = service.publication_epoch();
-    service.put_exact(
-        key.clone(),
-        make_test_response([192, 0, 2, 3], 300),
-        300,
-        None,
-    );
+    let response = make_test_response([192, 0, 2, 3], 300);
+    service.put_exact(key.clone(), response.clone(), 300, None);
     let revision = match service.lookup_exact(&key, true) {
         ExactLookup::Positive { revision, .. } => revision,
         _ => panic!("positive fixture"),
@@ -368,8 +370,9 @@ fn conditional_publication_rejects_stale_revision_after_each_publication() {
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 2
+        ExactLookup::Negative { rcode: 2, .. }
     ));
+    assert_eq!(cache.retained_bytes(), response.len());
 
     // Restored entries require compatibility-mode lookup.
     let cache = DnsCache::new(4);
@@ -469,14 +472,15 @@ fn matching_revision_nxdomain_removes_positive_and_keeps_negative() {
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 3, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
+    assert_eq!(cache.retained_bytes(), 0);
 
     // The old token must not mutate the negative-only slot either.
     let _ = service.put_negative_if_current(epoch, key.clone(), 60, 2, Some(revision));
     assert!(matches!(
         service.lookup_exact(&key, true),
-        ExactLookup::Negative { hit, .. } if hit.rcode == 3
+        ExactLookup::Negative { rcode: 3, .. }
     ));
 
     service.insert_expired_negative_exact_for_test(key.clone(), 3);
@@ -498,7 +502,8 @@ fn supersede_key(id: u8) -> CacheKey {
 #[test]
 fn supersede_matching_revision_removes_combined_slot_and_releases_capacity() {
     let key = supersede_key(1);
-    let service = DnsCache::new(4).service();
+    let cache = DnsCache::new(4);
+    let service = cache.service();
     let epoch = service.publication_epoch();
     service.put_exact(
         key.clone(),
@@ -520,6 +525,7 @@ fn supersede_matching_revision_removes_combined_slot_and_releases_capacity() {
     ));
     assert!(service.get_stale_exact(&key, true).is_none());
     assert!(service.negative_hit_exact(&key).is_none());
+    assert_eq!(cache.retained_bytes(), 0);
 
     let mut replacement = make_test_response([192, 0, 2, 2], 300);
     replacement.resize(65_524, 0);
@@ -532,6 +538,7 @@ fn supersede_matching_revision_removes_combined_slot_and_releases_capacity() {
             .as_ref(),
         replacement.as_slice()
     );
+    assert_eq!(cache.retained_bytes(), replacement.len());
 }
 
 #[tokio::test]

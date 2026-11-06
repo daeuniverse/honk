@@ -246,12 +246,13 @@ pub(crate) async fn resolve_with_owner(
         return Ok(outcome);
     }
 
+    // Miss work is boxed so cache-hit futures do not reserve its state.
     if !reuse_eligible {
-        return operation::run(&context).await;
+        return Box::pin(operation::run(&context)).await;
     }
 
     if let Some(owner) = refresh_owner {
-        return operation::run_as_leader(owner, &context).await;
+        return Box::pin(operation::run_as_leader(owner, &context)).await;
     }
 
     let flight_key = if options.cache == CacheAccess::Refresh {
@@ -292,7 +293,7 @@ pub(crate) async fn resolve_with_owner(
                 {
                     return Ok(flight::publish_outcome(leader, outcome));
                 }
-                return operation::run_as_leader(leader, &context).await;
+                return Box::pin(operation::run_as_leader(leader, &context)).await;
             }
         }
     }

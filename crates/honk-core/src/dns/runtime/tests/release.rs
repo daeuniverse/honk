@@ -42,7 +42,6 @@ fn pooled_runtime(
     };
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
-        udp_query_limit: 256,
         forwarder,
         routing_projection: projection,
         outbound_runtime,

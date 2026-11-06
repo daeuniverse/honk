@@ -51,12 +51,10 @@ pub struct RealEbpfBackend {
     /// Map names this instance claimed at attach, so cleanup unlinks what it owns instead of
     /// everything under a pin root that is shared with every other BPF consumer.
     pinned_maps: Vec<String>,
-    /// Every TC link attached to a configured interface, including the four
-    /// primary LAN/WAN hooks, startup bridge/bond slaves, extra configured
-    /// interfaces, and watcher rebinds. Keying ownership by (ifindex,is_egress)
-    /// lets a reconnect release stale primary links and makes a
-    /// retry observe hooks that are still live instead of stacking them.
-    interface_links: Vec<(u32, bool, aya::programs::tc::SchedClassifierLink)>,
+    /// Every TCX link on a configured interface, keyed by `(ifindex, direction)`,
+    /// plus the preloaded TC program FDs. Created and replaced only through
+    /// `bindings::apply`; dropped by `detach_hooks`.
+    bindings: bindings::InterfaceBindings,
     /// cgroup sock_create identity-capture link, held for the backend lifetime.
     /// Dropping the link detaches the program in the kernel.
     cgroup_sock_links: Vec<aya::programs::cgroup_sock::CgroupSockLink>,
@@ -170,9 +168,12 @@ impl RealEbpfBackend {
 }
 
 mod attach;
+mod bindings;
 mod btf;
 mod events;
 mod iface_watch;
+mod interface_startup;
+mod interface_state;
 mod layout;
 mod observation;
 mod process_name;
@@ -186,7 +187,8 @@ mod tcp_binding;
 mod tests;
 
 pub use events::*;
-pub use iface_watch::{AttachedInterface, AttachedMap, IfaceWatcher};
+pub use iface_watch::IfaceWatcher;
+pub(crate) use interface_startup::start_interfaces;
 use syscall::{
     bpf_lookup_batch_scan_cb, reset_udp_decision_sequence_locked,
     validate_loaded_udp_decision_sequence,
@@ -278,7 +280,10 @@ impl RealEbpfBackend {
         &self,
         name: &str,
         key: &K,
-    ) -> anyhow::Result<Option<V>> {
+    ) -> anyhow::Result<Option<V>>
+    where
+        FlowMapValue<V>: Pod,
+    {
         match self
             .hash_map::<K, FlowMapValue<V>>(name)?
             .get(key, aya_obj::generated::BPF_F_LOCK as u64)
@@ -294,11 +299,14 @@ impl RealEbpfBackend {
         name: &str,
         key: &K,
         value: &V,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         self.hash_map_mut::<K, FlowMapValue<V>>(name)?
             .insert(
                 key,
-                FlowMapValue::new(*value),
+                &FlowMapValue::new(*value),
                 aya_obj::generated::BPF_F_LOCK as u64,
             )
             .map_err(|error| anyhow::anyhow!("map '{name}' locked insert: {error}"))
@@ -309,7 +317,10 @@ impl RealEbpfBackend {
         name: &str,
         chunk_size: usize,
         visit: &mut ChunkVisitor<'_, K, V>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         self.flow_scan_from(
             name,
             chunk_size,
@@ -324,7 +335,10 @@ impl RealEbpfBackend {
         chunk_size: usize,
         cursor: &mut crate::ebpf::FlowScanCursor,
         visit: &mut ChunkVisitor<'_, K, V>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        FlowMapValue<V>: Pod,
+    {
         let mut projected = Vec::with_capacity(syscall::BPF_BATCH_CHUNK);
         if syscall::bpf_lookup_batch_scan_cb_flags::<K, FlowMapValue<V>>(
             self.bpf()?,
@@ -505,48 +519,15 @@ impl EbpfBackend for RealEbpfBackend {
         self.observe_backend()
     }
 
-    fn attach_dynamic_interface(
-        &mut self,
-        ifname: &str,
-        role: super::IfaceRole,
-        single_homed: bool,
-    ) -> anyhow::Result<super::DynamicHooks> {
-        match role {
-            super::IfaceRole::Lan => self.attach_lan(ifname, single_homed),
-            super::IfaceRole::Wan => {
-                self.attach_wan_egress(ifname)?;
-                self.attach_wan_ingress(ifname)?;
-                Ok(super::DynamicHooks {
-                    ingress: true,
-                    egress: true,
-                })
-            }
-            super::IfaceRole::LanWan => {
-                self.attach_lan(ifname, true)?;
-                self.attach_wan_egress(ifname)?;
-                Ok(super::DynamicHooks {
-                    ingress: true,
-                    egress: true,
-                })
-            }
-            super::IfaceRole::WanBondSlave => {
-                self.attach_wan_egress(ifname)?;
-                Ok(super::DynamicHooks {
-                    ingress: false,
-                    egress: true,
-                })
-            }
-            super::IfaceRole::LanBridgeSlave | super::IfaceRole::LanBondSlave => {
-                self.attach_slave(ifname, role)
-            }
-        }
+    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
+        self.bindings.snapshot()
     }
 
-    fn forget_dynamic_interface(&mut self, ifindex: u32) {
-        // The device may still exist when an auto-resolved route changes, so
-        // dropping every owned link for this ifindex must perform the detach
-        // before a later reconcile attempts to bind it again.
-        self.interface_links.retain(|(i, _, _)| *i != ifindex);
+    fn commit_interface_bindings(
+        &mut self,
+        commit: super::interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        self.bindings.commit(commit)
     }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
@@ -603,7 +584,7 @@ impl EbpfBackend for RealEbpfBackend {
         for (current, update) in value.bitmap.iter_mut().zip(bitmap.bitmap) {
             *current |= update;
         }
-        map.insert(ip_key.data, value, 0)
+        map.insert(&ip_key.data, &value, 0)
             .map_err(|error| anyhow::anyhow!("active domain map insert: {error}"))
     }
 
@@ -612,7 +593,7 @@ impl EbpfBackend for RealEbpfBackend {
         ip_key: &LpmKey,
         bitmap: &DomainRouting,
     ) -> Result<(), super::DomainRouteWriteError> {
-        match self.active_domain_mut()?.insert(ip_key.data, *bitmap, 0) {
+        match self.active_domain_mut()?.insert(&ip_key.data, bitmap, 0) {
             Ok(()) => Ok(()),
             Err(MapError::SyscallError(error))
                 if matches!(
@@ -964,10 +945,8 @@ impl EbpfBackend for RealEbpfBackend {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         // Drop all TC links, which detaches the eBPF programs from the
         // network interfaces and restores normal packet processing.
-        info!(
-            "Detaching BPF hooks (lan_ingress, lan_egress, wan_egress, wan_ingress, bond slaves, bridge slaves, cgroup, dae0, sk_lookup)"
-        );
-        self.interface_links.clear();
+        info!("Detaching BPF hooks (interface bindings, cgroup, dae0, sk_lookup)");
+        self.bindings.release();
         self.tcp_proof_link = None;
         self.cgroup_sock_links.clear();
         self.cgroup_sock_addr_links.clear();

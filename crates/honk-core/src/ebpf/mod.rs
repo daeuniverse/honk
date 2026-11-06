@@ -1,5 +1,7 @@
 //! eBPF backend abstraction.
 
+#[cfg(feature = "ebpf")]
+pub(crate) mod interface;
 pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
@@ -12,6 +14,8 @@ pub use retirement::*;
 pub mod real;
 #[cfg(feature = "ebpf")]
 pub use real::TcpKernelPin;
+#[cfg(all(test, feature = "ebpf"))]
+pub(crate) mod test_support;
 
 /// Resume state for a bounded traversal of one tuple map. A completed traversal
 /// resets it, so the next scan starts a new pass. Batch cursors name buckets,
@@ -296,36 +300,6 @@ impl DomainRouteWriteError {
     pub const fn is_map_full(&self) -> bool {
         matches!(self, Self::MapFull)
     }
-}
-
-/// Which config list an interface came from; selects the TC programs a
-/// dynamic attach installs on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IfaceRole {
-    Lan,
-    Wan,
-    /// LAN and WAN resolve to the same interface. The startup datapath uses
-    /// LAN ingress plus WAN egress, not the LAN egress/WAN ingress pair.
-    LanWan,
-    /// Slave port of a configured LAN bridge master: forwarded L2 traffic
-    /// never crosses the master's TC hooks, so the LAN programs go on each
-    /// slave (mirrors the startup expansion).
-    LanBridgeSlave,
-    /// Slave of a configured LAN bond master: packets may arrive/leave on the
-    /// slave without touching the master's TC hooks, so it gets
-    /// lan_ingress + wan_egress (mirrors the startup expansion).
-    LanBondSlave,
-    /// Slave of a WAN bond master: locally-originated traffic can bypass the
-    /// master's egress hook, so only wan_egress belongs on this interface.
-    WanBondSlave,
-}
-
-/// Per-direction outcome of a dynamic attach: which hooks are live on the
-/// interface after the call (including ones attached earlier).
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct DynamicHooks {
-    pub ingress: bool,
-    pub egress: bool,
 }
 
 pub const MAX_DATAPATH_PROGRAMS: usize = 64;
@@ -613,22 +587,18 @@ pub trait EbpfBackend: Send + Sync {
 
     async fn cleanup(&mut self) -> anyhow::Result<()>;
 
-    /// Attach TC programs to a configured interface that appeared after
-    /// startup.  Backends dedupe per (ifindex, direction): a direction that
-    /// is already hooked is reported, never re-attached, so retrying after
-    /// a partial failure cannot stack duplicate hooks.
-    fn attach_dynamic_interface(
-        &mut self,
-        _ifname: &str,
-        _role: IfaceRole,
-        _single_homed: bool,
-    ) -> anyhow::Result<DynamicHooks> {
-        Ok(DynamicHooks::default())
-    }
+    /// Snapshot what this backend owns for the interface reconciler: program
+    /// FDs plus dup'd link FDs.
+    #[cfg(feature = "ebpf")]
+    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
-    /// Drop any dynamic-attach state for `ifindex` (the device is gone or
-    /// was recreated, so its hooks died with it).
-    fn forget_dynamic_interface(&mut self, _ifindex: u32) {}
+    /// Apply the commit and return replaced or removed link FDs. The caller
+    /// must close them outside any lock: the last close takes the rtnl lock.
+    #[cfg(feature = "ebpf")]
+    fn commit_interface_bindings(
+        &mut self,
+        commit: interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd>;
 
     /// Atomically publish a complete compiled routing plan into an inactive slot.
     /// Implementations stage every generation-owned fact map and program before

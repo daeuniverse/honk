@@ -42,7 +42,7 @@ LLM-generated code is welcome in:
 **Conditions (all mandatory):**
 
 1. **Pre-arranged.** The change fits an agreed division of labor, not a drive-by PR.
-2. **Disclosed.** The PR description must state which files/areas are LLM-generated (see §5). Undisclosed LLM authorship is grounds for closing.
+2. **Disclosed.** The PR description states whether AI was used (see §5). Undisclosed AI use is grounds for closing.
 3. **Tested.** Any LLM-created production-adjacent code (fixtures, mocks that other tests depend on) must itself be exercised by CI. Benchmarks must carry their contract assertions in-tree.
 4. **Human-reviewed.** A human maintainer has read the diff. LLM review never substitutes for human review or self-review.
 5. **Invariants respected.** LLM-created code must obey every contract in `AGENTS.md` (e.g. never call `clear_routes` on the push path; generation-bound ownership; no new lock edges). Reviewers should assume the generator generalized the contract imperfectly and check the seams.
@@ -55,15 +55,11 @@ LLM-generated code is welcome in:
 4. **Tests must attack, not mirror.** Reviewers of LLM-written tests should sample whether assertions are independently derived semantic claims (e.g. "old-generation entries survive one transition") or restatements of the implementation. Mirror tests are rejected regardless of coverage numbers.
 5. **Reviewers may close non-compliant PRs** with a pointer to this document, no questions asked.
 
-## 5. Disclosure
+## 5. Responsibility for AI-assisted work
 
-Every PR must answer, in its description or the PR template:
+AI may help with writing, analysis and review. Before submitting, the submitter must have read and tested everything, understand every line, and answer for it. State in the pull request whether AI helped write it; which files it wrote need not be listed.
 
-- Which parts (by file or area) are LLM-generated?
-- Which LLM tools/agents were used, if any, for analysis or review?
-- If LLM-written tests cover human-written core code: what did the author verify beyond the tests?
-
-Disclosure calibrates reviewer trust. Hidden LLM involvement is treated as a breach of trust between author and reviewer, independent of code quality.
+Start the pull request body from `.github/pull_request_template.md`, also when you open it with `gh pr create --body` or the API, which do not fill it in. Keep its checklist and check only true boxes. For an outside contributor, `template-check` closes a pull request that drops a required box, does not check exactly one of the two AI boxes, or checks the unread or AI-agent box, and reopens it once the body is fixed.
 
 ## 6. Adversarial deep review
 
@@ -82,13 +78,13 @@ An unbroken streak of "no findings" from any single reviewer — human or LLM �
 - CI regression gates that turn performance/correctness claims into executable checks
 - Keeping `AGENTS.md` and `.agents/rules/` synchronized with code changes
 - First-pass review, evidence audit, and adversarial second-pass review under human direction
-- Analysis, translation, summarization — without posting raw output where maintainers are expected to read it unmarked
+- Analysis, translation, summarization — with the pull request stating that AI helped, as §5 requires; individual passages need not be marked
 
 ## 8. What LLMs are not for here
 
 - Originating changes in §2 areas unless the domain-expert exception in §11 applies
 - Substituting for the author's mental model of merged code
-- Producing PR descriptions, issue text, or review replies posted without disclosure
+- Producing PR descriptions, issue text, or review replies posted without saying whether AI helped write them; one statement per pull request, issue or reply is enough, and the parts need not be listed
 - Lowering any existing bar: clippy clean, passing the applicable CI and documented validation gates, and `AGENTS.md`/`.agents/rules/` synchronization are required of LLM-assisted PRs exactly as of human ones. Use the gates in [CI](.github/workflows/ci.yml), the [Justfile](Justfile), `AGENTS.md` and `.agents/rules/`, including only their explicitly documented temporary test exclusions. Disclosure and human review remain mandatory; LLM assistance is never a reason to skip required validation.
 
 ## 9. Enforcement and scope notes
@@ -107,5 +103,13 @@ Merged code becomes the maintainer's burden. If you cannot explain, unprompted, 
 A human author who is already a domain expert in the affected area may use an LLM to originate a §2 change, provided that the author fully understands and stands behind every line before submitting it. This is the same exception referenced in §§1, 2, and 8, not a separate permission granted by each section.
 
 The exception concerns only who originates the code. All conditions in §3, disclosure under §5, human maintainer approval under §4, and adversarial deep review under §6 still apply. The author retains responsibility for the design and its invariants; passing tests, LLM review, or relying on a maintainer to supply the missing understanding does not satisfy the exception.
+
+## Changelog
+
+A PR that changes `crates/`, `Cargo.toml`, `Cargo.lock`, `ci/fetch-doona.sh` or `.github/ci/pins.env` adds a fragment at `changes/<branch-slug>.md`. [changes/README.md](changes/README.md) gives the format, the exemptions and how fragments become `CHANGELOG.md`. CI fails without a fragment unless a maintainer applies the `no-changelog` label.
+
+## Release
+
+Follow the [release process](.agents/rules/release.md#release-process-standing-convention) to prepare a release.
 
 _No programmer tapes._

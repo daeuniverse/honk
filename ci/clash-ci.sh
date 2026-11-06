@@ -18,8 +18,8 @@ step() { printf '\n==> %s\n' "$1"; }
 step "cargo fmt --check"
 cargo fmt -p honk-core -- --check
 
-step "cargo clippy -p honk-core --all-targets --features udp-bench -D warnings"
-cargo clippy -p honk-core --all-targets --features udp-bench -- -D warnings
+step "cargo clippy -p honk-core --all-targets --features udp-bench,dns-bench -D warnings"
+cargo clippy -p honk-core --all-targets --features udp-bench,dns-bench -- -D warnings
 
 step "cargo test -p honk-core --test clash_api_test"
 cargo test -p honk-core --test clash_api_test

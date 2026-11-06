@@ -319,7 +319,6 @@ fn assembler_stops_at_instruction_capacity_without_publishing_fixup() {
     asm.insns
         .resize_with(BPF_INSTRUCTION_CAPACITY - 1, || bpf_insn {
             code: 0,
-            _bitfield_align_1: [],
             _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
             off: 0,
             imm: 0,
@@ -362,7 +361,6 @@ fn assembler_accepts_signed_jump_range_endpoints() {
         .insns
         .resize_with(i16::MAX as usize + 1, || bpf_insn {
             code: 0,
-            _bitfield_align_1: [],
             _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
             off: 0,
             imm: 0,
@@ -376,7 +374,6 @@ fn assembler_accepts_signed_jump_range_endpoints() {
     backward.bind(target);
     backward.insns.resize_with(i16::MAX as usize, || bpf_insn {
         code: 0,
-        _bitfield_align_1: [],
         _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
         off: 0,
         imm: 0,
@@ -392,7 +389,6 @@ fn assembler_accepts_signed_jump_range_endpoints() {
         .insns
         .resize_with(i16::MAX as usize + 2, || bpf_insn {
             code: 0,
-            _bitfield_align_1: [],
             _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
             off: 0,
             imm: 0,
@@ -407,7 +403,6 @@ fn assembler_accepts_signed_jump_range_endpoints() {
         .insns
         .resize_with(i16::MAX as usize + 1, || bpf_insn {
             code: 0,
-            _bitfield_align_1: [],
             _bitfield_1: bpf_insn::new_bitfield_1(0, 0),
             off: 0,
             imm: 0,

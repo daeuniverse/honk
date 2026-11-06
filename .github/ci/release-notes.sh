@@ -1,41 +1,43 @@
 #!/usr/bin/env bash
-# Print the draft notes for a formal release: commits since the previous v* tag,
-# grouped by their type(scope) prefix and credited to GitHub logins.
-# Usage: release-notes.sh <tag>   (run inside a full clone; gh resolves logins
-# through GH_TOKEN and GITHUB_REPOSITORY, and a failed lookup omits the login)
+# Run inside a full clone: release-notes.sh <tag> [assets.md].
 set -euo pipefail
 
-tag=${1:?usage: release-notes.sh <tag>}
+tag=${1:?usage: release-notes.sh <tag> [assets.md]}
+assets=${2:-}
 repo=${GITHUB_REPOSITORY:-daeuniverse/honk}
 prev=$(git describe --tags --abbrev=0 --match 'v*' "$tag^" 2>/dev/null || true)
-range=${prev:+$prev..}$tag
+notes=$(python3 - "$tag" <<'PY'
+import re
+import subprocess
+import sys
 
-declare -A title=([feat]='New Features' [fix]='Bug Fixes' [perf]='Performance' [docs]='Documentation') sections=()
-other=0
-
-while IFS=$'\t' read -r sha subject; do
-  if [[ ! $subject =~ ^([a-z]+)(\([^\)]*\))?!?:\ (.+)$ ]]; then
-    other=$((other + 1))
-    continue
-  fi
-  type=${BASH_REMATCH[1]}
-  [[ $type == bench ]] && type=docs
-  if [[ -z ${title[$type]+set} ]]; then
-    other=$((other + 1))
-    continue
-  fi
-  user=$(gh api "repos/$repo/commits/$sha" --jq '.author.login // empty' 2>/dev/null || true)
-  sections[$type]+="- $subject${user:+ by @$user} in ${sha:0:9}"$'\n'
-done < <(git log --no-merges --reverse --format='%H%x09%s' "$range")
-
-printf '## Highlights\n\n<!-- Maintainer: two to five bullets on what this release means to a gateway operator. -->\n\n## What'"'"'s Changed\n'
-for type in feat fix perf docs; do
-  [[ -z ${sections[$type]-} ]] && continue
-  printf '\n### %s\n\n%s' "${title[$type]}" "${sections[$type]}"
-done
-if (( other > 0 )); then
-  printf '\n%d refactoring, test and maintenance commits are not listed.\n' "$other"
+tag = sys.argv[1]
+version = tag.removeprefix('v')
+changelog = subprocess.check_output(['git', 'show', f'{tag}:CHANGELOG.md'], text=True)
+section = re.search(rf'^## \[{re.escape(version)}\] - [^\n]+\n(.*?)(?=^## \[|^\[Unreleased\]:|\Z)', changelog, re.M | re.S)
+if not section:
+    sys.exit(f'CHANGELOG.md has no release section for {tag}')
+pins = subprocess.check_output(['git', 'show', f'{tag}:.github/ci/pins.env'], text=True)
+pin = re.search(r'^DOONA_VERSION=(\S+)$', pins, re.M)
+if not pin:
+    sys.exit(f'.github/ci/pins.env has no DOONA_VERSION at {tag}')
+print('## Changes')
+for group in re.finditer(r'^### ([^\n]+)\n(.*?)(?=^### |\Z)', section[1], re.M | re.S):
+    body = group[2].strip()
+    if not body:
+        continue
+    count = len(re.findall(r'^- ', body, re.M))
+    print(f'\n<details>\n<summary>{group[1]} ({count})</summary>\n\n{body}\n\n</details>')
+print(f'\n## Pairing with doona\n\nThe full builds embed [doona {pin[1]}](https://github.com/Zakkaus/doona/releases/tag/v{pin[1]}), pinned in `.github/ci/pins.env` at this tag.')
+PY
+)
+stage=' This is a stable release.'
+[[ $tag != *-* ]] || stage=' This is a pre-release.'
+printf 'honk %s.%s\n\n## Highlights\n\n<!-- Maintainer: three to five bullets on what this release means to a gateway operator. -->\n\n%s\n' "${tag#v}" "$stage" "$notes"
+if [[ -n $assets ]]; then
+  downloads=$(<"$assets")
+  printf '\n%s\n' "$downloads"
 fi
-if [[ -n $prev ]]; then
-  printf '\n**Full Changelog**: https://github.com/%s/compare/%s...%s\n' "$repo" "$prev" "$tag"
-fi
+links="[Documentation](https://github.com/$repo/blob/$tag/doc/README.md) | [doona](https://github.com/Zakkaus/doona) | [OpenWrt feed](https://openwrt.daeuniverse.org/)"
+[[ -z $prev ]] || links="[Full changelog](https://github.com/$repo/compare/$prev...$tag) | $links"
+printf '\n%s\n' "$links"

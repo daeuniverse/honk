@@ -72,11 +72,8 @@ pub(in crate::control::tests) fn run_isolated(
     Ok(())
 }
 
-/// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
-pub(in crate::control::tests) fn build_lab(
-    lan_ip: IpAddr,
-    wan_ip: IpAddr,
-) -> anyhow::Result<(OwnedFd, OwnedFd)> {
+/// Enters private net/mount namespaces with their own sysfs, bpffs and cgroup2.
+pub(in crate::control::tests) fn enter_lab_namespaces() -> anyhow::Result<()> {
     let expected_kernel = std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap_or_default();
     anyhow::ensure!(
         std::env::var_os("HONK_CI_VM_LANE").is_some()
@@ -141,6 +138,15 @@ pub(in crate::control::tests) fn build_lab(
         MsFlags::empty(),
         None::<&str>,
     )?;
+    Ok(())
+}
+
+/// Enters private net/mount namespaces and wires the LAN and WAN veth edges.
+pub(in crate::control::tests) fn build_lab(
+    lan_ip: IpAddr,
+    wan_ip: IpAddr,
+) -> anyhow::Result<(OwnedFd, OwnedFd)> {
+    enter_lab_namespaces()?;
     let client_netns = fresh_test_netns();
     let server_netns = fresh_test_netns();
     let mut netlink = crate::netlink::NlSock::new()?;
@@ -203,6 +209,21 @@ pub(in crate::control::tests) fn add_address(
 
 pub(in crate::control::tests) fn pinned_map(root: &Path, name: &str) -> anyhow::Result<Map> {
     Ok(Map::from_map_data(MapData::from_pin(root.join(name))?)?)
+}
+
+/// The kernel's key for `source -> destination`, as the control plane builds it.
+pub(in crate::control::tests) fn tuples_key(
+    source: SocketAddr,
+    destination: SocketAddr,
+    proto: u8,
+) -> honk_ebpf_common::TuplesKey {
+    crate::control::connection::build_tuples_key(
+        destination.ip(),
+        destination.port(),
+        source.ip(),
+        source.port(),
+        proto,
+    )
 }
 
 /// Bucket-protected copies for external readers that cannot exclude userspace tuple

@@ -153,6 +153,7 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
                 "insecure",
                 "pin-sha256",
                 "pin_sha256",
+                "fingerprint",
                 "reality-opts",
             ],
         )
@@ -214,24 +215,12 @@ fn validate_source(mapping: &Mapping) -> Result<ProxySource, &'static str> {
     }
 
     let udp = yaml_bool_alias(mapping, &["udp"])?;
-    let udp_capable = matches!(
-        protocol,
-        NodeProtocol::SS
-            | NodeProtocol::Trojan
-            | NodeProtocol::VLess
-            | NodeProtocol::Socks5
-            | NodeProtocol::Hysteria2
-            | NodeProtocol::Tuic
-            | NodeProtocol::Juicity
-            | NodeProtocol::AnyTLS
-    );
+    // VMess has no UDP path: `udp: true` there is a capability claim honk
+    // cannot honor, not a restriction, so the node still imports for TCP.
     let udp_restrictable = matches!(
         protocol,
         NodeProtocol::Trojan | NodeProtocol::VMess | NodeProtocol::VLess | NodeProtocol::AnyTLS
     );
-    if udp == Some(true) && !udp_capable {
-        return Err("UDP capability is unsupported for this protocol");
-    }
     if udp == Some(false) && !udp_restrictable {
         return Err("UDP restriction is unsupported for this protocol");
     }
@@ -441,7 +430,9 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
             let network = if udp { "tcp,udp" } else { "tcp" }.to_string();
             match &mut node.outbound {
                 OutboundConfig::Trojan(config) => config.network = Some(network),
-                OutboundConfig::Vmess(config) => config.network = Some(network),
+                // VMess has no UDP path, so only an explicit restriction is
+                // representable; `udp: true` keeps the TCP node as-is.
+                OutboundConfig::Vmess(config) if !udp => config.network = Some(network),
                 OutboundConfig::Vless(config) => config.network = Some(network),
                 _ => {}
             }
@@ -477,20 +468,21 @@ fn apply_stream(mapping: &Mapping, node: &mut Node, udp: Option<bool>) -> Result
                 let headers = headers
                     .as_mapping()
                     .ok_or("ws-opts.headers must be a mapping")?;
+                let mut ws_host = None;
                 for (key, value) in headers {
                     let key = key.as_str().ok_or("websocket header name is invalid")?;
-                    if !key.eq_ignore_ascii_case("host")
-                        && !matches!(value, serde_yaml::Value::Null)
-                    {
-                        return Err("unsupported websocket header");
+                    if key.eq_ignore_ascii_case("host") {
+                        if ws_host.is_none() {
+                            ws_host = yaml_text(value)
+                                .ok()
+                                .flatten()
+                                .filter(|value| !value.trim().is_empty());
+                        }
+                    } else if let Some(value) = yaml_text(value)? {
+                        transport.ws_headers.insert(key.to_owned(), value);
                     }
                 }
-                transport.ws_host = headers.iter().find_map(|(key, value)| {
-                    key.as_str()
-                        .filter(|key| key.eq_ignore_ascii_case("host"))
-                        .and_then(|_| yaml_text(value).ok().flatten())
-                        .filter(|value| !value.trim().is_empty())
-                });
+                transport.ws_host = ws_host;
             }
         }
         transport.ws_path = transport
@@ -570,7 +562,7 @@ fn apply_tls(
             &["skip-cert-verify", "skip_cert_verify", "insecure"],
         )?
         .unwrap_or(false);
-        tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256"])?;
+        tls.pin_sha256 = yaml_text_alias(mapping, &["pin-sha256", "pin_sha256", "fingerprint"])?;
         if !supports_quic(protocol)
             && let Some(alpn) = yaml_value(mapping, "alpn")
         {
@@ -702,12 +694,13 @@ pub(super) fn parse_clash_proxy(
     mapping: &Mapping,
     subscription_id: Option<uuid::Uuid>,
     tuic_default_alpn: Option<&str>,
-) -> Result<Node, &'static str> {
+) -> Result<Node, (Option<&'static str>, &'static str)> {
+    let entry_error = |message| (None, message);
     if yaml_value(mapping, "type")
         .and_then(serde_yaml::Value::as_str)
         .is_some_and(|protocol| protocol.eq_ignore_ascii_case("wireguard"))
     {
-        return wireguard::parse(mapping, subscription_id);
+        return wireguard::parse(mapping, subscription_id).map_err(entry_error);
     }
     let ProxySource {
         protocol,
@@ -717,7 +710,7 @@ pub(super) fn parse_clash_proxy(
         udp,
         tls_explicit,
         tls_enabled,
-    } = validate_source(mapping)?;
+    } = validate_source(mapping).map_err(entry_error)?;
     let mut node = Node {
         name,
         address: format!("{server}:{port}"),
@@ -728,17 +721,18 @@ pub(super) fn parse_clash_proxy(
         ..Default::default()
     };
 
-    apply_protocol(mapping, &mut node)?;
-    apply_stream(mapping, &mut node, udp)?;
-    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled)?;
-    apply_quic(mapping, &mut node, tuic_default_alpn)?;
-    node.normalize_stream_transport()?;
+    apply_protocol(mapping, &mut node).map_err(entry_error)?;
+    apply_stream(mapping, &mut node, udp).map_err(entry_error)?;
+    apply_tls(mapping, &mut node, protocol, tls_explicit, tls_enabled).map_err(entry_error)?;
+    apply_quic(mapping, &mut node, tuic_default_alpn).map_err(entry_error)?;
+    node.normalize_stream_transport()
+        .map_err(|(field, message)| (Some(field), message))?;
     if let Some(config) = node.vless_mut() {
         config.normalize();
     }
-    validate_imported_node(&node)?;
+    validate_imported_node(&node).map_err(entry_error)?;
     node.validate()
-        .map_err(|_| "invalid imported node protocol settings")?;
+        .map_err(|_| (None, "invalid imported node protocol settings"))?;
     node.id = node.derive_id();
     Ok(node)
 }

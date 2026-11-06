@@ -1,9 +1,10 @@
 use honk_ebpf_common::DomainRouting;
 use honk_outbound::alive::IpVersion;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::Instant;
 
 use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
@@ -26,22 +27,55 @@ pub(super) fn family_of(ip: IpAddr) -> IpVersion {
 pub(super) const IP_CAPACITY: usize = crate::ebpf::maps::DOMAIN_MAP_CAPACITY as usize * 3 / 4;
 pub(super) const ZERO_IP_CAPACITY: usize = crate::ebpf::maps::DOMAIN_MAP_CAPACITY as usize / 2;
 
-fn aggregate_domains(
-    snapshot: &RoutingProjectionSnapshot,
-    owners: &BTreeSet<FamilyOwner>,
-) -> Option<DomainRouting> {
-    let mut aggregate = None;
-    let mut previous = None;
-    // Both family owners of one name may share a canonical IP; the bitmap is per name.
-    for (domain, _) in owners {
-        if previous.replace(domain) == Some(domain) {
-            continue;
-        }
-        if let Some(bitmap) = snapshot.bitmap_for(domain) {
-            or_bitmap(aggregate.get_or_insert_default(), &bitmap);
+/// The owners of one IP and the bitmaps they contribute under the current
+/// snapshot. Contributions are counted per member, so changing one owner of a
+/// shared IP never re-evaluates the domain matcher for its siblings.
+#[derive(Debug, Default)]
+pub(super) struct IpOwners {
+    pub(super) members: HashSet<FamilyOwner>,
+    contributions: Vec<(DomainRouting, u32)>,
+}
+
+impl IpOwners {
+    fn insert(&mut self, member: FamilyOwner, bitmap: Option<DomainRouting>) {
+        if self.members.insert(member)
+            && let Some(bitmap) = bitmap
+        {
+            Self::add_bitmap(&mut self.contributions, bitmap);
         }
     }
-    aggregate
+
+    fn add_bitmap(contributions: &mut Vec<(DomainRouting, u32)>, bitmap: DomainRouting) {
+        match contributions.iter_mut().find(|(known, _)| *known == bitmap) {
+            Some((_, count)) => *count += 1,
+            None => contributions.push((bitmap, 1)),
+        }
+    }
+
+    fn remove(&mut self, member: &FamilyOwner, bitmap: Option<DomainRouting>) {
+        if self.members.remove(member)
+            && let Some(bitmap) = bitmap
+        {
+            let index = self
+                .contributions
+                .iter()
+                .position(|(known, _)| *known == bitmap)
+                .expect("projection member lost its bitmap contribution");
+            self.contributions[index].1 -= 1;
+            if self.contributions[index].1 == 0 {
+                self.contributions.swap_remove(index);
+            }
+        }
+    }
+
+    fn aggregate(&self) -> Option<DomainRouting> {
+        let mut contributions = self.contributions.iter().map(|(bitmap, _)| bitmap);
+        let mut aggregate = *contributions.next()?;
+        for bitmap in contributions {
+            or_bitmap(&mut aggregate, bitmap);
+        }
+        Some(aggregate)
+    }
 }
 
 fn insert_bounded(
@@ -75,8 +109,14 @@ fn insert_bounded(
 #[derive(Debug)]
 pub(super) struct DomainOwner {
     pub(super) ips: BTreeSet<IpAddr>,
+    /// The name's bitmap under `DesiredState::snapshot`; `None` means no
+    /// domain predicate exists, unlike a present-zero bitmap.
+    pub(super) bitmap: Option<DomainRouting>,
     pub(super) expires_at: Instant,
     pub(super) sequence: u64,
+    // Queued entries survive refreshes; these fence removed/re-added owners.
+    expiry_sequence: u64,
+    eviction_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,8 +151,8 @@ pub(super) struct DesiredState {
     pub(super) sequence: u64,
     pub(super) snapshot: Arc<RoutingProjectionSnapshot>,
     /// Indexed by `IpVersion`; one owner per name and family.
-    pub(super) owners: [BTreeMap<OwnerKey, DomainOwner>; 2],
-    pub(super) reverse: BTreeMap<IpAddr, BTreeSet<FamilyOwner>>,
+    pub(super) owners: [HashMap<OwnerKey, DomainOwner>; 2],
+    pub(super) reverse: BTreeMap<IpAddr, IpOwners>,
     pub(super) desired: BTreeMap<IpAddr, DomainRouting>,
     zero_ips: BTreeSet<IpAddr>,
     capacity_warning_emitted: bool,
@@ -121,6 +161,9 @@ pub(super) struct DesiredState {
     pub(super) retries: BTreeMap<IpAddr, RetryMetadata>,
     pub(super) expiry_deadlines: BinaryHeap<Reverse<DeadlineEntry>>,
     pub(super) eviction_order: BinaryHeap<Reverse<(u64, usize, OwnerKey)>>,
+    /// Advances whenever an owner is added, removed, re-keyed or rebuilt, so
+    /// cache-hit hints can detect owner changes without taking the state lock.
+    pub(super) structure: Arc<AtomicU64>,
 }
 
 impl DesiredState {
@@ -129,7 +172,7 @@ impl DesiredState {
             capacity,
             sequence: 0,
             snapshot,
-            owners: [BTreeMap::new(), BTreeMap::new()],
+            owners: [HashMap::new(), HashMap::new()],
             reverse: BTreeMap::new(),
             desired: BTreeMap::new(),
             zero_ips: BTreeSet::new(),
@@ -139,14 +182,15 @@ impl DesiredState {
             retries: BTreeMap::new(),
             expiry_deadlines: BinaryHeap::new(),
             eviction_order: BinaryHeap::new(),
+            structure: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub(super) fn update_snapshot(&mut self, snapshot: Arc<RoutingProjectionSnapshot>) -> bool {
+    pub(super) fn update_snapshot(&mut self, snapshot: &Arc<RoutingProjectionSnapshot>) -> bool {
         if snapshot.generation() <= self.snapshot.generation() {
             return snapshot.generation() == self.snapshot.generation();
         }
-        self.snapshot = snapshot;
+        self.snapshot = Arc::clone(snapshot);
         self.rebuild_all();
         true
     }
@@ -158,8 +202,16 @@ impl DesiredState {
                 domain,
                 family,
                 ips,
-                advertised_ttl,
-            } => self.replace(family as usize, domain, ips, now + advertised_ttl),
+                expires_at,
+            } => {
+                if expires_at > now {
+                    self.replace(family as usize, domain, ips, expires_at)
+                } else {
+                    // Reload prefill can run before the expiry worker does.
+                    self.remove_owner(family as usize, domain);
+                    0
+                }
+            }
             ProjectionObservation::Clear { domain, family } => {
                 self.remove_owner(family as usize, domain);
                 0
@@ -174,16 +226,49 @@ impl DesiredState {
     }
 
     fn owner_count(&self) -> usize {
-        self.owners.iter().map(BTreeMap::len).sum()
+        self.owners.iter().map(HashMap::len).sum()
     }
 
     fn replace(&mut self, family: usize, domain: &str, ips: &[IpAddr], expires_at: Instant) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
+        // Cache hits re-submit an unchanged set; avoid rebuilding it. With the
+        // same members, recompute changes nothing unless an address was left
+        // out of `desired` by capacity, which the general path re-admits.
+        let unchanged = self.owners[family].get(domain).is_some_and(|owner| {
+            same_address_set(owner.ips.iter(), ips)
+                && owner.ips.iter().all(|ip| self.fully_admitted(ip))
+        });
+        if unchanged {
+            let (key, owner) = self.owners[family]
+                .get_key_value(domain)
+                .expect("refreshed projection owner disappeared");
+            let key = Arc::clone(key);
+            let shortened = expires_at < owner.expires_at;
+            let owner = self.owners[family]
+                .get_mut(domain)
+                .expect("refreshed projection owner disappeared");
+            if shortened {
+                owner.expiry_sequence = sequence;
+            }
+            owner.expires_at = expires_at;
+            owner.sequence = sequence;
+            if shortened {
+                self.expiry_deadlines.push(Reverse(DeadlineEntry {
+                    at: expires_at,
+                    family,
+                    domain: key,
+                    sequence,
+                }));
+            }
+            self.compact_owner_heaps_if_needed();
+            return 0;
+        }
         let ips = ips
             .iter()
             .map(|ip| ip.to_canonical())
             .collect::<BTreeSet<_>>();
+        self.structure.fetch_add(1, Ordering::Release);
         let existing = self.owners[family]
             .get_key_value(domain)
             .map(|(key, owner)| {
@@ -193,65 +278,82 @@ impl DesiredState {
                     .filter(|ip| !owner.ips.contains(ip) || !self.desired.contains_key(ip))
                     .copied()
                     .collect::<Vec<_>>();
-                (Arc::clone(key), removed, added)
+                (Arc::clone(key), owner.bitmap, removed, added)
             });
 
-        let owner_key = existing
-            .as_ref()
-            .map(|(key, _, _)| Arc::clone(key))
-            .or_else(|| {
-                self.owners[1 - family]
-                    .get_key_value(domain)
-                    .map(|(key, _)| Arc::clone(key))
-            })
-            .unwrap_or_else(|| Arc::<str>::from(domain));
+        let (owner_key, bitmap) = match &existing {
+            Some((key, bitmap, _, _)) => (Arc::clone(key), *bitmap),
+            None => match self.owners[1 - family].get_key_value(domain) {
+                Some((key, sibling)) => (Arc::clone(key), sibling.bitmap),
+                None => (Arc::<str>::from(domain), self.snapshot.bitmap_for(domain)),
+            },
+        };
         let member: FamilyOwner = (Arc::clone(&owner_key), family);
         let mut affected = Vec::new();
-        if let Some((_, removed, added)) = &existing {
+        let mut schedule_expiry = true;
+        if let Some((_, _, removed, added)) = &existing {
             affected.reserve(removed.len() + added.len());
             for ip in removed {
                 if let Some(owners) = self.reverse.get_mut(ip) {
-                    owners.remove(&member);
-                    if owners.is_empty() {
+                    owners.remove(&member, bitmap);
+                    if owners.members.is_empty() {
                         self.reverse.remove(ip);
                     }
                 }
                 affected.push(*ip);
             }
             for ip in added {
-                self.reverse.entry(*ip).or_default().insert(member.clone());
+                self.reverse
+                    .entry(*ip)
+                    .or_default()
+                    .insert(member.clone(), bitmap);
                 affected.push(*ip);
             }
             let owner = self.owners[family]
                 .get_mut(&owner_key)
                 .expect("existing projection owner disappeared");
             owner.ips = ips;
+            // Extensions reuse the earlier queued wake; shortening cannot.
+            schedule_expiry = expires_at < owner.expires_at;
+            if schedule_expiry {
+                owner.expiry_sequence = sequence;
+            }
             owner.expires_at = expires_at;
             owner.sequence = sequence;
         } else {
             affected.reserve(ips.len());
             for ip in &ips {
-                self.reverse.entry(*ip).or_default().insert(member.clone());
+                self.reverse
+                    .entry(*ip)
+                    .or_default()
+                    .insert(member.clone(), bitmap);
                 affected.push(*ip);
             }
             self.owners[family].insert(
                 Arc::clone(&owner_key),
                 DomainOwner {
                     ips,
+                    bitmap,
                     expires_at,
                     sequence,
+                    expiry_sequence: sequence,
+                    eviction_sequence: sequence,
                 },
             );
         }
 
-        self.expiry_deadlines.push(Reverse(DeadlineEntry {
-            at: expires_at,
-            family,
-            domain: Arc::clone(&owner_key),
-            sequence,
-        }));
-        self.eviction_order
-            .push(Reverse((sequence, family, Arc::clone(&owner_key))));
+        if schedule_expiry {
+            self.expiry_deadlines.push(Reverse(DeadlineEntry {
+                at: expires_at,
+                family,
+                domain: Arc::clone(&owner_key),
+                sequence,
+            }));
+        }
+        if existing.is_none() {
+            self.eviction_order
+                .push(Reverse((sequence, family, Arc::clone(&owner_key))));
+        }
         self.recompute_ips(affected);
         self.compact_owner_heaps_if_needed();
         if self.owner_count() <= self.capacity {
@@ -264,12 +366,20 @@ impl DesiredState {
             else {
                 break None;
             };
-            if self.owners[candidate_family]
-                .get(&candidate)
-                .is_some_and(|owner| owner.sequence == candidate_sequence)
-            {
+            let Some(owner) = self.owners[candidate_family].get_mut(&candidate) else {
+                continue;
+            };
+            if owner.eviction_sequence != candidate_sequence {
+                continue;
+            }
+            if owner.sequence == candidate_sequence {
                 break Some((candidate_family, candidate));
             }
+            // A refreshed head is a lower bound, not an eviction candidate.
+            let current_sequence = owner.sequence;
+            owner.eviction_sequence = current_sequence;
+            self.eviction_order
+                .push(Reverse((current_sequence, candidate_family, candidate)));
         };
         if let Some((evicted_family, evicted)) = evicted {
             self.remove_owner(evicted_family, &evicted);
@@ -283,11 +393,12 @@ impl DesiredState {
         let Some((owner_key, owner)) = self.owners[family].remove_entry(domain) else {
             return;
         };
+        self.structure.fetch_add(1, Ordering::Release);
         let member: FamilyOwner = (owner_key, family);
         for ip in &owner.ips {
             if let Some(owners) = self.reverse.get_mut(ip) {
-                owners.remove(&member);
-                if owners.is_empty() {
+                owners.remove(&member, owner.bitmap);
+                if owners.members.is_empty() {
                     self.reverse.remove(ip);
                 }
             }
@@ -298,10 +409,7 @@ impl DesiredState {
 
     fn recompute_ips(&mut self, ips: impl IntoIterator<Item = IpAddr>) {
         for ip in ips {
-            let next = self
-                .reverse
-                .get(&ip)
-                .and_then(|domains| aggregate_domains(&self.snapshot, domains));
+            let next = self.reverse.get(&ip).and_then(IpOwners::aggregate);
             let unchanged = match (self.desired.get(&ip), next.as_ref()) {
                 (Some(current), Some(next)) => current.bitmap == next.bitmap,
                 (None, None) => true,
@@ -335,7 +443,9 @@ impl DesiredState {
     }
 
     pub(super) fn rebuild_all(&mut self) {
-        let desired = self.project(&self.snapshot);
+        self.structure.fetch_add(1, Ordering::Release);
+        self.refresh_owner_bitmaps();
+        let desired = self.project_by(IpOwners::aggregate);
         let ips = self
             .desired
             .keys()
@@ -363,9 +473,7 @@ impl DesiredState {
             let deadline = &entry.0;
             !self.owners[deadline.family]
                 .get(&deadline.domain)
-                .is_some_and(|owner| {
-                    owner.sequence == deadline.sequence && owner.expires_at == deadline.at
-                })
+                .is_some_and(|owner| owner.expiry_sequence == deadline.sequence)
         }) {
             self.expiry_deadlines.pop();
         }
@@ -382,8 +490,10 @@ impl DesiredState {
         }
         let mut expiry_deadlines = BinaryHeap::with_capacity(live);
         let mut eviction_order = BinaryHeap::with_capacity(live);
-        for (family, owners) in self.owners.iter().enumerate() {
+        for (family, owners) in self.owners.iter_mut().enumerate() {
             for (domain, owner) in owners {
+                owner.expiry_sequence = owner.sequence;
+                owner.eviction_sequence = owner.sequence;
                 expiry_deadlines.push(Reverse(DeadlineEntry {
                     at: owner.expires_at,
                     family,
@@ -397,14 +507,64 @@ impl DesiredState {
         self.eviction_order = eviction_order;
     }
 
+    /// Re-evaluate each name once under the current snapshot and rebuild every
+    /// IP's counted contributions from its unchanged members.
+    fn refresh_owner_bitmaps(&mut self) {
+        let [v4, v6] = &mut self.owners;
+        for (domain, owner) in v4.iter_mut() {
+            owner.bitmap = self.snapshot.bitmap_for(domain);
+        }
+        for (domain, owner) in v6.iter_mut() {
+            owner.bitmap = v4.get(domain).map_or_else(
+                || self.snapshot.bitmap_for(domain),
+                |sibling| sibling.bitmap,
+            );
+        }
+        for owners in self.reverse.values_mut() {
+            owners.contributions.clear();
+            for (domain, family) in &owners.members {
+                if let Some(bitmap) = self.owners[*family]
+                    .get(domain)
+                    .expect("projection IP lost its domain owner")
+                    .bitmap
+                {
+                    IpOwners::add_bitmap(&mut owners.contributions, bitmap);
+                }
+            }
+        }
+    }
+
+    /// Pure projection under any snapshot, evaluating each name at most once;
+    /// reload uses it before the replacement snapshot is committed.
     pub(super) fn project(
         &self,
         snapshot: &RoutingProjectionSnapshot,
     ) -> BTreeMap<IpAddr, DomainRouting> {
+        let mut bitmaps = HashMap::<&str, Option<DomainRouting>>::new();
+        self.project_by(|owners| {
+            owners
+                .members
+                .iter()
+                .fold(None, |mut aggregate, (domain, _)| {
+                    if let Some(bitmap) = *bitmaps
+                        .entry(domain)
+                        .or_insert_with(|| snapshot.bitmap_for(domain))
+                    {
+                        or_bitmap(aggregate.get_or_insert_default(), &bitmap);
+                    }
+                    aggregate
+                })
+        })
+    }
+
+    fn project_by<'a>(
+        &'a self,
+        mut aggregate: impl FnMut(&'a IpOwners) -> Option<DomainRouting>,
+    ) -> BTreeMap<IpAddr, DomainRouting> {
         let mut entries = BTreeMap::new();
         let mut zero_ips = BTreeSet::new();
-        for (ip, domains) in &self.reverse {
-            if let Some(bitmap) = aggregate_domains(snapshot, domains) {
+        for (ip, owners) in &self.reverse {
+            if let Some(bitmap) = aggregate(owners) {
                 insert_bounded(&mut entries, &mut zero_ips, *ip, bitmap);
             }
         }
@@ -421,23 +581,80 @@ impl DesiredState {
                 .pop()
                 .expect("expiry heap entry disappeared")
                 .0;
-            if self.owners[deadline.family]
-                .get(&deadline.domain)
-                .is_some_and(|owner| owner.sequence == deadline.sequence && owner.expires_at <= now)
+            if let Some(owner) = self.owners[deadline.family].get(&deadline.domain)
+                && owner.expiry_sequence == deadline.sequence
             {
-                self.remove_owner(deadline.family, &deadline.domain);
+                if owner.expires_at <= now {
+                    self.remove_owner(deadline.family, &deadline.domain);
+                } else {
+                    self.expiry_deadlines.push(Reverse(DeadlineEntry {
+                        at: owner.expires_at,
+                        ..deadline
+                    }));
+                }
             }
             self.prune_stale_expiry_heads();
         }
         self.compact_owner_heaps_if_needed();
     }
 
+    /// The live owner's key, exact canonical address set and expiry, for a
+    /// cache-hit hint that skips the projection fence and state lock. Owners with
+    /// capacity-omitted addresses are excluded so refreshes keep retrying admission.
+    pub(super) fn cache_hit_hint(
+        &self,
+        family: usize,
+        domain: &str,
+    ) -> Option<(OwnerKey, Box<[IpAddr]>, Instant)> {
+        let (key, owner) = self.owners[family].get_key_value(domain)?;
+        owner.ips.iter().all(|ip| self.fully_admitted(ip)).then(|| {
+            (
+                Arc::clone(key),
+                owner.ips.iter().copied().collect(),
+                owner.expires_at,
+            )
+        })
+    }
+
+    /// True unless capacity left this address out of `desired` although its
+    /// owners contribute a bitmap; such addresses must retry admission.
+    fn fully_admitted(&self, ip: &IpAddr) -> bool {
+        self.desired.contains_key(ip)
+            || self.reverse.get(ip).and_then(IpOwners::aggregate).is_none()
+    }
+
     #[cfg(test)]
     pub(super) fn owner_domains(&self) -> Vec<String> {
-        self.owners
-            .iter()
-            .flat_map(BTreeMap::keys)
-            .map(ToString::to_string)
-            .collect()
+        let mut domains = Vec::new();
+        for owners in &self.owners {
+            let start = domains.len();
+            domains.extend(owners.keys().map(ToString::to_string));
+            domains[start..].sort_unstable();
+        }
+        domains
     }
+}
+
+/// Whether `ips` canonicalizes to exactly the ascending set `known`.
+pub(super) fn same_address_set<'a>(
+    known: impl ExactSizeIterator<Item = &'a IpAddr> + Clone,
+    ips: &[IpAddr],
+) -> bool {
+    // Answers are usually tiny; a large one sorts once instead of comparing
+    // quadratically. Duplicates break the strict ascending match.
+    const SMALL_SET: usize = 16;
+    if known.len() != ips.len() {
+        return false;
+    }
+    if ips.len() <= SMALL_SET {
+        return ips
+            .iter()
+            .all(|ip| known.clone().any(|known| *known == ip.to_canonical()))
+            && known
+                .clone()
+                .all(|known| ips.iter().any(|ip| ip.to_canonical() == *known));
+    }
+    let mut sorted = ips.iter().map(IpAddr::to_canonical).collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted.iter().eq(known)
 }

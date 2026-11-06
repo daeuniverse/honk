@@ -306,7 +306,6 @@ async fn c14_sighup_retains_rebased_provider_provenance() {
 #[tokio::test]
 async fn c14_network_refresh_preserves_active_provenance() {
     let mut config = changed_routing_config();
-    config.global.lan_interface = vec!["lo".into()];
     let expected_routing = config.routing.clone();
     config.dns.client_subnet = "auto(127.0.0.1)".into();
     config.dns.resolved_client_subnet = Some("198.51.100.0/24".parse().unwrap());
@@ -525,24 +524,50 @@ async fn c14_provider_diagnostics_follow_the_declaring_file_across_reloads() {
 async fn c14_rejected_refresh_keeps_nodes_and_diagnostics() {
     let (config, buckets) = provider_config();
     let provider = config.subscriptions[0].clone();
-    let mut collision = config.nodes[1].clone();
-    collision.subscription_id = Some(provider.id);
+    let foreign = config.nodes[1].clone();
     let cp = fixture(config.clone(), buckets).await;
     let before = snapshot(&cp).await;
     assert_eq!(before.diagnostics[1].code, "first");
     assert!(
-        refresh(
-            &cp,
-            &provider,
-            vec![collision],
-            warning("rejected", 4),
-            false
-        )
-        .await
-        .is_err()
+        refresh(&cp, &provider, vec![foreign], warning("rejected", 4), false)
+            .await
+            .is_err()
     );
     assert_eq!(snapshot(&cp).await, before);
     assert_eq!(cp.config.read().await.as_ref(), &config);
+}
+
+#[tokio::test]
+async fn refresh_drops_nodes_another_provider_published() {
+    for own in [true, false] {
+        let (mut config, buckets) = provider_config();
+        config.nodes.truncate(1);
+        let (first, second) = (config.subscriptions[0].id, config.subscriptions[1].clone());
+        let mut shared = config.nodes[0].clone();
+        shared.subscription_id = Some(second.id);
+        let mut nodes = vec![shared];
+        let mut expected = vec![("first", Some(first))];
+        if own {
+            let node = canonical_socks5("own", "127.0.0.1", 1082, Some(second.id));
+            nodes.push(node);
+            expected.push(("own", Some(second.id)));
+        }
+        let cp = fixture(config, buckets).await;
+
+        assert!(
+            refresh(&cp, &second, nodes, Vec::new(), false)
+                .await
+                .unwrap()
+        );
+
+        let config = cp.config.read().await.clone();
+        let published: Vec<_> = config
+            .nodes
+            .iter()
+            .map(|node| (node.name.as_str(), node.subscription_id))
+            .collect();
+        assert_eq!(published, expected);
+    }
 }
 
 #[tokio::test]

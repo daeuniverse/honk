@@ -1,22 +1,30 @@
 mod canonical;
 
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use honk_config::dns::DnsConfig;
 use sha2::{Digest, Sha256};
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PolicyId {
     digest: [u8; 32],
     canonical: Arc<[u8]>,
     artifacts: Option<Arc<ArtifactFingerprints>>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(PartialEq, Eq)]
 struct ArtifactFingerprints {
     hosts: [u8; 32],
     dns_geo: [u8; 32],
+}
+
+impl Hash for PolicyId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        // The digest covers both inputs; equality still checks their full contents.
+        self.digest.hash(state);
+    }
 }
 
 impl PolicyId {

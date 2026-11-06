@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{SubscriptionManager, SubscriptionStore, SubscriptionUserinfo};
 use crate::control::ControlCommand;
 use crate::control::ReloadOutcome;
+use schedule::{Provider, ProviderSchedule};
 use tokio::time::Instant;
 
 const MAX_ACTIVE_FETCHES: usize = 4;
@@ -178,6 +179,49 @@ pub(crate) fn validate_subscription_ids(subscriptions: &[Subscription]) -> anyho
     Ok(())
 }
 
+/// Drops the nodes whose IDs another provider already published, so an
+/// endpoint served by two providers stays with the first one instead of
+/// rejecting the whole publication of the second.
+pub(crate) fn drop_nodes_published_elsewhere(
+    published: &[Node],
+    subscriptions: &[Subscription],
+    provider: uuid::Uuid,
+    nodes: &mut Vec<Node>,
+) {
+    let owners: HashMap<_, _> = published
+        .iter()
+        .filter_map(|node| Some((node.id, node.subscription_id.filter(|id| *id != provider)?)))
+        .collect();
+    let mut dropped = Vec::new();
+    let mut dropped_owners = Vec::new();
+    nodes.retain(|node| {
+        let Some(owner) = owners.get(&node.id) else {
+            return true;
+        };
+        dropped.push(node.name.clone());
+        if !dropped_owners.contains(owner) {
+            dropped_owners.push(*owner);
+        }
+        false
+    });
+    if dropped.is_empty() {
+        return;
+    }
+    let name = |id: uuid::Uuid| {
+        subscriptions
+            .iter()
+            .find(|subscription| subscription.id == id)
+            .map_or("", |subscription| subscription.name.as_str())
+    };
+    let owners: Vec<_> = dropped_owners.into_iter().map(name).collect();
+    warn!(
+        provider = %name(provider),
+        nodes = %dropped.join(", "),
+        owners = %owners.join(", "),
+        "Subscription nodes already published by another provider; keeping the first copy"
+    );
+}
+
 struct FetchCompletion {
     authorized: AuthorizedSubscription,
     result: Option<anyhow::Result<(Vec<Node>, SubscriptionUserinfo)>>,
@@ -228,41 +272,6 @@ struct Flight {
     userinfo: SubscriptionUserinfo,
     #[cfg(feature = "native-api")]
     operation: Option<Box<dyn RefreshReport>>,
-}
-
-enum ProviderSchedule {
-    #[cfg(feature = "native-api")]
-    Deferred,
-    RefreshEligible(Option<Instant>),
-}
-
-struct Provider {
-    authorized: AuthorizedSubscription,
-    schedule: ProviderSchedule,
-}
-
-impl Provider {
-    fn new(authorized: AuthorizedSubscription) -> Self {
-        let mut provider = Self {
-            authorized,
-            schedule: ProviderSchedule::RefreshEligible(None),
-        };
-        provider.reset_deadline(Instant::now());
-        provider
-    }
-
-    fn reset_deadline(&mut self, now: Instant) {
-        match &mut self.schedule {
-            ProviderSchedule::RefreshEligible(next) => {
-                let interval = self.authorized.subscription.update_interval;
-                *next = (interval > 0)
-                    .then(|| now.checked_add(Duration::from_secs(interval)))
-                    .flatten();
-            }
-            #[cfg(feature = "native-api")]
-            ProviderSchedule::Deferred => {}
-        }
-    }
 }
 
 struct SupervisorState {
@@ -468,6 +477,12 @@ impl SupervisorState {
             _ => ProviderLoad::default(),
         };
         drop(observations);
+        if current {
+            self.providers
+                .get_mut(&id)
+                .unwrap()
+                .finished(Instant::now(), result.as_ref().err().copied());
+        }
         #[cfg(feature = "native-api")]
         if let Some(operation) = flight.operation {
             operation.finish(&flight.authorized.subscription, load, result);
@@ -504,11 +519,24 @@ impl SupervisorState {
                 self.publication_ids.insert(task.id(), id);
             }
             Some(Err(error)) => {
-                warn!(
-                    subscription = %completion.authorized.subscription.name,
-                    %error,
-                    "Subscription refresh failed; keeping active nodes"
-                );
+                let subscription = &completion.authorized.subscription;
+                if self
+                    .providers
+                    .get(&id)
+                    .is_some_and(|provider| provider.failures == 0)
+                {
+                    warn!(
+                        subscription = %subscription.name,
+                        %error,
+                        "Subscription refresh failed; keeping active nodes"
+                    );
+                } else {
+                    debug!(
+                        subscription = %subscription.name,
+                        %error,
+                        "Subscription refresh retry failed; keeping active nodes"
+                    );
+                }
                 self.finish(id, Err(super::failure_code(&error)));
             }
             None => self.finish(id, Err("supervisor_stopped")),
@@ -662,6 +690,7 @@ impl SupervisorState {
                                 self.providers.insert(deferred, Provider {
                                     authorized: provider.clone(),
                                     schedule: ProviderSchedule::Deferred,
+                                    failures: 0,
                                 });
                                 self.reconcile(authorized);
                                 Ok(())
@@ -911,7 +940,7 @@ impl SubscriptionSupervisor {
             .expect("subscription startup state missing");
         let now = Instant::now();
         for provider in state.providers.values_mut() {
-            provider.reset_deadline(now);
+            provider.restart_deadline(now);
         }
         self.command_tx = Some(command_tx);
         self.task = Some(tokio::spawn(state.run(commands, merge_tx)));
@@ -963,6 +992,7 @@ impl SubscriptionSupervisor {
     }
 }
 
+mod schedule;
 mod startup;
 
 #[cfg(test)]

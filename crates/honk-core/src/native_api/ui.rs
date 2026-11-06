@@ -21,18 +21,28 @@ const IMMUTABLE: &str = "public, max-age=31536000, immutable";
 pub(super) enum Ui {
     Directory(Box<(ServeDir, ServeFile)>),
     #[cfg(feature = "native-ui")]
-    Embedded,
+    Embedded(&'static [(&'static str, EmbeddedAsset)]),
 }
 
 pub(super) async fn load(path: &str) -> anyhow::Result<Option<Ui>> {
     if path.is_empty() {
         return Ok(None);
     }
-    if path == "embedded" {
+    if matches!(path, "embedded" | "embedded-lite") {
         #[cfg(feature = "native-ui")]
-        return Ok(Some(Ui::Embedded));
+        {
+            static STANDARD: &[(&str, EmbeddedAsset)] =
+                include!(concat!(env!("OUT_DIR"), "/native_ui_assets.rs"));
+            static LITE: &[(&str, EmbeddedAsset)] =
+                include!(concat!(env!("OUT_DIR"), "/native_ui_lite_assets.rs"));
+            return Ok(Some(Ui::Embedded(if path == "embedded-lite" {
+                LITE
+            } else {
+                STANDARD
+            })));
+        }
         #[cfg(not(feature = "native-ui"))]
-        anyhow::bail!("embedded native UI requires the native-ui feature");
+        anyhow::bail!("{path} native UI requires the native-ui feature");
     }
 
     let root = honk_config::paths::resolve_dependency_path(path);
@@ -120,8 +130,9 @@ impl Ui {
         let (files, index) = match self {
             Self::Directory(directory) => (&directory.0, &directory.1),
             #[cfg(feature = "native-ui")]
-            Self::Embedded => {
+            Self::Embedded(files) => {
                 return embedded_response(
+                    files,
                     &decoded,
                     navigation,
                     request.method() == Method::HEAD,
@@ -227,7 +238,7 @@ fn cache_control(hashed: bool, status: StatusCode) -> &'static str {
 }
 
 #[cfg(feature = "native-ui")]
-enum EmbeddedAsset {
+pub(super) enum EmbeddedAsset {
     /// Formats that do not compress, embedded as stored.
     Identity(&'static [u8]),
     /// Text embedded only in compressed form; `len` is the decoded size.
@@ -298,14 +309,17 @@ fn negotiate(headers: &axum::http::HeaderMap) -> Encoding {
 }
 
 #[cfg(feature = "native-ui")]
-fn embedded_response(path: &str, navigation: bool, head: bool, encoding: Encoding) -> Response {
+fn embedded_response(
+    files: &'static [(&'static str, EmbeddedAsset)],
+    path: &str,
+    navigation: bool,
+    head: bool,
+    encoding: Encoding,
+) -> Response {
     use std::io::Read;
 
-    static FILES: &[(&str, EmbeddedAsset)] =
-        include!(concat!(env!("OUT_DIR"), "/native_ui_assets.rs"));
-
     let path = if path.is_empty() { "index.html" } else { path };
-    let Ok(index) = FILES.binary_search_by(|(name, _)| name.cmp(&path)) else {
+    let Ok(index) = files.binary_search_by(|(name, _)| name.cmp(&path)) else {
         return if navigation {
             // The hash router's relative assets and service worker require /ui/.
             Redirect::temporary("/ui/").into_response()
@@ -313,7 +327,7 @@ fn embedded_response(path: &str, navigation: bool, head: bool, encoding: Encodin
             StatusCode::NOT_FOUND.into_response()
         };
     };
-    let (path, ref asset) = FILES[index];
+    let (path, ref asset) = files[index];
     let content_type = match path.rsplit('.').next().unwrap_or_default() {
         "html" => "text/html",
         "js" => "text/javascript",

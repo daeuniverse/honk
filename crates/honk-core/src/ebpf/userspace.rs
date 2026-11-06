@@ -168,13 +168,22 @@ impl EbpfBackend for UserspaceBackend {
         anyhow::bail!("XDP software policy does not support clear_listener_sockets")
     }
 
-    fn attach_dynamic_interface(
+    #[cfg(feature = "ebpf")]
+    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot> {
+        anyhow::bail!("XDP software policy has no TC interface ownership")
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn commit_interface_bindings(
         &mut self,
-        _ifname: &str,
-        _role: IfaceRole,
-        _single_homed: bool,
-    ) -> anyhow::Result<DynamicHooks> {
-        anyhow::bail!("XDP software policy does not support attach_dynamic_interface")
+        commit: interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        if !commit.is_empty() {
+            self.admission.store(false, Ordering::Release);
+            tracing::error!("TC binding commit reached XDP software policy; closing admission");
+        }
+        // Even misrouted link FDs must be closed outside the backend lock.
+        commit.add.into_iter().map(|(_, _, fd)| fd).collect()
     }
 
     fn conn_state_lookup(&self, _key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
@@ -397,5 +406,39 @@ mod tests {
         assert!(!admission.load(Ordering::Acquire));
         assert!(backend.policy.routing_generation.is_none());
         assert!(!backend.get_outbound_alive(2, 0, 0).unwrap());
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn unexpected_tc_commit_fences_admission_and_defers_descriptor_disposal() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+
+        let admission = Arc::new(AtomicBool::new(false));
+        let mut backend = UserspaceBackend::new(Arc::clone(&admission));
+        assert!(backend.interface_binding_snapshot().is_err());
+        admission.store(true, Ordering::Release);
+        let (owned, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let closed = backend.commit_interface_bindings(interface::BindingCommit {
+            add: vec![(
+                interface::Binding {
+                    ifindex: std::num::NonZeroU32::new(1).unwrap(),
+                    direction: interface::Direction::Ingress,
+                    program: interface::TcProgram::LanIngressL2,
+                    interface: "test".into(),
+                },
+                1,
+                owned.into(),
+            )],
+            ..Default::default()
+        });
+        assert!(!admission.load(Ordering::Acquire));
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(closed);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 }

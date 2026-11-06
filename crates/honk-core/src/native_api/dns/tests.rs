@@ -36,7 +36,9 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     use crate::dns::query::QueryContext;
 
     let mut config = honk_config::Config::default();
-    config.dns.cache.max_size = 8192;
+    // The ~10 MiB fixture must exceed the 8 MiB snapshot budget, so the cache's
+    // 1 KiB-per-entry byte budget has to retain all of it.
+    config.dns.cache.max_size = 100_000;
     let state = dns_state(config).await;
     let service = state.dns.cache().lock().await.service();
     let scope = RequestScope::Upstream(UpstreamTag::new("default").unwrap());
@@ -91,7 +93,7 @@ async fn cache_snapshot_filters_before_budget_admission_and_freezes_selected_pag
     assert_eq!(first["total"], 2);
     assert_eq!(
         first["usage"],
-        json!({"entries":"322","entry_capacity":"8192"})
+        json!({"entries":"322","entry_capacity":"100000"})
     );
     assert_eq!(first["entries"][0]["entry_id"], expected_ids[0]);
     assert_eq!(first["entries"][0]["type"], "A");

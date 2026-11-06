@@ -85,6 +85,19 @@ use lifecycle::{ProjectionLifecycle, TerminationGuard};
 use state::DesiredState;
 
 const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
+/// Cache-hit refreshes of an unchanged owner within this window skip the
+/// projection fence and state lock. Bounds stale LRU recency and how late a
+/// skipped TTL shortening is applied.
+const CACHE_HIT_COALESCE: Duration = Duration::from_secs(1);
+
+/// Owner state last applied under the projection fence and state lock.
+struct CacheHitHint {
+    structure: u64,
+    generation: u64,
+    ips: Box<[IpAddr]>,
+    expires_at: tokio::time::Instant,
+    applied_at: tokio::time::Instant,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RoutingProjectionSnapshot {
@@ -110,13 +123,13 @@ impl RoutingProjectionSnapshot {
 }
 
 /// A/AAAA results own only their address family; NXDOMAIN clears the name.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum ProjectionObservation<'a> {
     Positive {
         domain: &'a str,
         family: IpVersion,
         ips: &'a [IpAddr],
-        advertised_ttl: Duration,
+        expires_at: tokio::time::Instant,
     },
     Clear {
         domain: &'a str,
@@ -168,11 +181,29 @@ pub(crate) struct RoutingProjection {
     counters: Arc<ProjectionCounters>,
     worker: parking_lot::Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle: Arc<ProjectionLifecycle>,
+    /// Per-family cache-hit hints, dropped wholesale whenever the owner
+    /// structure changes so the store never outgrows the owner set.
+    hints: [dashmap::DashMap<Arc<str>, CacheHitHint>; 2],
+    structure: Arc<std::sync::atomic::AtomicU64>,
+    /// Structure epoch the hint store was last cleared for; written under the
+    /// state lock only.
+    hints_epoch: AtomicU64,
+    /// Woken after every exclusive fence release so contended submissions
+    /// wait asynchronously instead of blocking a thread.
+    publication_released: tokio::sync::Notify,
 }
 
 pub(crate) struct PreparedProjectionPublication<'a> {
     projection: &'a RoutingProjection,
-    _fence: parking_lot::RwLockWriteGuard<'a, ()>,
+    fence: Option<parking_lot::RwLockWriteGuard<'a, ()>>,
+}
+
+impl Drop for PreparedProjectionPublication<'_> {
+    fn drop(&mut self) {
+        // Release before waking so woken submissions can take the fence.
+        drop(self.fence.take());
+        self.projection.publication_released.notify_waiters();
+    }
 }
 
 impl PreparedProjectionPublication<'_> {
@@ -196,7 +227,7 @@ impl PreparedProjectionPublication<'_> {
             state.dirty_ips.clear();
             state.retries.clear();
         }
-        state.update_snapshot(snapshot);
+        state.update_snapshot(&snapshot);
         drop(state);
         self.projection.notify_worker();
     }
@@ -210,14 +241,20 @@ impl RoutingProjection {
         let (wake, receiver) = tokio::sync::mpsc::channel(1);
         let counters = Arc::new(ProjectionCounters::default());
         let lifecycle = ProjectionLifecycle::running();
+        let state = DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY);
+        let structure = Arc::clone(&state.structure);
         let projection = Arc::new(Self {
-            state: parking_lot::Mutex::new(DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY)),
+            state: parking_lot::Mutex::new(state),
             publication_fence: parking_lot::RwLock::new(()),
             wake: parking_lot::Mutex::new(Some(wake)),
             wake_pending: AtomicBool::new(false),
             counters: Arc::clone(&counters),
             worker: parking_lot::Mutex::new(None),
             lifecycle: Arc::clone(&lifecycle),
+            hints: Default::default(),
+            structure,
+            hints_epoch: AtomicU64::new(0),
+            publication_released: tokio::sync::Notify::new(),
         });
         let guard = TerminationGuard::new(lifecycle);
         let projection_worker = Arc::downgrade(&projection);
@@ -231,16 +268,28 @@ impl RoutingProjection {
     pub(crate) fn prepare_snapshot_publication(&self) -> PreparedProjectionPublication<'_> {
         PreparedProjectionPublication {
             projection: self,
-            _fence: self.publication_fence.write(),
+            fence: Some(self.publication_fence.write()),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn update_snapshot(&self, snapshot: Arc<RoutingProjectionSnapshot>) {
-        self.mutate(|state| {
-            state.update_snapshot(snapshot);
+        assert!(self.try_mutate(snapshot.generation(), |state| {
+            state.update_snapshot(&snapshot);
             0
-        });
+        }));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn submit(
+        &self,
+        snapshot: Arc<RoutingProjectionSnapshot>,
+        observation: ProjectionObservation<'_>,
+    ) {
+        assert!(
+            self.try_submit(&snapshot, observation),
+            "test submission met a held publication fence"
+        );
     }
 
     #[cfg(test)]
@@ -251,15 +300,15 @@ impl RoutingProjection {
         self.state.lock().project(snapshot).into_iter().collect()
     }
 
-    pub(crate) fn submit(
+    /// Applies `observation`, or returns `false` while a publication holds
+    /// the fence; see [`Self::submit_after_publication`].
+    pub(crate) fn try_submit(
         &self,
-        snapshot: Arc<RoutingProjectionSnapshot>,
+        snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
-    ) {
-        self.mutate(|state| {
-            if state.update_snapshot(snapshot) {
-                state.observe(observation, tokio::time::Instant::now())
-            } else {
+    ) -> bool {
+        self.try_mutate(snapshot.generation(), |state| {
+            if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
                 );
@@ -267,9 +316,97 @@ impl RoutingProjection {
                     reason = "older_snapshot",
                     "DNS routing projection update ignored"
                 );
-                0
+                return 0;
             }
+            // A same-set positive changes expiry without a structure bump;
+            // drop the hint so it cannot coalesce against the old expiry.
+            if let ProjectionObservation::Positive { domain, family, .. } = observation {
+                self.hints[family as usize].remove(domain);
+            }
+            state.observe(observation, tokio::time::Instant::now())
+        })
+    }
+
+    /// Submits a DNS-cache observation. A refresh identical to one applied within
+    /// `CACHE_HIT_COALESCE`, shortening expiry by at most that window, is coalesced
+    /// without taking the projection fence or state lock.
+    /// Returns `false` while a publication holds the fence.
+    pub(crate) fn try_submit_cache_hit(
+        &self,
+        snapshot: &Arc<RoutingProjectionSnapshot>,
+        domain: &str,
+        family: IpVersion,
+        ips: &[IpAddr],
+        expires_at: tokio::time::Instant,
+    ) -> bool {
+        let now = tokio::time::Instant::now();
+        let hints = &self.hints[family as usize];
+        let structure = self.structure.load(Ordering::Acquire);
+        let coalesced = hints.get(domain).is_some_and(|hint| {
+            hint.structure == structure
+                && hint.generation == snapshot.generation()
+                && now < expires_at
+                && now < hint.expires_at
+                && now.saturating_duration_since(hint.applied_at) < CACHE_HIT_COALESCE
+                && expires_at <= hint.expires_at
+                && expires_at + CACHE_HIT_COALESCE >= hint.expires_at
+                && state::same_address_set(hint.ips.iter(), ips)
         });
+        if coalesced {
+            return true;
+        }
+        self.try_mutate(snapshot.generation(), |state| {
+            if !state.update_snapshot(snapshot) {
+                crate::stats::record_dns_event(
+                    crate::stats::DnsStatEvent::ProjectionStaleGeneration,
+                );
+                return 0;
+            }
+            let applied_at = tokio::time::Instant::now();
+            let evicted = state.observe(
+                ProjectionObservation::Positive {
+                    domain,
+                    family,
+                    ips,
+                    expires_at,
+                },
+                applied_at,
+            );
+            let structure = state.structure.load(Ordering::Acquire);
+            if self.hints_epoch.swap(structure, Ordering::Relaxed) != structure {
+                for family_hints in &self.hints {
+                    family_hints.clear();
+                }
+            }
+            if let Some((key, ips, expires_at)) = state.cache_hit_hint(family as usize, domain) {
+                hints.insert(
+                    key,
+                    CacheHitHint {
+                        structure,
+                        generation: state.snapshot.generation(),
+                        ips,
+                        expires_at,
+                        applied_at,
+                    },
+                );
+            }
+            evicted
+        })
+    }
+
+    /// Retries a `try_submit*` closure that met a held publication fence,
+    /// awaiting each release instead of blocking the thread.
+    pub(crate) async fn submit_after_publication(&self, mut submit: impl FnMut() -> bool) {
+        loop {
+            let released = self.publication_released.notified();
+            tokio::pin!(released);
+            // Registered before retrying, so a release in between still wakes it.
+            released.as_mut().enable();
+            if submit() {
+                return;
+            }
+            released.await;
+        }
     }
 
     #[cfg(test)]
@@ -293,13 +430,40 @@ impl RoutingProjection {
         }
     }
 
-    fn mutate(&self, operation: impl FnOnce(&mut DesiredState) -> u64) {
-        let _publication = self.publication_fence.write();
-        let counter_delta = operation(&mut self.state.lock());
+    /// Applies `operation` under the shared publication fence, which worker
+    /// map writes also share, or returns `false` while a publication holds or
+    /// awaits it. Only a newer snapshot needs the fence exclusively.
+    fn try_mutate(
+        &self,
+        generation: u64,
+        operation: impl FnOnce(&mut DesiredState) -> u64,
+    ) -> bool {
+        let Some(shared) = self.publication_fence.try_read() else {
+            return false;
+        };
+        let mut state = self.state.lock();
+        let counter_delta = if generation > state.snapshot.generation() {
+            drop(state);
+            drop(shared);
+            // Rebuilding under a newer snapshot must not interleave with a
+            // worker batch. Reload commits snapshots under its own fence, so
+            // a submission only gets here outside one, briefly.
+            let exclusive = self.publication_fence.write();
+            let delta = operation(&mut self.state.lock());
+            drop(exclusive);
+            self.publication_released.notify_waiters();
+            delta
+        } else {
+            let delta = operation(&mut state);
+            drop(state);
+            drop(shared);
+            delta
+        };
         self.counters
             .evictions
             .fetch_add(counter_delta, Ordering::Relaxed);
         self.notify_worker();
+        true
     }
 
     fn notify_worker(&self) {
@@ -335,45 +499,44 @@ impl RoutingProjection {
 #[cfg(feature = "dns-bench")]
 pub(crate) struct ProjectionReplacementBenchmark {
     state: DesiredState,
-    domain: Arc<str>,
+    domains: Vec<Arc<str>>,
+    next: usize,
     ip: IpAddr,
     now: tokio::time::Instant,
 }
 
 #[cfg(feature = "dns-bench")]
 impl ProjectionReplacementBenchmark {
+    /// Observes `domains` round-robin on one shared IP; more names than the
+    /// owner capacity make every observation insert one owner and evict another.
     pub(crate) fn new(
         snapshot: Arc<RoutingProjectionSnapshot>,
-        domain: Arc<str>,
+        domains: Vec<Arc<str>>,
         ip: IpAddr,
     ) -> Self {
-        let now = tokio::time::Instant::now();
-        let mut state = DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY);
-        state.observe(
-            ProjectionObservation::Positive {
-                domain: &domain,
-                family: state::family_of(ip),
-                ips: std::slice::from_ref(&ip),
-                advertised_ttl: Duration::from_secs(300),
-            },
-            now,
-        );
-        Self {
-            state,
-            domain,
+        let mut replacement = Self {
+            state: DesiredState::new(snapshot, DEFAULT_DOMAIN_CAPACITY),
+            domains,
+            next: 0,
             ip,
-            now,
+            now: tokio::time::Instant::now(),
+        };
+        for _ in 0..replacement.domains.len().min(DEFAULT_DOMAIN_CAPACITY) {
+            replacement.replace();
         }
+        replacement
     }
 
     pub(crate) fn replace(&mut self) -> u64 {
         self.now += Duration::from_millis(1);
+        let domain = &self.domains[self.next];
+        self.next = (self.next + 1) % self.domains.len();
         self.state.observe(
             ProjectionObservation::Positive {
-                domain: &self.domain,
+                domain,
                 family: state::family_of(self.ip),
                 ips: std::slice::from_ref(&self.ip),
-                advertised_ttl: Duration::from_secs(300),
+                expires_at: self.now + Duration::from_secs(300),
             },
             self.now,
         );

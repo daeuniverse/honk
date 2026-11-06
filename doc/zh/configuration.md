@@ -1,6 +1,6 @@
 # honk 配置指南
 
-本指南说明 honk 配置的组合和运行方法。字段清单见参考文档。
+使用本指南组合并运行 honk 配置。安装步骤以及仅直连、代理、界面/API 的起步配置见[启动指南](./how-to-start.md#最小配置)。字段清单见参考文档。
 
 honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考](./reference/dialect.md)。下表列出运行时分段与 CLI 入口；`include {}` 用于组合文件。
 
@@ -22,7 +22,7 @@ honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考]
 ## 配置格式
 
 - 配置项放在 `section { ... }` 块中，每行一个 `key: value`。也接受 `global { log_level: debug }` 这样的单行块，以及嵌套的单行块。
-- URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值需要加引号。标量值及 `include`、`node` 条目接受单引号或双引号；带引号的 `subscription` URL 使用单引号。
+- 建议为 URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值加引号。标量值及 `include`、`node` 条目接受单引号或双引号；带引号的 `subscription` URL 使用单引号。
 - 在匹配器参数和过滤、路由表达式中，成对单引号或双引号内的逗号、右圆括号、`&&` 和 `->` 按字面值保留。但 `group(...)` 和 `qtype(...)` 仍将带引号的逗号分隔文本按列表解释。
 - 配置项或 matcher 接受列表时，用逗号分隔：`lan_interface: eth0, eth1` 或 `dport(80, 443)`。
 - 以秒为单位的时长接受裸秒数或 `ms`、`s`、`m`、`h` 后缀。`check_tolerance` 等毫秒配置项接受裸毫秒数、`ms` 或 `s`。
@@ -45,7 +45,7 @@ include {
 
 只有顶层 `include` 允许起始花括号另起一行，并产生 `legacy-include-opener` 警告；建议在同一行写 `include {`。`include` 注释遵循词法单元规则：`path.dae # note` 加载 `path.dae`，而 `path.dae#note` 是字面 glob 模式，并产生 `legacy-include-hash` 警告。字面 `#` 可加引号，以免触发迁移警告。字符串解析检查 `include` 结构，但不打开被包含文件；`include` 不能把片段拼接到尚未闭合的块中。
 
-所有相对 include，包括嵌套包含文件中的 include，都以传给 `--config` 的入口配置所在目录为基准解析。加载器会 canonicalize 入口目录与每个匹配项；指向该目录之外的绝对路径或符号链接会被拒绝。同一 canonical 文件无论直接重复加载，还是通过循环再次加载，都会被拒绝。
+所有相对 include，包括嵌套包含文件中的 include，都以传给 `--config` 的入口配置所在目录为基准解析。加载器会解析入口目录与每个匹配项的规范路径；指向该目录之外的绝对路径或符号链接会被拒绝。同一规范路径的文件无论直接重复加载，还是通过循环再次加载，都会被拒绝。
 
 入口文件自身的分段始终最先合并，不受 `include` 块位置影响；之后依次合并每个被包含文件及其后代。后出现的标量键覆盖先前值。节点、订阅、组、DNS 上游、固定 TTL 与路由规则等集合条目按合并顺序追加。
 
@@ -53,13 +53,25 @@ include {
 
 ## 运行时数据目录
 
-`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录。默认值为 `/var/lib/honk`，必须是非空绝对路径，修改后需重启。启动时 honk 会递归创建目录，并以私有 create-new/remove 文件执行探测；候选目录不可用时，只有通过同一探测的工作目录才能作为回退。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源可继续使用，不会自动迁移；复用的可写状态仍会在原位置更新。对于相对可写资源和只读依赖，honk 依次检查已有的 `<data_dir>/<path>`、已有的 `/var/share/honk/<path>`，再检查调用方已有的旧候选路径（缓存使用原始配置目录，其他依赖使用工作目录）；都不存在时返回 `<data_dir>/<path>` 用于创建。相对日志仅用于创建，始终使用 `<data_dir>/<path>`；绝对路径保持原样。Geo 资源独立按普通文件查找：`$DAE_LOCATION_ASSET`、`<data_dir>`、`/var/share/honk`、工作目录、honk share 目录，最后是 dae share 目录。
+`global.data_dir` 是运行时状态与相对运行时资源的进程级根目录，默认值为 `/var/lib/honk`，必须是非空绝对路径。修改后需重启。
+
+启动时，honk 递归创建目录，并通过新建、删除私有文件检查目录是否可用。候选目录不可用时，只有通过同一检查的工作目录才能作为回退；但 `--store db` 和已启用的原生 API 密码登录不允许这种回退。
+
+相对可写资源和只读依赖依次使用第一个已存在的路径：
+
+1. `<data_dir>/<path>`。
+2. `/var/share/honk/<path>`。
+3. 调用方的旧位置：缓存使用原始配置目录，其他依赖使用工作目录。
+
+都不存在时，honk 返回 `<data_dir>/<path>` 用于创建。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源可通过这些回退路径继续使用，但旧缓存和订阅导入会将符合条件的状态复制到 `state/honk.db`。相对日志始终使用 `<data_dir>/<path>` 创建。绝对路径保持原样。
+
+Geo 资源独立按普通文件查找：`$DAE_LOCATION_ASSET`、`<data_dir>`、`/var/share/honk`、工作目录、honk share 目录，最后是 dae share 目录。
 
 详见 [Global 参考](./reference/global.md)。
 
 ## 最小配置
 
-部署前须替换 `eth0` 与示例节点地址。每条注释只说明对应配置项或规则的一项用途。
+部署前须替换 `eth0` 与示例节点地址。
 
 ```dae
 # 设置拦截基线。
@@ -74,7 +86,7 @@ global {
     log_file: 'honk.log'
     # 嗅探域名并校验目的 IP。
     dial_mode: domain
-    # 应用推荐的网关 sysctl。
+    # 为兼容 dae 而保留；honk 按固定规则设置 sysctl。
     auto_config_kernel_parameter: true
     # 解析代理主机名时避免自拦截。
     bootstrap_resolver: '1.1.1.1:53'
@@ -210,7 +222,11 @@ experimental {
 
 ## 选择接口
 
-将 `lan_interface` 设为接收 LAN 转发流量的接口，多个接口用逗号分隔。将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定，不会回退到 loopback，之后在链路、地址或路由变化时自动协调。仅代理本机流量时省略 `lan_interface`：已配置的 WAN hook 仍处理本机发起的 TCP 与 UDP。不得把 `lo` 作为虚构的 LAN 接口加入配置。
+- 将 `lan_interface` 设为接收 LAN 转发流量的接口，多个接口用逗号分隔。
+- 将 `wan_interface` 设为承载本机发起流量的接口。`auto` 跟随 IPv4 默认路由接口；没有默认路由时保持待定，不会回退到回环接口，之后在链路、地址或路由变化时重新协调。
+- 仅代理本机流量时省略 `lan_interface`：已配置的 WAN 挂钩仍处理本机发起的 TCP 与 UDP。不得把 `lo` 作为虚构的 LAN 接口加入配置。
+
+不存在、被拒绝（`lo`、VRF 设备、`dae0`）或无法挂载的接口不会阻止启动。见[网卡语义](./reference/global.md#网卡语义)。
 
 接口设置详见 [Global 参考](./reference/global.md)。
 
@@ -227,13 +243,21 @@ experimental {
 
 ## 声明节点
 
-每个 `node` 行都是分享链接：`tag: 'scheme://...'` 或带引号的裸链接。显式 tag 会成为路由/API 名称，并覆盖链接内嵌名称；裸链接使用其 fragment 或生成的协议/主机名称。凭据、TLS/REALITY、transport 与协议调优项都放在链接的 userinfo 与 query 参数中。无法解析的条目会附诊断后跳过，已移除的协议则是硬配置错误。
+每个 `node` 行都是分享链接：`tag: 'scheme://...'` 或带引号的裸链接。显式 tag 会成为路由/API 名称，并覆盖链接内嵌名称；裸链接使用其 fragment 或生成的协议/主机名称。凭据、TLS/REALITY、传输与协议调优项都放在链接的 userinfo 与 query 参数中。无法解析的条目会附诊断后跳过；已移除的协议会导致配置被拒绝。
 
 详见 [节点参考](./reference/nodes.md)。
 
 ## 构建组
 
-静态名称使用 `filter: name(...)`，订阅来源使用 `filter: subtag(...)`，嵌套组使用 `filter: group(...)`。以 `&&` 连接的谓词执行 AND，`!` 对单个谓词取反；不同 `filter:` 行执行 OR。没有 filter 且没有嵌套组时包含全部节点，仅有嵌套组时不会自动包含全部节点。策略可选 `selector`/`fixed`、`urltest`/`min_moving_avg`、`loadbalance`/`roundrobin` 或 `fallback`；用 `final` 指定策略选择为空时的结果。Selector 的 TCP 与 UDP 都遵循已选成员，不会因健康状态切换到兄弟成员；同一叶节点的 TCP 最后尝试也不能绕过嵌套 Selector 的选择。组拨号最终总会解析到一个叶子节点。每份配置最多可定义 250 个顶层用户组；更高序号由路由 ABI 保留。
+按以下顺序构建组：
+
+1. 选择成员：静态名称使用 `filter: name(...)`，订阅来源使用 `filter: subtag(...)`，嵌套组使用 `filter: group(...)`。
+2. 组合条件：`&&` 表示 AND，`!` 对单个谓词取反，不同 `filter:` 行表示 OR。没有过滤条件且没有嵌套组时包含全部节点；仅有嵌套组时不会自动包含全部节点。
+3. 选择策略：可用 `selector`/`fixed`、`urltest`/`min_moving_avg`、`loadbalance`/`roundrobin`、`fallback` 或 `score`。用 `final` 指定策略选择为空时的结果。
+
+Selector 的 TCP 与 UDP 都遵循已选成员，不会因健康状态切换到兄弟成员。同一叶节点的 TCP 最后尝试也不能绕过嵌套 Selector 的选择。组拨号最终总会解析到一个叶节点。
+
+每份配置最多可定义 250 个顶层用户组；更高序号由路由 ABI 保留。
 
 详见 [组参考](./reference/groups.md)。
 
@@ -279,13 +303,19 @@ dns {
 
 ## 订阅
 
-每个来源写作 `tag: 'url'`；要单独覆盖 `ua`、`interval`、`cache` 或 `route`，在带引号的 URL 后接一个块。`assets.subscription` 提供共用的 `ua`、`interval` 和 `cache` 默认值；未单独设置出口时使用 `assets.route`。`subtag(...)` 匹配该 tag。仅当 `global.store_subscribe`（默认 `true`）与条目生效的 `cache` 均为 `true` 时，成功获取并解析的原始正文才会存入状态数据库。请求默认使用 `honk/<version>`，条目或 `assets.subscription` 设置的 `ua` 会覆盖它。缓存 key 包含配置中的覆盖值，因此不同请求身份使用不同的已存正文。启动时先恢复有效且非空的存储，再后台刷新；SIGHUP 沿用活动订阅节点，不从存储恢复。获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文。订阅节点仅存在于 runtime。修改 `store_subscribe` 后需重启。
+每个来源写作 `tag: 'url'`，`subtag(...)` 匹配该标签。要单独覆盖 `ua`、`interval`、`cache` 或 `route`，在带引号的 URL 后接一个块。
+
+- 共用默认值：`assets.subscription` 提供 `ua`、`interval` 和 `cache`；未单独设置下载出口时使用 `assets.route`。
+- 请求身份：请求默认使用 `honk/<version>`，条目或 `assets.subscription` 设置的 `ua` 会覆盖它。缓存键包含配置中的覆盖值，因此不同请求身份使用不同的已存正文。
+- 持久化：仅当 `global.store_subscribe`（默认 `true`）与条目生效的 `cache` 均为 `true` 时，成功获取并解析的原始正文才会存入状态数据库。修改 `store_subscribe` 后需重启。
+- 启动与重载：启动时先恢复有效且非空的已存正文，再后台刷新。SIGHUP 沿用活动订阅节点，不从存储恢复。
+- 失败处理：获取、解析或没有可用节点的失败会保留活动节点与上一次有效正文。订阅节点仅存在于运行时。
 
 详见 [订阅参考](./reference/subscription.md)。
 
 ## 启用 Clash API、缓存文件与首包保留 UDP
 
-**原生 API。** `native-api` 需显式编译：以 `--features native-api`（或 `native-ui`）构建；full 与 `-native-api` 发布产物包含它。listener 须配置 `experimental.native_api.enabled: true`，并满足以下条件之一：配置 bearer `secret`、设置 `password_auth: true`，或在 loopback `listen` 上设置 `allow_anonymous_loopback: true`。honk 不限制 `secret` 的最短长度，应使用足够长的随机值。默认监听地址为 `127.0.0.1:9527`，匿名 loopback 访问仅供本地开发。所有生效的原生字段均需重启。用户态观测、事件与有界历史独立于 Clash；流量/内存历史默认保留最多 600 点/600 秒。可选 `ui` 目录需已有可读 `index.html`，也可用 `--features native-ui` 与 `ui: embedded` 内嵌固定版本的 doona；运行时不下载或构建 UI。
+**原生 API。** `native-api` 需显式编译：以 `--features native-api`（或 `native-ui`）构建；full 与 `-native-api` 发布产物包含它。listener 须配置 `experimental.native_api.enabled: true`，并满足以下条件之一：配置 bearer `secret`、设置 `password_auth: true`，或在 loopback `listen` 上设置 `allow_anonymous_loopback: true`。honk 不限制 `secret` 的最短长度，应使用足够长的随机值。默认监听地址为 `127.0.0.1:9527`，匿名 loopback 访问仅供本地开发。所有生效的原生字段均需重启。用户态观测、事件与有界历史独立于 Clash；流量/内存历史默认保留最多 600 点/600 秒。可选 `ui` 目录需已有可读 `index.html`，也可用 `--features native-ui` 与 `ui: embedded` 内嵌固定版本的 doona；运行时不下载或构建 UI。`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要 `native-ui`。
 
 `.dae` 仍是唯一配置权威。启动时捕获来源、离线校验和 reload 共用引擎。配置读取返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。`config_write` 默认 false，要求非空 secret 或 `password_auth`。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威。启用 `config_write` 后，所有已接受的非凭据 include 均可编辑源，但不授予专用条目删除权限。配置的 geodata 更新将不可变的已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [主文件条目与 geodata 契约](./reference/api.md#主文件条目与-geodata-管理)。
 
@@ -335,7 +365,7 @@ cargo run --release -p honk-core -- \
 1. 从仓库的 `config.min.dae` 或 `config.dae` 开始，并替换其中的接口、端点与凭据。
 2. 确保每个路由规则/`fallback`、DNS `fallback`、组 `final` 与 `->` 代理目标都按场景指向已有的组、节点、`direct` 或 `block`。
 3. 对首连域名规则使用 `dial_mode: domain`/`domain++`，或确保客户端 DNS 经过 honk 以填充域名路由 map。
-4. 修改组或策略后，SIGHUP 会重建 `GroupManager`；仍有效的 Selector 选择会迁移到 replacement generation。
+4. 修改组或策略后，SIGHUP 会重建 `GroupManager`；仍有效的 Selector 选择会迁移到新的运行时代次。
 5. 修改 `global.nfqueue_enable` 后需重启；若希望启用暂存，确认真实 eBPF 后端和启动前置条件可用，并确保防火墙管理器不修改 `inet honk_nfqueue` / `udp_decision`。
 6. 增加或修改配置 fixture 时，运行 `cargo test -p honk-config` 以保持解析器示例有效。
 

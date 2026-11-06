@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::de::{DeserializeSeed, Error as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -134,6 +136,8 @@ struct FlatNode {
     ws_path: Option<String>,
     #[serde(default)]
     ws_host: Option<String>,
+    #[serde(default)]
+    ws_headers: BTreeMap<String, String>,
     #[serde(default)]
     grpc_service: Option<String>,
     #[serde(default)]
@@ -427,6 +431,7 @@ impl FlatNode {
         );
         strip!(self.ws_path.is_some() && !stream, ws_path);
         strip!(self.ws_host.is_some() && !stream, ws_host);
+        strip!(!self.ws_headers.is_empty() && !stream, ws_headers);
         strip!(self.grpc_service.is_some() && !stream, grpc_service);
 
         let hy2 = self.protocol == NodeProtocol::Hysteria2;
@@ -540,6 +545,7 @@ impl FlatNode {
             transport: std::mem::take(&mut self.transport),
             ws_path: self.ws_path.take(),
             ws_host: self.ws_host.take(),
+            ws_headers: std::mem::take(&mut self.ws_headers),
             grpc_service: self.grpc_service.take(),
             xhttp: self.xhttp.take(),
         }
@@ -777,7 +783,9 @@ impl FlatNode {
         };
         node.normalize_wireguard();
         node.normalize_stream_transport()
-            .map_err(|message| semantic_error(source, setting.clone().field("xhttp"), message))?;
+            .map_err(|(field, message)| {
+                semantic_error(source, setting.clone().field(field), message)
+            })?;
         node.validate_detailed_at(source, setting)?;
         if let Some(config) = node.vless_mut() {
             config.normalize();
@@ -824,6 +832,8 @@ struct WireOptions<'a> {
     network: Option<&'a str>,
     ws_path: Option<&'a str>,
     ws_host: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ws_headers: Option<&'a BTreeMap<String, String>>,
     grpc_service: Option<&'a str>,
     hy2_auth: Option<&'a str>,
     hy2_obfs: Option<&'a str>,
@@ -891,6 +901,7 @@ impl<'a> WireOptions<'a> {
         self.transport = &transport.transport;
         self.ws_path = transport.ws_path.as_deref();
         self.ws_host = transport.ws_host.as_deref();
+        self.ws_headers = (!transport.ws_headers.is_empty()).then_some(&transport.ws_headers);
         self.grpc_service = transport.grpc_service.as_deref();
         self.xhttp = transport.xhttp.as_ref();
     }

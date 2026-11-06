@@ -198,7 +198,7 @@ fn managed_node_rejection_keeps_the_static_parser_reason() {
         ),
         (
             r#"{"headers":{"Host":"private-value"}}"#,
-            "invalid or protocol-managed XHTTP header",
+            "invalid or protocol-managed header",
         ),
     ] {
         let error = append_node_source(&loaded.sources[0], "edge", &link(extra)).unwrap_err();

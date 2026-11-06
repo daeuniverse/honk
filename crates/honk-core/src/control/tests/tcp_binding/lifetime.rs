@@ -500,19 +500,19 @@ async fn backdate(
         root,
         "CONN_STATE_MAP",
     )?)?
-    .insert(*key, FlowMapValue::new(conn), flags)?;
+    .insert(key, &FlowMapValue::new(conn), flags)?;
     HashMap::<_, TuplesKey, FlowMapValue<RoutingHandoffEntry>>::try_from(pinned_map(
         root,
         "ROUTING_HANDOFF_MAP",
     )?)?
-    .insert(*key, FlowMapValue::new(handoff), flags)?;
+    .insert(key, &FlowMapValue::new(handoff), flags)?;
     HashMap::<_, RedirectTuple, FlowMapValue<RedirectEntry>>::try_from(pinned_map(
         root,
         "REDIRECT_TRACK",
     )?)?
     .insert(
-        RedirectTuple::from_tuples(key),
-        FlowMapValue::new(redirect),
+        &RedirectTuple::from_tuples(key),
+        &FlowMapValue::new(redirect),
         flags,
     )?;
     Ok(())

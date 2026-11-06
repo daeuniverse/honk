@@ -1,5 +1,42 @@
 use super::*;
 
+#[tokio::test]
+async fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
+    let controller = controller_with_limit(
+        Arc::new(SlowUpstream {
+            calls: AtomicUsize::new(0),
+            delay: Duration::ZERO,
+            response: Vec::new(),
+        }),
+        usize::MAX,
+    );
+    let udp: Vec<_> = (0..super::super::MAX_UDP_CLIENT_QUERIES)
+        .map(|index| {
+            if index % 2 == 0 {
+                controller.try_admit_query(true)
+            } else {
+                controller.try_admit_packet_query(true)
+            }
+            .unwrap()
+        })
+        .collect();
+    assert!(controller.try_admit_query(true).is_err());
+    assert!(controller.try_admit_packet_query(true).is_err());
+    let tcp: Vec<_> = (0..2048 - super::super::MAX_UDP_CLIENT_QUERIES)
+        .map(|index| {
+            if index % 2 == 0 {
+                controller.try_admit_query(false)
+            } else {
+                controller.try_admit_packet_query(false)
+            }
+            .unwrap()
+        })
+        .collect();
+    assert!(controller.try_admit_query(false).is_err());
+    assert!(controller.try_admit_packet_query(false).is_err());
+    drop((udp, tcp));
+}
+
 #[cfg(feature = "native-api")]
 #[tokio::test]
 async fn native_log_captures_transparent_udp_completion_with_full_source() {
@@ -128,7 +165,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
-            advertised_ttl: Duration::from_secs(30),
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
         },
     );
     let projected = controller.project_routes(&snapshot);
@@ -149,7 +186,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         .expect("truncated outcome");
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
-    controller.submit_projection(runtime.runtime(), &outcome);
+    controller.try_submit_projection(runtime.runtime(), &outcome, tokio::time::Instant::now());
     drop(runtime);
 
     assert!(cache.lock().await.is_empty());
@@ -206,7 +243,7 @@ async fn projection_follows_query_family_until_nxdomain() {
             domain: "example.com",
             family: honk_outbound::alive::IpVersion::V6,
             ips: &[v6],
-            advertised_ttl: Duration::from_secs(30),
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
         },
     );
     // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,

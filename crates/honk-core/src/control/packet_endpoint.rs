@@ -1051,7 +1051,10 @@ impl EndpointRuntime {
                 };
                 match dns.try_admit_packet_query(true) {
                     Ok(admission) => {
+                        self.plane.stats.record_udp_slow_permit_accepted();
+                        let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                         pool.spawn_slow_path(async move {
+                            let _guard = guard;
                             let _response_memory = response_memory;
                             let _source_work = source_work;
                             let operation = dns.handle_udp_dns_admitted(
@@ -1079,18 +1082,62 @@ impl EndpointRuntime {
                     }
                     Err(error) => {
                         if let Some((runtime, permit)) = error.udp_reply {
+                            self.plane.stats.record_udp_slow_permit_accepted();
+                            let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                             pool.spawn_slow_path(async move {
+                                let _guard = guard;
                                 let (_response_memory, _permit) = (response_memory, permit);
                                 let _source_work = source_work;
-                                let response = crate::dns::response::build_dns_refused(&bytes);
-                                let _ = runtime.run_reply(sender.send_to(&response, source)).await;
                                 #[cfg(feature = "native-api")]
-                                observation.finish(
-                                    crate::observe::vocab::ConnectionState::Closed,
-                                    "dns_query_refused",
-                                );
+                                let started = Instant::now();
+                                let response = crate::dns::response::build_dns_refused(&bytes);
+                                let operation = async {
+                                    crate::observe::flows::dns::decision(
+                                        "rejected",
+                                        Some("admission_refused"),
+                                    );
+                                    let delivery =
+                                        runtime.run_reply(sender.send_to(&response, source)).await;
+                                    crate::observe::flows::dns::reply_delivery(
+                                        &delivery,
+                                        |length| *length == response.len(),
+                                        "client_send_failed",
+                                    );
+                                };
+                                #[cfg(feature = "native-api")]
+                                {
+                                    let operation = std::pin::pin!(operation);
+                                    let operation = crate::observe::flows::dns::client_scope(
+                                        &bytes,
+                                        validated.ingress(),
+                                        crate::dns::query::DnsRequestMeta::new(
+                                            Some(source.ip()),
+                                            Some(destination),
+                                        ),
+                                        operation,
+                                    );
+                                    match observer {
+                                        Some(observer) => observer.scope(operation).await,
+                                        None => operation.await,
+                                    }
+                                    observation.finish(
+                                        crate::observe::vocab::ConnectionState::Closed,
+                                        "dns_query_refused",
+                                    );
+                                    dns.dns_service().observer.observe_client(
+                                        &bytes,
+                                        validated.ingress(),
+                                        Some(source),
+                                        None,
+                                        &response,
+                                        started.elapsed(),
+                                    );
+                                }
+                                #[cfg(not(feature = "native-api"))]
+                                operation.await;
                             });
                         } else {
+                            self.plane.stats.record_udp_slow_permit_rejected();
                             #[cfg(feature = "native-api")]
                             observation.finish(
                                 crate::observe::vocab::ConnectionState::Failed,

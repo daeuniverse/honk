@@ -21,10 +21,12 @@ pub(crate) enum Component {
     )]
     UdpTrace,
     QuicProbe,
+    #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
+    InterfaceBinding,
 }
 
 impl Component {
-    const COUNT: usize = 6;
+    const COUNT: usize = 7;
 
     #[cfg_attr(not(feature = "native-api"), allow(dead_code))]
     pub(crate) fn id(self) -> &'static str {
@@ -35,6 +37,7 @@ impl Component {
             Self::PnameRouting => "pname_routing",
             Self::UdpTrace => "udp_trace",
             Self::QuicProbe => "quic_probe",
+            Self::InterfaceBinding => "interface_binding",
         }
     }
 }

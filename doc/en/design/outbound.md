@@ -24,7 +24,7 @@ Speculative UDP dialing first returns `PreparedUdpTransport<T>`. Commit is falli
 request. Every other handler turns the selected node into bytes understood by
 its proxy server.
 
-Outbound dialing, groups, and health checking. Re-exported by `honk-core` as `honk_core::{proxy, group, outbound}`.
+`honk-core` re-exports outbound dialing, groups, and health checking as `honk_core::{proxy, group, outbound}`.
 
 ## Implementation ownership
 
@@ -241,7 +241,7 @@ AnyTLS and VLESS pools enter draining: no new logical streams are admitted, but
 existing streams retain their carriers until completion. QUIC flows own
 connection clones, so terminal generation checks reject new work while current
 flows finish naturally. Process shutdown force-closes remaining pools and QUIC
-clients only after the process-level flow drain.
+clients after the optional [business-connection grace](../reference/global.md#shutdown).
 
 Generation-free callers such as standalone probes use
 `EphemeralRuntimeGuard`. AnyTLS or VLESS streams and packet transports retain
@@ -293,8 +293,9 @@ the pool notification before publication or detached attachment; manual pruning
 also broadcasts when it removes an already-closed carrier.
 
 VLESS physical carriers additionally hold one permit from the immutable
-process-wide VLESS-carrier gate. The startup resource budget computes
-`min(after_dials / 8, 8192)` before sizing UDP endpoints; zero remains zero.
+process-wide VLESS-carrier gate. The startup resource budget deducts the DNS
+socket partition, then computes `min(after_dns / 8, 8192)` before sizing UDP
+endpoints; zero remains zero.
 Reloaded traffic and DNS runtime forks share the same gate. A permit stays with
 actual carrier I/O through provisional, active, draining, and idle task
 teardown. This gate, not a sum of node-local pool caps, is the authoritative descriptor bound.
@@ -410,15 +411,19 @@ may clamp and reports twice the configured sysctl accounting value; the core
 raises the corresponding maxima at startup.
 
 `bootstrap.rs` prevents proxy-hostname resolution from depending on honk's own
-intercepted DNS path. Node dial sites use `bootstrap::resolve` through
-`connect_marked` or the QUIC setup and never call bare `lookup_host` directly.
-The configured bootstrap resolver is queried over bypass-marked UDP/TCP; failure
-falls back to `/etc/hosts` and marked DNS to the first numeric nameserver in
-`/etc/resolv.conf`. This does not invoke libc NSS or apply search suffixes.
-A and AAAA are queried concurrently, each within its own 3 s budget, and only a
-response matching the random query ID and the exact question is accepted; a truncated UDP answer is retried over marked TCP.
-`query_ech_config` uses the same raw path for DNS HTTPS records (`qtype 65`)
-and extracts the SVCB `ech` parameter.
+intercepted DNS path. Node dial sites must use `bootstrap::resolve` through
+`connect_marked` (`util::connect_marked`) or the QUIC setup in `quic.rs`, never bare `lookup_host`.
+Otherwise proxy-hostname resolution can deadlock against honk's own intercepted DNS path.
+The implementation in `crates/honk-outbound/src/bootstrap.rs` provides dae
+`bootstrap_resolver` parity with a process-wide resolver and a hand-rolled wire codec.
+It queries the configured bootstrap resolver over bypass-marked UDP/TCP. On failure,
+it falls back to `/etc/hosts` and marked DNS to the first numeric nameserver in
+`/etc/resolv.conf`, without libc NSS or search suffixes.
+A and AAAA queries run concurrently, each within its own 3 s budget. The resolver
+accepts only responses matching the random query ID and exact question, and retries
+a truncated UDP answer over marked TCP.
+`tls::discover_ech_config` uses `query_ech_config` for DNS HTTPS records (`qtype 65`)
+and extraction of the SVCB `ech` parameter through the same raw-query path.
 
 After resolution, `src/address_race.rs` schedules proxy-server TCP `connect_marked`
 and shared QUIC `QuicClient` attempts with stable IPv4/IPv6 interleaving and at most
@@ -431,7 +436,6 @@ at the configured ceiling a fallback waits for an earlier attempt to finish;
 already selected node: socket marks and security settings are identical, and
 TCP TLS setup and QUIC protocol setup/authentication run only on the winning transport; QUIC TLS handshakes participate in address racing. Errors are reported deterministically in original address order.
 
-`crates/honk-outbound/src/bootstrap.rs` provides bootstrap DNS resolution for proxy-server hostnames (dae `bootstrap_resolver` parity): process-wide resolver querying over bypass-marked UDP/TCP with a hand-rolled wire codec, falling back to `/etc/hosts` and marked DNS to the first numeric `/etc/resolv.conf` nameserver without libc NSS. Node dials must use it (wired into `util::connect_marked` and `quic.rs`), never bare `lookup_host` — otherwise resolution deadlocks against honk's own intercepted DNS path. Also carries the raw-query path behind ECH discovery: `query_ech_config` (HTTPS RR qtype 65, SVCB `ech` param parsing) used by `tls::discover_ech_config`.
 `crates/honk-outbound/src/util.rs` holds `connect_marked` / `connect_outbound` (TCP `SO_MARK`, keepalive, timeout), `udp_marked_bind`. `marked_udp_socket` requests 8 MiB `SO_RCVBUF`/`SO_SNDBUF`; Linux clamps each request to `rmem_max`/`wmem_max` respectively and reports twice the accounting value. Non-mock honk-core startup attempts to raise `net.core.rmem_max`/`wmem_max` to 16 MiB and only warns on failure: the 208 KiB default caps QUIC at ~2 Gbps/ms RTT. Follow the runtime **Bypass mark** invariant; otherwise `wan_egress` loops sockets into `daens`.
 
 ## TLS, fingerprinting, ECH, and pins
@@ -767,17 +771,18 @@ carriers with live children remain independently and cannot displace the idle
 replacement; idle reaping and unpin removal traverse the pool linearly.
 
 The descriptor partition is fixed at process startup and shared across reloads
-and DNS forks. With `rprx`, it reserves `min(after_dials / 8, 8192)` carrier slots
-before sizing UDP endpoints, even when the initial configuration has no VLESS
-nodes; native VLESS UDP, UoT, and Single XUDP consume this gate too. Without
-`rprx`, no carrier slots are reserved and UDP endpoints retain that headroom.
+and DNS forks. After reserving DNS sockets, `rprx` reserves
+`min(after_dns / 8, 8192)` carrier slots before sizing UDP endpoints, even when
+the initial configuration has no VLESS nodes; native VLESS UDP, UoT, and Single
+XUDP consume this gate too. Without `rprx`, no carrier slots are reserved and
+UDP endpoints retain that headroom.
 Exhaustion returns an immediate typed Capacity refusal, not a wait queue.
 
 | Effective `nofile` | UDP endpoints without carrier reserve | UDP endpoints with carrier reserve | Reduction |
 | ---: | ---: | ---: | ---: |
-| 1,024 | 50 | 44 | 12.00% |
-| 4,096 | 216 | 189 | 12.50% |
-| 65,536 | 4,588 | 4,015 | 12.49% |
+| 1,024 | 45 | 39 | 13.33% |
+| 4,096 | 192 | 168 | 12.50% |
+| 65,536 | 4,563 | 3,992 | 12.51% |
 | 1,048,576 | 32,768 | 32,768 | 0% (endpoint cap) |
 
 These are descriptor-derived limits, not preallocated endpoint memory; startup

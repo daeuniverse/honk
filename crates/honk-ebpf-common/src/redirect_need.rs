@@ -12,6 +12,7 @@ pub struct RoutingResult {
     pub pname: [u8; 16],
     pub pid: u32,
     pub dscp: u8,
+    pub padding: [u8; 3],
     pub decision_token: u32,
 }
 
@@ -25,6 +26,7 @@ const _ROUTING_RESULT_OUTBOUND_OFFSET: () =
 const _ROUTING_RESULT_PNAME_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, pname) == 12);
 const _ROUTING_RESULT_PID_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, pid) == 28);
 const _ROUTING_RESULT_DSCP_OFFSET: () = assert!(core::mem::offset_of!(RoutingResult, dscp) == 32);
+const _: () = assert!(core::mem::offset_of!(RoutingResult, padding) == 33);
 const _ROUTING_RESULT_TOKEN_OFFSET: () =
     assert!(core::mem::offset_of!(RoutingResult, decision_token) == 36);
 
@@ -115,6 +117,23 @@ const _: () = assert!(core::mem::align_of::<SocketIdentity>() == 4);
 const _: () = assert!(core::mem::offset_of!(SocketIdentity, pid) == 0);
 const _: () = assert!(core::mem::offset_of!(SocketIdentity, pname) == 4);
 
+// Field-size sums include explicit padding and recursively checked payloads.
+// Integer flags/indices are not Rust enums or bools: every bit pattern is valid.
+const _: () = {
+    use core::mem::size_of;
+    assert!(size_of::<RoutingResult>() == 4 + 1 + 6 + 1 + 16 + 4 + 1 + 3 + 4);
+    assert!(size_of::<TuplesKey>() == 16 + 16 + 2 + 2 + 1 + 3);
+    assert!(size_of::<RoutingHandoffEntry>() == 8 + size_of::<RoutingResult>() + 8 + 4 + 4 + 8);
+    assert!(size_of::<DomainRouting>() == size_of::<[u32; ROUTING_BITMAP_WORDS]>());
+    assert!(size_of::<SocketIdentity>() == 4 + TASK_COMM_LEN);
+    assert!(
+        size_of::<TcpSocketBinding>()
+            == size_of::<TuplesKey>() + size_of::<RoutingHandoffEntry>() + 4 + 4
+    );
+};
+
+// SAFETY: All fields admit arbitrary bits; the sums above rule out implicit
+// padding, including inside In6Addr and RoutingResult.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for TuplesKey {}
 #[cfg(not(target_arch = "bpf"))]

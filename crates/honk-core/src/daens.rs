@@ -7,12 +7,55 @@ use crate::sysctl::{require_off, set_sysctl};
 #[cfg(feature = "ebpf")]
 use tracing::{info, warn};
 
+/// Validated identity of the daemon-owned `dae0`/`dae0peer` pair, read once
+/// over netlink right after creation (both ends still in the host namespace).
+/// The datapath PARAM is built only from this, so a zero ifindex or MAC never
+/// reaches the kernel.
 #[cfg(feature = "ebpf")]
 #[derive(Debug, Clone)]
 pub struct Dae0Setup {
-    pub ifindex: u32,
-    pub peer_ifindex: u32,
-    pub peer_mac: [u8; 6],
+    ifindex: u32,
+    peer_ifindex: u32,
+    peer_mac: [u8; 6],
+}
+
+#[cfg(feature = "ebpf")]
+impl Dae0Setup {
+    pub fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    pub fn peer_ifindex(&self) -> u32 {
+        self.peer_ifindex
+    }
+
+    pub fn peer_mac(&self) -> [u8; 6] {
+        self.peer_mac
+    }
+
+    fn new(ifindex: u32, peer_ifindex: u32, peer_mac: [u8; 6]) -> anyhow::Result<Self> {
+        anyhow::ensure!(ifindex != 0, "dae0 has no valid ifindex");
+        anyhow::ensure!(peer_ifindex != 0, "dae0peer has no valid ifindex");
+        anyhow::ensure!(peer_mac != [0; 6], "dae0peer has an all-zero MAC address");
+        Ok(Self {
+            ifindex,
+            peer_ifindex,
+            peer_mac,
+        })
+    }
+
+    /// Read through the netlink socket's own namespace, never sysfs (whose
+    /// view is per-mount and ignores a scoped setns).
+    fn read_links(nl: &mut netlink::NlSock, dae0: &str, peer: &str) -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let (ifindex, _) = nl.get_link(dae0).with_context(|| format!("read {dae0}"))?;
+        let (peer_ifindex, peer_mac) = nl.get_link(peer).with_context(|| format!("read {peer}"))?;
+        Self::new(ifindex, peer_ifindex, peer_mac)
+    }
+
+    pub(crate) fn read(nl: &mut netlink::NlSock) -> anyhow::Result<Self> {
+        Self::read_links(nl, "dae0", "dae0peer")
+    }
 }
 
 /// Guard that removes the `dae0` link pair and policy routing when it goes out
@@ -44,7 +87,7 @@ impl Drop for Dae0Guard {
 }
 
 #[cfg(feature = "ebpf")]
-pub(crate) fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
+pub(crate) fn create_dae0_link() -> anyhow::Result<(Dae0Guard, Dae0Setup)> {
     let mut guard = Dae0Guard::new();
 
     // Stale-state cleanup (previous run): drop the compat bind-mount (the
@@ -68,8 +111,8 @@ pub(crate) fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
         .map_err(|e| anyhow::anyhow!("failed to add dae0 link pair: {e}"))?;
     info!(kind = ?link_kind, "Created dae0/dae0peer link pair");
 
-    let dae0_idx = netlink::ifindex_of("dae0")?;
-    let peer_idx = netlink::ifindex_of("dae0peer")?;
+    let setup = Dae0Setup::read(&mut nl)?;
+    let (dae0_idx, peer_idx) = (setup.ifindex(), setup.peer_ifindex());
 
     // These are datapath-critical: a "successful" startup without them is
     // worse than a loud failure.
@@ -112,7 +155,7 @@ pub(crate) fn create_dae0_link() -> anyhow::Result<Dae0Guard> {
     // Enable IPv6 forwarding so daens-originated IPv6 packets reach the LAN.
     let _ = set_sysctl("net.ipv6.conf.all.forwarding", "1");
 
-    Ok(guard)
+    Ok((guard, setup))
 }
 
 #[cfg(feature = "ebpf")]
@@ -616,4 +659,57 @@ fn is_mountpoint(path: &str) -> bool {
     std::fs::read_to_string("/proc/mounts")
         .map(|m| m.lines().any(|l| l.split_whitespace().nth(1) == Some(path)))
         .unwrap_or(false)
+}
+
+/// Fixture for production-load tests: a real `dae0`/`dae0peer` pair in the
+/// caller's (disposable) network namespace, read through the same validated
+/// path as startup. Dropping the guard deletes the pair.
+#[cfg(all(test, feature = "ebpf"))]
+pub(crate) fn create_test_dae0_pair() -> anyhow::Result<(Dae0Guard, Dae0Setup)> {
+    let mut nl = netlink::NlSock::new()?;
+    if let Ok((stale, _)) = nl.get_link("dae0") {
+        nl.del_link(stale)?;
+    }
+    nl.add_link_pair("dae0", "dae0peer")?;
+    let setup = Dae0Setup::read(&mut nl)?;
+    Ok((
+        Dae0Guard {
+            ifindex: setup.ifindex(),
+        },
+        setup,
+    ))
+}
+
+#[cfg(all(test, feature = "ebpf"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_rejects_zero_ifindex_and_zero_mac() {
+        let mac = [0x02, 0, 0, 0, 0, 1];
+        assert!(Dae0Setup::new(1, 2, mac).is_ok());
+        assert!(Dae0Setup::new(0, 2, mac).is_err());
+        assert!(Dae0Setup::new(1, 0, mac).is_err());
+        assert!(Dae0Setup::new(1, 2, [0; 6]).is_err());
+    }
+
+    #[test]
+    fn read_links_reports_missing_link_and_zero_mac() {
+        let mut nl = netlink::NlSock::new().expect("netlink socket");
+        let missing = Dae0Setup::read_links(&mut nl, "honk-no-such0", "lo")
+            .expect_err("missing dae0 must fail");
+        assert!(
+            format!("{missing:#}").contains("honk-no-such0"),
+            "{missing:#}"
+        );
+        let missing_peer = Dae0Setup::read_links(&mut nl, "lo", "honk-no-such1")
+            .expect_err("missing dae0peer must fail");
+        assert!(
+            format!("{missing_peer:#}").contains("honk-no-such1"),
+            "{missing_peer:#}"
+        );
+        // `lo` exists with a nonzero ifindex but an all-zero MAC.
+        let zero_mac = Dae0Setup::read_links(&mut nl, "lo", "lo").expect_err("zero MAC must fail");
+        assert!(format!("{zero_mac:#}").contains("MAC"), "{zero_mac:#}");
+    }
 }

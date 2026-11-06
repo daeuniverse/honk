@@ -658,7 +658,7 @@ pub(super) async fn send_to_with_src(
 }
 
 // Accommodate IPv6 ORIGDST, PKTINFO, packet mark and optional priority records.
-// Capacity is validated before scalar receives and when each batch is built.
+// Capacity is validated when each batch is built.
 const CMSG_CONTROL_CAPACITY: usize = 256;
 const UDP_RECV_BATCH_SIZE: usize = 8;
 const UDP_RECV_PACKET_CAPACITY: usize = 64 * 1024;
@@ -962,80 +962,6 @@ pub(super) async fn recv_batch_from_with_orig_dst(
             batch.recv_now(socket.as_raw_fd(), local_addr)
         })
         .await
-}
-
-/// Receive a UDP datagram and preserve every destination provenance source.
-/// `IP_RECVORIGDSTADDR` / `IPV6_RECVORIGDSTADDR` provide the authoritative
-/// address; packet-info and the listener address are retained only as guarded
-/// fallbacks by [`udp_original_dst`].
-pub(super) async fn recv_from_with_orig_dst(
-    socket: &UdpSocket,
-    local_addr: SocketAddr,
-    buf: &mut [u8],
-) -> io::Result<(usize, SocketAddr, UdpRecvMeta)> {
-    socket
-        .async_io(Interest::READABLE, || {
-            recvmsg_origdst(socket.as_raw_fd(), buf, local_addr)
-        })
-        .await
-}
-
-fn recvmsg_origdst(
-    fd: RawFd,
-    buf: &mut [u8],
-    local_addr: SocketAddr,
-) -> io::Result<(usize, SocketAddr, UdpRecvMeta)> {
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
-        iov_len: buf.len(),
-    };
-    let mut src_addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    if !cmsg_control_capacity_is_sufficient() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recvmsg control buffer cannot hold IPv6 ORIGDST, PKTINFO, mark and priority",
-        ));
-    }
-    // CmsgStorage is naturally aligned and the checked CMSG_SPACE total keeps
-    // the IPv6 provenance records and packet mark from crowding each other out.
-    let mut cmsg_buf = CmsgStorage::new();
-    if !(cmsg_buf.bytes.as_ptr() as usize).is_multiple_of(std::mem::align_of::<libc::cmsghdr>()) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recvmsg control storage is not cmsghdr-aligned",
-        ));
-    }
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_name = &mut src_addr as *mut _ as *mut libc::c_void;
-    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.bytes.as_mut_ptr() as *mut libc::c_void;
-    #[cfg(target_env = "musl")]
-    {
-        msg.msg_controllen = cmsg_buf.bytes.len() as u32;
-    }
-    #[cfg(not(target_env = "musl"))]
-    {
-        msg.msg_controllen = cmsg_buf.bytes.len();
-    }
-
-    let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    let src = sockaddr_to_std(&src_addr, msg.msg_namelen)?;
-    #[cfg(target_env = "musl")]
-    let returned_control_len = msg.msg_controllen as usize;
-    #[cfg(not(target_env = "musl"))]
-    let returned_control_len = msg.msg_controllen;
-    // Only kernel-returned bytes are trusted. A larger value can never make
-    // the parser read past our actual allocation.
-    let control_len = returned_control_len.min(cmsg_buf.bytes.len());
-    let meta = parse_cmsg_control(&cmsg_buf.bytes[..control_len], msg.msg_flags, local_addr)?;
-
-    Ok((n as usize, src, meta))
 }
 
 /// Parse the returned ancillary byte range without looking past

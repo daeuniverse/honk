@@ -5,6 +5,7 @@ impl Worker {
     pub(super) async fn validate(&self, request: ValidationRequest) -> Result<Value, ApiError> {
         let active = self.active.read().await.clone();
         let log_files = self.log_files.clone();
+        let startup_downgrades = self.startup_downgrades.clone();
         let generation = self.diagnostics.read().generation;
         let instance = self.service.instance_id.clone();
         let store = self.store.clone();
@@ -47,7 +48,7 @@ impl Worker {
                     }
                     let validated=offline::validate_for_coordinator(loaded,store.dependency_root(),&active,&data_dir,SourceLimits::DEFAULT,&mut diagnostics,&deferred,None,&documents)?;
                     // A save of this candidate would be refused; a dry run only warns.
-                    diagnostics.extend(restart_diagnostics(&active,&validated.config,&log_files,&validated.sources[0].source,Severity::Warning));
+                    diagnostics.extend(restart_diagnostics(&active,&validated.config,&log_files,&startup_downgrades,&validated.sources[0].source,Severity::Warning));
                     Ok(LoadedConfig {config:validated.config,sources:validated.sources})
                 })()};
             if let Err(error)=&result {
@@ -69,6 +70,7 @@ impl Worker {
             secrets: self.service.secrets_with(&active),
             active,
             log_files: self.log_files.clone(),
+            startup_downgrades: self.startup_downgrades.clone(),
             data_dir: self.data_dir.clone(),
             deferred: self
                 .subscriptions
@@ -86,6 +88,7 @@ pub(super) struct CandidateCheck {
     pub(super) secrets: ListenerSecrets,
     pub(super) active: Arc<Config>,
     pub(super) log_files: LogFiles,
+    pub(super) startup_downgrades: StartupDowngrades,
     pub(super) data_dir: PathBuf,
     pub(super) deferred: Vec<honk_config::subscription::Subscription>,
 }
@@ -184,6 +187,7 @@ impl CandidateCheck {
             active,
             &validated.config,
             &self.log_files,
+            &self.startup_downgrades,
             &written.source,
             Severity::Error,
         );
@@ -251,12 +255,13 @@ pub(super) fn restart_diagnostics(
     active: &Config,
     candidate: &Config,
     log_files: &LogFiles,
+    startup_downgrades: &StartupDowngrades,
     source: &honk_config::diagnostic::SourceRef,
     severity: Severity,
 ) -> Vec<DetailedDiagnostic> {
     use honk_config::diagnostic::{SafeValue, SettingPath, SettingSegment};
 
-    crate::control::restart_required_fields(active, candidate, log_files)
+    crate::control::restart_required_fields(active, candidate, log_files, startup_downgrades)
         .into_iter()
         .map(|field| {
             let mut diagnostic = DetailedDiagnostic::warning(

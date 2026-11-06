@@ -1,6 +1,6 @@
 # DNS configuration reference
 
-`dns { ... }` configures DNS in dae syntax. This reference covers its fields and runtime semantics.
+`dns { ... }` configures DNS in dae syntax.
 
 ## Top-level keys
 
@@ -15,7 +15,7 @@
 | `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
 | `optimistic_cache_ttl` | `600` seconds | Fixed positive-answer cache and wire TTL, excluding NODATA; `0` preserves the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
-| `max_cache_size` | `10000` | Maximum cache entries, at most 100,000. |
+| `max_cache_size` | `10000` | Maximum cache entries, at most 100,000; also determines the per-shard byte budget below. |
 | `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
 
 Scalar values own the remainder of their physical line and split only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` remain intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line; malformed quotes fail the configuration.
@@ -63,9 +63,18 @@ SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule abort
 
 ## EDNS Client Subnet (`client_subnet`)
 
-`client_subnet` applies only to named upstreams. An IPv4 address is a `/32`; an IPv4 CIDR is normalized to its network. `auto` sends bypass-marked UDP probes toward `1.1.1.1:33434`, while `auto(IPv4)` changes only that probe target. It uses the route-selected public local address when available; otherwise it checks at most 12 TTLs with three independent UDP flows per TTL and selects the first public ICMP hop as a `/24`. The probe needs neither DNS nor an HTTP service. Startup, SIGHUP, and route/link/address changes resolve a new immutable value for the replacement DNS generation. A bounded failure disables generated ECS for that generation.
+ECS reveals an approximate client network to upstream authoritative servers. Leave `client_subnet` empty unless CDN locality requires it. The setting applies only to named upstreams.
 
-honk never overrides client-supplied ECS, including `/0`. Generated ECS follows the resolved dial route after both explicit `-> tag` selection and ordinary traffic routing: direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit it. UDP address retries are judged separately, so ECS from a failed direct attempt cannot reach a proxied retry. For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying. The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged. ECS reveals an approximate client network to upstream authoritative servers; leave the field empty unless CDN locality requires it.
+- Explicit value: an IPv4 address is a `/32`; honk normalizes an IPv4 CIDR to its network.
+- Automatic value: `auto` sends bypass-marked UDP probes toward `1.1.1.1:33434`; `auto(IPv4)` changes only that probe target. honk uses the route-selected public local address when available. Otherwise, it checks at most 12 TTLs with three independent UDP flows per TTL, then selects the first public ICMP hop as a `/24`. The probe needs neither DNS nor an HTTP service.
+- Refresh: startup, SIGHUP and route/link/address changes resolve a new immutable value for the replacement DNS generation. A bounded failure disables generated ECS for that generation.
+
+honk never overrides client-supplied ECS, including `/0`. For generated ECS:
+
+- The resolved dial route applies after both explicit `-> tag` selection and ordinary traffic routing. Direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit ECS.
+- honk judges each UDP address retry separately. ECS from a failed direct attempt cannot reach a proxied retry.
+- For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying.
+- The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged.
 
 ## Upstreams
 
@@ -169,7 +178,7 @@ Native `direct(must)` bypass differs from `asis` re-querying; see [DNS source/NA
 
 NXDOMAIN and SERVFAIL bypass response routing and are returned directly, without applying response rules or fallback.
 
-A response traversal has a maximum re-query depth of three upstreams, including the initial upstream; a fourth exchange is rejected. Re-query cycles are also rejected.
+A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle.
 
 ### Legacy conversion
 
@@ -207,7 +216,7 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | `optimistic_cache` | `true` | Enables cache reads and publications. |
 | `optimistic_cache_ttl` | `600` | Overrides the positive answer's minimum TTL for cache lifetime and returned wire RR TTLs, but never applies to NODATA. `0` keeps the answer TTL. |
 | `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. |
-| `max_cache_size` | `10000` | Entry limit, and the only cache limit: an answer of any size occupies one entry. Values above 100,000 are clamped to 100,000 and `0` to one entry, each with a warning. |
+| `max_cache_size` | `10000` | Entry limit, divided across at most 16 shards. Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`; it evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` to one entry, each with a warning. |
 | `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. |
 
 Request routing runs before cache lookup. Cache and background-refresh identity uses the selected upstream or exact `asis` destination, not the raw client source: clients selecting the same exchange scope share entries, while different selected upstreams or `asis` destinations remain isolated. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.

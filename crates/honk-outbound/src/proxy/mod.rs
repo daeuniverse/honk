@@ -40,10 +40,10 @@ pub use outbound::{
     WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
-pub(crate) use packet::{FramePoison, MuxSession, packet_transport_with_owner};
+pub(crate) use packet::{FramePoison, MuxSession};
 pub use packet::{
     MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
-    UdpSocketTransport,
+    UdpSocketTransport, packet_transport_with_owner,
 };
 pub use registry::{ProtocolEntry, ProxyRegistry};
 
@@ -94,48 +94,72 @@ where
     }
 }
 
-struct RuntimeOwnedIo<T> {
-    inner: Box<dyn AsyncReadWrite>,
+/// Keeps an owner alive until after the inner I/O is dropped.
+///
+/// Independently retained I/O handles or driver tasks must retain their own owner.
+pub struct RuntimeOwnedIo<S, T> {
+    inner: S,
     _owner: T,
 }
 
-impl<T> std::fmt::Debug for RuntimeOwnedIo<T> {
+impl<S, T> RuntimeOwnedIo<S, T> {
+    pub fn new(inner: S, owner: T) -> Self {
+        Self {
+            inner,
+            _owner: owner,
+        }
+    }
+}
+
+impl<S, T> std::fmt::Debug for RuntimeOwnedIo<S, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeOwnedIo").finish_non_exhaustive()
     }
 }
 
-impl<T: Unpin> AsyncRead for RuntimeOwnedIo<T> {
+impl<S: AsyncRead + Unpin, T: Unpin> AsyncRead for RuntimeOwnedIo<S, T> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(self.inner.as_mut()).poll_read(cx, buf)
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
-impl<T: Unpin> AsyncWrite for RuntimeOwnedIo<T> {
+impl<S: AsyncWrite + Unpin, T: Unpin> AsyncWrite for RuntimeOwnedIo<S, T> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(self.inner.as_mut()).poll_write(cx, buf)
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(self.inner.as_mut()).poll_flush(cx)
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(self.inner.as_mut()).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -196,13 +220,58 @@ impl ProxyStream {
     where
         T: Send + Unpin + 'static,
     {
-        self.stream = Box::new(RuntimeOwnedIo {
-            inner: self.stream,
-            _owner: owner,
-        });
+        self.stream = Box::new(RuntimeOwnedIo::new(self.stream, owner));
         self
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod runtime_owned_io_tests {
+    use super::RuntimeOwnedIo;
+    use std::io::Read;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+    struct SocketOwner {
+        peer: std::os::unix::net::UnixStream,
+        _permit: OwnedSemaphorePermit,
+    }
+
+    impl Drop for SocketOwner {
+        fn drop(&mut self) {
+            assert_eq!(
+                self.peer.read(&mut [0]).unwrap(),
+                0,
+                "stream socket must close before its credit is released"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn split_stream_retains_owner_until_socket_teardown() {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        stream.set_nonblocking(true).unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let capacity = Arc::new(Semaphore::new(1));
+        let owner = SocketOwner {
+            peer: peer.try_clone().unwrap(),
+            _permit: capacity.clone().acquire_owned().await.unwrap(),
+        };
+        let stream = RuntimeOwnedIo::new(tokio::net::UnixStream::from_std(stream).unwrap(), owner);
+        let (mut reader, writer) = tokio::io::split(stream);
+        let mut peer = tokio::net::UnixStream::from_std(peer).unwrap();
+        drop(writer);
+        assert_eq!(capacity.available_permits(), 0);
+        peer.write_all(b"reply").await.unwrap();
+        let mut reply = [0; 5];
+        reader.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"reply");
+        assert_eq!(capacity.available_permits(), 0);
+        drop(reader);
+        assert_eq!(capacity.available_permits(), 1);
+    }
+}

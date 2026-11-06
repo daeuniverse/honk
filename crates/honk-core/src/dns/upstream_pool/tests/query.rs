@@ -671,7 +671,7 @@ async fn replacing_same_family_pool_preserves_in_flight_exchange() {
         let state = pool.entries["replace"].udp.lock();
         assert_eq!(state.current, None);
         assert_eq!(
-            state.pools[0].as_ref().map(|(address, _)| *address),
+            state.pools[0].as_ref().map(|family| family.address),
             Some(replacement_address)
         );
     }

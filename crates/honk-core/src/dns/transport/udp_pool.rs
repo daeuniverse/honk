@@ -14,16 +14,60 @@ use std::time::{Duration, Instant};
 use honk_outbound::SharedError;
 use parking_lot::Mutex;
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex as TokioMutex, oneshot};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, oneshot};
 
+use super::budget::{DnsSocketBudget, IdlePressureRelease};
 use super::owned_task::OwnedTask;
 
 #[cfg(target_os = "linux")]
 mod error_queue;
 
 const MAX_PENDING: usize = 1024;
-const ID_QUARANTINE: Duration = Duration::from_secs(3);
+const ANSWERED_QUARANTINE: Duration = Duration::from_millis(500);
+const ABANDONED_QUARANTINE: Duration = Duration::from_secs(3);
 const ID_BITMAP_WORDS: usize = (u16::MAX as usize + 1) / u64::BITS as usize;
+
+#[derive(Clone, Copy)]
+enum Retirement {
+    Answered,
+    Abandoned,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("UDP DNS {0}")]
+pub(crate) struct UdpPoolCapacity(
+    &'static str,
+    #[source] honk_outbound::proxy::PacketRejection,
+);
+
+impl UdpPoolCapacity {
+    pub(crate) const PENDING: Self = Self(
+        "exchange pool saturated",
+        honk_outbound::proxy::PacketRejection::Capacity,
+    );
+    pub(crate) const IDS: Self = Self(
+        "IDs exhausted",
+        honk_outbound::proxy::PacketRejection::Capacity,
+    );
+    pub(crate) const SHARDS: Self = Self(
+        "shard admission saturated",
+        honk_outbound::proxy::PacketRejection::Capacity,
+    );
+}
+
+struct SocketOwner {
+    socket: UdpSocket,
+    _permit: OwnedSemaphorePermit,
+    _extra: Option<OwnedSemaphorePermit>,
+}
+
+impl std::ops::Deref for SocketOwner {
+    type Target = UdpSocket;
+
+    fn deref(&self) -> &Self::Target {
+        &self.socket
+    }
+}
 
 struct Pending {
     nonce: u64,
@@ -50,13 +94,30 @@ struct State {
     stopped: Option<SharedError>,
     next_nonce: u64,
     pending: HashMap<u16, Pending>,
-    retired: VecDeque<(Instant, u16)>,
-    retired_ids: [u64; ID_BITMAP_WORDS],
+    answered: VecDeque<(Instant, u16)>,
+    abandoned: VecDeque<(Instant, u16)>,
+    occupied: [u64; ID_BITMAP_WORDS],
+    last_activity: Instant,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            closed: false,
+            stopped: None,
+            next_nonce: 0,
+            pending: HashMap::new(),
+            answered: VecDeque::new(),
+            abandoned: VecDeque::new(),
+            occupied: [0; ID_BITMAP_WORDS],
+            last_activity: Instant::now(),
+        }
+    }
 }
 
 /// One bounded, connected socket for a direct UDP upstream.
 pub struct UdpPool {
-    socket: Arc<UdpSocket>,
+    socket: Arc<SocketOwner>,
     state: Mutex<State>,
     receive_task: TokioMutex<Option<OwnedTask>>,
     timeout: Duration,
@@ -77,7 +138,7 @@ impl Drop for PendingGuard<'_> {
             .is_some_and(|pending| pending.nonce == self.nonce)
         {
             state.pending.remove(&self.id);
-            UdpPool::retire_id(&mut state, self.id);
+            UdpPool::retire_id(&mut state, self.id, Retirement::Abandoned, Instant::now());
         }
     }
 }
@@ -92,11 +153,50 @@ impl UdpPool {
         timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
+        let budget = DnsSocketBudget::default();
+        let permit = budget
+            .acquire_until(tokio::time::Instant::now() + timeout)
+            .await?;
+        Self::new_budgeted(
+            address,
+            timeout,
+            timeout,
+            permit,
+            None,
+            &budget,
+            active_tasks,
+        )
+        .await
+    }
+
+    pub(crate) async fn new_budgeted(
+        address: SocketAddr,
+        timeout: Duration,
+        dial_timeout: Duration,
+        permit: OwnedSemaphorePermit,
+        extra: Option<OwnedSemaphorePermit>,
+        budget: &DnsSocketBudget,
+        active_tasks: Arc<AtomicUsize>,
+    ) -> anyhow::Result<Arc<Self>> {
         let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
             Some(address),
             honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
         );
-        let result = Self::new_tracked_inner(address, timeout, active_tasks).await;
+        let deadline = tokio::time::Instant::now() + dial_timeout;
+        let result = tokio::time::timeout_at(deadline, async {
+            Self::new_tracked_inner(
+                address,
+                timeout,
+                active_tasks,
+                permit,
+                extra,
+                budget.clone(),
+            )
+            .await
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("UDP DNS socket setup timed out"))
+        .and_then(std::convert::identity);
         if let Some(observation) = &mut observation {
             observation.finish(
                 if result.is_ok() {
@@ -116,6 +216,9 @@ impl UdpPool {
         address: SocketAddr,
         timeout: Duration,
         active_tasks: Arc<AtomicUsize>,
+        permit: OwnedSemaphorePermit,
+        extra: Option<OwnedSemaphorePermit>,
+        budget: DnsSocketBudget,
     ) -> anyhow::Result<Arc<Self>> {
         let domain = if address.is_ipv4() {
             socket2::Domain::IPV4
@@ -134,23 +237,20 @@ impl UdpPool {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED)
         };
         socket.bind(&SocketAddr::new(unspecified, 0).into())?;
-        let socket = Arc::new(UdpSocket::from_std(socket.into())?);
+        let socket = Arc::new(SocketOwner {
+            socket: UdpSocket::from_std(socket.into())?,
+            _permit: permit,
+            _extra: extra,
+        });
         socket.connect(address).await?;
         let pool = Arc::new(Self {
             socket: Arc::clone(&socket),
-            state: Mutex::new(State {
-                closed: false,
-                stopped: None,
-                next_nonce: 0,
-                pending: HashMap::new(),
-                retired: VecDeque::new(),
-                retired_ids: [0; ID_BITMAP_WORDS],
-            }),
+            state: Mutex::new(State::new()),
             receive_task: TokioMutex::new(None),
             timeout,
         });
         let receive_task = OwnedTask::spawn(
-            Self::receive_loop(Arc::downgrade(&pool), socket),
+            Self::receive_loop(Arc::downgrade(&pool), socket, budget),
             active_tasks,
         );
         pool.receive_task.lock().await.replace(receive_task);
@@ -163,16 +263,31 @@ impl UdpPool {
         state.closed || state.stopped.is_some()
     }
 
+    pub(crate) fn pending_count(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
+    pub(crate) fn is_idle(&self, now: Instant, idle_timeout: Duration) -> bool {
+        let state = self.state.lock();
+        state.pending.is_empty()
+            && now.saturating_duration_since(state.last_activity) >= idle_timeout
+    }
+
     pub(crate) async fn close(&self) {
         {
             let mut state = self.state.lock();
             state.closed = true;
-            state.pending.clear();
+            let pending = std::mem::take(&mut state.pending);
+            let now = Instant::now();
+            for id in pending.keys() {
+                Self::retire_id(&mut state, *id, Retirement::Abandoned, now);
+            }
         }
-        let receive_task = self.receive_task.lock().await.take();
-        if let Some(receive_task) = receive_task {
-            receive_task.shutdown(Duration::ZERO).await;
+        let mut receive_task = self.receive_task.lock().await;
+        if let Some(task) = receive_task.as_ref() {
+            task.shutdown(Duration::ZERO).await;
         }
+        receive_task.take();
     }
 
     pub async fn exchange(
@@ -194,17 +309,18 @@ impl UdpPool {
             if let Some(failure) = &state.stopped {
                 return Err(anyhow::Error::new(failure.clone()));
             }
-            Self::purge_retired(&mut state);
+            Self::purge_retired(&mut state, Instant::now());
             if state.pending.len() >= MAX_PENDING {
-                anyhow::bail!("UDP DNS exchange pool saturated");
+                return Err(UdpPoolCapacity::PENDING.into());
             }
-            let id = Self::allocate_id(&state)
-                .ok_or_else(|| anyhow::anyhow!("UDP DNS IDs exhausted"))?;
+            let id = Self::allocate_id(&state).ok_or(UdpPoolCapacity::IDS)?;
             let nonce = state
                 .next_nonce
                 .checked_add(1)
                 .ok_or_else(|| anyhow::anyhow!("UDP DNS registration nonce exhausted"))?;
             state.next_nonce = nonce;
+            Self::set_occupied(&mut state, id, true);
+            state.last_activity = Instant::now();
             state.pending.insert(
                 id,
                 Pending {
@@ -253,7 +369,7 @@ impl UdpPool {
             state.stopped.get_or_insert_with(|| failure.clone());
             let pending = std::mem::take(&mut state.pending);
             for id in pending.keys() {
-                Self::retire_id(&mut state, *id);
+                Self::retire_id(&mut state, *id, Retirement::Abandoned, Instant::now());
             }
             pending
         };
@@ -262,7 +378,7 @@ impl UdpPool {
         }
     }
 
-    fn take_pending(&self, wire: &[u8]) -> Option<Pending> {
+    fn take_pending(&self, wire: &[u8], retirement: Retirement) -> Option<Pending> {
         let end = Self::question_end(wire).ok()?;
         let id = u16::from_be_bytes([wire[0], wire[1]]);
         let mut state = self.state.lock();
@@ -270,11 +386,11 @@ impl UdpPool {
             return None;
         }
         let pending = state.pending.remove(&id);
-        Self::retire_id(&mut state, id);
+        Self::retire_id(&mut state, id, retirement, Instant::now());
         pending
     }
 
-    async fn receive_loop(pool: Weak<Self>, socket: Arc<UdpSocket>) {
+    async fn receive_loop(pool: Weak<Self>, socket: Arc<SocketOwner>, budget: DnsSocketBudget) {
         let mut buffer = vec![0; 65535];
         #[cfg(target_os = "linux")]
         let mut quote = [0; 512];
@@ -292,7 +408,8 @@ impl UdpPool {
                     socket.recv(&mut buffer).await.map(Received::Datagram)
                 }
             };
-            let event = tokio::time::timeout(Duration::from_secs(1), receive).await;
+            let event = receive.await;
+            let _release = IdlePressureRelease(&budget);
             let Some(pool) = pool.upgrade() else {
                 break;
             };
@@ -300,18 +417,20 @@ impl UdpPool {
                 break;
             }
             match event {
-                Err(_) => {}
-                Ok(Ok(Received::Datagram(length))) => {
-                    if let Some(pending) = pool.take_pending(&buffer[..length]) {
+                Ok(Received::Datagram(length)) => {
+                    if let Some(pending) =
+                        pool.take_pending(&buffer[..length], Retirement::Answered)
+                    {
                         let mut response = buffer[..length].to_vec();
                         response[..2].copy_from_slice(&pending.original_id);
                         let _ = pending.reply.send(Ok(response));
                     }
                 }
                 #[cfg(target_os = "linux")]
-                Ok(Ok(Received::ErrorQuote(length, error))) => {
+                Ok(Received::ErrorQuote(length, error)) => {
                     if let Some(error) = error
-                        && let Some(pending) = pool.take_pending(&quote[..length])
+                        && let Some(pending) =
+                            pool.take_pending(&quote[..length], Retirement::Abandoned)
                     {
                         let failure = SharedError::new(
                             anyhow::Error::new(error).context("UDP DNS receive failed"),
@@ -320,11 +439,11 @@ impl UdpPool {
                     }
                     tokio::task::yield_now().await;
                 }
-                Ok(Err(error)) if socket_failed(&error) => {
+                Err(error) if socket_failed(&error) => {
                     pool.stop(error);
                     break;
                 }
-                Ok(Err(_)) => {
+                Err(_) => {
                     // recv may report a delayed packet error without its quote. The
                     // error-queue branch owns attribution; no pending query is removed.
                     tokio::task::yield_now().await;
@@ -333,33 +452,38 @@ impl UdpPool {
         }
     }
 
-    fn purge_retired(state: &mut State) {
-        let now = Instant::now();
-        while state
-            .retired
-            .front()
-            .is_some_and(|(until, _)| *until <= now)
-        {
-            if let Some((_, id)) = state.retired.pop_front() {
-                Self::set_retired(state, id, false);
+    fn purge_retired(state: &mut State, now: Instant) {
+        for queue in [&mut state.answered, &mut state.abandoned] {
+            while queue.front().is_some_and(|(until, _)| *until <= now) {
+                let (_, id) = queue.pop_front().expect("expired ID is present");
+                let id = usize::from(id);
+                state.occupied[id / u64::BITS as usize] &= !(1u64 << (id % u64::BITS as usize));
             }
         }
     }
-    fn retire_id(state: &mut State, id: u16) {
-        Self::set_retired(state, id, true);
-        state
-            .retired
-            .push_back((Instant::now() + ID_QUARANTINE, id));
+
+    fn retire_id(state: &mut State, id: u16, retirement: Retirement, now: Instant) {
+        Self::set_occupied(state, id, true);
+        state.last_activity = now;
+        let (queue, quarantine) = match retirement {
+            Retirement::Answered => (&mut state.answered, ANSWERED_QUARANTINE),
+            Retirement::Abandoned => (&mut state.abandoned, ABANDONED_QUARANTINE),
+        };
+        queue.push_back((now + quarantine, id));
     }
+
+    #[cfg(test)]
     fn is_retired(state: &State, id: u16) -> bool {
-        let id = usize::from(id);
-        state.retired_ids[id / u64::BITS as usize] & (1u64 << (id % u64::BITS as usize)) != 0
+        let index = usize::from(id);
+        state.occupied[index / u64::BITS as usize] & (1u64 << (index % u64::BITS as usize)) != 0
+            && !state.pending.contains_key(&id)
     }
-    fn set_retired(state: &mut State, id: u16, retired: bool) {
+
+    fn set_occupied(state: &mut State, id: u16, occupied: bool) {
         let id = usize::from(id);
-        let word = &mut state.retired_ids[id / u64::BITS as usize];
+        let word = &mut state.occupied[id / u64::BITS as usize];
         let mask = 1u64 << (id % u64::BITS as usize);
-        if retired {
+        if occupied {
             *word |= mask;
         } else {
             *word &= !mask;
@@ -394,10 +518,17 @@ impl UdpPool {
     }
 
     fn allocate_id_from(state: &State, start: u16) -> Option<u16> {
-        for offset in 0..=u16::MAX {
-            let id = start.wrapping_add(offset);
-            if !state.pending.contains_key(&id) && !Self::is_retired(state, id) {
-                return Some(id);
+        let start = usize::from(start);
+        let first_word = start / u64::BITS as usize;
+        let first_bit = start % u64::BITS as usize;
+        for offset in 0..ID_BITMAP_WORDS {
+            let index = (first_word + offset) % ID_BITMAP_WORDS;
+            let free = !state.occupied[index];
+            if free != 0 {
+                let bit = (free.rotate_right(first_bit as u32).trailing_zeros() as usize
+                    + first_bit)
+                    % u64::BITS as usize;
+                return Some((index * u64::BITS as usize + bit) as u16);
             }
         }
         None
@@ -470,6 +601,8 @@ mod tests {
             let state = pool.state.lock();
             assert!(UdpPool::is_retired(&state, first_id));
             assert_ne!(UdpPool::allocate_id_from(&state, first_id), Some(first_id));
+            assert!(state.answered.iter().any(|(_, id)| *id == first_id));
+            assert!(state.abandoned.is_empty());
         }
         pool.exchange(&query(0x5678), None).await.unwrap();
 
@@ -499,6 +632,11 @@ mod tests {
                         .downcast_ref::<io::Error>()
                         .is_some_and(|error| error.raw_os_error() == Some(libc::ECONNREFUSED))
                 }));
+            }
+            {
+                let state = pool.state.lock();
+                assert_eq!(state.abandoned.len(), 9);
+                assert!(state.answered.is_empty());
             }
             let server = UdpSocket::bind(address).await.unwrap();
             let respond = async {
@@ -599,6 +737,8 @@ mod tests {
             let state = pool.state.lock();
             assert!(!state.pending.contains_key(&first_id));
             assert!(UdpPool::is_retired(&state, first_id));
+            assert!(state.abandoned.iter().any(|(_, id)| *id == first_id));
+            assert!(state.answered.is_empty());
         }
 
         let second_pool = Arc::clone(&pool);
@@ -673,25 +813,128 @@ mod tests {
     }
 
     #[test]
-    fn retired_id_bitmap_tracks_expiry_without_history_scans() {
-        let mut state = State {
-            closed: false,
-            stopped: None,
-            next_nonce: 0,
-            pending: HashMap::new(),
-            retired: VecDeque::new(),
-            retired_ids: [0; ID_BITMAP_WORDS],
-        };
-        for id in 0..32_768 {
-            UdpPool::retire_id(&mut state, id);
-        }
+    fn answered_and_abandoned_ids_expire_independently() {
+        let now = Instant::now();
+        let mut state = State::new();
+        UdpPool::retire_id(&mut state, 0, Retirement::Abandoned, now);
+        UdpPool::retire_id(
+            &mut state,
+            1,
+            Retirement::Answered,
+            now + Duration::from_secs(2),
+        );
+        UdpPool::retire_id(
+            &mut state,
+            2,
+            Retirement::Answered,
+            now + Duration::from_millis(2100),
+        );
 
+        UdpPool::purge_retired(&mut state, now + Duration::from_millis(2500));
         assert!(UdpPool::is_retired(&state, 0));
-        assert!(UdpPool::is_retired(&state, 32_767));
-        assert_eq!(UdpPool::allocate_id_from(&state, 0), Some(32_768));
+        assert!(!UdpPool::is_retired(&state, 1));
+        assert!(UdpPool::is_retired(&state, 2));
+        assert_eq!(UdpPool::allocate_id_from(&state, 1), Some(1));
 
-        state.retired.front_mut().unwrap().0 = Instant::now() - Duration::from_secs(1);
-        UdpPool::purge_retired(&mut state);
-        assert!(!UdpPool::is_retired(&state, 0));
+        UdpPool::purge_retired(&mut state, now + Duration::from_secs(3));
+        assert!(state.answered.is_empty());
+        assert!(state.abandoned.is_empty());
+        assert_eq!(UdpPool::allocate_id_from(&state, 0), Some(0));
+    }
+
+    #[test]
+    fn occupied_bitmap_finds_the_only_free_id_from_every_word_boundary() {
+        let mut state = State::new();
+        state.occupied.fill(u64::MAX);
+        assert_eq!(UdpPool::allocate_id_from(&state, 0), None);
+        for free in [0, 1, 63, 64, 32768, u16::MAX] {
+            UdpPool::set_occupied(&mut state, free, false);
+            for start in [0, 63, 64, 32767, 32768, u16::MAX] {
+                assert_eq!(UdpPool::allocate_id_from(&state, start), Some(free));
+            }
+            UdpPool::set_occupied(&mut state, free, true);
+        }
+    }
+
+    #[tokio::test]
+    async fn id_exhaustion_is_a_pre_send_capacity_refusal() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = UdpPool::new(server.local_addr().unwrap(), Duration::from_secs(1))
+            .await
+            .unwrap();
+        pool.state.lock().occupied.fill(u64::MAX);
+        let error = pool.exchange(&query(1), None).await.unwrap_err();
+        assert!(error.is::<UdpPoolCapacity>());
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+        let mut wire = [0; 512];
+        assert_eq!(
+            server.try_recv_from(&mut wire).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn saturation_rejects_registration_without_sending_another_packet() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let pool = UdpPool::new(server.local_addr().unwrap(), Duration::from_secs(60))
+            .await
+            .unwrap();
+        let mut exchanges = tokio::task::JoinSet::new();
+        let mut wire = [0; 512];
+        for id in 0..MAX_PENDING {
+            let pool = Arc::clone(&pool);
+            exchanges.spawn(async move { pool.exchange(&query(id as u16), None).await });
+            server.recv_from(&mut wire).await.unwrap();
+        }
+        let error = pool.exchange(&query(0xffff), None).await.unwrap_err();
+        assert!(error.is::<UdpPoolCapacity>());
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+        assert_eq!(
+            server.try_recv_from(&mut wire).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        exchanges.abort_all();
+        while exchanges.join_next().await.is_some() {}
+        assert_eq!(pool.pending_count(), 0);
+        assert_eq!(pool.state.lock().abandoned.len(), MAX_PENDING);
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn dropped_receive_task_retains_credit_until_its_socket_is_destroyed() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let budget = DnsSocketBudget::new(1);
+        let permit = budget.try_acquire().unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let pool = UdpPool::new_budgeted(
+            server.local_addr().unwrap(),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            permit,
+            None,
+            &budget,
+            Arc::clone(&active),
+        )
+        .await
+        .unwrap();
+        let socket = Arc::clone(&pool.socket);
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(budget.available_sockets(), 0);
+        drop(socket);
+        assert_eq!(budget.available_sockets(), 1);
     }
 }

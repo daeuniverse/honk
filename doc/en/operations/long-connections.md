@@ -4,7 +4,7 @@ honk does not synthesize application keepalives. Keeping a transport carrier ope
 
 ## UDP: replies keep the endpoint alive
 
-An endpoint retires after **120 s without a reply**; successful sends and carrier keepalives do not reset that timer. Pure-uplink flows expire even while sending, and the next packet may create a new endpoint if admission permits; old packets are not replayed. A never-replied flow settles Score as timeout; after a delivered reply, later idle retirement is health-neutral and settles Score as success.
+An endpoint retires after **120 s without a reply**; successful sends and carrier keepalives do not reset that timer. Pure-uplink flows expire even while sending. The next packet may create a new endpoint if admission permits; old packets are not replayed. A never-replied flow settles Score as timeout. After a delivered reply, later idle retirement is health-neutral and settles Score as success.
 
 Each ordinary no-reply expiry counts as a `DataUdp` health failure. After a node's 60 s registration grace, 50 consecutive counted failures make it unavailable for that probe domain/address family. Delivered replies or successful probes for the same key reset the run, not sends alone. A shared UDP association reports one no-reply health failure only if it sent data and never received a reply: once another destination has replied, an unreplied view can still expire with a Score timeout, but neither demotes nor retires the whole source. See [health and Score](../design/groups.md).
 

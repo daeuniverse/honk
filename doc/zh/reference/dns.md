@@ -1,6 +1,6 @@
 # DNS 配置参考
 
-本页列出 dae 语法的 `dns { ... }` 配置段及其运行时语义。
+`dns { ... }` 配置段使用 dae 语法，运行时语义如下。
 
 ## 顶层键
 
@@ -15,7 +15,7 @@
 | `optimistic_cache` | `true` | 启用正、负缓存的读取与写入。 |
 | `optimistic_cache_ttl` | `600` 秒 | 固定正应答的缓存和报文 TTL，不适用于 NODATA；`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用的 TTL；非零值替换每个非 OPT RR 的 TTL，`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL。 |
-| `max_cache_size` | `10000` | 缓存最大条目数，最大 100,000。 |
+| `max_cache_size` | `10000` | 缓存最大条目数，最大 100,000；同时决定下文的分片字节预算。 |
 | `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答和 NODATA 的 TTL；`0` 禁止缓存所有响应码的应答，包括负应答。 |
 
 标量值占据该物理行的剩余部分，只在键后的冒号处分隔，因此裸写的 IPv6 地址和 `client_subnet: auto(9.9.9.9)` 保持完整。解析器只移除一对包围整个值的匹配引号。已开启的标量引号必须在同一行闭合，否则配置失败。
@@ -24,7 +24,7 @@
 
 ## 独立监听器（`bind`）
 
-独立监听器使用 host 网络命名空间中的普通、未打 bypass mark 的 socket。关闭它不会关闭透明 TCP/UDP 53 端口拦截；透明路径遵循[流量规则所有权](./routing.md#出站目标与-must)。
+独立监听器使用主机网络命名空间中的普通套接字，不设置旁路标记。关闭它不会关闭透明 TCP/UDP 53 端口拦截；透明路径遵循[流量规则所有权](./routing.md#出站目标与-must)。
 
 | 值 | 结果 |
 | --- | --- |
@@ -36,9 +36,9 @@
 
 主机名必须带 scheme，例如 `udp://localhost:1053`。IPv6 字面量必须使用方括号。`tcp+udp://:1053` 这样的空 host 表示通配地址。每种形式都必须显式给出十进制 `u16` 端口。端口 `0` 表示申请临时端口；honk 会记录最终选择的地址。
 
-裸主机名无效。解析器也会拒绝 userinfo、path、query、fragment、反斜杠、IPv6 zone identifier、错误的方括号、不支持的 scheme 和超出范围的端口。使用主机名时，honk 按系统解析顺序尝试地址，并使用第一个能让全部请求 transport 成功 bind 的地址。bind 同步且 all-or-nothing：任一失败都会关闭其他已选 socket 并令启动失败。
+裸主机名无效。解析器也会拒绝 userinfo、path、query、fragment、反斜杠、IPv6 zone identifier、错误的方括号、不支持的 scheme 和超出范围的端口。使用主机名时，honk 按系统解析顺序尝试地址，选择第一个能让全部请求传输成功绑定的地址。绑定同步执行，必须全部成功；任一绑定失败都会关闭其他已选套接字，并令启动失败。
 
-监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但 host、port 或 transport 集合的任何变化都会作为 restart-required 被拒绝。通配或 LAN 侧 bind 会暴露一个无认证的递归 resolver；必须用主机防火墙限制来源，绝不能发布到不可信网络。
+监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但主机、端口或传输集合的任何变化都会因需要重启而被拒绝。通配或 LAN 侧绑定会暴露一个无认证的递归解析器；必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
 监听 `:53` 不会抢先于 LAN 流量策略接收查询：即使 dnsmasq 或 `dns.bind` 占用该 socket，非 `must` 的 LAN TCP/UDP53 查询仍进入 honk 透明 DNS。主机 loopback 和显式原生 `direct(must)` 交付仍可到达该普通监听器；见[监听器矩阵](../design/dns.md#dns-所有权状态机)。
 
@@ -59,13 +59,22 @@ dns {
 
 在 `ipv4only`/`ipv6only` 的硬地址族过滤之后，已知名称的 IN class A 或 AAAA 查询优先于 request 规则（包括 `reject`）、缓存查询和上游交换。名称存在但没有所请求地址族时，honk 返回 NOERROR/NODATA，且不查询上游。其他 class 和 qtype 继续走正常管线。Hosts 应答使用 60 秒 TTL，并绕过 honk 的 DNS 缓存。
 
-SIGHUP 会构建新快照。任一来源不可读或自定义规则无效时启动失败；重载时，替换 generation 会在发布前失败，当前 generation 继续使用。
+SIGHUP 会构建新快照。任一来源不可读或自定义规则无效时，启动失败；重载时，新运行时代次会在发布前失败，当前运行时代次继续运行。
 
 ## EDNS Client Subnet（`client_subnet`）
 
-`client_subnet` 只作用于命名上游。IPv4 地址表示 `/32`；IPv4 CIDR 会归一化到网络地址。`auto` 向 `1.1.1.1:33434` 发送带 bypass mark 的 UDP 探测，`auto(IPv4)` 只替换该探测目标。若路由选出的本地地址是公网地址则直接使用；否则每个 TTL 使用 3 个独立 UDP flow、最多检查 12 个 TTL，并把首个公网 ICMP hop 作为 `/24`。探测不依赖 DNS 或 HTTP 服务。启动、SIGHUP 以及 route/link/address 变化会为替换 DNS generation 解析一个新的不可变值；有界探测失败时，该 generation 不生成 ECS。
+ECS 会向上游权威服务器暴露近似的客户端网络。只有 CDN 本地性确有需要时才应设置 `client_subnet`，否则请留空。该设置只作用于命名上游。
 
-honk 不会覆盖客户端自带的 ECS，包括 `/0`。生成的 ECS 会在显式 `-> tag` 选择和普通流量路由都完成后，跟随最终解析出的拨号路径：直连尝试（包括 `-> direct`）可以注入；解析出代理 leaf 的尝试不注入。UDP 地址重试会逐次独立判断，因此失败的直连尝试所带 ECS 不会进入后续代理重试。对于没有 ECS 且发往合格命名上游的查询，honk 在 cache/singleflight 接纳后添加配置的 option，校验上游回显的 ECS，并在缓存或答复前只移除自身注入的状态。有效 prefix 会进入 DNS policy identity，因此自动 prefix 变化前后的应答不会交叉复用。`asis` 请求保持逐字节不变。ECS 会向上游权威服务器暴露近似客户端网络；只有 CDN 本地性确有需要时才应启用。
+- 显式值：IPv4 地址表示 `/32`；honk 将 IPv4 CIDR 规范化为网络地址。
+- 自动值：`auto` 向 `1.1.1.1:33434` 发送带绕过标记的 UDP 探测；`auto(IPv4)` 只替换探测目标。路由选出的本地地址为公网地址时，honk 直接使用它。否则，每个 TTL 使用 3 个独立 UDP 流，最多检查 12 个 TTL，将首个公网 ICMP 路由跳点作为 `/24`。探测不依赖 DNS 或 HTTP 服务。
+- 刷新：启动、SIGHUP 以及路由、链路或地址变化会为替换的 DNS 运行时代次解析一个新的不可变值。有界探测失败时，该代次不生成 ECS。
+
+honk 不会覆盖客户端自带的 ECS，包括 `/0`。生成的 ECS 遵循以下规则：
+
+- 显式 `-> tag` 选择和普通流量路由都完成后，以最终解析出的拨号路径为准。直连尝试（包括 `-> direct`）可以注入 ECS；使用代理叶节点的尝试不注入。
+- honk 独立判断每次 UDP 地址重试。失败的直连尝试所带 ECS 不会进入后续代理重试。
+- 对于没有 ECS 且发往合格命名上游的查询，honk 在缓存／同键请求合并准入后添加配置的选项，校验上游回显的 ECS，并在缓存或答复前只移除自身注入的状态。
+- 有效前缀参与 DNS 策略身份，因此自动前缀变化前后的应答不会交叉复用。`asis` 请求保持逐字节不变。
 
 ## 上游
 
@@ -104,7 +113,7 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 
 ### 出站选择
 
-末尾的 `-> tag` 强制该上游经过指定节点或组。省略时，honk 会解析上游目的地址并应用普通流量的 `routing { ... }` 规则；该路由仍可选择代理 leaf。旧版同一行写法 `name: 'uri' outbound: tag` 仍然接受。
+末尾的 `-> tag` 强制该上游经过指定节点或组。省略时，honk 会解析上游目的地址并应用普通流量的 `routing { ... }` 规则；该路由仍可选择代理叶节点。旧版同一行写法 `name: 'uri' outbound: tag` 仍然接受。
 
 只有引号外的 `->` 与 `outbound:` 后缀选择出站。它们在 URI 引号内仍是数据；与旧版拆分结果不同的写法产生 `legacy-upstream-separator` 警告。引号外词法单元开头的 `#` 开始行尾注释，行为变化产生 `legacy-upstream-comment`。注释和出站后缀请放在 URI 引号外。
 
@@ -167,7 +176,7 @@ DNS `sip()` 与 `ip()` 共用 IP/CIDR 解码器。裸 IPv4 和 IPv6 地址分别
 | 上游名 | 通过该命名上游重新查询，然后再次执行 response 路由。 |
 | `fallback: accept\|reject\|<upstream>` | 无 response 规则匹配时使用的判定或命名上游；默认为 `accept`。 |
 
-NXDOMAIN 和 SERVFAIL 应答会直接返回，不经过应答路由，也不应用应答规则或回退动作。
+NXDOMAIN 和 SERVFAIL 应答直接返回，不经过应答路由，也不应用其规则或回退动作。
 
 一次 response 遍历的最大重新查询深度为三个上游，其中包括初始上游；第四次交换会被拒绝。重新查询形成环路时也会被拒绝。
 
@@ -207,7 +216,7 @@ NXDOMAIN 和 SERVFAIL 应答会直接返回，不经过应答路由，也不应�
 | `optimistic_cache` | `true` | 启用缓存读取与发布。 |
 | `optimistic_cache_ttl` | `600` | 覆盖正应答的最小 TTL，用于缓存生命周期和返回的记录 TTL，不适用于 NODATA。`0` 保留应答 TTL。 |
 | `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用此 TTL；非零值替换每个非 OPT RR 的 TTL。`0` 保留缓存中已按策略改写的 wire TTL，而不是权威 TTL；此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，不存在正 TTL 时回退为 60 秒。非零值时，即使不存在正 TTL，outcome TTL 仍为配置值。 |
-| `max_cache_size` | `10000` | 条目上限，也是缓存唯一的上限：任意大小的应答都只占一个条目。大于 100,000 的值钳制为 100,000，`0` 钳制为一个条目，两者均会告警。 |
+| `max_cache_size` | `10000` | 条目上限，由最多 16 个分片分摊。每个分片的应答字节预算为 `max(条目容量 × 1 KiB, 65,535 字节)`；按 LRU 淘汰直到两个上限都满足。单条超过 65,535 字节的应答不缓存。大于 100,000 的值钳制为 100,000，`0` 钳制为一个条目，两者均会告警。 |
 | `fixed_domain_ttl { domain: seconds }` | 空 | 先于 `optimistic_cache_ttl` 应用的按域名覆盖；`0` 禁止缓存所有响应码的应答，包括 NXDOMAIN 和 SERVFAIL。 |
 
 Request 路由先于缓存查询执行。缓存与后台刷新的标识使用选中的上游或精确 `asis` 目的地址，不使用原始客户端来源：选择相同交换 scope 的客户端共享条目，选择不同上游或 `asis` 目的地址的客户端仍相互隔离。偏好地址族的渲染继续保留来源元数据，因此依赖来源的 sibling 策略不会经 foreground singleflight 泄漏。

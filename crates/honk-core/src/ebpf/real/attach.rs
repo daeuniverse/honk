@@ -19,13 +19,15 @@ impl Drop for StartupPins<'_> {
 }
 
 impl RealEbpfBackend {
+    /// `local_ip` is the IPv4 (`u32::from_ne_bytes` of the octets) of the first
+    /// resolved LAN, else WAN, interface; 0 when it has none. No configured
+    /// interface is attached here: `bind_interfaces` does that.
     pub async fn load(
         obj: &[u8],
         pin_root: &Path,
         tproxy_port: u16,
-        lan_ifname: Option<&str>,
-        wan_ifname: &str,
-        single_homed: bool,
+        dae0: &crate::daens::Dae0Setup,
+        local_ip: u32,
     ) -> anyhow::Result<Self> {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
@@ -46,36 +48,9 @@ impl RealEbpfBackend {
             u8::from(crate::netlink::ipv6_socket_available().context("probe IPv6 socket family")?);
 
         info!("Loading eBPF programs ({} bytes)", obj.len());
-        let dae0_ifindex = crate::netlink::ifindex_of("dae0").unwrap_or(0);
-        let dae0peer_ifindex = crate::netlink::ifindex_of("dae0peer").unwrap_or(0);
-        let dae0peer_mac = std::fs::read_to_string("/sys/class/net/dae0peer/address")
-            .ok()
-            .map(|s| {
-                let mut mac = [0u8; 6];
-                for (i, b) in s.trim().split(':').enumerate().take(6) {
-                    mac[i] = u8::from_str_radix(b, 16).unwrap_or(0);
-                }
-                mac
-            })
-            .unwrap_or([0u8; 6]);
-        let ebpf_lan_ifname = lan_ifname
-            .map(|name| Self::bridge_interface(name).unwrap_or_else(|| name.to_string()))
-            .unwrap_or_default();
-        // Determine the actual WAN interface (bond master if the configured
-        // interface is a slave) so the eBPF datapath can identify locally-
-        // generated packets that the bonding driver forwards onto the master.
-        let ebpf_wan_ifname = if single_homed {
-            ebpf_lan_ifname.clone()
-        } else {
-            Self::bridge_interface(wan_ifname).unwrap_or_else(|| wan_ifname.to_string())
-        };
-        let wan_ifindex = crate::netlink::ifindex_of(&ebpf_wan_ifname).unwrap_or(0);
-        let local_ifname = if ebpf_lan_ifname.is_empty() {
-            &ebpf_wan_ifname
-        } else {
-            &ebpf_lan_ifname
-        };
-
+        let (dae0_ifindex, dae0peer_ifindex, dae0peer_mac) =
+            (dae0.ifindex(), dae0.peer_ifindex(), dae0.peer_mac());
+        let wan_ifindex = 0u32;
         // Enable bpf_redirect_peer on kernels >= 6.8, and also on backported
         // LTS kernels that received the CVE-2024-37959 fix:
         //   5.15.164+, 6.1.99+, 6.6.40+
@@ -119,12 +94,12 @@ impl RealEbpfBackend {
             dae_socket_mark: honk_outbound::util::bypass_mark(),
             control_plane_pid: std::process::id(),
             tcp_daens_netns_id,
-            local_ip: Self::iface_ipv4(local_ifname).unwrap_or(0),
+            local_ip,
             ..Default::default()
         };
         debug!(
-            "PARAM: port={} dae0_ifindex={} wan_ifindex={} (iface={})",
-            tproxy_port, dae0_ifindex, wan_ifindex, ebpf_wan_ifname
+            "PARAM: port={} dae0_ifindex={} local_ip={:#x}",
+            tproxy_port, dae0_ifindex, local_ip
         );
         std::fs::create_dir_all(pin_root)?;
         let sequence_pin = pin_root.join(UDP_DECISION_SEQUENCE_MAP);
@@ -140,7 +115,7 @@ impl RealEbpfBackend {
         let _ = std::fs::remove_file(pin_root.join("LISTEN_SOCKET_MAP"));
         let mut loader = EbpfLoader::new();
         loader
-            .btf(Some(&kernel_btf))
+            .btf(&kernel_btf)
             .override_global("PARAM", &dae_param, true)
             .override_global("WAN_IFINDEX", &wan_ifindex, true)
             .override_global("DAE0PEER_IFINDEX", &dae0peer_ifindex, true)
@@ -301,198 +276,10 @@ impl RealEbpfBackend {
                 .map_err(|e| anyhow::anyhow!("OUTBOUND_CONNECTIVITY_MAP init: {e}"))?;
         }
 
-        if ebpf_lan_ifname.is_empty() {
-            info!("LAN interception disabled; attaching only configured WAN hooks");
-        } else {
-            info!(
-                "Attaching eBPF TC programs to LAN interface: {} (configured: {})",
-                ebpf_lan_ifname,
-                lan_ifname.unwrap_or_default()
-            );
-        }
-        let (lan_ingress_prog, lan_egress_prog) = Self::lan_program_pair(&ebpf_lan_ifname);
-        // Primary hooks share the watcher-owned table so an interface rebind
-        // can drop the old TCX fd before attaching its replacement.
-        let mut interface_links = Vec::new();
-
-        if !ebpf_lan_ifname.is_empty() {
-            interface_links.push(
-                Self::attach_tc_owned(
-                    &mut bpf,
-                    lan_ingress_prog,
-                    &ebpf_lan_ifname,
-                    aya::programs::TcAttachType::Ingress,
-                )
-                .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_ingress_prog, e))?,
-            );
-        }
-        // In a single-homed setup (LAN and WAN share the same physical
-        // interface) attaching lan_egress to the host's only outbound interface
-        // would drop the host's own traffic. Attach only ingress in that case.
-        if !ebpf_lan_ifname.is_empty() {
-            if single_homed {
-                info!("Single-homed interface detected; skipping lan_egress attach");
-            } else {
-                interface_links.push(
-                    Self::attach_tc_owned(
-                        &mut bpf,
-                        lan_egress_prog,
-                        &ebpf_lan_ifname,
-                        aya::programs::TcAttachType::Egress,
-                    )
-                    .map_err(|e| anyhow::anyhow!("attach {}: {}", lan_egress_prog, e))?,
-                );
-            }
-        }
-
-        // Attach WAN egress program to intercept locally-generated traffic.
-        // In single-homed setups the WAN and LAN share the same interface, so
-        // we attach wan_egress there (lan_egress is skipped above to avoid
-        // interfering with host traffic).
-        if ebpf_wan_ifname.is_empty() {
-            warn!("WAN interface name is empty; skipping wan_egress attach");
-        } else {
-            let wan_egress_prog = Self::wan_program_pair(&ebpf_wan_ifname).1;
-            interface_links.push(
-                Self::attach_tc_owned(
-                    &mut bpf,
-                    wan_egress_prog,
-                    &ebpf_wan_ifname,
-                    aya::programs::TcAttachType::Egress,
-                )
-                .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_egress_prog, e))?,
-            );
-        }
-
-        // Attach the WAN ingress program so replies arriving from the WAN
-        // refresh the reverse-direction conntrack state (the datapath's
-        // is_wan_ingress_direction tracking for direct flows).  Unlike
-        // wan_egress — which uses the L3 program because a bond master may
-        // emit locally-generated egress skbs without an Ethernet header —
-        // ingress packets always arrive from the wire fully framed, so the
-        // L2/L3 choice follows the interface type (same judgment as
-        // attach_wan_egress uses for secondary interfaces).
-        //
-        // Single-homed setups share one interface between LAN and WAN and
-        // lan_ingress already owns that ingress hook, so wan_ingress is
-        // skipped there (mirroring the lan_egress skip above).
-        if single_homed {
-            info!("Single-homed interface detected; skipping wan_ingress attach");
-        } else if !ebpf_wan_ifname.is_empty() {
-            let wan_ingress_prog = Self::wan_program_pair(&ebpf_wan_ifname).0;
-            interface_links.push(
-                Self::attach_tc_owned(
-                    &mut bpf,
-                    wan_ingress_prog,
-                    &ebpf_wan_ifname,
-                    aya::programs::TcAttachType::Ingress,
-                )
-                .map_err(|e| anyhow::anyhow!("attach {}: {}", wan_ingress_prog, e))?,
-            );
-        }
-
-        // For bridge masters, forwarded L2 traffic does not traverse the
-        // master's TC hooks; attach the LAN programs to every slave.
-        let br_slaves = if ebpf_lan_ifname.is_empty() {
-            Vec::new()
-        } else {
-            Self::bridge_slaves(&ebpf_lan_ifname)
-        };
-        if !br_slaves.is_empty() {
-            info!(
-                "Bridge master {} has slaves {:?}; attaching LAN programs to bridge slaves",
-                ebpf_lan_ifname, br_slaves
-            );
-            let ingress_dir = aya::programs::TcAttachType::Ingress;
-            let egress_dir = aya::programs::TcAttachType::Egress;
-            for slave in &br_slaves {
-                let slave_prog = Self::lan_program_pair(slave).0;
-                // A slave we cannot attach silently leaves that traffic
-                // outside the proxy — abort rather than run half-covered.
-                interface_links.push(
-                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, ingress_dir).map_err(
-                        |e| {
-                            anyhow::anyhow!(
-                                "attach {} to bridge slave {}: {}",
-                                slave_prog,
-                                slave,
-                                e
-                            )
-                        },
-                    )?,
-                );
-                info!(
-                    "attached {} to bridge slave {} (Ingress)",
-                    slave_prog, slave
-                );
-
-                interface_links.push(
-                    Self::attach_tc_owned(&mut bpf, "lan_egress_l2", slave, egress_dir).map_err(
-                        |e| {
-                            anyhow::anyhow!("attach lan_egress_l2 to bridge slave {}: {}", slave, e)
-                        },
-                    )?,
-                );
-                info!("attached lan_egress_l2 to bridge slave {} (Egress)", slave);
-            }
-        }
-
-        // Bond slaves can receive packets before the master; keep their
-        // startup links in the same ownership table so watcher retries only
-        // a missing direction.
-        let lan_slaves = if ebpf_lan_ifname.is_empty() {
-            Vec::new()
-        } else {
-            Self::bond_slaves(&ebpf_lan_ifname)
-        };
-        if !lan_slaves.is_empty() {
-            info!(
-                "Bond master {} has slaves {:?}; attaching lan_ingress to slaves",
-                ebpf_lan_ifname, lan_slaves
-            );
-            // The ingress program is already loaded for the master; reuse the
-            // same loaded program object and attach it to each slave.
-            let slave_dir = aya::programs::TcAttachType::Ingress;
-            for slave in &lan_slaves {
-                let slave_prog = Self::lan_program_pair(slave).0;
-                interface_links.push(
-                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
-                        anyhow::anyhow!("attach lan_ingress to bond slave {}: {}", slave, e)
-                    })?,
-                );
-                info!("attached lan_ingress to bond slave {}", slave);
-            }
-        }
-
-        // Preserve the LAN-bond egress hooks used by single-homed setups, then
-        // add WAN-bond slaves so WAN-only hosts cover the same physical path.
-        let mut wan_egress_slaves = lan_slaves.clone();
-        if !ebpf_wan_ifname.is_empty() {
-            for slave in Self::bond_slaves(&ebpf_wan_ifname) {
-                if !wan_egress_slaves.contains(&slave) {
-                    wan_egress_slaves.push(slave);
-                }
-            }
-        }
-        if !wan_egress_slaves.is_empty() {
-            info!(
-                "Attaching wan_egress to bond slaves {:?}",
-                wan_egress_slaves
-            );
-            let slave_dir = aya::programs::TcAttachType::Egress;
-            for slave in &wan_egress_slaves {
-                // Bond slaves are ARPHRD_ETHER and see fully-framed skbs at
-                // their TC egress hook (the bond driver has already built
-                // the Ethernet header), so use the L2 program.
-                let slave_prog = "wan_egress_l2";
-                interface_links.push(
-                    Self::attach_tc_owned(&mut bpf, slave_prog, slave, slave_dir).map_err(|e| {
-                        anyhow::anyhow!("attach wan_egress to bond slave {}: {}", slave, e)
-                    })?,
-                );
-                info!("attached wan_egress to bond slave {}", slave);
-            }
-        }
+        // Every TC variant is loaded up front, so reconciling interfaces later
+        // never runs the verifier. Before `EbpfLogger::init`, which holds the
+        // AYA_LOGS map fd the loads need.
+        let bindings = bindings::InterfaceBindings::preload(&mut bpf)?;
 
         info!("eBPF loaded and attached");
 
@@ -551,7 +338,7 @@ impl RealEbpfBackend {
             bpf: Some(bpf),
             pin_root: pin_root.to_path_buf(),
             pinned_maps: std::mem::take(&mut pinned_maps.names),
-            interface_links,
+            bindings,
             cgroup_sock_links,
             cgroup_sock_addr_links,
             pname_mode,
@@ -599,16 +386,16 @@ impl RealEbpfBackend {
             .program_mut(prog)
             .ok_or_else(|| anyhow::anyhow!("prog '{}' not found", prog))?
             .try_into()?;
-        // Re-attaching an interface (extra LAN/WAN, dynamic watcher) reuses
-        // the program loaded for the primary interface; only the first
-        // attach actually loads.
+        // The program may already be loaded (`load` preloads the TC variants).
         match p.load() {
             Ok(()) => {}
             Err(aya::programs::ProgramError::AlreadyLoaded) => {}
             Err(e) => return Err(anyhow::anyhow!("load '{}': {}", prog, e)),
         }
+        let name = std::ffi::CString::new(iface)
+            .map_err(|e| anyhow::anyhow!("interface name '{}': {}", iface, e))?;
         let id = p
-            .attach(iface, dir)
+            .attach(name.as_c_str(), dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
         debug!(
             "attached '{}' to {} ({:?}) link_id={:?}",
@@ -617,224 +404,11 @@ impl RealEbpfBackend {
         Ok(id)
     }
 
-    /// Attach a TC program and transfer the resulting link into the common
-    /// (ifindex, direction, link) ownership shape used by startup and rebinds.
-    fn attach_tc_owned(
-        bpf: &mut Ebpf,
-        prog: &str,
-        iface: &str,
-        dir: aya::programs::TcAttachType,
-    ) -> anyhow::Result<(u32, bool, aya::programs::tc::SchedClassifierLink)> {
-        let ifindex = crate::netlink::ifindex_of(iface).unwrap_or(0);
-        let id = Self::attach_tc_at(bpf, prog, iface, dir)?;
-        let p: &mut aya::programs::SchedClassifier = bpf
-            .program_mut(prog)
-            .ok_or_else(|| anyhow::anyhow!("{} program disappeared", prog))?
-            .try_into()?;
-        let link = p.take_link(id)?;
-        let is_egress = matches!(dir, aya::programs::TcAttachType::Egress);
-        Ok((ifindex, is_egress, link))
-    }
-
     pub fn attach_tc(
         bpf: &mut Ebpf,
         prog: &str,
         iface: &str,
     ) -> anyhow::Result<aya::programs::tc::SchedClassifierLinkId> {
         Self::attach_tc_at(bpf, prog, iface, aya::programs::TcAttachType::Ingress)
-    }
-
-    /// Determine whether an interface carries Ethernet frames (ARPHRD_ETHER).
-    /// `getifaddrs` covers private network namespaces whose `/sys` mount still
-    /// reflects the parent namespace.
-    fn iface_is_ethernet(iface: &str) -> bool {
-        std::fs::read_to_string(format!("/sys/class/net/{iface}/type"))
-            .ok()
-            .and_then(|value| value.trim().parse::<u32>().ok())
-            .map(|kind| kind == libc::ARPHRD_ETHER as u32)
-            .or_else(|| {
-                nix::ifaddrs::getifaddrs().ok()?.find_map(|entry| {
-                    if entry.interface_name != iface {
-                        return None;
-                    }
-                    entry
-                        .address?
-                        .as_link_addr()
-                        .map(|address| address.hatype() == libc::ARPHRD_ETHER)
-                })
-            })
-            .unwrap_or(false)
-    }
-
-    /// Ethernet interfaces, including bridge masters, use L2; others use L3.
-    fn lan_program_pair(iface: &str) -> (&'static str, &'static str) {
-        // NOTE: bridge masters are attached with L2 programs because the TC
-        // ingress hook on a Linux bridge sees the full Ethernet frame.
-        if Self::iface_is_ethernet(iface) {
-            ("lan_ingress_l2", "lan_egress_l2")
-        } else {
-            ("lan_ingress_l3", "lan_egress_l3")
-        }
-    }
-
-    /// Pick the ingress/egress program pair for a WAN interface using the
-    /// same Ethernet detection as the LAN selector.
-    fn wan_program_pair(iface: &str) -> (&'static str, &'static str) {
-        if Self::iface_is_ethernet(iface) {
-            ("wan_ingress_l2", "wan_egress_l2")
-        } else {
-            ("wan_ingress_l3", "wan_egress_l3")
-        }
-    }
-
-    /// Read the IPv4 address of an interface in big-endian u32, or 0
-    /// (getifaddrs — no `ip` subprocess needed).
-    fn iface_ipv4(iface: &str) -> Option<u32> {
-        nix::ifaddrs::getifaddrs().ok()?.find_map(|ifa| {
-            if ifa.interface_name != iface {
-                return None;
-            }
-            ifa.address?
-                .as_sockaddr_in()
-                .map(|sock| u32::from_ne_bytes(sock.ip().octets()))
-        })
-    }
-
-    /// Return the bridge master of `iface` if it is a bridge slave.
-    fn bridge_interface(iface: &str) -> Option<String> {
-        let master_link = format!("/sys/class/net/{}/master", iface);
-        std::fs::read_link(&master_link)
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-    }
-
-    /// Return the list of bond slaves for `iface` if it is a bond master.
-    pub(crate) fn bond_slaves(iface: &str) -> Vec<String> {
-        let path = format!("/sys/class/net/{}/bonding/slaves", iface);
-        std::fs::read_to_string(&path)
-            .ok()
-            .map(|s| {
-                s.split_whitespace()
-                    .map(|n| n.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    }
-
-    /// Return the list of bridge slaves for `iface` if it is a bridge master.
-    pub(crate) fn bridge_slaves(iface: &str) -> Vec<String> {
-        let path = format!("/sys/class/net/{}/brif", iface);
-        std::fs::read_dir(&path)
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default()
-    }
-}
-
-impl RealEbpfBackend {
-    /// Attach one TC program and record the link under (ifindex, direction)
-    /// so it joins the detach lifecycle and dedupes later retries.
-    fn attach_tc_tracked(
-        &mut self,
-        prog: &str,
-        iface: &str,
-        dir: aya::programs::TcAttachType,
-    ) -> anyhow::Result<()> {
-        let link = Self::attach_tc_owned(self.bpf_mut()?, prog, iface, dir)?;
-        self.interface_links.push(link);
-        Ok(())
-    }
-
-    fn interface_hooked(&self, ifindex: u32, is_egress: bool) -> bool {
-        self.interface_links
-            .iter()
-            .any(|(i, e, _)| *i == ifindex && *e == is_egress)
-    }
-
-    /// Attach LAN programs to an additional interface (beyond the primary).
-    /// Directions already hooked on this ifindex are skipped, so a retry
-    /// after a partial failure only fills the gap.
-    pub fn attach_lan(
-        &mut self,
-        ifname: &str,
-        single_homed: bool,
-    ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
-        let ifname = Self::bridge_interface(ifname).unwrap_or_else(|| ifname.to_string());
-        debug!("Attaching LAN programs to additional interface: {}", ifname);
-        let ifindex = crate::netlink::ifindex_of(&ifname).unwrap_or(0);
-        let (ingress_prog, egress_prog) = Self::lan_program_pair(&ifname);
-        let mut hooks = crate::ebpf::DynamicHooks {
-            ingress: self.interface_hooked(ifindex, false),
-            egress: self.interface_hooked(ifindex, true),
-        };
-        if !hooks.ingress {
-            self.attach_tc_tracked(ingress_prog, &ifname, aya::programs::TcAttachType::Ingress)?;
-            hooks.ingress = true;
-        }
-        if !single_homed && !hooks.egress {
-            self.attach_tc_tracked(egress_prog, &ifname, aya::programs::TcAttachType::Egress)?;
-            hooks.egress = true;
-        }
-        Ok(hooks)
-    }
-
-    /// Attach WAN egress to an additional interface.
-    pub fn attach_wan_egress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        debug!("Attaching WAN egress to additional interface: {}", ifname);
-        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), true) {
-            return Ok(());
-        }
-        let prog = Self::wan_program_pair(ifname).1;
-        self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Egress)
-    }
-
-    /// Attach WAN ingress to an additional interface (reverse-direction
-    /// conntrack updates for replies arriving from the WAN).  L2/L3 is
-    /// chosen by interface type, same as `attach_wan_egress`.
-    pub fn attach_wan_ingress(&mut self, ifname: &str) -> anyhow::Result<()> {
-        debug!("Attaching WAN ingress to additional interface: {}", ifname);
-        if self.interface_hooked(crate::netlink::ifindex_of(ifname).unwrap_or(0), false) {
-            return Ok(());
-        }
-        let prog = Self::wan_program_pair(ifname).0;
-        self.attach_tc_tracked(prog, ifname, aya::programs::TcAttachType::Ingress)
-    }
-
-    /// Attach a bridge/bond slave of a configured LAN master, mirroring the
-    /// program choices `load()` makes at startup: bridge slaves get the LAN
-    /// pair, bond slaves lan_ingress + wan_egress (both L2 on the egress —
-    /// bond/bridge slaves are ARPHRD_ETHER and see fully-framed skbs).
-    pub fn attach_slave(
-        &mut self,
-        ifname: &str,
-        role: crate::ebpf::IfaceRole,
-    ) -> anyhow::Result<crate::ebpf::DynamicHooks> {
-        debug!(
-            "Attaching slave programs to additional interface: {}",
-            ifname
-        );
-        let ifindex = crate::netlink::ifindex_of(ifname).unwrap_or(0);
-        let mut hooks = crate::ebpf::DynamicHooks {
-            ingress: self.interface_hooked(ifindex, false),
-            egress: self.interface_hooked(ifindex, true),
-        };
-        let ingress_prog = Self::lan_program_pair(ifname).0;
-        if !hooks.ingress {
-            self.attach_tc_tracked(ingress_prog, ifname, aya::programs::TcAttachType::Ingress)?;
-            hooks.ingress = true;
-        }
-        let egress_prog = match role {
-            crate::ebpf::IfaceRole::LanBridgeSlave => "lan_egress_l2",
-            _ => "wan_egress_l2",
-        };
-        if !hooks.egress {
-            self.attach_tc_tracked(egress_prog, ifname, aya::programs::TcAttachType::Egress)?;
-            hooks.egress = true;
-        }
-        Ok(hooks)
     }
 }

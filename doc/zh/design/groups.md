@@ -4,7 +4,7 @@ honk 将组解析为叶子出站，跟踪其健康状态，并限制预热资源
 
 ## 范围
 
-本页涵盖 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源 coordinator。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
+组运行时包括 `GroupManager`、`AliveDialerSet`、始终编译的 Score 评分器、冷启动 URLTest 准备流程与预热资源协调器。组字段和策略语法见[组参考](../reference/groups.md)；进程级健康检查、预热与拨号配置键见[全局参考](../reference/global.md)。
 
 ## 组管理器与选择流水线
 
@@ -156,7 +156,7 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 `next = (previous + sample) / 2`
 
-第一个样本初始化平均值。这就是 dae `min_moving_avg` 语义：近期变化能较快生效，同时不让单次抖动成为权威值。
+第一个样本初始化平均值。该算法遵循 dae `min_moving_avg` 语义：近期变化能较快生效，单次抖动不会成为权威值。
 
 `SelectionNetwork::Tcp` 与 `SelectionNetwork::Udp` 分别保留胜者。TCP 使用 TCP 探测平均值；若组配置了自定义目标，则使用 `(member tag, check_url)` 平均值。UDP 先使用 `DataUdp`，再使用 `DnsUdp`；如果在当前地址族下，所有合格候选在这两个域保留的移动平均值中都没有真实 UDP 排名依据，则沿用 TCP 选择。仅有拨号失败产生的合成样本不会停用这一回退；真实样本被历史环形缓冲区淘汰后，保留的排名依据仍然有效。因此有效回退顺序是 `DataUdp → DnsUdp → TCP`。
 
@@ -220,6 +220,8 @@ Selector 在候选展开和健康过滤前绑定具体节点或子组成员；�
 
 探测失败与流量失败使用独立计数器。探测失败应用从 5 秒到 300 秒的指数冷却。另一个 `min(5s, check_interval)` 恢复调度器只检查冷却已到期的死亡域/地址族状态；深度退避状态仍以 300 秒节奏继续探测，不会永久停止。
 
+周期检查分别以 `Tcp`/IPv4 和 `DataUdp`/IPv4 冷却决定 TCP 与共享 UDP 探测的准入；TCP 冷却不会阻止已到期的 UDP 探测。派发时两个条件都仍在冷却的节点不创建 worker，留待后续周期重新检查。仅执行 TCP 的紧急探测只清除节点 TCP IPv4/IPv6 冷却，保留两个 UDP 域的冷却。
+
 Go dae 的 TCP=1 会使短暂的探测丢包在 URLTest 选择前将当前节点从候选集中移除，绕过 tolerance 滞后机制。
 
 死亡状态通常需要连续两次探测成功才能恢复。相关链路、地址或路由变化后，`notify_network_change` 会清除旧冷却、预置死亡状态并触发探测，使一次新的成功即可验证恢复。新注册节点有 60 秒宽限期；其间非强制失败会写入记录，但不计入死亡。探测历史为每个节点、域和地址族保留 100 条。
@@ -275,8 +277,8 @@ eBPF alive slot 属于组，而不是某个节点。对于每个域和地址族�
 Selector 与 UDP ownership 是 reusable node runtime 上相互独立的 bit。
 `WarmRequirement::Session` 跟随 TCP path，`WarmRequirement::Udp` 跟随 UDP path，
 因此仅 UDP 的 VLESS pool 不改变 direct-TCP warming 或 bare-TCP eligibility。移除
-一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用 owner 释放后才排空未来
-reuse。active flow 不会被切断，startup preconnect 仍只是一颗 pool seed。
+一个 owner 时，另一个 owner 仍可保留共享 pool；最后一个适用 owner 释放后才停止后续
+复用并排空资源。active flow 不会被切断，启动预连接只向池中提供初始连接。
 
 重载时，配置不变的节点将现有 `NodeRuntime` 转移给 replacement，包括 AnyTLS、
 VLESS pool/source key 与 QUIC 状态；配置变化时得到 fresh runtime。现有 outbound

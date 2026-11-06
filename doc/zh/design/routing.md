@@ -33,7 +33,7 @@ native-direct 与已有流缓存路径保持原生执行。
 
 ## 内核路由
 
-切换后保留当前用户态匹配语义：
+内核路由保留以下用户态匹配语义：
 
 - 普通 domain pattern/suffix/keyword/regex 与 geosite 在同一条件内按 OR 匹配。
   否定作用于整个并集。suffix、regex、keyword、大小写和 geosite 属性行为不变。
@@ -71,7 +71,7 @@ LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，
   `@` 处分隔，并以不区分大小写的方式筛选属性键。
   启动时，流量路由与 DNS 路由共用同一份 Geo 资源快照；两者完成编译后即释放
   原始资源快照，已编译的 matcher 与指纹仍由各自的 router 持有。
-- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs)
+- [`crates/honk-core/src/control/routing_matcher.rs`](../../../crates/honk-core/src/control/routing_matcher.rs)：
   把 IR 编译为 `RoutingPushPlan`，不修改 map。
   [`crates/honk-core/src/ebpf/real/routing.rs`](../../../crates/honk-core/src/ebpf/real/routing.rs)
   负责 generation map、扩展加载、目标挂接与发布。
@@ -172,7 +172,7 @@ mask 共享 scalar id；若直接把 mask 寄存器存进去，二者被关联�
 只在全部规则都失败后到达的 fallback 出口写入 mark、`must` 与直连 mark 索引；普通
 fallback 不增加写入。
 
-这样做是为了 verifier。指针的类型取决于 lookup 结果，verifier 不会把 NULL 和
+复制 bitmap 可限制 verifier 状态增长。指针类型取决于 lookup 结果，verifier 不会把 NULL 和
 map 指针合并成一个状态，于是跨越后续规则仍然存活的事实指针，会让它后面所有指令的
 状态数成倍增长；两条 `sip && dip && dport` 规则放在十五条进程名规则前面，就把一份
 策略推过了 1,000,000 指令预算（#280：Linux 6.12 上去掉这两条处理 159,837 条指令，
@@ -210,7 +210,7 @@ IPv4/IPv6 仍分别构造 key、
 
 每个相关 TC 程序暴露两个真正保留的、非内联、BTF-global 函数：
 `honk_route_slot0` 和 `honk_route_slot1`。未安装槽返回错误，不实现第二套 fallback
-路由器。后端在放行前加载 LAN/WAN L2/L3 路由目标，包括将来可能动态附着的 variant。
+路由器。后端在放行前加载 LAN/WAN L2/L3 路由目标；八个 TC variant 已在 `load` 时预加载，目标直接复用，也覆盖之后才绑定到接口的 variant。
 
 `ROUTING_POLICY_ROOT` 是单项 map-in-map，指向不可变的
 `RoutingPolicyDescriptor`。descriptor 标识 slot、policy generation、feature bits
@@ -235,7 +235,7 @@ IPv4/IPv6 仍分别构造 key、
 3. 用这些确切 map FD 和合法 BTF 加载生成扩展。
 4. 给全部相关 TC target 的 inactive 槽完成 attach。
 5. 最后只替换一个 generation root。
-6. 成功更新返回后才允许退休旧 TC 槽和旧 maps；用户态 IR/reference lease 独立保有
+6. 成功更新返回后才允许退役旧 TC 槽和旧 maps；用户态 IR/reference lease 独立保有
    自己的生命周期。
 
 Linux 6.12 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成：

@@ -1,4 +1,4 @@
-//! Raw extensions for BPF map commands that Aya 0.14 does not expose.
+//! Raw extensions for BPF map commands that Aya does not expose.
 //!
 //! Ordinary map reads, writes, deletes, iteration, and per-CPU access use
 //! Aya's typed map APIs in `real::mod`. This module owns the atomic commands,
@@ -17,7 +17,7 @@ pub const BPF_BATCH_CHUNK: usize = 128;
 
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
-pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(), c_long> {
+pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<c_long, c_long> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
@@ -31,7 +31,7 @@ pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<(),
             .raw_os_error()
             .unwrap_or(libc::EIO) as c_long)
     } else {
-        Ok(())
+        Ok(ret)
     }
 }
 
@@ -45,7 +45,7 @@ pub(super) fn next_flow_key(
     attr.__bindgen_anon_2.key = previous.map_or(0, |key| key.as_ptr() as u64);
     attr.__bindgen_anon_2.__bindgen_anon_1.next_key = next.as_mut_ptr() as u64;
     match unsafe { bpf_syscall(BPF_MAP_GET_NEXT_KEY as c_long, &mut attr) } {
-        Ok(()) => Ok(Some(next)),
+        Ok(_) => Ok(Some(next)),
         Err(errno) if errno == libc::ENOENT as c_long => Ok(None),
         Err(errno) => anyhow::bail!("bpf get_next_key errno={errno}"),
     }
@@ -58,20 +58,24 @@ pub(super) fn insert_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow:
     attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
     attr.__bindgen_anon_2.__bindgen_anon_1.value = (&value as *const u8) as u64;
     attr.__bindgen_anon_2.flags = aya_obj::generated::BPF_NOEXIST as u64;
-    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }.map_err(|error| {
-        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
-            .context("TCP_LIVE_PINS no-exist insert")
-    })
+    unsafe { bpf_syscall(BPF_MAP_UPDATE_ELEM as c_long, &mut attr) }
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+                .context("TCP_LIVE_PINS no-exist insert")
+        })
 }
 
 pub(super) fn remove_tcp_live_pin(map: &AyaMapData, incarnation: u64) -> anyhow::Result<()> {
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
     attr.__bindgen_anon_2.map_fd = map.fd().as_fd().as_raw_fd() as u32;
     attr.__bindgen_anon_2.key = (&incarnation as *const u64) as u64;
-    unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) }.map_err(|error| {
-        anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
-            .context(format!("TCP_LIVE_PINS release {incarnation}"))
-    })
+    unsafe { bpf_syscall(BPF_MAP_DELETE_ELEM as c_long, &mut attr) }
+        .map(|_| ())
+        .map_err(|error| {
+            anyhow::Error::new(std::io::Error::from_raw_os_error(error as i32))
+                .context(format!("TCP_LIVE_PINS release {incarnation}"))
+        })
 }
 
 fn map_raw_fd(map: &aya::maps::Map) -> RawFd {

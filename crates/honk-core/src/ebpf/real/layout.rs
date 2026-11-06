@@ -168,6 +168,7 @@ fn validate_flow_lifetime_btf(data: &[u8]) -> anyhow::Result<()> {
                 ("pname", 16, offset_of!(RoutingResult, pname)),
                 ("pid", 4, offset_of!(RoutingResult, pid)),
                 ("dscp", 1, offset_of!(RoutingResult, dscp)),
+                ("padding", 3, offset_of!(RoutingResult, padding)),
                 (
                     "decision_token",
                     4,
@@ -499,7 +500,8 @@ mod tests {
             types.extend_from_slice(&[0, 3 << 24, 0, 1, 1, length]);
         }
         // ID 17: the unwrapped routing result nested in handoff/proof payloads.
-        types.extend_from_slice(&[add_name("RoutingResult"), (4 << 24) | 8, 40]);
+        let routing_result = btf::BTF_HEADER_LEN + types.len() * 4;
+        types.extend_from_slice(&[add_name("RoutingResult"), (4 << 24) | 9, 40]);
         for (name, type_id, offset) in [
             ("mark", 9, 0),
             ("must", 1, 4),
@@ -508,6 +510,7 @@ mod tests {
             ("pname", 16, 12),
             ("pid", 9, 28),
             ("dscp", 1, 32),
+            ("padding", 3, 33),
             ("decision_token", 9, 36),
         ] {
             types.extend_from_slice(&[add_name(name), type_id, offset * 8]);
@@ -557,6 +560,19 @@ mod tests {
         data[padding_name..padding_name + 4].copy_from_slice(&0u32.to_le_bytes());
         assert!(validate(&data).is_err());
         data[padding_name..padding_name + 4].copy_from_slice(&name);
+
+        let result_padding = routing_result + 12 + 7 * 12;
+        for (offset, invalid) in [
+            (result_padding, 0u32),
+            (result_padding + 4, 18),
+            (result_padding + 8, 32 * 8),
+        ] {
+            let original: [u8; 4] = data[offset..offset + 4].try_into().unwrap();
+            data[offset..offset + 4].copy_from_slice(&invalid.to_le_bytes());
+            assert!(validate(&data).is_err());
+            data[offset..offset + 4].copy_from_slice(&original);
+            assert!(validate(&data).is_ok());
+        }
 
         let size_offset = records[4] + 8;
         data[size_offset..size_offset + 4].copy_from_slice(&72u32.to_le_bytes());

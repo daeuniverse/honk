@@ -11,6 +11,71 @@ use crate::dns::transport::{
     DialContext, Doh3Client, DohClient, DoqClient, DotPool, LifecycleSlot, ProxyDial, TcpPool,
 };
 
+impl super::DnsIdleResources {
+    pub(crate) fn reclaim_idle(&self) {
+        let registered = self.registered.lock();
+        if !*registered {
+            return;
+        }
+        let Some(_admission) = self.admission.admit() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let mut udp_pools = Vec::new();
+        for entry in self.entries.values() {
+            let mut state = entry.udp.lock();
+            let current = state.current;
+            let mut clear_current = false;
+            for family in state.pools.iter_mut().flatten() {
+                for shard in &mut family.shards {
+                    if shard.as_ref().is_some_and(|pool| {
+                        Arc::strong_count(pool) == 1 && pool.is_idle(now, std::time::Duration::ZERO)
+                    }) {
+                        udp_pools.extend(shard.take());
+                        crate::stats::record_dns_event(
+                            crate::stats::DnsStatEvent::PressureRetiredUdpPool,
+                        );
+                    }
+                }
+                clear_current |=
+                    current == Some(family.address) && family.shards.iter().all(Option::is_none);
+            }
+            if clear_current {
+                state.current = None;
+            }
+        }
+        let slots = self
+            .entries
+            .values()
+            .flat_map(|entry| {
+                entry
+                    .transports
+                    .lock()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let mut retiring = self.retiring_transports.lock();
+        retiring.udp_pools.extend(udp_pools);
+        for slot in slots {
+            let failed = Arc::clone(&self.transport_tasks_failed);
+            if let Some(teardown) = slot.retire_idle(move |transport| async move {
+                transport.close().await;
+                if transport.tasks_failed() {
+                    failed.store(true, Ordering::Release);
+                }
+            }) {
+                retiring.teardowns.spawn_on(teardown, &runtime);
+            }
+        }
+        retiring.drain(Some(runtime), false, &self.transport_tasks_failed);
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TransportKey {
     resolved_leaf: Option<String>,
@@ -91,6 +156,7 @@ impl UpstreamPool {
             endpoint: entry.endpoint.clone().with_resolved_addr(target),
             query_timeout: self.dns_query_timeout,
             dial_timeout: self.dns_dial_timeout,
+            socket_budget: self.socket_budget.clone(),
             proxy,
         })
     }
@@ -190,12 +256,12 @@ impl UpstreamPool {
                     .pools
                     .iter_mut()
                     .filter_map(Option::take)
-                    .map(|(_, pool)| pool),
+                    .flat_map(|family| family.shards.into_iter().flatten()),
             );
         }
-        for pool in udp_pools {
-            pool.close().await;
-        }
+        self.retiring_transports.lock().udp_pools.extend(udp_pools);
+        self.drain_retired_transports(true);
+        self.join_retired_transports().await;
         for slot in slots {
             let failed = Arc::clone(&self.transport_tasks_failed);
             slot.close(move |transport| async move {

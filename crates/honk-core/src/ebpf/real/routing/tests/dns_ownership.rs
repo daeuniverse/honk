@@ -173,6 +173,13 @@ fn isolated(f: impl FnOnce() + Send + 'static) {
     .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
 }
 
+/// Per-CPU state (parser scratch, rate budgets): keep consecutive runs on one CPU.
+fn pin_to_current_cpu() {
+    let mut set = nix::sched::CpuSet::new();
+    set.set(unsafe { libc::sched_getcpu() } as usize).unwrap();
+    nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set).unwrap();
+}
+
 fn fixture_param() -> DaeParam {
     DaeParam {
         tproxy_port: 12345u16.to_be() as u32,
@@ -217,11 +224,14 @@ fn set_array<V: Pod>(backend: &mut RealEbpfBackend, name: &str, index: u32, valu
     let map = backend.bpf_mut().unwrap().map_mut(name).unwrap();
     Array::<_, V>::try_from(map)
         .unwrap()
-        .set(index, value, 0)
+        .set(index, &value, 0)
         .unwrap();
 }
 
-fn flow_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize {
+fn flow_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize
+where
+    FlowMapValue<V>: Pod,
+{
     let mut count = 0;
     backend
         .flow_for_each_chunk::<K, V>(name, 256, &mut |chunk| {

@@ -31,6 +31,84 @@ fn an_interval_past_the_clock_range_is_never_due() {
     ));
 }
 
+#[test]
+fn rejected_publication_ends_pending_fetch_backoff() {
+    let mut subscription = authorized(uuid::Uuid::new_v4(), 1, "http://provider".into());
+    subscription.subscription.update_interval = 86400;
+    let id = subscription.subscription.id;
+    let mut state = state();
+    state.reconcile(vec![subscription.clone()]);
+    state.pending.clear();
+    state.finish(id, Err("fetch_failed"));
+    assert!(
+        next_deadline(&state.providers[&id]).unwrap() < Instant::now() + Duration::from_secs(60)
+    );
+
+    state.schedule(id);
+    state.pending.clear();
+    let rejected_at = Instant::now();
+    state.finish(
+        id,
+        Ok(SubscriptionMergeReply {
+            outcome: ReloadOutcome::Rejected,
+            node_count: 0,
+            authorized: vec![subscription],
+            rejection: Some("duplicate-node-id"),
+        }),
+    );
+    assert!(
+        next_deadline(&state.providers[&id]).unwrap() >= rejected_at + Duration::from_secs(86400)
+    );
+    let load = state.observations.read()[&id].load;
+    assert_eq!(load.error, Some("publication_rejected"));
+    assert_eq!(load.rejection, Some("duplicate-node-id"));
+}
+
+fn next_deadline(provider: &Provider) -> Option<Instant> {
+    match &provider.schedule {
+        ProviderSchedule::RefreshEligible(next) => *next,
+        #[cfg(feature = "native-api")]
+        ProviderSchedule::Deferred => None,
+    }
+}
+
+#[test]
+fn retry_schedule_respects_interval_and_recovery() {
+    let now = Instant::now();
+    for (interval, delays) in [
+        (0, &[0][..]),
+        (10, &[10, 10][..]),
+        (45, &[30, 45, 45][..]),
+        (3600, &[30, 60, 120, 240, 480, 600, 600][..]),
+        (u64::MAX, &[30, 60][..]),
+    ] {
+        let mut subscription = authorized(uuid::Uuid::new_v4(), 1, "http://provider".into());
+        subscription.subscription.update_interval = interval;
+        let mut provider = Provider::new(subscription);
+        provider.reset_deadline(now);
+        let periodic = next_deadline(&provider);
+        provider.finished(now + Duration::from_secs(1), None);
+        assert_eq!(next_deadline(&provider), periodic);
+        for &seconds in delays {
+            provider.finished(now, Some("fetch_failed"));
+            assert_eq!(
+                next_deadline(&provider),
+                (seconds > 0).then(|| now + Duration::from_secs(seconds))
+            );
+        }
+        let retry = next_deadline(&provider);
+        provider.restart_deadline(now + Duration::from_secs(1));
+        assert_eq!(next_deadline(&provider), retry);
+        provider.finished(now, None);
+        assert_eq!(next_deadline(&provider), periodic);
+        provider.finished(now, Some("route_unavailable"));
+        assert_eq!(
+            next_deadline(&provider),
+            (interval > 0).then(|| now + Duration::from_secs(interval.min(30)))
+        );
+    }
+}
+
 #[tokio::test]
 async fn shutdown_joins_pending_fetch_socket_instead_of_detaching_it() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -763,41 +841,49 @@ async fn startup_rejects_a_cached_provider_whose_node_duplicates_an_inline_node(
 }
 
 #[tokio::test]
-async fn startup_rejects_a_provider_whose_node_duplicates_another_provider() {
-    let temp = tempfile::tempdir().unwrap();
-    let store = SubscriptionStore::in_dir(temp.path());
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    let first = authorized(uuid::Uuid::new_v4(), 1, format!("{url}/first"));
-    let second = authorized(uuid::Uuid::new_v4(), 1, format!("{url}/second"));
-    for (provider, body) in [
-        (&first, "socks5://127.0.0.1:1080#first"),
-        (&second, "socks5://127.0.0.1:1080#second"),
+async fn startup_drops_provider_nodes_another_provider_published() {
+    for (second_body, expected) in [
+        (
+            "socks5://127.0.0.1:1080#second\nsocks5://127.0.0.1:1082#second-own",
+            &["kept", "first", "second-own"][..],
+        ),
+        ("socks5://127.0.0.1:1080#second", &["kept", "first"][..]),
     ] {
-        store
-            .store_content(&provider.subscription, body.into())
-            .await
-            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let store = SubscriptionStore::in_dir(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let first = authorized(uuid::Uuid::new_v4(), 1, format!("{url}/first"));
+        let second = authorized(uuid::Uuid::new_v4(), 1, format!("{url}/second"));
+        for (provider, body) in [
+            (&first, "socks5://127.0.0.1:1080#first"),
+            (&second, second_body),
+        ] {
+            store
+                .store_content(&provider.subscription, body.into())
+                .await
+                .unwrap();
+        }
+        let mut config = Config {
+            nodes: inline("socks5://127.0.0.1:1081#kept"),
+            subscriptions: vec![first.subscription.clone(), second.subscription.clone()],
+            ..Default::default()
+        };
+        let mut state =
+            SupervisorState::new(Arc::new(SubscriptionManager::new().unwrap()), Some(store));
+        state.reconcile(vec![first.clone(), second.clone()]);
+
+        state.prepare_startup(&mut config, Vec::new()).await;
+
+        config.validate_assembled().unwrap();
+        assert_eq!(node_names(&config), expected);
+        for provider in [&first, &second] {
+            let load = state.observations.read()[&provider.subscription.id].load;
+            assert!(load.updated_at.is_some() && load.cached);
+            assert_eq!((load.error, load.rejection), (None, None));
+        }
+        state.shutdown().await.unwrap();
     }
-    let mut config = Config {
-        nodes: inline("socks5://127.0.0.1:1081#kept"),
-        subscriptions: vec![first.subscription.clone(), second.subscription.clone()],
-        ..Default::default()
-    };
-    let mut state =
-        SupervisorState::new(Arc::new(SubscriptionManager::new().unwrap()), Some(store));
-    state.reconcile(vec![first.clone(), second.clone()]);
-
-    state.prepare_startup(&mut config, Vec::new()).await;
-
-    config.validate_assembled().unwrap();
-    assert_eq!(node_names(&config), ["kept", "first"]);
-    assert_eq!(
-        state.observations.read()[&first.subscription.id].load.error,
-        None
-    );
-    assert_rejected(&state, second.subscription.id);
-    state.shutdown().await.unwrap();
 }
 
 #[tokio::test]

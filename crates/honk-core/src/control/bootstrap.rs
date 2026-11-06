@@ -23,6 +23,7 @@ impl ControlPlane {
                 ),
                 config.dns.strategy,
             )?
+            .with_socket_budget(dns_forwarder.socket_budget().clone())
             .with_client_subnet(config.dns.effective_client_subnet()?),
         );
         Self::new_with_upstream_pool(
@@ -67,6 +68,15 @@ impl ControlPlane {
         degradations: Arc<crate::degradations::Degradations>,
     ) -> anyhow::Result<Self> {
         config.validate_assembled()?;
+        let dns_socket_budget = dns_upstream_pool.socket_budget().clone();
+        anyhow::ensure!(
+            dns_socket_budget.shares_admission(dns_forwarder.socket_budget()),
+            "DNS forwarder and upstream pool must share socket admission"
+        );
+        anyhow::ensure!(
+            dns_socket_budget.limit() <= resource_budget.dns_sockets,
+            "DNS socket admission exceeds its descriptor partition"
+        );
         honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
@@ -148,7 +158,8 @@ impl ControlPlane {
             vless_carriers = resource_budget.vless_carriers,
             udp_endpoints = resource_budget.udp_endpoints,
             udp_slow = resource_budget.udp_slow_path,
-            dns_slow = resource_budget.dns_slow_path,
+            dns_sockets = resource_budget.dns_sockets,
+            dns_udp_queries = resource_budget.dns_udp_queries,
             "Control-plane descriptor budget"
         );
         let outbound_runtime = runtime_registry.read().clone();
@@ -174,7 +185,6 @@ impl ControlPlane {
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
-                udp_query_limit: resource_budget.dns_slow_path,
                 forwarder: dns_forwarder.clone(),
                 routing_projection: Arc::new(crate::dns::runtime::RoutingProjectionSnapshot::new(
                     0,
@@ -193,6 +203,7 @@ impl ControlPlane {
             crate::control::dns_control::DnsController::new_with_service(
                 dns_service,
                 ebpf_arc.clone(),
+                resource_budget.dns_udp_queries,
             ),
         );
         // Health-check name resolution shares honk's own DNS forwarder
@@ -232,6 +243,7 @@ impl ControlPlane {
                 cli_override: None,
                 effective: effective_log_file,
             },
+            startup_downgrades: StartupDowngrades::default(),
             ebpf: ebpf_arc,
             router: router_arc,
             proxy_registry,
@@ -266,6 +278,7 @@ impl ControlPlane {
             quic_score_target: None,
             outbound_id_map,
             resource_budget,
+            dns_socket_budget,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
             )),

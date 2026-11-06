@@ -3,16 +3,25 @@ Description=honk Service
 Documentation=https://github.com/daeuniverse/honk
 After=network-online.target docker.service systemd-sysctl.service
 Wants=network-online.target
+# dae attaches to the same interfaces, so starting one stops the other.
+Conflicts=dae.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=notify
 User=root
-LimitNPROC=512
+LimitNPROC=4096
 LimitNOFILE=1048576
+# eBPF maps count against locked memory before Linux 5.11.
+LimitMEMLOCK=infinity
+OOMScoreAdjust=-100
 ExecStart=/usr/bin/honk-core --disable-timestamp -c /etc/honk/config.dae
 ExecReload=/usr/bin/honk-core reload
 Restart=on-abnormal
+RestartSec=5s
 TimeoutStartSec=120
+TimeoutStopSec=30
 
 [Install]
 WantedBy=multi-user.target

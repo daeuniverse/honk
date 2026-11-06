@@ -7,9 +7,13 @@
 //! - `1.1.1.1:443/dns-query`
 
 use std::net::{IpAddr, SocketAddr};
+use std::time::Duration;
 
 use honk_config::dns::DnsStrategy;
 use honk_config::types::DnsProtocol;
+use tokio::time::Instant;
+
+use super::transport::DnsSocketBudget;
 
 /// Default DoH / DoH3 request path (RFC 8484).
 pub const DEFAULT_DOH_PATH: &str = "/dns-query";
@@ -97,12 +101,17 @@ impl DnsEndpoint {
     /// Dialers iterate this list so failure in the preferred family can fall
     /// back to the other family.
     pub async fn resolve_addrs(&self) -> anyhow::Result<Vec<SocketAddr>> {
-        self.resolve_addrs_with(self.bootstrap_resolver).await
+        self.resolve_addrs_budgeted(
+            &DnsSocketBudget::default(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .await
     }
 
-    async fn resolve_addrs_with(
+    pub(crate) async fn resolve_addrs_budgeted(
         &self,
-        bootstrap_resolver: Option<honk_outbound::bootstrap::BootstrapResolver>,
+        budget: &DnsSocketBudget,
+        deadline: Instant,
     ) -> anyhow::Result<Vec<SocketAddr>> {
         if let Some(address) = self.resolved_addr {
             return Ok(vec![address]);
@@ -110,11 +119,21 @@ impl DnsEndpoint {
         let ips = if let Ok(ip) = self.host.parse::<IpAddr>() {
             vec![ip]
         } else {
-            let ips = honk_outbound::bootstrap::resolve_with(bootstrap_resolver, &self.host)
-                .await
-                .map_err(|error| {
-                    anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
-                })?;
+            let ips = honk_outbound::bootstrap::resolve_with_admission(
+                self.bootstrap_resolver,
+                &self.host,
+                deadline,
+                || async {
+                    budget
+                        .acquire_bootstrap_until(deadline)
+                        .await
+                        .map_err(|error| std::io::Error::other(error.into_boxed_dyn_error()))
+                },
+            )
+            .await
+            .map_err(|error| {
+                anyhow::Error::new(error).context(format!("bootstrap resolve '{}'", self.host))
+            })?;
             if ips.is_empty() {
                 anyhow::bail!("bootstrap resolve '{}' returned no addresses", self.host);
             }
@@ -272,7 +291,16 @@ mod tests {
         // Given
         let old = spawn_bootstrap_server([192, 0, 2, 10], None, 2).await;
         let replacement = spawn_bootstrap_server([198, 51, 100, 20], None, 2).await;
-        let endpoint = DnsEndpoint::parse("runtime.test:853", DnsProtocol::Tls, None).unwrap();
+        let endpoint = |resolver| {
+            DnsEndpoint::parse_with_resolver(
+                "runtime.test:853",
+                DnsProtocol::Tls,
+                None,
+                Some(resolver),
+                DnsStrategy::default(),
+            )
+            .unwrap()
+        };
         let old_resolver =
             honk_outbound::bootstrap::BootstrapResolver::parse(&format!("udp://{old}")).unwrap();
         let replacement_resolver =
@@ -280,12 +308,9 @@ mod tests {
                 .unwrap();
 
         // When
-        let old_addrs = endpoint
-            .resolve_addrs_with(Some(old_resolver))
-            .await
-            .unwrap();
-        let replacement_addrs = endpoint
-            .resolve_addrs_with(Some(replacement_resolver))
+        let old_addrs = endpoint(old_resolver).resolve_addrs().await.unwrap();
+        let replacement_addrs = endpoint(replacement_resolver)
+            .resolve_addrs()
             .await
             .unwrap();
 
@@ -358,6 +383,172 @@ mod tests {
         assert!(prefer_v6[1].is_ipv4());
         assert!(v4_only.iter().all(SocketAddr::is_ipv4));
         assert!(v6_only.iter().all(SocketAddr::is_ipv6));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_burst_holds_two_sockets_until_inline_lookup_cancellation() {
+        use honk_outbound::proxy::{PacketRejection, packet_rejection};
+        use tokio::net::UdpSocket;
+
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&format!(
+            "udp://{}",
+            silent.local_addr().unwrap()
+        ))
+        .unwrap();
+        let budget = DnsSocketBudget::new(2);
+        let endpoint = DnsEndpoint::parse_with_resolver(
+            "first.invalid:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::Both,
+        )
+        .unwrap();
+        let mut first = Box::pin(
+            endpoint.resolve_addrs_budgeted(&budget, Instant::now() + Duration::from_secs(10)),
+        );
+        let mut packet = [0; 512];
+        let mut peers = Vec::with_capacity(2);
+        let mut qtypes = Vec::with_capacity(2);
+        for _ in 0..2 {
+            let (length, peer) = tokio::select! {
+                result = &mut first => panic!("silent bootstrap completed: {result:?}"),
+                packet = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    silent.recv_from(&mut packet),
+                ) => packet.unwrap().unwrap(),
+            };
+            assert_eq!(&packet[12..length - 4], b"\x05first\x07invalid\0");
+            qtypes.push(u16::from_be_bytes([packet[length - 4], packet[length - 3]]));
+            peers.push(peer);
+        }
+        qtypes.sort_unstable();
+        assert_eq!(qtypes, [1, 28]);
+        assert_ne!(peers[0], peers[1]);
+        assert_eq!(budget.available_sockets(), 0);
+        for peer in &peers {
+            let error = UdpSocket::bind(*peer).await.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        }
+
+        let mut siblings = Vec::with_capacity(8);
+        for index in 0..8 {
+            let endpoint = DnsEndpoint::parse_with_resolver(
+                &format!("blocked-{index}.invalid:853"),
+                DnsProtocol::Tls,
+                None,
+                Some(resolver),
+                DnsStrategy::Both,
+            )
+            .unwrap();
+            let budget = budget.clone();
+            let mut sibling = Box::pin(async move {
+                endpoint
+                    .resolve_addrs_budgeted(&budget, Instant::now() + Duration::from_secs(10))
+                    .await
+            });
+            assert!(futures::poll!(sibling.as_mut()).is_pending());
+            siblings.push(sibling);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), silent.recv_from(&mut packet))
+                .await
+                .is_err(),
+            "blocked distinct hosts opened extra bootstrap sockets"
+        );
+        drop(siblings);
+        assert_eq!(budget.available_sockets(), 0);
+
+        let waiting = DnsEndpoint::parse_with_resolver(
+            "deadline.invalid:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::Both,
+        )
+        .unwrap();
+        let error = waiting
+            .resolve_addrs_budgeted(&budget, Instant::now() + Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(packet_rejection(&error), Some(PacketRejection::Capacity));
+        assert_eq!(budget.available_sockets(), 0);
+        drop(first);
+        assert_eq!(budget.available_sockets(), 2);
+        let _first_rebound = UdpSocket::bind(peers[0]).await.unwrap();
+        let _second_rebound = UdpSocket::bind(peers[1]).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), silent.recv_from(&mut packet))
+                .await
+                .is_err(),
+            "cancelled bootstrap work sent another packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_credit_refuses_hostname_bootstrap_but_numeric_and_resolved_endpoints_bypass_it() {
+        use honk_outbound::proxy::{PacketRejection, packet_rejection};
+        use tokio::net::UdpSocket;
+
+        let silent = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&format!(
+            "udp://{}",
+            silent.local_addr().unwrap()
+        ))
+        .unwrap();
+        let budget = DnsSocketBudget::new(1);
+        let endpoint = DnsEndpoint::parse_with_resolver(
+            "unadmitted.invalid:853",
+            DnsProtocol::Tls,
+            None,
+            Some(resolver),
+            DnsStrategy::Both,
+        )
+        .unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            endpoint.resolve_addrs_budgeted(&budget, Instant::now() + Duration::from_secs(1)),
+        )
+        .await
+        .expect("an impossible two-socket reservation must fail immediately")
+        .unwrap_err();
+        assert_eq!(packet_rejection(&error), Some(PacketRejection::Capacity));
+        assert_eq!(budget.available_sockets(), 1);
+
+        let held = budget
+            .acquire_until(Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        for address in ["192.0.2.10:853", "[2001:db8::10]:853"] {
+            let numeric = DnsEndpoint::parse(address, DnsProtocol::Tls, None).unwrap();
+            assert_eq!(
+                numeric
+                    .resolve_addrs_budgeted(&budget, Instant::now())
+                    .await
+                    .unwrap(),
+                vec![address.parse::<SocketAddr>().unwrap()]
+            );
+            assert_eq!(budget.available_sockets(), 0);
+        }
+        let resolved = SocketAddr::from(([192, 0, 2, 11], 853));
+        assert_eq!(
+            endpoint
+                .with_resolved_addr(resolved)
+                .resolve_addrs_budgeted(&budget, Instant::now())
+                .await
+                .unwrap(),
+            vec![resolved]
+        );
+        assert_eq!(budget.available_sockets(), 0);
+        drop(held);
+        assert_eq!(budget.available_sockets(), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), silent.recv_from(&mut [0; 512]))
+                .await
+                .is_err(),
+            "unadmitted or pre-resolved endpoints sent a bootstrap query"
+        );
     }
 
     async fn spawn_bootstrap_server(

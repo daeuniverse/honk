@@ -150,7 +150,6 @@ impl Assembler {
         );
         let insn = bpf_insn {
             code: code as u8,
-            _bitfield_align_1: [],
             _bitfield_1: bpf_insn::new_bitfield_1(dst, src),
             off,
             imm,

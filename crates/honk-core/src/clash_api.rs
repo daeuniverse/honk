@@ -1011,12 +1011,26 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
     let pool = s.connection_pool.ready_metrics();
     let tcp = s.stats.tcp_snapshot();
     let udp = s.stats.udp_snapshot();
+    let dns = crate::stats::dns::dns_snapshot();
     let warm = s
         .stats
         .warm_snapshot(&s.runtime_registry.read().clone(), &s.connection_pool);
     let quic = honk_outbound::quic::quic_stats_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
+        "dns": {
+            "socketAdmission": {
+                "refused": dns.socket_admission_refused,
+                "timeouts": dns.socket_admission_timeout,
+            },
+            "proxyAdmission": {
+                "timeouts": dns.proxy_admission_timeout,
+            },
+            "pressure": {
+                "retiredUdpPools": dns.pressure_retired_udp_pool,
+                "retiredTransports": dns.pressure_retired_transport,
+            },
+        },
         "score": {
             "groups": score_groups,
             "businessStarts": group_manager.score_state().root_business_starts(),

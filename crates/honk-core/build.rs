@@ -66,6 +66,29 @@ mod hashed_asset;
 
 #[cfg(feature = "native-ui")]
 fn embed_native_ui() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+
+    println!("cargo:rerun-if-env-changed=HONK_DOONA_DIR");
+    let root = std::path::PathBuf::from(std::env::var_os("HONK_DOONA_DIR").context(
+        "the native-ui feature embeds doona and doona lite from HONK_DOONA_DIR and its -lite sibling; \
+         fetch the pinned release with `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`",
+    )?);
+    ensure!(
+        root.is_absolute(),
+        "HONK_DOONA_DIR must be an absolute path: {}",
+        root.display()
+    );
+    let mut lite_name = root
+        .file_name()
+        .context("HONK_DOONA_DIR must name a directory below its parent")?
+        .to_os_string();
+    lite_name.push("-lite");
+    embed_ui_assets(&root, "native_ui")?;
+    embed_ui_assets(&root.with_file_name(lite_name), "native_ui_lite")
+}
+
+#[cfg(feature = "native-ui")]
+fn embed_ui_assets(root: &std::path::Path, name: &str) -> anyhow::Result<()> {
     use std::{fmt::Write, fs, path::Path};
 
     use anyhow::{Context, ensure};
@@ -98,32 +121,23 @@ fn embed_native_ui() -> anyhow::Result<()> {
         Ok(())
     }
 
-    println!("cargo:rerun-if-env-changed=HONK_DOONA_DIR");
-    let root = std::path::PathBuf::from(std::env::var_os("HONK_DOONA_DIR").context(
-        "the native-ui feature embeds a doona build from HONK_DOONA_DIR; \
-         fetch the pinned release with `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`",
-    )?);
-    ensure!(
-        root.is_absolute(),
-        "HONK_DOONA_DIR must be an absolute path: {}",
-        root.display()
-    );
     println!("cargo:rerun-if-changed={}", root.display());
     ensure!(
-        fs::symlink_metadata(&root)
-            .with_context(|| format!("failed to inspect HONK_DOONA_DIR {}", root.display()))?
+        fs::symlink_metadata(root)
+            .with_context(|| format!("failed to inspect native UI directory {}", root.display()))?
             .is_dir(),
-        "HONK_DOONA_DIR must be a directory: {}",
+        "native UI path must be a directory: {}",
         root.display()
     );
     let mut files = Vec::new();
-    collect(&root, &root, &mut files)?;
+    collect(root, root, &mut files)?;
     files.sort_unstable();
     ensure!(
         files
             .binary_search_by(|path| path.as_str().cmp("index.html"))
             .is_ok(),
-        "native UI assets must include index.html"
+        "native UI assets must include index.html: {}",
+        root.display()
     );
     let unhashed: Vec<_> = files
         .iter()
@@ -136,7 +150,7 @@ fn embed_native_ui() -> anyhow::Result<()> {
     );
 
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-    let compressed = out.join("native_ui");
+    let compressed = out.join(name);
     if compressed.exists() {
         fs::remove_dir_all(&compressed)?;
     }
@@ -182,7 +196,7 @@ fn embed_native_ui() -> anyhow::Result<()> {
             let file = root.join(path);
             let file = file
                 .to_str()
-                .context("HONK_DOONA_DIR paths must be UTF-8")?;
+                .context("native UI asset paths must be UTF-8")?;
             writeln!(
                 generated,
                 "    ({path:?}, EmbeddedAsset::Identity(include_bytes!({file:?}))),"
@@ -190,7 +204,7 @@ fn embed_native_ui() -> anyhow::Result<()> {
         }
     }
     generated.push_str("]\n");
-    fs::write(out.join("native_ui_assets.rs"), generated)?;
+    fs::write(out.join(format!("{name}_assets.rs")), generated)?;
     Ok(())
 }
 

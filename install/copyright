@@ -1,0 +1,13 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: honk
+Source: https://github.com/daeuniverse/honk
+
+Files: *
+Copyright: 2026 glassyiris <honk@catmint.cc> and honk contributors
+License: GPL-3.0-only
+ The embedded doona web UI is also GPL-3.0-only; the notices of the
+ third-party files it bundles are in /usr/share/doc/honk-core/doona and
+ /usr/share/doc/honk-core/doona-lite.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 3 is in /usr/share/common-licenses/GPL-3.

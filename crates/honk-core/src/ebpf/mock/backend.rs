@@ -765,31 +765,32 @@ impl EbpfBackend for MockEbpfBackend {
     fn detach_hooks(&mut self) -> anyhow::Result<()> {
         self.detach_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "ebpf")]
+        self.bound_interfaces.clear();
         Ok(())
     }
 
-    fn attach_dynamic_interface(
-        &mut self,
-        _ifname: &str,
-        _role: ebpf::IfaceRole,
-        _single_homed: bool,
-    ) -> anyhow::Result<ebpf::DynamicHooks> {
-        #[cfg(test)]
-        anyhow::ensure!(
-            !self.dynamic_attach_fault,
-            "injected dynamic attach failure"
-        );
-        self.dynamic_attach_calls
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(ebpf::DynamicHooks {
-            ingress: true,
-            egress: true,
+    #[cfg(feature = "ebpf")]
+    fn interface_binding_snapshot(&self) -> anyhow::Result<ebpf::interface::BindingSnapshot> {
+        let owned = self
+            .bound_interfaces
+            .iter()
+            .map(|(binding, id, fd)| Ok((binding.clone(), *id, fd.try_clone()?)))
+            .collect::<std::io::Result<_>>()?;
+        Ok(ebpf::interface::BindingSnapshot {
+            programs: Vec::new(),
+            owned,
         })
     }
 
-    fn forget_dynamic_interface(&mut self, _ifindex: u32) {
-        self.dynamic_forget_calls
+    #[cfg(feature = "ebpf")]
+    fn commit_interface_bindings(
+        &mut self,
+        commit: ebpf::interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        self.binding_commits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        commit.apply_to(&mut self.bound_interfaces)
     }
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {

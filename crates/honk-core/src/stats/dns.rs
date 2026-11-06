@@ -19,6 +19,11 @@ pub(crate) enum DnsStatEvent {
     RuntimeForcedClose,
     TransportInit,
     TransportReset,
+    SocketAdmissionRefused,
+    SocketAdmissionTimeout,
+    ProxyAdmissionTimeout,
+    PressureRetiredUdpPool,
+    PressureRetiredTransport,
     ProjectionStaleGeneration,
     ProjectionWriteFailure,
     ProjectionRetry,
@@ -47,6 +52,11 @@ struct DnsStats {
     runtime_forced_close: AtomicU64,
     transport_init: AtomicU64,
     transport_reset: AtomicU64,
+    socket_admission_refused: AtomicU64,
+    socket_admission_timeout: AtomicU64,
+    proxy_admission_timeout: AtomicU64,
+    pressure_retired_udp_pool: AtomicU64,
+    pressure_retired_transport: AtomicU64,
     projection_stale_generation: AtomicU64,
     projection_write_failure: AtomicU64,
     projection_retry: AtomicU64,
@@ -82,6 +92,11 @@ impl DnsStats {
             DnsStatEvent::RuntimeForcedClose => &self.runtime_forced_close,
             DnsStatEvent::TransportInit => &self.transport_init,
             DnsStatEvent::TransportReset => &self.transport_reset,
+            DnsStatEvent::SocketAdmissionRefused => &self.socket_admission_refused,
+            DnsStatEvent::SocketAdmissionTimeout => &self.socket_admission_timeout,
+            DnsStatEvent::ProxyAdmissionTimeout => &self.proxy_admission_timeout,
+            DnsStatEvent::PressureRetiredUdpPool => &self.pressure_retired_udp_pool,
+            DnsStatEvent::PressureRetiredTransport => &self.pressure_retired_transport,
             DnsStatEvent::ProjectionStaleGeneration => &self.projection_stale_generation,
             DnsStatEvent::ProjectionWriteFailure => &self.projection_write_failure,
             DnsStatEvent::ProjectionRetry => &self.projection_retry,
@@ -118,6 +133,11 @@ impl DnsStats {
             runtime_forced_close: self.runtime_forced_close.load(Ordering::Relaxed),
             transport_init: self.transport_init.load(Ordering::Relaxed),
             transport_reset: self.transport_reset.load(Ordering::Relaxed),
+            socket_admission_refused: self.socket_admission_refused.load(Ordering::Relaxed),
+            socket_admission_timeout: self.socket_admission_timeout.load(Ordering::Relaxed),
+            proxy_admission_timeout: self.proxy_admission_timeout.load(Ordering::Relaxed),
+            pressure_retired_udp_pool: self.pressure_retired_udp_pool.load(Ordering::Relaxed),
+            pressure_retired_transport: self.pressure_retired_transport.load(Ordering::Relaxed),
             projection_stale_generation: self.projection_stale_generation.load(Ordering::Relaxed),
             projection_write_failure: self.projection_write_failure.load(Ordering::Relaxed),
             projection_retry: self.projection_retry.load(Ordering::Relaxed),
@@ -136,10 +156,10 @@ pub(crate) fn record_dns_event(event: DnsStatEvent) {
 }
 
 #[cfg_attr(
-    all(not(test), not(feature = "dns-bench")),
+    all(not(test), not(feature = "dns-bench"), not(feature = "clash-api")),
     expect(
         dead_code,
-        reason = "the internal snapshot intentionally has no public endpoint"
+        reason = "DNS statistics are exposed only with the Clash API"
     )
 )]
 pub(crate) fn dns_snapshot() -> DnsStatsSnapshot {

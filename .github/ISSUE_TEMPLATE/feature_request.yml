@@ -1,47 +1,71 @@
 name: Feature request / 功能请求
-description: Propose a capability honk does not have. / 提议 honk 目前没有的功能。
+description: Explain an unmet need and the capability that would address it. / 请说明目前无法满足的需求，以及希望增加的功能。
 title: "feat: "
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        AI may help you write this; unverified content may not be submitted.
+        可以用 AI 辅助撰写，但提交前须自行核实全部内容。
+
+        State each fact once; do not restate the title, diff or template.
+        同一件事只写一次，不要重复标题、代码改动或模板内容。
+        No filler, praise, summaries of your own work or emoji.
+        不写客套话、夸赞和自我总结，不用表情符号。
+        Paste only relevant log lines; link or collapse long output.
+        日志只贴相关的几行；较长的输出请附链接或折叠。
+        Say what you could not verify.
+        没有验证过的地方请注明。
+  - type: input
+    id: human-responsible
+    attributes:
+      label: Human responsible / 负责人
+      description: Enter your GitHub username; you verified this request and will answer follow-up questions. / 请填写你的 GitHub 用户名。填写即表示你已核实需求，并会回复后续提问。
+      placeholder: "@your-name"
+    validations:
+      required: true
   - type: textarea
     id: problem
     attributes:
-      label: Problem / 要解决的问题
-      description: What you are trying to do and why the current behaviour does not cover it. / 想做什么，以及现有行为为何无法满足。
+      label: Problem / 问题
+      description: Explain what you are trying to do and why the current behaviour does not meet that need. / 请说明你想做什么，以及现有行为为什么做不到。
     validations:
       required: true
   - type: textarea
     id: proposal
     attributes:
-      label: Proposal / 提议
-      description: The behaviour or configuration you would like. / 希望的行为或配置写法。
-    validations:
-      required: true
+      label: Proposal / 建议方案
+      description: Describe the behaviour or configuration you would like and how it would solve the problem. / 请说明你希望的行为或配置，以及它如何解决问题。
   - type: dropdown
     id: area
     attributes:
       label: Area / 范围
+      description: Select the part of honk that would change. / 请选择需要改动的 honk 部分。
       options:
         - Routing / 路由
         - DNS
         - Outbound and protocols / 出站与协议
         - eBPF datapath / eBPF 数据面
-        - Native API
-        - Clash API
+        - Native API / 原生 API
+        - Clash API / Clash API
         - Configuration / 配置
         - Documentation / 文档
         - Other / 其他
-    validations:
-      required: true
   - type: textarea
     id: alternatives
     attributes:
       label: Alternatives / 替代方案
-      description: Workarounds you use today, or how dae or other tools handle this. / 目前的变通做法，或 dae 等其他工具的处理方式。
+      description: Explain your current workaround or how dae or other tools handle this need. / 请说明目前的变通做法，或 dae 等工具是怎么处理的。
   - type: checkboxes
     id: checks
     attributes:
       label: Checks / 确认
+      description: Check only true claims; an applicable required box left unchecked or a false claim closes the issue. / 只勾选属实的选项。适用的必选项没有勾选，或勾选的内容不属实，issue 会被关闭。
       options:
-        - label: I searched existing issues and discussions and found no request for this. / 我已搜索现有 issue 与 discussion，没有相同的请求。
+        - label: I searched existing issues / 我已搜索过现有 issue
           required: true
+        - label: This describes what I need / 以上是我的实际需求
+          required: true
+        - label: I checked the boxes above without reading them / 我没有阅读上面的选项就直接勾选了
+        - label: I am an AI agent, and this content was submitted without human review / 我是 AI 代理，这些内容没有经过人工审核

@@ -246,7 +246,7 @@ fn routing_generation_ceiling_preserves_the_committed_root() {
         RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
     backend
         .routing_generation_sequence
-        .set(0, DNS_ROUTE_GENERATION_MAX - 1, 0)
+        .set(0, &(DNS_ROUTE_GENERATION_MAX - 1), 0)
         .unwrap();
     backend.publish_routing_plan(&old, &[]).unwrap();
     assert_eq!(
@@ -334,7 +334,8 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     let mut connection = golden::connection();
     connection.dst_port = 53;
     let input = input(&connection);
-    let mut backend = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
+    let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().unwrap();
+    let mut backend = RealEbpfBackend::load(&object, &pin_root, 12345, &dae0_setup, 0)
         .await
         .unwrap();
     backend.publish_routing_plan(&plan, &[]).unwrap();
@@ -411,7 +412,7 @@ async fn pinned_generation_survives_restart_and_failed_fence() {
     );
     drop(backend);
 
-    let mut reloaded = RealEbpfBackend::load(&object, &pin_root, 12345, None, "lo", false)
+    let mut reloaded = RealEbpfBackend::load(&object, &pin_root, 12345, &dae0_setup, 0)
         .await
         .unwrap();
     reloaded.publish_routing_plan(&plan, &[]).unwrap();

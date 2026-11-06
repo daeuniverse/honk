@@ -70,11 +70,11 @@ hyper-util = { version = "0.1", features = [
 ] }
 
 # eBPF / Aya
-aya = "0.14"
-aya-obj = "0.3"
-aya-log = "0.3"
-aya-ebpf = "0.2"
-aya-ebpf-bindings = "0.2"
+aya = "0.16"
+aya-obj = "0.6"
+aya-log = "0.4"
+aya-ebpf = "0.3"
+aya-ebpf-bindings = "0.3"
 network-types = "0.2"
 
 # CLI
@@ -121,7 +121,7 @@ percent-encoding = "2"
 aho-corasick = "1"
 
 # Persistence (state database)
-rusqlite = { version = "0.40", features = ["bundled", "blob"] }
+rusqlite = { version = "0.41", features = ["bundled", "blob"] }
 
 # Misc
 chrono = { version = "0.4", features = ["serde"] }

@@ -326,6 +326,7 @@ mod tests {
             .unwrap(),
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: None,
         })
         .unwrap();
@@ -437,6 +438,7 @@ mod tests {
     }
     #[tokio::test]
     async fn deterministic_responses_preserve_the_live_session() {
+        use super::super::DnsSocketBudget;
         use super::*;
         use crate::dns::endpoint::DnsEndpoint;
         use crate::dns::forwarder::build_dns_query;
@@ -447,9 +449,15 @@ mod tests {
         let mut answer = query.clone();
         answer[..2].fill(0);
         answer[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
-        let (client_io, server_io) = tokio::io::duplex(4096);
+        let (mut config, _) = super::super::tests_proto::self_signed_server_config();
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
-            let mut connection = h2::server::handshake(server_io).await.unwrap();
+            let (tcp, _) = listener.accept().await.unwrap();
+            let tls = acceptor.accept(tcp).await.unwrap();
+            let mut connection = h2::server::handshake(tls).await.unwrap();
             let mut responses = tokio::task::JoinSet::new();
             for (status, body) in [(400, Vec::new()), (200, vec![0; 3]), (200, answer)] {
                 let (request, mut respond) = connection.accept().await.unwrap().unwrap();
@@ -470,17 +478,16 @@ mod tests {
                 });
             }
             assert!(
-                connection.accept().await.is_none(),
+                !matches!(connection.accept().await, Some(Ok(_))),
                 "unexpected query replay"
             );
             while let Some(result) = responses.join_next().await {
                 result.unwrap();
             }
         });
-        let unused_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = unused_listener.local_addr().unwrap();
         let active_tasks = Arc::new(AtomicUsize::new(0));
-        let client = DohClient::new_tracked(
+        let budget = DnsSocketBudget::new(1);
+        let mut client = DohClient::new_tracked(
             DialContext {
                 endpoint: DnsEndpoint::parse(
                     &format!("{address}/dns-query"),
@@ -489,17 +496,16 @@ mod tests {
                 )
                 .unwrap(),
                 query_timeout: Duration::from_secs(1),
-                dial_timeout: Duration::from_millis(100),
+                dial_timeout: Duration::from_secs(2),
+                socket_budget: budget.clone(),
                 proxy: None,
             },
             Arc::clone(&active_tasks),
         )
         .unwrap();
-        client
-            .session
-            .acquire(|| spawn_h2(client_io, Arc::clone(&active_tasks)))
-            .await
-            .unwrap();
+        Arc::get_mut(&mut client).unwrap().connector =
+            honk_outbound::tls::build_dns_connector(true, DOH_ALPN_WIRE).unwrap();
+        assert_eq!(budget.available_sockets(), 1);
         for _ in 0..2 {
             let error = client.exchange(&query, None).await.unwrap_err();
             assert!(
@@ -507,13 +513,22 @@ mod tests {
                     .chain()
                     .any(|cause| cause.is::<super::super::doh_message::DeterministicResponse>())
             );
+            assert_eq!(
+                budget.available_sockets(),
+                0,
+                "live H2 lost its socket credit"
+            );
+            assert_eq!(active_tasks.load(Ordering::SeqCst), 1);
         }
         let response = client.exchange(&query, None).await.unwrap();
         assert!(super::super::is_valid_response(&query, &response));
         assert_eq!(&response[..2], &query[..2]);
         assert_eq!(client.session.init_count(), 1);
+        assert_eq!(budget.available_sockets(), 0);
+        assert_eq!(active_tasks.load(Ordering::SeqCst), 1);
         client.close().await;
         assert_eq!(active_tasks.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.available_sockets(), 1);
         tokio::time::timeout(Duration::from_secs(2), server)
             .await
             .unwrap()

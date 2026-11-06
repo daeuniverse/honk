@@ -3,23 +3,10 @@ use super::*;
 #[tokio::test]
 async fn dns_wait_timeout_remains_retryable_with_free_admission() {
     // Bootstrap DNS is process-global; isolate it from parallel core tests.
-    const CHILD: &str = "HONK_DIAL_DNS_TIMEOUT_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "control::connection::tcp::dial_permit_scope_tests::dns_wait_timeout_remains_retryable_with_free_admission",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .output()
-            .expect("isolated DNS timeout test");
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if crate::test_support::run_exact_in_child(
+        "HONK_DIAL_DNS_TIMEOUT_CHILD",
+        "control::connection::tcp::dial_permit_scope_tests::dns_wait_timeout_remains_retryable_with_free_admission",
+    ) {
         return;
     }
 

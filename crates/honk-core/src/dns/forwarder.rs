@@ -148,6 +148,7 @@ pub struct DnsForwarder {
     pub(crate) policy_id: Option<PolicyId>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
+    socket_budget: super::transport::DnsSocketBudget,
     flights: Singleflight,
     refresh_tasks: Arc<refresh::RefreshTasks>,
     prefetch_tasks: Arc<prefetch::PrefetchTasks>,
@@ -178,12 +179,22 @@ impl DnsForwarder {
             policy_id: None,
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
+            socket_budget: super::transport::DnsSocketBudget::default(),
             flights: Singleflight::default(),
             refresh_tasks: refresh::RefreshTasks::new(),
             prefetch_tasks: prefetch::PrefetchTasks::new(),
             #[cfg(feature = "native-api")]
             configured_upstreams: Arc::from([]),
         }
+    }
+
+    pub fn with_socket_budget(mut self, budget: super::transport::DnsSocketBudget) -> Self {
+        self.socket_budget = budget;
+        self
+    }
+
+    pub(crate) fn socket_budget(&self) -> &super::transport::DnsSocketBudget {
+        &self.socket_budget
     }
 
     /// Set the IP-version strategy used for DNS responses.
@@ -350,6 +361,7 @@ impl DnsForwarder {
             policy_id: self.policy_id.clone(),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
+            socket_budget: self.socket_budget.clone(),
             flights: self.flights.clone(),
             refresh_tasks: Arc::clone(&self.refresh_tasks),
             prefetch_tasks: prefetch::PrefetchTasks::closed(),

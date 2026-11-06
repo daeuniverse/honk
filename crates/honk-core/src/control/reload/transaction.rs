@@ -232,6 +232,7 @@ impl ControlPlane {
             warn!(%error, "reload rejected: invalid subscription ids");
             return Ok(ReloadOutcome::Rejected);
         }
+        self.startup_downgrades.apply(&mut new_config);
         #[cfg(target_os = "linux")]
         if self
             .core_forward_users
@@ -408,8 +409,12 @@ impl ControlPlane {
                 return Ok(ReloadOutcome::Noop { generation });
             }
         }
-        let restart_required =
-            restart_required_fields(&current_config, &new_config, &self.log_files);
+        let restart_required = restart_required_fields(
+            &current_config,
+            &new_config,
+            &self.log_files,
+            &self.startup_downgrades,
+        );
         if !restart_required.is_empty() {
             warn!(
                 fields = ?restart_required.iter().map(|field| field.path).collect::<Vec<_>>(),
@@ -603,7 +608,6 @@ impl ControlPlane {
         let new_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation,
-                udp_query_limit: self.resource_budget.dns_slow_path,
                 forwarder: Arc::clone(&new_dns_forwarder),
                 routing_projection: Arc::clone(&projection_snapshot),
                 outbound_runtime: Some(Arc::clone(&new_runtime_registry)),
@@ -717,7 +721,6 @@ impl ControlPlane {
                             .map(|(ip, bitmap)| (ip, &bitmap.bitmap)));
                 drop(old_projection);
                 let provider = self.dns_controller.runtime_provider();
-                let publication = provider.prepare_publication(new_runtime);
 
                 let transition_group_count =
                     current_config.groups.len().max(new_config.groups.len());
@@ -768,6 +771,8 @@ impl ControlPlane {
                         "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
                     );
                 }
+                // Fence DNS admission for authority changes, not the preceding map staging.
+                let publication = provider.prepare_publication(new_runtime);
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();

@@ -3,27 +3,7 @@ use super::*;
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn missing_dae0_attach_failure_is_propagated() {
-    std::thread::spawn(|| {
-        nix::sched::unshare(
-            nix::sched::CloneFlags::CLONE_NEWNS | nix::sched::CloneFlags::CLONE_NEWNET,
-        )
-        .expect("create private test namespaces");
-        nix::mount::mount(
-            None::<&str>,
-            "/",
-            None::<&str>,
-            nix::mount::MsFlags::MS_REC | nix::mount::MsFlags::MS_PRIVATE,
-            None::<&str>,
-        )
-        .expect("make test mounts private");
-        nix::mount::mount(
-            Some("tmpfs"),
-            "/run",
-            Some("tmpfs"),
-            nix::mount::MsFlags::empty(),
-            None::<&str>,
-        )
-        .expect("isolate test runtime directory");
+    private_netns(|| {
         let mut netlink = crate::netlink::NlSock::new().unwrap();
         let missing = netlink
             .get_link("dae0")
@@ -66,7 +46,5 @@ fn missing_dae0_attach_failure_is_propagated() {
             netlink.get_link("dae0").is_err(),
             "failed attach created dae0"
         );
-    })
-    .join()
-    .expect("reply attach regression thread");
+    });
 }

@@ -1,6 +1,6 @@
 # Subscription reference
 
-`subscription {}` configures remote node lists. This reference covers entries, durable recovery, and accepted subscription body formats.
+`subscription {}` configures remote node lists.
 
 ## `subscription {}` syntax
 
@@ -19,11 +19,35 @@ subscription {
 }
 ```
 
-The entry block accepts `ua`, `interval`, `cache` and `route`. `interval` is a duration; `0` disables periodic refresh. `cache: false` keeps this subscription's body out of the subscription store. `route` selects the fetch route (see below). A missing option uses the `assets.subscription` default, or `assets.route` for the route, then the built-in default: User-Agent `honk/<version>`, `86400s`, cache on, `routing`. See the [assets reference](./assets.md).
+The entry block accepts four options:
 
-Two earlier forms still parse without a warning: a `(UA)` suffix after a quoted URL (`compatible: 'https://example.net/sub'(honk/1.0 like)`), and a block containing the URL (`detailed: { url: '…' ua: '…' }`). The block also accepts `download_detour` as an alias for `route`; setting both fails with `conflicting-subscription-route`. The rules below for suffixes and glued comments apply to the `(UA)` form.
+| Option | Effect | Built-in default |
+| --- | --- | --- |
+| `ua` | Override the request User-Agent. | `honk/<version>` |
+| `interval` | Set the refresh duration; `0` disables periodic refresh. | `86400s` |
+| `cache` | `false` keeps this subscription's body out of the subscription store. | On |
+| `route` | Select the fetch route (see below). | `routing` |
 
-Tags are optional. For a bare entry, the text before the first `:` is its tag unless that colon starts `://`; later colons in a URL do not split a tag. Tags and URLs may use matching single or double quotes. A quoted tag followed by `:` is explicit; otherwise the parser removes the URL's enclosing quotes before applying the same first-colon rule. Thus `'paid:https://example.com/sub'` has tag `paid`, while `'https://example.com/sub'` is tagless. Requiring quotes for the `(UA)` suffix keeps parentheses in bare URLs unambiguous. Both forms keep `sub_type: simple`, which automatically detects the supported body formats below.
+A missing option uses the `assets.subscription` default, or `assets.route` for the route, before the built-in default. See the [assets reference](./assets.md).
+
+Two earlier forms still parse without a warning:
+
+| Form | Example |
+| --- | --- |
+| `(UA)` suffix after a quoted URL | `compatible: 'https://example.net/sub'(honk/1.0 like)` |
+| URL inside a block | `detailed: { url: '…' ua: '…' }` |
+
+The block also accepts `download_detour` as an alias for `route`. Setting both fails with `conflicting-subscription-route`. The suffix and joined-comment rules below apply to the `(UA)` form.
+
+Tags are optional. Tags and URLs may use matching single or double quotes.
+
+| Entry form | Tag parsing |
+| --- | --- |
+| Bare entry | Text before the first `:` is the tag, unless that colon begins `://`. Later URL colons do not split a tag. |
+| Quoted tag followed by `:` | Explicit tag. |
+| Quoted URL without an explicit tag | Remove the enclosing quotes, then apply the first-colon rule. `'paid:https://example.com/sub'` has tag `paid`; `'https://example.com/sub'` is tagless. |
+
+The `(UA)` suffix requires a quoted URL, so parentheses in bare URLs remain unambiguous. Both forms retain `sub_type: simple`, which automatically detects the supported body formats below.
 
 The link suffix is parsed before embedded-tag normalization: `'paid:https://example.com/sub'(agent)` and `'paid:https://example.com/sub'#note` retain tag `paid`. Diagnostic entry ordinals count both block and inline declarations in source order, including skipped entries.
 For a quoted head, only a colon immediately after the closing quote (allowing whitespace) declares an explicit tag. Colons in an unquoted User-Agent or glued comment suffix remain suffix data: `'https://example.com/sub'(agent:1)` is still tagless.
@@ -79,33 +103,92 @@ Body parser selection:
 | Key | URL-safe Base64 of a SHA-256 hash over the length-delimited URL, configured user-agent override (empty when unset or empty), and ordered header key/value pairs, plus `.sub`. The versioned default request UA is intentionally not part of the key, so default subscriptions retain their body across upgrades. The request identity is not exposed in plaintext. |
 | Write boundary | After HTTP success and body acceptance, the complete raw response, including rejected entries, is written in one transaction. |
 | Limits | Each body is at most 8 MiB, and all bodies together at most 32 MiB. A write that would pass 32 MiB first deletes bodies of subscriptions that are no longer enabled; if that is not enough it is refused, the previous body stays, and the fetch reports `subscription-store-write-failed`. A body whose subscription is not enabled at two consecutive maintenance ticks (every 60 seconds) is deleted, and a start with `store_subscribe: false` that still opens the state db, for `cache_file`, `password_auth` or `--store db`, empties the table. |
-| Upgrade from `.sub` | Once the instance lock is held, a start copies the bodies of enabled subscriptions from the first private legacy store it finds in `<data_dir>/.sub`, `/var/share/honk/.sub` and `./.sub`, keeping bodies already in the state db. honk then unlinks the copied `*.sub` and every `.*.tmp` in that directory and removes it if empty; other legacy locations are left alone. A body that is unreadable, over 8 MiB, or would pass 32 MiB in total stays with a warning, and the body of a disabled subscription stays too, so a later start that enables the subscription imports it without a fetch. The previous process has exited by then, so a body it wrote last is copied like the others. An older binary started afterwards finds only the bodies left behind and fetches the others again. |
+| Upgrade from `.sub` | Import eligible legacy bodies after acquiring the instance lock, as described below. |
 | Redirects | At most 5 hops. A redirect from `https` to another scheme fails the fetch, as does one to a loopback, private, link-local, or unspecified literal address that the configured URL did not itself use. A hostname resolving to such an address is not detected. |
 | Body size | At most 8 MiB, enforced while reading rather than after the body is buffered. |
 
-Subscription bodies and the nodes created from them remain runtime state; neither is written back into the dae configuration.
+Legacy `.sub` import runs at startup after the instance lock is held:
 
-Subscription fetches follow routing unless the entry's `route` (or `assets.route`) says otherwise, like every other download honk makes itself. With `routing` the fetch target goes through the routing rules as user traffic does, so a rule can send it to a node, a group, `direct`, or `block`; each redirect is routed again. A group name forces that group. Routed requests share the route decision and tunnel of geodata and external UI downloads, send the same `User-Agent` and headers, and keep the 30-second timeout, 8 MiB limit, and redirect rules (only 301, 302, 303, 307 and 308, at most 5, never from HTTPS to HTTP, never to a private literal address from a public one). URL userinfo is sent as basic authentication, and a redirect to another scheme, host or port drops `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. `direct` keeps the previous transport: the bootstrap resolver and the bypass mark, with no routing involved. Builds without the `native-api` feature route these fetches the same way.
+1. Select the first private legacy store in `<data_dir>/.sub`, `/var/share/honk/.sub`, then `./.sub`.
+2. Copy bodies for enabled subscriptions, retaining bodies already in the state db.
+3. Unlink copied `*.sub` files and every `.*.tmp` file in that directory. Remove the directory if empty. Leave other legacy locations unchanged.
+
+Unreadable bodies, bodies over 8 MiB, and bodies that would exceed the 32 MiB total remain in place with a warning. Disabled subscriptions' bodies also remain. A later startup that enables such a subscription can import its body without fetching it.
+
+The previous process has exited before import, so its final body writes are copied like the others. An older binary started afterward finds only the bodies left behind and fetches the others again.
+
+Subscription bodies and their nodes remain runtime state. Neither is written back into the dae configuration.
+
+Subscription fetches follow routing unless the entry's `route` or `assets.route` overrides it, as with other downloads initiated by honk.
+
+| Route | Behavior |
+| --- | --- |
+| Empty or `routing` | Apply traffic-routing rules to each URL, including redirects. Rules may select a node, group, `direct`, or `block`. |
+| Group name | Force that group. |
+| `direct` | Use the bootstrap resolver and bypass mark, without routing. This retains the previous direct transport. |
+
+Routed requests share route decisions and tunnels with geodata and external UI downloads. They retain the same `User-Agent`, headers and download constraints:
+
+| Constraint | Behavior |
+| --- | --- |
+| Timeout and body size | 30 seconds; at most 8 MiB. |
+| Redirect status | Only 301, 302, 303, 307 and 308; at most 5 hops. |
+| Redirect destination | Never HTTPS to HTTP, or a public address to a private literal address. The redirect restrictions in the preceding table also apply. |
+| URL userinfo | Sent as basic authentication. |
+| Change of scheme, host or port | Drop `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. |
+
+Builds without `native-api` route subscription fetches identically.
 
 A subscription can route through nodes it supplies itself, for example when the rules send its URL to a group made only of its own nodes. On a fresh install those nodes do not exist yet. honk never falls back to direct: when the chosen route has no usable node, the fetch fails with an error that names the subscription and the outbound, says the route cannot carry the download yet, and suggests `route: direct` for that subscription. The provider status in the native API reports `last_error.code` `route_unavailable`. Nodes restored from the stored body stay in service throughout.
 
-Routing starts after the startup subscription pass. Only `direct` subscriptions take part in the five-second first-fetch wait; routed subscriptions restore their stored body there and are fetched as soon as routing is ready.
+Startup restores nodes before refreshing subscriptions:
 
-Startup parses stored bodies before launching network refreshes. A valid restored body supplies active nodes immediately and excludes that subscription from the five-second first-fetch wait; its refresh still runs in the background. Missing, invalid or empty stored bodies are ignored. Only direct subscriptions without a valid restore enter the shared bounded wait, until their fetch finishes or the deadline expires; routed subscriptions fetch once routing is ready. A later accepted refresh replaces the SQLite body row, not a legacy file.
+1. Parse stored bodies before starting network refreshes. A valid restored body supplies active nodes immediately. Missing, invalid or empty stored bodies are ignored.
+2. Wait for direct subscriptions without a valid restore to finish fetching, within one shared five-second deadline. A valid restore excludes that subscription from the wait; its refresh still runs in the background.
+3. Make routing ready after the startup subscription pass, then fetch routed subscriptions.
 
-A restored or first-fetched body whose node ID is already used by an inline node or another subscription's node leaves that subscription out of the startup configuration instead of failing startup; a runtime publication rejects the same collision. A body may still replace the subscription's own nodes. The native API provider reports `last_error.code` `publication_rejected` with `last_error.details.diagnostic_code` `duplicate-node-id`. A restored body rejected this way still counts as restored: the subscription does not join the first-fetch wait, and its background refresh still runs and repeats the check.
+A later accepted refresh replaces the SQLite body row, not a legacy file.
+
+If a restored or first-fetched body contains a node ID already used by an inline node, startup excludes that subscription instead of failing, and runtime publication rejects the same collision. A node whose ID another subscription already published is dropped from this subscription with a warning, and its other nodes are published; the first subscription keeps the node. A body may still replace its own subscription's nodes.
+
+The native API provider reports `last_error.code` as `publication_rejected` and `last_error.details.diagnostic_code` as `duplicate-node-id`. A restored body rejected this way still counts as restored: it skips the first-fetch wait. Background refresh still runs and repeats the check.
 
 On SIGHUP, subscriptions with the same fetch identity (URL + configured `ua` + headers) retain their runtime ID. The reload carries active nodes belonging to still-enabled subscriptions, commits the rebuilt configuration, and then starts an immediate background refresh. It does not read stored bodies, even when no nodes survive for a subscription; stored-body recovery runs only at startup.
 
 Failure handling preserves a usable runtime rather than clearing it:
 
 - HTTP, invalid UTF-8 encoding, parse, or no-usable-node failure publishes no replacement nodes and performs no write, so the active nodes and last valid stored body remain. Accepted bodies are persisted byte-for-byte, without repairing encoding.
+- Fetch failures first retry after the smaller of 30 seconds and `interval`, then double the delay up to the smaller of 10 minutes and `interval`; `interval: 0` disables automatic retries. Publication acceptance or rejection clears existing backoff and resumes the normal interval.
 - A persistence-write failure is non-fatal after parsing: the newly parsed nodes are still returned for publication, while the atomic path never installs a partially written body. The next restart can therefore restore whichever complete valid body remains on disk.
-- An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based proxy index and a static rejection reason, never the raw record or its credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
+- An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based entry index and a static rejection reason. Stream-normalization failures also retain the canonical field, such as `proxies[1].xhttp` or `outbounds[1].ws_headers`, without exposing supplied header names, values or credentials. The whole body fails only when no usable nodes remain; an empty result never clears the previous generation.
 
 The last valid body is the last body accepted by the current import policy, not the last successfully published runtime generation. A partial body with one distinct usable node may replace the stored body; an all-invalid body cannot. Restore reparses with the current policy and may reject a body saved by an older version. Runtime collection or publication failure after a successful write retains the active generation but can leave the new body on disk. Disk and active state are not one transaction.
 
 Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
+
+## First start when the subscription URL is blocked
+
+If the subscription URL is blocked or its domain is poisoned, add a reachable static proxy node and set the subscription's `route` to a group containing only that node.
+This group is available on first start without nodes from any subscription.
+Replace the SOCKS5 address below with a proxy that can reach the provider, and replace the subscription URL with your own.
+
+```dae
+node {
+    bootstrap: 'socks5://192.168.1.2:1080'
+}
+
+group {
+    Bootstrap {
+        filter: name(bootstrap)
+    }
+}
+
+subscription {
+    provider: 'https://example.com/sub' {
+        route: Bootstrap
+    }
+}
+```
 
 ## Subscription body formats
 
@@ -147,11 +230,12 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |
 | `skip-cert-verify`, `skip_cert_verify`, `insecure` | `skip_cert_verify` | Native booleans; supplied aliases must agree. |
+| `fingerprint`, `pin-sha256`, `pin_sha256` | `tls_pin_sha256` | Leaf-certificate SHA-256 pin (hex; colons and whitespace ignored) that replaces PKI and hostname verification. All TLS protocols import Clash's `fingerprint`; a protocol without TLS skips the entry. Supplied aliases must agree. |
 | `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for raw-TCP TLS; XHTTP accepts only H2 and normalizes omission to `["h2"]`. QUIC retains the protocol-specific rules below. |
 
 #### Protocol-specific options
 
-Hysteria2 imports `password`/`auth`, `obfs: salamander` with `obfs-password`, upload/download bandwidth, `ports`/`mport` hopping ranges, `hop-interval`/`mhop`, receive windows, MTU, and MTU-discovery settings. TUIC imports UUID/password, congestion control, ALPN, receive windows, and MTU. AnyTLS imports `idle-session-check-interval`, `idle-session-timeout`, and `min-idle-session`. Supported spelling aliases are normalized before node identity is derived.
+Supported spelling aliases normalize before node identity is derived.
 
 WireGuard uses a dedicated single-peer adapter, including a one-element Mihomo `peers` array. Parent and peer claims must agree after typed conversion; zero/multiple peers, malformed keys/addresses/MTU/reserved bytes and empty allowed-IP lists reject only that entry. `udp: false` maps to `network: tcp`. WARP `reserved` accepts three integer bytes or base64, without dropping the value. Active AmneziaWG options, stream/TLS wrappers and `dialer-proxy` chaining reject instead of producing a plain/direct substitute.
 
@@ -169,13 +253,45 @@ WireGuard uses a dedicated single-peer adapter, including a one-element Mihomo `
 
 Key decoding, interface-prefix stripping, allowed-IP canonicalization and MTU bounds are shared with [WireGuard share links and flat nodes](./nodes.md#wireguard). Missing allowed IPs default to both full routes; no tunnel address is synthesized. URI lists delegate to the same canonical parser. Surge-style WireGuard section references are not URI links and remain unsupported.
 
-Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols; an explicit UDP restriction is rejected where the node model cannot preserve it. TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection; Juicity receive windows remain fixed at 8 MiB, so non-default overrides are rejected.
+| Protocol | Imported options |
+| --- | --- |
+| Hysteria2 | `password`/`auth`; `obfs: salamander` with `obfs-password`; upload/download bandwidth; `ports`/`mport` hopping ranges; `hop-interval`/`mhop`; receive windows; MTU and MTU-discovery settings. |
+| TUIC | UUID/password, congestion control, ALPN, receive windows, MTU. |
+| AnyTLS | `idle-session-check-interval`, `idle-session-timeout`, `min-idle-session`. |
+
+Explicit disabled feature blocks are treated as disabled, not as unsupported active features. `udp: true` is accepted for intrinsically UDP-capable protocols, and ignored on VMess, which has no UDP path, so the node still imports for TCP. An explicit UDP restriction is rejected where the node model cannot preserve it.
+
+TUIC permits an absent or empty password. Hysteria2 and Juicity accept an explicit `h3` ALPN matching their fixed runtime selection.
+
+Juicity starts with 8 MiB stream and connection receive windows; adaptive flow control can raise each of them up to 32 MiB. Imported initial-window fields accept absent values, `0`, or `8388608`; other overrides are rejected.
 
 AnyTLS packet claims are resolved once in this order: `anytls-network`, applicable `network`, then `udp`. Empty or null network text supplies no claim. Network strings use comma-separated `tcp`/`udp` tokens; aliases are compared by UDP allowance, so `udp` and `tcp,udp` agree, while `tcp` with `udp: true` conflicts. Unknown tokens such as `quic` reject the entry even beside a valid alias. Equivalent claims retain the first explicit network spelling; only a boolean-only input synthesizes `tcp` or `tcp,udp`.
 
-TCP TLS ALPN list members are preserved verbatim, including order; each name must occupy 1–255 UTF-8 bytes and the length-prefixed list may not exceed 65,533 bytes. This is a syntactic ceiling; the complete ClientHello also has TLS-library size limits. Absent, null, or empty imported `alpn` lists preserve existing TLS-profile defaults and node IDs; the flat `tls_alpn` field accepts omission or a string array, not null. Nonempty overrides participate in identity and are rejected with disabled TLS, REALITY, WebSocket, or gRPC rather than silently discarded. Chrome ALPS is offered only when the actual ALPN list contains `h2`. Share-link ALPN compatibility is unchanged; this applies to structured subscription imports and the flat `tls_alpn` model field.
+TCP TLS ALPN rules apply to structured subscription imports and the flat `tls_alpn` field. Share-link ALPN compatibility is unchanged.
 
-XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including REALITY or explicit cleartext H2. Mihomo `network: xhttp` (or input alias `splithttp`) accepts `xhttp-opts` keys `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, and `sc-min-posts-interval-ms`. Server-only `no-sse-header`, `sc-max-buffered-posts` and `sc-stream-up-server-secs` are type-checked and dropped; `reuse-settings` and `xmux` follow the URI `xmux` rule with Xray's meaning, although mihomo would enable its own reuse manager whenever `reuse-settings` is present. `download-settings` must be a mapping in the Xray StreamConfig shape panels export (`address`, `port`, `network`, `security`, `alpn`, `tlsSettings`, `xhttpSettings`), optionally with flat `x-padding-bytes`, upload-only `no-grpc-header`/`sc-*` keys and default `reuse-settings`/`xmux`; it has the URI `downloadSettings` meaning, so both exports of one subscription import the same node IDs. Mihomo's own inheriting keys (`server`, `servername`, `tls`, `skip-cert-verify`, ...) reject. This deliberately differs from mihomo, which ignores the Xray-shaped keys and sends GETs to the upload server. The canonical defaults, bounds and header restrictions are in the [XHTTP node reference](./nodes.md#xhttp-over-h2). Other unsupported options, such as alternate placements and padding-obfuscation settings, reject that entry by raw presence, including null/empty/false; valid sibling nodes survive. URI/VMess extra JSON rejects duplicate members before decoding them into maps.
+| Input or constraint | Behavior |
+| --- | --- |
+| List members | Preserve bytes and order. Each name occupies 1–255 UTF-8 bytes. |
+| Length-prefixed list | At most 65,533 bytes. The complete ClientHello also has TLS-library size limits. |
+| Imported `alpn` absent, null, or empty | Preserve existing TLS-profile defaults and node IDs. |
+| Flat `tls_alpn` | Accept omission or a string array, not null. |
+| Nonempty override | Participate in node identity. Reject with disabled TLS, REALITY, WebSocket, or gRPC instead of discarding it. |
+| Chrome ALPS | Offer only when the actual ALPN list contains `h2`. |
+
+XHTTP is the exception to the raw-TCP ALPN rule: it always uses H2, including REALITY and explicit cleartext H2. Mihomo accepts `network: xhttp` or the input alias `splithttp`.
+
+| `xhttp-opts` fields | Import behavior |
+| --- | --- |
+| `path`, `host`, `mode`, `headers`, `x-padding-bytes`, `no-grpc-header`, `sc-max-each-post-bytes`, `sc-min-posts-interval-ms` | Accepted. |
+| `no-sse-header`, `sc-max-buffered-posts`, `sc-stream-up-server-secs` | Server-only; type-checked and dropped. |
+| `reuse-settings`, `xmux` | Follow the URI `xmux` rule with Xray's meaning. Mihomo instead enables its own reuse manager whenever `reuse-settings` is present. |
+| `download-settings` | Must be an Xray StreamConfig mapping, as described below. |
+
+`download-settings` accepts the panel-exported Xray shape: `address`, `port`, `network`, `security`, `alpn`, `tlsSettings`, and `xhttpSettings`. It may also contain flat `x-padding-bytes`, upload-only `no-grpc-header`/`sc-*` keys, and default `reuse-settings`/`xmux`. It has the same meaning as URI `downloadSettings`, so the two exports of one subscription produce the same node IDs.
+
+Mihomo's inheriting keys, such as `server`, `servername`, `tls`, and `skip-cert-verify`, reject. This intentionally differs from mihomo, which ignores Xray-shaped keys and sends GETs to the upload server. See the [XHTTP node reference](./nodes.md#xhttp-over-h2) for canonical defaults, bounds and header restrictions.
+
+Other unsupported options, including alternate placements and padding-obfuscation settings, reject the entry by raw presence, even when null, empty or false. Valid sibling nodes survive. URI/VMess extra JSON rejects duplicate members before map construction.
 
 #### VLESS transport and REALITY
 
@@ -191,7 +307,8 @@ VLESS fields are applied before node identity is derived:
 | `reality-opts.short-id` | Optional REALITY short ID. |
 | `reality-opts.spider-x` | REALITY spider path; missing or empty becomes `/`. |
 | `ws-opts.path` | WebSocket path; falls back to flat `ws-path`. |
-| `ws-opts.headers.Host` | WebSocket Host header, with case-insensitive key matching; falls back to scalar `ws-headers`, then `ws-host`. |
+| `ws-opts.headers.Host` | WebSocket Host header: the first nonblank case-insensitive Host value wins; strings retain their bytes and finite numbers become text. Invalid or blank Host values are ignored. Falls back to scalar `ws-headers`, then `ws-host`, inspecting each only if no earlier value won. |
+| `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#node-fields). |
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
 
@@ -214,7 +331,15 @@ Import defaults are source-specific. They do not all mean honk's canonical `pack
 
 For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are inactive behind the selected wrapper.
 
-An enabled Clash `mux` block accepts active settings only for `enabled`, signed-`i16` `concurrency`, signed-`i16` `xudpConcurrency`, and `xudpProxyUDP443`; inactive extras are ignored. Zero TCP concurrency allows 8 concurrent logical children per carrier, a negative value disables TCP mux, and a positive value sets that per-carrier concurrency up to 128—it never specifies a physical-carrier count. Zero XUDP concurrency shares the enabled TCP pool and its per-carrier concurrency, or follows the packet fallback when TCP mux is disabled; negative always follows the fallback, and positive creates a separate UDP pool with that per-carrier logical-child concurrency, capped at 128. UDP/443 policy is `allow` by default and also accepts `skip` or `reject`; its precedence is documented in the [node reference](./nodes.md#vless-udp-and-multiplexing).
+An enabled Clash `mux` block accepts active settings only for `enabled`, signed-`i16` `concurrency`, signed-`i16` `xudpConcurrency`, and `xudpProxyUDP443`. Inactive extras are ignored.
+
+| Concurrency value | TCP `concurrency` | `xudpConcurrency` |
+| --- | --- | --- |
+| Negative | Disable TCP mux. | Use the packet fallback. |
+| Zero | Allow 8 concurrent logical children per TCP carrier. | Share the enabled TCP pool and its per-carrier concurrency. If TCP mux is disabled, use the packet fallback. |
+| Positive | Set per-carrier logical-child concurrency, capped at 128. | Create a separate UDP pool with this per-carrier logical-child concurrency, capped at 128. |
+
+Concurrency never specifies a physical-carrier count. UDP/443 policy defaults to `allow` and also accepts `skip` or `reject`. See the [node reference](./nodes.md#vless-udp-and-multiplexing) for precedence.
 
 `udp: false` disables packet dialing independently; it does not disable an eligible bare TCP path. A VLESS Clash entry is also rejected for conflicting aliases, duplicate XUDP representations, enabled packet-address mode, unsupported packet encoding, unsupported UoT version, or an invalid/unsupported active Xray mux setting.
 
@@ -224,7 +349,22 @@ Canonical VLESS share links use exact `packetEncoding=auto|none|xudp|uot-v2`, `m
 
 SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
 
-sing-box profiles import supported entries from `outbounds`: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS. Structural `selector`, `urltest`, `direct`, `block`, and `dns` entries are not proxy nodes. TLS/SNI, REALITY, WebSocket/gRPC, VLESS packet choices, and supported protocol tuning are normalized through the common node builder. A sing-box VLESS entry defaults specifically to Single XUDP with UDP permitted when no enabled H2MUX/UoT wrapper or explicit `packet_encoding` selects another path. This is a sing-box import default, not the global meaning of Auto. Empty or omitted gRPC service names retain sing-box's empty service rather than honk's `GunService` default. Hysteria2 accepts `server_ports` without `server_port`, using the first hopping port as its nominal endpoint. Unsupported chaining, wire features, or authentication requirements are not silently discarded, and per-node uTLS fingerprint hints do not override honk's process-wide TLS selection.
+sing-box profiles import supported entries from `outbounds`:
+
+- Proxy nodes: Shadowsocks, SOCKS5, VMess, VLESS, Trojan, Hysteria2, TUIC, Juicity, and AnyTLS.
+- Structural entries, not proxy nodes: `selector`, `urltest`, `direct`, `block`, and `dns`.
+
+TLS/SNI, REALITY, WebSocket/gRPC (including non-`Host` upgrade headers), VLESS packet choices, and supported protocol tuning normalize through the common node builder.
+
+| Source-specific case | Import behavior |
+| --- | --- |
+| WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#node-fields). |
+| VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
+| Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
+| Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |
+| Per-node uTLS fingerprint hint | Does not override honk's process-wide TLS selection. |
+
+Unsupported chaining, wire features, and authentication requirements are not silently discarded.
 
 WireGuard additionally imports the legacy `type: wireguard` outbound and the newer `endpoints` array. A profile can contain both `outbounds` and `endpoints`; valid entries in both survive invalid neighbors, with diagnostics retaining their original section and one-based position. Endpoints must describe exactly one peer. `system: true`, `system_interface: true`, nonzero `listen_port`, peer wire extensions and detour chaining are unsupported; honk's tunnel is userspace-owned. Worker-count hints do not change the protocol model.
 

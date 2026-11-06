@@ -186,196 +186,215 @@ async fn ui_serves_only_its_directory_with_navigation_and_static_cache_policy() 
 async fn embedded_ui_preserves_assets_head_and_safe_navigation() {
     use std::io::Read;
 
-    let app = TestApp::new(|config| config.experimental.native_api.ui = "embedded".into()).await;
-    for path in ["/", "/ui", "/ui/a/", "/ui/a/b"] {
-        for method in [Method::GET, Method::HEAD] {
-            let response = app
-                .client
-                .request(method, app.url(path))
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
-            assert_eq!(response.headers()["location"], "/ui/");
-        }
-    }
-
-    let navigation = app.client.get(app.url("/ui/a/b")).send().await.unwrap();
-    let entry_url = navigation
-        .url()
-        .join(navigation.headers()["location"].to_str().unwrap())
-        .unwrap();
-    let response = app.client.get(entry_url).send().await.unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.url().path(), "/ui/");
-    assert_eq!(response.headers()["content-type"], "text/html");
-    let entry_url = response.url().clone();
-    let index = response.text().await.unwrap();
-    assert_eq!(
-        index,
-        include_str!(concat!(env!("HONK_DOONA_DIR"), "/index.html"))
-    );
+    let standard = std::path::Path::new(env!("HONK_DOONA_DIR"));
+    let mut lite_name = standard.file_name().unwrap().to_os_string();
+    lite_name.push("-lite");
     let references = regex::Regex::new(r#"(?:src|href)="(\./[^"]+)""#).unwrap();
-    let paths = references
-        .captures_iter(&index)
-        .map(|value| value[1].to_owned());
-    for path in paths.chain(["./index.html".into(), "./sw.js".into()]) {
-        let url = entry_url.join(&path).unwrap();
-        let expected =
-            std::fs::read(std::path::Path::new(env!("HONK_DOONA_DIR")).join(&path)).unwrap();
-        for method in [Method::GET, Method::HEAD] {
-            let response = app
-                .client
-                .request(method.clone(), url.clone())
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            assert_eq!(
-                response.headers()["cache-control"],
-                if path.starts_with("./assets/") {
-                    "public, max-age=31536000, immutable"
+    for (ui, directory) in [
+        ("embedded", standard.to_path_buf()),
+        ("embedded-lite", standard.with_file_name(lite_name)),
+    ] {
+        let app = TestApp::new(|config| config.experimental.native_api.ui = ui.into()).await;
+        for path in ["/", "/ui", "/ui/a/", "/ui/a/b"] {
+            for method in [Method::GET, Method::HEAD] {
+                let response = app
+                    .client
+                    .request(method, app.url(path))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+                assert_eq!(response.headers()["location"], "/ui/");
+            }
+        }
+
+        let navigation = app.client.get(app.url("/ui/a/b")).send().await.unwrap();
+        let entry_url = navigation
+            .url()
+            .join(navigation.headers()["location"].to_str().unwrap())
+            .unwrap();
+        let response = app.client.get(entry_url).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.url().path(), "/ui/");
+        assert_eq!(response.headers()["content-type"], "text/html");
+        let entry_url = response.url().clone();
+        let index = response.text().await.unwrap();
+        assert_eq!(
+            index,
+            std::fs::read_to_string(directory.join("index.html")).unwrap(),
+            "{ui}"
+        );
+        let paths = references
+            .captures_iter(&index)
+            .map(|value| value[1].to_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            paths.iter().any(|path| path.starts_with("./assets/")),
+            "{ui}"
+        );
+        for path in paths
+            .into_iter()
+            .chain(std::iter::once("./index.html".into()))
+            .chain((ui == "embedded").then(|| "./sw.js".into()))
+        {
+            let url = entry_url.join(&path).unwrap();
+            let expected = std::fs::read(directory.join(&path)).unwrap();
+            for method in [Method::GET, Method::HEAD] {
+                let response = app
+                    .client
+                    .request(method.clone(), url.clone())
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                assert_eq!(
+                    response.headers()["cache-control"],
+                    if path.starts_with("./assets/") {
+                        "public, max-age=31536000, immutable"
+                    } else {
+                        "no-cache"
+                    },
+                    "{path}"
+                );
+                assert_eq!(response.headers()["x-content-type-options"], "nosniff");
+                assert!(response.headers().get("x-frame-options").is_none());
+                assert_eq!(
+                    response.headers()["content-length"]
+                        .to_str()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap(),
+                    expected.len()
+                );
+                let mime = match path.rsplit('.').next().unwrap() {
+                    "html" => "text/html",
+                    "js" => "text/javascript",
+                    "css" => "text/css",
+                    "svg" => "image/svg+xml",
+                    "webmanifest" => "application/manifest+json",
+                    "png" => "image/png",
+                    extension => panic!("unexpected entry asset extension: {extension}"),
+                };
+                assert_eq!(response.headers()["content-type"], mime, "{path}");
+                let body = response.bytes().await.unwrap();
+                if method == Method::HEAD {
+                    assert!(body.is_empty(), "{path}");
                 } else {
-                    "no-cache"
-                },
-                "{path}"
-            );
-            assert_eq!(response.headers()["x-content-type-options"], "nosniff");
-            assert!(response.headers().get("x-frame-options").is_none());
-            assert_eq!(
-                response.headers()["content-length"]
+                    assert_eq!(body.as_ref(), expected, "{path}");
+                }
+            }
+            if path.ends_with(".png") {
+                continue;
+            }
+            for encoding in ["br", "gzip"] {
+                let response = app
+                    .client
+                    .get(url.clone())
+                    .header("accept-encoding", format!("identity;q=0.5, {encoding}"))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+                let Some(content_encoding) = response.headers().get("content-encoding") else {
+                    // The build stores a file as is when compression does not shrink it.
+                    assert!(expected.len() < 1024, "{path}");
+                    assert_eq!(response.headers()["vary"], "Origin", "{path}");
+                    assert_eq!(response.bytes().await.unwrap().as_ref(), expected, "{path}");
+                    continue;
+                };
+                assert_eq!(content_encoding, encoding, "{path}");
+                assert_eq!(response.headers()["vary"], "accept-encoding", "{path}");
+                let length = response.headers()["content-length"]
                     .to_str()
                     .unwrap()
                     .parse::<usize>()
-                    .unwrap(),
-                expected.len()
-            );
-            let mime = match path.rsplit('.').next().unwrap() {
-                "html" => "text/html",
-                "js" => "text/javascript",
-                "css" => "text/css",
-                "svg" => "image/svg+xml",
-                "webmanifest" => "application/manifest+json",
-                "png" => "image/png",
-                extension => panic!("unexpected entry asset extension: {extension}"),
-            };
-            assert_eq!(response.headers()["content-type"], mime, "{path}");
-            let body = response.bytes().await.unwrap();
-            if method == Method::HEAD {
-                assert!(body.is_empty(), "{path}");
-            } else {
-                assert_eq!(body.as_ref(), expected, "{path}");
+                    .unwrap();
+                let body = response.bytes().await.unwrap();
+                assert_eq!(body.len(), length, "{path}");
+                assert!(body.len() < expected.len(), "{path}");
+                let mut decoded = Vec::new();
+                if encoding == "br" {
+                    brotli::Decompressor::new(body.as_ref(), 4096)
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                } else {
+                    flate2::read::GzDecoder::new(body.as_ref())
+                        .read_to_end(&mut decoded)
+                        .unwrap();
+                }
+                assert_eq!(decoded, expected, "{path}");
             }
         }
-        if path.ends_with(".png") {
-            continue;
-        }
-        for encoding in ["br", "gzip"] {
+        if ui == "embedded" {
+            let webp = std::fs::read_dir(directory.join("assets"))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .find(|name| name.ends_with(".webp"))
+                .unwrap();
             let response = app
                 .client
-                .get(url.clone())
-                .header("accept-encoding", format!("identity;q=0.5, {encoding}"))
+                .get(entry_url.join(&format!("./assets/{webp}")).unwrap())
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let Some(content_encoding) = response.headers().get("content-encoding") else {
-                // The build stores a file as is when compression does not shrink it.
-                assert!(expected.len() < 1024, "{path}");
-                assert_eq!(response.headers()["vary"], "Origin", "{path}");
-                assert_eq!(response.bytes().await.unwrap().as_ref(), expected, "{path}");
-                continue;
-            };
-            assert_eq!(content_encoding, encoding, "{path}");
-            assert_eq!(response.headers()["vary"], "accept-encoding", "{path}");
-            let length = response.headers()["content-length"]
-                .to_str()
-                .unwrap()
-                .parse::<usize>()
-                .unwrap();
-            let body = response.bytes().await.unwrap();
-            assert_eq!(body.len(), length, "{path}");
-            assert!(body.len() < expected.len(), "{path}");
-            let mut decoded = Vec::new();
-            if encoding == "br" {
-                brotli::Decompressor::new(body.as_ref(), 4096)
-                    .read_to_end(&mut decoded)
-                    .unwrap();
-            } else {
-                flate2::read::GzDecoder::new(body.as_ref())
-                    .read_to_end(&mut decoded)
-                    .unwrap();
-            }
-            assert_eq!(decoded, expected, "{path}");
+            assert_eq!(response.status(), StatusCode::OK, "{webp}");
+            assert_eq!(response.headers()["content-type"], "image/webp", "{webp}");
         }
+        for path in [
+            "/ui/missing.js",
+            "/ui/assets/missing",
+            "/ui/fonts/missing",
+            "/ui/icons/missing",
+            "/ui/missing.webmanifest",
+            "/ui/provenance/source.tar.gz",
+        ] {
+            let response = app.client.get(app.url(path)).send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_ne!(response.text().await.unwrap(), index);
+        }
+        for path in [
+            "/ui/../private",
+            "/ui/%2e%2e/private",
+            "/ui/%2E%2E%2Fprivate",
+            "/ui/%2e%2e%5cprivate",
+            "/ui/%00",
+            "/ui/%FF",
+            "/ui/%zz",
+        ] {
+            let response = raw_request(&app, path, "", b"").await;
+            assert!(
+                (400..500).contains(&response.status),
+                "{path}: {}",
+                response.status
+            );
+            assert_ne!(response.body, index.as_bytes());
+        }
+        for (header, value) in [
+            ("host", "attacker.example"),
+            ("origin", "https://attacker.example"),
+        ] {
+            let response = app
+                .client
+                .get(app.url("/ui/"))
+                .header(header, value)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        // Serving the UI does not exempt the API: a protected route still needs its bearer.
+        error_response(
+            app.client
+                .get(app.url("/api/v1/version"))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::UNAUTHORIZED,
+            "authentication_required",
+        )
+        .await;
+        app.shutdown().await;
     }
-    let webp = std::fs::read_dir(std::path::Path::new(env!("HONK_DOONA_DIR")).join("assets"))
-        .unwrap()
-        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-        .find(|name| name.ends_with(".webp"))
-        .unwrap();
-    let response = app
-        .client
-        .get(entry_url.join(&format!("./assets/{webp}")).unwrap())
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK, "{webp}");
-    assert_eq!(response.headers()["content-type"], "image/webp", "{webp}");
-    for path in [
-        "/ui/missing.js",
-        "/ui/assets/missing",
-        "/ui/fonts/missing",
-        "/ui/icons/missing",
-        "/ui/missing.webmanifest",
-        "/ui/provenance/source.tar.gz",
-    ] {
-        let response = app.client.get(app.url(path)).send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-        assert_ne!(response.text().await.unwrap(), index);
-    }
-    for path in [
-        "/ui/../private",
-        "/ui/%2e%2e/private",
-        "/ui/%2E%2E%2Fprivate",
-        "/ui/%2e%2e%5cprivate",
-        "/ui/%00",
-        "/ui/%FF",
-        "/ui/%zz",
-    ] {
-        let response = raw_request(&app, path, "", b"").await;
-        assert!(
-            (400..500).contains(&response.status),
-            "{path}: {}",
-            response.status
-        );
-        assert_ne!(response.body, index.as_bytes());
-    }
-    for (header, value) in [
-        ("host", "attacker.example"),
-        ("origin", "https://attacker.example"),
-    ] {
-        let response = app
-            .client
-            .get(app.url("/ui/"))
-            .header(header, value)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    }
-    // Serving the UI does not exempt the API: a protected route still needs its bearer.
-    error_response(
-        app.client
-            .get(app.url("/api/v1/version"))
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::UNAUTHORIZED,
-        "authentication_required",
-    )
-    .await;
-    app.shutdown().await;
 }
 
 #[tokio::test]
@@ -385,6 +404,8 @@ async fn ui_without_available_assets_rejects_startup() {
         directory.path().to_str().unwrap(),
         #[cfg(not(feature = "native-ui"))]
         "embedded",
+        #[cfg(not(feature = "native-ui"))]
+        "embedded-lite",
     ] {
         let mut config = Config::default();
         config.global.nfqueue_enable = false;

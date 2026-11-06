@@ -21,39 +21,76 @@ pub(super) async fn dns_quic_config(alpn: &[&[u8]]) -> anyhow::Result<quinn::Cli
     .await
 }
 
-/// Per-family endpoint of the latest direct dial, closed at shutdown, plus the
-/// owner of packet-backed endpoints.
+#[derive(Debug)]
+pub(super) enum QuicEndpoint {
+    Direct {
+        endpoint: quinn::Endpoint,
+        drivers: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
+    },
+    Packet(honk_outbound::quic::PacketTransportEndpoint),
+}
+
+impl QuicEndpoint {
+    fn endpoint(&self) -> &quinn::Endpoint {
+        match self {
+            Self::Direct { endpoint, .. } => endpoint,
+            Self::Packet(endpoint) => endpoint.endpoint(),
+        }
+    }
+
+    pub(super) fn packet(&self) -> Option<&honk_outbound::quic::PacketTransportEndpoint> {
+        match self {
+            Self::Direct { .. } => None,
+            Self::Packet(endpoint) => Some(endpoint),
+        }
+    }
+
+    pub(super) async fn close(&self, timeout: Duration) {
+        match self {
+            Self::Direct { endpoint, drivers } => {
+                endpoint.close(0_u32.into(), b"shutdown");
+                if !timeout.is_zero() {
+                    let _ = tokio::time::timeout(timeout, endpoint.wait_idle()).await;
+                }
+                drivers.close().await;
+            }
+            Self::Packet(endpoint) => {
+                endpoint.close(timeout).await;
+            }
+        }
+    }
+}
+
+/// Retains native and packet-backed driver joins, including unpublished setup.
 pub(super) struct SharedQuicEndpoint {
-    direct: tokio::sync::Mutex<[Option<quinn::Endpoint>; 2]>,
     tasks: std::sync::Arc<honk_outbound::runtime::TaskOwner>,
 }
 
 impl SharedQuicEndpoint {
     pub(super) fn new() -> Self {
         Self {
-            direct: tokio::sync::Mutex::new([None, None]),
             tasks: std::sync::Arc::new(honk_outbound::runtime::TaskOwner::production()),
         }
     }
 
-    /// Binds a fresh socket for every direct dial, so a redial does not inherit
-    /// the local port of a black-holed flow.
-    async fn bind_direct(&self, ipv6: bool) -> anyhow::Result<quinn::Endpoint> {
-        let created = honk_outbound::quic::client_endpoint(ipv6)
-            .map_err(|e| anyhow::anyhow!("QUIC client endpoint: {e}"))?;
-        self.direct.lock().await[usize::from(ipv6)] = Some(created.clone());
-        Ok(created)
+    /// Session ownership prevents a retired cached endpoint from blocking redial.
+    fn bind_direct(
+        &self,
+        ipv6: bool,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> anyhow::Result<QuicEndpoint> {
+        let drivers = std::sync::Arc::new(honk_outbound::runtime::TaskOwner::production());
+        let endpoint = honk_outbound::quic::client_endpoint_with_owner_and_tasks(
+            ipv6,
+            permit,
+            &drivers,
+            Some(&self.tasks),
+        )
+        .map_err(|error| anyhow::anyhow!("QUIC client endpoint: {error}"))?;
+        Ok(QuicEndpoint::Direct { endpoint, drivers })
     }
 
-    pub(super) async fn close(&self, timeout: Duration) {
-        let endpoints = {
-            let mut endpoints = self.direct.lock().await;
-            [endpoints[0].take(), endpoints[1].take()]
-        };
-        for endpoint in endpoints.into_iter().flatten() {
-            endpoint.close(0_u32.into(), b"shutdown");
-            let _ = tokio::time::timeout(timeout, endpoint.wait_idle()).await;
-        }
+    pub(super) async fn close(&self) {
         self.tasks.close().await;
     }
 
@@ -118,24 +155,27 @@ pub(super) fn with_packet_cause(
     }
 }
 
-/// Connect `config` to `addr`, using either a freshly bound direct endpoint or an
+/// Connect the admitted candidate using either a freshly bound direct endpoint or an
 /// endpoint backed by the selected proxy's PacketTransport. `label` prefixes
 /// error messages (`DoQ` / `DoH3 QUIC`).
 async fn quic_connect(
     dial: &DialContext,
     direct_endpoint: &SharedQuicEndpoint,
     config: &quinn::ClientConfig,
-    addr: std::net::SocketAddr,
+    candidate: (
+        std::net::SocketAddr,
+        Option<tokio::sync::OwnedSemaphorePermit>,
+    ),
     sni: &str,
     label: &str,
     budget: Duration,
-) -> anyhow::Result<(
-    quinn::Connection,
-    Option<honk_outbound::quic::PacketTransportEndpoint>,
-)> {
+) -> anyhow::Result<(quinn::Connection, QuicEndpoint)> {
+    let (addr, mut permit) = candidate;
     let deadline = tokio::time::Instant::now() + budget;
     let owner = if dial.proxy.is_some() {
-        let transport = dial.dial_packet_transport_until(addr, deadline).await?;
+        let transport = dial
+            .dial_packet_transport_until(addr, deadline, permit.take())
+            .await?;
         let owner = honk_outbound::quic::packet_transport_endpoint_with_metrics(
             transport,
             addr,
@@ -143,17 +183,14 @@ async fn quic_connect(
             Some(&direct_endpoint.tasks),
         )
         .map_err(|error| anyhow::anyhow!("{label} packet endpoint: {error}"))?;
-        Some(owner)
+        QuicEndpoint::Packet(owner)
     } else {
-        None
+        direct_endpoint.bind_direct(
+            addr.is_ipv6(),
+            permit.expect("direct QUIC has socket admission"),
+        )?
     };
-    let direct;
-    let endpoint = if let Some(owner) = &owner {
-        owner.endpoint()
-    } else {
-        direct = direct_endpoint.bind_direct(addr.is_ipv6()).await?;
-        &direct
-    };
+    let endpoint = owner.endpoint();
     let mut observation = honk_outbound::runtime::flow_observation::TransportAttempt::start(
         Some(addr),
         honk_outbound::runtime::flow_observation::ResolutionLocation::Unknown,
@@ -162,14 +199,14 @@ async fn quic_connect(
         let connecting = endpoint
             .connect_with(config.clone(), addr, sni)
             .map_err(|error| {
-                with_packet_cause(owner.as_ref(), error.into())
+                with_packet_cause(owner.packet(), error.into())
                     .context(format!("{label} connect_with"))
             })?;
         tokio::time::timeout_at(deadline, connecting)
             .await
             .map_err(|_| anyhow::anyhow!("{label} handshake timed out"))?
             .map_err(|error| {
-                with_packet_cause(owner.as_ref(), error.into())
+                with_packet_cause(owner.packet(), error.into())
                     .context(format!("{label} handshake"))
             })
     }
@@ -197,24 +234,27 @@ pub(super) async fn quic_connect_endpoint(
     target: &DnsEndpoint,
     deadline: tokio::time::Instant,
     label: &str,
-) -> anyhow::Result<(
-    quinn::Connection,
-    Option<honk_outbound::quic::PacketTransportEndpoint>,
-)> {
-    let addresses = tokio::time::timeout_at(deadline, target.resolve_addrs())
-        .await
-        .map_err(|_| anyhow::anyhow!("{label} address resolution timed out"))??;
-    dial_candidates(addresses, deadline, label, |address, budget| {
-        quic_connect(
-            dial,
-            direct_endpoint,
-            config,
-            address,
-            &target.sni,
-            label,
-            budget,
-        )
-    })
+) -> anyhow::Result<(quinn::Connection, QuicEndpoint)> {
+    let addresses = target
+        .resolve_addrs_budgeted(&dial.socket_budget, deadline)
+        .await?;
+    dial_candidates(
+        addresses,
+        deadline,
+        label,
+        dial.packet_admission(),
+        |address, budget, permit| {
+            quic_connect(
+                dial,
+                direct_endpoint,
+                config,
+                (address, permit),
+                &target.sni,
+                label,
+                budget,
+            )
+        },
+    )
     .await
 }
 
@@ -237,6 +277,7 @@ mod direct_endpoint_tests {
             .unwrap(),
             query_timeout: Duration::from_secs(2),
             dial_timeout: Duration::from_secs(2),
+            socket_budget: Default::default(),
             proxy: None,
         };
         let endpoint = SharedQuicEndpoint::new();
@@ -254,13 +295,165 @@ mod direct_endpoint_tests {
                 ),
                 async { server.accept().await.unwrap().await.unwrap() },
             );
-            let (connection, _) = client.unwrap();
+            let (connection, owner) = client.unwrap();
             ports.push(accepted.remote_address().port());
             connection.close(0_u32.into(), b"redial");
+            drop((connection, owner));
         }
         assert_ne!(ports[0], ports[1]);
-        endpoint.close(Duration::from_secs(1)).await;
+        endpoint.close().await;
         server.close(0_u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn direct_failed_or_cancelled_setup_releases_one_credit_before_redial() {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            for cancel in [true, false] {
+                let (server, address) = quic_server_endpoint(b"doq");
+                let budget = super::super::DnsSocketBudget::new(1);
+                let dial = DialContext {
+                    endpoint: DnsEndpoint::parse(
+                        &address.to_string(),
+                        honk_config::types::DnsProtocol::Quic,
+                        Some("localhost"),
+                    )
+                    .unwrap(),
+                    query_timeout: Duration::from_secs(1),
+                    dial_timeout: Duration::from_secs(2),
+                    socket_budget: budget.clone(),
+                    proxy: None,
+                };
+                let endpoints = SharedQuicEndpoint::new();
+                let config = insecure_quic_config(b"doq").await;
+                if cancel {
+                    let sink = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                    let target = DnsEndpoint::parse(
+                        &sink.local_addr().unwrap().to_string(),
+                        honk_config::types::DnsProtocol::Quic,
+                        Some("localhost"),
+                    )
+                    .unwrap();
+                    let connecting = quic_connect_endpoint(
+                        &dial,
+                        &endpoints,
+                        &config,
+                        &target,
+                        tokio::time::Instant::now() + dial.dial_timeout,
+                        "DoQ",
+                    );
+                    tokio::pin!(connecting);
+                    let mut initial = [0; 1500];
+                    tokio::select! {
+                        result = &mut connecting => panic!("setup ended before cancellation: {result:?}"),
+                        packet = sink.recv_from(&mut initial) => {
+                            assert!(packet.unwrap().0 >= 1200);
+                        }
+                    }
+                } else {
+                    let (rejecting, address) = quic_server_endpoint(b"mismatch");
+                    let target = DnsEndpoint::parse(
+                        &address.to_string(),
+                        honk_config::types::DnsProtocol::Quic,
+                        Some("localhost"),
+                    )
+                    .unwrap();
+                    let (client, accepted) = tokio::join!(
+                        quic_connect_endpoint(
+                            &dial,
+                            &endpoints,
+                            &config,
+                            &target,
+                            tokio::time::Instant::now() + dial.dial_timeout,
+                            "DoQ",
+                        ),
+                        async { rejecting.accept().await.unwrap().await },
+                    );
+                    assert!(client.is_err());
+                    assert!(accepted.is_err());
+                }
+
+                let (client, accepted) = tokio::join!(
+                    quic_connect_endpoint(
+                        &dial,
+                        &endpoints,
+                        &config,
+                        &dial.endpoint,
+                        tokio::time::Instant::now() + dial.dial_timeout,
+                        "DoQ",
+                    ),
+                    async { server.accept().await.unwrap().await.unwrap() },
+                );
+                let (connection, owner) = client.unwrap();
+                assert_eq!(budget.available_sockets(), 0);
+                connection.close(0_u32.into(), b"done");
+                owner.close(Duration::ZERO).await;
+                drop((connection, owner));
+                endpoints.close().await;
+                assert_eq!(budget.available_sockets(), 1);
+                accepted.close(0_u32.into(), b"done");
+                server.close(0_u32.into(), b"done");
+            }
+        })
+        .await
+        .expect("unpublished native setup must release its real socket before redial admission");
+    }
+
+    #[tokio::test]
+    async fn direct_quic_credit_outlives_endpoint_handles_until_socket_teardown() {
+        let budget = super::super::DnsSocketBudget::new(1);
+        let endpoints = SharedQuicEndpoint::new();
+        let endpoint = endpoints
+            .bind_direct(false, budget.try_acquire().unwrap())
+            .unwrap();
+        drop(endpoint);
+        assert_eq!(budget.available_sockets(), 0);
+        endpoints.close().await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while budget.available_sockets() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_quic_capacity_refusal_sends_no_packet() {
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let dial = DialContext {
+            endpoint: DnsEndpoint::parse(
+                &peer.local_addr().unwrap().to_string(),
+                honk_config::types::DnsProtocol::Quic,
+                Some("localhost"),
+            )
+            .unwrap(),
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_millis(10),
+            socket_budget: super::super::DnsSocketBudget::new(0),
+            proxy: None,
+        };
+        let endpoints = SharedQuicEndpoint::new();
+        let config = insecure_quic_config(b"doq").await;
+        let error = quic_connect_endpoint(
+            &dial,
+            &endpoints,
+            &config,
+            &dial.endpoint,
+            tokio::time::Instant::now() + dial.dial_timeout,
+            "DoQ",
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+        let mut wire = [0; 1500];
+        assert_eq!(
+            peer.try_recv_from(&mut wire).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        endpoints.close().await;
     }
 }
 #[cfg(test)]
@@ -304,7 +497,8 @@ mod packet_cause_tests {
             vec![remote],
             tokio::time::Instant::now() + Duration::from_secs(2),
             "DoQ",
-            |address, _| {
+            None,
+            |address, _, _| {
                 let endpoint = Arc::clone(&endpoint);
                 let config = config.clone();
                 let observed = Arc::clone(&connection_error);

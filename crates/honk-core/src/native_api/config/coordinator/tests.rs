@@ -109,6 +109,7 @@ fn candidate_secret_refusals_precede_listener_settings_changes() {
         secrets: ListenerSecrets::from_config(&loaded.config),
         active: Arc::new(loaded.config),
         log_files: LogFiles::default(),
+        startup_downgrades: Default::default(),
         data_dir: directory.path().to_path_buf(),
         deferred: vec![],
     };

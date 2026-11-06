@@ -1,88 +1,92 @@
+<div align="center">
+
 # honk
 
-English | [中文](./README.zh.md)
+**An experimental transparent-proxy engine for Linux, written in Rust.**
 
-<a id="english"></a>
+**[Documentation](https://daeuniverse.org/honk/)** / **[Web UI demo](https://demo.daeuniverse.org/)** / **[Releases](https://github.com/daeuniverse/honk/releases)**
 
-honk is an experimental Rust transparent-proxy engine for Linux. Its eBPF datapath and configuration syntax are inspired by [dae](https://github.com/daeuniverse/dae); its outbound groups, multi-protocol dialers, and Clash-compatible API follow [sing-box](https://github.com/SagerNet/sing-box) designs. It is an independent implementation, not a line-for-line port.
+English / [简体中文](README.zh.md)
+
+[Capabilities](#capabilities) / [Install](#install) / [Web interface](#web-interface) / [Report problems](#report-problems)
+
+</div>
 
 > **Early alpha, not recommended for production.** Expect breaking changes, incomplete features, and limited real-world validation.
 
+honk follows the design of dae's eBPF datapath and configuration syntax, and of sing-box's outbound groups and Clash API. It is an independent implementation, not a port of either project.
+
 ## Capabilities
 
-- Transparent TCP/UDP: LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing on Linux 6.12+.
-- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, and single-peer WireGuard (a userspace tunnel over the built-in `honk-netstack` TCP/UDP stack), plus built-in `direct` and `block`. Trojan/VMess/VLESS support the H2 XHTTP profile (`packet-up`, `stream-up`, `stream-one`); VMess remains TCP-only. Protocol-specific limits are in the [node reference](doc/en/reference/nodes.md) and the [network stack design](doc/en/design/netstack.md).
-- Groups: Selector, URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; select it with `policy: score`. Omitted policy remains Selector. See the [group reference](doc/en/reference/groups.md#score-policy).
+- Transparent TCP/UDP for LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing. An explicitly configured [XDP backend](doc/en/design/datapath.md#full-xdp-startup) provides Endpoint/Core execution, with optional Core firewall/NAT and no automatic fallback.
+- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, single-peer WireGuard over the built-in sans-I/O `honk-netstack` TCP/UDP stack, `direct`, and `block`. Trojan/VMess/VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`); VMess is TCP-only. See [protocol limits](doc/en/reference/nodes.md) and [network stack design](doc/en/design/netstack.md).
+- Groups: Selector (the default), URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; see [group policies](doc/en/reference/groups.md#score-policy).
 - DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
 - Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.
 
-Implemented does not mean fully reviewed; see [review status](#review-status). There is no FakeIP engine, full mihomo parity, or Windows/macOS datapath.
+There is no FakeIP engine, full mihomo parity, or Windows/macOS datapath.
 
-## Getting started
+## Install
 
-Real transparent proxying requires **root, Linux 6.12+, the required kernel options, and bpffs**. Initial deployment changes network hooks, namespaces, and sysctls; keep an out-of-band management path available.
+Download an archive for your platform from [Releases](https://github.com/daeuniverse/honk/releases). Releases cover x86_64 and aarch64 Linux; `full` suits most deployments.
 
-1. Follow the [startup guide](doc/en/how-to-start.md) for kernel checks, installation, a direct-only configuration, and connectivity verification.
-2. Download a matching binary from [Releases](https://github.com/daeuniverse/honk/releases); each release's Downloads section explains every archive, and `SHA256SUMS` verifies it. Or follow the guide's source-build prerequisites. Release binaries embed the eBPF object; source builds require the `ebpf` feature. Plain `cargo build --release` does **not** enable the real datapath.
-3. Add nodes, groups, routing, and DNS using the [configuration guide](doc/en/configuration.md). The repository provides [full](config.dae) and [minimal development](config.min.dae) examples; adapt interfaces and node addresses before use.
+| Build | Native API | Clash API | Embedded doona and doona lite |
+| --- | --- | --- | --- |
+| `full` | Yes | Yes | Yes |
+| `native-api` | Yes | No | No |
+| `clash-api` | No | Yes | No |
 
-The [documentation index](doc/README.md) links all bilingual guides, references, and subsystem designs. Start with the [architecture overview](doc/en/design/overview.md), [node reference](doc/en/reference/nodes.md), or [API reference](doc/en/reference/api.md) for details.
+Every build comes as a static musl binary; `full` also comes linked against glibc (`gnu`). Archives with `stock` in the name use the system allocator instead of jemalloc. Each release's Downloads section lists checksums and provenance.
 
-## Operational notes
+Packages for Debian, Ubuntu, Fedora, openSUSE and Arch Linux are covered in the [installation guide](https://daeuniverse.org/honk/installation/). For OpenWrt, use the [daeuniverse package feed](https://daeuniverse.org/openwrt/).
 
-- **UDP NFQUEUE is enabled by default:** it holds ambiguous LAN-forwarded first packets before conntrack/NAT. Set `global.nfqueue_enable: false` to disable it; changing this setting requires a restart. Mock mode, builds without `ebpf`, or an unavailable queue disable staging for that process with a warning. honk exclusively owns queue `320` and nftables `inet honk_nfqueue` / `udp_decision`; same-namespace firewall managers must not modify them. See the [NFQUEUE design](doc/en/design/nfqueue.md).
-- **VLESS upgrade:** `vless_mode` is removed and all VLESS node IDs are re-derived. Migrate static links and cached/provider content before upgrading, especially offline; keep usable name-based Selector choices and persisted delay samples. UDP permission, packet encoding, and multiplexing are independent settings. See the [migration guide](doc/en/reference/nodes.md#migration-from-vless_mode) and [VLESS design](doc/en/design/outbound.md#vless-wire-contracts).
+For source builds, follow [Build from source](doc/en/how-to-start.md#build-from-source). Release binaries embed eBPF; plain `cargo build --release` does not enable the real datapath.
 
-## Opt-in native observation API
+Follow the [startup guide](doc/en/how-to-start.md) for kernel checks, installation, and connectivity verification. Initial deployment changes network hooks, namespaces, and sysctls; keep an out-of-band management path available.
 
-Build with `--features native-api` (the full and `-native-api` release artifacts include it) and configure `experimental.native_api` for independent observations and controls on `127.0.0.1:9527`: bounded flows/logs/DNS history, probes, provider status/refresh, per-network Selector control and exact connection closure. Captured `.dae` sources remain authoritative, with opt-in source/Group PATCH transactions, synchronous main-file node/provider creation and removal, and verified-geodata operations; existing entries are edited through source PUT. `--store db` records accepted sources as revisions in a state database instead. A bearer secret or password login is required unless anonymous loopback is explicitly enabled. Serve a trusted directory, or build `--features native-ui` and set `ui: embedded` for the pinned doona build without runtime downloads. Native runtime_mode and full kernel transparency remain unavailable. See [native settings](doc/en/reference/experimental.md#native_api) and the [API contract](doc/en/reference/api.md#native-api).
+## Web interface
+
+honk works with two kinds of web UI:
+
+- [doona](https://github.com/Zakkaus/doona) uses the native API, which adds observations, diagnostics and configuration editing. doona lite is a lighter preview edition. Try the [demo](https://demo.daeuniverse.org/) or the [lite demo](https://demo.daeuniverse.org/lite/).
+- Clash dashboards such as [zashboard](https://github.com/Zephyruso/zashboard) use the Clash-compatible API.
+
+![doona Activity page with traffic charts and status cards](https://daeuniverse.org/doona/screenshots/en/activity-light.webp)
+
+![doona lite Nodes page](https://daeuniverse.org/doona/images/lite-nodes-light.webp)
+
+For doona, enable `experimental.native_api` and set `ui: 'embedded'` in a `full` build, or `ui: 'embedded-lite'` for doona lite; the [doona quick start](https://daeuniverse.org/doona/quick-start) walks through it. A `native-api` build can serve a separately [installed doona](https://daeuniverse.org/doona/install) from its directory instead. For a Clash dashboard, set `experimental.clash_api`; honk downloads zashboard on first start. The [experimental settings](doc/en/reference/experimental.md) list every field of both.
+
+## Documentation
+
+The [documentation index](doc/README.md) links configuration guides, native and Clash API references, subsystem designs, and operations guides in both languages.
 
 ## Versions and compatibility
 
-- Releases follow [SemVer](https://semver.org/) from `v0.1.0`; tags with `-alpha.N`, `-beta.N` or `-rc.N` are prereleases. Before `1.0`, a minor release may change configuration or behaviour, and its notes list what needs action before upgrading.
-- Requirements: root and Linux 6.12+ with the kernel options in the [startup guide](doc/en/how-to-start.md), on `x86_64` or `aarch64` with gnu or musl.
-- Configuration uses dae syntax, documented in the [configuration guide](doc/en/configuration.md).
-- The native API is served under the fixed `/api/v1` base and stays opt-in through `experimental.native_api`; before `1.0` it may change in a minor release. `GET /api/v1/version` reports the contract identity.
-- Each release lists its archives in a Downloads section and carries `SHA256SUMS` and build provenance. Security reports go through the [security policy](.github/SECURITY.md).
+- Releases follow [SemVer](https://semver.org/) from `v0.1.0`; `-alpha.N`, `-beta.N`, and `-rc.N` tags are prereleases. Before `1.0`, minor releases may change configuration or behaviour; read the release notes before upgrading.
+- Transparent proxying requires root, Linux 6.12+, the required kernel options, and bpffs. See the startup guide linked above.
+- Configuration uses [dae syntax](doc/en/configuration.md). See [NFQUEUE operation](doc/en/design/nfqueue.md) and [VLESS migration](doc/en/reference/nodes.md#migration-from-vless_mode) before changing an existing deployment.
+- The native API uses `/api/v1`; before `1.0` its contract may change in a minor release. `GET /api/v1/version` reports the contract identity.
 
 ## Development
 
-The workspace contains configuration, shared eBPF types, NFQUEUE, outbound, core, and tooling crates. The kernel program in `crates/honk-ebpf` is built separately. Build prerequisites and commands are in the [startup guide](doc/en/how-to-start.md#build-from-source) and [Justfile](Justfile).
+The workspace contains configuration, shared eBPF types, NFQUEUE, netstack, datapath, XSK, outbound, core, and tooling crates; `crates/honk-ebpf` builds separately. See the [Justfile](Justfile) and [contribution policy](CONTRIBUTING.md).
 
-For unprivileged userspace development, use [mock mode](doc/en/how-to-start.md#unprivileged-development). `--mock-ebpf` does not intercept traffic and is not a datapath test.
+Use [mock mode](doc/en/how-to-start.md#unprivileged-development) for unprivileged userspace development. `--mock-ebpf` does not intercept traffic or test the datapath.
 
-### Debug builds
+The rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug) provides the latest `debug.*` build from `main` for testing. These use the release profile, not Cargo's debug profile; retention and publication follow the [release rules](.agents/rules/release.md).
 
-Between releases, maintainers publish `debug.*` builds from `main`: release-profile binaries for testing, not Cargo debug-profile builds. The rolling [Debug prerelease](https://github.com/daeuniverse/honk/releases/tag/debug) always holds the newest one and is never marked Latest; each debug tag also keeps its own release: the nine newest other tags plus the tag a re-run has just updated. Like formal releases, they carry `SHA256SUMS`, build provenance and a Downloads section. Publication details are in [the release rules](.agents/rules/release.md).
+## Report problems
 
-## Review status
+Report proxy, routing, and DNS problems in [honk issues](https://github.com/daeuniverse/honk/issues); report web interface problems in [doona issues](https://github.com/Zakkaus/doona/issues).
 
-Most userspace subsystems were largely AI-authored with partial maintainer review; the maintainer's primary focus is eBPF. These checkboxes record **maintainer review, not feature availability**:
+For vulnerabilities, follow [SECURITY.md](.github/SECURITY.md).
 
-- [x] eBPF routing, maps, and semantics
-- [x] Control plane
-- [x] AnyTLS / Shadowsocks (including 2022) / SOCKS5
-- [x] RPRX (VLESS / XTLS / XHTTP / WSS / REALITY) exclude XHTTP
-- [ ] WireGuard / `honk-netstack` (new userspace TCP/UDP stack, entirely AI-authored)
-- [ ] Trojan-GFW (needs UoT implementation)
-- [x] DNS logic
-- [ ] Configuration parser (dae extensions)
-- [x] Reload logic
-- [x] Tooling
-
-No `test.1` release tag will be published until all currently unreviewed code has been reviewed and any unverified AI-generated implementation has been addressed.
-
-### TODO
-
-- [ ] Evaluate AF_XDP and XDP paths for further performance gains
-- [ ] Add a honk-specific REST API beyond Clash compatibility
-- [ ] Add inbound support
-
-Track other work in [Issues](https://github.com/daeuniverse/honk/issues) and [Discussions](https://github.com/daeuniverse/honk/discussions).
+Most userspace subsystems were largely AI-authored with partial maintainer review; the maintainer's primary focus is eBPF. WireGuard, `honk-netstack` and the explicit XDP/Core path still require maintainer review. Automated checks do not replace the [human review and AI disclosure requirements](CONTRIBUTING.md#5-responsibility-for-ai-assisted-work).
 
 ## Acknowledgments
 
-- [dae](https://github.com/daeuniverse/dae) / [daed-rs](https://github.com/daeuniverse/daed-rs): eBPF transparent proxy lineage
+- [dae](https://github.com/daeuniverse/dae) / daed-rs: eBPF transparent proxy lineage
 - [sing-box](https://github.com/SagerNet/sing-box): outbound group and Clash API patterns
 - [daeuniverse/outbound](https://github.com/daeuniverse/outbound): protocol reference
 - [juicity-rs](https://github.com/juicity/juicity-rs) by Markson Pigeonzilla Plus: Juicity protocol reference, wire-format alignment, and live interop testing
@@ -90,9 +94,17 @@ Track other work in [Issues](https://github.com/daeuniverse/honk/issues) and [Di
 
 ## License
 
+[GPL-3.0-only](LICENSE).
+
 ```text
 SPDX-License-Identifier: GPL-3.0-only
 Copyright (c) 2025, glassyiris <honk@catmint.cc> and honk contributors
 ```
 
 The development-only [dae parser oracle](tools/dae-parse/README.md) links dae (AGPL-3.0-only). It is never shipped or linked into `honk-core`.
+
+## TODO
+
+- [ ] Measure AF_XDP/XDP performance on real hardware; the implemented backend does not establish hardware, ARM or performance acceptance
+- [ ] Add inbound support
+- [ ] Explore macOS and Windows support; the datapath is Linux eBPF, so these platforms need another way to capture traffic

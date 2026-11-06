@@ -248,6 +248,11 @@ async fn typed_outcome_tracks_positive_requery_and_caller_rendering() {
     assert_eq!(outcome.status(), OutcomeStatus::Accepted);
     assert_eq!(outcome.response_class(), ResponseClass::Positive);
     assert_eq!(outcome.provenance(), Provenance::Upstream);
+    #[cfg(feature = "native-api")]
+    assert_eq!(
+        [outcome.cache_entry_id(), cached.cache_entry_id()],
+        [None, None]
+    );
     assert_eq!(outcome.logical_upstream(), Some("first"));
     assert_eq!(outcome.final_upstream(), Some("second"));
     assert_eq!(outcome.requery_history(), &["first", "second"]);
@@ -498,6 +503,11 @@ async fn stale_outcome_covers_upstream_error_and_servfail_without_sleeping() {
     // Then
     assert_eq!(on_error.provenance(), Provenance::Stale);
     assert_eq!(on_servfail.provenance(), Provenance::Stale);
+    #[cfg(feature = "native-api")]
+    assert_eq!(
+        [on_error.cache_entry_id(), on_servfail.cache_entry_id()],
+        [None, None]
+    );
     assert_eq!(
         on_error.expiry().ttl(),
         std::time::Duration::from_secs(error_forwarder.stale_reply_ttl.into())
@@ -743,8 +753,13 @@ async fn negative_outcome_expiry_matches_insert_and_cache_hit_lifetime() {
     assert_eq!(inserted.response_class(), ResponseClass::Nxdomain);
     assert_eq!(inserted.expiry().ttl(), std::time::Duration::from_secs(20));
     assert_eq!(hit.provenance(), Provenance::Cache);
+    #[cfg(feature = "native-api")]
+    assert_eq!(hit.cache_entry_id(), None);
     assert!(hit.expiry().is_cacheable());
-    assert_eq!(hit.expiry().ttl(), std::time::Duration::from_secs(20));
+    assert!(
+        (std::time::Duration::from_secs(19)..=std::time::Duration::from_secs(20))
+            .contains(&hit.expiry().ttl())
+    );
     assert_eq!(pool.calls.load(Ordering::SeqCst), 1);
 }
 

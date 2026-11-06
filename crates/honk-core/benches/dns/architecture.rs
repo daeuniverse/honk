@@ -123,6 +123,13 @@ pub(super) fn bench_projection_replacement(c: &mut Criterion) {
     c.bench_function("dns_projection/hot_replacement", |b| {
         b.iter(|| black_box(replacement.replace()));
     });
+    // 5,000 names refresh in place; 12,000 names churn past the 10,000-owner cap.
+    for names in [5_000_usize, 12_000] {
+        let mut shared = ProjectionBenchmark::shared_ip(names);
+        c.bench_function(&format!("dns_projection/shared_ip/{names}"), |b| {
+            b.iter(|| black_box(shared.replace()));
+        });
+    }
 }
 
 pub(super) fn bench_policy_evaluation(c: &mut Criterion) {

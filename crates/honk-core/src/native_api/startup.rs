@@ -100,6 +100,7 @@ impl NativeRuntime {
                 honk_config::paths::data_dir().to_path_buf(),
                 control_plane.config_handle(),
                 control_plane.log_files(),
+                control_plane.startup_downgrades(),
                 control_plane.diagnostics_handle(),
                 commands,
                 subscriptions,

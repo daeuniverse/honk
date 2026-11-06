@@ -36,18 +36,23 @@ async fn packet_dns_answers_do_not_enter_the_kernel_projection() {
     let (controller, backend) = projection_controller(forwarder);
     let packet_query = query_with_txid("packet.example.com", 1);
     let admission = controller.try_admit_packet_query(true).unwrap();
-    let answer = controller
-        .answer_query(
+    let publication = controller.prepare_projection_publication();
+    let answer = tokio::time::timeout(
+        Duration::from_secs(1),
+        controller.answer_query(
             &admission,
             &packet_query,
             crate::dns::query::DnsRequestMeta::new(None, None),
             crate::dns::query::validate_exact_dns_query(&packet_query)
                 .unwrap()
                 .ingress(),
-        )
-        .await;
+        ),
+    )
+    .await
+    .expect("packet-owned DNS must not wait for a kernel publication");
     assert!(answer.wire().ends_with(&[192, 0, 2, 1]));
     drop(admission);
+    drop(publication);
     let host_query = query_with_txid("example.com", 2);
     let admission = controller.try_admit_query(true).unwrap();
     let answer = controller

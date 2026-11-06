@@ -43,6 +43,7 @@ parking_lot.workspace = true
 lru.workspace = true
 tokio-tungstenite.workspace = true
 futures-util.workspace = true
+percent-encoding.workspace = true
 # QUIC transport (TUIC / Hysteria2 / Juicity outbounds)
 quinn.workspace = true
 quinn-proto.workspace = true

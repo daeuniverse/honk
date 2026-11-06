@@ -299,7 +299,10 @@ impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
     }
 }
 
-pub(crate) fn packet_transport_with_owner<T>(
+/// Keeps `owner` alive until after this wrapper drops its inner transport handle.
+///
+/// Independent inner handles or driver tasks must retain their own owner.
+pub fn packet_transport_with_owner<T>(
     transport: Arc<dyn PacketTransport>,
     owner: T,
 ) -> Arc<dyn PacketTransport>

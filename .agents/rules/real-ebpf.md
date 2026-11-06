@@ -4,11 +4,11 @@ Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for
 
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
-- `default = ["clash-api", "mimalloc", "rprx"]`
+- `default = ["clash-api", "jemalloc", "rprx"]`
 - `ebpf` — aya real TC backend + `honk-nfqueue`, requires Linux kernel 6.12+; the default TC path otherwise uses `MockEbpfBackend`. Explicit XDP selection uses its userspace policy backend and real XDP/AF_XDP adapter independently of this feature. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
-- `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds the pinned doona build and fails without an absolute `HONK_DOONA_DIR` (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded`) is not needed.
+- `jemalloc` — shipped binary allocates through jemalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds both pinned doona editions and requires the absolute standard directory `HONK_DOONA_DIR` plus its `-lite` sibling (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded` or `ui: embedded-lite`, the lighter doona lite preview edition; both need `native-ui`) is not needed.
 - `rprx` — forwards to `honk-outbound/rprx`: registers VLESS (VLESS Encryption and xtls-rprx-vision) and VMess handlers; without it VLESS/VMess nodes parse fine but fail at dial with "No handler for protocol".
 
 Score is always compiled, without a Cargo feature; omitted policy selects Selector.
@@ -59,9 +59,11 @@ private mount/network namespaces do not isolate cgroup BPF attachment.
 gate (`.github/ci/run-vm-gate.sh floor`); `test-netns` retains `test-routing` as
 its dependency and boots only one guest. The complete routing suite also has
 root-cgroup cases, so neither recipe executes ignored tests on the host.
-The VM gate includes compiled routing, real backend/datapath, NFQUEUE/netns,
-TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership,
-native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher and SO_MARK socket checks. Exact nonempty selections remain intact. The same guest gate then runs the matching real daemon's XDP/native-control/guard smoke and omitted-datapath TC startup/reload, with Core/XSK ignored cases restricted to its owned private namespace.
+The VM gate includes compiled routing (its exact-name-guarded `dns_ownership::tcx::unsupported_lan_ingress_frames_continue_tcx_without_marking`), real backend/datapath, NFQUEUE/netns,
+TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source ownership, real VLAN/macsec frame cases,
+bond binding, native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
+lazy interface binding and SO_MARK socket checks. Exact nonempty
+selections in the guest gate must remain intact. The same guest gate then runs the matching real daemon's XDP/native-control/guard smoke and omitted-datapath TC startup/reload, with Core/XSK ignored cases restricted to its owned private namespace.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,
@@ -98,7 +100,7 @@ cargo run --release -p honk-core -- --config config.min.dae --mock-ebpf
 
 ### eBPF program standalone
 
-Kernel eBPF, **excluded from the workspace**, own `Cargo.lock`. Edition 2024, `aya-ebpf` 0.2; release `panic = "abort"`, `lto = true`, `opt-level = 2`. `src/main.rs`: `#![no_std] #![no_main]`, spin-loop panic handler, module declarations. Optional `log` enables `aya-log-ebpf`; otherwise `log_shim.rs` macros are no-ops.
+Kernel eBPF, **excluded from the workspace**, own `Cargo.lock`. Edition 2024, `aya-ebpf` 0.3; release `panic = "abort"`, `lto = true`, `opt-level = 2`. `src/main.rs`: `#![no_std] #![no_main]`, spin-loop panic handler, module declarations. Optional `log` enables `aya-log-ebpf`; otherwise `log_shim.rs` macros are no-ops.
 
 ```bash
 cd crates/honk-ebpf

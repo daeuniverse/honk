@@ -322,6 +322,28 @@ async fn grpc_request_path_and_authority_length_boundaries() {
 }
 
 #[tokio::test]
+async fn grpc_request_encodes_service_path() {
+    let mut node = grpc_node();
+    node.transport_mut().unwrap().grpc_service = Some("svc 雪%20name".into());
+    let (client, server) = tokio::io::duplex(4096);
+    let serve = async {
+        let mut connection = h2::server::handshake(server).await.unwrap();
+        let (request, _) = connection.accept().await.expect("gRPC request").unwrap();
+        assert_eq!(request.uri().path(), "/svc%20%E9%9B%AA%20name/Tun");
+        assert_eq!(request.uri().authority().unwrap().as_str(), "127.0.0.1");
+    };
+    tokio::time::timeout(Duration::from_secs(3), async {
+        tokio::try_join!(wrap_grpc(&node, Box::new(client)), async {
+            serve.await;
+            Ok::<_, anyhow::Error>(())
+        },)
+        .unwrap();
+    })
+    .await
+    .expect("request headers stalled awaiting a response");
+}
+
+#[tokio::test]
 async fn grpc_transport_roundtrip_through_dialer() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();

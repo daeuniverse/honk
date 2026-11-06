@@ -20,7 +20,7 @@ step "cargo fmt --check"
 cargo fmt -p honk-config -p honk-core -p honk-outbound -- --check
 
 step "cargo clippy -D warnings"
-cargo clippy -p honk-config -p honk-core -p honk-outbound --all-targets --features honk-core/udp-bench -- -D warnings
+cargo clippy -p honk-config -p honk-core -p honk-outbound --all-targets --features honk-core/udp-bench,honk-core/dns-bench -- -D warnings
 
 step "cargo test -p honk-config"
 cargo test -p honk-config
