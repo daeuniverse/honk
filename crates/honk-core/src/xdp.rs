@@ -293,6 +293,32 @@ struct Realm {
     scope: PacketScope,
     pending: [Option<(OutputLease, ReturnPath)>; 2],
 }
+
+impl Realm {
+    fn output_header(
+        &self,
+        path: ReturnPath,
+        physical_ifindex: u32,
+        ipv6: bool,
+    ) -> io::Result<honk_datapath::forward::EthernetHeader> {
+        if path.device != self.device {
+            return Err(io::Error::other(
+                "Endpoint reply belongs to another physical device",
+            ));
+        }
+        return_header(path, self.link.mac, physical_ifindex, ipv6)
+    }
+}
+
+fn finish_transmit<T>(work: anyhow::Result<T>, kick: io::Result<()>) -> anyhow::Result<T> {
+    match (work, kick) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Err(work), Err(kick)) => Err(work.context(kick).context("TX wakeup also failed")),
+    }
+}
+
 struct Runtime {
     devices: Vec<Device>,
     topology: AsyncFd<Topology>,
@@ -381,7 +407,11 @@ impl Runtime {
                         return Poll::Ready(Err(error.into()));
                     }
                 };
-                if !self.closing {
+                let mut backpressure = None;
+                let (received, kick) = port.transmit_batch(|port| {
+                    if self.closing {
+                        return Ok(0);
+                    }
                     let capture = &device.capture;
                     let core = &mut self.core;
                     let waiting = &mut self.waiting;
@@ -422,14 +452,23 @@ impl Runtime {
                                 } else {
                                     let egress = before.iter_mut().chain(after.iter_mut()).find(|device| device.info.ifindex == route.l2.physical_ifindex)
                                         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "Core egress is not a selected XDP interface"))?;
-                                    while let Some(length) = output.next_len() {
-                                        egress.queues[0].io.get_mut().transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease() }, |_, target| {
-                                            output.write_next_segments(target, &header).map(|_| ()).ok_or_else(|| io::Error::other("Core SG materialization refused"))
-                                        })?;
+                                    let (work, kick) = egress.queues[0].io.get_mut().transmit_batch(|port| -> io::Result<()> {
+                                        while let Some(length) = output.next_len() {
+                                            port.transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease() }, |_, target| {
+                                                output.write_next_segments(target, &header).map(|_| ()).ok_or_else(|| io::Error::other("Core SG materialization refused"))
+                                            })?;
+                                        }
+                                        Ok(())
+                                    });
+                                    if let Err(kick) = kick {
+                                        failure = finish_transmit(work.map_err(Into::into), Err(kick)).err();
+                                        return Err(io::Error::other("Core egress TX wakeup failed"));
                                     }
+                                    work?;
                                 }
                                 Ok(Some(()))
                             });
+                            if failure.is_some() { return; }
                             match cached {
                                 Ok(CachedDecision::Forwarded(()) | CachedDecision::Drop) => return,
                                 Ok(CachedDecision::Cold) => {
@@ -448,9 +487,10 @@ impl Runtime {
                                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                     pressure.tx_credit = pressure.tx_credit.saturating_add(1);
                                     pressure.refused = true;
+                                    backpressure.get_or_insert(error);
                                     return;
                                 }
-                                Err(error) => { failure = Some(error); return; }
+                                Err(error) => { failure = Some(error.into()); return; }
                             }
                         }
                         let bytes = if count == 1 { l3[0] } else {
@@ -459,72 +499,75 @@ impl Runtime {
                             &staging[..decoded.l3_len]
                         };
                         if let Err(error) = receive_endpoint(endpoints, peers, pressure, scope, bytes, now, path, None)
-                            && !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) { failure = Some(error); }
+                            && !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) { failure = Some(error.into()); }
                     });
-                    progress += match received {
-                        Ok(count) => count,
-                        Err(error) => return Poll::Ready(Err(error.into())),
-                    };
                     if let Some(error) = failure {
-                        return Poll::Ready(Err(error.into()));
+                        return Err(match received {
+                            Ok(_) => error,
+                            Err(rx) => error.context(rx).context("RX also failed"),
+                        });
                     }
-                }
-                if let Err(error) = port.kick() {
-                    return Poll::Ready(Err(error.into()));
-                }
+                    received.map_err(Into::into)
+                });
+                let received = match (received, backpressure) {
+                    (Ok(_), Some(error)) if kick.is_err() => Err(error.into()),
+                    (received, _) => received,
+                };
+                progress += finish_transmit(received, kick)?;
             }
         }
         for realm in &mut self.realms {
-            for (class_index, class) in [TxClass::Control, TxClass::Bulk].into_iter().enumerate() {
-                for _ in 0..BATCH {
-                    let (output, path) = match realm.pending[class_index].take() {
-                        Some(pending) => pending,
-                        None => match realm.scope.poll_output_class(cx, class) {
-                            Poll::Ready(Some(output)) => {
-                                let Some(path) = endpoint_return_path(&self.peers, &output) else {
-                                    continue;
+            let device = &mut self.devices[realm.device];
+            let ifindex = device.info.ifindex;
+            let (work, kick) = device.queues[0].io.get_mut().transmit_batch(|port| {
+                let mut submitted = 0;
+                for (class_index, class) in
+                    [TxClass::Control, TxClass::Bulk].into_iter().enumerate()
+                {
+                    for _ in 0..BATCH {
+                        let (output, path) = match realm.pending[class_index].take() {
+                            Some(pending) => pending,
+                            None => match realm.scope.poll_output_class(cx, class) {
+                                Poll::Ready(Some(output)) => {
+                                    let Some(path) = endpoint_return_path(&self.peers, &output)
+                                    else {
+                                        continue;
+                                    };
+                                    (output, path)
+                                }
+                                _ => break,
+                            },
+                        };
+                        if self.closing {
+                            continue;
+                        }
+                        let header =
+                            realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
+                        let length = header.len();
+                        if !port.tx_packet_credit(class, length + output.packet().len()) {
+                            self.pressure.counters.tx_credit =
+                                self.pressure.counters.tx_credit.saturating_add(1);
+                            self.pressure.counters.refused = true;
+                            realm.pending[class_index] = Some((output, path));
+                            break;
+                        }
+                        port.transmit_with(
+                            class,
+                            length + output.packet().len(),
+                            Retained::Endpoint(output),
+                            |owner, target| {
+                                let Retained::Endpoint(output) = owner else {
+                                    return Err(io::Error::other("wrong endpoint TX owner"));
                                 };
-                                (output, path)
-                            }
-                            _ => break,
-                        },
-                    };
-                    if self.closing {
-                        continue;
+                                fill_output(target, &header[..length], output.packet())
+                            },
+                        )?;
+                        submitted += 1;
                     }
-                    let device = &mut self.devices[path.device];
-                    let header = return_header(
-                        path,
-                        realm.link.mac,
-                        device.info.ifindex,
-                        output.packet()[0] >> 4 == 6,
-                    )?;
-                    let length = header.len();
-                    let port = device.queues[0].io.get_mut();
-                    if !port.tx_packet_credit(class, length + output.packet().len()) {
-                        self.pressure.counters.tx_credit =
-                            self.pressure.counters.tx_credit.saturating_add(1);
-                        self.pressure.counters.refused = true;
-                        realm.pending[class_index] = Some((output, path));
-                        break;
-                    }
-                    let result = port.transmit_with(
-                        class,
-                        length + output.packet().len(),
-                        Retained::Endpoint(output),
-                        |owner, target| {
-                            let Retained::Endpoint(output) = owner else {
-                                return Err(io::Error::other("wrong endpoint TX owner"));
-                            };
-                            fill_output(target, &header[..length], output.packet())
-                        },
-                    );
-                    if let Err(error) = result {
-                        return Poll::Ready(Err(error.into()));
-                    }
-                    progress += 1;
                 }
-            }
+                Ok(submitted)
+            });
+            progress += finish_transmit(work, kick)?;
         }
         if progress == 0 {
             Poll::Pending

@@ -250,6 +250,22 @@ mod linux {
         join: JoinHandle<(Device, io::Result<()>)>,
     }
 
+    #[derive(Debug, thiserror::Error)]
+    #[error("{work}; TX wakeup also failed: {kick}")]
+    struct TransmitFailure {
+        #[source]
+        work: io::Error,
+        kick: io::Error,
+    }
+
+    fn finish_transmit(work: io::Result<usize>, kick: io::Result<()>) -> io::Result<usize> {
+        match (work, kick) {
+            (Ok(progress), Ok(())) => Ok(progress),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(work), Err(kick)) => Err(io::Error::other(TransmitFailure { work, kick })),
+        }
+    }
+
     impl Device {
         fn new(
             port: Port<OutputLease>,
@@ -286,70 +302,84 @@ mod linux {
         }
 
         fn turn(&mut self, cx: &mut Context<'_>) -> io::Result<usize> {
-            let port = self.io.get_mut();
+            let Self {
+                io,
+                capture,
+                scope,
+                endpoints,
+                rejects,
+                udp_ingress_drops,
+                tx_control,
+                tx_bulk,
+                stopping,
+                retry_wakeup,
+                ..
+            } = self;
+            let port = io.get_mut();
             let wakeup_errors = port.counters().wakeup_errors;
-            let mut progress = port.complete()?;
-            port.observe_fill()?;
-            if self.stopping.is_none() {
-                let now = Instant::now();
-                let mut failure = None;
-                progress += port.receive(BATCH, |frame| match self.capture.rx_ip(frame) {
-                    Ok(ip) => {
-                        if let Err(error) = self
-                            .endpoints
-                            .as_ref()
-                            .expect("core ready before device start")
-                            .receive(self.scope.scope(), ip, now)
-                        {
-                            if self.capture.protocol == Protocol::Udp
-                                && matches!(
-                                    error.kind(),
-                                    io::ErrorKind::WouldBlock
-                                        | io::ErrorKind::OutOfMemory
-                                        | io::ErrorKind::BrokenPipe
-                                )
+            let (work, kick) = port.transmit_batch(|port| {
+                let mut progress = port.complete()?;
+                port.observe_fill()?;
+                if stopping.is_none() {
+                    let now = Instant::now();
+                    let mut failure = None;
+                    progress += port.receive(BATCH, |frame| match capture.rx_ip(frame) {
+                        Ok(ip) => {
+                            if let Err(error) = endpoints
+                                .as_ref()
+                                .expect("core ready before device start")
+                                .receive(scope.scope(), ip, now)
                             {
-                                self.udp_ingress_drops += 1;
-                            } else {
-                                failure.get_or_insert(error);
+                                if capture.protocol == Protocol::Udp
+                                    && matches!(
+                                        error.kind(),
+                                        io::ErrorKind::WouldBlock
+                                            | io::ErrorKind::OutOfMemory
+                                            | io::ErrorKind::BrokenPipe
+                                    )
+                                {
+                                    *udp_ingress_drops += 1;
+                                } else {
+                                    failure.get_or_insert(error);
+                                }
                             }
                         }
+                        Err(reason) => rejects[reason.index()] += 1,
+                    })?;
+                    if let Some(error) = failure {
+                        return Err(error);
                     }
-                    Err(reason) => self.rejects[reason.index()] += 1,
-                })?;
-                if let Some(error) = failure {
-                    return Err(error);
-                }
-                port.refill()?;
-                let header = self.capture.eth_header();
-                for class in [TxClass::Control, TxClass::Bulk] {
-                    for _ in 0..BATCH {
-                        if !port.tx_credit(class) {
-                            break;
-                        }
-                        let Poll::Ready(Some(output)) = self.scope.poll_output_class(cx, class)
-                        else {
-                            break;
-                        };
-                        if output.scope() != self.scope.scope() || output.class() != class {
-                            return Err(io::Error::other("foreign output scope/class"));
-                        }
-                        let submitted = port.counters().submitted;
-                        let result = port.transmit_retained(class, &header, output);
-                        if port.counters().submitted != submitted {
-                            match class {
-                                TxClass::Control => self.tx_control += 1,
-                                TxClass::Bulk => self.tx_bulk += 1,
+                    port.refill()?;
+                    let header = capture.eth_header();
+                    for class in [TxClass::Control, TxClass::Bulk] {
+                        for _ in 0..BATCH {
+                            if !port.tx_credit(class) {
+                                break;
                             }
+                            let Poll::Ready(Some(output)) = scope.poll_output_class(cx, class)
+                            else {
+                                break;
+                            };
+                            if output.scope() != scope.scope() || output.class() != class {
+                                return Err(io::Error::other("foreign output scope/class"));
+                            }
+                            let submitted = port.counters().submitted;
+                            let result = port.transmit_retained(class, &header, output);
+                            if port.counters().submitted != submitted {
+                                match class {
+                                    TxClass::Control => *tx_control += 1,
+                                    TxClass::Bulk => *tx_bulk += 1,
+                                }
+                            }
+                            result?;
+                            progress += 1;
                         }
-                        result?;
-                        progress += 1;
                     }
                 }
-            }
-            port.kick()?;
-            self.retry_wakeup = port.counters().wakeup_errors != wakeup_errors;
-            Ok(progress)
+                Ok(progress)
+            });
+            *retry_wakeup = port.counters().wakeup_errors != wakeup_errors;
+            finish_transmit(work, kick)
         }
 
         fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1094,6 +1124,31 @@ mod linux {
             counters.options = 0;
             counters.malformed = 1;
             assert!(discovery_queue(&counters, 3).is_err());
+        }
+
+        #[test]
+        fn fatal_batch_kick_cannot_be_reported_as_would_block() {
+            let error = finish_transmit(
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "writer pressure")),
+                Err(io::Error::from_raw_os_error(libc::EBADF)),
+            )
+            .unwrap_err();
+            assert_ne!(error.kind(), io::ErrorKind::WouldBlock);
+            let causes = error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<TransmitFailure>()
+                .unwrap();
+            assert_eq!(causes.work.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(causes.kick.raw_os_error(), Some(libc::EBADF));
+            assert!(error.to_string().contains("writer pressure"));
+            let error =
+                finish_transmit(Ok(1), Err(io::Error::from_raw_os_error(libc::EBADF))).unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+            let error = finish_transmit(Err(io::Error::from_raw_os_error(libc::EAGAIN)), Ok(()))
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EAGAIN));
+            assert_eq!(finish_transmit(Ok(1), Ok(())).unwrap(), 1);
         }
     }
 }

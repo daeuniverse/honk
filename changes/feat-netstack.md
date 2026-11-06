@@ -6,3 +6,4 @@ Added
 - Abort packet protocol state before normal shutdown waits for selector retirement, without releasing outstanding output ownership early.
 - Avoid a redundant XDP daemon RX refill while preserving receive-owned replenishment and explicit RX/TX wakeup checks.
 - Default explicit XDP capture to forced AF_XDP ZeroCopy without fallback; keep TC as the default backend and support explicit `xsk_mode: copy` for existing Copy deployments.
+- Amortize AF_XDP transmit wakeup checks within synchronous device turns without delaying packet publication or releasing outstanding owners on failure.

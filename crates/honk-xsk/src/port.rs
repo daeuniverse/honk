@@ -205,8 +205,22 @@ pub struct Port<L> {
     cq_consumer: u32,
     tx_free: [usize; 2],
     closed: bool,
+    tx_batch_active: bool,
     counters: PortCounters,
     _bookkeeping: MemoryReservation,
+}
+
+struct TxBatchGuard<'a, L> {
+    port: &'a mut Port<L>,
+}
+
+impl<L> Drop for TxBatchGuard<'_, L> {
+    fn drop(&mut self) {
+        if self.port.tx_batch_active {
+            self.port.tx_batch_active = false;
+            self.port.close();
+        }
+    }
 }
 
 impl<L> Port<L> {
@@ -262,6 +276,7 @@ impl<L> Port<L> {
             cq_consumer: 0,
             tx_free: [config.control_frames, config.bulk_frames],
             closed: false,
+            tx_batch_active: false,
             counters: PortCounters::default(),
             _bookkeeping: bookkeeping,
         })
@@ -417,6 +432,20 @@ impl<L> Port<L> {
         Ok(packets)
     }
 
+    /// Defer per-packet wakeups only until this synchronous operation returns.
+    /// Work and final wakeup results are independent, including after work fails.
+    /// Panicking work closes admission without I/O or releasing published owners.
+    /// Scopes on the same Port must not nest or span an asynchronous suspension.
+    pub fn transmit_batch<R>(&mut self, work: impl FnOnce(&mut Self) -> R) -> (R, io::Result<()>) {
+        assert!(!self.tx_batch_active, "nested Port transmit scope");
+        self.tx_batch_active = true;
+        let guard = TxBatchGuard { port: self };
+        let result = work(guard.port);
+        let kick = guard.port.kick();
+        guard.port.tx_batch_active = false;
+        (result, kick)
+    }
+
     /// Copy borrowed L2 segments directly to reserved UMEM chunks, then publish once.
     pub fn transmit_segments(
         &mut self,
@@ -534,7 +563,11 @@ impl<L> Port<L> {
         self.tx_producer = self.tx_producer.wrapping_add(count as u32);
         self.counters.submitted += count as u64;
         self.rings.tx.publish_producer(self.tx_producer);
-        self.kick_tx()
+        if self.tx_batch_active {
+            Ok(())
+        } else {
+            self.kick_tx()
+        }
     }
 
     pub fn zerocopy(&self) -> bool {
@@ -764,7 +797,11 @@ impl<L> Port<L> {
         self.tx_free[class_index(prepared.class)] -= 1;
         self.counters.submitted += 1;
         self.rings.tx.publish_producer(self.tx_producer);
-        self.kick_tx()
+        if self.tx_batch_active {
+            Ok(())
+        } else {
+            self.kick_tx()
+        }
     }
 
     pub fn transmit(
@@ -999,6 +1036,7 @@ mod tests {
             cq_consumer: 0,
             tx_free: [config.control_frames, config.bulk_frames],
             closed: false,
+            tx_batch_active: false,
             counters: PortCounters::default(),
             _bookkeeping: bookkeeping,
         }
@@ -1379,6 +1417,13 @@ mod tests {
         assert_eq!(port.counters().wakeup_errors, 4);
         assert_eq!(port.counters().completed, 0);
         assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        let ((), kick) = port.transmit_batch(|_| ());
+        kick.unwrap();
+        port.rings.tx.set_wakeup();
+        let ((), kick) = port.transmit_batch(|_| ());
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(port.counters().submitted, 1);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         let address = port.rings.tx.read(0).addr;
         port.rings.cq.write(0, address);
@@ -1870,5 +1915,328 @@ mod tests {
         assert_eq!(port.tx_free[1], 4);
         assert!(port.sidecar.slots.iter().all(Option::is_none));
         assert!(port.tx_packet_credit(TxClass::Bulk, 9000));
+    }
+
+    fn transmit_entry(
+        port: &mut Port<Retained>,
+        entry: usize,
+        drops: &Arc<AtomicUsize>,
+    ) -> io::Result<()> {
+        let owner = Retained::new(drops);
+        match entry {
+            0 => port.transmit(TxClass::Bulk, &[3; 14], &[7; 28], owner),
+            1 => port.transmit_retained(TxClass::Bulk, &[3; 14], owner),
+            2 => port.transmit_segments(TxClass::Bulk, &[&[3; 14], &[7; 28]], owner),
+            3 => port.transmit_with(TxClass::Bulk, 42, owner, |_, target| {
+                target[0][..14].fill(3);
+                target[0][14..].fill(7);
+                Ok(())
+            }),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn batch_tx_entries_publish_the_whole_prefix_before_terminal_wakeup() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(
+            PortConfig {
+                bulk_frames: 4,
+                ring_size: 8,
+                ..config()
+            },
+            &budget,
+        );
+        port.rings.tx.set_wakeup();
+        let (work, kick) = port.transmit_batch(|port| {
+            for entry in 0..4 {
+                transmit_entry(port, entry, &drops)?;
+            }
+            assert!(!port.drain_state().closed);
+            assert_eq!(port.rings().tx_producer, 4);
+            Ok::<_, io::Error>(())
+        });
+        work.unwrap();
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert!(port.drain_state().closed);
+        assert!(!port.tx_batch_active);
+        assert_eq!(port.outstanding().count(), 4);
+        port.rings.tx.publish_consumer(4);
+        assert_eq!(port.complete().unwrap(), 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used(), retained);
+    }
+
+    #[test]
+    fn batch_writer_errors_and_credit_pressure_keep_the_final_kick_separate() {
+        for suffix in 0..3 {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut port = fake(config(), &budget);
+            port.rings.tx.set_wakeup();
+            let (work, kick) = port.transmit_batch(|port| {
+                transmit_entry(port, 1, &drops)?;
+                if suffix == 2 {
+                    return transmit_entry(port, 2, &drops);
+                }
+                port.transmit_with(TxClass::Control, 60, Retained::new(&drops), |_, _| {
+                    Err(io::Error::new(
+                        if suffix == 0 {
+                            io::ErrorKind::InvalidData
+                        } else {
+                            io::ErrorKind::WouldBlock
+                        },
+                        "unpublished writer suffix",
+                    ))
+                })
+            });
+            assert_eq!(
+                work.unwrap_err().kind(),
+                if suffix == 0 {
+                    io::ErrorKind::InvalidData
+                } else {
+                    io::ErrorKind::WouldBlock
+                }
+            );
+            assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            assert!(port.drain_state().closed);
+            assert_eq!(port.drain_state().control_reserved, 0);
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            assert_eq!(port.rings().tx_producer, 1);
+            assert_eq!(port.outstanding().count(), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+            port.rings.cq.write(0, port.rings.tx.read(0).addr);
+            port.rings.cq.publish_producer(1);
+            assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+        }
+    }
+
+    #[test]
+    fn batch_early_and_pending_returns_reinspect_wakeup_without_new_publication() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        let (pending, kick) = port.transmit_batch(|_| std::task::Poll::<()>::Pending);
+        assert!(pending.is_pending());
+        kick.unwrap();
+        assert!(!port.tx_batch_active);
+        port.rings.tx.set_wakeup();
+        let (work, kick) = port.transmit_batch(|port| {
+            transmit_entry(port, 0, &drops)?;
+            if !port.tx_credit(TxClass::Bulk) {
+                return Ok::<_, io::Error>(7);
+            }
+            panic!("one-frame bulk commitment was exceeded");
+        });
+        assert_eq!(work.unwrap(), 7);
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        let ((), kick) = port.transmit_batch(|_| ());
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(port.counters().submitted, 1);
+        assert_eq!(port.counters().completed, 0);
+        assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn borrowed_tx_sink_prefix_is_finalized_after_a_later_rx_error() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        port.refill().unwrap();
+        port.rings.fill.publish_consumer(2);
+        let rx = port.rings.fill.read(0);
+        port.umem.write_bytes(rx, &[7; 60]);
+        port.rings.rx.write(
+            0,
+            Descriptor {
+                addr: rx,
+                len: 60,
+                options: 0,
+            },
+        );
+        port.rings.rx.write(
+            1,
+            Descriptor {
+                addr: port.rings.fill.read(1),
+                len: 0,
+                options: 0,
+            },
+        );
+        port.rings.rx.publish_producer(2);
+        port.rings.tx.set_wakeup();
+        let (work, kick) = port.transmit_batch(|port| {
+            port.receive_segments_with(2, false, |parts, _, tx| {
+                tx.transmit_segments(TxClass::Bulk, parts, Retained::new(&drops))
+                    .unwrap();
+                tx.transmit_with(TxClass::Control, 60, Retained::new(&drops), |_, target| {
+                    target[0].copy_from_slice(parts[0]);
+                    Ok(())
+                })
+                .unwrap();
+            })
+        });
+        assert!(
+            work.unwrap_err()
+                .to_string()
+                .contains("invalid RX chain descriptor")
+        );
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(port.drain_state().rx_leased, 0);
+        assert_eq!(port.rings().tx_producer, 2);
+        assert_eq!(port.outstanding().count(), 2);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        for index in 0..2 {
+            let descriptor = port.rings.tx.read(index);
+            assert_eq!(port.umem.frame(descriptor.addr, 60).unwrap(), &[7; 60]);
+            assert!(descriptor.addr >= (config().rx_frames * FRAME_SIZE) as u64);
+        }
+    }
+
+    #[test]
+    fn batch_panic_closes_admission_and_retains_published_and_reserved_ownership() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        port.rings.tx.set_wakeup();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = port.transmit_batch(|port| {
+                transmit_entry(port, 1, &drops).unwrap();
+                port.transmit_with(TxClass::Control, 60, Retained::new(&drops), |_, _| {
+                    panic!("writer unwound after a published prefix")
+                })
+                .unwrap();
+            });
+        }));
+        assert!(panic.is_err());
+        let state = port.drain_state();
+        assert!(state.closed);
+        assert_eq!(state.control_reserved, 1);
+        assert_eq!(state.bulk_outstanding, 1);
+        assert!(!state.ready_for_backend_teardown());
+        assert!(!port.tx_batch_active);
+        assert!(!port.tx_credit(TxClass::Control));
+        assert_eq!(port.counters().wakeup_errors, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(budget.used(), retained);
+    }
+
+    #[test]
+    fn batch_is_finalized_before_the_owning_future_can_suspend_and_be_cancelled() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        port.rings.tx.set_wakeup();
+        let mut future = Box::pin(async {
+            let (work, kick) = port.transmit_batch(|port| transmit_entry(port, 3, &drops));
+            work.unwrap();
+            assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            std::future::pending::<()>().await;
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        drop(future);
+        assert!(port.drain_state().closed);
+        assert!(!port.tx_batch_active);
+        assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(port.counters().completed, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        port.rings.cq.write(0, port.rings.tx.read(0).addr);
+        port.rings.cq.publish_producer(1);
+        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn distinct_device_scopes_finalize_both_orderings_after_inner_credit_failure() {
+        for egress_first in [false, true] {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut ports = [fake(config(), &budget), fake(config(), &budget)];
+            let (first, second) = ports.split_at_mut(1);
+            let (current, egress) = if egress_first {
+                (&mut second[0], &mut first[0])
+            } else {
+                (&mut first[0], &mut second[0])
+            };
+            current.rings.tx.set_wakeup();
+            egress.rings.tx.set_wakeup();
+            let ((work, egress_kick), current_kick) = current.transmit_batch(|current| {
+                transmit_entry(current, 1, &drops).unwrap();
+                egress.transmit_batch(|egress| {
+                    transmit_entry(egress, 2, &drops)?;
+                    transmit_entry(egress, 3, &drops)
+                })
+            });
+            assert_eq!(work.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            for kick in [egress_kick, current_kick] {
+                assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+            }
+            for port in &ports {
+                assert!(port.drain_state().closed);
+                assert!(!port.tx_batch_active);
+                assert_eq!(port.outstanding().count(), 1);
+                assert_eq!(port.counters().submitted, 1);
+                assert_eq!(port.counters().completed, 0);
+            }
+            assert_eq!(drops.load(Ordering::Relaxed), 1);
+        }
+    }
+
+    #[test]
+    fn batch_rx_wakeup_failure_does_not_skip_the_published_tx_obligation() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        port.rings.fill.set_wakeup();
+        port.rings.tx.set_wakeup();
+        let (work, kick) = port.transmit_batch(|port| transmit_entry(port, 1, &drops));
+        work.unwrap();
+        assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(port.counters().wakeup_errors, 2);
+        assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(port.counters().completed, 0);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(!port.drain_state().ready_for_backend_teardown());
+    }
+
+    #[test]
+    fn batch_close_and_socket_close_do_not_retire_a_partial_sg_completion() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(
+            PortConfig {
+                bulk_frames: 3,
+                ring_size: 4,
+                ..config()
+            },
+            &budget,
+        );
+        port.mtu = 9000;
+        port.scatter_gather = true;
+        let (work, kick) = port.transmit_batch(|port| {
+            port.transmit_segments(TxClass::Bulk, &[&[7; 9000]], Retained::new(&drops))?;
+            assert_eq!(port.close().bulk_outstanding, 3);
+            port.close_socket();
+            Ok::<_, io::Error>(())
+        });
+        work.unwrap();
+        kick.unwrap();
+        assert_eq!(port.counters().completed, 0);
+        for index in 0..3 {
+            port.rings.cq.write(index, port.rings.tx.read(index).addr);
+            port.rings.cq.publish_producer(index + 1);
+            assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), usize::from(index == 2));
+            assert_eq!(port.drain_state().ready_for_backend_teardown(), index == 2);
+        }
     }
 }

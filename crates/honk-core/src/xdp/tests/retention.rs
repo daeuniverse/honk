@@ -861,3 +861,129 @@ async fn peer_capacity_cannot_erase_an_unexpired_conflict_hold() {
     .await
     .expect("peer-table churn must preserve the conflict hold until its real deadline");
 }
+
+#[test]
+fn transmit_finalization_preserves_primary_failure_and_terminal_kick() {
+    for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::InvalidData] {
+        let work = io::Error::new(kind, "packet work failed");
+        let error = finish_transmit::<()>(
+            Err(work.into()),
+            Err(io::Error::from_raw_os_error(libc::EBADF)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .root_cause()
+                .downcast_ref::<io::Error>()
+                .unwrap()
+                .kind(),
+            kind
+        );
+        let evidence = format!("{error:#}");
+        assert!(evidence.contains("packet work failed"));
+        assert!(evidence.contains(&io::Error::from_raw_os_error(libc::EBADF).to_string()));
+    }
+    let error =
+        finish_transmit::<()>(Ok(()), Err(io::Error::from_raw_os_error(libc::EBADF))).unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+        Some(libc::EBADF)
+    );
+    let error = finish_transmit::<()>(
+        Err(io::Error::from_raw_os_error(libc::EINVAL).into()),
+        Ok(()),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+        Some(libc::EINVAL)
+    );
+    assert_eq!(finish_transmit(Ok(7), Ok(())).unwrap(), 7);
+}
+
+#[tokio::test]
+async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let first = fixture().await;
+        let second = fixture().await;
+        for (device, (endpoints, owner, scope, _budget, _slots)) in
+            [first, second].into_iter().enumerate()
+        {
+            let mut reply_path = path();
+            reply_path.device = device;
+            reply_path.mac[5] += device as u8;
+            reply_path.vlan_tci[0] += device as u16;
+            let ifindex = device as u32 + 10;
+            let realm = Realm {
+                ingress: Ingress {
+                    scope: scope.scope(),
+                    namespace: 1,
+                    ifindex,
+                    attachment: 1,
+                    mark: MarkProvenance::BeforeSkb,
+                },
+                device,
+                link: LogicalLink {
+                    ifindex,
+                    mtu: 1500,
+                    mac: [4 + device as u8; 6],
+                    path: LinkPath {
+                        physical_ifindex: ifindex,
+                        vlan_tci: reply_path.vlan_tci,
+                        vlan_proto: reply_path.vlan_proto,
+                        vlan_count: reply_path.vlan_count,
+                    },
+                },
+                scope,
+                pending: [None, None],
+            };
+            let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+            let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
+            let now = Instant::now();
+            realm
+                .scope
+                .receive(&segment(source, destination, 100, 0, tcp::SYN), now);
+            let (_, flow) = realm.scope.poll_accept().unwrap();
+            realm.scope.drive(now);
+            realm
+                .scope
+                .datagram_sender(destination)
+                .send_to(b"lone final reply", source)
+                .await
+                .unwrap();
+            let peers = [Peer {
+                scope: realm.scope.scope(),
+                address: source.ip(),
+                path: reply_path,
+                last_seen: now,
+                conflict: None,
+            }];
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            for class in [TxClass::Control, TxClass::Bulk] {
+                let Poll::Ready(Some(output)) = realm.scope.poll_output_class(&mut cx, class)
+                else {
+                    panic!("actual Endpoint output missing for {class:?}");
+                };
+                assert_eq!(output.class(), class);
+                let selected = endpoint_return_path(&peers, &output).unwrap();
+                let header = realm.output_header(selected, ifindex, false).unwrap();
+                assert_eq!(&header[..6], &reply_path.mac);
+                assert_eq!(&header[6..12], &realm.link.mac);
+                assert_eq!(&header[14..16], &reply_path.vlan_tci[0].to_be_bytes());
+                assert_eq!(&header[18..20], &reply_path.vlan_tci[1].to_be_bytes());
+                let mut wrong = selected;
+                wrong.device = 1 - device;
+                assert!(realm.output_header(wrong, ifindex, false).is_err());
+                if class == TxClass::Bulk {
+                    assert!(output.packet().ends_with(b"lone final reply"));
+                }
+                output.release();
+            }
+            drop(flow);
+            endpoints.shutdown().await.unwrap();
+            owner.run().await.unwrap();
+        }
+    })
+    .await
+    .expect("each real scoped output must retain its own physical reply path");
+}
