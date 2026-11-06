@@ -33,7 +33,7 @@ pub(crate) type ReceiveTracePreparation =
 /// Owns the original relocation FDs even when a blocking load outlives its caller.
 pub(super) struct ProgramLoader {
     object: Mutex<Ebpf>,
-    _maps: Arc<KernelMaps>,
+    _maps: KernelMaps,
     #[cfg(feature = "native-api")]
     trace: Mutex<TraceState>,
     #[cfg(feature = "native-api")]
@@ -85,10 +85,9 @@ impl ProgramLoader {
                 Ok((name.clone(), Map::from_map_data(duplicate)?))
             })
             .collect::<anyhow::Result<KernelMaps>>()?;
-        let maps = Arc::new(maps);
         let loader = Arc::new(Self {
             object: Mutex::new(object),
-            _maps: Arc::clone(&maps),
+            _maps: maps,
             #[cfg(feature = "native-api")]
             trace: Mutex::new(TraceState::default()),
             #[cfg(feature = "native-api")]

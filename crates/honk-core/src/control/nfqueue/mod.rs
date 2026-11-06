@@ -45,7 +45,7 @@ const IPPROTO_UDP: u8 = 17;
 /// runtime hands the worker's queue to another thread meanwhile; a
 /// current-thread runtime (and any non-runtime caller) runs it inline because
 /// `block_in_place` panics there.
-pub(crate) fn blocking_section<R>(section: impl FnOnce() -> R) -> R {
+fn blocking_section<R>(section: impl FnOnce() -> R) -> R {
     match tokio::runtime::Handle::try_current().map(|handle| handle.runtime_flavor()) {
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(section),
         _ => section(),
