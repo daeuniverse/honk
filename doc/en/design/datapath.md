@@ -73,12 +73,16 @@ L2 group addresses cannot grant unicast IP a native socket exemption. Existing
 native ARP/ND and IP special-address handling remains; directed broadcasts come
 from at most 64 exact local-table `RTN_BROADCAST` routes, never suffix guesses.
 
-The daemon defaults to AF_XDP Copy; `datapath.xsk_mode: zerocopy` requests forced
-ZeroCopy for every selected queue. Every RX queue must have a corresponding TX
-queue; shared preflight checks device/frame commitments before any guard attaches.
-Queue admission then rechecks device
-facts and verifies the actual bind result; a late failure retains fail-closed
-guard custody rather than retrying Copy. Mode changes require restart.
+Explicit XDP selection defaults to forced AF_XDP ZeroCopy for every selected
+queue; `datapath.xsk_mode: copy` remains an explicitly supported mode. The default
+backend is still TC. Every RX queue must have a corresponding TX queue; shared
+preflight checks device/frame commitments before any guard attaches. Queue
+admission then rechecks device facts and verifies the actual bind result; a late
+failure retains fail-closed guard custody rather than retrying Copy or another
+backend. Omitted and explicit ZeroCopy have the same device setup; changing the
+effective mode requires restart. Existing omitted-mode XDP configurations must
+add `xsk_mode: copy` to preserve their previous Copy behavior; see the
+[configuration migration note](../reference/global.md#capture-backend-selection).
 
 
 Start a freshly built real daemon with `honk-core -c config.dae --bpf-pin-root <private-bpffs-directory>`, without `--mock-ebpf`. Readiness is `XDP datapath ready`. The XDP path creates neither TC hooks, NFQUEUE, `dae0` nor `daens`. Software checksums remain the default.

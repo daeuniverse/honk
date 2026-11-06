@@ -118,13 +118,13 @@ fn datapath_restart_identity_uses_effective_setup_not_policy() {
     assert_eq!(restart_required_changes(&current, &xdp), ["datapath"]);
     assert_eq!(restart_required_changes(&xdp, &current), ["datapath"]);
     candidate = xdp.clone();
-    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::Copy);
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::ZeroCopy);
     assert!(restart_required_changes(&xdp, &candidate).is_empty());
     assert!(restart_required_changes(&candidate, &xdp).is_empty());
 
     xdp.datapath.as_mut().unwrap().firewall = Some(Default::default());
     assert!(restart_required_changes(&candidate, &xdp).is_empty());
-    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::ZeroCopy);
+    candidate.datapath.as_mut().unwrap().xsk_mode = Some(XskMode::Copy);
     assert_eq!(restart_required_changes(&xdp, &candidate), ["datapath"]);
 }
 

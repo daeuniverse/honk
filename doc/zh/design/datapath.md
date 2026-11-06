@@ -61,11 +61,13 @@ device-bound 程序必须以真实入站验证，不能使用 `BPF_PROG_TEST_RUN
 L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和 IP 特殊地址
 处理保留；定向广播取自最多 64 条精确的本地表 `RTN_BROADCAST` 路由，不猜后缀。
 
-daemon 默认使用 AF_XDP Copy；`datapath.xsk_mode: zerocopy` 对所有选中队列
-要求强制 ZeroCopy。每条 RX 队列必须有对应 TX 队列；共用预检在挂载任何 guard
-前检查设备/frame 承诺。实际队列准入仍复核设备事实及 bind 回读。较晚失败时保留
-fail-closed guard，
-不重试 Copy；模式变化要求重启。
+显式选择 XDP 时，默认对所有选中队列强制使用 AF_XDP ZeroCopy；
+`datapath.xsk_mode: copy` 仍是正式支持的显式模式。默认后端仍为 TC。
+每条 RX 队列必须有对应 TX 队列；共用预检在挂载任何 guard 前检查设备/frame
+承诺。实际队列准入仍复核设备事实及 bind 回读。较晚失败时保留 fail-closed
+guard，不重试 Copy 或其他后端。省略与显式 ZeroCopy 具有相同设备设置；有效
+模式变化要求重启。已有省略模式的 XDP 配置必须加入 `xsk_mode: copy` 才能
+保留原有 Copy 行为，参阅[配置迁移说明](../reference/global.md#捕获后端选择)。
 
 
 使用新构建的真实 daemon：`honk-core -c config.dae --bpf-pin-root <私有-bpffs-目录>`，不要传 `--mock-ebpf`。就绪日志为 `XDP datapath ready`。XDP 路径不创建 TC hook、NFQUEUE、`dae0` 或 `daens`。默认使用软件校验和。

@@ -452,7 +452,7 @@ async fn xdp_policy_rejection_preserves_files_database_and_runtime() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
-async fn xdp_device_changes_reject_before_persistence_but_effective_copy_and_policy_commit() {
+async fn xdp_device_changes_reject_before_persistence_but_effective_mode_and_policy_commit() {
     for database in [false, true] {
         let fixture = xdp_fixture(database).await;
         let original = &fixture.originals["main.dae"];
@@ -466,7 +466,7 @@ async fn xdp_device_changes_reject_before_persistence_but_effective_copy_and_pol
             original.replace("direct: core", "direct: endpoint"),
             original.replace("eth0: lan", "eth1: lan"),
             original.replace("eth0: lan", "eth0: wan"),
-            original.replace("direct: core", "direct: core\n xsk_mode: zerocopy"),
+            original.replace("direct: core", "direct: core\n xsk_mode: copy"),
         ] {
             let full = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
             assert_eq!(full["valid"], true, "{full}");
@@ -507,10 +507,10 @@ async fn xdp_device_changes_reject_before_persistence_but_effective_copy_and_pol
                 );
             }
         }
-        let copy = original.replace("direct: core", "direct: core\n xsk_mode: copy");
-        let policy = copy.replace("\n xsk_mode: copy", "\n firewall {\n original {\n default: allow\n }\n forward {\n default: drop\n }\n }")
+        let equivalent = original.replace("direct: core", "direct: core\n xsk_mode: zerocopy");
+        let policy = equivalent.replace("\n xsk_mode: zerocopy", "\n firewall {\n original {\n default: allow\n }\n forward {\n default: drop\n }\n }")
             .replace("fallback: direct", "fallback: block");
-        for (index, candidate) in [copy, policy].iter().enumerate() {
+        for (index, candidate) in [equivalent, policy].iter().enumerate() {
             let full = ok(fixture.validate("full", candidate).send().await.unwrap()).await;
             assert_eq!(full["valid"], true, "{full}");
             assert!(

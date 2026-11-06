@@ -395,12 +395,12 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
                 print('omitted datapath default TC startup/traffic/Block/Direct reload verified', flush=True)
             if mode == 'endpoint' and family == socket.AF_INET and kind == socket.SOCK_DGRAM:
                 original = pathlib.Path(sys.argv[2]).read_text()
-                for binding, expected in [('copy', 'applied'), ('zerocopy', 'rejected'), ('', 'applied')]:
-                    candidate = original.replace('direct: endpoint', f'direct: endpoint\n xsk_mode: {binding}') if binding else original
+                for binding, expected in [('copy', 'applied'), ('zerocopy', 'rejected'), ('', 'rejected')]:
+                    candidate = original.replace('xsk_mode: copy', f'xsk_mode: {binding}' if binding else '')
                     reload_config(candidate, expected)
                     sock.sendall(payload)
                     assert sock.recv(4096) == payload, 'binding-mode reload disturbed the existing flow'
-                print('binding mode keeps omitted/copy equivalent and rejects live zerocopy changes', flush=True)
+                print('explicit copy reload preserves flows; omitted and explicit zerocopy require restart', flush=True)
             if mode == 'snat' and family == socket.AF_INET and kind == socket.SOCK_DGRAM:
                 original = pathlib.Path(sys.argv[2]).read_text()
                 for outbound in ('block', 'direct'):
@@ -464,7 +464,7 @@ routing {
 }
 EOF
 }
-write_config "$work/asymmetric.dae" 'backend: xdp' 'direct: endpoint'
+write_config "$work/asymmetric.dae" 'backend: xdp' 'direct: endpoint' '' 'copy'
 python3 - "$work/asymmetric.dae" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -535,20 +535,24 @@ for missing in backend direct; do
     ip netns exec dut python3 "$work/check.py" absent
     [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'invalid config left pinned kernel objects'
 done
-write_config "$work/zerocopy-refused.dae" 'backend: xdp' 'direct: endpoint' '' 'zerocopy'
-set +e
-ip netns exec dut timeout 15s "$daemon" -c "$work/zerocopy-refused.dae" --bpf-pin-root "$work/bpf" >"$work/zerocopy-refused.log" 2>&1
-status=$?
-set -e
-[[ $status != 0 && $status != 124 && $status != 137 ]] || fail 'unsupported zero-copy did not reject startup'
-grep -q 'zero-copy segment capability unavailable' "$work/zerocopy-refused.log" || fail 'zero-copy request missed capability admission'
-if grep -q 'XDP queue bound' "$work/zerocopy-refused.log"; then fail 'unsupported zero-copy reached queue binding'; fi
-ip netns exec dut python3 "$work/check.py" absent
-[[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'unsupported zero-copy left pinned objects'
+for binding in omitted zerocopy; do
+    mode=$binding
+    if [[ $binding == omitted ]]; then mode=; fi
+    write_config "$work/$binding-refused.dae" 'backend: xdp' 'direct: endpoint' '' "$mode"
+    set +e
+    ip netns exec dut timeout 15s "$daemon" -c "$work/$binding-refused.dae" --bpf-pin-root "$work/bpf" >"$work/$binding-refused.log" 2>&1
+    status=$?
+    set -e
+    [[ $status != 0 && $status != 124 && $status != 137 ]] || fail "unsupported $binding zero-copy did not reject startup"
+    grep -q 'zero-copy segment capability unavailable' "$work/$binding-refused.log" || fail "$binding zero-copy request missed capability admission"
+    if grep -q 'XDP queue bound' "$work/$binding-refused.log"; then fail 'unsupported zero-copy reached queue binding'; fi
+    ip netns exec dut python3 "$work/check.py" absent
+    [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'unsupported zero-copy left pinned objects'
+done
 ip -n dut link add link dut1 name lowmtu type vlan id 321
 ip -n dut link set lowmtu mtu 1200 up
 for profile in endpoint core; do
-    write_config "$work/low-mtu-$profile.dae" 'backend: xdp' "direct: $profile"
+    write_config "$work/low-mtu-$profile.dae" 'backend: xdp' "direct: $profile" '' 'copy'
     set +e
     ip netns exec dut timeout 15s "$daemon" -c "$work/low-mtu-$profile.dae" --bpf-pin-root "$work/bpf" >"$work/low-mtu-$profile.log" 2>&1
     status=$?
@@ -606,9 +610,7 @@ for profile in endpoint core snat masquerade endpoint-vlan core-vlan endpoint-vl
     ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
     direct=core
     if [[ $profile == endpoint* ]]; then direct=endpoint; fi
-    binding=
-    if [[ $profile == core ]]; then binding=copy; fi
-    write_config "$work/$profile.dae" 'backend: xdp' "direct: $direct" "$profile" "$binding"
+    write_config "$work/$profile.dae" 'backend: xdp' "direct: $direct" "$profile" 'copy'
     ip -n dut -j address show >"$work/$profile.addresses.json"
     ip netns exec server python3 "$work/echo.py" "$profile" "$work/$profile.server-ready" >"$work/$profile.server.log" 2>&1 &
     server_pid=$!

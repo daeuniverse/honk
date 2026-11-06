@@ -239,12 +239,17 @@ datapath {
 接口条目只能是 `名称: lan` 或 `名称: wan`；携带子块（包括空子块）会被拒绝，
 不会忽略其中的设置。
 
-`xsk_mode` 接受 `copy` 或 `zerocopy`，省略时保持 `copy`。`zerocopy` 对全部选中
-RX 队列强制启用该模式，绝不重试或回退到 Copy。在首次挂载之前，对全部设备
-检查 zero-copy/segment 能力通告和完整包 frame 承诺；成功 bind 后还必须与
-内核 `XDP_OPTIONS_ZEROCOPY` 回读一致。queue 日志报告实际观察到的模式。
-省略与显式 `copy` 在 reload 时等价；切换到或离开 `zerocopy` 必须重启。
-TC 拒绝显式 `xsk_mode`。
+`xsk_mode` 接受 `copy` 或 `zerocopy`；显式选择 XDP 时，省略该字段默认使用
+`zerocopy`，对全部选中 RX 队列强制启用 ZeroCopy，绝不重试 Copy 或回退到其他
+后端。显式 `copy` 仍受支持。在首次挂载之前，对全部设备检查 zero-copy/segment
+能力通告和完整包 frame 承诺；成功 bind 后还必须与内核 `XDP_OPTIONS_ZEROCOPY`
+回读一致。queue 日志报告实际观察到的模式。省略与显式 `zerocopy` 在 reload 时
+等价；切换到或离开 `copy` 必须重启。默认后端仍为 TC，且拒绝显式 `xsk_mode`。
+
+**从原 Copy 默认值迁移：**已有 XDP 配置若省略 `xsk_mode`，现在要求全部选中
+队列实际支持 ZeroCopy。若要保留 Copy 行为，请在升级前向原有 `datapath` 块加入
+`xsk_mode: copy`。否则，不支持 ZeroCopy 会拒绝启动，不会静默降级。省略
+`datapath` 的配置仍使用 TC，不受影响。
 
 Core Direct 要求 `dial_mode: ip`，且不允许需要域名/嗅探的谓词。XDP Endpoint
 不会伪造进程或逐流 MAC 事实。部署必须预先配置并通过独立验证的 bypass-mark

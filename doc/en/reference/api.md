@@ -541,7 +541,7 @@ A refused configuration write names its cause in `details.reason`, merged with a
 
 Full admission also checks the selected XDP execution policy before durable file or
 database mutation. Backend, Direct profile, interface identity and effective XSK mode
-changes require restart; omitted and explicit Copy are equivalent. Firewall/NAT policy
+changes require restart; omitted and explicit ZeroCopy are equivalent. Firewall/NAT policy
 changes remain reloadable. This validates policy, not physical device capabilities.
 
 Each response names the first failed check:

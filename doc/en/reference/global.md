@@ -245,13 +245,21 @@ Unknown settings and native/marked continuation requests are rejected, not ignor
 Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
 including empty nested blocks, are rejected rather than ignored.
 
-`xsk_mode` accepts `copy` or `zerocopy`; omission keeps `copy`. `zerocopy` forces
-that mode for every selected RX queue, with no Copy retry or fallback. Advertised
-zero-copy/segment capability and complete-packet frame commitments are checked
-for all devices before the first attachment; every successful bind must also
-agree with the kernel's `XDP_OPTIONS_ZEROCOPY` readback. Queue logs report that
-observed mode. Omitted and explicit `copy` are equivalent for reload; changing
-to or from `zerocopy` requires restart. TC rejects an explicit `xsk_mode`.
+`xsk_mode` accepts `copy` or `zerocopy`; explicit XDP selection defaults to
+`zerocopy` when the field is omitted. ZeroCopy is forced for every selected RX
+queue, with no Copy retry or fallback to another backend. Explicit `copy` remains
+supported. Advertised zero-copy/segment capability and complete-packet frame
+commitments are checked for all devices before the first attachment; every
+successful bind must also agree with the kernel's `XDP_OPTIONS_ZEROCOPY` readback.
+Queue logs report that observed mode. Omitted and explicit `zerocopy` are equivalent
+for reload; changing to or from `copy` requires restart. TC remains the default
+backend and rejects an explicit `xsk_mode`.
+
+**Migration from the previous Copy default:** existing XDP configurations that
+omit `xsk_mode` now require working ZeroCopy on every selected queue. To preserve
+Copy behavior, add `xsk_mode: copy` to the existing `datapath` block before
+upgrading. Without it, unsupported ZeroCopy rejects startup rather than silently
+falling back. Configurations that omit `datapath` keep TC unchanged.
 
 Core Direct requires `dial_mode: ip` and no domain/sniff predicates. XDP Endpoint
 routing does not invent process or per-flow MAC facts. A pre-existing, independently
