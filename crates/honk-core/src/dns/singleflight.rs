@@ -8,6 +8,7 @@ use tokio::sync::broadcast;
 
 use super::cache::{CacheKey, OperationKind};
 use super::forwarder::{DnsForwardError, ResolveMode};
+use super::outcome::Provenance;
 use super::query::DnsRequestMeta;
 use super::response::ResponseTemplate;
 
@@ -78,7 +79,13 @@ struct CounterSet {
     refreshes: AtomicU64,
 }
 
-pub(crate) type FlightResult = Result<Arc<ResponseTemplate>, Arc<DnsForwardError>>;
+pub(crate) struct FlightAnswer {
+    pub(crate) template: ResponseTemplate,
+    pub(crate) provenance: Provenance,
+    pub(crate) final_upstream: Option<String>,
+}
+
+pub(crate) type FlightResult = Result<Arc<FlightAnswer>, Arc<DnsForwardError>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {

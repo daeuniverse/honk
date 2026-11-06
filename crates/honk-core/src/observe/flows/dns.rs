@@ -324,7 +324,7 @@ pub(crate) fn decision(status: &'static str, error: Option<&'static str>) {
 }
 
 pub(crate) fn qtype(value: u16) -> String {
-    crate::dns::response::native::record_type(value)
+    crate::dns::response::presentation::record_type(value)
 }
 
 fn addresses(values: &[IpAddr], observer: &FlowObserver) -> Vec<IpAddr> {

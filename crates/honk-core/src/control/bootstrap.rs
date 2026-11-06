@@ -171,6 +171,7 @@ impl ControlPlane {
             None,
         );
 
+        let (dns_audit, dns_audit_worker) = crate::audit::DnsAuditWorker::start(&config.global)?;
         let pinned_router = Arc::new(router.clone());
         let pinned_groups = group_manager.read().clone();
         dns_upstream_pool.set_group_manager_snapshot(Arc::clone(&pinned_groups));
@@ -196,7 +197,8 @@ impl ControlPlane {
         let runtime_provider = Arc::new(crate::dns::runtime::DnsServiceProvider::new(
             initial_runtime,
         ));
-        let dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
+        let mut dns_service = crate::dns::DnsService::with_provider(Arc::clone(&runtime_provider));
+        dns_service.audit = dns_audit;
         let dns_resolver = Arc::new(DnsResolver::with_service(dns_service.clone()));
 
         let dns_controller = Arc::new(
@@ -234,6 +236,7 @@ impl ControlPlane {
         }
 
         let control_plane = Self {
+            dns_audit: dns_audit_worker,
             config: config_arc,
             diagnostics: std::sync::Arc::new(parking_lot::RwLock::new(
                 crate::config_diagnostics::ActiveDiagnostics::default(),

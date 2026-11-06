@@ -116,3 +116,41 @@ The `honk-tool` CLI toolbox (bin crate, diagnostics that don't belong in the eng
 - `geosite list [FILTER] | show <category> [--attr ATTR] | find <domain>` and `geoip list [FILTER] | show <code> | lookup <ip>` — offline content search of geosite.dat/geoip.dat (one record per line, `--file PATH` overrides the default search). Without `--file`, honk-tool selects the first regular file from `$DAE_LOCATION_ASSET`, `/var/lib/honk`, legacy `/var/share/honk`, CWD, honk share directories, then dae asset locations; it does not load a config to discover a custom `global.data_dir`. Backed by the read-only scan API in `honk-core::routing` (`GeositeScan`/`GeoipScan`, including `@attr` decoding); `lookup` is longest-prefix. `--attr` uses the same key-presence predicate as routing's `category@attr` filter, so tool output and expansion agree.
 - honk-tool is a **static musl binary** for gateway deployment: build with the `build-musl` zig env (`ZIGCC_TARGET=x86_64-linux-musl` + ci wrappers) and scp — a gnu build fails to exec on VyOS.
 
+
+
+DNS audit is process-owned and independent of native observation. The restart-only
+settings are `global.syslog_dns_enabled` (default false), numeric `global.syslog_addr`,
+`global.syslog_hostname` (empty means system hostname) and `global.syslog_app_name`
+(default `honk`). Explicit identity fields obey RFC 5424 printable ASCII token limits
+(255/48 bytes); headers and JSON share the same identity. One marked TCP connection
+uses RFC 6587 octet counting, 128 KiB/1s batching, bounded raw admission (1024 events,
+8 MiB) and a 4 MiB whole-message limit. Connect failures retain the current batch
+with bounded reconnect backoff; ambiguous failed writes are dropped without replay.
+There is no UDP, application acknowledgment, disk persistence or raw DNS relay
+inspection. Shared DNS presentation is always-built `dns/response/presentation.rs`.
+
+`global.syslog_dns_template` (default RFC5424 plus `${json}`) and
+`global.syslog_dns_json` (empty means the full original event) are hot-reloadable.
+The compiler in honk-config is shared by all config admission paths and the sender;
+no CEE/CEF selector remains. Earlier fork-only `syslog_cee_enabled` is rejected in
+dae/structured loaders, even false/null; programmatic true is rejected too.
+Combined input64KiB, nesting16, AST1024 nodes,2048 tags, expansion4MiB. JSON keys
+are literal and unique at every level; whole unfiltered tag values preserve types,
+while embedded/filtered tags render strings. Header substitutions cannot inject
+spaces; structured-data values require `sd` escaping. Dynamic headers are checked
+before whole-event RFC6587 framing. Unknown tags/filters fail admission.
+Audit snapshots are pinned at frontend admission (transparent UDP before dispatch),
+not when sending. Prepare profile before runtime publication, hold its write guard
+across config/DNS commit; committed-degraded also keeps the new profile. No-op and
+failed reload retain the old profile. Eight live profiles use owned permits, with
+old references released naturally and new-version overflow rejecting the reload.
+`${template_version}` is SHA256 of length-prefixed raw message/JSON sources.
+
+DNS audit JSON includes a nonempty `message` summary in both ordinary and CEE
+modes. VictoriaLogs syslog ingestion maps it to `_msg`; structured fields remain
+the audit query contract and the full-message byte cap includes this summary.
+Numeric `duration_ms` freezes monotonic frontend processing time at response
+readiness or cancellation, before response copies, reply I/O and sender queuing.
+`upstream` uses only the final outcome name, `cache` for normal/stale cache results,
+or null when no upstream metadata exists. Both fields are template tags; copied
+upstream bytes share the raw response admission budget.

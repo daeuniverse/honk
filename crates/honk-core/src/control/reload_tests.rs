@@ -9,6 +9,7 @@ use super::tests::support::{
 };
 use super::udp_endpoint::UdpEndpoint;
 use super::*;
+mod syslog;
 
 use crate::ebpf::mock::MockEbpfBackend;
 use crate::ebpf::{DatapathFlagsWriteOrigin, RoutingPushPhase};

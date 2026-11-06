@@ -191,3 +191,10 @@ pub fn decode_http_check_target(
 pub fn decode_health_http_target(value: &str) -> Result<HttpCheckTarget, InvalidCheckTarget> {
     decode_http_check_target(value.split(',').next().unwrap_or(""), false)
 }
+
+/// RFC 5424 header tokens contain printable US-ASCII without spaces.
+pub fn valid_syslog_header_field(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value.bytes().all(|byte| byte.is_ascii_graphic())
+}

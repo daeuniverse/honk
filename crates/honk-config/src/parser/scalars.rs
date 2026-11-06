@@ -73,6 +73,13 @@ pub(super) const GLOBAL_KEYS: &[&str] = &[
     "so_mark_from_dae",
     "log_level",
     "log_file",
+    "syslog_addr",
+    "syslog_dns_enabled",
+    "syslog_cee_enabled",
+    "syslog_dns_template",
+    "syslog_dns_json",
+    "syslog_hostname",
+    "syslog_app_name",
     "disable_waiting_network",
     "shutdown_wait_connections",
     "lan_interface",
@@ -324,6 +331,46 @@ pub(super) fn parse_global_section(
     }
     if let Some(value) = settings.get("log_file").map(|text| text.unquote().raw()) {
         cfg.log_file = value.to_owned();
+    }
+    if let Some(value) = settings.get("syslog_addr").map(|text| text.unquote().raw()) {
+        cfg.syslog_addr = value.to_owned();
+    }
+    if let Some(value) = settings
+        .get("syslog_hostname")
+        .map(|text| text.unquote().raw())
+    {
+        cfg.syslog_hostname = value.to_owned();
+    }
+    if let Some(value) = settings
+        .get("syslog_app_name")
+        .map(|text| text.unquote().raw())
+    {
+        cfg.syslog_app_name = value.to_owned();
+    }
+    if let Some(value) = settings.get("syslog_dns_enabled") {
+        cfg.syslog_dns_enabled = strict_bool(value.unquote().raw()).ok_or_else(|| {
+            scalar_error(
+                *value,
+                "invalid-config-value",
+                "global.syslog_dns_enabled",
+                "expected true/false, yes/no, 1/0 or on/off",
+            )
+        })?;
+    }
+    if let Some(value) = settings.get("syslog_cee_enabled") {
+        return Err(scalar_error(
+            *value,
+            "removed-config-setting",
+            "global.syslog_cee_enabled",
+            "syslog_cee_enabled was removed; put @cee: in syslog_dns_template",
+        )
+        .into());
+    }
+    if let Some(value) = settings.get("syslog_dns_template") {
+        cfg.syslog_dns_template = value.unquote().raw().to_owned();
+    }
+    if let Some(value) = settings.get("syslog_dns_json") {
+        cfg.syslog_dns_json = value.unquote().raw().to_owned();
     }
     if settings.contains_key("disable_waiting_network") {
         cfg.disable_waiting_network = bool_value(

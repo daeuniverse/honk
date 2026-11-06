@@ -1,4 +1,4 @@
-//! Native DNS presentation over the response validator's record boundaries.
+//! DNS presentation over the response validator's record boundaries.
 
 use std::fmt::{self, Write};
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -9,6 +9,7 @@ use thiserror::Error;
 use super::{RecordBoundary, ResponseError, Section, read_u16, visit_layout};
 use crate::dns::query::{IngressProfile, QueryContext, parse_name_into};
 
+#[cfg(any(feature = "native-api", test))]
 pub(crate) const MAX_JSON_BYTES: usize = 262_144;
 
 #[derive(Debug, Error)]
@@ -409,6 +410,7 @@ pub(crate) fn record_type(value: u16) -> String {
         .map_or_else(|| format!("TYPE{value}"), |(_, name)| (*name).into())
 }
 
+#[cfg(feature = "native-api")]
 pub(crate) fn parse_type(value: &str) -> Option<u16> {
     RECORD_TYPES
         .iter()

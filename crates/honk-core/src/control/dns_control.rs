@@ -55,7 +55,6 @@ impl DnsClientAnswer {
         }
     }
 
-    #[cfg(feature = "native-api")]
     pub(crate) fn outcome(&self) -> Option<&crate::dns::outcome::DnsOutcome> {
         self.0.as_ref().ok()
     }

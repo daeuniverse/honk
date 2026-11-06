@@ -1,0 +1,538 @@
+use super::*;
+use std::time::Duration;
+
+mod metadata;
+
+fn identity() -> Identity {
+    Identity {
+        hostname: "router01".into(),
+        app_name: "honk-audit".into(),
+    }
+}
+
+pub(super) fn profile(identity: Identity) -> Profile {
+    Profile::compile(&Default::default(), identity).unwrap()
+}
+
+pub(crate) fn install_test_profile(audit: &DnsAudit) {
+    let mut initial = profile(identity());
+    initial.slot = Some(
+        Arc::clone(&audit.admission.formats)
+            .try_acquire_owned()
+            .unwrap(),
+    );
+    *audit.format.write() = Some(Arc::new(initial));
+}
+
+pub(crate) fn current_test_profile(audit: &DnsAudit) -> Arc<Profile> {
+    audit.format.read().clone().unwrap()
+}
+
+pub(crate) fn test_profile_event(profile: &Profile) -> serde_json::Value {
+    let input = entry(crate::dns::response::build_dns_refused(&query()));
+    let value = encode(&input, "instance:1", &profile.identity).unwrap();
+    decode_frame(&super::frame(&value, profile).unwrap())
+}
+
+pub(crate) fn test_profile_slots(audit: &DnsAudit) -> usize {
+    audit.admission.formats.available_permits()
+}
+
+pub(crate) fn test_pending_event(mut pending: DnsAuditQuery) -> serde_json::Value {
+    let input = pending.entry.take().unwrap();
+    pending.permit.take();
+    let event = encode(&input, "instance:1", &input.profile.identity).unwrap();
+    decode_frame(&super::frame(&event, &input.profile).unwrap())
+}
+
+fn frame(
+    value: &serde_json::Value,
+    time: SystemTime,
+    identity: &Identity,
+) -> std::io::Result<Vec<u8>> {
+    framed(value, time, identity, "")
+}
+
+fn frame_cee(
+    value: &serde_json::Value,
+    time: SystemTime,
+    identity: &Identity,
+) -> std::io::Result<Vec<u8>> {
+    framed(value, time, identity, "@cee: ")
+}
+
+fn framed(
+    value: &serde_json::Value,
+    time: SystemTime,
+    identity: &Identity,
+    prefix: &str,
+) -> std::io::Result<Vec<u8>> {
+    let global = honk_config::config::GlobalConfig {
+        syslog_dns_template: format!("{}{prefix}${{json}}", identity.header(time)),
+        ..Default::default()
+    };
+    let profile = Profile::compile(&global, identity.clone()).unwrap();
+    super::frame(value, &profile)
+}
+
+fn query() -> Vec<u8> {
+    crate::dns::forwarder::build_dns_query("audit.example", 1)
+}
+
+fn entry(response: Vec<u8>) -> Entry {
+    Entry {
+        profile: Arc::new(profile(identity())),
+        started: SystemTime::UNIX_EPOCH,
+        completed: SystemTime::UNIX_EPOCH + Duration::from_millis(10),
+        duration: Duration::from_millis(10),
+        upstream: None,
+        source: "[::ffff:192.0.2.8]:53000".parse().unwrap(),
+        ingress: IngressProfile::Tcp,
+        query: query().into(),
+        response: Some(response.into()),
+        _query_memory: None,
+        _response_memory: None,
+    }
+}
+
+struct SocketConnector(SocketAddr);
+
+impl transport::Connector for SocketConnector {
+    type Stream = tokio::net::TcpStream;
+    async fn connect(&mut self) -> std::io::Result<Self::Stream> {
+        tokio::net::TcpStream::connect(self.0).await
+    }
+}
+
+pub(crate) struct Receiver {
+    listener: tokio::net::TcpListener,
+    stream: Option<tokio::net::TcpStream>,
+}
+
+pub(crate) async fn receiver() -> (DnsAudit, DnsAuditWorker, Receiver) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (audit, worker) = DnsAuditWorker::with_connector(
+        SocketConnector(listener.local_addr().unwrap()),
+        profile(identity()),
+    );
+    (
+        audit,
+        worker,
+        Receiver {
+            listener,
+            stream: None,
+        },
+    )
+}
+
+pub(super) fn decode_message(message: &[u8]) -> serde_json::Value {
+    let text = std::str::from_utf8(message).unwrap();
+    assert!(text.starts_with("<134>1 "));
+    let body = text.splitn(8, ' ').nth(7).unwrap();
+    serde_json::from_str(body.strip_prefix("@cee: ").unwrap_or(body)).unwrap()
+}
+
+pub(super) fn decode_frame(bytes: &[u8]) -> serde_json::Value {
+    let split = bytes.iter().position(|byte| *byte == b' ').unwrap();
+    let length: usize = std::str::from_utf8(&bytes[..split])
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!(bytes.len() - split - 1, length);
+    decode_message(&bytes[split + 1..])
+}
+
+pub(super) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
+) -> serde_json::Value {
+    use tokio::io::AsyncReadExt;
+    let mut prefix = Vec::new();
+    loop {
+        let byte = stream.read_u8().await.unwrap();
+        if byte == b' ' {
+            break;
+        }
+        assert!(byte.is_ascii_digit());
+        prefix.push(byte);
+        assert!(prefix.len() <= 8);
+    }
+    let length: usize = std::str::from_utf8(&prefix).unwrap().parse().unwrap();
+    assert!(length <= MAX_EVENT_BYTES);
+    let mut bytes = vec![0; length];
+    stream.read_exact(&mut bytes).await.unwrap();
+    decode_message(&bytes)
+}
+
+pub(crate) async fn receive(receiver: &mut Receiver) -> serde_json::Value {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        if receiver.stream.is_none() {
+            receiver.stream = Some(receiver.listener.accept().await.unwrap().0);
+        }
+        read_frame(receiver.stream.as_mut().unwrap()).await
+    })
+    .await
+    .unwrap()
+}
+
+#[test]
+fn default_is_inert_and_creates_no_runtime() {
+    let (audit, worker) = DnsAuditWorker::start(&Default::default()).unwrap();
+    assert!(worker.is_none());
+    assert!(
+        audit
+            .begin(
+                &query(),
+                IngressProfile::Tcp,
+                "127.0.0.1:1".parse().unwrap()
+            )
+            .is_none()
+    );
+}
+
+#[test]
+fn default_template_keeps_legacy_bytes_for_response_and_cancelled_fixtures() {
+    let mut positive = query();
+    positive[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    positive[6..8].copy_from_slice(&1u16.to_be_bytes());
+    positive.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 203, 0, 113, 8]);
+    for response in [
+        Some(crate::dns::response::build_dns_refused(&query())),
+        Some(positive),
+        None,
+    ] {
+        let mut input = entry(Vec::new());
+        input.response = response.map(Vec::into_boxed_slice);
+        let value = encode(&input, "instance:1", &input.profile.identity).unwrap();
+        let mut legacy = input.profile.identity.header(input.completed).into_bytes();
+        serde_json::to_writer(&mut legacy, &value).unwrap();
+        let mut expected = format!("{} ", legacy.len()).into_bytes();
+        expected.extend(legacy);
+        assert_eq!(super::frame(&value, &input.profile).unwrap(), expected);
+    }
+}
+
+#[test]
+fn response_projection_keeps_rcode_source_and_actual_answers() {
+    let wire = crate::dns::response::build_dns_refused(&query());
+    let value = encode(&entry(wire), "instance:1", &identity()).unwrap();
+    assert_eq!(value["domain"], "audit.example.");
+    assert_eq!(value["client_ip"], "192.0.2.8");
+    assert_eq!(value["client_port"], 53000);
+    assert_eq!(value["query_time"], "1970-01-01T00:00:00.000000Z");
+    assert_eq!(value["rcode"], "REFUSED");
+    assert_eq!(value["answers"], json!([]));
+    assert_eq!(value["answer_ips"], json!([]));
+    assert_eq!(value["answer_cnames"], json!([]));
+    assert_eq!(value["answer_types"], json!([]));
+    let mut truncated = query();
+    truncated[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
+    let mut truncated = entry(truncated);
+    truncated.ingress = IngressProfile::Udp {
+        advertised_size: 512,
+    };
+    let value = encode(&truncated, "instance:2", &identity()).unwrap();
+    assert_eq!(value["response_truncated"], true);
+}
+
+#[test]
+fn readable_message_identifies_responses_and_cancellation() {
+    let mut input = entry(crate::dns::response::build_dns_refused(&query()));
+    let value = encode(&input, "instance:1", &identity()).unwrap();
+    assert_eq!(
+        value["message"],
+        "DNS 192.0.2.8 audit.example. A IN: REFUSED answers=0"
+    );
+    assert_eq!(value["result"], "response");
+    assert_eq!(value["rcode"], "REFUSED");
+    input.response = None;
+    input.source = "[2001:db8::8]:53000".parse().unwrap();
+    let value = encode(&input, "instance:2", &identity()).unwrap();
+    assert_eq!(
+        value["message"],
+        "DNS 2001:db8::8 audit.example. A IN: cancelled answers=0"
+    );
+    assert_eq!(value["result"], "cancelled");
+    assert!(value["rcode"].is_null());
+    assert_eq!(value["answers"], json!([]));
+}
+
+#[test]
+fn queue_reservations_bound_inflight_wire_memory() {
+    let (sender, mut receiver) = mpsc::channel(QUEUE_LEN);
+    let audit = DnsAudit {
+        sender: Some(sender),
+        admission: Arc::default(),
+        format: Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            profile(identity()),
+        )))),
+    };
+    let source = "192.0.2.1:53".parse().unwrap();
+    let reservations: Vec<_> = (0..QUEUE_LEN)
+        .map(|_| audit.begin(&query(), IngressProfile::Tcp, source).unwrap())
+        .collect();
+    assert!(audit.begin(&query(), IngressProfile::Tcp, source).is_none());
+    assert_eq!(audit.admission.counters.dropped.load(Ordering::Relaxed), 1);
+    drop(reservations);
+    for _ in 0..QUEUE_LEN {
+        let entry = receiver.try_recv().unwrap();
+        assert!(entry.response.is_none());
+    }
+    assert!(receiver.try_recv().is_err());
+    receiver.close();
+    assert!(audit.begin(&query(), IngressProfile::Tcp, source).is_none());
+}
+
+#[test]
+fn raw_byte_budget_rejects_new_events_and_releases_all_permits() {
+    let (sender, mut receiver) = mpsc::channel(QUEUE_LEN);
+    let audit = DnsAudit {
+        sender: Some(sender),
+        admission: Arc::default(),
+        format: Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            profile(identity()),
+        )))),
+    };
+    let large = vec![0; WIRE_LIMIT];
+    let mut held = Vec::new();
+    while let Some(query) =
+        audit.begin(&large, IngressProfile::Tcp, "192.0.2.1:53".parse().unwrap())
+    {
+        held.push(query);
+    }
+    assert!(held.len() < QUEUE_LEN);
+    assert_eq!(audit.admission.counters.dropped.load(Ordering::Relaxed), 1);
+    drop(held);
+    while receiver.try_recv().is_ok() {}
+    assert_eq!(audit.admission.bytes.available_permits(), QUEUE_BYTES);
+}
+
+#[test]
+fn response_admission_failure_discards_whole_event_without_false_cancellation() {
+    let (sender, mut receiver) = mpsc::channel(QUEUE_LEN);
+    let audit = DnsAudit {
+        sender: Some(sender),
+        admission: Arc::default(),
+        format: Arc::new(parking_lot::RwLock::new(Some(Arc::new(
+            profile(identity()),
+        )))),
+    };
+    let pending = audit
+        .begin(
+            &query(),
+            IngressProfile::Tcp,
+            "192.0.2.1:53".parse().unwrap(),
+        )
+        .unwrap();
+    let remaining = audit.admission.bytes.available_permits();
+    let held = Arc::clone(&audit.admission.bytes)
+        .try_acquire_many_owned(remaining as u32)
+        .unwrap();
+    pending.finish(&crate::dns::response::build_dns_refused(&query()), None);
+    assert!(receiver.try_recv().is_err());
+    assert_eq!(audit.admission.counters.dropped.load(Ordering::Relaxed), 1);
+    drop(held);
+    assert_eq!(audit.admission.bytes.available_permits(), QUEUE_BYTES);
+}
+
+#[test]
+fn oversized_unknown_rr_round_trips_without_clipping() {
+    let query = crate::dns::forwarder::build_dns_query("large.example", 65000);
+    let mut response = query.clone();
+    response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    response[6..8].copy_from_slice(&1u16.to_be_bytes());
+    response.extend_from_slice(&[0xc0, 12, 0xfd, 0xe8, 0, 1, 0, 0, 0, 1]);
+    response.extend_from_slice(&60000u16.to_be_bytes());
+    response.resize(response.len() + 60000, 0xab);
+    let mut input = entry(response);
+    input.query = query.into();
+    let value = encode(&input, "instance:1", &identity()).unwrap();
+    assert_eq!(
+        value["answers"][0]["data"],
+        format!("\\# 60000 {}", "AB".repeat(60000))
+    );
+    assert_eq!(value["answer_ips"], json!([]));
+    assert_eq!(value["answer_cnames"], json!([]));
+    assert_eq!(value["answer_types"], json!(["TYPE65000"]));
+    let bytes = frame(&value, input.completed, &identity()).unwrap();
+    assert!(bytes.len() > 8192);
+    assert_eq!(decode_frame(&bytes), value);
+}
+
+#[test]
+fn derived_search_arrays_deduplicate_without_removing_answers() {
+    let mut response = query();
+    response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    let records: &[(u16, &[u8])] = &[
+        (5, b"\x04edge\x07example\0"),
+        (1, &[203, 0, 113, 20]),
+        (1, &[203, 0, 113, 20]),
+        (
+            28,
+            &[0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+        ),
+        (5, b"\x04edge\x07example\0"),
+        (16, b"\x03foo"),
+        (65000, &[0xab]),
+    ];
+    response[6..8].copy_from_slice(&(records.len() as u16).to_be_bytes());
+    for (rtype, data) in records {
+        response.extend_from_slice(&[0xc0, 12]);
+        response.extend_from_slice(&rtype.to_be_bytes());
+        response.extend_from_slice(&[0, 1, 0, 0, 0, 60]);
+        response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        response.extend_from_slice(data);
+    }
+    let value = encode(&entry(response), "instance:1", &identity()).unwrap();
+    assert_eq!(
+        value["message"],
+        "DNS 192.0.2.8 audit.example. A IN: NOERROR answers=7"
+    );
+    assert_eq!(value["answers"].as_array().unwrap().len(), records.len());
+    assert_eq!(value["answer_ips"], json!(["203.0.113.20", "2001:db8::1"]));
+    assert_eq!(value["answer_cnames"], json!(["edge.example."]));
+    assert_eq!(
+        value["answer_types"],
+        json!(["CNAME", "A", "AAAA", "TXT", "TYPE65000"])
+    );
+}
+
+#[test]
+fn configured_identity_is_shared_by_json_and_rfc_header() {
+    let global = honk_config::config::GlobalConfig {
+        syslog_hostname: "gateway.example".into(),
+        syslog_app_name: "dns-audit".into(),
+        ..Default::default()
+    };
+    let identity = Identity::from_config(&global);
+    let input = entry(crate::dns::response::build_dns_refused(&query()));
+    let value = encode(&input, "instance:1", &identity).unwrap();
+    assert_eq!(value["hostname"], "gateway.example");
+    assert_eq!(value["app_name"], "dns-audit");
+    let bytes = frame(&value, SystemTime::UNIX_EPOCH, &identity).unwrap();
+    let prefix_end = bytes.iter().position(|byte| *byte == b' ').unwrap() + 1;
+    let (header, body) = std::str::from_utf8(&bytes[prefix_end..])
+        .unwrap()
+        .split_once('{')
+        .unwrap();
+    assert_eq!(
+        header,
+        "<134>1 1970-01-01T00:00:00.000000Z gateway.example dns-audit - dns.query - "
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&format!("{{{body}")).unwrap();
+    assert_eq!(parsed, value);
+    let mut baseline = encode(
+        &input,
+        "instance:1",
+        &Identity {
+            hostname: "-".into(),
+            app_name: "honk".into(),
+        },
+    )
+    .unwrap();
+    let mut customized = value;
+    for body in [&mut baseline, &mut customized] {
+        body.as_object_mut().unwrap().remove("hostname");
+        body.as_object_mut().unwrap().remove("app_name");
+    }
+    assert_eq!(customized, baseline);
+}
+
+#[test]
+fn automatic_hostname_uses_only_valid_system_values() {
+    assert_eq!(Identity::system_hostname("router01\n"), "router01");
+    assert_eq!(Identity::system_hostname("router01"), "router01");
+    for invalid in ["", "with space\n", "router\n\n", "\r\n", "路由器\n"] {
+        assert_eq!(Identity::system_hostname(invalid), "-");
+    }
+    assert_eq!(Identity::system_hostname(&"x".repeat(256)), "-");
+}
+
+#[test]
+fn whole_event_limit_includes_header_and_utf8_framing_counts_bytes() {
+    let identity = Identity {
+        hostname: "h".repeat(255),
+        app_name: "a".repeat(48),
+    };
+    let time = SystemTime::UNIX_EPOCH;
+    let mut value =
+        json!({"hostname": identity.hostname, "app_name": identity.app_name, "padding": ""});
+    let overhead = identity.header(time).len() + serde_json::to_vec(&value).unwrap().len();
+    value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead));
+    let at_limit = frame(&value, time, &identity).unwrap();
+    assert!(at_limit.starts_with(format!("{MAX_EVENT_BYTES} ").as_bytes()));
+    assert_eq!(decode_frame(&at_limit), value);
+    value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead + 1));
+    assert!(frame(&value, time, &identity).is_err());
+    let utf8 =
+        json!({"label": "上海", "hostname": identity.hostname, "app_name": identity.app_name});
+    let bytes = frame(&utf8, time, &identity).unwrap();
+    assert_eq!(decode_frame(&bytes), utf8);
+    let text = std::str::from_utf8(&bytes).unwrap();
+    let (length, message) = text.split_once(' ').unwrap();
+    assert_eq!(length.parse::<usize>().unwrap(), message.len());
+    assert!(message.len() > message.chars().count());
+}
+
+#[test]
+fn compressed_aaaa_answers_expand_past_the_syslog_budget() {
+    let query = crate::dns::forwarder::build_dns_query("audit.example", 28);
+    let mut response = query.clone();
+    response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    response[6..8].copy_from_slice(&100u16.to_be_bytes());
+    for index in 1u16..=100 {
+        response.extend_from_slice(&[0xc0, 12, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16]);
+        let mut ip = "2001:db8::".parse::<std::net::Ipv6Addr>().unwrap().octets();
+        ip[14..].copy_from_slice(&index.to_be_bytes());
+        response.extend_from_slice(&ip);
+    }
+    let wire_bytes = response.len();
+    let mut input = entry(response);
+    input.query = query.into();
+    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let json_bytes = serde_json::to_vec(&value).unwrap().len();
+    let bytes = frame(&value, input.completed, &identity()).unwrap();
+    assert!(wire_bytes < 4096);
+    assert!(json_bytes > 8192);
+    assert_eq!(value["answers"].as_array().unwrap().len(), 100);
+    assert_eq!(value["answer_ips"].as_array().unwrap().len(), 100);
+    assert_eq!(decode_frame(&bytes), value);
+    println!(
+        "100 compressed AAAA answers: DNS wire={wire_bytes} bytes, audit JSON={json_bytes} bytes, single TCP frame={} bytes",
+        bytes.len()
+    );
+}
+
+#[test]
+fn cee_is_an_opt_in_prefix_and_keeps_the_same_event_json() {
+    let input = entry(crate::dns::response::build_dns_refused(&query()));
+    let profile = identity();
+    let ordinary = encode(&input, "instance:1", &profile).unwrap();
+    let plain_frame = frame(&ordinary, input.completed, &profile).unwrap();
+    let cee = encode(&input, "instance:1", &profile).unwrap();
+    assert_eq!(cee, ordinary);
+    let cee_frame = frame_cee(&cee, input.completed, &profile).unwrap();
+    let plain_split = plain_frame.iter().position(|byte| *byte == b' ').unwrap();
+    let cee_split = cee_frame.iter().position(|byte| *byte == b' ').unwrap();
+    let plain_message = &plain_frame[plain_split + 1..];
+    let cee_message = &cee_frame[cee_split + 1..];
+    let header = profile.header(input.completed);
+    assert!(plain_message.starts_with(format!("{header}{{").as_bytes()));
+    assert!(cee_message.starts_with(format!("{header}@cee: {{").as_bytes()));
+    assert_eq!(cee_message.len(), plain_message.len() + 6);
+    assert_eq!(decode_frame(&cee_frame), decode_frame(&plain_frame));
+}
+
+#[test]
+fn cee_prefix_is_included_in_the_whole_message_ceiling() {
+    let profile = identity();
+    let time = SystemTime::UNIX_EPOCH;
+    let mut value = json!({"padding": ""});
+    let overhead = profile.header(time).len() + serde_json::to_vec(&value).unwrap().len();
+    value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead));
+    assert!(frame(&value, time, &profile).is_ok());
+    assert!(frame_cee(&value, time, &profile).is_err());
+    value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead - 6));
+    let bytes = frame_cee(&value, time, &profile).unwrap();
+    assert!(bytes.starts_with(format!("{MAX_EVENT_BYTES} ").as_bytes()));
+    assert_eq!(decode_frame(&bytes), value);
+}

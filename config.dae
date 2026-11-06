@@ -1,4 +1,13 @@
 global {
+    # Optional client DNS audit over batched TCP syslog.
+    syslog_addr: ''
+    syslog_dns_enabled: false
+    # Address, enable flag and identity defaults require restart; templates reload live.
+    syslog_dns_template: '<134>1 ${completed_at} ${hostname} ${app_name} - dns.query - ${json}'
+    syslog_dns_json: ''
+    syslog_hostname: ''
+    syslog_app_name: 'honk'
+
     wan_interface: bond0 # 使用 "auto" 自动侦测 WAN 接口。
     lan_interface: podman0
     log_level: info

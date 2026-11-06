@@ -389,6 +389,14 @@ impl ControlPlane {
             );
             return Ok(ReloadOutcome::Rejected);
         }
+        let dns_audit = self.dns_controller.dns_service().audit;
+        let prepared_audit_format = match dns_audit.prepare_format(&new_config.global) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(%error, "reload rejected: DNS audit format unavailable");
+                return Ok(ReloadOutcome::Rejected);
+            }
+        };
 
         #[cfg(feature = "reload-bench-counters")]
         self.reload_slow_path_entries
@@ -754,10 +762,14 @@ impl ControlPlane {
                 } {
                     hook(&new_group_manager);
                 }
+                let mut audit_publication = dns_audit.prepare_publication(prepared_audit_format);
                 publication.commit();
                 *router_guard = new_router;
                 crate::ebpf::record_pname_routing(&router_guard, &**ebpf, &self.degradations);
                 *config_guard = Arc::new(new_config);
+                if let Some(publication) = &mut audit_publication {
+                    publication.commit();
+                }
                 match &self.quic_score_target {
                     Some(target) => {
                         target.set_needed(crate::control::probers::needs_quic_probe(&config_guard))

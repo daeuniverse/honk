@@ -25,6 +25,9 @@ impl ControlPlane {
         let state_tick = self.state_tick.stop_and_join().await;
         info!("shutdown: stopping DNS controller");
         self.dns_controller.shutdown(STAGE_TIMEOUT).await;
+        if let Some(mut audit) = self.dns_audit.take() {
+            audit.shutdown().await;
+        }
         let dns_cache = self.dns_controller.cache().await;
         let persistence = dns_cache.lock().await.persistence();
         if let Some(persistence) = persistence {

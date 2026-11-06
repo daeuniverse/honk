@@ -14,6 +14,12 @@
 | `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
 | `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
 | `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
+| `syslog_addr` | `syslog_addr` | `""` | TCP syslog 接收端的数字 IP 和端口，如 `192.0.2.10:514` 或 `[2001:db8::10]:514`。启用 DNS 审计时必填。修改需重启。 |
+| `syslog_dns_enabled` | `syslog_dns_enabled` | `false` | 将客户端 DNS 结果以 RFC 5424 消息（默认 JSON 正文）通过 TCP 长连接发送，使用 RFC 6587 长度前缀分帧。独立于原生 API、历史记录与日志级别；有界组批和退避重连，不做应用层确认、不落盘。见 [DNS 审计](../design/dns-syslog.md)。修改需重启。 |
+| `syslog_dns_template` | `syslog_dns_template` | `<134>1 ${completed_at} ${hostname} ${app_name} - dns.query - ${json}` | 预编译的完整 RFC 5424 消息模板，支持热重载。在模板中添加 `@cee: ` 或完整 CEF 正文；RFC 6587 字节数由程序自动生成。详见[模板与热重载](../design/dns-syslog.md#模板与热重载)。 |
+| `syslog_dns_json` | `syslog_dns_json` | `""` | `${json}` 使用的 JSON 对象模板。空值保留默认完整事件，包括数字 `${duration_ms}` 和最终上游 `${upstream}`（缓存结果为 `cache`）；独立标签保留 JSON 类型，嵌入文本的标签生成字符串。支持热重载。 |
+| `syslog_hostname` | `syslog_hostname` | `""` | 运行 honk 的设备名，同时写入 RFC 5424 头和 JSON。空值在启动时读取系统主机名，失败回退 `-`。显式值为 1–255 字节、不含空格的可打印 ASCII。修改需重启。 |
+| `syslog_app_name` | `syslog_app_name` | `"honk"` | 应用名，同时写入 RFC 5424 头和 JSON；为 1–48 字节、不含空格的可打印 ASCII。修改需重启。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `shutdown_wait_connections` | `shutdown_wait_connections` | `false` | 可重载、显式启用的业务连接宽限等待；见[关闭](#关闭)。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
