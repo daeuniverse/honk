@@ -754,7 +754,7 @@ Targets come only from accepted configuration:
 
 There is no caller URL or redirect following. Probes apply no address or port policy checks to configured targets or node servers.
 
-IPv4-mapped IPv6 is normalized, and the selected IP is pinned while HTTP Host/TLS SNI retains the configured name. Private/loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
+Target hosts resolve through the running DNS configuration; when it cannot answer, for example under `asis` routing, they fall back to bootstrap DNS. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while HTTP Host/TLS SNI retains the configured name. Private/loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
