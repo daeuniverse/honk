@@ -460,7 +460,17 @@ async fn terminal_device_error_escapes_a_real_output_blocked_join_without_refund
         endpoints.close();
         assert!(scope.next_output().await.is_none());
         assert!(futures::poll!(std::future::poll_fn(|cx| owner.poll_join_plane(cx))).is_pending());
-        let retained = budget.used();
+        // Close aborts synchronously; ordinary pre-join teardown must settle before the fatal
+        // path is checked against the output-blocked join.
+        let mut retained = budget.used();
+        loop {
+            tokio::task::yield_now().await;
+            let settled = budget.used();
+            if settled == retained {
+                break;
+            }
+            retained = settled;
+        }
         let mut warned = false;
         let result = tokio::time::timeout(Duration::from_secs(1), join_endpoints(&mut owner,
             |_| Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "invalid CQ").into())), Instant::now(), &mut warned)).await.expect("fatal I/O must escape before the supervisor join");

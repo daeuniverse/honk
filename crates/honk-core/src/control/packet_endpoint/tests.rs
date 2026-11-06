@@ -32,6 +32,12 @@ fn scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
 }
 
 async fn local_plane() -> (ControlPlane, tokio::net::TcpListener) {
+    local_plane_with(|_| {}).await
+}
+
+async fn local_plane_with(
+    configure: impl FnOnce(&mut honk_config::Config),
+) -> (ControlPlane, tokio::net::TcpListener) {
     let mut config = honk_config::Config::default();
     config.ensure_builtin_nodes();
     config.global.dial_mode = "ip".into();
@@ -47,7 +53,19 @@ async fn local_plane() -> (ControlPlane, tokio::net::TcpListener) {
         ],
         ..Default::default()
     });
-    let plane = super::super::tests::support::control_plane(config);
+    configure(&mut config);
+    let resolver = crate::dns::DnsResolver::new(&config.dns).unwrap();
+    let forwarder = resolver.forwarder();
+    let router = crate::routing::Router::from_config(&config.routing).unwrap();
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver().unwrap()),
+        resolver,
+        forwarder,
+    )
+    .unwrap();
     let health = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     plane
         .alive_set

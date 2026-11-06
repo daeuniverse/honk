@@ -4,12 +4,17 @@ use super::*;
 mod fatal;
 
 async fn xdp_plane(mode: &str, selection: &str) -> (ControlPlane, tokio::net::TcpListener) {
-    let (mut plane, health) = local_plane().await;
-    {
-        let mut config = plane.config.write().await;
-        let mut candidate = config.as_ref().clone();
-        candidate.global.nfqueue_enable = false;
-        candidate.datapath = Some(honk_config::datapath::DatapathConfig {
+    xdp_plane_with(mode, selection, |_| {}).await
+}
+
+async fn xdp_plane_with(
+    mode: &str,
+    selection: &str,
+    configure: impl FnOnce(&mut honk_config::Config),
+) -> (ControlPlane, tokio::net::TcpListener) {
+    let (mut plane, health) = local_plane_with(|config| {
+        config.global.nfqueue_enable = false;
+        config.datapath = Some(honk_config::datapath::DatapathConfig {
             backend: honk_config::datapath::Backend::Xdp,
             direct: Some(honk_config::datapath::DirectProfile::Endpoint),
             interfaces: vec![honk_config::datapath::XdpInterface {
@@ -18,9 +23,10 @@ async fn xdp_plane(mode: &str, selection: &str) -> (ControlPlane, tokio::net::Tc
             }],
             ..Default::default()
         });
-        candidate.validate_assembled().unwrap();
-        *config = Arc::new(candidate);
-    }
+        configure(config);
+        config.validate_assembled().unwrap();
+    })
+    .await;
     plane.set_mode_state(Arc::new(parking_lot::RwLock::new(
         crate::mode::ModeState::new(mode, selection),
     )));
@@ -216,6 +222,114 @@ async fn elastic_tcp_admission_has_funded_task_slots_beyond_the_initial_floor() 
     })
     .await
     .expect("elastic permits must admit real TCP work above the startup floor");
+}
+
+#[cfg(feature = "clash-api")]
+#[tokio::test]
+async fn normal_close_aborts_packet_protocol_before_waiting_for_selector_retirement() {
+    use crate::control::{ControlCommand, client::ControlError, client::SelectionRequest};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, scope_owner) = scope(&budget);
+        let (plane, _health) = xdp_plane_with("Rule", "block", |config| {
+            config.groups[0].interrupt_connections = true;
+            config.routing.default_outbound = "packet-control".into();
+        })
+        .await;
+        let commands = plane.command_sender();
+        let tracker = Arc::clone(&plane.connection_tracker);
+        tracker.enable();
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
+            .await
+            .unwrap();
+        let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let (flow, _) = established_tcp(&scope, destination).await;
+        let source = flow.peer_addr();
+        let permit = Arc::clone(&endpoints.shared.tcp_slots)
+            .acquire_owned()
+            .await
+            .unwrap();
+        endpoints
+            .sender
+            .send(Work::Tcp(flow, permit))
+            .await
+            .unwrap();
+        let (mut server, _) = upstream.accept().await.unwrap();
+        server.write_all(b"held selector output").await.unwrap();
+        let output = loop {
+            let output = scope.next_output().await.unwrap();
+            if output.packet().ends_with(b"held selector output") {
+                break output;
+            }
+            output.release();
+        };
+        let bytes = output.packet().to_vec();
+        let late_permit = commands.clone().reserve_owned().await.unwrap();
+        let (reply, selected) = tokio::sync::oneshot::channel();
+        commands
+            .send(ControlCommand::SetSelector {
+                request: SelectionRequest::Name {
+                    group: "packet-control".into(),
+                    member: "block".into(),
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            server.read(&mut [0; 1]).await.unwrap(),
+            0,
+            "the real selector interruption must close its loopback upstream"
+        );
+        let mut selected = Box::pin(selected);
+        assert!(futures::poll!(&mut selected).is_pending());
+        assert_eq!(tracker.snapshot().len(), 1);
+
+        endpoints.close();
+        commands.closed().await;
+        let mut shutdown = Box::pin(endpoints.shutdown());
+        let mut joined = Box::pin(owner.run());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        assert!(futures::poll!(&mut joined).is_pending());
+        assert!(futures::poll!(&mut selected).is_pending());
+        assert_eq!(tracker.snapshot().len(), 1);
+        assert!(endpoints.retains(scope.scope(), source, destination, 6));
+        assert_eq!(output.packet(), bytes);
+        assert!(budget.used() > 0, "exported bytes must remain funded");
+
+        output.release();
+        let result = selected.await.unwrap().unwrap();
+        #[cfg(feature = "native-api")]
+        assert!(result.interrupted);
+        #[cfg(not(feature = "native-api"))]
+        let _ = result;
+        assert!(tracker.snapshot().is_empty());
+        assert!(futures::poll!(&mut shutdown).is_pending());
+        assert!(futures::poll!(&mut joined).is_pending());
+        let (reply, late_reply) = tokio::sync::oneshot::channel();
+        late_permit.send(ControlCommand::SetSelector {
+            request: SelectionRequest::Name {
+                group: "packet-control".into(),
+                member: "direct".into(),
+            },
+            reply,
+        });
+        assert!(matches!(
+            late_reply.await.unwrap(),
+            Err(ControlError::Unavailable)
+        ));
+        shutdown.await.unwrap();
+        joined.await.unwrap();
+        assert!(scope.next_output().await.is_none());
+        drop(endpoints);
+        drop(scope);
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("ordinary close must abort packet state and join without further peer ingress");
 }
 
 #[cfg(feature = "native-api")]

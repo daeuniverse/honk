@@ -99,7 +99,7 @@ impl Shared {
     fn close(&self) {
         self.admission.store(CLOSING, Ordering::Release);
         for scope in self.scopes.iter() {
-            scope.close_admission();
+            scope.shutdown(true);
         }
         self.changed.notify_one();
     }
@@ -574,8 +574,8 @@ impl PacketEndpoints {
         Ok(())
     }
 
-    /// Close new admission. The owner performs explicit abort and joined teardown;
-    /// exported output leases must still be released by their actual I/O consumers.
+    /// Close admission and abort protocol state before waiting for joined teardown.
+    /// Exported output leases must still be released by their actual I/O consumers.
     pub fn close(&self) {
         self.shared.close();
     }
@@ -862,7 +862,9 @@ impl EndpointRuntime {
                     None => break,
                 },
                 result = self.scope_tasks.join_next(), if !self.scope_tasks.is_empty() => {
-                    failure = Some(anyhow::anyhow!("packet scope owner exited before shutdown: {result:?}"));
+                    if !self.shared.is_closing() || !matches!(result, Some(Ok(()))) {
+                        failure = Some(anyhow::anyhow!("packet scope owner exited before shutdown: {result:?}"));
+                    }
                     break;
                 }
                 error = failures.recv() => {
@@ -925,10 +927,6 @@ impl EndpointRuntime {
         self.shared.commands_closed.finish(true);
         self.receiver.close();
         self.initializers.close();
-        for scope in self.shared.scopes.iter() {
-            scope.close_admission();
-            scope.shutdown(true);
-        }
         // Pre-close permits can still publish FlowIo; drain them before joining scopes.
         while self.receiver.recv().await.is_some() {}
         while self.initializers.recv().await.is_some() {}

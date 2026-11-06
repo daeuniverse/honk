@@ -29,15 +29,10 @@ async fn fatal_selector_releases_real_config_and_subscription_shutdown_before_cq
     tokio::time::timeout(Duration::from_secs(20), async {
         let budget = MemoryBudget::new(64 << 20);
         let (scope, scope_owner) = scope(&budget);
-        let (mut plane, _health) = xdp_plane("Rule", "block").await;
-        {
-            let mut config = plane.config.write().await;
-            let mut next = config.as_ref().clone();
-            next.groups[0].interrupt_connections = true;
-            next.routing.default_outbound = "packet-control".into();
-            *config = Arc::new(next);
-        }
-        *plane.router.write().await = crate::routing::Router::new(&[], "packet-control").unwrap();
+        let (mut plane, _health) = xdp_plane_with("Rule", "block", |config| {
+            config.groups[0].interrupt_connections = true;
+            config.routing.default_outbound = "packet-control".into();
+        }).await;
         let native = crate::native_api::observation::NativeObservation::attach(&mut plane).await;
         let mut phase = plane.observe_phase();
         let commands = plane.command_sender();
@@ -115,38 +110,17 @@ async fn fatal_selector_releases_real_config_and_subscription_shutdown_before_cq
         late_permit.send(late_command);
         assert!(late_reply.await.is_err());
         assert!(failed.await.is_err());
-        assert!(!owner.task.as_ref().unwrap().is_finished(), "active selector work remains retained, not aborted");
+        assert!(!owner.task.as_ref().unwrap().is_finished(), "selector completion remains retained by actual CQ output");
         assert_eq!(tracker.snapshot().len(), 1);
         assert!(output.packet().ends_with(b"CQ-held selector reply"));
         assert!(budget.used() > 0);
 
-        let ip = wire::parse_ip(output.packet()).unwrap();
-        let (sent, offset) = wire::tcp::parse(&output.packet()[ip.payload.clone()]).unwrap();
-        let mut reset = [0; 128];
-        let length = wire::tcp::emit_packet(&mut reset, ip.dst, ip.src, &wire::tcp::Header {
-            src_port: sent.dst_port,
-            dst_port: sent.src_port,
-            seq: sent.ack,
-            ack: sent.seq.wrapping_add((ip.payload.len() - offset) as u32),
-            flags: wire::tcp::RST | wire::tcp::ACK,
-            window: 4096,
-            urgent: 0,
-            options: wire::tcp::Options::default(),
-        }, [&[], &[]]).unwrap();
-        let output_scope = scope.clone();
-        let consumer = tokio::spawn(async move {
-            while let Some(output) = output_scope.next_output().await {
-                wire::PacketView::from_slice(output.packet()).validate_transport().unwrap();
-                output.release();
-            }
-        });
-        assert_eq!(scope.receive(&reset[..length], Instant::now()), Rx::Consumed);
+        assert!(scope.next_output().await.is_none());
         output.release();
         endpoints.shutdown().await.unwrap();
         owner.run().await.unwrap();
-        consumer.await.unwrap();
         assert!(tracker.snapshot().is_empty());
-    }).await.expect("fatal acknowledgements and retained TCP protocol cleanup must complete independently");
+    }).await.expect("fatal acknowledgements and actual output release must complete independently");
 }
 
 #[tokio::test]
