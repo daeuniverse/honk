@@ -55,7 +55,6 @@ impl DnsClientAnswer {
         }
     }
 
-    #[cfg(feature = "native-api")]
     pub(crate) fn outcome(&self) -> Option<&crate::dns::outcome::DnsOutcome> {
         self.0.as_ref().ok()
     }
@@ -185,6 +184,11 @@ impl DnsController {
         self.dns_service
             .provider()
             .unwrap_or_else(|| unreachable!("controller always uses runtime DNS service"))
+    }
+
+    #[inline]
+    pub(crate) fn dns_audit(&self) -> &crate::audit::DnsAudit {
+        &self.dns_service.audit
     }
 
     pub(crate) fn dns_service(&self) -> crate::dns::DnsService {

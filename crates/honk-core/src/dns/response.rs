@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use super::query::{IngressProfile, QueryContext, TxId, parse_name_into};
 
-#[cfg(feature = "native-api")]
-pub(crate) mod native;
+#[cfg(any(feature = "native-api", feature = "dns-syslog"))]
+pub(crate) mod presentation;
 
 const HEADER_LEN: usize = 12;
 const QR: u16 = 0x8000;

@@ -79,7 +79,7 @@ check:
 
 # Clippy lint all (fetches the pinned doona for native-ui unless HONK_DOONA_DIR is set)
 lint:
-    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/dns-syslog,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
 
 # Format all
 fmt:
@@ -97,8 +97,10 @@ test:
 
 # Workspace CI gate (requires cargo-nextest).
 test-ci:
-    # Without nextest: cargo test --workspace --features honk-core/native-ui --no-fail-fast
-    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui --profile ci
+    # Without nextest: cargo test --workspace --features honk-core/native-ui,honk-core/dns-syslog --no-fail-fast
+    HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui,honk-core/dns-syslog --profile ci
+    cargo test -p honk-core --no-default-features --lib audit_feature_tests::
+    cargo test -p honk-core --no-default-features --features dns-syslog --lib audit::
 
 # Run core + outbound tests
 test-core:

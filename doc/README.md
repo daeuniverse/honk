@@ -61,6 +61,7 @@ How honk works, by subsystem. / honk 的工作原理，按子系统划分。
 | Held-first-packet UDP (NFQUEUE) | [en/design/nfqueue.md](./en/design/nfqueue.md) | [zh/design/nfqueue.md](./zh/design/nfqueue.md) |
 | Userspace control plane | [en/design/control-plane.md](./en/design/control-plane.md) | [zh/design/control-plane.md](./zh/design/control-plane.md) |
 | DNS subsystem | [en/design/dns.md](./en/design/dns.md) | [zh/design/dns.md](./zh/design/dns.md) |
+| Client DNS audit over TCP syslog / 客户端 DNS TCP syslog 审计 | [en/design/dns-syslog.md](./en/design/dns-syslog.md) | [zh/design/dns-syslog.md](./zh/design/dns-syslog.md) |
 | Outbound stack | [en/design/outbound.md](./en/design/outbound.md) | [zh/design/outbound.md](./zh/design/outbound.md) |
 | Groups, health, warm-up | [en/design/groups.md](./en/design/groups.md) | [zh/design/groups.md](./zh/design/groups.md) |
 

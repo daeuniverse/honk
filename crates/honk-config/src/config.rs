@@ -76,6 +76,31 @@ pub struct GlobalConfig {
     #[serde(default)]
     pub log_file: String,
     #[serde(default)]
+    pub syslog_addr: String,
+    #[serde(default)]
+    pub syslog_dns_enabled: bool,
+    #[serde(default)]
+    pub syslog_cee_enabled: bool,
+    /// Reject removed formatting controls in structured configuration.
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_dns_syslog_format"
+    )]
+    pub syslog_dns_template: (),
+    #[doc(hidden)]
+    #[serde(
+        default,
+        skip_serializing,
+        deserialize_with = "removed_dns_syslog_format"
+    )]
+    pub syslog_dns_json: (),
+    #[serde(default)]
+    pub syslog_hostname: String,
+    #[serde(default = "default_syslog_app_name")]
+    pub syslog_app_name: String,
+    #[serde(default)]
     pub disable_waiting_network: bool,
     /// Give accepted connections up to five seconds to finish on ordinary shutdown.
     #[serde(default)]
@@ -306,6 +331,19 @@ fn default_tproxy_mark() -> u32 {
 /// compiled in, so userspace cannot honor any other value. honk-core pins
 /// this against `honk_ebpf_common::TPROXY_MARK` with a unit test.
 pub const DEFAULT_TPROXY_MARK: u32 = 0x0800_0000;
+fn default_syslog_app_name() -> String {
+    "honk".into()
+}
+
+fn removed_dns_syslog_format<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<(), D::Error> {
+    let _ = serde::de::IgnoredAny::deserialize(deserializer)?;
+    Err(serde::de::Error::custom(
+        "DNS syslog uses a fixed JSON schema; remove this formatting setting",
+    ))
+}
+
 fn default_log_level() -> String {
     "info".into()
 }
@@ -381,6 +419,13 @@ impl Default for GlobalConfig {
             so_mark_from_dae: 0,
             log_level: default_log_level(),
             log_file: String::new(),
+            syslog_addr: String::new(),
+            syslog_dns_enabled: false,
+            syslog_cee_enabled: false,
+            syslog_dns_template: (),
+            syslog_dns_json: (),
+            syslog_hostname: String::new(),
+            syslog_app_name: default_syslog_app_name(),
             disable_waiting_network: false,
             shutdown_wait_connections: false,
             lan_interface: vec![],
@@ -767,6 +812,52 @@ impl Config {
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         self.experimental.native_api.validate_detailed(source)?;
+        if self.global.syslog_dns_enabled
+            && !self
+                .global
+                .syslog_addr
+                .parse::<std::net::SocketAddr>()
+                .is_ok_and(|address| {
+                    let ip = address.ip().to_canonical();
+                    address.port() != 0
+                        && !ip.is_unspecified()
+                        && !ip.is_multicast()
+                        && !matches!(ip, std::net::IpAddr::V4(ip) if ip.is_broadcast())
+                })
+        {
+            return Err(config_validation_error(
+                source,
+                SettingPath::new("global").field("syslog_addr"),
+                "invalid-config-value",
+                "DNS syslog requires a unicast IP address and nonzero port",
+            ));
+        }
+
+        for (value, limit, field, auto) in [
+            (
+                self.global.syslog_hostname.as_str(),
+                255,
+                "syslog_hostname",
+                true,
+            ),
+            (
+                self.global.syslog_app_name.as_str(),
+                48,
+                "syslog_app_name",
+                false,
+            ),
+        ] {
+            if !(auto && value.is_empty()) && !crate::check::valid_syslog_header_field(value, limit)
+            {
+                return Err(config_validation_error(
+                    source,
+                    SettingPath::new("global").field(field),
+                    "invalid-config-value",
+                    "syslog header fields require printable ASCII without spaces and must fit their RFC 5424 byte limits",
+                ));
+            }
+        }
+
         if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
         {
             error.diagnostic.source = source.clone();

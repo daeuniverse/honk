@@ -10,7 +10,7 @@ use parking_lot::{Mutex, MutexGuard};
 
 use crate::dns::outcome::{DnsOutcome, RequestRoute};
 use crate::dns::query::IngressProfile;
-use crate::dns::response::native::{self, DnsQuestion};
+use crate::dns::response::presentation::{self, DnsQuestion};
 
 pub(crate) const MAX_RECORDS: usize = 512;
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -116,10 +116,10 @@ impl DnsHistory {
         {
             return;
         }
-        let Ok(context) = native::context(query, ingress) else {
+        let Ok(context) = presentation::context(query, ingress) else {
             return;
         };
-        if native::measure(&context, response, usize::MAX).is_err() {
+        if presentation::measure(&context, response, usize::MAX).is_err() {
             return;
         }
         let Some(qtype) = context.qtype().map(|value| value.get()) else {
@@ -143,7 +143,7 @@ impl DnsHistory {
         {
             return;
         }
-        let Ok(question) = native::question(query, ingress) else {
+        let Ok(question) = presentation::question(query, ingress) else {
             return;
         };
         let bytes = query.len()

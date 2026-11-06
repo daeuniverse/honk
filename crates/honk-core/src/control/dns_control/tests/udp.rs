@@ -43,6 +43,7 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
             source,
             "[::1]:53".parse().unwrap(),
             crate::dns::query::validate_exact_dns_query(&query).unwrap(),
+            None,
         )
         .await;
     let response = api.log_page_for_test();
@@ -102,6 +103,7 @@ async fn admitted_transparent_udp_routes_by_client_source() {
                 client_addr.parse().expect("client"),
                 original_dst,
                 validated,
+                None,
             )
             .await;
     }

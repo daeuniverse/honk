@@ -125,6 +125,21 @@ pub(crate) fn restart_required_changes(
     if old_global.so_mark_from_dae != new_global.so_mark_from_dae {
         changed.push(field!("global.so_mark_from_dae"));
     }
+    if old_global.syslog_addr != new_global.syslog_addr {
+        changed.push(field!("global.syslog_addr"));
+    }
+    if old_global.syslog_dns_enabled != new_global.syslog_dns_enabled {
+        changed.push(field!("global.syslog_dns_enabled"));
+    }
+    if old_global.syslog_cee_enabled != new_global.syslog_cee_enabled {
+        changed.push(field!("global.syslog_cee_enabled"));
+    }
+    if old_global.syslog_hostname != new_global.syslog_hostname {
+        changed.push(field!("global.syslog_hostname"));
+    }
+    if old_global.syslog_app_name != new_global.syslog_app_name {
+        changed.push(field!("global.syslog_app_name"));
+    }
     if old_global.log_level != new_global.log_level {
         changed.push(field!("global.log_level"));
     }
@@ -212,5 +227,43 @@ fn udp_probe_input_changed(current: &[String], candidate: &[String]) -> bool {
                     .eq_ignore_ascii_case(b.strip_suffix('.').unwrap_or(b))
         }
         (a, b) => a != b,
+    }
+}
+
+#[cfg(test)]
+mod syslog_tests {
+    use super::*;
+
+    #[test]
+    fn dns_syslog_settings_require_restart() {
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.global.syslog_addr = "192.0.2.10:514".into();
+        candidate.global.syslog_dns_enabled = true;
+        candidate.global.syslog_cee_enabled = true;
+        candidate.global.syslog_hostname = "router01".into();
+        candidate.global.syslog_app_name = "dns-audit".into();
+        let changed = restart_required_changes(&current, &candidate, None, None);
+        let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
+        assert_eq!(
+            paths,
+            [
+                "global.syslog_addr",
+                "global.syslog_dns_enabled",
+                "global.syslog_cee_enabled",
+                "global.syslog_hostname",
+                "global.syslog_app_name"
+            ]
+        );
+    }
+
+    #[test]
+    fn cee_mode_requires_restart_while_dns_audit_is_disabled() {
+        let current = Config::default();
+        let mut candidate = current.clone();
+        candidate.global.syslog_cee_enabled = true;
+        let changed = restart_required_changes(&current, &candidate, None, None);
+        let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
+        assert_eq!(paths, ["global.syslog_cee_enabled"]);
     }
 }
