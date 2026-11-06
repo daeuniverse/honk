@@ -4,8 +4,9 @@
 //! the TCX bindings once and reconcile them against the backend's single
 //! owner (`bindings`). Every step that can wait on rtnl (link dump, TCX
 //! create/update/query, closing a link FD, sysctl) runs on a blocking thread
-//! with no backend lock held; the backend lock is taken only to snapshot
-//! (read) and to commit (write). Without a usable event
+//! with no backend lock held. Verification also runs off-lock; only current-generation
+//! extension installation, bindability publication and link commits require the write
+//! lock. Without a usable event
 //! subscription the same loop runs on the ticker alone.
 
 use nix::errno::Errno;
@@ -456,7 +457,32 @@ impl Watch {
                 }
             }
 
-            let snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let mut snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let missing = snapshot
+                .as_ref()
+                .map(|held| missing_programs(held, &plan))
+                .unwrap_or_default();
+            if !missing.is_empty() {
+                let prepare = self.ebpf.read().await.prepare_tc_programs(&missing);
+                match prepare {
+                    Ok(Some(prepare)) => {
+                        let prepared = tokio::task::spawn_blocking(prepare).await;
+                        let batch = match prepared {
+                            Ok(batch) => batch,
+                            Err(error) => {
+                                return Err(self.step_failed(ReconcileStep::Join, error.into()));
+                            }
+                        };
+                        let mut ebpf = self.ebpf.write().await;
+                        if let Err(error) = ebpf.commit_tc_programs(batch) {
+                            warn!("load TC programs for the interface plan: {error:#}");
+                        }
+                        snapshot = ebpf.interface_binding_snapshot();
+                    }
+                    Ok(None) => {}
+                    Err(error) => warn!("prepare TC programs for the interface plan: {error:#}"),
+                }
+            }
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
@@ -559,6 +585,18 @@ impl Watch {
             None => Ok(changed),
         }
     }
+}
+
+fn missing_programs(held: &BindingSnapshot, plan: &InterfacePlan) -> Vec<interface::TcProgram> {
+    let mut missing: Vec<_> = plan
+        .bindings
+        .iter()
+        .map(|binding| binding.program)
+        .filter(|program| !held.programs.iter().any(|(loaded, _)| loaded == program))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
 }
 
 fn log_commit(commit: &interface::BindingCommit) {

@@ -62,9 +62,15 @@ fn kernel_btf_override_controls_startup() {
             assert!(!pin_root.exists());
             let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
             let before = held_bpf_link_count();
-            let result =
-                RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-                    .await;
+            let result = RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                &dae0_setup,
+                0,
+                &crate::ebpf::interface::TcProgram::ALL,
+            )
+            .await;
             let mut backend = match result {
                 Ok(backend) => backend,
                 Err(error) => {
@@ -80,13 +86,16 @@ fn kernel_btf_override_controls_startup() {
                     .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                     .unwrap();
                 let storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
-                    backend.bpf().unwrap().map("SOCKET_IDENTITY").unwrap(),
+                    backend.maps().unwrap().get("SOCKET_IDENTITY").unwrap(),
                 )
                 .unwrap();
                 assert_eq!(storage.get(&receiver, 0).unwrap().pid, std::process::id());
                 #[cfg(feature = "native-api")]
                 {
-                    let trace = backend.receive_trace().expect("override receive trace");
+                    let trace = backend
+                        .prepare_receive_trace()
+                        .expect("receive trace preparation")()
+                    .expect("override receive trace");
                     let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
                     let mut registration = trace.register(receiver.as_raw_fd()).unwrap();
                     sender

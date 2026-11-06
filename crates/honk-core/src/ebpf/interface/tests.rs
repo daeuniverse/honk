@@ -97,6 +97,27 @@ fn program_names_are_unique_and_cover_all_variants() {
 }
 
 #[test]
+fn startup_verifies_only_what_the_plan_binds_plus_one_routing_target() {
+    use TcProgram::*;
+    let ethernet_wan = run(&[], &["ens3"], &[base()]);
+    assert_eq!(
+        initial_programs(&ethernet_wan, false),
+        [WanIngressL2, WanEgressL2]
+    );
+    let ppp_wan = run(&[], &["ppp0"], &[vec![link(51, "ppp0").arphrd(PPP)]]);
+    assert_eq!(
+        initial_programs(&ppp_wan, false),
+        [WanIngressL3, WanEgressL3]
+    );
+    let lan = run(&["ens3"], &[], &[base()]);
+    assert_eq!(initial_programs(&lan, true), [LanIngressL2, LanEgressL2]);
+    let absent = run(&["br9"], &["wan9"], &[base()]);
+    assert!(absent.bindings.is_empty());
+    assert_eq!(initial_programs(&absent, true), [LanIngressL2]);
+    assert_eq!(initial_programs(&absent, false), [WanEgressL2]);
+}
+
+#[test]
 fn single_lan() {
     let plan = run(&["ens3"], &[], &[base()]);
     assert_eq!(set(&plan), ["2 in lan_ingress_l2", "2 eg lan_egress_l2"]);

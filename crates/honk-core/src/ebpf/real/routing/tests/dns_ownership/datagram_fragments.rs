@@ -268,7 +268,7 @@ fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
         );
         assert_eq!(verdict(&backend, "lan_ingress_l2", &later), TC_ACT_SHOT);
 
-        let map = backend.bpf_mut().unwrap().map_mut("FRAG_VERDICT").unwrap();
+        let map = backend.maps_mut().unwrap().get_mut("FRAG_VERDICT").unwrap();
         let mut map = AyaHashMap::<_, FragmentKey, FragmentVerdict>::try_from(map).unwrap();
         let keys: Vec<_> = map.keys().map(Result::unwrap).collect();
         assert_eq!(keys.len(), 1);

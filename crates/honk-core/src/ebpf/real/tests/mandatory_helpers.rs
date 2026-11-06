@@ -1,8 +1,10 @@
-use super::raw_bpf::{ADD64_IMM, CALL, EXIT, MOV64_IMM, MOV64_REG, insn, load_program};
+use super::raw_bpf::{
+    ADD64_IMM, CALL, EXIT, MOV64_IMM, MOV64_REG, insn, load_program, program_info,
+};
 use super::*;
 use anyhow::Context as _;
 use aya::programs::Program;
-use aya_obj::generated::{bpf_attr, bpf_cmd::BPF_OBJ_GET_INFO_BY_FD, bpf_prog_info, bpf_prog_type};
+use aya_obj::generated::{bpf_prog_info, bpf_prog_type};
 
 const MANDATORY_PROGRAMS: [&str; 16] = [
     "lan_ingress_l2",
@@ -26,16 +28,6 @@ const MANDATORY_PROGRAMS: [&str; 16] = [
 const BPF_PROBE_READ: i32 = 4;
 const BPF_PROBE_READ_KERNEL: i32 = 113;
 const BPF_PROBE_READ_KERNEL_STR: i32 = 115;
-
-fn program_info(fd: RawFd, info: &mut bpf_prog_info) -> anyhow::Result<()> {
-    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
-    attr.info.bpf_fd = fd as u32;
-    attr.info.info_len = core::mem::size_of::<bpf_prog_info>() as u32;
-    attr.info.info = info as *mut bpf_prog_info as u64;
-    unsafe { syscall::bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
-        .map(|_| ())
-        .map_err(|errno| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD failed with errno {errno}"))
-}
 
 /// Verifier-rewritten instructions; a call's `imm` is then the helper's address relative
 /// to `__bpf_call_base`, not its id, and is zeroed unless raw dumps are permitted.

@@ -86,9 +86,12 @@ pub(super) fn attach(bpf: &mut Ebpf, cgroup: &std::fs::File) -> Result<SockOpsLi
     Ok(program.take_link(link)?)
 }
 
-pub(super) fn lookup(bpf: &Ebpf, fd: BorrowedFd<'_>) -> Result<TcpSocketBinding> {
+pub(super) fn lookup(
+    bpf: &super::programs::KernelMaps,
+    fd: BorrowedFd<'_>,
+) -> Result<TcpSocketBinding> {
     let storage = SkStorage::<_, TcpSocketBinding>::try_from(
-        bpf.map("TCP_SOCKET_BINDING")
+        bpf.get("TCP_SOCKET_BINDING")
             .ok_or_else(|| anyhow!("required TCP_SOCKET_BINDING missing"))?,
     )?;
     match storage.get(&fd, 0) {
@@ -109,7 +112,7 @@ pub(super) fn adopt(
         !backend.retirement_failed,
         "retirement ownership is unresolved"
     );
-    let binding = lookup(backend.bpf()?, fd)?;
+    let binding = lookup(backend.maps()?, fd)?;
     let current = backend
         .conn_state_lookup(tuples)?
         .ok_or_else(|| anyhow!("accepted TCP flow has no conn-state: {tuples:?}"))?;

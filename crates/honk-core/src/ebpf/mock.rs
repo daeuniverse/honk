@@ -191,6 +191,8 @@ pub struct MockEbpfBackend {
     datapath_flags_write_trace: Vec<DatapathFlagsWriteTrace>,
     #[cfg(test)]
     pub datapath_observation_fixture: Option<super::DatapathObservation>,
+    #[cfg(all(test, feature = "ebpf"))]
+    pub(crate) tc_program_preparation: super::real::programs::TcProgramPreparationFixture,
     #[cfg(test)]
     pub pname_support: super::PnameSupport,
 }
