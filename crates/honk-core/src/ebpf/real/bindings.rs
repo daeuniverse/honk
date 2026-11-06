@@ -1,6 +1,6 @@
 //! Single owner of the TCX links on configured interfaces.
 //!
-//! The backend holds the preloaded TC program FDs and one owned link per
+//! The backend holds the loaded TC program FDs and one owned link per
 //! `(ifindex, direction)`. [`apply`] turns one validated [`InterfacePlan`] into
 //! a [`BindingCommit`] without any lock held: it creates links by interface
 //! index, updates a link in place when the program changes, and proves a
@@ -39,7 +39,7 @@ const CHAIN_CAPACITY: usize = 64;
 
 type Key = (NonZeroU32, Direction);
 
-/// A verified TC variant that has not yet been published for binding.
+/// A verified TC variant with the routing extension targets it carries.
 pub struct PreparedTcProgram {
     pub(super) program: TcProgram,
     pub(super) fd: OwnedFd,
@@ -105,7 +105,6 @@ impl InterfaceBindings {
         self.programs.iter().any(|held| held.program == program)
     }
 
-    /// Variants `plan` binds that are not loaded yet.
     pub(super) fn missing(&self, plan: &InterfacePlan) -> Vec<TcProgram> {
         TcProgram::ALL
             .into_iter()
@@ -580,7 +579,7 @@ pub(super) fn commit_program_batch(
 }
 
 impl super::RealEbpfBackend {
-    /// Verify without sharing the backend, as used by startup and real-kernel fixtures.
+    /// Verify and commit in place; only for a backend not yet shared.
     pub(crate) fn load_tc_programs(&mut self, programs: &[TcProgram]) -> anyhow::Result<()> {
         let prepare = self.prepare_tc_programs(programs)?;
         self.commit_tc_programs(prepare())
