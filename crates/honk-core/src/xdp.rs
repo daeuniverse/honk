@@ -468,9 +468,6 @@ impl Runtime {
                     if let Some(error) = failure {
                         return Poll::Ready(Err(error.into()));
                     }
-                    if let Err(error) = port.refill() {
-                        return Poll::Ready(Err(error.into()));
-                    }
                 }
                 if let Err(error) = port.kick() {
                     return Poll::Ready(Err(error.into()));
