@@ -601,7 +601,7 @@ fn already_funded_followers_remain_admissible_at_the_memory_ceiling() {
     pool.finish_removal(&removals.try_recv().unwrap(), true);
 }
 
-#[cfg(feature = "native-api")]
+#[cfg(all(feature = "native-api", feature = "clash-api"))]
 #[tokio::test]
 async fn startup_publishes_running_before_servicing_native_selector_requests() {
     tokio::time::timeout(Duration::from_secs(10), async {
