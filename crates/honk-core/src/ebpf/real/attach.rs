@@ -297,7 +297,7 @@ impl RealEbpfBackend {
         // Wait on the ringbuf fd with AsyncFd (official aya-log 0.4 pattern).
         // A fixed-interval flush was waking every 100ms even when empty and
         // could burn a full core under high eBPF log volume via spawn_blocking.
-        let log_flush_handle = match aya_log::EbpfLogger::init(&mut bpf) {
+        let async_logger = match aya_log::EbpfLogger::init(&mut bpf) {
             Ok(logger) => {
                 debug!("eBPF logger initialized");
                 match unsafe {
@@ -306,21 +306,7 @@ impl RealEbpfBackend {
                         tokio::io::Interest::READABLE,
                     )
                 } {
-                    Ok(async_logger) => Some(tokio::spawn(async move {
-                        let mut async_logger = async_logger;
-                        loop {
-                            let mut guard = match async_logger.readable_mut().await {
-                                Ok(g) => g,
-                                Err(e) => {
-                                    debug!("eBPF logger AsyncFd wait failed: {}", e);
-                                    break;
-                                }
-                            };
-                            // Non-blocking drain; returns immediately when empty.
-                            guard.get_inner_mut().flush();
-                            guard.clear_ready();
-                        }
-                    })),
+                    Ok(async_logger) => Some(async_logger),
                     Err(e) => {
                         warn!(
                             "eBPF logger AsyncFd setup failed (logs will not be drained): {}",
@@ -338,8 +324,6 @@ impl RealEbpfBackend {
                 None
             }
         };
-        let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
-        let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
         let tcp_live_pins = tcp_binding::take_live_pins(&mut bpf)?;
         #[cfg(test)]
         let routing_test_targets = routing::prepare_test_target(&mut bpf)?;
@@ -349,6 +333,26 @@ impl RealEbpfBackend {
             #[cfg(feature = "native-api")]
             receive_trace_offsets.is_some(),
         )?;
+
+        // Spawned only after the last fallible step: an early return would detach them.
+        let log_flush_handle = async_logger.map(|mut async_logger| {
+            tokio::spawn(async move {
+                loop {
+                    let mut guard = match async_logger.readable_mut().await {
+                        Ok(g) => g,
+                        Err(e) => {
+                            debug!("eBPF logger AsyncFd wait failed: {}", e);
+                            break;
+                        }
+                    };
+                    // Non-blocking drain; returns immediately when empty.
+                    guard.get_inner_mut().flush();
+                    guard.clear_ready();
+                }
+            })
+        });
+        let (expiry_tx, expiry_rx) = tokio::sync::mpsc::channel(RETIRE_BATCH_CAPACITY);
+        let event_flush_handle = Some(tokio::spawn(consume_dae_events(event_fd, expiry_tx)));
 
         Ok(Self {
             maps: Some(maps),
