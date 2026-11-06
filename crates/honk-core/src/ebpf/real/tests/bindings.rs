@@ -298,17 +298,7 @@ fn held_program_ids(snapshot: &BindingSnapshot) -> BTreeMap<TcProgram, u32> {
         .iter()
         .map(|(program, fd)| {
             let mut info: bpf_prog_info = unsafe { std::mem::zeroed() };
-            let mut attr: bpf_attr = unsafe { std::mem::zeroed() };
-            attr.info.bpf_fd = fd.as_raw_fd() as u32;
-            attr.info.info_len = size_of::<bpf_prog_info>() as u32;
-            attr.info.info = (&mut info as *mut bpf_prog_info) as u64;
-            unsafe {
-                super::super::syscall::bpf_syscall(
-                    bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as std::ffi::c_long,
-                    &mut attr,
-                )
-            }
-            .unwrap();
+            super::raw_bpf::program_info(fd.as_raw_fd(), &mut info).unwrap();
             (*program, info.id)
         })
         .collect()
