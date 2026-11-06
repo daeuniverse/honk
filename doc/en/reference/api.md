@@ -762,6 +762,7 @@ Whoever can write the configuration or control subscription content decides thos
 | --- | --- |
 | Member associations per job | 64 |
 | Projected rows per job | 256 |
+| Concurrent measurements per job | 10 |
 | Active jobs | 4 |
 | Queued jobs | 16 |
 | Jobs per target | 1 |
