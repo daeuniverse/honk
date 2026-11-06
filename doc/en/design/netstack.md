@@ -129,6 +129,8 @@ Payload storage is a pool of chunks organized in two rings per TCP flow (send, r
 
 `control::packet_endpoint::PacketEndpoints` consumes an unstarted control plane and explicit scopes sharing one budget. Its supervisor joins scope, TCP, UDP and retirement work; cancelling a shutdown waiter does not cancel admitted cleanup. TCP uses the existing routing/dial/Score path with copy relay, not kernel adoption or splice. UDP reuses the one endpoint/source pool and captured packet reply sender, with no reply FD. Endpoint/source/foreign-reply/sniffer keys include scope; packet retirement cannot mutate coincident kernel state. DNS still follows traffic policy before controller admission, and must/Block remain final.
 
+Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
+
 Normal close initiates protocol abort at the shared admission boundary, before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
 
 `PacketScope::receive_with_source` invokes the source callback under the existing

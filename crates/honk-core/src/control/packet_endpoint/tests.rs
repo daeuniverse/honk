@@ -166,6 +166,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
     };
     let first_snapshot = handle
         .prepare_packet_routing_snapshot(
+            scope.scope(),
             first,
             destination,
             "tcp",
@@ -192,6 +193,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
     *handle.config.write().await = Arc::new(next);
     let second_snapshot = handle
         .prepare_packet_routing_snapshot(
+            scope.scope(),
             second,
             destination,
             "tcp",

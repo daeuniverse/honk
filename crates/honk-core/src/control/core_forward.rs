@@ -682,6 +682,7 @@ impl RoutedCore {
                     decision: RoutingDecision::from_router(
                         &router,
                         &input,
+                        None,
                         #[cfg(feature = "native-api")]
                         self.authority
                             .0

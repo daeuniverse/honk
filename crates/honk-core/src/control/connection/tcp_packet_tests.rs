@@ -264,6 +264,7 @@ async fn admitted_packet_tcp_keeps_route_and_mode_after_publication() -> anyhow:
         let handle = plane.spawn_handle();
         let mut snapshot = handle
             .prepare_packet_routing_snapshot(
+                flow.scope(),
                 flow.peer_addr(),
                 flow.local_addr(),
                 "tcp",
@@ -459,6 +460,9 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
                 });
             }
             let plane = plane(config)?;
+            plane
+                .dns_controller
+                .register_packet_scopes(std::slice::from_ref(&wire.scope))?;
             let handle = plane.spawn_handle();
             let worker = handle.clone();
             let serving = tokio::spawn(async move { worker.serve_packet_connection(flow).await });
@@ -518,6 +522,124 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
             wire.finish().await;
         }
         tokio::time::timeout(Duration::from_secs(5), dns_server).await???;
+        Ok(())
+    })
+    .await?
+}
+
+#[tokio::test]
+async fn packet_tcp_uses_dns_learned_domain_without_a_sniffed_name() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+        let blocked = TcpListener::bind("127.0.0.1:0").await?;
+        let direct = TcpListener::bind("127.0.0.1:0").await?;
+        let dns = UdpSocket::bind("127.0.0.1:0").await?;
+        let mut config = config();
+        config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "loopback".into(),
+            address: dns.local_addr()?.to_string(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+        config.dns.routing.fallback = "loopback".into();
+        config.routing.rules.push(RoutingRule {
+            name: "learned-block".into(),
+            condition: RoutingCondition {
+                domain: vec!["a.com".into()],
+                port: vec![blocked.local_addr()?.port().to_string()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("block".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        });
+        let (mut wire, flow) = Wire::connect("198.51.100.53:53".parse()?)?;
+        let plane = plane(config)?;
+        plane
+            .dns_controller
+            .register_packet_scopes(std::slice::from_ref(&wire.scope))?;
+        let handle = plane.spawn_handle();
+        let worker = handle.clone();
+        let serving = tokio::spawn(async move { worker.serve_packet_connection(flow).await });
+        let query = dns_query_payload();
+        let mut framed = (query.len() as u16).to_be_bytes().to_vec();
+        framed.extend_from_slice(&query);
+        wire.send(&framed);
+        let mut response = [0; 1024];
+        let (length, sender) = dns.recv_from(&mut response).await?;
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(&response[..length]),
+            Some(("a.com".into(), 1))
+        );
+        response[2] = 0x81;
+        response[3] = 0x80;
+        response[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let answer = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1];
+        response[length..length + answer.len()].copy_from_slice(&answer);
+        dns.send_to(&response[..length + answer.len()], sender)
+            .await?;
+        wire.until(|wire| {
+            wire.received.len() >= 2
+                && wire.received.len()
+                    == usize::from(u16::from_be_bytes([wire.received[0], wire.received[1]])) + 2
+        })
+        .await?;
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(&wire.received[2..]),
+            ["127.0.0.1".parse::<std::net::IpAddr>()?]
+        );
+        serving.abort();
+        assert!(serving.await.unwrap_err().is_cancelled());
+        wire.pump();
+
+        let destination = blocked.local_addr()?;
+        let accepting = tokio::spawn(async move { blocked.accept().await });
+        for blocked in [false, true] {
+            let destination = if blocked {
+                destination
+            } else {
+                direct.local_addr()?
+            };
+            wire.id = wire
+                .client
+                .tcp_connect(wire.now, destination)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            wire.received.clear();
+            wire.eof = false;
+            wire.pump();
+            let (_, flow) = wire.scope.poll_accept().expect("numeric TCP SYN admitted");
+            wire.pump();
+            let worker = handle.clone();
+            let serving = tokio::spawn(async move { worker.serve_packet_connection(flow).await });
+            if blocked {
+                wire.until(|_| serving.is_finished() || accepting.is_finished())
+                    .await?;
+                assert!(
+                    !accepting.is_finished(),
+                    "DNS-learned Block reached the fallback Direct TCP peer"
+                );
+                serving.await??;
+            } else {
+                let (mut server, _) = direct.accept().await?;
+                wire.send(b"numeric-direct-control");
+                let mut bytes = [0; 22];
+                server.read_exact(&mut bytes).await?;
+                assert_eq!(&bytes, b"numeric-direct-control");
+                server.write_all(b"numeric-reply").await?;
+                wire.until(|wire| wire.received.len() == 13).await?;
+                assert_eq!(wire.received, b"numeric-reply");
+                serving.abort();
+                assert!(serving.await.unwrap_err().is_cancelled());
+                wire.pump();
+            }
+        }
+        accepting.abort();
+        assert!(accepting.await.unwrap_err().is_cancelled());
+        assert!(plane.ebpf.read().await.projection_map_snapshot().is_empty());
+        wire.finish().await;
         Ok(())
     })
     .await?

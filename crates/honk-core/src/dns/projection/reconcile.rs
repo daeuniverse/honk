@@ -1,9 +1,10 @@
+use honk_datapath::ScopeId;
 use std::net::IpAddr;
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-use super::state::{Batch, DesiredState, IP_CAPACITY, PendingSet, RetryMetadata};
+use super::state::{Batch, DesiredState, IP_CAPACITY, PendingSet, ProjectionIp, RetryMetadata};
 
 const RETRY_MIN: Duration = Duration::from_millis(100);
 const RETRY_MAX: Duration = Duration::from_secs(5);
@@ -17,18 +18,21 @@ impl DesiredState {
         let candidates = self
             .dirty_ips
             .iter()
-            .filter(|ip| !self.desired.contains_key(ip))
-            .chain(
-                self.dirty_ips
-                    .iter()
-                    .filter(|ip| self.desired.contains_key(ip)),
-            )
+            .filter(|ip| {
+                !self
+                    .desired
+                    .contains_key(&ProjectionIp::new(ScopeId::HOST, **ip))
+            })
+            .chain(self.dirty_ips.iter().filter(|ip| {
+                self.desired
+                    .contains_key(&ProjectionIp::new(ScopeId::HOST, **ip))
+            }))
             .copied()
             .filter(|ip| self.next_attempt_at(*ip, now) == Some(now))
             .take(MAX_BATCH_ENTRIES)
             .collect::<Vec<_>>();
         for ip in candidates {
-            match self.desired.get(&ip) {
+            match self.desired.get(&ProjectionIp::new(ScopeId::HOST, ip)) {
                 Some(desired)
                     if self
                         .applied
@@ -69,7 +73,7 @@ impl DesiredState {
             self.retries.remove(&set.ip);
             if self
                 .desired
-                .get(&set.ip)
+                .get(&ProjectionIp::new(ScopeId::HOST, set.ip))
                 .is_some_and(|desired| desired.bitmap == set.bitmap.bitmap)
             {
                 self.dirty_ips.remove(&set.ip);
@@ -81,7 +85,10 @@ impl DesiredState {
         for &ip in removes {
             self.applied.remove(&ip);
             self.retries.remove(&ip);
-            if !self.desired.contains_key(&ip) {
+            if !self
+                .desired
+                .contains_key(&ProjectionIp::new(ScopeId::HOST, ip))
+            {
                 self.dirty_ips.remove(&ip);
             } else {
                 self.dirty_ips.insert(ip);
@@ -103,7 +110,9 @@ impl DesiredState {
     }
 
     fn next_attempt_at(&self, ip: std::net::IpAddr, now: Instant) -> Option<Instant> {
-        if self.desired.contains_key(&ip)
+        if self
+            .desired
+            .contains_key(&ProjectionIp::new(ScopeId::HOST, ip))
             && !self.applied.contains_key(&ip)
             && self.applied.len() >= IP_CAPACITY
         {

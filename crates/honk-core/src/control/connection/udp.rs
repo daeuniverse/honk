@@ -149,6 +149,7 @@ impl ControlPlaneHandle {
                 Some(snapshot) => snapshot,
                 None => {
                     self.prepare_packet_routing_snapshot(
+                        lease.scope(),
                         client_addr,
                         original_dst,
                         "udp",

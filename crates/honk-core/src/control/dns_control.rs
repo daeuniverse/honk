@@ -10,6 +10,7 @@ use crate::dns::forwarder::DnsForwarder;
 use crate::ebpf::EbpfBackend;
 #[cfg(test)]
 use crate::routing::Router;
+use honk_datapath::ScopeId;
 use std::future::Future;
 #[cfg(test)]
 use std::net::SocketAddr;
@@ -44,6 +45,7 @@ pub struct DnsController {
     dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
     udp_query_limit: Arc<Semaphore>,
+    packet_scopes: std::sync::OnceLock<Box<[ScopeId]>>,
 }
 
 pub(crate) struct DnsClientAnswer(Result<crate::dns::outcome::DnsOutcome, Vec<u8>>);
@@ -76,7 +78,7 @@ pub(crate) struct AdmittedDnsQuery {
     runtime: crate::dns::runtime::RuntimeLease,
     _query_permit: OwnedSemaphorePermit,
     _udp_permit: Option<OwnedSemaphorePermit>,
-    project_kernel: bool,
+    projection_scope: ScopeId,
 }
 
 pub(crate) struct DnsAdmissionError {
@@ -171,6 +173,7 @@ impl DnsController {
         Self {
             dns_service,
             routing_projection,
+            packet_scopes: std::sync::OnceLock::new(),
             udp_query_limit: Arc::new(Semaphore::new(udp_query_limit.min(MAX_UDP_CLIENT_QUERIES))),
         }
     }
@@ -227,6 +230,41 @@ impl DnsController {
         self.routing_projection.prepare_snapshot_publication()
     }
 
+    pub(in crate::control) fn register_packet_scopes(
+        &self,
+        scopes: &[super::netstack::PacketScope],
+    ) -> anyhow::Result<()> {
+        let scopes = scopes
+            .iter()
+            .map(super::netstack::PacketScope::scope)
+            .collect();
+        self.packet_scopes
+            .set(scopes)
+            .map_err(|_| anyhow::anyhow!("packet DNS scopes are already registered"))
+    }
+
+    pub(in crate::control) fn packet_domain_bitmap(
+        &self,
+        scope: ScopeId,
+        ip: std::net::IpAddr,
+        router: &crate::routing::Router,
+        generation: u64,
+    ) -> anyhow::Result<Option<honk_ebpf_common::DomainRouting>> {
+        if !self.owns_packet_scope(scope) {
+            return Ok(None);
+        }
+        self.routing_projection
+            .packet_bitmap(scope, ip, router, generation)
+    }
+
+    fn owns_packet_scope(&self, scope: ScopeId) -> bool {
+        scope != ScopeId::HOST
+            && self
+                .packet_scopes
+                .get()
+                .is_some_and(|scopes| scopes.contains(&scope))
+    }
+
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {
         self.dns_service.cache()
     }
@@ -266,16 +304,23 @@ impl DnsController {
             runtime,
             _query_permit: query_permit,
             _udp_permit: udp_permit,
-            project_kernel: true,
+            projection_scope: ScopeId::HOST,
         })
     }
 
     pub(in crate::control) fn try_admit_packet_query(
         &self,
         udp: bool,
+        scope: ScopeId,
     ) -> Result<AdmittedDnsQuery, DnsAdmissionError> {
+        if !self.owns_packet_scope(scope) {
+            return Err(DnsAdmissionError {
+                error: TryAcquireError::Closed,
+                udp_reply: None,
+            });
+        }
         self.try_admit_query(udp).map(|mut query| {
-            query.project_kernel = false;
+            query.projection_scope = scope;
             query
         })
     }
@@ -333,10 +378,10 @@ impl DnsController {
                     break 'failed build_dns_servfail(data);
                 }
             };
-            if !admission.project_kernel {
-                return DnsClientAnswer(Ok(outcome));
-            }
-            match self.project_answer(&admission.runtime, outcome).await {
+            match self
+                .project_answer(&admission.runtime, admission.projection_scope, outcome)
+                .await
+            {
                 Ok(answer) => return answer,
                 Err(error) => {
                     crate::observe::flows::dns::decision("cancelled", Some("runtime_retired"));
@@ -360,16 +405,17 @@ impl DnsController {
     async fn project_answer(
         &self,
         lease: &crate::dns::runtime::RuntimeLease,
+        scope: ScopeId,
         outcome: crate::dns::outcome::DnsOutcome,
     ) -> Result<DnsClientAnswer, crate::dns::runtime::RuntimeCancelled> {
         let observed_at = tokio::time::Instant::now();
-        if !self.try_submit_projection(lease.runtime(), &outcome, observed_at) {
+        if !self.try_submit_projection(lease.runtime(), scope, &outcome, observed_at) {
             return Box::pin(async move {
                 tokio::select! {
                     biased;
                     error = lease.cancelled() => return Err(error),
                     () = self.routing_projection.submit_after_publication(|| {
-                        self.try_submit_projection(lease.runtime(), &outcome, observed_at)
+                        self.try_submit_projection(lease.runtime(), scope, &outcome, observed_at)
                     }) => {}
                 }
                 Ok(DnsClientAnswer(Ok(outcome)))
@@ -399,6 +445,7 @@ impl DnsController {
     fn try_submit_projection(
         &self,
         runtime: &crate::dns::runtime::DnsRuntime,
+        scope: ScopeId,
         outcome: &crate::dns::outcome::DnsOutcome,
         observed_at: tokio::time::Instant,
     ) -> bool {
@@ -430,6 +477,7 @@ impl DnsController {
                     let expires_at = observed_at + advertised_ttl;
                     if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
                         return projection.try_submit_cache_hit(
+                            scope,
                             snapshot,
                             domain,
                             family,
@@ -460,6 +508,6 @@ impl DnsController {
                 | (OutcomeStatus::Rejected, _, _) => ProjectionObservation::Retain,
             }
         };
-        projection.try_submit(snapshot, observation)
+        projection.try_submit(scope, snapshot, observation)
     }
 }

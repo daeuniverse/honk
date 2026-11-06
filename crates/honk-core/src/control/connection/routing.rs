@@ -45,14 +45,18 @@ impl RoutingDecision {
     pub(in crate::control) fn from_router(
         router: &crate::routing::Router,
         input: &ConnectionInfo,
+        domain_bitmap: Option<&honk_ebpf_common::DomainRouting>,
         #[cfg(feature = "native-api")] native: Option<(&crate::observe::Observation, u64)>,
     ) -> Self {
         #[cfg(feature = "native-api")]
         let mut native_route = None;
         #[cfg(feature = "native-api")]
         let matched = if let Some((native, generation)) = native {
-            let observed =
-                router.route_full_observed(input, None, crate::observe::flows::MAX_RULE_VALUES);
+            let observed = router.route_full_observed(
+                input,
+                domain_bitmap,
+                crate::observe::flows::MAX_RULE_VALUES,
+            );
             let rules = crate::observe::rules::observed_rule_evaluations(
                 &native.instance_id,
                 generation,
@@ -70,10 +74,10 @@ impl RoutingDecision {
             ));
             observed.matched
         } else {
-            router.route_full(input)
+            router.route_full_with_domain_bitmap(input, domain_bitmap)
         };
         #[cfg(not(feature = "native-api"))]
-        let matched = router.route_full(input);
+        let matched = router.route_full_with_domain_bitmap(input, domain_bitmap);
         let action = matched.as_ref().map_or(router.fallback(), |hit| hit.action);
         Self {
             outbound: action.outbound.clone(),
@@ -270,6 +274,7 @@ impl ControlPlaneHandle {
 
     pub(in crate::control) async fn prepare_packet_routing_snapshot(
         &self,
+        scope: honk_datapath::ScopeId,
         client: SocketAddr,
         destination: SocketAddr,
         protocol: &'static str,
@@ -279,16 +284,31 @@ impl ControlPlaneHandle {
         let config = Arc::clone(&*self.config.read().await);
         let mut input = build_connection_info(None, destination, client, protocol, None);
         input.dscp = Some(dscp);
-        let decision = self
-            .prepare_routing(
-                DialMode::Ip,
+        let decision = {
+            let router = self.router.read().await;
+            let current = self.config.read().await;
+            anyhow::ensure!(
+                Arc::ptr_eq(&config, &current),
+                "packet routing generation changed"
+            );
+            let generation = self.diagnostics.read().generation;
+            let bitmap = self.dns_controller.packet_domain_bitmap(
+                scope,
+                destination.ip(),
+                &router,
+                generation,
+            )?;
+            RoutingDecision::from_router(
+                &router,
                 &input,
-                false,
-                None,
+                bitmap.as_ref(),
                 #[cfg(feature = "native-api")]
-                record_route,
+                self.native
+                    .as_deref()
+                    .filter(|_| record_route)
+                    .map(|native| (native, generation)),
             )
-            .await;
+        };
         let current = self.config.read().await;
         anyhow::ensure!(
             Arc::ptr_eq(&config, &current),
@@ -429,6 +449,7 @@ impl ControlPlaneHandle {
             let decision = RoutingDecision::from_router(
                 &router,
                 &routing_conn_info,
+                None,
                 #[cfg(feature = "native-api")]
                 native.map(|native| (native, self.diagnostics.read().generation)),
             );

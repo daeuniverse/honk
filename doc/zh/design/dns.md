@@ -294,15 +294,17 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 同一名称的 A 与 AAAA owner 相互独立，各自使用自己的 TTL。因此，已学到 IPv4 地址的名称收到空的 AAAA 或 HTTPS 应答时，IPv4 事实仍然保留。
 
-每个 policy generation 内的域名关联仍为全局且与来源无关。带来源的请求路由隔离 DNS 交换 scope 与应答；它不划分 eBPF domain observation 或普通流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
+每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
-投影最多保留 10,000 个 owner（同一名称的 A 与 AAAA owner 分别计数），并向容量为 65,536 的 domain map 准入最多 49,152 个唯一 IP key。选入 desired/reload 集合的零 bitmap 另有 32,768 个 key 的上限，为后续命中规则的 DNS 事实留出空间；等待成功删除的过时零值 key 可暂时突破该子上限，但仍受 applied 总上限约束。剩余 16,384 个 map 槽位不供 DNS 投影使用，留给 sniff 写入。IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰地址最大的 IP。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 IP。容量压力会产生警告。
+新建数值目标的 packet TCP/UDP 路由通过 canonical Router 消费同一 scope 尚未过期的 bitmap，不虚构 hostname，并保留规则顺序、mode 与终态 `must`/`block` 语义。已接纳的 transport 保留原有路由所有权；配置允许的真实嗅探名称重路由仍使用既有语义。软件查询要求已提交的 routing generation 与 policy fingerprint 同时匹配，不匹配时失败，而不是当作缺失域名事实回退。
+
+共享投影最多保留 10,000 个 `(scope, name, family)` owner 和 49,152 个 `(scope, canonical IP)` desired key，零 bitmap 另有 32,768 个 key 的上限。这些限制由全部 scope 共享，不按 scope 倍增。只有 HOST key 进入容量为 65,536 的 domain map，仍为 sniff 写入保留不供 DNS 投影使用的 16,384 个槽位；等待成功删除的过时零值 key 可暂时突破零值子上限，但仍受 applied 总上限约束。同一 scope 内 IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰最大的 IP/scope key。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 key。容量压力会产生警告。全局回收 HOST owner 时仍经正常 worker 删除与 publication fence。
 
 同一 generation 内，每个 owner 缓存其谓词 bitmap，每个 IP 按名称/地址族成员记录各 bitmap 的贡献次数。变更单个 owner 时只合并不同的 bitmap，不再重新匹配共享该 IP 的所有名称。Reload 投影在候选快照下对每个保留名称只计算一次；发布时重建缓存贡献，不改变准入策略。
 
 延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
 
-由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
+由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 scope、policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
 
 每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
 
@@ -310,7 +312,7 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 worker 以最多 256 个 set/remove 为一批，协调带 generation 的 desired state，并自行调度剩余已就绪工作，不必等待下一次 DNS observation。过时 key 优先于新增项进入批次；已写入的投影达到 IP 上限后，新增 DNS key 必须等待删除确认，删除失败期间也不释放额度。失败写入保持 dirty，并以有界退避重试。批次修改 backend 前，worker 获取 backend lock，并在持有 publication fence 时重新检查 generation。reload 在同一个 backend lock 下安装替换投影快照。因此，旧批次在替换 generation 发布后既不能进入，也不能继续修改 map。
 
-同代 DNS observation 与 worker 批次共享 publication fence；desired-state mutex 仍串行化 observation 与写入确认。只有携带更新快照的 observation 才独占 fence。查询与 reload 争用时，在应答前异步等待，并受其已捕获 runtime 的取消约束。取消与发布释放同时就绪时优先取消，因此该等待者不发布 observation，而是经现有应答路径返回终态 SERVFAIL。只有争用等待被装箱，未争用应答的 future 大小不变。这不把缓存 flush 的取消范围扩展到解析之后，也不改变独立监听器的 reload 准入。
+同代 HOST observation 与 worker 批次共享 publication fence；desired-state mutex 仍串行化 observation 与写入确认。只有携带更新快照的 HOST observation 才独占 fence。Packet observation 在同一 state mutex 下使用已提交的快照，不获取 HOST fence；未来代 observation 等待提交而不能推进快照，旧代 observation 不能引入事实。查询等待匹配的发布时，在应答前异步等待，并受其已捕获 runtime 的取消约束。取消与发布释放同时就绪时优先取消，因此该等待者不发布 observation，而是经现有应答路径返回终态 SERVFAIL。只有争用等待被装箱，未争用应答的 future 大小不变。这不把缓存 flush 的取消范围扩展到解析之后，也不改变独立监听器的 reload 准入。
 
 重试唤醒与批次准入共用同一个带容量判断的逐 IP deadline；投影已满时，过期但无法准入的新增项不会在删除退避期间空转。成功 reload 会先把实际写入新 map 的完整 IP 集合记为 applied，再协调当前 owner，包括加载期间已到期的 owner。worker 的 map 写入与确认保持在同一个 generation fence 内，旧完成事件不能覆盖新发布的记账。保留物理 map 的 reload 也保留原有 applied 状态。
 

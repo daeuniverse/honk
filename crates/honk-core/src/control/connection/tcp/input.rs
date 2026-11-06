@@ -50,8 +50,9 @@ impl TcpFlow {
                     .await
             }
             Self::Packet(flow) => {
+                let scope = flow.stream.scope();
                 controller
-                    .handle_packet_tcp_dns(&mut flow.stream, client, destination)
+                    .handle_packet_tcp_dns(&mut flow.stream, client, destination, scope)
                     .await
             }
         }

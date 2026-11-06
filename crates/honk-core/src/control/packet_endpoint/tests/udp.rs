@@ -487,6 +487,193 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
     .expect("UDP53 policy must precede controller and raw transport admission");
 }
 
+#[tokio::test]
+async fn packet_dns_learned_domain_blocks_new_numeric_udp_only_in_its_scope() {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config(&[]);
+        config.dns.upstream = vec![honk_config::dns::DnsUpstream {
+            name: "loopback".into(),
+            address: dns.local_addr().unwrap().to_string(),
+            protocol: honk_config::types::DnsProtocol::Udp,
+            tls_server_name: None,
+            outbound: None,
+        }];
+        config.dns.routing.fallback = "loopback".into();
+        config.routing.rules = vec![
+            RoutingRule {
+                name: "ordered-direct".into(),
+                condition: RoutingCondition {
+                    dscp: vec!["46".into()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("direct".into()),
+                priority: 0,
+                must: true,
+                mark: 0,
+            },
+            RoutingRule {
+                name: "learned-block".into(),
+                condition: RoutingCondition {
+                    domain: vec!["a.com".into()],
+                    port: vec![destination.port().to_string()],
+                    ..Default::default()
+                },
+                outbound: RoutingOutbound::Simple("block".into()),
+                priority: 1,
+                must: false,
+                mark: 0,
+            },
+        ];
+        let (plane, _health) = plane(config).await;
+        let backend = Arc::clone(&plane.ebpf);
+        let budget = MemoryBudget::new(64 << 20);
+        let first = scope(&budget);
+        let second = scope(&budget);
+        let learned = first.0.clone();
+        let unrelated = second.0.clone();
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![first, second], 8)
+            .await
+            .unwrap();
+        let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        endpoints
+            .receive(
+                learned.scope(),
+                &packet(source, destination, 0, b"before-dns"),
+                Instant::now(),
+            )
+            .unwrap();
+        let mut received = [0; 1024];
+        let (length, sender) = upstream.recv_from(&mut received).await.unwrap();
+        assert_eq!(&received[..length], b"before-dns");
+        upstream.send_to(&received[..length], sender).await.unwrap();
+        reply(&learned, source, destination, b"before-dns").await;
+
+        let dns_destination = "198.51.100.53:53".parse().unwrap();
+        let query = dns_query_payload();
+        endpoints
+            .receive(
+                learned.scope(),
+                &packet(source, dns_destination, 0, &query),
+                Instant::now(),
+            )
+            .unwrap();
+        let (length, sender) = dns.recv_from(&mut received).await.unwrap();
+        assert_eq!(
+            crate::dns::forwarder::parse_dns_question(&received[..length]),
+            Some(("a.com".to_owned(), 1)),
+        );
+        received[2] = 0x81;
+        received[3] = 0x80;
+        received[6..8].copy_from_slice(&1u16.to_be_bytes());
+        let answer = [0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1];
+        received[length..length + answer.len()].copy_from_slice(&answer);
+        dns.send_to(&received[..length + answer.len()], sender)
+            .await
+            .unwrap();
+        let response = reply_payload(&learned, source, dns_destination).await;
+        assert_eq!(&response[..2], &query[..2]);
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(&response),
+            vec![destination.ip()],
+        );
+
+        let fresh = SocketAddr::new(source.ip(), source.port() + 1);
+        let ordered = SocketAddr::new(source.ip(), source.port() + 2);
+        for (scope, client, dscp, payload) in [
+            (&learned, fresh, 0, b"must-block".as_slice()),
+            (&learned, source, 0, b"retained-owner".as_slice()),
+            (&unrelated, fresh, 0, b"other-scope".as_slice()),
+            (&learned, ordered, 46, b"ordered-direct".as_slice()),
+        ] {
+            endpoints
+                .receive(
+                    scope.scope(),
+                    &packet(client, destination, dscp, payload),
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        let mut delivered = Vec::new();
+        for _ in 0..3 {
+            let (length, sender) = upstream.recv_from(&mut received).await.unwrap();
+            assert_ne!(
+                &received[..length],
+                b"must-block",
+                "a learned DNS domain must select Block instead of fallback Direct",
+            );
+            delivered.push((received[..length].to_vec(), sender));
+        }
+        delivered.sort_by(|left, right| left.0.cmp(&right.0));
+        for ((payload, sender), (scope, client, expected)) in delivered.iter().zip([
+            (&learned, ordered, b"ordered-direct".as_slice()),
+            (&unrelated, fresh, b"other-scope".as_slice()),
+            (&learned, source, b"retained-owner".as_slice()),
+        ]) {
+            assert_eq!(payload, expected);
+            upstream.send_to(payload, sender).await.unwrap();
+            reply(scope, client, destination, expected).await;
+        }
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                upstream.recv_from(&mut received)
+            )
+            .await
+            .is_err(),
+            "the blocked numeric datagram must not arrive after the positive controls",
+        );
+        endpoints
+            .receive(
+                unrelated.scope(),
+                &packet(source, dns_destination, 0, &query),
+                Instant::now(),
+            )
+            .unwrap();
+        let cached = reply_payload(&unrelated, source, dns_destination).await;
+        assert_eq!(
+            crate::dns::forwarder::extract_answer_ips(&cached),
+            vec![destination.ip()]
+        );
+        assert!(
+            dns.try_recv_from(&mut received).is_err(),
+            "the second scope learns from a real cache hit"
+        );
+        let cached_fresh = SocketAddr::new(source.ip(), source.port() + 3);
+        for (client, payload) in [
+            (cached_fresh, b"cached-must-block".as_slice()),
+            (fresh, b"retained-after-cache".as_slice()),
+        ] {
+            endpoints
+                .receive(
+                    unrelated.scope(),
+                    &packet(client, destination, 0, payload),
+                    Instant::now(),
+                )
+                .unwrap();
+        }
+        let (length, sender) = upstream.recv_from(&mut received).await.unwrap();
+        assert_eq!(&received[..length], b"retained-after-cache");
+        upstream.send_to(&received[..length], sender).await.unwrap();
+        reply(&unrelated, fresh, destination, b"retained-after-cache").await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                upstream.recv_from(&mut received)
+            )
+            .await
+            .is_err()
+        );
+        assert!(backend.read().await.projection_map_snapshot().is_empty());
+        endpoints.shutdown().await.unwrap();
+        owner.run().await.unwrap();
+    })
+    .await
+    .expect("learned domain routing must preserve live Direct controls");
+}
+
 fn fragments(source: SocketAddr, destination: SocketAddr, payload: &[u8]) -> Vec<Vec<u8>> {
     let now = Instant::now();
     let mut config = StackConfig::new([91; 32]);
@@ -643,6 +830,7 @@ async fn admitted_udp_keeps_route_and_mode_after_publication() {
         let destination = upstream.local_addr().unwrap();
         let mut snapshot = handle
             .prepare_packet_routing_snapshot(
+                scope.scope(),
                 source,
                 destination,
                 "udp",

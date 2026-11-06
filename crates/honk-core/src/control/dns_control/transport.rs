@@ -106,8 +106,13 @@ impl DnsController {
             return Ok(false);
         }
         stream.set_nodelay(true)?;
-        self.serve_tcp_frames(stream, client_addr, Some(original_dst), true)
-            .await
+        self.serve_tcp_frames(
+            stream,
+            client_addr,
+            Some(original_dst),
+            honk_datapath::ScopeId::HOST,
+        )
+        .await
     }
 
     pub(in crate::control) async fn handle_packet_tcp_dns(
@@ -115,8 +120,13 @@ impl DnsController {
         stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
         client_addr: SocketAddr,
         original_dst: SocketAddr,
+        scope: honk_datapath::ScopeId,
     ) -> anyhow::Result<bool> {
-        self.serve_tcp_frames(stream, client_addr, Some(original_dst), false)
+        anyhow::ensure!(
+            self.owns_packet_scope(scope),
+            "packet DNS scope is not owned"
+        );
+        self.serve_tcp_frames(stream, client_addr, Some(original_dst), scope)
             .await
     }
 
@@ -128,7 +138,7 @@ impl DnsController {
     ) -> anyhow::Result<()> {
         stream.set_nodelay(true)?;
         let _ = self
-            .serve_tcp_frames(stream, client_addr, None, true)
+            .serve_tcp_frames(stream, client_addr, None, honk_datapath::ScopeId::HOST)
             .await?;
         Ok(())
     }
@@ -141,7 +151,7 @@ impl DnsController {
         stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
         client_addr: SocketAddr,
         original_dst: Option<SocketAddr>,
-        project_kernel: bool,
+        scope: honk_datapath::ScopeId,
     ) -> anyhow::Result<bool> {
         let metadata = DnsRequestMeta::new(Some(client_addr.ip()), original_dst);
         let mut query = Vec::new();
@@ -150,14 +160,14 @@ impl DnsController {
         }
 
         debug!(%client_addr, "DNS controller (TCP): forwarding query");
-        self.process_tcp_query(stream, &query, client_addr, metadata, project_kernel)
+        self.process_tcp_query(stream, &query, client_addr, metadata, scope)
             .await?;
 
         loop {
             if !read_tcp_dns_query(stream, &mut query, Some(TCP_DNS_IO_TIMEOUT)).await {
                 return Ok(true);
             }
-            self.process_tcp_query(stream, &query, client_addr, metadata, project_kernel)
+            self.process_tcp_query(stream, &query, client_addr, metadata, scope)
                 .await?;
         }
     }
@@ -168,10 +178,9 @@ impl DnsController {
         query: &[u8],
         client_addr: SocketAddr,
         metadata: DnsRequestMeta,
-        project_kernel: bool,
+        scope: honk_datapath::ScopeId,
     ) -> anyhow::Result<()> {
-        let operation =
-            self.process_tcp_query_inner(stream, query, client_addr, metadata, project_kernel);
+        let operation = self.process_tcp_query_inner(stream, query, client_addr, metadata, scope);
         crate::observe::scope_pin!(operation);
         let operation = crate::observe::flows::dns::client_scope(
             query,
@@ -188,17 +197,17 @@ impl DnsController {
         query: &[u8],
         client_addr: SocketAddr,
         metadata: DnsRequestMeta,
-        project_kernel: bool,
+        scope: honk_datapath::ScopeId,
     ) -> anyhow::Result<()> {
         #[cfg(feature = "native-api")]
         let started = std::time::Instant::now();
         #[cfg(not(feature = "native-api"))]
         let _ = client_addr;
         // Each persistent frame gets the current generation independently.
-        let admission = match if project_kernel {
+        let admission = match if scope == honk_datapath::ScopeId::HOST {
             self.try_admit_query(false)
         } else {
-            self.try_admit_packet_query(false)
+            self.try_admit_packet_query(false, scope)
         } {
             Ok(admission) => admission,
             Err(_) => {

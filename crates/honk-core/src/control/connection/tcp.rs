@@ -161,6 +161,10 @@ impl ControlPlaneHandle {
             TcpInput::Packet(stream) => Some(stream.dscp()),
             TcpInput::Kernel(_) => None,
         };
+        let packet_scope = match &input {
+            TcpInput::Packet(stream) => Some(stream.scope()),
+            TcpInput::Kernel(_) => None,
+        };
         let mut observation = ConnectionObservation::begin(
             self.native.as_deref(),
             crate::observe::vocab::Network::Tcp,
@@ -214,6 +218,7 @@ impl ControlPlaneHandle {
                         Some(snapshot) => snapshot,
                         None => {
                             self.prepare_packet_routing_snapshot(
+                                packet_scope.expect("packet stream carries its scope"),
                                 client_addr,
                                 original_dst,
                                 "tcp",

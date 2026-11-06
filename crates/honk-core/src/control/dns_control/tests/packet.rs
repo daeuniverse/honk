@@ -1,6 +1,36 @@
 use super::*;
 
 #[tokio::test]
+async fn packet_dns_admission_requires_a_registered_nonhost_scope() {
+    let controller = snapshot_controller(snapshot_forwarder(Arc::new(SnapshotUpstream {
+        ip: [192, 0, 2, 1],
+        calls: AtomicUsize::new(0),
+        entered: None,
+        release: None,
+    })));
+    let foreign = honk_datapath::ScopeId::allocate().unwrap();
+    assert!(controller.try_admit_packet_query(true, foreign).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(false, honk_datapath::ScopeId::HOST)
+            .is_err()
+    );
+    let (scope, _owner) = packet_scope(&controller);
+    assert!(controller.try_admit_packet_query(false, foreign).is_err());
+    let admitted = controller
+        .try_admit_packet_query(true, scope.scope())
+        .unwrap();
+    assert!(controller.try_admit_query(true).is_err());
+    drop(admitted);
+    assert!(controller.try_admit_query(true).is_ok());
+    assert!(
+        controller
+            .register_packet_scopes(std::slice::from_ref(&scope))
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn packet_dns_answers_do_not_enter_the_kernel_projection() {
     struct Answers;
     #[async_trait::async_trait]
@@ -34,8 +64,11 @@ async fn packet_dns_answers_do_not_enter_the_kernel_projection() {
         .with_cache_enabled(false),
     );
     let (controller, backend) = projection_controller(forwarder);
+    let (scope, _scope_owner) = packet_scope(&controller);
     let packet_query = query_with_txid("packet.example.com", 1);
-    let admission = controller.try_admit_packet_query(true).unwrap();
+    let admission = controller
+        .try_admit_packet_query(true, scope.scope())
+        .unwrap();
     let publication = controller.prepare_projection_publication();
     let answer = tokio::time::timeout(
         Duration::from_secs(1),

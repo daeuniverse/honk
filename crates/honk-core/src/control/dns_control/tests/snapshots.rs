@@ -74,11 +74,16 @@ async fn admitted_query_keeps_shared_udp_quota_after_publication() {
         entered: Some(entered.clone()),
         release: Some(release.clone()),
     })));
+    let (scope, _scope_owner) = packet_scope(&controller);
     let old_admission = controller
-        .try_admit_packet_query(true)
+        .try_admit_packet_query(true, scope.scope())
         .expect("old-generation packet UDP admission");
     assert!(controller.try_admit_query(true).is_err());
-    assert!(controller.try_admit_packet_query(true).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(true, scope.scope())
+            .is_err()
+    );
     let query = crate::dns::forwarder::build_dns_query("example.com", 1);
     let running = {
         let controller = controller.clone();
@@ -108,7 +113,11 @@ async fn admitted_query_keeps_shared_udp_quota_after_publication() {
     )
     .await;
     assert!(controller.try_admit_query(true).is_err());
-    assert!(controller.try_admit_packet_query(true).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(true, scope.scope())
+            .is_err()
+    );
     let new_admission = controller
         .try_admit_query(false)
         .expect("TCP remains admissible while the shared UDP quota is occupied");
@@ -152,17 +161,28 @@ async fn forced_retirement_does_not_reissue_held_udp_permits() {
         }))
     };
     let controller = snapshot_controller(forwarder());
-    let held = controller.try_admit_packet_query(true).unwrap();
+    let (scope, _scope_owner) = packet_scope(&controller);
+    let held = controller
+        .try_admit_packet_query(true, scope.scope())
+        .unwrap();
     for _ in 0..=crate::dns::runtime::MAX_RETIRED_RUNTIMES {
         publish_snapshot_forwarder(&controller, forwarder()).await;
         assert!(controller.try_admit_query(true).is_err());
-        assert!(controller.try_admit_packet_query(true).is_err());
+        assert!(
+            controller
+                .try_admit_packet_query(true, scope.scope())
+                .is_err()
+        );
     }
     tokio::time::timeout(Duration::from_secs(1), held.runtime.runtime().wait_closed())
         .await
         .expect("cap-evicted generation closes even while its caller retains admission");
     assert!(controller.try_admit_query(true).is_err());
-    assert!(controller.try_admit_packet_query(true).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(true, scope.scope())
+            .is_err()
+    );
     let _tcp = controller
         .try_admit_query(false)
         .expect("TCP remains admissible");
@@ -354,6 +374,7 @@ async fn projection_rollback_preserves_cached_deadline() {
             )
             .await;
             controller.routing_projection.submit(
+                honk_datapath::ScopeId::HOST,
                 Arc::clone(&snapshot),
                 crate::dns::projection::ProjectionObservation::Retain,
             );

@@ -80,6 +80,36 @@ fn controller_for_upstream_and_config(
     )
 }
 
+pub(super) fn packet_scope(
+    controller: &DnsController,
+) -> (
+    crate::control::netstack::PacketScope,
+    crate::control::netstack::PacketOwner,
+) {
+    let mut config = honk_netstack::Config::new([59; 32]);
+    config.mode = honk_netstack::Mode::Transparent {
+        exclude: honk_netstack::ExcludeSet::default(),
+    };
+    config.max_flows = 1;
+    config.memory_limit = 2 << 20;
+    let pair = crate::control::netstack::PacketScope::new(
+        config,
+        honk_netstack::MemoryBudget::new(16 << 20),
+        crate::control::netstack::RuntimeLimits {
+            max_slots: 1,
+            control_frames: 1,
+            bulk_frames: 1,
+            max_waiters: 1,
+        },
+        std::time::Instant::now(),
+    )
+    .unwrap();
+    controller
+        .register_packet_scopes(std::slice::from_ref(&pair.0))
+        .unwrap();
+    pair
+}
+
 pub(super) fn projection_controller(
     forwarder: Arc<DnsForwarder>,
 ) -> (DnsController, Arc<RwLock<Box<dyn EbpfBackend>>>) {

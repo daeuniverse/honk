@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Disposable-guest actual-ingress, producer identity and shutdown wire probes."""
 import ctypes as C
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ if os.geteuid() != 0 or 'virtme.' not in cmdline or not parent or current == par
 
 marker = b'HONK-IPV4-NATIVE-BOUNDARY'
 path = str(Path(__file__).resolve())
+domain_probe_name = b'\x0bpacket-path\x04test\0'
 
 
 def command(namespace, *args):
@@ -235,6 +237,123 @@ def guard_probe(expected, client_device, server_device):
                 stop(receiver)
 
 
+def dns_name_end(message, offset):
+    while True:
+        length = message[offset]
+        offset += 1
+        if not length:
+            return offset
+        if length & 0xc0 == 0xc0:
+            assert offset < len(message)
+            return offset + 1
+        assert length < 64 and offset + length <= len(message)
+        offset += length
+
+
+def domain_peer():
+    with contextlib.ExitStack() as owned:
+        dns = owned.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
+        dns.bind(('10.77.0.2', 15353))
+        data_sockets = {}
+        for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd00:2::2')):
+            for port in (18082, 18083):
+                sock = owned.enter_context(socket.socket(family, socket.SOCK_DGRAM))
+                sock.bind((address, port))
+                data_sockets[sock] = family
+        received, queries = [], 0
+        deadline = time.monotonic() + 30
+        print('READY', flush=True)
+        while time.monotonic() < deadline:
+            readable, _, _ = select.select([dns, *data_sockets, sys.stdin], [], [], 1)
+            for sock in readable:
+                if sock is sys.stdin:
+                    assert sys.stdin.readline().strip() == 'done'
+                    print(json.dumps({'received': received, 'queries': queries}), flush=True)
+                    return
+                data, peer = sock.recvfrom(4096)
+                if sock is dns:
+                    end = dns_name_end(data, 12)
+                    qtype, qclass = struct.unpack_from('!HH', data, end)
+                    accepted = data[12:end].lower() == domain_probe_name and qclass == 1 and qtype in (1, 28)
+                    answer = b''
+                    if accepted:
+                        queries += 1
+                        address = socket.inet_pton(socket.AF_INET if qtype == 1 else socket.AF_INET6, '198.51.100.2' if qtype == 1 else 'fd00:2::2')
+                        answer = b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, 60, len(address)) + address
+                    response = data[:2] + struct.pack('!HHHHH', 0x8180 if accepted else 0x8183, 1, int(accepted), 0, 0) + data[12:end + 4] + answer
+                    sock.sendto(response, peer)
+                else:
+                    expected = '10.77.0.1' if data_sockets[sock] == socket.AF_INET else 'fd00:77::1'
+                    assert peer[0] == expected, ('packet Endpoint reply source', peer, expected)
+                    received.append(data.decode('ascii'))
+                    assert len(received) <= 16, received
+                    sock.sendto(data, peer)
+        raise TimeoutError('domain peer did not receive its completion barrier')
+
+
+def domain_client():
+    for family, address, qtype, label in ((socket.AF_INET, '198.51.100.2', 1, '4'), (socket.AF_INET6, 'fd00:2::2', 28, '6')):
+        with socket.socket(family, socket.SOCK_DGRAM) as original, socket.socket(family, socket.SOCK_DGRAM) as fresh:
+            original.settimeout(5)
+            original.connect((address, 18082))
+            before = ('before-' + label).encode()
+            original.send(before)
+            assert original.recv(4096) == before
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as query:
+                query.settimeout(5)
+                query.connect(('198.51.100.99', 53))
+                identifier = 0xd000 + qtype
+                question = domain_probe_name + struct.pack('!HH', qtype, 1)
+                query.send(struct.pack('!HHHHHH', identifier, 0x100, 1, 0, 0, 0) + question)
+                response = query.recv(4096)
+                ident, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', response)
+                assert ident == identifier and flags & 0xf == 0 and questions == answers == 1
+                start = dns_name_end(response, dns_name_end(response, 12) + 4)
+                rtype, rclass, _, size = struct.unpack_from('!HHIH', response, start)
+                assert (rtype, rclass) == (qtype, 1)
+                assert response[start + 10:start + 10 + size] == socket.inet_pton(family, address)
+            fresh.settimeout(1)
+            fresh.connect((address, 18082))
+            assert fresh.getsockname()[1] != original.getsockname()[1]
+            fresh.send(('blocked-' + label).encode())
+            try:
+                leaked = fresh.recv(4096)
+            except socket.timeout:
+                pass
+            else:
+                raise AssertionError(('learned domain bypassed Block', leaked))
+            with socket.socket(family, socket.SOCK_DGRAM) as must:
+                must.settimeout(5)
+                must.connect((address, 18083))
+                payload = ('must-' + label).encode()
+                must.send(payload)
+                assert must.recv(4096) == payload
+        print(json.dumps({'packet_domain_family': label, 'before': 'direct', 'after': 'blocked', 'earlier_must': 'direct'}), flush=True)
+
+
+def domain_check():
+    peer = None
+    try:
+        before = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
+        peer = subprocess.Popen(command('server', 'domain-peer'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert ready_line(peer) == 'READY'
+        client = subprocess.run(command('client', 'domain-client'), capture_output=True, text=True, timeout=20)
+        peer.stdin.write('done\n')
+        peer.stdin.flush()
+        observed = json.loads(ready_line(peer))
+        peer.wait(timeout=5)
+        assert peer.returncode == 0, peer.stderr.read()
+        print(client.stdout, end='', flush=True)
+        assert client.returncode == 0, (client.stdout, client.stderr, observed)
+        assert sorted(observed['received']) == ['before-4', 'before-6', 'must-4', 'must-6'], observed
+        assert observed['queries'] == 2, observed
+        after = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
+        assert sum(after) - sum(before) >= 8, ('domain probe lacked actual capture', before, after)
+        print(json.dumps({'packet_dns_domain_routing': 'PASS', 'peer': observed, 'capture_delta': sum(after) - sum(before)}), flush=True)
+    finally:
+        stop(peer)
+
+
 mode = sys.argv[1] if len(sys.argv) > 1 else 'check'
 if mode == 'hold':
     ipv6 = sys.argv[3] == '6'
@@ -359,6 +478,12 @@ elif mode == 'settled':
             break
         assert time.monotonic() < deadline, ('test producers still own unfinished TCP wire work', states)
         time.sleep(0.02)
+elif mode == 'domain-peer':
+    domain_peer()
+elif mode == 'domain-client':
+    domain_client()
+elif mode == 'domain':
+    domain_check()
 elif mode == 'guard':
     guard_probe(*sys.argv[2:])
 elif mode in ('check', 'native-baseline'):

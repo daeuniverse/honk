@@ -129,6 +129,8 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
+已接受的 packet DNS 应答写入同一 scope 的 canonical [路由投影](./dns.md#路由投影)，新建数值目标的 TCP/UDP 流无需嗅探名称即可消费这些事实。它们不授予 HOST/内核投影权威。
+
 正常关闭在共享准入边界立即启动协议 abort，然后才等待正在执行的 selector 精确退休。应用关闭以及已导出/CQ 持有输出的实际释放仍必须完成；命令完成或空 scope owner 退出都不能伪造这些释放。
 
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback

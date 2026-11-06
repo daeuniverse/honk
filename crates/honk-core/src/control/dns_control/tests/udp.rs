@@ -10,30 +10,39 @@ async fn udp_client_limit_cannot_consume_the_combined_query_ceiling() {
         }),
         usize::MAX,
     );
+    let (scope, _scope_owner) = packet_scope(&controller);
     let udp: Vec<_> = (0..super::super::MAX_UDP_CLIENT_QUERIES)
         .map(|index| {
             if index % 2 == 0 {
                 controller.try_admit_query(true)
             } else {
-                controller.try_admit_packet_query(true)
+                controller.try_admit_packet_query(true, scope.scope())
             }
             .unwrap()
         })
         .collect();
     assert!(controller.try_admit_query(true).is_err());
-    assert!(controller.try_admit_packet_query(true).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(true, scope.scope())
+            .is_err()
+    );
     let tcp: Vec<_> = (0..2048 - super::super::MAX_UDP_CLIENT_QUERIES)
         .map(|index| {
             if index % 2 == 0 {
                 controller.try_admit_query(false)
             } else {
-                controller.try_admit_packet_query(false)
+                controller.try_admit_packet_query(false, scope.scope())
             }
             .unwrap()
         })
         .collect();
     assert!(controller.try_admit_query(false).is_err());
-    assert!(controller.try_admit_packet_query(false).is_err());
+    assert!(
+        controller
+            .try_admit_packet_query(false, scope.scope())
+            .is_err()
+    );
     drop((udp, tcp));
 }
 
@@ -160,6 +169,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
     let snapshot = Arc::clone(runtime.runtime().routing_projection());
     let learned_ip = "192.0.2.10".parse().expect("learned IP");
     controller.routing_projection.submit(
+        honk_datapath::ScopeId::HOST,
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",
@@ -186,7 +196,12 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
         .expect("truncated outcome");
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
-    controller.try_submit_projection(runtime.runtime(), &outcome, tokio::time::Instant::now());
+    controller.try_submit_projection(
+        runtime.runtime(),
+        honk_datapath::ScopeId::HOST,
+        &outcome,
+        tokio::time::Instant::now(),
+    );
     drop(runtime);
 
     assert!(cache.lock().await.is_empty());
@@ -238,6 +253,7 @@ async fn projection_follows_query_family_until_nxdomain() {
     let v4 = std::net::IpAddr::from([192, 0, 2, 10]);
     let v6 = std::net::IpAddr::from([0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x10]);
     controller.routing_projection.submit(
+        honk_datapath::ScopeId::HOST,
         Arc::clone(&snapshot),
         crate::dns::projection::ProjectionObservation::Positive {
             domain: "example.com",

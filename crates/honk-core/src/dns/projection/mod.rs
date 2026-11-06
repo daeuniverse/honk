@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
+use honk_datapath::ScopeId;
 use honk_ebpf_common::DomainRouting;
 use honk_outbound::alive::IpVersion;
 
@@ -90,8 +91,9 @@ const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
 /// skipped TTL shortening is applied.
 const CACHE_HIT_COALESCE: Duration = Duration::from_secs(1);
 
-/// Owner state last applied under the projection fence and state lock.
+/// Owner state last applied under its committed generation and state lock.
 struct CacheHitHint {
+    scope: ScopeId,
     structure: u64,
     generation: u64,
     ips: Box<[IpAddr]>,
@@ -274,20 +276,23 @@ impl RoutingProjection {
 
     #[cfg(test)]
     pub(crate) fn update_snapshot(&self, snapshot: Arc<RoutingProjectionSnapshot>) {
-        assert!(self.try_mutate(snapshot.generation(), |state| {
-            state.update_snapshot(&snapshot);
-            0
-        }));
+        assert!(
+            self.try_mutate(ScopeId::HOST, snapshot.generation(), |state| {
+                state.update_snapshot(&snapshot);
+                0
+            })
+        );
     }
 
     #[cfg(test)]
     pub(crate) fn submit(
         &self,
+        scope: ScopeId,
         snapshot: Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) {
         assert!(
-            self.try_submit(&snapshot, observation),
+            self.try_submit(scope, &snapshot, observation),
             "test submission met a held publication fence"
         );
     }
@@ -300,14 +305,31 @@ impl RoutingProjection {
         self.state.lock().project(snapshot).into_iter().collect()
     }
 
-    /// Applies `observation`, or returns `false` while a publication holds
-    /// the fence; see [`Self::submit_after_publication`].
+    pub(crate) fn packet_bitmap(
+        &self,
+        scope: ScopeId,
+        ip: IpAddr,
+        router: &Router,
+        generation: u64,
+    ) -> anyhow::Result<Option<DomainRouting>> {
+        let mut state = self.state.lock();
+        anyhow::ensure!(
+            state.snapshot.generation() == generation
+                && state.snapshot.matcher.policy_fingerprint() == router.policy_fingerprint(),
+            "packet DNS projection generation does not match routing authority"
+        );
+        Ok(state.bitmap(scope, ip))
+    }
+
+    /// Defers HOST writes behind publication; packet observations also defer
+    /// until their exact snapshot is committed, without taking the HOST fence.
     pub(crate) fn try_submit(
         &self,
+        scope: ScopeId,
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) -> bool {
-        self.try_mutate(snapshot.generation(), |state| {
+        self.try_mutate(scope, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
@@ -323,16 +345,17 @@ impl RoutingProjection {
             if let ProjectionObservation::Positive { domain, family, .. } = observation {
                 self.hints[family as usize].remove(domain);
             }
-            state.observe(observation, tokio::time::Instant::now())
+            state.observe(scope, observation, tokio::time::Instant::now())
         })
     }
 
     /// Submits a DNS-cache observation. A refresh identical to one applied within
     /// `CACHE_HIT_COALESCE`, shortening expiry by at most that window, is coalesced
     /// without taking the projection fence or state lock.
-    /// Returns `false` while a publication holds the fence.
+    /// Returns `false` until the matching publication can accept the observation.
     pub(crate) fn try_submit_cache_hit(
         &self,
+        scope: ScopeId,
         snapshot: &Arc<RoutingProjectionSnapshot>,
         domain: &str,
         family: IpVersion,
@@ -343,7 +366,8 @@ impl RoutingProjection {
         let hints = &self.hints[family as usize];
         let structure = self.structure.load(Ordering::Acquire);
         let coalesced = hints.get(domain).is_some_and(|hint| {
-            hint.structure == structure
+            hint.scope == scope
+                && hint.structure == structure
                 && hint.generation == snapshot.generation()
                 && now < expires_at
                 && now < hint.expires_at
@@ -355,7 +379,7 @@ impl RoutingProjection {
         if coalesced {
             return true;
         }
-        self.try_mutate(snapshot.generation(), |state| {
+        self.try_mutate(scope, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
@@ -364,6 +388,7 @@ impl RoutingProjection {
             }
             let applied_at = tokio::time::Instant::now();
             let evicted = state.observe(
+                scope,
                 ProjectionObservation::Positive {
                     domain,
                     family,
@@ -378,10 +403,13 @@ impl RoutingProjection {
                     family_hints.clear();
                 }
             }
-            if let Some((key, ips, expires_at)) = state.cache_hit_hint(family as usize, domain) {
+            if let Some((key, ips, expires_at)) =
+                state.cache_hit_hint(scope, family as usize, domain)
+            {
                 hints.insert(
                     key,
                     CacheHitHint {
+                        scope,
                         structure,
                         generation: state.snapshot.generation(),
                         ips,
@@ -430,14 +458,27 @@ impl RoutingProjection {
         }
     }
 
-    /// Applies `operation` under the shared publication fence, which worker
-    /// map writes also share, or returns `false` while a publication holds or
-    /// awaits it. Only a newer snapshot needs the fence exclusively.
+    /// HOST mutations share the worker's publication fence. Packet mutations
+    /// use the committed snapshot under the state lock and cannot advance it.
     fn try_mutate(
         &self,
+        scope: ScopeId,
         generation: u64,
         operation: impl FnOnce(&mut DesiredState) -> u64,
     ) -> bool {
+        if scope != ScopeId::HOST {
+            let mut state = self.state.lock();
+            if generation > state.snapshot.generation() {
+                return false;
+            }
+            let counter_delta = operation(&mut state);
+            drop(state);
+            self.counters
+                .evictions
+                .fetch_add(counter_delta, Ordering::Relaxed);
+            self.notify_worker();
+            return true;
+        }
         let Some(shared) = self.publication_fence.try_read() else {
             return false;
         };
@@ -532,6 +573,7 @@ impl ProjectionReplacementBenchmark {
         let domain = &self.domains[self.next];
         self.next = (self.next + 1) % self.domains.len();
         self.state.observe(
+            ScopeId::HOST,
             ProjectionObservation::Positive {
                 domain,
                 family: state::family_of(self.ip),

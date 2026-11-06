@@ -417,7 +417,7 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
         print(mode, family, kind, 'echo verified', flush=True)
 PY
 write_config() {
-    local file=$1 backend=$2 direct=$3 security= action= binding=
+    local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= dns="dns { bind: '' }"
     if [[ -n ${5:-} ]]; then binding="xsk_mode: $5"; fi
     if [[ ${4:-} == snat || ${4:-} == masquerade ]]; then
         # Separate daemon profiles must not reuse the peer's retained TIME_WAIT tuple.
@@ -431,6 +431,15 @@ write_config() {
         postrouting { sip(192.0.2.2) -> $action }
     }"
     fi
+    if [[ ${4:-} == endpoint ]]; then
+        dns="dns {
+    bind: ''
+    optimistic_cache_ttl: 0
+    upstream { default: 'udp://10.77.0.2:15353' }
+}"
+        packet_policy="dport(18083) -> direct(must)
+    domain(packet-path.test) -> block"
+    fi
     cat >"$file" <<EOF
 global {
     dial_mode: ip
@@ -438,7 +447,7 @@ global {
     so_mark_from_dae: 0x100
     data_dir: '/run/honk-xdp-state'
 }
-dns { bind: '' }
+$dns
 datapath {
     $backend
     $direct
@@ -450,6 +459,7 @@ datapath {
     $security
 }
 routing {
+    $packet_policy
     fallback: direct
 }
 EOF
@@ -632,6 +642,9 @@ PY
     wait "$server_pid"
     server_pid=
     for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+    if [[ $profile == endpoint ]]; then
+        python3 "$HONK_XDP_PROBE" domain | tee "$work/$profile.domain-routing.log"
+    fi
     if [[ $profile == snat || $profile == masquerade ]]; then
         ip netns exec server cat /proc/net/tcp >"$work/$profile.server-tcp.txt"
     fi

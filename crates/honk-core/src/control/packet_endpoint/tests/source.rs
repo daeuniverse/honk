@@ -97,8 +97,9 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
     let destination: SocketAddr = "198.51.100.9:443".parse().unwrap();
     let budget = MemoryBudget::new(1 << 20);
+    let scope = ScopeId::allocate().unwrap();
     let plain = handle
-        .prepare_packet_routing_snapshot(source, destination, "tcp", 0, false)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, false)
         .await
         .unwrap();
     let plain = EndpointAdmission::new(plain, &budget).unwrap();
@@ -106,7 +107,7 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     drop(plain);
     assert_eq!(budget.used(), 0);
     let observed = handle
-        .prepare_packet_routing_snapshot(source, destination, "tcp", 0, true)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, true)
         .await
         .unwrap();
     let insufficient = MemoryBudget::new(plain_bytes);
@@ -114,7 +115,7 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(insufficient.used(), 0);
     let observed = handle
-        .prepare_packet_routing_snapshot(source, destination, "tcp", 0, true)
+        .prepare_packet_routing_snapshot(scope, source, destination, "tcp", 0, true)
         .await
         .unwrap();
     let admission = EndpointAdmission::new(observed, &budget).unwrap();

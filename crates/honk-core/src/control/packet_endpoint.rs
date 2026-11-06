@@ -272,6 +272,7 @@ impl PacketEndpoints {
             .ok_or_else(|| anyhow::anyhow!("packet ingress memory capacity"))?;
         let (scopes, owners): (Vec<_>, Vec<_>) = scopes.into_iter().unzip();
         let scopes: Arc<[PacketScope]> = scopes.into();
+        plane.dns_controller.register_packet_scopes(&scopes)?;
         plane.udp_pool = Arc::new(UdpEndpointPool::with_packet_reply_factory(
             udp_capacity,
             Arc::new(Replies(Arc::clone(&scopes))),
@@ -993,6 +994,7 @@ impl EndpointRuntime {
                 Some(snapshot) => snapshot,
                 None => match handle
                     .prepare_packet_routing_snapshot(
+                        scope,
                         source,
                         destination,
                         "udp",
@@ -1047,7 +1049,7 @@ impl EndpointRuntime {
                     );
                     return;
                 };
-                match dns.try_admit_packet_query(true) {
+                match dns.try_admit_packet_query(true, scope) {
                     Ok(admission) => {
                         self.plane.stats.record_udp_slow_permit_accepted();
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
