@@ -106,8 +106,9 @@ pub(crate) enum CacheAccess {
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
-    /// A node server host lookup on the dial path: response rules may
-    /// requery through a proxy whose own dial would need this very lookup.
+    /// A node server host lookup on the dial path. It skips response rules,
+    /// which may requery through a proxy whose own dial would need this very
+    /// lookup, and family preference, which its caller applies itself.
     pub(crate) node_host: bool,
 }
 
@@ -625,6 +626,9 @@ mod strategy {
             options: &ResolveOptions,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
+                // A node host lookup orders both families itself; its uncached
+                // sibling probe would be an extra exchange that could empty one.
+                _ if options.node_host => return Ok(response),
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
                 (DnsStrategy::PreferIpv6, 1) => 28u16,
                 _ => return Ok(response),

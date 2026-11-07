@@ -512,3 +512,36 @@ async fn claimed_node_host_reports_the_exchange_failure_not_an_empty_answer() {
         assert!(format!("{error:#}").contains(expected), "{error:#}");
     }
 }
+
+#[tokio::test]
+async fn claimed_node_host_keeps_both_families_under_a_prefer_strategy() {
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let pool = ScriptedPool::new(Reply::Address(300), Reply::Address(300));
+    let forwarder = DnsForwarder::new(
+        pool.clone(),
+        Arc::new(Mutex::new(DnsCache::new(32))),
+        Arc::new(DnsRouter::new_from_dns_config(&config).expect("router")),
+    )
+    .with_strategy(DnsStrategy::PreferIpv4)
+    .with_node_hosts(
+        [("node.example".to_owned(), vec!["MyAirport".to_owned()])]
+            .into_iter()
+            .collect(),
+    );
+    let addresses = DnsService::with_forwarder(Arc::new(forwarder))
+        .resolve_node_host("node.example")
+        .await
+        .expect("node host lookup")
+        .expect("claimed");
+    // The claimed lookup orders families itself; an uncached sibling probe
+    // would be a third exchange that could empty the other family.
+    assert!(
+        addresses[0].is_ipv4() && addresses[1].is_ipv6(),
+        "{addresses:?}"
+    );
+    assert_eq!(pool.counts(), [1, 1]);
+}
