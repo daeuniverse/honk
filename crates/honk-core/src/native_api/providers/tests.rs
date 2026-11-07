@@ -607,7 +607,7 @@ fn provider_debug_omits_full_url() {
         ),
         ..Default::default()
     };
-    let row = Provider::observed(&subscription, ProviderLoad::default(), 0);
+    let row = Provider::observed(&subscription, ProviderLoad::default(), 0, |_| None);
     assert_eq!(row.url_redacted.as_deref(), Some(subscription.url.as_str()));
     assert!(!format!("{row:?}").contains("url-sentinel"));
 }
@@ -672,15 +672,13 @@ fn provider_rows_report_the_download_route_like_geodata() {
     );
 }
 
-/// The provider list for one subscription whose last fetch failed as `fetch`.
-fn failed_fetch(config: &Config, name: &str, fetch: Option<FetchFailure>) -> Value {
-    let mut config = config.clone();
-    config.subscriptions.push(Subscription {
-        name: name.into(),
+/// A provider whose last fetch failed as `fetch`.
+fn failed_fetch(config: &Config, fetch: Option<FetchFailure>) -> Value {
+    let subscription = Subscription {
+        name: "p".into(),
         url: "https://example.test/sub".into(),
         ..Default::default()
-    });
-    let subscription = config.subscriptions.last().unwrap();
+    };
     let load = ProviderLoad {
         error: Some("fetch_failed"),
         fetch,
@@ -688,9 +686,7 @@ fn failed_fetch(config: &Config, name: &str, fetch: Option<FetchFailure>) -> Val
     };
     let group_id = |name: &str| (name == "proxy").then(|| "group-proxy".to_owned());
     serde_json::to_value(
-        Provider::observed(subscription, load, 0)
-            .routed(subscription, group_id)
-            .mask_listener_secrets(&config, None),
+        Provider::observed(&subscription, load, 0, group_id).mask_listener_secrets(config, None),
     )
     .unwrap()
 }
@@ -705,7 +701,7 @@ fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
             group: group.map(str::to_owned),
         }),
     };
-    let row = failed_fetch(&config, "p", Some(through("hk-1", Some("proxy"))));
+    let row = failed_fetch(&config, Some(through("hk-1", Some("proxy"))));
     assert_eq!(row["last_error"]["code"], "fetch_failed");
     assert_eq!(
         row["last_error"]["details"],
@@ -713,7 +709,7 @@ fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
     );
     // A group the catalog does not know, and a node chosen without a group.
     for group in [Some("gone"), None] {
-        let row = failed_fetch(&config, "p", Some(through("hk-1", group)));
+        let row = failed_fetch(&config, Some(through("hk-1", group)));
         assert_eq!(
             row["last_error"]["details"],
             json!({"stage": "connection_failed", "node": "hk-1", "group_id": null})
@@ -724,7 +720,7 @@ fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
         via: None,
     };
     assert_eq!(
-        failed_fetch(&config, "p", Some(direct))["last_error"]["details"],
+        failed_fetch(&config, Some(direct))["last_error"]["details"],
         json!({"stage": "download_timeout", "node": null, "group_id": null})
     );
     let parse = FetchFailure {
@@ -732,12 +728,12 @@ fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
         via: None,
     };
     assert_eq!(
-        failed_fetch(&config, "p", Some(parse))["last_error"]["details"]["stage"],
+        failed_fetch(&config, Some(parse))["last_error"]["details"]["stage"],
         "parse_failed"
     );
     // A failure that names no stage reports none.
     assert_eq!(
-        failed_fetch(&config, "p", None)["last_error"]["details"],
+        failed_fetch(&config, None)["last_error"]["details"],
         Value::Null
     );
 }
@@ -753,7 +749,7 @@ fn a_failed_fetch_masks_listener_values_in_the_node_name() {
             group: None,
         }),
     };
-    let row = failed_fetch(&config, "p", Some(fetch));
+    let row = failed_fetch(&config, Some(fetch));
     assert_eq!(row["last_error"]["details"]["node"], "node-<redacted>");
     assert!(!row.to_string().contains("native-listener-token"));
 }
@@ -934,7 +930,6 @@ fn retained_bytes_charge_the_owned_route_and_error_json() {
         code: "rejected",
         message: "rejected",
         details: Some(json!({"diagnostic_code": "d".repeat(100)})),
-        group: None,
     });
     assert!(owned.retained_bytes() >= bare.retained_bytes() + 64 + 100);
 }

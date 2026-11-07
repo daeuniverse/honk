@@ -28,7 +28,7 @@ pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
 pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
-#[cfg(feature = "native-api")]
+#[cfg(all(test, feature = "native-api"))]
 pub(crate) use route::FetchFailure;
 pub(crate) use route::{failure_code, failure_stage};
 pub(crate) use supervisor::SubscriptionMergeReply;

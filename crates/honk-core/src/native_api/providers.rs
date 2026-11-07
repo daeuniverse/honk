@@ -23,10 +23,12 @@ use super::{
     parse_query, timestamp,
     types::RequestId,
 };
+#[cfg(test)]
+use crate::subscription::FetchFailure;
 use crate::{
     control::ReloadOutcome,
     subscription::{
-        FetchFailure, ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
+        ProviderLoad, RefreshRefusal, RefreshReport, SubscriptionMergeReply,
         SubscriptionSupervisorHandle,
     },
 };
@@ -70,10 +72,6 @@ struct ProviderError {
     code: &'static str,
     message: &'static str,
     details: Option<Value>,
-    /// The group a failed download went through, until `routed` swaps it for
-    /// its id in `details`.
-    #[serde(skip)]
-    group: Option<String>,
 }
 
 /// The message for a failure code that says more than the generic one.
@@ -89,16 +87,6 @@ fn error_message(code: &str) -> Option<&'static str> {
 /// Names the configuration diagnostic that rejected a publication.
 fn rejection_details(rejection: Option<&'static str>) -> Option<Value> {
     rejection.map(|code| json!({"diagnostic_code": code}))
-}
-
-/// Names the stage a fetch failed at and the node that carried it. `group_id`
-/// stays null until `Provider::routed` can look the group up.
-fn fetch_details(failure: &FetchFailure) -> Value {
-    json!({
-        "stage": failure.stage,
-        "node": failure.via.as_ref().map(|via| &via.node),
-        "group_id": null,
-    })
 }
 
 impl Provider {
@@ -118,7 +106,12 @@ impl Provider {
         }
     }
 
-    fn observed(subscription: &Subscription, load: ProviderLoad, node_count: usize) -> Self {
+    fn observed(
+        subscription: &Subscription,
+        load: ProviderLoad,
+        node_count: usize,
+        group_id: impl Fn(&str) -> Option<String>,
+    ) -> Self {
         Self {
             id: subscription.id.to_string(),
             name: subscription.name.clone(),
@@ -159,26 +152,26 @@ impl Provider {
                 details: load
                     .fetch
                     .as_ref()
-                    .map(fetch_details)
+                    .map(|failure| {
+                        json!({
+                            "stage": failure.stage,
+                            "node": failure.via.as_ref().map(|via| &via.node),
+                            "group_id": failure.via.as_ref()
+                                .and_then(|via| via.group.as_deref())
+                                .and_then(&group_id),
+                        })
+                    })
                     .or_else(|| rejection_details(load.rejection)),
-                group: load.fetch.and_then(|fetch| fetch.via?.group),
             }),
             download: None,
         }
     }
 
-    /// The subscription's download route, `{route, group_id}` as for geodata.
     fn routed(
         mut self,
         subscription: &Subscription,
         group_id: impl Fn(&str) -> Option<String>,
     ) -> Self {
-        if let Some(error) = self.last_error.as_mut()
-            && let Some(group) = error.group.take()
-            && let Some(Value::Object(details)) = error.details.as_mut()
-        {
-            details.insert("group_id".into(), json!(group_id(&group)));
-        }
         self.download = Some(
             super::geodata::Route::from_detour(&subscription.download_detour)
                 .unwrap_or_default()
@@ -367,8 +360,9 @@ pub(super) async fn list(
             .as_ref()
             .map(|owner| owner.observation(subscription))
             .unwrap_or_default();
-        let row = Provider::observed(subscription, load, counts[&subscription.id])
-            .routed(subscription, |name| identity.groups.get(name).cloned())
+        let group_id = |name: &str| identity.groups.get(name).cloned();
+        let row = Provider::observed(subscription, load, counts[&subscription.id], group_id)
+            .routed(subscription, group_id)
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
@@ -434,7 +428,7 @@ pub(super) fn provider_value(
         .filter(|node| node.subscription_id == Some(provider_id))
         .count();
     serde_json::to_value(
-        Provider::observed(subscription, load, count)
+        Provider::observed(subscription, load, count, &group_id)
             .routed(subscription, group_id)
             .mask_listener_secrets(config, sources),
     )
@@ -501,10 +495,10 @@ pub(super) async fn refresh(
                 .read()
                 .clone()
                 .ok_or_else(not_refreshable)?;
-            let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
-                .routed(&subscription, |name| {
-                    super::geodata::group_id(&state.observation.core.catalog, name)
-                })
+            let group_id =
+                |name: &str| super::geodata::group_id(&state.observation.core.catalog, name);
+            let display = Provider::observed(&subscription, ProviderLoad::default(), 0, group_id)
+                .routed(&subscription, group_id)
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
         }
@@ -561,7 +555,8 @@ impl RefreshReport for RefreshOperation {
             Ok(reply) => {
                 match reply.outcome {
                     ReloadOutcome::Noop { .. } | ReloadOutcome::Committed { .. } => {
-                        let mut provider = Provider::observed(subscription, load, reply.node_count);
+                        let mut provider =
+                            Provider::observed(subscription, load, reply.node_count, |_| None);
                         provider.name = self.display_name;
                         provider.url_redacted = Some(self.display_url);
                         provider.download = self.display_download;
