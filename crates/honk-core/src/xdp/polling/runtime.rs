@@ -38,6 +38,61 @@ pub(in crate::xdp) fn polling_segment_stop(
 
 impl Runtime {
     #[cfg(test)]
+    pub(in crate::xdp) fn polling_test_snapshot(&self) -> super::testing::Snapshot {
+        let polling = &self.polling;
+        super::testing::Snapshot {
+            mode: polling.config.mode,
+            high: polling.status.high,
+            low: polling.status.low,
+            rx_high_windows: polling.status.rx_high_windows,
+            tx_high_windows: polling.status.tx_high_windows,
+            busy_entries: polling.busy_entries,
+            probe_rounds: polling.busy_probe_rounds,
+            qualified_rx: polling.qualified_rx_total,
+            published_tx: polling.published_tx_total,
+            local_revision: polling.config.revision,
+            process_revision: polling.process_revision,
+            reason: polling.reason,
+            clock: polling.last_clock,
+            clock_error: polling.clock_error,
+            executable_sha256: polling
+                .budget
+                .as_ref()
+                .and_then(|budget| budget.executable_sha256().map(str::to_owned)),
+            context_sha256: polling.context_sha256.clone(),
+            parameter_sha256: polling.parameter_sha256.clone(),
+            queues: self
+                .devices
+                .iter()
+                .flat_map(|device| {
+                    device
+                        .queues
+                        .iter()
+                        .map(move |queue| super::testing::Queue {
+                            device: device.info.name.clone(),
+                            id: queue.id,
+                            counters: queue.io.get_ref().counters(),
+                            rings: queue.io.get_ref().rings(),
+                        })
+                })
+                .collect(),
+            cursors: (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class),
+            pollable: self.has_pollable_obligation(),
+            waiting: self.waiting.len(),
+            pending: self.pending.len(),
+        }
+    }
+
+    #[cfg(test)]
+    fn polling_test_pause(&self, point: super::testing::Point) {
+        if self.polling.test_control.armed(point) {
+            self.polling
+                .test_control
+                .arrive(point, self.polling_test_snapshot());
+        }
+    }
+
+    #[cfg(test)]
     fn polling_test_pending(&self, reading: bool, timer: Pin<&Option<tokio::time::Sleep>>) {
         self.polling
             .test_control
@@ -187,11 +242,23 @@ impl Runtime {
         if owner_affinity().ok() != self.polling_affinity {
             return Err("calibration_context_mismatch");
         }
+        #[cfg(test)]
+        let mut pause_snapshot = self
+            .polling
+            .test_control
+            .armed(super::testing::Point::FeatureQuery)
+            .then(|| self.polling_test_snapshot());
         for device in &mut self.devices {
             if let Some(reason) =
                 polling_segment_stop(&self.polling, Some(interval), shutdown, deadline)
             {
                 return Err(reason);
+            }
+            #[cfg(test)]
+            if let Some(snapshot) = pause_snapshot.take() {
+                self.polling
+                    .test_control
+                    .arrive(super::testing::Point::FeatureQuery, snapshot);
             }
             match device
                 .features
@@ -202,6 +269,10 @@ impl Runtime {
                 Ok(true) => {}
                 Ok(false) => return Err("calibration_context_mismatch"),
                 Err(_error) => {
+                    #[cfg(test)]
+                    self.polling
+                        .test_control
+                        .note_query_errno(_error.raw_os_error());
                     device.features = None;
                     return Err("offload_query_failed");
                 }
@@ -248,6 +319,10 @@ impl Runtime {
     ) -> Poll<anyhow::Result<()>> {
         self.polling.poll_change(notification, cx);
         self.polling.synchronize();
+        #[cfg(test)]
+        self.polling
+            .test_control
+            .note_serviced_revision(self.polling.revision());
         if !self.closing
             && (self.polling.revision() != self.context_revision || self.context_recheck)
         {
@@ -300,8 +375,25 @@ impl Runtime {
             _ => None,
         };
         let pollable = self.has_pollable_obligation();
+        #[cfg(test)]
+        let idle_high = !pollable && self.polling.status.high;
         let interval = self.polling.begin(pollable, deadline_ns);
+        #[cfg(test)]
+        if idle_high {
+            self.polling.test_control.note_idle_high(interval.is_some());
+        }
         if let Some(interval) = interval {
+            #[cfg(test)]
+            let start_cursors = (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class);
+            #[cfg(test)]
+            let start_rx = self
+                .devices
+                .iter()
+                .flat_map(|device| &device.queues)
+                .map(|queue| queue.io.get_ref().counters().rx)
+                .sum();
+            #[cfg(test)]
+            self.polling_test_pause(super::testing::Point::Reserved);
             let mut failure = None;
             let reason = loop {
                 if let Some(reason) =
@@ -340,8 +432,14 @@ impl Runtime {
                     break "no_pollable_work";
                 }
             };
+            #[cfg(test)]
+            let mut settlement = None;
             let reason = match interval.finish() {
                 Ok(record) => {
+                    #[cfg(test)]
+                    {
+                        settlement = Some(record);
+                    }
                     self.log_polling_ledger(&record, reason);
                     reason
                 }
@@ -351,6 +449,27 @@ impl Runtime {
                 }
             };
             self.polling.leave(reason);
+            #[cfg(test)]
+            self.polling.test_control.note_exit(super::testing::Exit {
+                reason,
+                probe_rounds: self.polling.busy_probe_rounds,
+                published_packets: self
+                    .devices
+                    .iter()
+                    .flat_map(|device| &device.queues)
+                    .map(|queue| queue.io.get_ref().counters().published_packets)
+                    .sum(),
+                settlement,
+                start_cursors,
+                cursors: (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class),
+                start_rx,
+                rx_packets: self
+                    .devices
+                    .iter()
+                    .flat_map(|device| &device.queues)
+                    .map(|queue| queue.io.get_ref().counters().rx)
+                    .sum(),
+            });
             timer.set(None);
             return Poll::Ready(failure.map_or(Ok(()), Err));
         }

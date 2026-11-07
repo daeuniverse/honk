@@ -436,6 +436,10 @@ impl AdaptivePoll {
             .busy
             .as_ref()
             .and_then(|config| u64::from(config.observation_window_us).checked_mul(1_000));
+        #[cfg(test)]
+        {
+            self.clock.fault = self.test_control.clock_fault();
+        }
         let observation = self.clock.sample(gap);
         let continuous = self.accept_clock_observation(
             observation,
@@ -457,6 +461,14 @@ impl AdaptivePoll {
     ) -> bool {
         match observation {
             Ok(sample) => {
+                #[cfg(test)]
+                if sample.discontinuity || sample.offset_changed {
+                    self.test_control.note_clock(
+                        sample.discontinuity && !sample.offset_changed,
+                        sample.offset_changed,
+                        false,
+                    );
+                }
                 self.clock_error = None;
                 let continuous = sample.continuous;
                 if !continuous {
@@ -482,6 +494,10 @@ impl AdaptivePoll {
                 continuous
             }
             Err(reason) => {
+                #[cfg(test)]
+                if self.clock_error != Some(reason) {
+                    self.test_control.note_clock(false, false, true);
+                }
                 self.clock_error = Some(reason);
                 self.last_clock = None;
                 self.reset();

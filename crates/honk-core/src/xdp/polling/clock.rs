@@ -64,6 +64,8 @@ pub(crate) struct SchedulingClock {
     resolutions: Option<(u64, u64)>,
     previous: Option<Sample>,
     baseline: Option<(i128, i128)>,
+    #[cfg(test)]
+    pub(super) fault: super::testing::ClockFault,
 }
 
 impl SchedulingClock {
@@ -72,6 +74,8 @@ impl SchedulingClock {
             resolutions: resolutions().ok(),
             previous: None,
             baseline: None,
+            #[cfg(test)]
+            fault: super::testing::ClockFault::None,
         }
     }
 
@@ -88,6 +92,14 @@ impl SchedulingClock {
             )
             .map_err(|_| "clock_conversion_invalid")?;
             let boot = boottime_ns().map_err(|_| "clock_unavailable")?;
+            #[cfg(test)]
+            let boot = match self.fault {
+                super::testing::ClockFault::None => boot,
+                super::testing::ClockFault::Unavailable => return Err("clock_unavailable"),
+                super::testing::ClockFault::BootOffset(offset) => {
+                    boot.checked_add(offset).ok_or("clock_interval_overflow")?
+                }
+            };
             let after = timespec_ns(
                 clock_gettime(ClockId::CLOCK_MONOTONIC).map_err(|_| "clock_unavailable")?,
             )
@@ -188,6 +200,7 @@ mod tests {
             resolutions: Some((2, 3)),
             previous: None,
             baseline: None,
+            fault: super::super::testing::ClockFault::None,
         }
     }
 
@@ -352,6 +365,7 @@ mod tests {
             resolutions: Some((1, 1)),
             previous: None,
             baseline: None,
+            fault: super::super::testing::ClockFault::None,
         };
         clock
             .accept(

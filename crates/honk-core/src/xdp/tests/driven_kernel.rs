@@ -6,8 +6,10 @@ use tokio::{
     process::{Child, ChildStdin, ChildStdout, Command},
 };
 
+mod adaptive;
+
 const PEER: &str = r#"
-import contextlib, os, socket, struct, sys
+import contextlib, os, socket, struct, sys, time
 
 home = os.open('/proc/self/ns/net', os.O_RDONLY)
 @contextlib.contextmanager
@@ -23,6 +25,8 @@ def namespace(name):
 with namespace('client'):
     client = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
     client.bind(('c0', 0))
+    # The UDP pump must not fill the TCP witness queue with local transmissions.
+    client.setsockopt(263, 23, 1)
 with namespace('server'):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -30,6 +34,7 @@ with namespace('server'):
     listener.listen(2)
     transit = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
     transit.bind(('s0', 0))
+    transit.setsockopt(263, 23, 1) # PACKET_IGNORE_OUTGOING: the independent WAN pump is not this peer.
 for sock in (client, listener, transit):
     sock.settimeout(8)
 os.close(home)
@@ -50,9 +55,22 @@ def send(protocol, body, source='192.0.2.99'):
     ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
     client.send(bytes.fromhex('0200000000100200000000200800') + ip + body)
 
-def receive(sock, protocol, source, destination):
+def receive(sock, protocol, source, destination, deadline=None):
+    deadline = time.monotonic() + 8 if deadline is None else deadline
+    observed = 0
     while True:
-        packet, peer = sock.recvfrom(65535)
+        try:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError('matching packet deadline')
+            sock.settimeout(left)
+            packet, peer = sock.recvfrom(65535)
+            observed += 1
+        except TimeoutError as error:
+            packets, dropped = struct.unpack('=II', sock.getsockopt(263, 6, 8))
+            raise RuntimeError(('packet witness timeout', protocol, source, destination,
+                                'observed', observed, 'socket_packets', packets,
+                                'socket_drops', dropped)) from error
         if peer[2] == 4 or packet[12:14] != b'\x08\x00':
             continue
         ip = packet[14:]
@@ -69,8 +87,9 @@ def tcp(flags, payload=b''):
     send(6, struct.pack('!HHIIBBHHH', port, 18084, sequence, acknowledgment, 5 << 4, flags, 60000, 0, 0) + payload)
 
 def reply():
+    deadline = time.monotonic() + 8
     while True:
-        _, body = receive(client, 6, '198.51.100.2', '192.0.2.99')
+        _, body = receive(client, 6, '198.51.100.2', '192.0.2.99', deadline)
         source, destination, seq, ack, offset, flags, _, _, _ = struct.unpack('!HHIIBBHHH', body[:20])
         if (source, destination) != (18084, port):
             continue
@@ -87,22 +106,28 @@ def exact(sock, expected):
 
 print('READY', flush=True)
 connection = None
+connections = 0
 for line in sys.stdin:
     command, label = line.strip().split()
     if command == 'CONNECT':
-        port = 41084 if label == 'router' else 41085
-        sequence, acknowledgment = 100 if label == 'router' else 10000, 0
+        connections += 1
+        port = 41084 if label == 'router' else 41085 if label == 'config' else 42000 + connections
+        sequence, acknowledgment = 100 if label == 'router' else 10000 if label == 'config' else connections * 20000, 0
         tcp(2)
+        print(label + ': SYN sent', file=sys.stderr, flush=True)
         seq, ack, flags, payload = reply()
         assert (ack, flags, payload) == (sequence + 1, 18, b'')
+        print(label + ': SYN-ACK received', file=sys.stderr, flush=True)
         sequence += 1
         acknowledgment = (seq + 1) & 0xffffffff
         tcp(16)
         connection, address = listener.accept()
         connection.settimeout(8)
         assert address[0] == '10.77.0.1', ('not the actual Endpoint dial', address)
+        print(label + ': upstream accepted', file=sys.stderr, flush=True)
         warm = ('prime/' + label).encode()
         connection.sendall(warm)
+        print(label + ': warm payload sent', file=sys.stderr, flush=True)
         while True:
             seq, ack, flags, payload = reply()
             if payload:
@@ -112,6 +137,19 @@ for line in sys.stdin:
         tcp(16)
         print('CONNECTED ' + label, flush=True)
     elif command == 'COLD':
+        # No cold packet exists yet; discard old unrelated traffic before its observation window.
+        transit.setblocking(False)
+        try:
+            for _ in range(4096):
+                try:
+                    transit.recvfrom(65535)
+                except BlockingIOError:
+                    break
+            else:
+                raise AssertionError('transit observer did not drain before cold send')
+        finally:
+            transit.settimeout(8)
+        transit.getsockopt(263, 6, 8) # Reset PACKET_STATISTICS at the actual window boundary.
         payload = ('cold/' + label).encode()
         send(17, struct.pack('!HHHH', port + 10, 18085, 8 + len(payload), 0) + payload, '192.0.2.2')
         print('COLD ' + label, flush=True)
@@ -161,6 +199,8 @@ for line in sys.stdin:
             if body[8:] == ('cold/' + label).encode():
                 break
         assert struct.unpack('!HH', body[:4]) == (port + 10, 18085) and ip[8] == 63
+        _, drops = struct.unpack('=II', transit.getsockopt(263, 6, 8))
+        assert drops == 0, ('cold-packet observer lost wire evidence', drops)
         print('FORWARDED ' + label, flush=True)
     elif command == 'STOP':
         assert connection is None
