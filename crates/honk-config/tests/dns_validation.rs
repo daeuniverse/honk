@@ -307,6 +307,12 @@ fn subtag_rules_need_a_direct_upstream_and_only_qname() {
             "dns.routing.request.rules[1].action",
         ),
         (
+            " -> proxy\n  providerdoh: 'https://203.0.113.2/dns-query' -> direct",
+            accepted,
+            "subtag-dns-upstream-route",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
             " -> direct",
             "subtag(MyAirport) -> asis",
             "subtag-dns-action",
