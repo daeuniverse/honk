@@ -1,4 +1,5 @@
 use super::*;
+use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub(super) async fn execute(
@@ -14,20 +15,39 @@ pub(super) async fn execute(
             plan.result.results[row].observed_at = timestamp(skipped.observed_at);
         }
     }
-    for attempt in &plan.attempts {
-        let candidate = &attempt.candidate;
-        if *stop.borrow() || Instant::now() >= deadline {
-            for &row in &candidate.rows {
-                plan.result.results[row].error = Some(if *stop.borrow() {
-                    "cancelled"
-                } else {
-                    "deadline"
-                });
-                plan.result.results[row].observed_at = timestamp(SystemTime::now());
-            }
-            continue;
+    let context = &plan.context;
+    let mut pending = plan.attempts.iter();
+    let mut running = futures::stream::FuturesUnordered::new();
+    loop {
+        while running.len() < honk_outbound::urltest::URLTEST_MAX_CONCURRENT
+            && let Some(attempt) = pending.next()
+        {
+            let stop = stop.clone();
+            running.push(async move {
+                if *stop.borrow() {
+                    return (attempt, Err("cancelled"));
+                }
+                if Instant::now() >= deadline {
+                    return (attempt, Err("deadline"));
+                }
+                let outcome = attempt_wire(state, context, attempt, deadline, stop).await;
+                (attempt, Ok(outcome))
+            });
         }
-        let outcome = attempt_wire(state, &plan.context, attempt, deadline, stop.clone()).await;
+        let Some((attempt, outcome)) = running.next().await else {
+            break;
+        };
+        let candidate = &attempt.candidate;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                for &row in &candidate.rows {
+                    plan.result.results[row].error = Some(reason);
+                    plan.result.results[row].observed_at = timestamp(SystemTime::now());
+                }
+                continue;
+            }
+        };
         cleanup = cleanup.and(outcome.cleanup);
         let sample = outcome.sample;
         let completed = outcome.completed;
