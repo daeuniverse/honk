@@ -409,3 +409,33 @@ fn subtag_rules_claim_only_node_hosts_of_matching_subscriptions() {
         DnsRequestDecision::Upstream("ordinary".into())
     );
 }
+
+#[test]
+fn subtag_exact_tags_are_anchored_literals_and_regex_tags_are_patterns() {
+    let router = router_from_request(request(vec![rule(
+        DnsCond::Subtag {
+            not: false,
+            tags: vec![
+                DnsTagMatcher::Exact("Air.port".into()),
+                DnsTagMatcher::Regex("^Paid-[0-9]+$".into()),
+            ],
+        },
+        DnsRequestAction::Upstream("providerdoh".into()),
+    )]));
+    let claims = |tag: &str| {
+        router
+            .select_node_upstream("node.example", &[tag.to_owned()])
+            .is_some()
+    };
+    for (tag, claimed) in [
+        ("Air.port", true),
+        ("AirXport", false),
+        ("MyAir.port", false),
+        ("Air.port2", false),
+        ("air.port", false),
+        ("Paid-12", true),
+        ("Paid-x", false),
+    ] {
+        assert_eq!(claims(tag), claimed, "{tag}");
+    }
+}
