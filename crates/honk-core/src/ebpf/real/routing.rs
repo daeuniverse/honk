@@ -13,11 +13,13 @@ use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::fd::{FromRawFd, OwnedFd};
 
-const ROUTING_TARGETS: [&str; 4] = [
-    "lan_ingress_l2",
-    "lan_ingress_l3",
-    "wan_egress_l2",
-    "wan_egress_l3",
+/// Programs that call the routing slot; WAN egress attaches through its
+/// lanes on kernels without TCX.
+const ROUTING_TARGETS: [crate::ebpf::interface::TcProgram; 4] = [
+    crate::ebpf::interface::TcProgram::LanIngressL2,
+    crate::ebpf::interface::TcProgram::LanIngressL3,
+    crate::ebpf::interface::TcProgram::WanEgressL2,
+    crate::ebpf::interface::TcProgram::WanEgressL3,
 ];
 const FACT_MAP_CAPACITY: u32 = 2_048_000;
 const BPF_F_NO_PREALLOC: u32 = 1;
@@ -491,7 +493,11 @@ impl RealEbpfBackend {
 
     fn routing_targets(&mut self, slot_name: &str) -> anyhow::Result<Vec<Target>> {
         let bpf = self.bpf_mut()?;
-        let mut names = ROUTING_TARGETS.to_vec();
+        let mut names: Vec<&str> = ROUTING_TARGETS
+            .iter()
+            .flat_map(|program| super::bindings::loaded_names(*program))
+            .copied()
+            .collect();
         if bpf.program("routing_test").is_some() {
             names.push("routing_test");
         }

@@ -128,7 +128,18 @@ fn mandatory_programs_call_no_probe_read_helper() -> anyhow::Result<()> {
         // A zero cookie is frozen read-only data: the verifier prunes the whole callback body.
         .override_global("TCP_DAENS_NETNS_COOKIE", &1u64, true)
         .load(crate::DEFAULT_BPF_OBJECT)?;
-    for name in MANDATORY_PROGRAMS {
+    // Without TCX the WAN egress hooks run its lanes instead of the unsplit pair.
+    let lanes =
+        super::super::bindings::loaded_names(crate::ebpf::interface::TcProgram::WanEgressL2)
+            .iter()
+            .chain(super::super::bindings::loaded_names(
+                crate::ebpf::interface::TcProgram::WanEgressL3,
+            ));
+    let names = MANDATORY_PROGRAMS
+        .iter()
+        .filter(|name| !name.starts_with("wan_egress_"))
+        .chain(lanes);
+    for &name in names {
         let program = bpf
             .program_mut(name)
             .with_context(|| format!("mandatory program {name} missing from the object"))?;

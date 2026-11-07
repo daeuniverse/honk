@@ -22,7 +22,6 @@ use honk_ebpf_common::{
     conn::{BpfStatsKey, UdpDecisionState},
     redirect_need::{RoutingHandoffEntry, Tuples, TuplesKey},
 };
-use network_types::eth::EthHdr;
 
 use crate::{
     contrack::{
@@ -399,17 +398,7 @@ fn do_tproxy_wan_egress_tcp(
     } else {
         AuxPrep::Refresh
     };
-    let prepare_result = prep_redirect_to_control_plane(
-        ctx,
-        link_h_len,
-        tuples,
-        ethh,
-        1,
-        aux,
-        outbound,
-        0,
-        pkt.incarnation,
-    );
+    let prepare_result = wan_prep_redirect(ctx, link_h_len, aux, outbound, 0, pkt.incarnation);
     if prepare_result != 0 {
         return Err(TC_ACT_SHOT);
     }
@@ -468,6 +457,70 @@ fn do_tproxy_wan_egress_tcp(
     redirect_to_control_plane_egress()
 }
 
+/// WAN egress redirect preparation as a global function, which the verifier
+/// checks once instead of once per reaching path: before Linux 6.x its weaker
+/// pruning took WAN egress past the one-million-instruction limit. Only the
+/// context and scalars cross the boundary; the tuple and Ethernet header come
+/// from the per-CPU packet scratch the caller parsed into, so map keys stay
+/// map-value pointers, which Linux 5.15 requires of helper keys.
+///
+/// `shape` packs `link_h_len` (bits 0..32), the [`AuxPrep`] (32..40) and the
+/// outbound (40..48).
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub extern "C" fn honk_wan_prep_redirect(
+    skb: *mut __sk_buff,
+    shape: u64,
+    decision_token: u64,
+    incarnation: u64,
+) -> i32 {
+    let ctx = tc_context(skb);
+    let Some(pkt) = PKT_SCRATCH_KEY.get_ptr(0) else {
+        return -1;
+    };
+    let pkt = unsafe { &*pkt };
+    let mode = match (shape >> 32) as u8 {
+        0 => AuxPrep::Publish,
+        1 => AuxPrep::Refresh,
+        2 => AuxPrep::Existing,
+        _ => AuxPrep::RedirectOnly,
+    };
+    prep_redirect_to_control_plane(
+        &ctx,
+        shape as u32,
+        &pkt.tuples,
+        &pkt.ethh,
+        1,
+        mode,
+        (shape >> 40) as u8,
+        decision_token as u32,
+        incarnation,
+    )
+}
+
+#[inline(always)]
+fn wan_prep_redirect(
+    ctx: &TcContext,
+    link_h_len: u32,
+    mode: AuxPrep,
+    outbound: u8,
+    decision_token: u32,
+    incarnation: u64,
+) -> i32 {
+    let mode = match mode {
+        AuxPrep::Publish => 0u64,
+        AuxPrep::Refresh => 1,
+        AuxPrep::Existing => 2,
+        AuxPrep::RedirectOnly => 3,
+    };
+    honk_wan_prep_redirect(
+        raw_skb(ctx),
+        u64::from(link_h_len) | mode << 32 | u64::from(outbound) << 40,
+        u64::from(decision_token),
+        incarnation,
+    )
+}
+
 /// Fast-path decision after routing (shared by the cached and full-routing
 /// UDP paths).
 #[inline(always)]
@@ -475,7 +528,6 @@ fn fast_path_decision(
     ctx: &TcContext,
     link_h_len: u32,
     tuples: &Tuples,
-    ethh: &EthHdr,
     outbound: u8,
     mark: u32,
     must: bool,
@@ -517,12 +569,9 @@ fn fast_path_decision(
         return Err(TC_ACT_SHOT);
     }
 
-    let prepare_result = prep_redirect_to_control_plane(
+    let prepare_result = wan_prep_redirect(
         ctx,
         link_h_len,
-        tuples,
-        ethh,
-        1,
         AuxPrep::Refresh,
         outbound,
         decision_token,
@@ -648,7 +697,6 @@ fn do_tproxy_wan_egress_udp(
                 ctx,
                 link_h_len,
                 tuples,
-                ethh,
                 outbound,
                 mark,
                 must,
@@ -750,7 +798,6 @@ fn do_tproxy_wan_egress_udp(
         ctx,
         link_h_len,
         tuples,
-        ethh,
         outbound,
         mark,
         must,
@@ -769,16 +816,37 @@ fn do_tproxy_wan_egress_udp(
 /// direct `__sk_buff` field access, skip non-localhost traffic, then dispatch
 /// to the TCP or UDP handler.
 #[inline(always)]
-fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
+fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32, lane: Lane) -> Option<Verdict> {
     let scratch_key: u32 = 0;
     let pkt = match unsafe { PKT_SCRATCH_KEY.get_ptr_mut(scratch_key) } {
         Some(ptr) => unsafe { &mut *ptr },
-        None => return Err(TC_ACT_SHOT),
+        None => return Some(Err(TC_ACT_SHOT)),
     };
 
     // Parse before reading __sk_buff fields: ctx.load() proves to the verifier
     // that raw_skb(ctx) is a valid non-null pointer.
     let ret = parse_packet(ctx, link_h_len, pkt);
+    let tcp = (ret == 0 || ret == PARSE_FRAGMENT as c_long) && pkt.l4proto == IPPROTO_TCP;
+    let mine = match lane {
+        Lane::All => true,
+        Lane::Tcp => tcp,
+        Lane::Other => !tcp,
+    };
+    if !mine {
+        // Untouched and unrecorded: the chained lane classifier owns it.
+        return None;
+    }
+    Some(wan_egress_parsed(ctx, link_h_len, pkt, ret, lane))
+}
+
+#[inline(always)]
+fn wan_egress_parsed(
+    ctx: &TcContext,
+    link_h_len: u32,
+    pkt: &mut crate::transport::ParsedPacket,
+    ret: c_long,
+    lane: Lane,
+) -> Verdict {
     if ret != 0 {
         if ret == PARSE_FRAGMENT as c_long && crate::fragment::condemned(pkt) {
             return Err(TC_ACT_SHOT);
@@ -849,9 +917,12 @@ fn do_tproxy_wan_egress(ctx: &TcContext, link_h_len: u32) -> Verdict {
         pkt.incarnation = tcp_publisher.incarnation;
     }
 
-    match pkt.l4proto {
-        IPPROTO_TCP => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
-        IPPROTO_UDP => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
+    // Dispatch on the constant lane: the verifier does not track the parsed
+    // protocol in map memory, so only this prunes the other handler.
+    match (lane, pkt.l4proto) {
+        (Lane::Tcp, _) => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
+        (Lane::All, IPPROTO_TCP) => do_tproxy_wan_egress_tcp(ctx, link_h_len, pkt, &tcp_publisher),
+        (Lane::All | Lane::Other, IPPROTO_UDP) => do_tproxy_wan_egress_udp(ctx, link_h_len, pkt),
         _ => Ok(TC_ACT_UNSPEC),
     }
 }
@@ -874,10 +945,29 @@ pub fn lan_egress_l3(ctx: *mut __sk_buff) -> i32 {
     ))
 }
 
+/// Which packets one WAN egress classifier handles. Kernels before 6.6 bind
+/// the TCP and the other lane as two chained clsact filters, each its own
+/// program within the verifier's instruction limit; a packet the TCP lane
+/// leaves continues to the other lane through `TC_ACT_UNSPEC`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Lane {
+    All,
+    Tcp,
+    Other,
+}
+
+#[inline(always)]
+fn wan_egress(ctx: &TcContext, link_h_len: u32, lane: Lane) -> i32 {
+    match do_tproxy_wan_egress(ctx, link_h_len, lane) {
+        Some(verdict) => crate::fragment::record(flatten(verdict)),
+        None => TC_ACT_UNSPEC as i32,
+    }
+}
+
 #[unsafe(no_mangle)]
 #[unsafe(link_section = "classifier")]
 pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
-    crate::fragment::record(flatten(do_tproxy_wan_egress(&tc_context(ctx), 14)))
+    wan_egress(&tc_context(ctx), 14, Lane::All)
 }
 
 #[unsafe(no_mangle)]
@@ -885,5 +975,49 @@ pub fn wan_egress_l2(ctx: *mut __sk_buff) -> i32 {
 pub fn wan_egress_l3(ctx: *mut __sk_buff) -> i32 {
     let ctx = tc_context(ctx);
     let link_h_len = crate::transport::l3_link_h_len(&ctx);
-    crate::fragment::record(flatten(do_tproxy_wan_egress(&ctx, link_h_len)))
+    wan_egress(&ctx, link_h_len, Lane::All)
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn wan_egress_tcp_l2(ctx: *mut __sk_buff) -> i32 {
+    wan_egress(&tc_context(ctx), 14, Lane::Tcp)
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn wan_egress_tcp_l3(ctx: *mut __sk_buff) -> i32 {
+    let ctx = tc_context(ctx);
+    let link_h_len = crate::transport::l3_link_h_len(&ctx);
+    wan_egress(&ctx, link_h_len, Lane::Tcp)
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn wan_egress_other_l2(ctx: *mut __sk_buff) -> i32 {
+    wan_egress(&tc_context(ctx), 14, Lane::Other)
+}
+
+// The other lane of an L3 link split once more by its two possible link-header
+// lengths: a constant length keeps packet offsets exact, which the 5.15
+// verifier needs to stay within its instruction limit.
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn wan_egress_other_l3_eth(ctx: *mut __sk_buff) -> i32 {
+    let ctx = tc_context(ctx);
+    if crate::transport::l3_link_h_len(&ctx) != ETH_HLEN {
+        return TC_ACT_UNSPEC as i32;
+    }
+    wan_egress(&ctx, ETH_HLEN, Lane::Other)
+}
+
+#[unsafe(no_mangle)]
+#[unsafe(link_section = "classifier")]
+pub fn wan_egress_other_l3_bare(ctx: *mut __sk_buff) -> i32 {
+    let ctx = tc_context(ctx);
+    if crate::transport::l3_link_h_len(&ctx) != 0 {
+        return TC_ACT_UNSPEC as i32;
+    }
+    wan_egress(&ctx, 0, Lane::Other)
 }

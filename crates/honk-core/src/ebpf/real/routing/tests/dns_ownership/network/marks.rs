@@ -29,14 +29,18 @@ fn attach_wan(backend: &mut RealEbpfBackend, interface: &str) {
     load_classifier(backend, "wan_egress_l2");
     let interface = std::ffi::CString::new(interface).unwrap();
     aya::programs::tc::qdisc_add_clsact(&interface).unwrap();
-    let program: &mut SchedClassifier = backend
-        .bpf_mut()
-        .unwrap()
-        .program_mut("wan_egress_l2")
-        .unwrap()
-        .try_into()
-        .unwrap();
-    program.attach(&interface, TcAttachType::Egress).unwrap();
+    // A filter added without a priority runs before the existing ones, so
+    // lanes go in last to first.
+    for lane in lanes("wan_egress_l2").into_iter().rev() {
+        let program: &mut SchedClassifier = backend
+            .bpf_mut()
+            .unwrap()
+            .program_mut(lane)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        program.attach(&interface, TcAttachType::Egress).unwrap();
+    }
 }
 
 // The main table blackholes these destinations. Only the rule-mark table

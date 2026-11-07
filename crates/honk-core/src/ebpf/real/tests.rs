@@ -364,14 +364,16 @@ async fn bare_load_holds_no_tracing_links() {
     );
     let (_dae0, mut backend) = load_bare(&pin_root).await;
     for program in crate::ebpf::interface::TcProgram::ALL {
-        let info = backend
-            .bpf()
-            .unwrap()
-            .program(program.name())
-            .unwrap()
-            .info()
-            .unwrap_or_else(|error| panic!("{} was not preloaded: {error}", program.name()));
-        assert_ne!(info.id(), 0);
+        for name in super::bindings::loaded_names(program) {
+            let info = backend
+                .bpf()
+                .unwrap()
+                .program(name)
+                .unwrap()
+                .info()
+                .unwrap_or_else(|error| panic!("{name} was not preloaded: {error}"));
+            assert_ne!(info.id(), 0);
+        }
     }
     assert_eq!(
         backend.owned_bindings().count(),

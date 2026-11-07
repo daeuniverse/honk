@@ -44,8 +44,14 @@ fn attach_type(direction: Direction) -> u32 {
     kind as u32
 }
 
-/// Link IDs on a chain of the calling thread's namespace, in kernel order.
+/// Link IDs on a chain of the calling thread's namespace, in kernel order;
+/// without TCX, the handles of honk's clsact filters.
 fn chain(ifindex: u32, direction: Direction) -> Vec<u32> {
+    if !owner::tcx_supported() {
+        return owner::filter_chain(ifindex, direction)
+            .unwrap_or_else(|error| panic!("list filters of {ifindex} {direction:?}: {error}"))
+            .links;
+    }
     owner::query_chain(ifindex, direction)
         .unwrap_or_else(|error| panic!("query chain of {ifindex} {direction:?}: {error}"))
         .links
@@ -260,7 +266,7 @@ fn program_ids(backend: &RealEbpfBackend) -> BTreeMap<TcProgram, u32> {
             let id = backend
                 .bpf()
                 .unwrap()
-                .program(program.name())
+                .program(owner::loaded_names(*program)[0])
                 .unwrap()
                 .info()
                 .unwrap()

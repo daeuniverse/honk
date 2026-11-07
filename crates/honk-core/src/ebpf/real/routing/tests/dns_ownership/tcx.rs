@@ -16,7 +16,10 @@ fn untouched_passes_return_next_before_backend_admission() {
             "wan_egress_l2",
             "wan_egress_l3",
             "dae0_ingress",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(lanes)
+        {
             let program: &mut SchedClassifier = bpf.program_mut(name).unwrap().try_into().unwrap();
             program.load().unwrap();
             let result = program

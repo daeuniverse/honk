@@ -56,15 +56,42 @@ impl TcProgram {
     ];
 
     pub fn name(self) -> &'static str {
+        Self::NAMES[self as usize]
+    }
+
+    const NAMES: [&'static str; 8] = [
+        "lan_ingress_l2",
+        "lan_ingress_l3",
+        "lan_egress_l2",
+        "lan_egress_l3",
+        "wan_ingress_l2",
+        "wan_ingress_l3",
+        "wan_egress_l2",
+        "wan_egress_l3",
+    ];
+
+    /// The one classifier a TCX binding attaches.
+    pub fn tcx_program(self) -> &'static [&'static str] {
+        std::slice::from_ref(&Self::NAMES[self as usize])
+    }
+
+    /// Classifiers a clsact binding chains, in order, on kernels without TCX.
+    /// WAN egress runs as lanes, each its own program within the Linux 5.15
+    /// verifier's limit; a packet a lane leaves continues to the next one.
+    pub fn clsact_lanes(self) -> &'static [&'static str] {
         match self {
-            Self::LanIngressL2 => "lan_ingress_l2",
-            Self::LanIngressL3 => "lan_ingress_l3",
-            Self::LanEgressL2 => "lan_egress_l2",
-            Self::LanEgressL3 => "lan_egress_l3",
-            Self::WanIngressL2 => "wan_ingress_l2",
-            Self::WanIngressL3 => "wan_ingress_l3",
-            Self::WanEgressL2 => "wan_egress_l2",
-            Self::WanEgressL3 => "wan_egress_l3",
+            Self::LanIngressL2 => &["lan_ingress_l2"],
+            Self::LanIngressL3 => &["lan_ingress_l3"],
+            Self::LanEgressL2 => &["lan_egress_l2"],
+            Self::LanEgressL3 => &["lan_egress_l3"],
+            Self::WanIngressL2 => &["wan_ingress_l2"],
+            Self::WanIngressL3 => &["wan_ingress_l3"],
+            Self::WanEgressL2 => &["wan_egress_tcp_l2", "wan_egress_other_l2"],
+            Self::WanEgressL3 => &[
+                "wan_egress_tcp_l3",
+                "wan_egress_other_l3_eth",
+                "wan_egress_other_l3_bare",
+            ],
         }
     }
 
@@ -231,7 +258,8 @@ impl Hook {
 /// What the owner holds; moved into the apply step.
 #[derive(Debug, Default)]
 pub struct BindingSnapshot {
-    pub(crate) programs: Vec<(TcProgram, OwnedFd)>,
+    /// The program, or with clsact its lanes in order.
+    pub(crate) programs: Vec<(TcProgram, Vec<OwnedFd>)>,
     /// `(binding, link id or filter handle, hook copy)`.
     pub(crate) owned: Vec<(Binding, u32, Hook)>,
 }

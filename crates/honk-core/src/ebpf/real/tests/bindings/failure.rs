@@ -39,8 +39,9 @@ fn rejected_update_keeps_old_link_and_commits_the_healthy_direction() {
             .find(|(program, _)| *program == WanIngressL2)
             .unwrap()
             .1
-            .try_clone()
-            .unwrap();
+            .iter()
+            .map(|fd| fd.try_clone().unwrap())
+            .collect();
         snapshot
             .programs
             .iter_mut()

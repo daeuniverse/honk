@@ -255,57 +255,83 @@ fn handoff(backend: &RealEbpfBackend, key: &TuplesKey) -> RoutingHandoffEntry {
     backend.routing_handoff_lookup(key).unwrap().unwrap()
 }
 
+/// The programs `name` runs as: itself, or its lane filters on kernels
+/// without TCX.
+fn lanes(name: &str) -> Vec<&str> {
+    crate::ebpf::interface::TcProgram::ALL
+        .into_iter()
+        .find(|program| program.name() == name)
+        .map_or(vec![name], |program| {
+            crate::ebpf::real::bindings::loaded_names(program).to_vec()
+        })
+}
+
 fn load_classifier(backend: &mut RealEbpfBackend, name: &str) {
-    let program: &mut SchedClassifier = backend
-        .bpf_mut()
-        .unwrap()
-        .program_mut(name)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    match program.load() {
-        Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-        Err(error) => panic!("load {name}: {error}"),
+    for lane in lanes(name) {
+        let program: &mut SchedClassifier = backend
+            .bpf_mut()
+            .unwrap()
+            .program_mut(lane)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        match program.load() {
+            Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+            Err(error) => panic!("load {lane}: {error}"),
+        }
     }
 }
 
+/// Runs `name`, or on kernels without TCX the lane filters it is installed
+/// as, in chain order: each lane sees the previous lane's packet and context,
+/// and the first verdict other than `TC_ACT_UNSPEC` ends the chain.
 fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) -> Run {
-    let program: &SchedClassifier = backend
-        .bpf()
-        .unwrap()
-        .program(name)
-        .unwrap()
-        .try_into()
-        .unwrap();
     let mut context: __sk_buff = unsafe { mem::zeroed() };
     context.mark = input.mark;
     context.ingress_ifindex = input.ingress_ifindex;
     context.ifindex = if input.ifindex == 0 { 1 } else { input.ifindex };
     context.cb = input.cb;
-    let context = unsafe {
-        std::slice::from_raw_parts(
-            (&context as *const __sk_buff).cast::<u8>(),
-            mem::size_of::<__sk_buff>(),
-        )
-    };
-    let mut output = vec![0; packet.len() + 64];
-    let mut context_out = vec![0; mem::size_of::<__sk_buff>()];
-    let result = program
-        .test_run(TestRunOptions {
-            data_in: Some(packet),
-            data_out: Some(&mut output),
-            ctx_in: Some(context),
-            ctx_out: Some(&mut context_out),
-            repeat: 1,
-            ..Default::default()
-        })
-        .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error:?}"));
-    let returned: __sk_buff = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
+    let mut data = packet.to_vec();
+    let mut verdict = 0;
+    let mut output = Vec::new();
+    for lane in lanes(name) {
+        let program: &SchedClassifier = backend
+            .bpf()
+            .unwrap()
+            .program(lane)
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let context_in = unsafe {
+            std::slice::from_raw_parts(
+                (&context as *const __sk_buff).cast::<u8>(),
+                mem::size_of::<__sk_buff>(),
+            )
+        };
+        output = vec![0; data.len() + 64];
+        let mut context_out = vec![0; mem::size_of::<__sk_buff>()];
+        let result = program
+            .test_run(TestRunOptions {
+                data_in: Some(&data),
+                data_out: Some(&mut output),
+                ctx_in: Some(context_in),
+                ctx_out: Some(&mut context_out),
+                repeat: 1,
+                ..Default::default()
+            })
+            .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {lane}: {error:?}"));
+        context = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
+        verdict = result.return_value;
+        if verdict != TC_ACT_UNSPEC {
+            break;
+        }
+        data = output[..result.data_size_out as usize].to_vec();
+    }
     Run {
-        verdict: result.return_value,
-        mark: returned.mark,
-        cb: returned.cb,
-        priority: returned.priority,
+        verdict,
+        mark: context.mark,
+        cb: context.cb,
+        priority: context.priority,
         data: output,
     }
 }

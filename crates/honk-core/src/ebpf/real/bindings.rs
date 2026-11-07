@@ -43,9 +43,12 @@ const CHAIN_CAPACITY: usize = 64;
 
 type Key = (NonZeroU32, Direction);
 
-/// clsact priority of every honk filter: the highest, so it runs last, as
-/// a TCX link appended with `BPF_F_AFTER` does.
-pub(crate) const FILTER_PRIORITY: u16 = 0xfffe;
+/// clsact priority of a honk binding's first lane; lane `i` sits at
+/// `FILTER_PRIORITY + i`. The top of the range, so honk runs last, as a TCX
+/// link appended with `BPF_F_AFTER` does.
+pub(crate) const FILTER_PRIORITY: u16 = 0xfffc;
+/// Every lane priority honk owns.
+const FILTER_PRIORITIES: std::ops::Range<u16> = FILTER_PRIORITY..FILTER_PRIORITY + 3;
 
 /// TCX arrived in Linux 6.6. Tests can force the clsact path on any kernel
 /// with `HONK_TEST_CLSACT=1`.
@@ -74,16 +77,22 @@ fn next_filter_handle() -> u32 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A clsact filter honk installed. The netlink socket is bound to the
-/// namespace the filter lives in, whichever thread drops it.
+/// The clsact filters of one honk binding: one per lane, all with one handle.
+/// The netlink socket is bound to the namespace the filters live in,
+/// whichever thread drops them.
 pub struct TcFilter {
     ifindex: u32,
     direction: Direction,
     handle: u32,
-    socket: parking_lot::Mutex<NlSock>,
+    state: parking_lot::Mutex<FilterState>,
     /// IDs of every honk TC program: only a filter still running one of them
     /// is deleted, so a recycled ifindex keeps its own filters.
     programs: std::sync::Arc<[u32]>,
+}
+
+struct FilterState {
+    socket: NlSock,
+    lanes: u16,
 }
 
 impl std::fmt::Debug for TcFilter {
@@ -101,40 +110,95 @@ impl TcFilter {
         self.handle
     }
 
-    /// The program this filter runs, if it is still on its device.
+    /// The program the first lane runs, if it is still on its device.
     pub(crate) fn program_id(&self) -> io::Result<Option<u32>> {
-        Ok(self
+        Ok(self.lane_programs()?.first().copied().flatten())
+    }
+
+    /// The program each lane runs, in order; `None` for a lane that is gone.
+    pub(crate) fn lane_programs(&self) -> io::Result<Vec<Option<u32>>> {
+        let mut state = self.state.lock();
+        let lanes = state.lanes;
+        let entries = state
             .socket
-            .lock()
-            .dump_filters(self.ifindex, filter_parent(self.direction))?
-            .into_iter()
-            .find(|entry| entry.priority == FILTER_PRIORITY && entry.handle == self.handle)
-            .and_then(|entry| entry.program_id))
+            .dump_filters(self.ifindex, filter_parent(self.direction))?;
+        Ok((0..lanes)
+            .map(|lane| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.priority == FILTER_PRIORITY + lane && entry.handle == self.handle
+                    })
+                    .and_then(|entry| entry.program_id)
+            })
+            .collect())
+    }
+
+    fn set_lanes(&self, chain: &[OwnedFd], names: &[&str], exclusive: bool) -> io::Result<()> {
+        let mut state = self.state.lock();
+        let parent = filter_parent(self.direction);
+        for (lane, (program, name)) in chain.iter().zip(names).enumerate() {
+            state.socket.set_bpf_filter(
+                self.ifindex,
+                parent,
+                FILTER_PRIORITY + lane as u16,
+                self.handle,
+                program.as_raw_fd(),
+                name,
+                exclusive,
+            )?;
+            state.lanes = state.lanes.max(lane as u16 + 1);
+        }
+        let wanted = chain.len() as u16;
+        while state.lanes > wanted {
+            let lane = state.lanes - 1;
+            match state
+                .socket
+                .del_filter(self.ifindex, parent, FILTER_PRIORITY + lane, self.handle)
+            {
+                Err(error) if error.raw_os_error() != Some(libc::ENOENT) => return Err(error),
+                _ => state.lanes = lane,
+            }
+        }
+        Ok(())
     }
 }
 
 impl Drop for TcFilter {
     fn drop(&mut self) {
-        let owned = self
-            .program_id()
-            .ok()
-            .flatten()
-            .is_some_and(|id| self.programs.contains(&id));
-        if owned {
-            let _ = self.socket.get_mut().del_filter(
-                self.ifindex,
-                filter_parent(self.direction),
-                FILTER_PRIORITY,
-                self.handle,
-            );
+        let Ok(lanes) = self.lane_programs() else {
+            return;
+        };
+        let parent = filter_parent(self.direction);
+        let state = self.state.get_mut();
+        for (lane, program) in lanes.into_iter().enumerate() {
+            if program.is_some_and(|id| self.programs.contains(&id)) {
+                let _ = state.socket.del_filter(
+                    self.ifindex,
+                    parent,
+                    FILTER_PRIORITY + lane as u16,
+                    self.handle,
+                );
+            }
         }
     }
 }
 
 #[derive(Default)]
 pub(crate) struct InterfaceBindings {
-    programs: Vec<(TcProgram, OwnedFd)>,
+    /// TCX loads each program; clsact loads its lanes in order instead.
+    programs: Vec<(TcProgram, Vec<OwnedFd>)>,
     owned: Vec<(Binding, u32, Hook)>,
+}
+
+/// What one binding of `program` loads: the program itself with TCX, its
+/// lanes with clsact.
+pub(crate) fn loaded_names(program: TcProgram) -> &'static [&'static str] {
+    if tcx_supported() {
+        program.tcx_program()
+    } else {
+        program.clsact_lanes()
+    }
 }
 
 impl InterfaceBindings {
@@ -144,21 +208,25 @@ impl InterfaceBindings {
     pub(super) fn preload(bpf: &mut Ebpf) -> anyhow::Result<Self> {
         let mut programs = Vec::with_capacity(TcProgram::ALL.len());
         for program in TcProgram::ALL {
-            let name = program.name();
-            let classifier: &mut SchedClassifier = bpf
-                .program_mut(name)
-                .ok_or_else(|| anyhow::anyhow!("TC program '{name}' not found"))?
-                .try_into()?;
-            match classifier.load() {
-                Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
-                Err(error) => anyhow::bail!("load TC program '{name}': {error}"),
+            let mut fds = Vec::new();
+            for name in loaded_names(program) {
+                let classifier: &mut SchedClassifier = bpf
+                    .program_mut(name)
+                    .ok_or_else(|| anyhow::anyhow!("TC program '{name}' not found"))?
+                    .try_into()?;
+                match classifier.load() {
+                    Ok(()) | Err(ProgramError::AlreadyLoaded) => {}
+                    Err(error) => anyhow::bail!("load TC program '{name}': {error}"),
+                }
+                fds.push(
+                    classifier
+                        .fd()?
+                        .as_fd()
+                        .try_clone_to_owned()
+                        .with_context(|| format!("duplicate TC program '{name}' fd"))?,
+                );
             }
-            let fd = classifier
-                .fd()?
-                .as_fd()
-                .try_clone_to_owned()
-                .with_context(|| format!("duplicate TC program '{name}' fd"))?;
-            programs.push((program, fd));
+            programs.push((program, fds));
         }
         Ok(Self {
             programs,
@@ -171,7 +239,7 @@ impl InterfaceBindings {
     }
 
     #[cfg(test)]
-    pub(super) fn programs(&self) -> &[(TcProgram, OwnedFd)] {
+    pub(super) fn programs(&self) -> &[(TcProgram, Vec<OwnedFd>)] {
         &self.programs
     }
 
@@ -180,8 +248,12 @@ impl InterfaceBindings {
             programs: self
                 .programs
                 .iter()
-                .map(|(program, fd)| {
-                    Ok((*program, fd.try_clone().context("duplicate TC program fd")?))
+                .map(|(program, fds)| {
+                    let fds = fds
+                        .iter()
+                        .map(|fd| fd.try_clone().context("duplicate TC program fd"))
+                        .collect::<anyhow::Result<_>>()?;
+                    Ok((*program, fds))
                 })
                 .collect::<anyhow::Result<_>>()?,
             owned: self
@@ -388,16 +460,23 @@ pub(crate) fn apply(
     report
 }
 
-fn program_fd(programs: &[(TcProgram, OwnedFd)], program: TcProgram) -> anyhow::Result<&OwnedFd> {
+type Programs = [(TcProgram, Vec<OwnedFd>)];
+
+/// The loaded program, or with clsact its lanes.
+fn program_chain(programs: &Programs, program: TcProgram) -> anyhow::Result<&[OwnedFd]> {
     programs
         .iter()
-        .find(|(p, _)| *p == program)
-        .map(|(_, fd)| fd)
+        .find(|(p, fds)| *p == program && !fds.is_empty())
+        .map(|(_, fds)| fds.as_slice())
         .ok_or_else(|| anyhow::anyhow!("TC program {} is not preloaded", program.name()))
 }
 
+fn program_fd(programs: &Programs, program: TcProgram) -> anyhow::Result<&OwnedFd> {
+    Ok(&program_chain(programs, program)?[0])
+}
+
 fn create_into(
-    programs: &[(TcProgram, OwnedFd)],
+    programs: &Programs,
     binding: &Binding,
     created: &mut Vec<(Binding, u32, Hook)>,
     report: &mut ApplyReport,
@@ -431,7 +510,7 @@ fn device_gone(error: &anyhow::Error) -> bool {
 /// The held link is gone from this namespace's chain. Release that owner even
 /// if creating or confirming the replacement fails.
 fn replace_dead(
-    programs: &[(TcProgram, OwnedFd)],
+    programs: &Programs,
     binding: &Binding,
     created: &mut Vec<(Binding, u32, Hook)>,
     report: &mut ApplyReport,
@@ -441,8 +520,7 @@ fn replace_dead(
     }
 }
 
-fn create(programs: &[(TcProgram, OwnedFd)], binding: &Binding) -> anyhow::Result<(u32, Hook)> {
-    let program = program_fd(programs, binding.program)?;
+fn create(programs: &Programs, binding: &Binding) -> anyhow::Result<(u32, Hook)> {
     let context = || {
         format!(
             "attach {} to {} (ifindex {}, {:?})",
@@ -453,25 +531,24 @@ fn create(programs: &[(TcProgram, OwnedFd)], binding: &Binding) -> anyhow::Resul
         )
     };
     if !tcx_supported() {
-        let filter = create_filter(programs, program, binding).with_context(context)?;
+        let filter = create_filter(programs, binding).with_context(context)?;
         return Ok((filter.handle, Hook::Filter(std::sync::Arc::new(filter))));
     }
+    let program = program_fd(programs, binding.program)?;
     let fd =
         link_create(program, binding.ifindex.get(), binding.direction).with_context(context)?;
     let info = link_info(fd.as_raw_fd()).context("read the new TCX link")?;
     Ok((info.id, Hook::Link(fd)))
 }
 
-/// A filter at honk's priority that runs none of this process's programs was
-/// left by an instance that died without detaching: remove it first.
-fn create_filter(
-    programs: &[(TcProgram, OwnedFd)],
-    program: &OwnedFd,
-    binding: &Binding,
-) -> anyhow::Result<TcFilter> {
+/// A filter at honk's priorities that runs none of this process's programs
+/// was left by an instance that died without detaching: remove it first.
+fn create_filter(programs: &Programs, binding: &Binding) -> anyhow::Result<TcFilter> {
+    let chain = program_chain(programs, binding.program)?;
     let ids: std::sync::Arc<[u32]> = programs
         .iter()
-        .map(|(_, fd)| program_id(fd.as_raw_fd()))
+        .flat_map(|(_, fds)| fds)
+        .map(|fd| program_id(fd.as_raw_fd()))
         .collect::<io::Result<Vec<_>>>()
         .context("read TC program IDs")?
         .into();
@@ -482,49 +559,42 @@ fn create_filter(
         .dump_filters(ifindex, parent)
         .context("list filters")?
     {
-        if stale.priority == FILTER_PRIORITY
+        if FILTER_PRIORITIES.contains(&stale.priority)
             && !stale.program_id.is_some_and(|id| ids.contains(&id))
         {
             socket
-                .del_filter(ifindex, parent, FILTER_PRIORITY, stale.handle)
+                .del_filter(ifindex, parent, stale.priority, stale.handle)
                 .context("remove a stale honk filter")?;
         }
     }
-    let handle = next_filter_handle();
-    socket
-        .set_bpf_filter(
-            ifindex,
-            parent,
-            FILTER_PRIORITY,
-            handle,
-            program.as_raw_fd(),
-            binding.program.name(),
-            true,
-        )
-        .context("add clsact filter")?;
-    Ok(TcFilter {
+    let filter = TcFilter {
         ifindex,
         direction: binding.direction,
-        handle,
-        socket: parking_lot::Mutex::new(socket),
+        handle: next_filter_handle(),
+        state: parking_lot::Mutex::new(FilterState { socket, lanes: 0 }),
         programs: ids,
-    })
+    };
+    // A partial chain drops with `filter`, removing the lanes already added.
+    filter
+        .set_lanes(chain, binding.program.clsact_lanes(), true)
+        .context("add clsact filters")?;
+    Ok(filter)
 }
 
 fn update(
-    programs: &[(TcProgram, OwnedFd)],
+    programs: &Programs,
     links: &HashMap<Key, Hook>,
     to: &Binding,
     from: TcProgram,
 ) -> anyhow::Result<()> {
-    let new = program_fd(programs, to.program)?;
-    let old = program_fd(programs, from)?;
+    let new = program_chain(programs, to.program)?;
+    let old = program_chain(programs, from)?;
     let hook = links
         .get(&to.key())
         .ok_or_else(|| anyhow::anyhow!("owned link is missing from the snapshot"))?;
     let result = match hook {
-        Hook::Link(link) => link_update(link.as_raw_fd(), new.as_raw_fd(), old.as_raw_fd()),
-        Hook::Filter(filter) => filter_update(filter, new, old, to.program.name()),
+        Hook::Link(link) => link_update(link.as_raw_fd(), new[0].as_raw_fd(), old[0].as_raw_fd()),
+        Hook::Filter(filter) => filter_update(filter, new, old, to.program.clsact_lanes()),
     };
     result.with_context(|| {
         format!(
@@ -538,22 +608,20 @@ fn update(
     })
 }
 
-/// clsact has no compare-and-swap: the expected program is checked first,
-/// then the filter is changed in place, which never leaves a gap.
-fn filter_update(filter: &TcFilter, new: &OwnedFd, old: &OwnedFd, name: &str) -> io::Result<()> {
-    let expected = program_id(old.as_raw_fd())?;
+/// clsact has no compare-and-swap: the expected first lane is checked, then
+/// each lane is changed in place, which never leaves a lane gap, and lanes the
+/// new program does not have are removed last.
+fn filter_update(
+    filter: &TcFilter,
+    new: &[OwnedFd],
+    old: &[OwnedFd],
+    names: &[&str],
+) -> io::Result<()> {
+    let expected = program_id(old[0].as_raw_fd())?;
     if filter.program_id()? != Some(expected) {
         return Err(io::Error::from_raw_os_error(libc::EPERM));
     }
-    filter.socket.lock().set_bpf_filter(
-        filter.ifindex,
-        filter_parent(filter.direction),
-        FILTER_PRIORITY,
-        filter.handle,
-        new.as_raw_fd(),
-        name,
-        false,
-    )
+    filter.set_lanes(new, names, false)
 }
 
 /// `BPF_OBJ_GET_INFO_BY_FD` on a program.
