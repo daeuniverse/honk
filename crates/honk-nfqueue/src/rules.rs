@@ -74,7 +74,7 @@ impl NftRuleset {
         ruleset.remove_owned_table()?;
         let sequence = ruleset.next_sequence();
         let request = build_install_batch(sequence);
-        netlink::send_and_acks(ruleset.socket.as_raw_fd(), &request, sequence, 4)?;
+        netlink::send_batch_and_acks(ruleset.socket.as_raw_fd(), &request, sequence, 3)?;
         ruleset.installed = true;
         Ok(ruleset)
     }
@@ -93,7 +93,7 @@ impl NftRuleset {
     fn remove_owned_table(&mut self) -> Result<(), RulesError> {
         let sequence = self.next_sequence();
         let request = build_delete_batch(sequence);
-        match netlink::send_and_acks(self.socket.as_raw_fd(), &request, sequence, 2) {
+        match netlink::send_batch_and_acks(self.socket.as_raw_fd(), &request, sequence, 1) {
             Ok(()) => Ok(()),
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(()),
             Err(error) => Err(error.into()),

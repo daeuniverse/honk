@@ -268,13 +268,17 @@ pub(crate) fn send(fd: RawFd, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub(crate) fn recv_datagram(fd: RawFd, capacity: usize) -> io::Result<Bytes> {
+    recv_datagram_with(fd, capacity, 0)
+}
+
+fn recv_datagram_with(fd: RawFd, capacity: usize, flags: libc::c_int) -> io::Result<Bytes> {
     let mut buffer = BytesMut::zeroed(capacity);
     let received = unsafe {
         libc::recv(
             fd,
             buffer.as_mut_ptr().cast::<libc::c_void>(),
             buffer.len(),
-            0,
+            flags,
         )
     };
     if received < 0 {
@@ -293,29 +297,63 @@ pub(crate) fn send_and_acks(
     debug_assert_ne!(expected, 0);
     send(fd, request)?;
     let mut received = 0usize;
+    while received < expected {
+        received += acknowledgements(recv_datagram(fd, 64 * 1024)?, sequence)?;
+    }
+    Ok(())
+}
+
+/// Sends one nfnetlink batch whose `inner` messages each request an
+/// acknowledgement. Only Linux 6.10 and later also acknowledge the batch END,
+/// with the commit result; earlier kernels report a failed commit as an error
+/// on the batch sequence instead. The kernel handles the batch inside `send`,
+/// so whatever follows the inner acknowledgements is already queued and is
+/// drained without blocking.
+pub(crate) fn send_batch_and_acks(
+    fd: RawFd,
+    request: &[u8],
+    sequence: u32,
+    inner: usize,
+) -> io::Result<()> {
+    debug_assert_ne!(inner, 0);
+    send(fd, request)?;
+    let mut received = 0usize;
     loop {
-        let datagram = recv_datagram(fd, 64 * 1024)?;
-        for message in messages(datagram) {
-            let message = message.map_err(invalid_data)?;
-            if message.message_type != NLMSG_ERROR || message.sequence != sequence {
-                continue;
-            }
-            if message.body.len() < 4 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "truncated NLMSG_ERROR",
-                ));
-            }
-            let code = i32::from_ne_bytes(message.body[..4].try_into().expect("four bytes"));
-            if code != 0 {
-                return Err(io::Error::from_raw_os_error(-code));
-            }
-            received += 1;
-            if received == expected {
-                return Ok(());
-            }
+        let flags = if received < inner {
+            0
+        } else {
+            libc::MSG_DONTWAIT
+        };
+        match recv_datagram_with(fd, 64 * 1024, flags) {
+            Ok(datagram) => received += acknowledgements(datagram, sequence)?,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => return Err(error),
         }
     }
+}
+
+/// Successful acknowledgements of `sequence` in one datagram; the first
+/// error among them fails.
+fn acknowledgements(datagram: Bytes, sequence: u32) -> io::Result<usize> {
+    let mut received = 0;
+    for message in messages(datagram) {
+        let message = message.map_err(invalid_data)?;
+        if message.message_type != NLMSG_ERROR || message.sequence != sequence {
+            continue;
+        }
+        if message.body.len() < 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated NLMSG_ERROR",
+            ));
+        }
+        let code = i32::from_ne_bytes(message.body[..4].try_into().expect("four bytes"));
+        if code != 0 {
+            return Err(io::Error::from_raw_os_error(-code));
+        }
+        received += 1;
+    }
+    Ok(received)
 }
 
 pub(crate) fn send_and_ack(fd: RawFd, request: &[u8], sequence: u32) -> io::Result<()> {

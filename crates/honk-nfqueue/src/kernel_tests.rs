@@ -301,7 +301,10 @@ fn exercise_datagram(
     client.send(payload).expect("send marked UDP datagram");
     let event = receive_event_or_fatal(events, fatal);
     assert_eq!(event.mark, INPUT_MARK, "NFQA_MARK is an exact carrier");
-    assert_eq!(event.priority, (priority != 0).then_some(priority));
+    assert_eq!(
+        event.priority,
+        (priority != 0 && reports_priority()).then_some(priority)
+    );
     assert_eq!(event.payload.as_ref(), payload);
     assert_eq!(event.tuple.destination, receiver.local_addr().unwrap());
     assert_eq!(event.decision, expected_decision);
@@ -329,6 +332,17 @@ fn exercise_datagram(
     } else {
         assert_no_delivery(receiver, Duration::from_millis(250));
     }
+}
+
+/// `NFQA_PRIORITY` arrived in Linux 5.18; earlier kernels omit it.
+fn reports_priority() -> bool {
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut name) }, 0, "uname");
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }.to_string_lossy();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (5, 18)
 }
 
 fn receive_event_or_fatal(
