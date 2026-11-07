@@ -1687,7 +1687,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-04"
-source = { file = "doc/en/reference/dns.md", fence = 4 }
+source = { file = "doc/en/reference/dns.md", fence = 5 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -1698,7 +1698,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-05"
-source = { file = "doc/en/reference/dns.md", fence = 5 }
+source = { file = "doc/en/reference/dns.md", fence = 6 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1707,6 +1707,18 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{use_host:trueipversion_prefer:4upstream{default:'udp://223.5.5.5:53'cloudflare_dot:'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'google_doh:'https://dns.google/dns-query'->'"
+
+[[case]]
+id = "honk-doc-en-reference-dns-06"
+source = { file = "doc/en/reference/dns.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{alidns:'udp://223.5.5.5:53'providerdoh:'https://doh.provider.example/dns-query'->'"
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
@@ -2016,7 +2028,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-04"
-source = { file = "doc/zh/reference/dns.md", fence = 4 }
+source = { file = "doc/zh/reference/dns.md", fence = 5 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -2027,7 +2039,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-05"
-source = { file = "doc/zh/reference/dns.md", fence = 5 }
+source = { file = "doc/zh/reference/dns.md", fence = 6 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2036,6 +2048,18 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{use_host:trueipversion_prefer:4upstream{default:'udp://223.5.5.5:53'cloudflare_dot:'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'google_doh:'https://dns.google/dns-query'->'"
+
+[[case]]
+id = "honk-doc-zh-reference-dns-06"
+source = { file = "doc/zh/reference/dns.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{alidns:'udp://223.5.5.5:53'providerdoh:'https://doh.provider.example/dns-query'->'"
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
