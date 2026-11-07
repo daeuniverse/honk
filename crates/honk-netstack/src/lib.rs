@@ -33,8 +33,9 @@
 //! install reverse delivery facts before protocol state mutation; false refuses the packet.
 //! This receipt is not handshake or kernel accepted-child proof. Ordinary receive APIs use a
 //! reporting-disabled specialization and retain their behavior without reporting allocation.
-//! [`Stack::receive_with_tcp_admission`] additionally returns only the passive [`FlowId`]
-//! created by that receive, so an embedding can bind admitted policy before any accept dequeue.
+//! [`Stack::receive_with_tcp_admission`] returns [`ReceiveReport`]: source validity and actual
+//! protocol acceptance, including the exact new passive [`FlowId`] for captured policy binding.
+//! Neither a new SYN nor protocol acceptance proves a successful outbound admission.
 //! [`Stack::retains_tcp`] classifies existing scoped transport ownership through pending
 //! opens, TIME_WAIT and flow-owned controls; adapters must additionally retain their own
 //! queued/exported output leases. It neither validates input nor mutates protocol state.
@@ -180,8 +181,8 @@ pub use icmp_out::IcmpLimits;
 pub use mode::{ExcludeSet, Mode};
 pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, Transmit, TxCaps, TxCsum};
 pub use stack::{
-    BindError, Config, ConnectError, ConstructionError, DropReason, FlowId, Ready, Rx, Stack,
-    StackStats, StreamError, UdpError, ValidatedSource,
+    BindError, Config, ConnectError, ConstructionError, DropReason, FlowId, Ready, ReceiveOutcome,
+    ReceiveReport, Rx, Stack, StackStats, StreamError, UdpError, ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

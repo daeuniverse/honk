@@ -18,6 +18,7 @@ struct Wire {
     hold_data: bool,
     held: Option<OutputLease>,
     budget: Arc<MemoryBudget>,
+    qualified_rx: usize,
 }
 
 impl Wire {
@@ -66,6 +67,7 @@ impl Wire {
             hold_data: false,
             held: None,
             budget,
+            qualified_rx: 0,
         };
         wire.pump();
         let (syn, flow) = wire.scope.poll_accept().expect("real peer SYN admitted");
@@ -75,6 +77,10 @@ impl Wire {
         assert_ne!(flow.scope(), honk_datapath::ScopeId::HOST);
         wire.pump();
         assert_eq!(wire.client.tcp_state(id), Some(TcpState::Established));
+        assert_eq!(
+            wire.qualified_rx, 0,
+            "handshake alone has no winning outbound"
+        );
         Ok((wire, flow))
     }
 
@@ -88,7 +94,10 @@ impl Wire {
                 let Some(length) = self.client.poll_transmit(self.now, &mut packet) else {
                     break;
                 };
-                let _ = self.scope.receive(&packet[..length], self.now);
+                let (_, received) =
+                    self.scope
+                        .receive_with_source(&packet[..length], self.now, false, |_, _| true);
+                self.qualified_rx += usize::from(received.qualified_rx);
             }
             self.scope.drive(self.now);
             for _ in 0..64 {
@@ -215,6 +224,10 @@ async fn packet_tcp_routes_real_loopback_and_keeps_close_until_output_release() 
             server.write_all(b"loopback response").await?;
             wire.until(|wire| wire.received.len() == 17).await?;
             assert_eq!(wire.received, b"loopback response");
+            assert!(
+                wire.qualified_rx > 0,
+                "later accepted input observes the real successful winner"
+            );
             assert!(wire.held.is_some());
             let connections = handle.connection_tracker.snapshot();
             assert_eq!(connections.len(), 1);
@@ -359,6 +372,7 @@ async fn packet_tcp_sniffing_preserves_domain_plus_and_initial_must() -> anyhow:
                     .await
                     .with_context(|| format!("{mode}: blocked task completion"))?;
                 serving.await??;
+                assert_eq!(wire.qualified_rx, 0, "sniffed Block never marks the flow");
                 assert!(
                     tokio::time::timeout(Duration::from_millis(20), listener.accept())
                         .await
@@ -472,6 +486,7 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
                     wire.until(|_| serving.is_finished()).await?;
                     serving.await??;
                     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+                    assert_eq!(wire.qualified_rx, 0);
                 }
                 "controller" => {
                     wire.until(|wire| wire.received.len() == framed.len())
@@ -488,6 +503,10 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
                     wire.until(|wire| wire.eof).await?;
                     assert_eq!(wire.received.len(), framed.len() * 2);
                     assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+                    assert_eq!(
+                        wire.qualified_rx, 0,
+                        "per-query DNS authority never marks the stream"
+                    );
                     wire.client.tcp_shutdown(wire.id).unwrap();
                     wire.settle(&serving).await?;
                     serving.await??;

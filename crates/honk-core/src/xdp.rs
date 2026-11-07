@@ -1,6 +1,11 @@
 //! One Linux capture owner for every selected RX queue and one routing domain.
 //! Pinned links remain fail-closed after shutdown; UMEM is retained until process exit.
 
+pub(crate) mod polling;
+use crate::control::poll_budget::BusyInterval;
+use polling::runtime::polling_segment_stop;
+use polling::{AdaptivePoll, ContextDigest};
+
 use crate::control::{
     ControlPlane,
     core_forward::{
@@ -8,7 +13,7 @@ use crate::control::{
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{OutputLease, OutputOwner, PacketDriver, PacketScope, RuntimeLimits},
-    packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints},
+    packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
 use crate::netlink::fib::{Fib, LogicalLink};
 use anyhow::{Context as _, ensure};
@@ -30,7 +35,9 @@ use honk_netstack::{
 };
 use honk_xsk::{
     BindMode, DecodedPacket, FRAME_SIZE, GeneralCapture, PersistentAttachment, Port, PortConfig,
-    Programs, device::DeviceInfo, topology::Topology,
+    PortCounters, Programs, RingSnapshot,
+    device::{DeviceInfo, FeatureQuery},
+    topology::Topology,
 };
 use std::{
     collections::VecDeque,
@@ -54,6 +61,24 @@ const PEERS: usize = 4096;
 const PEER_CONFLICT_HOLD: Duration = Duration::from_secs(60);
 const BATCH: usize = 32;
 const MEMORY: usize = 256 << 20;
+
+fn qualify_packet(count: &mut u64, unavailable: &mut bool) {
+    match count.checked_add(1) {
+        Some(value) => *count = value,
+        None => *unavailable = true,
+    }
+}
+
+fn qualify_receive(
+    result: io::Result<PacketReceive>,
+    count: &mut u64,
+    unavailable: &mut bool,
+) -> io::Result<()> {
+    if result?.qualified_rx {
+        qualify_packet(count, unavailable);
+    }
+    Ok(())
+}
 
 pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     let Some(datapath) = config
@@ -144,6 +169,8 @@ fn release_completed(completed: &mut [Option<&mut Retained>]) {
 struct Queue {
     id: u32,
     io: AsyncFd<Port<Retained>>,
+    observed: PortCounters,
+    observed_rings: RingSnapshot,
 }
 struct Device {
     info: DeviceInfo,
@@ -153,6 +180,9 @@ struct Device {
     queues: Vec<Queue>,
     active: bool,
     metadata_checked: Instant,
+    features: Option<FeatureQuery>,
+    port_config: PortConfig,
+    role: honk_config::datapath::InterfaceRole,
 }
 struct Waiting {
     packet: Packet,
@@ -420,6 +450,20 @@ struct Runtime {
     closing: bool,
     pressure: Pressure,
     core_maintenance_checked: Instant,
+    polling: AdaptivePoll,
+    polling_prefix: Result<ContextDigest, &'static str>,
+    polling_budget: Arc<MemoryBudget>,
+    polling_affinity: Option<[u8; libc::CPU_SETSIZE as usize / 8]>,
+    qualified_rx: u64,
+    qualification_unavailable: bool,
+    rx_device: usize,
+    rx_queue: usize,
+    tx_realm: usize,
+    tx_class: usize,
+    round_cut_short: bool,
+    policy_recheck: bool,
+    context_recheck: bool,
+    context_revision: u64,
     _memory: MemoryReservation,
 }
 
@@ -427,6 +471,9 @@ impl Runtime {
     fn close_capture(&mut self) -> anyhow::Result<()> {
         self.admission.store(false, Ordering::Release);
         self.closing = true;
+        self.policy_recheck = false;
+        self.context_recheck = false;
+        self.polling.leave("closing");
         let mut failure = None;
         for device in &mut self.devices {
             if device.active {
@@ -452,7 +499,17 @@ impl Runtime {
         failure.map_or(Ok(()), |error| Err(error.into()))
     }
 
-    fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+    fn poll_io(
+        &mut self,
+        cx: &mut Context<'_>,
+        interval: Option<&BusyInterval>,
+        shutdown: &crate::control::ShutdownIntent,
+        reading: bool,
+    ) -> Poll<anyhow::Result<()>> {
+        if polling_segment_stop(&self.polling, interval, shutdown, None).is_some() {
+            self.round_cut_short = true;
+            return Poll::Pending;
+        }
         if !self.closing {
             if !self.admission.load(Ordering::Acquire) {
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
@@ -468,7 +525,17 @@ impl Runtime {
         }
         let now = Instant::now();
         let mut progress = 0;
-        for device_index in 0..self.devices.len() {
+        self.round_cut_short = false;
+        let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
+        for realm in &mut self.realms {
+            if realm.generated.is_some() {
+                realm.driver.begin_turn(now);
+            }
+        }
+        let mut finalized = [false; 64];
+        let start_device = self.rx_device.min(self.devices.len().saturating_sub(1));
+        'receive: for device_offset in 0..self.devices.len() {
+            let device_index = (start_device + device_offset) % self.devices.len();
             let (before, remaining) = self.devices.split_at_mut(device_index);
             let (device, after) = remaining.split_first_mut().unwrap();
             if !self.closing
@@ -480,7 +547,25 @@ impl Runtime {
             {
                 return Poll::Ready(Err(error));
             }
-            for queue in &mut device.queues {
+            let queue_count = device.queues.len();
+            let start_queue = if device_index == start_device {
+                self.rx_queue.min(queue_count.saturating_sub(1))
+            } else {
+                0
+            };
+            for queue_offset in 0..queue_count {
+                if polling_segment_stop(&self.polling, interval, shutdown, deadline).is_some() {
+                    self.round_cut_short = true;
+                    break 'receive;
+                }
+                let queue_index = (start_queue + queue_offset) % queue_count;
+                self.rx_queue = (queue_index + 1) % queue_count;
+                self.rx_device = if self.rx_queue == 0 {
+                    (device_index + 1) % (before.len() + 1 + after.len())
+                } else {
+                    device_index
+                };
+                let queue = &mut device.queues[queue_index];
                 if !self.closing {
                     match queue.io.poll_read_ready(cx) {
                         Poll::Ready(Ok(mut ready)) => ready.clear_ready(),
@@ -508,6 +593,8 @@ impl Runtime {
                     let endpoints = &self.endpoints;
                     let pressure = &mut self.pressure.counters;
                     let realms = &self.realms;
+                    let qualified_rx = &mut self.qualified_rx;
+                    let qualification_unavailable = &mut self.qualification_unavailable;
                     let mut failure = None;
                     let ifindex = device.info.ifindex;
                     let received = port.receive_segments_with(BATCH, capture.vlan_metadata, |segments, metadata, same_port| {
@@ -558,7 +645,8 @@ impl Runtime {
                             });
                             if failure.is_some() { return; }
                             match cached {
-                                Ok(CachedDecision::Forwarded(()) | CachedDecision::Drop) => return,
+                                Ok(CachedDecision::Forwarded(())) => { qualify_packet(qualified_rx, qualification_unavailable); return; }
+                                Ok(CachedDecision::Drop) => return,
                                 Ok(CachedDecision::Cold) => {
                                     if waiting.len() == PENDING {
                                         pressure.waiting_full = pressure.waiting_full.saturating_add(1);
@@ -586,8 +674,12 @@ impl Runtime {
                             if view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return; }
                             &staging[..decoded.l3_len]
                         };
-                        if let Err(error) = receive_endpoint(endpoints, peers, pressure, scope, bytes, now, path, None)
-                            && !matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) { failure = Some(error.into()); }
+                        match receive_endpoint(endpoints, peers, pressure, scope, bytes, now, path, None) {
+                            Ok(report) if report.qualified_rx => qualify_packet(qualified_rx, qualification_unavailable),
+                            Ok(_) => {}
+                            Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) => {}
+                            Err(error) => failure = Some(error.into()),
+                        }
                     });
                     if let Some(error) = failure {
                         return Err(match received {
@@ -603,23 +695,48 @@ impl Runtime {
                 };
                 progress += finish_transmit(received, kick)?;
             }
+            self.rx_device = (device_index + 1) % (before.len() + 1 + after.len());
+            self.rx_queue = 0;
         }
         for realm in &mut self.realms {
-            if realm.generated.is_some() {
-                realm.driver.begin_turn(now);
-            } else if realm.driver.service(cx, now) {
+            if realm.generated.is_none() && realm.driver.service(cx, now) {
                 progress += 1;
             }
         }
         let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
-        for realm in &mut self.realms {
+        let start_realm = self.tx_realm.min(self.realms.len().saturating_sub(1));
+        for realm_offset in 0..self.realms.len() {
+            let realm_index = (start_realm + realm_offset) % self.realms.len();
+            if polling_segment_stop(&self.polling, interval, shutdown, deadline).is_some() {
+                self.round_cut_short = true;
+                break;
+            }
+            let realm_count = self.realms.len();
+            let realm = &mut self.realms[realm_index];
             let device = &mut self.devices[realm.device];
             let ifindex = device.info.ifindex;
             let (work, kick) = device.queues[0].io.get_mut().transmit_batch(|port| {
                 let mut serviced = 0;
-                for (class_index, class) in
-                    [TxClass::Control, TxClass::Bulk].into_iter().enumerate()
-                {
+                let start_class = if realm_index == start_realm {
+                    self.tx_class
+                } else {
+                    0
+                };
+                let mut serviced_classes = 0;
+                for class_offset in 0..2 {
+                    if polling_segment_stop(&self.polling, interval, shutdown, deadline).is_some() {
+                        self.round_cut_short = true;
+                        break;
+                    }
+                    let class_index = (start_class + class_offset) % 2;
+                    let class = [TxClass::Control, TxClass::Bulk][class_index];
+                    self.tx_class = (class_index + 1) % 2;
+                    self.tx_realm = if self.tx_class == 0 {
+                        (realm_index + 1) % realm_count
+                    } else {
+                        realm_index
+                    };
+                    serviced_classes += 1;
                     let mut considered = 0;
                     while considered < BATCH {
                         let capacity = if self.closing {
@@ -722,12 +839,22 @@ impl Runtime {
                         }
                     }
                 }
+                if serviced_classes == 2 {
+                    self.tx_class = 0;
+                    self.tx_realm = (realm_index + 1) % realm_count;
+                }
                 Ok(serviced)
             });
             if realm.generated.is_some() {
                 realm.driver.finish_turn(cx, now);
             }
+            finalized[realm_index] = true;
             progress += finish_transmit(work, kick)?;
+        }
+        for (index, realm) in self.realms.iter_mut().enumerate() {
+            if !finalized[index] && realm.generated.is_some() {
+                realm.driver.finish_turn(cx, now);
+            }
         }
         if progress == 0 {
             Poll::Pending
@@ -849,26 +976,6 @@ impl Runtime {
         !self.closing && self.core_deadline(now).is_some_and(|due| due <= now)
     }
 
-    fn poll_service(
-        &mut self,
-        cx: &mut Context<'_>,
-        shutdown: &crate::control::ShutdownIntent,
-        mut timer: Pin<&mut Option<tokio::time::Sleep>>,
-        reading: bool,
-    ) -> Poll<anyhow::Result<()>> {
-        if let Poll::Ready(result) = self.poll_io(cx) {
-            timer.set(None);
-            return Poll::Ready(result);
-        }
-        if !self.closing && shutdown.requested() {
-            timer.set(None);
-            return Poll::Ready(Ok(()));
-        }
-        // Registration and ring/output service may create obligations absent before this poll.
-        let now = Instant::now();
-        poll_deadline(timer, self.next_deadline(now, !reading), now, cx).map(Ok)
-    }
-
     /// One bounded turn under the actual router/config readers acquired beside device
     /// service; nothing here awaits, so no reader or scope lock crosses a suspension.
     fn resolve(&mut self, read: &PolicyRead<'_>) -> anyhow::Result<()> {
@@ -894,15 +1001,19 @@ impl Runtime {
                 work.scope,
                 PacketView::from_slice(work.packet.as_ref()),
             ) {
-                if let Err(error) = receive_endpoint(
-                    &self.endpoints,
-                    &mut self.peers,
-                    &mut self.pressure.counters,
-                    work.scope,
-                    work.packet.as_ref(),
-                    now,
-                    work.path,
-                    None,
+                if let Err(error) = qualify_receive(
+                    receive_endpoint(
+                        &self.endpoints,
+                        &mut self.peers,
+                        &mut self.pressure.counters,
+                        work.scope,
+                        work.packet.as_ref(),
+                        now,
+                        work.path,
+                        None,
+                    ),
+                    &mut self.qualified_rx,
+                    &mut self.qualification_unavailable,
                 ) && !matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
@@ -929,15 +1040,19 @@ impl Runtime {
                 }),
                 Decision::Drop | Decision::LocalInput => {}
                 Decision::Endpoint(packet, admission) => {
-                    if let Err(error) = receive_endpoint(
-                        &self.endpoints,
-                        &mut self.peers,
-                        &mut self.pressure.counters,
-                        work.scope,
-                        packet.as_ref(),
-                        now,
-                        work.path,
-                        Some(admission),
+                    if let Err(error) = qualify_receive(
+                        receive_endpoint(
+                            &self.endpoints,
+                            &mut self.peers,
+                            &mut self.pressure.counters,
+                            work.scope,
+                            packet.as_ref(),
+                            now,
+                            work.path,
+                            Some(admission),
+                        ),
+                        &mut self.qualified_rx,
+                        &mut self.qualification_unavailable,
                     ) && !matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
@@ -1053,8 +1168,12 @@ impl Runtime {
                 )
                 .map(Some)
             })?;
-            if submitted.is_some() && !work.output.is_complete() {
-                self.pending.push_back(work);
+            if submitted.is_some() {
+                if work.output.is_complete() {
+                    qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
+                } else {
+                    self.pending.push_back(work);
+                }
             }
         }
         if let Some(error) = core.poll_reassembly_error(read, now, &mut self.staging)? {
@@ -1260,7 +1379,7 @@ fn receive_endpoint(
     now: Instant,
     path: ReturnPath,
     admission: Option<EndpointAdmission>,
-) -> io::Result<Option<honk_netstack::ValidatedSource>> {
+) -> io::Result<PacketReceive> {
     let policy = match wire::parse_ip(packet) {
         Ok(ip)
             if ip.proto == wire::PROTO_TCP
@@ -1536,6 +1655,71 @@ async fn turn<R, J>(
     }
 }
 
+/// The production non-closing owner iteration, also used by the owned-kernel fixture.
+/// Policy guards end synchronously; only then may this owner yield its executor.
+async fn owner_step<'policy, R>(
+    runtime: &mut Runtime,
+    owner: &mut PacketEndpointOwner,
+    mut reader: Pin<&mut Option<R>>,
+    mut acquire: impl FnMut() -> Option<R>,
+    shutdown: &crate::control::ShutdownIntent,
+    mut timer: Pin<&mut Option<tokio::time::Sleep>>,
+    mut notification: Pin<&mut tokio::sync::futures::OwnedNotified>,
+) -> anyhow::Result<Option<anyhow::Result<(ControlPlane, anyhow::Result<()>)>>>
+where
+    R: Future<Output = PolicyRead<'policy>>,
+{
+    let mut failure = None;
+    runtime.pressure.sample(
+        Instant::now(),
+        runtime.core.as_ref(),
+        runtime.waiting.len(),
+        runtime.pending.len(),
+        runtime.peers.len(),
+        &runtime.devices,
+    );
+    if reader.is_none() && runtime.core.is_some() && runtime.core_due(Instant::now()) {
+        reader.set(acquire());
+    }
+    match turn(
+        reader.as_mut(),
+        |cx| owner.poll_join_plane(cx),
+        |cx, reading| {
+            runtime.poll_service(cx, shutdown, timer.as_mut(), reading, notification.as_mut())
+        },
+        shutdown,
+    )
+    .await
+    {
+        Turn::Joined(result) => return Ok(Some(result)),
+        Turn::Read(read) => {
+            let had_clock = runtime.polling.last_clock.is_some();
+            runtime.polling.boundary(0, 0);
+            if runtime.polling.clock_requires_policy_recheck(had_clock) {
+                runtime.policy_recheck = true;
+            } else if let Err(error) = runtime.resolve(&read) {
+                failure.get_or_insert(error);
+            }
+            drop(read);
+            runtime.observe_polling_round();
+        }
+        Turn::Serviced(Err(error)) => {
+            tracing::error!(%error, "XDP owner failed closed");
+            failure = Some(error);
+        }
+        Turn::Serviced(Ok(())) | Turn::Shutdown => {}
+    }
+    if runtime.policy_recheck {
+        reader.set(None);
+        runtime.policy_recheck = false;
+    }
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    tokio::task::yield_now().await;
+    Ok(None)
+}
+
 fn poll_deadline(
     mut timer: Pin<&mut Option<tokio::time::Sleep>>,
     deadline: Option<Instant>,
@@ -1567,12 +1751,27 @@ pub(crate) async fn run(
     let config = plane.config_handle().read().await.as_ref().clone();
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
+    let (polling_publication, process_polling) = plane
+        .polling_runtime()
+        .expect("validated XDP polling consumer");
+    let notification = polling_publication.notification();
+    tokio::pin!(notification);
     let prepared = prepare(&plane, &config, pin_root).await;
-    let (devices, topology, realms, scope_pairs, core, memory, staging, mut link_proof) =
-        match prepared {
-            Ok(prepared) => prepared,
-            Err(error) => return (Some(plane), Err(error)),
-        };
+    let (
+        devices,
+        topology,
+        realms,
+        scope_pairs,
+        core,
+        memory,
+        staging,
+        mut link_proof,
+        polling_prefix,
+        polling_budget,
+    ) = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => return (Some(plane), Err(error)),
+    };
     let (endpoints, mut owner, mut drivers) =
         match PacketEndpoints::start_driven(plane, scope_pairs, 64) {
             Ok(started) => started,
@@ -1610,6 +1809,20 @@ pub(crate) async fn run(
         closing: false,
         pressure: Pressure::new(Instant::now()),
         core_maintenance_checked: Instant::now(),
+        polling: AdaptivePoll::new(polling_publication, process_polling),
+        polling_prefix,
+        polling_budget,
+        polling_affinity: None,
+        qualified_rx: 0,
+        qualification_unavailable: false,
+        rx_device: 0,
+        rx_queue: 0,
+        tx_realm: 0,
+        tx_class: 0,
+        round_cut_short: false,
+        policy_recheck: false,
+        context_recheck: false,
+        context_revision: 0,
         _memory: memory,
     };
     let timer = None;
@@ -1668,6 +1881,7 @@ pub(crate) async fn run(
             !runtime.topology.get_mut().check_changed()?,
             "capture topology changed before publication"
         );
+        runtime.rebuild_polling_context();
         runtime.admission.store(true, Ordering::Release);
         runtime.endpoints.capture_ready()?;
         Ok(())
@@ -1700,7 +1914,15 @@ pub(crate) async fn run(
         if runtime.closing {
             match join_endpoints(
                 &mut owner,
-                |cx| runtime.poll_service(cx, &shutdown, timer.as_mut(), false),
+                |cx| {
+                    runtime.poll_service(
+                        cx,
+                        &shutdown,
+                        timer.as_mut(),
+                        false,
+                        notification.as_mut(),
+                    )
+                },
                 close_started.unwrap(),
                 &mut warned,
             )
@@ -1715,44 +1937,23 @@ pub(crate) async fn run(
                 }
             }
         }
-        runtime.pressure.sample(
-            Instant::now(),
-            runtime.core.as_ref(),
-            runtime.waiting.len(),
-            runtime.pending.len(),
-            runtime.peers.len(),
-            &runtime.devices,
-        );
-        if reader.is_none()
-            && let Some(authority) = &authority
-            && runtime.core_due(Instant::now())
-        {
-            reader.set(Some(authority.read_policy()));
-        }
-        match turn(
+        match owner_step(
+            &mut runtime,
+            &mut owner,
             reader.as_mut(),
-            |cx| owner.poll_join_plane(cx),
-            |cx, reading| runtime.poll_service(cx, &shutdown, timer.as_mut(), reading),
+            || authority.as_ref().map(|authority| authority.read_policy()),
             &shutdown,
+            timer.as_mut(),
+            notification.as_mut(),
         )
         .await
         {
-            Turn::Joined(result) => break result,
-            // The readers drop at the end of this synchronous turn, before any await.
-            Turn::Read(read) => {
-                if let Err(error) = runtime.resolve(&read) {
-                    failure.get_or_insert(error);
-                }
-            }
-            Turn::Serviced(Err(error)) => {
-                if failure.is_none() {
-                    tracing::error!(%error, "XDP owner failed closed");
-                }
+            Ok(Some(result)) => break result,
+            Ok(None) => {}
+            Err(error) => {
                 failure.get_or_insert(error);
             }
-            Turn::Serviced(Ok(())) | Turn::Shutdown => {}
         }
-        tokio::task::yield_now().await;
     };
     if !runtime.closing
         && let Err(error) = runtime.close_capture()
@@ -1824,6 +2025,8 @@ type PreparedRuntime = (
     MemoryReservation,
     Vec<u8>,
     Fib,
+    Result<ContextDigest, &'static str>,
+    Arc<MemoryBudget>,
 );
 
 async fn prepare(
@@ -1861,6 +2064,7 @@ async fn prepare(
     }
     let indices: Vec<_> = infos.iter().map(|info| info.ifindex).collect();
     let budget = MemoryBudget::new(MEMORY);
+    let polling_prefix = ContextDigest::platform(&budget);
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     let namespace = socket_namespace(socket.as_fd())?;
     let mut links = Fib::new(&budget, namespace)?;
@@ -1955,7 +2159,7 @@ async fn prepare(
         None
     };
     let mut devices = Vec::with_capacity(infos.len());
-    for info in infos {
+    for (device_index, info) in infos.into_iter().enumerate() {
         let incarnation = ScopeId::allocate()
             .context("XDP attachment identity exhausted")?
             .as_u64();
@@ -2013,8 +2217,12 @@ async fn prepare(
             port.refill()?;
             programs.insert_xsk(id, port.as_fd())?;
             let zero_copy = port.zerocopy();
+            let observed = port.counters();
+            let observed_rings = port.rings();
             queues.push(Queue {
                 id,
+                observed,
+                observed_rings,
                 // SAFETY: close_socket is called only after AsyncFd::into_inner deregisters it.
                 io: unsafe { AsyncFd::register(port) }.map_err(io::Error::from)?,
             });
@@ -2028,6 +2236,9 @@ async fn prepare(
             queues,
             active: false,
             metadata_checked: Instant::now(),
+            features: None,
+            port_config,
+            role: datapath.interfaces[device_index].role,
         });
     }
     let ingresses: Vec<_> = realms.iter().map(|(ingress, ..)| *ingress).collect();
@@ -2067,6 +2278,8 @@ async fn prepare(
         memory,
         vec![0; max_mtu.max(65536)],
         links,
+        polling_prefix,
+        budget,
     ))
 }
 

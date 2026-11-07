@@ -49,7 +49,10 @@ async fn source_receipts_preserve_udp_queue_pressure_and_reject_unowned_scopes()
             endpoints
                 .receive_with_source(scope.scope(), &packet[..length], now, false, |_, _| false)
                 .unwrap(),
-            Some(expected)
+            PacketReceive {
+                source: Some(expected),
+                qualified_rx: false
+            }
         );
         assert_eq!(
             endpoints.sender.capacity(),
@@ -63,7 +66,7 @@ async fn source_receipts_preserve_udp_queue_pressure_and_reject_unowned_scopes()
                     "bad checksum reported a source"
                 ))
                 .unwrap(),
-            None
+            PacketReceive::default()
         );
         let foreign = ScopeId::allocate().unwrap();
         assert_eq!(
@@ -125,4 +128,92 @@ async fn observed_routing_admission_funds_its_real_route_and_transfers_the_charg
     assert_eq!(budget.used(), charged);
     drop(snapshot);
     assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn udp_qualification_requires_ready_enqueue_not_pending_or_refused_work() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let destination = upstream.local_addr().unwrap();
+        let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, scope_owner) = scope(&budget);
+        let (plane, _health) = local_plane().await;
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
+            .await
+            .unwrap();
+        let owner = tokio::spawn(owner.run());
+        let mut packet = [0; 128];
+        let length = wire::udp::emit_packet(&mut packet, source, destination, b"pending").unwrap();
+        let receive = |bytes: &[u8]| {
+            endpoints
+                .receive_with_source(scope.scope(), bytes, Instant::now(), false, |_, _| true)
+                .unwrap()
+        };
+        let slow = Arc::clone(&endpoints.shared.udp_slots)
+            .try_acquire_many_owned(endpoints.shared.udp_slots.available_permits() as u32)
+            .unwrap();
+        let refused = receive(&packet[..length]);
+        assert!(refused.source.is_some());
+        assert!(
+            !refused.qualified_rx,
+            "missing slow permit is successful no-op, not admission"
+        );
+        drop(slow);
+        assert!(
+            !receive(&packet[..length]).qualified_rx,
+            "new initializer has unknown policy"
+        );
+        assert!(
+            !receive(&packet[..length]).qualified_rx,
+            "Initializing enqueue is not Ready"
+        );
+        let mut bytes = [0; 128];
+        for _ in 0..2 {
+            let (n, _) = upstream.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[..n], b"pending");
+        }
+        let length = wire::udp::emit_packet(&mut packet, source, destination, &[]).unwrap();
+        let slow = Arc::clone(&endpoints.shared.udp_slots)
+            .try_acquire_many_owned(endpoints.shared.udp_slots.available_permits() as u32)
+            .unwrap();
+        assert!(
+            receive(&packet[..length]).qualified_rx,
+            "Ready zero-length UDP needs no slow permit"
+        );
+        assert_eq!(upstream.recv_from(&mut bytes).await.unwrap().0, 0);
+        let mut enqueued = 0;
+        for _ in 0..65 {
+            if !receive(&packet[..length]).qualified_rx {
+                break;
+            }
+            enqueued += 1;
+        }
+        assert_eq!(
+            enqueued, 64,
+            "Some(QueueFull) must not qualify a refused datagram"
+        );
+        drop(slow);
+        let dns: SocketAddr = "198.51.100.1:53".parse().unwrap();
+        let length = wire::udp::emit_packet(&mut packet, source, dns, b"unknown-query").unwrap();
+        assert!(
+            !receive(&packet[..length]).qualified_rx,
+            "controller DNS remains per-query unknown"
+        );
+        endpoints.close();
+        assert_eq!(receive(&packet[..length]), PacketReceive::default());
+        assert_eq!(
+            endpoints
+                .queue_datagram(scope.scope(), source, dns, 0, None, |budget| {
+                    FundedDatagram::copy_from(&[], budget)
+                })
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::BrokenPipe
+        );
+        endpoints.shutdown().await.unwrap();
+        owner.await.unwrap().unwrap();
+    })
+    .await
+    .expect("qualification fixture must join real UDP owners");
 }

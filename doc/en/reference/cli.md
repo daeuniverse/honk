@@ -21,6 +21,7 @@ honk-core [OPTIONS] [COMMAND]
 | `--disable-timestamp` | Off | Omit the timestamp from console log lines. Use it under systemd or another logger that stamps each line itself; the file selected by `--log-file` or `global.log_file` keeps its timestamps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
 | `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
+| `--busy-poll-calibration-experiment` | Off | XDP-only laboratory admission for a fully bound `status: candidate` polling record. It uses the same finite runtime/ledger as qualified adaptive polling; it bypasses neither identity checks nor dwell, quota or explicit Event. The record binds an already written preregistration, not a future successful result. Product launches omit this flag; reload cannot change it. |
 | `--store file\|db` | `file` | `db` runs from the revisions in `<data-dir>/state/honk.db` and imports `-c` into an empty db. See the [configuration db](./api.md#configuration-db---store-db). |
 | `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. It must equal `global.data_dir`. Used by `--store db`, `config export` and `admin reset`. |
 

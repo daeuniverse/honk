@@ -85,6 +85,9 @@ impl Stack {
             idx: index,
             generation: self.table.slots[index as usize].generation,
         };
+        if REPORT {
+            report.outcome = crate::ReceiveOutcome::DatagramValidated;
+        }
         Rx::Datagram {
             flow: id,
             src: SocketAddr::new(ip.src, src),

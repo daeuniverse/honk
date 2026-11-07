@@ -774,7 +774,13 @@ async fn fragmented_packet_udp_reaches_real_outbound_and_returns_every_byte() {
             .unwrap();
         let now = Instant::now();
         for packet in fragments(source, destination, &body) {
-            endpoints.receive(scope.scope(), &packet, now).unwrap();
+            let result = endpoints
+                .receive_with_source(scope.scope(), &packet, now, false, |_, _| true)
+                .unwrap();
+            assert!(
+                !result.qualified_rx,
+                "incomplete fragments and a new initializer never qualify"
+            );
         }
         let mut received = [0; 8192];
         let (length, peer) = upstream.recv_from(&mut received).await.unwrap();
@@ -805,6 +811,20 @@ async fn fragmented_packet_udp_reaches_real_outbound_and_returns_every_byte() {
                 other => panic!("unexpected reply fragment {other:?}"),
             }
         }
+        let fragments = fragments(source, destination, &body);
+        for (index, packet) in fragments.iter().enumerate() {
+            let result = endpoints
+                .receive_with_source(scope.scope(), packet, now, false, |_, _| true)
+                .unwrap();
+            let complete = index + 1 == fragments.len();
+            assert_eq!(result.source.is_some(), complete);
+            assert_eq!(
+                result.qualified_rx, complete,
+                "only Ready-owned completion qualifies"
+            );
+        }
+        let (length, _) = upstream.recv_from(&mut received).await.unwrap();
+        assert_eq!(&received[..length], body);
         endpoints.shutdown().await.unwrap();
         owner.run().await.unwrap();
         drop(endpoints);

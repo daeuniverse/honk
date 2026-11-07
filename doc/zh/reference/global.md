@@ -261,6 +261,59 @@ Core 当前的带输入上下文 FIB 契约会拒绝非零 IPv6 flow label，以
 路由器专用扩展头/options 执行。Endpoint 支持 IPv6 并不证明这些数据包组合在
 Core 中具有等价执行授权。
 
+### 有界自适应轮询
+
+`datapath.poll_mode` 接受 `event` 或 `adaptive`。省略表示选择 adaptive **策略**，
+不是立即进入 Busy：owner 从 Event 开始。显式 `event` 禁止主动轮询，但允许保留
+完全相同的调参与校准块，用于 Event/adaptive 对照。TC 拒绝任何显式模式（包括
+`event`）及任何 `busy_poll` 块。轮询与校准可重载而不重建设备；变更清除本地
+资格累计，但不重置进程配额或债务。
+
+`datapath.busy_poll` 是可选单例块；出现时下列九个整数全部必填，不提供已校准的
+PPS 默认值。值采用无符号十进制整数，不接受 duration 字符串或浮点数。
+
+| 字段 | 类型 | 接受的安全/表示边界 |
+| --- | --- | --- |
+| `pps_enter` | `u32` | `1..=4294967295` |
+| `pps_exit` | `u32` | `0 <= pps_exit < pps_enter` |
+| `observation_window_us` | `u32` | `1..=60000000` 微秒 |
+| `enter_windows` | `u16` | `2..=65535` 个连续完整窗口 |
+| `exit_windows` | `u16` | `1..=65535` 个连续完整窗口 |
+| `max_busy_us` | `u32` | `1..=1000` 微秒且 `<= budget_us` |
+| `empty_rounds` | `u16` | `1..=65535` 个完整空设备轮次 |
+| `budget_window_us` | `u32` | `1..=60000000` 微秒（W） |
+| `budget_us` | `u32` | `0 < budget_us < budget_window_us`（B） |
+
+唯一可选子块是单例 `datapath.busy_poll.calibration`。出现时全部字段必填：正整数
+`schema: u16`、正整数 `counting_revision: u32`、`executable_sha256`、
+`context_sha256`、`parameter_sha256`、`status: candidate | qualified` 和
+`evidence_manifest_sha256`。四个摘要各为恰好 64 个小写十六进制字符。消费方要求
+schema 1/counting revision 1；格式正确的其他版本保持 Event 并报告不匹配原因，
+不会假定其兼容。
+
+`candidate` 的 `evidence_manifest_sha256` 绑定**已预注册的实验清单**，不是未来
+补交结果的空承诺。候选资格还要求进程启动时显式选择校准实验模式，不能靠配置
+重载开启。`qualified` 的摘要绑定经过评审的已完成资格证据清单。两种状态都必须
+精确匹配可执行文件、实际设备/上下文及参数。摘要/状态不是签名、下载的测量结果
+或收益证明；配置不提供清单路径或 URL。
+
+未知键/块、重复字段/块（包括合并 section/include）、不完整块、正负号、小数、
+溢出及非法边界均拒绝准入。类型化适配器沿用相同准入规则；新增可选字段的显式
+`null` 被拒绝，原有类型化适配器的 `xsk_mode: null` 行为不变。不提供 global/顶层
+calibration 别名或逐接口配额。
+
+缺少调参/校准、证据不匹配、必要上下文不可用或无法证明共享进程记账时，仍可
+使用正常 Event 网络处理，并保留资格原因。Busy 还要求独立 RX 或 TX PPS 持续
+达标、具体可轮询设备义务及进程额度。RX 统计已证明准入的结果而非源地址收据；
+TX 统计完整 producer 发布而非描述符/CQ 事件。进程账本同时至多允许一个 Busy
+区间，初始额度为零，按完整 BOOTTIME 流逝时间（含停顿）收费，跨重载保留债务，
+并放弃未结算区间跨越的补充额度。Busy 到达边界/截止时间后退出并让出执行，再
+重新评估；仅有配额不会唤醒空闲 owner。Event 不是对有效业务或总 CPU 的限额。
+
+这些是协作式安全边界，不是实测阈值或硬实时保证。时钟连续性观察不能排除低于
+保留的非原子读取/分辨率不确定性的 suspend。未经与精确绑定上下文一致的完整
+证据和评审，不宣称吞吐、延迟、CPU 或能耗收益。
+
 ## 相关文档
 
 - [配置指南](../configuration.md)

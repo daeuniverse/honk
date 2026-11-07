@@ -69,20 +69,31 @@ fn fragmented_current_source_never_comes_from_an_older_pending_syn() {
             let input = packet(current, destination, protocol);
             let fragments = fragmented(&input, 17);
             let mut reported = Vec::new();
+            let mut new_id = None;
             for (index, fragment) in fragments.iter().enumerate() {
-                let (rx, source) = stack.receive_with_source(now, fragment, |source| {
+                let (rx, report) = stack.receive_with_tcp_admission(now, fragment, |source| {
                     reported.push(source);
                     true
                 });
+                let source = report.source;
                 if index + 1 == fragments.len() {
                     assert_eq!(source, Some(expected));
                     if protocol == wire::PROTO_UDP {
                         assert!(matches!(rx, Rx::TransparentOwned { .. }));
+                        assert_eq!(
+                            report.outcome,
+                            honk_netstack::ReceiveOutcome::DatagramValidated
+                        );
                     } else {
                         assert_eq!(rx, Rx::Consumed);
+                        let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome else {
+                            panic!("completion must retain its own new flow identity")
+                        };
+                        new_id = Some(id);
                     }
                 } else {
                     assert_eq!(source, None);
+                    assert_eq!(report.outcome, honk_netstack::ReceiveOutcome::Unqualified);
                     assert_eq!(rx, Rx::Consumed);
                     assert!(reported.is_empty());
                 }
@@ -94,7 +105,9 @@ fn fragmented_current_source_never_comes_from_an_older_pending_syn() {
                 "older pending SYN is still independent of receipt"
             );
             if protocol == wire::PROTO_TCP {
-                assert_eq!(stack.poll_accept().unwrap().client, current);
+                let current_syn = stack.poll_accept().unwrap();
+                assert_eq!(current_syn.client, current);
+                assert_eq!(Some(current_syn.id), new_id);
             }
             assert!(stack.poll_accept().is_none());
 
@@ -165,5 +178,207 @@ fn checksum_failure_never_reports_and_callback_refusal_precedes_protocol_admissi
         } else {
             assert!(matches!(rx, Rx::Transparent { .. }));
         }
+    }
+}
+
+fn matching_output(reported: &mut Stack, ordinary: &mut Stack, now: Instant) -> Vec<Vec<u8>> {
+    let mut outputs = Vec::new();
+    let (mut left, mut right) = ([0; 2000], [0; 2000]);
+    loop {
+        let a = reported.poll_transmit(now, &mut left);
+        let b = ordinary.poll_transmit(now, &mut right);
+        assert_eq!(a, b, "reporting must preserve output obligations");
+        let Some(length) = a else { break };
+        assert_eq!(&left[..length], &right[..length]);
+        outputs.push(left[..length].to_vec());
+    }
+    outputs
+}
+
+fn report_pair(
+    reported: &mut Stack,
+    ordinary: &mut Stack,
+    now: Instant,
+    packet: &[u8],
+) -> honk_netstack::ReceiveReport {
+    let (rx, report) = reported.receive_with_tcp_admission(now, packet, |_| true);
+    assert_eq!(rx, ordinary.receive(now, packet));
+    matching_output(reported, ordinary, now);
+    report
+}
+
+#[test]
+fn protocol_outcomes_preserve_ordinary_actions_and_exclude_rejections() {
+    use honk_netstack::ReceiveOutcome::{TcpAccepted, TcpNew, Unqualified};
+    for (source, destination) in [
+        (addr(CLIENT), addr(DST)),
+        (addr("[fd00::2]:40000"), addr("[2001:db8::9]:443")),
+    ] {
+        let now = Instant::now();
+        let mut reported = Stack::new(transparent(), now);
+        let mut ordinary = Stack::new(transparent(), now);
+        let syn = build(source, destination, 100, 0, SYN, opts_syn(1200), &[]);
+        let report = report_pair(&mut reported, &mut ordinary, now, &syn);
+        let TcpNew(id) = report.outcome else {
+            panic!("missing exact new incarnation")
+        };
+        assert!(report.source.is_some());
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &syn).outcome,
+            Unqualified
+        );
+        assert_eq!(reported.poll_accept().unwrap().id, id);
+        assert_eq!(ordinary.poll_accept().unwrap().id, id);
+        reported.tcp_accept(id, AcceptOpts::default()).unwrap();
+        ordinary.tcp_accept(id, AcceptOpts::default()).unwrap();
+        let replies = matching_output(&mut reported, &mut ordinary, now);
+        let server = decode(&replies[0]).h.seq.wrapping_add(1);
+        let input = |seq, ack, flags, ts, data: &[u8]| {
+            build(
+                source,
+                destination,
+                seq,
+                ack,
+                flags,
+                Options {
+                    timestamps: Some((ts, 0)),
+                    ..Options::default()
+                },
+                data,
+            )
+        };
+        let invalid_handshake = input(101, server.wrapping_add(1), ACK, 5001, &[]);
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &invalid_handshake).outcome,
+            Unqualified
+        );
+        let ack = input(101, server, ACK, 5001, &[]);
+        let mut corrupt = ack.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &corrupt),
+            Default::default()
+        );
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &ack).outcome,
+            TcpAccepted(id)
+        );
+        for rejected in [
+            input(101, server, ACK, 4999, &[]),
+            input(101, server.wrapping_add(1), ACK, 5002, &[]),
+            input(100, server, ACK, 5002, &[]),
+            input(101, server, SYN | ACK, 5002, &[]),
+            input(102, server, RST | ACK, 5002, &[]),
+            input(101, 0, 0, 5002, &[]),
+        ] {
+            let report = report_pair(&mut reported, &mut ordinary, now, &rejected);
+            assert!(report.source.is_some());
+            assert_eq!(report.outcome, Unqualified);
+        }
+        for index in 0..33 {
+            let data = input(103 + index * 2, server, ACK, 5002, b"x");
+            let outcome = report_pair(&mut reported, &mut ordinary, now, &data).outcome;
+            assert_eq!(
+                outcome,
+                if index < 32 {
+                    TcpAccepted(id)
+                } else {
+                    Unqualified
+                }
+            );
+        }
+        let data = input(101, server, ACK, 5003, b"a");
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &data).outcome,
+            TcpAccepted(id)
+        );
+        let fin = input(102, server, ACK | FIN, 5004, &[]);
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &fin).outcome,
+            TcpAccepted(id)
+        );
+        let reset = input(103, server, RST, 5004, &[]);
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &reset).outcome,
+            TcpAccepted(id)
+        );
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &ack).outcome,
+            Unqualified
+        );
+    }
+}
+
+#[test]
+fn detailed_reports_keep_source_gate_capacity_and_datagram_evidence_separate() {
+    use honk_netstack::ReceiveOutcome::{DatagramValidated, Unqualified};
+    let now = Instant::now();
+    let source = addr(CLIENT);
+    let destination = addr(DST);
+    for protocol in [wire::PROTO_TCP, wire::PROTO_UDP] {
+        let mut cfg = transparent();
+        cfg.max_flows = 0;
+        let mut stack = Stack::new(cfg, now);
+        let packet = packet(source, destination, protocol);
+        let (rx, report) = stack.receive_with_tcp_admission(now, &packet, |_| false);
+        assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
+        assert!(report.source.is_some());
+        assert_eq!(report.outcome, Unqualified);
+        let (_, report) = stack.receive_with_tcp_admission(now, &packet, |_| true);
+        assert!(report.source.is_some());
+        assert_eq!(
+            report.outcome,
+            if protocol == wire::PROTO_TCP {
+                Unqualified
+            } else {
+                DatagramValidated
+            }
+        );
+    }
+}
+
+#[test]
+fn active_open_reports_only_valid_handshake_or_exact_reset() {
+    use honk_netstack::ReceiveOutcome::{TcpAccepted, Unqualified};
+    for reset in [false, true] {
+        let now = Instant::now();
+        let mut cfg = Config::new([18; 32]);
+        cfg.local_v4 = Some("192.0.2.1".parse().unwrap());
+        let mut reported = Stack::new(cfg.clone(), now);
+        let mut ordinary = Stack::new(cfg, now);
+        let remote = addr(DST);
+        let id = reported.tcp_connect(now, remote).unwrap();
+        assert_eq!(ordinary.tcp_connect(now, remote).unwrap(), id);
+        let outgoing = matching_output(&mut reported, &mut ordinary, now);
+        let syn = decode(&outgoing[0]);
+        let ack = syn.h.seq.wrapping_add(1);
+        for (flags, peer_ack) in [(ACK, ack.wrapping_add(1)), (RST, 0), (0, 0)] {
+            let packet = build(
+                remote,
+                syn.src,
+                200,
+                peer_ack,
+                flags,
+                Options::default(),
+                &[],
+            );
+            let report = report_pair(&mut reported, &mut ordinary, now, &packet);
+            assert!(report.source.is_some());
+            assert_eq!(report.outcome, Unqualified);
+        }
+        let packet = build(
+            remote,
+            syn.src,
+            200,
+            ack,
+            ACK | if reset { RST } else { SYN },
+            Options::default(),
+            &[],
+        );
+        assert_eq!(
+            report_pair(&mut reported, &mut ordinary, now, &packet).outcome,
+            TcpAccepted(id)
+        );
+        assert_eq!(reported.tcp_state(id), ordinary.tcp_state(id));
     }
 }

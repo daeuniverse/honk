@@ -272,6 +272,69 @@ support does not establish equivalent Core authority for those packet combinatio
 See [Full-XDP startup and limitations](../design/datapath.md) for device, VLAN,
 scatter/gather, retained-memory, pinned-guard, and stock-kernel admission boundaries.
 
+### Bounded adaptive polling
+
+`datapath.poll_mode` accepts `event` or `adaptive`. Omission selects the adaptive
+**policy**, not Busy operation: the owner starts in Event. Explicit `event` forbids
+active polling and can retain the identical complete tuning/calibration block for
+an Event-versus-adaptive comparison. TC rejects either explicit mode (even `event`)
+and any `busy_poll` block. Polling and calibration changes are reloadable without
+changing device setup; they reset local qualification, not process quota or debt.
+
+`datapath.busy_poll` is an optional singleton block. When present, all nine integers
+below are required; there are no calibrated PPS defaults. Values use unsigned
+decimal integers, not duration strings or floating-point values.
+
+| Field | Type | Accepted safety/representation bounds |
+| --- | --- | --- |
+| `pps_enter` | `u32` | `1..=4294967295` |
+| `pps_exit` | `u32` | `0 <= pps_exit < pps_enter` |
+| `observation_window_us` | `u32` | `1..=60000000` microseconds |
+| `enter_windows` | `u16` | `2..=65535` consecutive complete windows |
+| `exit_windows` | `u16` | `1..=65535` consecutive complete windows |
+| `max_busy_us` | `u32` | `1..=1000` microseconds and `<= budget_us` |
+| `empty_rounds` | `u16` | `1..=65535` complete empty device rounds |
+| `budget_window_us` | `u32` | `1..=60000000` microseconds (W) |
+| `budget_us` | `u32` | `0 < budget_us < budget_window_us` (B) |
+
+The only optional child is `datapath.busy_poll.calibration`, also a singleton. All
+its fields are required when present: positive `schema: u16`, positive
+`counting_revision: u32`, `executable_sha256`, `context_sha256`, `parameter_sha256`,
+`status: candidate | qualified`, and `evidence_manifest_sha256`. Each of the four
+digests is exactly 64 lowercase hexadecimal characters. The consumer expects schema
+1/counting revision 1; well-formed other revisions remain Event with a mismatch
+reason, rather than being assumed compatible.
+
+For `candidate`, `evidence_manifest_sha256` binds the **already preregistered
+experiment manifest**, not a future empty promise of results. Candidate eligibility
+also requires the explicit process-start calibration-experiment opt-in; configuration
+reload cannot enable it. For `qualified`, the digest binds the reviewed completed
+qualification evidence manifest. Both statuses require exact executable, actual
+device/context and parameter binding. A digest/status is not a signature, fetched
+measurement, or proof of benefit; configuration supplies no manifest path or URL.
+
+Unknown keys/blocks, duplicate fields/blocks (including merged sections/includes),
+partial blocks, signs, fractions, overflow and invalid bounds reject admission.
+Typed adapters use the same admission rules. Explicit `null` for the new optional
+fields is rejected; the existing `xsk_mode: null` typed-adapter behavior is unchanged.
+There is no global/top-level calibration alias or per-interface quota.
+
+Missing tuning/calibration, mismatched evidence, unavailable required context or
+unproven shared process accounting leave normal Event networking available with an
+eligibility reason. Busy additionally requires sustained separately measured RX or
+TX PPS, concrete pollable device obligations and process credit. RX counts proven
+admitted outcomes, not source receipts; TX counts complete producer publications,
+not descriptors/CQ events. One process ledger permits at most one Busy interval,
+starts with zero credit, charges full BOOTTIME elapsed (including stalls), retains
+debt across reloads and forfeits refill grants crossed by an outstanding interval.
+Busy ends at its bounds/deadlines and yields before reevaluation; quota alone never
+wakes an idle owner. Event processing is not a cap on useful work or total CPU.
+
+These are cooperative safety bounds, not measured thresholds or hard realtime
+guarantees. Clock continuity observations cannot exclude suspend below the retained
+non-atomic-read/resolution uncertainty. No throughput, latency, CPU or energy benefit
+is claimed without completed, reviewed evidence for the exact bound context.
+
 ## Related docs
 
 - [Configuration guide](../configuration.md)

@@ -26,6 +26,7 @@ flowchart LR
 | `receive(now, packet) -> Rx` | 借用一个完整 IP 包并验证校验和（`RxMeta::VERIFY`）。需要保留的 TCP 字节会复制进栈自有的环。UDP 返回 `Rx::Datagram`（Endpoint）或 `Rx::Transparent`（透明模式）：**返回的范围只在调用方复用或回收输入 buffer 之前有效**。`Rx::TransparentOwned` 自带重组后的包。`Rx::Dropped(reason)` 会被计数。 |
 | `receive_with(now, packet, RxMeta) -> Rx` | 在透明模式下附带可信的 TCP/UDP 校验和来源和/或 GRO/USO 元数据。Endpoint 模式将 `RxMeta::VERIFY` 之外的元数据以 `Unsupported` 丢弃；WireGuard 不能跳过验证。见[校验和信任](#校验和信任)和[分段卸载](#分段卸载)。 |
 | `receive_with_source(now, packet, callback) -> (Rx, Option<ValidatedSource>)` | 复用同一 parser/reassembler/checksum 路径，仅当前完成验证的 TCP/UDP 包返回 `{src, dst, protocol, tcp_flags}`；TCP flags 是已校验的首部事实，不是准入证明。callback 先于协议状态变更/UDP 分发执行；false 以 `NotForUs` 丢弃。即使被拒绝，receipt 仍只是有效性事实，**不是**握手、交付或内核 accepted-child 证明。未完成/无效分片、坏校验和均无 receipt。 |
+| `receive_with_tcp_admission(now, packet, callback) -> (Rx, ReceiveReport)` | 同一验证路径分别报告 `source` 和 `outcome`：`Unqualified`、`TcpAccepted(original_id)`、`TcpNew(exact_new_id)` 或 `DatagramValidated`。仅来源 API 从该报告投影 receipt。gated 输入、非法握手 ACK、PAWS/序列号/ACK 拒绝、触发 challenge 的 RST/SYN 及容量丢弃，不会因 `Rx::Consumed` 而成为已接受输入。合法 TIME_WAIT FIN/旧数据处理在压缩后仍保留原始句柄。 |
 | `poll_transmit(now, out) -> Option<usize>` | 把一个完整 IP 包写入 `out[..n]`。`out` 过小时返回 `None` 且不丢包。`None` 也表示 cwnd、rwnd 或 pacing 当前不允许发送。 |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | 同一调度器，在透明模式下可选用 TCP 分段卸载；返回 `len`、`gso`、`csum` 和已知 TCP 输出的原始 `flow` 句柄，无状态或未知流输出的 `flow` 为 `None`。Endpoint 模式忽略卸载能力。`poll_transmit` 是使用 `TxCaps::NONE` 的普通包封装，会丢弃这些元数据。 |
 | `poll_control_transmit(now, out)` | 复用 TCP emitter，但不发送 TCP/UDP 载荷；保留普通 readiness、DRR 和载荷 TLP 义务，允许符合协议条件的 ACK/RST/SYN/FIN/探测、TIME_WAIT ACK 和 ICMP。调用前须取得控制 frame/descriptor credit。 |
@@ -153,11 +154,21 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
 不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出
-消费者继续；关联冲突则在协议状态变更前拒绝。`PacketEndpoints` 传递这个精确
-receipt，不从 `poll_accept` 推导来源，因为它可能取出更早的 pending SYN。
-UDP queue/capacity 错误保持不变：callback 能报告有效来源事实，但随后的 UDP work
-仍可能因容量不足失败。旧 receive API 使用编译期禁用 reporting 的路径，没有
-reporting 分配，也不维护跨调用的“上一个包”状态。
+消费者继续；关联冲突则在协议状态变更前拒绝。source-aware scope 与 `PacketEndpoints`
+返回 `PacketReceive { source, qualified_rx }`（scope 另返回 `Rx`）。receipt 即使被拒绝
+也仍只是有效性事实。TCP qualification 在同一把锁内对照精确的原始 FlowSlot 完成。
+仅真正成功的非 Block winning stream 调用 `FlowIo::mark_rx_admitted`；pending routing、
+嗅探、任务排队、拨号失败及 controller DNS 都不置位。只有后续协议已接受输入才可能
+qualify；过期或正在关闭的 marker 不会接纳后继 incarnation。捕获的路由元数据仍绑定
+精确 `TcpNew` id，绝不借用更早的 `poll_accept` occupant。异步新 SYN 一律不 qualify：
+`accept_ready` 仅排队工作，不增加 deferred token，也不补记历史 credit。
+
+UDP 仅在既有 Ready owner 快路径返回 `Enqueued` 时 qualify，零长度 datagram 同样适用。
+Initializing/慢路径排队、逐查询 DNS 的未知结果以及成功返回的拒绝/no-op 均为 false；
+`Some(QueueFull/Closed/CapacityRejected/IdentityMismatch)` 不代表入队成功。普通、拥有
+重组包及 split 载荷保留原有分发与压力语义；split 输入仅在每块都 Ready-enqueued 时
+qualify。既有 queue/memory 错误仍原样返回。普通 receive API 使用编译期禁用 reporting
+的路径，没有 reporting 分配、额外 parser、读时钟或跨调用的“上一个包”状态。
 
 `PacketEndpoints` 在既有 scope 互斥锁内检查被动 accept 队列，再预留 TCP/channel permit。空探测不扫描 flow slot，也不通知 owner。排队 SYN 仍进入既有的逐次 receive 后立即接纳循环，容量恢复后的无关入站包仍可触发重试；不会推迟到批尾接纳。该查询只提供否定提示：队列中可能只有过期句柄，随后仍不返回有效流。
 

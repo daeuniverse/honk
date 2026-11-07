@@ -161,9 +161,25 @@ pub struct ValidatedSource {
     pub tcp_flags: Option<u8>,
 }
 
+/// Protocol evidence for this input, not routing or application admission.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReceiveOutcome {
+    #[default]
+    Unqualified,
+    TcpAccepted(FlowId),
+    TcpNew(FlowId),
+    DatagramValidated,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReceiveReport {
+    pub source: Option<ValidatedSource>,
+    pub outcome: ReceiveOutcome,
+}
+
 pub(crate) struct SourceReport<F> {
     source: Option<ValidatedSource>,
-    tcp_admission: Option<FlowId>,
+    pub(crate) outcome: ReceiveOutcome,
     accept: F,
 }
 
@@ -171,7 +187,7 @@ impl<F: FnMut(ValidatedSource) -> bool> SourceReport<F> {
     fn new(accept: F) -> Self {
         Self {
             source: None,
-            tcp_admission: None,
+            outcome: ReceiveOutcome::Unqualified,
             accept,
         }
     }
@@ -504,23 +520,29 @@ impl Stack {
         packet: &[u8],
         on_source: impl FnMut(ValidatedSource) -> bool,
     ) -> (Rx, Option<ValidatedSource>) {
-        let (rx, source, _) = self.receive_with_tcp_admission(now, packet, on_source);
-        (rx, source)
+        let (rx, report) = self.receive_with_tcp_admission(now, packet, on_source);
+        (rx, report.source)
     }
 
-    /// Also returns the new passive incarnation created by this exact receive, never
-    /// a later accept-queue occupant. Retransmits and existing-flow input return None.
+    /// Reports actual protocol acceptance and the exact newly created passive incarnation.
+    /// A source receipt alone is not acceptance evidence.
     pub fn receive_with_tcp_admission(
         &mut self,
         now: Instant,
         packet: &[u8],
         on_source: impl FnMut(ValidatedSource) -> bool,
-    ) -> (Rx, Option<ValidatedSource>, Option<FlowId>) {
+    ) -> (Rx, ReceiveReport) {
         self.now = now;
         self.counters.rx_packets += 1;
         let mut report = SourceReport::new(on_source);
         let rx = self.receive_packet::<true>(now, packet, RxMeta::VERIFY, &mut report);
-        (rx, report.source, report.tcp_admission)
+        (
+            rx,
+            ReceiveReport {
+                source: report.source,
+                outcome: report.outcome,
+            },
+        )
     }
 
     /// Receives one IP packet with what the driver knows about it: a trusted L4 checksum
@@ -606,9 +628,13 @@ impl Stack {
                 let rx = crate::udp_t::receive_transparent(self, &ip, packet, meta);
                 if let Rx::Transparent { src, dst, .. } | Rx::TransparentSplit { src, dst, .. } =
                     &rx
-                    && !report.record::<REPORT>(*src, *dst, wire::PROTO_UDP, None)
                 {
-                    return self.drop_packet(DropReason::NotForUs);
+                    if !report.record::<REPORT>(*src, *dst, wire::PROTO_UDP, None) {
+                        return self.drop_packet(DropReason::NotForUs);
+                    }
+                    if REPORT {
+                        report.outcome = ReceiveOutcome::DatagramValidated;
+                    }
                 }
                 rx
             }
@@ -670,10 +696,14 @@ impl Stack {
                 generation: slot.generation,
             };
             self.cache = Some((tuple, id));
-            if let Some(Flow::Tcp(t)) = slot.flow.as_mut()
-                && let Some((seq, ack, flags)) = t.input(now, &h, &seg[off..], gso, &mut self.pool)
-            {
-                self.control(tuple, seq, ack, flags, Some(id));
+            if let Some(Flow::Tcp(t)) = slot.flow.as_mut() {
+                let input = t.input(now, &h, &seg[off..], gso, &mut self.pool);
+                if REPORT && input.accepted {
+                    report.outcome = ReceiveOutcome::TcpAccepted(id);
+                }
+                if let Some((seq, ack, flags)) = input.reset {
+                    self.control(tuple, seq, ack, flags, Some(id));
+                }
             }
             self.sync(index, now);
             return Rx::Consumed;
@@ -699,12 +729,17 @@ impl Stack {
                         t.ts_recent = h.options.timestamps.map(|v| v.0);
                     }
                 }
-                if (fin
+                let accepted = fin
                     || crate::tcp::valid_timewait_old_data(
                         &h, args.0, args.1, args.2, args.3, args.4,
-                    ))
-                    && !t.ack_due
-                {
+                    );
+                if REPORT && accepted {
+                    report.outcome = ReceiveOutcome::TcpAccepted(FlowId {
+                        idx: index,
+                        generation: t.handle_generation,
+                    });
+                }
+                if accepted && !t.ack_due {
                     t.ack_due = true;
                     self.timewait_ready.push_back(FlowId {
                         idx: index,
@@ -718,8 +753,11 @@ impl Stack {
         if self.transparent()
             && let Some(rx) = self.passive_open(now, tuple, &h, ip.dscp, reopen)
         {
-            if REPORT && matches!(rx, Rx::Consumed) {
-                report.tcp_admission = self.table.tcp.get(&tuple).map(|&index| FlowId {
+            if REPORT
+                && matches!(rx, Rx::Consumed)
+                && let Some(&index) = self.table.tcp.get(&tuple)
+            {
+                report.outcome = ReceiveOutcome::TcpNew(FlowId {
                     idx: index,
                     generation: self.table.slots[index as usize].generation,
                 });

@@ -181,6 +181,12 @@ impl ControlPlane {
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
+        #[cfg(target_os = "linux")]
+        let polling = config
+            .datapath
+            .as_ref()
+            .filter(|datapath| datapath.backend == honk_config::datapath::Backend::Xdp)
+            .map(|_| crate::xdp::polling::PollingPublication::new(&config));
         let config_arc = Arc::new(RwLock::new(Arc::new(config)));
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
@@ -280,6 +286,10 @@ impl ControlPlane {
             outbound_id_map,
             resource_budget,
             dns_socket_budget,
+            #[cfg(target_os = "linux")]
+            process_polling: None,
+            #[cfg(target_os = "linux")]
+            polling,
             concurrency_limit: Arc::new(tokio::sync::Semaphore::new(
                 resource_budget.active_tcp_flows,
             )),
@@ -347,6 +357,84 @@ impl ControlPlane {
         control_plane.install_node_death_callback();
 
         Ok(control_plane)
+    }
+
+    /// Attach the process-start polling resource before handing ingress to its owner.
+    #[cfg(target_os = "linux")]
+    pub fn with_process_polling(mut self, binding: PollBudgetBinding) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            self.process_polling.is_none(),
+            "process polling is already attached"
+        );
+        anyhow::ensure!(
+            self.command_rx.is_some(),
+            "process polling must attach before owner startup"
+        );
+        let polling = self
+            .polling
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("process polling requires an explicit XDP consumer"))?;
+        let policy = polling.snapshot().quota().map_err(anyhow::Error::msg)?;
+        if let Err(reason) = binding.prepare_policy(policy)
+            && reason == "process_budget_policy_mismatch"
+        {
+            anyhow::bail!(reason);
+        }
+        let error = binding.publish_policy(policy).err();
+        polling.attachment_error(error);
+        self.process_polling = Some(binding);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn polling_runtime(
+        &self,
+    ) -> Option<(
+        Arc<crate::xdp::polling::PollingPublication>,
+        Option<ProcessPollBudget>,
+    )> {
+        self.polling.as_ref().map(|polling| {
+            (
+                Arc::clone(polling),
+                self.process_polling
+                    .as_ref()
+                    .map(PollBudgetBinding::participant_handle),
+            )
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn prepare_polling_config(
+        &self,
+        config: &Config,
+    ) -> Result<(), &'static str> {
+        if self.polling.is_none() {
+            return Ok(());
+        }
+        let policy = crate::xdp::polling::quota_policy(config)?;
+        if let Some(binding) = &self.process_polling
+            && let Err(reason) = binding.prepare_policy(policy)
+            && reason == "process_budget_policy_mismatch"
+        {
+            return Err(reason);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::control) fn publish_polling_config(&self, config: &Config) {
+        let Some(polling) = &self.polling else { return };
+        if !polling.differs(config) {
+            return;
+        }
+        let error = match crate::xdp::polling::quota_policy(config) {
+            Ok(policy) => self
+                .process_polling
+                .as_ref()
+                .and_then(|binding| binding.publish_policy(policy).err()),
+            Err(reason) => Some(reason),
+        };
+        polling.publish(config, error);
     }
     pub(crate) fn set_log_file_override(
         &mut self,

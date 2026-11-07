@@ -89,6 +89,16 @@ debug 级别下，同一 sampler 至多每秒报告一次各队列的内核 sock
 索引与 port 计数；读取错误保持显式，空 ring 遭遇次数和 wakeup 错误不能相加
 当成丢包数。
 
+### Event 与有限 adaptive 服务
+
+`datapath.poll_mode` 选择 Event 或 adaptive 策略，两者都从 Event 开始。Adaptive 要求精确匹配可执行文件、计数位置、设备/offload 和参数的校准，RX 或 TX 独立在至少两个完整非重叠窗口内持续高 PPS，真实可轮询设备义务以及共享进程配额。未知 source receipt、异步 SYN/Initializing/DNS 准入、队列拒绝、descriptor、CQ 和空探测都不计资格。TX 按完整 producer publication 计包，包括 generated 与 SG，不按发送函数的成功返回或 descriptor 数。边界与 candidate/qualified 记录见[全局参考](../reference/global.md)。
+
+同一 capture Runtime 服务 driver、timer、completion/FILL、control、有限 RX/TX 和 close；真实策略 reader 的 Pending 获取保持 pinned，并与这些服务复用，blocked-ready 本身不持续 spin。每个活动区间都结算并执行 Event 重评估/协作 yield。只有真实 owner 边界观察到时间经过时才补充配额，不设空闲配额/采样 timer；真实设备可见性与 completion 义务所需的 Event 后备 deadline 仍保留。
+
+每个选中设备（包括 metadata/veth）都持有冷路径计费的 ethtool FD 和有界查询缓冲。每个有限 Busy 探测轮前读取真实 active bit，查询/比较成本计入活动区间；轮内变化在下次扫描发现，不宣称原子排除。MONOTONIC-before/BOOTTIME/MONOTONIC-after 形成的 offset 区间逐次求交：普通重叠不确定性允许累积资格，分离/错误/倒退/长间隔则清空资格。报告的分辨率及非原子读取不确定性不能证明更短 suspend 不存在。协议 Instant 与 scoped 最终发布/权威检查保持原义。
+
+Event 启动即使无校准，也输出可复现的 executable/context/counting 身份；完整数值块还输出参数摘要。因此 candidate 可在测量前绑定预登记实验 manifest，但只有显式实验 CLI 参数才准入该记录。Qualified 仍是特权操作员经外部评审的证据声明，不是 runtime 科学认证。不据此宣称未经测量的吞吐或节能收益；未合格平台继续 Event。
+
 移除 custody 前先停止流量源。正常关闭报告 `XDP admission closed; UMEM retained until process exit`；netdev 上的 XDP 挂载作为 fail-closed guard 保留，`guard`/`data` program pin 位于 `<bpf-pin-root>/xdp-<ifindex>/`。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。接口仍有 XDP 挂载时启动会拒绝。停源并确认当前程序 ID 属于本实例 guard 后，先移除该挂载（`ip link set dev <接口> xdp off`），再只删除其自有 pin。不存在自动零驻留热重开：保留 UMEM 仍计入进程生命周期 **512 MiB** 上限；close 或空 ring 不证明 DMA 释放。
 
 `.github/ci/xdp-daemon-smoke.sh` 已由完整 floor/recent disposable-VM gate 使用匹配的预构建 daemon、Core 和 XSK 测试程序执行，也可在已准备好的 guest 中直接运行。它要求 guest root、Linux 6.12+、namespace、AF_XDP/native-XDP veth、bpffs、iproute2、nft、ethtool 与 Python 3，不构建、安装或下载。每个 Core/VLAN/jumbo 场景同时验证真实 capture 计数、对端载荷及私有 native-forwarding 丢弃围栏；关闭后核对自有 guard 程序 ID，并用同路径正向基线对照受选流量的拒绝，之后才移除自有挂载。门禁还覆盖不对称队列、原生控制流量、带填充 VLAN 帧，以及省略 datapath 的真实 TC 启动/流量/reload。虚拟场景通过不等于物理 NIC、逐队列/RSS 或性能认证。

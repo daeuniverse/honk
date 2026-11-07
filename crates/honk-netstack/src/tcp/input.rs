@@ -11,8 +11,31 @@ use super::sack::Insert;
 use super::sent::Acked;
 use super::{DATA, DELAY_ACK, FIN_ACK, OOO, PROBE_RESPONSE, Tcb, TcpState, seq};
 
+pub(crate) struct InputOutcome {
+    pub reset: Option<(u32, u32, u8)>,
+    pub accepted: bool,
+}
+
+impl InputOutcome {
+    const REJECTED: Self = Self {
+        reset: None,
+        accepted: false,
+    };
+    const ACCEPTED: Self = Self {
+        reset: None,
+        accepted: true,
+    };
+
+    fn reset(ack: u32) -> Self {
+        Self {
+            reset: Some((ack, 0, RST)),
+            accepted: false,
+        }
+    }
+}
+
 impl Tcb {
-    /// Returns a reset reply for an unacceptable handshake ACK.
+    /// Preserves reset output separately from actual protocol acceptance.
     pub fn input(
         &mut self,
         now: Instant,
@@ -20,13 +43,13 @@ impl Tcb {
         data: &[u8],
         gso: u16,
         pool: &mut Pool,
-    ) -> Option<(u32, u32, u8)> {
+    ) -> InputOutcome {
         if self.state == TcpState::Closed {
-            return None;
+            return InputOutcome::REJECTED;
         }
         if self.gate != Gate::Open {
             // Before the application decides nothing is answered: retransmitted SYNs are absorbed.
-            return None;
+            return InputOutcome::REJECTED;
         }
         if self.state == TcpState::SynSent {
             return self.syn_sent_input(now, h, data, pool);
@@ -38,13 +61,13 @@ impl Tcb {
         {
             if h.flags & ACK == 0 {
                 self.syn_due = true;
-                return None;
+                return InputOutcome::REJECTED;
             }
             if h.ack != self.snd_nxt {
-                return Some((h.ack, 0, RST));
+                return InputOutcome::reset(h.ack);
             }
             if !self.paws(now, h) {
-                return None;
+                return InputOutcome::REJECTED;
             }
             self.snd_una = h.ack;
             self.syn_due = false;
@@ -59,14 +82,18 @@ impl Tcb {
             {
                 self.ts_recent = Some((ts, now));
             }
+            let mut accepted = true;
             if !data.is_empty() || h.flags & FIN != 0 {
                 let mut established = *h;
                 established.seq = established.seq.wrapping_add(1);
                 established.flags &= !SYN;
-                self.receive_data(now, &established, data, gso, pool);
+                accepted = self.receive_data(now, &established, data, gso, pool);
             }
             self.rearm(now);
-            return None;
+            return InputOutcome {
+                reset: None,
+                accepted,
+            };
         }
         if self.state == TcpState::TimeWait {
             if valid_timewait_fin(
@@ -84,6 +111,7 @@ impl Tcb {
                 {
                     self.ts_recent = Some((ts, now));
                 }
+                return InputOutcome::ACCEPTED;
             } else if valid_timewait_old_data(
                 h,
                 data.len(),
@@ -93,15 +121,16 @@ impl Tcb {
                 self.ts_recent.map(|v| v.0),
             ) {
                 self.ack_due |= FIN_ACK;
+                return InputOutcome::ACCEPTED;
             }
-            return None;
+            return InputOutcome::REJECTED;
         }
         if h.flags & SYN != 0 && h.flags & RST == 0 {
             self.challenge(now);
-            return None;
+            return InputOutcome::REJECTED;
         }
         if h.flags & RST == 0 && !self.paws(now, h) {
-            return None;
+            return InputOutcome::REJECTED;
         }
         let seg_len =
             data.len() as u32 + u32::from(h.flags & FIN != 0) + u32::from(h.flags & SYN != 0);
@@ -119,23 +148,24 @@ impl Tcb {
                     OOO
                 };
             }
-            return None;
+            return InputOutcome::REJECTED;
         }
         self.ka_activity(now);
         if h.flags & RST != 0 {
             if h.seq == self.rcv_nxt {
                 self.fail(StreamError::Reset);
+                return InputOutcome::ACCEPTED;
             } else {
                 self.challenge(now);
             }
-            return None;
+            return InputOutcome::REJECTED;
         }
         if h.flags & ACK == 0 {
-            return None;
+            return InputOutcome::REJECTED;
         }
         if self.state == TcpState::SynReceived {
             if h.ack != self.snd_nxt || !seq::gt(h.ack, self.iss) {
-                return Some((h.ack, 0, RST));
+                return InputOutcome::reset(h.ack);
             }
             self.snd_una = h.ack;
             self.established(now);
@@ -144,7 +174,7 @@ impl Tcb {
             || seq::lt(h.ack, self.snd_una.wrapping_sub(self.snd_wnd_max))
         {
             self.challenge(now);
-            return None;
+            return InputOutcome::REJECTED;
         }
         let old_wnd = self.snd_wnd;
         self.update_send_window(h);
@@ -156,7 +186,7 @@ impl Tcb {
             pool,
         );
         if self.state == TcpState::Closed {
-            return None;
+            return InputOutcome::ACCEPTED;
         }
         if self.timestamps
             && let Some((ts, _)) = h.options.timestamps
@@ -164,6 +194,7 @@ impl Tcb {
         {
             self.ts_recent = Some((ts, now));
         }
+        let mut accepted = true;
         if !data.is_empty() || h.flags & FIN != 0 {
             if matches!(
                 self.state,
@@ -171,15 +202,19 @@ impl Tcb {
             ) {
                 if !self.app_open && !data.is_empty() {
                     self.abort();
-                    return None;
+                    return InputOutcome::REJECTED;
                 }
-                self.receive_data(now, h, data, gso, pool);
+                accepted = self.receive_data(now, h, data, gso, pool);
             } else {
                 self.ack_due |= FIN_ACK;
+                accepted = false;
             }
         }
         self.rearm(now);
-        None
+        InputOutcome {
+            reset: None,
+            accepted,
+        }
     }
 
     pub fn init_window(&mut self, pool: &mut Pool) {
@@ -192,22 +227,23 @@ impl Tcb {
         h: &Header,
         data: &[u8],
         pool: &mut Pool,
-    ) -> Option<(u32, u32, u8)> {
+    ) -> InputOutcome {
         if h.flags & ACK != 0 && (!seq::gt(h.ack, self.iss) || seq::gt(h.ack, self.snd_nxt)) {
             return if h.flags & RST == 0 {
-                Some((h.ack, 0, RST))
+                InputOutcome::reset(h.ack)
             } else {
-                None
+                InputOutcome::REJECTED
             };
         }
         if h.flags & RST != 0 {
             if h.flags & ACK != 0 {
                 self.fail(StreamError::Reset);
+                return InputOutcome::ACCEPTED;
             }
-            return None;
+            return InputOutcome::REJECTED;
         }
         if h.flags & SYN == 0 {
-            return None;
+            return InputOutcome::REJECTED;
         }
         self.irs = h.seq;
         let width = self.committed_right.wrapping_sub(self.rcv_nxt);
@@ -245,6 +281,7 @@ impl Tcb {
         self.snd_wl1 = h.seq;
         self.snd_wl2 = h.ack;
         self.syn_due = false;
+        let mut accepted = true;
         if h.flags & ACK != 0 {
             self.snd_una = h.ack;
             if self.syn_retries == 0
@@ -258,13 +295,16 @@ impl Tcb {
                 let mut h = *h;
                 h.seq = h.seq.wrapping_add(1);
                 h.flags &= !SYN;
-                self.receive_data(now, &h, data, 0, pool);
+                accepted = self.receive_data(now, &h, data, 0, pool);
             }
         } else {
             self.state = TcpState::SynReceived;
             self.syn_due = true;
         }
-        None
+        InputOutcome {
+            reset: None,
+            accepted,
+        }
     }
 
     fn established(&mut self, now: Instant) {
@@ -512,7 +552,14 @@ impl Tcb {
     /// `gso` is the segment size of a received super-packet (`0`: an ordinary segment). The data
     /// is ingested as one contiguous segment either way; the size only tells the delayed-ACK
     /// cadence how many full frames it stands for.
-    fn receive_data(&mut self, now: Instant, h: &Header, data: &[u8], gso: u16, pool: &mut Pool) {
+    fn receive_data(
+        &mut self,
+        now: Instant,
+        h: &Header,
+        data: &[u8],
+        gso: u16,
+        pool: &mut Pool,
+    ) -> bool {
         if now.saturating_duration_since(self.last_rx) > self.rtt.rto() {
             self.quickack = 16;
             self.rcv_mss = self.send_mss().min(536) as usize;
@@ -549,6 +596,7 @@ impl Tcb {
         }
         let had_ooo = !self.ooo.is_empty();
         let mut advanced = false;
+        let mut accepted = true;
         if !bytes.is_empty() {
             let end = start.wrapping_add(bytes.len() as u32);
             if start == self.rcv_nxt {
@@ -597,7 +645,10 @@ impl Tcb {
                             self.dsack = Some((start, end));
                         }
                     }
-                    Insert::Full => self.stats.ooo_drops += 1,
+                    Insert::Full => {
+                        self.stats.ooo_drops += 1;
+                        accepted = false;
+                    }
                 }
                 self.ack_due |= OOO;
                 if !self.sack {
@@ -606,6 +657,7 @@ impl Tcb {
             }
         } else if !data.is_empty() {
             self.ack_due |= OOO;
+            accepted = false;
         }
         if h.flags & FIN != 0
             && seq::ge(original_end, self.rcv_nxt)
@@ -640,6 +692,7 @@ impl Tcb {
             self.rcv_rtt_seq = self.max_adv_right;
             self.rcv_rtt_time = now;
         }
+        accepted
     }
 }
 

@@ -895,7 +895,8 @@ fn validated_source_callback_holds_the_output_mutex_before_control_output() {
         tcp_flags: Some(tcp::ACK),
     };
     assert_eq!(observed, Some(expected));
-    assert_eq!(receipt, Some(expected));
+    assert_eq!(receipt.source, Some(expected));
+    assert!(!receipt.qualified_rx);
     assert_eq!(
         rx,
         Rx::Dropped(DropReason::NoFlow),
@@ -905,4 +906,112 @@ fn validated_source_callback_holds_the_output_mutex_before_control_output() {
     let reset = output(&scope);
     assert_eq!(decode(&reset).0.flags, tcp::RST);
     reset.release();
+}
+
+#[test]
+fn receive_qualification_requires_original_flow_marker_and_protocol_acceptance() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client: SocketAddr = "10.0.0.2:40000".parse().unwrap();
+    let syn = segment(client, 100, 0, tcp::SYN, &[]);
+    let (_, received) = scope.receive_with_source(&syn, now, false, |_, _| true);
+    assert!(received.source.is_some());
+    assert!(!received.qualified_rx, "new asynchronous SYN has no winner");
+    let (_, received) = scope.receive_with_source(&syn, now, false, |_, _| true);
+    assert!(
+        !received.qualified_rx,
+        "gated retransmission is not accepted input"
+    );
+    let (_, flow) = scope.poll_accept().unwrap();
+    scope.drive(now);
+    let reply = output(&scope);
+    let server = decode(&reply).0.seq.wrapping_add(1);
+    reply.release();
+    let ack = segment(client, 101, server, tcp::ACK, &[]);
+    assert!(
+        !scope
+            .receive_with_source(&ack, now, false, |_, _| true)
+            .1
+            .qualified_rx
+    );
+    flow.mark_rx_admitted();
+    assert!(
+        scope
+            .receive_with_source(&ack, now, false, |_, _| true)
+            .1
+            .qualified_rx
+    );
+    let refused = scope.receive_with_source(&ack, now, false, |_, _| false).1;
+    assert!(refused.source.is_some());
+    assert!(!refused.qualified_rx);
+    for input in [
+        segment(client, 101, server.wrapping_add(1), tcp::ACK, &[]),
+        segment(client, 101, server, tcp::SYN | tcp::ACK, &[]),
+        segment(client, 102, server, tcp::RST | tcp::ACK, &[]),
+        segment(client, 99, server, tcp::ACK, &[]),
+    ] {
+        let received = scope.receive_with_source(&input, now, false, |_, _| true).1;
+        assert!(received.source.is_some());
+        assert!(!received.qualified_rx);
+    }
+    let other: SocketAddr = "10.0.0.3:40001".parse().unwrap();
+    let (_, new) = scope.receive_with_source(
+        &segment(other, 200, 0, tcp::SYN, &[]),
+        now,
+        false,
+        |_, _| true,
+    );
+    assert!(
+        !new.qualified_rx,
+        "a different marked flow cannot credit a new SYN"
+    );
+    assert!(
+        scope
+            .receive_with_source(
+                &segment(client, 101, server, tcp::RST, &[]),
+                now,
+                false,
+                |_, _| true
+            )
+            .1
+            .qualified_rx
+    );
+    assert!(
+        !scope
+            .receive_with_source(&ack, now, false, |_, _| true)
+            .1
+            .qualified_rx
+    );
+}
+
+#[test]
+fn stale_or_closing_flow_marker_does_not_admit_another_incarnation() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let (mut old, _) = handshake(&scope, now, client, 100);
+    old.abort();
+    scope.drive(now);
+    while let Poll::Ready(Some(output)) = scope.poll_output(&mut context()) {
+        output.release();
+    }
+    scope.drive(now);
+    let (new, server) = handshake(&scope, now, client, 200);
+    assert_ne!(old.flow_id(), new.flow_id());
+    old.mark_rx_admitted();
+    let ack = segment(client, 201, server, tcp::ACK, &[]);
+    assert!(
+        !scope
+            .receive_with_source(&ack, now, false, |_, _| true)
+            .1
+            .qualified_rx
+    );
+    scope.shutdown(false);
+    new.mark_rx_admitted();
+    assert!(
+        !scope
+            .receive_with_source(&ack, now, false, |_, _| true)
+            .1
+            .qualified_rx
+    );
 }

@@ -93,6 +93,7 @@ struct FlowSlot {
     tx: Option<Waker>,
     callback: Option<RetirementCallback>,
     accepted: bool,
+    rx_admitted: bool,
     routing: Option<super::packet_endpoint::EndpointAdmission>,
 }
 
@@ -338,15 +339,15 @@ impl PacketScope {
         now: Instant,
         check_output: bool,
         mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
-    ) -> (Rx, Option<honk_netstack::ValidatedSource>) {
+    ) -> (Rx, super::packet_endpoint::PacketReceive) {
         self.0.with(|inner| {
             let pending = check_output && inner.pending_source_output(packet);
-            match &mut inner.stack {
-                Some(stack) => {
-                    stack.receive_with_source(now, packet, |source| on_source(source, pending))
-                }
-                None => (Rx::Dropped(DropReason::Stale), None),
-            }
+            let Some(stack) = &mut inner.stack else {
+                return (Rx::Dropped(DropReason::Stale), Default::default());
+            };
+            let (rx, report) =
+                stack.receive_with_tcp_admission(now, packet, |source| on_source(source, pending));
+            (rx, inner.receive_result(report))
         })
     }
 
@@ -412,17 +413,19 @@ impl PacketScope {
         admission: &mut Option<super::packet_endpoint::EndpointAdmission>,
         check_output: bool,
         mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
-    ) -> (Rx, Option<honk_netstack::ValidatedSource>) {
+    ) -> (Rx, super::packet_endpoint::PacketReceive) {
         self.0.with(|inner| {
             let pending = check_output && inner.pending_source_output(packet);
             let Some(stack) = &mut inner.stack else {
-                return (Rx::Dropped(DropReason::Stale), None);
+                return (Rx::Dropped(DropReason::Stale), Default::default());
             };
-            let (rx, source, admitted) =
+            let (rx, report) =
                 stack.receive_with_tcp_admission(now, packet, |source| on_source(source, pending));
-            if let Some(id) = admitted {
+            if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
                 if let Some(vacant) = inner.slots.iter().position(Option::is_none) {
-                    let source = source.expect("new TCP admission has a validated tuple");
+                    let source = report
+                        .source
+                        .expect("new TCP admission has a validated tuple");
                     inner.slots[vacant] = Some(FlowSlot {
                         id,
                         client: source.src,
@@ -435,6 +438,7 @@ impl PacketScope {
                         tx: None,
                         callback: None,
                         accepted: false,
+                        rx_admitted: false,
                         routing: admission.take(),
                     });
                     inner.pending_routing += 1;
@@ -442,7 +446,7 @@ impl PacketScope {
                     stack.tcp_refuse(id, honk_netstack::Refuse::Drop);
                 }
             }
-            (rx, source)
+            (rx, inner.receive_result(report))
         })
     }
 
@@ -497,6 +501,7 @@ impl PacketScope {
                     tx: None,
                     callback: None,
                     accepted: true,
+                    rx_admitted: false,
                     routing: None,
                 });
                 None
@@ -693,6 +698,20 @@ impl Drop for RetirementCompletion<'_> {
 }
 
 impl Inner {
+    fn receive_result(
+        &self,
+        report: honk_netstack::ReceiveReport,
+    ) -> super::packet_endpoint::PacketReceive {
+        let qualified_rx = !self.closing
+            && !self.finished
+            && matches!(report.outcome, honk_netstack::ReceiveOutcome::TcpAccepted(id)
+                if self.slots.iter().flatten().any(|slot| slot.id == id && slot.rx_admitted));
+        super::packet_endpoint::PacketReceive {
+            source: report.source,
+            qualified_rx,
+        }
+    }
+
     /// Under this mutex: the driving device's wake, or `None` to notify the original owner.
     /// Returned/Abandoned progress goes to the original owner, never a stale device task.
     fn device_wake(&mut self) -> Option<Option<Waker>> {

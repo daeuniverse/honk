@@ -26,6 +26,7 @@ The stack is driven by exactly one owner through `&mut Stack`. It has no locks o
 | `receive(now, packet) -> Rx` | Borrows one complete IP packet and verifies its checksums (`RxMeta::VERIFY`). Retained TCP bytes are copied into stack-owned rings. UDP returns `Rx::Datagram` (Endpoint) or `Rx::Transparent` (transparent mode): **the returned range is valid only until the caller reuses or recycles the input buffer**. `Rx::TransparentOwned` owns a reassembled packet. `Rx::Dropped(reason)` is counted. |
 | `receive_with(now, packet, RxMeta) -> Rx` | Adds trusted TCP/UDP checksum provenance and/or GRO/USO metadata in transparent mode. Endpoint mode drops any metadata other than `RxMeta::VERIFY` as `Unsupported`; WireGuard cannot skip verification. See [Checksum trust](#checksum-trust) and [Segmentation offload](#segmentation-offload). |
 | `receive_with_source(now, packet, callback) -> (Rx, Option<ValidatedSource>)` | Verifies through the same parser/reassembler/checksum path. Only the current completed TCP/UDP packet yields `{src, dst, protocol, tcp_flags}`; TCP flags are verified header facts, not admission evidence. The callback runs before protocol state mutation/UDP dispatch; false drops as `NotForUs`. The returned receipt is a validity fact even when refused, **not** handshake, delivery or kernel accepted-child proof. Incomplete/invalid fragments and bad checksums yield no receipt. |
+| `receive_with_tcp_admission(now, packet, callback) -> (Rx, ReceiveReport)` | The same validation path reports `source` separately from `outcome`: `Unqualified`, `TcpAccepted(original_id)`, `TcpNew(exact_new_id)` or `DatagramValidated`. Source-only receive projects this report. Gated input, invalid handshake ACK, PAWS/sequence/ACK rejection, challenged RST/SYN and capacity discards do not become accepted input merely because `Rx` is `Consumed`. Valid TIME_WAIT FIN/old-data handling retains the original handle through compaction. |
 | `poll_transmit(now, out) -> Option<usize>` | Writes one complete IP packet to `out[..n]`. A too-small `out` returns `None` without losing the packet. `None` also means nothing is currently allowed by cwnd, rwnd or pacing. |
 | `poll_transmit_with(now, out, TxCaps) -> Option<Transmit>` | Same scheduler with optional TCP segmentation offload in transparent mode; returns `len`, `gso`, `csum` and the original known-TCP `flow` handle, or `None` for stateless/unknown-flow output. Endpoint mode ignores offload capabilities. `poll_transmit` is the plain-packet wrapper with `TxCaps::NONE` and discards metadata. |
 | `poll_control_transmit(now, out)` | Shares the TCP emitter without TCP/UDP payload. Preserves ordinary readiness, DRR and payload TLP work while emitting eligible ACK/RST/SYN/FIN/probes, TIME_WAIT ACKs and ICMP. Reserve control frame/descriptor credit before calling. |
@@ -154,12 +155,25 @@ Normal close closes admission and publishes the same control-plane shutdown sign
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install
 the current packet's reverse L2 association before any output consumer proceeds,
-or refuse a conflicting association before protocol state changes. `PacketEndpoints`
-threads that exact receipt without inspecting `poll_accept`, which may dequeue an
-older pending SYN. UDP queue/capacity errors remain unchanged: a callback can report
-valid source facts even when subsequent UDP work has no capacity. Existing receive
-APIs use a compile-time reporting-disabled path, with no reporting allocation or
-mutable cross-call “last packet” state.
+or refuse a conflicting association before protocol state changes. Source-aware scope
+and `PacketEndpoints` receives return `PacketReceive { source, qualified_rx }` (alongside
+`Rx` at the scope). The receipt remains validity-only, including on refusal. TCP's
+qualification is completed under that same mutex against the exact original FlowSlot.
+Only the actual successful non-Block winning stream calls `FlowIo::mark_rx_admitted`;
+pending routing, sniffing, task enqueue, failed dial and controller DNS do not set it.
+Later protocol-accepted input may qualify; a stale or closing marker cannot admit a
+successor. Captured route metadata still binds to the exact `TcpNew` id, not an older
+`poll_accept` occupant. New asynchronous SYNs are always unqualified: `accept_ready`
+only queues work, with no deferred token or retroactive credit.
+
+UDP qualifies only when the existing Ready-owner fast path returns `Enqueued`, including
+a zero-length datagram. Initializing/slow-path enqueues, unknown per-query DNS outcomes
+and successful refusal/no-op paths remain false; `Some(QueueFull/Closed/CapacityRejected/
+IdentityMismatch)` is not enqueue success. Ordinary, owned-reassembly and split payloads
+retain their dispatch and pressure semantics; a split input qualifies only if every
+chunk is Ready-enqueued. Existing queue/memory errors remain errors. Ordinary receive
+APIs use a compile-time reporting-disabled path, with no reporting allocation, extra
+parser, clock read or mutable cross-call “last packet” state.
 
 `PacketEndpoints` checks the passive accept queue under the existing scope mutex before reserving TCP/channel permits. Empty probes neither scan flow slots nor notify the owner. A queued SYN still reaches the existing immediate post-receive admission loop, including retries triggered by unrelated ingress after capacity returns; acceptance is not deferred to the batch tail. The query is only a negative hint: stale queued handles can still yield no accepted flow.
 

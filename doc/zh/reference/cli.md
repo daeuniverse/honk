@@ -21,6 +21,7 @@ honk-core [OPTIONS] [COMMAND]
 | `--disable-timestamp` | 关 | 控制台日志行不再带时间戳。在 systemd 或其他自带时间戳的日志系统下使用；`--log-file` 或 `global.log_file` 指定的文件仍带时间戳。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效过滤器时，选择 `debug` 作为默认控制台过滤器。 |
 | `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录警告并仅在本进程关闭 NFQUEUE 暂存。 |
+| `--busy-poll-calibration-experiment` | 关 | 仅供 XDP 实验：允许身份完整匹配的 `status: candidate` 轮询记录，仍运行与合格 adaptive 相同的有限 runtime/账本；不绕过身份、驻留、配额或显式 Event。记录绑定预先写好的实验登记，而不是未来成功结果。产品启动不应带此参数，reload 不能改变它。 |
 | `--store file\|db` | `file` | `db` 从 `<data-dir>/state/honk.db` 中的修订版本加载配置，数据库为空时导入 `-c`。见[配置数据库](./api.md#配置数据库--store-db)。 |
 | `--data-dir PATH` | `/var/lib/honk` | 数据目录，状态数据库位于其下的 `state/honk.db`，必须与 `global.data_dir` 相同。供 `--store db`、`config export` 与 `admin reset` 使用。 |
 

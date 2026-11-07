@@ -37,6 +37,12 @@ impl TcpFlow {
         matches!(self, Self::Kernel(_))
     }
 
+    pub(super) fn mark_packet_rx_admitted(&self) {
+        if let Self::Packet(flow) = self {
+            flow.stream.mark_rx_admitted();
+        }
+    }
+
     pub(super) async fn serve_dns(
         &mut self,
         controller: &crate::control::dns_control::DnsController,

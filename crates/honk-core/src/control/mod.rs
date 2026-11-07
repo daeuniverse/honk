@@ -25,6 +25,8 @@ use nfqueue_runtime::{
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
 mod lifecycle;
 pub mod packet_sniffer;
+#[cfg(target_os = "linux")]
+pub(crate) mod poll_budget;
 mod preconnect;
 mod probers;
 pub mod quic;
@@ -32,6 +34,8 @@ pub(crate) mod reload;
 #[cfg(test)]
 mod reload_tests;
 mod resource_budget;
+#[cfg(target_os = "linux")]
+pub use poll_budget::{PollBudgetBinding, PollBudgetPublisher, ProcessPollBudget};
 mod runtime;
 mod shutdown;
 mod task_registry;
@@ -212,6 +216,10 @@ pub struct ControlPlane {
     outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
     resource_budget: ResourceBudget,
     dns_socket_budget: crate::dns::transport::DnsSocketBudget,
+    #[cfg(target_os = "linux")]
+    process_polling: Option<PollBudgetBinding>,
+    #[cfg(target_os = "linux")]
+    polling: Option<Arc<crate::xdp::polling::PollingPublication>>,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
     tcp_admission_target: Arc<std::sync::atomic::AtomicUsize>,
     /// Cold non-DNS UDP initialization budget. Ready endpoints bypass it.

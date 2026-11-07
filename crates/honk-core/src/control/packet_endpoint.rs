@@ -155,6 +155,13 @@ impl EndpointAdmission {
     }
 }
 
+/// Source validity and proven admission for this input are independent facts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PacketReceive {
+    pub source: Option<ValidatedSource>,
+    pub qualified_rx: bool,
+}
+
 /// A bounded ingress handle. Copies share admission, scopes and one core UDP pool.
 #[derive(Clone)]
 pub struct PacketEndpoints {
@@ -416,7 +423,7 @@ impl PacketEndpoints {
         now: Instant,
         check_output: bool,
         on_source: impl FnMut(ValidatedSource, bool) -> bool,
-    ) -> io::Result<Option<ValidatedSource>> {
+    ) -> io::Result<PacketReceive> {
         self.receive_inner::<true>(scope, packet, now, None, check_output, on_source)
     }
 
@@ -429,7 +436,7 @@ impl PacketEndpoints {
         admission: EndpointAdmission,
         check_output: bool,
         on_source: impl FnMut(ValidatedSource, bool) -> bool,
-    ) -> io::Result<Option<ValidatedSource>> {
+    ) -> io::Result<PacketReceive> {
         self.receive_inner::<true>(scope, packet, now, Some(admission), check_output, on_source)
     }
 
@@ -441,7 +448,7 @@ impl PacketEndpoints {
         mut admission: Option<EndpointAdmission>,
         check_output: bool,
         on_source: impl FnMut(ValidatedSource, bool) -> bool,
-    ) -> io::Result<Option<ValidatedSource>> {
+    ) -> io::Result<PacketReceive> {
         let scope = self
             .shared
             .scopes
@@ -449,12 +456,12 @@ impl PacketEndpoints {
             .find(|item| item.scope() == scope)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unowned packet scope"))?;
         self.shared.udp_pool.reap_tasks();
-        let (rx, source) = if admission.is_some() {
+        let (rx, mut received) = if admission.is_some() {
             scope.receive_admitted_with_source(packet, now, &mut admission, check_output, on_source)
         } else if REPORT {
             scope.receive_with_source(packet, now, check_output, on_source)
         } else {
-            (scope.receive(packet, now), None)
+            (scope.receive(packet, now), PacketReceive::default())
         };
         let result = match rx {
             Rx::Transparent {
@@ -482,8 +489,9 @@ impl PacketEndpoints {
                 size,
             } => {
                 let mut failure = None;
+                let mut qualified = true;
                 for payload in packet[payload].chunks(usize::from(size)) {
-                    if let Err(error) = self.queue_datagram(
+                    match self.queue_datagram(
                         scope.scope(),
                         src,
                         dst,
@@ -491,15 +499,21 @@ impl PacketEndpoints {
                         admission.take(),
                         |budget| FundedDatagram::copy_from(payload, budget),
                     ) {
-                        failure.get_or_insert(error);
+                        Ok(enqueued) => qualified &= enqueued,
+                        Err(error) => {
+                            failure.get_or_insert(error);
+                        }
                     }
                 }
-                failure.map_or(Ok(()), Err)
+                failure.map_or(Ok(qualified), Err)
             }
-            _ => Ok(()),
+            _ => Ok(received.qualified_rx),
         };
         self.accept_ready(scope);
-        result.map(|()| source)
+        result.map(|qualified_rx| {
+            received.qualified_rx = REPORT && qualified_rx;
+            received
+        })
     }
 
     fn queue_datagram(
@@ -510,7 +524,7 @@ impl PacketEndpoints {
         dscp: u8,
         routing: Option<EndpointAdmission>,
         make: impl FnOnce(&Arc<MemoryBudget>) -> Option<FundedDatagram>,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         if self.shared.is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -526,19 +540,16 @@ impl PacketEndpoints {
         if destination.port() != 53 {
             let pool = &self.shared.udp_pool;
             let now = super::udp_endpoint::queue_now();
-            if pool
-                .fast_path_enqueue_payload_at(
-                    scope,
-                    source,
-                    destination,
-                    DatagramPayload::Funded(bytes.clone()),
-                    None,
-                    now,
-                    &self.shared.stats,
-                )
-                .is_some()
-            {
-                return Ok(());
+            if let Some(reservation) = pool.fast_path_enqueue_payload_at(
+                scope,
+                source,
+                destination,
+                DatagramPayload::Funded(bytes.clone()),
+                None,
+                now,
+                &self.shared.stats,
+            ) {
+                return Ok(matches!(reservation, EndpointReservation::Enqueued));
             }
             let initializer = self.initializers.try_reserve().map_err(|_| {
                 io::Error::new(
@@ -550,7 +561,7 @@ impl PacketEndpoints {
                 &self.shared.stats,
                 &self.shared.udp_slots,
             ) else {
-                return Ok(());
+                return Ok(false);
             };
             if let EndpointReservation::Initializing(mut lease) = pool
                 .reserve_payload_or_enqueue_at(
@@ -570,7 +581,7 @@ impl PacketEndpoints {
                 lease.packet_dscp = Some(dscp);
                 initializer.send(lease);
             }
-            return Ok(());
+            return Ok(false);
         }
         let source_work = self
             .shared
@@ -588,7 +599,7 @@ impl PacketEndpoints {
             bytes,
             source_work,
         }));
-        Ok(())
+        Ok(false)
     }
 
     fn accept_ready(&self, scope: &PacketScope) {

@@ -283,6 +283,11 @@ impl ControlPlane {
         if new_config != *current_config.as_ref() {
             new_config.validate_assembled()?;
         }
+        #[cfg(target_os = "linux")]
+        if let Err(reason) = self.prepare_polling_config(&new_config) {
+            warn!(reason, "reload rejected: process polling policy mismatch");
+            return Ok(ReloadOutcome::Rejected);
+        }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
         #[cfg(feature = "native-api")]
@@ -375,6 +380,8 @@ impl ControlPlane {
                 {
                     owner.activate(&new_config);
                 }
+                #[cfg(target_os = "linux")]
+                self.publish_polling_config(&new_config);
                 if declaring_sources_replaced(current_config.as_ref(), &new_config) {
                     *config = Arc::new(new_config);
                 }
@@ -810,6 +817,8 @@ impl ControlPlane {
                 *router_guard = new_router;
                 crate::ebpf::record_pname_routing(&router_guard, &**ebpf, &self.degradations);
                 *config_guard = Arc::new(new_config);
+                #[cfg(target_os = "linux")]
+                self.publish_polling_config(&config_guard);
                 match &self.quic_score_target {
                     Some(target) => {
                         target.set_needed(crate::control::probers::needs_quic_probe(&config_guard))

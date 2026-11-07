@@ -51,6 +51,22 @@ impl FlowIo {
         self.id
     }
 
+    /// Mark only a successfully selected non-Block outbound stream, never pending routing.
+    pub(in crate::control) fn mark_rx_admitted(&self) {
+        self.scope.0.with(|inner| {
+            if inner.closing || inner.finished {
+                return;
+            }
+            if let Some(slot) = inner.slot(self.id)
+                && slot.app_open
+                && !slot.close_pending
+                && !slot.retiring
+            {
+                slot.rx_admitted = true;
+            }
+        });
+    }
+
     pub(in crate::control) fn set_routing(
         &mut self,
         routing: Option<crate::control::packet_endpoint::EndpointAdmission>,

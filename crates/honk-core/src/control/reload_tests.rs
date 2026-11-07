@@ -128,6 +128,198 @@ fn datapath_restart_identity_uses_effective_setup_not_policy() {
     assert_eq!(restart_required_changes(&xdp, &candidate), ["datapath"]);
 }
 
+#[cfg(target_os = "linux")]
+fn polling_config() -> Config {
+    honk_config::parser::parse_dae_config(
+        r#"
+        global {
+            dial_mode: ip
+            nfqueue_enable: false
+        }
+        datapath {
+            backend: xdp
+            direct: endpoint
+            xsk_mode: copy
+            interface { dut0: lan }
+            busy_poll {
+                pps_enter: 100
+                pps_exit: 10
+                observation_window_us: 1000000
+                enter_windows: 2
+                exit_windows: 2
+                max_busy_us: 100
+                empty_rounds: 3
+                budget_window_us: 10000
+                budget_us: 1000
+            }
+        }
+        routing { fallback: direct }
+    "#,
+    )
+    .unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn polling_reload_changes_consumer_but_never_grants_new_quota() {
+    use honk_config::datapath::PollMode;
+    let original = polling_config();
+    let publisher = ProcessPollBudget::test_publisher(true);
+    let handle = publisher.participant_handle();
+    let mut plane = control_plane(original.clone())
+        .with_process_polling(PollBudgetBinding::Publisher(publisher))
+        .unwrap();
+    let (publication, _) = plane.polling_runtime().unwrap();
+    let allowance = |state: super::poll_budget::PollBudgetSnapshot| {
+        (
+            state.net_ns,
+            state.capacity_ns,
+            state.next_refill_ns,
+            state.active_id,
+            state.charged_ns,
+        )
+    };
+    let initial = allowance(handle.snapshot());
+    let revision = publication.revision();
+    let mut changed = original.clone();
+    changed
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .max_busy_us -= 1;
+    assert!(restart_required_changes(&original, &changed).is_empty());
+    assert!(
+        plane
+            .reload_runtime_config(changed.clone(), Default::default())
+            .await
+    );
+    assert!(publication.revision() > revision);
+    assert_eq!(allowance(handle.snapshot()), initial);
+    changed.datapath.as_mut().unwrap().poll_mode = Some(PollMode::Event);
+    assert!(
+        plane
+            .reload_runtime_config(changed.clone(), Default::default())
+            .await
+    );
+    assert_eq!(publication.snapshot().mode, PollMode::Event);
+    assert_eq!(
+        allowance(handle.snapshot()),
+        initial,
+        "Event cannot reset or refill the process schedule"
+    );
+    let mut consumer = crate::xdp::polling::AdaptivePoll::new(publication, Some(handle.clone()));
+    assert!(consumer.begin(true, None).is_none());
+    assert_eq!(consumer.reason, "explicit_event");
+    changed.datapath.as_mut().unwrap().poll_mode = Some(PollMode::Adaptive);
+    assert!(
+        plane
+            .reload_runtime_config(changed, Default::default())
+            .await
+    );
+    assert_eq!(
+        allowance(handle.snapshot()),
+        initial,
+        "adaptive reload cannot mint its own initial B"
+    );
+    plane.shutdown_runtime(None, None).await.unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn participant_prepare_rejects_known_mismatch_but_lost_commit_race_stays_event() {
+    use super::poll_budget::QuotaPolicy;
+    let original = polling_config();
+    let publisher = ProcessPollBudget::test_publisher(true);
+    let handle = publisher.participant_handle();
+    let root = Arc::new(PollBudgetBinding::Publisher(publisher));
+    let initial_policy = QuotaPolicy::from_config(
+        original
+            .datapath
+            .as_ref()
+            .unwrap()
+            .busy_poll
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    root.publish_policy(Some(initial_policy)).unwrap();
+    let mut plane = control_plane(original.clone())
+        .with_process_polling(PollBudgetBinding::Participant(handle.clone()))
+        .unwrap();
+    let before = handle.snapshot();
+    let mut incompatible = original.clone();
+    incompatible
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .budget_us += 1;
+    assert!(
+        !plane
+            .reload_runtime_config(incompatible.clone(), Default::default())
+            .await
+    );
+    assert_eq!(handle.snapshot(), before);
+    assert_eq!(
+        plane.polling_runtime().unwrap().0.snapshot().busy,
+        original.datapath.as_ref().unwrap().busy_poll
+    );
+
+    let policy = QuotaPolicy::from_config(
+        incompatible
+            .datapath
+            .as_ref()
+            .unwrap()
+            .busy_poll
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let expected = Arc::new(parking_lot::Mutex::new(None));
+    let committed = Arc::clone(&expected);
+    let publishing = Arc::clone(&root);
+    let observed = handle.clone();
+    let hook = plane.set_pre_dns_publication_hook(move |_| {
+        publishing.publish_policy(Some(policy)).unwrap();
+        *committed.lock() = Some(observed.snapshot());
+    });
+    let mut candidate = original.clone();
+    candidate
+        .datapath
+        .as_mut()
+        .unwrap()
+        .busy_poll
+        .as_mut()
+        .unwrap()
+        .observation_window_us += 1;
+    assert!(
+        plane
+            .reload_runtime_config(candidate, Default::default())
+            .await
+    );
+    drop(hook);
+    assert_eq!(
+        handle.snapshot(),
+        expected.lock().unwrap(),
+        "the participant commit must not mutate the publisher ledger"
+    );
+    let (publication, participant) = plane.polling_runtime().unwrap();
+    assert_eq!(
+        publication.snapshot().publication_error,
+        Some("process_budget_policy_mismatch")
+    );
+    let mut consumer = crate::xdp::polling::AdaptivePoll::new(publication, participant);
+    assert!(consumer.begin(true, None).is_none());
+    assert_eq!(consumer.reason, "process_budget_policy_mismatch");
+    assert_eq!(handle.snapshot().desired_policy, Some(policy));
+    plane.shutdown_runtime(None, None).await.unwrap();
+}
+
 #[test]
 fn native_api_settings_require_restart() {
     let current = Config::default();

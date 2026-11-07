@@ -246,8 +246,20 @@ async fn start_runtime(
     artifacts: &Path,
     admission: Arc<AtomicBool>,
 ) -> anyhow::Result<(Runtime, PacketEndpointOwner)> {
-    let (devices, topology, plans, scopes, core, memory, staging, mut links) =
-        prepare(&plane, config, pins).await?;
+    let (polling_publication, process_polling) =
+        plane.polling_runtime().expect("explicit XDP fixture");
+    let (
+        devices,
+        topology,
+        plans,
+        scopes,
+        core,
+        memory,
+        staging,
+        mut links,
+        polling_prefix,
+        polling_budget,
+    ) = prepare(&plane, config, pins).await?;
     let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(plane, scopes, 64)?;
     let realms = plans
         .into_iter()
@@ -281,6 +293,20 @@ async fn start_runtime(
         closing: false,
         pressure: Pressure::new(Instant::now()),
         core_maintenance_checked: Instant::now(),
+        polling: AdaptivePoll::new(polling_publication, process_polling),
+        polling_prefix,
+        polling_budget,
+        polling_affinity: None,
+        qualified_rx: 0,
+        qualification_unavailable: false,
+        rx_device: 0,
+        rx_queue: 0,
+        tx_realm: 0,
+        tx_class: 0,
+        round_cut_short: false,
+        policy_recheck: false,
+        context_recheck: false,
+        context_revision: 0,
         _memory: memory,
     };
     let timer = None;
@@ -335,6 +361,7 @@ async fn start_runtime(
         );
     }
     ensure!(!runtime.topology.get_mut().check_changed()?);
+    runtime.rebuild_polling_context();
     runtime.admission.store(true, Ordering::Release);
     runtime.endpoints.capture_ready()?;
     Ok((runtime, owner))
@@ -361,10 +388,25 @@ where
     R: Future<Output = PolicyRead<'policy>>,
 {
     tokio::pin!(event);
+    let notification = runtime.polling.notification();
+    tokio::pin!(notification);
     let mut output = None;
     let mut pending_reader = false;
     let mut armed_driver_timer = false;
+    let control = runtime.polling.test_control();
+    if held_publication {
+        control.clear_pending();
+    }
     loop {
+        if let Some(wait) = control.pending_wait()
+            && wait.reading
+            && wait.idle_ports
+            && !wait.pending_outputs
+            && let Some(due) = wait.driver_deadline
+            && wait.armed_deadline == Some(tokio::time::Instant::from_std(due))
+        {
+            armed_driver_timer = true;
+        }
         if output.is_some() && (held_publication || policy.reader.is_none()) {
             if held_publication {
                 assert!(
@@ -382,10 +424,6 @@ where
             }
             return Ok(output.take().unwrap());
         }
-        if output.is_none() && policy.reader.is_none() && runtime.core_due(Instant::now()) {
-            policy.reader.set(Some(acquire()));
-            policy.started += 1;
-        }
         if held_publication && let Some(read) = policy.reader.as_mut().as_pin_mut() {
             assert!(
                 futures::poll!(read).is_pending(),
@@ -398,49 +436,33 @@ where
             }
             pending_reader = true;
         }
+        let retained_core = runtime.waiting.len();
+        let started = std::cell::Cell::new(policy.started);
         tokio::select! {
             result = &mut event, if output.is_none() => output = Some(result?),
-            turned = turn(
+            joined = owner_step(
+                runtime,
+                owner,
                 policy.reader.as_mut(),
-                |cx| owner.poll_join_plane(cx),
-                |cx, reading| {
-                    let result = runtime.poll_service(cx, shutdown, policy.timer.as_mut(), reading);
-                    if held_publication && reading && result.is_pending() {
-                        let now = Instant::now();
-                        let due = runtime.realms.iter().filter_map(|realm| realm.driver.deadline()).min();
-                        let idle_ports = runtime.devices.iter().flat_map(|device| &device.queues).all(|queue| {
-                            let port = queue.io.get_ref();
-                            port.counters().submitted == port.counters().completed && !port.needs_service_retry()
-                        });
-                        if let Some(due) = due
-                            && due > now
-                            && idle_ports
-                            && runtime.realms.iter().all(|realm| realm.pending.iter().all(Option::is_none))
-                            && runtime.devices.iter().all(|device| !device.capture.vlan_metadata || due < device.metadata_checked + Duration::from_secs(1))
-                        {
-                            assert_eq!(runtime.next_deadline(now, false), Some(due), "the actual driver deadline wins without Core readers or a CQ retry");
-                            assert_eq!(policy.timer.as_ref().get_ref().as_ref().map(|sleep| sleep.deadline()), Some(tokio::time::Instant::from_std(due)), "poll_service must arm that same driver deadline");
-                            armed_driver_timer = true;
-                        }
-                    }
-                    result
-                },
+                || { started.set(started.get() + 1); Some(acquire()) },
                 shutdown,
-            ) => match turned {
-                Turn::Read(read) => {
-                    assert!(!held_publication, "the real writer is still held");
-                    if policy.blocked == Some(policy.started) {
-                        assert_eq!(runtime.waiting.len(), 1, "the original blocked reader resumes the retained Core packet");
-                        policy.resumed = Some(policy.started);
-                    }
-                    runtime.resolve(&read)?;
+                policy.timer.as_mut(),
+                notification.as_mut(),
+            ) => {
+                if joined?.is_some() {
+                    anyhow::bail!("real endpoint supervisor ended before capture close");
                 }
-                Turn::Serviced(result) => result?,
-                Turn::Joined(_) => anyhow::bail!("real endpoint supervisor ended before capture close"),
-                Turn::Shutdown => anyhow::bail!("real endpoint runtime shut down before the peer finished"),
             }
         }
-        tokio::task::yield_now().await;
+        policy.started = started.get();
+        if policy.blocked == Some(policy.started)
+            && retained_core == 1
+            && runtime.waiting.is_empty()
+            && policy.reader.is_none()
+        {
+            assert!(!held_publication, "the real writer is still held");
+            policy.resumed = Some(policy.started);
+        }
     }
 }
 
@@ -530,7 +552,6 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
             peer.command("FORWARDED", label).await?;
             drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("FORWARDED {label}")), false).await?;
             assert_eq!(policy.resumed, Some(queued), "the original queued acquisition completed after writer release, not a replacement reader");
-            assert!(runtime.waiting.is_empty() && runtime.pending.is_empty(), "the same Core owner resumes after its real writer releases");
         }
         }
         reader.set(None);
@@ -539,9 +560,11 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
         peer.command("STOP", "owned").await?;
         peer.expect("STOPPED owned").await?;
         let mut warned = false;
+        let notification = runtime.polling.notification();
+        tokio::pin!(notification);
         let (_plane, result) = join_endpoints(
             &mut owner,
-            |cx| runtime.poll_service(cx, &shutdown, timer.as_mut(), false),
+            |cx| runtime.poll_service(cx, &shutdown, timer.as_mut(), false, notification.as_mut()),
             Instant::now(),
             &mut warned,
         ).await??;

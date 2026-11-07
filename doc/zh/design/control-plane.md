@@ -49,6 +49,10 @@
 
 配置为 XDP 的守护进程复用同一 mode/flags coordinator，但会在 packet scope 准入或 capture ready 之前以禁用 NFQUEUE 的状态初始化软件 flags。初始化保持恢复后的 mode 不变；发布失败时，通过 packet supervisor 的 joined cleanup 拒绝启动。该路径不启动 TC listener 或 NFQUEUE helper，显式非 XDP packet embedding 仍保留独立生命周期。
 
+XDP 的可选轮询资源由进程启动点持有，与不可变的 `ResourceBudget` 尺寸值分开。唯一不可克隆的 publisher 派生共享 participant 句柄，普通 embedding 构造器不创建配额。reload、owner 替换或所有句柄被释放都不能重新初始化进程槽。有限 mutex 账本在整个进程最多允许一个同步 Busy 区间，持锁期间不访问设备/策略、不跨 await。按完整 BOOTTIME 时长计费，包括有用工作和调度停顿；结算未知时禁用 Busy，而不是退款。未结算活动区间跨过的补充边界作废，债务保留。
+
+轮询参数随现有本地配置提交发布。唯一 publisher 必须先按旧/已经暂存的策略把空闲账本推进至发布时间，**之后**才暂存新 W/B；保留推进所得的未来边界，不赠送 reload 配额。活动区间不会因发布而推进或补充。participant 的已知不匹配可在提交前拒绝；若准备后 publisher 发生竞争更新，participant 的本地提交仍被接受，但实际状态只能为 Event/mismatch，不能修改账本。预留和每个有限 Busy 段都重检本地 revision、独立的进程 revision 和 publisher 关闭状态。这些版本只控制可选调度，不构成 scoped flow/fact 权威。参数发布清空资格，不迁移 flow、不重启 TCP。
+
 对象准入会在进程名 probe 或任何 Aya loader 运行前拒绝隐式 `ByName` map pinning。外部对象必须声明未 pin 的 map；包括持久分配器在内，所有 pin 路径均由 core 显式提供，避免 loader 创建的别名逃出启动回滚。
 
 真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。

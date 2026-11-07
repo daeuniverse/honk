@@ -259,6 +259,10 @@ pub struct Cli {
     #[arg(long)]
     pub mock_ebpf: bool,
 
+    /// Permit fully bound candidate polling parameters for a preregistered lab experiment
+    #[arg(long)]
+    pub busy_poll_calibration_experiment: bool,
+
     /// Where the administered configuration lives: the `-c` file tree, or the
     /// revisions in `<data-dir>/state/honk.db`
     #[arg(long, value_enum, default_value = "file")]
@@ -901,6 +905,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         !xdp_mode || !cli.mock_ebpf,
         "XDP cannot be selected with --mock-ebpf"
     );
+    anyhow::ensure!(
+        !cli.busy_poll_calibration_experiment || xdp_mode,
+        "--busy-poll-calibration-experiment requires the explicit XDP backend"
+    );
     #[cfg(not(target_os = "linux"))]
     anyhow::ensure!(!xdp_mode, "XDP requires Linux");
     #[cfg(target_os = "linux")]
@@ -1001,6 +1009,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         ),
     }
     let dns_socket_budget = dns::transport::DnsSocketBudget::new(resource_budget.dns_sockets);
+    #[cfg(target_os = "linux")]
+    let process_polling = if xdp_mode {
+        Some(control::ProcessPollBudget::initialize_process(
+            cli.busy_poll_calibration_experiment,
+        )?)
+    } else {
+        None
+    };
     let tcp_flow_max = resource_budget.active_tcp_flows.saturating_mul(2);
     if tcp_flow_max < 256 {
         warn!(
@@ -1317,6 +1333,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
+    #[cfg(target_os = "linux")]
+    if let Some(publisher) = process_polling {
+        control_plane =
+            control_plane.with_process_polling(control::PollBudgetBinding::Publisher(publisher))?;
+    }
     if nfqueue_unavailable {
         control_plane
             .startup_downgrades()

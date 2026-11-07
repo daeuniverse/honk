@@ -828,7 +828,10 @@ fn a_tombstone_acks_old_data_without_extending_time_wait() {
         seg(fin_seq.wrapping_sub(4), ACK, our_end, peer.ts - 1, b"tail"), // PAWS
         seg(fin_seq.wrapping_sub(4), 0, 0, peer.ts + 1, b"tail"),         // no ACK
     ] {
-        assert_eq!(c.stack.receive(now, &bad), Rx::Consumed);
+        let (rx, report) = c.stack.receive_with_tcp_admission(now, &bad, |_| true);
+        assert_eq!(rx, Rx::Consumed);
+        assert!(report.source.is_some());
+        assert_eq!(report.outcome, honk_netstack::ReceiveOutcome::Unqualified);
         assert!(drain(&mut c.stack, now).is_empty());
     }
     // An old duplicate: one ACK, however many arrive before it leaves; the stored timestamp is
@@ -841,7 +844,12 @@ fn a_tombstone_acks_old_data_without_extending_time_wait() {
         b"tail",
     );
     for _ in 0..3 {
-        assert_eq!(c.stack.receive(now, &old), Rx::Consumed);
+        let (rx, report) = c.stack.receive_with_tcp_admission(now, &old, |_| true);
+        assert_eq!(rx, Rx::Consumed);
+        assert_eq!(
+            report.outcome,
+            honk_netstack::ReceiveOutcome::TcpAccepted(c.id)
+        );
     }
     let out = drain(&mut c.stack, now);
     assert_eq!(out.len(), 1);

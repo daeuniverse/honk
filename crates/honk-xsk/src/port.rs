@@ -102,12 +102,26 @@ impl PortConfig {
 pub struct PortCounters {
     pub submitted: u64,
     pub completed: u64,
+    /// Complete packets released to the TX producer, independent of descriptor count.
+    pub published_packets: u64,
+    /// Sticky overflow: publication and DMA ownership cannot be rolled back.
+    pub publication_count_unavailable: bool,
     pub rx: u64,
     pub fill: u64,
     pub invalid: u64,
     pub rx_kicks: u64,
     pub tx_kicks: u64,
     pub wakeup_errors: u64,
+}
+
+impl PortCounters {
+    fn published(&mut self) {
+        if let Some(next) = self.published_packets.checked_add(1) {
+            self.published_packets = next;
+        } else {
+            self.publication_count_unavailable = true;
+        }
+    }
 }
 
 #[repr(C)]
@@ -600,6 +614,7 @@ impl<L> Port<L> {
         self.tx_producer = self.tx_producer.wrapping_add(count as u32);
         self.counters.submitted += count as u64;
         self.rings.tx.publish_producer(self.tx_producer);
+        self.counters.published();
         if self.tx_batch_active {
             Ok(())
         } else {
@@ -905,6 +920,7 @@ impl<L> Port<L> {
         self.tx_free[class_index(prepared.class)] -= 1;
         self.counters.submitted += 1;
         self.rings.tx.publish_producer(self.tx_producer);
+        self.counters.published();
         if self.tx_batch_active {
             Ok(())
         } else {
@@ -1187,6 +1203,36 @@ mod tests {
             tx_batch_active: false,
             counters: PortCounters::default(),
             _bookkeeping: bookkeeping,
+        }
+    }
+
+    #[test]
+    fn packet_count_overflow_never_rolls_back_publication() {
+        for writer in [false, true] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.counters.published_packets = u64::MAX;
+            if writer {
+                port.transmit_with(TxClass::Bulk, 60, (), |_, chunks| {
+                    chunks[0].fill(0);
+                    Ok(())
+                })
+                .unwrap();
+            } else {
+                port.transmit(TxClass::Bulk, &[0; 14], &[0; 28], ())
+                    .unwrap();
+            }
+            assert_eq!(port.rings().tx_producer, 1);
+            assert_eq!(port.outstanding().count(), 1);
+            assert_eq!(port.counters().submitted, 1);
+            assert_eq!(port.counters().published_packets, u64::MAX);
+            assert!(port.counters().publication_count_unavailable);
+            port.rings.tx.publish_consumer(1);
+            port.rings.cq.write(0, port.rings.tx.read(0).addr);
+            port.rings.cq.publish_producer(1);
+            assert_eq!(port.complete(|_| {}).unwrap(), 1);
+            assert!(port.counters().publication_count_unavailable);
+            assert!(port.close().ready_for_backend_teardown());
         }
     }
 
@@ -2224,6 +2270,8 @@ mod tests {
         assert!(!port.tx_credit(TxClass::Control));
         assert_eq!(port.counters().submitted, 2);
         assert_eq!(port.counters().completed, 2);
+        assert_eq!(port.counters().published_packets, 2);
+        assert!(!port.counters().publication_count_unavailable);
     }
 
     #[test]
@@ -2277,6 +2325,7 @@ mod tests {
         assert!(port.kick().is_err());
         assert_eq!(port.counters().tx_kicks, 2);
         assert_eq!(port.counters().wakeup_errors, 2);
+        assert_eq!(port.counters().published_packets, 1);
         port.close_socket();
         assert_eq!(port.as_raw_fd(), -1);
         assert_eq!(port.outstanding().count(), 1);
@@ -2848,6 +2897,7 @@ mod tests {
             .is_err()
         );
         assert_eq!(port.rings().tx_producer, 0);
+        assert_eq!(port.counters().published_packets, 0);
         assert_eq!(port.tx_free[1], 4);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert!(
@@ -2858,6 +2908,8 @@ mod tests {
             .unwrap();
         assert!(port.needs_service_retry());
         assert_eq!(port.rings().tx_producer, 3);
+        assert_eq!(port.counters().submitted, 3);
+        assert_eq!(port.counters().published_packets, 1);
         assert!(port.tx_credit(TxClass::Bulk));
         assert!(!port.tx_packet_credit(TxClass::Bulk, 9000));
         port.rings.tx.publish_consumer(3);
@@ -2882,6 +2934,7 @@ mod tests {
         assert_eq!(port.tx_free[1], 4);
         assert!(port.sidecar.slots.iter().all(Option::is_none));
         assert!(port.tx_packet_credit(TxClass::Bulk, 9000));
+        assert_eq!(port.counters().published_packets, 1);
     }
 
     #[test]
@@ -3000,6 +3053,7 @@ mod tests {
         let (work, kick) = port.transmit_batch(|port| {
             for entry in 0..5 {
                 transmit_entry(port, entry, &drops)?;
+                assert_eq!(port.counters().published_packets, entry as u64 + 1);
             }
             assert!(!port.drain_state().closed);
             assert_eq!(port.rings().tx_producer, 5);
@@ -3021,6 +3075,8 @@ mod tests {
         }
         port.rings.tx.publish_consumer(5);
         assert_eq!(port.complete(|_| {}).unwrap(), 0);
+        assert_eq!(port.counters().published_packets, 5);
+        assert!(!port.counters().publication_count_unavailable);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
         drop(port);
@@ -3064,11 +3120,13 @@ mod tests {
             assert_eq!(port.drain_state().control_reserved, 0);
             assert_eq!(port.drain_state().bulk_reserved, 0);
             assert_eq!(port.rings().tx_producer, 1);
+            assert_eq!(port.counters().published_packets, 1);
             assert_eq!(port.outstanding().count(), 1);
             assert_eq!(drops.load(Ordering::Relaxed), 1);
             port.rings.cq.write(0, port.rings.tx.read(0).addr);
             port.rings.cq.publish_producer(1);
             assert_eq!(port.complete(|_| {}).unwrap(), 1);
+            assert_eq!(port.counters().published_packets, 1);
             assert_eq!(drops.load(Ordering::Relaxed), 2);
         }
     }
@@ -3096,6 +3154,7 @@ mod tests {
         assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
         assert_eq!(port.counters().submitted, 1);
         assert_eq!(port.counters().completed, 0);
+        assert_eq!(port.counters().published_packets, 1);
         assert_eq!(port.outstanding().count(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
     }

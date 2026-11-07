@@ -738,6 +738,9 @@ impl ControlPlaneHandle {
                 let mut proxy_stream = winner.stream;
                 let node = winner.node;
                 let score_reporter = winner.reporter;
+                if node.protocol() != honk_config::types::NodeProtocol::Block {
+                    flow.mark_packet_rx_admitted();
+                }
                 #[cfg(feature = "native-api")]
                 let attempt_id = winner.attempt_id;
                 #[cfg(feature = "native-api")]
