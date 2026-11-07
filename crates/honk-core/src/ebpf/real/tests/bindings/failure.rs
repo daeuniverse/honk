@@ -12,13 +12,13 @@ fn kernel_program(lab: &Lab, ifindex: u32, direction: Direction) -> u32 {
         .iter()
         .find(|h| (h.binding.ifindex.get(), h.binding.direction) == (ifindex, direction))
         .expect("owned binding");
-    owner::link_info(held.link.as_raw_fd()).unwrap().program_id
+    owner::link_info(link_fd(&held.link)).unwrap().program_id
 }
 
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn rejected_update_keeps_old_link_and_commits_the_healthy_direction() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbt_a", "hbt_ap");
         let foreign = foreign_link(ifindex, Direction::Ingress).unwrap();
@@ -106,7 +106,7 @@ fn rejected_update_keeps_old_link_and_commits_the_healthy_direction() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn device_deleted_before_verified_apply_reports_failure_without_recreating() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbx_a", "hbx_ap");
         let baseline = held_bpf_link_count();
@@ -142,7 +142,7 @@ fn device_deleted_before_verified_apply_reports_failure_without_recreating() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn rename_after_planning_is_not_confirmed_and_update_rolls_back() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbi_a", "hbi_ap");
         let baseline = held_bpf_link_count();
@@ -224,7 +224,7 @@ fn rename_after_planning_is_not_confirmed_and_update_rolls_back() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn device_deleted_before_attach_is_a_topology_change_not_an_attach_failure() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbt_gone", "hbt_gonep");
         let (plan, topology) = plan_for(&["hbt_gone"], &[]);

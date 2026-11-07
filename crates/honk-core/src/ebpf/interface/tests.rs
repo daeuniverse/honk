@@ -719,12 +719,16 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
         program,
         interface: format!("v{index}"),
     };
-    let fd = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+    let fd = || Hook::Link(std::fs::File::open("/dev/null").unwrap().into());
 
     let old = binding(2, Ingress, LanIngressL2);
     let other = binding(3, Egress, LanEgressL2);
     let mut owned = vec![(old.clone(), 10, fd()), (other.clone(), 11, fd())];
-    let first_fd = owned[0].2.as_raw_fd();
+    let raw = |hook: &Hook| match hook {
+        Hook::Link(fd) => fd.as_raw_fd(),
+        Hook::Filter(_) => unreachable!(),
+    };
+    let first_fd = raw(&owned[0].2);
     let updated = binding(2, Ingress, WanIngressL3);
     let commit = BindingCommit {
         add: vec![(updated.clone(), 12, fd())],
@@ -741,7 +745,7 @@ fn commit_replaces_existing_add_and_ignores_missing_removals() {
     );
     let closed = commit.apply_to(&mut owned);
     assert_eq!(closed.len(), 1);
-    assert_eq!(closed[0].as_raw_fd(), first_fd);
+    assert_eq!(raw(&closed[0]), first_fd);
     assert_eq!(owned.len(), 2);
     assert_eq!(owned[0].0, updated);
     assert_eq!(owned[0].1, 12);

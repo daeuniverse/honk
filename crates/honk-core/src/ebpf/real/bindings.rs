@@ -1,5 +1,10 @@
 //! Single owner of the TCX links on configured interfaces.
 //!
+//! Kernels before Linux 6.6 have no TCX; there each binding is a clsact
+//! direct-action filter at honk's own priority instead, with a fresh handle
+//! standing in for the link ID. Return codes mean the same in both: TCX_NEXT
+//! is TC_ACT_UNSPEC (continue to the next filter) and TCX_PASS is TC_ACT_OK.
+//!
 //! The backend holds the eight preloaded TC program FDs and one owned link per
 //! `(ifindex, direction)`. [`apply`] turns one validated [`InterfacePlan`] into
 //! a [`BindingCommit`] without any lock held: it creates links by interface
@@ -25,10 +30,10 @@ use aya_obj::generated::{
 
 use super::syscall::bpf_syscall;
 use crate::ebpf::interface::{
-    ApplyReport, Binding, BindingCommit, BindingSnapshot, Direction, InterfacePlan, TcProgram,
-    Topology,
+    ApplyReport, Binding, BindingCommit, BindingSnapshot, Direction, Hook, InterfacePlan,
+    TcProgram, Topology,
 };
-use crate::netlink::LinkSnapshot;
+use crate::netlink::{LinkSnapshot, NlSock};
 
 #[cfg(test)]
 mod tests;
@@ -38,10 +43,98 @@ const CHAIN_CAPACITY: usize = 64;
 
 type Key = (NonZeroU32, Direction);
 
+/// clsact priority of every honk filter: the highest, so it runs last, as
+/// a TCX link appended with `BPF_F_AFTER` does.
+pub(crate) const FILTER_PRIORITY: u16 = 0xfffe;
+
+/// TCX arrived in Linux 6.6. Tests can force the clsact path on any kernel
+/// with `HONK_TEST_CLSACT=1`.
+pub(crate) fn tcx_supported() -> bool {
+    static TCX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TCX.get_or_init(|| {
+        #[cfg(test)]
+        if std::env::var_os("HONK_TEST_CLSACT").is_some() {
+            return false;
+        }
+        super::kernel_version().is_some_and(|version| version >= (6, 6, 0))
+    })
+}
+
+fn filter_parent(direction: Direction) -> u32 {
+    match direction {
+        Direction::Ingress => crate::netlink::tc::TC_PARENT_INGRESS,
+        Direction::Egress => crate::netlink::tc::TC_PARENT_EGRESS,
+    }
+}
+
+/// Handles are never reused within a process, so a released filter can only
+/// ever delete itself, never a replacement at the same priority.
+fn next_filter_handle() -> u32 {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A clsact filter honk installed. The netlink socket is bound to the
+/// namespace the filter lives in, whichever thread drops it.
+pub struct TcFilter {
+    ifindex: u32,
+    direction: Direction,
+    handle: u32,
+    socket: parking_lot::Mutex<NlSock>,
+    /// IDs of every honk TC program: only a filter still running one of them
+    /// is deleted, so a recycled ifindex keeps its own filters.
+    programs: std::sync::Arc<[u32]>,
+}
+
+impl std::fmt::Debug for TcFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TcFilter")
+            .field("ifindex", &self.ifindex)
+            .field("direction", &self.direction)
+            .field("handle", &self.handle)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TcFilter {
+    pub(crate) fn handle(&self) -> u32 {
+        self.handle
+    }
+
+    /// The program this filter runs, if it is still on its device.
+    pub(crate) fn program_id(&self) -> io::Result<Option<u32>> {
+        Ok(self
+            .socket
+            .lock()
+            .dump_filters(self.ifindex, filter_parent(self.direction))?
+            .into_iter()
+            .find(|entry| entry.priority == FILTER_PRIORITY && entry.handle == self.handle)
+            .and_then(|entry| entry.program_id))
+    }
+}
+
+impl Drop for TcFilter {
+    fn drop(&mut self) {
+        let owned = self
+            .program_id()
+            .ok()
+            .flatten()
+            .is_some_and(|id| self.programs.contains(&id));
+        if owned {
+            let _ = self.socket.get_mut().del_filter(
+                self.ifindex,
+                filter_parent(self.direction),
+                FILTER_PRIORITY,
+                self.handle,
+            );
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct InterfaceBindings {
     programs: Vec<(TcProgram, OwnedFd)>,
-    owned: Vec<(Binding, u32, OwnedFd)>,
+    owned: Vec<(Binding, u32, Hook)>,
 }
 
 impl InterfaceBindings {
@@ -73,7 +166,7 @@ impl InterfaceBindings {
         })
     }
 
-    pub(super) fn owned(&self) -> &[(Binding, u32, OwnedFd)] {
+    pub(super) fn owned(&self) -> &[(Binding, u32, Hook)] {
         &self.owned
     }
 
@@ -83,22 +176,29 @@ impl InterfaceBindings {
     }
 
     pub(super) fn snapshot(&self) -> anyhow::Result<BindingSnapshot> {
-        let dup = |fd: &OwnedFd| fd.try_clone().context("duplicate TCX fd");
         Ok(BindingSnapshot {
             programs: self
                 .programs
                 .iter()
-                .map(|(program, fd)| Ok((*program, dup(fd)?)))
+                .map(|(program, fd)| {
+                    Ok((*program, fd.try_clone().context("duplicate TC program fd")?))
+                })
                 .collect::<anyhow::Result<_>>()?,
             owned: self
                 .owned
                 .iter()
-                .map(|(binding, id, fd)| Ok((binding.clone(), *id, dup(fd)?)))
+                .map(|(binding, id, hook)| {
+                    Ok((
+                        binding.clone(),
+                        *id,
+                        hook.try_clone().context("duplicate hook")?,
+                    ))
+                })
                 .collect::<anyhow::Result<_>>()?,
         })
     }
 
-    pub(super) fn commit(&mut self, commit: BindingCommit) -> Vec<OwnedFd> {
+    pub(super) fn commit(&mut self, commit: BindingCommit) -> Vec<Hook> {
         commit.apply_to(&mut self.owned)
     }
 
@@ -192,14 +292,14 @@ pub(crate) fn apply(
             interface: binding.interface.clone(),
         })
         .collect();
-    let links: HashMap<Key, OwnedFd> = owned
+    let links: HashMap<Key, Hook> = owned
         .into_iter()
         .map(|(binding, _, fd)| (binding.key(), fd))
         .collect();
 
     let mut report = ApplyReport::default();
     // Created or updated this round; confirmed against a fresh dump below.
-    let mut created: Vec<(Binding, u32, OwnedFd)> = Vec::new();
+    let mut created: Vec<(Binding, u32, Hook)> = Vec::new();
     let mut updated: Vec<(&Binding, u32, TcProgram)> = Vec::new();
 
     for step in diff(&held, &plan.bindings, verify) {
@@ -299,7 +399,7 @@ fn program_fd(programs: &[(TcProgram, OwnedFd)], program: TcProgram) -> anyhow::
 fn create_into(
     programs: &[(TcProgram, OwnedFd)],
     binding: &Binding,
-    created: &mut Vec<(Binding, u32, OwnedFd)>,
+    created: &mut Vec<(Binding, u32, Hook)>,
     report: &mut ApplyReport,
 ) -> bool {
     match create(programs, binding) {
@@ -333,7 +433,7 @@ fn device_gone(error: &anyhow::Error) -> bool {
 fn replace_dead(
     programs: &[(TcProgram, OwnedFd)],
     binding: &Binding,
-    created: &mut Vec<(Binding, u32, OwnedFd)>,
+    created: &mut Vec<(Binding, u32, Hook)>,
     report: &mut ApplyReport,
 ) {
     if !create_into(programs, binding, created, report) {
@@ -341,9 +441,9 @@ fn replace_dead(
     }
 }
 
-fn create(programs: &[(TcProgram, OwnedFd)], binding: &Binding) -> anyhow::Result<(u32, OwnedFd)> {
+fn create(programs: &[(TcProgram, OwnedFd)], binding: &Binding) -> anyhow::Result<(u32, Hook)> {
     let program = program_fd(programs, binding.program)?;
-    let fd = link_create(program, binding.ifindex.get(), binding.direction).with_context(|| {
+    let context = || {
         format!(
             "attach {} to {} (ifindex {}, {:?})",
             binding.program.name(),
@@ -351,23 +451,82 @@ fn create(programs: &[(TcProgram, OwnedFd)], binding: &Binding) -> anyhow::Resul
             binding.ifindex,
             binding.direction
         )
-    })?;
+    };
+    if !tcx_supported() {
+        let filter = create_filter(programs, program, binding).with_context(context)?;
+        return Ok((filter.handle, Hook::Filter(std::sync::Arc::new(filter))));
+    }
+    let fd =
+        link_create(program, binding.ifindex.get(), binding.direction).with_context(context)?;
     let info = link_info(fd.as_raw_fd()).context("read the new TCX link")?;
-    Ok((info.id, fd))
+    Ok((info.id, Hook::Link(fd)))
+}
+
+/// A filter at honk's priority that runs none of this process's programs was
+/// left by an instance that died without detaching: remove it first.
+fn create_filter(
+    programs: &[(TcProgram, OwnedFd)],
+    program: &OwnedFd,
+    binding: &Binding,
+) -> anyhow::Result<TcFilter> {
+    let ids: std::sync::Arc<[u32]> = programs
+        .iter()
+        .map(|(_, fd)| program_id(fd.as_raw_fd()))
+        .collect::<io::Result<Vec<_>>>()
+        .context("read TC program IDs")?
+        .into();
+    let (ifindex, parent) = (binding.ifindex.get(), filter_parent(binding.direction));
+    let mut socket = NlSock::new().context("netlink socket")?;
+    socket.add_clsact(ifindex).context("add clsact qdisc")?;
+    for stale in socket
+        .dump_filters(ifindex, parent)
+        .context("list filters")?
+    {
+        if stale.priority == FILTER_PRIORITY
+            && !stale.program_id.is_some_and(|id| ids.contains(&id))
+        {
+            socket
+                .del_filter(ifindex, parent, FILTER_PRIORITY, stale.handle)
+                .context("remove a stale honk filter")?;
+        }
+    }
+    let handle = next_filter_handle();
+    socket
+        .set_bpf_filter(
+            ifindex,
+            parent,
+            FILTER_PRIORITY,
+            handle,
+            program.as_raw_fd(),
+            binding.program.name(),
+            true,
+        )
+        .context("add clsact filter")?;
+    Ok(TcFilter {
+        ifindex,
+        direction: binding.direction,
+        handle,
+        socket: parking_lot::Mutex::new(socket),
+        programs: ids,
+    })
 }
 
 fn update(
     programs: &[(TcProgram, OwnedFd)],
-    links: &HashMap<Key, OwnedFd>,
+    links: &HashMap<Key, Hook>,
     to: &Binding,
     from: TcProgram,
 ) -> anyhow::Result<()> {
     let new = program_fd(programs, to.program)?;
     let old = program_fd(programs, from)?;
-    let link = links
+    let hook = links
         .get(&to.key())
         .ok_or_else(|| anyhow::anyhow!("owned link is missing from the snapshot"))?;
-    link_update(link.as_raw_fd(), new.as_raw_fd(), old.as_raw_fd()).with_context(|| {
+    let result = match hook {
+        Hook::Link(link) => link_update(link.as_raw_fd(), new.as_raw_fd(), old.as_raw_fd()),
+        Hook::Filter(filter) => filter_update(filter, new, old, to.program.name()),
+    };
+    result.with_context(|| {
         format!(
             "replace {} with {} on {} (ifindex {}, {:?})",
             from.name(),
@@ -379,8 +538,47 @@ fn update(
     })
 }
 
+/// clsact has no compare-and-swap: the expected program is checked first,
+/// then the filter is changed in place, which never leaves a gap.
+fn filter_update(filter: &TcFilter, new: &OwnedFd, old: &OwnedFd, name: &str) -> io::Result<()> {
+    let expected = program_id(old.as_raw_fd())?;
+    if filter.program_id()? != Some(expected) {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    filter.socket.lock().set_bpf_filter(
+        filter.ifindex,
+        filter_parent(filter.direction),
+        FILTER_PRIORITY,
+        filter.handle,
+        new.as_raw_fd(),
+        name,
+        false,
+    )
+}
+
+/// `BPF_OBJ_GET_INFO_BY_FD` on a program.
+pub(super) fn program_id(program: RawFd) -> io::Result<u32> {
+    let mut info: aya_obj::generated::bpf_prog_info = unsafe { core::mem::zeroed() };
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.info.bpf_fd = program as u32;
+    attr.info.info_len = size_of::<aya_obj::generated::bpf_prog_info>() as u32;
+    attr.info.info = (&mut info as *mut aya_obj::generated::bpf_prog_info) as u64;
+    unsafe { bpf_syscall(bpf_cmd::BPF_OBJ_GET_INFO_BY_FD as c_long, &mut attr) }.map_err(errno)?;
+    Ok(info.id)
+}
+
 /// Is `link_id` on the chain of the calling thread's network namespace?
 fn chain_has(binding: &Binding, link_id: u32) -> anyhow::Result<bool> {
+    if !tcx_supported() {
+        return filter_chain(binding.ifindex.get(), binding.direction)
+            .map(|chain| chain.contains_link(link_id))
+            .with_context(|| {
+                format!(
+                    "verify {} (ifindex {}, {:?}): list clsact filters",
+                    binding.interface, binding.ifindex, binding.direction
+                )
+            });
+    }
     let chain = query_chain(binding.ifindex.get(), binding.direction).with_context(|| {
         format!(
             "verify {} (ifindex {}, {:?}): query TCX chain",
@@ -411,6 +609,17 @@ fn confirm(
         _ => return Ok(false),
     }
     chain_has(binding, link_id)
+}
+
+/// Handles of honk-priority filters, as a chain whose "link IDs" are handles.
+pub(super) fn filter_chain(ifindex: u32, direction: Direction) -> io::Result<Chain> {
+    let links = NlSock::new()?
+        .dump_filters(ifindex, filter_parent(direction))?
+        .into_iter()
+        .filter(|entry| entry.priority == FILTER_PRIORITY && entry.program_id.is_some())
+        .map(|entry| entry.handle)
+        .collect();
+    Ok(Chain { links })
 }
 
 /// Link IDs on one chain, in order; 0 marks a legacy (non-link) attachment.

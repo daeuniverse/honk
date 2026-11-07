@@ -183,7 +183,7 @@ impl RealEbpfBackend {
 }
 
 mod attach;
-mod bindings;
+pub(crate) mod bindings;
 mod btf;
 mod events;
 mod iface_watch;
@@ -541,7 +541,7 @@ impl EbpfBackend for RealEbpfBackend {
     fn commit_interface_bindings(
         &mut self,
         commit: super::interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
+    ) -> Vec<super::interface::Hook> {
         self.bindings.commit(commit)
     }
 

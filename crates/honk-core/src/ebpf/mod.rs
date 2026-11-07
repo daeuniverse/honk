@@ -573,13 +573,13 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
-    /// Apply the commit and return replaced or removed link FDs. The caller
-    /// must close them outside any lock: the last close takes the rtnl lock.
+    /// Apply the commit and return replaced or removed hooks. The caller must
+    /// drop them outside any lock: the last drop takes the rtnl lock.
     #[cfg(feature = "ebpf")]
     fn commit_interface_bindings(
         &mut self,
         commit: interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd>;
+    ) -> Vec<interface::Hook>;
 
     /// Atomically publish a complete compiled routing plan into an inactive slot.
     /// Implementations stage every generation-owned fact map and program before

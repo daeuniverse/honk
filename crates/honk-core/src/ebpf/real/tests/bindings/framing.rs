@@ -87,7 +87,7 @@ fn gre_binds_l3_only_when_point_to_point() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn collect_md_gre_binds_l3() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         ip(&["link", "add", "hbgrex", "type", "gre", "external"]);
         let (plan, topology) = plan_for(&["hbgrex"], &[]);

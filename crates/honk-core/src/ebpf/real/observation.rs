@@ -87,8 +87,8 @@ impl RealEbpfBackend {
         let bound = owned
             .iter()
             .take(MAX_DATAPATH_ATTACHMENTS)
-            .map(|(binding, link_id, fd)| {
-                observe_binding(binding, *link_id, fd.as_raw_fd(), &result.loaded_programs)
+            .map(|(binding, link_id, hook)| {
+                observe_binding(binding, *link_id, hook, &result.loaded_programs)
             })
             .chain(dae0)
             .collect::<Vec<_>>();
@@ -122,23 +122,48 @@ impl RealEbpfBackend {
 fn observe_binding(
     binding: &Binding,
     link_id: u32,
-    link: RawFd,
+    hook: &crate::ebpf::interface::Hook,
     programs: &[DatapathProgram],
 ) -> anyhow::Result<DatapathAttachment> {
-    let info = bindings::link_info(link)?;
-    anyhow::ensure!(
-        info.id == link_id
-            && info.ifindex == binding.ifindex.get()
-            && info.attach_type == bindings::tcx_attach_type(binding.direction),
-        "interface identity changed during observation"
-    );
+    let (program_id, verified) = match hook {
+        crate::ebpf::interface::Hook::Link(link) => {
+            let info = bindings::link_info(link.as_raw_fd())?;
+            anyhow::ensure!(
+                info.id == link_id
+                    && info.ifindex == binding.ifindex.get()
+                    && info.attach_type == bindings::tcx_attach_type(binding.direction),
+                "interface identity changed during observation"
+            );
+            let verified = bindings::query_chain(binding.ifindex.get(), binding.direction)
+                .map_err(|error| anyhow::anyhow!("query TCX chain: {error}"))?
+                .contains_link(link_id);
+            (info.program_id, verified)
+        }
+        crate::ebpf::interface::Hook::Filter(filter) => {
+            anyhow::ensure!(
+                filter.handle() == link_id,
+                "interface identity changed during observation"
+            );
+            match filter
+                .program_id()
+                .map_err(|error| anyhow::anyhow!("list clsact filters: {error}"))?
+            {
+                Some(id) => (id, true),
+                None => {
+                    return Ok(DatapathAttachment {
+                        program: binding.program.name().to_owned(),
+                        interface: binding.interface.clone(),
+                        egress: binding.direction == Direction::Egress,
+                        state: DatapathCheck::Absent,
+                    });
+                }
+            }
+        }
+    };
     let program = programs
         .iter()
-        .find(|program| program.id == info.program_id)
+        .find(|program| program.id == program_id)
         .ok_or_else(|| anyhow::anyhow!("hook program is not owned"))?;
-    let verified = bindings::query_chain(binding.ifindex.get(), binding.direction)
-        .map_err(|error| anyhow::anyhow!("query TCX chain: {error}"))?
-        .contains_link(link_id);
     Ok(DatapathAttachment {
         program: program.name.clone(),
         interface: binding.interface.clone(),
@@ -158,6 +183,9 @@ fn observe_dae0(
     programs: &[DatapathProgram],
 ) -> anyhow::Result<DatapathAttachment> {
     let ifindex = nix::net::if_::if_nametoindex("dae0")?;
+    if !bindings::tcx_supported() {
+        return observe_dae0_filter(link, ifindex, programs);
+    }
     let fd: &FdLink = link.try_into()?;
     let info = fd.info()?;
     let program = programs
@@ -172,6 +200,39 @@ fn observe_dae0(
         interface: "dae0".to_owned(),
         egress: false,
         state: if verified {
+            DatapathCheck::Verified
+        } else {
+            DatapathCheck::Absent
+        },
+    })
+}
+
+/// Before Linux 6.6 Aya attaches dae0_ingress as a clsact filter; its
+/// priority and handle identify it in the ingress dump.
+fn observe_dae0_filter(
+    link: &aya::programs::tc::SchedClassifierLink,
+    ifindex: u32,
+    programs: &[DatapathProgram],
+) -> anyhow::Result<DatapathAttachment> {
+    let (priority, handle) = (link.priority()?, u32::from(link.handle()?));
+    let entry = crate::netlink::NlSock::new()?
+        .dump_filters(ifindex, crate::netlink::tc::TC_PARENT_INGRESS)?
+        .into_iter()
+        .find(|entry| entry.priority == priority && entry.handle == handle);
+    let program = entry
+        .and_then(|entry| entry.program_id)
+        .map(|id| {
+            programs
+                .iter()
+                .find(|program| program.id == id)
+                .ok_or_else(|| anyhow::anyhow!("hook program is not owned"))
+        })
+        .transpose()?;
+    Ok(DatapathAttachment {
+        program: program.map_or_else(|| "dae0_ingress".to_owned(), |p| p.name.clone()),
+        interface: "dae0".to_owned(),
+        egress: false,
+        state: if program.is_some() {
             DatapathCheck::Verified
         } else {
             DatapathCheck::Absent

@@ -39,7 +39,7 @@ fn up_pair(netlink: &mut NlSock, name: &str, peer: &str) -> u32 {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
-    private_netns(|| {
+    tcx_netns(|| {
         let lab = Lab::new();
         let programs = program_ids(&lab.backend);
         let Lab {

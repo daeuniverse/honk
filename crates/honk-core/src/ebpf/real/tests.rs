@@ -194,6 +194,10 @@ fn missing_dae0peer_attach_failure_is_propagated() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
+    // Counts BPF links; clsact filters before Linux 6.6 are not links.
+    if !super::bindings::tcx_supported() {
+        return;
+    }
     std::thread::spawn(|| {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
         let mut netlink = crate::netlink::NlSock::new().unwrap();

@@ -45,12 +45,11 @@ fn model_apply(
             None if fail_egress && binding.direction == Direction::Egress => report
                 .failed
                 .push((binding.clone(), anyhow::anyhow!("injected attach failure"))),
-            None => {
-                report
-                    .commit
-                    .add
-                    .push((binding.clone(), binding.ifindex.get() * 10, fake_fd()))
-            }
+            None => report.commit.add.push((
+                binding.clone(),
+                binding.ifindex.get() * 10,
+                crate::ebpf::interface::Hook::Link(fake_fd()),
+            )),
             Some((held, ..)) => {
                 if held.interface != binding.interface {
                     report.commit.rename.push((

@@ -51,6 +51,23 @@ fn chain(ifindex: u32, direction: Direction) -> Vec<u32> {
         .links
 }
 
+/// These cases prove TCX link semantics; kernels before 6.6 bind through
+/// clsact filters instead, covered by `bindings::clsact`.
+fn tcx_netns(test: impl FnOnce() + Send + 'static) {
+    if !owner::tcx_supported() {
+        eprintln!("skipped: no TCX before Linux 6.6");
+        return;
+    }
+    private_netns(test);
+}
+
+fn link_fd(hook: &crate::ebpf::interface::Hook) -> std::os::fd::RawFd {
+    match hook {
+        crate::ebpf::interface::Hook::Link(link) => link.as_raw_fd(),
+        crate::ebpf::interface::Hook::Filter(_) => panic!("TCX case holds a clsact filter"),
+    }
+}
+
 fn has_errno(error: &anyhow::Error, errno: i32) -> bool {
     error.chain().any(|cause| {
         cause
@@ -117,7 +134,7 @@ impl Round {
 struct Held {
     binding: Binding,
     id: u32,
-    link: OwnedFd,
+    link: crate::ebpf::interface::Hook,
 }
 
 struct Lab {
@@ -254,7 +271,8 @@ fn program_ids(backend: &RealEbpfBackend) -> BTreeMap<TcProgram, u32> {
 }
 
 /// Every record matches the kernel: link ID, interface index, attach type,
-/// program, and exactly one entry on the namespace-local chain.
+/// program, and exactly one entry on the namespace-local chain; a clsact
+/// filter, its handle and program as the only one at honk's priority.
 fn assert_truthful(held: &[Held], programs: &BTreeMap<TcProgram, u32>) {
     for held in held {
         let Binding {
@@ -263,8 +281,20 @@ fn assert_truthful(held: &[Held], programs: &BTreeMap<TcProgram, u32>) {
             program,
             ref interface,
         } = held.binding;
-        let info = owner::link_info(held.link.as_raw_fd()).unwrap();
         let what = format!("{interface} ({ifindex}, {direction:?})");
+        if let crate::ebpf::interface::Hook::Filter(filter) = &held.link {
+            assert_eq!(filter.handle(), held.id, "{what}: filter handle");
+            assert_eq!(
+                filter.program_id().unwrap(),
+                Some(programs[&program]),
+                "{what}: kernel filter runs another program than {}",
+                program.name()
+            );
+            let handles = owner::filter_chain(ifindex.get(), direction).unwrap().links;
+            assert_eq!(handles, [held.id], "{what}: honk filters {handles:?}");
+            continue;
+        }
+        let info = owner::link_info(link_fd(&held.link)).unwrap();
         assert_eq!(info.id, held.id, "{what}: link id");
         assert_eq!(info.ifindex, ifindex.get(), "{what}: link ifindex");
         assert_eq!(
@@ -299,6 +329,7 @@ async fn kernel_held(
     held
 }
 
+mod clsact;
 mod failure;
 mod framing;
 mod lazy;
@@ -307,7 +338,7 @@ mod watcher;
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn private_netns_binding_is_owned_and_detached_by_true_ifindex() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hb268", "hb268p");
         let sysfs = crate::netlink::ifindex_of("hb268");
@@ -353,7 +384,7 @@ fn private_netns_binding_is_owned_and_detached_by_true_ifindex() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn unchanged_plan_keeps_link_ids_and_leaves_foreign_hooks() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let lan = lab.veth("hbu_a", "hbu_ap");
         let wan = lab.veth("hbu_b", "hbu_bp");
@@ -408,7 +439,7 @@ fn unchanged_plan_keeps_link_ids_and_leaves_foreign_hooks() {
 #[ignore = "requires root; run via just test-netns"]
 fn role_and_framing_change_updates_links_in_place() {
     use TcProgram::*;
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbr_a", "hbr_ap");
         let foreign_in = foreign_link(ifindex, Direction::Ingress).unwrap();
@@ -525,7 +556,7 @@ fn role_and_framing_change_updates_links_in_place() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn moved_device_recreated_with_same_name_and_index_is_rebound() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbm_a", "hbm_ap");
         let away = fresh_netns();
@@ -558,7 +589,7 @@ fn moved_device_recreated_with_same_name_and_index_is_rebound() {
         // The held link FD still claims this ifindex; only the namespace-local
         // chain tells the two devices apart.
         for held in lab.held() {
-            let info = owner::link_info(held.link.as_raw_fd()).unwrap();
+            let info = owner::link_info(link_fd(&held.link)).unwrap();
             assert_eq!(info.ifindex, ifindex, "link info is ambiguous by design");
         }
         assert!(chain(ifindex, Direction::Ingress).is_empty());
@@ -610,7 +641,7 @@ fn moved_device_recreated_with_same_name_and_index_is_rebound() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn full_chain_fails_one_direction_and_retry_does_not_stack() {
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbf_a", "hbf_ap");
         let mut fillers = Vec::new();
@@ -666,7 +697,7 @@ fn full_chain_fails_one_direction_and_retry_does_not_stack() {
 #[ignore = "requires root; run via just test-netns"]
 fn observation_follows_add_replace_remove() {
     use crate::ebpf::{DatapathCheck, DatapathObservationError};
-    private_netns(|| {
+    tcx_netns(|| {
         let mut lab = Lab::new();
         let ifindex = lab.veth("hbo_a", "hbo_ap");
         let seen = |lab: &Lab| {

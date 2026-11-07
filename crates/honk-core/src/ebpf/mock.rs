@@ -163,7 +163,11 @@ pub struct MockEbpfBackend {
     pub binding_commits: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Bindings recorded by commits (no real links: `/dev/null` stand-in fds).
     #[cfg(feature = "ebpf")]
-    pub(crate) bound_interfaces: Vec<(crate::ebpf::interface::Binding, u32, std::os::fd::OwnedFd)>,
+    pub(crate) bound_interfaces: Vec<(
+        crate::ebpf::interface::Binding,
+        u32,
+        crate::ebpf::interface::Hook,
+    )>,
     pub routing_publication_order: Vec<MockRoutingPublicationWrite>,
     #[cfg(feature = "reload-bench-counters")]
     routing_map_writes: std::sync::Arc<std::sync::atomic::AtomicU64>,

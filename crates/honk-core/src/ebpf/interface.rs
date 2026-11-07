@@ -209,17 +209,36 @@ pub(crate) struct InterfacePlan {
     pub bound: Vec<(String, Vec<NonZeroU32>)>,
 }
 
+/// What keeps one interface binding attached; dropping the last holder
+/// detaches it.
+#[derive(Debug)]
+pub enum Hook {
+    /// A TCX link (Linux 6.6+).
+    Link(OwnedFd),
+    /// A clsact filter, for kernels without TCX; snapshots share it.
+    Filter(std::sync::Arc<crate::ebpf::real::bindings::TcFilter>),
+}
+
+impl Hook {
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        Ok(match self {
+            Self::Link(fd) => Self::Link(fd.try_clone()?),
+            Self::Filter(filter) => Self::Filter(std::sync::Arc::clone(filter)),
+        })
+    }
+}
+
 /// What the owner holds; moved into the apply step.
 #[derive(Debug, Default)]
 pub struct BindingSnapshot {
     pub(crate) programs: Vec<(TcProgram, OwnedFd)>,
-    /// `(binding, link id, dup of the link fd)`.
-    pub(crate) owned: Vec<(Binding, u32, OwnedFd)>,
+    /// `(binding, link id or filter handle, hook copy)`.
+    pub(crate) owned: Vec<(Binding, u32, Hook)>,
 }
 
 #[derive(Debug, Default)]
 pub struct BindingCommit {
-    pub(crate) add: Vec<(Binding, u32, OwnedFd)>,
+    pub(crate) add: Vec<(Binding, u32, Hook)>,
     pub(crate) remove: Vec<(NonZeroU32, Direction)>,
     pub(crate) reprogram: Vec<(NonZeroU32, Direction, TcProgram)>,
     /// Retained keys whose link now has another name (same ifindex).
@@ -252,11 +271,11 @@ impl BindingCommit {
         owned
     }
 
-    /// Apply to an owner's `(binding, link id, link fd)` table: removals, then
+    /// Apply to an owner's `(binding, id, hook)` table: removals, then
     /// reprograms and renames, then adds. An add for an existing
     /// `(ifindex, direction)` replaces it; a removal, reprogram or rename of a
-    /// missing key is ignored. Returns the replaced or removed FDs.
-    pub(crate) fn apply_to(self, owned: &mut Vec<(Binding, u32, OwnedFd)>) -> Vec<OwnedFd> {
+    /// missing key is ignored. Returns the replaced or removed hooks.
+    pub(crate) fn apply_to(self, owned: &mut Vec<(Binding, u32, Hook)>) -> Vec<Hook> {
         let mut closed = Vec::new();
         for gone in self.remove {
             if let Some(at) = owned.iter().position(|(b, ..)| b.key() == gone) {

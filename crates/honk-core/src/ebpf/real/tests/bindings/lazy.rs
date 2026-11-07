@@ -169,7 +169,7 @@ fn keys(kernel: &Kernel) -> Vec<(&str, Direction)> {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn startup_refuses_nested_entry_while_binding_the_ordinary_lan() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         down_veth("hbl_lan", "hbl_lanp");
         down_veth("hbl_nested", "hbl_nestedp");
@@ -234,7 +234,7 @@ fn startup_refuses_nested_entry_while_binding_the_ordinary_lan() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn absent_interfaces_start_pending_then_bind_release_and_rebind() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         let mut started = start(&rt, "absent", &["hbl_lan"], &["hbl_wan"]);
         let base = held_bpf_link_count();
@@ -335,7 +335,7 @@ fn only_one_interface_missing_binds_the_down_one_at_startup() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn startup_attach_failure_degrades_and_recovers_without_stacking() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         let ifindex = down_veth("hbl_full", "hbl_fullp");
         let mut foreign: Vec<_> = (0..63)
@@ -384,7 +384,7 @@ fn startup_attach_failure_degrades_and_recovers_without_stacking() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn bridge_member_leaving_releases_master_links_and_a_recreated_bridge_rebinds() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         ip(&["link", "add", "hbl_br", "type", "bridge"]);
         down_veth("hbl_p", "hbl_pp");
@@ -457,7 +457,7 @@ fn bridge_member_leaving_releases_master_links_and_a_recreated_bridge_rebinds() 
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn accept_ra_and_rp_filter_are_written_on_sight_for_dotted_names() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         down_veth("hbl.100", "hbl_ap");
         down_veth("hbl_lan", "hbl_lanp");
@@ -507,7 +507,7 @@ fn accept_ra_and_rp_filter_are_written_on_sight_for_dotted_names() {
 #[test]
 #[ignore = "requires root; run via just test-netns"]
 fn watcher_binds_on_an_event_from_the_subscription_startup_opened() {
-    private_netns(|| {
+    tcx_netns(|| {
         let rt = runtime();
         let mut started = start(&rt, "event", &["hbl_lan"], &[]);
         let handoff = started.handoff.take().unwrap();

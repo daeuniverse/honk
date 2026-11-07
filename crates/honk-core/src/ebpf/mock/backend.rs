@@ -855,7 +855,7 @@ impl EbpfBackend for MockEbpfBackend {
     fn commit_interface_bindings(
         &mut self,
         commit: ebpf::interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
+    ) -> Vec<ebpf::interface::Hook> {
         self.binding_commits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         commit.apply_to(&mut self.bound_interfaces)

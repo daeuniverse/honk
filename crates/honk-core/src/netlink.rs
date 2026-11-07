@@ -23,6 +23,8 @@ use nix::sys::time::TimeVal;
 
 #[cfg(feature = "ebpf")]
 mod netns_id;
+#[cfg(feature = "ebpf")]
+pub(crate) mod tc;
 
 pub(crate) fn ipv6_socket_available() -> std::io::Result<bool> {
     match socket2::Socket::new(
