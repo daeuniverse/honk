@@ -446,7 +446,7 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
                 ("other.private.example", "Other"),
             ]
             .into_iter()
-            .map(|(host, tag)| (host.to_owned(), Arc::from([tag.to_owned()])))
+            .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
             .collect(),
         ),
     );

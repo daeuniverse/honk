@@ -12,22 +12,18 @@ use honk_config::node::Node;
 use super::DnsService;
 
 /// Lowercase node server host to the tags of every subscription serving it.
-pub(crate) type NodeHosts = HashMap<String, Arc<[String]>>;
-
-fn routes_node_hosts(config: &Config) -> bool {
-    config.dns.routing.request.rules.iter().any(|rule| {
-        rule.conditions
-            .iter()
-            .any(|condition| matches!(condition, DnsCond::Subtag { .. }))
-    })
-}
+pub(crate) type NodeHosts = HashMap<String, Vec<String>>;
 
 /// The node hosts `config`'s `subtag()` rules may claim; empty without one.
 pub(crate) fn index(config: &Config) -> NodeHosts {
-    if !routes_node_hosts(config) {
-        return NodeHosts::new();
+    let mut hosts = NodeHosts::new();
+    if !config.dns.routing.request.rules.iter().any(|rule| {
+        rule.conditions
+            .iter()
+            .any(|condition| matches!(condition, DnsCond::Subtag { .. }))
+    }) {
+        return hosts;
     }
-    let mut hosts: HashMap<String, Vec<String>> = HashMap::new();
     for node in &config.nodes {
         let tags: Vec<&String> = config
             .subscriptions
@@ -54,9 +50,6 @@ pub(crate) fn index(config: &Config) -> NodeHosts {
         }
     }
     hosts
-        .into_iter()
-        .map(|(host, tags)| (host, tags.into()))
-        .collect()
 }
 
 struct NodeHostRouting(DnsService);
@@ -130,10 +123,7 @@ mod tests {
             1,
             "static nodes and IP literals are not claimable"
         );
-        assert_eq!(
-            hosts["node.example"].as_ref(),
-            ["MyAirport".to_owned(), "Other".to_owned()]
-        );
+        assert_eq!(hosts["node.example"], ["MyAirport", "Other"]);
 
         config.dns.routing.request.rules.clear();
         assert!(index(&config).is_empty());
