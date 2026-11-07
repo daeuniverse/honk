@@ -34,7 +34,6 @@ pub(crate) struct DownloadFailed {
     subscription: String,
     stage: &'static str,
     via: Option<Via>,
-    /// The rejecting answer, for the stages that come from a status.
     status: Option<http::StatusCode>,
     /// The io error behind a direct failure. Only its own text is kept: the
     /// error types around a request name its URL, which carries the token.
@@ -150,9 +149,6 @@ pub(crate) fn failure_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
-/// A hop's answer and the node that carried it, or why it failed.
-type Attempt = Result<(Reply, Option<Via>), DownloadFailed>;
-
 /// Where each request of a subscription fetch goes.
 pub(super) enum Hop<'a> {
     /// Straight to the host on the marked client, outside routing.
@@ -177,7 +173,7 @@ impl Hop<'_> {
         deadline: Instant,
     ) -> anyhow::Result<(Reply, Option<Via>)> {
         let max_bytes = super::MAX_SUBSCRIPTION_BYTES;
-        let reply: Attempt = match self {
+        let reply = match self {
             Self::Direct(client) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
@@ -191,8 +187,6 @@ impl Hop<'_> {
                                     DownloadFailed::new(subscription, error.stage, None)
                                 })
                         }
-                        // A failure that fits no stage, such as an invalid URL,
-                        // keeps its own message.
                         Err(error) => match direct_stage(&error) {
                             Some((stage, cause)) => Err(DownloadFailed {
                                 cause,
@@ -243,11 +237,7 @@ impl Hop<'_> {
     }
 }
 
-/// The stage of an error the direct client returns without one, from what it
-/// wraps: a timed-out socket, a TLS failure inside the handshake's io error, a
-/// lookup that found no address, or else any other connect error. With the
-/// io error's own text, the one cause that is safe to log. Nothing else (an
-/// invalid URL, an unsupported scheme) names a stage.
+/// Classify direct-client errors without retaining URL-bearing request wrappers.
 fn direct_stage(error: &anyhow::Error) -> Option<(&'static str, Option<String>)> {
     if let Some(failed) = error.downcast_ref::<marked_http::Error>() {
         return Some((failed.stage, None));
