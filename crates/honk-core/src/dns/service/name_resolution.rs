@@ -379,10 +379,14 @@ async fn resolve_claimed(
         node_host: true,
     };
     let mut operation = service.operation();
-    let responses =
+    let mut responses =
         resolve_with_forwarder(service, &mut operation, forwarder, domain, None, &options)
             .await?
             .fail_on_packet_rejection()?;
+    // Without a fallback, an exchange failure is the dial's error, not an empty answer.
+    let failure = [&mut responses.ipv4, &mut responses.ipv6]
+        .into_iter()
+        .find_map(|response| response.take_if(|response| response.is_err())?.err());
     let resolved = resolved_from_responses(responses);
     let (first, second) = if forwarder.strategy == DnsStrategy::PreferIpv6 {
         (resolved.ipv6, resolved.ipv4)
@@ -391,10 +395,12 @@ async fn resolve_claimed(
     };
     let addresses: Vec<IpAddr> = first.into_iter().chain(second).collect();
     if addresses.is_empty() {
-        return Err(NameResolutionError::NoAddresses {
-            domain: domain.to_owned(),
-        }
-        .into());
+        return Err(failure.unwrap_or_else(|| {
+            NameResolutionError::NoAddresses {
+                domain: domain.to_owned(),
+            }
+            .into()
+        }));
     }
     Ok(addresses)
 }

@@ -481,3 +481,34 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
     }
     assert_eq!(pool.0.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn claimed_node_host_reports_the_exchange_failure_not_an_empty_answer() {
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    for (replies, expected) in [
+        ([Reply::Failure, Reply::Failure], "scripted"),
+        ([Reply::Empty, Reply::Failure], "scripted 28 failure"),
+        ([Reply::Empty, Reply::Empty], "no A/AAAA records"),
+    ] {
+        let forwarder = DnsForwarder::new(
+            ScriptedPool::new(replies[0], replies[1]),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&config).expect("router")),
+        )
+        .with_strategy(DnsStrategy::Both)
+        .with_node_hosts(
+            [("node.example".to_owned(), vec!["MyAirport".to_owned()])]
+                .into_iter()
+                .collect(),
+        );
+        let error = DnsService::with_forwarder(Arc::new(forwarder))
+            .resolve_node_host("node.example")
+            .await
+            .expect_err("a claimed lookup without addresses fails");
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+    }
+}
