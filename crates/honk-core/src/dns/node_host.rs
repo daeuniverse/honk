@@ -130,6 +130,31 @@ mod tests {
     }
 
     #[test]
+    fn indexes_the_xhttp_download_host_of_a_subscription_node() {
+        let mut config = honk_config::parser::parse_dae_config(
+            "subscription {\n MyAirport: 'https://sub.invalid/'\n}\ndns {\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
+        )
+        .unwrap();
+        let mut link =
+            reqwest::Url::parse("vless://b831381d-6324-4d53-ad4f-8cda48b30811@up.example:443")
+                .unwrap();
+        link.query_pairs_mut()
+            .append_pair("type", "xhttp")
+            .append_pair("security", "tls")
+            .append_pair(
+                "extra",
+                r#"{"downloadSettings":{"address":"down.example","port":8443,"network":"xhttp","security":"tls","alpn":["h2"]}}"#,
+            );
+        let mut node = Node::from_share_link(link.as_str()).unwrap();
+        node.subscription_id = Some(config.subscriptions[0].id);
+        config.nodes.push(node);
+
+        let mut hosts: Vec<_> = index(&config).into_keys().collect();
+        hosts.sort();
+        assert_eq!(hosts, ["down.example", "up.example"]);
+    }
+
+    #[test]
     fn hook_declines_indexed_hosts_no_rule_claims() {
         struct NoPool;
 
