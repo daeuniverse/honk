@@ -1,5 +1,5 @@
 use super::*;
-use crate::ebpf::{EbpfBackend, RoutingPushPhase, mock::MockEbpfBackend};
+use crate::ebpf::{EbpfBackend, PolicyBackend, RoutingPushPhase, mock::MockEbpfBackend};
 use honk_config::types::DialMode;
 use std::collections::HashMap;
 

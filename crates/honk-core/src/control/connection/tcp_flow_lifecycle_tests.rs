@@ -28,12 +28,12 @@ fn reverse_tuple() -> TuplesKey {
     )
 }
 
-fn backend() -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+fn backend() -> Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> {
     Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())))
 }
 
 fn removal_worker(
-    backend: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: &Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     pins: &Arc<TcpFlowPins>,
     tracker: &Arc<ConnectionTracker>,
 ) -> (
@@ -170,15 +170,20 @@ async fn tcp_flow_guard_abort_releases_pin_tracker_and_socket() -> anyhow::Resul
 async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
     let tuple = forward_tuple();
     let backend = backend();
-    backend.write().await.tcp_conn_state_store(
-        &tuple,
-        &ConnState {
-            state: TcpState::TcpStateActive as u8,
-            incarnation: 1,
-            last_seen_ns: 0,
-            ..Default::default()
-        },
-    )?;
+    backend
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuple,
+            &ConnState {
+                state: TcpState::TcpStateActive as u8,
+                incarnation: 1,
+                last_seen_ns: 0,
+                ..Default::default()
+            },
+        )?;
     let pins = Arc::new(TcpFlowPins::default());
     let tracker = Arc::new(ConnectionTracker::new());
     let (pool, port, worker, fatal) = removal_worker(&backend, &pins, &tracker);
@@ -204,11 +209,27 @@ async fn tcp_retire_waits_for_final_owner() -> anyhow::Result<()> {
     );
 
     assert!(first.retire(Default::default()).await);
-    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_some());
+    assert!(
+        backend
+            .read()
+            .await
+            .tc()
+            .unwrap()
+            .conn_state_lookup(&tuple)?
+            .is_some()
+    );
     assert!(pins.snapshot().contains(&TcpFlowKey::from_tuples(&tuple)));
 
     assert!(second.retire(Default::default()).await);
-    assert!(backend.read().await.conn_state_lookup(&tuple)?.is_none());
+    assert!(
+        backend
+            .read()
+            .await
+            .tc()
+            .unwrap()
+            .conn_state_lookup(&tuple)?
+            .is_none()
+    );
     assert!(pins.snapshot().is_empty());
     stop_removals(pool, &port, worker, fatal).await?;
     Ok(())
@@ -226,7 +247,9 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     };
     let backend = backend();
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         backend.tcp_conn_state_store(&tuple, &old)?;
         backend.tcp_conn_state_store(&reverse, &old)?;
     }
@@ -246,7 +269,9 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     );
     flow.track(tracked_entry("replacement"));
 
-    let mut backend_guard = backend.write().await;
+    let mut backend_guard = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+        backend.tc_mut().unwrap()
+    });
     let retire = tokio::spawn(flow.retire(Default::default()));
     tokio::task::yield_now().await;
     assert_eq!(
@@ -265,7 +290,8 @@ async fn tcp_retire_preserves_newer_incarnation() -> anyhow::Result<()> {
     drop(backend_guard);
     assert!(retire.await?);
 
-    let backend = backend.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     assert_eq!(
         backend
             .conn_state_lookup(&tuple)?

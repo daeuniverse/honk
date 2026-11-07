@@ -10,14 +10,14 @@ use super::worker;
 use super::{ProjectionObservation, RoutingProjection, RoutingProjectionSnapshot};
 use crate::ebpf::maps;
 use crate::ebpf::mock::MockEbpfBackend;
-use crate::ebpf::{EbpfBackend, ProjectionMapOperation};
+use crate::ebpf::{PolicyBackend, ProjectionMapOperation};
 use crate::routing::Router;
 
 fn host_ip(ip: IpAddr) -> super::state::ProjectionIp {
     super::state::ProjectionIp::new(honk_datapath::ScopeId::HOST, ip)
 }
 
-type SharedBackend = Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>;
+type SharedBackend = Arc<tokio::sync::RwLock<Box<dyn PolicyBackend>>>;
 type TestProjection = (
     RoutingProjection,
     tokio::sync::mpsc::Receiver<()>,

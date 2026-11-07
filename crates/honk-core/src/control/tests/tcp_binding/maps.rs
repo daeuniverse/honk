@@ -65,7 +65,13 @@ pub(super) async fn await_conn(
 ) -> anyhow::Result<ConnState> {
     tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
         loop {
-            let conn = handle.ebpf.read().await.conn_state_lookup(key)?;
+            let conn = handle
+                .ebpf
+                .read()
+                .await
+                .tc()
+                .unwrap()
+                .conn_state_lookup(key)?;
             if let Some(conn) = conn.filter(&ready) {
                 return Ok::<_, anyhow::Error>(conn);
             }

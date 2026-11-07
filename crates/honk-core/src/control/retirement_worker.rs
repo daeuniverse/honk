@@ -227,7 +227,7 @@ impl Ingress {
 /// Admitted I/O and guards stay with this joined owner after waiter cancellation.
 pub(in crate::control) fn spawn_retirement_worker(
     udp_pool: Arc<UdpEndpointPool>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     tracker: Arc<ConnectionTracker>,
     fatal_tx: mpsc::UnboundedSender<anyhow::Error>,
     tcp_flow_pins: Arc<TcpFlowPins>,
@@ -255,7 +255,10 @@ pub(in crate::control) fn spawn_packet_retirement_worker(
     spawn_worker(udp_pool, tracker, fatal_tx, None, None, None)
 }
 
-type KernelRetirement = (Arc<RwLock<Box<dyn EbpfBackend>>>, Arc<TcpFlowPins>);
+type KernelRetirement = (
+    Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+    Arc<TcpFlowPins>,
+);
 
 fn spawn_worker(
     udp_pool: Arc<UdpEndpointPool>,
@@ -275,7 +278,13 @@ fn spawn_worker(
         };
         let hints = match (retained_hints, kernel.as_ref()) {
             (Some(receiver), _) => Some(receiver),
-            (None, Some((backend, _))) => backend.write().await.take_expiry_hints(),
+            (None, Some((backend, _))) => match backend.write().await.tc_mut() {
+                Ok(tc) => tc.take_expiry_hints(),
+                Err(error) => {
+                    let _ = fatal_tx.send(error.context("TC retirement capability unavailable"));
+                    None
+                }
+            },
             (None, None) => None,
         };
         let mut ingress = Ingress {
@@ -337,11 +346,17 @@ fn spawn_worker(
                 }
             }
             requests.extend(slots.iter().filter_map(|slot| slot.request));
+            outcomes[..requests.len()].fill(RetireOutcome::NotRun);
             let batch_ok = requests.is_empty()
                 || match backend
                     .as_mut()
                     .expect("kernel requests require kernel authority")
-                    .retire_batch(&requests, &mut outcomes[..requests.len()])
+                    .tc_mut()
+                    .map_err(|source| crate::ebpf::RetireError {
+                        counts: Default::default(),
+                        source,
+                    })
+                    .and_then(|tc| tc.retire_batch(&requests, &mut outcomes[..requests.len()]))
                 {
                     Ok(_) => true,
                     Err(error) => {
@@ -502,7 +517,8 @@ mod tests {
                 ..ConnState::default()
             },
         )?;
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(mock)));
         let pool = Arc::new(UdpEndpointPool::new());
         let pins = Arc::new(TcpFlowPins::default());
         let tracker = Arc::new(ConnectionTracker::new());
@@ -544,7 +560,9 @@ mod tests {
             process: None,
             process_path: None,
         });
-        let locked = backend.read().await;
+        let locked = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         let (fatal_tx, mut fatal_rx) = mpsc::unbounded_channel();
         let worker = spawn_retirement_worker(
             Arc::clone(&pool),
@@ -596,7 +614,15 @@ mod tests {
         })?;
         assert_eq!(hints.try_recv()?.incarnation, 71);
         assert_eq!(confirmation.await, CloseOutcome::Closed);
-        assert!(backend.read().await.conn_state_lookup(&key)?.is_none());
+        assert!(
+            backend
+                .read()
+                .await
+                .tc()
+                .unwrap()
+                .conn_state_lookup(&key)?
+                .is_none()
+        );
         assert!(!pins.contains(&key));
         assert!(tracker.snapshot().is_empty());
         assert_eq!(
@@ -634,7 +660,7 @@ mod tests {
             50001,
             6,
         );
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
         let pool = Arc::new(UdpEndpointPool::new());
         let pins = Arc::new(TcpFlowPins::default());

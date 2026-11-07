@@ -27,7 +27,8 @@ async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::R
         }
         let faults = Arc::clone(&model.telemetry_faults);
         let admission = Arc::clone(&model.admission_pressure);
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
         let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
         let start = tokio::time::Instant::now();
         let mut state = tick::TickState::new(start);
@@ -80,7 +81,7 @@ async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::R
         }
         *faults.lock() = MockTelemetryFaults::default();
         assert_eq!(
-            backend.read().await.aux_occupancy()?.0,
+            backend.read().await.tc().unwrap().aux_occupancy()?.0,
             count.saturating_sub(JANITOR_MAX_CANDIDATES * 4) as u64
         );
         for round in 5..=7 {

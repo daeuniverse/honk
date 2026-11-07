@@ -298,7 +298,7 @@ pub(crate) fn group_connectivity_snapshot(
 }
 
 pub(crate) fn publish_group_connectivity(
-    ebpf: &mut dyn EbpfBackend,
+    ebpf: &mut dyn crate::ebpf::PolicyBackend,
     snapshot: &[GroupConnectivity],
 ) -> anyhow::Result<()> {
     for &(outbound, domain, ipver, alive) in snapshot {
@@ -308,7 +308,7 @@ pub(crate) fn publish_group_connectivity(
 }
 
 pub(crate) fn open_group_connectivity(
-    ebpf: &mut dyn EbpfBackend,
+    ebpf: &mut dyn crate::ebpf::PolicyBackend,
     group_count: usize,
 ) -> anyhow::Result<()> {
     for index in 0..group_count {

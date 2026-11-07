@@ -6,14 +6,14 @@ use tokio::sync::{RwLock, mpsc};
 use tokio::time::Instant;
 
 use super::{ProjectionCounters, RoutingProjection};
-use crate::ebpf::{EbpfBackend, maps};
+use crate::ebpf::{PolicyBackend, maps};
 
 const WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) async fn run(
     projection: std::sync::Weak<RoutingProjection>,
     mut receiver: mpsc::Receiver<()>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
     counters: Arc<ProjectionCounters>,
 ) {
     let mut last_warning = None;
@@ -54,7 +54,7 @@ pub(super) async fn run(
 
 async fn flush(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn PolicyBackend>>,
     counters: &ProjectionCounters,
     last_warning: &mut Option<Instant>,
 ) {
@@ -63,7 +63,7 @@ async fn flush(
 
 async fn flush_after_snapshot(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn PolicyBackend>>,
     counters: &ProjectionCounters,
     last_warning: &mut Option<Instant>,
     after_snapshot: impl FnOnce(),
@@ -146,7 +146,7 @@ async fn flush_after_snapshot(
 #[cfg(test)]
 pub(super) async fn flush_for_test(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn PolicyBackend>>,
 ) {
     let mut last_warning = None;
     flush(projection, ebpf, &projection.counters, &mut last_warning).await;
@@ -155,7 +155,7 @@ pub(super) async fn flush_for_test(
 #[cfg(test)]
 pub(super) async fn flush_for_test_after_snapshot(
     projection: &RoutingProjection,
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn PolicyBackend>>,
     after_snapshot: impl FnOnce(),
 ) {
     let mut last_warning = None;

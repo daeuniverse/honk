@@ -436,7 +436,7 @@ pub enum PnameSupport {
 /// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
 pub(crate) fn record_pname_routing(
     router: &crate::routing::Router,
-    backend: &dyn EbpfBackend,
+    backend: &dyn PolicyBackend,
     degradations: &crate::degradations::Degradations,
 ) {
     use crate::degradations::{Component, Issue};
@@ -460,8 +460,12 @@ pub(crate) fn record_pname_routing(
     }
 }
 
+/// Policy publication shared by kernel and software execution owners.
 #[async_trait]
-pub trait EbpfBackend: Send + Sync {
+pub trait PolicyBackend: Send + Sync {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
+
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {
         DatapathObservation::unknown(DatapathKind::Unknown)
@@ -500,36 +504,18 @@ pub trait EbpfBackend: Send + Sync {
     }
     #[cfg(test)]
     fn clear_projection_write_log(&mut self) {}
-    fn detach_hooks(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    /// Open or close admission at the TC entry points. Implementations must
-    /// publish listener sockets before setting this to `true`.
-    fn set_datapath_ready(&mut self, _ready: bool) -> anyhow::Result<()> {
-        Ok(())
-    }
 
-    /// Write the mode-based direct-offload policy (the
-    /// `DATAPATH_FLAG_OFFLOAD_*` bits) into `DATAPATH_FLAGS_MAP`.  The
-    /// control plane recomputes and pushes the full word on startup, at the
-    /// reload commit point, and on every clash mode switch; `lan_ingress`
-    /// reads it once per new flow and caches the decision per flow, so the
-    /// write takes effect for new flows only — established flows keep the
-    /// decision they were created with.
-    fn set_datapath_flags(&mut self, _flags: u32) -> anyhow::Result<()> {
-        Ok(())
-    }
+    /// Open or close this backend's admission; TC requires published listeners.
+    fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()>;
+
+    /// Publish the composed mode/admission flags supported by this backend.
+    fn set_datapath_flags(&mut self, flags: u32) -> anyhow::Result<()>;
     #[cfg(test)]
     fn arm_datapath_flags_write_fault(&mut self, _nth: usize) -> anyhow::Result<()> {
         anyhow::bail!("datapath flag fault injection is unsupported")
     }
     #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, _origin: DatapathFlagsWriteOrigin) {}
-    #[cfg(test)]
-    fn arm_quiesce_fault(&mut self) {}
     #[cfg(test)]
     fn datapath_flags_write_log(&self) -> Vec<u32> {
         Vec::new()
@@ -541,64 +527,7 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(test)]
     fn clear_datapath_flags_write_log(&mut self) {}
 
-    /// After READY has been cleared, wait for every kernel invocation that
-    /// observed the prior fence to finish, then remove all unpublished or
-    /// pending staged states. Delayed NFQUEUE deliveries therefore fail
-    /// token lookup instead of crossing a runtime-generation boundary.
-    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Attach the dae0peer_ingress TC program after dae0peer has been moved
-    /// into the isolated daens namespace.  The attach runs inside a scoped
-    /// `with_daens_netns` switch — the process threads always stay in the
-    /// host netns — while the dae0peer interface and the TPROXY listener
-    /// sockets both live in daens.
-    fn attach_dae0peer_ingress(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Attach the sk_lookup program to the isolated daens namespace (also a
-    /// scoped switch).  The program overrides socket selection for
-    /// proxy-bound packets arriving on dae0peer and delivers them to the
-    /// daens-resident TPROXY listener while keeping the original destination
-    /// intact.
-    fn attach_sk_lookup(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Publish transparent listeners after their required address-family proofs
-    /// are attached. Missing TCP6 leaves slot 1 empty, never an IPv4 substitute.
-    /// Keys: 0 TCP4, 1 TCP6, 2.. IPv4 UDP, 2 + UDP_LISTENER_COUNT.. IPv6 UDP.
-    /// UDP descriptors must be in flow-hash slot order.
-    fn publish_listener_sockets(
-        &mut self,
-        _tcp4_fd: std::os::unix::io::RawFd,
-        _tcp6_fd: Option<std::os::unix::io::RawFd>,
-        _udp4_fds: &[std::os::unix::io::RawFd],
-        _udp6_fds: &[std::os::unix::io::RawFd],
-    ) -> anyhow::Result<()> {
-        Ok(())
-    }
-
-    /// Release all published listener references only after admission is closed
-    /// and the caller has joined ingress. Errors never authorize reopening.
-    fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
-
     async fn cleanup(&mut self) -> anyhow::Result<()>;
-
-    /// Snapshot what this backend owns for the interface reconciler: program
-    /// FDs plus dup'd link FDs.
-    #[cfg(feature = "ebpf")]
-    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
-
-    /// Apply the commit and return replaced or removed link FDs. The caller
-    /// must close them outside any lock: the last close takes the rtnl lock.
-    #[cfg(feature = "ebpf")]
-    fn commit_interface_bindings(
-        &mut self,
-        commit: interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd>;
 
     /// Atomically publish a complete compiled routing plan into an inactive slot.
     /// Implementations stage every generation-owned fact map and program before
@@ -649,6 +578,88 @@ pub trait EbpfBackend: Send + Sync {
         }
         Ok(())
     }
+
+    fn pname_support(&self) -> PnameSupport {
+        PnameSupport::Full
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()>;
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
+}
+
+/// TC hooks, transparent socket ownership and fenced kernel tuple operations.
+pub trait EbpfBackend: PolicyBackend {
+    fn detach_hooks(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {}
+
+    /// After READY has been cleared, wait for every kernel invocation that
+    /// observed the prior fence to finish, then remove all unpublished or
+    /// pending staged states. Delayed NFQUEUE deliveries therefore fail
+    /// token lookup instead of crossing a runtime-generation boundary.
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Attach the dae0peer_ingress TC program after dae0peer has been moved
+    /// into the isolated daens namespace.  The attach runs inside a scoped
+    /// `with_daens_netns` switch — the process threads always stay in the
+    /// host netns — while the dae0peer interface and the TPROXY listener
+    /// sockets both live in daens.
+    fn attach_dae0peer_ingress(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Attach the sk_lookup program to the isolated daens namespace (also a
+    /// scoped switch).  The program overrides socket selection for
+    /// proxy-bound packets arriving on dae0peer and delivers them to the
+    /// daens-resident TPROXY listener while keeping the original destination
+    /// intact.
+    fn attach_sk_lookup(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Publish transparent listeners after their required address-family proofs
+    /// are attached. Missing TCP6 leaves slot 1 empty, never an IPv4 substitute.
+    /// Keys: 0 TCP4, 1 TCP6, 2.. IPv4 UDP, 2 + UDP_LISTENER_COUNT.. IPv6 UDP.
+    /// UDP descriptors must be in flow-hash slot order.
+    fn publish_listener_sockets(
+        &mut self,
+        _tcp4_fd: std::os::unix::io::RawFd,
+        _tcp6_fd: Option<std::os::unix::io::RawFd>,
+        _udp4_fds: &[std::os::unix::io::RawFd],
+        _udp6_fds: &[std::os::unix::io::RawFd],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Release all published listener references only after admission is closed
+    /// and the caller has joined ingress. Errors never authorize reopening.
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()>;
+
+    /// Snapshot what this backend owns for the interface reconciler: program
+    /// FDs plus dup'd link FDs.
+    #[cfg(feature = "ebpf")]
+    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
+
+    /// Apply the commit and return replaced or removed link FDs. The caller
+    /// must close them outside any lock: the last close takes the rtnl lock.
+    #[cfg(feature = "ebpf")]
+    fn commit_interface_bindings(
+        &mut self,
+        commit: interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd>;
 
     /// Locked snapshot of one tuple's conn state, for either protocol.
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>>;
@@ -793,19 +804,6 @@ pub trait EbpfBackend: Send + Sync {
     fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
         None
     }
-
-    fn pname_support(&self) -> PnameSupport {
-        PnameSupport::Full
-    }
-
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()>;
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool>;
 
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>>;
 

@@ -34,7 +34,11 @@ fn redirect_timeout_ns(
 }
 
 impl BpfJanitor {
-    pub(super) async fn run_blocking_read<T, F>(&self, label: &'static str, work: F) -> Option<T>
+    pub(super) async fn run_blocking_read<T, F>(
+        &self,
+        label: &'static str,
+        work: F,
+    ) -> anyhow::Result<Option<T>>
     where
         T: Send + 'static,
         F: FnOnce(&dyn EbpfBackend) -> T + Send + 'static,
@@ -48,17 +52,17 @@ impl BpfJanitor {
             if let Some(hook) = blocking_read_hook {
                 hook();
             }
-            work(ebpf.as_ref())
+            anyhow::Ok(work(ebpf.tc()?))
         })
         .await
         {
-            Ok(result) => Some(result),
+            Ok(result) => result.map(Some),
             Err(error) => {
                 error!(%error, map = label, "BPF janitor blocking read task failed");
                 if error.is_panic() {
                     std::panic::resume_unwind(error.into_panic());
                 }
-                None
+                Ok(None)
             }
         }
     }
@@ -98,7 +102,10 @@ impl BpfJanitor {
                 if requests.is_empty() {
                     continue;
                 }
-                let batch = ebpf.retire_batch(&requests, &mut outcomes[..requests.len()]);
+                let batch = ebpf
+                    .tc_mut()
+                    .map_err(|source| RetireError { counts, source })?
+                    .retire_batch(&requests, &mut outcomes[..requests.len()]);
                 drop(ebpf);
                 // Deletes before a failure are real, so their endpoints retire too.
                 if let Some(pool) = &udp_pool {
@@ -179,6 +186,10 @@ impl BpfJanitor {
                 anyhow::Ok((expired, total, complete && from_start && cursor.is_start()))
             })
             .await;
+        let scanned = match scanned {
+            Ok(scanned) => scanned,
+            Err(error) => return (AuxScanResult::default(), Err(error)),
+        };
         let (expired, total, complete) = match scanned {
             Some(Ok(scanned)) => scanned,
             Some(Err(error)) => {

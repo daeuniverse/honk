@@ -94,7 +94,7 @@ fn netns_nfqueue_reconstruction_refuses_unresolved_retirement() -> anyhow::Resul
                 );
                 assert_eq!(fences.get(&key, 0)?.owner, 900);
 
-                let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+                let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
                     Arc::new(RwLock::new(Box::new(backend)));
                 let (pending, mut fatal) = PendingUdpVerdicts::new(
                     backend,

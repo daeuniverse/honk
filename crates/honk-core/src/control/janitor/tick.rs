@@ -66,7 +66,8 @@ impl BpfJanitor {
         now_ns: Option<u64>,
     ) -> anyhow::Result<()> {
         let (overflow_delta, overflow_read_ok, utilizations, occ_counters) = {
-            let ebpf = self.ebpf.read().await;
+            let backend = self.ebpf.read().await;
+            let ebpf = backend.tc()?;
             let udp = telemetry_sample(
                 BpfStatsKey::UdpConnOverflow.label(),
                 ebpf.get_bpf_stats(BpfStatsKey::UdpConnOverflow as u32)
@@ -116,6 +117,7 @@ impl BpfJanitor {
             self.ebpf
                 .write()
                 .await
+                .tc_mut()?
                 .set_admission_pressure(admission_pressure)
                 .context("publishing reverse UDP admission pressure")?;
             state.admission_pressure = admission_pressure;
@@ -172,7 +174,7 @@ impl BpfJanitor {
         }
         if state.last_health_check + Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS) <= now {
             self.check_map_health(utilizations, state.aux_scan_results, &mut state.health)
-                .await;
+                .await?;
             state.last_health_check = now;
         }
         Ok(())

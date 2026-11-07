@@ -15,8 +15,8 @@ use tracing::{debug, info, warn};
 use super::TcpSocketOwnership;
 use super::retirement::AuxDeleteTally;
 use super::{
-    EbpfBackend, FlowExpiryHint, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP, RetireCounts,
-    RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
+    EbpfBackend, FlowExpiryHint, PolicyBackend, RETIRE_BATCH_CAPACITY, RETIRE_FENCE_MAP,
+    RetireCounts, RetireError, RetireKind, RetireOutcome, RetireRequest, UDP_DECISION_SEQUENCE_MAP,
     UdpDecisionCommitResult, UdpDecisionSequenceStatus, UdpDecisionTransition,
     probe::BatchCapability, validate_udp_decision_transition,
 };
@@ -514,20 +514,17 @@ impl RealEbpfBackend {
 }
 
 #[async_trait]
-impl EbpfBackend for RealEbpfBackend {
+impl PolicyBackend for RealEbpfBackend {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
     fn observe_datapath(&self) -> super::DatapathObservation {
         self.observe_backend()
-    }
-
-    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
-        self.bindings.snapshot()
-    }
-
-    fn commit_interface_bindings(
-        &mut self,
-        commit: super::interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
-        self.bindings.commit(commit)
     }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
@@ -548,10 +545,6 @@ impl EbpfBackend for RealEbpfBackend {
             "UDP staging quiescence must complete before NFQUEUE can reopen"
         );
         self.array_set("DATAPATH_FLAGS_MAP", 0, &flags)
-    }
-
-    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        self.quiesce_staged_udp()
     }
 
     fn publish_routing_plan(
@@ -620,6 +613,95 @@ impl EbpfBackend for RealEbpfBackend {
                 "active domain map delete: {error}"
             ))),
         }
+    }
+
+    /// Without the cgroup hooks `pname()` never matches and `!pname()`
+    /// always does; without argv capture they see the thread name.
+    fn pname_support(&self) -> super::PnameSupport {
+        if self.cgroup_sock_links.is_empty() {
+            super::PnameSupport::Unavailable
+        } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
+            super::PnameSupport::ThreadName
+        } else {
+            super::PnameSupport::Full
+        }
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()> {
+        let key = conn_key(outbound, domain, ipver);
+        self.array_set("OUTBOUND_CONNECTIVITY_MAP", key, &u64::from(alive))
+    }
+
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
+        let key = conn_key(outbound, domain, ipver);
+        Ok(self
+            .array_get::<u64>("OUTBOUND_CONNECTIVITY_MAP", key)?
+            .unwrap_or(0)
+            != 0)
+    }
+
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        // Detach eBPF programs immediately to restore network connectivity.
+        self.detach_hooks()?;
+
+        // Stop the aya-log flush task before dropping the Ebpf object.
+        if let Some(h) = self.log_flush_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        // The root and generated freplace links remain valid until every
+        // network entry point is detached above.
+        self.routing_generation = None;
+        // Stop the DaeEvent ringbuf consumer as well; it owns the
+        // EVENT_RINGBUF MapData taken out of the Ebpf object.
+        if let Some(h) = self.event_flush_handle.take() {
+            h.abort();
+            let _ = h.await;
+        }
+        #[cfg(feature = "native-api")]
+        drop(self.receive_trace.take());
+
+        // Drop object map fds before unlinking generation-owned pins; both
+        // persistent sequence pins survive ordinary shutdown.
+        if let Some(bpf) = self.bpf.take() {
+            drop(bpf);
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        if let Err(error) = self.remove_nonpersistent_pins() {
+            if error.raw_os_error() == Some(libc::EBUSY) {
+                debug!(
+                    "BPF pin still busy after teardown, will be cleaned up later: {}",
+                    error
+                );
+            } else {
+                warn!("cleanup transient BPF pins: {}", error);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl EbpfBackend for RealEbpfBackend {
+    fn interface_binding_snapshot(&self) -> anyhow::Result<super::interface::BindingSnapshot> {
+        self.bindings.snapshot()
+    }
+
+    fn commit_interface_bindings(
+        &mut self,
+        commit: super::interface::BindingCommit,
+    ) -> Vec<std::os::fd::OwnedFd> {
+        self.bindings.commit(commit)
+    }
+
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        self.quiesce_staged_udp()
     }
 
     fn conn_state_lookup(&self, key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
@@ -821,18 +903,6 @@ impl EbpfBackend for RealEbpfBackend {
         self.trace_dictionaries.capture(&witness, key, reference)
     }
 
-    /// Without the cgroup hooks `pname()` never matches and `!pname()`
-    /// always does; without argv capture they see the thread name.
-    fn pname_support(&self) -> super::PnameSupport {
-        if self.cgroup_sock_links.is_empty() {
-            super::PnameSupport::Unavailable
-        } else if self.pname_mode == process_name::PnameCaptureMode::Comm {
-            super::PnameSupport::ThreadName
-        } else {
-            super::PnameSupport::Full
-        }
-    }
-
     #[cfg(feature = "native-api")]
     fn receive_trace(&mut self) -> Option<std::sync::Arc<receive_trace::ReceiveTrace>> {
         if !self.receive_trace_attempted {
@@ -917,25 +987,6 @@ impl EbpfBackend for RealEbpfBackend {
 
     fn set_admission_pressure(&mut self, pressured: bool) -> anyhow::Result<()> {
         self.array_set("ADMISSION_PRESSURE", 0, &u32::from(pressured))
-    }
-
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()> {
-        let key = conn_key(outbound, domain, ipver);
-        self.array_set("OUTBOUND_CONNECTIVITY_MAP", key, &u64::from(alive))
-    }
-
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
-        let key = conn_key(outbound, domain, ipver);
-        Ok(self
-            .array_get::<u64>("OUTBOUND_CONNECTIVITY_MAP", key)?
-            .unwrap_or(0)
-            != 0)
     }
 
     fn get_bpf_stats(&self, k: u32) -> anyhow::Result<Option<u64>> {
@@ -1060,47 +1111,6 @@ impl EbpfBackend for RealEbpfBackend {
                 Ok(()) => {}
                 Err(error) if Self::sockmap_slot_is_empty(&error) => {}
                 Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(())
-    }
-
-    async fn cleanup(&mut self) -> anyhow::Result<()> {
-        // Detach eBPF programs immediately to restore network connectivity.
-        self.detach_hooks()?;
-
-        // Stop the aya-log flush task before dropping the Ebpf object.
-        if let Some(h) = self.log_flush_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-        // The root and generated freplace links remain valid until every
-        // network entry point is detached above.
-        self.routing_generation = None;
-        // Stop the DaeEvent ringbuf consumer as well; it owns the
-        // EVENT_RINGBUF MapData taken out of the Ebpf object.
-        if let Some(h) = self.event_flush_handle.take() {
-            h.abort();
-            let _ = h.await;
-        }
-        #[cfg(feature = "native-api")]
-        drop(self.receive_trace.take());
-
-        // Drop object map fds before unlinking generation-owned pins; both
-        // persistent sequence pins survive ordinary shutdown.
-        if let Some(bpf) = self.bpf.take() {
-            drop(bpf);
-        }
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        if let Err(error) = self.remove_nonpersistent_pins() {
-            if error.raw_os_error() == Some(libc::EBUSY) {
-                debug!(
-                    "BPF pin still busy after teardown, will be cleaned up later: {}",
-                    error
-                );
-            } else {
-                warn!("cleanup transient BPF pins: {}", error);
             }
         }
         Ok(())

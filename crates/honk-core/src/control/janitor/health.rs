@@ -40,8 +40,9 @@ impl BpfJanitor {
         [conn_utilization, redirect_utilization, handoff_utilization]: [f64; 3],
         aux_scans: [AuxScanResult; AuxMap::COUNT],
         latches: &mut HealthLatches,
-    ) {
-        let ebpf = self.ebpf.read().await;
+    ) -> anyhow::Result<()> {
+        let backend = self.ebpf.read().await;
+        let ebpf = backend.tc()?;
         let mut stats = latches.last_failures;
         for key in BpfStatsKey::ALL {
             if let Some(value) = super::tick::telemetry_sample(
@@ -52,7 +53,7 @@ impl BpfJanitor {
                 stats[key as usize] = value;
             }
         }
-        drop(ebpf);
+        drop(backend);
         let udp_overflow = stats[BpfStatsKey::UdpConnOverflow as usize];
         let tcp_overflow = stats[BpfStatsKey::TcpConnOverflow as usize];
 
@@ -168,5 +169,6 @@ impl BpfJanitor {
                 "BPF janitor: conn-state map occupancy is high; sweeping every tick; consider increasing MAX_CONN_STATE_NUM if this persists"
             );
         }
+        Ok(())
     }
 }

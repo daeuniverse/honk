@@ -3,7 +3,7 @@ use super::*;
 impl ControlPlane {
     pub fn new(
         config: Config,
-        ebpf: Box<dyn EbpfBackend>,
+        ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_resolver: DnsResolver,
@@ -38,7 +38,7 @@ impl ControlPlane {
 
     pub fn new_with_upstream_pool(
         config: Config,
-        ebpf: Box<dyn EbpfBackend>,
+        ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
@@ -59,7 +59,7 @@ impl ControlPlane {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_upstream_pool_and_budget(
         config: Config,
-        mut ebpf: Box<dyn EbpfBackend>,
+        mut ebpf: Box<dyn crate::ebpf::PolicyBackend>,
         router: Router,
         proxy_registry: std::sync::Arc<ProxyRegistry>,
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
@@ -405,11 +405,10 @@ impl ControlPlane {
             &config,
             &self.active_routing_plan.read(),
         );
-        if let Some(dictionary) = dictionary {
-            self.ebpf
-                .write()
-                .await
-                .bind_kernel_trace_dictionary(dictionary);
+        if let Some(dictionary) = dictionary
+            && let Ok(tc) = self.ebpf.write().await.tc_mut()
+        {
+            tc.bind_kernel_trace_dictionary(dictionary);
         }
         provider
             .current()

@@ -49,7 +49,7 @@ fn down_veth(name: &str, peer: &str) -> u32 {
 
 /// What startup returned plus everything a reconcile round needs.
 struct Started {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     programs: BTreeMap<TcProgram, u32>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     degradations: Arc<Degradations>,
@@ -124,7 +124,10 @@ impl Started {
     /// Release everything this test attached to the shared kernel.
     fn finish(self, rt: &tokio::runtime::Runtime) {
         rt.block_on(async {
-            let mut backend = self.ebpf.write().await;
+            let mut backend =
+                tokio::sync::RwLockWriteGuard::map(self.ebpf.write().await, |backend| {
+                    backend.tc_mut().unwrap()
+                });
             backend.detach_hooks().expect("detach hooks");
             backend.cleanup().await.expect("cleanup");
         });

@@ -1,6 +1,6 @@
 //! Mock eBPF backend for testing.
 //!
-//! This backend implements the `EbpfBackend` trait using in-memory
+//! This backend models `PolicyBackend` publication and TC `EbpfBackend` ownership using in-memory
 //! data structures instead of real kernel eBPF. All operations use
 //! HashMap storage.
 
@@ -16,8 +16,8 @@ use super::retirement::{
 #[cfg(test)]
 use super::{DatapathFlagsWriteOrigin, DatapathFlagsWriteTrace, ProjectionMapOperation};
 use super::{
-    EbpfBackend, RoutingPushPhase, UdpDecisionCommitResult, UdpDecisionSequenceStatus,
-    UdpDecisionTransition, validate_udp_decision_transition,
+    EbpfBackend, PolicyBackend, RoutingPushPhase, UdpDecisionCommitResult,
+    UdpDecisionSequenceStatus, UdpDecisionTransition, validate_udp_decision_transition,
 };
 use super::{
     FlowExpiryHint, RETIRE_BATCH_CAPACITY, RetireCounts, RetireError, RetireOutcome, RetireRequest,

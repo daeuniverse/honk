@@ -232,10 +232,12 @@ impl PendingUdpVerdicts {
         }));
         completed.resize_with(batch.len(), || Completion::NotRun);
         let result = blocking_section(|| {
-            backend.commit_udp_batch(requests, &mut |index, apply| {
-                completed[index] = self.apply_pending_commit(&batch[index], apply)?;
-                Ok(())
-            })
+            backend
+                .tc_mut()?
+                .commit_udp_batch(requests, &mut |index, apply| {
+                    completed[index] = self.apply_pending_commit(&batch[index], apply)?;
+                    Ok(())
+                })
         });
         drop(backend);
         self.reject_expired_commits(expired);

@@ -1,8 +1,8 @@
 use super::super::{attach_extension, bpf_syscall, create_maps, load_extension};
 use super::{assert_route, input, object, outbound_ids, rule};
 use crate::control::routing_matcher::RoutingPushPlan;
-use crate::ebpf::EbpfBackend;
 use crate::ebpf::real::RealEbpfBackend;
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::routing::{Router, golden};
 use aya_obj::generated::{bpf_attr, bpf_cmd};
 use honk_config::types::DialMode;

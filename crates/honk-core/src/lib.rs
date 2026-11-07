@@ -1104,7 +1104,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut interface_handoff = None;
-    let ebpf_backend: Box<dyn ebpf::EbpfBackend> = if xdp_mode {
+    let ebpf_backend: Box<dyn crate::ebpf::PolicyBackend> = if xdp_mode {
         #[cfg(feature = "ebpf")]
         {
             _dae0_guard = None;
@@ -1170,7 +1170,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         {
             // Attach dae0_ingress on dae0 (host namespace) first, while
             // dae0peer is still in the host namespace as well.
-            ebpf_backend.attach_dae0_programs()?;
+            ebpf_backend.tc_mut()?.attach_dae0_programs()?;
             info!("dae0 programs attached");
 
             // Move dae0peer into daens and install the daens policy routing.
@@ -1191,14 +1191,14 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             // the backend).  It overrides socket selection for proxy-bound
             // packets arriving on dae0peer and delivers them to the TPROXY
             // listener while keeping the original destination intact.
-            ebpf_backend.attach_sk_lookup()?;
+            ebpf_backend.tc_mut()?.attach_sk_lookup()?;
             info!("tproxy_sk_lookup attached in daens");
 
             // Attach the dae0peer TC ingress program (scoped switch inside
             // the backend).  It uses bpf_sk_assign() to hand proxy-bound
             // packets to the transparent listener socket while preserving
             // the original destination.
-            ebpf_backend.attach_dae0peer_ingress()?;
+            ebpf_backend.tc_mut()?.attach_dae0peer_ingress()?;
             info!("dae0peer_ingress attached in daens");
         }
     } else if !xdp_mode {
@@ -1335,7 +1335,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     #[cfg(feature = "ebpf")]
     control_plane.set_iface_watcher(interface_handoff.map(|handoff| {
         ebpf::real::IfaceWatcher::spawn(
-            control_plane.ebpf_handle(),
+            control_plane.policy_backend_handle(),
             control_plane.config_handle(),
             control_plane.command_sender(),
             Arc::clone(&degradations),

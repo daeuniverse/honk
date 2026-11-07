@@ -1,13 +1,13 @@
 use super::*;
 use crate::observe::catalog::Catalog;
 use crate::{
-    ebpf::{EbpfBackend, mock::MockEbpfBackend},
+    ebpf::{PolicyBackend, mock::MockEbpfBackend},
     mode::{ModeOverride, SharedModeState},
 };
 use honk_config::{Config, node::Node};
 use std::sync::Arc;
 
-type Backend = Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>;
+type Backend = Arc<tokio::sync::RwLock<Box<dyn PolicyBackend>>>;
 
 fn config() -> Config {
     let mut config = Config::default();
@@ -347,7 +347,7 @@ async fn incomplete_fence_blocks_mode_ready_resurrection_and_explicit_reopen() {
     let config = config();
     let catalog = Catalog::new(&config);
     let (flags, backend) = owner(ModeState::native(), None).await;
-    backend.write().await.arm_quiesce_fault();
+    backend.write().await.tc_mut().unwrap().arm_quiesce_fault();
     assert!(flags.fence_nfqueue().await.is_err());
     flags
         .set_clash_mode("Direct", &config, &catalog.snapshot().groups)

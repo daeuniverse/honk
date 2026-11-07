@@ -6,7 +6,7 @@
 
 控制平面负责透明代理入口、内核交接、用户态路由、嗅探、出站选择、中继、资源准入与运行时发布。内核如何向用户态交付流量见[数据路径设计](./datapath.md)。组策略和健康状态如何驱动选择见[组设计](./groups.md)，DNS 运行时行为见 [DNS 设计](./dns.md)。
 
-主要实现在 `crates/honk-core/src/control/`。控制平面读取 `EbpfBackend` 状态，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。
+主要实现在 `crates/honk-core/src/control/`。控制平面共享同一个 `PolicyBackend` 发布 cell，并把 TCP 流或 `PacketTransport` UDP 契约交给 `honk-outbound`。TC 专属操作从该 cell 借用 `EbpfBackend` 能力，始终保留原 backend guard。
 
 模块分工：
 
@@ -44,6 +44,8 @@
 9. 绑定透明 TCP/UDP listener，发布完整 listener FD 集，启动独立 DNS 和 UDP 接收循环；仅当生效开关仍开启时，才启动 NFQUEUE 服务及其 ingest actor、correlator、watchdog 和独立的队列压力采样器（每秒采样一次）。
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查，或随后准入前的队列/规则/健康检查时，会记录 warning 并关闭；该启动降级在重载后仍生效（见[全局配置参考](../reference/global.md)）。持久化 token generation 恢复失败与服务准入后的失败仍为 fatal。
+
+编译路由、已学习域名 map、连通性、模式标志、接纳及清理使用共同接口。真实与 mock TC backend 通过 `tc()` / `tc_mut()` 暴露其既有对象；软件 backend 以 `Unsupported` 拒绝该能力，包括在绑定任何透明 listener 之前拒绝。可选内核观测保持不可用，不伪造事实。此拆分不新增 Host 捕获、native 续行、captured return 或 TUN 权威。
 
 配置为 XDP 的守护进程复用同一 mode/flags coordinator，但会在 packet scope 准入或 capture ready 之前以禁用 NFQUEUE 的状态初始化软件 flags。初始化保持恢复后的 mode 不变；发布失败时，通过 packet supervisor 的 joined cleanup 拒绝启动。该路径不启动 TC listener 或 NFQUEUE helper，显式非 XDP packet embedding 仍保留独立生命周期。
 

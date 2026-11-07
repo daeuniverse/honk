@@ -42,7 +42,8 @@ async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> an
         }
         cases.push((key, expired));
     }
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
     assert_eq!(janitor.cleanup_redirect_track_for_test(deadline).await.0, 0);
     assert_eq!(
@@ -52,7 +53,8 @@ async fn short_auxiliary_deadline_preserves_conn_and_other_udp_redirects() -> an
             .0,
         3
     );
-    let backend = backend.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     for (key, expired) in cases {
         assert_eq!(
             backend
@@ -76,12 +78,15 @@ async fn redirect_refresh_after_scan_supersedes_short_deadline_candidate() -> an
     let now_ns = UNPINNED_REDIRECT_RECLAIM_NS + 1;
     let mut model = MockEbpfBackend::new();
     model.redirect_track_store(&RedirectTuple::from_tuples(&key), &RedirectEntry::default())?;
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
     let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let retained = Arc::clone(&backend);
     janitor.before_delete_hook = Some(Arc::new(move || {
         retained
             .blocking_write()
+            .tc_mut()
+            .unwrap()
             .redirect_track_store(
                 &RedirectTuple::from_tuples(&key),
                 &RedirectEntry {
@@ -96,6 +101,8 @@ async fn redirect_refresh_after_scan_supersedes_short_deadline_candidate() -> an
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .redirect_track_lookup(&RedirectTuple::from_tuples(&key))?
             .is_some()
     );

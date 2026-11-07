@@ -145,7 +145,7 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
 }
 
 pub(super) struct OutboundHealthPublisher {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
     group_manager: SharedGroupManager,
     alive_set: Arc<AliveDialerSet>,
@@ -180,7 +180,7 @@ fn group_slot_flipped(
 
 impl OutboundHealthPublisher {
     pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
         group_manager: SharedGroupManager,
         alive_set: Arc<AliveDialerSet>,

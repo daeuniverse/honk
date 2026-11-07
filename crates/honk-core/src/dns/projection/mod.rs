@@ -8,7 +8,7 @@ use honk_datapath::ScopeId;
 use honk_ebpf_common::DomainRouting;
 use honk_outbound::alive::IpVersion;
 
-use crate::ebpf::EbpfBackend;
+use crate::ebpf::PolicyBackend;
 use crate::routing::Router;
 
 mod lifecycle {
@@ -237,7 +237,7 @@ impl PreparedProjectionPublication<'_> {
 
 impl RoutingProjection {
     pub(crate) fn spawn(
-        ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<tokio::sync::RwLock<Box<dyn PolicyBackend>>>,
         snapshot: Arc<RoutingProjectionSnapshot>,
     ) -> Arc<Self> {
         let (wake, receiver) = tokio::sync::mpsc::channel(1);

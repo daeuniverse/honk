@@ -2,7 +2,15 @@ use super::*;
 use crate::ebpf;
 
 #[async_trait]
-impl EbpfBackend for MockEbpfBackend {
+impl PolicyBackend for MockEbpfBackend {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)> {
+        Ok(self)
+    }
+
     fn observe_datapath(&self) -> ebpf::DatapathObservation {
         #[cfg(test)]
         if let Some(observation) = &self.datapath_observation_fixture {
@@ -77,42 +85,6 @@ impl EbpfBackend for MockEbpfBackend {
     fn clear_projection_write_log(&mut self) {
         self.projection_writes.clear();
     }
-    fn publish_listener_sockets(
-        &mut self,
-        tcp4_fd: std::os::fd::RawFd,
-        tcp6_fd: Option<std::os::fd::RawFd>,
-        udp4_fds: &[std::os::fd::RawFd],
-        udp6_fds: &[std::os::fd::RawFd],
-    ) -> anyhow::Result<()> {
-        self.listener_socket_slots.insert(0, tcp4_fd);
-        if let Some(fd) = tcp6_fd {
-            self.listener_socket_slots.insert(1, fd);
-        }
-        for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
-            for (offset, fd) in fds.iter().enumerate() {
-                self.listener_socket_slots.insert(base + offset as u32, *fd);
-            }
-        }
-        self.listener_sockets_published = true;
-        Ok(())
-    }
-
-    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.datapath_ready,
-            "datapath admission must be closed before clearing listeners"
-        );
-        self.listener_sockets_published = false;
-        for key in 0..10 {
-            #[cfg(test)]
-            if self.listener_clear_fault_at == Some(key) {
-                self.listener_clear_fault_at = None;
-                anyhow::bail!("injected listener clear failure");
-            }
-            self.listener_socket_slots.remove(&key);
-        }
-        Ok(())
-    }
 
     fn set_datapath_ready(&mut self, ready: bool) -> anyhow::Result<()> {
         if ready && !self.listener_sockets_published {
@@ -154,11 +126,6 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(test)]
-    fn arm_quiesce_fault(&mut self) {
-        self.fail_next_quiesce = true;
-    }
-
-    #[cfg(test)]
     fn mark_datapath_flags_write_origin(&mut self, origin: DatapathFlagsWriteOrigin) {
         self.datapath_flags_write_origin = origin;
     }
@@ -178,41 +145,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.datapath_flags_writes.lock().clear();
         self.datapath_flags_write_trace.clear();
         self.datapath_flags_writes_after_arm = 0;
-    }
-
-    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        #[cfg(test)]
-        self.quiesce_datapath_ready.lock().push(self.datapath_ready);
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_quiesce) {
-            anyhow::bail!("injected quiesce failure");
-        }
-        let staged = self
-            .udp_conn_states
-            .iter()
-            .filter(|(_, state)| udp_state_is_staged(state.state))
-            .map(|(key, state)| {
-                (
-                    Self::bytes_to_tuples_key(key),
-                    state.decision_token,
-                    state.incarnation,
-                )
-            })
-            .collect::<Vec<_>>();
-        retire_staged_udp(&staged, |requests, outcomes| {
-            self.retire_batch(requests, outcomes)
-        })?;
-        if self.policy.routing_generation.is_some() {
-            let generation = self
-                .policy
-                .next_generation
-                .checked_add(1)
-                .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
-                .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
-            self.policy.next_generation = generation;
-            self.policy.descriptor.generation = generation;
-        }
-        Ok(())
     }
 
     fn publish_routing_plan(
@@ -301,6 +233,120 @@ impl EbpfBackend for MockEbpfBackend {
         self.take_projection_fault(ProjectionMapOperation::Remove)?;
         self.policy.remove_domain(ip_key)?;
         self.count_routing_writes(1);
+        Ok(())
+    }
+
+    fn set_outbound_alive(
+        &mut self,
+        outbound: u8,
+        domain: u32,
+        ipver: u32,
+        alive: bool,
+    ) -> anyhow::Result<()> {
+        self.count_outbound_alive_write();
+        self.policy.set_alive(outbound, domain, ipver, alive);
+        Ok(())
+    }
+
+    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
+        Ok(self.policy.alive(outbound, domain, ipver))
+    }
+
+    async fn cleanup(&mut self) -> anyhow::Result<()> {
+        self.datapath_ready = false;
+        self.admission_pressure
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.listener_sockets_published = false;
+        self.listener_socket_slots.clear();
+        self.policy.routing_generation = None;
+        self.policy.descriptor = RoutingPolicyDescriptor::default();
+        self.tcp_conn_states.clear();
+        self.udp_conn_states.clear();
+        self.redirect_tracks.clear();
+        self.routing_handoffs.get_mut().clear();
+        self.retire_fences.clear();
+        self.route_witnesses.clear();
+        self.policy.outbound_alive.clear();
+        self.bpf_stats.clear();
+        Ok(())
+    }
+}
+
+impl EbpfBackend for MockEbpfBackend {
+    fn publish_listener_sockets(
+        &mut self,
+        tcp4_fd: std::os::fd::RawFd,
+        tcp6_fd: Option<std::os::fd::RawFd>,
+        udp4_fds: &[std::os::fd::RawFd],
+        udp6_fds: &[std::os::fd::RawFd],
+    ) -> anyhow::Result<()> {
+        self.listener_socket_slots.insert(0, tcp4_fd);
+        if let Some(fd) = tcp6_fd {
+            self.listener_socket_slots.insert(1, fd);
+        }
+        for (base, fds) in [(2, udp4_fds), (6, udp6_fds)] {
+            for (offset, fd) in fds.iter().enumerate() {
+                self.listener_socket_slots.insert(base + offset as u32, *fd);
+            }
+        }
+        self.listener_sockets_published = true;
+        Ok(())
+    }
+
+    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.datapath_ready,
+            "datapath admission must be closed before clearing listeners"
+        );
+        self.listener_sockets_published = false;
+        for key in 0..10 {
+            #[cfg(test)]
+            if self.listener_clear_fault_at == Some(key) {
+                self.listener_clear_fault_at = None;
+                anyhow::bail!("injected listener clear failure");
+            }
+            self.listener_socket_slots.remove(&key);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn arm_quiesce_fault(&mut self) {
+        self.fail_next_quiesce = true;
+    }
+
+    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
+        #[cfg(test)]
+        self.quiesce_datapath_ready.lock().push(self.datapath_ready);
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_quiesce) {
+            anyhow::bail!("injected quiesce failure");
+        }
+        let staged = self
+            .udp_conn_states
+            .iter()
+            .filter(|(_, state)| udp_state_is_staged(state.state))
+            .map(|(key, state)| {
+                (
+                    Self::bytes_to_tuples_key(key),
+                    state.decision_token,
+                    state.incarnation,
+                )
+            })
+            .collect::<Vec<_>>();
+        retire_staged_udp(&staged, |requests, outcomes| {
+            self.retire_batch(requests, outcomes)
+        })?;
+        if self.policy.routing_generation.is_some() {
+            let generation = self
+                .policy
+                .next_generation
+                .checked_add(1)
+                .filter(|generation| *generation <= DNS_ROUTE_GENERATION_MAX)
+                .ok_or_else(|| anyhow::anyhow!("routing generation counter exhausted"))?;
+            self.policy.next_generation = generation;
+            self.policy.descriptor.generation = generation;
+        }
         Ok(())
     }
 
@@ -681,22 +727,6 @@ impl EbpfBackend for MockEbpfBackend {
         self.trace_dictionaries.capture(witness, key, reference)
     }
 
-    fn set_outbound_alive(
-        &mut self,
-        outbound: u8,
-        domain: u32,
-        ipver: u32,
-        alive: bool,
-    ) -> anyhow::Result<()> {
-        self.count_outbound_alive_write();
-        self.policy.set_alive(outbound, domain, ipver, alive);
-        Ok(())
-    }
-
-    fn get_outbound_alive(&self, outbound: u8, domain: u32, ipver: u32) -> anyhow::Result<bool> {
-        Ok(self.policy.alive(outbound, domain, ipver))
-    }
-
     fn get_bpf_stats(&self, key: u32) -> anyhow::Result<Option<u64>> {
         #[cfg(test)]
         anyhow::ensure!(
@@ -791,24 +821,5 @@ impl EbpfBackend for MockEbpfBackend {
         self.binding_commits
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         commit.apply_to(&mut self.bound_interfaces)
-    }
-
-    async fn cleanup(&mut self) -> anyhow::Result<()> {
-        self.datapath_ready = false;
-        self.admission_pressure
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-        self.listener_sockets_published = false;
-        self.listener_socket_slots.clear();
-        self.policy.routing_generation = None;
-        self.policy.descriptor = RoutingPolicyDescriptor::default();
-        self.tcp_conn_states.clear();
-        self.udp_conn_states.clear();
-        self.redirect_tracks.clear();
-        self.routing_handoffs.get_mut().clear();
-        self.retire_fences.clear();
-        self.route_witnesses.clear();
-        self.policy.outbound_alive.clear();
-        self.bpf_stats.clear();
-        Ok(())
     }
 }

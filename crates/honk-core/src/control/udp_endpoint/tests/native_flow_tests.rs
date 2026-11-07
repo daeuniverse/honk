@@ -582,7 +582,7 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
 #[tokio::test]
 async fn native_udp_queued_packet_cannot_borrow_recreated_token_zero_witness() {
     use crate::control::tests::support::{UdpTestReplySocketFactory, control_plane};
-    use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+    use crate::ebpf::{EbpfBackend, PolicyBackend, mock::MockEbpfBackend};
     use honk_ebpf_common::*;
     for recreated in [false, true] {
         let api_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

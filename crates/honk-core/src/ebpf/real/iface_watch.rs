@@ -23,7 +23,7 @@ use tracing::{debug, info, warn};
 
 use super::interface_startup::InterfaceHandoff;
 use super::interface_state::{self, InterfaceState, SysctlWrite};
-use crate::ebpf::EbpfBackend;
+use crate::ebpf::PolicyBackend;
 use crate::ebpf::interface::status::{BindFailure, ReconcileStep};
 use crate::ebpf::interface::{self, ApplyReport, BindingSnapshot, InterfacePlan, Topology};
 use crate::netlink::{RTM_DELLINK, RTM_NEWLINK};
@@ -87,7 +87,7 @@ impl IfaceWatcher {
     /// Takes over the subscription and the interface state startup built; with
     /// no subscription the watcher reconciles on its ticker alone.
     pub(crate) fn spawn(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
         degradations: Arc<crate::degradations::Degradations>,
@@ -223,7 +223,7 @@ fn drain_with(
 #[allow(clippy::too_many_arguments)]
 async fn run(
     subscription: Option<OwnedFd>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: tokio::sync::mpsc::Sender<crate::control::ControlCommand>,
     mut stop: watch::Receiver<bool>,
@@ -356,7 +356,7 @@ async fn update_network_state(
 }
 
 pub(super) struct Watch {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commands: mpsc::Sender<crate::control::ControlCommand>,
     reconciler: Reconciler,
@@ -367,7 +367,7 @@ pub(super) struct Watch {
 
 impl Watch {
     pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         config: Arc<RwLock<Arc<honk_config::Config>>>,
         commands: mpsc::Sender<crate::control::ControlCommand>,
         reconciler: Reconciler,
@@ -456,7 +456,12 @@ impl Watch {
                 }
             }
 
-            let snapshot = self.ebpf.read().await.interface_binding_snapshot();
+            let snapshot = self
+                .ebpf
+                .read()
+                .await
+                .tc()
+                .and_then(|tc| tc.interface_binding_snapshot());
             let snapshot = match snapshot {
                 Ok(snapshot) => snapshot,
                 Err(error) => return Err(self.step_failed(ReconcileStep::Snapshot, error)),
@@ -510,7 +515,20 @@ impl Watch {
             if !commit.is_empty() {
                 changed = true;
                 log_commit(&commit);
-                let closed = self.ebpf.write().await.commit_interface_bindings(commit);
+                let mut backend = self.ebpf.write().await;
+                let tc = match backend.tc_mut() {
+                    Ok(tc) => tc,
+                    Err(error) => {
+                        drop(backend);
+                        let closed = tokio::task::spawn_blocking(move || drop(commit)).await;
+                        if let Err(join_error) = closed {
+                            return Err(self.step_failed(ReconcileStep::Join, join_error.into()));
+                        }
+                        return Err(self.step_failed(ReconcileStep::Snapshot, error));
+                    }
+                };
+                let closed = tc.commit_interface_bindings(commit);
+                drop(backend);
                 // The last close of a link takes the rtnl lock.
                 if let Err(error) = tokio::task::spawn_blocking(move || drop(closed)).await {
                     return Err(self.step_failed(ReconcileStep::Join, error.into()));

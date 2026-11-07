@@ -30,7 +30,7 @@ pub(in crate::control) struct ControlPlaneHandle {
     pub(in crate::control) dns_resolver: Arc<DnsResolver>,
     pub(in crate::control) group_manager: SharedGroupManager,
     pub(in crate::control) stats: Arc<StatsManager>,
-    pub(in crate::control) ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    pub(in crate::control) ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     pub(in crate::control) udp_pool: Arc<UdpEndpointPool>,
     #[cfg(feature = "ebpf")]
     pub(in crate::control) pending_udp_verdicts:

@@ -273,7 +273,9 @@ async fn refuses_without(lab: &Lab, missing: Missing) -> anyhow::Result<()> {
     let syn = hs.syn.clone();
     hs.assert_refused(&syn).await?;
     {
-        let backend = lab.handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(lab.handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         ensure!(
             backend
                 .conn_state_lookup(&key)?
@@ -350,6 +352,8 @@ pub(super) fn full_child_unproven(family: &str) -> anyhow::Result<()> {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&hs.key)?
             .context("refused SYNs deleted conn-state")?;
         ensure!(

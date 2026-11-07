@@ -9,11 +9,11 @@
 
 use super::super::bindings as owner;
 use super::*;
-use crate::ebpf::EbpfBackend;
 use crate::ebpf::interface::{
     Binding, BindingSnapshot, Direction, InterfacePlan, TcProgram, Topology,
     plan as plan_interfaces, read_topology,
 };
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::netlink::NlSock;
 use aya_obj::generated::{BPF_F_AFTER, bpf_attach_type, bpf_attr, bpf_cmd, bpf_prog_type};
 use std::collections::BTreeMap;
@@ -290,10 +290,16 @@ fn assert_truthful(held: &[Held], programs: &BTreeMap<TcProgram, u32>) {
 
 /// `held_of` for a backend behind the daemon's lock, proven against the kernel.
 async fn kernel_held(
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn crate::ebpf::PolicyBackend>>,
     programs: &BTreeMap<TcProgram, u32>,
 ) -> Vec<Held> {
-    let snapshot = ebpf.read().await.interface_binding_snapshot().unwrap();
+    let snapshot = ebpf
+        .read()
+        .await
+        .tc()
+        .unwrap()
+        .interface_binding_snapshot()
+        .unwrap();
     let held = held_of(snapshot);
     assert_truthful(&held, programs);
     held

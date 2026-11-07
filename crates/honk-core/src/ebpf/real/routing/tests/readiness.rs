@@ -2,7 +2,7 @@ use super::{assert_route, decision, input, object};
 use crate::control::routing_matcher::{
     KernelAction, KernelCondition, KernelPredicate, KernelRule, RoutingFactMaps, RoutingPushPlan,
 };
-use crate::ebpf::EbpfBackend;
+use crate::ebpf::PolicyBackend;
 use crate::ebpf::maps::LpmKey;
 use crate::ebpf::real::RealEbpfBackend;
 use crate::routing::golden;

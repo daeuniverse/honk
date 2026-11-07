@@ -2,7 +2,7 @@ use super::*;
 use crate::connection_tracker::{CloseOutcome, ConnectionTracker};
 use crate::control::retirement_worker::{RetirementPort, spawn_retirement_worker};
 use crate::control::udp_endpoint::tests::closure::tracked_entry;
-use crate::ebpf::{EbpfBackend, mock::MockEbpfBackend};
+use crate::ebpf::mock::MockEbpfBackend;
 
 #[tokio::test(flavor = "current_thread")]
 async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
@@ -29,7 +29,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
         let alive = Arc::new(honk_outbound::alive::AliveDialerSet::new());
         let tracker = Arc::new(ConnectionTracker::new());
         tracker.enable();
-        let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let (fatal, mut failures) = mpsc::unbounded_channel();
         let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());

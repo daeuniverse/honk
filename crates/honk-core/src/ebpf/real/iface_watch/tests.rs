@@ -133,7 +133,7 @@ impl Stub {
 }
 
 struct Fixture {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     config: Arc<RwLock<Arc<honk_config::Config>>>,
     commits: Arc<AtomicU64>,
     degradations: Arc<Degradations>,
@@ -174,6 +174,8 @@ impl Fixture {
         self.ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .interface_binding_snapshot()
             .unwrap()
             .owned

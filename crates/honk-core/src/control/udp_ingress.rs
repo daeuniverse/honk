@@ -323,7 +323,14 @@ impl UdpLoopState {
             None
         };
         let config = self.handle.config.read().await;
-        let backend = self.handle.ebpf.read().await;
+        let backend_guard = self.handle.ebpf.read().await;
+        let backend = match backend_guard.tc() {
+            Ok(backend) => backend,
+            Err(error) => {
+                debug!(%src_addr, %original_dst, %error, "Dropping routed UDP/53 without TC authority");
+                return UdpSlowPathWork::Done;
+            }
+        };
         if backend.routing_policy_generation() != u64::from(route.generation()) {
             debug!(%src_addr, %original_dst, packet_generation = route.generation(),
                 "Dropping UDP/53 from a stale routing generation");
@@ -382,7 +389,7 @@ impl UdpLoopState {
                 ),
                 None => Err("receive_metadata_unavailable"),
             });
-        drop(backend);
+        drop(backend_guard);
         let validated_dns = raw_dns_route
             .is_none()
             .then(|| validate_exact_dns_query(data.as_slice()))
@@ -478,10 +485,11 @@ impl UdpLoopState {
                 src_addr.port(),
                 17,
             );
-            match backend
-                .conn_state_lookup(&key)
-                .and_then(|state| backend.udp_flow_owner(0, state))
-            {
+            match backend.tc().and_then(|backend| {
+                backend
+                    .conn_state_lookup(&key)
+                    .and_then(|state| backend.udp_flow_owner(0, state))
+            }) {
                 Ok(owner) => owner,
                 Err(error) => {
                     debug!(%src_addr, %original_dst, %error, "Dropping UDP without kernel flow ownership");

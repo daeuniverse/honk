@@ -106,6 +106,7 @@ impl HealthUpdates {
 
 impl ControlPlane {
     async fn bind_runtime_listeners(&self) -> anyhow::Result<BoundListeners> {
+        self.ebpf.read().await.tc()?;
         let config = self.config.read().await;
         let tproxy_port = config.global.tproxy_port;
         let tproxy_mark = config.global.tproxy_mark;
@@ -328,6 +329,7 @@ impl ControlPlane {
         self.ebpf
             .write()
             .await
+            .tc_mut()?
             .publish_listener_sockets(tcp4, tcp6, &udp4, &udp6)?;
         let (critical_tx, critical_errors) = mpsc::unbounded_channel();
         let (removal_tx, removal_errors) = mpsc::unbounded_channel();
@@ -559,14 +561,19 @@ impl ControlPlane {
 /// the kernel has it, otherwise the eBPF receive trace.
 #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]
 async fn enable_receive_trace(
-    ebpf: &RwLock<Box<dyn EbpfBackend>>,
+    ebpf: &RwLock<Box<dyn crate::ebpf::PolicyBackend>>,
     batch: &mut sockets::UdpRecvBatch,
     socket: &tokio::net::UdpSocket,
 ) -> std::io::Result<()> {
     if batch.enable_trace(socket, None).is_ok() {
         return Ok(());
     }
-    let trace = ebpf.write().await.receive_trace();
+    let trace = ebpf
+        .write()
+        .await
+        .tc_mut()
+        .map_err(std::io::Error::other)?
+        .receive_trace();
     batch.enable_trace(socket, trace)
 }
 
@@ -871,6 +878,54 @@ mod reap_tests {
         let cancelled = tasks.join_next().await;
         assert!(matches!(&cancelled, Some(Err(error)) if error.is_cancelled()));
         assert!(matches!(reap_tcp(cancelled), EpochEvent::Reaped));
+    }
+}
+
+#[cfg(test)]
+mod policy_capability_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn software_policy_reloads_but_cannot_start_tc_listeners() -> anyhow::Result<()> {
+        let mut config = Config::default();
+        config.ensure_builtin_nodes();
+        config.routing.default_outbound = "direct".into();
+        config.global.nfqueue_enable = false;
+        config.global.preconnect_node_count = 0;
+        config.global.udp_warm_node_count = 0;
+        let admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut plane = ControlPlane::new(
+            config.clone(),
+            Box::new(crate::ebpf::userspace::UserspaceBackend::new(Arc::clone(
+                &admission,
+            ))),
+            Router::new(&[], "direct")?,
+            Arc::new(ProxyRegistry::default_resolver()?),
+            DnsResolver::new(&config.dns)?,
+            crate::control::tests::support::test_dns_forwarder(),
+        )?;
+        let generation = plane.ebpf.read().await.routing_policy_generation();
+        let error = plane
+            .bind_runtime_listeners()
+            .await
+            .err()
+            .expect("TC capability is required before binding");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::Unsupported
+        );
+        config.routing.default_outbound = "block".into();
+        assert!(
+            plane
+                .reload_runtime_config(config, Default::default())
+                .await
+        );
+        assert!(plane.ebpf.read().await.routing_policy_generation() > generation);
+        assert_eq!(plane.config.read().await.routing.default_outbound, "block");
+        plane.stop_packet_epoch().await?;
+        plane.finalize_shutdown().await?;
+        assert!(!admission.load(Ordering::Acquire));
+        Ok(())
     }
 }
 

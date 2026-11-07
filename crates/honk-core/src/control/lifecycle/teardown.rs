@@ -165,7 +165,14 @@ impl ControlPlane {
             }
         }
         if owns_backend {
-            retain_error(&mut error, self.ebpf.write().await.clear_listener_sockets());
+            retain_error(
+                &mut error,
+                self.ebpf
+                    .write()
+                    .await
+                    .tc_mut()
+                    .and_then(|tc| tc.clear_listener_sockets()),
+            );
             retain_error(
                 &mut error,
                 cleanup_stage(async {
@@ -238,7 +245,9 @@ impl ControlPlane {
             watcher.shutdown(STAGE_TIMEOUT).await;
         }
         // No watcher can reattach after this terminal boundary.
-        retain_error(&mut fatal, self.ebpf.write().await.detach_hooks());
+        if let Ok(tc) = self.ebpf.write().await.tc_mut() {
+            retain_error(&mut fatal, tc.detach_hooks());
+        }
         if self.health_task.is_some() {
             retain_error(
                 &mut fatal,

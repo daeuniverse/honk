@@ -855,8 +855,10 @@ impl ControlPlane {
                 if routing_publication_needed {
                     *plan_guard = Arc::clone(&new_plan);
                     #[cfg(feature = "native-api")]
-                    if let Some(dictionary) = prepared_dictionary {
-                        ebpf.bind_kernel_trace_dictionary(dictionary);
+                    if let Some(dictionary) = prepared_dictionary
+                        && let Ok(tc) = ebpf.tc_mut()
+                    {
+                        tc.bind_kernel_trace_dictionary(dictionary);
                     }
                 }
                 // The projection worker takes eBPF before its generation fence;

@@ -112,7 +112,10 @@ pub(super) fn packet_scope(
 
 pub(super) fn projection_controller(
     forwarder: Arc<DnsForwarder>,
-) -> (DnsController, Arc<RwLock<Box<dyn EbpfBackend>>>) {
+) -> (
+    DnsController,
+    Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
+) {
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 
     let router = Arc::new(
@@ -140,7 +143,7 @@ pub(super) fn projection_controller(
     .unwrap();
     let mut backend = crate::ebpf::mock::MockEbpfBackend::new();
     backend.publish_routing_plan(&plan, &[]).unwrap();
-    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::EbpfBackend>>> =
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(backend)));
     let runtime = crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
         generation: crate::dns::runtime::RuntimeGeneration::new(1),

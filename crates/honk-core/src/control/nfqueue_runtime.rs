@@ -164,7 +164,7 @@ pub(super) struct NfqueueRuntime {
 impl NfqueueRuntime {
     pub(super) async fn next_event(
         &mut self,
-        ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: &Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     ) -> NfqueueRuntimeEvent {
         enum ExitedTask {
             Watchdog(Result<(), tokio::task::JoinError>),
@@ -234,7 +234,12 @@ impl NfqueueRuntime {
                 };
                 return NfqueueRuntimeEvent::Fatal(anyhow::Error::new(fatal));
             }
-            match ebpf.read().await.udp_decision_sequence_status() {
+            match ebpf
+                .read()
+                .await
+                .tc()
+                .and_then(|tc| tc.udp_decision_sequence_status())
+            {
                 Ok(status) if status.exhausted() => {
                     self.stats.record_udp_nfqueue_token_exhaustion();
                     return NfqueueRuntimeEvent::TokenExhausted;
@@ -422,7 +427,7 @@ impl NfqueueRuntime {
 #[cfg(feature = "ebpf")]
 pub(super) async fn wait_nfqueue_event(
     runtime: &mut Option<NfqueueRuntime>,
-    ebpf: &Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: &Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
 ) -> NfqueueRuntimeEvent {
     let Some(runtime) = runtime.as_mut() else {
         return std::future::pending::<NfqueueRuntimeEvent>().await;
@@ -434,6 +439,7 @@ impl ControlPlane {
     #[cfg(feature = "ebpf")]
     pub(super) async fn rotate_udp_decision_generation(&self) -> anyhow::Result<bool> {
         let mut backend = self.ebpf.write().await;
+        let backend = backend.tc_mut()?;
         backend
             .verify_udp_decision_sequence()
             .map_err(|error| anyhow::anyhow!("verify UDP decision sequence: {error}"))?;

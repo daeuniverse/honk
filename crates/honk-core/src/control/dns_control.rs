@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 use crate::dns::forwarder::DnsForwarder;
-use crate::ebpf::EbpfBackend;
+use crate::ebpf::PolicyBackend;
 #[cfg(test)]
 use crate::routing::Router;
 use honk_datapath::ScopeId;
@@ -117,7 +117,7 @@ impl DnsController {
     #[cfg(test)]
     pub fn new(
         forwarder: Arc<DnsForwarder>,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         _router: Arc<RwLock<Router>>,
         udp_query_limit: usize,
     ) -> Self {
@@ -146,7 +146,7 @@ impl DnsController {
     #[cfg(test)]
     pub(crate) fn new_with_runtime(
         runtime_provider: Arc<crate::dns::runtime::DnsServiceProvider>,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         udp_query_limit: usize,
     ) -> Self {
         Self::new_with_service(
@@ -158,7 +158,7 @@ impl DnsController {
 
     pub(crate) fn new_with_service(
         dns_service: crate::dns::DnsService,
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn PolicyBackend>>>,
         udp_query_limit: usize,
     ) -> Self {
         let snapshot = {

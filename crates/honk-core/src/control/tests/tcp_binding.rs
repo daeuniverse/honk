@@ -474,6 +474,8 @@ impl Lab {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .tcp_socket_ownership(stream.as_fd())
     }
 }
@@ -562,7 +564,9 @@ impl<'a> Handshake<'a> {
             "expected only the original SYN {isn:#x} in the daens, saw {arrived:x?}"
         );
         let key = conn_key(source, lab.target);
-        let backend = lab.handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(lab.handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         let original = backend
             .conn_state_lookup(&key)?
             .context("real SYN did not publish conn-state")?;
@@ -866,7 +870,9 @@ async fn refused_without_cleanup(
         lab.dials.load(Ordering::SeqCst) == 0,
         "unproven/superseded child reached outbound dial"
     );
-    let backend = lab.handle.ebpf.read().await;
+    let backend = tokio::sync::RwLockReadGuard::map(lab.handle.ebpf.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     ensure!(
         backend
             .conn_state_lookup(key)?
@@ -929,7 +935,9 @@ async fn supersede(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Resu
     let mut handoffs = HashMap::<_, TuplesKey, FlowMapValue<RoutingHandoffEntry>>::try_from(
         pinned_map(root, "ROUTING_HANDOFF_MAP")?,
     )?;
-    let mut backend = handle.ebpf.write().await;
+    let mut backend = tokio::sync::RwLockWriteGuard::map(handle.ebpf.write().await, |backend| {
+        backend.tc_mut().unwrap()
+    });
     let mut next = conns.get(key, aya_obj::generated::BPF_F_LOCK as u64)?.value;
     next.incarnation += 1;
     conns.insert(

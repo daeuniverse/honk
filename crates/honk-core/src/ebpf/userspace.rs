@@ -25,7 +25,23 @@ impl UserspaceBackend {
 }
 
 #[async_trait]
-impl EbpfBackend for UserspaceBackend {
+impl PolicyBackend for UserspaceBackend {
+    fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "software policy has no TC capability",
+        )
+        .into())
+    }
+
+    fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "software policy has no TC capability",
+        )
+        .into())
+    }
+
     fn observe_datapath(&self) -> DatapathObservation {
         let mut result = DatapathObservation::unknown(DatapathKind::XdpUserspace);
         result.routing = if self.policy.routing_generation.is_some() {
@@ -114,184 +130,6 @@ impl EbpfBackend for UserspaceBackend {
         self.admission.store(false, Ordering::Release);
         self.policy.clear();
         Ok(())
-    }
-
-    fn get_bpf_stats(&self, _key: u32) -> anyhow::Result<Option<u64>> {
-        Ok(None)
-    }
-    fn take_expiry_hints(&mut self) -> Option<tokio::sync::mpsc::Receiver<FlowExpiryHint>> {
-        None
-    }
-
-    fn retire_batch(
-        &mut self,
-        _requests: &[RetireRequest<'_>],
-        outcomes: &mut [RetireOutcome],
-    ) -> Result<RetireCounts, RetireError> {
-        outcomes.fill(RetireOutcome::NotRun);
-        Err(RetireError {
-            counts: RetireCounts::default(),
-            source: anyhow::anyhow!("XDP has no kernel retirement authority"),
-        })
-    }
-    fn detach_hooks(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support detach_hooks")
-    }
-
-    fn attach_dae0_programs(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support attach_dae0_programs")
-    }
-
-    fn quiesce_udp_staging(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support quiesce_udp_staging")
-    }
-
-    fn attach_dae0peer_ingress(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support attach_dae0peer_ingress")
-    }
-
-    fn attach_sk_lookup(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support attach_sk_lookup")
-    }
-
-    fn publish_listener_sockets(
-        &mut self,
-        _tcp4_fd: std::os::unix::io::RawFd,
-        _tcp6_fd: Option<std::os::unix::io::RawFd>,
-        _udp4_fds: &[std::os::unix::io::RawFd],
-        _udp6_fds: &[std::os::unix::io::RawFd],
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support publish_listener_sockets")
-    }
-
-    fn clear_listener_sockets(&mut self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support clear_listener_sockets")
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot> {
-        anyhow::bail!("XDP software policy has no TC interface ownership")
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn commit_interface_bindings(
-        &mut self,
-        commit: interface::BindingCommit,
-    ) -> Vec<std::os::fd::OwnedFd> {
-        if !commit.is_empty() {
-            self.admission.store(false, Ordering::Release);
-            tracing::error!("TC binding commit reached XDP software policy; closing admission");
-        }
-        // Even misrouted link FDs must be closed outside the backend lock.
-        commit.add.into_iter().map(|(_, _, fd)| fd).collect()
-    }
-
-    fn conn_state_lookup(&self, _key: &TuplesKey) -> anyhow::Result<Option<ConnState>> {
-        anyhow::bail!("XDP software policy does not support conn_state_lookup")
-    }
-
-    fn udp_flow_owner(
-        &self,
-        _token: u32,
-        _state: Option<ConnState>,
-    ) -> anyhow::Result<UdpFlowOwner> {
-        anyhow::bail!("XDP software policy does not support udp_flow_owner")
-    }
-
-    fn commit_udp_decision(
-        &mut self,
-        _key: &TuplesKey,
-        _token: u32,
-        _transition: UdpDecisionTransition,
-    ) -> anyhow::Result<UdpDecisionCommitResult> {
-        anyhow::bail!("XDP software policy does not support commit_udp_decision")
-    }
-
-    fn commit_udp_batch(
-        &mut self,
-        _requests: &[UdpDecisionCommit],
-        _visit: &mut UdpCommitVisit<'_>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support commit_udp_batch")
-    }
-
-    fn adopt_tcp(
-        &self,
-        _fd: std::os::fd::BorrowedFd<'_>,
-        _tuples: &TuplesKey,
-        _errors: TcpPinErrorSink,
-    ) -> anyhow::Result<TcpAdoption> {
-        anyhow::bail!("XDP software policy does not support adopt_tcp")
-    }
-
-    #[cfg(test)]
-    fn tcp_socket_ownership(
-        &self,
-        _fd: std::os::fd::BorrowedFd<'_>,
-    ) -> anyhow::Result<TcpSocketOwnership> {
-        anyhow::bail!("XDP software policy does not support tcp_socket_ownership")
-    }
-
-    fn verify_udp_decision_sequence(&self) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support verify_udp_decision_sequence")
-    }
-
-    fn udp_decision_sequence_status(&self) -> anyhow::Result<UdpDecisionSequenceStatus> {
-        anyhow::bail!("XDP software policy does not support udp_decision_sequence_status")
-    }
-
-    fn reset_udp_decision_sequence(&mut self, _generation: u32) -> anyhow::Result<bool> {
-        anyhow::bail!("XDP software policy does not support reset_udp_decision_sequence")
-    }
-
-    fn routing_handoff_lookup(
-        &self,
-        _key: &TuplesKey,
-    ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
-        anyhow::bail!("XDP software policy does not support routing_handoff_lookup")
-    }
-
-    fn redirect_track_lookup(&self, _key: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {
-        anyhow::bail!("XDP software policy does not support redirect_track_lookup")
-    }
-
-    fn conn_state_for_each_chunk(
-        &self,
-        _chunk_size: usize,
-        _cursor: &mut FlowScanCursor,
-        _visit: &mut ConnStateChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support conn_state_for_each_chunk")
-    }
-
-    fn redirect_track_for_each_chunk(
-        &self,
-        _chunk_size: usize,
-        _cursor: &mut FlowScanCursor,
-        _visit: &mut RedirectTrackChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support redirect_track_for_each_chunk")
-    }
-
-    fn routing_handoff_for_each_chunk(
-        &self,
-        _chunk_size: usize,
-        _cursor: &mut FlowScanCursor,
-        _visit: &mut RoutingHandoffChunkVisitor<'_>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support routing_handoff_for_each_chunk")
-    }
-
-    fn set_admission_pressure(&mut self, _pressured: bool) -> anyhow::Result<()> {
-        anyhow::bail!("XDP software policy does not support set_admission_pressure")
-    }
-
-    fn conn_state_occupancy(&self) -> anyhow::Result<(u64, u64)> {
-        anyhow::bail!("XDP software policy does not support conn_state_occupancy")
-    }
-
-    fn aux_occupancy(&self) -> anyhow::Result<(u64, u64)> {
-        anyhow::bail!("XDP software policy does not support aux_occupancy")
     }
 }
 
@@ -382,7 +220,6 @@ mod tests {
         assert_eq!(observed.programs, DatapathCheck::Unknown);
         assert_eq!(observed.hooks, DatapathCheck::Unknown);
         assert_eq!(observed.conn_state_capacity, None);
-        assert_eq!(backend.get_bpf_stats(0).unwrap(), None);
         assert!(
             backend
                 .set_datapath_flags(DATAPATH_FLAG_NFQ_ENABLED)
@@ -393,52 +230,11 @@ mod tests {
                 .set_datapath_flags(DATAPATH_FLAG_TRACE_ENABLED)
                 .is_err()
         );
-        assert!(backend.attach_dae0_programs().is_err());
-        assert!(
-            backend
-                .publish_listener_sockets(-1, None, &[], &[])
-                .is_err()
-        );
-        assert!(backend.verify_udp_decision_sequence().is_err());
-        assert!(backend.udp_flow_owner(0, None).is_err());
-        assert!(backend.quiesce_udp_staging().is_err());
+        assert!(backend.tc().is_err());
+        assert!(backend.tc_mut().is_err());
         backend.cleanup().await.unwrap();
         assert!(!admission.load(Ordering::Acquire));
         assert!(backend.policy.routing_generation.is_none());
         assert!(!backend.get_outbound_alive(2, 0, 0).unwrap());
-    }
-
-    #[cfg(feature = "ebpf")]
-    #[test]
-    fn unexpected_tc_commit_fences_admission_and_defers_descriptor_disposal() {
-        use std::io::Read;
-        use std::os::unix::net::UnixStream;
-
-        let admission = Arc::new(AtomicBool::new(false));
-        let mut backend = UserspaceBackend::new(Arc::clone(&admission));
-        assert!(backend.interface_binding_snapshot().is_err());
-        admission.store(true, Ordering::Release);
-        let (owned, mut peer) = UnixStream::pair().unwrap();
-        peer.set_nonblocking(true).unwrap();
-        let closed = backend.commit_interface_bindings(interface::BindingCommit {
-            add: vec![(
-                interface::Binding {
-                    ifindex: std::num::NonZeroU32::new(1).unwrap(),
-                    direction: interface::Direction::Ingress,
-                    program: interface::TcProgram::LanIngressL2,
-                    interface: "test".into(),
-                },
-                1,
-                owned.into(),
-            )],
-            ..Default::default()
-        });
-        assert!(!admission.load(Ordering::Acquire));
-        assert_eq!(
-            peer.read(&mut [0]).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        drop(closed);
-        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 }

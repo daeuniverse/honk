@@ -27,7 +27,8 @@ async fn auxiliary_occupancy_drives_real_ticks_and_drains_backlog() -> anyhow::R
                     .insert(*key, RoutingHandoffEntry::default());
             }
         }
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
         let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
         let start = tokio::time::Instant::now();
         let mut state = tick::TickState::new(start);
@@ -51,7 +52,7 @@ async fn auxiliary_occupancy_drives_real_ticks_and_drains_backlog() -> anyhow::R
             if tick == 1 {
                 assert_eq!(state.pressure.active, pressured);
             }
-            let (redirect, handoffs) = backend.read().await.aux_occupancy()?;
+            let (redirect, handoffs) = backend.read().await.tc().unwrap().aux_occupancy()?;
             let remaining = if handoff { handoffs } else { redirect };
             assert!(previous - remaining <= JANITOR_MAX_CANDIDATES as u64);
             if !pressured && tick == 1 {

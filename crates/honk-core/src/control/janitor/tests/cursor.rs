@@ -26,7 +26,8 @@ async fn bounded_scans_resume_beyond_a_pinned_prefix() -> anyhow::Result<()> {
     for key in &order[..JANITOR_SCAN_CHUNK * 2] {
         pins.retain_for_test(TcpFlowKey::from_tuples(key));
     }
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
     let tuning = ScanTuning {
         candidates: JANITOR_MAX_CANDIDATES,
@@ -40,7 +41,7 @@ async fn bounded_scans_resume_beyond_a_pinned_prefix() -> anyhow::Result<()> {
         assert_eq!(result.scanned, JANITOR_SCAN_CHUNK);
     }
     assert_eq!(
-        backend.read().await.aux_occupancy()?.0,
+        backend.read().await.tc().unwrap().aux_occupancy()?.0,
         (JANITOR_SCAN_CHUNK * 2) as u64
     );
     Ok(())

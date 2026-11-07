@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-type SharedEbpfBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::EbpfBackend>>>;
+type SharedPolicyBackend = Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>>;
 
 /// Shared outbound mode; native targets retain identity rather than display names.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -330,7 +330,7 @@ enum Persistence {
 }
 
 struct DatapathFlagsInner {
-    backend: SharedEbpfBackend,
+    backend: SharedPolicyBackend,
     mode_state: SharedModeState,
     cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     state: DatapathFlagsState,
@@ -338,7 +338,7 @@ struct DatapathFlagsInner {
 
 impl DatapathFlagsHandle {
     pub fn new(
-        backend: SharedEbpfBackend,
+        backend: SharedPolicyBackend,
         mode_state: SharedModeState,
         cache_db: Option<Arc<crate::state::cache::CacheDb>>,
     ) -> Self {
@@ -461,11 +461,14 @@ impl DatapathFlagsHandle {
             backend
                 .set_datapath_flags(flags)
                 .with_context(|| format!("failed to publish datapath flags {flags:#010x}"))?;
-            if quiesce && backend.observe_datapath().kind != crate::ebpf::DatapathKind::XdpUserspace
-            {
-                backend
-                    .quiesce_udp_staging()
-                    .context("failed to quiesce staged UDP decisions")
+            if quiesce {
+                match backend.tc_mut() {
+                    Ok(tc) => tc
+                        .quiesce_udp_staging()
+                        .context("failed to quiesce staged UDP decisions"),
+                    Err(error) if state.nfqueue_enabled => Err(error),
+                    Err(_) => Ok(()),
+                }
             } else {
                 Ok(())
             }
@@ -524,7 +527,7 @@ impl DatapathFlagsHandle {
         }
         let backend = Arc::clone(&inner.backend);
         let mut backend = backend.write().await;
-        if backend.observe_datapath().kind == crate::ebpf::DatapathKind::XdpUserspace {
+        if backend.tc().is_err() {
             return Ok(());
         }
         // Demand may have changed while waiting for either publication lock.
@@ -625,7 +628,7 @@ impl DatapathFlagsPublication<'_> {
     /// caller must commit degraded and keep admission closed, not report rejection.
     pub(crate) fn reset_for_activation(
         &mut self,
-        backend: &mut dyn crate::ebpf::EbpfBackend,
+        backend: &mut dyn crate::ebpf::PolicyBackend,
     ) -> anyhow::Result<()> {
         if !self.inner.mode_state.read().is_native() {
             return Ok(());
@@ -745,13 +748,13 @@ mod tests {
         DatapathFlagsHandle,
         SharedModeState,
         Arc<parking_lot::Mutex<Vec<u32>>>,
-        SharedEbpfBackend,
+        SharedPolicyBackend,
     );
 
     fn flags_fixture() -> FlagsFixture {
         let backend = crate::ebpf::mock::MockEbpfBackend::new();
         let writes = backend.datapath_flags_writes.clone();
-        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
         let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
         let handle = DatapathFlagsHandle::new(Arc::clone(&backend), Arc::clone(&state), None);
         (handle, state, writes, backend)
@@ -783,7 +786,7 @@ mod tests {
         let backend = crate::ebpf::userspace::UserspaceBackend::new(Arc::new(
             std::sync::atomic::AtomicBool::new(false),
         ));
-        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(backend)));
         let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
         let handle = DatapathFlagsHandle::new(backend, state, None);
         handle.initialize(false, false).await.unwrap();
@@ -836,7 +839,7 @@ mod tests {
                 ..ConnState::default()
             },
         );
-        let backend: SharedEbpfBackend = Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
+        let backend: SharedPolicyBackend = Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
         let state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "Proxy")));
         let handle = DatapathFlagsHandle::new(Arc::clone(&backend), state, None);
 
@@ -846,6 +849,8 @@ mod tests {
             backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&key)
                 .unwrap()
                 .is_none()

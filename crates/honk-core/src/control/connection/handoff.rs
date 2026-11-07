@@ -481,7 +481,8 @@ impl ControlPlaneHandle {
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
     ) -> anyhow::Result<Option<HandoffResult>> {
         let backend = self.ebpf.read().await;
-        let entry = backend.verify_udp_admission(tuples, owner)?;
+        let tc = backend.tc()?;
+        let entry = tc.verify_udp_admission(tuples, owner)?;
         Ok(entry
             .filter(|entry| {
                 tuples.dst_port != 53
@@ -491,7 +492,7 @@ impl ControlPlaneHandle {
             })
             .map(|entry| {
                 HandoffResult::captured(
-                    backend.as_ref(),
+                    tc,
                     tuples,
                     entry,
                     #[cfg(feature = "native-api")]
@@ -515,7 +516,7 @@ impl ControlPlaneHandle {
         let mut retries = Self::CHILD_PROOF_RETRIES;
         let (backend, adoption) = loop {
             let backend = self.ebpf.read().await;
-            match backend.adopt_tcp(
+            match backend.tc()?.adopt_tcp(
                 stream.as_fd(),
                 &tuples,
                 Arc::clone(&self.retirement.pin_errors),
@@ -538,9 +539,10 @@ impl ControlPlaneHandle {
             Arc::clone(&self.retirement),
             adoption.pin,
         );
+        let tc = backend.tc()?;
         let handoff = adoption.handoff.map(|entry| {
             HandoffResult::captured(
-                backend.as_ref(),
+                tc,
                 &tuples,
                 entry,
                 #[cfg(feature = "native-api")]

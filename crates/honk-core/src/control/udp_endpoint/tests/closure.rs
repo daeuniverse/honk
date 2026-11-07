@@ -44,7 +44,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             let stats = Arc::new(StatsManager::new());
             let tracker = Arc::new(ConnectionTracker::new());
             tracker.enable();
-            let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+            let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
                 Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
             let (fatal, mut failures) = mpsc::unbounded_channel();
             let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
@@ -95,6 +95,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             backend
                 .write()
                 .await
+                .tc_mut()
+                .unwrap()
                 .udp_conn_state_store(
                     &key,
                     &ConnState {
@@ -145,7 +147,9 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                 .snapshot_group("captured-parent", Some("udp"))
                 .pop()
                 .unwrap();
-            let mut locked = backend.write().await;
+            let mut locked = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+                backend.tc_mut().unwrap()
+            });
             if mismatch {
                 locked
                     .redirect_track_store(
@@ -195,6 +199,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
+                        .tc()
+                        .unwrap()
                         .conn_state_lookup(&key)
                         .unwrap()
                         .unwrap()
@@ -210,6 +216,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     backend
                         .read()
                         .await
+                        .tc()
+                        .unwrap()
                         .conn_state_lookup(&key)
                         .unwrap()
                         .is_none()
@@ -484,7 +492,7 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             },
         )
         .unwrap();
-        let backend: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(mock)));
         let pins = Arc::new(crate::control::connection::handoff::TcpFlowPins::default());
         let (fatal, mut failures) = mpsc::unbounded_channel();
@@ -515,6 +523,8 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
         backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(
                 &key,
                 &ConnState {
@@ -530,6 +540,8 @@ async fn token_zero_endpoint_retirement_cannot_select_recreated_kernel_flow() {
             backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&key)
                 .unwrap()
                 .unwrap()

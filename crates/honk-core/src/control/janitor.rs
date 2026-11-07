@@ -20,7 +20,9 @@
 
 use super::connection::TcpFlowPins;
 use super::udp_endpoint::UdpEndpointPool;
-use crate::ebpf::{EbpfBackend, RETIRE_BATCH_CAPACITY};
+#[cfg(test)]
+use crate::ebpf::EbpfBackend;
+use crate::ebpf::RETIRE_BATCH_CAPACITY;
 use health::{AuxMap, HealthLatches};
 use honk_ebpf_common::conn::{BpfStatsKey, MAX_CONN_STATE_NUM};
 use std::sync::Arc;
@@ -134,7 +136,7 @@ struct PressureState {
 /// Runs background cleanup of stale eBPF map entries to prevent map overflow
 /// and memory pressure. The janitor adapts its behaviour based on map pressure.
 pub struct BpfJanitor {
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     tcp_flow_pins: Arc<TcpFlowPins>,
     udp_pool: Option<Arc<UdpEndpointPool>>,
     scan_cursors: [Arc<parking_lot::Mutex<crate::ebpf::FlowScanCursor>>; 3],
@@ -147,7 +149,7 @@ pub struct BpfJanitor {
 impl BpfJanitor {
     /// Create a new janitor bound to the given eBPF backend.
     pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
         tcp_flow_pins: Arc<TcpFlowPins>,
     ) -> Self {
         Self {

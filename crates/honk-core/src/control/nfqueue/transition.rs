@@ -80,7 +80,7 @@ impl PendingUdpVerdicts {
                 continue;
             }
             let result = blocking_section(|| {
-                backend.commit_udp_decision(
+                backend.tc_mut()?.commit_udp_decision(
                     &identity.tuples(),
                     identity.owner.token,
                     UdpDecisionTransition::ActivateDirect(direct_rule_mark),

@@ -38,7 +38,7 @@ fn scan_tuning_grows_with_pressure() {
 
 #[tokio::test]
 async fn blocking_scan_keeps_hot_path_readers_available() {
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -57,7 +57,12 @@ async fn blocking_scan_keeps_hot_path_readers_available() {
         .await
         .is_ok();
     release_tx.send(()).expect("release blocking scan");
-    scan.await.expect("scan task joins");
+    assert!(
+        scan.await
+            .expect("scan task joins")
+            .expect("TC capability remains available")
+            .is_some()
+    );
 
     assert!(
         read_available,
@@ -68,7 +73,7 @@ async fn blocking_scan_keeps_hot_path_readers_available() {
 #[tokio::test(start_paused = true)]
 async fn supervised_stop_retains_blocking_scan_across_cancelled_join() {
     for panic_in_scan in [false, true] {
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
         let retained_backend = Arc::downgrade(&backend);
         let mut janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
@@ -266,11 +271,13 @@ fn test_state(state: TcpState, last_seen_ns: u64) -> ConnState {
 
 #[tokio::test]
 async fn aux_pressure_detects_bounded_scan_and_recovers() -> anyhow::Result<()> {
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     let stale = RedirectEntry::default();
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         for port in 0..=(JANITOR_BASE_CANDIDATES as u16) {
             backend
                 .redirect_track_store(&RedirectTuple::from_tuples(&test_tuple(port, 17)), &stale)?;
@@ -308,7 +315,8 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
     for key in BpfStatsKey::ALL {
         model.bpf_stats.insert(key as u32, 101 + key as u64);
     }
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(backend, Arc::new(TcpFlowPins::default()));
     let high = (AUX_MAP_CAPACITY as f64 * AUX_MAP_PRESSURE_WATERMARK) as usize + 1;
     for map in AuxMap::ALL {
@@ -351,7 +359,8 @@ async fn map_health_warnings_rearm_after_pressure_ends() {
             }
             janitor
                 .check_map_health(utilizations, scans, &mut health)
-                .await;
+                .await
+                .unwrap();
             assert_eq!(health.aux_pressure_warned[map as usize], aux_expected);
             assert_eq!(health.occupancy_warned, occupancy_expected);
             assert_eq!(
@@ -379,10 +388,12 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
     let udp = test_tuple(10_005, 17);
     let now_ns = TCP_CONN_STATE_ESTABLISHED_TIMEOUT_NS + 1;
 
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         backend.tcp_conn_state_store(&pinned_active, &test_state(TcpState::TcpStateActive, 0))?;
         backend.tcp_conn_state_store(&pinned_closing, &test_state(TcpState::TcpStateClosing, 0))?;
         backend.tcp_conn_state_store(&unpinned_active, &test_state(TcpState::TcpStateActive, 0))?;
@@ -398,7 +409,9 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
 
     assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (3, 5));
     {
-        let backend = backend.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.conn_state_lookup(&pinned_active)?.is_some());
         assert!(backend.conn_state_lookup(&pinned_closing)?.is_some());
         assert!(backend.conn_state_lookup(&unpinned_active)?.is_none());
@@ -415,7 +428,8 @@ async fn tcp_pin_conn_state_matrix() -> anyhow::Result<()> {
         Some(true)
     );
     assert_eq!(janitor.cleanup_conn_state_for_test(now_ns).await, (2, 2));
-    let backend = backend.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     assert!(backend.conn_state_lookup(&pinned_active)?.is_none());
     assert!(backend.conn_state_lookup(&pinned_closing)?.is_none());
 
@@ -436,10 +450,12 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
     };
     let now_ns = REDIRECT_TRACK_TIMEOUT_NS + 1;
 
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     {
-        let mut backend = backend.write().await;
+        let mut backend = tokio::sync::RwLockWriteGuard::map(backend.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         backend.redirect_track_store(&pinned, &stale)?;
         backend.redirect_track_store(&unpinned, &stale)?;
         backend.redirect_track_store(&udp, &stale)?;
@@ -454,7 +470,9 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
         (2, 3)
     );
     {
-        let backend = backend.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.redirect_track_lookup(&pinned)?.is_some());
         assert!(backend.redirect_track_lookup(&unpinned)?.is_none());
         assert!(backend.redirect_track_lookup(&udp)?.is_none());
@@ -472,6 +490,8 @@ async fn tcp_pin_redirect_matrix() -> anyhow::Result<()> {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .redirect_track_lookup(&pinned)?
             .is_none()
     );
@@ -567,7 +587,8 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
         for key in &order[..JANITOR_BASE_CANDIDATES] {
             pins.retain_for_test(TcpFlowKey::from_tuples(key));
         }
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
         let janitor = BpfJanitor::new(Arc::clone(&backend), pins);
         let mut gauge = OccupancyGauge::default();
         let tuning = ScanTuning {
@@ -594,7 +615,9 @@ async fn pinned_tcp_prefix_does_not_consume_candidate_budget() -> anyhow::Result
             }
             _ => unreachable!(),
         }
-        let backend = backend.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         for key in &order {
             let retained = match map {
                 "conn" => backend.conn_state_lookup(key)?.is_some(),
@@ -630,7 +653,8 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
                 .expect("conn fixture exists"),
             honk_ebpf_common::RoutingHandoffEntry::default(),
         );
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(model)));
         let pins = Arc::new(TcpFlowPins::default());
         let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::clone(&pins));
         let adopt_backend = Arc::clone(&backend);
@@ -654,7 +678,9 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
         };
         assert_eq!(result, (0, 1));
         {
-            let backend = backend.read().await;
+            let backend = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+                backend.tc().unwrap()
+            });
             assert!(backend.conn_state_lookup(&key)?.is_some());
             assert!(
                 backend
@@ -680,7 +706,9 @@ async fn tcp_adoption_after_scan_preserves_current_owner() -> anyhow::Result<()>
             _ => unreachable!(),
         };
         assert_eq!(result, (1, 1));
-        let backend = backend.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         match map {
             "conn" => assert!(backend.conn_state_lookup(&key)?.is_none()),
             "redirect" => assert!(
@@ -705,7 +733,8 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         )?;
     }
     model.retire_fault_after = Some(2);
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(model)));
     let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
     let mut gauge = OccupancyGauge::default();
     let error = janitor
@@ -729,14 +758,19 @@ async fn retirement_error_keeps_actual_partial_map_counts() -> anyhow::Result<()
         }
     );
     let mut remaining = 0;
-    backend.read().await.conn_state_for_each_chunk(
-        JANITOR_SCAN_CHUNK,
-        &mut crate::ebpf::FlowScanCursor::default(),
-        &mut |chunk| {
-            remaining += chunk.len();
-            true
-        },
-    )?;
+    backend
+        .read()
+        .await
+        .tc()
+        .unwrap()
+        .conn_state_for_each_chunk(
+            JANITOR_SCAN_CHUNK,
+            &mut crate::ebpf::FlowScanCursor::default(),
+            &mut |chunk| {
+                remaining += chunk.len();
+                true
+            },
+        )?;
     assert_eq!(remaining, 1);
     Ok(())
 }

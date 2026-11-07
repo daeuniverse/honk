@@ -46,7 +46,8 @@ fn watcher_reconcile_binds_reprograms_writes_accept_ra_and_releases() {
             backend,
             mut netlink,
         } = lab;
-        let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(backend)));
+        let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(backend)));
         let mut config = honk_config::Config::default();
         config.global.lan_interface = vec![LAN.to_string()];
         config.global.wan_interface = vec!["auto".to_string()];

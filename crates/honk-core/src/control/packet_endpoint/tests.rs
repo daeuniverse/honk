@@ -298,7 +298,14 @@ async fn real_udp_outbound_replies_stay_in_their_original_scope() {
             source.port(),
             17,
         );
-        assert!(backend_guard.conn_state_lookup(&key).unwrap().is_none());
+        assert!(
+            backend_guard
+                .tc()
+                .unwrap()
+                .conn_state_lookup(&key)
+                .unwrap()
+                .is_none()
+        );
         endpoints.close();
         drop(endpoints);
         owner.await.unwrap().unwrap();

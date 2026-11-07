@@ -26,7 +26,7 @@ fn kernel_conn(state: UdpDecisionState, token: u32, incarnation: u64) -> ConnSta
 }
 
 struct Fixture {
-    backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
     pending: Arc<PendingUdpVerdicts>,
     hints: mpsc::Sender<FlowExpiryHint>,
@@ -40,7 +40,8 @@ impl Fixture {
     }
 
     fn with_backend(mock: MockEbpfBackend) -> Self {
-        let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+        let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+            Arc::new(RwLock::new(Box::new(mock)));
         let endpoints = Arc::new(UdpEndpointPool::new());
         let stats = Arc::new(StatsManager::new());
         let (pending, _) =
@@ -72,6 +73,8 @@ impl Fixture {
         self.backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(&key.tuples(), &kernel)
             .unwrap();
         match self.endpoints.reserve_owned_or_enqueue_at(
@@ -107,6 +110,8 @@ impl Fixture {
         self.backend
             .write()
             .await
+            .tc_mut()
+            .unwrap()
             .udp_conn_state_store(
                 &key.tuples(),
                 &kernel_conn(UdpDecisionState::Pending, NEW_TOKEN, NEW_INCARNATION),
@@ -218,6 +223,8 @@ async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
                 .backend
                 .read()
                 .await
+                .tc()
+                .unwrap()
                 .conn_state_lookup(&foreign.tuples())
                 .unwrap()
                 .is_some(),

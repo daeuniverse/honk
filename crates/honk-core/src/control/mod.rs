@@ -54,7 +54,8 @@ use crate::control::packet_sniffer::PacketSnifferPool;
 use crate::control::udp_endpoint::{EndpointReservation, UdpEndpointPool, UdpInitLease};
 use crate::dns::DnsResolver;
 use crate::dns::query::{ValidatedDnsQuery, validate_exact_dns_query};
-use crate::ebpf::EbpfBackend;
+#[cfg(test)]
+use crate::ebpf::{EbpfBackend, PolicyBackend};
 use crate::group::{GroupManager, SharedGroupManager};
 use crate::pool::ConnectionPool;
 use crate::proxy::ProxyRegistry;
@@ -143,7 +144,7 @@ pub struct ControlPlane {
     reload_lock: tokio::sync::Mutex<()>,
     log_files: LogFiles,
     startup_downgrades: StartupDowngrades,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     router: Arc<RwLock<Router>>,
     proxy_registry: Arc<ProxyRegistry>,
     dns_resolver: Arc<DnsResolver>,
@@ -346,8 +347,8 @@ impl ControlPlane {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Shared backend cell, used by the interface watcher for dynamic attach.
-    pub fn ebpf_handle(&self) -> Arc<RwLock<Box<dyn EbpfBackend>>> {
+    /// The sole policy publication cell; TC consumers borrow its explicit capability view.
+    pub fn policy_backend_handle(&self) -> Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> {
         self.ebpf.clone()
     }
 

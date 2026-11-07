@@ -287,7 +287,7 @@ pub(super) fn capability() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ebpf::{DatapathAttachment, EbpfBackend, mock::MockEbpfBackend};
+    use crate::ebpf::{DatapathAttachment, PolicyBackend, mock::MockEbpfBackend};
 
     #[test]
     fn mock_admission_never_claims_kernel_activity() {

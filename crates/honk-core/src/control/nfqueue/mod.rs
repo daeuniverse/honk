@@ -105,7 +105,7 @@ pub(super) struct PendingUdpVerdicts {
     admission: AdmissionGate,
     empty: Notify,
     commits: commit::CommitPump,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     endpoints: Arc<UdpEndpointPool>,
     stats: Arc<StatsManager>,
     fatal: mpsc::Sender<PendingUdpFatal>,
@@ -113,7 +113,7 @@ pub(super) struct PendingUdpVerdicts {
 
 impl PendingUdpVerdicts {
     pub(super) fn new(
-        ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+        ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
         endpoints: Arc<UdpEndpointPool>,
         stats: Arc<StatsManager>,
     ) -> (Self, mpsc::Receiver<PendingUdpFatal>) {

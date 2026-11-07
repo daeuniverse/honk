@@ -255,9 +255,9 @@ async fn changed_entry_is_written_before_obsolete_entry_is_deleted_and_delete_re
 #[tokio::test(start_paused = true)]
 async fn spawned_worker_converges_mock_map_after_transient_failure() {
     let current = snapshot(7, 1, 2);
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> = Arc::new(tokio::sync::RwLock::new(
-        Box::new(backend_for_test(&current)),
-    ));
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(
+        tokio::sync::RwLock::new(Box::new(backend_for_test(&current))),
+    );
     ebpf.write()
         .await
         .inject_projection_fault(ProjectionMapOperation::Set, 1, false)
@@ -383,7 +383,7 @@ async fn reload_prefilled_facts_are_removed_after_clear_or_concurrent_expiry() {
 #[tokio::test]
 async fn shutdown_timeout_aborts_wedged_worker() {
     // Given a worker wedged on the backend write lock mid-flush.
-    let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+    let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
     let projection = RoutingProjection::spawn(ebpf.clone(), snapshot(1, 1, 2));
     let termination = projection.termination_probe_for_test();
@@ -412,7 +412,7 @@ async fn shutdown_timeout_aborts_wedged_worker() {
 async fn shutdown_is_idempotent_and_awaits_worker_termination() {
     for _ in 0..10 {
         // Given
-        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
         let termination = projection.termination_probe_for_test();
@@ -432,7 +432,7 @@ async fn shutdown_is_idempotent_and_awaits_worker_termination() {
 async fn drop_cancels_projection_worker() {
     for _ in 0..10 {
         // Given
-        let ebpf: Arc<tokio::sync::RwLock<Box<dyn EbpfBackend>>> =
+        let ebpf: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
             Arc::new(tokio::sync::RwLock::new(Box::new(MockEbpfBackend::new())));
         let projection = RoutingProjection::spawn(ebpf, snapshot(1, 1, 2));
         let termination = projection.termination_probe_for_test();

@@ -198,6 +198,8 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     for destination in [a, b] {
                         ebpf.read()
                             .await
+                            .tc()
+                            .unwrap()
                             .redirect_track_lookup(&redirect_key(client_addr, destination))?
                             .context("contacted target must have exact redirect framing")?;
                     }
@@ -221,15 +223,27 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                             receive(&client, c, b"uncontacted-C-to-client").await?;
                         }
                         ensure!(
-                            ebpf.read().await.redirect_track_lookup(&c_key)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .redirect_track_lookup(&c_key)?
+                                .is_none(),
                             "C unexpectedly acquired exact redirect framing"
                         );
                         ensure!(
-                            ebpf.read().await.conn_state_lookup(&forward)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .conn_state_lookup(&forward)?
+                                .is_none(),
                             "foreign reply learned client-to-C UDP state"
                         );
                         ensure!(
-                            ebpf.read().await.conn_state_lookup(&reverse)?.is_none(),
+                            ebpf.read()
+                                .await
+                                .tc()?
+                                .conn_state_lookup(&reverse)?
+                                .is_none(),
                             "foreign reply learned C-to-client UDP state"
                         );
                     }
@@ -262,7 +276,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.tc()?.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless source53 traffic created ordinary conn-state"
                                 );
                             }
@@ -290,7 +304,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                                 tuples_key(destination, client_addr, 17),
                             ] {
                                 ensure!(
-                                    ebpf.read().await.conn_state_lookup(&tuple)?.is_none(),
+                                    ebpf.read().await.tc()?.conn_state_lookup(&tuple)?.is_none(),
                                     "stateless retirement acquired ordinary conn-state"
                                 );
                             }

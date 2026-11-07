@@ -177,7 +177,9 @@ pub(super) struct Lineage {
 
 impl Lineage {
     pub(super) async fn read(handle: &ControlPlaneHandle, key: &TuplesKey) -> anyhow::Result<Self> {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         Ok(Self {
             conn: backend
                 .conn_state_lookup(key)?
@@ -557,7 +559,10 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
     let mut new_generation = 0;
     if policy {
         let plan = port_plan(target.port(), "block", false)?;
-        let mut backend = handle.ebpf.write().await;
+        let mut backend =
+            tokio::sync::RwLockWriteGuard::map(handle.ebpf.write().await, |backend| {
+                backend.tc_mut().unwrap()
+            });
         let old = backend.routing_policy_generation();
         backend.publish_routing_plan(&plan, &[])?;
         new_generation = backend.routing_policy_generation();
@@ -595,7 +600,7 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
             .ebpf
             .read()
             .await
-            .tcp_socket_ownership(accepted.as_fd());
+            .tc().unwrap().tcp_socket_ownership(accepted.as_fd());
         let binding = match ownership {
             Ok(TcpSocketOwnership::Kernel(binding)) => binding,
             Ok(TcpSocketOwnership::Model) => anyhow::bail!("real backend returned model ownership"),
@@ -682,7 +687,7 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
                 let fresh_key = conn_key(fresh_source, target);
                 tokio::time::timeout(NETNS_TEST_TIMEOUT, async {
                     loop {
-                        if let Some(state) = handle.ebpf.read().await.conn_state_lookup(&fresh_key)? {
+                        if let Some(state) = handle.ebpf.read().await.tc().unwrap().conn_state_lookup(&fresh_key)? {
                             let raw = unsafe { state.meta.raw };
                             if raw & honk_ebpf_common::ROUTING_META_FLAG_PUBLISHED != 0 {
                                 ensure!(raw as u8 == OutboundIndex::Block as u8,
@@ -705,7 +710,7 @@ async fn proxy(lab: &Lab, wan: bool, policy: bool) -> anyhow::Result<()> {
                 .ebpf
                 .read()
                 .await
-                .tcp_socket_ownership(fresh.as_fd())?
+                .tc().unwrap().tcp_socket_ownership(fresh.as_fd())?
             else {
                 anyhow::bail!("real backend returned model ownership")
             };

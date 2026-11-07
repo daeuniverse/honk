@@ -8,7 +8,7 @@ struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,
     native: Arc<crate::native_api::observation::NativeObservation>,
-    backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
     api: crate::native_api::NativeServer,
@@ -141,7 +141,7 @@ impl Fixture {
         let phase = plane.observe_phase();
         let native = Arc::clone(&state.observation);
         let commands = plane.command_sender();
-        let backend = plane.ebpf_handle();
+        let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_requested.clone();
         plane.alive_set().shutdown_health_checks().await?;
         let api = crate::native_api::NativeServer::start(listener, Arc::new(state));
@@ -189,14 +189,19 @@ impl Fixture {
             client.port(),
             6,
         );
-        self.backend.write().await.tcp_conn_state_store(
-            &tuples,
-            &honk_ebpf_common::ConnState {
-                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-                last_seen_ns: crate::control::janitor::monotonic_now_ns()?,
-                ..Default::default()
-            },
-        )?;
+        self.backend
+            .write()
+            .await
+            .tc_mut()
+            .unwrap()
+            .tcp_conn_state_store(
+                &tuples,
+                &honk_ebpf_common::ConnState {
+                    state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                    last_seen_ns: crate::control::janitor::monotonic_now_ns()?,
+                    ..Default::default()
+                },
+            )?;
         Ok(tokio::time::timeout(WAIT, socket.connect(self.tproxy)).await??)
     }
 
@@ -320,7 +325,7 @@ async fn a_socket_without_any_receive_trace_is_untraced() {
     let socket = unsafe { std::net::UdpSocket::from_raw_fd(read.into_raw_fd()) };
     socket.set_nonblocking(true).unwrap();
     let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
-    let ebpf: RwLock<Box<dyn EbpfBackend>> =
+    let ebpf: RwLock<Box<dyn crate::ebpf::PolicyBackend>> =
         RwLock::new(Box::new(crate::ebpf::mock::MockEbpfBackend::new()));
     let mut batch = sockets::UdpRecvBatch::new().unwrap();
     assert!(
@@ -369,7 +374,9 @@ async fn shutdown_quiesces_nfqueue_before_closing_datapath_admission() -> anyhow
     plane.start_datapath_flags_coordinator()?;
     plane.initialize_datapath_flags(true, true).await?;
     {
-        let mut ebpf = plane.ebpf.write().await;
+        let mut ebpf = tokio::sync::RwLockWriteGuard::map(plane.ebpf.write().await, |backend| {
+            backend.tc_mut().unwrap()
+        });
         ebpf.publish_listener_sockets(0, None, &[], &[])?;
         ebpf.set_datapath_ready(true)?;
     }

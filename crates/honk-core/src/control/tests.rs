@@ -65,7 +65,7 @@ async fn health_push_re_resolves_after_reload_writer() {
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
     let alive_set = Arc::new(AliveDialerSet::new());
-    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
     let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
@@ -1478,14 +1478,20 @@ pub(in crate::control) async fn store_active_tcp_flow(
         client_addr.port(),
         6,
     );
-    handle.ebpf.write().await.tcp_conn_state_store(
-        &tuples,
-        &honk_ebpf_common::conn::ConnState {
-            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-            last_seen_ns: 1,
-            ..Default::default()
-        },
-    )?;
+    handle
+        .ebpf
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuples,
+            &honk_ebpf_common::conn::ConnState {
+                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                last_seen_ns: 1,
+                ..Default::default()
+            },
+        )?;
     Ok(())
 }
 
@@ -2018,7 +2024,9 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
         (0, 1)
     );
     {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.conn_state_lookup(&tuples)?.is_some());
         assert!(backend.redirect_track_lookup(&redirect_key)?.is_some());
     }
@@ -2049,7 +2057,9 @@ async fn tcp_idle_relay_survives_conn_state_sweep() -> anyhow::Result<()> {
     handler_result??;
 
     {
-        let backend = handle.ebpf.read().await;
+        let backend = tokio::sync::RwLockReadGuard::map(handle.ebpf.read().await, |backend| {
+            backend.tc().unwrap()
+        });
         assert!(backend.conn_state_lookup(&tuples)?.is_none());
     }
     assert!(handle.tcp_flow_pins.snapshot().is_empty());
@@ -2342,14 +2352,20 @@ async fn tcp_tracker_keeps_the_dial_selection_snapshot() -> anyhow::Result<()> {
         client_addr.port(),
         6,
     );
-    handle.ebpf.write().await.tcp_conn_state_store(
-        &tuples,
-        &honk_ebpf_common::conn::ConnState {
-            state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
-            last_seen_ns: 1,
-            ..Default::default()
-        },
-    )?;
+    handle
+        .ebpf
+        .write()
+        .await
+        .tc_mut()
+        .unwrap()
+        .tcp_conn_state_store(
+            &tuples,
+            &honk_ebpf_common::conn::ConnState {
+                state: honk_ebpf_common::conn::TcpState::TcpStateActive as u8,
+                last_seen_ns: 1,
+                ..Default::default()
+            },
+        )?;
     let task_handle = handle.clone();
     let mut task =
         tokio::spawn(async move { task_handle.serve_connection(accepted, client_addr).await });
@@ -4503,6 +4519,8 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .udp_decision_sequence_status()
             .unwrap()
             .exhausted()
@@ -4510,7 +4528,10 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
 
     for index in [2, 3] {
         {
-            let mut backend = control.ebpf.write().await;
+            let mut backend =
+                tokio::sync::RwLockWriteGuard::map(control.ebpf.write().await, |backend| {
+                    backend.tc_mut().unwrap()
+                });
             let expected = backend.conn_state_lookup(&keys[index]).unwrap().unwrap();
             backend
                 .retire_batch(
@@ -4536,6 +4557,8 @@ async fn exhausted_udp_tokens_wait_for_a_rollback_safe_generation() {
             .ebpf
             .read()
             .await
+            .tc()
+            .unwrap()
             .udp_decision_sequence_status()
             .unwrap(),
         crate::ebpf::UdpDecisionSequenceStatus {
@@ -4631,7 +4654,8 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
@@ -4666,6 +4690,8 @@ async fn retirement_worker_retires_legacy_token_zero_conn_state() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .is_none()
@@ -4694,7 +4720,8 @@ async fn retirement_worker_acknowledges_superseding_token() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
@@ -4730,6 +4757,8 @@ async fn retirement_worker_acknowledges_superseding_token() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
@@ -4768,7 +4797,8 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         },
     )
     .unwrap();
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let pool = Arc::new(UdpEndpointPool::new());
     let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let pins = Arc::new(connection::handoff::TcpFlowPins::default());
@@ -4808,6 +4838,8 @@ async fn retirement_worker_escalates_auxiliary_token_mismatch() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&key)
             .unwrap()
             .unwrap()
@@ -5345,7 +5377,7 @@ struct NfqueueRuntimeFixture {
     runtime: NfqueueRuntime,
     listener_fatal_tx: tokio::sync::oneshot::Sender<honk_nfqueue::FatalError>,
     pending: Arc<nfqueue::PendingUdpVerdicts>,
-    ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
 }
 
 #[cfg(feature = "ebpf")]
@@ -5364,7 +5396,7 @@ fn nfqueue_runtime_fixture(
     stop: tokio::sync::watch::Sender<bool>,
 ) -> NfqueueRuntimeFixture {
     let stats = Arc::new(StatsManager::new());
-    let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
+    let ebpf: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
     )));
     let (pending, pending_fatal) = nfqueue::PendingUdpVerdicts::new(

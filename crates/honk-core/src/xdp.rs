@@ -1218,7 +1218,7 @@ pub(crate) async fn run(
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     let config = plane.config_handle().read().await.as_ref().clone();
     let shutdown = plane.shutdown_intent();
-    let backend = plane.ebpf_handle();
+    let backend = plane.policy_backend_handle();
     let prepared = prepare(&plane, &config, pin_root).await;
     let (devices, topology, realms, scope_pairs, core, memory, staging, mut link_proof) =
         match prepared {

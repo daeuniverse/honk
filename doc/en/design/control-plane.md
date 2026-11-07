@@ -6,7 +6,7 @@ The `honk-core` userspace engine connects the kernel datapath to the outbound st
 
 The control plane owns transparent ingress, kernel handoff consumption, userspace routing, sniffing, outbound selection, relay, resource admission, and runtime publication. [Datapath design](./datapath.md) describes kernel flow delivery, [Group design](./groups.md) describes group policy and health-driven selection, and [DNS design](./dns.md) describes DNS runtime behavior.
 
-The main implementation is `crates/honk-core/src/control/`. It consumes `EbpfBackend` state and hands TCP streams or the `PacketTransport` UDP contract to `honk-outbound`.
+The main implementation is `crates/honk-core/src/control/`. It shares one `PolicyBackend` publication cell and hands TCP streams or the `PacketTransport` UDP contract to `honk-outbound`. TC-specific operations borrow an `EbpfBackend` capability from that same cell while retaining the original backend guard.
 
 Module map:
 
@@ -45,6 +45,8 @@ Startup keeps kernel admission closed until userspace can receive every redirect
 10. Check NFQUEUE health, publish its ready state, open pending verdict admission, and set `DATAPATH_STATE_MAP[0]` ready last. The TCP accept loop then runs in the control-plane supervisor.
 
 `RealEbpfBackend` owns aya programs, maps, links, persistent allocator handling, and real NFQUEUE integration. `MockEbpfBackend` provides the same control-plane interface without privileged kernel resources. A requested NFQUEUE path that cannot pass the post-lock fixed-queue preflight or later pre-admission queue/rules/health checks is disabled with a warning; that startup downgrade remains effective across reloads ([global reference](../reference/global.md)). Persistent token-generation recovery failures and failures after the service is admitted remain fatal.
+
+Compiled routing, learned-domain maps, connectivity, mode flags, admission and cleanup use the common interface. Real and mock TC backends expose their existing object through `tc()` / `tc_mut()`; the software backend rejects that capability with `Unsupported`, including before any transparent listener is bound. Optional kernel observations remain unavailable rather than fabricated. This split adds no Host capture, native continuation, captured return or TUN authority.
 
 The configured XDP daemon uses the same mode/flags coordinator but initializes its software flags with NFQUEUE disabled before packet-scope admission or capture readiness. Initialization publishes the restored mode unchanged; a publication failure rejects startup through the packet supervisor's joined cleanup. This path starts no TC listeners or NFQUEUE helpers, and explicit non-XDP packet embedding keeps its separate lifecycle.
 

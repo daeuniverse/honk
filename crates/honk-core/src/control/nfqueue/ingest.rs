@@ -143,14 +143,19 @@ impl PendingUdpVerdicts {
                 return NfqueueIngest::Dropped;
             }
         };
-        self.ingest_admitted_with_backend(
-            packet,
-            held,
-            slow_permit,
-            backend.as_ref(),
-            key,
-            decision_token,
-        )
+        let tc = match backend.tc() {
+            Ok(tc) => tc,
+            Err(error) => {
+                self.signal_fatal(PendingUdpFatal::new(
+                    "ingest capability",
+                    format!("{error:#}"),
+                ));
+                drop(backend);
+                self.reject_before_backend(&packet, held, DropOutcome::Cancel);
+                return NfqueueIngest::Dropped;
+            }
+        };
+        self.ingest_admitted_with_backend(packet, held, slow_permit, tc, key, decision_token)
     }
 
     pub(in crate::control) fn reject_actor_queue(&self, packet: QueuedPacket, guard: VerdictGuard) {

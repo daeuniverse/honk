@@ -708,7 +708,7 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
     let manager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone())),
     )));
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> =
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
         Arc::new(RwLock::new(Box::new(MockEbpfBackend::new())));
     let outbound = OutboundIndex::UserBase as u8;
     for index in 0..config.groups.len() {
@@ -1625,7 +1625,7 @@ async fn quiesce_failure_keeps_reload_fenced_and_unhealthy() {
     {
         let mut ebpf = cp.ebpf.write().await;
         ebpf.clear_datapath_flags_write_log();
-        ebpf.arm_quiesce_fault();
+        ebpf.tc_mut().unwrap().arm_quiesce_fault();
     }
     let drain = DrainTracker::new();
     let revision = 1;
@@ -2775,7 +2775,7 @@ async fn normalized_routing_reload_preserves_sniff_only_facts() {
         (crate::ebpf::maps::lpm_key_bytes(&positive), bitmap.bitmap),
         (crate::ebpf::maps::lpm_key_bytes(&negative), zero.bitmap),
     ];
-    let facts = |backend: &dyn crate::ebpf::EbpfBackend| {
+    let facts = |backend: &dyn crate::ebpf::PolicyBackend| {
         backend
             .projection_map_snapshot()
             .into_iter()

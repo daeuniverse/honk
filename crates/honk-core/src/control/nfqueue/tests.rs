@@ -165,7 +165,7 @@ fn held_guards_preserve_fifo_without_retaining_payloads() {
 
 struct DecisionFixture {
     pending: Arc<PendingUdpVerdicts>,
-    backend: Arc<RwLock<Box<dyn EbpfBackend>>>,
+    backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     lease: UdpInitLease,
     identity: PendingUdpIdentity,
     sink: Arc<Mutex<Vec<TestVerdict>>>,
@@ -193,7 +193,8 @@ fn pending_fixture_with(
             ..ConnState::default()
         },
     );
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let endpoints = Arc::new(UdpEndpointPool::new());
     let stats = Arc::new(StatsManager::new());
     let (pending, fatal) = PendingUdpVerdicts::new(
@@ -361,7 +362,8 @@ async fn correlator_flow_slots_fail_closed_at_the_hard_cap() {
             ..ConnState::default()
         },
     );
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let stats = Arc::new(StatsManager::new());
     let (pending, _fatal) = PendingUdpVerdicts::new(
         backend,
@@ -418,7 +420,8 @@ async fn armed_direct_backend_wait_is_bounded_by_hold_deadline() {
         mut fatal,
         ..
     } = pending_fixture(26);
-    let initial_reader = backend.read().await;
+    let initial_reader =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     let activation_pending = Arc::clone(&pending);
     let activation = tokio::spawn(async move {
         activation_pending
@@ -490,7 +493,8 @@ async fn wait_empty_includes_cleanup_blocked_on_backend() {
         &identity.tuples(),
         retained(27, UdpDecisionState::Pending, 0),
     );
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let (pending, _fatal) = PendingUdpVerdicts::new(
         Arc::clone(&backend),
         Arc::new(UdpEndpointPool::new()),
@@ -524,6 +528,8 @@ async fn wait_empty_includes_cleanup_blocked_on_backend() {
         backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&identity.tuples())
             .unwrap()
             .is_none()
@@ -593,6 +599,8 @@ async fn direct_arms_accepts_fifo_then_activates_without_copying_payload() {
         .backend
         .read()
         .await
+        .tc()
+        .unwrap()
         .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
@@ -627,6 +635,8 @@ async fn proxy_commits_before_dropping_original_and_retains_copied_payload() {
         .backend
         .read()
         .await
+        .tc()
+        .unwrap()
         .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
@@ -659,6 +669,8 @@ async fn block_commits_then_drops_original_and_retires_initializer() {
         .backend
         .read()
         .await
+        .tc()
+        .unwrap()
         .conn_state_lookup(&fixture.identity.tuples())
         .unwrap()
         .unwrap();
@@ -708,7 +720,8 @@ async fn backend_write_lock_cannot_extend_packet_hold_deadline() {
             ..ConnState::default()
         },
     );
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let stats = Arc::new(StatsManager::new());
     let (pending, _fatal) = PendingUdpVerdicts::new(
         Arc::clone(&backend),
@@ -818,7 +831,8 @@ async fn rejected_dns_carrier_never_aborts_an_ordinary_token_incarnation() {
             },
         );
     }
-    let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(mock)));
+    let backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>> =
+        Arc::new(RwLock::new(Box::new(mock)));
     let (pending, mut fatal) = PendingUdpVerdicts::new(
         Arc::clone(&backend),
         Arc::new(UdpEndpointPool::new()),
@@ -837,7 +851,8 @@ async fn rejected_dns_carrier_never_aborts_an_ordinary_token_incarnation() {
         );
     }
     pending.drain_scheduled_cleanups().await;
-    let backend = backend.read().await;
+    let backend =
+        tokio::sync::RwLockReadGuard::map(backend.read().await, |backend| backend.tc().unwrap());
     assert_eq!(
         backend
             .conn_state_lookup(&dns.tuples())

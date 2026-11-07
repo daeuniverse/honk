@@ -172,6 +172,8 @@ async fn each_batch_item_rechecks_its_own_deadline_before_applying() {
             .backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&second_id.tuples())
             .unwrap()
             .unwrap()
@@ -265,6 +267,8 @@ async fn cancelled_direct_waiter_leaves_its_lease_and_work_with_the_joined_pump(
             .backend
             .read()
             .await
+            .tc()
+            .unwrap()
             .conn_state_lookup(&fixture.identity.tuples())
             .unwrap()
             .unwrap()
@@ -304,7 +308,9 @@ async fn fence_release_failure_never_acknowledges_an_applied_batch_as_success() 
         *fixture.sink.lock(),
         vec![TestVerdict::Drop { id: 1 }, TestVerdict::Drop { id: 2 }]
     );
-    let backend = fixture.backend.read().await;
+    let backend = tokio::sync::RwLockReadGuard::map(fixture.backend.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     assert!(
         backend
             .udp_flow_owner(
@@ -324,7 +330,9 @@ async fn fence_release_failure_never_acknowledges_an_applied_batch_as_success() 
 async fn cancelling_an_owned_armed_flow_waits_for_activation_instead_of_killing_it() {
     let fixture = pending_fixture(43);
     let pending = Arc::clone(&fixture.pending);
-    let reader = fixture.backend.read().await;
+    let reader = tokio::sync::RwLockReadGuard::map(fixture.backend.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     let identity = fixture.identity;
     let activation =
         tokio::spawn(async move { pending.activate_direct(identity, fixture.lease, 0).await });
@@ -420,7 +428,9 @@ async fn cleanup_of_a_now_armed_request_does_not_stall_the_hold_watchdog() {
 #[tokio::test]
 async fn terminal_verdicts_are_settled_before_another_batched_flow_waits_to_activate() {
     let (fixture, second, second_id) = pair(MockEbpfBackend::new());
-    let reader = fixture.backend.read().await;
+    let reader = tokio::sync::RwLockReadGuard::map(fixture.backend.read().await, |backend| {
+        backend.tc().unwrap()
+    });
     let operation = async {
         tokio::join!(biased;
             fixture.pending.activate_direct(fixture.identity, fixture.lease, 0),
