@@ -12,7 +12,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context as _, ensure};
+use anyhow::{Context as _, bail, ensure};
 use honk_config::Config;
 use honk_xsk::topology::{
     Topology, TunReadback, TunRoute, TunRouteKind, TunRule, TunRuleAction, TunRuleSelector,
@@ -165,6 +165,29 @@ fn same_namespace(device: &OwnedFd) -> io::Result<()> {
         ));
     }
     Ok(())
+}
+
+/// Linux validates locally delivered replies with a reverse lookup using iif=lo
+/// and the packet mark (0 for unmarked physical carrier replies). The capture
+/// RPDB then routes through TUN instead of the real ingress, so strict filtering
+/// drops proxy/direct carrier replies. Per-device 0 cannot lower max(all, device).
+fn admit_all_rp_filter(
+    ipv4: bool,
+    read: impl FnOnce() -> io::Result<String>,
+) -> anyhow::Result<()> {
+    if !ipv4 {
+        return Ok(());
+    }
+    let value = read().context("read net.ipv4.conf.all.rp_filter")?;
+    match value.trim() {
+        "0" | "2" => Ok(()),
+        "1" => bail!(
+            "net.ipv4.conf.all.rp_filter is 1 (strict): reverse-source lookup routes unmarked proxy/direct carrier replies through the TUN instead of their real ingress; per-device 0 cannot override all; set it to 0 or 2 before starting backend tun"
+        ),
+        other => bail!(
+            "unrecognized net.ipv4.conf.all.rp_filter value {other:?}; set it to 0 or 2 before starting backend tun"
+        ),
+    }
 }
 
 /// Proves the bypass mark sticks on real TCP and UDP sockets and returns the
@@ -669,6 +692,9 @@ impl TunSetup {
              build from a Git checkout or set HONK_SOURCE_SHA to the 40-character commit when building from a source archive"
         );
         let plan = Plan::from_config(config)?;
+        admit_all_rp_filter(plan.address4.is_some(), || {
+            std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
+        })?;
         let netns_cookie = probe_marks(plan.mark)?;
         let netlink = NlSock::new().context("open rtnetlink")?;
         let preflight = Topology::preflight_tun(&plan.spec()).context("TUN resource preflight")?;

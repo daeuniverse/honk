@@ -352,11 +352,16 @@ main/default 中经 TUN 的路径、额外 local rule、P 之前的其他 rule�
 特权路由修改的原子栅栏。仅自有 TUN 设置 `rp_filter=0`，IPv6 关闭自动地址生成/
 RA，明确配置 NODAD 地址。
 
-全局 IPv4 严格模式 `net.ipv4.conf.all.rp_filter=1` 与上述已准入的 active RPDB
-兼容：对捕获的原目的地址进行反向源验证时，会经 P+4 命中指向入站 TUN 的
-active route。这依赖上述精确 rule、未改写的 L3 回复输入及稳定的操作者拓扑。
-honk 不读取或修改 global、WAN 或 LAN 的 `rp_filter`，只把自有 TUN 设为 `0`。
-IPv6 没有对应的 `rp_filter` 设置。
+启用 IPv4 时，TUN 启动会在创建任何资源前读取
+`net.ipv4.conf.all.rp_filter`。接受 `0` 和 `2`；严格模式（`1`）、未知值或
+读取失败均拒绝启动。请在启动 honk 前将其设为 `0` 或 `2`。Linux 验证本地
+交付回复的源地址时，使用 `iif=lo` 和数据包的 mark（未标记的物理承载回复为
+`0`）进行反向查路由。在 TUN capture RPDB 下，该查询命中经 TUN 的捕获路由，
+与真实入站接口不符，因此严格模式会丢弃代理/Direct 承载回复。有效设置取
+`max(all, interface)`，自有 TUN 的 `0` 无法降低全局 `1`。honk 从不写入全局值，
+也不修改 WAN/LAN 的 `rp_filter`。操作者在启动后改为严格模式不会被运行时检测。
+仅 IPv6 的 TUN 不读取也不因该 IPv4 设置而拒绝启动；IPv6 没有对应的
+`rp_filter` 设置。
 
 Setup 以 create-new、拒绝符号链接、mode 0600 创建
 `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json` receipt，记录完整源码

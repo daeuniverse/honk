@@ -372,12 +372,18 @@ notifications close capture; the watcher is not an atomic fence against a
 concurrent privileged route writer. Only the owned TUN gets `rp_filter=0` and
 explicit IPv6 NODAD addresses with automatic address generation/RA disabled.
 
-Strict global IPv4 `net.ipv4.conf.all.rp_filter=1` is compatible with this admitted
-active RPDB: reverse-source validation for the captured original destination
-reaches P+4 and finds the active route through the incoming TUN. This relies on
-the exact rules, unchanged L3 reply input and stable operator topology above.
-honk neither reads nor writes global, WAN or LAN `rp_filter` values; only its
-owned TUN is set to `0`. IPv6 has no equivalent `rp_filter` setting.
+When IPv4 is enabled, TUN startup reads `net.ipv4.conf.all.rp_filter` before
+creating any resources. Values `0` and `2` are accepted; strict mode (`1`),
+unknown values and read failures reject startup. Set it to `0` or `2` before
+starting honk. Linux validates the source of locally delivered replies with a
+reverse lookup using `iif=lo` and the packet's mark (`0` for unmarked physical
+carrier replies). Under the TUN capture RPDB, that lookup reaches the capture
+route through TUN instead of the real ingress, so strict mode drops proxy/direct
+carrier replies. The effective setting is `max(all, interface)`, so the owned
+TUN's `0` cannot lower global `1`. honk never writes the global value or changes
+WAN/LAN `rp_filter` values. A later operator change to strict mode is not detected
+at runtime. IPv6-only TUN neither reads nor rejects this IPv4 setting; IPv6 has
+no equivalent `rp_filter` setting.
 
 Setup writes a create-new, nonsymlink, mode-0600 receipt at
 `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`. It records full source
