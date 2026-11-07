@@ -1,7 +1,8 @@
 use super::{ParseFailure, cursor::Segment, diagnostics::ParserDiagnostics, read};
 use crate::datapath::{
     Backend, BusyPollConfig, CalibrationStatus, DatapathConfig, DirectProfile, InterfaceRole,
-    PollCalibration, PollMode, XdpInterface, XskMode,
+    PollCalibration, PollMode, TunConfig, XdpInterface, XskMode, canonical_tun_capture,
+    default_tun_mtu, parse_tun_address4, parse_tun_address6,
 };
 
 fn invalid(message: &str) -> ParseFailure {
@@ -13,7 +14,7 @@ pub(super) fn parse_section(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<DatapathConfig, ParseFailure> {
     let mut config = DatapathConfig::default();
-    let mut seen = [false; 8];
+    let mut seen = [false; 9];
     for section in sections {
         for child in section.body().ok_or_else(|| invalid("expected block"))? {
             if let Some(header) = read::block_header(&child) {
@@ -22,6 +23,7 @@ pub(super) fn parse_section(
                     "firewall" => 3,
                     "nat" => 4,
                     "busy_poll" => 7,
+                    "tun" => 8,
                     _ => return Err(invalid("unknown nested block")),
                 };
                 if std::mem::replace(&mut seen[index], true) {
@@ -75,6 +77,7 @@ pub(super) fn parse_section(
                             super::firewall::parse_nat(std::slice::from_ref(&child), diagnostics)?
                     }
                     7 => config.busy_poll = Some(parse_busy_poll(&child)?),
+                    8 => config.tun = Some(parse_tun(&child)?),
                     _ => unreachable!(),
                 }
             } else {
@@ -96,7 +99,8 @@ pub(super) fn parse_section(
                         config.backend = match value.unquote().raw() {
                             "tc" => Backend::Tc,
                             "xdp" => Backend::Xdp,
-                            _ => return Err(invalid("backend must be tc or xdp")),
+                            "tun" => Backend::Tun,
+                            _ => return Err(invalid("backend must be tc, xdp or tun")),
                         }
                     }
                     1 => {
@@ -129,6 +133,85 @@ pub(super) fn parse_section(
             }
         }
     }
+    if config.backend == Backend::Tun && seen[2] {
+        return Err(invalid("TUN does not accept an interface block"));
+    }
+    config.validate()?;
+    Ok(config)
+}
+
+fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
+    let keys = [
+        "name",
+        "mtu",
+        "address4",
+        "address6",
+        "table",
+        "rule_priority",
+    ];
+    let mut values = [None; 6];
+    let mut capture = None;
+    for child in section
+        .body()
+        .ok_or_else(|| invalid("expected tun block"))?
+    {
+        if let Some(header) = read::block_header(&child) {
+            if header.raw() != "capture" {
+                return Err(invalid("unknown tun block"));
+            }
+            if capture.is_some() {
+                return Err(invalid("duplicate capture block"));
+            }
+            let mut prefixes = Vec::new();
+            for prefix in child
+                .body()
+                .ok_or_else(|| invalid("capture requires a nonempty block"))?
+            {
+                if prefix.is_block() {
+                    return Err(invalid("capture does not accept nested blocks"));
+                }
+                prefixes.push(
+                    read::Text::segment(&prefix)
+                        .unquote()
+                        .raw()
+                        .parse()
+                        .map_err(|_| invalid("capture entries must be CIDR network prefixes"))?,
+                );
+            }
+            capture = Some(canonical_tun_capture(prefixes)?);
+        } else {
+            let (key, value) = read::Text::segment(&child)
+                .kv()
+                .ok_or_else(|| invalid("expected tun setting: value"))?;
+            let index = keys
+                .iter()
+                .position(|name| *name == key.raw())
+                .ok_or_else(|| invalid("unknown tun setting"))?;
+            if values[index].replace(value.unquote().raw()).is_some() {
+                return Err(invalid("duplicate tun setting"));
+            }
+        }
+    }
+    let config = TunConfig {
+        name: values[0]
+            .ok_or_else(|| invalid("tun.name is required"))?
+            .to_owned(),
+        mtu: values[1]
+            .map(|value| value.parse().map_err(|_| invalid("invalid tun MTU")))
+            .transpose()?
+            .unwrap_or_else(default_tun_mtu),
+        address4: values[2].map(parse_tun_address4).transpose()?,
+        address6: values[3].map(parse_tun_address6).transpose()?,
+        table: values[4]
+            .ok_or_else(|| invalid("tun.table is required"))?
+            .parse()
+            .map_err(|_| invalid("invalid tun table"))?,
+        rule_priority: values[5]
+            .ok_or_else(|| invalid("tun.rule_priority is required"))?
+            .parse()
+            .map_err(|_| invalid("invalid tun rule_priority"))?,
+        capture: capture.ok_or_else(|| invalid("tun.capture is required"))?,
+    };
     config.validate()?;
     Ok(config)
 }

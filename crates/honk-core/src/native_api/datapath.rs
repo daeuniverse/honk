@@ -121,7 +121,7 @@ pub(super) fn summary(
     let kind = match observation.kind {
         DatapathKind::Real => "ebpf",
         DatapathKind::Mock => "mock",
-        DatapathKind::XdpUserspace => "userspace",
+        DatapathKind::PacketUserspace => "userspace",
         DatapathKind::Unknown => "unknown",
     };
     if observation.kind != DatapathKind::Real {

@@ -254,13 +254,27 @@ impl ControlPlane {
         };
         if !same_datapath_setup {
             warn!(
-                "reload rejected: datapath backend, Direct profile, binding mode and interface setup require restart"
+                "reload rejected: datapath backend, Direct profile and device setup require restart"
             );
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(target_os = "linux")]
         if let Err(error) = crate::xdp::validate_config(&new_config) {
             warn!(%error, "reload rejected: unsupported XDP policy facts or execution profile");
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(target_os = "linux")]
+        if let Err(error) = crate::tun::validate_config(&new_config) {
+            warn!(%error, "reload rejected: unsupported TUN policy facts or execution profile");
+            return Ok(ReloadOutcome::Rejected);
+        }
+        #[cfg(not(target_os = "linux"))]
+        if new_config
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        {
+            warn!("reload rejected: TUN requires Linux");
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "native-api")]

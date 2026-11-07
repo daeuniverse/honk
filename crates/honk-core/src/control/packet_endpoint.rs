@@ -6,6 +6,7 @@
 use super::ControlPlane;
 use super::connection::{ConnectionGuard, ControlPlaneHandle};
 use super::dns_control::DnsUdpReply;
+use super::dns_listener::{BoundDnsListener, PreparedDnsBind};
 use super::netstack::{FlowIo, PacketDriver, PacketOwner, PacketScope, SourceWork};
 use super::task_registry::TaskRegistry;
 use super::udp_endpoint::{
@@ -185,6 +186,7 @@ struct EndpointRuntime {
     owners: Vec<PacketOwner>,
     // Driven scopes park their original owners until the device returns or abandons them.
     driven: bool,
+    prepared_dns_addresses: Option<PreparedDnsBind>,
     scope_tasks: TaskRegistry,
     tcp_tasks: TaskRegistry,
     startup: Option<tokio::sync::oneshot::Sender<()>>,
@@ -241,6 +243,17 @@ impl PacketEndpoints {
             || self.shared.udp_pool.retains_source(scope, address)
     }
 
+    pub(crate) fn prepare_dns_bind(
+        config: &honk_config::Config,
+    ) -> io::Result<Option<PreparedDnsBind>> {
+        config
+            .dns
+            .bind_endpoint()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?
+            .map(PreparedDnsBind::new)
+            .transpose()
+    }
+
     /// Consume an unstarted control plane; no second host ingress is started beside it.
     /// `udp_capacity` is shared by every supplied scope, not multiplied per scope.
     pub async fn new(
@@ -248,7 +261,7 @@ impl PacketEndpoints {
         scopes: Vec<(PacketScope, PacketOwner)>,
         udp_capacity: usize,
     ) -> anyhow::Result<(Self, PacketEndpointOwner)> {
-        let (endpoints, mut owner, _) = Self::start(plane, scopes, udp_capacity, false)?;
+        let (endpoints, mut owner, _) = Self::start(plane, scopes, udp_capacity, false, None)?;
         std::future::poll_fn(|cx| owner.poll_ready(cx)).await?;
         Ok((endpoints, owner))
     }
@@ -260,8 +273,9 @@ impl PacketEndpoints {
         plane: ControlPlane,
         scopes: Vec<(PacketScope, PacketOwner)>,
         udp_capacity: usize,
+        prepared_dns_addresses: Option<PreparedDnsBind>,
     ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
-        Self::start(plane, scopes, udp_capacity, true)
+        Self::start(plane, scopes, udp_capacity, true, prepared_dns_addresses)
     }
 
     fn start(
@@ -269,6 +283,7 @@ impl PacketEndpoints {
         scopes: Vec<(PacketScope, PacketOwner)>,
         udp_capacity: usize,
         driven: bool,
+        prepared_dns_addresses: Option<PreparedDnsBind>,
     ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
         anyhow::ensure!(
             plane.command_rx.is_some() && plane.health_task.is_none(),
@@ -367,6 +382,7 @@ impl PacketEndpoints {
             initializers: initializer_rx,
             owners,
             driven,
+            prepared_dns_addresses,
             scope_tasks,
             tcp_tasks,
             startup: Some(started),
@@ -833,14 +849,21 @@ impl EndpointRuntime {
             }
         }
         let fallback_fatal = (!self.owners.is_empty()).then(|| fatal.clone());
-        let (xdp, mut authorizations, endpoint) = if failure.is_none() && !self.shared.is_closing()
+        let (configured_packet, egress_mark, mut authorizations, endpoint) = if failure.is_none()
+            && !self.shared.is_closing()
         {
             let config = self.plane.config.read().await;
-            let xdp = config
-                .datapath
-                .as_ref()
-                .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Xdp);
-            let authorizations = if xdp {
+            let backend = config.datapath.as_ref().map(|datapath| datapath.backend);
+            let configured_packet = matches!(
+                backend,
+                Some(honk_config::datapath::Backend::Xdp | honk_config::datapath::Backend::Tun)
+            );
+            let tun = backend == Some(honk_config::datapath::Backend::Tun);
+            if tun && self.shared.scopes.len() != 1 {
+                failure = Some(anyhow::anyhow!("TUN requires exactly one packet scope"));
+            }
+            let egress_mark = tun.then(|| config.global.effective_so_mark());
+            let authorizations = if configured_packet {
                 match crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions) {
                     Ok(authorizations) => Some(authorizations),
                     Err(error) => {
@@ -851,16 +874,21 @@ impl EndpointRuntime {
             } else {
                 None
             };
-            let endpoint = if xdp {
+            let endpoint = if configured_packet {
                 config.dns.bind_endpoint().map_err(anyhow::Error::from)
             } else {
                 Ok(None)
             };
-            (xdp, authorizations, endpoint)
+            (configured_packet, egress_mark, authorizations, endpoint)
         } else {
-            (false, None, Ok(None))
+            (false, None, None, Ok(None))
         };
-        if xdp
+        let fact_scope = if egress_mark.is_some() {
+            self.shared.scopes[0].scope()
+        } else {
+            ScopeId::HOST
+        };
+        if configured_packet
             && failure.is_none()
             && !self.shared.is_closing()
             && let Err(error) = self.plane.initialize_datapath_flags(false, false).await
@@ -868,13 +896,27 @@ impl EndpointRuntime {
             failure = Some(error);
         }
         let mut dns_listener = None;
-        if xdp && failure.is_none() && !self.shared.is_closing() {
+        if configured_packet && failure.is_none() && !self.shared.is_closing() {
             let bound = endpoint.and_then(|endpoint| {
-                endpoint
-                    .as_ref()
-                    .map(super::dns_listener::BoundDnsListener::bind)
-                    .transpose()
-                    .map_err(anyhow::Error::from)
+                let Some(endpoint) = endpoint else {
+                    return Ok(None);
+                };
+                if let Some(mark) = egress_mark {
+                    let prepared = self.prepared_dns_addresses.take().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "TUN dns.bind requires addresses prepared before routing setup"
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        prepared.endpoint == endpoint,
+                        "prepared dns.bind endpoint changed"
+                    );
+                    BoundDnsListener::bind_prepared(&prepared, Some(mark))
+                } else {
+                    BoundDnsListener::bind(&endpoint, None)
+                }
+                .map(Some)
+                .map_err(anyhow::Error::from)
             });
             match bound {
                 Ok(Some(bound)) => match bound.spawn(
@@ -884,6 +926,7 @@ impl EndpointRuntime {
                     Arc::clone(&self.plane.drain_tracker),
                     self.plane.native.clone(),
                     Arc::clone(&self.plane.diagnostics),
+                    fact_scope,
                 ) {
                     Ok(listener) => dns_listener = Some(listener),
                     Err(error) => failure = Some(error.into()),
@@ -934,7 +977,7 @@ impl EndpointRuntime {
                 .is_ok()
         {
             #[cfg(feature = "native-api")]
-            if !xdp {
+            if !configured_packet {
                 self.plane.publish_phase(super::EnginePhase::Running);
                 running_published = true;
             }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::proxy::direct::DirectHandler;
 use crate::proxy::{DirectMark, ProxyStream, TcpOutbound};
-use crate::util::{bypass_mark, connect_outbound, init_bypass_mark, marked_udp_socket};
+use crate::util::{bypass_mark, connect_outbound, init_dae_socket_mark, marked_udp_socket};
 use honk_config::node::Node;
 use honk_ebpf_common::DAE_BYPASS_MARK;
 use std::time::Duration;
@@ -21,8 +21,13 @@ fn tcp_mark(stream: &ProxyStream) -> u32 {
 }
 
 #[test]
-#[ignore = "requires Linux CAP_NET_ADMIN or CAP_NET_RAW for real SO_MARK"]
+#[ignore = "requires real SO_MARK and credential isolation in the disposable VM"]
 fn socket_marks_preserve_global_and_direct_flow_isolation() {
+    assert!(
+        std::fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .contains("virtme.")
+    );
     const CHILD: &str = "HONK_SOCKET_MARK_CHILD";
     let Some(mark) = std::env::var_os(CHILD) else {
         for mark in [0x200, 0x300] {
@@ -52,10 +57,15 @@ fn socket_marks_preserve_global_and_direct_flow_isolation() {
         socket2::SockRef::from(&default).mark().unwrap(),
         DAE_BYPASS_MARK
     );
-    init_bypass_mark(mark).unwrap();
-    init_bypass_mark(mark).unwrap();
+    let required = mark == 0x300;
+    init_dae_socket_mark(mark, required).unwrap();
+    init_dae_socket_mark(mark, required).unwrap();
     assert_eq!(
-        init_bypass_mark(mark + 1).unwrap_err().kind(),
+        init_dae_socket_mark(mark + 1, required).unwrap_err().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(
+        init_dae_socket_mark(mark, !required).unwrap_err().kind(),
         std::io::ErrorKind::AlreadyExists
     );
     assert_eq!(bypass_mark(), mark);
@@ -72,6 +82,37 @@ fn socket_marks_preserve_global_and_direct_flow_isolation() {
             .await
             .expect("marked loopback traffic must complete");
         });
+    if required {
+        // Only this isolated child drops credentials, after its runtime has stopped.
+        assert_eq!(unsafe { libc::setuid(65534) }, 0);
+        for kind in [socket2::Type::STREAM, socket2::Type::DGRAM] {
+            let socket = socket2::Socket::new(socket2::Domain::IPV4, kind, None).unwrap();
+            assert_eq!(
+                crate::util::set_mark_best_effort(&socket, mark)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+            assert_eq!(
+                crate::util::set_mark_verified(&socket, mark)
+                    .unwrap_err()
+                    .raw_os_error(),
+                Some(libc::EPERM)
+            );
+        }
+        assert_eq!(
+            marked_udp_socket("127.0.0.1:0".parse().unwrap())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+        assert_eq!(
+            crate::util::bind_tcp_listener("127.0.0.1:0".parse().unwrap(), Some(mark))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
+    }
 }
 
 async fn exercise_marks(ip: std::net::IpAddr, global: u32) {

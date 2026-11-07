@@ -1,6 +1,141 @@
-# eBPF kernel datapath
+# Linux capture datapaths
 
-The kernel datapath intercepts traffic. [Control plane](./control-plane.md) describes the userspace path; [NFQUEUE](./nfqueue.md) describes held-first-packet UDP.
+Linux capture delivers traffic to the shared userspace policy and outbound path. [Control plane](./control-plane.md) describes that path; [NFQUEUE](./nfqueue.md) describes TC held-first-packet UDP.
+
+## Linux TUN Endpoint
+
+`backend: tun; direct: endpoint` selects the daemon-owned Linux TUN path. The
+[global reference](../reference/global.md#linux-tun-endpoint) gives the full syntax,
+required resource values, validation and exact five RPDB rules. TUN is a real FD
+consumer of the existing scoped Stack, canonical Router, DNS projector and
+outbound flow initializers. It creates no TC hooks, NFQUEUE, `dae0` or `daens`,
+and does not depend on the `ebpf` feature. It rejects `--mock-ebpf`.
+
+A single `TunDevice` owns `/dev/net/tun`, opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`.
+`TUNSETIFF` requests `IFF_TUN|IFF_NO_PI|IFF_TUN_EXCL`; `TUNGETIFF` verifies actual
+TUN/NO_PI and rejects multi-queue, VNET_HDR and NAPI. The creation-only EXCL bit is
+not required in readback. `TUNSETOFFLOAD(0)` selects complete ordinary L3 packets
+with software checksums. There is one reader/writer, no duplicate/inherited FD,
+persistent device, external-FD input or pre-existing-link adoption.
+
+### Setup and readiness
+
+1. Complete static/runtime admission, take the real instance lock, initialize the
+   required exact bypass mark M and verify it on actual TCP/UDP sockets. Before
+   any rule or blackhole mutation, `prepare_dns_bind(&Config)` resolves and retains
+   the enabled bind endpoint's actual `SocketAddr` candidates. Failure rejects
+   startup before routing changes; disabled listening returns `None`.
+2. Subscribe to rtnetlink before snapshotting. Refuse occupied name/table/all five
+   priorities and unsupported RPDB/main/default topology. Create the private setup
+   receipt and persist the create intent before the exclusive TUN ioctl. Record
+   actual netns cookie, ifindex and attachment incarnation immediately; set MTU,
+   explicit addresses, owned-link sysctls and UP, recording ACK/readback.
+3. Write each mutation intent ahead of installing capture-prefix blackholes
+   (static, metric 32760) and the five rules. Do not install unicast capture yet:
+   selected prefixes are contained while Endpoint startup is incomplete.
+4. Create one non-HOST `PacketScope` and its original owner using the shared capture
+   helper, then call `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
+   prepared_dns_addresses)`. The final argument is the retained
+   `Option<PreparedDnsBind>` containing endpoint and resolved candidates, not a
+   boolean or a request to resolve again. Keep the unique `PacketDriver` servicing
+   timers/output while waiting for `owner.poll_ready`, including failed-startup
+   cleanup. DNS bind, software flags and subscription authorizations must be ready.
+5. Read back link/address/offload/rules, install and read back metric-1024 capture
+   routes, then establish the final `Topology::admit_tun` subscription and full
+   snapshot while retaining the old watch. Only after successful final admission
+   open the shared gate, call `capture_ready()`, and report `TUN datapath ready`,
+   lifecycle Running and sd_notify READY. Close cannot lose this readiness race.
+
+The receipt at `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json` is
+create-new, mode 0600 and nonsymlink. It journals full source SHA, PID/starttime,
+actual namespace/link/attachment identity and exact address/route/rule keys with
+Intent/Acknowledged/Removed states, persisting and fsyncing each transition.
+Only confirmed instance-owned objects can be removed. Ambiguity retains the
+receipt and object; a receipt never authorizes adoption or automatic recovery.
+
+Active capture routes use metric 1024 in both families, while static blackhole
+guards retain metric 32760. Linux normalizes IPv6 metric 0, and IPv4 route delete
+with metric 0 is a wildcard; choosing 1024 is a deliberate representation
+adjustment from the initial metric-0 design. Exclusive create, readback and exact
+delete all include table, family, prefix, output interface and metric, preventing
+active-route removal from selecting its guard.
+
+The operator keeps main/WAN/LAN routes, source addresses, forwarding, NAT and
+firewall stable. Enabled families need a valid non-TUN main uplink and source;
+main/default must not refer to TUN through unicast, multipath, nexthop, VRF or lwt
+paths. Additional early/local rules, VRF/l3mdev and unknown selectors/actions are
+refused rather than approximated. Route/address/link/rule changes, ENOBUFS,
+interrupted/unknown dumps or replaced ifindex cause sticky invalidation and close
+capture. Subscription is not an atomic fence against arbitrary concurrent root
+route writes, and retained guards are not a whole-host firewall kill switch.
+
+### FD packet pipeline
+
+Kernel egress appears on FD read; FD write injects a **new interface-ingress
+packet**, never the original skb. Host- and Transit-generated TCP/UDP selected by
+capture follow actual FD read → `receive_with_source` in the registered scope →
+Stack → canonical initializer/Router → real outbound → generated output lease →
+same FD write. Direct explicitly terminates and makes a new dial. Policy sees the
+captured L3 source/destination/DSCP; scope, tuple, mark and TUN address authenticate
+neither Host origin nor process identity. No pre-DNAT/pre-SNAT or original-socket
+semantics are recovered. Capture/reply legs must not rewrite that policy input.
+
+RX uses one funded 65576-byte buffer, full software checksum verification and one
+ingress timestamp per turn. Length mismatch, truncation or unexpected negotiated
+representation is never shortened into a valid Stack packet. Borrowed UDP is
+accepted/copied through the existing funded ingress before the next read. The
+source callback only checks the live reverse consumer for this scope/attachment;
+it never writes the FD, blocks or re-enters the scope mutex.
+
+The owner services driver deadlines before and after bounded RX. RX is limited to
+32 syscall attempts/packets, 1 MiB or 1 ms per turn; EINTR counts, time is checked
+at most every eight packets, and one final full record may exceed the byte bound
+by at most 65575 bytes. TX alternates the first Control/Bulk class, services at
+most 32 outputs per class and preserves fixed pending lease cells, with its own
+bounded syscall/byte/time turn. Limits are scheduler bounds, not preemptible
+syscall deadlines. Pending output is retried before new exports of that class.
+
+| TUN write result | Ownership |
+| --- | --- |
+| Full packet length | Kernel accepted this one record; release the lease outside the scope lock. This is neither remote delivery nor TCP ACK. |
+| EAGAIN/EWOULDBLOCK | Retain the same lease, bytes, scope and FlowId at its class head; register writable and retry that record. |
+| EINTR | Retain the same lease; retry/yield within the finite syscall budget. |
+| Zero or short write | Fatal packet-boundary violation; never write a suffix or replay the whole packet. Preserve the reported partial outcome and dispose local ownership explicitly. |
+| Other error | Fatal owner I/O failure; no backend fallback or replay through another executor. An ambiguous submission stays ambiguous. |
+
+Readiness is cleared only after EAGAIN. Idle waits register readable, writable
+only for blocked pending output, topology/driver/close/supervisor wakers and the
+earliest real driver deadline, then recheck. No flow/deadline/pending work means
+no periodic dataplane timer; TUN has no XSK CQ/FILL fallback. No scope/config/Router
+or projection lock crosses an await.
+
+### Stop and failure custody
+
+Normal operator stop first closes admission, removes metric-1024 capture routes so
+prefixes hit guards, and stops FD RX while retaining setup/watcher/FD/driver.
+`endpoints.close()` closes protocol admission before DNS/command admission stops.
+No new protocol output is sent: pending/closing leases are explicitly disposed
+outside locks while driver service and `owner.poll_join_plane` continue until
+TCP/UDP initializers, sources/receivers, retirement, DNS and original scope owners
+actually join. `shutdown_wait_connections` supplies no natural-completion grace.
+
+After the supervisor returns its real `(ControlPlane, result)`, close the only FD,
+confirm owned-link disappearance, and remove only receipt-backed objects still
+proven to belong to this instance. Once business cleanup succeeds, remove P+4
+first, then guards/table and bypass/return rules, and finally the receipt. This
+explicit stop restores ordinary main routing. Software policy cleanup and the
+existing API/subscription shutdown follow.
+
+Runtime failure, crash or unconfirmed cleanup retains blackholes/rules and the
+receipt and returns an error. Stop sources and inspect exact ownership before
+operator cleanup; do not restart by deleting a name/table blindly. Drop only
+closes local admission/endpoints, disposes local leases, returns driving rights
+and closes the FD; it performs no rtnetlink cleanup or successful-cleanup ack.
+The original supervisor retains joined cleanup on its original Tokio runtime,
+which an embedder must keep alive. There is no automatic FD reopen, resource
+adoption, TC/XDP fallback or Native continuation. HostFacts (S-b), pre-import
+Native (S-c) and FD-read captured return (S-d) remain unimplemented; this S-a
+Endpoint path does not complete E6.4.
 
 ## Full-XDP startup
 

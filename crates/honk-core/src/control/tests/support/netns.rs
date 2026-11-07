@@ -73,7 +73,7 @@ pub(in crate::control::tests) fn run_isolated(
 }
 
 /// Enters private net/mount namespaces with their own sysfs, bpffs and cgroup2.
-pub(in crate::control::tests) fn enter_lab_namespaces() -> anyhow::Result<()> {
+pub(in crate::control) fn enter_lab_namespaces() -> anyhow::Result<()> {
     let expected_kernel = std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap_or_default();
     anyhow::ensure!(
         std::env::var_os("HONK_CI_VM_LANE").is_some()

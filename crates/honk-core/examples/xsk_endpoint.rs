@@ -647,7 +647,7 @@ mod linux {
             let capture = self.config.capture()?;
             let mode = self.config.bind_mode()?;
             let budget = MemoryBudget::new(self.config.budget_bytes);
-            honk_outbound::util::init_bypass_mark(0x100)?;
+            honk_outbound::util::init_dae_socket_mark(0x100, false)?;
             let (netns_inode, uid, queues) = guards(&self.config)?;
             let mut cfg = honk_config::Config::default();
             cfg.ensure_builtin_nodes();

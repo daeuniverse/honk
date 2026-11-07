@@ -390,11 +390,18 @@ Ephemeral establishment is guarded through cancellation, pool-owned handshakes h
 - `udp_marked_bind` and `marked_udp_socket` create bypass-marked UDP sockets.
 
 Control-plane sockets use the process-scoped `global.so_mark_from_dae`; zero
-selects `DAE_BYPASS_MARK` (`0x100`). Nonzero direct rule marks instead use
+selects `DAE_BYPASS_MARK` (`0x100`). TC nonzero direct rule marks instead use
 `rule_mark | CLASSIFIED_MARK`, without leaking the override into bootstrap or
-proxy carriers. WAN egress recognizes both forms. Mark application remains
-best-effort only for unprivileged `EPERM` environments without the production
-datapath; other errors propagate.
+proxy carriers; WAN egress recognizes both forms. TUN rejects nonzero traffic
+marks and initializes `init_dae_socket_mark(mark, required)` with `required=true`.
+The original process OnceLock retains that consistent pair; repeated startup/
+bootstrap initialization must agree. Required mode propagates every mark error,
+including EPERM, and startup verifies real TCP/UDP set/readback before capture.
+Later physical TCP/UDP/QUIC/DNS/bootstrap/health/download sockets retain this
+requirement through the shared setter. Other backends use `required=false` and
+retain existing best-effort EPERM behavior; other errors propagate. TUN DNS and
+management listeners also set/read back the exact mark before bind/listen, so
+accepted children and remote replies use the bypass route from the handshake.
 
 Subscription and direct UI downloads use the same marked TCP dialer before
 Hyper HTTP/1 framing and the existing rustls/platform-verifier TLS policy. This

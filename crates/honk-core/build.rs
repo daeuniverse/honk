@@ -1,6 +1,7 @@
 //! Build script for honk-core.
 //!
-//! Embeds the release tag or Git description for the CLI and Clash API.
+//! Embeds the release tag or Git description for the CLI and Clash API, and
+//! the full source commit that TUN setup receipts record.
 //!
 //! When the `ebpf` feature is enabled, this script ensures the eBPF object
 //! file is available and copies it into `OUT_DIR` so `lib.rs` can embed it
@@ -56,8 +57,29 @@ fn emit_version() {
     // The commit and target triple identify a build precisely when the version is a tag.
     let revision = git_output(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_default();
     println!("cargo:rustc-env=HONK_REVISION={revision}");
+    // A source archive has no Git metadata; its packager names the commit explicitly.
+    println!("cargo:rerun-if-env-changed=HONK_SOURCE_SHA");
+    let source_sha = match std::env::var_os("HONK_SOURCE_SHA") {
+        Some(explicit) => {
+            let explicit = explicit.to_str().filter(|sha| is_full_sha(sha));
+            explicit
+                .expect("HONK_SOURCE_SHA must be a full 40-character lowercase hexadecimal commit")
+                .to_string()
+        }
+        None => git_output(&["rev-parse", "--verify", "HEAD^{commit}"])
+            .filter(|sha| is_full_sha(sha))
+            .unwrap_or_default(),
+    };
+    println!("cargo:rustc-env=HONK_SOURCE_SHA={source_sha}");
     let target = std::env::var("TARGET").unwrap_or_default();
     println!("cargo:rustc-env=HONK_TARGET={target}");
+}
+
+fn is_full_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 #[cfg(feature = "native-ui")]

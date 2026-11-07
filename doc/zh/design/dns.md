@@ -50,7 +50,7 @@ flowchart LR
 | 路径 | Socket 与目的地址模型 | 应答模型 |
 | --- | --- | --- |
 | 透明 53 端口，无终局用户 `must` 结果 | 按[流量规则所有权](../reference/routing.md#出站目标与-must)准入的有效查询进入 `DnsController`。 | 控制器接管的透明 UDP 使用绑定到原始目的地址的 anyfrom socket；TCP 在被拦截的 stream 上应答。请求动作 `asis` 拨该原始目的地址并保留 TCP/UDP，包括 UDP `TC` 后回退 TCP。 |
-| 独立 `dns.bind` | 所选 TCP/UDP socket 是 host network namespace 中普通且未打 mark 的 socket。它们没有拦截所得的目的地址。 | TCP 在 accept 得到的 socket 上应答。UDP 使用 packet info，使通配 bind 从查询实际命中的本地地址与网卡应答。 |
+| 独立 `dns.bind` | 普通 host-netns socket，没有拦截所得目的地址；TC/XDP/普通嵌入无 mark，TUN 在 bind/listen 前严格设置 required bypass mark。 | TCP 在 accepted socket 上应答；UDP 用 packet info 从查询实际命中的本地地址与网卡应答。 |
 
 `DnsRequestMeta { source_ip, original_dst }` 以一个不可变值承载逻辑客户端来源与拦截所得目的地址。透明 adapter 和独立 adapter 都从 socket peer 设置 `source_ip`；只有透明拦截设置 `original_dst`。IPv4-mapped IPv6 peer 会规范化为 IPv4。代表已接纳 TCP/UDP 流执行的查询使用该流的客户端地址，且没有拦截所得的 DNS 目的地址。内部、bootstrap、prefetch 与 Clash API 查询两者都为空。
 
@@ -60,6 +60,12 @@ flowchart LR
 
 过期缓存刷新与偏好地址族的附加查询保留发起者的 `DnsRequestMeta`。为流执行的 DNS 解析按客户端来源进行，但没有被拦截的目的地址；策略选择 `asis` 时会 fail-closed。
 
+配置为 TUN 时，独立 listener 是 mark 规则的明确例外。安装任何 capture rule/blackhole 前，`PacketEndpoints::prepare_dns_bind(&Config)` 先解析启用的 endpoint，用 `PreparedDnsBind` 保留非空实际地址候选、transport 与 port。TUN setup 在实际 bind 前创建配置地址；启动消费该次候选，不在 containment 生效后再次 NSS。关闭监听返回 `None`；TUN 启用监听却没有准备好的候选时拒绝启动。
+
+每个 TUN listener socket 先创建，严格设置并回读有效 bypass mark M，再 bind/listen、转换为 Tokio。Accepted TCP 继承 M，UDP 保留 packet-info 源选择。bind 仍是普通 host-netns 服务，从 peer 取得 source，`original_dst=None`。TC/XDP/普通嵌入继续使用无 mark 独立 socket。Clash/native API listener 遵循同样的 TUN pre-bind/listen mark 顺序，使面向 capture 内远端客户端的回复经 main 旁路。
+
+配置 TUN 的 listener 使用唯一真实、已注册的非 HOST `PacketScope` 作为 `fact_scope`，即使 bind 在 loopback/LAN 地址也一样。UDP 使用该 scope 的当前 packet-query admission，持久 TCP 每帧重新检查当前 packet admission。透明 packet UDP53/TCP DNS 同样使用实际 realm；Host 发起的捕获包也不例外，裸 L3 不是 HostFacts，不能选择 `ScopeId::HOST`。TC/XDP/非 TUN 独立调用者明确保持 HOST。不新增 tuple 永久 DNS permit cache、HOST bitmap 副本、第二个 server 或 projector。
+
 独立监听器具有以下生命周期与准入不变量：
 
 - 启动 supervisor 前，同步绑定全部所选 transport。任一绑定失败都会关闭已绑定的部分，并令启动失败。
@@ -67,7 +73,7 @@ flowchart LR
 - UDP 入口 profile 将声明的应答大小钳制到 `512..=1232`。Packet-info provenance 保留通配应答源地址选择。
 - TCP 使用持久 RFC 7766 双字节 framing。每次长度读取、正文读取和应答写入都有 30 秒限制。
 - 独立 TCP 最多占用进程级全局连接预算的四分之一。持久连接上的每个 frame 都分别进入 DNS 查询预算。
-- `DnsListener` 为进程级对象，由 `ControlPlane::run` 持有。关闭时先停止准入，再排空或中止子任务，并在 DNS runtime 退役前 join 每个 supervisor。
+- `DnsListener` 为进程级对象：TC 由 `ControlPlane::run` 持有，XDP/TUN 由 configured packet supervisor 持有。关闭先停准入，再排空或中止子任务，在 DNS runtime 退役前 join 每个 supervisor。
 - SIGHUP 中 `dns.bind` 的语义变化要求重启。未变化的监听器继续使用新发布的 DNS generation。
 - 独立请求传入 `original_dst=None`；选择 `asis` 因而产生 DNS 失败（`SERVFAIL`），不会递归拨回监听器。
 
@@ -75,7 +81,7 @@ flowchart LR
 
 ## DNS 所有权状态机
 
-下表区分 LAN 入站与普通主机/loopback 投递。honk 透明代理依赖真实 eBPF 数据面与已挂载的 LAN hook；mock 模式不能拦截报文。`must` 保留已选出站，不再通过嗅探重判，但不绕过所有处理。
+下表描述 TC 的 LAN 入站与普通 host/loopback 投递，其透明拦截要求真实 eBPF 数据面与 LAN hook，mock 不能拦截。TUN 则按上文显式 Endpoint profile 与实际 packet realm 执行，Direct 也一样，没有 native `direct(must)` 逃逸。`must` 保留所选出站并禁止嗅探重判，不绕过所有处理。
 
 | 查询路径 | 流量策略结果 | 接收者 | 应答路径 |
 | --- | --- | --- | --- |

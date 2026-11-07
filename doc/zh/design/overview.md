@@ -1,6 +1,6 @@
 # 架构概览
 
-`honk` 是面向网关与本机流量的 Linux eBPF 透明代理引擎。本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
+`honk` 是面向网关与本机流量的 Linux 透明代理引擎，默认 TC/eBPF capture，也可显式选择 XDP 或 TUN packet 后端。本页说明其架构及关键运行时规则。项目当前为实验性 alpha，采用 `GPL-3.0-only` 许可证，仓库为 `daeuniverse/honk`。
 
 其配置语法和 TC 数据路径源自 dae，并在文档声明的范围内保持 dae 兼容；出站 Handler、组与 Clash API 则采用 sing-box 风格的设计。`honk` 是独立实现，现已与两者显著分化。
 
@@ -27,7 +27,7 @@
 | `honk-config` | 成员 | 共享配置模型、dae 语法解析器、include 处理、分享链接解析和订阅解码。 |
 | `honk-ebpf-common` | 成员 | 内核程序与用户态 map 写入端共享的 `no_std`、`#[repr(C)]` 常量和 ABI 类型。 |
 | `honk-nfqueue` | 成员 | raw `NETLINK_NETFILTER` 队列 `320`、verdict 所有权和自有 nftables 事务。 |
-| `honk-netstack` | 成员 | sans-I/O 的 IPv4/IPv6 TCP/UDP 栈，作为 WireGuard 隧道的内层网络；只依赖 `blake3` 和 `thiserror`。见[用户态网络栈](./netstack.md)。 |
+| `honk-netstack` | 成员 | sans-I/O IPv4/IPv6 TCP/UDP 栈，用于 WireGuard 及 scoped packet Endpoint，包括配置 XDP/TUN；只依赖 `blake3` 与 `thiserror`。见[用户态网络栈](./netstack.md)。 |
 | `honk-datapath` | 成员 | scoped frame 所有权、纯 Core 转发与状态防火墙/NAT；规范策略及平台 FIB 权威仍由 core/adapter 持有。 |
 | `honk-xsk` | 成员 | 已配置 daemon 与显式实验消费端共用的 Linux XDP/AF_XDP 原语；不代表延迟 DMA 释放栅栏或硬件验收通过。 |
 | `honk-outbound` | 成员 | 协议 Handler、逐节点 runtime、出站组、健康状态、URLTest 探测和始终编译的 Score 评分器。 |
@@ -83,6 +83,8 @@ flowchart LR
 
 ## 高层数据路径
 
+下图及报文路径描述默认 TC。显式 [TUN Endpoint](./datapath.md#linux-tun-endpoint) 经 daemon 自有唯一 FD 捕获真实 L3，共用 scoped Stack、canonical Router 与真实 outbound，再把生成回复写回同一 FD。Direct 明确新建 dial 并 relay，不宣称 HostFacts、原 socket、pre-NAT/TTL 等价、Native bypass 或 captured return；S-b/S-c/S-d 缺口保留，S-a 不代表 E6.4 完成。XDP 保持各自 device/Core 合同。
+
 ```mermaid
 flowchart TB
   PACKET[LAN-forwarded or host-originated TCP/UDP] --> TC[TC classification]
@@ -116,7 +118,7 @@ flowchart TB
 
 ## 运行时不变量
 
-- **旁路标记纪律：** 拨号、探测、DNS 上游、HTTP 下载、QUIC endpoint 和透明监听器携带进程配置的旁路 mark。非零直连规则 mark 替换其低 30 位，并携带 `CLASSIFIED_MARK`；策略路由须使用 `0x3fffffff` 掩码。接受后的 TCP 套接字会清除监听器标记；普通 host-netns `dns.bind` 入口套接字则有意保持无标记。
+- **旁路标记纪律：** dial、probe、DNS 上游、HTTP 下载、QUIC endpoint 与 TC 透明 listener 携带进程 mark。TC 非零直连规则使用 `CLASSIFIED_MARK` 和带掩码策略路由，accepted TC TCP 清 listener mark。TC/XDP 独立 `dns.bind` 无 mark。TUN 要求 physical egress 使用精确有效 M，DNS/管理 socket 在 bind/listen 前严格设置并回读 M，accepted service child 保留该值；权限错误拒绝 TUN，不能冒路由回环风险。
 - **Anyfrom UDP 回包：** 代理 UDP 与透明 53 端口 DNS 回包使用在 `daens` 中创建、并绑定到流量原始目的地址的透明套接字。直接从 TPROXY 监听器回包会暴露 `dae0` 源地址，并在返回路径失败。来自其他 full-cone 来源的回复通过仅含客户端的 `CLIENT_REPLY_TRACK` 帧信息返回，而不经过主机转发，也不会让数据路径为客户端随后发往该来源的包学到原生反向方向。
 - **DNS 来源边界：** 透明入口与 `dns.bind` adapter 从 socket peer 得到逻辑客户端来源；流关联查询使用已准入流的来源。缓存仅在路由确定所选、与来源无关的 scope 后复用，而每个 policy generation 的域名谓词投影仍为全局且不区分来源。
 - **UDP source 边界：** 来源共享协议按 reused runtime、规范化 client、协议/UDP path 与 actual-peer/original-destination reply projection 复用。完整五元组 endpoint map 仍持有 route、token/generation 与逐 flow Score；source association 持有唯一 receiver 与 transport health。关闭 `rprx` 时，除 VLESS 外各协议的 source ownership 仍可用。
@@ -132,6 +134,7 @@ flowchart TB
 - **Score 按需反馈：** setup/首响应与有界分方向进展可在终态前发布，不增加 Beta 完成。业务、配置健康与预热分别承担不同作用；任意手动 delay 测量不变成业务可靠性或配置基线。Score TCP 建立失败可在原 deadline 内通过不同的合格叶节点恢复一次，不打开新 final、不越过 Selector、不重放负载。
 - **条件性验证接口：** Score 代理组发布聚合临时／可用状态、新鲜的成对挑战者响应关系、证据问题和等待原因，并与同一次只读选择的成员一致；不存在全组比较结论。`/stats` 增加固定组／网络验证及预算／成本字段，以及嵌套去重的根业务计数；实际试用失败不是因果额外失败。两者都不导出原始目标键或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。
 - **内部与特殊流量：** honk 的内部链路地址范围 `169.254.0.0/16` 和 `fd00:686f:6e6b::/64` 永不代理。L2 广播/组播、IPv4 广播/组播/未指定目的地址以及 IPv6 组播会在路由或 conntrack 前直通。
+- **TUN 所有权：** daemon 独占新建 nonpersistent link、明确地址、专用 capture table、五条 RPDB rule、blackhole guard 与 setup receipt。操作者保持 main/WAN/LAN/NAT/firewall/forwarding 拓扑稳定。Watcher 失效关闭 capture，但不是 root 改路的原子栅栏。正常 joined stop 最后撤销自有 containment，失败保留 guard/rule/receipt 供精确核对清理。
 
 ## 构建 feature 与 mock 模式
 
@@ -146,7 +149,7 @@ flowchart TB
 | `jemalloc` | 是 | 引入 `tikv-jemallocator`，并将 jemalloc 安装为 `honk-core` 二进制的 allocator；该 crate 从 C 源码构建 jemalloc。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。运行期选项使用 `_RJEM_MALLOC_CONF` 而非 `MALLOC_CONF`：crate 以 `_rjem_` 前缀构建 jemalloc，环境变量名同样被加上该前缀。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
-`mock-ebpf` 不是 Cargo feature。默认 TC 路径在不带 `ebpf` 的构建中使用 `MockEbpfBackend`，`--mock-ebpf` 显式选择无特权开发路径；若该路径请求 `global.nfqueue_enable = true`，启动会告警并仅在本进程关闭 NFQUEUE 暂存，文件不变。显式选择 XDP 则使用其 userspace policy backend 与真实 XDP/AF_XDP adapter，不依赖 `ebpf` feature，也不是 mock capture。
+`mock-ebpf` 不是 Cargo feature。默认 TC 在不带 `ebpf` 的构建中使用 `MockEbpfBackend`，`--mock-ebpf` 显式选择无特权开发；该路径请求 NFQUEUE 时告警并仅在进程内禁用，不改文件。显式 XDP/TUN 使用共享 userspace policy backend 与真实 Linux device owner，不依赖 `ebpf` feature。TUN 要求 `/dev/net/tun`、设备/路由与 socket mark 权限，拒绝 `--mock-ebpf`，必须显式设 `nfqueue_enable: false`，绝不回退 TC/NFQUEUE。
 
 嵌入 eBPF 时，`build.rs` 使用内核 crate 固定的编译器及独立 release 策略重建，不继承 host 的 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS` 或 `CARGO_PROFILE_*` 性能分析覆盖。编译器 sidecar 还必须不早于嵌入构建脚本，因此修改嵌入策略会使既有对象失效。显式 `--bpf-object` 资产及手动内核构建仍由调用方负责。
 

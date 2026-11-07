@@ -188,11 +188,19 @@ pub fn router(state: Arc<ClashState>) -> Router {
         .with_state(state)
 }
 
-async fn bind_listener(
+fn bind_listener(
     listen: std::net::SocketAddr,
+    config: &Config,
     connection_tracker: &crate::connection_tracker::ConnectionTracker,
 ) -> Option<tokio::net::TcpListener> {
-    match tokio::net::TcpListener::bind(listen).await {
+    let egress_mark = config
+        .datapath
+        .as_ref()
+        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        .then(|| config.global.effective_so_mark());
+    match honk_outbound::util::bind_tcp_listener(listen, egress_mark)
+        .and_then(tokio::net::TcpListener::from_std)
+    {
         Ok(listener) => {
             connection_tracker.enable();
             Some(listener)
@@ -205,7 +213,11 @@ async fn bind_listener(
 }
 
 pub async fn serve(state: Arc<ClashState>, listen: std::net::SocketAddr) {
-    let Some(listener) = bind_listener(listen, &state.connection_tracker).await else {
+    let listener = {
+        let config = state.config.read().await;
+        bind_listener(listen, &config, &state.connection_tracker)
+    };
+    let Some(listener) = listener else {
         return;
     };
     let app = router(state.clone());
@@ -341,6 +353,22 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     let config = s.config.read().await;
     let mode = s.mode_state.read().mode.clone();
     let diagnostics = s.diagnostics.read().snapshot(&config.subscriptions);
+    let tun = config
+        .datapath
+        .as_ref()
+        .filter(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        .and_then(|datapath| datapath.tun.as_ref());
+    let tun_config = tun.map_or_else(
+        || serde_json::json!({"enable": false}),
+        |tun| {
+            serde_json::json!({
+                "enable": true,
+                "device": tun.name,
+                "mtu": tun.mtu,
+                "stack": "honk",
+            })
+        },
+    );
     Json(serde_json::json!({
         "mode": mode,
         "mode-list": ["Rule", "Global", "Direct"],
@@ -348,10 +376,10 @@ async fn get_configs(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
         "socks-port": 0,
         "mixed-port": 0,
         "allow-lan": false,
-        "ipv6": false,
+        "ipv6": tun.is_some_and(|tun| tun.address6.is_some()),
         "bind-address": "*",
         "log-level": config.global.log_level,
-        "tun": {"enable": false},
+        "tun": tun_config,
         "honk-diagnostics": diagnostics,
     }))
 }
@@ -1773,11 +1801,50 @@ mod sampler_tests {
         let tracker = crate::connection_tracker::ConnectionTracker::new();
 
         assert!(
-            bind_listener(occupied.local_addr().unwrap(), &tracker)
-                .await
-                .is_none()
+            bind_listener(occupied.local_addr().unwrap(), &Config::default(), &tracker).is_none()
         );
         assert!(!tracker.is_enabled());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "requires real SO_MARK in the disposable VM; run via just test-netns"]
+    async fn netns_tun_listener_marks_accepted_sockets() {
+        assert!(
+            std::fs::read_to_string("/proc/cmdline")
+                .unwrap()
+                .contains("virtme.")
+        );
+        let mut config = honk_config::parser::parse_dae_config(
+            "global { nfqueue_enable: false }\n\
+             datapath {\n backend: tun\n direct: endpoint\n tun {\n\
+             name: honk0\n address4: 198.18.0.1/32\n table: 202\n\
+             rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n }",
+        )
+        .unwrap();
+        config.global.so_mark_from_dae = 0x37ff_ffff;
+        for listen in ["127.0.0.1:0", "[::1]:0"] {
+            let tracker = crate::connection_tracker::ConnectionTracker::new();
+            let listener = bind_listener(listen.parse().unwrap(), &config, &tracker).unwrap();
+            assert!(tracker.is_enabled());
+            assert_eq!(
+                socket2::SockRef::from(&listener).mark().unwrap(),
+                config.global.effective_so_mark()
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (accepted, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    socket2::SockRef::from(&accepted).mark().unwrap(),
+                    config.global.effective_so_mark()
+                );
+                drop(client);
+            })
+            .await
+            .unwrap();
+        }
     }
 
     #[test]

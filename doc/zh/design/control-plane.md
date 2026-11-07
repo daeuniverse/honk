@@ -31,7 +31,7 @@
 
 配置诊断在初始化 tracing 前收集。加载或配置校验提前失败时，先向标准错误输出已有的非终止诊断，每条仅输出一次，再由二进制程序返回一次脱敏后的终止错误。加载成功时，诊断延迟到配置指定的 tracing 订阅器就绪后输出。后续运行时致命错误仍保留原有的日志文件记录。
 
-启动时保持内核准入关闭，直到用户态能够接收每个重定向流：
+以下启动顺序描述 TC；配置 XDP/TUN 则使用下述 packet supervisor 与各自[捕获 setup](./datapath.md)。TUN 在无 `ebpf` feature 时同样取得真实 instance lock。所选消费端能够接收全部捕获流量前，准入保持关闭：
 
 1. 真实模式取得 `/run/honk-core.lock`，最多等待 240 秒让前一个实例退出，并把进程 PID 发布到已锁文件；`honk-core reload` 读取该 PID 并发送 `SIGHUP`。未取得锁的后继实例在读取配置和打开状态数据库之前退出。Mock 模式不取得进程全局锁。
 2. 加载并校验配置、选择 `global.data_dir`，在任何网络 I/O 前初始化进程旁路 mark，提升 `RLIMIT_NOFILE`，并取得一次不可变的描述符预算快照。
@@ -45,9 +45,13 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查，或随后准入前的队列/规则/健康检查时，会记录 warning 并关闭；该启动降级在重载后仍生效（见[全局配置参考](../reference/global.md)）。持久化 token generation 恢复失败与服务准入后的失败仍为 fatal。
 
-编译路由、已学习域名 map、连通性、模式标志、接纳及清理使用共同接口。真实与 mock TC backend 通过 `tc()` / `tc_mut()` 暴露其既有对象；软件 backend 以 `Unsupported` 拒绝该能力，包括在绑定任何透明 listener 之前拒绝。可选内核观测保持不可用，不伪造事实。此拆分不新增 Host 捕获、native 续行、captured return 或 TUN 权威。
+编译路由、已学习域名 map、连通性、模式标志、接纳及清理使用共同接口。真实与 mock TC backend 通过 `tc()` / `tc_mut()` 暴露既有对象；软件 backend 以 `Unsupported` 拒绝该能力，包括在绑定任何透明 listener 前拒绝。可选内核观测保持不可用，不伪造事实。共享 policy publication 本身不授予 HostFacts、native 续行或 captured return；具体 TUN owner 仅提供 S-a Endpoint capture。
 
-配置为 XDP 的守护进程复用同一 mode/flags coordinator，但会在 packet scope 准入或 capture ready 之前以禁用 NFQUEUE 的状态初始化软件 flags。初始化保持恢复后的 mode 不变；发布失败时，通过 packet supervisor 的 joined cleanup 拒绝启动。该路径不启动 TC listener 或 NFQUEUE helper，显式非 XDP packet embedding 仍保留独立生命周期。
+配置为 XDP 和 TUN 的 daemon 共用 packet supervisor、mode/flags coordinator、订阅 authorization 及完整 control-command dispatch。软件 flags 在 scope 准入前以禁用 NFQUEUE 的状态初始化，保持恢复后的 mode；发布失败进入 joined startup cleanup。这两条路径不创建 TC listener 或 NFQUEUE helper；原 `PacketEndpoints::new()` 嵌入生命周期保持不变。
+
+TUN 在改路前准备 DNS bind 候选，把保留的 `Option<PreparedDnsBind>` 交给 `start_driven`；XDP 传 `None`。两个设备 runtime 在等待 `owner.poll_ready` 或失败启动清理时都持续服务唯一 `PacketDriver`。Supervisor ready 不等于 capture ready：只有真实设备/拓扑提交后调用 `capture_ready()`，才允许 lifecycle Running。TUN 的 setup/FD owner 与[保留 guard 的停止顺序](./datapath.md#停止与失败保留)不属于共享 policy backend。
+
+TUN 的有效进程 mark 是 required：初始化存储一致的 `(mark, required)`，用真实 TCP/UDP socket 回读，并传播后续 mark 失败。独立 DNS 及两个管理 API listener 均在 bind/listen 前设置并回读 M，让握手期间的 accepted child 就已继承；TC 透明 accepted socket 清 mark 的规则不适用于这些普通 TUN 服务 socket。Clash bind/mark 失败报告 API unavailable，native API 失败拒绝启动；授权不变。`/configs.tun` 投影已接受的 backend/device/MTU/stack 及由 address6 决定的 IPv6，不证明 runtime 健康；native datapath summary 仍为 unknown，无内核可见性。
 
 XDP 的可选轮询资源由进程启动点持有，与不可变的 `ResourceBudget` 尺寸值分开。唯一不可克隆的 publisher 派生共享 participant 句柄，普通 embedding 构造器不创建配额。reload、owner 替换或所有句柄被释放都不能重新初始化进程槽。有限 mutex 账本在整个进程最多允许一个同步 Busy 区间，持锁期间不访问设备/策略、不跨 await。按完整 BOOTTIME 时长计费，包括有用工作和调度停顿；结算未知时禁用 Busy，而不是退款。未结算活动区间跨过的补充边界作废，债务保留。
 
@@ -299,6 +303,7 @@ Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./gro
 | 区域 | 需要重启的字段 |
 | --- | --- |
 | Listener/数据路径 | `global.tproxy_port`、`global.tproxy_mark`、`global.tproxy_port_protect`、`global.pprof_port`、`global.so_mark_from_dae`、`global.lan_interface`、`global.wan_interface`、`global.auto_config_kernel_parameter` |
+| 捕获设备 | backend、Direct profile、完整规范 TUN setup（全部 `tun` 值）、XDP interface/zone 与有效 XSK mode；轮询策略/校准仍按独立合同可重载 |
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode`；生效的 `assets.ui.url` 和 `assets.ui.route` |
@@ -308,6 +313,8 @@ Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./gro
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |
 
 UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认出口的变更若影响任一启动阶段持有的下载出口，则需重启。`assets.subscription` 默认值与订阅条目设置交由订阅协调处理。
+
+TUN startup、SIGHUP 和 native offline/save 准入使用同一 runtime-policy validator。`same_device_setup` 比较整个规范 `TunConfig`（name、应用默认值后的 MTU、地址、排序去重后的 capture prefix、table、首 rule priority）、backend 与 Direct profile；有效设备值变化一律需重启。省略 MTU 与显式 1500 等价，既有省略/显式 TC 与 XDP 省略/显式 ZeroCopy 等价关系保留。policy/group/DNS/订阅/mode 发布保留活动 TUN FD 与 scope，不重建；候选被拒绝时保留活动 generation 与设备。`dns.bind` 语义变化仍需重启。
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 
@@ -389,6 +396,8 @@ Native cold/warm HTTP probe 与 URLTest 共用 dial/TLS/ALPN 和 H1/H2 exchange�
 `control/lifecycle/teardown.rs` 共用网络清理支持存在或不存在 listener epoch，涵盖部分启动。独立 DNS supervisor 保留已回收 child 的失败，并经 joined teardown 传播；主动关闭导致的取消是中性的，但 owner panic 会使清理失败。
 
 网络维护任务属于 `RuntimeEpoch`。延迟缓存 writer 属于进程，仅在终止关闭时 join。
+
+TUN 在原 packet supervisor 返回真实 joined plane/result 前保留 FD、driver、watcher 与 blackhole containment；abort/drain 前先撤销 capture route。正常确认 stop 先删除 P+4，再清其余自有路由资源与 receipt；失败或清理不明时保留 guard/rule/receipt 并报告失败。Driver Drop 仅归还驱动权，不确认 join 或 netlink 删除；取消后仍须保留原 runtime 执行清理。见 [TUN 停止与失败保留](./datapath.md#停止与失败保留)。
 
 已开始的阻塞工作无法靠取消 async waiter 停止，持有它的 owner 必须等待实际 join。通用清理/join 阶段使用十秒 `STAGE_TIMEOUT`，超时的 async task 会被 abort，teardown 报告失败。`control/cache.rs::StateTick` 是例外：十秒后告警并继续 join 实际维护任务及在途阻塞 SQLite 写入，不 abort。取消这次等待时，handle 仍留在 owner 中，可再次等待；owner 被 Drop 时只发出停止信号，外层 task 继续持有阻塞写入。因此总关闭时间没有严格十秒上限。TCP 连接任务 panic 时记录日志并回收，不停止引擎。关闭时可选的[业务连接宽限等待](../reference/global.md#关闭)在 joined teardown 之前执行。
 

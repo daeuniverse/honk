@@ -5,7 +5,7 @@ Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "jemalloc", "rprx"]`
-- `ebpf` — aya real TC backend + `honk-nfqueue`, requires Linux kernel 6.12+; the default TC path otherwise uses `MockEbpfBackend`. Explicit XDP selection uses its userspace policy backend and real XDP/AF_XDP adapter independently of this feature. NFQUEUE activation follows `configuration.md`.
+- `ebpf` — aya real TC backend + `honk-nfqueue`, requires Linux kernel 6.12+; default TC otherwise uses `MockEbpfBackend`. Explicit XDP/TUN use the shared userspace policy backend and real Linux device owners independently of this feature. TUN S-a still requires `/dev/net/tun`, device/route and SO_MARK privileges, rejects `--mock-ebpf` and requires NFQUEUE off; it grants no HostFacts/native/captured-return capability. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
 - `jemalloc` — shipped binary allocates through jemalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds both pinned doona editions and requires the absolute standard directory `HONK_DOONA_DIR` plus its `-lite` sibling (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded` or `ui: embedded-lite`, the lighter doona lite preview edition; both need `native-ui`) is not needed.
@@ -64,6 +64,8 @@ TCP accepted-FD child-proof and tuple-reuse ownership, UDP fullcone source owner
 bond binding, native lifecycle, UDP receive tracing (including per-family attachment failure), route-only watcher,
 lazy interface binding and SO_MARK socket checks. Exact nonempty
 selections in the guest gate must remain intact. The same guest gate then runs the matching real daemon's XDP/native-control/guard smoke and omitted-datapath TC startup/reload, with Core/XSK ignored cases restricted to its owned private namespace.
+
+TUN S-a real-FD validation belongs to `.github/ci/tun-daemon-smoke.sh`, restricted to the same disposable floor/recent guest and its private namespaces with a matching daemon. The fixture owns operator forwarding/firewall/main-route prerequisites; the daemon must own TUN/address/table/five-rule/receipt setup. The complete gate must retain TC/XDP selections and exercise all twelve A Host/Transit × IPv4/IPv6 × TCP/connected/unconnected UDP rows, actual proxy and Endpoint Direct exchanges, FD/read-write/mark/DNS/reload/failure/representation subrows and confirmed stop versus crash guards. Socketpair/unit tests are not TUN evidence; record missing rows as NOT_RUN, never HostFacts/Native or E6.4 acceptance. This location/required matrix is not a claim that the gate has run.
 
 Use skill `honk-real-ebpf-tests` for the prerequisite sequence from CI: an
 x86_64 Ubuntu 24.04 host, repository-pinned Rust toolchains, build/VM packages,

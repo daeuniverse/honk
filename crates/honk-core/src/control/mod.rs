@@ -7,7 +7,7 @@ mod connection;
 #[cfg(target_os = "linux")]
 pub mod core_forward;
 pub mod dns_control;
-mod dns_listener;
+pub(crate) mod dns_listener;
 pub mod drain;
 pub mod janitor;
 pub mod netstack;
@@ -359,6 +359,9 @@ impl ControlPlane {
     }
     pub fn config_handle(&self) -> Arc<RwLock<Arc<Config>>> {
         self.config.clone()
+    }
+    pub(crate) fn packet_udp_capacity(&self) -> usize {
+        self.resource_budget.udp_endpoints.min(64)
     }
     #[cfg(feature = "native-api")]
     pub(crate) fn log_files(&self) -> LogFiles {

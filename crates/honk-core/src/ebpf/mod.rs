@@ -309,7 +309,7 @@ pub const MAX_DATAPATH_ATTACHMENTS: usize = 128;
 pub enum DatapathKind {
     Real,
     Mock,
-    XdpUserspace,
+    PacketUserspace,
     Unknown,
 }
 

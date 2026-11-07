@@ -8,14 +8,22 @@ use tokio::net::TcpStream;
 
 const EINPROGRESS: i32 = libc::EINPROGRESS;
 
-static BYPASS_MARK: OnceLock<u32> = OnceLock::new();
+static BYPASS_MARK: OnceLock<(u32, bool)> = OnceLock::new();
 
-/// Process-wide mark for originated sockets; initialize before startup network I/O.
-pub fn init_bypass_mark(mark: u32) -> io::Result<()> {
-    if *BYPASS_MARK.get_or_init(|| mark) != mark {
+/// Process-wide mark and enforcement policy; initialize before startup network I/O.
+pub fn init_dae_socket_mark(mark: u32, required: bool) -> io::Result<()> {
+    if mark == 0
+        || mark & (honk_ebpf_common::SKB_MARK_RESERVED_MASK | honk_ebpf_common::TPROXY_MARK) != 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket bypass mark must be nonzero and exclude datapath-reserved and TPROXY bits",
+        ));
+    }
+    if *BYPASS_MARK.get_or_init(|| (mark, required)) != (mark, required) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
-            "socket bypass mark is already initialized to a different value",
+            "socket bypass mark or enforcement policy is already initialized differently",
         ));
     }
     Ok(())
@@ -25,15 +33,10 @@ pub fn init_bypass_mark(mark: u32) -> io::Result<()> {
 pub fn bypass_mark() -> u32 {
     BYPASS_MARK
         .get()
-        .copied()
-        .unwrap_or(honk_ebpf_common::DAE_BYPASS_MARK)
+        .map_or(honk_ebpf_common::DAE_BYPASS_MARK, |&(mark, _)| mark)
 }
 
-/// Set `SO_MARK` best-effort. In production honk runs as root (eBPF load
-/// requires it) so the mark always applies; unprivileged environments (CI,
-/// local tests) get EPERM, where we log once and continue unmarked — the
-/// bypass is irrelevant there because no eBPF datapath is loaded.
-/// Non-EPERM errors are real failures and propagate.
+/// Set `SO_MARK`, tolerating permission denial only when the process mark is optional.
 #[cfg(target_os = "linux")]
 pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
     set_mark_result_best_effort(socket.set_mark(mark))
@@ -45,7 +48,10 @@ pub fn set_mark_best_effort(socket: &socket2::Socket, mark: u32) -> io::Result<(
 pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
     match result {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+        Err(e)
+            if e.kind() == io::ErrorKind::PermissionDenied
+                && !BYPASS_MARK.get().is_some_and(|&(_, required)| required) =>
+        {
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| {
                 tracing::debug!("SO_MARK denied (unprivileged); continuing without bypass mark");
@@ -54,6 +60,49 @@ pub fn set_mark_result_best_effort(result: io::Result<()>) -> io::Result<()> {
         }
         Err(e) => Err(e),
     }
+}
+
+/// Set and read back the complete `SO_MARK`; every error or mismatch is fatal.
+#[cfg(target_os = "linux")]
+pub fn set_mark_verified(socket: &socket2::Socket, mark: u32) -> io::Result<()> {
+    socket.set_mark(mark)?;
+    let actual = socket.mark()?;
+    if actual != mark {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SO_MARK readback mismatch: expected {mark:#x}, received {actual:#x}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Bind a nonblocking TCP listener, verifying an optional mark before bind/listen.
+pub fn bind_tcp_listener(
+    address: SocketAddr,
+    egress_mark: Option<u32>,
+) -> io::Result<std::net::TcpListener> {
+    let domain = if address.is_ipv4() {
+        socket2::Domain::IPV4
+    } else {
+        socket2::Domain::IPV6
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(target_os = "linux")]
+    if let Some(mark) = egress_mark {
+        set_mark_verified(&socket, mark)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    if egress_mark.is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "required socket marks need Linux",
+        ));
+    }
+    socket.bind(&address.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
 }
 
 /// Apply TCP keepalive tuning (idle 15s, interval 10s, 3 probes) via
@@ -264,4 +313,77 @@ pub(crate) fn marked_udp_socket_with_mark(
 /// [`marked_udp_socket`] as a tokio socket.
 pub async fn udp_marked_bind(bind_addr: SocketAddr) -> io::Result<tokio::net::UdpSocket> {
     tokio::net::UdpSocket::from_std(marked_udp_socket(bind_addr)?)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    fn assert_mark_policy(required: bool) {
+        init_dae_socket_mark(0x200, required).unwrap();
+        init_dae_socket_mark(0x200, required).unwrap();
+        assert_eq!(bypass_mark(), 0x200);
+        for (mark, required) in [(0x201, required), (0x200, !required)] {
+            assert_eq!(
+                init_dae_socket_mark(mark, required).unwrap_err().kind(),
+                io::ErrorKind::AlreadyExists
+            );
+        }
+        let denied = set_mark_result_best_effort(Err(io::Error::from_raw_os_error(libc::EPERM)));
+        if required {
+            assert_eq!(denied.unwrap_err().raw_os_error(), Some(libc::EPERM));
+        } else {
+            denied.unwrap();
+        }
+        assert_eq!(
+            set_mark_result_best_effort(Err(io::Error::from_raw_os_error(libc::EINVAL)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EINVAL)
+        );
+        set_mark_result_best_effort(Ok(())).unwrap();
+    }
+
+    #[test]
+    fn required_mark_rejects_permission_denial_and_policy_changes() {
+        if crate::bootstrap::run_global_test_in_child(
+            "util::tests::required_mark_rejects_permission_denial_and_policy_changes",
+        ) {
+            return;
+        }
+        assert_mark_policy(true);
+    }
+
+    #[test]
+    fn optional_mark_keeps_legacy_permission_denial_contract() {
+        if crate::bootstrap::run_global_test_in_child(
+            "util::tests::optional_mark_keeps_legacy_permission_denial_contract",
+        ) {
+            return;
+        }
+        assert_mark_policy(false);
+    }
+
+    #[test]
+    fn invalid_process_marks_do_not_claim_initialization() {
+        if crate::bootstrap::run_global_test_in_child(
+            "util::tests::invalid_process_marks_do_not_claim_initialization",
+        ) {
+            return;
+        }
+        for mark in [
+            0,
+            honk_ebpf_common::CLASSIFIED_MARK | 0x100,
+            honk_ebpf_common::NFQUEUE_PENDING_MARK | 0x100,
+            honk_ebpf_common::TPROXY_MARK | 0x100,
+        ] {
+            assert_eq!(
+                init_dae_socket_mark(mark, true).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        let mark = !(honk_ebpf_common::SKB_MARK_RESERVED_MASK | honk_ebpf_common::TPROXY_MARK);
+        init_dae_socket_mark(mark, true).unwrap();
+        assert_eq!(bypass_mark(), mark);
+    }
 }

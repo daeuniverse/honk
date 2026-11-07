@@ -355,10 +355,16 @@ Ephemeral 建立过程在取消期间也受 guard 管理，pool 自主管理的�
 - `udp_marked_bind` 与 `marked_udp_socket` 创建带 bypass mark 的 UDP socket。
 
 控制面 socket 使用进程级 `global.so_mark_from_dae`；零值选择
-`DAE_BYPASS_MARK`（`0x100`）。非零直连规则 mark 改用
-`rule_mark | CLASSIFIED_MARK`，不会把覆盖值传给 bootstrap 或代理载体。
-WAN egress 识别两类标记。只有在没有生产 datapath 的非特权
-`EPERM` 环境中 mark 应用才是 best-effort；其他错误都会传播。
+`DAE_BYPASS_MARK`（`0x100`）。TC 非零直连规则改用 `rule_mark | CLASSIFIED_MARK`，
+不会把覆盖值传给 bootstrap 或代理载体，WAN egress 识别两类。TUN 拒绝非零
+traffic mark，以 `required=true` 调用 `init_dae_socket_mark(mark, required)`。
+原进程 OnceLock 保留一致的二元组，startup/bootstrap 重复初始化必须相同。
+Required 模式传播全部 mark 错误，包括 EPERM；启动在 capture 前用真实 TCP/UDP
+socket set/readback 核对。后续 physical TCP/UDP/QUIC/DNS/bootstrap/health/
+download socket 通过共享 setter 保持 required。其他后端使用 `required=false`，
+保留既有 best-effort EPERM 行为，其他错误传播。TUN DNS 与管理 listener 同样
+在 bind/listen 前设置并回读精确 mark，让 accepted child 与远端回复从握手时起
+就经旁路路由。
 
 订阅与直连 UI 下载也先经相同的带 mark TCP 拨号，再使用 Hyper HTTP/1
 帧处理和既有 rustls/platform-verifier TLS 策略，包括挂载 eBPF 前的首次订阅抓取；

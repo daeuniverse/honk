@@ -77,7 +77,13 @@ impl ControlPlane {
             dns_socket_budget.limit() <= resource_budget.dns_sockets,
             "DNS socket admission exceeds its descriptor partition"
         );
-        honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+        honk_outbound::util::init_dae_socket_mark(
+            config.global.effective_so_mark(),
+            config
+                .datapath
+                .as_ref()
+                .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun),
+        )?;
         let (tx, rx) = mpsc::channel(256);
         let effective_log_file = crate::resolved_log_file_path(&config, None);
 

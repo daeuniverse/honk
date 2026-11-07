@@ -43,6 +43,28 @@ impl CapturedConfig {
                 "datapath policy is unsupported by its execution profile",
             )
         })?;
+        #[cfg(target_os = "linux")]
+        crate::tun::validate_config(&config).map_err(|_| {
+            error(
+                source,
+                "datapath",
+                "invalid-datapath-config",
+                "datapath policy is unsupported by its execution profile",
+            )
+        })?;
+        #[cfg(not(target_os = "linux"))]
+        if config
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        {
+            return Err(error(
+                source,
+                "datapath",
+                "invalid-datapath-config",
+                "TUN requires Linux",
+            ));
+        }
         let dns_requirements = DnsRouter::geo_requirements(&config.dns);
         let requirements = GeoRequirements::for_forwarding(&config).union(&dns_requirements);
         geo.validate(&requirements)

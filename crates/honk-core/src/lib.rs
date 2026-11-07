@@ -38,6 +38,8 @@ pub mod stats;
 pub mod subscription;
 mod sysctl;
 #[cfg(target_os = "linux")]
+pub(crate) mod tun;
+#[cfg(target_os = "linux")]
 pub(crate) mod xdp;
 
 #[cfg(test)]
@@ -364,7 +366,12 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
         ClashCommand::Delay { node, url } => {
             let config = read_config()?;
             config.validate()?;
-            honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+            honk_outbound::util::init_dae_socket_mark(
+                config.global.effective_so_mark(),
+                config.datapath.as_ref().is_some_and(|datapath| {
+                    datapath.backend == honk_config::datapath::Backend::Tun
+                }),
+            )?;
             honk_outbound::bootstrap::set_global(
                 honk_outbound::bootstrap::BootstrapResolver::parse(
                     &config.global.bootstrap_resolver,
@@ -897,31 +904,42 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             return Err(error);
         }
     };
-    let xdp_mode = config
+    use honk_config::datapath::Backend;
+    let backend = config
         .datapath
         .as_ref()
-        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Xdp);
-    anyhow::ensure!(
-        !xdp_mode || !cli.mock_ebpf,
-        "XDP cannot be selected with --mock-ebpf"
-    );
+        .map_or(Backend::Tc, |datapath| datapath.backend);
+    let xdp_mode = backend == Backend::Xdp;
+    let packet_mode = matches!(backend, Backend::Xdp | Backend::Tun);
+    match backend {
+        Backend::Tc => {}
+        Backend::Xdp => {
+            anyhow::ensure!(!cli.mock_ebpf, "XDP cannot be selected with --mock-ebpf");
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("XDP requires Linux");
+            #[cfg(target_os = "linux")]
+            xdp::validate_config(&config)?;
+        }
+        Backend::Tun => {
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("TUN requires Linux");
+            #[cfg(target_os = "linux")]
+            {
+                tun::validate_runtime(&config, cli.mock_ebpf)?;
+            }
+        }
+    }
     anyhow::ensure!(
         !cli.busy_poll_calibration_experiment || xdp_mode,
         "--busy-poll-calibration-experiment requires the explicit XDP backend"
     );
-    #[cfg(not(target_os = "linux"))]
-    anyhow::ensure!(!xdp_mode, "XDP requires Linux");
-    #[cfg(target_os = "linux")]
-    if xdp_mode {
-        xdp::validate_config(&config)?;
-    }
-    let tc_mode = !mock_mode && !xdp_mode;
-    let _xdp_instance_lock = if xdp_mode && mock_mode {
+    let tc_mode = backend == Backend::Tc && !mock_mode;
+    let _packet_instance_lock = if packet_mode && mock_mode {
         instance_lock(false)?
     } else {
         None
     };
-    let xdp_admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let packet_admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Console, optional file, and Clash API output use independent layers.
     // With no `/logs` subscription, the API layer contributes no callsite interest.
@@ -1027,7 +1045,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         );
     }
 
-    honk_outbound::util::init_bypass_mark(config.global.effective_so_mark())?;
+    honk_outbound::util::init_dae_socket_mark(
+        config.global.effective_so_mark(),
+        backend == Backend::Tun,
+    )?;
     honk_outbound::proxy::wireguard::init_memory_share(resource_budget.wireguard_memory)?;
 
     // Install the bootstrap resolver for proxy-server hostname lookups so
@@ -1098,7 +1119,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     // The old instance owns queue 320 until this lock is released. Check
     // NFQUEUE only after the handoff so a transient busy result cannot turn
     // a healthy restart into a permanently degraded process.
-    let nfqueue_unavailable = !xdp_mode && prepare_nfqueue_startup(&mut config, mock_mode);
+    let nfqueue_unavailable =
+        backend == Backend::Tc && prepare_nfqueue_startup(&mut config, mock_mode);
 
     #[cfg(feature = "ebpf")]
     let _dae0_guard;
@@ -1120,62 +1142,70 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
 
     #[cfg(feature = "ebpf")]
     let mut interface_handoff = None;
-    let ebpf_backend: Box<dyn crate::ebpf::PolicyBackend> = if xdp_mode {
-        #[cfg(feature = "ebpf")]
-        {
-            _dae0_guard = None;
+    let ebpf_backend: Box<dyn crate::ebpf::PolicyBackend> = match backend {
+        Backend::Xdp | Backend::Tun => {
+            #[cfg(feature = "ebpf")]
+            {
+                _dae0_guard = None;
+            }
+            Box::new(ebpf::userspace::UserspaceBackend::new(Arc::clone(
+                &packet_admission,
+            )))
         }
-        Box::new(ebpf::userspace::UserspaceBackend::new(Arc::clone(
-            &xdp_admission,
-        )))
-    } else if cli.mock_ebpf {
-        #[cfg(feature = "ebpf")]
-        {
-            _dae0_guard = None;
-        }
-        info!("Using mock eBPF backend");
-        Box::new(ebpf::mock::MockEbpfBackend::new())
-    } else {
-        #[cfg(feature = "ebpf")]
-        {
-            // PARAM.dae0_ifindex must describe the pair before eBPF load.
-            let (guard, dae0_setup) = daens::create_dae0_link()?;
-            info!(
-                "dae0 link created before eBPF load (ifindex={})",
-                dae0_setup.ifindex()
-            );
-            _dae0_guard = Some(guard);
-            let bpf_object_bytes = match &cli.bpf_object {
-                Some(path) => {
-                    info!("Loading real eBPF backend from {}", path.display());
-                    std::fs::read(path).map_err(|e| {
-                        anyhow::anyhow!("failed to read eBPF object file {}: {}", path.display(), e)
-                    })?
-                }
-                None => {
-                    info!("Loading real eBPF backend from built-in object");
-                    DEFAULT_BPF_OBJECT.to_vec()
-                }
-            };
-            let (backend, handoff) = ebpf::real::start_interfaces(
-                &bpf_object_bytes,
-                &cli.bpf_pin_root,
-                config.global.tproxy_port,
-                &dae0_setup,
-                &config.global.lan_interface,
-                &config.global.wan_interface,
-                &degradations,
-                ebpf::interface::read_topology,
-            )
-            .await?;
-            interface_handoff = Some(handoff);
-
-            Box::new(backend)
-        }
-        #[cfg(not(feature = "ebpf"))]
-        {
-            info!("eBPF feature not compiled in, using mock backend");
+        Backend::Tc if cli.mock_ebpf => {
+            #[cfg(feature = "ebpf")]
+            {
+                _dae0_guard = None;
+            }
+            info!("Using mock eBPF backend");
             Box::new(ebpf::mock::MockEbpfBackend::new())
+        }
+        Backend::Tc => {
+            #[cfg(feature = "ebpf")]
+            {
+                // PARAM.dae0_ifindex must describe the pair before eBPF load.
+                let (guard, dae0_setup) = daens::create_dae0_link()?;
+                info!(
+                    "dae0 link created before eBPF load (ifindex={})",
+                    dae0_setup.ifindex()
+                );
+                _dae0_guard = Some(guard);
+                let bpf_object_bytes = match &cli.bpf_object {
+                    Some(path) => {
+                        info!("Loading real eBPF backend from {}", path.display());
+                        std::fs::read(path).map_err(|e| {
+                            anyhow::anyhow!(
+                                "failed to read eBPF object file {}: {}",
+                                path.display(),
+                                e
+                            )
+                        })?
+                    }
+                    None => {
+                        info!("Loading real eBPF backend from built-in object");
+                        DEFAULT_BPF_OBJECT.to_vec()
+                    }
+                };
+                let (backend, handoff) = ebpf::real::start_interfaces(
+                    &bpf_object_bytes,
+                    &cli.bpf_pin_root,
+                    config.global.tproxy_port,
+                    &dae0_setup,
+                    &config.global.lan_interface,
+                    &config.global.wan_interface,
+                    &degradations,
+                    ebpf::interface::read_topology,
+                )
+                .await?;
+                interface_handoff = Some(handoff);
+
+                Box::new(backend)
+            }
+            #[cfg(not(feature = "ebpf"))]
+            {
+                info!("eBPF feature not compiled in, using mock backend");
+                Box::new(ebpf::mock::MockEbpfBackend::new())
+            }
         }
     };
     #[cfg(feature = "ebpf")]
@@ -1217,7 +1247,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             ebpf_backend.tc_mut()?.attach_dae0peer_ingress()?;
             info!("dae0peer_ingress attached in daens");
         }
-    } else if !xdp_mode {
+    } else if backend == Backend::Tc {
         info!("Skipping real interface binding (mock mode)");
     }
 
@@ -1233,7 +1263,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             "Using eBPF TC redirect datapath (tproxy_mark=0x{:x})",
             config.global.tproxy_mark
         );
-    } else if !xdp_mode {
+    } else if backend == Backend::Tc {
         info!("Skipping eBPF datapath setup (mock mode)");
     }
 
@@ -1517,7 +1547,11 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     }
 
     info!(
-        backend = if xdp_mode { "xdp" } else { "tc" },
+        backend = match backend {
+            Backend::Tc => "tc",
+            Backend::Xdp => "xdp",
+            Backend::Tun => "tun",
+        },
         "Starting selected datapath owner"
     );
 
@@ -1657,18 +1691,27 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     } else {
         info!("honk-core is running.");
     }
-    let (control_plane, control_result) = if xdp_mode {
-        #[cfg(target_os = "linux")]
-        {
-            xdp::run(control_plane, &cli.bpf_pin_root, xdp_admission).await
+    let (control_plane, control_result) = match backend {
+        Backend::Tc => {
+            let result = control_plane.run().await;
+            (Some(control_plane), result)
         }
-        #[cfg(not(target_os = "linux"))]
-        {
+        Backend::Xdp => {
+            #[cfg(target_os = "linux")]
+            {
+                xdp::run(control_plane, &cli.bpf_pin_root, packet_admission).await
+            }
+            #[cfg(not(target_os = "linux"))]
             unreachable!("XDP admission requires Linux")
         }
-    } else {
-        let result = control_plane.run().await;
-        (Some(control_plane), result)
+        Backend::Tun => {
+            #[cfg(target_os = "linux")]
+            {
+                tun::run(control_plane, packet_admission).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("TUN admission requires Linux")
+        }
     };
     #[cfg(feature = "native-api")]
     native_api::NativeRuntime::shutdown(native, control_plane.as_ref(), control_result.is_err())

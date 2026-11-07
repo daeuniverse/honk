@@ -24,7 +24,7 @@
 
 ## 独立监听器（`bind`）
 
-独立监听器使用主机网络命名空间中的普通套接字，不设置旁路标记。关闭它不会关闭透明 TCP/UDP 53 端口拦截；透明路径遵循[流量规则所有权](./routing.md#出站目标与-must)。
+独立监听器使用普通 host-netns socket，TC/XDP 与普通嵌入不设置 mark。`backend: tun` 时，每个 listener 在 bind/listen 前严格设置并回读有效 `global.so_mark_from_dae`，accepted TCP child 继承它，使远端回复旁路 capture。TUN 在任何改路前解析并保留 hostname bind 候选，配置地址存在后再 bind。UDP/TCP 独立应答都写入 TUN 的真实已注册 packet realm，loopback/LAN bind 也不写 HOST 事实；持久 TCP 每帧重查当前 packet admission。关闭监听不关闭捕获的 TCP/UDP53 DNS，后者遵循[流量规则所有权](./routing.md#出站目标与-must)及所选 Direct 执行 profile。见 [TUN DNS 所有权](../design/dns.md#入口路径)。
 
 | 值 | 结果 |
 | --- | --- |
@@ -40,7 +40,7 @@
 
 监听器归进程所有。SIGHUP 重载接受语义等价的不同写法，但主机、端口或传输集合的任何变化都会因需要重启而被拒绝。通配或 LAN 侧绑定会暴露一个无认证的递归解析器；必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
-监听 `:53` 不会抢先于 LAN 流量策略接收查询：即使 dnsmasq 或 `dns.bind` 占用该 socket，非 `must` 的 LAN TCP/UDP53 查询仍进入 honk 透明 DNS。主机 loopback 和显式原生 `direct(must)` 交付仍可到达该普通监听器；见[监听器矩阵](../design/dns.md#dns-所有权状态机)。
+TC 上监听 `:53` 不会抢先于 LAN 流量策略接收查询：即使 dnsmasq 或 `dns.bind` 占用 socket，非 `must` 的 LAN TCP/UDP53 仍进入 honk 透明 DNS。Host-loopback 与显式 native `direct(must)` 仍可到达普通 listener，见[监听器矩阵](../design/dns.md#dns-所有权状态机)。TUN 的系统 local RPDB rule 在捕获前处理本地目的；被捕获的 Direct 使用 Endpoint relay，不是 TC native 投递。
 
 ## Hosts 快照（`use_host`）
 

@@ -4,6 +4,11 @@
 //! ports without replacing CoreForward's input FIB. Notifications invalidate
 //! this snapshot; they are not an atomic fence against external RTNL writers.
 //! Kernel IPv6 ff00::/8 multicast routes remain outside native unicast capture.
+//!
+//! TUN admission instead proves only what the daemon created: one link, its exact
+//! addresses, the five per-family rules at `[P, P+4]` and the dedicated capture table,
+//! beside operator main routing it can represent completely. Unknown selectors, actions,
+//! nexthop forms and attributes are refused rather than interpreted.
 
 use std::collections::HashSet;
 use std::io;
@@ -16,6 +21,220 @@ use crate::bpf::{attributes, wait_netlink};
 
 const MAX_OBJECTS: usize = 65_536;
 pub(crate) const MAX_BROADCASTS: usize = 64;
+
+const IFA_F_NODAD: u32 = 0x02;
+const IFA_F_DADFAILED: u32 = 0x08;
+const IFA_F_TENTATIVE: u32 = 0x40;
+const IFA_F_PERMANENT: u32 = 0x80;
+const IFA_F_NOPREFIXROUTE: u32 = 0x200;
+const FIB_RULE_IIF_DETACHED: u32 = 0x08;
+const FR_ACT_PROHIBIT: u8 = 8;
+const RTN_BLACKHOLE: u8 = 6;
+const RTPROT_STATIC: u8 = 4;
+const TUN_GUARD_METRIC: u32 = 32760;
+// IPv6 stores metric 0 as 1024, and IPv4 deletion treats priority 0 as a wildcard.
+const TUN_CAPTURE_METRIC: u32 = 1024;
+
+/// Borrowed TUN configuration plus the process bypass mark capture must route around.
+#[derive(Clone, Copy, Debug)]
+pub struct TunSpec<'a> {
+    pub name: &'a str,
+    pub mtu: u32,
+    pub address4: Option<Ipv4Addr>,
+    pub address6: Option<Ipv6Addr>,
+    pub table: u32,
+    pub rule_priority: u32,
+    pub bypass_mark: u32,
+    pub capture: &'a [(IpAddr, u8)],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunRouteKind {
+    Blackhole,
+    Unicast { oif: u32 },
+}
+
+/// One bare `RTPROT_STATIC` route in the dedicated capture table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TunRoute {
+    pub table: u32,
+    pub destination: IpAddr,
+    pub prefix_len: u8,
+    pub kind: TunRouteKind,
+    pub metric: u32,
+}
+
+/// `Fwmark` carries an exact `0xffffffff` mask; `Iif` names the owned TUN.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunRuleSelector {
+    Fwmark(u32),
+    Iif,
+    All,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunRuleAction {
+    Lookup(u32),
+    Prohibit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TunRule {
+    pub ipv6: bool,
+    pub priority: u32,
+    pub selector: TunRuleSelector,
+    pub action: TunRuleAction,
+}
+
+/// `Guarded` holds every rule and blackhole guard but no capture route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TunStage {
+    Guarded,
+    Active,
+}
+
+/// Cleanup facts from one dump; `None` marks an object no TUN key represents exactly.
+#[derive(Debug)]
+pub struct TunReadback {
+    /// Some link, of any identity, still has the recorded ifindex.
+    pub link: bool,
+    pub addresses: Vec<(IpAddr, u8)>,
+    /// Every capture-table route as `(table, destination, prefix, metric, key)`.
+    pub routes: Vec<(u32, IpAddr, u8, u32, Option<TunRoute>)>,
+    /// Every rule of either family in `[P, P+4]` as `(ipv6, priority, key)`.
+    pub rules: Vec<(bool, u32, Option<TunRule>)>,
+}
+
+impl TunSpec<'_> {
+    /// Per enabled family, IPv4 first, in install order `P..=P+4`.
+    pub fn rules(&self) -> Vec<TunRule> {
+        use TunRuleAction::{Lookup, Prohibit};
+        use TunRuleSelector::{All, Fwmark, Iif};
+        let mark = Fwmark(self.bypass_mark);
+        let shape = [
+            (mark, Lookup(254)),
+            (mark, Prohibit),
+            (Iif, Lookup(254)),
+            (Iif, Prohibit),
+            (All, Lookup(self.table)),
+        ];
+        let mut rules = Vec::with_capacity(2 * shape.len());
+        for ipv6 in self.families() {
+            for (offset, (selector, action)) in (0..).zip(shape) {
+                rules.push(TunRule {
+                    ipv6,
+                    priority: self.rule_priority.saturating_add(offset),
+                    selector,
+                    action,
+                });
+            }
+        }
+        rules
+    }
+
+    pub fn guard_routes(&self) -> Vec<TunRoute> {
+        self.routes(TunRouteKind::Blackhole, TUN_GUARD_METRIC)
+    }
+
+    pub fn capture_routes(&self, oif: u32) -> Vec<TunRoute> {
+        self.routes(TunRouteKind::Unicast { oif }, TUN_CAPTURE_METRIC)
+    }
+
+    fn routes(&self, kind: TunRouteKind, metric: u32) -> Vec<TunRoute> {
+        self.capture
+            .iter()
+            .map(|&(destination, prefix_len)| TunRoute {
+                table: self.table,
+                destination,
+                prefix_len,
+                kind,
+                metric,
+            })
+            .collect()
+    }
+
+    fn families(&self) -> impl Iterator<Item = bool> {
+        [self.address4.map(|_| false), self.address6.map(|_| true)]
+            .into_iter()
+            .flatten()
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = IpAddr> {
+        [self.address4.map(IpAddr::V4), self.address6.map(IpAddr::V6)]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Refuses values that would make derived keys or the reserved range inexact.
+    fn validate(&self) -> io::Result<[u8; 16]> {
+        let name = self.name.as_bytes();
+        let network = |&(destination, prefix): &(IpAddr, u8)| match destination {
+            IpAddr::V4(ip) => self.address4.is_some() && network_address(IpAddr::V4(ip), prefix),
+            IpAddr::V6(ip) => self.address6.is_some() && network_address(IpAddr::V6(ip), prefix),
+        };
+        if name.is_empty()
+            || !name
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'.' | b'-'))
+            || matches!(self.name, "lo" | "auto")
+            || !(1280..=65535).contains(&self.mtu)
+            || self.address4.is_some_and(|ip| {
+                ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() || ip.is_link_local()
+            })
+            || self.address6.is_some_and(|ip| {
+                ip.is_unspecified()
+                    || ip.is_multicast()
+                    || ip.is_unicast_link_local()
+                    || ip.to_ipv4_mapped().is_some()
+            })
+            || (self.address4.is_none() && self.address6.is_none())
+            || self.bypass_mark == 0
+            || self.bypass_mark & honk_ebpf_common::CLASSIFIED_MARK != 0
+            || matches!(self.table, 0 | 253..=255 | u32::MAX)
+            || self.rule_priority == 0
+            || self
+                .rule_priority
+                .checked_add(4)
+                .is_none_or(|last| last >= 32766)
+            || self.capture.is_empty()
+            || self.capture.len() > 64
+            || !self.capture.iter().all(network)
+            || self
+                .capture
+                .iter()
+                .enumerate()
+                .any(|(index, &(address, prefix))| {
+                    self.capture[..index].iter().any(|&(other, other_prefix)| {
+                        let common = prefix.min(other_prefix);
+                        match (address, other) {
+                            (IpAddr::V4(a), IpAddr::V4(b)) => {
+                                u32::from(a)
+                                    .checked_shr(u32::from(32 - common))
+                                    .unwrap_or(0)
+                                    == u32::from(b)
+                                        .checked_shr(u32::from(32 - common))
+                                        .unwrap_or(0)
+                            }
+                            (IpAddr::V6(a), IpAddr::V6(b)) => {
+                                u128::from(a)
+                                    .checked_shr(u32::from(128 - common))
+                                    .unwrap_or(0)
+                                    == u128::from(b)
+                                        .checked_shr(u32::from(128 - common))
+                                        .unwrap_or(0)
+                            }
+                            _ => false,
+                        }
+                    })
+                })
+        {
+            return Err(unsupported(
+                "invalid TUN name, addresses, mark, table, priority range or capture prefixes",
+            ));
+        }
+        interface_name(name)
+    }
+}
 
 pub struct Topology {
     fd: OwnedFd,
@@ -36,11 +255,8 @@ impl Topology {
         bypass_mark: u32,
     ) -> io::Result<Self> {
         validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
-        let fd = route_socket()?;
-        let mut snapshot = Snapshot::default();
-        for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
-            dump(fd.as_fd(), sequence, kind, body_len, &mut snapshot)?;
-        }
+        let fd = route_socket(true)?;
+        let snapshot = snapshot(fd.as_fd())?;
         snapshot.admit(captured_physical, captured_logical, bypass_mark)?;
         let (ipv4_broadcasts, broadcast_count) = snapshot.ipv4_broadcasts()?;
         let mut topology = Self {
@@ -48,6 +264,35 @@ impl Topology {
             invalidated: false,
             ipv4_broadcasts,
             broadcast_count,
+        };
+        if topology.check_changed()? {
+            return Err(unsupported("routing topology changed during admission"));
+        }
+        Ok(topology)
+    }
+
+    /// Before creating the TUN: subscribes, then proves the name, addresses, capture
+    /// table and `[P, P+4]` are free and each enabled family has an operator uplink.
+    pub fn preflight_tun(spec: &TunSpec<'_>) -> io::Result<Self> {
+        Self::watch_tun(spec, None)
+    }
+
+    /// Proves exactly the owned link, addresses, rules and guards (plus capture routes
+    /// when `Active`) beside representable operator routing. Retain and watch it like
+    /// [`Self::admit`]; any invalidation requires closing capture admission.
+    pub fn admit_tun(spec: &TunSpec<'_>, ifindex: u32, stage: TunStage) -> io::Result<Self> {
+        Self::watch_tun(spec, Some((ifindex, stage)))
+    }
+
+    fn watch_tun(spec: &TunSpec<'_>, owned: Option<(u32, TunStage)>) -> io::Result<Self> {
+        let name = spec.validate()?;
+        let fd = route_socket(true)?;
+        snapshot(fd.as_fd())?.admit_tun(spec, name, owned)?;
+        let mut topology = Self {
+            fd,
+            invalidated: false,
+            ipv4_broadcasts: [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS],
+            broadcast_count: 0,
         };
         if topology.check_changed()? {
             return Err(unsupported("routing topology changed during admission"));
@@ -166,7 +411,88 @@ fn validate_capture_sets(
     Ok(())
 }
 
-fn route_socket() -> io::Result<OwnedFd> {
+/// Reads cleanup evidence without requiring the topology to remain admissible.
+/// Unrepresentable occupants retain their slot and have no deletable key.
+pub fn tun_readback(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback> {
+    spec.validate()?;
+    let fd = route_socket(false)?;
+    snapshot(fd.as_fd())?.tun_readback(spec, ifindex)
+}
+
+fn snapshot(fd: BorrowedFd<'_>) -> io::Result<Snapshot> {
+    let mut snapshot = Snapshot::default();
+    for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
+        dump(fd, sequence, kind, body_len, &mut snapshot)?;
+    }
+    Ok(snapshot)
+}
+
+fn interface_name(bytes: &[u8]) -> io::Result<[u8; 16]> {
+    if bytes.is_empty() || bytes.len() >= 16 || bytes.contains(&0) {
+        return Err(malformed("invalid topology interface name"));
+    }
+    let mut name = [0; 16];
+    name[..bytes.len()].copy_from_slice(bytes);
+    Ok(name)
+}
+
+fn netlink_name(bytes: &[u8]) -> io::Result<[u8; 16]> {
+    let Some((&0, name)) = bytes.split_last() else {
+        return Err(malformed("unterminated topology interface name"));
+    };
+    interface_name(name)
+}
+
+fn ip_address(family: u8, bytes: &[u8]) -> io::Result<IpAddr> {
+    match (family, bytes.len()) {
+        (2, 4) => Ok(IpAddr::V4(Ipv4Addr::from(
+            <[u8; 4]>::try_from(bytes).unwrap(),
+        ))),
+        (10, 16) => Ok(IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(bytes).unwrap(),
+        ))),
+        _ => Err(malformed("invalid topology address extent")),
+    }
+}
+
+fn unspecified(family: u8) -> Option<IpAddr> {
+    match family {
+        2 => Some(Ipv4Addr::UNSPECIFIED.into()),
+        10 => Some(Ipv6Addr::UNSPECIFIED.into()),
+        _ => None,
+    }
+}
+
+fn network_address(address: IpAddr, prefix: u8) -> bool {
+    match address {
+        IpAddr::V4(ip) => {
+            prefix <= 32 && u32::from(ip).checked_shl(prefix.into()).unwrap_or(0) == 0
+        }
+        IpAddr::V6(ip) => {
+            prefix <= 128 && u128::from(ip).checked_shl(prefix.into()).unwrap_or(0) == 0
+        }
+    }
+}
+
+fn exact_u32(bytes: &[u8]) -> io::Result<u32> {
+    let value = bytes
+        .try_into()
+        .map_err(|_| malformed("invalid topology integer extent"))?;
+    Ok(u32::from_ne_bytes(value))
+}
+
+fn unique_attribute(seen: &mut u64, kind: u16) -> io::Result<()> {
+    if kind < 64 {
+        let bit = 1u64 << kind;
+        if *seen & bit != 0 {
+            return Err(malformed("duplicate topology attribute"));
+        }
+        *seen |= bit;
+    }
+    Ok(())
+}
+
+fn route_socket(watch: bool) -> io::Result<OwnedFd> {
     // SAFETY: socket takes scalar arguments and returns a new owned descriptor.
     let raw = unsafe {
         libc::socket(
@@ -184,7 +510,11 @@ fn route_socket() -> io::Result<OwnedFd> {
     let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     address.nl_family = libc::AF_NETLINK as libc::sa_family_t;
     // Subscribe before dumping, including both rule families.
-    address.nl_groups = 1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400;
+    address.nl_groups = if watch {
+        1 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400
+    } else {
+        0
+    };
     // SAFETY: address is complete and alive during bind.
     if unsafe {
         libc::bind(
@@ -198,15 +528,16 @@ fn route_socket() -> io::Result<OwnedFd> {
     }
     let ipv6_rules: libc::c_int = 19;
     // SAFETY: the supplied option is a live integer, for RTNLGRP_IPV6_RULE.
-    if unsafe {
-        libc::setsockopt(
-            raw,
-            270,
-            1,
-            (&ipv6_rules as *const libc::c_int).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
-    } < 0
+    if watch
+        && unsafe {
+            libc::setsockopt(
+                raw,
+                270,
+                1,
+                (&ipv6_rules as *const libc::c_int).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        } < 0
     {
         return Err(io::Error::last_os_error());
     }
@@ -352,16 +683,34 @@ struct Snapshot {
     routes: Vec<Route>,
 }
 
+#[derive(Clone)]
 struct Link {
     index: u32,
     plain_up_ethernet: bool,
     loopback: bool,
+    name: Option<[u8; 16]>,
+    mtu: Option<u32>,
+    kind: Option<[u8; 16]>,
+    flags: u32,
+    master: u32,
+    arphrd: u16,
 }
+#[derive(Clone)]
 struct Address {
     family: u8,
     index: u32,
     unicast_source: bool,
+    address: IpAddr,
+    peer: Option<IpAddr>,
+    prefix_len: u8,
+    flags: u32,
+    scope: u8,
+    label: Option<[u8; 16]>,
+    unsupported: bool,
+    permanent: bool,
+    preferred: bool,
 }
+#[derive(Clone)]
 struct Rule {
     family: u8,
     priority: u32,
@@ -369,7 +718,12 @@ struct Rule {
     mark: Option<u32>,
     mask: u32,
     simple: bool,
+    action: u8,
+    iif: Option<[u8; 16]>,
+    flags: u32,
+    unsupported: bool,
 }
+#[derive(Clone)]
 struct Route {
     family: u8,
     table: u32,
@@ -379,6 +733,16 @@ struct Route {
     simple: bool,
     native_multicast: bool,
     ipv4_destination: Option<Ipv4Addr>,
+    destination: Option<IpAddr>,
+    prefix_len: u8,
+    metric: u32,
+    protocol: u8,
+    scope: u8,
+    flags: u32,
+    gateway: Option<IpAddr>,
+    source: Option<IpAddr>,
+    preference: u8,
+    unsupported: bool,
 }
 
 impl Snapshot {
@@ -432,34 +796,53 @@ impl Snapshot {
                 }
                 let index = u32_at(body, 4)?;
                 let flags = u32_at(body, 8)?;
-                let mut plain =
-                    u16::from_ne_bytes([body[2], body[3]]) == 1 && flags & 0x10001 == 0x10001;
+                let arphrd = u16::from_ne_bytes([body[2], body[3]]);
+                let mut link = Link {
+                    index,
+                    plain_up_ethernet: arphrd == 1 && flags & 0x10001 == 0x10001,
+                    loopback: flags & 8 != 0,
+                    name: None,
+                    mtu: None,
+                    kind: None,
+                    flags,
+                    master: 0,
+                    arphrd,
+                };
                 let mut parent = index;
-                let mut link_kind = None;
+                let mut seen = 0;
                 attributes(&body[16..], |kind, value| {
                     match kind {
-                        5 => parent = u32_at(value, 0)?,
-                        10 if u32_at(value, 0)? != 0 => plain = false,
-                        18 => attributes(value, |kind, name| {
-                            if kind == 1 {
-                                link_kind = Some(name);
-                            }
-                            Ok(())
-                        })?,
+                        3 | 4 | 5 | 10 | 18 => unique_attribute(&mut seen, kind)?,
+                        _ => {}
+                    }
+                    match kind {
+                        3 => link.name = Some(netlink_name(value)?),
+                        4 => link.mtu = Some(exact_u32(value)?),
+                        5 => parent = exact_u32(value)?,
+                        10 => {
+                            link.master = exact_u32(value)?;
+                            link.plain_up_ethernet &= link.master == 0;
+                        }
+                        18 => {
+                            let mut seen_info = 0;
+                            attributes(value, |kind, value| {
+                                if kind == 1 {
+                                    unique_attribute(&mut seen_info, kind)?;
+                                    link.kind = Some(netlink_name(value)?);
+                                }
+                                Ok(())
+                            })?;
+                        }
                         _ => {}
                     }
                     Ok(())
                 })?;
-                plain &= match link_kind {
-                    Some(b"veth\0") => true,
+                link.plain_up_ethernet &= match link.kind {
+                    Some(name) if name == interface_name(b"veth")? => true,
                     None => parent == index,
                     _ => false,
                 };
-                self.links.push(Link {
-                    index,
-                    plain_up_ethernet: plain,
-                    loopback: flags & 8 != 0,
-                });
+                self.links.push(link);
             }
             20 => {
                 if body.len() < 8 {
@@ -471,49 +854,90 @@ impl Snapshot {
                 }
                 let mut address = None;
                 let mut local = None;
+                let mut flags = u32::from(body[2]);
+                let mut label = None;
+                let mut unsupported = false;
+                let mut permanent = true;
+                let mut preferred = true;
+                let mut seen = 0;
                 attributes(&body[8..], |kind, value| {
-                    let slot = match kind {
-                        1 => &mut address,
-                        2 => &mut local,
-                        _ => return Ok(()),
-                    };
-                    if slot.replace(unicast_source(family, value)?).is_some() {
-                        return Err(malformed("duplicate topology source address"));
+                    unique_attribute(&mut seen, kind)?;
+                    match kind {
+                        1 => address = Some(ip_address(family, value)?),
+                        2 => local = Some(ip_address(family, value)?),
+                        3 => label = Some(netlink_name(value)?),
+                        6 => {
+                            if value.len() != 16 {
+                                return Err(malformed("invalid topology address cache info"));
+                            }
+                            permanent =
+                                u32_at(value, 0)? == u32::MAX && u32_at(value, 4)? == u32::MAX;
+                            preferred = u32_at(value, 0)? != 0 && u32_at(value, 4)? != 0;
+                        }
+                        8 => flags = exact_u32(value)?,
+                        11 if value.len() == 1 && value[0] == 0 => {}
+                        _ => unsupported = true,
                     }
                     Ok(())
                 })?;
+                let ip = local
+                    .or(address)
+                    .ok_or_else(|| malformed("missing topology source address"))?;
+                let unicast_source = match ip {
+                    IpAddr::V4(ip) => unicast_source(family, &ip.octets())?,
+                    IpAddr::V6(ip) => unicast_source(family, &ip.octets())?,
+                };
                 self.addresses.push(Address {
                     family,
                     index: u32_at(body, 4)?,
-                    unicast_source: local
-                        .or(address)
-                        .ok_or_else(|| malformed("missing topology source address"))?,
+                    unicast_source,
+                    address: ip,
+                    peer: address.filter(|peer| *peer != ip),
+                    prefix_len: body[1],
+                    flags,
+                    scope: body[3],
+                    label,
+                    unsupported,
+                    permanent,
+                    preferred,
                 });
             }
             32 => {
                 if body.len() < 12 {
                     return Err(malformed("short topology rule"));
                 }
-                if !matches!(body[0], 2 | 10) {
-                    return Ok(());
-                }
+                let flags = u32_at(body, 8)?;
                 let mut rule = Rule {
                     family: body[0],
                     priority: 0,
                     table: u32::from(body[4]),
                     mark: None,
                     mask: 0,
-                    simple: body[1..4] == [0, 0, 0] && body[7] == 1 && u32_at(body, 8)? == 0,
+                    simple: body[1..4] == [0, 0, 0] && body[7] == 1 && flags == 0,
+                    action: body[7],
+                    iif: None,
+                    flags,
+                    unsupported: body[1..4] != [0, 0, 0] || body[5..7] != [0, 0],
                 };
+                let mut seen = 0;
                 attributes(&body[12..], |kind, value| {
+                    unique_attribute(&mut seen, kind)?;
                     match kind {
-                        6 => rule.priority = u32_at(value, 0)?,
-                        10 => rule.mark = Some(u32_at(value, 0)?),
-                        15 => rule.table = u32_at(value, 0)?,
-                        16 => rule.mask = u32_at(value, 0)?,
-                        14 if u32_at(value, 0)? == u32::MAX => {}
-                        18 | 21 => {}
-                        _ => rule.simple = false,
+                        3 => {
+                            rule.iif = Some(netlink_name(value)?);
+                            rule.simple = false;
+                        }
+                        6 => rule.priority = exact_u32(value)?,
+                        10 => rule.mark = Some(exact_u32(value)?),
+                        15 => rule.table = exact_u32(value)?,
+                        16 => rule.mask = exact_u32(value)?,
+                        14 if exact_u32(value)? == u32::MAX => {}
+                        18 if value.is_empty() => {}
+                        21 if value.len() == 1 => {}
+                        _ => {
+                            rule.simple = false;
+                            rule.unsupported = true;
+                        }
                     }
                     Ok(())
                 })?;
@@ -522,9 +946,6 @@ impl Snapshot {
             24 => {
                 if body.len() < 12 {
                     return Err(malformed("short topology route"));
-                }
-                if !matches!(body[0], 2 | 10) {
-                    return Ok(());
                 }
                 let mut route = Route {
                     family: body[0],
@@ -535,17 +956,31 @@ impl Snapshot {
                     simple: body[2] == 0 && body[3] == 0 && u32_at(body, 8)? == 0,
                     native_multicast: body[0] == 10 && body[1] == 8 && body[7] == 5,
                     ipv4_destination: None,
+                    destination: unspecified(body[0]),
+                    prefix_len: body[1],
+                    metric: 0,
+                    protocol: body[5],
+                    scope: body[6],
+                    flags: u32_at(body, 8)?,
+                    gateway: None,
+                    source: None,
+                    preference: 0,
+                    unsupported: body[2] != 0 || body[3] != 0,
                 };
                 let mut multicast_destination = None;
+                let mut seen = 0;
                 attributes(&body[12..], |kind, value| {
+                    unique_attribute(&mut seen, kind)?;
                     match kind {
                         1 => {
-                            let exact = value.len() == 16
-                                && value[0] == 0xff
-                                && value[1..].iter().all(|&byte| byte == 0);
-                            if multicast_destination.replace(exact).is_some() {
-                                return Err(malformed("duplicate topology route destination"));
-                            }
+                            multicast_destination = Some(
+                                value.len() == 16
+                                    && value[0] == 0xff
+                                    && value[1..].iter().all(|&byte| byte == 0),
+                            );
+                            // XDP historically refuses malformed non-/32 destinations at
+                            // admission rather than parsing them as usable multicast.
+                            route.destination = ip_address(route.family, value).ok();
                             if body[0] == 2 && body[1] == 32 {
                                 route.ipv4_destination = Some(Ipv4Addr::from(
                                     <[u8; 4]>::try_from(value)
@@ -553,19 +988,431 @@ impl Snapshot {
                                 ));
                             }
                         }
-                        4 => route.output = u32_at(value, 0)?,
-                        15 => route.table = u32_at(value, 0)?,
-                        5 | 6 | 7 | 8 | 12 | 20 | 23 => {}
-                        _ => route.simple = false,
+                        4 => route.output = exact_u32(value)?,
+                        5 => route.gateway = Some(ip_address(route.family, value)?),
+                        6 => route.metric = exact_u32(value)?,
+                        7 => route.source = Some(ip_address(route.family, value)?),
+                        12 => {
+                            if value.len() != 32 {
+                                return Err(malformed("invalid topology route cache info"));
+                            }
+                            route.unsupported |= u32_at(value, 8)? != 0 || u32_at(value, 12)? != 0;
+                        }
+                        15 => route.table = exact_u32(value)?,
+                        20 if value.len() == 1 && matches!(value[0], 0 | 1 | 3) => {
+                            route.preference = value[0];
+                        }
+                        8 | 23 => route.unsupported = true,
+                        _ => {
+                            route.simple = false;
+                            route.unsupported = true;
+                        }
                     }
                     Ok(())
                 })?;
+                route.unsupported |= route
+                    .destination
+                    .is_none_or(|ip| !network_address(ip, route.prefix_len))
+                    || (route.prefix_len != 0 && multicast_destination.is_none());
                 route.native_multicast &= route.simple && multicast_destination == Some(true);
                 self.routes.push(route);
             }
             _ => unreachable!(),
         }
         Ok(())
+    }
+
+    fn admit_tun(
+        &self,
+        spec: &TunSpec<'_>,
+        name: [u8; 16],
+        owned: Option<(u32, TunStage)>,
+    ) -> io::Result<()> {
+        let mut indices = HashSet::new();
+        let mut names = HashSet::new();
+        let vrf = interface_name(b"vrf")?;
+        for link in &self.links {
+            if link.index == 0
+                || !indices.insert(link.index)
+                || link.name.is_none_or(|name| !names.insert(name))
+                || link.kind == Some(vrf)
+            {
+                return Err(unsupported("TUN requires unique named links without VRFs"));
+            }
+        }
+        let ifindex = owned.map(|(index, _)| index);
+        if let Some(index) = ifindex {
+            if !self.tun_link(spec, index) {
+                return Err(unsupported(
+                    "owned TUN name, MTU, kind, flags or master changed",
+                ));
+            }
+        } else if self.links.iter().any(|link| link.name == Some(name)) {
+            return Err(unsupported("TUN name is already occupied"));
+        }
+        let expected_addresses: Vec<_> = spec.addresses().collect();
+        let mut found_addresses = HashSet::new();
+        for address in &self.addresses {
+            if Some(address.index) == ifindex {
+                let flags = IFA_F_PERMANENT
+                    | IFA_F_NOPREFIXROUTE
+                    | if address.family == 10 { IFA_F_NODAD } else { 0 };
+                if !expected_addresses.contains(&address.address)
+                    || !found_addresses.insert(address.address)
+                    || address.prefix_len != if address.family == 2 { 32 } else { 128 }
+                    || address.flags != flags
+                    || address.scope != 0
+                    || address.peer.is_some()
+                    || address.unsupported
+                    || !address.permanent
+                    || address.label.is_some_and(|label| label != name)
+                {
+                    return Err(unsupported(
+                        "owned TUN addresses do not match the exact permanent host keys",
+                    ));
+                }
+            } else if expected_addresses.contains(&address.address)
+                || address
+                    .peer
+                    .is_some_and(|peer| expected_addresses.contains(&peer))
+            {
+                return Err(unsupported(
+                    "TUN address is already occupied on another link",
+                ));
+            }
+        }
+        if owned.is_some() && found_addresses.len() != expected_addresses.len() {
+            return Err(unsupported("owned TUN address is missing"));
+        }
+        if let Some(index) = ifindex {
+            for address in &expected_addresses {
+                if !self.routes.iter().any(|route| {
+                    route.table == 255
+                        && route.kind == 2
+                        && route.destination == Some(*address)
+                        && route.output == index
+                        && route.prefix_len == if address.is_ipv4() { 32 } else { 128 }
+                }) {
+                    return Err(unsupported("owned TUN address lacks its exact local route"));
+                }
+            }
+        }
+        let expected_rules = spec.rules();
+        let mut seen_rules = Vec::with_capacity(expected_rules.len());
+        for rule in &self.rules {
+            let reserved = (spec.rule_priority..=spec.rule_priority + 4).contains(&rule.priority);
+            if reserved {
+                let key = owned.and_then(|_| {
+                    self.tun_rule_key(spec, &expected_rules, rule, ifindex.unwrap_or(0), false)
+                });
+                if key.is_none() || seen_rules.contains(&key) {
+                    return Err(unsupported(
+                        "TUN priority range contains a foreign or duplicate rule",
+                    ));
+                }
+                seen_rules.push(key);
+            } else if rule.table == spec.table {
+                return Err(unsupported("another rule references the TUN capture table"));
+            } else if matches!(rule.family, 2 | 10) && !Self::system_tun_rule(rule) {
+                return Err(unsupported(
+                    "TUN requires only standard local, main and default operator rules",
+                ));
+            }
+        }
+        if owned.is_some() && seen_rules.len() != expected_rules.len() {
+            return Err(unsupported(
+                "TUN requires all five exact rules per enabled family",
+            ));
+        }
+        for ipv6 in spec.families() {
+            let family = if ipv6 { 10 } else { 2 };
+            for (priority, required) in [(0, true), (32766, true), (32767, false)] {
+                let count = self
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.family == family && rule.priority == priority)
+                    .count();
+                if count > 1 || (required && count != 1) {
+                    return Err(unsupported(
+                        "TUN requires unique standard local and main rules",
+                    ));
+                }
+            }
+        }
+        let mut expected_routes = spec.guard_routes();
+        if let Some((index, TunStage::Active)) = owned {
+            expected_routes.extend(spec.capture_routes(index));
+        }
+        let mut seen_routes = Vec::with_capacity(expected_routes.len());
+        for route in &self.routes {
+            if route.table == spec.table {
+                let key = owned.and_then(|(index, _)| self.tun_route_key(spec, route, index));
+                if key.is_none_or(|key| !expected_routes.contains(&key))
+                    || seen_routes.contains(&key)
+                {
+                    return Err(unsupported(
+                        "TUN capture table contains a foreign, wrong-stage or duplicate route",
+                    ));
+                }
+                seen_routes.push(key);
+            } else if matches!(route.family, 2 | 10) && route.table == 255 {
+                let own_local = route.kind == 2
+                    && route.prefix_len == if route.family == 2 { 32 } else { 128 }
+                    && route
+                        .destination
+                        .is_some_and(|destination| expected_addresses.contains(&destination));
+                if route.unsupported
+                    || route.flags != 0
+                    || !matches!(route.kind, 2..=5)
+                    || (Some(route.output) == ifindex && !own_local && !route.native_multicast)
+                {
+                    return Err(unsupported(
+                        "TUN requires representable local routes without alternate capture paths",
+                    ));
+                }
+            } else if matches!(route.family, 2 | 10) && matches!(route.table, 253 | 254) {
+                if !self.operator_tun_route(route, ifindex) {
+                    return Err(unsupported(
+                        "operator main/default routes must be verifiable and avoid the TUN",
+                    ));
+                }
+            } else if route.output != 0 && Some(route.output) == ifindex {
+                return Err(unsupported("another routing table selects the owned TUN"));
+            }
+        }
+        if owned.is_some() && seen_routes.len() != expected_routes.len() {
+            return Err(unsupported(
+                "TUN capture table is missing an exact guard or active route",
+            ));
+        }
+        for ipv6 in spec.families() {
+            let family = if ipv6 { 10 } else { 2 };
+            if !self.routes.iter().any(|route| {
+                route.family == family && route.table == 254 && route.kind == 1 && route.default
+                    && self.addresses.iter().any(|address| {
+                        address.family == family && address.index == route.output
+                            && address.unicast_source && address.preferred && address.scope == 0
+                            && address.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED | 0x20) == 0
+                            && (family != 10 || !matches!(address.address, IpAddr::V6(ip) if ip.is_unicast_link_local() || ip.to_ipv4_mapped().is_some()))
+                            && route.source.is_none_or(|source| source == address.address)
+                    })
+            }) {
+                return Err(unsupported("each enabled TUN family needs a non-TUN main default and usable uplink source"));
+            }
+        }
+        Ok(())
+    }
+
+    fn tun_link(&self, spec: &TunSpec<'_>, index: u32) -> bool {
+        // tun_net_initialize sets POINTOPOINT|NOARP|MULTICAST; an attached,
+        // administratively up queue also reports RUNNING|LOWER_UP.
+        self.links.iter().any(|link| {
+            link.index == index
+                && interface_name(spec.name.as_bytes()).ok() == link.name
+                && link.mtu == Some(spec.mtu)
+                && link.kind == interface_name(b"tun").ok()
+                && link.arphrd == 0xfffe
+                && link.flags == 0x110d1
+                && link.master == 0
+        })
+    }
+
+    fn system_tun_rule(rule: &Rule) -> bool {
+        !rule.unsupported
+            && rule.flags == 0
+            && rule.action == 1
+            && rule.mark.is_none()
+            && rule.mask == 0
+            && rule.iif.is_none()
+            && matches!(
+                (rule.priority, rule.table),
+                (0, 255) | (32766, 254) | (32767, 253)
+            )
+    }
+
+    fn operator_tun_route(&self, route: &Route, owned: Option<u32>) -> bool {
+        if route.unsupported
+            || route.flags != 0
+            || !matches!(route.scope, 0 | 253)
+            || !matches!(route.kind, 1 | RTN_BLACKHOLE | 7 | FR_ACT_PROHIBIT | 9)
+        {
+            return false;
+        }
+        if route.kind != 1 {
+            return (route.output == 0
+                || (route.family == 10
+                    && self
+                        .links
+                        .iter()
+                        .any(|link| link.index == route.output && link.loopback)))
+                && route.gateway.is_none()
+                && route.source.is_none();
+        }
+        Some(route.output) != owned
+            && self.links.iter().any(|link| {
+                let direct_link = link.kind.is_none()
+                    || [
+                        b"veth".as_slice(),
+                        b"bridge",
+                        b"bond",
+                        b"vlan",
+                        b"macvlan",
+                        b"ipvlan",
+                        b"team",
+                    ]
+                    .iter()
+                    .any(|kind| interface_name(kind).ok() == link.kind);
+                link.index == route.output
+                    && link.flags & 1 != 0
+                    && !link.loopback
+                    && link.master == 0
+                    && direct_link
+            })
+            && route.source.is_none_or(|source| {
+                self.addresses.iter().any(|address| {
+                    address.index == route.output
+                        && address.address == source
+                        && address.unicast_source
+                        && address.preferred
+                        && address.flags & (IFA_F_TENTATIVE | IFA_F_DADFAILED | 0x20) == 0
+                })
+            })
+    }
+
+    fn tun_rule_key(
+        &self,
+        spec: &TunSpec<'_>,
+        expected: &[TunRule],
+        rule: &Rule,
+        ifindex: u32,
+        cleanup: bool,
+    ) -> Option<TunRule> {
+        if rule.unsupported || !matches!(rule.family, 2 | 10) {
+            return None;
+        }
+        let name = interface_name(spec.name.as_bytes()).ok()?;
+        let selector = match (rule.mark, rule.mask, rule.iif) {
+            (Some(mark), u32::MAX, None) => TunRuleSelector::Fwmark(mark),
+            (None, 0, Some(iif)) if iif == name => TunRuleSelector::Iif,
+            (None, 0, None) => TunRuleSelector::All,
+            _ => return None,
+        };
+        let detached = cleanup
+            && selector == TunRuleSelector::Iif
+            && !self
+                .links
+                .iter()
+                .any(|link| link.index == ifindex || link.name == Some(name));
+        if rule.flags != if detached { FIB_RULE_IIF_DETACHED } else { 0 } {
+            return None;
+        }
+        if selector == TunRuleSelector::Iif && !detached && !self.tun_link(spec, ifindex) {
+            return None;
+        }
+        let action = match (rule.action, rule.table) {
+            (1, table) if table != 0 => TunRuleAction::Lookup(table),
+            (FR_ACT_PROHIBIT, 0) => TunRuleAction::Prohibit,
+            _ => return None,
+        };
+        let key = TunRule {
+            ipv6: rule.family == 10,
+            priority: rule.priority,
+            selector,
+            action,
+        };
+        expected.contains(&key).then_some(key)
+    }
+
+    fn tun_route_key(&self, spec: &TunSpec<'_>, route: &Route, ifindex: u32) -> Option<TunRoute> {
+        if route.unsupported
+            || route.protocol != RTPROT_STATIC
+            || route.flags != 0
+            || route.gateway.is_some()
+            || route.source.is_some()
+            || route.preference != 0
+        {
+            return None;
+        }
+        let kind = match route.kind {
+            RTN_BLACKHOLE
+                if route.scope == 0
+                    && (route.output == 0
+                        || (route.family == 10
+                            && self
+                                .links
+                                .iter()
+                                .any(|link| link.index == route.output && link.loopback))) =>
+            {
+                TunRouteKind::Blackhole
+            }
+            1 if ifindex != 0
+                && route.output == ifindex
+                && self.tun_link(spec, ifindex)
+                && route.scope == if route.family == 2 { 253 } else { 0 } =>
+            {
+                TunRouteKind::Unicast { oif: ifindex }
+            }
+            _ => return None,
+        };
+        let key = TunRoute {
+            table: route.table,
+            destination: route.destination?,
+            prefix_len: route.prefix_len,
+            kind,
+            metric: route.metric,
+        };
+        let metric = match kind {
+            TunRouteKind::Blackhole => TUN_GUARD_METRIC,
+            TunRouteKind::Unicast { .. } => TUN_CAPTURE_METRIC,
+        };
+        (key.table == spec.table
+            && key.metric == metric
+            && spec.capture.contains(&(key.destination, key.prefix_len)))
+        .then_some(key)
+    }
+
+    fn tun_readback(&self, spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback> {
+        let expected_rules = spec.rules();
+        let mut readback = TunReadback {
+            link: self.links.iter().any(|link| link.index == ifindex),
+            addresses: self
+                .addresses
+                .iter()
+                .filter(|address| address.index == ifindex)
+                .map(|address| (address.address, address.prefix_len))
+                .collect(),
+            routes: Vec::new(),
+            rules: Vec::new(),
+        };
+        for route in self.routes.iter().filter(|route| route.table == spec.table) {
+            let destination = route
+                .destination
+                .ok_or_else(|| malformed("unrepresentable route in TUN cleanup table"))?;
+            readback.routes.push((
+                route.table,
+                destination,
+                route.prefix_len,
+                route.metric,
+                self.tun_route_key(spec, route, ifindex),
+            ));
+        }
+        for rule in self
+            .rules
+            .iter()
+            .filter(|rule| (spec.rule_priority..=spec.rule_priority + 4).contains(&rule.priority))
+        {
+            if !matches!(rule.family, 2 | 10) {
+                return Err(unsupported(
+                    "unrepresentable rule family in TUN cleanup priority range",
+                ));
+            }
+            readback.rules.push((
+                rule.family == 10,
+                rule.priority,
+                self.tun_rule_key(spec, &expected_rules, rule, ifindex, true),
+            ));
+        }
+        Ok(readback)
     }
 
     fn admit(
@@ -595,7 +1442,8 @@ impl Snapshot {
             }
         }
         if self.routes.iter().any(|route| {
-            route.table == 255
+            matches!(route.family, 2 | 10)
+                && route.table == 255
                 && !route.native_multicast
                 && (route.kind == 1 || captured_logical.contains(&route.output))
         }) {
@@ -684,6 +1532,8 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod tun;
 
     fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
         let length = value.len() + 4;
@@ -879,11 +1729,7 @@ mod tests {
     #[test]
     fn global_ipv6_host_address_on_loopback_requires_ipv6_bypass_proof() {
         let mut snapshot = topology();
-        snapshot.links.push(Link {
-            index: 1,
-            plain_up_ethernet: false,
-            loopback: true,
-        });
+        snapshot.links.push(xdp_link(1, false, true));
         snapshot
             .push(20, &address_body(2, 1, &[127, 0, 0, 1], None))
             .unwrap();
@@ -904,11 +1750,7 @@ mod tests {
             .iter()
             .map(|rule| Rule {
                 family: 10,
-                priority: rule.priority,
-                table: rule.table,
-                mark: rule.mark,
-                mask: rule.mask,
-                simple: rule.simple,
+                ..rule.clone()
             })
             .collect();
         snapshot.rules.extend(ipv6_rules);
@@ -945,80 +1787,82 @@ mod tests {
         let mut snapshot = topology();
         snapshot.rules[1] = parsed.rules.pop().unwrap();
         assert!(snapshot.admit(&[2], &[2], 128).is_ok());
-        body.extend_from_slice(&8u16.to_ne_bytes());
-        body.extend_from_slice(&3u16.to_ne_bytes());
-        body.extend_from_slice(b"lo\0\0");
+        attribute(&mut body, 3, b"lo\0");
         parsed.push(32, &body).unwrap();
         snapshot.rules[1] = parsed.rules.pop().unwrap();
         assert!(snapshot.admit(&[2], &[2], 128).is_err());
     }
 
+    fn xdp_link(index: u32, plain: bool, loopback: bool) -> Link {
+        let mut body = vec![0; 16];
+        body[2..4].copy_from_slice(&(if plain { 1u16 } else { 0xfffe }).to_ne_bytes());
+        body[4..8].copy_from_slice(&index.to_ne_bytes());
+        body[8..12].copy_from_slice(&(if loopback { 9u32 } else { 0x10001 }).to_ne_bytes());
+        let mut snapshot = Snapshot::default();
+        snapshot.push(16, &body).unwrap();
+        snapshot.links.pop().unwrap()
+    }
+
+    fn xdp_address(family: u8, index: u32) -> Address {
+        let ip = if family == 2 {
+            vec![192, 0, 2, 1]
+        } else {
+            "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets().to_vec()
+        };
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .push(20, &address_body(family, index, &ip, None))
+            .unwrap();
+        snapshot.addresses.pop().unwrap()
+    }
+
+    fn xdp_rule(family: u8, priority: u32, table: u32, mark: Option<u32>) -> Rule {
+        let mut body = vec![0; 12];
+        body[0] = family;
+        body[7] = 1;
+        attribute(&mut body, 6, &priority.to_ne_bytes());
+        attribute(&mut body, 15, &table.to_ne_bytes());
+        if let Some(mark) = mark {
+            attribute(&mut body, 10, &mark.to_ne_bytes());
+            attribute(&mut body, 16, &u32::MAX.to_ne_bytes());
+        }
+        let mut snapshot = Snapshot::default();
+        snapshot.push(32, &body).unwrap();
+        snapshot.rules.pop().unwrap()
+    }
+
+    fn xdp_route(family: u8, table: u32, output: u32, default: bool, kind: u8) -> Route {
+        let mut body = vec![0; 12];
+        body[0] = family;
+        body[7] = kind;
+        if !default {
+            body[1] = if family == 2 { 24 } else { 64 };
+            let destination = if family == 2 {
+                vec![192, 0, 2, 0]
+            } else {
+                "2001:db8::".parse::<Ipv6Addr>().unwrap().octets().to_vec()
+            };
+            attribute(&mut body, 1, &destination);
+        }
+        attribute(&mut body, 15, &table.to_ne_bytes());
+        attribute(&mut body, 4, &output.to_ne_bytes());
+        let mut snapshot = Snapshot::default();
+        snapshot.push(24, &body).unwrap();
+        snapshot.routes.pop().unwrap()
+    }
+
     fn topology() -> Snapshot {
         Snapshot {
-            links: vec![
-                Link {
-                    index: 2,
-                    plain_up_ethernet: true,
-                    loopback: false,
-                },
-                Link {
-                    index: 3,
-                    plain_up_ethernet: true,
-                    loopback: false,
-                },
-            ],
-            addresses: vec![Address {
-                family: 2,
-                index: 3,
-                unicast_source: true,
-            }],
+            links: vec![xdp_link(2, true, false), xdp_link(3, true, false)],
+            addresses: vec![xdp_address(2, 3)],
             rules: vec![
-                Rule {
-                    family: 2,
-                    priority: 0,
-                    table: 255,
-                    mark: None,
-                    mask: 0,
-                    simple: true,
-                },
-                Rule {
-                    family: 2,
-                    priority: 100,
-                    table: 100,
-                    mark: Some(128),
-                    mask: u32::MAX,
-                    simple: true,
-                },
-                Rule {
-                    family: 2,
-                    priority: 32766,
-                    table: 254,
-                    mark: None,
-                    mask: 0,
-                    simple: true,
-                },
+                xdp_rule(2, 0, 255, None),
+                xdp_rule(2, 100, 100, Some(128)),
+                xdp_rule(2, 32766, 254, None),
             ],
             routes: vec![
-                Route {
-                    family: 2,
-                    table: 100,
-                    output: 3,
-                    default: true,
-                    kind: 1,
-                    simple: true,
-                    native_multicast: false,
-                    ipv4_destination: None,
-                },
-                Route {
-                    family: 2,
-                    table: 254,
-                    output: 2,
-                    default: false,
-                    kind: 1,
-                    simple: true,
-                    native_multicast: false,
-                    ipv4_destination: None,
-                },
+                xdp_route(2, 100, 3, true, 1),
+                xdp_route(2, 254, 2, false, 1),
             ],
         }
     }
@@ -1030,21 +1874,13 @@ mod tests {
         snapshot.routes[0].output = 2;
         assert!(snapshot.admit(&[2], &[2], 128).is_err());
         snapshot.routes[0].output = 3;
-        snapshot.addresses.push(Address {
-            family: 10,
-            index: 2,
-            unicast_source: true,
-        });
+        snapshot.addresses.push(xdp_address(10, 2));
         assert!(snapshot.admit(&[2], &[2], 128).is_err());
         snapshot.addresses.pop();
         snapshot.rules[1].mask = 255;
         assert!(snapshot.admit(&[2], &[2], 128).is_err());
         snapshot.rules[1].mask = u32::MAX;
-        snapshot.addresses.push(Address {
-            family: 10,
-            index: 3,
-            unicast_source: true,
-        });
+        snapshot.addresses.push(xdp_address(10, 3));
         assert!(snapshot.admit(&[2], &[2], 128).is_err());
     }
 
@@ -1070,11 +1906,7 @@ mod tests {
     fn captured_vlan_marked_routes_are_refused_regardless_of_link_shape() {
         for plain_up_ethernet in [false, true] {
             let mut snapshot = topology();
-            snapshot.links.push(Link {
-                index: 4,
-                plain_up_ethernet,
-                loopback: false,
-            });
+            snapshot.links.push(xdp_link(4, plain_up_ethernet, false));
             snapshot.routes[0].output = 4;
             assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
         }
@@ -1083,41 +1915,15 @@ mod tests {
     #[test]
     fn external_uplink_accepts_unnumbered_captured_vlan_downstream() {
         let mut snapshot = topology();
-        snapshot.links.push(Link {
-            index: 4,
-            plain_up_ethernet: false,
-            loopback: false,
-        });
-        snapshot.routes.push(Route {
-            family: 2,
-            table: 254,
-            output: 4,
-            default: false,
-            kind: 1,
-            simple: true,
-            native_multicast: false,
-            ipv4_destination: None,
-        });
+        snapshot.links.push(xdp_link(4, false, false));
+        snapshot.routes.push(xdp_route(2, 254, 4, false, 1));
         assert!(snapshot.admit(&[2], &[2, 4], 128).is_ok());
         for family in [2, 10] {
-            snapshot.addresses.push(Address {
-                family,
-                index: 4,
-                unicast_source: true,
-            });
+            snapshot.addresses.push(xdp_address(family, 4));
             assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
             snapshot.addresses.pop();
         }
-        snapshot.routes.push(Route {
-            family: 2,
-            table: 255,
-            output: 4,
-            default: false,
-            kind: 2,
-            simple: true,
-            native_multicast: false,
-            ipv4_destination: None,
-        });
+        snapshot.routes.push(xdp_route(2, 255, 4, false, 2));
         assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
     }
 

@@ -12,6 +12,82 @@ fn exported(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        for (source, destination) in [
+            ("10.0.0.2:40000", "203.0.113.9:443"),
+            ("[fd00::2]:40000", "[2001:db8::9]:443"),
+        ] {
+            let now = Instant::now();
+            let (source, destination): (SocketAddr, SocketAddr) =
+                (source.parse().unwrap(), destination.parse().unwrap());
+            let mut cfg = config();
+            cfg.fragment_limits.timeout = Duration::from_millis(20);
+            let (scope, owner) =
+                PacketScope::new(cfg, MemoryBudget::new(32 << 20), limits(), now).unwrap();
+            let mut peer = Stack::new(config(), now);
+            let mut first = [0; 1280];
+            let length = peer
+                .udp_send_from(source, destination, &[7; 4000], &mut first)
+                .unwrap();
+            assert_eq!(scope.receive(&first[..length], now), Rx::Consumed);
+            let due = now + Duration::from_millis(20);
+            let mut driver = owner.hand_off();
+            let (writer, reader) = std::os::unix::net::UnixDatagram::pair().unwrap();
+            writer.set_nonblocking(true).unwrap();
+            reader.set_nonblocking(true).unwrap();
+            let mut cx = context();
+            let more = crate::tun::service_turn(&mut driver, &mut cx, now, |driver, cx| {
+                for class in [TxClass::Control, TxClass::Bulk] {
+                    assert!(exported(driver, cx, class).is_none());
+                }
+                assert_eq!(driver.deadline(), Some(due));
+                // Expiry crosses after the last output poll, with no further ingress.
+                std::thread::sleep(due.saturating_duration_since(Instant::now()));
+                assert!(Instant::now() >= due);
+                Ok(false)
+            })
+            .unwrap();
+            assert!(!more, "the empty output pass supplied no continuation");
+            assert_eq!(scope.0.inner.lock().queued, 0, "finalization must not strand an unexported ICMP packet");
+            assert_eq!(driver.deadline(), Some(due), "overdue work must remain a next-turn trigger");
+            let mut packet = [0; 1280];
+            assert!(matches!(reader.recv(&mut packet), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+
+            tokio::time::sleep_until(tokio::time::Instant::from_std(driver.deadline().unwrap())).await;
+            let mut emitted = 0;
+            crate::tun::service_turn(&mut driver, &mut cx, Instant::now(), |driver, cx| {
+                for class in [TxClass::Control, TxClass::Bulk] {
+                    if let Some(output) = exported(driver, cx, class) {
+                        assert_eq!(writer.send(output.packet())?, output.packet().len());
+                        output.release();
+                        emitted += 1;
+                    }
+                }
+                Ok(false)
+            })
+            .unwrap();
+            assert_eq!(emitted, 1, "the deadline alone must deliver the expired fragment's reply");
+            let length = reader.recv(&mut packet).unwrap();
+            let ip = wire::parse_ip(&packet[..length]).unwrap();
+            assert_eq!((ip.src, ip.dst), (destination.ip(), source.ip()));
+            let message = &packet[ip.payload];
+            assert_eq!((message[0], message[1]), (if source.is_ipv6() { 3 } else { 11 }, 1));
+            assert_eq!(&message[8..], &first[..if source.is_ipv6() { 56 } else { 28 }]);
+            assert!(matches!(reader.recv(&mut packet), Err(error) if error.kind() == io::ErrorKind::WouldBlock));
+            assert_eq!(driver.deadline(), None);
+            scope.shutdown(true);
+            driver.service(&mut cx, Instant::now());
+            assert!(owner.reclaim().await);
+            owner.run().await;
+        }
+    })
+    .await
+    .expect("expiry after the output pass must reach the next turn without fresh input");
+}
+
 #[tokio::test]
 async fn driven_scope_progresses_from_application_work_without_ingress() {
     tokio::time::timeout(Duration::from_secs(5), async {

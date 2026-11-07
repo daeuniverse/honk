@@ -35,6 +35,60 @@ fn admit_with_limits(
     )
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn tun_offline_admission_uses_the_runtime_policy_validator() {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    let temp = tempfile::tempdir().unwrap();
+    let loaded = fixture(
+        temp.path(),
+        "datapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n table: 202\n rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n }",
+    );
+    let active = loaded.config.clone();
+    admit(loaded.clone(), &active)
+        .expect("valid Endpoint TUN needs no live device for offline admission");
+    for fact in [
+        "default_mark",
+        "rule_mark",
+        "pname",
+        "not_pname",
+        "mac",
+        "not_mac",
+        "nfqueue",
+        "lan",
+        "wan",
+    ] {
+        let mut candidate = loaded.clone();
+        let mut rule = RoutingRule {
+            name: "unsupported-tun-fact".into(),
+            condition: RoutingCondition::default(),
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        };
+        match fact {
+            "default_mark" => candidate.config.routing.default_mark = 1,
+            "rule_mark" => rule.mark = 1,
+            "pname" => rule.condition.process_name = vec!["curl".into()],
+            "not_pname" => rule.condition.not.process_name = vec!["curl".into()],
+            "mac" => rule.condition.mac = vec!["02:00:00:00:00:01".into()],
+            "not_mac" => rule.condition.not.mac = vec!["02:00:00:00:00:01".into()],
+            "nfqueue" => candidate.config.global.nfqueue_enable = true,
+            "lan" => candidate.config.global.lan_interface = vec!["eth0".into()],
+            "wan" => candidate.config.global.wan_interface = vec!["eth0".into()],
+            _ => unreachable!(),
+        }
+        candidate.config.routing.rules.push(rule);
+        let error = admit(candidate, &active)
+            .err()
+            .expect("unavailable TUN facts must fail offline admission");
+        assert_eq!(error.diagnostic.code, "invalid-datapath-config", "{fact}");
+    }
+    assert!(!temp.path().join("state").exists());
+}
+
 #[test]
 fn effective_root_overrides_requested_data_directory() {
     let temp = tempfile::tempdir().unwrap();

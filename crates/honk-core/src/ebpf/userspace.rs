@@ -1,4 +1,4 @@
-//! Software policy publication for the XDP runtime; capture ownership stays with that runtime.
+//! Software policy publication for packet backends; capture ownership stays with their runtime.
 
 use super::policy_state::PolicyState;
 use super::*;
@@ -43,7 +43,7 @@ impl PolicyBackend for UserspaceBackend {
     }
 
     fn observe_datapath(&self) -> DatapathObservation {
-        let mut result = DatapathObservation::unknown(DatapathKind::XdpUserspace);
+        let mut result = DatapathObservation::unknown(DatapathKind::PacketUserspace);
         result.routing = if self.policy.routing_generation.is_some() {
             DatapathCheck::Verified
         } else {
@@ -111,7 +111,7 @@ impl PolicyBackend for UserspaceBackend {
                     | DATAPATH_FLAG_NFQ_READY
                     | DATAPATH_FLAG_TRACE_ENABLED)
                 == 0,
-            "XDP software policy cannot enable NFQUEUE or kernel route witnesses"
+            "packet software policy cannot enable NFQUEUE or kernel route witnesses"
         );
         self.flags = flags;
         Ok(())
@@ -216,7 +216,7 @@ mod tests {
             3
         );
         let observed = backend.observe_datapath();
-        assert_eq!(observed.kind, DatapathKind::XdpUserspace);
+        assert_eq!(observed.kind, DatapathKind::PacketUserspace);
         assert_eq!(observed.programs, DatapathCheck::Unknown);
         assert_eq!(observed.hooks, DatapathCheck::Unknown);
         assert_eq!(observed.conn_state_capacity, None);

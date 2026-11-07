@@ -24,7 +24,7 @@ For scalar settings, only an unquoted token-head `#` starts a comment. `use_host
 
 ## Standalone listener (`bind`)
 
-The standalone listener uses ordinary, unmarked sockets in the host network namespace. Disabling it does not disable transparent TCP/UDP port-53 interception, which follows [traffic-rule ownership](./routing.md#outbound-targets-and-must).
+The standalone listener uses ordinary host-netns sockets, unmarked for TC/XDP and ordinary embeddings. With `backend: tun`, each listener strictly sets and reads back the effective `global.so_mark_from_dae` before bind/listen; accepted TCP children inherit it so remote replies escape capture. TUN resolves and retains hostname bind candidates before any routing change, then binds after its configured addresses exist. Answers from both standalone transports belong to TUN's actual registered packet realm, even on loopback/LAN binds; they do not populate HOST facts. Persistent TCP rechecks current packet admission per frame. Disabling the listener does not disable captured TCP/UDP port-53 DNS, which follows [traffic-rule ownership](./routing.md#outbound-targets-and-must) and the selected Direct execution profile. See [TUN DNS ownership](../design/dns.md#ingress-paths).
 
 | Value | Result |
 | --- | --- |
@@ -40,7 +40,7 @@ A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fr
 
 Listener ownership is process-scoped. A SIGHUP reload accepts semantically equivalent spelling, but rejects any change to the host, port, or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver; restrict source access with the host firewall and never publish it to an untrusted network.
 
-Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
+On TC, listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine). TUN's standard local RPDB rule handles local destinations before capture; captured Direct uses Endpoint relay, not TC native delivery.
 
 ## Hosts snapshot (`use_host`)
 

@@ -135,10 +135,11 @@ impl DnsController {
         &self,
         stream: &mut TcpStream,
         client_addr: SocketAddr,
+        fact_scope: honk_datapath::ScopeId,
     ) -> anyhow::Result<()> {
         stream.set_nodelay(true)?;
         let _ = self
-            .serve_tcp_frames(stream, client_addr, None, honk_datapath::ScopeId::HOST)
+            .serve_tcp_frames(stream, client_addr, None, fact_scope)
             .await?;
         Ok(())
     }

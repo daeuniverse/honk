@@ -49,7 +49,7 @@ The standalone UDP listener runs `min(runtime workers, 4)` receive supervisors o
 | Path | Socket and destination model | Reply model |
 | --- | --- | --- |
 | Transparent port 53, without a terminal user `must` result | Valid queries admitted under [traffic-rule ownership](../reference/routing.md#outbound-targets-and-must) enter `DnsController`. | Transparent UDP uses an anyfrom socket bound to the original destination; TCP replies on the intercepted stream. Request action `asis` creates a new query to that destination on honk-originated sockets, preserving TCP/UDP including UDP `TC` fallback to TCP, not the client's network source. |
-| Standalone `dns.bind` | Selected TCP/UDP sockets are ordinary unmarked sockets in the host network namespace. They have no intercepted destination. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
+| Standalone `dns.bind` | Ordinary host-netns sockets with no intercepted destination; unmarked for TC/XDP/ordinary embeddings, required bypass-marked before bind/listen for TUN. | TCP replies on the accepted socket. UDP uses packet info so a wildcard bind replies from the exact local address and interface that received the query. |
 
 Native `direct(must)` leaves the original source IP/port untouched by honk, subject to external firewall/NAT. DNS bypassed by native direct or raw group transport contributes no answers to honk's routing projection. Anyfrom is the client-facing reply leg, not upstream source spoofing. Private-DNS bypass migration belongs in the [routing reference](../reference/routing.md#explicit-local-rules).
 
@@ -59,6 +59,12 @@ The control plane owns [TCP handoff and UDP per-packet admission](./control-plan
 
 Stale refresh and preferred-family siblings retain the initiating `DnsRequestMeta`. Source-aware flow resolution without an intercepted destination fails closed when policy selects `asis`.
 
+Configured TUN is the standalone-listener mark exception. Before any capture rule or blackhole is installed, `PacketEndpoints::prepare_dns_bind(&Config)` resolves the enabled endpoint and retains its nonempty actual address candidates in `PreparedDnsBind`, with transport and port. The TUN setup creates configured addresses before the actual bind; startup consumes these exact candidates rather than invoking NSS after containment. Disabled listening yields `None`; enabled TUN listening without prepared candidates rejects startup.
+
+Each TUN listener socket is created, strictly set/read back to effective bypass mark M, then bound/listened and converted to Tokio. Accepted TCP inherits M; UDP retains packet-info source selection. The bind stays an ordinary host-netns service with peer-derived source and `original_dst=None`. TC/XDP/ordinary embeddings retain unmarked standalone sockets. Clash/native API listeners follow the same TUN pre-bind/listen mark ordering so replies to captured remote clients escape through main.
+
+The configured TUN listener's `fact_scope` is its one actual registered non-HOST `PacketScope`, even when bound to loopback or a LAN address. UDP uses current packet-query admission in that scope; persistent TCP rechecks current packet admission for every frame. Transparent packet UDP53/TCP DNS use the same actual realm, including Host-generated captured packets: bare L3 is not HostFacts and cannot select `ScopeId::HOST`. TC/XDP/non-TUN standalone callers explicitly retain HOST. No tuple-wide DNS permit cache, HOST-bitmap copy, second server or second projector is introduced.
+
 The standalone listener has these lifecycle and admission invariants:
 
 - It binds every selected transport synchronously and all-or-nothing before starting a supervisor. One bind failure closes the partial set and fails startup.
@@ -66,7 +72,7 @@ The standalone listener has these lifecycle and admission invariants:
 - Its UDP ingress profile clamps the advertised response size to `512..=1232`. Packet-info provenance preserves wildcard reply source selection.
 - TCP uses persistent RFC 7766 two-octet framing. Each length read, body read, and response write has a 30-second bound.
 - Standalone TCP may consume at most one quarter of the process-wide connection budget. Each frame on a persistent connection separately enters the DNS query budget.
-- `DnsListener` is process-scoped and owned by `ControlPlane::run`. Shutdown stops admission, drains or aborts children, and joins every supervisor before DNS runtime retirement.
+- `DnsListener` is process-scoped: `ControlPlane::run` owns it for TC, and the configured packet supervisor owns it for XDP/TUN. Shutdown stops admission, drains or aborts children, and joins every supervisor before DNS runtime retirement.
 - A semantic `dns.bind` change on SIGHUP is restart-required. An unchanged listener continues through the newly published DNS generation.
 - Standalone requests pass `original_dst=None`; selecting `asis` therefore produces a DNS failure (`SERVFAIL`) rather than dialing the listener recursively.
 
@@ -74,7 +80,7 @@ Leaving `dns.bind` empty does not disable transparent TCP/UDP interception. A lo
 
 ## DNS ownership state machine
 
-This matrix distinguishes LAN ingress from ordinary host/loopback delivery. `Transparent Honk` requires the real eBPF datapath and attached LAN hooks; mock mode cannot intercept packets. `must` suppresses sniff-driven rerouting and preserves the selected outbound, not a blanket bypass of processing.
+This matrix describes TC LAN ingress versus ordinary host/loopback delivery. Its transparent interception requires the real eBPF datapath and attached LAN hooks; mock mode cannot intercept packets. TUN instead follows its explicit Endpoint profile and actual packet realm above, including for Direct; it has no native `direct(must)` escape. `must` suppresses sniff-driven rerouting and preserves the selected outbound, not a blanket bypass of processing.
 
 | Query path | Traffic-policy result | Receiver | Answer path |
 | --- | --- | --- | --- |

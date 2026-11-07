@@ -1,7 +1,120 @@
-# eBPF 内核数据路径
+# Linux 捕获数据路径
 
-内核数据路径负责流量拦截。用户态路径见[控制平面](./control-plane.md)，持有首包的 UDP 路径见 [NFQUEUE](./nfqueue.md)。
+Linux capture 向共享用户态策略和出站路径交付流量。用户态路径见[控制平面](./control-plane.md)，TC 持有首包的 UDP 路径见 [NFQUEUE](./nfqueue.md)。
 
+## Linux TUN Endpoint
+
+`backend: tun; direct: endpoint` 选择 daemon-owned Linux TUN 路径。
+[全局参考](../reference/global.md#linux-tun-endpoint)列出完整语法、必填资源值、
+准入及精确五条 RPDB rule。TUN 通过真实 FD 消费已有 scoped Stack、canonical
+Router、DNS projector 与出站流初始化器，不创建 TC hook、NFQUEUE、`dae0` 或
+`daens`，不依赖 `ebpf` feature，拒绝 `--mock-ebpf`。
+
+唯一 `TunDevice` 以 `O_RDWR|O_NONBLOCK|O_CLOEXEC` 打开 `/dev/net/tun`。
+`TUNSETIFF` 使用 `IFF_TUN|IFF_NO_PI|IFF_TUN_EXCL`；`TUNGETIFF` 核对实际
+TUN/NO_PI 并拒绝 multi-queue、VNET_HDR 与 NAPI，不要求回读仅创建时有意义的
+EXCL 位。`TUNSETOFFLOAD(0)` 仅允许完整普通 L3 包与软件校验和。只有一个
+reader/writer，不 dup/继承 FD，不支持 persistent、外部 FD 或接管已有链路。
+
+### Setup 与就绪
+
+1. 完成静态/runtime 准入，取得真实 instance lock，初始化 required 精确旁路
+   mark M，并用真实 TCP/UDP socket 核对。在任何 rule/blackhole 变更前，
+   `prepare_dns_bind(&Config)` 解析并保留启用 bind endpoint 的实际 `SocketAddr`
+   候选。失败在改路前拒绝启动；关闭监听时返回 `None`。
+2. 先订阅 rtnetlink 再 snapshot。拒绝已占用的名称/表/五个优先级以及不支持的
+   RPDB/main/default 拓扑。先创建私有 setup receipt，持久化 create intent，
+   再执行 exclusive TUN ioctl；立即记录实际 netns cookie、ifindex 与 attachment
+   incarnation。设置 MTU、明确地址、自有 link sysctl 与 UP，逐项记录 ACK/回读。
+3. 每项变更前先写 intent，安装 capture prefix 的 static blackhole（metric
+   32760）和五条 rule；此时不安装 unicast capture，Endpoint 未 ready 期间所选
+   prefix 由 guard 拒绝，不能原生漏过。
+4. 通过共享 capture helper 创建唯一非 HOST `PacketScope` 及原 owner，调用
+   `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
+   prepared_dns_addresses)`。最后一参是真实 `Option<PreparedDnsBind>`，保存
+   endpoint 与已解析候选，不是布尔开关或再次解析请求。等待 `owner.poll_ready`
+   时仍须服务唯一 `PacketDriver` 的 timer/output，包括失败启动清理；DNS bind、
+   软件 flags 与订阅 authorization 全部 ready 后才继续。
+5. 回读 link/address/offload/rule，安装并回读 metric-1024 capture route；保留旧
+   watch 的同时建立最终 `Topology::admit_tun` 订阅及完整 snapshot。全部准入成功
+   后才开共享 gate，调用 `capture_ready()`，报告 `TUN datapath ready`、lifecycle
+   Running 和 sd_notify READY。close 不能在此竞争中被绕过。
+
+Receipt 位于 `<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`，
+create-new、mode 0600、拒绝 symlink。它记录完整源码 SHA、PID/starttime、实际
+netns/link/attachment identity，以及精确 address/route/rule key 的
+Intent/Acknowledged/Removed 状态，每次转换都持久化并 fsync。仅删除已确认仍属
+本实例的对象；归属不明时保留对象和 receipt，不用 receipt 自动重放或接管。
+
+两个地址族的 active capture route 使用 metric 1024，static blackhole guard
+仍为 32760。Linux 会规范化 IPv6 metric 0，IPv4 route delete 的 metric 0
+则表示通配，因此 1024 是相对初始 metric-0 设计的明确表示调整。Exclusive
+create、回读及 exact delete 都包含 table、family、prefix、output interface
+和 metric，移除 active route 时不能选中 guard。
+
+操作者保持 main/WAN/LAN 路由、源地址、forwarding、NAT、防火墙稳定。每个启用
+地址族都须有非 TUN 的有效 main uplink 与源地址；main/default 不得通过 unicast、
+multipath、nexthop、VRF 或 lwt 路径引用 TUN。额外早期/local rule、VRF/l3mdev、
+未知 selector/action 均拒绝，不近似解释。route/address/link/rule 变化、ENOBUFS、
+dump 中断/未知解析或 ifindex 替换都会 sticky invalidation 并关闭捕获。订阅不是
+抵御任意并发 root 改路的原子栅栏，保留 guard 也不是完整宿主防火墙 kill switch。
+
+### FD 报文管线
+
+FD read 接收 kernel egress；FD write 注入**新的 interface ingress 包**，不能恢复
+原始 skb。capture 选中的 Host/Transit TCP/UDP 走真实 FD read → 注册 scope 的
+`receive_with_source` → Stack → canonical initializer/Router → 真实 outbound →
+生成 output lease → 同一 FD write。Direct 明确终止并新建 dial。策略只见实际
+L3 source/destination/DSCP；scope、tuple、mark、TUN 地址均不能认证 Host origin
+或进程身份，不恢复 pre-DNAT/pre-SNAT 或原 socket 语义。capture/reply 腿不能改写
+这些策略输入。
+
+RX 复用一个已计费的 65576-byte buffer，完整验证软件校验和，一轮共用同一个
+入口时间戳。长度不符、截断或协商外 representation 不能截短成合法 Stack 包。
+借用 UDP 在下一次 read 前经既有 funded ingress 接纳/复制。source callback 仅
+检查该 scope/attachment 的真实 reverse consumer 存活，不写 FD、不阻塞、不重入
+scope mutex。
+
+Owner 在有界 RX 前后服务 driver deadline。RX 每轮最多 32 次 syscall 尝试/包、
+1 MiB 或 1 ms，EINTR 也计数，最多每八包检查一次时间；最后一个完整 record
+可让 byte 限额最多超出 65575 bytes。TX 交替先服务 Control/Bulk，每类别最多
+32 个输出，保留固定 pending lease 槽，并有独立 syscall/byte/time 上限。这是
+调度限额，不是可抢占 syscall 的硬期限。同类别先重试 pending，再导出新输出。
+
+| TUN write 结果 | 所有权 |
+| --- | --- |
+| 完整包长度 | 内核接受这一个 record，锁外释放 lease；不代表远端交付或 TCP ACK。 |
+| EAGAIN/EWOULDBLOCK | 原 lease、bytes、scope、FlowId 保持在该类别队首，注册 writable 后重试该记录。 |
+| EINTR | 保留同一 lease，在有限 syscall 预算内重试/让出。 |
+| 零或短写 | 致命 packet-boundary violation，禁止写 suffix 或重发整包；保留已报告的部分结果，明确处置本地所有权。 |
+| 其他错误 | 致命 owner I/O failure，不回退后端或由其他 executor 重放；模糊提交结果保持模糊。 |
+
+仅 EAGAIN 才清 readiness。空闲前注册 readable，仅 blocked pending 注册 writable，
+并注册 topology/driver/close/supervisor waker 与最早真实 driver deadline，再重查。
+无 flow/deadline/pending 时没有周期数据面 timer；TUN 没有 XSK CQ/FILL 后备轮询。
+任何 scope/config/Router/projection 锁均不跨 await。
+
+### 停止与失败保留
+
+正常 operator stop 先关 admission、移除 metric-1024 capture route，让 prefix 命中
+guard，再停止 FD RX，同时保留 setup/watcher/FD/driver。`endpoints.close()` 先关
+协议准入，再停止 DNS/command 准入。不再发送新协议输出；pending/closing lease
+锁外明确处置，同时继续 driver service 和 `owner.poll_join_plane`，直到 TCP/UDP
+initializer、source/receiver、retirement、DNS 与原 scope owner 真正 join。
+`shutdown_wait_connections` 不提供自然结束宽限。
+
+Supervisor 返回真实 `(ControlPlane, result)` 后关闭唯一 FD，确认自有 link 消失，
+仅删除 receipt 记录且仍证明属于本实例的对象。全部业务清理成功后，先删除 P+4，
+再清 guard/table、bypass/return rule，最后删除 receipt。这个显式 stop 恢复普通
+main 路由；之后进行软件 policy cleanup 和已有 API/订阅 shutdown。
+
+Runtime failure、crash 或未确认清理时保留 blackhole/rule 与 receipt，返回错误。
+先停源并核对精确归属再由操作者清理，不按名称/表盲删后重启。Drop 只同步关闭
+本地 admission/endpoint、处置本地 lease、归还驱动权并关闭 FD，不做 rtnetlink
+清理或成功 ack。原 supervisor 在原 Tokio runtime 上继续持有 joined cleanup，
+嵌入方必须保持该 runtime 存活。不自动重开 FD、接管资源、回退 TC/XDP 或执行
+Native 续行。HostFacts（S-b）、导入前 Native（S-c）、FD-read 后 captured return
+（S-d）均未实现；这条 S-a Endpoint 路径不代表 E6.4 完成。
 ## Full-XDP 启动
 
 未配置 `datapath` 时仍默认使用 TC。Full-XDP 是显式选择的真实 daemon 后端，不是 XSK fixture，也不会回退到 TC/NFQUEUE/TUN：

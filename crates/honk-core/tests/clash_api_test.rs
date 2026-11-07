@@ -983,6 +983,78 @@ async fn test_put_and_patch_without_content_type() {
 }
 
 #[tokio::test]
+async fn test_configs_reports_accepted_tun_device_and_address_families() {
+    let app = spawn_app("", "").await;
+    for (addresses, capture, ipv6) in [
+        ("address4: 198.18.0.1/32", "0.0.0.0/0", false),
+        ("address6: fd00:686f:6e6b:100::1/128", "::/0", true),
+        (
+            "address4: 198.18.0.1/32\naddress6: fd00:686f:6e6b:100::1/128",
+            "0.0.0.0/0\n::/0",
+            true,
+        ),
+    ] {
+        let parsed = honk_config::parser::parse_dae_config(&format!(
+            "datapath {{\n backend: tun\n direct: endpoint\n tun {{\n\
+             name: honk-test\n mtu: 1420\n {addresses}\n table: 202\n\
+             rule_priority: 10000\n capture {{\n {capture}\n }}\n }}\n }}"
+        ))
+        .unwrap();
+        let mut config = app.state.config.read().await.as_ref().clone();
+        config.datapath = parsed.datapath;
+        config.validate_assembled().unwrap();
+        *app.state.config.write().await = Arc::new(config);
+
+        let body: serde_json::Value = http_client()
+            .get(app.url("/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["tun"],
+            serde_json::json!({
+                "enable": true,
+                "device": "honk-test",
+                "mtu": 1420,
+                "stack": "honk",
+            })
+        );
+        assert_eq!(body["ipv6"], ipv6);
+    }
+    for backend in [None, Some("tc"), Some("xdp")] {
+        let mut config = app.state.config.read().await.as_ref().clone();
+        config.datapath = backend.map(|backend| {
+            let fields = if backend == "xdp" {
+                "direct: endpoint\n interface { eth-test: wan }"
+            } else {
+                ""
+            };
+            honk_config::parser::parse_dae_config(&format!(
+                "datapath {{\n backend: {backend}\n {fields}\n }}"
+            ))
+            .unwrap()
+            .datapath
+            .unwrap()
+        });
+        config.validate_assembled().unwrap();
+        *app.state.config.write().await = Arc::new(config);
+        let body: serde_json::Value = http_client()
+            .get(app.url("/configs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(body["tun"], serde_json::json!({"enable": false}));
+        assert_eq!(body["ipv6"], false);
+    }
+}
+
+#[tokio::test]
 async fn test_configs_additive_safe_diagnostics_snapshot() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("private-input.dae");

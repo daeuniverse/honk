@@ -75,7 +75,7 @@ async fn native_log_keeps_admission_refusal_and_forward_failure() {
     let source = server.peer_addr().unwrap();
     let task = tokio::spawn(async move {
         controller
-            .serve_bound_tcp_dns(&mut server, source)
+            .serve_bound_tcp_dns(&mut server, source, honk_datapath::ScopeId::HOST)
             .await
             .unwrap();
     });
@@ -334,6 +334,7 @@ async fn bound_tcp_connection_uses_shared_persistent_frame_loop() {
             .serve_bound_tcp_dns(
                 &mut server,
                 "127.0.0.1:10007".parse().expect("client address"),
+                honk_datapath::ScopeId::HOST,
             )
             .await
     });
@@ -357,6 +358,7 @@ async fn bound_tcp_connection_closes_after_idle_timeout() {
             .serve_bound_tcp_dns(
                 &mut server,
                 "127.0.0.1:10008".parse().expect("client address"),
+                honk_datapath::ScopeId::HOST,
             )
             .await
     });
@@ -403,7 +405,11 @@ async fn dns_flow_tracks_each_persistent_frame_and_actual_delivery() {
     let source = server.peer_addr().unwrap();
     let task = tokio::spawn(async move {
         observer
-            .scope(controller.serve_bound_tcp_dns(&mut server, source))
+            .scope(controller.serve_bound_tcp_dns(
+                &mut server,
+                source,
+                honk_datapath::ScopeId::HOST,
+            ))
             .await
     });
     for txid in [1, 2] {
@@ -446,7 +452,11 @@ async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
         let source = server.peer_addr().unwrap();
         let task = tokio::spawn(async move {
             observer
-                .scope(controller.serve_bound_tcp_dns(&mut server, source))
+                .scope(controller.serve_bound_tcp_dns(
+                    &mut server,
+                    source,
+                    honk_datapath::ScopeId::HOST,
+                ))
                 .await
         });
         write_tcp_query(&mut client, &query_with_txid("first.example", 1)).await;

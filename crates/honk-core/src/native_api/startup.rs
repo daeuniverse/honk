@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
+use anyhow::Context;
+
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -37,17 +39,11 @@ impl NativeRuntime {
         engine_level: EngineLevel,
         log_binding: &LogBinding,
     ) -> anyhow::Result<Self> {
-        let listen = control_plane
-            .config_handle()
-            .read()
-            .await
-            .experimental
-            .native_api
-            .listen
-            .clone();
-        let listener = tokio::net::TcpListener::bind(&listen)
-            .await
-            .map_err(|_| anyhow::anyhow!("native API listener bind failed"))?;
+        let listener = {
+            let config = control_plane.config_handle();
+            let config = config.read().await;
+            bind_listener(&config).context("native API listener bind failed")?
+        };
         let listen = listener.local_addr()?;
         let state = NativeState::with_observation(
             control_plane,
@@ -132,6 +128,22 @@ impl NativeRuntime {
     }
 }
 
+fn bind_listener(config: &honk_config::Config) -> std::io::Result<tokio::net::TcpListener> {
+    let listen = config
+        .experimental
+        .native_api
+        .listen
+        .parse::<std::net::SocketAddr>()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let egress_mark = config
+        .datapath
+        .as_ref()
+        .is_some_and(|datapath| datapath.backend == honk_config::datapath::Backend::Tun)
+        .then(|| config.global.effective_so_mark());
+    honk_outbound::util::bind_tcp_listener(listen, egress_mark)
+        .and_then(tokio::net::TcpListener::from_std)
+}
+
 /// Sweeps every directory a configuration or geodata write stages into; runs before the
 /// coordinator exists, so no temporary file of this process can be caught.
 fn remove_stale_temporaries(sources: Option<&SourceUpdate>, config_path: &Path) {
@@ -155,6 +167,50 @@ fn remove_stale_temporaries(sources: Option<&SourceUpdate>, config_path: &Path) 
     for directory in directories {
         for path in config_write::remove_stale_temporaries(directory) {
             info!(target: "honk_core", path = %path.display(), message = "removed stale configuration write temporary file");
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires real SO_MARK in the disposable VM; run via just test-netns"]
+    async fn netns_tun_listener_marks_accepted_sockets() {
+        assert!(
+            std::fs::read_to_string("/proc/cmdline")
+                .unwrap()
+                .contains("virtme.")
+        );
+        let mut config = honk_config::parser::parse_dae_config(
+            "global { nfqueue_enable: false }\n\
+             datapath {\n backend: tun\n direct: endpoint\n tun {\n\
+             name: honk0\n address4: 198.18.0.1/32\n table: 202\n\
+             rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n }",
+        )
+        .unwrap();
+        config.global.so_mark_from_dae = 0x37ff_ffff;
+        for listen in ["127.0.0.1:0", "[::1]:0"] {
+            config.experimental.native_api.listen = listen.into();
+            let listener = bind_listener(&config).unwrap();
+            assert_eq!(
+                socket2::SockRef::from(&listener).mark().unwrap(),
+                config.global.effective_so_mark()
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (accepted, _) = listener.accept().await.unwrap();
+                assert_eq!(
+                    socket2::SockRef::from(&accepted).mark().unwrap(),
+                    config.global.effective_so_mark()
+                );
+                drop(client);
+            })
+            .await
+            .unwrap();
         }
     }
 }

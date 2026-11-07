@@ -65,6 +65,10 @@ TC 后端仅在设为 `shutdown_wait_connections: true`，且正常关闭、数�
 
 XDP 后端先关闭抓包准入并安装 guard，再中止 packet endpoint 并等待其输出/CQ 拆卸完成。此开关不为 XDP packet TCP 连接提供自然结束的宽限期；仍须等待所持有的拆卸工作完成。
 
+TUN 先关闭准入、移除活动 capture route，再 join Endpoint 清理，整个排空期间
+保留 blackhole guard。正常确认停止后才移除自有策略资源；失败时保留 guard 与
+setup receipt。该开关不为 TUN packet 连接提供自然结束宽限。
+
 这不是优雅重启，也不限制总退出时间：[持有的清理及阻塞工作](../design/control-plane.md#终止所有权)仍须完成。
 
 ## 套接字 mark
@@ -73,8 +77,12 @@ XDP 后端先关闭抓包准入并安装 guard，再中止 packet endpoint 并�
 非零值会在 connect/send 之前原样应用，包括代理承载连接、bootstrap/DNS、
 健康检查、订阅与 UI 下载。数据路径按配置值精确匹配旁路；仅含有 `0x100`
 这一位并不能免于拦截。透明监听套接字使用相同 mark 供内核识别；
-accept 得到的 TCP 客户端套接字会清除此 mark。独立 `dns.bind` 入口仍是
-普通的无 mark 本地服务。
+accept 得到的 TC TCP 客户端 socket 会清除此 mark。TC/XDP 与普通嵌入的独立
+`dns.bind` 保持无 mark。TUN 要求全部 physical egress socket 设置有效 mark，
+并在捕获前用真实 TCP/UDP socket set/readback；required 模式传播全部 mark
+错误，包括权限拒绝。其独立 DNS、Clash、native API socket 均在 bind/listen 前
+设置并回读 mark，accepted TCP child 保留该值，防止远端服务回复重新进入捕获；
+API 授权规则不变。
 
 dae 全局标量保留 honk 既有的十六进制优先规则：`10` 与 `0x10` 都表示 16；
 格式错误或溢出文本会产生诊断，并回退到原始值 `0`，即实际 `0x100`。
@@ -261,11 +269,125 @@ Core 当前的带输入上下文 FIB 契约会拒绝非零 IPv6 flow label，以
 路由器专用扩展头/options 执行。Endpoint 支持 IPv6 并不证明这些数据包组合在
 Core 中具有等价执行授权。
 
+### Linux TUN Endpoint
+
+通过 `backend: tun` 和 `direct: endpoint` 显式选择 TUN。honk 新建并独占一个
+非 persistent、单队列 Linux TUN；下列值由操作者选择，不是全局保留的默认资源：
+
+```dae
+global {
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    dial_mode: ip
+}
+datapath {
+    backend: tun
+    direct: endpoint
+    tun {
+        name: honk0
+        mtu: 1500
+        address4: 198.18.0.1/32
+        address6: fd00:686f:6e6b:100::1/128
+        table: 202
+        rule_priority: 10000
+        capture {
+            0.0.0.0/0
+            ::/0
+        }
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+| `tun` 字段 | 必需值与准入 |
+| --- | --- |
+| `name` | 必填；1–15 个 ASCII 字节，仅限 `[A-Za-z0-9_.-]`，拒绝 `lo` 和 `auto`。该 netns 内必须尚无同名链路，绝不接管或替换已有链路。 |
+| `mtu` | 可省略，默认 `1500`；整数 `1280..=65535`。 |
+| `address4` / `address6` | 至少配置一个，严格使用 `/32`、`/128` 主机前缀。拒绝 unspecified、multicast、broadcast、mapped IPv6、link-local 及重复的本地地址。 |
+| `table` | 必填；`1..=0xfffffffe`，排除 `253..=255`。任何现存 route/rule 都不得使用此专用表。 |
+| `rule_priority` | 必填，首优先级 P；`P >= 1` 且 checked `P+4 < 32766`。五个优先级 `[P,P+4]` 必须全部空闲。 |
+| `capture { ... }` | 必填，1–64 条已配置地址族内的规范 CIDR 网络。拒绝 host bits 及互相包含的冗余前缀；排序并去重。仅接受裸前缀，不接受键值条目或嵌套块。 |
+
+TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
+`xsk_mode`、显式 `poll_mode`、`busy_poll`、`firewall`、非空 `nat` 及
+`direct: core` 或 `native`。未知字段以及
+合并 sections/includes 后重复的标量/块均拒绝；结构化输入使用同一校验。
+这是新增的显式选择，既有配置不改变含义，无须 TUN 迁移。
+
+要求 Linux、`/dev/net/tun`、创建/配置 TUN 和应用 `SO_MARK` 的权限，不能传
+`--mock-ebpf`。必须显式关闭 NFQUEUE，并保持 `global.lan_interface`/
+`wan_interface` 为空。拒绝非零 traffic rule/default mark、MAC 与进程名谓词
+（包括否定谓词）。既有四种 dial mode 均可使用；示例选择 `ip`。
+
+对每个已启用地址族，honk 验证系统 priority-0 local rule，并安装恰好五条自有
+RPDB rule；M 为有效 `global.so_mark_from_dae`，T 为 `tun.table`，P 为
+`tun.rule_priority`：
+
+| 优先级 | 精确匹配 | 动作 |
+| --- | --- | --- |
+| P | `fwmark M/0xffffffff` | `lookup main` |
+| P+1 | `fwmark M/0xffffffff` | `prohibit` |
+| P+2 | `iif <tun.name>` | `lookup main` |
+| P+3 | `iif <tun.name>` | `prohibit` |
+| P+4 | 全部流量 | `lookup T` |
+
+系统 local rule 先执行，32766/32767 的普通 main/default rule 保留。T 中每条
+capture prefix 先安装 metric 32760 的 static blackhole guard，Endpoint 启动后
+才加入经 TUN 的 metric-1024 unicast route。不复制 main 表，不合成私网豁免。
+daemon socket 经 P/P+1 旁路；写入 TUN 的回复作为新 interface ingress 进入
+内核，经 P+2/P+3 回程。main 缺路由时终止，不重新进入 TUN。
+
+两个地址族的 active capture 都使用 metric 1024：Linux 会规范化 IPv6 的
+metric 0，而 IPv4 删除时 metric 0 表示通配。这是相对初始 metric-0 设计的
+明确 Linux 表示调整。Exclusive create、回读与删除均使用完整 route key：
+table、地址族、prefix、output interface 和 metric。Blackhole guard 保持 32760。
+
+操作者持有 main/default 路由、WAN/LAN 地址、NAT、防火墙及 forwarding 开关，
+并须保持拓扑稳定。每个已启用族都须有可用源地址和非 TUN 的 main uplink；拒绝
+main/default 中经 TUN 的路径、额外 local rule、P 之前的其他 rule、VRF/l3mdev、
+未知 selector/action 及其他对 T 的引用。capture/reply 腿必须保持实际 L3 策略
+输入，不宣称外部 NAT 等价。拓扑变化或通知丢失关闭捕获；watcher 不是抵御并发
+特权路由修改的原子栅栏。仅自有 TUN 设置 `rp_filter=0`，IPv6 关闭自动地址生成/
+RA，明确配置 NODAD 地址。
+
+启用 IPv4 的 TUN 在 startup/restart setup 时读取 `net.ipv4.conf.all.rp_filter`；严格模式
+`1` 会拒绝启动，操作者须先改为 `0`（关闭）或 `2`（宽松）再重试，因为 Linux
+也会把全局设置应用于 TUN 回复入口。honk 不修改 global、WAN 或 LAN 的值，
+仅将自有 TUN 设为 `0`。IPv6 没有对应的 `rp_filter` 设置；仅 IPv6 的 TUN 不读取或拒绝此 IPv4 设置。运行期间操作者若把
+全局 IPv4 值改为严格模式，honk 不会检测该变化，回复可能失败；保持已准入的
+设置是操作者前置条件。
+
+Setup 以 create-new、拒绝符号链接、mode 0600 创建
+`<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json` receipt，记录完整源码
+SHA、PID/starttime、netns cookie、link/attachment identity 及精确 address/route/
+rule key。每次外部变更前先持久化 Intent；ACK 与 Removed 状态均持久化并 fsync。
+它只供操作者精确核对清理，不授权重放 setup、接管资源或删除归属不明对象。
+详见 [TUN setup 与拆卸](../design/datapath.md#linux-tun-endpoint)。
+
+Direct TCP/UDP 明确使用 Endpoint relay：真实 TUN FD read → scoped Stack →
+canonical Router → 新建 direct/proxy outbound → 生成回复 → 同一 FD。裸 IP
+不提供经认证的 Host/Transit 或进程身份、原 socket、pre-NAT 输入或 Native
+续行。HostFacts（S-b）、导入前 Native（S-c）与 captured return（S-d）仍未交付；
+S-a 不代表 E6.4 完成。
+
+整个规范 TUN setup、backend 与 Direct profile 都需重启；省略 MTU 与显式 1500
+等价。policy/group/DNS/订阅/mode 更新沿用既有事务，不重开 FD 或替换 scope；
+`dns.bind` 的语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
+退出，再移除自有 rule/guard 与 receipt，恢复 main 路由。失败或未确认清理时保留
+blackhole、rule 与 receipt，供停源后核对并精确清理；不自动重开、接管或回退后端。
+
+`/configs.tun` 报告已接受配置（`enable`、`device`、`mtu`、`stack: "honk"`），
+IPv6 投影由 `address6` 决定；这些字段不是就绪证明。就绪由 `capture_ready()`
+后的 lifecycle Running、`TUN datapath ready` 与 sd_notify 表达；native datapath
+可见性仍为 unknown。
+
 ### 有界自适应轮询
 
-`datapath.poll_mode` 接受 `event` 或 `adaptive`。省略表示选择 adaptive **策略**，
+XDP 的 `datapath.poll_mode` 接受 `event` 或 `adaptive`。省略表示选择 adaptive **策略**，
 不是立即进入 Busy：owner 从 Event 开始。显式 `event` 禁止主动轮询，但允许保留
-完全相同的调参与校准块，用于 Event/adaptive 对照。TC 拒绝任何显式模式（包括
+完全相同的调参与校准块，用于 Event/adaptive 对照。TC/TUN 拒绝任何显式模式（包括
 `event`）及任何 `busy_poll` 块。轮询与校准可重载而不重建设备；变更清除本地
 资格累计，但不重置进程配额或债务。
 

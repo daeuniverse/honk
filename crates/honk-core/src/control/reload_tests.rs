@@ -128,6 +128,126 @@ fn datapath_restart_identity_uses_effective_setup_not_policy() {
     assert_eq!(restart_required_changes(&xdp, &candidate), ["datapath"]);
 }
 
+fn tun_endpoint_config() -> Config {
+    honk_config::parser::parse_dae_config(
+        "global { nfqueue_enable: false }\ndatapath {\n backend: tun\n direct: endpoint\n tun {\n name: honk0\n address4: 198.18.0.1/32\n address6: fd00:686f:6e6b:100::1/128\n table: 202\n rule_priority: 10000\n capture {\n 0.0.0.0/0\n ::/0\n }\n }\n }",
+    ).unwrap()
+}
+
+#[test]
+fn tun_restart_identity_covers_every_owned_device_value() {
+    let current = tun_endpoint_config();
+    let tun = current.datapath.as_ref().unwrap().tun.as_ref().unwrap();
+    assert_eq!(tun.mtu, 1500);
+    let mut explicit = serde_json::to_value(&current).unwrap();
+    explicit["datapath"]["tun"]["mtu"] = serde_json::json!(1500);
+    let explicit: Config = serde_json::from_value(explicit).unwrap();
+    assert!(restart_required_changes(&current, &explicit).is_empty());
+    let mut policy = current.clone();
+    policy.routing.default_outbound = "block".into();
+    assert!(restart_required_changes(&current, &policy).is_empty());
+    for field in [
+        "name",
+        "mtu",
+        "address4",
+        "address6",
+        "table",
+        "rule_priority",
+        "capture",
+    ] {
+        let mut candidate = current.clone();
+        let tun = candidate.datapath.as_mut().unwrap().tun.as_mut().unwrap();
+        match field {
+            "name" => tun.name = "honk1".into(),
+            "mtu" => tun.mtu = 1280,
+            "address4" => tun.address4 = Some("198.18.0.2".parse().unwrap()),
+            "address6" => tun.address6 = Some("fd00:686f:6e6b:100::2".parse().unwrap()),
+            "table" => tun.table = 203,
+            "rule_priority" => tun.rule_priority = 10010,
+            "capture" => tun.capture = vec!["0.0.0.0/1".parse().unwrap(), "::/1".parse().unwrap()],
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            restart_required_changes(&current, &candidate),
+            ["datapath"],
+            "{field}"
+        );
+        assert_eq!(
+            restart_required_changes(&candidate, &current),
+            ["datapath"],
+            "{field}"
+        );
+    }
+    for (backend, direct) in [
+        (
+            honk_config::datapath::Backend::Tc,
+            Some(honk_config::datapath::DirectProfile::Endpoint),
+        ),
+        (
+            honk_config::datapath::Backend::Tun,
+            Some(honk_config::datapath::DirectProfile::Core),
+        ),
+    ] {
+        let mut candidate = current.clone();
+        let datapath = candidate.datapath.as_mut().unwrap();
+        datapath.backend = backend;
+        datapath.direct = direct;
+        assert_eq!(restart_required_changes(&current, &candidate), ["datapath"]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_reload_rejects_unavailable_packet_facts_before_publication() {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    let cp = test_cp().await;
+    let mut accepted = (**cp.config.read().await).clone();
+    accepted.datapath = tun_endpoint_config().datapath;
+    accepted.global.nfqueue_enable = false;
+    *cp.config.write().await = Arc::new(accepted);
+    let before = cp.config.read().await.clone();
+    let generation = cp.diagnostics.read().generation;
+    let plan = cp.active_routing_plan.read().clone();
+    for fact in [
+        "default_mark",
+        "rule_mark",
+        "pname",
+        "not_pname",
+        "mac",
+        "not_mac",
+    ] {
+        let mut candidate = (*before).clone();
+        let mut rule = RoutingRule {
+            name: "unsupported-tun-fact".into(),
+            condition: RoutingCondition::default(),
+            outbound: RoutingOutbound::Simple("direct".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        };
+        match fact {
+            "default_mark" => candidate.routing.default_mark = 1,
+            "rule_mark" => rule.mark = 1,
+            "pname" => rule.condition.process_name = vec!["curl".into()],
+            "not_pname" => rule.condition.not.process_name = vec!["curl".into()],
+            "mac" => rule.condition.mac = vec!["02:00:00:00:00:01".into()],
+            "not_mac" => rule.condition.not.mac = vec!["02:00:00:00:00:01".into()],
+            _ => unreachable!(),
+        }
+        candidate.routing.rules.push(rule);
+        assert_eq!(
+            cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+                .await,
+            ReloadOutcome::Rejected,
+            "{fact}"
+        );
+        assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+        assert!(Arc::ptr_eq(&plan, &cp.active_routing_plan.read()));
+        assert_eq!(cp.diagnostics.read().generation, generation);
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn polling_config() -> Config {
     honk_config::parser::parse_dae_config(

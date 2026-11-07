@@ -34,6 +34,37 @@ const BATCH: usize = 64;
 // Budget refunds in another scope have no protocol event in this Stack.
 const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(100);
 
+#[cfg(target_os = "linux")]
+pub(crate) const CAPTURE_MEMORY: usize = 256 << 20;
+
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_scope(
+    mtu: u32,
+    realms: usize,
+    budget: &Arc<MemoryBudget>,
+) -> anyhow::Result<(PacketScope, PacketOwner)> {
+    // ponytail: fixed per-realm partitions; rebalance only if measured tenant skew needs it.
+    let slots = (4096 / realms).min(1024);
+    let mut stack = Config::new(rand::random());
+    stack.mode = Mode::Transparent {
+        exclude: Default::default(),
+    };
+    stack.mtu = u16::try_from(mtu)?;
+    stack.max_flows = slots as u32;
+    stack.memory_limit = CAPTURE_MEMORY / 2 / realms;
+    Ok(PacketScope::new(
+        stack,
+        Arc::clone(budget),
+        RuntimeLimits {
+            max_slots: slots,
+            control_frames: 32,
+            bulk_frames: 128,
+            max_waiters: 256,
+        },
+        Instant::now(),
+    )?)
+}
+
 /// Fixed metadata and frame ceilings for one scope, all funded by the supplied shared budget.
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeLimits {

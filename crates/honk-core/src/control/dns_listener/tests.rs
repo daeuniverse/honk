@@ -102,7 +102,7 @@ fn start_listener_with_connection_limit(
     connection_permits: usize,
 ) -> (DnsListener, SocketAddr, Arc<DrainTracker>) {
     let endpoint = DnsBindEndpoint::parse(bind).expect("dns.bind endpoint");
-    let bound = BoundDnsListener::bind(&endpoint).expect("bind standalone DNS");
+    let bound = BoundDnsListener::bind(&endpoint, None).expect("bind standalone DNS");
     let address = bound.local_addr();
     let drain = Arc::new(DrainTracker::new().with_drain_timeout(Duration::from_millis(20)));
     let listener = bound
@@ -113,6 +113,7 @@ fn start_listener_with_connection_limit(
             Arc::clone(&drain),
             None,
             Default::default(),
+            ScopeId::HOST,
         )
         .expect("spawn standalone DNS");
     (listener, address, drain)
@@ -177,23 +178,56 @@ async fn read_tcp_frame(stream: &mut TcpStream) -> Vec<u8> {
 #[test]
 fn selected_transports_and_dual_port_zero_are_exact() {
     let udp_endpoint = DnsBindEndpoint::parse("udp://127.0.0.1:0").unwrap();
-    let udp = BoundDnsListener::bind(&udp_endpoint).unwrap();
+    let udp = BoundDnsListener::bind(&udp_endpoint, None).unwrap();
     assert!(udp.has_udp());
     assert!(!udp.has_tcp());
     drop(udp);
 
     let tcp_endpoint = DnsBindEndpoint::parse("tcp://127.0.0.1:0").unwrap();
-    let tcp = BoundDnsListener::bind(&tcp_endpoint).unwrap();
+    let tcp = BoundDnsListener::bind(&tcp_endpoint, None).unwrap();
     assert!(tcp.has_tcp());
     assert!(!tcp.has_udp());
     drop(tcp);
 
     let dual_endpoint = DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap();
-    let dual = BoundDnsListener::bind(&dual_endpoint).unwrap();
+    let dual = BoundDnsListener::bind(&dual_endpoint, None).unwrap();
     assert!(dual.has_tcp());
     assert!(dual.has_udp());
     assert_eq!(dual.tcp_local_addr(), dual.udp_local_addr());
     assert_ne!(dual.local_addr().port(), 0);
+}
+
+#[test]
+fn prepared_bind_retains_resolved_candidates_and_transports() {
+    let mut config = honk_config::Config::default();
+    assert!(
+        crate::control::packet_endpoint::PacketEndpoints::prepare_dns_bind(&config)
+            .unwrap()
+            .is_none()
+    );
+    config.dns.bind = "tcp+udp://localhost:0".into();
+    let prepared = crate::control::packet_endpoint::PacketEndpoints::prepare_dns_bind(&config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        prepared.endpoint,
+        config.dns.bind_endpoint().unwrap().unwrap()
+    );
+    assert!(!prepared.candidates.is_empty());
+    assert!(
+        prepared
+            .candidates
+            .iter()
+            .all(|address| address.port() == 0)
+    );
+    let retained = PreparedDnsBind {
+        endpoint: DnsBindEndpoint::parse("tcp+udp://never-resolve.invalid:0").unwrap(),
+        candidates: vec!["127.0.0.1:0".parse().unwrap()],
+    };
+    let bound = BoundDnsListener::bind_prepared(&retained, None).unwrap();
+    assert!(bound.has_tcp() && bound.has_udp());
+    assert_eq!(bound.tcp_local_addr(), bound.udp_local_addr());
+    assert!(bound.local_addr().ip().is_loopback());
 }
 
 #[test]
@@ -237,7 +271,7 @@ fn dual_bind_failure_releases_first_transport_atomically() {
         let address = occupied_tcp.local_addr().unwrap();
         let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
 
-        assert!(BoundDnsListener::bind(&endpoint).is_err());
+        assert!(BoundDnsListener::bind(&endpoint, None).is_err());
         if std::net::UdpSocket::bind(address).is_ok() {
             return;
         }
@@ -248,7 +282,7 @@ fn dual_bind_failure_releases_first_transport_atomically() {
 #[test]
 fn wildcard_ipv6_sockets_explicitly_enable_dual_stack() {
     let endpoint = DnsBindEndpoint::parse("tcp+udp://:0").unwrap();
-    let bound = BoundDnsListener::bind(&endpoint).unwrap();
+    let bound = BoundDnsListener::bind(&endpoint, None).unwrap();
     if bound.local_addr().is_ipv6() {
         assert!(
             !socket2::SockRef::from(bound.tcp.as_ref().unwrap())
@@ -353,6 +387,7 @@ async fn listener_start_is_not_logged_when_socket_adoption_fails() {
             Arc::new(DrainTracker::new()),
             None,
             Default::default(),
+            ScopeId::HOST,
         )
     });
 
@@ -608,7 +643,7 @@ async fn shutdown_releases_listener_address_for_rebind() {
     stop_listener(&mut listener, &drain).await;
 
     let endpoint = DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap();
-    let rebound = BoundDnsListener::bind(&endpoint)
+    let rebound = BoundDnsListener::bind(&endpoint, None)
         .expect("joined listener supervisors must release both sockets");
     assert_eq!(rebound.tcp_local_addr(), Some(address));
     assert_eq!(rebound.udp_local_addr(), Some(address));
@@ -660,8 +695,11 @@ async fn supervisor_panic_is_a_listener_shutdown_failure() {
         .spawn(async { panic!("DNS supervisor failed") });
     assert!(listener.abort_and_join().await.is_err());
     assert_eq!(drain.active_count(), 0);
-    BoundDnsListener::bind(&DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap())
-        .expect("failed shutdown must still join healthy supervisors");
+    BoundDnsListener::bind(
+        &DnsBindEndpoint::parse(&format!("tcp+udp://{address}")).unwrap(),
+        None,
+    )
+    .expect("failed shutdown must still join healthy supervisors");
 }
 
 #[tokio::test]
@@ -703,4 +741,197 @@ async fn query_start_spawns_only_unfinished_work_and_retains_panics() {
     });
     start_query(&mut children, &phase, &mut failure, panicking).await;
     assert!(failure.is_some(), "a query panic must fail teardown");
+}
+
+#[tokio::test]
+async fn packet_scoped_bound_dns_keeps_udp_and_each_tcp_frame_current() {
+    use crate::control::netstack::{PacketScope, RuntimeLimits};
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RoutingProjectionSnapshot,
+        RuntimeGeneration,
+    };
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let router = Arc::new(
+            Router::new(
+                &[RoutingRule {
+                    name: "packet-domain".into(),
+                    condition: RoutingCondition {
+                        domain_suffix: vec!["example.com".into()],
+                        ..Default::default()
+                    },
+                    outbound: RoutingOutbound::Simple("block".into()),
+                    priority: 0,
+                    must: false,
+                    mark: 0,
+                }],
+                "direct",
+            )
+            .unwrap(),
+        );
+        let projection = Arc::new(RoutingProjectionSnapshot::new(1, Arc::clone(&router)));
+        let (first_forwarder, _) = forwarder([192, 0, 2, 10]);
+        let provider = Arc::new(DnsServiceProvider::new(DnsRuntime::new(DnsRuntimeParts {
+            generation: RuntimeGeneration::new(1),
+            forwarder: first_forwarder,
+            routing_projection: Arc::clone(&projection),
+            outbound_runtime: None,
+            transport: Arc::new(TestRuntimeTransport),
+        })));
+        let controller = Arc::new(DnsController::new_with_runtime(
+            Arc::clone(&provider),
+            Arc::new(tokio::sync::RwLock::new(Box::new(
+                crate::ebpf::mock::MockEbpfBackend::new(),
+            ))),
+            16,
+        ));
+        let budget = honk_netstack::MemoryBudget::new(16 << 20);
+        let pairs: Vec<_> = (0..2)
+            .map(|_| {
+                let mut config = honk_netstack::Config::new([61; 32]);
+                config.mode = honk_netstack::Mode::Transparent {
+                    exclude: Default::default(),
+                };
+                config.max_flows = 1;
+                config.memory_limit = 2 << 20;
+                PacketScope::new(
+                    config,
+                    Arc::clone(&budget),
+                    RuntimeLimits {
+                        max_slots: 1,
+                        control_frames: 1,
+                        bulk_frames: 1,
+                        max_waiters: 1,
+                    },
+                    std::time::Instant::now(),
+                )
+                .unwrap()
+            })
+            .collect();
+        let scopes: Vec<_> = pairs.iter().map(|pair| pair.0.clone()).collect();
+        controller.register_packet_scopes(&scopes).unwrap();
+        let fact_scope = scopes[0].scope();
+        let bound = BoundDnsListener::bind(
+            &DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap(),
+            None,
+        )
+        .unwrap();
+        let address = bound.local_addr();
+        let drain = Arc::new(DrainTracker::new().with_drain_timeout(Duration::from_millis(20)));
+        let mut listener = bound
+            .spawn(
+                Arc::clone(&controller),
+                Arc::new(Semaphore::new(16)),
+                Arc::new(StatsManager::new()),
+                Arc::clone(&drain),
+                None,
+                Default::default(),
+                fact_scope,
+            )
+            .unwrap();
+        let mut tcp = TcpStream::connect(address).await.unwrap();
+        for (generation, expected) in [(1, [192, 0, 2, 10]), (2, [192, 0, 2, 11])] {
+            if generation == 2 {
+                let (replacement, _) = forwarder(expected);
+                provider.publish(DnsRuntime::new(DnsRuntimeParts {
+                    generation: RuntimeGeneration::new(generation),
+                    forwarder: replacement,
+                    routing_projection: Arc::clone(&projection),
+                    outbound_runtime: None,
+                    transport: Arc::new(TestRuntimeTransport),
+                }));
+            }
+            let udp_answer =
+                udp_exchange(address, &query("udp.example.com", generation as u16)).await;
+            assert!(udp_answer.ends_with(&expected));
+            crate::dns::transport::write_length_prefixed(
+                &mut tcp,
+                &query("tcp.example.com", generation as u16),
+            )
+            .await
+            .unwrap();
+            assert!(read_tcp_frame(&mut tcp).await.ends_with(&expected));
+            let ip = IpAddr::V4(Ipv4Addr::from(expected));
+            let bitmap = controller
+                .packet_domain_bitmap(fact_scope, ip, &router, 1)
+                .unwrap()
+                .unwrap();
+            assert_ne!(bitmap.bitmap[0], 0);
+            assert!(
+                controller
+                    .packet_domain_bitmap(scopes[1].scope(), ip, &router, 1)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                controller
+                    .routing_projection()
+                    .project(&projection)
+                    .is_empty()
+            );
+        }
+        provider.begin_pause();
+        crate::dns::transport::write_length_prefixed(&mut tcp, &query("paused.example.com", 3))
+            .await
+            .unwrap();
+        assert_eq!(read_tcp_frame(&mut tcp).await[3] & 15, 5);
+        assert_eq!(
+            udp_exchange(address, &query("paused.example.com", 4)).await[3] & 15,
+            5
+        );
+        drop(tcp);
+        stop_listener(&mut listener, &drain).await;
+        provider.finish_pause().await.unwrap();
+        controller.shutdown(Duration::from_secs(1)).await;
+    })
+    .await
+    .expect("bound DNS must use its registered scope and current per-frame admission");
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[test]
+#[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
+fn tun_prepared_listener_marks_tcp_udp_and_accepted_sockets() {
+    std::thread::spawn(|| {
+        crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
+        crate::netlink::NlSock::new()
+            .unwrap()
+            .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for endpoint in ["tcp+udp://127.0.0.1:0", "tcp+udp://[::1]:0"] {
+                    let prepared =
+                        PreparedDnsBind::new(DnsBindEndpoint::parse(endpoint).unwrap()).unwrap();
+                    let mut bound =
+                        BoundDnsListener::bind_prepared(&prepared, Some(0x100)).unwrap();
+                    assert_eq!(
+                        socket2::SockRef::from(bound.tcp.as_ref().unwrap())
+                            .mark()
+                            .unwrap(),
+                        0x100
+                    );
+                    assert_eq!(
+                        socket2::SockRef::from(bound.udp.as_ref().unwrap())
+                            .mark()
+                            .unwrap(),
+                        0x100
+                    );
+                    let address = bound.local_addr();
+                    let listener = TcpListener::from_std(bound.tcp.take().unwrap()).unwrap();
+                    let (client, accepted) =
+                        tokio::join!(TcpStream::connect(address), listener.accept());
+                    let client = client.unwrap();
+                    let (accepted, _) = accepted.unwrap();
+                    assert_eq!(socket2::SockRef::from(&accepted).mark().unwrap(), 0x100);
+                    drop((client, accepted));
+                }
+            });
+    })
+    .join()
+    .unwrap();
 }

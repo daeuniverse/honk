@@ -110,3 +110,21 @@ test "$("$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --list --format
 HONK_XDP_CORE_TEST_BIN="$HONK_CORE_TEST_BIN" HONK_XDP_XSK_TEST_BIN="$HONK_XSK_TEST_BIN" HONK_XDP_ARTIFACT_ROOT="$log_dir" \
   bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
   2>&1 | tee "$log_dir/honk-xdp-daemon.log"
+# TUN uses the same fresh executable, independently of the eBPF Cargo feature.
+for tun_test in \
+  tun::setup::tests::kernel_tun_exclusive_fd_and_containment_are_owned \
+  control::packet_endpoint::tests::startup::tun_dns_bind_starts_with_prepared_addresses_and_marks_both_transports \
+  control::dns_listener::tests::tun_prepared_listener_marks_tcp_udp_and_accepted_sockets \
+  clash_api::sampler_tests::netns_tun_listener_marks_accepted_sockets \
+  native_api::startup::tests::netns_tun_listener_marks_accepted_sockets; do
+  test "$("$HONK_CORE_TEST_BIN" "$tun_test" --exact --ignored --list --format terse)" = "$tun_test: test"
+  "$HONK_CORE_TEST_BIN" "$tun_test" --exact --ignored --test-threads=1 \
+    2>&1 | tee -a "$log_dir/honk-tun-consumers.log"
+done
+tun_readiness_test=tun::tests::writable_readiness_retries_the_same_lease_without_new_input
+test "$("$HONK_CORE_TEST_BIN" "$tun_readiness_test" --exact --list --format terse)" = "$tun_readiness_test: test"
+"$HONK_CORE_TEST_BIN" "$tun_readiness_test" --exact --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-tun-readiness.log"
+HONK_TUN_ARTIFACT_ROOT="$log_dir" \
+  bash "$repo/.github/ci/tun-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
+  2>&1 | tee "$log_dir/honk-tun-daemon.log"

@@ -300,7 +300,8 @@ async fn start_runtime(
         polling_prefix,
         polling_budget,
     ) = prepare(&plane, config, pins).await?;
-    let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(plane, scopes, 64)?;
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, scopes, 64, None)?;
     let realms = plans
         .into_iter()
         .map(|(ingress, device, link, scope)| {

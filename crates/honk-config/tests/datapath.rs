@@ -608,3 +608,6 @@ fn calibration_numbers_and_duplicate_optional_child_are_strict() {
     );
     assert!(serde_json::from_str::<honk_config::datapath::BusyPollConfig>(&duplicate).is_err());
 }
+
+#[path = "datapath/tun.rs"]
+mod tun;

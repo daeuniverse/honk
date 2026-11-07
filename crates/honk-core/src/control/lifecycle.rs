@@ -125,7 +125,7 @@ impl ControlPlane {
         }
         let bound_dns_listener = dns_bind_endpoint
             .as_ref()
-            .map(dns_listener::BoundDnsListener::bind)
+            .map(|endpoint| dns_listener::BoundDnsListener::bind(endpoint, None))
             .transpose()
             .map_err(|error| anyhow::anyhow!("bind dns.bind listener: {error}"))?;
         let tcp4_addr = SocketAddr::new("0.0.0.0".parse()?, tproxy_port);
@@ -361,6 +361,7 @@ impl ControlPlane {
                     self.drain_tracker.clone(),
                     self.native.clone(),
                     self.diagnostics.clone(),
+                    honk_datapath::ScopeId::HOST,
                 )?);
             }
             #[cfg(all(feature = "native-api", feature = "ebpf", target_os = "linux"))]

@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::netstack::{FlowIo, PacketDriver, PacketOwner};
+use crate::control::netstack::{FlowIo, PacketDriver, PacketOwner, RuntimeLimits};
 use honk_netstack::wire::tcp;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -88,7 +88,7 @@ async fn driven(
     plane: ControlPlane,
 ) -> (PacketEndpoints, PacketEndpointOwner, PacketDriver) {
     let (endpoints, mut owner, mut drivers) =
-        PacketEndpoints::start_driven(plane, vec![(scope, owner)], 4).unwrap();
+        PacketEndpoints::start_driven(plane, vec![(scope, owner)], 4, None).unwrap();
     poll_fn(|cx| owner.poll_ready(cx)).await.unwrap();
     assert_eq!(drivers.len(), 1);
     (endpoints, owner, drivers.pop().unwrap())
@@ -808,7 +808,7 @@ async fn queued_priority_is_preserved_but_exported_output_does_not_freeze_new_pr
 #[tokio::test]
 async fn full_live_peer_table_refuses_then_recovers_after_actual_tcp_retirement() {
     tokio::time::timeout(Duration::from_secs(15), async {
-        let budget = MemoryBudget::new(MEMORY);
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let mut pairs = Vec::new();
         for _ in 0..4 {
             let mut config = honk_netstack::Config::new([91; 32]);
@@ -816,7 +816,7 @@ async fn full_live_peer_table_refuses_then_recovers_after_actual_tcp_retirement(
                 exclude: Default::default(),
             };
             config.max_flows = 1024;
-            config.memory_limit = MEMORY / 8;
+            config.memory_limit = CAPTURE_MEMORY / 8;
             config.tcp_rcv_buf_max = 4096;
             pairs.push(
                 PacketScope::new(

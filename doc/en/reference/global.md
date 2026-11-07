@@ -65,6 +65,11 @@ Shutdown uses the latest accepted configuration; rejected reloads preserve the p
 
 The XDP backend closes capture admission and installs its guard before aborting packet endpoints and joining their output/CQ teardown. This flag does not provide natural-completion grace for XDP packet TCP connections; joined teardown is still required.
 
+TUN closes admission and removes its active capture routes before joined Endpoint
+cleanup, retaining blackhole guards throughout the drain. Normal confirmed stop
+then removes owned policy resources; failure keeps guards and the setup receipt.
+This flag supplies no natural-completion grace for TUN packet connections.
+
 This is neither graceful restart nor a total exit deadline: [owned cleanup and blocking work](../design/control-plane.md#runtime-teardown) still have to finish.
 
 ## Socket marks
@@ -74,8 +79,13 @@ A nonzero value is applied exactly before connect/send, including proxy carriers
 bootstrap/DNS traffic, health checks, subscriptions and UI downloads. The datapath
 bypass compares this exact configured value: merely containing bit `0x100` is not
 an exemption. Transparent listeners use the same mark for socket recognition;
-accepted TCP client sockets have it cleared. Standalone `dns.bind` ingress stays
-an ordinary unmarked local service.
+accepted TC TCP client sockets have it cleared. Standalone `dns.bind` ingress is
+unmarked for TC/XDP and ordinary embeddings. TUN requires its effective mark on
+all physical egress sockets and verifies actual TCP/UDP set/readback before
+capture. Mark errors, including permission denial, are fatal in required mode.
+Its standalone DNS, Clash and native API sockets set and read back that mark
+before bind/listen; accepted TCP children retain it. This prevents remote service
+replies from re-entering capture and does not change API authorization.
 
 The dae global scalar keeps honk's existing hexadecimal-first lexical behavior:
 `10` and `0x10` both mean 16; malformed or overflowing text emits a diagnostic and
@@ -272,12 +282,138 @@ support does not establish equivalent Core authority for those packet combinatio
 See [Full-XDP startup and limitations](../design/datapath.md) for device, VLAN,
 scatter/gather, retained-memory, pinned-guard, and stock-kernel admission boundaries.
 
+### Linux TUN Endpoint
+
+Select TUN explicitly with `backend: tun` and `direct: endpoint`. honk creates and
+owns a new, nonpersistent, single-queue Linux TUN; the values below are resources
+chosen by the operator, not reserved defaults:
+
+```dae
+global {
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    dial_mode: ip
+}
+datapath {
+    backend: tun
+    direct: endpoint
+    tun {
+        name: honk0
+        mtu: 1500
+        address4: 198.18.0.1/32
+        address6: fd00:686f:6e6b:100::1/128
+        table: 202
+        rule_priority: 10000
+        capture {
+            0.0.0.0/0
+            ::/0
+        }
+    }
+}
+routing {
+    fallback: direct
+}
+```
+
+| `tun` field | Required value and admission |
+| --- | --- |
+| `name` | Required; 1–15 ASCII bytes from `[A-Za-z0-9_.-]`. `lo` and `auto` are rejected. The name must be unused in this network namespace; existing links are never adopted or replaced. |
+| `mtu` | Optional, default `1500`; integer `1280..=65535`. |
+| `address4` / `address6` | At least one required; exact host prefixes `/32` and `/128`. Unspecified, multicast, broadcast, mapped IPv6, link-local and duplicate local addresses are rejected. |
+| `table` | Required; `1..=0xfffffffe`, excluding `253..=255`. No existing route or rule may use this dedicated table. |
+| `rule_priority` | Required first priority P; `P >= 1` and checked `P+4 < 32766`. All five priorities `[P,P+4]` must be unused. |
+| `capture { ... }` | Required, 1–64 canonical CIDR networks in configured address families. Host bits and mutually containing redundant prefixes are rejected; entries are sorted and deduplicated. Only bare prefixes are accepted, without keyed entries or nested blocks. |
+
+TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
+`interface`, `xsk_mode`, explicit `poll_mode`, `busy_poll`, `firewall`, nonempty
+`nat`, and `direct: core` or `native`.
+Unknown fields and duplicate scalars/blocks reject across merged sections and
+includes. Structured input uses the same validation. This is an opt-in addition;
+existing configurations do not change meaning and need no TUN migration.
+
+Run on Linux with `/dev/net/tun`, permission to create/configure TUN and apply
+`SO_MARK`, and no `--mock-ebpf`. Explicitly disable NFQUEUE and leave
+`global.lan_interface`/`wan_interface` empty. Nonzero traffic-rule/default marks,
+MAC and process-name predicates (including their negations) are unsupported.
+All four existing dial modes remain available; the example uses `ip`.
+
+For every enabled address family honk validates the standard priority-0 local
+rule and installs exactly five owned RPDB rules, where M is the effective
+`global.so_mark_from_dae`, T is `tun.table`, and P is `tun.rule_priority`:
+
+| Priority | Exact match | Action |
+| --- | --- | --- |
+| P | `fwmark M/0xffffffff` | `lookup main` |
+| P+1 | `fwmark M/0xffffffff` | `prohibit` |
+| P+2 | `iif <tun.name>` | `lookup main` |
+| P+3 | `iif <tun.name>` | `prohibit` |
+| P+4 | All traffic | `lookup T` |
+
+The system local rule runs first; ordinary system main/default rules at
+32766/32767 remain. Each capture prefix gets a static blackhole guard in T with
+metric 32760, then a metric-1024 unicast route through TUN only after Endpoint startup.
+No main-table copy or private-subnet exemption is synthesized. Daemon sockets
+escape through P/P+1; replies written to TUN enter the kernel as new interface
+ingress and use P+2/P+3. Missing main routes terminate instead of looping.
+
+Active capture uses metric 1024 for both families because Linux normalizes IPv6
+metric 0 and treats IPv4 delete metric 0 as a wildcard. This is a deliberate
+Linux representation adjustment from the initial metric-0 design. Exclusive
+creation, readback and deletion use the full route key: table, address family,
+prefix, output interface and metric. Blackhole guards remain metric 32760.
+
+The operator owns main/default routes, WAN/LAN addresses, NAT, firewall and
+forwarding switches, and must keep that topology stable. Each enabled family
+needs a usable source and non-TUN main uplink; main/default paths through TUN,
+extra local rules, rules before P, VRF/l3mdev, unknown selectors/actions and other
+references to T are rejected. Capture/reply legs must preserve the L3 policy
+input; external NAT equivalence is not established. Topology changes or lost
+notifications close capture; the watcher is not an atomic fence against a
+concurrent privileged route writer. Only the owned TUN gets `rp_filter=0` and
+explicit IPv6 NODAD addresses with automatic address generation/RA disabled.
+
+At TUN startup/restart setup with IPv4 enabled, honk reads `net.ipv4.conf.all.rp_filter`. Strict
+mode `1` rejects startup: the operator must choose `0` (disabled) or `2` (loose)
+before retrying, because Linux also applies the global setting to the TUN reply
+ingress. honk never writes the global, WAN or LAN values; it sets only its owned
+TUN value to `0`. IPv6 has no equivalent `rp_filter` setting; an IPv6-only TUN neither reads nor rejects this IPv4 setting. A later operator
+change of the global IPv4 value to strict mode is not detected at runtime and
+can break replies; maintaining the admitted setting is an operator prerequisite.
+
+Setup writes a create-new, nonsymlink, mode-0600 receipt at
+`<data_dir>/state/tun-<netns_cookie>-<instance_nonce>.json`. It records full source
+SHA, PID/starttime, namespace cookie, link/attachment identity and exact
+address/route/rule keys. Intent is persisted before each external mutation;
+ACK and Removed states are persisted and fsynced. It is evidence for exact
+operator cleanup, never authority to replay setup, adopt resources or delete an
+ambiguous object. See [TUN setup and teardown](../design/datapath.md#linux-tun-endpoint).
+
+Direct TCP/UDP is an explicit Endpoint relay: real TUN FD read → scoped Stack →
+canonical Router → new direct/proxy outbound → generated reply → the same FD.
+Bare IP provides no authenticated Host/Transit or process identity, original
+socket, pre-NAT input or Native continuation. HostFacts (S-b), pre-import Native
+(S-c) and captured return (S-d) remain future work; S-a does not complete E6.4.
+
+The entire canonical TUN setup, backend and Direct profile are restart-only;
+omitted MTU and explicit 1500 compare equal. Policy/group/DNS/subscription/mode
+updates use the existing transaction without reopening the FD or replacing its
+scope. Semantic `dns.bind` changes still require restart. Normal joined stop
+removes capture first, drains actual owners, then removes owned rules/guards and
+the receipt to restore main routing. Failure or unconfirmed cleanup retains
+blackholes, rules and receipt for stop-source inspection and exact cleanup;
+there is no automatic reopen, adoption or backend fallback.
+
+`/configs.tun` reports accepted configuration (`enable`, `device`, `mtu`,
+`stack: "honk"`); its IPv6 projection follows `address6`. These fields do not
+prove readiness. Readiness follows `capture_ready()`, lifecycle Running,
+`TUN datapath ready` and sd_notify; native datapath visibility remains unknown.
+
 ### Bounded adaptive polling
 
-`datapath.poll_mode` accepts `event` or `adaptive`. Omission selects the adaptive
+For XDP, `datapath.poll_mode` accepts `event` or `adaptive`. Omission selects the adaptive
 **policy**, not Busy operation: the owner starts in Event. Explicit `event` forbids
 active polling and can retain the identical complete tuning/calibration block for
-an Event-versus-adaptive comparison. TC rejects either explicit mode (even `event`)
+an Event-versus-adaptive comparison. TC/TUN reject either explicit mode (even `event`)
 and any `busy_poll` block. Polling and calibration changes are reloadable without
 changing device setup; they reset local qualification, not process quota or debt.
 

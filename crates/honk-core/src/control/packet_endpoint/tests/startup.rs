@@ -1,4 +1,46 @@
 use super::*;
+use honk_config::datapath::Backend;
+
+const PACKET_BACKENDS: [Backend; 2] = [Backend::Xdp, Backend::Tun];
+
+async fn packet_plane(
+    backend: Backend,
+    mode: &str,
+    selection: &str,
+) -> (ControlPlane, tokio::net::TcpListener) {
+    packet_plane_with(backend, mode, selection, |_| {}).await
+}
+
+async fn packet_plane_with(
+    backend: Backend,
+    mode: &str,
+    selection: &str,
+    configure: impl FnOnce(&mut honk_config::Config),
+) -> (ControlPlane, tokio::net::TcpListener) {
+    let (plane, health) = xdp_plane_with(mode, selection, configure).await;
+    if backend == Backend::Tun {
+        // Supervisor fixtures share ordinary process mark initialization; real TUN startup is VM-only.
+        let mut accepted = plane.config.write().await;
+        let mut config = (**accepted).clone();
+        config.datapath = Some(honk_config::datapath::DatapathConfig {
+            backend,
+            direct: Some(honk_config::datapath::DirectProfile::Endpoint),
+            tun: Some(honk_config::datapath::TunConfig {
+                name: "honk0".into(),
+                mtu: 1500,
+                address4: Some("198.18.0.1".parse().unwrap()),
+                address6: Some("fd00:686f:6e6b:100::1".parse().unwrap()),
+                table: 202,
+                rule_priority: 10000,
+                capture: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
+            }),
+            ..Default::default()
+        });
+        config.validate_assembled().unwrap();
+        *accepted = Arc::new(config);
+    }
+    (plane, health)
+}
 
 #[cfg(all(feature = "native-api", feature = "clash-api", target_os = "linux"))]
 mod fatal;
@@ -35,85 +77,89 @@ async fn xdp_plane_with(
 }
 
 #[tokio::test]
-async fn xdp_startup_initializes_exact_mode_flags_before_capture() {
+async fn configured_packet_startup_initializes_exact_mode_flags_before_capture() {
     use honk_ebpf_common::{
         DATAPATH_FLAG_OFFLOAD_ALL as ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as RULE,
     };
 
     tokio::time::timeout(Duration::from_secs(10), async {
-        for (mode, selection, expected) in [
-            ("Rule", "block", RULE),
-            ("Direct", "block", ALL),
-            ("Global", "direct", ALL),
-            ("Global", "block", 0),
-        ] {
-            let budget = MemoryBudget::new(32 << 20);
-            let (scope, scope_owner) = scope(&budget);
-            let (plane, _health) = xdp_plane(mode, selection).await;
-            let backend = Arc::clone(&plane.ebpf);
-            let flags = plane.datapath_flags_handle().unwrap();
-            let restored = flags.snapshot();
-            let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
-                .await
-                .unwrap();
-            assert_eq!(backend.read().await.datapath_flags_write_log(), [expected]);
-            flags.fence_nfqueue().await.unwrap();
-            flags.reopen_nfqueue().await.unwrap();
-            assert_eq!(flags.snapshot(), restored);
-            assert_eq!(
-                backend.read().await.datapath_flags_write_log(),
-                [expected; 3]
-            );
-            endpoints.capture_ready().unwrap();
-            endpoints.shutdown().await.unwrap();
-            owner.run().await.unwrap();
+        for backend in PACKET_BACKENDS {
+            for (mode, selection, expected) in [
+                ("Rule", "block", RULE),
+                ("Direct", "block", ALL),
+                ("Global", "direct", ALL),
+                ("Global", "block", 0),
+            ] {
+                let budget = MemoryBudget::new(32 << 20);
+                let (scope, scope_owner) = scope(&budget);
+                let (plane, _health) = packet_plane(backend, mode, selection).await;
+                let policy = Arc::clone(&plane.ebpf);
+                let flags = plane.datapath_flags_handle().unwrap();
+                let restored = flags.snapshot();
+                let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+                    .await
+                    .unwrap();
+                assert_eq!(policy.read().await.datapath_flags_write_log(), [expected]);
+                flags.fence_nfqueue().await.unwrap();
+                flags.reopen_nfqueue().await.unwrap();
+                assert_eq!(flags.snapshot(), restored);
+                assert_eq!(
+                    policy.read().await.datapath_flags_write_log(),
+                    [expected; 3]
+                );
+                endpoints.capture_ready().unwrap();
+                endpoints.shutdown().await.unwrap();
+                owner.run().await.unwrap();
+            }
         }
     })
     .await
-    .expect("XDP startup must initialize software-only flags before capture");
+    .expect("configured packet startup must initialize software flags before capture");
 }
 
 #[tokio::test]
-async fn xdp_flag_initialization_failure_retains_cleanup_until_output_returns() {
+async fn configured_packet_flag_failure_retains_cleanup_until_output_returns() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let budget = MemoryBudget::new(32 << 20);
-        let (scope, scope_owner) = scope(&budget);
-        let (plane, _health) = xdp_plane("Direct", "block").await;
-        let projection = plane.dns_controller.routing_projection();
-        let stopped = Arc::clone(&plane.shutdown_requested);
-        let backend = Arc::clone(&plane.ebpf);
-        let mut held_backend = backend.write().await;
-        held_backend.arm_datapath_flags_write_fault(1).unwrap();
-        let mut opening = Box::pin(PacketEndpoints::new(
-            plane,
-            vec![(scope.clone(), scope_owner)],
-            1,
-        ));
-        assert!(futures::poll!(&mut opening).is_pending());
-        scope
-            .datagram_sender("198.51.100.1:53".parse().unwrap())
-            .send_to(b"retained", "192.0.2.1:41000".parse().unwrap())
-            .await
-            .unwrap();
-        let output = scope.next_output().await.unwrap();
-        drop(held_backend);
-        while !stopped.requested() {
-            tokio::task::yield_now().await;
+        for backend in PACKET_BACKENDS {
+            let budget = MemoryBudget::new(32 << 20);
+            let (scope, scope_owner) = scope(&budget);
+            let (plane, _health) = packet_plane(backend, "Direct", "block").await;
+            let projection = plane.dns_controller.routing_projection();
+            let stopped = Arc::clone(&plane.shutdown_requested);
+            let policy = Arc::clone(&plane.ebpf);
+            let mut held_backend = policy.write().await;
+            held_backend.arm_datapath_flags_write_fault(1).unwrap();
+            let mut opening = Box::pin(PacketEndpoints::new(
+                plane,
+                vec![(scope.clone(), scope_owner)],
+                1,
+            ));
+            assert!(futures::poll!(&mut opening).is_pending());
+            scope
+                .datagram_sender("198.51.100.1:53".parse().unwrap())
+                .send_to(b"retained", "192.0.2.1:41000".parse().unwrap())
+                .await
+                .unwrap();
+            let output = scope.next_output().await.unwrap();
+            drop(held_backend);
+            while !stopped.requested() {
+                tokio::task::yield_now().await;
+            }
+            assert!(futures::poll!(&mut opening).is_pending());
+            output.release();
+            let error = opening
+                .await
+                .err()
+                .expect("failed flags must reject startup");
+            assert!(format!("{error:#}").contains("injected datapath flags write failure"));
+            drop(scope);
+            projection.shutdown(Duration::from_secs(1)).await;
+            drop(projection);
+            assert_eq!(budget.used(), 0);
         }
-        assert!(futures::poll!(&mut opening).is_pending());
-        output.release();
-        let error = opening
-            .await
-            .err()
-            .expect("failed flags must reject startup");
-        assert!(format!("{error:#}").contains("injected datapath flags write failure"));
-        drop(scope);
-        projection.shutdown(Duration::from_secs(1)).await;
-        drop(projection);
-        assert_eq!(budget.used(), 0);
     })
     .await
-    .expect("failed XDP flags must retain joined packet cleanup");
+    .expect("failed packet flags must retain joined cleanup");
 }
 
 #[cfg(feature = "native-api")]
@@ -347,26 +393,28 @@ async fn normal_close_aborts_packet_protocol_before_waiting_for_selector_retirem
 
 #[cfg(feature = "native-api")]
 #[tokio::test]
-async fn xdp_native_running_waits_for_actual_capture_activation() {
+async fn configured_packet_running_waits_for_actual_capture_activation() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let budget = MemoryBudget::new(32 << 20);
-        let (scope, scope_owner) = scope(&budget);
-        let (mut plane, _health) = xdp_plane("Rule", "block").await;
-        *plane.ebpf.write().await = Box::new(crate::ebpf::userspace::UserspaceBackend::new(
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ));
-        let mut phase = plane.observe_phase();
-        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
-            .await
-            .unwrap();
-        assert_eq!(*phase.borrow(), super::super::super::EnginePhase::Starting);
-        assert!(!endpoints.shared.capture_ready.load(Ordering::Acquire));
-        endpoints.capture_ready().unwrap();
-        while *phase.borrow() != super::super::super::EnginePhase::Running {
-            phase.changed().await.unwrap();
+        for backend in PACKET_BACKENDS {
+            let budget = MemoryBudget::new(32 << 20);
+            let (scope, scope_owner) = scope(&budget);
+            let (mut plane, _health) = packet_plane(backend, "Rule", "block").await;
+            *plane.ebpf.write().await = Box::new(crate::ebpf::userspace::UserspaceBackend::new(
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ));
+            let mut phase = plane.observe_phase();
+            let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+                .await
+                .unwrap();
+            assert_eq!(*phase.borrow(), super::super::super::EnginePhase::Starting);
+            assert!(!endpoints.shared.capture_ready.load(Ordering::Acquire));
+            endpoints.capture_ready().unwrap();
+            while *phase.borrow() != super::super::super::EnginePhase::Running {
+                phase.changed().await.unwrap();
+            }
+            endpoints.shutdown().await.unwrap();
+            owner.run().await.unwrap();
         }
-        endpoints.shutdown().await.unwrap();
-        owner.run().await.unwrap();
     })
     .await
     .expect("native Running must follow capture-ready notification");
@@ -574,17 +622,22 @@ async fn driven_start_keeps_the_ordinary_pairing_and_budget_validation() {
     let (first, first_owner) = scope(&budget);
     let (_second, second_owner) = scope(&budget);
     let (plane, _health) = local_plane().await;
-    let swapped = PacketEndpoints::start_driven(plane, vec![(first.clone(), second_owner)], 1)
-        .err()
-        .expect("a swapped owner must not receive a driver");
+    let swapped =
+        PacketEndpoints::start_driven(plane, vec![(first.clone(), second_owner)], 1, None)
+            .err()
+            .expect("a swapped owner must not receive a driver");
     assert!(format!("{swapped:#}").contains("owner mismatch"));
     let foreign = MemoryBudget::new(32 << 20);
     let (other, other_owner) = scope(&foreign);
     let (plane, _health) = local_plane().await;
-    let mixed =
-        PacketEndpoints::start_driven(plane, vec![(first, first_owner), (other, other_owner)], 1)
-            .err()
-            .expect("a foreign budget must not receive a driver");
+    let mixed = PacketEndpoints::start_driven(
+        plane,
+        vec![(first, first_owner), (other, other_owner)],
+        1,
+        None,
+    )
+    .err()
+    .expect("a foreign budget must not receive a driver");
     assert!(format!("{mixed:#}").contains("one memory ceiling"));
 }
 
@@ -599,7 +652,7 @@ async fn driven_startup_failure_keeps_drivers_serviceable_and_reports_abandonmen
             let (scope, scope_owner) = scope(&budget);
             let (plane, _health) = local_plane().await;
             let (endpoints, mut owner, mut drivers) =
-                PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1)
+                PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1, None)
                     .unwrap();
             let mut driver = drivers.pop();
             scope
@@ -673,6 +726,7 @@ async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_return
             plane,
             vec![(first.clone(), first_owner), (second.clone(), second_owner)],
             1,
+            None,
         )
         .unwrap();
         let mut held = Vec::new();
@@ -732,4 +786,171 @@ async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_return
     })
     .await
     .expect("unfunded scope startup must keep and finish real ownership");
+}
+
+#[tokio::test]
+async fn configured_packet_reload_authorizes_subscription_workers() {
+    use crate::control::{ControlCommand, commands::ReloadOutcome};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for backend in PACKET_BACKENDS {
+            let budget = MemoryBudget::new(32 << 20);
+            let (scope, scope_owner) = scope(&budget);
+            let (plane, _health) = packet_plane(backend, "Rule", "block").await;
+            let config = plane.config_handle();
+            let commands = plane.command_sender();
+            let mut candidate = (**config.read().await).clone();
+            let subscription = honk_config::subscription::Subscription {
+                name: "packet-provider".into(),
+                url: "http://127.0.0.1:9".into(),
+                update_interval: 0,
+                ..Default::default()
+            };
+            let id = subscription.id;
+            candidate.subscriptions.push(subscription);
+            let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+                .await
+                .unwrap();
+            let (result, reply) = tokio::sync::oneshot::channel();
+            commands
+                .send(ControlCommand::ReloadConfig {
+                    request_id: 1,
+                    config: Box::new(candidate),
+                    diagnostics: Vec::new(),
+                    #[cfg(feature = "native-api")]
+                    sources: None,
+                    #[cfg(feature = "native-api")]
+                    expected_group_revision: None,
+                    result,
+                })
+                .await
+                .unwrap();
+            let reply = reply.await.unwrap();
+            assert!(matches!(reply.outcome, ReloadOutcome::Committed { .. }));
+            assert_eq!(reply.authorized.len(), 1);
+            assert_eq!(reply.authorized[0].subscription.id, id);
+            let revision = reply.authorized[0].revision;
+            assert_eq!(config.read().await.subscriptions[0].id, id);
+            for worker_revision in [revision.wrapping_sub(1), revision] {
+                let (result, reply) = tokio::sync::oneshot::channel();
+                commands
+                    .send(ControlCommand::MergeSubscription {
+                        subscription_id: id,
+                        revision: worker_revision,
+                        nodes: Vec::new(),
+                        diagnostics: Vec::new(),
+                        result,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    reply.await.unwrap().outcome.accepted(),
+                    worker_revision == revision
+                );
+            }
+            endpoints.shutdown().await.unwrap();
+            owner.run().await.unwrap();
+        }
+    })
+    .await
+    .expect("configured packet commands must retain subscription authorization");
+}
+
+#[tokio::test]
+async fn tun_dns_bind_requires_preparation_before_startup() {
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, scope_owner) = scope(&budget);
+    let (plane, _health) = packet_plane_with(Backend::Tun, "Rule", "block", |config| {
+        config.dns.bind = "tcp+udp://localhost:0".into();
+    })
+    .await;
+    let error = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+        .await
+        .err()
+        .expect("TUN cannot resolve a bind endpoint after routing setup");
+    assert!(format!("{error:#}").contains("addresses prepared before routing setup"));
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+async fn configured_dns_startup(backend: Backend) {
+    let reservation = super::super::super::dns_listener::BoundDnsListener::bind(
+        &honk_config::dns::DnsBindEndpoint::parse("tcp+udp://127.0.0.1:0").unwrap(),
+        None,
+    )
+    .unwrap();
+    let address = reservation.local_addr();
+    let hosts = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(hosts.path(), "full:packet.example.com 192.0.2.44\n").unwrap();
+    let (plane, _health) = packet_plane_with(backend, "Rule", "block", |config| {
+        config.dns.bind = format!("tcp+udp://{address}");
+        config.dns.hosts = vec![hosts.path().to_str().unwrap().into()];
+    })
+    .await;
+    let prepared = if backend == Backend::Tun {
+        PacketEndpoints::prepare_dns_bind(plane.config.read().await.as_ref()).unwrap()
+    } else {
+        None
+    };
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, scope_owner) = scope(&budget);
+    drop(reservation);
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(scope, scope_owner)], 1, prepared).unwrap();
+    let mut driver = drivers.pop().unwrap();
+    std::future::poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        owner.poll_ready(cx)
+    })
+    .await
+    .unwrap();
+    let query = crate::dns::forwarder::build_dns_query("packet.example.com", 1);
+    let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    udp.send_to(&query, address).await.unwrap();
+    let mut response = [0; 512];
+    let length = udp.recv(&mut response).await.unwrap();
+    assert!(response[..length].ends_with(&[192, 0, 2, 44]));
+    let mut tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    crate::dns::transport::write_length_prefixed(&mut tcp, &query)
+        .await
+        .unwrap();
+    let mut response = Vec::new();
+    crate::dns::transport::read_length_prefixed_into(&mut tcp, &mut response, None)
+        .await
+        .unwrap();
+    assert!(response.ends_with(&[192, 0, 2, 44]));
+    drop(tcp);
+    endpoints.close();
+    let (_, result) = std::future::poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        owner.poll_join_plane(cx)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
+}
+
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+#[test]
+#[ignore = "requires the disposable kernel VM gate and SO_MARK privileges"]
+fn tun_dns_bind_starts_with_prepared_addresses_and_marks_both_transports() {
+    std::thread::spawn(|| {
+        crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
+        crate::netlink::NlSock::new()
+            .unwrap()
+            .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
+            .unwrap();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for backend in PACKET_BACKENDS {
+                    tokio::time::timeout(Duration::from_secs(10), configured_dns_startup(backend))
+                        .await
+                        .expect("prepared configured packet DNS must start both transports");
+                }
+            });
+    })
+    .join()
+    .unwrap();
 }

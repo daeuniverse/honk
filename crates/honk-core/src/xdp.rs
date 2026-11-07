@@ -12,7 +12,9 @@ use crate::control::{
         CachedDecision, Decision, Execution, GeneratedError, IngressBinding, PolicyGeneration,
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
-    netstack::{OutputLease, OutputOwner, PacketDriver, PacketScope, RuntimeLimits},
+    netstack::{
+        CAPTURE_MEMORY, OutputLease, OutputOwner, PacketDriver, PacketScope, capture_scope,
+    },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
 use crate::netlink::fib::{Fib, LogicalLink};
@@ -60,7 +62,6 @@ const PENDING: usize = 64;
 const PEERS: usize = 4096;
 const PEER_CONFLICT_HOLD: Duration = Duration::from_secs(60);
 const BATCH: usize = 32;
-const MEMORY: usize = 256 << 20;
 
 fn qualify_packet(count: &mut u64, unavailable: &mut bool) {
     match count.checked_add(1) {
@@ -1773,7 +1774,7 @@ pub(crate) async fn run(
         Err(error) => return (Some(plane), Err(error)),
     };
     let (endpoints, mut owner, mut drivers) =
-        match PacketEndpoints::start_driven(plane, scope_pairs, 64) {
+        match PacketEndpoints::start_driven(plane, scope_pairs, 64, None) {
             Ok(started) => started,
             Err(error) => return (None, Err(error)),
         };
@@ -2063,7 +2064,7 @@ async fn prepare(
         );
     }
     let indices: Vec<_> = infos.iter().map(|info| info.ifindex).collect();
-    let budget = MemoryBudget::new(MEMORY);
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let polling_prefix = ContextDigest::platform(&budget);
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     let namespace = socket_namespace(socket.as_fd())?;
@@ -2208,7 +2209,7 @@ async fn prepare(
                 attachment: incarnation,
                 mark: MarkProvenance::BeforeSkb,
             };
-            let (scope, scope_owner) = packet_scope(link.mtu, realm_count, &budget)?;
+            let (scope, scope_owner) = capture_scope(link.mtu, realm_count, &budget)?;
             realms.push((ingress, devices.len(), link, scope.scope()));
             scope_pairs.push((scope, scope_owner));
         }
@@ -2283,33 +2284,6 @@ async fn prepare(
     ))
 }
 
-fn packet_scope(
-    mtu: u32,
-    realms: usize,
-    budget: &Arc<MemoryBudget>,
-) -> anyhow::Result<(PacketScope, crate::control::netstack::PacketOwner)> {
-    // ponytail: fixed per-realm partitions; rebalance only if measured tenant skew needs it.
-    let slots = (4096 / realms).min(1024);
-    let mut stack = honk_netstack::Config::new(rand::random());
-    stack.mode = honk_netstack::Mode::Transparent {
-        exclude: Default::default(),
-    };
-    stack.mtu = u16::try_from(mtu)?;
-    stack.max_flows = slots as u32;
-    stack.memory_limit = MEMORY / 2 / realms;
-    Ok(PacketScope::new(
-        stack,
-        Arc::clone(budget),
-        RuntimeLimits {
-            max_slots: slots,
-            control_frames: 32,
-            bulk_frames: 128,
-            max_waiters: 256,
-        },
-        Instant::now(),
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2351,9 +2325,9 @@ mod tests {
 
     #[test]
     fn qinq_realms_share_capacity_and_release_their_complete_budget() {
-        let budget = MemoryBudget::new(MEMORY);
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let scopes: Vec<_> = (0..6)
-            .map(|_| packet_scope(1500, 6, &budget).unwrap())
+            .map(|_| capture_scope(1500, 6, &budget).unwrap())
             .collect();
         drop(scopes);
         assert_eq!(budget.used(), 0);

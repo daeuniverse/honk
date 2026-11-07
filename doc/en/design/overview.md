@@ -1,6 +1,6 @@
 # Architecture overview
 
-`honk` is a Linux eBPF transparent-proxy engine for gateway and host traffic. This page describes its architecture and runtime invariants. The project is experimental alpha, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
+`honk` is a Linux transparent-proxy engine for gateway and host traffic, with default TC/eBPF capture and explicit XDP or TUN packet backends. This page describes its architecture and runtime invariants. The project is experimental alpha, licensed `GPL-3.0-only`, and developed in `daeuniverse/honk`.
 
 Its configuration syntax and TC datapath derive from dae and remain dae-compatible where documented. Its outbound handlers, groups, and Clash API follow sing-box designs. `honk` is an independent implementation and has diverged substantially from both.
 
@@ -27,7 +27,7 @@ The root workspace contains nine crates. `honk-ebpf` is a separate Cargo project
 | `honk-config` | member | Shared configuration model, dae-syntax parser, include handling, share-link parsing, and subscription decoding. |
 | `honk-ebpf-common` | member | `no_std`, `#[repr(C)]` constants and ABI types shared by kernel programs and userspace map writers. |
 | `honk-nfqueue` | member | Raw `NETLINK_NETFILTER` queue `320`, verdict ownership, and the owned nftables transaction. |
-| `honk-netstack` | member | Sans-I/O IPv4/IPv6 TCP/UDP stack used as the inner network of the WireGuard tunnel; depends only on `blake3` and `thiserror`. See [Userspace network stack](./netstack.md). |
+| `honk-netstack` | member | Sans-I/O IPv4/IPv6 TCP/UDP stack for WireGuard and scoped packet Endpoint execution, including configured XDP/TUN; depends only on `blake3` and `thiserror`. See [Userspace network stack](./netstack.md). |
 | `honk-datapath` | member | Scoped frame ownership, pure Core transit and stateful firewall/NAT; canonical policy and platform FIB authority remain in core/adapters. |
 | `honk-xsk` | member | Linux XDP/AF_XDP primitives used by the configured daemon and explicit experimental consumers; no deferred-DMA release fence or hardware acceptance claim. |
 | `honk-outbound` | member | Protocol handlers, per-node runtimes, outbound groups, health state, URLTest probing, and the always-compiled Score scorer. |
@@ -73,6 +73,8 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 
 ## High-level data path
 
+The diagram and packet walk below describe default TC. Explicit [TUN Endpoint](./datapath.md#linux-tun-endpoint) captures actual L3 through one daemon-owned FD, uses the same scoped Stack, canonical Router and real outbound, then writes generated replies to that FD. Direct is an explicit new-dial relay; no HostFacts, original socket, pre-NAT/TTL equivalence, Native bypass or captured return is claimed. These S-b/S-c/S-d gaps remain; S-a does not complete E6.4. XDP retains its separate device/Core contracts.
+
 ```mermaid
 flowchart TB
   PACKET[LAN-forwarded or host-originated TCP/UDP] --> TC[TC classification]
@@ -106,7 +108,7 @@ flowchart TB
 
 ## Runtime invariants
 
-- **Bypass-mark discipline:** dials, probes, DNS upstreams, HTTP downloads, QUIC endpoints, and transparent listeners carry the process-configured bypass mark. Nonzero direct rule marks replace its low 30 bits and carry `CLASSIFIED_MARK`; policy rules must mask with `0x3fffffff`. Accepted TCP sockets have the listener mark cleared; ordinary host-netns `dns.bind` ingress sockets are deliberately unmarked.
+- **Bypass-mark discipline:** dials, probes, DNS upstreams, HTTP downloads, QUIC endpoints, and TC transparent listeners carry the process-configured mark. TC nonzero direct rule marks use `CLASSIFIED_MARK` with masked policy routing; accepted TC TCP sockets clear the listener mark. TC/XDP standalone `dns.bind` stays unmarked. TUN requires exact effective M on physical egress and strictly sets/reads back M on DNS/management sockets before bind/listen; accepted service children retain it. Permission failures reject TUN rather than risking a routing loop.
 - **Anyfrom UDP replies:** proxied UDP and transparent port-53 DNS replies use transparent sockets created inside `daens` and bound to the flow's original destination. Replying from the TPROXY listener exposes the `dae0` source and fails on the return path. A reply from an alternate full-cone source returns through the client-only `CLIENT_REPLY_TRACK` framing instead of host forwarding, and never teaches the datapath a native reverse direction for the client's next packet to that source.
 - **DNS source boundary:** transparent and `dns.bind` adapters derive the logical client source from the socket peer; flow-associated lookups use the admitted flow's source. Cache reuse starts only after routing materializes the selected source-neutral scope, while each policy generation's domain-predicate projection remains global and source-independent.
 - **UDP source boundary:** source-shared protocol reuse is indexed by reused runtime, normalized client, protocol/UDP path, and actual-peer/original-destination reply projection. The full five-tuple endpoint map still owns routing, token/generation, and per-flow Score; the source association owns its one receiver and transport health. Source ownership of every non-VLESS protocol remains available without `rprx`.
@@ -122,6 +124,7 @@ flowchart TB
 - **Conditional verification surface:** Score proxy objects publish aggregate provisional/usable state, fresh pairwise challenger response relations, evidence questions and wait reasons with the same readonly selected member; there is no group-wide comparison claim. `/stats` adds fixed group/network verification and budget/cost fields plus a nested-deduplicated root business count; observed trial failures are not causal extra failures. Neither surface exports raw target keys or a probability of optimality. See [API verification](../reference/api.md#score-verification).
 - **Internal and special traffic:** honk's link-internal ranges `169.254.0.0/16` and `fd00:686f:6e6b::/64` are never proxied. L2 broadcast/multicast, IPv4 broadcast/multicast/unspecified destinations, and IPv6 multicast pass through before routing or conntrack.
 - **Explicit local routing:** users [configure gateway management access](../reference/routing.md#explicit-local-rules) explicitly; no generated interface rules provide it. WAN egress still bypasses destinations matching `PARAM.local_ip`; this is not a general management-access guarantee. `PARAM.local_ip` is a startup snapshot: select the first resolved, existing LAN entry with a bindable canonical root (else WAN), skip refused roots, then take that root's first IPv4 address. Canonicalization follows the interface planner: bond/bridge members use their canonical master, while `vrf`/`openvswitch` members stay themselves. If no root is selectable or the selected root has no IPv4 address, the value is 0 and that bypass stays off. Later interface or address changes do not update the snapshot; a WAN address chosen while the LAN is absent also stays for the process lifetime. Interface observation still serves topology/ECS/health, and the existing non-DNS TCP pure-SYN local-probe skip remains.
+- **TUN ownership:** the daemon exclusively owns its new nonpersistent link, explicit addresses, dedicated capture table, five RPDB rules, blackhole guards and setup receipt. Operators keep main/WAN/LAN/NAT/firewall/forwarding topology stable. Watcher invalidation closes capture but is not an atomic root-route fence. Normal joined stop removes owned containment last; failure retains guards/rules/receipt for exact operator cleanup.
 
 ## Build features and mock mode
 
@@ -136,7 +139,7 @@ flowchart TB
 | `jemalloc` | yes | Pulls in `tikv-jemallocator` and installs jemalloc as the `honk-core` binary allocator; the crate builds jemalloc from C source. On Linux, startup disables transparent huge pages for the process before starting Tokio. Runtime options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`, because the crate prefixes jemalloc symbols with `_rjem_`. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
-`mock-ebpf` is not a Cargo feature. For the default TC path, a build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` selects the unprivileged development path explicitly. If `global.nfqueue_enable = true` is requested there, startup warns and disables NFQUEUE staging for that process without changing the file. Explicit XDP selection instead uses its userspace policy backend and real XDP/AF_XDP adapter independently of the `ebpf` feature; it is not mock capture.
+`mock-ebpf` is not a Cargo feature. For default TC, a build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` explicitly selects unprivileged development. Requested NFQUEUE there warns and disables for the process without changing the file. Explicit XDP/TUN use the shared userspace policy backend and their real Linux device owners independently of the `ebpf` feature. TUN requires `/dev/net/tun`, device/route and socket-mark privileges, rejects `--mock-ebpf`, and requires explicit `nfqueue_enable: false`; it never takes a TC/NFQUEUE fallback.
 
 When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy, not inherited host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 
