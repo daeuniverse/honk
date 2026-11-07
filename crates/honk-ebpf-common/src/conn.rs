@@ -341,6 +341,8 @@ pub struct ParseTransportCtx {
     pub listener_l4proto: u8, // Listener protocol
     pub is_fragmented: u8,
     pub frag_id: u32, // IPv4 identification or IPv6 fragment identification, host order
+    /// Offset of the UDP header; set only when the packet parsed as UDP.
+    pub l4_offset: u32,
 }
 
 // Every field is counted, including explicit padding and the lock's u32 value.

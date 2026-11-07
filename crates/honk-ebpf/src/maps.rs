@@ -11,7 +11,7 @@ use honk_ebpf_common::conn::{
 use honk_ebpf_common::dae_ip::In6Addr;
 use honk_ebpf_common::event::DaeEvent;
 use honk_ebpf_common::redirect_need::{
-    RoutingHandoffEntry, SocketIdentity, TcpSocketBinding, TuplesKey,
+    DnsRouteKey, RoutingHandoffEntry, SocketIdentity, TcpSocketBinding, TuplesKey,
 };
 use honk_ebpf_common::{DaeParam, RedirectEntry, RedirectTuple, RoutingPolicyDescriptor};
 #[cfg(feature = "routing-test")]
@@ -136,17 +136,22 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, FlowMapValue<RedirectEntry>, 6
 pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
 
 #[btf_map]
-/// The last UDP/53 route mark redirected for each tuple, read by userspace on
-/// kernels whose listeners cannot receive skb marks. Within one routing
-/// generation a tuple always gets the same mark; userspace still fences the
-/// generation it reads.
-pub static DNS_ROUTE_MARKS: LruHashMap<TuplesKey, u32, 16384> = LruHashMap::new();
+/// UDP/53 route marks of redirected queries, read by userspace on kernels
+/// whose listeners cannot receive skb marks. Routing can differ per datagram
+/// (DSCP), so the key includes the DNS transaction ID; userspace still fences
+/// the generation it reads.
+pub static DNS_ROUTE_MARKS: LruHashMap<DnsRouteKey, u32, 16384> = LruHashMap::new();
 
 /// Mirror a redirected UDP/53 route mark for listeners without `SO_RCVMARK`.
 #[inline(always)]
-pub fn publish_dns_route_mark(tuple: &TuplesKey, mark: u32) {
+pub fn publish_dns_route_mark(tuple: &TuplesKey, query_id: u16, mark: u32) {
     if mark != 0 && PARAM.load().dns_route_marks != 0 {
-        let _ = DNS_ROUTE_MARKS.insert(tuple, &mark, 0);
+        let key = DnsRouteKey {
+            tuple: *tuple,
+            query_id,
+            padding: [0; 6],
+        };
+        let _ = DNS_ROUTE_MARKS.insert(&key, &mark, 0);
     }
 }
 

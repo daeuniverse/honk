@@ -44,6 +44,19 @@ pub struct TuplesKey {
 const _: () = assert!(core::mem::size_of::<TuplesKey>() == 40);
 const _: () = assert!(core::mem::offset_of!(TuplesKey, padding) == 37);
 
+/// Key of a published UDP/53 route mark: the datagram's tuple and DNS
+/// transaction ID, so queries queued on one tuple keep their own routes.
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+pub struct DnsRouteKey {
+    pub tuple: TuplesKey,
+    pub query_id: u16,
+    pub padding: [u8; 6],
+}
+
+const _: () = assert!(core::mem::size_of::<DnsRouteKey>() == 48);
+const _: () = assert!(core::mem::offset_of!(DnsRouteKey, query_id) == 40);
+
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
 pub struct Tuples {
@@ -136,6 +149,9 @@ const _: () = {
 // padding, including inside In6Addr and RoutingResult.
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for TuplesKey {}
+// SAFETY: TuplesKey has no implicit padding, and the remainder is explicit.
+#[cfg(not(target_arch = "bpf"))]
+unsafe impl aya::Pod for DnsRouteKey {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for RoutingHandoffEntry {}
 #[cfg(not(target_arch = "bpf"))]

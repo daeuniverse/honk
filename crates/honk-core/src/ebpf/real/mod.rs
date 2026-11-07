@@ -786,12 +786,12 @@ impl EbpfBackend for RealEbpfBackend {
         self.flow_lookup("ROUTING_HANDOFF_MAP", key)
     }
 
-    fn dns_route_mark(&self, key: &TuplesKey) -> anyhow::Result<Option<u32>> {
+    fn dns_route_mark(&self, key: &honk_ebpf_common::DnsRouteKey) -> anyhow::Result<Option<u32>> {
         if crate::kernel::so_rcvmark_supported() {
             return Ok(None);
         }
         match self
-            .hash_map::<TuplesKey, u32>("DNS_ROUTE_MARKS")?
+            .hash_map::<honk_ebpf_common::DnsRouteKey, u32>("DNS_ROUTE_MARKS")?
             .get(key, 0)
         {
             Ok(mark) => Ok(Some(mark)),

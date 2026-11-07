@@ -539,6 +539,7 @@ fn fast_path_decision(
     trace_id: u32,
     direct_mark_index: u32,
     incarnation: u64,
+    dns_query_id: u16,
 ) -> Verdict {
     let dns = tuples.five.dst_port == 53;
     if outbound == OUTBOUND_DIRECT && mark == 0 && (!dns || must) {
@@ -581,7 +582,7 @@ fn fast_path_decision(
         return Err(TC_ACT_SHOT);
     }
 
-    crate::maps::publish_dns_route_mark(&tuples.five, dns_route_mark);
+    crate::maps::publish_dns_route_mark(&tuples.five, dns_query_id, dns_route_mark);
     unsafe {
         (*raw_skb(ctx)).cb[0] = TPROXY_MARK;
         (*raw_skb(ctx)).cb[1] = IPPROTO_UDP as u32;
@@ -708,6 +709,7 @@ fn do_tproxy_wan_egress_udp(
                 conn_state.trace_id,
                 u32::MAX,
                 conn_state.incarnation,
+                pkt.dns_query_id,
             );
         }
     }
@@ -809,6 +811,7 @@ fn do_tproxy_wan_egress_udp(
         trace_id,
         decision.direct_mark_index,
         pkt.incarnation,
+        pkt.dns_query_id,
     )
 }
 

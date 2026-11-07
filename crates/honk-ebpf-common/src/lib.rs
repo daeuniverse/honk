@@ -15,8 +15,8 @@ pub use crate::conn::{
     UdpDecisionState,
 };
 pub use crate::redirect_need::{
-    DomainRouting, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult, SocketIdentity,
-    TCP_BINDING_CHILD, TcpSocketBinding, Tuples, TuplesKey,
+    DnsRouteKey, DomainRouting, ROUTING_BITMAP_WORDS, RoutingHandoffEntry, RoutingResult,
+    SocketIdentity, TCP_BINDING_CHILD, TcpSocketBinding, Tuples, TuplesKey,
 };
 pub use routing_policy::{
     KernelRouteOutput, KernelRouteWitness, ROUTE_FACT_DESTINATION, ROUTE_FACT_DOMAIN,

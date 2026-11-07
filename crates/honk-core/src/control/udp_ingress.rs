@@ -257,7 +257,10 @@ impl UdpLoopState {
         let work = if self.requires_dns_route_mark && original_dst.port() == 53 {
             let mark = match recv_meta.packet_mark {
                 Some(mark) => Some(mark),
-                None => self.published_dns_route_mark(src_addr, original_dst).await,
+                None => {
+                    self.published_dns_route_mark(src_addr, original_dst, data)
+                        .await
+                }
             };
             let Some(route) = mark.and_then(UdpDnsRoute::from_mark) else {
                 debug!(%src_addr, %original_dst, "Dropping UDP/53 without a valid route mark");
@@ -313,14 +316,23 @@ impl UdpLoopState {
         &self,
         src_addr: SocketAddr,
         original_dst: SocketAddr,
+        query: &[u8],
     ) -> Option<u32> {
-        let key = crate::control::connection::build_tuples_key(
-            original_dst.ip(),
-            original_dst.port(),
-            src_addr.ip(),
-            src_addr.port(),
-            17,
-        );
+        let key = honk_ebpf_common::DnsRouteKey {
+            tuple: crate::control::connection::build_tuples_key(
+                original_dst.ip(),
+                original_dst.port(),
+                src_addr.ip(),
+                src_addr.port(),
+                17,
+            ),
+            // The datapath reads the same two payload bytes; a shorter
+            // datagram has none there either.
+            query_id: query
+                .first_chunk::<2>()
+                .map_or(0, |id| u16::from_be_bytes(*id)),
+            padding: [0; 6],
+        };
         self.handle
             .ebpf
             .read()

@@ -68,6 +68,9 @@ pub struct ParsedPacket {
     pub l4proto: u8,
     pub listener_l4proto: u8,
     pub is_fragmented: u8,
+    /// DNS transaction ID of a UDP/53 query, when DNS route marks are
+    /// published; zero otherwise.
+    pub dns_query_id: u16,
     pub routing_input: honk_ebpf_common::RoutingInput,
     pub route_witness: honk_ebpf_common::KernelRouteWitness,
     pub trace_id: u32,
@@ -380,6 +383,7 @@ impl ParseTransportExt for ParseTransportCtx {
                         return Err(ERR_MALFORMED);
                     }
                     self.listener_l4proto = IPPROTO_UDP;
+                    self.l4_offset = offset;
                 }
                 _ => return Err(PASS_UNSUPPORTED),
             }
@@ -494,6 +498,7 @@ impl ParseTransportExt for ParseTransportCtx {
                         return Err(ERR_MALFORMED);
                     }
                     self.listener_l4proto = IPPROTO_UDP;
+                    self.l4_offset = offset;
                 }
                 IPPROTO_ICMPV6 => {
                     ret = unsafe {
@@ -589,6 +594,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     }
                     self.udph = unsafe { ptr::read(udph_ptr) };
                     self.listener_l4proto = IPPROTO_UDP;
+                    self.l4_offset = l4_offset as u32;
                     return Ok(());
                 }
                 _ => return Err(PASS_UNSUPPORTED),
@@ -664,6 +670,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     }
                     self.udph = unsafe { ptr::read(udph_ptr) };
                     self.listener_l4proto = IPPROTO_UDP;
+                    self.l4_offset = offset;
                     return Ok(());
                 }
                 IPPROTO_ICMPV6 => {
@@ -761,6 +768,14 @@ pub fn parse_packet(ctx: &TcContext, link_h_len: u32, out: &mut ParsedPacket) ->
     out.is_fragmented = tctx.is_fragmented;
     out.frag_id = tctx.frag_id;
     out.incarnation = 0;
+    out.dns_query_id = 0;
+    if tctx.l4proto == IPPROTO_UDP
+        && u16::from_be_bytes(tctx.udph.dst) == 53
+        && crate::maps::PARAM.load().dns_route_marks != 0
+        && let Ok(id) = ctx.load::<[u8; 2]>(tctx.l4_offset as usize + mem::size_of::<UdpHdr>())
+    {
+        out.dns_query_id = u16::from_be_bytes(id);
+    }
     tctx.fill_tuples(&mut out.tuples);
     0
 }
