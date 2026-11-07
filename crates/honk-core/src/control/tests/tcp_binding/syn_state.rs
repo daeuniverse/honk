@@ -334,6 +334,9 @@ pub(super) fn full_child(family: &str) -> anyhow::Result<()> {
 /// A full child without proof storage is refused whatever the SYN's ISN: only the storage
 /// can authorize reuse, and the ISN comparison needs it.
 pub(super) fn full_child_unproven(family: &str) -> anyhow::Result<()> {
+    if !optmem_is_per_netns() {
+        return Ok(());
+    }
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         let mut hs = Handshake::open(lab, false).await?;
         let child = release_without_storage(&mut hs).await?;

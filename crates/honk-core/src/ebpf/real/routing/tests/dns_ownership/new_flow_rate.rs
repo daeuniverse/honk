@@ -52,7 +52,7 @@ fn fixture() -> (RealEbpfBackend, TproxyListeners) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published() {
     isolated(|| {
         let families: [(IpAddr, IpAddr, IpAddr); 2] = [
@@ -118,7 +118,7 @@ fn lan_source_over_the_new_flow_limit_is_dropped_before_any_state_is_published()
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn local_udp_learning_shares_the_source_budget_without_dropping_service_requests() {
     isolated(|| {
         assert!(

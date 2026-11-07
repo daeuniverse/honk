@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn untouched_passes_return_next_before_backend_admission() {
     isolated(|| {
         // No backend ABI validation: this also replays the pre-cutover object.
@@ -57,7 +57,7 @@ const PEERS: [(IpAddr, IpAddr, IpAddr); 2] = [
 ];
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn pure_passes_continue_tcx_without_changing_marks() {
     isolated(|| {
         let mut backend = RealEbpfBackend::load_routing_test_fixture(
@@ -129,16 +129,18 @@ fn pure_passes_continue_tcx_without_changing_marks() {
                 );
                 assert_next(&backend, "wan_egress_l2", "", &local, input);
             }
-            assert_next(
-                &backend,
-                "wan_egress_l2",
-                "",
-                &bytes,
-                SkbInput {
-                    ingress_ifindex: 1,
-                    ..input
-                },
-            );
+            if forwarded_test_runs(&backend) {
+                assert_next(
+                    &backend,
+                    "wan_egress_l2",
+                    "",
+                    &bytes,
+                    SkbInput {
+                        ingress_ifindex: 1,
+                        ..input
+                    },
+                );
+            }
             for name in ["lan_egress_l2", "wan_ingress_l2"] {
                 for (sport, dport) in [(53, port + 3), (port + 4, 3478)] {
                     let reply = packet(src, dst, IPPROTO_UDP, sport, dport, 0, 0);
@@ -220,7 +222,7 @@ fn pure_passes_continue_tcx_without_changing_marks() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
     isolated(|| {
         // The parser scratch is per CPU: pin so each frame follows the TCP
@@ -298,7 +300,7 @@ fn unsupported_lan_ingress_frames_continue_tcx_without_marking() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn conn_capacity_native_passes_continue_tcx_without_clearing_marks() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[]);

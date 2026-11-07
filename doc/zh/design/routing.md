@@ -4,7 +4,7 @@
 
 路由只有一个手写语义模型，执行方式可以不同：用户态 `Router` 解释规范化的
 policy IR，受限编译器把同一 IR 编译为原生 eBPF 比较代码。内核不解释第二套
-policy 表示。真实后端的内核基线为 Linux 6.12。
+policy 表示。真实后端的最低内核为 Linux 5.15；下文的测量来自 Linux 6.12。
 
 静态 TC 程序继续负责报文解析、特殊/本地排除、DNS 接管判断、conntrack、mode 与健康检查、
 NFQUEUE 所有权、重定向和回包统计。生成函数只负责
@@ -238,9 +238,10 @@ IPv4/IPv6 仍分别构造 key、
 6. 成功更新返回后才允许退役旧 TC 槽和旧 maps；用户态 IR/reference lease 独立保有
    自己的生命周期。
 
-Linux 6.12 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成：
-[`maybe_wait_bpf_programs`](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c)
-使用 `synchronize_rcu()`。普通 root store、固定延时或“有两个槽”不是等价 grace。
+Linux 在 map-in-map 更新成功返回前等待旧 non-sleepable BPF 调用完成：
+[5.15](https://github.com/torvalds/linux/blob/v5.15/kernel/bpf/syscall.c) 与
+[6.12](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c) 的
+`maybe_wait_bpf_programs` 均使用 `synchronize_rcu()`。普通 root store、固定延时或“有两个槽”不是等价 grace。
 不能依赖不支持的 freplace `BPF_LINK_UPDATE`，也不 detach/attach 活跃槽。
 
 后端发布操作在 root commit 前必须 all-or-nothing。map 构建、verifier、任一 inactive

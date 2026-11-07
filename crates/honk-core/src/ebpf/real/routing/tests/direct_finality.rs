@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn direct_prefix_finality_preserves_domain_order_and_terminal_contracts() {
     use honk_ebpf_common::{
         DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, DATAPATH_FLAG_TRACE_ENABLED,

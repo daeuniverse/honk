@@ -42,6 +42,31 @@ const TC_PROGRAMS: &[&str] = &[
     "wan_egress_l3",
 ];
 
+/// Kernels before Linux 6.6 have no TCX and bind WAN egress as lane filters:
+/// the unsplit programs exceed their verifier's instruction budget.
+fn tcx_supported() -> bool {
+    let mut name: libc::utsname = unsafe { mem::zeroed() };
+    assert_eq!(unsafe { libc::uname(&mut name) }, 0, "uname");
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }.to_string_lossy();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (6, 6)
+}
+
+/// The programs `name` runs as, in filter-chain order.
+fn lanes(name: &'static str) -> Vec<&'static str> {
+    match (tcx_supported(), name) {
+        (false, "wan_egress_l2") => vec!["wan_egress_tcp_l2", "wan_egress_other_l2"],
+        (false, "wan_egress_l3") => vec![
+            "wan_egress_tcp_l3",
+            "wan_egress_other_l3_eth",
+            "wan_egress_other_l3_bare",
+        ],
+        _ => vec![name],
+    }
+}
+
 struct Fixture {
     bpf: Ebpf,
     _pin: tempfile::TempDir,
@@ -115,7 +140,7 @@ impl Fixture {
 
         // Loading every production classifier catches missing map relocations
         // and verifier regressions without installing any host hook.
-        for name in TC_PROGRAMS {
+        for name in TC_PROGRAMS.iter().flat_map(|name| lanes(name)) {
             let program: &mut SchedClassifier = bpf
                 .program_mut(name)
                 .unwrap_or_else(|| panic!("missing TC program {name}"))
@@ -129,43 +154,90 @@ impl Fixture {
         Self { bpf, _pin: pin }
     }
 
-    fn run(&self, name: &str, packet: &[u8], input: SkbInput) -> Run {
-        assert!(
-            packet.len() >= 14,
-            "SCHED_CLS test-run requires Ethernet input"
-        );
+    /// Whether `BPF_PROG_TEST_RUN` accepts an `ingress_ifindex`, which
+    /// forwarded packets carry; Linux 5.15 refuses it with EINVAL. Real
+    /// forwarding is covered on a tun device instead.
+    fn forwarded_test_runs(&self) -> bool {
         let program: &SchedClassifier = self
             .bpf
-            .program(name)
-            .unwrap_or_else(|| panic!("missing loaded TC program {name}"))
+            .program("lan_egress_l2")
+            .unwrap()
             .try_into()
-            .unwrap_or_else(|error| panic!("{name} is not SCHED_CLS: {error}"));
-        let context = skb_context(input);
+            .unwrap();
+        let context = skb_context(SkbInput {
+            ingress_ifindex: 1,
+            ..Default::default()
+        });
         let context_bytes = unsafe {
             std::slice::from_raw_parts(
                 (&context as *const __sk_buff).cast::<u8>(),
                 mem::size_of::<__sk_buff>(),
             )
         };
-        let mut output = vec![0u8; packet.len() + 64];
-        let mut context_out = vec![0u8; mem::size_of::<__sk_buff>()];
-        let result = program
+        let supported = program
             .test_run(TestRunOptions {
-                data_in: Some(packet),
-                data_out: Some(&mut output),
+                data_in: Some(&[0u8; 64]),
                 ctx_in: Some(context_bytes),
-                ctx_out: Some(&mut context_out),
                 repeat: 1,
                 ..Default::default()
             })
-            .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {name}: {error}"));
-        let returned: __sk_buff = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
-        Run {
-            return_value: result.return_value,
-            data_size_out: result.data_size_out,
-            mark: returned.mark,
-            data: output[..result.data_size_out as usize].to_vec(),
+            .is_ok();
+        if !supported {
+            eprintln!("BPF_PROG_TEST_RUN refuses ingress_ifindex: forwarded cases skipped");
         }
+        supported
+    }
+
+    /// Runs `name`'s lanes in chain order: each sees the previous lane's
+    /// packet and context, and the first verdict other than
+    /// `TC_ACT_UNSPEC` ends the chain.
+    fn run(&self, name: &'static str, packet: &[u8], input: SkbInput) -> Run {
+        assert!(
+            packet.len() >= 14,
+            "SCHED_CLS test-run requires Ethernet input"
+        );
+        let mut context = skb_context(input);
+        let mut data = packet.to_vec();
+        let mut run = None;
+        for lane in lanes(name) {
+            let program: &SchedClassifier = self
+                .bpf
+                .program(lane)
+                .unwrap_or_else(|| panic!("missing loaded TC program {lane}"))
+                .try_into()
+                .unwrap_or_else(|error| panic!("{lane} is not SCHED_CLS: {error}"));
+            let context_bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&context as *const __sk_buff).cast::<u8>(),
+                    mem::size_of::<__sk_buff>(),
+                )
+            };
+            let mut output = vec![0u8; data.len() + 64];
+            let mut context_out = vec![0u8; mem::size_of::<__sk_buff>()];
+            let result = program
+                .test_run(TestRunOptions {
+                    data_in: Some(&data),
+                    data_out: Some(&mut output),
+                    ctx_in: Some(context_bytes),
+                    ctx_out: Some(&mut context_out),
+                    repeat: 1,
+                    ..Default::default()
+                })
+                .unwrap_or_else(|error| panic!("BPF_PROG_TEST_RUN {lane}: {error}"));
+            context = unsafe { ptr::read_unaligned(context_out.as_ptr().cast()) };
+            data = output[..result.data_size_out as usize].to_vec();
+            let done = result.return_value != TC_ACT_UNSPEC;
+            run = Some(Run {
+                return_value: result.return_value,
+                data_size_out: result.data_size_out,
+                mark: context.mark,
+                data: data.clone(),
+            });
+            if done {
+                break;
+            }
+        }
+        run.expect("at least one lane")
     }
 }
 
@@ -430,13 +502,16 @@ fn ndp_redirect_l2_contract() {
         TC_ACT_SHOT,
         "local ICMPv6 Redirect is dropped on WAN egress"
     );
-    assert_eq!(
-        fixture
-            .run("wan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
-            .return_value,
-        TC_ACT_UNSPEC,
-        "forwarded ICMPv6 Redirect passes on WAN egress"
-    );
+    let forwarded_runs = fixture.forwarded_test_runs();
+    if forwarded_runs {
+        assert_eq!(
+            fixture
+                .run("wan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
+                .return_value,
+            TC_ACT_UNSPEC,
+            "forwarded ICMPv6 Redirect passes on WAN egress"
+        );
+    }
     assert_eq!(
         fixture
             .run(
@@ -448,13 +523,15 @@ fn ndp_redirect_l2_contract() {
         TC_ACT_UNSPEC,
         "other ICMPv6 remains untouched on WAN egress"
     );
-    assert_eq!(
-        fixture
-            .run("lan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
-            .return_value,
-        TC_ACT_UNSPEC,
-        "forwarded ICMPv6 Redirect passes"
-    );
+    if forwarded_runs {
+        assert_eq!(
+            fixture
+                .run("lan_egress_l2", &icmp6(src6, dst6, 137), forwarded)
+                .return_value,
+            TC_ACT_UNSPEC,
+            "forwarded ICMPv6 Redirect passes"
+        );
+    }
     assert_eq!(
         fixture
             .run(
@@ -592,6 +669,9 @@ fn reply_rx_counters_require_exact_reverse_tuple() {
 #[ignore = "requires root, bpffs, and BPF_PROG_TEST_RUN"]
 fn proxy_replies_do_not_create_reverse_udp_state() {
     let fixture = Fixture::load();
+    if !fixture.forwarded_test_runs() {
+        return;
+    }
     let client = [10, 0, 0, 2];
     let peer = [198, 51, 100, 9];
     // The fixture's dae0 is ifindex 1. A reply forwarded from the WAN still
@@ -996,15 +1076,17 @@ fn ndp_redirect_l3_on_real_tun() {
 
         // A single-homed gateway shares one L3 link, where wan_egress is the
         // only egress hook that can suppress the kernel's Redirect.
-        let program: &mut SchedClassifier = fixture
-            .bpf
-            .program_mut("wan_egress_l3")
-            .unwrap()
-            .try_into()
-            .unwrap();
-        let link = program
-            .attach(c"honk-out", aya::programs::TcAttachType::Egress)
-            .unwrap();
+        // A filter added without a priority runs first, so lanes go in last
+        // to first.
+        let mut links = Vec::new();
+        for lane in lanes("wan_egress_l3").into_iter().rev() {
+            let program: &mut SchedClassifier =
+                fixture.bpf.program_mut(lane).unwrap().try_into().unwrap();
+            let link = program
+                .attach(c"honk-out", aya::programs::TcAttachType::Egress)
+                .unwrap();
+            links.push((lane, link));
+        }
         message[0] = 137;
         match socket.send_to(&message, &SocketAddr::new(destination.into(), 0).into()) {
             Ok(sent) => assert_eq!(sent, message.len()),
@@ -1019,7 +1101,11 @@ fn ndp_redirect_l3_on_real_tun() {
             received(&mut outgoing, destination, 137),
             "forwarded Redirect passes on WAN egress"
         );
-        program.detach(link).unwrap();
+        for (lane, link) in links {
+            let program: &mut SchedClassifier =
+                fixture.bpf.program_mut(lane).unwrap().try_into().unwrap();
+            program.detach(link).unwrap();
+        }
         socket
             .send_to(&message, &SocketAddr::new(destination.into(), 0).into())
             .unwrap();

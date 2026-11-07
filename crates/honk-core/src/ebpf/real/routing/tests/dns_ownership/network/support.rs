@@ -124,7 +124,7 @@ impl NetworkFixture {
             dae0peer_mac: peer_mac,
             use_redirect_peer,
             dae_socket_mark: DAE_BYPASS_MARK,
-            ..Default::default()
+            ..fixture_param()
         };
         let mut rules = vec![rule(
             "native-dns",
@@ -427,15 +427,35 @@ pub(super) fn recv_marked(socket: &UdpSocket) -> (Vec<u8>, SocketAddr, u32) {
     let size = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut message, 0) };
     assert!(size >= 0, "recvmsg: {}", std::io::Error::last_os_error());
     assert_eq!(message.msg_flags & libc::MSG_CTRUNC, 0);
-    let first = unsafe { libc::CMSG_FIRSTHDR(&message) };
-    assert!(!first.is_null(), "missing SO_MARK cmsg");
-    assert_eq!(unsafe { (*first).cmsg_level }, libc::SOL_SOCKET);
-    assert_eq!(unsafe { (*first).cmsg_type }, libc::SO_MARK);
-    assert_eq!(unsafe { (*first).cmsg_len } as usize, unsafe {
-        libc::CMSG_LEN(mem::size_of::<u32>() as u32)
-    } as usize);
-    let mark = unsafe { ptr::read_unaligned(libc::CMSG_DATA(first).cast::<u32>()) };
-    assert!(unsafe { libc::CMSG_NXTHDR(&message, first) }.is_null());
+    let mut mark = None;
+    let mut original_destination = None;
+    let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !header.is_null() {
+        let (level, kind) = unsafe { ((*header).cmsg_level, (*header).cmsg_type) };
+        let data = unsafe { libc::CMSG_DATA(header) };
+        match (level, kind) {
+            (libc::SOL_SOCKET, libc::SO_MARK) => {
+                assert!(mark.is_none(), "duplicate SO_MARK cmsg");
+                mark = Some(unsafe { ptr::read_unaligned(data.cast::<u32>()) });
+            }
+            (libc::IPPROTO_IP, libc::IP_ORIGDSTADDR) => {
+                let address = unsafe { ptr::read_unaligned(data.cast::<libc::sockaddr_in>()) };
+                original_destination = Some(SocketAddr::from((
+                    Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes()),
+                    u16::from_be(address.sin_port),
+                )));
+            }
+            (libc::IPPROTO_IPV6, libc::IPV6_ORIGDSTADDR) => {
+                let address = unsafe { ptr::read_unaligned(data.cast::<libc::sockaddr_in6>()) };
+                original_destination = Some(SocketAddr::from((
+                    Ipv6Addr::from(address.sin6_addr.s6_addr),
+                    u16::from_be(address.sin6_port),
+                )));
+            }
+            other => panic!("unexpected cmsg {other:?}"),
+        }
+        header = unsafe { libc::CMSG_NXTHDR(&message, header) };
+    }
     let source = unsafe {
         match source.ss_family as libc::c_int {
             libc::AF_INET => {
@@ -459,7 +479,51 @@ pub(super) fn recv_marked(socket: &UdpSocket) -> (Vec<u8>, SocketAddr, u32) {
             family => panic!("unexpected source family {family}"),
         }
     };
+    let mark = mark.unwrap_or_else(|| {
+        published_dns_route_mark(
+            &payload[..size as usize],
+            source,
+            original_destination.expect("missing SO_MARK and original destination cmsgs"),
+        )
+    });
     (payload[..size as usize].to_vec(), source, mark)
+}
+
+/// The route mark the newest loaded datapath published for a UDP/53 query, as
+/// the listener reads it before Linux 5.19; zero when none was published.
+fn published_dns_route_mark(
+    query: &[u8],
+    source: SocketAddr,
+    original_destination: SocketAddr,
+) -> u32 {
+    let id = aya::maps::loaded_maps()
+        .filter_map(Result::ok)
+        .filter(|map| map.name_as_str() == Some("DNS_ROUTE_MARKS"))
+        .map(|map| map.id())
+        .max()
+        .expect("no DNS_ROUTE_MARKS map loaded");
+    let map = aya::maps::Map::LruHashMap(aya::maps::MapData::from_id(id).unwrap());
+    let marks =
+        aya::maps::HashMap::<_, honk_ebpf_common::DnsRouteKey, u32>::try_from(&map).unwrap();
+    let mapped = |address: SocketAddr| match address.ip() {
+        std::net::IpAddr::V4(ip) => In6Addr::from_ipv6_addr(ip.to_ipv6_mapped()),
+        std::net::IpAddr::V6(ip) => In6Addr::from_ipv6_addr(ip),
+    };
+    let key = honk_ebpf_common::DnsRouteKey {
+        tuple: TuplesKey {
+            dst_ip: mapped(original_destination),
+            src_ip: mapped(source),
+            dst_port: original_destination.port(),
+            src_port: source.port(),
+            l4proto: libc::IPPROTO_UDP as u8,
+            ..Default::default()
+        },
+        query_id: query
+            .first_chunk::<2>()
+            .map_or(0, |id| u16::from_be_bytes(*id)),
+        padding: [0; 6],
+    };
+    marks.get(&key, 0).unwrap_or(0)
 }
 
 fn add_default_routes(netns: &OwnedFd, name: &str, v4_gateway: [u8; 4], v6_gateway: [u8; 16]) {

@@ -31,7 +31,7 @@ fn capturing(must: bool) -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) 
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -116,7 +116,7 @@ fn old_tcp_owner_cannot_retire_a_new_syn_on_the_same_tuple() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -194,7 +194,7 @@ fn runtime_trace_gate_preserves_redirect_authority_and_admitted_witnesses() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_changes() {
     isolated(|| {
         let (mut backend, plan, _listeners) = capturing(true);
@@ -236,7 +236,7 @@ fn cached_token_zero_udp_preserves_original_witness_across_policy_and_packet_cha
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn staged_udp_witness_uses_exact_token_and_generation() {
     isolated(|| {
         for capture in [false, true] {
@@ -297,7 +297,7 @@ fn staged_udp_witness_uses_exact_token_and_generation() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn tcp_replacement_keeps_ambiguity_after_prior_sidecar_loss() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -335,7 +335,7 @@ fn tcp_replacement_keeps_ambiguity_after_prior_sidecar_loss() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn exhausted_capture_ids_do_not_change_redirect_or_decision_tokens() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -363,7 +363,7 @@ fn exhausted_capture_ids_do_not_change_redirect_or_decision_tokens() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -415,7 +415,7 @@ fn sidecar_pressure_preserves_cached_reference_without_fabricating_new_evidence(
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
     isolated(|| {
         let (mut backend, _, _listeners) = capturing(true);
@@ -502,7 +502,7 @@ fn delayed_token_zero_udp_keeps_its_packet_reference_after_conn_recreation() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn marked_direct_must_wan_redirects_capture_tcp_and_udp_witnesses() {
     isolated(|| {
         let rules = [(443, USER_MARK), (444, 0), (53, USER_MARK)].map(|(port, mark)| {

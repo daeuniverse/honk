@@ -112,7 +112,7 @@ fn policy_targets(fixture: &NetworkFixture) -> [IpAddr; 2] {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -187,7 +187,7 @@ fn direct_marks_route_native_lan_v4_v6_tcp_udp_and_cached_packets() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn direct_socket_marks_route_v4_v6_tcp_udp_without_socket_identity_or_recapture() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -295,7 +295,7 @@ fn direct_socket_marks_route_v4_v6_tcp_udp_without_socket_identity_or_recapture(
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn wan_global_bypass_is_exact_and_pending_tokens_never_bypass() {
     isolated(|| {
         let mut netlink = crate::netlink::NlSock::new().unwrap();
@@ -368,7 +368,7 @@ fn wan_global_bypass_is_exact_and_pending_tokens_never_bypass() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn wan_marked_direct_must_dns_and_cached_flows_reach_transparent_sockets() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -429,7 +429,10 @@ fn wan_marked_direct_must_dns_and_cached_flows_reach_transparent_sockets() {
                             UdpDnsRoute::direct(0, fixture.backend.routing_policy_generation())
                         );
                     } else {
-                        assert_eq!(mark, TPROXY_MARK);
+                        // Before Linux 5.19 only UDP/53 marks are observable.
+                        if crate::kernel::so_rcvmark_supported() {
+                            assert_eq!(mark, TPROXY_MARK);
+                        }
                         let selected = handoff(&fixture.backend, &key);
                         assert_eq!(selected.result.mark, RULE_MARK);
                         assert_eq!(selected.result.must, 1);
@@ -451,7 +454,7 @@ fn wan_marked_direct_must_dns_and_cached_flows_reach_transparent_sockets() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -781,7 +784,7 @@ fn wan_direct_udp_retirement_reselects_marks_on_the_same_tuple() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn wan_direct_dns_same_tuple_keeps_each_datagrams_mark_before_userspace_reads() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -860,7 +863,7 @@ fn wan_direct_dns_same_tuple_keeps_each_datagrams_mark_before_userspace_reads() 
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn compiled_direct_mark_index_matches_canonical_table_and_absent_actions() {
     isolated(|| {
         let rules = [

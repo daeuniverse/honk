@@ -24,7 +24,7 @@ const REQUESTS: [&[u8]; 2] = [b"first-transparent-request", b"reused-tuple-reque
 const REPLIES: [&[u8]; 2] = [b"first-server-active-close", b"second-server-active-close"];
 
 #[test]
-#[ignore = "requires Linux 6.12+, root, bpffs and eBPF TC support in an isolated VM"]
+#[ignore = "requires Linux 5.15+, root, bpffs and eBPF TC support in an isolated VM"]
 fn netns_tcp_reuses_tuple_during_daens_time_wait() -> anyhow::Result<()> {
     run_isolated(CASE, CHILD, ["v4", "v6"], run_child)
 }

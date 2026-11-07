@@ -20,7 +20,7 @@ fn addresses() -> [(IpAddr, IpAddr); 2] {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[]);
@@ -87,7 +87,7 @@ fn reverse_udp_pressure_keeps_existing_entries_without_learning_new_ones() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn reverse_udp_observation_never_overwrites_forward_authority() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[]);

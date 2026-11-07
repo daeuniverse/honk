@@ -68,7 +68,7 @@ fn take_filler(backend: &mut RealEbpfBackend, handoff_map: bool, index: u32) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn failed_syn_publication_retries_but_committed_metadata_loss_refuses() {
     isolated(|| {
         let mut case = 0u16;

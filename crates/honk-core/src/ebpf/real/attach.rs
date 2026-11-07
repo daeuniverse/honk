@@ -33,7 +33,9 @@ impl RealEbpfBackend {
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
             version >= super::MIN_KERNEL,
-            "compiled routing requires Linux 6.12 or newer (running {}.{}.{})",
+            "compiled routing requires Linux {}.{} or newer (running {}.{}.{})",
+            super::MIN_KERNEL.0,
+            super::MIN_KERNEL.1,
             version.0,
             version.1,
             version.2

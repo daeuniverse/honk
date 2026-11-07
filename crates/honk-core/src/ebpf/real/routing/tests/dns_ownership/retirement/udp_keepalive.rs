@@ -13,7 +13,7 @@ fn age_udp_conn(backend: &mut RealEbpfBackend, key: &TuplesKey, age_s: u64) -> C
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn idle_udp_handoff_renews_only_its_matching_owner_without_an_expiry_hint() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -96,7 +96,7 @@ fn set_udp_reply_owner(backend: &mut RealEbpfBackend, key: &TuplesKey, state: u8
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn proxied_udp_replies_renew_liveness_and_allow_client_resumption() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -153,7 +153,7 @@ fn proxied_udp_replies_renew_liveness_and_allow_client_resumption() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn udp_replies_preserve_frozen_and_expired_connection_timestamps() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -188,7 +188,7 @@ fn udp_replies_preserve_frozen_and_expired_connection_timestamps() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn udp_reply_renewal_requires_exact_redirect_and_connection_identity() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();

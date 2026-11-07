@@ -105,7 +105,7 @@ fn verdict(backend: &RealEbpfBackend, side: &str, frame: &[u8]) -> u32 {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn later_fragments_of_a_redirected_or_dropped_datagram_are_dropped() {
     isolated(|| {
         for (family, side, outbound, first_verdict, pass) in [
@@ -219,7 +219,7 @@ fn fragment_behind_destination_options(src: IpAddr, dst: IpAddr, id: u32, first:
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn later_fragments_behind_ipv6_extension_headers_inherit_the_first_fragments_fate() {
     isolated(|| {
         let (src, _, dst) = families()[1];
@@ -246,7 +246,7 @@ fn later_fragments_behind_ipv6_extension_headers_inherit_the_first_fragments_fat
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn an_expired_fragment_record_does_not_affect_a_reused_datagram_id() {
     isolated(|| {
         // A fresh VM may have less uptime than the record TTL. Wait once for a

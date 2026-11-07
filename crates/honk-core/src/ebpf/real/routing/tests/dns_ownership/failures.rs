@@ -90,7 +90,7 @@ fn fragmented_dns_packet(source_port: u16, dscp: u8) -> Vec<u8> {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn routing_handoff_map_exhaustion_preserves_raw_udp_dns_carriers_and_fails_closed_required_handoffs()
  {
     isolated(|| {
@@ -158,7 +158,7 @@ fn routing_handoff_map_exhaustion_preserves_raw_udp_dns_carriers_and_fails_close
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn redirect_track_exhaustion_fails_closed_redirected_dns_but_preserves_native_direct_must() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&pressure_rules());

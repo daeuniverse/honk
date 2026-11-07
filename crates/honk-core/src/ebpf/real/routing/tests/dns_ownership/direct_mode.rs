@@ -4,7 +4,7 @@ use super::*;
 /// hook: no dead-proxy health gate, no handoff, and no proxy-rule mark in
 /// policy routing. A `must` proxy rule keeps its route and new-flow health gate.
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
     isolated(|| {
         let destinations: [(IpAddr, bool); 4] = [
@@ -99,7 +99,7 @@ fn direct_mode_normalizes_nonmust_proxy_in_lan_and_wan_tcp_udp() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn rule_direct_prefix_offload_preserves_global_handoffs() {
     isolated(|| {
         let destination = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 80));

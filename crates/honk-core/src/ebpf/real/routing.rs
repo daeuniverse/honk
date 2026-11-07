@@ -671,8 +671,10 @@ impl RealEbpfBackend {
         let version =
             kernel_version().ok_or_else(|| anyhow::anyhow!("cannot determine kernel version"))?;
         anyhow::ensure!(
-            version >= (6, 12, 0),
-            "routing tests require Linux 6.12 or newer"
+            version >= super::MIN_KERNEL,
+            "routing tests require Linux {}.{} or newer",
+            super::MIN_KERNEL.0,
+            super::MIN_KERNEL.1
         );
         layout::validate_object(obj)?;
         param.tcp_daens_netns_id = crate::daens::daens_netns_id()?;
@@ -728,6 +730,9 @@ impl RealEbpfBackend {
         ifindex: u32,
         direction: crate::ebpf::interface::Direction,
     ) -> std::io::Result<Vec<u32>> {
+        if !bindings::tcx_supported() {
+            return Ok(bindings::filter_chain(ifindex, direction)?.links);
+        }
         Ok(bindings::query_chain(ifindex, direction)?.links)
     }
 

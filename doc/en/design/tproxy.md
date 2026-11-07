@@ -1,6 +1,6 @@
 # TPROXY datapath
 
-The TPROXY datapath intercepts traffic with netfilter instead of eBPF. It serves kernels the [eBPF datapath](./datapath.md) cannot load on (Linux 4.19 up to its floor) and Android, where netd owns the root-cgroup BPF hooks. `global.datapath` selects it ([Datapath selection](../reference/global.md#datapath-selection)); the code lives in `crates/honk-core/src/tproxy.rs`.
+The TPROXY datapath intercepts traffic with netfilter instead of eBPF. It serves kernels the [eBPF datapath](./datapath.md) cannot load on (older than Linux 5.15) and Android, where netd owns the root-cgroup BPF hooks. `global.datapath` selects it ([Datapath selection](../reference/global.md#datapath-selection)); the code lives in `crates/honk-core/src/tproxy.rs`.
 
 ## Interception
 

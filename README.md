@@ -64,7 +64,7 @@ The [documentation index](doc/README.md) links configuration guides, native and 
 ## Versions and compatibility
 
 - Releases follow [SemVer](https://semver.org/) from `v0.1.0`; `-alpha.N`, `-beta.N`, and `-rc.N` tags are prereleases. Before `1.0`, minor releases may change configuration or behaviour; read the release notes before upgrading.
-- Transparent proxying requires root. The eBPF datapath needs Linux 6.12+, the required kernel options, and bpffs; older kernels (down to 4.14) and rooted Android use the [netfilter TPROXY datapath](doc/en/design/tproxy.md), selected automatically. See the startup guide linked above.
+- Transparent proxying requires root. The eBPF datapath needs Linux 5.15+, the required kernel options, and bpffs; older kernels (down to 4.14) and rooted Android use the [netfilter TPROXY datapath](doc/en/design/tproxy.md), selected automatically. See the startup guide linked above.
 - Configuration uses [dae syntax](doc/en/configuration.md). See [NFQUEUE operation](doc/en/design/nfqueue.md) and [VLESS migration](doc/en/reference/nodes.md#migration-from-vless_mode) before changing an existing deployment.
 - The native API uses `/api/v1`; before `1.0` its contract may change in a minor release. `GET /api/v1/version` reports the contract identity.
 

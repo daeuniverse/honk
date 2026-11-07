@@ -158,7 +158,7 @@ fn queue() -> (
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
 fn fragmented_dns_v4_v6_reassembles_before_queue_in_both_orders() {
     for use_redirect_peer in [0, 1] {
         isolated(move || {
@@ -240,7 +240,7 @@ fn fragmented_dns_v4_v6_reassembles_before_queue_in_both_orders() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
 fn fragmented_dns_preserves_native_must_block_and_queue_readiness() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -313,7 +313,7 @@ fn fragmented_dns_preserves_native_must_block_and_queue_readiness() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn fragmented_dns_parser_state_does_not_capture_following_unfragmented_packets() {
     isolated(|| {
         pin_to_current_cpu();
@@ -407,7 +407,7 @@ fn fragmented_dns_parser_state_does_not_capture_following_unfragmented_packets()
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, NFQUEUE, and isolated netns support"]
 fn fragmented_dns_bad_checksum_drops_without_poisoning_the_queue() {
     isolated(|| {
         let mut fixture = NetworkFixture::new(0);
@@ -456,11 +456,14 @@ fn fragmented_dns_bad_checksum_drops_without_poisoning_the_queue() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn dns_queue_carriers_cannot_escape_through_lan_or_wan_egress() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&dns_ordering_rules());
         load_classifier(&mut backend, "lan_egress_l2");
+        if !forwarded_test_runs(&backend) {
+            return;
+        }
         let route = UdpDnsRoute::new(2, backend.routing_policy_generation()).unwrap();
         for ready in [true, false] {
             backend.set_datapath_ready(ready).unwrap();

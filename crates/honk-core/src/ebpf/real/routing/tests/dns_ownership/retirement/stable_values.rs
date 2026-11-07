@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn native_retained_tuple_elements_observe_same_key_fresh_syn_publication() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();

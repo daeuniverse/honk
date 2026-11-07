@@ -2,7 +2,7 @@ use super::*;
 use aya::maps::IterableMap;
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn locked_flow_snapshots_are_coherent_during_native_in_place_updates() -> anyhow::Result<()> {
     use std::os::fd::AsFd;
     use std::sync::{Arc, Barrier};

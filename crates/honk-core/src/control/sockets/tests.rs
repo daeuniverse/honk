@@ -630,7 +630,7 @@ fn optional_priority_cmsg_cannot_reject_or_relabel_packet_marks() {
     any(target_os = "linux", target_os = "android")
 ))]
 #[test]
-#[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+#[ignore = "requires Linux 5.15+ and root; run in the eBPF VM"]
 fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Result<()> {
     use socket2::Protocol;
     std::thread::spawn(|| -> anyhow::Result<()> {
@@ -708,10 +708,13 @@ fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Resul
                             } else {
                                 assert_eq!(payload, &[index as u8]);
                             }
-                            assert_eq!(meta.packet_mark, Some(200 + index as u32));
+                            // SO_RCVMARK arrived in Linux 5.19; a traced priority
+                            // counts only once its mark matches the received one.
+                            let marked = crate::kernel::so_rcvmark_supported();
+                            assert_eq!(meta.packet_mark, marked.then_some(200 + index as u32));
                             assert_eq!(
                                 meta.packet_priority,
-                                Some(if index == 4 { 0 } else { 100 + index as u32 })
+                                marked.then_some(if index == 4 { 0 } else { 100 + index as u32 })
                             );
                         }
                         assert_eq!(
@@ -724,7 +727,10 @@ fn netns_udp_receive_trace_preserves_batch_slots_and_lifetime() -> anyhow::Resul
                         sender.set_priority(555)?;
                         sender.send_to(b"x", &local.into())?;
                         batch.recv_now(receiver.as_raw_fd(), local)?;
-                        assert_eq!(batch.packet(0).unwrap().2.packet_priority, Some(555));
+                        assert_eq!(
+                            batch.packet(0).unwrap().2.packet_priority,
+                            crate::kernel::so_rcvmark_supported().then_some(555)
+                        );
                         drop(batch);
                         if !native {
                             drop(trace.register(receiver.as_raw_fd())?);
@@ -791,9 +797,11 @@ fn netns_transparent_udp_batches_preserve_queued_packet_marks() -> anyhow::Resul
                                 assert_eq!(peer, source);
                                 assert_eq!(metadata.original_dst_cmsg, Some(local));
                                 assert_eq!(metadata.packet_dst_ip, Some(local.ip()));
+                                // SO_RCVMARK arrived in Linux 5.19.
                                 assert_eq!(
                                     metadata.packet_mark,
-                                    Some(marks[usize::from(sequence) % marks.len()])
+                                    crate::kernel::so_rcvmark_supported()
+                                        .then_some(marks[usize::from(sequence) % marks.len()])
                                 );
                                 received += 1;
                             }

@@ -1,6 +1,6 @@
 # TPROXY 数据路径
 
-TPROXY 数据路径使用 netfilter 而非 eBPF 拦截流量，服务于 [eBPF 数据路径](./datapath.md) 无法加载的内核（Linux 4.19 至其最低版本之间）以及 Android（netd 占用根 cgroup 的 BPF 挂载点）。由 `global.datapath` 选择（[数据路径选择](../reference/global.md#数据路径选择)）；代码位于 `crates/honk-core/src/tproxy.rs`。
+TPROXY 数据路径使用 netfilter 而非 eBPF 拦截流量，服务于 [eBPF 数据路径](./datapath.md) 无法加载的内核（早于 Linux 5.15）以及 Android（netd 占用根 cgroup 的 BPF 挂载点）。由 `global.datapath` 选择（[数据路径选择](../reference/global.md#数据路径选择)）；代码位于 `crates/honk-core/src/tproxy.rs`。
 
 ## 拦截
 

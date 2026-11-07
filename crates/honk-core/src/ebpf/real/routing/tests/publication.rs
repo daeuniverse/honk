@@ -13,7 +13,7 @@ use honk_ebpf_common::{
 use std::os::fd::{AsFd, AsRawFd};
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn publication_failure_recovery_and_frozen_root() {
     let ids = outbound_ids();
     let mut backend =
@@ -215,7 +215,7 @@ fn publication_failure_recovery_and_frozen_root() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn routing_generation_ceiling_preserves_the_committed_root() {
     let old_rules = [rule(
         "old-root",
@@ -311,7 +311,7 @@ fn published_descriptor(backend: &RealEbpfBackend) -> honk_ebpf_common::RoutingP
 }
 
 #[tokio::test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 async fn pinned_generation_survives_restart_and_failed_fence() {
     let pin_root = std::path::Path::new("/sys/fs/bpf").join(format!(
         "honk-routing-generation-test-{}",

@@ -54,7 +54,7 @@ type Backend = Arc<RwLock<Box<dyn EbpfBackend>>>;
 macro_rules! bond_case {
     ($name:ident, [$($case:literal),+]) => {
         #[test]
-        #[ignore = "requires root, bonding/bridge and the disposable Linux 6.12+ VM gate"]
+        #[ignore = "requires root, bonding/bridge and the disposable Linux 5.15+ VM gate"]
         fn $name() -> anyhow::Result<()> {
             if let Ok(client) = std::env::var(CLIENT) {
                 return client_main(&client);

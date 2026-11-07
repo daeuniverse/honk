@@ -69,7 +69,7 @@ enum Kind {
 macro_rules! kernel_case {
     ($name:ident, [$($family:literal),+], $case:path) => {
         #[test]
-        #[ignore = "requires Linux 6.12+, root and the disposable kernel VM gate"]
+        #[ignore = "requires Linux 5.15+, root and the disposable kernel VM gate"]
         fn $name() -> anyhow::Result<()> {
             run_isolated(
                 concat!("control::tests::tcp_binding::", stringify!($name)),
@@ -825,12 +825,31 @@ fn cookie_child(family: &str) -> anyhow::Result<()> {
 }
 
 fn child_storage_full(family: &str) -> anyhow::Result<()> {
+    if !optmem_is_per_netns() {
+        return Ok(());
+    }
     run_child(family, Kind::Proxy, async |lab: &Lab| {
         let mut hs = Handshake::open(lab, false).await?;
         let child = release_without_storage(&mut hs).await?;
         hs.unproven(child, Authority::all(hs.original.incarnation))
             .await
     })
+}
+
+/// Starving daens of socket memory needs a per-namespace `optmem_max`, which
+/// older kernels (Linux 5.15) lack; the cases that do so skip there.
+pub(super) fn optmem_is_per_netns() -> bool {
+    let per_netns = std::thread::spawn(|| {
+        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)
+            .expect("unshare optmem probe namespace");
+        std::path::Path::new("/proc/sys/net/core/optmem_max").exists()
+    })
+    .join()
+    .expect("optmem probe thread");
+    if !per_netns {
+        eprintln!("skipped: optmem_max is not per network namespace on this kernel");
+    }
+    per_netns
 }
 
 /// Completes the handshake while the daens cannot allocate socket storage, so the child

@@ -85,7 +85,7 @@ fn publish_and_check(
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn rules_sharing_one_ip_list_exceed_the_per_category_fact_capacity() {
     publish_and_check(
         json!({"ip": ["198.51.100.0/24"]}),
@@ -95,7 +95,7 @@ fn rules_sharing_one_ip_list_exceed_the_per_category_fact_capacity() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn rules_sharing_one_mac_list_exceed_the_per_category_fact_capacity() {
     publish_and_check(
         json!({"mac": ["02:00:00:00:00:01"]}),

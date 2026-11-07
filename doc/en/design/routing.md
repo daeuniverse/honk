@@ -5,7 +5,7 @@
 Routing has one authored semantic model and two derived execution paths. The
 userspace `Router` evaluates a canonical policy IR; a restricted compiler lowers
 that same IR to native eBPF comparisons. The kernel does not interpret a second
-policy representation. Linux 6.12 is the real-backend baseline.
+policy representation. Linux 5.15 is the real-backend floor; the measurements below are from Linux 6.12.
 
 The static TC programs retain packet parsing, special/local exclusions, DNS ownership,
 conntrack, mode and health enforcement, NFQUEUE ownership, redirection, and reply
@@ -293,9 +293,10 @@ Publication is serialized with the existing reload and DNS publication fences:
  6. Only after that successful update returns may old TC slots/maps be retired.
     Userspace IR/reference leases retain their own lifetime independently.
 
-Linux 6.12 waits for old non-sleepable BPF invocations before a successful
-map-in-map update returns: its
-[`maybe_wait_bpf_programs`](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c)
+Linux waits for old non-sleepable BPF invocations before a successful
+map-in-map update returns: `maybe_wait_bpf_programs` in
+[5.15](https://github.com/torvalds/linux/blob/v5.15/kernel/bpf/syscall.c) and
+[6.12](https://github.com/torvalds/linux/blob/v6.12/kernel/bpf/syscall.c)
 uses `synchronize_rcu()`. A plain root store, elapsed delay, or merely retaining
 two slots is not an equivalent grace period. The design does not rely on
 `BPF_LINK_UPDATE` for freplace (unsupported), nor detach/attach the active slot.

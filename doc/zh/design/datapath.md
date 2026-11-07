@@ -58,7 +58,9 @@ bond 拦截覆盖经过逻辑 master TC hook 的正常软件 skb 路径。bondin
 
 `lan_ingress` 对转发的客户端流量分类。`wan_egress` 独立地对主机创建的流量分类。拓扑提供独立方向时，反向 ingress/egress 挂钩刷新已有连接状态。只有正向 TCP SYN 发布 TCP 状态：反向的纯 SYN 既不创建也不刷新它。
 
-Linux 6.12+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追加在其他 TCX 程序之后；启动、重绑定和关闭只释放自有 link。honk 既不创建也不删除物理接口上的 `clsact` qdisc 或旧式 filter；不需要的遗留项请手动移除。启动时会重建遗留的 `dae0`/`dae0peer` 对。内核选项见[开始使用](../how-to-start.md#内核配置)。
+Linux 6.6+ 上，honk 把接口挂钩创建为 FD 持有的 TCX BPF link，追加在其他 TCX 程序之后；启动、重绑定和关闭只释放自有 link。此时 honk 既不创建也不删除物理接口上的 `clsact` qdisc 或旧式 filter；不需要的遗留项请手动移除。
+
+6.6 之前的内核没有 TCX。此时设备若没有 `clsact` qdisc，honk 会添加一个（释放时保留），并把每个挂钩绑定为优先级 `0xfffc`–`0xfffe` 的 `cls_bpf` direct-action filter；这是优先级范围的末端，因此 honk 像追加的 TCX link 一样排在其他 filter 之后运行。每个进程内唯一的 handle 代替 link ID，所以释放绑定只会删除自己的 filter；绑定时，honk 优先级范围内不运行任何已加载程序的 filter 视为早先进程的遗留并被删除。`wan_egress` 作为单个程序会超出这些 verifier 的一百万指令预算，因此按 lane 安装为多个 filter：一个 TCP lane，再加一个（`_l2`）或两个（`_l3`，分别对应以太网帧和裸 IP 包）其他协议 lane。每个 lane 对属于其他 lane 的包返回 `TC_ACT_UNSPEC`，其余返回码含义与 TCX 相同。启动时会重建遗留的 `dae0`/`dae0peer` 对。内核选项见[开始使用](../how-to-start.md#内核配置)。
 
 不写 mark 且不受所有权 guard 保护的直通退出点返回 `TC_ACT_UNSPEC`（`-1`，TCX `NEXT`），包括反向刷新与跳过 DNS，让后续 TCX 程序继续运行。最低支持内核上的 `TC_ACT_PIPE` 不是继续动作。写入 mark 的路径（包括显式写零的 WAN 路径）、LAN classified/pending 及 WAN 精确 socket-mark/classified 所有权 guard 返回 `TC_ACT_OK`（`0`，TCX `PASS`），终止链。
 

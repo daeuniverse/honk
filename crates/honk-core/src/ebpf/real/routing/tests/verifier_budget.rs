@@ -16,7 +16,7 @@ use honk_config::types::DialMode;
 use honk_ebpf_common::DaeParam;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn facts_ahead_of_long_process_chains_stay_within_the_verifier_budget() {
     let config = honk_config::parser::parse_dae_config(
         r#"

@@ -135,7 +135,7 @@ flowchart TB
 
 | Feature | 默认 | 作用 |
 | --- | --- | --- |
-| `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 6.12+。 |
+| `ebpf` | 否 | 引入 `aya`、`aya-obj`、`aya-log` 和可选 `honk-nfqueue`；`build.rs` 嵌入静态 `honk-ebpf` 对象，用户态在运行时编译 policy extension。运行时要求 Linux kernel 5.15+。 |
 | `clash-api` | 是 | 引入可选 `axum` 与 `tower-http`，提供 Clash 兼容 REST/WebSocket 服务。 |
 | `native-api` | 否 | 独立的 HTTP/1.1 原生观测、可选历史、受控源管理/reload API 与本地目录 UI；持有有界连接并负责其生命周期，严格校验 bearer/Host/Origin，不依赖 Clash。 |
 | `native-ui` | 否 | 隐含 `native-api`，为 `ui: embedded` 内嵌固定版本的 doona 发行资产；`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要该特性。运行时不解压、不下载、不构建前端。 |

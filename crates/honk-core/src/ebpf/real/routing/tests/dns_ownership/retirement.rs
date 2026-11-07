@@ -104,7 +104,7 @@ fn unfence(backend: &mut RealEbpfBackend, key: &TuplesKey) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn retirement_fence_refuses_forward_reverse_and_reply_writers_without_mutation() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -180,7 +180,7 @@ fn retirement_fence_refuses_forward_reverse_and_reply_writers_without_mutation()
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn retirement_fence_prevents_missing_tuple_publication_and_reply_fallback() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -224,7 +224,7 @@ fn retirement_fence_prevents_missing_tuple_publication_and_reply_fallback() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_is_ignored() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -308,7 +308,7 @@ fn forward_syn_publisher_refuses_busy_and_releases_for_reuse_while_reverse_syn_i
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
     isolated(|| {
         let (src, dst) = PEERS[0];
@@ -425,7 +425,7 @@ fn final_56_bit_incarnation_survives_tcp_carrier_and_exhaustion_stays_closed() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn actual_expiry_hints_preserve_kernel_entries_and_batch_revalidates_ownership() {
     isolated(|| {
         // A fresh VM may have <120s uptime. Wait once for a genuine old
@@ -640,7 +640,7 @@ fn assert_fenced_claim_unchanged(backend: &RealEbpfBackend, key: &TuplesKey, byt
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republishes() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -713,7 +713,7 @@ fn controlled_pre_fence_udp_claim_completes_terminally_then_retires_and_republis
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_republishes() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -795,7 +795,7 @@ fn controlled_udp_abort_retains_owned_metadata_until_fenced_retirement_then_repu
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
     isolated(|| {
         let (mut backend, _, _listeners) = proxy_fixture();
@@ -881,7 +881,7 @@ fn controlled_udp_abort_preserves_foreign_auxiliaries_and_newer_owner() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn udp_preparing_and_aborted_followers_do_not_renew_claim_timestamp() {
     isolated(|| {
         // Keep the age strictly above lazy refresh and below UDP expiry, even

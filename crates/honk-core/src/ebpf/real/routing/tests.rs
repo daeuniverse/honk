@@ -115,7 +115,7 @@ fn domain_entry(
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
     use honk_config::routing::{RoutingCondition, RoutingNotCondition};
 
@@ -296,7 +296,7 @@ fn lazy_fact_cache_short_circuit_reuse_and_alternating_inputs() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
     use honk_config::routing::RoutingCondition;
 
@@ -368,7 +368,7 @@ fn lazy_fact_cache_ipv6_host_overlap_and_default_prefix() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
     use honk_config::routing::{RoutingCondition, RoutingNotCondition};
 
@@ -536,7 +536,7 @@ fn lazy_fact_cache_null_zero_mac_presence_and_invalid_family() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn four_mode_golden_policies() {
     let (router, cases) = golden::fixtures();
     let ids = outbound_ids();
@@ -590,7 +590,7 @@ fn four_mode_golden_policies() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn empty_scalar_predicates_preserve_rule_reachability() {
     let config = honk_config::parser::parse_dae_config(
         r#"
@@ -640,7 +640,7 @@ fn empty_scalar_predicates_preserve_rule_reachability() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn large_prefix_fact_policy() {
     let ids = outbound_ids();
     let mut backend =
@@ -698,7 +698,7 @@ fn large_prefix_fact_policy() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn predicate_bits_and_capacity_limits() {
     let ids = outbound_ids();
     let mut backend =

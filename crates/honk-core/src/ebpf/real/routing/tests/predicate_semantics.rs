@@ -8,7 +8,7 @@ use honk_ebpf_common::DaeParam;
 use std::collections::HashSet;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn parsed_predicates_match_independent_cases() {
     let sources = parsed::sources();
     let mut backend =

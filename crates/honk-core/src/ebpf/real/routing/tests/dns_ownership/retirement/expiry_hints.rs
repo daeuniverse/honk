@@ -14,7 +14,7 @@ fn hints(ring: &mut RingBuf<aya::maps::MapData>) -> Vec<DaeEvent> {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn repeated_expiry_hints_are_bounded_without_renewing_or_releasing_refused_flows() {
     isolated(|| {
         let mut affinity = CpuSet::new();

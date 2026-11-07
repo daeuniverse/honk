@@ -17,7 +17,7 @@ fn fixture() -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn auxiliary_occupancy_counts_inserts_and_subtracts_userspace_reclamation() {
     isolated(|| {
         let (mut backend, _, _listeners) = fixture();

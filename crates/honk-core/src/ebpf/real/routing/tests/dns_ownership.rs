@@ -106,19 +106,28 @@ impl TproxyListeners {
             socket.set_only_v6(true).unwrap();
         }
         Self::configure(&socket, ipv6);
+        // Before Linux 5.19 the mark is read back from the DNS route marks
+        // the datapath publishes, keyed by the original destination.
+        let (level, option) = if crate::kernel::so_rcvmark_supported() {
+            (libc::SOL_SOCKET, libc::SO_RCVMARK)
+        } else if ipv6 {
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVORIGDSTADDR)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_RECVORIGDSTADDR)
+        };
         let enabled: libc::c_int = 1;
         assert_eq!(
             unsafe {
                 libc::setsockopt(
                     socket.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_RCVMARK,
+                    level,
+                    option,
                     (&enabled as *const libc::c_int).cast(),
                     mem::size_of_val(&enabled) as libc::socklen_t,
                 )
             },
             0,
-            "SO_RCVMARK: {}",
+            "receive mark option: {}",
             std::io::Error::last_os_error()
         );
         let address = if ipv6 {
@@ -187,6 +196,7 @@ fn fixture_param() -> DaeParam {
         wan_ifindex: 1,
         dae0peer_mac: [0x02, 0, 0, 0, 0, 2],
         dae_socket_mark: DAE_BYPASS_MARK,
+        dns_route_marks: u8::from(!crate::kernel::so_rcvmark_supported()),
         ..Default::default()
     }
 }
@@ -280,6 +290,44 @@ fn load_classifier(backend: &mut RealEbpfBackend, name: &str) {
             Err(error) => panic!("load {lane}: {error}"),
         }
     }
+}
+
+/// Whether `BPF_PROG_TEST_RUN` accepts an `ingress_ifindex`, which forwarded
+/// packets carry; Linux 5.15 refuses it with EINVAL.
+fn forwarded_test_runs(backend: &RealEbpfBackend) -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let program: &SchedClassifier = backend
+            .bpf()
+            .unwrap()
+            .program("lan_ingress_l2")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let mut context: __sk_buff = unsafe { mem::zeroed() };
+        context.ingress_ifindex = 1;
+        context.ifindex = 1;
+        let context = unsafe {
+            std::slice::from_raw_parts(
+                (&context as *const __sk_buff).cast::<u8>(),
+                mem::size_of::<__sk_buff>(),
+            )
+        };
+        let supported = !matches!(
+            program.test_run(TestRunOptions {
+                data_in: Some(&[0u8; 64]),
+                ctx_in: Some(context),
+                repeat: 1,
+                ..Default::default()
+            }),
+            Err(ProgramError::SyscallError(ref error))
+                if error.io_error.raw_os_error() == Some(libc::EINVAL)
+        );
+        if !supported {
+            eprintln!("BPF_PROG_TEST_RUN refuses ingress_ifindex: forwarded cases skipped");
+        }
+        supported
+    })
 }
 
 /// Runs `name`, or on kernels without TCX the lane filters it is installed
@@ -507,7 +555,7 @@ fn dns_ordering_rules() -> Vec<honk_config::routing::RoutingRule> {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn dns_direct_must_marks_keep_lan_native_and_reroute_wan_v4_v6_tcp_udp() {
     isolated(|| {
         let destinations = [
@@ -606,7 +654,7 @@ fn dns_direct_must_marks_keep_lan_native_and_reroute_wan_v4_v6_tcp_udp() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn dns_block_redirects_nonmust_and_drops_must() {
     isolated(|| {
         for must in [false, true] {
@@ -746,7 +794,7 @@ fn dns_block_redirects_nonmust_and_drops_must() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn dns_policy_order_mode_flags_carriers_and_handoff_generation_are_exact() {
     isolated(|| {
         let rules = dns_ordering_rules();

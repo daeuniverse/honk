@@ -60,7 +60,7 @@ The configured request path and query retain their original dot segments and per
 
 ## Datapath selection
 
-`datapath: ebpf` loads the compiled eBPF datapath and fails startup on a kernel that cannot host it (Linux older than 6.12) or on Android. `datapath: tproxy` installs the [netfilter TPROXY datapath](../design/tproxy.md) instead: iptables `mangle` rules and one fwmark policy rule, with every flow routed in userspace. `auto` (the default) logs a warning and selects TPROXY when the eBPF datapath is unavailable. `--mock-ebpf` overrides all three.
+`datapath: ebpf` loads the compiled eBPF datapath and fails startup on a kernel that cannot host it (Linux older than 5.15) or on Android. `datapath: tproxy` installs the [netfilter TPROXY datapath](../design/tproxy.md) instead: iptables `mangle` rules and one fwmark policy rule, with every flow routed in userspace. `auto` (the default) logs a warning and selects TPROXY when the eBPF datapath is unavailable. `--mock-ebpf` overrides all three.
 
 TPROXY has no kernel offload, NFQUEUE staging or kernel-side `must` decisions; direct flows are relayed through honk. `process_name` rules match the owning process's `comm` for host-originated traffic only; `mac` and `dscp` conditions never match.
 

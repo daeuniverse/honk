@@ -125,7 +125,7 @@ flowchart TB
 
 | Feature | Default | Effect |
 | --- | --- | --- |
-| `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 6.12+ at runtime. |
+| `ebpf` | no | Pulls in `aya`, `aya-obj`, `aya-log`, and optional `honk-nfqueue`; `build.rs` embeds the static `honk-ebpf` object, and userspace compiles policy extensions at runtime. Requires Linux kernel 5.15+ at runtime. |
 | `clash-api` | yes | Pulls in optional `axum` and `tower-http` for the Clash-compatible REST/WebSocket service. |
 | `native-api` | no | Independent HTTP/1.1 native observations, opt-in accepted-source administration and local-directory UI, with owned bounded connections, strict bearer/Host/Origin checks, and no dependency on Clash. |
 | `native-ui` | no | Includes `native-api` and embeds assets from the pinned doona distribution for `ui: embedded`; `ui: embedded-lite` selects the lighter doona lite edition (preview) with the same feature requirement. No runtime extraction, download or frontend build. |

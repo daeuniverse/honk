@@ -138,7 +138,7 @@ fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn fact_readiness_failure_joins_preserve_full_decisions() {
     let all = bitmap(0b11);
     let second_only = bitmap(0b10);
@@ -243,7 +243,7 @@ fn fact_readiness_failure_joins_preserve_full_decisions() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn fact_readiness_independent_bitmap_states() {
     // Missing, present-zero, first bit, second bit, and both bits must remain
     // independent across categories at every failure join.

@@ -6,7 +6,7 @@ use honk_ebpf_common::conn::{FlowMapValue, RetirementFence};
 mod storage;
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn retirement_release_failure_retains_applied_counts_and_releases_other_fences() {
     let mut backend = retirement_fixture();
     let requests = [
@@ -54,7 +54,7 @@ fn retirement_fixture() -> RealEbpfBackend {
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn quiescence_preserves_tcp_closing_while_retiring_udp_staging() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let tcp = TuplesKey {
@@ -90,7 +90,7 @@ fn quiescence_preserves_tcp_closing_while_retiring_udp_staging() -> anyhow::Resu
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn quiescence_preserves_native_udp_publication_completed_after_scan() -> anyhow::Result<()> {
     fn key() -> TuplesKey {
         TuplesKey {
@@ -129,7 +129,7 @@ fn quiescence_preserves_native_udp_publication_completed_after_scan() -> anyhow:
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn udp_admission_requires_current_token_and_nonzero_56_bit_incarnation() {
     use honk_ebpf_common::conn::FLOW_INCARNATION_MAX;
 
@@ -233,7 +233,7 @@ fn assert_retirement_fence(backend: &RealEbpfBackend, key: &TuplesKey, present: 
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_fences() {
     for barrier in [false, true] {
         let mut backend = retirement_fixture();
@@ -272,7 +272,7 @@ fn retirement_acquire_and_barrier_failures_preserve_all_maps_and_release_owned_f
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn retirement_delete_failure_reports_completed_map_deletions_only() {
     let mut backend = retirement_fixture();
     let request = seed_retirement_flow(&mut backend, 41003);
@@ -318,7 +318,7 @@ fn retirement_delete_failure_reports_completed_map_deletions_only() {
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn retirement_preserves_barrier_and_release_errors_and_inhibits_admission() {
     let mut backend = retirement_fixture();
     let requests = [
@@ -393,7 +393,7 @@ fn publish_retirement_flow(
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let key = TuplesKey {
@@ -469,7 +469,7 @@ fn token_zero_lan_retirement_allows_same_tuple_republication() -> anyhow::Result
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     for (index, (proto, token)) in [(6, 0), (17, 0), (17, 7)].into_iter().enumerate() {
@@ -519,7 +519,7 @@ fn expired_conn_retirement_removes_auxiliaries_before_tuple_reuse() -> anyhow::R
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn retirement_auxiliary_owner_mismatch_is_fatal_and_preserves_all_maps() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     for operation in 0..5 {
@@ -588,7 +588,7 @@ fn retirement_auxiliary_owner_mismatch_is_fatal_and_preserves_all_maps() -> anyh
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn udp_commit_auxiliary_incarnation_mismatch_is_fatal() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     for handoff_mismatch in [false, true] {
@@ -629,7 +629,7 @@ fn udp_commit_auxiliary_incarnation_mismatch_is_fatal() -> anyhow::Result<()> {
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let seeded = seed_retirement_flow(&mut backend, 41260);
@@ -674,7 +674,7 @@ fn expired_conn_delete_failure_preserves_actual_auxiliary_progress() -> anyhow::
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let key = TuplesKey {
@@ -737,7 +737,7 @@ fn hint_auxiliary_expiry_requires_matching_tokens_without_conn() -> anyhow::Resu
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn aborted_udp_retires_without_age_and_quiescence_keeps_completed_flows() -> anyhow::Result<()> {
     let mut backend = retirement_fixture();
     let key = TuplesKey {

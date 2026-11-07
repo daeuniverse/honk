@@ -64,7 +64,7 @@ honk 可配合以下两类网页界面使用：
 ## 版本与兼容性
 
 - 自 `v0.1.0` 起，发布遵循 [SemVer](https://semver.org/lang/zh-CN/)；带 `-alpha.N`、`-beta.N` 或 `-rc.N` 后缀的标签为预发布。`1.0` 之前，次版本可能改变配置或行为，升级前应阅读发布说明。
-- 透明代理需要 root 权限。eBPF 数据路径需要 Linux 6.12+、所需内核选项和 bpffs；更早的内核（最低 4.14）与已 root 的 Android 自动使用 [netfilter TPROXY 数据路径](doc/zh/design/tproxy.md)。详见上方链接的启动指南。
+- 透明代理需要 root 权限。eBPF 数据路径需要 Linux 5.15+、所需内核选项和 bpffs；更早的内核（最低 4.14）与已 root 的 Android 自动使用 [netfilter TPROXY 数据路径](doc/zh/design/tproxy.md)。详见上方链接的启动指南。
 - 配置使用 [dae 语法](doc/zh/configuration.md)。修改已有部署前，请查阅 [NFQUEUE 运行说明](doc/zh/design/nfqueue.md)和 [VLESS 迁移指南](doc/zh/reference/nodes.md#从-vless_mode-迁移)。
 - 原生 API 使用 `/api/v1`，其契约在 `1.0` 之前可能随次版本变化。`GET /api/v1/version` 返回契约标识。
 

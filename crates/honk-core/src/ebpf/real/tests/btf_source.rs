@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires disposable VM, root, cgroup v2, Linux 6.12+, and an eBPF build"]
+#[ignore = "requires disposable VM, root, cgroup v2, Linux 5.15+, and an eBPF build"]
 fn kernel_btf_override_controls_startup() {
     const CHILD: &str = "HONK_TEST_KERNEL_BTF";
     let Ok(case) = std::env::var(CHILD) else {

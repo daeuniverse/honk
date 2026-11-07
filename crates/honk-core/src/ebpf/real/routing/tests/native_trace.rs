@@ -36,7 +36,7 @@ fn outcomes(trace: &KernelRouteOutput, expected: &[u32]) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn branch_witness_keeps_port_order_missing_negation_and_consumed_domain_facts() {
     let (router, mut plan) = compile(
         r#"
@@ -137,7 +137,7 @@ fn branch_witness_keeps_port_order_missing_negation_and_consumed_domain_facts() 
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn folded_and_unreachable_conditions_have_no_invented_runtime_outcomes() {
     use KernelTraceDisposition::{FoldedFalse, FoldedTrue, Runtime, Unreachable};
     let (_, plan) = compile(
@@ -189,7 +189,7 @@ fn folded_and_unreachable_conditions_have_no_invented_runtime_outcomes() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
     let mut source = String::from("routing {\n");
     for port in 1000..1129 {
@@ -313,7 +313,7 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn capture_preserves_every_golden_decision_before_and_after_dns_override() {
     let (router, cases) = golden::fixtures();
     let mut backend =

@@ -26,7 +26,7 @@ fn kernel_version() -> Option<(u32, u32, u32)> {
 }
 
 /// Oldest kernel the eBPF datapath loads on.
-pub(crate) const MIN_KERNEL: (u32, u32, u32) = (6, 12, 0);
+pub(crate) const MIN_KERNEL: (u32, u32, u32) = (5, 15, 0);
 
 /// Why the running kernel cannot host the eBPF datapath, or `None` if it can.
 pub(crate) fn kernel_unsupported_reason() -> Option<String> {

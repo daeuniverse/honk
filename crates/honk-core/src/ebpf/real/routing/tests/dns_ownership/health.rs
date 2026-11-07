@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn tcp_health_applies_to_fresh_admission_not_cached_packets_while_udp_stays_gated() {
     isolated(|| {
         let (mut backend, _, _listeners) = publish(&[rule(

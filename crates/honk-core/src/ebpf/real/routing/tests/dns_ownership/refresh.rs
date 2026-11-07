@@ -86,7 +86,7 @@ fn fixture() -> (RealEbpfBackend, RoutingPushPlan, TproxyListeners) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn client_framing_refills_after_outbound_and_exact_reply_refresh() {
     isolated(|| {
         let [v4, v6] = peers();
@@ -212,7 +212,7 @@ fn client_framing_refresh_excludes_dns_destinations_and_wan_records() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn stateless_udp_refreshes_complete_policy_without_changing_owned_lifetimes() {
     isolated(|| {
         for (client, target, _) in peers() {

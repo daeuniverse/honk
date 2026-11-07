@@ -373,7 +373,7 @@ fn dns_l3_tun_v4_v6_udp_local_and_forwarded_policy_carriers() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
+#[ignore = "requires root, Linux 5.15+, HONK_ROUTING_TEST_OBJECT, and isolated netns support"]
 fn marked_loopback_backend_survives_lan_hook_without_exempting_other_marks() {
     for bypass_mark in [DAE_BYPASS_MARK, 0x200, 0] {
         isolated(move || {

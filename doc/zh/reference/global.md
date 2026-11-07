@@ -60,7 +60,7 @@ HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：I
 
 ## 数据路径选择
 
-`datapath: ebpf` 加载编译型 eBPF 数据路径；内核无法承载（早于 Linux 6.12）或运行于 Android 时启动失败。`datapath: tproxy` 改为安装 [netfilter TPROXY 数据路径](../design/tproxy.md)：iptables `mangle` 规则加一条 fwmark 策略路由，所有流量在用户态完成路由。默认的 `auto` 在 eBPF 数据路径不可用时记录 warning 并选择 TPROXY。`--mock-ebpf` 优先于三者。
+`datapath: ebpf` 加载编译型 eBPF 数据路径；内核无法承载（早于 Linux 5.15）或运行于 Android 时启动失败。`datapath: tproxy` 改为安装 [netfilter TPROXY 数据路径](../design/tproxy.md)：iptables `mangle` 规则加一条 fwmark 策略路由，所有流量在用户态完成路由。默认的 `auto` 在 eBPF 数据路径不可用时记录 warning 并选择 TPROXY。`--mock-ebpf` 优先于三者。
 
 TPROXY 没有内核 offload、NFQUEUE 暂存或内核侧 `must` 决策；直连流量由 honk 在用户态中继。`process_name` 规则仅对本机发起的流量匹配属主进程的 `comm`；`mac` 与 `dscp` 条件永不匹配。
 

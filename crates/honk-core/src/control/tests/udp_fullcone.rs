@@ -23,7 +23,7 @@ const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_con
 const CHILD: &str = "HONK_UDP_FULLCONE_CHILD";
 
 #[test]
-#[ignore = "requires Linux 6.12+, root, bpffs and eBPF TC support in an isolated VM"]
+#[ignore = "requires Linux 5.15+, root, bpffs and eBPF TC support in an isolated VM"]
 fn netns_udp_full_cone_source_contract() -> anyhow::Result<()> {
     run_isolated(
         CASE,

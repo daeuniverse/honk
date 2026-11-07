@@ -15,7 +15,7 @@ uname -r
 ```
 
 - 仅支持 Linux；真实透明代理必须以 `root` 运行。
-- eBPF 数据路径的编译式路由及其 map-in-map 同步发布保证要求 Linux `6.12+`。默认的 `datapath: auto` 下，更早的内核（最低 4.14）改用 [netfilter TPROXY 数据路径](design/tproxy.md)；`datapath: ebpf` 会在附着前拒绝它们。
+- eBPF 数据路径的编译式路由及其 map-in-map 同步发布保证要求 Linux `5.15+`。Linux 6.6 之前改用 `clsact` direct-action filter 而非 TCX link 绑定接口；5.19 之前没有 `SO_RCVMARK`，数据路径把每条 UDP DNS 路由 mark 以查询的五元组和 DNS 事务 ID 为键发布到 map 中供监听器读取；此时原生 API 的 UDP 流记录不带内核路由 witness，因为接收追踪只有在其 mark 与收到的 mark 一致时才被采信。默认的 `datapath: auto` 下，更早的内核（最低 4.14）改用 [netfilter TPROXY 数据路径](design/tproxy.md)；`datapath: ebpf` 会在附着前拒绝它们。
 - `netkit` 不是必需项；内核不支持时 honk 自动回退到 veth。
 
 `lan_interface` 用于代理从局域网进入网关的流量，`wan_interface` 用于代理网关本机发起的流量：
@@ -46,7 +46,7 @@ CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
 
-TCX 后端需要由 `CONFIG_NET_CLS_ACT` 选中的隐藏选项 `CONFIG_NET_XGRESS`，不要求旧式 `CONFIG_NET_CLS_BPF` 或 `CONFIG_NET_SCH_INGRESS`。参见[挂钩与 qdisc 所有权](./design/datapath.md#接口挂钩集合)。
+TCX 后端需要由 `CONFIG_NET_CLS_ACT` 选中的隐藏选项 `CONFIG_NET_XGRESS`，不要求旧式 `CONFIG_NET_CLS_BPF` 或 `CONFIG_NET_SCH_INGRESS`。6.6 之前的内核没有 TCX，改为需要 `CONFIG_NET_CLS_ACT`、`CONFIG_NET_SCH_INGRESS`（`clsact` qdisc）与 `CONFIG_NET_CLS_BPF`。参见[挂钩与 qdisc 所有权](./design/datapath.md#接口挂钩集合)。
 
 默认启用的首包保留 UDP 还需要：
 
@@ -415,7 +415,7 @@ sudo journalctl -xefu honk-core
 
 [GitHub Container Registry](https://github.com/daeuniverse/honk/pkgs/container/honk) 上的镜像 `ghcr.io/daeuniverse/honk` 包含 musl `full` 发布版二进制以及仓库固定版本的 GeoIP 和 Geosite 文件；构建时会用 SHA-256 校验每个下载文件。每个发布版以去掉 `v` 的版本号作为镜像标签，例如 `ghcr.io/daeuniverse/honk:0.1.0-beta.4`；`latest` 只指向正式版，不包含预发布版。镜像提供 linux/amd64 和 linux/arm64 两种架构，拉取时无需登录。
 
-honk 需要加载并挂载 eBPF 程序、创建 `dae0` 和 `daens` 命名空间、修改 sysctl，并在宿主机的 bpffs 上固定 map，因此容器以特权模式运行，并共享宿主机的网络和 PID 命名空间。它对宿主机的改动与直接安装相同，不提供任何隔离。宿主机必须满足[内核要求](#linux-内核要求)，包括 Linux 6.12+ 和已挂载的 bpffs。
+honk 需要加载并挂载 eBPF 程序、创建 `dae0` 和 `daens` 命名空间、修改 sysctl，并在宿主机的 bpffs 上固定 map，因此容器以特权模式运行，并共享宿主机的网络和 PID 命名空间。它对宿主机的改动与直接安装相同，不提供任何隔离。宿主机必须满足[内核要求](#linux-内核要求)，包括 Linux 5.15+ 和已挂载的 bpffs。
 
 按[最小配置](#最小配置)准备 `/etc/honk/config.dae` 和 `/var/lib/honk`，然后在 `.env` 中写入发布版本号，再启动仓库中的 `docker-compose.yml`：
 
@@ -554,12 +554,12 @@ cargo run --release -p honk-core -- \
 | --- | --- |
 | `bpf-linker` 不存在 | 按源码构建章节安装，并将 Cargo 的 bin 目录加入 PATH。 |
 | `no BTF parsed for object` | 清除 `RUSTFLAGS` 和 `CARGO_ENCODED_RUSTFLAGS`，重新构建 eBPF 目标文件，并用 `readelf` 确认 `.BTF`。 |
-| 内核或 verifier 拒绝编译式路由 | 使用支持 BPF/BTF 和 freplace 的 Linux `6.12+`，保留完整 verifier 日志及生成规则定位信息，不要绕过启动失败。 |
+| 内核或 verifier 拒绝编译式路由 | 使用支持 BPF/BTF 和 freplace 的 Linux `5.15+`，保留完整 verifier 日志及生成规则定位信息，不要绕过启动失败。 |
 | pin map 报 `Invalid argument` | `/sys/fs/bpf` 不是 bpffs；按上文重新挂载。 |
 | mock 启动成功但流量不经过 honk | 这是预期行为；使用含 `ebpf` 特性的构建并以 root 启动。 |
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、队列 320 占用者和残留 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
 | LAN 流量未被代理 | `lan_interface` 为空或接口名错误；它不会自动使用 `lo`。接口名无误时见下一行。 |
-| `GET /runtime` 出现 `interface_binding` 降级 | 某个已配置的接口尚未绑定；日志中有接口名。`pending`：接口不存在，或 `auto` 条目没有 IPv4 默认路由。`unsupported_type`：链路类型被拒绝（例如 `lo`、VRF 设备或 `dae0`）；请改配受支持的接口或其成员。`attach_failed`：TCX link 无法创建、更新或校验；日志中的警告会给出原因。接口状态字段见[原生 API 参考](./reference/api.md#原生-api)。 |
+| `GET /runtime` 出现 `interface_binding` 降级 | 某个已配置的接口尚未绑定；日志中有接口名。`pending`：接口不存在，或 `auto` 条目没有 IPv4 默认路由。`unsupported_type`：链路类型被拒绝（例如 `lo`、VRF 设备或 `dae0`）；请改配受支持的接口或其成员。`attach_failed`：TCX link（Linux 6.6 之前为 `clsact` filter）无法创建、更新或校验；日志中的警告会给出原因。接口状态字段见[原生 API 参考](./reference/api.md#原生-api)。 |
 | 旁路由的客户端绕过 honk，或转发的流量被丢弃 | 把 `all` 与 LAN 接口的 `send_redirects` 设为 `0`，并把 `net.ipv4.conf.all.rp_filter` 设为 `0`，见[旁路由](#旁路由)。 |
 | VLESS/VMess 报 `No handler for protocol` | 构建缺少 `rprx`；使用默认特性，或显式加入 `rprx`。 |
 | Geo 规则加载失败 | 将 `geoip.dat`/`geosite.dat` 放入配置的 `data_dir`，或检查文档所列的旧目录/共享目录搜索位置；不需要时删除未使用的 Geo 规则。 |

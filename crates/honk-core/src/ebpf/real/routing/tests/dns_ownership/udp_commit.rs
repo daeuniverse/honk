@@ -44,7 +44,7 @@ fn stage(
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn pending_and_armed_followers_freeze_the_conn_timestamp() {
     isolated(|| {
         let (mut backend, _listeners) = fixture();
@@ -96,7 +96,7 @@ fn pending_and_armed_followers_freeze_the_conn_timestamp() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn armed_direct_activation_does_not_run_a_grace_barrier() {
     isolated(|| {
         let (mut backend, _listeners) = fixture();
@@ -133,7 +133,7 @@ fn armed_direct_activation_does_not_run_a_grace_barrier() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn a_batched_tuple_is_fenced_once_and_every_transition_rechecks_its_state() {
     isolated(|| {
         let (mut backend, _listeners) = fixture();
@@ -192,7 +192,7 @@ fn a_batched_tuple_is_fenced_once_and_every_transition_rechecks_its_state() {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn a_batch_release_failure_reports_error_after_all_successful_mutations() {
     isolated(|| {
         let (mut backend, _listeners) = fixture();

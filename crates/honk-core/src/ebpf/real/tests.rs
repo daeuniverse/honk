@@ -802,7 +802,7 @@ fn test_event_ip() {
 }
 
 #[test]
-#[ignore = "requires root and Linux 6.12+; run in the isolated VM gate"]
+#[ignore = "requires root and Linux 5.15+; run in the isolated VM gate"]
 fn datapath_observation_crosschecks_program_hook_root_and_admission() {
     use crate::ebpf::{DatapathCheck, DatapathObservationError};
     use aya::maps::{ArrayOfMaps, IterableMap};

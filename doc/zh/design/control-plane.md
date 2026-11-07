@@ -266,7 +266,7 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 `control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 延后到 backend staging 完成后、紧接着在 registry 权限替换之前取得，仍持有到原有 DNS pointer 提交点。因此 backend staging 不再占用 provider 准入锁，而 registry 转移、回调安装和 Score 权限发布仍阻止新的旧代 DNS 准入。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
 
-`RoutingPushPlan::compile` 是唯一用户态 lowering 路径；调用方不选择 slot，也没有独立 domain-publication handshake。`routing_policy.rs` ABI 分别为 `RoutingInput` 128 字节、`RoutingDecision` 24 字节与 `RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取前检查 `pname_len`，以符合 6.12 verifier。已加载路由 slot 的 BTF 必须暴露当前输出布局。
+`RoutingPushPlan::compile` 是唯一用户态 lowering 路径；调用方不选择 slot，也没有独立 domain-publication handshake。`routing_policy.rs` ABI 分别为 `RoutingInput` 128 字节、`RoutingDecision` 24 字节与 `RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 5.15+；生成的进程名匹配代码在固定偏移读取前检查 `pname_len`，以符合 5.15 起各版本的 verifier。已加载路由 slot 的 BTF 必须暴露当前输出布局。
 
 提交前失败保留活动代码与事实，不再重放旧路由计划。Fence 后发布被拒绝时，控制器恢复组连通性并重开旧 generation；连通性恢复失败则继续拒绝准入。Root 切换成功后新 generation 已提交，之后若 NFQUEUE 重开失败，保留已发布的新 generation 并继续 fence 准入，直到后续成功 reload 修复。
 

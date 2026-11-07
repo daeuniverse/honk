@@ -53,7 +53,7 @@ enum Case {
 macro_rules! vlan_case {
     ($name:ident, $case:expr) => {
         #[test]
-        #[ignore = "requires Linux 6.12+, root, 8021q/macsec and the disposable kernel VM gate"]
+        #[ignore = "requires Linux 5.15+, root, 8021q/macsec and the disposable kernel VM gate"]
         fn $name() -> anyhow::Result<()> {
             if let Some(target) = std::env::var_os(HOST_CLIENT) {
                 return host_client(target.to_str().context("host client target")?);

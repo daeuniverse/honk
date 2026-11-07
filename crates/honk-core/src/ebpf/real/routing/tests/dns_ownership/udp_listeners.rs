@@ -29,7 +29,7 @@ fn flow(ipv6: bool, index: u16, port: u16) -> (IpAddr, IpAddr, u16) {
 }
 
 #[test]
-#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+#[ignore = "requires root, Linux 5.15+, and HONK_ROUTING_TEST_OBJECT"]
 fn udp_flow_selects_one_listener_across_assign_and_lookup() {
     isolated(|| {
         let (mut backend, _, listeners) = publish(&[rule(

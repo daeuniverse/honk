@@ -15,7 +15,7 @@ uname -r
 ```
 
 - Only Linux is supported. The real transparent datapath must run as `root`.
-- The eBPF datapath requires Linux `6.12+` for compiled routing and its synchronous map-in-map publication guarantee. With the default `datapath: auto`, older kernels (down to 4.14) use the [netfilter TPROXY datapath](design/tproxy.md) instead; `datapath: ebpf` rejects them before attachment.
+- The eBPF datapath requires Linux `5.15+` for compiled routing and its synchronous map-in-map publication guarantee. Before Linux 6.6 it binds interfaces with `clsact` direct-action filters instead of TCX links; before 5.19, which has no `SO_RCVMARK`, the datapath publishes each UDP DNS route mark in a map, keyed by the query's tuple and DNS transaction ID, for the listener to read; native API UDP flow records there carry no kernel route witness, because the receive trace is only trusted once its mark matches the received one. With the default `datapath: auto`, older kernels (down to 4.14) use the [netfilter TPROXY datapath](design/tproxy.md) instead; `datapath: ebpf` rejects them before attachment.
 - `netkit` is optional. honk falls back to veth when the kernel does not support it.
 
 `lan_interface` intercepts traffic entering the gateway from the LAN. `wan_interface` intercepts traffic originated by the gateway itself:
@@ -46,7 +46,7 @@ CONFIG_NET_XGRESS=y
 CONFIG_NET_NS=y
 ```
 
-The TCX backend needs `CONFIG_NET_XGRESS`, a hidden option selected by `CONFIG_NET_CLS_ACT`, not legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
+The TCX backend needs `CONFIG_NET_XGRESS`, a hidden option selected by `CONFIG_NET_CLS_ACT`, not legacy `CONFIG_NET_CLS_BPF` or `CONFIG_NET_SCH_INGRESS`. Kernels before 6.6 have no TCX and need `CONFIG_NET_CLS_ACT`, `CONFIG_NET_SCH_INGRESS` (the `clsact` qdisc) and `CONFIG_NET_CLS_BPF` instead. See [hook and qdisc ownership](./design/datapath.md#interface-hook-sets).
 
 Held-first-packet UDP, which is enabled by default, additionally requires:
 
@@ -415,7 +415,7 @@ Do not add strict capability bounding, a read-only `/proc/sys`, or `NoNewPrivile
 
 The image `ghcr.io/daeuniverse/honk` on [GitHub Container Registry](https://github.com/daeuniverse/honk/pkgs/container/honk) contains the musl `full` release binary and the GeoIP and Geosite files pinned by the repository; the build checks every download against its SHA-256 checksum. Each release is tagged with its version without the `v`, for example `ghcr.io/daeuniverse/honk:0.1.0-beta.4`; `latest` follows formal releases only, never pre-releases. Images are published for linux/amd64 and linux/arm64, and pulling needs no login.
 
-The container runs privileged in the host's network and PID namespaces, because honk loads and attaches eBPF programs, creates `dae0` and the `daens` namespace, changes sysctls and pins maps on the host's bpffs. It therefore changes the host exactly as a native installation does and provides no isolation. The host must meet the [kernel requirements](#linux-kernel-requirements), including Linux 6.12+ and a mounted bpffs.
+The container runs privileged in the host's network and PID namespaces, because honk loads and attaches eBPF programs, creates `dae0` and the `daens` namespace, changes sysctls and pins maps on the host's bpffs. It therefore changes the host exactly as a native installation does and provides no isolation. The host must meet the [kernel requirements](#linux-kernel-requirements), including Linux 5.15+ and a mounted bpffs.
 
 Prepare `/etc/honk/config.dae` and `/var/lib/honk` as in [Minimal configuration](#minimal-configuration), then start the repository's `docker-compose.yml` with the release version in `.env`:
 
@@ -554,12 +554,12 @@ cargo run --release -p honk-core -- \
 | --- | --- |
 | `bpf-linker` is missing | Install it as shown in the source-build section and add Cargo's bin directory to PATH. |
 | `no BTF parsed for object` | Clear `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`, rebuild the eBPF object, and confirm `.BTF` with `readelf`. |
-| The kernel or verifier rejects compiled routing | Use Linux `6.12+` with BPF/BTF and freplace support. Keep the full verifier log and the generated rule attribution; do not bypass the startup failure. |
+| The kernel or verifier rejects compiled routing | Use Linux `5.15+` with BPF/BTF and freplace support. Keep the full verifier log and the generated rule attribution; do not bypass the startup failure. |
 | Pinning a map returns `Invalid argument` | `/sys/fs/bpf` is not bpffs; mount it as shown above. |
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
-| `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
+| `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link (a `clsact` filter before Linux 6.6) could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
 | On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways). |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
 | A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |

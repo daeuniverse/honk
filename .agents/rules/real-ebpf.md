@@ -5,7 +5,7 @@ Read with: `AGENTS.md` (Technology stack, Current validation guidance, Notes for
 The proxy engine (library `honk_core` + `honk-core` binary). Cargo features:
 
 - `default = ["clash-api", "mimalloc", "rprx"]`
-- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 6.12+; otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
+- `ebpf` — aya real backend + `honk-nfqueue`, requires Linux kernel 5.15+ (clsact filters before 6.6, published DNS route marks before 5.19); otherwise `MockEbpfBackend`. NFQUEUE activation follows `configuration.md`.
 - `clash-api` — Clash-compatible REST/WS API (pulls in optional axum/tower-http).
 - `native-api` — independent, opt-in native HTTP observations/control with a default-off listener; build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. It can run with mock or real eBPF and without Clash; real-kernel CI enables it for lifecycle regression coverage.
 - `mimalloc` — shipped binary allocates through mimalloc (see Technology stack in `AGENTS.md`); build with `--no-default-features --features "clash-api,ebpf,rprx,native-ui"` for the release capabilities with stock malloc. `native-ui` embeds both pinned doona editions and requires the absolute standard directory `HONK_DOONA_DIR` plus its `-lite` sibling (`export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`); use `native-api` instead only when embedded hosting (`ui: embedded` or `ui: embedded-lite`, the lighter doona lite preview edition; both need `native-ui`) is not needed.
@@ -73,7 +73,7 @@ requires root; the guest runs as root. KVM access is optional with explicit TCG
 fallback. The recipes do not install host packages or change shared-host KVM
 permissions. Non-x86_64/non-Linux hosts and restricted containers without these
 prerequisites cannot run this runner; report the gate as not run and use CI.
-Native builds and unprivileged tests remain supported, but Linux 6.12+ and root
+Native builds and unprivileged tests remain supported, but Linux 5.15+ and root
 are not sufficient isolation for direct protected-suite execution. Never invoke
 the guest script directly on a host or export its VM identity markers to bypass
 the fixture guard.
@@ -83,7 +83,7 @@ Keep every object map unpinned, including allocator maps; core owns explicit pin
 `build.rs` always emits `HONK_VERSION` from the GitHub release tag, local `git describe`, or Cargo package version without Git metadata. `honk_core::VERSION` supplies both CLIs and Clash `/version`; runtime needs no Git. With `ebpf`, locate `crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf` or `target/honk-core.o` and **verify `.BTF`**. Missing, BTF-less or stale objects trigger a rebuild with the channel read from `crates/honk-ebpf/rust-toolchain.toml`, stripping child `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS`: environment flags override `crates/honk-ebpf/.cargo/config.toml`'s `--btf` and silently omit BTF. The child also strips inherited `CARGO_PROFILE_*` overrides so host profiling cannot replace the standalone kernel crate's release policy. The object records its compiler channel in a `.toolchain` sidecar; source or pin changes invalidate it, and a sidecar older than core's `build.rs` triggers a rebuild after embedding-policy changes. Copy to `OUT_DIR/honk-ebpf.o`, set `HONK_EBPF_OBJECT`; `lib.rs` embeds with `include_bytes!`. Runtime override: `--bpf-object`; manually built or supplied objects remain the caller's responsibility.
 
 ```bash
-# Requires Linux kernel 6.12+, clang/llvm/libbpf headers, nightly + bpf-linker.
+# Requires Linux kernel 5.15+, clang/llvm/libbpf headers, nightly + bpf-linker.
 # build.rs auto-builds the eBPF object on first build (~30s).
 cargo build --release -p honk-core --features ebpf
 sudo ./target/release/honk-core --config /etc/honk/config.dae          # embedded object
