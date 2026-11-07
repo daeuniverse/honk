@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable-virtme-guest gate. Never invoke on the host; no downloads/builds.
-# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core
+# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon]
 set -euo pipefail
 
 fail() { printf 'xdp-daemon-smoke: %s\n' "$*" >&2; exit 1; }
@@ -19,15 +19,22 @@ assert os.path.exists('/proc/self/ns/net'), 'requires network namespaces'
 PY
 
 if [[ ${1:-} != --isolated ]]; then
-    [[ $# -le 1 ]] || fail 'expected one freshly built daemon executable'
+    [[ $# -le 2 ]] || fail 'expected a fresh daemon executable and optional smoke scope'
     daemon=${1:-${HONK_XDP_DAEMON:-}}
     [[ $daemon == /* && -x $daemon ]] || fail 'supply an absolute fresh honk-core executable path'
     export HONK_XDP_PARENT_NETNS
     HONK_XDP_PARENT_NETNS=$(stat -Lc %i /proc/self/ns/net)
-    exec unshare --mount --net -- bash "${BASH_SOURCE[0]}" --isolated "$daemon"
+    exec unshare --mount --net -- bash "${BASH_SOURCE[0]}" --isolated "$daemon" "${2:-all}"
 fi
-[[ $# == 2 && -x $2 && $2 == /* ]] || fail 'invalid isolated invocation'
+[[ $# == 3 && -x $2 && $2 == /* ]] || fail 'invalid isolated invocation'
 daemon=$2
+smoke_scope=$3
+case $smoke_scope in
+    all) ;;
+    runtime) [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]] || fail 'runtime scope requires the complete Core test executable' ;;
+    daemon) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'daemon scope cannot ignore supplied test executables' ;;
+    *) fail 'unknown smoke scope' ;;
+esac
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 export HONK_XDP_PROBE="$script_dir/xdp-ipv4-options.py"
 current_netns=$(stat -Lc %i /proc/self/ns/net)
@@ -48,6 +55,7 @@ mount -t bpf bpf "$work/bpf"
 [[ $(stat -f -c %T "$work/bpf") == bpf_fs ]] || fail 'requires bpffs'
 export HONK_XDP_PIN_ROOT="$work/bpf"
 server_pid= daemon_pid=
+adaptive_active=false
 namespaces=()
 stop_sources() {
     if [[ -n $server_pid ]]; then
@@ -64,10 +72,31 @@ stop_sources() {
     ip -n server link set s0 down 2>/dev/null || true
     ip -n server link set su down 2>/dev/null || true
 }
+retain_adaptive_custody() {
+    python3 - <<'PY'
+import os, signal
+held = [os.open('/proc/thread-self/ns/mnt', os.O_RDONLY)]
+for name in os.listdir('/run/netns'):
+    held.append(os.open('/run/netns/' + name, os.O_RDONLY))
+print('unresolved adaptive owner custody retained until VM teardown', flush=True)
+while True:
+    signal.pause()
+PY
+}
+
 cleanup() {
     status=$?
     trap - EXIT
     stop_sources
+    if [[ $adaptive_active == true && ! -f $work/adaptive-runtime.joined ]]; then
+        # A failed join cannot authorize namespace/pin teardown. This guest-only
+        # custodian retains the private mount/nsfs/bpffs until the VM is destroyed.
+        retain_adaptive_custody </dev/null >"$work/adaptive-custodian.log" 2>&1 &
+        printf '%s\n' "$!" >"$work/adaptive-custodian.pid"
+        printf 'Retaining unresolved adaptive ownership: %s (exit %s)\n' "$work" "$status" >&2
+        [[ $status != 0 ]] || status=1
+        exit "$status"
+    fi
     ip netns exec dut nft -j list ruleset >"$work/final.nft.json" 2>"$work/final.nft.stderr" || true
     ip -n dut -j -d link show >"$work/final.links.json" 2>"$work/final.links.stderr" || true
     if [[ -n $daemon_pid ]]; then
@@ -226,13 +255,14 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     ip -n dut route replace prohibit 198.51.100.98/32
     ip -n dut -6 route replace prohibit fd00:2::98/128
     driven_test=xdp::tests::driven_kernel::policy_publication_keeps_real_endpoint_app_timer_and_close_owned
+    adaptive_test=xdp::tests::driven_kernel::adaptive::actual_owner_clock_budget_fairness_and_live_features
     for test in \
         control::core_forward::tests::firewall_capacity_refusal_keeps_packet_owner_alive \
         control::core_forward::tests::unresolved_forward_neighbor_does_not_delay_transit_errors \
         control::core_forward::tests::generated_reassembly_error_keeps_scoped_nat_and_funding_through_completion \
         control::core_forward::tests::plain_output_history_survives_first_nat_enable_and_cq_owners \
         control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity \
-        "$driven_test"; do
+        "$driven_test" "$adaptive_test"; do
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
     done
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" control::core_forward::tests:: --ignored --test-threads=1 --nocapture | tee "$work/core-forward.log"
@@ -269,6 +299,127 @@ PY
     ip -n dut route del prohibit 198.51.100.98/32
     ip -n dut -6 route del prohibit fd00:2::98/128
     provision_routes c0 s0 dut0 dut1
+
+    # A separate 45-second combined-consumer window; the original Event/E32
+    # selection and every later daemon profile keep their original bounds.
+    ip -n client -j -d link show dev c0 >"$work/adaptive-original-c0.json"
+    ip -n server -j -d link show dev s0 >"$work/adaptive-original-s0.json"
+    read -r original_c0_rx original_c0_tx original_s0_rx original_s0_tx < <(
+        python3 -c 'import json,sys; links=[json.load(open(path))[0] for path in sys.argv[1:]]; print(*(link[key] for link in links for key in ("num_rx_queues", "num_tx_queues")))' \
+            "$work/adaptive-original-c0.json" "$work/adaptive-original-s0.json"
+    )
+    recreate_adaptive_peers() {
+        local c0_rx=$1 c0_tx=$2 s0_rx=$3 s0_tx=$4
+        ip netns exec dut python3 "$work/check.py" absent
+        # These exact pairs were created by this private window. No active
+        # program/owner survives the preceding real join and identity checks.
+        ip -n dut link del dut0
+        ip -n dut link del dut1
+        ip -n dut link add dut0 numrxqueues 2 numtxqueues 2 type veth peer name c0 numrxqueues "$c0_rx" numtxqueues "$c0_tx" netns client
+        ip -n dut link add dut1 numrxqueues 2 numtxqueues 2 type veth peer name s0 numrxqueues "$s0_rx" numtxqueues "$s0_tx" netns server
+        for spec in 'dut dut0' 'dut dut1' 'client c0' 'server s0'; do
+            read -r ns dev <<<"$spec"
+            ip -n "$ns" link set dev "$dev" mtu 1500 addrgenmode none
+            ip netns exec "$ns" ethtool -K "$dev" rx off tx off tso off gso off gro off rxvlan off rx-vlan-stag-hw-parse off tx-vlan-offload off tx-vlan-stag-hw-insert off
+            ip -n "$ns" link set dev "$dev" up
+        done
+        ip -n dut link set dut0 address 02:00:00:00:00:10
+        ip -n dut link set dut1 address 02:00:00:00:00:11
+        ip -n client link set c0 address 02:00:00:00:00:20
+        ip -n server link set s0 address 02:00:00:00:00:21
+        provision_routes c0 s0 dut0 dut1
+    }
+    recreate_adaptive_peers 2 2 2 2
+    for spec in 'client c0' 'server s0'; do
+        read -r ns dev <<<"$spec"
+        ip netns exec "$ns" tc qdisc add dev "$dev" root mqprio num_tc 2 map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 queues 1@0 1@1 hw 0
+    done
+    suffix="$BASHPID-$RANDOM"
+    export HONK_XDP_ADAPTIVE_B_NS="hv7-b-$suffix"
+    export HONK_XDP_ADAPTIVE_CLIENT_NS="hv7-c-$suffix"
+    ip netns add "$HONK_XDP_ADAPTIVE_B_NS"
+    adaptive_namespace_base=${#namespaces[@]}
+    namespaces+=("$HONK_XDP_ADAPTIVE_B_NS")
+    ip netns add "$HONK_XDP_ADAPTIVE_CLIENT_NS"
+    namespaces+=("$HONK_XDP_ADAPTIVE_CLIENT_NS")
+    export HONK_XDP_ADAPTIVE_B_INODE HONK_XDP_ADAPTIVE_CLIENT_INODE
+    HONK_XDP_ADAPTIVE_B_INODE=$(stat -Lc %i "/run/netns/$HONK_XDP_ADAPTIVE_B_NS")
+    HONK_XDP_ADAPTIVE_CLIENT_INODE=$(stat -Lc %i "/run/netns/$HONK_XDP_ADAPTIVE_CLIENT_NS")
+    [[ $HONK_XDP_ADAPTIVE_B_INODE != "$current_netns" &&
+       $HONK_XDP_ADAPTIVE_B_INODE != "$(stat -Lc %i /run/netns/dut)" &&
+       $HONK_XDP_ADAPTIVE_CLIENT_INODE != "$HONK_XDP_ADAPTIVE_B_INODE" ]] || fail 'adaptive namespace identity collision'
+    for ns in "$HONK_XDP_ADAPTIVE_B_NS" "$HONK_XDP_ADAPTIVE_CLIENT_NS"; do
+        ip netns exec "$ns" sysctl -qw net.ipv6.conf.default.addr_gen_mode=1
+        ip -n "$ns" link set lo up
+    done
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" link add dut2 numrxqueues 2 numtxqueues 2 type veth peer name c1 numrxqueues 2 numtxqueues 2 netns "$HONK_XDP_ADAPTIVE_CLIENT_NS"
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" link add upb type veth peer name sub netns server
+    for spec in "$HONK_XDP_ADAPTIVE_B_NS dut2" "$HONK_XDP_ADAPTIVE_B_NS upb" "$HONK_XDP_ADAPTIVE_CLIENT_NS c1" 'server sub'; do
+        read -r ns dev <<<"$spec"
+        ip -n "$ns" link set dev "$dev" mtu 1500 addrgenmode none
+        ip netns exec "$ns" ethtool -K "$dev" rx off tx off tso off gso off gro off rxvlan off rx-vlan-stag-hw-parse off tx-vlan-offload off tx-vlan-stag-hw-insert off
+        ip -n "$ns" link set dev "$dev" up
+    done
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" link set dut2 address 02:00:00:00:00:12
+    ip -n "$HONK_XDP_ADAPTIVE_CLIENT_NS" link set c1 address 02:00:00:00:00:22
+    ip -n "$HONK_XDP_ADAPTIVE_CLIENT_NS" addr add 192.0.3.2/24 dev c1
+    ip -n "$HONK_XDP_ADAPTIVE_CLIENT_NS" route add 198.51.100.2/32 dev c1
+    ip -n "$HONK_XDP_ADAPTIVE_CLIENT_NS" neigh add 198.51.100.2 lladdr 02:00:00:00:00:12 nud permanent dev c1
+    # Two actual traffic classes/queues, selected by the two real packet sockets'
+    # SO_PRIORITY. The test must still observe both actual RX queue counters.
+    ip netns exec "$HONK_XDP_ADAPTIVE_CLIENT_NS" tc qdisc add dev c1 root mqprio num_tc 2 map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 queues 1@0 1@1 hw 0
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" addr add 10.78.0.1/30 dev upb
+    ip -n server addr add 10.78.0.2/30 dev sub
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" rule add pref 100 fwmark 0x100/0xffffffff lookup 100
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" route add table 100 default via 10.78.0.2 dev upb
+    ip -n "$HONK_XDP_ADAPTIVE_B_NS" route add 198.51.100.2/32 via 10.78.0.2 dev upb
+    ip netns exec "$HONK_XDP_ADAPTIVE_B_NS" sysctl -qw net.ipv4.ip_forward=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+    ip -n dut route replace 192.0.2.99/32 dev dut0 src 203.0.113.1
+    ip -n dut route replace 198.51.100.99/32 dev dut1 src 203.0.113.1
+    ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
+    ip netns exec client nft add table inet honk_smoke_driven
+    ip netns exec client nft 'add chain inet honk_smoke_driven prerouting { type filter hook prerouting priority -300; policy accept; }'
+    ip netns exec client nft add rule inet honk_smoke_driven prerouting ip daddr 192.0.2.99 drop
+    ip netns exec "$HONK_XDP_ADAPTIVE_B_NS" nft add table inet honk_smoke_native
+    ip netns exec "$HONK_XDP_ADAPTIVE_B_NS" nft 'add chain inet honk_smoke_native forward { type filter hook forward priority -300; policy accept; }'
+    ip netns exec "$HONK_XDP_ADAPTIVE_B_NS" nft add rule inet honk_smoke_native forward counter drop
+    mkdir "$work/adaptive-bpf"
+    mount -t bpf bpf "$work/adaptive-bpf"
+    adaptive_active=true
+    ip netns exec dut env HONK_XDP_PIN_ROOT="$work/adaptive-bpf" HONK_XDP_ARTIFACT_ROOT="$work" \
+        "$HONK_XDP_CORE_TEST_BIN" "$adaptive_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/adaptive-runtime.log"
+    [[ -f $work/adaptive-runtime.joined ]] || fail 'adaptive owners did not all genuinely join'
+    for ns in dut "$HONK_XDP_ADAPTIVE_B_NS"; do
+        ip netns exec "$ns" nft -j list chain inet honk_smoke_native forward >"$work/adaptive-native-$ns.json"
+    done
+    python3 - "$work/adaptive-native-dut.json" "$work/adaptive-native-$HONK_XDP_ADAPTIVE_B_NS.json" <<'PY'
+import json, pathlib, sys
+for path in sys.argv[1:]:
+    items = json.loads(pathlib.Path(path).read_text())['nftables']
+    rules = [item['rule']['expr'] for item in items if 'rule' in item]
+    assert len(rules) == 1 and rules[0][-1] == {'drop': None}, rules
+    counter = next(item['counter'] for item in rules[0] if 'counter' in item)
+    assert counter['packets'] == 0, ('native forwarding masked adaptive Runtime evidence', path, counter)
+PY
+    [[ -z $(find "$work/adaptive-bpf" -type f -print -quit) ]] || fail 'adaptive exact-owned pin cleanup incomplete'
+    adaptive_active=false
+    umount "$work/adaptive-bpf"
+    rmdir "$work/adaptive-bpf"
+    [[ $(stat -Lc %i "/run/netns/$HONK_XDP_ADAPTIVE_B_NS") == "$HONK_XDP_ADAPTIVE_B_INODE" &&
+       $(stat -Lc %i "/run/netns/$HONK_XDP_ADAPTIVE_CLIENT_NS") == "$HONK_XDP_ADAPTIVE_CLIENT_INODE" ]] || fail 'adaptive namespace identity changed before cleanup'
+    ip netns del "$HONK_XDP_ADAPTIVE_CLIENT_NS"
+    ip netns del "$HONK_XDP_ADAPTIVE_B_NS"
+    namespaces=("${namespaces[@]:0:adaptive_namespace_base}")
+    ip netns exec client nft delete table inet honk_smoke_driven
+    ip netns exec dut nft flush chain inet honk_smoke_native forward
+    # The fixture's A frontier left dut0/dut1 administratively down, which flushed
+    # their 192.0.2.99/198.51.100.99 routes; recreation below deletes both links.
+    ip netns exec dut python3 "$work/check.py" absent
+    recreate_adaptive_peers "$original_c0_rx" "$original_c0_tx" "$original_s0_rx" "$original_s0_tx"
+fi
+if [[ $smoke_scope == runtime ]]; then
+    printf 'PASS: complete real driven Runtime tests and joined ownership cleanup.\n'
+    exit 0
 fi
 cat >"$work/echo.py" <<'PY'
 import pathlib, selectors, socket, sys
@@ -316,7 +467,7 @@ while len(completed) < 4:
         print(mode, family, kind, peer, 'payload verified', flush=True)
 PY
 cat >"$work/client.py" <<'PY'
-import contextlib, json, os, pathlib, re, signal, socket, struct, subprocess, sys, time
+import contextlib, hashlib, json, os, pathlib, re, signal, socket, struct, subprocess, sys, time
 mode = sys.argv[1]
 def captures():
     return {dev: json.loads(subprocess.check_output(['ip', 'netns', 'exec', 'dut', sys.executable, os.environ['HONK_XDP_PROBE'], 'count', dev], text=True, timeout=5)) for dev in ('dut0', 'dut1')}
@@ -333,6 +484,73 @@ def reload_config(text, expected):
             return
         assert time.monotonic() < deadline, 'policy reload did not acknowledge publication'
         time.sleep(0.02)
+def polling_identity(log, offset=0, reason=None):
+    deadline = time.monotonic() + 10
+    while True:
+        text = re.sub(r'\x1b\[[0-9;]*m', '', log.read_text()[offset:])
+        lines = [line for line in text.splitlines() if 'XDP polling calibration identity' in line and (reason is None or reason in line)]
+        if lines:
+            line = lines[-1]
+            values = {name: re.search(r'\b' + name + r'="([0-9a-f]{64})"', line) for name in ('executable_sha256', 'context_sha256', 'parameter_sha256')}
+            if all(values.values()):
+                return line, {name: match[1] for name, match in values.items()}
+        assert time.monotonic() < deadline, 'missing actual Event calibration identities'
+        time.sleep(0.01)
+
+def polling_traffic(sock, payload, seconds=0.5):
+    deadline = time.monotonic() + seconds
+    count = 0
+    while time.monotonic() < deadline:
+        sock.sendall(payload)
+        assert sock.recv(4096) == payload, 'adaptive probe lost real Endpoint reply progress'
+        count += 1
+    assert count > 2, 'no actual qualifying traffic was offered'
+    return count
+
+def polling_case(sock, payload, original, flagged):
+    config, log = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+    line, identity = polling_identity(log)
+    actual = hashlib.sha256(pathlib.Path(f'/proc/{int(sys.argv[4])}/exe').read_bytes()).hexdigest()
+    assert identity['executable_sha256'] == actual, 'calibration did not identify running executable'
+    if flagged:
+        assert 'explicit_event' in line, 'baseline did not actually remain Event'
+        manifest = config.with_name('polling-preregistration.json')
+        declaration = {'schema': 'honk-xdp-poll-smoke-preregistration-v1', 'identities': identity,
+                       'parameters': {'pps_enter': 1, 'pps_exit': 0, 'observation_window_us': 20000,
+                                      'enter_windows': 2, 'exit_windows': 1, 'max_busy_us': 1000,
+                                      'empty_rounds': 2, 'budget_window_us': 10000, 'budget_us': 2000},
+                       'purpose': 'real consumer correctness; not performance or energy qualification'}
+        manifest.write_text(json.dumps(declaration, sort_keys=True) + '\n')
+        evidence = hashlib.sha256(manifest.read_bytes()).hexdigest()
+        calibration = '\ncalibration {\n schema: 1\n counting_revision: 1\n' + ''.join(f' {name}: "{value}"\n' for name, value in identity.items()) + f' status: candidate\n evidence_manifest_sha256: "{evidence}"\n}}\n'
+        candidate = original.replace('poll_mode: event', 'poll_mode: adaptive', 1).replace('budget_us: 2000', 'budget_us: 2000' + calibration, 1)
+        mismatch = '0' * 64 if identity['context_sha256'] != '0' * 64 else '1' * 64
+        offset = len(log.read_text())
+        reload_config(candidate.replace(identity['context_sha256'], mismatch), 'applied')
+        reason, _ = polling_identity(log, offset, 'calibration_context_mismatch')
+        assert 'calibration_context_mismatch' in reason, 'mismatched context was not actual Event'
+        offset = len(log.read_text())
+        reload_config(candidate, 'applied')
+        polling_traffic(sock, payload)
+        reload_config(candidate.replace('poll_mode: adaptive', 'poll_mode: event', 1), 'applied')
+        settled, _ = polling_identity(log, offset, 'explicit_event')
+        entries = re.search(r'\bbusy_entries=(\d+)', settled)
+        rounds = re.search(r'\bbusy_probe_rounds=(\d+)', settled)
+        assert entries and int(entries[1]) > 0, 'fully bound real candidate never entered Busy'
+        assert rounds and int(rounds[1]) > 0, 'candidate had no complete actual Busy probe round'
+        assert 'explicit_event' in settled, 'Event override did not reach real consumer'
+        config.with_name('polling-candidate.dae').write_text(candidate)
+        reload_config(original, 'applied')
+        print('real Event identities, preregistered candidate, context mismatch, Busy rounds and Event reload verified', flush=True)
+    else:
+        assert 'calibration_candidate_not_enabled' in line, 'candidate without process opt-in was not refused'
+        polling_traffic(sock, payload)
+        offset = len(log.read_text())
+        reload_config(original.replace('poll_mode: adaptive', 'poll_mode: event', 1), 'applied')
+        settled, _ = polling_identity(log, offset, 'explicit_event')
+        assert re.search(r'\bbusy_entries=0\b', settled), 'unflagged candidate entered Busy'
+        print('real matching candidate remains Event without the laboratory process flag', flush=True)
+
 for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd00:2::2')):
     for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
         payload = f'{mode}/{family}/{kind}:'.encode() + bytes(range(256)) * (32 if 'jumbo' in mode else 4)
@@ -429,6 +647,9 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
                     sock.sendall(payload)
                     assert sock.recv(4096) == payload, 'binding-mode reload disturbed the existing flow'
                 print('explicit copy reload preserves flows; omitted and explicit zerocopy require restart', flush=True)
+                polling_case(sock, payload, original, True)
+            if mode == 'endpoint-candidate-unflagged' and family == socket.AF_INET and kind == socket.SOCK_DGRAM:
+                polling_case(sock, payload, pathlib.Path(sys.argv[2]).read_text(), False)
             if mode == 'snat' and family == socket.AF_INET and kind == socket.SOCK_DGRAM:
                 original = pathlib.Path(sys.argv[2]).read_text()
                 for outbound in ('block', 'direct'):
@@ -445,7 +666,7 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
         print(mode, family, kind, 'echo verified', flush=True)
 PY
 write_config() {
-    local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= dns="dns { bind: '' }"
+    local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= polling= log_level=info dns="dns { bind: '' }"
     if [[ -n ${5:-} ]]; then binding="xsk_mode: $5"; fi
     if [[ ${4:-} == snat || ${4:-} == masquerade ]]; then
         # Separate daemon profiles must not reuse the peer's retained TIME_WAIT tuple.
@@ -468,18 +689,37 @@ write_config() {
         packet_policy="dport(18083) -> direct(must)
     domain(packet-path.test) -> block"
     fi
+    if [[ ${4:-} == endpoint ]]; then
+        log_level=debug
+        polling="poll_mode: event
+    busy_poll {
+        pps_enter: 1
+        pps_exit: 0
+        observation_window_us: 20000
+        enter_windows: 2
+        exit_windows: 1
+        max_busy_us: 1000
+        empty_rounds: 2
+        budget_window_us: 10000
+        budget_us: 2000
+    }"
+    fi
     cat >"$file" <<EOF
 global {
     dial_mode: ip
     nfqueue_enable: false
     so_mark_from_dae: 0x100
     data_dir: '/run/honk-xdp-state'
+    tcp_check_url: 'http://127.0.0.1:1/'
+    udp_check_dns: '127.0.0.1:9'
+    log_level: $log_level
 }
 $dns
 datapath {
     $backend
     $direct
     $binding
+    $polling
     interface {
         dut0: lan
         dut1: wan
@@ -592,7 +832,7 @@ for profile in endpoint core; do
     [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'low MTU left pinned kernel objects'
 done
 ip -n dut link del lowmtu
-for profile in endpoint core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo; do
+for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo; do
     for spec in 'client c0' 'server s0' 'server su'; do
         read -r ns dev <<<"$spec"
         ip -n "$ns" link set lo up
@@ -639,10 +879,16 @@ for profile in endpoint core snat masquerade endpoint-vlan core-vlan endpoint-vl
     direct=core
     if [[ $profile == endpoint* ]]; then direct=endpoint; fi
     write_config "$work/$profile.dae" 'backend: xdp' "direct: $direct" "$profile" 'copy'
+    polling_args=()
+    if [[ $profile == endpoint ]]; then
+        polling_args=(--busy-poll-calibration-experiment)
+    elif [[ $profile == endpoint-candidate-unflagged ]]; then
+        cp "$work/polling-candidate.dae" "$work/$profile.dae"
+    fi
     ip -n dut -j address show >"$work/$profile.addresses.json"
     ip netns exec server python3 "$work/echo.py" "$profile" "$work/$profile.server-ready" >"$work/$profile.server.log" 2>&1 &
     server_pid=$!
-    ip netns exec dut "$daemon" -c "$work/$profile.dae" --bpf-pin-root "$work/bpf" >"$work/$profile.daemon.log" 2>&1 &
+    ip netns exec dut "$daemon" -c "$work/$profile.dae" --bpf-pin-root "$work/bpf" "${polling_args[@]}" >"$work/$profile.daemon.log" 2>&1 &
     daemon_pid=$!
     ready=false
     for ((attempt=0; attempt<200; attempt++)); do
@@ -727,6 +973,8 @@ global {
     nfqueue_enable: false
     so_mark_from_dae: 0x100
     data_dir: '/run/honk-tc-state'
+    tcp_check_url: 'http://127.0.0.1:1/'
+    udp_check_dns: '127.0.0.1:9'
 }
 dns { bind: '' }
 routing { fallback: direct }
