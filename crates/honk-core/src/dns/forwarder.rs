@@ -106,6 +106,9 @@ pub(crate) enum CacheAccess {
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
+    /// A node server host lookup on the dial path: response rules may
+    /// requery through a proxy whose own dial would need this very lookup.
+    pub(crate) node_host: bool,
 }
 
 impl ResolveOptions {
@@ -117,6 +120,7 @@ impl ResolveOptions {
                 self.cache
             },
             forced_upstream: self.forced_upstream.clone(),
+            node_host: self.node_host,
         }
     }
 }
@@ -146,6 +150,9 @@ pub struct DnsForwarder {
     /// `0` preserves the cached wire TTLs.
     pub(crate) stale_reply_ttl: u32,
     pub(crate) policy_id: Option<PolicyId>,
+    /// Server hosts of subscription nodes, to their subscription tags, in
+    /// this generation; empty unless a `subtag()` rule exists.
+    pub(crate) node_hosts: Arc<super::node_host::NodeHosts>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
     socket_budget: super::transport::DnsSocketBudget,
@@ -177,6 +184,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             stale_reply_ttl: 30,
             policy_id: None,
+            node_hosts: Arc::default(),
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
             socket_budget: super::transport::DnsSocketBudget::default(),
@@ -200,6 +208,12 @@ impl DnsForwarder {
     /// Set the IP-version strategy used for DNS responses.
     pub fn with_strategy(mut self, strategy: DnsStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Node server hosts that `subtag()` rules of this generation may claim.
+    pub(crate) fn with_node_hosts(mut self, node_hosts: super::node_host::NodeHosts) -> Self {
+        self.node_hosts = Arc::new(node_hosts);
         self
     }
 
@@ -359,6 +373,7 @@ impl DnsForwarder {
             cache_ttl: self.cache_ttl,
             stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
+            node_hosts: Arc::clone(&self.node_hosts),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
             socket_budget: self.socket_budget.clone(),

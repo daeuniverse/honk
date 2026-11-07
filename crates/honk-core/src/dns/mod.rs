@@ -21,6 +21,7 @@ pub(crate) mod ecs;
 pub mod endpoint;
 pub mod engine;
 pub mod forwarder;
+pub(crate) mod node_host;
 pub mod outcome;
 pub mod persist;
 pub mod planner;

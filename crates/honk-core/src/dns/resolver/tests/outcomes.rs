@@ -408,3 +408,76 @@ async fn literal_ip_skips_dns_and_fallback() {
     assert_eq!(pool.counts(), [0, 0]);
     assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test]
+async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_cache() {
+    struct NamedPool(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl DnsUpstreamPool for NamedPool {
+        async fn query(&self, upstream_name: &str, query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.0.lock().unwrap().push(upstream_name.to_owned());
+            let (_, qtype) =
+                parse_dns_question(query).ok_or_else(|| anyhow::anyhow!("question"))?;
+            Ok(address_response(query, qtype, 300))
+        }
+    }
+
+    // The response rule would send every provider answer through a proxied
+    // upstream, whose dial could need this very node host.
+    let mut config = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n  response {\n   upstream(providerdoh) -> proxied\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    config.strategy = DnsStrategy::Ipv4Only;
+    let pool = Arc::new(NamedPool(std::sync::Mutex::default()));
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            Arc::new(DnsRouter::new_from_dns_config(&config).expect("router")),
+        )
+        .with_strategy(config.strategy)
+        .with_node_hosts(
+            [
+                ("node.private.example", "MyAirport"),
+                ("node.public.example", "MyAirport"),
+                ("other.private.example", "Other"),
+            ]
+            .into_iter()
+            .map(|(host, tag)| (host.to_owned(), Arc::from([tag.to_owned()])))
+            .collect(),
+        ),
+    );
+    let service = DnsService::with_forwarder(forwarder);
+
+    for _ in 0..2 {
+        let addresses = service
+            .resolve_node_host("Node.Private.Example.")
+            .await
+            .expect("node host lookup")
+            .expect("claimed by the subtag rule");
+        assert_eq!(addresses.len(), 1);
+    }
+    assert_eq!(
+        *pool.0.lock().unwrap(),
+        ["providerdoh", "providerdoh"],
+        "each lookup reaches only its own upstream and none is served from cache"
+    );
+    for unclaimed in [
+        "node.public.example",
+        "other.private.example",
+        "unindexed.private.example",
+    ] {
+        assert!(
+            service
+                .resolve_node_host(unclaimed)
+                .await
+                .unwrap()
+                .is_none(),
+            "{unclaimed}"
+        );
+    }
+    assert_eq!(pool.0.lock().unwrap().len(), 2);
+}

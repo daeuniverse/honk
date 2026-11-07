@@ -7,13 +7,16 @@
 //! reach. dae solves this with `bootstrap_resolver`: a plain, direct DNS
 //! server that honk queries itself on a bypass-marked socket.
 //!
-//! [`resolve`] checks the configured bootstrap resolver first, then `/etc/hosts`
-//! and the first numeric `/etc/resolv.conf` nameserver. Every DNS socket is
-//! bypass-marked; libc NSS/search-suffix resolution is deliberately not used.
+//! [`resolve`] first offers the host to the installed [`NodeHostResolver`],
+//! which claims only node hosts an explicit `subtag()` DNS rule routes to a
+//! direct upstream. Otherwise it checks the configured bootstrap resolver,
+//! then `/etc/hosts` and the first numeric `/etc/resolv.conf` nameserver.
+//! Every DNS socket is bypass-marked; libc NSS/search-suffix resolution is
+//! deliberately not used.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// A direct DNS server used to resolve proxy-server hostnames.
@@ -64,9 +67,40 @@ pub fn global_server() -> Option<SocketAddr> {
     GLOBAL.read().unwrap().map(|r| r.server)
 }
 
-/// Resolve `host`, preferring the configured bootstrap resolver and falling back
-/// to `/etc/hosts` and bypass-marked queries to the system nameserver.
+/// An authoritative node server host lookup.
+pub type NodeHostLookup = std::pin::Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
+
+/// Resolves node server hosts that configured DNS rules claim.
+pub trait NodeHostResolver: Send + Sync {
+    /// `None` leaves `host` to the bootstrap resolver. A returned lookup is
+    /// authoritative: its failure is the dial's failure.
+    fn lookup(&self, host: &str) -> Option<NodeHostLookup>;
+}
+
+static NODE_HOSTS: RwLock<Option<Arc<dyn NodeHostResolver>>> = RwLock::new(None);
+
+/// Install (or clear) the process-wide node host resolver alongside
+/// [`set_global`].
+pub fn set_node_host_resolver(resolver: Option<Arc<dyn NodeHostResolver>>) {
+    *NODE_HOSTS
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = resolver;
+}
+
+/// Resolve `host`, preferring a claiming [`NodeHostResolver`], then the
+/// configured bootstrap resolver, then `/etc/hosts` and bypass-marked queries
+/// to the system nameserver.
 pub async fn resolve(host: &str) -> io::Result<Vec<IpAddr>> {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if crate::runtime::pinned_server_address(bare).is_none() && bare.parse::<IpAddr>().is_err() {
+        let resolver = NODE_HOSTS
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(lookup) = resolver.and_then(|resolver| resolver.lookup(bare)) {
+            return lookup.await;
+        }
+    }
     resolve_with(global(), host).await
 }
 

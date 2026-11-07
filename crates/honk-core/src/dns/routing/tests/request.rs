@@ -2,7 +2,7 @@ use std::net::IpAddr;
 
 use honk_config::dns::{
     DnsCond, DnsDomainMatcher, DnsLegacyRule, DnsRequestAction, DnsRequestRouting, DnsRequestRule,
-    DnsRouting,
+    DnsRouting, DnsTagMatcher,
 };
 
 use super::{DnsRouter, router_from_request};
@@ -360,4 +360,52 @@ fn invalid_sip_conditions_fail_router_construction() {
         };
         assert!(DnsRouter::new(&routing).is_err());
     }
+}
+
+#[test]
+fn subtag_rules_claim_only_node_hosts_of_matching_subscriptions() {
+    let subtag = |not, tag: DnsTagMatcher| DnsCond::Subtag {
+        not,
+        tags: vec![tag],
+    };
+    let suffix = |value: &str| DnsCond::Qname {
+        not: false,
+        matchers: vec![DnsDomainMatcher::Suffix(value.into())],
+    };
+    let upstream = |name: &str| DnsRequestAction::Upstream(name.into());
+    let router = router_from_request(request(vec![
+        DnsRequestRule {
+            conditions: vec![
+                subtag(false, DnsTagMatcher::Keyword("Airport".into())),
+                suffix("private.example"),
+            ],
+            action: upstream("providerdoh"),
+        },
+        rule(
+            subtag(true, DnsTagMatcher::Exact("Other".into())),
+            upstream("negated"),
+        ),
+        rule(suffix("example"), upstream("ordinary")),
+    ]));
+    let node = |host, tag: &str| {
+        router
+            .select_node_upstream(host, &[tag.to_owned()])
+            .map(str::to_owned)
+    };
+
+    assert_eq!(
+        node("a.private.example", "MyAirport").as_deref(),
+        Some("providerdoh")
+    );
+    assert_eq!(
+        node("a.public.example", "MyAirport").as_deref(),
+        Some("negated")
+    );
+    // Ordinary rules and the fallback never claim a node host.
+    assert_eq!(node("a.private.example", "Other"), None);
+    // Client queries carry no subscription, so even !subtag() stays false.
+    assert_eq!(
+        router.select_request("a.private.example", 1),
+        DnsRequestDecision::Upstream("ordinary".into())
+    );
 }
