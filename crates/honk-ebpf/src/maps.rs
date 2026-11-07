@@ -135,6 +135,21 @@ pub static REDIRECT_TRACK: HashMap<RedirectTuple, FlowMapValue<RedirectEntry>, 6
 /// unlike the plain hashes above, so no userspace sweep owns it.
 pub static CLIENT_REPLY_TRACK: LruHashMap<RedirectTuple, RedirectEntry, 16384> = LruHashMap::new();
 
+#[btf_map]
+/// The last UDP/53 route mark redirected for each tuple, read by userspace on
+/// kernels whose listeners cannot receive skb marks. Within one routing
+/// generation a tuple always gets the same mark; userspace still fences the
+/// generation it reads.
+pub static DNS_ROUTE_MARKS: LruHashMap<TuplesKey, u32, 16384> = LruHashMap::new();
+
+/// Mirror a redirected UDP/53 route mark for listeners without `SO_RCVMARK`.
+#[inline(always)]
+pub fn publish_dns_route_mark(tuple: &TuplesKey, mark: u32) {
+    if mark != 0 && PARAM.load().dns_route_marks != 0 {
+        let _ = DNS_ROUTE_MARKS.insert(tuple, &mark, 0);
+    }
+}
+
 /// Fixed one-second window of a source's new-flow budget on one CPU.
 #[repr(C)]
 pub struct NewFlowWindow {

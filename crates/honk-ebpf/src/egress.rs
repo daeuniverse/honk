@@ -532,6 +532,7 @@ fn fast_path_decision(
         return Err(TC_ACT_SHOT);
     }
 
+    crate::maps::publish_dns_route_mark(&tuples.five, dns_route_mark);
     unsafe {
         (*raw_skb(ctx)).cb[0] = TPROXY_MARK;
         (*raw_skb(ctx)).cb[1] = IPPROTO_UDP as u32;

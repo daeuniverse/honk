@@ -734,6 +734,12 @@ pub trait EbpfBackend: Send + Sync {
     /// rolled-back legacy monotonic allocator starting at `generation`.
     fn reset_udp_decision_sequence(&mut self, generation: u32) -> anyhow::Result<bool>;
 
+    /// The UDP/53 route mark the datapath last published for `key`, on kernels
+    /// whose listeners cannot receive skb marks; `None` everywhere else.
+    fn dns_route_mark(&self, _key: &TuplesKey) -> anyhow::Result<Option<u32>> {
+        Ok(None)
+    }
+
     /// Inspect immutable handoff metadata without consuming newer ownership.
     fn routing_handoff_lookup(
         &self,

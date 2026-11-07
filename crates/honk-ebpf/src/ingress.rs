@@ -97,6 +97,7 @@ fn redirect_lan_packet_to_control_plane(
     crate::stats::count_tx(ctx, unsafe { routing_meta.data.outbound });
 
     if !dns_fragment {
+        crate::maps::publish_dns_route_mark(&pkt.tuples.five, dns_route_mark);
         // The link crossing may scrub skb->mark; dae0peer restores routing
         // authority from cb[2] after validating the carrier.
         ctx.skb

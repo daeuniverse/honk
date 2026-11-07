@@ -92,6 +92,7 @@ impl RealEbpfBackend {
             has_bpf_get_current_task: matches!(pname_mode, process_name::PnameCaptureMode::Argv0)
                 as u8,
             dae_socket_mark: honk_outbound::util::bypass_mark(),
+            dns_route_marks: u8::from(!crate::kernel::so_rcvmark_supported()),
             control_plane_pid: std::process::id(),
             tcp_daens_netns_id,
             local_ip,

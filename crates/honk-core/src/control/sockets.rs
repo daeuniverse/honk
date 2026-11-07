@@ -256,8 +256,9 @@ fn build_tproxy_udp(
         if transparent {
             set_ip_transparent(&socket, addr.is_ipv6())?;
             // Only the eBPF datapath carries routes in packet marks; TPROXY
-            // marks carry nothing, and SO_RCVMARK needs Linux 5.19.
-            if !crate::tproxy::host_transparent() {
+            // marks carry nothing. Before Linux 5.19 the eBPF datapath
+            // publishes UDP/53 marks to DNS_ROUTE_MARKS instead.
+            if !crate::tproxy::host_transparent() && crate::kernel::so_rcvmark_supported() {
                 set_so_recvmark(&socket)?;
             }
             if addr.is_ipv4() {

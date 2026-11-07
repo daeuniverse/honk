@@ -225,7 +225,10 @@ pub struct DaeParam {
     pub dae_netns_id: u32,
     pub wan_ifindex: u32,
     pub dae0peer_mac: [u8; 6],
-    pub padding_after_mac: [u8; 2], // Padding to align to use_redirect_peer
+    /// Nonzero when listeners cannot read skb marks (`SO_RCVMARK`, Linux
+    /// 5.19): UDP/53 route marks are also published to `DNS_ROUTE_MARKS`.
+    pub dns_route_marks: u8,
+    pub padding_after_mac: u8,
     pub use_redirect_peer: u8,
     pub has_bpf_get_current_task: u8,
     /// Datapath log gate (convention only; layout unchanged): bit 0 enables
@@ -240,6 +243,8 @@ pub struct DaeParam {
 }
 
 const _: () = assert!(core::mem::offset_of!(DaeParam, tcp_daens_netns_id) == 40);
+const _: () = assert!(core::mem::offset_of!(DaeParam, dns_route_marks) == 26);
+const _: () = assert!(core::mem::offset_of!(DaeParam, use_redirect_peer) == 28);
 const _: () = assert!(core::mem::size_of::<DaeParam>() == 44);
 
 impl DaeParam {
@@ -251,7 +256,8 @@ impl DaeParam {
         dae_netns_id: u32::MAX,
         wan_ifindex: 0,
         dae0peer_mac: [0; 6],
-        padding_after_mac: [0; 2],
+        dns_route_marks: 0,
+        padding_after_mac: 0,
         use_redirect_peer: 0,
         has_bpf_get_current_task: 0,
         padding2: 0,

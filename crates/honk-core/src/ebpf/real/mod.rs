@@ -21,24 +21,8 @@ use super::{
     probe::BatchCapability, validate_udp_decision_transition,
 };
 
-/// Parse the running kernel version from /proc/version.
-/// Returns `(major, minor, patch)` on success; `patch` defaults to 0
-/// if the version string only carries two components.
 fn kernel_version() -> Option<(u32, u32, u32)> {
-    let version = std::fs::read_to_string("/proc/version").ok()?;
-    let ver_str = version.split_whitespace().nth(2)?;
-    let parts: Vec<&str> = ver_str.split('.').collect();
-    if parts.len() >= 2 {
-        let major = parts[0].parse::<u32>().ok()?;
-        let minor = parts[1].parse::<u32>().ok()?;
-        let patch = parts
-            .get(2)
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
-        Some((major, minor, patch))
-    } else {
-        None
-    }
+    crate::kernel::release()
 }
 
 /// Oldest kernel the eBPF datapath loads on.
@@ -796,6 +780,20 @@ impl EbpfBackend for RealEbpfBackend {
         key: &TuplesKey,
     ) -> anyhow::Result<Option<RoutingHandoffEntry>> {
         self.flow_lookup("ROUTING_HANDOFF_MAP", key)
+    }
+
+    fn dns_route_mark(&self, key: &TuplesKey) -> anyhow::Result<Option<u32>> {
+        if crate::kernel::so_rcvmark_supported() {
+            return Ok(None);
+        }
+        match self
+            .hash_map::<TuplesKey, u32>("DNS_ROUTE_MARKS")?
+            .get(key, 0)
+        {
+            Ok(mark) => Ok(Some(mark)),
+            Err(MapError::KeyNotFound) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn redirect_track_lookup(&self, k: &RedirectTuple) -> anyhow::Result<Option<RedirectEntry>> {

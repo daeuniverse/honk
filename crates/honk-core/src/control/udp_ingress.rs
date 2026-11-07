@@ -255,7 +255,11 @@ impl UdpLoopState {
         };
         let original_dst = destination.address;
         let work = if self.requires_dns_route_mark && original_dst.port() == 53 {
-            let Some(route) = recv_meta.packet_mark.and_then(UdpDnsRoute::from_mark) else {
+            let mark = match recv_meta.packet_mark {
+                Some(mark) => Some(mark),
+                None => self.published_dns_route_mark(src_addr, original_dst).await,
+            };
+            let Some(route) = mark.and_then(UdpDnsRoute::from_mark) else {
                 debug!(%src_addr, %original_dst, "Dropping UDP/53 without a valid route mark");
                 return;
             };
@@ -301,6 +305,32 @@ impl UdpLoopState {
             work
         };
         self.spawn_work(src_addr, original_dst, work);
+    }
+
+    /// Before Linux 5.19 the listener cannot read the skb mark; the datapath
+    /// publishes the same route per tuple instead.
+    async fn published_dns_route_mark(
+        &self,
+        src_addr: SocketAddr,
+        original_dst: SocketAddr,
+    ) -> Option<u32> {
+        let key = crate::control::connection::build_tuples_key(
+            original_dst.ip(),
+            original_dst.port(),
+            src_addr.ip(),
+            src_addr.port(),
+            17,
+        );
+        self.handle
+            .ebpf
+            .read()
+            .await
+            .dns_route_mark(&key)
+            .inspect_err(
+                |error| debug!(%src_addr, %original_dst, %error, "DNS route mark lookup failed"),
+            )
+            .ok()
+            .flatten()
     }
 
     pub(super) async fn admit_routed_dns_at(

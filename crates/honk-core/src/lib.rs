@@ -27,6 +27,7 @@ pub mod mode;
 pub mod native_api;
 // The TPROXY datapath needs only rules and routes, so builds without eBPF
 // keep the rest of the client unused.
+pub(crate) mod kernel;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[cfg_attr(not(feature = "ebpf"), allow(dead_code))]
 pub(crate) mod netlink;
