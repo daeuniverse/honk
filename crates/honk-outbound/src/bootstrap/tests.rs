@@ -184,7 +184,7 @@ async fn claimed_node_host_replaces_bootstrap_only_on_the_global_path() {
         fn lookup(&self, host: &str) -> Option<NodeHostLookup> {
             let answer = match host {
                 "localhost" => Ok(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]),
-                "failing.invalid" => Err(io::Error::other("claimed lookup failed")),
+                "failing.invalid" | "192.0.2.9" => Err(io::Error::other("claimed lookup failed")),
                 _ => return None,
             };
             Some(Box::pin(std::future::ready(answer)))
