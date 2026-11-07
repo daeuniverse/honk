@@ -1188,7 +1188,42 @@ def dns_extensions(fixture):
         answer.get('type') == qtype and answer.get('name', '').rstrip('.').lower() == name
         and ipaddress.ip_address(answer['data']) == expected
         for answer in result.get('Answer', [])), ('API DNS did not resolve the expected address', result)
-    fixture.exchange('api-dns-cache-does-not-contaminate-packet-scope', target=str(expected), port=18083)
+    capture = None
+    tool = os.environ.get('HONK_TUN_CAPTURE_TOOL')
+    try:
+        if tool:
+            capture_log = fixture.open('cross-scope.capture.log')
+            try:
+                if not os.path.isabs(tool) or not os.access(tool, os.X_OK):
+                    raise OSError('HONK_TUN_CAPTURE_TOOL must name an absolute executable')
+                capture = fixture.track(subprocess.Popen(
+                    ['ip', 'netns', 'exec', fixture.names['dut'], tool,
+                     '-i', 'any', '-y', 'LINUX_SLL2', '-s', '0', '-U', '-n',
+                     '-w', str(fixture.directory / 'cross-scope.pcap'), 'udp', 'port', '18083'],
+                    stdout=subprocess.DEVNULL, stderr=capture_log))
+                def listening():
+                    if capture.poll() is not None:
+                        raise RuntimeError(f'capture exited before readiness: {capture.returncode}')
+                    return 'listening on' in (fixture.directory / 'cross-scope.capture.log').read_text()
+                eventually(listening, 'capture did not report listening', seconds=3)
+            except (OSError, RuntimeError, AssertionError) as error:
+                capture_log.write(f'capture unavailable: {error!r}\n')
+                capture_log.flush()
+                if capture is not None and capture.poll() is None:
+                    capture.send_signal(signal.SIGINT)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        capture.wait(timeout=5)
+                stop(capture)
+        fixture.exchange('api-dns-cache-does-not-contaminate-packet-scope', target=str(expected), port=18083)
+    finally:
+        if capture is not None:
+            try:
+                if capture.poll() is None:
+                    capture.send_signal(signal.SIGINT)
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        capture.wait(timeout=5)
+            finally:
+                stop(capture)
     for transport in ('udp', 'tcp'):
         fixture.probe('dns', number, fixture.source, TARGETS[number][0], 53, transport, 'asis.test')
     for port, action in ((26000, 'proxy'), (26001, 'direct')):
