@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::net::{TcpStream, UdpSocket};
 
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
-pub(in crate::control) mod netns;
+pub(crate) mod netns;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]
 pub(super) mod shared_udp;
 #[cfg(all(feature = "ebpf", target_os = "linux"))]

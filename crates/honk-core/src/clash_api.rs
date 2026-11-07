@@ -1806,45 +1806,57 @@ mod sampler_tests {
         assert!(!tracker.is_enabled());
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[test]
     #[ignore = "requires real SO_MARK in the disposable VM; run via just test-netns"]
-    async fn netns_tun_listener_marks_accepted_sockets() {
-        assert!(
-            std::fs::read_to_string("/proc/cmdline")
+    fn netns_tun_listener_marks_accepted_sockets() {
+        std::thread::spawn(|| {
+            crate::control::tests::support::netns::enter_lab_namespaces().unwrap();
+            crate::netlink::NlSock::new()
                 .unwrap()
-                .contains("virtme.")
-        );
-        let mut config = honk_config::parser::parse_dae_config(
-            "global { nfqueue_enable: false }\n\
-             datapath {\n backend: tun\n direct: endpoint\n tun {\n\
-             name: honk0\n address4: 198.18.0.1/32\n table: 202\n\
-             rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n }",
-        )
-        .unwrap();
-        config.global.so_mark_from_dae = 0x37ff_ffff;
-        for listen in ["127.0.0.1:0", "[::1]:0"] {
-            let tracker = crate::connection_tracker::ConnectionTracker::new();
-            let listener = bind_listener(listen.parse().unwrap(), &config, &tracker).unwrap();
-            assert!(tracker.is_enabled());
-            assert_eq!(
-                socket2::SockRef::from(&listener).mark().unwrap(),
-                config.global.effective_so_mark()
-            );
-            tokio::time::timeout(Duration::from_secs(2), async {
-                let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-                    .await
+                .set_link_up(crate::netlink::ifindex_of("lo").unwrap(), true)
+                .unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let mut config = honk_config::parser::parse_dae_config(
+                        "global { nfqueue_enable: false }\n\
+                         datapath {\n backend: tun\n direct: endpoint\n tun {\n\
+                         name: honk0\n address4: 198.18.0.1/32\n table: 202\n\
+                         rule_priority: 10000\n capture { 0.0.0.0/0 }\n }\n }",
+                    )
                     .unwrap();
-                let (accepted, _) = listener.accept().await.unwrap();
-                assert_eq!(
-                    socket2::SockRef::from(&accepted).mark().unwrap(),
-                    config.global.effective_so_mark()
-                );
-                drop(client);
-            })
-            .await
-            .unwrap();
-        }
+                    config.global.so_mark_from_dae = 0x37ff_ffff;
+                    for listen in ["127.0.0.1:0", "[::1]:0"] {
+                        let tracker = crate::connection_tracker::ConnectionTracker::new();
+                        let listener =
+                            bind_listener(listen.parse().unwrap(), &config, &tracker).unwrap();
+                        assert!(tracker.is_enabled());
+                        assert_eq!(
+                            socket2::SockRef::from(&listener).mark().unwrap(),
+                            config.global.effective_so_mark()
+                        );
+                        tokio::time::timeout(Duration::from_secs(2), async {
+                            let client =
+                                tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+                                    .await
+                                    .unwrap();
+                            let (accepted, _) = listener.accept().await.unwrap();
+                            assert_eq!(
+                                socket2::SockRef::from(&accepted).mark().unwrap(),
+                                config.global.effective_so_mark()
+                            );
+                            drop(client);
+                        })
+                        .await
+                        .unwrap();
+                    }
+                });
+        })
+        .join()
+        .unwrap();
     }
 
     #[test]
