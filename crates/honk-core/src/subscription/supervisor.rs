@@ -546,13 +546,17 @@ impl SupervisorState {
                         "Subscription refresh retry failed; keeping active nodes"
                     );
                 }
-                if let Some(flight) = self.flights.get_mut(&id) {
-                    flight.failure = super::failure_stage(&error);
-                }
-                self.finish(id, Err(super::failure_code(&error)));
+                self.finish_fetch_failure(id, &error, super::failure_code(&error));
             }
             None => self.finish(id, Err("supervisor_stopped")),
         }
+    }
+
+    fn finish_fetch_failure(&mut self, id: uuid::Uuid, error: &anyhow::Error, code: &'static str) {
+        if let Some(flight) = self.flights.get_mut(&id) {
+            flight.failure = super::failure_stage(error);
+        }
+        self.finish(id, Err(code));
     }
 
     #[cfg(feature = "native-api")]
@@ -611,7 +615,7 @@ impl SupervisorState {
                                 %error,
                                 "Subscription refresh failed; keeping active nodes"
                             );
-                            self.finish(id, Err("fetch_failed"));
+                            self.finish_fetch_failure(id, &error, "fetch_failed");
                         }
                         Some(Ok(_)) | None => self.finish(id, Err("supervisor_stopped")),
                     }

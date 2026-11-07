@@ -612,6 +612,13 @@ async fn shutdown_preserves_a_completed_http_failure() {
         state.observations.read()[&id].load.error,
         Some("fetch_failed")
     );
+    assert_eq!(
+        state.observations.read()[&id].load.fetch,
+        Some(FetchFailure {
+            stage: "http_status_rejected",
+            via: None,
+        })
+    );
 }
 
 #[cfg(feature = "native-api")]
