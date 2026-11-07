@@ -175,7 +175,7 @@ dns {
 ```
 
 - 节点域名只匹配含 `subtag()` 的规则；普通规则、fallback 以及未匹配的域名仍走 bootstrap 解析。其他查询不带订阅，对它们而言 `subtag()` 与 `!subtag()` 都为假。
-- 被接管的查询只发往选中的上游，遵守 `strategy` 与 `use_host`，不经过缓存和 response 规则，也不回落：查询失败即拨号失败。接管按域名生效，honk 自身对该域名的下载与探测同样走该规则。
+- 被接管的查询只发往选中的上游，遵守 `strategy` 与 `use_host`，不经过缓存和 response 规则，也不回落：查询失败即拨号失败。接管按域名生效，honk 自身经 bootstrap 路径解析该域名的探测与下载同样走该规则；单独配置了 `bootstrap` 解析器的下载仍使用该解析器。
 - 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
 

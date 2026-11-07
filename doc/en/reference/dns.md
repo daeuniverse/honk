@@ -175,7 +175,7 @@ dns {
 ```
 
 - Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts keep bootstrap resolution. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
-- A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, skips the cache and response rules, and never falls back: its failure fails the dial. Claiming is by hostname, so honk's own downloads and probes to that host follow the rule too.
+- A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, skips the cache and response rules, and never falls back: its failure fails the dial. Claiming is by hostname, so honk's own probes and downloads that resolve that host through the bootstrap path follow the rule too; a download with its own `bootstrap` resolver keeps using it.
 - The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`; otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
 - The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
 
