@@ -83,6 +83,7 @@ impl honk_outbound::bootstrap::NodeHostResolver for NodeHostRouting {
                 }
                 Err(error) => {
                     crate::logging::warn_throttled!(
+                        host = %host,
                         error = %format_args!("{error:#}"),
                         "node host lookup through its subtag() DNS rule failed"
                     );

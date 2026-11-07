@@ -394,7 +394,8 @@ async fn resolve_claimed(
     // Without a fallback, an exchange failure is the dial's error, not an empty answer.
     let failure = [&mut responses.ipv4, &mut responses.ipv6]
         .into_iter()
-        .find_map(|response| response.take_if(|response| response.is_err())?.err());
+        .find_map(|response| response.take_if(|response| response.is_err())?.err())
+        .inspect(|error| debug!(error_kind = "lookup_failed", "{error:#}"));
     let resolved = resolved_from_responses(responses);
     let (first, second) = if forwarder.strategy == DnsStrategy::PreferIpv6 {
         (resolved.ipv6, resolved.ipv4)
