@@ -396,6 +396,21 @@ impl RealEbpfBackend {
         }
         let name = std::ffi::CString::new(iface)
             .map_err(|e| anyhow::anyhow!("interface name '{}': {}", iface, e))?;
+        if !super::bindings::tcx_supported() {
+            // Without TCX the attachment is a clsact filter, which needs the
+            // qdisc; these internal devices are honk's own.
+            let ifindex = unsafe { libc::if_nametoindex(name.as_ptr()) };
+            if ifindex == 0 {
+                return Err(anyhow::anyhow!(
+                    "interface '{}': {}",
+                    iface,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            crate::netlink::NlSock::new()
+                .and_then(|mut socket| socket.add_clsact(ifindex))
+                .map_err(|e| anyhow::anyhow!("add clsact qdisc to '{}': {}", iface, e))?;
+        }
         let id = p
             .attach(name.as_c_str(), dir)
             .map_err(|e| anyhow::anyhow!("attach '{}': {} (raw={:?})", prog, e, e))?;
