@@ -369,7 +369,7 @@ impl RealEbpfBackend {
             #[cfg(feature = "native-api")]
             receive_trace: None,
             #[cfg(feature = "native-api")]
-            receive_trace_available: receive_trace_offsets.is_some(),
+            receive_trace_programs: receive_trace_offsets.map(|offsets| offsets.programs()),
             #[cfg(feature = "native-api")]
             receive_trace_attempted: false,
             udp_staging_quiesce_incomplete: false,

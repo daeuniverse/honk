@@ -20,6 +20,18 @@ pub(super) struct ReceiveTraceOffsets {
     priority: u32,
     mark: u32,
     owner: u32,
+    layout: Layout,
+}
+
+/// Argument layout of the traced receive functions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Layout {
+    /// Before Linux 5.19 every function also takes `noblock`.
+    Noblock,
+    /// `udp_recvmsg(sk, msg, len, flags, addr_len)`.
+    AddrLen,
+    /// Newer kernels dropped `addr_len` from the recvmsg handlers.
+    Plain,
 }
 
 impl ReceiveTraceOffsets {
@@ -32,11 +44,66 @@ impl ReceiveTraceOffsets {
     }
 }
 
+impl ReceiveTraceOffsets {
+    pub(super) fn programs(&self) -> ProgramSet {
+        ProgramSet::for_layout(self.layout)
+    }
+}
+
+/// Program names for one traced-function layout.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ProgramSet {
+    pub(super) candidate: &'static str,
+    pub(super) ipv4: (&'static str, &'static str),
+    pub(super) ipv6: (&'static str, &'static str),
+}
+
+impl ProgramSet {
+    fn for_layout(layout: Layout) -> Self {
+        match layout {
+            Layout::Noblock => Self {
+                candidate: "honk_udp_nb_candidate",
+                ipv4: ("honk_udp_nb_enter", "honk_udp_nb_exit"),
+                ipv6: ("honk_udp6_nb_enter", "honk_udp6_nb_exit"),
+            },
+            Layout::AddrLen => Self {
+                candidate: "honk_udp_receive_candidate",
+                ipv4: ("honk_udp_receive_enter", "honk_udp_receive_exit"),
+                ipv6: ("honk_udp6_receive_enter", "honk_udp6_receive_exit"),
+            },
+            Layout::Plain => Self {
+                candidate: "honk_udp_receive_candidate",
+                ipv4: ("honk_udp_receive_enter", "honk_udp_plain_exit"),
+                ipv6: ("honk_udp6_receive_enter", "honk_udp6_plain_exit"),
+            },
+        }
+    }
+}
+
 pub(super) fn detect(data: &[u8]) -> Option<ReceiveTraceOffsets> {
     let btf = OffsetBtf::parse(data)?;
     let common = btf.member_offset("sock", "__sk_common")?;
     let cookie = common.checked_add(btf.sized_member_offset("sock_common", "skc_cookie", 8)?)?;
+    // Each program set assumes one layout across the three functions.
+    let recvmsg = |function: &str| match btf.function_params(function)?.as_slice() {
+        ["sk", "msg", "len", "noblock", "flags", "addr_len"] => Some(Layout::Noblock),
+        ["sk", "msg", "len", "flags", "addr_len"] => Some(Layout::AddrLen),
+        ["sk", "msg", "len", "flags"] => Some(Layout::Plain),
+        _ => None,
+    };
+    let layout = recvmsg("udp_recvmsg")?;
+    let skb_noblock = match btf.function_params("__skb_recv_udp")?.as_slice() {
+        ["sk", "flags", "noblock", "off", "err"] => true,
+        ["sk", "flags", "off", "err"] => false,
+        _ => return None,
+    };
+    if skb_noblock != (layout == Layout::Noblock)
+        || recvmsg("udpv6_recvmsg").is_some_and(|other| other != layout)
+    {
+        return None;
+    }
     Some(ReceiveTraceOffsets {
+        layout,
         cookie,
         priority: btf.sized_member_offset("sk_buff", "priority", 4)?,
         mark: btf.sized_member_offset("sk_buff", "mark", 4)?,
@@ -97,7 +164,7 @@ fn attach_family(
 
 impl ReceiveTrace {
     #[cfg(test)]
-    fn load_unattached_for_test() -> anyhow::Result<(Ebpf, Vec<u8>, Btf)> {
+    fn load_unattached_for_test() -> anyhow::Result<(Ebpf, Vec<u8>, Btf, ProgramSet)> {
         let (data, kernel_btf) = super::btf::load_kernel()?;
         let offsets = detect(&data)
             .ok_or_else(|| anyhow::anyhow!("receive trace BTF offsets unavailable"))?;
@@ -106,33 +173,25 @@ impl ReceiveTrace {
         offsets.configure(&mut loader);
         let bpf = loader.load(crate::DEFAULT_BPF_OBJECT)?;
         drop(loader);
-        Ok((bpf, data, kernel_btf))
+        Ok((bpf, data, kernel_btf, offsets.programs()))
     }
 
     #[cfg(test)]
     pub(crate) fn load_for_test() -> anyhow::Result<(Ebpf, Arc<Self>)> {
-        let (mut bpf, _, kernel_btf) = Self::load_unattached_for_test()?;
-        let trace = Self::attach(&mut bpf, &kernel_btf)?;
+        let (mut bpf, _, kernel_btf, programs) = Self::load_unattached_for_test()?;
+        let trace = Self::attach(&mut bpf, &kernel_btf, programs)?;
         Ok((bpf, trace))
     }
 
-    pub(super) fn attach(bpf: &mut Ebpf, btf: &Btf) -> anyhow::Result<Arc<Self>> {
+    pub(super) fn attach(
+        bpf: &mut Ebpf,
+        btf: &Btf,
+        programs: ProgramSet,
+    ) -> anyhow::Result<Arc<Self>> {
         // Both recvmsg paths consume the candidate from this shared helper.
-        let candidate = attach_exit(bpf, btf, "honk_udp_receive_candidate", "__skb_recv_udp")?;
-        let ipv4 = attach_family(
-            bpf,
-            btf,
-            "honk_udp_receive_enter",
-            "honk_udp_receive_exit",
-            "udp_recvmsg",
-        );
-        let ipv6 = attach_family(
-            bpf,
-            btf,
-            "honk_udp6_receive_enter",
-            "honk_udp6_receive_exit",
-            "udpv6_recvmsg",
-        );
+        let candidate = attach_exit(bpf, btf, programs.candidate, "__skb_recv_udp")?;
+        let ipv4 = attach_family(bpf, btf, programs.ipv4.0, programs.ipv4.1, "udp_recvmsg");
+        let ipv6 = attach_family(bpf, btf, programs.ipv6.0, programs.ipv6.1, "udpv6_recvmsg");
         if let (Err(ipv4), Err(ipv6)) = (&ipv4, &ipv6) {
             anyhow::bail!("UDP receive hooks unavailable: IPv4: {ipv4:#}; IPv6: {ipv6:#}");
         }
@@ -292,26 +351,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    #[ignore = "requires Linux 5.15+ and root; run in the eBPF VM"]
     fn receive_trace_family_failure_is_isolated() -> anyhow::Result<()> {
-        for (target, enter, exit, unavailable, available) in [
-            (
-                "udp_recvmsg",
-                "honk_udp_receive_enter",
-                "honk_udp_receive_exit",
-                "127.0.0.1:0",
-                "[::1]:0",
-            ),
-            (
-                "udpv6_recvmsg",
-                "honk_udp6_receive_enter",
-                "honk_udp6_receive_exit",
-                "[::1]:0",
-                "127.0.0.1:0",
-            ),
+        let (_, _, _, programs) = ReceiveTrace::load_unattached_for_test()?;
+        for (target, (enter, exit), unavailable, available) in [
+            ("udp_recvmsg", programs.ipv4, "127.0.0.1:0", "[::1]:0"),
+            ("udpv6_recvmsg", programs.ipv6, "[::1]:0", "127.0.0.1:0"),
         ] {
             for fail_exit in [false, true] {
-                let (mut bpf, data, kernel_btf) = ReceiveTrace::load_unattached_for_test()?;
+                let (mut bpf, data, kernel_btf, _) = ReceiveTrace::load_unattached_for_test()?;
                 let missing_btf;
                 let attach_btf = if fail_exit {
                     // Force the second hook to fail after the family's entry has attached.
@@ -322,7 +370,7 @@ mod tests {
                     missing_btf = without_target(data, target)?;
                     &missing_btf
                 };
-                let trace = ReceiveTrace::attach(&mut bpf, attach_btf)
+                let trace = ReceiveTrace::attach(&mut bpf, attach_btf, programs)
                     .expect("one family must survive a sibling hook failure");
                 if fail_exit {
                     let failed_entry_id = bpf.program(enter).unwrap().info()?.id();
@@ -351,14 +399,14 @@ mod tests {
                 assert_eq!(packets[0].length, length as u32);
             }
         }
-        let (mut bpf, data, _) = ReceiveTrace::load_unattached_for_test()?;
+        let (mut bpf, data, _, programs) = ReceiveTrace::load_unattached_for_test()?;
         let missing_btf = without_target(data, "__skb_recv_udp")?;
-        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf).is_err());
+        assert!(ReceiveTrace::attach(&mut bpf, &missing_btf, programs).is_err());
         Ok(())
     }
 
     #[test]
-    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    #[ignore = "requires Linux 5.15+ and root; run in the eBPF VM"]
     fn receive_trace_registration_loss_and_successful_zero_byte() -> anyhow::Result<()> {
         let (bpf, trace) = ReceiveTrace::load_for_test()?;
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -449,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    #[ignore = "requires Linux 5.15+ and root; run in the eBPF VM"]
     fn receive_trace_stays_armed_between_receives() -> anyhow::Result<()> {
         let (_bpf, trace) = ReceiveTrace::load_for_test()?;
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;
@@ -504,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires Linux 6.12+ and root; run in the eBPF VM"]
+    #[ignore = "requires Linux 5.15+ and root; run in the eBPF VM"]
     fn receive_trace_ignores_other_processes() -> anyhow::Result<()> {
         let (_bpf, trace) = ReceiveTrace::load_for_test()?;
         let receiver = std::net::UdpSocket::bind("127.0.0.1:0")?;

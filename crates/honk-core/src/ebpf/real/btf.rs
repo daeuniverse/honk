@@ -277,6 +277,22 @@ impl<'a> Btf<'a> {
         None
     }
 
+    /// Parameter names of the function `name`, in order.
+    pub(super) fn function_params(&self, name: &str) -> Option<Vec<&str>> {
+        let function = self.find_type(12, name)?;
+        let proto = self.type_by_id(self.u32_at(function.checked_add(8)?)?)?;
+        if self.kind(proto)? != 13 {
+            return None;
+        }
+        let count = self.u32_at(proto.checked_add(4)?)? & 0xffff;
+        (0..count as usize)
+            .map(|index| {
+                let param = proto.checked_add(12)?.checked_add(index.checked_mul(8)?)?;
+                self.string(self.u32_at(param)?)
+            })
+            .collect()
+    }
+
     pub(super) fn type_by_id(&self, type_id: u32) -> Option<usize> {
         if type_id == 0 {
             return None;

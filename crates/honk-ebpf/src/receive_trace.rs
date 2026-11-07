@@ -19,7 +19,6 @@ pub static RECEIVE_SKB_PRIORITY_OFFSET: Global<u32> = Global::new(0);
 pub static RECEIVE_SKB_MARK_OFFSET: Global<u32> = Global::new(0);
 #[unsafe(no_mangle)]
 pub static RECEIVE_OWNER_TGID: Global<u32> = Global::new(0);
-
 #[map]
 pub static RECEIVE_TRACE: HashMap<u64, ReceiveTraceBatch> =
     HashMap::with_max_entries(RECEIVE_TRACE_SOCKETS, 0);
@@ -92,6 +91,14 @@ fn exit(sk: *const u8, result: Result<i32, i32>) {
     batch.candidate.valid = 0;
 }
 
+// Linux 5.19 removed `noblock` from both recvmsg paths and from
+// `__skb_recv_udp`, moving `flags` and the return-value slot, and later
+// kernels dropped `addr_len` from the recvmsg handlers, moving the return
+// slot again. Each layout has its own programs with constant context offsets
+// (the verifier rejects loads through an offset context pointer, and
+// `bpf_get_func_ret` needs 5.17); userspace attaches the set matching the
+// kernel's BTF.
+
 #[fentry]
 pub fn honk_udp_receive_enter(ctx: FEntryContext) -> u32 {
     enter(ctx.arg(0), ctx.arg(3));
@@ -106,19 +113,65 @@ pub fn honk_udp6_receive_enter(ctx: FEntryContext) -> u32 {
 
 #[fexit]
 pub fn honk_udp_receive_exit(ctx: FExitContext) -> u32 {
-    exit(ctx.arg(0), ctx.ret());
+    exit(ctx.arg(0), Ok(ctx.arg(5)));
     0
 }
 
 #[fexit]
 pub fn honk_udp6_receive_exit(ctx: FExitContext) -> u32 {
-    exit(ctx.arg(0), ctx.ret());
+    exit(ctx.arg(0), Ok(ctx.arg(5)));
+    0
+}
+
+#[fexit]
+pub fn honk_udp_plain_exit(ctx: FExitContext) -> u32 {
+    exit(ctx.arg(0), Ok(ctx.arg(4)));
+    0
+}
+
+#[fexit]
+pub fn honk_udp6_plain_exit(ctx: FExitContext) -> u32 {
+    exit(ctx.arg(0), Ok(ctx.arg(4)));
+    0
+}
+
+#[fentry]
+pub fn honk_udp_nb_enter(ctx: FEntryContext) -> u32 {
+    enter(ctx.arg(0), ctx.arg(4));
+    0
+}
+
+#[fentry]
+pub fn honk_udp6_nb_enter(ctx: FEntryContext) -> u32 {
+    enter(ctx.arg(0), ctx.arg(4));
+    0
+}
+
+#[fexit]
+pub fn honk_udp_nb_exit(ctx: FExitContext) -> u32 {
+    exit(ctx.arg(0), Ok(ctx.arg(6)));
+    0
+}
+
+#[fexit]
+pub fn honk_udp6_nb_exit(ctx: FExitContext) -> u32 {
+    exit(ctx.arg(0), Ok(ctx.arg(6)));
     0
 }
 
 #[fexit]
 pub fn honk_udp_receive_candidate(ctx: FExitContext) -> u32 {
-    let Some(ptr) = state(ctx.arg(0)) else {
+    candidate(ctx.arg(0), ctx.arg(4))
+}
+
+#[fexit]
+pub fn honk_udp_nb_candidate(ctx: FExitContext) -> u32 {
+    candidate(ctx.arg(0), ctx.arg(5))
+}
+
+#[inline(always)]
+fn candidate(sk: *const u8, skb: *const u8) -> u32 {
+    let Some(ptr) = state(sk) else {
         return 0;
     };
     let batch = unsafe { &mut *ptr };
@@ -128,9 +181,6 @@ pub fn honk_udp_receive_candidate(ctx: FExitContext) -> u32 {
     }
     // A checksum-discarded candidate is overwritten by the next helper return.
     batch.candidate.valid = 0;
-    let Ok(skb) = ctx.ret::<*const u8>() else {
-        return 0;
-    };
     if skb.is_null() || skb as usize >= usize::MAX - 4095 {
         return 0;
     }

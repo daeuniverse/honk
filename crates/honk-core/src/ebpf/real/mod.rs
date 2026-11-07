@@ -90,7 +90,9 @@ pub struct RealEbpfBackend {
     #[cfg(feature = "native-api")]
     receive_trace: Option<std::sync::Arc<receive_trace::ReceiveTrace>>,
     #[cfg(feature = "native-api")]
-    receive_trace_available: bool,
+    /// Programs matching the kernel's traced-function layout; `None` when
+    /// its BTF offsets are missing.
+    receive_trace_programs: Option<receive_trace::ProgramSet>,
     #[cfg(feature = "native-api")]
     receive_trace_attempted: bool,
     udp_staging_quiesce_incomplete: bool,
@@ -852,24 +854,25 @@ impl EbpfBackend for RealEbpfBackend {
             // Kernel/loader offsets are fixed for this backend, and a partially loaded Aya
             // program cannot be loaded again on listener reload. Restart retries attachment.
             self.receive_trace_attempted = true;
-            if !self.receive_trace_available {
-                warn!(
+            match self.receive_trace_programs {
+                None => warn!(
                     ipv4_unavailable = true,
                     ipv6_unavailable = true,
                     "kernel UDP trace unavailable: checked BTF offsets missing"
-                );
-            } else {
-                let result = btf::load_kernel().and_then(|(_, kernel_btf)| {
-                    receive_trace::ReceiveTrace::attach(self.bpf_mut()?, &kernel_btf)
-                });
-                match result {
-                    Ok(trace) => self.receive_trace = Some(trace),
-                    Err(error) => warn!(
-                        error = %format_args!("{error:#}"),
-                        ipv4_unavailable = true,
-                        ipv6_unavailable = true,
-                        "kernel UDP trace attach unavailable"
-                    ),
+                ),
+                Some(programs) => {
+                    let result = btf::load_kernel().and_then(|(_, kernel_btf)| {
+                        receive_trace::ReceiveTrace::attach(self.bpf_mut()?, &kernel_btf, programs)
+                    });
+                    match result {
+                        Ok(trace) => self.receive_trace = Some(trace),
+                        Err(error) => warn!(
+                            error = %format_args!("{error:#}"),
+                            ipv4_unavailable = true,
+                            ipv6_unavailable = true,
+                            "kernel UDP trace attach unavailable"
+                        ),
+                    }
                 }
             }
         }
