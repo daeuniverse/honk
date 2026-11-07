@@ -210,6 +210,74 @@ async fn pause_cancels_bootstrap_fallback_under_the_original_query_lease() {
     assert_eq!(current.lease_count(), 0);
 }
 
+fn node_host_runtime(generation: u64) -> Arc<DnsRuntime> {
+    let dns = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            Arc::new(UnusedPool),
+            Arc::new(Mutex::new(DnsCache::new(8))),
+            Arc::new(DnsRouter::new_from_dns_config(&dns).unwrap()),
+        )
+        .with_node_hosts([("node.example".to_owned(), vec!["MyAirport".to_owned()])].into()),
+    );
+    DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(generation),
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            Arc::new(Router::new(&[], "direct").unwrap()),
+        )),
+        outbound_runtime: None,
+        transport: Arc::new(ObservedTransport::default()),
+    })
+}
+
+#[tokio::test]
+async fn paused_dns_fails_claimed_node_hosts_and_reload_releases_them() {
+    let provider = Arc::new(DnsServiceProvider::new(node_host_runtime(1)));
+    #[cfg(feature = "native-api")]
+    provider.enable_lifecycle();
+    let service = DnsService::with_provider(Arc::clone(&provider));
+    let hook = crate::dns::node_host::resolver(&service);
+    assert!(hook.lookup("node.example").is_some());
+
+    // A paused runtime still decides the claim: only claimed hosts fail, and
+    // they never reach bootstrap.
+    provider.begin_pause();
+    assert!(hook.lookup("node.example").is_some());
+    let error = service.resolve_node_host("node.example").await.unwrap_err();
+    assert!(
+        honk_outbound::proxy::packet_rejection(&error).is_some(),
+        "{error:#}"
+    );
+    assert!(hook.lookup("other.example").is_none());
+    assert!(
+        service
+            .resolve_node_host("other.example")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    provider.finish_pause().await.unwrap();
+
+    let provider = Arc::new(DnsServiceProvider::new(node_host_runtime(1)));
+    let service = DnsService::with_provider(Arc::clone(&provider));
+    let hook = crate::dns::node_host::resolver(&service);
+    provider.publish(runtime(2, 0).0);
+    assert!(hook.lookup("node.example").is_none());
+    assert!(
+        service
+            .resolve_node_host("node.example")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn pause_retains_evicted_lease_cleanup_and_deadline_failure_after_wait_cancellation() {
     let transport = Arc::new(BlockingTransport::default());
