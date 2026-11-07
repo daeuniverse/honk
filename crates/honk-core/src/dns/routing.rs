@@ -320,8 +320,8 @@ mod matcher {
             }
         }
 
-        /// A node server host lookup: no client, no query type, only the
-        /// node's subscription tags.
+        /// A node server host lookup: the qname and the node's subscription
+        /// tags, without a client or query type.
         pub(super) fn node_host(domain: &'a str, subscriptions: &'a [String]) -> Self {
             Self {
                 domain,

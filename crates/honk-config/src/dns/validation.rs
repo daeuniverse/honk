@@ -125,7 +125,7 @@ impl DnsConfig {
             }
             let rejection = if rule.conditions.iter().any(|condition| match condition {
                 DnsCond::Qname { .. } => false,
-                // Built without the parser, an empty matcher would claim every tag.
+                // Built without the parser, an empty keyword or regex would claim every tag.
                 DnsCond::Subtag { tags, .. } => {
                     tags.is_empty()
                         || tags.iter().any(|tag| match tag {

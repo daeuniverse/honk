@@ -190,7 +190,6 @@ impl DnsEngine {
         })
     }
 
-    /// `route_response: false` accepts the answer without response rules.
     pub(crate) fn analyze(
         &self,
         prepared: &PreparedQuery,
