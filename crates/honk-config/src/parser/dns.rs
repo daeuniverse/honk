@@ -751,8 +751,7 @@ fn parse_dns_conditions(
                 crate::dns::DnsCond::Qtype { not, types }
             }
             "subtag" => {
-                // Unlike `args`, quotes stay so a quoted argument is an exact tag.
-                let tags = parse_dns_subtag_args(&arguments.split(",").collect::<Vec<_>>());
+                let tags = parse_dns_subtag_args(arguments);
                 if tags.is_empty() {
                     invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-dns-rule");
                     return Vec::new();
@@ -863,10 +862,11 @@ fn parse_dns_qname_args(args: &[Text<'_, '_>]) -> Vec<crate::dns::DnsDomainMatch
 }
 
 /// Parse subtag(args) like the group filter: exact, `keyword:` or `regex:`.
-fn parse_dns_subtag_args(args: &[Text<'_, '_>]) -> Vec<crate::dns::DnsTagMatcher> {
+/// Arguments keep their quotes so a quoted argument is an exact tag.
+fn parse_dns_subtag_args(arguments: Text<'_, '_>) -> Vec<crate::dns::DnsTagMatcher> {
     use crate::dns::DnsTagMatcher;
     let mut tags = Vec::new();
-    for a in args {
+    for a in arguments.split(",") {
         let a = a.trim();
         let raw = a.raw();
         let (prefix, matcher): (&str, fn(String) -> DnsTagMatcher) = if raw.starts_with("keyword:")
