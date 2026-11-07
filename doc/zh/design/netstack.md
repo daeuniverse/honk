@@ -131,6 +131,8 @@ XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务
 
 AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
 
+按类别导出输出时，最多填充调用者提供的 64 个空 lease 槽，保持类别内 FIFO 顺序，不复制载荷。XDP daemon 每轮每 realm 每类别最多处理 32 个输出，批量受实际端口 MTU、类别 credit 和 TX ring 空间约束；保守批容量为零时仍尝试单个短包，保留其进展机会。CQ 每轮最多验证 64 个 descriptor，只借出全部 descriptor 已完成的包 owner，按真实 scope 分组归还。后续 CQ 非法也不阻止已验证完成前缀的释放；未完整归还的 SG owner 继续保留。退休回调在解锁后执行，TCP ACK 持有与设备完成相互独立。
+
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
 已接受的 packet DNS 应答写入同一 scope 的 canonical [路由投影](./dns.md#路由投影)，新建数值目标的 TCP/UDP 流无需嗅探名称即可消费这些事实。它们不授予 HOST/内核投影权威。

@@ -350,7 +350,7 @@ mod linux {
             }
             let now = Instant::now();
             for index in 0..2 {
-                ports[index].complete()?;
+                ports[index].complete(|_| {})?;
                 ports[index].kick()?;
                 ports[index].receive(32, |frame| {
                     if waiting.len() == 64 {
@@ -496,7 +496,7 @@ mod linux {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             for port in &mut ports {
-                port.complete()?;
+                port.complete(|_| {})?;
                 port.kick()?;
             }
             if ports

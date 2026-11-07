@@ -181,6 +181,19 @@ impl<L> Drop for Sidecar<L> {
     }
 }
 
+struct CompletedOwners<'a, L> {
+    slots: &'a mut [Option<(L, usize)>],
+    indices: &'a [usize],
+}
+
+impl<L> Drop for CompletedOwners<'_, L> {
+    fn drop(&mut self) {
+        for &index in self.indices {
+            self.slots[index] = None;
+        }
+    }
+}
+
 struct PreparedTx {
     lease: FrameLease,
     slot: usize,
@@ -714,6 +727,24 @@ impl<L> Port<L> {
         .is_ok_and(|used| self.tx_chain_credit(class, count, used))
     }
 
+    /// Conservative packet count for this port's largest admitted Ethernet frame.
+    /// A zero count can still leave credit for one shorter packet.
+    pub fn tx_packet_capacity(&mut self, class: TxClass) -> io::Result<usize> {
+        let (_, count) = self.tx_packet_layout(self.mtu as usize + 22)?;
+        let used = ring::distance(
+            self.tx_producer,
+            self.rings.tx.consumer(),
+            self.config.ring_size,
+        )
+        .map_err(|error| self.invalid(error))?;
+        Ok(if self.closed {
+            0
+        } else {
+            self.tx_free[class_index(class)].min(self.config.ring_size as usize - used as usize)
+                / count
+        })
+    }
+
     fn tx_packet_layout(&self, length: usize) -> io::Result<(usize, usize)> {
         if length < 14 || length > self.mtu as usize + 22 {
             return Err(invalid_config("invalid TX packet extent"));
@@ -829,7 +860,9 @@ impl<L> Port<L> {
         self.publish_tx(prepared, retained)
     }
 
-    pub fn complete(&mut self) -> io::Result<usize> {
+    /// Lend only owners whose final descriptor returned; sidecars are dropped afterward.
+    /// A later invalid CQ still commits and releases the validated prefix.
+    pub fn complete(&mut self, release: impl FnOnce(&mut [Option<&mut L>])) -> io::Result<usize> {
         ring::distance(
             self.tx_producer,
             self.rings.tx.consumer(),
@@ -840,31 +873,61 @@ impl<L> Port<L> {
         let count = ring::distance(producer, self.cq_consumer, self.config.ring_size)
             .map_err(|error| self.invalid(error))?
             .min(64);
+        let mut indices = [0; 64];
+        let mut owners = 0;
+        let mut completed = 0;
+        let mut failure = None;
         for _ in 0..count {
             let address = self.rings.cq.read(self.cq_consumer);
             let owner = match self.ledger.complete_tx(address) {
                 Ok(owner) => owner as usize,
                 Err(error) => {
-                    self.rings.cq.publish_consumer(self.cq_consumer);
-                    return Err(self.invalid(io::Error::other(error)));
+                    failure = Some(self.invalid(io::Error::other(error)));
+                    break;
                 }
             };
             let Some((_, remaining)) = self.sidecar.slots.get_mut(owner).and_then(Option::as_mut)
             else {
-                self.rings.cq.publish_consumer(self.cq_consumer);
-                return Err(self.invalid(io::Error::other("CQ owner has no retained TX sidecar")));
+                failure =
+                    Some(self.invalid(io::Error::other("CQ owner has no retained TX sidecar")));
+                break;
             };
             *remaining -= 1;
             if *remaining == 0 {
-                self.sidecar.slots[owner].take();
+                indices[owners] = owner;
+                owners += 1;
             }
             let slot = address as usize / FRAME_SIZE - self.config.rx_frames;
             self.tx_free[usize::from(slot >= self.config.control_frames)] += 1;
             self.cq_consumer = self.cq_consumer.wrapping_add(1);
             self.counters.completed += 1;
+            completed += 1;
         }
         self.rings.cq.publish_consumer(self.cq_consumer);
-        Ok(count as usize)
+        let indices = &mut indices[..owners];
+        indices.sort_unstable();
+        let cleanup = CompletedOwners {
+            slots: &mut self.sidecar.slots,
+            indices,
+        };
+        {
+            let mut outputs: [Option<&mut L>; 64] = std::array::from_fn(|_| None);
+            let mut slots = &mut *cleanup.slots;
+            let mut start = 0;
+            for (output, &index) in outputs.iter_mut().zip(cleanup.indices) {
+                let (_, suffix) = slots.split_at_mut(index - start);
+                let (slot, suffix) = suffix.split_first_mut().expect("completed sidecar index");
+                *output = Some(&mut slot.as_mut().expect("completed TX sidecar").0);
+                slots = suffix;
+                start = index + 1;
+            }
+            release(&mut outputs[..owners]);
+        }
+        drop(cleanup);
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(completed),
+        }
     }
 
     fn wakeup_result(&mut self, result: io::Result<()>) -> io::Result<()> {
@@ -1287,7 +1350,7 @@ mod tests {
         port.rings.tx.publish_consumer(1);
         port.rings.cq.write(0, tx_address);
         port.rings.cq.publish_producer(1);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert!(port.tx_credit(TxClass::Control));
         port.rings.fill.publish_consumer(1);
         let mut delivered = 0;
@@ -1351,12 +1414,12 @@ mod tests {
         assert_eq!(port.outstanding().count(), 2);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         port.rings.tx.publish_consumer(2);
-        assert_eq!(port.complete().unwrap(), 0);
+        assert_eq!(port.complete(|_| {}).unwrap(), 0);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         port.rings.cq.write(0, bulk.addr);
         port.rings.cq.write(1, control.addr);
         port.rings.cq.publish_producer(2);
-        assert_eq!(port.complete().unwrap(), 2);
+        assert_eq!(port.complete(|_| {}).unwrap(), 2);
         assert_eq!(drops.load(Ordering::Relaxed), 2);
         assert_eq!(port.outstanding().count(), 0);
         assert!(port.tx_credit(TxClass::Control));
@@ -1386,11 +1449,18 @@ mod tests {
         }
         port.rings.tx.publish_consumer(65);
         port.rings.cq.publish_producer(65);
-        assert_eq!(port.complete().unwrap(), 64);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 64))
+                .unwrap(),
+            64
+        );
         assert_eq!(drops.load(Ordering::Relaxed), 64);
         assert_eq!(port.outstanding().count(), 1);
         assert_eq!(port.rings().cq_consumer, 64);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 1)).unwrap(),
+            1
+        );
         assert_eq!(drops.load(Ordering::Relaxed), 65);
     }
 
@@ -1446,7 +1516,7 @@ mod tests {
         let address = port.rings.tx.read(0).addr;
         port.rings.cq.write(0, address);
         port.rings.cq.publish_producer(1);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
@@ -1460,17 +1530,17 @@ mod tests {
         let address = port.rings.tx.read(0).addr;
         port.rings.cq.write(0, 0);
         port.rings.cq.publish_producer(1);
-        assert!(port.complete().is_err());
+        assert!(port.complete(|_| {}).is_err());
         assert_eq!(port.counters().invalid, 1);
         assert_eq!(port.rings().cq_consumer, 0);
         assert_eq!(port.outstanding().count(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         port.rings.cq.write(0, address);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         port.rings.cq.write(1, address);
         port.rings.cq.publish_producer(2);
-        assert!(port.complete().is_err());
+        assert!(port.complete(|_| {}).is_err());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(port.counters().completed, 1);
         assert_eq!(port.rings().cq_consumer, 1);
@@ -1480,6 +1550,73 @@ mod tests {
     fn fatal_cq_after_progress_retains_only_unreturned_outputs_and_charge() {
         let budget = MemoryBudget::new(1 << 20);
         let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(
+            PortConfig {
+                rx_frames: 1,
+                control_frames: 1,
+                bulk_frames: 4,
+                ring_size: 8,
+            },
+            &budget,
+        );
+        port.mtu = 9000;
+        port.scatter_gather = true;
+        for (class, length, id) in [
+            (TxClass::Bulk, 6000, 1),
+            (TxClass::Control, 60, 2),
+            (TxClass::Bulk, 6000, 3),
+        ] {
+            let mut owner = Retained::new(&drops);
+            owner.bytes.fill(id);
+            port.transmit_with(class, length, owner, |owner, chunks| {
+                for chunk in chunks {
+                    chunk.fill(owner.bytes[0]);
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        port.rings.tx.publish_consumer(5);
+        for (index, descriptor) in [0, 2, 3, 1].into_iter().enumerate() {
+            port.rings
+                .cq
+                .write(index as u32, port.rings.tx.read(descriptor).addr);
+        }
+        port.rings.cq.write(4, port.rings.tx.read(4).addr + 1);
+        port.rings.cq.write(5, port.rings.tx.read(4).addr);
+        port.rings.cq.publish_producer(6);
+        let mut released = Vec::new();
+        assert!(
+            port.complete(|owners| {
+                for owner in owners.iter().flatten() {
+                    released.push(owner.bytes[0]);
+                }
+            })
+            .is_err()
+        );
+        released.sort_unstable();
+        assert_eq!(released, [1, 2]);
+        assert_eq!(port.rings().cq_consumer, 4);
+        assert_eq!(
+            (port.counters().submitted, port.counters().completed),
+            (5, 4)
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(port.outstanding().count(), 1);
+        assert!(port.complete(|owners| assert!(owners.is_empty())).is_err());
+        assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
+        assert_eq!(port.sidecar.slots.iter().flatten().next().unwrap().1, 1);
+        let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        port.close_socket();
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
+        assert_eq!(budget.used(), retained);
+    }
+
+    #[test]
+    fn completion_callback_unwind_disposes_only_proven_owners() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
         let mut port = fake(config(), &budget);
         for class in [TxClass::Control, TxClass::Bulk] {
             port.transmit_retained(class, &[0; 14], Retained::new(&drops))
@@ -1487,17 +1624,18 @@ mod tests {
         }
         port.rings.tx.publish_consumer(2);
         port.rings.cq.write(0, port.rings.tx.read(0).addr);
-        port.rings.cq.write(1, 0);
-        port.rings.cq.publish_producer(2);
-        assert!(port.complete().is_err());
-        assert_eq!(port.rings().cq_consumer, 1);
-        assert_eq!(
-            (port.counters().submitted, port.counters().completed),
-            (2, 1)
-        );
+        port.rings.cq.publish_producer(1);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            port.complete(|owners| {
+                assert_eq!(owners.len(), 1);
+                panic!("retirement callback failed");
+            })
+        }));
+        assert!(result.is_err());
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert_eq!(port.counters().completed, 1);
+        assert_eq!(port.rings().cq_consumer, 1);
         assert_eq!(port.outstanding().count(), 1);
-        assert!(port.complete().is_err());
         let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
         port.close_socket();
         drop(port);
@@ -1609,9 +1747,9 @@ mod tests {
         port.rings.tx.publish_consumer(0);
         port.rings.cq.write(initial, tx_address);
         port.rings.cq.publish_producer(0);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert_eq!(port.rings().cq_consumer, 0);
-        assert_eq!(port.complete().unwrap(), 0);
+        assert_eq!(port.complete(|_| {}).unwrap(), 0);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
         assert_eq!(port.counters().submitted, 1);
         assert_eq!(port.counters().completed, 1);
@@ -1722,7 +1860,7 @@ mod tests {
         }
         port.rings.tx.publish_consumer(2);
         port.rings.cq.publish_producer(2);
-        assert_eq!(port.complete().unwrap(), 2);
+        assert_eq!(port.complete(|_| {}).unwrap(), 2);
     }
 
     #[test]
@@ -1933,7 +2071,13 @@ mod tests {
                 .cq
                 .write(completion as u32, port.rings.tx.read(descriptor).addr);
             port.rings.cq.publish_producer(completion as u32 + 1);
-            assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(
+                port.complete(|owners| {
+                    assert_eq!(owners.len(), usize::from(completion == 2));
+                })
+                .unwrap(),
+                1
+            );
             assert_eq!(port.needs_service_retry(), completion != 2);
             assert_eq!(
                 drops.load(Ordering::Relaxed),
@@ -1943,6 +2087,54 @@ mod tests {
         assert_eq!(port.tx_free[1], 4);
         assert!(port.sidecar.slots.iter().all(Option::is_none));
         assert!(port.tx_packet_credit(TxClass::Bulk, 9000));
+    }
+
+    #[test]
+    fn packet_capacity_uses_actual_mtu_class_frames_and_tx_ring_space() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(
+            PortConfig {
+                rx_frames: 1,
+                control_frames: 1,
+                bulk_frames: 7,
+                ring_size: 8,
+            },
+            &budget,
+        );
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 7);
+        assert_eq!(port.tx_packet_capacity(TxClass::Control).unwrap(), 1);
+        port.mtu = 9000;
+        port.scatter_gather = true;
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 2);
+        assert_eq!(port.tx_packet_capacity(TxClass::Control).unwrap(), 0);
+        assert!(port.tx_packet_credit(TxClass::Control, 60));
+        port.transmit_segments(TxClass::Control, &[&[1; 60]], ())
+            .unwrap();
+        for _ in 0..2 {
+            port.transmit_segments(TxClass::Bulk, &[&[7; 9022]], ())
+                .unwrap();
+        }
+        assert_eq!(port.counters().submitted, 7);
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 0);
+        assert_eq!(
+            port.transmit_segments(TxClass::Bulk, &[&[7; 9022]], ())
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        for index in 0..7 {
+            port.rings.cq.write(index, port.rings.tx.read(index).addr);
+        }
+        port.rings.cq.publish_producer(7);
+        assert_eq!(port.complete(|_| {}).unwrap(), 7);
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 0);
+        port.rings.tx.publish_consumer(7);
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 2);
+        port.close();
+        assert_eq!(port.tx_packet_capacity(TxClass::Bulk).unwrap(), 0);
+        port.rings.tx.publish_consumer(8);
+        assert!(port.tx_packet_capacity(TxClass::Bulk).is_err());
+        assert_eq!(port.counters().invalid, 1);
     }
 
     #[test]
@@ -1962,7 +2154,7 @@ mod tests {
             port.rings.cq.write(index, port.rings.tx.read(index).addr);
         }
         port.rings.cq.publish_producer(2);
-        assert_eq!(port.complete().unwrap(), 2);
+        assert_eq!(port.complete(|_| {}).unwrap(), 2);
         assert!(port.outstanding().next().is_none());
         assert!(!port.tx_credit(TxClass::Bulk));
         assert!(port.needs_service_retry());
@@ -2017,7 +2209,7 @@ mod tests {
         assert!(!port.tx_batch_active);
         assert_eq!(port.outstanding().count(), 4);
         port.rings.tx.publish_consumer(4);
-        assert_eq!(port.complete().unwrap(), 0);
+        assert_eq!(port.complete(|_| {}).unwrap(), 0);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
         drop(port);
@@ -2065,7 +2257,7 @@ mod tests {
             assert_eq!(drops.load(Ordering::Relaxed), 1);
             port.rings.cq.write(0, port.rings.tx.read(0).addr);
             port.rings.cq.publish_producer(1);
-            assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(port.complete(|_| {}).unwrap(), 1);
             assert_eq!(drops.load(Ordering::Relaxed), 2);
         }
     }
@@ -2205,7 +2397,7 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         port.rings.cq.write(0, port.rings.tx.read(0).addr);
         port.rings.cq.publish_producer(1);
-        assert_eq!(port.complete().unwrap(), 1);
+        assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
     }
 
@@ -2288,7 +2480,7 @@ mod tests {
         for index in 0..3 {
             port.rings.cq.write(index, port.rings.tx.read(index).addr);
             port.rings.cq.publish_producer(index + 1);
-            assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(port.complete(|_| {}).unwrap(), 1);
             assert_eq!(drops.load(Ordering::Relaxed), usize::from(index == 2));
             assert_eq!(port.drain_state().ready_for_backend_teardown(), index == 2);
         }

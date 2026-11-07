@@ -232,7 +232,7 @@ fn closed_admission_keeps_established_reads_writes_and_original_addresses() {
 }
 
 #[test]
-fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() {
+fn saturated_bulk_keeps_control_progress_and_batch_returns_exact_scopes() {
     let now = Instant::now();
     let (scope, _owner, _) = runtime(now);
     let client = "10.0.0.2:40000".parse().unwrap();
@@ -253,7 +253,7 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
         Poll::Ready(Ok(10))
     ));
     scope.drive(now);
-    let old_output = output(&scope);
+    let mut old_output = output(&scope);
     assert_eq!(old_output.class(), TxClass::Bulk);
     assert_eq!(old_output.flow_id(), Some(old));
     let original_bytes = old_output.packet().to_vec();
@@ -289,7 +289,18 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
     let (new_io, _) = handshake(&scope, now + Duration::from_millis(52), client, 900);
     assert_ne!(new_io.flow_id(), old);
     assert_eq!(old_output.packet(), original_bytes);
-    old_output.release();
+    let (other_scope, _other_owner, _) = runtime(now);
+    let (mut other_io, _) = handshake(&other_scope, now, client, 100);
+    assert_eq!(other_io.flow_id(), old, "FlowIds are local to each stack");
+    assert!(matches!(
+        std::pin::Pin::new(&mut other_io).poll_write(&mut context(), b"other-output"),
+        Poll::Ready(Ok(12))
+    ));
+    other_scope.drive(now);
+    let mut other_output = output(&other_scope);
+    OutputLease::release_batch(&mut [Some(&mut other_output), Some(&mut old_output)]);
+    drop((old_output, other_output));
+    assert!(other_scope.retains_tcp(client, destination));
     assert_eq!(retired.load(Ordering::SeqCst), 1);
     let completed = retirement.wait();
     let mut completed = pin!(completed);
@@ -310,7 +321,7 @@ fn saturated_bulk_keeps_ack_and_reset_control_progress_and_reuses_exact_owner() 
 }
 
 #[tokio::test]
-async fn class_selective_output_passes_wrapped_distinct_bulk_in_order() {
+async fn class_batch_exports_bounded_wrapped_bulk_without_consuming_control() {
     let now = Instant::now();
     let budget = MemoryBudget::new(32 << 20);
     let mut limits = limits();
@@ -324,9 +335,13 @@ async fn class_selective_output_passes_wrapped_distinct_bulk_in_order() {
         output(&scope).release();
     }
     assert_eq!(scope.0.inner.lock().head, 3);
-    for (index, payload) in [b"first".as_slice(), b"second".as_slice()]
-        .into_iter()
-        .enumerate()
+    for (index, payload) in [
+        b"first".as_slice(),
+        b"second".as_slice(),
+        b"third".as_slice(),
+    ]
+    .into_iter()
+    .enumerate()
     {
         assert!(matches!(
             std::pin::Pin::new(&mut io).poll_write(&mut context(), payload),
@@ -339,6 +354,21 @@ async fn class_selective_output_passes_wrapped_distinct_bulk_in_order() {
         Rx::Consumed
     );
     scope.drive(now + Duration::from_millis(50));
+    let mut bulk: [Option<OutputLease>; 3] = std::array::from_fn(|_| None);
+    assert_eq!(
+        scope.poll_outputs_class(&mut context(), TxClass::Bulk, &mut bulk[..2]),
+        Poll::Ready(Some(2))
+    );
+    assert!(bulk[2].is_none());
+    for (output, payload) in bulk[..2]
+        .iter()
+        .zip([b"first".as_slice(), b"second".as_slice()])
+    {
+        let output = output.as_ref().unwrap();
+        assert_eq!(output.class(), TxClass::Bulk);
+        assert_eq!(output.flow_id(), Some(io.flow_id()));
+        assert_eq!(decode(output).1, payload);
+    }
     let Poll::Ready(Some(ack)) = scope.poll_output_class(&mut context(), TxClass::Control) else {
         panic!("control output stranded behind wrapped bulk");
     };
@@ -348,12 +378,11 @@ async fn class_selective_output_passes_wrapped_distinct_bulk_in_order() {
             .poll_output_class(&mut context(), TxClass::Control)
             .is_pending()
     );
-    for payload in [b"first".as_slice(), b"second".as_slice()] {
-        let bulk = output(&scope);
-        assert_eq!(bulk.class(), TxClass::Bulk);
-        assert_eq!(decode(&bulk).1, payload);
-        bulk.release();
-    }
+    OutputLease::release_batch(&mut bulk.each_mut().map(Option::as_mut));
+    drop(bulk);
+    let last = output(&scope);
+    assert_eq!(decode(&last).1, b"third");
+    last.release();
     assert!(scope.poll_output(&mut context()).is_pending());
 }
 

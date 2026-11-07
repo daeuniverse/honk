@@ -318,7 +318,7 @@ mod linux {
             let port = io.get_mut();
             let wakeup_errors = port.counters().wakeup_errors;
             let (work, kick) = port.transmit_batch(|port| {
-                let mut progress = port.complete()?;
+                let mut progress = port.complete(OutputLease::release_batch)?;
                 port.observe_fill()?;
                 if stopping.is_none() {
                     let now = Instant::now();
@@ -351,28 +351,36 @@ mod linux {
                     }
                     port.refill()?;
                     let header = capture.eth_header();
+                    let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
                     for class in [TxClass::Control, TxClass::Bulk] {
-                        for _ in 0..BATCH {
-                            if !port.tx_credit(class) {
+                        let mut considered = 0;
+                        while considered < BATCH {
+                            let capacity = port.tx_packet_capacity(class)?.min(BATCH - considered);
+                            if capacity == 0 {
                                 break;
                             }
-                            let Poll::Ready(Some(output)) = scope.poll_output_class(cx, class)
+                            let Poll::Ready(Some(count)) =
+                                scope.poll_outputs_class(cx, class, &mut outputs[..capacity])
                             else {
                                 break;
                             };
-                            if output.scope() != scope.scope() || output.class() != class {
-                                return Err(io::Error::other("foreign output scope/class"));
-                            }
-                            let submitted = port.counters().submitted;
-                            let result = port.transmit_retained(class, &header, output);
-                            if port.counters().submitted != submitted {
-                                match class {
-                                    TxClass::Control => *tx_control += 1,
-                                    TxClass::Bulk => *tx_bulk += 1,
+                            considered += count;
+                            for output in &mut outputs[..count] {
+                                let output = output.take().expect("selected Endpoint output");
+                                if output.scope() != scope.scope() || output.class() != class {
+                                    return Err(io::Error::other("foreign output scope/class"));
                                 }
+                                let submitted = port.counters().submitted;
+                                let result = port.transmit_retained(class, &header, output);
+                                if port.counters().submitted != submitted {
+                                    match class {
+                                        TxClass::Control => *tx_control += 1,
+                                        TxClass::Bulk => *tx_bulk += 1,
+                                    }
+                                }
+                                result?;
+                                progress += 1;
                             }
-                            result?;
-                            progress += 1;
                         }
                     }
                 }

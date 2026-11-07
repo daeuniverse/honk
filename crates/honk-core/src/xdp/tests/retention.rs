@@ -957,7 +957,7 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
             reply_path.mac[5] += device as u8;
             reply_path.vlan_tci[0] += device as u16;
             let ifindex = device as u32 + 10;
-            let realm = Realm {
+            let mut realm = Realm {
                 ingress: Ingress {
                     scope: scope.scope(),
                     namespace: 1,
@@ -1003,10 +1003,12 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
             }];
             let mut cx = Context::from_waker(std::task::Waker::noop());
             for class in [TxClass::Control, TxClass::Bulk] {
-                let Poll::Ready(Some(output)) = realm.scope.poll_output_class(&mut cx, class)
-                else {
-                    panic!("actual Endpoint output missing for {class:?}");
-                };
+                let mut outputs = [None, None];
+                let (selected, pending_path) = realm.poll_outputs(&mut cx, class, 2, &mut outputs);
+                assert_eq!(selected, Poll::Ready(Some(1)));
+                assert!(pending_path.is_none());
+                let output = outputs[0].take().expect("actual Endpoint output");
+                assert!(outputs[1].is_none());
                 assert_eq!(output.class(), class);
                 let selected = endpoint_return_path(&peers, &output).unwrap();
                 let header = realm.output_header(selected, ifindex, false).unwrap();
@@ -1029,4 +1031,87 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
     })
     .await
     .expect("each real scoped output must retain its own physical reply path");
+}
+
+#[tokio::test]
+async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+        let reply_path = path();
+        let mut realm = Realm {
+            ingress: Ingress {
+                scope: scope.scope(),
+                namespace: 1,
+                ifindex: 10,
+                attachment: 1,
+                mark: MarkProvenance::BeforeSkb,
+            },
+            device: 0,
+            link: LogicalLink {
+                ifindex: 10,
+                mtu: 1500,
+                mac: [4; 6],
+                path: LinkPath {
+                    physical_ifindex: 10,
+                    vlan_tci: reply_path.vlan_tci,
+                    vlan_proto: reply_path.vlan_proto,
+                    vlan_count: reply_path.vlan_count,
+                },
+            },
+            scope,
+            pending: [None, None],
+        };
+        let destination: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let sender = realm
+            .scope
+            .datagram_sender("198.51.100.1:443".parse().unwrap());
+        for payload in [b"A", b"B"] {
+            sender.send_to(payload, destination).await.unwrap();
+        }
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut outputs = [None, None];
+        let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs);
+        assert_eq!(selected, Poll::Ready(Some(1)));
+        assert!(saved.is_none() && outputs[1].is_none());
+        let first = outputs[0].take().unwrap();
+        assert!(first.packet().ends_with(b"A"));
+        first.release();
+        sender.send_to(b"C", destination).await.unwrap();
+
+        let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, 0, &mut outputs);
+        assert_eq!(selected, Poll::Ready(Some(1)));
+        assert!(saved.is_none() && outputs[1].is_none());
+        let pending = outputs[0].take().unwrap();
+        assert!(pending.packet().ends_with(b"B"));
+        realm.pending[1] = Some((pending, reply_path));
+        for _ in 0..2 {
+            let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, BATCH, &mut outputs);
+            assert_eq!(selected, Poll::Ready(Some(1)));
+            assert!(outputs[1].is_none());
+            let saved = saved.expect("pending output keeps its captured return path");
+            assert_eq!(saved.mac, reply_path.mac);
+            assert_eq!(saved.vlan_tci, reply_path.vlan_tci);
+            assert_eq!(saved.vlan_proto, reply_path.vlan_proto);
+            assert_eq!(saved.vlan_count, reply_path.vlan_count);
+            let pending = outputs[0].take().unwrap();
+            assert!(pending.packet().ends_with(b"B"));
+            realm.pending[1] = Some((pending, saved));
+        }
+        realm.pending[1].take().unwrap().0.release();
+        sender.send_to(b"D", destination).await.unwrap();
+        let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, BATCH, &mut outputs);
+        assert_eq!(selected, Poll::Ready(Some(2)));
+        assert!(saved.is_none());
+        for (output, payload) in outputs.iter().zip([b"C", b"D"]) {
+            assert!(output.as_ref().unwrap().packet().ends_with(payload));
+        }
+        let mut completed = outputs.map(|output| output.map(Retained::Endpoint));
+        release_completed(&mut completed.each_mut().map(Option::as_mut));
+        drop(completed);
+        drop(sender);
+        endpoints.shutdown().await.unwrap();
+        owner.run().await.unwrap();
+    })
+    .await
+    .expect("bounded selection must retain only its one blocked head");
 }

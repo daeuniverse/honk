@@ -144,6 +144,18 @@ enum Retained {
         _owner: GeneratedError,
     },
 }
+
+fn release_completed(completed: &mut [Option<&mut Retained>]) {
+    let mut outputs: [Option<&mut OutputLease>; 64] = std::array::from_fn(|_| None);
+    let mut count = 0;
+    for owner in completed.iter_mut().filter_map(Option::take) {
+        if let Retained::Endpoint(output) = owner {
+            outputs[count] = Some(output);
+            count += 1;
+        }
+    }
+    OutputLease::release_batch(&mut outputs[..count]);
+}
 struct Queue {
     id: u32,
     io: AsyncFd<Port<Retained>>,
@@ -301,6 +313,34 @@ struct Realm {
 }
 
 impl Realm {
+    fn poll_outputs(
+        &mut self,
+        cx: &mut Context<'_>,
+        class: TxClass,
+        capacity: usize,
+        outputs: &mut [Option<OutputLease>],
+    ) -> (Poll<Option<usize>>, Option<ReturnPath>) {
+        assert!(!outputs.is_empty() && outputs.len() <= BATCH);
+        assert!(
+            outputs.iter().all(Option::is_none),
+            "empty output destination"
+        );
+        let class_index = match class {
+            TxClass::Control => 0,
+            TxClass::Bulk => 1,
+        };
+        if let Some((output, path)) = self.pending[class_index].take() {
+            outputs[0] = Some(output);
+            return (Poll::Ready(Some(1)), Some(path));
+        }
+        let count = outputs.len().min(capacity.max(1));
+        (
+            self.scope
+                .poll_outputs_class(cx, class, &mut outputs[..count]),
+            None,
+        )
+    }
+
     fn output_header(
         &self,
         path: ReturnPath,
@@ -408,7 +448,7 @@ impl Runtime {
                     }
                 }
                 let port = queue.io.get_mut();
-                progress += match port.complete() {
+                progress += match port.complete(release_completed) {
                     Ok(count) => count,
                     Err(error) => {
                         return Poll::Ready(Err(error.into()));
@@ -523,6 +563,7 @@ impl Runtime {
                 progress += finish_transmit(received, kick)?;
             }
         }
+        let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
         for realm in &mut self.realms {
             let device = &mut self.devices[realm.device];
             let ifindex = device.info.ifindex;
@@ -531,52 +572,69 @@ impl Runtime {
                 for (class_index, class) in
                     [TxClass::Control, TxClass::Bulk].into_iter().enumerate()
                 {
-                    for _ in 0..BATCH {
-                        let (output, path) = match realm.pending[class_index].take() {
-                            Some(pending) => pending,
-                            None => match realm.scope.poll_output_class(cx, class) {
-                                Poll::Ready(Some(output)) => {
-                                    let Some(path) = endpoint_return_path(&self.peers, &output)
-                                    else {
-                                        serviced += 1;
-                                        continue;
-                                    };
-                                    (output, path)
-                                }
-                                Poll::Ready(None)
-                                    if !self.closing && !self.endpoints.is_closing() =>
-                                {
-                                    anyhow::bail!("XDP packet scope ended before endpoint close");
-                                }
-                                _ => break,
-                            },
+                    let mut considered = 0;
+                    while considered < BATCH {
+                        let capacity = if self.closing {
+                            BATCH - considered
+                        } else {
+                            port.tx_packet_capacity(class)?
                         };
-                        if self.closing {
+                        let (selected, pending_path) = realm.poll_outputs(
+                            cx,
+                            class,
+                            capacity,
+                            &mut outputs[..BATCH - considered],
+                        );
+                        let count = match selected {
+                            Poll::Ready(Some(count)) => count,
+                            Poll::Ready(None) if !self.closing && !self.endpoints.is_closing() => {
+                                anyhow::bail!("XDP packet scope ended before endpoint close");
+                            }
+                            _ => break,
+                        };
+                        considered += count;
+                        let mut blocked = false;
+                        for output in &mut outputs[..count] {
+                            let output = output.take().expect("selected Endpoint output");
+                            let Some(path) =
+                                pending_path.or_else(|| endpoint_return_path(&self.peers, &output))
+                            else {
+                                serviced += 1;
+                                continue;
+                            };
+                            if self.closing {
+                                serviced += 1;
+                                continue;
+                            }
+                            let header =
+                                realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
+                            let length = header.len();
+                            if count == 1
+                                && !port.tx_packet_credit(class, length + output.packet().len())
+                            {
+                                self.pressure.counters.tx_credit =
+                                    self.pressure.counters.tx_credit.saturating_add(1);
+                                self.pressure.counters.refused = true;
+                                realm.pending[class_index] = Some((output, path));
+                                blocked = true;
+                                break;
+                            }
+                            port.transmit_with(
+                                class,
+                                length + output.packet().len(),
+                                Retained::Endpoint(output),
+                                |owner, target| {
+                                    let Retained::Endpoint(output) = owner else {
+                                        return Err(io::Error::other("wrong endpoint TX owner"));
+                                    };
+                                    fill_output(target, &header[..length], output.packet())
+                                },
+                            )?;
                             serviced += 1;
-                            continue;
                         }
-                        let header =
-                            realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
-                        let length = header.len();
-                        if !port.tx_packet_credit(class, length + output.packet().len()) {
-                            self.pressure.counters.tx_credit =
-                                self.pressure.counters.tx_credit.saturating_add(1);
-                            self.pressure.counters.refused = true;
-                            realm.pending[class_index] = Some((output, path));
+                        if blocked {
                             break;
                         }
-                        port.transmit_with(
-                            class,
-                            length + output.packet().len(),
-                            Retained::Endpoint(output),
-                            |owner, target| {
-                                let Retained::Endpoint(output) = owner else {
-                                    return Err(io::Error::other("wrong endpoint TX owner"));
-                                };
-                                fill_output(target, &header[..length], output.packet())
-                            },
-                        )?;
-                        serviced += 1;
                     }
                 }
                 Ok(serviced)
@@ -1481,7 +1539,7 @@ pub(crate) async fn run(
             for device in &mut runtime.devices {
                 for queue in &mut device.queues {
                     let port = queue.io.get_mut();
-                    port.complete()?;
+                    port.complete(release_completed)?;
                     port.kick()?;
                     outstanding |= port.counters().submitted != port.counters().completed;
                 }

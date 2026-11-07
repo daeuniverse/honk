@@ -517,22 +517,57 @@ impl PacketScope {
         self.poll_output_from(cx, Some(class))
     }
 
+    /// Fill empty lease cells with the oldest outputs of `class`, in queue order.
+    /// The destination must contain 1..=64 empty cells; retain leases through actual I/O.
+    pub fn poll_outputs_class(
+        &self,
+        cx: &mut Context<'_>,
+        class: TxClass,
+        outputs: &mut [Option<OutputLease>],
+    ) -> Poll<Option<usize>> {
+        self.poll_outputs_from(cx, Some(class), outputs)
+    }
+
     fn poll_output_from(
         &self,
         cx: &mut Context<'_>,
         class: Option<TxClass>,
     ) -> Poll<Option<OutputLease>> {
+        let mut outputs = [None];
+        self.poll_outputs_from(cx, class, &mut outputs)
+            .map(|count| count.map(|_| outputs[0].take().expect("exported output")))
+    }
+
+    fn poll_outputs_from(
+        &self,
+        cx: &mut Context<'_>,
+        class: Option<TxClass>,
+        outputs: &mut [Option<OutputLease>],
+    ) -> Poll<Option<usize>> {
+        assert!(!outputs.is_empty() && outputs.len() <= BATCH);
+        assert!(
+            outputs.iter().all(Option::is_none),
+            "empty output destination"
+        );
         self.0.with(|inner| {
-            if let Some(queued) = inner.pop(class) {
+            let mut count = 0;
+            for output in outputs {
+                let Some(queued) = inner.pop(class) else {
+                    break;
+                };
                 let index = inner.index(queued.lease);
                 let bytes = inner.frames[index]
                     .take()
                     .expect("queued frame owns storage");
-                return Poll::Ready(Some(OutputLease {
+                *output = Some(OutputLease {
                     scope: self.clone(),
                     queued: Some(queued),
                     bytes: Some(bytes),
-                }));
+                });
+                count += 1;
+            }
+            if count != 0 {
+                return Poll::Ready(Some(count));
             }
             if inner.finished || inner.aborted {
                 return Poll::Ready(None);
@@ -724,7 +759,15 @@ impl Inner {
         {
             slot.outputs = slot.outputs.checked_sub(1).expect("original output owner");
         }
-        self.wake_waiters();
+    }
+
+    fn release_output(&mut self, queued: Queued, bytes: Box<[u8]>) {
+        let index = self.index(queued.lease);
+        assert!(
+            self.frames[index].replace(bytes).is_none(),
+            "exclusive output storage"
+        );
+        self.release(queued);
     }
 
     fn pull(&mut self, now: Instant, class: TxClass) -> bool {
@@ -963,6 +1006,34 @@ impl OutputLease {
     pub fn release(self) {
         drop(self);
     }
+
+    /// Return completed or explicitly disposed outputs without moving their owners.
+    /// References may belong to several scopes; retirement callbacks run unlocked.
+    /// Returned leases are inert: only their later destruction is valid.
+    pub fn release_batch(outputs: &mut [Option<&mut OutputLease>]) {
+        assert!(outputs.len() <= BATCH);
+        // ponytail: at most 64x64 scope comparisons; index only if measured batches need it.
+        while let Some(shared) = outputs
+            .iter()
+            .flatten()
+            .find_map(|output| output.queued.map(|_| Arc::clone(&output.scope.0)))
+        {
+            shared.with(|inner| {
+                for output in outputs.iter_mut() {
+                    if !output.as_ref().is_some_and(|output| {
+                        output.queued.is_some() && Arc::ptr_eq(&shared, &output.scope.0)
+                    }) {
+                        continue;
+                    }
+                    let output = output.take().expect("matching output scope");
+                    let queued = output.queued.take().expect("live output");
+                    let bytes = output.bytes.take().expect("live output storage");
+                    inner.release_output(queued, bytes);
+                }
+                inner.wake_waiters();
+            });
+        }
+    }
 }
 
 impl AsRef<[u8]> for OutputLease {
@@ -986,12 +1057,8 @@ impl Drop for OutputLease {
         if let Some(queued) = self.queued.take() {
             let bytes = self.bytes.take().expect("live output storage");
             self.scope.0.with(|inner| {
-                let index = inner.index(queued.lease);
-                assert!(
-                    inner.frames[index].replace(bytes).is_none(),
-                    "exclusive output storage"
-                );
-                inner.release(queued);
+                inner.release_output(queued, bytes);
+                inner.wake_waiters();
             });
         }
     }

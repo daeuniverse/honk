@@ -10,3 +10,4 @@ Added
 - Keep packet-scope statistics and quiescence reads passive, and skip retirement locking when no application has closed.
 - Separate shared policy publication from borrowed TC-only authority, rejecting software-backend kernel operations without fabricating kernel state.
 - Sleep the XDP owner on actual readiness and deadlines, retaining bounded fallbacks for unresolved device visibility, completion and budget obligations.
+- Batch scoped packet output and completed-owner returns while preserving class order, bounded device credit and last-descriptor CQ ownership.
