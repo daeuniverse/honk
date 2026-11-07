@@ -171,7 +171,7 @@ nodes and explicitly policy-denied targets skip resolution entirely.
 
 ### DNS routing
 
-Conditions within one rule are ANDed; arguments inside one condition are ORed; each condition can be negated. The compiled condition model covers qname, qtype, request-only source IP, upstream name, and response IP. Rules are evaluated in source order and stop on the first match. An unknown source makes both `sip(...)` and `!sip(...)` false, and response rules reject `sip` during configuration.
+Conditions within one rule are ANDed; arguments inside one condition are ORed; each condition can be negated. The compiled condition model covers qname, qtype, request-only source IP, request-only subscription tag, upstream name, and response IP. Rules are evaluated in source order and stop on the first match. An unknown source makes both `sip(...)` and `!sip(...)` false, and response rules reject `sip` during configuration. Likewise `subtag(...)` and `!subtag(...)` are false for every query except a [node server host](../reference/dns.md#node-server-hosts) lookup, which evaluates only `subtag()` rules.
 
 | Phase | Inputs used by policy | Actions |
 | --- | --- | --- |
