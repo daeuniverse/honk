@@ -142,7 +142,7 @@ fn transport(connector: ScriptConnector) -> Transport<ScriptConnector> {
 
 fn batch(label: &str) -> Batch {
     let mut batch = Batch::default();
-    let value = json!({"event": label, "hostname": "router01", "app_name": "honk", "completed_at": timestamp(SystemTime::UNIX_EPOCH)});
+    let value = json!({"event": label, "completed_at": timestamp(SystemTime::UNIX_EPOCH)});
     batch.push(frame(&value, SystemTime::UNIX_EPOCH, &identity(), true).unwrap());
     batch
 }
@@ -362,12 +362,16 @@ async fn sender_preserves_plain_json_and_cee_modes() {
         let bytes = sink.bytes.lock().clone();
         let text = std::str::from_utf8(&bytes).unwrap();
         let message = text.split_once(' ').unwrap().1;
+        assert_eq!(message.split(' ').nth(2), Some("router01"));
+        assert_eq!(message.split(' ').nth(3), Some("honk"));
         let body = message.splitn(8, ' ').nth(7).unwrap();
         assert_eq!(body.starts_with("@cee: "), cee);
         let events = sink.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["domain"], "mode.example.");
         assert_eq!(events[0]["event"], "dns.query");
+        assert!(events[0].get("hostname").is_none());
+        assert!(events[0].get("app_name").is_none());
         worker.shutdown().await;
     }
 }

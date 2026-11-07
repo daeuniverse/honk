@@ -52,11 +52,11 @@ async fn processing_duration_is_monotonic_fractional_and_frozen_before_queuing()
     tokio::time::advance(Duration::from_secs(60)).await;
     let input = receiver.try_recv().unwrap();
     assert!(input.completed < input.started);
-    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let value = encode(&input, "instance:1").unwrap();
     assert_eq!(value["duration_ms"], 429.064);
     assert!(value["upstream"].is_null());
     tokio::time::advance(Duration::from_secs(3600)).await;
-    assert_eq!(encode(&input, "instance:1", &identity()).unwrap(), value);
+    assert_eq!(encode(&input, "instance:1").unwrap(), value);
 }
 
 #[tokio::test(start_paused = true)]
@@ -67,7 +67,7 @@ async fn cancellation_keeps_elapsed_processing_time_without_an_upstream() {
     drop(pending);
     tokio::time::advance(Duration::from_secs(30)).await;
     let input = receiver.try_recv().unwrap();
-    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let value = encode(&input, "instance:1").unwrap();
     assert_eq!(value["duration_ms"], 12.345);
     assert_eq!(value["result"], "cancelled");
     assert!(value["upstream"].is_null());
@@ -87,10 +87,7 @@ fn upstream_uses_only_the_final_name_and_cache_overrides_retained_metadata() {
         let result = outcome(provenance, final_name);
         begin(&audit).finish(result.rendered(), Some(&result));
         let input = receiver.try_recv().unwrap();
-        assert_eq!(
-            encode(&input, "instance:1", &identity()).unwrap()["upstream"],
-            expected
-        );
+        assert_eq!(encode(&input, "instance:1").unwrap()["upstream"], expected);
     }
 }
 
@@ -122,7 +119,7 @@ fn upstream_bytes_share_response_admission_and_release_their_permits() {
 #[test]
 fn default_event_adds_only_duration_and_upstream_to_the_existing_contract() {
     let input = entry(crate::dns::response::build_dns_refused(&query()));
-    let mut value = encode(&input, "instance:1", &identity()).unwrap();
+    let mut value = encode(&input, "instance:1").unwrap();
     assert_eq!(
         value.as_object_mut().unwrap().remove("duration_ms"),
         Some(json!(10.0))
@@ -136,7 +133,6 @@ fn default_event_adds_only_duration_and_upstream_to_the_existing_contract() {
         json!({
             "schema_version":1,"event":"dns.query","event_id":"instance:1",
             "message":"DNS 192.0.2.8 audit.example. A IN: REFUSED answers=0",
-            "hostname":"router01","app_name":"honk-audit",
             "query_time":"1970-01-01T00:00:00.000000Z",
             "completed_at":"1970-01-01T00:00:00.010000Z",
             "client_ip":"192.0.2.8","client_port":53000,"transport":"tcp",

@@ -33,7 +33,8 @@ remove one trailing LF and validate; unavailable/invalid values fall back to `-`
 It identifies the device running honk, not the DNS client. Explicit hostnames use
 1–255 printable ASCII bytes without spaces. `syslog_app_name` defaults to `honk`
 and requires 1–48 of the same bytes. Explicit whitespace, control bytes and Unicode
-are rejected, not trimmed. The fixed header and JSON use the same identity.
+are rejected, not trimmed. Sender identity appears only in the RFC 5424 header;
+the JSON body omits `hostname` and `app_name` to avoid duplicate receiver fields.
 
 ## Capture and event format
 
@@ -64,8 +65,6 @@ in the example above, to prefix `@cee: ` for a CEE-aware receiver:
   "schema_version": 1,
   "event": "dns.query",
   "message": "DNS 192.168.1.100 example.com. A IN: NOERROR answers=1",
-  "hostname": "router01",
-  "app_name": "honk",
   "event_id": "process-uuid:1",
   "query_time": "2026-11-02T12:00:00.000000Z",
   "completed_at": "2026-11-02T12:00:00.010000Z",
@@ -188,6 +187,10 @@ its TCP sender. Changing `syslog_addr`, `syslog_dns_enabled`, `syslog_cee_enable
 disabled.
 
 ### Migration from earlier fork builds
+
+Receivers that previously read `hostname` or `app_name` from the JSON body must
+use the corresponding parsed RFC 5424 header fields instead. Existing stored
+events are unchanged.
 
 Remove `syslog_dns_template` and `syslog_dns_json`. Both removed keys are rejected
 by presence in dae and structured configuration, including empty strings, false

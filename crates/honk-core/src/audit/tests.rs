@@ -13,7 +13,7 @@ fn identity() -> Identity {
 pub(crate) fn test_pending_event(mut pending: DnsAuditQuery) -> serde_json::Value {
     let input = pending.entry.take().unwrap();
     pending.permit.take();
-    let event = encode(&input, "instance:1", &identity()).unwrap();
+    let event = encode(&input, "instance:1").unwrap();
     decode_frame(&super::frame(&event, input.completed, &identity(), true).unwrap())
 }
 
@@ -162,7 +162,7 @@ fn fixed_json_frames_preserve_events_with_and_without_cee() {
         ] {
             let mut input = entry(Vec::new());
             input.response = response.map(Vec::into_boxed_slice);
-            let value = encode(&input, "instance:1", &identity()).unwrap();
+            let value = encode(&input, "instance:1").unwrap();
             let mut message = header.as_bytes().to_vec();
             serde_json::to_writer(&mut message, &value).unwrap();
             let mut expected = format!("{} ", message.len()).into_bytes();
@@ -177,7 +177,7 @@ fn fixed_json_frames_preserve_events_with_and_without_cee() {
 #[test]
 fn response_projection_keeps_rcode_source_and_actual_answers() {
     let wire = crate::dns::response::build_dns_refused(&query());
-    let value = encode(&entry(wire), "instance:1", &identity()).unwrap();
+    let value = encode(&entry(wire), "instance:1").unwrap();
     assert_eq!(value["domain"], "audit.example.");
     assert_eq!(value["client_ip"], "192.0.2.8");
     assert_eq!(value["client_port"], 53000);
@@ -193,14 +193,14 @@ fn response_projection_keeps_rcode_source_and_actual_answers() {
     truncated.ingress = IngressProfile::Udp {
         advertised_size: 512,
     };
-    let value = encode(&truncated, "instance:2", &identity()).unwrap();
+    let value = encode(&truncated, "instance:2").unwrap();
     assert_eq!(value["response_truncated"], true);
 }
 
 #[test]
 fn readable_message_identifies_responses_and_cancellation() {
     let mut input = entry(crate::dns::response::build_dns_refused(&query()));
-    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let value = encode(&input, "instance:1").unwrap();
     assert_eq!(
         value["message"],
         "DNS 192.0.2.8 audit.example. A IN: REFUSED answers=0"
@@ -209,7 +209,7 @@ fn readable_message_identifies_responses_and_cancellation() {
     assert_eq!(value["rcode"], "REFUSED");
     input.response = None;
     input.source = "[2001:db8::8]:53000".parse().unwrap();
-    let value = encode(&input, "instance:2", &identity()).unwrap();
+    let value = encode(&input, "instance:2").unwrap();
     assert_eq!(
         value["message"],
         "DNS 2001:db8::8 audit.example. A IN: cancelled answers=0"
@@ -299,7 +299,7 @@ fn oversized_unknown_rr_round_trips_without_clipping() {
     response.resize(response.len() + 60000, 0xab);
     let mut input = entry(response);
     input.query = query.into();
-    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let value = encode(&input, "instance:1").unwrap();
     assert_eq!(
         value["answers"][0]["data"],
         format!("\\# 60000 {}", "AB".repeat(60000))
@@ -336,7 +336,7 @@ fn derived_search_arrays_deduplicate_without_removing_answers() {
         response.extend_from_slice(&(data.len() as u16).to_be_bytes());
         response.extend_from_slice(data);
     }
-    let value = encode(&entry(response), "instance:1", &identity()).unwrap();
+    let value = encode(&entry(response), "instance:1").unwrap();
     assert_eq!(
         value["message"],
         "DNS 192.0.2.8 audit.example. A IN: NOERROR answers=7"
@@ -351,7 +351,7 @@ fn derived_search_arrays_deduplicate_without_removing_answers() {
 }
 
 #[test]
-fn configured_identity_is_shared_by_json_and_rfc_header() {
+fn configured_identity_is_only_in_rfc_header() {
     let global = honk_config::config::GlobalConfig {
         syslog_hostname: "gateway.example".into(),
         syslog_app_name: "dns-audit".into(),
@@ -359,36 +359,24 @@ fn configured_identity_is_shared_by_json_and_rfc_header() {
     };
     let identity = Identity::from_config(&global);
     let input = entry(crate::dns::response::build_dns_refused(&query()));
-    let value = encode(&input, "instance:1", &identity).unwrap();
-    assert_eq!(value["hostname"], "gateway.example");
-    assert_eq!(value["app_name"], "dns-audit");
-    let bytes = frame(&value, SystemTime::UNIX_EPOCH, &identity).unwrap();
-    let prefix_end = bytes.iter().position(|byte| *byte == b' ').unwrap() + 1;
-    let (header, body) = std::str::from_utf8(&bytes[prefix_end..])
-        .unwrap()
-        .split_once('{')
-        .unwrap();
-    assert_eq!(
-        header,
-        "<134>1 1970-01-01T00:00:00.000000Z gateway.example dns-audit - dns.query - @cee: "
-    );
-    let parsed: serde_json::Value = serde_json::from_str(&format!("{{{body}")).unwrap();
-    assert_eq!(parsed, value);
-    let mut baseline = encode(
-        &input,
-        "instance:1",
-        &Identity {
-            hostname: "-".into(),
-            app_name: "honk".into(),
-        },
-    )
-    .unwrap();
-    let mut customized = value;
-    for body in [&mut baseline, &mut customized] {
-        body.as_object_mut().unwrap().remove("hostname");
-        body.as_object_mut().unwrap().remove("app_name");
+    let value = encode(&input, "instance:1").unwrap();
+    assert!(value.get("hostname").is_none());
+    assert!(value.get("app_name").is_none());
+    for (cee, marker) in [(false, ""), (true, "@cee: ")] {
+        let bytes = super::frame(&value, SystemTime::UNIX_EPOCH, &identity, cee).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        let (length, message) = text.split_once(' ').unwrap();
+        assert_eq!(length.parse::<usize>().unwrap(), message.len());
+        let (header, body) = message.split_once('{').unwrap();
+        assert_eq!(
+            header,
+            format!(
+                "<134>1 1970-01-01T00:00:00.000000Z gateway.example dns-audit - dns.query - {marker}"
+            )
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&format!("{{{body}")).unwrap();
+        assert_eq!(parsed, value);
     }
-    assert_eq!(customized, baseline);
 }
 
 #[test]
@@ -408,8 +396,7 @@ fn whole_event_limit_includes_header_and_utf8_framing_counts_bytes() {
         app_name: "a".repeat(48),
     };
     let time = SystemTime::UNIX_EPOCH;
-    let mut value =
-        json!({"hostname": identity.hostname, "app_name": identity.app_name, "padding": ""});
+    let mut value = json!({"padding": ""});
     let overhead = identity.header(time, true).len() + serde_json::to_vec(&value).unwrap().len();
     value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead));
     let at_limit = frame(&value, time, &identity).unwrap();
@@ -417,8 +404,7 @@ fn whole_event_limit_includes_header_and_utf8_framing_counts_bytes() {
     assert_eq!(decode_frame(&at_limit), value);
     value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead + 1));
     assert!(frame(&value, time, &identity).is_err());
-    let utf8 =
-        json!({"label": "上海", "hostname": identity.hostname, "app_name": identity.app_name});
+    let utf8 = json!({"label": "上海"});
     let bytes = frame(&utf8, time, &identity).unwrap();
     assert_eq!(decode_frame(&bytes), utf8);
     let text = std::str::from_utf8(&bytes).unwrap();
@@ -442,7 +428,7 @@ fn compressed_aaaa_answers_expand_past_the_syslog_budget() {
     let wire_bytes = response.len();
     let mut input = entry(response);
     input.query = query.into();
-    let value = encode(&input, "instance:1", &identity()).unwrap();
+    let value = encode(&input, "instance:1").unwrap();
     let json_bytes = serde_json::to_vec(&value).unwrap().len();
     let bytes = frame(&value, input.completed, &identity()).unwrap();
     assert!(wire_bytes < 4096);

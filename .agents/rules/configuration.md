@@ -130,7 +130,7 @@ The restart-only settings are `global.syslog_dns_enabled` (default false), numer
 `global.syslog_addr`, `global.syslog_cee_enabled` (default false),
 `global.syslog_hostname` (empty means system hostname) and `global.syslog_app_name`
 (default `honk`). Explicit identity fields obey RFC 5424 printable ASCII token
-limits (255/48 bytes); headers and JSON share the same identity. One marked TCP
+limits (255/48 bytes); identity appears only in the RFC 5424 header, not in JSON. One marked TCP
 connection uses RFC 6587 octet counting, 128 KiB/1s batching, bounded raw admission
 (1024 events, 8 MiB) and a 4 MiB whole-message limit. Connect failures retain the
 current batch with bounded reconnect backoff; ambiguous failed writes are dropped

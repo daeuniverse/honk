@@ -17,8 +17,8 @@
 | `syslog_addr` | `syslog_addr` | `""` | TCP syslog 接收端的数字 IP 和端口，如 `192.0.2.10:514` 或 `[2001:db8::10]:514`。启用 DNS 审计时必填。修改需重启。 |
 | `syslog_dns_enabled` | `syslog_dns_enabled` | `false` | 需要 `dns-syslog` Cargo feature。将客户端 DNS 结果以固定 RFC 5424 消息和 JSON 正文通过 TCP 长连接发送，使用 RFC 6587 长度前缀分帧。独立于原生 API、历史记录与日志级别；有界组批和退避重连，不做应用层确认、不落盘。见 [DNS 审计](../design/dns-syslog.md)。修改需重启。 |
 | `syslog_cee_enabled` | `syslog_cee_enabled` | `false` | 为固定 JSON 正文添加 `@cee: ` 前缀，用于支持 CEE 的接收端（如 VictoriaLogs）。保持 false 则发送普通 JSON。此项不负责启用审计或编译功能。修改需重启。 |
-| `syslog_hostname` | `syslog_hostname` | `""` | 运行 honk 的设备名，同时写入 RFC 5424 头和 JSON。空值在启动时读取系统主机名，失败回退 `-`。显式值为 1–255 字节、不含空格的可打印 ASCII。修改需重启。 |
-| `syslog_app_name` | `syslog_app_name` | `"honk"` | 应用名，同时写入 RFC 5424 头和 JSON；为 1–48 字节、不含空格的可打印 ASCII。修改需重启。 |
+| `syslog_hostname` | `syslog_hostname` | `""` | 运行 honk 的设备名，仅写入 RFC 5424 头。空值在启动时读取系统主机名，失败回退 `-`。显式值为 1–255 字节、不含空格的可打印 ASCII。修改需重启。 |
+| `syslog_app_name` | `syslog_app_name` | `"honk"` | 应用名，仅写入 RFC 5424 头；为 1–48 字节、不含空格的可打印 ASCII。修改需重启。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `shutdown_wait_connections` | `shutdown_wait_connections` | `false` | 可重载、显式启用的业务连接宽限等待；见[关闭](#关闭)。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |

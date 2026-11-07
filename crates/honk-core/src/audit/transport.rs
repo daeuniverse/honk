@@ -179,7 +179,7 @@ async fn run<C: Connector>(
                 };
                 sequence += 1;
                 let id = format!("{instance}:{sequence}");
-                let encoded = encode(&entry, &id, &identity).map_err(io::Error::other)
+                let encoded = encode(&entry, &id).map_err(io::Error::other)
                     .and_then(|value| frame(&value, entry.completed, &identity, cee));
                 drop(entry);
                 let bytes = match encoded {

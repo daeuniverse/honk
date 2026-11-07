@@ -30,7 +30,8 @@ IPv6 写作 `[2001:db8::10]:514`。审计默认关闭，地址默认空；启用
 LF 后校验，读取失败或非法时回退 `-`。这是运行 honk 的设备名，不是客户端名。
 显式 hostname 为1–255字节、不含空格的可打印 ASCII。`syslog_app_name` 默认 `honk`，
 要求1–48个同类字节。显式空白、控制字符和 Unicode 会被拒绝，不做 trim。
-固定消息头和 JSON 使用同一身份。
+发送端身份仅写入 RFC5424 消息头；JSON 正文不再包含 `hostname` 和 `app_name`，
+避免接收端解析后出现重复字段。
 
 ## 采集和事件格式
 
@@ -57,8 +58,6 @@ JSON 接收端；如上例设为 true 时，为支持 CEE 的接收端添加 `@c
   "schema_version": 1,
   "event": "dns.query",
   "message": "DNS 192.168.1.100 example.com. A IN: NOERROR answers=1",
-  "hostname": "router01",
-  "app_name": "honk",
   "event_id": "process-uuid:1",
   "query_time": "2026-11-02T12:00:00.000000Z",
   "completed_at": "2026-11-02T12:00:00.010000Z",
@@ -162,6 +161,9 @@ RFC5424 消息头布局和 JSON 字段结构固定。CEE 只控制可选的 `@ce
 `syslog_hostname` 或 `syslog_app_name` 均需重启，审计当前关闭时同样如此。
 
 ### 从较早的 fork 构建迁移
+
+原先从 JSON 正文读取 `hostname` 或 `app_name` 的接收端，应改为使用解析后的
+RFC5424 头部对应字段。已有的历史日志不受影响。
 
 删除 `syslog_dns_template` 和 `syslog_dns_json`。dae 和结构化配置均按旧键是否出现
 进行拒绝，空字符串、false 和 null 也不能保留。若需保持上一版固定 CEE 输出，显式

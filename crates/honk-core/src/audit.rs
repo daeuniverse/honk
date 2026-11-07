@@ -255,11 +255,7 @@ fn timestamp(time: SystemTime) -> String {
     chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-fn encode(
-    entry: &Entry,
-    id: &str,
-    identity: &Identity,
-) -> Result<serde_json::Value, presentation::ProjectionError> {
+fn encode(entry: &Entry, id: &str) -> Result<serde_json::Value, presentation::ProjectionError> {
     let question = presentation::question(&entry.query, entry.ingress)?;
     let mut budget = MAX_EVENT_BYTES;
     let answers = entry
@@ -283,7 +279,6 @@ fn encode(
     Ok(json!({
         "schema_version": 1, "event": "dns.query", "event_id": id,
         "message": message,
-        "hostname": identity.hostname, "app_name": identity.app_name,
         "query_time": timestamp(entry.started), "completed_at": timestamp(entry.completed),
         "duration_ms": entry.duration.as_micros() as f64 / 1000.0,
         "upstream": entry.upstream,
