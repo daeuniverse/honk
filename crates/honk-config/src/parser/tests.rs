@@ -1942,7 +1942,7 @@ dns {
     routing {
         request {
             subtag(MyAirport, keyword: Air, regex: '^Paid') && qname(suffix: private.example) -> providerdoh
-            !subtag(Free) -> providerdoh
+            !subtag(Free, 'keyword: Air') -> providerdoh
         }
         response {
             subtag(MyAirport) -> reject
@@ -1965,7 +1965,11 @@ dns {
                     Regex("^Paid".into())
                 ]
             ),
-            &subtag(true, vec![Exact("Free".into())]),
+            // Like the group filter, a quoted argument is an exact tag.
+            &subtag(
+                true,
+                vec![Exact("Free".into()), Exact("keyword: Air".into())]
+            ),
         ]
     );
     // subtag() is request-only: the response rule is omitted.

@@ -751,7 +751,8 @@ fn parse_dns_conditions(
                 crate::dns::DnsCond::Qtype { not, types }
             }
             "subtag" => {
-                let tags = parse_dns_subtag_args(&args);
+                // Unlike `args`, quotes stay so a quoted argument is an exact tag.
+                let tags = parse_dns_subtag_args(&arguments.split(",").collect::<Vec<_>>());
                 if tags.is_empty() {
                     invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-dns-rule");
                     return Vec::new();
