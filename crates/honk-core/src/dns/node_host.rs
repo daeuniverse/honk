@@ -54,10 +54,10 @@ pub(crate) fn index(config: &Config) -> NodeHosts {
 
 struct NodeHostRouting(DnsService);
 
-/// The process-wide hook. It claims nothing while the current DNS generation
-/// indexes no node host, so configurations without `subtag()` keep bootstrap
-/// resolution without a per-dial allocation; otherwise the generation each
-/// lookup leases decides the claim.
+/// The process-wide hook. Hosts the current generation does not claim are
+/// declined synchronously, so bootstrap keeps them without a boxed lookup; a claimed lookup
+/// is decided again by the generation it leases, and a host a reload stopped
+/// claiming in between still resolves through bootstrap.
 pub(crate) fn resolver(
     service: &DnsService,
 ) -> Arc<dyn honk_outbound::bootstrap::NodeHostResolver> {
@@ -66,7 +66,7 @@ pub(crate) fn resolver(
 
 impl honk_outbound::bootstrap::NodeHostResolver for NodeHostRouting {
     fn lookup(&self, host: &str) -> Option<honk_outbound::bootstrap::NodeHostLookup> {
-        if self.0.forwarder().node_hosts.is_empty() {
+        if !self.0.claims_node_host(host) {
             return None;
         }
         let service = self.0.clone();
@@ -127,5 +127,39 @@ mod tests {
 
         config.dns.routing.request.rules.clear();
         assert!(index(&config).is_empty());
+    }
+
+    #[test]
+    fn hook_declines_indexed_hosts_no_rule_claims() {
+        struct NoPool;
+
+        #[async_trait::async_trait]
+        impl crate::dns::forwarder::DnsUpstreamPool for NoPool {
+            async fn query(&self, _: &str, _: &[u8]) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("declined and unawaited lookups never query")
+            }
+        }
+
+        let dns = honk_config::parser::parse_dae_config(
+            "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n }\n}\n",
+        )
+        .unwrap()
+        .dns;
+        let forwarder = crate::dns::forwarder::DnsForwarder::new(
+            Arc::new(NoPool),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+            Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&dns).unwrap()),
+        )
+        .with_node_hosts(
+            ["node.private.example", "node.public.example"]
+                .map(|host| (host.to_owned(), vec!["MyAirport".to_owned()]))
+                .into(),
+        );
+        let hook = resolver(&DnsService::with_forwarder(Arc::new(forwarder)));
+
+        assert!(hook.lookup("Node.Private.Example.").is_some());
+        for unclaimed in ["node.public.example", "unindexed.private.example"] {
+            assert!(hook.lookup(unclaimed).is_none(), "{unclaimed}");
+        }
     }
 }

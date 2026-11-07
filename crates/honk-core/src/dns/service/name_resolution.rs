@@ -355,6 +355,14 @@ impl DnsService {
         }
         .map(Some)
     }
+
+    /// Whether the current generation's `subtag()` rules claim `host`.
+    pub(crate) fn claims_node_host(&self, host: &str) -> bool {
+        let forwarder = self.forwarder();
+        !forwarder.node_hosts.is_empty()
+            && normalize_domain(host)
+                .is_ok_and(|domain| claimed_upstream(&forwarder, &domain).is_some())
+    }
 }
 
 fn claimed_upstream<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<&'f str> {
