@@ -8,13 +8,13 @@ Test policy and general gates: `AGENTS.md`, "Testing instructions" and "Current 
 
 ## Native Linux
 
-Native Linux supports builds and unprivileged tests; build prerequisites are in `.agents/rules/real-ebpf.md`. Linux 6.12+ and root alone do **not** make the complete ignored real-kernel suites safe on a shared host. They attach root-cgroup BPF programs, which private network/mount namespaces do not isolate. The routing suite also includes VM-only cases.
+Native Linux supports builds and unprivileged tests; build prerequisites are in `.agents/rules/real-ebpf.md`. Linux 5.15+ and root alone do **not** make the complete ignored real-kernel suites safe on a shared host. They attach root-cgroup BPF programs, which private network/mount namespaces do not isolate. The routing suite also includes VM-only cases.
 
 Use the disposable VM path below for both `just test-routing` and `just test-netns`. Neither recipe runs ignored tests on the host. Do not run the protected suites directly, weaken their fixture guard, or set `HONK_CI_VM_LANE` / `HONK_CI_EXPECTED_KERNEL` to make a host look like a guest. Those variables belong to the VM launcher.
 
 ## CI-shaped disposable VM
 
-This path follows the `ebpf` job in `.github/workflows/ci.yml` on an **x86_64 Ubuntu 24.04 Linux host**. The pinned kernel packages and bpf-linker executable are x86_64; this is not a native aarch64, macOS or Windows runner. The host need not run Linux 6.12+: the guest boots the pinned floor kernel. Installing host dependencies and geo assets requires root; after setup, the launcher runs as the checkout user and the guest runs as root. KVM is optional; inaccessible KVM requires TCG software emulation.
+This path follows the `ebpf` job in `.github/workflows/ci.yml` on an **x86_64 Ubuntu 24.04 Linux host**. The pinned kernel packages and bpf-linker executable are x86_64; this is not a native aarch64, macOS or Windows runner. The host need not run Linux 5.15+: the guest boots the pinned floor kernel. Installing host dependencies and geo assets requires root; after setup, the launcher runs as the checkout user and the guest runs as root. KVM is optional; inaccessible KVM requires TCG software emulation.
 
 If this path could not run, put this exact sentence in Verified: "eBPF VM tests: not run (needs Linux root or a VM; CI runs them)".
 

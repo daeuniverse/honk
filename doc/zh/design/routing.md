@@ -270,7 +270,7 @@ map，不能假设重 pin 一个同名 map 就能改变已加载程序持有的�
 ### 分支验证记录
 
 当前 CI 的真实内核基线是固定的 Ubuntu Linux
-`6.12.0-061200-generic` VM。CI 在 hosted runner 上构建测试 executable，
+`5.15.0-051500-generic` VM。CI 在 hosted runner 上构建测试 executable，
 再在该 VM 中运行完全相同的产物，不会在 guest 内重新编译。`just test-routing`
 与依赖它的 `just test-netns` 共用完整、已准备前置条件的一次性 VM gate，
 沿真实 root/slot 路径检查优先级、完整 decision 元数据、容量失败和发布失败保留，

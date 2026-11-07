@@ -342,7 +342,7 @@ Implementation is accepted only with all existing matchers supported and with:
 ### Recorded branch validation
 
 The current CI real-kernel baseline is the pinned Ubuntu Linux
-`6.12.0-061200-generic` VM. CI builds the test executables on the hosted runner
+`5.15.0-051500-generic` VM. CI builds the test executables on the hosted runner
 and runs those exact artifacts in the VM; it does not compile again in the guest.
 `just test-routing` and dependent `just test-netns` share that complete
 pre-provisioned disposable-VM gate. It exercises the real root/slot path,
