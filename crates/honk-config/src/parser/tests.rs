@@ -1936,6 +1936,43 @@ dns {
 }
 
 #[test]
+fn test_parse_dns_request_routing_subtag() {
+    let input = r#"
+dns {
+    routing {
+        request {
+            subtag(MyAirport, keyword: Air, regex: '^Paid') && qname(suffix: private.example) -> providerdoh
+            !subtag(Free) -> providerdoh
+        }
+        response {
+            subtag(MyAirport) -> reject
+        }
+    }
+}
+"#;
+    let config = parse_dae_config(input).unwrap();
+    let rules = &config.dns.routing.request.rules;
+    let subtag = |not, tags| crate::dns::DnsCond::Subtag { not, tags };
+    use crate::dns::DnsTagMatcher::{Exact, Keyword, Regex};
+    assert_eq!(
+        [&rules[0].conditions[0], &rules[1].conditions[0]],
+        [
+            &subtag(
+                false,
+                vec![
+                    Exact("MyAirport".into()),
+                    Keyword("Air".into()),
+                    Regex("^Paid".into())
+                ]
+            ),
+            &subtag(true, vec![Exact("Free".into())]),
+        ]
+    );
+    // subtag() is request-only: the response rule is omitted.
+    assert!(config.dns.routing.response.rules.is_empty());
+}
+
+#[test]
 fn test_parse_dns_request_routing_negation() {
     let input = r#"
 dns {

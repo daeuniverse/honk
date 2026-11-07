@@ -190,12 +190,14 @@ impl DnsEngine {
         })
     }
 
+    /// `route_response: false` accepts the answer without response rules.
     pub(crate) fn analyze(
         &self,
         prepared: &PreparedQuery,
         traversal: ResponseTraversal,
         wire: Vec<u8>,
         strict: bool,
+        route_response: bool,
     ) -> Result<ResponseDirective, EngineError> {
         let truncated = super::response::is_truncated(&wire);
         let strict_reusable = if strict {
@@ -222,14 +224,18 @@ impl DnsEngine {
             super::forwarder::extract_answer_ips(&wire)
         };
         let current_traversal = traversal.clone();
-        let planned = self.planner.plan_response(
-            ResponseContext {
-                domain: &prepared.domain,
-                qtype: prepared.qtype,
-                answer_ips: &answer_ips,
-            },
-            traversal,
-        );
+        let planned = if route_response {
+            self.planner.plan_response(
+                ResponseContext {
+                    domain: &prepared.domain,
+                    qtype: prepared.qtype,
+                    answer_ips: &answer_ips,
+                },
+                traversal,
+            )
+        } else {
+            Ok(ResponsePlan::Accept)
+        };
         let mut response = AnalyzedResponse {
             wire,
             class,
