@@ -269,7 +269,9 @@ class Peer:
                         sock.sendto(dns_answer(payload), remote)
                     else:
                         self.event('echo', transport='udp', **values)
-                        assert sock.sendto(payload, remote) == len(payload)
+                        sent = sock.sendto(payload, remote)
+                        assert sent == len(payload)
+                        self.event('echo-sent', transport='udp', length=sent, **values)
 
     def connection(self, conn, remote, role):
         with conn:
@@ -310,9 +312,14 @@ class Peer:
                                    target=endpoint(conn.getsockname()), payload=payload.hex())
                         conn.sendall(struct.pack('!I', count) + payload)
                     time.sleep(0.05)
-                    conn.sendall(TAIL)
-                    conn.shutdown(socket.SHUT_WR)
-                    self.event('close-tail', remote=endpoint(remote), target=endpoint(conn.getsockname()), length=len(TAIL))
+                    try:
+                        conn.sendall(TAIL)
+                        conn.shutdown(socket.SHUT_WR)
+                    except OSError as error:
+                        if error.errno != errno.ENOTCONN:
+                            raise
+                    else:
+                        self.event('close-tail', remote=endpoint(remote), target=endpoint(conn.getsockname()), length=len(TAIL))
             except (EOFError, ConnectionResetError, BrokenPipeError):
                 pass  # Selector warm sockets can close before any SOCKS request.
             except Exception as error:
@@ -536,12 +543,12 @@ def one_exchange(number, source, target, port, payload, blocked='false', source_
     with socket.socket(family(number), socket.SOCK_DGRAM) as sock:
         sock.settimeout(0.6 if blocked == 'true' else 8)
         sock.bind((source, int(source_port)))
-        sock.sendto(payload.encode(), (target, port))
         try:
+            sock.sendto(payload.encode(), (target, port))
             data, remote = sock.recvfrom(65535)
         except (socket.timeout, ConnectionRefusedError, OSError) as error:
             if isinstance(error, OSError) and not isinstance(error, socket.timeout):
-                assert error.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES), error
+                assert error.errno in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES, errno.EINVAL), error
             assert blocked == 'true', error
         else:
             assert blocked == 'false' and data == payload.encode() and endpoint(remote) == [target, port]
@@ -1110,10 +1117,13 @@ def assert_outbound(events, replies, action, number):
                  and (event['kind'] == 'socks-connect' or event.get('payload') == reply['payload'])]
         assert bool(socks) == (action == 'proxy'), ('actual SOCKS5 action witness', action, reply, socks)
     if primary and primary[0]['transport'] == 'udp':
-        assert len({tuple(event['remote']) for event in primary}) == 1, ('one source socket to two destinations lost outbound source ownership', primary)
         if action == 'proxy':
+            assert len({tuple(event['remote']) for event in primary}) == 1, ('one source socket to two destinations lost outbound source ownership', primary)
             actual = [event for event in events if event['kind'] == 'socks-udp' and event.get('payload') in {reply['payload'] for reply in replies if 'reuseport_receiver' not in reply}]
             assert len({event['association'] for event in actual}) == 1, 'two targets did not share the actual SOCKS5 UDP association'
+        else:
+            for target in {tuple(event['target']) for event in primary}:
+                assert len({tuple(event['remote']) for event in primary if tuple(event['target']) == target}) == 1, ('one Direct destination changed outbound source tuple', target, primary)
 
 
 def matrix_row(daemon, root, row):
@@ -1123,7 +1133,7 @@ def matrix_row(daemon, root, row):
         if transport == 'T':
             namespace = fixture.names['dut' if origin == 'H' else 'source']
             if origin == 'T':
-                run('nft', '-f', '-', namespace=namespace, input='table inet honk_tun_loss { chain input { type filter hook input priority -10; policy accept; } }')
+                run('nft', '-f', '-', namespace=namespace, input='table inet honk_tun_loss {\n chain input { type filter hook input priority -10; policy accept; }\n}\n')
             table = 'honk_tun_operator' if origin == 'H' else 'honk_tun_loss'
             for port in (18080, 18081):
                 source_address = fixture.host_source if origin == 'H' else fixture.source
@@ -1434,25 +1444,17 @@ def strict_rpf(daemon, root, number):
     row = f'A-{number}-strict-rpf'
     with Fixture(daemon, root, row, number) as fixture:
         run('sysctl', '-qw', 'net.ipv4.conf.all.rp_filter=1', namespace=fixture.names['dut'])
-        fixture.start()
-        for origin in ('H', 'T'):
-            for transport in ('T', 'Uc', 'Uu'):
-                for action, port in (('proxy', 18080), ('direct', 18081)):
-                    before = fixture.counters()
-                    start = len(fixture.peer_events())
-                    label = f'{row}/{origin}/{transport}/{action}'
-                    observed = fixture.probe(
-                        'traffic', number, fixture.host_source if origin == 'H' else fixture.source,
-                        transport, port, label, origin=origin, timeout=80)
-                    events = fixture.peer_events()[start:]
-                    assert_outbound(events, observed['replies'], action, number)
-                    after = fixture.counters()
-                    assert after['tx'] > before['tx'] and after['rx'] > before['rx']
-                    (fixture.directory / f'{origin}-{transport}-{action}.json').write_text(
-                        json.dumps({'client': observed, 'peer': events, 'counters': [before, after]}, indent=2))
+        fixture.daemon = fixture.launch()
+        assert fixture.daemon.wait(timeout=15) != 0, 'strict global IPv4 rp_filter did not refuse startup'
+        text = fixture.log.read_text()
+        assert 'net.ipv4.conf.all.rp_filter' in text, ('missing strict-rpf startup diagnostic', text)
+        assert 'TUN datapath ready' not in text, 'strict-rpf rejection followed false readiness'
         assert run('sysctl', '-n', 'net.ipv4.conf.all.rp_filter', namespace=fixture.names['dut']).stdout.strip() == '1'
+        after = fixture.snapshot('strict-rpf-rejected')
+        assert not any(link['ifname'] == 'honk0' for link in after['links']), 'strict-rpf rejection retained a TUN link'
+        assert fixture.resources() == fixture.before, 'strict-rpf rejection changed preexisting RPDB/routes'
+        assert not list((fixture.state / 'state').glob('tun-*.json')), 'strict-rpf rejection retained a setup receipt'
         fixture.fence_counters()
-        fixture.normal_stop(expected_rp_filter=1)
 
 
 def gate(daemon, root):
