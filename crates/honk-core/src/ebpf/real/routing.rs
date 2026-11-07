@@ -1,6 +1,7 @@
 use super::*;
 use crate::ebpf::DomainRouteWriteError;
 use crate::ebpf::maps::DOMAIN_MAP_CAPACITY;
+use anyhow::Context as _;
 use aya::maps::{ArrayOfMaps as AyaArrayOfMaps, IterableMap};
 use aya::programs::{ProgramError, ProgramFd, SchedClassifier};
 #[cfg(test)]
@@ -44,6 +45,50 @@ pub(super) struct RoutingGeneration {
     _btf: OwnedFd,
     _program: OwnedFd,
     _links: Vec<OwnedFd>,
+}
+
+/// Older kernels, 5.15 among them, match an inner map against the root's
+/// template by its BTF-derived timer offset, which only a map carrying the
+/// same struct type shares; a BTF-less descriptor map is refused with EINVAL.
+pub(super) struct DescriptorBtf {
+    fd: OwnedFd,
+    key: u32,
+    value: u32,
+}
+
+impl DescriptorBtf {
+    /// The object BTF the kernel holds for a loaded program.
+    pub(super) fn resolve(bpf: &aya::Ebpf) -> anyhow::Result<Self> {
+        let program = bpf
+            .program("lan_ingress_l2")
+            .ok_or_else(|| anyhow::anyhow!("lan_ingress_l2 not found"))?;
+        let btf_id = program
+            .info()?
+            .btf_id()
+            .ok_or_else(|| anyhow::anyhow!("lan_ingress_l2 has no BTF"))?;
+        let fd = btf_fd_by_id(btf_id)?;
+        let btf = Btf::parse(&btf_bytes(&fd)?, Default::default())?;
+        Ok(Self {
+            key: btf.id_by_type_name_kind("u32", BtfKind::Int)?,
+            value: btf.id_by_type_name_kind("RoutingPolicyDescriptor", BtfKind::Struct)?,
+            fd,
+        })
+    }
+
+    pub(super) fn create_descriptor(&self) -> anyhow::Result<RoutingDescriptor> {
+        let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+        let create = unsafe { &mut attr.__bindgen_anon_1 };
+        create.map_type = aya_obj::generated::bpf_map_type::BPF_MAP_TYPE_ARRAY as u32;
+        create.key_size = size_of::<u32>() as u32;
+        create.value_size = size_of::<RoutingPolicyDescriptor>() as u32;
+        create.max_entries = 1;
+        create.btf_fd = self.fd.as_raw_fd() as u32;
+        create.btf_key_type_id = self.key;
+        create.btf_value_type_id = self.value;
+        let fd = bpf_fd(bpf_cmd::BPF_MAP_CREATE, &mut attr).context("create descriptor map")?;
+        let map = aya::maps::Map::Array(AyaMapData::from_fd(fd)?);
+        Ok(RoutingDescriptor::try_from(map)?)
+    }
 }
 
 struct RoutingMaps {
@@ -468,14 +513,24 @@ impl RealEbpfBackend {
         &mut self,
         value: RoutingPolicyDescriptor,
     ) -> anyhow::Result<RoutingDescriptor> {
-        let mut descriptor = RoutingDescriptor::create(1, 0)?;
-        descriptor.set(0, &value, 0)?;
+        if self.descriptor_btf.is_none() {
+            self.descriptor_btf = Some(DescriptorBtf::resolve(self.bpf()?)?);
+        }
+        let mut descriptor = self
+            .descriptor_btf
+            .as_ref()
+            .expect("resolved above")
+            .create_descriptor()?;
+        descriptor
+            .set(0, &value, 0)
+            .context("write the routing descriptor")?;
         let root = self
             .bpf_mut()?
             .map_mut(ROUTING_POLICY_ROOT_NAME)
             .ok_or_else(|| anyhow::anyhow!("map '{ROUTING_POLICY_ROOT_NAME}' not found"))?;
         let mut root = AyaArrayOfMaps::<_, RoutingDescriptor>::try_from(root)?;
-        root.set(0, &descriptor, 0)?;
+        root.set(0, &descriptor, 0)
+            .context("publish the routing descriptor into its root")?;
         Ok(descriptor)
     }
 
@@ -651,6 +706,7 @@ impl RealEbpfBackend {
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,
             routing_generation: None,
+            descriptor_btf: None,
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence: AyaArray::create(1, 0)?,

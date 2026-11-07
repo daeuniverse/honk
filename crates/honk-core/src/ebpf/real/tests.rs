@@ -884,7 +884,10 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         let root = ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
             .unwrap();
         let old_descriptor = root.get(&0, 0).unwrap();
-        let mut foreign_descriptor = AyaArray::<_, RoutingPolicyDescriptor>::create(1, 0).unwrap();
+        let mut foreign_descriptor = super::routing::DescriptorBtf::resolve(backend.bpf().unwrap())
+            .unwrap()
+            .create_descriptor()
+            .unwrap();
         foreign_descriptor
             .set(0, &old_descriptor.get(&0, 0).unwrap(), 0)
             .unwrap();

@@ -81,6 +81,8 @@ pub struct RealEbpfBackend {
     tcp_live_pins: std::sync::Arc<AyaMapData>,
     /// Active compiled program, links, descriptor, and generation-owned maps.
     routing_generation: Option<routing::RoutingGeneration>,
+    /// Object BTF and type IDs for descriptor maps, resolved on first publish.
+    descriptor_btf: Option<routing::DescriptorBtf>,
     routing_slot: u32,
     routing_generation_counter: u64,
     routing_generation_sequence: AyaArray<AyaMapData, u64>,

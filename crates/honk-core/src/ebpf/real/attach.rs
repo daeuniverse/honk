@@ -360,6 +360,7 @@ impl RealEbpfBackend {
             cap_flow_lookup_batch: BatchCapability::new(),
             tcp_live_pins,
             routing_generation: None,
+            descriptor_btf: None,
             routing_slot: 0,
             routing_generation_counter: 0,
             routing_generation_sequence,
