@@ -142,9 +142,14 @@ fn network_header_at_eth_hlen(ctx: &TcContext, head: u32) -> u32 {
 /// `vlan_tci`, cleared by `vlan_do_receive` before the VLAN device's own TC).
 /// Redirecting it into daens would drop it as OTHERHOST, so the VLAN device
 /// must classify it instead. VID 0 priority tags are delivered normally.
+/// Older kernels (Linux 5.15) clear only `vlan_present` and keep the TCI;
+/// newer ones derive `vlan_present` from the TCI, so both are checked.
 #[inline(always)]
 pub fn is_vlan_tagged(ctx: &TcContext, link_h_len: u32) -> bool {
-    link_h_len == ETH_HLEN && unsafe { (*raw_skb(ctx)).vlan_tci } & VLAN_VID_MASK != 0
+    let skb = raw_skb(ctx);
+    link_h_len == ETH_HLEN
+        && unsafe { (*skb).vlan_present } != 0
+        && unsafe { (*skb).vlan_tci } & VLAN_VID_MASK != 0
 }
 
 /// Destinations that must never enter routing/conntrack: L2
