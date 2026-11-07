@@ -155,7 +155,9 @@ pub fn stable_flow_element_identity_test(ctx: *mut __sk_buff) -> c_long {
         return TC_ACT_SHOT;
     };
     let scratch = unsafe { &mut *scratch };
-    let redirect_key = RedirectTuple::from_tuples(key);
+    // Kept in scratch: a stack copy rounds this frame past the 512-byte
+    // combined limit of verifiers before Linux 6.6.
+    scratch.redirect_key = RedirectTuple::from_tuples(key);
     let Some(previous) = conn_incarnation(key) else {
         return TC_ACT_SHOT;
     };
@@ -168,7 +170,7 @@ pub fn stable_flow_element_identity_test(ctx: *mut __sk_buff) -> c_long {
         copy_payload(&mut scratch.handoff, &raw const (*input_handoff).value);
         bpf_spin_unlock(&mut (*input_handoff).lock);
     }
-    let Some(input_redirect) = REDIRECT_TRACK.get_ptr_mut(&redirect_key) else {
+    let Some(input_redirect) = REDIRECT_TRACK.get_ptr_mut(&scratch.redirect_key) else {
         return TC_ACT_SHOT;
     };
     unsafe {
@@ -191,7 +193,7 @@ pub fn stable_flow_element_identity_test(ctx: *mut __sk_buff) -> c_long {
     let Some(handoff_ptr) = ROUTING_HANDOFF_MAP.get_ptr_mut(key) else {
         return TC_ACT_SHOT;
     };
-    let Some(redirect_ptr) = REDIRECT_TRACK.get_ptr_mut(&redirect_key) else {
+    let Some(redirect_ptr) = REDIRECT_TRACK.get_ptr_mut(&scratch.redirect_key) else {
         return TC_ACT_SHOT;
     };
     let Some(current) = publish_syn(ctx, key, direction, scratch).map(NonZeroU64::get) else {
@@ -230,7 +232,7 @@ pub fn stable_flow_element_identity_test(ctx: *mut __sk_buff) -> c_long {
     {
         observed |= 2;
     }
-    if let Some(value) = redirect_snapshot(&redirect_key)
+    if let Some(value) = redirect_snapshot(&scratch.redirect_key)
         && value.incarnation == current
         && value.decision_token == 0
         && unsafe { same_payload(&scratch.redirect, &value) }
