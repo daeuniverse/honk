@@ -13,11 +13,12 @@ pub(super) fn unsynchronized_core(
         routes: Vec::new(),
         address_generation: 1,
         firewall: table.unwrap_or_else(|| Firewall::new_history(Arc::clone(budget), 2, 0).unwrap()),
-        ingress_roles: Vec::new(),
+        ingress_bindings: Vec::new(),
         reassembly_outputs: reassembly::Outputs::new(budget).unwrap(),
         pending_reassembly_error: None,
         reassembly_poll_pending: false,
         counters: RefusalCounters::default(),
+        after_fact_read: None,
         _role_charge: budget.reserve(0).unwrap(),
         _charge: budget.reserve(0).unwrap(),
         budget: Arc::clone(budget),
@@ -631,9 +632,17 @@ async fn firewall_capacity_refusal_keeps_packet_owner_alive() {
         budget.clone(),
     )
     .unwrap();
-    core.set_ingress_roles(&[
-        (ingress, InterfaceRole::Lan),
-        (ingresses[1], InterfaceRole::Wan),
+    core.set_ingress_bindings(&[
+        IngressBinding {
+            ingress,
+            role: InterfaceRole::Lan,
+            facts: ScopeId::allocate().unwrap(),
+        },
+        IngressBinding {
+            ingress: ingresses[1],
+            role: InterfaceRole::Wan,
+            facts: ScopeId::allocate().unwrap(),
+        },
     ])
     .unwrap();
     let baseline = budget.used();
@@ -856,9 +865,17 @@ async fn plain_output_history_survives_first_nat_enable_and_cq_owners() {
             budget.clone(),
         )
         .unwrap();
-        core.set_ingress_roles(&[
-            (ingresses[0], InterfaceRole::Lan),
-            (ingresses[1], InterfaceRole::Wan),
+        core.set_ingress_bindings(&[
+            IngressBinding {
+                ingress: ingresses[0],
+                role: InterfaceRole::Lan,
+                facts: ScopeId::allocate().unwrap(),
+            },
+            IngressBinding {
+                ingress: ingresses[1],
+                role: InterfaceRole::Wan,
+                facts: ScopeId::allocate().unwrap(),
+            },
         ])
         .unwrap();
         let mut bytes = [0; 80];
@@ -1036,9 +1053,17 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
         let table = Firewall::new_history(budget.clone(), 4, 1).unwrap();
         let mut core = unsynchronized_core(authority.clone(), &ingresses, &budget, Some(table));
         core.core = CoreForward::new(&ingresses, budget.clone(), 4).unwrap();
-        core.set_ingress_roles(&[
-            (ingresses[0], InterfaceRole::Lan),
-            (ingresses[1], InterfaceRole::Wan),
+        core.set_ingress_bindings(&[
+            IngressBinding {
+                ingress: ingresses[0],
+                role: InterfaceRole::Lan,
+                facts: ScopeId::allocate().unwrap(),
+            },
+            IngressBinding {
+                ingress: ingresses[1],
+                role: InterfaceRole::Wan,
+                facts: ScopeId::allocate().unwrap(),
+            },
         ])
         .unwrap();
         core.fib.synchronize().unwrap();
@@ -1422,15 +1447,49 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
     use std::time::Duration;
     let ingresses = smoke_ingresses();
     for completion_after_owner in [false, true] {
-        let mut config = honk_config::Config::default();
+        let mut config = honk_config::parser::parse_dae_config(
+            "global { dial_mode: ip }\nrouting { domain(suffix: test) -> direct\n fallback: direct }",
+        ).unwrap();
         config.ensure_builtin_nodes();
-        config.global.dial_mode = "ip".into();
         let plane = crate::control::tests::support::control_plane(config);
+        let snapshot = {
+            let mut router = plane.router.write().await;
+            let config = plane.config.read().await;
+            *router = crate::routing::Router::from_config(&config.routing).unwrap();
+            let generation = plane.diagnostics.read().generation.checked_add(1).unwrap();
+            let snapshot = Arc::new(crate::dns::projection::RoutingProjectionSnapshot::new(
+                generation,
+                Arc::new(router.clone()),
+            ));
+            plane.diagnostics.write().generation = generation;
+            plane
+                .dns_controller
+                .prepare_projection_publication()
+                .commit(Arc::clone(&snapshot), None);
+            snapshot
+        };
         let authority = plane
             .core_forward_policy(Execution::MixedEndpoints)
             .await
             .unwrap();
         let budget = MemoryBudget::new(32 << 20);
+        let scopes = [ScopeId::allocate().unwrap(), ScopeId::allocate().unwrap()];
+        let projection = plane.dns_controller.routing_projection();
+        projection.shutdown(Duration::from_secs(1)).await;
+        projection
+            .register_packet_scopes(scopes.into_iter(), &budget)
+            .unwrap();
+        let ips = ["198.51.100.99".parse().unwrap()];
+        projection.submit(
+            scopes[0],
+            Arc::clone(&snapshot),
+            crate::dns::projection::ProjectionObservation::Positive {
+                domain: "timeout.test",
+                family: honk_outbound::alive::IpVersion::V4,
+                ips: &ips,
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
         let start = Instant::now() - Duration::from_secs(31);
         let mut bytes = [0; 80];
         let len = wire::udp::emit_packet(
@@ -1463,6 +1522,19 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
             .unwrap();
         drop(witness);
         let mut core = unsynchronized_core(authority.clone(), &ingresses, &budget, Some(table));
+        core.set_ingress_bindings(&[
+            IngressBinding {
+                ingress: ingresses[0],
+                role: InterfaceRole::Lan,
+                facts: scopes[0],
+            },
+            IngressBinding {
+                ingress: ingresses[1],
+                role: InterfaceRole::Wan,
+                facts: scopes[1],
+            },
+        ])
+        .unwrap();
         core.fib.synchronize().unwrap();
         let baseline = budget.used();
         let mut fragment = bytes[..36].to_vec();
@@ -1485,6 +1557,8 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
             .poll_reassembly_error(&authority.read_policy().await, Instant::now(), &mut output)
             .unwrap()
             .expect("timeout emits despite unresolved forward neighbor");
+        assert_eq!(generated.ingress, ingresses[0]);
+        assert!(generated.generation.facts.is_some());
         assert_eq!(&output[20..22], &[11, 1]);
         assert_eq!(core.reassembly_outputs.pending(), 1);
         assert!(!core.fragments_quiescent());
@@ -1502,11 +1576,45 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
                 &authority.read_policy().await,
                 generated.route,
                 generated.generation,
-                || Ok(Some(()))
+                || {
+                    assert!(projection.try_packet_facts().is_none());
+                    Ok(Some(()))
+                }
             )
             .unwrap(),
             Some(())
         );
+        projection.submit(
+            scopes[0],
+            Arc::clone(&snapshot),
+            crate::dns::projection::ProjectionObservation::Clear {
+                domain: "timeout.test",
+                family: honk_outbound::alive::IpVersion::V4,
+            },
+        );
+        projection.submit(
+            scopes[0],
+            snapshot,
+            crate::dns::projection::ProjectionObservation::Positive {
+                domain: "timeout.test",
+                family: honk_outbound::alive::IpVersion::V4,
+                ips: &ips,
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+        assert!(
+            core.submit(
+                &authority.read_policy().await,
+                generated.route,
+                generated.generation,
+                || -> io::Result<Option<()>> { panic!("withdrawn timeout fact reached TX") },
+            )
+            .unwrap()
+            .is_none()
+        );
+        drop(projection);
+        drop(authority);
+        drop(plane);
         core.firewall
             .expire(Instant::now() + Duration::from_secs(121));
         let retirement = Instant::now() + Duration::from_secs(242);
@@ -1660,3 +1768,5 @@ async fn submit_refuses_mode_generation_and_aba_without_router_reload() {
         Some(11)
     );
 }
+
+mod facts;

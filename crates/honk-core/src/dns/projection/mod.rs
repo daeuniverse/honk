@@ -86,14 +86,12 @@ use lifecycle::{ProjectionLifecycle, TerminationGuard};
 use state::DesiredState;
 
 const DEFAULT_DOMAIN_CAPACITY: usize = 10_000;
-/// Cache-hit refreshes of an unchanged owner within this window skip the
-/// projection fence and state lock. Bounds stale LRU recency and how late a
-/// skipped TTL shortening is applied.
+/// HOST cache-hit refreshes of an unchanged owner within this window skip the
+/// projection fence and state lock, bounding stale recency and TTL shortening.
 const CACHE_HIT_COALESCE: Duration = Duration::from_secs(1);
 
 /// Owner state last applied under its committed generation and state lock.
 struct CacheHitHint {
-    scope: ScopeId,
     structure: u64,
     generation: u64,
     ips: Box<[IpAddr]>,
@@ -193,6 +191,53 @@ pub(crate) struct RoutingProjection {
     /// Woken after every exclusive fence release so contended submissions
     /// wait asynchronously instead of blocking a thread.
     publication_released: tokio::sync::Notify,
+}
+
+/// One scope's withdrawal identity and original applicable expiry in tokio time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FactStamp {
+    scope: ScopeId,
+    revision: u64,
+    expires_at: Option<tokio::time::Instant>,
+}
+
+impl FactStamp {
+    pub(crate) fn is_unexpired_at(self, now: tokio::time::Instant) -> bool {
+        self.expires_at.is_none_or(|expires_at| now < expires_at)
+    }
+}
+
+/// Synchronous fact mutation serialization; never held across an await.
+pub(crate) struct PacketFacts<'a>(parking_lot::MutexGuard<'a, DesiredState>);
+
+impl PacketFacts<'_> {
+    pub(crate) fn lookup(
+        &mut self,
+        scope: ScopeId,
+        ip: IpAddr,
+        router: &Router,
+        generation: u64,
+    ) -> anyhow::Result<(Option<DomainRouting>, FactStamp)> {
+        check_packet_authority(&self.0, router, generation)?;
+        self.0.packet_fact(scope, ip, tokio::time::Instant::now())
+    }
+
+    pub(crate) fn is_current(&mut self, stamp: FactStamp) -> bool {
+        self.0.fact_is_current(stamp, tokio::time::Instant::now())
+    }
+}
+
+fn check_packet_authority(
+    state: &DesiredState,
+    router: &Router,
+    generation: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        state.snapshot.generation() == generation
+            && state.snapshot.matcher.policy_fingerprint() == router.policy_fingerprint(),
+        "packet DNS projection generation does not match routing authority"
+    );
+    Ok(())
 }
 
 pub(crate) struct PreparedProjectionPublication<'a> {
@@ -305,6 +350,39 @@ impl RoutingProjection {
         self.state.lock().project(snapshot).into_iter().collect()
     }
 
+    pub(crate) fn register_packet_scopes(
+        &self,
+        scopes: impl ExactSizeIterator<Item = ScopeId> + Clone,
+        budget: &Arc<honk_netstack::MemoryBudget>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            scopes.len() != 0
+                && scopes.clone().enumerate().all(|(index, scope)| {
+                    scope != ScopeId::HOST
+                        && !scopes.clone().take(index).any(|other| other == scope)
+                }),
+            "packet DNS scopes must be distinct non-HOST scopes"
+        );
+        let bytes = std::alloc::Layout::array::<state::PacketFactScope>(scopes.len())?.size();
+        let charge = budget
+            .reserve(bytes)
+            .ok_or_else(|| anyhow::anyhow!("packet DNS scope registration memory capacity"))?;
+        let table = scopes.map(state::PacketFactScope::new).collect();
+        self.state.lock().register_packet_scopes(table, charge)
+    }
+
+    pub(crate) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
+        self.state.lock().owns_packet_scope(scope)
+    }
+
+    pub(crate) fn packet_facts(&self) -> PacketFacts<'_> {
+        PacketFacts(self.state.lock())
+    }
+
+    pub(crate) fn try_packet_facts(&self) -> Option<PacketFacts<'_>> {
+        self.state.try_lock().map(PacketFacts)
+    }
+
     pub(crate) fn packet_bitmap(
         &self,
         scope: ScopeId,
@@ -313,11 +391,7 @@ impl RoutingProjection {
         generation: u64,
     ) -> anyhow::Result<Option<DomainRouting>> {
         let mut state = self.state.lock();
-        anyhow::ensure!(
-            state.snapshot.generation() == generation
-                && state.snapshot.matcher.policy_fingerprint() == router.policy_fingerprint(),
-            "packet DNS projection generation does not match routing authority"
-        );
+        check_packet_authority(&state, router, generation)?;
         Ok(state.bitmap(scope, ip))
     }
 
@@ -349,9 +423,8 @@ impl RoutingProjection {
         })
     }
 
-    /// Submits a DNS-cache observation. A refresh identical to one applied within
-    /// `CACHE_HIT_COALESCE`, shortening expiry by at most that window, is coalesced
-    /// without taking the projection fence or state lock.
+    /// Submits a DNS-cache observation. Only HOST refreshes may coalesce within
+    /// `CACHE_HIT_COALESCE`; packet-scope shortening must revoke old permissions.
     /// Returns `false` until the matching publication can accept the observation.
     pub(crate) fn try_submit_cache_hit(
         &self,
@@ -362,12 +435,23 @@ impl RoutingProjection {
         ips: &[IpAddr],
         expires_at: tokio::time::Instant,
     ) -> bool {
+        if scope != ScopeId::HOST {
+            return self.try_submit(
+                scope,
+                snapshot,
+                ProjectionObservation::Positive {
+                    domain,
+                    family,
+                    ips,
+                    expires_at,
+                },
+            );
+        }
         let now = tokio::time::Instant::now();
         let hints = &self.hints[family as usize];
         let structure = self.structure.load(Ordering::Acquire);
         let coalesced = hints.get(domain).is_some_and(|hint| {
-            hint.scope == scope
-                && hint.structure == structure
+            hint.structure == structure
                 && hint.generation == snapshot.generation()
                 && now < expires_at
                 && now < hint.expires_at
@@ -409,7 +493,6 @@ impl RoutingProjection {
                 hints.insert(
                     key,
                     CacheHitHint {
-                        scope,
                         structure,
                         generation: state.snapshot.generation(),
                         ips,

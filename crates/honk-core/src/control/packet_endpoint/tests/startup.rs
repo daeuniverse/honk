@@ -79,6 +79,7 @@ async fn xdp_flag_initialization_failure_retains_cleanup_until_output_returns() 
         let budget = MemoryBudget::new(32 << 20);
         let (scope, scope_owner) = scope(&budget);
         let (plane, _health) = xdp_plane("Direct", "block").await;
+        let projection = plane.dns_controller.routing_projection();
         let stopped = Arc::clone(&plane.shutdown_requested);
         let backend = Arc::clone(&plane.ebpf);
         let mut held_backend = backend.write().await;
@@ -107,6 +108,8 @@ async fn xdp_flag_initialization_failure_retains_cleanup_until_output_returns() 
             .expect("failed flags must reject startup");
         assert!(format!("{error:#}").contains("injected datapath flags write failure"));
         drop(scope);
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(projection);
         assert_eq!(budget.used(), 0);
     })
     .await
@@ -121,6 +124,7 @@ async fn cancelled_startup_never_activates_and_retains_exported_output() {
             let budget = MemoryBudget::new(32 << 20);
             let (scope, scope_owner) = scope(&budget);
             let (mut plane, _health) = local_plane().await;
+            let projection = plane.dns_controller.routing_projection();
             let native =
                 crate::native_api::observation::NativeObservation::attach(&mut plane).await;
             let generation = plane.diagnostics.read().generation;
@@ -167,6 +171,9 @@ async fn cancelled_startup_never_activates_and_retains_exported_output() {
             output.release();
             assert!(scope.next_output().await.is_none());
             drop(scope);
+            drop(native);
+            projection.shutdown(Duration::from_secs(1)).await;
+            drop(projection);
             while budget.used() != 0 {
                 tokio::task::yield_now().await;
             }
@@ -241,6 +248,7 @@ async fn normal_close_aborts_packet_protocol_before_waiting_for_selector_retirem
             config.routing.default_outbound = "packet-control".into();
         })
         .await;
+        let projection = plane.dns_controller.routing_projection();
         let commands = plane.command_sender();
         let tracker = Arc::clone(&plane.connection_tracker);
         tracker.enable();
@@ -329,6 +337,8 @@ async fn normal_close_aborts_packet_protocol_before_waiting_for_selector_retirem
         assert!(scope.next_output().await.is_none());
         drop(endpoints);
         drop(scope);
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(projection);
         assert_eq!(budget.used(), 0);
     })
     .await
@@ -658,6 +668,7 @@ async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_return
         let (second, second_owner) = scope(&budget);
         let (plane, _health) = local_plane().await;
         let stopped = plane.shutdown_intent();
+        let projection = plane.dns_controller.routing_projection();
         let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
             plane,
             vec![(first.clone(), first_owner), (second.clone(), second_owner)],
@@ -715,6 +726,8 @@ async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_return
         );
         drop(pressure);
         drop((drivers, owner, endpoints, first, second));
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(projection);
         assert_eq!(budget.used(), 0);
     })
     .await

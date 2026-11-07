@@ -204,11 +204,13 @@ remain unsupported requirements. Routed-only policy uses `dial_mode: ip` and unm
 `ControlPlane::core_forward_policy(Execution)` returns a narrow registered
 `RoutingAuthority` before `PacketEndpoints` consumes the plane; both retain the
 same published router/config, never separate policy owners. The explicit
-`MixedEndpoints` profile admits only IP-mode policy without domain, process-name,
-MAC or mark dependencies. Its ordinary final Direct action is Core transit;
-non-must DNS53 and group actions return the original funded packet to Endpoint,
-while Block remains terminal. Policies needing unresolved TCP/domain facts must
-select Endpoint instead of silently turning configured Core Direct into a relay.
+`MixedEndpoints` profile requires IP-mode policy and rejects process-name, MAC and
+mark dependencies. Domain predicates consume only learned DNS facts from the exact
+registered non-HOST ingress scope, never HOST facts or a synthesized hostname.
+Its ordinary final Direct action is Core transit; non-must DNS53 and group actions
+return the original funded packet to Endpoint, while Block remains terminal.
+Routed-only embeddings have no packet fact scope and reject domain predicates at registration and reload;
+sniff-dependent execution requires Endpoint rather than a hidden Core-to-relay fallback.
 
 Core and Endpoint share the existing Rule/Global/Direct mode override, including
 typed native targets and final must/Block precedence. A Core `PolicyGeneration`
@@ -217,6 +219,8 @@ holds the router/config/mode readers through the actual writer. A mode ABA chang
 cannot revive queued output, and rejected output is disposed without replay.
 
 `RoutingAuthority::read_policy` supplies the real router/config guards. The XDP owner keeps a pending acquisition beside device, timer, shutdown and supervisor service, then resolves a bounded Core turn synchronously under those guards. A foreign registration's reader is refused; no scope mutex crosses an await.
+
+Scoped fact lookup retains a nonwrapping scope revision and its original expiry. Same-generation withdrawal, owner replacement, expiry or a shorter TTL can invalidate prepared work even when its bitmap is unchanged. Cached forwarding serializes fact lookup through its actual writer; prepared output rechecks its stamp under the same fact mutex through publication, and Endpoint handoff rechecks before committing its decision. Stale prepared work is not replayed or authorized by a later TTL extension.
 
 Ordinary Global decisions on the borrowed cached path return Cold rather than
 inventing an Endpoint handoff without owning its decision. An existing unbound

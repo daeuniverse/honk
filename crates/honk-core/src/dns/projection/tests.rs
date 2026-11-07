@@ -754,7 +754,7 @@ async fn refresh_and_ip_replacement_preserve_ttl() {
 fn backend_for_test(snapshot: &RoutingProjectionSnapshot) -> MockEbpfBackend {
     let plan = crate::control::routing_matcher::RoutingPushPlan::compile(
         &snapshot.matcher,
-        &std::collections::HashMap::from([("direct".to_owned(), 0)]),
+        &std::collections::HashMap::from([("direct".to_owned(), 0), ("block".to_owned(), 1)]),
         honk_config::types::DialMode::Domain,
     )
     .unwrap();

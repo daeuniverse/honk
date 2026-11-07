@@ -132,3 +132,38 @@ async fn packet_dns_answers_do_not_enter_the_kernel_projection() {
     );
     controller.shutdown(Duration::from_secs(1)).await;
 }
+
+#[tokio::test]
+async fn packet_dns_registration_requires_one_shared_budget_without_partial_ownership() {
+    let controller = || {
+        snapshot_controller(snapshot_forwarder(Arc::new(SnapshotUpstream {
+            ip: [192, 0, 2, 1],
+            calls: AtomicUsize::new(0),
+            entered: None,
+            release: None,
+        })))
+    };
+    let first = controller();
+    let second = controller();
+    let target = controller();
+    assert!(target.register_packet_scopes(&[]).is_err());
+    let (a, _a_owner) = packet_scope(&first);
+    let (b, _b_owner) = packet_scope(&second);
+    let budget = a.budget();
+    let before = budget.used();
+    let error = target
+        .register_packet_scopes(&[a.clone(), b.clone()])
+        .unwrap_err();
+    assert!(error.to_string().contains("share one memory budget"));
+    assert!(!target.owns_packet_scope(a.scope()));
+    assert!(!target.owns_packet_scope(b.scope()));
+    assert_eq!(budget.used(), before);
+    target
+        .register_packet_scopes(std::slice::from_ref(&a))
+        .unwrap();
+    assert!(target.owns_packet_scope(a.scope()));
+    assert!(budget.used() > before);
+    for controller in [&first, &second, &target] {
+        controller.shutdown(Duration::from_secs(1)).await;
+    }
+}

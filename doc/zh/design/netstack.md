@@ -195,10 +195,12 @@ routed-only 策略只允许 `dial_mode: ip`、无 mark 的 `direct`/`block`；
 
 `ControlPlane::core_forward_policy(Execution)` 在 `PacketEndpoints` 消费 plane 前
 返回窄化的注册 `RoutingAuthority`；两者保留同一已发布 router/config，不另建策略
-owner。显式 `MixedEndpoints` profile 仅接纳 IP 模式且不依赖 domain、pname、MAC
-或 mark 的策略。普通最终 Direct 动作进入 Core；非 must DNS53 和 group 动作把
-原计费包交给 Endpoint，Block 仍终结。需要未决 TCP/domain 事实的策略应显式选择
-Endpoint，不能把要求 Core 的 Direct 静默降成 relay。
+owner。显式 `MixedEndpoints` profile 要求 IP 模式，拒绝 pname、MAC 和 mark
+依赖。域名谓词只消费精确注册的非 HOST 入口 scope 内学到的 DNS 事实，不能借用
+HOST 事实或虚构 hostname。普通最终 Direct 动作进入 Core；非 must DNS53 和
+group 动作把原计费包交给 Endpoint，Block 仍终结。routed-only 嵌入没有 packet fact
+scope，在注册与 reload 时拒绝域名谓词；依赖嗅探的执行须选择 Endpoint，不能把 Core
+静默降成 relay。
 
 Core 和 Endpoint 复用既有 Rule/Global/Direct mode override，包括 native typed
 target 和 must/Block 终端优先级。Core 的 `PolicyGeneration` 同时捕获 routing
@@ -206,6 +208,8 @@ generation 与不回绕的 mode revision；submit 把 router/config/mode 读锁�
 实际 writer 完成。mode 的 ABA 变化不能重新授权排队输出，拒绝后只处置、不重放。
 
 `RoutingAuthority::read_policy` 提供真实 router/config guard。XDP owner 等待读锁时仍并行服务设备、timer、shutdown 与 supervisor，取得 guard 后同步处理有界 Core 轮次。其他 registration 的 reader 被拒绝；scope 互斥锁不跨 await。
+
+Scoped fact 查询保留不回绕的 scope revision 及原始到期时间。同代撤销、owner 替换、过期或缩短 TTL 即使没有改变 bitmap，也能使准备中的工作失效。缓存转发将 fact 查询串行化到实际 writer；准备输出在同一 fact mutex 下重查 stamp 并完成发布，Endpoint handoff 在判决提交前重查。过期准备工作不能重放，也不能借后续 TTL 延长重新获得授权。
 
 借用缓存路径对普通 Global 判决返回 Cold，不在没有判决所有权时发出 Endpoint
 handoff。Core transport 跨 traffic-class 变化和精确 reverse ingress 保留执行

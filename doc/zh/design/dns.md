@@ -298,6 +298,8 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
+Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
+
 新建数值目标的 packet TCP/UDP 路由通过 canonical Router 消费同一 scope 尚未过期的 bitmap，不虚构 hostname，并保留规则顺序、mode 与终态 `must`/`block` 语义。已接纳的 transport 保留原有路由所有权；配置允许的真实嗅探名称重路由仍使用既有语义。软件查询要求已提交的 routing generation 与 policy fingerprint 同时匹配，不匹配时失败，而不是当作缺失域名事实回退。
 
 共享投影最多保留 10,000 个 `(scope, name, family)` owner 和 49,152 个 `(scope, canonical IP)` desired key，零 bitmap 另有 32,768 个 key 的上限。这些限制由全部 scope 共享，不按 scope 倍增。只有 HOST key 进入容量为 65,536 的 domain map，仍为 sniff 写入保留不供 DNS 投影使用的 16,384 个槽位；等待成功删除的过时零值 key 可暂时突破零值子上限，但仍受 applied 总上限约束。同一 scope 内 IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰最大的 IP/scope key。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 key。容量压力会产生警告。全局回收 HOST owner 时仍经正常 worker 删除与 publication fence。
@@ -306,7 +308,7 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 延长 TTL 和更新 LRU 时复用已经入堆的条目。过期唤醒和淘汰候选先重新校验当前 owner，再重排或删除；缩短 TTL 则立即安排更早的截止时间。独立的入队 sequence 标记隔离清除后重建及地址族变化，并保留原有的有界堆压缩。
 
-由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 scope、policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
+由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。HOST 缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的 HOST 命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。Packet scope 的缓存命中不合并缩短的 expiry，而是精确应用，并按需撤销此前准备中的权威。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
 
 每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
 

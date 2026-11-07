@@ -519,6 +519,9 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
                 _ => unreachable!(),
             }
             assert!(handle.tcp_flow_pins.snapshot().is_empty());
+            plane.dns_controller.shutdown(Duration::from_secs(1)).await;
+            drop(handle);
+            drop(plane);
             wire.finish().await;
         }
         tokio::time::timeout(Duration::from_secs(5), dns_server).await???;
@@ -639,6 +642,9 @@ async fn packet_tcp_uses_dns_learned_domain_without_a_sniffed_name() -> anyhow::
         accepting.abort();
         assert!(accepting.await.unwrap_err().is_cancelled());
         assert!(plane.ebpf.read().await.projection_map_snapshot().is_empty());
+        plane.dns_controller.shutdown(Duration::from_secs(1)).await;
+        drop(handle);
+        drop(plane);
         wire.finish().await;
         Ok(())
     })

@@ -72,15 +72,6 @@ pub struct CompiledRoute {
     pub condition_expressions: Vec<String>,
 }
 
-impl CompiledRoute {
-    /// Whether the rule references any domain-class matcher, positive or negated.
-    pub fn has_domain_conditions(&self) -> bool {
-        self.conditions
-            .iter()
-            .any(|condition| matches!(condition.predicate, CompiledPredicate::Domain(_)))
-    }
-}
-
 // The untimed production specialization has no clock reads or per-alternative budget branch.
 fn bounded_any<const BOUNDED: bool, T>(
     values: &[T],
@@ -582,10 +573,14 @@ impl Router {
         self.matches_input(route, input, domain_bitmap, observe)
     }
 
-    pub(crate) fn route_input(&self, input: PredicateInput<'_>) -> &RouteAction {
+    pub(crate) fn route_input(
+        &self,
+        input: PredicateInput<'_>,
+        domain_bitmap: Option<&DomainRouting>,
+    ) -> &RouteAction {
         self.routes
             .iter()
-            .find(|route| self.matches_input(route, input, None, |_, _| {}))
+            .find(|route| self.matches_input(route, input, domain_bitmap, |_, _| {}))
             .map_or_else(|| self.fallback(), |route| &route.action)
     }
 

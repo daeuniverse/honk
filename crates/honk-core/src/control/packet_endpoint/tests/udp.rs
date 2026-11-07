@@ -768,6 +768,7 @@ async fn fragmented_packet_udp_reaches_real_outbound_and_returns_every_byte() {
         let budget = MemoryBudget::new(32 << 20);
         let (scope, scope_owner) = scope(&budget);
         let (plane, _health) = local_plane().await;
+        let projection = plane.dns_controller.routing_projection();
         let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
             .await
             .unwrap();
@@ -808,6 +809,8 @@ async fn fragmented_packet_udp_reaches_real_outbound_and_returns_every_byte() {
         owner.run().await.unwrap();
         drop(endpoints);
         drop(scope);
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(projection);
         assert_eq!(budget.used(), 0);
     })
     .await
@@ -929,4 +932,116 @@ async fn queued_udp_owner_is_exactly_retired_on_close_and_not_created_on_queue_r
     })
     .await
     .expect("closing queued UDP joins the original lease retirement");
+}
+
+#[tokio::test]
+async fn admitted_udp_keeps_route_after_fact_withdrawal() {
+    use crate::dns::projection::{ProjectionObservation, RoutingProjectionSnapshot};
+    use honk_outbound::alive::IpVersion;
+
+    tokio::time::timeout(Duration::from_secs(15), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, scope_owner) = scope(&budget);
+        let config = honk_config::parser::parse_dae_config(
+            "routing { domain(suffix: admitted.test) -> direct\n fallback: block }",
+        )
+        .unwrap();
+        let (plane, _health) = local_plane_with(|current| current.routing = config.routing).await;
+        let projection = plane.dns_controller.routing_projection();
+        let current = {
+            let router = plane.router.write().await;
+            let generation = plane.diagnostics.read().generation.checked_add(1).unwrap();
+            let current = Arc::new(RoutingProjectionSnapshot::new(
+                generation,
+                Arc::new(router.clone()),
+            ));
+            plane.diagnostics.write().generation = generation;
+            plane
+                .dns_controller
+                .prepare_projection_publication()
+                .commit(Arc::clone(&current), None);
+            current
+        };
+        let handle = plane.spawn_handle();
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 1)
+            .await
+            .unwrap();
+        let owner = tokio::spawn(owner.run());
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let source = "192.0.2.10:41000".parse().unwrap();
+        let destination = upstream.local_addr().unwrap();
+        projection.submit(
+            scope.scope(),
+            Arc::clone(&current),
+            ProjectionObservation::Positive {
+                domain: "admitted.test",
+                family: IpVersion::V4,
+                ips: &[destination.ip()],
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            },
+        );
+        let mut snapshot = handle
+            .prepare_packet_routing_snapshot(
+                scope.scope(),
+                source,
+                destination,
+                "udp",
+                0,
+                #[cfg(feature = "native-api")]
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(snapshot.decision.outbound, "direct");
+        snapshot.admission_final = true;
+        let admission = EndpointAdmission::new(snapshot, &budget).unwrap();
+        projection.submit(
+            scope.scope(),
+            current,
+            ProjectionObservation::Clear {
+                domain: "admitted.test",
+                family: IpVersion::V4,
+            },
+        );
+        let fresh = handle
+            .prepare_packet_routing_snapshot(
+                scope.scope(),
+                source,
+                destination,
+                "udp",
+                0,
+                #[cfg(feature = "native-api")]
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.decision.outbound, "block");
+        drop(fresh);
+        let mut packet = [0; 128];
+        let length = wire::udp::emit_packet(&mut packet, source, destination, b"admitted").unwrap();
+        endpoints
+            .receive_admitted_with_source(
+                scope.scope(),
+                &packet[..length],
+                Instant::now(),
+                admission,
+                false,
+                |_, _| true,
+            )
+            .unwrap();
+        assert!(endpoints.retains(scope.scope(), source, destination, 17));
+        let mut bytes = [0; 32];
+        let (length, _) = upstream.recv_from(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..length], b"admitted");
+        endpoints.shutdown().await.unwrap();
+        owner.await.unwrap().unwrap();
+        drop(endpoints);
+        drop(scope);
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(handle);
+        drop(projection);
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("already committed UDP must not be re-decided after fact withdrawal");
 }

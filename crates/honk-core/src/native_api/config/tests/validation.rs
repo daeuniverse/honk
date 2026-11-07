@@ -364,8 +364,6 @@ async fn xdp_policy_rejection_preserves_files_database_and_runtime() {
             "!pname(browser) -> direct",
             "mac(02:00:00:00:00:01) -> direct",
             "!mac(02:00:00:00:00:01) -> direct",
-            "domain(example.com) -> direct",
-            "!domain(example.com) -> direct",
         ]
         .into_iter()
         .map(|rule| original.replace("fallback: direct", &format!("{rule}\n fallback: direct")))
@@ -433,6 +431,15 @@ async fn xdp_policy_rejection_preserves_files_database_and_runtime() {
                 std::fs::write(tree.join("main.dae"), original).unwrap();
             }
             assert_eq!(fixture.reloads.load(Ordering::SeqCst), 0);
+        }
+        for rule in [
+            "domain(example.com) -> direct",
+            "!domain(example.com) -> direct",
+        ] {
+            let candidate =
+                original.replace("fallback: direct", &format!("{rule}\n fallback: direct"));
+            let full = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
+            assert_eq!(full["valid"], true, "{full}");
         }
         let endpoint = original
             .replace("direct: core", "direct: endpoint")
@@ -562,6 +569,31 @@ async fn xdp_device_changes_reject_before_persistence_but_effective_mode_and_pol
         .await;
         assert_eq!(trace["evaluations"][0]["outbound"], "block");
         assert_eq!(fixture.reloads.load(Ordering::SeqCst), 2);
+        fixture.shutdown().await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn xdp_core_domain_rules_pass_public_configuration_activation() {
+    for database in [false, true] {
+        let fixture = xdp_fixture(database).await;
+        let original = &fixture.originals["main.dae"];
+        let before = fixture.get(CONFIG).await;
+        let main = source(&before, original);
+        let candidate = original.replace(
+            "fallback: direct",
+            "domain(example.com) -> block\n fallback: direct",
+        );
+        let full = ok(fixture.validate("full", &candidate).send().await.unwrap()).await;
+        assert_eq!(full["valid"], true, "{full}");
+        let operation = accepted(fixture.replace(main, &candidate).send().await.unwrap()).await;
+        let terminal = fixture.terminal(&operation).await;
+        assert_eq!(terminal["status"], "succeeded", "{terminal}");
+        let after = fixture.get(CONFIG).await;
+        assert_ne!(after["revision"], before["revision"]);
+        assert_eq!(source(&after, &candidate)["id"], main["id"]);
+        assert_eq!(fixture.reloads.load(Ordering::SeqCst), 1);
         fixture.shutdown().await;
     }
 }

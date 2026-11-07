@@ -459,7 +459,7 @@ write_config() {
         postrouting { sip(192.0.2.2) -> $action }
     }"
     fi
-    if [[ ${4:-} == endpoint ]]; then
+    if [[ ${4:-} == endpoint || ${4:-} == core ]]; then
         dns="dns {
     bind: ''
     optimistic_cache_ttl: 0
@@ -672,8 +672,8 @@ PY
     wait "$server_pid"
     server_pid=
     for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
-    if [[ $profile == endpoint ]]; then
-        python3 "$HONK_XDP_PROBE" domain | tee "$work/$profile.domain-routing.log"
+    if [[ $profile == endpoint || $profile == core ]]; then
+        python3 "$HONK_XDP_PROBE" domain "$profile" | tee "$work/$profile.domain-routing.log"
     fi
     if [[ $profile == snat || $profile == masquerade ]]; then
         ip netns exec server cat /proc/net/tcp >"$work/$profile.server-tcp.txt"

@@ -110,6 +110,7 @@ fn insert_bounded(
     zero_ips: &mut BTreeSet<ProjectionIp>,
     ip: ProjectionIp,
     bitmap: DomainRouting,
+    before_evict: impl FnOnce(ProjectionIp),
 ) -> Option<ProjectionIp> {
     entries.insert(ip, bitmap);
     if bitmap.bitmap == [0; 8] {
@@ -127,6 +128,7 @@ fn insert_bounded(
         None
     };
     if let Some(evicted) = evicted {
+        before_evict(evicted);
         entries.remove(&evicted);
         zero_ips.remove(&evicted);
     }
@@ -174,6 +176,35 @@ pub(super) struct DeadlineEntry {
     pub(super) sequence: u64,
 }
 
+#[derive(Debug)]
+pub(super) struct PacketFactScope {
+    scope: u64,
+    revision: u64,
+}
+
+impl PacketFactScope {
+    pub(super) fn new(scope: ScopeId) -> Self {
+        Self {
+            scope: scope.as_u64(),
+            revision: 0,
+        }
+    }
+}
+
+fn advance_revision(scopes: &mut [PacketFactScope], scope: u64) {
+    if let Some(entry) = scopes.iter_mut().find(|entry| entry.scope == scope)
+        && entry.revision != u64::MAX
+    {
+        entry.revision += 1;
+        if entry.revision == u64::MAX {
+            tracing::error!(
+                scope,
+                "packet DNS fact revision exhausted; fact-dependent Core decisions now drop"
+            );
+        }
+    }
+}
+
 pub(super) struct DesiredState {
     pub(super) capacity: usize,
     pub(super) sequence: u64,
@@ -192,6 +223,9 @@ pub(super) struct DesiredState {
     /// Advances whenever an owner is added, removed, re-keyed or rebuilt, so
     /// cache-hit hints can detect owner changes without taking the state lock.
     pub(super) structure: Arc<AtomicU64>,
+    /// Set once: removing the table would allow a retained stamp's revision to be reissued.
+    packet_scopes: Box<[PacketFactScope]>,
+    _packet_scope_charge: Option<honk_netstack::MemoryReservation>,
 }
 
 impl DesiredState {
@@ -211,7 +245,90 @@ impl DesiredState {
             expiry_deadlines: BinaryHeap::new(),
             eviction_order: BinaryHeap::new(),
             structure: Arc::new(AtomicU64::new(0)),
+            packet_scopes: Box::default(),
+            _packet_scope_charge: None,
         }
+    }
+
+    pub(super) fn register_packet_scopes(
+        &mut self,
+        scopes: Box<[PacketFactScope]>,
+        charge: honk_netstack::MemoryReservation,
+    ) -> anyhow::Result<()> {
+        if !self.packet_scopes.is_empty() {
+            // Parameters otherwise drop the charge before the rejected table.
+            drop(scopes);
+            anyhow::bail!("packet DNS scopes are already registered");
+        }
+        self.packet_scopes = scopes;
+        self._packet_scope_charge = Some(charge);
+        Ok(())
+    }
+
+    pub(super) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
+        scope != ScopeId::HOST
+            && self
+                .packet_scopes
+                .iter()
+                .any(|entry| entry.scope == scope.as_u64())
+    }
+
+    pub(super) fn packet_fact(
+        &mut self,
+        scope: ScopeId,
+        ip: IpAddr,
+        now: Instant,
+    ) -> anyhow::Result<(Option<DomainRouting>, super::FactStamp)> {
+        self.expire(now);
+        let revision = self
+            .packet_scopes
+            .iter()
+            .find(|entry| entry.scope == scope.as_u64())
+            .map(|entry| entry.revision)
+            .ok_or_else(|| anyhow::anyhow!("packet DNS fact scope is not registered"))?;
+        anyhow::ensure!(
+            revision != u64::MAX,
+            "packet DNS fact revision is exhausted"
+        );
+        let key = ProjectionIp::new(scope, ip);
+        let expires_at = self
+            .reverse
+            .get(&key)
+            .into_iter()
+            .flat_map(|owners| &owners.members)
+            .filter_map(|(domain, family)| {
+                self.owners[*family]
+                    .get(&key.scope)
+                    .and_then(|owners| owners.get(domain))
+                    .map(|owner| owner.expires_at)
+            })
+            .min();
+        Ok((
+            self.desired.get(&key).copied(),
+            super::FactStamp {
+                scope,
+                revision,
+                expires_at,
+            },
+        ))
+    }
+
+    pub(super) fn fact_is_current(&mut self, stamp: super::FactStamp, now: Instant) -> bool {
+        self.expire(now);
+        stamp.revision != u64::MAX
+            && self.packet_scopes.iter().any(|entry| {
+                entry.scope == stamp.scope.as_u64() && entry.revision == stamp.revision
+            })
+            && stamp.is_unexpired_at(now)
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_packet_fact_revision_for_test(&mut self, scope: ScopeId, revision: u64) {
+        self.packet_scopes
+            .iter_mut()
+            .find(|entry| entry.scope == scope.as_u64())
+            .expect("registered test scope")
+            .revision = revision;
     }
 
     pub(super) fn update_snapshot(&mut self, snapshot: &Arc<RoutingProjectionSnapshot>) -> bool {
@@ -298,6 +415,9 @@ impl DesiredState {
                 .expect("refreshed projection owner disappeared");
             let key = Arc::clone(key);
             let shortened = expires_at < owner.expires_at;
+            if shortened {
+                advance_revision(&mut self.packet_scopes, scope);
+            }
             let owner = self.owners[family]
                 .get_mut(&scope)
                 .expect("refreshed projection scope disappeared")
@@ -324,6 +444,7 @@ impl DesiredState {
             .iter()
             .map(|ip| ip.to_canonical())
             .collect::<BTreeSet<_>>();
+        advance_revision(&mut self.packet_scopes, scope);
         self.structure.fetch_add(1, Ordering::Release);
         let existing = self.owners[family]
             .get(&scope)
@@ -469,9 +590,13 @@ impl DesiredState {
         let Some(owners) = self.owners[family].get_mut(&scope) else {
             return;
         };
-        let Some((owner_key, owner)) = owners.remove_entry(domain) else {
+        if !owners.contains_key(domain) {
             return;
-        };
+        }
+        advance_revision(&mut self.packet_scopes, scope);
+        let (owner_key, owner) = owners
+            .remove_entry(domain)
+            .expect("existing projection owner");
         if owners.is_empty() {
             self.owners[family].remove(&scope);
         }
@@ -503,7 +628,9 @@ impl DesiredState {
                 continue;
             }
             let evicted = if let Some(next) = next {
-                insert_bounded(&mut self.desired, &mut self.zero_ips, ip, next)
+                insert_bounded(&mut self.desired, &mut self.zero_ips, ip, next, |victim| {
+                    advance_revision(&mut self.packet_scopes, victim.scope);
+                })
             } else {
                 self.desired.remove(&ip);
                 self.zero_ips.remove(&ip);
@@ -527,6 +654,10 @@ impl DesiredState {
     }
 
     pub(super) fn rebuild_all(&mut self) {
+        for entry in &mut self.packet_scopes {
+            let scope = entry.scope;
+            advance_revision(std::slice::from_mut(entry), scope);
+        }
         self.structure.fetch_add(1, Ordering::Release);
         self.refresh_owner_bitmaps();
         let desired = self.project_by(IpOwners::aggregate);
@@ -669,7 +800,7 @@ impl DesiredState {
         let mut zero_ips = BTreeSet::new();
         for (ip, owners) in &self.reverse {
             if let Some(bitmap) = aggregate(owners) {
-                insert_bounded(&mut entries, &mut zero_ips, *ip, bitmap);
+                insert_bounded(&mut entries, &mut zero_ips, *ip, bitmap, |_| {});
             }
         }
         entries

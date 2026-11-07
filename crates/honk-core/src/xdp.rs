@@ -4,8 +4,8 @@
 use crate::control::{
     ControlPlane,
     core_forward::{
-        CachedDecision, Decision, Execution, GeneratedError, PolicyGeneration, PolicyRead,
-        Requirements, RoutedCore, socket_namespace,
+        CachedDecision, Decision, Execution, GeneratedError, IngressBinding, PolicyGeneration,
+        PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{OutputLease, PacketDriver, PacketScope, RuntimeLimits},
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints},
@@ -85,21 +85,6 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
                 && condition.not.mac.is_empty(),
             "XDP Endpoint routing has no process/socket or per-flow MAC authority; predicate admission refused"
         );
-        if datapath.direct == Some(DirectProfile::Core) {
-            ensure!(
-                condition.domain.is_empty()
-                    && condition.domain_suffix.is_empty()
-                    && condition.domain_keyword.is_empty()
-                    && condition.domain_regex.is_empty()
-                    && condition.geosite.is_empty()
-                    && condition.not.domain.is_empty()
-                    && condition.not.domain_suffix.is_empty()
-                    && condition.not.domain_keyword.is_empty()
-                    && condition.not.domain_regex.is_empty()
-                    && condition.not.geosite.is_empty(),
-                "Core Direct requires final IP routing; domain/sniff policy requires direct: endpoint"
-            );
-        }
     }
     let security_conditions = datapath
         .firewall
@@ -1846,7 +1831,7 @@ async fn prepare(
                         + size_of::<PacketDriver>()
                         + size_of::<(PacketScope, crate::control::netstack::PacketOwner)>()
                         + size_of::<Ingress>()
-                        + size_of::<(Ingress, honk_config::datapath::InterfaceRole)>())
+                        + size_of::<IngressBinding>())
                 + infos.len() * size_of::<Device>()
                 + infos
                     .iter()
@@ -1959,11 +1944,15 @@ async fn prepare(
             },
             Arc::clone(&budget),
         )?;
-        let roles: Vec<_> = realms
+        let bindings: Vec<_> = realms
             .iter()
-            .map(|(ingress, device, ..)| (*ingress, datapath.interfaces[*device].role))
+            .map(|(ingress, device, _, facts)| IngressBinding {
+                ingress: *ingress,
+                role: datapath.interfaces[*device].role,
+                facts: *facts,
+            })
             .collect();
-        core.set_ingress_roles(&roles)?;
+        core.set_ingress_bindings(&bindings)?;
         Some(core)
     } else {
         None

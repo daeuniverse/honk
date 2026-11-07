@@ -9,17 +9,20 @@ use super::connection::{
     routing::{PacketRoutingSnapshot, RoutingDecision},
 };
 pub use super::packet_endpoint::EndpointAdmission;
+use crate::dns::projection::{FactStamp, PacketFacts, RoutingProjection};
 use crate::{
     netlink::fib::{Fib, Resolution},
     routing::PredicateInput,
 };
 use honk_config::{datapath::InterfaceRole, firewall::FirewallVerdict, routing::RoutingConfig};
 use honk_datapath::{
+    ScopeId,
     firewall::{self, Admission, EgressAddress, Facts, Firewall, SourceNat},
     forward::{
         CoreForward, ForwardError, Ingress, MarkProvenance, Packet, Prepared, Route, RouteQuery,
     },
 };
+use honk_ebpf_common::DomainRouting;
 use honk_netstack::{MemoryBudget, MemoryReservation, transit::TransitError};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -70,6 +73,22 @@ pub(super) fn validate_config(config: &honk_config::Config) -> anyhow::Result<()
         config.global.dial_mode == "ip",
         "routed-only CoreForward requires dial_mode ip"
     );
+    anyhow::ensure!(
+        config.routing.rules.iter().all(|rule| {
+            let condition = &rule.condition;
+            condition.domain.is_empty()
+                && condition.domain_suffix.is_empty()
+                && condition.domain_keyword.is_empty()
+                && condition.domain_regex.is_empty()
+                && condition.geosite.is_empty()
+                && condition.not.domain.is_empty()
+                && condition.not.domain_suffix.is_empty()
+                && condition.not.domain_keyword.is_empty()
+                && condition.not.domain_regex.is_empty()
+                && condition.not.geosite.is_empty()
+        }),
+        "routed-only CoreForward has no packet DNS fact scope; domain predicates are unbacked"
+    );
     validate_policy(&config.routing)
 }
 
@@ -86,8 +105,7 @@ fn validate_policy(config: &RoutingConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Conservative final-Direct profile: reject inputs that require unresolved socket/domain
-/// facts rather than silently changing their execution owner to a relay.
+/// Final-Direct profile backed by packet DNS facts, without socket/process authority.
 pub fn validate_mixed(
     config: &honk_config::Config,
     router: &crate::routing::Router,
@@ -99,12 +117,11 @@ pub fn validate_mixed(
             && router
                 .compiled_routes()
                 .iter()
-                .all(|route| !route.has_domain_conditions()
-                    && route.conditions.iter().all(|condition| !matches!(
-                        condition.predicate,
-                        crate::routing::CompiledPredicate::Mac(_)
-                    ))),
-        "mixed Core/Endpoint requires ip mode and no domain/process/MAC/marked routing; select Endpoint for that policy"
+                .all(|route| route.conditions.iter().all(|condition| !matches!(
+                    condition.predicate,
+                    crate::routing::CompiledPredicate::Mac(_)
+                ))),
+        "mixed Core/Endpoint requires ip mode and no process/MAC/marked routing; select Endpoint for that policy"
     );
     Ok(())
 }
@@ -120,6 +137,7 @@ fn route_action<'a>(
     router: &'a crate::routing::Router,
     query: RouteQuery,
     source_mac: Option<&str>,
+    bitmap: Option<&DomainRouting>,
 ) -> Option<&'a crate::routing::RouteAction> {
     let protocol = match query.protocol {
         6 => "tcp",
@@ -128,17 +146,20 @@ fn route_action<'a>(
         58 => "icmpv6",
         _ => return None,
     };
-    Some(router.route_input(PredicateInput {
-        domain: None,
-        dst_ip: Some(query.destination),
-        dst_port: query.ports.map(|ports| ports.1),
-        src_ip: Some(query.source),
-        src_port: query.ports.map(|ports| ports.0),
-        protocol,
-        process_name: None,
-        mac: source_mac,
-        dscp: Some(query.traffic_class >> 2),
-    }))
+    Some(router.route_input(
+        PredicateInput {
+            domain: None,
+            dst_ip: Some(query.destination),
+            dst_port: query.ports.map(|ports| ports.1),
+            src_ip: Some(query.source),
+            src_port: query.ports.map(|ports| ports.0),
+            protocol,
+            process_name: None,
+            mac: source_mac,
+            dscp: Some(query.traffic_class >> 2),
+        },
+        bitmap,
+    ))
 }
 
 fn disposition(
@@ -167,11 +188,26 @@ fn disposition(
     }
 }
 
-/// Both traffic policy and transient mode publication must still match at submission.
+/// Policy publications and any scoped DNS fact basis retained until the writer commits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyGeneration {
     routing: u64,
     mode: u64,
+    facts: Option<FactStamp>,
+}
+
+impl PolicyGeneration {
+    fn same_policy(self, other: Self) -> bool {
+        self.routing == other.routing && self.mode == other.mode
+    }
+}
+
+/// Immutable ingress role and packet-DNS realm; the forwarding scope is not a fact scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IngressBinding {
+    pub ingress: Ingress,
+    pub role: InterfaceRole,
+    pub facts: ScopeId,
 }
 
 struct Cached {
@@ -211,6 +247,7 @@ struct Registration {
     mode_state: Option<crate::mode::SharedModeState>,
     group_manager: crate::group::SharedGroupManager,
     runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
+    projection: Arc<RoutingProjection>,
     #[cfg(feature = "native-api")]
     native: Option<Arc<crate::observe::Observation>>,
 }
@@ -224,6 +261,7 @@ impl RoutingAuthority {
         PolicyGeneration {
             routing: self.0.diagnostics.read().generation,
             mode: mode.map_or(0, crate::mode::ModeState::revision),
+            facts: None,
         }
     }
 
@@ -293,6 +331,7 @@ impl ControlPlane {
             mode_state: self.mode_state.clone(),
             group_manager: self.group_manager.clone(),
             runtime_registry: self.runtime_registry.clone(),
+            projection: self.dns_controller.routing_projection(),
             #[cfg(feature = "native-api")]
             native: self.native.clone(),
         })))
@@ -348,11 +387,13 @@ pub struct RoutedCore {
     address_generation: u64,
     firewall: Firewall,
     budget: Arc<MemoryBudget>,
-    ingress_roles: Vec<(Ingress, InterfaceRole)>,
+    ingress_bindings: Vec<IngressBinding>,
     reassembly_outputs: Arc<reassembly::Outputs>,
     pending_reassembly_error: Option<reassembly::Pending>,
     reassembly_poll_pending: bool,
     counters: RefusalCounters,
+    #[cfg(test)]
+    after_fact_read: Option<Box<dyn FnOnce() + Send>>,
     _role_charge: MemoryReservation,
     _charge: MemoryReservation,
 }
@@ -394,8 +435,8 @@ impl RoutedCore {
             .reserve(1024 * size_of::<Cached>())
             .ok_or_else(|| anyhow::anyhow!("route cache budget exhausted"))?;
         let role_charge = budget
-            .reserve(ingresses.len() * size_of::<(Ingress, InterfaceRole)>())
-            .ok_or_else(|| anyhow::anyhow!("ingress role budget exhausted"))?;
+            .reserve(ingresses.len() * size_of::<IngressBinding>())
+            .ok_or_else(|| anyhow::anyhow!("ingress binding budget exhausted"))?;
         let reassembly_outputs = reassembly::Outputs::new(&budget)?;
         let firewall = Firewall::new_history(Arc::clone(&budget), 1024, 0)?;
         Ok(Self {
@@ -406,11 +447,13 @@ impl RoutedCore {
             routes: Vec::with_capacity(1024),
             firewall,
             budget,
-            ingress_roles: Vec::with_capacity(ingresses.len()),
+            ingress_bindings: Vec::with_capacity(ingresses.len()),
             reassembly_outputs,
             pending_reassembly_error: None,
             reassembly_poll_pending: false,
             counters: RefusalCounters::default(),
+            #[cfg(test)]
+            after_fact_read: None,
             _role_charge: role_charge,
             _charge: charge,
         })
@@ -432,24 +475,44 @@ impl RoutedCore {
         }
     }
 
-    pub fn set_ingress_roles(&mut self, roles: &[(Ingress, InterfaceRole)]) -> anyhow::Result<()> {
+    pub fn set_ingress_bindings(&mut self, bindings: &[IngressBinding]) -> anyhow::Result<()> {
         anyhow::ensure!(
-            self.ingress_roles.is_empty(),
-            "ingress roles are immutable after installation"
+            self.ingress_bindings.is_empty(),
+            "ingress bindings are immutable after installation"
         );
         anyhow::ensure!(
-            roles.len() == self.core.ingresses().len()
-                && roles.iter().enumerate().all(|(index, (identity, _))| self
-                    .core
-                    .ingresses()
-                    .any(|registered| registered == *identity)
-                    && roles[..index]
-                        .iter()
-                        .all(|(previous, _)| previous != identity)),
-            "roles must cover every exact registered ingress once"
+            bindings.len() == self.core.ingresses().len()
+                && bindings.iter().enumerate().all(|(index, binding)| {
+                    binding.facts != ScopeId::HOST
+                        && self
+                            .core
+                            .ingresses()
+                            .any(|registered| registered == binding.ingress)
+                        && bindings[..index]
+                            .iter()
+                            .all(|previous| previous.ingress != binding.ingress)
+                }),
+            "bindings must cover every exact registered ingress once with a non-HOST fact scope"
         );
-        self.ingress_roles.extend_from_slice(roles);
+        self.ingress_bindings.extend_from_slice(bindings);
         Ok(())
+    }
+
+    fn read_facts(
+        &self,
+        facts: &mut PacketFacts<'_>,
+        router: &crate::routing::Router,
+        ingress: Ingress,
+        destination: std::net::IpAddr,
+        generation: u64,
+    ) -> anyhow::Result<(Option<DomainRouting>, FactStamp)> {
+        let scope = self
+            .ingress_bindings
+            .iter()
+            .find(|binding| binding.ingress == ingress)
+            .map(|binding| binding.facts)
+            .ok_or_else(|| anyhow::anyhow!("Core ingress has no packet DNS fact scope"))?;
+        facts.lookup(scope, destination, router, generation)
     }
 
     pub fn state(&self) -> FibState {
@@ -523,6 +586,7 @@ impl RoutedCore {
 
     /// Borrowed RX -> reserved TX, with no whole-packet staging. Cold means retain the
     /// necessary bytes and use decide(); publication contention never invents a decision.
+    /// A fact-dependent callback holds DNS mutation serialization and must not re-enter it.
     pub fn forward_cached<'a, T>(
         &mut self,
         ingress: Ingress,
@@ -561,7 +625,27 @@ impl RoutedCore {
             Err(_) => return Ok(CachedDecision::Drop),
         };
         let query = input.query();
-        let Some(action) = route_action(&router, query, source_mac) else {
+        let generation = self.authority.0.diagnostics.read().generation;
+        let mut facts = None;
+        let bitmap = if router.domain_predicate_count() != 0 {
+            let Some(mut guard) = self.authority.0.projection.try_packet_facts() else {
+                return Ok(CachedDecision::Cold);
+            };
+            let Ok((bitmap, stamp)) =
+                self.read_facts(&mut guard, &router, ingress, query.destination, generation)
+            else {
+                return Ok(CachedDecision::Drop);
+            };
+            facts = Some((guard, stamp));
+            bitmap
+        } else {
+            None
+        };
+        #[cfg(test)]
+        if let Some(hook) = self.after_fact_read.take() {
+            hook();
+        }
+        let Some(action) = route_action(&router, query, source_mac, bitmap.as_ref()) else {
             return Ok(CachedDecision::Drop);
         };
         if !action.must
@@ -615,7 +699,6 @@ impl RoutedCore {
         else {
             return Ok(CachedDecision::Cold);
         };
-        let generation = self.authority.0.diagnostics.read().generation;
         let mut output = match self.core.prepare_view(input, route, generation, now) {
             Ok(Some(output)) => output,
             Ok(None) => return Ok(CachedDecision::Cold),
@@ -644,8 +727,16 @@ impl RoutedCore {
                 }
             }
         }
+        if let Some((_, stamp)) = &facts
+            && !stamp.is_unexpired_at(tokio::time::Instant::now())
+        {
+            return Ok(CachedDecision::Drop);
+        }
+        // ponytail: one projection mutex spans fact-dependent cached TX; split per scope
+        // only if measured DNS/Core contention requires it.
         let result = submit(route, &mut output)
             .map(|result| result.map_or(CachedDecision::Drop, CachedDecision::Forwarded));
+        drop(facts);
         drop(mode);
         result
     }
@@ -679,8 +770,30 @@ impl RoutedCore {
                     native.catalog.snapshot(),
                 )
             });
-            let generation = self.authority.generation(mode_state.as_deref());
-            let Some(action) = route_action(router, packet.query(), source_mac) else {
+            let mut generation = self.authority.generation(mode_state.as_deref());
+            let fact = if router.domain_predicate_count() != 0 {
+                let mut facts = self.authority.0.projection.packet_facts();
+                match self.read_facts(
+                    &mut facts,
+                    router,
+                    packet.query().ingress,
+                    packet.query().destination,
+                    generation.routing,
+                ) {
+                    Ok(fact) => Some(fact),
+                    Err(_) => return Ok(Decision::Drop),
+                }
+            } else {
+                None
+            };
+            #[cfg(test)]
+            if let Some(hook) = self.after_fact_read.take() {
+                hook();
+            }
+            generation.facts = fact.map(|(_, stamp)| stamp);
+            let bitmap = fact.and_then(|(bitmap, _)| bitmap);
+            let Some(action) = route_action(router, packet.query(), source_mac, bitmap.as_ref())
+            else {
                 return Ok(Decision::Drop);
             };
             let mode = mode_decision(
@@ -723,7 +836,7 @@ impl RoutedCore {
                     decision: RoutingDecision::from_router(
                         router,
                         &input,
-                        None,
+                        bitmap.as_ref(),
                         #[cfg(feature = "native-api")]
                         self.authority
                             .0
@@ -744,6 +857,12 @@ impl RoutedCore {
             } else {
                 None
             };
+            if admission.is_some()
+                && let Some((_, stamp)) = fact
+                && !self.authority.0.projection.packet_facts().is_current(stamp)
+            {
+                return Ok(Decision::Wait(packet));
+            }
             (
                 generation,
                 router.security_epoch(),
@@ -820,10 +939,10 @@ impl RoutedCore {
         }
         let ingress = packet.query().ingress;
         let zone = self
-            .ingress_roles
+            .ingress_bindings
             .iter()
-            .find(|(identity, _)| *identity == ingress)
-            .map(|(_, role)| *role);
+            .find(|binding| binding.ingress == ingress)
+            .map(|binding| binding.role);
         let mut dnat = None;
         let before = if let Some(binding) = &binding {
             Some(binding.before_route())
@@ -1069,6 +1188,7 @@ impl RoutedCore {
     /// Run inside the actual policy publication readers AND the provider owner through
     /// descriptor submission. A rejected fence must dispose output, not replay decremented bytes.
     /// The callback rechecks its packet/lease after expiration; `None` disposes stale output.
+    /// Fact-dependent callbacks also hold DNS mutation serialization; do not re-enter policy/DNS.
     pub fn submit<T>(
         &mut self,
         read: &PolicyRead<'_>,
@@ -1097,10 +1217,21 @@ impl RoutedCore {
             self.fib.address_generation(),
         );
         let current_policy = self.authority.generation(mode.as_deref());
-        if !self.authority.admitting() || current_policy != generation || !current? {
+        if !self.authority.admitting() || !current_policy.same_policy(generation) || !current? {
             return Ok(None);
         }
+        let facts = match generation.facts {
+            Some(stamp) => {
+                let mut facts = self.authority.0.projection.packet_facts();
+                if !facts.is_current(stamp) {
+                    return Ok(None);
+                }
+                Some(facts)
+            }
+            None => None,
+        };
         let result = submit();
+        drop(facts);
         drop(mode);
         result
     }

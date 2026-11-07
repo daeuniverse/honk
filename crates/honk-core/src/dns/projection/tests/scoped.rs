@@ -292,3 +292,351 @@ async fn scoped_families_share_canonical_ips_without_sharing_withdrawal_or_ttl()
     assert!(state.dirty_ips.is_empty());
     assert!(state.retries.is_empty());
 }
+
+fn fact_snapshot(generation: u64) -> Arc<RoutingProjectionSnapshot> {
+    let config = honk_config::parser::parse_dae_config(
+        "routing { domain(suffix: test) -> block\n fallback: direct }",
+    )
+    .unwrap();
+    Arc::new(RoutingProjectionSnapshot::new(
+        generation,
+        Arc::new(Router::from_config(&config.routing).unwrap()),
+    ))
+}
+
+fn registered_projection(
+    current: &Arc<RoutingProjectionSnapshot>,
+    scopes: &[ScopeId],
+) -> TestProjection {
+    let result = projection_for_test(Arc::clone(current));
+    result
+        .0
+        .register_packet_scopes(
+            scopes.iter().copied(),
+            &honk_netstack::MemoryBudget::new(4096),
+        )
+        .unwrap();
+    result
+}
+
+fn stamp(
+    projection: &RoutingProjection,
+    current: &RoutingProjectionSnapshot,
+    scope: ScopeId,
+    ip: IpAddr,
+) -> super::super::FactStamp {
+    projection
+        .packet_facts()
+        .lookup(scope, ip, &current.matcher, current.generation())
+        .unwrap()
+        .1
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_cache_hit_shortening_is_applied_exactly() {
+    let current = fact_snapshot(1);
+    let (projection, _receiver, _backend) = projection_for_test(Arc::clone(&current));
+    let scope = ScopeId::allocate().unwrap();
+    let ips = ["192.0.2.1".parse().unwrap()];
+    let now = tokio::time::Instant::now();
+    for ttl in [Duration::from_secs(2), Duration::from_millis(1500)] {
+        assert!(projection.try_submit_cache_hit(
+            scope,
+            &current,
+            "a.test",
+            IpVersion::V4,
+            &ips,
+            now + ttl
+        ));
+    }
+    tokio::time::advance(Duration::from_millis(1600)).await;
+    assert!(
+        projection
+            .packet_bitmap(scope, ips[0], &current.matcher, 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_fact_revision_follows_owner_withdrawal_not_bitmap_equality() {
+    for mutation in ["clear", "aba", "insert", "replace", "expire"] {
+        let current = fact_snapshot(1);
+        let scope = ScopeId::allocate().unwrap();
+        let (projection, _receiver, _backend) = registered_projection(&current, &[scope]);
+        let x = "192.0.2.1".parse().unwrap();
+        let y = "192.0.2.2".parse().unwrap();
+        let now = tokio::time::Instant::now();
+        projection.submit(
+            scope,
+            Arc::clone(&current),
+            positive("a.test", &[x], now + Duration::from_secs(2)),
+        );
+        projection.submit(
+            scope,
+            Arc::clone(&current),
+            positive("b.test", &[x], now + Duration::from_secs(30)),
+        );
+        let expected = projection
+            .packet_bitmap(scope, x, &current.matcher, 1)
+            .unwrap();
+        let old = stamp(
+            &projection,
+            &current,
+            scope,
+            if mutation == "insert" { y } else { x },
+        );
+        match mutation {
+            "clear" => projection.submit(scope, Arc::clone(&current), clear_v4("a.test")),
+            "aba" => {
+                projection.submit(scope, Arc::clone(&current), clear_v4("a.test"));
+                projection.submit(
+                    scope,
+                    Arc::clone(&current),
+                    positive("a.test", &[x], now + Duration::from_secs(2)),
+                );
+            }
+            "insert" => projection.submit(
+                scope,
+                Arc::clone(&current),
+                positive("c.test", &[y], now + Duration::from_secs(30)),
+            ),
+            "replace" => projection.submit(
+                scope,
+                Arc::clone(&current),
+                positive("a.test", &[y], now + Duration::from_secs(2)),
+            ),
+            "expire" => tokio::time::advance(Duration::from_secs(3)).await,
+            _ => unreachable!(),
+        }
+        assert!(!projection.packet_facts().is_current(old), "{mutation}");
+        assert_eq!(
+            projection
+                .packet_bitmap(scope, x, &current.matcher, 1)
+                .unwrap(),
+            expected,
+            "{mutation}"
+        );
+        let fresh = stamp(&projection, &current, scope, x);
+        assert!(projection.packet_facts().is_current(fresh), "{mutation}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_fact_stamp_keeps_original_expiry() {
+    for mutation in ["shorten", "extend", "equal"] {
+        let current = fact_snapshot(1);
+        let scope = ScopeId::allocate().unwrap();
+        let (projection, _receiver, _backend) = registered_projection(&current, &[scope]);
+        let ip = "192.0.2.1".parse().unwrap();
+        let now = tokio::time::Instant::now();
+        let initial = if mutation == "extend" { 2 } else { 30 };
+        projection.submit(
+            scope,
+            Arc::clone(&current),
+            positive("a.test", &[ip], now + Duration::from_secs(initial)),
+        );
+        projection.submit(
+            scope,
+            Arc::clone(&current),
+            positive("b.test", &[ip], now + Duration::from_secs(30)),
+        );
+        let expected = projection
+            .packet_bitmap(scope, ip, &current.matcher, 1)
+            .unwrap();
+        let old = stamp(&projection, &current, scope, ip);
+        let refreshed = if mutation == "shorten" { 20 } else { 30 };
+        projection.submit(
+            scope,
+            Arc::clone(&current),
+            positive("a.test", &[ip], now + Duration::from_secs(refreshed)),
+        );
+        assert_eq!(
+            projection.packet_facts().is_current(old),
+            mutation != "shorten",
+            "{mutation}"
+        );
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert_eq!(
+            projection.packet_facts().is_current(old),
+            mutation == "equal",
+            "{mutation}"
+        );
+        assert_eq!(
+            projection
+                .packet_bitmap(scope, ip, &current.matcher, 1)
+                .unwrap(),
+            expected
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_fact_revocation_follows_its_scope_only() {
+    use super::super::state::IP_CAPACITY;
+    let scopes = std::array::from_fn::<_, 3, _>(|_| ScopeId::allocate().unwrap());
+    let [a, b, c] = scopes;
+    let current = fact_snapshot(1);
+    let now = tokio::time::Instant::now();
+    let x = "192.0.2.1".parse().unwrap();
+    let y = "192.0.2.2".parse().unwrap();
+    let until = now + Duration::from_secs(30);
+    let (projection, _receiver, _backend) = registered_projection(&current, &scopes);
+    projection.submit(a, Arc::clone(&current), positive("a.test", &[x], until));
+    let c_stamp = stamp(&projection, &current, c, x);
+    let a_stamp = stamp(&projection, &current, a, x);
+    projection.submit(b, Arc::clone(&current), positive("b.test", &[x], until));
+    assert!(projection.packet_facts().is_current(a_stamp));
+    for observation in [
+        positive("a.test", std::slice::from_ref(&y), until),
+        clear_v4("a.test"),
+    ] {
+        let old = stamp(&projection, &current, a, x);
+        projection.submit(a, Arc::clone(&current), observation);
+        assert!(!projection.packet_facts().is_current(old));
+        assert!(projection.packet_facts().is_current(c_stamp));
+    }
+
+    let (projection, _receiver, _backend) = registered_projection(&current, &scopes);
+    projection.state.lock().capacity = 3;
+    projection.submit(a, Arc::clone(&current), positive("a.test", &[x], until));
+    projection.submit(a, Arc::clone(&current), positive("b.test", &[x], until));
+    projection.submit(c, Arc::clone(&current), positive("c.test", &[x], until));
+    let a_stamp = stamp(&projection, &current, a, x);
+    let c_stamp = stamp(&projection, &current, c, x);
+    let expected = projection.packet_bitmap(a, x, &current.matcher, 1).unwrap();
+    projection.submit(b, Arc::clone(&current), positive("d.test", &[x], until));
+    assert!(!projection.packet_facts().is_current(a_stamp));
+    assert!(projection.packet_facts().is_current(c_stamp));
+    assert_eq!(
+        projection.packet_bitmap(a, x, &current.matcher, 1).unwrap(),
+        expected
+    );
+
+    let (projection, _receiver, _backend) = registered_projection(&current, &scopes);
+    let highest = IpAddr::V4(Ipv4Addr::from(u32::MAX - 1));
+    projection.submit(
+        a,
+        Arc::clone(&current),
+        positive("a.test", &[highest], until),
+    );
+    let a_stamp = stamp(&projection, &current, a, highest);
+    let c_stamp = stamp(&projection, &current, c, x);
+    let lower = (1..=IP_CAPACITY as u32)
+        .map(|ip| IpAddr::V4(Ipv4Addr::from(ip)))
+        .collect::<Vec<_>>();
+    projection.submit(b, Arc::clone(&current), positive("b.test", &lower, until));
+    assert!(
+        projection
+            .packet_bitmap(a, highest, &current.matcher, 1)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!projection.packet_facts().is_current(a_stamp));
+    assert!(projection.packet_facts().is_current(c_stamp));
+    projection.submit(b, Arc::clone(&current), clear_v4("b.test"));
+    let absent = stamp(&projection, &current, a, highest);
+    projection.submit(
+        a,
+        Arc::clone(&current),
+        positive("a.test", &[highest], until),
+    );
+    assert!(!projection.packet_facts().is_current(absent));
+    assert!(
+        projection
+            .packet_bitmap(a, highest, &current.matcher, 1)
+            .unwrap()
+            .is_some()
+    );
+    assert!(projection.packet_facts().is_current(c_stamp));
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_fact_revision_exhaustion_is_terminal() {
+    let scope = ScopeId::allocate().unwrap();
+    let current = fact_snapshot(1);
+    let (projection, _receiver, _backend) = registered_projection(&current, &[scope]);
+    let ip = "192.0.2.1".parse().unwrap();
+    projection
+        .state
+        .lock()
+        .set_packet_fact_revision_for_test(scope, u64::MAX - 1);
+    let old = stamp(&projection, &current, scope, ip);
+    for observation in [
+        positive(
+            "a.test",
+            std::slice::from_ref(&ip),
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        ),
+        clear_v4("a.test"),
+    ] {
+        projection.submit(scope, Arc::clone(&current), observation);
+        assert!(!projection.packet_facts().is_current(old));
+        assert!(
+            projection
+                .packet_facts()
+                .lookup(scope, ip, &current.matcher, 1)
+                .is_err()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_fact_rebuild_revokes_every_registered_scope() {
+    let scopes = [ScopeId::allocate().unwrap(), ScopeId::allocate().unwrap()];
+    let current = fact_snapshot(1);
+    let (projection, _receiver, _backend) = registered_projection(&current, &scopes);
+    let ip = "192.0.2.1".parse().unwrap();
+    let stamps = scopes.map(|scope| stamp(&projection, &current, scope, ip));
+    let next = fact_snapshot(2);
+    projection
+        .prepare_snapshot_publication()
+        .commit(Arc::clone(&next), None);
+    for (scope, old) in scopes.into_iter().zip(stamps) {
+        assert!(!projection.packet_facts().is_current(old));
+        let fresh = stamp(&projection, &next, scope, ip);
+        assert!(projection.packet_facts().is_current(fresh));
+    }
+}
+
+#[tokio::test]
+async fn packet_scope_registration_is_funded_atomic_and_set_once() {
+    let current = fact_snapshot(1);
+    let scope = ScopeId::allocate().unwrap();
+    for invalid in [vec![], vec![ScopeId::HOST], vec![scope, scope]] {
+        let (projection, _receiver, _backend) = projection_for_test(Arc::clone(&current));
+        let budget = honk_netstack::MemoryBudget::new(4096);
+        assert!(
+            projection
+                .register_packet_scopes(invalid.into_iter(), &budget)
+                .is_err()
+        );
+        assert!(!projection.owns_packet_scope(scope));
+        assert_eq!(budget.used(), 0);
+    }
+    let (projection, _receiver, _backend) = projection_for_test(Arc::clone(&current));
+    let budget = honk_netstack::MemoryBudget::new(4096);
+    let pressure = budget.reserve(budget.limit()).unwrap();
+    assert!(
+        projection
+            .register_packet_scopes([scope].into_iter(), &budget)
+            .is_err()
+    );
+    assert!(!projection.owns_packet_scope(scope));
+    assert_eq!(budget.used(), budget.limit());
+    drop(pressure);
+    projection
+        .register_packet_scopes([scope].into_iter(), &budget)
+        .unwrap();
+    assert!(projection.owns_packet_scope(scope));
+    assert!(budget.used() > 0);
+    let registered = budget.used();
+    assert!(
+        projection
+            .register_packet_scopes([scope].into_iter(), &budget)
+            .is_err()
+    );
+    assert_eq!(budget.used(), registered);
+    drop(projection);
+    assert_eq!(budget.used(), 0);
+}

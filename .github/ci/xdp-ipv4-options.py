@@ -250,7 +250,7 @@ def dns_name_end(message, offset):
         offset += length
 
 
-def domain_peer():
+def domain_peer(profile):
     with contextlib.ExitStack() as owned:
         dns = owned.enter_context(socket.socket(socket.AF_INET, socket.SOCK_DGRAM))
         dns.bind(('10.77.0.2', 15353))
@@ -283,8 +283,11 @@ def domain_peer():
                     response = data[:2] + struct.pack('!HHHHH', 0x8180 if accepted else 0x8183, 1, int(accepted), 0, 0) + data[12:end + 4] + answer
                     sock.sendto(response, peer)
                 else:
-                    expected = '10.77.0.1' if data_sockets[sock] == socket.AF_INET else 'fd00:77::1'
-                    assert peer[0] == expected, ('packet Endpoint reply source', peer, expected)
+                    if profile == 'core':
+                        expected = '192.0.2.2' if data_sockets[sock] == socket.AF_INET else 'fd00:1::2'
+                    else:
+                        expected = '10.77.0.1' if data_sockets[sock] == socket.AF_INET else 'fd00:77::1'
+                    assert peer[0] == expected, ('packet domain reply source', profile, peer, expected)
                     received.append(data.decode('ascii'))
                     assert len(received) <= 16, received
                     sock.sendto(data, peer)
@@ -331,11 +334,12 @@ def domain_client():
         print(json.dumps({'packet_domain_family': label, 'before': 'direct', 'after': 'blocked', 'earlier_must': 'direct'}), flush=True)
 
 
-def domain_check():
+def domain_check(profile):
+    assert profile in ('endpoint', 'core'), profile
     peer = None
     try:
         before = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
-        peer = subprocess.Popen(command('server', 'domain-peer'), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        peer = subprocess.Popen(command('server', 'domain-peer', profile), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         assert ready_line(peer) == 'READY'
         client = subprocess.run(command('client', 'domain-client'), capture_output=True, text=True, timeout=20)
         peer.stdin.write('done\n')
@@ -349,7 +353,7 @@ def domain_check():
         assert observed['queries'] == 2, observed
         after = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
         assert sum(after) - sum(before) >= 8, ('domain probe lacked actual capture', before, after)
-        print(json.dumps({'packet_dns_domain_routing': 'PASS', 'peer': observed, 'capture_delta': sum(after) - sum(before)}), flush=True)
+        print(json.dumps({'packet_dns_domain_routing': 'PASS', 'profile': profile, 'peer': observed, 'capture_delta': sum(after) - sum(before)}), flush=True)
     finally:
         stop(peer)
 
@@ -479,11 +483,11 @@ elif mode == 'settled':
         assert time.monotonic() < deadline, ('test producers still own unfinished TCP wire work', states)
         time.sleep(0.02)
 elif mode == 'domain-peer':
-    domain_peer()
+    domain_peer(sys.argv[2])
 elif mode == 'domain-client':
     domain_client()
 elif mode == 'domain':
-    domain_check()
+    domain_check(sys.argv[2])
 elif mode == 'guard':
     guard_probe(*sys.argv[2:])
 elif mode in ('check', 'native-baseline'):

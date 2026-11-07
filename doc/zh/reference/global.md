@@ -251,8 +251,9 @@ datapath {
 `xsk_mode: copy`。否则，不支持 ZeroCopy 会拒绝启动，不会静默降级。省略
 `datapath` 的配置仍使用 TC，不受影响。
 
-Core Direct 要求 `dial_mode: ip`，且不允许需要域名/嗅探的谓词。XDP Endpoint
-不会伪造进程或逐流 MAC 事实。部署必须预先配置并通过独立验证的 bypass-mark
+Core Direct 要求 `dial_mode: ip`；域名谓词只使用精确 packet 入口 scope 内学到的
+DNS 事实，不虚构 hostname 或依赖嗅探。Core 与 Endpoint 都不会伪造进程或逐流
+MAC 事实。部署必须预先配置并通过独立验证的 bypass-mark
 路由表，将守护进程自身的套接字流量隔离到未捕获的上联；上述示例本身不构成
 拓扑证明。设备、VLAN、散布/聚集、保留内存、固定丢弃保护及原生内核准入限制，
 请参阅[完整 XDP 启动与限制](../design/datapath.md)。

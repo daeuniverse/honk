@@ -168,7 +168,24 @@ impl RoutedCore {
                     .mode_state
                     .as_ref()
                     .map(|state| state.read());
-                let Some(action) = route_action(router, query, None) else {
+                let mut generation = self.authority.generation(mode_state.as_deref());
+                let bitmap = if router.domain_predicate_count() != 0 {
+                    let mut facts = self.authority.0.projection.packet_facts();
+                    let Ok((bitmap, stamp)) = self.read_facts(
+                        &mut facts,
+                        router,
+                        pending.ingress,
+                        metadata.destination,
+                        generation.routing,
+                    ) else {
+                        continue;
+                    };
+                    generation.facts = Some(stamp);
+                    bitmap
+                } else {
+                    None
+                };
+                let Some(action) = route_action(router, query, None, bitmap.as_ref()) else {
                     continue;
                 };
                 let mode = mode_decision(
@@ -198,11 +215,11 @@ impl RoutedCore {
                     continue;
                 }
                 if let Some(policy) = router.firewall_policy() {
-                    let (Some((source_port, destination_port)), Some((_, role))) = (
+                    let (Some((source_port, destination_port)), Some(binding)) = (
                         metadata.ports,
-                        self.ingress_roles
+                        self.ingress_bindings
                             .iter()
-                            .find(|(identity, _)| *identity == pending.ingress),
+                            .find(|binding| binding.ingress == pending.ingress),
                     ) else {
                         continue;
                     };
@@ -213,13 +230,13 @@ impl RoutedCore {
                         source_port,
                         destination_port,
                     };
-                    if policy.original(tuple, metadata.traffic_class, *role)
+                    if policy.original(tuple, metadata.traffic_class, binding.role)
                         != FirewallVerdict::Allow
                     {
                         continue;
                     }
                 }
-                self.authority.generation(mode_state.as_deref())
+                generation
             };
             if !self.fib.current(self.fib.generation())? {
                 self.routes.clear();

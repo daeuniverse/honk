@@ -45,7 +45,6 @@ pub struct DnsController {
     dns_service: crate::dns::DnsService,
     routing_projection: Arc<crate::dns::projection::RoutingProjection>,
     udp_query_limit: Arc<Semaphore>,
-    packet_scopes: std::sync::OnceLock<Box<[ScopeId]>>,
 }
 
 pub(crate) struct DnsClientAnswer(Result<crate::dns::outcome::DnsOutcome, Vec<u8>>);
@@ -173,7 +172,6 @@ impl DnsController {
         Self {
             dns_service,
             routing_projection,
-            packet_scopes: std::sync::OnceLock::new(),
             udp_query_limit: Arc::new(Semaphore::new(udp_query_limit.min(MAX_UDP_CLIENT_QUERIES))),
         }
     }
@@ -234,13 +232,20 @@ impl DnsController {
         &self,
         scopes: &[super::netstack::PacketScope],
     ) -> anyhow::Result<()> {
-        let scopes = scopes
-            .iter()
-            .map(super::netstack::PacketScope::scope)
-            .collect();
-        self.packet_scopes
-            .set(scopes)
-            .map_err(|_| anyhow::anyhow!("packet DNS scopes are already registered"))
+        let budget = scopes
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("packet DNS scopes must not be empty"))?
+            .budget();
+        anyhow::ensure!(
+            scopes
+                .iter()
+                .all(|scope| Arc::ptr_eq(&budget, &scope.budget())),
+            "packet DNS scopes must share one memory budget"
+        );
+        self.routing_projection.register_packet_scopes(
+            scopes.iter().map(super::netstack::PacketScope::scope),
+            &budget,
+        )
     }
 
     pub(in crate::control) fn packet_domain_bitmap(
@@ -258,11 +263,13 @@ impl DnsController {
     }
 
     fn owns_packet_scope(&self, scope: ScopeId) -> bool {
-        scope != ScopeId::HOST
-            && self
-                .packet_scopes
-                .get()
-                .is_some_and(|scopes| scopes.contains(&scope))
+        self.routing_projection.owns_packet_scope(scope)
+    }
+
+    pub(in crate::control) fn routing_projection(
+        &self,
+    ) -> Arc<crate::dns::projection::RoutingProjection> {
+        Arc::clone(&self.routing_projection)
     }
 
     pub async fn cache(&self) -> Arc<tokio::sync::Mutex<crate::dns::cache::DnsCache>> {

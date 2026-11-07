@@ -261,8 +261,9 @@ Copy behavior, add `xsk_mode: copy` to the existing `datapath` block before
 upgrading. Without it, unsupported ZeroCopy rejects startup rather than silently
 falling back. Configurations that omit `datapath` keep TC unchanged.
 
-Core Direct requires `dial_mode: ip` and no domain/sniff predicates. XDP Endpoint
-routing does not invent process or per-flow MAC facts. A pre-existing, independently
+Core Direct requires `dial_mode: ip`; domain predicates use only DNS facts learned
+in the exact packet ingress scope, without hostname synthesis or sniffing. Core
+and Endpoint routing do not invent process or per-flow MAC facts. A pre-existing, independently
 validated bypass-mark routing table must isolate daemon socket traffic onto
 uncaptured uplinks; this example alone does not establish that topology.
 Core's input-context FIB contract currently rejects nonzero IPv6 flow labels and
