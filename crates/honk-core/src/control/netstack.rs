@@ -548,31 +548,33 @@ impl PacketScope {
 
     /// No live TCP/TIME_WAIT/control protocol state and no flow slot; exported leases may remain.
     pub fn is_protocol_quiescent(&self) -> bool {
-        self.0.with(|inner| {
-            inner.stack.as_ref().is_none_or(Stack::is_quiescent)
-                && inner.slots.iter().all(Option::is_none)
-        })
+        let inner = self.0.inner.lock();
+        inner.stack.as_ref().is_none_or(Stack::is_quiescent)
+            && inner.slots.iter().all(Option::is_none)
     }
 
     pub fn stats(&self) -> Option<StackStats> {
-        self.0.with(|inner| inner.stack.as_ref().map(Stack::stats))
+        self.0.inner.lock().stack.as_ref().map(Stack::stats)
     }
 }
 
 impl Shared {
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        let result = {
+        let (result, closed_apps) = {
             let mut inner = self.inner.lock();
             let result = f(&mut inner);
             inner.events();
             if let Some(stack) = &mut inner.stack {
                 stack.take_tx_wakeup();
             }
-            result
+            // Every reapable slot is a closed app, and its transition's actor reaps it.
+            (result, inner.closed_apps != 0)
         };
         // Notify carries a permit even if the owner has not started awaiting yet.
         self.owner_wake.notify_one();
-        self.reap();
+        if closed_apps {
+            self.reap();
+        }
         result
     }
 

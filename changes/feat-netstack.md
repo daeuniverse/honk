@@ -7,3 +7,4 @@ Added
 - Avoid a redundant XDP daemon RX refill while preserving receive-owned replenishment and explicit RX/TX wakeup checks.
 - Default explicit XDP capture to forced AF_XDP ZeroCopy without fallback; keep TC as the default backend and support explicit `xsk_mode: copy` for existing Copy deployments.
 - Amortize AF_XDP transmit wakeup checks within synchronous device turns without delaying packet publication or releasing outstanding owners on failure.
+- Keep packet-scope statistics and quiescence reads passive, and skip retirement locking when no application has closed.
