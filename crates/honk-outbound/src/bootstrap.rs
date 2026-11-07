@@ -68,7 +68,7 @@ pub fn global_server() -> Option<SocketAddr> {
 }
 
 /// An authoritative node server host lookup.
-pub type NodeHostLookup = std::pin::Pin<Box<dyn Future<Output = io::Result<Vec<IpAddr>>> + Send>>;
+pub type NodeHostLookup = futures_util::future::BoxFuture<'static, io::Result<Vec<IpAddr>>>;
 
 /// Resolves node server hosts that configured DNS rules claim.
 pub trait NodeHostResolver: Send + Sync {
