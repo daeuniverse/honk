@@ -6,7 +6,7 @@ use honk_config::subscription::Subscription;
 use honk_outbound::group::ScoreContinuation;
 use tokio::time::Instant;
 
-use crate::download_route::{Detour, Failed, NoUsableNode, Request};
+use crate::download_route::{Detour, Failed, NoUsableNode, Request, Via};
 use crate::marked_http::{self, Reply};
 
 pub(crate) type Routing = crate::download_route::SharedOutbounds;
@@ -25,6 +25,118 @@ pub(crate) fn direct(subscription: &Subscription) -> bool {
 pub(crate) struct RouteUnavailable {
     subscription: String,
     outbound: String,
+}
+
+/// Classified download failure with selected-outbound metadata when available.
+#[derive(Debug)]
+pub(crate) struct DownloadFailed {
+    subscription: String,
+    stage: &'static str,
+    via: Option<Via>,
+    status: Option<http::StatusCode>,
+    /// The io error behind a direct failure. Only its own text is kept: the
+    /// error types around a request name its URL, which carries the token.
+    cause: Option<String>,
+}
+
+impl DownloadFailed {
+    fn new(subscription: &Subscription, stage: &'static str, via: Option<Via>) -> Self {
+        Self {
+            subscription: subscription.name.clone(),
+            stage,
+            via,
+            status: None,
+            cause: None,
+        }
+    }
+
+    /// The server answered with a client or server error, as an expired
+    /// subscription token does. Geodata stages the same statuses alike.
+    pub(crate) fn status(
+        subscription: &Subscription,
+        status: http::StatusCode,
+        via: Option<Via>,
+    ) -> Self {
+        Self {
+            status: Some(status),
+            ..Self::new(
+                subscription,
+                crate::download_route::status_stage(status),
+                via,
+            )
+        }
+    }
+}
+
+impl std::fmt::Display for DownloadFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            subscription,
+            stage,
+            via,
+            status,
+            cause,
+        } = self;
+        match *stage {
+            "asset_too_large" => {
+                return write!(
+                    f,
+                    "subscription body exceeds {} bytes",
+                    super::MAX_SUBSCRIPTION_BYTES
+                );
+            }
+            "route_blocked" => {
+                return f.write_str("routing sends the subscription download to 'block'");
+            }
+            _ => {}
+        }
+        write!(f, "subscription '{subscription}': ")?;
+        match (status, via) {
+            (Some(status), None) => write!(f, "server answered HTTP {status}"),
+            (None, None) => {
+                write!(f, "download failed: {stage}")?;
+                match cause {
+                    Some(cause) => write!(f, " ({cause})"),
+                    None => Ok(()),
+                }
+            }
+            (status, Some(via)) => {
+                match status {
+                    Some(status) => write!(f, "server answered HTTP {status} through {via}")?,
+                    None => write!(f, "download through {via} failed: {stage}")?,
+                }
+                f.write_str("; set route: direct for this subscription to fetch it outside routing")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DownloadFailed {}
+
+/// Where and why a fetch failed, for the provider status.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FetchFailure {
+    pub(crate) stage: &'static str,
+    pub(crate) via: Option<Via>,
+}
+
+/// The stage a failed fetch stopped at: a download stage, or `parse_failed`
+/// when the body arrived but is not a usable subscription. Content errors are
+/// the only `DetailedConfigError`s a fetch returns. `None` for failures that
+/// name no stage, such as an invalid URL.
+pub(crate) fn failure_stage(error: &anyhow::Error) -> Option<FetchFailure> {
+    if let Some(failed) = error.downcast_ref::<DownloadFailed>() {
+        return Some(FetchFailure {
+            stage: failed.stage,
+            via: failed.via.clone(),
+        });
+    }
+    error
+        .downcast_ref::<honk_config::error::DetailedConfigError>()
+        .map(|_| FetchFailure {
+            stage: "parse_failed",
+            via: None,
+        })
 }
 
 /// The provider status code for a failed fetch.
@@ -58,18 +170,30 @@ impl Hop<'_> {
         url: &reqwest::Url,
         headers: &http::HeaderMap,
         deadline: Instant,
-    ) -> anyhow::Result<Reply> {
+    ) -> anyhow::Result<(Reply, Option<Via>)> {
         let max_bytes = super::MAX_SUBSCRIPTION_BYTES;
         let reply = match self {
             Self::Direct(client) => {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match tokio::time::timeout_at(deadline, client.get(url, headers, remaining)).await {
-                    Err(_) => Err("download_timeout"),
-                    Ok(response) => {
-                        marked_http::read(response?, wants_body, deadline.into(), max_bytes)
-                            .await
-                            .map_err(|error| error.stage)
-                    }
+                    Err(_) => Err(DownloadFailed::new(subscription, "download_timeout", None)),
+                    Ok(response) => match response {
+                        Ok(response) => {
+                            marked_http::read(response, wants_body, deadline.into(), max_bytes)
+                                .await
+                                .map(|reply| (reply, None))
+                                .map_err(|error| {
+                                    DownloadFailed::new(subscription, error.stage, None)
+                                })
+                        }
+                        Err(error) => match direct_stage(&error) {
+                            Some((stage, cause)) => Err(DownloadFailed {
+                                cause,
+                                ..DownloadFailed::new(subscription, stage, None)
+                            }),
+                            None => return Err(error),
+                        },
+                    },
                 }
             }
             Self::Routed { routing, original } => {
@@ -92,8 +216,10 @@ impl Hop<'_> {
                     )
                     .await;
                 match fetched {
-                    Ok((reply, _)) => Ok(reply),
-                    Err(Failed::Stage(stage)) => Err(stage),
+                    Ok((reply, _, via)) => Ok((reply, via)),
+                    Err(Failed::Stage(stage, via)) => {
+                        Err(DownloadFailed::new(subscription, stage, via))
+                    }
                     Err(Failed::Route(error)) => {
                         return Err(match error.downcast_ref::<NoUsableNode>() {
                             Some(unusable) => anyhow::Error::new(RouteUnavailable {
@@ -106,14 +232,30 @@ impl Hop<'_> {
                 }
             }
         };
-        reply.map_err(|stage| match stage {
-            "asset_too_large" => anyhow::anyhow!("subscription body exceeds {max_bytes} bytes"),
-            "route_blocked" => {
-                anyhow::anyhow!("routing sends the subscription download to 'block'")
-            }
-            stage => anyhow::anyhow!("subscription download failed: {stage}"),
-        })
+        reply.map_err(anyhow::Error::new)
     }
+}
+
+/// Classify direct-client errors without retaining URL-bearing request wrappers.
+fn direct_stage(error: &anyhow::Error) -> Option<(&'static str, Option<String>)> {
+    if let Some(failed) = error.downcast_ref::<marked_http::Error>() {
+        return Some((failed.stage, None));
+    }
+    let io = error.downcast_ref::<std::io::Error>()?;
+    let stage = if io
+        .get_ref()
+        .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
+    {
+        "tls_failed"
+    } else {
+        match io.kind() {
+            std::io::ErrorKind::TimedOut => "download_timeout",
+            std::io::ErrorKind::NotFound => "resolution_failed",
+            std::io::ErrorKind::InvalidInput => return None,
+            _ => "connection_failed",
+        }
+    };
+    Some((stage, Some(io.to_string())))
 }
 
 /// The body of every answer that is neither followed nor failed.

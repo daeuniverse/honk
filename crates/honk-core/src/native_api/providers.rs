@@ -23,6 +23,8 @@ use super::{
     parse_query, timestamp,
     types::RequestId,
 };
+#[cfg(test)]
+use crate::subscription::FetchFailure;
 use crate::{
     control::ReloadOutcome,
     subscription::{
@@ -104,7 +106,12 @@ impl Provider {
         }
     }
 
-    fn observed(subscription: &Subscription, load: ProviderLoad, node_count: usize) -> Self {
+    fn observed(
+        subscription: &Subscription,
+        load: ProviderLoad,
+        node_count: usize,
+        group_id: impl Fn(&str) -> Option<String>,
+    ) -> Self {
         Self {
             id: subscription.id.to_string(),
             name: subscription.name.clone(),
@@ -142,13 +149,24 @@ impl Provider {
                 message: error_message(code).unwrap_or(
                     "Provider loading or runtime publication did not complete successfully.",
                 ),
-                details: rejection_details(load.rejection),
+                details: load
+                    .fetch
+                    .as_ref()
+                    .map(|failure| {
+                        json!({
+                            "stage": failure.stage,
+                            "node": failure.via.as_ref().map(|via| &via.node),
+                            "group_id": failure.via.as_ref()
+                                .and_then(|via| via.group.as_deref())
+                                .and_then(&group_id),
+                        })
+                    })
+                    .or_else(|| rejection_details(load.rejection)),
             }),
             download: None,
         }
     }
 
-    /// The subscription's download route, `{route, group_id}` as for geodata.
     fn routed(
         mut self,
         subscription: &Subscription,
@@ -173,6 +191,14 @@ impl Provider {
         };
         for value in std::iter::once(&mut self.name).chain(self.url_redacted.iter_mut()) {
             *value = secrets.mask(value).0;
+        }
+        if let Some(Value::Object(details)) = self
+            .last_error
+            .as_mut()
+            .and_then(|error| error.details.as_mut())
+            && let Some(Value::String(node)) = details.get_mut("node")
+        {
+            *node = secrets.mask(node).0;
         }
         self
     }
@@ -334,8 +360,9 @@ pub(super) async fn list(
             .as_ref()
             .map(|owner| owner.observation(subscription))
             .unwrap_or_default();
-        let row = Provider::observed(subscription, load, counts[&subscription.id])
-            .routed(subscription, |name| identity.groups.get(name).cloned())
+        let group_id = |name: &str| identity.groups.get(name).cloned();
+        let row = Provider::observed(subscription, load, counts[&subscription.id], group_id)
+            .routed(subscription, group_id)
             .mask_listener_secrets(&config, Some(&state.observation.configuration));
         bytes += row.retained_bytes();
         if bytes > MAX_SNAPSHOT_BYTES {
@@ -401,7 +428,7 @@ pub(super) fn provider_value(
         .filter(|node| node.subscription_id == Some(provider_id))
         .count();
     serde_json::to_value(
-        Provider::observed(subscription, load, count)
+        Provider::observed(subscription, load, count, &group_id)
             .routed(subscription, group_id)
             .mask_listener_secrets(config, sources),
     )
@@ -468,10 +495,10 @@ pub(super) async fn refresh(
                 .read()
                 .clone()
                 .ok_or_else(not_refreshable)?;
-            let display = Provider::observed(&subscription, ProviderLoad::default(), 0)
-                .routed(&subscription, |name| {
-                    super::geodata::group_id(&state.observation.core.catalog, name)
-                })
+            let group_id =
+                |name: &str| super::geodata::group_id(&state.observation.core.catalog, name);
+            let display = Provider::observed(&subscription, ProviderLoad::default(), 0, group_id)
+                .routed(&subscription, group_id)
                 .mask_listener_secrets(&config, Some(&state.observation.configuration));
             Ok((subscription, supervisor, display))
         }
@@ -528,7 +555,8 @@ impl RefreshReport for RefreshOperation {
             Ok(reply) => {
                 match reply.outcome {
                     ReloadOutcome::Noop { .. } | ReloadOutcome::Committed { .. } => {
-                        let mut provider = Provider::observed(subscription, load, reply.node_count);
+                        let mut provider =
+                            Provider::observed(subscription, load, reply.node_count, |_| None);
                         provider.name = self.display_name;
                         provider.url_redacted = Some(self.display_url);
                         provider.download = self.display_download;

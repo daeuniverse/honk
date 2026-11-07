@@ -28,7 +28,9 @@ pub use store::SubscriptionStore;
 pub(crate) use store::same_subscription_fetch_identity;
 pub(crate) use store::{LegacySubscriptionStore, legacy_store_roots, prune_bodies};
 
-pub(crate) use route::failure_code;
+#[cfg(all(test, feature = "native-api"))]
+pub(crate) use route::FetchFailure;
+pub(crate) use route::{failure_code, failure_stage};
 pub(crate) use supervisor::SubscriptionMergeReply;
 #[cfg(feature = "native-api")]
 pub(crate) use supervisor::same_subscription_source_spec;
@@ -452,7 +454,7 @@ async fn fetch_following(
     crate::marked_http::normalize_url(&mut url, &mut headers)?;
     let origin = url.clone();
     for redirects in 0..=MAX_SUBSCRIPTION_REDIRECTS {
-        let reply = hop.get(sub, &url, &headers, deadline).await?;
+        let (reply, via) = hop.get(sub, &url, &headers, deadline).await?;
         if crate::marked_http::followed_redirect(reply.status)
             && let Some(location) = reply.location
         {
@@ -473,11 +475,9 @@ async fn fetch_following(
             url = next;
             continue;
         }
-        anyhow::ensure!(
-            !reply.status.is_client_error() && !reply.status.is_server_error(),
-            "subscription server answered HTTP {}",
-            reply.status
-        );
+        if reply.status.is_client_error() || reply.status.is_server_error() {
+            return Err(route::DownloadFailed::status(sub, reply.status, via).into());
+        }
         let userinfo = reply
             .subscription_userinfo
             .as_ref()

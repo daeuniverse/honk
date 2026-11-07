@@ -921,9 +921,9 @@ Subscription rows carry `download`, derived from `download_detour` and shaped li
 
 File and inline rows report null for `download`.
 
-A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
+A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For classified `fetch_failed` errors, `details` gives the failing `stage` (such as `connection_failed`, `download_timeout`, `tls_failed` or `parse_failed`), the selected `node`, and its selecting group's `group_id`. Unclassified failures, such as invalid URLs or redirects, have `details: null`. `node` is null for direct downloads, failures before node selection, and parse failures whose download attribution is unavailable. `group_id` is null when attribution has no group or that group no longer exists in the catalog. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
 
-A failed refresh operation carries the same details.
+A refresh operation that fails on a rejected publication carries the same `details.diagnostic_code`; the fetch `stage`, `node` and `group_id` appear only in the provider's `last_error`.
 
 `POST /providers/{id}/refresh` takes an empty body and optional `Idempotency-Key`, returning a 202 operation. Success requires actual revision-authorized runtime publication, not just fetch or cache write. Disconnecting HTTP does not cancel admitted work.
 

@@ -649,18 +649,16 @@ async fn exchange(
         Some((outbounds, detour)) => outbounds
             .fetch(detour, DETOUR_SETTING, PURPOSE, &request, &mut None)
             .await
+            .map(|(reply, group, _)| (reply, group))
             .map_err(|failed| match failed {
                 Failed::Route(_) => "group_unavailable",
-                Failed::Stage(stage) => stage,
+                Failed::Stage(stage, _) => stage,
             })?,
     };
     match reply.status {
         StatusCode::OK => Ok((reply.body, group)),
         status => Err(Failure {
-            code: match status {
-                StatusCode::NOT_FOUND => "http_not_found",
-                _ => "http_status_rejected",
-            },
+            code: download_route::status_stage(status),
             status: Some(status.as_u16()),
         }),
     }

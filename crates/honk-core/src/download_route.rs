@@ -335,24 +335,52 @@ pub(crate) struct Request<'a> {
     pub(crate) bootstrap: Option<&'a str>,
 }
 
+/// The stage of a download the server answered with `status`: a 404 is told
+/// apart because it is what a removed file or an expired link gives.
+pub(crate) fn status_stage(status: http::StatusCode) -> &'static str {
+    match status {
+        http::StatusCode::NOT_FOUND => "http_not_found",
+        _ => "http_status_rejected",
+    }
+}
+
+/// The outbound a download went through: the node that carried it, and the
+/// group that chose the node when one did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Via {
+    pub(crate) node: String,
+    pub(crate) group: Option<String>,
+}
+
+impl std::fmt::Display for Via {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "node '{}'", self.node)?;
+        match &self.group {
+            Some(group) => write!(f, " of group '{group}'"),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Why a routed download failed.
 pub(crate) enum Failed {
     /// The detour names no outbound, or the chosen one has no usable node.
     Route(anyhow::Error),
-    /// The stage that failed.
-    Stage(&'static str),
+    /// The stage that failed, and the outbound it went through; `None` before
+    /// a node was chosen and for direct downloads.
+    Stage(&'static str, Option<Via>),
 }
 
 impl From<&'static str> for Failed {
     fn from(stage: &'static str) -> Self {
-        Self::Stage(stage)
+        Self::Stage(stage, None)
     }
 }
 
 impl Outbounds<'_> {
     /// Makes `request` through `detour`: straight to its host, or through the
     /// node the detour or the routing rules choose, whose tunnel is closed
-    /// after. Also returns the group the route went through. `setting` and
+    /// after. Also returns the group and the node the route went through. `setting` and
     /// `purpose` are as in [`Self::decide`]. Setup has to finish by the
     /// deadline's `headers`. `original` is the first admitted Score business of
     /// a redirect chain; later hops of the chain continue it instead of
@@ -364,9 +392,9 @@ impl Outbounds<'_> {
         purpose: &str,
         request: &Request<'_>,
         original: &mut Option<ScoreContinuation>,
-    ) -> Result<(Reply, Option<String>), Failed> {
+    ) -> Result<(Reply, Option<String>, Option<Via>), Failed> {
         let (detour, strict_resolver) = match detour {
-            Detour::Direct => return Ok((fetch_direct(request).await?, None)),
+            Detour::Direct => return Ok((fetch_direct(request).await?, None, None)),
             Detour::Routing => (None, None),
             Detour::Group(group) => (Some(group), request.bootstrap),
         };
@@ -401,6 +429,10 @@ impl Outbounds<'_> {
             decision.group.as_deref(),
             purpose,
         )?;
+        let via = node.as_ref().map(|node| Via {
+            node: node.name.clone(),
+            group: decision.group.clone(),
+        });
         let reply = match node {
             None => fetch_direct(request).await,
             Some(node) => self.fetch_through(&node, purpose, request).await,
@@ -408,8 +440,11 @@ impl Outbounds<'_> {
         if let Some(business) = business {
             business.finish(settlement(&reply));
         }
-        let reply = reply?;
-        Ok((reply, decision.group))
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(stage) => return Err(Failed::Stage(stage, via)),
+        };
+        Ok((reply, decision.group, via))
     }
 
     async fn fetch_through(

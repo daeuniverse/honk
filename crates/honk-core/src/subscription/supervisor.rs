@@ -7,6 +7,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, info, warn};
 
+use super::route::FetchFailure;
 use super::{SubscriptionManager, SubscriptionStore, SubscriptionUserinfo};
 use crate::control::ControlCommand;
 use crate::control::ReloadOutcome;
@@ -25,7 +26,7 @@ pub(crate) struct SubscriptionMergeReply {
     pub(crate) rejection: Option<&'static str>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ProviderLoad {
     pub(crate) updated_at: Option<SystemTime>,
     pub(crate) userinfo: SubscriptionUserinfo,
@@ -33,6 +34,8 @@ pub(crate) struct ProviderLoad {
     pub(crate) error: Option<&'static str>,
     /// The configuration diagnostic code behind a `publication_rejected` error.
     pub(crate) rejection: Option<&'static str>,
+    /// Classified fetch diagnostics associated with the current load error, when available.
+    pub(crate) fetch: Option<FetchFailure>,
 }
 
 /// Why the supervisor refused an explicit provider refresh.
@@ -270,6 +273,7 @@ async fn fetch_once(
 struct Flight {
     authorized: AuthorizedSubscription,
     userinfo: SubscriptionUserinfo,
+    failure: Option<FetchFailure>,
     #[cfg(feature = "native-api")]
     operation: Option<Box<dyn RefreshReport>>,
 }
@@ -323,6 +327,7 @@ impl SupervisorState {
             Flight {
                 authorized: provider.authorized.clone(),
                 userinfo: SubscriptionUserinfo::default(),
+                failure: None,
                 #[cfg(feature = "native-api")]
                 operation: None,
             },
@@ -438,6 +443,7 @@ impl SupervisorState {
             }
         });
         let observed = observations.get_mut(&id).filter(|_| current);
+        let fallback;
         let load = match (&result, observed) {
             (Ok(reply), Some(observed)) if reply.outcome.accepted() => {
                 info!(
@@ -452,9 +458,10 @@ impl SupervisorState {
                     matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
                         .then_some("publication_degraded");
                 observed.load.rejection = None;
-                observed.load
+                observed.load.fetch = None;
+                &observed.load
             }
-            (Err("supervisor_stopped"), Some(observed)) => observed.load,
+            (Err("supervisor_stopped"), Some(observed)) => &observed.load,
             (_, Some(observed)) => {
                 observed.load.error = Some(
                     result
@@ -464,18 +471,30 @@ impl SupervisorState {
                         .unwrap_or("publication_rejected"),
                 );
                 observed.load.rejection = result.as_ref().ok().and_then(|reply| reply.rejection);
-                observed.load
+                observed.load.fetch = flight.failure;
+                &observed.load
             }
-            (Ok(reply), None) if reply.outcome.accepted() => ProviderLoad {
-                updated_at: Some(SystemTime::now()),
-                userinfo: flight.userinfo,
-                cached: false,
-                error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
-                    .then_some("publication_degraded"),
-                rejection: None,
-            },
-            _ => ProviderLoad::default(),
+            (Ok(reply), None) if reply.outcome.accepted() => {
+                fallback = ProviderLoad {
+                    updated_at: Some(SystemTime::now()),
+                    userinfo: flight.userinfo,
+                    cached: false,
+                    error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
+                        .then_some("publication_degraded"),
+                    rejection: None,
+                    fetch: None,
+                };
+                &fallback
+            }
+            _ => {
+                fallback = ProviderLoad::default();
+                &fallback
+            }
         };
+        #[cfg(feature = "native-api")]
+        let report = flight.operation.map(|operation| (operation, load.clone()));
+        #[cfg(not(feature = "native-api"))]
+        let _ = load;
         drop(observations);
         if current {
             self.providers
@@ -484,11 +503,9 @@ impl SupervisorState {
                 .finished(Instant::now(), result.as_ref().err().copied());
         }
         #[cfg(feature = "native-api")]
-        if let Some(operation) = flight.operation {
+        if let Some((operation, load)) = report {
             operation.finish(&flight.authorized.subscription, load, result);
         }
-        #[cfg(not(feature = "native-api"))]
-        let _ = load;
         if !current {
             self.schedule(id);
         }
@@ -537,10 +554,17 @@ impl SupervisorState {
                         "Subscription refresh retry failed; keeping active nodes"
                     );
                 }
-                self.finish(id, Err(super::failure_code(&error)));
+                self.finish_fetch_failure(id, &error, super::failure_code(&error));
             }
             None => self.finish(id, Err("supervisor_stopped")),
         }
+    }
+
+    fn finish_fetch_failure(&mut self, id: uuid::Uuid, error: &anyhow::Error, code: &'static str) {
+        if let Some(flight) = self.flights.get_mut(&id) {
+            flight.failure = super::failure_stage(error);
+        }
+        self.finish(id, Err(code));
     }
 
     #[cfg(feature = "native-api")]
@@ -572,6 +596,7 @@ impl SupervisorState {
             Flight {
                 authorized: provider.authorized.clone(),
                 userinfo: SubscriptionUserinfo::default(),
+                failure: None,
                 operation: Some(operation),
             },
         );
@@ -598,7 +623,7 @@ impl SupervisorState {
                                 %error,
                                 "Subscription refresh failed; keeping active nodes"
                             );
-                            self.finish(id, Err("fetch_failed"));
+                            self.finish_fetch_failure(id, &error, "fetch_failed");
                         }
                         Some(Ok(_)) | None => self.finish(id, Err("supervisor_stopped")),
                     }
@@ -805,7 +830,7 @@ impl SubscriptionSupervisorHandle {
             .read()
             .get(&subscription.id)
             .filter(|observed| same_worker_spec(&observed.subscription, subscription))
-            .map(|observed| observed.load)
+            .map(|observed| observed.load.clone())
             .unwrap_or_default()
     }
 
