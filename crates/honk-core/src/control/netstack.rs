@@ -430,6 +430,11 @@ impl PacketScope {
         })
     }
 
+    pub(in crate::control) fn has_pending_accept(&self) -> bool {
+        let inner = self.0.inner.lock();
+        !inner.closing && inner.stack.as_ref().is_some_and(Stack::has_pending_accept)
+    }
+
     /// Accepts with an immediate SYN-ACK. This is not kernel accepted-child evidence.
     pub fn poll_accept(&self) -> Option<(SynInfo, FlowIo)> {
         self.0.with(|inner| {

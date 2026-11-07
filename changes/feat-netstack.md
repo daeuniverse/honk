@@ -13,3 +13,4 @@ Added
 - Batch scoped packet output and completed-owner returns while preserving class order, bounded device credit and last-descriptor CQ ownership.
 - Drive XDP packet-scope timers and output from the device owner with joined accounted cleanup, real policy readers and failed-startup owner cleanup; keep DNS resolver hooks from retaining packet-scope registration budgets.
 - Apply scope-local DNS predicates to mixed Core forwarding and fence prepared output against same-generation fact withdrawal, replacement and exact expiry; routed-only Core embeddings now reject domain predicates instead of never matching them.
+- Skip empty passive-accept work before reserving packet TCP/channel capacity, without delaying queued SYN admission behind the receive batch.

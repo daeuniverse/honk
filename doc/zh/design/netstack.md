@@ -151,6 +151,8 @@ UDP queue/capacity 错误保持不变：callback 能报告有效来源事实，�
 仍可能因容量不足失败。旧 receive API 使用编译期禁用 reporting 的路径，没有
 reporting 分配，也不维护跨调用的“上一个包”状态。
 
+`PacketEndpoints` 在既有 scope 互斥锁内检查被动 accept 队列，再预留 TCP/channel permit。空探测不扫描 flow slot，也不通知 owner。排队 SYN 仍进入既有的逐次 receive 后立即接纳循环，容量恢复后的无关入站包仍可触发重试；不会推迟到批尾接纳。该查询只提供否定提示：队列中可能只有过期句柄，随后仍不返回有效流。
+
 启动先打开 scope 准入，再报告 Endpoint supervisor 就绪；非 XDP 嵌入仍在该提交点发布 native `Running`。显式 XDP owner 只有在全部真实 capture gate 激活后才调用 `PacketEndpoints::capture_ready()`，同一个 supervisor 等到该通知才发布 native `Running`。启动失败须等待 supervisor 清理后才返回。关闭保留第一次 UDP 排空结果，不能把强制取消报告为优雅成功。清理超过五秒只告警，不释放所有权，也不承诺硬性完成期限。条目元数据计费保留到精确退休完成，任务分配及 buffer credit 保留到 join；下一次入口复制计费前先回收已完成的 UDP 任务。健康回调只观察 UDP pool，不延长其生命周期。
 
 单个连接任务 panic 只终止该 TCP 流，不停止其他 packet 服务。TCP 任务接纳先回收已完成工作，确实无法接纳时显式 reset 该流。周期 UDP 维护也会在空闲期间 join 已完成任务并返还 credit。关闭入口后仍须等待此前预留的 producer permit，处置其迟到消息，再 join scope owner；只关闭 receiver 不能证明此后不会再收到 `FlowIo`。

@@ -592,7 +592,7 @@ impl PacketEndpoints {
     }
 
     fn accept_ready(&self, scope: &PacketScope) {
-        if self.shared.is_closing() {
+        if self.shared.is_closing() || !scope.has_pending_accept() {
             return;
         }
         for _ in 0..INGRESS_CAPACITY {

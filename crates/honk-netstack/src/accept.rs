@@ -84,6 +84,11 @@ pub enum Refuse {
 }
 
 impl Stack {
+    /// Queued passive candidates remain; stale entries may still make `poll_accept` return None.
+    pub fn has_pending_accept(&self) -> bool {
+        !self.accept_q.is_empty()
+    }
+
     /// Next new connection, once. Nothing has been sent for it.
     pub fn poll_accept(&mut self) -> Option<SynInfo> {
         while let Some(id) = self.accept_q.pop_front() {

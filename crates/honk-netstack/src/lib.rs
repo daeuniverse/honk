@@ -77,6 +77,8 @@
 //! client address ([`Config::half_open_max`], [`Config::half_open_per_source`]); SYNs beyond a
 //! cap, or beyond the flow or memory limits, are dropped and counted
 //! ([`DropReason::HalfOpen`], [`DropReason::Capacity`]), never answered and never cookied.
+//! [`Stack::has_pending_accept`] can skip an empty probe without consuming a candidate;
+//! stale queued handles can still make a subsequent `poll_accept` return `None`.
 //!
 //! The side that closes first keeps TIME_WAIT (RFC 9293 MUST-13), including simultaneous close,
 //! with the RFC 6191 reopen check for a new SYN on the same tuple; the side that closes second
