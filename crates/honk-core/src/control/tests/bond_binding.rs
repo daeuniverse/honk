@@ -23,7 +23,6 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, UdpSocket};
@@ -430,7 +429,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                 exercise(&scenario, &ebpf, &mut peer).await
             }
             .await;
-            shutdown.store(true, Ordering::Release);
+            shutdown.request();
             let sent = if task.is_finished() {
                 Ok(())
             } else {

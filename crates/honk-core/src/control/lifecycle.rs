@@ -4,6 +4,7 @@ use super::runtime::{
 use super::udp_ingress::{UdpLoopState, udp_listener_loop};
 use super::*;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::sync::atomic::Ordering;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
@@ -797,7 +798,7 @@ impl ControlPlane {
             }
             // A persistent accept error repeats every iteration; warn once per episode.
             let mut accept_failing = false;
-            while fatal.is_none() && !self.shutdown_requested.load(Ordering::Acquire) {
+            while fatal.is_none() && !self.shutdown_requested.requested() {
                 match active.next(self, &mut commands).await {
                     EpochEvent::Command(command) => {
                         let Some(command) = command else {

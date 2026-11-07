@@ -16,7 +16,6 @@ use honk_ebpf_common::{RedirectEntry, RedirectTuple};
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tokio::net::UdpSocket;
 
 const CASE: &str = "control::tests::udp_fullcone::netns_udp_full_cone_source_contract";
@@ -317,7 +316,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
-                shutdown.store(true, Ordering::Release);
+                shutdown.request();
                 let command = if task.is_finished() {
                     Ok(())
                 } else {

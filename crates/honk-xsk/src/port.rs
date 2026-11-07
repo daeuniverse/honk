@@ -933,6 +933,14 @@ impl<L> Port<L> {
         self.counters
     }
 
+    /// Retry published TX/CQ work or RX blocked by a partial chain/FILL visibility.
+    /// A populated FILL ring without queued RX is an ordinary idle receive reservation.
+    pub fn needs_service_retry(&self) -> bool {
+        self.counters.submitted != self.counters.completed
+            || self.tx_producer != self.rings.tx.consumer()
+            || self.rings.rx.producer() != self.rx_consumer
+    }
+
     pub fn stats(&self) -> io::Result<SocketStats> {
         self.socket
             .as_ref()
@@ -1230,7 +1238,12 @@ mod tests {
     fn receive_defers_rx_until_fill_consumer_publication_and_counts_only_deliveries() {
         let budget = MemoryBudget::new(1 << 20);
         let mut port = fake::<()>(config(), &budget);
+        assert!(!port.needs_service_retry());
         assert_eq!(port.refill().unwrap(), 2);
+        assert!(
+            !port.needs_service_retry(),
+            "posted FILL alone must stay event-driven"
+        );
         let first = port.rings.fill.read(0);
         let second = port.rings.fill.read(1);
         port.umem.write_bytes(first + 128, &[1, 2, 3]);
@@ -1256,6 +1269,10 @@ mod tests {
             port.receive(2, |_| panic!("FILL consumer not published"))
                 .unwrap(),
             0
+        );
+        assert!(
+            port.needs_service_retry(),
+            "late FILL publication has no reliable event"
         );
         assert_ne!(port.rings().rx_producer, port.rings().rx_consumer);
         assert_eq!(port.rings().rx_consumer, 0);
@@ -1302,6 +1319,7 @@ mod tests {
         assert_eq!(port.rings.fill.read(3), second);
         assert_eq!(port.drain_state().rx_leased, 0);
         assert_eq!(port.drain_state().fill_queued, 2);
+        assert!(!port.needs_service_retry());
         assert!(!port.drain_state().closed);
         assert_eq!(port.counters().invalid, 0);
         assert_eq!(port.counters().rx, 2);
@@ -1836,6 +1854,10 @@ mod tests {
                 .unwrap(),
             0
         );
+        assert!(
+            port.needs_service_retry(),
+            "partial RX chains retain a retry obligation"
+        );
         assert_eq!(port.rings().rx_consumer, 0);
         port.rings.rx.write(
             1,
@@ -1895,8 +1917,13 @@ mod tests {
         assert_eq!(port.rings().tx_producer, 0);
         assert_eq!(port.tx_free[1], 4);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+        assert!(
+            !port.needs_service_retry(),
+            "unpublished writer failure owes no CQ"
+        );
         port.transmit_segments(TxClass::Bulk, &[&[7; 9000]], Retained::new(&drops))
             .unwrap();
+        assert!(port.needs_service_retry());
         assert_eq!(port.rings().tx_producer, 3);
         assert!(port.tx_credit(TxClass::Bulk));
         assert!(!port.tx_packet_credit(TxClass::Bulk, 9000));
@@ -1907,6 +1934,7 @@ mod tests {
                 .write(completion as u32, port.rings.tx.read(descriptor).addr);
             port.rings.cq.publish_producer(completion as u32 + 1);
             assert_eq!(port.complete().unwrap(), 1);
+            assert_eq!(port.needs_service_retry(), completion != 2);
             assert_eq!(
                 drops.load(Ordering::Relaxed),
                 if completion == 2 { 2 } else { 1 }
@@ -1915,6 +1943,32 @@ mod tests {
         assert_eq!(port.tx_free[1], 4);
         assert!(port.sidecar.slots.iter().all(Option::is_none));
         assert!(port.tx_packet_credit(TxClass::Bulk, 9000));
+    }
+
+    #[test]
+    fn returned_cq_still_retries_until_tx_ring_credit_is_visible() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(
+            PortConfig {
+                ring_size: 2,
+                ..config()
+            },
+            &budget,
+        );
+        for class in [TxClass::Control, TxClass::Bulk] {
+            port.transmit_segments(class, &[&[1; 60]], ()).unwrap();
+        }
+        for index in 0..2 {
+            port.rings.cq.write(index, port.rings.tx.read(index).addr);
+        }
+        port.rings.cq.publish_producer(2);
+        assert_eq!(port.complete().unwrap(), 2);
+        assert!(port.outstanding().next().is_none());
+        assert!(!port.tx_credit(TxClass::Bulk));
+        assert!(port.needs_service_retry());
+        port.rings.tx.publish_consumer(2);
+        assert!(port.tx_credit(TxClass::Bulk));
+        assert!(!port.needs_service_retry());
     }
 
     fn transmit_entry(

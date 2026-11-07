@@ -136,6 +136,33 @@ pub(crate) enum EnginePhase {
     Failed,
 }
 
+#[derive(Default)]
+pub(crate) struct ShutdownIntent {
+    requested: std::sync::atomic::AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl ShutdownIntent {
+    pub(crate) fn requested(&self) -> bool {
+        self.requested.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn request(&self) {
+        self.requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) async fn wait(&self) {
+        let notified = self.changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.requested() {
+            notified.await;
+        }
+    }
+}
+
 /// The main control plane.
 pub struct ControlPlane {
     config: Arc<RwLock<Arc<Config>>>,
@@ -222,7 +249,7 @@ pub struct ControlPlane {
     native_owner: Option<Arc<dyn crate::observe::Owner>>,
     #[cfg(feature = "native-api")]
     subscriptions: Option<crate::subscription::SubscriptionSupervisorHandle>,
-    shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
+    shutdown_requested: Arc<ShutdownIntent>,
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
     active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
@@ -423,7 +450,7 @@ impl ControlPlane {
         self.subscriptions = Some(subscriptions);
     }
 
-    pub(crate) fn shutdown_intent(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    pub(crate) fn shutdown_intent(&self) -> Arc<ShutdownIntent> {
         Arc::clone(&self.shutdown_requested)
     }
 

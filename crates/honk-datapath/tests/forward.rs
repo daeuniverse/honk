@@ -1,6 +1,6 @@
 use honk_datapath::{
     ScopeId,
-    forward::{CoreForward, Ingress, MarkProvenance, Prepared, Route},
+    forward::{CoreForward, ForwardLease, Ingress, MarkProvenance, Prepared, Route},
 };
 use honk_netstack::{
     MemoryBudget,
@@ -431,14 +431,14 @@ fn retained_core_execution_covers_reverse_and_class_changes_until_output_return(
     .unwrap();
     let packet = core.receive(first, now, &bytes[..length]).unwrap().unwrap();
     let mut original = packet.query();
-    assert!(!core.retains(original));
+    assert!(!core.retains(original, now));
     let Prepared::Forward(output) = core.prepare(packet, route(false, 1500), 1, now).unwrap()
     else {
         panic!()
     };
     let lease = output.lease();
     original.traffic_class = 0xb9;
-    assert!(core.retains(original));
+    assert!(core.retains(original, now));
     let reverse = honk_datapath::forward::RouteQuery {
         ingress: second,
         source: original.destination,
@@ -448,33 +448,130 @@ fn retained_core_execution_covers_reverse_and_class_changes_until_output_return(
             .map(|(source, destination)| (destination, source)),
         ..original
     };
-    assert!(core.retains(reverse));
-    assert!(!core.retains(honk_datapath::forward::RouteQuery {
-        ingress: first,
-        ..reverse
-    }));
-    assert!(!core.retains(honk_datapath::forward::RouteQuery {
-        ingress: Ingress {
-            attachment: 13,
-            ..second
+    assert!(core.retains(reverse, now));
+    assert!(!core.retains(
+        honk_datapath::forward::RouteQuery {
+            ingress: first,
+            ..reverse
         },
-        ..reverse
-    }));
+        now
+    ));
+    assert!(!core.retains(
+        honk_datapath::forward::RouteQuery {
+            ingress: Ingress {
+                attachment: 13,
+                ..second
+            },
+            ..reverse
+        },
+        now
+    ));
     drop(output);
     core.retire(now + Duration::from_secs(121));
-    assert!(core.retains(reverse));
+    assert!(core.retains(reverse, now + Duration::from_secs(121)));
     drop(lease);
     core.retire(now + Duration::from_secs(121));
-    assert!(core.retains(original));
+    assert!(core.retains(original, now + Duration::from_secs(121)));
     assert!(
-        core.retains(reverse),
+        core.retains(reverse, now + Duration::from_secs(121)),
         "idle TCP must not be reclassified into Endpoint"
     );
     core.retire(now + Duration::from_secs(7439));
-    assert!(core.retains(reverse));
+    assert!(core.retains(reverse, now + Duration::from_secs(7439)));
     core.retire(now + Duration::from_secs(7440));
-    assert!(!core.retains(original));
-    assert!(!core.retains(reverse));
+    assert!(!core.retains(original, now + Duration::from_secs(7440)));
+    assert!(!core.retains(reverse, now + Duration::from_secs(7440)));
+}
+
+#[test]
+fn expired_cached_and_owned_claims_get_new_owners_unless_output_is_still_held() {
+    let now = Instant::now();
+    for ipv6 in [false, true] {
+        for tcp in [false, true] {
+            let input = if tcp {
+                let mut bytes = vec![0; 80];
+                let source = if ipv6 { "fd00::1" } else { "192.0.2.1" }.parse().unwrap();
+                let destination = if ipv6 { "fd00::2" } else { "192.0.2.2" }.parse().unwrap();
+                let length = wire::tcp::emit_packet(
+                    &mut bytes,
+                    source,
+                    destination,
+                    &wire::tcp::Header {
+                        src_port: 40000,
+                        dst_port: 443,
+                        seq: 10,
+                        ack: 0,
+                        flags: wire::tcp::SYN,
+                        window: 4096,
+                        urgent: 0,
+                        options: Default::default(),
+                    },
+                    [&[], &[]],
+                )
+                .unwrap();
+                bytes.truncate(length);
+                bytes
+            } else {
+                udp(ipv6, 32)
+            };
+            let ttl = Duration::from_secs(if tcp { 7440 } else { 120 });
+            let expired = now + ttl;
+            for cached in [false, true] {
+                for held in [false, true] {
+                    let mut core =
+                        CoreForward::new(&[ingress()], MemoryBudget::new(16 << 20), 2).unwrap();
+                    let query = core
+                        .validate_view(ingress(), now, wire::PacketView::from_slice(&input))
+                        .unwrap()
+                        .query();
+                    let publish = |core: &mut CoreForward,
+                                   at: Instant,
+                                   generation: u64|
+                     -> ForwardLease {
+                        let mut bytes = [0; 1500];
+                        if cached {
+                            let validated = core
+                                .validate_view(ingress(), at, wire::PacketView::from_slice(&input))
+                                .unwrap();
+                            let mut output = core
+                                .prepare_view(validated, route(ipv6, 1500), generation, at)
+                                .unwrap()
+                                .unwrap();
+                            assert_eq!(
+                                output.write_next_segments(&mut [&mut bytes], &[]),
+                                Some(input.len())
+                            );
+                            output.lease()
+                        } else {
+                            let packet = core.receive(ingress(), at, &input).unwrap().unwrap();
+                            let Prepared::Forward(mut output) = core
+                                .prepare(packet, route(ipv6, 1500), generation, at)
+                                .unwrap()
+                            else {
+                                panic!("valid packet must produce Core output");
+                            };
+                            let (length, lease) = output.write_next(&mut bytes).unwrap();
+                            assert_eq!(length, input.len());
+                            lease
+                        }
+                    };
+                    let mut old_output = Some(publish(&mut core, now, 1));
+                    if !held {
+                        drop(old_output.take());
+                    }
+                    assert!(core.retains(query, expired - Duration::from_nanos(1)));
+                    assert_eq!(core.retains(query, expired), held);
+                    let new_output = publish(&mut core, expired, 2);
+                    assert_eq!(new_output.policy_generation(), if held { 1 } else { 2 });
+                    assert_eq!(new_output.ingress(), ingress());
+                    drop(old_output);
+                    drop(new_output);
+                    assert!(core.retains(query, expired + ttl - Duration::from_nanos(1)));
+                    assert!(!core.retains(query, expired + ttl));
+                }
+            }
+        }
+    }
 }
 
 #[test]
@@ -664,8 +761,8 @@ fn untrusted_tcp_close_cannot_shorten_cached_or_owned_execution_retention() {
             drop(core.prepare(packet, reply_route, 1, now).unwrap());
         }
         core.retire(now + Duration::from_secs(60));
-        assert!(core.retains(original));
-        assert!(core.retains(reverse));
+        assert!(core.retains(original, now + Duration::from_secs(60)));
+        assert!(core.retains(reverse, now + Duration::from_secs(60)));
         header.dst_port += 1;
         header.flags = wire::tcp::SYN;
         let len =
@@ -677,8 +774,8 @@ fn untrusted_tcp_close_cannot_shorten_cached_or_owned_execution_retention() {
         ));
         let expired = now + Duration::from_secs(7440);
         core.retire(expired);
-        assert!(!core.retains(original));
-        assert!(!core.retains(reverse));
+        assert!(!core.retains(original, expired));
+        assert!(!core.retains(reverse, expired));
         let packet = core
             .receive(second, expired, &bytes[..len])
             .unwrap()

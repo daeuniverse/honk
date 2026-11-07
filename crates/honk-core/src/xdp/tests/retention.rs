@@ -487,6 +487,49 @@ async fn terminal_device_error_escapes_a_real_output_blocked_join_without_refund
 }
 
 #[tokio::test]
+async fn terminal_join_sleeps_until_the_actual_output_owner_returns() {
+    struct Wake(std::sync::atomic::AtomicUsize);
+    impl std::task::Wake for Wake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let (endpoints, mut owner, scope, _budget, _slots) = fixture().await;
+    scope
+        .datagram_sender("198.51.100.1:53".parse().unwrap())
+        .send_to(b"held", "192.0.2.10:41000".parse().unwrap())
+        .await
+        .unwrap();
+    let output = scope.next_output().await.unwrap();
+    endpoints.close();
+    let wakes = Arc::new(Wake(Default::default()));
+    let waker = std::task::Waker::from(wakes.clone());
+    let mut warned = false;
+    let joined = join_endpoints(&mut owner, |_| Poll::Pending, Instant::now(), &mut warned);
+    tokio::pin!(joined);
+    assert!(
+        joined
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(
+        wakes.0.load(Ordering::SeqCst),
+        0,
+        "no periodic terminal poll without a device obligation"
+    );
+    assert!(output.packet().ends_with(b"held"));
+    output.release();
+    let (_plane, result) = tokio::time::timeout(Duration::from_secs(1), joined)
+        .await
+        .expect("actual output release wakes the joined owner")
+        .unwrap()
+        .unwrap();
+    result.unwrap();
+}
+
+#[tokio::test]
 async fn queued_priority_is_preserved_but_exported_output_does_not_freeze_new_priority() {
     tokio::time::timeout(Duration::from_secs(10), async {
         let (endpoints, owner, scope, _budget, _slots) = fixture().await;

@@ -127,13 +127,15 @@ Payload storage is a pool of chunks organized in two rings per TCP flow (send, r
 
 `honk-datapath` supplies nonwrapping `ScopeId` and a fixed frame/descriptor ledger; it grants no capture or routing authority. `control::netstack::PacketScope` owns one accounted Stack, one mutex, bounded frames/waiters and an externally joined timer owner. Output leases retain original TCP `FlowId`, bytes and credit until actual consumer release. Local release is not a NIC CQ, and a CQ address has no fabricated generation. Control and bulk reserves are separate.
 
+The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. PacketOwner protocol and conditional 100ms shared-budget timers remain unchanged. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
+
 AF_XDP TX still publishes each packet immediately. A concrete synchronous device turn may defer only its per-packet NEED_WAKEUP check until the turn exits; standalone sends still kick immediately. Every normal exit preserves both work and final-kick errors, and no batch spans an await. Panic closes admission without issuing I/O or releasing published owners; only real CQ can return those owners.
 
 `control::packet_endpoint::PacketEndpoints` consumes an unstarted control plane and explicit scopes sharing one budget. Its supervisor joins scope, TCP, UDP and retirement work; cancelling a shutdown waiter does not cancel admitted cleanup. TCP uses the existing routing/dial/Score path with copy relay, not kernel adoption or splice. UDP reuses the one endpoint/source pool and captured packet reply sender, with no reply FD. Endpoint/source/foreign-reply/sniffer keys include scope; packet retirement cannot mutate coincident kernel state. DNS still follows traffic policy before controller admission, and must/Block remain final.
 
 Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
 
-Normal close initiates protocol abort at the shared admission boundary, before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
+Normal close closes admission and publishes the same control-plane shutdown signal before protocol abort and before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
 
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install
@@ -309,6 +311,7 @@ and longer while output leases remain. Unverified FIN/RST cannot shorten that
 protection. An expired non-SYN TCP packet cannot create a fresh Endpoint or a forged
 reverse reset; a fresh initial SYN may create a new incarnation. FIB changes never
 promote Core owners to native forwarding. Queued packets have a two-second deadline.
+Lookup and claim check the same idle horizon before refreshing an unleased entry; slower physical maintenance cannot keep an expired execution owner authoritative. Actual retained output continues to preserve its original owner.
 
 Route authority and MTU are available before forward-neighbor resolution, so a
 known hop-limit or oversized-packet error does not wait for that unused neighbor.

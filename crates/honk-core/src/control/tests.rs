@@ -34,6 +34,48 @@ mod udp_fullcone;
 mod vlan_frames;
 
 #[tokio::test]
+async fn shutdown_intent_wakes_all_waiters_before_a_blocked_command_send() {
+    let plane = control_plane(Config::default());
+    let signal = plane.shutdown_intent();
+    let commands = plane.command_sender();
+    let _reserved = commands
+        .reserve_many(commands.max_capacity())
+        .await
+        .unwrap();
+    let (ready, mut registered) = tokio::sync::mpsc::channel(2);
+    let mut waiters = tokio::task::JoinSet::new();
+    for _ in 0..2 {
+        let signal = Arc::clone(&signal);
+        let ready = ready.clone();
+        waiters.spawn(async move {
+            let notified = signal.wait();
+            tokio::pin!(notified);
+            assert!(futures::poll!(&mut notified).is_pending());
+            ready.send(()).await.unwrap();
+            notified.await;
+        });
+    }
+    for _ in 0..2 {
+        registered.recv().await.unwrap();
+    }
+    let request = async {
+        signal.request();
+        commands.send(ControlCommand::Shutdown).await.unwrap();
+    };
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        for _ in 0..2 {
+            waiters.join_next().await.unwrap().unwrap();
+        }
+        signal.wait().await;
+    })
+    .await
+    .expect("all current and late shutdown waiters progress while command admission is blocked");
+    assert!(futures::poll!(&mut request).is_pending());
+}
+
+#[tokio::test]
 async fn health_push_re_resolves_after_reload_writer() {
     let node = udp_test_node();
     let old_config = udp_test_config(

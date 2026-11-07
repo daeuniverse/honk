@@ -79,6 +79,19 @@ impl Drop for GeneratedError {
 }
 
 impl RoutedCore {
+    /// The same clock as receive/retire; a pending neighbor quote keeps its original deadline.
+    pub fn poll_reassembly_timeout(&self, now: Instant) -> Option<Instant> {
+        let output = match &self.pending_reassembly_error {
+            Some(pending) => Some(pending.retry_at.min(pending.deadline)),
+            None => self.reassembly_poll_pending.then_some(now),
+        };
+        self.core
+            .poll_reassembly_timeout()
+            .into_iter()
+            .chain(output)
+            .min()
+    }
+
     /// Requires funded control-output storage of at least 1280 bytes. Suppressed/denied
     /// quotes are retired in bounded batches; one unresolved neighbor quote may wait for
     /// two seconds, never renewing its deadline. No conntrack grant is inferred from a quote.
@@ -93,11 +106,13 @@ impl RoutedCore {
         );
         let now = now.max(Instant::now());
         self.retire(now);
+        self.reassembly_poll_pending = true;
         for _ in 0..64 {
             let pending = match self.pending_reassembly_error.take() {
                 Some(pending) => pending,
                 None => {
                     let Some((ingress, quote)) = self.core.poll_expired_quote() else {
+                        self.reassembly_poll_pending = false;
                         return Ok(None);
                     };
                     let fragment = match transit::quote_metadata(&quote) {
@@ -174,7 +189,7 @@ impl RoutedCore {
                     marked,
                     query,
                     self.authority.0.execution,
-                    self.core.retains(query),
+                    self.core.retains(query, now),
                 ) != Disposition::Core
                 {
                     continue;
@@ -298,6 +313,120 @@ fn timeout_query(ingress: Ingress, quote: Quote) -> Option<RouteQuery> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reassembly_wait_uses_actual_expiry_then_quote_retry_and_bounded_drain() {
+        use honk_netstack::wire;
+        use std::os::fd::AsFd;
+        let mut config = honk_config::Config::default();
+        config.ensure_builtin_nodes();
+        config.global.dial_mode = "ip".into();
+        config.routing.default_outbound = "block".into();
+        let router = crate::routing::Router::from_config(&config.routing).unwrap();
+        let plane = crate::control::tests::support::control_plane(config);
+        *plane.router.write().await = router;
+        let authority = plane
+            .core_forward_policy(super::super::Execution::MixedEndpoints)
+            .await
+            .unwrap();
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        let ingress = Ingress {
+            scope: honk_datapath::ScopeId::allocate().unwrap(),
+            namespace: super::super::socket_namespace(socket.as_fd()).unwrap(),
+            ifindex: 2,
+            attachment: 1,
+            mark: honk_datapath::forward::MarkProvenance::BeforeSkb,
+        };
+        // Five quote queues retain 65 outputs, but the shared 64-entry admission needs two expiry waves.
+        let inputs: [Ingress; 5] = std::array::from_fn(|index| Ingress {
+            ifindex: 2 + index as u32,
+            ..ingress
+        });
+        let budget = MemoryBudget::new(16 << 20);
+        let mut core = super::super::tests::unsynchronized_core(authority, &inputs, &budget, None);
+        let start = Instant::now() - Duration::from_secs(62);
+        let mut bytes = [0; 60];
+        wire::udp::emit_packet(
+            &mut bytes,
+            "192.0.2.1:40000".parse().unwrap(),
+            "198.51.100.1:41000".parse().unwrap(),
+            &[7; 32],
+        )
+        .unwrap();
+        bytes[2..4].copy_from_slice(&36u16.to_be_bytes());
+        bytes[6..8].copy_from_slice(&0x2000u16.to_be_bytes());
+        for id in 0..65u16 {
+            if id == 64 {
+                assert_eq!(
+                    core.poll_reassembly_timeout(start),
+                    Some(start + Duration::from_secs(30))
+                );
+                core.retire(start + Duration::from_secs(30));
+            }
+            bytes[4..6].copy_from_slice(&id.to_be_bytes());
+            bytes[10..12].fill(0);
+            let checksum = wire::checksum::checksum(&bytes[..20]);
+            bytes[10..12].copy_from_slice(&checksum.to_be_bytes());
+            let input = inputs[usize::from(id % 5)];
+            let received = start + Duration::from_secs(if id == 64 { 31 } else { 0 });
+            assert!(
+                core.receive(input, received, &bytes[..36])
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let now = Instant::now();
+        core.retire(now);
+        assert_eq!(core.poll_reassembly_timeout(now), Some(now));
+        let (input, quote) = core.core.poll_expired_quote().unwrap();
+        let deadline = now + Duration::from_secs(120);
+        core.wait_reassembly_neighbor(Pending {
+            ingress: input,
+            quote,
+            deadline,
+            retry_at: now,
+            fragment: None,
+        });
+        let pending = core.pending_reassembly_error.as_mut().unwrap();
+        assert_eq!(pending.deadline, deadline);
+        assert!(pending.retry_at > now);
+        // Keep wall-clock scheduling out of the retry test; the absolute expiry is unchanged.
+        pending.retry_at = now + Duration::from_secs(60);
+        let retry = pending.retry_at;
+        assert_eq!(core.poll_reassembly_timeout(now), Some(retry));
+        let mut output = [0; 1280];
+        assert!(
+            core.poll_reassembly_error(now, &mut output)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(core.poll_reassembly_timeout(now), Some(retry));
+        let pending = core.pending_reassembly_error.as_mut().unwrap();
+        pending.retry_at = deadline + Duration::from_secs(1);
+        assert_eq!(core.poll_reassembly_timeout(now), Some(deadline));
+        core.pending_reassembly_error.as_mut().unwrap().deadline = now - Duration::from_nanos(1);
+        assert!(
+            core.poll_reassembly_error(now, &mut output)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            core.poll_reassembly_timeout(now),
+            Some(now),
+            "64 disposals must leave the remaining quote runnable"
+        );
+        assert!(
+            core.poll_reassembly_error(now, &mut output)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(core.poll_reassembly_timeout(now), None);
+        assert!(core.fragments_quiescent());
+    }
 
     #[test]
     fn timeout_query_uses_retained_first_fragment_context_in_both_families() {

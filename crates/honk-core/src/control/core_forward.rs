@@ -205,7 +205,7 @@ struct Registration {
     config: Arc<tokio::sync::RwLock<Arc<honk_config::Config>>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     users: Arc<std::sync::atomic::AtomicUsize>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<super::ShutdownIntent>,
     healthy: Arc<std::sync::atomic::AtomicBool>,
     execution: Execution,
     mode_state: Option<crate::mode::SharedModeState>,
@@ -217,7 +217,7 @@ struct Registration {
 
 impl RoutingAuthority {
     fn admitting(&self) -> bool {
-        !self.0.shutdown.load(Ordering::Acquire) && self.0.healthy.load(Ordering::Acquire)
+        !self.0.shutdown.requested() && self.0.healthy.load(Ordering::Acquire)
     }
 
     fn generation(&self, mode: Option<&crate::mode::ModeState>) -> PolicyGeneration {
@@ -331,6 +331,7 @@ pub struct RoutedCore {
     ingress_roles: Vec<(Ingress, InterfaceRole)>,
     reassembly_outputs: Arc<reassembly::Outputs>,
     pending_reassembly_error: Option<reassembly::Pending>,
+    reassembly_poll_pending: bool,
     counters: RefusalCounters,
     _role_charge: MemoryReservation,
     _charge: MemoryReservation,
@@ -388,6 +389,7 @@ impl RoutedCore {
             ingress_roles: Vec::with_capacity(ingresses.len()),
             reassembly_outputs,
             pending_reassembly_error: None,
+            reassembly_poll_pending: false,
             counters: RefusalCounters::default(),
             _role_charge: role_charge,
             _charge: charge,
@@ -546,7 +548,7 @@ impl RoutedCore {
             action.mark.is_some(),
             query,
             self.authority.0.execution,
-            self.core.retains(query),
+            self.core.retains(query, now),
         ) {
             Disposition::Drop => return Ok(CachedDecision::Drop),
             Disposition::Endpoint => {
@@ -658,7 +660,7 @@ impl RoutedCore {
                 marked,
                 packet.query(),
                 self.authority.0.execution,
-                self.core.retains(packet.query()),
+                self.core.retains(packet.query(), now),
             );
             let admission = if selected == Disposition::Endpoint && packet.permits_new_endpoint() {
                 let (source_port, destination_port) =
@@ -1099,6 +1101,10 @@ impl RoutedCore {
     }
 
     pub fn retire(&mut self, now: Instant) {
+        self.reassembly_poll_pending |= self
+            .core
+            .poll_reassembly_timeout()
+            .is_some_and(|deadline| deadline <= now);
         self.core.retire(now);
         invalidate_address_grants(
             &mut self.firewall,
@@ -1109,6 +1115,10 @@ impl RoutedCore {
             .set_fragment_obligations(self.core.fragment_obligations());
         self.firewall.expire(now);
     }
+    pub fn has_maintenance(&self) -> bool {
+        self.core.has_retained_flows() || self.firewall.has_maintenance()
+    }
+
     pub fn fragments_quiescent(&self) -> bool {
         self.core.fragments_quiescent()
             && self.reassembly_outputs.pending() == 0

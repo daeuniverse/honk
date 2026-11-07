@@ -744,6 +744,15 @@ impl Firewall {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+    /// Includes ID history and exported fragment owners even without a live binding.
+    pub fn has_maintenance(&self) -> bool {
+        !self.entries.is_empty()
+            || !self.identities.is_empty()
+            || !self.native_history.is_empty()
+            || !self.retained_fragments.is_empty()
+            || self.overflow_active != 0
+    }
+
     /// Missing fragment ports retain only the address/protocol domains they could complete.
     pub fn set_fragment_obligations(&mut self, pending: impl Iterator<Item = FragmentObligation>) {
         for entry in &self.entries {

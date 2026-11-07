@@ -338,6 +338,18 @@ struct Entry {
     flow: Arc<Flow>,
     last: Instant,
 }
+impl Entry {
+    fn retained(&self, now: Instant) -> bool {
+        // Without TCP sequence/window authority, FIN/RST cannot prove retirement.
+        let ttl = match self.flow.query.protocol {
+            wire::PROTO_TCP => TCP_IDLE_TIMEOUT,
+            wire::PROTO_UDP => UDP_IDLE_TIMEOUT,
+            _ => Duration::from_secs(60),
+        };
+        now.saturating_duration_since(self.last) < ttl || Arc::strong_count(&self.flow) > 1
+    }
+}
+
 struct Input {
     identity: Ingress,
     transit: Transit,
@@ -445,10 +457,11 @@ impl CoreForward {
 
     /// Execution ownership only, not a firewall grant or proof of TCP establishment.
     /// Reverse identity requires a registered logical egress; traffic class is not a tuple.
-    pub fn retains(&self, query: RouteQuery) -> bool {
+    /// Unleased idle owners expire at `now` even before the next maintenance sweep.
+    pub fn retains(&self, query: RouteQuery, now: Instant) -> bool {
         self.flows
             .iter()
-            .any(|entry| entry.flow.standalone && entry.flow.matches(query))
+            .any(|entry| entry.flow.standalone && entry.flow.matches(query) && entry.retained(now))
     }
 
     /// Copies only after validation; RX borrowed from AF_XDP is no longer accessible when
@@ -565,7 +578,10 @@ impl CoreForward {
         let mut existing = None;
         // ponytail: bounded 4096-entry lookup; index only after profiling the slow owner.
         for (index, entry) in self.flows.iter_mut().enumerate() {
-            if entry.flow.standalone != standalone || !entry.flow.matches(query) {
+            if entry.flow.standalone != standalone
+                || !entry.flow.matches(query)
+                || !entry.retained(now)
+            {
                 continue;
             }
             entry.last = now;
@@ -636,16 +652,12 @@ impl CoreForward {
             .error(now, error, source, &packet.as_ref()[..quote_len], out)?)
     }
 
+    pub fn has_retained_flows(&self) -> bool {
+        !self.flows.is_empty()
+    }
+
     pub fn retire(&mut self, now: Instant) {
-        self.flows.retain(|entry| {
-            // Without TCP sequence/window authority, FIN/RST cannot prove retirement.
-            let ttl = match entry.flow.query.protocol {
-                wire::PROTO_TCP => TCP_IDLE_TIMEOUT,
-                wire::PROTO_UDP => UDP_IDLE_TIMEOUT,
-                _ => Duration::from_secs(60),
-            };
-            Arc::strong_count(&entry.flow) > 1 || now.saturating_duration_since(entry.last) < ttl
-        });
+        self.flows.retain(|entry| entry.retained(now));
         for input in &mut self.inputs {
             input.transit.expire(now);
         }

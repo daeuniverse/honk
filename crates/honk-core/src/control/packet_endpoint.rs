@@ -81,6 +81,7 @@ struct Shared {
     udp_slots: Arc<tokio::sync::Semaphore>,
     stats: Arc<crate::stats::StatsManager>,
     admission: AtomicU8,
+    shutdown: Arc<super::ShutdownIntent>,
     #[cfg(feature = "native-api")]
     capture_ready: AtomicBool,
     changed: Notify,
@@ -98,6 +99,7 @@ impl Shared {
 
     fn close(&self) {
         self.admission.store(CLOSING, Ordering::Release);
+        self.shutdown.request();
         for scope in self.scopes.iter() {
             scope.shutdown(true);
         }
@@ -287,6 +289,7 @@ impl PacketEndpoints {
             udp_slots: Arc::clone(&plane.udp_concurrency_limit),
             stats: Arc::clone(&plane.stats),
             admission: AtomicU8::new(STARTING),
+            shutdown: plane.shutdown_intent(),
             #[cfg(feature = "native-api")]
             capture_ready: AtomicBool::new(false),
             changed: Notify::new(),
@@ -575,6 +578,10 @@ impl PacketEndpoints {
         Ok(())
     }
 
+    pub(crate) fn is_closing(&self) -> bool {
+        self.shared.is_closing()
+    }
+
     /// Close admission and abort protocol state before waiting for joined teardown.
     /// Exported output leases must still be released by their actual I/O consumers.
     pub fn close(&self) {
@@ -853,7 +860,6 @@ impl EndpointRuntime {
                     Some(command) => {
                         if self.shared.is_closing() {
                             if !self.shared.fatal_control.load(Ordering::Acquire) {
-                                self.plane.shutdown_requested.store(true, Ordering::Release);
                                 let _ = maintenance::handle_command(&mut self.plane, command).await;
                             }
                             break;
@@ -905,7 +911,6 @@ impl EndpointRuntime {
             }
         }
         self.shared.close();
-        self.plane.shutdown_requested.store(true, Ordering::Release);
         self.plane.drain_tracker.start_rejecting();
         if let Some(listener) = &dns_listener {
             listener.stop_accepting();

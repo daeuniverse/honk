@@ -309,7 +309,7 @@ impl ControlPlane {
             native_owner: None,
             #[cfg(feature = "native-api")]
             subscriptions: None,
-            shutdown_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            shutdown_requested: Arc::new(super::ShutdownIntent::default()),
             #[cfg(feature = "clash-api")]
             ui_download: Arc::new(tokio::sync::Mutex::new(None)),
             active_routing_plan: Arc::new(parking_lot::RwLock::new(initial_routing_plan)),

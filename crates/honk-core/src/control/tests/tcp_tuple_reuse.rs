@@ -14,7 +14,6 @@ use std::net::{IpAddr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket};
 
@@ -164,7 +163,7 @@ fn run_child(family: &str) -> anyhow::Result<()> {
                 server.abort();
             }
             let served = tokio::time::timeout(NETNS_TEST_TIMEOUT, server).await;
-            shutdown.store(true, Ordering::Release);
+            shutdown.request();
             let command = if task.is_finished() {
                 Ok(())
             } else {

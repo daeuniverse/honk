@@ -22,6 +22,7 @@ Read with: `AGENTS.md` (Notes for agents: the netstack paragraph); `test-locatio
 - Packet DNS facts use the canonical projection with registered non-HOST scope keys and shared owner/IP/zero-fact ceilings. Fresh numeric TCP/UDP consumes only its own scope's unexpired bitmap under matching routing generation/fingerprint; never synthesize a name, borrow HOST facts or add a second projector. HOST eviction still reconciles through the normal fenced worker.
 - Normal endpoint close aborts protocol state at the shared admission boundary before awaiting selector retirement. Preserve actual application/output/CQ completion and true command outcomes; a successful scope-owner exit after closing is not an unexpected failure.
 - TX wakeup batching is a synchronous per-Port scope, not delayed producer publication. Standalone sends kick immediately; normal exits retain both work and final-kick results. No scope crosses await, and unwind closes admission without I/O or refunding published ownership.
+- XDP arms readiness before rechecking state and computes the next obligation after service. Keep conditional CQ/TX-consumer/RX retries and required metadata/retained-history maintenance; posted FILL alone is idle. The same control-plane shutdown signal precedes scope abort and wakes capture independently of blocked commands. Lookup/claim rejects expired unleased Core owners without waiting for a sweep; actual retained output preserves ownership. Protocol and shared-budget timers remain unchanged.
 
 ### Stack invariants
 

@@ -133,6 +133,7 @@ async fn normal_close_preserves_an_active_reload_result_but_fatal_close_is_indet
             let config = Arc::clone(&plane.config);
             let router = Arc::clone(&plane.router);
             let commands = plane.command_sender();
+            let shutdown = plane.shutdown_intent();
             let mut candidate = (**config.read().await).clone();
             candidate.global.connect_timeout_ms += 1;
             let expected = candidate.global.connect_timeout_ms;
@@ -162,7 +163,22 @@ async fn normal_close_preserves_an_active_reload_result_but_fatal_close_is_indet
                 assert!(!owner.task.as_ref().unwrap().is_finished());
                 drop(held_router);
             } else {
+                let waiting = Arc::clone(&shutdown);
+                let (armed, registered) = tokio::sync::oneshot::channel();
+                let capture = tokio::spawn(async move {
+                    let stopping = waiting.wait();
+                    tokio::pin!(stopping);
+                    assert!(futures::poll!(&mut stopping).is_pending());
+                    armed.send(()).unwrap();
+                    stopping.await;
+                });
+                registered.await.unwrap();
                 endpoints.close();
+                tokio::time::timeout(Duration::from_secs(1), capture)
+                    .await.expect("direct close wakes the capture wait before the blocked reload can finish")
+                    .unwrap();
+                assert!(scope.next_output().await.is_none());
+                assert!(!owner.task.as_ref().unwrap().is_finished());
                 let mut reply = Box::pin(reply);
                 assert!(futures::poll!(&mut reply).is_pending());
                 drop(held_router);

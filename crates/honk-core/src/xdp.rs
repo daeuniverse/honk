@@ -39,6 +39,7 @@ use std::{
     net::IpAddr,
     os::fd::AsFd,
     path::Path,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -240,6 +241,19 @@ impl Pressure {
         }
     }
 
+    fn refusing(&self, core: crate::control::core_forward::RefusalCounters) -> bool {
+        self.counters.refused
+            || core.core_capacity != self.core.core_capacity
+            || core.nat_capacity != self.core.nat_capacity
+            || core.nat_exhausted != self.core.nat_exhausted
+            || core.nat_conflict != self.core.nat_conflict
+    }
+
+    fn next_deadline(&self, core: Option<&RoutedCore>) -> Option<Instant> {
+        (self.active || self.refusing(core.map(RoutedCore::counters).unwrap_or_default()))
+            .then_some(self.checked + Duration::from_secs(1))
+    }
+
     fn sample(
         &mut self,
         now: Instant,
@@ -263,15 +277,7 @@ impl Pressure {
         }
         let core = core.map(RoutedCore::counters).unwrap_or_default();
         let diagnostics_changed = self.counters != self.previous || core != self.core;
-        let active = self.counters.refused
-            || [
-                (core.core_capacity, self.core.core_capacity),
-                (core.nat_capacity, self.core.nat_capacity),
-                (core.nat_exhausted, self.core.nat_exhausted),
-                (core.nat_conflict, self.core.nat_conflict),
-            ]
-            .into_iter()
-            .any(|(current, previous)| current != previous || current == u64::MAX);
+        let active = self.refusing(core);
         if active && !self.active {
             tracing::warn!(counters = ?self.counters, core = ?core, waiting, pending, peers, "XDP packet pressure entered");
         } else if !active && self.active {
@@ -332,6 +338,7 @@ struct Runtime {
     staging: Vec<u8>,
     closing: bool,
     pressure: Pressure,
+    core_maintenance_checked: Instant,
     _memory: MemoryReservation,
 }
 
@@ -369,13 +376,13 @@ impl Runtime {
             if !self.admission.load(Ordering::Acquire) {
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
-            if let Err(error) = current_topology(&mut self.topology) {
-                return Poll::Ready(Err(error.into()));
-            }
             match self.topology.poll_read_ready(cx) {
                 Poll::Ready(Ok(mut ready)) => ready.clear_ready(),
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
                 Poll::Pending => {}
+            }
+            if let Err(error) = current_topology(&mut self.topology) {
+                return Poll::Ready(Err(error.into()));
             }
         }
         let now = Instant::now();
@@ -520,7 +527,7 @@ impl Runtime {
             let device = &mut self.devices[realm.device];
             let ifindex = device.info.ifindex;
             let (work, kick) = device.queues[0].io.get_mut().transmit_batch(|port| {
-                let mut submitted = 0;
+                let mut serviced = 0;
                 for (class_index, class) in
                     [TxClass::Control, TxClass::Bulk].into_iter().enumerate()
                 {
@@ -531,14 +538,21 @@ impl Runtime {
                                 Poll::Ready(Some(output)) => {
                                     let Some(path) = endpoint_return_path(&self.peers, &output)
                                     else {
+                                        serviced += 1;
                                         continue;
                                     };
                                     (output, path)
+                                }
+                                Poll::Ready(None)
+                                    if !self.closing && !self.endpoints.is_closing() =>
+                                {
+                                    anyhow::bail!("XDP packet scope ended before endpoint close");
                                 }
                                 _ => break,
                             },
                         };
                         if self.closing {
+                            serviced += 1;
                             continue;
                         }
                         let header =
@@ -562,10 +576,10 @@ impl Runtime {
                                 fill_output(target, &header[..length], output.packet())
                             },
                         )?;
-                        submitted += 1;
+                        serviced += 1;
                     }
                 }
-                Ok(submitted)
+                Ok(serviced)
             });
             progress += finish_transmit(work, kick)?;
         }
@@ -574,6 +588,103 @@ impl Runtime {
         } else {
             Poll::Ready(Ok(()))
         }
+    }
+
+    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut deadline: Option<Instant> = None;
+        let mut include = |due: Instant| {
+            deadline = Some(deadline.map_or(due, |previous| previous.min(due)));
+        };
+        for device in &self.devices {
+            for queue in &device.queues {
+                let port = queue.io.get_ref();
+                let retry = if self.closing {
+                    port.counters().submitted != port.counters().completed
+                } else {
+                    port.needs_service_retry()
+                };
+                if retry {
+                    include(now + Duration::from_millis(1));
+                }
+            }
+            if !self.closing && device.capture.vlan_metadata {
+                include(device.metadata_checked + Duration::from_secs(1));
+            }
+        }
+        if self.closing {
+            return deadline;
+        }
+        for work in &self.waiting {
+            include(work.retry.min(work.packet.deadline()));
+        }
+        for work in &self.pending {
+            let route = work.output.route();
+            let port = self
+                .devices
+                .iter()
+                .find(|device| device.info.ifindex == route.l2.physical_ifindex)
+                .map(|device| device.queues[0].io.get_ref());
+            let runnable = !selected_egress(&self.realms, route)
+                || port.is_none()
+                || work.output.next_len().is_none_or(|length| {
+                    port.is_some_and(|port| {
+                        port.tx_packet_credit(
+                            TxClass::Bulk,
+                            14 + 4 * usize::from(route.l2.vlan_count) + length,
+                        )
+                    })
+                });
+            include(if runnable {
+                now
+            } else {
+                work.output.deadline()
+            });
+        }
+        if let Some(core) = &self.core {
+            if let Some(due) = core.poll_reassembly_timeout(now) {
+                include(due);
+            }
+            if core.has_maintenance() {
+                include(self.core_maintenance_checked + Duration::from_secs(1));
+            }
+        }
+        if let Some(due) = self.pressure.next_deadline(self.core.as_ref()) {
+            include(due);
+        }
+        deadline
+    }
+
+    fn poll_service(
+        &mut self,
+        cx: &mut Context<'_>,
+        shutdown: &crate::control::ShutdownIntent,
+        mut timer: Pin<&mut Option<tokio::time::Sleep>>,
+    ) -> Poll<anyhow::Result<()>> {
+        if let Poll::Ready(result) = self.poll_io(cx) {
+            timer.set(None);
+            return Poll::Ready(result);
+        }
+        if !self.closing && shutdown.requested() {
+            timer.set(None);
+            return Poll::Ready(Ok(()));
+        }
+        // Registration and ring/output service may create obligations absent before this poll.
+        let now = Instant::now();
+        let Some(deadline) = self.next_deadline(now) else {
+            timer.set(None);
+            return Poll::Pending;
+        };
+        if deadline <= now {
+            timer.set(None);
+            return Poll::Ready(Ok(()));
+        }
+        let deadline = tokio::time::Instant::from_std(deadline);
+        if let Some(mut sleep) = timer.as_mut().as_pin_mut() {
+            sleep.as_mut().reset(deadline);
+        } else {
+            timer.set(Some(tokio::time::sleep_until(deadline)));
+        }
+        timer.as_pin_mut().unwrap().poll(cx).map(|()| Ok(()))
     }
 
     async fn resolve(&mut self) -> anyhow::Result<()> {
@@ -762,7 +873,6 @@ impl Runtime {
                 self.pending.push_back(work);
             }
         }
-        core.retire(now);
         if let Some(error) = core.poll_reassembly_error(now, &mut self.staging).await? {
             let route = error.route;
             if selected_egress(&self.realms, route)
@@ -787,6 +897,7 @@ impl Runtime {
                 }
             }
         }
+        self.core_maintenance_checked = Instant::now();
         Ok(())
     }
 }
@@ -1199,9 +1310,9 @@ pub(crate) async fn join_endpoints(
                 owner.fail_control().await?;
                 return Err(error);
             },
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(started + Duration::from_secs(10))), if !*warned => {}
         }
-        if started.elapsed() > Duration::from_secs(10) && !*warned {
+        if started.elapsed() >= Duration::from_secs(10) && !*warned {
             tracing::warn!(
                 "XDP terminal completion is delayed; retaining owners and UMEM until actual return"
             );
@@ -1242,6 +1353,7 @@ pub(crate) async fn run(
         staging,
         closing: false,
         pressure: Pressure::new(Instant::now()),
+        core_maintenance_checked: Instant::now(),
         _memory: memory,
     };
     let activate = (|| -> anyhow::Result<()> {
@@ -1304,8 +1416,10 @@ pub(crate) async fn run(
     }
     let mut warned = false;
     let mut close_started = None;
+    let timer = None;
+    tokio::pin!(timer);
     let joined = loop {
-        if (failure.is_some() || shutdown.load(Ordering::Acquire)) && !runtime.closing {
+        if (failure.is_some() || shutdown.requested()) && !runtime.closing {
             if let Err(error) = runtime.close_capture() {
                 failure.get_or_insert(error);
             }
@@ -1314,7 +1428,7 @@ pub(crate) async fn run(
         if runtime.closing {
             match join_endpoints(
                 &mut owner,
-                |cx| runtime.poll_io(cx),
+                |cx| runtime.poll_service(cx, &shutdown, timer.as_mut()),
                 close_started.unwrap(),
                 &mut warned,
             )
@@ -1345,13 +1459,13 @@ pub(crate) async fn run(
         }
         tokio::select! {
             result = poll_fn(|cx| owner.poll_join_plane(cx)) => break result,
-            result = poll_fn(|cx| runtime.poll_io(cx)) => {
+            result = poll_fn(|cx| runtime.poll_service(cx, &shutdown, timer.as_mut())) => {
                 if let Err(error) = result {
                     if failure.is_none() { tracing::error!(%error, "XDP owner failed closed"); }
                     failure.get_or_insert(error);
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(1)) => {}
+            _ = shutdown.wait() => {}
         }
         tokio::task::yield_now().await;
     };
@@ -1700,6 +1814,38 @@ mod tests {
     use super::*;
 
     mod retention;
+
+    #[test]
+    fn pressure_deadline_ends_after_the_recovery_sample() {
+        let start = Instant::now();
+        let mut pressure = Pressure::new(start);
+        assert_eq!(pressure.next_deadline(None), None);
+        pressure.counters.capture_rejected = 1;
+        assert_eq!(
+            pressure.next_deadline(None),
+            None,
+            "diagnostics do not drive polling"
+        );
+        pressure.counters.refused = true;
+        assert_eq!(
+            pressure.next_deadline(None),
+            Some(start + Duration::from_secs(1))
+        );
+        pressure.sample(start + Duration::from_secs(1), None, 0, 0, 0, &[]);
+        assert!(pressure.active);
+        assert_eq!(
+            pressure.next_deadline(None),
+            Some(start + Duration::from_secs(2))
+        );
+        pressure.sample(start + Duration::from_secs(2), None, 0, 0, 0, &[]);
+        assert!(!pressure.active);
+        assert_eq!(pressure.next_deadline(None), None);
+        pressure.core.core_capacity = u64::MAX;
+        assert!(
+            !pressure.refusing(pressure.core),
+            "a saturated historic counter is not new work"
+        );
+    }
 
     #[test]
     fn qinq_realms_share_capacity_and_release_their_complete_budget() {

@@ -81,9 +81,7 @@ pub(super) async fn handle_command(
     plane: &mut ControlPlane,
     command: ControlCommand,
 ) -> CommandAction {
-    let closing = plane
-        .shutdown_requested
-        .load(std::sync::atomic::Ordering::Acquire);
+    let closing = plane.shutdown_requested.requested();
     match command {
         #[cfg(any(feature = "native-api", feature = "clash-api"))]
         ControlCommand::SetSelector { request, reply } => {
@@ -159,9 +157,7 @@ pub(super) async fn shutdown(
     mut failure: Option<anyhow::Error>,
     udp: Option<super::super::udp_endpoint::UdpShutdown>,
 ) -> anyhow::Result<()> {
-    plane
-        .shutdown_requested
-        .store(true, std::sync::atomic::Ordering::Release);
+    plane.shutdown_requested.request();
     plane.drain_tracker.start_rejecting();
     #[cfg(feature = "native-api")]
     plane.publish_phase(if failure.is_some() {

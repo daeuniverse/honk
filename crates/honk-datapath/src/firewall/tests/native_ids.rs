@@ -364,11 +364,16 @@ fn prepolicy_history_has_no_grant_and_repairs_unbound_quotes_after_reload() {
     let now = Instant::now();
     let budget = MemoryBudget::new(4 << 20);
     let mut table = Firewall::new_history(Arc::clone(&budget), 4, 1).unwrap();
+    assert!(!table.has_maintenance());
     let plain = tuple("10.0.0.2:1001", "10.0.1.8:80", wire::PROTO_UDP);
     let held_plain = table
         .observe_plain(ingress(1), ingress(2), plain, 0, now)
         .unwrap();
     assert!(table.is_empty());
+    assert!(
+        table.has_maintenance(),
+        "native history needs maintenance without a grant"
+    );
     assert!(table._state_charge.is_none());
     let nat = fragmentable_udp(
         tuple("10.0.0.2:1000", "198.51.100.1:8080", wire::PROTO_UDP),

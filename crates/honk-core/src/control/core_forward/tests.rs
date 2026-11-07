@@ -1,6 +1,6 @@
 use super::*;
 
-fn unsynchronized_core(
+pub(super) fn unsynchronized_core(
     authority: RoutingAuthority,
     ingresses: &[Ingress],
     budget: &Arc<MemoryBudget>,
@@ -16,6 +16,7 @@ fn unsynchronized_core(
         ingress_roles: Vec::new(),
         reassembly_outputs: reassembly::Outputs::new(budget).unwrap(),
         pending_reassembly_error: None,
+        reassembly_poll_pending: false,
         counters: RefusalCounters::default(),
         _role_charge: budget.reserve(0).unwrap(),
         _charge: budget.reserve(0).unwrap(),
@@ -38,7 +39,7 @@ fn fib_prohibit_authorizes_admin_error_without_forwarding_authority() {
 }
 
 #[tokio::test]
-async fn expired_reverse_tcp_is_silent_and_fresh_syn_can_create_an_endpoint() {
+async fn expired_reverse_tcp_is_silent_and_new_endpoint_is_admitted_without_retire() {
     use honk_netstack::wire::{self, tcp};
     use std::{os::fd::AsFd, time::Duration};
 
@@ -113,10 +114,22 @@ async fn expired_reverse_tcp_is_silent_and_fresh_syn_can_create_an_endpoint() {
             source_mac: [2; 6],
             destination_mac: [4; 6],
         };
-        drop(core.core.prepare(packet, route, 1, old).unwrap());
-        assert!(core.core.retains(original));
-        core.retire(Instant::now());
-        assert!(!core.core.retains(original));
+        let Prepared::Forward(output) = core.core.prepare(packet, route, 1, old).unwrap() else {
+            panic!("initial Core owner missing");
+        };
+        let held = output.lease();
+        drop(output);
+        assert!(
+            core.core.retains(original, Instant::now()),
+            "actual output retains the old executor past idle expiry"
+        );
+        drop(held);
+        assert!(core.core.retains(original, old));
+        assert!(!core.core.retains(original, Instant::now()));
+        assert!(
+            core.has_maintenance(),
+            "the expired directory entry has not been swept"
+        );
         header.src_port = 443;
         header.dst_port = 40000;
         for flags in [tcp::ACK, tcp::FIN | tcp::ACK, tcp::RST, tcp::SYN | tcp::ACK] {
@@ -152,6 +165,17 @@ async fn expired_reverse_tcp_is_silent_and_fresh_syn_can_create_an_endpoint() {
         header.flags = tcp::SYN | 0xc0;
         let len = tcp::emit_packet(&mut bytes, destination, source, &header, [&[], &[]]).unwrap();
         let now = Instant::now();
+        assert!(matches!(
+            core.forward_cached(
+                reply,
+                wire::PacketView::from_slice(&bytes[..len]),
+                None,
+                now,
+                |_, _| -> io::Result<Option<()>> { panic!("new Endpoint SYN reached Core TX") }
+            )
+            .unwrap(),
+            CachedDecision::Cold
+        ));
         let packet = core.receive(reply, now, &bytes[..len]).unwrap().unwrap();
         let Decision::Endpoint(_, admission) = core.decide(packet, None, now).await.unwrap() else {
             panic!("a fresh SYN must be able to reuse the expired tuple");
@@ -1419,6 +1443,10 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            core.poll_reassembly_timeout(start),
+            Some(start + Duration::from_secs(30))
+        );
         let mut output = [0; 1280];
         let generated = core
             .poll_reassembly_error(Instant::now(), &mut output)
@@ -1428,6 +1456,15 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
         assert_eq!(&output[20..22], &[11, 1]);
         assert_eq!(core.reassembly_outputs.pending(), 1);
         assert!(!core.fragments_quiescent());
+        let due = Instant::now();
+        assert_eq!(core.poll_reassembly_timeout(due), Some(due));
+        assert!(
+            core.poll_reassembly_error(due, &mut [0; 1280])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(core.poll_reassembly_timeout(due), None);
         assert!(budget.used() > baseline);
         assert_eq!(
             core.submit(generated.route, generated.generation, || Ok(Some(())))

@@ -96,7 +96,7 @@ async fn xdp_flag_initialization_failure_retains_cleanup_until_output_returns() 
             .unwrap();
         let output = scope.next_output().await.unwrap();
         drop(held_backend);
-        while !stopped.load(Ordering::Acquire) {
+        while !stopped.requested() {
             tokio::task::yield_now().await;
         }
         assert!(futures::poll!(&mut opening).is_pending());
@@ -153,12 +153,15 @@ async fn cancelled_startup_never_activates_and_retains_exported_output() {
                 .await
                 .unwrap();
             let output = scope.next_output().await.unwrap();
+            let stopping = stopped.wait();
+            tokio::pin!(stopping);
+            assert!(futures::poll!(&mut stopping).is_pending());
             drop(opening);
+            tokio::time::timeout(Duration::from_secs(1), &mut stopping)
+                .await
+                .expect("startup cancellation wakes capture before its blocked supervisor resumes");
             drop(config_guard);
             let _ = release.send(());
-            while !stopped.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
-            }
             assert!(native.core.activated_at(generation).is_none());
             assert!(output.packet().ends_with(b"retained"));
             output.release();

@@ -24,7 +24,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::OwnedFd;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
@@ -490,7 +489,7 @@ async fn with_datapath(scenario: Scenario, dae0: &daens::Dae0Setup) -> anyhow::R
         exchange(&scenario).await
     }
     .await;
-    shutdown.store(true, Ordering::Release);
+    shutdown.request();
     let command = if task.is_finished() {
         Ok(())
     } else {

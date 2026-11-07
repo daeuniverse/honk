@@ -540,7 +540,7 @@ async fn startup_failure_waits_for_owned_output_and_supervisor_cleanup() {
         let output = scope.next_output().await.unwrap();
         scope.shutdown(true);
         drop(config_guard);
-        while !stopped.load(Ordering::Acquire) {
+        while !stopped.requested() {
             tokio::task::yield_now().await;
         }
         assert!(
@@ -671,7 +671,7 @@ async fn late_reserved_tcp_ingress_is_disposed_before_scope_join() {
             .unwrap();
         let flow = pending_tcp(&scope, "203.0.113.9:443".parse().unwrap());
         endpoints.close();
-        while !stopped.load(Ordering::Acquire) {
+        while !stopped.requested() {
             tokio::task::yield_now().await;
         }
         let mut closing = Box::pin(endpoints.shutdown());

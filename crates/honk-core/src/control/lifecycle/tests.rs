@@ -9,7 +9,7 @@ struct Fixture {
     phase: watch::Receiver<EnginePhase>,
     native: Arc<crate::native_api::observation::NativeObservation>,
     backend: Arc<RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    shutdown: Arc<crate::control::ShutdownIntent>,
     task: tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>,
     api: crate::native_api::NativeServer,
     tproxy: SocketAddr,
@@ -211,7 +211,7 @@ impl Fixture {
 
     async fn finish(self, failure: bool) -> ControlPlane {
         if !self.task.is_finished() {
-            self.shutdown.store(true, Ordering::Release);
+            self.shutdown.request();
             let _ = self.commands.send(ControlCommand::Shutdown).await;
         }
         let (plane, result) = tokio::time::timeout(WAIT, self.task)
@@ -295,7 +295,7 @@ async fn ordinary_shutdown_preserves_live_tcp_until_graceful_completion() -> any
         .await
         .expect("timed out receiving graceful-shutdown TCP request at the SOCKS peer")?;
     assert_eq!(&request, b"request");
-    fixture.shutdown.store(true, Ordering::Release);
+    fixture.shutdown.request();
     fixture.commands.send(ControlCommand::Shutdown).await?;
     tokio::time::timeout(
         WAIT,

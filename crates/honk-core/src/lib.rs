@@ -1624,7 +1624,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 info!("Received SIGTERM, shutting down...");
             }
         }
-        shutdown_intent.store(true, std::sync::atomic::Ordering::Release);
+        shutdown_intent.request();
         let _ = cmd_tx.send(control::ControlCommand::Shutdown).await;
     });
 

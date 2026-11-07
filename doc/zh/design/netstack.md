@@ -127,13 +127,15 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 `honk-datapath` 提供不回绕的 `ScopeId` 和固定 frame/descriptor 账本，不授予抓包或路由权威。`control::netstack::PacketScope` 持有一个计账 Stack、一把互斥锁、有界 frame/waiter 和须由外层 join 的 timer owner。输出 lease 保留原始 TCP `FlowId`、字节和 credit，直到真实消费者释放。本地归还不是 NIC CQ，CQ 地址也没有虚构的 generation；控制与 bulk 各有预留。
 
+XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。PacketOwner 的协议 timer 与有条件的 100ms 共享预算后备不变。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
+
 AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
 已接受的 packet DNS 应答写入同一 scope 的 canonical [路由投影](./dns.md#路由投影)，新建数值目标的 TCP/UDP 流无需嗅探名称即可消费这些事实。它们不授予 HOST/内核投影权威。
 
-正常关闭在共享准入边界立即启动协议 abort，然后才等待正在执行的 selector 精确退休。应用关闭以及已导出/CQ 持有输出的实际释放仍必须完成；命令完成或空 scope owner 退出都不能伪造这些释放。
+正常关闭先关闭准入并发布同一个控制面 shutdown signal，再启动协议 abort，随后等待正在执行的 selector 精确退休。应用关闭以及已导出/CQ 持有输出的实际释放仍必须完成；命令完成或空 scope owner 退出都不能伪造这些释放。
 
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
 不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出
@@ -276,6 +278,7 @@ Core TCP 执行保留到空闲 7440 秒，UDP 为 120 秒，其他流量 60 秒�
 时继续持有。未经窗口验证的 FIN/RST 不能缩短保护。过期后的非 SYN TCP 包不能
 创建新 Endpoint 或伪造反向 RST；新 initial SYN 可创建新 incarnation。
 FIB 变化不升级成原生转发，排队包截止时间仍为两秒。
+lookup/claim 在刷新无 lease 条目之前检查同一空闲期限；降低物理维护频率不能延长已过期执行 owner 的权威。实际保留的输出仍持有原 owner。
 
 转发邻居未解析时仍可取得路由权威和 MTU，已知 hop-limit/超 MTU 错误不等待
 这个不需要的邻居。生成错误仍需独立 local-output 路由、回程邻居，以及同步本地
