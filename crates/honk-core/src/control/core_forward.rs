@@ -226,6 +226,26 @@ impl RoutingAuthority {
             mode: mode.map_or(0, crate::mode::ModeState::revision),
         }
     }
+
+    /// Acquire the actual router then config publication readers, in the existing order.
+    /// Keep a pending acquisition beside other owner work; drop the guards before awaiting.
+    pub async fn read_policy(&self) -> PolicyRead<'_> {
+        let router = self.0.router.read().await;
+        let config = self.0.config.read().await;
+        PolicyRead {
+            registration: &self.0,
+            router,
+            config,
+        }
+    }
+}
+
+/// Held publication readers of one registration. Core rejects another registration's guards;
+/// there is no other constructor and no detached generation.
+pub struct PolicyRead<'a> {
+    registration: &'a Arc<Registration>,
+    router: tokio::sync::RwLockReadGuard<'a, crate::routing::Router>,
+    config: tokio::sync::RwLockReadGuard<'a, Arc<honk_config::Config>>,
 }
 
 impl Drop for Registration {
@@ -394,6 +414,22 @@ impl RoutedCore {
             _role_charge: role_charge,
             _charge: charge,
         })
+    }
+
+    /// A clone of this core's existing registration, not a second policy consumer.
+    pub fn authority(&self) -> RoutingAuthority {
+        self.authority.clone()
+    }
+
+    fn check_policy(&self, read: &PolicyRead<'_>) -> io::Result<()> {
+        if Arc::ptr_eq(read.registration, &self.authority.0) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "policy readers belong to another Core registration",
+            ))
+        }
     }
 
     pub fn set_ingress_roles(&mut self, roles: &[(Ingress, InterfaceRole)]) -> anyhow::Result<()> {
@@ -614,19 +650,22 @@ impl RoutedCore {
         result
     }
 
-    pub async fn decide(
+    /// Bounded and synchronous under readers acquired from this core's own registration.
+    pub fn decide(
         &mut self,
+        read: &PolicyRead<'_>,
         mut packet: Packet,
         source_mac: Option<&str>,
         now: Instant,
     ) -> anyhow::Result<Decision> {
+        self.check_policy(read)?;
         let now = now.max(Instant::now());
         if now >= packet.deadline() || !self.authority.admitting() {
             return Ok(Decision::Drop);
         }
         let (generation, epoch, policy, selected, admission) = {
-            let router = self.authority.0.router.read().await;
-            let config = self.authority.0.config.read().await;
+            let router = &*read.router;
+            let config = &*read.config;
             let mode_state = self
                 .authority
                 .0
@@ -641,12 +680,12 @@ impl RoutedCore {
                 )
             });
             let generation = self.authority.generation(mode_state.as_deref());
-            let Some(action) = route_action(&router, packet.query(), source_mac) else {
+            let Some(action) = route_action(router, packet.query(), source_mac) else {
                 return Ok(Decision::Drop);
             };
             let mode = mode_decision(
                 mode_state.as_deref(),
-                &config,
+                config,
                 #[cfg(feature = "native-api")]
                 native.as_ref().map(|(_, catalog)| &**catalog),
                 action.outbound.clone(),
@@ -682,7 +721,7 @@ impl RoutedCore {
                 };
                 Some(PacketRoutingSnapshot {
                     decision: RoutingDecision::from_router(
-                        &router,
+                        router,
                         &input,
                         None,
                         #[cfg(feature = "native-api")]
@@ -696,7 +735,7 @@ impl RoutedCore {
                     mode_state: None,
                     admission_final: true,
                     memory: None,
-                    config: Arc::clone(&config),
+                    config: Arc::clone(config),
                     group_manager: self.authority.0.group_manager.read().clone(),
                     runtime: self.authority.0.runtime_registry.read().clone(),
                     #[cfg(feature = "native-api")]
@@ -1027,17 +1066,18 @@ impl RoutedCore {
         Ok(Decision::Forward(prepared, generation))
     }
 
-    /// Hold the existing policy publication reader AND the provider owner through actual
+    /// Run inside the actual policy publication readers AND the provider owner through
     /// descriptor submission. A rejected fence must dispose output, not replay decremented bytes.
     /// The callback rechecks its packet/lease after expiration; `None` disposes stale output.
-    pub async fn submit<T>(
+    pub fn submit<T>(
         &mut self,
+        read: &PolicyRead<'_>,
         route: Route,
         generation: PolicyGeneration,
         submit: impl FnOnce() -> io::Result<Option<T>>,
     ) -> io::Result<Option<T>> {
-        let router = self.authority.0.router.read().await;
-        let _config = self.authority.0.config.read().await;
+        self.check_policy(read)?;
+        let router = &*read.router;
         let mode = self
             .authority
             .0

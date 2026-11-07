@@ -324,6 +324,8 @@ mod linux {
             config.requirements.clone(),
             Arc::clone(&budget),
         )?;
+        // Readers are acquired per decision/publication and dropped before the next await.
+        let authority = core.authority();
         for index in 0..2 {
             links[index].0.as_ref().unwrap().replace(&programs[index])?;
         }
@@ -381,10 +383,13 @@ mod linux {
                     waiting.push_back(work);
                     continue;
                 }
-                match core
-                    .decide(work.packet, Some(&macs[work.owner]), now)
-                    .await?
-                {
+                let decision = core.decide(
+                    &authority.read_policy().await,
+                    work.packet,
+                    Some(&macs[work.owner]),
+                    now,
+                )?;
+                match decision {
                     Decision::Wait(packet) => waiting.push_back(Waiting {
                         packet,
                         retry: now + Duration::from_millis(10),
@@ -415,7 +420,7 @@ mod linux {
                         {
                             let header = route.ethernet_header(packet.ip().src.is_ipv6())?;
                             if core
-                                .submit(route, generation, || {
+                                .submit(&authority.read_policy().await, route, generation, || {
                                     if !packet.is_current(Instant::now()) {
                                         return Ok(None);
                                     }
@@ -428,8 +433,7 @@ mod linux {
                                             },
                                         )
                                         .map(Some)
-                                })
-                                .await?
+                                })?
                                 .is_some()
                             {
                                 errors += 1;
@@ -459,23 +463,27 @@ mod linux {
                 };
                 let header = route.ethernet_header(out[0] >> 4 == 6)?;
                 if core
-                    .submit(route, work.generation, || {
-                        if !lease
-                            .retained_packet()
-                            .expect("owned forwarding cursor")
-                            .is_current(Instant::now())
-                        {
-                            return Ok(None);
-                        }
-                        ports[device]
-                            .transmit_segments(
-                                TxClass::Bulk,
-                                &[&header, &out[..length]],
-                                Lease::Forward { _owner: lease },
-                            )
-                            .map(Some)
-                    })
-                    .await?
+                    .submit(
+                        &authority.read_policy().await,
+                        route,
+                        work.generation,
+                        || {
+                            if !lease
+                                .retained_packet()
+                                .expect("owned forwarding cursor")
+                                .is_current(Instant::now())
+                            {
+                                return Ok(None);
+                            }
+                            ports[device]
+                                .transmit_segments(
+                                    TxClass::Bulk,
+                                    &[&header, &out[..length]],
+                                    Lease::Forward { _owner: lease },
+                                )
+                                .map(Some)
+                        },
+                    )?
                     .is_some()
                 {
                     transmitted += 1;

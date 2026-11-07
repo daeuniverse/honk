@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::netstack::{FlowIo, PacketOwner};
+use crate::control::netstack::{FlowIo, PacketDriver, PacketOwner};
 use honk_netstack::wire::tcp;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,11 +14,11 @@ fn path() -> ReturnPath {
     }
 }
 
-async fn fixture() -> (
-    PacketEndpoints,
-    PacketEndpointOwner,
+fn fixture_parts() -> (
     PacketScope,
+    PacketOwner,
     Arc<MemoryBudget>,
+    ControlPlane,
     Arc<tokio::sync::Semaphore>,
 ) {
     let budget = MemoryBudget::new(32 << 20);
@@ -52,10 +52,50 @@ async fn fixture() -> (
     config.global.udp_warm_node_count = 0;
     let plane = crate::control::tests::support::control_plane(config);
     let slots = crate::control::tests::support::tcp_slots(&plane);
+    (scope, owner, budget, plane, slots)
+}
+
+async fn fixture() -> (
+    PacketEndpoints,
+    PacketEndpointOwner,
+    PacketScope,
+    Arc<MemoryBudget>,
+    Arc<tokio::sync::Semaphore>,
+) {
+    let (scope, owner, budget, plane, slots) = fixture_parts();
     let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), owner)], 4)
         .await
         .unwrap();
     (endpoints, owner, scope, budget, slots)
+}
+
+/// The daemon's start: the driver exists before readiness and this test is its device owner.
+async fn driven(
+    scope: PacketScope,
+    owner: PacketOwner,
+    plane: ControlPlane,
+) -> (PacketEndpoints, PacketEndpointOwner, PacketDriver) {
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(scope, owner)], 4).unwrap();
+    poll_fn(|cx| owner.poll_ready(cx)).await.unwrap();
+    assert_eq!(drivers.len(), 1);
+    (endpoints, owner, drivers.pop().unwrap())
+}
+
+/// Close, then keep driving until the parked original owner and supervisor have joined.
+async fn join_driven(
+    endpoints: PacketEndpoints,
+    mut owner: PacketEndpointOwner,
+    driver: &mut PacketDriver,
+) {
+    endpoints.close();
+    let (_plane, result) = poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        owner.poll_join_plane(cx)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
 }
 
 fn datagram(source: SocketAddr, destination: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -947,11 +987,12 @@ fn transmit_finalization_preserves_primary_failure_and_terminal_kick() {
 #[tokio::test]
 async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let first = fixture().await;
-        let second = fixture().await;
-        for (device, (endpoints, owner, scope, _budget, _slots)) in
-            [first, second].into_iter().enumerate()
-        {
+        let mut fixtures = Vec::new();
+        for _ in 0..2 {
+            let (scope, owner, _budget, plane, _slots) = fixture_parts();
+            fixtures.push((scope.clone(), driven(scope, owner, plane).await));
+        }
+        for (device, (scope, (endpoints, owner, driver))) in fixtures.into_iter().enumerate() {
             let mut reply_path = path();
             reply_path.device = device;
             reply_path.mac[5] += device as u8;
@@ -977,31 +1018,29 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
                         vlan_count: reply_path.vlan_count,
                     },
                 },
-                scope,
+                driver,
                 pending: [None, None],
             };
             let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
             let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
             let now = Instant::now();
-            realm
-                .scope
-                .receive(&segment(source, destination, 100, 0, tcp::SYN), now);
-            let (_, flow) = realm.scope.poll_accept().unwrap();
-            realm.scope.drive(now);
-            realm
-                .scope
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            scope.receive(&segment(source, destination, 100, 0, tcp::SYN), now);
+            let (_, flow) = scope.poll_accept().unwrap();
+            // The device's driver, not a separate owner task, materializes the SYN-ACK.
+            assert!(!realm.driver.service(&mut cx, now));
+            scope
                 .datagram_sender(destination)
                 .send_to(b"lone final reply", source)
                 .await
                 .unwrap();
             let peers = [Peer {
-                scope: realm.scope.scope(),
+                scope: realm.driver.scope(),
                 address: source.ip(),
                 path: reply_path,
                 last_seen: now,
                 conflict: None,
             }];
-            let mut cx = Context::from_waker(std::task::Waker::noop());
             for class in [TxClass::Control, TxClass::Bulk] {
                 let mut outputs = [None, None];
                 let (selected, pending_path) = realm.poll_outputs(&mut cx, class, 2, &mut outputs);
@@ -1025,8 +1064,7 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
                 output.release();
             }
             drop(flow);
-            endpoints.shutdown().await.unwrap();
-            owner.run().await.unwrap();
+            join_driven(endpoints, owner, &mut realm.driver).await;
         }
     })
     .await
@@ -1036,7 +1074,8 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
 #[tokio::test]
 async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
     tokio::time::timeout(Duration::from_secs(10), async {
-        let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+        let (scope, owner, _budget, plane, _slots) = fixture_parts();
+        let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
         let reply_path = path();
         let mut realm = Realm {
             ingress: Ingress {
@@ -1058,13 +1097,11 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
                     vlan_count: reply_path.vlan_count,
                 },
             },
-            scope,
+            driver,
             pending: [None, None],
         };
         let destination: SocketAddr = "192.0.2.10:41000".parse().unwrap();
-        let sender = realm
-            .scope
-            .datagram_sender("198.51.100.1:443".parse().unwrap());
+        let sender = scope.datagram_sender("198.51.100.1:443".parse().unwrap());
         for payload in [b"A", b"B"] {
             sender.send_to(payload, destination).await.unwrap();
         }
@@ -1109,9 +1146,91 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
         release_completed(&mut completed.each_mut().map(Option::as_mut));
         drop(completed);
         drop(sender);
-        endpoints.shutdown().await.unwrap();
-        owner.run().await.unwrap();
+        join_driven(endpoints, owner, &mut realm.driver).await;
     })
     .await
     .expect("bounded selection must retain only its one blocked head");
+}
+
+#[tokio::test]
+async fn held_policy_publication_never_suspends_the_driven_scope_timer_owner() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (scope, owner, _budget, plane, _slots) = fixture_parts();
+        let authority = plane
+            .core_forward_policy(Execution::MixedEndpoints)
+            .await
+            .unwrap();
+        let config = plane.config_handle();
+        let shutdown = plane.shutdown_intent();
+        let (endpoints, mut owner, mut driver) = driven(scope.clone(), owner, plane).await;
+        let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        scope.receive(
+            &segment(source, destination, 100, 0, tcp::SYN),
+            Instant::now(),
+        );
+        let (_, flow) = scope.poll_accept().unwrap();
+        // A reload holds publication while Core resolution is due; no further RX arrives.
+        let publication = config.write().await;
+        let reader = Some(authority.read_policy());
+        tokio::pin!(reader);
+        let timer = None;
+        tokio::pin!(timer);
+        let mut synacks = Vec::new();
+        while synacks.len() < 2 {
+            let turned = turn(
+                reader.as_mut(),
+                |cx| owner.poll_join_plane(cx),
+                |cx, reading| {
+                    assert!(reading);
+                    let now = Instant::now();
+                    driver.service(cx, now);
+                    let mut outputs = [None];
+                    if driver.poll_outputs_class(cx, TxClass::Control, &mut outputs)
+                        == Poll::Ready(Some(1))
+                    {
+                        let output = outputs[0].take().unwrap();
+                        let ip = wire::parse_ip(output.packet()).unwrap();
+                        let (header, _) = tcp::parse(&output.packet()[ip.payload]).unwrap();
+                        assert_eq!(header.flags, tcp::SYN | tcp::ACK);
+                        synacks.push(header.seq);
+                        return Poll::Ready(Ok(()));
+                    }
+                    poll_deadline(timer.as_mut(), driver.deadline(), now, cx).map(Ok)
+                },
+                &shutdown,
+            )
+            .await;
+            assert!(matches!(turned, Turn::Serviced(Ok(()))));
+        }
+        assert_eq!(
+            synacks[0], synacks[1],
+            "the protocol deadline retransmitted the SYN-ACK"
+        );
+        drop(publication);
+        loop {
+            let turned = turn(
+                reader.as_mut(),
+                |cx| owner.poll_join_plane(cx),
+                |cx, _| {
+                    driver.service(cx, Instant::now());
+                    Poll::Pending
+                },
+                &shutdown,
+            )
+            .await;
+            if let Turn::Read(read) = turned {
+                drop(read);
+                break;
+            }
+        }
+        assert!(
+            reader.is_none(),
+            "the pinned acquisition completed instead of restarting"
+        );
+        drop(flow);
+        join_driven(endpoints, owner, &mut driver).await;
+    })
+    .await
+    .expect("a pending policy reader must sit beside the sole scope timer owner");
 }

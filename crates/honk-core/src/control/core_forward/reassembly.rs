@@ -1,8 +1,8 @@
 //! Reassembly timeout control output on the same Core/FIB/policy owner.
 
 use super::{
-    Disposition, FirewallVerdict, PolicyGeneration, Resolution, RoutedCore, disposition,
-    mode_decision, route_action,
+    Disposition, FirewallVerdict, PolicyGeneration, PolicyRead, Resolution, RoutedCore,
+    disposition, mode_decision, route_action,
 };
 use honk_datapath::{
     firewall::{FragmentLease, Tuple},
@@ -95,11 +95,14 @@ impl RoutedCore {
     /// Requires funded control-output storage of at least 1280 bytes. Suppressed/denied
     /// quotes are retired in bounded batches; one unresolved neighbor quote may wait for
     /// two seconds, never renewing its deadline. No conntrack grant is inferred from a quote.
-    pub async fn poll_reassembly_error(
+    /// Synchronous under readers of this core's own registration.
+    pub fn poll_reassembly_error(
         &mut self,
+        read: &PolicyRead<'_>,
         now: Instant,
         out: &mut [u8],
     ) -> anyhow::Result<Option<GeneratedError>> {
+        self.check_policy(read)?;
         anyhow::ensure!(
             out.len() >= 1280,
             "reassembly error output requires 1280 bytes"
@@ -157,20 +160,20 @@ impl RoutedCore {
                 continue;
             };
             let generation = {
-                let router = self.authority.0.router.read().await;
-                let config = self.authority.0.config.read().await;
+                let router = &*read.router;
+                let config = &*read.config;
                 let mode_state = self
                     .authority
                     .0
                     .mode_state
                     .as_ref()
                     .map(|state| state.read());
-                let Some(action) = route_action(&router, query, None) else {
+                let Some(action) = route_action(router, query, None) else {
                     continue;
                 };
                 let mode = mode_decision(
                     mode_state.as_deref(),
-                    &config,
+                    config,
                     #[cfg(feature = "native-api")]
                     self.authority
                         .0
@@ -345,6 +348,7 @@ mod tests {
         });
         let budget = MemoryBudget::new(16 << 20);
         let mut core = super::super::tests::unsynchronized_core(authority, &inputs, &budget, None);
+        let authority = core.authority();
         let start = Instant::now() - Duration::from_secs(62);
         let mut bytes = [0; 60];
         wire::udp::emit_packet(
@@ -397,8 +401,7 @@ mod tests {
         assert_eq!(core.poll_reassembly_timeout(now), Some(retry));
         let mut output = [0; 1280];
         assert!(
-            core.poll_reassembly_error(now, &mut output)
-                .await
+            core.poll_reassembly_error(&authority.read_policy().await, now, &mut output)
                 .unwrap()
                 .is_none()
         );
@@ -408,8 +411,7 @@ mod tests {
         assert_eq!(core.poll_reassembly_timeout(now), Some(deadline));
         core.pending_reassembly_error.as_mut().unwrap().deadline = now - Duration::from_nanos(1);
         assert!(
-            core.poll_reassembly_error(now, &mut output)
-                .await
+            core.poll_reassembly_error(&authority.read_policy().await, now, &mut output)
                 .unwrap()
                 .is_none()
         );
@@ -419,8 +421,7 @@ mod tests {
             "64 disposals must leave the remaining quote runnable"
         );
         assert!(
-            core.poll_reassembly_error(now, &mut output)
-                .await
+            core.poll_reassembly_error(&authority.read_policy().await, now, &mut output)
                 .unwrap()
                 .is_none()
         );

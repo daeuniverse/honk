@@ -125,9 +125,13 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 ## Core packet-endpoint 嵌入
 
-`honk-datapath` 提供不回绕的 `ScopeId` 和固定 frame/descriptor 账本，不授予抓包或路由权威。`control::netstack::PacketScope` 持有一个计账 Stack、一把互斥锁、有界 frame/waiter 和须由外层 join 的 timer owner。输出 lease 保留原始 TCP `FlowId`、字节和 credit，直到真实消费者释放。本地归还不是 NIC CQ，CQ 地址也没有虚构的 generation；控制与 bulk 各有预留。
+`honk-datapath` 提供不回绕的 `ScopeId` 和固定 frame/descriptor 账本，不授予抓包或路由权威。`control::netstack::PacketScope` 持有一个计账 Stack、一把互斥锁、有界 frame/waiter 和须由外层 join 的 owner。输出 lease 保留原始 TCP `FlowId`、字节和 credit，直到真实消费者释放。本地归还不是 NIC CQ，CQ 地址也没有虚构的 generation；控制与 bulk 各有预留。
 
-XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。PacketOwner 的协议 timer 与有条件的 100ms 共享预算后备不变。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
+普通嵌入运行 `PacketOwner`；XDP 把驱动权交给设备 runtime 内唯一且不可 Clone 的 `PacketDriver`。原已计费 owner task 保持停放，随后执行并 join 真实 finish 或被放弃 driver 的清理。应用/输出变更唤醒当前 driver，而 driver 自己的扫描和导出不自通知。共享互斥锁及锁外退休回调不变；归还驱动权既不是完成，也不是 CQ。
+
+只有任务计费成功后才从原列表取走 scope owner。接纳失败时，已计费 supervisor 保留所有未启动 owner，在 producer、应用和退休工作结束后完成其真实清理；任何已导出输出尚未归还时，就绪等待都不能结束。panic payload 保留到全部原 owner 和已接纳任务 join 完成。
+
+XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。阻塞 scope 保留原有 100ms 共享预算后备，已设期限直到服务才重置，不被无关轮询延后。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
 
 AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
 
@@ -200,6 +204,9 @@ Core 和 Endpoint 复用既有 Rule/Global/Direct mode override，包括 native 
 target 和 must/Block 终端优先级。Core 的 `PolicyGeneration` 同时捕获 routing
 generation 与不回绕的 mode revision；submit 把 router/config/mode 读锁持有到
 实际 writer 完成。mode 的 ABA 变化不能重新授权排队输出，拒绝后只处置、不重放。
+
+`RoutingAuthority::read_policy` 提供真实 router/config guard。XDP owner 等待读锁时仍并行服务设备、timer、shutdown 与 supervisor，取得 guard 后同步处理有界 Core 轮次。其他 registration 的 reader 被拒绝；scope 互斥锁不跨 await。
+
 借用缓存路径对普通 Global 判决返回 Cold，不在没有判决所有权时发出 Endpoint
 handoff。Core transport 跨 traffic-class 变化和精确 reverse ingress 保留执行
 owner，但保留关系不能覆盖当前 Block。firewall binding 保留独立的

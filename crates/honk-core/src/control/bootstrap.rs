@@ -212,25 +212,26 @@ impl ControlPlane {
         // stays for node hostnames and startup. The same hook backs the
         // urltest (clash delay) measurements.
         {
-            let controller = dns_controller.clone();
-            let make_hook =
-                move |controller: std::sync::Arc<crate::control::dns_control::DnsController>| {
-                    let hook: crate::outbound::ResolveHook =
-                        Arc::new(move |host: String, port: u16| {
-                            let controller = controller.clone();
-                            Box::pin(async move {
-                                controller.resolve_domain(&host).await.map(|addresses| {
-                                    addresses
-                                        .into_iter()
-                                        .map(|ip| std::net::SocketAddr::new(ip, port))
-                                        .collect()
-                                })
+            let service = dns_controller.dns_service();
+            let make_hook = move |service: crate::dns::DnsService| {
+                let hook: crate::outbound::ResolveHook =
+                    Arc::new(move |host: String, port: u16| {
+                        let service = service.clone();
+                        Box::pin(async move {
+                            service.resolve_name(&host).await.map(|addresses| {
+                                addresses
+                                    .ipv4
+                                    .into_iter()
+                                    .chain(addresses.ipv6)
+                                    .map(|ip| std::net::SocketAddr::new(ip, port))
+                                    .collect()
                             })
-                        });
-                    hook
-                };
-            alive_set.set_resolver(make_hook(controller.clone()));
-            honk_outbound::urltest::set_urltest_resolver(make_hook(controller));
+                        })
+                    });
+                hook
+            };
+            alive_set.set_resolver(make_hook(service.clone()));
+            honk_outbound::urltest::set_urltest_resolver(make_hook(service));
         }
 
         let control_plane = Self {

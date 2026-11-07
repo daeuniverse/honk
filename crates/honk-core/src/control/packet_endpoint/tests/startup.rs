@@ -557,3 +557,166 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
     .await
     .expect("XDP reload must preserve non-lease ingress work");
 }
+
+#[tokio::test]
+async fn driven_start_keeps_the_ordinary_pairing_and_budget_validation() {
+    let budget = MemoryBudget::new(32 << 20);
+    let (first, first_owner) = scope(&budget);
+    let (_second, second_owner) = scope(&budget);
+    let (plane, _health) = local_plane().await;
+    let swapped = PacketEndpoints::start_driven(plane, vec![(first.clone(), second_owner)], 1)
+        .err()
+        .expect("a swapped owner must not receive a driver");
+    assert!(format!("{swapped:#}").contains("owner mismatch"));
+    let foreign = MemoryBudget::new(32 << 20);
+    let (other, other_owner) = scope(&foreign);
+    let (plane, _health) = local_plane().await;
+    let mixed =
+        PacketEndpoints::start_driven(plane, vec![(first, first_owner), (other, other_owner)], 1)
+            .err()
+            .expect("a foreign budget must not receive a driver");
+    assert!(format!("{mixed:#}").contains("one memory ceiling"));
+}
+
+#[tokio::test]
+async fn driven_startup_failure_keeps_drivers_serviceable_and_reports_abandonment() {
+    use honk_datapath::buffer::TxClass;
+    use std::task::{Context, Poll, Waker};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for abandon in [false, true] {
+            let budget = MemoryBudget::new(32 << 20);
+            let (scope, scope_owner) = scope(&budget);
+            let (plane, _health) = local_plane().await;
+            let (endpoints, mut owner, mut drivers) =
+                PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1)
+                    .unwrap();
+            let mut driver = drivers.pop();
+            scope
+                .datagram_sender("198.51.100.1:53".parse().unwrap())
+                .send_to(b"retained", "192.0.2.1:41000".parse().unwrap())
+                .await
+                .unwrap();
+            let mut outputs = [None];
+            assert_eq!(
+                driver.as_mut().unwrap().poll_outputs_class(
+                    &mut Context::from_waker(Waker::noop()),
+                    TxClass::Bulk,
+                    &mut outputs
+                ),
+                Poll::Ready(Some(1))
+            );
+            let output = outputs[0].take().unwrap();
+            // Closed before its supervisor's first poll: startup cannot commit readiness.
+            endpoints.close();
+            if abandon {
+                driver.take();
+            }
+            for _ in 0..16 {
+                let ready = std::future::poll_fn(|cx| {
+                    if let Some(driver) = &mut driver {
+                        driver.service(cx, Instant::now());
+                    }
+                    Poll::Ready(owner.poll_ready(cx))
+                })
+                .await;
+                assert!(ready.is_pending(), "startup cleanup still owns the output");
+                tokio::task::yield_now().await;
+            }
+            assert!(output.packet().ends_with(b"retained"));
+            output.release();
+            let error = std::future::poll_fn(|cx| {
+                if let Some(driver) = &mut driver {
+                    driver.service(cx, Instant::now());
+                }
+                owner.poll_ready(cx)
+            })
+            .await
+            .expect_err("closed startup must not report readiness");
+            let message = format!("{error:#}");
+            if abandon {
+                assert!(message.contains("abandoned"), "{message}");
+            } else {
+                assert!(message.contains("before admission"), "{message}");
+            }
+            drop((endpoints, owner, driver, scope));
+            assert_eq!(budget.used(), 0);
+        }
+    })
+    .await
+    .expect("failed driven startup must retain cleanup and its abandonment outcome");
+}
+
+#[tokio::test]
+async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_returns() {
+    use honk_datapath::buffer::TxClass;
+    use std::task::{Context, Poll, Waker};
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (first, first_owner) = scope(&budget);
+        let (second, second_owner) = scope(&budget);
+        let (plane, _health) = local_plane().await;
+        let stopped = plane.shutdown_intent();
+        let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
+            plane,
+            vec![(first.clone(), first_owner), (second.clone(), second_owner)],
+            1,
+        )
+        .unwrap();
+        let mut held = Vec::new();
+        for (index, scope) in [&first, &second].into_iter().enumerate() {
+            scope
+                .datagram_sender("198.51.100.1:53".parse().unwrap())
+                .send_to(&[index as u8], "192.0.2.1:41000".parse().unwrap())
+                .await
+                .unwrap();
+            let mut outputs = [None];
+            assert_eq!(
+                drivers[index].poll_outputs_class(
+                    &mut Context::from_waker(Waker::noop()),
+                    TxClass::Bulk,
+                    &mut outputs,
+                ),
+                Poll::Ready(Some(1))
+            );
+            held.push(outputs[0].take().unwrap());
+        }
+        let pressure = budget.reserve(budget.limit() - budget.used()).unwrap();
+        stopped.wait().await;
+        while let Some(output) = held.pop() {
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(30),
+                    std::future::poll_fn(|cx| {
+                        for driver in &mut drivers {
+                            driver.service(cx, Instant::now());
+                        }
+                        owner.poll_ready(cx)
+                    })
+                )
+                .await
+                .is_err(),
+                "failed scope-task admission must still join every original output owner"
+            );
+            assert_eq!(output.packet().last(), Some(&(held.len() as u8)));
+            output.release();
+        }
+        let result = std::future::poll_fn(|cx| {
+            for driver in &mut drivers {
+                driver.service(cx, Instant::now());
+            }
+            owner.poll_ready(cx)
+        })
+        .await;
+        assert!(
+            result.is_err(),
+            "allocation failure remains a failed startup after cleanup"
+        );
+        drop(pressure);
+        drop((drivers, owner, endpoints, first, second));
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("unfunded scope startup must keep and finish real ownership");
+}

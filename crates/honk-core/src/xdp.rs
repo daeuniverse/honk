@@ -4,10 +4,10 @@
 use crate::control::{
     ControlPlane,
     core_forward::{
-        CachedDecision, Decision, Execution, GeneratedError, PolicyGeneration, Requirements,
-        RoutedCore, socket_namespace,
+        CachedDecision, Decision, Execution, GeneratedError, PolicyGeneration, PolicyRead,
+        Requirements, RoutedCore, socket_namespace,
     },
-    netstack::{OutputLease, PacketScope, RuntimeLimits},
+    netstack::{OutputLease, PacketDriver, PacketScope, RuntimeLimits},
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints},
 };
 use crate::netlink::fib::{Fib, LogicalLink};
@@ -308,7 +308,7 @@ struct Realm {
     ingress: Ingress,
     device: usize,
     link: LogicalLink,
-    scope: PacketScope,
+    driver: PacketDriver,
     pending: [Option<(OutputLease, ReturnPath)>; 2],
 }
 
@@ -335,7 +335,7 @@ impl Realm {
         }
         let count = outputs.len().min(capacity.max(1));
         (
-            self.scope
+            self.driver
                 .poll_outputs_class(cx, class, &mut outputs[..count]),
             None,
         )
@@ -479,7 +479,7 @@ impl Runtime {
                         let Some(realm) = realms.iter().find(|realm| realm.device == device_index && realm.link.path.vlan_count == decoded.vlan_count
                             && realm.link.path.vlan_proto == decoded.vlan_proto && realm.link.path.vlan_tci.iter().zip(decoded.vlan_tci).all(|(configured, captured)| configured & 0x0fff == captured & 0x0fff)) else { return; };
                         if decoded.destination_mac != realm.link.mac { return; }
-                        let scope = realm.scope.scope();
+                        let scope = realm.driver.scope();
                         let ingress = realm.ingress;
                         let path = ReturnPath { device: device_index, mac: decoded.source_mac, vlan_tci: decoded.vlan_tci, vlan_proto: decoded.vlan_proto, vlan_count: decoded.vlan_count };
                         let mut l3 = [&[][..]; 18];
@@ -562,6 +562,11 @@ impl Runtime {
                 };
                 progress += finish_transmit(received, kick)?;
             }
+        }
+        // The sole scope owner: timers, closes and events run here even without RX or Core
+        // readers, before this turn exports their CPU outputs.
+        if self.service_scopes(cx, now) {
+            progress += 1;
         }
         let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
         for realm in &mut self.realms {
@@ -648,7 +653,35 @@ impl Runtime {
         }
     }
 
-    fn next_deadline(&self, now: Instant) -> Option<Instant> {
+    /// Every realm driver, including after close: their finish needs this owner too.
+    fn service_scopes(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
+        let mut more = false;
+        for realm in &mut self.realms {
+            more |= realm.driver.service(cx, now);
+        }
+        more
+    }
+
+    /// Drivers only, before capture is attached: a failed start's supervisor waits for their
+    /// cleanup, while the old topology watch may legitimately see our own bind events.
+    fn poll_scopes(
+        &mut self,
+        cx: &mut Context<'_>,
+        timer: Pin<&mut Option<tokio::time::Sleep>>,
+    ) -> Poll<()> {
+        let now = Instant::now();
+        let more = self.service_scopes(cx, now);
+        let deadline = self
+            .realms
+            .iter()
+            .filter_map(|realm| realm.driver.deadline())
+            .min();
+        poll_deadline(timer, if more { Some(now) } else { deadline }, now, cx)
+    }
+
+    /// `core` false while a publication-reader acquisition is already pending: its
+    /// completion, not a due Core deadline, is what can make that work runnable.
+    fn next_deadline(&self, now: Instant, core: bool) -> Option<Instant> {
         let mut deadline: Option<Instant> = None;
         let mut include = |due: Instant| {
             deadline = Some(deadline.map_or(due, |previous| previous.min(due)));
@@ -669,9 +702,29 @@ impl Runtime {
                 include(device.metadata_checked + Duration::from_secs(1));
             }
         }
+        for realm in &self.realms {
+            if let Some(due) = realm.driver.deadline() {
+                include(due);
+            }
+        }
         if self.closing {
             return deadline;
         }
+        if core && let Some(due) = self.core_deadline(now) {
+            include(due);
+        }
+        if let Some(due) = self.pressure.next_deadline(self.core.as_ref()) {
+            include(due);
+        }
+        deadline
+    }
+
+    /// The earliest Waiting/Pending/reassembly/maintenance work, all resolved under readers.
+    fn core_deadline(&self, now: Instant) -> Option<Instant> {
+        let mut deadline: Option<Instant> = None;
+        let mut include = |due: Instant| {
+            deadline = Some(deadline.map_or(due, |previous| previous.min(due)));
+        };
         for work in &self.waiting {
             include(work.retry.min(work.packet.deadline()));
         }
@@ -706,10 +759,11 @@ impl Runtime {
                 include(self.core_maintenance_checked + Duration::from_secs(1));
             }
         }
-        if let Some(due) = self.pressure.next_deadline(self.core.as_ref()) {
-            include(due);
-        }
         deadline
+    }
+
+    fn core_due(&self, now: Instant) -> bool {
+        !self.closing && self.core_deadline(now).is_some_and(|due| due <= now)
     }
 
     fn poll_service(
@@ -717,6 +771,7 @@ impl Runtime {
         cx: &mut Context<'_>,
         shutdown: &crate::control::ShutdownIntent,
         mut timer: Pin<&mut Option<tokio::time::Sleep>>,
+        reading: bool,
     ) -> Poll<anyhow::Result<()>> {
         if let Poll::Ready(result) = self.poll_io(cx) {
             timer.set(None);
@@ -728,24 +783,12 @@ impl Runtime {
         }
         // Registration and ring/output service may create obligations absent before this poll.
         let now = Instant::now();
-        let Some(deadline) = self.next_deadline(now) else {
-            timer.set(None);
-            return Poll::Pending;
-        };
-        if deadline <= now {
-            timer.set(None);
-            return Poll::Ready(Ok(()));
-        }
-        let deadline = tokio::time::Instant::from_std(deadline);
-        if let Some(mut sleep) = timer.as_mut().as_pin_mut() {
-            sleep.as_mut().reset(deadline);
-        } else {
-            timer.set(Some(tokio::time::sleep_until(deadline)));
-        }
-        timer.as_pin_mut().unwrap().poll(cx).map(|()| Ok(()))
+        poll_deadline(timer, self.next_deadline(now, !reading), now, cx).map(Ok)
     }
 
-    async fn resolve(&mut self) -> anyhow::Result<()> {
+    /// One bounded turn under the actual router/config readers acquired beside device
+    /// service; nothing here awaits, so no reader or scope lock crosses a suspension.
+    fn resolve(&mut self, read: &PolicyRead<'_>) -> anyhow::Result<()> {
         current_topology(&mut self.topology)?;
         let Some(core) = &mut self.core else {
             return Ok(());
@@ -786,9 +829,12 @@ impl Runtime {
                 continue;
             }
             let mac = mac_text(work.mac);
-            let decision = core
-                .decide(work.packet, Some(std::str::from_utf8(&mac).unwrap()), now)
-                .await?;
+            let decision = core.decide(
+                read,
+                work.packet,
+                Some(std::str::from_utf8(&mac).unwrap()),
+                now,
+            )?;
             current_topology(&mut self.topology)?;
             match decision {
                 Decision::Wait(packet) => self.waiting.push_back(Waiting {
@@ -842,7 +888,7 @@ impl Runtime {
                             core.error(now, &packet, error, route, &mut self.staging)?
                     {
                         let header = route.ethernet_header(packet.ip().src.is_ipv6())?;
-                        core.submit(route, generation, || {
+                        core.submit(read, route, generation, || {
                             current_topology(&mut self.topology)?;
                             if !packet.is_current(Instant::now()) {
                                 return Ok(None);
@@ -858,8 +904,7 @@ impl Runtime {
                                     },
                                 )
                                 .map(Some)
-                        })
-                        .await?;
+                        })?;
                     }
                 }
             }
@@ -903,35 +948,33 @@ impl Runtime {
                 self.pending.push_back(work);
                 continue;
             }
-            let submitted = core
-                .submit(route, work.generation, || {
-                    current_topology(&mut self.topology)?;
-                    if !lease
-                        .retained_packet()
-                        .expect("owned forwarding cursor")
-                        .is_current(Instant::now())
-                    {
-                        return Ok(None);
-                    }
-                    port.transmit_with(
-                        TxClass::Bulk,
-                        header.len() + length,
-                        Retained::Forward { _owner: lease },
-                        |_, target| {
-                            work.output
-                                .write_next_segments(target, &header)
-                                .map(|_| ())
-                                .ok_or_else(|| io::Error::other("Core SG materialization refused"))
-                        },
-                    )
-                    .map(Some)
-                })
-                .await?;
+            let submitted = core.submit(read, route, work.generation, || {
+                current_topology(&mut self.topology)?;
+                if !lease
+                    .retained_packet()
+                    .expect("owned forwarding cursor")
+                    .is_current(Instant::now())
+                {
+                    return Ok(None);
+                }
+                port.transmit_with(
+                    TxClass::Bulk,
+                    header.len() + length,
+                    Retained::Forward { _owner: lease },
+                    |_, target| {
+                        work.output
+                            .write_next_segments(target, &header)
+                            .map(|_| ())
+                            .ok_or_else(|| io::Error::other("Core SG materialization refused"))
+                    },
+                )
+                .map(Some)
+            })?;
             if submitted.is_some() && !work.output.is_complete() {
                 self.pending.push_back(work);
             }
         }
-        if let Some(error) = core.poll_reassembly_error(now, &mut self.staging).await? {
+        if let Some(error) = core.poll_reassembly_error(read, now, &mut self.staging)? {
             let route = error.route;
             if selected_egress(&self.realms, route)
                 && let Some(device) = self
@@ -942,7 +985,7 @@ impl Runtime {
                 let header = route.ethernet_header(self.staging[0] >> 4 == 6)?;
                 let port = device.queues[0].io.get_mut();
                 if port.tx_packet_credit(TxClass::Control, header.len() + error.len) {
-                    core.submit(route, error.generation, || {
+                    core.submit(read, route, error.generation, || {
                         current_topology(&mut self.topology)?;
                         port.transmit_segments(
                             TxClass::Control,
@@ -950,8 +993,7 @@ impl Runtime {
                             Retained::Generated { _owner: error },
                         )
                         .map(Some)
-                    })
-                    .await?;
+                    })?;
                 }
             }
         }
@@ -1380,6 +1422,58 @@ pub(crate) async fn join_endpoints(
     }
 }
 
+/// What woke one wait of the started device owner.
+enum Turn<R, J> {
+    Joined(J),
+    Read(R),
+    Serviced(anyhow::Result<()>),
+    Shutdown,
+}
+
+/// One device-owner wait. A pending policy-reader acquisition is polled beside device/scope
+/// service, the supervisor join and shutdown, never ahead of them. It stays pinned in
+/// `reader` across turns, keeping its place in the publication lock queue.
+async fn turn<R, J>(
+    mut reader: Pin<&mut Option<impl Future<Output = R>>>,
+    mut join: impl FnMut(&mut Context<'_>) -> Poll<J>,
+    mut service: impl FnMut(&mut Context<'_>, bool) -> Poll<anyhow::Result<()>>,
+    shutdown: &crate::control::ShutdownIntent,
+) -> Turn<R, J> {
+    let reading = reader.is_some();
+    tokio::select! {
+        joined = poll_fn(&mut join) => Turn::Joined(joined),
+        read = async { reader.as_mut().as_pin_mut().expect("pending policy reader").await }, if reading => {
+            reader.set(None);
+            Turn::Read(read)
+        }
+        result = poll_fn(|cx| service(cx, reading)) => Turn::Serviced(result),
+        _ = shutdown.wait() => Turn::Shutdown,
+    }
+}
+
+fn poll_deadline(
+    mut timer: Pin<&mut Option<tokio::time::Sleep>>,
+    deadline: Option<Instant>,
+    now: Instant,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
+    let Some(deadline) = deadline else {
+        timer.set(None);
+        return Poll::Pending;
+    };
+    if deadline <= now {
+        timer.set(None);
+        return Poll::Ready(());
+    }
+    let deadline = tokio::time::Instant::from_std(deadline);
+    if let Some(mut sleep) = timer.as_mut().as_pin_mut() {
+        sleep.as_mut().reset(deadline);
+    } else {
+        timer.set(Some(tokio::time::sleep_until(deadline)));
+    }
+    timer.as_pin_mut().unwrap().poll(cx)
+}
+
 pub(crate) async fn run(
     plane: ControlPlane,
     pin_root: &Path,
@@ -1394,10 +1488,28 @@ pub(crate) async fn run(
             Ok(prepared) => prepared,
             Err(error) => return (Some(plane), Err(error)),
         };
-    let (endpoints, mut owner) = match PacketEndpoints::new(plane, scope_pairs, 64).await {
-        Ok(pair) => pair,
-        Err(error) => return (None, Err(error)),
-    };
+    let (endpoints, mut owner, mut drivers) =
+        match PacketEndpoints::start_driven(plane, scope_pairs, 64) {
+            Ok(started) => started,
+            Err(error) => return (None, Err(error)),
+        };
+    let realms = realms
+        .into_iter()
+        .map(|(ingress, device, link, scope)| {
+            // Installed by the exact handed-off scope identity, not by position.
+            let index = drivers
+                .iter()
+                .position(|driver| driver.scope() == scope)
+                .expect("start_driven returns one driver per validated scope");
+            Realm {
+                ingress,
+                device,
+                link,
+                driver: drivers.swap_remove(index),
+                pending: [None, None],
+            }
+        })
+        .collect();
     let mut runtime = Runtime {
         devices,
         topology,
@@ -1414,6 +1526,18 @@ pub(crate) async fn run(
         core_maintenance_checked: Instant::now(),
         _memory: memory,
     };
+    let timer = None;
+    tokio::pin!(timer);
+    // The drivers already exist: a failed start's supervisor cleanup waits on their service.
+    let ready = loop {
+        tokio::select! {
+            ready = poll_fn(|cx| owner.poll_ready(cx)) => break ready,
+            () = poll_fn(|cx| runtime.poll_scopes(cx, timer.as_mut())) => tokio::task::yield_now().await,
+        }
+    };
+    if let Err(error) = ready {
+        return (None, Err(error));
+    }
     let activate = (|| -> anyhow::Result<()> {
         for device in &mut runtime.devices {
             device.attachment.replace(&device.programs)?;
@@ -1474,10 +1598,14 @@ pub(crate) async fn run(
     }
     let mut warned = false;
     let mut close_started = None;
-    let timer = None;
-    tokio::pin!(timer);
+    // One clone of the existing registration; each acquisition yields real guards only.
+    let authority = runtime.core.as_ref().map(RoutedCore::authority);
+    let reader = None;
+    tokio::pin!(reader);
     let joined = loop {
         if (failure.is_some() || shutdown.requested()) && !runtime.closing {
+            // Cleanup never resolves Core again; a queued reader must not stall publication.
+            reader.set(None);
             if let Err(error) = runtime.close_capture() {
                 failure.get_or_insert(error);
             }
@@ -1486,7 +1614,7 @@ pub(crate) async fn run(
         if runtime.closing {
             match join_endpoints(
                 &mut owner,
-                |cx| runtime.poll_service(cx, &shutdown, timer.as_mut()),
+                |cx| runtime.poll_service(cx, &shutdown, timer.as_mut(), false),
                 close_started.unwrap(),
                 &mut warned,
             )
@@ -1509,21 +1637,34 @@ pub(crate) async fn run(
             runtime.peers.len(),
             &runtime.devices,
         );
-        if !runtime.closing
-            && let Err(error) = runtime.resolve().await
+        if reader.is_none()
+            && let Some(authority) = &authority
+            && runtime.core_due(Instant::now())
         {
-            failure.get_or_insert(error);
-            continue;
+            reader.set(Some(authority.read_policy()));
         }
-        tokio::select! {
-            result = poll_fn(|cx| owner.poll_join_plane(cx)) => break result,
-            result = poll_fn(|cx| runtime.poll_service(cx, &shutdown, timer.as_mut())) => {
-                if let Err(error) = result {
-                    if failure.is_none() { tracing::error!(%error, "XDP owner failed closed"); }
+        match turn(
+            reader.as_mut(),
+            |cx| owner.poll_join_plane(cx),
+            |cx, reading| runtime.poll_service(cx, &shutdown, timer.as_mut(), reading),
+            &shutdown,
+        )
+        .await
+        {
+            Turn::Joined(result) => break result,
+            // The readers drop at the end of this synchronous turn, before any await.
+            Turn::Read(read) => {
+                if let Err(error) = runtime.resolve(&read) {
                     failure.get_or_insert(error);
                 }
             }
-            _ = shutdown.wait() => {}
+            Turn::Serviced(Err(error)) => {
+                if failure.is_none() {
+                    tracing::error!(%error, "XDP owner failed closed");
+                }
+                failure.get_or_insert(error);
+            }
+            Turn::Serviced(Ok(())) | Turn::Shutdown => {}
         }
         tokio::task::yield_now().await;
     };
@@ -1585,10 +1726,13 @@ pub(crate) async fn run(
     }
 }
 
+/// A realm before validated endpoint start hands it the driver of this exact scope.
+type RealmPlan = (Ingress, usize, LogicalLink, ScopeId);
+
 type PreparedRuntime = (
     Vec<Device>,
     AsyncFd<Topology>,
-    Vec<Realm>,
+    Vec<RealmPlan>,
     Vec<(PacketScope, crate::control::netstack::PacketOwner)>,
     Option<RoutedCore>,
     MemoryReservation,
@@ -1698,6 +1842,8 @@ async fn prepare(
                 + PENDING * (size_of::<Waiting>() + size_of::<Pending>())
                 + realm_count
                     * (size_of::<Realm>()
+                        + size_of::<RealmPlan>()
+                        + size_of::<PacketDriver>()
                         + size_of::<(PacketScope, crate::control::netstack::PacketOwner)>()
                         + size_of::<Ingress>()
                         + size_of::<(Ingress, honk_config::datapath::InterfaceRole)>())
@@ -1773,13 +1919,7 @@ async fn prepare(
                 mark: MarkProvenance::BeforeSkb,
             };
             let (scope, scope_owner) = packet_scope(link.mtu, realm_count, &budget)?;
-            realms.push(Realm {
-                ingress,
-                device: devices.len(),
-                link,
-                scope: scope.clone(),
-                pending: [None, None],
-            });
+            realms.push((ingress, devices.len(), link, scope.scope()));
             scope_pairs.push((scope, scope_owner));
         }
         let mut queues = Vec::with_capacity(ports.len());
@@ -1804,7 +1944,7 @@ async fn prepare(
             metadata_checked: Instant::now(),
         });
     }
-    let ingresses: Vec<_> = realms.iter().map(|realm| realm.ingress).collect();
+    let ingresses: Vec<_> = realms.iter().map(|(ingress, ..)| *ingress).collect();
     let core = if let Some(authority) = authority {
         let mut core = RoutedCore::new(
             authority,
@@ -1821,7 +1961,7 @@ async fn prepare(
         )?;
         let roles: Vec<_> = realms
             .iter()
-            .map(|realm| (realm.ingress, datapath.interfaces[realm.device].role))
+            .map(|(ingress, device, ..)| (*ingress, datapath.interfaces[*device].role))
             .collect();
         core.set_ingress_roles(&roles)?;
         Some(core)
@@ -1871,6 +2011,7 @@ fn packet_scope(
 mod tests {
     use super::*;
 
+    mod driven_kernel;
     mod retention;
 
     #[test]

@@ -6,12 +6,13 @@
 use super::ControlPlane;
 use super::connection::{ConnectionGuard, ControlPlaneHandle};
 use super::dns_control::DnsUdpReply;
-use super::netstack::{FlowIo, PacketOwner, PacketScope, SourceWork};
+use super::netstack::{FlowIo, PacketDriver, PacketOwner, PacketScope, SourceWork};
 use super::task_registry::TaskRegistry;
 use super::udp_endpoint::{
     DatagramPayload, EndpointReservation, FundedDatagram, RawDnsRoute, ReplySocketFd,
     UdpEndpointPool, UdpInitLease, UdpReplySocketFactory,
 };
+use futures::FutureExt;
 use honk_datapath::ScopeId;
 use honk_netstack::{MemoryBudget, MemoryReservation, Rx, ValidatedSource};
 use std::io;
@@ -166,6 +167,7 @@ pub struct PacketEndpoints {
 pub struct PacketEndpointOwner {
     shared: Arc<Shared>,
     task: Option<tokio::task::JoinHandle<(ControlPlane, anyhow::Result<()>)>>,
+    ready: Option<tokio::sync::oneshot::Receiver<()>>,
 }
 
 struct EndpointRuntime {
@@ -174,9 +176,26 @@ struct EndpointRuntime {
     receiver: mpsc::Receiver<Work>,
     initializers: mpsc::Receiver<UdpInitLease>,
     owners: Vec<PacketOwner>,
+    // Driven scopes park their original owners until the device returns or abandons them.
+    driven: bool,
     scope_tasks: TaskRegistry,
     tcp_tasks: TaskRegistry,
     startup: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+async fn run_driven_scope(
+    owner: PacketOwner,
+    shared: Arc<Shared>,
+    failed: mpsc::UnboundedSender<anyhow::Error>,
+) {
+    if !owner.reclaim().await {
+        let _ = failed.send(anyhow::anyhow!(
+            "packet scope driver abandoned its scope before finish"
+        ));
+        shared.close();
+    }
+    drop((failed, shared));
+    owner.run().await;
 }
 
 impl PacketEndpoints {
@@ -218,10 +237,32 @@ impl PacketEndpoints {
     /// Consume an unstarted control plane; no second host ingress is started beside it.
     /// `udp_capacity` is shared by every supplied scope, not multiplied per scope.
     pub async fn new(
-        mut plane: ControlPlane,
+        plane: ControlPlane,
         scopes: Vec<(PacketScope, PacketOwner)>,
         udp_capacity: usize,
     ) -> anyhow::Result<(Self, PacketEndpointOwner)> {
+        let (endpoints, mut owner, _) = Self::start(plane, scopes, udp_capacity, false)?;
+        std::future::poll_fn(|cx| owner.poll_ready(cx)).await?;
+        Ok((endpoints, owner))
+    }
+
+    /// `new` for a capture owner that drives these scopes itself: the same validation,
+    /// with one exclusive driver per scope in `scopes` order before readiness. Service
+    /// them while polling `PacketEndpointOwner::poll_ready`; failed-start cleanup needs it.
+    pub(crate) fn start_driven(
+        plane: ControlPlane,
+        scopes: Vec<(PacketScope, PacketOwner)>,
+        udp_capacity: usize,
+    ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
+        Self::start(plane, scopes, udp_capacity, true)
+    }
+
+    fn start(
+        mut plane: ControlPlane,
+        scopes: Vec<(PacketScope, PacketOwner)>,
+        udp_capacity: usize,
+        driven: bool,
+    ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
         anyhow::ensure!(
             plane.command_rx.is_some() && plane.health_task.is_none(),
             "packet endpoints require an unstarted control plane"
@@ -265,7 +306,12 @@ impl PacketEndpoints {
         let bytes = (INGRESS_CAPACITY + 32)
             .checked_mul(4 * (size_of::<Work>() + size_of::<UdpInitLease>()))
             .and_then(|n| {
-                n.checked_add(MAX_SCOPES * (size_of::<PacketScope>() + size_of::<PacketOwner>()))
+                n.checked_add(
+                    MAX_SCOPES
+                        * (size_of::<PacketScope>()
+                            + size_of::<PacketOwner>()
+                            + size_of::<PacketDriver>()),
+                )
             })
             .and_then(|n| n.checked_add(size_of::<Shared>() + maintenance::COMMAND_MEMORY))
             .ok_or_else(|| anyhow::anyhow!("packet ingress capacity overflows"))?;
@@ -302,12 +348,18 @@ impl PacketEndpoints {
         let (sender, receiver) = mpsc::channel(INGRESS_CAPACITY);
         let (initializers, initializer_rx) = mpsc::channel(INGRESS_CAPACITY);
         let (started, ready) = tokio::sync::oneshot::channel();
+        let drivers = if driven {
+            owners.iter().map(PacketOwner::hand_off).collect()
+        } else {
+            Vec::new()
+        };
         let runtime = EndpointRuntime {
             shared: Arc::clone(&shared),
             plane,
             receiver,
             initializers: initializer_rx,
             owners,
+            driven,
             scope_tasks,
             tcp_tasks,
             startup: Some(started),
@@ -333,13 +385,8 @@ impl PacketEndpoints {
         let owner = PacketEndpointOwner {
             shared: Arc::clone(&shared),
             task: Some(task),
+            ready: Some(ready),
         };
-        if ready.await.is_err() {
-            return match owner.run().await {
-                Err(error) => Err(error),
-                Ok(()) => Err(anyhow::anyhow!("packet supervisor failed before admission")),
-            };
-        }
         Ok((
             Self {
                 shared,
@@ -347,6 +394,7 @@ impl PacketEndpoints {
                 initializers,
             },
             owner,
+            drivers,
         ))
     }
 
@@ -623,6 +671,25 @@ impl PacketEndpointOwner {
         std::task::Poll::Ready(result.map_err(Into::into))
     }
 
+    /// Poll until Ready once. A failed start joins the supervisor's actual cleanup and
+    /// returns its error; a driven caller keeps servicing its drivers meanwhile.
+    pub(crate) fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<anyhow::Result<()>> {
+        if let Some(ready) = &mut self.ready {
+            let started = std::task::ready!(std::pin::Pin::new(ready).poll(cx)).is_ok();
+            self.ready = None;
+            if started {
+                return std::task::Poll::Ready(Ok(()));
+            }
+        }
+        std::task::Poll::Ready(Err(match std::task::ready!(self.poll_join_plane(cx)) {
+            Ok((_, Err(error))) | Err(error) => error,
+            Ok((_, Ok(()))) => anyhow::anyhow!("packet supervisor failed before admission"),
+        }))
+    }
+
     pub(crate) async fn fail_control(&self) -> anyhow::Result<()> {
         self.shared.fatal_control.store(true, Ordering::Release);
         self.shared.close();
@@ -729,12 +796,32 @@ impl EndpointRuntime {
 
     async fn run(mut self) -> (ControlPlane, anyhow::Result<()>) {
         let mut failure = None;
-        for owner in self.owners.drain(..) {
-            if let Err(error) = self.scope_tasks.spawn(owner.run(), 0) {
+        // Before scope tasks: their wrappers report abandonment here before closing.
+        let (fatal, mut failures) = mpsc::unbounded_channel();
+        while !self.owners.is_empty() {
+            let owners = &mut self.owners;
+            let spawned = if self.driven {
+                let shared = &self.shared;
+                self.scope_tasks.spawn_with(
+                    || {
+                        run_driven_scope(
+                            owners.pop().expect("unadmitted scope owner"),
+                            Arc::clone(shared),
+                            fatal.clone(),
+                        )
+                    },
+                    0,
+                )
+            } else {
+                self.scope_tasks
+                    .spawn_with(|| owners.pop().expect("unadmitted scope owner").run(), 0)
+            };
+            if let Err(error) = spawned {
                 failure = Some(error.into());
                 break;
             }
         }
+        let fallback_fatal = (!self.owners.is_empty()).then(|| fatal.clone());
         let (xdp, mut authorizations, endpoint) = if failure.is_none() && !self.shared.is_closing()
         {
             let config = self.plane.config.read().await;
@@ -810,7 +897,6 @@ impl EndpointRuntime {
                 .expect("unstarted packet control receiver"),
         );
         let handle = self.plane.spawn_handle();
-        let (fatal, mut failures) = mpsc::unbounded_channel();
         let removals = super::retirement_worker::spawn_packet_retirement_worker(
             Arc::clone(&self.plane.udp_pool),
             Arc::clone(&self.plane.connection_tracker),
@@ -948,10 +1034,42 @@ impl EndpointRuntime {
         if let Err(error) = removals.await {
             failure.get_or_insert(error.into());
         }
+        // The supervisor is already funded; admission failure cannot drop these owners.
+        // Retain opaque panic payloads until every other original owner has joined too.
+        let mut panics: [Option<Box<dyn std::any::Any + Send>>; MAX_SCOPES] =
+            std::array::from_fn(|_| None);
+        for (index, owner) in self.owners.drain(..).enumerate() {
+            let result = if self.driven {
+                std::panic::AssertUnwindSafe(run_driven_scope(
+                    owner,
+                    Arc::clone(&self.shared),
+                    fallback_fatal
+                        .as_ref()
+                        .expect("unadmitted scope failure channel")
+                        .clone(),
+                ))
+                .catch_unwind()
+                .await
+            } else {
+                std::panic::AssertUnwindSafe(owner.run())
+                    .catch_unwind()
+                    .await
+            };
+            if let Err(panic) = result {
+                panics[index] = Some(panic);
+                failure.get_or_insert_with(|| {
+                    anyhow::anyhow!("unadmitted packet scope cleanup panicked")
+                });
+            }
+        }
         while let Some(result) = self.scope_tasks.join_next().await {
             if let Err(error) = result {
                 failure.get_or_insert(error.into());
             }
+        }
+        // An abandonment recorded behind a winning close is still a failed outcome.
+        while let Ok(error) = failures.try_recv() {
+            failure.get_or_insert(error);
         }
         if let Some(listener) = &mut dns_listener
             && let Err(error) = listener.abort_and_join().await
@@ -962,6 +1080,7 @@ impl EndpointRuntime {
             failure.get_or_insert(error);
         }
         let result = maintenance::shutdown(&mut self.plane, failure, Some(shutdown)).await;
+        drop(panics);
         (self.plane, result)
     }
 

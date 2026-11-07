@@ -268,13 +268,15 @@ impl ControlPlane {
             };
             let quic_url = super::probers::quic_probe_url(&*self.config.read().await);
             let resolver: crate::outbound::ResolveHook = {
-                let controller = self.dns_controller.clone();
+                let service = self.dns_controller.dns_service();
                 Arc::new(move |host: String, port: u16| {
-                    let controller = controller.clone();
+                    let service = service.clone();
                     Box::pin(async move {
-                        controller.resolve_domain(&host).await.map(|addresses| {
+                        service.resolve_name(&host).await.map(|addresses| {
                             addresses
+                                .ipv4
                                 .into_iter()
+                                .chain(addresses.ipv6)
                                 .map(|ip| std::net::SocketAddr::new(ip, port))
                                 .collect()
                         })

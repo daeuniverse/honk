@@ -77,7 +77,7 @@ async fn expired_reverse_tcp_is_silent_and_new_endpoint_is_admitted_without_reti
         ..ingress
     };
     let budget = MemoryBudget::new(16 << 20);
-    let mut core = unsynchronized_core(authority, &[ingress, reply], &budget, None);
+    let mut core = unsynchronized_core(authority.clone(), &[ingress, reply], &budget, None);
     for ipv6 in [false, true] {
         let source = if ipv6 { "2001:db8::1" } else { "192.0.2.1" }
             .parse()
@@ -157,7 +157,8 @@ async fn expired_reverse_tcp_is_silent_and_new_endpoint_is_admitted_without_reti
                 .unwrap()
                 .unwrap();
                 assert!(matches!(
-                    core.decide(packet, None, now).await.unwrap(),
+                    core.decide(&authority.read_policy().await, packet, None, now)
+                        .unwrap(),
                     Decision::Drop
                 ));
             }
@@ -177,7 +178,10 @@ async fn expired_reverse_tcp_is_silent_and_new_endpoint_is_admitted_without_reti
             CachedDecision::Cold
         ));
         let packet = core.receive(reply, now, &bytes[..len]).unwrap().unwrap();
-        let Decision::Endpoint(_, admission) = core.decide(packet, None, now).await.unwrap() else {
+        let Decision::Endpoint(_, admission) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
+        else {
             panic!("a fresh SYN must be able to reuse the expired tuple");
         };
         assert_eq!(admission.into_snapshot().decision.outbound, "proxy");
@@ -224,7 +228,7 @@ async fn endpoint_handoff_retains_matched_rule_and_native_generation() {
         mark: MarkProvenance::BeforeSkb,
     };
     let budget = MemoryBudget::new(16 << 20);
-    let mut core = unsynchronized_core(authority, &[ingress], &budget, None);
+    let mut core = unsynchronized_core(authority.clone(), &[ingress], &budget, None);
     let mut bytes = [0; 64];
     let source = "192.0.2.2:40000".parse().unwrap();
     let destination = "198.51.100.2:443".parse().unwrap();
@@ -232,7 +236,10 @@ async fn endpoint_handoff_retains_matched_rule_and_native_generation() {
         honk_netstack::wire::udp::emit_packet(&mut bytes, source, destination, b"rule").unwrap();
     let now = Instant::now();
     let packet = core.receive(ingress, now, &bytes[..len]).unwrap().unwrap();
-    let Decision::Endpoint(_, admission) = core.decide(packet, None, now).await.unwrap() else {
+    let Decision::Endpoint(_, admission) = core
+        .decide(&authority.read_policy().await, packet, None, now)
+        .unwrap()
+    else {
         panic!("matching group route must enter Endpoint");
     };
     #[allow(unused_mut)]
@@ -311,7 +318,7 @@ async fn received_native_quote_pins_overflow_before_old_id_retirement() {
     };
     let budget = MemoryBudget::new(16 << 20);
     let table = Firewall::new_history(budget.clone(), 2, 1).unwrap();
-    let mut core = unsynchronized_core(authority, &[ingress, reply], &budget, Some(table));
+    let mut core = unsynchronized_core(authority.clone(), &[ingress, reply], &budget, Some(table));
     let now = Instant::now();
     let mut original = [0; 64];
     let len = wire::udp::emit_packet(
@@ -442,7 +449,12 @@ async fn blocked_bound_nat_packets_neither_allocate_ids_nor_renew_bindings() {
             now,
         })
         .unwrap();
-    let mut core = unsynchronized_core(authority, &[ingress, reply_ingress], &budget, Some(table));
+    let mut core = unsynchronized_core(
+        authority.clone(),
+        &[ingress, reply_ingress],
+        &budget,
+        Some(table),
+    );
     let baseline = budget.used();
     for segmented in [false, true] {
         let received_at = now + Duration::from_secs(10);
@@ -454,7 +466,8 @@ async fn blocked_bound_nat_packets_neither_allocate_ids_nor_renew_bindings() {
         .unwrap()
         .unwrap();
         assert!(matches!(
-            core.decide(packet, None, received_at).await.unwrap(),
+            core.decide(&authority.read_policy().await, packet, None, received_at)
+                .unwrap(),
             Decision::Drop
         ));
         assert_eq!(
@@ -553,7 +566,12 @@ async fn completing_related_reassembly_pins_identity_before_pending_keys_disappe
     error[28..].copy_from_slice(&request[..28]);
     let checksum = wire::checksum::checksum(&error[20..]);
     error[22..24].copy_from_slice(&checksum.to_be_bytes());
-    let mut core = unsynchronized_core(authority, &[ingress, reply_ingress], &budget, Some(table));
+    let mut core = unsynchronized_core(
+        authority.clone(),
+        &[ingress, reply_ingress],
+        &budget,
+        Some(table),
+    );
     for (offset, end, more) in [(0usize, 16usize, true), (16, 36, false)] {
         let mut fragment = error[..20].to_vec();
         fragment.extend_from_slice(&error[20 + offset..20 + end]);
@@ -600,7 +618,7 @@ async fn firewall_capacity_refusal_keeps_packet_owner_alive() {
     let ingress = ingresses[0];
     let budget = MemoryBudget::new(128 << 20);
     let mut core = RoutedCore::new(
-        authority,
+        authority.clone(),
         &ingresses,
         Requirements {
             execution: Execution::MixedEndpoints,
@@ -633,7 +651,8 @@ async fn firewall_capacity_refusal_keeps_packet_owner_alive() {
         .unwrap();
     let pressure = budget.reserve(budget.limit() - budget.used()).unwrap();
     assert!(matches!(
-        core.decide(packet, None, Instant::now()).await.unwrap(),
+        core.decide(&authority.read_policy().await, packet, None, Instant::now())
+            .unwrap(),
         Decision::Drop
     ));
     assert!(core.authority.admitting());
@@ -646,7 +665,8 @@ async fn firewall_capacity_refusal_keeps_packet_owner_alive() {
         .unwrap()
         .unwrap();
     assert!(matches!(
-        core.decide(packet, None, Instant::now()).await.unwrap(),
+        core.decide(&authority.read_policy().await, packet, None, Instant::now())
+            .unwrap(),
         Decision::Forward(Prepared::Forward(_), _)
     ));
     assert!(!core.firewall.is_empty());
@@ -823,7 +843,7 @@ async fn plain_output_history_survives_first_nat_enable_and_cq_owners() {
             .unwrap();
         let budget = MemoryBudget::new(32 << 20);
         let mut core = RoutedCore::new(
-            authority,
+            authority.clone(),
             &ingresses,
             Requirements {
                 execution: Execution::MixedEndpoints,
@@ -869,8 +889,9 @@ async fn plain_output_history_survives_first_nat_enable_and_cq_owners() {
         };
         let now = Instant::now();
         let packet = core.receive(ingresses[0], now, initial).unwrap().unwrap();
-        let Decision::Forward(Prepared::Forward(mut output), _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Forward(mut output), _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("plain traffic must forward without conntrack authority");
         };
@@ -930,8 +951,9 @@ async fn plain_output_history_survives_first_nat_enable_and_cq_owners() {
             .receive(ingresses[0], now, &translated)
             .unwrap()
             .unwrap();
-        let Decision::Forward(Prepared::Forward(mut output), _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Forward(mut output), _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("NAT must remain available alongside previously plain traffic");
         };
@@ -960,8 +982,9 @@ async fn plain_output_history_survives_first_nat_enable_and_cq_owners() {
         let public = emit("192.0.2.2:42000", "203.0.113.1:18080");
         let now = Instant::now();
         let packet = core.receive(ingresses[0], now, &public).unwrap().unwrap();
-        let Decision::Forward(Prepared::Error { packet, error }, _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Error { packet, error }, _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("forward reject must be evaluated after the DNAT input lookup");
         };
@@ -1011,7 +1034,7 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
             .unwrap();
         let budget = MemoryBudget::new(32 << 20);
         let table = Firewall::new_history(budget.clone(), 4, 1).unwrap();
-        let mut core = unsynchronized_core(authority, &ingresses, &budget, Some(table));
+        let mut core = unsynchronized_core(authority.clone(), &ingresses, &budget, Some(table));
         core.core = CoreForward::new(&ingresses, budget.clone(), 4).unwrap();
         core.set_ingress_roles(&[
             (ingresses[0], InterfaceRole::Lan),
@@ -1125,7 +1148,10 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
         assert!(packet.binding().is_none());
         assert!(packet.native_quote().is_some());
         let waiting = if wait_before_policy {
-            let Decision::Wait(packet) = core.decide(packet, None, now).await.unwrap() else {
+            let Decision::Wait(packet) = core
+                .decide(&authority.read_policy().await, packet, None, now)
+                .unwrap()
+            else {
                 panic!("the missing return neighbor must retain the original wire quote");
             };
             assert_eq!(
@@ -1135,8 +1161,9 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
             Facts::from_packet(&packet).unwrap();
             Some(packet)
         } else {
-            let Decision::Forward(Prepared::Forward(mut output), _) =
-                core.decide(packet, None, now).await.unwrap()
+            let Decision::Forward(Prepared::Forward(mut output), _) = core
+                .decide(&authority.read_policy().await, packet, None, now)
+                .unwrap()
             else {
                 panic!("policy-free forwarding must repair the native quote at output");
             };
@@ -1160,8 +1187,9 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
         let new = udp(42000, public, b"new-incarnation");
         let now = Instant::now();
         let packet = core.receive(ingresses[0], now, &new).unwrap().unwrap();
-        let Decision::Forward(Prepared::Forward(mut output), _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Forward(mut output), _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("the new UDP incarnation must receive its own grant");
         };
@@ -1184,7 +1212,8 @@ async fn unbound_native_quote_cannot_authorize_a_reused_nat_identity() {
         assert!(packet.binding().is_none());
         assert!(
             matches!(
-                core.decide(packet, None, Instant::now()).await.unwrap(),
+                core.decide(&authority.read_policy().await, packet, None, Instant::now())
+                    .unwrap(),
                 Decision::Drop
             ),
             "a native quote must not borrow the new incarnation's related-NAT authority"
@@ -1235,7 +1264,7 @@ async fn unresolved_forward_neighbor_does_not_delay_transit_errors() {
         .await
         .unwrap();
     let budget = MemoryBudget::new(16 << 20);
-    let mut core = unsynchronized_core(authority, &ingresses, &budget, None);
+    let mut core = unsynchronized_core(authority.clone(), &ingresses, &budget, None);
     for ipv6 in [false, true] {
         let source = if ipv6 {
             "[fd00:1::2]:40000"
@@ -1273,8 +1302,9 @@ async fn unresolved_forward_neighbor_does_not_delay_transit_errors() {
                 core.fib.lookup(packet.query()).unwrap(),
                 Resolution::NeighborPending(_)
             ));
-            let Decision::Forward(Prepared::Error { packet, error }, generation) =
-                core.decide(packet, None, now).await.unwrap()
+            let Decision::Forward(Prepared::Error { packet, error }, generation) = core
+                .decide(&authority.read_policy().await, packet, None, now)
+                .unwrap()
             else {
                 panic!("forward neighbor absence cannot delay a known transit error");
             };
@@ -1303,9 +1333,10 @@ async fn unresolved_forward_neighbor_does_not_delay_transit_errors() {
                 &expected_type
             );
             assert_eq!(
-                core.submit(route, generation, || Ok(Some(len)))
-                    .await
-                    .unwrap(),
+                core.submit(&authority.read_policy().await, route, generation, || Ok(
+                    Some(len)
+                ))
+                .unwrap(),
                 Some(len)
             );
             let invalid_source = Route {
@@ -1335,8 +1366,9 @@ async fn unresolved_forward_neighbor_does_not_delay_transit_errors() {
             .receive(ingresses[0], now, &bytes[..len])
             .unwrap()
             .unwrap();
-        let Decision::Forward(Prepared::Error { packet, error }, _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Error { packet, error }, _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("real prohibit route must retain administrative error authority");
         };
@@ -1372,8 +1404,9 @@ async fn unresolved_forward_neighbor_does_not_delay_transit_errors() {
             .receive(ingresses[0], now, &bytes[..len])
             .unwrap()
             .unwrap();
-        let Decision::Forward(Prepared::Error { packet, .. }, _) =
-            core.decide(packet, None, now).await.unwrap()
+        let Decision::Forward(Prepared::Error { packet, .. }, _) = core
+            .decide(&authority.read_policy().await, packet, None, now)
+            .unwrap()
         else {
             panic!("prohibit still applies with unresolved return neighbor");
         };
@@ -1429,7 +1462,7 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
             })
             .unwrap();
         drop(witness);
-        let mut core = unsynchronized_core(authority, &ingresses, &budget, Some(table));
+        let mut core = unsynchronized_core(authority.clone(), &ingresses, &budget, Some(table));
         core.fib.synchronize().unwrap();
         let baseline = budget.used();
         let mut fragment = bytes[..36].to_vec();
@@ -1449,8 +1482,7 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
         );
         let mut output = [0; 1280];
         let generated = core
-            .poll_reassembly_error(Instant::now(), &mut output)
-            .await
+            .poll_reassembly_error(&authority.read_policy().await, Instant::now(), &mut output)
             .unwrap()
             .expect("timeout emits despite unresolved forward neighbor");
         assert_eq!(&output[20..22], &[11, 1]);
@@ -1459,17 +1491,20 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
         let due = Instant::now();
         assert_eq!(core.poll_reassembly_timeout(due), Some(due));
         assert!(
-            core.poll_reassembly_error(due, &mut [0; 1280])
-                .await
+            core.poll_reassembly_error(&authority.read_policy().await, due, &mut [0; 1280])
                 .unwrap()
                 .is_none()
         );
         assert_eq!(core.poll_reassembly_timeout(due), None);
         assert!(budget.used() > baseline);
         assert_eq!(
-            core.submit(generated.route, generated.generation, || Ok(Some(())))
-                .await
-                .unwrap(),
+            core.submit(
+                &authority.read_policy().await,
+                generated.route,
+                generated.generation,
+                || Ok(Some(()))
+            )
+            .unwrap(),
             Some(())
         );
         core.firewall
@@ -1552,26 +1587,37 @@ async fn submit_refuses_mode_generation_and_aba_without_router_reload() {
         destination_mac: [4; 6],
     };
     assert_eq!(
-        core.submit(route, admitted, || Ok(Some(7))).await.unwrap(),
+        core.submit(&authority.read_policy().await, route, admitted, || Ok(
+            Some(7)
+        ))
+        .unwrap(),
         Some(7)
     );
     flags.set_mode("Global").await.unwrap();
     let global = authority.generation(Some(&mode.read()));
     assert_eq!(admitted.routing, global.routing);
     assert!(
-        core.submit(route, admitted, || -> io::Result<Option<()>> {
-            panic!("stale mode submitted a descriptor");
-        })
-        .await
+        core.submit(
+            &authority.read_policy().await,
+            route,
+            admitted,
+            || -> io::Result<Option<()>> {
+                panic!("stale mode submitted a descriptor");
+            }
+        )
         .unwrap()
         .is_none()
     );
     flags.set_mode("Rule").await.unwrap();
     assert!(
-        core.submit(route, admitted, || -> io::Result<Option<()>> {
-            panic!("mode ABA revived a descriptor");
-        })
-        .await
+        core.submit(
+            &authority.read_policy().await,
+            route,
+            admitted,
+            || -> io::Result<Option<()>> {
+                panic!("mode ABA revived a descriptor");
+            }
+        )
         .unwrap()
         .is_none()
     );
@@ -1579,7 +1625,38 @@ async fn submit_refuses_mode_generation_and_aba_without_router_reload() {
     route.generation = core.fib.generation();
     let current = authority.generation(Some(&mode.read()));
     assert_eq!(
-        core.submit(route, current, || Ok(Some(9))).await.unwrap(),
+        core.submit(&authority.read_policy().await, route, current, || Ok(Some(
+            9
+        )))
+        .unwrap(),
         Some(9)
+    );
+    // Readers are bound to this registration, and a held publication is waited for.
+    let mut other = honk_config::Config::default();
+    other.ensure_builtin_nodes();
+    other.global.dial_mode = "ip".into();
+    let other = crate::control::tests::support::control_plane(other);
+    let foreign = other
+        .core_forward_policy(Execution::MixedEndpoints)
+        .await
+        .unwrap();
+    let refused = core.submit(
+        &foreign.read_policy().await,
+        route,
+        current,
+        || -> io::Result<Option<()>> {
+            panic!("another registration's readers submitted a descriptor");
+        },
+    );
+    assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    let writer = plane.router.write().await;
+    let reading = authority.read_policy();
+    tokio::pin!(reading);
+    assert!(futures::poll!(&mut reading).is_pending());
+    drop(writer);
+    let read = reading.await;
+    assert_eq!(
+        core.submit(&read, route, current, || Ok(Some(11))).unwrap(),
+        Some(11)
     );
 }

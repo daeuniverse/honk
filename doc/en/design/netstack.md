@@ -125,9 +125,13 @@ Payload storage is a pool of chunks organized in two rings per TCP flow (send, r
 
 ## Core packet-endpoint embedding
 
-`honk-datapath` supplies nonwrapping `ScopeId` and a fixed frame/descriptor ledger; it grants no capture or routing authority. `control::netstack::PacketScope` owns one accounted Stack, one mutex, bounded frames/waiters and an externally joined timer owner. Output leases retain original TCP `FlowId`, bytes and credit until actual consumer release. Local release is not a NIC CQ, and a CQ address has no fabricated generation. Control and bulk reserves are separate.
+`honk-datapath` supplies nonwrapping `ScopeId` and a fixed frame/descriptor ledger; it grants no capture or routing authority. `control::netstack::PacketScope` owns one accounted Stack, one mutex, bounded frames/waiters and an externally joined owner obligation. Output leases retain original TCP `FlowId`, bytes and credit until actual consumer release. Local release is not a NIC CQ, and a CQ address has no fabricated generation. Control and bulk reserves are separate.
 
-The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. PacketOwner protocol and conditional 100ms shared-budget timers remain unchanged. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
+Ordinary embeddings run `PacketOwner`; XDP transfers the driving right to one non-cloneable `PacketDriver` in its device runtime. The original funded owner task stays parked, then runs and joins the actual finish or abandoned-driver cleanup. App/output mutations wake the active driver, while its own scans and exports do not self-notify. The shared mutex and unlocked retirement callbacks remain; a right handback is neither completion nor a CQ.
+
+Scope-task admission takes an original owner only after funding succeeds. On refusal, the already-funded supervisor retains unspawned owners and completes their real cleanup after producer, application and retirement teardown; readiness cannot finish while any exported output remains. Panic payloads stay retained until all original owners and admitted tasks have joined.
+
+The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. A blocked scope keeps its existing 100ms shared-budget fallback, armed until serviced rather than postponed by unrelated polls. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
 
 AF_XDP TX still publishes each packet immediately. A concrete synchronous device turn may defer only its per-packet NEED_WAKEUP check until the turn exits; standalone sends still kick immediately. Every normal exit preserves both work and final-kick errors, and no batch spans an await. Panic closes admission without issuing I/O or releasing published owners; only real CQ can return those owners.
 
@@ -211,6 +215,9 @@ typed native targets and final must/Block precedence. A Core `PolicyGeneration`
 captures both routing generation and the nonwrapping mode revision; submission
 holds the router/config/mode readers through the actual writer. A mode ABA change
 cannot revive queued output, and rejected output is disposed without replay.
+
+`RoutingAuthority::read_policy` supplies the real router/config guards. The XDP owner keeps a pending acquisition beside device, timer, shutdown and supervisor service, then resolves a bounded Core turn synchronously under those guards. A foreign registration's reader is refused; no scope mutex crosses an await.
+
 Ordinary Global decisions on the borrowed cached path return Cold rather than
 inventing an Endpoint handoff without owning its decision. An existing unbound
 Core transport keeps its execution owner across traffic-class changes and exact

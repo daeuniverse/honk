@@ -1,8 +1,11 @@
 //! Bounded L3 termination, not capture/classification or native continuation.
 //!
-//! One externally joined `PacketOwner` drives timers and queues complete IP packets. An
-//! `OutputLease` owns its actual frame bytes and credit until the consumer releases it.
-//! A backend must retain that lease through real I/O completion; local disposal is not a NIC CQ.
+//! One externally joined `PacketOwner` drives timers and queues complete IP packets, unless
+//! validated endpoint start hands that right to one device-owned `PacketDriver`. The original
+//! owner then stays parked in its joined task and resumes for the actual finish or for cleanup
+//! of an abandoned driver. An `OutputLease` owns its actual frame bytes and credit until the
+//! consumer releases it. A backend must retain that lease through real I/O completion; local
+//! disposal is not a NIC CQ.
 
 use std::fmt;
 use std::future::poll_fn;
@@ -28,6 +31,8 @@ pub use stream::{FlowIo, FlowRetirement};
 mod tests;
 
 const BATCH: usize = 64;
+// Budget refunds in another scope have no protocol event in this Stack.
+const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// Fixed metadata and frame ceilings for one scope, all funded by the supplied shared budget.
 #[derive(Clone, Copy, Debug)]
@@ -103,7 +108,21 @@ struct Queued {
     class: TxClass,
 }
 
+/// The one mutex-protected authority for who may drive this scope and whom mutations wake.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rights {
+    /// The original PacketOwner drives (ordinary, or reclaimed after a driver).
+    Task,
+    /// The unique PacketDriver drives; the original owner is parked.
+    Driven,
+    /// The driver irrevocably returned after actual finish.
+    Returned,
+    /// The driver disappeared without a successful return.
+    Abandoned,
+}
+
 struct Inner {
+    rights: Rights,
     stack: Option<Stack>,
     ledger: FrameLedger<Option<FlowId>>,
     frames: Box<[Option<Box<[u8]>>]>,
@@ -199,6 +218,7 @@ impl PacketScope {
             scope,
             budget,
             inner: Mutex::new(Inner {
+                rights: Rights::Task,
                 stack: Some(stack),
                 ledger,
                 frames,
@@ -544,37 +564,7 @@ impl PacketScope {
         class: Option<TxClass>,
         outputs: &mut [Option<OutputLease>],
     ) -> Poll<Option<usize>> {
-        assert!(!outputs.is_empty() && outputs.len() <= BATCH);
-        assert!(
-            outputs.iter().all(Option::is_none),
-            "empty output destination"
-        );
-        self.0.with(|inner| {
-            let mut count = 0;
-            for output in outputs {
-                let Some(queued) = inner.pop(class) else {
-                    break;
-                };
-                let index = inner.index(queued.lease);
-                let bytes = inner.frames[index]
-                    .take()
-                    .expect("queued frame owns storage");
-                *output = Some(OutputLease {
-                    scope: self.clone(),
-                    queued: Some(queued),
-                    bytes: Some(bytes),
-                });
-                count += 1;
-            }
-            if count != 0 {
-                return Poll::Ready(Some(count));
-            }
-            if inner.finished || inner.aborted {
-                return Poll::Ready(None);
-            }
-            register(&mut inner.output_waker, cx.waker());
-            Poll::Pending
-        })
+        self.0.with(|inner| inner.export(self, cx, class, outputs))
     }
 
     pub async fn next_output(&self) -> Option<OutputLease> {
@@ -595,7 +585,7 @@ impl PacketScope {
 
 impl Shared {
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        let (result, closed_apps) = {
+        let (result, closed_apps, device) = {
             let mut inner = self.inner.lock();
             let result = f(&mut inner);
             inner.events();
@@ -603,10 +593,9 @@ impl Shared {
                 stack.take_tx_wakeup();
             }
             // Every reapable slot is a closed app, and its transition's actor reaps it.
-            (result, inner.closed_apps != 0)
+            (result, inner.closed_apps != 0, inner.device_wake())
         };
-        // Notify carries a permit even if the owner has not started awaiting yet.
-        self.owner_wake.notify_one();
+        self.wake_owner(device);
         if closed_apps {
             self.reap();
         }
@@ -647,6 +636,17 @@ impl Shared {
             drop(completion);
         }
     }
+
+    /// Applies `Inner::device_wake` after unlocking. Notify carries a permit even if the
+    /// owner has not started awaiting yet.
+    fn wake_owner(&self, device: Option<Option<Waker>>) {
+        match device {
+            Some(Some(waker)) => waker.wake(),
+            // Already woken, or not armed before its first service: it will rescan anyway.
+            Some(None) => {}
+            None => self.owner_wake.notify_one(),
+        }
+    }
 }
 
 struct RetirementCompletion<'a> {
@@ -657,7 +657,7 @@ struct RetirementCompletion<'a> {
 
 impl Drop for RetirementCompletion<'_> {
     fn drop(&mut self) {
-        {
+        let device = {
             let mut inner = self.shared.inner.lock();
             let slot = inner.slots[self.index]
                 .take()
@@ -665,12 +665,56 @@ impl Drop for RetirementCompletion<'_> {
             assert_eq!(slot.id, self.id);
             inner.closed_apps -= 1;
             inner.wake_waiters();
-        }
-        self.shared.owner_wake.notify_one();
+            inner.device_wake()
+        };
+        self.shared.wake_owner(device);
     }
 }
 
 impl Inner {
+    /// Under this mutex: the driving device's wake, or `None` to notify the original owner.
+    /// Returned/Abandoned progress goes to the original owner, never a stale device task.
+    fn device_wake(&mut self) -> Option<Option<Waker>> {
+        (self.rights == Rights::Driven).then(|| self.output_waker.take())
+    }
+
+    /// The one CPU-output consumer body, shared by `Shared::with` and the device driver.
+    fn export(
+        &mut self,
+        scope: &PacketScope,
+        cx: &Context<'_>,
+        class: Option<TxClass>,
+        outputs: &mut [Option<OutputLease>],
+    ) -> Poll<Option<usize>> {
+        assert!(!outputs.is_empty() && outputs.len() <= BATCH);
+        assert!(
+            outputs.iter().all(Option::is_none),
+            "empty output destination"
+        );
+        let mut count = 0;
+        for output in outputs {
+            let Some(queued) = self.pop(class) else { break };
+            let index = self.index(queued.lease);
+            let bytes = self.frames[index]
+                .take()
+                .expect("queued frame owns storage");
+            *output = Some(OutputLease {
+                scope: scope.clone(),
+                queued: Some(queued),
+                bytes: Some(bytes),
+            });
+            count += 1;
+        }
+        if count != 0 {
+            return Poll::Ready(Some(count));
+        }
+        if self.finished || self.aborted {
+            return Poll::Ready(None);
+        }
+        register(&mut self.output_waker, cx.waker());
+        Poll::Pending
+    }
+
     fn pending_source_output(&self, packet: &[u8]) -> bool {
         let Ok((address, _)) = honk_netstack::wire::packet_addresses(packet) else {
             return false;
@@ -928,6 +972,43 @@ impl PacketOwner {
         self.scope.scope()
     }
 
+    /// The validated endpoint start's one-time Task → Driven transfer. This original owner
+    /// keeps the joined finish obligation: park it in `reclaim`, then run it.
+    pub(in crate::control) fn hand_off(&self) -> PacketDriver {
+        let mut inner = self.scope.0.inner.lock();
+        assert!(
+            inner.rights == Rights::Task,
+            "one driving right per original owner"
+        );
+        inner.rights = Rights::Driven;
+        drop(inner);
+        PacketDriver {
+            scope: self.scope.clone(),
+            fallback: None,
+            deadline: None,
+        }
+    }
+
+    /// Park while a device drives this scope, then take the right back. True only for a
+    /// return after actual finish; either way the caller must still run this owner.
+    pub(in crate::control) async fn reclaim(&self) -> bool {
+        loop {
+            // The state is authoritative; an armed Notify only hints that it changed.
+            let notified = self.scope.0.owner_wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut inner = self.scope.0.inner.lock();
+                if inner.rights != Rights::Driven {
+                    let returned = inner.rights == Rights::Returned && inner.finished;
+                    inner.rights = Rights::Task;
+                    return returned;
+                }
+            }
+            notified.await;
+        }
+    }
+
     pub async fn run(self) {
         loop {
             let notified = self.scope.0.owner_wake.notified();
@@ -941,11 +1022,10 @@ impl PacketOwner {
                     stack.take_tx_wakeup();
                 }
                 let mut deadline = inner.stack.as_ref().and_then(Stack::poll_timeout);
-                // Budget refunds in another scope have no protocol event in this Stack.
                 if inner.waiters.iter().any(Option::is_some)
                     || inner.slots.iter().flatten().any(|slot| slot.tx.is_some())
                 {
-                    let readiness = now + std::time::Duration::from_millis(100);
+                    let readiness = now + READINESS_FALLBACK;
                     deadline = Some(deadline.map_or(readiness, |due| due.min(readiness)));
                 }
                 (more, deadline)
@@ -978,6 +1058,109 @@ impl Drop for PacketOwner {
         if !finished {
             self.scope.shutdown(true);
         }
+    }
+}
+
+/// The exclusive driving right handed to one device owner. Not Clone; only `hand_off` makes
+/// one. Keep it in the outer device owner, never inside a scope callback or lock holder.
+pub(crate) struct PacketDriver {
+    scope: PacketScope,
+    // Kept until serviced so frequent unrelated device polls cannot postpone it.
+    fallback: Option<Instant>,
+    deadline: Option<Instant>,
+}
+
+impl PacketDriver {
+    pub(crate) fn scope(&self) -> ScopeId {
+        self.scope.scope()
+    }
+
+    /// The protocol or conditional refund-readiness deadline found by the last service.
+    pub(crate) fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    /// One device turn of owner work without `Shared::with`: timers, pending closes, events
+    /// and bounded CPU output, then unlocked reap and the actual finish check. True only when
+    /// the pull budget was exhausted. After a successful return the driver is inert.
+    pub(crate) fn service(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
+        let shared = &self.scope.0;
+        let more = {
+            let mut inner = shared.inner.lock();
+            if inner.rights != Rights::Driven {
+                self.deadline = None;
+                return false;
+            }
+            // Disarmed under this lock, so these pulls cannot wake their own device; armed
+            // again before unlocking, so a later producer finds it.
+            let armed = inner.output_waker.take();
+            if self.fallback.is_some_and(|due| due <= now) {
+                self.fallback = None;
+                inner.wake_waiters();
+            }
+            let more = inner.drive(now);
+            if let Some(stack) = &mut inner.stack {
+                stack.take_tx_wakeup();
+            }
+            inner.output_waker = armed;
+            register(&mut inner.output_waker, cx.waker());
+            more
+        };
+        shared.reap();
+        let mut inner = shared.inner.lock();
+        let armed = inner.output_waker.take();
+        if inner.finish() {
+            inner.rights = Rights::Returned;
+            drop(inner);
+            drop(armed);
+            self.fallback = None;
+            self.deadline = None;
+            shared.owner_wake.notify_one();
+            return false;
+        }
+        inner.output_waker = armed;
+        register(&mut inner.output_waker, cx.waker());
+        let blocked = inner.waiters.iter().any(Option::is_some)
+            || inner.slots.iter().flatten().any(|slot| slot.tx.is_some());
+        self.fallback = blocked.then(|| self.fallback.unwrap_or(now + READINESS_FALLBACK));
+        self.deadline = [
+            inner.stack.as_ref().and_then(Stack::poll_timeout),
+            self.fallback,
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        more
+    }
+
+    /// `PacketScope::poll_outputs_class` for the driving device, without `Shared::with`.
+    pub(crate) fn poll_outputs_class(
+        &mut self,
+        cx: &mut Context<'_>,
+        class: TxClass,
+        outputs: &mut [Option<OutputLease>],
+    ) -> Poll<Option<usize>> {
+        let mut inner = self.scope.0.inner.lock();
+        if inner.rights != Rights::Driven {
+            return Poll::Ready(None);
+        }
+        inner.export(&self.scope, cx, Some(class), outputs)
+    }
+}
+
+impl Drop for PacketDriver {
+    /// Only a right change; the parked original owner performs any cleanup.
+    fn drop(&mut self) {
+        let stale = {
+            let mut inner = self.scope.0.inner.lock();
+            if inner.rights != Rights::Driven {
+                return;
+            }
+            inner.rights = Rights::Abandoned;
+            inner.output_waker.take()
+        };
+        drop(stale);
+        self.scope.0.owner_wake.notify_one();
     }
 }
 

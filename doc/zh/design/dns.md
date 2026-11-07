@@ -27,6 +27,8 @@ flowchart LR
 
 非 `must` 透明入口与独立 `dns.bind` 两个 adapter 使用同一个 `DnsController`、当前 `DnsServiceProvider`、forwarder、缓存、singleflight 集合、上游池与路由投影。adapter 从准入开始一直持有所有权，直至应答 I/O 完成；它不会直接写 domain route。终局 `group(must)` 使用原始 TCP relay / UDP `PacketTransport`，不进入这条 DNS 管线，跳过 hosts、缓存、请求/响应策略和投影。
 
+健康与 URLTest resolver hook 只保留已有 `DnsService` handle，而不是整个 controller。当前 generation 查询、runtime 取消与缓存 flush 语义不变，但不再因此持有可变路由投影和 packet scope 注册预算。
+
 独立 UDP 监听器在同一个 socket 上运行 `min(runtime worker 数, 4)` 个接收 supervisor。每个 supervisor 每批最多接收八个报文，各自保留目的地元数据并独立准入，并复用自己的 512 KiB payload 缓冲（每个监听器最多 2 MiB）。socket 请求 4 MiB 内核接收缓冲区，Linux 会静默截断到 `net.core.rmem_max`。每个查询先在 supervisor 上 poll 一次再决定是否 spawn，因此已就绪的缓存应答不需要任务；未完成的查询在停止与排空期间仍被持有和 join，查询 panic 会使 teardown 失败。批处理不会绕过容量或 generation 检查。接收错误告警按 supervisor 计，同一个 socket 故障最多可告警四次。
 
 - [`src/dns.rs`](../../../crates/honk-config/src/dns.rs) — `DnsConfig`（`bind`、`upstream`、`routing`、`strategy`、`cache`、`fixed_domain_ttl`）。`DnsBindEndpoint` / `DnsBindTransport` / `DnsBindError` 解析当前 dae 监听器配置，并支持语义相等判断；`DnsConfig::bind_endpoint` 将空值映射为关闭。监听器绑定语法见[配置指南](../configuration.md)。`DnsUpstream` 包含 `name`、`address`、`protocol: DnsProtocol`、`tls_server_name` 与拨号路径的代理 tag **`outbound: Option<String>`**。

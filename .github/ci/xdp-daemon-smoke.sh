@@ -225,15 +225,43 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     ip -n dut -6 route replace fd00:1::99/128 dev dut0 src fd00:77::1
     ip -n dut route replace prohibit 198.51.100.98/32
     ip -n dut -6 route replace prohibit fd00:2::98/128
+    driven_test=xdp::tests::driven_kernel::policy_publication_keeps_real_endpoint_app_timer_and_close_owned
     for test in \
         control::core_forward::tests::firewall_capacity_refusal_keeps_packet_owner_alive \
         control::core_forward::tests::unresolved_forward_neighbor_does_not_delay_transit_errors \
         control::core_forward::tests::generated_reassembly_error_keeps_scoped_nat_and_funding_through_completion \
         control::core_forward::tests::plain_output_history_survives_first_nat_enable_and_cq_owners \
-        control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity; do
+        control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity \
+        "$driven_test"; do
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
     done
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" control::core_forward::tests:: --ignored --test-threads=1 --nocapture | tee "$work/core-forward.log"
+    ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
+    ip netns exec client nft add table inet honk_smoke_driven
+    ip netns exec client nft 'add chain inet honk_smoke_driven prerouting { type filter hook prerouting priority -300; policy accept; }'
+    ip netns exec client nft add rule inet honk_smoke_driven prerouting ip daddr 192.0.2.99 drop
+    ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work" "$HONK_XDP_CORE_TEST_BIN" "$driven_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/driven-runtime.log"
+    ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$work/driven-runtime.native-fence.json"
+    python3 - "$work/driven-runtime.native-fence.json" <<'PY'
+import json, pathlib, sys
+items = json.loads(pathlib.Path(sys.argv[1]).read_text())['nftables']
+rules = [item['rule']['expr'] for item in items if 'rule' in item]
+assert len(rules) == 1 and rules[0][-1] == {'drop': None}, rules
+counter = next(item['counter'] for item in rules[0] if 'counter' in item)
+assert counter['packets'] == 0, ('native forwarding masked real Runtime evidence', counter)
+PY
+    for dev in dut0 dut1; do
+        ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
+        guard_id=$(<"$work/driven-runtime.$dev.guard-id")
+        ip netns exec dut env HONK_XDP_PIN_ROOT="$work/bpf/driven-runtime" python3 "$HONK_XDP_PROBE" identity "$dev" guard "$guard_id"
+        ip -n dut link set "$dev" xdp off
+        rm "$work/bpf/driven-runtime/xdp-$ifindex/guard" "$work/bpf/driven-runtime/xdp-$ifindex/data"
+        rmdir "$work/bpf/driven-runtime/xdp-$ifindex"
+    done
+    rmdir "$work/bpf/driven-runtime"
+    ip netns exec client nft delete table inet honk_smoke_driven
+    ip netns exec dut nft flush chain inet honk_smoke_native forward
+    ip netns exec dut python3 "$work/check.py" absent
     ip -n dut route del 198.51.100.99/32
     ip -n dut -6 route del fd00:2::99/128
     ip -n dut route del 192.0.2.99/32
