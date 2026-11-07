@@ -251,20 +251,9 @@ impl Runtime {
             if !exact_record(packet) {
                 continue;
             }
-            let result =
-                self.endpoints
-                    .receive_with_source(scope, packet, ingress, false, |_, _| {
-                        self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing()
-                    });
-            match result {
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
-                    ) => {}
-                Err(error) => return Err(error).context("TUN Endpoint admission"),
-            }
+            admit_packet(&self.endpoints, scope, packet, ingress, |_, _| {
+                self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing()
+            })?;
         }
         Ok(true)
     }
@@ -322,6 +311,28 @@ impl Drop for Runtime {
         self.dispose_pending();
         drop(self.driver.take());
         drop(self.io.take());
+    }
+}
+
+fn admit_packet(
+    endpoints: &PacketEndpoints,
+    scope: honk_datapath::ScopeId,
+    packet: &[u8],
+    ingress: Instant,
+    on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
+) -> anyhow::Result<()> {
+    match endpoints.receive_with_source(scope, packet, ingress, false, on_source) {
+        Ok(_) => Ok(()),
+        Err(error)
+            if endpoints.is_closing()
+                || matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
+                ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error).context("TUN Endpoint admission"),
     }
 }
 
@@ -519,6 +530,13 @@ pub(crate) async fn run(
     (plane, result)
 }
 
+fn finish_failed_setup(setup: TunSetup, error: anyhow::Error) -> anyhow::Error {
+    match setup.finish(false) {
+        Ok(()) => error,
+        Err(cleanup) => error.context(cleanup),
+    }
+}
+
 async fn run_owned(
     plane: ControlPlane,
     admission: Arc<AtomicBool>,
@@ -539,21 +557,40 @@ async fn run_owned(
             .as_ref()
             .and_then(|value| value.tun.as_ref())
             .context("TUN configuration missing")?;
-        let (setup, device, topology) = TunSetup::prepare(&config)?;
         let pair = capture_scope(u32::from(tun.mtu), 1, &budget)?;
-        // SAFETY: these concrete owners never replace their descriptors while registered.
-        let io = unsafe { AsyncFd::register(device) }.map_err(io::Error::from)?;
-        let topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-        Ok((dns, capacity, memory, pair, setup, io, topology))
+        let (setup, device, topology) = TunSetup::prepare(&config)?;
+        Ok((dns, capacity, memory, pair, setup, device, topology))
     })();
-    let (dns, capacity, memory, pair, setup, io, topology) = match prepared {
+    let (dns, capacity, memory, pair, setup, device, topology) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
+    };
+    // SAFETY: these concrete owners never replace their descriptors while registered.
+    let io = match unsafe { AsyncFd::register(device) } {
+        Ok(io) => io,
+        Err(error) => {
+            let (device, error) = error.into_parts();
+            drop(device);
+            return (Some(plane), Err(finish_failed_setup(setup, error.into())));
+        }
+    };
+    // SAFETY: the subscribed watcher retains its descriptor unchanged while registered.
+    let topology = match unsafe { AsyncFd::register(topology) } {
+        Ok(topology) => topology,
+        Err(error) => {
+            let (topology, error) = error.into_parts();
+            drop(topology);
+            drop(io);
+            return (Some(plane), Err(finish_failed_setup(setup, error.into())));
+        }
     };
     let (endpoints, owner, mut drivers) =
         match PacketEndpoints::start_driven(plane, vec![pair], capacity, dns) {
             Ok(started) => started,
-            Err(error) => return (None, Err(error)),
+            Err(error) => {
+                drop(io);
+                return (None, Err(finish_failed_setup(setup, error)));
+            }
         };
     let mut runtime = Runtime {
         io: Some(io),
@@ -574,11 +611,7 @@ async fn run_owned(
     if let Err(error) = poll_fn(|cx| runtime.poll_startup(cx, timer.as_mut())).await {
         runtime.admission.store(false, Ordering::Release);
         drop(runtime.io.take());
-        let cleanup = runtime.setup.take().unwrap().finish(false);
-        let error = match cleanup {
-            Ok(()) => error,
-            Err(cleanup) => error.context(cleanup),
-        };
+        let error = finish_failed_setup(runtime.setup.take().unwrap(), error);
         return (None, Err(error));
     }
     let activated = (|| -> anyhow::Result<()> {

@@ -14,21 +14,6 @@ fn stored(journal: &Journal) -> Value {
 }
 
 #[test]
-fn strict_global_reverse_path_filter_is_refused_without_a_write() {
-    for value in ["0", "0\n", "2", "2\n"] {
-        admit_all_rp_filter(true, || Ok(value.into())).unwrap();
-    }
-    let error = admit_all_rp_filter(true, || Ok("1\n".into())).unwrap_err();
-    assert!(error.to_string().contains("net.ipv4.conf.all.rp_filter"));
-    assert!(admit_all_rp_filter(true, || Ok("3".into())).is_err());
-    assert!(admit_all_rp_filter(true, || Err(io::ErrorKind::PermissionDenied.into())).is_err());
-    admit_all_rp_filter(false, || {
-        panic!("IPv6-only startup must not read IPv4 policy")
-    })
-    .unwrap();
-}
-
-#[test]
 fn tun_attachment_requires_plain_single_queue_flags_and_a_bounded_name() {
     let flags = libc::IFF_TUN | libc::IFF_NO_PI;
     assert!(valid_attachment_flags(flags));
@@ -218,7 +203,7 @@ fn kernel_tun_exclusive_fd_and_containment_are_owned() {
     );
     std::thread::spawn(|| {
         nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
-        std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"0").unwrap();
+        std::fs::write("/proc/sys/net/ipv4/conf/all/rp_filter", b"1").unwrap();
         std::fs::write("/proc/sys/net/ipv6/conf/default/disable_ipv6", b"1").unwrap();
         let mut netlink = NlSock::new().unwrap();
         netlink.add_veth_pair("uplink", "peer").unwrap();
@@ -257,6 +242,12 @@ fn kernel_tun_exclusive_fd_and_containment_are_owned() {
             "cannot adopt an occupied name"
         );
         let final_watch = setup.activate(&device).unwrap();
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
+                .unwrap()
+                .trim(),
+            "1"
+        );
         let facts = setup.readback().unwrap();
         assert!(facts.link);
         assert_eq!(facts.routes.len(), 2);

@@ -256,7 +256,7 @@ impl Topology {
     ) -> io::Result<Self> {
         validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
         let fd = route_socket(true)?;
-        let snapshot = snapshot(fd.as_fd())?;
+        let snapshot = snapshot(fd.as_fd(), None)?;
         snapshot.admit(captured_physical, captured_logical, bypass_mark)?;
         let (ipv4_broadcasts, broadcast_count) = snapshot.ipv4_broadcasts()?;
         let mut topology = Self {
@@ -277,6 +277,29 @@ impl Topology {
         Self::watch_tun(spec, None)
     }
 
+    /// Completes only the owned IPv6 local-route work before any guards or rules
+    /// divert traffic. Foreign topology and malformed observations stay terminal.
+    pub fn wait_tun_device(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<()> {
+        let name = spec.validate()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let fd = route_socket(false)?;
+        loop {
+            let watch = route_socket(true)?;
+            let ready =
+                snapshot(fd.as_fd(), Some(deadline))?.tun_ready(spec, name, Some(ifindex), None)?;
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "owned TUN device readiness deadline expired",
+                ));
+            }
+            if ready {
+                return Ok(());
+            }
+            wait_netlink(watch.as_fd(), libc::POLLIN, deadline)?;
+        }
+    }
+
     /// Proves exactly the owned link, addresses, rules and guards (plus capture routes
     /// when `Active`) beside representable operator routing. Retain and watch it like
     /// [`Self::admit`]; any invalidation requires closing capture admission.
@@ -287,7 +310,7 @@ impl Topology {
     fn watch_tun(spec: &TunSpec<'_>, owned: Option<(u32, TunStage)>) -> io::Result<Self> {
         let name = spec.validate()?;
         let fd = route_socket(true)?;
-        snapshot(fd.as_fd())?.admit_tun(spec, name, owned)?;
+        snapshot(fd.as_fd(), None)?.admit_tun(spec, name, owned)?;
         let mut topology = Self {
             fd,
             invalidated: false,
@@ -416,13 +439,20 @@ fn validate_capture_sets(
 pub fn tun_readback(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback> {
     spec.validate()?;
     let fd = route_socket(false)?;
-    snapshot(fd.as_fd())?.tun_readback(spec, ifindex)
+    snapshot(fd.as_fd(), None)?.tun_readback(spec, ifindex)
 }
 
-fn snapshot(fd: BorrowedFd<'_>) -> io::Result<Snapshot> {
+fn snapshot(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<Snapshot> {
     let mut snapshot = Snapshot::default();
     for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
-        dump(fd, sequence, kind, body_len, &mut snapshot)?;
+        dump(
+            fd,
+            sequence,
+            kind,
+            body_len,
+            &mut snapshot,
+            deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)),
+        )?;
     }
     Ok(snapshot)
 }
@@ -550,6 +580,7 @@ fn dump(
     kind: u16,
     body_len: usize,
     snapshot: &mut Snapshot,
+    deadline: Instant,
 ) -> io::Result<()> {
     let mut request = [0u8; 32];
     let length = 16 + body_len;
@@ -560,8 +591,13 @@ fn dump(
     // SAFETY: zero is valid initialization for sockaddr_nl.
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "topology dump deadline expired",
+            ));
+        }
         // SAFETY: request and kernel match their supplied lengths.
         let n = unsafe {
             libc::sendto(
@@ -590,6 +626,12 @@ fn dump(
     }
     let mut buffer = [0u8; 65_536];
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "topology dump deadline expired",
+            ));
+        }
         wait_netlink(fd, libc::POLLIN, deadline)?;
         let mut source = kernel;
         let mut source_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
@@ -1028,6 +1070,25 @@ impl Snapshot {
         name: [u8; 16],
         owned: Option<(u32, TunStage)>,
     ) -> io::Result<()> {
+        if self.tun_ready(
+            spec,
+            name,
+            owned.map(|(index, _)| index),
+            owned.map(|(_, stage)| stage),
+        )? {
+            Ok(())
+        } else {
+            Err(unsupported("owned TUN address lacks its exact local route"))
+        }
+    }
+
+    fn tun_ready(
+        &self,
+        spec: &TunSpec<'_>,
+        name: [u8; 16],
+        ifindex: Option<u32>,
+        stage: Option<TunStage>,
+    ) -> io::Result<bool> {
         let mut indices = HashSet::new();
         let mut names = HashSet::new();
         let vrf = interface_name(b"vrf")?;
@@ -1040,7 +1101,6 @@ impl Snapshot {
                 return Err(unsupported("TUN requires unique named links without VRFs"));
             }
         }
-        let ifindex = owned.map(|(index, _)| index);
         if let Some(index) = ifindex {
             if !self.tun_link(spec, index) {
                 return Err(unsupported(
@@ -1081,19 +1141,28 @@ impl Snapshot {
                 ));
             }
         }
-        if owned.is_some() && found_addresses.len() != expected_addresses.len() {
+        if ifindex.is_some() && found_addresses.len() != expected_addresses.len() {
             return Err(unsupported("owned TUN address is missing"));
         }
+        let mut ready = true;
         if let Some(index) = ifindex {
             for address in &expected_addresses {
-                if !self.routes.iter().any(|route| {
-                    route.table == 255
-                        && route.kind == 2
+                let family = if address.is_ipv4() { 2 } else { 10 };
+                let prefix = if address.is_ipv4() { 32 } else { 128 };
+                let mut local = self.routes.iter().filter(|route| {
+                    route.family == family
+                        && route.table == 255
                         && route.destination == Some(*address)
-                        && route.output == index
-                        && route.prefix_len == if address.is_ipv4() { 32 } else { 128 }
-                }) {
-                    return Err(unsupported("owned TUN address lacks its exact local route"));
+                        && route.prefix_len == prefix
+                });
+                match (local.next(), local.next()) {
+                    (None, None) if address.is_ipv6() => ready = false,
+                    (Some(route), None) if route.kind == 2 && route.output == index => {}
+                    _ => {
+                        return Err(unsupported(
+                            "owned TUN local route is missing, conflicting or duplicated",
+                        ));
+                    }
                 }
             }
         }
@@ -1102,8 +1171,8 @@ impl Snapshot {
         for rule in &self.rules {
             let reserved = (spec.rule_priority..=spec.rule_priority + 4).contains(&rule.priority);
             if reserved {
-                let key = owned.and_then(|_| {
-                    self.tun_rule_key(spec, &expected_rules, rule, ifindex.unwrap_or(0), false)
+                let key = ifindex.zip(stage).and_then(|(index, _)| {
+                    self.tun_rule_key(spec, &expected_rules, rule, index, false)
                 });
                 if key.is_none() || seen_rules.contains(&key) {
                     return Err(unsupported(
@@ -1119,7 +1188,7 @@ impl Snapshot {
                 ));
             }
         }
-        if owned.is_some() && seen_rules.len() != expected_rules.len() {
+        if stage.is_some() && seen_rules.len() != expected_rules.len() {
             return Err(unsupported(
                 "TUN requires all five exact rules per enabled family",
             ));
@@ -1139,14 +1208,20 @@ impl Snapshot {
                 }
             }
         }
-        let mut expected_routes = spec.guard_routes();
-        if let Some((index, TunStage::Active)) = owned {
+        let mut expected_routes = if stage.is_some() {
+            spec.guard_routes()
+        } else {
+            Vec::new()
+        };
+        if let (Some(index), Some(TunStage::Active)) = (ifindex, stage) {
             expected_routes.extend(spec.capture_routes(index));
         }
         let mut seen_routes = Vec::with_capacity(expected_routes.len());
         for route in &self.routes {
             if route.table == spec.table {
-                let key = owned.and_then(|(index, _)| self.tun_route_key(spec, route, index));
+                let key = ifindex
+                    .zip(stage)
+                    .and_then(|(index, _)| self.tun_route_key(spec, route, index));
                 if key.is_none_or(|key| !expected_routes.contains(&key))
                     || seen_routes.contains(&key)
                 {
@@ -1180,7 +1255,7 @@ impl Snapshot {
                 return Err(unsupported("another routing table selects the owned TUN"));
             }
         }
-        if owned.is_some() && seen_routes.len() != expected_routes.len() {
+        if stage.is_some() && seen_routes.len() != expected_routes.len() {
             return Err(unsupported(
                 "TUN capture table is missing an exact guard or active route",
             ));
@@ -1200,7 +1275,7 @@ impl Snapshot {
                 return Err(unsupported("each enabled TUN family needs a non-TUN main default and usable uplink source"));
             }
         }
-        Ok(())
+        Ok(ready)
     }
 
     fn tun_link(&self, spec: &TunSpec<'_>, index: u32) -> bool {

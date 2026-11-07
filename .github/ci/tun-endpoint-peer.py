@@ -21,6 +21,9 @@ import threading
 import time
 import traceback
 
+if sys.flags.optimize:
+    raise RuntimeError('optimized Python disables required fixture checks')
+
 SCRIPT = str(Path(__file__).resolve())
 ROWS = [f'A-{origin}{family}-{transport}' for origin in 'HT' for family in '46'
         for transport in ('T', 'Uc', 'Uu')]
@@ -33,6 +36,10 @@ TARGETS = {4: ['198.51.100.' + str(i) for i in (2, 3, 10, 11, 12, 13, 14, 15, 16
 DOMAINS = {'bound-udp.test': 2, 'bound-tcp.test': 3, 'transparent-udp.test': 4,
            'transparent-tcp.test': 5, 'asis.test': 6, 'must.test': 7,
            'after-reload.test': 8, 'cross-scope.test': 9}
+
+
+class CleanupIncomplete(RuntimeError):
+    """Do not start another scenario after unconfirmed resource teardown."""
 
 
 def guard():
@@ -58,9 +65,10 @@ def json_ip(namespace, *args):
     return json.loads(ip(namespace, '-j', *args).stdout)
 
 
-def child(namespace, *args, **kwargs):
-    return subprocess.Popen(['ip', 'netns', 'exec', namespace, sys.executable, SCRIPT,
-                             *map(str, args)], text=True, **kwargs)
+def child(owner, namespace, *args, **kwargs):
+    return owner.track(subprocess.Popen(
+        ['ip', 'netns', 'exec', namespace, sys.executable, SCRIPT, *map(str, args)],
+        text=True, **kwargs))
 
 
 def eventually(predicate, description, seconds=10):
@@ -74,13 +82,26 @@ def eventually(predicate, description, seconds=10):
 
 
 def stop(process):
-    if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+    try:
+        if process is not None and process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except BaseException as error:
+        raise CleanupIncomplete(f'child {process.pid} did not join: {error!r}') from error
+    errors = []
+    if process is not None:
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception as error:
+                    errors.append(repr(error))
+    if errors:
+        raise CleanupIncomplete(f'child {process.pid} pipe cleanup: {errors}')
 
 
 def line(process):
@@ -608,6 +629,7 @@ class Fixture:
         self.state.mkdir(mode=0o700)
         self.names = {role: 'ht-' + label.lower() + '-' + role for role in ('dut', 'source', 'server')}
         self.created, self.daemon, self.peer = [], None, None
+        self.children = []
         self.handles = []
         self.notify = None
         self.config = self.directory / 'config.dae'
@@ -671,7 +693,7 @@ class Fixture:
         self.snapshot('operator-prerequisites')
         self.before = self.resources()
         (self.directory / 'peer-control.json').write_text(json.dumps({'subscription': 1}))
-        self.peer = child(server, 'serve', self.directory, stdout=self.open('peer.log'), stderr=subprocess.STDOUT)
+        self.peer = child(self, server, 'serve', self.directory, stdout=self.open('peer.log'), stderr=subprocess.STDOUT)
         eventually(lambda: (self.directory / 'peer-ready').exists() or self.peer.poll() is not None, 'real peer did not bind both transports')
         assert self.peer.poll() is None, 'real peer exited before readiness'
         self.text = self.config_text()
@@ -768,6 +790,14 @@ experimental {{
 }}
 '''
 
+    def track(self, process):
+        try:
+            self.children.append(process)
+        except BaseException:
+            stop(process)
+            raise
+        return process
+
     def launch(self, special=None, log=None):
         namespace = self.names['dut']
         environment = dict(os.environ, NOTIFY_SOCKET=str(self.state / 'notify.sock'), NO_COLOR='1')
@@ -775,7 +805,8 @@ experimental {{
         if special:
             argv += [sys.executable, SCRIPT, special]
         argv += [self.daemon_path, '-c', str(self.config)]
-        return subprocess.Popen(argv, env=environment, stdout=self.open(log or 'daemon.log'), stderr=subprocess.STDOUT)
+        return self.track(subprocess.Popen(
+            argv, env=environment, stdout=self.open(log or 'daemon.log'), stderr=subprocess.STDOUT))
 
     def start(self):
         self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
@@ -843,7 +874,7 @@ experimental {{
                 if index in (1, 3):
                     assert rule.get('action') == 'prohibit' or rule.get('type') == 'prohibit', rule
                 else:
-                    assert rule['table'] == ('main' if index in (0, 2) else 202), rule
+                    assert str(rule['table']) == ('main' if index in (0, 2) else '202'), rule
             routes = json_ip(dut, '-' + str(number), 'route', 'show', 'table', '202')
             assert len(routes) == 2, routes
             active = [route for route in routes if route.get('type', 'unicast') == 'unicast']
@@ -959,7 +990,7 @@ experimental {{
 
     def api(self, path='/configs', method='GET', body=None, prove_marks=False):
         before = self.counters()
-        process = child(self.names['source'], 'api', self.number, self.source, self.api_address,
+        process = child(self, self.names['source'], 'api', self.number, self.source, self.api_address,
                         method, path, json.dumps(body) if body is not None else '', stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=self.open('api.stderr'))
         try:
@@ -1003,7 +1034,7 @@ experimental {{
                 assert counters == [0], ('native/unmarked path attempted', rule)
         assert found == {'native-forward-refused', 'unmarked-uplink-refused'}, 'operator containment rules disappeared'
 
-    def normal_stop(self):
+    def normal_stop(self, expected_rp_filter=0):
         self.daemon.terminate()
         status = self.daemon.wait(timeout=20)
         assert status == 0 and 'TUN datapath stopped' in self.log.read_text(), ('unconfirmed joined normal stop', status)
@@ -1011,29 +1042,58 @@ experimental {{
         assert self.resources() == self.before, 'normal stop did not remove exactly the owned RPDB/routes'
         assert not list((self.state / 'state').glob('tun-*.json')), 'successful cleanup retained setup receipt'
         assert run('sysctl', '-n', 'net.ipv4.ip_forward', 'net.ipv6.conf.all.forwarding',
-                   'net.ipv4.conf.all.rp_filter', namespace=self.names['dut']).stdout.splitlines() == ['1', '1', '0']
+                   'net.ipv4.conf.all.rp_filter', namespace=self.names['dut']).stdout.splitlines() == ['1', '1', str(expected_rp_filter)]
         self.snapshot('normal-stopped')
 
-    def __exit__(self, *_):
-        # Stop producers before namespace destruction removes retained crash guards.
+    def __exit__(self, _kind, body_error, _traceback):
+        errors = ['unconfirmed child before teardown'] if isinstance(body_error, CleanupIncomplete) else []
         if self.names['source'] in self.created:
-            ip(self.names['source'], 'link', 'set', 'src0', 'down', check=False)
-        stop(self.peer)
-        stop(self.daemon)
+            try:
+                ip(self.names['source'], 'link', 'set', 'src0', 'down')
+            except Exception as error:
+                errors.append(f'quiesce: {error!r}')
+        can_remove = not errors
+        for process in reversed(self.children):
+            try:
+                stop(process)
+            except Exception as error:
+                errors.append(f'join: {error!r}')
+                can_remove = False
         if self.names['dut'] in self.created:
             try:
                 self.snapshot('final')
             except Exception as error:
-                (self.directory / 'snapshot-error.txt').write_text(repr(error))
+                errors.append(f'snapshot: {error!r}')
         if self.state.exists():
-            shutil.copytree(self.state, self.directory / 'state', dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns('notify.sock'))
-        for ns in reversed(self.created):
-            run('ip', 'netns', 'del', ns, check=False)
-        if self.notify is not None:
-            self.notify.close()
-        for handle in self.handles:
-            handle.close()
+            try:
+                shutil.copytree(self.state, self.directory / 'state', dirs_exist_ok=True,
+                                ignore=shutil.ignore_patterns('notify.sock'))
+            except Exception as error:
+                errors.append(f'state retention: {error!r}')
+        retained = list(self.created)
+        if can_remove:
+            for ns in reversed(self.created):
+                try:
+                    run('ip', 'netns', 'del', ns)
+                    retained.remove(ns)
+                except Exception as error:
+                    errors.append(f'namespace {ns}: {error!r}')
+        for handle in [self.notify, *self.handles]:
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception as error:
+                    errors.append(f'handle close: {error!r}')
+        try:
+            (self.directory / 'cleanup.json').write_text(json.dumps({
+                'complete': not errors, 'errors': errors, 'retained_namespaces': retained,
+                'children': [{'pid': process.pid, 'returncode': process.returncode}
+                             for process in self.children],
+            }, indent=2) + '\n')
+        except Exception as error:
+            errors.append(f'cleanup receipt: {error!r}')
+        if errors:
+            raise CleanupIncomplete('; '.join(errors))
 
 
 def assert_outbound(events, replies, action, number):
@@ -1112,8 +1172,13 @@ def dns_extensions(fixture):
             fixture.exchange('blocked-' + origin + '-' + name, target=TARGETS[number][DOMAINS[name]], port=18083, blocked=True, origin=origin)
     name = 'cross-scope.test'
     result = fixture.api('/dns/query?name=' + name + '&type=' + ('A' if number == 4 else 'AAAA'))
-    assert result is not None
-    fixture.exchange('host-scope-does-not-authorize-packet', target=TARGETS[number][DOMAINS[name]], port=18083)
+    expected = ipaddress.ip_address(TARGETS[number][DOMAINS[name]])
+    qtype = 1 if number == 4 else 28
+    assert result['Status'] == 0 and any(
+        answer.get('type') == qtype and answer.get('name', '').rstrip('.').lower() == name
+        and ipaddress.ip_address(answer['data']) == expected
+        for answer in result.get('Answer', [])), ('API DNS did not resolve the expected address', result)
+    fixture.exchange('api-dns-cache-does-not-contaminate-packet-scope', target=str(expected), port=18083)
     for transport in ('udp', 'tcp'):
         fixture.probe('dns', number, fixture.source, TARGETS[number][0], 53, transport, 'asis.test')
     for port, action in ((26000, 'proxy'), (26001, 'direct')):
@@ -1136,9 +1201,9 @@ def control_extensions(fixture):
     number = fixture.number
     config = fixture.api(prove_marks=True)
     assert config['tun'] == dict(enable=True, device='honk0', mtu=1500, stack='honk') and config['ipv6'] is True, config
-    live = child(fixture.names['source'], 'live', number, fixture.source, stdin=subprocess.PIPE,
+    live = child(fixture, fixture.names['source'], 'live', number, fixture.source, stdin=subprocess.PIPE,
                  stdout=subprocess.PIPE, stderr=fixture.open('live.stderr'))
-    dns = child(fixture.names['source'], 'dns', number, fixture.source, fixture.bind_address,
+    dns = child(fixture, fixture.names['source'], 'dns', number, fixture.source, fixture.bind_address,
                 1053, 'tcp', 'bound-tcp.test', 'false', 'true', stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, stderr=fixture.open('persistent-dns.stderr'))
     try:
@@ -1161,8 +1226,10 @@ def control_extensions(fixture):
         fixture.probe('dns', number, fixture.source, fixture.bind_address, 1053, 'udp', 'after-reload.test', 'true')
         fixture.reload(fixture.text)
     finally:
-        stop(live)
-        stop(dns)
+        try:
+            stop(live)
+        finally:
+            stop(dns)
     for origin in ('H', 'T'):
         fixture.exchange('block-must-' + origin, port=18085, blocked=True, origin=origin)
         fixture.exchange('direct-must-' + origin, port=18082, origin=origin)
@@ -1269,8 +1336,6 @@ def setup_fault(daemon, root, number, fault):
             ip(dut, option, 'route', 'del', 'default')
         elif fault == 'rpdb':
             ip(dut, option, 'rule', 'add', 'pref', '500', 'lookup', 'main')
-        elif fault == 'rp-filter':
-            run('sysctl', '-qw', 'net.ipv4.conf.all.rp_filter=1', namespace=dut)
         elif fault == 'dns-bind':
             fixture.config.write_text(fixture.text.replace('tcp+udp://' + ('[' + fixture.bind_address + ']' if number == 6 else fixture.bind_address) + ':1053', 'tcp+udp://' + ('[fd00:bad::1]' if number == 6 else '203.0.113.254') + ':1053'))
         elif fault not in ('no-cap', 'no-tun'):
@@ -1294,7 +1359,7 @@ def setup_fault(daemon, root, number, fault):
             # Bind fails after guards exist: either exact normal rollback or retained containment.
             rules = after[option]['rules']
             if any(rule.get('priority') == 10004 for rule in rules):
-                assert any(route.get('type') == 'blackhole' and route.get('table') == 202 for route in after[option]['routes'])
+                assert any(route.get('type') == 'blackhole' and str(route.get('table')) == '202' for route in after[option]['routes'])
                 fixture.check_receipt()
             else:
                 assert after[option] == before[option]
@@ -1306,9 +1371,44 @@ def duplicate_lock(daemon, root, number):
         fixture.start()
         before = fixture.resources()
         identity = fixture.device_identity()
+        lock_stat = Path('/run/honk-core.lock').stat()
+        lock_key = (lock_stat.st_dev, lock_stat.st_ino)
+
+        def lock_fds(process):
+            assert process.poll() is None, 'instance exited before lock observation'
+            found = []
+            for fd in Path(f'/proc/{process.pid}/fd').iterdir():
+                try:
+                    info = fd.stat()
+                    if (info.st_dev, info.st_ino) == lock_key:
+                        found.append(Path(f'/proc/{process.pid}/fdinfo/{fd.name}').read_text())
+                except FileNotFoundError:
+                    continue
+            return found
+
+        def holds_lock(records):
+            return any(line.startswith('lock:') and 'FLOCK' in line
+                       for text in records for line in text.splitlines())
+
+        first_lock = lock_fds(fixture.daemon)
+        assert holds_lock(first_lock), 'first daemon does not hold the actual instance lock'
         second = fixture.launch(log='second-instance.log')
         try:
-            assert second.wait(timeout=10) != 0, 'real instance lock admitted a second daemon'
+            eventually(lambda: lock_fds(second), 'second instance did not reach the lock file', seconds=10)
+            observations = []
+            for _ in range(2):
+                waiting = lock_fds(second)
+                held = lock_fds(fixture.daemon)
+                assert waiting and not holds_lock(waiting) and holds_lock(held)
+                assert fixture.resources() == before and fixture.device_identity() == identity
+                fixture.exchange('first-owner-progresses-while-second-waits')
+                observations.append({'first_fdinfo': held, 'second_fdinfo': waiting,
+                                     'monotonic_ns': time.monotonic_ns()})
+                time.sleep(0.5)
+            (fixture.directory / 'lock-wait.json').write_text(json.dumps({
+                'first_pid': fixture.daemon.pid, 'second_pid': second.pid,
+                'lock_device_inode': lock_key, 'observations': observations,
+            }, indent=2) + '\n')
         finally:
             stop(second)
         assert fixture.resources() == before and fixture.device_identity() == identity
@@ -1319,7 +1419,7 @@ def duplicate_lock(daemon, root, number):
 def close_active(daemon, root, number):
     with Fixture(daemon, root, f'A-{number}-close-active', number) as fixture:
         fixture.start()
-        process = child(fixture.names['source'], 'live', number, fixture.source, stdin=subprocess.PIPE,
+        process = child(fixture, fixture.names['source'], 'live', number, fixture.source, stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=fixture.open('held-close.stderr'))
         try:
             assert line(process)['phase'] == 'before'
@@ -1330,20 +1430,48 @@ def close_active(daemon, root, number):
             stop(process)
 
 
+def strict_rpf(daemon, root, number):
+    row = f'A-{number}-strict-rpf'
+    with Fixture(daemon, root, row, number) as fixture:
+        run('sysctl', '-qw', 'net.ipv4.conf.all.rp_filter=1', namespace=fixture.names['dut'])
+        fixture.start()
+        for origin in ('H', 'T'):
+            for transport in ('T', 'Uc', 'Uu'):
+                for action, port in (('proxy', 18080), ('direct', 18081)):
+                    before = fixture.counters()
+                    start = len(fixture.peer_events())
+                    label = f'{row}/{origin}/{transport}/{action}'
+                    observed = fixture.probe(
+                        'traffic', number, fixture.host_source if origin == 'H' else fixture.source,
+                        transport, port, label, origin=origin, timeout=80)
+                    events = fixture.peer_events()[start:]
+                    assert_outbound(events, observed['replies'], action, number)
+                    after = fixture.counters()
+                    assert after['tx'] > before['tx'] and after['rx'] > before['rx']
+                    (fixture.directory / f'{origin}-{transport}-{action}.json').write_text(
+                        json.dumps({'client': observed, 'peer': events, 'counters': [before, after]}, indent=2))
+        assert run('sysctl', '-n', 'net.ipv4.conf.all.rp_filter', namespace=fixture.names['dut']).stdout.strip() == '1'
+        fixture.fence_counters()
+        fixture.normal_stop(expected_rp_filter=1)
+
+
 def gate(daemon, root):
     root = Path(root)
-    fault_names = ('name', 'table', 'priority', 'address', 'main-route', 'rpdb', 'rp-filter', 'dns-bind', 'no-cap', 'no-tun')
+    fault_names = ('name', 'table', 'priority', 'address', 'main-route', 'rpdb', 'dns-bind', 'no-cap', 'no-tun')
     cases = ROWS + [f'A-{number}-{name}' for number in (4, 6)
-                    for name in ('DNS', 'control', 'packets', 'instance-lock', 'close-active',
+                    for name in ('DNS', 'control', 'packets', 'instance-lock', 'close-active', 'strict-rpf',
                                  'crash-guard', 'topology-fault', *('setup-' + fault for fault in fault_names))]
     results = {row: {'status': 'NOT_RUN'} for row in cases}
     failures = []
     def record(row, operation):
+        terminal_cleanup = None
         try:
             operation()
         except Exception as error:
             status = dict(status='FAIL', error=repr(error))
             failures.append(row)
+            if isinstance(error, CleanupIncomplete):
+                terminal_cleanup = error
             detail = traceback.format_exc()
             if isinstance(error, subprocess.CalledProcessError):
                 detail += '\nstdout:\n' + (error.stdout or '') + '\nstderr:\n' + (error.stderr or '')
@@ -1356,6 +1484,8 @@ def gate(daemon, root):
         with (root / 'rows.jsonl').open('a') as output:
             output.write(json.dumps(result, sort_keys=True) + '\n')
         (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
+        if terminal_cleanup is not None:
+            raise terminal_cleanup
     (root / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
     (root / 'executable.json').write_text(json.dumps(dict(path=daemon, sha256=hashlib.sha256(Path(daemon).read_bytes()).hexdigest(),
                                                           kernel=os.uname().release, lane=os.environ['HONK_CI_VM_LANE']), indent=2))
@@ -1381,6 +1511,7 @@ def gate(daemon, root):
             record(row, extension)
         record(f'A-{number}-instance-lock', lambda number=number: duplicate_lock(daemon, root, number))
         record(f'A-{number}-close-active', lambda number=number: close_active(daemon, root, number))
+        record(f'A-{number}-strict-rpf', lambda number=number: strict_rpf(daemon, root, number))
         for fault in fault_names:
             record(f'A-{number}-setup-{fault}', lambda number=number, fault=fault: setup_fault(daemon, root, number, fault))
         for topology in (False, True):

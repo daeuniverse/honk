@@ -19,23 +19,28 @@ reader/writer，不 dup/继承 FD，不支持 persistent、外部 FD 或接管�
 ### Setup 与就绪
 
 1. 完成静态/runtime 准入，取得真实 instance lock，初始化 required 精确旁路
-   mark M，并用真实 TCP/UDP socket 核对。在任何 rule/blackhole 变更前，
-   `prepare_dns_bind(&Config)` 解析并保留启用 bind endpoint 的实际 `SocketAddr`
-   候选。失败在改路前拒绝启动；关闭监听时返回 `None`。
-2. 先订阅 rtnetlink 再 snapshot。拒绝已占用的名称/表/五个优先级以及不支持的
-   RPDB/main/default 拓扑。先创建私有 setup receipt，持久化 create intent，
-   再执行 exclusive TUN ioctl；立即记录实际 netns cookie、ifindex 与 attachment
+   mark M。`prepare_dns_bind(&Config)` 解析并保留启用 bind endpoint 的实际
+   `SocketAddr` 候选；关闭监听时返回 `None`。在任何链路或路由变更前，先计费
+   runtime/RX 存储，并创建唯一非 HOST `PacketScope` 及原 owner。
+2. 用真实 TCP/UDP socket 验证 required mark，先订阅 rtnetlink 再 snapshot。
+   拒绝已占用的名称/表/五个优先级及不支持的 RPDB/main/default 拓扑。先创建
+   私有 setup receipt，持久化 create intent，再执行 exclusive TUN ioctl；
+   立即记录实际 netns cookie、ifindex 与 attachment
    incarnation。设置 MTU、明确地址、自有 link sysctl 与 UP，逐项记录 ACK/回读。
+   UP ACK 后，先等精确自有 link、永久 host address 与 local host route 回读完成，
+   再安装任何 guard/rule。IPv6 NODAD 仍会排队执行 local-route 工作；仅缺失其
+   `/128` route 时按通知等待，所有回读共用一个两秒截止时间，不延长。冲突、
+   外部非法拓扑或损坏观察立即拒绝，失败发生在改路之前。
 3. 每项变更前先写 intent，安装 capture prefix 的 static blackhole（metric
    32760）和五条 rule；此时不安装 unicast capture，Endpoint 未 ready 期间所选
    prefix 由 guard 拒绝，不能原生漏过。
-4. 通过共享 capture helper 创建唯一非 HOST `PacketScope` 及原 owner，调用
+4. 把已计费的 scope 及原 owner 交给
    `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
    prepared_dns_addresses)`。最后一参是真实 `Option<PreparedDnsBind>`，保存
    endpoint 与已解析候选，不是布尔开关或再次解析请求。等待 `owner.poll_ready`
    时仍须服务唯一 `PacketDriver` 的 timer/output，包括失败启动清理；DNS bind、
    软件 flags 与订阅 authorization 全部 ready 后才继续。
-5. 回读 link/address/offload/rule，安装并回读 metric-1024 capture route；保留旧
+5. 回读 link/address/rule，安装并回读 metric-1024 capture route；保留旧
    watch 的同时建立最终 `Topology::admit_tun` 订阅及完整 snapshot。全部准入成功
    后才开共享 gate，调用 `capture_ready()`，报告 `TUN datapath ready`、lifecycle
    Running 和 sd_notify READY。close 不能在此竞争中被绕过。

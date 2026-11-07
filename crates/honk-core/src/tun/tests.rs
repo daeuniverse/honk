@@ -71,6 +71,164 @@ fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
     (scope, owner, budget)
 }
 
+async fn driven_endpoints() -> (
+    PacketEndpoints,
+    PacketEndpointOwner,
+    PacketDriver,
+    PacketScope,
+    Arc<MemoryBudget>,
+) {
+    let (scope, scope_owner, budget) = scope();
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.global.tcp_check_url.clear();
+    config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
+    config.global.preconnect_node_count = 0;
+    config.global.udp_warm_node_count = 0;
+    let plane = crate::control::tests::support::control_plane(config);
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1, None).unwrap();
+    let mut driver = drivers.pop().unwrap();
+    poll_fn(|cx| {
+        driver.service(cx, Instant::now());
+        owner.poll_ready(cx)
+    })
+    .await
+    .unwrap();
+    (endpoints, owner, driver, scope, budget)
+}
+
+#[tokio::test]
+async fn close_racing_udp_admission_preserves_the_joined_shutdown_outcome() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for port in [53, 443] {
+            for abandon in [false, true] {
+                let (endpoints, mut owner, driver, scope, budget) = driven_endpoints().await;
+                let mut driver = Some(driver);
+                let admission = AtomicBool::new(true);
+                let source = "192.0.2.1:41000".parse().unwrap();
+                let destination = std::net::SocketAddr::from(([198, 51, 100, 1], port));
+                let mut packet = [0; 128];
+                let length = honk_netstack::wire::udp::emit_packet(
+                    &mut packet,
+                    source,
+                    destination,
+                    b"close-race",
+                )
+                .unwrap();
+                let mut received_source = false;
+                std::thread::scope(|threads| {
+                    let (close, requested) = std::sync::mpsc::sync_channel(0);
+                    let closing = &endpoints;
+                    threads.spawn(move || {
+                        requested.recv().unwrap();
+                        closing.close();
+                    });
+                    admit_packet(
+                        &endpoints,
+                        scope.scope(),
+                        &packet[..length],
+                        Instant::now(),
+                        |_, _| {
+                            let allowed =
+                                admission.load(Ordering::Acquire) && !endpoints.is_closing();
+                            assert!(allowed);
+                            received_source = true;
+                            close.send(()).unwrap();
+                            // close publishes CLOSING before waiting for this scope mutex.
+                            let deadline = Instant::now() + Duration::from_secs(5);
+                            while !endpoints.is_closing() {
+                                assert!(Instant::now() < deadline, "close did not publish");
+                                std::thread::yield_now();
+                            }
+                            allowed
+                        },
+                    )
+                    .expect("an admitted UDP racing endpoint close must not fail the TUN owner");
+                });
+                assert!(received_source);
+                assert!(endpoints.is_closing());
+                assert!(!endpoints.retains_source(scope.scope(), source.ip()));
+                if abandon {
+                    drop(driver.take());
+                }
+                let (plane, result) = poll_fn(|cx| {
+                    if let Some(driver) = &mut driver {
+                        driver.service(cx, Instant::now());
+                    }
+                    owner.poll_join_plane(cx)
+                })
+                .await
+                .unwrap();
+                if abandon {
+                    result.expect_err("a close must preserve supervisor failure");
+                } else {
+                    result.expect("ordinary joined stop must preserve supervisor success");
+                }
+                drop((plane, endpoints, owner, driver, scope));
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    })
+    .await
+    .expect("both normal stop and failed supervisor must join the original packet owners");
+}
+
+#[tokio::test]
+async fn admission_errors_without_endpoint_close_remain_failures() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (endpoints, mut owner, mut driver, scope, budget) = driven_endpoints().await;
+        let mut packet = [0; 128];
+        let source = "192.0.2.1:41000".parse().unwrap();
+        let length = honk_netstack::wire::udp::emit_packet(
+            &mut packet,
+            source,
+            "198.51.100.1:53".parse().unwrap(),
+            b"source-closed",
+        )
+        .unwrap();
+        scope.shutdown(false);
+        let error = admit_packet(
+            &endpoints,
+            scope.scope(),
+            &packet[..length],
+            Instant::now(),
+            |_, _| true,
+        )
+        .expect_err("a closed UDP53 source hold alone is not a graceful endpoint stop");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+        assert!(!endpoints.is_closing());
+        let error = admit_packet(
+            &endpoints,
+            honk_datapath::ScopeId::HOST,
+            &packet[..length],
+            Instant::now(),
+            |_, _| true,
+        )
+        .expect_err("an unowned scope must remain an admission failure");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().kind(),
+            io::ErrorKind::NotFound
+        );
+        endpoints.close();
+        let (plane, result) = poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            owner.poll_join_plane(cx)
+        })
+        .await
+        .unwrap();
+        result.unwrap();
+        drop((plane, endpoints, owner, driver, scope));
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("a genuine admission error must still permit joined cleanup");
+}
+
 async fn output(scope: &PacketScope) -> OutputLease {
     scope
         .datagram_sender("198.51.100.1:53".parse().unwrap())

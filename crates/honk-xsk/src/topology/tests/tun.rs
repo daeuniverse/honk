@@ -118,6 +118,24 @@ fn route_body(route: TunRoute) -> Vec<u8> {
     body
 }
 
+fn owned_local_route_body(ip: IpAddr, ifindex: u32) -> Vec<u8> {
+    let family = if ip.is_ipv6() { 10 } else { 2 };
+    let mut local = local_route_body(
+        family,
+        if family == 2 { 32 } else { 128 },
+        2,
+        Some(&bytes(ip)),
+    );
+    local[6] = if family == 2 { 254 } else { 0 };
+    let output = local.len() - 12;
+    assert_eq!(
+        u16::from_ne_bytes(local[output - 2..output].try_into().unwrap()),
+        4
+    );
+    local[output..output + 4].copy_from_slice(&ifindex.to_ne_bytes());
+    local
+}
+
 fn fixture(spec: &TunSpec<'_>, stage: Option<TunStage>) -> Snapshot {
     let mut snapshot = Snapshot::default();
     snapshot.links.push(link(1, "lo", None, 0x10049, 772));
@@ -141,21 +159,7 @@ fn fixture(spec: &TunSpec<'_>, stage: Option<TunStage>) -> Snapshot {
             .push(link(17, "honk0", Some("tun"), 0x110d1, 0xfffe));
         for ip in spec.addresses() {
             snapshot.addresses.push(address(17, ip, true));
-            let family = if ip.is_ipv6() { 10 } else { 2 };
-            let mut local = local_route_body(
-                family,
-                if family == 2 { 32 } else { 128 },
-                2,
-                Some(&bytes(ip)),
-            );
-            local[6] = if family == 2 { 254 } else { 0 };
-            let output = local.len() - 12;
-            assert_eq!(
-                u16::from_ne_bytes(local[output - 2..output].try_into().unwrap()),
-                4
-            );
-            local[output..output + 4].copy_from_slice(&17u32.to_ne_bytes());
-            snapshot.push(24, &local).unwrap();
+            snapshot.push(24, &owned_local_route_body(ip, 17)).unwrap();
         }
         for rule in spec.rules() {
             snapshot.push(32, &rule_body(rule, spec.name)).unwrap();
@@ -174,6 +178,121 @@ fn fixture(spec: &TunSpec<'_>, stage: Option<TunStage>) -> Snapshot {
 
 fn admit(snapshot: &Snapshot, spec: &TunSpec<'_>, stage: Option<TunStage>) -> io::Result<()> {
     snapshot.admit_tun(spec, spec.validate()?, stage.map(|stage| (17, stage)))
+}
+
+fn device_fixture(spec: &TunSpec<'_>) -> Snapshot {
+    let mut snapshot = fixture(spec, Some(TunStage::Guarded));
+    snapshot
+        .rules
+        .retain(|rule| !(spec.rule_priority..=spec.rule_priority + 4).contains(&rule.priority));
+    snapshot.routes.retain(|route| route.table != spec.table);
+    snapshot
+}
+
+#[test]
+fn tun_device_readiness_waits_only_for_its_parsed_ipv6_local_route() {
+    for (v4, v6) in [(true, false), (false, true), (true, true)] {
+        let spec = spec(v4, v6);
+        let name = spec.validate().unwrap();
+        let mut snapshot = device_fixture(&spec);
+        assert!(snapshot.tun_ready(&spec, name, Some(17), None).unwrap());
+        if !v6 {
+            continue;
+        }
+        snapshot
+            .routes
+            .retain(|route| route.family != 10 || route.table != 255);
+        assert!(!snapshot.tun_ready(&spec, name, Some(17), None).unwrap());
+        let local = owned_local_route_body(IpAddr::V6(spec.address6.unwrap()), 17);
+        snapshot.push(24, &local).unwrap();
+        assert!(snapshot.tun_ready(&spec, name, Some(17), None).unwrap());
+
+        for stage in [TunStage::Guarded, TunStage::Active] {
+            let mut snapshot = fixture(&spec, Some(stage));
+            snapshot
+                .routes
+                .retain(|route| route.family != 10 || route.table != 255);
+            assert!(
+                !snapshot
+                    .tun_ready(&spec, name, Some(17), Some(stage))
+                    .unwrap()
+            );
+            assert_eq!(
+                admit(&snapshot, &spec, Some(stage)).unwrap_err().kind(),
+                io::ErrorKind::Unsupported
+            );
+            snapshot.push(24, &local).unwrap();
+            admit(&snapshot, &spec, Some(stage)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn tun_device_readiness_never_retries_foreign_or_conflicting_parsed_state() {
+    let spec = spec(true, true);
+    let name = spec.validate().unwrap();
+    let address6 = IpAddr::V6(spec.address6.unwrap());
+    for change in 0..13 {
+        let mut snapshot = device_fixture(&spec);
+        snapshot
+            .routes
+            .retain(|route| route.family != 10 || route.table != 255);
+        assert!(!snapshot.tun_ready(&spec, name, Some(17), None).unwrap());
+        match change {
+            0 => snapshot.rules.push(xdp_rule(2, 99, 100, Some(0x100))),
+            1 => snapshot
+                .push(24, &route_body(spec.guard_routes()[0]))
+                .unwrap(),
+            2 => snapshot.routes.push(xdp_route(2, 254, 17, false, 1)),
+            3 => snapshot
+                .routes
+                .retain(|route| route.family != 2 || route.table != 255),
+            4 => snapshot
+                .push(24, &owned_local_route_body(address6, 3))
+                .unwrap(),
+            5 => {
+                let mut local = owned_local_route_body(address6, 17);
+                local[7] = 1;
+                snapshot.push(24, &local).unwrap();
+            }
+            6 => snapshot
+                .push(
+                    24,
+                    &owned_local_route_body(IpAddr::V4(spec.address4.unwrap()), 17),
+                )
+                .unwrap(),
+            7 => {
+                let mut local = owned_local_route_body(address6, 17);
+                attribute(&mut local, 99, &[0; 8]);
+                snapshot.push(24, &local).unwrap();
+            }
+            8 => {
+                snapshot.links.pop();
+                snapshot
+                    .links
+                    .push(link(17, "honk0", Some("tun"), 0x100d1, 0xfffe));
+            }
+            9 => snapshot.addresses.push(address(3, address6, false)),
+            10 => snapshot.addresses.push(address(17, address6, true)),
+            11 => {
+                let mut local = owned_local_route_body(address6, 17);
+                local[1] = 64;
+                snapshot.push(24, &local).unwrap();
+            }
+            _ => snapshot.addresses.retain(|address| address.family != 10),
+        }
+        assert!(
+            snapshot.tun_ready(&spec, name, Some(17), None).is_err(),
+            "accepted pending state mutation {change}"
+        );
+    }
+}
+
+#[test]
+fn tun_device_readback_does_not_refresh_an_expired_deadline() {
+    let fd = std::fs::File::open("/dev/null").unwrap();
+    let error = snapshot(fd.as_fd(), Some(Instant::now())).err().unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 }
 
 #[test]

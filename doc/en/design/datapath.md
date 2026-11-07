@@ -20,27 +20,33 @@ persistent device, external-FD input or pre-existing-link adoption.
 
 ### Setup and readiness
 
-1. Complete static/runtime admission, take the real instance lock, initialize the
-   required exact bypass mark M and verify it on actual TCP/UDP sockets. Before
-   any rule or blackhole mutation, `prepare_dns_bind(&Config)` resolves and retains
-   the enabled bind endpoint's actual `SocketAddr` candidates. Failure rejects
-   startup before routing changes; disabled listening returns `None`.
-2. Subscribe to rtnetlink before snapshotting. Refuse occupied name/table/all five
-   priorities and unsupported RPDB/main/default topology. Create the private setup
-   receipt and persist the create intent before the exclusive TUN ioctl. Record
+1. Complete static/runtime admission, take the real instance lock and initialize
+   the required exact bypass mark M. `prepare_dns_bind(&Config)` resolves and
+   retains the enabled bind endpoint's actual `SocketAddr` candidates; disabled
+   listening returns `None`. Fund runtime/RX storage and one non-HOST
+   `PacketScope` with its original owner before any link or routing mutation.
+2. Verify the required mark on actual TCP/UDP sockets, subscribe to rtnetlink and
+   snapshot. Refuse occupied name/table/all five priorities and unsupported
+   RPDB/main/default topology. Create the private setup receipt and persist the
+   create intent before the exclusive TUN ioctl. Record
    actual netns cookie, ifindex and attachment incarnation immediately; set MTU,
    explicit addresses, owned-link sysctls and UP, recording ACK/readback.
+   After the UP ACK, wait for the exact owned link, permanent host addresses and
+   local host routes before installing any guard or rule. IPv6 NODAD still queues
+   local-route work; only its absent `/128` route may wait on notifications, within
+   one two-second deadline covering every readback. Conflicting or foreign
+   topology and malformed observations fail immediately, before diversion.
 3. Write each mutation intent ahead of installing capture-prefix blackholes
    (static, metric 32760) and the five rules. Do not install unicast capture yet:
    selected prefixes are contained while Endpoint startup is incomplete.
-4. Create one non-HOST `PacketScope` and its original owner using the shared capture
-   helper, then call `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
+4. Pass the already-funded scope and original owner to
+   `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
    prepared_dns_addresses)`. The final argument is the retained
    `Option<PreparedDnsBind>` containing endpoint and resolved candidates, not a
    boolean or a request to resolve again. Keep the unique `PacketDriver` servicing
    timers/output while waiting for `owner.poll_ready`, including failed-startup
    cleanup. DNS bind, software flags and subscription authorizations must be ready.
-5. Read back link/address/offload/rules, install and read back metric-1024 capture
+5. Read back link/address/rules, install and read back metric-1024 capture
    routes, then establish the final `Topology::admit_tun` subscription and full
    snapshot while retaining the old watch. Only after successful final admission
    open the shared gate, call `capture_ready()`, and report `TUN datapath ready`,
