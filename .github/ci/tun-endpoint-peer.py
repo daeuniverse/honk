@@ -667,12 +667,14 @@ class Fixture:
                              (dut, 'dup', '02:00:00:00:00:11'), (server, 'srv0', '02:00:00:00:00:21')):
             ip(ns, 'link', 'set', dev, 'mtu', '1500', 'addrgenmode', 'none', 'address', mac, 'up')
             run('ethtool', '-K', dev, 'rx', 'off', 'tx', 'off', 'tso', 'off', 'gso', 'off', 'gro', 'off', namespace=ns)
-        for ns, dev, address4, address6 in ((dut, 'dlan', '192.0.2.1/24', 'fd00:1::1/64'),
-                                           (source, 'src0', '192.0.2.2/24', 'fd00:1::2/64'),
-                                           (dut, 'dup', '10.77.0.1/24', 'fd00:77::1/64'),
-                                           (server, 'srv0', '10.77.0.2/24', 'fd00:77::2/64')):
+        # NDP needs a link-local source when replying from loopback aliases.
+        for ns, dev, address4, address6, link_local in ((dut, 'dlan', '192.0.2.1/24', 'fd00:1::1/64', 'fe80::1/64'),
+                                                       (source, 'src0', '192.0.2.2/24', 'fd00:1::2/64', 'fe80::2/64'),
+                                                       (dut, 'dup', '10.77.0.1/24', 'fd00:77::1/64', 'fe80::3/64'),
+                                                       (server, 'srv0', '10.77.0.2/24', 'fd00:77::2/64', 'fe80::4/64')):
             ip(ns, '-4', 'addr', 'add', address4, 'dev', dev)
             ip(ns, '-6', 'addr', 'add', address6, 'dev', dev, 'nodad')
+            ip(ns, '-6', 'addr', 'add', link_local, 'dev', dev, 'nodad')
         for number, gateway, server_gateway, subnet in ((4, '192.0.2.1', '10.77.0.1', '192.0.2.0/24'),
                                                         (6, 'fd00:1::1', 'fd00:77::1', 'fd00:1::/64')):
             option = '-' + str(number)
@@ -1188,35 +1190,49 @@ def dns_extensions(fixture):
         answer.get('type') == qtype and answer.get('name', '').rstrip('.').lower() == name
         and ipaddress.ip_address(answer['data']) == expected
         for answer in result.get('Answer', [])), ('API DNS did not resolve the expected address', result)
-    capture = None
+    captures = []
     tool = os.environ.get('HONK_TUN_CAPTURE_TOOL')
     try:
         if tool:
-            capture_log = fixture.open('cross-scope.capture.log')
-            try:
-                if not os.path.isabs(tool) or not os.access(tool, os.X_OK):
-                    raise OSError('HONK_TUN_CAPTURE_TOOL must name an absolute executable')
-                capture = fixture.track(subprocess.Popen(
-                    ['ip', 'netns', 'exec', fixture.names['dut'], tool,
-                     '-i', 'any', '-y', 'LINUX_SLL2', '-s', '0', '-U', '-n',
-                     '-w', str(fixture.directory / 'cross-scope.pcap'), 'udp', 'port', '18083'],
-                    stdout=subprocess.DEVNULL, stderr=capture_log))
-                def listening():
-                    if capture.poll() is not None:
-                        raise RuntimeError(f'capture exited before readiness: {capture.returncode}')
-                    return 'listening on' in (fixture.directory / 'cross-scope.capture.log').read_text()
-                eventually(listening, 'capture did not report listening', seconds=3)
-            except (OSError, RuntimeError, AssertionError) as error:
-                capture_log.write(f'capture unavailable: {error!r}\n')
-                capture_log.flush()
-                if capture is not None and capture.poll() is None:
-                    capture.send_signal(signal.SIGINT)
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        capture.wait(timeout=5)
-                stop(capture)
+            for role, device, label, packet_filter in (
+                    ('dut', 'any', 'cross-scope', ['udp', 'port', '18083']),
+                    ('server', 'srv0', 'cross-scope.server', ['udp', 'port', '18083', 'or', 'icmp6'])):
+                capture = None
+                capture_log = fixture.open(label + '.capture.log')
+                try:
+                    if not os.path.isabs(tool) or not os.access(tool, os.X_OK):
+                        raise OSError('HONK_TUN_CAPTURE_TOOL must name an absolute executable')
+                    capture = fixture.track(subprocess.Popen(
+                        ['ip', 'netns', 'exec', fixture.names[role], tool,
+                         '-i', device, *(['-y', 'LINUX_SLL2'] if role == 'dut' else []),
+                         '-s', '0', '-U', '-n', '--immediate-mode',
+                         '-w', str(fixture.directory / (label + '.pcap')), *packet_filter],
+                        stdout=subprocess.DEVNULL, stderr=capture_log))
+                    captures.append(capture)
+                    def listening():
+                        if capture.poll() is not None:
+                            raise RuntimeError(f'capture exited before readiness: {capture.returncode}')
+                        return 'listening on' in (fixture.directory / (label + '.capture.log')).read_text()
+                    eventually(listening, 'capture did not report listening', seconds=3)
+                except (OSError, RuntimeError, AssertionError) as error:
+                    capture_log.write(f'capture unavailable: {error!r}\n')
+                    capture_log.flush()
+                    if capture is not None and capture.poll() is None:
+                        capture.send_signal(signal.SIGINT)
+                        with contextlib.suppress(subprocess.TimeoutExpired):
+                            capture.wait(timeout=5)
+                    stop(capture)
+        with contextlib.suppress(Exception):
+            (fixture.directory / 'cross-scope.server-neigh.before.txt').write_text(
+                ip(fixture.names['server'], '-6', 'neigh', 'show').stdout
+                + ip(fixture.names['server'], '-6', 'addr', 'show').stdout)
         fixture.exchange('api-dns-cache-does-not-contaminate-packet-scope', target=str(expected), port=18083)
     finally:
-        if capture is not None:
+        with contextlib.suppress(Exception):
+            (fixture.directory / 'cross-scope.server-neigh.after.txt').write_text(
+                ip(fixture.names['server'], '-6', 'neigh', 'show').stdout
+                + ip(fixture.names['server'], '-6', 'addr', 'show').stdout)
+        for capture in captures:
             try:
                 if capture.poll() is None:
                     capture.send_signal(signal.SIGINT)
