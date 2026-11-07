@@ -27,8 +27,7 @@ pub(crate) struct RouteUnavailable {
     outbound: String,
 }
 
-/// The download failed at `stage`, through `via` when a node carried it. The
-/// message names the outbound, so the log shows which node to look at.
+/// Classified download failure with selected-outbound metadata when available.
 #[derive(Debug)]
 pub(crate) struct DownloadFailed {
     subscription: String,

@@ -34,7 +34,7 @@ pub(crate) struct ProviderLoad {
     pub(crate) error: Option<&'static str>,
     /// The configuration diagnostic code behind a `publication_rejected` error.
     pub(crate) rejection: Option<&'static str>,
-    /// Where the last fetch failed, kept until a fetch succeeds.
+    /// Classified fetch diagnostics associated with the current load error, when available.
     pub(crate) fetch: Option<FetchFailure>,
 }
 
@@ -273,7 +273,6 @@ async fn fetch_once(
 struct Flight {
     authorized: AuthorizedSubscription,
     userinfo: SubscriptionUserinfo,
-    /// Where the fetch failed, for the provider status.
     failure: Option<FetchFailure>,
     #[cfg(feature = "native-api")]
     operation: Option<Box<dyn RefreshReport>>,
