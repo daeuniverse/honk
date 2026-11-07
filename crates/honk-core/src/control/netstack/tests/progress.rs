@@ -125,3 +125,219 @@ async fn graceful_fragmented_udp_drain_preserves_every_accepted_byte() {
     assert!(scope.0.inner.lock().finished);
     owner.run().await;
 }
+
+#[test]
+fn direct_rack_deferral_preserves_deadline_credit_and_original_retransmissions() {
+    fn drain(driver: &mut PacketDriver, now: &mut Instant) -> Vec<(tcp::Header, Vec<u8>)> {
+        let mut packets = Vec::new();
+        let mut frame = [0; 1280];
+        for _ in 0..128 {
+            driver.begin_turn(*now);
+            let before = packets.len();
+            for _ in 0..32 {
+                let Some(owner) = driver
+                    .materialize_into(*now, TxClass::Bulk, &mut frame)
+                    .unwrap()
+                else {
+                    break;
+                };
+                assert!(owner.packet().is_none());
+                packets.push(decode_packet(&frame[..owner.len()]));
+                drop(owner);
+            }
+            driver.finish_turn(&mut context(), *now);
+            if packets.len() - before == 32 {
+                continue;
+            }
+            match driver.deadline() {
+                Some(due) if due <= *now + Duration::from_millis(5) => *now = due.max(*now),
+                _ => return packets,
+            }
+        }
+        panic!("direct packet drain exceeded its bounded pacing turns");
+    }
+
+    let mut now = Instant::now();
+    let mut cfg = config();
+    cfg.tcp_chunk = Some(4096);
+    cfg.tcp_snd_buf_max = 256 * 1024;
+    let budget = MemoryBudget::new(32 << 20);
+    let (scope, owner) = PacketScope::new(cfg, Arc::clone(&budget), limits(), now).unwrap();
+    let mut driver = owner.hand_off();
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let options = tcp::Options {
+        mss: Some(1000),
+        sack_permitted: true,
+        ..tcp::Options::default()
+    };
+    assert_eq!(
+        scope.receive(
+            &segment_with_options(client, 100, 0, tcp::SYN, &[], options),
+            now
+        ),
+        Rx::Consumed
+    );
+    let (_, mut io) = scope.poll_accept().unwrap();
+    let id = io.flow_id();
+    let mut frame = [0; 1280];
+    driver.begin_turn(now);
+    let synack = materialized(&mut driver, now, TxClass::Control, &mut frame);
+    let server_seq = decode_packet(&frame[..synack.len()]).0.seq.wrapping_add(1);
+    drop(synack);
+    now += Duration::from_millis(10);
+    scope.receive(&segment(client, 101, server_seq, tcp::ACK, &[]), now);
+    driver.begin_turn(now);
+    driver.finish_turn(&mut context(), now);
+    for _ in 0..8 {
+        let cwnd = scope
+            .0
+            .inner
+            .lock()
+            .stack
+            .as_ref()
+            .unwrap()
+            .tcp_stats(id)
+            .unwrap()
+            .cwnd;
+        if cwnd >= 60_000 {
+            break;
+        }
+        let payload: Vec<_> = (0..cwnd as usize).map(|n| (n % 251) as u8).collect();
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_write(&mut context(), &payload),
+            Poll::Ready(Ok(n)) if n == payload.len()
+        ));
+        let packets = drain(&mut driver, &mut now);
+        assert_eq!(
+            packets
+                .iter()
+                .flat_map(|(_, bytes)| bytes.iter().copied())
+                .collect::<Vec<_>>(),
+            payload
+        );
+        let (header, bytes) = packets.last().unwrap();
+        now += Duration::from_millis(10);
+        scope.receive(
+            &segment(
+                client,
+                101,
+                header.seq.wrapping_add(bytes.len() as u32),
+                tcp::ACK,
+                &[],
+            ),
+            now,
+        );
+        driver.begin_turn(now);
+        driver.finish_turn(&mut context(), now);
+    }
+    assert!(
+        scope
+            .0
+            .inner
+            .lock()
+            .stack
+            .as_ref()
+            .unwrap()
+            .tcp_stats(id)
+            .unwrap()
+            .cwnd
+            >= 60_000
+    );
+    let payload: Vec<_> = (0..60_000).map(|n| (n % 251) as u8).collect();
+    assert!(matches!(
+        std::pin::Pin::new(&mut io).poll_write(&mut context(), &payload),
+        Poll::Ready(Ok(n)) if n == payload.len()
+    ));
+    let original = drain(&mut driver, &mut now);
+    assert_eq!(original.len(), 60);
+    let before = budget.used();
+    let held = budget.reserve(budget.limit() - before).unwrap();
+    now += Duration::from_millis(10);
+    let (last, bytes) = original.last().unwrap();
+    let end = last.seq.wrapping_add(bytes.len() as u32);
+    let mut options = tcp::Options::default();
+    options.sack.push(original[28].0.seq, end);
+    assert_eq!(
+        scope.receive(
+            &segment_with_options(client, 101, original[0].0.seq, tcp::ACK, &[], options),
+            now
+        ),
+        Rx::Consumed
+    );
+    let mut retransmitted = drain(&mut driver, &mut now);
+    assert_eq!(retransmitted.len(), 16);
+    let deadline = driver.deadline();
+    let blocked = scope
+        .0
+        .inner
+        .lock()
+        .stack
+        .as_ref()
+        .unwrap()
+        .tcp_stats(id)
+        .unwrap();
+    assert_eq!(blocked.retrans_segments, 16);
+    for _ in 0..3 {
+        driver.begin_turn(now);
+        for class in [TxClass::Control, TxClass::Bulk] {
+            assert!(
+                driver
+                    .materialize_into(now, class, &mut frame)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        driver.finish_turn(&mut context(), now);
+        assert_eq!(driver.deadline(), deadline);
+        assert_eq!(
+            driver.deadline(),
+            scope.0.inner.lock().stack.as_ref().unwrap().poll_timeout()
+        );
+        let mut inner = scope.0.inner.lock();
+        let after = inner.stack.as_ref().unwrap().tcp_stats(id).unwrap();
+        assert_eq!(
+            (
+                after.retrans_segments,
+                after.retrans_bytes,
+                after.lost_bytes
+            ),
+            (
+                blocked.retrans_segments,
+                blocked.retrans_bytes,
+                blocked.lost_bytes
+            )
+        );
+        assert_eq!(inner.ledger.outstanding_tx().count(), 0);
+        assert!(inner.frames.iter().all(Option::is_some));
+        for class in [TxClass::Control, TxClass::Bulk] {
+            let lease = inner.ledger.reserve_tx(class).unwrap();
+            inner.ledger.cancel_tx(lease).unwrap();
+        }
+        assert_eq!(budget.used(), budget.limit());
+    }
+    drop(held);
+    retransmitted.extend(drain(&mut driver, &mut now));
+    assert_eq!(retransmitted.len(), 28);
+    assert!(budget.used() > before);
+    for ((header, bytes), (expected, payload)) in retransmitted.iter().zip(&original[..28]) {
+        assert_eq!((header.seq, bytes), (expected.seq, payload));
+    }
+    now += Duration::from_millis(10);
+    scope.receive(&segment(client, 101, end, tcp::ACK, &[]), now);
+    driver.begin_turn(now);
+    driver.finish_turn(&mut context(), now);
+    assert_eq!(
+        scope
+            .0
+            .inner
+            .lock()
+            .stack
+            .as_ref()
+            .unwrap()
+            .tcp_stats(id)
+            .unwrap()
+            .outstanding_bytes,
+        0
+    );
+    assert_eq!(scope.0.inner.lock().queued, 0);
+}

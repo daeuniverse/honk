@@ -223,6 +223,30 @@ pub struct Port<L> {
     _bookkeeping: MemoryReservation,
 }
 
+struct TxReservation<'a, L> {
+    port: &'a mut Port<L>,
+    prepared: Option<PreparedTx>,
+}
+
+impl<L> TxReservation<'_, L> {
+    fn publish(mut self, retained: L) -> io::Result<()> {
+        // Publication owns fatal retention from submission onward, including a failed kick.
+        let prepared = self.prepared.take().expect("unpublished TX reservation");
+        self.port.publish_tx(prepared, retained)
+    }
+}
+
+impl<L> Drop for TxReservation<'_, L> {
+    fn drop(&mut self) {
+        if let Some(prepared) = self.prepared.take()
+            && self.port.ledger.cancel_tx(prepared.lease).is_err()
+        {
+            self.port.counters.invalid += 1;
+            self.port.close();
+        }
+    }
+}
+
 struct TxBatchGuard<'a, L> {
     port: &'a mut Port<L>,
 }
@@ -583,6 +607,49 @@ impl<L> Port<L> {
         }
     }
 
+    /// Generate one complete L2 packet directly in an unpublished UMEM frame.
+    /// Resource shortage returns WouldBlock without calling `generate`; None publishes nothing.
+    /// Only the returned actual extent (with minimum Ethernet padding) is submitted.
+    /// The callback receives exactly `max_length` bytes and must return 14..=max_length.
+    /// None, errors and panics cancel unpublished storage, without I/O.
+    /// A kick error after publication still retains the submitted packet and its owner.
+    pub fn transmit_generated(
+        &mut self,
+        class: TxClass,
+        max_length: usize,
+        generate: impl FnOnce(&mut [u8]) -> io::Result<Option<(usize, L)>>,
+    ) -> io::Result<bool> {
+        let (padded_max, count) = self.tx_packet_layout(max_length)?;
+        if count != 1 {
+            return Err(invalid_config("generated TX must fit one UMEM frame"));
+        }
+        let prepared = self.reserve_single_tx(class)?;
+        let address = prepared.lease.address();
+        let mut reservation = TxReservation {
+            port: self,
+            prepared: Some(prepared),
+        };
+        let pointer = reservation
+            .port
+            .umem
+            .frame_pointer(address, padded_max)
+            .map_err(|error| reservation.port.invalid(error))?;
+        // SAFETY: this checked extent belongs to the sole unpublished TX reservation,
+        // disjoint from RX and outstanding TX. The borrow ends before submission.
+        let frame = unsafe { std::slice::from_raw_parts_mut(pointer, padded_max) };
+        let Some((actual_length, retained)) = generate(&mut frame[..max_length])? else {
+            return Ok(false);
+        };
+        if !(14..=max_length).contains(&actual_length) {
+            return Err(invalid_config("invalid generated TX packet extent"));
+        }
+        let (wire_length, _) = reservation.port.tx_packet_layout(actual_length)?;
+        frame[actual_length..wire_length].fill(0);
+        reservation.prepared.as_mut().expect("reserved TX").length = wire_length as u32;
+        reservation.publish(retained)?;
+        Ok(true)
+    }
+
     pub fn zerocopy(&self) -> bool {
         self.zerocopy
     }
@@ -763,6 +830,36 @@ impl<L> Port<L> {
             && self.config.ring_size as usize - used as usize >= count
     }
 
+    fn reserve_single_tx(&mut self, class: TxClass) -> io::Result<PreparedTx> {
+        let used = ring::distance(
+            self.tx_producer,
+            self.rings.tx.consumer(),
+            self.config.ring_size,
+        )
+        .map_err(|error| self.invalid(error))?;
+        let blocked = || io::Error::new(io::ErrorKind::WouldBlock, "single TX frame unavailable");
+        if !self.tx_chain_credit(class, 1, used) {
+            return Err(blocked());
+        }
+        let slot = self
+            .sidecar
+            .slots
+            .iter()
+            .position(Option::is_none)
+            .ok_or_else(blocked)?;
+        let lease = match self.ledger.reserve_tx(class) {
+            Ok(lease) => lease,
+            Err(LedgerError::NoFrame | LedgerError::NoDescriptor) => return Err(blocked()),
+            Err(error) => return Err(self.invalid(io::Error::other(error))),
+        };
+        Ok(PreparedTx {
+            lease,
+            slot,
+            length: 0,
+            class,
+        })
+    }
+
     fn prepare_tx(
         &mut self,
         class: TxClass,
@@ -772,39 +869,19 @@ impl<L> Port<L> {
         if header.len().checked_add(l3.len()).is_none_or(|n| n > 1514) {
             return Err(invalid_config("TX frame exceeds Ethernet MTU 1500"));
         }
-        let used = ring::distance(
-            self.tx_producer,
-            self.rings.tx.consumer(),
-            self.config.ring_size,
-        )
-        .map_err(|error| self.invalid(error))?;
-        if used == self.config.ring_size {
-            return Err(io::Error::other(LedgerError::NoDescriptor));
-        }
-        let lease = self.ledger.reserve_tx(class).map_err(io::Error::other)?;
-        let slot = self
-            .sidecar
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| io::Error::other("no TX sidecar"));
-        let result = (|| {
-            let slot = slot?;
-            let length = self.umem.write_frame(lease.address(), header, l3)?;
-            Ok(PreparedTx {
-                lease,
-                slot,
-                length,
-                class,
-            })
-        })();
-        match result {
-            Ok(prepared) => Ok(prepared),
-            Err(error) => {
-                self.ledger.cancel_tx(lease).map_err(io::Error::other)?;
-                Err(self.invalid(error))
-            }
-        }
+        let prepared = self.reserve_single_tx(class)?;
+        let address = prepared.lease.address();
+        let mut reservation = TxReservation {
+            port: self,
+            prepared: Some(prepared),
+        };
+        let length = reservation
+            .port
+            .umem
+            .write_frame(address, header, l3)
+            .map_err(|error| reservation.port.invalid(error))?;
+        reservation.prepared.as_mut().expect("reserved TX").length = length;
+        Ok(reservation.prepared.take().expect("prepared TX"))
     }
 
     fn publish_tx(&mut self, prepared: PreparedTx, retained: L) -> io::Result<()> {
@@ -1389,6 +1466,724 @@ mod tests {
         assert_eq!(port.counters().fill, 4);
         assert_eq!(port.receive(2, |_| panic!("duplicate RX")).unwrap(), 0);
         assert_eq!(port.rings().fill_producer, 4);
+    }
+
+    #[test]
+    fn generated_standalone_fatal_kick_retains_actual_bytes_and_owner_credit() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        port.rings.tx.set_wakeup();
+        let error = port
+            .transmit_generated(TxClass::Bulk, 80, |frame| {
+                frame.fill(0xa5);
+                frame[..42].fill(4);
+                Ok(Some((42, Retained::new(&drops))))
+            })
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+        let descriptor = port.rings.tx.read(0);
+        assert_eq!(descriptor.len, 60);
+        assert_eq!(descriptor.options, 0);
+        let frame = port.umem.frame(descriptor.addr, 80).unwrap();
+        assert_eq!(&frame[..42], &[4; 42]);
+        assert_eq!(&frame[42..60], &[0; 18]);
+        assert_eq!(&frame[60..], &[0xa5; 20]);
+        assert!(port.drain_state().closed);
+        assert_eq!(port.drain_state().bulk_reserved, 0);
+        assert_eq!(port.drain_state().bulk_outstanding, 1);
+        assert_eq!(port.counters().submitted, 1);
+        assert_eq!(port.counters().tx_kicks, 1);
+        assert_eq!(port.tx_free, [1, 0]);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        port.rings.tx.publish_consumer(1);
+        assert_eq!(
+            port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+            0
+        );
+        for errno in [libc::EAGAIN, libc::EBUSY, libc::ENOBUFS, libc::EINTR] {
+            port.wakeup_result(Err(io::Error::from_raw_os_error(errno)))
+                .unwrap();
+        }
+        port.close_socket();
+        assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(port.umem.frame(descriptor.addr, 42).unwrap(), &[4; 42]);
+        assert_eq!(port.umem.frame(descriptor.addr + 42, 18).unwrap(), &[0; 18]);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        let charge = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used(), charge);
+    }
+
+    #[test]
+    fn generated_published_prefix_survives_every_unpublished_suffix_failure() {
+        for suffix in [
+            "none",
+            "error",
+            "short",
+            "long",
+            "panic_before",
+            "panic_after",
+            "close",
+        ] {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut port = fake(config(), &budget);
+            port.rings.tx.set_wakeup();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                port.transmit_batch(|port| {
+                    assert!(port.transmit_generated(TxClass::Bulk, 60, |frame| {
+                        frame.fill(9);
+                        let mut owner = Retained::new(&drops);
+                        owner.bytes.fill(9);
+                        Ok(Some((60, owner)))
+                    })?);
+                    if suffix == "close" {
+                        port.close();
+                        return port.transmit_generated(TxClass::Control, 80, |_| {
+                            panic!("closed generator ran")
+                        });
+                    }
+                    port.transmit_generated(TxClass::Control, 80, |frame| {
+                        frame.fill(5);
+                        if suffix == "panic_before" {
+                            panic!("before suffix owner");
+                        }
+                        let owner = Retained::new(&drops);
+                        match suffix {
+                            "none" => Ok(None),
+                            "error" => Err(io::Error::other("suffix generation failed")),
+                            "short" => Ok(Some((13, owner))),
+                            "long" => Ok(Some((81, owner))),
+                            "panic_after" => panic!("after suffix owner"),
+                            _ => unreachable!(),
+                        }
+                    })
+                })
+            }));
+            if suffix.starts_with("panic") {
+                assert!(result.is_err());
+                assert_eq!(port.counters().tx_kicks, 0);
+            } else {
+                let (work, kick) = result.unwrap();
+                if suffix == "none" {
+                    assert!(!work.unwrap());
+                } else {
+                    assert_eq!(
+                        work.unwrap_err().kind(),
+                        match suffix {
+                            "close" => io::ErrorKind::WouldBlock,
+                            "error" => io::ErrorKind::Other,
+                            _ => io::ErrorKind::InvalidInput,
+                        }
+                    );
+                }
+                assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
+                assert_eq!(port.counters().tx_kicks, 1);
+            }
+            let disposed = usize::from(!matches!(suffix, "panic_before" | "close"));
+            assert_eq!(drops.load(Ordering::Relaxed), disposed);
+            assert!(port.drain_state().closed);
+            assert!(!port.tx_batch_active);
+            assert_eq!(port.drain_state().control_reserved, 0);
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            assert_eq!(port.drain_state().bulk_outstanding, 1);
+            assert_eq!(port.tx_free, [1, 0]);
+            assert_eq!(port.rings().tx_producer, 1);
+            assert_eq!(port.counters().submitted, 1);
+            assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
+            let prefix = port.rings.tx.read(0);
+            assert_eq!(port.umem.frame(prefix.addr, 60).unwrap(), &[9; 60]);
+            port.rings.tx.publish_consumer(1);
+            assert_eq!(
+                port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+                0
+            );
+            port.close_socket();
+            assert_eq!(port.outstanding().count(), 1);
+            assert_eq!(drops.load(Ordering::Relaxed), disposed);
+            assert_eq!(port.umem.frame(prefix.addr, 60).unwrap(), &[9; 60]);
+            port.rings.cq.write(0, prefix.addr);
+            port.rings.cq.publish_producer(1);
+            assert_eq!(
+                port.complete(|owners| {
+                    assert_eq!(owners.len(), 1);
+                    assert_eq!(owners[0].as_ref().unwrap().bytes, [9; 28]);
+                })
+                .unwrap(),
+                1
+            );
+            assert_eq!(drops.load(Ordering::Relaxed), disposed + 1);
+            assert_eq!(port.tx_free, [1, 1]);
+            assert!(port.drain_state().ready_for_backend_teardown());
+        }
+    }
+
+    #[test]
+    fn generated_mixed_cq_valid_prefix_keeps_partial_sg_and_invalid_suffix_retained() {
+        for invalid in ["duplicate", "foreign", "shifted"] {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut port = fake(
+                PortConfig {
+                    bulk_frames: 5,
+                    ring_size: 8,
+                    ..config()
+                },
+                &budget,
+            );
+            port.mtu = 9000;
+            port.scatter_gather = true;
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 80, |frame| {
+                    frame.fill(1);
+                    let mut owner = Retained::new(&drops);
+                    owner.bytes.fill(1);
+                    Ok(Some((80, owner)))
+                })
+                .unwrap()
+            );
+            let mut cpu = Retained::new(&drops);
+            cpu.bytes.fill(2);
+            port.transmit_retained(TxClass::Control, &[2; 14], cpu)
+                .unwrap();
+            let mut sg = Retained::new(&drops);
+            sg.bytes.fill(3);
+            port.transmit_with(TxClass::Bulk, 6000, sg, |owner, chunks| {
+                for chunk in chunks {
+                    chunk.fill(owner.bytes[0]);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 60, |frame| {
+                    frame.fill(4);
+                    let mut owner = Retained::new(&drops);
+                    owner.bytes.fill(4);
+                    Ok(Some((60, owner)))
+                })
+                .unwrap()
+            );
+            let pending = port.rings.tx.read(4);
+            let direct = port.rings.tx.read(0);
+            let first = port.rings.tx.read(2);
+            let last = port.rings.tx.read(3);
+            assert_eq!((first.options, last.options), (1, 0));
+            assert_eq!(first.len + last.len, 6000);
+            port.rings.tx.publish_consumer(5);
+            port.kick().unwrap();
+            assert_eq!(
+                port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+                0
+            );
+            assert_eq!(port.outstanding().count(), 5);
+            assert_eq!(drops.load(Ordering::Relaxed), 0);
+            assert_eq!(port.umem.frame(direct.addr, 80).unwrap(), &[1; 80]);
+            assert_eq!(port.umem.frame(pending.addr, 60).unwrap(), &[4; 60]);
+            assert_eq!(
+                port.umem.frame(first.addr, FRAME_SIZE).unwrap(),
+                &[3; FRAME_SIZE]
+            );
+            for (index, descriptor) in [3, 1, 0].into_iter().enumerate() {
+                port.rings
+                    .cq
+                    .write(index as u32, port.rings.tx.read(descriptor).addr);
+            }
+            port.rings.cq.write(
+                3,
+                match invalid {
+                    "duplicate" => direct.addr,
+                    "foreign" => 0,
+                    "shifted" => pending.addr + 1,
+                    _ => unreachable!(),
+                },
+            );
+            port.rings.cq.write(4, first.addr);
+            port.rings.cq.write(5, pending.addr);
+            port.rings.cq.publish_producer(6);
+            let mut released = Vec::new();
+            assert!(
+                port.complete(|owners| {
+                    for owner in owners.iter().flatten() {
+                        released.push(owner.bytes[0]);
+                    }
+                })
+                .is_err()
+            );
+            assert_eq!(released, [1, 2]);
+            assert_eq!(port.rings().cq_consumer, 3);
+            assert_eq!(port.counters().completed, 3);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            assert_eq!(port.tx_free, [1, 3]);
+            assert_eq!(port.outstanding().count(), 2);
+            assert!(port.outstanding().any(|tx| tx.address == first.addr));
+            assert!(port.outstanding().any(|tx| tx.address == pending.addr));
+            assert_eq!(port.sidecar.slots.iter().flatten().count(), 2);
+            let pending_owner = port.sidecar.slots.iter().flatten().last().unwrap();
+            assert_eq!(pending_owner.0.bytes, [4; 28]);
+            assert_eq!(pending_owner.1, 1);
+            let retained = port.sidecar.slots.iter().flatten().next().unwrap();
+            assert_eq!(retained.0.bytes, [3; 28]);
+            assert_eq!(retained.1, 1);
+            assert_eq!(
+                port.umem.frame(first.addr, FRAME_SIZE).unwrap(),
+                &[3; FRAME_SIZE]
+            );
+            assert_eq!(port.umem.frame(pending.addr, 60).unwrap(), &[4; 60]);
+            assert!(port.complete(|owners| assert!(owners.is_empty())).is_err());
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 60, |_| panic!("fatal port reused TX"))
+                    .is_err()
+            );
+            assert_eq!(port.close().bulk_outstanding, 2);
+            port.close_socket();
+            assert_eq!(
+                port.umem.frame(first.addr, FRAME_SIZE).unwrap(),
+                &[3; FRAME_SIZE]
+            );
+            assert_eq!(port.umem.frame(pending.addr, 60).unwrap(), &[4; 60]);
+            let charge = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+            drop(port);
+            assert_eq!(drops.load(Ordering::Relaxed), 2);
+            assert_eq!(budget.used(), charge);
+        }
+    }
+
+    #[test]
+    fn generated_submit_invariant_failure_transfers_to_fatal_retention() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        let mut prepared = port.reserve_single_tx(TxClass::Bulk).unwrap();
+        let address = prepared.lease.address();
+        port.umem.write_bytes(address, &[9; 60]);
+        prepared.length = FRAME_SIZE as u32 + 1;
+        let reservation = TxReservation {
+            port: &mut port,
+            prepared: Some(prepared),
+        };
+        assert!(reservation.publish(Retained::new(&drops)).is_err());
+        assert!(port.drain_state().closed);
+        assert_eq!(port.drain_state().bulk_reserved, 1);
+        assert_eq!(port.outstanding().count(), 0);
+        assert_eq!(port.rings().tx_producer, 0);
+        assert_eq!(port.counters().submitted, 0);
+        assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
+        assert_eq!(port.umem.frame(address, 60).unwrap(), &[9; 60]);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert!(
+            port.transmit_generated(TxClass::Bulk, 60, |_| panic!("failed submit reused TX"))
+                .is_err()
+        );
+        let charge = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used(), charge);
+    }
+
+    #[test]
+    fn generated_publication_survives_future_cancellation_and_close_without_cq() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        let mut future = Box::pin(async {
+            let (work, kick) = port.transmit_batch(|port| {
+                port.transmit_generated(TxClass::Bulk, 60, |frame| {
+                    frame.fill(6);
+                    Ok(Some((60, Retained::new(&drops))))
+                })
+            });
+            assert!(work.unwrap());
+            kick.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.as_mut().poll(&mut cx).is_pending());
+        drop(future);
+        let descriptor = port.rings.tx.read(0);
+        assert_eq!(port.umem.frame(descriptor.addr, 60).unwrap(), &[6; 60]);
+        port.rings.tx.publish_consumer(1);
+        port.kick().unwrap();
+        assert_eq!(
+            port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+            0
+        );
+        assert_eq!(port.close().bulk_outstanding, 1);
+        assert_eq!(port.tx_free, [1, 0]);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        port.close_socket();
+        assert_eq!(port.umem.frame(descriptor.addr, 60).unwrap(), &[6; 60]);
+        let charge = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
+        drop(port);
+        assert_eq!(drops.load(Ordering::Relaxed), 0);
+        assert_eq!(budget.used(), charge);
+    }
+
+    #[test]
+    fn generated_reserve_shortages_preserve_the_original_unsent_packet() {
+        for shortage in ["class", "ledger", "descriptor", "sidecar", "ring"] {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut port = fake(
+                PortConfig {
+                    ring_size: if shortage == "ring" { 2 } else { 4 },
+                    bulk_frames: if shortage == "descriptor" { 2 } else { 1 },
+                    ..config()
+                },
+                &budget,
+            );
+            if shortage == "descriptor" {
+                let mut frames = port.config.frame_config();
+                frames.bulk_descriptors = 1;
+                port.ledger = FrameLedger::new(frames, &budget).unwrap();
+            }
+            let mut held = None;
+            match shortage {
+                "class" => port
+                    .transmit_generated(TxClass::Bulk, 60, |frame| {
+                        frame.fill(1);
+                        Ok(Some((60, Retained::new(&drops))))
+                    })
+                    .map(|sent| assert!(sent))
+                    .unwrap(),
+                "ledger" | "descriptor" => {
+                    held = Some(port.ledger.reserve_tx(TxClass::Bulk).unwrap());
+                }
+                "sidecar" => {
+                    for slot in &mut port.sidecar.slots {
+                        *slot = Some((Retained::new(&drops), 1));
+                    }
+                }
+                "ring" => {
+                    for class in [TxClass::Control, TxClass::Bulk] {
+                        port.transmit_generated(class, 60, |frame| {
+                            frame.fill(1);
+                            Ok(Some((60, Retained::new(&drops))))
+                        })
+                        .unwrap();
+                    }
+                    for index in 0..2 {
+                        port.rings.cq.write(index, port.rings.tx.read(index).addr);
+                    }
+                    port.rings.cq.publish_producer(2);
+                    assert_eq!(
+                        port.complete(|owners| assert_eq!(owners.len(), 2)).unwrap(),
+                        2
+                    );
+                    assert_eq!(port.outstanding().count(), 0);
+                    assert_eq!(port.tx_free, [1, 1]);
+                }
+                _ => unreachable!(),
+            }
+            let before = port.counters();
+            let mut unsent = Some([0x5a; 60]);
+            let error = port
+                .transmit_generated(TxClass::Bulk, 60, |frame| {
+                    frame.copy_from_slice(&unsent.take().expect("original packet"));
+                    Ok(Some((60, Retained::new(&drops))))
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock, "{shortage}");
+            assert_eq!(unsent, Some([0x5a; 60]));
+            assert_eq!(port.counters(), before);
+            assert!(!port.drain_state().closed);
+            match shortage {
+                "class" | "ledger" | "descriptor" => {
+                    assert!(
+                        port.transmit_generated(TxClass::Control, 60, |frame| {
+                            frame.fill(2);
+                            Ok(Some((60, Retained::new(&drops))))
+                        })
+                        .unwrap()
+                    );
+                    if let Some(lease) = held {
+                        port.ledger.cancel_tx(lease).unwrap();
+                    } else {
+                        port.rings.cq.write(0, port.rings.tx.read(0).addr);
+                        port.rings.cq.publish_producer(1);
+                        assert_eq!(
+                            port.complete(|owners| assert_eq!(owners.len(), 1)).unwrap(),
+                            1
+                        );
+                        assert_eq!(
+                            port.umem.frame(port.rings.tx.read(1).addr, 60).unwrap(),
+                            &[2; 60]
+                        );
+                    }
+                }
+                "sidecar" => {
+                    drop(port.sidecar.slots[0].take());
+                }
+                "ring" => port.rings.tx.publish_consumer(1),
+                _ => unreachable!(),
+            }
+            let index = port.tx_producer;
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 60, |frame| {
+                    frame.copy_from_slice(&unsent.take().expect("still unsent"));
+                    Ok(Some((60, Retained::new(&drops))))
+                })
+                .unwrap()
+            );
+            assert!(unsent.is_none());
+            let descriptor = port.rings.tx.read(index);
+            assert_eq!(descriptor.len, 60);
+            assert_eq!(descriptor.options, 0);
+            assert_eq!(port.umem.frame(descriptor.addr, 60).unwrap(), &[0x5a; 60]);
+            assert_eq!(
+                port.counters().submitted,
+                before.submitted
+                    + 1
+                    + u64::from(matches!(shortage, "class" | "ledger" | "descriptor"))
+            );
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            if shortage == "sidecar" {
+                drop(port.sidecar.slots[1].take());
+            }
+            port.rings.tx.publish_consumer(port.tx_producer);
+            let cq = port.cq_consumer;
+            let addresses: Vec<_> = port.outstanding().map(|tx| tx.address).collect();
+            for (index, address) in addresses.iter().enumerate() {
+                port.rings.cq.write(cq + index as u32, *address);
+            }
+            port.rings.cq.publish_producer(cq + addresses.len() as u32);
+            assert_eq!(port.complete(|_| {}).unwrap(), addresses.len());
+            assert_eq!(port.outstanding().count(), 0);
+            assert_eq!(port.tx_free, [1, port.config.bulk_frames]);
+            assert!(port.sidecar.slots.iter().all(Option::is_none));
+        }
+    }
+
+    #[test]
+    fn generated_closed_corrupt_and_unmapped_reserves_never_call_the_emitter() {
+        for failure in ["closed", "ring", "ledger", "extent"] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            match failure {
+                "closed" => {
+                    port.close();
+                }
+                "ring" => port.rings.tx.publish_consumer(1),
+                "ledger" => {
+                    port.ledger.close();
+                }
+                "extent" => {
+                    let mut frames = config().frame_config();
+                    frames.base_address = port.umem_bytes() as u64;
+                    port.ledger = FrameLedger::new(frames, &budget).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 60, |_| panic!("{failure} emitter ran"))
+                    .is_err()
+            );
+            assert!(port.drain_state().closed);
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            assert_eq!(port.rings().tx_producer, 0);
+            assert_eq!(port.outstanding().count(), 0);
+            assert_eq!(port.tx_free, [1, 1]);
+            assert!(port.sidecar.slots.iter().all(Option::is_none));
+            assert_eq!(port.counters().invalid, u64::from(failure != "closed"));
+        }
+    }
+
+    #[test]
+    fn generated_unpublished_none_errors_lengths_and_panics_restore_credit() {
+        for outcome in [
+            "none",
+            "error",
+            "zero",
+            "short",
+            "long",
+            "overflow",
+            "panic_before",
+            "panic_after",
+        ] {
+            let budget = MemoryBudget::new(1 << 20);
+            let drops = Arc::new(AtomicUsize::new(0));
+            let mut port = fake(config(), &budget);
+            let funded = budget.used();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                port.transmit_generated(TxClass::Bulk, 80, |frame| {
+                    assert_eq!(frame.len(), 80);
+                    frame.fill(0xa5);
+                    if outcome == "panic_before" {
+                        panic!("before owner");
+                    }
+                    let owner = Retained::new(&drops);
+                    match outcome {
+                        "none" => Ok(None),
+                        "error" => Err(io::Error::other("generator failed")),
+                        "zero" => Ok(Some((0, owner))),
+                        "short" => Ok(Some((13, owner))),
+                        "long" => Ok(Some((81, owner))),
+                        "overflow" => Ok(Some((usize::MAX, owner))),
+                        "panic_after" => panic!("after owner"),
+                        _ => unreachable!(),
+                    }
+                })
+            }));
+            if outcome.starts_with("panic") {
+                assert!(result.is_err());
+            } else if outcome == "none" {
+                assert!(!result.unwrap().unwrap());
+            } else {
+                let error = result.unwrap().unwrap_err();
+                assert_eq!(
+                    error.kind(),
+                    if outcome == "error" {
+                        io::ErrorKind::Other
+                    } else {
+                        io::ErrorKind::InvalidInput
+                    }
+                );
+            }
+            let disposed = usize::from(outcome != "panic_before");
+            assert_eq!(drops.load(Ordering::Relaxed), disposed);
+            assert_eq!(budget.used(), funded);
+            assert_eq!(port.rings().tx_producer, 0);
+            assert_eq!(port.outstanding().count(), 0);
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            assert_eq!(port.tx_free, [1, 1]);
+            assert!(port.sidecar.slots.iter().all(Option::is_none));
+            assert!(!port.drain_state().closed);
+            assert!(!port.needs_service_retry());
+            assert!(
+                port.transmit_generated(TxClass::Bulk, 80, |frame| {
+                    frame[..42].fill(7);
+                    Ok(Some((42, Retained::new(&drops))))
+                })
+                .unwrap()
+            );
+            let descriptor = port.rings.tx.read(0);
+            assert_eq!(descriptor.len, 60);
+            let frame = port.umem.frame(descriptor.addr, 80).unwrap();
+            assert_eq!(&frame[..42], &[7; 42]);
+            assert_eq!(&frame[42..60], &[0; 18]);
+            assert_eq!(&frame[60..], &[0xa5; 20]);
+            port.rings.tx.publish_consumer(1);
+            port.rings.cq.write(0, descriptor.addr);
+            port.rings.cq.publish_producer(1);
+            assert_eq!(
+                port.complete(|owners| assert_eq!(owners.len(), 1)).unwrap(),
+                1
+            );
+            assert_eq!(drops.load(Ordering::Relaxed), disposed + 1);
+            assert_eq!(port.tx_free, [1, 1]);
+        }
+    }
+
+    #[test]
+    fn generated_all_none_turns_leave_both_classes_reusable_without_publication() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(config(), &budget);
+        for _ in 0..8 {
+            for class in [TxClass::Control, TxClass::Bulk] {
+                assert!(
+                    !port
+                        .transmit_generated(class, 42, |frame| {
+                            assert_eq!(frame.len(), 42);
+                            frame.fill(9);
+                            Ok(None)
+                        })
+                        .unwrap()
+                );
+            }
+        }
+        assert_eq!(port.tx_free, [1, 1]);
+        assert_eq!(port.drain_state().control_reserved, 0);
+        assert_eq!(port.drain_state().bulk_reserved, 0);
+        assert_eq!(port.rings().tx_producer, 0);
+        assert_eq!(port.counters().submitted, 0);
+        assert!(port.sidecar.slots.iter().all(Option::is_none));
+        for class in [TxClass::Control, TxClass::Bulk] {
+            assert!(
+                port.transmit_generated(class, 14, |frame| {
+                    frame.fill(3);
+                    Ok(Some((14, ())))
+                })
+                .unwrap()
+            );
+        }
+        assert_eq!(port.outstanding().count(), 2);
+        for index in 0..2 {
+            let descriptor = port.rings.tx.read(index);
+            assert_eq!(descriptor.len, 60);
+            let frame = port.umem.frame(descriptor.addr, 60).unwrap();
+            assert_eq!(&frame[..14], &[3; 14]);
+            assert_eq!(&frame[14..], &[0; 46]);
+            port.rings.cq.write(index, descriptor.addr);
+        }
+        port.rings.tx.publish_consumer(2);
+        port.rings.cq.publish_producer(2);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 2)).unwrap(),
+            2
+        );
+        assert_eq!(port.tx_free, [1, 1]);
+    }
+
+    #[test]
+    fn generated_extent_uses_actual_padding_and_the_unshifted_single_frame_base() {
+        for actual in [14, 42, 59, 60, 61, FRAME_SIZE] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.mtu = 9000;
+            assert!(
+                port.transmit_generated(TxClass::Bulk, FRAME_SIZE, |frame| {
+                    assert_eq!(frame.len(), FRAME_SIZE);
+                    frame.fill(0xa5);
+                    frame[..actual].fill(7);
+                    Ok(Some((actual, ())))
+                })
+                .unwrap()
+            );
+            let descriptor = port.rings.tx.read(0);
+            assert_eq!(
+                descriptor.addr,
+                ((config().rx_frames + config().control_frames) * FRAME_SIZE) as u64
+            );
+            assert_eq!(descriptor.options, 0);
+            assert_eq!(descriptor.len as usize, actual.max(60));
+            assert_eq!(port.rings().tx_producer, 1);
+            assert_eq!(port.counters().submitted, 1);
+            let frame = port.umem.frame(descriptor.addr, FRAME_SIZE).unwrap();
+            assert!(frame[..actual].iter().all(|&byte| byte == 7));
+            assert!(frame[actual..actual.max(60)].iter().all(|&byte| byte == 0));
+            assert!(frame[actual.max(60)..].iter().all(|&byte| byte == 0xa5));
+            port.rings.tx.publish_consumer(1);
+            port.rings.cq.write(0, descriptor.addr);
+            port.rings.cq.publish_producer(1);
+            assert_eq!(port.complete(|_| {}).unwrap(), 1);
+        }
+        for (mtu, sg, maximum) in [
+            (1500, false, 0),
+            (1500, false, 13),
+            (1500, false, 1523),
+            (9000, false, FRAME_SIZE + 1),
+            (9000, true, FRAME_SIZE + 1),
+            (9000, true, usize::MAX),
+        ] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.mtu = mtu;
+            port.scatter_gather = sg;
+            assert_eq!(
+                port.transmit_generated(TxClass::Bulk, maximum, |_| {
+                    panic!("invalid maximum invoked generator")
+                })
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(port.drain_state().bulk_reserved, 0);
+            assert_eq!(port.tx_free, [1, 1]);
+            assert_eq!(port.rings().tx_producer, 0);
+            assert!(!port.drain_state().closed);
+        }
     }
 
     #[test]
@@ -2178,6 +2973,13 @@ mod tests {
                 target[0][14..].fill(7);
                 Ok(())
             }),
+            4 => port
+                .transmit_generated(TxClass::Bulk, 42, |target| {
+                    target[..14].fill(3);
+                    target[14..].copy_from_slice(owner.as_ref());
+                    Ok(Some((42, owner)))
+                })
+                .map(|sent| assert!(sent)),
             _ => unreachable!(),
         }
     }
@@ -2188,7 +2990,7 @@ mod tests {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut port = fake(
             PortConfig {
-                bulk_frames: 4,
+                bulk_frames: 5,
                 ring_size: 8,
                 ..config()
             },
@@ -2196,19 +2998,28 @@ mod tests {
         );
         port.rings.tx.set_wakeup();
         let (work, kick) = port.transmit_batch(|port| {
-            for entry in 0..4 {
+            for entry in 0..5 {
                 transmit_entry(port, entry, &drops)?;
             }
             assert!(!port.drain_state().closed);
-            assert_eq!(port.rings().tx_producer, 4);
+            assert_eq!(port.rings().tx_producer, 5);
             Ok::<_, io::Error>(())
         });
         work.unwrap();
         assert_eq!(kick.unwrap_err().raw_os_error(), Some(libc::EBADF));
         assert!(port.drain_state().closed);
         assert!(!port.tx_batch_active);
-        assert_eq!(port.outstanding().count(), 4);
-        port.rings.tx.publish_consumer(4);
+        assert_eq!(port.outstanding().count(), 5);
+        for index in 0..5 {
+            let descriptor = port.rings.tx.read(index);
+            assert_eq!(descriptor.len, 60);
+            assert_eq!(descriptor.options, 0);
+            let frame = port.umem.frame(descriptor.addr, 60).unwrap();
+            assert_eq!(&frame[..14], &[3; 14]);
+            assert_eq!(&frame[14..42], &[7; 28]);
+            assert_eq!(&frame[42..], &[0; 18]);
+        }
+        port.rings.tx.publish_consumer(5);
         assert_eq!(port.complete(|_| {}).unwrap(), 0);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);

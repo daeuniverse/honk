@@ -7,7 +7,7 @@ use crate::control::{
         CachedDecision, Decision, Execution, GeneratedError, IngressBinding, PolicyGeneration,
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
-    netstack::{OutputLease, PacketDriver, PacketScope, RuntimeLimits},
+    netstack::{OutputLease, OutputOwner, PacketDriver, PacketScope, RuntimeLimits},
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints},
 };
 use crate::netlink::fib::{Fib, LogicalLink};
@@ -29,8 +29,8 @@ use honk_netstack::{
     wire::{self, PacketView},
 };
 use honk_xsk::{
-    BindMode, DecodedPacket, GeneralCapture, PersistentAttachment, Port, PortConfig, Programs,
-    device::DeviceInfo, topology::Topology,
+    BindMode, DecodedPacket, FRAME_SIZE, GeneralCapture, PersistentAttachment, Port, PortConfig,
+    Programs, device::DeviceInfo, topology::Topology,
 };
 use std::{
     collections::VecDeque,
@@ -118,7 +118,7 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
 }
 
 enum Retained {
-    Endpoint(OutputLease),
+    Endpoint(OutputOwner),
     Forward {
         _owner: ForwardLease,
     },
@@ -131,7 +131,7 @@ enum Retained {
 }
 
 fn release_completed(completed: &mut [Option<&mut Retained>]) {
-    let mut outputs: [Option<&mut OutputLease>; 64] = std::array::from_fn(|_| None);
+    let mut outputs: [Option<&mut OutputOwner>; 64] = std::array::from_fn(|_| None);
     let mut count = 0;
     for owner in completed.iter_mut().filter_map(Option::take) {
         if let Retained::Endpoint(output) = owner {
@@ -139,7 +139,7 @@ fn release_completed(completed: &mut [Option<&mut Retained>]) {
             count += 1;
         }
     }
-    OutputLease::release_batch(&mut outputs[..count]);
+    OutputOwner::release_batch(&mut outputs[..count]);
 }
 struct Queue {
     id: u32,
@@ -294,7 +294,14 @@ struct Realm {
     device: usize,
     link: LogicalLink,
     driver: PacketDriver,
+    generated: Option<(usize, usize)>,
     pending: [Option<(OutputLease, ReturnPath)>; 2],
+}
+
+fn generated_layout(link: LogicalLink) -> Option<(usize, usize)> {
+    let l2_len = 14usize.checked_add(4usize.checked_mul(usize::from(link.path.vlan_count))?)?;
+    let max_length = l2_len.checked_add(usize::try_from(link.mtu.max(1280)).ok()?)?;
+    (max_length <= FRAME_SIZE).then_some((l2_len, max_length))
 }
 
 impl Realm {
@@ -332,12 +339,61 @@ impl Realm {
         physical_ifindex: u32,
         ipv6: bool,
     ) -> io::Result<honk_datapath::forward::EthernetHeader> {
-        if path.device != self.device {
+        if path.device != self.device
+            || physical_ifindex != self.link.path.physical_ifindex
+            || path.vlan_count != self.link.path.vlan_count
+            || path.vlan_proto != self.link.path.vlan_proto
+            || !path
+                .vlan_tci
+                .iter()
+                .zip(self.link.path.vlan_tci)
+                .all(|(peer, configured)| peer & 0x0fff == configured & 0x0fff)
+        {
             return Err(io::Error::other(
-                "Endpoint reply belongs to another physical device",
+                "Endpoint reply changed its admitted L2 identity",
             ));
         }
         return_header(path, self.link.mac, physical_ifindex, ipv6)
+    }
+
+    fn generate_output(
+        &mut self,
+        now: Instant,
+        class: TxClass,
+        physical_ifindex: u32,
+        peers: &[Peer],
+        frame: &mut [u8],
+        emitted: &mut bool,
+    ) -> io::Result<Option<(usize, Retained)>> {
+        let Some((l2_len, max_length)) = self.generated else {
+            return Ok(None);
+        };
+        let class_index = match class {
+            TxClass::Control => 0,
+            TxClass::Bulk => 1,
+        };
+        if self.pending[class_index].is_some() {
+            return Ok(None);
+        }
+        if frame.len() != max_length {
+            return Err(io::Error::other("invalid generated Endpoint reservation"));
+        }
+        let (l2, l3) = frame.split_at_mut(l2_len);
+        let Some(owner) = self.driver.materialize_into(now, class, l3)? else {
+            return Ok(None);
+        };
+        *emitted = true;
+        let packet = &l3[..owner.len()];
+        let (_, destination) = wire::packet_addresses(packet).map_err(io::Error::other)?;
+        let Some(path) = peer_return_path(peers, owner.scope(), destination) else {
+            return Ok(None);
+        };
+        let header = self.output_header(path, physical_ifindex, packet[0] >> 4 == 6)?;
+        if header.len() != l2_len {
+            return Err(io::Error::other("generated Endpoint header length changed"));
+        }
+        l2.copy_from_slice(&header);
+        Ok(Some((l2_len + owner.len(), Retained::Endpoint(owner))))
     }
 }
 
@@ -548,10 +604,12 @@ impl Runtime {
                 progress += finish_transmit(received, kick)?;
             }
         }
-        // The sole scope owner: timers, closes and events run here even without RX or Core
-        // readers, before this turn exports their CPU outputs.
-        if self.service_scopes(cx, now) {
-            progress += 1;
+        for realm in &mut self.realms {
+            if realm.generated.is_some() {
+                realm.driver.begin_turn(now);
+            } else if realm.driver.service(cx, now) {
+                progress += 1;
+            }
         }
         let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
         for realm in &mut self.realms {
@@ -580,7 +638,41 @@ impl Runtime {
                             Poll::Ready(None) if !self.closing && !self.endpoints.is_closing() => {
                                 anyhow::bail!("XDP packet scope ended before endpoint close");
                             }
-                            _ => break,
+                            _ => {
+                                let Some((_, max_length)) =
+                                    realm.generated.filter(|_| !self.closing)
+                                else {
+                                    break;
+                                };
+                                let mut emitted = false;
+                                let generated =
+                                    port.transmit_generated(class, max_length, |frame| {
+                                        realm.generate_output(
+                                            now,
+                                            class,
+                                            ifindex,
+                                            &self.peers,
+                                            frame,
+                                            &mut emitted,
+                                        )
+                                    });
+                                if emitted {
+                                    considered += 1;
+                                    serviced += 1;
+                                }
+                                match generated {
+                                    Ok(true) => continue,
+                                    Ok(false) if emitted => continue,
+                                    Ok(false) => break,
+                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                        self.pressure.counters.tx_credit =
+                                            self.pressure.counters.tx_credit.saturating_add(1);
+                                        self.pressure.counters.refused = true;
+                                        break;
+                                    }
+                                    Err(error) => return Err(error.into()),
+                                }
+                            }
                         };
                         considered += count;
                         let mut blocked = false;
@@ -612,12 +704,15 @@ impl Runtime {
                             port.transmit_with(
                                 class,
                                 length + output.packet().len(),
-                                Retained::Endpoint(output),
+                                Retained::Endpoint(output.into_owner()),
                                 |owner, target| {
                                     let Retained::Endpoint(output) = owner else {
                                         return Err(io::Error::other("wrong endpoint TX owner"));
                                     };
-                                    fill_output(target, &header[..length], output.packet())
+                                    let packet = output.packet().ok_or_else(|| {
+                                        io::Error::other("Endpoint CPU writer has no packet")
+                                    })?;
+                                    fill_output(target, &header[..length], packet)
                                 },
                             )?;
                             serviced += 1;
@@ -629,6 +724,9 @@ impl Runtime {
                 }
                 Ok(serviced)
             });
+            if realm.generated.is_some() {
+                realm.driver.finish_turn(cx, now);
+            }
             progress += finish_transmit(work, kick)?;
         }
         if progress == 0 {
@@ -1281,11 +1379,13 @@ fn retained_icmp(
 
 fn endpoint_return_path(peers: &[Peer], output: &OutputLease) -> Option<ReturnPath> {
     let (_, destination) = wire::packet_addresses(output.packet()).ok()?;
+    peer_return_path(peers, output.scope(), destination)
+}
+
+fn peer_return_path(peers: &[Peer], scope: ScopeId, destination: IpAddr) -> Option<ReturnPath> {
     peers
         .iter()
-        .find(|peer| {
-            peer.scope == output.scope() && peer.address == destination && peer.conflict.is_none()
-        })
+        .find(|peer| peer.scope == scope && peer.address == destination && peer.conflict.is_none())
         .map(|peer| peer.path)
 }
 
@@ -1490,6 +1590,7 @@ pub(crate) async fn run(
                 ingress,
                 device,
                 link,
+                generated: generated_layout(link),
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             }

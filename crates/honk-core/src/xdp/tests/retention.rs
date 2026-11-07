@@ -21,12 +21,24 @@ fn fixture_parts() -> (
     ControlPlane,
     Arc<tokio::sync::Semaphore>,
 ) {
+    fixture_parts_mtu(1500)
+}
+
+fn fixture_parts_mtu(
+    mtu: usize,
+) -> (
+    PacketScope,
+    PacketOwner,
+    Arc<MemoryBudget>,
+    ControlPlane,
+    Arc<tokio::sync::Semaphore>,
+) {
     let budget = MemoryBudget::new(32 << 20);
     let mut config = honk_netstack::Config::new([89; 32]);
     config.mode = honk_netstack::Mode::Transparent {
         exclude: Default::default(),
     };
-    config.mtu = 1500;
+    config.mtu = u16::try_from(mtu).unwrap();
     config.max_flows = 8;
     config.memory_limit = 2 << 20;
     config.tcp_rcv_buf_max = 4096;
@@ -106,6 +118,17 @@ fn datagram(source: SocketAddr, destination: SocketAddr, payload: &[u8]) -> Vec<
 }
 
 fn segment(source: SocketAddr, destination: SocketAddr, seq: u32, ack: u32, flags: u8) -> Vec<u8> {
+    segment_mss(source, destination, seq, ack, flags, 1460)
+}
+
+fn segment_mss(
+    source: SocketAddr,
+    destination: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    mss: u16,
+) -> Vec<u8> {
     let mut bytes = vec![0; 128];
     let length = tcp::emit_packet(
         &mut bytes,
@@ -120,7 +143,7 @@ fn segment(source: SocketAddr, destination: SocketAddr, seq: u32, ack: u32, flag
             window: 60000,
             urgent: 0,
             options: tcp::Options {
-                mss: (flags & tcp::SYN != 0).then_some(1460),
+                mss: (flags & tcp::SYN != 0).then_some(mss),
                 ..Default::default()
             },
         },
@@ -129,6 +152,137 @@ fn segment(source: SocketAddr, destination: SocketAddr, seq: u32, ack: u32, flag
     .unwrap();
     bytes.truncate(length);
     bytes
+}
+
+fn output_realm(driver: PacketDriver, reply: ReturnPath, mtu: usize) -> Realm {
+    let link = LogicalLink {
+        ifindex: 10,
+        mtu: u32::try_from(mtu).unwrap(),
+        mac: [4; 6],
+        path: LinkPath {
+            physical_ifindex: 10,
+            vlan_tci: reply.vlan_tci,
+            vlan_proto: reply.vlan_proto,
+            vlan_count: reply.vlan_count,
+        },
+    };
+    Realm {
+        ingress: Ingress {
+            scope: driver.scope(),
+            namespace: 1,
+            ifindex: 10,
+            attachment: 1,
+            mark: MarkProvenance::BeforeSkb,
+        },
+        device: reply.device,
+        generated: generated_layout(link),
+        link,
+        driver,
+        pending: [None, None],
+    }
+}
+
+fn output_peer(scope: &PacketScope, address: SocketAddr, path: ReturnPath, now: Instant) -> Peer {
+    Peer {
+        scope: scope.scope(),
+        address: address.ip(),
+        path,
+        last_seen: now,
+        conflict: None,
+    }
+}
+
+fn generate(
+    realm: &mut Realm,
+    now: Instant,
+    class: TxClass,
+    peers: &[Peer],
+) -> (Vec<u8>, Retained) {
+    let (_, capacity) = realm.generated.expect("eligible realm");
+    let mut frame = vec![0xa5; capacity];
+    let mut emitted = false;
+    let (length, owner) = realm
+        .generate_output(now, class, 10, peers, &mut frame, &mut emitted)
+        .unwrap()
+        .expect("actual Stack output");
+    assert!(emitted);
+    let Retained::Endpoint(output) = &owner else {
+        panic!("generated Endpoint owner");
+    };
+    assert!(output.packet().is_none());
+    assert_eq!(output.scope(), realm.driver.scope());
+    assert_eq!(length, realm.generated.unwrap().0 + output.len());
+    assert!(frame[length..].iter().all(|byte| *byte == 0xa5));
+    frame.truncate(length);
+    (frame, owner)
+}
+
+fn check_tcp_frame(
+    frame: &[u8],
+    reply: ReturnPath,
+    source: SocketAddr,
+    destination: SocketAddr,
+) -> (tcp::Header, &[u8]) {
+    let l2 = 14 + 4 * usize::from(reply.vlan_count);
+    assert_eq!(&frame[..6], &reply.mac);
+    assert_eq!(&frame[6..12], &[4; 6]);
+    for tag in 0..usize::from(reply.vlan_count) {
+        let offset = 12 + tag * 4;
+        assert_eq!(
+            &frame[offset..offset + 2],
+            &reply.vlan_proto[tag].to_be_bytes()
+        );
+        assert_eq!(
+            &frame[offset + 2..offset + 4],
+            &reply.vlan_tci[tag].to_be_bytes()
+        );
+    }
+    let ethertype: u16 = if source.is_ipv6() { 0x86dd } else { 0x0800 };
+    assert_eq!(&frame[l2 - 2..l2], &ethertype.to_be_bytes());
+    let packet = &frame[l2..];
+    let ip = wire::parse_ip(packet).unwrap();
+    assert_eq!(
+        (ip.src, ip.dst, ip.proto),
+        (source.ip(), destination.ip(), wire::PROTO_TCP)
+    );
+    assert_eq!(ip.payload.end, packet.len());
+    assert!(tcp::verify_checksum(
+        ip.src,
+        ip.dst,
+        &packet[ip.payload.clone()]
+    ));
+    let (header, offset) = tcp::parse(&packet[ip.payload.clone()]).unwrap();
+    assert_eq!(
+        (header.src_port, header.dst_port),
+        (source.port(), destination.port())
+    );
+    (header, &packet[ip.payload.start + offset..ip.payload.end])
+}
+
+fn fragment_bytes(packet: &[u8]) -> (u32, usize, bool, &[u8]) {
+    assert_eq!(wire::parse_ip(packet), Err(wire::ParseError::Fragment));
+    if packet[0] >> 4 == 4 {
+        let head = usize::from(packet[0] & 15) * 4;
+        assert_eq!(wire::checksum::checksum(&packet[..head]), 0);
+        assert_eq!(packet[9], wire::PROTO_UDP);
+        let bits = u16::from_be_bytes(packet[6..8].try_into().unwrap());
+        (
+            u32::from(u16::from_be_bytes(packet[4..6].try_into().unwrap())),
+            usize::from(bits & 0x1fff) * 8,
+            bits & 0x2000 != 0,
+            &packet[head..],
+        )
+    } else {
+        assert_eq!(packet[6], 44);
+        assert_eq!(packet[40], wire::PROTO_UDP);
+        let bits = u16::from_be_bytes(packet[42..44].try_into().unwrap());
+        (
+            u32::from_be_bytes(packet[44..48].try_into().unwrap()),
+            usize::from(bits & 0xfff8),
+            bits & 1 != 0,
+            &packet[48..],
+        )
+    }
 }
 
 fn receive(
@@ -1019,6 +1173,7 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
                     },
                 },
                 driver,
+                generated: Some((22, 1522)),
                 pending: [None, None],
             };
             let source: SocketAddr = "192.0.2.10:41000".parse().unwrap();
@@ -1098,6 +1253,7 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
                 },
             },
             driver,
+            generated: Some((22, 1522)),
             pending: [None, None],
         };
         let destination: SocketAddr = "192.0.2.10:41000".parse().unwrap();
@@ -1142,7 +1298,8 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
         for (output, payload) in outputs.iter().zip([b"C", b"D"]) {
             assert!(output.as_ref().unwrap().packet().ends_with(payload));
         }
-        let mut completed = outputs.map(|output| output.map(Retained::Endpoint));
+        let mut completed =
+            outputs.map(|output| output.map(|output| Retained::Endpoint(output.into_owner())));
         release_completed(&mut completed.each_mut().map(Option::as_mut));
         drop(completed);
         drop(sender);
@@ -1233,4 +1390,591 @@ async fn held_policy_publication_never_suspends_the_driven_scope_timer_owner() {
     })
     .await
     .expect("a pending policy reader must sit beside the sole scope timer owner");
+}
+
+#[tokio::test]
+async fn generated_tcp_wire_matrix_freezes_qos_and_uses_full_eligible_extent() {
+    for (client, server) in [
+        ("192.0.2.10:41000", "198.51.100.9:443"),
+        ("[2001:db8::10]:41000", "[2001:db8::9]:443"),
+    ] {
+        let client: SocketAddr = client.parse().unwrap();
+        let server: SocketAddr = server.parse().unwrap();
+        for tags in 0..=2 {
+            let mut reply = path();
+            reply.vlan_count = tags;
+            for tag in usize::from(tags)..2 {
+                reply.vlan_tci[tag] = 0;
+                reply.vlan_proto[tag] = 0;
+            }
+            let l2 = 14 + 4 * usize::from(tags);
+            for mtu in [1280, honk_xsk::FRAME_SIZE - l2] {
+                let (scope, owner, _budget, plane, _slots) = fixture_parts_mtu(mtu);
+                let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+                let mut realm = output_realm(driver, reply, mtu);
+                assert_eq!(realm.generated, Some((l2, l2 + mtu)));
+                let now = Instant::now();
+                let mut peers = [output_peer(&scope, client, reply, now)];
+                scope.receive(
+                    &segment_mss(client, server, 100, 0, tcp::SYN, u16::MAX),
+                    now,
+                );
+                let (_, mut flow) = scope.poll_accept().unwrap();
+                realm.driver.begin_turn(now);
+                let (synack, syn_owner) = generate(&mut realm, now, TxClass::Control, &peers);
+                let (syn, payload) = check_tcp_frame(&synack, reply, server, client);
+                assert_eq!(syn.flags, tcp::SYN | tcp::ACK);
+                assert_eq!(syn.ack, 101);
+                assert!(payload.is_empty());
+                drop(syn_owner);
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                realm.driver.finish_turn(&mut cx, now);
+                assert!(realm.driver.deadline().is_some_and(|due| due > now));
+                scope.receive(
+                    &segment(client, server, 101, syn.seq.wrapping_add(1), tcp::ACK),
+                    now,
+                );
+
+                let payload = vec![0x5a; mtu - wire::ip_header_len(client.is_ipv6()) - 20];
+                flow.write_all(&payload).await.unwrap();
+                let (first, first_owner) = generate(&mut realm, now, TxClass::Bulk, &peers);
+                let (header, bytes) = check_tcp_frame(&first, reply, server, client);
+                assert_eq!(bytes, payload);
+                assert_eq!(first.len(), l2 + mtu);
+                assert_eq!(header.seq, syn.seq.wrapping_add(1));
+                let next_seq = header.seq.wrapping_add(payload.len() as u32);
+                scope.receive(&segment(client, server, 101, next_seq, tcp::ACK), now);
+                for tag in 0..usize::from(tags) {
+                    peers[0].path.vlan_tci[tag] ^= 0xf000;
+                }
+                flow.write_all(b"new snapshot").await.unwrap();
+                let later = now + Duration::from_millis(50);
+                realm.driver.begin_turn(later);
+                let (second, second_owner) = generate(&mut realm, later, TxClass::Bulk, &peers);
+                let (header, bytes) = check_tcp_frame(&second, peers[0].path, server, client);
+                assert_eq!(header.seq, next_seq);
+                assert_eq!(bytes, b"new snapshot");
+                let mut completed = [Some(first_owner), Some(second_owner)];
+                release_completed(&mut completed.each_mut().map(Option::as_mut));
+                drop(completed);
+
+                flow.abort();
+                drop(flow);
+                realm.driver.begin_turn(later);
+                let (reset, reset_owner) = generate(&mut realm, later, TxClass::Control, &peers);
+                let (header, bytes) = check_tcp_frame(&reset, peers[0].path, server, client);
+                assert_ne!(header.flags & tcp::RST, 0);
+                assert!(bytes.is_empty());
+                assert_eq!(reset.len(), l2 + wire::ip_header_len(client.is_ipv6()) + 20);
+                if client.is_ipv4() && tags == 0 {
+                    assert_eq!(
+                        reset.len(),
+                        54,
+                        "Port pads this actual extent to 60, not the maximum"
+                    );
+                }
+                drop(reset_owner);
+                realm.driver.finish_turn(&mut cx, later);
+                join_driven(endpoints, owner, &mut realm.driver).await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_fragments_follow_atomic_cpu_and_saved_heads_for_both_families() {
+    for (client, server) in [
+        ("192.0.2.10:41000", "198.51.100.9:53"),
+        ("[2001:db8::10]:41000", "[2001:db8::9]:53"),
+    ] {
+        let client: SocketAddr = client.parse().unwrap();
+        let server: SocketAddr = server.parse().unwrap();
+        let (scope, owner, _budget, plane, _slots) = fixture_parts();
+        let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+        let mut realm = output_realm(driver, path(), 1500);
+        let now = Instant::now();
+        let peers = [output_peer(&scope, client, path(), now)];
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let mut outputs = [None];
+        assert!(
+            realm
+                .poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs)
+                .0
+                .is_pending()
+        );
+        let sender = scope.datagram_sender(server);
+        let payload = vec![0x69; 3500];
+        // The app accepts fragment zero after the outer CPU-empty observation.
+        sender.send_to(&payload, client).await.unwrap();
+        let mut frame = vec![0xa5; realm.generated.unwrap().1];
+        let mut emitted = false;
+        assert!(
+            realm
+                .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!emitted);
+        assert_eq!(
+            realm
+                .poll_outputs(&mut cx, TxClass::Bulk, 0, &mut outputs)
+                .0,
+            Poll::Ready(Some(1))
+        );
+        let first = outputs[0].take().unwrap();
+        let (id, offset, more, bytes) = fragment_bytes(first.packet());
+        assert_eq!(offset, 0);
+        assert!(more);
+        let mut datagram = bytes.to_vec();
+        realm.pending[1] = Some((first, path()));
+        for _ in 0..2 {
+            assert!(
+                realm
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!emitted, "a saved CPU head blocks direct generation");
+        }
+        let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs);
+        assert_eq!(selected, Poll::Ready(Some(1)));
+        let first = outputs[0].take().unwrap();
+        let header = realm
+            .output_header(saved.unwrap(), 10, client.is_ipv6())
+            .unwrap();
+        let mut first_wire = vec![0; header.len() + first.packet().len()];
+        fill_output(&mut [&mut first_wire], &header, first.packet()).unwrap();
+        assert_eq!(fragment_bytes(&first_wire[22..]).1, 0);
+        let mut completed = [Some(Retained::Endpoint(first.into_owner()))];
+        loop {
+            let (wire, owner) = generate(&mut realm, now, TxClass::Bulk, &peers);
+            assert_eq!(
+                wire::packet_addresses(&wire[22..]).unwrap(),
+                (server.ip(), client.ip())
+            );
+            let (next_id, offset, more, bytes) = fragment_bytes(&wire[22..]);
+            assert_eq!(next_id, id);
+            assert_eq!(offset, datagram.len());
+            datagram.extend_from_slice(bytes);
+            drop(owner);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(&datagram[8..], payload);
+        assert!(wire::udp::verify_checksum(
+            server.ip(),
+            client.ip(),
+            &datagram
+        ));
+        release_completed(&mut completed.each_mut().map(Option::as_mut));
+        drop(completed);
+        for payload in [b"".as_slice(), b"ordinary CPU reply".as_slice()] {
+            sender.send_to(payload, client).await.unwrap();
+            emitted = false;
+            assert!(
+                realm
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!emitted);
+            assert_eq!(
+                realm
+                    .poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs)
+                    .0,
+                Poll::Ready(Some(1))
+            );
+            let output = outputs[0].take().unwrap();
+            let ip = wire::parse_ip(output.packet()).unwrap();
+            let udp = &output.packet()[ip.payload];
+            let (src, dst, data) = wire::udp::parse(udp).unwrap();
+            assert_eq!((src, dst), (server.port(), client.port()));
+            assert_eq!(&udp[data], payload);
+            assert!(wire::udp::verify_checksum(ip.src, ip.dst, udp));
+            output.release();
+        }
+        realm.driver.finish_turn(&mut cx, now);
+        drop(sender);
+        join_driven(endpoints, owner, &mut realm.driver).await;
+    }
+}
+
+#[tokio::test]
+async fn generated_local_disposal_and_header_errors_retire_unlocked_and_refresh_deadlines() {
+    for failure in 0..7 {
+        let (scope, owner, _budget, plane, _slots) = fixture_parts();
+        let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+        let mut realm = output_realm(driver, path(), 1500);
+        let client: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let server: SocketAddr = "198.51.100.9:443".parse().unwrap();
+        let now = Instant::now();
+        let mut peers = vec![output_peer(&scope, client, path(), now)];
+        scope.receive(&segment(client, server, 100, 0, tcp::SYN), now);
+        let (_, mut flow) = scope.poll_accept().unwrap();
+        let (synack, syn_owner) = generate(&mut realm, now, TxClass::Control, &peers);
+        let (syn, _) = check_tcp_frame(&synack, path(), server, client);
+        drop(syn_owner);
+        scope.receive(
+            &segment(client, server, 101, syn.seq.wrapping_add(1), tcp::ACK),
+            now,
+        );
+        let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = retired.clone();
+        let callback_scope = scope.clone();
+        flow.set_retirement_callback(move || {
+            let _ = callback_scope.stats();
+            observed.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        flow.abort();
+        drop(flow);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        let mut physical_ifindex = 10;
+        match failure {
+            0 => peers.clear(),
+            1 => peers[0].conflict = Some(now),
+            2 => peers[0].path.device = 1,
+            3 => physical_ifindex = 11,
+            4 => peers[0].path.vlan_tci[0] ^= 1,
+            5 => peers[0].path.vlan_proto[0] = 0x0800,
+            6 => realm.generated = Some((26, 1526)),
+            _ => unreachable!(),
+        }
+        let mut frame = vec![0xa5; realm.generated.unwrap().1];
+        let mut emitted = false;
+        realm.driver.begin_turn(now);
+        let result = realm.generate_output(
+            now,
+            TxClass::Control,
+            physical_ifindex,
+            &peers,
+            &mut frame,
+            &mut emitted,
+        );
+        assert!(
+            emitted,
+            "an emitted-but-disposed packet spends the bounded work budget"
+        );
+        if failure < 2 {
+            assert!(result.unwrap().is_none());
+        } else {
+            assert!(result.is_err());
+        }
+        assert_eq!(
+            retired.load(Ordering::SeqCst),
+            1,
+            "local disposal returns the original owner outside its lock"
+        );
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        realm.driver.finish_turn(&mut cx, now);
+        assert!(!endpoints.retains(scope.scope(), client, server, 6));
+        assert!(scope.is_protocol_quiescent());
+        let deadline = realm.driver.deadline();
+        emitted = false;
+        assert!(
+            realm
+                .generate_output(
+                    now,
+                    TxClass::Control,
+                    physical_ifindex,
+                    &peers,
+                    &mut frame,
+                    &mut emitted
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(!emitted);
+        realm.driver.finish_turn(&mut cx, now);
+        assert_eq!(realm.driver.deadline(), deadline);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        join_driven(endpoints, owner, &mut realm.driver).await;
+    }
+}
+
+#[tokio::test]
+async fn generated_missing_peer_synack_keeps_its_real_retransmission_deadline() {
+    let (scope, owner, _budget, plane, _slots) = fixture_parts();
+    let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+    let mut realm = output_realm(driver, path(), 1500);
+    let client: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+    let server: SocketAddr = "198.51.100.9:443".parse().unwrap();
+    let now = Instant::now();
+    scope.receive(&segment(client, server, 100, 0, tcp::SYN), now);
+    let (_, flow) = scope.poll_accept().unwrap();
+    realm.driver.begin_turn(now);
+    let mut frame = vec![0; realm.generated.unwrap().1];
+    let mut emitted = false;
+    assert!(
+        realm
+            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut emitted)
+            .unwrap()
+            .is_none()
+    );
+    assert!(emitted);
+    let ip = wire::parse_ip(&frame[22..]).unwrap();
+    let (original, _) = tcp::parse(&frame[22 + ip.payload.start..22 + ip.payload.end]).unwrap();
+    let original_seq = original.seq;
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    realm.driver.finish_turn(&mut cx, now);
+    let due = realm
+        .driver
+        .deadline()
+        .expect("disposed SYNACK still arms the actual protocol timer");
+    assert!(due > now);
+    emitted = false;
+    assert!(
+        realm
+            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut emitted)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!emitted);
+    realm.driver.finish_turn(&mut cx, now);
+    assert_eq!(realm.driver.deadline(), Some(due));
+    realm.driver.begin_turn(due);
+    let peers = [output_peer(&scope, client, path(), due)];
+    let (retry, retained) = generate(&mut realm, due, TxClass::Control, &peers);
+    assert_eq!(
+        check_tcp_frame(&retry, path(), server, client).0.seq,
+        original_seq
+    );
+    drop(retained);
+    realm.driver.finish_turn(&mut cx, due);
+    drop(flow);
+    join_driven(endpoints, owner, &mut realm.driver).await;
+}
+
+#[tokio::test]
+async fn mixed_cpu_direct_completion_releases_exact_scopes_through_reuse_close_and_callback_panic()
+{
+    for panic_callback in [false, true] {
+        let client: SocketAddr = "192.0.2.10:41000".parse().unwrap();
+        let server: SocketAddr = "198.51.100.9:443".parse().unwrap();
+        let now = Instant::now();
+        let mut fixtures = Vec::new();
+        let mut completed = Vec::new();
+        let mut original_ids = Vec::new();
+        for index in 0..2 {
+            let (scope, owner, _budget, plane, _slots) = fixture_parts();
+            let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+            let mut realm = output_realm(driver, path(), 1500);
+            let peers = [output_peer(&scope, client, path(), now)];
+            scope.receive(&segment(client, server, 100, 0, tcp::SYN), now);
+            let (_, mut flow) = scope.poll_accept().unwrap();
+            original_ids.push(flow.flow_id());
+            let (synack, syn_owner) = generate(&mut realm, now, TxClass::Control, &peers);
+            let (syn, _) = check_tcp_frame(&synack, path(), server, client);
+            drop(syn_owner);
+            scope.receive(
+                &segment(client, server, 101, syn.seq.wrapping_add(1), tcp::ACK),
+                now,
+            );
+            let retired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = retired.clone();
+            let callback_scope = scope.clone();
+            flow.set_retirement_callback(move || {
+                let _ = callback_scope.stats();
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert!(
+                    !(panic_callback && index == 0),
+                    "injected retirement callback panic"
+                );
+            })
+            .unwrap();
+            flow.write_all(b"original retained bytes").await.unwrap();
+            let held = if index == 0 {
+                generate(&mut realm, now, TxClass::Bulk, &peers).1
+            } else {
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                realm.driver.service(&mut cx, now);
+                let mut outputs = [None];
+                assert_eq!(
+                    realm
+                        .poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs)
+                        .0,
+                    Poll::Ready(Some(1))
+                );
+                let output = outputs[0].take().unwrap();
+                assert_eq!(output.flow_id(), Some(flow.flow_id()));
+                assert!(output.packet().ends_with(b"original retained bytes"));
+                Retained::Endpoint(output.into_owner())
+            };
+            completed.push(Some(held));
+            flow.abort();
+            drop(flow);
+            completed.push(Some(generate(&mut realm, now, TxClass::Control, &peers).1));
+            assert_eq!(retired.load(Ordering::SeqCst), 0);
+            scope.receive(&segment(client, server, 900, 0, tcp::SYN), now);
+            let (_, new_flow) = scope.poll_accept().unwrap();
+            assert_ne!(new_flow.flow_id(), original_ids[index]);
+            let (synack, syn_owner) = generate(&mut realm, now, TxClass::Control, &peers);
+            let (syn, _) = check_tcp_frame(&synack, path(), server, client);
+            drop(syn_owner);
+            scope.receive(
+                &segment(client, server, 901, syn.seq.wrapping_add(1), tcp::ACK),
+                now,
+            );
+            fixtures.push((scope, endpoints, owner, realm, new_flow, retired));
+        }
+        assert_eq!(
+            original_ids[0], original_ids[1],
+            "FlowIds are local, not completion scope keys"
+        );
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut owners: Vec<_> = completed.iter_mut().map(Option::as_mut).collect();
+            release_completed(&mut owners);
+        }));
+        assert_eq!(result.is_err(), panic_callback);
+        drop(completed);
+        for (scope, endpoints, mut owner, mut realm, mut flow, retired) in fixtures {
+            assert_eq!(retired.load(Ordering::SeqCst), 1);
+            assert!(endpoints.retains(scope.scope(), client, server, 6));
+            let peers = [output_peer(&scope, client, path(), now)];
+            flow.write_all(b"new incarnation").await.unwrap();
+            let (frame, held) = generate(&mut realm, now, TxClass::Bulk, &peers);
+            assert_eq!(
+                check_tcp_frame(&frame, path(), server, client).1,
+                b"new incarnation"
+            );
+            endpoints.close();
+            drop(flow);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            realm.driver.finish_turn(&mut cx, now);
+            assert!(owner.poll_join_plane(&mut cx).is_pending());
+            assert!(endpoints.retains_source(scope.scope(), client.ip()));
+            let mut final_completion = [Some(held)];
+            release_completed(&mut final_completion.each_mut().map(Option::as_mut));
+            drop(final_completion);
+            join_driven(endpoints, owner, &mut realm.driver).await;
+            assert_eq!(retired.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn just_over_generated_limit_keeps_full_cpu_tcp_extent_and_sg_writer() {
+    for (client, server) in [
+        ("192.0.2.10:41000", "198.51.100.9:443"),
+        ("[2001:db8::10]:41000", "[2001:db8::9]:443"),
+    ] {
+        let client: SocketAddr = client.parse().unwrap();
+        let server: SocketAddr = server.parse().unwrap();
+        for tags in 0..=2 {
+            let mut reply = path();
+            reply.vlan_count = tags;
+            for tag in usize::from(tags)..2 {
+                reply.vlan_tci[tag] = 0;
+                reply.vlan_proto[tag] = 0;
+            }
+            let l2 = 14 + 4 * usize::from(tags);
+            let mtu = honk_xsk::FRAME_SIZE + 1 - l2;
+            let (scope, owner, _budget, plane, _slots) = fixture_parts_mtu(mtu);
+            let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
+            let mut realm = output_realm(driver, reply, mtu);
+            assert!(realm.generated.is_none());
+            let now = Instant::now();
+            let peers = [output_peer(&scope, client, reply, now)];
+            scope.receive(
+                &segment_mss(client, server, 100, 0, tcp::SYN, u16::MAX),
+                now,
+            );
+            let (_, mut flow) = scope.poll_accept().unwrap();
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            let mut outputs = [None];
+            let mut frame = [0xa5; honk_xsk::FRAME_SIZE];
+            let mut emitted = false;
+            assert!(
+                realm
+                    .generate_output(now, TxClass::Control, 10, &peers, &mut frame, &mut emitted)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!emitted);
+            realm.driver.service(&mut cx, now);
+            assert_eq!(
+                realm
+                    .poll_outputs(&mut cx, TxClass::Control, 1, &mut outputs)
+                    .0,
+                Poll::Ready(Some(1))
+            );
+            let synack = outputs[0].take().unwrap();
+            let ip = wire::parse_ip(synack.packet()).unwrap();
+            let (syn, _) = tcp::parse(&synack.packet()[ip.payload]).unwrap();
+            assert_eq!(syn.flags, tcp::SYN | tcp::ACK);
+            synack.release();
+            scope.receive(
+                &segment(client, server, 101, syn.seq.wrapping_add(1), tcp::ACK),
+                now,
+            );
+            let payload = vec![0x3c; mtu - wire::ip_header_len(client.is_ipv6()) - 20];
+            flow.write_all(&payload).await.unwrap();
+            assert!(
+                realm
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!emitted);
+            realm.driver.service(&mut cx, now);
+            assert_eq!(
+                realm
+                    .poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs)
+                    .0,
+                Poll::Ready(Some(1))
+            );
+            let output = outputs[0].take().unwrap();
+            assert_eq!(output.packet().len(), mtu);
+            let header = realm
+                .output_header(
+                    endpoint_return_path(&peers, &output).unwrap(),
+                    10,
+                    client.is_ipv6(),
+                )
+                .unwrap();
+            let length = header.len() + output.packet().len();
+            assert_eq!(length, honk_xsk::FRAME_SIZE + 1);
+            let mut wire = vec![0; length];
+            let (first, last) = wire.split_at_mut(honk_xsk::FRAME_SIZE);
+            assert_eq!(
+                last.len(),
+                1,
+                "the CPU owner requires a whole two-descriptor SG packet"
+            );
+            fill_output(&mut [first, last], &header, output.packet()).unwrap();
+            assert_eq!(check_tcp_frame(&wire, reply, server, client).1, payload);
+            let mut completed = [Some(Retained::Endpoint(output.into_owner()))];
+            release_completed(&mut completed.each_mut().map(Option::as_mut));
+            drop(completed);
+            drop(flow);
+            join_driven(endpoints, owner, &mut realm.driver).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn generated_empty_turns_do_not_create_protocol_deadlines() {
+    let (scope, owner, _budget, plane, _slots) = fixture_parts();
+    let (endpoints, owner, driver) = driven(scope, owner, plane).await;
+    let mut realm = output_realm(driver, path(), 1500);
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    let now = Instant::now();
+    let mut frame = vec![0xa5; realm.generated.unwrap().1];
+    for _ in 0..4 {
+        realm.driver.begin_turn(now);
+        for class in [TxClass::Control, TxClass::Bulk] {
+            let mut emitted = false;
+            assert!(
+                realm
+                    .generate_output(now, class, 10, &[], &mut frame, &mut emitted)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!emitted);
+        }
+        realm.driver.finish_turn(&mut cx, now);
+        assert!(realm.driver.deadline().is_none());
+    }
+    join_driven(endpoints, owner, &mut realm.driver).await;
 }

@@ -50,6 +50,17 @@ fn output(scope: &PacketScope) -> OutputLease {
 }
 
 fn segment(client: SocketAddr, seq: u32, ack: u32, flags: u8, payload: &[u8]) -> Vec<u8> {
+    segment_with_options(client, seq, ack, flags, payload, tcp::Options::default())
+}
+
+fn segment_with_options(
+    client: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+    options: tcp::Options,
+) -> Vec<u8> {
     let dst: SocketAddr = if client.is_ipv6() {
         "[2001:db8::9]:443"
     } else {
@@ -70,7 +81,7 @@ fn segment(client: SocketAddr, seq: u32, ack: u32, flags: u8, payload: &[u8]) ->
             flags,
             window: 60000,
             urgent: 0,
-            options: tcp::Options::default(),
+            options,
         },
         [payload, &[]],
     )
@@ -80,12 +91,31 @@ fn segment(client: SocketAddr, seq: u32, ack: u32, flags: u8, payload: &[u8]) ->
 }
 
 fn decode(output: &OutputLease) -> (tcp::Header, Vec<u8>) {
-    let ip = wire::parse_ip(output.packet()).unwrap();
+    decode_packet(output.packet())
+}
+
+fn decode_packet(packet: &[u8]) -> (tcp::Header, Vec<u8>) {
+    let ip = wire::parse_ip(packet).unwrap();
     assert_eq!(ip.proto, wire::PROTO_TCP);
-    let tcp = &output.packet()[ip.payload];
+    let tcp = &packet[ip.payload];
     assert!(tcp::verify_checksum(ip.src, ip.dst, tcp));
     let (header, offset) = tcp::parse(tcp).unwrap();
     (header, tcp[offset..].to_vec())
+}
+
+fn materialized(
+    driver: &mut PacketDriver,
+    now: Instant,
+    class: TxClass,
+    packet: &mut [u8],
+) -> OutputOwner {
+    let owner = driver
+        .materialize_into(now, class, packet)
+        .unwrap()
+        .expect("actual direct stack output");
+    assert_eq!(owner.class(), class);
+    assert!(owner.packet().is_none());
+    owner
 }
 
 fn handshake(scope: &PacketScope, now: Instant, client: SocketAddr, seq: u32) -> (FlowIo, u32) {
@@ -233,92 +263,150 @@ fn closed_admission_keeps_established_reads_writes_and_original_addresses() {
 }
 
 #[test]
-fn saturated_bulk_keeps_control_progress_and_batch_returns_exact_scopes() {
+fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
     let now = Instant::now();
-    let (scope, _owner, _) = runtime(now);
     let client = "10.0.0.2:40000".parse().unwrap();
-    let (mut io, server_seq) = handshake(&scope, now, client, 100);
-    let old = io.flow_id();
-    let destination = io.local_addr();
-    let retired = Arc::new(AtomicUsize::new(0));
-    let callback_scope = scope.clone();
-    let observed = Arc::clone(&retired);
-    io.set_retirement_callback(move || {
-        // A callback can enter the scope: it must not run under the runtime mutex.
-        let _ = callback_scope.stats();
-        observed.fetch_add(1, Ordering::SeqCst);
-    })
-    .unwrap();
-    assert!(matches!(
-        std::pin::Pin::new(&mut io).poll_write(&mut context(), b"old-output"),
-        Poll::Ready(Ok(10))
-    ));
-    scope.drive(now);
-    let mut old_output = output(&scope);
-    assert_eq!(old_output.class(), TxClass::Bulk);
-    assert_eq!(old_output.flow_id(), Some(old));
-    let original_bytes = old_output.packet().to_vec();
-
-    assert_eq!(
-        scope.receive(&segment(client, 101, server_seq, tcp::ACK, b"data"), now),
-        Rx::Consumed
-    );
-    scope.drive(now + Duration::from_millis(50));
-    let ack = output(&scope);
-    assert_eq!(ack.class(), TxClass::Control);
-    assert_eq!(decode(&ack).0.ack, 105);
-    assert!(decode(&ack).1.is_empty());
-    ack.release();
-    let mut retirement = io.retirement();
-    io.abort();
-    drop(io);
-    scope.drive(now + Duration::from_millis(51));
-    let reset = output(&scope);
-    assert_eq!(reset.class(), TxClass::Control);
-    assert_ne!(decode(&reset).0.flags & tcp::RST, 0);
-    reset.release();
-    assert_eq!(retired.load(Ordering::SeqCst), 0);
-    assert!(
-        scope.retains_tcp(client, destination),
-        "exported output retains Endpoint execution after app close"
-    );
-    {
-        let pending = retirement.wait();
-        let mut pending = pin!(pending);
-        assert!(pending.as_mut().poll(&mut context()).is_pending());
-    }
-    let (new_io, _) = handshake(&scope, now + Duration::from_millis(52), client, 900);
-    assert_ne!(new_io.flow_id(), old);
-    assert_eq!(old_output.packet(), original_bytes);
-    let (other_scope, _other_owner, _) = runtime(now);
-    let (mut other_io, _) = handshake(&other_scope, now, client, 100);
-    assert_eq!(other_io.flow_id(), old, "FlowIds are local to each stack");
-    assert!(matches!(
-        std::pin::Pin::new(&mut other_io).poll_write(&mut context(), b"other-output"),
-        Poll::Ready(Ok(12))
-    ));
-    other_scope.drive(now);
-    let mut other_output = output(&other_scope);
-    OutputLease::release_batch(&mut [Some(&mut other_output), Some(&mut old_output)]);
-    drop((old_output, other_output));
-    assert!(other_scope.retains_tcp(client, destination));
-    assert_eq!(retired.load(Ordering::SeqCst), 1);
-    let completed = retirement.wait();
-    let mut completed = pin!(completed);
-    assert!(matches!(
-        completed.as_mut().poll(&mut context()),
-        Poll::Ready(Ok(()))
-    ));
-    assert!(
-        scope
+    let mut runtimes = Vec::new();
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = PacketScope::new(
+            config(),
+            Arc::clone(&budget),
+            RuntimeLimits {
+                control_frames: 2,
+                bulk_frames: 2,
+                ..limits()
+            },
+            now,
+        )
+        .unwrap();
+        let (mut io, server_seq) = handshake(&scope, now, client, 100);
+        let old = io.flow_id();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let callback_scope = scope.clone();
+        let observed = Arc::clone(&retired);
+        io.set_retirement_callback(move || {
+            assert!(callback_scope.0.inner.try_lock().is_some());
+            let _ = callback_scope.stats();
+            observed.fetch_add(1, Ordering::SeqCst);
+        })
+        .unwrap();
+        let backing: Vec<_> = scope
             .0
             .inner
             .lock()
-            .slots
+            .frames
             .iter()
-            .flatten()
-            .any(|slot| slot.id == new_io.flow_id())
-    );
+            .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
+            .collect();
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_write(&mut context(), b"cpu-old"),
+            Poll::Ready(Ok(7))
+        ));
+        scope.drive(now);
+        let cpu = output(&scope).into_owner();
+        let cpu_bytes = cpu.packet().unwrap().to_vec();
+        assert_eq!(decode_packet(&cpu_bytes).1, b"cpu-old");
+        let mut driver = owner.hand_off();
+        assert!(matches!(
+            std::pin::Pin::new(&mut io).poll_write(&mut context(), b"direct-old"),
+            Poll::Ready(Ok(10))
+        ));
+        driver.begin_turn(now);
+        let mut packet = [0; 1280];
+        let direct = materialized(&mut driver, now, TxClass::Bulk, &mut packet);
+        assert_eq!(direct.flow_id(), Some(old));
+        assert_eq!(decode_packet(&packet[..direct.len()]).1, b"direct-old");
+        assert_eq!(cpu.packet().unwrap(), cpu_bytes);
+        assert_eq!(
+            scope.receive(&segment(client, 101, server_seq, tcp::ACK, b"data"), now),
+            Rx::Consumed
+        );
+        let ack_time = now + Duration::from_millis(50);
+        driver.begin_turn(ack_time);
+        let mut control_packet = [0; 1280];
+        let ack = materialized(&mut driver, ack_time, TxClass::Control, &mut control_packet);
+        assert_eq!(decode_packet(&control_packet[..ack.len()]).0.ack, 105);
+        drop(ack);
+        io.abort();
+        drop(io);
+        driver.begin_turn(ack_time);
+        let reset = materialized(&mut driver, ack_time, TxClass::Control, &mut control_packet);
+        assert_eq!(reset.flow_id(), Some(old));
+        assert_ne!(
+            decode_packet(&control_packet[..reset.len()]).0.flags & tcp::RST,
+            0
+        );
+        driver.finish_turn(&mut context(), ack_time);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        assert!(scope.retains_tcp(client, "203.0.113.9:443".parse().unwrap()));
+        assert_eq!(
+            scope.receive(&segment(client, 900, 0, tcp::SYN, &[]), ack_time),
+            Rx::Consumed
+        );
+        let (_, new_io) = scope.poll_accept().unwrap();
+        assert_ne!(new_io.flow_id(), old);
+        driver.begin_turn(ack_time);
+        let mut new_packet = [0; 1280];
+        let new_synack = materialized(&mut driver, ack_time, TxClass::Control, &mut new_packet);
+        assert_eq!(new_synack.flow_id(), Some(new_io.flow_id()));
+        let frames = [packet, control_packet, new_packet];
+        scope.shutdown(false);
+        outputs.extend([cpu, direct, reset]);
+        runtimes.push((
+            scope, owner, driver, new_io, new_synack, retired, old, backing, budget, frames,
+        ));
+    }
+    assert_eq!(runtimes[0].6, runtimes[1].6, "FlowIds are Stack-local");
+    assert_ne!(runtimes[0].0.scope(), runtimes[1].0.scope());
+    let mut batch: [Option<&mut OutputOwner>; 6] = std::array::from_fn(|_| None);
+    for (cell, output) in batch.iter_mut().zip(&mut outputs) {
+        *cell = Some(output);
+    }
+    batch.swap(1, 4);
+    OutputOwner::release_batch(&mut batch);
+    assert!(batch.iter().all(Option::is_none));
+    assert!(outputs.iter().all(|output| output.queued.is_none()));
+    drop(outputs);
+    for (scope, _owner, mut driver, new_io, new_synack, retired, old, backing, budget, _frames) in
+        runtimes
+    {
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+        {
+            let inner = scope.0.inner.lock();
+            assert!(!inner.slots.iter().flatten().any(|slot| slot.id == old));
+            let current = inner
+                .slots
+                .iter()
+                .flatten()
+                .find(|slot| slot.id == new_io.flow_id())
+                .unwrap();
+            assert_eq!(
+                current.outputs, 1,
+                "old returns cannot debit the reused tuple"
+            );
+            assert_eq!(inner.ledger.outstanding_tx().count(), 1);
+            assert_eq!(inner.output_peers.iter().flatten().count(), 1);
+            let restored: Vec<_> = inner
+                .frames
+                .iter()
+                .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
+                .collect();
+            assert_eq!(restored, backing);
+            assert_eq!(inner._storage.bytes(), 4 * 1280);
+            assert!(budget.used() >= inner._storage.bytes());
+        }
+        scope.shutdown(true);
+        drop(new_io);
+        driver.finish_turn(&mut context(), now);
+        assert!(!scope.0.inner.lock().finished);
+        drop(new_synack);
+        driver.finish_turn(&mut context(), now);
+        assert!(scope.0.inner.lock().finished);
+        assert!(scope.0.inner.lock().rights == Rights::Returned);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

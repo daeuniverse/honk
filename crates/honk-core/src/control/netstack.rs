@@ -1,11 +1,11 @@
 //! Bounded L3 termination, not capture/classification or native continuation.
 //!
 //! One externally joined `PacketOwner` drives timers and queues complete IP packets, unless
-//! validated endpoint start hands that right to one device-owned `PacketDriver`. The original
-//! owner then stays parked in its joined task and resumes for the actual finish or for cleanup
-//! of an abandoned driver. An `OutputLease` owns its actual frame bytes and credit until the
-//! consumer releases it. A backend must retain that lease through real I/O completion; local
-//! disposal is not a NIC CQ.
+//! validated endpoint start hands that right to one device-owned `PacketDriver`. That driver
+//! can instead emit into already-reserved device storage. The original owner stays parked in
+//! its joined task and resumes for actual finish or abandoned-driver cleanup. `OutputLease`
+//! is a CPU-packet capability; both CPU and direct output retain their original scope credit
+//! until actual I/O completion or explicit local disposal, never a fabricated NIC CQ.
 
 use std::fmt;
 use std::future::poll_fn;
@@ -144,6 +144,22 @@ struct Inner {
     finished: bool,
     // Frame bytes are freed before this reservation, including bytes returned by OutputLease.
     _storage: MemoryReservation,
+}
+
+struct OutputReservation<'a> {
+    inner: &'a mut Inner,
+    lease: Option<FrameLease>,
+}
+
+impl Drop for OutputReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            self.inner
+                .ledger
+                .cancel_tx(lease)
+                .expect("unpublished scope output reservation");
+        }
+    }
 }
 
 impl PacketScope {
@@ -703,11 +719,11 @@ impl Inner {
             let bytes = self.frames[index]
                 .take()
                 .expect("queued frame owns storage");
-            *output = Some(OutputLease {
+            *output = Some(OutputLease(OutputOwner {
                 scope: scope.clone(),
                 queued: Some(queued),
                 bytes: Some(bytes),
-            });
+            }));
             count += 1;
         }
         if count != 0 {
@@ -773,26 +789,39 @@ impl Inner {
         queued
     }
 
-    fn publish(&mut self, lease: FrameLease, tx: Transmit, class: TxClass) {
+    fn install(
+        &mut self,
+        lease: FrameLease,
+        tx: Transmit,
+        class: TxClass,
+        destination: IpAddr,
+    ) -> io::Result<Queued> {
         let index = self.index(lease);
-        self.output_peers[index] = Some(
-            honk_netstack::wire::packet_addresses(
-                &self.frames[index]
-                    .as_ref()
-                    .expect("reserved output storage")[..tx.len],
-            )
-            .expect("stack output has IP addresses")
-            .1,
-        );
         self.ledger
             .submit_tx(lease, tx.len, tx.flow)
-            .expect("reserved complete output frame");
+            .map_err(io::Error::other)?;
+        self.output_peers[index] = Some(destination);
         if let Some(id) = tx.flow
             && let Some(slot) = self.slot(id)
         {
             slot.outputs += 1;
         }
-        self.push(Queued { lease, tx, class });
+        Ok(Queued { lease, tx, class })
+    }
+
+    fn publish(&mut self, lease: FrameLease, tx: Transmit, class: TxClass) {
+        let index = self.index(lease);
+        let destination = honk_netstack::wire::packet_addresses(
+            &self.frames[index]
+                .as_ref()
+                .expect("reserved output storage")[..tx.len],
+        )
+        .expect("stack output has IP addresses")
+        .1;
+        let queued = self
+            .install(lease, tx, class, destination)
+            .expect("reserved complete output frame");
+        self.push(queued);
     }
 
     fn release(&mut self, queued: Queued) {
@@ -810,12 +839,16 @@ impl Inner {
         }
     }
 
-    fn release_output(&mut self, queued: Queued, bytes: Box<[u8]>) {
+    fn release_output(&mut self, queued: Queued, bytes: Option<Box<[u8]>>) {
         let index = self.index(queued.lease);
-        assert!(
-            self.frames[index].replace(bytes).is_none(),
-            "exclusive output storage"
-        );
+        if let Some(bytes) = bytes {
+            assert!(
+                self.frames[index].replace(bytes).is_none(),
+                "exclusive output storage"
+            );
+        } else {
+            assert!(self.frames[index].is_some(), "funded direct output storage");
+        }
         self.release(queued);
     }
 
@@ -845,7 +878,7 @@ impl Inner {
         }
     }
 
-    fn drive(&mut self, now: Instant) -> bool {
+    fn advance(&mut self, now: Instant) {
         if let Some(stack) = &mut self.stack {
             stack.handle_timeout(now);
             if self.pending_closes != 0 {
@@ -858,6 +891,9 @@ impl Inner {
                 self.pending_closes = 0;
             }
         }
+    }
+
+    fn fill(&mut self, now: Instant) -> bool {
         let mut sent = 0;
         for _ in 0..BATCH {
             let first = self.next_tx;
@@ -877,8 +913,14 @@ impl Inner {
         if sent != 0 {
             self.wake_waiters();
         }
-        self.events();
         sent == BATCH
+    }
+
+    fn drive(&mut self, now: Instant) -> bool {
+        self.advance(now);
+        let more = self.fill(now);
+        self.events();
+        more
     }
 
     fn events(&mut self) {
@@ -1085,32 +1127,52 @@ impl PacketDriver {
         self.deadline
     }
 
-    /// One device turn of owner work without `Shared::with`: timers, pending closes, events
-    /// and bounded CPU output, then unlocked reap and the actual finish check. True only when
-    /// the pull budget was exhausted. After a successful return the driver is inert.
+    /// Complete CPU service for startup-only driving and realms using the CPU/SG path.
     pub(crate) fn service(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
+        let more = self.begin(now, true);
+        self.finish_turn(cx, now);
+        more
+    }
+
+    /// Advance timers and pending closes before a bounded direct-output turn.
+    pub(crate) fn begin_turn(&mut self, now: Instant) {
+        self.begin(now, false);
+    }
+
+    fn begin(&mut self, now: Instant, cpu_output: bool) -> bool {
+        let mut inner = self.scope.0.inner.lock();
+        if inner.rights != Rights::Driven {
+            self.deadline = None;
+            return false;
+        }
+        let armed = inner.output_waker.take();
+        if self.fallback.is_some_and(|due| due <= now) {
+            self.fallback = None;
+            inner.wake_waiters();
+        }
+        inner.advance(now);
+        let more = cpu_output && inner.fill(now);
+        inner.output_waker = armed;
+        more
+    }
+
+    /// Finalize after the last emission, including None and local disposal. Do not self-wake.
+    pub(crate) fn finish_turn(&mut self, cx: &mut Context<'_>, now: Instant) {
         let shared = &self.scope.0;
-        let more = {
+        {
             let mut inner = shared.inner.lock();
             if inner.rights != Rights::Driven {
                 self.deadline = None;
-                return false;
+                return;
             }
-            // Disarmed under this lock, so these pulls cannot wake their own device; armed
-            // again before unlocking, so a later producer finds it.
             let armed = inner.output_waker.take();
-            if self.fallback.is_some_and(|due| due <= now) {
-                self.fallback = None;
-                inner.wake_waiters();
-            }
-            let more = inner.drive(now);
+            inner.events();
             if let Some(stack) = &mut inner.stack {
                 stack.take_tx_wakeup();
             }
             inner.output_waker = armed;
             register(&mut inner.output_waker, cx.waker());
-            more
-        };
+        }
         shared.reap();
         let mut inner = shared.inner.lock();
         let armed = inner.output_waker.take();
@@ -1121,7 +1183,7 @@ impl PacketDriver {
             self.fallback = None;
             self.deadline = None;
             shared.owner_wake.notify_one();
-            return false;
+            return;
         }
         inner.output_waker = armed;
         register(&mut inner.output_waker, cx.waker());
@@ -1135,7 +1197,73 @@ impl PacketDriver {
         .into_iter()
         .flatten()
         .min();
-        more
+    }
+
+    /// Emit into the device's already-reserved full L3 frame; never finish L2 under this lock.
+    pub(crate) fn materialize_into(
+        &mut self,
+        now: Instant,
+        class: TxClass,
+        l3: &mut [u8],
+    ) -> io::Result<Option<OutputOwner>> {
+        let mut inner = self.scope.0.inner.lock();
+        if inner.rights != Rights::Driven || inner.aborted || inner.finished {
+            return Ok(None);
+        }
+        if inner.stack.is_none() {
+            return Ok(None);
+        }
+        let frame_size = inner.frame_size;
+        if l3.len() < frame_size {
+            return Err(invalid("short direct output frame"));
+        }
+        if inner
+            .queue
+            .iter()
+            .flatten()
+            .any(|queued| queued.class == class)
+        {
+            let wake = inner.output_waker.take();
+            drop(inner);
+            if let Some(wake) = wake {
+                wake.wake();
+            }
+            return Ok(None);
+        }
+        let lease = match inner.ledger.reserve_tx(class) {
+            Ok(lease) => lease,
+            Err(
+                honk_datapath::buffer::LedgerError::NoFrame
+                | honk_datapath::buffer::LedgerError::NoDescriptor,
+            ) => return Ok(None),
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        let mut reservation = OutputReservation {
+            inner: &mut inner,
+            lease: Some(lease),
+        };
+        let stack = reservation.inner.stack.as_mut().expect("live driven stack");
+        let packet = &mut l3[..frame_size];
+        let tx = match class {
+            TxClass::Control => stack.poll_control_transmit(now, packet),
+            TxClass::Bulk => stack.poll_transmit_with(now, packet, TxCaps::NONE),
+        };
+        let Some(tx) = tx else { return Ok(None) };
+        if tx.len == 0 || tx.len > frame_size {
+            return Err(io::Error::other("invalid direct output extent"));
+        }
+        let destination = honk_netstack::wire::packet_addresses(&packet[..tx.len])
+            .map_err(io::Error::other)?
+            .1;
+        let queued = reservation.inner.install(lease, tx, class, destination)?;
+        reservation.lease = None;
+        drop(reservation);
+        drop(inner);
+        Ok(Some(OutputOwner {
+            scope: self.scope.clone(),
+            queued: Some(queued),
+            bytes: None,
+        }))
     }
 
     /// `PacketScope::poll_outputs_class` for the driving device, without `Shared::with`.
@@ -1171,7 +1299,9 @@ impl Drop for PacketDriver {
 
 /// An immutable local output capability, not an AF_XDP completion descriptor.
 /// Dropping/releasing it means the actual consumer has finished I/O or explicitly disposed it.
-pub struct OutputLease {
+pub struct OutputLease(OutputOwner);
+
+pub(crate) struct OutputOwner {
     scope: PacketScope,
     queued: Option<Queued>,
     bytes: Option<Box<[u8]>>,
@@ -1179,26 +1309,60 @@ pub struct OutputLease {
 
 impl OutputLease {
     pub fn packet(&self) -> &[u8] {
-        &self.bytes.as_ref().expect("live output storage")
-            [..self.queued.expect("live output").tx.len]
+        self.0.packet().expect("CPU output storage")
     }
     pub fn flow_id(&self) -> Option<FlowId> {
-        self.queued.expect("live output").tx.flow
+        self.0.flow_id()
     }
     pub fn scope(&self) -> ScopeId {
-        self.scope.scope()
+        self.0.scope()
     }
     pub fn class(&self) -> TxClass {
-        self.queued.expect("live output").class
+        self.0.class()
     }
     pub fn release(self) {
         drop(self);
+    }
+
+    pub(crate) fn into_owner(self) -> OutputOwner {
+        self.0
     }
 
     /// Return completed or explicitly disposed outputs without moving their owners.
     /// References may belong to several scopes; retirement callbacks run unlocked.
     /// Returned leases are inert: only their later destruction is valid.
     pub fn release_batch(outputs: &mut [Option<&mut OutputLease>]) {
+        assert!(outputs.len() <= BATCH);
+        let mut owners: [Option<&mut OutputOwner>; BATCH] = std::array::from_fn(|_| None);
+        for (owner, output) in owners.iter_mut().zip(outputs.iter_mut()) {
+            *owner = output.take().map(|output| &mut output.0);
+        }
+        OutputOwner::release_batch(&mut owners[..outputs.len()]);
+    }
+}
+
+impl OutputOwner {
+    pub(crate) fn len(&self) -> usize {
+        self.queued.expect("live output").tx.len
+    }
+
+    fn flow_id(&self) -> Option<FlowId> {
+        self.queued.expect("live output").tx.flow
+    }
+
+    pub(crate) fn scope(&self) -> ScopeId {
+        self.scope.scope()
+    }
+
+    fn class(&self) -> TxClass {
+        self.queued.expect("live output").class
+    }
+
+    pub(crate) fn packet(&self) -> Option<&[u8]> {
+        self.bytes.as_ref().map(|bytes| &bytes[..self.len()])
+    }
+
+    pub(crate) fn release_batch(outputs: &mut [Option<&mut OutputOwner>]) {
         assert!(outputs.len() <= BATCH);
         // ponytail: at most 64x64 scope comparisons; index only if measured batches need it.
         while let Some(shared) = outputs
@@ -1215,8 +1379,7 @@ impl OutputLease {
                     }
                     let output = output.take().expect("matching output scope");
                     let queued = output.queued.take().expect("live output");
-                    let bytes = output.bytes.take().expect("live output storage");
-                    inner.release_output(queued, bytes);
+                    inner.release_output(queued, output.bytes.take());
                 }
                 inner.wake_waiters();
             });
@@ -1240,10 +1403,10 @@ impl fmt::Debug for OutputLease {
     }
 }
 
-impl Drop for OutputLease {
+impl Drop for OutputOwner {
     fn drop(&mut self) {
         if let Some(queued) = self.queued.take() {
-            let bytes = self.bytes.take().expect("live output storage");
+            let bytes = self.bytes.take();
             self.scope.0.with(|inner| {
                 inner.release_output(queued, bytes);
                 inner.wake_waiters();

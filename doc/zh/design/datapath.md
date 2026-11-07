@@ -77,6 +77,10 @@ SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 ve
 jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096 字节、完整且
 未分片的 IP 包。物理 NIC zero-copy、jumbo 性能与 DMA 释放仍需各自证据。
 
+仅当已准入 realm 经溢出检查的 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才直接在一个已预留 UMEM frame 内生成输出，不放宽物理端口最大长度。jumbo/不符合资格的 realm 继续 CPU 输出和整链 SG，控制包也一样。应用 UDP 首包/首分片、未分片和零长度数据报及控制器 DNS 回复仍是真实计费的 CPU 输出；后续直接分片不能越过更早 CPU 前缀，此顺序在 scope 锁内原子复查。
+
+`Port::transmit_generated(class, max_length, generate)` 先预留真实单帧/ring/sidecar 容量，再调用同步 generator；scope credit 也早于 Stack emitter 预留。私有 guard 在无输出、错误或 panic 时取消未发布预留。原始 FlowId 持有先在 scope mutex 内安装，随后在锁外完成精确 peer/header，中间不 await 或服务 RX。只按实际长度补零到以太网最小帧，并以未偏移的 frame base 发布；后续错误不释放已发布 owner，仍须真实 CQ。CPU 与直接 Endpoint owner 共用按精确 scope 混合归还的 CQ batch。既有每 realm 每类别 32 个候选输出、64 个 CQ descriptor 的上限、相互独立的 ACK/重传/CQ 生命周期、E3.1 handoff 及进程生命周期 UMEM 计费不变。符合资格的 driver 轮次只跳过 CPU 拉取，在直接输出后完成 timer/event/close/deadline 收尾，不增加 busy polling。只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制，TCP payload/校验和与 relay 复制仍存在；这不是通用 UDP zero-copy、常驻内存减少或已测收益。
+
 XDP 拥有规范的内存内 routing、domain 与 health 发布，而非 Mock 或 TC 后端。native API 报告的 datapath kind 为 `userspace`，不声称拥有硬件计数器或 program/attachment 清单；实际 capture admission 由 runtime 共享 gate 提供。kernel witness recording 与 TC/listener/token API 不受支持。软件 flags 仍走规范发布流程；该后端仅跳过 native UDP staging 与 witness admission。
 
 固定聚合计数区分队列/credit/容量拒绝、native-ID 历史精度下降及成功 peer 回收。

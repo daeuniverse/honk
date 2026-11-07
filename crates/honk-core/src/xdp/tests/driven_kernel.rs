@@ -260,6 +260,7 @@ async fn start_runtime(
                 ingress,
                 device,
                 link,
+                generated: generated_layout(link),
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             }

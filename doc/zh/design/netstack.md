@@ -125,17 +125,25 @@ Endpoint 模式只支持主动打开：`tcp_connect` 用 RFC 6056 算法 3 选�
 
 ## Core packet-endpoint 嵌入
 
-`honk-datapath` 提供不回绕的 `ScopeId` 和固定 frame/descriptor 账本，不授予抓包或路由权威。`control::netstack::PacketScope` 持有一个计账 Stack、一把互斥锁、有界 frame/waiter 和须由外层 join 的 owner。输出 lease 保留原始 TCP `FlowId`、字节和 credit，直到真实消费者释放。本地归还不是 NIC CQ，CQ 地址也没有虚构的 generation；控制与 bulk 各有预留。
+`honk-datapath` 提供不回绕的 `ScopeId` 和固定 frame/descriptor 账本，不授予抓包或路由权威。`control::netstack::PacketScope` 持有一个计账 Stack、一把互斥锁、有界 frame/waiter 和须由外层 join 的 owner。输出 owner 保留原始 TCP `FlowId` 和 credit，直到真实消费者释放；公开 `OutputLease` 始终代表真实 CPU 包，crate-private `OutputOwner` 则可在没有 CPU 字节时保留直接生成输出。本地归还不是 NIC CQ，CQ 地址也没有虚构的 generation；控制与 bulk 各有预留。
 
 普通嵌入运行 `PacketOwner`；XDP 把驱动权交给设备 runtime 内唯一且不可 Clone 的 `PacketDriver`。原已计费 owner task 保持停放，随后执行并 join 真实 finish 或被放弃 driver 的清理。应用/输出变更唤醒当前 driver，而 driver 自己的扫描和导出不自通知。共享互斥锁及锁外退休回调不变；归还驱动权既不是完成，也不是 CQ。
 
 只有任务计费成功后才从原列表取走 scope owner。接纳失败时，已计费 supervisor 保留所有未启动 owner，在 producer、应用和退休工作结束后完成其真实清理；任何已导出输出尚未归还时，就绪等待都不能结束。panic payload 保留到全部原 owner 和已接纳任务 join 完成。
 
+对于已准入的 XDP realm，仅当经过溢出检查的完整长度 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才在最终单个 UMEM frame 内生成输出；既有物理端口最大长度限制继续生效。Stack 使用完整 scope L3 容量和 `TxCaps::NONE`，不能缩短容量以强行满足资格。符合资格的 driver 只禁用 CPU 拉取：timer、pending close、event、唤醒注册、退休和真实 finish 继续运行。有界直接输出轮次结束后才刷新最终 deadline/event/reap/finish 状态，包括无输出和本地处置的结果。普通 owner、显式时钟 CPU drive 及不符合资格/jumbo realm 继续 CPU 物化，包括控制输出和 SG 提交。
+
+应用 UDP 仍生成真实且已计费的 CPU 首包/首分片，包括未分片、零长度数据报和控制器 DNS 回复。每个类别内，暂存 pending CPU 输出先于已导出的 CPU 前缀，再处理更早排队的 CPU 输出，最后才直接生成新输出。直接 emitter 在与发包相同的 scope 互斥锁内复查更早 CPU 队列，因此应用在外层判空和加锁之间发送数据，也不会让后续分片越过 fragment zero。阻塞的 CPU 前缀只阻塞自身类别。
+
+调用 Stack emitter 前先预留真实 Port 容量和 scope frame/descriptor credit，私有同步 guard 在无输出、错误或 unwind 时只取消未发布预留。原始 `Transmit::flow`、peer 持有和精确 slot 计数在 scope 锁内安装，早于任何 retention/reap 查询。解锁后，同一个同步设备 callback 查找精确 scope 下无冲突的 peer，验证物理设备/VLAN/header identity，并原地补齐 MAC、完整 VLAN TCI 与 EtherType；scope 锁内没有 L2 callback，中间不 await 或处理 RX。缺失/冲突 peer 在锁外处置已生成 owner，不重试、不回滚序号；header/长度不一致是真实错误。后续 peer QoS 更新不能改动已发布字节。
+
+CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ batch 内按精确 scope 混合归还。TCP 重传 ring 和 ACK 生命周期仍与 UMEM/CQ 分离：ACK 不能释放在途 DMA owner，CQ 不能确认 TCP。既有 CPU backing 与进程生命周期 UMEM 仍完整计费。符合资格的直接生成输出只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制；TCP payload 复制/校验和及 socket/relay 复制仍存在。这不是免 payload 复制的 TCP、通用 UDP zero-copy、更低常驻内存或已测性能收益；既有 E3.1 driver handoff 不变。
+
 XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。阻塞 scope 保留原有 100ms 共享预算后备，已设期限直到服务才重置，不被无关轮询延后。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
 
 AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
 
-按类别导出输出时，最多填充调用者提供的 64 个空 lease 槽，保持类别内 FIFO 顺序，不复制载荷。XDP daemon 每轮每 realm 每类别最多处理 32 个输出，批量受实际端口 MTU、类别 credit 和 TX ring 空间约束；保守批容量为零时仍尝试单个短包，保留其进展机会。CQ 每轮最多验证 64 个 descriptor，只借出全部 descriptor 已完成的包 owner，按真实 scope 分组归还。后续 CQ 非法也不阻止已验证完成前缀的释放；未完整归还的 SG owner 继续保留。退休回调在解锁后执行，TCP ACK 持有与设备完成相互独立。
+按类别导出输出时，最多填充调用者提供的 64 个空 lease 槽，保持类别内 FIFO 顺序，不复制载荷。XDP daemon 每轮每 realm 每类别最多考虑 32 个输出，暂存/已导出的 CPU 输出、直接生成包及已生成但被处置的包共用该上限。实际端口 MTU、类别 credit 和 TX ring 空间继续决定容量；CPU 批量保留短包 singleton 后备。一个类别阻塞不妨碍另一个类别；无输出或容量探测失败不算进展，也不能据此 busy-poll。CQ 每轮最多验证 64 个 descriptor，只借出全部 descriptor 已完成的包 owner，按真实 scope 分组归还。后续 CQ 非法也不阻止已验证完成前缀的释放；未完整归还的 SG owner 继续保留。退休回调和非 Endpoint sidecar 析构在解锁后执行，TCP ACK 持有与设备完成相互独立。
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
