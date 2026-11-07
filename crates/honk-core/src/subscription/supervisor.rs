@@ -444,6 +444,7 @@ impl SupervisorState {
             }
         });
         let observed = observations.get_mut(&id).filter(|_| current);
+        let fallback;
         let load = match (&result, observed) {
             (Ok(reply), Some(observed)) if reply.outcome.accepted() => {
                 info!(
@@ -459,9 +460,9 @@ impl SupervisorState {
                         .then_some("publication_degraded");
                 observed.load.rejection = None;
                 observed.load.fetch = None;
-                observed.load.clone()
+                &observed.load
             }
-            (Err("supervisor_stopped"), Some(observed)) => observed.load.clone(),
+            (Err("supervisor_stopped"), Some(observed)) => &observed.load,
             (_, Some(observed)) => {
                 observed.load.error = Some(
                     result
@@ -472,19 +473,29 @@ impl SupervisorState {
                 );
                 observed.load.rejection = result.as_ref().ok().and_then(|reply| reply.rejection);
                 observed.load.fetch = flight.failure;
-                observed.load.clone()
+                &observed.load
             }
-            (Ok(reply), None) if reply.outcome.accepted() => ProviderLoad {
-                updated_at: Some(SystemTime::now()),
-                userinfo: flight.userinfo,
-                cached: false,
-                error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
-                    .then_some("publication_degraded"),
-                rejection: None,
-                fetch: None,
-            },
-            _ => ProviderLoad::default(),
+            (Ok(reply), None) if reply.outcome.accepted() => {
+                fallback = ProviderLoad {
+                    updated_at: Some(SystemTime::now()),
+                    userinfo: flight.userinfo,
+                    cached: false,
+                    error: matches!(reply.outcome, ReloadOutcome::CommittedDegraded { .. })
+                        .then_some("publication_degraded"),
+                    rejection: None,
+                    fetch: None,
+                };
+                &fallback
+            }
+            _ => {
+                fallback = ProviderLoad::default();
+                &fallback
+            }
         };
+        #[cfg(feature = "native-api")]
+        let report = flight.operation.map(|operation| (operation, load.clone()));
+        #[cfg(not(feature = "native-api"))]
+        let _ = load;
         drop(observations);
         if current {
             self.providers
@@ -493,11 +504,9 @@ impl SupervisorState {
                 .finished(Instant::now(), result.as_ref().err().copied());
         }
         #[cfg(feature = "native-api")]
-        if let Some(operation) = flight.operation {
+        if let Some((operation, load)) = report {
             operation.finish(&flight.authorized.subscription, load, result);
         }
-        #[cfg(not(feature = "native-api"))]
-        let _ = load;
         if !current {
             self.schedule(id);
         }
