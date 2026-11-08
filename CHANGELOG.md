@@ -6,6 +6,36 @@ This changelog follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) 
 
 Entries live in [changes/](changes/) until release.
 
+## [0.1.0-beta.6] - 2026-11-09
+
+### Added
+
+- DNS request rules accept `subtag(...)`, which resolves the server hosts of nodes from matching subscriptions through a chosen `-> direct` upstream (for example a provider's own DoH) instead of the bootstrap resolver. Each DNS generation precomputes host policy outcomes; native flow traces explicitly mark consumption of these decisions as incomplete evidence (`not_instrumented`). (#463)
+
+### Changed
+
+- The shipped `honk-core` binary now allocates through jemalloc instead of mimalloc; `-stock` archives still use the system allocator. (#455)
+- The `honk-core` Cargo feature formerly named `mimalloc` is now `jemalloc`; builds with `--no-default-features` keep the system allocator. (#455)
+- Release downloads label the default allocator `jemalloc-*` instead of `mimalloc-*`. (#455)
+- Removed the mimalloc-only `HONK_MI_COLLECT_SECS` and `MIMALLOC_PURGE_DELAY` environment variables and the worker idle-collection machinery they controlled. (#455)
+- Runtime jemalloc options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`: the crate prefixes jemalloc symbols and the environment variable with `_rjem_`. (#455)
+- Startup verifies only the TC programs the configured interfaces bind (plus one routing target when they bind none), so a WAN-only Ethernet host no longer loads the LAN or L3 variants. Later variants are verified outside the shared backend lock and become bindable only after receiving the current routing generation; a failed variant does not block independent variants. Logging and event-consumer cancellation preserve the original map FDs required by deferred loads. (#450)
+
+### Fixed
+
+- Bound each DNS cache shard's answer bytes to `max(entry capacity × 1 KiB, 65,535 bytes)`, evicting LRU entries when large answers fill the budget. (#454)
+- Inline DNS cache insert/remove accounting in size-optimized builds. (#454)
+- Group probes measure up to 10 members at once, so a slow member no longer leaves later members at `deadline`. (#459)
+- Probe target resolution failures are logged with the host and DNS error instead of appearing only as `address_unavailable`. (#459)
+- Probe targets fall back to bootstrap DNS when the running DNS configuration cannot answer, so `asis` routing no longer reports every probe as `address_unavailable`. (#459)
+- A refused `--store db` start no longer leaves an empty state database, or its data directory, behind. (#467)
+- Subscription connection and HTTP status failures name the selected node and group in the log. Classified fetch failures report their stage and available outbound attribution in native API provider `last_error.details`, including completed failures retained during shutdown; unusable subscription content reports `parse_failed`. (#451)
+
+### Internal
+
+- Move the aya family to userspace `aya` 0.16, `aya-obj` 0.6, `aya-log` 0.4 and kernel-side `aya-ebpf` 0.3, adapting call sites to the new map, loader and TC context APIs while preserving programs, map names and shared binary layouts. (#436)
+- Make shared payload padding explicit and restrict locked-value `Pod` implementations to the three audited payloads; reject stale BTF schemas without changing existing field offsets or map-value sizes. (#436)
+
 ## [0.1.0-beta.5] - 2026-11-03
 
 ### Added
@@ -118,7 +148,8 @@ Summarised from the [release notes](https://github.com/daeuniverse/honk/releases
 - Shared UDP sources survive malformed SOCKS5, Trojan and Juicity datagrams.
 - QUIC session tickets honour `skip_cert_verify`, and a reload restores warm carriers and probes.
 
-[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...HEAD
+[Unreleased]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.6...HEAD
+[0.1.0-beta.6]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.5...v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.4...v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.3...v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/daeuniverse/honk/compare/v0.1.0-beta.2...v0.1.0-beta.3
