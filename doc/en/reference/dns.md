@@ -147,12 +147,39 @@ Put each complete call and action on one physical line. Incomplete nonblank line
 | `qname(geosite: cn)` | Request and response | Match domains expanded from the named geosite code. |
 | `qtype(a, aaaa, ...)` | Request and response | Match QTYPE names or a numeric `u16`. Recognized names are `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `NS`, `PTR`, `SOA`, `SRV`, `HTTPS`, `SVCB`, `ANY`, and `*`. |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | Request only | Match the logical client source against any listed IP host or CIDR. |
+| `subtag(MyAirport, keyword: Air, regex: ^Paid)` | Request only | Match the subscription tags of a [node server host](#node-server-hosts) lookup: exact, `keyword:` or `regex:`, case-sensitive. |
 | `upstream(name, ...)` | Response only | Match the upstream that produced the current response. |
 | `ip(192.0.2.0/24, geoip: private, ...)` | Response only | Match when any answer IP belongs to a listed CIDR or GeoIP set. |
 
 For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
 
 DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresses mean `/32` and `/128`; CIDR host bits are truncated with `dns-network-host-bits`. Malformed networks produce located `invalid-dns-network` diagnostics and omit the whole dae rule; constructed invalid routing fails router/policy construction. Equivalent network spellings use the same policy identity without reordering or deduplicating arguments.
+
+### Node server hosts
+
+Node server hosts resolve through `global.bootstrap_resolver`, then `/etc/hosts` and the system nameserver, not through DNS routing. A request rule containing `subtag(...)` instead claims the server hosts, including XHTTP download hosts, of nodes from matching subscriptions:
+
+```dae
+dns {
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+        providerdoh: 'https://doh.provider.example/dns-query' -> direct
+    }
+    routing {
+        request {
+            subtag(MyAirport) && qname(suffix: private.provider.example) -> providerdoh
+            fallback: alidns
+        }
+    }
+}
+```
+
+- Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts keep bootstrap resolution. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
+- A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, skips the cache and response rules, and never falls back: its failure fails the physical node or probe connection.
+- Claims are hostname-based, not an end-to-end download destination policy. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
+- The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`; otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
+- The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
+- Each DNS generation precomputes node-host policy outcomes, including nonmatching hosts, from the subscription tags and ordered rules. Native flow traces report `partial` with `not_instrumented` when consuming these outcomes: the node-host rule decision is not captured.
 
 ### Request actions
 

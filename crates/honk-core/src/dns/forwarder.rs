@@ -6,6 +6,7 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +107,10 @@ pub(crate) enum CacheAccess {
 pub(crate) struct ResolveOptions {
     pub(crate) cache: CacheAccess,
     pub(crate) forced_upstream: Option<super::planner::UpstreamTag>,
+    /// A node server host lookup on the dial path. It skips response rules,
+    /// which may requery through a proxy whose own dial would need this very
+    /// lookup, and family preference, which its caller applies itself.
+    pub(crate) node_host: bool,
 }
 
 impl ResolveOptions {
@@ -117,6 +122,7 @@ impl ResolveOptions {
                 self.cache
             },
             forced_upstream: self.forced_upstream.clone(),
+            node_host: self.node_host,
         }
     }
 }
@@ -146,6 +152,9 @@ pub struct DnsForwarder {
     /// `0` preserves the cached wire TTLs.
     pub(crate) stale_reply_ttl: u32,
     pub(crate) policy_id: Option<PolicyId>,
+    /// Precomputed node-host policy decisions for this generation, including
+    /// indexed hosts declined by every `subtag()` rule; empty without one.
+    pub(crate) node_host_upstreams: Arc<HashMap<String, Option<String>>>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
     socket_budget: super::transport::DnsSocketBudget,
@@ -177,6 +186,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             stale_reply_ttl: 30,
             policy_id: None,
+            node_host_upstreams: Arc::default(),
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
             socket_budget: super::transport::DnsSocketBudget::default(),
@@ -200,6 +210,27 @@ impl DnsForwarder {
     /// Set the IP-version strategy used for DNS responses.
     pub fn with_strategy(mut self, strategy: DnsStrategy) -> Self {
         self.strategy = strategy;
+        self
+    }
+
+    /// Compile the node-host decisions of this generation's `subtag()` rules.
+    pub(crate) fn with_node_hosts(mut self, node_hosts: super::node_host::NodeHosts) -> Self {
+        if !node_hosts.is_empty() && self.routing.has_node_rules() {
+            self.node_host_upstreams = Arc::new(
+                node_hosts
+                    .into_iter()
+                    .map(|(host, tags)| {
+                        let upstream = self
+                            .routing
+                            .select_node_upstream(&host, &tags)
+                            .map(str::to_owned);
+                        (host, upstream)
+                    })
+                    .collect(),
+            );
+        } else {
+            self.node_host_upstreams = Arc::default();
+        }
         self
     }
 
@@ -359,6 +390,7 @@ impl DnsForwarder {
             cache_ttl: self.cache_ttl,
             stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
+            node_host_upstreams: Arc::clone(&self.node_host_upstreams),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
             socket_budget: self.socket_budget.clone(),
@@ -610,6 +642,9 @@ mod strategy {
             options: &ResolveOptions,
         ) -> anyhow::Result<Bytes> {
             let preferred = match (&self.strategy, qtype) {
+                // A node host lookup orders both families itself; its uncached
+                // sibling probe would be an extra exchange that could empty one.
+                _ if options.node_host => return Ok(response),
                 (DnsStrategy::PreferIpv4, 28) => 1u16,
                 (DnsStrategy::PreferIpv6, 1) => 28u16,
                 _ => return Ok(response),

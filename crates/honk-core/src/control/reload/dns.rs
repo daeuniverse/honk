@@ -128,7 +128,8 @@ impl ControlPlane {
             .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
             .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
             .with_policy_id(dns_policy)
-            .with_hosts_snapshot(hosts_snapshot),
+            .with_hosts_snapshot(hosts_snapshot)
+            .with_node_hosts(crate::dns::node_host::index(config)),
         );
         Ok((forwarder, dns_upstream_pool))
     }

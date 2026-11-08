@@ -369,7 +369,9 @@ Basic Authorization header，显式配置的 Authorization 优先。同源重定
 
 `bootstrap.rs` 避免代理主机名解析依赖 honk 自己拦截的 DNS 路径。节点
 拨号点经 `connect_marked` 或 QUIC 建立调用 `bootstrap::resolve`，绝不
-直接调用裸 `lookup_host`，否则代理主机名解析会与 honk 自己拦截的 DNS 路径形成死锁。配置的 bootstrap resolver 通过带 bypass mark
+直接调用裸 `lookup_host`，否则代理主机名解析会与 honk 自己拦截的 DNS 路径形成死锁。`resolve` 先交给 core 的进程级 `NodeHostResolver`，
+它只接管当前 DNS 代次中由 [`subtag()` 规则](../reference/dns.md#节点服务器域名)路由的主机名；`resolve_with*`（DNS 上游端点）跳过它，
+因此上游自身的域名不会递归。其余情况下，配置的 bootstrap resolver 通过带 bypass mark
 的 UDP/TCP 查询；失败时回退 `/etc/hosts` 及 `/etc/resolv.conf` 中第一个
 数字 nameserver，DNS socket 同样带 mark，不调用 libc NSS 或追加搜索后缀。
 A 与 AAAA 并发查询，各自拥有独立的 3 s 预算；只接受与随机查询 ID 及原问题

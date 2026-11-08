@@ -415,7 +415,11 @@ intercepted DNS path. Node dial sites must use `bootstrap::resolve` through
 Otherwise proxy-hostname resolution can deadlock against honk's own intercepted DNS path.
 The implementation in `crates/honk-outbound/src/bootstrap.rs` provides dae
 `bootstrap_resolver` parity with a process-wide resolver and a hand-rolled wire codec.
-It queries the configured bootstrap resolver over bypass-marked UDP/TCP. On failure,
+`resolve` first offers the host to core's process-wide `NodeHostResolver`, which claims
+only hosts a DNS [`subtag()` rule](../reference/dns.md#node-server-hosts) routes in the
+current DNS generation; `resolve_with*` (DNS upstream endpoints) skip it, so an
+upstream's own name cannot recurse. Otherwise it queries the configured bootstrap
+resolver over bypass-marked UDP/TCP. On failure,
 it falls back to `/etc/hosts` and marked DNS to the first numeric nameserver in
 `/etc/resolv.conf`, without libc NSS or search suffixes.
 A and AAAA queries run concurrently, each within its own 3 s budget. The resolver

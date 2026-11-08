@@ -807,6 +807,7 @@ impl Config {
             ));
         }
         self.dns.validate_upstream_references_detailed(source)?;
+        self.dns.validate_node_host_rules_detailed(source)?;
         if self.global.check_interval_secs == 0 {
             return Err(config_validation_error(
                 source,

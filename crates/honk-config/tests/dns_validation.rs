@@ -276,3 +276,59 @@ fn test_validate_rejects_unknown_quoted_dns_upstream_name() {
     let config = quoted_upstream_config("'my dns'", "\"other dns\"");
     assert_missing_dns_upstream(&config, "dns.routing.request.rules[1].action", "other dns");
 }
+
+#[test]
+fn subtag_rules_need_a_direct_upstream_and_only_qname() {
+    let config = |upstream: &str, rule: &str| {
+        honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n upstream {{\n  providerdoh: 'https://203.0.113.1/dns-query'{upstream}\n }}\n routing {{\n  request {{\n   {rule}\n   fallback: providerdoh\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+    };
+    let accepted = "subtag(MyAirport) && qname(suffix: private.example) -> providerdoh";
+    config(" -> direct", accepted).validate().unwrap();
+    for (upstream, rule, code, setting) in [
+        (
+            "",
+            accepted,
+            "subtag-dns-upstream-route",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
+            " -> proxy",
+            accepted,
+            "subtag-dns-upstream-route",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
+            " -> direct\n  providerdoh: 'https://203.0.113.2/dns-query' -> proxy",
+            accepted,
+            "subtag-dns-upstream-route",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
+            " -> proxy\n  providerdoh: 'https://203.0.113.2/dns-query' -> direct",
+            accepted,
+            "subtag-dns-upstream-route",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
+            " -> direct",
+            "subtag(MyAirport) -> asis",
+            "subtag-dns-action",
+            "dns.routing.request.rules[1].action",
+        ),
+        (
+            " -> direct",
+            "subtag(MyAirport) && qtype(aaaa) -> providerdoh",
+            "subtag-dns-condition",
+            "dns.routing.request.rules[1].conditions",
+        ),
+    ] {
+        let error = config(upstream, rule)
+            .validate_detailed()
+            .expect_err("unsafe subtag rule must fail");
+        assert_eq!(error.diagnostic.code, code, "{upstream:?} {rule:?}");
+        assert_eq!(error.diagnostic.setting.to_string(), setting);
+    }
+}

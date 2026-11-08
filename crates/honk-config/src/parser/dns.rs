@@ -694,6 +694,7 @@ fn parse_dns_conditions(
         let name = inner.sub(0, open).raw();
         if !matches!(name, "qname" | "qtype" | "sip")
             && !(is_response && matches!(name, "upstream" | "ip"))
+            && !(!is_response && name == "subtag")
         {
             let code = if matches!(name, "sub" | "node" | "subnode") {
                 "unsupported-dns-condition"
@@ -748,6 +749,14 @@ fn parse_dns_conditions(
                     return Vec::new();
                 };
                 crate::dns::DnsCond::Qtype { not, types }
+            }
+            "subtag" => {
+                let tags = parse_dns_subtag_args(arguments);
+                if tags.is_empty() {
+                    invalid_dns_rule(diagnostics, route_kind, ordinal, "invalid-dns-rule");
+                    return Vec::new();
+                }
+                crate::dns::DnsCond::Subtag { not, tags }
             }
             "sip" => {
                 let args: Vec<_> = args.into_iter().map(|arg| arg.raw().to_owned()).collect();
@@ -850,6 +859,30 @@ fn parse_dns_qname_args(args: &[Text<'_, '_>]) -> Vec<crate::dns::DnsDomainMatch
         }
     }
     matchers
+}
+
+/// Parse subtag(args) like the group filter: exact, `keyword:` or `regex:`.
+/// Arguments keep their quotes so a quoted argument is an exact tag.
+fn parse_dns_subtag_args(arguments: Text<'_, '_>) -> Vec<crate::dns::DnsTagMatcher> {
+    use crate::dns::DnsTagMatcher;
+    let mut tags = Vec::new();
+    for a in arguments.split(",") {
+        let a = a.trim();
+        let raw = a.raw();
+        let (prefix, matcher): (&str, fn(String) -> DnsTagMatcher) = if raw.starts_with("keyword:")
+        {
+            ("keyword:", DnsTagMatcher::Keyword)
+        } else if raw.starts_with("regex:") {
+            ("regex:", DnsTagMatcher::Regex)
+        } else {
+            ("", DnsTagMatcher::Exact)
+        };
+        let value = a.sub(prefix.len(), raw.len()).trim().unquote().raw();
+        if !value.is_empty() {
+            tags.push(matcher(value.to_owned()));
+        }
+    }
+    tags
 }
 
 /// Parse ip(...) args into (cidrs, geoip_codes).

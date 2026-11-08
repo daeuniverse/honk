@@ -147,12 +147,39 @@ cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 | `qname(geosite: cn)` | Request 与 response | 匹配由指定 geosite 代码展开的域名。 |
 | `qtype(a, aaaa, ...)` | Request 与 response | 匹配 QTYPE 名称或数字 `u16`。可识别名称为 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。 |
 | `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 仅 request | 将逻辑客户端来源与任一所列 IP 主机地址或 CIDR 匹配。 |
+| `subtag(MyAirport, keyword: Air, regex: ^Paid)` | 仅 request | 匹配[节点服务器域名](#节点服务器域名)查询所属订阅的 tag：精确值、`keyword:` 或 `regex:`，区分大小写。 |
 | `upstream(name, ...)` | 仅 response | 匹配生成当前应答的上游。 |
 | `ip(192.0.2.0/24, geoip: private, ...)` | 仅 response | 任一应答 IP 属于所列 CIDR 或 GeoIP 集时匹配。 |
 
 透明 53 端口与 `dns.bind` 入口的逻辑来源是 socket peer；代表已接纳 TCP/UDP 流执行的 DNS 解析使用该流的客户端地址。内部、bootstrap、prefetch 与 Clash API 查询没有逻辑来源。来源未知时，正向和取反的 `sip` 条件都为 false，请求路由会继续执行下一条规则或 fallback。response 路由不接受 `sip`。
 
 DNS `sip()` 与 `ip()` 共用 IP/CIDR 解码器。裸 IPv4 和 IPv6 地址分别表示 `/32` 和 `/128`；CIDR 中的主机位会被清零，并产生 `dns-network-host-bits` 警告。无效网络产生带位置的 `invalid-dns-network` 诊断，并省略整条 dae 规则；通过代码构造的无效路由会在路由器或策略构建时失败。等价网络写法使用相同策略标识，不改变参数顺序或删除重复参数。
+
+### 节点服务器域名
+
+节点服务器域名经 `global.bootstrap_resolver`、`/etc/hosts` 和系统 nameserver 解析，不经过 DNS 路由。含 `subtag(...)` 的 request 规则会改为接管匹配订阅中节点的服务器域名（包括 XHTTP 下载域名）：
+
+```dae
+dns {
+    upstream {
+        alidns: 'udp://223.5.5.5:53'
+        providerdoh: 'https://doh.provider.example/dns-query' -> direct
+    }
+    routing {
+        request {
+            subtag(MyAirport) && qname(suffix: private.provider.example) -> providerdoh
+            fallback: alidns
+        }
+    }
+}
+```
+
+- 节点域名只匹配含 `subtag()` 的规则；普通规则、fallback 以及未匹配的域名仍走 bootstrap 解析。其他查询不带订阅，对它们而言 `subtag()` 与 `!subtag()` 都为假。
+- 被接管的查询只发往选中的上游，遵守 `strategy` 与 `use_host`，不经过缓存和 response 规则，也不回落：查询失败即物理节点连接或探测连接失败。
+- 接管按域名生效，并非端到端的下载目标解析策略。下载为路由选择预先解析 URL 域名属于尽力获取信息；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守该规则。显式使用 bootstrap 解析器的下载绕过此 hook。
+- 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
+- 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
+- 每个 DNS 代次根据订阅 tag 和有序规则预计算节点域名的策略结果，包括未匹配结果。使用这些结果时，原生 flow trace 会以 `not_instrumented` 标记为 `partial`：节点域名的规则决策证据尚未采集。
 
 ### Request 动作
 
