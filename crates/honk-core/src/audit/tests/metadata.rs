@@ -138,7 +138,8 @@ fn default_event_adds_only_duration_and_upstream_to_the_existing_contract() {
             "client_ip":"192.0.2.8","client_port":53000,"transport":"tcp",
             "domain":"audit.example.","qtype":"A","qclass":"IN",
             "result":"response","rcode":"REFUSED","response_truncated":false,
-            "answers":[],"answer_ips":[],"answer_cnames":[],"answer_types":[]
+            "answers":[],"answers_omitted":null,
+            "answer_ips":[],"answer_cnames":[],"answer_types":[]
         })
     );
 }

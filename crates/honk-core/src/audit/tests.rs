@@ -443,6 +443,24 @@ fn compressed_aaaa_answers_expand_past_the_syslog_budget() {
 }
 
 #[test]
+fn unrenderable_answer_data_keeps_the_event_without_answers() {
+    let mut response = query();
+    response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+    response[6..8].copy_from_slice(&1u16.to_be_bytes());
+    // Five RDATA bytes form a valid record boundary but not an IPv4 address.
+    response.extend_from_slice(&[0xc0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 5, 192, 0, 2, 1, 9]);
+    let value = encode(&entry(response), "instance:1").unwrap();
+    assert_eq!(value["rcode"], "NOERROR");
+    assert_eq!(value["answers"], json!(null));
+    assert_eq!(value["answers_omitted"], "invalid");
+    assert_eq!(value["answer_ips"], json!([]));
+    assert_eq!(
+        value["message"],
+        "DNS 192.0.2.8 audit.example. A IN: NOERROR answers=invalid"
+    );
+}
+
+#[test]
 fn optional_cee_prefix_counts_toward_the_whole_message_limit() {
     let identity = identity();
     let time = SystemTime::UNIX_EPOCH;

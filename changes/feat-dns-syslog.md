@@ -8,3 +8,4 @@ Added
 - Emit a fixed RFC 5424 header and JSON schema; optionally prefix CEE with `global.syslog_cee_enabled` (default false), and reject obsolete format-template settings.
 - Preserve final-upstream and response-source metadata when a concurrent DNS query reuses an in-flight result without a cache hit, including stale-cache fallback.
 - Include a readable `message` in DNS audit JSON so CEE syslog receivers can display each event; VictoriaLogs maps it to `_msg` instead of using its missing-message placeholder.
+- Keep the DNS audit event when a delivered response's answers cannot be rendered, with `answers: null` and the reason in `answers_omitted`.

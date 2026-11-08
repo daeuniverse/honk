@@ -82,6 +82,7 @@ in the example above, to prefix `@cee: ` for a CEE-aware receiver:
   "answers": [
     {"name":"example.com.","type":"A","class":"IN","ttl":60,"data":"203.0.113.20"}
   ],
+  "answers_omitted": null,
   "answer_ips": ["203.0.113.20"],
   "answer_cnames": [],
   "answer_types": ["A"]
@@ -100,7 +101,11 @@ Complete answers retain owner, type, class, TTL and data, including unknown type
 as RFC 3597 text. Honk derives three arrays, deduplicated in first-occurrence order:
 `answer_ips` takes A/AAAA data, `answer_cnames` takes CNAME target data and
 `answer_types` takes all types. Missing matches produce empty arrays. Original
-answers are not removed or rewritten. TC describes the actual client response,
+answers are not removed or rewritten. Response validation checks record boundaries,
+not every record's data, so a delivered response can still be unrenderable; its
+event keeps the other fields with `answers: null`, empty arrays and
+`answers_omitted: "invalid"` (`"budget"` if the projection would exceed the event
+limit). Otherwise `answers_omitted` is null. TC describes the actual client response,
 possibly limited by its UDP advertisement. Capture precedes reply I/O and does not
 prove client receipt. Process UUID changes on restart; sequence identifies generated
 events, not requests dropped before admission or proof of losslessness.
@@ -126,8 +131,10 @@ One asynchronous task lazily creates and reuses one TCP connection. Batches targ
 128 KiB or flush one second after their first prepared frame; arrivals never reset
 that deadline. A single event above the batch target is sent whole in its own batch.
 Complete RFC 5424 messages are limited to 4 MiB, with a finite projection budget before
-answer allocation and capped serialization. Oversized events are rejected whole and
-counted, never silently clipped. These are initial parameters, not a throughput claim.
+answer allocation and capped serialization. Answers over the projection budget are
+omitted as described above; a message still above the limit is rejected whole and
+counted. Answers are never silently clipped. These are initial parameters, not a
+throughput claim.
 
 ## Admission and failures
 

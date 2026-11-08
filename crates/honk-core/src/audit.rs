@@ -258,13 +258,19 @@ fn timestamp(time: SystemTime) -> String {
 fn encode(entry: &Entry, id: &str) -> Result<serde_json::Value, presentation::ProjectionError> {
     let question = presentation::question(&entry.query, entry.ingress)?;
     let mut budget = MAX_EVENT_BYTES;
-    let answers = entry
-        .response
-        .as_deref()
-        .map(|response| presentation::project(&entry.query, response, entry.ingress, &mut budget))
-        .transpose()?
-        .unwrap_or_default();
-    let (answer_ips, answer_cnames, answer_types) = answer_indexes(&answers);
+    // Strict response admission validates record boundaries, not every RDATA, so a
+    // delivered response may still be unrenderable; the query is audited regardless.
+    let (answers, omitted) =
+        match entry.response.as_deref().map(|response| {
+            presentation::project(&entry.query, response, entry.ingress, &mut budget)
+        }) {
+            None => (Some(Vec::new()), None),
+            Some(Ok(answers)) => (Some(answers), None),
+            Some(Err(presentation::ProjectionError::Invalid)) => (None, Some("invalid")),
+            Some(Err(presentation::ProjectionError::Budget)) => (None, Some("budget")),
+        };
+    let (answer_ips, answer_cnames, answer_types) =
+        answer_indexes(answers.as_deref().unwrap_or_default());
     let client_ip = entry.source.ip().to_canonical();
     let rcode = entry.response.as_deref().map(presentation::status);
     let message = format!(
@@ -274,7 +280,10 @@ fn encode(entry: &Entry, id: &str) -> Result<serde_json::Value, presentation::Pr
         question.rtype,
         question.class,
         rcode.as_deref().unwrap_or("cancelled"),
-        answers.len()
+        answers.as_ref().map_or_else(
+            || omitted.unwrap_or_default().to_owned(),
+            |answers| answers.len().to_string()
+        )
     );
     Ok(json!({
         "schema_version": 1, "event": "dns.query", "event_id": id,
@@ -288,7 +297,7 @@ fn encode(entry: &Entry, id: &str) -> Result<serde_json::Value, presentation::Pr
         "result": if entry.response.is_some() { "response" } else { "cancelled" },
         "rcode": rcode,
         "response_truncated": entry.response.as_deref().is_some_and(crate::dns::response::is_truncated),
-        "answers": answers,
+        "answers": answers, "answers_omitted": omitted,
         "answer_ips": answer_ips, "answer_cnames": answer_cnames, "answer_types": answer_types
     }))
 }
