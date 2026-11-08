@@ -147,6 +147,14 @@ routing {
 
 启动前必须准备与有效 bypass mark 精确匹配、优先于 `main` 的 RPDB rule，指向专用表；对每个已启用源地址族，该表都须有经过**未捕获** uplink 的默认路由。`so_mark_from_dae` 指定此 mark（示例为 `0x100`）；它不是 `CLASSIFIED_MARK`，也不能恢复已捕获的原始 skb。捕获的以太网端口必须完全无地址，包括 IPv6 link-local。Core transit 路由及邻居由内核 routing domain 管理。stock 内核 native continuation、非零 native rule mark、不支持的 socket/process 条件及 native local/wildcard listener 假设不会被悄悄替换成 Core 或 Endpoint；仅有 FIB Local 结果不足以证明本地 socket 归属。DNS53 仍走规范策略。
 
+捕获的物理根接口与 bypass 表中的以太网 uplink 必须处于管理 UP、独立且有 carrier
+的状态（`IFF_UP | IFF_LOWER_UP`）；捕获的逻辑接口仍须完全无地址。部分原生驱动
+首次挂载 XDP 程序时会重新协商 carrier。完成自身挂载后，honk 通过 netlink 通知
+仅等待捕获的物理根接口恢复 carrier，所有根接口及最终准入共用一个 10 秒 deadline。
+其他拓扑拒绝仍立即失败，包括管理 DOWN 或无 carrier 的 bypass uplink。carrier
+等待超时会指出接口名并报告 `no carrier after XDP attach`；启动失败保留现有 guard
+托管行为。后续链路通知仍会关闭捕获并要求重启。
+
 mark 专用表预检只证明**出站路由隔离**，不能证明远端网络不会非对称回程。
 自身未连接 UDP、分片、IPv4 options 和 IPv6 扩展头回复不会获得 connected-socket
 原生豁免；若进入捕获端口，仍按所选 packet policy 处理。必须把自身回程放在未捕获

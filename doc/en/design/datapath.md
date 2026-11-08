@@ -170,6 +170,17 @@ Use `direct: endpoint` to terminate Direct TCP/UDP through the existing packet E
 
 Before startup, provision an exact effective-bypass-mark RPDB rule before `main`, selecting a dedicated table with a default route for every enabled source-address family through an **uncaptured** uplink. `so_mark_from_dae` supplies that mark (the example uses `0x100`); it is not `CLASSIFIED_MARK` and cannot restore an original captured skb. Captured Ethernet ports must be unnumbered, including IPv6 link-local addresses. Core transit routes and neighbors belong in the kernel routing domain. Stock native continuation, nonzero native rule marks, unsupported socket/process predicates and native local/wildcard-listener assumptions are not silently translated to Core or Endpoint: a FIB Local result alone is not local-socket authority. DNS53 still follows canonical policy.
 
+Captured physical roots and bypass-table Ethernet uplinks must be administratively
+up, standalone and have carrier (`IFF_UP | IFF_LOWER_UP`); captured logical
+interfaces must remain unnumbered. Some native drivers renegotiate carrier when
+the first XDP program attaches. After its own attachments, honk waits on netlink
+notifications for only the captured physical roots to regain carrier, with one
+10-second deadline across all roots and final admission. Other topology refusals
+remain immediate, including a down or carrier-less bypass uplink. An expired
+carrier wait names the interface and reports `no carrier after XDP attach`;
+startup fails with the existing guard custody. Later link notifications still
+close capture and require restart.
+
 The marked-table preflight proves **output-route isolation**, not the remote network's
 asymmetric return path. Own unconnected UDP, fragmented replies, IPv4 options and
 IPv6 extension-header replies do not receive the connected-socket native exemption;

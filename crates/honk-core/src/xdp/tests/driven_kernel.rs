@@ -376,7 +376,8 @@ async fn start_runtime(
         .iter()
         .map(|realm| realm.ingress.ifindex)
         .collect();
-    let topology = Topology::admit(&indices, &logical, config.global.effective_so_mark())?;
+    let topology =
+        Topology::admit_after_xdp_attach(&indices, &logical, config.global.effective_so_mark())?;
     ensure!(topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts());
     // SAFETY: this is the same owned, stable Topology descriptor used by production run.
     runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;

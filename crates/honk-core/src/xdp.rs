@@ -1854,7 +1854,8 @@ pub(crate) async fn run(
             .iter()
             .map(|realm| realm.ingress.ifindex)
             .collect();
-        let topology = Topology::admit(&indices, &logical, config.global.effective_so_mark())?;
+        let topology =
+            Topology::admit_after_xdp_attach(&indices, &logical, config.global.effective_so_mark())?;
         ensure!(
             topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
             "XDP broadcast classification changed before publication"

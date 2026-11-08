@@ -254,9 +254,50 @@ impl Topology {
         captured_logical: &[u32],
         bypass_mark: u32,
     ) -> io::Result<Self> {
+        Self::admit_until(captured_physical, captured_logical, bypass_mark, None)
+    }
+
+    /// Native drivers may renegotiate carrier after their first XDP attachment.
+    pub fn admit_after_xdp_attach(
+        captured_physical: &[u32],
+        captured_logical: &[u32],
+        bypass_mark: u32,
+    ) -> io::Result<Self> {
         validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let fd = route_socket(false)?;
+        settle_xdp_carrier(
+            deadline,
+            |deadline| {
+                let watch = route_socket(true)?;
+                let current = snapshot(fd.as_fd(), Some(deadline))?;
+                let pending = current
+                    .pending_xdp_carrier(captured_physical, captured_logical, bypass_mark)?
+                    .map(|link| PendingCarrier {
+                        index: link.index,
+                        name: link.name,
+                    });
+                Ok((watch, pending))
+            },
+            |watch: OwnedFd, deadline| wait_netlink(watch.as_fd(), libc::POLLIN, deadline),
+            |deadline| {
+                Self::admit_until(captured_physical, captured_logical, bypass_mark, deadline)
+            },
+            Instant::now,
+        )
+    }
+
+    fn admit_until(
+        captured_physical: &[u32],
+        captured_logical: &[u32],
+        bypass_mark: u32,
+        deadline: Option<Instant>,
+    ) -> io::Result<Self> {
+        validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
+        check_xdp_admission_deadline(deadline)?;
         let fd = route_socket(true)?;
-        let snapshot = snapshot(fd.as_fd(), None)?;
+        let dump_fd = deadline.map(|_| route_socket(false)).transpose()?;
+        let snapshot = snapshot(dump_fd.as_ref().unwrap_or(&fd).as_fd(), deadline)?;
         snapshot.admit(captured_physical, captured_logical, bypass_mark)?;
         let (ipv4_broadcasts, broadcast_count) = snapshot.ipv4_broadcasts()?;
         let mut topology = Self {
@@ -268,6 +309,7 @@ impl Topology {
         if topology.check_changed()? {
             return Err(unsupported("routing topology changed during admission"));
         }
+        check_xdp_admission_deadline(deadline)?;
         Ok(topology)
     }
 
@@ -380,6 +422,68 @@ fn unsupported(message: &'static str) -> io::Error {
 
 fn malformed(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn check_xdp_admission_deadline(deadline: Option<Instant>) -> io::Result<()> {
+    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "XDP topology admission deadline expired",
+        ));
+    }
+    Ok(())
+}
+
+struct PendingCarrier {
+    index: u32,
+    name: Option<[u8; 16]>,
+}
+
+fn settle_xdp_carrier<W, T>(
+    deadline: Instant,
+    mut snapshot: impl FnMut(Instant) -> io::Result<(W, Option<PendingCarrier>)>,
+    mut wait: impl FnMut(W, Instant) -> io::Result<()>,
+    admit: impl FnOnce(Option<Instant>) -> io::Result<T>,
+    mut now: impl FnMut() -> Instant,
+) -> io::Result<T> {
+    let mut previous = None::<PendingCarrier>;
+    loop {
+        let (watch, pending) = snapshot(deadline).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut
+                && now() >= deadline
+                && let Some(link) = &previous
+            {
+                xdp_carrier_timeout(link)
+            } else {
+                error
+            }
+        })?;
+        let Some(link) = pending else {
+            return admit(Some(deadline));
+        };
+        if now() >= deadline {
+            return Err(xdp_carrier_timeout(&link));
+        }
+        wait(watch, deadline).map_err(|error| {
+            if error.kind() == io::ErrorKind::TimedOut {
+                xdp_carrier_timeout(&link)
+            } else {
+                error
+            }
+        })?;
+        previous = Some(link);
+    }
+}
+
+fn xdp_carrier_timeout(link: &PendingCarrier) -> io::Error {
+    let message = match &link.name {
+        Some(name) => format!(
+            "{}: no carrier after XDP attach",
+            String::from_utf8_lossy(name).trim_end_matches('\0')
+        ),
+        None => format!("ifindex {}: no carrier after XDP attach", link.index),
+    };
+    io::Error::new(io::ErrorKind::TimedOut, message)
 }
 
 fn u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {
@@ -841,7 +945,7 @@ impl Snapshot {
                 let arphrd = u16::from_ne_bytes([body[2], body[3]]);
                 let mut link = Link {
                     index,
-                    plain_up_ethernet: arphrd == 1 && flags & 0x10001 == 0x10001,
+                    plain_up_ethernet: arphrd == 1 && flags & 1 != 0,
                     loopback: flags & 8 != 0,
                     name: None,
                     mtu: None,
@@ -1496,11 +1600,35 @@ impl Snapshot {
         captured_logical: &[u32],
         bypass_mark: u32,
     ) -> io::Result<()> {
+        self.admit_with_carrier(captured_physical, captured_logical, bypass_mark, true)
+    }
+
+    fn pending_xdp_carrier(
+        &self,
+        captured_physical: &[u32],
+        captured_logical: &[u32],
+        bypass_mark: u32,
+    ) -> io::Result<Option<&Link>> {
+        self.admit_with_carrier(captured_physical, captured_logical, bypass_mark, false)?;
+        self.ipv4_broadcasts()?;
+        Ok(self.links.iter().find(|link| {
+            captured_physical.contains(&link.index) && link.flags & 0x10000 == 0
+        }))
+    }
+
+    fn admit_with_carrier(
+        &self,
+        captured_physical: &[u32],
+        captured_logical: &[u32],
+        bypass_mark: u32,
+        require_capture_carrier: bool,
+    ) -> io::Result<()> {
         for &index in captured_physical {
-            if !self
-                .links
-                .iter()
-                .any(|link| link.index == index && link.plain_up_ethernet)
+            if !self.links.iter().any(|link| {
+                link.index == index
+                    && link.plain_up_ethernet
+                    && (!require_capture_carrier || link.flags & 0x10000 != 0)
+            })
             {
                 return Err(unsupported(
                     "capture requires unnumbered, up, standalone Ethernet roots",
@@ -1582,7 +1710,10 @@ impl Snapshot {
                     || route.kind != 1
                     || captured_logical.contains(&route.output)
                     || !self.links.iter().any(|link| {
-                        link.index == route.output && link.plain_up_ethernet && !link.loopback
+                        link.index == route.output
+                            && link.plain_up_ethernet
+                            && link.flags & 0x10000 != 0
+                            && !link.loopback
                     })
                 {
                     return Err(unsupported(
@@ -1940,6 +2071,177 @@ mod tests {
                 xdp_route(2, 254, 2, false, 1),
             ],
         }
+    }
+
+    #[test]
+    fn xdp_attach_carrier_settle_preserves_strict_admission() {
+        let link_body = |index: u32, flags: u32| {
+            let mut body = vec![0; 16];
+            body[2..4].copy_from_slice(&1u16.to_ne_bytes());
+            body[4..8].copy_from_slice(&index.to_ne_bytes());
+            body[8..12].copy_from_slice(&flags.to_ne_bytes());
+            attribute(&mut body, 3, b"dut0\0");
+            body
+        };
+        for flags in [1, 0x10001, 0x10000, 0] {
+            let mut current = topology();
+            current.push(16, &link_body(2, flags)).unwrap();
+            current.links[0] = current.links.pop().unwrap();
+            assert_eq!(current.admit(&[2], &[2], 128).is_ok(), flags == 0x10001);
+            let pending = current.pending_xdp_carrier(&[2], &[2], 128);
+            if flags & 1 == 0 {
+                assert!(pending.is_err(), "admin-down roots cannot wait for carrier");
+            } else if flags & 0x10000 == 0 {
+                let link = pending.unwrap().expect("attached root must await carrier");
+                assert_eq!(link.index, 2);
+                let error = xdp_carrier_timeout(&PendingCarrier {
+                    index: link.index,
+                    name: link.name,
+                });
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert_eq!(error.to_string(), "dut0: no carrier after XDP attach");
+            } else {
+                assert!(pending.unwrap().is_none());
+            }
+        }
+        for mutation in 0..7 {
+            let mut current = topology();
+            let mut body = link_body(2, 1);
+            match mutation {
+                0 => attribute(&mut body, 10, &9u32.to_ne_bytes()),
+                1 => {
+                    let mut info = Vec::new();
+                    attribute(&mut info, 1, b"vlan\0");
+                    attribute(&mut body, 18, &info);
+                }
+                2 => body[2..4].copy_from_slice(&0xfffeu16.to_ne_bytes()),
+                3 => current.addresses.push(xdp_address(2, 2)),
+                4 => {
+                    current.push(16, &link_body(3, 1)).unwrap();
+                    current.links[1] = current.links.pop().unwrap();
+                }
+                5 => current.rules[1].mask = 255,
+                _ => {
+                    for subnet in 0..=MAX_BROADCASTS {
+                        let mut route =
+                            local_route_body(2, 32, 3, Some(&[192, 0, subnet as u8, 255]));
+                        route[24..28].copy_from_slice(&3u32.to_ne_bytes());
+                        current.push(24, &route).unwrap();
+                    }
+                }
+            }
+            current.push(16, &body).unwrap();
+            current.links[0] = current.links.pop().unwrap();
+            assert!(
+                current.pending_xdp_carrier(&[2], &[2], 128).is_err(),
+                "non-carrier refusal {mutation} must be immediate"
+            );
+        }
+        let mut current = topology();
+        current.push(16, &link_body(4, 1)).unwrap();
+        assert!(current.pending_xdp_carrier(&[2], &[2], 128).unwrap().is_none());
+    }
+
+    #[test]
+    fn xdp_attach_settle_coordinator_preserves_deadline_and_failures() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(10);
+        let reads = std::cell::Cell::new(0);
+        let mut waited = Vec::new();
+        settle_xdp_carrier(
+            deadline,
+            |seen| {
+                assert_eq!(seen, deadline);
+                let stage = reads.get();
+                reads.set(stage + 1);
+                let mut current = topology();
+                current.links.push(xdp_link(4, true, false));
+                if stage == 0 {
+                    current.links[0].flags = 1;
+                }
+                if stage < 2 {
+                    current.links[2].flags = 1;
+                }
+                let pending = current
+                    .pending_xdp_carrier(&[2, 4], &[2, 4], 128)?
+                    .map(|link| PendingCarrier {
+                        index: link.index,
+                        name: link.name,
+                    });
+                let notification = pending.as_ref().map_or(0, |link| link.index);
+                Ok((notification, pending))
+            },
+            |notification, seen| {
+                assert_eq!(seen, deadline);
+                waited.push(notification);
+                Ok(())
+            },
+            |seen| {
+                assert_eq!(seen, Some(deadline));
+                Ok(())
+            },
+            || start,
+        )
+        .unwrap();
+        assert_eq!(waited, [2, 4]);
+        assert_eq!(reads.get(), 3);
+
+        let reads = std::cell::Cell::new(0);
+        let clock = std::cell::Cell::new(start);
+        let error = settle_xdp_carrier::<_, ()>(
+            deadline,
+            |seen| {
+                assert_eq!(seen, deadline);
+                reads.set(reads.get() + 1);
+                if reads.get() == 1 {
+                    Ok((
+                        (),
+                        Some(PendingCarrier {
+                            index: 2,
+                            name: Some(interface_name(b"dut0").unwrap()),
+                        }),
+                    ))
+                } else {
+                    clock.set(deadline);
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "topology dump deadline expired",
+                    ))
+                }
+            },
+            |(), seen| {
+                assert_eq!(seen, deadline);
+                Ok(())
+            },
+            |_| panic!("expired resnapshot must not reach final admission"),
+            || clock.get(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "dut0: no carrier after XDP attach");
+
+        let error = settle_xdp_carrier::<_, ()>(
+            deadline,
+            |_| Ok(((), None)),
+            |(), _| panic!("ready roots must not wait"),
+            |seen| {
+                assert_eq!(seen, Some(deadline));
+                Err(unsupported("routing topology changed during admission"))
+            },
+            || start,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(error.to_string(), "routing topology changed during admission");
+    }
+
+    #[test]
+    fn xdp_final_admission_preserves_expired_startup_deadline() {
+        let error = Topology::admit_until(&[2], &[2], 128, Some(Instant::now()))
+            .err()
+            .expect("expired startup must fail before opening a topology socket");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(error.to_string(), "XDP topology admission deadline expired");
     }
 
     #[test]
