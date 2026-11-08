@@ -18,7 +18,7 @@ fn audited_controller(
         )),
         limit,
     );
-    let mut service = base.dns_service().clone();
+    let mut service = base.dns_service();
     service.audit = audit;
     (
         Arc::new(DnsController::new_with_service(service, backend, limit)),

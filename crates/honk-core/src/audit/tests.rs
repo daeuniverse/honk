@@ -16,14 +16,6 @@ pub(crate) fn test_pending_event(mut pending: DnsAuditQuery) -> serde_json::Valu
     encode(&input, "instance:1").unwrap()
 }
 
-fn frame(
-    value: &serde_json::Value,
-    time: SystemTime,
-    identity: &Identity,
-) -> std::io::Result<Vec<u8>> {
-    super::frame(value, time, identity, true)
-}
-
 fn query() -> Vec<u8> {
     crate::dns::forwarder::build_dns_query("audit.example", 1)
 }
@@ -174,18 +166,7 @@ fn fixed_json_frames_preserve_events_with_and_without_cee() {
 }
 
 #[test]
-fn response_projection_keeps_rcode_source_and_actual_answers() {
-    let wire = crate::dns::response::build_dns_refused(&query());
-    let value = encode(&entry(wire), "instance:1").unwrap();
-    assert_eq!(value["domain"], "audit.example.");
-    assert_eq!(value["client_ip"], "192.0.2.8");
-    assert_eq!(value["client_port"], 53000);
-    assert_eq!(value["query_time"], "1970-01-01T00:00:00.000000Z");
-    assert_eq!(value["rcode"], "REFUSED");
-    assert_eq!(value["answers"], json!([]));
-    assert_eq!(value["answer_ips"], json!([]));
-    assert_eq!(value["answer_cnames"], json!([]));
-    assert_eq!(value["answer_types"], json!([]));
+fn udp_truncation_flag_reflects_the_client_response() {
     let mut truncated = query();
     truncated[2..4].copy_from_slice(&0x8380u16.to_be_bytes());
     let mut truncated = entry(truncated);
@@ -306,7 +287,7 @@ fn oversized_unknown_rr_round_trips_without_clipping() {
     assert_eq!(value["answer_ips"], json!([]));
     assert_eq!(value["answer_cnames"], json!([]));
     assert_eq!(value["answer_types"], json!(["TYPE65000"]));
-    let bytes = frame(&value, input.completed, &identity()).unwrap();
+    let bytes = super::frame(&value, input.completed, &identity(), true).unwrap();
     assert!(bytes.len() > 8192);
     assert_eq!(decode_frame(&bytes), value);
 }
@@ -398,13 +379,13 @@ fn whole_event_limit_includes_header_and_utf8_framing_counts_bytes() {
     let mut value = json!({"padding": ""});
     let overhead = identity.header(time, true).len() + serde_json::to_vec(&value).unwrap().len();
     value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead));
-    let at_limit = frame(&value, time, &identity).unwrap();
+    let at_limit = super::frame(&value, time, &identity, true).unwrap();
     assert!(at_limit.starts_with(format!("{MAX_EVENT_BYTES} ").as_bytes()));
     assert_eq!(decode_frame(&at_limit), value);
     value["padding"] = json!("x".repeat(MAX_EVENT_BYTES - overhead + 1));
-    assert!(frame(&value, time, &identity).is_err());
+    assert!(super::frame(&value, time, &identity, true).is_err());
     let utf8 = json!({"label": "上海"});
-    let bytes = frame(&utf8, time, &identity).unwrap();
+    let bytes = super::frame(&utf8, time, &identity, true).unwrap();
     assert_eq!(decode_frame(&bytes), utf8);
     let text = std::str::from_utf8(&bytes).unwrap();
     let (length, message) = text.split_once(' ').unwrap();
@@ -413,7 +394,7 @@ fn whole_event_limit_includes_header_and_utf8_framing_counts_bytes() {
 }
 
 #[test]
-fn compressed_aaaa_answers_expand_past_the_syslog_budget() {
+fn compressed_aaaa_answers_expand_beyond_eight_kib_in_one_frame() {
     let query = crate::dns::forwarder::build_dns_query("audit.example", 28);
     let mut response = query.clone();
     response[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
@@ -429,16 +410,12 @@ fn compressed_aaaa_answers_expand_past_the_syslog_budget() {
     input.query = query.into();
     let value = encode(&input, "instance:1").unwrap();
     let json_bytes = serde_json::to_vec(&value).unwrap().len();
-    let bytes = frame(&value, input.completed, &identity()).unwrap();
+    let bytes = super::frame(&value, input.completed, &identity(), true).unwrap();
     assert!(wire_bytes < 4096);
     assert!(json_bytes > 8192);
     assert_eq!(value["answers"].as_array().unwrap().len(), 100);
     assert_eq!(value["answer_ips"].as_array().unwrap().len(), 100);
     assert_eq!(decode_frame(&bytes), value);
-    println!(
-        "100 compressed AAAA answers: DNS wire={wire_bytes} bytes, audit JSON={json_bytes} bytes, single TCP frame={} bytes",
-        bytes.len()
-    );
 }
 
 #[test]

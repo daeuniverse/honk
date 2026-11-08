@@ -29,18 +29,9 @@ impl Sink {
                 .unwrap()
                 .parse()
                 .unwrap();
-            let message = std::str::from_utf8(&rest[split + 1..split + 1 + length]).unwrap();
-            events.push(
-                serde_json::from_str(
-                    message
-                        .splitn(8, ' ')
-                        .nth(7)
-                        .unwrap()
-                        .strip_prefix("@cee: ")
-                        .unwrap_or(message.splitn(8, ' ').nth(7).unwrap()),
-                )
-                .unwrap(),
-            );
+            events.push(crate::audit::tests::decode_message(
+                &rest[split + 1..split + 1 + length],
+            ));
             rest = &rest[split + 1 + length..];
         }
         events
@@ -343,7 +334,8 @@ async fn one_large_dns_event_is_sent_whole_in_its_own_batch() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["event"], "dns.query");
     assert_eq!(events[0]["answers"].as_array().unwrap().len(), 1);
-    assert!(events[0]["answers"][0]["data"].as_str().unwrap().len() > BATCH_BYTES);
+    let chunk = format!("\"{}\"", "\\255".repeat(255));
+    assert_eq!(events[0]["answers"][0]["data"], vec![chunk; 200].join(" "));
     assert_eq!(events[0]["answer_types"], json!(["TXT"]));
     assert_eq!(sink.writes.load(Ordering::Relaxed), 1);
     worker.shutdown().await;
