@@ -21,3 +21,4 @@ Added
 - Dispatch simulator application work by actual per-flow readiness, retaining shared-budget writer wakeups, deferred acceptance and complete byte/FIN checks without sweeping unrelated flows.
 - Use BoringSSL SHA-256 for the process executable identity while retaining the full-image digest. In a native dev opt0/debug0 diagnostic on a 182,685,912-byte VM daemon image, measured hash work was 2.9553/2.9556 s with sha2 and 0.0996/0.0995 s with boring; this does not measure VM 9p or production throughput.
 - Add a separate ignored recent-kernel igb adaptive-ZeroCopy entry that reuses the complete Copy owner/clock/fairness/accounting/live-feature fixture under the same 45-second deadline, with actual driver and per-queue bind receipts for every owner reconstruction and the existing joined-cleanup frontier.
+- Keep loopback UDP reply ports reserved across shared-source endpoint retirement and recreation in the control tests.

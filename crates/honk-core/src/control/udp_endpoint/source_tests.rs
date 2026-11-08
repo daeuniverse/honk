@@ -51,11 +51,14 @@ impl UdpReplySocketFactory for SourceReplySocketFactory {
                 "unreserved test scope",
             ));
         }
+        // Keep the source reserved across endpoint retirement and recreation.
         let socket = self
             .sockets
             .lock()
-            .get_mut(&source)
-            .and_then(VecDeque::pop_front);
+            .get(&source)
+            .and_then(VecDeque::front)
+            .map(std::net::UdpSocket::try_clone)
+            .transpose()?;
         let socket = match socket {
             Some(socket) => socket,
             None => std::net::UdpSocket::bind(source)?,
