@@ -118,6 +118,107 @@ fn dns_rows(detail: &serde_json::Value) -> Vec<&serde_json::Value> {
 }
 
 #[tokio::test]
+async fn node_subtag_selection_marks_only_executed_predicates_partial() {
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RoutingProjectionSnapshot,
+        RuntimeGeneration,
+    };
+
+    let config = honk_config::parser::parse_dae_config(
+        "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n }\n}\n",
+    )
+    .unwrap()
+    .dns;
+    let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+    let pool = Arc::new(UpstreamPool::new(&[], router.clone()).unwrap());
+    let forwarder = Arc::new(
+        DnsForwarder::new(
+            pool.clone(),
+            Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+            router,
+        )
+        .with_node_hosts(
+            [
+                ("node.private.example", "MyAirport"),
+                ("node.public.example", "MyAirport"),
+                ("other.private.example", "Other"),
+            ]
+            .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
+            .into(),
+        ),
+    );
+    let runtime = DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(7),
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            7,
+            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
+        )),
+        outbound_runtime: None,
+        transport: pool,
+    });
+    let provider = Arc::new(DnsServiceProvider::new(runtime));
+    let service = DnsService::with_provider(provider.clone());
+    let pinned = service.pin_name_resolution().unwrap();
+    let hook = crate::dns::node_host::resolver(&service);
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ));
+
+    assert!(hook.lookup("node.private.example").is_some());
+    provider.begin_pause();
+    for (host, claimed, evaluated) in [
+        ("node.private.example", true, true),
+        ("node.public.example", false, true),
+        ("other.private.example", false, true),
+        ("unindexed.private.example", false, false),
+    ] {
+        for path in ["preflight", "paused", "pinned"] {
+            let (flow, observation) = observer(&store);
+            assert_eq!(detail(&store, &flow)["trace_status"], "complete");
+            match path {
+                "preflight" => assert_eq!(
+                    observation.sync_scope(|| hook.lookup(host).is_some()),
+                    claimed,
+                ),
+                "paused" => {
+                    let result = observation.scope(service.resolve_node_host(host)).await;
+                    assert_eq!(result.is_err(), claimed);
+                    if !claimed {
+                        assert!(result.unwrap().is_none());
+                    }
+                }
+                "pinned" => {
+                    assert!(
+                        observation
+                            .scope(pinned.resolve_node_server(host))
+                            .await
+                            .is_err()
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let view = detail(&store, &flow);
+            let expected = if evaluated { "partial" } else { "complete" };
+            assert_eq!(view["trace_status"], expected, "{host} {path}: {view:#}");
+            assert_eq!(view["trace"]["status"], expected);
+            assert_eq!(
+                view["trace"]["missing"],
+                if evaluated {
+                    serde_json::json!(["not_instrumented"])
+                } else {
+                    serde_json::json!([])
+                },
+            );
+        }
+    }
+    drop(pinned);
+    provider.finish_pause().await.unwrap();
+}
+
+#[tokio::test]
 async fn source_policy_cache_and_verification_ignore_dns_log_toggle() {
     let (service, store, api, gate, mut calls, server) = fixture().await;
     let (flow, observer) = observer(&store);

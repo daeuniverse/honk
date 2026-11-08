@@ -758,6 +758,9 @@ impl DnsRouter {
         domain: &str,
         subscriptions: &[String],
     ) -> Option<&str> {
+        use honk_outbound::runtime::flow_observation::{self, FlowEvent, GapReason};
+
+        let mut observer = flow_observation::current();
         let evaluation = Evaluation::node_host(domain, subscriptions);
         self.request_rules
             .iter()
@@ -766,7 +769,12 @@ impl DnsRouter {
                     .iter()
                     .any(|condition| matches!(condition, matcher::CompiledCond::Subtag { .. }))
             })
-            .find(|rule| eval_conditions(&rule.conditions, &evaluation))
+            .find(|rule| {
+                if let Some(observer) = observer.take() {
+                    observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
+                }
+                eval_conditions(&rule.conditions, &evaluation)
+            })
             .and_then(|rule| request_upstream(&rule.action))
     }
 }

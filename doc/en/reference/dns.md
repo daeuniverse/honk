@@ -179,6 +179,7 @@ dns {
 - Claims are hostname-based, not an end-to-end download destination policy. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
 - The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`; otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
 - The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
+- Native flow traces report `partial` with `not_instrumented` when these rules are evaluated: the node-host rule decision is not captured.
 
 ### Request actions
 
