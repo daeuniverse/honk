@@ -174,7 +174,7 @@ Do not treat dated pass counts as repository status; use current command output 
 
 DNS syslog auditing is a default-off `dns-syslog` feature, independent of API
 features. Builds without it use zero-sized audit hooks and reject enabled audit
-at startup. Configuration and wire contracts: `.agents/rules/configuration.md`.
+at startup. Wire contract: `doc/en/design/dns-syslog.md`; implementation rules: `.agents/rules/configuration.md`.
 
 `just test-ci` requires `cargo-nextest` and selects `.config/nextest.toml`'s `ci` profile: no retries, a three-minute per-test timeout and no fail-fast. JUnit is written to `target/nextest/ci/junit.xml`; CI uploads it on failure. Plain `cargo test` remains supported.
 

@@ -118,7 +118,7 @@ The `honk-tool` CLI toolbox (bin crate, diagnostics that don't belong in the eng
 - `geosite list [FILTER] | show <category> [--attr ATTR] | find <domain>` and `geoip list [FILTER] | show <code> | lookup <ip>` — offline content search of geosite.dat/geoip.dat (one record per line, `--file PATH` overrides the default search). Without `--file`, honk-tool selects the first regular file from `$DAE_LOCATION_ASSET`, `/var/lib/honk`, legacy `/var/share/honk`, CWD, honk share directories, then dae asset locations; it does not load a config to discover a custom `global.data_dir`. Backed by the read-only scan API in `honk-core::routing` (`GeositeScan`/`GeoipScan`, including `@attr` decoding); `lookup` is longest-prefix. `--attr` uses the same key-presence predicate as routing's `category@attr` filter, so tool output and expansion agree.
 - honk-tool is a **static musl binary** for gateway deployment: build with the `build-musl` zig env (`ZIGCC_TARGET=x86_64-linux-musl` + ci wrappers) and scp — a gnu build fails to exec on VyOS.
 
-
+### DNS audit (`dns-syslog`)
 
 DNS audit is process-owned and independent of native observation. The honk-core
 `dns-syslog` Cargo feature defaults off and is independent of native/Clash APIs.
@@ -128,32 +128,23 @@ subsequent runtime/kernel setup; the common ControlPlane constructor also reject
 enablement before its owned side effects. Configuration parsing itself remains
 build-capability agnostic. Existing release capability sets do not imply audit.
 
-The restart-only settings are `global.syslog_dns_enabled` (default false), numeric
-`global.syslog_addr`, `global.syslog_cee_enabled` (default false),
-`global.syslog_hostname` (empty means system hostname) and `global.syslog_app_name`
-(default `honk`). Explicit identity fields obey RFC 5424 printable ASCII token
-limits (255/48 bytes); identity appears only in the RFC 5424 header, not in JSON. One marked TCP
-connection uses RFC 6587 octet counting, 128 KiB/1s batching, bounded raw admission
-(1024 events, 8 MiB) and a 4 MiB whole-message limit. Connect failures retain the
-current batch with bounded reconnect backoff; ambiguous failed writes are dropped
-without replay. There is no UDP, application acknowledgment, disk persistence or
-raw DNS relay inspection. Shared DNS presentation lives in
-`dns/response/presentation.rs`, compiled for either `native-api` or `dns-syslog`.
+User-facing defaults, limits, wire format and event schema live in
+[global reference](../../doc/en/reference/global.md) and
+[DNS audit design](../../doc/en/design/dns-syslog.md); change them there, not here.
+Shared DNS presentation lives in `dns/response/presentation.rs`, compiled for
+either `native-api` or `dns-syslog`.
 
-The wire format is fixed RFC 5424 (PRI 134, UTC completion time, configured
-identity, `- dns.query -`) followed by canonical JSON. `syslog_cee_enabled: true`
-adds only `@cee: ` before that JSON. Identity and mode are immutable worker state;
-entries carry no format snapshots or version permits, and reload adds no formatter
-publication locks. All five settings remain restart-only, including while audit
-is disabled. Removed `syslog_dns_template` and `syslog_dns_json` are rejected by
-presence in dae and structured loaders, including empty/false/null values. Hidden
-public unit guards preserve structured rejection without serializing obsolete
-settings; keep removed names recognized in dae so raw_fields cannot skip them.
+Implementation invariants:
 
-DNS audit JSON includes a nonempty `message` summary. CEE-aware VictoriaLogs
-syslog ingestion maps it to `_msg`; structured fields remain the audit query
-contract and the full-message cap includes any CEE marker and summary.
-Numeric `duration_ms` freezes monotonic frontend processing time at response
-readiness or cancellation, before response copies, reply I/O and sender queuing.
-`upstream` uses only the final outcome name, `cache` for normal/stale cache results,
-or null when no upstream metadata exists. Copied upstream bytes share the raw response admission budget.
+- All five `global.syslog_*` settings are restart-only, including while audit is
+  disabled. Identity and CEE mode are immutable worker state; entries carry no
+  format snapshots or version permits, and reload adds no formatter publication locks.
+- Removed `syslog_dns_template` and `syslog_dns_json` are rejected by presence in dae
+  and structured loaders, including empty/false/null values. Hidden public unit guards
+  preserve structured rejection without serializing obsolete settings; keep removed
+  names recognized in dae so raw_fields cannot skip them.
+- DNS admission never waits on audit; ambiguous failed writes are dropped, never
+  replayed. An unrenderable response still emits its event with `answers_omitted`.
+- `duration_ms` freezes at response readiness or cancellation, before response
+  copies, reply I/O and sender queuing. Copied upstream bytes share the raw response
+  admission budget.

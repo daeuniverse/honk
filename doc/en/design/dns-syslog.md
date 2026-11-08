@@ -26,7 +26,7 @@ global {
 
 IPv6 uses `[2001:db8::10]:514`. Audit defaults off; the destination defaults empty
 and must be a numeric unicast IP with nonzero port when enabled. Address, enabled
-state, CEE mode, hostname and app-name require restart. This implementation does not include an IP access recorder or its switch.
+state, CEE mode, hostname and app-name require restart.
 
 `syslog_hostname` defaults empty: read `/proc/sys/kernel/hostname` once at startup,
 remove one trailing LF and validate; unavailable/invalid values fall back to `-`.
@@ -123,8 +123,7 @@ independently framed events:
 ```
 
 The receiver must support octet counting. An HTTP JSON Lines endpoint cannot
-consume this protocol directly. There is no UDP output or application-level fragmentation. An event above 8192 bytes remains one whole frame: a test with 100 compressed
-AAAA answers yields a 2831-byte DNS response and about 10.3 kB of audit JSON. Repeated
+consume this protocol directly. There is no UDP output or application-level fragmentation. An event above 8192 bytes remains one whole frame up to the 4 MiB limit. Repeated
 keys, expanded names/search arrays, long TXT and binary/unknown data grow the JSON.
 
 One asynchronous task lazily creates and reuses one TCP connection. Batches target
@@ -186,15 +185,11 @@ and [message fields](https://docs.victoriametrics.com/victorialogs/keyconcepts/#
 
 ## Fixed format and configuration changes
 
-The RFC 5424 header layout and JSON field schema are fixed. CEE changes only the
-optional `@cee: ` prefix; the JSON fields and their types are identical in both
-modes. Leave `syslog_cee_enabled` false when the receiver does not support CEE,
-and configure its JSON parser as needed. There are no message templates, JSON
-templates, tags, format versions or CEF mode. Serialization runs in the background
-sender. Ordinary configuration reload does not change the event format or restart
-its TCP sender. Changing `syslog_addr`, `syslog_dns_enabled`, `syslog_cee_enabled`,
-`syslog_hostname` or `syslog_app_name` requires restart, even if audit is currently
-disabled.
+The header layout and JSON schema are fixed; see above. There are no message
+templates, JSON templates, tags, format versions or CEF mode. Serialization runs in
+the background sender, and ordinary configuration reload neither changes the event
+format nor restarts its TCP sender. The five settings require restart even while
+audit is disabled.
 
 ### Migration from earlier fork builds
 
