@@ -4,6 +4,7 @@ use super::app::{Driver, Plan, Role, StreamError, StreamIo};
 use super::engine::{Host, epoch};
 use super::smol::Family;
 use honk_netstack::{Config, FlowId, Stack, StreamError as NsError, TcpState};
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
@@ -71,6 +72,7 @@ fn map_err(e: NsError) -> StreamError {
 pub struct HonkHost {
     pub io: HonkTcp,
     pub app: Driver<FlowId>,
+    app_indices: HashMap<FlowId, usize>,
 }
 
 impl HonkHost {
@@ -94,8 +96,13 @@ impl HonkHost {
                 io.stack.tcp_connect(now, remote).expect("connect")
             })
             .collect();
+        let app_indices = ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
         let app = Driver::new(plan, Role::Client, ids, now);
-        HonkHost { io, app }
+        HonkHost {
+            io,
+            app,
+            app_indices,
+        }
     }
 
     pub fn close_all(&mut self) {
@@ -122,9 +129,9 @@ impl Host for HonkHost {
     }
 
     fn poll_app(&mut self, now: Instant) {
-        // The driver reads/writes every flow each wakeup, so readiness only needs draining here.
-        while self.io.stack.poll_event().is_some() {}
-        self.app.poll(&mut self.io, now);
+        while let Some((id, _ready)) = self.io.stack.poll_event() {
+            self.app.poll_flow(self.app_indices[&id], &mut self.io, now);
+        }
         self.io.stack.take_tx_wakeup();
     }
 }

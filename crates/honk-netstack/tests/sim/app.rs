@@ -152,86 +152,91 @@ impl<Id: Copy + Debug> Driver<Id> {
     }
 
     pub fn poll(&mut self, io: &mut impl StreamIo<Id = Id>, now: Instant) {
+        for i in 0..self.flows.len() {
+            self.poll_flow(i, io, now);
+        }
+    }
+
+    pub fn poll_flow(&mut self, i: usize, io: &mut impl StreamIo<Id = Id>, now: Instant) {
         let (send, recv) = self.plan.targets(self.role);
         let peer = match self.role {
             Role::Client => Role::Server,
             Role::Server => Role::Client,
         };
-        for (i, f) in self.flows.iter_mut().enumerate() {
-            f.connected |= io.connected(f.id);
-            if !f.connected || f.completed.is_some() {
-                continue;
+        let f = &mut self.flows[i];
+        f.connected |= io.connected(f.id);
+        if !f.connected || f.completed.is_some() {
+            return;
+        }
+        while !f.fin {
+            match io.read(f.id, &mut self.scratch) {
+                Ok(0) => {
+                    assert_eq!(f.received, recv, "{peer:?} flow {i}: premature FIN");
+                    f.fin = true;
+                }
+                Ok(n) => {
+                    assert!(
+                        f.received + n <= recv,
+                        "{peer:?} flow {i}: excess bytes (duplicate delivery)"
+                    );
+                    fill_pattern(
+                        &mut self.expected[..n],
+                        self.plan.pattern_seed(i, peer),
+                        f.received,
+                    );
+                    if let Some(j) = self.scratch[..n]
+                        .iter()
+                        .zip(&self.expected[..n])
+                        .position(|(a, b)| a != b)
+                    {
+                        panic!(
+                            "{peer:?} flow {i}: wrong byte at offset {}: {} != {} (gap, reorder or corruption)",
+                            f.received + j,
+                            self.scratch[j],
+                            self.expected[j]
+                        );
+                    }
+                    f.received += n;
+                }
+                Err(StreamError::WouldBlock) => break,
+                Err(e) => panic!(
+                    "{peer:?} flow {i}: read failed after {} bytes: {e:?}",
+                    f.received
+                ),
             }
-            while !f.fin {
-                match io.read(f.id, &mut self.scratch) {
-                    Ok(0) => {
-                        assert_eq!(f.received, recv, "{peer:?} flow {i}: premature FIN");
-                        f.fin = true;
-                    }
-                    Ok(n) => {
-                        assert!(
-                            f.received + n <= recv,
-                            "{peer:?} flow {i}: excess bytes (duplicate delivery)"
-                        );
-                        fill_pattern(
-                            &mut self.expected[..n],
-                            self.plan.pattern_seed(i, peer),
-                            f.received,
-                        );
-                        if let Some(j) = self.scratch[..n]
-                            .iter()
-                            .zip(&self.expected[..n])
-                            .position(|(a, b)| a != b)
-                        {
-                            panic!(
-                                "{peer:?} flow {i}: wrong byte at offset {}: {} != {} (gap, reorder or corruption)",
-                                f.received + j,
-                                self.scratch[j],
-                                self.expected[j]
-                            );
-                        }
-                        f.received += n;
-                    }
+        }
+        let can_reply = !matches!(self.role, Role::Server)
+            || !self.plan.response_after_request
+            || f.received == recv;
+        if can_reply {
+            while f.sent < send {
+                let n = self.scratch.len().min(send - f.sent);
+                fill_pattern(
+                    &mut self.scratch[..n],
+                    self.plan.pattern_seed(i, self.role),
+                    f.sent,
+                );
+                match io.write(f.id, &self.scratch[..n]) {
+                    Ok(0) => panic!("write returned zero for a nonempty buffer"),
+                    Ok(n) => f.sent += n,
                     Err(StreamError::WouldBlock) => break,
                     Err(e) => panic!(
-                        "{peer:?} flow {i}: read failed after {} bytes: {e:?}",
-                        f.received
+                        "{:?} flow {i}: write failed after {} bytes: {e:?}",
+                        self.role, f.sent
                     ),
                 }
             }
-            let can_reply = !matches!(self.role, Role::Server)
-                || !self.plan.response_after_request
-                || f.received == recv;
-            if can_reply {
-                while f.sent < send {
-                    let n = self.scratch.len().min(send - f.sent);
-                    fill_pattern(
-                        &mut self.scratch[..n],
-                        self.plan.pattern_seed(i, self.role),
-                        f.sent,
-                    );
-                    match io.write(f.id, &self.scratch[..n]) {
-                        Ok(0) => panic!("write returned zero for a nonempty buffer"),
-                        Ok(n) => f.sent += n,
-                        Err(StreamError::WouldBlock) => break,
-                        Err(e) => panic!(
-                            "{:?} flow {i}: write failed after {} bytes: {e:?}",
-                            self.role, f.sent
-                        ),
-                    }
-                }
-                if f.sent == send
-                    && !f.shutdown
-                    && (self.plan.fin_after_peer != Some(self.role) || f.fin)
-                {
-                    io.shutdown(f.id)
-                        .expect("shutdown after the application queued all bytes");
-                    f.shutdown = true;
-                }
+            if f.sent == send
+                && !f.shutdown
+                && (self.plan.fin_after_peer != Some(self.role) || f.fin)
+            {
+                io.shutdown(f.id)
+                    .expect("shutdown after the application queued all bytes");
+                f.shutdown = true;
             }
-            if f.shutdown && f.fin {
-                f.completed = Some(now);
-            }
+        }
+        if f.shutdown && f.fin {
+            f.completed = Some(now);
         }
     }
 

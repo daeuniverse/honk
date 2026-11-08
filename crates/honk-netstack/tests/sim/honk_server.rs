@@ -11,7 +11,7 @@ use honk_netstack::{
     AcceptOpts, AcceptWhen, Config, ExcludeSet, FlowId, Mode, Stack, StreamError as NsError,
     TcpState,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,7 @@ pub struct Audit {
 pub struct HonkServerIo {
     pub stack: Stack,
     ids: Vec<Option<FlowId>>,
+    app_indices: HashMap<FlowId, usize>,
     /// When each flow was reported by `poll_accept`.
     pub admitted: Vec<Option<Instant>>,
     closed: Vec<bool>,
@@ -157,13 +158,14 @@ impl HonkServerHost {
         let io = HonkServerIo {
             stack: Stack::new(cfg, epoch()),
             ids: vec![None; flows],
+            app_indices: HashMap::with_capacity(flows),
             admitted: vec![None; flows],
             closed: vec![false; flows],
-            held: Vec::new(),
+            held: Vec::with_capacity(flows),
             defer,
             per_source: opts.per_source,
             close_when_done: opts.close_when_done,
-            tuples: HashSet::new(),
+            tuples: HashSet::with_capacity(flows),
             audit: Audit::default(),
         };
         HonkServerHost {
@@ -222,6 +224,7 @@ impl Host for HonkServerHost {
             let i = io.index_of(info.client.ip(), info.original_dst.port());
             assert!(io.ids[i].is_none(), "flow {i} reported twice");
             io.ids[i] = Some(info.id);
+            io.app_indices.insert(info.id, i);
             io.admitted[i] = Some(now);
             io.tuples.insert((info.original_dst, info.client));
             let when = match io.defer {
@@ -243,20 +246,19 @@ impl Host for HonkServerHost {
                 )
                 .expect("accept");
         }
-        let (due, later): (Vec<_>, Vec<_>) = io.held.drain(..).partition(|&(_, at)| at <= now);
-        io.held = later;
-        for (id, _) in due {
+        io.held.retain(|&(id, at)| {
+            if at > now {
+                return true;
+            }
             io.stack.tcp_complete(id).expect("complete");
-        }
-        while io.stack.poll_event().is_some() {}
-        self.app.poll(&mut self.io, now);
-        let io = &mut self.io;
-        if io.close_when_done {
-            for (i, f) in self.app.flows.iter().enumerate() {
-                if f.completed.is_some() && !io.closed[i] {
-                    io.closed[i] = true;
-                    io.stack.tcp_close(io.ids[i].unwrap());
-                }
+            false
+        });
+        while let Some((id, _ready)) = io.stack.poll_event() {
+            let i = io.app_indices[&id];
+            self.app.poll_flow(i, io, now);
+            if io.close_when_done && self.app.flows[i].completed.is_some() && !io.closed[i] {
+                io.closed[i] = true;
+                io.stack.tcp_close(id);
             }
         }
         io.stack.take_tx_wakeup();
