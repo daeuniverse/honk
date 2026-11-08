@@ -179,7 +179,7 @@ dns {
 - 接管按域名生效，并非端到端的下载目标解析策略。下载为路由选择预先解析 URL 域名属于尽力获取信息；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守该规则。显式使用 bootstrap 解析器的下载绕过此 hook。
 - 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
-- 执行这些规则时，原生 flow trace 会以 `not_instrumented` 标记为 `partial`：节点域名的规则决策证据尚未采集。
+- 每个 DNS 代次根据订阅 tag 和有序规则预计算节点域名的策略结果，包括未匹配结果。使用这些结果时，原生 flow trace 会以 `not_instrumented` 标记为 `partial`：节点域名的规则决策证据尚未采集。
 
 ### Request 动作
 

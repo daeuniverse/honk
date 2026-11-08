@@ -750,6 +750,14 @@ impl DnsRouter {
         self.select_upstream_normalized(&domain.to_ascii_lowercase())
     }
 
+    pub(crate) fn has_node_rules(&self) -> bool {
+        self.request_rules.iter().any(|rule| {
+            rule.conditions
+                .iter()
+                .any(|condition| matches!(condition, matcher::CompiledCond::Subtag { .. }))
+        })
+    }
+
     /// The upstream of the first `subtag()` request rule matching a node's
     /// lowercase server host and subscription tags. Rules without `subtag()`
     /// never claim node hosts: those keep the bootstrap resolver.
@@ -758,9 +766,6 @@ impl DnsRouter {
         domain: &str,
         subscriptions: &[String],
     ) -> Option<&str> {
-        use honk_outbound::runtime::flow_observation::{self, FlowEvent, GapReason};
-
-        let mut observer = flow_observation::current();
         let evaluation = Evaluation::node_host(domain, subscriptions);
         self.request_rules
             .iter()
@@ -769,12 +774,7 @@ impl DnsRouter {
                     .iter()
                     .any(|condition| matches!(condition, matcher::CompiledCond::Subtag { .. }))
             })
-            .find(|rule| {
-                if let Some(observer) = observer.take() {
-                    observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
-                }
-                eval_conditions(&rule.conditions, &evaluation)
-            })
+            .find(|rule| eval_conditions(&rule.conditions, &evaluation))
             .and_then(|rule| request_upstream(&rule.action))
     }
 }

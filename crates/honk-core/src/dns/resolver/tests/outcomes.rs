@@ -426,43 +426,73 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
     // The response rule would send every provider answer through a proxied
     // upstream, whose dial could need this very node host.
     let mut config = honk_config::parser::parse_dae_config(
-        "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n  response {\n   upstream(providerdoh) -> proxied\n  }\n }\n}\n",
+        "dns {\n routing {\n  request {\n   qname(suffix: example) -> ordinary\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n   subtag(Shared) -> shared\n  }\n  response {\n   upstream(providerdoh) -> proxied\n  }\n }\n}\n",
     )
     .unwrap()
     .dns;
     config.strategy = DnsStrategy::Ipv4Only;
     let pool = Arc::new(NamedPool(std::sync::Mutex::default()));
+    let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("router"));
     let forwarder = Arc::new(
         DnsForwarder::new(
             pool.clone(),
             Arc::new(Mutex::new(DnsCache::new(32))),
-            Arc::new(DnsRouter::new_from_dns_config(&config).expect("router")),
+            router.clone(),
         )
         .with_strategy(config.strategy)
         .with_node_hosts(
             [
-                ("node.private.example", "MyAirport"),
-                ("node.public.example", "MyAirport"),
-                ("other.private.example", "Other"),
+                ("node.private.example", vec!["MyAirport"]),
+                ("shared.private.example", vec!["Shared", "MyAirport"]),
+                ("node.public.example", vec!["MyAirport"]),
+                ("other.private.example", vec!["Other"]),
             ]
             .into_iter()
-            .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
+            .map(|(host, tags)| {
+                (
+                    host.to_owned(),
+                    tags.into_iter().map(str::to_owned).collect(),
+                )
+            })
             .collect(),
         ),
     );
-    let service = DnsService::with_forwarder(forwarder);
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, DnsServiceProvider, RoutingProjectionSnapshot,
+        RuntimeGeneration,
+    };
+    let runtime = |generation, forwarder| {
+        DnsRuntime::new(DnsRuntimeParts {
+            generation: RuntimeGeneration::new(generation),
+            forwarder,
+            routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+                generation,
+                Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
+            )),
+            outbound_runtime: None,
+            transport: Arc::new(
+                crate::dns::upstream_pool::UpstreamPool::new(&[], router.clone()).unwrap(),
+            ),
+        })
+    };
+    let provider = Arc::new(DnsServiceProvider::new(runtime(1, forwarder)));
+    let service = DnsService::with_provider(provider.clone());
+    #[cfg(feature = "native-api")]
+    let pinned = service.pin_name_resolution().unwrap();
 
     for _ in 0..2 {
-        let addresses = service
-            .resolve_node_host("Node.Private.Example.")
-            .await
-            .expect("node host lookup")
-            .expect("claimed by the subtag rule");
-        assert_eq!(addresses.len(), 1);
+        for host in ["Node.Private.Example.", "shared.private.example"] {
+            let addresses = service
+                .resolve_node_host(host)
+                .await
+                .expect("node host lookup")
+                .expect("claimed by the first matching subtag rule");
+            assert_eq!(addresses.len(), 1);
+        }
     }
     assert_eq!(
         *pool.0.lock().unwrap(),
-        ["providerdoh", "providerdoh"],
+        ["providerdoh", "providerdoh", "providerdoh", "providerdoh"],
         "each lookup reaches only its own upstream and none is served from cache"
     );
     for unclaimed in [
@@ -479,7 +509,54 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
             "{unclaimed}"
         );
     }
-    assert_eq!(pool.0.lock().unwrap().len(), 2);
+    assert_eq!(pool.0.lock().unwrap().len(), 4);
+
+    let pending = service.resolve_node_host("node.private.example");
+    let replacement = Arc::new(
+        DnsForwarder::new(
+            pool.clone(),
+            Arc::new(Mutex::new(DnsCache::new(32))),
+            router.clone(),
+        )
+        .with_strategy(config.strategy)
+        .with_node_hosts(
+            [
+                ("node.private.example".to_owned(), vec!["Other".to_owned()]),
+                (
+                    "shared.private.example".to_owned(),
+                    vec!["Shared".to_owned()],
+                ),
+            ]
+            .into(),
+        ),
+    );
+    provider.publish(runtime(2, replacement));
+    assert!(pending.await.unwrap().is_none());
+    let hook = crate::dns::node_host::resolver(&service);
+    assert!(hook.lookup("node.private.example").is_none());
+    assert!(hook.lookup("shared.private.example").is_some());
+    assert!(
+        service
+            .resolve_node_host("shared.private.example")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(pool.0.lock().unwrap().last().unwrap(), "shared");
+    #[cfg(feature = "native-api")]
+    {
+        assert_eq!(
+            pinned
+                .resolve_node_server("node.private.example")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(pool.0.lock().unwrap().last().unwrap(), "providerdoh");
+        drop(pinned);
+    }
+    provider.shutdown().await;
 }
 
 #[tokio::test]

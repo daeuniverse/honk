@@ -6,6 +6,7 @@
 //! and returns the result.  It also supports background prefetch to
 //! warm the cache for frequently-accessed domains.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -151,9 +152,9 @@ pub struct DnsForwarder {
     /// `0` preserves the cached wire TTLs.
     pub(crate) stale_reply_ttl: u32,
     pub(crate) policy_id: Option<PolicyId>,
-    /// Server hosts of subscription nodes, to their subscription tags, in
-    /// this generation; empty unless a `subtag()` rule exists.
-    pub(crate) node_hosts: Arc<super::node_host::NodeHosts>,
+    /// Precomputed node-host policy decisions for this generation, including
+    /// indexed hosts declined by every `subtag()` rule; empty without one.
+    pub(crate) node_host_upstreams: Arc<HashMap<String, Option<String>>>,
     pub(crate) query_timeout: Duration,
     pub(crate) dial_timeout: Duration,
     socket_budget: super::transport::DnsSocketBudget,
@@ -185,7 +186,7 @@ impl DnsForwarder {
             cache_ttl: 0,
             stale_reply_ttl: 30,
             policy_id: None,
-            node_hosts: Arc::default(),
+            node_host_upstreams: Arc::default(),
             query_timeout: Duration::from_secs(5),
             dial_timeout: Duration::from_secs(10),
             socket_budget: super::transport::DnsSocketBudget::default(),
@@ -212,9 +213,24 @@ impl DnsForwarder {
         self
     }
 
-    /// Node server hosts that `subtag()` rules of this generation may claim.
+    /// Compile the node-host decisions of this generation's `subtag()` rules.
     pub(crate) fn with_node_hosts(mut self, node_hosts: super::node_host::NodeHosts) -> Self {
-        self.node_hosts = Arc::new(node_hosts);
+        if !node_hosts.is_empty() && self.routing.has_node_rules() {
+            self.node_host_upstreams = Arc::new(
+                node_hosts
+                    .into_iter()
+                    .map(|(host, tags)| {
+                        let upstream = self
+                            .routing
+                            .select_node_upstream(&host, &tags)
+                            .map(str::to_owned);
+                        (host, upstream)
+                    })
+                    .collect(),
+            );
+        } else {
+            self.node_host_upstreams = Arc::default();
+        }
         self
     }
 
@@ -374,7 +390,7 @@ impl DnsForwarder {
             cache_ttl: self.cache_ttl,
             stale_reply_ttl: self.stale_reply_ttl,
             policy_id: self.policy_id.clone(),
-            node_hosts: Arc::clone(&self.node_hosts),
+            node_host_upstreams: Arc::clone(&self.node_host_upstreams),
             query_timeout: self.query_timeout,
             dial_timeout: self.dial_timeout,
             socket_budget: self.socket_budget.clone(),

@@ -359,17 +359,20 @@ impl DnsService {
     /// Whether the current generation's `subtag()` rules claim `host`.
     pub(crate) fn claims_node_host(&self, host: &str) -> bool {
         let forwarder = self.forwarder();
-        !forwarder.node_hosts.is_empty()
+        !forwarder.node_host_upstreams.is_empty()
             && normalize_domain(host)
                 .is_ok_and(|domain| claimed_upstream(&forwarder, &domain).is_some())
     }
 }
 
 fn claimed_upstream<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<&'f str> {
-    let subscriptions = forwarder.node_hosts.get(domain)?;
-    forwarder
-        .routing
-        .select_node_upstream(domain, subscriptions)
+    use honk_outbound::runtime::flow_observation::{self, FlowEvent, GapReason};
+
+    let upstream = forwarder.node_host_upstreams.get(domain)?;
+    if let Some(observer) = flow_observation::current() {
+        observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
+    }
+    upstream.as_deref()
 }
 
 /// Query only `upstream` for a node server host: uncached like the bootstrap

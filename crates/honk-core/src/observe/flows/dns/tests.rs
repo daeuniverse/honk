@@ -124,6 +124,11 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
         RuntimeGeneration,
     };
 
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ));
     let config = honk_config::parser::parse_dae_config(
         "dns {\n routing {\n  request {\n   subtag(MyAirport) && qname(suffix: private.example) -> providerdoh\n  }\n }\n}\n",
     )
@@ -131,22 +136,26 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
     .dns;
     let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
     let pool = Arc::new(UpstreamPool::new(&[], router.clone()).unwrap());
-    let forwarder = Arc::new(
-        DnsForwarder::new(
-            pool.clone(),
-            Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
-            router,
+    let (compile_flow, compile_observation) = observer(&store);
+    let forwarder = compile_observation.sync_scope(|| {
+        Arc::new(
+            DnsForwarder::new(
+                pool.clone(),
+                Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+                router,
+            )
+            .with_node_hosts(
+                [
+                    ("node.private.example", "MyAirport"),
+                    ("node.public.example", "MyAirport"),
+                    ("other.private.example", "Other"),
+                ]
+                .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
+                .into(),
+            ),
         )
-        .with_node_hosts(
-            [
-                ("node.private.example", "MyAirport"),
-                ("node.public.example", "MyAirport"),
-                ("other.private.example", "Other"),
-            ]
-            .map(|(host, tag)| (host.to_owned(), vec![tag.to_owned()]))
-            .into(),
-        ),
-    );
+    });
+    assert_eq!(detail(&store, &compile_flow)["trace_status"], "complete");
     let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(7),
         forwarder,
@@ -161,11 +170,6 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
     let service = DnsService::with_provider(provider.clone());
     let pinned = service.pin_name_resolution().unwrap();
     let hook = crate::dns::node_host::resolver(&service);
-    let instance = Uuid::new_v4().to_string();
-    let store = Arc::new(FlowStore::new(
-        instance.clone(),
-        Arc::new(EventHub::new(instance)),
-    ));
 
     assert!(hook.lookup("node.private.example").is_some());
     provider.begin_pause();
@@ -216,6 +220,52 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
     }
     drop(pinned);
     provider.finish_pause().await.unwrap();
+}
+
+#[tokio::test]
+async fn node_hosts_without_subtag_rules_keep_complete_evidence() {
+    for rules in ["", "qname(suffix: example) -> ordinary"] {
+        let config = honk_config::parser::parse_dae_config(&format!(
+            "dns {{\n routing {{\n  request {{\n   {rules}\n  }}\n }}\n}}\n"
+        ))
+        .unwrap()
+        .dns;
+        let instance = Uuid::new_v4().to_string();
+        let store = Arc::new(FlowStore::new(
+            instance.clone(),
+            Arc::new(EventHub::new(instance)),
+        ));
+        let (flow, observation) = observer(&store);
+        let service = observation.sync_scope(|| {
+            let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+            DnsService::with_forwarder(Arc::new(
+                DnsForwarder::new(
+                    Arc::new(UpstreamPool::new(&[], router.clone()).unwrap()),
+                    Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+                    router,
+                )
+                .with_node_hosts(
+                    [("node.example".to_owned(), vec!["MyAirport".to_owned()])].into(),
+                ),
+            ))
+        });
+        let hook = crate::dns::node_host::resolver(&service);
+        assert!(
+            observation
+                .sync_scope(|| hook.lookup("node.example"))
+                .is_none()
+        );
+        assert!(
+            observation
+                .scope(service.resolve_node_host("node.example"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let view = detail(&store, &flow);
+        assert_eq!(view["trace_status"], "complete");
+        assert_eq!(view["trace"]["missing"], serde_json::json!([]));
+    }
 }
 
 #[tokio::test]
