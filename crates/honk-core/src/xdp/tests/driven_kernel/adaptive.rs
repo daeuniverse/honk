@@ -1128,14 +1128,50 @@ impl Rig {
         Ok((retired, state))
     }
 
-    /// Re-enable only the owned B capture link the frontier brought down, before fresh capture.
+    // igb can finish autonegotiation after administrative UP has returned.
     async fn restore_b_link(&self) -> anyhow::Result<()> {
-        owned_command(
-            &self.b_namespace,
-            &["ip", "link", "set", "dev", "dut2", "up"],
-        )
-        .await?;
-        Ok(())
+        within(self.deadline, "dut2 carrier recovery before owner restart", async {
+            owned_command(
+                &self.b_namespace,
+                &["ip", "link", "set", "dev", "dut2", "up"],
+            )
+            .await?;
+            loop {
+                let output = owned_command(
+                    &self.b_namespace,
+                    &["ip", "-j", "link", "show", "dev", "dut2"],
+                )
+                .await?;
+                let links: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+                let link = links
+                    .as_array()
+                    .and_then(|links| links.first())
+                    .context("owned dut2 is missing during carrier recovery")?;
+                ensure!(
+                    link["address"] == "02:00:00:00:00:12",
+                    "owned dut2 identity changed during carrier recovery: {link}"
+                );
+                let flags = link["flags"]
+                    .as_array()
+                    .context("owned dut2 has no flags during carrier recovery")?;
+                let operstate = link["operstate"]
+                    .as_str()
+                    .context("owned dut2 has no operstate during carrier recovery")?;
+                if flags.iter().any(|flag| flag == "UP")
+                    && flags.iter().any(|flag| flag == "LOWER_UP")
+                    && operstate == "UP"
+                {
+                    ensure!(
+                        Instant::now() < self.deadline,
+                        "dut2 carrier recovery completed after the original fixture deadline"
+                    );
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .context("waiting for owned dut2 carrier before owner restart")
     }
 }
 
