@@ -164,7 +164,10 @@ receiver persistence proof. Successful writes count as submitted, not confirmed 
 Shutdown immediately cancels connect/write/backoff, closes admission and discards
 pending work; the 1 s bound is a join/abort deadline, not a final-flush grace. Drop
 aborts the task; reload does not duplicate it. Shutdown reports dropped/invalid/
-submitted events and connect/write failures; operational warnings are throttled.
+submitted events and connect/write failures. A collector outage logs one WARN with
+the error when it begins and INFO when a later batch write succeeds; retries in
+between log at DEBUG. Queue-ceiling drops log a WARN at most every 10 s, and
+unencodable events log at DEBUG.
 No audit data is persisted locally. The receiver owns retention, rotation and search.
 
 ## Display message

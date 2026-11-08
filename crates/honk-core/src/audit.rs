@@ -93,6 +93,17 @@ impl Default for Admission {
     }
 }
 
+impl Admission {
+    fn saturated(&self, saturation: &'static str) {
+        self.counters.dropped.fetch_add(1, Ordering::Relaxed);
+        crate::logging::warn_throttled!(
+            saturation,
+            action = "drop",
+            "DNS syslog audit queue saturated"
+        );
+    }
+}
+
 struct Entry {
     started: SystemTime,
     completed: SystemTime,
@@ -144,7 +155,11 @@ impl DnsAudit {
         }
         let permit = match sender.clone().try_reserve_owned() {
             Ok(permit) => permit,
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.admission.saturated("slots");
+                return None;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
                 self.admission
                     .counters
                     .dropped
@@ -157,10 +172,7 @@ impl DnsAudit {
         {
             Ok(memory) => memory,
             Err(_) => {
-                self.admission
-                    .counters
-                    .dropped
-                    .fetch_add(1, Ordering::Relaxed);
+                self.admission.saturated("bytes");
                 return None;
             }
         };
@@ -211,10 +223,7 @@ impl DnsAuditQuery {
                     .ok()
             });
         let Some(memory) = memory else {
-            self.admission
-                .counters
-                .dropped
-                .fetch_add(1, Ordering::Relaxed);
+            self.admission.saturated("bytes");
             self.entry.take();
             self.permit.take();
             return;

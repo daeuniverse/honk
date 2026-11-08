@@ -93,12 +93,20 @@ impl<C: Connector> Transport<C> {
             }
             match tokio::time::timeout(IO_TIMEOUT, self.connector.connect()).await {
                 Ok(Ok(stream)) => self.stream = Some(stream),
-                _ => {
+                failure => {
                     self.admission
                         .counters
                         .connect_failed
                         .fetch_add(1, Ordering::Relaxed);
-                    crate::logging::warn_throttled!("DNS syslog TCP connection failed");
+                    let error = match failure {
+                        Ok(Err(error)) => error,
+                        _ => io::ErrorKind::TimedOut.into(),
+                    };
+                    crate::logging::warn_on_entry!(
+                        self.backoff == INITIAL_BACKOFF,
+                        %error,
+                        "DNS syslog TCP connection failed"
+                    );
                     self.failed();
                 }
             }
@@ -110,10 +118,13 @@ impl<C: Connector> Transport<C> {
                     .counters
                     .submitted
                     .fetch_add(batch.events, Ordering::Relaxed);
+                if self.backoff != INITIAL_BACKOFF {
+                    tracing::info!("DNS syslog TCP delivery recovered");
+                }
                 self.backoff = INITIAL_BACKOFF;
                 self.retry_at = None;
             }
-            _ => {
+            failure => {
                 self.admission
                     .counters
                     .send_failed
@@ -122,7 +133,13 @@ impl<C: Connector> Transport<C> {
                     .counters
                     .dropped
                     .fetch_add(batch.events, Ordering::Relaxed);
-                crate::logging::warn_throttled!(
+                let error = match failure {
+                    Ok(Err(error)) => error,
+                    _ => io::ErrorKind::TimedOut.into(),
+                };
+                crate::logging::warn_on_entry!(
+                    self.backoff == INITIAL_BACKOFF,
+                    %error,
                     "DNS syslog TCP batch write failed; discarding ambiguous batch"
                 );
                 self.failed();
@@ -184,8 +201,9 @@ async fn run<C: Connector>(
                 drop(entry);
                 let bytes = match encoded {
                     Ok(bytes) => bytes,
-                    Err(_) => {
+                    Err(error) => {
                         admission.counters.invalid.fetch_add(1, Ordering::Relaxed);
+                        tracing::debug!(%error, "DNS syslog event not encodable; dropped");
                         continue;
                     }
                 };
