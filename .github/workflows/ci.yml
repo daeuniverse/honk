@@ -319,7 +319,7 @@ jobs:
           dir=$(ci/fetch-doona.sh)
           echo "HONK_DOONA_DIR=$dir" >> "$GITHUB_ENV"
       - run: cargo fmt --all -- --check
-      - run: cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
+      - run: cargo clippy --all --all-targets --features honk-core/native-ui,honk-core/dns-syslog,honk-core/udp-bench,honk-core/dns-bench -- -D warnings
       - name: Write lint CI report
         if: always()
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
@@ -428,13 +428,24 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/ci-report
-          cargo nextest list --workspace --features honk-core/native-ui --profile ci --message-format json \
+          cargo nextest list --workspace --features honk-core/native-ui,honk-core/dns-syslog --profile ci --message-format json \
             > target/ci-report/nextest-list.json
       # Named first so a PR shows rule-matching failures on their own; the
       # root-gated kernel half runs in the ebpf lane from the same tables.
       - name: Routing rule-matching goldens
-        run: cargo nextest run -p honk-core --features native-ui --lib --profile ci --no-tests=fail -E 'test(/^routing::golden::/)'
-      - run: cargo nextest run --workspace --features honk-core/native-ui --profile ci
+        run: cargo nextest run -p honk-core --features native-ui,dns-syslog --lib --profile ci --no-tests=fail -E 'test(/^routing::golden::/)'
+      - run: cargo nextest run --workspace --features honk-core/native-ui,honk-core/dns-syslog --profile ci
+      - name: Test DNS syslog feature boundaries independently
+        run: |
+          set -euo pipefail
+          for test_name in audit_feature_tests::disabled_feature_uses_zero_sized_inert_hooks audit_feature_tests::enabling_without_feature_is_rejected_before_sender_start; do
+            test "$(cargo test -p honk-core --no-default-features --lib "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          done
+          cargo test -p honk-core --no-default-features --lib audit_feature_tests::
+          for test_name in audit::tests::fixed_json_frames_preserve_events_with_and_without_cee control::dns_control::tests::udp::transparent_udp_completion_is_exported_to_dns_syslog; do
+            test "$(cargo test -p honk-core --no-default-features --features dns-syslog --lib "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          done
+          cargo test -p honk-core --no-default-features --features dns-syslog --lib -- audit:: syslog
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -1372,6 +1383,7 @@ jobs:
           printf '%s' "$EBPF_TOOLCHAIN" > target/bpfel-unknown-none/release/honk-ebpf.toolchain
       - run: cargo check -p honk-core --no-default-features
       - run: cargo check -p honk-core --no-default-features --features udp-bench --bench udp_io
+      - run: cargo check -p honk-core --no-default-features --features dns-syslog
       - run: cargo check -p honk-core --no-default-features --features clash-api
       - run: cargo check -p honk-core --no-default-features --features native-api
       - run: cargo check -p honk-core --no-default-features --features native-api,clash-api

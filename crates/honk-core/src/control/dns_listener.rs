@@ -427,6 +427,7 @@ async fn run_udp_supervisor(
                         debug!(%client_addr, "standalone UDP DNS datagram has no reply source address");
                         continue;
                     };
+                    let audit = controller.dns_audit().begin_udp(query, client_addr);
                     #[cfg(feature = "native-api")]
                     let started = std::time::Instant::now();
                     let observation = crate::control::connection::observation::ConnectionObservation::begin(
@@ -436,6 +437,7 @@ async fn run_udp_supervisor(
 
                     if drain.should_reject() {
                         let refused = minimal_dns_error_response(query, 5);
+                        if let Some(audit) = audit { audit.finish(&refused, None); }
                         let operation = async { Ok(send_udp_refused(socket.as_ref(), &refused, response_source, client_addr).await) };
                         #[cfg(feature = "native-api")]
                         let operation = observe_bound_error(&observation, observer, query, client_addr, "draining", operation);
@@ -459,6 +461,7 @@ async fn run_udp_supervisor(
                                 stats.record_udp_slow_permit_rejected();
                             }
                             let refused = minimal_dns_error_response(query, 5);
+                            if let Some(audit) = audit { audit.finish(&refused, None); }
                             let operation = error.run_reply(send_udp_refused(socket.as_ref(), &refused, response_source, client_addr));
                             #[cfg(feature = "native-api")]
                             let operation = observe_bound_error(&observation, observer, query, client_addr, "admission_refused", operation);
@@ -470,6 +473,7 @@ async fn run_udp_supervisor(
                     };
                     let Some(validated) = validate_exact_dns_query(query) else {
                         let response = minimal_dns_error_response(query, 1);
+                        if let Some(audit) = audit { audit.finish(&response, None); }
                         let operation = admission.run_reply(send_bound_udp_response(
                             socket.as_ref(), &response, response_source, client_addr,
                         ));
@@ -497,6 +501,7 @@ async fn run_udp_supervisor(
                         let response = child_controller
                             .answer_query(&admission, &query, metadata, ingress)
                             .await;
+                        if let Some(audit) = audit { audit.finish(response.wire(), response.outcome()); }
                         match admission
                             .run_reply(send_bound_udp_response(
                                 child_socket.as_ref(),

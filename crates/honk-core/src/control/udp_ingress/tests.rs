@@ -2,6 +2,36 @@ use super::*;
 use crate::control::tests::support::{addr, bytes_of, dns_query_payload};
 use crate::dns::query::is_exact_dns_query;
 
+#[cfg(feature = "dns-syslog")]
+#[tokio::test]
+async fn transparent_udp_admission_captures_audit_before_dispatch() {
+    let mut config = honk_config::Config::default();
+    config.global.syslog_dns_enabled = true;
+    config.global.syslog_addr = "192.0.2.10:5514".into();
+    let plane = crate::control::tests::support::control_plane(config.clone());
+    let query = dns_query_payload();
+    let client = addr("192.0.2.8:53000");
+    let work = begin_udp_dns_query(
+        &plane.dns_controller,
+        &plane.stats,
+        DatagramPayload::Borrowed(&query),
+        validate_exact_dns_query(&query).unwrap(),
+        client,
+    );
+    let UdpSlowPathWork::Dns {
+        audit: Some(pending),
+        ..
+    } = work
+    else {
+        panic!("transparent DNS must capture audit before dispatch");
+    };
+    let event = crate::audit::tests::test_pending_event(pending);
+    assert_eq!(event["client_ip"], "192.0.2.8");
+    assert_eq!(event["client_port"], 53000);
+    assert_eq!(event["transport"], "udp");
+    assert_eq!(event["domain"], "a.com.");
+}
+
 #[test]
 fn udp_original_dst_unspecified_origdst_is_authoritative_and_fails_closed() {
     let meta = UdpRecvMeta {
@@ -193,6 +223,7 @@ async fn transparent_dns_refusal_records_flow_evidence_without_dns_log() {
         &plane.stats,
         DatagramPayload::Borrowed(&query),
         validate_exact_dns_query(&query).unwrap(),
+        addr("127.0.0.1:40000"),
     );
     assert!(matches!(work, UdpSlowPathWork::DnsRefused { .. }));
     loop_state.spawn_work(addr("127.0.0.1:40000"), addr("127.0.0.1:53"), work);

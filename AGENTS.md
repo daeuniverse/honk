@@ -146,9 +146,9 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 
 | Recipe                                                                          | Purpose                                                                                                                                                                                                                                      |
 | ------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `build` / `check` / `lint` / `fmt` / `fmt-check`                                              | `cargo build --release` / `check` / `clippy --all --all-targets --features honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench -- -D warnings` / `fmt --all` / `fmt --all -- --check`                                                                                                                                  |
+| `build` / `check` / `lint` / `fmt` / `fmt-check`                                              | `cargo build --release` / `check` / `clippy --all --all-targets --features honk-core/native-ui,honk-core/dns-syslog,honk-core/udp-bench,honk-core/dns-bench -- -D warnings` / `fmt --all` / `fmt --all -- --check`                                                                                                                                  |
 | `test-routing` | Complete pre-provisioned floor-kernel VM gate, including compiled routing goldens and failed-publication preservation; prerequisites in `honk-real-ebpf-tests` |
-| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full workspace; `test-ci` = nextest CI profile with `honk-core/native-ui`, per-test timeouts and JUnit; `test-core` = core + outbound unit/integration tests; `test-config` = config unit/integration tests; `test-ebpf` = honk-ebpf-common only) |
+| `test` / `test-ci` / `test-core` / `test-config` / `test-ebpf` | Test suites (`test` = full workspace; `test-ci` = nextest CI profile with `honk-core/native-ui,honk-core/dns-syslog`, per-test timeouts and JUnit; `test-core` = core + outbound unit/integration tests; `test-config` = config unit/integration tests; `test-ebpf` = honk-ebpf-common only) |
 | `test-netns` | Depends on `test-routing`, sharing its single disposable-VM run of routing, real NFQUEUE/eBPF, ownership, lifecycle and exact SO_MARK tests |
 | `outbound-ci` / `outbound-ci-e2e`                                               | honk-outbound gate (`ci/outbound-ci.sh`: fmt + clippy + honk-config & honk-outbound suites; `...-e2e` adds live hy2 e2e via `HONK_HY2_SERVER=`) — run after every outbound change                                                            |
 | `dns-ci`                                                                        | DNS subsystem gate (`ci/dns-ci.sh`: fmt + clippy + honk-config + honk-core dns/control + honk-outbound suites) — run after every DNS-path change                                                                                             |
@@ -171,6 +171,10 @@ Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.
 ## Current validation guidance
 
 Do not treat dated pass counts as repository status; use current command output and CI. `just test-routing` and `just test-netns` use the same complete pre-provisioned disposable-VM gate. The `routing-test` object, toolchain and VM environment must be prepared as documented in `honk-real-ebpf-tests`; do not substitute host execution or spoof VM markers.
+
+DNS syslog auditing is a default-off `dns-syslog` feature, independent of API
+features. Builds without it use zero-sized audit hooks and reject enabled audit
+at startup. Wire contract: `doc/en/design/dns-syslog.md`; implementation rules: `.agents/rules/configuration.md`.
 
 `just test-ci` requires `cargo-nextest` and selects `.config/nextest.toml`'s `ci` profile: no retries, a three-minute per-test timeout and no fail-fast. JUnit is written to `target/nextest/ci/junit.xml`; CI uploads it on failure. Plain `cargo test` remains supported.
 

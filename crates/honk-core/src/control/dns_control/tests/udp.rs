@@ -43,6 +43,7 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
             source,
             "[::1]:53".parse().unwrap(),
             crate::dns::query::validate_exact_dns_query(&query).unwrap(),
+            None,
         )
         .await;
     let response = api.log_page_for_test();
@@ -53,6 +54,35 @@ async fn native_log_captures_transparent_udp_completion_with_full_source() {
     assert_eq!(log["total"], 1);
     assert_eq!(log["records"][0]["src"], source.to_string());
     assert_eq!(log["records"][0]["answers"][0]["data"], "192.0.2.5");
+}
+
+#[cfg(feature = "dns-syslog")]
+#[tokio::test]
+async fn transparent_udp_completion_is_exported_to_dns_syslog() {
+    let (audit, mut worker, mut receiver) = crate::audit::tests::receiver().await;
+    let query = query_with_txid("example.com", 0x2222);
+    let (controller, _) = test_controller(a_response(&query, [192, 0, 2, 6]), Duration::ZERO);
+    let source: SocketAddr = "192.0.2.9:53001".parse().unwrap();
+    let validated = crate::dns::query::validate_exact_dns_query(&query).unwrap();
+    let pending = audit.begin(&query, validated.ingress(), source);
+    let admission = controller.try_admit_query(true).unwrap();
+    controller
+        .handle_udp_dns_admitted(
+            &admission,
+            &query,
+            source,
+            "127.0.0.1:53".parse().unwrap(),
+            validated,
+            pending,
+        )
+        .await;
+    let event = crate::audit::tests::receive(&mut receiver).await;
+    assert_eq!(event["result"], "response");
+    assert_eq!(event["client_ip"], "192.0.2.9");
+    assert_eq!(event["client_port"], 53001);
+    assert_eq!(event["transport"], "udp");
+    assert_eq!(event["answers"][0]["data"], "192.0.2.6");
+    worker.shutdown().await;
 }
 
 #[tokio::test]
@@ -102,6 +132,7 @@ async fn admitted_transparent_udp_routes_by_client_source() {
                 client_addr.parse().expect("client"),
                 original_dst,
                 validated,
+                None,
             )
             .await;
     }

@@ -132,6 +132,7 @@ pub(crate) enum EnginePhase {
 
 /// The main control plane.
 pub struct ControlPlane {
+    dns_audit: Option<crate::audit::DnsAuditWorker>,
     config: Arc<RwLock<Arc<Config>>>,
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     /// Reuse decisions must observe the generation they eventually replace.

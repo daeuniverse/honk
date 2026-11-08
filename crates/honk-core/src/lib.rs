@@ -9,6 +9,11 @@
 //! in dae netns"). Trait-based backends (real aya + mock) for testing
 //! without kernel eBPF support.
 
+#[cfg_attr(not(feature = "dns-syslog"), path = "audit/inert.rs")]
+mod audit;
+#[cfg(all(test, not(feature = "dns-syslog")))]
+#[path = "audit/inert_tests.rs"]
+mod audit_feature_tests;
 #[cfg(feature = "clash-api")]
 pub mod clash_api;
 pub mod config_diagnostics;
@@ -806,6 +811,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             !config.experimental.native_api.enabled,
             "native-api feature is required"
         );
+        #[cfg(not(feature = "dns-syslog"))]
+        audit::validate_config(&config.global)?;
         let requested_data_dir = PathBuf::from(&config.global.data_dir);
         let (runtime_data_dir, data_dir_creation_error) =
             prepare_runtime_data_dir(&requested_data_dir)?;

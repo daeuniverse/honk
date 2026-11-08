@@ -124,6 +124,8 @@ native-ui = ["native-api", "dep:brotli", "dep:flate2"]
 jemalloc = ["dep:tikv-jemallocator"]
 # VLESS / VMess proxy handlers (xtls-rprx-vision flow support)
 rprx = ["honk-outbound/rprx"]
+# Compile optional client DNS syslog auditing.
+dns-syslog = []
 dns-bench = []
 udp-bench = []
 reload-bench = []

@@ -28,12 +28,16 @@ fn key(index: u16) -> FlightKey {
     )
 }
 
-fn template(rcode: u8) -> Arc<ResponseTemplate> {
+fn template(rcode: u8) -> Arc<FlightAnswer> {
     let query = QueryContext::parse(&[0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 1, 0, 1])
         .expect("query");
     let mut response = query.canonical_wire().to_vec();
     response[2..4].copy_from_slice(&(0x8180_u16 | u16::from(rcode)).to_be_bytes());
-    Arc::new(ResponseTemplate::validate(&query, &response).expect("template"))
+    Arc::new(FlightAnswer {
+        template: ResponseTemplate::validate(&query, &response).expect("template"),
+        provenance: Provenance::Upstream,
+        final_upstream: Some("default".into()),
+    })
 }
 
 #[tokio::test]
@@ -48,7 +52,7 @@ async fn completion_notifies_attached_waiter_and_preserves_fresh_flight() {
     };
 
     let completed = template(0);
-    leader.publish(Ok(Arc::clone(&completed)));
+    leader.publish(|| Ok(Arc::clone(&completed)));
     assert_eq!(flights.active_len(), 0);
 
     let FlightRole::Leader(successor) = flights.acquire(flight_key.clone()) else {
@@ -60,15 +64,15 @@ async fn completion_notifies_attached_waiter_and_preserves_fresh_flight() {
     let Some(Ok(received)) = waiter.receive().await else {
         panic!("completed result");
     };
-    assert_eq!(received.wire(), completed.wire());
+    assert_eq!(received.template.wire(), completed.template.wire());
 
     let fresh = template(3);
-    successor.publish(Ok(Arc::clone(&fresh)));
+    successor.publish(|| Ok(Arc::clone(&fresh)));
     let Some(Ok(received)) = successor_waiter.receive().await else {
         panic!("fresh result");
     };
-    assert_eq!(received.wire(), fresh.wire());
-    assert_ne!(received.wire(), completed.wire());
+    assert_eq!(received.template.wire(), fresh.template.wire());
+    assert_ne!(received.template.wire(), completed.template.wire());
     assert_eq!(flights.active_len(), 0);
 }
 

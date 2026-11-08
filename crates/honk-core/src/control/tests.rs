@@ -3362,7 +3362,7 @@ async fn udp_dns_with_ready_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
                 .await;
         }
         _ => panic!("strict DNS must not enter the Ready endpoint queue"),
@@ -3427,7 +3427,7 @@ async fn udp_dns_with_initializing_endpoint_uses_controller_not_queue() {
             validated,
             ..
         } => {
-            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated)
+            dns.handle_udp_dns_admitted(&admission, &data, client, dst, validated, None)
                 .await;
         }
         _ => panic!("strict DNS must not enter the Initializing endpoint queue"),
