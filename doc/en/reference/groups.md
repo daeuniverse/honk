@@ -51,7 +51,7 @@ group {
 | -------------- | ---------------------- | -------- |
 | `selector` | `selector`, `select`, `fixed`, `fixed(0)` | Independently for TCP and UDP, uses that network's runtime choice, then `default`, then the first existing member before health filtering. Health never replaces a valid choice with a sibling. The choice may be a direct node or nested group. |
 | `urltest` | `urltest`, `min_moving_avg`, `min_avg10`, `min_last_delay` | Selects the lowest-latency alive member using the halving moving average `(prev + sample) / 2` and tolerance; TCP and UDP selections are independent. |
-| `loadbalance` | `loadbalance`, `roundrobin`, `round_robin`, `balance` | Round-robins over alive members with independent counters per group and TCP/UDP network. |
+| `loadbalance` | `loadbalance`, `roundrobin`, `round_robin`, `balance` | Round-robins over alive members with independent counters per group and TCP/UDP network. Consecutive connections to one destination leave through different nodes, and TCP and UDP rotate separately, so a service that ties a session to the client address drops it: sign-ins end, and Cloudflare clearances are challenged again. Use `urltest` or `score` where that matters. |
 | `fallback` | `fallback` | Pins the first alive member in declaration order independently for TCP and UDP; recovery of an earlier member does not immediately fail back. |
 | `score` | `score` | Always compiled; chooses one alive member using observed reliability, fresh target quality and bounded validation. TCP/UDP and target IPv4/IPv6 evidence remain separate. |
 
