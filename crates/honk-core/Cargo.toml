@@ -97,6 +97,7 @@ dashmap.workspace = true
 libsystemd.workspace = true
 nix.workspace = true
 sha2.workspace = true
+boring.workspace = true
 aes-gcm.workspace = true
 hkdf.workspace = true
 
@@ -148,7 +149,6 @@ tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 rcgen.workspace = true
-boring.workspace = true
 tokio-boring.workspace = true
 rustls-pemfile.workspace = true
 webpki-roots.workspace = true

@@ -5,9 +5,9 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use boring::sha::Sha256;
 use honk_config::datapath::BusyPollConfig;
 use parking_lot::Mutex;
-use sha2::{Digest, Sha256};
 
 use crate::xdp::polling::clock::boottime_ns;
 
@@ -404,7 +404,7 @@ fn executable_sha256() -> io::Result<String> {
         }
         hash.update(&buffer[..count]);
     }
-    Ok(crate::configuration::encode_digest(&hash.finalize()))
+    Ok(crate::configuration::encode_digest(&hash.finish()))
 }
 
 impl Shared {

@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 fn policy(window_ns: u64, budget_ns: u64) -> QuotaPolicy {
     QuotaPolicy {
