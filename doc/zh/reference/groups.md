@@ -51,7 +51,7 @@ group {
 | ------ | --------------- | ---- |
 | `selector` | `selector`、`select`、`fixed`、`fixed(0)` | TCP/UDP 各自维护运行时选择，在健康过滤前依次使用对应网络的选择、`default` 和第一个现存成员。健康状态不会把有效选择替换成兄弟成员；选择可为直接节点或嵌套组 tag。 |
 | `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
-| `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。 |
+| `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。连向同一目标的相邻连接会从不同节点出去，TCP 与 UDP 也各自轮换，因此把会话绑定到客户端地址的服务会断开：登录状态失效，Cloudflare 的放行记录会被重新质询。需要稳定出口时改用 `urltest` 或 `score`。 |
 | `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即切回。 |
 | `score` | `score` | 根据实际可靠性、新鲜目标质量与有界验证选择一个存活成员；TCP/UDP 和目标 IPv4/IPv6 证据各自隔离。 |
 
