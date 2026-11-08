@@ -780,7 +780,6 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     let startup = (|| -> anyhow::Result<_> {
         #[cfg(feature = "native-api")]
         let mut config = if cli.store == ConfigStore::Db {
-            std::fs::create_dir_all(&cli.data_dir)?;
             // DbStore needs an absolute, lexically normal entry; a missing -c
             // is fine once the db holds a revision.
             let entry =
