@@ -47,6 +47,26 @@ impl RuntimeTransport for FamilyPool {
     async fn close(&self) {}
 }
 
+fn publish_dns(state: &NativeState, pool: Arc<FamilyPool>, dns: &honk_config::dns::DnsConfig) {
+    let forwarder = Arc::new(DnsForwarder::new(
+        pool.clone(),
+        Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+        Arc::new(DnsRouter::new_from_dns_config(dns).unwrap()),
+    ));
+    let provider = state.dns.provider().unwrap();
+    let generation = provider.current_generation().get() + 1;
+    provider.publish(DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(generation),
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
+        )),
+        outbound_runtime: None,
+        transport: pool,
+    }));
+}
+
 async fn family_preparation(refusal: bool, response_code: u8) {
     let listener = tokio::net::TcpListener::bind("[::1]:0").await.unwrap();
     let node = Node::from_share_link(&format!(
@@ -63,23 +83,11 @@ async fn family_preparation(refusal: bool, response_code: u8) {
         response_code,
         ipv6_queries: AtomicUsize::new(0),
     });
-    let forwarder = Arc::new(DnsForwarder::new(
+    publish_dns(
+        &state,
         pool.clone(),
-        Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
-        Arc::new(DnsRouter::new_from_dns_config(&honk_config::dns::DnsConfig::default()).unwrap()),
-    ));
-    let provider = state.dns.provider().unwrap();
-    let generation = provider.current_generation().get() + 1;
-    provider.publish(DnsRuntime::new(DnsRuntimeParts {
-        generation: RuntimeGeneration::new(generation),
-        forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
-        )),
-        outbound_runtime: None,
-        transport: pool.clone(),
-    }));
+        &honk_config::dns::DnsConfig::default(),
+    );
     let (stop, receiver) = watch::channel(false);
     let worker = state.observation.probes.start(Arc::clone(&state), receiver);
     let input = request(
@@ -148,7 +156,7 @@ async fn family_preparation(refusal: bool, response_code: u8) {
                 .any(|sample| sample.ip_version == IpVersion::V4)
         );
     }
-    provider.shutdown().await;
+    state.dns.provider().unwrap().shutdown().await;
 }
 
 #[tokio::test]
@@ -164,4 +172,61 @@ async fn ordinary_dns_failure_keeps_usable_sibling_and_skips_missing_family() {
 #[tokio::test]
 async fn negative_dns_answer_addresses_cannot_admit_a_probe() {
     family_preparation(false, 3).await;
+}
+
+#[tokio::test]
+async fn asis_dns_routing_falls_back_to_bootstrap_for_probe_targets() {
+    // Bootstrap DNS is process-global; isolate it from parallel core tests.
+    if crate::test_support::run_exact_in_child(
+        "HONK_PROBE_BOOTSTRAP_FALLBACK_CHILD",
+        "native_api::probes::tests::preparation::asis_dns_routing_falls_back_to_bootstrap_for_probe_targets",
+    ) {
+        return;
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let node = Node::from_share_link(&format!(
+        "socks5://localhost:{}",
+        listener.local_addr().unwrap().port(),
+    ))
+    .unwrap();
+    let node_id = node.id;
+    let mut config = Config::default();
+    config.nodes.push(node);
+    let state = state(config).await;
+    let mut dns = honk_config::dns::DnsConfig::default();
+    dns.routing.request.fallback = honk_config::dns::DnsRequestAction::AsIs;
+    let pool = Arc::new(FamilyPool {
+        refusal: false,
+        response_code: 0,
+        ipv6_queries: AtomicUsize::new(0),
+    });
+    publish_dns(&state, pool.clone(), &dns);
+    let (stop, receiver) = watch::channel(false);
+    let worker = state.observation.probes.start(Arc::clone(&state), receiver);
+    let input = request(
+        json!({"type":"node","node_id":node_id.to_string()}),
+        "tcp_connect",
+        json!(["tcp"]),
+        "ipv4",
+    );
+    let response = create(
+        &state,
+        http_request(&input, "asis"),
+        &RequestId("asis".into()),
+    )
+    .await;
+    let accepted = body(response.unwrap()).await;
+    let result = terminal(&state, accepted["operation_id"].as_str().unwrap()).await;
+    assert_eq!(result["result"]["results"][0]["state"], "healthy");
+    assert_eq!(result["result"]["results"][0]["health_updated"], true);
+    let (mut socket, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(socket.read(&mut [0]).await.unwrap(), 0);
+    stop.send(true).unwrap();
+    worker.await.unwrap();
+    assert_eq!(pool.ipv6_queries.load(Ordering::SeqCst), 0);
+    state.dns.provider().unwrap().shutdown().await;
 }

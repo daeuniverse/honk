@@ -78,7 +78,8 @@ pub(crate) struct PinnedNameResolver {
 
 #[cfg(feature = "native-api")]
 impl PinnedNameResolver {
-    /// Resolve only through the captured generation, never bootstrap or system DNS.
+    /// Resolve through the captured generation and, when it cannot answer,
+    /// through bootstrap DNS as [`DnsService::resolve_name`] does.
     pub(crate) async fn resolve(&self, domain: &str) -> anyhow::Result<Vec<IpAddr>> {
         let domain = normalize_domain(domain)?;
         if let Ok(ip) = domain.parse::<IpAddr>() {
@@ -97,9 +98,36 @@ impl PinnedNameResolver {
             responses.ipv6 = Some(self.resolve_family(&domain, 28).await);
         }
         let responses = responses.fail_on_packet_rejection()?;
+        let (ipv4_eligible, ipv6_eligible) = (responses.ipv4_eligible, responses.ipv6_eligible);
+        let answered = responses
+            .ipv4
+            .iter()
+            .chain(&responses.ipv6)
+            .any(Result::is_ok);
         let mut addresses = Vec::new();
         for outcome in responses.ipv4.into_iter().chain(responses.ipv6).flatten() {
             addresses.extend_from_slice(outcome.answer_ips());
+        }
+        if !answered {
+            addresses = self
+                .service
+                .operation()
+                .run(honk_outbound::bootstrap::resolve(&domain))
+                .await?
+                .map_err(|source| NameResolutionError::Bootstrap {
+                    domain: domain.clone(),
+                    source: source.into(),
+                })?;
+            addresses.retain(|ip| {
+                if ip.is_ipv4() {
+                    ipv4_eligible
+                } else {
+                    ipv6_eligible
+                }
+            });
+            if addresses.is_empty() {
+                return Err(NameResolutionError::NoAddresses { domain }.into());
+            }
         }
         Ok(addresses)
     }
