@@ -181,6 +181,12 @@ carrier wait names the interface and reports `no carrier after XDP attach`;
 startup fails with the existing guard custody. Later link notifications still
 close capture and require restart.
 
+During that startup wait only, the existing native IPv6 `ff00::/8` multicast
+route may carry the sole `RTNH_F_LINKDOWN` flag when its output is a captured
+physical root still awaiting carrier. A recovered root, a logical-only output,
+additional flags or unsupported route facts remain refusals. Final strict
+admission still requires the multicast route's flags to be zero.
+
 The marked-table preflight proves **output-route isolation**, not the remote network's
 asymmetric return path. Own unconnected UDP, fragmented replies, IPv4 options and
 IPv6 extension-header replies do not receive the connected-socket native exemption;

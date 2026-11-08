@@ -28,6 +28,7 @@ const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_PERMANENT: u32 = 0x80;
 const IFA_F_NOPREFIXROUTE: u32 = 0x200;
 const FIB_RULE_IIF_DETACHED: u32 = 0x08;
+const RTNH_F_LINKDOWN: u32 = 0x10;
 const FR_ACT_PROHIBIT: u8 = 8;
 const RTN_BLACKHOLE: u8 = 6;
 const RTPROT_STATIC: u8 = 4;
@@ -878,6 +879,7 @@ struct Route {
     kind: u8,
     simple: bool,
     native_multicast: bool,
+    native_multicast_linkdown: bool,
     ipv4_destination: Option<Ipv4Addr>,
     destination: Option<IpAddr>,
     prefix_len: u8,
@@ -1099,8 +1101,9 @@ impl Snapshot {
                     output: 0,
                     default: body[1] == 0,
                     kind: body[7],
-                    simple: body[2] == 0 && body[3] == 0 && u32_at(body, 8)? == 0,
+                    simple: body[2] == 0 && body[3] == 0,
                     native_multicast: body[0] == 10 && body[1] == 8 && body[7] == 5,
+                    native_multicast_linkdown: false,
                     ipv4_destination: None,
                     destination: unspecified(body[0]),
                     prefix_len: body[1],
@@ -1161,6 +1164,12 @@ impl Snapshot {
                     .is_none_or(|ip| !network_address(ip, route.prefix_len))
                     || (route.prefix_len != 0 && multicast_destination.is_none());
                 route.native_multicast &= route.simple && multicast_destination == Some(true);
+                // The first native XDP attachment can temporarily mark this route LINKDOWN.
+                route.native_multicast_linkdown = route.native_multicast
+                    && !route.unsupported
+                    && route.flags == RTNH_F_LINKDOWN;
+                route.simple &= route.flags == 0;
+                route.native_multicast &= route.simple;
                 self.routes.push(route);
             }
             _ => unreachable!(),
@@ -1647,7 +1656,13 @@ impl Snapshot {
         if self.routes.iter().any(|route| {
             matches!(route.family, 2 | 10)
                 && route.table == 255
-                && !route.native_multicast
+                && !(route.native_multicast
+                    || (!require_capture_carrier
+                        && route.native_multicast_linkdown
+                        && captured_physical.contains(&route.output)
+                        && self.links.iter().any(|link| {
+                            link.index == route.output && link.flags & 0x10000 == 0
+                        })))
                 && (route.kind == 1 || captured_logical.contains(&route.output))
         }) {
             return Err(unsupported(
@@ -1882,6 +1897,102 @@ mod tests {
         let mut duplicate = local_route_body(10, 8, 5, Some(&multicast));
         attribute(&mut duplicate, 1, &unicast);
         assert!(Snapshot::default().push(24, &duplicate).is_err());
+    }
+
+    #[test]
+    fn xdp_attach_multicast_linkdown_requires_its_own_pending_physical_root() {
+        let multicast = Ipv6Addr::from(0xff00u128 << 112).octets();
+        let flags = std::iter::once(RTNH_F_LINKDOWN).chain((0..32).flat_map(|bit| {
+            let other = 1u32 << bit;
+            [other, other | RTNH_F_LINKDOWN]
+        }));
+        for flags in flags {
+            for (root_flags, output, other_physical, allowed) in [
+                (1, 2u32, false, flags == RTNH_F_LINKDOWN),
+                (0x10001, 2, false, false),
+                (0x10001, 2, true, false),
+                (1, 4, false, false),
+            ] {
+                let mut current = topology();
+                current.links[0].flags = root_flags;
+                current.links.push(xdp_link(4, true, false));
+                current.links[2].flags = 1;
+                let mut body = local_route_body(10, 8, 5, Some(&multicast));
+                body[8..12].copy_from_slice(&flags.to_ne_bytes());
+                let output_at = body.len() - 12;
+                body[output_at..output_at + 4].copy_from_slice(&output.to_ne_bytes());
+                let mut cache = [0u8; 32];
+                cache[0] = 1;
+                cache[16] = 1;
+                attribute(&mut body, 12, &cache);
+                current.push(24, &body).unwrap();
+                let route = current.routes.last().unwrap();
+                assert!(!route.simple);
+                assert!(!route.native_multicast);
+                assert_eq!(route.native_multicast_linkdown, flags == RTNH_F_LINKDOWN);
+                let physical = if other_physical { &[2, 4][..] } else { &[2][..] };
+                let pending = current.pending_xdp_carrier(physical, &[2, 4], 128);
+                if allowed {
+                    let root = pending
+                        .expect("sole LINKDOWN must not hide a pending root's multicast route")
+                        .expect("attached physical root must still await carrier");
+                    assert_eq!(root.index, 2);
+                } else {
+                    assert!(pending.is_err(), "flags={flags:#x}, output={output}");
+                }
+                assert!(current.admit(physical, &[2, 4], 128).is_err());
+            }
+        }
+        let mut recovered = topology();
+        recovered
+            .push(24, &local_route_body(10, 8, 5, Some(&multicast)))
+            .unwrap();
+        assert!(recovered.admit(&[2], &[2], 128).is_ok());
+    }
+
+    #[test]
+    fn xdp_attach_linkdown_preserves_multicast_shape_and_attribute_refusals() {
+        let multicast = Ipv6Addr::from(0xff00u128 << 112).octets();
+        let unicast = "2001:db8::".parse::<Ipv6Addr>().unwrap().octets();
+        let mut host_bits = multicast;
+        host_bits[15] = 1;
+        for mutation in 0..16 {
+            let mut current = topology();
+            current.links[0].flags = 1;
+            let mut body = local_route_body(10, 8, 5, Some(&multicast));
+            match mutation {
+                0 => body[0] = 2,
+                1 => body[7] = 1,
+                2 => body[1] = 128,
+                3 => body = local_route_body(10, 8, 5, None),
+                4 => body = local_route_body(10, 8, 5, Some(&multicast[..15])),
+                5 => body = local_route_body(10, 8, 5, Some(&unicast)),
+                6 => body = local_route_body(10, 8, 5, Some(&host_bits)),
+                7 => body[2] = 1,
+                8 => body[3] = 1,
+                9 => attribute(&mut body, 99, &0u32.to_ne_bytes()),
+                10 => attribute(&mut body, 8, &[]),
+                11 => attribute(&mut body, 23, &[]),
+                12 | 13 => {
+                    let mut cache = [0u8; 32];
+                    cache[if mutation == 12 { 8 } else { 12 }] = 1;
+                    attribute(&mut body, 12, &cache);
+                }
+                14 => attribute(&mut body, 1, &multicast),
+                _ => attribute(&mut body, 12, &[0; 31]),
+            }
+            body[8..12].copy_from_slice(&RTNH_F_LINKDOWN.to_ne_bytes());
+            if let Err(error) = current.push(24, &body) {
+                assert!(matches!(mutation, 14 | 15));
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                continue;
+            }
+            let route = current.routes.last().unwrap();
+            assert!(!route.simple);
+            assert!(!route.native_multicast);
+            assert!(!route.native_multicast_linkdown, "mutation {mutation}");
+            assert!(current.pending_xdp_carrier(&[2], &[2], 128).is_err());
+        }
     }
 
     #[test]

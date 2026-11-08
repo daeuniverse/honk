@@ -155,6 +155,11 @@ routing {
 等待超时会指出接口名并报告 `no carrier after XDP attach`；启动失败保留现有 guard
 托管行为。后续链路通知仍会关闭捕获并要求重启。
 
+仅在这段启动等待期间，既有原生 IPv6 `ff00::/8` 组播路由可携带唯一的
+`RTNH_F_LINKDOWN` flag，且出口必须是仍在等待 carrier 的捕获物理根接口。
+已恢复 carrier 的根接口、仅属于逻辑捕获的出口、额外 flag 或不支持的路由事实
+仍立即拒绝。最终严格准入仍要求该组播路由的 flags 为零。
+
 mark 专用表预检只证明**出站路由隔离**，不能证明远端网络不会非对称回程。
 自身未连接 UDP、分片、IPv4 options 和 IPv6 扩展头回复不会获得 connected-socket
 原生豁免；若进入捕获端口，仍按所选 packet policy 处理。必须把自身回程放在未捕获

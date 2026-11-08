@@ -23,3 +23,4 @@ Added
 - Add a separate ignored recent-kernel igb adaptive-ZeroCopy entry that reuses the complete Copy owner/clock/fairness/accounting/live-feature fixture under the same 45-second deadline, with actual driver and per-queue bind receipts for every owner reconstruction and the existing joined-cleanup frontier.
 - Keep loopback UDP reply ports reserved across shared-source endpoint retirement and recreation in the control tests.
 - Wait up to one shared 10-second deadline for captured Ethernet carrier recovery after initial XDP attachment, preserving strict admission, immediate structural/uplink refusal and terminal runtime topology notifications.
+- Recognize the kernel's sole LINKDOWN flag on native IPv6 multicast routes only while their captured physical output is awaiting XDP-attach carrier recovery; keep final admission and other route facts strict.
