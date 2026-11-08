@@ -13,8 +13,7 @@ fn identity() -> Identity {
 pub(crate) fn test_pending_event(mut pending: DnsAuditQuery) -> serde_json::Value {
     let input = pending.entry.take().unwrap();
     pending.permit.take();
-    let event = encode(&input, "instance:1").unwrap();
-    decode_frame(&super::frame(&event, input.completed, &identity(), true).unwrap())
+    encode(&input, "instance:1").unwrap()
 }
 
 fn frame(

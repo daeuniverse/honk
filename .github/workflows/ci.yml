@@ -442,9 +442,10 @@ jobs:
             test "$(cargo test -p honk-core --no-default-features --lib "$test_name" -- --exact --list --format terse)" = "$test_name: test"
           done
           cargo test -p honk-core --no-default-features --lib audit_feature_tests::
-          test_name=audit::tests::fixed_json_frames_preserve_events_with_and_without_cee
-          test "$(cargo test -p honk-core --no-default-features --features dns-syslog --lib "$test_name" -- --exact --list --format terse)" = "$test_name: test"
-          cargo test -p honk-core --no-default-features --features dns-syslog --lib audit::
+          for test_name in audit::tests::fixed_json_frames_preserve_events_with_and_without_cee control::dns_control::tests::udp::transparent_udp_completion_is_exported_to_dns_syslog; do
+            test "$(cargo test -p honk-core --no-default-features --features dns-syslog --lib "$test_name" -- --exact --list --format terse)" = "$test_name: test"
+          done
+          cargo test -p honk-core --no-default-features --features dns-syslog --lib -- audit:: syslog
       - name: Upload workspace JUnit
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

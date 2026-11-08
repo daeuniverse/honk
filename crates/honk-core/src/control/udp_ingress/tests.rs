@@ -25,10 +25,11 @@ async fn transparent_udp_admission_captures_audit_before_dispatch() {
     else {
         panic!("transparent DNS must capture audit before dispatch");
     };
-    assert_eq!(
-        crate::audit::tests::test_pending_event(pending)["event"],
-        "dns.query"
-    );
+    let event = crate::audit::tests::test_pending_event(pending);
+    assert_eq!(event["client_ip"], "192.0.2.8");
+    assert_eq!(event["client_port"], 53000);
+    assert_eq!(event["transport"], "udp");
+    assert_eq!(event["domain"], "a.com.");
 }
 
 #[test]

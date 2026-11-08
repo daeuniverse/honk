@@ -100,7 +100,7 @@ test-ci:
     # Without nextest: cargo test --workspace --features honk-core/native-ui,honk-core/dns-syslog --no-fail-fast
     HONK_DOONA_DIR="${HONK_DOONA_DIR:-$(ci/fetch-doona.sh)}" cargo nextest run --workspace --features honk-core/native-ui,honk-core/dns-syslog --profile ci
     cargo test -p honk-core --no-default-features --lib audit_feature_tests::
-    cargo test -p honk-core --no-default-features --features dns-syslog --lib audit::
+    cargo test -p honk-core --no-default-features --features dns-syslog --lib -- audit:: syslog
 
 # Run core + outbound tests
 test-core:
