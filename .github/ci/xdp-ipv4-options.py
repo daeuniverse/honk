@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import socket
 import struct
 import subprocess
@@ -399,7 +400,18 @@ elif mode == 'send':
         sock.bind(('c0', 0))
         assert sock.send(packet) == len(packet)
 elif mode == 'count':
-    print(json.dumps(counts(sys.argv[2] if len(sys.argv) > 2 else 'dut0')), flush=True)
+    devices = sys.argv[2:] or ['dut0']
+    def count_deadline(signum, frame):
+        raise TimeoutError('actual producer counter read exceeded its five-second deadline')
+    signal.signal(signal.SIGALRM, count_deadline)
+    values = {}
+    for device in devices:
+        signal.setitimer(signal.ITIMER_REAL, 5)
+        try:
+            values[device] = counts(device)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    print(json.dumps(values[devices[0]] if len(devices) == 1 else values), flush=True)
 elif mode in ('identity', 'pin-id'):
     device, role = sys.argv[2:4]
     fd = program_fd(device, role)

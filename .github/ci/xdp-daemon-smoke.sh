@@ -35,6 +35,7 @@ case $smoke_scope in
     daemon) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'daemon scope cannot ignore supplied test executables' ;;
     *) fail 'unknown smoke scope' ;;
 esac
+read -r smoke_started _ </proc/uptime
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 export HONK_XDP_PROBE="$script_dir/xdp-ipv4-options.py"
 current_netns=$(stat -Lc %i /proc/self/ns/net)
@@ -50,6 +51,12 @@ mount -t cgroup2 cgroup2 /run/honk-cgroup
 [[ $(stat -f -c %T /run/honk-cgroup) == cgroup2fs ]] || fail 'requires guest cgroup2'
 work=$(mktemp -d "${HONK_XDP_ARTIFACT_ROOT:-/tmp}/honk-xdp-daemon.XXXXXX")
 printf 'XDP smoke artifacts: %s\n' "$work"
+printf 'monotonic_seconds\tprofile\tphase\n%s\tsetup\tbegin\n' "$smoke_started" >"$work/phases.tsv"
+mark_phase() {
+    local uptime idle
+    read -r uptime idle </proc/uptime
+    printf '%s\t%s\t%s\n' "$uptime" "$1" "$2" >>"$work/phases.tsv"
+}
 mkdir "$work/bpf"
 mount -t bpf bpf "$work/bpf"
 [[ $(stat -f -c %T "$work/bpf") == bpf_fs ]] || fail 'requires bpffs'
@@ -87,6 +94,7 @@ PY
 cleanup() {
     status=$?
     trap - EXIT
+    mark_phase cleanup "begin-status-$status"
     stop_sources
     if [[ $adaptive_active == true && ! -f $work/adaptive-runtime.joined ]]; then
         # A failed join cannot authorize namespace/pin teardown. This guest-only
@@ -111,6 +119,7 @@ cleanup() {
     cp -a /run/honk-xdp-state "$work/state" || status=1
     cp -a /run/honk-tc-state "$work/tc-state" || status=1
     umount /run/honk-cgroup || true
+    mark_phase cleanup "complete-status-$status"
     printf 'Artifacts retained: %s (exit %s)\n' "$work" "$status"
     exit "$status"
 }
@@ -182,8 +191,11 @@ for family in -4 -6; do
     ip -n dut "$family" -j route show table all >"$work/topology.$family.routes.json"
 done
 
+mark_phase setup topology-ready
 ip netns exec dut sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
+mark_phase native-baseline begin
 python3 "$HONK_XDP_PROBE" native-baseline | tee "$work/native-baseline.log"
+mark_phase native-baseline complete
 ip netns exec dut sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.ip_early_demux=0 net.ipv4.conf.all.accept_source_route=1 net.ipv4.conf.dut0.accept_source_route=1
 ip netns exec dut nft add table inet honk_smoke_native
 ip netns exec dut nft 'add chain inet honk_smoke_native forward { type filter hook forward priority -300; policy accept; }'
@@ -470,7 +482,11 @@ cat >"$work/client.py" <<'PY'
 import contextlib, hashlib, json, os, pathlib, re, signal, socket, struct, subprocess, sys, time
 mode = sys.argv[1]
 def captures():
-    return {dev: json.loads(subprocess.check_output(['ip', 'netns', 'exec', 'dut', sys.executable, os.environ['HONK_XDP_PROBE'], 'count', dev], text=True, timeout=5)) for dev in ('dut0', 'dut1')}
+    started = time.monotonic()
+    # Keep the original five-second allowance per device while batching startup.
+    result = json.loads(subprocess.check_output(['ip', 'netns', 'exec', 'dut', sys.executable, os.environ['HONK_XDP_PROBE'], 'count', 'dut0', 'dut1'], text=True, timeout=10))
+    print(json.dumps({'counter_readback_seconds': time.monotonic() - started, 'devices': list(result)}), flush=True)
+    return result
 def reload_config(text, expected):
     config, log = pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
     offset = len(log.read_text())
@@ -733,6 +749,7 @@ routing {
 EOF
 }
 write_config "$work/asymmetric.dae" 'backend: xdp' 'direct: endpoint' '' 'copy'
+mark_phase admission begin
 python3 - "$work/asymmetric.dae" <<'PY'
 import pathlib, sys
 path = pathlib.Path(sys.argv[1])
@@ -832,7 +849,9 @@ for profile in endpoint core; do
     [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'low MTU left pinned kernel objects'
 done
 ip -n dut link del lowmtu
+mark_phase admission complete
 for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo; do
+    mark_phase "$profile" setup-begin
     for spec in 'client c0' 'server s0' 'server su'; do
         read -r ns dev <<<"$spec"
         ip -n "$ns" link set lo up
@@ -869,12 +888,14 @@ for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoi
         provision_routes c0 s0 dut0 dut1
     fi
     ip netns exec dut nft flush chain inet honk_smoke_native forward
+    mark_phase "$profile" guard-positive-begin
     python3 "$HONK_XDP_PROBE" guard delivered "$client_dev" "$server_dev" | tee "$work/$profile.guard-positive.log"
     if [[ $profile == endpoint-vlan ]]; then
         ip netns exec dut sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
         HONK_XDP_INLINE_QINQ=1 python3 "$HONK_XDP_PROBE" native-baseline | tee "$work/native-qinq-baseline.log"
         ip netns exec dut sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
     fi
+    mark_phase "$profile" guard-positive-complete
     ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
     direct=core
     if [[ $profile == endpoint* ]]; then direct=endpoint; fi
@@ -886,6 +907,7 @@ for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoi
         cp "$work/polling-candidate.dae" "$work/$profile.dae"
     fi
     ip -n dut -j address show >"$work/$profile.addresses.json"
+    mark_phase "$profile" readiness-begin
     ip netns exec server python3 "$work/echo.py" "$profile" "$work/$profile.server-ready" >"$work/$profile.server.log" 2>&1 &
     server_pid=$!
     ip netns exec dut "$daemon" -c "$work/$profile.dae" --bpf-pin-root "$work/bpf" "${polling_args[@]}" >"$work/$profile.daemon.log" 2>&1 &
@@ -898,6 +920,7 @@ for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoi
         sleep 0.1
     done
     [[ $ready == true ]] || fail "$profile readiness deadline"
+    mark_phase "$profile" ready
     python3 - "$work/$profile.daemon.log" <<'PY'
 import pathlib, re, sys
 log = re.sub(r'\x1b\[[0-9;]*m', '', pathlib.Path(sys.argv[1]).read_text())
@@ -910,14 +933,19 @@ for interface in ('dut0', 'dut1'):
                    for line in before_ready.splitlines()), (interface, queue, 'queue not bound before readiness')
 print('all selected RX queues bound before readiness')
 PY
+    mark_phase "$profile" pre-client-check-begin
     ip netns exec dut python3 "$work/check.py" data
     for dev in dut0 dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" pin-id "$dev" guard >"$work/$profile.$dev.guard-id"; done
     ip -n dut -j -d link show >"$work/$profile.links.json"
+    mark_phase "$profile" client-begin
     ip netns exec client python3 "$work/client.py" "$profile" "$work/$profile.dae" "$work/$profile.daemon.log" "$daemon_pid" | tee "$work/$profile.client.log"
+    mark_phase "$profile" client-complete
     ip netns exec dut python3 "$work/check.py" data
     wait "$server_pid"
     server_pid=
+    mark_phase "$profile" server-joined
     for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+    mark_phase "$profile" producers-settled
     if [[ $profile == endpoint || $profile == core ]]; then
         python3 "$HONK_XDP_PROBE" domain "$profile" | tee "$work/$profile.domain-routing.log"
     fi
@@ -933,15 +961,20 @@ PY
     if [[ $profile == core-vlan-single-offload ]]; then
         HONK_XDP_SINGLE_VLAN=1 python3 "$HONK_XDP_PROBE" padding | tee "$work/$profile.padded-vlan.log"
     fi
+    mark_phase "$profile" probes-complete
     ip netns exec dut python3 "$work/check.py" data
+    mark_phase "$profile" shutdown-begin
     kill -TERM "$daemon_pid"
     timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'daemon shutdown deadline (guard custody retained)'
     wait "$daemon_pid"
     daemon_pid=
+    mark_phase "$profile" daemon-joined
     ip netns exec dut nft flush chain inet honk_smoke_native forward
     grep -q 'XDP admission closed; UMEM retained until process exit' "$work/$profile.daemon.log" || fail 'missing shutdown admission fence'
+    mark_phase "$profile" guard-negative-begin
     ip netns exec dut python3 "$work/check.py" guard "$work/$profile"
     python3 "$HONK_XDP_PROBE" guard refused "$client_dev" "$server_dev" | tee "$work/$profile.guard-negative.log"
+    mark_phase "$profile" guard-negative-complete
     stop_sources
     # Deliberate operator removal with traffic already stopped; never automatic hot reopen.
     for dev in dut0 dut1; do
@@ -952,7 +985,9 @@ PY
         rmdir "$work/bpf/xdp-$ifindex"
     done
     ip netns exec dut python3 "$work/check.py" absent
+    mark_phase "$profile" detached
 done
+mark_phase tc setup-begin
 for spec in 'dut lans' 'dut wans' 'client clis' 'server srvs'; do
     read -r ns dev <<<"$spec"
     ip -n "$ns" link del "$dev"
@@ -979,6 +1014,7 @@ global {
 dns { bind: '' }
 routing { fallback: direct }
 EOF
+mark_phase tc readiness-begin
 ip netns exec server python3 "$work/echo.py" tc "$work/tc.server-ready" >"$work/tc.server.log" 2>&1 &
 server_pid=$!
 ip netns exec dut "$daemon" -c "$work/tc.dae" --bpf-pin-root "$work/bpf/tc" >"$work/tc.daemon.log" 2>&1 &
@@ -991,17 +1027,24 @@ for ((attempt=0; attempt<300; attempt++)); do
     sleep 0.1
 done
 [[ $ready == true ]] || fail 'default TC readiness deadline'
+mark_phase tc ready
 ip netns exec dut python3 "$work/check.py" tc
+mark_phase tc client-begin
 ip netns exec client python3 "$work/client.py" tc "$work/tc.dae" "$work/tc.daemon.log" "$daemon_pid" | tee "$work/tc.client.log"
+mark_phase tc client-complete
 wait "$server_pid"
 server_pid=
+mark_phase tc server-joined
 for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+mark_phase tc shutdown-begin
 kill -TERM "$daemon_pid"
 timeout 30s tail --pid="$daemon_pid" -f /dev/null || fail 'default TC shutdown deadline'
 wait "$daemon_pid"
 daemon_pid=
+mark_phase tc daemon-joined
 stop_sources
 ip netns exec dut python3 "$work/check.py" absent
+mark_phase tc complete
 printf 'PASS: omitted-datapath real TC startup, IPv4/IPv6 TCP/UDP and new-flow Block/Direct SIGHUP reload.\n'
 printf 'PASS: real capture and Endpoint/Core consumption for IPv4/IPv6 TCP/UDP, QinQ, IPv4 NAT, binding-mode admission/reload, selected guard wire refusal, and veth MTU 1500/9000.\n'
 printf 'IPv6 Core uses flow-label zero; veth copy/SG results do not establish physical zero-copy, jumbo performance or DMA release.\n'
