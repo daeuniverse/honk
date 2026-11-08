@@ -11,6 +11,15 @@ Entries live in [changes/](changes/) until release.
 ### Added
 
 - DNS request rules accept `subtag(...)`, which resolves the server hosts of nodes from matching subscriptions through a chosen `-> direct` upstream (for example a provider's own DoH) instead of the bootstrap resolver. Each DNS generation precomputes host policy outcomes; native flow traces explicitly mark consumption of these decisions as incomplete evidence (`not_instrumented`). (#463)
+- Add default-off `dns-syslog` Cargo support to send client DNS outcomes to a configured TCP syslog receiver with `global.syslog_dns_enabled` and `global.syslog_addr`, independently of native API history. (#462)
+- Preserve complete DNS answers and include deduplicated IP, CNAME and record-type arrays for search. (#462)
+- Include monotonic processing time as numeric `duration_ms` and final upstream name as `upstream` in DNS audit events; cache responses use `cache`, and results without upstream metadata use null. (#462)
+- Configure sender hostname and application name only in syslog headers using `global.syslog_hostname` and `global.syslog_app_name`, avoiding duplicate fields when receivers parse the JSON body. (#462)
+- Reuse one TCP connection with octet-counted whole events, bounded batching and reconnect backoff. (#462)
+- Emit a fixed RFC 5424 header and JSON schema; optionally prefix CEE with `global.syslog_cee_enabled` (default false), and reject obsolete format-template settings. (#462)
+- Preserve final-upstream and response-source metadata when a concurrent DNS query reuses an in-flight result without a cache hit, including stale-cache fallback. (#462)
+- Include a readable `message` in DNS audit JSON so CEE syslog receivers can display each event; VictoriaLogs maps it to `_msg` instead of using its missing-message placeholder. (#462)
+- Keep the DNS audit event when a delivered response's answers cannot be rendered, with `answers: null` and the reason in `answers_omitted`. (#462)
 
 ### Changed
 
