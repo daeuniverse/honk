@@ -112,8 +112,8 @@ async fn parked(owner: &Owner) -> anyhow::Result<(State, PendingWait)> {
         "Endpoint-only owner unexpectedly acquired Core policy: {state:?}"
     );
     owner.ready.control.clear_pending();
-    // veth retains metadata maintenance even without protocol work. Publication
-    // must wake the idle owner before any already-armed timer can explain service.
+    // Publication must wake the idle owner before any already-armed driver or
+    // maintenance timer can explain service.
     let state = owner.state().await?;
     loop {
         if let Some(wait) = owner.ready.control.pending_wait()
@@ -789,7 +789,9 @@ async fn feature_change(rig: &mut Rig) -> anyhow::Result<()> {
             .filter(|(state, fixed)| !fixed && matches!(*state, "on" | "off"))
             .map(|(state, _)| (name, state))
     })
-    .context("owned veth advertises no changeable GRO feature for the real retained-query row")?;
+    .context(
+        "owned capture device advertises no changeable GRO feature for the real retained-query row",
+    )?;
     let requested = if previous == "on" { "off" } else { "on" };
     let config = rig.b().config.clone();
     let control = Arc::clone(&rig.b().ready.control);
@@ -856,7 +858,7 @@ async fn feature_query_error(rig: &mut Rig) -> anyhow::Result<()> {
         .context("owned dut2 has no real ifindex")?;
     ensure!(
         original_link[0]["address"] == "02:00:00:00:00:12",
-        "rename target is not the fixture-owned veth"
+        "rename target is not the fixture-owned capture device"
     );
     let config = rig.b().config.clone();
     let control = Arc::clone(&rig.b().ready.control);

@@ -217,6 +217,32 @@ debug 级别下，同一 sampler 至多每秒报告一次各队列的内核 sock
 
 Event 启动即使无校准，也输出可复现的 executable/context/counting 身份；完整数值块还输出参数摘要。因此 candidate 可在测量前绑定预登记实验 manifest，但只有显式实验 CLI 参数才准入该记录。Qualified 仍是特权操作员经外部评审的证据声明，不是 runtime 科学认证。不据此宣称未经测量的吞吐或节能收益；未合格平台继续 Event。
 
+被忽略的 `xdp::tests::driven_kernel::adaptive` 入口
+`actual_owner_clock_budget_fairness_and_live_features`（Copy）与
+`actual_zerocopy_owner_clock_budget_fairness_and_live_features`（ZeroCopy）
+运行同一完整 fixture。一个 Core owner 与独立 Endpoint owner 在同一进程中
+共用账本，Endpoint 的每次重建也沿用该账本。唯一的 45 秒绝对 deadline 在
+初始化前开始，包含流量、clock/publication 间隔、真实 socket 应用数据/重传/
+timer/close、所有队列进展、Core 两个设备的 egress、同线程公平性、配额/债务、
+独立发布、真实 feature 修改/恢复、保留查询的 `ENODEV` 及 joined 清理。
+ZeroCopy 入口要求实际 `igb` driver 身份、精确队列 `[0, 1]`，以及每个绑定
+port 的实际 ZeroCopy 回读，包括每次重建。
+
+独立 recent-kernel igb rig 要求六块 igb NIC、三个封闭 hub、两个 KVM vCPU、
+1536 MiB、只读 host root 和一个私有可写 export，不使用 host TAP、bridge
+或 socket 网络后端。每个 capture 设备必须回读两个 combined 队列、UDP IPv4
+哈希字段 `sdfn` 及双队列 RSS indirection table（`ethtool -N DEV rx-flow-hash
+udp4 sdfn` 与 `ethtool -X DEV equal 2`）。producer 变化 64 个 UDP 源端口；
+只有真实逐队列 RX 增长才满足队列证据。`HONK_XDP_ARTIFACT_ROOT` 下的
+`adaptive-runtime.bindings.jsonl` 与对应 `adaptive-runtime.binding ` stdout
+记录保留五次启动：A 一次、B 四次。每条记录包含实际 capture incarnation
+（`startup_id`）、namespace/inode、driver、device/ifindex、配置模式及每个队列
+的实际 bind 模式。只有真实 peer、scope/CQ、socket、worker 与 OS thread
+完成 join，精确 guard 已 detach 且自有 pin 已清理后，才写
+`adaptive-runtime.joined`。这些源码覆盖仍须 rig 实际通过才能接受某次运行；
+不构成 virtio 等价、物理 NIC 性能或 DMA 释放结论。既有 Copy 与 virtio Event
+profile 仍作为独立结果。
+
 移除 custody 前先停止流量源。正常关闭报告 `XDP admission closed; UMEM retained until process exit`；netdev 上的 XDP 挂载作为 fail-closed guard 保留，`guard`/`data` program pin 位于 `<bpf-pin-root>/xdp-<ifindex>/`。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。接口仍有 XDP 挂载时启动会拒绝。停源并确认当前程序 ID 属于本实例 guard 后，先移除该挂载（`ip link set dev <接口> xdp off`），再只删除其自有 pin。不存在自动零驻留热重开：保留 UMEM 仍计入进程生命周期 **512 MiB** 上限；close 或空 ring 不证明 DMA 释放。
 
 `.github/ci/xdp-daemon-smoke.sh` 已由完整 floor/recent disposable-VM gate 使用匹配的预构建 daemon、Core 和 XSK 测试程序执行，也可在已准备好的 guest 中直接运行。它要求 guest root、Linux 6.12+、namespace、AF_XDP/native-XDP veth、bpffs、iproute2、nft、ethtool 与 Python 3，不构建、安装或下载。每个 Core/VLAN/jumbo 场景同时验证真实 capture 计数、对端载荷及私有 native-forwarding 丢弃围栏；关闭后核对自有 guard 程序 ID，并用同路径正向基线对照受选流量的拒绝，之后才移除自有挂载。门禁还覆盖不对称队列、原生控制流量、带填充 VLAN 帧，以及省略 datapath 的真实 TC 启动/流量/reload。虚拟场景通过不等于物理 NIC、逐队列/RSS 或性能认证。

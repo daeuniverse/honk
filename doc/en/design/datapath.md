@@ -259,6 +259,36 @@ Every selected device, metadata/veth included, has a cold-funded retained ethtoo
 
 Event startup emits reproducible executable/context/counting identities even without calibration, and a complete numeric block adds its parameter digest. A candidate record can therefore bind a preregistered manifest before measurements exist; only the explicit laboratory CLI flag admits that candidate. Qualified status remains a privileged, externally reviewed evidence assertion, not runtime scientific certification. No unmeasured throughput or energy benefit is implied, and an unqualified platform remains Event.
 
+The ignored `xdp::tests::driven_kernel::adaptive` entries
+`actual_owner_clock_budget_fairness_and_live_features` (Copy) and
+`actual_zerocopy_owner_clock_budget_fairness_and_live_features` (ZeroCopy) run
+the same complete fixture. A Core owner and a separate Endpoint owner share one
+process ledger, including every reconstruction of the Endpoint owner. A single
+45-second absolute deadline starts before initialization and includes traffic,
+clock/publication gaps, real socket app/retransmission/timer/close work, every
+queue's progress, both Core egress devices, same-thread fairness, quota/debt,
+independent publication, actual feature mutation/restoration, retained-query
+`ENODEV` and joined cleanup. The ZeroCopy entry requires actual `igb` driver
+identity, exactly queues `[0, 1]` and actual ZeroCopy on every bound port,
+including every reconstruction.
+
+The separate recent-kernel igb rig requires six igb NICs on three closed hubs,
+two KVM vCPUs and 1536 MiB, a read-only host root and one private writable
+export. It uses no host TAP, bridge or socket network backend. Each capture
+device must read back two combined queues, UDP IPv4 hash fields `sdfn` and a
+two-queue RSS indirection table (`ethtool -N DEV rx-flow-hash udp4 sdfn` and
+`ethtool -X DEV equal 2`). The producer varies 64 UDP source ports; only actual
+per-queue RX advancement satisfies the queue witness. Under
+`HONK_XDP_ARTIFACT_ROOT`, `adaptive-runtime.bindings.jsonl` and matching
+`adaptive-runtime.binding ` stdout records retain five startup events: A once
+and B four times. Each records its actual capture incarnation (`startup_id`),
+namespace/inode, driver, device/ifindex, configured mode and every observed
+queue bind mode. `adaptive-runtime.joined` is written only after actual peer,
+scope/CQ, socket, worker and OS-thread joins, exact guard detach and owned-pin
+cleanup. This source coverage requires a passing rig execution before any run
+is accepted; it establishes no virtio equivalence, physical-NIC performance or
+DMA-release result. Existing Copy and virtio Event profiles remain separate.
+
 
 Stop traffic sources before removing custody. Normal shutdown reports `XDP admission closed; UMEM retained until process exit`; the netdev XDP attachment remains a fail-closed guard, with `guard`/`data` program pins under `<bpf-pin-root>/xdp-<ifindex>/`. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Startup refuses an interface that still has an XDP attachment. After stopping sources and verifying the attached program ID belongs to this instance's guard, remove that attachment (`ip link set dev <interface> xdp off`), then only its owned pins. There is no automatic zero-resident hot reopen: retained UMEM remains charged against the process-lifetime **512 MiB** ceiling; close and empty rings are not DMA-release evidence.
 

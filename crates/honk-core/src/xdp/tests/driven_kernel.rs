@@ -392,14 +392,23 @@ async fn start_runtime(
     for realm in &runtime.realms {
         assert!(links.logical_links().any(|link| link == realm.link));
     }
+    let zero_copy = config
+        .datapath
+        .as_ref()
+        .context("XDP configuration missing")?
+        .effective_xsk_mode()
+        == XskMode::ZeroCopy;
     for device in &runtime.devices {
         device.info.validate_current()?;
-        assert!(
-            device
-                .queues
-                .iter()
-                .all(|queue| !queue.io.get_ref().zerocopy())
-        );
+        for queue in &device.queues {
+            assert_eq!(
+                queue.io.get_ref().zerocopy(),
+                zero_copy,
+                "actual AF_XDP mode differs from configuration on {} queue {}",
+                device.info.name,
+                queue.id
+            );
+        }
     }
     ensure!(!runtime.topology.get_mut().check_changed()?);
     runtime.rebuild_polling_context();

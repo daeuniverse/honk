@@ -4,9 +4,10 @@ use super::*;
 use crate::control::poll_budget::{PollBudgetBinding, PollBudgetSnapshot, ProcessPollBudget};
 use crate::control::{ControlCommand, ReloadReply};
 use crate::xdp::polling::testing::{ClockFault, Control, Snapshot};
-use honk_config::datapath::{BusyPollConfig, CalibrationStatus, PollCalibration, PollMode};
-use std::os::fd::AsRawFd;
-use std::sync::atomic::AtomicU64;
+use honk_config::datapath::{
+    BusyPollConfig, CalibrationStatus, PollCalibration, PollMode, XskMode,
+};
+use std::{io::Write as _, os::fd::AsRawFd, sync::atomic::AtomicU64};
 use tokio::sync::{mpsc, oneshot, watch};
 
 mod clocks;
@@ -365,7 +366,12 @@ impl Owner {
                     .await
                 {
                     Ok(outcome) => {
-                        if let Ok(Err(cause)) = outcome {
+                        let cause = match outcome {
+                            Ok(Err(cause)) => Some(cause),
+                            Ok(Ok(mut retired)) => retired.failure.take(),
+                            Err(_) => None,
+                        };
+                        if let Some(cause) = cause {
                             error = cause.context("real owner startup failed");
                         }
                         if thread.join().is_err() {
@@ -665,6 +671,103 @@ fn enter_owned_namespace(namespace: &OwnedNamespace) -> anyhow::Result<Namespace
     Ok(NamespaceCustody { net, mount })
 }
 
+fn record_bindings(
+    runtime: &Runtime,
+    config: &Config,
+    namespace: &OwnedNamespace,
+    artifacts: &Path,
+) -> anyhow::Result<()> {
+    let namespace_inode = std::fs::metadata("/proc/thread-self/ns/net")?.ino();
+    ensure!(
+        namespace_inode == namespace.inode,
+        "binding receipt is outside the retained owner namespace"
+    );
+    let xsk_mode = config
+        .datapath
+        .as_ref()
+        .context("XDP configuration missing")?
+        .effective_xsk_mode();
+    let startup_id = runtime
+        .devices
+        .first()
+        .context("binding receipt has no captured device")?
+        .capture
+        .authority
+        .attachment_generation;
+    let mut devices = Vec::with_capacity(runtime.devices.len());
+    for device in &runtime.devices {
+        let context = device
+            .features
+            .as_ref()
+            .context("binding receipt has no actual retained driver context")?
+            .context();
+        ensure!(
+            context.starts_with(b"HXFEAT\0\x01"),
+            "binding receipt has an unsupported retained feature context"
+        );
+        let field = context
+            .get(8..40)
+            .context("retained driver field is truncated")?;
+        let end = field
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(field.len());
+        let driver = std::str::from_utf8(&field[..end])?;
+        ensure!(
+            device
+                .queues
+                .iter()
+                .map(|queue| queue.id)
+                .eq(device.info.queues.iter().copied()),
+            "actual bound queues differ from device readback on {}",
+            device.info.name
+        );
+        if xsk_mode == XskMode::ZeroCopy {
+            ensure!(
+                driver == "igb",
+                "adaptive ZeroCopy fixture requires actual igb: {driver}"
+            );
+            ensure!(
+                device.info.queues == [0, 1],
+                "adaptive ZeroCopy fixture requires exact queues [0, 1] on {}: {:?}",
+                device.info.name,
+                device.info.queues
+            );
+        }
+        let queues: Vec<_> = device
+            .queues
+            .iter()
+            .map(|queue| {
+                serde_json::json!({
+                    "queue_id": queue.id,
+                    "zero_copy": queue.io.get_ref().zerocopy(),
+                })
+            })
+            .collect();
+        devices.push(serde_json::json!({
+            "device": device.info.name,
+            "ifindex": device.info.ifindex,
+            "driver": driver,
+            "queues": queues,
+        }));
+    }
+    let record = serde_json::json!({
+        "schema": 1,
+        "startup_id": startup_id,
+        "namespace": namespace.name,
+        "namespace_inode": namespace_inode,
+        "xsk_mode": xsk_mode,
+        "devices": devices,
+    });
+    let line = format!("{record}\n");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(artifacts.join("adaptive-runtime.bindings.jsonl"))?
+        .write_all(line.as_bytes())?;
+    print!("adaptive-runtime.binding {line}");
+    Ok(())
+}
+
 async fn serve(
     config: Config,
     binding: PollBudgetBinding,
@@ -700,6 +803,7 @@ async fn serve(
     let backend = plane.policy_backend_handle();
     let (mut runtime, mut owner) =
         start_runtime(plane, &config, &pins, &artifacts, admission).await?;
+    let binding_failure = record_bindings(&runtime, &config, &namespace, &artifacts).err();
     let control = runtime.polling.test_control();
     let budget = runtime.polling.budget.as_ref().unwrap().clone();
     let (requests, mut receive) = mpsc::channel(4);
@@ -724,16 +828,21 @@ async fn serve(
             fair_count.fetch_add(1, Ordering::SeqCst);
         }
     });
-    let controller_left = started
-        .send(Ready {
-            requests,
-            commands,
-            router,
-            publication,
-            control: Arc::clone(&control),
-            fairness,
-        })
-        .is_err();
+    let controller_left = if binding_failure.is_none() {
+        started
+            .send(Ready {
+                requests,
+                commands,
+                router,
+                publication,
+                control: Arc::clone(&control),
+                fairness,
+            })
+            .is_err()
+    } else {
+        drop(started);
+        true
+    };
     let attempts = Arc::new(ReaderAttempts::default());
     let authority = runtime.core.as_ref().map(RoutedCore::authority);
     let acquire = || {
@@ -758,8 +867,10 @@ async fn serve(
     tokio::pin!(reader, timer, notification);
     let watchdog = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline));
     tokio::pin!(watchdog);
-    let mut failure = controller_left
-        .then(|| anyhow::anyhow!("fixture controller disappeared during real startup"));
+    let mut failure = binding_failure.or_else(|| {
+        controller_left
+            .then(|| anyhow::anyhow!("fixture controller disappeared during real startup"))
+    });
     let mut joined_plane = None;
     loop {
         if Instant::now() >= deadline {
@@ -920,7 +1031,7 @@ async fn serve(
     })
 }
 
-fn configuration(core: bool) -> anyhow::Result<Config> {
+fn configuration(core: bool, xsk_mode: XskMode) -> anyhow::Result<Config> {
     let interfaces = if core {
         "dut0: lan\n dut1: wan"
     } else {
@@ -930,7 +1041,7 @@ fn configuration(core: bool) -> anyhow::Result<Config> {
     let mut config = honk_config::parser::parse_dae_config(&format!(
         "global {{ dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }}\n\
          dns {{ bind: '' }}\n\
-         datapath {{ backend: xdp\n direct: {profile}\n xsk_mode: copy\n interface {{ {interfaces} }} }}\n\
+         datapath {{ backend: xdp\n direct: {profile}\n interface {{ {interfaces} }} }}\n\
          routing {{ dport(18084) -> packet-proof\n dport(18086) -> packet-proof\n fallback: direct }}"
     ))?;
     config.ensure_builtin_nodes();
@@ -945,6 +1056,7 @@ fn configuration(core: bool) -> anyhow::Result<Config> {
         nodes: vec![honk_config::config::DIRECT_NODE_ID],
         ..Default::default()
     });
+    config.datapath.as_mut().unwrap().xsk_mode = Some(xsk_mode);
     config.datapath.as_mut().unwrap().busy_poll = Some(BusyPollConfig {
         // Same small correctness-fixture parameters as the real daemon candidate profile.
         pps_enter: 1,
@@ -1443,9 +1555,23 @@ impl TcpPeer {
 #[tokio::test]
 #[ignore = "requires the owned adaptive disposable-VM window, real AF_XDP and run-owned B namespaces"]
 async fn actual_owner_clock_budget_fairness_and_live_features() -> anyhow::Result<()> {
+    actual_owner_fixture(XskMode::Copy).await
+}
+
+#[tokio::test]
+#[ignore = "requires the owned recent-kernel igb adaptive-ZeroCopy VM window and run-owned B namespaces"]
+async fn actual_zerocopy_owner_clock_budget_fairness_and_live_features() -> anyhow::Result<()> {
+    actual_owner_fixture(XskMode::ZeroCopy).await
+}
+
+async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
+    let deadline = Instant::now() + WINDOW;
     let pins = guarded_pin_root().join("adaptive");
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
-    let deadline = Instant::now() + WINDOW;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(artifacts.join("adaptive-runtime.bindings.jsonl"))?;
     let b_namespace = OwnedNamespace::b(deadline)?;
     let a_namespace = OwnedNamespace::open(
         "dut".into(),
@@ -1460,7 +1586,7 @@ async fn actual_owner_clock_budget_fairness_and_live_features() -> anyhow::Resul
     let publisher = ProcessPollBudget::initialize_process(true)?;
     let budget = publisher.participant_handle();
     let a = Owner::start(
-        configuration(true)?,
+        configuration(true, xsk_mode)?,
         PollBudgetBinding::Publisher(publisher),
         a_namespace,
         pins.join("a"),
@@ -1469,7 +1595,7 @@ async fn actual_owner_clock_budget_fairness_and_live_features() -> anyhow::Resul
     )
     .await?;
     let b = Owner::start(
-        configuration(false)?,
+        configuration(false, xsk_mode)?,
         PollBudgetBinding::Participant(budget.clone()),
         b_namespace.clone(),
         pins.join("b"),
