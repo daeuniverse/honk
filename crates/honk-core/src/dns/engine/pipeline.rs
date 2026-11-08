@@ -21,11 +21,13 @@ mod flight {
 
     pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(Ok(Arc::new(FlightAnswer {
-                template: template.clone(),
-                provenance: outcome.provenance(),
-                final_upstream: outcome.final_upstream().map(Into::into),
-            })));
+            leader.publish(|| {
+                Ok(Arc::new(FlightAnswer {
+                    template: template.clone(),
+                    provenance: outcome.provenance(),
+                    final_upstream: outcome.final_upstream().map(Into::into),
+                }))
+            });
         }
         outcome
     }
