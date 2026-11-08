@@ -60,11 +60,11 @@ impl RealEbpfBackend {
             anyhow::bail!("injected retirement barrier failure");
         }
         let bpf = self
-            .bpf
+            .maps
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("BPF backend closed"))?;
         let root = bpf
-            .map_mut("RETIRE_GRACE_ROOT")
+            .get_mut("RETIRE_GRACE_ROOT")
             .ok_or_else(|| anyhow::anyhow!("RETIRE_GRACE_ROOT unavailable"))?;
         // Linux map-in-map replacement synchronously waits for pre-update BPF
         // readers even when reinstalling the same inner FD. Never route through

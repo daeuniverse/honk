@@ -1274,7 +1274,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         .with_cache_ttl(config.dns.cache.ttl.min(u64::from(u32::MAX)) as u32)
         .with_stale_reply_ttl(config.dns.cache.stale_reply_ttl)
         .with_policy_id(dns_policy)
-        .with_hosts_snapshot(hosts_snapshot),
+        .with_hosts_snapshot(hosts_snapshot)
+        .with_node_hosts(dns::node_host::index(&config)),
     );
     info!("DNS forwarder ready");
 
@@ -1290,6 +1291,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         resource_budget,
         Arc::clone(&degradations),
     )?;
+    honk_outbound::bootstrap::set_node_host_resolver(Some(dns::node_host::resolver(
+        &control_plane.dns_service(),
+    )));
     if nfqueue_unavailable {
         control_plane
             .startup_downgrades()

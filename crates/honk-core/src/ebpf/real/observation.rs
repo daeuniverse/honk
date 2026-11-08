@@ -10,36 +10,40 @@ use aya::programs::{ProgramError, links::FdLink};
 impl RealEbpfBackend {
     pub(super) fn observe_backend(&self) -> DatapathObservation {
         let mut result = DatapathObservation::unknown(DatapathKind::Real);
-        let Some(bpf) = &self.bpf else {
+        let Some(loader) = &self.programs else {
             result.programs = DatapathCheck::Absent;
             result.hooks = DatapathCheck::Absent;
             result.routing = DatapathCheck::Absent;
             return result;
         };
         result.listeners_published = Some(self.listeners_published);
-        result.programs = DatapathCheck::Absent;
-        for (index, (name, program)) in bpf.programs().enumerate() {
-            if index == MAX_DATAPATH_PROGRAMS {
-                result.programs = DatapathCheck::Unknown;
-                result.record_error(DatapathObservationError::Limit);
-                break;
-            }
-            match program.info() {
-                Ok(info) => {
-                    result.loaded_programs.push(DatapathProgram {
-                        name: name.to_owned(),
-                        id: info.id(),
-                    });
-                    if result.programs != DatapathCheck::Error {
-                        result.programs = DatapathCheck::Verified;
+        if let Some(bpf) = loader.try_object() {
+            result.programs = DatapathCheck::Absent;
+            for (index, (name, program)) in bpf.programs().enumerate() {
+                if index == MAX_DATAPATH_PROGRAMS {
+                    result.programs = DatapathCheck::Unknown;
+                    result.record_error(DatapathObservationError::Limit);
+                    break;
+                }
+                match program.info() {
+                    Ok(info) => {
+                        result.loaded_programs.push(DatapathProgram {
+                            name: name.to_owned(),
+                            id: info.id(),
+                        });
+                        if result.programs != DatapathCheck::Error {
+                            result.programs = DatapathCheck::Verified;
+                        }
+                    }
+                    Err(ProgramError::NotLoaded) => {}
+                    Err(_) => {
+                        result.programs = DatapathCheck::Error;
+                        result.record_error(DatapathObservationError::Programs);
                     }
                 }
-                Err(ProgramError::NotLoaded) => {}
-                Err(_) => {
-                    result.programs = DatapathCheck::Error;
-                    result.record_error(DatapathObservationError::Programs);
-                }
             }
+        } else {
+            result.programs = DatapathCheck::Unknown;
         }
         match self.observed_routing_generation() {
             Ok(Some(generation)) => {

@@ -41,7 +41,7 @@
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片长度范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | 分片间隔范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `mptcp` | `mptcp` | `false` | MPTCP 兼容开关；当前拨号路径不读取该字段。 |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。 |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。DNS [`subtag()` 规则](./dns.md#节点服务器域名)可以改为接管某订阅的节点主机名。 |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | 回退 resolver 兼容值；当前运行时不读取该字段。 |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | 发送带宽提示兼容值，例如 `'200 mbps'`；当前运行时不读取该字段。 |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | 接收带宽提示兼容值；当前运行时不读取该字段。 |

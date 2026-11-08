@@ -1,5 +1,9 @@
-use aya_obj::generated::{bpf_attr, bpf_cmd::BPF_PROG_LOAD, bpf_prog_type};
-use std::os::fd::{FromRawFd, OwnedFd};
+use aya_obj::generated::{
+    bpf_attr,
+    bpf_cmd::{BPF_OBJ_GET_INFO_BY_FD, BPF_PROG_LOAD},
+    bpf_prog_info, bpf_prog_type,
+};
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 
 pub(super) const MOV64_REG: u8 = 0xbf;
 pub(super) const MOV64_IMM: u8 = 0xb7;
@@ -30,4 +34,14 @@ pub(super) fn load_program(
     let fd = unsafe { super::syscall::bpf_syscall(BPF_PROG_LOAD as libc::c_long, &mut attr) }
         .map_err(|errno| std::io::Error::from_raw_os_error(errno as i32))?;
     Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+pub(super) fn program_info(fd: RawFd, info: &mut bpf_prog_info) -> anyhow::Result<()> {
+    let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
+    attr.info.bpf_fd = fd as u32;
+    attr.info.info_len = core::mem::size_of::<bpf_prog_info>() as u32;
+    attr.info.info = info as *mut bpf_prog_info as u64;
+    unsafe { super::syscall::bpf_syscall(BPF_OBJ_GET_INFO_BY_FD as _, &mut attr) }
+        .map(|_| ())
+        .map_err(|errno| anyhow::anyhow!("BPF_OBJ_GET_INFO_BY_FD failed with errno {errno}"))
 }

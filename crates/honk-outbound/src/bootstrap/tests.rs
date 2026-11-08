@@ -173,6 +173,49 @@ async fn test_resolve_via_bootstrap_udp() {
 }
 
 #[tokio::test]
+async fn claimed_node_host_replaces_bootstrap_only_on_the_global_path() {
+    if run_global_test_in_child(
+        "bootstrap::tests::claimed_node_host_replaces_bootstrap_only_on_the_global_path",
+    ) {
+        return;
+    }
+    struct Claim;
+    impl NodeHostResolver for Claim {
+        fn lookup(&self, host: &str) -> Option<NodeHostLookup> {
+            let answer = match host {
+                "localhost" => Ok(vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]),
+                "failing.invalid" | "192.0.2.9" => Err(io::Error::other("claimed lookup failed")),
+                _ => return None,
+            };
+            Some(Box::pin(std::future::ready(answer)))
+        }
+    }
+    set_node_host_resolver(Some(Arc::new(Claim)));
+
+    assert_eq!(
+        resolve("localhost").await.unwrap(),
+        [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7))]
+    );
+    assert_eq!(
+        resolve("failing.invalid").await.unwrap_err().to_string(),
+        "claimed lookup failed",
+        "a claimed host never falls back to bootstrap resolution"
+    );
+    assert_eq!(
+        resolve("192.0.2.9").await.unwrap(),
+        [IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9))]
+    );
+    // DNS upstream hosts resolve through the explicit-resolver path, which a
+    // claim must not reach or a provider DoH host could recurse into itself.
+    let hosts = tokio::fs::read_to_string("/etc/hosts").await.unwrap();
+    assert_eq!(
+        resolve_with(None, "localhost").await.unwrap(),
+        hosts_addresses(&hosts, "localhost")
+    );
+    set_node_host_resolver(None);
+}
+
+#[tokio::test]
 async fn silent_aaaa_keeps_a_answer_within_family_budget() {
     let a = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 44));
     let server = spawn_udp_stub(move |query| match qtype(query) {

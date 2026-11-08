@@ -29,9 +29,9 @@ async fn allocation_failure_allows_create_connect_and_send_without_identity() {
                 netlink.set_link_up(loopback, true).unwrap();
                 let mut storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
                     backend
-                        .bpf_mut()
+                        .maps_mut()
                         .unwrap()
-                        .map_mut("SOCKET_IDENTITY")
+                        .get_mut("SOCKET_IDENTITY")
                         .unwrap(),
                 )
                 .unwrap();
@@ -177,6 +177,7 @@ fn unavailable_cgroup_capture_refuses_startup() {
             12345,
             &dae0_setup,
             0,
+            &crate::ebpf::interface::TcProgram::ALL,
         ));
         assert!(
             result.is_err(),
@@ -252,8 +253,15 @@ async fn occupied_sock_ops_slot_refuses_startup_without_leaving_links() {
     let links_before = held_bpf_link_count();
     let programs_before = cgroup_attached_prog_count(foreign.cgroup.as_raw_fd());
 
-    let result =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0).await;
+    let result = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await;
     assert!(
         result.is_err(),
         "startup allowed an occupied root sock_ops slot"

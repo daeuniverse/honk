@@ -496,12 +496,15 @@ async fn resolve<'a>(
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             vec![ip]
         } else {
-            match dns.resolve(host).await {
+            match dns.resolve_node_server(host).await {
                 Ok(addresses) => addresses,
                 Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
                     return Err(unsupported(refused, json!({"check":"resolution"})));
                 }
-                Err(_) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(host, error = %format_args!("{error:#}"), "probe target resolution failed");
+                    Vec::new()
+                }
             }
         };
         let mut unique = Vec::with_capacity(addresses.len());

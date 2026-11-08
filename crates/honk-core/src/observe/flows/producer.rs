@@ -59,7 +59,7 @@ impl FlowGuard {
             return;
         };
         match event {
-            FlowEvent::Gap(reason) => self.mark_gap(reason),
+            FlowEvent::Gap(reason) => store.mark_gap(&self.id, reason),
             FlowEvent::Dns(data) => {
                 if data.attempt_id != context.attempt_id
                     || (context.lookup_id != Some(data.lookup_id)

@@ -69,7 +69,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | 字段 | 类型 | 默认值 | 可在 dae 中设置 | 含义 |
 | --- | --- | --- | --- | --- |
 | `id` | UUID | 随机 UUID | 否 | 运行时订阅身份；SIGHUP 时，若拉取身份（URL + 配置的 `ua` + 标头）与已有订阅匹配则保留该值。 |
-| `name` | string | `""` | 是，作为标签；省略时取 URL 主机名 | 显示标签，也是组 `subtag(...)` 过滤条件使用的值。 |
+| `name` | string | `""` | 是，作为标签；省略时取 URL 主机名 | 显示标签，也是组 `subtag(...)` 过滤条件和 DNS `subtag(...)` 规则使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
 | `update_interval` | u64 | `86400` | 是，对应 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |

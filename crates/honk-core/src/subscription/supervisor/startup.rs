@@ -118,7 +118,11 @@ impl SupervisorState {
                                 }
                             }
                             Some(Err(error)) => {
-                                self.fail_startup_load(subscription.id, super::super::failure_code(&error));
+                                self.fail_startup_load(
+                                    subscription.id,
+                                    super::super::failure_code(&error),
+                                    super::super::failure_stage(&error),
+                                );
                                 warn!(subscription = %subscription.name, %error, "Failed to fetch subscription");
                             }
                             None => {}
@@ -129,7 +133,7 @@ impl SupervisorState {
                         if let Some(id) = self.fetch_ids.remove(&error.id()) {
                             self.flights.remove(&id);
                             requires_network.remove(&id);
-                            self.fail_startup_load(id, "fetch_failed");
+                            self.fail_startup_load(id, "fetch_failed", None);
                         }
                         tracing::error!(%error, "Subscription startup task failed");
                     }
@@ -184,6 +188,7 @@ impl SupervisorState {
             );
             load.error = Some("publication_rejected");
             load.rejection = Some("duplicate-node-id");
+            load.fetch = None;
             return None;
         }
         let count = nodes.len();
@@ -195,16 +200,23 @@ impl SupervisorState {
             cached,
             error: None,
             rejection: None,
+            fetch: None,
         };
         Some(count)
     }
 
-    fn fail_startup_load(&mut self, id: uuid::Uuid, error: &'static str) {
+    fn fail_startup_load(
+        &mut self,
+        id: uuid::Uuid,
+        error: &'static str,
+        fetch: Option<super::super::route::FetchFailure>,
+    ) {
         {
             let mut observations = self.observations.write();
             let load = &mut observations.get_mut(&id).unwrap().load;
             load.error = Some(error);
             load.rejection = None;
+            load.fetch = fetch;
         }
         if let Some(provider) = self.providers.get_mut(&id) {
             provider.finished(Instant::now(), Some(error));

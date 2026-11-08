@@ -29,14 +29,9 @@ fn repeated_expiry_hints_are_bounded_without_renewing_or_releasing_refused_flows
         }
         let (src, dst) = PEERS[0];
         let (mut backend, _, _listeners) = proxy_fixture();
-        let mut ring = RingBuf::try_from(
-            backend
-                .bpf_mut()
-                .unwrap()
-                .take_map("EVENT_RINGBUF")
-                .unwrap(),
-        )
-        .unwrap();
+        let mut ring =
+            RingBuf::try_from(backend.maps_mut().unwrap().remove("EVENT_RINGBUF").unwrap())
+                .unwrap();
         for side in ["lan_ingress_l2", "wan_egress_l2"] {
             for (index, (proto, state, age)) in [
                 (IPPROTO_UDP, UdpDecisionState::None as u8, 121_000_000_000),

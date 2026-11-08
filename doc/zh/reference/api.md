@@ -692,7 +692,7 @@ JSON 转义可能使修订大于源文件本身。单个修订的 JSON 超过 16
 
 HTTP 使用配置的检查 URL，不跟随重定向。DNS 执行实际 UDP 或带长度帧的 TCP 交换。探测目标仅来自已接受的配置，不对目标或节点服务器应用地址或端口策略。
 
-私网、回环地址与非默认配置端口无需放行。IPv4-mapped IPv6 规范化为 IPv4，选中的 IP 保持固定，HTTP Host/TLS SNI 保留配置的名称，不能交给代理重新解析。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。
+目标主机名按当前 DNS 配置解析；该配置无法应答时，例如使用 `asis` 路由，回退到 bootstrap DNS。私网、回环地址与非默认配置端口无需放行。IPv4-mapped IPv6 规范化为 IPv4，选中的 IP 保持固定，HTTP Host/TLS SNI 保留配置的名称，不能交给代理重新解析。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。
 
 能够写入配置或控制订阅内容的人决定这些目标。订阅源内容属于受信任的配置。
 
@@ -700,6 +700,7 @@ HTTP 使用配置的检查 URL，不跟随重定向。DNS 执行实际 UDP 或�
 | --- | --- |
 | 每项任务的成员关联 | 64 |
 | 每项任务的结果行 | 256 |
+| 每项任务的并发测量 | 10 |
 | 活动任务 | 4 |
 | 排队任务 | 16 |
 | 每个目标的任务 | 1 |
@@ -823,9 +824,9 @@ action 为 `upstream` 或 `requery` 时，`upstream` 为引擎使用的小写名
 
 真实失败且无节点才是 error，保留旧/缓存节点时为 stale。订阅条目还带有 `download`，即由 `download_detour` 决定的拉取路由，结构与 geodata 路由相同：`route` 为 `routing`、`direct` 或 `group`，`group_id` 为该组在 `GET /groups` 中的 ID，其他路由或组已不存在时为 null。文件与内联条目为 null。
 
-拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
+拉取失败时 `last_error.code` 为 `fetch_failed`。订阅的下载路由尚无可用节点时为 `route_unavailable`，见[订阅参考](./subscription.md#拉取持久化与恢复)。已分类的 `fetch_failed` 错误通过 `details` 给出失败阶段 `stage`（例如 `connection_failed`、`download_timeout`、`tls_failed`、`parse_failed`）、选中的节点 `node` 和选中该节点的组 `group_id`。无效 URL、重定向等未分类失败返回 `details: null`。直连下载、选中节点前的失败，以及无法保留下载归属的解析失败，其 `node` 为 null；没有组归属或对应组已不在目录中时，`group_id` 为 null。配置校验拒绝发布时（例如节点与静态节点重复），`last_error.code` 为 `publication_rejected`，诊断代码写在 `details.diagnostic_code`（例如 `duplicate-node-id`）。
 
-失败的 refresh 操作带相同的 details。列表 `limit` 默认 100、范围 1–1000，快照上限 8 份/30 秒/4 MiB，容量不足时返回 `503 snapshot_unavailable` 并带 `Retry-After`。游标无法识别时同样返回 `410 snapshot_expired`，带不同过滤器或 `limit` 的已识别游标返回 `400 invalid_request`。
+因发布被拒而失败的 refresh 操作带相同的 `details.diagnostic_code`；拉取的 `stage`、`node` 和 `group_id` 只出现在订阅源的 `last_error` 中。列表 `limit` 默认 100、范围 1–1000，快照上限 8 份/30 秒/4 MiB，容量不足时返回 `503 snapshot_unavailable` 并带 `Retry-After`。游标无法识别时同样返回 `410 snapshot_expired`，带不同过滤器或 `limit` 的已识别游标返回 `400 invalid_request`。
 
 启用且有运行 supervisor 的订阅可 POST refresh。订阅已禁用或未挂接 supervisor（`can_refresh: false`）时返回 `404 capability_not_supported`。同订阅源的不同并发 refresh 为 409，保留的幂等重放先于冲突检查。
 

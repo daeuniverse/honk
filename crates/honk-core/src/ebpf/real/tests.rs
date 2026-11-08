@@ -4,6 +4,7 @@ mod attachment;
 mod bindings;
 mod btf_source;
 mod mandatory_helpers;
+mod programs;
 mod raw_bpf;
 mod retirement;
 mod socket_identity;
@@ -98,9 +99,16 @@ pub(crate) fn in_netns<T>(netns: &std::os::fd::OwnedFd, f: impl FnOnce() -> T) -
 /// outlive the backend.
 async fn load_bare(pin_root: &Path) -> (crate::daens::Dae0Guard, RealEbpfBackend) {
     let (dae0, setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
-    let backend = RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, pin_root, 12345, &setup, 0)
-        .await
-        .expect("backend load");
+    let backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        pin_root,
+        12345,
+        &setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend load");
     (dae0, backend)
 }
 
@@ -213,7 +221,7 @@ fn link_lifecycle_holds_links_and_rebinds_primary_wan() {
             let baseline = cgroup_attached_prog_count(cgroup_file.as_raw_fd());
             let (_dae0, mut backend) = load_bare(&pin_root).await;
             backend.bind_test_interfaces(&[], &["lifecycle-wan"]);
-            syscall::reset_udp_decision_sequence_locked(backend.bpf().unwrap(), 2)
+            syscall::reset_udp_decision_sequence_locked(backend.maps().unwrap(), 2)
                 .expect("locked sequence reset");
             assert_eq!(
                 backend
@@ -445,8 +453,9 @@ async fn cleanup_leaves_foreign_pins_under_a_shared_pin_root() {
     }
     backend.detach_hooks().expect("detach hooks");
     let trace = backend
-        .receive_trace()
-        .expect("attach real receive fallback");
+        .prepare_receive_trace()
+        .expect("receive trace preparation")()
+    .expect("attach real receive fallback");
     let trace_owner = std::sync::Arc::downgrade(&trace);
     let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     receiver
@@ -507,16 +516,22 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     let pin_root =
         Path::new("/sys/fs/bpf").join(format!("honk-sequence-reload-test-{}", std::process::id()));
     let (_dae0, dae0_setup) = crate::daens::create_test_dae0_pair().expect("dae0 pair");
-    let mut backend =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-            .await
-            .expect("backend load");
+    let mut backend = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend load");
     let sequence_map_id = aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
         .expect("initial sequence map info")
         .id();
     let persisted_next = (1 << UDP_DECISION_GENERATION_SHIFT) | 42;
     syscall::write_udp_decision_sequence_locked(
-        backend.bpf().unwrap(),
+        backend.maps().unwrap(),
         &UdpDecisionSequence {
             next: persisted_next,
             ..UdpDecisionSequence::default()
@@ -526,10 +541,16 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
     backend.detach_hooks().expect("detach hooks");
     backend.cleanup().await.expect("cleanup");
 
-    let mut reloaded =
-        RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-            .await
-            .expect("backend reload");
+    let mut reloaded = RealEbpfBackend::load(
+        crate::DEFAULT_BPF_OBJECT,
+        &pin_root,
+        12345,
+        &dae0_setup,
+        0,
+        &crate::ebpf::interface::TcProgram::ALL,
+    )
+    .await
+    .expect("backend reload");
     assert_eq!(
         aya::maps::MapInfo::from_pin(pin_root.join(UDP_DECISION_SEQUENCE_MAP))
             .expect("reloaded sequence map info")
@@ -561,7 +582,7 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
         )
         .expect("seed live retirement fence");
     syscall::write_udp_decision_sequence_locked(
-        reloaded.bpf().unwrap(),
+        reloaded.maps().unwrap(),
         &UdpDecisionSequence {
             next: udp_decision_token(1, UDP_DECISION_SEQUENCE_MASK).unwrap(),
             ..UdpDecisionSequence::default()
@@ -589,7 +610,7 @@ async fn pinned_raw_udp_decision_sequence_survives_reload() {
             .reset_udp_decision_sequence(2)
             .expect("reset after retirement fence removal")
     );
-    let reset = syscall::read_udp_decision_sequence_locked(reloaded.bpf().unwrap())
+    let reset = syscall::read_udp_decision_sequence_locked(reloaded.maps().unwrap())
         .expect("read reset rollback-compatible sequence");
     assert_eq!(reset.next, 2 << UDP_DECISION_GENERATION_SHIFT);
     assert_eq!(reset.exhausted, 0);
@@ -626,9 +647,16 @@ async fn invalid_routing_sequence_pin_is_never_reset() {
         sequence.map().pin(&pin).unwrap();
         let id = sequence.map().info().unwrap().id();
         assert!(
-            RealEbpfBackend::load(crate::DEFAULT_BPF_OBJECT, &pin_root, 12345, &dae0_setup, 0)
-                .await
-                .is_err()
+            RealEbpfBackend::load(
+                crate::DEFAULT_BPF_OBJECT,
+                &pin_root,
+                12345,
+                &dae0_setup,
+                0,
+                &crate::ebpf::interface::TcProgram::ALL
+            )
+            .await
+            .is_err()
         );
         assert_eq!(aya::maps::MapInfo::from_pin(&pin).unwrap().id(), id);
         assert_eq!(sequence.get(&0, 0).unwrap(), value);
@@ -686,7 +714,7 @@ async fn pname_is_ready_before_first_packet() {
         }
     };
     let storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
-        backend.bpf().unwrap().map("SOCKET_IDENTITY").unwrap(),
+        backend.maps().unwrap().get("SOCKET_IDENTITY").unwrap(),
     )
     .expect("socket identity storage");
     for socket in &sockets {
@@ -710,9 +738,9 @@ async fn pname_is_ready_before_first_packet() {
         retained.pname[..12].copy_from_slice(b"sticky-owner");
         aya::maps::SkStorage::<_, SocketIdentity>::try_from(
             backend
-                .bpf_mut()
+                .maps_mut()
                 .unwrap()
-                .map_mut("SOCKET_IDENTITY")
+                .get_mut("SOCKET_IDENTITY")
                 .unwrap(),
         )
         .unwrap()
@@ -741,7 +769,7 @@ async fn pname_is_ready_before_first_packet() {
         assert_eq!(receiver.recv(&mut bytes).unwrap(), bytes.len());
         assert_eq!(&bytes, b"sticky");
         let storage = aya::maps::SkStorage::<_, SocketIdentity>::try_from(
-            backend.bpf().unwrap().map("SOCKET_IDENTITY").unwrap(),
+            backend.maps().unwrap().get("SOCKET_IDENTITY").unwrap(),
         )
         .unwrap();
         assert_eq!(storage.get(&duplicate, 0).unwrap(), retained);
@@ -814,7 +842,8 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         )
         .unwrap();
         let before = backend.observe_datapath();
-        assert_eq!(before.programs, DatapathCheck::Absent);
+        // The fixture, like startup, already holds its routing targets.
+        assert_eq!(before.programs, DatapathCheck::Verified);
         assert_eq!(before.hooks, DatapathCheck::Absent);
         assert_eq!(before.routing, DatapathCheck::Absent);
         assert_eq!(before.admission, Some(false));
@@ -870,9 +899,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         assert!(checked.errors.is_empty());
 
         let root = backend
-            .bpf()
+            .maps()
             .unwrap()
-            .map(ROUTING_POLICY_ROOT_NAME)
+            .get(ROUTING_POLICY_ROOT_NAME)
             .unwrap();
         let root = ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
             .unwrap();
@@ -882,9 +911,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
             .set(0, &old_descriptor.get(&0, 0).unwrap(), 0)
             .unwrap();
         let root = backend
-            .bpf_mut()
+            .maps_mut()
             .unwrap()
-            .map_mut(ROUTING_POLICY_ROOT_NAME)
+            .get_mut(ROUTING_POLICY_ROOT_NAME)
             .unwrap();
         ArrayOfMaps::<_, AyaArray<AyaMapData, RoutingPolicyDescriptor>>::try_from(root)
             .unwrap()
@@ -906,9 +935,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
         assert!(backend.set_datapath_ready(true).is_err());
         {
             let map = backend
-                .bpf_mut()
+                .maps_mut()
                 .unwrap()
-                .map_mut("LISTEN_SOCKET_MAP")
+                .get_mut("LISTEN_SOCKET_MAP")
                 .unwrap();
             let mut sockets = AyaSockMap::try_from(map).unwrap();
             for key in 0..10 {
@@ -927,9 +956,9 @@ fn datapath_observation_crosschecks_program_hook_root_and_admission() {
             .unwrap();
         {
             let map = backend
-                .bpf_mut()
+                .maps_mut()
                 .unwrap()
-                .map_mut("LISTEN_SOCKET_MAP")
+                .get_mut("LISTEN_SOCKET_MAP")
                 .unwrap();
             let mut sockets = AyaSockMap::try_from(map).unwrap();
             for key in 6..10 {

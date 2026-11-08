@@ -221,7 +221,7 @@ fn publish(
 }
 
 fn set_array<V: Pod>(backend: &mut RealEbpfBackend, name: &str, index: u32, value: V) {
-    let map = backend.bpf_mut().unwrap().map_mut(name).unwrap();
+    let map = backend.maps_mut().unwrap().get_mut(name).unwrap();
     Array::<_, V>::try_from(map)
         .unwrap()
         .set(index, &value, 0)
@@ -243,7 +243,7 @@ where
 }
 
 fn hash_count<K: Pod, V: Pod>(backend: &RealEbpfBackend, name: &str) -> usize {
-    let map = backend.bpf().unwrap().map(name).unwrap();
+    let map = backend.maps().unwrap().get(name).unwrap();
     HashMap::<_, K, V>::try_from(map)
         .unwrap()
         .keys()
@@ -270,13 +270,8 @@ fn load_classifier(backend: &mut RealEbpfBackend, name: &str) {
 }
 
 fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) -> Run {
-    let program: &SchedClassifier = backend
-        .bpf()
-        .unwrap()
-        .program(name)
-        .unwrap()
-        .try_into()
-        .unwrap();
+    let object = backend.bpf().unwrap();
+    let program: &SchedClassifier = object.program(name).unwrap().try_into().unwrap();
     let mut context: __sk_buff = unsafe { mem::zeroed() };
     context.mark = input.mark;
     context.ingress_ifindex = input.ingress_ifindex;

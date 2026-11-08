@@ -41,7 +41,7 @@ The dae parser accepts compatibility-only keys and stores them in `GlobalConfig`
 | `tls_fragment_length` | `tls_fragment_length` | `""` | Compatibility fragmentation-length range. The current TLS connector does not read it. |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | Compatibility fragmentation-interval range. The current TLS connector does not read it. |
 | `mptcp` | `mptcp` | `false` | Compatibility MPTCP switch. The current dial path does not read it. |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Marked UDP/TCP resolver for node hostnames and control-plane dials. Empty or failed bootstrap resolution uses `/etc/hosts`, then marked DNS to the first numeric `/etc/resolv.conf` nameserver; no libc NSS or search suffixes. |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | Marked UDP/TCP resolver for node hostnames and control-plane dials. Empty or failed bootstrap resolution uses `/etc/hosts`, then marked DNS to the first numeric `/etc/resolv.conf` nameserver; no libc NSS or search suffixes. A DNS [`subtag()` rule](./dns.md#node-server-hosts) can claim a subscription's node hostnames instead. |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | Compatibility fallback-resolver value. The current runtime does not read it. |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | Compatibility transmit-bandwidth hint, such as `'200 mbps'`. The current runtime does not read it. |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | Compatibility receive-bandwidth hint. The current runtime does not read it. |

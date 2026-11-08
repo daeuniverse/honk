@@ -2,6 +2,7 @@ use super::*;
 use crate::{
     control::{ControlCommand, ControlPlane},
     dns::DnsResolver,
+    download_route::Via,
     ebpf::mock::MockEbpfBackend,
     native_api::NativeServer,
     routing::Router,
@@ -416,6 +417,10 @@ async fn failed_initial_fetch_is_error_without_fabricated_success_time() {
     assert_eq!(provider["node_count"], 0);
     assert!(provider["updated_at"].is_null());
     assert_eq!(provider["last_error"]["code"], "fetch_failed");
+    assert_eq!(
+        provider["last_error"]["details"],
+        json!({"stage": "parse_failed", "node": null, "group_id": null})
+    );
     fixture.stop().await;
     origin.stop().await;
 }
@@ -602,7 +607,7 @@ fn provider_debug_omits_full_url() {
         ),
         ..Default::default()
     };
-    let row = Provider::observed(&subscription, ProviderLoad::default(), 0);
+    let row = Provider::observed(&subscription, ProviderLoad::default(), 0, |_| None);
     assert_eq!(row.url_redacted.as_deref(), Some(subscription.url.as_str()));
     assert!(!format!("{row:?}").contains("url-sentinel"));
 }
@@ -665,6 +670,88 @@ fn provider_rows_report_the_download_route_like_geodata() {
         serde_json::to_value(Provider::inline(0)).unwrap()["download"],
         Value::Null
     );
+}
+
+/// A provider whose last fetch failed as `fetch`.
+fn failed_fetch(config: &Config, fetch: Option<FetchFailure>) -> Value {
+    let subscription = Subscription {
+        name: "p".into(),
+        url: "https://example.test/sub".into(),
+        ..Default::default()
+    };
+    let load = ProviderLoad {
+        error: Some("fetch_failed"),
+        fetch,
+        ..Default::default()
+    };
+    let group_id = |name: &str| (name == "proxy").then(|| "group-proxy".to_owned());
+    serde_json::to_value(
+        Provider::observed(&subscription, load, 0, group_id).mask_listener_secrets(config, None),
+    )
+    .unwrap()
+}
+
+#[test]
+fn a_failed_fetch_names_its_stage_node_and_group_without_changing_the_code() {
+    let config = Config::default();
+    let through = |node: &str, group: Option<&str>| FetchFailure {
+        stage: "connection_failed",
+        via: Some(Via {
+            node: node.into(),
+            group: group.map(str::to_owned),
+        }),
+    };
+    let row = failed_fetch(&config, Some(through("hk-1", Some("proxy"))));
+    assert_eq!(row["last_error"]["code"], "fetch_failed");
+    assert_eq!(
+        row["last_error"]["details"],
+        json!({"stage": "connection_failed", "node": "hk-1", "group_id": "group-proxy"})
+    );
+    // A group the catalog does not know, and a node chosen without a group.
+    for group in [Some("gone"), None] {
+        let row = failed_fetch(&config, Some(through("hk-1", group)));
+        assert_eq!(
+            row["last_error"]["details"],
+            json!({"stage": "connection_failed", "node": "hk-1", "group_id": null})
+        );
+    }
+    let direct = FetchFailure {
+        stage: "download_timeout",
+        via: None,
+    };
+    assert_eq!(
+        failed_fetch(&config, Some(direct))["last_error"]["details"],
+        json!({"stage": "download_timeout", "node": null, "group_id": null})
+    );
+    let parse = FetchFailure {
+        stage: "parse_failed",
+        via: None,
+    };
+    assert_eq!(
+        failed_fetch(&config, Some(parse))["last_error"]["details"]["stage"],
+        "parse_failed"
+    );
+    // A failure that names no stage reports none.
+    assert_eq!(
+        failed_fetch(&config, None)["last_error"]["details"],
+        Value::Null
+    );
+}
+
+#[test]
+fn a_failed_fetch_masks_listener_values_in_the_node_name() {
+    let mut config = Config::default();
+    config.experimental.native_api.secret = "native-listener-token".into();
+    let fetch = FetchFailure {
+        stage: "connection_failed",
+        via: Some(Via {
+            node: "node-native-listener-token".into(),
+            group: None,
+        }),
+    };
+    let row = failed_fetch(&config, Some(fetch));
+    assert_eq!(row["last_error"]["details"]["node"], "node-<redacted>");
+    assert!(!row.to_string().contains("native-listener-token"));
 }
 
 #[tokio::test]

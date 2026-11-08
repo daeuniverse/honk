@@ -571,6 +571,21 @@ pub trait EbpfBackend: Send + Sync {
     #[cfg(feature = "ebpf")]
     fn interface_binding_snapshot(&self) -> anyhow::Result<interface::BindingSnapshot>;
 
+    /// Prepare a blocking verifier job without retaining backend ownership.
+    #[cfg(feature = "ebpf")]
+    fn prepare_tc_programs(
+        &self,
+        _programs: &[interface::TcProgram],
+    ) -> anyhow::Result<Option<real::programs::TcProgramPreparation>> {
+        Ok(None)
+    }
+
+    /// Install the current routing generation before making prepared targets bindable.
+    #[cfg(feature = "ebpf")]
+    fn commit_tc_programs(&mut self, _batch: real::programs::TcProgramBatch) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Apply the commit and return replaced or removed link FDs. The caller
     /// must close them outside any lock: the last close takes the rtnl lock.
     #[cfg(feature = "ebpf")]
@@ -765,7 +780,7 @@ pub trait EbpfBackend: Send + Sync {
     }
 
     #[cfg(all(feature = "ebpf", feature = "native-api"))]
-    fn receive_trace(&mut self) -> Option<std::sync::Arc<real::receive_trace::ReceiveTrace>> {
+    fn prepare_receive_trace(&self) -> Option<real::programs::ReceiveTracePreparation> {
         None
     }
 

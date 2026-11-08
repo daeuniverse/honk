@@ -560,7 +560,13 @@ async fn enable_receive_trace(
     if batch.enable_trace(socket, None).is_ok() {
         return Ok(());
     }
-    let trace = ebpf.write().await.receive_trace();
+    let prepare = ebpf.read().await.prepare_receive_trace();
+    let trace = match prepare {
+        Some(prepare) => tokio::task::spawn_blocking(prepare)
+            .await
+            .map_err(std::io::Error::other)?,
+        None => None,
+    };
     batch.enable_trace(socket, trace)
 }
 

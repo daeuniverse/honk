@@ -840,6 +840,18 @@ impl EbpfBackend for MockEbpfBackend {
     }
 
     #[cfg(feature = "ebpf")]
+    fn prepare_tc_programs(
+        &self,
+        _programs: &[ebpf::interface::TcProgram],
+    ) -> anyhow::Result<Option<ebpf::real::programs::TcProgramPreparation>> {
+        #[cfg(test)]
+        if let Some(prepare) = self.tc_program_preparation.0.lock().take() {
+            return Ok(Some(prepare));
+        }
+        Ok(None)
+    }
+
+    #[cfg(feature = "ebpf")]
     fn commit_interface_bindings(
         &mut self,
         commit: ebpf::interface::BindingCommit,

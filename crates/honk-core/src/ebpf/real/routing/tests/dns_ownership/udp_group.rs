@@ -113,9 +113,8 @@ pub(super) fn lookup_cookie(
     source: SocketAddr,
     destination: SocketAddr,
 ) -> u64 {
-    let program: &SkLookup = backend
-        .bpf()
-        .unwrap()
+    let object = backend.bpf().unwrap();
+    let program: &SkLookup = object
         .program("tproxy_sk_lookup")
         .unwrap()
         .try_into()
