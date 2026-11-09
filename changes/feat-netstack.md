@@ -25,3 +25,4 @@ Added
 - Wait up to one shared 10-second deadline for captured Ethernet carrier recovery after initial XDP attachment, preserving strict admission, immediate structural/uplink refusal and terminal runtime topology notifications.
 - Recognize the kernel's sole LINKDOWN flag on native IPv6 multicast routes only while their captured physical output is awaiting XDP-attach carrier recovery; keep final admission and other route facts strict.
 - Wait for the owned adaptive-test capture link to regain carrier before reconstructing its owner, retaining the original fixture deadline and strict production admission.
+- Re-arm XDP queue and topology read readiness after clearing a stale event, so a packet arriving after an empty owner pass wakes the owner instead of waiting for an unrelated deadline.

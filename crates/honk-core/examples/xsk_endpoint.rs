@@ -393,10 +393,9 @@ mod linux {
         fn poll_io(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             let was_retrying = self.retry_wakeup;
             if self.stopping.is_none() {
-                match self.io.poll_read_ready(cx) {
-                    Poll::Ready(Ok(mut ready)) => ready.clear_ready(),
-                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                    Poll::Pending => {}
+                // A cached Ready installs no reader waker: clear until Pending stores this task's.
+                while let Poll::Ready(ready) = self.io.poll_read_ready(cx) {
+                    ready?.clear_ready();
                 }
             }
             match self.turn(cx) {

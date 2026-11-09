@@ -46,7 +46,7 @@ use std::{
     future::poll_fn,
     io,
     net::IpAddr,
-    os::fd::AsFd,
+    os::fd::{AsFd, AsRawFd},
     path::Path,
     pin::Pin,
     sync::{
@@ -515,10 +515,8 @@ impl Runtime {
             if !self.admission.load(Ordering::Acquire) {
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
-            match self.topology.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut ready)) => ready.clear_ready(),
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                Poll::Pending => {}
+            if let Err(error) = arm_read(&self.topology, cx) {
+                return Poll::Ready(Err(error.into()));
             }
             if let Err(error) = current_topology(&mut self.topology) {
                 return Poll::Ready(Err(error.into()));
@@ -567,12 +565,10 @@ impl Runtime {
                     device_index
                 };
                 let queue = &mut device.queues[queue_index];
-                if !self.closing {
-                    match queue.io.poll_read_ready(cx) {
-                        Poll::Ready(Ok(mut ready)) => ready.clear_ready(),
-                        Poll::Ready(Err(error)) => return Poll::Ready(Err(error.into())),
-                        Poll::Pending => {}
-                    }
+                if !self.closing
+                    && let Err(error) = arm_read(&queue.io, cx)
+                {
+                    return Poll::Ready(Err(error.into()));
                 }
                 let port = queue.io.get_mut();
                 progress += match port.complete(release_completed) {
@@ -1535,6 +1531,16 @@ fn current_topology(topology: &mut AsyncFd<Topology>) -> io::Result<()> {
     Ok(())
 }
 
+/// Tokio takes the reader waker when it delivers readiness and a cached Ready installs none,
+/// so a single clear can park an empty pass with nothing to wake it. Pending registers this
+/// task (or schedules a coop-budget continuation) before the caller drains.
+fn arm_read<T: AsRawFd>(io: &AsyncFd<T>, cx: &mut Context<'_>) -> io::Result<()> {
+    while let Poll::Ready(ready) = io.poll_read_ready(cx) {
+        ready?.clear_ready();
+    }
+    Ok(())
+}
+
 fn selected_egress(realms: &[Realm], route: Route) -> bool {
     realms.iter().any(|realm| {
         realm.ingress.ifindex == route.ifindex
@@ -2378,5 +2384,44 @@ mod tests {
         })
         .unwrap();
         assert!(fill_output(&mut [&mut a[..8]], &header, &payload).is_err());
+    }
+
+    #[tokio::test]
+    async fn cleared_stale_readiness_arms_the_next_wake() {
+        let (reader, writer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        writer.set_nonblocking(true).unwrap();
+        // SAFETY: the socket keeps its descriptor unchanged until deregistration.
+        let reader = unsafe { AsyncFd::register(reader) }
+            .map_err(io::Error::from)
+            .unwrap();
+        writer.send(b"drained").unwrap();
+        // A previous pass consumed the packet whose event is still cached as Ready.
+        reader.readable().await.unwrap().retain_ready();
+        assert_eq!(reader.get_ref().recv(&mut [0; 16]).unwrap(), 7);
+        let (armed, waiting) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let mut armed = Some(armed);
+            poll_fn(|cx| {
+                arm_read(&reader, cx).unwrap();
+                match reader.get_ref().recv(&mut [0; 16]) {
+                    Ok(_) => Poll::Ready(()),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if let Some(armed) = armed.take() {
+                            let _ = armed.send(());
+                        }
+                        Poll::Pending
+                    }
+                    Err(error) => panic!("unexpected receive failure: {error}"),
+                }
+            })
+            .await;
+        });
+        waiting.await.unwrap();
+        writer.send(b"next").unwrap();
+        tokio::time::timeout(Duration::from_secs(5), worker)
+            .await
+            .expect("the next packet must wake the owner parked after an empty pass")
+            .unwrap();
     }
 }
