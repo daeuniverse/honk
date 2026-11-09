@@ -1165,9 +1165,8 @@ impl Snapshot {
                     || (route.prefix_len != 0 && multicast_destination.is_none());
                 route.native_multicast &= route.simple && multicast_destination == Some(true);
                 // The first native XDP attachment can temporarily mark this route LINKDOWN.
-                route.native_multicast_linkdown = route.native_multicast
-                    && !route.unsupported
-                    && route.flags == RTNH_F_LINKDOWN;
+                route.native_multicast_linkdown =
+                    route.native_multicast && !route.unsupported && route.flags == RTNH_F_LINKDOWN;
                 route.simple &= route.flags == 0;
                 route.native_multicast &= route.simple;
                 self.routes.push(route);
@@ -1620,9 +1619,10 @@ impl Snapshot {
     ) -> io::Result<Option<&Link>> {
         self.admit_with_carrier(captured_physical, captured_logical, bypass_mark, false)?;
         self.ipv4_broadcasts()?;
-        Ok(self.links.iter().find(|link| {
-            captured_physical.contains(&link.index) && link.flags & 0x10000 == 0
-        }))
+        Ok(self
+            .links
+            .iter()
+            .find(|link| captured_physical.contains(&link.index) && link.flags & 0x10000 == 0))
     }
 
     fn admit_with_carrier(
@@ -1637,8 +1637,7 @@ impl Snapshot {
                 link.index == index
                     && link.plain_up_ethernet
                     && (!require_capture_carrier || link.flags & 0x10000 != 0)
-            })
-            {
+            }) {
                 return Err(unsupported(
                     "capture requires unnumbered, up, standalone Ethernet roots",
                 ));
@@ -1660,9 +1659,10 @@ impl Snapshot {
                     || (!require_capture_carrier
                         && route.native_multicast_linkdown
                         && captured_physical.contains(&route.output)
-                        && self.links.iter().any(|link| {
-                            link.index == route.output && link.flags & 0x10000 == 0
-                        })))
+                        && self
+                            .links
+                            .iter()
+                            .any(|link| link.index == route.output && link.flags & 0x10000 == 0)))
                 && (route.kind == 1 || captured_logical.contains(&route.output))
         }) {
             return Err(unsupported(
@@ -1930,7 +1930,11 @@ mod tests {
                 assert!(!route.simple);
                 assert!(!route.native_multicast);
                 assert_eq!(route.native_multicast_linkdown, flags == RTNH_F_LINKDOWN);
-                let physical = if other_physical { &[2, 4][..] } else { &[2][..] };
+                let physical = if other_physical {
+                    &[2, 4][..]
+                } else {
+                    &[2][..]
+                };
                 let pending = current.pending_xdp_carrier(physical, &[2, 4], 128);
                 if allowed {
                     let root = pending
@@ -2250,7 +2254,12 @@ mod tests {
         }
         let mut current = topology();
         current.push(16, &link_body(4, 1)).unwrap();
-        assert!(current.pending_xdp_carrier(&[2], &[2], 128).unwrap().is_none());
+        assert!(
+            current
+                .pending_xdp_carrier(&[2], &[2], 128)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2343,7 +2352,10 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(error.to_string(), "routing topology changed during admission");
+        assert_eq!(
+            error.to_string(),
+            "routing topology changed during admission"
+        );
     }
 
     #[test]
