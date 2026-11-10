@@ -557,7 +557,7 @@ async fn run_owned(
             .as_ref()
             .and_then(|value| value.tun.as_ref())
             .context("TUN configuration missing")?;
-        let pair = capture_scope(u32::from(tun.mtu), 1, &budget)?;
+        let pair = capture_scope(u32::from(tun.mtu), 1, 128, &budget)?;
         let (setup, device, topology) = TunSetup::prepare(&config)?;
         Ok((dns, capacity, memory, pair, setup, device, topology))
     })();

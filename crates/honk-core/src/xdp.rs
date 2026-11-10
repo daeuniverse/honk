@@ -2040,6 +2040,29 @@ type PreparedRuntime = (
     Arc<MemoryBudget>,
 );
 
+#[cold]
+fn device_sizing(mtu: u32) -> (PortConfig, usize) {
+    // Two VLAN tags bound TX extent; RX keeps its independent SG admission.
+    let single_frame = usize::try_from(mtu)
+        .ok()
+        .and_then(|mtu| mtu.checked_add(22))
+        .is_some_and(|length| length <= FRAME_SIZE);
+    let (bulk_frames, ring_size, scope_bulk_frames) = if single_frame {
+        (480, 512, 256)
+    } else {
+        (224, 256, 128)
+    };
+    (
+        PortConfig {
+            rx_frames: 256,
+            control_frames: 32,
+            bulk_frames,
+            ring_size,
+        },
+        scope_bulk_frames,
+    )
+}
+
 async fn prepare(
     plane: &ControlPlane,
     config: &Config,
@@ -2054,18 +2077,13 @@ async fn prepare(
         XskMode::Copy => BindMode::Copy,
         XskMode::ZeroCopy => BindMode::ZeroCopy,
     };
-    let port_config = PortConfig {
-        rx_frames: 256,
-        control_frames: 32,
-        bulk_frames: 224,
-        ring_size: 256,
-    };
     let infos: Vec<_> = datapath
         .interfaces
         .iter()
         .map(|interface| DeviceInfo::discover(&interface.name))
         .collect::<io::Result<_>>()?;
     for info in &infos {
+        let (port_config, _) = device_sizing(info.mtu);
         info.validate_port_config(binding_mode, port_config)
             .with_context(|| format!("XDP device {} {binding_mode:?} admission", info.name))?;
         ensure!(
@@ -2171,6 +2189,7 @@ async fn prepare(
     };
     let mut devices = Vec::with_capacity(infos.len());
     for (device_index, info) in infos.into_iter().enumerate() {
+        let (port_config, scope_bulk_frames) = device_sizing(info.mtu);
         let incarnation = ScopeId::allocate()
             .context("XDP attachment identity exhausted")?
             .as_u64();
@@ -2219,7 +2238,8 @@ async fn prepare(
                 attachment: incarnation,
                 mark: MarkProvenance::BeforeSkb,
             };
-            let (scope, scope_owner) = capture_scope(link.mtu, realm_count, &budget)?;
+            let (scope, scope_owner) =
+                capture_scope(link.mtu, realm_count, scope_bulk_frames, &budget)?;
             realms.push((ingress, devices.len(), link, scope.scope()));
             scope_pairs.push((scope, scope_owner));
         }
@@ -2337,7 +2357,7 @@ mod tests {
     fn qinq_realms_share_capacity_and_release_their_complete_budget() {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let scopes: Vec<_> = (0..6)
-            .map(|_| capture_scope(1500, 6, &budget).unwrap())
+            .map(|_| capture_scope(1500, 6, 256, &budget).unwrap())
             .collect();
         drop(scopes);
         assert_eq!(budget.used(), 0);

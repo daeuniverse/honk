@@ -154,7 +154,13 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 TUN 以保留的 `Option<PreparedDnsBind>` 和唯一真实非 HOST scope 调用 `start_driven(plane, scopes, udp_capacity, prepared_dns_addresses)`；XDP 传 `None`。公开 `PacketEndpoints::new()` 嵌入构造器不变。两个 configured packet 后端共用 subscription/command/flags/DNS supervisor，不另建 Router 或 flow executor。
 
-`control::netstack::capture_scope(mtu, realms, &budget)` 与 `CAPTURE_MEMORY` 为 XDP/TUN 提供相同 capture 默认值：共享 256 MiB、Stack limit 128 MiB、1024 flow/slot、32 control frame、128 bulk frame、256 waiter。TUN 固定一个 realm，采用配置 MTU（默认 1500），UDP capacity 为非零 `min(64, resource_budget.udp_endpoints)`。helper 选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
+`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` 与 `CAPTURE_MEMORY` 让 XDP 或 TUN 的 scope 和设备/runtime 存储共用一个 256 MiB capture 预算。准入 `R` 个 realm 时，每个 Stack 的 limit 为 `128 MiB / R`，flow/slot 上限为 `min(4096 / R, 1024)`；每个 scope 保留 32 个 control frame 和 256 个 waiter。bulk 容量由调用方选择。CPU 输出 backing 仍按每 scope `(32 + bulk_frames) * mtu.max(1280)` 字节计费：bulk 128 对应 160 个 frame，bulk 256 对应 288 个 frame，另行计费的 metadata 和 Stack 存储也在同一共享预算内。helper 选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
+
+XDP 按每个物理设备经过溢出检查的 `physical_mtu + 22 <= FRAME_SIZE`（4096 字节）选择容量，覆盖 Ethernet 和最多两层 VLAN tag。满足条件的设备采用 RX/control/bulk 为 256/32/480 frame 的 Port 分区和 512 项 ring，其上每个 realm 使用 256 个 bulk frame。每个此类 Port 预留 3 MiB、保留至进程退出的 UMEM，另行计费的 metadata 和 ring 不包含在内。超过此界限的设备，包括带较小逻辑 realm 的 jumbo 设备，保持原有显式容量：Port 分区 256/32/224、256 项 ring、scope bulk 128，每 Port 的 UMEM 为 2 MiB。两条路径使用同一后端，RX SG 能力与 bind 校验不变；此界限只证明 TX 为单 frame。单个 scope 的 256 个 bulk owner 会留下 224 个 Port bulk frame，而原有 128/224 容量留下 96 个；其他 realm 和 Core 输出仍可使用这些余量。调度及每轮每 realm 每类别 32 个输出的限制不变，不承诺普遍公平性或已测吞吐收益。
+
+优化后的 Port 与 scope 预留更大，因此在固定 256 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
+
+TUN 选择 bulk 128，固定一个 realm，采用配置 MTU（默认 1500），UDP capacity 保持非零 `min(64, resource_budget.udp_endpoints)`。
 
 [TUN owner](./datapath.md#fd-报文管线) 保留 CPU-backed `OutputLease`，不使用 XDP direct-UMEM emission。它验证完整普通 L3，在回收唯一 RX buffer 前接纳/复制借用 UDP。Control/Bulk 各最多 32 个 pending lease；EAGAIN 保留精确原 bytes/scope/FlowId 直到 writable。完整 record write 只释放本地输出所有权，没有 CQ 或远端交付声明；短/零写致命，不写 suffix、不重放整包。就绪与 joined close 期间持续服务 driver，包括失败启动。正常 stop 处置 closing output，先 join 真实 owner 再删 route/receipt；失败保留路由 guard 与 receipt。归还/Drop driver 不代表 joined cleanup ack。
 

@@ -41,6 +41,7 @@ pub(crate) const CAPTURE_MEMORY: usize = 256 << 20;
 pub(crate) fn capture_scope(
     mtu: u32,
     realms: usize,
+    bulk_frames: usize,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<(PacketScope, PacketOwner)> {
     // ponytail: fixed per-realm partitions; rebalance only if measured tenant skew needs it.
@@ -58,7 +59,7 @@ pub(crate) fn capture_scope(
         RuntimeLimits {
             max_slots: slots,
             control_frames: 32,
-            bulk_frames: 128,
+            bulk_frames,
             max_waiters: 256,
         },
         Instant::now(),
@@ -1267,11 +1268,12 @@ impl PacketDriver {
         if l3.len() < frame_size {
             return Err(invalid("short direct output frame"));
         }
-        if inner
-            .queue
-            .iter()
-            .flatten()
-            .any(|queued| queued.class == class)
+        if inner.queued != 0
+            && inner
+                .queue
+                .iter()
+                .flatten()
+                .any(|queued| queued.class == class)
         {
             let wake = inner.output_waker.take();
             drop(inner);
