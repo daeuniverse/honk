@@ -28,7 +28,10 @@ async fn auxiliary_occupancy_drives_real_ticks_and_drains_backlog() -> anyhow::R
             }
         }
         let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        // `max_ticks` assumes full candidate batches; the mock's collect-and-sort
+        // of the pressured map can outlast the wall-clock scan budget.
+        janitor.unbounded_scan_time = true;
         let start = tokio::time::Instant::now();
         let mut state = tick::TickState::new(start);
         let max_ticks = usize::from(count).div_ceil(JANITOR_MAX_CANDIDATES) + 1;

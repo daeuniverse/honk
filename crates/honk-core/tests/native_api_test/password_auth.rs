@@ -42,9 +42,15 @@ impl PasswordApp {
     }
 }
 
+/// Setup and login derive `PBKDF2_ITERATIONS` (100 000) HMAC-SHA256 rounds off the executor. An
+/// unoptimised build on a CPU without SHA extensions needs seconds for that, so credential
+/// requests replace the shared client's `IO_TIMEOUT` with a hang guard sized for the derivation.
+const CREDENTIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn post_credentials(app: &TestApp, path: &str, user: &str, password: &str) -> Response {
     app.client
         .post(app.url(path))
+        .timeout(CREDENTIAL_TIMEOUT)
         .json(&serde_json::json!({"username": user, "password": password}))
         .send()
         .await
@@ -396,6 +402,7 @@ async fn credential_media_types_are_case_insensitive_but_not_duplicated() {
             .client
             .post(app.url(path))
             .header("content-type", "Application/JSON; charset=utf-8")
+            .timeout(CREDENTIAL_TIMEOUT)
             .body(body)
             .send()
             .await
