@@ -444,6 +444,7 @@ async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
         let (observer, rows) = dns_flow_observer();
         let (mut client, mut server) = tcp_pair().await;
         let source = server.peer_addr().unwrap();
+        let observed = socket2::SockRef::from(&server).try_clone().unwrap();
         let task = tokio::spawn(async move {
             observer
                 .scope(controller.serve_bound_tcp_dns(&mut server, source))
@@ -455,6 +456,12 @@ async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
             .set_linger(Some(Duration::ZERO))
             .unwrap();
         drop(client);
+        // Loopback delivers the reset asynchronously; an answer written before
+        // it lands succeeds, so hold the answer until the server socket is closed.
+        while tcp_state(&observed) != TCP_CLOSE {
+            tokio::task::yield_now().await;
+        }
+        drop(observed);
         upstream.release_first.notify_one();
         assert!(task.await.unwrap().is_err());
         let rows = rows.lock();
@@ -475,4 +482,26 @@ async fn dns_flow_does_not_promote_answer_to_failed_client_delivery() {
     })
     .await
     .expect("upstream admission and failed client delivery must settle");
+}
+
+/// `TCP_CLOSE` from the kernel's `tcp_states.h`; libc does not export it for Linux.
+#[cfg(feature = "native-api")]
+const TCP_CLOSE: u8 = 7;
+
+#[cfg(feature = "native-api")]
+fn tcp_state(socket: &socket2::Socket) -> u8 {
+    use std::os::fd::AsRawFd as _;
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of_val(&info) as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_INFO,
+            (&mut info as *mut libc::tcp_info).cast(),
+            &mut length,
+        )
+    };
+    assert_eq!(result, 0, "TCP_INFO: {}", std::io::Error::last_os_error());
+    info.tcpi_state
 }
