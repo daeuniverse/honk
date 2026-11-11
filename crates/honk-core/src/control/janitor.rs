@@ -142,6 +142,10 @@ pub struct BpfJanitor {
     blocking_read_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     before_delete_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Lets a test that counts candidates per tick lift the wall-clock scan
+    /// budget, which a loaded debug build trips at random.
+    #[cfg(test)]
+    unbounded_scan_time: bool,
 }
 
 impl BpfJanitor {
@@ -159,6 +163,8 @@ impl BpfJanitor {
             blocking_read_hook: None,
             #[cfg(test)]
             before_delete_hook: None,
+            #[cfg(test)]
+            unbounded_scan_time: false,
         }
     }
 

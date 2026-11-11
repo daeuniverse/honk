@@ -155,6 +155,10 @@ impl BpfJanitor {
     {
         let pins = Arc::clone(&self.tcp_flow_pins);
         let cursor = Arc::clone(&self.scan_cursors[cursor_index]);
+        #[cfg(not(test))]
+        let unbounded_scan_time = false;
+        #[cfg(test)]
+        let unbounded_scan_time = self.unbounded_scan_time;
         let scanned = self
             .run_blocking_read(label, move |ebpf| {
                 let mut cursor = cursor.lock();
@@ -173,7 +177,8 @@ impl BpfJanitor {
                             expired.push(*entry);
                         }
                     }
-                    complete = expired.len() < tuning.candidates && Instant::now() < deadline;
+                    complete = expired.len() < tuning.candidates
+                        && (unbounded_scan_time || Instant::now() < deadline);
                     complete
                 })?;
                 anyhow::Ok((expired, total, complete && from_start && cursor.is_start()))
