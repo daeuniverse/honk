@@ -427,7 +427,7 @@ sudo docker compose up -d
 sudo docker compose logs -f
 ```
 
-该文件从宿主机挂载 `/sys`、`/etc/honk` 和 `/var/lib/honk`。配置目录的挂载会覆盖镜像内仅直连的默认配置；`/var/lib/honk` 保存运行时状态，例如原生 API 的管理员账户，重启或升级后仍然保留。重载配置使用 `sudo docker compose exec honk honk-core reload`。镜像自带 iproute2 和 nftables，容器又与宿主机共用网络命名空间，因此 `sudo docker compose exec honk ip rule`、`ip route show table all`、`tc filter show dev <网卡> ingress` 和 `nft list ruleset` 显示的就是宿主机的状态。
+该文件从宿主机挂载 `/sys`、`/etc/honk`、`/var/lib/honk`，并以只读方式挂载 `/etc/localtime`，让容器的日志时间戳和 geodata 更新时间使用宿主机的时区。宿主机没有 `/etc/localtime` 时，删除这项挂载，在服务的 `environment` 中把 `TZ` 设为 `CST-8` 这类 POSIX 字符串。配置目录的挂载会覆盖镜像内仅直连的默认配置；`/var/lib/honk` 保存运行时状态，例如原生 API 的管理员账户，重启或升级后仍然保留。重载配置使用 `sudo docker compose exec honk honk-core reload`。镜像自带 iproute2 和 nftables，容器又与宿主机共用网络命名空间，因此 `sudo docker compose exec honk ip rule`、`ip route show table all`、`tc filter show dev <网卡> ingress` 和 `nft list ruleset` 显示的就是宿主机的状态。
 
 锁文件挂载让容器与原生实例共享 `/run/honk-core.lock`，防止容器接管正在运行的数据路径。停止后也应保留此文件；不要删除、替换或截断仍可能被实例持有的锁。每次开机后，必须先创建锁文件，再自动启动容器。使用 systemd 的宿主机可配置不截断已有文件的开机创建规则：
 

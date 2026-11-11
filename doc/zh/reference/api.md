@@ -956,15 +956,15 @@ HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_r
 
 ### Geodata 来源与自动更新
 
-有状态库且 geodata 所有者已初始化时，`resources.geodata.configurable_sources` 为 true，`runtime_settings.fields` 列出 `geodata`，能力还报告 `max_urls: 4`、`interval_hours: {min: 6, max: 168, default: 24}` 与 `lifecycle: {file_values: start, overrides_persist: true}`：仅在启动时读取配置文件的值，修改在重启后保留。无论有无状态库，`checksum` 均为 `sha256sum`。启用原生 API 时总会尝试打开 `<data_dir>/state/honk.db`。
+有状态库且 geodata 所有者已初始化时，`resources.geodata.configurable_sources` 为 true，`runtime_settings.fields` 列出 `geodata`，能力还报告 `max_urls: 4`、`interval_hours: {min: 6, max: 168, default: 24}`（cron 计划下 `interval_hours` 读作该默认值）与 `lifecycle: {file_values: start, overrides_persist: true}`：仅在启动时读取配置文件的值，修改在重启后保留。无论有无状态库，`checksum` 均为 `sha256sum`。启用原生 API 时总会尝试打开 `<data_dir>/state/honk.db`。
 
 数据库模式、启用 `password_auth`、数据库含外来 application ID 或更新模式、或被另一个 honk 实例占用时，打开失败会中止启动。其他打开失败可能在无持久化模式下继续运行。打开成功时，设置存于其中的严格表 `geodata_settings`，重启和激活后保留。
 
 若该表无法打开，监听器仍会启动，记录警告，并且不宣告 geodata 能力。没有状态库或 geodata 所有者时只使用配置文件中的 URL，下列字段均不出现。
 
-此时 `GET /runtime/settings` 包含 `geodata`：`source`、`geosite.urls`、`geoip.urls`、`auto_update`（`enabled`、`interval_hours`）、`download`（`route`、`group_id`）与 `verify_checksum`。只有已存储的设置生效。启动时，`assets.geodata` 设置了下载 URL 的，honk 将其写入已存储的设置，覆盖通过 API 修改的 URL。
+此时 `GET /runtime/settings` 包含 `geodata`：`source`、`geosite.urls`、`geoip.urls`、`auto_update`（`enabled`、`interval_hours`、`cron`）、`download`（`route`、`group_id`）与 `verify_checksum`。只有已存储的设置生效。启动时，`assets.geodata` 设置的下载 URL、出口、`auto_update`、`cron` 或 `checksum`，honk 写入已存储的设置，覆盖通过 API 修改的值。
 
-配置文件未设置 URL 的资产，若列表由先前的配置文件写入则删除，改用内置 URL。若由 API 修改则保留。配置文件的下载 URL 与出口由启动阶段持有。
+配置文件未设置 URL 的资产，若列表由先前的配置文件写入则删除，改用内置 URL。若由 API 修改则保留。更新计划与 `verify_checksum` 同理：配置文件不再设置时，先前配置文件写入的值被删除，恢复默认值；API 修改的值保留。配置文件的下载 URL、出口、更新计划与校验开关由启动阶段持有。
 
 重载改变生效值会因需要重启而被拒绝，因此其他激活不会改动已存储的设置，通过 API 修改的 URL 保持到下次启动。
 
@@ -994,11 +994,11 @@ HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_r
 
 `PATCH /runtime/settings` 合并并存储 `geodata`，不触发下载。`urls` 列表含 1–4 个互不相同的 HTTP(S) URL，每个最长 4096 字节，不含用户信息或片段，按回退顺序整体替换原列表。修改一个资产只存储该资产的列表，无论原来的 `source` 是什么，都随之变为 `override`，另一个资产仍取配置文件或内置 URL。
 
-`auto_update` 单独存储，`interval_hours` 取 6–168，配置文件不设置它。`download` 单独存储。`group` 路由必须带 `group_id`，其他路由不能带。
+`auto_update` 单独存储。`interval_hours`（6–168）切换为间隔计划，`cron` 切换为 cron 计划；同一请求同时带两者返回 400，只带 `enabled` 时保留当前计划。cron 计划读作 `interval_hours: 24`，`cron` 为表达式；间隔计划的 `cron` 为 null。`assets.geodata.auto_update` 与 `cron` 在启动时写入它（见 [Assets 参考](./assets.md)）。`download` 单独存储。`group` 路由必须带 `group_id`，其他路由不能带。
 
-ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，配置文件不设置它。
+ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，`assets.geodata.checksum` 在启动时写入它。
 
-`"geodata": null` 删除已存储的设置。配置文件中的 URL 在下次启动时重新写入。顶层 `source` 不受影响。
+`"geodata": null` 删除已存储的设置。配置文件中的值在下次启动时重新写入。顶层 `source` 不受影响。
 
 `geodata` 与其他字段在同一请求中一起校验，任一部分校验失败则全部不变。匿名回环主体不能修改 `geodata`（`403 permission_denied`）。所有获准访问的调用方都读到原始 URL，仅遮蔽监听凭据。
 若 geodata 已存储后关闭过程阻止记录器设置生效，PATCH 返回 `503 temporarily_unavailable`，并带 `details.geodata_stored: true`；已存储的 geodata 不会回滚。
@@ -1030,21 +1030,21 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 
 每个资产的字段只保存在内存中。重启后，在下一次尝试前这些字段为 null，`verified` 为 false。
 
-自动更新默认开启，间隔 24 小时。将 `auto_update.enabled` 设为 `false` 即关闭。启动后从上次记录的检查时间继续计时。
+自动更新默认开启，每天本地时间 03:00（`0 3 * * *`）。将 `auto_update.enabled` 设为 `false` 即关闭。cron 计划在上次记录的检查之后、表达式按系统本地时区给出的第一个时间检查；间隔计划（由 API 设置，或沿用 cron 计划出现前存储的记录）在上次检查后经过间隔时检查。启动后从上次记录的检查时间继续计时。
 
 符合以下任一条件时，首次检查在启动后五分钟加随机延迟时执行：
 
-- 上次检查距今已超过等待时间。
+- 上次检查距今已超过等待时间，或此后已错过 cron 表达式给出的时间。
 - 上次检查时间晚于当前时间，即时钟曾经超前。
 - 没有上次检查记录。
 
-因此重启不会立即触发下载，重启间隔短于更新间隔的主机仍会更新。`POST /geodata/update` 可立即更新。
+因此重启不会立即触发下载，重启间隔短于更新计划的主机仍会更新。`POST /geodata/update` 可立即更新。
 
 自动更新使用同一个 `geodata_update` 操作。自动更新执行期间，手动更新返回 `409 state_conflict`。
 
-自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次等待为间隔加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，最长不超过间隔，失败次数在重启后保留。
+自动更新到期时若已有更新在执行，下次时间由该更新的结果决定。每次计划检查加 0–60 分钟随机延迟。连续失败后等待 1 小时，每次失败加倍，不晚于下一次计划检查，失败次数在重启后保留。
 
-成功后恢复正常间隔。
+成功后恢复正常计划。
 
 ### 内嵌 doona 来源
 

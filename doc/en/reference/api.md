@@ -1019,15 +1019,15 @@ An update that reaches activation sets `runtime.last_reload`. A failure before a
 
 ### Geodata sources and automatic updates
 
-With a state db and an initialized geodata owner, `resources.geodata.configurable_sources` is true and `runtime_settings.fields` lists `geodata`. The capability then also reports `max_urls: 4`, `interval_hours: {min: 6, max: 168, default: 24}` and `lifecycle: {file_values: start, overrides_persist: true}`: file values are taken at startup only, and a patch lasts across restarts. `checksum` is `sha256sum` with or without a state db.
+With a state db and an initialized geodata owner, `resources.geodata.configurable_sources` is true and `runtime_settings.fields` lists `geodata`. The capability then also reports `max_urls: 4`, `interval_hours: {min: 6, max: 168, default: 24}` (the default is what `interval_hours` reads under a cron schedule) and `lifecycle: {file_values: start, overrides_persist: true}`: file values are taken at startup only, and a patch lasts across restarts. `checksum` is `sha256sum` with or without a state db.
 
 The native API tries to open `<data_dir>/state/honk.db` whenever it is enabled. A failed open aborts startup in db mode, with `password_auth`, for a foreign application ID or newer schema, or when another honk instance holds the database. Other failures may continue without persistence.
 
 When it opens, the settings live in its strict `geodata_settings` row and survive restarts and activations. If that row cannot be opened the listener still starts, logs a warning and advertises no geodata capability. Without a state db or geodata owner, only the configuration file's URLs apply and none of the fields below appear.
 
-`GET /runtime/settings` then carries `geodata`: `source`, `geosite.urls`, `geoip.urls`, `auto_update` (`enabled`, `interval_hours`), `download` (`route`, `group_id`) and `verify_checksum`. The stored settings are the only ones in force. At startup, when `assets.geodata` names a download URL, honk writes it into the stored settings over a patched one.
+`GET /runtime/settings` then carries `geodata`: `source`, `geosite.urls`, `geoip.urls`, `auto_update` (`enabled`, `interval_hours`, `cron`), `download` (`route`, `group_id`) and `verify_checksum`. The stored settings are the only ones in force. At startup, when `assets.geodata` names a download URL, a route, `auto_update`, `cron` or `checksum`, honk writes it into the stored settings over a patched one.
 
-If the file names no URL for an asset, a URL list from an earlier file is deleted and built-in URLs apply. A patched list is kept. Configuration download URLs and routes are startup-owned. A reload that changes their effective values is rejected as restart-required, so other activations never touch the stored settings and a patch lasts until the next startup.
+If the file names no URL for an asset, a URL list from an earlier file is deleted and built-in URLs apply. A patched list is kept. The schedule and `verify_checksum` follow the same rule: a value an earlier file wrote is deleted when the file no longer names it, so the default applies, and a patched value is kept. Configuration download URLs, routes, schedule and checksum switch are startup-owned. A reload that changes their effective values is rejected as restart-required, so other activations never touch the stored settings and a patch lasts until the next startup.
 
 | `source` | Meaning |
 | --- | --- |
@@ -1057,11 +1057,11 @@ See the [assets reference](./assets.md).
 
 `PATCH /runtime/settings` merges `geodata` and stores it without downloading. A `urls` list has 1–4 distinct HTTP(S) URLs of at most 4096 bytes, without userinfo or fragment, and replaces the whole list in fallback order. Patching one asset stores only that list, so `source` becomes `override`, whatever it was, and the other asset keeps following the file or the built-in URLs.
 
-`auto_update` is stored on its own, with `interval_hours` from 6 to 168, and the file never sets it. `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an id that is not a current group returns `409 state_conflict`.
+`auto_update` is stored on its own. `interval_hours` (6 to 168) switches to an interval schedule and `cron` to a cron schedule; both in one patch return 400, and `enabled` alone keeps the current schedule. A cron schedule reads `interval_hours: 24` and its expression as `cron`; an interval reads `cron: null`. `assets.geodata.auto_update` and `cron` seed it ([assets reference](./assets.md)). `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an id that is not a current group returns `409 state_conflict`.
 
-A stored group that a later activation removes reads `group_id: null`, and its downloads fail with `group_unavailable` until the route changes. `verify_checksum` is stored on its own, and the file never sets it. `"geodata": null` deletes the stored row.
+A stored group that a later activation removes reads `group_id: null`, and its downloads fail with `group_unavailable` until the route changes. `verify_checksum` is stored on its own, and `assets.geodata.checksum` seeds it. `"geodata": null` deletes the stored row.
 
-The file's URLs are written again at the next startup. The top-level `source` is unaffected. A geodata patch with other fields is validated as one request, and validation failures leave everything unchanged.
+The file's values are written again at the next startup. The top-level `source` is unaffected. A geodata patch with other fields is validated as one request, and validation failures leave everything unchanged.
 
 The anonymous loopback principal cannot patch `geodata` (`403 permission_denied`). Every admitted caller reads the URLs as written, with listener secrets masked.
 If shutdown prevents recorder settings from landing after geodata was stored, PATCH returns `503 temporarily_unavailable` with `details.geodata_stored: true`; the stored geodata is not rolled back.
@@ -1109,19 +1109,19 @@ A failure with `checksum_unavailable` or `checksum_mismatch` logs a warning that
 
 Per-asset fields remain in memory only. After restart they are null, and `verified` is false, until the next attempt.
 
-Automatic updates are on by default, every 24 hours. `auto_update.enabled: false` stops them. After startup the schedule continues from the last recorded check.
+Automatic updates are on by default, daily at 03:00 local time (`0 3 * * *`). `auto_update.enabled: false` stops them. A cron schedule checks at the first time the expression names after the last recorded check, in the system's local time zone; an interval schedule, set by a patch or kept from a record stored before cron schedules, checks the interval after it. After startup the schedule continues from the last recorded check.
 
 The first check runs five minutes plus the random delay after startup if the previous check:
 
-- Is older than the wait.
+- Is older than the wait, or a time the cron expression names has passed since it.
 - Lies in the future because the clock ran ahead.
 - Does not exist.
 
-Restart therefore never downloads immediately. A host that restarts more often than the interval still updates. `POST /geodata/update` fetches immediately.
+Restart therefore never downloads immediately. A host that restarts more often than the schedule still updates. `POST /geodata/update` fetches immediately.
 
-Automatic updates queue the same `geodata_update` operation. A manual update while one runs returns `409 state_conflict`. If an update is running when an automatic update becomes due, its outcome determines the schedule. Each wait is the interval plus up to 60 minutes of random delay. After consecutive failures the wait is one hour, doubling per failure, never longer than the interval, and the count survives restarts.
+Automatic updates queue the same `geodata_update` operation. A manual update while one runs returns `409 state_conflict`. If an update is running when an automatic update becomes due, its outcome determines the schedule. Each scheduled check gets up to 60 minutes of random delay. After consecutive failures the wait is one hour, doubling per failure, never later than the next scheduled check, and the count survives restarts.
 
-A success restores the interval.
+A success restores the schedule.
 
 ### Embedded doona provenance
 

@@ -109,10 +109,11 @@ impl NativeState {
         started: Instant,
     ) -> anyhow::Result<Self> {
         let config = control.config_handle();
-        let (settings, clash_secret, data_dir) = {
+        let (settings, geodata_file, clash_secret, data_dir) = {
             let config = config.read().await;
             (
                 config.experimental.native_api.clone(),
+                config.assets.geodata.clone(),
                 config.experimental.clash_api.secret.clone(),
                 std::path::PathBuf::from(&config.global.data_dir),
             )
@@ -156,7 +157,7 @@ impl NativeState {
             None
         };
         let geodata = control.state_db().and_then(|db| {
-            geodata::Sources::open(db, &settings)
+            geodata::Sources::open(db, &settings, &geodata_file)
                 .inspect_err(|error| {
                     tracing::warn!(
                         %error,

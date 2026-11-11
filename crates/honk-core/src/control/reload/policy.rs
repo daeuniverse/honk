@@ -188,6 +188,9 @@ pub(crate) fn restart_required_changes(
     if current.experimental.native_api != candidate.experimental.native_api {
         changed.push(field!("experimental.native_api"));
     }
+    if current.assets.geodata != candidate.assets.geodata {
+        changed.push(field!("assets.geodata"));
+    }
     if serde_json::to_value(&current.experimental.cache_file).ok()
         != serde_json::to_value(&candidate.experimental.cache_file).ok()
     {

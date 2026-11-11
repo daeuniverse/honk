@@ -248,7 +248,7 @@ async fn url_patches_are_accepted_while_the_configuration_names_urls() {
         json!({"source": "config",
             "geosite": {"urls": [format!("http://{address}/geosite/PRIVATE?token=PRIVATE")]},
             "geoip": {"urls": [format!("http://{address}/geoip")]},
-            "auto_update": {"enabled": true, "interval_hours": 24},
+            "auto_update": {"enabled": true, "interval_hours": 24, "cron": "0 3 * * *"},
             "download": {"route": "routing", "group_id": null},
             "verify_checksum": true})
     );
@@ -329,11 +329,21 @@ async fn auto_update_stays_settable_while_the_configuration_names_urls() {
     assert_eq!(settings["geodata"]["source"], "config");
     assert_eq!(
         settings["geodata"]["auto_update"],
-        json!({"enabled": false, "interval_hours": 48})
+        json!({"enabled": false, "interval_hours": 48, "cron": null})
     );
     assert_eq!(settings["source"], "config");
     assert_eq!(fixture.get(SETTINGS).await["geodata"], settings["geodata"]);
     assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    let settings = ok(patch_settings(
+        &fixture,
+        json!({"geodata": {"auto_update": {"cron": "30 4 * * 1-5"}}}),
+    )
+    .await)
+    .await;
+    assert_eq!(
+        settings["geodata"]["auto_update"],
+        json!({"enabled": false, "interval_hours": 24, "cron": "30 4 * * 1-5"})
+    );
     fixture.shutdown().await;
 }
 
@@ -422,7 +432,7 @@ async fn null_returns_to_the_built_in_sources() {
     assert_eq!(defaults["source"], "default");
     assert_eq!(
         defaults["auto_update"],
-        json!({"enabled": true, "interval_hours": 24})
+        json!({"enabled": true, "interval_hours": 24, "cron": "0 3 * * *"})
     );
     let stored = ok(patch_settings(
         &fixture,

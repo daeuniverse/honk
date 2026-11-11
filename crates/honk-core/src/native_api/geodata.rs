@@ -328,7 +328,7 @@ pub(super) async fn capability(state: &NativeState) -> Value {
                 value["max_urls"] = json!(sources::MAX_URLS);
                 value["interval_hours"] = json!({"min": sources::INTERVAL_HOURS.start(),
                     "max": sources::INTERVAL_HOURS.end(),
-                    "default": sources::AutoUpdate::default().interval_hours});
+                    "default": sources::NOMINAL_INTERVAL_HOURS});
                 // The file is read at startup only; patches live in the state db.
                 value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }

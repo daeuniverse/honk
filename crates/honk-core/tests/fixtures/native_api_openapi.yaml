@@ -5400,6 +5400,7 @@ paths:
                       auto_update:
                         enabled: true
                         interval_hours: 24
+                        cron: '0 3 * * *'
                       download:
                         route: routing
                         group_id: null
@@ -5432,6 +5433,7 @@ paths:
                       auto_update:
                         enabled: true
                         interval_hours: 48
+                        cron: null
                       download:
                         route: group
                         group_id: group-proxy
@@ -5488,10 +5490,11 @@ paths:
         are each overridden on their own; null removes every override and every
         value taken from the configuration file, so the built-in sources and
         defaults apply until the engine next takes file values. When it takes file
-        values, a URL list or download route the configuration file names replaces
-        the override for that field. Geodata URLs are fetched under the
-        outbound-request policy in api-config. More URLs than resources.geodata.max_urls or an interval outside
-        resources.geodata.interval_hours returns 400. A patch never downloads; POST
+        values, a URL list, download route, schedule or checksum switch the
+        configuration file names replaces the override for that field. Geodata URLs are fetched under the
+        outbound-request policy in api-config. More URLs than resources.geodata.max_urls, an interval outside
+        resources.geodata.interval_hours, interval_hours together with cron, or a
+        cron expression the engine refuses returns 400. A patch never downloads; POST
         /geodata/update does. A download with route group whose group_id is not a
         current group returns 409 state_conflict and changes nothing.
       x-permission: control
@@ -5535,6 +5538,12 @@ paths:
                     auto_update:
                       enabled: true
                       interval_hours: 48
+              geodata_auto_update_cron:
+                summary: Update at 04:30 local time on weekdays
+                value:
+                  geodata:
+                    auto_update:
+                      cron: '30 4 * * 1-5'
               geodata_download:
                 summary: Download geodata through a group
                 value:
@@ -5605,6 +5614,7 @@ paths:
                       auto_update:
                         enabled: true
                         interval_hours: 24
+                        cron: '0 3 * * *'
                       download:
                         route: routing
                         group_id: null
@@ -8324,7 +8334,7 @@ components:
                     - min
                     - max
                     - default
-                  description: Bounds and default of geodata auto_update.interval_hours. Required when configurable_sources is true. min <= default <= max is required; JSON Schema cannot express this ordering, so validators check it separately.
+                  description: Bounds of geodata auto_update.interval_hours, and the nominal value it reads under a cron schedule. Required when configurable_sources is true. min <= default <= max is required; JSON Schema cannot express this ordering, so validators check it separately.
                   properties:
                     min:
                       type: integer
@@ -9984,6 +9994,8 @@ components:
       required:
         - enabled
         - interval_hours
+        - cron
+      description: When the engine takes file values, a schedule the configuration file names replaces a stored one, and a schedule an earlier file set returns to the default when the file names none; a patched schedule is kept.
       properties:
         enabled:
           type: boolean
@@ -9992,7 +10004,13 @@ components:
         interval_hours:
           type: integer
           minimum: 1
-          description: Hours between automatic updates, within resources.geodata.interval_hours, whose default applies when nothing is set. The engine may add a random delay; next_check_at reports the result.
+          description: Hours between automatic updates, within resources.geodata.interval_hours, when cron is null. Under a cron schedule it reads resources.geodata.interval_hours.default and has no effect. The engine may add a random delay; next_check_at reports the result.
+        cron:
+          type:
+            - string
+            - 'null'
+          default: '0 3 * * *'
+          description: Five-field cron expression (minute hour day-of-month month day-of-week) evaluated in the engine's local time zone, or null when interval_hours applies. Daily at 03:00 when nothing is set. The engine adds a random delay of up to an hour.
     GeoDataDownloadRoute:
       type: string
       enum:
@@ -10063,7 +10081,7 @@ components:
           description: The route every geodata request takes. routing when nothing is stored, as for every download the engine makes itself. When the engine takes file values (resources.geodata.lifecycle.file_values), a route the configuration file names replaces a stored one, and a route an earlier file set returns to routing when the file names none; a patched route is kept. It does not affect source. A group that has no usable member when an update runs, for example just after startup before its health checks finish, fails that URL like a connection error; the engine tries the next URL and reports last_error, and never falls back to direct.
         verify_checksum:
           type: boolean
-          description: Whether an update verifies each file by the resources.geodata.checksum method and rejects a file that does not match. true when nothing is set, and an engine that omits the field behaves as true. false sends no checksum request and accepts the file unverified, with verified false, for a mirror that answers the checksum URL with an error page or a status other than 404.
+          description: Whether an update verifies each file by the resources.geodata.checksum method and rejects a file that does not match. true when nothing is set, and an engine that omits the field behaves as true. false sends no checksum request and accepts the file unverified, with verified false, for a mirror that answers the checksum URL with an error page or a status other than 404. When the engine takes file values, a value the configuration file names replaces a stored one, and a value an earlier file set returns to true when the file names none; a patched value is kept.
     GeoDataSourcesPatch:
       type: object
       additionalProperties: false
@@ -10103,7 +10121,15 @@ components:
                 interval_hours:
                   type: integer
                   minimum: 1
-                  description: Within resources.geodata.interval_hours; a value outside it returns 400.
+                  description: Within resources.geodata.interval_hours; a value outside it returns 400. Switches to the interval schedule.
+                cron:
+                  type: string
+                  minLength: 1
+                  description: Switches to the cron schedule. Numbers, lists, ranges and steps only, firing at most four times a day; an expression that breaks these rules or never fires returns 400.
+              not:
+                required:
+                  - interval_hours
+                  - cron
     GroupPolicy:
       type: object
       required:

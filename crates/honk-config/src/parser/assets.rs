@@ -5,6 +5,7 @@ use super::diagnostics::ParserDiagnostics;
 use super::read::{self, Text};
 use crate::Config;
 use crate::assets::AssetsConfig;
+use crate::cron::Cron;
 use crate::diagnostic::{ConfigDiagnostic, SafeValue, SettingPath, Severity};
 use crate::error::{DetailedConfigError, ErrorCategory};
 
@@ -20,8 +21,21 @@ pub(super) struct ParsedAssets<'d, 'a> {
     ui_route: Option<Text<'d, 'a>>,
 }
 
+const INVALID_CRON: &str =
+    "value is not a five-field cron expression that fires at most four times a day; ignored";
+
 const SUB_BLOCKS: [(&str, &[&str]); 3] = [
-    ("geodata", &["geosite", "geoip", "route"]),
+    (
+        "geodata",
+        &[
+            "geosite",
+            "geoip",
+            "route",
+            "auto_update",
+            "cron",
+            "checksum",
+        ],
+    ),
     ("ui", &["url", "route"]),
     ("subscription", &["ua", "interval", "cache"]),
 ];
@@ -109,10 +123,24 @@ impl<'d, 'a> ParsedAssets<'d, 'a> {
         diagnostics: &mut ParserDiagnostics<'_>,
     ) {
         let defaults = &mut self.config.subscription;
+        let geodata = &mut self.config.geodata;
         match (block, key) {
             ("geodata", "geosite") => self.geosite = Some(value),
             ("geodata", "geoip") => self.geoip = Some(value),
             ("geodata", "route") => self.geodata_route = Some(value),
+            ("geodata", "auto_update") => geodata.auto_update = boolean(value, key, diagnostics),
+            ("geodata", "checksum") => geodata.checksum = boolean(value, key, diagnostics),
+            ("geodata", "cron") => {
+                let raw = value.raw();
+                geodata.cron =
+                    super::lenient(Cron::parse(raw).ok().map(Some), None, diagnostics, || {
+                        ConfigDiagnostic {
+                            setting: "assets.geodata.cron".to_owned(),
+                            value: raw.to_owned(),
+                            message: INVALID_CRON.to_owned(),
+                        }
+                    });
+            }
             ("ui", "url") => self.ui_url = Some(value),
             ("ui", "route") => self.ui_route = Some(value),
             ("subscription", "ua") => defaults.ua = Some(value.raw().to_owned()),
@@ -146,6 +174,25 @@ impl<'d, 'a> ParsedAssets<'d, 'a> {
             _ => unreachable!("assets.{block}.{key} is not in SUB_BLOCKS"),
         }
     }
+}
+
+/// A geodata switch; a value that is not a boolean leaves the key unset.
+fn boolean(
+    value: Text<'_, '_>,
+    key: &str,
+    diagnostics: &mut ParserDiagnostics<'_>,
+) -> Option<bool> {
+    let raw = value.raw();
+    super::lenient(
+        super::scalars::strict_bool(raw).map(Some),
+        None,
+        diagnostics,
+        || ConfigDiagnostic {
+            setting: format!("assets.geodata.{key}"),
+            value: raw.to_owned(),
+            message: "value is not a boolean; ignored".to_owned(),
+        },
+    )
 }
 
 /// Moves the geodata and UI values into the fields consumers read and fills
