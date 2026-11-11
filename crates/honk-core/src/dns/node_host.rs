@@ -1,4 +1,4 @@
-//! Node server hosts claimed by `subtag()` DNS request rules.
+//! Node server hosts claimed by DNS hosts aliases or `subtag()` request rules.
 
 use std::collections::HashMap;
 use std::io;
@@ -85,7 +85,7 @@ impl honk_outbound::bootstrap::NodeHostResolver for NodeHostRouting {
                     crate::logging::warn_throttled!(
                         host = %host,
                         error = %format_args!("{error:#}"),
-                        "node host lookup through its subtag() DNS rule failed"
+                        "node host lookup through its DNS hosts alias or subtag() rule failed"
                     );
                     Err(io::Error::other(error))
                 }
@@ -185,6 +185,89 @@ mod tests {
 
         assert!(hook.lookup("Node.Private.Example.").is_some());
         for unclaimed in ["node.public.example", "unindexed.private.example"] {
+            assert!(hook.lookup(unclaimed).is_none(), "{unclaimed}");
+        }
+    }
+
+    /// Answers every A query with 192.0.2.90 and every other query with NODATA.
+    struct AnswerPool;
+
+    #[async_trait::async_trait]
+    impl crate::dns::forwarder::DnsUpstreamPool for AnswerPool {
+        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+            let query = crate::dns::query::QueryContext::parse(raw_query)?;
+            let mut response = crate::dns::forwarder::make_empty_response(raw_query, &query);
+            if query.qtype().unwrap().get() == 1 {
+                response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+                response.extend_from_slice(&[192, 0, 2, 90]);
+                response[6..8].copy_from_slice(&1u16.to_be_bytes());
+            }
+            Ok(response)
+        }
+    }
+
+    fn alias_hook(
+        rules: &str,
+        node_hosts: &[&str],
+    ) -> (
+        tempfile::NamedTempFile,
+        Arc<dyn honk_outbound::bootstrap::NodeHostResolver>,
+    ) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), rules).unwrap();
+        let mut dns = honk_config::parser::parse_dae_config(
+            "dns {\n upstream {\n  providerdoh: 'udp://192.0.2.53:53' -> direct\n }\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
+        )
+        .unwrap()
+        .dns;
+        dns.hosts = vec![file.path().to_string_lossy().into_owned()];
+        let forwarder = crate::dns::forwarder::DnsForwarder::new(
+            Arc::new(AnswerPool),
+            Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
+            Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&dns).unwrap()),
+        )
+        .with_policy_from_config(&dns)
+        .unwrap()
+        .with_hosts_from_config(&dns)
+        .unwrap()
+        .with_node_hosts(
+            node_hosts
+                .iter()
+                .map(|host| ((*host).to_owned(), vec!["MyAirport".to_owned()]))
+                .collect(),
+        );
+        let hook = resolver(&DnsService::with_forwarder(Arc::new(forwarder)));
+        (file, hook)
+    }
+
+    #[tokio::test]
+    async fn hook_claims_hosts_aliases_and_resolves_their_target() {
+        let (_file, hook) = alias_hook(
+            "full:node.example literal.example\n\
+             full:literal.example 192.0.2.80\n\
+             full:chained.example node.example\n\
+             full:claimed.example provider.example\n\
+             regexp:^rx[0-9]+\\. literal.example\n\
+             keyword:kwnode node.example\n",
+            &["provider.example"],
+        );
+        let literal = [IpAddr::from([192, 0, 2, 80])];
+
+        for host in [
+            "Node.Example.",
+            "chained.example",
+            "rx12.example",
+            "a-kwnode.example",
+        ] {
+            let lookup = hook.lookup(host).expect("alias claims the host");
+            assert_eq!(lookup.await.unwrap(), literal, "{host}");
+        }
+        let claimed = hook
+            .lookup("claimed.example")
+            .expect("alias claims the host");
+        assert_eq!(claimed.await.unwrap(), [IpAddr::from([192, 0, 2, 90])]);
+
+        for unclaimed in ["literal.example", "other.example"] {
             assert!(hook.lookup(unclaimed).is_none(), "{unclaimed}");
         }
     }

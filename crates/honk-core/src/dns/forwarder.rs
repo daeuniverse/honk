@@ -417,7 +417,7 @@ impl DnsForwarder {
 mod exchange;
 mod hosts;
 mod refresh;
-pub(crate) use hosts::{HostsSnapshot, HostsSourceSet};
+pub(crate) use hosts::{HostsResolution, HostsSnapshot, HostsSourceSet, NodeHostAlias};
 mod message {
     use crate::dns::query::parse_name;
     use std::net::{IpAddr, SocketAddr};
@@ -544,29 +544,9 @@ mod response {
         addresses: &[IpAddr],
         ttl: u32,
     ) -> Vec<u8> {
-        let question_end = query
-            .question_offsets()
-            .map(|offsets| offsets.end())
-            .unwrap_or(12)
-            .min(raw_query.len());
-        let mut response = Vec::with_capacity(
-            question_end
-                .saturating_add(addresses.len().saturating_mul(28))
-                .saturating_add(11),
-        );
-        response.extend_from_slice(&raw_query[..question_end]);
-        response.resize(response.len().max(12), 0);
-        response[2..4].copy_from_slice(&dns_error_flags(raw_query, 0).to_be_bytes());
-        response[4..6].copy_from_slice(&1u16.to_be_bytes());
-        response[6..12].fill(0);
-
+        let (mut response, name_pointer) =
+            response_prefix(raw_query, query, 0, addresses.len().saturating_mul(28));
         let qtype = query.qtype().map(|value| value.get()).unwrap_or_default();
-        let question_offset = query
-            .question_offsets()
-            .and_then(|offsets| u16::try_from(offsets.start()).ok())
-            .filter(|offset| *offset <= 0x3fff)
-            .unwrap_or(12);
-        let name_pointer = (0xc000 | question_offset).to_be_bytes();
         let mut answer_count = 0u16;
         for address in addresses {
             if answer_count == u16::MAX {
@@ -584,7 +564,43 @@ mod response {
             answer_count += 1;
         }
         response[6..8].copy_from_slice(&answer_count.to_be_bytes());
+        append_edns(&mut response, query);
+        response
+    }
 
+    /// The header and question of a local answer with `rcode` and empty
+    /// sections, plus a compression pointer to the question name.
+    pub(super) fn response_prefix(
+        raw_query: &[u8],
+        query: &QueryContext,
+        rcode: u8,
+        answer_capacity: usize,
+    ) -> (Vec<u8>, [u8; 2]) {
+        let question_end = query
+            .question_offsets()
+            .map(|offsets| offsets.end())
+            .unwrap_or(12)
+            .min(raw_query.len());
+        let mut response = Vec::with_capacity(
+            question_end
+                .saturating_add(answer_capacity)
+                .saturating_add(11),
+        );
+        response.extend_from_slice(&raw_query[..question_end]);
+        response.resize(response.len().max(12), 0);
+        response[2..4].copy_from_slice(&dns_error_flags(raw_query, rcode).to_be_bytes());
+        response[4..6].copy_from_slice(&1u16.to_be_bytes());
+        response[6..12].fill(0);
+
+        let question_offset = query
+            .question_offsets()
+            .and_then(|offsets| u16::try_from(offsets.start()).ok())
+            .filter(|offset| *offset <= 0x3fff)
+            .unwrap_or(12);
+        (response, (0xc000 | question_offset).to_be_bytes())
+    }
+
+    pub(super) fn append_edns(response: &mut Vec<u8>, query: &QueryContext) {
         if let Some(edns) = query.edns().filter(|edns| edns.version() == 0) {
             response[10..12].copy_from_slice(&1u16.to_be_bytes());
             response.extend_from_slice(&[0, 0, 41]);
@@ -593,7 +609,6 @@ mod response {
             response.extend_from_slice(&flags.to_be_bytes());
             response.extend_from_slice(&0u16.to_be_bytes());
         }
-        response
     }
 
     fn append_address_record(

@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::{DnsService, DnsServiceBackend, OperationToken};
 use crate::dns::forwarder::{
-    CacheAccess, DnsForwarder, ResolveMode, ResolveOptions, build_dns_query,
+    CacheAccess, DnsForwarder, NodeHostAlias, ResolveMode, ResolveOptions, build_dns_query,
 };
 use crate::dns::planner::{PlanError, UpstreamTag};
 use crate::dns::query::{DnsRequestMeta, IngressProfile};
@@ -354,9 +354,11 @@ impl DnsService {
         responses.fail_on_packet_rejection()
     }
 
-    /// Resolve a node server host through the `subtag()` rule that claims it
-    /// in the current generation. `None` when nothing claims it; a claimed
-    /// host never falls back to another resolver.
+    /// Resolve a node server host through the hosts alias or `subtag()` rule
+    /// that claims it in the current generation. An alias target resolves as
+    /// a node host would: through its own `subtag()` claim, else bootstrap.
+    /// `None` when nothing claims the host; a claimed host never falls back
+    /// to another resolver.
     pub(crate) async fn resolve_node_host(
         &self,
         domain: &str,
@@ -372,10 +374,32 @@ impl DnsService {
             (Some(Err(_)), Some(provider)) => Arc::clone(provider.current().forwarder()),
             _ => self.forwarder(),
         };
-        let Some(upstream) = claimed_upstream(&forwarder, &domain) else {
-            return Ok(None);
+        let alias = match forwarder.node_host_alias(&domain)? {
+            Some(NodeHostAlias::Addresses(addresses)) => return Ok(Some(addresses)),
+            Some(NodeHostAlias::Name(target)) => Some(target),
+            None => None,
         };
-        let resolve = resolve_claimed(self, &forwarder, &domain, upstream);
+        let domain = alias.as_deref().unwrap_or(&domain);
+        let Some(upstream) = claimed_upstream(&forwarder, domain) else {
+            drop(lease);
+            return match alias {
+                Some(target) => honk_outbound::bootstrap::resolve_with(
+                    honk_outbound::bootstrap::global(),
+                    &target,
+                )
+                .await
+                .map(Some)
+                .map_err(|source| {
+                    NameResolutionError::Bootstrap {
+                        domain: target.clone(),
+                        source: source.into(),
+                    }
+                    .into()
+                }),
+                None => Ok(None),
+            };
+        };
+        let resolve = resolve_claimed(self, &forwarder, domain, upstream);
         match lease {
             Some(Ok(lease)) => lease.run(std::pin::pin!(resolve)).await?,
             Some(Err(unavailable)) => Err(unavailable.into()),
@@ -384,12 +408,16 @@ impl DnsService {
         .map(Some)
     }
 
-    /// Whether the current generation's `subtag()` rules claim `host`.
+    /// Whether the current generation's hosts aliases or `subtag()` rules
+    /// claim `host`.
     pub(crate) fn claims_node_host(&self, host: &str) -> bool {
         let forwarder = self.forwarder();
-        !forwarder.node_host_upstreams.is_empty()
-            && normalize_domain(host)
-                .is_ok_and(|domain| claimed_upstream(&forwarder, &domain).is_some())
+        let aliases = forwarder.has_hosts_aliases();
+        (aliases || !forwarder.node_host_upstreams.is_empty())
+            && normalize_domain(host).is_ok_and(|domain| {
+                (aliases && forwarder.is_hosts_alias(&domain))
+                    || claimed_upstream(&forwarder, &domain).is_some()
+            })
     }
 }
 
