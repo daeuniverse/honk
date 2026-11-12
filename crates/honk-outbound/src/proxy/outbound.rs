@@ -4,7 +4,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use super::{DirectMark, MultiTargetTransport, PacketTransport, PreparedUdpTransport, ProxyStream};
+use super::{
+    AsyncReadWrite, DirectMark, MultiTargetTransport, PacketTransport, PreparedUdpTransport,
+    ProxyStream, TunnelUnsupported,
+};
 
 /// Result of requesting reusable protocol state. `Ready` means the state is
 /// usable after the call; `NotApplicable` means the protocol owns no
@@ -13,6 +16,24 @@ use super::{DirectMark, MultiTargetTransport, PacketTransport, PreparedUdpTransp
 pub enum WarmOutcome {
     Ready,
     NotApplicable,
+}
+
+/// Settings for a hop dialed over a stream tunneled through earlier hops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelDialOptions {
+    pub connect_timeout: Duration,
+    /// Offer hybrid post-quantum key shares in a REALITY ClientHello. A
+    /// caller redials with `false` after a REALITY mask certificate.
+    pub reality_key_shares: bool,
+}
+
+impl TunnelDialOptions {
+    pub fn new(connect_timeout: Duration) -> Self {
+        Self {
+            connect_timeout,
+            reality_key_shares: true,
+        }
+    }
 }
 
 /// TCP flow dialing. Every protocol implements this.
@@ -73,6 +94,26 @@ pub trait TcpOutbound: Send + Sync {
         mark: DirectMark,
     ) -> anyhow::Result<ProxyStream> {
         anyhow::bail!("outbound cannot carry direct mark {:#x}", mark.get())
+    }
+
+    /// Run this node's handshake over `carrier`, a stream already connected
+    /// to its server through earlier hops. The carrier's physical connection
+    /// owns dial admission and transport observation (`TransportAttached`,
+    /// `TransportReady`). This hop still emits its target milestones as a
+    /// direct dial does: `TargetRequestSent` through `request_write`, so a
+    /// carrier that defers delivery defers the event, and `TargetConfirmed`
+    /// directly once a protocol reply confirms the target. A caller chaining
+    /// several hops must suppress them on every hop but the last. Protocols that cannot run over a tunneled
+    /// stream keep the default, a [`TunnelUnsupported`] error.
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        _carrier: Box<dyn AsyncReadWrite>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        Err(TunnelUnsupported(runtime.node.protocol().as_str()).into())
     }
 }
 
