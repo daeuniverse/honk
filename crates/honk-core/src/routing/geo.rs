@@ -1492,6 +1492,14 @@ mod scan_tests {
 
     #[test]
     fn missing_geo_asset_warns_only_when_required() {
+        // Callsite interest is process-global; a parallel test without a default
+        // Dispatch can cache NoSubscriber's interest while this one captures.
+        if crate::test_support::run_exact_in_child(
+            "HONK_GEO_WARN_CHILD",
+            "routing::geo::scan_tests::missing_geo_asset_warns_only_when_required",
+        ) {
+            return;
+        }
         let output = tempfile::NamedTempFile::new().unwrap();
         let subscriber = tracing_subscriber::fmt()
             .without_time()

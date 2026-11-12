@@ -28,7 +28,10 @@ async fn failed_telemetry_reads_keep_last_samples_and_still_sweep() -> anyhow::R
         let faults = Arc::clone(&model.telemetry_faults);
         let admission = Arc::clone(&model.admission_pressure);
         let backend: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(model)));
-        let janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        let mut janitor = BpfJanitor::new(Arc::clone(&backend), Arc::new(TcpFlowPins::default()));
+        // The exact drain below counts pressure-sized candidate batches; the
+        // mock's collect-and-sort of the 90% map can outlast the scan budget.
+        janitor.unbounded_scan_time = true;
         let start = tokio::time::Instant::now();
         let mut state = tick::TickState::new(start);
         if failed_signal == 1 {
