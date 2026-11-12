@@ -10,7 +10,7 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::validate_node_collection;
+pub use validation::{MAX_CHAIN_HOPS, validate_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
@@ -103,6 +103,35 @@ impl Default for Node {
 impl Node {
     pub fn protocol(&self) -> NodeProtocol {
         self.outbound.protocol()
+    }
+
+    /// Hop names of a proxy chain node, entry first.
+    pub fn chain_hops(&self) -> Option<&[String]> {
+        self.outbound.chain_hops()
+    }
+
+    /// Whether this node's handshake can run over a stream tunneled through
+    /// an earlier chain hop. A chain's first hop dials as usual; every later
+    /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
+    /// in step with this table.
+    pub fn supports_tunneled_dial(&self) -> bool {
+        match &self.outbound {
+            OutboundConfig::Socks5(_) | OutboundConfig::Shadowsocks(_) => true,
+            OutboundConfig::Trojan(_) | OutboundConfig::Vmess(_) => !self.is_xhttp(),
+            OutboundConfig::Vless(config) => {
+                !self.is_xhttp()
+                    && !config.is_vision()
+                    && !config.is_encrypted()
+                    && config.tcp_path() == VlessTcpPath::Direct
+            }
+            OutboundConfig::Hysteria2(_)
+            | OutboundConfig::Tuic(_)
+            | OutboundConfig::Juicity(_)
+            | OutboundConfig::AnyTls(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block
+            | OutboundConfig::Chain { .. } => false,
+        }
     }
 
     pub fn is_xhttp(&self) -> bool {

@@ -6,6 +6,10 @@ use crate::node::{Node, OutboundConfig};
 use crate::options::vocab::{
     optional_flow, packet_network, parse_port_hopping, vmess_cipher, xhttp_stream_transport,
 };
+/// Longest accepted proxy chain. Each hop adds a round trip and a handshake
+/// to every connection.
+pub const MAX_CHAIN_HOPS: usize = 4;
+
 pub(super) fn semantic_error(
     source: &SourceRef,
     setting: SettingPath,
@@ -107,6 +111,9 @@ impl Node {
         if self.name.is_empty() {
             return Err(invalid(Some("name"), "node name must not be empty"));
         }
+        if let Some(hops) = self.chain_hops() {
+            return self.validate_chain(hops);
+        }
         if self.host().trim().is_empty()
             || self.port == 0
             || (self.host.is_empty() && self.address.matches(':').count() > 1)
@@ -185,6 +192,31 @@ impl Node {
         let uuid = uuid.ok_or_else(|| invalid(None, "protocol requires a valid UUID"))?;
         uuid::Uuid::parse_str(uuid).map_err(|_| invalid(None, "protocol requires a valid UUID"))?;
         self.validate_protocol_inner()
+    }
+
+    /// A chain owns no endpoint; its hops are names resolved after assembly
+    /// by `Config::validate_assembled`.
+    fn validate_chain(&self, hops: &[String]) -> Result<(), ValidationFailure> {
+        let invalid = ValidationFailure::new;
+        if !self.host.is_empty() || !self.address.is_empty() || self.port != 0 {
+            return Err(invalid(None, "chain node must not set an address or port"));
+        }
+        if hops.len() < 2 {
+            return Err(invalid(Some("hops"), "chain node needs at least two hops"));
+        }
+        if hops.len() > MAX_CHAIN_HOPS {
+            return Err(invalid(Some("hops"), "chain node allows at most four hops"));
+        }
+        if hops.iter().any(|hop| hop.trim().is_empty()) {
+            return Err(invalid(Some("hops"), "chain hop names must not be empty"));
+        }
+        if hops.contains(&self.name) {
+            return Err(invalid(
+                Some("hops"),
+                "chain node must not use itself as a hop",
+            ));
+        }
+        Ok(())
     }
 
     pub fn validate_protocol(&self) -> Result<(), crate::ConfigError> {
