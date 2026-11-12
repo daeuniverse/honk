@@ -318,9 +318,6 @@ fn write_data(
 }
 
 pub(crate) fn status(response: &[u8]) -> String {
-    let Some(low) = response.get(3).map(|flags| u16::from(flags & 15)) else {
-        return "INVALID".into();
-    };
     if response.len() > usize::from(u16::MAX)
         || response
             .get(4..6)
@@ -328,27 +325,9 @@ pub(crate) fn status(response: &[u8]) -> String {
     {
         return "INVALID".into();
     }
-    let mut code = low;
-    let mut seen_opt = false;
-    let mut invalid = false;
-    let parsed = super::visit_message(None, response, |record| {
-        let mut name = [0; 255];
-        let Ok((length, end)) = parse_name_into(response, record.wire.start, &mut name) else {
-            invalid = true;
-            return;
-        };
-        if read_u16(response, end) == Ok(41) {
-            if record.section != Section::Additional || seen_opt || name[..length] != [0] {
-                invalid = true;
-                return;
-            }
-            seen_opt = true;
-            code |= u16::from(response[end + 4]) << 4;
-        }
-    });
-    if parsed.is_err() || invalid {
+    let Ok(code) = super::response_rcode(response) else {
         return "INVALID".into();
-    }
+    };
     match code {
         0 => "NOERROR",
         1 => "FORMERR",
@@ -507,6 +486,11 @@ mod tests {
         assert_eq!(status(&wire), "BADVERS");
         wire[3] |= 5;
         assert_eq!(status(&wire), "BADALG");
+        let mut malformed = wire.clone();
+        let length = malformed.len();
+        malformed[length - 2..].copy_from_slice(&1u16.to_be_bytes());
+        malformed.push(0);
+        assert_eq!(status(&malformed), "INVALID");
         let mut refused = [0; 12];
         refused[2..4].copy_from_slice(&0x8185u16.to_be_bytes());
         let mut budget = MAX_JSON_BYTES;
