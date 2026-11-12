@@ -15,15 +15,15 @@ node {
 
 ## 欄位
 
-Node 模型包含下列欄位。分享連結會從協定方案、userinfo、位址部分、片段和查詢參數填入供使用者設定的欄位；其餘欄位由結構化 loader、匯入或執行時填入。這些欄位都不是 dae `node {}` 裡的獨立 key；節點寫成連結和標籤，見 [`node {}` 宣告](#node--宣告)。
+Node 模型包含下列欄位。分享連結會從協定方案、userinfo、位址部分、片段和查詢參數填入供使用者設定的欄位；其餘欄位由結構化 loader、匯入或執行時填入。這些欄位都不是 dae `node {}` 裡的獨立 key；節點寫成帶標籤的連結或[鏈式節點](#鏈式節點)，見 [`node {}` 宣告](#node--宣告)。
 
-扁平結構化輸入必須包含 `name`、`protocol`、`address` 和 `port`，即使已設定 `host`。表中的預設值是模型預設值。
+扁平結構化輸入必須包含 `name`、`protocol`、`address` 和 `port`，即使已設定 `host`。鏈式節點寫 `protocol: chain`、`address: ""`、`port: 0` 和 `hops` 清單。表中的預設值是模型預設值。
 
 | Key | 型別 | 預設值 | 意義 |
 | --- | --- | --- | --- |
 | `id` | UUID | 派生 | 穩定內容身分；執行時不允許 nil。見[節點身分](#節點身分)。 |
 | `name` | string | `""` | dae 標籤、解碼後的片段、`remark` 查詢參數、VMess `ps` 或不含憑據的 `{scheme}-{host}` 回退名稱。 |
-| `protocol` | enum | `ss` | 從分享連結協定方案派生。 |
+| `protocol` | enum | `ss` | 從分享連結協定方案派生；鏈式節點為 `chain`。 |
 | `address` | string | `""` | 從連結解析的 `host:port`；它不補充缺失的埠。 |
 | `host` | string | `""` | 明確伺服器端主機；否則 `Node::host()` 從 `address` 派生。 |
 | `port` | u16 | `0` | 伺服器端埠；URL 形連結省略埠時使用 `443`，v2rayN VMess 酬載則必須帶有效埠。 |
@@ -64,12 +64,13 @@ Node 模型包含下列欄位。分享連結會從協定方案、userinfo、位�
 | `anytls_min_idle_session` | usize? | `null` | 來自 `min_idle_session` 的空閒 session 目標下限；有效預設值 `0`，受八條 session 的池上限約束。 |
 | `anytls_idle_session_check_interval` | u64? | `null` | 解析後的 `idle_session_check_interval` 秒數；目前執行時 janitor 週期仍固定為 30 秒。 |
 | `anytls_idle_session_timeout` | u64? | `null` | 來自 `idle_session_timeout` 的空閒驅逐；有效預設值 30 秒。 |
+| `hops` | string[] | 省略 | 鏈式節點從入口到出口的各跳節點名；只有 `chain` 讀取，其他協定攜帶時會被移除並產生 warning。 |
 | `mark` | u32? | `null` | 結構化模型中的出站 `SO_MARK`；不是 dae 分享連結查詢參數。 |
 | `tags` | string[] | `[]` | 分類後設資料；不是 dae 分享連結查詢參數。 |
 | `subscription_id` / `group_id` | UUID? | `null` | 匯入與執行時歸屬後設資料。 |
 | `created_at` / `updated_at` | datetime | 目前時間 | 執行時後設資料。 |
 
-節點自身驗證要求非空名稱、有效主機和明確非零 `port`。`address` 不會補充缺失的埠；僅提供 IPv6 位址時須明確設定 `host`。只有身分與注入規則完全一致的 `direct`/`block` 內建節點可省略 endpoint。
+節點自身驗證要求非空名稱、有效主機和明確非零 `port`。`address` 不會補充缺失的埠；僅提供 IPv6 位址時須明確設定 `host`。只有身分與注入規則完全一致的 `direct`/`block` 內建節點可省略 endpoint。鏈式節點則必須留空 endpoint，見[鏈式節點](#鏈式節點)。
 
 URL userinfo 中，Trojan、AnyTLS、VLESS 和 VMess 取 `user:pass` 的密碼部分，沒有冒號時取整個 userinfo。Hysteria2 保留完整的 `user:pass`，TUIC 和 Juicity 讀取 `uuid:password`，SOCKS5 分別保留兩部分。憑據會做百分號解碼，結果必須是有效 UTF-8。secret 中的字面 `:` 或 `@` 須寫成 `%3A` 或 `%40`。
 
@@ -321,6 +322,7 @@ Auto、native、XUDP、Mux.Cool 與關閉 UDP 的節點 ID 不變。直接選擇
 | `anytls` | — | 是 | 是* | 多路複用 TLS session 與 UoT v2 |
 | `direct` | — | 是 | 是 | 保留的內建直連出站；沒有分享連結協定方案 |
 | `block` | — | 否 | 否 | 保留的內建拒絕出站；沒有分享連結協定方案 |
+| `chain` | — | 是 | 否 | 依次經過其他節點撥號；沒有分享連結協定方案；見[鏈式節點](#鏈式節點) |
 
 `network` 可獨立於流傳輸方式關閉 Trojan、AnyTLS 和 VLESS 的封包撥號。VMess UDP 尚未實作。
 
@@ -812,6 +814,63 @@ REALITY 不使用 CA 驗證或 `skip_cert_verify`。目標 TLS 記錄的緩衝�
 
 靜態設定會提供真實 ECH；ECH 被拒絕時，握手 fail-closed。發現是盡力而為且 fail-open：找不到 ECHConfigList 時，握手不帶真實 ECH 繼續，`utls` 仍傳送 ECH GREASE。發現走 bootstrap resolver，未設定時使用系統第一個 nameserver，並依網域名稱快取結果。同一組控制項也適用於 QUIC 協定。
 
+## 鏈式節點
+
+鏈式節點依次經過其他節點到達目的地。依入口到出口的順序列出各跳的節點名，以 `->` 分隔：
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    'hk: east': 'ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@hk.example.com:8388'
+    land: 'trojan://secret@land.example.com:443?sni=land.example.com'
+
+    via_hk: front -> 'hk: east' -> land
+}
+```
+
+honk 像連線到其他節點一樣連線到入口的伺服器。之後每一跳都在前面各跳建立的串流裡完成自己的握手，最後由出口連線到目的地。鏈式節點是一般節點：群組可以用 `filter` 或群組的 `final` 選中它，路由規則透過這樣的群組到達它，API 列出它時協定為 `chain`（Clash 類型為 `Chain`）。
+
+這種條目寫法是 honk 的擴充，見[方言參考](./dialect.md#node-與-subscription-條目)。
+
+| 輸入 | 處理結果 |
+| --- | --- |
+| 引號外的 `->` | 鏈式節點。`->` 兩側的空格可以省略。 |
+| 跳名含 `->`、`://` 或空白之後的 `#` | 給該跳加引號：`front -> 'a->b'`。不加引號時，`->` 會拆開該跳，`://` 讓整個值成為分享連結，` #` 開始註解。跳名中的 `:` 和空格不需要引號。 |
+| 值中有引號外的 `://` | 即使含 `->` 也是分享連結，所以 `land: trojan://…#hk->jp` 是 Trojan 節點。分享連結從第一個 `->` 起的文字會被忽略。 |
+| 整個值加引號，`via: 'front -> land'` | 視為一條協定未知的連結，條目會被丟棄並產生 `invalid-node-entry`。 |
+| 引號外沒有 `->`，`via: front` | 不是鏈式節點：值依分享連結解析，條目會被丟棄並產生 `invalid-node-entry`。 |
+| 沒有標籤、多於四跳、某跳為空、以鏈式節點自己的名字為跳 | 拒絕設定。與格式錯誤的分享連結不同，無效的鏈式節點條目不會被略過。 |
+
+靜態節點與訂閱節點組裝完成後，各跳依名稱解析。設定、reload 或訂閱重新整理未通過以下任一檢查時會被拒絕，正在執行的設定保持不變：
+
+| 檢查 | 診斷代碼 |
+| --- | --- |
+| 每一跳恰好對應一個節點 | 沒有符合的節點時為 `invalid-chain-hop-reference`，符合多個時為 `ambiguous-chain-hop-reference` |
+| 跳不是 `direct`、`block` 或另一個鏈式節點 | `unsupported-chain-hop` |
+| 入口之後的每一跳都支援隧道撥號（見下表） | `unsupported-chain-hop` |
+
+跳只能是節點，不能是群組。訂閱重新整理可能改名或產生重名節點，因此引用訂閱節點的鏈式節點會讓每次改動這些名稱的重新整理失敗。
+
+| 位置 | 支援的節點 |
+| --- | --- |
+| 入口 | 任意代理節點，依原方式撥號 |
+| 之後各跳，包括出口 | SOCKS5；Shadowsocks；不使用 XHTTP 的 Trojan 與 VMess；不使用 Vision、Encryption、XHTTP 或 TCP 多路複用（`mux=h2mux` 或 Mux.Cool）的 VLESS |
+
+Hysteria2、TUIC、Juicity 與 AnyTLS 只能作入口。VMess 與 VLESS 跳需要 `rprx` feature，與一般 VMess、VLESS 節點相同。
+
+鏈式節點沒有位址、埠、憑據或分享連結。它的[身分](#節點身分)由協定 `chain` 與依序排列的跳名衍生：為鏈式節點改名不改變 ID；修改跳名、調整各跳順序、增加或刪除跳，都會改變 ID。因此兩個鏈式節點只要各跳及順序相同，不論名稱是否相同都得到同一個 ID，設定會以 `duplicate-node-id` 被拒絕，與兩條相同的分享連結一樣。JSON、YAML 與 TOML 把它寫成 `protocol: chain` 加一個依入口到出口順序排列的 `hops` 清單；少於兩跳的清單會被拒絕。
+
+限制：
+
+- 只支援 TCP。群組為 UDP 選擇節點時會略過鏈式節點；路由到鏈式節點的 UDP 流會被拒絕，與 VMess 相同。
+- 鏈式節點不使用連線池，也不預熱。每條連線都新開一條第一跳的串流，並重做之後每一跳的握手，包括出口的握手。
+- 入口之後某一跳的伺服器是網域時，honk 把網域交給前一跳，由前一跳的伺服器解析，不在本機解析。入口的伺服器與一般節點一樣解析。
+- 沒有節點過濾器的群組會收入全部節點，因此也會收入每個鏈式節點及其各跳。出口不能直連時，用 `filter` 把它排除。
+- 撥號結果、健康狀態與 Score 都記在鏈式節點自己的 ID 下。設定了 HTTP 檢測目標時，探測經整條鏈撥號。沒有時（`tcp_check_url` 為空），原始 TCP 探測不為鏈式節點記錄任何結果，因此鏈式節點因連線失敗而失效後，只有三種方式能恢復：仍經過它的連線成功，兩次 Clash 延遲測試成功，或 reload 修改了它的跳、使它得到新 ID。群組中包含鏈式節點時，請保留 HTTP 檢測。只設定 `host` 和 `port`、`address` 為空的扁平結構化節點也是如此：沒有 HTTP 檢測時它不做原始 TCP 探測，維持原有狀態。原生 API 拒絕以鏈式節點為目標的 `tcp_connect` 探測，探測群組時把其中的鏈式節點成員回報為無法使用；`delay` 子命令測試鏈式節點時須提供 `--url`。原生 API 對鏈式節點的 `cold` 探測仍經當前 generation 中各跳的執行時撥號，因此會重用某一跳已預熱的 session，例如 AnyTLS 入口的 session。
+- 鏈式流量的 transport quality 證據記在各跳自己的節點上，不記在鏈式節點上。因此鏈式流量可能給入口節點帶來壓力，而包含該鏈式節點的 Score 群組看不到它的傳輸壓力。
+- 原生 API 的節點介面只能用分享連結建立節點，也拒絕刪除鏈式節點；請在設定中管理鏈式節點。
+- Clash 連線的 `chains` 先列出各跳（出口在前），再列出鏈式節點及其所在的群組。
+
 ## 分享連結 scheme
 
 XHTTP 以外，未知查詢 key 會被忽略，因此拼錯 key 名不會報錯。XHTTP 連結拒絕未知 key，VLESS 拒絕上文列出的第三方寫法。
@@ -834,7 +893,7 @@ honk 不執行 Shadowsocks 外掛。`plugin=name;options`、`plugin-opts` 和 `p
 
 SOCKS5 只在連結同時帶有使用者名稱和密碼時提供使用者名稱/密碼認證，兩者各不得超過 255 位元組。
 
-寫成 `a -> b` 的鏈只解析 `a`。節點名稱來自 dae 標籤、`#fragment`、`remark`、VMess `ps` 或 `{scheme}-{host}`，從不使用原始 URI 或 userinfo，因此名稱不會洩露憑據。
+分享連結從第一個 `->` 起的文字會被忽略。節點名稱來自 dae 標籤、`#fragment`、`remark`、VMess `ps` 或 `{scheme}-{host}`，從不使用原始 URI 或 userinfo，因此名稱不會洩露憑據。
 
 ## 相關文件
 
