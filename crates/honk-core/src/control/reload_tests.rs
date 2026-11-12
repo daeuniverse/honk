@@ -130,6 +130,25 @@ fn native_api_settings_require_restart() {
 }
 
 #[test]
+fn geodata_schedule_and_checksum_keys_require_restart() {
+    let current = Config::default();
+    for (field, value) in [
+        ("auto_update", serde_json::json!(false)),
+        ("cron", serde_json::json!("0 4 * * *")),
+        ("checksum", serde_json::json!(false)),
+    ] {
+        let mut replacement = current.clone();
+        replacement.assets.geodata =
+            serde_json::from_value(serde_json::json!({ field: value })).unwrap();
+        assert_eq!(
+            restart_required_changes(&current, &replacement),
+            ["assets.geodata"],
+            "{field}"
+        );
+    }
+}
+
+#[test]
 fn edits_to_removed_cache_file_keys_do_not_require_restart() {
     let current = Config::default();
     let mut replacement = current.clone();

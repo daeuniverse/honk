@@ -294,7 +294,7 @@ Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./gro
 | 进程状态 | `global.log_level`、`global.data_dir`、`global.store_subscribe` |
 | DNS listener | `dns.bind` endpoint 或 transport 的语义变更 |
 | Clash API | `experimental.clash_api.external_controller`、`external_ui`、`secret`、`default_mode`；生效的 `assets.ui.url` 和 `assets.ui.route` |
-| 原生 API | 任意 `experimental.native_api` 变更；生效的 `assets.geodata.geosite`、`assets.geodata.geoip`、`assets.geodata.route` |
+| 原生 API | 任意 `experimental.native_api` 变更；生效的 `assets.geodata.geosite`、`assets.geodata.geoip`、`assets.geodata.route`；`assets.geodata.auto_update`、`assets.geodata.cron`、`assets.geodata.checksum` |
 | 持久化 | `experimental.cache_file.enabled`、`store_dns` |
 | NFQUEUE | `global.nfqueue_enable`，已记录数据路径准入前启动降级时除外（[例外说明](../reference/global.md)） |
 | 健康检查与 TLS | `global.check_interval`、生效的第一个 `global.tcp_check_url`、启用 HTTP 检查时的 `global.tcp_check_http_method`、选中的 `global.udp_check_dns` 目标，或原生 TLS/uTLS 模式切换（参见[健康检查重载语义](../reference/global.md#重载健康检查与-tls-模式)） |

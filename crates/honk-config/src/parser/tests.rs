@@ -3254,6 +3254,73 @@ mod assets_block {
     }
 
     #[test]
+    fn geodata_schedule_and_checksum_keys_are_kept_in_assets() {
+        let (config, diagnostics) = parse(
+            "assets {\n geodata {\n  auto_update: false\n  cron: '0 4 * * 1'\n  checksum: no\n }\n}",
+        );
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let geodata = &config.assets.geodata;
+        assert_eq!(geodata.auto_update, Some(false));
+        assert_eq!(
+            geodata.cron.as_ref().map(crate::cron::Cron::as_str),
+            Some("0 4 * * 1")
+        );
+        assert_eq!(geodata.checksum, Some(false));
+        let (config, _) = parse("assets {\n geodata {\n  geosite: 'https://example.test/g'\n }\n}");
+        assert_eq!(
+            config.assets.geodata,
+            crate::assets::GeodataDefaults::default()
+        );
+    }
+
+    #[test]
+    fn an_invalid_geodata_schedule_key_warns_and_stays_unset() {
+        let input = "assets {\n geodata {\n  auto_update: maybe\n  cron: '* 3 * * *'\n  checksum: 2\n  crontab: '0 3 * * *'\n }\n}";
+        let (config, diagnostics) = parse(input);
+        assert_eq!(
+            config.assets.geodata,
+            crate::assets::GeodataDefaults::default()
+        );
+        let warnings = diagnostics
+            .iter()
+            .filter(|d| d.code == "legacy-config-warning")
+            .map(|d| {
+                (
+                    d.setting.to_string(),
+                    d.message,
+                    &input[d.span.clone().unwrap()],
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            warnings,
+            [
+                (
+                    "assets.geodata.auto_update".to_owned(),
+                    "value is not a boolean; ignored",
+                    "maybe"
+                ),
+                (
+                    "assets.geodata.cron".to_owned(),
+                    "value is not a five-field cron expression that fires at most four times a day; ignored",
+                    "'* 3 * * *'"
+                ),
+                (
+                    "assets.geodata.checksum".to_owned(),
+                    "value is not a boolean; ignored",
+                    "2"
+                ),
+            ]
+        );
+        let unknown = diagnostics
+            .iter()
+            .filter(|d| d.code == "unknown-key")
+            .map(|d| d.line)
+            .collect::<Vec<_>>();
+        assert_eq!(unknown, [Some(6)]);
+    }
+
+    #[test]
     fn a_subscription_entry_wins_over_assets_and_assets_over_the_built_in() {
         // The assets block comes after the entries on purpose.
         let (config, diagnostics) = parse(&format!(

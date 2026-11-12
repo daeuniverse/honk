@@ -8,6 +8,7 @@
 pub mod assets;
 pub mod check;
 pub mod config;
+pub mod cron;
 pub mod diagnostic;
 pub mod dns;
 pub mod error;

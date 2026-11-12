@@ -20,7 +20,7 @@ mod sources;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
+pub(crate) use sources::{Error as SourcesError, Fetched, Patch as SourcesPatch, Route, Sources};
 
 /// How long a file download may wait for any progress: the setup up to the
 /// answer's headers, and then each wait for more of the body.
@@ -328,7 +328,7 @@ pub(super) async fn capability(state: &NativeState) -> Value {
                 value["max_urls"] = json!(sources::MAX_URLS);
                 value["interval_hours"] = json!({"min": sources::INTERVAL_HOURS.start(),
                     "max": sources::INTERVAL_HOURS.end(),
-                    "default": sources::AutoUpdate::default().interval_hours});
+                    "default": sources::NOMINAL_INTERVAL_HOURS});
                 // The file is read at startup only; patches live in the state db.
                 value["lifecycle"] = json!({"file_values": "start", "overrides_persist": true});
             }

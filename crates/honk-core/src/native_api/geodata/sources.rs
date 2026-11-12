@@ -4,6 +4,9 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use chrono::{DateTime, TimeZone, Utc};
+use honk_config::assets::GeodataDefaults;
+use honk_config::cron::Cron;
 use honk_config::experimental::{MAX_GEODATA_URL_BYTES, NativeApiConfig, parse_geodata_url};
 use parking_lot::Mutex;
 use rusqlite::{OptionalExtension as _, TransactionBehavior};
@@ -16,6 +19,10 @@ use crate::state::StateDb;
 pub(crate) const KINDS: [&str; 2] = ["geosite", "geoip"];
 pub(super) const MAX_URLS: usize = 4;
 pub(super) const INTERVAL_HOURS: std::ops::RangeInclusive<u64> = 6..=168;
+/// What `interval_hours` reads under a cron schedule, so a client that knows
+/// only intervals still shows a day.
+pub(super) const NOMINAL_INTERVAL_HOURS: u64 = 24;
+const DEFAULT_CRON: &str = "0 3 * * *";
 const MAX_JITTER_SECS: u64 = 3600;
 const FIRST_BACKOFF: Duration = Duration::from_secs(3600);
 /// The shortest wait before an automatic check, so a startup never downloads
@@ -37,20 +44,61 @@ fn index(kind: &str) -> Option<usize> {
     KINDS.iter().position(|known| *known == kind)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AutoUpdate {
     pub(crate) enabled: bool,
-    pub(crate) interval_hours: u64,
+    pub(crate) schedule: Schedule,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Schedule {
+    /// At each time the expression names in the system's local time.
+    Cron(Cron),
+    /// Every so many hours after the last check, as records written before
+    /// cron schedules existed keep doing.
+    Interval(u64),
 }
 
 impl Default for AutoUpdate {
     fn default() -> Self {
         Self {
             enabled: true,
-            interval_hours: 24,
+            schedule: Schedule::Cron(Cron::parse(DEFAULT_CRON).expect("the default cron parses")),
         }
     }
+}
+
+impl AutoUpdate {
+    fn json(&self) -> Value {
+        let (hours, cron) = match &self.schedule {
+            Schedule::Cron(cron) => (NOMINAL_INTERVAL_HOURS, Some(cron.as_str())),
+            Schedule::Interval(hours) => (*hours, None),
+        };
+        json!({"enabled": self.enabled, "interval_hours": hours, "cron": cron})
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
+    #[error(
+        "geodata cron has no future occurrence in the system time zone; change or disable the schedule"
+    )]
+    ScheduleUnavailable,
+}
+
+fn validate_schedule<Tz: TimeZone>(
+    schedule: &Schedule,
+    now: SystemTime,
+    zone: &Tz,
+) -> Result<(), Error> {
+    if let Schedule::Cron(cron) = schedule
+        && cron.next_after(DateTime::<Utc>::from(now), zone).is_none()
+    {
+        return Err(Error::ScheduleUnavailable);
+    }
+    Ok(())
 }
 
 /// How geodata requests leave the device.
@@ -97,11 +145,64 @@ struct Stored {
     #[serde(default)]
     urls: [Option<StoredUrls>; 2],
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    auto_update: Option<AutoUpdate>,
+    auto_update: Option<StoredAutoUpdate>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     download: Option<StoredRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verify_checksum: Option<bool>,
+    /// `verify_checksum` was last written from the configuration file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    verify_checksum_from_config: bool,
+}
+
+/// Exactly one of `interval_hours` and `cron`; records written before cron
+/// schedules existed hold `interval_hours`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredAutoUpdate {
+    enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interval_hours: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cron: Option<Cron>,
+    /// The schedule was last written from the configuration file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    from_config: bool,
+}
+
+impl StoredAutoUpdate {
+    fn new(auto: AutoUpdate, from_config: bool) -> Self {
+        let (interval_hours, cron) = match auto.schedule {
+            Schedule::Cron(cron) => (None, Some(cron)),
+            Schedule::Interval(hours) => (Some(hours), None),
+        };
+        Self {
+            enabled: auto.enabled,
+            interval_hours,
+            cron,
+            from_config,
+        }
+    }
+
+    fn valid(&self) -> bool {
+        match (self.interval_hours, &self.cron) {
+            (Some(hours), None) => INTERVAL_HOURS.contains(&hours),
+            (None, Some(_)) => true,
+            _ => false,
+        }
+    }
+
+    fn value(&self) -> AutoUpdate {
+        let schedule = match (&self.cron, self.interval_hours) {
+            (Some(cron), _) => Schedule::Cron(cron.clone()),
+            (None, Some(hours)) => Schedule::Interval(hours),
+            (None, None) => AutoUpdate::default().schedule,
+        };
+        AutoUpdate {
+            enabled: self.enabled,
+            schedule,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,7 +231,9 @@ impl Stored {
             .all(|list| valid_urls(&list.urls))
             && self
                 .auto_update
-                .is_none_or(|auto| INTERVAL_HOURS.contains(&auto.interval_hours))
+                .as_ref()
+                .is_none_or(StoredAutoUpdate::valid)
+            && (self.verify_checksum.is_some() || !self.verify_checksum_from_config)
             && self
                 .download
                 .as_ref()
@@ -182,7 +285,7 @@ impl Effective {
         json!({"source": self.source,
             "geosite": {"urls": list(&self.urls[0])},
             "geoip": {"urls": list(&self.urls[1])},
-            "auto_update": self.auto_update,
+            "auto_update": self.auto_update.json(),
             "download": self.download.json(group_id),
             "verify_checksum": self.verify_checksum})
     }
@@ -244,6 +347,7 @@ struct UrlsPatch {
 struct AutoUpdatePatch {
     enabled: Option<bool>,
     interval_hours: Option<u64>,
+    cron: Option<Cron>,
 }
 
 impl Patch {
@@ -263,12 +367,16 @@ impl Patch {
             .into_iter()
             .flatten()
             .all(|patch| valid_urls(&patch.urls));
-        let auto_valid = patch.auto_update.as_ref().is_none_or(|auto| {
-            (auto.enabled.is_some() || auto.interval_hours.is_some())
-                && auto
-                    .interval_hours
-                    .is_none_or(|hours| INTERVAL_HOURS.contains(&hours))
-        });
+        let auto_valid =
+            patch
+                .auto_update
+                .as_ref()
+                .is_none_or(|auto| match (auto.interval_hours, &auto.cron) {
+                    (Some(hours), None) => INTERVAL_HOURS.contains(&hours),
+                    (None, None) => auto.enabled.is_some(),
+                    (None, Some(_)) => true,
+                    (Some(_), Some(_)) => false,
+                });
         let any = patch.geosite.is_some()
             || patch.geoip.is_some()
             || patch.auto_update.is_some()
@@ -328,6 +436,7 @@ struct Status {
     next_check_at: Option<SystemTime>,
     last_error: Option<String>,
     failures: u32,
+    schedule_unavailable: bool,
     fetched: [Option<Fetched>; 2],
 }
 
@@ -414,10 +523,14 @@ pub(crate) struct Sources {
 
 impl Sources {
     /// Reads the stored settings and update status and seeds the configuration
-    /// file's URLs. A record that fails its checks is ignored until the next
+    /// file's values. A record that fails its checks is ignored until the next
     /// write replaces it; a state db that cannot be read or written is an
     /// error, except for the status, which then starts empty.
-    pub(crate) fn open(db: Arc<StateDb>, settings: &NativeApiConfig) -> rusqlite::Result<Self> {
+    pub(crate) fn open(
+        db: Arc<StateDb>,
+        settings: &NativeApiConfig,
+        file: &GeodataDefaults,
+    ) -> Result<Self, Error> {
         let record: Option<String> = db
             .strict()
             .query_row(
@@ -445,8 +558,9 @@ impl Sources {
             status: Mutex::new(status),
             changed: tokio::sync::Notify::new(),
         };
-        sources.seed(settings)?;
-        sources.reschedule(SystemTime::now());
+        let now = SystemTime::now();
+        sources.seed(settings, file, now)?;
+        sources.reschedule(now);
         Ok(sources)
     }
 
@@ -459,15 +573,21 @@ impl Sources {
         Arc::clone(&self.db)
     }
 
-    /// Stores each URL and the route the configuration file names, over
-    /// whatever a patch stored. A value the file does not name is kept when a
-    /// patch stored it and deleted when an earlier file wrote it, so its
-    /// default applies again.
-    fn seed(&self, settings: &NativeApiConfig) -> rusqlite::Result<()> {
-        let file = [&settings.geosite_download_url, &settings.geoip_download_url];
+    /// Stores each URL, the route, the schedule and the checksum switch the
+    /// configuration file names, over whatever a patch stored. A value the
+    /// file does not name is kept when a patch stored it and deleted when an
+    /// earlier file wrote it, so its default applies again. The file's
+    /// `auto_update` and `cron` form one schedule, each defaulting on its own.
+    fn seed(
+        &self,
+        settings: &NativeApiConfig,
+        file: &GeodataDefaults,
+        now: SystemTime,
+    ) -> Result<(), Error> {
+        let urls = [&settings.geosite_download_url, &settings.geoip_download_url];
         let mut stored = self.stored.lock();
         let mut next = stored.clone();
-        for (list, url) in next.urls.iter_mut().zip(file) {
+        for (list, url) in next.urls.iter_mut().zip(urls) {
             if !url.is_empty() {
                 *list = Some(StoredUrls {
                     urls: vec![url.clone()],
@@ -493,6 +613,31 @@ impl Sources {
             }
             None => {}
         }
+        if file.auto_update.is_some() || file.cron.is_some() {
+            let default = AutoUpdate::default();
+            let auto = AutoUpdate {
+                enabled: file.auto_update.unwrap_or(default.enabled),
+                schedule: file.cron.clone().map_or(default.schedule, Schedule::Cron),
+            };
+            next.auto_update = Some(StoredAutoUpdate::new(auto, true));
+        } else if next
+            .auto_update
+            .as_ref()
+            .is_some_and(|auto| auto.from_config)
+        {
+            next.auto_update = None;
+        }
+        if let Some(verify) = file.checksum {
+            next.verify_checksum = Some(verify);
+            next.verify_checksum_from_config = true;
+        } else if next.verify_checksum_from_config {
+            next.verify_checksum = None;
+            next.verify_checksum_from_config = false;
+        }
+        let auto = effective(&next).auto_update;
+        if file.cron.is_some() || auto.enabled {
+            validate_schedule(&auto.schedule, now, &chrono::Local)?;
+        }
         if next != *stored {
             self.write(&next)?;
             *stored = next;
@@ -503,10 +648,14 @@ impl Sources {
     /// Stores a patch, or deletes everything stored for `None`. The schedule
     /// follows a changed `auto_update` at once. The write holds only `writer`,
     /// so readers of `stored` never wait on the state db.
-    pub(crate) fn apply(&self, patch: Option<Patch>) -> rusqlite::Result<Effective> {
+    pub(crate) fn apply(&self, patch: Option<Patch>) -> Result<Effective, Error> {
         let _writer = self.writer.lock();
         let stored = self.stored.lock().clone();
         let current = effective(&stored);
+        let explicit_cron = patch
+            .as_ref()
+            .and_then(|patch| patch.auto_update.as_ref())
+            .is_some_and(|auto| auto.cron.is_some());
         let next = match patch {
             None => Stored::default(),
             Some(patch) => {
@@ -522,8 +671,13 @@ impl Sources {
                 if let Some(auto) = patch.auto_update {
                     let mut value = current.auto_update;
                     value.enabled = auto.enabled.unwrap_or(value.enabled);
-                    value.interval_hours = auto.interval_hours.unwrap_or(value.interval_hours);
-                    next.auto_update = Some(value);
+                    if let Some(hours) = auto.interval_hours {
+                        value.schedule = Schedule::Interval(hours);
+                    }
+                    if let Some(cron) = auto.cron {
+                        value.schedule = Schedule::Cron(cron);
+                    }
+                    next.auto_update = Some(StoredAutoUpdate::new(value, false));
                 }
                 if let Some(route) = patch.download {
                     next.download = Some(StoredRoute {
@@ -533,10 +687,15 @@ impl Sources {
                 }
                 if let Some(verify) = patch.verify_checksum {
                     next.verify_checksum = Some(verify);
+                    next.verify_checksum_from_config = false;
                 }
                 next
             }
         };
+        let auto = effective(&next).auto_update;
+        if explicit_cron || auto.enabled {
+            validate_schedule(&auto.schedule, SystemTime::now(), &chrono::Local)?;
+        }
         self.write(&next)?;
         let schedule_changed = next.auto_update != stored.auto_update;
         let effective = effective(&next);
@@ -572,22 +731,28 @@ impl Sources {
         self.changed.notified()
     }
 
-    /// The wait counts from the last check, kept across restarts. A check
-    /// that is already due, that was never made, or that is recorded later
-    /// than `now` (a clock that ran ahead) comes `STARTUP_DELAY` after `now`:
-    /// a startup never downloads at once, a host that restarts more often than
-    /// the interval still updates, and that check replaces a bad time.
     fn reschedule(&self, now: SystemTime) {
         let stored = self.stored.lock();
         let auto = effective(&stored).auto_update;
         let mut status = self.status.lock();
-        status.next_check_at = auto.enabled.then(|| {
-            let due = status
-                .last_checked_at
-                .filter(|checked| *checked <= now)
-                .map_or(now, |checked| checked + wait(auto, status.failures));
-            due.max(now + STARTUP_DELAY) + jitter()
-        });
+        let (next, unavailable) = if auto.enabled {
+            due(
+                &auto.schedule,
+                status.last_checked_at,
+                status.failures,
+                now,
+                &chrono::Local,
+            )
+        } else {
+            (None, false)
+        };
+        if unavailable && !status.schedule_unavailable {
+            tracing::warn!(
+                "geodata cron has no future local occurrence; change or disable the schedule; failed downloads retain their retry backoff"
+            );
+        }
+        status.schedule_unavailable = unavailable;
+        status.next_check_at = next.map(|due| due + jitter());
         drop(status);
         drop(stored);
         self.changed.notify_one();
@@ -691,7 +856,10 @@ fn effective(stored: &Stored) -> Effective {
                 |list| list.urls.clone(),
             )
         }),
-        auto_update: stored.auto_update.unwrap_or_default(),
+        auto_update: stored
+            .auto_update
+            .as_ref()
+            .map_or_else(AutoUpdate::default, StoredAutoUpdate::value),
         download: stored
             .download
             .as_ref()
@@ -700,17 +868,39 @@ fn effective(stored: &Stored) -> Effective {
     }
 }
 
-/// The wait before the next automatic attempt, without its random delay:
-/// the interval, or after `failures` consecutive failures a backoff that
-/// starts at one hour, doubles, and never exceeds the interval.
-fn wait(auto: AutoUpdate, failures: u32) -> Duration {
-    let interval = Duration::from_secs(auto.interval_hours * 3600);
-    if failures == 0 {
-        return interval;
-    }
-    FIRST_BACKOFF
-        .saturating_mul(1 << (failures - 1).min(16))
-        .min(interval)
+/// The next check before jitter, and whether the cron has no future local
+/// occurrence. Counts from the persisted last check; failure backoff can come
+/// first or remain available without a cron occurrence. Unknown, future or
+/// overdue checks wait at least `STARTUP_DELAY` to avoid immediate downloads
+/// at every startup.
+fn due<Tz: TimeZone>(
+    schedule: &Schedule,
+    last_checked: Option<SystemTime>,
+    failures: u32,
+    now: SystemTime,
+    zone: &Tz,
+) -> (Option<SystemTime>, bool) {
+    let checked = last_checked.filter(|checked| *checked <= now);
+    let reference = checked.unwrap_or(now);
+    let scheduled = match schedule {
+        Schedule::Interval(hours) => Some(reference + Duration::from_secs(hours * 3600)),
+        Schedule::Cron(cron) => cron
+            .next_after(DateTime::<Utc>::from(reference), zone)
+            .map(SystemTime::from),
+    };
+    let unavailable = scheduled.is_none();
+    let next = match checked {
+        None => Some(now),
+        Some(checked) => {
+            let retry = (failures > 0)
+                .then(|| checked + FIRST_BACKOFF.saturating_mul(1 << (failures - 1).min(16)));
+            match (scheduled, retry) {
+                (Some(scheduled), Some(retry)) => Some(scheduled.min(retry)),
+                (next, None) | (None, next) => next,
+            }
+        }
+    };
+    (next.map(|due| due.max(now + STARTUP_DELAY)), unavailable)
 }
 
 /// Up to an hour, so many devices on the same schedule do not download at once.

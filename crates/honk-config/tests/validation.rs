@@ -101,11 +101,12 @@ mod empty_subgroups {
     #[test]
     fn structured_configs_keep_the_assets_block() {
         let config = parse_dae_config_with_detailed_diagnostics(
-            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
+            "group {\n proxy { policy: min_moving_avg }\n}\nassets {\n route: proxy\n geodata {\n  auto_update: true\n  cron: '0 4 * * *'\n  checksum: false\n }\n subscription {\n  ua: 'clash.meta'\n  interval: 3600s\n  cache: false\n }\n}",
             &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(config.assets.route, "proxy");
+        assert!(config.assets.geodata.cron.is_some());
         for restored in [
             serde_json::from_str::<Config>(&serde_json::to_string(&config).unwrap()).unwrap(),
             serde_yaml::from_str::<Config>(&serde_yaml::to_string(&config).unwrap()).unwrap(),

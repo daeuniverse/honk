@@ -309,7 +309,7 @@ The current process-scoped consumers reject a SIGHUP reload when any of these va
 | Process state | `global.log_level`, `global.data_dir`, `global.store_subscribe` |
 | DNS listener | Semantic `dns.bind` endpoint or transport change |
 | Clash API | `experimental.clash_api.external_controller`, `external_ui`, `secret`, `default_mode`; effective `assets.ui.url` and `assets.ui.route` |
-| Native API | Any `experimental.native_api` change; effective `assets.geodata.geosite`, `assets.geodata.geoip`, `assets.geodata.route` |
+| Native API | Any `experimental.native_api` change; effective `assets.geodata.geosite`, `assets.geodata.geoip`, `assets.geodata.route`; `assets.geodata.auto_update`, `assets.geodata.cron`, `assets.geodata.checksum` |
 | Persistence | `experimental.cache_file.enabled`, `store_dns` |
 | NFQUEUE | `global.nfqueue_enable`, except after a recorded pre-admission startup downgrade ([exception](../reference/global.md)) |
 | Health probes and TLS | `global.check_interval`, the effective first `global.tcp_check_url`, `global.tcp_check_http_method` when HTTP probing is enabled, the selected `global.udp_check_dns` target, or a native TLS/uTLS mode change ([health-check reload semantics](../reference/global.md#reloading-health-checks-and-tls-mode)) |
