@@ -817,3 +817,37 @@ async fn alias_target_query_preserves_opt_options_flags_and_question_fields() {
         }
     }
 }
+
+struct TruncatedUpstream;
+
+#[async_trait]
+impl DnsUpstreamPool for TruncatedUpstream {
+    async fn query(&self, _upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let query = QueryContext::parse(raw)?;
+        let mut response = make_address_response(raw, &query, &["192.0.2.80".parse().unwrap()], 60);
+        response[2] |= 0x06; // TC and AA: only TC belongs on the local composite.
+        response[3] |= 0x20; // AD does not authenticate a locally generated alias.
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn alias_preserves_small_truncated_target_without_authoritative_ips() {
+    let forwarder = rules_forwarder(
+        "full:alias.test target.test\n",
+        Default::default(),
+        Arc::new(TruncatedUpstream),
+    );
+    let outcome = forwarder.resolve_outcome_with_context_and_profile(
+        &build_dns_query("alias.test", 1),
+        DnsRequestMeta::EMPTY,
+        IngressProfile::Udp { advertised_size: 512 },
+    ).await.expect("truncated UDP outcome");
+    assert!(outcome.rendered().len() < 512);
+    assert!(crate::dns::response::is_truncated(outcome.rendered()));
+    assert!(crate::dns::response::is_truncated(outcome.reusable()));
+    assert_eq!(outcome.rendered()[2] & 0x04, 0);
+    assert_eq!(outcome.rendered()[3] & 0x20, 0);
+    assert!(outcome.answer_ips().is_empty());
+    assert!(!outcome.expiry().is_cacheable());
+}

@@ -669,6 +669,9 @@ fn alias_response(
         rcode,
         target.len().saturating_add(chain.len() * 64),
     );
+    if crate::dns::response::is_truncated(target) {
+        response[2] |= 0x02;
+    }
     if matches!(rcode, 0 | 3) {
         let qtype = query.qtype().map_or(0, |qtype| qtype.get());
         let mut owner = None;
