@@ -384,26 +384,34 @@ impl DnsService {
             return Ok(None);
         }
         let resolve = async {
-            let target = match forwarder.node_host_alias(&domain)? {
-                Some(NodeHostAlias::Addresses(addresses)) => return Ok(addresses),
-                Some(NodeHostAlias::Name(target)) => target,
-                None => {
-                    return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
-                }
-            };
-            if let Some(upstream) = claimed_upstream(&forwarder, &target) {
-                return resolve_claimed(self, &forwarder, &target, upstream).await;
+            if !alias {
+                return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
             }
-            let result =
-                honk_outbound::bootstrap::resolve_with(honk_outbound::bootstrap::global(), &target)
-                    .await;
-            result.map_err(|source| {
-                NameResolutionError::Bootstrap {
-                    domain: target,
-                    source: source.into(),
+            Box::pin(async {
+                let target = match forwarder.node_host_alias(&domain)? {
+                    Some(NodeHostAlias::Addresses(addresses)) => return Ok(addresses),
+                    Some(NodeHostAlias::Name(target)) => target,
+                    None => {
+                        return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
+                    }
+                };
+                if let Some(upstream) = claimed_upstream(&forwarder, &target) {
+                    return resolve_claimed(self, &forwarder, &target, upstream).await;
                 }
-                .into()
+                let result = honk_outbound::bootstrap::resolve_with(
+                    honk_outbound::bootstrap::global(),
+                    &target,
+                )
+                .await;
+                result.map_err(|source| {
+                    NameResolutionError::Bootstrap {
+                        domain: target,
+                        source: source.into(),
+                    }
+                    .into()
+                })
             })
+            .await
         };
         match lease {
             Some(Ok(lease)) => lease.run(std::pin::pin!(resolve)).await?,
