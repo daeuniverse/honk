@@ -134,6 +134,45 @@ impl Node {
         }
     }
 
+    /// Whether this node, as a chain's exit, can carry UDP over the stream
+    /// tunneled to it. honk-outbound keeps each handler's `dial_udp_over` in
+    /// step with this table. A VLESS exit sends native UDP even under `Auto`,
+    /// which would pick XUDP on most ports: XUDP rides a Mux.Cool session the
+    /// tunneled hop does not own. Any multiplexing is refused, since the
+    /// UDP/443 policy lives only there.
+    pub fn supports_tunneled_udp(&self) -> bool {
+        match &self.outbound {
+            OutboundConfig::Trojan(_) => {
+                !self.is_xhttp()
+                    && self.network().is_none_or(|network| {
+                        matches!(
+                            crate::options::vocab::packet_network(network),
+                            Ok(Some(true))
+                        )
+                    })
+            }
+            OutboundConfig::Vless(config) => {
+                self.supports_tunneled_dial()
+                    && config.multiplex == VlessMultiplex::Off
+                    && config.udp_enabled()
+                    && matches!(
+                        config.udp_encoding,
+                        VlessUdpEncoding::Auto | VlessUdpEncoding::Native
+                    )
+            }
+            OutboundConfig::Socks5(_)
+            | OutboundConfig::Shadowsocks(_)
+            | OutboundConfig::Vmess(_)
+            | OutboundConfig::Hysteria2(_)
+            | OutboundConfig::Tuic(_)
+            | OutboundConfig::Juicity(_)
+            | OutboundConfig::AnyTls(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block
+            | OutboundConfig::Chain { .. } => false,
+        }
+    }
+
     pub fn is_xhttp(&self) -> bool {
         self.transport()
             .is_some_and(StreamTransportOptions::is_xhttp)
