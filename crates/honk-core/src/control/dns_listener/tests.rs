@@ -580,7 +580,10 @@ async fn tcp_listener_preserves_global_connection_capacity() {
 #[tokio::test]
 async fn shutdown_releases_listener_address_for_rebind() {
     let (controller, _) = controller([203, 0, 113, 12]);
-    let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.1:0", controller);
+    // A freed ephemeral port can be taken before the rebind below. A loopback
+    // address of its own keeps it off the shared 127.0.0.1 port pool; wildcard
+    // binds elsewhere can still take it, so this narrows the race only.
+    let (mut listener, address, drain) = start_listener("tcp+udp://127.0.0.77:0", controller);
     let mut closed_client = TcpStream::connect(address)
         .await
         .expect("connect malformed TCP DNS client");
