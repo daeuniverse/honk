@@ -156,17 +156,20 @@ impl NativeState {
         } else {
             None
         };
-        let geodata = control.state_db().and_then(|db| {
-            geodata::Sources::open(db, &settings, &geodata_file)
-                .inspect_err(|error| {
+        let geodata = match control.state_db() {
+            Some(db) => match geodata::Sources::open(db, &settings, &geodata_file) {
+                Ok(sources) => Some(Arc::new(sources)),
+                Err(error @ geodata::SourcesError::ScheduleUnavailable) => return Err(error.into()),
+                Err(geodata::SourcesError::Storage(error)) => {
                     tracing::warn!(
                         %error,
                         "geodata settings cannot be stored; geodata sources are not configurable"
                     );
-                })
-                .ok()
-                .map(Arc::new)
-        });
+                    None
+                }
+            },
+            None => None,
+        };
         observation.telemetry.discover().await;
         let phase = control.observe_phase();
         observation.configuration.attach_phase(phase.clone());
@@ -640,6 +643,29 @@ mod tests {
     use super::server::sample_traffic;
     use super::*;
     use std::time::Duration;
+
+    pub(crate) fn run_local_schedule_test(name: &str) -> bool {
+        let (_, name) = name
+            .split_once("::")
+            .expect("test module path includes its crate");
+        const CHILD: &str = "HONK_LOCAL_SCHEDULE_TEST";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(CHILD, name)
+            .env("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
 
     pub(super) async fn state() -> Arc<NativeState> {
         let mut config = Config::default();

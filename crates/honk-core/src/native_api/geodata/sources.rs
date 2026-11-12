@@ -50,7 +50,6 @@ pub(crate) struct AutoUpdate {
     pub(crate) schedule: Schedule,
 }
 
-/// When automatic checks run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Schedule {
     /// At each time the expression names in the system's local time.
@@ -70,7 +69,6 @@ impl Default for AutoUpdate {
 }
 
 impl AutoUpdate {
-    /// `{enabled, interval_hours, cron}`; `cron` is null for an interval.
     fn json(&self) -> Value {
         let (hours, cron) = match &self.schedule {
             Schedule::Cron(cron) => (NOMINAL_INTERVAL_HOURS, Some(cron.as_str())),
@@ -78,6 +76,29 @@ impl AutoUpdate {
         };
         json!({"enabled": self.enabled, "interval_hours": hours, "cron": cron})
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum Error {
+    #[error(transparent)]
+    Storage(#[from] rusqlite::Error),
+    #[error(
+        "geodata cron has no future occurrence in the system time zone; change or disable the schedule"
+    )]
+    ScheduleUnavailable,
+}
+
+fn validate_schedule<Tz: TimeZone>(
+    schedule: &Schedule,
+    now: SystemTime,
+    zone: &Tz,
+) -> Result<(), Error> {
+    if let Schedule::Cron(cron) = schedule
+        && cron.next_after(DateTime::<Utc>::from(now), zone).is_none()
+    {
+        return Err(Error::ScheduleUnavailable);
+    }
+    Ok(())
 }
 
 /// How geodata requests leave the device.
@@ -415,6 +436,7 @@ struct Status {
     next_check_at: Option<SystemTime>,
     last_error: Option<String>,
     failures: u32,
+    schedule_unavailable: bool,
     fetched: [Option<Fetched>; 2],
 }
 
@@ -508,7 +530,7 @@ impl Sources {
         db: Arc<StateDb>,
         settings: &NativeApiConfig,
         file: &GeodataDefaults,
-    ) -> rusqlite::Result<Self> {
+    ) -> Result<Self, Error> {
         let record: Option<String> = db
             .strict()
             .query_row(
@@ -536,8 +558,9 @@ impl Sources {
             status: Mutex::new(status),
             changed: tokio::sync::Notify::new(),
         };
-        sources.seed(settings, file)?;
-        sources.reschedule(SystemTime::now());
+        let now = SystemTime::now();
+        sources.seed(settings, file, now)?;
+        sources.reschedule(now);
         Ok(sources)
     }
 
@@ -555,7 +578,12 @@ impl Sources {
     /// file does not name is kept when a patch stored it and deleted when an
     /// earlier file wrote it, so its default applies again. The file's
     /// `auto_update` and `cron` form one schedule, each defaulting on its own.
-    fn seed(&self, settings: &NativeApiConfig, file: &GeodataDefaults) -> rusqlite::Result<()> {
+    fn seed(
+        &self,
+        settings: &NativeApiConfig,
+        file: &GeodataDefaults,
+        now: SystemTime,
+    ) -> Result<(), Error> {
         let urls = [&settings.geosite_download_url, &settings.geoip_download_url];
         let mut stored = self.stored.lock();
         let mut next = stored.clone();
@@ -606,6 +634,10 @@ impl Sources {
             next.verify_checksum = None;
             next.verify_checksum_from_config = false;
         }
+        let auto = effective(&next).auto_update;
+        if file.cron.is_some() || auto.enabled {
+            validate_schedule(&auto.schedule, now, &chrono::Local)?;
+        }
         if next != *stored {
             self.write(&next)?;
             *stored = next;
@@ -616,10 +648,14 @@ impl Sources {
     /// Stores a patch, or deletes everything stored for `None`. The schedule
     /// follows a changed `auto_update` at once. The write holds only `writer`,
     /// so readers of `stored` never wait on the state db.
-    pub(crate) fn apply(&self, patch: Option<Patch>) -> rusqlite::Result<Effective> {
+    pub(crate) fn apply(&self, patch: Option<Patch>) -> Result<Effective, Error> {
         let _writer = self.writer.lock();
         let stored = self.stored.lock().clone();
         let current = effective(&stored);
+        let explicit_cron = patch
+            .as_ref()
+            .and_then(|patch| patch.auto_update.as_ref())
+            .is_some_and(|auto| auto.cron.is_some());
         let next = match patch {
             None => Stored::default(),
             Some(patch) => {
@@ -656,6 +692,10 @@ impl Sources {
                 next
             }
         };
+        let auto = effective(&next).auto_update;
+        if explicit_cron || auto.enabled {
+            validate_schedule(&auto.schedule, SystemTime::now(), &chrono::Local)?;
+        }
         self.write(&next)?;
         let schedule_changed = next.auto_update != stored.auto_update;
         let effective = effective(&next);
@@ -695,19 +735,24 @@ impl Sources {
         let stored = self.stored.lock();
         let auto = effective(&stored).auto_update;
         let mut status = self.status.lock();
-        status.next_check_at = auto
-            .enabled
-            .then(|| {
-                due(
-                    &auto.schedule,
-                    status.last_checked_at,
-                    status.failures,
-                    now,
-                    &chrono::Local,
-                )
-            })
-            .flatten()
-            .map(|due| due + jitter());
+        let (next, unavailable) = if auto.enabled {
+            due(
+                &auto.schedule,
+                status.last_checked_at,
+                status.failures,
+                now,
+                &chrono::Local,
+            )
+        } else {
+            (None, false)
+        };
+        if unavailable && !status.schedule_unavailable {
+            tracing::warn!(
+                "geodata cron has no future local occurrence; change or disable the schedule; failed downloads retain their retry backoff"
+            );
+        }
+        status.schedule_unavailable = unavailable;
+        status.next_check_at = next.map(|due| due + jitter());
         drop(status);
         drop(stored);
         self.changed.notify_one();
@@ -823,41 +868,39 @@ fn effective(stored: &Stored) -> Effective {
     }
 }
 
-/// When the next automatic check is due, before its random delay; `None`
-/// when the schedule names no later time.
-///
-/// It counts from the last check, kept across restarts: the interval after
-/// it, or the first time the cron expression names in `zone` after it. After
-/// `failures` consecutive failures a backoff that starts at one hour and
-/// doubles comes first when it is earlier. A check that is already due
-/// (missed while the device was off), that was never made, or that is
-/// recorded later than `now` (a clock that ran ahead) comes `STARTUP_DELAY`
-/// after `now`: a startup never downloads at once, a host that restarts more
-/// often than the schedule still updates, and that check replaces a bad time.
+/// The next check before jitter, and whether the cron has no future local
+/// occurrence. Counts from the persisted last check; failure backoff can come
+/// first or remain available without a cron occurrence. Unknown, future or
+/// overdue checks wait at least `STARTUP_DELAY` to avoid immediate downloads
+/// at every startup.
 fn due<Tz: TimeZone>(
     schedule: &Schedule,
     last_checked: Option<SystemTime>,
     failures: u32,
     now: SystemTime,
     zone: &Tz,
-) -> Option<SystemTime> {
-    let due = match last_checked.filter(|checked| *checked <= now) {
-        None => now,
+) -> (Option<SystemTime>, bool) {
+    let checked = last_checked.filter(|checked| *checked <= now);
+    let reference = checked.unwrap_or(now);
+    let scheduled = match schedule {
+        Schedule::Interval(hours) => Some(reference + Duration::from_secs(hours * 3600)),
+        Schedule::Cron(cron) => cron
+            .next_after(DateTime::<Utc>::from(reference), zone)
+            .map(SystemTime::from),
+    };
+    let unavailable = scheduled.is_none();
+    let next = match checked {
+        None => Some(now),
         Some(checked) => {
-            let scheduled = match schedule {
-                Schedule::Interval(hours) => checked + Duration::from_secs(hours * 3600),
-                Schedule::Cron(cron) => cron
-                    .next_after(DateTime::<Utc>::from(checked), zone)?
-                    .into(),
-            };
-            match failures {
-                0 => scheduled,
-                failures => scheduled
-                    .min(checked + FIRST_BACKOFF.saturating_mul(1 << (failures - 1).min(16))),
+            let retry = (failures > 0)
+                .then(|| checked + FIRST_BACKOFF.saturating_mul(1 << (failures - 1).min(16)));
+            match (scheduled, retry) {
+                (Some(scheduled), Some(retry)) => Some(scheduled.min(retry)),
+                (next, None) | (None, next) => next,
             }
         }
     };
-    Some(due.max(now + STARTUP_DELAY))
+    (next.map(|due| due.max(now + STARTUP_DELAY)), unavailable)
 }
 
 /// Up to an hour, so many devices on the same schedule do not download at once.

@@ -20,7 +20,7 @@ mod sources;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use sources::{Fetched, Patch as SourcesPatch, Route, Sources};
+pub(crate) use sources::{Error as SourcesError, Fetched, Patch as SourcesPatch, Route, Sources};
 
 /// How long a file download may wait for any progress: the setup up to the
 /// answer's headers, and then each wait for more of the body.

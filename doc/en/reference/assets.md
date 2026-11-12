@@ -31,7 +31,7 @@ assets {
 | `geodata.geoip` | Built-in URLs (with a state db) | HTTP(S) source for the loaded geoip asset, with the same limits. |
 | `geodata.route` | `assets.route` | Route for geodata downloads, including checksum requests. |
 | `geodata.auto_update` | `true` | Automatic geodata updates. |
-| `geodata.cron` | `0 3 * * *` | When automatic updates run: a five-field cron expression (minute, hour, day of month, month, day of week) in the system's local time zone, plus a random delay of up to an hour. Fields take numbers, `*`, lists `a,b`, ranges `a-b` and steps `*/n` or `a-b/n`; day of week 0 and 7 are Sunday, and when neither day field starts with `*` a day matching either fires. Names, macros such as `@daily`, a seconds field, and an expression that fires more than four times a day or never are refused. |
+| `geodata.cron` | `0 3 * * *` | When automatic updates run: a five-field cron expression (minute, hour, day of month, month, day of week) in the system's local time zone, plus a random delay of up to an hour. Nonexistent local times are skipped; repeated times fire only at their first occurrence. Fields take numbers, `*`, lists `a,b`, ranges `a-b` and steps `*/n` or `a-b/n`; day of week 0 and 7 are Sunday, and when neither day field starts with `*` a day matching either fires. Parsing is zone-independent: names, macros such as `@daily`, a seconds field, more than four fires a day, and expressions matching no calendar date are refused. |
 | `geodata.checksum` | `true` | Verify each downloaded file against the `.sha256sum` published beside it; `false` accepts files unverified. |
 | `ui.url` | Built-in zashboard URL | External dashboard ZIP source; `HONK_UI_DOWNLOAD_URL` overrides it. A missing or empty configured external-UI directory triggers the download. |
 | `ui.route` | `assets.route` | Route for the external UI ZIP download; also accepts a node tag. |
@@ -40,6 +40,8 @@ assets {
 | `subscription.cache` | `true` | Default per-entry body caching, subject to `global.store_subscribe`. |
 
 With a state db, configured geodata URLs, route, schedule and checksum switch are written into the stored settings at startup; API changes override them until the next startup. `auto_update` and `cron` form one schedule: naming only one takes the default for the other. Removing both restores the default schedule if an earlier file wrote it; removing `checksum` likewise restores its default if file-owned. API-owned settings are kept when the file names no replacement.
+
+Geodata owner startup also rejects an explicit cron with no future occurrence in the actual local zone, even with `auto_update: false`. A retained schedule is checked when enabled; a valid file override can repair an old stored plan. Unavailable plans are not replaced with defaults. See the [API reference](./api.md#geodata-sources-and-automatic-updates) for disabling or repairing a retained plan and handling later zone changes.
 
 On Linux, honk's locked chrono 0.4.45 uses `TZ` when set: an empty value selects UTC, POSIX strings such as `CST-8` need no tzdata, and IANA names require a readable zoneinfo file. When `TZ` is unset, it reads `/etc/localtime`. If that primary load fails, it tries a system zone name discovered by `iana-time-zone` and its zoneinfo file, then falls back to UTC. OpenWrt's `/etc/TZ` must be passed as `TZ` when no usable zoneinfo file is available; the repository's `docker-compose.yml` mounts the host's `/etc/localtime`. Log timestamps use the same zone.
 

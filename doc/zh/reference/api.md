@@ -337,7 +337,7 @@ Score 的 `previous_leaf_node_id` 与 `previous_member_id` 分开：叶节点历
 
 `Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态。
 
-`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、路径、extra 选项或链接。测试固定数据源自 doona 契约包，并包含 `read_only_reason`、geodata cron 计划等本地扩展（本地文件 SHA-256 `70cff8d8d331cb5da67dfd48f2775acdda572ba90962439708b0c658629b2afe`）。
+`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、路径、extra 选项或链接。测试固定数据源自 doona 契约包，并包含 `read_only_reason`、geodata cron 计划等本地扩展（本地文件 SHA-256 `444a9e4f6c8d35617cc36590e9d3fb985a164c8fb898cc70696ad1de66b1d0ab`）。
 
 此固定版本不代表已发布的前端版本。
 
@@ -994,6 +994,8 @@ HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_r
 
 `auto_update` 单独存储。`interval_hours`（6–168）切换为间隔计划，`cron` 切换为 cron 计划；同一请求同时带两者返回 400，只带 `enabled` 时保留当前计划。cron 计划读作 `interval_hours: 24`，`cron` 为表达式；间隔计划的 `cron` 为 null。`assets.geodata.auto_update` 与 `cron` 在启动时写入它（见 [Assets 参考](./assets.md)）。`download` 单独存储。`group` 路由必须带 `group_id`，其他路由不能带。
 
+Cron 语法与日历解析不依赖时区。Geodata 所有者启动与 PATCH 还会拒绝在实际本地时区中没有未来触发时间的显式 cron，即使 `enabled: false`。保留的计划在启用时接受此检查：不可用的计划仍可通过 PATCH 禁用或修复，有效的文件覆盖值也可以在启动时修复旧的已存储计划。不可用的计划不会被替换为默认值。
+
 ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被后续激活删除后，`group_id` 读作 null，下载以 `group_unavailable` 失败，直到修改路由。`verify_checksum` 单独存储，`assets.geodata.checksum` 在启动时写入它。
 
 `"geodata": null` 删除已存储的设置。配置文件中的值在下次启动时重新写入。顶层 `source` 不受影响。
@@ -1029,6 +1031,8 @@ ID 不对应当前任何组时返回 `409 state_conflict`。已存储的组被�
 每个资产的字段只保存在内存中。重启后，在下一次尝试前这些字段为 null，`verified` 为 false。
 
 自动更新默认开启，每天本地时间 03:00（`0 3 * * *`）。将 `auto_update.enabled` 设为 `false` 即关闭。cron 计划在上次记录的检查之后、表达式按系统本地时区给出的第一个时间检查；间隔计划（由 API 设置，或沿用 cron 计划出现前存储的记录）在上次检查后经过间隔时检查。启动后从上次记录的检查时间继续计时。
+
+跳过不存在的本地时间；重复时间仅在第一次出现时触发。若后续时区变化使计划不可用，honk 在进入该状态时发出警告，不再安排未来的计划下载。失败退避独立继续，因此 `next_check_at` 仍可能表示重试时间。`last_error` 继续描述最后一次实际更新尝试。
 
 符合以下任一条件时，首次检查在启动后五分钟加随机延迟时执行：
 

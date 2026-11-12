@@ -348,6 +348,75 @@ async fn auto_update_stays_settable_while_the_configuration_names_urls() {
 }
 
 #[tokio::test]
+async fn unavailable_cron_rejects_a_mixed_settings_patch_without_partial_changes() {
+    use rusqlite::OptionalExtension as _;
+
+    if crate::native_api::tests::run_local_schedule_test(concat!(
+        module_path!(),
+        "::unavailable_cron_rejects_a_mixed_settings_patch_without_partial_changes"
+    )) {
+        return;
+    }
+    let fixture = Fixture::new_with_state(Access::Admin, |root, files| {
+        setup_rules(root, files);
+        files.get_mut("main.dae").unwrap().push_str(
+            "assets { geodata { auto_update: false\n cron: '0 4 * * *'\n checksum: false\n } }\n",
+        );
+    })
+    .await;
+    let db = fixture
+        .state
+        .upgrade()
+        .unwrap()
+        .geodata
+        .as_ref()
+        .unwrap()
+        .db();
+    let record = || {
+        db.strict()
+            .query_row(
+                "SELECT record FROM geodata_settings WHERE id = 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+    };
+    let before = fixture.get(SETTINGS).await;
+    assert_eq!(before["geodata"]["auto_update"]["enabled"], false);
+    assert_eq!(before["geodata"]["auto_update"]["cron"], "0 4 * * *");
+    assert_eq!(before["geodata"]["verify_checksum"], false);
+    assert_eq!(fixture.get(GEO).await["next_check_at"], Value::Null);
+    let stored = record();
+    for enabled in [true, false] {
+        error(
+            patch_settings(
+                &fixture,
+                json!({
+                    "record_flows": "on",
+                    "log": {"level": "debug"},
+                    "geodata": {
+                        "auto_update": {"enabled": enabled, "cron": "30 2 8-14 3 */7"},
+                        "verify_checksum": true,
+                        "geosite": {"urls": ["https://mirror.example/geosite.dat"]}
+                    }
+                }),
+            )
+            .await,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+        )
+        .await;
+        assert_eq!(record(), stored);
+        let after = fixture.get(SETTINGS).await;
+        for key in ["geodata", "recording", "log", "flows", "source"] {
+            assert_eq!(after[key], before[key], "{key}");
+        }
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn checksum_verification_is_on_by_default_and_settable() {
     let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
     let fixture =

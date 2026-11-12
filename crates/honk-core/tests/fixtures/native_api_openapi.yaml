@@ -9910,7 +9910,7 @@ components:
           description: When an update last replaced a loaded file. Null before the first.
         next_check_at:
           $ref: '#/components/schemas/NullableTimestamp'
-          description: When the next automatic update is due, including its random delay and any failure backoff. Null while automatic updates are off.
+          description: When the next automatic update is due, including its random delay and any failure backoff. Null while automatic updates are off, or if a later local time-zone change leaves the enabled schedule without a future occurrence and no failure retry is pending; the engine warns when that schedule becomes unavailable.
         last_error:
           description: Why the last attempt failed after every URL was tried, with an engine-defined code. Null after a successful or unchanged attempt, and before the first.
           oneOf:

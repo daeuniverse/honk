@@ -12,7 +12,7 @@ use serde_json::Value;
 // Derived from api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f via
 // doona contract/api-standardize/openapi.yaml, with local extensions including
 // read_only_reason and geodata cron schedules.
-// Local fixture SHA-256: 70cff8d8d331cb5da67dfd48f2775acdda572ba90962439708b0c658629b2afe.
+// Local fixture SHA-256: 444a9e4f6c8d35617cc36590e9d3fb985a164c8fb898cc70696ad1de66b1d0ab.
 const CONTRACT: &str = include_str!("../fixtures/native_api_openapi.yaml");
 const CONTRACT_URL: &str = "https://contract.honk.invalid/openapi.json";
 

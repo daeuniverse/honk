@@ -354,7 +354,7 @@ Unrepresentable or oversized text and step/byte overflow remain explicit partial
 
 `Node.stream_transport` is an optional nullable string projected from accepted Trojan/VMess/VLESS configuration: `tcp`, `ws`, `grpc` or `xhttp` (including the `splithttp` alias). Honk returns null when unrecognized or inapplicable. It describes configured transport, not negotiation or health.
 
-`protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture derives from the doona contract bundle with local extensions including `read_only_reason` and geodata cron schedules (local fixture SHA-256 `70cff8d8d331cb5da67dfd48f2775acdda572ba90962439708b0c658629b2afe`).
+`protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture derives from the doona contract bundle with local extensions including `read_only_reason` and geodata cron schedules (local fixture SHA-256 `444a9e4f6c8d35617cc36590e9d3fb985a164c8fb898cc70696ad1de66b1d0ab`).
 
 This pin does not identify a published frontend release.
 
@@ -1057,6 +1057,8 @@ See the [assets reference](./assets.md).
 
 `auto_update` is stored on its own. `interval_hours` (6 to 168) switches to an interval schedule and `cron` to a cron schedule; both in one patch return 400, and `enabled` alone keeps the current schedule. A cron schedule reads `interval_hours: 24` and its expression as `cron`; an interval reads `cron: null`. `assets.geodata.auto_update` and `cron` seed it ([assets reference](./assets.md)). `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an id that is not a current group returns `409 state_conflict`.
 
+Cron grammar and calendar parsing are zone-independent. Geodata owner startup and PATCH additionally reject an explicit cron with no future occurrence in the actual local zone, even with `enabled: false`. A retained schedule is checked when enabled: an unavailable one can still be disabled or repaired by PATCH, and a valid file override can repair an old stored plan at startup. Unavailable plans are not replaced with defaults.
+
 A stored group that a later activation removes reads `group_id: null`, and its downloads fail with `group_unavailable` until the route changes. `verify_checksum` is stored on its own, and `assets.geodata.checksum` seeds it. `"geodata": null` deletes the stored row.
 
 The file's values are written again at the next startup. The top-level `source` is unaffected. A geodata patch with other fields is validated as one request, and validation failures leave everything unchanged.
@@ -1108,6 +1110,8 @@ A failure with `checksum_unavailable` or `checksum_mismatch` logs a warning that
 Per-asset fields remain in memory only. After restart they are null, and `verified` is false, until the next attempt.
 
 Automatic updates are on by default, daily at 03:00 local time (`0 3 * * *`). `auto_update.enabled: false` stops them. A cron schedule checks at the first time the expression names after the last recorded check, in the system's local time zone; an interval schedule, set by a patch or kept from a record stored before cron schedules, checks the interval after it. After startup the schedule continues from the last recorded check.
+
+Nonexistent local times are skipped; repeated times fire only at their first occurrence. If a later time-zone change makes the schedule unavailable, honk warns when entering that state and queues no future scheduled download. Failure backoff continues independently; `next_check_at` can therefore still name a retry. `last_error` continues to describe the last actual update attempt.
 
 The first check runs five minutes plus the random delay after startup if the previous check:
 

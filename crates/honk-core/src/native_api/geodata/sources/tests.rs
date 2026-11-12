@@ -1,5 +1,7 @@
 use super::*;
 
+mod schedule;
+
 const SECOND: Duration = Duration::from_secs(1);
 const HOUR: Duration = Duration::from_secs(3600);
 
@@ -7,8 +9,7 @@ fn db(directory: &std::path::Path) -> Arc<StateDb> {
     Arc::new(StateDb::open_for_test(directory, 28672))
 }
 
-/// Opens with no `assets.geodata` schedule or checksum keys in the file.
-fn open(db: Arc<StateDb>, settings: &NativeApiConfig) -> rusqlite::Result<Sources> {
+fn open(db: Arc<StateDb>, settings: &NativeApiConfig) -> Result<Sources, Error> {
     Sources::open(db, settings, &GeodataDefaults::default())
 }
 
@@ -174,13 +175,6 @@ fn patches_outside_the_url_and_interval_rules_are_refused() {
     ] {
         assert!(Patch::parse(value.clone(), invalid).is_err(), "{value}");
     }
-}
-
-#[test]
-fn automatic_updates_are_on_by_default() {
-    let directory = tempfile::tempdir().unwrap();
-    let sources = open(db(directory.path()), &settings("")).unwrap();
-    assert!(sources.effective().auto_update.enabled);
 }
 
 #[test]
@@ -363,12 +357,11 @@ fn an_unreadable_update_status_is_ignored_and_replaced() {
     }
 }
 
-/// The wait `due` gives after a check `HOUR` before `now`, counted from that
-/// check.
 fn wait_after(schedule: &Schedule, checked: &str, failures: u32) -> Duration {
     let checked = SystemTime::from(utc(checked));
     let now = checked + HOUR;
     due(schedule, Some(checked), failures, now, &Utc)
+        .0
         .unwrap()
         .duration_since(checked)
         .unwrap()
@@ -424,7 +417,7 @@ fn a_cron_check_comes_at_the_next_time_it_names() {
     let checked = SystemTime::from(utc("2026-11-11 00:00"));
     assert_eq!(
         due(&daily, Some(checked), 0, checked, &zone),
-        Some(SystemTime::from(utc("2026-11-11 17:00"))),
+        (Some(SystemTime::from(utc("2026-11-11 17:00"))), false),
         "03:00 in the given zone"
     );
 }
@@ -441,12 +434,20 @@ fn a_missed_or_unknown_cron_check_waits_only_the_startup_delay() {
         Some(utc("2026-11-12 12:00")),
     ] {
         let checked = checked.map(SystemTime::from);
-        assert_eq!(due(&daily, checked, 0, now, &Utc), soon, "{checked:?}");
-        assert_eq!(due(&daily, checked, 3, now, &Utc), soon, "{checked:?}");
+        assert_eq!(
+            due(&daily, checked, 0, now, &Utc),
+            (soon, false),
+            "{checked:?}"
+        );
+        assert_eq!(
+            due(&daily, checked, 3, now, &Utc),
+            (soon, false),
+            "{checked:?}"
+        );
     }
     assert_eq!(
         due(&daily, Some(now - STARTUP_DELAY), 0, now, &Utc),
-        Some(SystemTime::from(utc("2026-11-12 03:00")))
+        (Some(SystemTime::from(utc("2026-11-12 03:00"))), false)
     );
 }
 
@@ -775,11 +776,6 @@ fn the_file_seeds_the_schedule_at_startup_over_a_patch() {
         },
         "the cron defaults on its own"
     );
-    assert!(
-        stored_record(directory.path())
-            .unwrap()
-            .contains("from_config")
-    );
     let patched = sources
         .apply(patch(json!({"auto_update": {"interval_hours": 48}})))
         .unwrap();
@@ -911,8 +907,12 @@ fn a_record_from_before_cron_schedules_keeps_its_interval() {
         .apply(patch(json!({"auto_update": {"interval_hours": 12}})))
         .unwrap();
     assert_eq!(back.auto_update.schedule, Schedule::Interval(12));
-    let record = stored_record(directory.path()).unwrap();
-    assert!(!record.contains("cron"), "{record}");
+    drop(sources);
+    let reopened = open_with(directory.path(), &GeodataDefaults::default());
+    assert_eq!(
+        reopened.effective().auto_update.schedule,
+        Schedule::Interval(12)
+    );
 }
 
 #[test]
