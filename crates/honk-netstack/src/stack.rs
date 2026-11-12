@@ -532,10 +532,22 @@ impl Stack {
         packet: &[u8],
         on_source: impl FnMut(ValidatedSource) -> bool,
     ) -> (Rx, ReceiveReport) {
+        self.receive_with_meta_tcp_admission(now, packet, RxMeta::VERIFY, on_source)
+    }
+
+    /// Reports source and protocol acceptance with the driver's checksum/offload metadata.
+    /// The validation and Endpoint restrictions are identical to [`Stack::receive_with`].
+    pub fn receive_with_meta_tcp_admission(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        meta: RxMeta,
+        on_source: impl FnMut(ValidatedSource) -> bool,
+    ) -> (Rx, ReceiveReport) {
         self.now = now;
         self.counters.rx_packets += 1;
         let mut report = SourceReport::new(on_source);
-        let rx = self.receive_packet::<true>(now, packet, RxMeta::VERIFY, &mut report);
+        let rx = self.receive_packet::<true>(now, packet, meta, &mut report);
         (
             rx,
             ReceiveReport {
@@ -560,9 +572,6 @@ impl Stack {
     pub fn receive_with(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
-        if meta != RxMeta::VERIFY && !self.transparent() {
-            return self.drop_packet(DropReason::Unsupported);
-        }
         self.receive_packet::<false>(now, packet, meta, &mut SourceReport::new(|_| true))
     }
 
@@ -573,6 +582,9 @@ impl Stack {
         meta: RxMeta,
         report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
     ) -> Rx {
+        if meta != RxMeta::VERIFY && !self.transparent() {
+            return self.drop_packet(DropReason::Unsupported);
+        }
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
             Err(ParseError::Fragment) if self.transparent() => {

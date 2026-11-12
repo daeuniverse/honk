@@ -15,7 +15,7 @@ use super::udp_endpoint::{
 };
 use futures::FutureExt;
 use honk_datapath::ScopeId;
-use honk_netstack::{MemoryBudget, MemoryReservation, Rx, ValidatedSource};
+use honk_netstack::{MemoryBudget, MemoryReservation, Rx, RxMeta, ValidatedSource};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
@@ -424,8 +424,10 @@ impl PacketEndpoints {
     /// Receive one verified IP packet. A receive batch supplies one `now` value.
     /// Queue pressure drops only that UDP datagram; established TCP still progresses.
     pub fn receive(&self, scope: ScopeId, packet: &[u8], now: Instant) -> io::Result<()> {
-        self.receive_inner::<false>(scope, packet, now, None, false, |_, _| true)
-            .map(|_| ())
+        self.receive_inner::<false>(scope, (packet, RxMeta::VERIFY), now, None, false, |_, _| {
+            true
+        })
+        .map(|_| ())
     }
 
     /// Report/gate only the current validated TCP/UDP packet, including a completed
@@ -440,7 +442,20 @@ impl PacketEndpoints {
         check_output: bool,
         on_source: impl FnMut(ValidatedSource, bool) -> bool,
     ) -> io::Result<PacketReceive> {
-        self.receive_inner::<true>(scope, packet, now, None, check_output, on_source)
+        self.receive_with_meta_source(scope, packet, RxMeta::VERIFY, now, check_output, on_source)
+    }
+
+    /// Uses driver checksum/offload metadata without changing source gating or UDP funding.
+    pub fn receive_with_meta_source(
+        &self,
+        scope: ScopeId,
+        packet: &[u8],
+        meta: RxMeta,
+        now: Instant,
+        check_output: bool,
+        on_source: impl FnMut(ValidatedSource, bool) -> bool,
+    ) -> io::Result<PacketReceive> {
+        self.receive_inner::<true>(scope, (packet, meta), now, None, check_output, on_source)
     }
 
     /// Admit with the execution decision captured by the canonical Core classifier.
@@ -453,13 +468,20 @@ impl PacketEndpoints {
         check_output: bool,
         on_source: impl FnMut(ValidatedSource, bool) -> bool,
     ) -> io::Result<PacketReceive> {
-        self.receive_inner::<true>(scope, packet, now, Some(admission), check_output, on_source)
+        self.receive_inner::<true>(
+            scope,
+            (packet, RxMeta::VERIFY),
+            now,
+            Some(admission),
+            check_output,
+            on_source,
+        )
     }
 
     fn receive_inner<const REPORT: bool>(
         &self,
         scope: ScopeId,
-        packet: &[u8],
+        (packet, meta): (&[u8], RxMeta),
         now: Instant,
         mut admission: Option<EndpointAdmission>,
         check_output: bool,
@@ -475,7 +497,7 @@ impl PacketEndpoints {
         let (rx, mut received) = if admission.is_some() {
             scope.receive_admitted_with_source(packet, now, &mut admission, check_output, on_source)
         } else if REPORT {
-            scope.receive_with_source(packet, now, check_output, on_source)
+            scope.receive_with_meta_source(packet, meta, now, check_output, on_source)
         } else {
             (scope.receive(packet, now), PacketReceive::default())
         };

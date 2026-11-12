@@ -26,3 +26,7 @@ Added
 - Recognize the kernel's sole LINKDOWN flag on native IPv6 multicast routes only while their captured physical output is awaiting XDP-attach carrier recovery; keep final admission and other route facts strict.
 - Wait for the owned adaptive-test capture link to regain carrier before reconstructing its owner, retaining the original fixture deadline and strict production admission.
 - Re-arm XDP queue and topology read readiness after clearing a stale event, so a packet arriving after an empty owner pass wakes the owner instead of waiting for an unrelated deadline.
+- Compile honk-netstack, honk-xsk and honk-datapath at optimization level 3 in release-derived profiles while retaining the size-oriented default for other crates.
+- Publish bounded, timestamped XDP socket and ring observations through native datapath details and Clash stats independently of DEBUG logging, preserving idle scheduling, explicit unavailable samples and capture lifecycle.
+- Negotiate verified 10-byte little-endian TUN vnet headers for TCP receive aggregation and transmit segmentation, preserving logical MTU, checksum provenance, source admission, funded output capacity and whole-record lease retries; WireGuard and XDP offload behavior remain unchanged.
+- Cancel expired unmaterialized TCP tail probes on ACK progress, preserve original output ownership across FIN acknowledgement, and prove TUN smoke close with correlated original-socket and independent-peer byte/EOF/shutdown evidence rather than persistent external Linux TIME_WAIT.

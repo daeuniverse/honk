@@ -11,10 +11,12 @@ Router、DNS projector 与出站流初始化器，不创建 TC hook、NFQUEUE、
 `daens`，不依赖 `ebpf` feature，拒绝 `--mock-ebpf`。
 
 唯一 `TunDevice` 以 `O_RDWR|O_NONBLOCK|O_CLOEXEC` 打开 `/dev/net/tun`。
-`TUNSETIFF` 使用 `IFF_TUN|IFF_NO_PI|IFF_TUN_EXCL`；`TUNGETIFF` 核对实际
-TUN/NO_PI 并拒绝 multi-queue、VNET_HDR 与 NAPI，不要求回读仅创建时有意义的
-EXCL 位。`TUNSETOFFLOAD(0)` 仅允许完整普通 L3 包与软件校验和。只有一个
-reader/writer，不 dup/继承 FD，不支持 persistent、外部 FD 或接管已有链路。
+`TUNSETIFF` 使用 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`；
+`TUNGETIFF` 核对 TUN/NO_PI/VNET_HDR，拒绝 multi-queue、persistent、NAPI 与未知
+flag，不要求回读仅创建时有意义的 EXCL 位。setup 设置并回读 10 字节小端 vnet
+头，再仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持则明确拒绝。
+只有一个 reader/writer，不 dup/继承 FD，不支持 persistent、外部 FD 或接管已有
+链路，不启用 UFO、USO 或 TSO ECN。
 
 ### Setup 与就绪
 
@@ -67,30 +69,37 @@ dump 中断/未知解析或 ifindex 替换都会 sticky invalidation 并关闭�
 ### FD 报文管线
 
 FD read 接收 kernel egress；FD write 注入**新的 interface ingress 包**，不能恢复
-原始 skb。capture 选中的 Host/Transit TCP/UDP 走真实 FD read → 注册 scope 的
-`receive_with_source` → Stack → canonical initializer/Router → 真实 outbound →
-生成 output lease → 同一 FD write。Direct 明确终止并新建 dial。策略只见实际
-L3 source/destination/DSCP；scope、tuple、mark、TUN 地址均不能认证 Host origin
+原始 skb。capture 选中的 Host/Transit TCP/UDP 走真实 FD read → vnet 解码 →
+注册 scope 的 `receive_with_meta_source` → Stack → canonical initializer/Router →
+真实 outbound → output lease 及保留的 Transmit → 同一 FD 的一次 vnet+IP `writev`。
+Direct 明确终止并新建 dial。策略只见实际 L3 source/destination/DSCP；scope、tuple、mark、TUN 地址均不能认证 Host origin
 或进程身份，不恢复 pre-DNAT/pre-SNAT 或原 socket 语义。capture/reply 腿不能改写
 这些策略输入。
 
-RX 复用一个已计费的 65576-byte buffer，完整验证软件校验和，一轮共用同一个
-入口时间戳。长度不符、截断或协商外 representation 不能截短成合法 Stack 包。
-借用 UDP 在下一次 read 前经既有 funded ingress 接纳/复制。source callback 仅
-检查该 scope/attachment 的真实 reverse consumer 存活，不写 FD、不阻塞、不重入
-scope mutex。
+RX 复用一个已计费的 65,586 字节 buffer（10 字节 vnet + 65,575 字节普通 IPv6
+以及一个字节 sentinel），一轮共用同一个入口时间戳。读满 buffer 可能截断，直接拒绝；
+在组合 metadata/source/admission 路径之前，必须验证精确 IP 长度以及 vnet
+flag/type/family/header/checksum 范围。TCPv4/TCPv6 GSO 以一个连续 run 接收；
+普通 UDP partial checksum 无需 USO。IPv4 头、ICMP 和重组完成包仍验证校验和，
+Endpoint/WireGuard 信任规则不变。借用 UDP 在下一次 read 前经 funded ingress
+接纳/复制。source callback 仅检查该 scope/attachment 的真实 reverse consumer
+存活，不写 FD、不阻塞、不重入 scope mutex。
+
+TX 为 CPU frame 单独计费 65,535 字节容量，不放大逻辑 MTU、MSS/PMTU 或普通
+UDP MTU。所有输出均带 10 字节 vnet 头，包括普通 ACK/UDP/control；一次 writev
+提交该头与不可变 lease 字节，由内核分段 TSO 并完成 partial checksum。
 
 Owner 在有界 RX 前后服务 driver deadline。RX 每轮最多 32 次 syscall 尝试/包、
 1 MiB 或 1 ms，EINTR 也计数，最多每八包检查一次时间；最后一个完整 record
-可让 byte 限额最多超出 65575 bytes。TX 交替先服务 Control/Bulk，每类别最多
+可让 byte 限额最多超出 65,585 record bytes。TX 交替先服务 Control/Bulk，每类别最多
 32 个输出，保留固定 pending lease 槽，并有独立 syscall/byte/time 上限。这是
 调度限额，不是可抢占 syscall 的硬期限。同类别先重试 pending，再导出新输出。
 
 | TUN write 结果 | 所有权 |
 | --- | --- |
-| 完整包长度 | 内核接受这一个 record，锁外释放 lease；不代表远端交付或 TCP ACK。 |
-| EAGAIN/EWOULDBLOCK | 原 lease、bytes、scope、FlowId 保持在该类别队首，注册 writable 后重试该记录。 |
-| EINTR | 保留同一 lease，在有限 syscall 预算内重试/让出。 |
+| 完整 vnet+IP record 长度 | 内核接受这一个 record，锁外释放 lease；不代表远端交付或 TCP ACK。 |
+| EAGAIN/EWOULDBLOCK | 原 lease、metadata、bytes、scope、FlowId 保持在该类别队首，注册 writable 后重试该记录。 |
+| EINTR | 保留同一 lease、metadata 和 bytes，在有限 syscall 预算内重试/让出。 |
 | 零或短写 | 致命 packet-boundary violation，禁止写 suffix 或重发整包；保留已报告的部分结果，明确处置本地所有权。 |
 | 其他错误 | 致命 owner I/O failure，不回退后端或由其他 executor 重放；模糊提交结果保持模糊。 |
 
@@ -216,9 +225,17 @@ XDP 拥有规范的内存内 routing、domain 与 health 发布，而非 Mock �
 
 固定聚合计数区分队列/credit/容量拒绝、native-ID 历史精度下降及成功 peer 回收。
 只有实际拒绝 episode 会告警，持续压力以 debug 汇总，不逐包写日志。
-debug 级别下，同一 sampler 至多每秒报告一次各队列的内核 socket 统计、ring
-索引与 port 计数；读取错误保持显式，空 ring 遭遇次数和 wakeup 错误不能相加
-当成丢包数。
+同一 owner sampler 在 DEBUG 过滤外读取六项内核 socket 计数与原始 ring 索引，
+只在既有 owner turn 中至多每秒一次；DEBUG 复用样本并报告 port 计数。
+正常关闭在 socket 拆除前另取最终样本，不增加空闲采样 timer。
+`StatsManager` 仅共享最新有界观测，供 native `/api/v1/datapath` 的
+`x-honk.xdp` 与 Clash `/stats` 的 `xdp` 使用；GET 不读取内核、不改变 polling。
+按实际准入队列数分配共享存储，构造前计费，最后一个诊断读者释放后才退还预算；
+诊断不保留 Port、FD 或包 lease。身份采用真实 namespace/attachment/ifindex/queue，
+并保留实际 bind 模式与容量、采样时间/序列、不可用/错误/恢复，以及
+starting/active/closing/closed/failed-retained 生命周期。各 ring/队列顺序读取，
+不是原子快照。空 FILL 事件和 wakeup 错误不能相加当成丢包；当前 FILL 有内容
+不能否定历史饥饿。详见 [API 语义](../reference/api.md#连接关闭模式与数据面生命周期)。
 
 ### Event 与有限 adaptive 服务
 

@@ -182,6 +182,61 @@ async fn udp_qualification_requires_ready_enqueue_not_pending_or_refused_work() 
             "Ready zero-length UDP needs no slow permit"
         );
         assert_eq!(upstream.recv_from(&mut bytes).await.unwrap().0, 0);
+        let mut aggregate = [0; 128];
+        let split_len =
+            wire::udp::emit_packet(&mut aggregate, source, destination, b"abcDEFx").unwrap();
+        let meta = RxMeta {
+            csum: honk_netstack::Csum::Partial {
+                start: 20,
+                offset: 6,
+            },
+            gso: Some(honk_netstack::GsoRx {
+                kind: honk_netstack::GsoKind::UdpL4,
+                size: 3,
+            }),
+        };
+        let exhausted = budget.reserve(budget.limit() - budget.used()).unwrap();
+        let error = endpoints
+            .receive_with_meta_source(
+                scope.scope(),
+                &aggregate[..split_len],
+                meta,
+                Instant::now(),
+                false,
+                |_, _| true,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(exhausted);
+        let before_split = budget.used();
+        let received = endpoints
+            .receive_with_meta_source(
+                scope.scope(),
+                &aggregate[..split_len],
+                meta,
+                Instant::now(),
+                false,
+                |_, _| true,
+            )
+            .unwrap();
+        assert!(received.source.is_some());
+        assert!(
+            received.qualified_rx,
+            "every split chunk reaches the Ready owner"
+        );
+        assert!(
+            budget.used() > before_split,
+            "all copied datagrams are funded"
+        );
+        aggregate.fill(0);
+        for expected in [b"abc".as_slice(), b"DEF", b"x"] {
+            let (n, _) = upstream.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(
+                &bytes[..n],
+                expected,
+                "RX reuse cannot change queued chunks"
+            );
+        }
         let mut enqueued = 0;
         for _ in 0..65 {
             if !receive(&packet[..length]).qualified_rx {

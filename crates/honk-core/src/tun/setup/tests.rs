@@ -30,14 +30,18 @@ fn strict_global_reverse_path_filter_is_refused_without_a_write() {
 }
 
 #[test]
-fn tun_attachment_requires_plain_single_queue_flags_and_a_bounded_name() {
-    let flags = libc::IFF_TUN | libc::IFF_NO_PI;
+fn tun_attachment_requires_vnet_single_queue_flags_and_a_bounded_name() {
+    let flags = libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR;
     assert!(valid_attachment_flags(flags));
     assert!(valid_attachment_flags(flags | libc::IFF_TUN_EXCL));
     for wrong in [
         flags | libc::IFF_MULTI_QUEUE,
-        flags | libc::IFF_VNET_HDR,
+        flags & !libc::IFF_VNET_HDR,
         flags | libc::IFF_NAPI,
+        flags | libc::IFF_PERSIST,
+        flags | libc::IFF_NAPI_FRAGS,
+        flags | libc::IFF_ONE_QUEUE,
+        flags | libc::IFF_NO_CARRIER,
         libc::IFF_TUN,
         libc::IFF_TAP | libc::IFF_NO_PI,
     ] {
@@ -48,6 +52,13 @@ fn tun_attachment_requires_plain_single_queue_flags_and_a_bounded_name() {
     }
     let request = interface_request("abcdefghijklmno").unwrap();
     assert_eq!(request.ifr_name[15], 0);
+}
+
+#[test]
+fn vnet_setup_refuses_an_unsupported_descriptor_without_fallback() {
+    let (socket, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let error = configure_vnet(socket.as_raw_fd()).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
 }
 
 #[test]
@@ -253,6 +264,16 @@ fn kernel_tun_exclusive_fd_and_containment_are_owned() {
         .unwrap();
         let root = tempfile::tempdir().unwrap();
         let (mut setup, device, guarded) = TunSetup::prepare_in(&config, root.path()).unwrap();
+        for (request, expected) in [(libc::TUNGETVNETHDRSZ, 10), (libc::TUNGETVNETLE, 1)] {
+            let mut actual: libc::c_int = -1;
+            // SAFETY: both readbacks write one int to actual and device retains its FD.
+            assert_eq!(
+                unsafe { libc::ioctl(device.as_raw_fd(), request, &mut actual) },
+                0
+            );
+            assert_eq!(actual, expected);
+        }
+        verify_attachment(&device.fd, "honk0").unwrap();
         assert!(
             TunDevice::open("honk0", 2).is_err(),
             "cannot adopt an occupied name"

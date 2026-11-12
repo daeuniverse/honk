@@ -4,13 +4,15 @@ mod setup;
 
 use crate::control::{
     ControlPlane,
-    netstack::{CAPTURE_MEMORY, OutputLease, PacketDriver, capture_scope},
+    netstack::{CAPTURE_MEMORY, OutputLease, PacketDriver, capture_scope_with_output},
     packet_endpoint::{PacketEndpointOwner, PacketEndpoints},
 };
 use anyhow::{Context as _, ensure};
 use honk_config::{Config, datapath::Backend};
 use honk_datapath::buffer::TxClass;
-use honk_netstack::{MemoryBudget, MemoryReservation};
+use honk_netstack::{
+    Csum, GsoKind, GsoRx, MemoryBudget, MemoryReservation, RxMeta, Transmit, TxCaps, TxCsum, wire,
+};
 use honk_xsk::topology::Topology;
 use setup::{TunDevice, TunSetup};
 use std::{
@@ -28,7 +30,15 @@ use std::{
 use tokio::io::unix::AsyncFd;
 
 const BATCH: usize = 32;
-const RX_BYTES: usize = 65_576;
+const VNET_BYTES: usize = 10;
+const MAX_IP_BYTES: usize = 40 + u16::MAX as usize;
+const RX_BYTES: usize = VNET_BYTES + MAX_IP_BYTES + 1;
+const TX_CAPS: TxCaps = TxCaps {
+    tso4: true,
+    tso6: true,
+    uso4: false,
+    uso6: false,
+};
 const TURN_BYTES: usize = 1 << 20;
 const TURN_TIME: Duration = Duration::from_millis(1);
 
@@ -244,14 +254,13 @@ impl Runtime {
             ensure!(length != 0, "TUN packet reader reached EOF");
             ensure!(
                 length < RX_BYTES,
-                "TUN record exceeds ordinary IP representation"
+                "TUN record exceeds vnet and ordinary IP representation"
             );
             bytes += length;
-            let packet = &self.rx[..length];
-            if !exact_record(packet) {
+            let Some((packet, meta)) = decode_record(&self.rx[..length]) else {
                 continue;
-            }
-            admit_packet(&self.endpoints, scope, packet, ingress, |_, _| {
+            };
+            admit_packet(&self.endpoints, scope, packet, meta, ingress, |_, _| {
                 self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing()
             })?;
         }
@@ -318,10 +327,11 @@ fn admit_packet(
     endpoints: &PacketEndpoints,
     scope: honk_datapath::ScopeId,
     packet: &[u8],
+    meta: RxMeta,
     ingress: Instant,
     on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
 ) -> anyhow::Result<()> {
-    match endpoints.receive_with_source(scope, packet, ingress, false, on_source) {
+    match endpoints.receive_with_meta_source(scope, packet, meta, ingress, false, on_source) {
         Ok(_) => Ok(()),
         Err(error)
             if endpoints.is_closing()
@@ -386,6 +396,97 @@ fn exact_record(packet: &[u8]) -> bool {
     }
 }
 
+fn decode_record(record: &[u8]) -> Option<(&[u8], RxMeta)> {
+    if record.len() >= RX_BYTES {
+        return None;
+    }
+    let (header, packet) = record.split_at_checked(VNET_BYTES)?;
+    if !exact_record(packet) {
+        return None;
+    }
+    Some((packet, vnet_meta(header.try_into().ok()?, packet)?))
+}
+
+fn vnet_meta(header: &[u8; VNET_BYTES], packet: &[u8]) -> Option<RxMeta> {
+    let field = |offset| u16::from_le_bytes([header[offset], header[offset + 1]]);
+    let hdr_len = usize::from(field(2));
+    let size = field(4);
+    let start = field(6);
+    let offset = field(8);
+    let csum = match header[0] {
+        0 => Csum::Verify,
+        1 => Csum::Partial { start, offset },
+        2 => Csum::Valid,
+        _ => return None,
+    };
+    if header[0] != 1 && (start != 0 || offset != 0) {
+        return None;
+    }
+    let gso = match header[1] {
+        0 if size == 0 && hdr_len == 0 => None,
+        1 if packet.first()? >> 4 == 4 && size != 0 && size != u16::MAX => Some(GsoRx {
+            kind: GsoKind::Tcp,
+            size,
+        }),
+        4 if packet.first()? >> 4 == 6 && size != 0 && size != u16::MAX => Some(GsoRx {
+            kind: GsoKind::Tcp,
+            size,
+        }),
+        _ => return None,
+    };
+    if header[0] == 1 || gso.is_some() {
+        let ip = wire::parse_ip(packet).ok()?;
+        let l4 = packet.get(ip.payload.clone())?;
+        let (header_end, checksum_offset) = match ip.proto {
+            wire::PROTO_TCP => (ip.payload.start + wire::tcp::parse(l4).ok()?.1, 16),
+            wire::PROTO_UDP if gso.is_none() => {
+                wire::udp::parse(l4).ok()?;
+                (ip.payload.start + 8, 6)
+            }
+            _ => return None,
+        };
+        if header[0] == 1
+            && (usize::from(start) != ip.payload.start
+                || offset != checksum_offset
+                || usize::from(start) + usize::from(offset) + 2 > header_end)
+        {
+            return None;
+        }
+        // Linux reports skb_headlen, which can include linear payload after the headers.
+        if gso.is_some() && (hdr_len < header_end || hdr_len > packet.len()) {
+            return None;
+        }
+    }
+    Some(RxMeta { csum, gso })
+}
+
+fn vnet_header(packet: &[u8], transmit: Transmit) -> io::Result<[u8; VNET_BYTES]> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid TUN transmit metadata");
+    if transmit.len != packet.len() {
+        return Err(invalid());
+    }
+    let mut header = [0; VNET_BYTES];
+    if let TxCsum::Partial { start, offset } = transmit.csum {
+        header[0] = 1;
+        header[6..8].copy_from_slice(&start.to_le_bytes());
+        header[8..10].copy_from_slice(&offset.to_le_bytes());
+    }
+    if let Some(gso) = transmit.gso {
+        if gso.kind != GsoKind::Tcp || transmit.csum == TxCsum::Full {
+            return Err(invalid());
+        }
+        header[1] = match packet.first().map(|byte| byte >> 4) {
+            Some(4) => 1,
+            Some(6) => 4,
+            _ => return Err(invalid()),
+        };
+        header[2..4].copy_from_slice(&gso.hdr_len.to_le_bytes());
+        header[4..6].copy_from_slice(&gso.size.to_le_bytes());
+    }
+    vnet_meta(&header, packet).ok_or_else(invalid)?;
+    Ok(header)
+}
+
 fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     // SAFETY: buffer is a unique writable slice and fd remains owned across this call.
     let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -396,9 +497,19 @@ fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     }
 }
 
-fn write_packet(fd: RawFd, packet: &[u8]) -> io::Result<usize> {
-    // SAFETY: packet remains readable and the unique device owner keeps fd live.
-    let count = unsafe { libc::write(fd, packet.as_ptr().cast(), packet.len()) };
+fn write_packet(fd: RawFd, header: &[u8; VNET_BYTES], packet: &[u8]) -> io::Result<usize> {
+    let buffers = [
+        libc::iovec {
+            iov_base: header.as_ptr().cast_mut().cast(),
+            iov_len: header.len(),
+        },
+        libc::iovec {
+            iov_base: packet.as_ptr().cast_mut().cast(),
+            iov_len: packet.len(),
+        },
+    ];
+    // SAFETY: both slices remain readable and the unique owner keeps fd live during writev.
+    let count = unsafe { libc::writev(fd, buffers.as_ptr(), buffers.len() as libc::c_int) };
     if count < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -423,14 +534,15 @@ fn poll_flush<T: AsRawFd>(
         Poll::Pending => return Ok(false),
     };
     let accepted_before = *bytes;
-    let (blocked, runnable) = flush_pending(pending, attempts, bytes, started, |packet| {
-        if !open() {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        ready
-            .try_io(|inner| write_packet(inner.get_ref().as_raw_fd(), packet))
-            .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
-    })?;
+    let (blocked, runnable) =
+        flush_pending(pending, attempts, bytes, started, |header, packet| {
+            if !open() {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            ready
+                .try_io(|inner| write_packet(inner.get_ref().as_raw_fd(), header, packet))
+                .unwrap_or_else(|_| Err(io::ErrorKind::WouldBlock.into()))
+        })?;
     if !open() {
         return Ok(true);
     }
@@ -454,19 +566,20 @@ fn flush_pending(
     attempts: &mut usize,
     bytes: &mut usize,
     started: Instant,
-    mut write: impl FnMut(&[u8]) -> io::Result<usize>,
+    mut write: impl FnMut(&[u8; VNET_BYTES], &[u8]) -> io::Result<usize>,
 ) -> io::Result<(bool, bool)> {
     for output in pending {
         let Some(lease) = output.as_ref() else {
             continue;
         };
+        let header = vnet_header(lease.packet(), lease.transmit())?;
         loop {
             if turn_limit(*attempts, *bytes, started, BATCH * 2) {
                 return Ok((false, true));
             }
             *attempts += 1;
-            let length = lease.packet().len();
-            match write(lease.packet()) {
+            let length = VNET_BYTES + lease.packet().len();
+            match write(&header, lease.packet()) {
                 Ok(count) if count == length => {
                     *bytes += count;
                     drop(output.take());
@@ -557,7 +670,14 @@ async fn run_owned(
             .as_ref()
             .and_then(|value| value.tun.as_ref())
             .context("TUN configuration missing")?;
-        let pair = capture_scope(u32::from(tun.mtu), 1, 128, &budget)?;
+        let pair = capture_scope_with_output(
+            u32::from(tun.mtu),
+            1,
+            128,
+            u16::MAX as usize,
+            TX_CAPS,
+            &budget,
+        )?;
         let (setup, device, topology) = TunSetup::prepare(&config)?;
         Ok((dns, capacity, memory, pair, setup, device, topology))
     })();

@@ -19,7 +19,7 @@ use honk_datapath::ScopeId;
 use honk_datapath::buffer::{FrameConfig, FrameLease, FrameLedger, TxClass};
 use honk_netstack::{
     AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready, Rx,
-    Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
+    RxMeta, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
 };
 use parking_lot::Mutex;
 use tokio::sync::Notify;
@@ -44,6 +44,25 @@ pub(crate) fn capture_scope(
     bulk_frames: usize,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<(PacketScope, PacketOwner)> {
+    capture_scope_with_output(
+        mtu,
+        realms,
+        bulk_frames,
+        usize::try_from(mtu.max(1280))?,
+        TxCaps::NONE,
+        budget,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_scope_with_output(
+    mtu: u32,
+    realms: usize,
+    bulk_frames: usize,
+    output_capacity: usize,
+    caps: TxCaps,
+    budget: &Arc<MemoryBudget>,
+) -> anyhow::Result<(PacketScope, PacketOwner)> {
     // ponytail: fixed per-realm partitions; rebalance only if measured tenant skew needs it.
     let slots = (4096 / realms).min(1024);
     let mut stack = Config::new(rand::random());
@@ -53,7 +72,7 @@ pub(crate) fn capture_scope(
     stack.mtu = u16::try_from(mtu)?;
     stack.max_flows = slots as u32;
     stack.memory_limit = CAPTURE_MEMORY / 2 / realms;
-    Ok(PacketScope::new(
+    Ok(PacketScope::new_with_output(
         stack,
         Arc::clone(budget),
         RuntimeLimits {
@@ -63,6 +82,8 @@ pub(crate) fn capture_scope(
             max_waiters: 256,
         },
         Instant::now(),
+        caps,
+        output_capacity,
     )?)
 }
 
@@ -165,6 +186,7 @@ struct Inner {
     head: usize,
     queued: usize,
     frame_size: usize,
+    cpu_tx_caps: TxCaps,
     next_tx: TxClass,
     slots: Box<[Option<FlowSlot>]>,
     pending_closes: usize,
@@ -199,10 +221,22 @@ impl PacketScope {
     /// The returned owner must be run and joined by the embedding endpoint/task owner.
     /// No task is spawned and no network/capture authority is granted here.
     pub fn new(
+        cfg: Config,
+        budget: Arc<MemoryBudget>,
+        limits: RuntimeLimits,
+        now: Instant,
+    ) -> io::Result<(Self, PacketOwner)> {
+        let capacity = usize::from(cfg.mtu.max(1280));
+        Self::new_with_output(cfg, budget, limits, now, TxCaps::NONE, capacity)
+    }
+
+    pub(crate) fn new_with_output(
         mut cfg: Config,
         budget: Arc<MemoryBudget>,
         limits: RuntimeLimits,
         now: Instant,
+        caps: TxCaps,
+        frame_size: usize,
     ) -> io::Result<(Self, PacketOwner)> {
         if !matches!(cfg.mode, Mode::Transparent { .. }) {
             return Err(invalid(
@@ -211,6 +245,9 @@ impl PacketScope {
         }
         if limits.max_slots == 0 || limits.max_waiters == 0 {
             return Err(invalid("zero runtime metadata capacity"));
+        }
+        if frame_size < usize::from(cfg.mtu.max(1280)) {
+            return Err(invalid("output capacity is below logical MTU"));
         }
         let tx_frames = limits
             .control_frames
@@ -221,7 +258,6 @@ impl PacketScope {
             .max_slots
             .checked_add(tx_frames)
             .ok_or_else(|| invalid("flow retention capacity overflow"))?;
-        let frame_size = usize::from(cfg.mtu.max(1280));
         let frame_config = FrameConfig {
             base_address: 0,
             frame_size,
@@ -277,6 +313,7 @@ impl PacketScope {
                 head: 0,
                 queued: 0,
                 frame_size,
+                cpu_tx_caps: caps,
                 next_tx: TxClass::Control,
                 slots: (0..aliases).map(|_| None).collect(),
                 pending_closes: 0,
@@ -370,6 +407,18 @@ impl PacketScope {
         packet: &[u8],
         now: Instant,
         check_output: bool,
+        on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
+    ) -> (Rx, super::packet_endpoint::PacketReceive) {
+        self.receive_with_meta_source(packet, RxMeta::VERIFY, now, check_output, on_source)
+    }
+
+    /// Applies driver metadata through the same locked source/admission reporting path.
+    pub fn receive_with_meta_source(
+        &self,
+        packet: &[u8],
+        meta: RxMeta,
+        now: Instant,
+        check_output: bool,
         mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
     ) -> (Rx, super::packet_endpoint::PacketReceive) {
         self.0.with(|inner| {
@@ -377,8 +426,9 @@ impl PacketScope {
             let Some(stack) = &mut inner.stack else {
                 return (Rx::Dropped(DropReason::Stale), Default::default());
             };
-            let (rx, report) =
-                stack.receive_with_tcp_admission(now, packet, |source| on_source(source, pending));
+            let (rx, report) = stack.receive_with_meta_tcp_admission(now, packet, meta, |source| {
+                on_source(source, pending)
+            });
             (rx, inner.receive_result(report))
         })
     }
@@ -916,7 +966,7 @@ impl Inner {
             .expect("free frame owns storage");
         let tx = match class {
             TxClass::Control => stack.poll_control_transmit(now, out),
-            TxClass::Bulk => stack.poll_transmit_with(now, out, TxCaps::NONE),
+            TxClass::Bulk => stack.poll_transmit_with(now, out, self.cpu_tx_caps),
         };
         if let Some(tx) = tx {
             self.publish(lease, tx, class);
@@ -1362,6 +1412,9 @@ pub(crate) struct OutputOwner {
 impl OutputLease {
     pub fn packet(&self) -> &[u8] {
         self.0.packet().expect("CPU output storage")
+    }
+    pub(crate) fn transmit(&self) -> Transmit {
+        self.0.queued.expect("live output lease").tx
     }
     pub fn flow_id(&self) -> Option<FlowId> {
         self.0.flow_id()

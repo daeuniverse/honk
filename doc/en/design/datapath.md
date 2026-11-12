@@ -12,11 +12,13 @@ outbound flow initializers. It creates no TC hooks, NFQUEUE, `dae0` or `daens`,
 and does not depend on the `ebpf` feature. It rejects `--mock-ebpf`.
 
 A single `TunDevice` owns `/dev/net/tun`, opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`.
-`TUNSETIFF` requests `IFF_TUN|IFF_NO_PI|IFF_TUN_EXCL`; `TUNGETIFF` verifies actual
-TUN/NO_PI and rejects multi-queue, VNET_HDR and NAPI. The creation-only EXCL bit is
-not required in readback. `TUNSETOFFLOAD(0)` selects complete ordinary L3 packets
-with software checksums. There is one reader/writer, no duplicate/inherited FD,
-persistent device, external-FD input or pre-existing-link adoption.
+`TUNSETIFF` requests `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`;
+`TUNGETIFF` verifies TUN/NO_PI/VNET_HDR and rejects multi-queue, persistence,
+NAPI and unexpected flags. The creation-only EXCL bit is not required in readback.
+Setup sets and reads back a 10-byte little-endian vnet header, then enables only
+`TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`; unsupported setup refuses explicitly.
+There is one reader/writer, no duplicate/inherited FD, persistent device,
+external-FD input or pre-existing-link adoption. UFO, USO and TSO ECN are not enabled.
 
 ### Setup and readiness
 
@@ -79,33 +81,42 @@ route writes, and retained guards are not a whole-host firewall kill switch.
 
 Kernel egress appears on FD read; FD write injects a **new interface-ingress
 packet**, never the original skb. Host- and Transit-generated TCP/UDP selected by
-capture follow actual FD read → `receive_with_source` in the registered scope →
-Stack → canonical initializer/Router → real outbound → generated output lease →
-same FD write. Direct explicitly terminates and makes a new dial. Policy sees the
+capture follow actual FD read → vnet decode → `receive_with_meta_source` in the
+registered scope → Stack → canonical initializer/Router → real outbound → generated
+output lease and retained Transmit → one vnet+IP `writev` to the same FD.
+Direct explicitly terminates and makes a new dial. Policy sees the
 captured L3 source/destination/DSCP; scope, tuple, mark and TUN address authenticate
 neither Host origin nor process identity. No pre-DNAT/pre-SNAT or original-socket
 semantics are recovered. Capture/reply legs must not rewrite that policy input.
 
-RX uses one funded 65576-byte buffer, full software checksum verification and one
-ingress timestamp per turn. Length mismatch, truncation or unexpected negotiated
-representation is never shortened into a valid Stack packet. Borrowed UDP is
-accepted/copied through the existing funded ingress before the next read. The
-source callback only checks the live reverse consumer for this scope/attachment;
-it never writes the FD, blocks or re-enters the scope mutex.
+RX uses one funded 65,586-byte buffer (10 vnet + 65,575 ordinary IPv6 + 1 sentinel)
+and one ingress timestamp per turn. A full-buffer read is rejected as possibly
+truncated; exact IP extent and vnet flags/type/family/header/checksum bounds must
+validate before the combined metadata/source/admission path. TCPv4/TCPv6 GSO enters
+as one contiguous run; normal UDP partial checksums work without USO. IPv4 headers,
+ICMP and completed reassembly still verify checksums; Endpoint/WireGuard trust rules
+are unchanged. Borrowed UDP is accepted/copied through funded ingress before the
+next read. The source callback checks the live reverse consumer for this scope and
+attachment; it never writes the FD, blocks or re-enters the scope mutex.
+
+TX funds 65,535-byte CPU frames separately from logical MTU; MSS/PMTU and ordinary
+UDP MTU behavior do not increase. Every output includes a 10-byte vnet header,
+including plain ACK/UDP/control records. One writev submits that header and the
+immutable lease bytes; the kernel segments TSO and completes partial checksums.
 
 The owner services driver deadlines before and after bounded RX. RX is limited to
 32 syscall attempts/packets, 1 MiB or 1 ms per turn; EINTR counts, time is checked
 at most every eight packets, and one final full record may exceed the byte bound
-by at most 65575 bytes. TX alternates the first Control/Bulk class, services at
+by at most 65,585 record bytes. TX alternates the first Control/Bulk class, services at
 most 32 outputs per class and preserves fixed pending lease cells, with its own
 bounded syscall/byte/time turn. Limits are scheduler bounds, not preemptible
 syscall deadlines. Pending output is retried before new exports of that class.
 
 | TUN write result | Ownership |
 | --- | --- |
-| Full packet length | Kernel accepted this one record; release the lease outside the scope lock. This is neither remote delivery nor TCP ACK. |
-| EAGAIN/EWOULDBLOCK | Retain the same lease, bytes, scope and FlowId at its class head; register writable and retry that record. |
-| EINTR | Retain the same lease; retry/yield within the finite syscall budget. |
+| Full vnet+IP record length | Kernel accepted this one record; release the lease outside the scope lock. This is neither remote delivery nor TCP ACK. |
+| EAGAIN/EWOULDBLOCK | Retain the same lease, metadata, bytes, scope and original FlowId at its class head; register writable and retry that record. |
+| EINTR | Retain the same lease, metadata and bytes; retry/yield within the finite syscall budget. |
 | Zero or short write | Fatal packet-boundary violation; never write a suffix or replay the whole packet. Preserve the reported partial outcome and dispose local ownership explicitly. |
 | Other error | Fatal owner I/O failure; no backend fallback or replay through another executor. An ambiguous submission stays ambiguous. |
 
@@ -262,9 +273,21 @@ Fixed aggregate counters distinguish queue/credit/capacity refusals from native-
 history precision loss and successful peer reclamation. Only actual refusal
 episodes emit a warning; recurring pressure is summarized at debug level rather
 than logged per packet.
-At debug level, the same sampler reports each queue's kernel socket statistics,
-ring indices and port counters at most once per second. Read errors stay explicit;
-empty-ring encounters and wakeup errors are not additive packet-loss counts.
+The same owner sampler acquires each queue's six kernel socket counters and raw
+ring indices outside DEBUG filtering, at most once per second on existing owner
+turns. DEBUG reuses that sample and reports port counters. Normal close takes a
+final sample before socket teardown. There is no new idle sampling timer.
+`StatsManager` shares only the latest bounded observations with native
+`/api/v1/datapath` (`x-honk.xdp`) and Clash `/stats` (`xdp`); neither GET samples
+the kernel or changes polling. Exact admitted queue storage and its shared
+owner are funded before construction, with funding retained through the last
+diagnostic reader. No diagnostic retains a Port, FD or packet lease.
+Queue identity is the real namespace/attachment/ifindex/queue, with actual bind
+mode and capacities. Sampling time/sequence, unavailable/error/recovery and
+starting/active/closing/closed/failed-retained lifecycle remain explicit.
+Reads are sequential, not atomic across rings or queues. Empty-FILL events and
+wakeup errors are not additive packet-loss counts; a current populated FILL
+ring cannot disprove earlier starvation. See the [API semantics](../reference/api.md#connection-closing-mode-and-datapath-lifecycle).
 
 ### Event and bounded adaptive service
 

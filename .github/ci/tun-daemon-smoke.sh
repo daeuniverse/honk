@@ -14,14 +14,14 @@ done
 [[ -c /dev/net/tun ]] || fail 'requires provisioned /dev/net/tun'
 
 if [[ ${1:-} != --isolated ]]; then
-    [[ $# -le 1 ]] || fail 'expected one matching daemon executable'
+    [[ $# -ge 1 || -n ${HONK_XDP_DAEMON:-} ]] || fail 'expected a matching daemon executable and optional row IDs'
     daemon=${1:-${HONK_XDP_DAEMON:-}}
     [[ $daemon == /* && -x $daemon ]] || fail 'supply the absolute matching honk-core executable'
     export HONK_TUN_PARENT_NETNS
     HONK_TUN_PARENT_NETNS=$(stat -Lc %i /proc/self/ns/net)
-    exec unshare --mount --net -- bash "${BASH_SOURCE[0]}" --isolated "$daemon"
+    exec unshare --mount --net -- bash "${BASH_SOURCE[0]}" --isolated "$daemon" "${@:2}"
 fi
-[[ $# == 2 && $2 == /* && -x $2 ]] || fail 'invalid isolated invocation'
+[[ $# -ge 2 && $2 == /* && -x $2 ]] || fail 'invalid isolated invocation'
 current_netns=$(stat -Lc %i /proc/self/ns/net)
 [[ $current_netns != "${HONK_TUN_PARENT_NETNS:?missing outer guest guard}" &&
    $current_netns != "$(stat -Lc %i /proc/1/ns/net)" ]] || fail 'refusing initial network namespace'
@@ -35,4 +35,4 @@ printf 'TUN smoke artifacts: %s\n' "$work"
 # The fixture owns operator forwarding/firewall/main-route prerequisites. The
 # daemon must create its own TUN, addresses, table, five rules and crash guards.
 exec timeout --signal=TERM --kill-after=20s 900s \
-    python3 "$script_dir/tun-endpoint-peer.py" gate "$2" "$work"
+    python3 "$script_dir/tun-endpoint-peer.py" gate "$2" "$work" "${@:3}"

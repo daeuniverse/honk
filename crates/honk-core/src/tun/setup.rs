@@ -29,6 +29,8 @@ use crate::state;
 
 const SOURCE_SHA: &str = env!("HONK_SOURCE_SHA");
 const RECEIPT_FORMAT: u32 = 1;
+const OFFLOADS: libc::c_ulong =
+    (libc::TUN_F_CSUM | libc::TUN_F_TSO4 | libc::TUN_F_TSO6) as libc::c_ulong;
 
 static INCARNATION: AtomicU64 = AtomicU64::new(0);
 
@@ -74,7 +76,8 @@ impl TunDevice {
         .map_err(|errno| refused(errno.into()))?;
         // The ioctl takes a C short; IFF_TUN_EXCL is its sign bit.
         request.ifr_ifru.ifru_flags =
-            (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_TUN_EXCL) as libc::c_short;
+            (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR | libc::IFF_TUN_EXCL)
+                as libc::c_short;
         // SAFETY: TUNSETIFF reads and updates only this live, initialized ifreq.
         if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
             return Err(refused(io::Error::last_os_error()));
@@ -87,11 +90,7 @@ impl TunDevice {
 
     fn attached(fd: OwnedFd, name: &str, incarnation: u64) -> io::Result<Self> {
         verify_attachment(&fd, name)?;
-        let no_offloads: libc::c_ulong = 0;
-        // SAFETY: TUNSETOFFLOAD takes its offload mask by value.
-        if unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETOFFLOAD, no_offloads) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        configure_vnet(fd.as_raw_fd())?;
         same_namespace(&fd)?;
         let ifindex = nix::net::if_::if_nametoindex(name)?;
         Ok(Self {
@@ -103,7 +102,61 @@ impl TunDevice {
 }
 
 fn valid_attachment_flags(flags: libc::c_int) -> bool {
-    flags & !libc::IFF_TUN_EXCL == libc::IFF_TUN | libc::IFF_NO_PI
+    flags & !libc::IFF_TUN_EXCL == libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR
+}
+
+fn configure_vnet(fd: RawFd) -> io::Result<()> {
+    for (set, get, expected, contract) in [
+        (
+            libc::TUNSETVNETHDRSZ,
+            libc::TUNGETVNETHDRSZ,
+            super::VNET_BYTES as libc::c_int,
+            "10-byte vnet header",
+        ),
+        (
+            libc::TUNSETVNETLE,
+            libc::TUNGETVNETLE,
+            1,
+            "little-endian vnet header",
+        ),
+    ] {
+        let value = expected;
+        // SAFETY: each SET reads one initialized int and fd stays owned by the caller.
+        if unsafe { libc::ioctl(fd, set, &value) } < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("TUN requires {contract}: {}", io::Error::last_os_error()),
+            ));
+        }
+        let mut actual: libc::c_int = -1;
+        // SAFETY: each GET writes one int while fd remains owned by the caller.
+        if unsafe { libc::ioctl(fd, get, &mut actual) } < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "TUN requires {contract} readback: {}",
+                    io::Error::last_os_error()
+                ),
+            ));
+        }
+        if actual != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("TUN {contract} readback is {actual}, expected {expected}"),
+            ));
+        }
+    }
+    // SAFETY: TUNSETOFFLOAD takes its offload mask by value.
+    if unsafe { libc::ioctl(fd, libc::TUNSETOFFLOAD, OFFLOADS) } < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "TUN requires checksum and TCPv4/TCPv6 segmentation: {}",
+                io::Error::last_os_error()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn verify_attachment(fd: &OwnedFd, name: &str) -> io::Result<()> {
@@ -124,7 +177,7 @@ fn verify_attachment(fd: &OwnedFd, name: &str) -> io::Result<()> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "TUN attachment is not a single-queue IFF_TUN|IFF_NO_PI {name} (flags {flags:#x})"
+                "TUN attachment is not a single-queue IFF_TUN|IFF_NO_PI|IFF_VNET_HDR {name} (flags {flags:#x})"
             ),
         ));
     }
@@ -538,7 +591,8 @@ impl Journal {
         let family = |ipv6: bool| if ipv6 { "inet6" } else { "inet" };
         let mut entry = match resource {
             Resource::Link => json!({"kind": "link", "name": self.name, "ifindex": self.ifindex,
-                "flags": ["tun", "no_pi", "exclusive"], "offloads": 0, "persistent": false}),
+                "flags": ["tun", "no_pi", "vnet_hdr", "exclusive"], "offloads": OFFLOADS,
+                "vnet_header_bytes": super::VNET_BYTES, "vnet_endian": "little", "persistent": false}),
             Resource::Sysctl { key, value } => {
                 json!({"kind": "sysctl", "key": key, "value": value})
             }

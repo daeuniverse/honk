@@ -319,7 +319,9 @@ class Peer:
                         if error.errno != errno.ENOTCONN:
                             raise
                     else:
-                        self.event('close-tail', remote=endpoint(remote), target=endpoint(conn.getsockname()), length=len(TAIL))
+                        self.event('close-tail', remote=endpoint(remote), target=endpoint(conn.getsockname()),
+                                   length=len(TAIL), tail_digest=hashlib.sha256(TAIL).hexdigest(),
+                                   request_eof=True, shutdown='SHUT_WR')
             except (EOFError, ConnectionResetError, BrokenPipeError):
                 pass  # Selector warm sockets can close before any SOCKS request.
             except Exception as error:
@@ -412,8 +414,43 @@ def tcp_exchange(sock, payload):
 def tcp_close(sock):
     sock.shutdown(socket.SHUT_WR)
     time.sleep(0.1)
-    assert exact(sock, len(TAIL)) == TAIL, 'lost peer payload after request half-close'
+    tail = exact(sock, len(TAIL))
+    assert tail == TAIL, 'lost peer payload after request half-close'
     assert sock.recv(1) == b'', 'unexpected bytes after retained close tail'
+    error = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    assert error == 0, ('original TCP socket closed with an error', error)
+    return dict(shutdown='SHUT_WR', tail_bytes=len(tail), tail_digest=hashlib.sha256(tail).hexdigest(),
+                eof=True, so_error=error)
+
+
+def tcp_close_observation(sock, local, target, port, timewait, path):
+    observation = dict(local=local, peer=[target, port], monotonic_ns=time.monotonic_ns(),
+                       timewait=dict(argv=timewait.args, returncode=timewait.returncode,
+                                     stdout=timewait.stdout, stderr=timewait.stderr))
+    gaps = []
+    try:
+        info = sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 256)
+        observation['original_fd_tcp_info'] = dict(status='observed', state=info[0], bytes=info.hex())
+    except OSError as error:
+        observation['original_fd_tcp_info'] = dict(status='unknown', error=repr(error))
+        gaps.append('original FD TCP_INFO')
+    try:
+        states = run('ss', '-Htn', 'state', 'all', f'( sport = :{local[1]} and dport = :{port} )', check=False)
+        observation['all_states'] = dict(argv=states.args, returncode=states.returncode,
+                                         stdout=states.stdout, stderr=states.stderr)
+        if states.returncode:
+            gaps.append('all-state ss')
+    except (OSError, subprocess.SubprocessError) as error:
+        observation['all_states'] = dict(status='unknown', error=repr(error))
+        gaps.append('all-state ss')
+    if timewait.returncode:
+        gaps.append('TIME_WAIT ss')
+    observation['status'] = 'unknown' if gaps else 'observed'
+    observation['gaps'] = gaps
+    with Path(path).open('a') as output:
+        output.write(json.dumps(observation) + '\n')
+        output.flush()
+    assert not gaps, ('TCP close diagnostic gap', observation)
 
 
 def tcp_policy(number, source, target, port, label, blocked):
@@ -432,9 +469,10 @@ def tcp_policy(number, source, target, port, label, blocked):
     print(json.dumps(dict(blocked=blocked == 'true')), flush=True)
 
 
-def traffic(number, source, transport, port, label):
+def traffic(number, source, transport, port, label, diagnostic=''):
     number, port = int(number), int(port)
     replies = []
+    closes = []
     if transport == 'T':
         for target in TARGETS[number][:2]:
             with tcp_open(number, source, target, port) as sock:
@@ -443,9 +481,20 @@ def traffic(number, source, transport, port, label):
                     payload = f'{label}/{target}/{index}/'.encode() + bytes(range(256)) * (size // 256)
                     tcp_exchange(sock, payload)
                     replies.append(dict(payload=payload.hex(), local=local, target=[target, port]))
-                tcp_close(sock)
-                listing = run('ss', '-Htn', 'state', 'time-wait', f'( sport = :{local[1]} and dport = :{port} )').stdout
-                assert local[0] in listing and target in listing, ('no original close tail/TIME_WAIT witness', local, listing)
+                closes.append(dict(local=local, target=[target, port], **tcp_close(sock)))
+                if diagnostic:
+                    try:
+                        timewait = run('ss', '-Htn', 'state', 'time-wait', f'( sport = :{local[1]} and dport = :{port} )', check=False)
+                    except (OSError, subprocess.SubprocessError) as error:
+                        with Path(diagnostic).open('a') as output:
+                            output.write(json.dumps(dict(
+                                status='unknown', step='TIME_WAIT ss', local=local, peer=[target, port],
+                                monotonic_ns=time.monotonic_ns(), error=repr(error),
+                                stdout=repr(getattr(error, 'stdout', None)), stderr=repr(getattr(error, 'stderr', None)),
+                            )) + '\n')
+                            output.flush()
+                        raise
+                    tcp_close_observation(sock, local, target, port, timewait, diagnostic)
     else:
         connected = transport == 'Uc'
         assert connected or transport == 'Uu'
@@ -492,7 +541,7 @@ def traffic(number, source, transport, port, label):
                     assert data in offered and endpoint(remote) == offered.pop(data)
                     replies.append(dict(payload=data.hex(), local=endpoint(sock.getsockname()),
                                         target=endpoint(remote), reuseport_receiver=sources.index(sock)))
-    print(json.dumps(dict(replies=replies, same_tuple_reuseport=(transport != 'T'))), flush=True)
+    print(json.dumps(dict(replies=replies, tcp_closes=closes, same_tuple_reuseport=(transport != 'T'))), flush=True)
 
 
 def api_hold(number, source, address, method, path, body):
@@ -625,6 +674,108 @@ def inject(number, source, target, device, case):
             else:
                 assert wire.sendto(packet, (target, 0)) == len(packet)
     print(json.dumps(dict(case=case, lengths=list(map(len, packets)), payload=payload.hex())), flush=True)
+
+
+def offload_capture(device, number, host_source, transit_source, target, port):
+    number, port = int(number), int(port)
+    vnet = device == 'honk0'
+    summary = dict(records=0, host_kernel_tso=0, transit_stack_tso=0,
+                   wire_data=0, wire_checksums=0, maximum_ip=0)
+    with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as capture:
+        capture.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        if vnet:
+            capture.setsockopt(263, 15, 1)  # SOL_PACKET, PACKET_VNET_HDR
+        capture.bind((device, 0))
+        print(json.dumps(dict(ready=True)), flush=True)
+        while True:
+            ready = select.select([capture, sys.stdin], [], [], 20)[0]
+            assert ready, 'offload capture owner stopped servicing'
+            if sys.stdin in ready:
+                assert sys.stdin.readline() == 'stop\n'
+                break
+            record, _, flags, address = capture.recvmsg(65586)
+            assert not flags & socket.MSG_TRUNC, 'offload capture record truncated'
+            metadata = struct.unpack_from('<BB4H', record) if vnet else (0,) * 6
+            packet = record[10:] if vnet else record[14:]
+            if not packet or packet[0] >> 4 != number:
+                continue
+            if number == 4:
+                size = struct.unpack_from('!H', packet, 2)[0]
+                header = (packet[0] & 15) * 4
+                protocol = packet[9]
+                src, dst = packet[12:16], packet[16:20]
+                assert checksum(packet[:header]) == 0, 'invalid wire IPv4 checksum'
+            else:
+                size = 40 + struct.unpack_from('!H', packet, 4)[0]
+                header, protocol = 40, packet[6]
+                src, dst = packet[8:24], packet[24:40]
+            if protocol != 6:
+                continue
+            packet = packet[:size]
+            tcp = packet[header:]
+            source_port, destination_port = struct.unpack_from('!HH', tcp)
+            source, destination = socket.inet_ntop(family(number), src), socket.inet_ntop(family(number), dst)
+            if port not in (source_port, destination_port) or target not in (source, destination):
+                continue
+            summary['records'] += 1
+            summary['maximum_ip'] = max(summary['maximum_ip'], size)
+            payload = len(tcp) - (tcp[12] >> 4) * 4
+            if vnet:
+                if metadata[1]:
+                    assert metadata[0] == 1 and metadata[1] == (1 if number == 4 else 4), metadata
+                    assert metadata[3] > 0 and metadata[4:] == (header, 16), metadata
+                    assert header + (tcp[12] >> 4) * 4 <= metadata[2] <= len(packet), metadata
+                    if size > 1500 and payload > metadata[3]:
+                        if source == host_source and destination == target and address[2] == 4:
+                            summary['host_kernel_tso'] += 1
+                        if source == target and destination == transit_source and address[2] != 4:
+                            summary['transit_stack_tso'] += 1
+            elif source == target and destination == transit_source and address[2] != 4:
+                assert size <= 1500, ('kernel did not segment TUN TCP output', size)
+                pseudo = src + dst + (struct.pack('!BBH', 0, 6, len(tcp)) if number == 4 else struct.pack('!I3xB', len(tcp), 6))
+                assert checksum(pseudo + tcp) == 0, 'kernel did not complete TCP checksum'
+                summary['wire_checksums'] += 1
+                summary['wire_data'] += payload > 0
+        _, dropped = struct.unpack('=II', capture.getsockopt(263, 6, 8))  # PACKET_STATISTICS
+        assert dropped == 0, ('offload capture dropped records', dropped)
+    print(json.dumps(summary), flush=True)
+
+
+def offload_client(number, source, target, port):
+    payload = bytes(range(256)) * 4096
+    with tcp_open(number, source, target, int(port)) as sock:
+        tcp_exchange(sock, payload)
+        tcp_close(sock)
+    print(json.dumps(dict(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())), flush=True)
+
+
+def offload_extensions(fixture):
+    for action, port in (('proxy', 18080), ('direct', 18081)):
+        monitors = []
+        try:
+            for role, device in (('dut', 'honk0'), ('source', 'src0')):
+                process = child(fixture, fixture.names[role], 'offload-capture', device, fixture.number,
+                                fixture.host_source, fixture.source, TARGETS[fixture.number][0], port,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=fixture.open('offload-capture.stderr'))
+                monitors.append(process)
+                assert line(process)['ready']
+            clients = [fixture.probe('offload-client', fixture.number, source, TARGETS[fixture.number][0], port, origin=origin)
+                       for origin, source in (('H', fixture.host_source), ('T', fixture.source))]
+            observations = []
+            for process in monitors:
+                process.stdin.write('stop\n')
+                process.stdin.flush()
+                observations.append(line(process))
+                assert process.wait(timeout=10) == 0
+            tun, wire = observations
+            assert tun['host_kernel_tso'] > 0, ('no large kernel TCP offload entered TUN', tun)
+            assert tun['transit_stack_tso'] > 0, ('no large Stack TCP offload reached the kernel', tun)
+            assert wire['wire_data'] > 1 and wire['wire_checksums'] >= wire['wire_data'], wire
+            (fixture.directory / ('offload-' + action + '-wire.json')).write_text(json.dumps(
+                dict(clients=clients, tun=tun, wire=wire), indent=2) + '\n')
+        finally:
+            for process in monitors:
+                stop(process)
 
 
 class Fixture:
@@ -866,7 +1017,7 @@ experimental {{
         link = json_ip(dut, '-d', 'link', 'show', 'dev', 'honk0')[0]
         assert link['mtu'] == 1500 and 'UP' in link['flags'] and link['linkinfo']['info_kind'] == 'tun'
         tun_flags = int(run('cat', '/sys/class/net/honk0/tun_flags', namespace=dut).stdout.strip(), 16)
-        assert tun_flags & 0x1003 == 0x1001 and tun_flags & (0x100 | 0x30 | 0x4000) == 0, hex(tun_flags)
+        assert tun_flags & ~0x8000 == 0x5001, hex(tun_flags)
         addresses = json_ip(dut, 'address', 'show', 'dev', 'honk0')[0]['addr_info']
         assert {(item['local'], item['prefixlen']) for item in addresses} == {('198.18.0.1', 32), ('fd00:686f:6e6b:100::1', 128)}, addresses
         assert run('cat', '/proc/sys/net/ipv4/conf/honk0/rp_filter', namespace=dut).stdout.strip() == '0'
@@ -1005,10 +1156,31 @@ experimental {{
         try:
             assert line(process)['connected']
             if prove_marks:
+                evidence = self.open('api-socket-observations.jsonl')
+                version = run('ss', '--version', namespace=self.names['dut'], check=False)
+                evidence.write(json.dumps(dict(
+                    kind='observer', path=shutil.which('ss'), returncode=version.returncode,
+                    stdout=version.stdout, stderr=version.stderr,
+                    modules=Path('/proc/modules').read_text(),
+                    kernel_modprobe=Path('/proc/sys/kernel/modprobe').read_text().strip(),
+                    client_pid=process.pid, daemon_pid=self.daemon.pid,
+                )) + '\n')
+                evidence.flush()
+                assert version.returncode == 0, 'cannot identify API socket mark observer'
                 for args in (('-lntpe',), ('-ntpe', 'state', 'established')):
                     def marked():
-                        listing = run('ss', *args, '( sport = :19090 )', namespace=self.names['dut']).stdout
-                        return listing if re.search(r'fwmark:(?:0x100|256)\b', listing) else False
+                        observed = run('ss', *args, '( sport = :19090 )',
+                                       namespace=self.names['dut'], check=False)
+                        evidence.write(json.dumps(dict(
+                            kind='sockets', monotonic_ns=time.monotonic_ns(),
+                            argv=observed.args, returncode=observed.returncode,
+                            stdout=observed.stdout, stderr=observed.stderr,
+                            client_returncode=process.poll(), daemon_returncode=self.daemon.poll(),
+                        )) + '\n')
+                        evidence.flush()
+                        assert observed.returncode == 0, 'API socket observation command failed'
+                        # ss's /proc fallback has no mark; retain observations before testing it.
+                        return observed.stdout if re.search(r'fwmark:(?:0x100|256)\b', observed.stdout) else False
                     listing = eventually(marked, 'actual API listener/accepted socket lacks bypass mark')
                     self.open('api-socket-marks.log').write(listing)
             process.stdin.write('request\n')
@@ -1105,9 +1277,11 @@ experimental {{
             raise CleanupIncomplete('; '.join(errors))
 
 
-def assert_outbound(events, replies, action, number):
+def assert_outbound(events, result, action, number, pending_close=False):
+    replies = result['replies']
     expected_source = ('10.77.0.1' if number == 4 else 'fd00:77::1') if action == 'direct' else ('198.51.100.250' if number == 4 else 'fd00:2::250')
     primary = []
+    complete = True
     for reply in replies:
         matches = [event for event in events if event['kind'] == 'echo' and event.get('payload') == reply['payload'] and event['target'] == reply['target']]
         assert len(matches) == 1, ('independent far socket did not receive exactly once', reply, matches)
@@ -1118,6 +1292,40 @@ def assert_outbound(events, replies, action, number):
         socks = [event for event in events if event['kind'] in ('socks-connect', 'socks-udp') and event['target'] == reply['target']
                  and (event['kind'] == 'socks-connect' or event.get('payload') == reply['payload'])]
         assert bool(socks) == (action == 'proxy'), ('actual SOCKS5 action witness', action, reply, socks)
+    if primary and primary[0]['transport'] == 'tcp':
+        expected = {(tuple(reply['local']), tuple(reply['target'])) for reply in replies}
+        closes = result['tcp_closes']
+        assert len(closes) == len(expected)
+        for close in closes:
+            key = (tuple(close['local']), tuple(close['target']))
+            assert key in expected, ('missing or duplicate original TCP close', close, expected)
+            expected.remove(key)
+            assert (close['shutdown'], close['tail_bytes'], close['tail_digest'], close['eof'], close['so_error']) == (
+                'SHUT_WR', len(TAIL), hashlib.sha256(TAIL).hexdigest(), True, 0), close
+            payloads = {reply['payload'] for reply in replies
+                        if (tuple(reply['local']), tuple(reply['target'])) == key}
+            far = {tuple(event['remote']) for event in primary
+                   if event['target'] == close['target'] and event['payload'] in payloads}
+            assert len(far) == 1, ('original TCP tuple changed far socket', close, far)
+            remote = list(far.pop())
+            tails = [event for event in events if event['kind'] == 'close-tail'
+                     and event['target'] == close['target']]
+            assert len(tails) <= 1 and all(event['remote'] == remote for event in tails), ('wrong or duplicate far close tail', close, tails)
+            assert tails or pending_close, ('far socket did not finish the retained tail and FIN', close, tails)
+            cleanup = [event for event in events if event['kind'] == 'echo-closed'
+                       and event['target'] == close['target']]
+            assert len(cleanup) <= 1 and all(event['remote'] == remote for event in cleanup), ('wrong or duplicate far cleanup', close, cleanup)
+            if not tails:
+                assert not cleanup, ('far socket cleaned up without a successful close tail', close, cleanup)
+                complete = False
+                continue
+            tail = tails[0]
+            assert (tail['request_eof'], tail['shutdown'], tail['length'], tail['tail_digest']) == (
+                True, 'SHUT_WR', close['tail_bytes'], close['tail_digest']), tail
+            assert all(event['serial'] > tail['serial'] for event in cleanup), ('far cleanup preceded successful close', close, cleanup)
+            assert cleanup or pending_close, ('far socket did not reach cleanup after successful close', close, cleanup)
+            complete &= bool(cleanup)
+        assert not expected, ('missing original TCP closes', expected)
     if primary and primary[0]['transport'] == 'udp':
         if action == 'proxy':
             assert len({tuple(event['remote']) for event in primary}) == 1, ('one source socket to two destinations lost outbound source ownership', primary)
@@ -1126,11 +1334,79 @@ def assert_outbound(events, replies, action, number):
         else:
             for target in {tuple(event['target']) for event in primary}:
                 assert len({tuple(event['remote']) for event in primary if tuple(event['target']) == target}) == 1, ('one Direct destination changed outbound source tuple', target, primary)
+    return complete
 
 
-def matrix_row(daemon, root, row):
+@contextlib.contextmanager
+def tcp_capture(fixture, origin, enabled):
+    if not enabled:
+        yield
+        return
+    captures, errors = [], []
+    manifest = dict(status='unknown', captures=captures,
+                    status_scope='capture process readiness, exit, file finalization and kernel drop report only',
+                    exact_tuple_coverage=dict(status='unknown', reason='requires offline tuple-by-tuple packet inspection'))
+    try:
+        for role in (('dut', 'source') if origin == 'T' else ('dut',)):
+            label = 'tcp-close-' + role
+            record = dict(namespace=fixture.names[role], pcap=str(fixture.directory / (label + '.pcap')),
+                          log=str(fixture.directory / (label + '.capture.log')), status='unknown')
+            captures.append(record)
+            process = fixture.track(subprocess.Popen(
+                ['ip', 'netns', 'exec', record['namespace'], 'tcpdump', '--immediate-mode', '-U', '-s', '128', '-n',
+                 '-i', 'any', '-w', record['pcap'], 'tcp', 'and', '(', 'port', '18080', 'or', 'port', '18081', ')'],
+                stdout=subprocess.DEVNULL, stderr=fixture.open(label + '.capture.log'),
+                env=dict(os.environ, LC_ALL='C')))
+            record.update(pid=process.pid, process=process)
+            def listening():
+                assert process.poll() is None, ('TCP diagnostic capture exited before readiness', process.returncode)
+                return 'listening on' in Path(record['log']).read_text()
+            eventually(listening, 'TCP diagnostic capture did not report readiness', seconds=3)
+            record['ready'] = True
+        yield
+    except BaseException as error:
+        manifest['operation_error'] = repr(error)
+        raise
+    finally:
+        for record in captures:
+            process = record.pop('process', None)
+            try:
+                if process is None:
+                    raise RuntimeError('TCP diagnostic capture was not started')
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                    process.wait(timeout=5)
+                stop(process)
+                record['returncode'] = process.returncode
+                assert process.returncode == 0, ('TCP diagnostic capture failed', process.returncode)
+                text = Path(record['log']).read_text()
+                dropped = re.search(r'^(\d+) packets dropped by kernel$', text, re.M)
+                packets = re.search(r'^(\d+) packets captured$', text, re.M)
+                assert dropped and int(dropped[1]) == 0 and packets and int(packets[1]) > 0, ('TCP diagnostic capture gap', text)
+                assert Path(record['pcap']).stat().st_size >= 24, 'TCP diagnostic pcap not finalized'
+                received = re.search(r'^(\d+) packets received by filter$', text, re.M)
+                record.update(status='complete', packets=int(packets[1]), kernel_dropped=int(dropped[1]),
+                              received_by_filter=int(received[1]) if received else None,
+                              exact_tuple_coverage='unknown')
+            except BaseException as error:
+                record.update(status='unknown', error=repr(error))
+                errors.append(error)
+                if process is not None:
+                    try:
+                        stop(process)
+                    except BaseException as join_error:
+                        errors.append(join_error)
+        manifest['status'] = 'unknown' if errors or any(not record.get('ready') for record in captures) else 'complete'
+        (fixture.directory / 'tcp-close-capture.json').write_text(json.dumps(manifest, indent=2) + '\n')
+        if errors:
+            if any(isinstance(error, CleanupIncomplete) for error in errors):
+                raise CleanupIncomplete(f'TCP diagnostic capture cleanup: {errors!r}')
+            raise RuntimeError(f'TCP diagnostic capture unknown: {errors!r}')
+
+
+def matrix_row(daemon, root, row, diagnostic_tcp=False):
     origin, number, transport = row[2], int(row[3]), row[5:]
-    with Fixture(daemon, root, row, number) as fixture:
+    with Fixture(daemon, root, row, number) as fixture, tcp_capture(fixture, origin, diagnostic_tcp and transport == 'T'):
         fixture.start()
         if transport == 'T':
             namespace = fixture.names['dut' if origin == 'H' else 'source']
@@ -1144,10 +1420,17 @@ def matrix_row(daemon, root, row):
         for action, port in (('proxy', 18080), ('direct', 18081)):
             before = fixture.counters()
             start = len(fixture.peer_events())
+            diagnostic = [str(fixture.directory / 'tcp-close-observations.jsonl')] if diagnostic_tcp and transport == 'T' else []
             result = fixture.probe('traffic', number, fixture.host_source if origin == 'H' else fixture.source,
-                                   transport, port, row + '/' + action, origin=origin, timeout=80)
-            events = fixture.peer_events()[start:]
-            assert_outbound(events, result['replies'], action, number)
+                                   transport, port, row + '/' + action, *diagnostic, origin=origin, timeout=80)
+            if transport == 'T':
+                def close_receipts():
+                    events = fixture.peer_events()[start:]
+                    return events if assert_outbound(events, result, action, number, pending_close=True) else None
+                events = eventually(close_receipts, 'independent far sockets did not publish successful close and cleanup')
+            else:
+                events = fixture.peer_events()[start:]
+            assert_outbound(events, result, action, number)
             after = fixture.counters()
             assert after['tx'] > before['tx'] and after['rx'] > before['rx'], ('missing real TUN FD read/write witness', before, after)
             assert after['tx'] - before['tx'] < 20000 and after['rx'] - before['rx'] < 20000, 'possible capture loop'
@@ -1343,6 +1626,7 @@ def packet_extensions(fixture):
         after = fixture.counters()
         assert after['tx'] - before['tx'] >= 2 and after['rx'] - before['rx'] >= 2
         (fixture.directory / ('mtu-' + action + '-wire.json')).write_text(json.dumps(dict(client=result, counters=[before, after]), indent=2))
+    offload_extensions(fixture)
     fixture.fence_counters()
 
 
@@ -1508,15 +1792,27 @@ def strict_rpf(daemon, root, number):
         fixture.fence_counters()
 
 
-def gate(daemon, root):
+def gate(daemon, root, selected=()):
     root = Path(root)
     fault_names = ('name', 'table', 'priority', 'address', 'main-route', 'rpdb', 'dns-bind', 'no-cap', 'no-tun')
     cases = ROWS + [f'A-{number}-{name}' for number in (4, 6)
                     for name in ('DNS', 'control', 'packets', 'instance-lock', 'close-active', 'strict-rpf',
                                  'crash-guard', 'topology-fault', *('setup-' + fault for fault in fault_names))]
+    assert len(selected) == len(set(selected)), ('duplicate TUN row selection', selected)
+    assert all(isinstance(row, str) and row and row in cases for row in selected), ('unknown or empty TUN row selection', selected)
+    requested = set(selected or cases)
+    (root / 'coverage.json').write_text(json.dumps(dict(
+        mode='partial' if selected else 'full', total_rows=len(cases),
+        selected_rows=[row for row in cases if row in requested],
+        skipped_rows=[row for row in cases if row not in requested],
+        tcp_diagnostics_rows=[row for row in ROWS if selected and row in requested and row.endswith('-T')],
+        fixture_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+    ), indent=2) + '\n')
     results = {row: {'status': 'NOT_RUN'} for row in cases}
     failures = []
     def record(row, operation):
+        if row not in requested:
+            return
         terminal_cleanup = None
         try:
             operation()
@@ -1551,7 +1847,7 @@ def gate(daemon, root):
         'oversize_datagram_boundary': 'The ordinary UDP length ceiling is rejected by the source kernel; this is not a claim of TUN FD jumbogram rejection.'
     }, indent=2) + '\n')
     for row in ROWS:
-        record(row, lambda row=row: matrix_row(daemon, root, row))
+        record(row, lambda row=row: matrix_row(daemon, root, row, diagnostic_tcp=bool(selected)))
     for number in (4, 6):
         for name, operation in (('DNS', dns_extensions), ('control', control_extensions), ('packets', packet_extensions)):
             row = f'A-{number}-{name}'
@@ -1570,7 +1866,7 @@ def gate(daemon, root):
         for topology in (False, True):
             record(f'A-{number}-' + ('topology-fault' if topology else 'crash-guard'),
                    lambda number=number, topology=topology: crash_fault(daemon, root, number, topology))
-    assert all(result['status'] != 'NOT_RUN' for result in results.values())
+    assert all(results[row]['status'] != 'NOT_RUN' for row in requested)
     assert not failures, ('TUN scenarios failed; inspect independent row artifacts', failures)
 
 
@@ -1680,7 +1976,8 @@ def main():
         def terminate(signum, _):
             raise SystemExit(128 + signum)
         signal.signal(signal.SIGTERM, terminate)
-        gate(*args)
+        daemon, root, *selected = args
+        gate(daemon, root, selected)
     elif mode == 'serve':
         Peer(*args).serve()
     elif mode == 'traffic':
@@ -1701,6 +1998,10 @@ def main():
         inject(*args)
     elif mode == 'mtu':
         mtu_client(*args)
+    elif mode == 'offload-capture':
+        offload_capture(*args)
+    elif mode == 'offload-client':
+        offload_client(*args)
     elif mode == 'netns-cookie':
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             cookie = struct.unpack('=Q', sock.getsockopt(socket.SOL_SOCKET, 71, 8))[0]

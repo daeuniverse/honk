@@ -36,6 +36,8 @@
 //! [`Stack::receive_with_tcp_admission`] returns [`ReceiveReport`]: source validity and actual
 //! protocol acceptance, including the exact new passive [`FlowId`] for captured policy binding.
 //! Neither a new SYN nor protocol acceptance proves a successful outbound admission.
+//! [`Stack::receive_with_meta_tcp_admission`] combines the same report with driver [`RxMeta`]
+//! through the shared parser; Endpoint retains its strict metadata rejection.
 //! [`Stack::retains_tcp`] classifies existing scoped transport ownership through pending
 //! opens, TIME_WAIT and flow-owned controls; adapters must additionally retain their own
 //! queued/exported output leases. It neither validates input nor mutates protocol state.
@@ -100,8 +102,9 @@
 //! # Offload
 //!
 //! A transparent driver reading a TUN device with `virtio_net_hdr` hands the stack what the
-//! kernel knows, through [`Stack::receive_with`] and [`RxMeta`]. [`Csum::Verify`] (flags 0) is the
-//! only provenance [`Stack::receive`] and an endpoint stack know. [`Csum::Valid`]
+//! kernel knows, through [`Stack::receive_with`] or [`Stack::receive_with_meta_tcp_admission`]
+//! and [`RxMeta`]. [`Csum::Verify`] (flags 0) is the only provenance [`Stack::receive`] and an
+//! endpoint stack know. [`Csum::Valid`]
 //! (`DATA_VALID`) says the checksum was verified already; [`Csum::Partial`] (`NEEDS_CSUM`,
 //! `CHECKSUM_PARTIAL`) says the field holds only the pseudo-header sum, common for locally
 //! generated packets and GRO super-packets, so there is no complete checksum to verify. Both are

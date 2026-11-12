@@ -56,7 +56,7 @@ fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
     config.mtu = 1500;
     config.max_flows = 8;
     config.memory_limit = 2 << 20;
-    let (scope, owner) = PacketScope::new(
+    let (scope, owner) = PacketScope::new_with_output(
         config,
         Arc::clone(&budget),
         RuntimeLimits {
@@ -66,6 +66,8 @@ fn scope() -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
             max_waiters: 4,
         },
         Instant::now(),
+        TX_CAPS,
+        u16::MAX as usize,
     )
     .unwrap();
     (scope, owner, budget)
@@ -117,6 +119,14 @@ async fn close_racing_udp_admission_preserves_the_joined_shutdown_outcome() {
                     b"close-race",
                 )
                 .unwrap();
+                let seed = !wire::checksum::Checksum::pseudo(
+                    source.ip(),
+                    destination.ip(),
+                    wire::PROTO_UDP,
+                    length - 20,
+                )
+                .finish();
+                packet[26..28].copy_from_slice(&seed.to_be_bytes());
                 let mut received_source = false;
                 std::thread::scope(|threads| {
                     let (close, requested) = std::sync::mpsc::sync_channel(0);
@@ -129,6 +139,13 @@ async fn close_racing_udp_admission_preserves_the_joined_shutdown_outcome() {
                         &endpoints,
                         scope.scope(),
                         &packet[..length],
+                        RxMeta {
+                            csum: Csum::Partial {
+                                start: 20,
+                                offset: 6,
+                            },
+                            gso: None,
+                        },
                         Instant::now(),
                         |_, _| {
                             let allowed =
@@ -193,6 +210,7 @@ async fn admission_errors_without_endpoint_close_remain_failures() {
             &endpoints,
             scope.scope(),
             &packet[..length],
+            RxMeta::VERIFY,
             Instant::now(),
             |_, _| true,
         )
@@ -206,6 +224,7 @@ async fn admission_errors_without_endpoint_close_remain_failures() {
             &endpoints,
             honk_datapath::ScopeId::HOST,
             &packet[..length],
+            RxMeta::VERIFY,
             Instant::now(),
             |_, _| true,
         )
@@ -266,13 +285,54 @@ async fn writable_readiness_retries_the_same_lease_without_new_input() {
             scope.receive(&syn[..length], Instant::now()),
             honk_netstack::Rx::Consumed
         );
-        let (syn, flow) = scope.poll_accept().unwrap();
+        let (_, mut flow) = scope.poll_accept().unwrap();
+        scope.drive(Instant::now());
+        let synack = scope.next_output().await.unwrap();
+        let ip = wire::parse_ip(synack.packet()).unwrap();
+        let sequence = tcp::parse(&synack.packet()[ip.payload])
+            .unwrap()
+            .0
+            .seq
+            .wrapping_add(1);
+        drop(synack);
+        let length = tcp::emit_packet(
+            &mut syn,
+            "192.0.2.1".parse().unwrap(),
+            "198.51.100.1".parse().unwrap(),
+            &tcp::Header {
+                src_port: 41000,
+                dst_port: 443,
+                seq: 20,
+                ack: sequence,
+                flags: tcp::ACK,
+                window: u16::MAX,
+                urgent: 0,
+                options: tcp::Options::default(),
+            },
+            [&[], &[]],
+        )
+        .unwrap();
+        assert_eq!(
+            scope.receive(&syn[..length], Instant::now()),
+            honk_netstack::Rx::Consumed
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut flow, &[5; 8192])
+            .await
+            .unwrap();
         scope.drive(Instant::now());
         let lease = scope.next_output().await.unwrap();
-        assert_eq!(lease.flow_id(), Some(syn.id));
+        assert_eq!(lease.flow_id(), Some(flow.flow_id()));
+        assert!(lease.transmit().gso.is_some());
+        assert!(matches!(lease.transmit().csum, TxCsum::Partial { .. }));
         let original = lease.packet().to_vec();
         let pointer = lease.packet().as_ptr();
-        let identity = (lease.scope(), lease.flow_id(), lease.class());
+        let identity = (
+            lease.scope(),
+            lease.flow_id(),
+            lease.class(),
+            lease.transmit(),
+        );
+        let header = vnet_header(lease.packet(), lease.transmit()).unwrap();
         let mut pending = std::array::from_fn(|_| None);
         pending[0] = Some(lease);
         let (writer, reader) = UnixDatagram::pair().unwrap();
@@ -288,23 +348,38 @@ async fn writable_readiness_retries_the_same_lease_without_new_input() {
         }
         let mut attempts = 0;
         let mut bytes = 0;
+        let mut interrupted = false;
         assert_eq!(
             flush_pending(
                 &mut pending,
                 &mut attempts,
                 &mut bytes,
                 Instant::now(),
-                |packet| write_packet(writer.as_raw_fd(), packet)
+                |actual_header, packet| {
+                    assert_eq!(actual_header, &header);
+                    assert_eq!(packet, original);
+                    if !interrupted {
+                        interrupted = true;
+                        Err(io::ErrorKind::Interrupted.into())
+                    } else {
+                        write_packet(writer.as_raw_fd(), actual_header, packet)
+                    }
+                }
             )
             .unwrap(),
             (true, false)
         );
-        assert_eq!(attempts, 1);
+        assert_eq!(attempts, 2);
         assert_eq!(bytes, 0);
         let retained = pending[0].as_ref().unwrap();
         assert_eq!(retained.packet().as_ptr(), pointer);
         assert_eq!(
-            (retained.scope(), retained.flow_id(), retained.class()),
+            (
+                retained.scope(),
+                retained.flow_id(),
+                retained.class(),
+                retained.transmit()
+            ),
             identity
         );
         assert_eq!(retained.packet(), original);
@@ -344,7 +419,7 @@ async fn writable_readiness_retries_the_same_lease_without_new_input() {
         });
         tokio::pin!(retry);
         assert!(futures::poll!(&mut retry).is_pending());
-        let mut received = [0; 4096];
+        let mut received = [0; RX_BYTES];
         loop {
             match reader.recv(&mut received) {
                 Ok(length) => assert_eq!(&received[..length], filler),
@@ -354,7 +429,8 @@ async fn writable_readiness_retries_the_same_lease_without_new_input() {
         }
         retry.await;
         let length = reader.recv(&mut received).unwrap();
-        assert_eq!(&received[..length], original);
+        assert_eq!(&received[..VNET_BYTES], header);
+        assert_eq!(&received[VNET_BYTES..length], original);
         assert_eq!(
             reader.recv(&mut received).unwrap_err().kind(),
             io::ErrorKind::WouldBlock
@@ -416,6 +492,9 @@ async fn short_zero_and_fatal_writes_never_replay_or_release_as_success() {
     for outcome in [
         Ok(0),
         Ok(1),
+        Ok(VNET_BYTES - 1),
+        Ok(VNET_BYTES),
+        Ok(VNET_BYTES + 1),
         Err(io::ErrorKind::InvalidInput),
         Err(io::ErrorKind::BrokenPipe),
     ] {
@@ -432,8 +511,9 @@ async fn short_zero_and_fatal_writes_never_replay_or_release_as_success() {
             &mut attempts,
             &mut bytes,
             Instant::now(),
-            |packet| {
+            |header, packet| {
                 calls += 1;
+                assert_eq!(header, &[0; VNET_BYTES]);
                 assert_eq!(packet, original);
                 outcome.map_err(io::Error::from)
             },
@@ -473,7 +553,7 @@ async fn interrupted_writes_keep_one_lease_with_a_finite_syscall_budget() {
         &mut attempts,
         &mut bytes,
         Instant::now(),
-        |_| Err(io::ErrorKind::Interrupted.into()),
+        |_, _| Err(io::ErrorKind::Interrupted.into()),
     )
     .unwrap();
     assert!(!blocked && runnable);
@@ -487,7 +567,7 @@ async fn interrupted_writes_keep_one_lease_with_a_finite_syscall_budget() {
             &mut attempts,
             &mut bytes,
             Instant::now(),
-            |packet| Ok(packet.len())
+            |header, packet| Ok(header.len() + packet.len())
         )
         .unwrap(),
         (false, false)
@@ -507,7 +587,7 @@ async fn accepted_prefix_is_not_rolled_back_when_the_next_record_blocks() {
     pending[0] = Some(output(&scope).await);
     pending[1] = Some(output(&scope).await);
     let pointer = pending[1].as_ref().unwrap().packet().as_ptr();
-    let length = pending[0].as_ref().unwrap().packet().len();
+    let length = VNET_BYTES + pending[0].as_ref().unwrap().packet().len();
     let mut attempts = 0;
     let mut bytes = 0;
     let mut calls = 0;
@@ -517,10 +597,10 @@ async fn accepted_prefix_is_not_rolled_back_when_the_next_record_blocks() {
             &mut attempts,
             &mut bytes,
             Instant::now(),
-            |packet| {
+            |header, packet| {
                 calls += 1;
                 if calls == 1 {
-                    Ok(packet.len())
+                    Ok(header.len() + packet.len())
                 } else {
                     Err(io::ErrorKind::WouldBlock.into())
                 }
@@ -561,6 +641,145 @@ fn fd_records_require_exact_ip_extent_and_bounded_turns() {
     assert!(turn_limit(8, 0, now - TURN_TIME, BATCH));
     assert!(!turn_limit(0, 0, now - TURN_TIME, BATCH));
     assert!(!turn_limit(7, 0, now - TURN_TIME, BATCH));
+}
+
+#[test]
+fn vnet_byte_vectors_validate_family_extents_and_partial_udp_without_uso() {
+    let tcp4 = [
+        0x45, 0, 0, 44, 0, 0, 0x40, 0, 64, 6, 0x4e, 0x96, 192, 0, 2, 1, 198, 51, 100, 1, 0xa0,
+        0x28, 1, 0xbb, 0, 0, 0, 1, 0, 0, 0, 1, 0x50, 0x10, 0xff, 0xff, 0, 0, 0, 0, 1, 2, 3, 4,
+    ];
+    let tcp4_header = [1, 1, 40, 0, 0xb4, 5, 20, 0, 16, 0];
+    let expected = RxMeta {
+        csum: Csum::Partial {
+            start: 20,
+            offset: 16,
+        },
+        gso: Some(GsoRx {
+            kind: GsoKind::Tcp,
+            size: 1460,
+        }),
+    };
+    assert_eq!(vnet_meta(&tcp4_header, &tcp4), Some(expected));
+    assert_eq!(
+        vnet_header(
+            &tcp4,
+            Transmit {
+                len: tcp4.len(),
+                gso: Some(honk_netstack::GsoTx {
+                    kind: GsoKind::Tcp,
+                    size: 1460,
+                    hdr_len: 40
+                }),
+                csum: TxCsum::Partial {
+                    start: 20,
+                    offset: 16
+                },
+                flow: None,
+            }
+        )
+        .unwrap(),
+        tcp4_header
+    );
+    let mut linear_payload_header = tcp4_header;
+    linear_payload_header[2] = 44;
+    assert_eq!(vnet_meta(&linear_payload_header, &tcp4), Some(expected));
+    for (field, value) in [
+        (0, 3),
+        (0, 4),
+        (1, 3),
+        (1, 5),
+        (1, 0x81),
+        (1, 4),
+        (2, 39),
+        (2, 45),
+        (6, 21),
+        (8, 6),
+        (4, 0),
+    ] {
+        let mut header = tcp4_header;
+        header[field] = value;
+        if field == 4 {
+            header[5] = 0;
+        }
+        assert!(
+            vnet_meta(&header, &tcp4).is_none(),
+            "field {field} value {value}"
+        );
+    }
+    let mut tcp6 = vec![0; 64];
+    tcp6[..8].copy_from_slice(&[0x60, 0, 0, 0, 0, 24, 6, 64]);
+    tcp6[8..24].copy_from_slice(&[0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    tcp6[24..40].copy_from_slice(&[0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+    tcp6[40..].copy_from_slice(&tcp4[20..]);
+    let tcp6_header = [1, 4, 60, 0, 0xb4, 5, 40, 0, 16, 0];
+    assert_eq!(
+        vnet_meta(&tcp6_header, &tcp6),
+        Some(RxMeta {
+            csum: Csum::Partial {
+                start: 40,
+                offset: 16
+            },
+            gso: expected.gso,
+        })
+    );
+    let udp4 = [
+        0x45, 0, 0, 32, 0, 0, 0x40, 0, 64, 17, 0x4e, 0x97, 192, 0, 2, 1, 198, 51, 100, 1, 0xa0,
+        0x28, 1, 0xbb, 0, 12, 0, 0, 1, 2, 3, 4,
+    ];
+    let udp_header = [1, 0, 0, 0, 0, 0, 20, 0, 6, 0];
+    let record = [udp_header.as_slice(), &udp4].concat();
+    let (packet, meta) = decode_record(&record).unwrap();
+    assert_eq!(packet, udp4);
+    assert_eq!(
+        meta,
+        RxMeta {
+            csum: Csum::Partial {
+                start: 20,
+                offset: 6
+            },
+            gso: None
+        }
+    );
+    let mut udp6 = tcp6[..40].to_vec();
+    udp6[5] = 12;
+    udp6[6] = 17;
+    udp6.extend_from_slice(&udp4[20..]);
+    assert_eq!(
+        vnet_meta(&[1, 0, 0, 0, 0, 0, 40, 0, 6, 0], &udp6),
+        Some(RxMeta {
+            csum: Csum::Partial {
+                start: 40,
+                offset: 6
+            },
+            gso: None
+        })
+    );
+    for flags in [0, 2] {
+        let mut header = [0; VNET_BYTES];
+        header[0] = flags;
+        assert_eq!(
+            vnet_meta(&header, &udp4).unwrap().csum,
+            if flags == 0 {
+                Csum::Verify
+            } else {
+                Csum::Valid
+            }
+        );
+    }
+    for length in 0..record.len() {
+        assert!(decode_record(&record[..length]).is_none());
+    }
+    let mut padded = record;
+    padded.push(0);
+    assert!(decode_record(&padded).is_none());
+    let mut maximum = vec![0; RX_BYTES - 1];
+    maximum[VNET_BYTES] = 0x60;
+    maximum[VNET_BYTES + 4..VNET_BYTES + 6].copy_from_slice(&u16::MAX.to_be_bytes());
+    assert_eq!(decode_record(&maximum).unwrap().0.len(), 65_575);
+    maximum.push(0);
+    assert!(decode_record(&maximum).is_none());
+    assert_eq!(RX_BYTES, 65_586);
 }
 
 #[test]

@@ -87,6 +87,77 @@ fn a_tcp_super_packet_is_one_contiguous_segment_with_intact_data_and_one_ack() {
 }
 
 #[test]
+fn metadata_admission_reports_the_exact_new_passive_flow() {
+    let now = Instant::now();
+    let mut stack = Stack::new(transparent(), now);
+    let syn = corrupt_l4(
+        build(
+            addr(CLIENT),
+            addr(DST),
+            100,
+            0,
+            tcp::SYN,
+            opts_syn(1460),
+            &[],
+        ),
+        16,
+    );
+    let (rx, refused) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| false);
+    assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
+    assert!(refused.source.is_some());
+    assert_eq!(refused.outcome, honk_netstack::ReceiveOutcome::Unqualified);
+    assert!(stack.poll_accept().is_none());
+    let (rx, admitted) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| true);
+    assert_eq!(rx, Rx::Consumed);
+    let new = stack.poll_accept().unwrap();
+    assert_eq!(
+        admitted.outcome,
+        honk_netstack::ReceiveOutcome::TcpNew(new.id)
+    );
+    let (_, retry) = stack.receive_with_meta_tcp_admission(now, &syn, valid(), |_| true);
+    assert_eq!(retry.outcome, honk_netstack::ReceiveOutcome::Unqualified);
+    assert!(stack.poll_accept().is_none());
+}
+
+#[test]
+fn metadata_reporting_gates_gro_before_mutation_and_keeps_original_flow() {
+    let mut c = Conn::new(transparent());
+    let data = pattern(2 * MSS + 17, 7);
+    let segs = segments(&mut c, &data, MSS);
+    let (packet, meta) = gro(&segs, MSS as u16);
+    let packet = corrupt_l4(packet, 16);
+    let mut callbacks = 0;
+    let (rx, refused) = c
+        .stack
+        .receive_with_meta_tcp_admission(c.now, &packet, meta, |source| {
+            callbacks += 1;
+            assert_eq!((source.src, source.dst), (c.client, c.dst));
+            false
+        });
+    assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
+    assert_eq!(callbacks, 1);
+    assert!(refused.source.is_some());
+    assert_eq!(refused.outcome, honk_netstack::ReceiveOutcome::Unqualified);
+    assert!(read_all(&mut c).is_empty());
+    let (rx, accepted) = c
+        .stack
+        .receive_with_meta_tcp_admission(c.now, &packet, meta, |_| true);
+    assert_eq!(rx, Rx::Consumed);
+    assert_eq!(accepted.source, refused.source);
+    assert_eq!(
+        accepted.outcome,
+        honk_netstack::ReceiveOutcome::TcpAccepted(c.id)
+    );
+    assert_eq!(read_all(&mut c), data);
+    let (rx, invalid) = c.stack.receive_with_tcp_admission(c.now, &packet, |_| {
+        panic!("VERIFY reporting must not inherit earlier metadata")
+    });
+    assert_eq!(rx, Rx::Dropped(DropReason::Checksum));
+    assert_eq!(invalid.source, None);
+    assert_eq!(invalid.outcome, honk_netstack::ReceiveOutcome::Unqualified);
+}
+
+#[test]
 fn ack_cadence_counts_full_frames_of_a_super_packet() {
     let mut c = Conn::new(transparent());
     spend_quickack(&mut c);
@@ -296,6 +367,14 @@ fn offload_metadata_is_refused_by_an_endpoint_stack() {
     ] {
         assert_eq!(s.receive_with(now, &bad, meta), unsupported);
         assert_eq!(s.receive_with(now, &good, meta), unsupported);
+        for packet in [&bad, &good] {
+            let (rx, report) = s.receive_with_meta_tcp_admission(now, packet, meta, |_| {
+                panic!("Endpoint metadata must be rejected before source reporting")
+            });
+            assert_eq!(rx, unsupported);
+            assert_eq!(report.source, None);
+            assert_eq!(report.outcome, honk_netstack::ReceiveOutcome::Unqualified);
+        }
     }
     let mut out = [0u8; 200];
     assert_eq!(
@@ -312,7 +391,7 @@ fn offload_metadata_is_refused_by_an_endpoint_stack() {
     assert_eq!(s.receive_with(now, &good, RxMeta::default()), Rx::Consumed);
     assert_eq!(s.tcp_read(id, &mut out), Ok(100));
     let stats = s.stats();
-    assert_eq!(stats.drops[DropReason::Unsupported as usize], 6);
+    assert_eq!(stats.drops[DropReason::Unsupported as usize], 12);
 }
 
 #[test]

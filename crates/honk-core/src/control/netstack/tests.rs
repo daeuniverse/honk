@@ -8,6 +8,7 @@ use honk_netstack::{ExcludeSet, Mode};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 mod driven;
+mod offload;
 mod progress;
 
 fn config() -> Config {
