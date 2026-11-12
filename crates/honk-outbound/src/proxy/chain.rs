@@ -3,14 +3,14 @@
 
 use async_trait::async_trait;
 use honk_config::node::Node;
-use honk_config::types::NodeProtocol;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{
-    ChainHopFailure, NodeFailure, ProxyStream, TcpOutbound, TunnelDialOptions, is_packet_rejection,
+    AsyncReadWrite, ChainHopFailure, NodeFailure, PacketOutbound, PacketTransport, ProtocolEntry,
+    ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported, is_packet_rejection,
     target_failure,
 };
 use crate::runtime::flow_observation::without_target_milestones;
@@ -19,37 +19,43 @@ use crate::runtime::{NodeRuntime, RouteRuntime};
 /// Dials a chain through the hop runtimes of its own generation, using the
 /// same handler instances the registry dispatches to.
 pub struct ChainHandler {
-    handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>,
+    handlers: Vec<ProtocolEntry>,
 }
 
 impl ChainHandler {
-    pub fn new(handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>) -> Self {
+    pub fn new(handlers: Vec<ProtocolEntry>) -> Self {
         Self { handlers }
     }
 
-    fn handler(&self, node: &Node) -> anyhow::Result<&Arc<dyn TcpOutbound>> {
+    fn handler(&self, node: &Node) -> anyhow::Result<&ProtocolEntry> {
         self.handlers
             .iter()
-            .find(|(protocol, _)| *protocol == node.protocol())
-            .map(|(_, handler)| handler)
+            .find(|entry| entry.descriptor.protocol == node.protocol())
             .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol()))
     }
 
     /// On failure, also returns the index of the hop that failed.
-    async fn dial_hops(
+    async fn dial_hops<T, Fut>(
         &self,
         hops: &[Arc<NodeRuntime>],
-        target: SocketAddr,
-        target_domain: Option<&str>,
         connect_timeout: Duration,
         deadline: Instant,
         reality_key_shares: bool,
-    ) -> Result<ProxyStream, (usize, anyhow::Error)> {
+        exit: &impl Fn(
+            &ProtocolEntry,
+            Arc<NodeRuntime>,
+            Box<dyn AsyncReadWrite>,
+            TunnelDialOptions,
+        ) -> Fut,
+    ) -> Result<T, (usize, anyhow::Error)>
+    where
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         let budget = || connect_timeout.min(deadline.saturating_duration_since(Instant::now()));
         let at = |hop: usize| move |error| (hop, error);
         let (first, rest) = hops.split_first().expect("a chain has at least two hops");
         let (server, server_domain) = server_target(&rest[0].node);
-        let handler = self.handler(&first.node).map_err(at(0))?;
+        let handler = &self.handler(&first.node).map_err(at(0))?.tcp;
         let mut carrier = hop_scope(
             first,
             without_target_milestones(handler.dial_runtime(
@@ -69,17 +75,14 @@ impl ChainHandler {
                 reality_key_shares,
             };
             let Some(next) = rest.get(index + 1) else {
-                return hop_scope(
-                    hop,
-                    handler.dial_over(Arc::clone(hop), carrier, target, target_domain, options),
-                )
-                .await
-                .map_err(at(index + 1));
+                return hop_scope(hop, exit(handler, Arc::clone(hop), carrier, options))
+                    .await
+                    .map_err(at(index + 1));
             };
             let (server, server_domain) = server_target(&next.node);
             carrier = hop_scope(
                 hop,
-                without_target_milestones(handler.dial_over(
+                without_target_milestones(handler.tcp.dial_over(
                     Arc::clone(hop),
                     carrier,
                     server,
@@ -168,9 +171,14 @@ impl TcpOutbound for ChainHandler {
         self.dial_chain(
             &runtime.node.name,
             runtime.chain_hops(),
-            target,
-            target_domain,
             connect_timeout,
+            |exit, hop, carrier, options| {
+                let tcp = Arc::clone(&exit.tcp);
+                async move {
+                    tcp.dial_over(hop, carrier, target, target_domain, options)
+                        .await
+                }
+            },
         )
         .await
     }
@@ -188,9 +196,14 @@ impl ChainHandler {
         self.dial_chain(
             "group exit route",
             route.hops(),
-            target,
-            target_domain,
             connect_timeout,
+            |exit, hop, carrier, options| {
+                let tcp = Arc::clone(&exit.tcp);
+                async move {
+                    tcp.dial_over(hop, carrier, target, target_domain, options)
+                        .await
+                }
+            },
         )
         .await
     }
@@ -201,34 +214,35 @@ impl ChainHandler {
     /// hybrid key shares, as a direct REALITY dial retries once. The first hop
     /// dials directly and has already had that retry, so its failure stands.
     /// A failure names its hop through [`ChainHopFailure`]; the deadline
-    /// belongs to no hop.
-    async fn dial_chain(
+    /// belongs to no hop. `exit` runs the last hop's handshake over the
+    /// carrier to its server.
+    async fn dial_chain<T, Fut>(
         &self,
         label: &str,
         hops: &[Arc<NodeRuntime>],
-        target: SocketAddr,
-        target_domain: Option<&str>,
         connect_timeout: Duration,
-    ) -> anyhow::Result<ProxyStream> {
+        exit: impl Fn(
+            &ProtocolEntry,
+            Arc<NodeRuntime>,
+            Box<dyn AsyncReadWrite>,
+            TunnelDialOptions,
+        ) -> Fut,
+    ) -> anyhow::Result<T>
+    where
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         if hops.len() < 2 {
             anyhow::bail!("chain node '{label}' has no hops in this runtime");
         }
         let deadline = Instant::now() + connect_timeout * 3;
         let dial = async {
             match self
-                .dial_hops(hops, target, target_domain, connect_timeout, deadline, true)
+                .dial_hops(hops, connect_timeout, deadline, true, &exit)
                 .await
             {
                 Err((hop, error)) if hop > 0 && reality_mask_certificate(&error) => {
-                    self.dial_hops(
-                        hops,
-                        target,
-                        target_domain,
-                        connect_timeout,
-                        deadline,
-                        false,
-                    )
-                    .await
+                    self.dial_hops(hops, connect_timeout, deadline, false, &exit)
+                        .await
                 }
                 result => result,
             }
@@ -244,6 +258,47 @@ impl ChainHandler {
         tokio::time::timeout_at(deadline, dial).await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy chain setup timeout")
         })?
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for ChainHandler {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        anyhow::bail!(
+            "chain node '{}' dials only through a runtime generation",
+            node.name
+        )
+    }
+
+    async fn dial_udp_transport_runtime(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_chain(
+            &runtime.node.name,
+            runtime.chain_hops(),
+            connect_timeout,
+            |exit, hop, carrier, options| {
+                let packet = exit.packet.clone();
+                async move {
+                    let protocol = hop.node.protocol().as_str();
+                    packet
+                        .ok_or(TunnelUnsupported(protocol))?
+                        .dial_udp_over(hop, carrier, target, target_domain, options)
+                        .await
+                }
+            },
+        )
+        .await
     }
 }
 

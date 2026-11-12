@@ -211,10 +211,19 @@ impl ProxyRegistry {
         let hop_handlers = registry
             .entries
             .iter()
-            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
+            .map(|entry| ProtocolEntry {
+                descriptor: entry.descriptor,
+                tcp: Arc::clone(&entry.tcp),
+                packet: entry.packet.clone(),
+                warmable: None,
+                probeable: None,
+                shared: entry.shared.clone(),
+            })
             .collect();
         let chain = Arc::new(ChainHandler::new(hop_handlers));
-        registry.register(ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)));
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)).with_packet(chain.clone()),
+        );
         registry.chain = Some(chain);
         for entry in &registry.entries {
             entry.validate_consistency();

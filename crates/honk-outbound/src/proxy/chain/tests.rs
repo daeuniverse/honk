@@ -1,10 +1,11 @@
 use super::*;
-use crate::proxy::{AsyncReadWrite, ProtocolEntry, ProxyRegistry, node_failure};
+use crate::proxy::{AsyncReadWrite, PacketOutbound, ProtocolEntry, ProxyRegistry, node_failure};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{
     assert_legacy_bulk_echo, chain, mock_legacy_tcp_server, node, socks5, socks5_relay,
 };
 use honk_config::node::OutboundConfig;
+use honk_config::types::NodeProtocol;
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
@@ -118,6 +119,149 @@ async fn the_last_hop_target_failure_stays_a_target_failure() {
         .unwrap_err();
     assert!(target_failure(&error), "{error:#}");
     assert_eq!(refusing.requests(), [TARGET]);
+}
+
+fn trojan_exit(name: &str, host: &str, port: u16) -> Node {
+    node(
+        name,
+        host,
+        port,
+        OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            tls: honk_config::node::TlsOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    )
+}
+
+/// A plaintext Trojan server that answers a UDP associate by echoing its
+/// frames, so each reply names the peer its request did.
+async fn trojan_udp_echo() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            tokio::spawn(async move {
+                // hex(sha224) | CRLF | UDP ASSOCIATE | IPv4 target | CRLF
+                let mut head = [0u8; 56 + 2 + 1 + 7 + 2];
+                stream.read_exact(&mut head).await.unwrap();
+                assert_eq!(head[58], 0x03);
+                let (mut rd, mut wr) = stream.split();
+                let _ = tokio::io::copy(&mut rd, &mut wr).await;
+            });
+        }
+    });
+    addr
+}
+
+async fn dial_chain_udp(
+    generation: &OutboundRuntimeRegistry,
+    chain: &Node,
+) -> anyhow::Result<Arc<dyn PacketTransport>> {
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let packet = Arc::clone(
+        registry
+            .find(NodeProtocol::Chain)
+            .unwrap()
+            .packet
+            .as_ref()
+            .unwrap(),
+    );
+    packet
+        .dial_udp_transport_runtime(
+            generation.get(&chain.id).unwrap(),
+            target(),
+            None,
+            Duration::from_secs(3),
+        )
+        .await
+}
+
+async fn assert_udp_echo(transport: &dyn PacketTransport) {
+    transport.send_packet(b"ping").await.unwrap();
+    let mut buf = [0u8; 16];
+    let (len, peer) = transport.recv_packet(&mut buf).await.unwrap();
+    assert_eq!((&buf[..len], peer), (&b"ping"[..], target()));
+}
+
+#[tokio::test]
+async fn socks5_front_carries_a_trojan_udp_exit() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = trojan_udp_echo().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = trojan_exit("land", "127.0.0.1", server.port());
+    let via = chain(&[&front, &land]);
+    let generation = OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap();
+    let transport = dial_chain_udp(&generation, &via).await.unwrap();
+    assert_udp_echo(transport.as_ref()).await;
+    assert_eq!(relay.requests(), [server.to_string()]);
+}
+
+#[tokio::test]
+async fn three_hops_carry_udp_to_the_exit() {
+    let server = trojan_udp_echo().await;
+    let inner = socks5_relay(vec![("land.test", server)], false).await;
+    let outer = socks5_relay(vec![("mid.test", inner.addr)], false).await;
+    let front = socks5("front", "127.0.0.1", outer.addr.port());
+    let mid = socks5("mid", "mid.test", inner.addr.port());
+    let land = trojan_exit("land", "land.test", server.port());
+    let via = chain(&[&front, &mid, &land]);
+    let generation = OutboundRuntimeRegistry::build(&[via.clone(), front, mid, land]).unwrap();
+    let transport = dial_chain_udp(&generation, &via).await.unwrap();
+    assert_udp_echo(transport.as_ref()).await;
+    assert_eq!(inner.requests(), [format!("land.test:{}", server.port())]);
+}
+
+#[tokio::test]
+async fn an_earlier_hop_target_failure_fails_a_udp_chain_at_the_next_hop() {
+    let relay = socks5_relay(Vec::new(), true).await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = trojan_exit("land", "127.0.0.1", 9);
+    let land_id = land.id;
+    let via = chain(&[&front, &land]);
+    let generation = OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap();
+    let error = dial_chain_udp(&generation, &via).await.unwrap_err();
+    assert!(!target_failure(&error), "{error:#}");
+    assert!(node_failure(&error), "{error:#}");
+    assert_eq!(
+        crate::proxy::failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+        Some((1, land_id)),
+        "{error:#}"
+    );
+}
+
+#[cfg(feature = "rprx")]
+#[tokio::test]
+async fn socks5_front_carries_a_vless_native_udp_exit() {
+    use tokio::io::AsyncWriteExt;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        // version | uuid | addons | command | port | IPv4 target
+        let mut head = [0u8; 26];
+        stream.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[18], 0x02);
+        stream.write_all(&[0, 0]).await.unwrap();
+        let (mut rd, mut wr) = stream.split();
+        let _ = tokio::io::copy(&mut rd, &mut wr).await;
+    });
+    let relay = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let mut land = Node::from_share_link(&format!(
+        "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:{}?security=none",
+        server.port()
+    ))
+    .unwrap();
+    land.name = "land".into();
+    let via = chain(&[&front, &land]);
+    let generation = OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap();
+    let transport = dial_chain_udp(&generation, &via).await.unwrap();
+    assert_udp_echo(transport.as_ref()).await;
 }
 
 #[tokio::test]
@@ -363,6 +507,53 @@ impl TcpOutbound for FakeHop {
     }
 }
 
+/// An exit's carrier held as a packet transport.
+#[derive(Debug)]
+struct CarrierPacket(#[allow(dead_code)] tokio::sync::Mutex<Box<dyn AsyncReadWrite>>);
+
+#[async_trait]
+impl PacketTransport for CarrierPacket {
+    fn relay_addr(&self) -> SocketAddr {
+        target()
+    }
+
+    async fn send_packet(&self, _data: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn recv_packet(&self, _buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+}
+
+#[async_trait]
+impl PacketOutbound for FakeHop {
+    async fn dial_udp_transport(
+        &self,
+        node: &Node,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        panic!("hop '{}' must dial through the chain", node.name)
+    }
+
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        let mut call = self.record(&runtime, target, target_domain);
+        call.timeout = options.connect_timeout;
+        call.key_shares = Some(options.reality_key_shares);
+        let stream = self.act(call, carrier).await?.stream;
+        Ok(Arc::new(CarrierPacket(tokio::sync::Mutex::new(stream))))
+    }
+}
+
 struct Fakes {
     generation: Arc<OutboundRuntimeRegistry>,
     via: Node,
@@ -401,26 +592,27 @@ impl Fakes {
 
     fn handler(&self) -> ChainHandler {
         ChainHandler::new(vec![
-            (
-                NodeProtocol::AnyTLS,
-                self.front.clone() as Arc<dyn TcpOutbound>,
-            ),
-            (
-                NodeProtocol::Trojan,
-                self.land.clone() as Arc<dyn TcpOutbound>,
-            ),
+            ProtocolEntry::new(NodeProtocol::AnyTLS, self.front.clone()),
+            ProtocolEntry::new(NodeProtocol::Trojan, self.land.clone())
+                .with_packet(self.land.clone()),
         ])
     }
 
-    async fn dial(&self, connect_timeout: Duration) -> anyhow::Result<ProxyStream> {
-        self.handler()
-            .dial_runtime(
-                self.generation.get(&self.via.id).unwrap(),
-                target(),
-                Some("example.com"),
-                connect_timeout,
-            )
-            .await
+    /// The chain dial for TCP, or for UDP when `udp` is set.
+    async fn dial_on(&self, udp: bool, connect_timeout: Duration) -> anyhow::Result<()> {
+        let runtime = self.generation.get(&self.via.id).unwrap();
+        let domain = Some("example.com");
+        if udp {
+            self.handler()
+                .dial_udp_transport_runtime(runtime, target(), domain, connect_timeout)
+                .await
+                .map(drop)
+        } else {
+            self.handler()
+                .dial_runtime(runtime, target(), domain, connect_timeout)
+                .await
+                .map(drop)
+        }
     }
 
     fn calls(&self) -> Vec<Call> {
@@ -432,119 +624,138 @@ impl Fakes {
 
 #[tokio::test]
 async fn the_front_dials_its_own_runtime_toward_the_next_server() {
-    let fakes = Fakes::new(FakeHop::default(), FakeHop::default());
-    fakes.dial(Duration::from_secs(1)).await.unwrap();
-    let second = Duration::from_secs(1);
-    assert_eq!(
-        fakes.calls(),
-        [
-            Call {
-                hop: "front/runtime".into(),
-                target: "0.0.0.0:443".parse().unwrap(),
-                domain: Some("land.example".into()),
-                timeout: second,
-                key_shares: None,
-            },
-            Call {
-                hop: "land/over".into(),
-                target: target(),
-                domain: Some("example.com".into()),
-                timeout: second,
-                key_shares: Some(true),
-            },
-        ]
-    );
+    for udp in [false, true] {
+        let fakes = Fakes::new(FakeHop::default(), FakeHop::default());
+        fakes.dial_on(udp, Duration::from_secs(1)).await.unwrap();
+        let second = Duration::from_secs(1);
+        assert_eq!(
+            fakes.calls(),
+            [
+                Call {
+                    hop: "front/runtime".into(),
+                    target: "0.0.0.0:443".parse().unwrap(),
+                    domain: Some("land.example".into()),
+                    timeout: second,
+                    key_shares: None,
+                },
+                Call {
+                    hop: "land/over".into(),
+                    target: target(),
+                    domain: Some("example.com".into()),
+                    timeout: second,
+                    key_shares: Some(true),
+                },
+            ]
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_reality_mask_certificate_redials_the_chain_once_without_key_shares() {
-    let fakes = Fakes::new(
-        FakeHop::default(),
-        FakeHop {
-            masked: true,
-            ..Default::default()
-        },
-    );
-    fakes.dial(Duration::from_secs(1)).await.unwrap();
-    let hops: Vec<_> = fakes
-        .calls()
-        .into_iter()
-        .map(|call| (call.hop, call.key_shares))
-        .collect();
-    assert_eq!(
-        hops,
-        [
-            ("front/runtime".to_string(), None),
-            ("front/runtime".to_string(), None),
-            ("land/over".to_string(), Some(true)),
-            ("land/over".to_string(), Some(false)),
-        ]
-    );
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop::default(),
+            FakeHop {
+                masked: true,
+                ..Default::default()
+            },
+        );
+        fakes.dial_on(udp, Duration::from_secs(1)).await.unwrap();
+        let hops: Vec<_> = fakes
+            .calls()
+            .into_iter()
+            .map(|call| (call.hop, call.key_shares))
+            .collect();
+        assert_eq!(
+            hops,
+            [
+                ("front/runtime".to_string(), None),
+                ("front/runtime".to_string(), None),
+                ("land/over".to_string(), Some(true)),
+                ("land/over".to_string(), Some(false)),
+            ]
+        );
+    }
 }
 
 /// The first hop dials its server directly, where a REALITY dial has already
 /// retried once, so its mask certificate ends the chain dial.
 #[tokio::test]
 async fn a_reality_mask_certificate_on_the_first_hop_is_not_redialed() {
-    let fakes = Fakes::new(
-        FakeHop {
-            failure: Some(|| crate::reality::RealityMaskCertificate.into()),
-            ..Default::default()
-        },
-        FakeHop::default(),
-    );
-    let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
-    assert!(reality_mask_certificate(&error), "{error:#}");
-    let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
-    assert_eq!(hops, ["front/runtime"]);
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop {
+                failure: Some(|| crate::reality::RealityMaskCertificate.into()),
+                ..Default::default()
+            },
+            FakeHop::default(),
+        );
+        let error = fakes
+            .dial_on(udp, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(reality_mask_certificate(&error), "{error:#}");
+        let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
+        assert_eq!(hops, ["front/runtime"]);
+    }
 }
 
 /// A packet policy rejection keeps its class whichever hop raises it.
 #[tokio::test]
 async fn packet_rejections_pass_through_the_chain_unchanged() {
-    let rejection: fn() -> anyhow::Error = || crate::proxy::PacketRejection::Capacity.into();
-    for (front, land) in [(Some(rejection), None), (None, Some(rejection))] {
-        let fakes = Fakes::new(
-            FakeHop {
-                failure: front,
-                ..Default::default()
-            },
-            FakeHop {
-                failure: land,
-                ..Default::default()
-            },
-        );
-        let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
-        assert_eq!(
-            crate::proxy::packet_rejection(&error),
-            Some(crate::proxy::PacketRejection::Capacity),
-            "{error:#}"
-        );
-        assert!(!node_failure(&error), "{error:#}");
+    for udp in [false, true] {
+        let rejection: fn() -> anyhow::Error = || crate::proxy::PacketRejection::Capacity.into();
+        for (front, land) in [(Some(rejection), None), (None, Some(rejection))] {
+            let fakes = Fakes::new(
+                FakeHop {
+                    failure: front,
+                    ..Default::default()
+                },
+                FakeHop {
+                    failure: land,
+                    ..Default::default()
+                },
+            );
+            let error = fakes
+                .dial_on(udp, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                crate::proxy::packet_rejection(&error),
+                Some(crate::proxy::PacketRejection::Capacity),
+                "{error:#}"
+            );
+            assert!(!node_failure(&error), "{error:#}");
+        }
     }
 }
 
 #[tokio::test]
 async fn a_chain_failure_names_the_hop_that_failed() {
-    let failure: fn() -> anyhow::Error = || anyhow::anyhow!("handshake failed");
-    for (hop, front, land) in [(0, Some(failure), None), (1, None, Some(failure))] {
-        let fakes = Fakes::new(
-            FakeHop {
-                failure: front,
-                ..Default::default()
-            },
-            FakeHop {
-                failure: land,
-                ..Default::default()
-            },
-        );
-        let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
-        let hops = fakes.generation.get(&fakes.via.id).unwrap();
-        assert_eq!(
-            crate::proxy::failed_hop(&error).map(|failure| (failure.hop, failure.node)),
-            Some((hop, hops.chain_hops()[hop].node.id)),
-            "{error:#}"
-        );
+    for udp in [false, true] {
+        let failure: fn() -> anyhow::Error = || anyhow::anyhow!("handshake failed");
+        for (hop, front, land) in [(0, Some(failure), None), (1, None, Some(failure))] {
+            let fakes = Fakes::new(
+                FakeHop {
+                    failure: front,
+                    ..Default::default()
+                },
+                FakeHop {
+                    failure: land,
+                    ..Default::default()
+                },
+            );
+            let error = fakes
+                .dial_on(udp, Duration::from_secs(1))
+                .await
+                .unwrap_err();
+            let hops = fakes.generation.get(&fakes.via.id).unwrap();
+            assert_eq!(
+                crate::proxy::failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+                Some((hop, hops.chain_hops()[hop].node.id)),
+                "{error:#}"
+            );
+        }
     }
 }
 
@@ -553,44 +764,46 @@ async fn a_chain_failure_names_the_hop_that_failed() {
 /// leaves no transport evidence for the chain or its hops.
 #[tokio::test]
 async fn dropping_the_dial_after_the_first_hop_releases_everything() {
-    let fakes = Fakes::new(
-        FakeHop::default(),
-        FakeHop {
-            delay: Duration::from_secs(3600),
-            ..Default::default()
-        },
-    );
-    let runtime = fakes.generation.get(&fakes.via.id).unwrap();
-    let held = || {
-        runtime
-            .chain_hops()
-            .iter()
-            .map(Arc::strong_count)
-            .collect::<Vec<_>>()
-    };
-    let before = held();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        let dial = fakes.dial(Duration::from_secs(1));
-        tokio::pin!(dial);
-        while fakes.land.calls.lock().unwrap().is_empty() {
-            assert!(futures_util::poll!(&mut dial).is_pending());
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
-    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
-    assert_eq!(held(), before);
-    for hop in std::iter::once(&runtime).chain(runtime.chain_hops()) {
-        assert!(
-            hop.transport_quality()
-                .snapshot()
-                .iter()
-                .all(Option::is_none),
-            "{}",
-            hop.node.name
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop::default(),
+            FakeHop {
+                delay: Duration::from_secs(3600),
+                ..Default::default()
+            },
         );
+        let runtime = fakes.generation.get(&fakes.via.id).unwrap();
+        let held = || {
+            runtime
+                .chain_hops()
+                .iter()
+                .map(Arc::strong_count)
+                .collect::<Vec<_>>()
+        };
+        let before = held();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let dial = fakes.dial_on(udp, Duration::from_secs(1));
+            tokio::pin!(dial);
+            while fakes.land.calls.lock().unwrap().is_empty() {
+                assert!(futures_util::poll!(&mut dial).is_pending());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+        assert_eq!(held(), before);
+        for hop in std::iter::once(&runtime).chain(runtime.chain_hops()) {
+            assert!(
+                hop.transport_quality()
+                    .snapshot()
+                    .iter()
+                    .all(Option::is_none),
+                "{}",
+                hop.node.name
+            );
+        }
     }
 }
 
@@ -622,42 +835,52 @@ async fn warming_a_chain_does_not_apply_and_leaves_its_hops_cold() {
 
 #[tokio::test(start_paused = true)]
 async fn later_hops_get_what_remains_of_one_chain_deadline() {
-    let fakes = Fakes::new(
-        FakeHop {
-            delay: Duration::from_millis(250),
-            ..Default::default()
-        },
-        FakeHop::default(),
-    );
-    fakes.dial(Duration::from_millis(100)).await.unwrap();
-    let timeouts: Vec<_> = fakes.calls().into_iter().map(|call| call.timeout).collect();
-    assert_eq!(
-        timeouts,
-        [Duration::from_millis(100), Duration::from_millis(50)]
-    );
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop {
+                delay: Duration::from_millis(250),
+                ..Default::default()
+            },
+            FakeHop::default(),
+        );
+        fakes
+            .dial_on(udp, Duration::from_millis(100))
+            .await
+            .unwrap();
+        let timeouts: Vec<_> = fakes.calls().into_iter().map(|call| call.timeout).collect();
+        assert_eq!(
+            timeouts,
+            [Duration::from_millis(100), Duration::from_millis(50)]
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
 async fn the_chain_deadline_bounds_every_hop_together() {
-    let fakes = Fakes::new(
-        FakeHop {
-            delay: Duration::from_millis(200),
-            ..Default::default()
-        },
-        FakeHop {
-            delay: Duration::from_millis(200),
-            ..Default::default()
-        },
-    );
-    let started = Instant::now();
-    let error = fakes.dial(Duration::from_millis(100)).await.unwrap_err();
-    assert_eq!(started.elapsed(), Duration::from_millis(300));
-    assert_eq!(
-        error
-            .downcast_ref::<std::io::Error>()
-            .map(std::io::Error::kind),
-        Some(std::io::ErrorKind::TimedOut)
-    );
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop {
+                delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+            FakeHop {
+                delay: Duration::from_millis(200),
+                ..Default::default()
+            },
+        );
+        let started = Instant::now();
+        let error = fakes
+            .dial_on(udp, Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_millis(300));
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::TimedOut)
+        );
+    }
 }
 
 /// The whole chain runs inside the generation's dial scope. A generation that
@@ -733,7 +956,7 @@ async fn observed_milestones(
         }),
     );
     observer
-        .scope(fakes.dial(Duration::from_secs(1)))
+        .scope(fakes.dial_on(false, Duration::from_secs(1)))
         .await
         .unwrap();
     events.lock().unwrap().clone()
