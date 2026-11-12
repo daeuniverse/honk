@@ -336,11 +336,11 @@ impl ShadowsocksHandler {
 
     /// Shared dial tail: run the cipher-family prologue on the connected
     /// socket and return the inline codec stream (no relay task).
-    async fn start_relay(
+    async fn start_relay<T: stream::SsTransport>(
         &self,
         method: &str,
         password: &str,
-        server: TcpStream,
+        server: T,
         header: Vec<u8>,
         target: SocketAddr,
         target_domain: Option<&str>,

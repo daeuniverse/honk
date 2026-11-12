@@ -1,6 +1,6 @@
 use super::*;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
 #[test]
 fn test_evp_bytes_to_key() {
@@ -204,78 +204,107 @@ fn test_batched_decrypt_split_feeds() {
     assert_eq!(received, payload);
 }
 
-/// End-to-end TCP test: mock legacy-AEAD TCP server (salt + chunk
-/// codec), real `dial` through the inline `SsStream`, bulk data both
-/// ways (chunk boundaries crossed many times).
+/// Mock legacy-AEAD TCP server (salt + chunk codec): echoes every payload
+/// byte uppercased after skipping the 7-byte IPv4 target header.
+async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S) {
+    let method = "aes-128-gcm";
+    let password = "test-password";
+    let conf = CipherConf::for_method(method).unwrap();
+    let master = ShadowsocksHandler::master_key(password, conf.key_len);
+
+    // Read the client salt + derive the c2s cipher.
+    let mut c2s_salt = vec![0u8; conf.salt_len];
+    server.read_exact(&mut c2s_salt).await.unwrap();
+    let mut c2s_subkey = vec![0u8; conf.key_len];
+    hkdf_sha1_derive(&master, &c2s_salt, &mut c2s_subkey);
+    let c2s_cipher = AeadCipher::new(method, &c2s_subkey).unwrap();
+    let mut c2s_nonce = vec![0u8; conf.nonce_len];
+
+    // Send our salt back.
+    let mut s2c_salt = vec![0u8; conf.salt_len];
+    rand::rng().fill_bytes(&mut s2c_salt);
+    server.write_all(&s2c_salt).await.unwrap();
+    let mut s2c_subkey = vec![0u8; conf.key_len];
+    hkdf_sha1_derive(&master, &s2c_salt, &mut s2c_subkey);
+    let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
+    let mut s2c_nonce = vec![0u8; conf.nonce_len];
+
+    // Echo loop: decrypt chunks, uppercase the payload, re-seal.
+    // The first plaintext bytes are the target header (own chunk);
+    // skip them, echo the rest.
+    let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
+    let mut skip = header_len;
+    let mut buf = vec![0u8; 262144];
+    let mut carry = 0usize;
+    let mut pending_len = None;
+    loop {
+        let n = server.read(&mut buf[carry..]).await.unwrap();
+        if n == 0 {
+            return;
+        }
+        let total = carry + n;
+        let (out_len, rest) = decrypt_chunks_in_place(
+            &c2s_cipher,
+            &mut c2s_nonce,
+            &mut pending_len,
+            &mut buf,
+            total,
+            conf.tag_len,
+        )
+        .unwrap();
+        if out_len > 0 {
+            let start = skip.min(out_len);
+            skip -= start;
+            if start < out_len {
+                let upper: Vec<u8> = buf[start..out_len]
+                    .iter()
+                    .map(|b| b.to_ascii_uppercase())
+                    .collect();
+                let mut sealed = Vec::new();
+                seal_chunks_into(&s2c_cipher, &mut s2c_nonce, &upper, &mut sealed).unwrap();
+                server.write_all(&sealed).await.unwrap();
+            }
+        }
+        if rest > 0 {
+            buf.copy_within(out_len..out_len + rest, 0);
+        }
+        carry = rest;
+    }
+}
+
+/// Writes ~1MB in 8 uneven writes and expects it back uppercased.
+async fn assert_legacy_bulk_echo<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(stream: &mut S) {
+    let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    let mut off = 0;
+    for chunk in [3usize, 65536, 17, 262144, 999, 400_000, 131071, 271_329] {
+        let end = (off + chunk).min(payload.len());
+        stream.write_all(&payload[off..end]).await.unwrap();
+        off = end;
+    }
+    assert_eq!(off, payload.len());
+
+    let mut received = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_exact(&mut received),
+    )
+    .await
+    .expect("echo timed out")
+    .unwrap();
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(received, expected);
+}
+
+/// End-to-end TCP test: mock legacy-AEAD TCP server, real `dial` through
+/// the inline `SsStream`, bulk data both ways (chunk boundaries crossed
+/// many times).
 #[tokio::test]
 async fn test_dial_tcp_legacy_end_to_end() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut server, _) = listener.accept().await.unwrap();
-        let method = "aes-128-gcm";
-        let password = "test-password";
-        let conf = CipherConf::for_method(method).unwrap();
-        let master = ShadowsocksHandler::master_key(password, conf.key_len);
-
-        // Read the client salt + derive the c2s cipher.
-        let mut c2s_salt = vec![0u8; conf.salt_len];
-        server.read_exact(&mut c2s_salt).await.unwrap();
-        let mut c2s_subkey = vec![0u8; conf.key_len];
-        hkdf_sha1_derive(&master, &c2s_salt, &mut c2s_subkey);
-        let c2s_cipher = AeadCipher::new(method, &c2s_subkey).unwrap();
-        let mut c2s_nonce = vec![0u8; conf.nonce_len];
-
-        // Send our salt back.
-        let mut s2c_salt = vec![0u8; conf.salt_len];
-        rand::rng().fill_bytes(&mut s2c_salt);
-        server.write_all(&s2c_salt).await.unwrap();
-        let mut s2c_subkey = vec![0u8; conf.key_len];
-        hkdf_sha1_derive(&master, &s2c_salt, &mut s2c_subkey);
-        let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
-        let mut s2c_nonce = vec![0u8; conf.nonce_len];
-
-        // Echo loop: decrypt chunks, uppercase the payload, re-seal.
-        // The first plaintext bytes are the target header (own chunk);
-        // skip them, echo the rest.
-        let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
-        let mut skip = header_len;
-        let mut buf = vec![0u8; 262144];
-        let mut carry = 0usize;
-        let mut pending_len = None;
-        loop {
-            let n = server.read(&mut buf[carry..]).await.unwrap();
-            if n == 0 {
-                return;
-            }
-            let total = carry + n;
-            let (out_len, rest) = decrypt_chunks_in_place(
-                &c2s_cipher,
-                &mut c2s_nonce,
-                &mut pending_len,
-                &mut buf,
-                total,
-                conf.tag_len,
-            )
-            .unwrap();
-            if out_len > 0 {
-                let start = skip.min(out_len);
-                skip -= start;
-                if start < out_len {
-                    let upper: Vec<u8> = buf[start..out_len]
-                        .iter()
-                        .map(|b| b.to_ascii_uppercase())
-                        .collect();
-                    let mut sealed = Vec::new();
-                    seal_chunks_into(&s2c_cipher, &mut s2c_nonce, &upper, &mut sealed).unwrap();
-                    server.write_all(&sealed).await.unwrap();
-                }
-            }
-            if rest > 0 {
-                buf.copy_within(out_len..out_len + rest, 0);
-            }
-            carry = rest;
-        }
+        let (server, _) = listener.accept().await.unwrap();
+        mock_legacy_tcp_server(server).await;
     });
 
     let node = Node {
@@ -297,27 +326,31 @@ async fn test_dial_tcp_legacy_end_to_end() {
         .dial(&node, target, None, std::time::Duration::from_secs(3))
         .await
         .unwrap();
+    assert_legacy_bulk_echo(&mut stream.stream).await;
+}
 
-    // Bulk transfer both ways: ~1MB in 8 uneven writes.
-    let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
-    let mut off = 0;
-    for chunk in [3usize, 65536, 17, 262144, 999, 400_000, 131071, 271_329] {
-        let end = (off + chunk).min(payload.len());
-        stream.stream.write_all(&payload[off..end]).await.unwrap();
-        off = end;
-    }
-    assert_eq!(off, payload.len());
+/// The legacy dial tail over a non-TCP carrier: same wire codec, no
+/// physical socket underneath.
+#[tokio::test]
+async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
+    // Large enough to hold the whole echo while the client is still writing.
+    let (client, server) = tokio::io::duplex(4 << 20);
+    tokio::spawn(mock_legacy_tcp_server(server));
 
-    let mut received = vec![0u8; payload.len()];
-    tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        stream.stream.read_exact(&mut received),
-    )
-    .await
-    .expect("echo timed out")
-    .unwrap();
-    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
-    assert_eq!(received, expected);
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let header = addr::encode_address(target, None).unwrap();
+    let mut stream = ShadowsocksHandler::new()
+        .start_relay(
+            "aes-128-gcm",
+            "test-password",
+            Box::new(client),
+            header,
+            target,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_legacy_bulk_echo(&mut stream.stream).await;
 }
 
 /// A datagram the session cannot open is dropped; the next valid one is

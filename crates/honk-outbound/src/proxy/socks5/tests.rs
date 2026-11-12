@@ -892,49 +892,51 @@ async fn run_test_socks5_server() -> SocketAddr {
 
     tokio::spawn(async move {
         loop {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    // Simple SOCKS5 server: no auth, always succeed
-                    let mut buf = [0u8; 256];
-
-                    // Read greeting
-                    let _ = stream.read(&mut buf).await.unwrap();
-                    assert!(buf[0] == SOCKS5_VERSION);
-
-                    // Reply: no auth
-                    stream
-                        .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
-                        .await
-                        .unwrap();
-
-                    // Read request
-                    let _ = stream.read(&mut buf).await.unwrap();
-                    assert!(buf[0] == SOCKS5_VERSION);
-                    assert!(buf[1] == CMD_CONNECT);
-
-                    // Reply: success, bind to 0.0.0.0:0
-                    let reply = [
-                        SOCKS5_VERSION,
-                        REP_SUCCESS,
-                        0x00, // RSV
-                        ATYP_IPV4,
-                        0,
-                        0,
-                        0,
-                        0, // 0.0.0.0
-                        0,
-                        0, // port 0
-                    ];
-                    stream.write_all(&reply).await.unwrap();
-
-                    // Keep connection alive briefly for test
-                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                });
+            if let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(serve_test_socks5(stream));
             }
         }
     });
 
     addr
+}
+
+async fn serve_test_socks5<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S) {
+    // Simple SOCKS5 server: no auth, always succeed
+    let mut buf = [0u8; 256];
+
+    // Read greeting
+    let _ = stream.read(&mut buf).await.unwrap();
+    assert!(buf[0] == SOCKS5_VERSION);
+
+    // Reply: no auth
+    stream
+        .write_all(&[SOCKS5_VERSION, METHOD_NO_AUTH])
+        .await
+        .unwrap();
+
+    // Read request
+    let _ = stream.read(&mut buf).await.unwrap();
+    assert!(buf[0] == SOCKS5_VERSION);
+    assert!(buf[1] == CMD_CONNECT);
+
+    // Reply: success, bind to 0.0.0.0:0
+    let reply = [
+        SOCKS5_VERSION,
+        REP_SUCCESS,
+        0x00, // RSV
+        ATYP_IPV4,
+        0,
+        0,
+        0,
+        0, // 0.0.0.0
+        0,
+        0, // port 0
+    ];
+    stream.write_all(&reply).await.unwrap();
+
+    // Keep connection alive briefly for test
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 }
 
 #[tokio::test]
@@ -962,6 +964,18 @@ async fn test_socks5_handshake_no_auth() {
         )
         .await;
     assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn socks5_handshake_runs_over_a_non_tcp_stream() {
+    let (mut client, server) = tokio::io::duplex(4096);
+    let server = tokio::spawn(serve_test_socks5(server));
+    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+
+    Socks5Handler::handshake(&mut client, target, Some("example.com"), None, None)
+        .await
+        .unwrap();
+    server.await.unwrap();
 }
 
 mod shared_source;

@@ -6,7 +6,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
@@ -59,8 +59,8 @@ impl Socks5Handler {
     }
 
     /// Perform full SOCKS5 handshake.
-    async fn handshake(
-        stream: &mut TcpStream,
+    async fn handshake<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+        stream: &mut S,
         target: SocketAddr,
         target_domain: Option<&str>,
         username: Option<&str>,
