@@ -288,8 +288,18 @@ async fn paused_and_stopped_dns_refuse_literal_and_bootstrap_aliases() {
                 Some(honk_outbound::proxy::PacketRejection::Cancelled)
             );
         }
-        for unclaimed in ["literal.example", "bootstrap-target.example", "other.example"] {
-            assert!(service.resolve_node_host(unclaimed).await.unwrap().is_none());
+        for unclaimed in [
+            "literal.example",
+            "bootstrap-target.example",
+            "other.example",
+        ] {
+            assert!(
+                service
+                    .resolve_node_host(unclaimed)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
         }
         provider.finish_pause().await.unwrap();
         assert_eq!(current.lease_count(), 0);

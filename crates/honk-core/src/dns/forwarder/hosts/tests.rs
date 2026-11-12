@@ -3,9 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
-use honk_config::dns::{
-    DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRule,
-};
+use honk_config::dns::{DnsCond, DnsConfig, DnsDomainMatcher, DnsRequestAction, DnsRequestRule};
 use tempfile::{NamedTempFile, tempdir};
 use tokio::sync::Mutex;
 
@@ -265,10 +263,9 @@ async fn configured_sources_merge_in_order() {
     };
     let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
     let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
-    let forwarder =
-        DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
-            .with_hosts_from_config(&config)
-            .expect("merged hosts snapshot");
+    let forwarder = DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router)
+        .with_hosts_from_config(&config)
+        .expect("merged hosts snapshot");
 
     for (domain, last) in [
         ("first.test", 40),
@@ -293,8 +290,7 @@ fn enabled_hosts_load_failure_is_fatal_but_disabled_hosts_skips_io() {
     let mut config = DnsConfig::default();
     let router = Arc::new(DnsRouter::new_from_dns_config(&config).expect("DNS router"));
     let upstream: Arc<dyn DnsUpstreamPool> = Arc::new(CountingUpstream::default());
-    let forwarder =
-        DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router);
+    let forwarder = DnsForwarder::new(upstream, Arc::new(Mutex::new(DnsCache::new(100))), router);
 
     assert!(forwarder.clone().with_hosts_from_config(&config).is_ok());
     config.hosts.push(missing.to_string_lossy().into_owned());
@@ -769,14 +765,25 @@ async fn alias_rejects_unsupported_query_sections_before_io() {
         Default::default(),
         upstream.clone(),
     );
-    for (section, owner) in [(6, vec![0]), (8, vec![0]), (10, vec![0]), (10, vec![0xc0, 0x0e])] {
+    for (section, owner) in [
+        (6, vec![0]),
+        (8, vec![0]),
+        (10, vec![0]),
+        (10, vec![0xc0, 0x0e]),
+    ] {
         let mut query = build_dns_query("a.test", 1);
         query[section..section + 2].copy_from_slice(&1u16.to_be_bytes());
         query.extend_from_slice(&owner);
         query.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
         assert!(QueryContext::parse(&query).is_ok());
-        let error = forwarder.resolve_outcome(&query).await.expect_err("unsupported section");
-        assert!(error.to_string().contains("unsupported hosts alias query"), "{error}");
+        let error = forwarder
+            .resolve_outcome(&query)
+            .await
+            .expect_err("unsupported section");
+        assert!(
+            error.to_string().contains("unsupported hosts alias query"),
+            "{error}"
+        );
         assert!(upstream.queries.lock().unwrap().is_empty());
     }
 }
@@ -800,15 +807,23 @@ async fn alias_target_query_preserves_opt_options_flags_and_question_fields() {
             } else {
                 query.push(0);
             }
-            let opt = [0, 41, 0x05, 0x00, 0, 1, 0x80, 0x01, 0, 7, 0xfd, 0xe9, 0, 3, 1, 2, 3];
+            let opt = [
+                0, 41, 0x05, 0x00, 0, 1, 0x80, 0x01, 0, 7, 0xfd, 0xe9, 0, 3, 1, 2, 3,
+            ];
             query.extend_from_slice(&opt);
             assert!(!QueryContext::parse(&query).unwrap().is_cacheable());
-            forwarder.resolve_outcome(&query).await.expect("supported EDNS query");
+            forwarder
+                .resolve_outcome(&query)
+                .await
+                .expect("supported EDNS query");
             let captured = upstream.queries.lock().unwrap();
             let target = captured.last().unwrap();
             assert_eq!(&target[..12], &query[..12]);
             let parsed = QueryContext::parse(target).unwrap();
-            assert_eq!(parsed.qname().unwrap().to_domain_name().unwrap(), "longer.example");
+            assert_eq!(
+                parsed.qname().unwrap().to_domain_name().unwrap(),
+                "longer.example"
+            );
             assert_eq!(parsed.qtype().unwrap().get(), qtype);
             assert_eq!(parsed.qclass().unwrap().get(), 1);
             let end = parsed.question_offsets().unwrap().end();
@@ -838,11 +853,16 @@ async fn alias_preserves_small_truncated_target_without_authoritative_ips() {
         Default::default(),
         Arc::new(TruncatedUpstream),
     );
-    let outcome = forwarder.resolve_outcome_with_context_and_profile(
-        &build_dns_query("alias.test", 1),
-        DnsRequestMeta::EMPTY,
-        IngressProfile::Udp { advertised_size: 512 },
-    ).await.expect("truncated UDP outcome");
+    let outcome = forwarder
+        .resolve_outcome_with_context_and_profile(
+            &build_dns_query("alias.test", 1),
+            DnsRequestMeta::EMPTY,
+            IngressProfile::Udp {
+                advertised_size: 512,
+            },
+        )
+        .await
+        .expect("truncated UDP outcome");
     assert!(outcome.rendered().len() < 512);
     assert!(crate::dns::response::is_truncated(outcome.rendered()));
     assert!(crate::dns::response::is_truncated(outcome.reusable()));
@@ -882,14 +902,20 @@ async fn alias_preserves_extended_errors_and_emits_valid_badvers_opt() {
                 query[10..12].copy_from_slice(&1u16.to_be_bytes());
                 query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, version, 0x80, 0, 0, 0]);
             }
-            let outcome = forwarder.resolve_outcome(&query).await.expect("error outcome");
+            let outcome = forwarder
+                .resolve_outcome(&query)
+                .await
+                .expect("error outcome");
             let response = outcome.rendered();
             let decoded = QueryContext::parse(response).expect("valid error OPT");
             assert_eq!(&response[6..10], &[0, 0, 0, 0]);
             assert!(outcome.answer_ips().is_empty());
             if version.is_some() {
                 let opt = decoded.edns().expect("extended error requires OPT");
-                assert_eq!(u16::from(opt.extended_rcode()) * 16 + u16::from(rcode(response)), code);
+                assert_eq!(
+                    u16::from(opt.extended_rcode()) * 16 + u16::from(rcode(response)),
+                    code
+                );
                 assert_eq!(opt.version(), 0);
                 assert_eq!(opt.advertised_size(), 1232);
                 assert!(opt.dnssec_ok());
@@ -900,10 +926,6 @@ async fn alias_preserves_extended_errors_and_emits_valid_badvers_opt() {
             }
         }
     }
-}
-
-#[tokio::test]
-async fn address_hosts_keep_existing_edns_version_sanitization() {
     let forwarder = rules_forwarder(
         "full:address.test 192.0.2.81\n",
         Default::default(),
@@ -916,7 +938,10 @@ async fn address_hosts_keep_existing_edns_version_sanitization() {
         let outcome = forwarder.resolve_outcome(&query).await.unwrap();
         let decoded = QueryContext::parse(outcome.rendered()).unwrap();
         assert_eq!(decoded.edns().is_some(), version == 0);
-        assert_eq!(outcome.answer_ips(), &["192.0.2.81".parse::<IpAddr>().unwrap()]);
+        assert_eq!(
+            outcome.answer_ips(),
+            &["192.0.2.81".parse::<IpAddr>().unwrap()]
+        );
     }
 }
 
@@ -945,7 +970,10 @@ async fn alias_rejects_zero_short_and_trailing_cname_rdata_without_partial_succe
             Arc::new(MalformedCnameUpstream(rdata.clone())),
         );
         assert!(
-            forwarder.resolve_outcome(&build_dns_query("alias.test", 1)).await.is_err(),
+            forwarder
+                .resolve_outcome(&build_dns_query("alias.test", 1))
+                .await
+                .is_err(),
             "accepted malformed CNAME RDATA {rdata:?}"
         );
     }
@@ -977,12 +1005,17 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
             upstream.clone(),
             Arc::new(Mutex::new(DnsCache::new(100))),
             router,
-        ).with_policy_from_config(&config).unwrap();
-        forwarder.hosts = Some(Arc::new(HostsFile::parse_rules(
-            "full:alias.test upstream.test\n",
-        ).unwrap()));
+        )
+        .with_policy_from_config(&config)
+        .unwrap();
+        forwarder.hosts = Some(Arc::new(
+            HostsFile::parse_rules("full:alias.test upstream.test\n").unwrap(),
+        ));
         for _ in 0..2 {
-            let outcome = forwarder.resolve_outcome(&build_dns_query("alias.test", 1)).await.unwrap();
+            let outcome = forwarder
+                .resolve_outcome(&build_dns_query("alias.test", 1))
+                .await
+                .unwrap();
             assert_eq!(outcome.status(), OutcomeStatus::Rejected);
             assert!(outcome.answer_ips().is_empty());
             assert_eq!(outcome.domain(), "alias.test");
@@ -990,18 +1023,30 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
             assert!(!outcome.expiry().is_cacheable());
             assert_eq!(outcome.provenance(), Provenance::Fresh);
             assert_eq!(outcome.logical_upstream(), None);
-            let target = forwarder.resolve_outcome(&build_dns_query("upstream.test", 1)).await.unwrap();
+            let target = forwarder
+                .resolve_outcome(&build_dns_query("upstream.test", 1))
+                .await
+                .unwrap();
             assert_eq!(outcome.final_upstream(), target.final_upstream());
             assert_eq!(outcome.requery_history(), target.requery_history());
             assert_eq!(outcome.final_upstream().is_some(), response_reject);
             #[cfg(feature = "native-api")]
             {
                 assert_eq!(outcome.cache_entry_id(), None);
-                assert_eq!(outcome.request_route().source, crate::dns::outcome::RouteSource::Default);
+                assert_eq!(
+                    outcome.request_route().source,
+                    crate::dns::outcome::RouteSource::Default
+                );
                 assert!(outcome.request_route().rule.is_none());
-                assert_eq!(target.request_route().source, crate::dns::outcome::RouteSource::Routing);
+                assert_eq!(
+                    target.request_route().source,
+                    crate::dns::outcome::RouteSource::Routing
+                );
             }
         }
-        assert_eq!(upstream.names.lock().unwrap().len(), usize::from(response_reject));
+        assert_eq!(
+            upstream.names.lock().unwrap().len(),
+            usize::from(response_reject)
+        );
     }
 }

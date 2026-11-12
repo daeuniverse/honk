@@ -234,7 +234,10 @@ async fn alias_failures_preserve_routing_projection() {
     ] {
         config.hosts = vec![hosts.path().to_string_lossy().into_owned()];
         let mut response = if rcode == 0 {
-            a_response(&query_with_txid("target.example", 0x5151), [198, 51, 100, 20])
+            a_response(
+                &query_with_txid("target.example", 0x5151),
+                [198, 51, 100, 20],
+            )
         } else {
             response_with_txid("target.example", 0x5151)
         };

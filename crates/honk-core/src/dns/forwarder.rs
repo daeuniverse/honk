@@ -601,7 +601,10 @@ mod response {
     }
 
     pub(super) fn append_edns(response: &mut Vec<u8>, query: &QueryContext, rcode: u16) {
-        if let Some(edns) = query.edns().filter(|edns| edns.version() == 0 || rcode > 15) {
+        if let Some(edns) = query
+            .edns()
+            .filter(|edns| edns.version() == 0 || rcode > 15)
+        {
             response[10..12].copy_from_slice(&1u16.to_be_bytes());
             response.extend_from_slice(&[0, 0, 41]);
             response.extend_from_slice(&edns.advertised_size().to_be_bytes());

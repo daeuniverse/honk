@@ -406,8 +406,10 @@ impl DnsController {
             _ => None,
         };
         let observation = if crate::dns::response::is_truncated(outcome.reusable())
-            || !matches!(crate::dns::response::response_rcode(outcome.reusable()), Ok(0 | 3))
-        {
+            || !matches!(
+                crate::dns::response::response_rcode(outcome.reusable()),
+                Ok(0 | 3)
+            ) {
             ProjectionObservation::Retain
         } else {
             match (outcome.status(), outcome.response_class(), family) {

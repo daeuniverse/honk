@@ -617,14 +617,9 @@ impl DnsForwarder {
     }
 }
 
-fn retarget_query(
-    raw_query: &[u8],
-    query: &QueryContext,
-    target: &str,
-) -> anyhow::Result<Vec<u8>> {
+fn retarget_query(raw_query: &[u8], query: &QueryContext, target: &str) -> anyhow::Result<Vec<u8>> {
     anyhow::ensure!(
-        raw_query[4..10] == [0, 1, 0, 0, 0, 0]
-            && matches!(&raw_query[10..12], [0, 0] | [0, 1]),
+        raw_query[4..10] == [0, 1, 0, 0, 0, 0] && matches!(&raw_query[10..12], [0, 0] | [0, 1]),
         "unsupported hosts alias query sections"
     );
     let question_end = query
@@ -664,7 +659,11 @@ fn alias_response(
     target: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let rcode = crate::dns::response::response_rcode(target)?;
-    let rcode = if rcode > 15 && query.edns().is_none() { 2 } else { rcode };
+    let rcode = if rcode > 15 && query.edns().is_none() {
+        2
+    } else {
+        rcode
+    };
     let (mut response, question_name) = response_prefix(
         raw_query,
         query,
@@ -727,7 +726,10 @@ fn copy_answers(response: &mut Vec<u8>, target: &[u8], qtype: u16) -> anyhow::Re
         if record_type == 5 {
             let mut alias = [0; 255];
             let (alias_length, encoded_end) = parse_name_into(target, rdata_start, &mut alias)?;
-            anyhow::ensure!(encoded_end == rdata_end, "malformed alias target CNAME RDATA");
+            anyhow::ensure!(
+                encoded_end == rdata_end,
+                "malformed alias target CNAME RDATA"
+            );
             response.extend_from_slice(&name[..owner_length]);
             response.extend_from_slice(&fixed[..8]);
             response.extend_from_slice(&(alias_length as u16).to_be_bytes());

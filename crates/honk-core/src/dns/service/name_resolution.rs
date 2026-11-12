@@ -394,11 +394,9 @@ impl DnsService {
             if let Some(upstream) = claimed_upstream(&forwarder, &target) {
                 return resolve_claimed(self, &forwarder, &target, upstream).await;
             }
-            let result = honk_outbound::bootstrap::resolve_with(
-                honk_outbound::bootstrap::global(),
-                &target,
-            )
-            .await;
+            let result =
+                honk_outbound::bootstrap::resolve_with(honk_outbound::bootstrap::global(), &target)
+                    .await;
             result.map_err(|source| {
                 NameResolutionError::Bootstrap {
                     domain: target,
