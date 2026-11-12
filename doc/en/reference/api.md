@@ -14,7 +14,7 @@ Enable the opt-in `native-api` Cargo feature with `--features native-api` (or `n
 
 The listener remains disabled until you enable [`experimental.native_api`](./experimental.md#native_api). `.dae` remains the configuration format. Source administration edits the `-c` files, or with `--store db` records revisions in a SQLite configuration db ([Configuration db](#configuration-db---store-db)).
 
-The native contract, including authentication, node/provider management, geodata and automatic-policy overrides, is [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f). `crates/honk-core/tests/fixtures/native_api_openapi.yaml` tracks this bundle. Native runtime mode remains gated, and `full_transparency` is not advertised.
+The native contract, including authentication, node/provider management, geodata and automatic-policy overrides, is based on [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f), with local extensions including `read_only_reason` and geodata cron schedules. `crates/honk-core/tests/fixtures/native_api_openapi.yaml` defines the locally tested contract. Native runtime mode remains gated, and `full_transparency` is not advertised.
 
 Source administration requires a captured `.dae` startup. Writes additionally require `config_write` and either a nonempty secret or `password_auth`. Discover current capabilities and source permissions rather than inferring availability from route names.
 
@@ -354,7 +354,7 @@ Unrepresentable or oversized text and step/byte overflow remain explicit partial
 
 `Node.stream_transport` is an optional nullable string projected from accepted Trojan/VMess/VLESS configuration: `tcp`, `ws`, `grpc` or `xhttp` (including the `splithttp` alias). Honk returns null when unrecognized or inapplicable. It describes configured transport, not negotiation or health.
 
-`protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture copies the doona contract bundle with its `read_only_reason` extension (SHA-256 `9f780ba92f13218ed7bc52e9a9af79a960d241ce6552a45522b41c30fc04faa0`).
+`protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture derives from the doona contract bundle with local extensions including `read_only_reason` and geodata cron schedules (local fixture SHA-256 `70cff8d8d331cb5da67dfd48f2775acdda572ba90962439708b0c658629b2afe`).
 
 This pin does not identify a published frontend release.
 
@@ -1034,8 +1034,6 @@ If the file names no URL for an asset, a URL list from an earlier file is delete
 | `config` | Every stored list came from the configuration file. |
 | `override` | At least one stored list came from a URL patch. |
 | `default` | No list is stored. Built-in MetaCubeX `meta-rules-dat` release files apply, from raw.githubusercontent.com first and fastly.jsdelivr.net second. |
-
-Automatic updates are on by default, with a 24-hour interval.
 
 `download.route` selects the route for every geodata request, including checksums: `routing`, the default, follows the routing rules like user traffic. `group` forces the group in `group_id`, the ID `GET /groups` reports. `direct` dials the host over the bypass mark with the bootstrap resolver.
 

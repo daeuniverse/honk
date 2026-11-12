@@ -14,7 +14,7 @@
 
 监听器默认关闭，须显式启用 [`experimental.native_api`](./experimental.md#native_api)。`.dae` 仍是配置格式；显式授权后可读取与替换 `-c` 指定的已接受源文件，或以 `--store db` 把修订记录保存在 SQLite 配置数据库中（见[配置数据库](#配置数据库--store-db)）。
 
-原生契约（包括认证、节点与订阅源管理、地理数据及自动策略覆盖）为 [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f)。`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 跟踪该契约包。原生运行模式仍未开放，不声明 `full_transparency`。
+原生契约（包括认证、节点与订阅源管理、地理数据及自动策略覆盖）基于 [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f)，并包含 `read_only_reason`、geodata cron 计划等本地扩展。`crates/honk-core/tests/fixtures/native_api_openapi.yaml` 定义本地测试使用的契约。原生运行模式仍未开放，不声明 `full_transparency`。
 
 源管理要求真实 `.dae` 启动，写入还需启用 `config_write` 并配置非空 `secret` 或 `password_auth`。可用功能以能力声明和逐源权限为准，不按路由名称推断。
 
@@ -337,7 +337,7 @@ Score 的 `previous_leaf_node_id` 与 `previous_member_id` 分开：叶节点历
 
 `Node.stream_transport` 是可选、可为 null 的字符串，投影已接受的 Trojan/VMess/VLESS 配置：`tcp`、`ws`、`grpc` 或 `xhttp`（包括 `splithttp` 别名）。无法识别或不适用时，honk 返回 null。该字段表示配置的传输方式，不表示协商结果或健康状态。
 
-`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、路径、extra 选项或链接。测试固定数据复制 doona 契约包，保留其 `read_only_reason` 扩展（SHA-256 `9f780ba92f13218ed7bc52e9a9af79a960d241ce6552a45522b41c30fc04faa0`）。
+`protocol` 与 TCP/UDP 健康传输字段的含义不变。它不暴露凭据、host、路径、extra 选项或链接。测试固定数据源自 doona 契约包，并包含 `read_only_reason`、geodata cron 计划等本地扩展（本地文件 SHA-256 `70cff8d8d331cb5da67dfd48f2775acdda572ba90962439708b0c658629b2afe`）。
 
 此固定版本不代表已发布的前端版本。
 
@@ -973,8 +973,6 @@ HTTPS 验证证书。直连请求只用配置的数字地址 `global.bootstrap_r
 | `config` | 已存储的列表全部来自配置文件。 |
 | `override` | 至少一个已存储列表来自 API URL 修改。 |
 | `default` | 没有已存储列表。使用内置 MetaCubeX `meta-rules-dat` 发布文件，先尝试 raw.githubusercontent.com，再尝试 fastly.jsdelivr.net。 |
-
-自动更新默认开启，间隔默认 24 小时。
 
 `download.route` 决定每个 geodata 请求（包括校验文件）的出口。`routing` 为默认值，与用户流量一样遵循路由规则。`group` 始终经过 `group_id` 指定的组，该 ID 即 `GET /groups` 返回的 ID。
 
