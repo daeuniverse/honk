@@ -1046,6 +1046,7 @@ async fn get_outbound_stats(State(s): State<Arc<ClashState>>) -> Json<serde_json
     let quic = honk_outbound::quic::quic_stats_snapshot();
     Json(serde_json::json!({
         "outbounds": per_outbound,
+        "xdp": s.stats.xdp_json(true),
         "dns": {
             "socketAdmission": {
                 "refused": dns.socket_admission_refused,

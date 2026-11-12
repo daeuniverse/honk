@@ -1133,6 +1133,14 @@ Global 绑定稳定身份，目标消失后新流量失败时拒绝转发，不�
 
 正常 no-op 接受也触发重置，provider/network 更新不触发。
 
+XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包含 `state`、`state_changed_at_unix_ms` 和 `queue_count`；`detail=full` 增加 `queues` 与 `truncated`。Clash `GET /stats` 的 `xdp` 使用同一完整投影。尚未安装 XDP owner（包括 TC/TUN）时为 null；生产者不依赖任一 HTTP feature。每个 XDP 投影至多 64 KiB；`truncated: true` 表示只容纳了按准入设备/队列顺序排列的前若干项，`queue_count` 仍为全部已准入队列数。
+
+每队列保留真实 `namespace_cookie`、`attachment_generation`、`ifindex`、`queue_id`、实际 `mode`（`copy` 或 `zerocopy`）、`ring_capacity` 以及 RX/control/bulk frame 容量。一个物理队列可服务多个逻辑 realm。`sequence`、`attempted_at_unix_ms` 和 `last_success_at_unix_ms` 分别标识采样次数、最近尝试与最近成功的 socket 读取；时间为十进制 Unix 毫秒字符串，所有完整宽度整数均为十进制字符串，序列和错误计数饱和。`socket` 保存六项原始累计 XDP_STATISTICS：`rx_dropped`、`rx_invalid_descs`、`tx_invalid_descs`、`rx_ring_full`、`rx_fill_ring_empty_descs`、`tx_ring_empty_descs`。`rings` 保存 `rx`、`tx`、`fill`、`cq` 的原始 u32 `producer`/`consumer` 索引；索引会回绕，单位为 descriptor，不是包数。
+
+采样不受 DEBUG 过滤影响，只在既有 owner turn 中至多每秒执行一次，正常 socket 关闭前另取最终样本。不增加空闲 timer，安静队列可能保留较旧样本。Socket、ring、各队列均顺序读取，不是跨计数器/ring/队列的原子快照。`socket_available: false` 且 `socket: null` 表示尚未观测或不可用，不代表零丢包；尝试失败后 `socket_error` 为 `statistics_unavailable`，`socket_errno` 有值时保留数字 errno，即使错误无 errno 也增加 `socket_read_errors`。失败可保留旧 `last_success_at_unix_ms`，但不会将旧成功计数冒充本次数据。统计读取失败不终止 capture。`rx_fill_ring_empty_descs` 是内核空 FILL 事件，不是丢包率；当前 FILL 有内容不能否定历史饥饿。不会相加为总丢包，也不推导速率或增量。
+
+生命周期从真实激活前的 `starting` 进入 `active`；关闭 capture admission 后为 `closing`，完成 socket 拆除后为 `closed`，失败且保留 capture 所有权/UMEM 时为终态 `failed_retained`。终态不再改变生命周期；策略重载保留同一 attachment 身份和计数。HTTP 只读保留值，不读取 socket、不推进序列、不重置计数，也不改变 polling/admission。诊断读者在持有观测期间保留其内存计费，不持有 Port、FD 或包 lease。
+
 关闭时间没有硬上限。abort async 外层不会取消已开始的 blocking 工作。StateTick 维护所有者超过名义停止期限后告警，继续等待实际 SQLite 工作。
 
 凭据 KDF/数据库工作及已开始的系统解析/NSS 同样保留真实等待结束。可选的[业务连接宽限等待](./global.md#关闭)不允许在清理阶段超期时丢弃所有者来声称成功。
@@ -1309,6 +1317,7 @@ URLTest、LoadBalance、Fallback 与 Score 拒绝手动选择。
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

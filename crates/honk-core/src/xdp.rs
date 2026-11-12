@@ -18,6 +18,7 @@ use crate::control::{
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
 use crate::netlink::fib::{Fib, LogicalLink};
+use crate::stats::xdp::{Diagnostics, Lifecycle, QueueObservation};
 use anyhow::{Context as _, ensure};
 use honk_config::{
     Config,
@@ -54,7 +55,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::io::unix::AsyncFd;
 
@@ -250,6 +251,50 @@ struct PressureCounters {
     capture_rejected: u64,
 }
 
+fn diagnostics(devices: &[Device], budget: &Arc<MemoryBudget>) -> io::Result<Arc<Diagnostics>> {
+    Diagnostics::new(
+        budget,
+        devices.iter().map(|device| device.queues.len()).sum(),
+        devices.iter().flat_map(|device| {
+            device.queues.iter().map(|queue| QueueObservation {
+                namespace: device.capture.authority.namespace_cookie,
+                attachment: device.capture.authority.attachment_generation,
+                ifindex: device.info.ifindex,
+                queue: queue.id,
+                zero_copy: queue.io.get_ref().zerocopy(),
+                ring_capacity: device.port_config.ring_size,
+                rx_frames: device.port_config.rx_frames,
+                control_frames: device.port_config.control_frames,
+                bulk_frames: device.port_config.bulk_frames,
+                sequence: 0,
+                attempted_at: None,
+                succeeded_at: None,
+                socket: None,
+                errno: None,
+                read_errors: 0,
+                rings: None,
+            })
+        }),
+    )
+}
+
+fn sample_queues(devices: &[Device], diagnostics: &Diagnostics) {
+    let at = SystemTime::now();
+    let mut index = 0;
+    for device in devices {
+        for queue in &device.queues {
+            let port = queue.io.get_ref();
+            let socket = port.stats();
+            let rings = port.rings();
+            tracing::debug!(interface = %device.info.name, queue = queue.id,
+                socket = ?socket, rings = ?rings, counters = ?port.counters(),
+                "XDP queue pressure");
+            diagnostics.sample(index, at, socket, rings);
+            index += 1;
+        }
+    }
+}
+
 struct Pressure {
     counters: PressureCounters,
     previous: PressureCounters,
@@ -289,20 +334,11 @@ impl Pressure {
         waiting: usize,
         pending: usize,
         peers: usize,
-        devices: &[Device],
-    ) {
+    ) -> bool {
         if now.saturating_duration_since(self.checked) < Duration::from_secs(1) {
-            return;
+            return false;
         }
         self.checked = now;
-        for device in devices {
-            for queue in &device.queues {
-                let port = queue.io.get_ref();
-                tracing::debug!(interface = %device.info.name, queue = queue.id,
-                    socket = ?port.stats(), rings = ?port.rings(), counters = ?port.counters(),
-                    "XDP queue pressure");
-            }
-        }
         let core = core.map(RoutedCore::counters).unwrap_or_default();
         let diagnostics_changed = self.counters != self.previous || core != self.core;
         let active = self.refusing(core);
@@ -318,6 +354,7 @@ impl Pressure {
         self.previous = self.counters;
         self.core = core;
         self.counters.refused = false;
+        true
     }
 }
 struct Realm {
@@ -450,6 +487,7 @@ struct Runtime {
     staging: Vec<u8>,
     closing: bool,
     pressure: Pressure,
+    diagnostics: Arc<Diagnostics>,
     core_maintenance_checked: Instant,
     polling: AdaptivePoll,
     polling_prefix: Result<ContextDigest, &'static str>,
@@ -472,6 +510,7 @@ impl Runtime {
     fn close_capture(&mut self) -> anyhow::Result<()> {
         self.admission.store(false, Ordering::Release);
         self.closing = true;
+        self.diagnostics.lifecycle(Lifecycle::Closing);
         self.policy_recheck = false;
         self.context_recheck = false;
         self.polling.leave("closing");
@@ -1204,6 +1243,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.admission.store(false, Ordering::Release);
+        self.diagnostics.lifecycle(Lifecycle::FailedRetained);
         for device in &self.devices {
             if device.active
                 && let Err(error) = device.attachment.guard(&device.programs)
@@ -1677,14 +1717,15 @@ where
     R: Future<Output = PolicyRead<'policy>>,
 {
     let mut failure = None;
-    runtime.pressure.sample(
+    if runtime.pressure.sample(
         Instant::now(),
         runtime.core.as_ref(),
         runtime.waiting.len(),
         runtime.pending.len(),
         runtime.peers.len(),
-        &runtime.devices,
-    );
+    ) {
+        sample_queues(&runtime.devices, &runtime.diagnostics);
+    }
     if reader.is_none() && runtime.core.is_some() && runtime.core_due(Instant::now()) {
         reader.set(acquire());
     }
@@ -1775,14 +1816,19 @@ pub(crate) async fn run(
         mut link_proof,
         polling_prefix,
         polling_budget,
+        diagnostics,
     ) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
     };
+    plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) =
         match PacketEndpoints::start_driven(plane, scope_pairs, 64, None) {
             Ok(started) => started,
-            Err(error) => return (None, Err(error)),
+            Err(error) => {
+                diagnostics.lifecycle(Lifecycle::FailedRetained);
+                return (None, Err(error));
+            }
         };
     let realms = realms
         .into_iter()
@@ -1815,6 +1861,7 @@ pub(crate) async fn run(
         staging,
         closing: false,
         pressure: Pressure::new(Instant::now()),
+        diagnostics,
         core_maintenance_checked: Instant::now(),
         polling: AdaptivePoll::new(polling_publication, process_polling),
         polling_prefix,
@@ -1900,6 +1947,7 @@ pub(crate) async fn run(
     drop(link_proof);
     let mut failure = activate.err();
     if failure.is_none() {
+        runtime.diagnostics.lifecycle(Lifecycle::Active);
         tracing::info!(interfaces = runtime.devices.len(), "XDP datapath ready");
         if let Err(error) =
             libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
@@ -1943,6 +1991,7 @@ pub(crate) async fn run(
                 Err(error) => {
                     tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
                     failure.get_or_insert(error);
+                    runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
                     std::mem::forget((runtime, owner));
                     return (None, Err(failure.unwrap()));
                 }
@@ -1992,12 +2041,14 @@ pub(crate) async fn run(
     {
         tracing::error!(%error, "XDP terminal drain failed; retaining owners and UMEM until process exit");
         failure.get_or_insert(error.into());
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
         if let Err(error) = owner.fail_control().await {
             failure.get_or_insert(error);
         }
         std::mem::forget((runtime, joined));
         return (None, Err(failure.unwrap()));
     }
+    sample_queues(&runtime.devices, &runtime.diagnostics);
     for device in &mut runtime.devices {
         for queue in device.queues.drain(..) {
             let mut port = queue.io.into_inner();
@@ -2009,6 +2060,7 @@ pub(crate) async fn run(
             port.close_socket();
         }
     }
+    runtime.diagnostics.lifecycle(Lifecycle::Closed);
     if let Err(error) = backend.write().await.cleanup().await {
         failure.get_or_insert(error);
     }
@@ -2038,6 +2090,7 @@ type PreparedRuntime = (
     Fib,
     Result<ContextDigest, &'static str>,
     Arc<MemoryBudget>,
+    Arc<Diagnostics>,
 );
 
 #[cold]
@@ -2189,7 +2242,7 @@ async fn prepare(
     };
     let mut devices = Vec::with_capacity(infos.len());
     for (device_index, info) in infos.into_iter().enumerate() {
-        let (port_config, scope_bulk_frames) = device_sizing(info.mtu);
+        let (port_config, _) = device_sizing(info.mtu);
         let incarnation = ScopeId::allocate()
             .context("XDP attachment identity exhausted")?
             .as_u64();
@@ -2227,22 +2280,6 @@ async fn prepare(
                     .is_ok_and(|observed| observed == namespace)),
             "queue capture namespace changed"
         );
-        for link in links
-            .logical_links()
-            .filter(|link| link.path.physical_ifindex == info.ifindex)
-        {
-            let ingress = Ingress {
-                scope: routing_scope,
-                namespace,
-                ifindex: link.ifindex,
-                attachment: incarnation,
-                mark: MarkProvenance::BeforeSkb,
-            };
-            let (scope, scope_owner) =
-                capture_scope(link.mtu, realm_count, scope_bulk_frames, &budget)?;
-            realms.push((ingress, devices.len(), link, scope.scope()));
-            scope_pairs.push((scope, scope_owner));
-        }
         let mut queues = Vec::with_capacity(ports.len());
         for (id, mut port) in info.queues.iter().copied().zip(ports) {
             port.refill()?;
@@ -2271,6 +2308,26 @@ async fn prepare(
             port_config,
             role: datapath.interfaces[device_index].role,
         });
+    }
+    let diagnostics = diagnostics(&devices, &budget)?;
+    for (device_index, device) in devices.iter().enumerate() {
+        let (_, scope_bulk_frames) = device_sizing(device.info.mtu);
+        for link in links
+            .logical_links()
+            .filter(|link| link.path.physical_ifindex == device.info.ifindex)
+        {
+            let ingress = Ingress {
+                scope: routing_scope,
+                namespace,
+                ifindex: link.ifindex,
+                attachment: device.capture.authority.attachment_generation,
+                mark: MarkProvenance::BeforeSkb,
+            };
+            let (scope, scope_owner) =
+                capture_scope(link.mtu, realm_count, scope_bulk_frames, &budget)?;
+            realms.push((ingress, device_index, link, scope.scope()));
+            scope_pairs.push((scope, scope_owner));
+        }
     }
     let ingresses: Vec<_> = realms.iter().map(|(ingress, ..)| *ingress).collect();
     let core = if let Some(authority) = authority {
@@ -2311,6 +2368,7 @@ async fn prepare(
         links,
         polling_prefix,
         budget,
+        diagnostics,
     ))
 }
 
@@ -2337,13 +2395,23 @@ mod tests {
             pressure.next_deadline(None),
             Some(start + Duration::from_secs(1))
         );
-        pressure.sample(start + Duration::from_secs(1), None, 0, 0, 0, &[]);
+        assert!(!pressure.sample(
+            start + Duration::from_secs(1) - Duration::from_nanos(1),
+            None,
+            0,
+            0,
+            0,
+        ));
+        assert_eq!(pressure.checked, start);
+        assert!(pressure.counters.refused);
+        assert!(pressure.sample(start + Duration::from_secs(1), None, 0, 0, 0));
+        assert!(!pressure.sample(start + Duration::from_secs(1), None, 0, 0, 0));
         assert!(pressure.active);
         assert_eq!(
             pressure.next_deadline(None),
             Some(start + Duration::from_secs(2))
         );
-        pressure.sample(start + Duration::from_secs(2), None, 0, 0, 0, &[]);
+        assert!(pressure.sample(start + Duration::from_secs(2), None, 0, 0, 0));
         assert!(!pressure.active);
         assert_eq!(pressure.next_deadline(None), None);
         pressure.core.core_capacity = u64::MAX;

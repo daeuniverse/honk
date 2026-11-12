@@ -299,7 +299,9 @@ async fn start_runtime(
         mut links,
         polling_prefix,
         polling_budget,
+        diagnostics,
     ) = prepare(&plane, config, pins).await?;
+    plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) =
         PacketEndpoints::start_driven(plane, scopes, 64, None)?;
     let realms = plans
@@ -333,6 +335,7 @@ async fn start_runtime(
         staging,
         closing: false,
         pressure: Pressure::new(Instant::now()),
+        diagnostics,
         core_maintenance_checked: Instant::now(),
         polling: AdaptivePoll::new(polling_publication, process_polling),
         polling_prefix,
@@ -366,6 +369,7 @@ async fn start_runtime(
         device.attachment.replace(&device.programs)?;
         device.active = true;
     }
+    runtime.diagnostics.lifecycle(Lifecycle::Active);
     let indices: Vec<_> = runtime
         .devices
         .iter()

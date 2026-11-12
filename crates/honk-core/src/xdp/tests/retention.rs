@@ -884,7 +884,7 @@ async fn full_live_peer_table_refuses_then_recovers_after_actual_tcp_retirement(
         assert!(!endpoints.retains(scopes[0].scope(), newcomer, destination, 6));
         let mut pressure = Pressure::new(now);
         pressure.counters = counters;
-        pressure.sample(now + Duration::from_secs(1), None, 0, 0, peers.len(), &[]);
+        assert!(pressure.sample(now + Duration::from_secs(1), None, 0, 0, peers.len()));
         assert!(pressure.active);
         counters.refused = false;
         let (syn, mut flow) = scopes[0].poll_accept().unwrap();
@@ -904,7 +904,7 @@ async fn full_live_peer_table_refuses_then_recovers_after_actual_tcp_retirement(
         assert!(endpoints.retains(scopes[0].scope(), newcomer, destination, 6));
         assert_eq!(scopes[0].stats().unwrap().half_open, 1024);
         pressure.counters = counters;
-        pressure.sample(now + Duration::from_secs(2), None, 0, 0, peers.len(), &[]);
+        assert!(pressure.sample(now + Duration::from_secs(2), None, 0, 0, peers.len()));
         assert!(
             !pressure.active,
             "successful reclamation is not a resource refusal"

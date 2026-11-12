@@ -40,6 +40,8 @@ struct Datapath {
     visibility: &'static str,
     ebpf: Option<EbpfDetail>,
     errors: Vec<SafeError>,
+    #[serde(rename = "x-honk", skip_serializing_if = "Option::is_none")]
+    extension: Option<Value>,
 }
 
 /// The kernel detail is optional in the contract: `detail=summary` (the
@@ -260,6 +262,7 @@ fn detail(observation: DatapathObservation, instance: &str, healthy: bool, full:
             }),
         }),
         errors: observation.errors.into_iter().map(safe_error).collect(),
+        extension: None,
     }
 }
 
@@ -277,7 +280,9 @@ pub(super) async fn get(
             state.healthy.load(Ordering::Acquire),
         )
     };
-    Ok(Json(detail(observation, &state.instance_id, healthy, full)).into_response())
+    let mut datapath = detail(observation, &state.instance_id, healthy, full);
+    datapath.extension = Some(json!({"xdp": state.stats.xdp_json(full)}));
+    Ok(Json(datapath).into_response())
 }
 
 pub(super) fn capability() -> Value {

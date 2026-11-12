@@ -1246,6 +1246,14 @@ If the backend rejects the reset before commit, activation is rejected. After ro
 
 Map capacity may be known while occupancy remains null. Attached hooks alone do not establish active admission, and `full_transparency` is never advertised.
 
+XDP additionally publishes `x-honk.xdp` from the capture owner's latest observations. The default summary contains `state`, `state_changed_at_unix_ms` and `queue_count`; `detail=full` adds `queues` and `truncated`. Clash `GET /stats` exposes the same full projection as `xdp`. It is null before an XDP owner is installed, including TC/TUN deployments. The producer remains available independently of either HTTP feature. Each XDP projection is bounded to 64 KiB; `truncated: true` means only the first queues in admitted device/queue order fit, while `queue_count` retains the complete admitted count.
+
+Each queue identifies its actual `namespace_cookie`, `attachment_generation`, `ifindex` and `queue_id`, actual `mode` (`copy` or `zerocopy`), `ring_capacity` and RX/control/bulk frame capacities. A physical queue can serve several logical realms. `sequence`, `attempted_at_unix_ms` and `last_success_at_unix_ms` identify sampling attempts and the latest successful socket read; timestamps are decimal Unix milliseconds, and all full-width integers are decimal strings. Sequence and read-error counts saturate. Queue `socket` contains the six raw cumulative XDP_STATISTICS counters: `rx_dropped`, `rx_invalid_descs`, `tx_invalid_descs`, `rx_ring_full`, `rx_fill_ring_empty_descs` and `tx_ring_empty_descs`. `rings` contains raw `producer`/`consumer` u32 indices for `rx`, `tx`, `fill` and `cq`; these wrap and are descriptor indices, not packet counts.
+
+Sampling runs outside DEBUG filtering, at most once per second on existing owner turns, plus a final sample before normal socket close. There is no new idle timer: a quiet queue may retain an old observation. Socket and ring reads are sequential, not an atomic snapshot across counters, rings or queues. `socket_available: false` with null `socket` means unobserved or unavailable, never zero loss; after an attempted failure `socket_error` is `statistics_unavailable`, optional `socket_errno` preserves the numeric errno, and `socket_read_errors` increases even without an errno. `last_success_at_unix_ms` may remain older after failure, but stale successful counters are not returned as current data. Errors remain nonfatal. `rx_fill_ring_empty_descs` records kernel empty-FILL events, not a packet-loss rate; a populated current FILL ring does not disprove earlier starvation. Counters are neither summed into total loss nor converted to rates/deltas.
+
+Lifecycle is `starting` until actual activation, then `active`, `closing` after capture admission closes, `closed` after socket teardown, or terminal `failed_retained` when failure retains capture ownership/UMEM. Terminal states freeze lifecycle; policy reload preserves the same attachment identity and counters. HTTP reads only project retained values: they do not sample sockets, advance sequence, reset counters or alter polling/admission. Diagnostic readers retain the observation's memory funding, without retaining a Port, FD or packet lease.
+
 The optional [business-connection grace](./global.md#shutdown) does not permit detaching unfinished cleanup to claim success. Already-started blocking work is not cancelled by aborting an async wrapper: the StateTick maintenance owner warns after its nominal stop deadline and continues to join the actual SQLite work. Blocking credential KDF/database work and an already-started NSS lookup also retain their real join.
 
 These exceptions can extend total shutdown beyond nominal per-stage or HTTP grace deadlines. See [control-plane ownership](../design/control-plane.md#native-observation-api).
@@ -1441,6 +1449,7 @@ Download or extraction failures are logged and do not stop the engine.
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },
