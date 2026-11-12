@@ -1,8 +1,8 @@
 ## Maintainer lab
 
-Read with: `AGENTS.md` (Current validation guidance: the REALITY `dest` certificate constraint) and `doc/en/design/outbound.md` (REALITY client).
+Read with: `AGENTS.md` (Technology stack: the patched boring-sys) and `doc/en/design/outbound.md` (REALITY client).
 
-The maintainer's own interop setup, kept for reference; contributions do not require it.
+The maintainer's own interop setup, kept for reference; contributions need none of it.
 
 Install boring-sys prerequisites (`AGENTS.md`, Technology stack) and its REALITY-hooks checkout
 at pinned `/root/code/boring-rprx/boring-sys`. Cross-build with `ci/zig*`, not containers.
@@ -25,3 +25,8 @@ same inbound, so GET and POST meet in one hub only when the client pairs them; a
 `down.lab.test`, then run
 `HONK_XHTTP_SPLIT_LINK=<link> HONK_XHTTP_SPLIT_ECHO=127.0.0.1:9000 cargo test -p honk-outbound --features rprx --lib lab_split -- --ignored`.
 Sessions attributed to `127.0.0.1` in Xray's access log arrived through the download tunnel.
+
+The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 REALITY lab peer buffers
+8192 bytes of target TLS records including framing; this is server-version-specific,
+not a universal honk certificate limit. Earlier `dl.google.com` / `www.microsoft.com`
+size observations are historical, not a maintained target allowlist.
