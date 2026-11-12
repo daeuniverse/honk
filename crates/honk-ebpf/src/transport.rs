@@ -560,7 +560,8 @@ impl ParseTransportExt for ParseTransportCtx {
 
             // Deep-copy the entire IP header struct to preserve bitfield fields
             // that cannot be assigned field-by-field through method getters.
-            self.iph = unsafe { ptr::read(iph_ptr) };
+            // `ptr::read` here becomes a `memmove` loop that Linux 7.4 rejects.
+            unsafe { ptr::copy_nonoverlapping(iph_ptr, &mut self.iph, 1) };
             self.ihl = iph.ihl();
             self.l4proto = iph.proto;
 
@@ -579,7 +580,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(l4_offset + mem::size_of::<TcpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    self.tcph = unsafe { ptr::read(tcph_ptr) };
+                    unsafe { ptr::copy_nonoverlapping(tcph_ptr, &mut self.tcph, 1) };
                     return Ok(());
                 }
                 IPPROTO_UDP => {
@@ -587,7 +588,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(l4_offset + mem::size_of::<UdpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    self.udph = unsafe { ptr::read(udph_ptr) };
+                    unsafe { ptr::copy_nonoverlapping(udph_ptr, &mut self.udph, 1) };
                     self.listener_l4proto = IPPROTO_UDP;
                     return Ok(());
                 }
@@ -602,7 +603,7 @@ impl ParseTransportExt for ParseTransportCtx {
             }
             let ipv6h = unsafe { &*ipv6h_ptr };
 
-            self.ipv6h = unsafe { ptr::read(ipv6h_ptr) };
+            unsafe { ptr::copy_nonoverlapping(ipv6h_ptr, &mut self.ipv6h, 1) };
             self.l4proto = ipv6h.next_hdr;
             self.ihl = (mem::size_of::<Ipv6Hdr>() / 4) as u8;
             offset += mem::size_of::<Ipv6Hdr>() as u32;
@@ -654,7 +655,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(offset as usize + mem::size_of::<TcpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    self.tcph = unsafe { ptr::read(tcph_ptr) };
+                    unsafe { ptr::copy_nonoverlapping(tcph_ptr, &mut self.tcph, 1) };
                     return Ok(());
                 }
                 IPPROTO_UDP => {
@@ -662,7 +663,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     if unsafe { data.add(offset as usize + mem::size_of::<UdpHdr>()) } > data_end {
                         return Err(ERR_FALLBACK);
                     }
-                    self.udph = unsafe { ptr::read(udph_ptr) };
+                    unsafe { ptr::copy_nonoverlapping(udph_ptr, &mut self.udph, 1) };
                     self.listener_l4proto = IPPROTO_UDP;
                     return Ok(());
                 }
@@ -672,7 +673,7 @@ impl ParseTransportExt for ParseTransportCtx {
                     {
                         return Err(ERR_FALLBACK);
                     }
-                    self.icmp6h = unsafe { ptr::read(icmp6h_ptr) };
+                    unsafe { ptr::copy_nonoverlapping(icmp6h_ptr, &mut self.icmp6h, 1) };
                     return Ok(());
                 }
                 _ => return Err(PASS_UNSUPPORTED),
