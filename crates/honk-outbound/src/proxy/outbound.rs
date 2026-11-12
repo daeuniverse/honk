@@ -174,6 +174,21 @@ pub trait PacketOutbound: Send + Sync {
             .await
             .map(PreparedUdpTransport::ready)
     }
+
+    /// UDP counterpart of [`TcpOutbound::dial_over`]. The handshake runs on
+    /// a carrier the caller already holds, so there is no state to publish
+    /// on commit. Exits that cannot carry UDP over a tunneled stream keep the
+    /// default, a [`TunnelUnsupported`] error.
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        _carrier: Box<dyn AsyncReadWrite>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Err(TunnelUnsupported(runtime.node.protocol().as_str()).into())
+    }
 }
 
 /// One association carrying every destination of a client source (the core
@@ -190,6 +205,18 @@ pub trait SharedSourceOutbound: Send + Sync {
         connect_timeout: Duration,
         speculative: bool,
     ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>>;
+
+    /// Shared-source counterpart of [`PacketOutbound::dial_udp_over`].
+    async fn prepare_shared_source_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        _carrier: Box<dyn AsyncReadWrite>,
+        _target: SocketAddr,
+        _target_domain: Option<&str>,
+        _options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn MultiTargetTransport>> {
+        Err(TunnelUnsupported(runtime.node.protocol().as_str()).into())
+    }
 }
 
 /// Which property a warm request must establish. Selector ownership needs

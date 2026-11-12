@@ -306,3 +306,47 @@ async fn interrupted_connected_send_poison_closes_with_last_owner() {
     .unwrap()
     .unwrap();
 }
+
+/// On a chain, `Auto` sends native UDP even on a port where a direct dial
+/// picks XUDP.
+#[tokio::test]
+async fn tunneled_auto_udp_sends_the_native_command_over_the_carrier() {
+    let node = Node::from_share_link(
+        "vless://b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3@198.51.100.1:443?security=none#vless-exit",
+    )
+    .unwrap();
+    let target: SocketAddr = "8.8.8.8:54".parse().unwrap();
+    assert_eq!(
+        node.vless().unwrap().udp_path(target.port()),
+        Some(VlessUdpPath::Xudp)
+    );
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+    let (carrier, mut server) = tokio::io::duplex(4096);
+    let transport = VLessHandler::new()
+        .dial_udp_over(
+            runtime,
+            Box::new(carrier),
+            target,
+            None,
+            crate::proxy::TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+
+    let mut head = [0; 26];
+    server.read_exact(&mut head).await.unwrap();
+    assert_eq!(head[18], 0x02);
+    assert_eq!(head[19..], [0, 54, ATYP_IPV4, 8, 8, 8, 8]);
+    transport.send_packet(b"ping").await.unwrap();
+    let mut packet = [0; 6];
+    server.read_exact(&mut packet).await.unwrap();
+    assert_eq!(packet, *b"\x00\x04ping");
+
+    server.write_all(b"\x00\x00\x00\x04pong").await.unwrap();
+    let mut output = [0; 8];
+    assert_eq!(
+        transport.recv_packet(&mut output).await.unwrap(),
+        (4, target)
+    );
+    assert_eq!(&output[..4], b"pong");
+}

@@ -162,6 +162,21 @@ impl TrojanHandler {
         Ok((transport, preparation))
     }
 
+    /// The UDP associate over `carrier`, a stream tunneled through earlier hops.
+    async fn open_udp_over(
+        node: &Node,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<TrojanUdpTransport>> {
+        if !node.supports_tunneled_udp() {
+            return Err(super::TunnelUnsupported("trojan udp").into());
+        }
+        let control = super::transport::wrap_tunnel(node, carrier, options).await?;
+        Self::finish_udp_stream(node, target, domain, control).await
+    }
+
     fn commit_udp_stream<T: ?Sized + Send + Sync + 'static>(
         transport: Arc<T>,
         preparation: super::transport::TransportPreparation,
@@ -278,6 +293,17 @@ impl SharedSourceOutbound for TrojanHandler {
         let _ = speculative;
         Self::prepare_udp_source(&runtime, target, target_domain, connect_timeout).await
     }
+
+    async fn prepare_shared_source_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn MultiTargetTransport>> {
+        Ok(Self::open_udp_over(&runtime.node, carrier, target, target_domain, options).await?)
+    }
 }
 
 #[async_trait]
@@ -324,6 +350,17 @@ impl PacketOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        Ok(Self::open_udp_over(&runtime.node, carrier, target, target_domain, options).await?)
     }
 }
 

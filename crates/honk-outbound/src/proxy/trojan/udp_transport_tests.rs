@@ -399,3 +399,63 @@ async fn plain_tcp_association_serves_every_destination() {
     drop(transport);
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn tunneled_associate_carries_every_destination_on_the_carrier() {
+    let first: SocketAddr = "192.0.2.1:53".parse().unwrap();
+    let second: SocketAddr = "192.0.2.2:443".parse().unwrap();
+    let mut node = Node {
+        name: "trojan-exit".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("tunnel-secret".into()),
+            tls: honk_config::node::TlsOptions {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+    let (carrier, mut server) = tokio::io::duplex(4096);
+    let transport = TrojanHandler::new()
+        .prepare_shared_source_over(
+            runtime,
+            Box::new(carrier),
+            first,
+            None,
+            TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+
+    // hex(sha224("tunnel-secret")) | CRLF | UDP ASSOCIATE | first | CRLF.
+    let mut expected = b"e18a99df762a533a40db57010c34dde76778a0ca43091577bf581b2b\r\n\x03".to_vec();
+    expected.extend(wire_addr(first));
+    expected.extend_from_slice(b"\r\n");
+    let mut request = vec![0; expected.len()];
+    server.read_exact(&mut request).await.unwrap();
+    assert_eq!(request, expected);
+
+    transport
+        .send_to(first, None, b"one", true, None)
+        .await
+        .unwrap();
+    transport
+        .send_to(second, None, b"two", false, None)
+        .await
+        .unwrap();
+    assert_eq!(read_frame(&mut server).await, (first, b"one".to_vec()));
+    assert_eq!(read_frame(&mut server).await, (second, b"two".to_vec()));
+
+    server
+        .write_all(&frame(wire_addr(second), b"reply"))
+        .await
+        .unwrap();
+    let mut buf = [0u8; 16];
+    let (len, peer) = transport.recv_packet(&mut buf).await.unwrap();
+    assert_eq!((&buf[..len], peer), (&b"reply"[..], second));
+}

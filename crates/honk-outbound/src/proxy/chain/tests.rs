@@ -837,3 +837,120 @@ async fn tunneled_dial_support_matches_the_config_table() {
         );
     }
 }
+
+/// `Node::supports_tunneled_udp` in honk-config decides which exits carry a
+/// chain's UDP; every registered packet handler must agree with it.
+#[tokio::test]
+async fn tunneled_udp_support_matches_the_config_table() {
+    use honk_config::node::{Udp443Policy, VlessMultiplex, VlessUdpEncoding};
+    const UUID: &str = "00000000-0000-4000-8000-000000000001";
+    let link = |link: &str| Node::from_share_link(link).unwrap();
+    let rebuilt = |mut node: Node, change: &dyn Fn(&mut Node)| {
+        change(&mut node);
+        node.id = node.derive_id();
+        node
+    };
+    let vless = link(&format!(
+        "vless://{UUID}@127.0.0.1:443?security=tls&sni=a.example"
+    ));
+    let trojan = link("trojan://secret@127.0.0.1:443?security=tls&sni=a.example");
+    let nodes = [
+        link("socks5://127.0.0.1:1080"),
+        link("ss://YWVzLTEyOC1nY206cGFzcw@127.0.0.1:8388"),
+        trojan.clone(),
+        rebuilt(trojan, &|node| {
+            node.trojan_mut().unwrap().network = Some("tcp".into())
+        }),
+        link("trojan://secret@127.0.0.1:443?security=tls&sni=a.example&type=xhttp&path=%2Fx"),
+        vless.clone(),
+        rebuilt(vless.clone(), &|node| {
+            node.vless_mut().unwrap().udp_encoding = VlessUdpEncoding::Xudp
+        }),
+        rebuilt(vless.clone(), &|node| {
+            node.vless_mut().unwrap().udp_encoding = VlessUdpEncoding::UotV2
+        }),
+        rebuilt(vless.clone(), &|node| {
+            node.vless_mut().unwrap().multiplex = VlessMultiplex::H2 { padding: false }
+        }),
+        rebuilt(vless.clone(), &|node| {
+            node.vless_mut().unwrap().multiplex = VlessMultiplex::xray(-1, 0, Udp443Policy::Reject)
+        }),
+        rebuilt(vless, &|node| {
+            node.vless_mut().unwrap().flow = Some("xtls-rprx-vision".into())
+        }),
+        link("hysteria2://auth@127.0.0.1:443"),
+        link(&format!("tuic://{UUID}:pass@127.0.0.1:443")),
+        link(&format!("juicity://{UUID}:pass@127.0.0.1:443")),
+        link("anytls://secret@127.0.0.1:443"),
+    ];
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    for node in nodes {
+        // VLESS handlers exist only with the rprx feature.
+        let Some(entry) = registry.find(node.protocol()) else {
+            continue;
+        };
+        // Plaintext, so a supported exit completes its handshake with the
+        // peer below; TLS plays no part in the table. Vision needs TLS.
+        let node = rebuilt(node, &|node| match &mut node.outbound {
+            OutboundConfig::Trojan(trojan) => trojan.tls.enabled = false,
+            OutboundConfig::Vless(vless) if vless.flow.is_none() => vless.tls.enabled = false,
+            _ => {}
+        });
+        let supported = match &entry.packet {
+            None => false,
+            Some(packet) => {
+                let runtime = NodeRuntime::try_ephemeral(&node).unwrap();
+                let (carrier, mut server) = tokio::io::duplex(1 << 16);
+                let dial = packet.dial_udp_over(
+                    runtime,
+                    Box::new(carrier),
+                    target(),
+                    None,
+                    TunnelDialOptions::new(Duration::from_millis(100)),
+                );
+                match tokio::time::timeout(Duration::from_millis(500), dial).await {
+                    Ok(Err(error)) if crate::proxy::tunnel_unsupported(&error) => false,
+                    Ok(Ok(transport)) => {
+                        transport.send_packet(b"ping").await.unwrap();
+                        let wire = read_until_payload(&mut server, b"ping").await;
+                        // The request asks the exit for UDP, not a stream.
+                        let (offset, command) = match node.protocol() {
+                            NodeProtocol::Trojan => (58, 0x03),
+                            _ => (18, 0x02),
+                        };
+                        assert_eq!(wire[offset], command, "{}", node.protocol().as_str());
+                        true
+                    }
+                    other => panic!(
+                        "{} {:?}: neither a typed refusal nor a UDP handshake: {:?}",
+                        node.protocol().as_str(),
+                        node.outbound,
+                        other.map(|result| result.map(drop))
+                    ),
+                }
+            }
+        };
+        assert_eq!(
+            supported,
+            node.supports_tunneled_udp(),
+            "{} {:?}",
+            node.protocol().as_str(),
+            node.outbound
+        );
+    }
+}
+
+/// What the client wrote to `server` up to and including `payload`.
+async fn read_until_payload(server: &mut tokio::io::DuplexStream, payload: &[u8]) -> Vec<u8> {
+    let mut wire = Vec::new();
+    let mut buf = [0u8; 512];
+    while !wire.ends_with(payload) {
+        let read = tokio::time::timeout(Duration::from_secs(1), server.read(&mut buf))
+            .await
+            .expect("the exit sends the packet")
+            .unwrap();
+        assert!(read > 0, "the exit closed before sending the packet");
+        wire.extend_from_slice(&buf[..read]);
+    }
+    wire
+}
