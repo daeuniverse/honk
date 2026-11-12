@@ -1,4 +1,4 @@
-use chrono::{FixedOffset, MappedLocalTime, NaiveDateTime, TimeDelta};
+use chrono::{FixedOffset, Local, NaiveDateTime};
 
 use super::*;
 
@@ -12,55 +12,6 @@ fn next(expression: &str, after: &str) -> Option<DateTime<Utc>> {
     Cron::parse(expression)
         .unwrap()
         .next_after(utc(after), &Utc)
-}
-
-/// Central European time in 2026: UTC+1, and UTC+2 from 29 March 01:00 UTC
-/// to 25 October 01:00 UTC.
-#[derive(Clone, Copy, Debug)]
-struct Berlin;
-
-impl Berlin {
-    fn offset_at(instant: &NaiveDateTime) -> FixedOffset {
-        let summer = utc("2026-03-29 01:00").naive_utc()..utc("2026-10-25 01:00").naive_utc();
-        FixedOffset::east_opt(if summer.contains(instant) { 7200 } else { 3600 }).unwrap()
-    }
-}
-
-impl TimeZone for Berlin {
-    type Offset = FixedOffset;
-
-    fn from_offset(_: &FixedOffset) -> Self {
-        Self
-    }
-
-    fn offset_from_local_date(&self, local: &NaiveDate) -> MappedLocalTime<FixedOffset> {
-        self.offset_from_local_datetime(&local.and_hms_opt(0, 0, 0).unwrap())
-    }
-
-    fn offset_from_local_datetime(&self, local: &NaiveDateTime) -> MappedLocalTime<FixedOffset> {
-        let candidates: Vec<FixedOffset> = [7200, 3600]
-            .into_iter()
-            .map(|secs| FixedOffset::east_opt(secs).unwrap())
-            .filter(|offset| {
-                let instant = *local - TimeDelta::seconds(offset.local_minus_utc().into());
-                Self::offset_at(&instant) == *offset
-            })
-            .collect();
-        match candidates[..] {
-            [] => MappedLocalTime::None,
-            [offset] => MappedLocalTime::Single(offset),
-            [earliest, latest] => MappedLocalTime::Ambiguous(earliest, latest),
-            _ => unreachable!(),
-        }
-    }
-
-    fn offset_from_utc_date(&self, date: &NaiveDate) -> FixedOffset {
-        Self::offset_at(&date.and_hms_opt(0, 0, 0).unwrap())
-    }
-
-    fn offset_from_utc_datetime(&self, instant: &NaiveDateTime) -> FixedOffset {
-        Self::offset_at(instant)
-    }
 }
 
 #[test]
@@ -230,31 +181,49 @@ fn local_times_follow_the_zone() {
 }
 
 #[test]
-fn a_skipped_local_time_does_not_fire() {
-    // 02:30 does not exist in Berlin on 29 March 2026.
-    let cron = Cron::parse("30 2 * * *").unwrap();
-    assert_eq!(
-        cron.next_after(utc("2026-03-28 02:00"), &Berlin),
-        Some(utc("2026-03-30 00:30"))
-    );
-    assert_eq!(
-        Cron::parse("0 3 * * *")
-            .unwrap()
-            .next_after(utc("2026-03-28 03:00"), &Berlin),
-        Some(utc("2026-03-29 01:00")),
-        "03:00 exists, in summer time"
-    );
-}
+fn local_dst_skips_gaps_and_fires_once_at_the_first_fold() {
+    const CHILD: &str = "HONK_CRON_LOCAL_DST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cron::tests::local_dst_skips_gaps_and_fires_once_at_the_first_fold",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("TZ", "EST5EDT,M3.2.0/2,M11.1.0/2")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
 
-#[test]
-fn a_repeated_local_time_fires_once() {
-    // 02:30 happens twice in Berlin on 25 October 2026: 00:30 and 01:30 UTC.
-    let cron = Cron::parse("30 2 * * *").unwrap();
-    let first = cron.next_after(utc("2026-10-24 12:00"), &Berlin);
-    assert_eq!(first, Some(utc("2026-10-25 00:30")));
+    for (expression, expected) in [
+        ("59 1 * * *", "2026-03-08 06:59"),
+        ("0 2 * * *", "2026-03-09 06:00"),
+        ("1 2 * * *", "2026-03-09 06:01"),
+        ("30 2 * * *", "2026-03-09 06:30"),
+        ("0 3 * * *", "2026-03-08 07:00"),
+    ] {
+        assert_eq!(
+            Cron::parse(expression)
+                .unwrap()
+                .next_after(utc("2026-03-07 12:00"), &Local),
+            Some(utc(expected)),
+            "{expression}"
+        );
+    }
+    let cron = Cron::parse("30 1 * * *").unwrap();
+    let first = cron.next_after(utc("2026-10-31 12:00"), &Local);
+    assert_eq!(first, Some(utc("2026-11-01 05:30")));
     assert_eq!(
-        cron.next_after(first.unwrap(), &Berlin),
-        Some(utc("2026-10-26 01:30"))
+        cron.next_after(first.unwrap(), &Local),
+        Some(utc("2026-11-02 06:30"))
     );
 }
 

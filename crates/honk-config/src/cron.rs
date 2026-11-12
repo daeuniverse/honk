@@ -111,10 +111,21 @@ impl Cron {
             .flat_map(|date| {
                 self.times().filter_map(move |(hour, minute)| {
                     let local = date.and_hms_opt(hour, minute, 0)?;
-                    zone.from_local_datetime(&local).earliest()
+                    // Local may return fold offsets out of order and map a gap boundary
+                    // with the old offset. Compare instants and require a real round trip.
+                    let times = match zone.from_local_datetime(&local) {
+                        chrono::MappedLocalTime::None => return None,
+                        chrono::MappedLocalTime::Single(time) => [Some(time), None],
+                        chrono::MappedLocalTime::Ambiguous(a, b) => [Some(a), Some(b)],
+                    };
+                    times
+                        .into_iter()
+                        .flatten()
+                        .map(|time| time.with_timezone(&Utc))
+                        .filter(|time| time.with_timezone(zone).naive_local() == local)
+                        .min()
                 })
             })
-            .map(|time| time.with_timezone(&Utc))
             .find(|time| *time > after)
     }
 
