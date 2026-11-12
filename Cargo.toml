@@ -191,3 +191,11 @@ boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b
 # let a controller pace by rate, and provide BBRv3 (Glassyiris/quinn#12).
 quinn = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
 quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
+
+# Optimize packet-processing crates without increasing the whole engine's size profile.
+[profile.release.package.honk-netstack]
+opt-level = 3
+[profile.release.package.honk-xsk]
+opt-level = 3
+[profile.release.package.honk-datapath]
+opt-level = 3
