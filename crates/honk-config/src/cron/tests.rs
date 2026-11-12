@@ -18,23 +18,35 @@ fn next(expression: &str, after: &str) -> Option<DateTime<Utc>> {
 fn fields_take_lists_ranges_and_steps() {
     let cron = Cron::parse(" 0,30  1-3/2 */10 1-12 * ").unwrap();
     assert_eq!(cron.as_str(), "0,30 1-3/2 */10 1-12 *");
-    assert_eq!(
-        cron.times().collect::<Vec<_>>(),
-        [(1, 0), (1, 30), (3, 0), (3, 30)]
-    );
-    assert_eq!(cron.days, 1 << 1 | 1 << 11 | 1 << 21 | 1 << 31);
-    assert_eq!(cron.months, 0x1ffe);
-    let sunday = Cron::parse("0 3 * * 7").unwrap();
-    assert_eq!(sunday.weekdays, 1);
-    assert_eq!(sunday, Cron::parse("0 3 * * 0").unwrap().with("0 3 * * 7"));
-    assert_eq!(Cron::parse("0 3 * * 5-7").unwrap().weekdays, 0b110_0001);
-}
-
-impl Cron {
-    fn with(mut self, expression: &str) -> Self {
-        self.expression = expression.to_owned();
-        self
+    let mut after = utc("2026-01-01 00:00");
+    for expected in [
+        "2026-01-01 01:00",
+        "2026-01-01 01:30",
+        "2026-01-01 03:00",
+        "2026-01-01 03:30",
+        "2026-01-11 01:00",
+    ] {
+        let fire = cron.next_after(after, &Utc).unwrap();
+        assert_eq!(fire, utc(expected));
+        after = fire;
     }
+    for after in ["2026-02-01 00:00", "2026-12-01 00:00"] {
+        let after = utc(after);
+        assert_eq!(
+            cron.next_after(after, &Utc),
+            Some(after + chrono::TimeDelta::hours(1))
+        );
+    }
+    for expression in ["0 3 * * 0", "0 3 * * 7", "0 3 * * 5-7"] {
+        assert_eq!(
+            next(expression, "2026-11-14 04:00"),
+            Some(utc("2026-11-15 03:00"))
+        );
+    }
+    assert_eq!(
+        next("0 3 * * 5-7", "2026-11-15 04:00"),
+        Some(utc("2026-11-20 03:00"))
+    );
 }
 
 #[test]
