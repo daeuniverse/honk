@@ -357,8 +357,8 @@ impl DnsService {
     /// Resolve a node server host through the hosts alias or `subtag()` rule
     /// that claims it in the current generation. An alias target resolves as
     /// a node host would: through its own `subtag()` claim, else bootstrap.
-    /// `None` when nothing claims the host; a claimed host never falls back
-    /// to another resolver.
+    /// `None` when nothing claims the host. Once its alias target or `subtag()`
+    /// path is selected, that path's failure is authoritative.
     pub(crate) async fn resolve_node_host(
         &self,
         domain: &str,
@@ -374,32 +374,39 @@ impl DnsService {
             (Some(Err(_)), Some(provider)) => Arc::clone(provider.current().forwarder()),
             _ => self.forwarder(),
         };
-        let alias = match forwarder.node_host_alias(&domain)? {
-            Some(NodeHostAlias::Addresses(addresses)) => return Ok(Some(addresses)),
-            Some(NodeHostAlias::Name(target)) => Some(target),
-            None => None,
+        let alias = forwarder.is_hosts_alias(&domain);
+        let upstream = if !alias {
+            claimed_upstream(&forwarder, &domain)
+        } else {
+            None
         };
-        let domain = alias.as_deref().unwrap_or(&domain);
-        let Some(upstream) = claimed_upstream(&forwarder, domain) else {
-            drop(lease);
-            return match alias {
-                Some(target) => honk_outbound::bootstrap::resolve_with(
-                    honk_outbound::bootstrap::global(),
-                    &target,
-                )
-                .await
-                .map(Some)
-                .map_err(|source| {
-                    NameResolutionError::Bootstrap {
-                        domain: target.clone(),
-                        source: source.into(),
-                    }
-                    .into()
-                }),
-                None => Ok(None),
+        if !alias && upstream.is_none() {
+            return Ok(None);
+        }
+        let resolve = async {
+            let target = match forwarder.node_host_alias(&domain)? {
+                Some(NodeHostAlias::Addresses(addresses)) => return Ok(addresses),
+                Some(NodeHostAlias::Name(target)) => target,
+                None => {
+                    return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
+                }
             };
+            if let Some(upstream) = claimed_upstream(&forwarder, &target) {
+                return resolve_claimed(self, &forwarder, &target, upstream).await;
+            }
+            let result = honk_outbound::bootstrap::resolve_with(
+                honk_outbound::bootstrap::global(),
+                &target,
+            )
+            .await;
+            result.map_err(|source| {
+                NameResolutionError::Bootstrap {
+                    domain: target,
+                    source: source.into(),
+                }
+                .into()
+            })
         };
-        let resolve = resolve_claimed(self, &forwarder, domain, upstream);
         match lease {
             Some(Ok(lease)) => lease.run(std::pin::pin!(resolve)).await?,
             Some(Err(unavailable)) => Err(unavailable.into()),

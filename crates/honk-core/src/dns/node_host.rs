@@ -190,12 +190,18 @@ mod tests {
     }
 
     /// Answers every A query with 192.0.2.90 and every other query with NODATA.
-    struct AnswerPool;
+    #[derive(Default)]
+    struct AnswerPool(std::sync::Mutex<Vec<(String, String, u16)>>);
 
     #[async_trait::async_trait]
     impl crate::dns::forwarder::DnsUpstreamPool for AnswerPool {
-        async fn query(&self, _: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
+        async fn query(&self, upstream: &str, raw_query: &[u8]) -> anyhow::Result<Vec<u8>> {
             let query = crate::dns::query::QueryContext::parse(raw_query)?;
+            self.0.lock().unwrap().push((
+                upstream.to_owned(),
+                query.qname().unwrap().to_domain_name().unwrap(),
+                query.qtype().unwrap().get(),
+            ));
             let mut response = crate::dns::forwarder::make_empty_response(raw_query, &query);
             if query.qtype().unwrap().get() == 1 {
                 response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
@@ -212,6 +218,7 @@ mod tests {
     ) -> (
         tempfile::NamedTempFile,
         Arc<dyn honk_outbound::bootstrap::NodeHostResolver>,
+        Arc<AnswerPool>,
     ) {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), rules).unwrap();
@@ -221,8 +228,9 @@ mod tests {
         .unwrap()
         .dns;
         dns.hosts = vec![file.path().to_string_lossy().into_owned()];
+        let pool = Arc::new(AnswerPool::default());
         let forwarder = crate::dns::forwarder::DnsForwarder::new(
-            Arc::new(AnswerPool),
+            pool.clone(),
             Arc::new(tokio::sync::Mutex::new(crate::dns::cache::DnsCache::new(8))),
             Arc::new(crate::dns::routing::DnsRouter::new_from_dns_config(&dns).unwrap()),
         )
@@ -237,12 +245,12 @@ mod tests {
                 .collect(),
         );
         let hook = resolver(&DnsService::with_forwarder(Arc::new(forwarder)));
-        (file, hook)
+        (file, hook, pool)
     }
 
     #[tokio::test]
     async fn hook_claims_hosts_aliases_and_resolves_their_target() {
-        let (_file, hook) = alias_hook(
+        let (_file, hook, pool) = alias_hook(
             "full:node.example literal.example\n\
              full:literal.example 192.0.2.80\n\
              full:chained.example node.example\n\
@@ -266,6 +274,15 @@ mod tests {
             .lookup("claimed.example")
             .expect("alias claims the host");
         assert_eq!(claimed.await.unwrap(), [IpAddr::from([192, 0, 2, 90])]);
+        let mut queries = pool.0.lock().unwrap().clone();
+        queries.sort_unstable();
+        assert_eq!(
+            queries,
+            [
+                ("providerdoh".to_owned(), "provider.example".to_owned(), 1),
+                ("providerdoh".to_owned(), "provider.example".to_owned(), 28),
+            ]
+        );
 
         for unclaimed in ["literal.example", "other.example"] {
             assert!(hook.lookup(unclaimed).is_none(), "{unclaimed}");
