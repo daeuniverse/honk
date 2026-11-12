@@ -2,7 +2,7 @@
 
 Agent guide to understanding, building, testing, and modifying honk. Repository layout/conventions last verified against the tree on 2026-08-09.
 
-Re-read it when a conversation grows long or context is trimmed: a rule read once is not a rule in force. Never substitute memory or resemblance for evidence.
+A rule is in force only while it is in context: re-read this file and the routed rules file when a conversation grows long or context is trimmed. Claims rest on current code and command output, not on memory or resemblance.
 
 <!-- task-routing:start -->
 ## Task routing
@@ -19,10 +19,11 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 | placing or finding tests, benchmarks | `.agents/rules/test-locations.md` |
 | releases, CI workflows | `.agents/rules/release.md`; skill [`honk-release`](.agents/skills/honk-release/SKILL.md) |
 | deployment, security-sensitive paths | `.agents/rules/deployment.md`, `.agents/rules/security.md` |
+| reviewing a change | `.agents/rules/review.md` |
 | REALITY / xtls interop verification against live servers | `.agents/rules/maintainer-lab.md` (the maintainer's lab; not required for contributions) |
 <!-- task-routing:end -->
 
-Maintaining this guide: a rule that binds every change goes in this file; a subsystem's reference goes in its `.agents/rules/` file, in the section it belongs to. A new rules file gets a row in the routing table, and every file the table sends the reader to must exist. `.agents/tools/` describes the one-time extraction and is not re-run on later edits. The CI mechanical review drops its documentation reminder when either `AGENTS.md` or `.agents/rules/` changes alongside code.
+Maintaining this guide: a rule that binds every change goes in this file; a subsystem's reference goes in its `.agents/rules/` file, in the section it belongs to. A new rules file gets a row in the routing table, and every file the table sends the reader to exists. `.agents/tools/` describes the one-time extraction and is not re-run on later edits. The CI mechanical review drops its documentation reminder when either `AGENTS.md` or `.agents/rules/` changes alongside code. Success signal for an edit here: the CI `docs` job (`lychee --offline --include-fragments` over `*.md`, `.agents/**/*.md`, `doc/**/*.md`, `changes/*.md`) passes.
 
 ## Project overview
 
@@ -60,7 +61,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
     └── honk-ebpf             # Kernel eBPF programs (EXCLUDED from workspace, own Cargo.lock)
 ```
 
-Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/` — these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. `test-routing` and its dependent `test-netns` share one complete disposable-VM gate; prepare its toolchain, objects and environment through `honk-real-ebpf-tests` rather than attaching root-cgroup hooks on a shared host.
+Notable absences (referenced by older docs but **not in this tree**): `Makefile`, `scripts/`, `plan.md`, `run_tests.sh`, `test-honk.sh`, `log/`, and the vendored reference checkouts (`honk/`, `outbound/`, `sing-box/`; these paths are `.gitignore`d). The old `run` / `deploy` / `docker*` recipes were removed with those missing files; use `run-debug`, `run-dae`, and `deploy-vyos`. Those recipes called `scripts/debug-local.sh` / `scripts/deploy-gateway.sh` and an earlier `Dockerfile` / `docker-compose.yml`; today's root `Dockerfile` repackages a published release (`.agents/rules/deployment.md`). `test-routing` and its dependent `test-netns` share one complete disposable-VM gate; prepare its toolchain, objects and environment through `honk-real-ebpf-tests`, which keeps root-cgroup hooks inside the VM.
 
 ## Technology stack
 
@@ -81,7 +82,6 @@ Notable absences (referenced by older docs but **not in this tree**): `Makefile`
 - **Dev/test:** tempfile, tokio-test, rcgen 0.14, tokio-tungstenite, criterion 0.8 (DNS and UDP benchmarks).
 
 See [design docs](doc/en/design/overview.md).
-
 
 ## Build and test commands
 
@@ -118,13 +118,11 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 | `cycle`                                                                         | `clean-all` + `build-core`                                                                                                                                                                                                                   |
 | `watch-core`                                                                    | `cargo watch` rebuild                                                                                                                                                                                                                        |
 
-Removed `run` / `deploy` / `docker*` recipes called absent `scripts/debug-local.sh` / `scripts/deploy-gateway.sh` / `Dockerfile` / `docker-compose.yml` (Repository layout).
-
 `outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the two public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
 
 ## Current validation guidance
 
-Do not treat dated pass counts as repository status; use current command output and CI. `just test-routing` and `just test-netns` use the same complete pre-provisioned disposable-VM gate. The `routing-test` object, toolchain and VM environment must be prepared as documented in `honk-real-ebpf-tests`; do not substitute host execution or spoof VM markers.
+Repository status is current command output and CI; dated pass counts are history. `just test-routing` and `just test-netns` use the same complete pre-provisioned disposable-VM gate. Prepare the `routing-test` object, toolchain and VM environment as `honk-real-ebpf-tests` documents; that skill also names the host shortcuts that do not count as running the gate.
 
 DNS syslog auditing is a default-off `dns-syslog` feature, independent of API
 features. Builds without it use zero-sized audit hooks and reject enabled audit
@@ -148,41 +146,102 @@ not the unprivileged suite. Deployment A/B needs real eBPF/netns/upstreams and t
 `bench` lab harness. TLS backends and the HTTP-download exception: Technology stack.
 
 `routing::tests::test_geosite_*` need `geosite.dat`/`geoip.dat`. Both tests call `use_repo_geo_assets()`, which points `DAE_LOCATION_ASSET` at the checkout root, so files at the top of the checkout are the quickest local setup; otherwise the loader falls through the documented geo asset search order, which is how CI's `/etc/dae` install works, and the tests fail for a reason unrelated to the change under test.
-Unset `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` so HTTP clients do not proxy loopback fetches.
-The maintainer's REALITY interop lab: `.agents/rules/maintainer-lab.md` (not required for contributions).
+Unset `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` so HTTP clients fetch loopback addresses directly.
+The maintainer's REALITY interop lab: `.agents/rules/maintainer-lab.md` (not required for contributions); it also records the REALITY lab peer's target-record limit.
 
-The documented sing-box 1.12 / MetaCubeX-uTLS 1.8.0 REALITY lab peer buffers
-8192 bytes of target TLS records including framing; this is server-version-specific,
-not a universal honk certificate limit. Earlier `dl.google.com` / `www.microsoft.com`
-size observations are historical, not a maintained target allowlist.
+## Change workflow
+
+The steps live in skill `honk-change`; this section sets how deep each step goes.
+
+### Risk classes
+
+| Class | Covers | Plan | Proof | Review |
+|---|---|---|---|---|
+| Low | docs, tests only | the commit message | the checks of the touched area (link check, the changed tests run) | read your own diff |
+| Medium | config, features a human assigns, and the refactors and tests `CONTRIBUTING.md` §3 allows an agent to originate, all outside §2 | a short plan, reviewed before code | tests for the changed behaviour, plus the impact inventory | a reviewer with fresh context |
+| High | `CONTRIBUTING.md` §2 areas, any invariant named in this file (Runtime invariants and the sections it links), hot-path performance | a written plan, reviewed before code | a test that fails without the fix, every behaviour hunk ablated, and the VM gate (`just test-netns`) when the change reaches eBPF, NFQUEUE, held packets or routing | `CONTRIBUTING.md` §6 deep review |
+
+When unsure, take the higher class. `CONTRIBUTING.md` §2 changes must be originated by a human, unless the §11 domain-expert exception applies; an agent may analyze, review and suggest there. Signal: the plan and the PR's Verified section name the class and the proof that ran.
+
+### Diagnosis
+
+- **Read to the end of the path before describing a defect.** The trigger, the consequence, and the absence of a thing are each bounded by code you have not opened yet: the callee, the caller, the consumer that clamps the value, the search that would have settled it.
+- **Fix where the paths converge**, not where you first saw the failure: a guard on one loader leaves its siblings failing open.
+
+### Ablation
+
+A multi-hunk change proves each behaviour hunk: revert that hunk alone, run the covering tests and watch one fail. High ablates every behaviour hunk. Low and Medium ablate each one or list the unablated hunks in the PR's Verified section. Docs, comments and pure moves have no behaviour hunk; say so instead.
+
+### Flaky tests
+
+A flaky test is red. Fix it, or quarantine it (ignored, with a reason naming an owner and a date) in the PR that found it. CI does not retry: `.config/nextest.toml`'s `ci` profile has no retries, and it stays that way.
+
+### Checks and gates
+
+- **A check that could not run did not pass.** If a gate is missing, errors, or produces no output, say so; empty output reads exactly like a clean run.
+- A new check or gate script proves itself before it guards anything: it fails on a planted violation and fails when its selection scans nothing, as `ci/run-exact-ignored-tests.sh` and the routing-golden CI step do. Exit codes: 0 clean, 1 violation found, 2 could not run.
+
+### Performance baselines
+
+Hot-path changes (dial, relay, Shadowsocks/VLESS streams, DNS, reload) carry a before/after measurement on the same host with its load recorded. Repeat the runs before calling a difference real. Harnesses and their run rules: `.agents/rules/test-locations.md` (Benchmarks); lab and deployment harnesses live on branch `bench`.
+
+### Stop points
+
+Stop and ask before touching an area `CONTRIBUTING.md` §2 reserves, before anything leaves the machine, and before discarding work someone else may want; otherwise continue.
 
 ## Code style guidelines
 
-- Rust source files do **not** carry SPDX/copyright headers; licensing and attribution live in the root `README.md`/`LICENSE`.
-- **Comment discipline (feat/analyze-dns): readable code; comments explain "why", never "what".** Allow module `//!` purpose/non-obvious architecture, public-item `///`, and short rationale/invariant/wire-format/upstream-parity/past-bug comments. Narrating/restating code is a defect. Ordinary logic should have near-zero comments (see `crates/honk-core/src/dns/runtime.rs`); prefer descriptive names/small functions. **Before closing each work phase, review touched comments and delete/rewrite stale behavior descriptions**; stale comments are defects.
-- **Commits:** `type(scope): one short imperative line` — `feat|fix|refactor|perf|test|docs|style|bench(<area>)`, no body, no markdown. Each commit stands alone and leaves the tree building; multi-part work is more commits, and fixups are squashed before pushing rather than pushed.
-- **Changelog:** a PR touching `crates/`, `Cargo.toml`, `Cargo.lock`, `ci/fetch-doona.sh` or `.github/ci/pins.env` adds `changes/<branch-slug>.md`; format and exemptions are in [changes/README.md](changes/README.md). CI fails without it unless a maintainer applies the `no-changelog` label.
-- **PR bodies:** English or Simplified Chinese, one short paragraph under each of `## Problem / 问题`, `## How I fixed it / 解决方法` and `## Verified / 验证`, in that order: what is wrong, what changed, what was checked. Follow the single bilingual `.github/pull_request_template.md` and link long evidence; do not paste it. Start the pull request body from that template, also when you open it with `gh pr create --body` or the API, which do not fill it in. Keep its checklist and check only true boxes. For an outside contributor, `template-check` closes a pull request that drops a required box, does not check exactly one of the two AI boxes, or checks the unread or AI-agent box, and reopens it once the body is fixed.
+- Rust source files carry no SPDX/copyright headers; licensing and attribution live in the root `README.md`/`LICENSE`.
 - Prefer `anyhow::Result` for application/binary code and `thiserror` for library error types.
 - Use `tracing` macros for logging; prefer structured fields (`info!(network = "tcp", outbound = %name, ...)`). Levels follow frequency × actionability: ERROR only when configured function is lost until an operator acts (committed-degraded activation, process exit, permanent subsystem death, invariant breach); WARN once per entered degraded state (fallback, ceiling, node/group unavailable, rejected candidate with the old config intact); INFO for low-rate lifecycle, operator outcomes and recovery; DEBUG for single connection/request/query outcomes and periodic maintenance. Log a failure once, at the layer that owns its stats/Score/recovery; repeat a persisting state at DEBUG, not per tick. A failure that repeats per query with no episode boundary (DNS SERVFAIL, singleflight saturation) uses `logging::warn_throttled!`: WARN at most every 10 s per site. Native `/api/v1/logs`, Clash `/logs` and the console all receive these levels.
 - Use `tokio` async/await and `tokio::select!` for long-lived loops.
 - Kernel/userspace structs belong in `honk-ebpf-common`; follow its stable `#[repr(C)]` layout and coordinated `honk-ebpf`/`honk-core` map-writer change rules.
 - Follow `cargo fmt --all` and keep `just lint` (all targets with `honk-core/native-ui,honk-core/udp-bench,honk-core/dns-bench`) and `cargo clippy --workspace --all-targets --no-default-features --features honk-core/udp-bench,honk-core/dns-bench -- -D warnings` clean.
-- **Claims need their line.** A consequence stated in a PR or an issue names the code producing it, or is narrowed until it can; say what you did not check. Line numbers come from `origin/main`, not your working tree.
-- **Read to the end of the path before describing a defect.** The trigger, the consequence, and the absence of a thing are each bounded by code you have not opened yet: the callee, the caller, the consumer that clamps the value, the search that would have settled it.
-- **Fix where the paths converge**, not where you first saw the failure: a guard on one loader leaves its siblings failing open.
-- **A check that could not run did not pass.** If a gate is missing, errors, or produces no output, say so; empty output reads exactly like a clean run.
-- Stop before touching an area `CONTRIBUTING.md` reserves, before anything leaves the machine, and before discarding work someone else may want; otherwise continue.
 - Match the surrounding file's idioms; make minimal, scoped changes (no opportunistic cleanups).
-- Documentation language: code comments and `doc/en/` docs are English; user docs are bilingual (`README.zh.md`, `doc/zh/`) — update both when you change documented behavior.
+
+## Commits and pull requests
+
+- **Commits:** `type(scope): one short imperative line`: `feat|fix|refactor|perf|test|docs|style|bench(<area>)`, no body, no markdown. Each commit stands alone and leaves the tree building; multi-part work is more commits, and fixups are squashed before pushing rather than pushed.
+- **Changelog:** a PR touching `crates/`, `Cargo.toml`, `Cargo.lock`, `ci/fetch-doona.sh` or `.github/ci/pins.env` adds `changes/<branch-slug>.md`; format and exemptions are in [changes/README.md](changes/README.md). CI fails without it unless a maintainer applies the `no-changelog` label.
+- **PR bodies:** English or Simplified Chinese, one short paragraph under each of `## Problem / 问题`, `## How I fixed it / 解决方法` and `## Verified / 验证`, in that order: what is wrong, what changed, what was checked. Follow the single bilingual `.github/pull_request_template.md` and link long evidence instead of pasting it. Start the pull request body from that template, also when you open it with `gh pr create --body` or the API, which leave it empty. Keep its checklist, check only true boxes, and check exactly one of its two AI-disclosure boxes (`CONTRIBUTING.md` §5). For an outside contributor, `template-check` closes a pull request that drops a required box, does not check exactly one of the two AI boxes, or checks the unread or AI-agent box, and reopens it once the body is fixed.
+
+## Writing
+
+Applies to code comments, docs, PR and issue text.
+
+- **Lead with the result.** One point per sentence; no introduction or recap paragraphs.
+- **Claims need their line.** A consequence stated in a PR or an issue names the code producing it, or is narrowed until it can; say what you did not check. Line numbers come from `origin/main`, not your working tree.
+- **Label the unverified.** Mark anything not run or not read as such (for example `not run:` in Verified) rather than leaving it implied.
+- **Comment discipline: readable code; comments explain "why", the code says "what".** Allow module `//!` purpose/non-obvious architecture, public-item `///`, and short rationale/invariant/wire-format/upstream-parity/past-bug comments. Narrating/restating code is a defect. Ordinary logic should have near-zero comments (see `crates/honk-core/src/dns/runtime.rs`); prefer descriptive names/small functions. **Before closing each work phase, review touched comments and delete/rewrite stale behavior descriptions**; stale comments are defects.
+- **Language:** code comments and `doc/en/` docs are English; user docs are bilingual (`README.zh.md`, `doc/zh/`); update both when you change documented behavior. Chinese docs use Simplified Chinese, one script per document, with a space between Chinese and Latin letters or digits.
 
 ## Testing instructions
 
-- **A new test must fail without the change.** Remove the production hunk, run it, read the failure; a test that passes either way is not evidence. Read what already covers the behaviour first — several deliberate oddities here are pinned by one test. A deletion needs no test of its own.
+- **A new test must fail without the change.** Remove the production hunk, run it, read the failure; a test that passes either way is not evidence. Read what already covers the behaviour first; several deliberate oddities here are pinned by one test (see Intentional designs). A deletion needs no test of its own. Multi-hunk changes: Change workflow, Ablation.
 - **Say which gates you ran and which you did not.** Running a subset is fine; reporting no limits after running a subset is not.
+- A flaky test counts as a failure: Change workflow, Flaky tests.
 - `cargo test --all`: unprivileged default workspace unit/integration suites using mock eBPF/loopback where appropriate. `just test-routing` and dependent `just test-netns` share the full isolated floor-kernel VM gate, including routing goldens, failed-publication preservation, real NFQUEUE/eBPF and guarded root-cgroup fixtures.
 - Test locations: `.agents/rules/test-locations.md`.
 - Older standalone netns/podman scripts mentioned in stale docs are absent; use the supported `just test-netns` gate above.
+
+## Intentional designs
+
+Behaviour that looks like a defect but is deliberate. Reviewers skip these unless the change alters them; a change that does alter one says so in its plan.
+
+| Behaviour | Reason | Ruling source |
+|---|---|---|
+| Direct eBPF offload traffic is not counted in stats | performance | maintainer, 2026-10-04 |
+| VLESS permits UDP/443 by default, including base Vision | users block QUIC through routing | `.agents/rules/configuration.md` |
+| VLESS Auto keeps native UDP on 53/443 without Vision instead of Single XUDP | Single XUDP measured about half the goodput and 1.9-3.3× the CPU per MB | `.agents/rules/outbound.md` (UDP transport invariant) |
+| A dead outbound drops new flows; there is no implicit `direct` fallback | fail-closed | Runtime invariants: Fail-closed on dead outbounds |
+| Real LAN self-protection only warns; it rejects no configuration and synthesizes no rules | advisory, not a connectivity guarantee | `.agents/rules/configuration.md` (Interface modes) |
+| Native probes, geodata and shared downloads have no address or port allowlist | whoever writes the configuration or controls subscription content decides those targets; provider content is trusted configuration | `.agents/rules/configuration.md`, `.agents/rules/security.md` |
+| Listener-secret values shorter than eight bytes are neither masked nor refused | not recorded | `.agents/rules/security.md` (Native source writes) |
+| A partial multi-asset geodata replacement is reported, not rolled back | after rename the new bytes are visible, so no rollback is claimed | `.agents/rules/security.md` (Native entry management) |
+| `MALLOC_CONF` has no effect; `_RJEM_MALLOC_CONF` tunes jemalloc | the crate prefixes jemalloc symbols and the variable | Technology stack |
+| Default logs silence `quinn::endpoint` | its driver-death ERROR duplicates the failure honk reports with context | `.agents/rules/native-api.md` (Logs) |
+| `honk-core proxy <group> <node>` persists nothing; `delay` times raw TCP | local-only commands that do not talk to the running engine | `.agents/rules/configuration.md` (CLI) |
+| `just test-routing` runs the complete VM gate, same as `test-netns` | routing contains root-cgroup cases | `.agents/skills/honk-real-ebpf-tests/SKILL.md` |
 
 ## Notes for agents
 
@@ -193,13 +252,22 @@ Configuration contracts (settings, dialect, `honk-tool`): `.agents/rules/configu
 - If you add or remove workspace crates, update this file and the root `Cargo.toml` `[workspace] members` list.
 - README authorship disclosure: the maintainer focuses on eBPF; most userspace subsystems were largely AI-authored with partial review. Review userspace changes accordingly.
 
+### Runtime invariants
 
-### Runtime invariants (do not break)
+Each item is an invariant named in this file for the High risk class and `CONTRIBUTING.md` §6. Its full contract lives in the linked section, which carries the same status as text in this file; a change to any of them is High.
 
-This text moved out of this file into the rules files below:
-
-- Datapath, ABI, marks, netns, NFQUEUE, token states: [`.agents/rules/datapath.md`](.agents/rules/datapath.md)
-- UDP transport, VLESS carriers, gRPC, XHTTP, connection establishment: [`.agents/rules/outbound.md`](.agents/rules/outbound.md)
-- Node identity, group filters, VLESS configuration: [`.agents/rules/configuration.md`](.agents/rules/configuration.md#node-identity-and-group-filters)
-- Score: [`.agents/rules/score.md`](.agents/rules/score.md)
-- Native observation and the native API: [`.agents/rules/native-api.md`](.agents/rules/native-api.md)
+- Datapath, full text in [`.agents/rules/datapath.md`](.agents/rules/datapath.md#runtime-invariants):
+  - **Kernel/userspace ABI:** layouts, map key sizes, marks, state transitions and statistics keys change together across `honk-ebpf-common`, `honk-ebpf`, `honk-core` and their consumers ([Kernel and userspace ABI](.agents/rules/datapath.md#kernel-and-userspace-abi)).
+  - **Bypass mark:** originated sockets and transparent listeners carry the exact effective `global.so_mark_from_dae`.
+  - **Anyfrom UDP replies:** replies keep original-destination addressing and leave transparent TPROXY listeners out of the reply path.
+  - **Netns discipline:** `daens` is entered only through scoped synchronous `daens::with_daens_netns`, with no `.await` inside.
+  - **Datapath admission:** admission opens after every internal hook, listener and queue is ready, and closes before listener teardown.
+  - **NFQUEUE readiness and ownership**, **Fragmented LAN UDP53**, **Token-checked terminal state**, **NFQUEUE lifecycle.**
+  - **must/block are final:** Clash mode override leaves `block` and `must` results in force.
+  - **Fail-closed on dead outbounds** and **group-OR connectivity pushes** with the sole-TCP-leaf exception.
+  - **Internal traffic is never proxied; broadcast/multicast passes through eBPF.**
+  - **Reserved outbound indices:** `0 Direct | 1 Block | 2+ user groups | 0xFC MustRules | 0xFD ControlPlaneRouting | 0xFE OR | 0xFF AND`.
+- **UDP transport invariant** and VLESS carrier ownership: [`.agents/rules/outbound.md`](.agents/rules/outbound.md#udp-transport-invariant); gRPC and XHTTP replay no application bytes ([gRPC and XHTTP](.agents/rules/outbound.md#grpc-and-xhttp)).
+- **Node identity and group filters:** `Node::derive_id()` is the sole identity source ([configuration](.agents/rules/configuration.md#node-identity-and-group-filters)).
+- **Score** evidence, serving pool and currency: [`.agents/rules/score.md`](.agents/rules/score.md).
+- **Native observation evidence** is source evidence of what executed, not a reconstruction from current state: [`.agents/rules/native-api.md`](.agents/rules/native-api.md#observation).
