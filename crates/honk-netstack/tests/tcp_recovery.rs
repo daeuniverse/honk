@@ -263,6 +263,45 @@ fn tail_loss_probe_fires_at_two_srtt_resends_the_last_segment_and_is_no_loss_eve
 }
 
 #[test]
+fn ack_progress_cancels_an_expired_unemitted_probe_before_the_next_flight() {
+    for ack_all in [false, true] {
+        let (mut stack, mut now, peer) = connect(true, false, false);
+        assert_eq!(stack.tcp_write(peer.id, &pattern(2000)), Ok(2000));
+        let old = pull_all(&mut stack, now);
+        assert_eq!(old.len(), 2);
+        tick(&mut stack, &mut now);
+        assert_eq!(stats(&stack, &peer).tlp_probes, 0);
+
+        let ack = old[usize::from(ack_all)].end();
+        peer.ack(&mut stack, now, ack, &[]);
+        let expected = if ack_all {
+            assert_eq!(stats(&stack, &peer).outstanding_bytes, 0);
+            assert_eq!(stack.tcp_write(peer.id, &pattern(2000)), Ok(2000));
+            let new = pull_all(&mut stack, now);
+            assert_eq!(new.len(), 2);
+            assert_eq!(new[0].h.seq, ack);
+            new[1].h.seq
+        } else {
+            assert!(pull(&mut stack, now).is_none());
+            old[1].h.seq
+        };
+        let before = stats(&stack, &peer);
+        assert_eq!(before.tlp_probes, 0, "ACK progress cancels the old probe");
+        assert_eq!(before.retrans_segments, 0);
+        let pto = if ack_all {
+            2 * before.srtt.unwrap()
+        } else {
+            before.rto
+        };
+        let due = now + pto;
+        let packet = next_packet(&mut stack, &mut now, pto).expect("fresh probe or RTO");
+        assert_eq!(now, due, "no probe inherits the expired timer");
+        assert_eq!(packet.h.seq, expected);
+        assert_eq!(stats(&stack, &peer).tlp_probes, u64::from(ack_all));
+    }
+}
+
+#[test]
 fn single_segment_flight_waits_for_the_peers_delayed_ack_before_probing() {
     let (mut stack, mut now, peer) = connect(true, false, false);
     assert_eq!(stack.tcp_write(peer.id, &pattern(500)), Ok(500));

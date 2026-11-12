@@ -640,6 +640,7 @@ impl Tcb {
     /// segment is in flight, never later than the retransmission timer.
     pub fn rearm_pto(&mut self, now: Instant) {
         self.tlp_deadline = None;
+        self.tlp_due = false;
         if !self.sack
             || self.persist
             || self.recovery.state() != recovery::State::Open
