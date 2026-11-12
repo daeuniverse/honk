@@ -5,6 +5,7 @@
 pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
+pub mod chain;
 pub mod direct;
 pub mod hysteria2;
 pub mod juicity;

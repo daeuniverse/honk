@@ -18,6 +18,8 @@ pub mod reality;
 pub mod runtime;
 pub(crate) mod session;
 mod shared_error;
+#[cfg(test)]
+mod test_support;
 pub mod tls;
 pub mod transport_quality;
 pub mod urltest;

@@ -144,6 +144,8 @@ pub struct FlowObserver {
     context: FlowContext,
     callback: Arc<dyn Fn(FlowContext, FlowEvent) + Send + Sync>,
     milestones: Arc<std::sync::atomic::AtomicU8>,
+    /// Milestones this view drops before they reach the shared once-state.
+    dropped: u8,
 }
 
 #[cfg(feature = "flow-observation")]
@@ -166,6 +168,7 @@ impl FlowObserver {
             context,
             callback,
             milestones: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            dropped: 0,
         }
     }
 
@@ -177,16 +180,27 @@ impl FlowObserver {
         if context == self.context {
             return self.clone();
         }
-        Self::new(context, Arc::clone(&self.callback))
+        Self {
+            dropped: self.dropped,
+            ..Self::new(context, Arc::clone(&self.callback))
+        }
     }
 
     /// Callbacks must remain bounded, synchronous and non-reentrant, with no I/O.
     pub fn publish(&self, event: FlowEvent) {
+        if let FlowEvent::Milestone { milestone } = event
+            && self.dropped & milestone.bit() != 0
+        {
+            return;
+        }
         (self.callback)(self.context, event);
     }
 
     pub fn milestone_once(&self, milestone: Milestone) {
         let bit = milestone.bit();
+        if self.dropped & bit != 0 {
+            return;
+        }
         if self
             .milestones
             .fetch_or(bit, std::sync::atomic::Ordering::Relaxed)
@@ -239,6 +253,20 @@ pub(crate) fn scope<F: Future>(
 #[cfg(feature = "flow-observation")]
 pub fn without<F: Future>(future: F) -> impl Future<Output = F::Output> {
     SUPPRESSED.scope(true, scope(None, future))
+}
+
+/// Run a proxy chain hop other than the last. Its target is the next hop's
+/// server, so its target milestones are dropped; transport events and
+/// `TransportReady` still reach the flow, deduplicated with the other hops.
+#[cfg(feature = "flow-observation")]
+pub(crate) fn without_target_milestones<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let observer = current().map(|flow| FlowObserver {
+        dropped: flow.dropped
+            | Milestone::TargetRequestSent.bit()
+            | Milestone::TargetConfirmed.bit(),
+        ..flow
+    });
+    scope(observer, future)
 }
 
 #[cfg(feature = "flow-observation")]
@@ -410,7 +438,7 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
     ));
     let captured = Arc::clone(&lookups);
     let output = observer.clone();
-    let nested = FlowObserver::new(
+    let mut nested = FlowObserver::new(
         context,
         Arc::new(move |source, event| {
             if let FlowEvent::Dns(lookup) = &event
@@ -437,6 +465,7 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
             (output.callback)(source, event);
         }),
     );
+    nested.dropped = observer.dropped;
     let result = nested.scope(future).await;
     (result, Some(LookupSelection { observer, lookups }))
 }
@@ -566,6 +595,11 @@ mod inert {
     }
 
     #[inline]
+    pub(crate) fn without_target_milestones<F: Future>(future: F) -> F {
+        future
+    }
+
+    #[inline]
     pub fn milestone(_milestone: Milestone) {}
 
     #[derive(Clone, Debug)]
@@ -638,7 +672,7 @@ pub use inert::{
     without,
 };
 #[cfg(not(feature = "flow-observation"))]
-pub(crate) use inert::{RequestWrite, is_suppressed, request_write};
+pub(crate) use inert::{RequestWrite, is_suppressed, request_write, without_target_milestones};
 
 #[cfg(all(test, feature = "flow-observation"))]
 mod tests;
