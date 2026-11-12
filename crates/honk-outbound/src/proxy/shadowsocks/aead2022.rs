@@ -341,6 +341,7 @@ pub(crate) async fn dial_stream<T: super::stream::SsTransport>(
 
     // SIP022 3.1.4: salt + header chunks MUST go out in a single write.
     server.write_all(&request).await?;
+    server.flush().await?;
 
     let prologue = super::stream::Ss2022Prologue {
         method,

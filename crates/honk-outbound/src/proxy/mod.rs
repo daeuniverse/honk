@@ -224,6 +224,8 @@ impl ProxyStream {
     }
 }
 
+#[cfg(all(test, feature = "flow-observation"))]
+mod request_observation_support;
 #[cfg(test)]
 mod tests;
 

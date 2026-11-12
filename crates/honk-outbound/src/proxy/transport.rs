@@ -293,10 +293,6 @@ fn tls_server_name(node: &Node) -> String {
 /// physical connection owns admission and observation, so nothing here
 /// connects or retries: a REALITY mask certificate stays the returned error
 /// for the caller to redial with `reality_key_shares` disabled.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "protocol handlers adopt it through dial_over")
-)]
 pub(crate) async fn wrap_tunnel(
     node: &Node,
     carrier: Box<dyn AsyncReadWrite>,

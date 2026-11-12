@@ -329,28 +329,142 @@ async fn test_dial_tcp_legacy_end_to_end() {
     assert_legacy_bulk_echo(&mut stream.stream).await;
 }
 
-/// The legacy dial tail over a non-TCP carrier: same wire codec, no
-/// physical socket underneath.
+/// The legacy dial over a non-TCP carrier: same wire codec, no physical
+/// socket underneath.
 #[tokio::test]
 async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     // Large enough to hold the whole echo while the client is still writing.
     let (client, server) = tokio::io::duplex(4 << 20);
     tokio::spawn(mock_legacy_tcp_server(server));
 
+    let mut node = Node {
+        name: "test-ss-tunnel".into(),
+        address: "198.51.100.1:8388".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 8388,
+        outbound: honk_config::node::OutboundConfig::Shadowsocks(
+            honk_config::node::ShadowsocksConfig {
+                encryption: Some("aes-128-gcm".into()),
+                password: Some("test-password".into()),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
     let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
-    let header = addr::encode_address(target, None).unwrap();
     let mut stream = ShadowsocksHandler::new()
-        .start_relay(
-            "aes-128-gcm",
-            "test-password",
+        .dial_over(
+            runtime,
             Box::new(client),
-            header,
             target,
             None,
+            crate::proxy::TunnelDialOptions::new(std::time::Duration::from_secs(3)),
         )
         .await
         .unwrap();
     assert_legacy_bulk_echo(&mut stream.stream).await;
+}
+
+#[cfg(feature = "flow-observation")]
+mod tunneled_request_observation {
+    use super::*;
+    use crate::proxy::request_observation_support::{DeferringCarrier, observed};
+    use crate::runtime::flow_observation::{FlowEvent, Milestone};
+    use tokio::io::AsyncReadExt;
+
+    const METHODS: [(&str, &str); 2] = [
+        ("aes-128-gcm", "test-password"),
+        ("2022-blake3-aes-128-gcm", "AAECAwQFBgcICQoLDA0ODw=="),
+    ];
+
+    fn request_sent(events: &[FlowEvent]) -> bool {
+        matches!(
+            events,
+            [FlowEvent::Milestone {
+                milestone: Milestone::TargetRequestSent
+            }]
+        )
+    }
+
+    async fn dial_over(
+        method: &str,
+        password: &str,
+        carrier: Box<dyn AsyncReadWrite>,
+    ) -> ProxyStream {
+        let mut node = Node {
+            name: "test-ss-observed-tunnel".into(),
+            address: "198.51.100.1:8388".into(),
+            host: "must-not-resolve.invalid".into(),
+            port: 8388,
+            outbound: honk_config::node::OutboundConfig::Shadowsocks(
+                honk_config::node::ShadowsocksConfig {
+                    encryption: Some(method.into()),
+                    password: Some(password.into()),
+                    ..Default::default()
+                },
+            ),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+        ShadowsocksHandler::new()
+            .dial_over(
+                runtime,
+                carrier,
+                "93.184.216.34:80".parse().unwrap(),
+                None,
+                crate::proxy::TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// The request is sent only once the carrier has flushed it, so a
+    /// buffered carrier holds no part of the prologue when the event fires.
+    #[tokio::test]
+    async fn request_sent_follows_the_buffered_carrier_flush() {
+        for (method, password) in METHODS {
+            let (client, mut peer) = tokio::io::duplex(64 * 1024);
+            let (observer, events) = observed();
+            let _stream = observer
+                .scope(dial_over(
+                    method,
+                    password,
+                    Box::new(tokio::io::BufWriter::new(client)),
+                ))
+                .await;
+            assert!(request_sent(&events.lock()), "{method}");
+            let mut salt = [0u8; 16];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                peer.read_exact(&mut salt),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{method}: prologue still buffered"))
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn request_sent_waits_for_a_deferring_carrier() {
+        for (method, password) in METHODS {
+            let (client, _peer) = tokio::io::duplex(64 * 1024);
+            let (carrier, request) = DeferringCarrier::new(client);
+            let (observer, events) = observed();
+            let _stream = observer
+                .scope(dial_over(method, password, Box::new(carrier)))
+                .await;
+            assert!(
+                events.lock().is_empty(),
+                "{method}: published before delivery"
+            );
+            let (request, position) = request.lock().take().expect(method);
+            request.delivered(position);
+            assert!(request_sent(&events.lock()), "{method}");
+        }
+    }
 }
 
 /// A datagram the session cannot open is dropped; the next valid one is

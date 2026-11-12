@@ -662,11 +662,34 @@ async fn tcp_2022_roundtrip_over_a_non_tcp_stream() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     tokio::spawn(serve_mock_2022(server, password, method_name));
 
+    let mut node = Node {
+        name: "test-ss2022-tunnel".into(),
+        address: "198.51.100.1:8388".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 8388,
+        outbound: honk_config::node::OutboundConfig::Shadowsocks(
+            honk_config::node::ShadowsocksConfig {
+                encryption: Some(method_name.into()),
+                password: Some(password.into()),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
     let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
-    let header = crate::proxy::addr::encode_address(target, None).unwrap();
-    let method = Ss2022Method::new(method_name, password).unwrap();
-    let mut stream = dial_stream(Box::new(client), method, header).await.unwrap();
-    assert_2022_echo(&mut stream).await;
+    let mut stream = ShadowsocksHandler::new()
+        .dial_over(
+            runtime,
+            Box::new(client),
+            target,
+            None,
+            crate::proxy::TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+    assert_2022_echo(&mut stream.stream).await;
 }
 
 #[tokio::test]
