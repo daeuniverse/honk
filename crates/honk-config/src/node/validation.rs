@@ -344,3 +344,89 @@ pub fn validate_node_collection(nodes: &[Node]) -> Result<(), DetailedConfigErro
     }
     Ok(())
 }
+
+/// A proxy chain whose hop names resolved against an assembled collection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedChain {
+    /// The chain's index in the collection.
+    pub index: usize,
+    /// The hops' node IDs, entry first.
+    pub hops: Vec<uuid::Uuid>,
+}
+
+/// Resolve every proxy chain hop by name against an assembled collection:
+/// each hop names exactly one proxy node that is not itself a chain, and every
+/// hop after the first can run over a tunneled stream.
+pub fn resolve_chain_hops(nodes: &[Node]) -> Result<Vec<ResolvedChain>, DetailedConfigError> {
+    let mut chains = Vec::new();
+    for (node_index, node) in nodes.iter().enumerate() {
+        let Some(hops) = node.chain_hops() else {
+            continue;
+        };
+        let mut resolved = Vec::with_capacity(hops.len());
+        for (hop_index, hop) in hops.iter().enumerate() {
+            let reject = |code, message| {
+                let mut error = collection_error(node_index, code, message);
+                error.diagnostic.setting = SettingPath::new("nodes")
+                    .index(node_index + 1)
+                    .field("hops")
+                    .index(hop_index + 1);
+                error
+            };
+            let mut matches = nodes.iter().filter(|candidate| candidate.name == *hop);
+            let target = match (matches.next(), matches.next()) {
+                (Some(target), None) => target,
+                (None, _)
+                    if matches!(
+                        hop.as_str(),
+                        crate::Config::BUILTIN_DIRECT_NODE | crate::Config::BUILTIN_BLOCK_NODE
+                    ) =>
+                {
+                    return Err(reject(
+                        "unsupported-chain-hop",
+                        "chain hop must be a proxy node, not a builtin",
+                    ));
+                }
+                (None, _) => {
+                    return Err(reject(
+                        "invalid-chain-hop-reference",
+                        "chain hop is not an assembled node",
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(reject(
+                        "ambiguous-chain-hop-reference",
+                        "chain hop name matches several assembled nodes",
+                    ));
+                }
+            };
+            match target.outbound {
+                OutboundConfig::Direct | OutboundConfig::Block => {
+                    return Err(reject(
+                        "unsupported-chain-hop",
+                        "chain hop must be a proxy node, not a builtin",
+                    ));
+                }
+                OutboundConfig::Chain { .. } => {
+                    return Err(reject(
+                        "unsupported-chain-hop",
+                        "chain hop must not be another chain",
+                    ));
+                }
+                _ if hop_index > 0 && !target.supports_tunneled_dial() => {
+                    return Err(reject(
+                        "unsupported-chain-hop",
+                        "chain hop after the first must support tunneled dial",
+                    ));
+                }
+                _ => {}
+            }
+            resolved.push(target.id);
+        }
+        chains.push(ResolvedChain {
+            index: node_index,
+            hops: resolved,
+        });
+    }
+    Ok(chains)
+}

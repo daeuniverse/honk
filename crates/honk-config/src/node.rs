@@ -10,7 +10,7 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::{MAX_CHAIN_HOPS, validate_node_collection};
+pub use validation::{MAX_CHAIN_HOPS, ResolvedChain, resolve_chain_hops, validate_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;

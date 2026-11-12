@@ -203,3 +203,97 @@ fn ordinary_nodes_do_not_serialize_hops() {
     let decoded: Node = serde_json::from_value(with_hops).unwrap();
     assert_eq!(decoded.outbound, node.outbound);
 }
+
+mod assembled {
+    use super::*;
+    use honk_config::node::{ResolvedChain, resolve_chain_hops};
+
+    const HY2: &str = "hysteria2://auth@hy2.example:443";
+    const VISION: &str = "vless://00000000-0000-4000-8000-000000000001@vless.example:443?security=tls&flow=xtls-rprx-vision";
+
+    fn rejection(nodes: &str) -> DetailedDiagnostic {
+        let (config, _) = parse(nodes).unwrap();
+        *config.validate_assembled().unwrap_err().diagnostic
+    }
+
+    #[test]
+    fn valid_chains_pass_with_any_first_hop() {
+        for front in [SOCKS, HY2, VISION] {
+            let (config, _) = parse(&format!(
+                " front: '{front}'\n mid: '{SS}'\n land: '{TROJAN}'\n via: front -> mid -> land\n"
+            ))
+            .unwrap();
+            config.validate_assembled().unwrap();
+        }
+    }
+
+    #[test]
+    fn hops_resolve_to_node_ids_entry_first() {
+        let (config, _) = parse(&format!(
+            " via: land -> front\n front: '{SOCKS}'\n land: '{TROJAN}'\n back: front -> land\n"
+        ))
+        .unwrap();
+        let index = |name| {
+            config
+                .nodes
+                .iter()
+                .position(|node| node.name == name)
+                .unwrap()
+        };
+        let id = |name| config.nodes[index(name)].id;
+        assert_eq!(
+            resolve_chain_hops(&config.nodes).unwrap(),
+            [
+                ResolvedChain {
+                    index: index("via"),
+                    hops: vec![id("land"), id("front")],
+                },
+                ResolvedChain {
+                    index: index("back"),
+                    hops: vec![id("front"), id("land")],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_hop_is_rejected() {
+        let error = rejection(&format!(" front: '{SOCKS}'\n via: front -> land\n"));
+        assert_eq!(error.code, "invalid-chain-hop-reference");
+        assert_eq!(error.setting.to_string(), "nodes[2].hops[2]");
+    }
+
+    #[test]
+    fn duplicate_hop_name_is_rejected() {
+        let error = rejection(&format!(
+            " front: '{SOCKS}'\n land: '{TROJAN}'\n land: '{SS}'\n via: front -> land\n"
+        ));
+        assert_eq!(error.code, "ambiguous-chain-hop-reference");
+    }
+
+    #[test]
+    fn builtins_and_chains_cannot_be_hops() {
+        for hops in [
+            "direct -> land",
+            "front -> block",
+            "inner -> land",
+            "front -> inner",
+        ] {
+            let error = rejection(&format!(
+                " front: '{SOCKS}'\n land: '{TROJAN}'\n inner: front -> land\n via: {hops}\n"
+            ));
+            assert_eq!(error.code, "unsupported-chain-hop", "{hops}");
+        }
+    }
+
+    #[test]
+    fn later_hops_must_support_tunneled_dial() {
+        for exit in [HY2, VISION, "anytls://secret@anytls.example:443"] {
+            let error = rejection(&format!(
+                " front: '{SOCKS}'\n land: '{exit}'\n via: front -> land\n"
+            ));
+            assert_eq!(error.code, "unsupported-chain-hop", "{exit}");
+            assert_eq!(error.setting.to_string(), "nodes[3].hops[2]");
+        }
+    }
+}
