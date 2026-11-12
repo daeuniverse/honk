@@ -1011,12 +1011,19 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
         forwarder.hosts = Some(Arc::new(
             HostsFile::parse_rules("full:alias.test upstream.test\n").unwrap(),
         ));
-        for _ in 0..2 {
+        for attempt in 0..2 {
             let outcome = forwarder
                 .resolve_outcome(&build_dns_query("alias.test", 1))
                 .await
                 .unwrap();
-            assert_eq!(outcome.status(), OutcomeStatus::Rejected);
+            // Cache hits expose the stored synthetic wire as Accepted; only
+            // the cold response-policy lookup carries its rejection verdict.
+            let expected_status = if response_reject && attempt == 1 {
+                OutcomeStatus::Accepted
+            } else {
+                OutcomeStatus::Rejected
+            };
+            assert_eq!(outcome.status(), expected_status);
             assert!(outcome.answer_ips().is_empty());
             assert_eq!(outcome.domain(), "alias.test");
             assert_eq!(outcome.qtype(), 1);
@@ -1027,9 +1034,31 @@ async fn alias_keeps_target_request_and_response_rejections_without_target_ident
                 .resolve_outcome(&build_dns_query("upstream.test", 1))
                 .await
                 .unwrap();
-            assert_eq!(outcome.final_upstream(), target.final_upstream());
-            assert_eq!(outcome.requery_history(), target.requery_history());
-            assert_eq!(outcome.final_upstream().is_some(), response_reject);
+            assert_eq!(
+                target.status(),
+                if response_reject {
+                    OutcomeStatus::Accepted
+                } else {
+                    OutcomeStatus::Rejected
+                }
+            );
+            assert!(target.answer_ips().is_empty());
+            if response_reject {
+                assert_eq!(target.provenance(), Provenance::Cache);
+                assert_eq!(target.final_upstream(), None);
+                assert!(target.requery_history().is_empty());
+            } else {
+                assert_eq!(target.provenance(), Provenance::Fresh);
+            }
+            if response_reject && attempt == 0 {
+                assert_eq!(outcome.final_upstream(), Some("upstream"));
+                assert_eq!(outcome.requery_history(), &["upstream"]);
+            } else {
+                assert_eq!(outcome.final_upstream(), target.final_upstream());
+                assert_eq!(outcome.requery_history(), target.requery_history());
+                assert_eq!(outcome.final_upstream(), None);
+                assert!(outcome.requery_history().is_empty());
+            }
             #[cfg(feature = "native-api")]
             {
                 assert_eq!(outcome.cache_entry_id(), None);
