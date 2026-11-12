@@ -29,7 +29,7 @@ use super::response::{append_edns, make_address_response, response_prefix};
 use super::{DnsForwardError, DnsForwarder, ResolveMode, ResolveOptions};
 
 const HOSTS_TTL_SECS: u32 = 60;
-/// Longest chain of hosts aliases one lookup follows; a loop always exceeds it.
+/// Maximum followed aliases; loops are rejected separately.
 const MAX_ALIAS_DEPTH: usize = 8;
 
 #[derive(Debug, Default)]
@@ -270,7 +270,7 @@ impl HostsFile {
     }
 
     fn parse(contents: &str) -> Self {
-        let mut entries: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        let mut entries = HashMap::new();
         for line in contents.lines() {
             let fields = line
                 .split_once('#')
@@ -285,17 +285,17 @@ impl HostsFile {
                 if hostname.is_empty() {
                     continue;
                 }
-                let addresses = entries.entry(hostname).or_default();
-                if !addresses.contains(&address) {
+                if let HostsTarget::Addresses(addresses) = entries
+                    .entry(hostname)
+                    .or_insert_with(|| HostsTarget::Addresses(Vec::new()))
+                    && !addresses.contains(&address)
+                {
                     addresses.push(address);
                 }
             }
         }
         Self {
-            entries: entries
-                .into_iter()
-                .map(|(hostname, addresses)| (hostname, HostsTarget::Addresses(addresses)))
-                .collect(),
+            entries,
             rules: Vec::new(),
             has_aliases: false,
         }
@@ -452,7 +452,7 @@ fn parse_target<'a>(
     let Some(first) = values.next() else {
         return Err(invalid_rule(line, "rule contains no IP address or alias"));
     };
-    if first.parse::<IpAddr>().is_err() {
+    let Ok(address) = first.parse::<IpAddr>() else {
         let alias = normalize_hostname(first);
         if !is_hostname(&alias) {
             return Err(invalid_rule(line, format!("invalid IP or alias {first:?}")));
@@ -464,9 +464,9 @@ fn parse_target<'a>(
             ));
         }
         return Ok(HostsTarget::Alias(alias));
-    }
-    let mut addresses = Vec::new();
-    for value in std::iter::once(first).chain(values) {
+    };
+    let mut addresses = vec![address];
+    for value in values {
         let address = value
             .parse::<IpAddr>()
             .map_err(|error| invalid_rule(line, format!("invalid IP {value:?}: {error}")))?;
@@ -555,7 +555,7 @@ impl DnsForwarder {
     /// Answer an alias with its CNAME chain followed by the answer records of
     /// the last target, which resolves through the whole pipeline. The
     /// composed answer is local, so it bypasses the cache like other hosts
-    /// answers; the target's own lookup does not.
+    /// answers; the target lookup keeps the caller's cache policy.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn resolve_hosts_alias(
         &self,
@@ -597,8 +597,8 @@ impl DnsForwarder {
             .is_some_and(|hosts| matches!(hosts.target_for(domain), Some(HostsTarget::Alias(_))))
     }
 
-    /// Follow a hosts alias for a node server host. `None` unless `host` is an
-    /// alias: address entries do not apply to node hosts.
+    /// Follow a hosts alias for a node server host. Direct address matches
+    /// do not claim the original host; an alias may end at an address entry.
     pub(crate) fn node_host_alias(&self, host: &str) -> anyhow::Result<Option<NodeHostAlias>> {
         let Some(hosts) = self.hosts.as_deref() else {
             return Ok(None);

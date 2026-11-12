@@ -301,8 +301,8 @@ fn enabled_hosts_load_failure_is_fatal_but_disabled_hosts_skips_io() {
     assert!(forwarder.with_hosts_from_config(&config).is_err());
 }
 
-/// Answers `upstream.test` with a compressed CNAME to `edge.upstream.test`
-/// and its address, `nodata.test` with NOERROR and no records,
+/// Answers A queries for `upstream.test` with a compressed CNAME to
+/// `edge.upstream.test` and its address, `nodata.test` with NOERROR and no records,
 /// `missing.test` with NXDOMAIN, and fails `broken.test`.
 #[derive(Default)]
 struct ScriptedUpstream {
