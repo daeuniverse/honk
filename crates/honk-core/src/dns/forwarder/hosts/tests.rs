@@ -746,3 +746,74 @@ async fn alias_leaves_other_qtypes_and_hard_filtered_families_alone() {
     assert_eq!(answers(a.rendered()).len(), 2);
     assert_eq!(upstream.names.lock().unwrap().len(), 1);
 }
+
+#[derive(Default)]
+struct QueryCapture {
+    queries: std::sync::Mutex<Vec<Vec<u8>>>,
+}
+
+#[async_trait]
+impl DnsUpstreamPool for QueryCapture {
+    async fn query(&self, _upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        self.queries.lock().unwrap().push(raw.to_vec());
+        let query = QueryContext::parse(raw)?;
+        Ok(make_empty_response(raw, &query))
+    }
+}
+
+#[tokio::test]
+async fn alias_rejects_unsupported_query_sections_before_io() {
+    let upstream = Arc::new(QueryCapture::default());
+    let forwarder = rules_forwarder(
+        "full:a.test longer.example\n",
+        Default::default(),
+        upstream.clone(),
+    );
+    for (section, owner) in [(6, vec![0]), (8, vec![0]), (10, vec![0]), (10, vec![0xc0, 0x0e])] {
+        let mut query = build_dns_query("a.test", 1);
+        query[section..section + 2].copy_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&owner);
+        query.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1]);
+        assert!(QueryContext::parse(&query).is_ok());
+        let error = forwarder.resolve_outcome(&query).await.expect_err("unsupported section");
+        assert!(error.to_string().contains("unsupported hosts alias query"), "{error}");
+        assert!(upstream.queries.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn alias_target_query_preserves_opt_options_flags_and_question_fields() {
+    let upstream = Arc::new(QueryCapture::default());
+    let forwarder = rules_forwarder(
+        "full:a.test longer.example\n",
+        Default::default(),
+        upstream.clone(),
+    );
+    for qtype in [1, 28] {
+        for compressed in [false, true] {
+            let mut query = build_dns_query("a.test", qtype);
+            query[..4].copy_from_slice(&[0x12, 0x34, 0x01, 0x30]);
+            let root = query.len() - 5;
+            query[10..12].copy_from_slice(&1u16.to_be_bytes());
+            if compressed {
+                query.extend_from_slice(&(0xc000 | root as u16).to_be_bytes());
+            } else {
+                query.push(0);
+            }
+            let opt = [0, 41, 0x05, 0x00, 0, 1, 0x80, 0x01, 0, 7, 0xfd, 0xe9, 0, 3, 1, 2, 3];
+            query.extend_from_slice(&opt);
+            assert!(!QueryContext::parse(&query).unwrap().is_cacheable());
+            forwarder.resolve_outcome(&query).await.expect("supported EDNS query");
+            let captured = upstream.queries.lock().unwrap();
+            let target = captured.last().unwrap();
+            assert_eq!(&target[..12], &query[..12]);
+            let parsed = QueryContext::parse(target).unwrap();
+            assert_eq!(parsed.qname().unwrap().to_domain_name().unwrap(), "longer.example");
+            assert_eq!(parsed.qtype().unwrap().get(), qtype);
+            assert_eq!(parsed.qclass().unwrap().get(), 1);
+            let end = parsed.question_offsets().unwrap().end();
+            assert_eq!(target[end], 0);
+            assert_eq!(&target[end + 1..], &opt);
+        }
+    }
+}

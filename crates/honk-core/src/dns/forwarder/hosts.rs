@@ -570,7 +570,7 @@ impl DnsForwarder {
         publication_epoch: PublicationEpoch,
     ) -> Result<DnsOutcome, DnsForwardError> {
         let target = chain.last().expect("an alias chain names its target");
-        let target_query = retarget_query(raw_query, parsed.query(), target);
+        let target_query = retarget_query(raw_query, parsed.query(), target)?;
         let target = resolve_with_owner(
             self,
             &target_query,
@@ -616,16 +616,41 @@ impl DnsForwarder {
     }
 }
 
-fn retarget_query(raw_query: &[u8], query: &QueryContext, target: &str) -> Vec<u8> {
-    let (name_start, question_end) = query
+fn retarget_query(
+    raw_query: &[u8],
+    query: &QueryContext,
+    target: &str,
+) -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        raw_query[4..10] == [0, 1, 0, 0, 0, 0]
+            && matches!(&raw_query[10..12], [0, 0] | [0, 1]),
+        "unsupported hosts alias query sections"
+    );
+    let question_end = query
         .question_offsets()
-        .map_or((12, 12), |offsets| (offsets.start(), offsets.end()));
-    let fields = question_end.saturating_sub(4).max(name_start);
+        .context("hosts alias query has no question")?
+        .end();
+    let opt_fields = if raw_query[10..12] == [0, 1] {
+        let mut name = [0; 255];
+        let (length, fields) = parse_name_into(raw_query, question_end, &mut name)?;
+        anyhow::ensure!(
+            name[..length] == [0] && raw_query[fields..fields + 2] == [0, 41],
+            "unsupported hosts alias query additional record"
+        );
+        Some(fields)
+    } else {
+        None
+    };
     let mut retargeted = Vec::with_capacity(raw_query.len() + target.len() + 2);
-    retargeted.extend_from_slice(&raw_query[..name_start]);
+    retargeted.extend_from_slice(&raw_query[..12]);
     append_name(&mut retargeted, target);
-    retargeted.extend_from_slice(&raw_query[fields..]);
-    retargeted
+    retargeted.extend_from_slice(&raw_query[question_end - 4..question_end]);
+    if let Some(fields) = opt_fields {
+        // The old root owner may be compressed into the replaced question.
+        retargeted.push(0);
+        retargeted.extend_from_slice(&raw_query[fields..]);
+    }
+    Ok(retargeted)
 }
 
 /// RFC 6604: the RCODE describes the last name in the chain, so a target
