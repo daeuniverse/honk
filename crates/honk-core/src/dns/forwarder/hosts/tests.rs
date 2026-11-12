@@ -851,3 +851,71 @@ async fn alias_preserves_small_truncated_target_without_authoritative_ips() {
     assert!(outcome.answer_ips().is_empty());
     assert!(!outcome.expiry().is_cacheable());
 }
+
+struct ExtendedErrorUpstream(u16);
+
+#[async_trait]
+impl DnsUpstreamPool for ExtendedErrorUpstream {
+    async fn query(&self, _upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let query = QueryContext::parse(raw)?;
+        let end = query.question_offsets().unwrap().end();
+        let mut response = raw[..end].to_vec();
+        response[2..4].copy_from_slice(&(0x8180 | (self.0 & 15)).to_be_bytes());
+        response[6..12].fill(0);
+        response[10..12].copy_from_slice(&1u16.to_be_bytes());
+        response.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, (self.0 >> 4) as u8, 0, 0, 0, 0, 0]);
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn alias_preserves_extended_errors_and_emits_valid_badvers_opt() {
+    for code in [16, 23] {
+        let forwarder = rules_forwarder(
+            "full:alias.test target.test\n",
+            Default::default(),
+            Arc::new(ExtendedErrorUpstream(code)),
+        );
+        for version in [None, Some(0), Some(1)] {
+            let mut query = build_dns_query("alias.test", 1);
+            if let Some(version) = version {
+                query[10..12].copy_from_slice(&1u16.to_be_bytes());
+                query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, version, 0x80, 0, 0, 0]);
+            }
+            let outcome = forwarder.resolve_outcome(&query).await.expect("error outcome");
+            let response = outcome.rendered();
+            let decoded = QueryContext::parse(response).expect("valid error OPT");
+            assert_eq!(&response[6..10], &[0, 0, 0, 0]);
+            assert!(outcome.answer_ips().is_empty());
+            if version.is_some() {
+                let opt = decoded.edns().expect("extended error requires OPT");
+                assert_eq!(u16::from(opt.extended_rcode()) * 16 + u16::from(rcode(response)), code);
+                assert_eq!(opt.version(), 0);
+                assert_eq!(opt.advertised_size(), 1232);
+                assert!(opt.dnssec_ok());
+            } else {
+                assert_eq!(rcode(response), 2);
+                assert!(decoded.edns().is_none());
+                assert_eq!(&response[10..12], &[0, 0]);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_hosts_keep_existing_edns_version_sanitization() {
+    let forwarder = rules_forwarder(
+        "full:address.test 192.0.2.81\n",
+        Default::default(),
+        Arc::new(CountingUpstream::default()),
+    );
+    for version in [0, 1] {
+        let mut query = build_dns_query("address.test", 1);
+        query[10..12].copy_from_slice(&1u16.to_be_bytes());
+        query.extend_from_slice(&[0, 0, 41, 0x04, 0xd0, 0, version, 0x80, 0, 0, 0]);
+        let outcome = forwarder.resolve_outcome(&query).await.unwrap();
+        let decoded = QueryContext::parse(outcome.rendered()).unwrap();
+        assert_eq!(decoded.edns().is_some(), version == 0);
+        assert_eq!(outcome.answer_ips(), &["192.0.2.81".parse::<IpAddr>().unwrap()]);
+    }
+}

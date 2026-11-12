@@ -564,7 +564,7 @@ mod response {
             answer_count += 1;
         }
         response[6..8].copy_from_slice(&answer_count.to_be_bytes());
-        append_edns(&mut response, query);
+        append_edns(&mut response, query, 0);
         response
     }
 
@@ -600,13 +600,13 @@ mod response {
         (response, (0xc000 | question_offset).to_be_bytes())
     }
 
-    pub(super) fn append_edns(response: &mut Vec<u8>, query: &QueryContext) {
-        if let Some(edns) = query.edns().filter(|edns| edns.version() == 0) {
+    pub(super) fn append_edns(response: &mut Vec<u8>, query: &QueryContext, rcode: u16) {
+        if let Some(edns) = query.edns().filter(|edns| edns.version() == 0 || rcode > 15) {
             response[10..12].copy_from_slice(&1u16.to_be_bytes());
             response.extend_from_slice(&[0, 0, 41]);
             response.extend_from_slice(&edns.advertised_size().to_be_bytes());
             let flags = if edns.dnssec_ok() { 0x8000u32 } else { 0 };
-            response.extend_from_slice(&flags.to_be_bytes());
+            response.extend_from_slice(&((u32::from(rcode >> 4) << 24) | flags).to_be_bytes());
             response.extend_from_slice(&0u16.to_be_bytes());
         }
     }

@@ -22,6 +22,44 @@ pub(crate) fn is_truncated(response: &[u8]) -> bool {
     u16::from_be_bytes([flags[0], flags[1]]) & TC != 0
 }
 
+/// Read the full twelve-bit RCODE without allocating a query or record list.
+pub(crate) fn response_rcode(wire: &[u8]) -> Result<u16, ResponseError> {
+    let mut code = read_u16(wire, 2)? & 0x000f;
+    let mut seen_opt = false;
+    let mut invalid = false;
+    visit_message(None, wire, |record| {
+        let mut name = [0; 255];
+        let Ok((length, fields)) = parse_name_into(wire, record.wire.start, &mut name) else {
+            invalid = true;
+            return;
+        };
+        if read_u16(wire, fields) != Ok(41) {
+            return;
+        }
+        if record.section != Section::Additional || seen_opt || name[..length] != [0] {
+            invalid = true;
+            return;
+        }
+        seen_opt = true;
+        code |= u16::from(wire[fields + 4]) << 4;
+        let mut option = fields + 10;
+        while option < record.wire.end {
+            if option + 4 > record.wire.end {
+                invalid = true;
+                break;
+            }
+            option += 4 + usize::from(u16::from_be_bytes([wire[option + 2], wire[option + 3]]));
+            if option > record.wire.end {
+                invalid = true;
+            }
+        }
+    })?;
+    if invalid {
+        return Err(ResponseError::MalformedRecord);
+    }
+    Ok(code)
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ResponseError {
     #[error("DNS response is shorter than its header")]

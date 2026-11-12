@@ -582,7 +582,7 @@ impl DnsForwarder {
             None,
         )
         .await?;
-        let response = alias_response(raw_query, parsed.query(), chain, target.reusable());
+        let response = alias_response(raw_query, parsed.query(), chain, target.reusable())?;
         self.local_outcome_from_wire(engine, parsed, response, mode)
     }
 
@@ -661,12 +661,13 @@ fn alias_response(
     query: &QueryContext,
     chain: &[&str],
     target: &[u8],
-) -> Vec<u8> {
-    let rcode = target.get(3).map_or(2, |flags| flags & 0x0f);
+) -> anyhow::Result<Vec<u8>> {
+    let rcode = crate::dns::response::response_rcode(target)?;
+    let rcode = if rcode > 15 && query.edns().is_none() { 2 } else { rcode };
     let (mut response, question_name) = response_prefix(
         raw_query,
         query,
-        rcode,
+        (rcode & 0x0f) as u8,
         target.len().saturating_add(chain.len() * 64),
     );
     if crate::dns::response::is_truncated(target) {
@@ -690,8 +691,8 @@ fn alias_response(
         let answers = chain.len() as u16 + copy_answers(&mut response, target, qtype);
         response[6..8].copy_from_slice(&answers.to_be_bytes());
     }
-    append_edns(&mut response, query);
-    response
+    append_edns(&mut response, query, rcode);
+    Ok(response)
 }
 
 /// Append the target's CNAME and `qtype` answer records with every name
