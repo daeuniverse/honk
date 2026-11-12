@@ -592,15 +592,15 @@ impl DnsForwarder {
     }
 
     pub(crate) fn is_hosts_alias(&self, domain: &str) -> bool {
-        self.hosts
-            .as_deref()
-            .is_some_and(|hosts| matches!(hosts.target_for(domain), Some(HostsTarget::Alias(_))))
+        self.hosts.as_deref().is_some_and(|hosts| {
+            hosts.has_aliases && matches!(hosts.target_for(domain), Some(HostsTarget::Alias(_)))
+        })
     }
 
     /// Follow a hosts alias for a node server host. Direct address matches
     /// do not claim the original host; an alias may end at an address entry.
     pub(crate) fn node_host_alias(&self, host: &str) -> anyhow::Result<Option<NodeHostAlias>> {
-        let Some(hosts) = self.hosts.as_deref() else {
+        let Some(hosts) = self.hosts.as_deref().filter(|hosts| hosts.has_aliases) else {
             return Ok(None);
         };
         let Some(HostsTarget::Alias(first)) = hosts.target_for(host) else {
