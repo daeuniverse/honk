@@ -837,7 +837,7 @@ impl ControlPlaneHandle {
                         native_flow_id: endpoint.native.flow().map(|flow| flow.id().to_owned()),
                         rule,
                         rule_payload,
-                        chains: connection_chains(selection_chain, &node.name),
+                        chains: connection_chains(selection_chain, &node),
                         upload,
                         download,
                         start_time: std::time::Instant::now(),

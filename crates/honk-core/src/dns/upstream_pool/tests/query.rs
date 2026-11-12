@@ -747,6 +747,62 @@ async fn test_tcp_query_pooled() {
     server_handle.await.unwrap();
 }
 
+/// A TCP DNS query routed to a proxy chain reaches the server through each
+/// hop, dialed in the DNS fork of the chain's generation.
+#[tokio::test]
+async fn tcp_query_through_a_chain_crosses_every_hop() {
+    use crate::test_support::{socks5_chain, socks5_relay};
+
+    let response = mock_dns_response(0x4321);
+    let answer = response.clone();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let length = usize::from(stream.read_u16().await.unwrap());
+        let mut query = vec![0_u8; length];
+        stream.read_exact(&mut query).await.unwrap();
+        stream
+            .write_all(&u16::try_from(answer.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        stream.write_all(&answer).await.unwrap();
+    });
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let nodes = socks5_chain(&front, &land).to_vec();
+    let generation =
+        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
+    let pool = UpstreamPool::new_with_proxy(
+        &[make_upstream(
+            "chained",
+            &server_address.to_string(),
+            DnsProtocol::Tcp,
+        )],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+        )),
+        nodes,
+        vec![],
+    )
+    .unwrap()
+    .with_traffic_router(Arc::new(tokio::sync::RwLock::new(
+        Router::new(&[], "via").unwrap(),
+    )));
+    pool.set_runtime_generation(generation).unwrap();
+    assert_eq!(
+        pool.query("chained", &mock_dns_query(0x4321))
+            .await
+            .unwrap(),
+        response
+    );
+    server.await.unwrap();
+    assert_eq!(*front.requests.lock(), [land.addr]);
+    assert_eq!(*land.requests.lock(), [server_address]);
+    pool.close().await;
+}
+
 #[tokio::test]
 async fn test_udp_hedged_retry_on_loss() {
     let response = mock_dns_response(0x1234);
