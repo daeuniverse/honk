@@ -950,3 +950,58 @@ async fn alias_rejects_zero_short_and_trailing_cname_rdata_without_partial_succe
         );
     }
 }
+
+#[tokio::test]
+async fn alias_keeps_target_request_and_response_rejections_without_target_identity() {
+    use honk_config::dns::DnsResponseAction;
+
+    for response_reject in [false, true] {
+        let upstream = Arc::new(ScriptedUpstream::default());
+        let mut config = DnsConfig::default();
+        config.routing.request.rules = vec![DnsRequestRule {
+            conditions: vec![DnsCond::Qname {
+                not: false,
+                matchers: vec![DnsDomainMatcher::Full("upstream.test".into())],
+            }],
+            action: if response_reject {
+                DnsRequestAction::Upstream("upstream".into())
+            } else {
+                DnsRequestAction::Reject
+            },
+        }];
+        if response_reject {
+            config.routing.response.fallback = DnsResponseAction::Reject;
+        }
+        let router = Arc::new(DnsRouter::new_from_dns_config(&config).unwrap());
+        let mut forwarder = DnsForwarder::new(
+            upstream.clone(),
+            Arc::new(Mutex::new(DnsCache::new(100))),
+            router,
+        ).with_policy_from_config(&config).unwrap();
+        forwarder.hosts = Some(Arc::new(HostsFile::parse_rules(
+            "full:alias.test upstream.test\n",
+        ).unwrap()));
+        for _ in 0..2 {
+            let outcome = forwarder.resolve_outcome(&build_dns_query("alias.test", 1)).await.unwrap();
+            assert_eq!(outcome.status(), OutcomeStatus::Rejected);
+            assert!(outcome.answer_ips().is_empty());
+            assert_eq!(outcome.domain(), "alias.test");
+            assert_eq!(outcome.qtype(), 1);
+            assert!(!outcome.expiry().is_cacheable());
+            assert_eq!(outcome.provenance(), Provenance::Fresh);
+            assert_eq!(outcome.logical_upstream(), None);
+            let target = forwarder.resolve_outcome(&build_dns_query("upstream.test", 1)).await.unwrap();
+            assert_eq!(outcome.final_upstream(), target.final_upstream());
+            assert_eq!(outcome.requery_history(), target.requery_history());
+            assert_eq!(outcome.final_upstream().is_some(), response_reject);
+            #[cfg(feature = "native-api")]
+            {
+                assert_eq!(outcome.cache_entry_id(), None);
+                assert_eq!(outcome.request_route().source, crate::dns::outcome::RouteSource::Default);
+                assert!(outcome.request_route().rule.is_none());
+                assert_eq!(target.request_route().source, crate::dns::outcome::RouteSource::Routing);
+            }
+        }
+        assert_eq!(upstream.names.lock().unwrap().len(), usize::from(response_reject));
+    }
+}

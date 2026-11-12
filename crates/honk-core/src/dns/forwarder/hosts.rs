@@ -584,6 +584,7 @@ impl DnsForwarder {
         .await?;
         let response = alias_response(raw_query, parsed.query(), chain, target.reusable())?;
         self.local_outcome_from_wire(engine, parsed, response, mode)
+            .map(|outcome| outcome.with_alias_target(target))
     }
 
     pub(crate) fn has_hosts_aliases(&self) -> bool {
