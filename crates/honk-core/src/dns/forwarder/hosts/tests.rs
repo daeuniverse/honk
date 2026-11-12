@@ -919,3 +919,34 @@ async fn address_hosts_keep_existing_edns_version_sanitization() {
         assert_eq!(outcome.answer_ips(), &["192.0.2.81".parse::<IpAddr>().unwrap()]);
     }
 }
+
+struct MalformedCnameUpstream(Vec<u8>);
+
+#[async_trait]
+impl DnsUpstreamPool for MalformedCnameUpstream {
+    async fn query(&self, _upstream_name: &str, raw: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let query = QueryContext::parse(raw)?;
+        let mut response = make_address_response(raw, &query, &["192.0.2.82".parse().unwrap()], 60);
+        response[6..8].copy_from_slice(&3u16.to_be_bytes());
+        response.extend_from_slice(&[0xc0, 0x0c, 0, 5, 0, 1, 0, 0, 0, 60]);
+        response.extend_from_slice(&(self.0.len() as u16).to_be_bytes());
+        response.extend_from_slice(&self.0);
+        response.extend_from_slice(&[0, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 83]);
+        Ok(response)
+    }
+}
+
+#[tokio::test]
+async fn alias_rejects_zero_short_and_trailing_cname_rdata_without_partial_success() {
+    for rdata in [vec![], vec![0xc0], vec![0, 0]] {
+        let forwarder = rules_forwarder(
+            "full:alias.test target.test\n",
+            Default::default(),
+            Arc::new(MalformedCnameUpstream(rdata.clone())),
+        );
+        assert!(
+            forwarder.resolve_outcome(&build_dns_query("alias.test", 1)).await.is_err(),
+            "accepted malformed CNAME RDATA {rdata:?}"
+        );
+    }
+}

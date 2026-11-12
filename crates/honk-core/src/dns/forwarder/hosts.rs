@@ -688,7 +688,7 @@ fn alias_response(
             append_name(&mut response, name);
             owner = Some(name);
         }
-        let answers = chain.len() as u16 + copy_answers(&mut response, target, qtype);
+        let answers = chain.len() as u16 + copy_answers(&mut response, target, qtype)?;
         response[6..8].copy_from_slice(&answers.to_be_bytes());
     }
     append_edns(&mut response, query, rcode);
@@ -697,40 +697,36 @@ fn alias_response(
 
 /// Append the target's CNAME and `qtype` answer records with every name
 /// expanded, since compression pointers only make sense in their own message.
-fn copy_answers(response: &mut Vec<u8>, target: &[u8], qtype: u16) -> u16 {
-    let Some(header) = target.get(..12) else {
-        return 0;
-    };
+fn copy_answers(response: &mut Vec<u8>, target: &[u8], qtype: u16) -> anyhow::Result<u16> {
+    let header = target.get(..12).context("truncated alias target header")?;
     let questions = u16::from_be_bytes([header[4], header[5]]);
     let answers = u16::from_be_bytes([header[6], header[7]]);
     let mut cursor = 12;
     for _ in 0..questions {
-        if !crate::dns::wire::skip_dns_name(target, &mut cursor) {
-            return 0;
-        }
+        anyhow::ensure!(
+            crate::dns::wire::skip_dns_name(target, &mut cursor),
+            "malformed alias target question"
+        );
         cursor += 4;
     }
     let mut copied = 0u16;
     let mut name = [0; 255];
     for _ in 0..answers {
-        let Ok((owner_length, fields)) = parse_name_into(target, cursor, &mut name) else {
-            break;
-        };
-        let Some(fixed) = target.get(fields..fields + 10) else {
-            break;
-        };
+        let (owner_length, fields) = parse_name_into(target, cursor, &mut name)?;
+        let fixed = target
+            .get(fields..fields + 10)
+            .context("truncated alias target record")?;
         let record_type = u16::from_be_bytes([fixed[0], fixed[1]]);
         let rdata_start = fields + 10;
         let rdata_end = rdata_start + usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
-        let Some(rdata) = target.get(rdata_start..rdata_end) else {
-            break;
-        };
+        let rdata = target
+            .get(rdata_start..rdata_end)
+            .context("truncated alias target RDATA")?;
         cursor = rdata_end;
         if record_type == 5 {
             let mut alias = [0; 255];
-            let Ok((alias_length, _)) = parse_name_into(target, rdata_start, &mut alias) else {
-                break;
-            };
+            let (alias_length, encoded_end) = parse_name_into(target, rdata_start, &mut alias)?;
+            anyhow::ensure!(encoded_end == rdata_end, "malformed alias target CNAME RDATA");
             response.extend_from_slice(&name[..owner_length]);
             response.extend_from_slice(&fixed[..8]);
             response.extend_from_slice(&(alias_length as u16).to_be_bytes());
@@ -747,7 +743,7 @@ fn copy_answers(response: &mut Vec<u8>, target: &[u8], qtype: u16) -> u16 {
             break;
         }
     }
-    copied
+    Ok(copied)
 }
 
 /// `name` is a validated hostname, so every label fits its length byte.
