@@ -465,7 +465,8 @@ fn parse_target<'a>(
         }
         return Ok(HostsTarget::Alias(alias));
     };
-    let mut addresses = vec![address];
+    let mut addresses = Vec::new();
+    addresses.push(address);
     for value in values {
         let address = value
             .parse::<IpAddr>()
