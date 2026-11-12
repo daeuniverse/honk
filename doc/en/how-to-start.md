@@ -292,6 +292,15 @@ The file is also applied at every boot. Check the values; each should be `0`:
 sysctl net.ipv4.conf.all.send_redirects net.ipv4.conf.br-lan.send_redirects net.ipv4.conf.all.rp_filter
 ```
 
+On a host that also runs Docker, the daemon usually sets the default policy of the iptables `FORWARD` chain to `DROP`. honk takes proxied TCP and UDP on the host, so they still work, but direct traffic and ICMP from clients must be forwarded and are dropped. Check the policy. If the first command prints `-P FORWARD DROP`, accept traffic that enters and leaves the LAN interface in Docker's `DOCKER-USER` chain:
+
+```shell
+sudo iptables -S FORWARD | head -1
+sudo iptables -I DOCKER-USER -i br-lan -o br-lan -j ACCEPT
+```
+
+The rule does not persist across reboots; add it to the host's firewall configuration.
+
 A client that already received a redirect may keep the learned route for a while; reconnect it to the network before testing.
 
 ### Web UI and APIs
@@ -560,7 +569,7 @@ cargo run --release -p honk-core -- \
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
 | `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
-| On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways). |
+| On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. On a Docker host, also accept forwarded LAN traffic in `DOCKER-USER`. See [Single-arm gateways](#single-arm-gateways). |
 | VLESS/VMess reports `No handler for protocol` | The build lacks `rprx`; use the default features or add `rprx` explicitly. |
 | A Geo rule fails to load | Put `geoip.dat`/`geosite.dat` in the configured `data_dir`, or verify the documented legacy/share search locations; remove unused Geo rules if not needed. |
 | A GNU binary does not execute on VyOS or a minimal system | Use the musl release for the same architecture. |
