@@ -63,7 +63,7 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             let source = client.local_addr().unwrap();
             let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
             socket.connect(destination).await.unwrap();
-            let local_transport = socket.local_addr().unwrap();
+            let socket_handle = Arc::downgrade(&socket);
             let endpoint = Arc::new(UdpEndpoint::new(
                 transport(socket, destination),
                 destination,
@@ -165,8 +165,10 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
             while weak.upgrade().is_some() {
                 tokio::task::yield_now().await;
             }
-            let socket_released = UdpSocket::bind(local_transport).await.unwrap();
-            drop(socket_released);
+            assert!(
+                socket_handle.upgrade().is_none(),
+                "endpoint released its UDP socket"
+            );
             let mut pending = Box::pin(pending.wait());
             assert!(futures::poll!(&mut pending).is_pending());
             assert!(locked.conn_state_lookup(&key).unwrap().is_some());
@@ -326,7 +328,7 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
         let destination = upstream.local_addr().unwrap();
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
         socket.connect(destination).await.unwrap();
-        let local_transport = socket.local_addr().unwrap();
+        let socket_handle = Arc::downgrade(&socket);
         let endpoint = Arc::new(UdpEndpoint::new(
             transport(socket, destination),
             destination,
@@ -386,7 +388,10 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
         drop(endpoint);
         let removal = removed.recv().await.unwrap();
         assert!(pool.wait_removal_io(&removal).await);
-        drop(UdpSocket::bind(local_transport).await.unwrap());
+        assert!(
+            socket_handle.upgrade().is_none(),
+            "endpoint released its UDP socket"
+        );
         let mut outcomes = [crate::ebpf::RetireOutcome::NotRun];
         backend
             .retire_batch(

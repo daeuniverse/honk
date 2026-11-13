@@ -508,10 +508,14 @@ async fn source_scope_shares_wire_demuxes_and_replaces_exact_owner() {
     let client_addr = client.local_addr().unwrap();
     let client_two = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let client_two_addr = client_two.local_addr().unwrap();
-    let raw_a = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_b = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_c = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let raw_d = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    // The reply factory rebinds target_c after its first socket is gone. A
+    // loopback address of its own keeps the targets off the shared 127.0.0.1
+    // port pool; wildcard binds elsewhere can still take a freed port, so this
+    // narrows the race only.
+    let raw_a = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_b = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_c = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
+    let raw_d = std::net::UdpSocket::bind("127.0.0.78:0").unwrap();
     let target_a = raw_a.local_addr().unwrap();
     let target_b = raw_b.local_addr().unwrap();
     let target_c = raw_c.local_addr().unwrap();
