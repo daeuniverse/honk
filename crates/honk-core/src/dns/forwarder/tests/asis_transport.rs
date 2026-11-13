@@ -17,6 +17,23 @@ fn asis_test_forwarder() -> DnsForwarder {
         .with_timeouts(Duration::from_millis(250), Duration::from_millis(250))
 }
 
+async fn bind_tcp_udp() -> (
+    tokio::net::TcpListener,
+    tokio::net::UdpSocket,
+    std::net::SocketAddr,
+) {
+    for _ in 0..8 {
+        let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = tcp.local_addr().unwrap();
+        match tokio::net::UdpSocket::bind(address).await {
+            Ok(udp) => return (tcp, udp, address),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {}
+            Err(error) => panic!("bind matching UDP endpoint: {error}"),
+        }
+    }
+    panic!("bind matching TCP and UDP endpoints after bounded retries");
+}
+
 async fn answer_one_tcp_query(listener: tokio::net::TcpListener, answer_ip: [u8; 4]) -> Vec<u8> {
     let (mut stream, _) = listener.accept().await.expect("accept asis TCP query");
     let mut query = Vec::new();
@@ -79,14 +96,8 @@ async fn tcp_asis_reaches_tcp_only_original_destination() {
 
 #[tokio::test]
 async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
-    let tcp = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-        .await
-        .expect("bind fallback TCP endpoint");
-    let original_dst = tcp.local_addr().expect("fallback endpoint address");
+    let (tcp, udp, original_dst) = bind_tcp_udp().await;
     let budget = crate::dns::transport::DnsSocketBudget::new(1);
-    let udp = tokio::net::UdpSocket::bind(original_dst)
-        .await
-        .expect("bind UDP endpoint on TCP port");
     let tcp_responder = tokio::spawn(answer_one_tcp_query(tcp, [203, 0, 113, 11]));
     let udp_responder = tokio::spawn(async move {
         let mut query = vec![0u8; 512];
@@ -129,9 +140,7 @@ async fn udp_asis_truncation_retries_tcp_on_the_same_endpoint() {
 
 #[tokio::test]
 async fn asis_socket_capacity_is_terminal_for_both_ingress_transports() {
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = tcp.local_addr().unwrap();
-    let udp = tokio::net::UdpSocket::bind(address).await.unwrap();
+    let (tcp, udp, address) = bind_tcp_udp().await;
     let query = make_a_query();
     for ingress in [
         IngressProfile::Tcp,
