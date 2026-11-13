@@ -1,6 +1,6 @@
 # Native API, Clash API and `/stats` reference
 
-honk provides a native HTTP API, a Clash-compatible HTTP API and a userspace statistics snapshot. The native and Clash APIs have independent features, listeners, credentials, and HTTP boundaries. Both reuse the same engine handles and userspace statistics.
+honk provides a native HTTP API, a Clash-compatible HTTP API and a userspace statistics snapshot. The two APIs are separate: each has its own Cargo features, listener, credentials and HTTP boundary. Both reuse the same engine handles and userspace statistics.
 
 ## Native API
 
@@ -12,11 +12,11 @@ Enable the opt-in `native-api` Cargo feature with `--features native-api` (or `n
 | `-native-api` | Yes | No | No |
 | `-clash-api` | No | No | Yes |
 
-The listener remains disabled until you enable [`experimental.native_api`](./experimental.md#native_api). `.dae` remains the configuration format. Source administration edits the `-c` files, or with `--store db` records revisions in a SQLite configuration db ([Configuration db](#configuration-db---store-db)).
+The listener stays disabled until you enable [`experimental.native_api`](./experimental.md#native_api). The configuration format is still `.dae`: source administration edits the `-c` files. With `--store db`, source administration records revisions in a SQLite configuration db instead; see [Configuration db](#configuration-db---store-db).
 
-The native contract, including authentication, node/provider management, geodata and automatic-policy overrides, is based on [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f), with local extensions including `read_only_reason` and geodata cron schedules. `crates/honk-core/tests/fixtures/native_api_openapi.yaml` defines the locally tested contract. Native runtime mode remains gated, and `full_transparency` is not advertised.
+The native contract covers authentication, node and provider management, geodata and automatic-policy overrides. It follows [api-standardize e6b0dbab5599689d965bc18a71be67c809d99d0f](https://github.com/daeuniverse/api-standardize/tree/e6b0dbab5599689d965bc18a71be67c809d99d0f) and adds local extensions such as `read_only_reason` and geodata cron schedules. The locally tested contract is `crates/honk-core/tests/fixtures/native_api_openapi.yaml`. Native runtime mode stays gated, and honk does not advertise `full_transparency`.
 
-Source administration requires a captured `.dae` startup. Writes additionally require `config_write` and either a nonempty secret or `password_auth`. Discover current capabilities and source permissions rather than inferring availability from route names.
+Source administration needs a captured `.dae` startup. Writes also need `config_write` and either a nonempty secret or `password_auth`. Check current capabilities and source permissions instead of inferring availability from route names.
 
 | Method | Path | Meaning |
 | --- | --- | --- |
@@ -24,7 +24,7 @@ Source administration requires a captured `.dae` startup. Writes additionally re
 | POST | `/api/v1/auth/setup` | Create the first password-mode administrator and issue a session. |
 | POST | `/api/v1/auth/login` | Verify the password-mode administrator and issue a session. |
 | POST | `/api/v1/auth/logout` | Revoke the authenticated password-mode session. |
-| GET | `/api/v1/version` | Native contract identity, the engine's build version, and the build's commit and target; no invented build timestamp. |
+| GET | `/api/v1/version` | Native contract identity, the engine's build version, and the build's commit and target; the build timestamp is always null. |
 | GET | `/api/v1/capabilities` | Implemented resources and request limits. |
 | GET | `/api/v1/runtime?detail=summary\|full` | Engine phase, accepted generation and independently timestamped visible userspace traffic. |
 | GET | `/api/v1/runtime/outbounds` | Full-width per-kind outbound counters from the shared statistics lifetime. |
@@ -46,7 +46,7 @@ Source administration requires a captured `.dae` startup. Writes additionally re
 | POST | `/api/v1/providers/{id}/refresh` | Fetch, admit and publish a configured provider through an operation. |
 | POST | `/api/v1/providers` | Create an unfetched main-source subscription from `{name,kind:"subscription",url}` plus optional `update_interval`, `user_agent` and `cache`. |
 | DELETE | `/api/v1/providers/{id}` | Remove a main-source HTTP(S) subscription and its loaded nodes. |
-| GET | `/api/v1/geodata` | Read retained metadata of the assets actually loaded by traffic/DNS routing. |
+| GET | `/api/v1/geodata` | Read retained metadata of the assets that traffic or DNS routing loaded. |
 | POST | `/api/v1/geodata/update` | Download configured assets, validate all candidates and activate verified bytes through an operation. |
 | DELETE | `/api/v1/connections/{connection_id}`, `/api/v1/connections` | Close exact userspace owners; bulk requires a filter or `all=true`. |
 | POST | `/api/v1/dns/query` | Live diagnostic query. |
@@ -71,7 +71,7 @@ Source administration requires a captured `.dae` startup. Writes additionally re
 
 ### Connection observations
 
-Admitted anonymous loopback requests read the same connection data as bearer-authenticated requests. Display fields mask listener-secret values.
+The connection routes return the same data to admitted anonymous loopback requests and bearer-authenticated requests. Display fields mask listener-secret values.
 
 | Parameter | Default | Values |
 | --- | --- | --- |
@@ -79,7 +79,7 @@ Admitted anonymous loopback requests read the same connection data as bearer-aut
 | `type` | `all` | `all`, `tcp`, `udp` |
 | `limit` | 100 | 1–1000, shared by TCP and UDP |
 
-Full detail does not grant elevated permissions. The API rejects unknown parameters and repeated single-value parameters.
+Requesting `detail=full` does not grant elevated permissions. The API rejects unknown parameters and repeated single-value parameters.
 
 `GET /connections?detail=full` returns this shape:
 
@@ -89,27 +89,27 @@ Full detail does not grant elevated permissions. The API rejects unknown paramet
 
 `total_tcp` and `total_udp` count matching rows before the limit. `src`, `dst` and `domain` appear only with `detail=full`. Byte counters are decimal strings.
 
-Filters apply before totals and the combined limit. Totals include all matching visible rows. Rows appear newest registered first, with lexical ID tie-breaking.
+Filters apply before totals and the combined limit, so totals include every matching visible row. Rows appear newest registered first, with lexical ID order breaking ties.
 
 IPv4-mapped IPv6 sources compare as IPv4.
 
-Connection `outbound` is the routing-time group/action, not a current leaf or a reconstructed selection. With recording enabled, `flow_id`, captured root-first group/leaf IDs, first-observation UTC and domain provenance link to retained evidence. Missing/evicted evidence remains unknown.
+`outbound` reports the group or action chosen at routing time. It is not the current leaf, and honk does not rebuild it from later state. With recording enabled, `flow_id`, the captured root-first group and leaf IDs, the first-observation UTC time and the domain provenance point to retained evidence. Missing or evicted evidence remains unknown.
 
-Captured userspace rule IDs share the generation identity used by `/rules` and trace. Kernel-final provenance is not reconstructed. Per-connection rates remain null.
+Captured userspace rule IDs use the same generation identity as `/rules` and the routing trace. honk never reconstructs kernel-final provenance. Per-connection rates stay null.
 
-Empty lists have `visibility: partial`, not proof that the device has no connections. HTTP readiness is not datapath readiness.
+An empty list reports `visibility: partial`; it does not prove that the device has no connections. An HTTP response also does not prove that the datapath is ready.
 
-TCP accounting advances during successful copy reads or splice destination writes, including successfully written sniff prefixes once. UDP retains its per-packet accounting. A single one-second sampler uses the actual elapsed interval.
+TCP accounting advances on a successful copy read or splice destination write, and a successfully written sniff prefix counts once. UDP keeps per-packet accounting. A single one-second sampler derives rates from the actual elapsed interval.
 
-First samples, resets and overflow produce null rates rather than synthetic zeros. `counter_since` belongs to the shared counter lifetime, `sampled_at` to the traffic sample, and `observed_at` to the HTTP observation. UInt64 fields are decimal strings.
+The first sample after a start, reset or overflow reports null rates instead of zeros. `counter_since` marks the start of the shared counter lifetime, `sampled_at` the traffic sample, and `observed_at` the HTTP observation. UInt64 fields are decimal strings.
 
-Bounded counts remain JSON numbers. `process.cpu_percent` is null until two usable CPU samples exist. See [telemetry](#outbound-counters-and-telemetry).
+Counts that have a bound stay JSON numbers. `process.cpu_percent` is null until two usable CPU samples exist. See [telemetry](#outbound-counters-and-telemetry).
 
-`generation.activated_at` is when the active generation was published, or when the engine first ran for the startup generation. While a configuration activation is in progress, `generation.state` is `reloading`, and a running, healthy engine reports `lifecycle.state: reloading`. Configuration revision is available with accepted sources.
+`generation.activated_at` records when the active generation was published. For the startup generation, it records when the engine first ran. While a configuration activation runs, `generation.state` is `reloading`, and a running, healthy engine reports `lifecycle.state: reloading`. The configuration revision appears with accepted sources.
 
-`last_reload` reports completed API reload outcomes as described below.
+`last_reload` reports the outcome of completed API reloads.
 
-`GET /runtime` takes `detail=summary` (the default) or `full`. The response has `observed_at`, `instance_id`, `lifecycle`, `generation`, `datapath`, `traffic`, `process`, `last_reload` and `degradations`:
+`GET /runtime` accepts `detail=summary` (the default) or `full`. The response has `observed_at`, `instance_id`, `lifecycle`, `generation`, `datapath`, `traffic`, `process`, `last_reload` and `degradations`:
 
 | Field | Contents |
 | --- | --- |
@@ -121,7 +121,7 @@ Bounded counts remain JSON numbers. `process.cpu_percent` is null until two usab
 
 ### Runtime degradations
 
-`degradations` lists reduced functionality after recovered failures and configured interfaces that are not yet bound. Each component has at most one entry.
+`degradations` lists components that currently run with reduced functionality. A component appears after a recovered failure, or because a configured interface is not fully bound. Each component has at most one entry.
 
 | Field | Meaning |
 | --- | --- |
@@ -129,7 +129,7 @@ Bounded counts remain JSON numbers. `process.cpu_percent` is null until two usab
 | `component` | Affected component |
 | `since` | First degradation time; repeated failures preserve it |
 
-An empty list means no known degradations. Entries do not change `lifecycle.state`: it remains `running` while configured interfaces are unbound. Monitoring must inspect `interface_binding`.
+An empty list means honk knows of no degradations. A degradation does not change `lifecycle.state`; the state stays `running` while configured interfaces are unbound. Monitoring must therefore inspect `interface_binding` as well.
 
 Adding, changing or clearing an entry publishes `runtime.updated`.
 
@@ -143,7 +143,7 @@ Adding, changing or clearing an entry publishes `runtime.updated`.
 | `interface_binding` | A configured `lan_interface` or `wan_interface` entry is not fully bound. | Clears automatically when every entry is bound. |
 | `udp_trace` | Kernel UDP receive tracing is unavailable during flow recording. | Every UDP listener start |
 
-For `quic_probe`, target/client failure means one of:
+For `quic_probe`, the startup target or client failed in one of these ways:
 
 - The first `tcp_check_url` is not an HTTPS URL.
 - Its host does not resolve.
@@ -167,11 +167,11 @@ The first applicable reason wins. The message never names an interface; names ap
 
 `udp_trace` keeps code `udp_trace_unavailable`. `details.reason` is `ipv4_unavailable` or `ipv6_unavailable` when failures affect only that listener family, and `unavailable` when both are affected. A family whose tracing remains available keeps recording kernel route evidence.
 
-Attach warnings name the missing `family`. The listener warning carries `ipv4_unavailable` and `ipv6_unavailable` fields. Re-evaluation at listener start does not retry fallback hook attachment: that attempt is once per real backend, so restart after changing kernel/BTF support.
+Attach warnings name the missing `family`. The listener warning carries `ipv4_unavailable` and `ipv6_unavailable` fields. Re-evaluating at listener start does not retry fallback hook attachment: honk attempts that once per real backend. If you change kernel or BTF support, restart honk.
 
-`GET /api` is public in every authentication mode. Password setup and login POSTs are also public. Without explicit anonymous loopback access, all other API resources require the configured static bearer or a live password session. This includes version and capabilities.
+`GET /api` is public in every authentication mode. Password setup and login POSTs are also public. Without explicit anonymous loopback access, all other API resources require the configured static bearer or a live password session. This requirement includes the version and capabilities endpoints.
 
-The exceptions cover only requests without credentials. Any request carrying credentials is authenticated, public or not. Invalid or duplicate credentials are rejected, not treated as anonymous. A token in the query string is always rejected. The existing secretless development mode requires explicit anonymous loopback authorization and rejects `Sec-Fetch-Site: cross-site`.
+The exceptions cover only requests without credentials. Any request that carries credentials is authenticated, even on a public resource. Invalid or duplicate credentials are rejected, not treated as anonymous. A token in the query string is always rejected. The existing secretless development mode requires explicit anonymous loopback authorization and rejects `Sec-Fetch-Site: cross-site`.
 
 Host and Origin checks apply before these authentication exceptions and also cover public static files. OPTIONS preflight requires a permitted Host, Origin, method and header set but no bearer. No cookie credentials or wildcard CORS is returned.
 
@@ -179,7 +179,7 @@ Preflight permits only `Authorization`, `Last-Event-ID`, `Content-Type`, `If-Mat
 
 ### HTTP errors and limits
 
-Errors use `{error:{code,message,details},request_id}`.
+Errors from application code use the envelope `{error:{code,message,details},request_id}`.
 
 | Condition | JSON response |
 | --- | --- |
@@ -195,37 +195,37 @@ HEAD follows GET status and headers without a body. API responses use `Cache-Con
 | Normalized header names and values, combined | 16384 |
 | Body, including chunked requests | 65536 |
 
-Authenticated GET/HEAD requests with a nonempty body are invalid. Observation reads never trigger probes or selection changes; `/dns/query` is explicitly a live diagnostic.
+Authenticated GET/HEAD requests with a nonempty body are invalid. Observation reads never trigger probes or selection changes. `/dns/query` is explicitly a live diagnostic.
 
-Error `details` name what was rejected, never a submitted or configured value. Request-boundary errors carry the `header` or request part (`field`: `query`, `body` or `target`) and a `kind`. A JSON body that fails to parse or match its schema gets the endpoint's `400 invalid_request` with `{field,kind}`: `field` identifies one of:
+Error `details` name what was rejected and never echo a submitted or configured value. A request-boundary error carries a `header`, or a `field` that names the request part (`query`, `body` or `target`), plus a `kind`. A JSON body that fails to parse or match its schema gets the endpoint's `400 invalid_request` with `{field,kind}`. `field` names one of these:
 
 - The dotted member path, such as `sources[0].content`.
 - The object holding an unknown key.
 - `body`.
 
-`kind` is `invalid_json`, `missing`, `wrong_type`, `unknown_field`, `duplicate`, `invalid_value` or `too_large`. A 422 `unsupported_value` names the rejected `field` or `fields`, plus where relevant the managed `resource` path, the `allowed` values or paths, the failed `check`, or the `settings` that can permit it.
+`kind` is `invalid_json`, `missing`, `wrong_type`, `unknown_field`, `duplicate`, `invalid_value` or `too_large`. A 422 `unsupported_value` names the rejected `field` or `fields`. Where relevant, it also names the managed `resource` path, the `allowed` values or paths, the failed `check`, or the `settings` that can permit the value.
 
-The native server owns at most 64 HTTP/1.1 connections in total and 16 per canonical socket peer IP. It pauses acceptance at the global capacity. Immediately after accept, it closes any connection exceeding its peer's limit without an HTTP response and logs it at DEBUG.
+The native server holds at most 64 HTTP/1.1 connections in total and 16 per canonical socket peer IP. At the global capacity it pauses acceptance. Immediately after accept, it closes a connection that exceeds its peer's limit without an HTTP response and logs the close at DEBUG.
 
 Forwarded headers do not change the peer, so clients behind one reverse proxy share its allowance.
 
-Header reading is bounded to five seconds. Shutdown drains connections for at most five seconds before aborting and joining them. The 30-second read-idle deadline applies only while no request is in flight on a connection (from the end of a request body until its response resolves).
+Header reading is bounded to five seconds. Shutdown drains connections for at most five seconds before aborting and joining them. The read-idle deadline is 30 seconds and applies only while no request is in flight on a connection. That window runs from the end of a request body until its response resolves.
 
-Stalled writes have a separate 30-second deadline. Successful SSE heartbeat writes keep healthy streams alive, while reads cannot extend a blocked writer's deadline.
+A stalled write has its own 30-second deadline. Successful SSE heartbeat writes keep healthy streams alive, while reads cannot extend a blocked writer's deadline.
 
-TLS/HTTP2 can terminate at a trusted reverse proxy. Forwarded headers neither rewrite fixed discovery paths nor authorize a Host/Origin.
+TLS and HTTP/2 can terminate at a trusted reverse proxy. Forwarded headers neither rewrite fixed discovery paths nor authorize a request that fails the Host/Origin check.
 
-Password mode closes credential admission before this HTTP grace, then joins its actual blocking credential job. The five-second HTTP budget does not bound that final KDF/database join.
+In password mode, honk closes credential admission before this HTTP grace and then joins the blocking credential job. The five-second HTTP budget does not bound that final KDF or database join.
 
-HTTP transport boundary: Hyper can reject malformed or hard-limit HTTP with 400/414/431 or a disconnect before application code; those transport rejections need not carry the JSON envelope or application headers.
+Hyper can reject malformed or hard-limit HTTP with 400/414/431 or a disconnect before application code runs. These transport rejections need not carry the JSON envelope or the application headers.
 
-Application target/header budgets apply to Hyper's parsed, normalized representation, not the original wire bytes. Hyper may remove a request-target fragment or coalesce equal `Content-Length` fields before application counting. Oversized original text in those forms can therefore reach a normal response instead of 413.
+The application target and header budgets apply to Hyper's parsed, normalized representation, not the original wire bytes. Before application counting, Hyper may drop a request-target fragment or coalesce equal `Content-Length` fields. Oversized original text in those forms can therefore reach a normal response instead of a 413.
 
-Raw input remains subject to Hyper's transport handling. This is an accepted boundary difference, not a second HTTP parser or a raw-wire size guarantee. Body limits still cover all delivered body bytes.
+Raw input stays subject to Hyper's transport handling. This is an accepted boundary difference; it is not a second HTTP parser or a raw-wire size guarantee. Body limits still cover every delivered body byte.
 
-With `ui` configured, `/` and `/ui` redirect to `/ui/`. Directory hosting retains extensionless SPA fallback. Missing static assets, fonts/icons, manifest or service worker return 404, never HTML.
+With `ui` configured, `/` and `/ui` redirect to `/ui/`. Directory hosting retains extensionless SPA fallback. Missing static assets, fonts, icons, the manifest and the service worker return 404, never HTML.
 
-Build with `--features native-ui` (the full release builds do) and set `ui: embedded` to serve the pinned real doona distribution without filesystem extraction or network access. `ui: embedded-lite` selects the lighter doona lite edition (preview), also requiring `native-ui`. Both editions connect to the native API on the page origin.
+Build with `--features native-ui`, as the full release does, then set `ui: embedded` to serve the pinned doona distribution without filesystem extraction or network access. `ui: embedded-lite` selects the lighter doona lite edition, which is in preview and also requires `native-ui`. Both editions connect to the native API on the page origin.
 
 The hash router uses `/ui/#/...`. Other safe embedded navigation paths redirect to `/ui/` so relative assets and the service worker resolve correctly. The embedded UI is stored precompressed and served as brotli or gzip when the browser accepts it.
 
@@ -233,11 +233,11 @@ Directory hosting serves the administrator's `.br`/`.gz` siblings the same way. 
 
 Static responses use `nosniff` and carry no framing header, so dashboards such as LuCI can embed the UI. A deployment that needs clickjacking protection adds `X-Frame-Options` or `Content-Security-Policy: frame-ancestors` at its reverse proxy. Assets remain public behind Host/Origin admission.
 
-Discovery and password setup/login use the public exceptions above. Other API requests require a static or session bearer unless explicit anonymous loopback access is enabled. No credentials are injected into the UI.
+Discovery, password setup and login use the public exceptions above. Other API requests need a static or session bearer unless explicit anonymous loopback access is enabled. honk injects no credentials into the UI.
 
 ### Authentication discovery and password sessions
 
-Discovery returns `auth: {mode, setup_required, anonymous_loopback}`. `mode` is `token` for a nonempty configured `secret` and for anonymous loopback development, or `password` when `secret` is empty and `password_auth` is enabled. `setup_required` is true only in password mode before the administrator record exists.
+Discovery reports authentication state in `auth: {mode, setup_required, anonymous_loopback}`. `mode` is `token` when a `secret` is configured or anonymous loopback development is active, and `password` when `secret` is empty and `password_auth` is enabled. `setup_required` is true only in password mode, before the administrator record exists.
 
 `anonymous_loopback` is true only for the explicit development mode on an actual loopback bind. `links.auth_setup`, `links.auth_login` and `links.auth_logout` contain their endpoint paths in password mode and are null otherwise.
 
@@ -251,7 +251,7 @@ An admitted token-mode discovery response, with `links` shortened:
  "auth":{"mode":"token","setup_required":false,"anonymous_loopback":false}}
 ```
 
-`links` also names `config`, `config_validate`, `runtime_outbounds`, `traffic_history`, `memory_history`, `logs`, `providers`, `rules`, `geodata`, `auth_setup` and `auth_logout`, and `x-honk` also has `config_import` and `config_revisions`. The `auth_*` links are null in token mode.
+`links` also contains `config`, `config_validate`, `runtime_outbounds`, `traffic_history`, `memory_history`, `logs`, `providers`, `rules`, `geodata`, `auth_setup` and `auth_logout`, and the `x-honk` object also has `config_import` and `config_revisions`. The `auth_*` links are null in token mode.
 
 `GET /version` returns:
 
@@ -259,7 +259,7 @@ An admitted token-mode discovery response, with `links` shortened:
 {"api":{"name":"daeuniverse/native","major":1,"status":"draft"},"engine":{"name":"honk","version":"<build-version>"},"build":{"revision":null,"target":null,"built_at":null}}
 ```
 
-`build.revision` and `build.target` are null when the build does not set them; `built_at` is always null.
+`build.revision` and `build.target` are null when the build does not set them. `built_at` is always null.
 
 `GET /capabilities` returns `observed_at`, `profiles: ["base"]`, `limits` (`max_request_target_bytes` 4096, `max_header_bytes` 16384, `max_json_body_bytes` 65536) and `resources`, an object keyed by resource name with `x-honk` extensions. Check each resource's `available` flag and advertised fields before using it.
 
@@ -284,7 +284,7 @@ In token mode, the three password endpoints are unavailable with `404 capability
 
 Invalid JSON or fields return `400 invalid_request`. A missing or different media type returns `415 unsupported_media_type`.
 
-Media types are case-insensitive. Duplicate or non-text `Content-Type` values return `400 invalid_request`; configuration, authentication, probes and routing diagnostics share this JSON/header parser.
+Media types are case-insensitive. Duplicate or non-text `Content-Type` values return `400 invalid_request`. Configuration, authentication, probes and routing diagnostics all use this JSON and header parser.
 
 Setup trusts only the peer address from the accepted socket, never `Forwarded`, `X-Forwarded-For` or another header. It permits `127.0.0.0/8`, `::1`, RFC 1918, `fc00::/7`, `169.254.0.0/16` and `fe80::/10`. IPv4-mapped IPv6 is classified as IPv4.
 
@@ -292,7 +292,7 @@ Other peers receive `403 permission_denied` before account-state or credential p
 
 Setup and login admit at most five attempts per canonical peer IP and ten attempts across all peers in each one-minute window. Five consecutive credential failures from one peer impose a 60-second lock on only that peer, measured from its last failure. Another peer's failures or successful login cannot extend or clear that lock.
 
-Successful setup/login clears only that peer's failure state but still counts in the attempt windows. A rejected attempt returns `429 rate_limited` with `Retry-After`. These counters and locks are process-local.
+A successful setup or login clears only that peer's failure state but still counts in the attempt windows. A rejected attempt returns `429 rate_limited` with `Retry-After`. These counters and locks are process-local.
 
 Peer state is bounded and discarded once both its attempt window and lock have expired, so an inactive peer's partial failure streak also expires. The global attempt window remains in force across all peers.
 
@@ -306,18 +306,18 @@ Restart ends every session. A session that ends by logout, expiry or eviction al
 
 Operations started through a configured secret or password login belong to the administrator rather than to one token, so logout does not delete them.
 
-Password mode stores one credential record in the `admin` row of the state db, `<data_dir>/state/honk.db` (a 0600 file in a 0700 directory; see [Configuration db](#configuration-db---store-db)). A malformed record prevents startup, and so does a corrupt state db: password mode never moves it aside.
+Password mode stores one credential record in the `admin` row of the state db, `<data_dir>/state/honk.db`. The file is 0600 in a 0700 directory; see [Configuration db](#configuration-db---store-db). A malformed record prevents startup, and so does a corrupt state db: password mode never moves it aside.
 
-The record uses PBKDF2-HMAC-SHA256 with 100,000 iterations and a fresh 16-byte random salt. Password mode uses the configured `global.data_dir` itself: if that directory is unusable, startup fails instead of falling back to another directory, where setup would reopen. First setup inserts the row without replacing an existing one, so of two processes racing setup on one state db exactly one wins.
+The record uses PBKDF2-HMAC-SHA256 with 100,000 iterations and a fresh 16-byte random salt. Password mode uses the configured `global.data_dir` itself. If that directory is unusable, startup fails rather than falling back to another directory, where setup would reopen. First setup inserts the row without replacing an existing one, so when two processes race setup on one state db, exactly one wins.
 
-Setup fails and can be retried in either case:
+Setup fails, and you can retry it, in either of these cases:
 
 - The db is busy before anything is written.
 - The insert fails and is rolled back.
 
-If the commit or rollback fails, the row’s durability is uncertain. The process refuses login and a second setup until it restarts.
+If the commit or rollback fails, the row's durability is uncertain. The process refuses login and a second setup until it restarts.
 
-Once setup claims the credential state, discovery reports `setup_required:false`, including while durability is indeterminate. An indeterminate write returns 503 with `durability_confirmed:false` and no `Retry-After`, without claiming `written:true`. Restart is required to establish the stored account state.
+Once setup claims the credential state, discovery reports `setup_required:false`, even while durability is indeterminate. Such a write returns 503 with `durability_confirmed:false` and no `Retry-After`, and does not claim `written:true`. Restart honk to establish the stored account state.
 
 There is no HTTP password reset. To recover access, stop honk, run `honk-core admin reset`, restart, and run setup again. Moving `<data_dir>/state` aside also works but discards every other persisted state.
 
@@ -325,9 +325,9 @@ Reset takes the exclusive state-directory lock before checking whether the datab
 
 ### Recorded userspace flows
 
-Admitted anonymous loopback requests read the same flow data as bearer-authenticated requests.
+The flow routes expose recorded userspace decisions. Admitted anonymous loopback requests read the same flow data as bearer-authenticated requests.
 
-General attachment is active while an admitted GET SSE on `/events` or `/logs` is open, or for 60 seconds after the last stream closes or a successful GET `/flows`, `/flows/{id}` or `/dns/log`. It enables ordinary event capture only. It does not enable any Auto diagnostic recorder.
+General attachment is active while an admitted GET SSE on `/events` or `/logs` is open. It stays active for 60 seconds after the last stream closes or after a successful GET of `/flows`, `/flows/{id}` or `/dns/log`. General attachment enables ordinary event capture only; it does not enable any Auto diagnostic recorder.
 
 Diagnostic demand is separate:
 
@@ -337,47 +337,47 @@ Diagnostic demand is separate:
 | Successful GET `/flows` or `/flows/{id}` | Flows only |
 | GET `/logs` SSE | Logs only |
 | Successful GET `/dns/log` | DNS log only |
-| Unfiltered/non-flow `/events`, ordinary API, validation, failed GET or HEAD | None |
+| Unfiltered or non-flow `/events`, ordinary API, validation, failed GET or HEAD | None |
 
-Flow-event demand means explicit `kinds` containing `flow.updated` or `flow.gap`, or a nonblank `flow_id` whose effective kinds include flow events. Omitted `kinds` without such a filter does not request flows. Each admitted stream owns an independent lease for exactly its requested demand.
+Flow-event demand means either explicit `kinds` that contain `flow.updated` or `flow.gap`, or a nonblank `flow_id` whose effective kinds include flow events. Without such a filter, omitting `kinds` requests no flows. Each admitted stream owns an independent lease for exactly the demand it requested.
 
-Failed admission acquires none, and closing/dropping the stream releases it even if never polled. Flows, logs and DNS logs each retain demand for an independent 60 seconds after their last stream closes or their corresponding successful GET. General activity and other demand kinds cannot extend that grace.
+A failed admission acquires no lease. Closing or dropping a stream releases its lease even if the stream was never polled. Flows, logs and DNS logs each keep their own demand for 60 seconds after their last stream closes or after their corresponding successful GET. General activity and other demand kinds cannot extend that grace.
 
 There is no DNS-log SSE kind. Recording starts on demand, so initially empty history is expected.
 
-`record_flows` defaults true and permits recording while flow diagnostic demand is active. An explicit runtime `record_flows: "on"` keeps recording enabled without clients. Runtime `"off"` forces it off, and configuration `record_flows: false` prohibits recording until changed and restarted.
+`record_flows` defaults true and permits recording while flow diagnostic demand is active. An explicit runtime `record_flows: "on"` keeps recording enabled with no clients. Runtime `"off"` forces it off. Configuration `record_flows: false` prohibits recording until you change it and restart.
 
-When effective recording stops, flow records and snapshots are released. One process-local store retains at most 1024 flows, 64 steps per flow and 8 MiB including snapshots and the kernel-dictionary reservation. Terminal records expire after at most 300 seconds, earlier under pressure.
+When effective recording stops, flow records and snapshots are released. One process-local store keeps at most 1024 flows, 64 steps per flow, and 8 MiB of records. That 8 MiB includes snapshots and the kernel-dictionary reservation. Terminal records expire after at most 300 seconds, earlier under pressure.
 
-Restart clears all records. The existing sampler performs expiry without a second timer.
+Restart clears all records. The existing sampler expires records; honk runs no second timer.
 
-Kernel witness production follows effective flow recording through the existing composed datapath flags. The existing sampler reconciles changes on a subsequent tick. Scheduling, telemetry and publication contention can delay convergence, so this is not a fixed one-second deadline.
+Kernel witness production follows effective flow recording through the existing composed datapath flags. The existing sampler reconciles changes on a later tick. Scheduling, telemetry and publication contention can delay convergence, so convergence has no fixed one-second deadline.
 
-Traffic routed before enablement can have explicit missing kernel evidence. Disabling demand does not discard retained witnesses or dictionaries, change routing/NFQUEUE authority, or revoke an operation's already-admitted capture eligibility. Unrecorded operations skip witness decoding.
+Traffic routed before you enable recording can carry explicitly missing kernel evidence. Disabling demand does not discard retained witnesses or dictionaries, change routing or NFQUEUE authority, or revoke an operation's already-admitted capture eligibility. Unrecorded operations skip witness decoding.
 
-Flow IDs represent incarnations, never tuples. TCP and UDP capture actual route predicates and short circuits, sniff/verification, group selection, DNS children, physical attempts, session reuse/retries and terminal boundaries. Failed or blocked setup is retained even without a live connection.
+A flow ID identifies an incarnation, never a tuple. For TCP and UDP, a flow captures the actual route predicates and short circuits, and the sniffing and verification steps. It also captures group selection, DNS children, physical attempts, session reuse and retries, and terminal boundaries. Failed or blocked setup is retained even without a live connection.
 
-Names, IDs and generations come from the operation that used them, not today's configuration or a routing simulation. DNS lookup/parent IDs and outbound attempt/parent IDs preserve causality. A reused carrier is an attachment, not a new physical dial.
+Names, IDs and generations come from the operation that used them, not from today's configuration or a routing simulation. DNS lookup and parent IDs preserve causality, and so do outbound attempt and parent IDs. A reused carrier is an attachment, not a new physical dial.
 
-Protocol request/confirmation milestones require actual protocol evidence, and DNS-child readiness never becomes business-target confirmation. Terminal TCP/UDP evidence follows the owning cleanup boundary. Kernel offload ends observation as unknown, not a fabricated closed connection.
+Protocol request and confirmation milestones require actual protocol evidence; DNS-child readiness never counts as business-target confirmation. Terminal TCP and UDP evidence follows the owning cleanup boundary. When traffic leaves through kernel offload, observation ends as unknown rather than as a fabricated closed connection.
 
-`trace_status` and `trace.status` are `complete` only when all executed decisions through the current frontier in that flow's scope were captured. Active, failed and closed flows can each be complete. This is not a success or global-coverage claim.
+`trace_status` and `trace.status` are `complete` only when honk captured every executed decision up to the current frontier in that flow's scope. Active, failed and closed flows can each be complete. A complete trace does not claim success or global coverage.
 
-Missing/ambiguous source evidence, listener-secret withholding and exhausted capture budgets remain sticky `partial` with explicit `missing` reasons. Reaching a trace limit never stops forwarding. Userspace TCP/UDP and intercepted DNS population coverage remains `partial`.
+A trace stays `partial` and names explicit `missing` reasons when source evidence is missing or ambiguous, listener secrets are withheld, or a capture budget runs out. Reaching a trace limit never stops forwarding. Coverage for userspace TCP, userspace UDP and intercepted DNS remains `partial`.
 
-Kernel-only direct, block and bypass populations remain `none`, and `full_transparency` stays absent.
+Coverage for kernel-only direct, block and bypass traffic stays `none`. honk does not advertise `full_transparency`.
 
-Per-flow condition expressions use configured source spelling cached with the compiled generation, including GeoIP references rather than expanded network lists. This avoids expansion-only truncation, not real capture limits: oversized authored text, redaction, missing source evidence and exhausted step/byte budgets still report partial traces.
+Per-flow condition expressions use the configured source spelling cached with the compiled generation, including GeoIP references rather than expanded network lists. That avoids truncating the expanded form, and it does not relax the real capture limits. Oversized authored text, redaction, missing source evidence and exhausted step or byte budgets still report partial traces.
 
-For handed-off traffic, kernel rule outcomes come from the compiled program's own branch witness, not userspace re-evaluation. UDP additionally requires the received packet's capture ID. Tuple, decision token, routing generation and action must agree with the retained witness.
+For handed-off traffic, kernel rule outcomes come from the compiled program's own branch witness, not from userspace re-evaluation. UDP also requires the received packet's capture ID. The tuple, decision token, routing generation and action must agree with the retained witness.
 
 A later tuple incarnation cannot supply an older packet's evidence. Capture IDs do not wrap. Frozen dictionaries retain at most 16 policies, 64 KiB each and 1 MiB total within the recorder reservation.
 
-Dictionary rejection/eviction, missing witnesses, ambiguous TCP association and executed overflow beyond 256 rule/condition values produce partial evidence. Unexecuted rules beyond that value ceiling alone do not imply lost execution.
+Partial evidence results from dictionary rejection or eviction, missing witnesses, ambiguous TCP association, or executed overflow beyond 256 rule or condition values. Rules beyond that value ceiling that were not executed do not, by themselves, imply lost execution.
 
-If a policy’s kernel trace dictionary would exceed 64 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest generation number, so a policy right at the bound may already be published untraced.
+If a policy's kernel trace dictionary would exceed 64 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest possible generation number, so a policy right at the bound may already be published untraced.
 
-Native extension fields retain source detail without inventing identities: route input may include `ingress`, `domain_fact_bitmap` and `domain_fact_state` rather than fabricated domain rule IDs. DNS-related outbound/connection steps carry `lookup_id`, and known physical peers carry `server_addr`. Selection facts include the health family and whether a decision was applied or only peeked.
+Native extension fields keep source detail without inventing identities. Route input may carry `ingress`, `domain_fact_bitmap` and `domain_fact_state` instead of fabricated domain rule IDs. DNS-related outbound and connection steps carry `lookup_id`, and known physical peers carry `server_addr`. Selection facts include the health family and whether a decision was applied or only peeked.
 
 Score's `previous_leaf_node_id` is distinct from `previous_member_id`: leaf history cannot reconstruct a historical subgroup path.
 
@@ -391,7 +391,7 @@ A flow page is `{instance_id,observed_at,coverage,dropped_records,flows,next_cur
 
 `trace.missing` reasons are `not_instrumented`, `started_late`, `buffer_overflow` and `redacted`. Each step has `seq`, `observed_at`, nullable `elapsed_us` and `generation_id`, `evidence`, `stage` and `data`. `stage` is `input`, `route`, `dns`, `datapath`, `dial_mode`, `reroute`, `outbound` or `connection`, and selects the fields of `data`.
 
-Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and `cursor`. Eight bounded immutable snapshots live for at most 30 seconds. Cursors bind instance and original filters/detail.
+Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and `cursor`. Eight bounded immutable snapshots live for at most 30 seconds. Cursors bind the instance and the original filters and detail.
 
 | Parameter | Default | Values |
 | --- | --- | --- |
@@ -404,29 +404,29 @@ Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and
 
 A recognised cursor sent with different filters, detail or limit returns `400 invalid_request`. A full snapshot table evicts the oldest snapshot. Exhausted retained-byte capacity returns `503 snapshot_unavailable` with Retry-After.
 
-Expired or evicted list snapshots return `410 snapshot_expired`, known retained tombstones `410 flow_expired`, unknown IDs `404 resource_not_found`. Detail has no query parameters and always includes full retained input/trace. Counters are decimal strings.
+Expired or evicted list snapshots return `410 snapshot_expired`. Known retained tombstones return `410 flow_expired`, and unknown IDs return `404 resource_not_found`. Detail has no query parameters and always includes the full retained input and trace. Counters are decimal strings.
 
-Revisions, sequence and elapsed microseconds are safe JSON integers. Display fields preserve paths, `@` and URLs within the 512-byte `MAX_TEXT` bound. Identifiers retain their separate validation.
+Revisions, sequence and elapsed microseconds are safe JSON integers. Display fields preserve paths, `@` and URLs within the 512-byte `MAX_TEXT` bound. Identifiers keep their separate validation.
 
-Unrepresentable or oversized text and step/byte overflow remain explicit partial evidence, without discarding causal IDs or outcomes. Retained rule displays belong to the captured generation and are never rebuilt from current configuration.
+Unrepresentable or oversized text, and step or byte overflow, stay explicit partial evidence, without discarding causal IDs or outcomes. Retained rule displays belong to the captured generation and are never rebuilt from current configuration.
 
 ### Nodes and groups
 
-`Node.stream_transport` is an optional nullable string projected from accepted Trojan/VMess/VLESS configuration: `tcp`, `ws`, `grpc` or `xhttp` (including the `splithttp` alias). Honk returns null when unrecognized or inapplicable. It describes configured transport, not negotiation or health.
+`Node.stream_transport` is an optional nullable string projected from accepted Trojan, VMess or VLESS configuration. Its values are `tcp`, `ws`, `grpc` or `xhttp`, and `splithttp` is accepted as an alias for `xhttp`. honk returns null when the value is unrecognized or inapplicable. The field describes configured transport, not negotiation or health.
 
-`protocol` and TCP/UDP health transport keep their existing meanings. It exposes no credentials, host, path, extra options or link. The fixture derives from the doona contract bundle with local extensions including `read_only_reason` and geodata cron schedules (local fixture SHA-256 `444a9e4f6c8d35617cc36590e9d3fb985a164c8fb898cc70696ad1de66b1d0ab`).
+`protocol` and the TCP and UDP health transports keep their existing meanings. `stream_transport` exposes no credentials, host, path, extra options or link. The fixture comes from the doona contract bundle and adds local extensions such as `read_only_reason` and geodata cron schedules. The local fixture's SHA-256 is `444a9e4f6c8d35617cc36590e9d3fb985a164c8fb898cc70696ad1de66b1d0ab`.
 
-This pin does not identify a published frontend release.
+The fixture pin does not identify a published frontend release.
 
-Node reads accept `group_id`, `limit` (1–1000) and `cursor`. Filtering is direct membership, not recursive leaves. Node pages freeze observations across up to eight snapshots, 30 seconds and 4 MiB.
+Node reads accept `group_id`, `limit` (1–1000) and `cursor`. `group_id` filters by direct membership, not by recursive leaves. Node pages freeze observations in up to eight snapshots; a snapshot lives for 30 seconds and the set is bounded to 4 MiB.
 
-`limit` defaults to 100. The page is `{observed_at,nodes,next_cursor}` with no `total`; `next_cursor` is null on the last page. A node row has `id` (UUID), `name`, `protocol`, nullable `stream_transport` (XHTTP only), nullable `subscription_tag`, `provider_id`, `group_ids` (direct containing groups) and `health`. `provider_id` is the subscription ID, `"inline"` for a configured node, or null for `direct` and `block`.
+`limit` defaults to 100. The page is `{observed_at,nodes,next_cursor}` with no `total`. `next_cursor` is null on the last page. A node row has `id` (UUID), `name`, `protocol`, nullable `stream_transport` (XHTTP only), nullable `subscription_tag`, `provider_id`, `group_ids` (direct containing groups) and `health`. `provider_id` is the subscription ID, `"inline"` for a configured node, or null for `direct` and `block`.
 
 A page that cannot fit returns `503 snapshot_unavailable` with `Retry-After`. An unrecognised node cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
-Groups return a summary array. Detail carries `config_revision` but no `ETag`, and `GET /groups/{groupId}/config` returns `{policy, config}` with that revision as a quoted `ETag`. Group IDs are random process-lifetime identities: same-name reload/reorder retains them, removal/readdition creates new IDs, and restart requires rediscovery.
+The group list returns summary rows. A group's detail view carries `config_revision` but no `ETag`. `GET /groups/{groupId}/config` returns `{policy, config}` with that revision as a quoted `ETag`. Group IDs are random process-lifetime identities. A reload or reorder that keeps the name retains them. Removing and re-adding a group creates new IDs, and a restart requires rediscovery.
 
-They are not positional config UUIDs or name hashes.
+Group IDs are not positional configuration UUIDs or name hashes.
 
 | Group view | Fields |
 | --- | --- |
@@ -440,7 +440,7 @@ They are not positional config UUIDs or name hashes.
 
 `config.check_interval` is read-only: periodic checks use the global interval, and zero reads as null.
 
-These display values use the same listener-secret mask as source/flow displays:
+These display values use the same listener-secret mask as source and flow displays:
 
 - Node names and subscription tags.
 - Group names, member names and icons.
@@ -450,42 +450,43 @@ These display values use the same listener-secret mask as source/flow displays:
 Node snapshots are masked before bounded serialization. Resumed pages retain those masked bytes.
 
 Opaque IDs, revision hashes, membership and cursor bindings are unchanged.
-The existing masking threshold still applies: listener-secret values shorter than eight bytes are not masked; startup warns about them.
 
-Health rows are completed, qualified producer observations rather than optimistic alive flags, copied IPv4/IPv6 ranking signals, synthetic failures or restored delays. Raw TCP, HTTP response headers, DNS exchanges and QUIC handshakes retain actual destination family and completion time.
+The existing masking threshold still applies: a listener-secret value shorter than eight bytes is not masked, and startup warns about it.
+
+A health row is a completed, qualified observation from the producer. It is not an optimistic alive flag, a copied IPv4 or IPv6 ranking signal, a synthetic failure or a restored delay. Raw TCP, HTTP response headers, DNS exchanges and QUIC handshakes keep the actual destination family and completion time.
 
 A health row has `transport` (`tcp`, `udp`), `purpose` (`data`, `dns`), `ip_version` (`ipv4`, `ipv6`), `warmth` (`cold`, `warm`, `unknown`), `measurement` (`tcp_connect`, `http_headers`, `dns_round_trip`, `quic_handshake`, `mixed`), `sample_source: "probe"`, `state` (`healthy`, `unavailable`), nullable `latency_ms`, `moving_avg_ms` and `avg10_ms`, `observed_at` and nullable `error`. Group rows add `member_id`, `resolved_leaf_node_id`, and null `sorting_latency_ms` and `ranking`.
 
-Node rows carry two averages per measurement key. Only successful native probes update them; restart clears them.
+Node rows carry two averages per measurement key. Only successful native probes update them. A restart clears them.
 
 | Field | Calculation |
 | --- | --- |
 | `moving_avg_ms` | Halving average `(previous + sample) / 2`, used by URLTest ranking |
 | `avg10_ms` | Mean of the newest ten successes, or all available successes during warm-up |
 
-Both are null while the row is unavailable, and always null on group-specific samples. Unknown ranking/warmth remain null/unknown.
+Both are null while the row is unavailable, and always null on group-specific samples. An unknown ranking stays null, and unknown warmth stays `unknown`.
 
 Group-specific samples preserve the measured member and leaf rather than rebinding to a later selection. GET never advances URLTest, round-robin or Score state. Group `icon` is the configured validated HTTP(S) URL or data URI, subject to listener-secret masking.
 
-Absent icons are null, never guessed.
+An absent icon is null; honk never guesses one.
 
 A health completion older than the retained sample for the same key is discarded, unless the retained sample lies in the future because the system clock stepped back. A replay at the same timestamp updates the row without counting twice in the averages. Group-specific samples keep at most 4096 measurement keys.
 
-When full, replacement is second-chance rather than strict least-recently-updated: a key refreshed since the scan last passed it is skipped, so a continuously refreshed key outlives stale ones.
+When the table is full, replacement is second-chance rather than strict least-recently-updated. A key refreshed since the scan last passed it is skipped, so a continuously refreshed key outlives stale ones.
 
 `PUT /groups/{groupId}/selection` takes `{"member_id":"<direct-member-id>","network":"tcp"}`. `network` is required and also accepts `udp` or `both`. On a Selector the write replaces its choice (`source: runtime`).
 
-On an automatic group (`can_override: true`) it pins the member (`source: override`). A pin acts like a Selector choice, so an unavailable pinned member is not replaced by a sibling. Pins are runtime-only: they are never persisted, every configuration activation (including a subscription refresh that changes nodes) clears them.
+On an automatic group (`can_override: true`), the write pins the member and sets `source: override`. A pin acts like a Selector choice, so an unavailable pinned member is not replaced by a sibling. Pins are runtime-only: honk never persists them, and every configuration activation clears them, including a subscription refresh that changes nodes.
 
-An unchanged or empty refresh activates nothing and keeps them, and health checks keep running. One owner validates both networks before publishing `both`. A TCP-only write leaves UDP unchanged.
+An unchanged or empty refresh activates nothing and keeps the pins, and health checks keep running. One owner validates both networks before publishing `both`. A TCP-only write leaves UDP unchanged.
 
-Writes serialize with manager replacement, update existing persistence/warm consumers, and return the committed `selection_revision` and actual `connections_interrupted`. Clash writes both networks and displays the TCP projection. With `interrupt_connections: true`, affected pre-transition transports are closed by their captured group path and network, not by deleting tracker rows or matching today's leaf names.
+Writes serialize with manager replacement, update existing persistence and warm consumers, and return the committed `selection_revision` and the actual `connections_interrupted`. Clash writes both networks and displays the TCP projection. With `interrupt_connections: true`, affected pre-transition transports are closed by their captured group path and network, not by deleting tracker rows or matching today's leaf names.
 
-`DELETE /groups/{groupId}/selection?network=` clears the pin for `tcp`, `udp` or `both` (the default) and returns `GroupOverrideCleared` with the selection per network. A network without a pin keeps its selection, and a Selector returns `409 state_conflict`.
+`DELETE /groups/{groupId}/selection?network=` clears the pin for `tcp`, `udp` or `both`; `network` defaults to `both`. It returns `GroupOverrideCleared` with the selection per network. A network without a pin keeps its selection, and a Selector returns `409 state_conflict`.
 
 `member_id` must be 1–256 bytes. PUT returns `{group_id,member_id,network,source,selection_revision,connections_interrupted}`. DELETE returns `{group_id,network,selection_revision,connections_interrupted,selection}`, where `selection` holds `tcp` and `udp` in the runtime selection shape above. `selection_revision` is separate from the configuration revision.
 
-Selection errors are `404 resource_not_found` for an unknown group or member, `422 unsupported_value` for an unsupported member or action, `409 state_conflict` for a conflicting state such as clearing a Selector, and `503 temporarily_unavailable` when the transition cannot be confirmed.
+Selection errors are `404 resource_not_found` for an unknown group or member. `422 unsupported_value` covers an unsupported member or action, `409 state_conflict` covers a conflicting state such as clearing a Selector, and `503 temporarily_unavailable` means the transition could not be confirmed.
 
 #### Group configuration patch
 
@@ -497,13 +498,13 @@ Selection errors are `404 resource_not_found` for an unknown group or member, `4
 
 Lists and multiple header field lines are combined. Weak tags never match. `*` matches the existing group.
 
-A nonmatching condition returns 412. A detected concurrent source/dependency change returns 409 if the condition still matches.
+A nonmatching condition returns 412. A detected concurrent source or dependency change returns 409 if the condition still matches.
 
-Operation members other than `op`, `path`, `from` and `value` are ignored. Body errors (400, 413) precede a stale `If-Match` (412). The operations `add`, `replace`, `remove`, `test`, `copy` and `move` must stay within these paths:
+Operation members other than `op`, `path`, `from` and `value` are ignored. A body error returns 400 or 413 before a stale `If-Match` returns 412. The operations `add`, `replace`, `remove`, `test`, `copy` and `move` must stay within these paths:
 
 | Path | Accepted value |
 | --- | --- |
-| `/policy` | Object containing only equal string `kind` and `native` values: `selector`, `urltest`, `loadbalance`, `fallback` or `score` |
+| `/policy` | Object with only string `kind` and `native` values, both equal: `selector`, `urltest`, `loadbalance`, `fallback` or `score` |
 | `/config/default_member_id` | Direct-member ID |
 | `/config/final_outbound` | Configured outbound name |
 | `/config/tolerance` | Nonnegative safe integer milliseconds or null; only URLTest accepts non-null values |
@@ -518,11 +519,11 @@ Operation members other than `op`, `path`, `from` and `value` are ignored. Body 
 - Not contain both single and double quote characters.
 - Fit within 2048 bytes in normalized form.
 
-PATCH stores the normalized URL that GET displays and the probe sends: no fragment, `/` for an empty path, lowercase host and no default port. `test` compares that form. Selector groups store `check_url` but do not probe it.
+PATCH stores the normalized URL that GET displays and the probe sends. The normalized form has no fragment, `/` for an empty path, a lowercase host and no default port. `test` compares that form. Selector groups store `check_url` but do not probe it.
 
 Only URLTest groups report or accept `tolerance`. Other policies report null and omit it from `mutable_config`. Setting it to a non-null value returns `422 unsupported_value`.
 
-`remove` is accepted. A patch switching the policy to URLTest may set it.
+`remove` is accepted. A patch that switches the policy to URLTest may set `tolerance`.
 
 Removing a field or setting it to null restores its dae default. If the source omits `tolerance` or `interrupt_connections`, GET reports null. The engine still applies `global.check_tolerance` or the default `interrupt_connections: false`.
 
@@ -536,7 +537,7 @@ Removing a field or setting it to null restores its dae default. If the source o
 
 Patch availability and `mutable_config` depend on the source's write permission. Without it, `mutable_config` is empty and PATCH returns `404 capability_not_supported`. PATCH edits parser spans in the authorized source, then performs full offline admission, durable replacement and a 202 reload operation.
 
-It does not edit the Group in memory. The accepted group/config revision is checked before writing and again under the reload lock before activation. Source disk hashes and dependency topology are independently fenced.
+It does not edit the group in memory. The accepted group and config revision is checked before writing and again under the reload lock before activation. Source disk hashes and dependency topology are independently fenced.
 
 A provider publication racing after the write can leave `written:true,committed:false`. No rollback is promised. A group ETag is not a source-file SHA-256.
 
@@ -546,7 +547,7 @@ Icons, names, filters and membership are not PATCH fields. Edit their authorized
 
 When bearer authentication is required, use streaming fetch with Bearer and `Accept: text/event-stream`. Browser EventSource cannot supply an Authorization header. Optional `kinds` and `flow_id` filters bind the resume cursor.
 
-`kinds` is a comma-separated list of the names in capabilities `events.kinds`, without duplicates; omitted, it selects all of them. `stream.ready` opens every stream whatever the filter. `flow_id` must be 1–256 bytes without control characters. Invalid filters return `400 invalid_request`.
+`kinds` is a comma-separated list of the names in capabilities `events.kinds`, without duplicates. When omitted, it selects all of them. `stream.ready` opens every stream whatever the filter. `flow_id` must be 1–256 bytes without control characters. Invalid filters return `400 invalid_request`.
 
 To resume, send the last received event `id` as `Last-Event-ID`:
 
@@ -563,17 +564,17 @@ Heartbeat comments arrive every 15 seconds. Every stream sends ready first. On a
 
 Expired, unknown, previous-instance or changed-filter cursors return `409 event_cursor_expired` before HTTP 200.
 
-Each event/log record caches at most one complete frame for its first exact filter binding. Other bindings remain independently signed. The unchanged 2 MiB retained-ring budget reserves payload storage, one possible cached frame and its cache cell before publication.
+Each event or log record caches at most one complete frame for its first exact filter binding. Other bindings remain independently signed. The 2 MiB retained-ring budget is unchanged. It reserves payload storage, one possible cached frame and its cache cell before publication.
 
 Near-maximum payloads can therefore expire earlier than the count limit. This ring budget is not a process-wide memory ceiling for queued or HTTP-held references.
 
 A fresh stream's ready cursor is an opaque checkpoint, not a retained event record. A newly issued checkpoint remains resumable when older history has already expired. It does not revive an evicted record cursor or survive loss of a newer event.
 
-Age, filter, instance and recording-reset checks still apply. Compare delivery/replay positions, not cursor bytes.
+Age, filter, instance and recording-reset checks still apply. Compare delivery and replay positions, not cursor bytes.
 
 Published events are `stream.ready`, `runtime.updated`, `flow.updated`, `flow.gap`, `generation.changed` and `operation.updated`. Operation events reflect actual admitted work, not only reloads. Generation events originate at accepted publication, not request receipt.
 
-Events contain bounded safe IDs/state, not packet bodies or raw configuration. Flow/event retention is memory-only, not a durable log.
+Events contain bounded safe IDs and state, not packet bodies or raw configuration. Flow and event retention is memory-only, not a durable log.
 
 Every event's JSON data contains `instance_id` and UTC `observed_at`:
 
@@ -589,13 +590,13 @@ Every event's JSON data contains `instance_id` and UTC `observed_at`:
 
 Publication is immediate, including terminal updates, with no batching timer. While event capture is active, the replay ring records every published notification, and replay is not coalesced. Other event kinds and logs are never coalesced.
 
-Distinct-flow or other nonreplaceable events still disconnect a full live queue. Flow data, revisions and captured trace steps are unchanged.
+A distinct-flow event or any other nonreplaceable event still disconnects a full live queue. Flow data, revisions and captured trace steps are unchanged.
 
 Event capture is active while a client is attached or a permitted recorder is explicitly pinned on. An idle hub still admits new streams. Stopping capture invalidates earlier event cursors.
 
 `flow.gap` with `reason=recording_changed` marks lost continuity across manual or automatic recording transitions when events are active. It does not count packet loss or uncaptured flows. A sleeping hub does not replay its shutdown gap.
 
-Reattachment starts a fresh boundary.
+Reattaching a client starts a fresh boundary.
 
 ### Outbound counters and telemetry
 
@@ -607,17 +608,17 @@ Reattachment starts a fresh boundary.
 
 Both history routes return `{observed_at,window_seconds,sampled_every_seconds,samples}`. Traffic samples have `sampled_at`, `upload_bytes_per_second`, `download_bytes_per_second` and nullable numeric `connections`. Memory samples have `sampled_at`, `rss_bytes`, `cgroup_current_bytes` and `kernel_ebpf_bytes`. Other sample values are decimal strings or null.
 
-Counters share the engine's existing statistics lifetime and survive reload, rather than resetting with a dashboard or listener request.
+Counters share the engine's existing statistics lifetime and survive a reload. A dashboard or listener request does not reset them.
 
-Traffic and memory histories use the existing one-second sampler with missed ticks skipped, not a task per client. Each enabled ring retains at most 600 points for 600 seconds, even with no clients. Restart clears it.
+Traffic and memory histories use the existing one-second sampler and skip missed ticks; they do not run a task per client. Each enabled ring retains at most 600 points for 600 seconds, even with no clients. Restart clears it.
 
-`record_traffic: false` or `record_memory: false` disables the corresponding history capability and releases its buffer on restart, without disabling current observations. History selects actual samples in the requested window. If thinning is needed, it uses the smallest stride that fits `max_points`, anchored at the newest sample, and returns oldest first.
+`record_traffic: false` or `record_memory: false` disables the corresponding history capability. The buffer is released on restart, without disabling current observations. History selects actual samples in the requested window. If thinning is needed, it uses the smallest stride that fits `max_points`, anchored at the newest sample, and returns oldest first.
 
 `sampled_every_seconds` describes that nominal stride, not a promise of evenly spaced timestamps: gaps and nulls remain, with no interpolation or zero filling.
 
-`process.cpu_percent` in `/runtime` is the process CPU-time delta (`CLOCK_PROCESS_CPUTIME_ID`) divided by the actual elapsed sampler interval, as a percentage of one CPU. A value of 100 is one fully busy core. Multi-threaded work can exceed 100. Sampling is nominally every second. It is null until two usable samples exist, or when readings are unavailable, time/counters move backward or the wall interval is zero.
+`process.cpu_percent` in `/runtime` is the process CPU-time delta (`CLOCK_PROCESS_CPUTIME_ID`) divided by the actual elapsed sampler interval, as a percentage of one CPU. A value of 100 is one fully busy core. Multi-threaded work can exceed 100. Sampling is nominally every second. It is null until two usable samples exist, or when readings are unavailable, time or counters move backward, or the wall interval is zero.
 
-RSS comes from `/proc/self/status`. Cgroup-v2 membership and mount discovery select the actual `memory.current`, `memory.max` and `memory.events` files. Unreadable/unknown values are null, not zero or substituted RSS.
+RSS comes from `/proc/self/status`. Cgroup-v2 membership and mount discovery select the actual `memory.current`, `memory.max` and `memory.events` files. Unreadable or unknown values are null, not zero or substituted RSS.
 
 An unlimited `memory.max` also has a null limit. Cgroup scope is `unknown`. Process and cgroup usage overlap and must not be added together.
 
@@ -625,26 +626,30 @@ An unlimited `memory.max` also has a null limit. Cgroup scope is `unknown`. Proc
 
 ### Accepted configuration and reload operations
 
-The source manager requires a genuine `.dae` startup captured by the file loader. Programmatic configs and compatibility serde loaders do not provide lossless sources. Their configuration/validation/reload capabilities remain unavailable.
+The source manager requires a genuine `.dae` startup captured by the file loader. Programmatic configurations and compatibility serde loaders do not provide lossless sources. For those loaders, the configuration, validation and reload capabilities stay unavailable.
 
-GET describes the accepted snapshot, not a fresh disk scan: opaque source IDs, exact-byte SHA-256 hashes, main/include kinds, write permissions and safe diagnostics. Source `path` and rule `file` retain canonical entry-directory-relative names, such as `config.d/routing.dae`. Source `absolute_path` additionally exposes the canonical absolute path.
+`GET /config` describes the accepted snapshot, not a fresh disk scan. It reports opaque source IDs, exact-byte SHA-256 hashes, main and include kinds, write permissions and safe diagnostics. Source `path` and rule `file` keep canonical entry-directory-relative names, such as `config.d/routing.dae`. Source `absolute_path` also exposes the canonical absolute path.
 
-`GET /config` returns `{generation_id,revision,sources,diagnostics,secrets_redacted,x-honk:{store}}`. Each source has `id`, `path`, `kind` (`main` or `include`), `content_sha256`, `content`, `bytes`, `line_count`, `writable` and `loaded_at`. A read-only source adds `read_only_reason`; file mode adds `absolute_path`. `GET /config/sources/{source_id}` returns one source object without `writable`, `read_only_reason` and `loaded_at`.
+`GET /config` returns `{generation_id,revision,sources,diagnostics,secrets_redacted,x-honk:{store}}`. Each source has `id`, `path`, `kind` (`main` or `include`), `content_sha256`, `content`, `bytes`, `line_count`, `writable` and `loaded_at`. A read-only source adds `read_only_reason`. File mode adds `absolute_path`. `GET /config/sources/{source_id}` returns one source object without `writable`, `read_only_reason` and `loaded_at`.
 
-Source hashes, configuration revision and runtime generation are distinct: accepting comments-only changes advances revision without requiring a new runtime generation. Effective group membership changes revision, but health observations do not.
-Reloads refresh any previously captured dependency fingerprints; unchanged sources and fingerprints retain their configuration revision.
+Source hashes, configuration revision and runtime generation are distinct.
+Accepting a comments-only change advances the revision without requiring a new
+runtime generation. Effective group membership changes the revision, but health
+observations do not. A reload refreshes any previously captured dependency
+fingerprints; unchanged sources and fingerprints keep their configuration
+revision.
 
-Admitted anonymous loopback requests read the same configuration data as bearer-authenticated requests. Accepted content includes ordinary credentials, share links and paths. Only declared native/Clash listener-secret values are masked, including duplicate and overridden declarations and occurrences elsewhere in the source.
+Configuration reads return the accepted content. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. Accepted content includes ordinary credentials, share links and paths. Only declared native and Clash listener-secret values are masked, including duplicate and overridden declarations and occurrences elsewhere in the source.
 
-Parser spans identify the secret values while preserving nonsecret text and line structure. Credential-bearing sources remain read-only with hashes of their original bytes. A write whose content contains a masked value, in either its raw or JSON-escaped spelling, returns `403 permission_denied`.
+Parser spans identify the secret values and preserve nonsecret text and line structure. A credential-bearing source stays read-only, and its hash covers the original bytes. A write whose content contains a masked value, in raw or JSON-escaped spelling, returns `403 permission_denied`.
 
-A value shorter than eight bytes is neither masked nor refused: it can be written into an ordinary source and is read back unmasked. The required `secrets_redacted` boolean reports whether listener-secret values were withheld. Masked content is never an editable round-trip payload.
+A value shorter than eight bytes is neither masked nor refused. It can be written into an ordinary source and is read back unmasked. The required `secrets_redacted` boolean reports whether honk withheld listener-secret values. Masked content is never an editable round-trip payload.
 
 Native settings and listener credentials cannot be changed or moved through this API. Edit them locally and restart. To make a main file editable, first place listener credentials in a dedicated read-only include locally.
 
 With `config_write: true` and either a nonempty secret or `password_auth`, the accepted main source and all accepted includes are writable unless credential-bearing. Only accepted source IDs authorize replacement, and creation accepts only a new `.dae` path that an include pattern loads. Caller-supplied paths do not authorize arbitrary file writes.
 
-Subscription/generated sources are not writable. Ordinary include glob ordering, entry-root confinement, duplicate/cycle rejection and no-match semantics remain unchanged. Saving does not flatten or reformat other files.
+Subscription and generated sources are not writable. Ordinary include glob ordering, entry-root confinement, duplicate or cycle rejection and no-match semantics remain unchanged. Saving does not flatten or reformat other files.
 
 A refused configuration write names its cause in `details.reason`, merged with any other details such as `stage`. Non-object details are preserved under `value`. The `code`, `message` and HTTP status do not change.
 
@@ -665,15 +670,15 @@ Write-refusal reasons appear on these responses:
 
 | Request or condition | Response |
 | --- | --- |
-| Source PUT/creation, import or revision activation | `403 permission_denied` |
-| Group PATCH or node/provider write | `404 capability_not_supported` |
-| Refused source write during a node/provider write | 503 |
+| Source PUT or creation, import or revision activation | `403 permission_denied` |
+| Group PATCH or node or provider write | `404 capability_not_supported` |
+| Refused source write during a node or provider write | 503 |
 | Store refuses a created source | `400 invalid_request` |
 | Database import leaves a secret outside its field after stripping | `422 unsupported_value`, reason `listener_secret_in_content` |
 
 Source and management admission check `writes_disabled` before `configuration_unavailable`.
 
-Candidate guards check secret declarations, secret content, credential-source changes, then listener-setting changes. Other refusals carry no `reason`. The request log line of a refusal with a reason is written at INFO with `reason` and never with the path or content.
+Candidate guards check secret declarations, secret content, credential-source changes, then listener-setting changes. Other refusals carry no `reason`. When a refusal carries a reason, its request log line is written at INFO with `reason` and never with the path or content.
 
 Native `/logs` shows that line with `reason` and `status`, while other request lines stay withheld.
 
@@ -688,23 +693,23 @@ A source listed by `GET /config` with `writable: false` names its first failed c
 
 `GET /config/sources/{source_id}` omits `read_only_reason`, `writable` and `loaded_at`.
 
-A source containing a listener-secret value remains read-only; honk keeps running. At startup and each accepted reload, including no-op reloads, honk logs one WARN per such source. This includes secret-declaring sources and applies even when configuration writes are disabled.
+A source that contains a listener-secret value stays read-only, and honk keeps running. At startup and each accepted reload, including no-op reloads, honk logs one WARN per such source. This includes secret-declaring sources and applies even when configuration writes are disabled.
 
 The warning includes the source ID and the path masked as in the listing. A secret that no source contains makes the source writable again.
 
-Validation takes JSON `{"mode":"syntax","sources":[{"id":"candidate","content":"..."}]}`. Each source may also carry `path`. Syntax mode parses only submitted documents: IDs/paths are diagnostic labels, not filesystem authority.
+Validation takes JSON `{"mode":"syntax","sources":[{"id":"candidate","content":"..."}]}`. Each source may also carry `path`. Syntax mode parses only submitted documents: IDs and paths are diagnostic labels, not filesystem authority.
 
-Omitted `sources[].id` defaults to `source-1`, `source-2` and so on. IDs are 1–128 bytes of ASCII letters, digits, `-`, `_` or `.`, unique within the request; they only label diagnostics. Supplied paths must be nonempty and unique. Invalid IDs or paths, or an empty `sources` array, return 400; more than 32 sources return 413; an unknown `mode` returns 422.
+An omitted `sources[].id` defaults to `source-1`, `source-2` and so on. IDs are 1–128 bytes of ASCII letters, digits, `-`, `_` or `.`, and unique within the request; they only label diagnostics. Supplied paths must be nonempty and unique. Invalid IDs or paths, or an empty `sources` array, return 400. More than 32 sources return 413, and an unknown `mode` returns 422.
 
 A native diagnostic is `{level,source_id,line,column,span,code,message}`. `level` is `error`, `warning` or `info`. `line` and byte `column` are null when the diagnostic cannot be placed exactly in a source. `span` is null.
 
-Full mode overlays the first document on the configured entry file, resolves additional `.dae` paths within its authorized entry root, and checks real local dependencies. These are cached subscriptions, geodata, hosts and ECH material. A never-fetched subscription is admitted with a warning and no cached nodes. Existing same-fetch active nodes can still be rebased.
+Full mode overlays the first document on the configured entry file, resolves additional `.dae` paths within its authorized entry root, and checks real local dependencies. They are cached subscriptions, geodata, hosts and ECH material. A never-fetched subscription is admitted with a warning and no cached nodes. If the same fetch already has active nodes, they can still be rebased.
 
-Other missing or invalid dependencies are errors. A full-mode first `path` other than the entry file, a non-`.dae` path, or a path outside the entry root returns `400 invalid_request`. Validation never fetches dependencies, creates/chmods cache directories, starts workers or publishes a generation.
+Other missing or invalid dependencies are errors. A full-mode first `path` other than the entry file, a non-`.dae` path, or a path outside the entry root returns `400 invalid_request`. Validation never fetches dependencies, creates or changes permissions on cache directories, starts workers or publishes a generation.
 
 A completed invalid candidate returns HTTP 200 with `valid:false` and safe diagnostics. This offline admission is not a promise that later runtime activation will succeed.
 
-Source/dependency admission is bounded to 32 sources and 8 MiB in total, counting each dependency materialization, including repeated references. Geodata files are runtime assets the engine loads whole anyway: they are hashed for conflict detection but never count toward this budget. The independent HTTP JSON body limit remains **64 KiB**, so it is not possible to upload an 8 MiB body.
+Source and dependency admission allows at most 32 sources and 8 MiB in total. Each dependency materialization counts, including repeated references. Geodata files are runtime assets that the engine loads whole; honk hashes them for conflict detection, but they never count toward this budget. The HTTP JSON body limit is independent and remains 64 KiB, so an 8 MiB body cannot be uploaded.
 
 | Capability | Limit | Basis |
 | --- | --- | --- |
@@ -719,25 +724,25 @@ Full validation applies include ordering before semantic admission. Submitted do
 
 Their bytes and source count still share the same budget as every materialized dependency reference.
 
-Unknown fields in PUT and validation bodies, `secrets_redacted` included, return `400 invalid_request`. PUT takes JSON `{"content":"..."}` and RFC 9110 `If-Match` over the current **disk bytes**, not the config revision or runtime generation. The resource's strong ETag is its lowercase SHA-256 hash, quoted: `If-Match: "<64 lowercase hex digits>"`.
+Unknown fields in PUT and validation bodies, `secrets_redacted` included, return `400 invalid_request`. PUT takes JSON `{"content":"..."}` and RFC 9110 `If-Match` over the current disk bytes, not the config revision or runtime generation. The resource's strong ETag is its lowercase SHA-256 hash, quoted: `If-Match: "<64 lowercase hex digits>"`.
 
-Lists and multiple header field lines are combined. Any matching strong tag satisfies the condition, weak tags are valid syntax but never match, and `*` matches an existing resource. Well-formed nonmatching opaque tags (including hashes with different case) yield `412 stale_revision`, not a schema error.
+Lists and multiple header field lines are combined. Any matching strong tag satisfies the condition, weak tags are valid syntax but never match, and `*` matches an existing resource. A well-formed nonmatching opaque tag, including a hash in a different case, yields `412 stale_revision`, not a schema error.
 
-Missing `If-Match` is 428, checked before `Content-Type` and the body. Malformed syntax or non-text values are 400. The condition is reevaluated on detected target/dependency changes. Failure returns 412. A change while the condition still holds, including `*` or a matching list, returns `409 state_conflict`.
+Missing `If-Match` is 428, checked before `Content-Type` and the body. Malformed syntax or non-text values are 400. The condition is reevaluated on detected target or dependency changes. Failure returns 412. A change while the condition still holds, including `*` or a matching list, returns `409 state_conflict`.
 
 Invalid candidates return 422 without a write or reload. Denied writes return 403.
 
 A candidate changing a restart-required setting also returns 422 without a write or reload. Otherwise, reload would reject the change and leave the disk file ahead of the accepted hash. Each setting receives an `error` diagnostic with code `restart-required` and a message naming the setting.
 
-This applies to source PUT, Group PATCH, node/provider edits, database import and revision activation.
+This applies to source PUT, Group PATCH, node or provider edits, database import and revision activation.
 
 `full` validation reports these rows as warnings. Change such settings in the file and restart honk. JSON-bearing requests require `Content-Type: application/json`.
 
-The whole candidate is validated before a mode-preserving, exclusive temporary write, file sync, atomic rename and parent-directory sync. Target identity/hash and the complete dependency set are rechecked before rename.
+The whole candidate is validated before a mode-preserving, exclusive temporary write, file sync, atomic rename and parent-directory sync. Target identity and hash, and the complete dependency set, are rechecked before rename.
 
-These checks do **not** lock out arbitrary external editors: an uncoordinated change can still race between the final check and rename. Do not manually edit the same configuration while an API save is in progress. Detected conflicts are rejected rather than overwriting them.
+These checks do not lock out arbitrary external editors: an uncoordinated change can still race between the final check and rename. Do not manually edit the same configuration while an API save is in progress. Detected conflicts are rejected, not overwritten.
 
-If rename succeeds but directory sync fails, the 503 reports `written:true,durability_confirmed:false` without `Retry-After`: bytes have changed and durability is unconfirmed, not rolled back. A later reload-queue failure can likewise report `written:true`, also without `Retry-After`. An HTTP error alone does not imply that nothing was written.
+If rename succeeds but directory sync fails, the 503 reports `written:true,durability_confirmed:false` without `Retry-After`. The bytes have changed. Durability is unconfirmed, and the write is not rolled back. A later reload-queue failure can likewise report `written:true`, also without `Retry-After`. An HTTP error alone does not imply that nothing was written.
 
 `POST /api/v1/config/sources` creates one new source file. Capabilities advertise `config.create` only when `config.writable` is true. An unavailable or read-only configuration answers as for PUT, and a writable configuration whose `config.create` is false returns `404 capability_not_supported`.
 
@@ -754,9 +759,9 @@ A path that exists on disk or names an accepted source returns `409 state_confli
 
 The file is written through a temporary file and a no-replace rename with the entry file's mode. In database mode the new source is recorded in a new revision instead. A failed reload leaves the created file in place, because honk cannot remove it without racing other editors of that path.
 
-Every failed creation reports `written` (`true` once the file is created) and `committed` (`false`, `true` or `null`). Size limits, `Idempotency-Key`, and the 413, 415, 429 and 503 responses match PUT.
+Every failed creation reports `written` and `committed`. `written` is `true` once the file is created, and `committed` is `false`, `true` or `null`. Size limits, `Idempotency-Key`, and the 413, 415, 429 and 503 responses match PUT.
 
-For PUT, HTTP 202 is sent only after durable replacement and real reload queue admission. `Location` matches the returned operation `href`, with `Retry-After: 1`.  202 is not activation success. The daemon owns the admitted work across HTTP disconnects.
+For PUT, HTTP 202 is sent only after durable replacement and real reload queue admission. `Location` matches the returned operation `href`, with `Retry-After: 1`. A 202 is not activation success. The daemon owns the admitted work across HTTP disconnects.
 
 Admission returns `{operation_id,kind,status,href}`. Polling `href` returns:
 
@@ -774,17 +779,17 @@ Admission returns `{operation_id,kind,status,href}`. Polling `href` returns:
 | `group_update` | `{group_id,config_revision}` |
 | `geodata_update` | GeoData representation described below |
 
-An optional `Idempotency-Key` binds principal, method, path and daemon instance plus the exact body bytes. Concurrent or later same-key/same-body requests share the original admission/operation, without another write, hash check or reload—even when retrying with the old hash after losing the first 202. A different body under that key is 409.
+An optional `Idempotency-Key` binds principal, method, path and daemon instance plus the exact body bytes. Concurrent or later requests that repeat the same key and body share the original admission and operation. They perform no further write, hash check or reload, even when retrying with the old hash after losing the first 202. A different body under that key is 409.
 
 A repeated, empty or non-text `Idempotency-Key` returns `400 invalid_request`.
 
-At most 32 reservations/operations are retained. Terminal operations remain for up to 300 seconds. When the store is full, a new admission evicts the oldest terminal operation, whose ID then returns 404.
+At most 32 reservations and operations are retained. Terminal operations remain for up to 300 seconds. When the store is full, a new admission evicts the oldest terminal operation, whose ID then returns 404.
 
 Its `Idempotency-Key` still replays the original 202, or returns 409 for a different body, until 300 seconds after the operation finished. At most 1024 evicted keys are kept (`resources.operations.max_replay_keys`), and past that the oldest is forgotten. Only when every slot holds a preparing or running operation does admission return `503 temporarily_unavailable` with `Retry-After: 1`.
 
 Restart clears this process-local replay state.
 
-The same coordinator serializes API writes/reloads and SIGHUP **before reading/parsing files**, then uses the real runtime reload and subscription reconciliation. Rejected activation retains the previous accepted snapshot/generation, but already-written bytes remain on disk. A committed-but-degraded result retains the new snapshot/generation and reports the operation as failed, with commit information.
+The same coordinator serializes API writes, reloads and SIGHUP before reading or parsing files, then uses the real runtime reload and subscription reconciliation. Rejected activation retains the previous accepted snapshot and generation, but already-written bytes remain on disk. A committed-but-degraded result retains the new snapshot and generation and reports the operation as failed, with commit information.
 
 There is no automatic file rollback. Repair the disk configuration and explicitly reload when needed. When files on disk fail to load, the failed operation and `last_reload` carry the same details:
 
@@ -792,7 +797,7 @@ There is no automatic file rollback. Repair the disk configuration and explicitl
 - The `details.diagnostics` that a write of that content returns, naming accepted source IDs and lines.
 - `committed:false`.
 
-When all rows would exceed the 4 KiB operation error details, only the error rows are kept. Every failed reload, source write and node/provider write reports `error.details.committed` (`false`, `true` or `null`). A plain reload's details omit `written`, which writes carry instead.
+When keeping every row would exceed the 4 KiB operation error details, honk keeps only the error rows. Every failed reload, source write and node or provider write reports `error.details.committed`, which is `false`, `true` or `null`. A plain reload's details omit `written`, which writes carry instead.
 
 GET operation, `runtime.last_reload` and `operation.updated` expose actual API reload outcomes. SIGHUP itself does not create a synthetic operation or populate `last_reload`. A no-op may accept changed source text without a new runtime generation.
 
@@ -804,22 +809,23 @@ When a configured secret or password login protects the listener, all sessions u
 
 `honk-core --store db` keeps the administered `.dae` sources as revisions in the state db, `<data_dir>/state/honk.db`. `data_dir` is `--data-dir` (default `/var/lib/honk`) and must equal `global.data_dir`. There is no working-directory fallback.
 
-The `state` directory is 0700 and the file 0600, both owned by the daemon user and neither a symlink. At startup or `honk-core admin reset`, if either is owned by the daemon user and has only extra group or other read or execute bits, honk removes those bits with a warning. Anything else, including group- or other-writable modes, is refused.
+The `state` directory is 0700 and the file 0600, both owned by the daemon user and neither a symlink. At startup or `honk-core admin reset`, honk checks the mode. If the daemon user owns the path and it has only extra group or other read or execute bits, honk removes those bits and logs a warning. Any other mode, including group-writable or other-writable, is refused.
 
-`config export` and other offline reads refuse any mode other than 0700 and 0600 and never change permissions. The db uses WAL, so `honk.db-wal` and `honk.db-shm` sit beside it with the same mode. On a filesystem that cannot hold WAL, for example one without shared memory, it falls back to a rollback journal (`honk.db-journal`) with a warning.
+`config export` and other offline reads refuse any mode other than 0700 and 0600 and never change permissions. The db uses WAL, so `honk.db-wal` and `honk.db-shm` sit beside it with the same mode. On a filesystem that cannot hold WAL, for example one without shared memory, honk falls back to a rollback journal (`honk.db-journal`) with a warning.
 
-Of the configuration, only `.dae` sources move into the db. Subscription bodies are there in both modes. Hosts, ECH and geodata stay on disk and resolve against `data_dir`.
+Only the `.dae` sources move into the db. Subscription bodies are there in both modes. Hosts, ECH and geodata stay on disk and resolve against `data_dir`.
 
-The directory of the imported tree authorizes nothing.
+The directory of the imported tree grants no authority.
 
 With an empty db, startup imports `-c`. It needs `native_api.enabled`, `config_write` and a credential. It strips every `native_api` and `clash_api` `secret:`, checks that the stripped tree with the secrets re-applied parses to the same configuration, and records revision 1 with principal `startup`.
 
-A secret value that survives stripping, for example in a comment or a file name, refuses the import. With a revision present, startup runs the active revision and does not read `-c`. It refuses to continue if another instance moved `head` during startup, which only a mock-mode instance, holding no instance lock, can do.
+The import is refused if a secret value survives stripping, for example in a comment or a file name. With a revision present, startup runs the active revision and does not read `-c`. Startup also refuses to continue if another instance moved `head` during startup. Only a mock-mode instance can do that, because it holds no instance lock.
 
 Db mode runs without the Clash API: a non-empty `experimental.clash_api.external_controller` refuses startup, both in an imported tree and in the active revision. A corrupt db, a foreign `application_id` or a newer schema refuses startup. The db is never renamed or recreated.
-Startup and API re-import compare configured values after restoring stripped credentials and reconciling parser-generated group/provider IDs and parse timestamps. Derived node identities, endpoints, group definitions and subscription fetch settings still participate in the strict comparison.
 
-Listener secrets are stored apart from the revisions and never returned. Writes cannot change them, `native_api` settings or `global.data_dir` (403), and a source that contains a stored secret value is refused. Responses and the `--without-secrets` export mask both stored values.
+Startup and API re-import compare configured values after restoring stripped credentials and reconciling parser-generated group and provider IDs and parse timestamps. Derived node identities, endpoints, group definitions and subscription fetch settings still participate in the strict comparison.
+
+Listener secrets are stored apart from the revisions and never returned. Writes cannot change them, `native_api` settings or `global.data_dir`; such a write returns 403. A source that contains a stored secret value is refused. Responses and the `--without-secrets` export mask both stored values.
 
 In db mode source `absolute_path` is omitted, source paths are labels rather than files, and `If-Match` covers the stored source bytes.
 
@@ -839,9 +845,9 @@ These routes and fields are honk extensions, so they live under `x-honk` (contra
 
 Admitted discovery links them in `links.x-honk`. The paths below are under `/api/v1/x-honk`.
 
-- `GET /config/export` returns the accepted sources as one inlined document: `text/plain; charset=utf-8`, `Content-Disposition: attachment; filename="honk-r<n>.dae"` (`honk.dae` in file mode), a strong `ETag` over the body and `Cache-Control: no-store`. Listener secrets are left out, and when any were the body starts with `# listener secrets omitted`. Add them back before running it. Available in both modes.
-- `POST /config/import` (db mode, writable) takes strict JSON `{"replace":bool}` and a required `Idempotency-Key`. It re-reads the `-c` tree and records it through a reload operation as a new revision with origin `import`. Startup always records revision 1, so `replace:true` is required and anything else returns `409 state_conflict`. A secret copy that survives stripping returns `422 unsupported_value`. The tree must keep the entry path, listener secrets, `native_api` settings and `data_dir`. Otherwise 403.
-- `GET /config/revisions` (db mode) returns `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`, newest first and without content. `active` and rows share one database snapshot.  `parent` becomes null if retention removes that parent revision.
+- `GET /config/export` returns the accepted sources as one inlined document. The response is `text/plain; charset=utf-8` with `Content-Disposition: attachment; filename="honk-r<n>.dae"` (`honk.dae` in file mode), a strong `ETag` over the body and `Cache-Control: no-store`. Listener secrets are left out. When any were omitted, the body starts with `# listener secrets omitted`; add them back before running the file. Available in both modes.
+- `POST /config/import` (db mode, writable) takes strict JSON `{"replace":bool}` and a required `Idempotency-Key`. It re-reads the `-c` tree and records it through a reload operation as a new revision with origin `import`. Startup always records revision 1, so `replace:true` is required and anything else returns `409 state_conflict`. A secret copy that survives stripping returns `422 unsupported_value`. The tree must keep the entry path, listener secrets, `native_api` settings and `data_dir`. Otherwise the request returns 403.
+- `GET /config/revisions` (db mode) returns `{active, max_revisions, revisions:[{revision, parent, created_at, principal, origin, content_sha256, bytes, sources:[{path, sha256}]}]}`, newest first and without content. `active` and rows share one database snapshot. `parent` becomes null if retention removes that parent revision.
 - `POST /config/revisions/{n}/activate` (db mode, writable) takes an empty body or `{}` and an optional `Idempotency-Key`. It validates revision `n`, activates it and records it as a new revision with origin `activate`. Activating the active revision is a no-op unless `store.recorded` is false. An unknown `n` returns `404 resource_not_found`.
 
 In file mode, import and the revision routes return `404 capability_not_supported`.
@@ -864,7 +870,7 @@ To recover from a damaged database:
 
 `POST /probes` requires JSON, for example `{"target":{"type":"node","node_id":"<id>"},"kind":"http","transport":["tcp"],"ip_version":"ipv4","warmth":"cold"}`.
 
-`target`, `kind`, `transport`, `ip_version` and `warmth` are required. `members` is optional but cannot be null; a member-ID list rejects empty or duplicate IDs, and a node target rejects `members`. A DNS probe over both transports:
+`target`, `kind`, `transport`, `ip_version` and `warmth` are required. `members` is optional but cannot be null. A member-ID list with empty or duplicate IDs is rejected, and a node target rejects `members`. A DNS probe over both transports looks like this:
 
 ```json
 {"target":{"type":"group","group_id":"<id>"},"kind":"dns","transport":["tcp","udp"],"ip_version":"ipv4","warmth":"cold","members":"direct"}
@@ -886,13 +892,13 @@ Targets come only from accepted configuration:
 
 | Probe | Target |
 | --- | --- |
-| Raw TCP | Node’s configured server endpoint |
+| Raw TCP | Node's configured server endpoint |
 | HTTP | Configured check URL |
 | DNS | Configured check target, with real UDP or framed TCP exchanges |
 
-There is no caller URL or redirect following. Probes apply no address or port policy checks to configured targets or node servers.
+Requests accept no caller URL, and a probe never follows redirects. Probes apply no address or port policy checks to configured targets or node servers.
 
-Target hosts resolve through the running DNS configuration; when it cannot answer, for example under `asis` routing, they fall back to bootstrap DNS. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while HTTP Host/TLS SNI retains the configured name. Private/loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
+Target hosts resolve through the running DNS configuration. When that configuration cannot answer, for example under `asis` routing, they fall back to bootstrap DNS. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while the HTTP Host and TLS SNI keep the configured name. Private and loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
@@ -909,13 +915,11 @@ Whoever can write the configuration or control subscription content decides thos
 | Preparation, queueing and measurement | One 30-second deadline |
 | Requests per minute, per resource | 30 for the sole principal and globally |
 
-Final transport-owner cleanup remains joined after the deadline, so total operation time can exceed 30 seconds. Rate rejection returns `429 rate_limited`; capacity rejection returns 503. Both include `Retry-After`.
+Final transport-owner cleanup remains joined after the deadline, so total operation time can exceed 30 seconds. Rate rejection returns `429 rate_limited`, and capacity rejection returns 503. Both include `Retry-After`.
 
-Admission returns 202 with a `queued` operation at once, even while four jobs are active. A job that ends before measurement fails with `probe_cancelled`, `probe_deadline`, `unsupported_value` (local resolution is refused, or the node cannot carry UDP to the probe port) or `engine_unavailable`. Optional `Idempotency-Key` replays retained admission.
+Admission returns 202 with a `queued` operation at once, even while four jobs are active. A job that ends before measurement fails with `probe_cancelled`, `probe_deadline`, `unsupported_value` or `engine_unavailable`. `unsupported_value` means local resolution is refused, or the node cannot carry UDP to the probe port. Repeating an optional `Idempotency-Key` replays the retained probe admission.
 
-Repeating an optional `Idempotency-Key` replays the retained probe admission.
-
-Results preserve member-to-leaf associations even when execution is deduplicated, actual measurement/family/warmth, and whether current-generation health accepted the result. Raw TCP latency is not HTTP ranking evidence. Cancelled, unavailable and obsolete work does not become a fake unhealthy sample.
+Results keep the member-to-leaf associations even when execution is deduplicated. They also report the actual measurement, family and warmth, and whether current-generation health accepted the result. Raw TCP latency is not HTTP ranking evidence. Cancelled, unavailable and obsolete work does not become a fake unhealthy sample.
 
 A successful probe operation's `result` has this shape:
 
@@ -929,13 +933,13 @@ Selection observations do not advance policy state. If final cleanup fails, the 
 
 A child group among the direct members is probed through one selected leaf. Selection can expand descendants; the planner rejects graphs above 256 entries. A Selector without subgroups or `final` is exempt from that planner limit.
 
-The target group still has the 64-member and 256-row limits. To probe larger groups in batches, send `members` as a list of at most 64 IDs. `members: "leaves"` additionally rejects a whole-group graph above 256 entries.
+The target group still has the 64-member and 256-row limits. To probe larger groups in batches, send `members` as a list of at most 64 IDs. `members: "leaves"` also rejects a whole-group graph above 256 entries.
 
 ### DNS query, cache and outcome history
 
-`POST /dns/query` requires a strict JSON body with `Content-Type: application/json`; other media types return 415.
+`POST /dns/query` requires a strict JSON body with `Content-Type: application/json`. Other media types return 415.
 
-The body is limited to 4096 bytes; a larger body returns `413 request_too_large`.
+The body is limited to 4096 bytes. A larger body returns `413 request_too_large`.
 
 | Field | Location | Requirement or default |
 | --- | --- | --- |
@@ -947,11 +951,11 @@ The body is limited to 4096 bytes; a larger body returns `413 request_too_large`
 
 Supported types are A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS and CAA.
 
-A type is an uppercase name, a decimal number, or `TYPE` plus a number, so `"A"`, `"1"` and `"TYPE1"` are the same. Type names are case-sensitive. Invalid or duplicate types return 400; a valid type outside the twelve above returns 422. Cache and log `type` filters accept any valid type.
+A type is an uppercase name, a decimal number, or `TYPE` plus a number, so `"A"`, `"1"` and `"TYPE1"` are the same. Type names are case-sensitive. Invalid or duplicate types return 400. A valid type outside the twelve above returns 422. Cache and log `type` filters accept any valid type.
 
-All types share one generation and a ten-second deadline. The rate ceiling is 30 requests/minute for the sole principal and globally.
+All types share one generation and a ten-second deadline. The rate ceiling is 30 requests per minute for the sole principal and globally.
 
-A forced upstream replaces request-stage routing, not hosts/strategy precedence or response policy. A local-host answer still reports the default route and no upstream.
+A forced upstream replaces request-stage routing. It does not replace hosts, strategy precedence, or response policy. A local-host answer still reports the default route and no upstream.
 
 `bypass` does none of the following:
 
@@ -959,9 +963,9 @@ A forced upstream replaces request-stage routing, not hosts/strategy precedence 
 - Join a writing singleflight.
 - Supersede entries or start refresh work.
 
-Full detail projects validated answer records. Per-type timeouts, refusals and errors remain actual outcomes.
+Full detail projects validated answer records. Per-type timeouts, refusals and errors stay actual outcomes.
 
-A `detail=full` response; summary omits `answers`:
+A `detail=full` response follows. The summary omits `answers`:
 
 ```json
 {"domain":"example.com.","cache_mode":"normal","query_time":"2026-11-13T00:00:00Z","results":[{"type":"A","question":{"name":"example.com.","type":"A","class":"IN"},"elapsed_ms":12,"cached":false,"cache_entry_id":null,"upstream":"dns1","route":{"source":"default","rule":null},"status":"NOERROR","answers":[{"name":"example.com.","type":"A","class":"IN","ttl":60,"data":"192.0.2.1"}]}]}
@@ -969,61 +973,61 @@ A `detail=full` response; summary omits `answers`:
 
 `route.source` is `default`, `dns.routing` or `forced`, and `route.rule` is nullable. `upstream` is null for cached results. `status` is the response code, or `TIMEOUT`, `REFUSED` or `ERROR` for a failed type.
 
-DNS query/cache responses and DNS log pages mask listener-secret display values without changing opaque IDs or cursor bindings.
+DNS query and cache responses, and DNS log pages, mask listener-secret display values without changing opaque IDs or cursor bindings.
 
 Literal `.` names the DNS root and works for live queries, exact cache listing and name-based deletion. Ordinary input names are case-insensitive with an optional trailing dot. Presented names retain their canonical trailing dot.
 
-A name, without its optional trailing dot, is 1–253 bytes of labels of 1–63 ASCII letters, digits, `-` or `_`. Live queries, cache `name` and routing-trace `domain` use this rule.
+Without its optional trailing dot, a name is 1–253 bytes of labels, and each label is 1–63 bytes of ASCII letters, digits, `-` or `_`. Live queries, cache `name` and routing-trace `domain` use this rule.
 
 Valid root wire questions also use the ordinary strict DNS path. Non-UTF-8 labels remain outside that consumer contract.
 
-`GET /dns/cache` accepts `name`, `domain`, repeated `type`, `include_expired=false|true`, `detail`, `limit` (1–1000, default 100) and `cursor`. Reads neither promote LRU nor count hits. Up to eight immutable filter/instance-bound snapshots live for 30 seconds within an aggregate 8 MiB wire/metadata budget.
+`GET /dns/cache` accepts `name`, `domain`, repeated `type`, `include_expired=false|true`, `detail`, `limit` (1–1000, default 100) and `cursor`. Reads neither promote LRU nor count hits. Up to eight immutable snapshots are bound to a filter and instance. They live for 30 seconds within an aggregate 8 MiB wire and metadata budget.
 
-`name` matches one exact name; `domain` matches a case-insensitive substring. The page is `{observed_at,coverage,entries,total,next_cursor,usage}`, where `total` counts matching entries. An entry is `{entry_id,domain,type,class,status,expires_at,stale_until}` with nullable `stale_until`; `detail=full` adds `answers`.
+`name` matches one exact name. `domain` matches a case-insensitive substring. The page is `{observed_at,coverage,entries,total,next_cursor,usage}`, where `total` counts matching entries. An entry is `{entry_id,domain,type,class,status,expires_at,stale_until}` with nullable `stale_until`. `detail=full` adds `answers`.
 
 Exhausted capacity returns `503 snapshot_unavailable` rather than clipping. An unrecognised cache cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
-Coverage is the runtime cache (`persistent:false`), not a SQLite inventory. Opaque `entry_id` identifies an exact cache incarnation, not merely a name/type.
+Coverage is the runtime cache (`persistent:false`), not a SQLite inventory. Opaque `entry_id` identifies an exact cache incarnation, not merely a name and type.
 
-Name/type/expiry selection happens before snapshot byte admission and cloning. Unselected cache entries do not consume the requested snapshot's budget. Negative-answer precedence and expiry selection use one observation instant.
+The name, type and expiry selection happens before snapshot byte admission and cloning. Unselected cache entries do not consume the requested snapshot's budget. Negative-answer precedence and expiry selection use one observation instant.
 
 Every page also carries `usage {entries, entry_capacity}` for the whole runtime cache at snapshot time, ignoring the filters. `entry_capacity` is `max_cache_size` after clamping to 1–100,000. Both values are decimal strings, taken while every shard is locked, and later pages of one snapshot repeat them.
 
 Eviction is per shard and also bounded by cached answer bytes, so a shard can evict while the totals still show headroom. `usage.entries` also counts expired and non-exact slots that `total` excludes.
 
-`DELETE /dns/cache/{entry_id}` takes no body/query and returns `{deleted}`. `DELETE /dns/cache?name=...&type=A` takes no body and returns `{matched,deleted}` (omit types to select all types for that name). `POST /dns/cache/flush` accepts an empty body or JSON `{}` and returns `{matched,deleted}`.
+`DELETE /dns/cache/{entry_id}` takes no body or query and returns `{deleted}`. `DELETE /dns/cache?name=...&type=A` takes no body and returns `{matched,deleted}`. Omit types to select all types for that name. `POST /dns/cache/flush` accepts an empty body or JSON `{}` and returns `{matched,deleted}`.
 
-The common cache owner fences old foreground/refresh publications and queued persistent puts, then waits for persistence deletion acknowledgement. Old work cannot resurrect invalidated entries after success. Persistence errors propagate instead of reporting a successful flush.
+The common cache owner fences old foreground and refresh publications and queued persistent puts, then waits for persistence deletion acknowledgement. Old work cannot resurrect invalidated entries after success. Persistence errors propagate instead of reporting a successful flush.
 
-Routing/domain maps are not cleared.
+Routing and domain maps are not cleared.
 
-`GET /dns/log` records completed ordinary client DNS outcomes once, including known client socket/ingress and parseable refusals/errors. Native/Clash diagnostics and background refresh duplicates are excluded. `record_dns_log` defaults true and permits recording while its independent DNS-log demand is active, retaining at most 512 records and 8 MiB.
+`GET /dns/log` records each completed ordinary client DNS outcome once. It includes a known client socket and ingress, plus parseable refusals and errors. Native and Clash diagnostics and background refresh duplicates are excluded. `record_dns_log` defaults true and permits recording while its independent DNS-log demand is active, retaining at most 512 records and 8 MiB.
 
 An explicit runtime `record_dns_log: "on"` keeps recording enabled without clients. Configuration false prohibits it until changed and restarted. When effective recording stops, history is released and its cursors become invalid.
 
 Eviction removes whole oldest records. Pages are newest first with `name`, `type`, `src`, `limit` (1–500, default 100) and filter-bound `cursor`. Eviction or shrink invalidates affected cursors.
 
-`name` matches a case-insensitive substring; `src` is an IP address without a port. The page is `{observed_at,total,next_cursor,records}`, where `total` counts all retained records, not matches. A record has `id`, `observed_at`, nullable client `src` (address and port), `question`, `status`, `cached`, nullable `upstream`, `route`, `elapsed_ms` and `answers`, shaped as in DNS query results.
+`name` matches a case-insensitive substring. `src` is an IP address without a port. The page is `{observed_at,total,next_cursor,records}`, where `total` counts all retained records, not matches. A record has `id`, `observed_at`, a nullable client `src` with address and port, `question`, `status`, `cached`, nullable `upstream`, `route`, `elapsed_ms` and `answers`, shaped as in DNS query results.
 
-An unrecognised log cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`. Query/cache/log JSON responses are capped at 262144 bytes.
+An unrecognised log cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`. Query, cache and log JSON responses are capped at 262144 bytes.
 
 A cache or log page ends before the first entry that would exceed the cap and returns `next_cursor`. Thus `limit` is a maximum, not a promised count.
 
-An entry exceeding the cap by itself occupies one complete page, without clipping. Its 65535-byte wire limit bounds the expansion; refusing the entry would make every following entry inaccessible.
+An entry exceeding the cap by itself occupies one complete page, without clipping. Its 65535-byte wire limit bounds the expansion. Refusing the entry would make every following entry inaccessible.
 
 A query response over the cap returns 503 with `Retry-After`, never a silently clipped RRset.
 
 ### Routing simulation and rule locations
 
-Admitted anonymous loopback requests have the same rule reads and routing simulation as bearer-authenticated requests. `POST /routing/trace` takes `{"input":{"network":"tcp","domain":"example.com","dst_port":443},"resolve":"none"}`. Input requires TCP/UDP, a nonzero destination port and at least one of `domain`/`dst_ip`.
+The routing trace simulates routing for one input against the running generation. Admitted anonymous loopback requests have the same rule reads and routing simulation as bearer-authenticated requests. `POST /routing/trace` takes `{"input":{"network":"tcp","domain":"example.com","dst_port":443},"resolve":"none"}`. Input requires TCP or UDP, a nonzero destination port and at least one of `domain` or `dst_ip`.
 
 Other input fields are optional: `dst_ip`, `src_ip`, `src_port` (1–65535), `pname`, `dscp` (0–63) and `mark` (32-bit, accepted but not evaluated). Unknown fields return 400. Missing evidence remains unknown.
 
-It does not resolve DNS, dial, probe or mutate group selection. `resolve` defaults to `none`. `live` requires a domain and no `dst_ip`.
+A trace does not resolve DNS, dial, probe or mutate group selection. `resolve` defaults to `none`. `live` requires a domain and no `dst_ip`.
 
-Violating that shape returns 400, while a well-shaped live request returns 422 because live resolution is unsupported. Content-Type, JSON/schema, input and resolve checks precede rate admission. Rejected validation consumes no trace-rate slot.
+A request that violates that shape returns 400, while a well-shaped live request returns 422 because live resolution is unsupported. Content-Type, JSON and schema, input and resolve checks precede rate admission. Rejected validation consumes no trace-rate slot.
 
-Limits are one address, 256 rule/condition steps, five seconds and 30 requests/minute for the sole principal and globally.
+Limits are one address, 256 rule or condition steps, five seconds and 30 requests per minute for the sole principal and globally.
 
 The response is a `simulation` pinned to one `instance_id` and `generation_id`, not historical flow evidence. `/rules` returns the complete dictionary including fallback, never truncated. `max_rules` is 4096 or the running dictionary size if larger, and `dns_rules.max_rules` likewise covers the larger DNS list.
 
@@ -1031,13 +1035,13 @@ The response is a `simulation` pinned to one `instance_id` and `generation_id`, 
 
 A trace is `{mode,instance_id,generation_id,observed_at,evaluations,dns}`. Each evaluation has nullable `dst_ip`, `decision`, nullable `outbound`, `missing_inputs` and `rules`. A rule evaluation is `{rule_id,expression,result,missing_inputs,conditions}` and a condition `{id,expression,result,missing_inputs}`; `result` is `matched`, `not_matched`, `indeterminate` or `skipped`.
 
-The fallback entry's `expression` is its source statement, such as `fallback: proxy`, or `fallback: <outbound>` when none is retained. Trace evaluations use `fallback: <outbound>`. If either read cannot pin the router within its deadline, it returns `503 snapshot_unavailable` with `Retry-After`.
+The fallback entry's `expression` is its source statement, such as `fallback: proxy`, or `fallback: <outbound>` when none is retained. Trace evaluations use `fallback: <outbound>`. If `/rules` or the trace cannot pin the router within its deadline, that request returns `503 snapshot_unavailable` with `Retry-After`.
 
-Its rule IDs use the same generation-scoped identity as trace and captured userspace flow evidence. Where accepted parser spans exist, source locations contain opaque `source_id`, one-based `line`/`column` and `file` matching that source's entry-relative `path`. Otherwise source is null.
+Rule IDs use the same generation-scoped identity as the trace and captured userspace flow evidence. Where accepted parser spans exist, source locations contain opaque `source_id`, one-based `line` and `column`, and `file` matching that source's entry-relative `path`. Otherwise source is null.
 
-An editor must use that source ID and its content permission, never derive a filesystem path from the display label. Edit rules through source PUT, not PATCH `/rules`.
+An editor must use that source ID and its content permission, and must never derive a filesystem path from the display label. Edit rules through source PUT, not PATCH `/rules`.
 
-For accepted `.dae` rules, `/rules` and `/routing/trace` rule `expression` retain the authored condition values, including geosite/geoip names, negation and quoted arguments. This includes rules in credential-bearing sources. Comments and the outbound clause are removed.
+For accepted `.dae` rules, `/rules` and `/routing/trace` rule `expression` retain the authored condition values, including geosite and geoip names, negation and quoted arguments. This includes rules in credential-bearing sources. Comments and the outbound clause are removed.
 
 Trace condition expressions show configured values as unquoted dae text, in actual compiled predicate order. Ordinary domain alternatives and geosite in one `domain(...)` call form one union condition. Negation applies to the whole union.
 
@@ -1053,9 +1057,9 @@ Disk edits do not change either response until a reload is accepted. Rejected re
 
 Each list is in evaluation order and ends with exactly one `kind: "fallback"` entry. Entries carry `rule_id`, zero-based `index`, `expression`, `action`, `upstream`, `source` and `kind`. Request actions are `upstream`, `asis` and `reject`.
 
-Response actions are `accept`, `reject` and `requery`. `upstream` is the name the engine uses for `upstream` and `requery`, lowercased, and null for the other actions. `expression` is the whole statement as written, action included and trailing comment removed, such as `qname(suffix: example.com) -> AliDNS` or `fallback: googledns`.
+Response actions are `accept`, `reject` and `requery`. For `upstream` and `requery`, `upstream` names the upstream the engine uses, lowercased. It is null for the other actions. `expression` is the whole statement as written, action included and trailing comment removed, such as `qname(suffix: example.com) -> AliDNS` or `fallback: googledns`.
 
-A fallback the configuration does not write still appears with the engine default (`upstream` `default` for requests, `accept` for responses), expression `fallback: <action>` and null `source`. Rules the parser omits with a warning are not listed.
+A fallback that the configuration does not write still appears, with the engine default action: `upstream` `default` for requests and `accept` for responses. Its expression is `fallback: <action>`, and its `source` is null. Rules the parser omits with a warning are not listed.
 
 `rule_id` is `{instance}:{generation}:dns_request:rule:{index}`, `{instance}:{generation}:dns_request:fallback`, or the same forms with `dns_response`. It is unique across both lists and changes with the generation, so address a rule by `generation_id` and `rule_id` together.
 
@@ -1064,7 +1068,7 @@ A fallback the configuration does not write still appears with the engine defaul
 | Field | Meaning |
 | --- | --- |
 | `source_id` | Opaque source identifier |
-| `file` | Display value matching that source’s entry-relative `path` |
+| `file` | Display value matching that source's entry-relative `path` |
 | `line` | One-based line where the statement starts in that source |
 | `column` | One-based byte column where the statement starts in that source |
 
@@ -1074,19 +1078,19 @@ A read that cannot pin the running configuration within five seconds returns `50
 
 ### Provider observations and refresh
 
-Admitted anonymous loopback requests read the same provider data as bearer-authenticated requests. Provider GETs do no networking. List accepts `limit` (1–1000, default 100) and `cursor`, with eight 30-second snapshots and 4 MiB aggregate retention.
+Provider GETs do no networking. Admitted anonymous loopback requests read the same provider data as bearer-authenticated requests. The list route accepts `limit` (1–1000, default 100) and `cursor`, with eight 30-second snapshots and 4 MiB aggregate retention.
 
 A page is `{providers,next_cursor}`. A provider has `id`, `name`, `kind` (`inline` or `subscription`), nullable `url_redacted`, `updated_at` and `expires_at`, `node_count`, `status` (`ok`, `stale` or `error`), `traffic` (null or `{upload_bytes,download_bytes,total_bytes}` as decimal strings), `last_error` (null or `{code,message,details}`) and `download` (the route object below, or null).
 
 A list that cannot fit returns `503 snapshot_unavailable` with `Retry-After`. An unrecognised provider cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
-IDs join accepted `Node.provider_id`. Subscriptions return their configured names and full URLs in `url_redacted`. The field name remains for compatibility.
+Provider IDs match accepted `Node.provider_id` values. Subscriptions return their configured names and full URLs in `url_redacted`. The field name remains for compatibility.
 
 GET and successful operation results use the same representation. `traffic` and `expires_at` come from the provider's `subscription-userinfo` header and are null without it. A configured name matching the former `provider-<id>` label is an ordinary name, never an ID alias.
 
-Their status comes from the subscription owner: `ok` requires a successful usable publication. Cached, pending, never-loaded, disabled or failed-with-retained-nodes providers are `stale`. `error` requires a real failure with no nodes.
+Provider status comes from the subscription owner: `ok` requires a successful usable publication. Cached, pending, never-loaded, disabled or failed-with-retained-nodes providers are `stale`. `error` requires a real failure with no nodes.
 
-Never-loaded or disabled-without-cache rows have zero nodes and null update/error, not synthetic failures.
+Never-loaded or disabled-without-cache rows have zero nodes, a null update time and a null error, not synthetic failures.
 
 Subscription rows carry `download`, derived from `download_detour` and shaped like the geodata route:
 
@@ -1097,13 +1101,13 @@ Subscription rows carry `download`, derived from `download_detour` and shaped li
 
 Inline rows report `download: null`. There is no file-provider kind.
 
-A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For classified `fetch_failed` errors, `details` gives the failing `stage` (such as `connection_failed`, `download_timeout`, `tls_failed` or `parse_failed`), the selected `node`, and its selecting group's `group_id`. Unclassified failures, such as invalid URLs or redirects, have `details: null`. `node` is null for direct downloads, failures before node selection, and parse failures whose download attribution is unavailable. `group_id` is null when attribution has no group or that group no longer exists in the catalog. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
+A failed fetch reports `last_error.code` `fetch_failed`. It reports `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For a classified `fetch_failed` error, `details` gives the failing `stage`, the selected `node`, and its selecting group's `group_id`. Stages include `connection_failed`, `download_timeout`, `tls_failed` and `parse_failed`. Unclassified failures, such as invalid URLs or redirects, have `details: null`. `node` is null for direct downloads, failures before node selection, and parse failures whose download attribution is unavailable. `group_id` is null when attribution has no group, or when that group no longer exists in the catalog. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code`, for example `duplicate-node-id`.
 
 A refresh operation that fails on a rejected publication carries the same `details.diagnostic_code`; the fetch `stage`, `node` and `group_id` appear only in the provider's `last_error`.
 
 `POST /providers/{id}/refresh` takes an empty body and optional `Idempotency-Key`, returning a 202 operation. Success requires actual revision-authorized runtime publication, not just fetch or cache write. Disconnecting HTTP does not cancel admitted work.
 
-A distinct concurrent refresh for the same provider conflicts (409), while retained same-key replay returns the original operation first. Disabled providers, or a runtime without a subscription owner (`can_refresh: false`), return `404 capability_not_supported`. Stopped/capacity-limited owners return 503.
+A distinct concurrent refresh for the same provider returns 409, while retained same-key replay returns the original operation first. Disabled providers, or a runtime without a subscription owner (`can_refresh: false`), return `404 capability_not_supported`. Stopped or capacity-limited owners return 503.
 
 The virtual `inline` provider is not refreshable or deletable. It groups static non-builtin nodes, whose `provider_id` is `inline`. Builtins retain null provider ownership.
 
@@ -1115,7 +1119,7 @@ Subscription IDs remain UUIDs.
 
 Submitted names, links and option values are never echoed, and nothing is written. `POST /api/v1/providers` reports a rejected subscription entry the same way. Other refusals keep the generic message.
 
-`resources.nodes.can_manage` and `resources.providers.can_manage` require a running source coordinator and a writable, non-credential-bearing accepted **main** source. Node creation accepts `{"name":"edge","link":"socks5://192.0.2.2:1080"}`. Provider creation accepts `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`.
+`resources.nodes.can_manage` and `resources.providers.can_manage` require a running source coordinator and a writable, non-credential-bearing accepted `main` source. Node creation accepts `{"name":"edge","link":"socks5://192.0.2.2:1080"}`. Provider creation accepts `{"name":"feed","kind":"subscription","url":"https://example.net/sub"}`.
 
 `resources.providers.create_options` lists the effective defaults for omitted provider fields:
 
@@ -1129,33 +1133,33 @@ Where `assets.subscription` sets a default, `create_options` returns that value 
 
 `resources.providers` also advertises `create_unfetched: true` for this creation path. A provider with any explicit option is written as `tag: 'url' { ... }`, with `ua`, `interval` and `cache` on separate lines. A schema length, pattern, kind, interval or user-agent bound violation returns `400 invalid_request`.
 
-An unadvertised option (such as `cache` without its store) returns `422 unsupported_value`. Strict JSON and the 64 KiB body limit remain. The engine parser and full offline admission precede the existing FD-relative durable replacement and real reload.
+An unadvertised option, such as `cache` without its store, returns `422 unsupported_value`. Strict JSON and the 64 KiB body limit remain. The engine parser and full offline admission run before the existing FD-relative durable replacement and real reload.
 
-`201` with the live Node/Provider and its `Location` is returned only after activation and subscription reconciliation. HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
+`201` with the live node or provider and its `Location` is returned only after activation and subscription reconciliation. HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
 
-Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 ASCII letters/digits/`_.-`, with an HTTP(S) URL of at most 4096 characters. Schema length/pattern/enum/bound violations return `400 invalid_request`.
+Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters of ASCII letters, digits, `_`, `.` or `-`, with an HTTP(S) URL of at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
 
 Duplicate names return 409. Structurally valid but unsupported links, identities, provider URL schemes or options return 422. New providers start with zero nodes, stale status and no update time, even if an old cached body exists.
 
-Their exact source specification remains deferred through unrelated edits and reload until explicit refresh. Changing that specification or restarting restores ordinary subscription startup behavior. Same-fetch provider aliases cannot be created through this API, and ambiguous alias deletion is refused rather than transferring IDs or nodes.
+The exact source specification stays deferred through unrelated edits and reloads until an explicit refresh. Changing that specification or restarting restores ordinary subscription startup behavior. Same-fetch provider aliases cannot be created through this API, and ambiguous alias deletion is refused rather than transferring IDs or nodes.
 
 DELETE takes no body or query. Sending one returns `400 invalid_request`, and a body over the limit returns `413 request_too_large`, both without `Retry-After`. Unknown IDs return `{"deleted":0}` without a write.
 
-Successful removal returns `{"deleted":1}` only after activation. Builtins, subscription-derived nodes, declarations outside the main source and unsupported/ambiguous ownership return `404 capability_not_supported`. Static includes remain visible under `inline`.
+Successful removal returns `{"deleted":1}` only after activation. Builtins, subscription-derived nodes, declarations outside the main source and unsupported or ambiguous ownership return `404 capability_not_supported`. Static includes remain visible under `inline`.
 
 The fixed client contract has no per-node writable flag, so a displayed removal action may still be refused. Deleting a node that a group names as its `final` returns `409 state_conflict` with those group IDs in `details.groups`. Other still-referenced entries fail validation before writing.
 
-A main source changed on disk after it was read returns `409 state_conflict`. Editing existing entries remains a source PUT. There is no node/provider PATCH endpoint.
+A main source changed on disk after it was read returns `409 state_conflict`. Editing existing entries remains a source PUT. There is no PATCH endpoint for nodes or providers.
 
-These synchronous actions serialize with source PUT, Group PATCH and SIGHUP. They fence accepted revision, disk bytes and dependencies, but do not lock out arbitrary external editors. Safe failure details include `stage` (these synchronous writes always carry it), `written`, `durability_confirmed` (present only when `written` is true) and `committed`.
+These synchronous actions serialize with source PUT, Group PATCH and SIGHUP. They fence accepted revision, disk bytes and dependencies, but do not lock out arbitrary external editors. Safe failure details include `stage`, `written`, `durability_confirmed` and `committed`. These synchronous writes always carry `stage`, and `durability_confirmed` appears only when `written` is true.
 
-Unknown completion is null, not false. Lifecycle and operational failures use 503 with Retry-After. POST name conflicts use 409, and a source changed on disk during the write returns `409 state_conflict`, since the request carries no precondition.
+An unknown completion state is null, not false. Lifecycle and operational failures use 503 with Retry-After. POST name conflicts use 409, and a source changed on disk during the write returns `409 state_conflict`, since the request carries no precondition.
 
-DELETE still maps other validation failures to 503. A durable write followed by rejected activation reports written true/committed false. With `--store db` nothing is written before activation, so rejection reports written false.
+DELETE still maps other validation failures to 503. A durable write followed by rejected activation reports written true and committed false. With `--store db` nothing is written before activation, so rejection reports written false.
 
-Committed degradation reports committed true with `active_generation_id` set, null when unknown. No rollback is promised. Source PUT retains its independent disk-hash If-Match contract, so a stale editor conflicts after a managed mutation.
+A committed degradation reports committed true and sets `active_generation_id`. The ID is null when unknown. No rollback is promised. Source PUT keeps its independent disk-hash If-Match contract, so a stale editor conflicts after a managed mutation.
 
-Admitted anonymous loopback requests read the same geodata as bearer-authenticated requests. Geodata GET joins retained traffic/DNS metadata under the existing router-before-config publication order. It never scans disk or downloads.
+The geodata route reports loaded asset metadata. Admitted anonymous loopback requests read the same geodata as bearer-authenticated requests. Geodata GET joins the retained traffic and DNS metadata under the existing router-before-config publication order. It never scans disk or downloads.
 
 Hash and size describe loaded bytes, not later disk edits. Unrecorded or differing modification times are null.
 
@@ -1169,23 +1173,24 @@ Hash and size describe loaded bytes, not later disk edits. Unrecorded or differi
 
 It is null for an asset without URLs or a URL that cannot be shown safely. Unused assets are absent. Incompatible loaded snapshots are unavailable rather than arbitrarily selected.
 
-Updates require `config_write`, source authority and download URLs for every loaded asset. URLs come from the configuration file’s `assets.geodata.geosite`/`assets.geodata.geoip`. When sources are configurable, they come from the stored or built-in URLs described below. URLs are never request parameters. Only direct final HTTP(S) URLs are accepted: no userinfo, fragments, redirects or content encoding.
+Updates require `config_write`, source authority and download URLs for every loaded asset. URLs come from the configuration file's `assets.geodata.geosite` or `assets.geodata.geoip` setting. When sources are configurable, they come from the stored or built-in URLs described below. URLs are never request parameters. Only direct final HTTP(S) URLs are accepted: no userinfo, fragments, redirects or content encoding.
 
 HTTPS verifies certificates. A direct request resolves a non-literal host only with the configured numeric `global.bootstrap_resolver`, without system-DNS fallback. To match routing rules, `routing` first looks up the host with that resolver. If it is unset or fails, lookup uses `/etc/hosts` and the system nameserver.
 
 Requests take the download route described below, `routing` by default. One update owns at most two 256 MiB assets. Each URL's file must return headers within 30 seconds of the request.
 
-No pause in its body may last 30 seconds, and the whole download is capped at 10 minutes. Its checksum request has a separate 10-second deadline, starting once the file arrives. This covers the whole request, including route decision, resolution, tunnel and TLS setup. Validation, filesystem work and mandatory joins are not a hard total-time guarantee.
+No pause in the file body may last 30 seconds, and the whole download is capped at 10 minutes. The checksum request has a separate 10-second deadline that starts once the file arrives. That deadline covers the whole request, including route decision, resolution, tunnel and TLS setup. Validation, filesystem work and mandatory joins have no hard total-time guarantee.
 
 All downloads are parsed and the full candidate compiled before any replacement. A file that lacks a category the active configuration uses fails with `asset_validation_failed` and leaves the loaded file in place. A loaded file in `global.data_dir` or `$DAE_LOCATION_ASSET` is replaced where it is.
 
 Updates never overwrite files loaded from lower-priority locations, such as a package's `/usr/share/honk`. Instead, they create `global.data_dir/<file>`, which takes precedence in later lookups. If another file appears there meanwhile, replacement is refused.
 
-Files are opened through no-symlink parent/file descriptors. Aliases, changed bytes, source/dependency conflicts and unsafe paths reject the work.
+Files are opened through no-symlink parent and file descriptors. Aliases, changed bytes, source or dependency conflicts and unsafe paths reject the work.
 
-Parent-component spellings are normalized only after the safe open for identity comparison. Replacements are individually atomic and durable, **not a multi-file transaction**. An error after the first rename retains per-asset written/durability facts and does not undo the replacement. The normal reload receives the immutable verified geo snapshot in both no-op and rebuild paths, so later disk changes cannot substitute different activation bytes.
+Parent-component spellings are normalized only after the safe open, for identity comparison. Replacements are individually atomic and durable, not a multi-file transaction. An error after the first rename keeps the per-asset written and durability facts and does not undo the replacement. The normal reload receives the immutable verified geo snapshot in both no-op and rebuild paths, so later disk changes cannot substitute different activation bytes.
 
-Results are actual published GeoData. Rejected/degraded activation remains failure with commit information. Repair conflicting disk state before retrying.
+Results are actual published GeoData. Rejected or degraded activation remains a failure with commit information. Repair conflicting disk state before retrying.
+
 Cached subscriptions remain dependencies of this admission, but their fingerprints name database rows rather than filesystem paths. Geodata updates fence those row bytes with the final pre-rename recapture. Only real file dependencies acquire inode guards.
 
 `POST /geodata/update` has no body. Same-key replay returns the retained operation before checking exclusivity. A distinct in-flight update conflicts, and operation capacity returns 503.
@@ -1196,15 +1201,15 @@ An update that reaches activation sets `runtime.last_reload`. A failure before a
 
 ### Geodata sources and automatic updates
 
-With a state db and an initialized geodata owner, `resources.geodata.configurable_sources` is true and `runtime_settings.fields` lists `geodata`. The capability then also reports `max_urls: 4`, `interval_hours: {min: 6, max: 168, default: 24}` (the default is what `interval_hours` reads under a cron schedule) and `lifecycle: {file_values: start, overrides_persist: true}`: file values are taken at startup only, and a patch lasts across restarts. `checksum` is `sha256sum` with or without a state db.
+With a state db and an initialized geodata owner, `resources.geodata.configurable_sources` is true, and `runtime_settings.fields` lists `geodata`. The capability then reports `max_urls: 4` and `interval_hours: {min: 6, max: 168, default: 24}`. Under a cron schedule, `interval_hours` reads the default. It also reports `lifecycle: {file_values: start, overrides_persist: true}`: honk takes file values at startup only, and a patch lasts across restarts. `checksum` is `sha256sum` with or without a state db.
 
-The native API tries to open `<data_dir>/state/honk.db` whenever it is enabled. A failed open aborts startup in db mode, with `password_auth`, for a foreign application ID or newer schema, or when another honk instance holds the database. Other failures may continue without persistence.
+The native API tries to open `<data_dir>/state/honk.db` whenever it is enabled. A failed open aborts startup in db mode. It also aborts startup when `password_auth` is set, when the application ID is foreign or the schema is newer, and when another honk instance holds the database. Other failures may continue without persistence.
 
 When it opens, the settings live in its strict `geodata_settings` row and survive restarts and activations. If that row cannot be opened the listener still starts, logs a warning and advertises no geodata capability. Without a state db or geodata owner, only the configuration file's URLs apply and none of the fields below appear.
 
-`GET /runtime/settings` then carries `geodata`: `source`, `geosite.urls`, `geoip.urls`, `auto_update` (`enabled`, `interval_hours`, `cron`), `download` (`route`, `group_id`) and `verify_checksum`. The stored settings are the only ones in force. At startup, when `assets.geodata` names a download URL, a route, `auto_update`, `cron` or `checksum`, honk writes it into the stored settings over a patched one.
+`GET /runtime/settings` then carries `geodata`: `source`, `geosite.urls`, `geoip.urls`, `auto_update` (`enabled`, `interval_hours`, `cron`), `download` (`route`, `group_id`) and `verify_checksum`. The stored settings are the only ones in force. At startup, when `assets.geodata` names a download URL, a route, `auto_update`, `cron` or `checksum`, honk writes that value into the stored settings in place of a patched value.
 
-If the file names no URL for an asset, a URL list from an earlier file is deleted and built-in URLs apply. A patched list is kept. The schedule and `verify_checksum` follow the same rule: a value an earlier file wrote is deleted when the file no longer names it, so the default applies, and a patched value is kept. Configuration download URLs, routes, schedule and checksum switch are startup-owned. A reload that changes their effective values is rejected as restart-required, so other activations never touch the stored settings and a patch lasts until the next startup.
+If the file names no URL for an asset, honk deletes a URL list from an earlier file and built-in URLs apply. A patched list is kept. The schedule and `verify_checksum` follow the same rule. When the file no longer names a value that an earlier file wrote, honk deletes it and the default applies. A patched value is kept. Configuration download URLs, routes, schedule and checksum switch are startup-owned. A reload that changes their effective values is rejected as restart-required. Other activations therefore never touch the stored settings, and a patch lasts until the next startup.
 
 | `source` | Meaning |
 | --- | --- |
@@ -1212,7 +1217,7 @@ If the file names no URL for an asset, a URL list from an earlier file is delete
 | `override` | At least one stored list came from a URL patch. |
 | `default` | No list is stored. Built-in MetaCubeX `meta-rules-dat` release files apply, from raw.githubusercontent.com first and fastly.jsdelivr.net second. |
 
-`download.route` selects the route for every geodata request, including checksums: `routing`, the default, follows the routing rules like user traffic. `group` forces the group in `group_id`, the ID `GET /groups` reports. `direct` dials the host over the bypass mark with the bootstrap resolver.
+`download.route` selects the route for every geodata request, including checksums. `routing`, the default, follows the routing rules like user traffic. `group` forces the group in `group_id`, the ID `GET /groups` reports. `direct` dials the host over the bypass mark with the bootstrap resolver.
 
 Routed and group requests use the external UI download's route decision and tunnel. An unusable route fails that URL like a connection error:
 
@@ -1224,7 +1229,7 @@ Routed and group requests use the external UI download's route decision and tunn
 
 honk tries the next URL and never falls back to direct.
 
-This also applies just after startup when the group selected by the route or rules has no reachable node. Through a node, a hostname is resolved at the node's egress. At startup, `assets.geodata.route` overrides `assets.route` and writes its effective route into the stored settings over an API patch.
+The same failure applies just after startup, when the group selected by the route or rules has no reachable node. Through a node, a hostname is resolved at the node's egress. At startup, `assets.geodata.route` overrides `assets.route` and writes its effective route into the stored settings over an API patch.
 
 Without a file route, a patched route is retained. Otherwise the route follows routing and a previous file route is removed. The route does not affect `source`.
 
@@ -1232,9 +1237,9 @@ See the [assets reference](./assets.md).
 
 `PATCH /runtime/settings` merges `geodata` and stores it without downloading. A `urls` list has 1–4 distinct HTTP(S) URLs of at most 4096 bytes, without userinfo or fragment, and replaces the whole list in fallback order. Patching one asset stores only that list, so `source` becomes `override`, whatever it was, and the other asset keeps following the file or the built-in URLs.
 
-`auto_update` is stored on its own. `interval_hours` (6 to 168) switches to an interval schedule and `cron` to a cron schedule; both in one patch return 400, and `enabled` alone keeps the current schedule. A cron schedule reads `interval_hours: 24` and its expression as `cron`; an interval reads `cron: null`. `assets.geodata.auto_update` and `cron` seed it ([assets reference](./assets.md)). `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an id that is not a current group returns `409 state_conflict`.
+`auto_update` is stored on its own. `interval_hours` (6 to 168) switches to an interval schedule, and `cron` switches to a cron schedule. Both in one patch return 400, and `enabled` alone keeps the current schedule. A cron schedule reads `interval_hours: 24` and its expression as `cron`; an interval reads `cron: null`. `assets.geodata.auto_update` and `cron` seed it; see the [assets reference](./assets.md). `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an ID that is not a current group returns `409 state_conflict`.
 
-`PATCH /runtime/settings` bodies that replace only the geosite URL list, and that enable a cron schedule downloading through a group:
+The first example `PATCH /runtime/settings` body replaces only the geosite URL list. The second enables a cron schedule that downloads through a group:
 
 ```json
 {"geodata":{"geosite":{"urls":["https://example.net/geosite.dat"]}}}
@@ -1244,14 +1249,15 @@ See the [assets reference](./assets.md).
 {"geodata":{"auto_update":{"enabled":true,"cron":"0 3 * * *"},"download":{"route":"group","group_id":"<id-from-GET-groups>"}}}
 ```
 
-Cron grammar and calendar parsing are zone-independent. Geodata owner startup and PATCH additionally reject an explicit cron with no future occurrence in the actual local zone, even with `enabled: false`. A retained schedule is checked when enabled: an unavailable one can still be disabled or repaired by PATCH, and a valid file override can repair an old stored plan at startup. Unavailable plans are not replaced with defaults.
+Cron grammar and calendar parsing are zone-independent. Geodata owner startup and PATCH also reject an explicit cron with no future occurrence in the actual local zone, even with `enabled: false`. A retained schedule is checked when enabled: an unavailable one can still be disabled or repaired by PATCH, and a valid file override can repair an old stored plan at startup. Unavailable plans are not replaced with defaults.
 
 A stored group that a later activation removes reads `group_id: null`, and its downloads fail with `group_unavailable` until the route changes. `verify_checksum` is stored on its own, and `assets.geodata.checksum` seeds it. `"geodata": null` deletes the stored row.
 
 The file's values are written again at the next startup. The top-level `source` is unaffected. A geodata patch with other fields is validated as one request, and validation failures leave everything unchanged.
 
 The anonymous loopback principal cannot patch `geodata` (`403 permission_denied`). Every admitted caller reads the URLs as written, with listener secrets masked.
-If shutdown prevents recorder settings from landing after geodata was stored, PATCH returns `503 temporarily_unavailable` with `details.geodata_stored: true`; the stored geodata is not rolled back.
+
+If shutdown prevents recorder settings from landing after geodata was stored, PATCH returns `503 temporarily_unavailable` with `details.geodata_stored: true`. The stored geodata is not rolled back.
 
 An update tries each asset's URLs in order. It advances to the next URL after a connection error, non-200 file response, deadline expiry or checksum failure.
 
@@ -1269,13 +1275,13 @@ If every URL fails, the details describe the last attempted URL:
 | --- | --- |
 | `stage` | Failed stage |
 | `asset` | `geosite` or `geoip` |
-| `http_status` | Present for a rejected reply: a file status other than 200, or a checksum status other than 200/404 |
+| `http_status` | Present for a rejected reply: a file status other than 200, or a checksum status other than 200 or 404 |
 
 `asset: geoip, stage: checksum_unavailable, http_status: 403` means the server refused the `.sha256sum`, not the file.
 
 Configured, stored and built-in geodata URLs, including their checksum requests, have no address or port allowlist.
 
-`verify_checksum` is `true` by default. Set to `false`, manual and automatic updates request no `.sha256sum` and use every downloaded file unverified: `verified` is `false` and `sha256` is still reported. It is for mirrors that answer a missing checksum with a status other than 404 or with a page that is not a checksum.
+`verify_checksum` is `true` by default. When set to `false`, manual and automatic updates request no `.sha256sum` and use every downloaded file unverified. `verified` is `false`, and `sha256` is still reported. The setting suits mirrors that answer a missing checksum with a status other than 404 or with a page that is not a checksum.
 
 A failure with `checksum_unavailable` or `checksum_mismatch` logs a warning that names this setting. Nothing turns the check off automatically.
 
@@ -1296,15 +1302,15 @@ A failure with `checksum_unavailable` or `checksum_mismatch` logs a warning that
 
 Per-asset fields remain in memory only. After restart they are null, and `verified` is false, until the next attempt.
 
-Automatic updates are on by default, daily at 03:00 local time (`0 3 * * *`). `auto_update.enabled: false` stops them. A cron schedule checks at the first time the expression names after the last recorded check, in the system's local time zone; an interval schedule, set by a patch or kept from a record stored before cron schedules, checks the interval after it. After startup the schedule continues from the last recorded check.
+Automatic updates are on by default, daily at 03:00 local time (`0 3 * * *`). `auto_update.enabled: false` stops them. A cron schedule checks at the first time the expression names after the last recorded check, in the system's local time zone. An interval schedule, set by a patch or kept from a record stored before cron schedules, checks once the interval has elapsed since that check. After startup the schedule continues from the last recorded check.
 
-Nonexistent local times are skipped; repeated times fire only at their first occurrence. If a later time-zone change makes the schedule unavailable, honk warns when entering that state and queues no future scheduled download. Failure backoff continues independently; `next_check_at` can therefore still name a retry. `last_error` continues to describe the last actual update attempt.
+Nonexistent local times are skipped. Repeated times fire only at their first occurrence. If a later time-zone change makes the schedule unavailable, honk warns when entering that state and queues no future scheduled download. Failure backoff continues independently, so `next_check_at` can still name a retry. `last_error` continues to describe the last actual update attempt.
 
-The first check runs five minutes plus the random delay after startup if the previous check:
+The first check runs five minutes plus the random delay after startup when the previous check meets one of these conditions:
 
-- Is older than the wait, or a time the cron expression names has passed since it.
-- Lies in the future because the clock ran ahead.
-- Does not exist.
+- It is older than the wait, or a time named by the cron expression has passed since it.
+- It lies in the future because the clock ran ahead.
+- It does not exist.
 
 Restart therefore never downloads immediately. A host that restarts more often than the schedule still updates. `POST /geodata/update` fetches immediately.
 
@@ -1354,7 +1360,7 @@ To reproduce the assets, extract the source archive into its own directory, use 
 3. `pnpm -C apps/lite build`.
 4. `SOURCE_DATE_EPOCH=1793194168 pnpm package`.
 
-The epoch is the pinned upstream commit's timestamp. The source archive has no Git history. Install brotli and use GNU tar and GNU gzip on `PATH` (verified with tar 1.35 and gzip 1.15).
+The epoch is the pinned upstream commit's timestamp. The source archive has no Git history. Install brotli and use GNU tar and GNU gzip on `PATH`. The reproduction was verified with tar 1.35 and gzip 1.15.
 
 Another gzip implementation can produce different archive hashes from identical tar bytes. Cargo builds embed only the files in `HONK_DOONA_DIR` and its `-lite` sibling and never build or download the frontend. That source's checker is `tools/conformance.mjs`.
 
@@ -1362,18 +1368,19 @@ Its live walk is read-only and skips controls, diagnostics and missing observed 
 
 ### Native logs and runtime settings
 
-`GET /logs` serves SSE to authenticated callers and admitted anonymous loopback callers, with optional minimum `level` and `target` prefix filter. Capture is a separate structured tracing layer, not formatted console/Clash text. Records contain actual `ts`, `level` and `target`.
+`GET /logs` serves SSE to authenticated callers and admitted anonymous loopback callers. Optional filters set a minimum `level` and a `target` prefix. Capture is a separate structured tracing layer, not formatted console or Clash text. Records contain actual `ts`, `level` and `target`.
 
 `GET /logs` takes `level` (lowercase `error`, `warn`, `info`, `debug` or `trace`; default `trace`) and `target` (a module-path prefix of 1–256 bytes). The filters select from captured records and do not raise the capture level. Each `log` event's data is `{ts,level,target,message,fields}` with nullable `fields`. A withheld message reads `[message withheld: not audited for native disclosure]`.
 
-Only audited static messages and bounded typed fields are disclosed. Unaudited messages are explicitly withheld and arbitrary Debug/error/config fields are not formatted into the native buffer. `record_logs` defaults true and permits capture while its independent `/logs` SSE demand is active, retaining up to 512 records for 60 seconds.
+Only audited static messages and bounded typed fields are disclosed. Unaudited messages are explicitly withheld, and arbitrary Debug, error and config fields are not formatted into the native buffer. `record_logs` defaults true and permits capture while its independent `/logs` SSE demand is active, retaining up to 512 records for 60 seconds.
 
 The logs capability advertises these limits as `max_buffered_records` and `retention_seconds`, and lists `filters: [level, target]`. An explicit runtime `record_logs: "on"` keeps capture enabled without clients. Configuration false prohibits it until changed and restarted.
 
 When effective recording stops, retained logs are released and resume cursors expire.
+
 Like Clash `/logs`, capture always omits the `quinn::endpoint` target: its endpoint-driver ERROR duplicates carrier failures that honk reports with their own context.
 
-Use `Last-Event-ID` for resume. Logs have independent stream/filter-bound cursors and, like `/events`, send ready → replay → live, retaining the supplied cursor on ready until replay advances it. Both reject expired/foreign/filter-changed cursors with `409 event_cursor_expired` before 200, allow 16 clients with 64 queued events each, disconnect full queues and send 15-second heartbeat comments.
+Use `Last-Event-ID` for resume. Logs have independent stream- and filter-bound cursors and, like `/events`, send ready → replay → live, retaining the supplied cursor on ready until replay advances it. Both reject expired, foreign or filter-changed cursors with `409 event_cursor_expired` before 200, allow 16 clients with 64 queued events each, disconnect full queues and send 15-second heartbeat comments.
 
 A new stream while all 16 slots are taken returns `503 temporarily_unavailable` with `Retry-After`. Retention shrink invalidates evicted cursors.
 
@@ -1391,9 +1398,9 @@ Supported fields are:
 | `flows.retention_seconds` | 1–300 | 300 |
 | `geodata` | See [geodata sources](#geodata-sources-and-automatic-updates) | Stored separately; not reset by activation |
 
-Configuration permission determines which level and retention controls are available, independently of temporary recording activity. Schema and bound violations, such as empty, null (except `geodata: null`, which clears stored geodata settings), unknown or out-of-range values, return `400 invalid_request`. Geodata credential admission precedes schema validation, so an anonymous request containing `geodata` returns `403 permission_denied` first.
+Configuration permission determines which level and retention controls are available, independently of temporary recording activity. Schema and bound violations return `400 invalid_request`. Examples are empty, unknown or out-of-range values, and null for every field except `geodata: null`, which clears stored geodata settings. Geodata credential admission precedes schema validation, so an anonymous request containing `geodata` returns `403 permission_denied` first.
 
-A field not listed in `resources.runtime_settings.fields` (a recorder's `log.*`, `dns_log.*` or `flows.*` fields when configuration prohibits that recorder, or `geodata` without a state db or geodata owner) instead returns `422 unsupported_value`. The full merge is validated before any store changes, and shrinking discards old records.
+A field not listed in `resources.runtime_settings.fields` returns `422 unsupported_value` instead. This covers a recorder's `log.*`, `dns_log.*` or `flows.*` fields when configuration prohibits that recorder, and `geodata` without a state db or geodata owner. The full merge is validated before any store changes, and shrinking discards old records.
 
 The capabilities advertise the bounds, not the current values: `logs.min_buffered_records`, `dns_log.min_records` and `flows.min_flows` are 64, and the `flows` capability reports the largest `max_flows` (1024) and `retention_seconds` (300). A patched `log.level` also replaces the console and log file filters, including one from `RUST_LOG` or `--debug`. Clash `/logs` keeps its per-request level.
 
@@ -1403,33 +1410,33 @@ The top-level recorder fields accept `"on"` to keep a permitted recorder on, `"o
 
 Configuration false prohibits recording, and a runtime request to pin that recorder on rejects the entire patch with `422 unsupported_value`.
 
-GET and successful PATCH include readonly `recording`: `flows`, `logs` and `dns_log` each contain `{allowed, mode, active}`, where `mode` is `"auto"`, `"on"` or `"off"`. `events.active` reports event capture, and `grace_remaining_seconds` reports the remaining general attachment grace, not any of the independent flow/log/DNS-log diagnostic countdowns. It is zero while a general stream is open.
+GET and successful PATCH include readonly `recording`: `flows`, `logs` and `dns_log` each contain `{allowed, mode, active}`, where `mode` is `"auto"`, `"on"` or `"off"`. `events.active` reports event capture, and `grace_remaining_seconds` reports the remaining general attachment grace, not any of the independent flow, log or DNS-log diagnostic countdowns. It is zero while a general stream is open.
 
 Settings reads renew none of these deadlines.
 
 ### Connection closing, mode and datapath lifecycle
 
-`DELETE /connections/{connection_id}` accepts no body or query. It returns 204 only after the exact TCP owner has closed or the UDP view has retired with token/generation/backend and in-flight reply-delivery acknowledgement. Concurrent/repeated closes of the same still-tracked owner wait for the same real completion (`Pending`) and inherit its success or `Failed` result.
+`DELETE /connections/{connection_id}` accepts no body or query. It returns 204 only after the exact TCP owner has closed or the UDP view has retired with token, generation, backend and in-flight reply-delivery acknowledgement. Concurrent or repeated closes of the same still-tracked owner wait for the same real completion (`Pending`) and inherit its success or `Failed` result.
 
-Closing/Failed is not fabricated Gone/404. Absent IDs or captured owners replaced by another incarnation remain Gone/404. Visible but non-closable owners return 409.
+A closing or failed close is not reported as a fabricated gone state or 404. Absent IDs or captured owners replaced by another incarnation remain gone and return 404. Visible but non-closable owners return 409.
 
 Unconfirmed retirement returns 503. Closing one shared XUDP view does not kill its carrier or siblings.
 
-Bulk DELETE accepts `type=all|tcp|udp`, optional source IP `src`, and `all=true|false`. Without a narrowing type/source filter, `all=true` is required. It snapshots the live set once and rejects more than 1000 matches with 413 before closing anything.
+Bulk DELETE accepts `type=all|tcp|udp`, optional source IP `src`, and `all=true|false`. Without a narrowing type or source filter, `all=true` is required. It snapshots the live set once and rejects more than 1000 matches with 413 before closing anything.
 
 Success returns `{closed,skipped}`. Vanished rows do not count as closed, and non-closable rows are skipped. A retirement failure returns 503 after every selected close has finished, with the `{closed,skipped}` counts in `error.details`.
 
 Those owners stay closed. Repeating an optional `Idempotency-Key` re-evaluates current owners. Synchronous close has no operation replay ledger.
 
-The native `x-honk` `runtime_mode` resource is unavailable: its pinned PUT contract omits lifecycle-conflict and owner/backend-unavailable responses, and its capability does not distinguish reads from writes. GET/HEAD/PUT return `404 capability_not_supported`. No accepted modes are advertised.
+The native `x-honk` `runtime_mode` resource is unavailable: its pinned PUT contract omits lifecycle-conflict, owner-unavailable and backend-unavailable responses, and its capability does not distinguish reads from writes. GET, HEAD and PUT return `404 capability_not_supported`. No accepted modes are advertised.
 
-The shared mode/target/origin owner remains active for Clash when native is enabled, without cache restore or mode persistence. Startup and accepted explicit activation (including no-op) reset to rule. Provider/network refresh preserves mode.
+The shared owner of mode, target and origin remains active for Clash when native is enabled, without cache restore or mode persistence. Startup and accepted explicit activation, including a no-op, reset to rule. Provider or network refresh preserves mode.
 
-If the backend rejects the reset before commit, activation is rejected. After routing commit, it reports committed-degraded, retains the previous mode/source and fences admission rather than claiming a reset. Global retains stable target identity: if refresh removes it, new traffic fails closed rather than selecting a same-named replacement.
+If the backend rejects the reset before commit, activation is rejected. After routing commit, it reports committed-degraded, retains the previous mode and source, and fences admission rather than claiming a reset. Global mode retains stable target identity: if refresh removes it, new traffic fails closed rather than selecting a same-named replacement.
 
-`must`/`block` remain final. With native disabled, existing Clash default/cached mode behavior is unchanged.
+`must` and `block` remain final. With native disabled, the existing Clash default and cached mode behavior is unchanged.
 
-`GET /datapath` and runtime's datapath summary use backend-owned program/hook/routing/admission observations, not configured-interface guesses. Mock reports disabled/none. Real observations are partial, with unknown/null for unverified facts and separate datapath routing-generation identity.
+`GET /datapath` and runtime's datapath summary use backend-owned observations of programs, hooks, routing and admission, not configured-interface guesses. The mock backend reports `disabled` and `none`. Real observations are partial, with unknown or null values for unverified facts and a separate datapath routing-generation identity.
 
 Map capacity may be known while occupancy remains null. Attached hooks alone do not establish active admission, and `full_transparency` is never advertised.
 
@@ -1466,17 +1473,17 @@ When `experimental.clash_api.secret` is non-empty, API requests require:
 Authorization: Bearer <secret>
 ```
 
-A WebSocket upgrade may instead pass `?token=<percent-encoded-secret>`. Honk percent-decodes the token before exact comparison. Query-token authentication is limited to WebSocket upgrades.
+A WebSocket upgrade may instead pass `?token=<percent-encoded-secret>`. honk percent-decodes the token before exact comparison. Query-token authentication is limited to WebSocket upgrades.
 
-The header must be exactly `Bearer ` and the secret, with that case and one space. On a WebSocket upgrade a nonempty `token` is checked instead of the header, so a wrong token fails even with a correct header. Failure returns `401 {"message":"Unauthorized"}`.
+The header must be exactly `Bearer ` followed by the secret, with that case and one space. On a WebSocket upgrade a nonempty `token` is checked instead of the header, so a wrong token fails even with a correct header. Failure returns `401 {"message":"Unauthorized"}`.
 
 Ordinary HTTP requests use the Bearer header. An empty `secret` disables authentication. The `/ui` static tree is outside the API authentication layer.
 
-**The API has no TLS.** Bind it to localhost or place a TLS reverse proxy in front of it, and set a strong `secret` when untrusted clients can reach the listener.
+The API has no TLS. Bind it to localhost or place a TLS reverse proxy in front of it, and set a strong `secret` when untrusted clients can reach the listener.
 
 The Clash listener allows any CORS origin and has none of the native API's Host or Origin checks.
 
-The shipped `config.dae` binds to `127.0.0.1:9090`. A non-loopback controller with an empty `secret` emits a startup warning but is still allowed. This applies to wildcard and assigned addresses, regardless of firewall configuration.
+The shipped `config.dae` binds to `127.0.0.1:9090`. A non-loopback controller with an empty `secret` emits a startup warning but is still allowed. The warning and the allowance cover wildcard and assigned addresses, regardless of firewall configuration.
 
 ## Endpoint map
 
@@ -1485,7 +1492,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | Method | Path | Purpose |
 | --- | --- | --- |
 | GET | `/` | Return the Clash hello document, or redirect a non-JSON client to `/ui/` when external UI hosting is enabled. |
-| GET | `/version` | Return `honk <build-version>` (including the release tag, using the same build identity as the CLI) and Clash premium/meta capability flags. |
+| GET | `/version` | Return `honk <build-version>` (including the release tag, using the same build identity as the CLI) and Clash premium and meta capability flags. |
 | GET | `/configs` | Return the current mode, the implemented Clash-compatible configuration snapshot, and safe active-generation diagnostics under `honk-diagnostics`. |
 | PUT | `/configs` | Compatibility no-op; accepts the request and returns `204 No Content`. |
 | PATCH | `/configs` | Set `mode` to `Rule`, `Global`, or `Direct`; matching is case-insensitive. |
@@ -1494,7 +1501,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | PUT | `/proxies/{name}` | Select a direct member of a Selector group with `{"name":"member"}`; also mutates the synthetic `GLOBAL` selector. Automatic groups, including Score, reject writes. |
 | GET | `/proxies/{name}/delay` | Run an on-demand proxied delay test against the caller's `?url=` for a node or group. Already-warm transports are reused; every cold reusable session or QUIC client is warmed in a throwaway runtime before timing. |
 | GET | `/group/{name}/delay` | Test all group members against the caller's `?url=` with up to `URLTEST_MAX_CONCURRENT` (10) proxied dials, returning successful member delays with the same timing semantics. |
-| GET | `/rules` | Return one row per route. Simple matchers use native Clash rule types; compound, negated, and `must` rules use `complex` with the full dae statement. |
+| GET | `/rules` | Return one row per route. Simple matchers use native Clash rule types; compound, negated and `must` rules use `complex` with the full dae statement. |
 | GET | `/connections` | Return a connection snapshot, or stream snapshots after a WebSocket upgrade. |
 | DELETE | `/connections` | Close all tracked connections. |
 | DELETE | `/connections/{id}` | Close one tracked connection. |
@@ -1509,7 +1516,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/providers/rules` | Return the current stub document `{"providers":[]}`. |
 | GET | `/ui`, `/ui/*` | Redirect `/ui` to `/ui/` and serve the configured external UI directory. |
 
-`/traffic`, `/memory`, and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist. With no subscribers, the Clash tracing layer does not format events.
+`/traffic`, `/memory` and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist. With no subscribers, the Clash tracing layer does not format events.
 
 Each subscriber's level filter runs after the shared queue. Lagged clients skip overwritten events without a gap marker.
 
@@ -1535,7 +1542,7 @@ On a WebSocket, `?interval=` sets the push period in milliseconds (default 1000)
 
 `/traffic` frames are `{"up":<bytes>,"down":<bytes>}`, the bytes since the previous frame. `/memory` frames are `{"inuse":<rss-bytes>,"oslimit":0}`; `inuse` is 0 when RSS cannot be read.
 
-`/logs?level=` accepts `trace`, `debug`, `info`, `warn`, `warning` or `error` in any case; another value returns `400 {"message":"invalid log level"}`. Frames are `{"type":"<level>","payload":"<text>"}`.
+`/logs?level=` accepts `trace`, `debug`, `info`, `warn`, `warning` or `error` in any case. Another value returns `400 {"message":"invalid log level"}`. Frames are `{"type":"<level>","payload":"<text>"}`.
 
 `GET /dns/query` takes `name` and `type` (`A`, `NS`, `CNAME`, `SOA`, `PTR`, `MX`, `TXT`, `AAAA`, `SRV`, `SVCB`, `HTTPS`, `CAA` in any case, or a number). A missing name or invalid type returns 400. The response is DoH JSON with numeric types:
 
@@ -1549,20 +1556,13 @@ A resolution failure returns 200 with `Status: 2` and an empty `Answer`.
 
 ### Diagnostics in `/configs`
 
-`GET /configs` preserves the existing Clash fields and adds `honk-diagnostics`.
-Settings and diagnostics are read from one committed configuration snapshot.
-Startup publishes only admitted file and subscription diagnostics. Failed reloads
-and rejected subscription refreshes leave the active list unchanged; there is no
-last-failed-attempt cache.
+`GET /configs` preserves the existing Clash fields and adds `honk-diagnostics`. Settings and diagnostics are read from one committed configuration snapshot. Startup publishes only admitted file and subscription diagnostics. Failed reloads and rejected subscription refreshes leave the active list unchanged; there is no last-failed-attempt cache.
 
-A successful reload with unchanged effective settings can replace diagnostics
-without advancing the generation. An authorized, admitted provider refresh replaces
-only that provider's diagnostics, even when its nodes are unchanged; static-file
-and other-provider diagnostics remain.
+A successful reload with unchanged effective settings can replace diagnostics without advancing the generation. An authorized, admitted provider refresh replaces only that provider's diagnostics, even when its nodes are unchanged; static-file and other-provider diagnostics remain.
 
 Library callers pass `DiagnosticBuckets` to `ControlPlane::reload_runtime_config(config, diagnostics)`, keeping static and provider-body diagnostics separate. Programmatic inputs without diagnostics use `DiagnosticBuckets::default()`. `merge_subscription_nodes(provider, nodes, diagnostics)` accepts that provider's diagnostic vector, including for admitted providers without worker declarations.
 
-Full configuration replacement moves the complete candidate provenance into place, while provider replacement affects only that provider. SIGHUP retains the buckets of provider bodies actually retained by rebasing. Generated topology/ECS updates preserve source provenance.
+Full configuration replacement moves the complete candidate provenance into place, while provider replacement affects only that provider. SIGHUP retains the buckets of provider bodies actually retained by rebasing. Generated topology and ECS updates preserve source provenance.
 
 All changes publish under the existing configuration write barrier, acquiring the diagnostics lock only after the configuration lock.
 
@@ -1589,40 +1589,35 @@ Full-replacement provider buckets must have unique UUIDs. Duplicate UUIDs reject
 | `diagnostics[].related_indices` | Related original entry ordinals. |
 | `diagnostics[].terminal` | Whether this diagnostic represents the terminal failure. |
 
-The generation matches the active DNS runtime generation. Source IDs are
-snapshot-local, not filesystem identifiers. Sources are ordered static-file first,
-then providers in configured declaration order, followed by admitted non-worker
-providers in retained bucket order. Each source table keeps its original order;
-only referenced sources and their ancestors are included.
-Paths, raw input, credentials, and provider names or IDs are never exported.
+The generation matches the active DNS runtime generation. Source IDs are snapshot-local, not filesystem identifiers. Sources are ordered static-file first, then providers in configured declaration order, followed by admitted non-worker providers in retained bucket order. Each source table keeps its original order; only referenced sources and their ancestors are included. Paths, raw input, credentials and provider names or IDs are never exported.
 
 ### Delay measurement
 
 The caller selects the test URL with `?url=`. A group request fans out to at most `URLTEST_MAX_CONCURRENT` (10) proxied measurements at once.
 
-Both delay routes accept `timeout` in milliseconds; omitted or 0 means 15000. Example: `GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`.
+Both delay routes accept `timeout` in milliseconds. An omitted value or 0 means 15000. Example: `GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`.
 
 Delay tests use the canonical HTTP check-target decoder:
 
-- HEAD preserves the raw path/query, including dot segments and query-only `/?query`.
+- HEAD preserves the raw path and query, including dot segments and query-only `/?query`.
 - Authority omits credentials and default ports.
 - Fragments are never sent.
 
-Tests share periodic health checks' HTTP implementation. They report the second request's warm-path RTT, excluding proxy dial, target TLS and the first request. HTTPS verifies certificates, negotiates HTTP/2 or HTTP/1.1, and disables server push.
+Delay tests use the same HTTP implementation as periodic health checks. They report the second request's warm-path RTT, excluding proxy dial, target TLS and the first request. HTTPS verifies certificates, negotiates HTTP/2 or HTTP/1.1, and disables server push.
 
 Both final responses must have valid decoded 200–499 statuses. A measured-round transport failure or timeout can fall back to the validated first sample. HTTP/1 partial responses never fall back, including on timeout, while graceful HTTP/2 GOAWAY can.
 
-HTTP/1 informational and final response heads share a 16 KiB per-round cap. H2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, H2 startup and each request have separate timeout budgets.
+HTTP/1 informational and final response heads share a 16 KiB per-round cap. HTTP/2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, HTTP/2 startup and each request have separate timeout budgets.
 
 Cold reusable generation probes use guarded temporary runtimes that close afterward. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
 
-Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results; arbitrary manual test targets do not advance real-dial failure streaks.
+Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results. Arbitrary manual test targets do not advance real-dial failure streaks.
 
-`/proxies/{name}/delay` returns `{"delay":12}`; `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. On a URLTest group, either route can switch its selection using the new measurements.
+`/proxies/{name}/delay` returns `{"delay":12}`. `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. On a URLTest group, either route can switch its selection using the new measurements.
 
-On-demand delay exchanges retain Alive/API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server/session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
+On-demand delay exchanges retain Alive and API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server or session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
 
-Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner. After the bounded peer-notification grace, Quinn drivers and then packet-adapter workers are stopped and joined.
+Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner. After the bounded peer-notification grace, Quinn drivers and then packet-adapter workers are stopped and joined.
 
 Actual owned-worker failure still closes health admission.
 
@@ -1644,15 +1639,15 @@ The mode update goes through `DatapathFlagsHandle`, the sole serialized writer f
 
 Mode is cached only when native is disabled. With native enabled, both APIs use the [same transient mode contract](#connection-closing-mode-and-datapath-lifecycle).
 
-`PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector, the target must be a direct member tag, not a leaf reachable only through a nested group. It validates and writes both TCP/UDP choices together.
+`PUT /proxies/{name}` accepts the body regardless of `Content-Type`. For a configured Selector, the target must be a direct member tag, not a leaf reachable only through a nested group. It validates and writes both TCP and UDP choices together.
 
-GET displays TCP. Changed choices invoke per-network persistence/warm callbacks. Selector choices persist when the state cache is available, unless `experimental.cache_file.enabled` is explicitly false.
+GET displays TCP. Changed choices invoke per-network persistence and warm callbacks. Selector choices persist when the state cache is available, unless `experimental.cache_file.enabled` is explicitly false.
 
 Omitting the setting retains persistence. With `interrupt_connections`, the control owner closes captured affected transports and waits for confirmation rather than removing tracker rows. Writing unchanged choices causes no interruption.
 
 URLTest, LoadBalance, Fallback and Score reject manual selection.
 
-`GLOBAL` is synthetic, but every `all` member is a concrete configured group/node with a top-level proxy document. `PUT /proxies/GLOBAL` accepts a member name through the same flags owner. With native disabled, the cache stores it under the `GLOBAL` selector key and unresolved display selections fall back to the first member.
+`GLOBAL` is synthetic, but every `all` member is a concrete configured group or node with a top-level proxy document. `PUT /proxies/GLOBAL` accepts a member name through the same flags owner. With native disabled, the cache stores it under the `GLOBAL` selector key and unresolved display selections fall back to the first member.
 
 With native enabled, writes resolve a stable identity and do not persist. Removing that target makes global routing fail closed, even if the legacy display projection shows another first member.
 
@@ -1674,15 +1669,15 @@ With no configured route, each URL follows honk's traffic routing decision:
 | `block` | Abort |
 | Proxy | Selected outbound leaf |
 
-Each direct or proxied HTTP exchange reports the real host/IP, port, setup, first response, bytes, and terminal outcome to its traversed Score groups. Paths that traverse no Score group create no score reporter or cell.
+Each direct or proxied HTTP exchange reports the real host and IP to its traversed Score groups. The same report carries the port, setup, first response, bytes and terminal outcome. Paths that traverse no Score group create no score reporter or cell.
 
-Setup is recorded after connection/TLS preparation and before sending the HTTP request. First response still requires the real response. Shared HTTP errors preserve their original typed causes: target failures remain target-scoped, while typed carrier failures keep node attribution even after setup.
+Setup is recorded after connection and TLS preparation and before sending the HTTP request. First response still requires the real response. Shared HTTP errors preserve their original typed causes: target failures remain target-scoped, while typed carrier failures keep node attribution even after setup.
 
 Download or extraction failures are logged and do not stop the engine.
 
 ## `GET /stats`
 
-`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed DNS, TCP, UDP, and NFQUEUE schemas create no dynamic per-node labels.
+`GET /stats` is a userspace snapshot. It is not the eBPF `OUTBOUND_STATS` map and does not expose its packet counters. The fixed DNS, TCP, UDP and NFQUEUE schemas create no dynamic per-node labels.
 
 ```text
 {
@@ -1758,17 +1753,17 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 
 ### DNS fields
 
-All `dns` fields are process-lifetime `u64` event counters shared across active and retired generations; reload does not reset them. Fields are sampled independently, so one snapshot does not imply cross-counter coherence. These totals are exposed by Clash `/stats`, not the native DNS diagnostic or history APIs.
+All `dns` fields are process-lifetime `u64` event counters shared across active and retired generations. A reload does not reset them. Fields are sampled independently, so one snapshot does not imply cross-counter coherence. These totals are exposed by Clash `/stats`, not the native DNS diagnostic or history APIs.
 
 | Field | Meaning |
 | --- | --- |
-| `socketAdmission.refused` | Endpoint network bootstrap refused because it needs two credits and the whole DNS socket partition is smaller than that. |
+| `socketAdmission.refused` | Endpoint network bootstrap refused because the whole DNS socket partition is smaller than the two credits it needs. |
 | `socketAdmission.timeouts` | Mandatory physical socket admission calls that return because their admission deadline expires. |
 | `proxyAdmission.timeouts` | Mandatory proxy stream or non-raw packet preparation admission calls that return because their admission deadline expires. |
 | `pressure.retiredUdpPools` | Idle UDP socket pools selected for pressure retirement, once per detached pool. |
-| `pressure.retiredTransports` | Idle TCP/TLS/H2/QUIC transport pools first selected for pressure retirement; resuming retained teardown does not count again. |
+| `pressure.retiredTransports` | Idle TCP, TLS, HTTP/2 or QUIC transport pools first selected for pressure retirement; resuming retained teardown does not count again. |
 
-`socketAdmission.refused` and `socketAdmission.timeouts` are disjoint. Initial contention, optional UDP shard-growth misses, and caller cancellation do not count as admission failures. Counters advance at admission, not once per singleflight follower or client reply. Pressure counters describe selected resources, not queries, drops, or descriptors already released; one transport pool may own multiple sockets. DNS admission failure may render as `SERVFAIL`, independently of singleflight `REFUSED`. Existing throttled failure logging is unchanged.
+`socketAdmission.refused` and `socketAdmission.timeouts` are disjoint. Initial contention, optional UDP shard-growth misses and caller cancellation do not count as admission failures. Counters advance at admission, not once per singleflight follower or client reply. Pressure counters describe selected resources, not queries, drops or descriptors already released. One transport pool may own multiple sockets. DNS admission failure may render as `SERVFAIL`, independently of singleflight `REFUSED`. Existing throttled failure logging is unchanged.
 
 ### TCP fields
 
@@ -1794,7 +1789,7 @@ Pooled TUIC, Juicity and Hysteria2 connections sample flow-control state once pe
 
 | Window-growth input | Effect |
 | --- | --- |
-| Ten-second receive/send goodput EWMA, RTT at least 80 ms, and three consecutive high-BDP samples | Raise the live connection's receive or send floor toward `2 x BDP`. |
+| Ten-second receive and send goodput EWMA, RTT of at least 80 ms and three consecutive high-BDP samples | Raise the live connection's receive or send floor toward `2 x BDP`. |
 | Peer `DATA_BLOCKED` or `STREAM_DATA_BLOCKED` | Direct evidence of a constrained advertised window. Bypass the RTT gate and double the connection or stream receive floor. |
 | Zero-progress sample while connection credit remains pressured | Preserve, but do not advance, the connection-level streak. |
 
@@ -1812,7 +1807,7 @@ honk never shrinks a learned window because application demand is low. It never 
 | `transportTxWouldBlock` | Full 64-packet adapter queues; Quinn retries |
 | `transportTxDrops` | Datagrams intentionally discarded after the proxied transport reports congestion or timeout |
 | `transportRxDrops` | Full adapter receive queues |
-| `sessionRxDrops` | Full 256-packet TUIC/Hysteria2 session queues |
+| `sessionRxDrops` | Full 256-packet TUIC or Hysteria2 session queues |
 | `sendTimeouts` | UDP sends on a metrics-enabled connection whose deadline expired while still admitted into that connection's current no-ACK wait |
 | `pathStalls` | Shared QUIC connections retired by the path watchdog after a full no-ACK grace |
 
@@ -1846,15 +1841,15 @@ Each `R` value is a saturating `u64` count, not a latency, throughput or health 
 
 First choices, trials and missing prior history cannot add switches. Peek, API reads, singleton bypass and last resort do not increment reason counters. Nested-group ranks are not a one-to-one count of dispatched connections.
 
-For UDP, `deadFiltered` also counts candidates excluded by protocol/configuration incapability. It is a candidate-filter count, not a count of newly failed nodes or business attempts. These exclusions do not add Score failures or exploration backoff.
+For UDP, `deadFiltered` also counts candidates excluded by protocol or configuration incapability. It is a candidate-filter count, not a count of newly failed nodes or business attempts. These exclusions do not add Score failures or exploration backoff.
 
-`carrierPressure` counts fresh carrier-family episodes admitted into an existing group/network aggregate cell, not packets or failed connections. Duplicate heartbeat reads do not increment it. `carrierValidation` counts periodic validation selections while the ordinary winner has a carrier hint newer than the previous validation.
+`carrierPressure` counts fresh carrier-family episodes admitted into an existing group and network aggregate cell, not packets or failed connections. Duplicate heartbeat reads do not increment it. `carrierValidation` counts periodic validation selections while the ordinary winner has a carrier hint newer than the previous validation.
 
 It is an overlapping diagnostic count, not another exclusive reason or proof that the hint alone caused the selection. Hints do not alter business reliability, qualification or health. These fields are readonly on API reads.
 
 Carrier observations arrive from the control heartbeat independently of selection calls.
 
-`carrierRttPressure` and `carrierLossPressure` retain the accepted episode's reason. An episode indicating both increments both reason counters but increments `carrierPressure` only once. These overlapping counts do not identify a specific carrier/transport, measure an application loss rate, or add failures.
+`carrierRttPressure` and `carrierLossPressure` retain the accepted episode's reason. An episode indicating both increments both reason counters but increments `carrierPressure` only once. These overlapping counts do not identify a specific carrier or transport, measure an application loss rate or add failures.
 
 Duplicate or stale hints increment none of them. TCP loss pressure means retransmission pressure, not confirmed application packet loss.
 
@@ -1862,7 +1857,7 @@ Counters begin at zero on process start and accumulate in process memory only. T
 
 A committed deletion prunes that name's counters, and a recreated name starts at zero. Generation-fenced superseded managers cannot mutate counters after replacement, including after same-name recreation. The snapshot is copied before JSON serialization, so reading it cannot mutate selection state.
 
-`/stats.score` exports group names, fixed TCP/UDP reason, verification and budget fields, a root business count, and bounded evidence-cache totals. It contains no node identity, target/domain/IP/port, raw cell, cadence key, authority or credential. Existing public member names in `/proxies` and destination metadata in `/connections` remain unchanged.
+`/stats.score` exports group names, fixed TCP and UDP reason, verification and budget fields, a root business count, and bounded evidence-cache totals. It contains no node identity, target, domain, IP or port, raw cell, cadence key, authority or credential. Existing public member names in `/proxies` and destination metadata in `/connections` remain unchanged.
 
 ### Score verification
 
@@ -1871,14 +1866,13 @@ Score group objects in `/proxies` and `/proxies/{name}` add `scoreVerification`.
 | Field | Meaning |
 | --- | --- |
 | `selected` | Existing public member tag for this readonly evaluation, or null with no ordinary eligible candidate. TCP `now` uses this same evaluated choice when present. |
-| `state` | `provisional` or `observedUsable`; the latter requires four distinct targeted Traffic reporters with RX after setup/TX in one uninterrupted cohort, whose latest eligible RX is less than 60 seconds old. Applicable failure/reload or a 60-second gap resets the cohort; clones/repeats cannot add credits. This does not grant cold qualification. In a genuine post-failure cohort the same four credits may independently earn scoped recovery; aggregate usability does not qualify every exact target. |
+| `state` | `provisional` or `observedUsable`; the latter requires four distinct targeted Traffic reporters with RX after setup and TX in one uninterrupted cohort, whose latest eligible RX is less than 60 seconds old. An applicable failure or reload, or a 60-second gap, resets the cohort; clones or repeats cannot add credits. This does not grant cold qualification. In a genuine post-failure cohort the same four credits may independently earn scoped recovery; aggregate usability does not qualify every exact target. |
 | `challengers` | Fresh pairwise response comparisons between `selected` and evaluated challengers; see below. |
 | `nextAction` | `nextBusinessFlow` names future real-work demand for evidence, ordinary qualification or recovery, not a reservation or dispatched I/O; inspect `waitReason`. `backoff` retains failure isolation; `none` means no actionable missing work. Missing transfer evidence never creates work; directional goodput waits for real offered load. |
 | `question` | `none`, `availability`, `response`, `qualification` or `recovery`: the next unresolved evidence question. No remaining action reports `none`; backoff retains the blocked candidate's question rather than the settled winner's. |
 | `waitReason` | Why work is waiting; values and aggregate-scope rules are listed below. A wait does not prove that work will succeed. |
 | `coverage` | `scope` (`all` or `bounded`); `candidates` counts the whole visible candidate view, `evaluated` its intersection with the shared serving pool, and `unevaluated` the difference. The winner gets no extra slot. Parent routes and targets share that pool; TCP and UDP remain separate. Out-of-pool members receive no ordinary or optional policy work. These are not counts of distinct leaves across existing connections. `pending` counts evaluated members with an open question, including qualification or recovery work for members that already have a comparison. |
-| `network`, `targetFamily`, `healthFamily`, `targetSpecific` | Transport and scope dimensions. This aggregate endpoint has no exact target and exports no domain/IP/port or raw node ID. |
-
+| `network`, `targetFamily`, `healthFamily`, `targetSpecific` | Transport and scope dimensions. This aggregate endpoint has no exact target and exports no domain, IP, port or raw node ID. |
 
 | `waitReason` | Meaning |
 | --- | --- |
@@ -1888,23 +1882,23 @@ Score group objects in `/proxies` and `/proxies/{name}` add `scoreVerification`.
 | `inFlight` | Sufficient matching-target work exists, or the separate four-work node ceiling applies. |
 | `backoff` | Failure isolation |
 
-Aggregate reads inspect retained IPv4/IPv6 scopes without creating them:
+Aggregate reads inspect retained IPv4 and IPv6 scopes without creating them:
 
 - Both scopes budget-blocked: `budget`.
 - Either scope available or unseen: future comparable traffic remains possible.
 - Otherwise: retain the in-flight wait.
 
-Readonly/Peek uses committed participant membership without reranking. Apply initializes and refreshes that membership. Before initialization, readonly reads use a temporary bounded projection.
+A readonly or peek read uses committed participant membership without reranking. Apply initializes and refreshes that membership. Before initialization, readonly reads use a temporary bounded projection.
 
 See [evaluation-set lifecycle](../design/groups.md#conditional-verification).
 
-`challengers` lists the selected member's current original pairs, the same pairs ordinary promotion reads, that hold a fresh qualified response metric. Members without one are omitted. The list is empty when none has one.
+`challengers` lists the selected member's current original pairs with a fresh qualified response metric. These are the same pairs that ordinary promotion reads. A member without such a metric is omitted, and the list is empty when none has one.
 
-Each entry has `name` (the public member tag, a display label that need not be unique across nested paths), `basis` (`targetResponse`, `commonTargets` or `configuredProbe`), `relation` (`selectedFaster`, `equivalent` or `challengerFaster`), `reporters` and `validForMs`. `equivalent` uses the inclusive symmetric band `high - low <= 0.1 × low` on actual response values, including zero and sub-millisecond values.
+Each entry has `name`, `basis`, `relation`, `reporters` and `validForMs`. `name` is the public member tag, a display label that need not be unique across nested paths. `basis` is `targetResponse`, `commonTargets` or `configuredProbe`, and `relation` is `selectedFaster`, `equivalent` or `challengerFaster`. `equivalent` uses the inclusive symmetric band `high - low <= 0.1 × low` on actual response values, including zero and sub-millisecond values.
 
 `reporters` is the weaker side's retained distinct-reporter support: each of four blocks retains up to four IDs, and their deduplicated union can reach sixteen. This is not the exact count of every observed reporter. `validForMs` is the remaining validity of that response metric.
 
-Business blocks last 15 seconds and expire at block start plus 60 seconds. Configured-probe blocks use `max(15s, 2I)` for the producer's interval `I`, with validity bounded by both the oldest supporting block's four-block retention deadline and the weaker side's latest support plus `max(60s, 2I)`. Existing failure/reload/incarnation fences remain.
+Business blocks last 15 seconds and expire at block start plus 60 seconds. Configured-probe blocks use `max(15s, 2I)` for the producer's interval `I`, with validity bounded by both the oldest supporting block's four-block retention deadline and the weaker side's latest support plus `max(60s, 2I)`. Existing failure, reload and incarnation fences remain.
 
 `commonTargets` uses at most eight canonical equal-weight response-qualified shared targets, not unrelated aggregate averages. Setup and warm-up are not comparison evidence.
 
@@ -1918,9 +1912,9 @@ Reads do not dispatch validation or change counters.
 
 `/stats.score.businessStarts` counts unique original Score business starts across nested groups. `/stats.score.groups[].budget.tcp` and `.udp` aggregate retained target-family scopes. Nested group totals must not be summed as unique businesses.
 
-Original work counts even when selected as a trial. Continuations, including a different network or target family, earn no additional original credit. Node-specific work starts before proxy DNS or physical-dial admission waits, independently of the reporter's physical/logical I/O boundary.
+Original work counts even when selected as a trial. Continuations, including a different network or target family, earn no additional original credit. Node-specific work starts before proxy DNS or physical-dial admission waits, independently of the reporter's physical and logical I/O boundary.
 
-DNS query lifecycle admission is a synchronous open/closed check before that work, not a physical-admission wait.
+DNS query lifecycle admission is a synchronous open or closed check before that work, not a physical-admission wait.
 
 Budget counters report recorded ledger values. Readonly wait and cold-start decisions also account for credit refundable from expired pending reservations; they do not update `refunded`, `expired` or other counters.
 
@@ -1928,19 +1922,19 @@ Budget counters report recorded ledger values. Readonly wait and cold-start deci
 | --- | --- |
 | `businessStarts` | Original starts summed over retained scopes. |
 | `scopes` | Retained scope count. |
-| `earningPeriod` | Fastest current earning period `q` across scopes: 16 normally. A scope uses 8 when its group sees at least two flows/second and recent trials mostly succeed. Before any scope exists, the value is 0. This is not a denominator for a combined-scope budget formula. Each scope freezes cold allowance `B` at creation and earns `1/q` per original start using the then-current `q`. Per scope, `spent + reserved` never exceeds `B` plus whole earned credit. |
-| `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial, or budget-neutral continuation. `recovery` includes TCP replacement, DNS rerouting/UDP-to-TCP fallback, and UI and subscription redirects, not only retries after errors. It is neither an optional trial nor new original business. Ordinary non-trial work has no source bucket. |
-| `trialStarts`, `spent`, `reserved` | Begun optional trials, cumulative spent tokens, and outstanding unbegun token reservations. Begin spends once; cancellation after begin does not refund. |
-| `coldAllowance`, `coldAvailable`, `earnedAvailable` | Summed frozen initial allowances and current available credit. Each scope retains at most eight unspent earned tokens. Time, reads, target churn and evidence expiry earn none; retained reload/membership changes do not reset currency. |
-| `budgetBlocked`, `inFlightBlocked`, `refunded`, `expired` | Denied reservation counts (`budgetBlocked` also counts candidates a scope refuses while failing trials pause it), last-reference/unbegun invalidation refunds, and expired in-flight tracking entries. Only unbegun reservations refund; tracking expiry never refunds begun work. |
-| `trialSuccess`, `trialFailure`, `trialCancelled` | Exactly-once outcomes of begun optional trials. Rejection/shutdown/neutral cancellation belongs to `trialCancelled`. `trialFailure` is actual observed failure, not the extra failures caused by choosing a trial instead of an unobserved alternative. |
+| `earningPeriod` | Fastest current earning period `q` across scopes: 16 normally. A scope uses 8 when its group sees at least two flows per second and recent trials mostly succeed. Before any scope exists, the value is 0. This is not a denominator for a combined-scope budget formula. Each scope freezes cold allowance `B` at creation and earns `1/q` per original start using the then-current `q`. Per scope, `spent + reserved` never exceeds `B` plus whole earned credit. |
+| `sources.cold`, `sources.periodic`, `sources.recovery` | Started work by source: cold-token trial, earned-token trial or budget-neutral continuation. `recovery` includes TCP replacement, DNS rerouting or UDP-to-TCP fallback, and UI and subscription redirects, not only retries after errors. It is neither an optional trial nor new original business. Ordinary non-trial work has no source bucket. |
+| `trialStarts`, `spent`, `reserved` | Begun optional trials, cumulative spent tokens and outstanding unbegun token reservations. Begin spends once; cancellation after begin does not refund. |
+| `coldAllowance`, `coldAvailable`, `earnedAvailable` | Summed frozen initial allowances and current available credit. Each scope retains at most eight unspent earned tokens. Time, reads, target churn and evidence expiry earn none; retained reload or membership changes do not reset currency. |
+| `budgetBlocked`, `inFlightBlocked`, `refunded`, `expired` | Denied reservation counts (`budgetBlocked` also counts candidates a scope refuses while failing trials pause it), last-reference or unbegun invalidation refunds, and expired in-flight tracking entries. Only unbegun reservations refund; tracking expiry never refunds begun work. |
+| `trialSuccess`, `trialFailure`, `trialCancelled` | Exactly-once outcomes of begun optional trials. Rejection, shutdown or neutral cancellation belongs to `trialCancelled`. `trialFailure` is actual observed failure, not the extra failures caused by choosing a trial instead of an unobserved alternative. |
 | `trialSetupHistogram`, `trialSetupMillis`, `trialElapsedMillis` | Eight fixed log2-millisecond setup buckets (slot 0 includes 0–1 ms; final slot includes 128 ms and above), summed observed setup duration, and summed start-to-settlement duration. These measure actual trial cost, not causal extra latency or overhead. |
 
 `/stats.score.cache.comparisonCells` is capped at 512. `comparisonLogicalBytes` charges the comparison store, vector capacity and owned key capacity. `comparisonLogicalCapacity` is its implementation-sized worst-case allocation bound, no greater than 1 MiB.
 
-Neither is measured process RSS or the size of all Score state. Allocator overhead and other process allocations are excluded. `comparisonEvictions`, `comparisonExpired` and `comparisonRejected` count store removal/admission events.
+Neither is measured process RSS or the size of all Score state. Allocator overhead and other process allocations are excluded. `comparisonEvictions`, `comparisonExpired` and `comparisonRejected` count store removal and admission events.
 
-Readonly expiry can invalidate support before physical removal increments a counter. Existing exact/aggregate LRU fields are unchanged.
+Readonly expiry can invalidate support before physical removal increments a counter. Existing exact and aggregate LRU fields are unchanged.
 
 ### Outbound and ready-pool fields
 
@@ -2015,13 +2009,13 @@ Each `H` is `{count, sumNanos, buckets}`. `count` is the number of observations 
 | `block` | Successful policy-block drop verdicts. |
 | `cancel` | Successful cancellation drop verdicts. |
 | `drop` | Other successful fail-closed drop verdicts. |
-| `tokenMismatch` | Stale or mismatched decision-token/flow-identity events. |
+| `tokenMismatch` | Stale or mismatched decision-token or flow-identity events. |
 | `tokenExhaustion` | Observations that the persistent decision-token allocator is exhausted. |
 | `tokenRollovers` | Successful exhausted-token generation rotations. |
 | `verdictErrors` | Failed `NF_ACCEPT` or `NF_DROP` operations. |
 | `receiptToVerdict` | Histogram from listener receipt to a successful terminal verdict; it is not kernel queue residence time. |
 
-A one-second sampler reads the owned kernel queue independently of packet dispatch. After a failed read, the previous `kernelQueueDepth`, `kernelDropped`, and `kernelUserDropped` remain visible, while local held-packet and receive-buffer gauges continue to refresh.
+A one-second sampler reads the owned kernel queue independently of packet dispatch. After a failed read, the previous `kernelQueueDepth`, `kernelDropped` and `kernelUserDropped` remain visible, while local held-packet and receive-buffer gauges continue to refresh.
 
 ### Warm-resource fields
 
@@ -2038,7 +2032,7 @@ A one-second sampler reads the owned kernel queue independently of packet dispat
 | `warm.sessions.juicity` | Occupied Juicity client slots. |
 | `warm.sessions.hysteria2` | Occupied Hysteria2 client slots. |
 
-A node may count under several explicit reasons. The gauges follow the current runtime generation; drained resources disappear from the next snapshot.
+A node may count under several explicit reasons. The gauges follow the current runtime generation, so drained resources disappear from the next snapshot.
 
 ## Related docs
 
