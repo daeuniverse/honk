@@ -21,7 +21,12 @@ check_body() {
             capture("^\\s*[-*] \\[(?<mark>[ x])\\] " + $text + "(?:\\s*/[^\\n]*)?\\s*$"; "i") | .mark | ascii_downcase];
         def checked($text): boxes($text) | any(. == "x");
         def kept($text): boxes($text) | length > 0 and all(. == "x");
+        def field($heading): [capture("(?:^|\\n)### " + $heading + "(?: /[^\\n]*)?\\n(?<v>[\\s\\S]*?)(?:\\n### |\\z)"; "i") | .v][0]
+            // "" | gsub("(?:^|\\n)```[^\\n]*"; "") | trim;
+        def placeholder: ascii_downcase | test("^(?:_no response_|none|n/?a|no|无|無|没有|沒有|-)?[.。]?$");
         gsub("<!--[\\s\\S]*?-->"; "") |
+        # A bug report must carry a log; the field is read before code fences are dropped.
+        (test("(?:^|\\n)### Relevant logs"; "i")) as $bug | field("Relevant logs") as $logs |
         gsub("(?:^|\\n)```[^\\n]*\\n[\\s\\S]*?\\n```[^\\n]*"; "") | . as $body |
         # Issues opened from other forms or blank issues carry no human-responsible field.
         if $kind == "issue" and (test("(?:^|\\n)### Human responsible"; "i") | not) then [] else
@@ -40,7 +45,10 @@ check_body() {
             {test: ($kind == "pr" and (checked($ai_yes) == checked($ai_no))),
                 en: "Check exactly one of the two AI boxes.", zh: "请在两个 AI 选项中勾选一项，且只能勾选一项。"},
             {test: ($kind == "issue" and (kept($search) | not)),
-                en: "Keep and check the existing-issue search box.", zh: "请保留并勾选“我已搜索过现有 issue”。"}
+                en: "Keep and check the existing-issue search box.", zh: "请保留并勾选“我已搜索过现有 issue”。"},
+            {test: ($kind == "issue" and $bug and (($logs | placeholder) or ($logs | length < 40))),
+                en: "Paste the honk log from startup to the failure, with `log_level: debug`; \"none\" is not accepted.",
+                zh: "请贴出 `log_level: debug` 下 honk 从启动到出问题的日志，不能填“无”。"}
         ] | map(select(.test) | {en, zh}) end'
 }
 
