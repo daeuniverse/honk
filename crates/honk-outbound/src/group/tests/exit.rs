@@ -721,15 +721,13 @@ fn a_one_hop_route_reports_health_on_the_exit() {
     }
 }
 
-#[cfg(feature = "rprx")]
 const TARGET_ALLOCATION_CHILD: &str = "HONK_GROUP_TARGET_ALLOCATION_CHILD";
 
 /// For a group without an exit on its path, owned dialing targets in order
 /// allocate exactly what owning the leaf plan they mirror does, for every
 /// policy and the nested path, also beside an unrelated exit group: no
-/// borrowed target list is built on the way. The counting allocator is
-/// installed by the `rprx`-only encryption tests.
-#[cfg(feature = "rprx")]
+/// borrowed target list is built on the way. Counted by
+/// `test_support::ALLOCATOR`.
 #[test]
 fn in_order_targets_without_exits_allocate_as_owned_leaves() {
     if std::env::var_os(TARGET_ALLOCATION_CHILD).is_some() {
@@ -781,7 +779,6 @@ fn in_order_targets_without_exits_allocate_as_owned_leaves() {
     );
 }
 
-#[cfg(feature = "rprx")]
 fn allocations_match(manager: &GroupManager, groups: &[Group], config: &str) {
     use stats_alloc::{INSTRUMENTED_SYSTEM, Region};
     for group in groups {
@@ -807,6 +804,426 @@ fn allocations_match(manager: &GroupManager, groups: &[Group], config: &str) {
             (targets.allocations, targets.reallocations),
             (leaves.allocations, leaves.reallocations),
             "{config}: {name}"
+        );
+    }
+}
+
+fn trojan(name: &str) -> Node {
+    Node {
+        outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
+        ..make_node(nid(name), name)
+    }
+}
+
+fn udp_context() -> ScoreSelectionContext {
+    ScoreSelectionContext::aggregate(SelectionNetwork::Udp, ProbeDomain::DataUdp, IpVersion::V4)
+}
+
+/// Each dialing target of `group`'s UDP plan, as [`tcp_plan`] lists them.
+fn udp_plan(manager: &GroupManager, group: &str) -> Vec<(String, Option<Vec<String>>)> {
+    manager
+        .selection_plan_for_target(group, &udp_context())
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let owned = manager.own_target(Target {
+                node: entry.node,
+                route: entry.route,
+            });
+            (
+                owned.node.name.clone(),
+                owned.route.map(|routed| routed.hop_names.into_vec()),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_exit_that_carries_udp_gives_route_udp_candidates() {
+    let mut all = nodes(&["a"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::new(&[exit_group("g", vec![nid("a")], "land")], &all);
+    assert_eq!(udp_plan(&manager, "g"), [routed("a", &["a", "land"])]);
+    // UDP warm-up keeps skipping exit groups: a route has no state to warm.
+    assert!(manager.ranked_udp_leaves("g", IpVersion::V4, 4).is_empty());
+}
+
+#[test]
+fn a_udp_parent_picks_a_child_behind_an_exit_that_carries_udp() {
+    let mut parent = make_group("parent", GroupPolicy::Fallback, vec![]);
+    parent.groups = vec!["g".into()];
+    let mut all = nodes(&["a"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::new(&[parent, exit_group("g", vec![nid("a")], "land")], &all);
+    assert_eq!(udp_plan(&manager, "parent"), [routed("a", &["a", "land"])]);
+    // Warm-up dials leaves as themselves, so it skips the route below.
+    assert!(
+        manager
+            .ranked_udp_leaves("parent", IpVersion::V4, 4)
+            .is_empty()
+    );
+}
+
+/// `final: direct` behind an exit dials the exit itself, so its UDP is the
+/// exit's own, not what the exit could carry through a tunnel.
+#[test]
+fn a_one_hop_route_offers_the_exit_own_udp() {
+    let mut group = exit_group("g", vec![], "land");
+    group.final_outbound = Some("direct".into());
+    let manager = GroupManager::new(&[group], &nodes(&["land"]));
+    assert_eq!(udp_plan(&manager, "g"), [direct("land")]);
+}
+
+/// A group without an exit under an ancestor whose exit cannot tunnel UDP
+/// drops the members whose route lacks it before its own policy picks, so
+/// Fallback passes over its first member to the one that carries UDP.
+#[test]
+fn a_child_under_an_exit_drops_udp_less_members_before_its_policy_picks() {
+    let child = make_group("child", GroupPolicy::Fallback, vec![nid("a"), nid("land")]);
+    let mut outer = exit_group("outer", vec![], "land");
+    outer.groups = vec!["child".into()];
+    let manager = GroupManager::new(&[outer, child], &nodes(&["a", "land"]));
+    assert_eq!(udp_plan(&manager, "outer"), [direct("land")]);
+}
+
+/// A member whose route through the exit has no UDP is dropped before the
+/// policy runs, so UDP falls to `final: direct`, the exit's own UDP.
+#[test]
+fn a_member_route_without_udp_falls_to_the_final() {
+    let mut group = exit_group("g", vec![nid("a")], "land");
+    group.final_outbound = Some("direct".into());
+    let manager = GroupManager::new(&[group], &nodes(&["a", "land"]));
+    assert_eq!(udp_plan(&manager, "g"), [direct("land")]);
+    assert_eq!(tcp_plan(&manager, "g"), [routed("a", &["a", "land"])]);
+}
+
+/// A child whose UDP routes are dropped offers its parent nothing, so the
+/// parent's policy picks a sibling instead of losing its pick. An outer
+/// group's exit gives the child a UDP route, past the up-front check.
+#[test]
+fn a_udp_parent_skips_a_child_whose_routes_lack_udp() {
+    for final_outbound in [None, Some("c")] {
+        let mut child = exit_group("g", vec![nid("a")], "land");
+        child.final_outbound = final_outbound.map(Into::into);
+        let mut outer = exit_group("outer", vec![], "tunnel");
+        outer.groups = vec!["g".into()];
+        let mut parent = make_group("parent", GroupPolicy::Fallback, vec![]);
+        parent.groups = vec!["g".into(), "h".into()];
+        let mut all = nodes(&["a", "b", "c", "land"]);
+        all.push(trojan("tunnel"));
+        let manager = GroupManager::new(
+            &[
+                parent,
+                outer,
+                child,
+                make_group("h", GroupPolicy::Selector, vec![nid("b")]),
+            ],
+            &all,
+        );
+        assert_eq!(
+            udp_plan(&manager, "outer")[0],
+            routed("a", &["a", "land", "tunnel"])
+        );
+        assert_eq!(
+            udp_plan(&manager, "parent"),
+            [direct("b")],
+            "{final_outbound:?}"
+        );
+    }
+}
+
+#[test]
+fn a_final_back_to_an_exit_ancestor_keeps_its_udp_routes() {
+    let mut proxy = exit_group("proxy", vec![], "land");
+    proxy.groups = vec!["hk".into()];
+    let mut hk = make_group("hk", GroupPolicy::Selector, vec![nid("a")]);
+    hk.final_outbound = Some("proxy".into());
+    let mut all = nodes(&["a"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::new(&[proxy, hk], &all);
+    assert_eq!(udp_plan(&manager, "proxy"), [routed("a", &["a", "land"])]);
+}
+
+/// The datapath reads the leaf's UDP liveness, so a route needs it although
+/// the leaf carries only the stream.
+#[test]
+fn a_route_needs_the_leaf_udp_alive() {
+    let alive = Arc::new(AliveDialerSet::new());
+    let mut all = nodes(&["a"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::with_alive_set(
+        &[exit_group("g", vec![nid("a")], "land")],
+        &all,
+        Some(Arc::clone(&alive)),
+    );
+    assert_eq!(udp_plan(&manager, "g"), [routed("a", &["a", "land"])]);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DataUdp, IpVersion::V4);
+    alive.report_unavailable_forced(nid("a"), ProbeDomain::DnsUdp, IpVersion::V4);
+    assert!(udp_plan(&manager, "g").is_empty());
+}
+
+/// A dead exit sends UDP to `final`, judged by its UDP state when it has one
+/// and by its TCP state otherwise.
+#[test]
+fn a_dead_exit_sends_udp_to_the_final() {
+    for udp_state in [false, true] {
+        let alive = Arc::new(AliveDialerSet::new());
+        let mut group = exit_group("g", vec![nid("a")], "land");
+        group.final_outbound = Some("block".into());
+        let mut all = nodes(&["a"]);
+        all.push(trojan("land"));
+        let manager = GroupManager::with_alive_set(&[group], &all, Some(Arc::clone(&alive)));
+        alive.register_node(nid("land"), "land".into(), "192.0.2.1:443".into());
+        assert_eq!(udp_plan(&manager, "g"), [routed("a", &["a", "land"])]);
+        if udp_state {
+            alive.report_unavailable_forced(nid("land"), ProbeDomain::DataUdp, IpVersion::V4);
+            alive.report_unavailable_forced(nid("land"), ProbeDomain::DnsUdp, IpVersion::V4);
+        } else {
+            alive.report_unavailable_forced(nid("land"), ProbeDomain::Tcp, IpVersion::V4);
+        }
+        assert_eq!(udp_plan(&manager, "g"), [direct("block")], "{udp_state}");
+    }
+}
+
+/// A dead exit drops a `final` that goes through it from a UDP plan as from
+/// a TCP one; only `block` stays.
+#[test]
+fn a_dead_exit_drops_a_udp_final_through_it() {
+    let alive = Arc::new(AliveDialerSet::new());
+    let with_final = |name: &str, final_outbound: &str| Group {
+        final_outbound: Some(final_outbound.into()),
+        ..exit_group(name, vec![], "land")
+    };
+    let mut all = nodes(&["f"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::with_alive_set(
+        &[
+            with_final("to-node", "f"),
+            with_final("to-group", "fg"),
+            with_final("to-direct", "direct"),
+            with_final("to-block", "block"),
+            make_group("fg", GroupPolicy::Selector, vec![nid("f")]),
+        ],
+        &all,
+        Some(Arc::clone(&alive)),
+    );
+    let plans =
+        || ["to-node", "to-group", "to-direct", "to-block"].map(|group| udp_plan(&manager, group));
+    alive.register_node(nid("land"), "land".into(), "192.0.2.1:443".into());
+    alive.report_available_traffic(nid("land"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        plans(),
+        [
+            vec![routed("f", &["f", "land"])],
+            vec![routed("f", &["f", "land"])],
+            vec![direct("land")],
+            vec![direct("block")],
+        ]
+    );
+    alive.report_unavailable_forced(nid("land"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(plans(), [vec![], vec![], vec![], vec![direct("block")]]);
+}
+
+fn vmess(name: &str) -> Node {
+    Node {
+        outbound: honk_config::node::OutboundConfig::Vmess(Default::default()),
+        ..make_node(nid(name), name)
+    }
+}
+
+/// A leaf whose own protocol has no UDP carries the stream to an exit that
+/// tunnels UDP, so it is a UDP candidate there, as a member, a `final`, or a
+/// target checked before its flow binds; without the exit it is none.
+#[test]
+fn a_tcp_only_leaf_carries_udp_through_an_exit_that_tunnels_it() {
+    let alive = Arc::new(AliveDialerSet::new());
+    let all = [vmess("m"), trojan("land")];
+    let mut final_only = exit_group("final-only", vec![], "land");
+    final_only.final_outbound = Some("m".into());
+    let mut plain_final = make_group("plain-final", GroupPolicy::Selector, vec![]);
+    plain_final.final_outbound = Some("m".into());
+    let manager = GroupManager::with_alive_set(
+        &[
+            exit_group("member", vec![nid("m")], "land"),
+            final_only,
+            make_group("plain", GroupPolicy::Selector, vec![nid("m")]),
+            plain_final,
+        ],
+        &all,
+        Some(Arc::clone(&alive)),
+    );
+    alive.register_node(nid("m"), "m".into(), "192.0.2.2:443".into());
+    alive.report_available_traffic(nid("m"), ProbeDomain::Tcp, IpVersion::V4);
+    for group in ["member", "final-only"] {
+        assert_eq!(
+            udp_plan(&manager, group),
+            [routed("m", &["m", "land"])],
+            "{group}"
+        );
+    }
+    for group in ["plain", "plain-final"] {
+        assert!(udp_plan(&manager, group).is_empty(), "{group}");
+    }
+    let target = |group: &str| {
+        let plan = manager.selection_plan_for_target(group, &tcp_context());
+        let entry = plan.entries.into_iter().next().unwrap();
+        manager.own_target(Target {
+            node: entry.node,
+            route: entry.route,
+        })
+    };
+    let selectable = |group: &str| {
+        manager.target_selectable(&target(group), ProbeDomain::DataUdp, IpVersion::V4)
+    };
+    assert!(selectable("member"));
+    assert!(!selectable("plain"));
+    // Health stays on the leaf.
+    alive.report_unavailable_forced(nid("m"), ProbeDomain::Tcp, IpVersion::V4);
+    assert!(udp_plan(&manager, "member").is_empty());
+    assert!(!selectable("member"));
+}
+
+/// Beside routes, a leaf without UDP of its own is still dropped where its
+/// path crosses no exit: in a group none of whose paths do, before that
+/// group's policy picks, and among a parent's own members.
+#[test]
+fn a_udp_less_leaf_beside_routes_is_dropped() {
+    let mut all = nodes(&["a", "b"]);
+    all.extend([vmess("m"), trojan("land")]);
+    let mut root = make_group("root", GroupPolicy::Fallback, vec![nid("m")]);
+    root.groups = vec!["plain".into(), "routed".into()];
+    let manager = GroupManager::new(
+        &[
+            root,
+            make_group("plain", GroupPolicy::Fallback, vec![nid("m"), nid("a")]),
+            exit_group("routed", vec![nid("b")], "land"),
+        ],
+        &all,
+    );
+    let plan = udp_plan(&manager, "root");
+    assert!(plan.iter().all(|(node, _)| node != "m"), "{plan:?}");
+    assert_eq!(plan.first(), Some(&direct("a")), "{plan:?}");
+}
+
+/// An exit before the outermost carries only the stream, so UDP needs its
+/// health, not its own UDP.
+#[test]
+fn an_inner_exit_needs_only_the_stream_for_udp() {
+    let alive = Arc::new(AliveDialerSet::new());
+    let mut outer = exit_group("outer", vec![], "land");
+    outer.groups = vec!["inner".into()];
+    let mut all = nodes(&["a"]);
+    all.extend([vmess("mid"), trojan("land")]);
+    let manager = GroupManager::with_alive_set(
+        &[outer, exit_group("inner", vec![nid("a")], "mid")],
+        &all,
+        Some(Arc::clone(&alive)),
+    );
+    alive.register_node(nid("mid"), "mid".into(), "192.0.2.3:443".into());
+    alive.report_available_traffic(nid("mid"), ProbeDomain::Tcp, IpVersion::V4);
+    assert_eq!(
+        udp_plan(&manager, "outer"),
+        [routed("a", &["a", "mid", "land"])]
+    );
+    alive.report_unavailable_forced(nid("mid"), ProbeDomain::Tcp, IpVersion::V4);
+    assert!(udp_plan(&manager, "outer").is_empty());
+}
+
+/// An exit that neither tunnels UDP nor can be the one node a route
+/// collapses to offers no UDP before any candidate is built.
+#[test]
+fn an_exit_without_udp_for_its_members_offers_none_up_front() {
+    let mut all = nodes(&["a", "b"]);
+    all.push(Node {
+        outbound: honk_config::node::OutboundConfig::Socks5(Default::default()),
+        ..make_node(nid("socks"), "socks")
+    });
+    let manager = GroupManager::new(&[exit_group("g", vec![nid("a"), nid("b")], "socks")], &all);
+    let group = &manager.groups.get("g").unwrap().group;
+    assert!(!manager.exit_offers_udp(group, &[]));
+    assert!(udp_plan(&manager, "g").is_empty());
+    let with_exit_member = Group {
+        exit: Some("socks".into()),
+        ..make_group("h", GroupPolicy::Fallback, vec![nid("a"), nid("socks")])
+    };
+    let manager = GroupManager::new(&[with_exit_member], &all);
+    let group = &manager.groups.get("h").unwrap().group;
+    assert!(manager.exit_offers_udp(group, &[]));
+    assert_eq!(udp_plan(&manager, "h"), [direct("socks")]);
+}
+
+const UDP_FILTER_ALLOCATION_CHILD: &str = "HONK_UDP_FILTER_ALLOCATION_CHILD";
+
+/// With exits configured elsewhere, filtering UDP candidates whose path
+/// crosses no exit allocates nothing, and judging one whose path does
+/// composes its route without collecting the path. Measured in a child
+/// process, so other tests' threads stay out of the process-wide allocation
+/// counters.
+#[test]
+fn udp_filtering_allocates_nothing_without_an_exit_on_the_path() {
+    if std::env::var_os(UDP_FILTER_ALLOCATION_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "group::tests::exit::udp_filtering_allocates_nothing_without_an_exit_on_the_path",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(UDP_FILTER_ALLOCATION_CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut all = nodes(&["a", "b", "c"]);
+    all.push(trojan("land"));
+    let manager = GroupManager::new(
+        &[
+            make_group("plain", GroupPolicy::Selector, vec![nid("a"), nid("b")]),
+            exit_group("routed", vec![nid("c")], "land"),
+        ],
+        &all,
+    );
+    let candidate = |name: &'static str, node| Candidate {
+        via: None,
+        node,
+        attribution: Vec::new(),
+        pool_bound: 0,
+        selection_chain: vec![name],
+        exit_on_path: false,
+        final_owners: Vec::new(),
+        score_work: Vec::new(),
+    };
+    for (group, members, ancestors) in [
+        (
+            "plain",
+            vec![candidate("a", &all[0]), candidate("b", &all[1])],
+            &["outer"][..],
+        ),
+        ("routed", vec![candidate("c", &all[2])], &[][..]),
+    ] {
+        let group = &manager.groups.get(group).unwrap().group;
+        let count = members.len();
+        let region = stats_alloc::Region::new(crate::test_support::ALLOCATOR);
+        let kept = manager.retain_exit_selectable(
+            members,
+            ancestors,
+            group,
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+        );
+        let change = region.change();
+        assert_eq!(kept.len(), count, "{}", group.name);
+        assert_eq!(
+            (change.allocations, change.reallocations),
+            (0, 0),
+            "{}",
+            group.name
         );
     }
 }

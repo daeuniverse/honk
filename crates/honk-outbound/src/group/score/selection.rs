@@ -233,6 +233,7 @@ impl super::GroupManager {
                         candidates,
                         context.probe_domain,
                         context.health_family,
+                        &[],
                         group,
                         entry.routes,
                     );
@@ -454,10 +455,13 @@ impl super::GroupManager {
                 observation::reason("resolution_limit");
                 return (super::SelectionPlanMode::Authoritative, Vec::new());
             }
-            // Routes are TCP only. Offering none here, before any policy runs,
-            // lets a parent pick a UDP-capable sibling instead.
-            if context.network == SelectionNetwork::Udp && group.exit.is_some() {
-                observation::reason("exit_tcp_only");
+            // Offering none when no route through the exit can carry UDP,
+            // before any policy runs, lets a parent pick a UDP-capable sibling.
+            if context.network == SelectionNetwork::Udp
+                && group.exit.is_some()
+                && !self.exit_offers_udp(group, visited)
+            {
+                observation::reason("exit_without_udp");
                 return (super::SelectionPlanMode::Authoritative, Vec::new());
             }
             let (mut mode, mut candidates, mut ordinary) =
@@ -498,8 +502,10 @@ impl super::GroupManager {
                             node.protocol(),
                             honk_config::types::NodeProtocol::Direct
                                 | honk_config::types::NodeProtocol::Block
-                        ) || self.is_node_selectable_for_domain(
-                            node.id,
+                        ) || self.final_node_selectable(
+                            node,
+                            visited,
+                            group,
                             context.probe_domain,
                             context.health_family,
                         );
@@ -650,6 +656,7 @@ impl super::GroupManager {
             candidates,
             context.probe_domain,
             context.health_family,
+            visited,
             group,
             self.has_exits() && rules.routes,
         );
@@ -980,6 +987,7 @@ impl super::GroupManager {
             candidates,
             context.probe_domain,
             context.health_family,
+            &[],
             group,
             entry.routes,
         );

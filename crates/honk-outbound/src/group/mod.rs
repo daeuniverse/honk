@@ -340,14 +340,16 @@ pub struct GroupManager {
     transport_quality: RwLock<Vec<score::TransportQualitySource>>,
     /// Exit edges and chain hops, only when some group has an `exit`.
     exits: Option<Box<exit::Exits>>,
-    /// Configured chain nodes whose exit carries UDP.
-    chain_udp: HashSet<uuid::Uuid>,
+    /// Configured chain nodes whose exit carries UDP, sorted, only when
+    /// there are any, so a configuration without them keeps the manager's
+    /// size.
+    chain_udp: Option<Box<[uuid::Uuid]>>,
 }
 
 /// Configured chains whose exit, their last hop, tunnels UDP. Validation
 /// leaves one node per hop name; the first namesake is taken regardless.
-fn chains_carrying_udp(nodes: &[Node]) -> HashSet<uuid::Uuid> {
-    nodes
+fn chains_carrying_udp(nodes: &[Node]) -> Option<Box<[uuid::Uuid]>> {
+    let mut chains: Vec<uuid::Uuid> = nodes
         .iter()
         .filter(|chain| {
             chain
@@ -359,7 +361,10 @@ fn chains_carrying_udp(nodes: &[Node]) -> HashSet<uuid::Uuid> {
                 })
         })
         .map(|chain| chain.id)
-        .collect()
+        .collect();
+    chains.sort_unstable();
+    chains.dedup();
+    (!chains.is_empty()).then(|| chains.into_boxed_slice())
 }
 
 impl GroupManager {
@@ -687,14 +692,20 @@ impl GroupManager {
             depth,
             SelectionEffects::Peek,
         );
+        // These leaves dial as themselves, so only exit-free paths qualify.
         if routes {
             candidates.retain(|candidate| {
-                self.routed_chain(candidate, SelectionNetwork::Udp)
-                    .is_some()
+                self.dials_as_itself(candidate.node, &candidate.selection_chain)
             });
         }
-        let candidates =
-            self.filter_alive_candidates(candidates, ProbeDomain::DataUdp, ipver, group, routes);
+        let candidates = self.filter_alive_candidates(
+            candidates,
+            ProbeDomain::DataUdp,
+            ipver,
+            visited,
+            group,
+            routes,
+        );
         if candidates.is_empty() {
             return match self.final_member(group) {
                 Some(GroupMember::Node(node)) => self
