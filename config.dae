@@ -22,7 +22,7 @@ global {
     udp_check_dns: 'dns.google.com:53,8.8.8.8,2001:4860:4860::8888'
     check_interval: 300s
     bootstrap_resolver: '1.1.1.1:53'
-    # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复
+    # 订阅正文存入 <data_dir>/state/honk.db，供离线启动恢复；重载不读取已存正文。订阅的 cache 为 false 时不保存。
     store_subscribe: true
     # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
     nfqueue_enable: true
@@ -202,7 +202,7 @@ routing {
     # AI 服务
     domain(geosite: category-ai-!cn) -> sgp
 
-    # 域名规则（优先级高于 geoip，先匹配域名再回退到 IP）
+    # 域名规则（规则按书写顺序匹配，不按类型区分优先级；前面的 GeoIP 规则先匹配）
     domain(geosite: netflix) -> sgp
     domain(geosite: category-media, geosite: youtube) -> sgp
     domain(geosite: bahamut) -> hk
@@ -214,7 +214,7 @@ routing {
     domain(geosite: google) -> hk
     domain(geosite: category-dev) -> hk
 
-    # IP 级别路由（domain 规则优先于 IP 规则）
+    # IP 级别路由（排在上面的域名规则之后匹配）
     dip(geoip: jp) -> jp
     dip(geoip: telegram) -> sgp
     # dip(x.x.x.x) -> tw  # 特定 IP 走台湾

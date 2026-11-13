@@ -1586,7 +1586,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-configuration-04"
-source = { file = "doc/en/configuration.md", fence = 4 }
+source = { file = "doc/en/configuration.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1595,6 +1595,17 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{home:'udp://223.5.5.5:53'->'"
+
+[[case]]
+id = "honk-doc-en-configuration-05"
+source = { file = "doc/en/configuration.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+unknown_sections = 0
+differences = [{ path = "sections[0].items[0].param", dae = { and_functions = [], annotation = [], key = "", val = "Hong" }, honk = { absent = true }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[0].section", dae = { absent = true }, honk = { items = [{ param = { and_functions = [{ name = "name", not = false, params = [{ key = "regex", val = "^edge\\.example$" }] }], annotation = [], key = "filter", val = "" } }], name = "Hong Kong" }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].name", dae = "name", honk = "group", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].params[0].key", dae = "regex", honk = "", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].params[0].val", dae = "^edge\\.example$", honk = "Hong Kong", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[1]", dae = { absent = true }, honk = { param = { and_functions = [{ name = "name", not = false, params = [{ key = "", val = "edge" }] }], annotation = [], key = "filter", val = "" } }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.name", dae = "Kong", honk = "proxy", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[2]", dae = { section = { items = [{ param = { and_functions = [{ name = "group", not = false, params = [{ key = "", val = "Hong Kong" }] }], annotation = [], key = "filter", val = "" } }, { param = { and_functions = [{ name = "name", not = false, params = [{ key = "", val = "edge" }] }], annotation = [], key = "filter", val = "" } }], name = "proxy" } }, honk = { absent = true }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[1].items[0].rule.outbound.name", dae = "Hong", honk = "Hong Kong", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[1].param.key", dae = "", honk = "fallback", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[1].param.val", dae = "Kong", honk = "Hong Kong", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[2]", dae = { param = { and_functions = [], annotation = [], key = "fallback", val = "Hong" } }, honk = { absent = true }, reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[3]", dae = { param = { and_functions = [], annotation = [], key = "", val = "Kong" } }, honk = { absent = true }, reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }]
 
 [[case]]
 id = "honk-doc-en-design-nfqueue-01"
@@ -2039,7 +2050,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-configuration-04"
-source = { file = "doc/zh/configuration.md", fence = 4 }
+source = { file = "doc/zh/configuration.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2048,6 +2059,17 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{home:'udp://223.5.5.5:53'->'"
+
+[[case]]
+id = "honk-doc-zh-configuration-05"
+source = { file = "doc/zh/configuration.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+unknown_sections = 0
+differences = [{ path = "sections[0].items[0].param", dae = { and_functions = [], annotation = [], key = "", val = "Hong" }, honk = { absent = true }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[0].section", dae = { absent = true }, honk = { items = [{ param = { and_functions = [{ name = "name", not = false, params = [{ key = "regex", val = "^edge\\.example$" }] }], annotation = [], key = "filter", val = "" } }], name = "Hong Kong" }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].name", dae = "name", honk = "group", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].params[0].key", dae = "regex", honk = "", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[0].param.and_functions[0].params[0].val", dae = "^edge\\.example$", honk = "Hong Kong", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.items[1]", dae = { absent = true }, honk = { param = { and_functions = [{ name = "name", not = false, params = [{ key = "", val = "edge" }] }], annotation = [], key = "filter", val = "" } }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[1].section.name", dae = "Kong", honk = "proxy", reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[0].items[2]", dae = { section = { items = [{ param = { and_functions = [{ name = "group", not = false, params = [{ key = "", val = "Hong Kong" }] }], annotation = [], key = "filter", val = "" } }, { param = { and_functions = [{ name = "name", not = false, params = [{ key = "", val = "edge" }] }], annotation = [], key = "filter", val = "" } }], name = "proxy" } }, honk = { absent = true }, reason = "Group declaration mode retains the complete dynamic header; dae reads Hong as a literal before the Kong section." }, { path = "sections[1].items[0].rule.outbound.name", dae = "Hong", honk = "Hong Kong", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[1].param.key", dae = "", honk = "fallback", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[1].param.val", dae = "Kong", honk = "Hong Kong", reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[2]", dae = { param = { and_functions = [], annotation = [], key = "fallback", val = "Hong" } }, honk = { absent = true }, reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }, { path = "sections[1].items[3]", dae = { param = { and_functions = [], annotation = [], key = "", val = "Kong" } }, honk = { absent = true }, reason = "honk keeps the whole group name, space included, after -> and fallback:; dae ends the name at Hong and reads Kong as a literal." }]
 
 [[case]]
 id = "honk-doc-zh-design-nfqueue-01"

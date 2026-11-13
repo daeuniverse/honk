@@ -20,25 +20,30 @@ honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考]
 
 ## 配置格式
 
+入口文件和被包含的 `.dae` 文件必须使用 UTF-8，其他编码会被拒绝。
+
 - 配置项放在 `section { ... }` 块中，每行一个 `key: value`。也接受 `global { log_level: debug }` 这样的单行块，以及嵌套的单行块。
-- 建议为 URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值加引号。标量值及 `include`、`node` 条目接受单引号或双引号；带引号的 `subscription` URL 使用单引号。
+- 建议为 URL、含空白的值以及含 `:`、`+`、`#` 等语法字符的值加引号。标量值及 `include`、`node`、`subscription` 条目接受单引号或双引号。
+- 引号内的文本按字面读取：不解码 `\n` 等转义，反斜杠只防止下一个引号结束字符串。引号必须在同一行闭合。`filter: name(regex: '^edge\.example$')` 向正则引擎传入 `^edge\.example$`。
 - 在匹配器参数和过滤、路由表达式中，成对单引号或双引号内的逗号、右圆括号、`&&` 和 `->` 按字面值保留。但 `group(...)` 和 `qtype(...)` 仍将带引号的逗号分隔文本按列表解释。
 - 配置项或 matcher 接受列表时，用逗号分隔：`lan_interface: eth0, eth1` 或 `dport(80, 443)`。
-- 以秒为单位的时长接受裸秒数或 `ms`、`s`、`m`、`h` 后缀。`check_tolerance` 等毫秒配置项接受裸毫秒数、`ms` 或 `s`。
+- `check_interval`、订阅 `interval` 等以秒为单位的时长只接受整秒，可裸写或添加 `s`、`m`、`h` 后缀，`1.5s` 无效。`ms` 值向上取整为整秒，`500ms` 即 `1s`。无效值会产生警告并变为 `0`，而 `check_interval` 为 `0` 时报错 `check_interval must be a positive duration`。
+- `check_tolerance` 等毫秒配置项接受裸毫秒数、带 `ms` 的整数或带 `s` 的秒数，`1.5s` 即 1500 ms。不足 1 ms 的小数部分会被舍去；`1.5ms` 以及 `m`、`h` 后缀无效。无效值会产生警告并保留默认值。
 - 引号外、词法单元开头的 `#` 引入注释；裸值内的 `#` 保留为数据。条目读取器也接受链接结束引号或订阅 `(UA)` 后缀之后紧贴的 `#` 注释，并产生 `legacy-glued-hash` 警告；注释前应留空白。词法单元开头的注释内，花括号不会闭合配置块。
 - 成对单引号或双引号内的花括号视为数据。多余的右花括号 `}` 会被忽略并报告诊断；未闭合的块会导致整个文档被拒绝。当前解析器能够定位时，详细诊断会附上物理行号；错误文本不回显任意输入内容。
-- 未知标量键产生诊断并被忽略。未知嵌套块按完整的已闭合子树跳过，不再将其中内容作为父块内容读取。只有文档列出的 `node` 和 `subscription` 包装块保留兼容遍历；未知的 `experimental` 外层设置及旧版 NFQUEUE 中不支持的内容都是错误。
+- 未知标量键产生诊断并被忽略。未知嵌套块按完整的已闭合子树跳过，不再将其中内容作为父块内容读取。只有文档列出的 `node` 和 `subscription` 包装块保留兼容遍历。未知的 `experimental` 外层设置、`experimental.native_api` 中的未知内容、旧版 NFQUEUE 中不支持的内容，以及以 `tolerance` 等组标量命名的块都是错误，见[方言参考](./reference/dialect.md#配置段与-include)。
 
 ### 使用 `include {}` 拆分配置
 
 ```dae
 include {
     config.d/*.dae
+    config.d/*/*.dae
     'config.d/extra config.dae'
 }
 ```
 
-`include` 条目可裸写或加引号，并支持 `*`、`?`、`[]` glob 模式。模式按声明顺序执行，每个模式的匹配项按字典序加载。未匹配的模式、目录以及扩展名不是 `.dae` 的文件会被跳过。
+`include` 条目是文件模式，可裸写或加引号，支持 `*`、`?`、`[]` glob。空路径、嵌套块或无效 glob 都是配置错误。模式按声明顺序执行，每个模式的匹配项按字典序加载。未匹配的模式、目录以及扩展名不是 `.dae` 的文件会被跳过。路径分量 `**` 与 `*` 一样只匹配一层目录，不会递归，因此示例用 `config.d/*/*.dae` 加载 `config.d` 下一级目录中的文件。
 
 被包含的空文件或纯注释 `.dae` 文件不提供配置段；dae 入口文档必须含块的要求不适用于这些片段。
 
@@ -240,7 +245,9 @@ experimental {
 
 ## 声明节点
 
-每个 `node` 行都是分享链接：`tag: 'scheme://...'` 或带引号的裸链接。显式 tag 会成为路由/API 名称，并覆盖链接内嵌名称；裸链接使用其 fragment 或生成的协议/主机名称。凭据、TLS/REALITY、传输与协议调优项都放在链接的 userinfo 与 query 参数中。无法解析的条目会附诊断后跳过；已移除的协议会导致配置被拒绝。
+每个 `node` 行都是分享链接：`tag: 'scheme://...'` 或带引号的裸链接。显式 tag 会成为路由/API 名称，并覆盖链接内嵌名称；裸链接使用其 fragment 或生成的协议/主机名称。凭据、TLS/REALITY、传输与协议调优项都放在链接的 userinfo 与 query 参数中。格式错误的链接会附诊断后跳过。未知或已移除的协议、已移除的 VLESS `vless_mode` 参数以及独立的 `mux` 行都是配置错误；请在各条 VLESS 链接上设置 `mux=`。
+
+`direct` 和 `block` 保留给内置出站，不能用作节点名。组名不能与节点名相同。
 
 详见 [节点参考](./reference/nodes.md)。
 
@@ -249,8 +256,26 @@ experimental {
 按以下顺序构建组：
 
 1. 选择成员：静态名称使用 `filter: name(...)`，订阅来源使用 `filter: subtag(...)`，嵌套组使用 `filter: group(...)`。
-2. 组合条件：`&&` 表示 AND，`!` 对单个谓词取反，不同 `filter:` 行表示 OR。没有过滤条件且没有嵌套组时包含全部节点；仅有嵌套组时不会自动包含全部节点。
+2. 用 `&&` 组合 `name(...)` 和 `subtag(...)` 谓词表示 AND，用 `!` 对单个谓词取反。`group(...)` 必须独占整个 `filter:` 值；与 `&&` 或 `!` 组合的行会附诊断后被忽略。不同 `filter:` 行表示 OR。没有过滤条件且没有嵌套组时包含全部节点；仅有嵌套组时不会自动包含全部节点。
 3. 选择策略：可用 `selector`/`fixed`、`urltest`/`min_moving_avg`、`loadbalance`/`roundrobin`、`fallback` 或 `score`。用 `final` 指定策略选择为空时的结果。
+
+组声明块头以及 `->`、`fallback:` 之后的组名不要加引号，即使名称含空格。这些位置的引号会成为名称的一部分，因此 `fallback: 'proxy'` 找不到组 `proxy`。`group(...)`、`final` 和 `default` 会去掉引号。子组和节点选择应放在不同的过滤行：
+
+```dae
+group {
+    Hong Kong {
+        filter: name(regex: '^edge\.example$')
+    }
+    proxy {
+        filter: group('Hong Kong')
+        filter: name('edge')
+    }
+}
+routing {
+    dport(443) -> Hong Kong
+    fallback: Hong Kong
+}
+```
 
 Selector 的 TCP 与 UDP 都遵循已选成员，不会因健康状态切换到兄弟成员。同一叶节点的 TCP 最后尝试也不能绕过嵌套 Selector 的选择。组拨号最终总会解析到一个叶节点。
 
@@ -270,7 +295,7 @@ Selector 的 TCP 与 UDP 都遵循已选成员，不会因健康状态切换到�
 
 ## DNS 设置
 
-上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`、`h3://`。追加 `-> node-or-group` 可强制拨号路径；所选叶节点具备对应能力时，上述 transport 均可使用代理出站。DoQ 与 DoH3 要求叶节点提供 UDP-capable `PacketTransport`；缺少代理 registry 或 packet capability 时会 fail closed。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
+上游可裸写 `host:port`（UDP），也可使用 `udp://`、`tcp://`、`tcp+udp://`/`udp+tcp://`、`tls://`、`https://`、`quic://`，以及 `h3://` 或其别名 `http3://`。追加 `-> node-or-group` 可强制拨号路径；所选叶节点具备对应能力时，上述 transport 均可使用代理出站。DoQ 与 DoH3 要求叶节点提供 UDP-capable `PacketTransport`；缺少代理 registry 或 packet capability 时会 fail closed。请求路由选择 `reject`、`asis` 或命名上游；响应路由选择 `accept`、`reject` 或用于有界重查询的命名上游：
 
 ```dae
 dns {
@@ -314,7 +339,9 @@ dns {
 
 **原生 API。** `native-api` 需显式编译：以 `--features native-api`（或 `native-ui`）构建；full 与 `-native-api` 发布产物包含它。listener 须配置 `experimental.native_api.enabled: true`，并满足以下条件之一：配置 bearer `secret`、设置 `password_auth: true`，或在 loopback `listen` 上设置 `allow_anonymous_loopback: true`。honk 不限制 `secret` 的最短长度，应使用足够长的随机值。默认监听地址为 `127.0.0.1:9527`，匿名 loopback 访问仅供本地开发。所有生效的原生字段均需重启。用户态观测、事件与有界历史独立于 Clash；流量/内存历史默认保留最多 600 点/600 秒。可选 `ui` 目录需已有可读 `index.html`，也可用 `--features native-ui` 与 `ui: embedded` 内嵌固定版本的 doona；运行时不下载或构建 UI。`ui: embedded-lite` 选择更轻量的 doona lite 预览版，同样需要 `native-ui`。
 
-`.dae` 仍是唯一配置权威。启动时捕获来源、离线校验和 reload 共用引擎。配置读取返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。`config_write` 默认 false，要求非空 secret 或 `password_auth`。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威。启用 `config_write` 后，所有已接受的非凭据 include 均可编辑源，但不授予专用条目删除权限。配置的 geodata 更新将不可变的已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [主文件条目与 geodata 契约](./reference/api.md#主文件条目与-geodata-管理)。
+对于启动时已捕获 `.dae` 来源的配置，来源元数据、离线校验和实际重载操作共用现有引擎。配置读取返回已接受正文，仅遮蔽监听凭据值，包括重复、被覆盖的值及其在其他位置的出现。凭据源仍只读，哈希仍对应原始字节。源 `path` 保持相对路径，`absolute_path` 另行提供规范化绝对路径。获准访问的匿名 loopback 请求与 bearer 认证请求读取相同的数据。`config_write` 默认 false，要求非空 secret 或 `password_auth`。主文件节点/provider 创建删除、授权源 PUT 和受限组 PATCH 复用该权威。启用 `config_write` 后，所有已接受的非凭据 include 均可编辑源，但不授予专用条目删除权限。配置的 geodata 更新将不可变的已验证字节交给同一 reload owner。激活失败不会自动回滚已写字节，应避免并发外部编辑。详见[原生设置](./reference/experimental.md#native_api)与 [主文件条目与 geodata 契约](./reference/api.md#主文件条目与-geodata-管理)。
+
+使用 `--store db` 时，honk 运行数据库中的当前修订；启动时仅在数据库为空时导入 `-c` 文件，见[配置数据库](./reference/api.md#配置数据库--store-db)。
 
 **Clash API。** 非空的 `experimental.clash_api.external_controller` 会启用服务器。除非防火墙和非空 `secret` 已提供保护，否则应保持 loopback 绑定；空 secret 会关闭 API 认证。相对 `external_ui` 依次优先使用 `data_dir` 下、`/var/share/honk` 下和工作目录中的已有目录；都不存在时，在 `data_dir` 下下载 dashboard。`assets.ui.url` 选择 ZIP 来源，`assets.ui.route` 选择下载出口，未设置时出口继承 `assets.route`。没有配置 URL 或出口时，分别使用内置 URL 和普通流量路由。`HONK_UI_DOWNLOAD_URL` 可覆盖 ZIP URL。
 
