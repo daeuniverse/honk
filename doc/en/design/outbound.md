@@ -1305,6 +1305,20 @@ from the entry with hybrid key shares disabled, as a direct REALITY dial
 retries once. The redial shares the original deadline. A REALITY entry retries
 inside its own `dial_runtime`.
 
+### Routes through group exits
+
+A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
+(`honk_config::route::Route`). `group_graph::compose` joins the leaf's own hops
+(the node itself, or a chain's hops) with the exits of the groups on its
+selection path, innermost first, and enters a repeated exit once. A route is a
+selection result, not a configured node, so it has no `NodeRuntime`.
+`ProxyRegistry::dial_ref` sends `DialRef::Route` to
+`ChainHandler::dial_route_tcp` over a `RouteRuntime` (`src/runtime/route.rs`),
+which borrows the hop runtimes of the generation that dials it. Each generation
+caches at most `MAX_ROUTE_RUNTIMES` (4096) of them and dials past that limit
+over an uncached one. The hop-by-hop rules above apply unchanged. Routes skip
+pool deposit and replenishment.
+
 ## Cold URLTest speculative preparation
 
 Cold URLTest is the only selection path that prepares more than one leaf. The

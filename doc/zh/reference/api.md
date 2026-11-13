@@ -421,6 +421,8 @@ Score 的 `previous_leaf_node_id` 和 `previous_member_id` 分开记录：仅有
 
 `config.check_interval` 是只读的：周期检查用全局间隔，值为 0 时读出来是 `null`。
 
+组的 [`exit`](./groups.md#出口) 只能在配置文件中设置：组文档不显示它，也没有补丁路径可以修改它。
+
 节点名、订阅标签、组名和成员名、icon、检查 URL、final 出站标签以及出站计数名称，
 都按与源内容、流显示相同的规则遮蔽 listener secret。节点快照在有界序列化之前就遮
 蔽凭据，续页沿用同一份已遮蔽的字节；不透明 ID、修订 hash、成员身份和游标绑定都不
@@ -1434,7 +1436,7 @@ Clash listener 允许任意 CORS 来源，没有原生 API 那样的 Host 和 Or
 
 `GET /rules` 返回 `{"rules":[{"type","payload","proxy"}]}`，由配置的路由规则生成，不含原生规则 ID，也没有 fallback 行。
 
-`GET /connections` 返回 `{downloadTotal,uploadTotal,connections,memory}`。两个总量是当前各行之和，`memory` 是进程 RSS 字节数。每行为 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字符串形式的 `sourceIP`、`destinationIP`、`sourcePort` 与 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 与 `processPath`；未知值为 `""`。`chains` 从拨号的节点倒推到规则的目标：先是节点，再是选中它的各层组。[链式节点](./nodes.md#链式节点)前面先列出它的各跳，出口在前。
+`GET /connections` 返回 `{downloadTotal,uploadTotal,connections,memory}`。两个总量是当前各行之和，`memory` 是进程 RSS 字节数。每行为 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字符串形式的 `sourceIP`、`destinationIP`、`sourcePort` 与 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 与 `processPath`；未知值为 `""`。`chains` 从拨号的节点倒推到规则的目标：先是节点，再是选中它的各层组。[链式节点](./nodes.md#链式节点)前面先列出它的各跳，出口在前。经组 [`exit`](./groups.md#出口) 的路由同样列出各跳，从最外层出口一直到叶节点。
 
 WebSocket 连接上，`?interval=` 设置推送间隔，单位毫秒，默认 1000。它会向上取整到 100、200、500、1000、2000、5000、10000、30000 或 60000，最大 60000。
 

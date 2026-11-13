@@ -421,6 +421,8 @@ flow 清單接受 `network/state/connection_id/detail/limit/cursor`。最多保�
 
 `config.check_interval` 是唯讀的：週期檢查使用全域間隔，值為 0 時讀出來是 `null`。
 
+群組的 [`exit`](./groups.md#出口) 只能在設定檔中設定：群組文件不顯示它，也沒有修補路徑可以修改它。
+
 節點名稱、訂閱標籤、群組名稱與成員名稱、icon、檢查 URL、final 出站標籤以及出站計數名稱，
 都以與來源內容、flow 顯示相同的規則遮蔽 listener secret。節點快照在有界序列化之前就遮
 蔽憑證，續頁沿用同一份已遮蔽的位元組；不透明 ID、修訂 hash、成員身分與游標繫結都不
@@ -1434,7 +1436,7 @@ Clash listener 允許任意 CORS 來源，沒有原生 API 那樣的 Host 與 Or
 
 `GET /rules` 回傳 `{"rules":[{"type","payload","proxy"}]}`，由設定的路由規則產生，不含原生規則 ID，也沒有 fallback 列。
 
-`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。`chains` 從撥號的節點倒推到規則的目標：先是節點，再是選中它的各層群組。[鏈式節點](./nodes.md#鏈式節點)前面先列出它的各跳，出口在前。
+`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。`chains` 從撥號的節點倒推到規則的目標：先是節點，再是選中它的各層群組。[鏈式節點](./nodes.md#鏈式節點)前面先列出它的各跳，出口在前。經群組 [`exit`](./groups.md#出口) 的路由同樣列出各跳，從最外層出口一直到葉節點。
 
 WebSocket 連線上，`?interval=` 設定推送間隔，單位毫秒，預設 1000。它會向上取整到 100、200、500、1000、2000、5000、10000、30000 或 60000，最大 60000。
 

@@ -440,6 +440,8 @@ Group IDs are not positional configuration UUIDs or name hashes.
 
 `config.check_interval` is read-only: periodic checks use the global interval, and zero reads as null.
 
+A group's [`exit`](./groups.md#exit) is set only in the configuration file: the group document does not show it, and no patch path changes it.
+
 These display values use the same listener-secret mask as source and flow displays:
 
 - Node names and subscription tags.
@@ -1534,7 +1536,7 @@ Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`,
 
 `GET /rules` returns `{"rules":[{"type","payload","proxy"}]}`, built from the configured routing rules, without native rule IDs or a fallback row.
 
-`GET /connections` returns `{downloadTotal,uploadTotal,connections,memory}`. The totals sum the current rows, and `memory` is process RSS in bytes. A row is `{id,metadata,upload,download,start,chains,rule,rulePayload}`. `metadata` has `network`, `type`, `sourceIP`, `destinationIP`, `sourcePort` and `destinationPort` as strings, `host`, `dnsMode: "normal"`, `process` and `processPath`; unknown values are `""`. `chains` runs from the dialed node back to the rule's target: the node, then each group it was selected through. A [proxy chain](./nodes.md#proxy-chains) node is preceded by its hops, exit first.
+`GET /connections` returns `{downloadTotal,uploadTotal,connections,memory}`. The totals sum the current rows, and `memory` is process RSS in bytes. A row is `{id,metadata,upload,download,start,chains,rule,rulePayload}`. `metadata` has `network`, `type`, `sourceIP`, `destinationIP`, `sourcePort` and `destinationPort` as strings, `host`, `dnsMode: "normal"`, `process` and `processPath`; unknown values are `""`. `chains` runs from the dialed node back to the rule's target: the node, then each group it was selected through. A [proxy chain](./nodes.md#proxy-chains) node is preceded by its hops, exit first. A route through a group [`exit`](./groups.md#exit) lists its hops the same way, from the outermost exit back to the leaf.
 
 On a WebSocket, `?interval=` sets the push period in milliseconds (default 1000), rounded up to 100, 200, 500, 1000, 2000, 5000, 10000, 30000 or 60000 and capped at 60000.
 

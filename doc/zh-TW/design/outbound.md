@@ -1034,6 +1034,15 @@ SID 的所有目的地。網域目標流，即 `RewriteTo`，仍按原始目的�
 經隧道撥號的某一跳以 `RealityMaskCertificate` 失敗時，整條鏈從入口重撥一次並關閉 hybrid key share，與直接 REALITY 撥號重試一次相同。
 重撥共用原來的期限。入口本身是 REALITY 時，由它自己的 `dial_runtime` 重試。
 
+### 經群組出口的路由
+
+群組的 [`exit`](../reference/groups.md#出口) 把選中的葉節點變成一條路由（`honk_config::route::Route`）。
+`group_graph::compose` 把葉節點自己的各跳（節點本身，或鏈式節點的各跳）與選中路徑上各群組的出口依由內到外的順序接起來，重複的出口只進入一次。
+路由是選擇結果，不是設定中的節點，所以沒有 `NodeRuntime`。
+`ProxyRegistry::dial_ref` 把 `DialRef::Route` 交給 `ChainHandler::dial_route_tcp`，在 `RouteRuntime`（`src/runtime/route.rs`）上撥號，
+`RouteRuntime` 借用發起撥號的 generation 中各跳的 runtime。每個 generation 最多快取 `MAX_ROUTE_RUNTIMES`（4096）個，超出後用不快取的 runtime 撥號。
+上述逐跳規則同樣適用。路由不存入連線池，也不觸發補充。
+
 ## 冷 URLTest speculative preparation
 
 冷 URLTest 是唯一會準備多個葉節點的選擇路徑。選擇策略和 stagger 規則見[群組設計](./groups.md)；
