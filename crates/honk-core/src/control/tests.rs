@@ -4374,6 +4374,7 @@ fn preconnect_test_group(name: &str, policy: GroupPolicy, ids: Vec<uuid::Uuid>) 
         groups: vec![],
         default: None,
         final_outbound: None,
+        exit: None,
         check_url: None,
         check_interval: None,
         tolerance: 50,
