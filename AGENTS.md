@@ -118,7 +118,7 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 | `cycle`                                                                         | `clean-all` + `build-core`                                                                                                                                                                                                                   |
 | `watch-core`                                                                    | `cargo watch` rebuild                                                                                                                                                                                                                        |
 
-`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the two public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
+`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the three public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
 
 ## Current validation guidance
 
