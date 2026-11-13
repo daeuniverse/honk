@@ -1722,7 +1722,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
-source = { file = "doc/en/reference/experimental.md", fence = 2 }
+source = { file = "doc/en/reference/experimental.md", fence = 3 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1733,7 +1733,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-experimental-02"
-source = { file = "doc/en/reference/experimental.md", fence = 3 }
+source = { file = "doc/en/reference/experimental.md", fence = 4 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2063,7 +2063,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
-source = { file = "doc/zh/reference/experimental.md", fence = 2 }
+source = { file = "doc/zh/reference/experimental.md", fence = 3 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2074,7 +2074,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-02"
-source = { file = "doc/zh/reference/experimental.md", fence = 3 }
+source = { file = "doc/zh/reference/experimental.md", fence = 4 }
 wrap = ""
 layer = "structure"
 honk = "accept"
