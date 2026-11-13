@@ -8,40 +8,40 @@
 
 | dae 键 | 内部字段 | 默认值 | 含义 |
 | ------- | -------- | ------ | ---- |
-| `tproxy_port` | `tproxy_port` | `12345` | 同时写入用户态监听器和 eBPF 数据路径的 TCP/UDP 透明监听端口；修改后需重启。 |
-| `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关；当前运行时不读取该字段。 |
-| `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段；`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。 |
+| `tproxy_port` | `tproxy_port` | `12345` | 同时写入用户态监听器和 eBPF 数据路径的 TCP/UDP 透明监听端口。取值为十进制端口号；其他文本（包括十六进制）产生 `legacy-config-warning` 并回退到 `12345`。修改后需重启。 |
+| `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用于避免透明监听端口被再次拦截的兼容开关。当前运行时不读取该字段。修改仍需重启。 |
+| `pprof_port` | `pprof_port` | `0` | pprof HTTP 端口兼容字段。`0` 表示关闭。honk 当前不启动 pprof 服务，也不读取该字段。不是十进制端口号的值产生警告并回退到 `0`。修改仍需重启。 |
 | `so_mark_from_dae` | `so_mark_from_dae` | `0`（实际 `0x100`） | honk 主动创建的套接字使用的进程级 `SO_MARK`，并用于数据路径精确旁路匹配。非零值替换 `0x100`，不会与其按位 OR；修改需重启。拒绝保留位 `0xc8000000`。见[套接字 mark](#套接字-mark)。 |
-| `log_level` | `log_level` | `"info"` | 启动日志过滤器。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
-| `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
-| `syslog_addr` | `syslog_addr` | `""` | TCP syslog 接收端的数字 IP 和端口，如 `192.0.2.10:514` 或 `[2001:db8::10]:514`。启用 DNS 审计时必填。修改需重启。 |
+| `log_level` | `log_level` | `"info"` | 启动时的日志过滤器，语法同 `RUST_LOG`，例如 `info` 或 `'info,honk_core=debug'`；空白值按 `info` 处理。优先级依次为有效的 `RUST_LOG`、`--debug`、该值。通过 SIGHUP 修改需重启；原生 API 的 `log.level` PATCH 会替换该过滤器，直到下一次激活。`info` 只记录运行状态（启动、重载、健康检查、订阅）；每条连接的分流记录（`TCP connection`、`UDP connection`、eBPF 卸载）在 `debug`，这样路由器的 syslog 不会被流量刷满。要核对分流结果，用 `debug` 运行，或从 API 读取 `/logs?level=debug`。 |
+| `log_file` | `log_file` | `""` | 可选的追加写日志路径。空值或仅含空白的值关闭文件输出；相对路径在 `data_dir` 下解析，控制台日志保持启用。仅当解析后的实际目标发生变化时，SIGHUP 才要求重启；`--log-file` 会遮蔽此配置值。 |
+| `syslog_addr` | `syslog_addr` | `""` | TCP syslog 接收端的数字 IP 和端口，如 `192.0.2.10:514` 或 `[2001:db8::10]:514`。启用 DNS 审计时必填，且必须是单播 IP 加非零端口，否则以 `invalid-config-value` 校验失败。修改需重启。 |
 | `syslog_dns_enabled` | `syslog_dns_enabled` | `false` | 需要 `dns-syslog` Cargo feature。将客户端 DNS 结果以固定 RFC 5424 消息和 JSON 正文通过 TCP 长连接发送，使用 RFC 6587 长度前缀分帧。独立于原生 API、历史记录与日志级别；有界组批和退避重连，不做应用层确认、不落盘。见 [DNS 审计](../design/dns-syslog.md)。修改需重启。 |
 | `syslog_cee_enabled` | `syslog_cee_enabled` | `false` | 为固定 JSON 正文添加 `@cee: ` 前缀，用于支持 CEE 的接收端（如 VictoriaLogs）。保持 false 则发送普通 JSON。此项不负责启用审计或编译功能。修改需重启。 |
-| `syslog_hostname` | `syslog_hostname` | `""` | 运行 honk 的设备名，仅写入 RFC 5424 头。空值在启动时读取系统主机名，失败回退 `-`。显式值为 1–255 字节、不含空格的可打印 ASCII。修改需重启。 |
-| `syslog_app_name` | `syslog_app_name` | `"honk"` | 应用名，仅写入 RFC 5424 头；为 1–48 字节、不含空格的可打印 ASCII。修改需重启。 |
+| `syslog_hostname` | `syslog_hostname` | `""` | 运行 honk 的设备名，仅写入 RFC 5424 头。空值在启动时读取系统主机名，失败回退 `-`。显式值为 1–255 字节、不含空格的可打印 ASCII，关闭 DNS 审计时同样校验。修改需重启。 |
+| `syslog_app_name` | `syslog_app_name` | `"honk"` | 应用名，仅写入 RFC 5424 头。必须为 1–48 字节、不含空格的可打印 ASCII，关闭 DNS 审计时同样校验。修改需重启。 |
 | `disable_waiting_network` | `disable_waiting_network` | `false` | 兼容键；当前启动路径不读取该字段。未解析的 `auto` 网卡本就保持待定，不会阻塞启动。 |
 | `shutdown_wait_connections` | `shutdown_wait_connections` | `false` | 可重载、显式启用的业务连接宽限等待；见[关闭](#关闭)。 |
 | `lan_interface` | `lan_interface` | `[]` | 拦截转发流量的 LAN 网卡，逗号分隔。空值不安装任何 LAN hook。参见[网卡语义](#网卡语义)。 |
 | `wan_interface` | `wan_interface` | `[]` | 安装 hook 以拦截本机发起 TCP/UDP 的 WAN 网卡，逗号分隔。字面值 `auto` 跟随 metric 最低的 IPv4 默认路由。WAN 绑定规则见[网卡语义](#网卡语义)。 |
-| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此对每个 WAN 根接口（包括同时也是 LAN 的接口）一出现在网卡拓扑中（启动时，或之后出现时）就写入 `net.ipv6.conf.<wan>.accept_ra=2`，不等待其 hook，也不要求链路 UP，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。同样地，对第一个已解析、存在且未被拒绝的 LAN 名称写入 `net.ipv4.conf.<lan>.rp_filter=0`，按配置原样、不做规范化。新加入设备的 udev `systemd-sysctl` 会在首次写入后立即恢复发行版默认值，因此每个值约一秒后会再写一次；此后 honk 不再改动，直到该设备被重建。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
+| `auto_config_kernel_parameter` | `auto_config_kernel_parameter` | `false` | 自动配置 sysctl 的兼容开关。修改仍需重启。当前运行时不会按该字段分支；真实数据路径会执行固定的 best-effort sysctl 设置。该设置会把 `net.ipv6.conf.all.forwarding` 固定为 1，并因此对每个 WAN 根接口（包括同时也是 LAN 的接口）一出现在网卡拓扑中（启动时，或之后出现时）就写入 `net.ipv6.conf.<wan>.accept_ra=2`，不等待其 hook，也不要求链路 UP，保证 SLAAC/RA 学来的 IPv6 默认路由不会因 forwarding 被固定而过期消失。同样地，对第一个已解析、存在且未被拒绝的 LAN 名称写入 `net.ipv4.conf.<lan>.rp_filter=0`，按配置原样、不做规范化。新加入设备的 udev `systemd-sysctl` 会在首次写入后立即恢复发行版默认值，因此每个值约一秒后会再写一次；此后 honk 不再改动，直到该设备被重建。使用 systemd-networkd 的主机建议在 WAN 的 `.network` 文件中显式配置 `IPv6AcceptRA=yes`。 |
 | `nfqueue_enable` | `nfqueue_enable` | `true` | 将有歧义的 LAN 转发 UDP 原始包保留在 NFQUEUE，直到用户态得到终态决策。需要真实 eBPF 后端；单实例交接后若固定队列不可用，或数据路径准入前的队列/规则/健康检查失败，honk 记录 warning，仅在本进程关闭该功能且不改写配置。持久化 token generation 恢复失败仍为 fatal，因为分配器状态无法确定。安装阶段会回收保留的 nftables table。除实际发生启动降级的情况外，修改后需重启（见下文）。新配置应使用此字段；已弃用的 `experimental.udp_nfqueue.enabled` 写法仍接受并给出迁移 warning；两者同时存在时以此 canonical 字段为准。 |
 | `data_dir` | `data_dir` | `"/var/lib/honk"` | 生成状态和相对运行时资源的非空绝对根目录。缺失目录会递归创建；每个候选目录都必须通过私有的 create-new/remove 探测。候选目录不可用时，仅回退到通过同一探测的工作目录，但 `--store db` 和已启用的原生 API 密码登录不允许这种回退。旧根目录 `/var/share/honk`（`LEGACY_DATA_DIR`）中的已有资源按下方各路径规则继续使用；旧缓存和订阅导入则会将符合条件的状态复制到 `state/honk.db`。修改后需重启。 |
 | `store_subscribe` | `store_subscribe` | `true` | 将每个订阅最近一次有效正文持久化到状态数据库 `data_dir/state/honk.db`，仅供启动恢复；重载沿用活动节点而不读取已存正文。修改后需重启。 |
-| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；空列表退回普通 TCP 检查。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并向解码后的路径和查询串发送 HEAD。 |
-| `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法；空值按 `HEAD` 处理。 |
+| `tcp_check_url` | `tcp_check_url` | `["https://www.gstatic.com/generate_204"]` | TCP/HTTP 健康检查 URL，逗号分隔。健康检查循环使用第一个值；首项缺失或为空时退回普通 TCP 检查。只支持 `http://`、`https://` 和无 scheme 的 URL；其他 scheme 或端口 `0` 仍能加载，但每次 HTTP 探测都会因请求无效而失败。URI 解析分别处理用户信息、带方括号的 IPv6、端口、路径、查询和片段。用户信息不会生成授权头；请求保留路径和查询，不发送片段，无斜杠的查询以 `/?query` 发送。HTTP/HTTPS 默认端口为 80/443；无协议的健康检查目标使用 HTTP/80。URLTest 的无协议目标使用 HTTPS/443，并向解码后的路径和查询串发送 HEAD。第一个 URL 同时是 Score QUIC 探测目标，见[重载健康检查与 TLS 模式](#重载健康检查与-tls-模式)。 |
+| `tcp_check_http_method` | `tcp_check_http_method` | `"HEAD"` | URL 健康检查发送的 HTTP 方法，例如 `HEAD` 或 `GET`。空值按 `HEAD` 处理；无效方法会使每次 HTTP 探测因请求无效而失败。 |
 | `udp_check_dns` | `udp_check_dns` | `["dns.google:53", "8.8.8.8", "2001:4860:4860::8888"]` | UDP 健康检查的 DNS 目标，逗号分隔。裸 IPv4/IPv6、`[IPv6]` 和域名默认使用端口 `53`；显式端口必须为 `1..65535` 内的整数。无效括号或端口会使校验失败，并产生带位置的诊断。优先选择第一个 IP 字面量，否则解析第一个域名。解析与 Score 共用解码后的主机和端口，解析完成后仍保留域名身份。 |
-| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热协调器也使用该值，但实际下限为 10 秒。 |
-| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量。接受裸毫秒数、`ms` 或 `s`，其余写法沿用此默认值并记录一条警告。 |
-| `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。参见[拨号模式](#拨号模式)。 |
+| `check_interval` | `check_interval_secs` | `30s` | 全局健康检查间隔，单位为整秒。取整数，可不带后缀或带 `s`、`m`、`h`；`ms` 值向上取整到秒（`500ms` 变为 `1s`），`1.5s` 无效。必须为正；解析失败的值会变成零并在校验时被拒绝。UDP 预热协调器也使用该值，但实际下限为 10 秒。 |
+| `check_tolerance` | `check_tolerance_ms` | `50ms` | URLTest 切换所选成员前要求的延迟改善量，单位为整毫秒。接受裸毫秒数、带 `ms` 的整数或带 `s` 的值，包括零；不足一毫秒的部分被截去，因此 `0.0005s` 变为 `0ms`，`0.5ms` 无效。其他写法保留默认值并记录警告。 |
+| `dial_mode` | `dial_mode` | `"domain"` | 目的域名发现和路由模式：`ip`、`domain`、`domain+` 或 `domain++`。拼写不区分大小写。未知名称以 `invalid-config-value` 拒绝校验。参见[拨号模式](#拨号模式)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全局 TLS 校验回退兼容字段。当前 TLS connector 不读取该字段；跳过证书校验需在节点分享链接中按节点配置。 |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探超时兼容字段；当前控制面不读取它。解析规则同 `check_tolerance`，无效值产生警告并保留默认的 `30ms`。 |
-| `tls_implementation` | `tls_implementation` | `"tls"` | `tls` 使用常规 BoringSSL 客户端配置；`utls` 启用 honk 的 Chrome 风格 ClientHello 模拟，不承诺精确浏览器身份。 |
-| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 兼容指纹配置。`utls` 模式使用唯一的 Chrome 风格配置；此值不会切换实现。 |
+| `tls_implementation` | `tls_implementation` | `"tls"` | `utls`（不区分大小写）启用 honk 的 Chrome 风格 ClientHello 模拟，不承诺精确浏览器身份。其他任何值，包括空值和拼写错误，都选择常规 BoringSSL 客户端配置，不报错也不警告。 |
+| `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 兼容指纹配置。`utls` 模式使用唯一的 Chrome 风格配置，此值不会切换实现。非空且不以小写 `chrome` 开头的值会在启动时记录警告。 |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello 分片兼容开关；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片长度范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `tls_fragment_interval` | `tls_fragment_interval` | `""` | 分片间隔范围兼容字段；当前 TLS connector 不读取该字段。 |
 | `mptcp` | `mptcp` | `false` | MPTCP 兼容开关；当前拨号路径不读取该字段。 |
-| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。DNS [`subtag()` 规则](./dns.md#节点服务器域名)可以改为接管某订阅的节点主机名。 |
+| `bootstrap_resolver` | `bootstrap_resolver` | `""` | 使用带 mark 的 UDP/TCP 解析节点主机名和控制面拨号目标。取值为数字 IP 加端口：`223.5.5.5:53`、`udp://223.5.5.5:53`、`tcp://223.5.5.5:53` 或 `[2001:4860:4860::8888]:53`。只有 `tcp://` 选择 TCP；其他 scheme（如 `tls://`）均按明文 UDP 处理。主机名或缺少端口时解析器不生效，也不报错。为空或查询失败时先查 `/etc/hosts`，再向 `/etc/resolv.conf` 第一个数字 nameserver 发送带 mark 的 DNS；不调用 libc NSS 或追加搜索后缀。去掉 scheme 后的同一地址也是周期性 `direct` 健康检查的目标，无效时回退到 `223.5.5.5:53`。DNS [`subtag()` 规则](./dns.md#节点服务器域名)可以改为接管某订阅的节点主机名。 |
 | `fallback_resolver` | `fallback_resolver` | `"8.8.8.8:53"` | 回退 resolver 兼容值；当前运行时不读取该字段。 |
 | `bandwidth_max_tx` | `bandwidth_max_tx` | `""` | 发送带宽提示兼容值，例如 `'200 mbps'`；当前运行时不读取该字段。 |
 | `bandwidth_max_rx` | `bandwidth_max_rx` | `""` | 接收带宽提示兼容值；当前运行时不读取该字段。 |
@@ -54,6 +54,12 @@
 | —（dae 语法中不可配置） | `dns_resolve_timeout_ms` | `2000ms` | 控制面 DNS 解析超时，包括拨号前必须转换为 IP 的目标。 |
 | —（dae 语法中不可配置） | `relay_idle_timeout_secs` | `300s` | 旧中继空闲超时字段；当前中继路径不读取它。 |
 
+`syslog_dns_template` 和 `syslog_dns_json` 已移除，因为 DNS syslog 使用固定 JSON schema。无论取值如何，出现任一键都会以 `removed-config-setting` 拒绝配置；请删除该键。
+
+默认值栏中的 `[]` 表示空列表；dae 没有列表字面量，`lan_interface: []` 会创建名为 `[]` 的网卡。清空网卡列表请写 `lan_interface: ''` 或 `wan_interface: ''`。`tcp_check_url: ''` 保留一个空项，从而关闭 HTTP 探测。
+
+`tcp_check_url` 和 `udp_check_dns` 的列表项应逐项加引号或不加引号。整串加引号（如 `'dns.google:53,8.8.8.8'`）仍可使用，但会产生 `legacy-quoted-list` 警告。
+
 仅当实际发生启动早期降级（mock/不带 `ebpf` 或固定队列前置检查失败），或数据路径准入前较晚的队列/规则/健康检查降级时，写入和重载才允许在 NFQUEUE 生效值保持关闭的情况下请求 `nfqueue_enable: true`，包括省略该键、采用默认值 `true` 的情况。请求的源文本保持原样，但生效值在本进程整个生命周期内保持 `false`；不会自动重试启用，需重启才能重试。没有发生该降级时，开关变更仍需重启。[公共重载流程](../design/control-plane.md#reload-与运行时-generation) 在指纹/no-op 检查前归一化生效配置；原生 API 的写入前检查与完整校验共用同一重启策略。持久化 token generation 恢复失败和[准入后的失败](../design/nfqueue.md#启用与范围)仍为 fatal。
 
 `nfqueue_enable` 同时控制 [LAN UDP/53 分片交付](../design/nfqueue.md#lan-dns-分片)：控制器/原始组分片要求 NFQUEUE ready，否则丢弃，不能绕过 DNS 策略。原生 `direct(must)` 和未分片 DNS 不变。
@@ -61,6 +67,8 @@
 HTTP 健康检查和 URLTest 的 `Host` 使用不含凭据的主机与端口：IPv6 保留方括号，非默认端口不会省略。建立连接和处理 TLS 服务端名称时仍使用不带方括号的主机。
 
 请求路径和查询字符串保留配置中的原始点路径段和百分号编码。在构造请求前拒绝 authority 含多余斜杠、包含反斜杠或内嵌 ASCII 空白／控制字符的 URL；健康检查警告不回显被拒绝的 URL。
+
+HTTP 探测把 `200–499` 的任何最终状态码视为成功，因此重定向或 `404` 也算通过。响应头超过 16 KiB 或不完整时探测失败。
 
 ## 关闭
 
@@ -98,10 +106,12 @@ honk 不负责安装用户的 WAN 策略路由表、路由、源地址规则或 
 - `check_interval`。
 - 第一个 `tcp_check_url`，包括回退地址、路径和查询字符串。缺失或空的首项均关闭 HTTP 探测；后续项不参与比较。
 - HTTP 探测启用时的 `tcp_check_http_method`。空值与 `HEAD` 等价。
-- `udp_check_dns` 选中的目标：去除首尾空白并忽略空项，优先选择列表中的第一个 IP 字面量，否则选择第一个域名，再无可用项则使用 `8.8.8.8:53`。重载检查只比较配置中的地址或域名及端口，不解析 DNS。未选中项的变化仍可重载。
+- `udp_check_dns` 选中的目标：去除首尾空白并忽略空项，优先选择列表中的第一个 IP 字面量，否则选择第一个域名，再无可用项则使用 `8.8.8.8:53`。重载检查只比较配置中的地址或域名及端口，不解析 DNS。域名比较不区分大小写并忽略一个尾随句点，因此 `dns.example:53` 与 `DNS.EXAMPLE.:53` 是同一目标。未选中项的变化仍可重载。
 - `tls_implementation` 在原生 TLS 与 uTLS 之间的切换。比较 `utls` 时不区分大小写。
 
 dae 配置中的 `check_tolerance` 仍可通过重载更新 URLTest 组的容差。组级检查 URL 与直接连接探测仍沿现有路径动态更新。重载 `utls_imitate` 只保存兼容配置值，不改变指纹。
+
+Score 组还会对第一个 `tcp_check_url` 发起 QUIC 握手探测。该 URL 必须以小写 `https://` 开头，否则此探测关闭，Score 只使用其他探测，并由 `quic_probe` 降级项报告。QUIC 目标只在启动时建立，因此重载新增第一个 Score 组时会报告原因 `restart_required`，直到下次重启。
 
 UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或初始化超时会使
 配置目标保持待定，留给后续健康检查周期重试，不替换默认目标，也不降低节点
@@ -111,6 +121,8 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 ## 网卡语义
 
 `lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。
+
+多个网卡使用 `lan_interface: 'eth0', 'eth1'`，`wan_interface` 也采用相同语法。将整个逗号分隔列表放在一组引号内，例如 `lan_interface: 'eth0,eth1'`，会创建一个网卡名称，而不是两个。
 
 在以太网父设备上，VID 非零的 VLAN 标签帧属于 VLAN 设备；要管理该子网，请列出 `eth1.20`（VLAN-aware bridge 请列出 `br0.N`）。VLAN-aware bridge 拓扑尚未经过真实流量测试验证。参见[接口挂钩集合](../design/datapath.md#接口挂钩集合)。
 
@@ -177,11 +189,13 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 
 ## 预热与拨号预算
 
+`preconnect_node_count`、`udp_warm_node_count` 和 `max_concurrent_dials` 取非负整数，例如 `4`；`preconnect_node_count` 还接受不区分大小写的 `auto`。其他值以 `invalid-config-value` 拒绝配置。
+
 | 键 | 默认值 | 运行时语义 | 详情 |
 | -- | ------ | ---------- | ---- |
 | `preconnect_node_count` | `'auto'` | 仅启动时执行一轮裸 TCP 预连接。`'auto'` 最多选择八个合格节点，并发四次尝试；显式 `N` 最多选择 `N` 个，并发不超过 `min(N, 8)`。各组当前选择优先，之后按节点配置顺序补充。`0` 关闭。 | [组设计](../design/groups.md) |
-| `udp_warm_node_count` | `0` | `0` 关闭。正值 `N` 按组和 IP family 选择 top `min(N, 3)` 的可复用 UDP 叶子，去重后全局最多保留 `4 × N` 个。最多并发四次尝试；启动后立即运行，之后每批完成再等待 `max(check_interval, 10s)`。 | [组设计](../design/groups.md) |
-| `max_concurrent_dials` | `64` | 限制每个 generation 的物理代理连接和握手，实际值至少为一，并受重叠 reload generation 共享的文件描述符预算上限约束。Ready pool 命中、已热 transport 上的逻辑流以及 `direct`/`block` 不占 permit。 | [组设计](../design/groups.md) |
+| `udp_warm_node_count` | `0` | `0` 关闭。正值 `N` 按组和 IP family 选择 top `min(N, 3)` 的可复用 UDP 叶子，去重后全局最多保留 `4 × N` 个。最多并发四次尝试；启动后立即运行，之后每批完成再等待 `max(check_interval, 10s)`，组的选择变化时会提前开始。 | [组设计](../design/groups.md) |
+| `max_concurrent_dials` | `64` | 限制每个 generation 的物理代理连接和握手，实际值至少为一，并受重叠 reload generation 共享的文件描述符预算上限约束。实际值不超过 `1024`，更大的配置值会被接受并收紧。Ready pool 命中、已热 transport 上的逻辑流以及 `direct`/`block` 不占 permit。 | [组设计](../design/groups.md) |
 
 ## 示例
 
@@ -199,7 +213,7 @@ global {
 
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53,8.8.8.8,2001:4860:4860::8888'
+    udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 30s
     check_tolerance: 50ms
 
