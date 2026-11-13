@@ -307,6 +307,7 @@ async fn shared_geoip_matchers_follow_reload_ownership() {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         }) == "block"
     };
     let rejects = |dns: &DnsRouter, ip: &str| {
@@ -456,6 +457,7 @@ async fn shared_geosite_matchers_follow_reload_ownership() {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         }) == "block"
     };
     let rejects = |dns: &DnsRouter, domain: &str| {

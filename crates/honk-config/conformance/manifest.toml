@@ -1933,7 +1933,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-01"
-source = { file = "doc/en/reference/routing.md", fence = 5 }
+source = { file = "doc/en/reference/routing.md", fence = 6 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1944,7 +1944,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-02"
-source = { file = "doc/en/reference/routing.md", fence = 7 }
+source = { file = "doc/en/reference/routing.md", fence = 8 }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -1968,7 +1968,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-marks"
-source = { file = "doc/en/reference/routing.md", fence = 6 }
+source = { file = "doc/en/reference/routing.md", fence = 7 }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -2397,7 +2397,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-01"
-source = { file = "doc/zh/reference/routing.md", fence = 5 }
+source = { file = "doc/zh/reference/routing.md", fence = 6 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2408,7 +2408,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-02"
-source = { file = "doc/zh/reference/routing.md", fence = 7 }
+source = { file = "doc/zh/reference/routing.md", fence = 8 }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -2432,7 +2432,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-marks"
-source = { file = "doc/zh/reference/routing.md", fence = 6 }
+source = { file = "doc/zh/reference/routing.md", fence = 7 }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -2653,3 +2653,51 @@ honk = "accept"
 honk_diagnostics = ["unknown-key", "unknown-key", "legacy-quoted-list", "legacy-quoted-list", "invalid-node-entry", "invalid-node-entry", "invalid-config-value", "invalid-node-entry", "unknown-key", "legacy-config-warning"]
 compare = "equal"
 unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-routing-user"
+source = { file = "doc/en/reference/routing.md", fence = 5 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk documents its `user()` predicate alongside the shared grammar; dae parses the matcher generically, so the dialect agrees structurally."
+
+[[case]]
+id = "honk-doc-zh-reference-routing-user"
+source = { file = "doc/zh/reference/routing.md", fence = 5 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk documents its `user()` predicate alongside the shared grammar; dae parses the matcher generically, so the dialect agrees structurally."
+
+[[case]]
+id = "honk-doc-en-configuration-inbound"
+source = { file = "doc/en/configuration.md", fence = 6 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+unknown_sections = 0
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "inbound" }, reason = "The inbound section is honk-only dialect: honk parses it into a typed (empty-item) section, while the pinned dae parser keeps the whole block as one unknown root section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "dae does not know the honk-only inbound root block and keeps it; honk recognises it, so honk counts no unknown root." }]
+reason = "honk accepts its documented dialect; the pinned dae parser keeps the honk-only inbound block as an unknown root section."
+
+[[case]]
+id = "honk-doc-zh-configuration-inbound"
+source = { file = "doc/zh/configuration.md", fence = 6 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+unknown_sections = 0
+differences = [{ path = "sections[0]", dae = { absent = true }, honk = { items = [], name = "inbound" }, reason = "The inbound section is honk-only dialect: honk parses it into a typed (empty-item) section, while the pinned dae parser keeps the whole block as one unknown root section." }, { path = "unknown_sections", dae = 1, honk = 0, reason = "dae does not know the honk-only inbound root block and keeps it; honk recognises it, so honk counts no unknown root." }]
+reason = "honk accepts its documented dialect; the pinned dae parser keeps the honk-only inbound block as an unknown root section."

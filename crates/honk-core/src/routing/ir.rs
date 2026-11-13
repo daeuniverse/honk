@@ -29,6 +29,11 @@ pub enum CompiledPredicate {
     Dscp(Vec<u8>),
     ProcessName(Vec<String>),
     Mac(Vec<[u8; 6]>),
+    /// SOCKS5 inbound usernames this rule matches (mihomo `in-user` analog).
+    /// Inbound-authenticated flows only: transparently intercepted traffic
+    /// never carries a user, so the native compiler folds this predicate
+    /// false (and its negation true).
+    User(Vec<String>),
 }
 
 /// Immutable IP matcher retaining the source nets for compiler lowering and a trie for lookup.
