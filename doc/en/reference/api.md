@@ -59,13 +59,14 @@ Source administration requires a captured `.dae` startup. Writes additionally re
 | GET | `/api/v1/logs` | Sanitized structured-log SSE, separate from Clash logs and native events. |
 | GET, PATCH | `/api/v1/runtime/settings` | Read or atomically merge supported transient recorder settings. |
 | GET, PUT | `/api/v1/x-honk/runtime/mode` | Gated with `404 capability_not_supported` pending a complete failure contract. |
-| GET | `/api/v1/datapath` | Bounded backend-owned observations, not full flow transparency. |
+| GET | `/api/v1/datapath?detail=summary\|full` | Bounded backend-owned observations; default `summary`. |
 | GET | `/api/v1/events` | Bounded authenticated SSE invalidations with filter-bound resumable cursors. |
 | GET | `/api/v1/config`, `/api/v1/config/sources/{source_id}` | Authenticated accepted source metadata and content, with listener-secret values masked. |
 | POST | `/api/v1/config/validate` | Offline `syntax` or `full` candidate validation, without writing or activation. |
 | PUT | `/api/v1/config/sources/{source_id}` | Authorized whole-source replacement with RFC 9110 `If-Match`, then a real reload operation. |
 | POST | `/api/v1/config/sources` | Create one new `.dae` file that an include pattern loads, then a real reload operation. |
 | POST | `/api/v1/operations/reload` | Queue a reload from disk; accepts an empty body or JSON `{}`. |
+| POST | `/api/v1/operations/suspend`, `/api/v1/operations/resume` | Registered but unavailable; return `404 capability_not_supported`. |
 | GET | `/api/v1/operations/{id}` | Actual queued/running/succeeded/failed state and safe result/error for admitted operations. |
 
 ### Connection observations
@@ -79,6 +80,14 @@ Admitted anonymous loopback requests read the same connection data as bearer-aut
 | `limit` | 100 | 1–1000, shared by TCP and UDP |
 
 Full detail does not grant elevated permissions. The API rejects unknown parameters and repeated single-value parameters.
+
+`GET /connections?detail=full` returns this shape:
+
+```json
+{"observed_at":"2026-11-13T00:00:00Z","instance_id":"instance","visibility":"partial","truncated":false,"tcp":[{"id":"connection-id","flow_id":null,"pname":null,"state":"active","src":"192.0.2.1:50000","dst":"198.51.100.1:443","domain":null,"outbound":"proxy","chain":[],"chain_source":"unknown","rule_id":null,"rule_expression":null,"rule_source":"unknown","ingress":null,"domain_source":null,"started_at":null,"observed_by":"userspace","upload_bytes":"128","download_bytes":"256","upload_bytes_per_second":null,"download_bytes_per_second":null}],"udp":[],"total_tcp":1,"total_udp":0}
+```
+
+`total_tcp` and `total_udp` count matching rows before the limit. `src`, `dst` and `domain` appear only with `detail=full`. Byte counters are decimal strings.
 
 Filters apply before totals and the combined limit. Totals include all matching visible rows. Rows appear newest registered first, with lexical ID tie-breaking.
 
@@ -99,6 +108,16 @@ Bounded counts remain JSON numbers. `process.cpu_percent` is null until two usab
 `generation.activated_at` is when the active generation was published, or when the engine first ran for the startup generation. While a configuration activation is in progress, `generation.state` is `reloading`, and a running, healthy engine reports `lifecycle.state: reloading`. Configuration revision is available with accepted sources.
 
 `last_reload` reports completed API reload outcomes as described below.
+
+`GET /runtime` takes `detail=summary` (the default) or `full`. The response has `observed_at`, `instance_id`, `lifecycle`, `generation`, `datapath`, `traffic`, `process`, `last_reload` and `degradations`:
+
+| Field | Contents |
+| --- | --- |
+| `lifecycle` | `state`, UTC `started_at`, and `uptime_seconds` as a decimal string. `state` is `starting`, `running`, `reloading`, `degraded`, `draining` or `failed`. |
+| `generation` | `active_id`, nullable `config_revision`, `state` (`active` or `reloading`) and nullable `activated_at` |
+| `datapath` | `kind`, `state`, `visibility` and `ebpf`, as in [`GET /datapath`](#connection-closing-mode-and-datapath-lifecycle) summary |
+| `traffic` | `scope: "visible"`, `observed_by: "userspace"`, `counter_since`, `sampled_at`, `connections` (`tcp`, `udp`, `total`), `bytes` (`upload`, `download`) and `rates` (null, or `window_seconds` with `upload_bytes_per_second` and `download_bytes_per_second`). Before the first sample, `sampled_at`, counts, bytes and `rates` are null. |
+| `process` | `cpu_percent`; only `detail=full` adds `pid` |
 
 ### Runtime degradations
 
@@ -155,6 +174,8 @@ Attach warnings name the missing `family`. The listener warning carries `ipv4_un
 The exceptions cover only requests without credentials. Any request carrying credentials is authenticated, public or not. Invalid or duplicate credentials are rejected, not treated as anonymous. A token in the query string is always rejected. The existing secretless development mode requires explicit anonymous loopback authorization and rejects `Sec-Fetch-Site: cross-site`.
 
 Host and Origin checks apply before these authentication exceptions and also cover public static files. OPTIONS preflight requires a permitted Host, Origin, method and header set but no bearer. No cookie credentials or wildcard CORS is returned.
+
+Preflight permits only `Authorization`, `Last-Event-ID`, `Content-Type`, `If-Match`, `Idempotency-Key` and `Accept` headers. Successful preflight returns 204. An unsupported method returns 404, a disallowed header returns 403, and malformed preflight returns 400. Responses to an allowed Origin expose `Location`, `Retry-After` and `ETag`. A 401 response includes `WWW-Authenticate: Bearer`.
 
 ### HTTP errors and limits
 
@@ -221,6 +242,26 @@ Discovery returns `auth: {mode, setup_required, anonymous_loopback}`. `mode` is 
 `anonymous_loopback` is true only for the explicit development mode on an actual loopback bind. `links.auth_setup`, `links.auth_login` and `links.auth_logout` contain their endpoint paths in password mode and are null otherwise.
 
 A request without a credential that the listener does not admit gets only `name`, `api_major`, `links.auth_setup`, `links.auth_login`, `auth.mode` and `auth.setup_required`. Every other field is omitted. A request admitted by bearer, session or explicit anonymous loopback gets the full response.
+
+An admitted token-mode discovery response, with `links` shortened:
+
+```json
+{"name":"daeuniverse/native","status":"draft","api_major":1,"base_path":"/api/v1",
+ "links":{"version":"/api/v1/version","capabilities":"/api/v1/capabilities","runtime":"/api/v1/runtime","operations":"/api/v1/operations/{operation_id}","auth_login":null,"x-honk":{"config_export":"/api/v1/x-honk/config/export"}},
+ "auth":{"mode":"token","setup_required":false,"anonymous_loopback":false}}
+```
+
+`links` also names `config`, `config_validate`, `runtime_outbounds`, `traffic_history`, `memory_history`, `logs`, `providers`, `rules`, `geodata`, `auth_setup` and `auth_logout`, and `x-honk` also has `config_import` and `config_revisions`. The `auth_*` links are null in token mode.
+
+`GET /version` returns:
+
+```json
+{"api":{"name":"daeuniverse/native","major":1,"status":"draft"},"engine":{"name":"honk","version":"<build-version>"},"build":{"revision":null,"target":null,"built_at":null}}
+```
+
+`build.revision` and `build.target` are null when the build does not set them; `built_at` is always null.
+
+`GET /capabilities` returns `observed_at`, `profiles: ["base"]`, `limits` (`max_request_target_bytes` 4096, `max_header_bytes` 16384, `max_json_body_bytes` 65536) and `resources`, an object keyed by resource name with `x-honk` extensions. Check each resource's `available` flag and advertised fields before using it.
 
 In token mode, the three password endpoints are unavailable with `404 capability_not_supported`. Password-mode requests use the following contract:
 
@@ -340,7 +381,26 @@ Native extension fields retain source detail without inventing identities: route
 
 Score's `previous_leaf_node_id` is distinct from `previous_member_id`: leaf history cannot reconstruct a historical subgroup path.
 
+A flow page is `{instance_id,observed_at,coverage,dropped_records,flows,next_cursor}`. `dropped_records` is a decimal string and `next_cursor` is null on the last page. `coverage` reports `partial` or `none` for each of `userspace_tcp`, `userspace_udp`, `dns_intercept`, `kernel_direct`, `kernel_block` and `kernel_bypass`.
+
+`GET /flows/{flow_id}` returns one row with `input` and `trace`. List rows carry `input` only with `detail=full` and never carry `trace`:
+
+```json
+{"id":"flow-id","instance_id":"instance","revision":1,"network":"tcp","state":"observed","pname":null,"connection_id":null,"outbound":null,"chain":[],"chain_source":"unknown","rule_id":null,"rule_generation_id":null,"rule_expression":null,"rule_source":"unknown","ingress":null,"domain_source":null,"observed_by":"userspace","started_at":"2026-11-13T00:00:00Z","ended_at":null,"trace_status":"partial","input":{"src":"192.0.2.1:50000","dst":"198.51.100.1:443","domain":null,"domain_source":null,"pid":null,"process_path":null,"src_mac":null,"ingress":null,"domain_rule_ids":null,"dscp":null,"mark":null},"trace":{"status":"partial","missing":["not_instrumented"],"steps":[]}}
+```
+
+`trace.missing` reasons are `not_instrumented`, `started_late`, `buffer_overflow` and `redacted`. Each step has `seq`, `observed_at`, nullable `elapsed_us` and `generation_id`, `evidence`, `stage` and `data`. `stage` is `input`, `route`, `dns`, `datapath`, `dial_mode`, `reroute`, `outbound` or `connection`, and selects the fields of `data`.
+
 Flow list filters are `network`, `state`, `connection_id`, `detail`, `limit` and `cursor`. Eight bounded immutable snapshots live for at most 30 seconds. Cursors bind instance and original filters/detail.
+
+| Parameter | Default | Values |
+| --- | --- | --- |
+| `network` | `all` | `all`, `tcp`, `udp` |
+| `state` | `all` | `all`, `observed`, `routing`, `dialing`, `active`, `closed`, `blocked`, `failed`, `unknown` |
+| `detail` | `summary` | `summary`, `full` |
+| `limit` | 100 | 1–1000 |
+| `connection_id` | Absent | Nonempty string |
+| `cursor` | Absent | Nonempty opaque cursor |
 
 A recognised cursor sent with different filters, detail or limit returns `400 invalid_request`. A full snapshot table evicts the oldest snapshot. Exhausted retained-byte capacity returns `503 snapshot_unavailable` with Retry-After.
 
@@ -360,11 +420,25 @@ This pin does not identify a published frontend release.
 
 Node reads accept `group_id`, `limit` (1–1000) and `cursor`. Filtering is direct membership, not recursive leaves. Node pages freeze observations across up to eight snapshots, 30 seconds and 4 MiB.
 
+`limit` defaults to 100. The page is `{observed_at,nodes,next_cursor}` with no `total`; `next_cursor` is null on the last page. A node row has `id` (UUID), `name`, `protocol`, nullable `stream_transport` (XHTTP only), nullable `subscription_tag`, `provider_id`, `group_ids` (direct containing groups) and `health`. `provider_id` is the subscription ID, `"inline"` for a configured node, or null for `direct` and `block`.
+
 A page that cannot fit returns `503 snapshot_unavailable` with `Retry-After`. An unrecognised node cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
 Groups return a summary array. Detail carries `config_revision` but no `ETag`, and `GET /groups/{groupId}/config` returns `{policy, config}` with that revision as a quoted `ETag`. Group IDs are random process-lifetime identities: same-name reload/reorder retains them, removal/readdition creates new IDs, and restart requires rediscovery.
 
 They are not positional config UUIDs or name hashes.
+
+| Group view | Fields |
+| --- | --- |
+| List row | `id`, `name`, nullable `icon`, `config_revision`, `policy` (`kind`, `native`), `member_count`, `selection` (`tcp_member_id`, `udp_member_id`, each nullable) |
+| Detail | `id`, `name`, `icon`, `config_revision`, `policy`, `members`, `config`, `runtime`, `capabilities` |
+| `members[]` | `id`, `name`, `kind` (`node` or `group`) |
+| `config` | `default_member_id`, `final_outbound`, `check_url`, `check_interval`, `tolerance`, `idle_timeout`, `interrupt_connections` |
+| `runtime` | `selection` (`tcp`, `udp`) and `health` |
+| Runtime selection | Null or `{member_id,resolved_leaf_node_id,source}`; `source` is `runtime`, `override`, `health` or `policy` |
+| `capabilities` | `can_select`, `can_override`, `supports_nested_groups`, `mutable_config`, `probe_transports` |
+
+`config.check_interval` is read-only: periodic checks use the global interval, and zero reads as null.
 
 These display values use the same listener-secret mask as source/flow displays:
 
@@ -379,6 +453,8 @@ Opaque IDs, revision hashes, membership and cursor bindings are unchanged.
 The existing masking threshold still applies: listener-secret values shorter than eight bytes are not masked; startup warns about them.
 
 Health rows are completed, qualified producer observations rather than optimistic alive flags, copied IPv4/IPv6 ranking signals, synthetic failures or restored delays. Raw TCP, HTTP response headers, DNS exchanges and QUIC handshakes retain actual destination family and completion time.
+
+A health row has `transport` (`tcp`, `udp`), `purpose` (`data`, `dns`), `ip_version` (`ipv4`, `ipv6`), `warmth` (`cold`, `warm`, `unknown`), `measurement` (`tcp_connect`, `http_headers`, `dns_round_trip`, `quic_handshake`, `mixed`), `sample_source: "probe"`, `state` (`healthy`, `unavailable`), nullable `latency_ms`, `moving_avg_ms` and `avg10_ms`, `observed_at` and nullable `error`. Group rows add `member_id`, `resolved_leaf_node_id`, and null `sorting_latency_ms` and `ranking`.
 
 Node rows carry two averages per measurement key. Only successful native probes update them; restart clears them.
 
@@ -407,6 +483,10 @@ Writes serialize with manager replacement, update existing persistence/warm cons
 
 `DELETE /groups/{groupId}/selection?network=` clears the pin for `tcp`, `udp` or `both` (the default) and returns `GroupOverrideCleared` with the selection per network. A network without a pin keeps its selection, and a Selector returns `409 state_conflict`.
 
+`member_id` must be 1–256 bytes. PUT returns `{group_id,member_id,network,source,selection_revision,connections_interrupted}`. DELETE returns `{group_id,network,selection_revision,connections_interrupted,selection}`, where `selection` holds `tcp` and `udp` in the runtime selection shape above. `selection_revision` is separate from the configuration revision.
+
+Selection errors are `404 resource_not_found` for an unknown group or member, `422 unsupported_value` for an unsupported member or action, `409 state_conflict` for a conflicting state such as clearing a Selector, and `503 temporarily_unavailable` when the transition cannot be confirmed.
+
 #### Group configuration patch
 
 `PATCH /groups/{groupId}/config` requires:
@@ -423,11 +503,11 @@ Operation members other than `op`, `path`, `from` and `value` are ignored. Body 
 
 | Path | Accepted value |
 | --- | --- |
-| `/policy` | A matching pair, such as `{"kind":"selector","native":"selector"}` |
+| `/policy` | Object containing only equal string `kind` and `native` values: `selector`, `urltest`, `loadbalance`, `fallback` or `score` |
 | `/config/default_member_id` | Direct-member ID |
 | `/config/final_outbound` | Configured outbound name |
-| `/config/tolerance` | Nonnegative safe integer or null; only URLTest accepts non-null values |
-| `/config/idle_timeout` | Nonnegative safe integer or null |
+| `/config/tolerance` | Nonnegative safe integer milliseconds or null; only URLTest accepts non-null values |
+| `/config/idle_timeout` | Nonnegative safe integer seconds or null (1800 seconds) |
 | `/config/interrupt_connections` | Boolean or null |
 | `/config/check_url` | Null or a URL meeting the requirements below |
 
@@ -466,6 +546,17 @@ Icons, names, filters and membership are not PATCH fields. Edit their authorized
 
 When bearer authentication is required, use streaming fetch with Bearer and `Accept: text/event-stream`. Browser EventSource cannot supply an Authorization header. Optional `kinds` and `flow_id` filters bind the resume cursor.
 
+`kinds` is a comma-separated list of the names in capabilities `events.kinds`, without duplicates; omitted, it selects all of them. `stream.ready` opens every stream whatever the filter. `flow_id` must be 1–256 bytes without control characters. Invalid filters return `400 invalid_request`.
+
+To resume, send the last received event `id` as `Last-Event-ID`:
+
+```http
+GET /api/v1/events?kinds=flow.updated,flow.gap&flow_id=flow-id HTTP/1.1
+Authorization: Bearer <secret>
+Accept: text/event-stream
+Last-Event-ID: <previous-opaque-cursor>
+```
+
 The store retains 512 events for at most 60 seconds, with 16 clients and 64 queued live events per client. A full client queue disconnects rather than silently skipping. A new stream while all 16 client slots are taken returns `503 temporarily_unavailable` with `Retry-After`.
 
 Heartbeat comments arrive every 15 seconds. Every stream sends ready first. On a valid resume, ready keeps the supplied cursor, retained replay then advances it, and live events follow without an attachment gap.
@@ -484,6 +575,16 @@ Published events are `stream.ready`, `runtime.updated`, `flow.updated`, `flow.ga
 
 Events contain bounded safe IDs/state, not packet bodies or raw configuration. Flow/event retention is memory-only, not a durable log.
 
+Every event's JSON data contains `instance_id` and UTC `observed_at`:
+
+| Event | Additional data fields |
+| --- | --- |
+| `runtime.updated` | `href` |
+| `flow.updated` | `resource_id`, safe integer `revision`, `href` |
+| `flow.gap` | Nullable `resource_id`, `reason` (`buffer_overflow`, `evicted` or `recording_changed`), nullable decimal-string `dropped_records` |
+| `operation.updated` | `resource_id`, `status` (`queued`, `running`, `succeeded` or `failed`), `href` |
+| `generation.changed` | `previous_generation_id`, `generation_id` |
+
 `flow.updated` is an invalidation hint: fetch its `href` for the latest retained revision. Each live client queue keeps only the newest pending hint for a given flow, appended at its new sequence position. Revisions may jump, but delivered cursors remain ordered.
 
 Publication is immediate, including terminal updates, with no batching timer. While event capture is active, the replay ring records every published notification, and replay is not coalesced. Other event kinds and logs are never coalesced.
@@ -500,6 +601,12 @@ Reattachment starts a fresh boundary.
 
 `runtime/outbounds` retains `kind` (`builtin`, `node` or `group`) alongside `name`: names can collide across kinds, so do not key rows by name alone. Cumulative connections, bytes and errors are full 64-bit decimal strings. Active connections are safe JSON integers.
 
+`GET /runtime/outbounds` returns `{observed_at,counter_since,outbounds}`. Each row has `name`, `kind`, numeric `active_connections`, and decimal-string `total_connections`, `upload_bytes`, `download_bytes` and `errors`.
+
+`GET /runtime/memory` returns `observed_at`, `process` (`rss_bytes`), `cgroup` and `kernel`. `cgroup` is null or has `scope`, `current_bytes`, `limit_bytes` and `events` (`high`, `oom`, `oom_kill`). All byte and event values are decimal strings or null.
+
+Both history routes return `{observed_at,window_seconds,sampled_every_seconds,samples}`. Traffic samples have `sampled_at`, `upload_bytes_per_second`, `download_bytes_per_second` and nullable numeric `connections`. Memory samples have `sampled_at`, `rss_bytes`, `cgroup_current_bytes` and `kernel_ebpf_bytes`. Other sample values are decimal strings or null.
+
 Counters share the engine's existing statistics lifetime and survive reload, rather than resetting with a dashboard or listener request.
 
 Traffic and memory histories use the existing one-second sampler with missed ticks skipped, not a task per client. Each enabled ring retains at most 600 points for 600 seconds, even with no clients. Restart clears it.
@@ -514,13 +621,15 @@ RSS comes from `/proc/self/status`. Cgroup-v2 membership and mount discovery sel
 
 An unlimited `memory.max` also has a null limit. Cgroup scope is `unknown`. Process and cgroup usage overlap and must not be added together.
 
-Capabilities list observed metrics, read once at startup before the first sample. `kernel` is null and kernel-memory accounting is not advertised.
+`runtime_memory.metrics` in capabilities lists the metrics read so far: it starts with those readable at startup, and later samples add names without removing any. `kernel` is null and kernel-memory accounting is not advertised.
 
 ### Accepted configuration and reload operations
 
 The source manager requires a genuine `.dae` startup captured by the file loader. Programmatic configs and compatibility serde loaders do not provide lossless sources. Their configuration/validation/reload capabilities remain unavailable.
 
 GET describes the accepted snapshot, not a fresh disk scan: opaque source IDs, exact-byte SHA-256 hashes, main/include kinds, write permissions and safe diagnostics. Source `path` and rule `file` retain canonical entry-directory-relative names, such as `config.d/routing.dae`. Source `absolute_path` additionally exposes the canonical absolute path.
+
+`GET /config` returns `{generation_id,revision,sources,diagnostics,secrets_redacted,x-honk:{store}}`. Each source has `id`, `path`, `kind` (`main` or `include`), `content_sha256`, `content`, `bytes`, `line_count`, `writable` and `loaded_at`. A read-only source adds `read_only_reason`; file mode adds `absolute_path`. `GET /config/sources/{source_id}` returns one source object without `writable`, `read_only_reason` and `loaded_at`.
 
 Source hashes, configuration revision and runtime generation are distinct: accepting comments-only changes advances revision without requiring a new runtime generation. Effective group membership changes revision, but health observations do not.
 Reloads refresh any previously captured dependency fingerprints; unchanged sources and fingerprints retain their configuration revision.
@@ -585,6 +694,10 @@ The warning includes the source ID and the path masked as in the listing. A secr
 
 Validation takes JSON `{"mode":"syntax","sources":[{"id":"candidate","content":"..."}]}`. Each source may also carry `path`. Syntax mode parses only submitted documents: IDs/paths are diagnostic labels, not filesystem authority.
 
+Omitted `sources[].id` defaults to `source-1`, `source-2` and so on. IDs are 1–128 bytes of ASCII letters, digits, `-`, `_` or `.`, unique within the request; they only label diagnostics. Supplied paths must be nonempty and unique. Invalid IDs or paths, or an empty `sources` array, return 400; more than 32 sources return 413; an unknown `mode` returns 422.
+
+A native diagnostic is `{level,source_id,line,column,span,code,message}`. `level` is `error`, `warning` or `info`. `line` and byte `column` are null when the diagnostic cannot be placed exactly in a source. `span` is null.
+
 Full mode overlays the first document on the configured entry file, resolves additional `.dae` paths within its authorized entry root, and checks real local dependencies. These are cached subscriptions, geodata, hosts and ECH material. A never-fetched subscription is admitted with a warning and no cached nodes. Existing same-fetch active nodes can still be rebased.
 
 Other missing or invalid dependencies are errors. A full-mode first `path` other than the entry file, a non-`.dae` path, or a path outside the entry root returns `400 invalid_request`. Validation never fetches dependencies, creates/chmods cache directories, starts workers or publishes a generation.
@@ -645,7 +758,25 @@ Every failed creation reports `written` (`true` once the file is created) and `c
 
 For PUT, HTTP 202 is sent only after durable replacement and real reload queue admission. `Location` matches the returned operation `href`, with `Retry-After: 1`.  202 is not activation success. The daemon owns the admitted work across HTTP disconnects.
 
+Admission returns `{operation_id,kind,status,href}`. Polling `href` returns:
+
+```json
+{"operation_id":"operation-id","kind":"reload","status":"queued","created_at":"2026-11-13T00:00:00Z","started_at":null,"finished_at":null,"result":null,"error":null}
+```
+
+`status` is `queued`, `running`, `succeeded` or `failed`; while it is not terminal, the response carries `Retry-After: 1`. `result` and `error` stay null until the operation finishes.
+
+| `kind` | Successful `result` |
+| --- | --- |
+| `reload` | `{active_generation_id,datapath_generation_id}`; each ID can be null |
+| `probe` | Probe result described under bounded probes |
+| `provider_refresh` | Provider representation described below |
+| `group_update` | `{group_id,config_revision}` |
+| `geodata_update` | GeoData representation described below |
+
 An optional `Idempotency-Key` binds principal, method, path and daemon instance plus the exact body bytes. Concurrent or later same-key/same-body requests share the original admission/operation, without another write, hash check or reload—even when retrying with the old hash after losing the first 202. A different body under that key is 409.
+
+A repeated, empty or non-text `Idempotency-Key` returns `400 invalid_request`.
 
 At most 32 reservations/operations are retained. Terminal operations remain for up to 300 seconds. When the store is full, a new admission evicts the oldest terminal operation, whose ID then returns 404.
 
@@ -733,12 +864,19 @@ To recover from a damaged database:
 
 `POST /probes` requires JSON, for example `{"target":{"type":"node","node_id":"<id>"},"kind":"http","transport":["tcp"],"ip_version":"ipv4","warmth":"cold"}`.
 
+`target`, `kind`, `transport`, `ip_version` and `warmth` are required. `members` is optional but cannot be null; a member-ID list rejects empty or duplicate IDs, and a node target rejects `members`. A DNS probe over both transports:
+
+```json
+{"target":{"type":"group","group_id":"<id>"},"kind":"dns","transport":["tcp","udp"],"ip_version":"ipv4","warmth":"cold","members":"direct"}
+```
+
 | Field | Values |
 | --- | --- |
 | Node target | `{"type":"node","node_id":"<id>"}`; rejects `members` |
 | Group target | `{"type":"group","group_id":"<id>"}` |
 | Group `members` | `"direct"` (default), `"leaves"`, or a nonempty list of direct-member IDs |
 | `kind` | `tcp_connect` and `http`: data probes over TCP only. `dns`: DNS probes over TCP, UDP or both. |
+| `transport` | `["tcp"]`, `["udp"]` or `["tcp","udp"]`; only `dns` accepts UDP |
 | `ip_version` | `ipv4`, `ipv6`, `any` |
 | `warmth` | `cold`, `warm` |
 
@@ -758,6 +896,8 @@ Target hosts resolve through the running DNS configuration; when it cannot answe
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
+`tcp_connect` on a `direct` or `block` node, and a UDP probe of a node without UDP, return `422 unsupported_value` before measuring.
+
 | Probe budget | Limit |
 | --- | --- |
 | Member associations per job | 64 |
@@ -773,7 +913,17 @@ Final transport-owner cleanup remains joined after the deadline, so total operat
 
 Admission returns 202 with a `queued` operation at once, even while four jobs are active. A job that ends before measurement fails with `probe_cancelled`, `probe_deadline`, `unsupported_value` (local resolution is refused, or the node cannot carry UDP to the probe port) or `engine_unavailable`. Optional `Idempotency-Key` replays retained admission.
 
+Repeating an optional `Idempotency-Key` replays the retained probe admission.
+
 Results preserve member-to-leaf associations even when execution is deduplicated, actual measurement/family/warmth, and whether current-generation health accepted the result. Raw TCP latency is not HTTP ranking evidence. Cancelled, unavailable and obsolete work does not become a fake unhealthy sample.
+
+A successful probe operation's `result` has this shape:
+
+```json
+{"target":{"type":"group","group_id":"group-id"},"selection_changed":{"tcp":false,"udp":false},"selection_before":{"tcp":"member-id","udp":null},"selection_after":{"tcp":"member-id","udp":null},"results":[{"member_id":"member-id","resolved_leaf_node_id":"node-id","kind":"dns","purpose":"dns","transport":"udp","ip_version":"ipv4","warmth":"cold","state":"healthy","latency_ms":12.5,"health_updated":true,"error":null,"observed_at":"2026-11-13T00:00:00Z"}]}
+```
+
+`latency_ms`, `resolved_leaf_node_id` and `error` can be null. `health_updated` reports whether the sample was applied to health.
 
 Selection observations do not advance policy state. If final cleanup fails, the operation fails with `probe_cleanup_failed`: `result` stays null and the completed measurements are in `error.details`.
 
@@ -785,15 +935,19 @@ The target group still has the 64-member and 256-row limits. To probe larger gro
 
 `POST /dns/query` requires a strict JSON body with `Content-Type: application/json`; other media types return 415.
 
+The body is limited to 4096 bytes; a larger body returns `413 request_too_large`.
+
 | Field | Location | Requirement or default |
 | --- | --- | --- |
 | `domain` | Body | Required |
-| `type` | Body | Optional array of up to eight distinct record types; default `["A"]`. More types return `413 request_too_large`. |
-| `cache_mode` | Body | `normal` or `bypass` |
+| `type` | Body | Optional nonempty array of up to eight distinct record types; default `["A"]`. More types return `413 request_too_large`. |
+| `cache_mode` | Body | `normal` (default) or `bypass` |
 | `upstream` | Body | Configured upstream name, including an otherwise unreferenced upstream |
-| `detail` | Query string | `summary` or `full` |
+| `detail` | Query string | `summary` (default) or `full` |
 
 Supported types are A, AAAA, NS, CNAME, SOA, PTR, MX, TXT, SRV, SVCB, HTTPS and CAA.
+
+A type is an uppercase name, a decimal number, or `TYPE` plus a number, so `"A"`, `"1"` and `"TYPE1"` are the same. Type names are case-sensitive. Invalid or duplicate types return 400; a valid type outside the twelve above returns 422. Cache and log `type` filters accept any valid type.
 
 All types share one generation and a ten-second deadline. The rate ceiling is 30 requests/minute for the sole principal and globally.
 
@@ -806,13 +960,26 @@ A forced upstream replaces request-stage routing, not hosts/strategy precedence 
 - Supersede entries or start refresh work.
 
 Full detail projects validated answer records. Per-type timeouts, refusals and errors remain actual outcomes.
+
+A `detail=full` response; summary omits `answers`:
+
+```json
+{"domain":"example.com.","cache_mode":"normal","query_time":"2026-11-13T00:00:00Z","results":[{"type":"A","question":{"name":"example.com.","type":"A","class":"IN"},"elapsed_ms":12,"cached":false,"cache_entry_id":null,"upstream":"dns1","route":{"source":"default","rule":null},"status":"NOERROR","answers":[{"name":"example.com.","type":"A","class":"IN","ttl":60,"data":"192.0.2.1"}]}]}
+```
+
+`route.source` is `default`, `dns.routing` or `forced`, and `route.rule` is nullable. `upstream` is null for cached results. `status` is the response code, or `TIMEOUT`, `REFUSED` or `ERROR` for a failed type.
+
 DNS query/cache responses and DNS log pages mask listener-secret display values without changing opaque IDs or cursor bindings.
 
 Literal `.` names the DNS root and works for live queries, exact cache listing and name-based deletion. Ordinary input names are case-insensitive with an optional trailing dot. Presented names retain their canonical trailing dot.
 
+A name, without its optional trailing dot, is 1–253 bytes of labels of 1–63 ASCII letters, digits, `-` or `_`. Live queries, cache `name` and routing-trace `domain` use this rule.
+
 Valid root wire questions also use the ordinary strict DNS path. Non-UTF-8 labels remain outside that consumer contract.
 
 `GET /dns/cache` accepts `name`, `domain`, repeated `type`, `include_expired=false|true`, `detail`, `limit` (1–1000, default 100) and `cursor`. Reads neither promote LRU nor count hits. Up to eight immutable filter/instance-bound snapshots live for 30 seconds within an aggregate 8 MiB wire/metadata budget.
+
+`name` matches one exact name; `domain` matches a case-insensitive substring. The page is `{observed_at,coverage,entries,total,next_cursor,usage}`, where `total` counts matching entries. An entry is `{entry_id,domain,type,class,status,expires_at,stale_until}` with nullable `stale_until`; `detail=full` adds `answers`.
 
 Exhausted capacity returns `503 snapshot_unavailable` rather than clipping. An unrecognised cache cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
@@ -836,6 +1003,8 @@ An explicit runtime `record_dns_log: "on"` keeps recording enabled without clien
 
 Eviction removes whole oldest records. Pages are newest first with `name`, `type`, `src`, `limit` (1–500, default 100) and filter-bound `cursor`. Eviction or shrink invalidates affected cursors.
 
+`name` matches a case-insensitive substring; `src` is an IP address without a port. The page is `{observed_at,total,next_cursor,records}`, where `total` counts all retained records, not matches. A record has `id`, `observed_at`, nullable client `src` (address and port), `question`, `status`, `cached`, nullable `upstream`, `route`, `elapsed_ms` and `answers`, shaped as in DNS query results.
+
 An unrecognised log cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`. Query/cache/log JSON responses are capped at 262144 bytes.
 
 A cache or log page ends before the first entry that would exceed the cap and returns `next_cursor`. Thus `limit` is a maximum, not a promised count.
@@ -848,7 +1017,7 @@ A query response over the cap returns 503 with `Retry-After`, never a silently c
 
 Admitted anonymous loopback requests have the same rule reads and routing simulation as bearer-authenticated requests. `POST /routing/trace` takes `{"input":{"network":"tcp","domain":"example.com","dst_port":443},"resolve":"none"}`. Input requires TCP/UDP, a nonzero destination port and at least one of `domain`/`dst_ip`.
 
-Optional source IP/port, `pname`, DSCP (0–63) and `mark` are accepted. It evaluates immutable current policy with three-valued conditions. Missing evidence remains unknown.
+Other input fields are optional: `dst_ip`, `src_ip`, `src_port` (1–65535), `pname`, `dscp` (0–63) and `mark` (32-bit, accepted but not evaluated). Unknown fields return 400. Missing evidence remains unknown.
 
 It does not resolve DNS, dial, probe or mutate group selection. `resolve` defaults to `none`. `live` requires a domain and no `dst_ip`.
 
@@ -857,6 +1026,10 @@ Violating that shape returns 400, while a well-shaped live request returns 422 b
 Limits are one address, 256 rule/condition steps, five seconds and 30 requests/minute for the sole principal and globally.
 
 The response is a `simulation` pinned to one `instance_id` and `generation_id`, not historical flow evidence. `/rules` returns the complete dictionary including fallback, never truncated. `max_rules` is 4096 or the running dictionary size if larger, and `dns_rules.max_rules` likewise covers the larger DNS list.
+
+`GET /rules` returns `{generation_id,rules,fallback}`. A rule has `rule_id`, `index`, `expression`, `outbound`, `must`, nullable `source` and `kind`; `fallback` is `{outbound,source}`.
+
+A trace is `{mode,instance_id,generation_id,observed_at,evaluations,dns}`. Each evaluation has nullable `dst_ip`, `decision`, nullable `outbound`, `missing_inputs` and `rules`. A rule evaluation is `{rule_id,expression,result,missing_inputs,conditions}` and a condition `{id,expression,result,missing_inputs}`; `result` is `matched`, `not_matched`, `indeterminate` or `skipped`.
 
 The fallback entry's `expression` is its source statement, such as `fallback: proxy`, or `fallback: <outbound>` when none is retained. Trace evaluations use `fallback: <outbound>`. If either read cannot pin the router within its deadline, it returns `503 snapshot_unavailable` with `Retry-After`.
 
@@ -903,6 +1076,8 @@ A read that cannot pin the running configuration within five seconds returns `50
 
 Admitted anonymous loopback requests read the same provider data as bearer-authenticated requests. Provider GETs do no networking. List accepts `limit` (1–1000, default 100) and `cursor`, with eight 30-second snapshots and 4 MiB aggregate retention.
 
+A page is `{providers,next_cursor}`. A provider has `id`, `name`, `kind` (`inline` or `subscription`), nullable `url_redacted`, `updated_at` and `expires_at`, `node_count`, `status` (`ok`, `stale` or `error`), `traffic` (null or `{upload_bytes,download_bytes,total_bytes}` as decimal strings), `last_error` (null or `{code,message,details}`) and `download` (the route object below, or null).
+
 A list that cannot fit returns `503 snapshot_unavailable` with `Retry-After`. An unrecognised provider cursor returns `410 snapshot_expired`. A recognised cursor sent with different filters or a different `limit` returns `400 invalid_request`.
 
 IDs join accepted `Node.provider_id`. Subscriptions return their configured names and full URLs in `url_redacted`. The field name remains for compatibility.
@@ -920,7 +1095,7 @@ Subscription rows carry `download`, derived from `download_detour` and shaped li
 | `route` | `routing`, `direct` or `group` |
 | `group_id` | The group's `GET /groups` ID; null for other routes or a group that no longer exists |
 
-File and inline rows report null for `download`.
+Inline rows report `download: null`. There is no file-provider kind.
 
 A failed fetch reports `last_error.code` `fetch_failed`, or `route_unavailable` when the subscription's download route has no usable node yet. See the [subscription reference](./subscription.md#fetch-persistence-and-recovery). For classified `fetch_failed` errors, `details` gives the failing `stage` (such as `connection_failed`, `download_timeout`, `tls_failed` or `parse_failed`), the selected `node`, and its selecting group's `group_id`. Unclassified failures, such as invalid URLs or redirects, have `details: null`. `node` is null for direct downloads, failures before node selection, and parse failures whose download attribution is unavailable. `group_id` is null when attribution has no group or that group no longer exists in the catalog. A publication that configuration validation rejects, such as a node that duplicates a static node, reports `publication_rejected` with the diagnostic in `details.diagnostic_code` (for example `duplicate-node-id`).
 
@@ -983,6 +1158,8 @@ Committed degradation reports committed true with `active_generation_id` set, nu
 Admitted anonymous loopback requests read the same geodata as bearer-authenticated requests. Geodata GET joins retained traffic/DNS metadata under the existing router-before-config publication order. It never scans disk or downloads.
 
 Hash and size describe loaded bytes, not later disk edits. Unrecorded or differing modification times are null.
+
+`GET /geodata` returns `{observed_at,assets}`. An asset is `{kind,sha256,size_bytes,modified_at,source_redacted}`: `kind` is `geosite` or `geoip`, `size_bytes` is a decimal string, and `modified_at` and `source_redacted` are nullable. With an initialized geodata owner, each asset adds `fetched_url_redacted`, `verified` and `download_route`, and the response adds the update-status fields described below.
 
 `source_redacted` keeps its compatibility field name. GET and successful operation results show the first download URL with these protections:
 
@@ -1056,6 +1233,16 @@ See the [assets reference](./assets.md).
 `PATCH /runtime/settings` merges `geodata` and stores it without downloading. A `urls` list has 1–4 distinct HTTP(S) URLs of at most 4096 bytes, without userinfo or fragment, and replaces the whole list in fallback order. Patching one asset stores only that list, so `source` becomes `override`, whatever it was, and the other asset keeps following the file or the built-in URLs.
 
 `auto_update` is stored on its own. `interval_hours` (6 to 168) switches to an interval schedule and `cron` to a cron schedule; both in one patch return 400, and `enabled` alone keeps the current schedule. A cron schedule reads `interval_hours: 24` and its expression as `cron`; an interval reads `cron: null`. `assets.geodata.auto_update` and `cron` seed it ([assets reference](./assets.md)). `download` is stored on its own. `group_id` is required for `group` and refused otherwise, and an id that is not a current group returns `409 state_conflict`.
+
+`PATCH /runtime/settings` bodies that replace only the geosite URL list, and that enable a cron schedule downloading through a group:
+
+```json
+{"geodata":{"geosite":{"urls":["https://example.net/geosite.dat"]}}}
+```
+
+```json
+{"geodata":{"auto_update":{"enabled":true,"cron":"0 3 * * *"},"download":{"route":"group","group_id":"<id-from-GET-groups>"}}}
+```
 
 Cron grammar and calendar parsing are zone-independent. Geodata owner startup and PATCH additionally reject an explicit cron with no future occurrence in the actual local zone, even with `enabled: false`. A retained schedule is checked when enabled: an unavailable one can still be disabled or repaired by PATCH, and a valid file override can repair an old stored plan at startup. Unavailable plans are not replaced with defaults.
 
@@ -1177,6 +1364,8 @@ Its live walk is read-only and skips controls, diagnostics and missing observed 
 
 `GET /logs` serves SSE to authenticated callers and admitted anonymous loopback callers, with optional minimum `level` and `target` prefix filter. Capture is a separate structured tracing layer, not formatted console/Clash text. Records contain actual `ts`, `level` and `target`.
 
+`GET /logs` takes `level` (lowercase `error`, `warn`, `info`, `debug` or `trace`; default `trace`) and `target` (a module-path prefix of 1–256 bytes). The filters select from captured records and do not raise the capture level. Each `log` event's data is `{ts,level,target,message,fields}` with nullable `fields`. A withheld message reads `[message withheld: not audited for native disclosure]`.
+
 Only audited static messages and bounded typed fields are disclosed. Unaudited messages are explicitly withheld and arbitrary Debug/error/config fields are not formatted into the native buffer. `record_logs` defaults true and permits capture while its independent `/logs` SSE demand is active, retaining up to 512 records for 60 seconds.
 
 The logs capability advertises these limits as `max_buffered_records` and `retention_seconds`, and lists `filters: [level, target]`. An explicit runtime `record_logs: "on"` keeps capture enabled without clients. Configuration false prohibits it until changed and restarted.
@@ -1244,6 +1433,23 @@ If the backend rejects the reset before commit, activation is rejected. After ro
 
 Map capacity may be known while occupancy remains null. Attached hooks alone do not establish active admission, and `full_transparency` is never advertised.
 
+`GET /datapath` returns `{observed_at,kind,state,visibility,ebpf,errors}`. `ebpf` is null unless `kind` is `ebpf`. `detail=full` adds `ebpf.attachments` and `ebpf.maps`; the default `summary` omits them.
+
+| Field | Values |
+| --- | --- |
+| `kind` | `ebpf`, `mock`, `unknown` |
+| `state` | `active`, `degraded`, `detached`, `disabled`, `unknown` |
+| `visibility` | `partial` for `ebpf`, otherwise `none` |
+| `ebpf` | `backend: "real"`, `programs`, `hooks`, `routing`, `health`, nullable `last_error`, `checked_at` |
+| `ebpf.programs` | `loaded`, `not_loaded`, `error`, `unknown` |
+| `ebpf.hooks` | `attached`, `detached`, `partially_attached`, `unknown` |
+| `ebpf.routing` | `state` (`published`, `not_published`, `error`, `unknown`), nullable `generation_id` of the form `<instance>:datapath:<n>`, null `epoch` |
+| `ebpf.health` | `healthy`, `degraded`, `unknown` |
+| `ebpf.attachments[]` | `name`, `kind: "interface"`, `interface`, `direction` (`ingress` or `egress`), `state` (`attached`, `detached`, `error`, `unknown`) |
+| `ebpf.maps` | `state` (`partial`, `error`, `unknown`) and `conn_state`: null or `{occupancy,capacity,occupancy_known}` |
+
+`errors[]` is `{code,message}` with `code` one of `program_observation_failed`, `hook_observation_incomplete`, `routing_observation_failed`, `admission_observation_failed`, `map_observation_failed` and `observation_limit_reached`.
+
 The optional [business-connection grace](./global.md#shutdown) does not permit detaching unfinished cleanup to claim success. Already-started blocking work is not cancelled by aborting an async wrapper: the StateTick maintenance owner warns after its nominal stop deadline and continues to join the actual SQLite work. Blocking credential KDF/database work and an already-started NSS lookup also retain their real join.
 
 These exceptions can extend total shutdown beyond nominal per-stage or HTTP grace deadlines. See [control-plane ownership](../design/control-plane.md#native-observation-api).
@@ -1262,9 +1468,13 @@ Authorization: Bearer <secret>
 
 A WebSocket upgrade may instead pass `?token=<percent-encoded-secret>`. Honk percent-decodes the token before exact comparison. Query-token authentication is limited to WebSocket upgrades.
 
+The header must be exactly `Bearer ` and the secret, with that case and one space. On a WebSocket upgrade a nonempty `token` is checked instead of the header, so a wrong token fails even with a correct header. Failure returns `401 {"message":"Unauthorized"}`.
+
 Ordinary HTTP requests use the Bearer header. An empty `secret` disables authentication. The `/ui` static tree is outside the API authentication layer.
 
 **The API has no TLS.** Bind it to localhost or place a TLS reverse proxy in front of it, and set a strong `secret` when untrusted clients can reach the listener.
+
+The Clash listener allows any CORS origin and has none of the native API's Host or Origin checks.
 
 The shipped `config.dae` binds to `127.0.0.1:9090`. A non-loopback controller with an empty `secret` emits a startup warning but is still allowed. This applies to wildcard and assigned addresses, regardless of firewall configuration.
 
@@ -1302,6 +1512,40 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 `/traffic`, `/memory`, and `/logs` send one JSON document per line for a plain HTTP GET. `/logs` installs dynamic tracing interest only while subscribers exist. With no subscribers, the Clash tracing layer does not format events.
 
 Each subscriber's level filter runs after the shared queue. Lagged clients skip overwritten events without a gap marker.
+
+`GET /` returns `{"hello":"clash"}`, or a 302 to `/ui/` when external UI is enabled and `Accept` does not contain `application/json`; `/ui` redirects with 301. `GET /version` returns:
+
+```json
+{"version":"honk <build-version>","premium":true,"meta":true}
+```
+
+`GET /configs` also returns fixed compatibility fields that configure nothing: `mode-list: ["Rule","Global","Direct"]`, `port`, `socks-port` and `mixed-port` of 0, `allow-lan` and `ipv6` false, `bind-address: "*"`, the configured `log-level`, and `tun: {"enable":false}`.
+
+`GET /proxies` returns `{"proxies":{"<name>":<document>}}`; `GET /proxies/{name}` returns one document. A node document has `name`, `type`, `udp: true` and `history`. A group document has `name`, `type`, member names in `all`, its TCP choice in `now` and `history`; Score adds `scoreVerification`. `GLOBAL` has `type: "selector"`, `all` and `now` but no `history`.
+
+Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`, `Tuic`, `Juicity`, `AnyTLS`, `Direct` or `Reject` (for `block`). Group `type` is `selector`, `url_test`, `load_balance` or `fallback`; Score reports `url_test`. A `history` entry is `{time,delay}` from the latest real TCP IPv4 measurement.
+
+`GET /rules` returns `{"rules":[{"type","payload","proxy"}]}`, built from the configured routing rules, without native rule IDs or a fallback row.
+
+`GET /connections` returns `{downloadTotal,uploadTotal,connections,memory}`. The totals sum the current rows, and `memory` is process RSS in bytes. A row is `{id,metadata,upload,download,start,chains,rule,rulePayload}`. `metadata` has `network`, `type`, `sourceIP`, `destinationIP`, `sourcePort` and `destinationPort` as strings, `host`, `dnsMode: "normal"`, `process` and `processPath`; unknown values are `""`.
+
+On a WebSocket, `?interval=` sets the push period in milliseconds (default 1000), rounded up to 100, 200, 500, 1000, 2000, 5000, 10000, 30000 or 60000 and capped at 60000.
+
+`DELETE /connections/{id}` returns 204 when the connection is closed or unknown, 409 when it cannot be closed, and 503 when closing fails. `DELETE /connections` returns 204, or 503 if any close failed. Neither has a body.
+
+`/traffic` frames are `{"up":<bytes>,"down":<bytes>}`, the bytes since the previous frame. `/memory` frames are `{"inuse":<rss-bytes>,"oslimit":0}`; `inuse` is 0 when RSS cannot be read.
+
+`/logs?level=` accepts `trace`, `debug`, `info`, `warn`, `warning` or `error` in any case; another value returns `400 {"message":"invalid log level"}`. Frames are `{"type":"<level>","payload":"<text>"}`.
+
+`GET /dns/query` takes `name` and `type` (`A`, `NS`, `CNAME`, `SOA`, `PTR`, `MX`, `TXT`, `AAAA`, `SRV`, `SVCB`, `HTTPS`, `CAA` in any case, or a number). A missing name or invalid type returns 400. The response is DoH JSON with numeric types:
+
+```json
+{"Status":0,"Question":[{"name":"example.com","type":1}],"Answer":[{"name":"example.com.","type":1,"TTL":60,"data":"192.0.2.1"}]}
+```
+
+A resolution failure returns 200 with `Status: 2` and an empty `Answer`.
+
+`GET /providers/proxies` returns `{"providers":{"<group>":{"name","type":"Proxy","vehicleType":"Compatible","updatedAt":null,"proxies":[...]}}}`, each proxy a node document.
 
 ### Diagnostics in `/configs`
 
@@ -1356,6 +1600,8 @@ Paths, raw input, credentials, and provider names or IDs are never exported.
 
 The caller selects the test URL with `?url=`. A group request fans out to at most `URLTEST_MAX_CONCURRENT` (10) proxied measurements at once.
 
+Both delay routes accept `timeout` in milliseconds; omitted or 0 means 15000. Example: `GET /proxies/edge/delay?url=https%3A%2F%2Fexample.com%2Fgenerate_204&timeout=5000`.
+
 Delay tests use the canonical HTTP check-target decoder:
 
 - HEAD preserves the raw path/query, including dot segments and query-only `/?query`.
@@ -1372,6 +1618,8 @@ Cold reusable generation probes use guarded temporary runtimes that close afterw
 
 Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results; arbitrary manual test targets do not advance real-dial failure streaks.
 
+`/proxies/{name}/delay` returns `{"delay":12}`; `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. On a URLTest group, either route can switch its selection using the new measurements.
+
 On-demand delay exchanges retain Alive/API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server/session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
 
 Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks, and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner. After the bounded peer-notification grace, Quinn drivers and then packet-adapter workers are stopped and joined.
@@ -1386,7 +1634,7 @@ No score cell or scorer-only target data is added to proxy documents. `/stats.sc
 
 ## Mode and selector mutations
 
-`PATCH /configs` accepts a JSON object such as:
+`PATCH /configs` reads the body as JSON whatever the `Content-Type`, and acts only on a string `mode`. A body without one returns 204 and changes nothing. Invalid JSON or an unknown mode returns 400, and a failed mode change returns 500 or 503. For example:
 
 ```json
 {"mode":"Global"}
