@@ -14,7 +14,9 @@
 mod admission;
 pub mod flow_observation;
 mod pooled;
+mod route;
 mod tasks;
+pub use route::{MAX_ROUTE_RUNTIMES, RouteRuntime};
 pub use tasks::TaskOwner;
 pub use tasks::TaskScope;
 pub(crate) use tasks::{
@@ -366,6 +368,17 @@ pub struct NodeRuntime {
     /// A proxy chain's hop runtimes from the same generation, entry first.
     /// Empty for every other node and for a chain outside any generation.
     chain_hops: Vec<Arc<NodeRuntime>>,
+}
+
+/// Run `future` outside any task owner, as a runtime without one does.
+pub(crate) fn scope_unowned<T, F>(future: F) -> impl Future<Output = anyhow::Result<T>>
+where
+    F: Future<Output = anyhow::Result<T>>,
+{
+    #[cfg(feature = "owned-tasks")]
+    return tasks::scope_owner(None, future);
+    #[cfg(not(feature = "owned-tasks"))]
+    future
 }
 
 impl NodeRuntime {
@@ -772,6 +785,9 @@ pub struct OutboundRuntimeRegistry {
     background_tasks: std::sync::LazyLock<Arc<tasks::TaskOwner>>,
     #[cfg(any(feature = "rprx", test))]
     vless_carrier_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Runtimes of the routes this generation dialed, over its own hop
+    /// runtimes. Every generation and DNS fork starts with none.
+    routes: route::RouteRuntimes,
 }
 
 /// Shared cell swapped atomically on reload (same pattern as
@@ -1003,6 +1019,7 @@ impl OutboundRuntimeRegistry {
                 }),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carrier_semaphore,
+                routes: route::RouteRuntimes::default(),
             },
             reused,
         ))
@@ -1044,6 +1061,16 @@ impl OutboundRuntimeRegistry {
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {
         self.nodes.get(id).map(Arc::clone)
+    }
+
+    /// The runtime that dials `route` over this generation's hop runtimes,
+    /// built on first use. `None` once the generation is shut down and when
+    /// any hop is not in it, so a route never dials part of its hops.
+    pub fn route_runtime(&self, route: &honk_config::route::Route) -> Option<Arc<RouteRuntime>> {
+        if self.is_shutdown() {
+            return None;
+        }
+        self.routes.get_or_build(route, &self.nodes)
     }
 
     /// Iterate every runtime of this generation (observability/gauges).

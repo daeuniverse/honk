@@ -27,9 +27,9 @@ mod registry;
 
 pub use direct::DirectMark;
 pub use error::{
-    FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection, TargetFailure,
-    TunnelUnsupported, is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class,
-    packet_rejection, target_failure, tunnel_unsupported,
+    ChainHopFailure, FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection,
+    TargetFailure, TunnelUnsupported, failed_hop, is_frame_interrupted, is_packet_rejection,
+    node_failure, packet_error_class, packet_rejection, target_failure, tunnel_unsupported,
 };
 pub(crate) use error::{
     io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
@@ -45,7 +45,7 @@ pub use packet::{
     MultiTargetTransport, PacketTransport, PreparedUdpTransport, QuicSendAttempt, QuicSendToken,
     UdpSocketTransport, packet_transport_with_owner,
 };
-pub use registry::{ProtocolEntry, ProxyRegistry};
+pub use registry::{DialRef, ProtocolEntry, ProxyRegistry};
 
 #[cfg(test)]
 use anytls::AnyTlsHandler;

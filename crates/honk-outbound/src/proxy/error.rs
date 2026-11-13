@@ -8,6 +8,18 @@ pub struct TargetFailure(#[source] pub anyhow::Error);
 #[error("{0}")]
 pub struct NodeFailure(#[source] pub anyhow::Error);
 
+/// A chain dial's failure at one hop, so its health can land on that hop's
+/// node rather than on the chain's exit.
+#[derive(Debug, thiserror::Error)]
+#[error("{error}")]
+pub struct ChainHopFailure {
+    /// Index of the failed hop in the chain's hops.
+    pub hop: usize,
+    pub node: uuid::Uuid,
+    #[source]
+    pub error: anyhow::Error,
+}
+
 /// A protocol or transport whose handshake cannot run over a stream tunneled
 /// through an earlier hop.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +75,11 @@ pub fn target_failure(error: &anyhow::Error) -> bool {
 
 pub(crate) fn io_target_failure(error: &std::io::Error) -> bool {
     find_cause::<TargetFailure>(error).is_some()
+}
+
+/// The chain hop that failed, through any error wrappers.
+pub fn failed_hop(error: &anyhow::Error) -> Option<&ChainHopFailure> {
+    find_cause::<ChainHopFailure>(error.as_ref())
 }
 
 /// Recover explicit carrier provenance without inferring it from error text.

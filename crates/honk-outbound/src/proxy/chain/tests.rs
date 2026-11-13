@@ -93,11 +93,18 @@ async fn an_earlier_hop_target_failure_is_a_chain_failure() {
     let relay = socks5_relay(Vec::new(), true).await;
     let front = socks5("front", "127.0.0.1", relay.addr.port());
     let land = shadowsocks("land", "127.0.0.1", 9);
+    let land_id = land.id;
     let error = dial_chain(&[chain(&[&front, &land]), front, land])
         .await
         .unwrap_err();
     assert!(!target_failure(&error), "{error:#}");
     assert!(node_failure(&error), "{error:#}");
+    // The front answered; the hop it could not reach is the one that failed.
+    assert_eq!(
+        crate::proxy::failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+        Some((1, land_id)),
+        "{error:#}"
+    );
 }
 
 #[tokio::test]
@@ -132,6 +139,119 @@ async fn a_chain_without_its_generation_refuses_to_dial() {
             .await
             .is_err()
     );
+}
+
+fn route(leaf: &Node, hops: &[&Node]) -> honk_config::route::Route {
+    let ids: Vec<_> = hops.iter().map(|hop| hop.id).collect();
+    let (exit, own) = ids.split_last().unwrap();
+    match honk_config::group_graph::compose(leaf.id, own, [*exit]) {
+        honk_config::group_graph::Composed::Routed(route) => route,
+        other => panic!("expected a route, got {other:?}"),
+    }
+}
+
+async fn dial_route(
+    generation: &Arc<OutboundRuntimeRegistry>,
+    route: &honk_config::route::Route,
+) -> anyhow::Result<ProxyStream> {
+    ProxyRegistry::default_resolver()
+        .unwrap()
+        .dial_ref(
+            Arc::clone(generation),
+            crate::proxy::DialRef::Route(route),
+            target(),
+            None,
+            Duration::from_secs(3),
+        )
+        .await
+}
+
+#[tokio::test]
+async fn a_route_dials_through_the_hop_runtimes_of_its_generation() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = shadowsocks_server().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", server.port());
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
+    let mut stream = dial_route(&generation, &route(&front, &[&front, &land]))
+        .await
+        .unwrap();
+    assert_legacy_bulk_echo(&mut stream.stream).await;
+    assert_eq!(relay.requests(), [server.to_string()]);
+}
+
+#[tokio::test]
+async fn a_route_with_a_missing_hop_fails_closed() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", 8388);
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(&front)).unwrap());
+    let error = dial_route(&generation, &route(&front, &[&front, &land]))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("route is not in runtime generation"),
+        "{error:#}"
+    );
+    generation.begin_retirement();
+    let full = Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
+    full.begin_retirement();
+    let error = dial_route(&full, &route(&front, &[&front, &land]))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("generation is shut down"),
+        "{error:#}"
+    );
+    assert!(relay.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_full_route_cache_still_dials_uncached() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = shadowsocks_server().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", server.port());
+    let generation =
+        Arc::new(OutboundRuntimeRegistry::build(&[front.clone(), land.clone()]).unwrap());
+    let mut leaf = front.clone();
+    for index in 0..crate::runtime::MAX_ROUTE_RUNTIMES {
+        leaf.id = uuid::Uuid::from_u128(index as u128 + 1);
+        generation
+            .route_runtime(&route(&leaf, &[&front, &land]))
+            .unwrap();
+    }
+    let mut stream = dial_route(&generation, &route(&front, &[&front, &land]))
+        .await
+        .unwrap();
+    assert_legacy_bulk_echo(&mut stream.stream).await;
+    assert_eq!(relay.requests(), [server.to_string()]);
+}
+
+/// A dialed route stream holds its hops' resources, not the route runtime,
+/// so it outlives a reload and the generation that cached the route.
+#[tokio::test]
+async fn a_route_flow_survives_reload_and_cache_drop() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = shadowsocks_server().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = shadowsocks("land", "127.0.0.1", server.port());
+    let nodes = [front.clone(), land.clone()];
+    let old = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
+    let route = route(&front, &[&front, &land]);
+    let mut stream = dial_route(&old, &route).await.unwrap();
+    let cached = Arc::downgrade(&old.route_runtime(&route).unwrap());
+    let (new, _) = OutboundRuntimeRegistry::build_reusing(&nodes, 8, Some(&old)).unwrap();
+    old.begin_retirement();
+    drop(old);
+    assert!(cached.upgrade().is_none());
+    assert_legacy_bulk_echo(&mut stream.stream).await;
+    let mut again = dial_route(&Arc::new(new), &route).await.unwrap();
+    assert_legacy_bulk_echo(&mut again.stream).await;
 }
 
 /// Records how the chain drives each hop and answers with a pass-through stream.
@@ -401,6 +521,30 @@ async fn packet_rejections_pass_through_the_chain_unchanged() {
             "{error:#}"
         );
         assert!(!node_failure(&error), "{error:#}");
+    }
+}
+
+#[tokio::test]
+async fn a_chain_failure_names_the_hop_that_failed() {
+    let failure: fn() -> anyhow::Error = || anyhow::anyhow!("handshake failed");
+    for (hop, front, land) in [(0, Some(failure), None), (1, None, Some(failure))] {
+        let fakes = Fakes::new(
+            FakeHop {
+                failure: front,
+                ..Default::default()
+            },
+            FakeHop {
+                failure: land,
+                ..Default::default()
+            },
+        );
+        let error = fakes.dial(Duration::from_secs(1)).await.unwrap_err();
+        let hops = fakes.generation.get(&fakes.via.id).unwrap();
+        assert_eq!(
+            crate::proxy::failed_hop(&error).map(|failure| (failure.hop, failure.node)),
+            Some((hop, hops.chain_hops()[hop].node.id)),
+            "{error:#}"
+        );
     }
 }
 

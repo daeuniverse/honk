@@ -10,10 +10,11 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{
-    NodeFailure, ProxyStream, TcpOutbound, TunnelDialOptions, is_packet_rejection, target_failure,
+    ChainHopFailure, NodeFailure, ProxyStream, TcpOutbound, TunnelDialOptions, is_packet_rejection,
+    target_failure,
 };
-use crate::runtime::NodeRuntime;
 use crate::runtime::flow_observation::without_target_milestones;
+use crate::runtime::{NodeRuntime, RouteRuntime};
 
 /// Dials a chain through the hop runtimes of its own generation, using the
 /// same handler instances the registry dispatches to.
@@ -59,7 +60,7 @@ impl ChainHandler {
             )),
         )
         .await
-        .map_err(|error| (0, earlier_hop_error(error)))?
+        .map_err(|error| earlier_hop_error(0, error))?
         .stream;
         for (index, hop) in rest.iter().enumerate() {
             let handler = self.handler(&hop.node).map_err(at(index + 1))?;
@@ -87,7 +88,7 @@ impl ChainHandler {
                 )),
             )
             .await
-            .map_err(|error| (index + 1, earlier_hop_error(error)))?
+            .map_err(|error| earlier_hop_error(index + 1, error))?
             .stream;
         }
         unreachable!("the last hop returns from the loop")
@@ -124,12 +125,16 @@ fn server_target(node: &Node) -> (SocketAddr, Option<&str>) {
 }
 
 /// An earlier hop's target is the next hop's server, so its target failure is
-/// a failure of the chain itself. Packet policy rejections keep their class.
-fn earlier_hop_error(error: anyhow::Error) -> anyhow::Error {
+/// a failure of the chain itself, and the failed hop is the next one: `hop`
+/// completed its own handshake and reported that it could not reach that
+/// server. Fronts that send no such reply (Shadowsocks, Trojan, VMess)
+/// surface the same outage as the next hop's handshake failure. Packet
+/// policy rejections keep their class and their hop.
+fn earlier_hop_error(hop: usize, error: anyhow::Error) -> (usize, anyhow::Error) {
     if is_packet_rejection(&error) || !target_failure(&error) {
-        return error;
+        return (hop, error);
     }
-    NodeFailure(anyhow::anyhow!("{error:#}")).into()
+    (hop + 1, NodeFailure(anyhow::anyhow!("{error:#}")).into())
 }
 
 fn reality_mask_certificate(error: &anyhow::Error) -> bool {
@@ -153,11 +158,6 @@ impl TcpOutbound for ChainHandler {
         )
     }
 
-    /// One deadline covers the whole chain, the caller's per-candidate bound;
-    /// each hop gets what remains of it, capped at `connect_timeout`. A REALITY
-    /// mask certificate on a tunneled hop redials the chain once without
-    /// hybrid key shares, as a direct REALITY dial retries once. The first hop
-    /// dials directly and has already had that retry, so its failure stands.
     async fn dial_runtime(
         &self,
         runtime: Arc<NodeRuntime>,
@@ -165,12 +165,53 @@ impl TcpOutbound for ChainHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream> {
-        let hops = runtime.chain_hops();
+        self.dial_chain(
+            &runtime.node.name,
+            runtime.chain_hops(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
+}
+
+impl ChainHandler {
+    /// Dial a route through group exits over its generation's hop runtimes.
+    pub async fn dial_route_tcp(
+        &self,
+        route: &RouteRuntime,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        self.dial_chain(
+            "group exit route",
+            route.hops(),
+            target,
+            target_domain,
+            connect_timeout,
+        )
+        .await
+    }
+
+    /// One deadline covers the whole chain, the caller's per-candidate bound;
+    /// each hop gets what remains of it, capped at `connect_timeout`. A REALITY
+    /// mask certificate on a tunneled hop redials the chain once without
+    /// hybrid key shares, as a direct REALITY dial retries once. The first hop
+    /// dials directly and has already had that retry, so its failure stands.
+    /// A failure names its hop through [`ChainHopFailure`]; the deadline
+    /// belongs to no hop.
+    async fn dial_chain(
+        &self,
+        label: &str,
+        hops: &[Arc<NodeRuntime>],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
         if hops.len() < 2 {
-            anyhow::bail!(
-                "chain node '{}' has no hops in this runtime",
-                runtime.node.name
-            );
+            anyhow::bail!("chain node '{label}' has no hops in this runtime");
         }
         let deadline = Instant::now() + connect_timeout * 3;
         let dial = async {
@@ -191,7 +232,14 @@ impl TcpOutbound for ChainHandler {
                 }
                 result => result,
             }
-            .map_err(|(_, error)| error)
+            .map_err(|(hop, error)| {
+                ChainHopFailure {
+                    hop,
+                    node: hops[hop].node.id,
+                    error,
+                }
+                .into()
+            })
         };
         tokio::time::timeout_at(deadline, dial).await.map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::TimedOut, "proxy chain setup timeout")
