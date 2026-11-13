@@ -21,8 +21,8 @@ honk-core [OPTIONS] [COMMAND]
 | `--disable-timestamp` | 关 | 控制台日志行不再带时间戳。在 systemd 或其他自带时间戳的日志系统下使用；`--log-file` 或 `global.log_file` 指定的文件仍带时间戳。 |
 | `-d`, `--debug` | 关 | 当 `RUST_LOG` 未提供有效过滤器时，选择 `debug` 作为默认控制台过滤器。 |
 | `--mock-ebpf` | 关 | 使用 `MockEbpfBackend`，不加载内核 eBPF。若配置请求 `global.nfqueue_enable: true`，honk 会记录警告并仅在本进程关闭 NFQUEUE 暂存。 |
-| `--store file\|db` | `file` | `db` 从 `<data-dir>/state/honk.db` 中的修订版本加载配置，数据库为空时导入 `-c`。见[配置数据库](./api.md#配置数据库--store-db)。 |
-| `--data-dir PATH` | `/var/lib/honk` | 数据目录，状态数据库位于其下的 `state/honk.db`，必须与 `global.data_dir` 相同。供 `--store db`、`config export` 与 `admin reset` 使用。 |
+| `--store file\|db` | `file` | `db` 从 `<data-dir>/state/honk.db` 中的修订版本加载配置，数据库为空时导入 `-c`，需要包含 `native-api` 的构建。见[配置数据库](./api.md#配置数据库--store-db)。 |
+| `--data-dir PATH` | `/var/lib/honk` | 数据目录，状态数据库位于其下的 `state/honk.db`。供 `--store db`、`config export` 与 `admin reset` 使用。使用 `--store db` 时必须与 `global.data_dir` 相同；文件模式启动忽略此选项。 |
 
 两个二进制都提供 `-h`/`--help` 和 `-v`/`--version`。
 
@@ -59,13 +59,13 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub 标签名
 | `reload` | 从已加锁的 `/run/honk-core.lock` 读取 PID 并发送 `SIGHUP`。 | 只报告信号成功送达；运行中进程随后记录 `applied` 或 `rejected`。mock 实例不持有该锁。 |
 | `mode <rule\|global\|direct>` | 加载 `--config`，将参数字符串赋给 `experimental.clash_api.default_mode`，并在重写结构化格式文件前完成校验。`.dae` 文件会被拒绝且保持不变，因为 writer 无法保留 dae 语法、注释或 include；请直接编辑这些源文件，或使用 `.toml`、`.yaml`、`.json`。 | 仅修改文件；不联系运行中的引擎，也不更改 dial mode。接受的字符串不同于正常 dial mode 值 `ip`、`domain`、`domain+`、`domain++`。 |
 | `proxy <group> <node>` | 检查组名和节点名各自存在，然后打印请求的选择；不检查节点是否属于该组。 | 不写入任何内容，也不联系运行中的引擎。 |
-| `config export --out PATH [--without-secrets]` | 把配置数据库的当前修订版本写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论守护进程是否运行，都通过以读写方式打开的 query-only 连接读取数据库。关闭该连接不会执行检查点，也不会删除 `honk.db-wal`；除 SQLite 可能创建的 `-shm` 索引外，唯一可能的写入是回滚崩溃遗留的日志。文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
+| `config export --out PATH [--without-secrets]` | 需要包含 `native-api` 的构建。把配置数据库的当前修订版本写成一份 `.dae` 文件；未给 `--without-secrets` 时补回监听凭据。无论守护进程是否运行，都通过以读写方式打开的 query-only 连接读取数据库。关闭该连接不会执行检查点，也不会删除 `honk.db-wal`；除 SQLite 可能创建的 `-shm` 索引外，唯一可能的写入是回滚崩溃遗留的日志。文件写完后才发布。 | 以 0600 权限新建 `PATH`，拒绝已存在的文件。 |
 | `admin reset` | 从 `--data-dir` 下的状态数据库删除密码模式管理员，下次启动时重新开放 setup。 | 任何 honk-core（包括 mock 模式）打开该状态数据库时拒绝执行。 |
-| `delay <node> [-u\|--url HOST:PORT]` | 建立一次原始 TCP 连接，超时五秒，并打印耗时毫秒数。未给 `--url` 时使用节点服务端地址。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
+| `delay <node> [-u\|--url HOST:PORT]` | 解析地址后直连 TCP，打印耗时毫秒数，含解析时间。未给 `--url` 时使用节点服务端地址。解析出的多个地址竞速连接，同时最多两个，间隔 250 ms，每次尝试超时五秒。 | 不经过代理，不是 HTTP URLTest，也不联系运行中的引擎。 |
 
 [编译路由发布计数器](../design/routing.md#同步槽与原子发布)耗尽后需重启；它与普通 SIGHUP 及 DNS 运行时重载分开计数。
 
-使用 `--store db` 时，`proxy` 与 `delay` 读取当前修订版本，`mode` 拒绝执行。
+使用 `--store db` 时，`proxy` 与 `delay` 读取当前修订版本，需要包含 `native-api` 的构建；`mode` 拒绝执行。
 
 真实数据面进程在其生命周期内持有该锁。`reload` 会先确认文件仍被锁定，再信任其中的 PID；`kill(2)` 成功送达并不表示候选配置通过校验或需重启字段检查。
 
@@ -74,9 +74,10 @@ CLI 与 Clash API 共用构建时版本号：发布构建使用 GitHub 标签名
 | 变量 | 作用范围 | 当前行为 |
 | --- | --- | --- |
 | `RUST_LOG` | 两个二进制 | Tracing 过滤条件。对 `honk-core` 采用上述当前有效优先级；`honk-tool` 在未设置时默认 `warn`。 |
+| `NO_COLOR` | `honk-core` 控制台 | 非空值关闭 ANSI 颜色。否则仅在 stdout 为终端时启用颜色。 |
 | `HONK_UI_DOWNLOAD_URL` | 启用 `clash-api` 的 `honk-core` | dashboard ZIP URL 的最高优先级覆盖；已配置的外部 UI 目录需要下载时，它会覆盖 `assets.ui.url`。 |
 | `HONK_POOL_DISABLE=1` | `honk-core` | 绕过 Ready 流与裸 TCP 两类池，每次全新拨号。代码也接受不区分大小写的 `true`；首次使用后缓存该值。 |
-| `HONK_QUIC_GSO=0\|1` | QUIC 出站 | 强制关闭/开启 UDP GSO。未覆盖时，保守的 1252-byte MTU 保持关闭；显式设置更大的 `mtu` 时自动开启，并把批量限制为最多 16 个 segment。 |
+| `HONK_QUIC_GSO` | QUIC 出站 | `1` 或不区分大小写的 `true` 强制开启 UDP GSO；其他任何值都强制关闭，空值也一样。该值首次使用后缓存。未覆盖时，保守的 1252 字节 MTU 保持关闭；显式设置更大的 `mtu` 时自动开启，并把批量限制为最多 16 个 segment。 |
 | `HONK_QUIC_BBR=v1\|v3` | QUIC 出站 | 选择 `bbr` 拥塞控制背后的实现：TUIC `congestion_control: bbr`、Juicity，以及未设上传速率的 Hysteria2。`v3` 是 BBRv3。`v1` 是 quinn 原有的 BBR，不响应丢包；在高带宽时延积路径上，quinn-proto 0.11.16 及以上的接收端可能以 `too many gaps in stream buffer` 中止其上传。默认 `v3`；其它值会告警并保持默认。 |
 | `TOKIO_WORKER_THREADS` | `honk-core` | Tokio 自带的工作线程数量；`honk-core` 使用默认多线程运行时，默认数量等于核数。必须是正整数：`0` 或非数字会使 Tokio 在启动时 panic。每个工作线程持有独立的分配器堆，在多核网关上调低该值可降低 RSS。实验室测量采用 4 核主机、120 条连接和 DNS：16 个工作线程约 85 MiB，8 个约 66 MiB，4 个约 60 MiB。CPU 差异在噪声内。中继路径运行在这些工作线程上，应按流量设置。 |
 | `HONK_VMLINUX_BTF` | 启用 `ebpf` 的 `honk-core` | 覆盖进程名路由和原生 UDP 接收追踪共用的原始内核 BTF。文件必须匹配运行中的内核。显式指定的文件不可读或无效时，拒绝真实后端启动，不会静默回退到其他文件。TCP 归属证明不读取内核结构，也不依赖它。 |
@@ -147,17 +148,24 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `<url\|file\|->` | 必填 | HTTP(S) 订阅 URL、已有本地订阅文件，或 `-`。`-` 从 stdin 读取且只接受一个 HTTP(S) 订阅 URL；不会从 stdin 读取订阅正文。 |
-| `--target HOST:PORT` | `cp.cloudflare.com:443` | 主机用于地址族探测的 HTTPS 请求 URL（TLS SNI 和 Host 标头）；主机和端口用于 QUIC 探测。未指定 `--v4-target`/`--v6-target` 地址覆盖时，地址族探测解析此主机并使用此端口。UDP DNS 探测目标由 `--udp-check` 单独指定。 |
+| `--target HOST:PORT` | `cp.cloudflare.com:443` | 主机用于地址族探测的 HTTPS 请求 URL、TLS SNI 和 Host 标头；主机和端口用于 QUIC 探测。地址族探测仍连接 `--v4-target` 和 `--v6-target`，改目标时应一并修改。UDP DNS 探测目标由 `--udp-check` 单独指定。 |
 | `--udp-check HOST[:PORT]` | `dns.google:53`、`8.8.8.8`、`2001:4860:4860::8888` | UDP DNS 检查目标，默认取自 `honk-config` 中的引擎列表。可重复指定或用逗号分隔。优先采用首个可解析为 IP 地址或套接字地址的目标，否则仅在节点支持 UDP DNS 探测时解析列表首项。省略端口时使用 `53`。 |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | 经代理的 URLTest 目标。 |
-| `--timeout SECS` | `5` | 每项探测的超时。 |
-| `--concurrency N` | `10` | 并发节点探测任务上限。 |
+| `--timeout SECS` | `5` | 每项探测的超时。`0` 表示零超时，不表示不限时。 |
+| `--concurrency N` | `10` | 并发节点探测任务上限。`0` 不执行任何探测，只输出空摘要，不表示不限并发。 |
 | `--limit N` | `0` | 仅探测前 `N` 个节点；`0` 表示全部。 |
 | `--ua UA` | 未设置 | 远程订阅拉取使用的 `User-Agent`。 |
 | `--tls-implementation tls\|utls` | `tls` | 探测使用的进程级 TLS ClientHello 实现。 |
 | `--utls-imitate PROFILE` | `chrome_auto` | `utls` 使用的指纹配置方案；当前校验器只接受以 `chrome` 开头的名称。 |
-| `--v4-target IP:PORT` | `1.1.1.1:443` | v4 连通性探测使用的显式 IPv4 地址。 |
-| `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | v6 连通性探测使用的显式 IPv6 地址。 |
+| `--v4-target IP:PORT` | `1.1.1.1:443` | v4 探测连接的数字 IPv4 地址，不检查地址族。 |
+| `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | v6 探测连接的数字 IPv6 地址，不检查地址族。 |
+
+自定义目标并给出对应的地址族地址：
+
+```bash
+honk-tool sub nodes.txt --target one.one.one.one:443 \
+  --v4-target 1.0.0.1:443 --v6-target '[2606:4700:4700::1001]:443'
+```
 
 远程订阅与本地文件共享引擎的自动格式识别：
 
@@ -166,6 +174,8 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 - 受支持的 Surge/Surfboard/Loon/Quantumult X 记录。
 
 不支持的节点会被跳过，不打印原始输入。使用 `-` 可避免把含凭据的订阅源 URL 放入 argv 和进程列表。
+
+订阅加载成功后，即使全部探测失败或全部节点被跳过，退出状态仍为 `0`；探测任务崩溃时打印 `probe task failed`，退出状态同样为 `0`。脚本应读取摘要行判断连通性。
 
 对每个节点，命令报告：
 
@@ -224,7 +234,7 @@ VLESS 承载连接和会话按运行时与规范化的线协议形态复用。�
 
 共享物理承载连接容量是全局的。XUDP 的 8 字节 Global ID 按 honk 的运行时、客户端、路径与目的地源身份确定作用域，不是进程级无碰撞 NAT 键。见[节点参考](./nodes.md#vless-udp-and-multiplexing)与规范的 [VLESS 出站设计](../design/outbound.md#sourcesession-ownership-and-capacity)。
 
-探测失败码为 `resolve`、`timeout`、`exchange`、`handler` 与 `admission`。凭据、端点详情、SNI、REALITY 键、URL 查询参数数据和原始错误绝不会输出。
+探测失败码为 `resolve`、`timeout`、`exchange`、`handler` 与 `admission`。探测结果行绝不输出凭据、端点详情、SNI、REALITY 键、URL 查询参数数据和原始错误。唯一例外在 stderr：探测运行时清理失败时打印 `probe runtime cleanup failed: <error>`，附带原始错误。
 
 ### `bpf`
 
@@ -244,10 +254,12 @@ honk-tool bpf stats [--pin-root PATH]
 
 | `show` map | 解码内容 |
 | --- | --- |
-| `conn-state` | Tuple、出站、mark、must 标记、状态与最近出现时间戳。 |
+| `conn-state` | Tuple、出站、mark、must 标记、状态、最近出现时间戳与追踪 ID。 |
 | `redirect-track` | 回包改写源/目的地址、出站、WAN 方向、接口与最近出现时间戳。 |
 | `domain-routing` | 从 DNS 或嗅探结果学习的 IP，以及活动 policy 的域名谓词位图索引；已知但全零的条目仍会显示。 |
-| `routing-handoff` | Tuple 与待处理的 eBPF 到控制面路由结果。 |
+| `routing-handoff` | Tuple、待处理的 eBPF 到控制面路由结果、最近出现时间戳、路由代次与追踪 ID。 |
+
+`conn-state`、`redirect-track` 与 `routing-handoff` 通过带 `BPF_F_LOCK` 的 `BPF_MAP_LOOKUP_BATCH` 读取。内核不支持时报错 `safe external map snapshot requires BPF_MAP_LOOKUP_BATCH ...`，不会退回不加锁的读取。
 
 命令通过原始 `bpf(2)` 读取 pin，不加载程序或挂载 hook；通常需要 root 或合适的 BPF capability。`stats` 为下列计数器逐行输出规范标签与计数，并打印 `CONN_STATE_OCCUPANCY` 插入/删除水位计及非零的每出站包/字节计数。`BPF_STATS_MAP` 必须有九个槽位：工具/引擎版本不匹配时以 `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` 失败（旧版工具则相反），不错误标注计数器。请将工具与引擎/对象一起升级。
 
@@ -275,10 +287,12 @@ honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark
 
 | 参数 | 默认值 | 含义 |
 | --- | --- | --- |
-| `--api URL` | `http://127.0.0.1:9090` | 明文 HTTP Clash API 基础 URL。空值跳过 API 检查；内置客户端不支持 HTTPS。 |
+| `--api URL` | `http://127.0.0.1:9090` | 明文 HTTP Clash API 基础 URL，必须写端口，例如 `http://panel.example:80`；不支持 HTTPS。空值跳过 API 检查。 |
 | `--secret TOKEN` | `HONK_API_SECRET`（若已设置） | Clash API 的 Bearer 令牌。命令行参数优先于环境变量。 |
 | `--pin-root PATH` | `/sys/fs/bpf` | 检查 pin map 是否存在及读取统计时使用的根目录。 |
-| `--tproxy-mark VALUE` | `134217728`（`0x08000000`） | `daens` 策略规则中预期的 fwmark。 |
+| `--tproxy-mark VALUE` | `134217728`（`0x08000000`） | `daens` 策略规则中预期的 fwmark，以十进制 32 位整数给出，不接受十六进制。 |
+
+API 检查没有超时，对端停滞会让命令挂起；需要时用 `timeout(1)` 包装，或传 `--api ''` 跳过。`diagnose` 会调用 `ip`；无法执行 `ip` 时以非零状态退出，不再执行剩余检查，也不输出摘要。
 
 该命令只读，检查以下项目：
 
@@ -318,6 +332,8 @@ honk-tool geoip [--file PATH] lookup <ip>
 | `geoip lookup <ip>` | 返回最长匹配前缀上并列的全部 code/CIDR。 |
 | `--file PATH` | 对应 `.dat` 文件的命令族全局覆盖路径。 |
 
+`show` 指定的类目或 code 不存在时以非零状态退出。`list`、`find` 或 `lookup` 没有匹配时不输出内容，退出状态为 `0`。
+
 未指定 `--file` 时，工具按以下顺序选择第一个已存在的普通文件：
 
 1. `$DAE_LOCATION_ASSET/<name>.dat`
@@ -331,6 +347,13 @@ honk-tool geoip [--file PATH] lookup <ip>
 9. `/etc/dae/<name>.dat`
 
 与 `honk-core` 不同，该工具不加载配置，因此无法获知自定义 `global.data_dir`。输出每行一条记录。下游管道关闭不会引发 panic。
+
+| 命令 | 行格式 |
+| --- | --- |
+| `geosite list` | `CATEGORY ENTRY_COUNT` |
+| `geosite show`、`geosite find` | `CATEGORY KIND VALUE [@ATTR ...]`，`KIND` 为 `domain`、`full`、`keyword` 或 `regexp` |
+| `geoip list` | `CODE CIDR_COUNT` |
+| `geoip show`、`geoip lookup` | `CODE CIDR` |
 
 ## 相关文档
 

@@ -10,13 +10,26 @@
 | `cache_file` | 在状态数据库中持久化运行时选择、模式、延迟样本和可选 DNS 状态 |
 | `native_api` | 独立、显式启用的原生观测/控制、受控 `.dae` 源管理与本地 UI 目录 |
 
-`udp_nfqueue { enabled: ... }` 是已弃用的兼容配置段。dae 和结构化配置加载器仍会接受它，输出迁移警告，并将值复制到 `global.nfqueue_enable`；新配置应直接使用全局字段。
+`udp_nfqueue { enabled: ... }` 是已弃用的兼容配置段。dae 和结构化配置加载器仍会接受它并输出迁移警告；仅当未设置 `global.nfqueue_enable` 时，才用它的值作为该全局字段。`enabled` 默认为 `false`，所以空的 `udp_nfqueue {}` 会关闭 NFQUEUE；删除该段才能保留默认开启的全局设置。新配置应直接使用全局字段。下例中全局字段优先，NFQUEUE 保持关闭：
+
+```dae
+global {
+    nfqueue_enable: false
+}
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
 
 ## `native_api`
 
 原生 API 需要显式启用 `native-api` Cargo 功能：以 `--features native-api` 或 `native-ui` 构建，或使用 full、`-native-api` 发布版本。不依赖 `clash-api`。监听器默认关闭；未编译该功能却启用配置时，启动报错。
 
 所有生效字段都要求重启。SIGHUP 拒绝其变更，并保留当前监听器与配置代次。未知字段、标量中的嵌套块、无效布尔值及安全列表空成员均报错。
+
+布尔字段写 `true` 或 `false`；也接受 `yes`/`no`、`1`/`0` 和 `on`/`off`，不区分大小写。其他写法（如 `t`）会产生 `invalid-config-value` 错误。
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -25,7 +38,7 @@
 | `secret` | `""` | 独立于 Clash 的静态 Bearer 凭据。非空值选择令牌模式，不能与 `password_auth` 组合。API 响应按值遮蔽监听密钥；短于 8 字节的值不遮蔽，启动时会记录提示。 |
 | `password_auth` | `false` | `secret` 为空时启用管理员密码登录。不能与 `allow_anonymous_loopback` 组合。 |
 | `allow_anonymous_loopback` | `false` | 仅在 `secret` 为空、`password_auth` 为 false 且实际监听 IP 为回环地址时允许无凭据请求。 |
-| `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、查询串、片段、`null` 或通配符。 |
+| `allow_origins` | 空列表 | 额外允许的完整 HTTP(S) Origin；不含路径、凭据、查询串、片段、`null` 或通配符。省略端口时，`http` 为 80，`https` 为 443。 |
 | `allowed_hosts` | 空列表 | 额外允许的 HTTP Host 地址和端口；不含 URL 协议、路径、凭据或通配符。省略端口表示 80，不是监听端口。 |
 | `ui` | `""` | 空值关闭托管；其他值为含可读 `index.html` 的可信本地目录，或配合默认关闭的 `native-ui` 功能使用 `embedded` / `embedded-lite`。`embedded-lite` 是更轻量的 doona lite 预览版。启动不下载、不解压、不构建前端。 |
 | `record_flows` | `true` | 允许按 flow 诊断需求记录有界用户态 flow，或通过显式运行时设置持续记录。`false` 禁止记录，运行时设置不能覆盖；修改配置需重启。 |
@@ -74,7 +87,9 @@ Host 与 Origin 检查独立于认证：
 
 转发请求头不授予权限。
 
-列表采用逐项引号与逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`。省略表示空列表；不接受 JSON 方括号或整段引号聚合。探测目标仅来自已接受的配置，仍解析并固定选中的 IP，将 IPv4-mapped IPv6 规范化为 IPv4，且不接受调用方 URL、不跟随 HTTP 重定向。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。
+两个列表中的主机可以是 IPv4 地址、带方括号的 IPv6 地址（如 `[::1]:9527`），或只含字母、数字和中间连字符的 ASCII DNS 名称：不能有下划线、空标签或末尾点。显式端口为 1 至 65535。
+
+列表用逗号分隔，例如 `allow_origins: 'http://localhost:3000', 'https://panel.example'`；每项可单独加引号，也可不加。省略表示空列表；不接受 JSON 方括号或整段引号聚合。探测目标仅来自已接受的配置，仍解析并固定选中的 IP，将 IPv4-mapped IPv6 规范化为 IPv4，且不接受调用方 URL、不跟随 HTTP 重定向。探测、geodata 和共享下载使用配置的目标，不设地址或端口白名单。能够写入配置或控制订阅内容的人决定这些目标；provider 内容属于受信任的配置。
 
 已移除的 `probe_allowed_cidrs` 与 `probe_allowed_ports` 键仍可在 dae 配置及兼容的结构化加载器中出现，每个键产生一条警告；其值被忽略，可以删除这两个键。配置序列化不输出这两个键。
 
@@ -102,9 +117,11 @@ Host 与 Origin 检查独立于认证：
 
 ## `clash_api`
 
+需要默认启用的 `clash-api` Cargo 功能；未编译该功能时忽略 `external_controller`。
+
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `external_controller` | `""` | HTTP 监听地址。空值关闭 API 服务。 |
+| `external_controller` | `""` | 由 IP 和端口组成的监听地址，例如 `127.0.0.1:9090` 或 `[::1]:9090`；`:9090` 表示 `0.0.0.0:9090`。不接受主机名。空值关闭 API 服务。地址无效时记录警告，引擎照常启动但没有该监听器。 |
 | `external_ui` | `""` | 外部面板目录。空值关闭面板服务与下载。 |
 | `secret` | `""` | API 鉴权 secret。空值关闭鉴权。短于 8 字节的值在原生 API 响应里不遮蔽。 |
 | `default_mode` | `"Rule"` | 原生 API 未启用时的启动模式：`Rule`、`Global` 或 `Direct`；`cache_file.enabled: true` 时有效的缓存模式优先。启用原生 API 时，启动改用共享的临时 rule 模式。 |
@@ -123,13 +140,15 @@ Host 与 Origin 检查独立于认证：
 
 ### 外部 UI
 
-绝对 `external_ui` 路径按原值使用。相对路径首先选择 `global.data_dir` 下的已有目录，其次选择 `/var/share/honk` 下的已有目录，再选择相对当前工作目录的已有目录；都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `assets.ui.url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
+绝对 `external_ui` 路径按原值使用。相对路径依次选择 `global.data_dir` 下、`/var/share/honk` 下和相对当前工作目录的第一个已有路径，文件和目录都算，先找到文件也不会跳过。都不存在时，honk 在 `global.data_dir` 下创建目标目录。目标缺失或为空时，会在后台下载 dashboard ZIP。非空 `assets.ui.url` 会替换内建 zashboard URL；`HONK_UI_DOWNLOAD_URL` 的优先级高于两者。
 
 `assets.ui.route` 优先于 `assets.route`，适用于初始请求及每次重定向。`direct` 直接下载，路由规则选中 `block` 时中止下载，组则为每次请求解析其权威叶节点。未配置出口时，每个 URL 遵循普通流量路由。标签不可用、下载失败或解压失败只写日志，不会停止引擎。压缩包写入目标目录中一个无文件名的私有文件，不保存在内存中；解压结束或下载失败后，honk 删除该压缩包。解压超过 10,000 个条目或 128 MiB 内容（与压缩包本身的上限相同）时拒绝继续，已写入的目录被清空，下次启动时重新下载。
 
+下载最多跟随五次重定向。每次 HTTP 交换超时 30 秒；经代理时从隧道拨号完成后开始计时。所有 ZIP 条目位于同一个顶层目录下时，解压去掉这一层，`dist/index.html` 变为 `index.html`。路径含空分量、`.`、`..` 或反斜杠的条目会被跳过。
+
 ### 启动模式
 
-原生 API 未启用时，`default_mode` 接受规范模式 `Rule`、`Global` 和 `Direct`。`cache_file.enabled` 为 `true` 且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。启用原生 API 后，两种 API 共用同一临时模式所有者，不恢复或持久化模式；启动时使用 `Rule`，已接受的显式配置激活（含 no-op）在后端重置成功时恢复 `Rule`，provider 刷新或网络刷新时保留模式。提交后重置失败则保留原模式、关闭准入并返回 `CommittedDegraded`。`Global` 模式绑定稳定的节点或组身份，刷新移除目标时拒绝新的流量。见[运行时模式](./api.md#连接关闭模式与数据面生命周期)。
+原生 API 未启用时，`default_mode` 接受 `Rule`、`Global` 和 `Direct`，不区分大小写。`cache_file.enabled` 为 `true` 且包含有效的 Clash 缓存模式时，改为恢复该值。无效的缓存值或配置值回退到 `Rule`。启用原生 API 后，两种 API 共用同一临时模式所有者，不恢复或持久化模式；启动时使用 `Rule`，已接受的显式配置激活（含 no-op）在后端重置成功时恢复 `Rule`，provider 刷新或网络刷新时保留模式。提交后重置失败则保留原模式、关闭准入并返回 `CommittedDegraded`。`Global` 模式绑定稳定的节点或组身份，刷新移除目标时拒绝新的流量。见[运行时模式](./api.md#连接关闭模式与数据面生命周期)。
 
 ## `cache_file`
 
@@ -143,6 +162,8 @@ Host 与 Origin 检查独立于认证：
 要保存 Clash 模式和 GLOBAL 选择，须显式设置 `true`；DNS 应答还须单独启用 `store_dns: true`。显式 `false` 禁用这些运行时缓存存储，不关闭独立的配置、凭据或订阅存储。
 
 `path`、`cache_id` 与 `store_fakeip` 已不再是设置项。它们仍可解析，但只产生 `legacy-cache-file` 警告，不起作用；SIGHUP 也接受对它们的修改。`path` 与 `cache_id` 只在导入旧 `cache.db` 时读取一次，见下文。
+
+`path` 省略或为空时表示 `cache.db`；`cache_id` 省略时为 `""`，即无前缀的 key。
 
 ### 持久化的状态
 
@@ -181,7 +202,7 @@ Host 与 Origin 检查独立于认证：
 
 ### 从 `cache.db` 升级
 
-启用 `enabled` 后首次启动时，honk 导入 `path` 指向的旧 `cache.db`，解析规则与旧版本相同：绝对路径按原样使用；相对路径依次查找 `global.data_dir` 下、`/var/share/honk` 下以及相对原配置目录的已有文件。honk 只读取本实例 `cache_id` 前缀下的 key，复制配置中 Selector 组在 TCP/UDP 上各自的选择、Clash 模式、Clash GLOBAL 选择以及已配置节点 24 小时内的延迟样本；状态数据库中已有的行优先。旧版本按名称保存的 Selector 选择、DNS 应答与 FakeIP 记录不导入，因此已持久化的 DNS 应答需要重新查询。导入按路径记录在状态数据库中，每个路径一行；即使旧版本重新创建了该文件，也不会再次导入。如果 `cache.db` 是符号链接、不是 honk 用户所有的普通文件、可被其他用户写入，或无法按 `cache.db` 读取，honk 保留该文件并记录警告，下次启动时再次尝试。
+存在状态数据库且 `enabled` 不为 `false` 时，首次启动会导入 `path` 指向的旧 `cache.db`。绝对路径按原样使用；相对路径依次查找 `global.data_dir` 下、`/var/share/honk` 下以及相对原配置目录的已有路径。honk 只读取本实例 `cache_id` 前缀下的 key。配置中 Selector 组在各网络上的选择以及已配置节点 24 小时内的延迟样本会被复制。只有 `enabled: true`、原生 API 未启用，且在 `clash-api` 构建中设置了 `external_controller` 时，才复制 Clash 模式和 Clash GLOBAL 选择。状态数据库中已有的行优先。旧版本按名称保存的 Selector 选择、DNS 应答与 FakeIP 记录不导入，因此已持久化的 DNS 应答需要重新查询。导入按文件与 `cache_id` 记录在状态数据库中，即使旧版本重新创建了该文件，也不会再次导入；其他 `cache_id` 仍可从保留的文件中导入自己的 key。如果 `cache.db` 是符号链接、不是 honk 用户所有的普通文件、可被其他用户写入，或无法按 `cache.db` 读取，honk 保留该文件并记录警告，下次启动时再次尝试。
 数据库模式下，最后这项回退使用当前 revision 保存的原始入口目录；即使本次 `-c` 指向其他位置、启动时不读取它，也不会改变旧缓存的位置。
 
 `cache_id` 为空时，honk 随后删除 `cache.db` 及其 `-wal`、`-shm`，保留 `cache.db.corrupt-*` 副本。`cache_id` 非空时，该文件可能由其他实例共用，因此保留，并只记录一次警告。此后再启动旧版本时，它找不到 `cache.db`，运行时状态从空开始。
