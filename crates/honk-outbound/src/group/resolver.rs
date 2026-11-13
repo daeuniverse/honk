@@ -144,8 +144,7 @@ impl GroupManager {
             }
         };
         (node.protocol() != honk_config::types::NodeProtocol::Block
-            && (domain == ProbeDomain::Tcp
-                || (crate::descriptor::descriptor(node.protocol()).supports_udp)(node)))
+            && (domain == ProbeDomain::Tcp || self.node_carries_udp(node)))
         .then_some(node)
     }
 

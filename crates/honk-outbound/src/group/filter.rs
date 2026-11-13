@@ -17,7 +17,7 @@ impl GroupManager {
         if matches!(domain, ProbeDomain::DataUdp | ProbeDomain::DnsUdp)
             && let Some(node) = self.nodes.get(&node_id)
             && node.protocol() != honk_config::types::NodeProtocol::Block
-            && !(crate::descriptor::descriptor(node.protocol()).supports_udp)(node)
+            && !self.node_carries_udp(node)
         {
             return false;
         }
@@ -33,6 +33,22 @@ impl GroupManager {
             };
         }
         alive.is_alive_for(node_id, domain, ipver)
+    }
+
+    /// Whether `node` carries UDP over its own protocol or, for a configured
+    /// chain, tunneled by its exit, which the chain's own descriptor cannot
+    /// see.
+    pub fn node_carries_udp(&self, node: &Node) -> bool {
+        if node.protocol() == honk_config::types::NodeProtocol::Chain {
+            return self.chain_carries_udp(node.id);
+        }
+        crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node))
+    }
+
+    /// Out of line so selection paths without chain nodes inline no lookup.
+    #[inline(never)]
+    fn chain_carries_udp(&self, chain: uuid::Uuid) -> bool {
+        self.chain_udp.contains(&chain)
     }
 
     /// Keep only capable, alive leaves; absent health tracking skips only health.

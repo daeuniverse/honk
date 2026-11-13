@@ -77,7 +77,9 @@ impl ProtocolEntry {
             outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         };
-        if (self.descriptor.supports_udp)(&default_node) && self.packet.is_none() {
+        if crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(&default_node))
+            && self.packet.is_none()
+        {
             panic!(
                 "protocol {} declares UDP without a packet handler",
                 protocol.as_str()
@@ -493,7 +495,9 @@ impl ProxyRegistry {
         {
             return Err(PacketRejection::Policy.into());
         }
-        if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
+        if protocol != NodeProtocol::Block
+            && !crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node))
+        {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
         let packet = entry.packet.as_ref().ok_or_else(|| {

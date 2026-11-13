@@ -620,6 +620,86 @@ fn nested_final_keeps_datapath_group_alive_without_reviving_dead_members() {
     }
 }
 
+/// The only member of a group with the given `final`: a configured chain
+/// whose exit sends XUDP, which a chain cannot carry, or Trojan, which it can.
+fn chain_group_config(exit_carries_udp: bool, final_outbound: Option<&str>) -> Config {
+    use honk_config::node::{OutboundConfig, TrojanConfig, VlessConfig, VlessUdpEncoding};
+    let front = canonical_socks5("front", "127.0.0.1", 1080, None);
+    let mut exit = Node {
+        name: "exit".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: if exit_carries_udp {
+            OutboundConfig::Trojan(TrojanConfig {
+                password: Some("secret".into()),
+                ..Default::default()
+            })
+        } else {
+            OutboundConfig::Vless(VlessConfig {
+                uuid: Some("11111111-1111-4111-8111-111111111111".into()),
+                udp_encoding: VlessUdpEncoding::Xudp,
+                ..Default::default()
+            })
+        },
+        ..Default::default()
+    };
+    exit.id = exit.derive_id();
+    let mut chain = Node {
+        name: "via".into(),
+        outbound: OutboundConfig::Chain {
+            hops: vec!["front".into(), "exit".into()],
+        },
+        ..Default::default()
+    };
+    chain.id = chain.derive_id();
+    Config {
+        groups: vec![Group {
+            name: "g".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![chain.id],
+            final_outbound: final_outbound.map(str::to_owned),
+            ..Default::default()
+        }],
+        nodes: vec![chain, front, exit],
+        ..Default::default()
+    }
+}
+
+fn chain_group_udp_plan(config: &Config) -> Vec<Node> {
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let context = honk_outbound::group::ScoreSelectionContext::aggregate(
+        honk_outbound::group::SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    resolve_udp_outbound_plan_for_target(
+        config,
+        &manager,
+        "g",
+        &context,
+        crate::control::reload::OutboundConstraint::Any,
+    )
+    .nodes
+}
+
+/// The configured `final` takes the group's UDP exactly when the chain's exit
+/// cannot carry it; there is no implicit fallback.
+#[test]
+fn a_chain_group_sends_udp_to_the_final_only_when_the_exit_cannot_carry_it() {
+    for (exit_carries_udp, protocol) in [
+        (true, honk_config::types::NodeProtocol::Chain),
+        (false, honk_config::types::NodeProtocol::Direct),
+    ] {
+        let plan = chain_group_udp_plan(&chain_group_config(exit_carries_udp, Some("direct")));
+        assert_eq!(
+            plan.iter().map(Node::protocol).collect::<Vec<_>>(),
+            [protocol],
+            "exit carries UDP: {exit_carries_udp}"
+        );
+    }
+}
+
 #[test]
 fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
     let config = nested_final_config();

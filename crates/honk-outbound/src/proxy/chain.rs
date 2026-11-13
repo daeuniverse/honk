@@ -9,9 +9,9 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{
-    AsyncReadWrite, ChainHopFailure, NodeFailure, PacketOutbound, PacketTransport, ProtocolEntry,
-    ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported, is_packet_rejection,
-    target_failure,
+    AsyncReadWrite, ChainHopFailure, NodeFailure, PacketOutbound, PacketRejection, PacketTransport,
+    ProtocolEntry, ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported,
+    is_packet_rejection, target_failure,
 };
 use crate::runtime::flow_observation::without_target_milestones;
 use crate::runtime::{NodeRuntime, RouteRuntime};
@@ -283,6 +283,11 @@ impl PacketOutbound for ChainHandler {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        // Probes reach this without the registry's capability gate; a typed
+        // refusal keeps a chain that cannot carry UDP out of their failures.
+        if !runtime.udp_capable {
+            return Err(PacketRejection::Policy.into());
+        }
         self.dial_chain(
             &runtime.node.name,
             runtime.chain_hops(),

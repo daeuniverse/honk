@@ -264,6 +264,113 @@ async fn socks5_front_carries_a_vless_native_udp_exit() {
     assert_udp_echo(transport.as_ref()).await;
 }
 
+fn xudp_exit(name: &str) -> Node {
+    node(
+        name,
+        "127.0.0.1",
+        443,
+        OutboundConfig::Vless(honk_config::node::VlessConfig {
+            uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+            udp_encoding: honk_config::node::VlessUdpEncoding::Xudp,
+            ..Default::default()
+        }),
+    )
+}
+
+#[tokio::test]
+async fn the_registry_dials_udp_for_a_chain_whose_exit_carries_it() {
+    let relay = socks5_relay(Vec::new(), false).await;
+    let server = trojan_udp_echo().await;
+    let front = socks5("front", "127.0.0.1", relay.addr.port());
+    let land = trojan_exit("land", "127.0.0.1", server.port());
+    let via = chain(&[&front, &land]);
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap());
+    let transport = ProxyRegistry::default_resolver()
+        .unwrap()
+        .dial_udp_transport_runtime(generation, via.id, target(), None, Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_udp_echo(transport.as_ref()).await;
+}
+
+/// The registry refuses a chain whose exit cannot carry UDP before dialing,
+/// and the chain refuses it with a typed policy rejection when a caller such
+/// as a probe skips that gate.
+#[tokio::test]
+async fn a_chain_whose_exit_cannot_carry_udp_refuses_udp() {
+    let front = socks5("front", "127.0.0.1", 9);
+    let land = xudp_exit("land");
+    let via = chain(&[&front, &land]);
+    let generation = Arc::new(OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap());
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let error = registry
+        .dial_udp_transport_runtime(
+            Arc::clone(&generation),
+            via.id,
+            target(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("UDP not supported"), "{error:#}");
+    let packet = registry.find(NodeProtocol::Chain).unwrap().packet.clone();
+    let error = packet
+        .unwrap()
+        .dial_udp_transport_runtime(
+            generation.get(&via.id).unwrap(),
+            target(),
+            None,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        crate::proxy::packet_rejection(&error),
+        Some(crate::proxy::PacketRejection::Policy),
+        "{error:#}"
+    );
+}
+
+/// A generation decides a chain's UDP from its exit, for a configured chain
+/// and a route through group exits alike.
+#[test]
+fn a_generation_takes_a_chain_udp_capability_from_its_exit() {
+    let front = socks5("front", "127.0.0.1", 9);
+    let trojan = trojan_exit("trojan", "127.0.0.1", 443);
+    let xudp = xudp_exit("xudp");
+    let mut via_trojan = chain(&[&front, &trojan]);
+    via_trojan.name = "via-trojan".into();
+    let mut via_xudp = chain(&[&front, &xudp]);
+    via_xudp.name = "via-xudp".into();
+    let generation = OutboundRuntimeRegistry::build(&[
+        via_trojan.clone(),
+        via_xudp.clone(),
+        front.clone(),
+        trojan.clone(),
+        xudp.clone(),
+    ])
+    .unwrap();
+    for (node, carries) in [(via_trojan, true), (via_xudp, false), (front.clone(), true)] {
+        assert_eq!(generation.udp_capable(&node), carries, "{}", node.name);
+        assert_eq!(
+            generation.get(&node.id).unwrap().udp_capable,
+            carries,
+            "{}",
+            node.name
+        );
+    }
+    for (exit, carries) in [(&trojan, true), (&xudp, false)] {
+        let honk_config::group_graph::Composed::Routed(route) =
+            honk_config::group_graph::compose(front.id, &[front.id], [exit.id])
+        else {
+            panic!("expected a route");
+        };
+        let runtime = generation.route_runtime(&route).unwrap();
+        assert_eq!(runtime.udp_capable, carries, "{}", exit.name);
+    }
+}
+
 #[tokio::test]
 async fn a_chain_without_its_generation_refuses_to_dial() {
     let front = socks5("front", "127.0.0.1", 1080);
@@ -888,39 +995,60 @@ async fn the_chain_deadline_bounds_every_hop_together() {
 /// dropped, front connection included, instead of handed out.
 #[tokio::test(start_paused = true)]
 async fn a_generation_shut_down_during_the_dial_publishes_nothing() {
-    let fakes = Fakes::new(
-        FakeHop {
-            delay: Duration::from_millis(50),
-            ..Default::default()
-        },
-        FakeHop::default(),
-    );
-    let mut registry = ProxyRegistry::new();
-    registry.register(ProtocolEntry::new(
-        NodeProtocol::Chain,
-        Arc::new(fakes.handler()),
-    ));
-    let dial = registry.dial_runtime(
-        Arc::clone(&fakes.generation),
-        fakes.via.id,
-        target(),
-        None,
-        Duration::from_secs(1),
-    );
-    let shutdown = async {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        fakes.generation.begin_retirement();
-    };
-    let (result, ()) = tokio::join!(dial, shutdown);
-    let error = result.unwrap_err();
-    assert!(
-        error.to_string().contains("shut down during dial"),
-        "{error:#}"
-    );
-    let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
-    assert_eq!(hops, ["front/runtime", "land/over"]);
-    let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
-    assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    for udp in [false, true] {
+        let fakes = Fakes::new(
+            FakeHop {
+                delay: Duration::from_millis(50),
+                ..Default::default()
+            },
+            FakeHop::default(),
+        );
+        let handler = Arc::new(fakes.handler());
+        let mut registry = ProxyRegistry::new();
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Chain, handler.clone()).with_packet(handler),
+        );
+        let generation = || Arc::clone(&fakes.generation);
+        let dial = async {
+            if udp {
+                registry
+                    .dial_udp_transport_runtime(
+                        generation(),
+                        fakes.via.id,
+                        target(),
+                        None,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .map(drop)
+            } else {
+                registry
+                    .dial_runtime(
+                        generation(),
+                        fakes.via.id,
+                        target(),
+                        None,
+                        Duration::from_secs(1),
+                    )
+                    .await
+                    .map(drop)
+            }
+        };
+        let shutdown = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            fakes.generation.begin_retirement();
+        };
+        let (result, ()) = tokio::join!(dial, shutdown);
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("shut down during dial"),
+            "{error:#}"
+        );
+        let hops: Vec<_> = fakes.calls().into_iter().map(|call| call.hop).collect();
+        assert_eq!(hops, ["front/runtime", "land/over"]);
+        let mut peer = fakes.front.peers.lock().unwrap().pop().unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+    }
 }
 
 #[cfg(feature = "flow-observation")]

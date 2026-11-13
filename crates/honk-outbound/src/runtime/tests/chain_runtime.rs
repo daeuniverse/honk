@@ -35,7 +35,8 @@ fn chain_runtime_holds_the_hops_built_in_the_same_pass() {
     let generation = OutboundRuntimeRegistry::build(&nodes).unwrap();
     assert_holds_hops_of(&generation, &nodes[0], &[&nodes[1], &nodes[2]]);
     let runtime = generation.get(&nodes[0].id).unwrap();
-    assert!(!runtime.udp_capable);
+    // A Trojan exit carries UDP over the stream to it.
+    assert!(runtime.udp_capable);
     assert!(matches!(runtime.runtime, ProtocolRuntime::None));
     assert!(
         generation

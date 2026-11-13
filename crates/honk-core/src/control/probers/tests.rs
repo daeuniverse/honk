@@ -523,6 +523,78 @@ async fn udp_capability_and_policy_gates_skip_target_resolution_and_health_feedb
     }
 }
 
+/// A chain's UDP follows its exit, which only the generation resolves,
+/// so the probe asks the generation rather than the chain's protocol.
+#[tokio::test]
+async fn a_chain_whose_exit_cannot_carry_udp_is_not_probed_for_udp() {
+    let front = udp_test_node();
+    let mut exit = udp_test_node();
+    exit.name = "xudp-exit".into();
+    exit.outbound = honk_config::node::OutboundConfig::Vless(honk_config::node::VlessConfig {
+        uuid: Some("00000000-0000-4000-8000-000000000001".into()),
+        udp_encoding: honk_config::node::VlessUdpEncoding::Xudp,
+        ..Default::default()
+    });
+    exit.id = exit.derive_id();
+    let mut chain = Node {
+        name: "via".into(),
+        outbound: honk_config::node::OutboundConfig::Chain {
+            hops: vec![front.name.clone(), exit.name.clone()],
+        },
+        ..Default::default()
+    };
+    chain.id = chain.derive_id();
+    let nodes = [chain.clone(), front, exit];
+    let generation = Arc::new(parking_lot::RwLock::new(Arc::new(
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap(),
+    )));
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let handler = Arc::new(UdpTestHandler {
+        mode: UdpTestMode::UdpCaptureTarget(captured.clone()),
+    });
+    let mut registry = ProxyRegistry::new();
+    registry.register(
+        honk_outbound::proxy::ProtocolEntry::new(chain.protocol(), handler.clone())
+            .with_packet(handler),
+    );
+    let config = Config {
+        nodes: nodes.to_vec(),
+        ..Config::default()
+    };
+    let manager = Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+        &[],
+        &nodes,
+    ))));
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_, _| {
+        panic!("a chain without UDP must not resolve a probe target");
+    });
+    let prober = ProxyUdpProber::new(
+        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(registry),
+        generation,
+        Arc::new(StatsManager::new()),
+        UdpDnsProbeTarget::new(vec!["probe.example:53".into()], Some(resolver.clone())),
+        Some(Arc::new(QuicScoreProbeTarget::new(
+            "https://probe.example/".into(),
+            Some(resolver),
+            Arc::default(),
+        ))),
+        manager,
+    );
+
+    let outcome = prober
+        .probe_udp(
+            chain.id,
+            Duration::from_millis(50),
+            honk_outbound::alive::ProbeCancellation::default(),
+        )
+        .await;
+
+    assert!(outcome.dns.is_none());
+    assert!(outcome.data_path.is_none());
+    assert!(captured.lock().unwrap().is_none());
+}
+
 #[tokio::test]
 async fn c27_urltest_propagates_admission_before_dial() {
     let generation = Arc::new(

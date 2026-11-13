@@ -200,9 +200,7 @@ fn plan(
             if request.kind == Kind::TcpConnect && (group.is_none() || !is_chain(node)) {
                 tcp_connect_target(node)?;
             }
-            if request.transport.contains(&Transport::Udp)
-                && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
-            {
+            if request.transport.contains(&Transport::Udp) && !registry.udp_capable(node) {
                 return Err(tcp_only());
             }
         }
@@ -255,7 +253,7 @@ fn plan(
                                 )
                             })?;
                         if transport == Transport::Udp
-                            && (!(entry.descriptor.supports_udp)(node) || entry.packet.is_none())
+                            && (!registry.udp_capable(node) || entry.packet.is_none())
                         {
                             return Err(tcp_only());
                         }

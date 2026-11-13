@@ -340,6 +340,26 @@ pub struct GroupManager {
     transport_quality: RwLock<Vec<score::TransportQualitySource>>,
     /// Exit edges and chain hops, only when some group has an `exit`.
     exits: Option<Box<exit::Exits>>,
+    /// Configured chain nodes whose exit carries UDP.
+    chain_udp: HashSet<uuid::Uuid>,
+}
+
+/// Configured chains whose exit, their last hop, tunnels UDP. Validation
+/// leaves one node per hop name; the first namesake is taken regardless.
+fn chains_carrying_udp(nodes: &[Node]) -> HashSet<uuid::Uuid> {
+    nodes
+        .iter()
+        .filter(|chain| {
+            chain
+                .chain_hops()
+                .and_then(<[String]>::last)
+                .and_then(|exit| nodes.iter().find(|node| node.name == *exit))
+                .is_some_and(|exit| {
+                    crate::descriptor::carries_udp(crate::descriptor::UdpPath::Tunneled { exit })
+                })
+        })
+        .map(|chain| chain.id)
+        .collect()
 }
 
 impl GroupManager {
@@ -400,6 +420,7 @@ impl GroupManager {
         }
         Self {
             exits: exit::Exits::build(groups, nodes, &mut managed),
+            chain_udp: chains_carrying_udp(nodes),
             groups: managed,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
             node_order: nodes.iter().map(|node| node.id).collect(),

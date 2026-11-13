@@ -875,7 +875,8 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     assert_udp_selection(&manager, "level-1", Some("direct"));
 }
 
-/// Proxy chains carry TCP only: UDP selection passes over them, TCP does not.
+/// UDP selection skips a chain whose exit cannot be resolved; TCP selection
+/// still admits it.
 #[test]
 fn udp_selection_skips_chain_nodes() {
     let front = make_node(nid("front"), "front");
@@ -898,4 +899,59 @@ fn udp_selection_skips_chain_nodes() {
         assert!(m.is_node_selectable_for_domain(front.id, domain, IpVersion::V4));
     }
     assert!(m.is_node_selectable_for_domain(chain.id, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// A configured chain's UDP follows its exit, not the chain descriptor.
+#[test]
+fn a_chain_offers_udp_exactly_when_its_exit_carries_it() {
+    use honk_config::node::{OutboundConfig, VlessConfig, VlessUdpEncoding};
+    let front = Node {
+        outbound: OutboundConfig::Socks5(Default::default()),
+        ..make_node(nid("front"), "front")
+    };
+    let trojan = Node {
+        outbound: OutboundConfig::Trojan(Default::default()),
+        ..make_node(nid("trojan"), "trojan")
+    };
+    let xudp = Node {
+        outbound: OutboundConfig::Vless(VlessConfig {
+            udp_encoding: VlessUdpEncoding::Xudp,
+            ..Default::default()
+        }),
+        ..make_node(nid("xudp"), "xudp")
+    };
+    let chain = |name: &str, exit: &str| Node {
+        outbound: OutboundConfig::Chain {
+            hops: vec!["front".into(), exit.into()],
+        },
+        ..make_node(nid(name), name)
+    };
+    let manager = GroupManager::new(
+        &[make_group(
+            "g",
+            GroupPolicy::LoadBalance,
+            vec![nid("via-trojan"), nid("via-xudp")],
+        )],
+        &[
+            front,
+            trojan,
+            xudp,
+            chain("via-trojan", "trojan"),
+            chain("via-xudp", "xudp"),
+        ],
+    );
+    for (name, carries) in [("via-trojan", true), ("via-xudp", false)] {
+        assert_eq!(
+            manager.is_node_selectable_for_domain(nid(name), ProbeDomain::DataUdp, IpVersion::V4),
+            carries,
+            "{name}"
+        );
+    }
+    for _ in 0..2 {
+        let plan = manager.selection_plan_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
+        assert_eq!(
+            plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [nid("via-trojan")]
+        );
+    }
 }

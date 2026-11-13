@@ -401,7 +401,14 @@ impl NodeRuntime {
         let build = || {
             Arc::new(Self {
                 node: Arc::new(node.clone()),
-                udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
+                udp_capable: crate::descriptor::carries_udp(
+                    match (node.protocol(), chain_hops.last()) {
+                        (honk_config::types::NodeProtocol::Chain, Some(exit)) => {
+                            crate::descriptor::UdpPath::Tunneled { exit: &exit.node }
+                        }
+                        _ => crate::descriptor::UdpPath::Own(node),
+                    },
+                ),
                 runtime: crate::descriptor::descriptor(node.protocol())
                     .generation_runtime
                     .build(node, !ephemeral, Arc::clone(&transport_quality)),
@@ -1061,6 +1068,16 @@ impl OutboundRuntimeRegistry {
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {
         self.nodes.get(id).map(Arc::clone)
+    }
+
+    /// Whether `node` carries UDP in this generation: its runtime's answer,
+    /// which for a chain follows its exit, or its own protocol's for a node
+    /// the generation does not hold.
+    pub fn udp_capable(&self, node: &Node) -> bool {
+        match self.nodes.get(&node.id) {
+            Some(runtime) => runtime.udp_capable,
+            None => crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node)),
+        }
     }
 
     /// The runtime that dials `route` over this generation's hop runtimes,

@@ -329,8 +329,7 @@ impl honk_outbound::alive::UdpProber for ProxyUdpProber {
                     observations: [None, None],
                 };
             };
-            let udp_capable =
-                (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(&node);
+            let udp_capable = generation.udp_capable(&node);
             let dns_allowed = udp_capable
                 && honk_outbound::descriptor::udp_target_allowed(&node, dns_probe.port());
             let data_allowed = udp_capable

@@ -22,6 +22,8 @@ pub struct RouteRuntime {
     /// Entry first; slots past the route's length repeat its exit, so the
     /// hops borrow as one slice without a separate allocation.
     hops: [Arc<NodeRuntime>; MAX_CHAIN_HOPS],
+    /// Whether the exit tunnels UDP over the stream to it.
+    pub udp_capable: bool,
 }
 
 impl RouteRuntime {
@@ -34,8 +36,13 @@ impl RouteRuntime {
         for (slot, id) in hops.iter_mut().zip(ids) {
             *slot = Arc::clone(nodes.get(id)?);
         }
+        let exit = &hops[ids.len().saturating_sub(1)].node;
         Some(Self {
             route: *route,
+            udp_capable: crate::descriptor::carries_udp(match ids.len() {
+                1 => crate::descriptor::UdpPath::Own(exit),
+                _ => crate::descriptor::UdpPath::Tunneled { exit },
+            }),
             hops,
         })
     }

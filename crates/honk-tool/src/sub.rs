@@ -558,9 +558,11 @@ impl ProbeOutcome {
     fn timed_out(registry: &ProxyRegistry, node: &Node, targets: &ProbeTargets) -> Self {
         let packet_available = registry
             .find(node.protocol())
-            .filter(|entry| (entry.descriptor.supports_udp)(node))
             .and_then(|entry| entry.packet.as_ref())
-            .is_some();
+            .is_some()
+            && honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(
+                node,
+            ));
         let packet_result = |port| {
             (packet_available && honk_outbound::descriptor::udp_target_allowed(node, port))
                 .then_some(Err(ProbeFailureKind::Timeout))
