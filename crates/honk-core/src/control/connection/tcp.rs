@@ -54,7 +54,7 @@ impl ControlPlaneHandle {
     /// Emergency probes to recover a group with no available candidate: its
     /// leaves (sub-group tags carry no probe state) and its exit, whose death
     /// empties the group too.
-    fn probe_unavailable_group(&self, group: &str) {
+    pub(super) fn probe_unavailable_group(&self, group: &str) {
         let group_manager = self.group_manager.read().clone();
         for node in group_manager.leaf_nodes_in_group(group) {
             self.alive_set.notify_check_tcp(node.id);

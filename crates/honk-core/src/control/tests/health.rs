@@ -589,3 +589,102 @@ async fn c28_dae_tolerance_reload_changes_real_urltest_selection() {
         "the live URLTest policy must apply the adapted global tolerance"
     );
 }
+
+fn loopback_node(name: &str, port: u16, outbound: honk_config::node::OutboundConfig) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        address: format!("127.0.0.1:{port}"),
+        host: "127.0.0.1".into(),
+        port,
+        outbound,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// A UDP flow through a group's `exit` belongs to the exit: the exit's death
+/// retires it and its traffic failures land there, never on the leaf.
+#[tokio::test]
+async fn a_route_udp_flow_binds_its_health_to_the_exit() {
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = server.local_addr().unwrap().port();
+    let held = Arc::new(Mutex::new(Vec::new()));
+    let holder = held.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = server.accept().await {
+            holder.lock().push(stream);
+        }
+    });
+    let relay = crate::test_support::socks5_relay().await;
+    let front = loopback_node(
+        "front",
+        relay.addr.port(),
+        honk_config::node::OutboundConfig::Socks5(Default::default()),
+    );
+    let land = loopback_node(
+        "land",
+        server_port,
+        honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+    );
+    let mut config = Config {
+        nodes: vec![front.clone(), land.clone()],
+        groups: vec![honk_config::group::Group {
+            name: "g".into(),
+            nodes: vec![front.id],
+            exit: Some("land".into()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.global.dial_mode = "ip".into();
+    let mut plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        crate::routing::Router::new(&[], "g").unwrap(),
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        crate::dns::DnsResolver::new(&Default::default()).unwrap(),
+        super::support::test_dns_forwarder(),
+    )
+    .unwrap();
+    plane.udp_pool = Arc::new(
+        crate::control::udp_endpoint::UdpEndpointPool::with_reply_socket_factory(
+            8,
+            Arc::new(super::support::UdpTestReplySocketFactory),
+        ),
+    );
+    let handle = plane.spawn_handle();
+    let client = super::support::addr("10.0.0.2:53000");
+    let retired = super::support::addr("192.0.2.1:5000");
+    let failing = super::support::addr("192.0.2.2:5000");
+    let land_addr = super::support::addr(&land.address);
+
+    super::support::serve_test_udp_to(&handle, client, retired, b"first")
+        .await
+        .unwrap();
+    assert_eq!(relay.requests.lock()[..], [land_addr]);
+    plane.udp_pool.remove_by_node(front.id);
+    assert!(plane.udp_pool.get(client, retired).is_some());
+    plane.udp_pool.remove_by_node(land.id);
+    assert!(plane.udp_pool.get(client, retired).is_none());
+
+    super::support::serve_test_udp_to(&handle, client, failing, b"second")
+        .await
+        .unwrap();
+    assert!(plane.udp_pool.get(client, failing).is_some());
+    assert!(!handle.alive_set.has_udp_state(land.id));
+    held.lock().clear();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !handle.alive_set.has_udp_state(land.id) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the exit records the flow's traffic failure");
+    assert!(plane.udp_pool.shutdown().await.joined);
+}

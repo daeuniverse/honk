@@ -304,6 +304,22 @@ impl GroupManager {
                 })
     }
 
+    /// Whether a UDP target is still selectable before its flow binds: the
+    /// node itself, or a route's leaf and its outermost exit, the same reach
+    /// as selection's exit check.
+    pub fn target_selectable(
+        &self,
+        target: &OwnedTarget,
+        domain: super::ProbeDomain,
+        ipver: super::IpVersion,
+    ) -> bool {
+        let Some(route) = target.route() else {
+            return self.is_node_selectable_for_domain(target.node.id, domain, ipver);
+        };
+        self.is_node_selectable_for_domain(route.leaf(), domain, ipver)
+            && self.node_exit_alive(route.exit(), domain, ipver)
+    }
+
     /// The resolved exit of `group`, for callers that probe it.
     pub fn group_exit(&self, group: &str) -> Option<Uuid> {
         match self.exits.as_deref()?.by_group.get(group)? {
@@ -323,9 +339,16 @@ impl GroupManager {
     /// exit the alive set does not register is never probed, so traffic
     /// alone could hold it dead; it counts as alive.
     fn exit_alive(&self, group: &str, domain: super::ProbeDomain, ipver: super::IpVersion) -> bool {
-        let Some(exit) = self.group_exit(group) else {
-            return true;
-        };
+        self.group_exit(group)
+            .is_none_or(|exit| self.node_exit_alive(exit, domain, ipver))
+    }
+
+    fn node_exit_alive(
+        &self,
+        exit: Uuid,
+        domain: super::ProbeDomain,
+        ipver: super::IpVersion,
+    ) -> bool {
         self.alive_set
             .as_ref()
             .is_none_or(|alive| !alive.is_registered(exit))

@@ -70,6 +70,13 @@ impl OwnedTarget {
         self.route().map_or(self.node.id, Route::exit)
     }
 
+    /// The node a UDP flow binds to once established: a route's exit, whose
+    /// death retires the flow and whose replies carry its health. The
+    /// route's own hops answered only at setup.
+    pub fn udp_binding(&self) -> Uuid {
+        self.route().map_or(self.node.id, Route::exit)
+    }
+
     /// The other nodes a successful dial proves reachable: a route's leaf,
     /// which stands for a configured chain leaf's own hops, and every exit
     /// before the last. Empty for any other target.

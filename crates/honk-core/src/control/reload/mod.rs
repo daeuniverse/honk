@@ -95,9 +95,8 @@ pub(in crate::control) enum OutboundConstraint {
     Unavailable,
 }
 
-/// What a resolved plan dials per entry. A TCP plan holds targets; a UDP
-/// plan holds nodes, since routes through group exits carry TCP only and
-/// selection offers none for UDP.
+/// What a resolved plan dials per entry: a configured node, or a route
+/// through group exits.
 pub(super) trait PlanTarget: Sized {
     fn node(node: Node) -> Self;
     fn own(group_manager: &GroupManager, target: honk_outbound::group::Target<'_>) -> Option<Self>;
@@ -110,17 +109,6 @@ impl PlanTarget for honk_outbound::group::OwnedTarget {
 
     fn own(group_manager: &GroupManager, target: honk_outbound::group::Target<'_>) -> Option<Self> {
         Some(group_manager.own_target(target))
-    }
-}
-
-impl PlanTarget for Node {
-    fn node(node: Node) -> Self {
-        node
-    }
-
-    fn own(_: &GroupManager, target: honk_outbound::group::Target<'_>) -> Option<Self> {
-        debug_assert!(target.route.is_none(), "a UDP plan holds no route");
-        target.route.is_none().then(|| target.node.clone())
     }
 }
 
@@ -316,12 +304,20 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
 #[derive(Debug, Clone)]
 pub(super) struct ResolvedUdpPlan {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
-    pub(super) nodes: Vec<Node>,
+    pub(super) targets: Vec<honk_outbound::group::OwnedTarget>,
     pub(super) ipver: IpVersion,
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
     #[cfg(feature = "native-api")]
     pub(super) observation: Option<Arc<honk_outbound::group::observation::SelectionObservation>>,
+}
+
+#[cfg(test)]
+impl ResolvedUdpPlan {
+    /// The node each entry dials as or through.
+    pub(super) fn nodes(&self) -> Vec<&Node> {
+        self.targets.iter().map(|target| &target.node).collect()
+    }
 }
 
 pub(super) fn resolve_udp_outbound_plan_for_target(
@@ -331,7 +327,7 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
     context: &honk_outbound::group::ScoreSelectionContext,
     constraint: OutboundConstraint,
 ) -> ResolvedUdpPlan {
-    let plan = resolve_outbound_plan_for_target::<Node>(
+    let plan = resolve_outbound_plan_for_target::<honk_outbound::group::OwnedTarget>(
         config,
         group_manager,
         outbound_name,
@@ -340,7 +336,7 @@ pub(super) fn resolve_udp_outbound_plan_for_target(
     );
     ResolvedUdpPlan {
         mode: plan.mode,
-        nodes: plan.targets,
+        targets: plan.targets,
         ipver: plan.health_family,
         feedback: plan.feedback,
         selection_chains: plan.selection_chains,

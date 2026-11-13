@@ -209,6 +209,32 @@ impl ChainHandler {
         .await
     }
 
+    /// UDP through a route's exit over its generation's hop runtimes.
+    pub async fn dial_route_udp(
+        &self,
+        route: &RouteRuntime,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        self.dial_chain(
+            "group exit route",
+            route.hops(),
+            connect_timeout,
+            |exit, hop, carrier, options| {
+                let packet = exit.packet.clone();
+                async move {
+                    let protocol = hop.node.protocol().as_str();
+                    packet
+                        .ok_or(TunnelUnsupported(protocol))?
+                        .dial_udp_over(hop, carrier, target, target_domain, options)
+                        .await
+                }
+            },
+        )
+        .await
+    }
+
     /// One deadline covers the whole chain, the caller's per-candidate bound;
     /// each hop gets what remains of it, capped at `connect_timeout`. A REALITY
     /// mask certificate on a tunneled hop redials the chain once without

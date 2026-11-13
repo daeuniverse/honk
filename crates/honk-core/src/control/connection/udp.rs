@@ -518,22 +518,20 @@ impl ControlPlaneHandle {
         // The same accounting identity survives candidate selection and driver publication.
         lease.set_connection_guard(self.stats.track_outbound(outbound_tracker.clone()));
 
-        if plan.nodes.is_empty() {
+        if plan.targets.is_empty() {
             debug!(
                 "No available candidate nodes for UDP outbound '{}' ({})",
                 outbound_name, client_addr
             );
-            let group_manager = self.group_manager.read().clone();
-            for node in group_manager.leaf_nodes_in_group(&outbound_name) {
-                self.alive_set.notify_check_tcp(node.id);
-            }
+            self.probe_unavailable_group(&outbound_name);
             outbound_tracker.increment_errors();
             if let Some(terminal) = &native_terminal {
                 terminal.outcome(UdpTerminal::NoAvailableCandidate);
             }
             return Ok(());
         }
-        let all_block = super::tcp::only_block_nodes(&plan.nodes);
+        let all_block =
+            super::tcp::only_block_nodes(plan.targets.iter().map(|target| &target.node));
 
         let (connect_timeout, transport_deadline) = {
             let config = self.config.read().await;
@@ -547,7 +545,7 @@ impl ControlPlaneHandle {
         let scheduler_ipver = plan.ipver;
         let runtime_generation = self.runtime_registry.read().clone();
         observation.udp_preparing();
-        let Some((node, prepared)) = self
+        let Some((target, prepared)) = self
             .prepare_udp_candidates(
                 plan,
                 mark,
@@ -594,13 +592,16 @@ impl ControlPlaneHandle {
             dial_mode,
             quic_domain.as_deref(),
             domain_verification,
-            Some((&node, target_domain.as_deref())),
+            Some((&target.node, target_domain.as_deref())),
         );
 
         // The prepared winner is bound only after every speculative loser has
         // been aborted/drained. Close the death-before-bind race again before
-        // creating endpoint state or allowing the driver to send.
-        if !lease.bind_selected_node(node.id) {
+        // creating endpoint state or allowing the driver to send. A route's
+        // flow belongs to its exit: the exit's death retires it and its
+        // traffic health lands there.
+        let health_id = target.udp_binding();
+        if !lease.bind_selected_node(health_id) {
             if let Some(terminal) = &native_terminal {
                 terminal.outcome(UdpTerminal::WinnerBindCancelled);
             }
@@ -612,8 +613,8 @@ impl ControlPlaneHandle {
             ));
         }
         if !lease.still_initializing()
-            || !self.group_manager.read().is_node_selectable_for_domain(
-                node.id,
+            || !self.group_manager.read().target_selectable(
+                &target,
                 ProbeDomain::DataUdp,
                 scheduler_ipver,
             )
@@ -627,9 +628,10 @@ impl ControlPlaneHandle {
             }
             return Err(anyhow::anyhow!(
                 "UDP winner '{}' became ineligible before endpoint setup",
-                node.name
+                target.node.name
             ));
         }
+        let node = &target.node;
         // Final promotion remains pre-publication and inside the unchanged
         // absolute preparation deadline.
         let source_pool = Arc::clone(&self.udp_pool);
@@ -689,7 +691,7 @@ impl ControlPlaneHandle {
                     flow.select_attempt(&attempt.id().to_string());
                 }
             }
-            observation.selected(&selection_chain, &node);
+            observation.selected(&selection_chain, &target);
             observation.release_selection();
         }
         if let Some(reporter) = &score_reporter {
@@ -725,7 +727,7 @@ impl ControlPlaneHandle {
                     transport,
                     relay_addr,
                     target_is_domain,
-                    node.id,
+                    health_id,
                     scheduler_ipver,
                     score_reporter,
                 );
@@ -738,7 +740,7 @@ impl ControlPlaneHandle {
                 target_domain.as_deref(),
                 Arc::clone(&reply_socket),
                 outbound_tracker.clone(),
-                node.id,
+                health_id,
                 scheduler_ipver,
                 score_reporter,
             ),
@@ -837,7 +839,7 @@ impl ControlPlaneHandle {
                         native_flow_id: endpoint.native.flow().map(|flow| flow.id().to_owned()),
                         rule,
                         rule_payload,
-                        chains: connection_chains(selection_chain, &node, None),
+                        chains: connection_chains(selection_chain, node, target.hop_names()),
                         upload,
                         download,
                         start_time: std::time::Instant::now(),

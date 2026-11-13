@@ -680,7 +680,10 @@ fn chain_group_udp_plan(config: &Config) -> Vec<Node> {
         &context,
         crate::control::reload::OutboundConstraint::Any,
     )
-    .nodes
+    .nodes()
+    .into_iter()
+    .cloned()
+    .collect()
 }
 
 /// The configured `final` takes the group's UDP exactly when the chain's exit
@@ -725,7 +728,10 @@ fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
         crate::control::reload::OutboundConstraint::Any,
     );
     assert_eq!(
-        plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        plan.targets
+            .iter()
+            .map(|target| target.node.id)
+            .collect::<Vec<_>>(),
         [backup]
     );
     assert_eq!(

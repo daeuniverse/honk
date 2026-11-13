@@ -525,6 +525,49 @@ impl ProxyRegistry {
             .await
     }
 
+    /// Generation-pinned UDP over a route through group exits: its exit
+    /// tunnels UDP over the stream the earlier hops open. The exit answers
+    /// the destination-port policy, as the node that frames the UDP. A route
+    /// never shares a source: its runtime is not a node of the generation.
+    pub async fn dial_udp_route(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        route: &honk_config::route::Route,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+        let runtime = generation
+            .route_runtime(route)
+            .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        let exit = runtime.hops().last().map(|exit| &exit.node);
+        if !exit.is_some_and(|exit| crate::descriptor::udp_target_allowed(exit, target.port())) {
+            return Err(PacketRejection::Policy.into());
+        }
+        if !runtime.udp_capable {
+            anyhow::bail!("UDP not supported through this route's exit");
+        }
+        let result = generation
+            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_udp(
+                &runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )))
+            .await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during dial");
+        }
+        Ok(result)
+    }
+
     /// Generation-pinned framed UDP transport for an authoritative flow.
     pub async fn dial_udp_transport_runtime(
         &self,

@@ -6,7 +6,6 @@
 
 use crate::group::SelectionPlanMode;
 use futures::{FutureExt, StreamExt, stream::FuturesUnordered};
-use honk_config::node::Node;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -15,17 +14,21 @@ use std::time::Duration;
 
 /// One candidate transport-preparation future. The candidate index preserves
 /// path-specific feedback when the same leaf appears through multiple groups.
-pub(super) type UdpPrepare<T> = Arc<
-    dyn Fn(usize, Node) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> + Send + Sync,
->;
+/// `C` is the candidate: a node, or a dialing target that may be a route.
+pub(super) type UdpPrepare<T, C> =
+    Arc<dyn Fn(usize, C) -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>> + Send + Sync>;
+
+/// Reports a completed transport failure with its error.
+pub(super) type UdpDialError<C> = Arc<dyn Fn(&C, &anyhow::Error) + Send + Sync>;
 
 /// Fixed callbacks let the scheduler keep policy, health, and metric effects
 /// at the integration boundary. Completed transport errors trigger
-/// `on_dial_error`; rejected, aborted and never-started candidates are neutral.
-pub(super) struct UdpStaggerCallbacks {
-    pub(super) allows_target: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
-    pub(super) is_eligible: Arc<dyn Fn(&Node) -> bool + Send + Sync>,
-    pub(super) on_dial_error: Arc<dyn Fn(&Node) + Send + Sync>,
+/// `on_dial_error` with the error, which names a chain's failed hop;
+/// rejected, aborted and never-started candidates are neutral.
+pub(super) struct UdpStaggerCallbacks<C> {
+    pub(super) allows_target: Arc<dyn Fn(&C) -> bool + Send + Sync>,
+    pub(super) is_eligible: Arc<dyn Fn(&C) -> bool + Send + Sync>,
+    pub(super) on_dial_error: UdpDialError<C>,
     pub(super) on_attempt: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_winner: Arc<dyn Fn() + Send + Sync>,
     pub(super) on_cancellation: Arc<dyn Fn() + Send + Sync>,
@@ -46,18 +49,19 @@ fn stagger_offset(index: usize) -> Duration {
 /// caller supplied more. A winner or deadline aborts and drains every started
 /// loser before this function returns, so speculative transports and dial
 /// permits cannot leak into the endpoint/lease lifecycle.
-pub(super) async fn prepare_udp_plan<T>(
+pub(super) async fn prepare_udp_plan<T, C>(
     mode: SelectionPlanMode,
-    candidates: Vec<Node>,
+    candidates: Vec<C>,
     deadline: tokio::time::Instant,
-    prepare: UdpPrepare<T>,
-    callbacks: UdpStaggerCallbacks,
-) -> anyhow::Result<Option<(Node, T)>>
+    prepare: UdpPrepare<T, C>,
+    callbacks: UdpStaggerCallbacks<C>,
+) -> anyhow::Result<Option<(C, T)>>
 where
     T: Send + 'static,
+    C: Clone + Send + 'static,
 {
     let records_stagger_metrics = mode == SelectionPlanMode::ColdUrlTest;
-    let candidates: Vec<Node> = match mode {
+    let candidates: Vec<C> = match mode {
         SelectionPlanMode::Authoritative => candidates.into_iter().take(1).collect(),
         SelectionPlanMode::ColdUrlTest => candidates,
     };
@@ -144,7 +148,7 @@ where
                     rejection = Some(error);
                     break 'schedule None;
                 }
-                (callbacks.on_dial_error)(&node);
+                (callbacks.on_dial_error)(&node, &error);
             }
         }
     };
@@ -159,7 +163,7 @@ where
                 if honk_outbound::proxy::is_packet_rejection(&error) {
                     rejection.get_or_insert(error);
                 } else {
-                    (callbacks.on_dial_error)(&node);
+                    (callbacks.on_dial_error)(&node, &error);
                 }
             }
             Ok((_, None)) => cancelled += 1,
