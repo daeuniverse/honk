@@ -34,6 +34,10 @@ pub struct ProtocolEntry {
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
     pub shared: Option<Arc<dyn SharedSourceOutbound>>,
+    /// Shares one association per client source when this protocol is a
+    /// chain's exit; only a handler implementing
+    /// [`SharedSourceOutbound::prepare_shared_source_over`] registers it.
+    pub tunneled_shared: Option<Arc<dyn SharedSourceOutbound>>,
 }
 
 impl ProtocolEntry {
@@ -45,6 +49,7 @@ impl ProtocolEntry {
             warmable: None,
             probeable: None,
             shared: None,
+            tunneled_shared: None,
         }
     }
 
@@ -65,6 +70,14 @@ impl ProtocolEntry {
 
     pub fn with_shared<T: SharedSourceOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
         self.shared = Some(handler);
+        self
+    }
+
+    pub fn with_tunneled_shared<T: SharedSourceOutbound + 'static>(
+        mut self,
+        handler: Arc<T>,
+    ) -> Self {
+        self.tunneled_shared = Some(handler);
         self
     }
 
@@ -152,6 +165,7 @@ impl ProxyRegistry {
             ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
                 .with_packet(trojan.clone())
                 .with_shared(trojan.clone())
+                .with_tunneled_shared(trojan.clone())
                 .with_warmable(trojan.clone())
                 .with_probeable(trojan),
         );
@@ -220,11 +234,14 @@ impl ProxyRegistry {
                 warmable: None,
                 probeable: None,
                 shared: entry.shared.clone(),
+                tunneled_shared: entry.tunneled_shared.clone(),
             })
             .collect();
         let chain = Arc::new(ChainHandler::new(hop_handlers));
         registry.register(
-            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)).with_packet(chain.clone()),
+            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain))
+                .with_packet(chain.clone())
+                .with_shared(chain.clone()),
         );
         registry.chain = Some(chain);
         for entry in &registry.entries {
@@ -588,6 +605,21 @@ impl ProxyRegistry {
     pub fn has_shared_source(&self, protocol: NodeProtocol) -> bool {
         self.find(protocol)
             .is_some_and(|entry| entry.shared.is_some())
+    }
+
+    /// [`Self::has_shared_source`] for a captured runtime. A chain shares
+    /// one association only through an exit registered as a tunneled shared
+    /// source; a chain without hops in its generation shares nothing.
+    pub fn has_shared_source_for(&self, runtime: &crate::runtime::NodeRuntime) -> bool {
+        let protocol = runtime.node.protocol();
+        if protocol != NodeProtocol::Chain {
+            return self.has_shared_source(protocol);
+        }
+        runtime.udp_capable
+            && runtime.chain_hops().last().is_some_and(|exit| {
+                self.find(exit.node.protocol())
+                    .is_some_and(|entry| entry.tunneled_shared.is_some())
+            })
     }
 
     /// Shared-source association for a captured runtime. The caller owns the

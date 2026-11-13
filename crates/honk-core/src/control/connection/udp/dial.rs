@@ -19,7 +19,12 @@ pub(super) enum PreparedEndpointTransport {
 
 /// The registry decides which protocols share one association per source: a
 /// protocol joins by registering a shared-source slot, not by a core list.
-pub(super) fn source_path(registry: &ProxyRegistry, node: &Node, port: u16) -> Option<SourcePath> {
+pub(super) fn source_path(
+    registry: &ProxyRegistry,
+    generation: &honk_outbound::runtime::OutboundRuntimeRegistry,
+    node: &Node,
+    port: u16,
+) -> Option<SourcePath> {
     let protocol = node.protocol();
     let shared = || {
         registry
@@ -41,6 +46,10 @@ pub(super) fn source_path(registry: &ProxyRegistry, node: &Node, port: u16) -> O
                 VlessUdpPath::Native => None,
             }
         }
+        honk_config::types::NodeProtocol::Chain => generation
+            .get(&node.id)
+            .filter(|runtime| registry.has_shared_source_for(runtime))
+            .map(|_| SourcePath::Shared),
         _ => {
             let _ = port;
             shared()
@@ -144,7 +153,9 @@ impl ControlPlaneHandle {
                         .map(PreparedEndpointTransport::Flow)
                     };
                     let operation = async {
-                        if let Some(path) = source_path(&registry, &node, original_dst.port()) {
+                        if let Some(path) =
+                            source_path(&registry, &runtime_generation, &node, original_dst.port())
+                        {
                             let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "node {} is not in the captured runtime generation",

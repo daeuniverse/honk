@@ -332,6 +332,43 @@ async fn a_chain_whose_exit_cannot_carry_udp_refuses_udp() {
     );
 }
 
+/// A chain shares a source only through an exit whose protocol registers
+/// the tunneled shared slot; the ordinary shared slot is not enough.
+#[test]
+fn only_registered_tunneled_shared_exits_share_a_source() {
+    let front = socks5("front", "127.0.0.1", 9);
+    let land = trojan_exit("land", "127.0.0.1", 443);
+    let via = chain(&[&front, &land]);
+    let generation = OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap();
+    let runtime = generation.get(&via.id).unwrap();
+    let trojan = Arc::new(crate::proxy::trojan::TrojanHandler::new());
+    for tunneled in [false, true] {
+        let mut entry = ProtocolEntry::new(NodeProtocol::Trojan, Arc::clone(&trojan))
+            .with_packet(Arc::clone(&trojan))
+            .with_shared(Arc::clone(&trojan));
+        if tunneled {
+            entry = entry.with_tunneled_shared(Arc::clone(&trojan));
+        }
+        let mut registry = ProxyRegistry::new();
+        registry.register(entry);
+        assert_eq!(registry.has_shared_source_for(&runtime), tunneled);
+    }
+}
+
+/// A chain runtime built without its hops shares no source, though Chain
+/// registers a shared slot.
+#[tokio::test]
+async fn a_hopless_chain_has_no_shared_source() {
+    let via = chain(&[
+        &socks5("front", "127.0.0.1", 9),
+        &trojan_exit("land", "127.0.0.1", 443),
+    ]);
+    let registry = ProxyRegistry::default_resolver().unwrap();
+    let held = crate::runtime::NodeRuntime::ephemeral_guarded_after_admission(&via);
+    assert!(registry.has_shared_source(NodeProtocol::Chain));
+    assert!(!registry.has_shared_source_for(&held.runtime()));
+}
+
 /// A generation decides a chain's UDP from its exit, for a configured chain
 /// and a route through group exits alike.
 #[test]

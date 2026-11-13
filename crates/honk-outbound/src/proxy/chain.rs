@@ -9,9 +9,10 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use super::{
-    AsyncReadWrite, ChainHopFailure, NodeFailure, PacketOutbound, PacketRejection, PacketTransport,
-    ProtocolEntry, ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported,
-    is_packet_rejection, target_failure,
+    AsyncReadWrite, ChainHopFailure, MultiTargetTransport, NodeFailure, PacketOutbound,
+    PacketRejection, PacketTransport, PreparedUdpTransport, ProtocolEntry, ProxyStream,
+    SharedSourceOutbound, TcpOutbound, TunnelDialOptions, TunnelUnsupported, is_packet_rejection,
+    target_failure,
 };
 use crate::runtime::flow_observation::without_target_milestones;
 use crate::runtime::{NodeRuntime, RouteRuntime};
@@ -304,6 +305,43 @@ impl PacketOutbound for ChainHandler {
             },
         )
         .await
+    }
+}
+
+/// One association through the chain for a whole client source, over the
+/// exit's tunneled shared slot. The exit's handshake runs on a carrier the
+/// chain owns, so a speculative preparation has nothing to hold back until
+/// commit.
+#[async_trait]
+impl SharedSourceOutbound for ChainHandler {
+    async fn prepare_shared_source(
+        &self,
+        runtime: Arc<NodeRuntime>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+        _speculative: bool,
+    ) -> anyhow::Result<PreparedUdpTransport<dyn MultiTargetTransport>> {
+        if !runtime.udp_capable {
+            return Err(PacketRejection::Policy.into());
+        }
+        self.dial_chain(
+            &runtime.node.name,
+            runtime.chain_hops(),
+            connect_timeout,
+            |exit, hop, carrier, options| {
+                let shared = exit.tunneled_shared.clone();
+                async move {
+                    let protocol = hop.node.protocol().as_str();
+                    shared
+                        .ok_or(TunnelUnsupported(protocol))?
+                        .prepare_shared_source_over(hop, carrier, target, target_domain, options)
+                        .await
+                }
+            },
+        )
+        .await
+        .map(PreparedUdpTransport::ready)
     }
 }
 
