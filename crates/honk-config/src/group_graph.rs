@@ -247,8 +247,13 @@ pub enum Step {
 pub trait Visitor {
     /// Before a group's members, with the exits of the groups around it,
     /// outermost first.
-    fn enter(&mut self, _group: usize, _depth: usize, _outer_exits: &[Uuid]) -> Step {
-        Step::Descend
+    fn enter(
+        &mut self,
+        _group: usize,
+        _depth: usize,
+        _outer_exits: &[Uuid],
+    ) -> ControlFlow<(), Step> {
+        ControlFlow::Continue(Step::Descend)
     }
 
     /// `exits` holds the exits of every group on the path, this leaf's own
@@ -276,7 +281,7 @@ impl<V: Visitor> Walk<'_, '_, '_, V> {
         {
             return ControlFlow::Continue(false);
         }
-        if self.visitor.enter(group, depth, &self.exits) == Step::Skip {
+        if self.visitor.enter(group, depth, &self.exits)? == Step::Skip {
             return ControlFlow::Continue(true);
         }
         let edges = &self.graph.groups[group];
