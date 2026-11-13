@@ -1140,9 +1140,9 @@ impl Config {
     /// Index of the first group from which some leaf's route through group
     /// exits is longer than `MAX_CHAIN_HOPS`. Each leaf is composed with the
     /// exits on its path by [`group_graph::compose`], as selection dials it.
-    /// The walk reaches one group deeper than selection, follows a cycle
-    /// until that depth, counts every node a `final` names and a zero-hop leaf
-    /// in every group, so an exit stack alone also counts.
+    /// The walk reaches as far as selection does: the same depth limit, each
+    /// group once per path, only the first node a `final` names. It also counts
+    /// a zero-hop leaf in every group, so an exit stack alone counts.
     ///
     /// [`group_graph::compose`]: crate::group_graph::compose
     fn overlong_group_route(&self) -> Option<usize> {

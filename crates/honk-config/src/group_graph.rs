@@ -192,37 +192,19 @@ impl<'a> GroupGraph<'a> {
     }
 }
 
-/// How far a traversal goes.
+/// How far a traversal goes. A group already on the current path is not
+/// entered again, and a `final` naming several nodes reaches the first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Groups on one path; the root is at depth 0.
-    pub max_depth: usize,
-    pub cycles: Cycles,
-    pub finals: Finals,
+    pub(crate) max_depth: usize,
 }
 
 impl Limits {
     /// What group selection reaches.
     pub const SELECTION: Self = Self {
         max_depth: MAX_GROUP_DEPTH,
-        cycles: Cycles::PathGuard,
-        finals: Finals::First,
     };
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Cycles {
-    /// A group already on the current path is not entered again.
-    PathGuard,
-    /// Only the depth limit stops a cycle.
-    DepthOnly,
-}
-
-/// Which nodes a `final` naming several nodes reaches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Finals {
-    First,
-    Every,
 }
 
 /// A leaf reached by a traversal.
@@ -276,9 +258,7 @@ struct Walk<'g, 'a, 'v, V> {
 
 impl<V: Visitor> Walk<'_, '_, '_, V> {
     fn group(&mut self, group: usize, depth: usize) -> ControlFlow<(), bool> {
-        if depth >= self.limits.max_depth
-            || (self.limits.cycles == Cycles::PathGuard && self.path.contains(&group))
-        {
+        if depth >= self.limits.max_depth || self.path.contains(&group) {
             return ControlFlow::Continue(false);
         }
         if self.visitor.enter(group, depth, &self.exits)? == Step::Skip {
@@ -303,13 +283,7 @@ impl<V: Visitor> Walk<'_, '_, '_, V> {
             Some(FinalEdge::Direct) => self.visitor.leaf(Leaf::Direct, &self.exits)?,
             Some(FinalEdge::Block) => self.visitor.leaf(Leaf::Block, &self.exits)?,
             Some(FinalEdge::Nodes(nodes)) => {
-                let reached = match self.limits.finals {
-                    Finals::First => &nodes[..1],
-                    Finals::Every => &nodes[..],
-                };
-                for node in reached {
-                    self.visitor.leaf(Leaf::Node(*node), &self.exits)?;
-                }
+                self.visitor.leaf(Leaf::Node(nodes[0]), &self.exits)?;
             }
             Some(FinalEdge::Group(final_group)) => {
                 complete &= self.group(*final_group, depth + 1)?;

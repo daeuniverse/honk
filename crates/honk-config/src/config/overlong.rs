@@ -5,21 +5,15 @@ use std::ops::ControlFlow;
 
 use uuid::Uuid;
 
-use crate::group::MAX_GROUP_DEPTH;
-use crate::group_graph::{
-    Composed, Cycles, Finals, GroupGraph, Leaf, Limits, Step, Visitor, compose,
-};
+use crate::group_graph::{Composed, GroupGraph, Leaf, Limits, Step, Visitor, compose};
 use crate::types::NodeProtocol;
 
-/// The validator's reach, wider than [`Limits::SELECTION`]: one group
-/// deeper, a cycle followed to that depth, and every node a `final` names.
-/// Narrowing it to selection's reach accepts more configurations, so it
-/// waits for its own change.
-const REACH: Limits = Limits {
-    max_depth: MAX_GROUP_DEPTH + 1,
-    cycles: Cycles::DepthOnly,
-    finals: Finals::Every,
-};
+/// The validator's limits are selection's: the same depth, each group once
+/// on a path, the first node a `final` names. It is still stricter than
+/// selection: it walks the graph before cycles are cut, starts from every
+/// declared group, shadowed namesakes included, and counts a group's exit
+/// stack even when the group has no leaf.
+const REACH: Limits = Limits::SELECTION;
 
 /// A route's length is the length of its part below a group, which depends
 /// only on the nearest exit outside that group, plus the length of the exits

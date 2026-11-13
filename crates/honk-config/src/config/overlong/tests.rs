@@ -2,8 +2,9 @@ use crate::Config;
 use crate::node::Node;
 use crate::parser::parse_dae_config;
 
-/// The validator's route-length walk before the group graph, kept as the
-/// oracle that the accepted configurations did not change.
+/// The validator's route-length walk before the group graph, narrowed to
+/// selection's reach: eight groups on a path, no group twice on one path,
+/// and the first node a `final` names.
 fn oracle(config: &Config) -> Option<usize> {
     use std::collections::HashMap;
 
@@ -12,7 +13,7 @@ fn oracle(config: &Config) -> Option<usize> {
         by_name: HashMap<&'a str, Vec<&'a Node>>,
         groups: HashMap<&'a str, &'a crate::group::Group>,
     }
-    impl Walk<'_> {
+    impl<'a> Walk<'a> {
         fn leaf(node: &Node, next: Option<&str>) -> usize {
             let (hops, last) = match node.protocol() {
                 crate::types::NodeProtocol::Block | crate::types::NodeProtocol::Direct => {
@@ -26,7 +27,19 @@ fn oracle(config: &Config) -> Option<usize> {
             hops - usize::from(last.is_some() && last == next)
         }
 
-        fn longest(&self, group: &crate::group::Group, depth: usize, next: Option<&str>) -> usize {
+        fn longest(
+            &self,
+            group: &'a crate::group::Group,
+            path: &[&'a str],
+            next: Option<&str>,
+        ) -> usize {
+            let depth = path.len();
+            let path = [path, &[group.name.as_str()]].concat();
+            let enter = |name: &str| {
+                (depth + 1 < crate::group::MAX_GROUP_DEPTH && !path.contains(&name))
+                    .then(|| self.groups.get(name))
+                    .flatten()
+            };
             let exit = group.exit.as_deref();
             let inner_next = exit.or(next);
             let leaves = group
@@ -35,24 +48,17 @@ fn oracle(config: &Config) -> Option<usize> {
                 .filter_map(|id| self.by_id.get(id))
                 .map(|node| Self::leaf(node, inner_next));
             let nested = group.groups.iter().filter_map(|name| {
-                (depth < 8)
-                    .then(|| self.groups.get(name.as_str()))
-                    .flatten()
-                    .map(|nested| self.longest(nested, depth + 1, inner_next))
+                enter(name.as_str()).map(|nested| self.longest(nested, &path, inner_next))
             });
             let fallback =
                 group
                     .final_outbound
                     .as_deref()
                     .and_then(|name| match self.by_name.get(name) {
-                        Some(namesakes) => namesakes
-                            .iter()
-                            .map(|node| Self::leaf(node, inner_next))
-                            .max(),
-                        None => (depth < 8)
-                            .then(|| self.groups.get(name))
-                            .flatten()
-                            .map(|nested| self.longest(nested, depth + 1, inner_next)),
+                        Some(namesakes) => {
+                            namesakes.first().map(|node| Self::leaf(node, inner_next))
+                        }
+                        None => enter(name).map(|nested| self.longest(nested, &path, inner_next)),
                     });
             let inner = leaves.chain(nested).chain(fallback).max().unwrap_or(0);
             inner + usize::from(exit.is_some() && exit != next)
@@ -77,7 +83,7 @@ fn oracle(config: &Config) -> Option<usize> {
     config
         .groups
         .iter()
-        .position(|group| walk.longest(group, 0, None) > crate::node::MAX_CHAIN_HOPS)
+        .position(|group| walk.longest(group, &[], None) > crate::node::MAX_CHAIN_HOPS)
 }
 
 /// A small deterministic generator, so a failure names its seed.
@@ -152,7 +158,7 @@ fn random_config(rng: &mut Rng) -> String {
 }
 
 #[test]
-fn route_length_validation_accepts_what_it_accepted_before_the_group_graph() {
+fn route_length_validation_matches_the_walk_at_selection_reach() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let (mut overlong, mut within) = (0, 0);
     for case in 0..4000 {
@@ -204,15 +210,18 @@ fn two_level(exits: [&str; 9], leaf_group: usize) -> Config {
 }
 
 #[test]
-fn validation_still_walks_one_group_deeper_than_selection() {
-    // The ninth group from g0 is past selection's reach; its exit still
-    // counts until validation narrows to that reach.
-    let config = two_level(["x", "y", "x", "y", "", "", "", "", "x"], 8);
+fn validation_and_selection_cut_at_the_same_depth() {
+    // From g0 the route through the ninth group, m-x-y-x-y, is five hops,
+    // but selection never reaches that group from g0; from g1, which does,
+    // it is four. One group up, g0 reaches it and the route counts.
+    let config = two_level(["y", "x", "y", "", "", "", "", "", "x"], 8);
+    assert_eq!(config.overlong_group_route(), None);
+    let config = two_level(["y", "x", "y", "", "", "", "", "x", ""], 7);
     assert_eq!(config.overlong_group_route(), Some(0));
 }
 
 #[test]
-fn validation_still_counts_every_node_a_final_names() {
+fn a_final_names_the_first_declared_namesake_everywhere() {
     let config = |long_first: bool| {
         let (first, second) = match long_first {
             true => ("a -> b -> c -> d", "'socks5://127.0.0.1:1005'"),
@@ -224,6 +233,18 @@ fn validation_still_counts_every_node_a_final_names() {
         .unwrap()
     };
     assert_eq!(config(true).overlong_group_route(), Some(0));
-    // Selection dials the first namesake; the later one still counts.
-    assert_eq!(config(false).overlong_group_route(), Some(0));
+    // Selection dials the first namesake, so the later one no longer counts.
+    assert_eq!(config(false).overlong_group_route(), None);
+}
+
+#[test]
+fn a_cycle_through_exit_groups_counts_each_group_once() {
+    // Followed to the depth limit, g0 -> g1 -> g0 -> ... would put m behind
+    // x-y-x-y-x; selection enters each group once per path, so the longest
+    // route is m-x-y, from g1.
+    let config = parse_dae_config(
+        "node {\n m: 'socks5://127.0.0.1:1000'\n x: 'socks5://127.0.0.1:1001'\n y: 'socks5://127.0.0.1:1002'\n}\ngroup {\n g0 {\n  filter: name(m)\n  filter: group(g1)\n  exit: x\n }\n g1 {\n  filter: group(g0)\n  exit: y\n }\n}\nrouting {\n fallback: direct\n}\n",
+    )
+    .unwrap();
+    assert_eq!(config.overlong_group_route(), None);
 }

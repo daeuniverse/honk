@@ -132,7 +132,7 @@ fn an_exit_that_does_not_name_one_tunnel_node_is_unresolved() {
 }
 
 #[test]
-fn a_final_reaches_its_first_namesake_or_every_namesake() {
+fn a_final_reaches_its_first_namesake() {
     let config = config(" g {\n  filter: name(e1)\n  final: m\n }\n m {\n  filter: name(e2)\n }");
     let graph = GroupGraph::new(&config.groups, &config.nodes);
     let namesakes: Vec<Uuid> = config
@@ -142,25 +142,14 @@ fn a_final_reaches_its_first_namesake_or_every_namesake() {
         .map(|node| node.id)
         .collect();
     assert_eq!(namesakes.len(), 2);
-    let finals = |finals| {
-        leaves(
-            &graph,
-            "g",
-            Limits {
-                finals,
-                ..Limits::SELECTION
-            },
-        )
-        .into_iter()
-        .skip(1)
-        .map(|(leaf, _)| leaf)
-        .collect::<Vec<_>>()
-    };
     // A node of the final's name wins over a group of that name.
-    assert_eq!(finals(Finals::First), [Leaf::Node(namesakes[0])]);
     assert_eq!(
-        finals(Finals::Every),
-        [Leaf::Node(namesakes[0]), Leaf::Node(namesakes[1])]
+        leaves(&graph, "g", Limits::SELECTION)
+            .into_iter()
+            .skip(1)
+            .map(|(leaf, _)| leaf)
+            .collect::<Vec<_>>(),
+        [Leaf::Node(namesakes[0])]
     );
 }
 
@@ -185,11 +174,6 @@ fn the_depth_limit_counts_groups_from_the_root() {
         leaves(&graph, "g0", Limits::SELECTION).len(),
         MAX_GROUP_DEPTH
     );
-    let deeper = Limits {
-        max_depth: MAX_GROUP_DEPTH + 1,
-        ..Limits::SELECTION
-    };
-    assert_eq!(leaves(&graph, "g0", deeper).len(), MAX_GROUP_DEPTH + 1);
 }
 
 #[derive(Default)]
@@ -206,17 +190,12 @@ impl Visitor for Completeness {
 }
 
 #[test]
-fn a_cycle_stops_at_the_path_guard_or_the_depth_limit() {
+fn a_cycle_stops_at_the_path_guard() {
     let config = config(
         " a {\n  filter: name(e1)\n  filter: group(b)\n }\n b {\n  filter: name(e2)\n  filter: group(a)\n }",
     );
     let graph = GroupGraph::new(&config.groups, &config.nodes);
     assert_eq!(leaves(&graph, "a", Limits::SELECTION).len(), 2);
-    let depth_only = Limits {
-        cycles: Cycles::DepthOnly,
-        ..Limits::SELECTION
-    };
-    assert_eq!(leaves(&graph, "a", depth_only).len(), MAX_GROUP_DEPTH);
     let mut completeness = Completeness::default();
     let _ = graph.visit(0, Limits::SELECTION, &mut completeness);
     assert_eq!(completeness.0, [(1, false), (0, false)]);

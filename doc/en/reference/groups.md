@@ -328,7 +328,7 @@ A group with `exit: E` dials its selected leaf as a route: the leaf, then the ex
 - Probes, delay tests and the latency shown for the group measure the leaf alone. Flows and DNS flows report the leaf captured when the route was selected; the Clash connection chain also lists the route's hops.
 - `final: direct` dials the exit itself, so its health and a Score retry's exclusion land on the exit, and the connection's chain lists the exit, then `direct`, then the group.
 - A leaf that is the exit, a chain leaf whose last hop is the exit, and nested groups that name the same exit all enter it once instead of tunneling it through itself.
-- Validation counts members, nested groups and `final`, and rejects a route longer than four hops.
+- Validation rejects a route longer than four hops. It uses selection's limits (eight nested groups at most, each group once on a path, only the first node a `final` names) but is stricter than selection: it walks the groups before cycles are cut, starts from every declared group, shadowed namesakes included, and counts a group's exit stack even when the group has no leaf. So it can reject a route selection never dials.
 
 ### How many routes
 
