@@ -1664,7 +1664,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-02"
-source = { file = "doc/en/reference/dns.md", fence = 2 }
+source = { file = "doc/en/reference/dns.md", fence = 3 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -1676,7 +1676,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-dns-03"
-source = { file = "doc/en/reference/dns.md", fence = 3 }
+source = { file = "doc/en/reference/dns.md", fence = 5 }
 wrap = "dns.upstream"
 layer = "structure"
 honk = "accept"
@@ -1687,7 +1687,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-04"
-source = { file = "doc/en/reference/dns.md", fence = 5 }
+source = { file = "doc/en/reference/dns.md", fence = 9 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -1698,7 +1698,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-dns-05"
-source = { file = "doc/en/reference/dns.md", fence = 6 }
+source = { file = "doc/en/reference/dns.md", fence = 10 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1710,7 +1710,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-dns-06"
-source = { file = "doc/en/reference/dns.md", fence = 4 }
+source = { file = "doc/en/reference/dns.md", fence = 8 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1719,6 +1719,51 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{alidns:'udp://223.5.5.5:53'providerdoh:'https://doh.provider.example/dns-query'->'"
+
+[[case]]
+id = "honk-doc-en-reference-dns-07"
+source = { file = "doc/en/reference/dns.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-dns-08"
+source = { file = "doc/en/reference/dns.md", fence = 4 }
+wrap = "dns"
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-dns-09"
+source = { file = "doc/en/reference/dns.md", fence = 6 }
+wrap = "dns"
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{default:'udp://223.5.5.5:53'->'"
+
+[[case]]
+id = "honk-doc-en-reference-dns-10"
+source = { file = "doc/en/reference/dns.md", fence = 7 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-experimental-01"
@@ -1749,13 +1794,35 @@ wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
-honk_diagnostics = ["legacy-quoted-list"]
+honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-groups-01"
 source = { file = "doc/en/reference/groups.md", fence = 1 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-groups-02"
+source = { file = "doc/en/reference/groups.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-groups-03"
+source = { file = "doc/en/reference/groups.md", fence = 3 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1783,13 +1850,13 @@ wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
-honk_diagnostics = ["invalid-config-value"]
+honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-03"
-source = { file = "doc/en/reference/nodes.md", fence = 4 }
+source = { file = "doc/en/reference/nodes.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1800,7 +1867,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-nodes-04"
-source = { file = "doc/en/reference/nodes.md", fence = 5 }
+source = { file = "doc/en/reference/nodes.md", fence = 8 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1812,6 +1879,39 @@ unknown_sections = 0
 [[case]]
 id = "honk-doc-en-reference-nodes-05"
 source = { file = "doc/en/reference/nodes.md", fence = 3 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-nodes-06"
+source = { file = "doc/en/reference/nodes.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-nodes-07"
+source = { file = "doc/en/reference/nodes.md", fence = 6 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-nodes-08"
+source = { file = "doc/en/reference/nodes.md", fence = 7 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1833,7 +1933,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-reference-routing-02"
-source = { file = "doc/en/reference/routing.md", fence = 3 }
+source = { file = "doc/en/reference/routing.md", fence = 4 }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -1845,7 +1945,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-03"
-source = { file = "doc/en/reference/routing.md", fence = 4 }
+source = { file = "doc/en/reference/routing.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -1857,7 +1957,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-en-reference-routing-marks"
-source = { file = "doc/en/reference/routing.md", fence = 2 }
+source = { file = "doc/en/reference/routing.md", fence = 3 }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -1865,6 +1965,18 @@ dae = "accept"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-reference-routing-04"
+source = { file = "doc/en/reference/routing.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'routing{domain(full:'*.example.com')->proxydomain(regex:'(^|\\.)example\\.com$')->proxydomain(suffix:'example.com')->proxy!geosite:'"
 
 [[case]]
 id = "honk-doc-en-reference-subscription-01"
@@ -2005,7 +2117,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-02"
-source = { file = "doc/zh/reference/dns.md", fence = 2 }
+source = { file = "doc/zh/reference/dns.md", fence = 3 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -2017,7 +2129,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-dns-03"
-source = { file = "doc/zh/reference/dns.md", fence = 3 }
+source = { file = "doc/zh/reference/dns.md", fence = 5 }
 wrap = "dns.upstream"
 layer = "structure"
 honk = "accept"
@@ -2028,7 +2140,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-04"
-source = { file = "doc/zh/reference/dns.md", fence = 5 }
+source = { file = "doc/zh/reference/dns.md", fence = 9 }
 wrap = "dns"
 layer = "structure"
 honk = "accept"
@@ -2039,7 +2151,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-dns-05"
-source = { file = "doc/zh/reference/dns.md", fence = 6 }
+source = { file = "doc/zh/reference/dns.md", fence = 10 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2051,7 +2163,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-dns-06"
-source = { file = "doc/zh/reference/dns.md", fence = 4 }
+source = { file = "doc/zh/reference/dns.md", fence = 8 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2060,6 +2172,51 @@ honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{alidns:'udp://223.5.5.5:53'providerdoh:'https://doh.provider.example/dns-query'->'"
+
+[[case]]
+id = "honk-doc-zh-reference-dns-07"
+source = { file = "doc/zh/reference/dns.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-dns-08"
+source = { file = "doc/zh/reference/dns.md", fence = 4 }
+wrap = "dns"
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-dns-09"
+source = { file = "doc/zh/reference/dns.md", fence = 6 }
+wrap = "dns"
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^^: no viable alternative at input 'dns{upstream{default:'udp://223.5.5.5:53'->'"
+
+[[case]]
+id = "honk-doc-zh-reference-dns-10"
+source = { file = "doc/zh/reference/dns.md", fence = 7 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-experimental-01"
@@ -2090,13 +2247,35 @@ wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
-honk_diagnostics = ["legacy-quoted-list"]
+honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-groups-01"
 source = { file = "doc/zh/reference/groups.md", fence = 1 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-groups-02"
+source = { file = "doc/zh/reference/groups.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-groups-03"
+source = { file = "doc/zh/reference/groups.md", fence = 3 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2124,13 +2303,13 @@ wrap = ""
 layer = "structure"
 honk = "accept"
 dae = "accept"
-honk_diagnostics = ["invalid-config-value"]
+honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-03"
-source = { file = "doc/zh/reference/nodes.md", fence = 4 }
+source = { file = "doc/zh/reference/nodes.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2141,7 +2320,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-nodes-04"
-source = { file = "doc/zh/reference/nodes.md", fence = 5 }
+source = { file = "doc/zh/reference/nodes.md", fence = 8 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2153,6 +2332,39 @@ unknown_sections = 0
 [[case]]
 id = "honk-doc-zh-reference-nodes-05"
 source = { file = "doc/zh/reference/nodes.md", fence = 3 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-nodes-06"
+source = { file = "doc/zh/reference/nodes.md", fence = 4 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-nodes-07"
+source = { file = "doc/zh/reference/nodes.md", fence = 6 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-nodes-08"
+source = { file = "doc/zh/reference/nodes.md", fence = 7 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2174,7 +2386,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-reference-routing-02"
-source = { file = "doc/zh/reference/routing.md", fence = 3 }
+source = { file = "doc/zh/reference/routing.md", fence = 4 }
 wrap = "routing"
 layer = "structure"
 honk = "accept"
@@ -2186,7 +2398,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-03"
-source = { file = "doc/zh/reference/routing.md", fence = 4 }
+source = { file = "doc/zh/reference/routing.md", fence = 5 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2198,7 +2410,7 @@ reason = "honk accepts its documented dialect; the pinned dae parser rejects thi
 
 [[case]]
 id = "honk-doc-zh-reference-routing-marks"
-source = { file = "doc/zh/reference/routing.md", fence = 2 }
+source = { file = "doc/zh/reference/routing.md", fence = 3 }
 wrap = ""
 layer = "typed:direct_marks_decode_decimal_hex_must_and_fallback"
 honk = "accept"
@@ -2206,6 +2418,18 @@ dae = "accept"
 honk_diagnostics = []
 compare = "equal"
 unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-reference-routing-04"
+source = { file = "doc/zh/reference/routing.md", fence = 2 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "honk accepts its documented dialect; the pinned dae parser rejects this input: ^: no viable alternative at input 'routing{domain(full:'*.example.com')->proxydomain(regex:'(^|\\.)example\\.com$')->proxydomain(suffix:'example.com')->proxy!geosite:'"
 
 [[case]]
 id = "honk-doc-zh-reference-subscription-01"
