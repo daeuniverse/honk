@@ -356,11 +356,11 @@ Media type 不区分大小写。重复或非文本的 `Content-Type` 值返回 `
 
 交接流量的内核规则结果来自编译程序实际执行的分支 witness，不做用户态重算。UDP 还必须使用收到报文携带的 capture ID。五元组、decision token、路由代次与动作均须匹配保留 witness，后来的同元组 incarnation 不能为旧报文提供证据。
 
-Capture ID 不回绕。冻结字典最多 16 份、每份 64 KiB、总计 1 MiB，计入记录器预留。字典拒绝/淘汰、witness 缺失、TCP 对应歧义及实际执行超出 256 个规则/条件值，都会使证据不完整。
+Capture ID 不回绕。冻结字典最多 16 份、每份 128 KiB、总计 2 MiB，计入记录器预留。字典拒绝/淘汰、witness 缺失、TCP 对应歧义及实际执行超出 256 个规则/条件值，都会使证据不完整。
 
 仅未执行的规则超出该值上限，不代表执行证据丢失。
 
-若策略的内核追踪字典会超过 64 KiB，启动和重载时该策略都以关闭内核路由追踪的方式发布并记录警告，其流报告 `kernel_trace_not_captured`，不再产生无法解码的 witness。检查按最长的代次编号估算规则 ID，因此恰好处于上限附近的策略可能已按关闭追踪发布。
+若策略的内核追踪字典会超过 128 KiB，启动和重载时该策略都以关闭内核路由追踪的方式发布并记录警告，其流报告 `kernel_trace_not_captured`，不再产生无法解码的 witness。检查按最长的代次编号估算规则 ID，因此恰好处于上限附近的策略可能已按关闭追踪发布。
 
 原生扩展字段保留来源细节而不虚构身份：路由输入可携带 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，不伪造域名 rule ID。DNS 关联的 outbound/connection step 带 `lookup_id`，已知物理对端带 `server_addr`。选择事实保留健康 IP 族以及实际应用还是仅 peek。
 
