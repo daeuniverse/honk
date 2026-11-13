@@ -384,8 +384,8 @@ impl DnsService {
             return Ok(None);
         }
         let resolve = async {
-            if !alias {
-                return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
+            if let Some(upstream) = upstream {
+                return resolve_claimed(self, &forwarder, &domain, upstream).await;
             }
             Box::pin(async {
                 let target = match forwarder.node_host_alias(&domain)? {
