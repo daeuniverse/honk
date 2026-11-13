@@ -32,12 +32,18 @@ use super::{
 
 /// Bounds each list, including its fallback.
 pub(super) const MAX_RULES: usize = 4096;
-const MAX_STEPS: usize = 256;
+/// Floor of the trace step limit, which grows with the loaded policy like `max_rules`.
+const MIN_STEPS: usize = 4096;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-pub(crate) fn trace_capability() -> Value {
+/// Never below the running policy's cost, so every accepted policy can be traced whole.
+fn max_steps(router: &Router) -> usize {
+    MIN_STEPS.max(router.trace_steps())
+}
+
+pub(crate) fn trace_capability(router: &Router) -> Value {
     json!({"available":true,"resolve_modes":["none"],"max_addresses":1,
-        "max_rule_steps":MAX_STEPS,"timeout_ms":TIMEOUT.as_millis(),
+        "max_rule_steps":max_steps(router),"timeout_ms":TIMEOUT.as_millis(),
         "per_principal_requests_per_minute":REQUESTS_PER_MINUTE,"global_requests_per_minute":REQUESTS_PER_MINUTE})
 }
 
@@ -374,7 +380,7 @@ fn evaluate(
     id: &RequestId,
 ) -> Result<RoutingEvaluation, ApiError> {
     let evaluation = router
-        .simulate(input.predicates(), MAX_STEPS, deadline)
+        .simulate(input.predicates(), max_steps(router), deadline)
         .map_err(|e| match e {
             TraceError::Steps => too_large(id),
             TraceError::Deadline => unavailable(id),
