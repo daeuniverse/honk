@@ -226,7 +226,7 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-默认运行时根目录是 `/var/lib/honk`。旧根目录 `/var/share/honk` 中的已有资源会按各路径规则继续使用；旧缓存和订阅导入会将符合条件的状态复制到 `state/honk.db`。自定义 `data_dir` 也遵循相同的回退顺序。相对缓存、订阅存储、ECH/UI 与其他只读依赖依次检查配置目录、`/var/share/honk`，再检查调用方的旧候选路径；相对日志只会在配置目录下创建。
+默认运行时根目录是 `/var/lib/honk`。旧根目录 `/var/share/honk` 中的已有资源会按各路径规则继续使用；旧缓存和订阅导入会将符合条件的状态复制到 `state/honk.db`。自定义 `data_dir` 也遵循相同的回退顺序。相对缓存、订阅存储、ECH/UI 与其他只读依赖依次检查 `global.data_dir` 选定的运行时目录、`/var/share/honk`，再检查调用方的旧候选路径。相对日志只会在该运行时目录下创建，而不是配置文件所在目录。
 
 前台启动：
 

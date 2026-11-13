@@ -226,7 +226,7 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. Legacy cache and subscription imports copy eligible state into `state/honk.db`. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the configured directory, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below the configured directory.
+The default runtime root is `/var/lib/honk`. Existing artifacts under the legacy `/var/share/honk` root remain usable through the documented per-path fallback. Legacy cache and subscription imports copy eligible state into `state/honk.db`. Custom `data_dir` values use the same fallback order. Relative caches, subscription stores, ECH/UI and other read-only dependencies check the runtime directory selected by `global.data_dir`, then `/var/share/honk`, then their caller-specific legacy path. Relative logs are created only below that runtime directory, not the directory containing the configuration file.
 
 Start honk in the foreground:
 

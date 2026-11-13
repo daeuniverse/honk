@@ -20,25 +20,30 @@ honk injects the built-in outbounds `direct` and `block` at startup. Use them in
 
 ## Configuration format
 
+The entry file and included `.dae` files must be UTF-8; other encodings are rejected.
+
 - Put settings in `section { ... }` blocks as one `key: value` pair per line. One-line blocks such as `global { log_level: debug }` and nested one-line blocks are accepted.
-- Prefer quoting URLs, values containing whitespace, and values containing syntax characters such as `:`, `+`, or `#`. Scalar values plus `include` and `node` entries accept single or double quotes; use single quotes for quoted `subscription` URLs.
+- Prefer quoting URLs, values containing whitespace, and values containing syntax characters such as `:`, `+`, or `#`. Scalar values and `include`, `node`, and `subscription` entries accept single or double quotes.
+- Quoted text is literal: escapes such as `\n` are not decoded, and a backslash only keeps the next quote from closing the string. A quote must close on the same line. `filter: name(regex: '^edge\.example$')` passes `^edge\.example$` to the regex engine.
 - Matching single or double quotes keep commas, closing parentheses, `&&`, and `->` literal in matcher arguments and filter/routing expressions. `group(...)` and `qtype(...)` still interpret quoted comma-separated text as lists.
 - Write lists accepted by a setting or matcher with commas: `lan_interface: eth0, eth1` or `dport(80, 443)`.
-- Second-based durations accept bare seconds or `ms`, `s`, `m`, and `h` suffixes. Millisecond settings such as `check_tolerance` accept bare milliseconds, `ms`, or `s`.
+- Second-based durations such as `check_interval` and subscription `interval` take whole seconds, bare or with an `s`, `m`, or `h` suffix; `1.5s` is invalid. An `ms` value rounds up to whole seconds, so `500ms` becomes `1s`. An invalid value warns and becomes `0`, which `check_interval` rejects with `check_interval must be a positive duration`.
+- Millisecond settings such as `check_tolerance` take bare milliseconds, an integer with `ms`, or seconds with `s`, so `1.5s` is 1500 ms. Fractions of a millisecond are dropped; `1.5ms` and the `m` and `h` suffixes are invalid. An invalid value warns and keeps the default.
 - An unquoted token-head `#` starts a comment; hashes inside bare values remain data. Entry readers also accept a glued `#` after a closing link quote or subscription `(UA)` suffix, with `legacy-glued-hash`; put whitespace before comments. Token-head comment braces never close blocks.
 - Braces inside matching single or double quotes are data. An unmatched closing `}` is ignored with a diagnostic; an unclosed block rejects the document. Detailed diagnostics carry physical line numbers where the current reader provides them; error text never echoes arbitrary input.
-- Unknown scalar keys are diagnosed and ignored. Unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains; unknown outer experimental settings and unsupported legacy NFQUEUE content are errors.
+- Unknown scalar keys are diagnosed and ignored. Unknown nested blocks are skipped as complete balanced subtrees, not flattened into their parent. Only documented node/subscription wrapper compatibility remains. Unknown outer `experimental` settings, unknown content in `experimental.native_api`, unsupported legacy NFQUEUE content, and a block named after a group scalar such as `tolerance` are errors; see the [dialect reference](./reference/dialect.md#sections-and-includes).
 
 ### Splitting a configuration with `include {}`
 
 ```dae
 include {
     config.d/*.dae
+    config.d/*/*.dae
     'config.d/extra config.dae'
 }
 ```
 
-`include` entries may be bare or quoted and support `*`, `?`, and `[]` glob patterns. Patterns run in declaration order; each pattern's matches load in lexical order. Unmatched patterns, directories, and files without the `.dae` extension are skipped.
+`include` entries are file patterns, bare or quoted, with `*`, `?`, and `[]` globs. An empty path, a nested block, or an invalid glob is a configuration error. Patterns run in declaration order; each pattern's matches load in lexical order. Unmatched patterns, directories, and files without the `.dae` extension are skipped. A `**` path component matches one directory level like `*` and is not recursive, so the example lists `config.d/*/*.dae` for files one level below `config.d`.
 
 Empty or comment-only included `.dae` files contribute no sections; the dae entry-document block requirement does not apply to these fragments.
 
@@ -240,7 +245,9 @@ See the [global reference](./reference/global.md).
 
 ## Declaring nodes
 
-Each `node` line is a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link; a bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. Unparseable entries are skipped with a diagnostic, while removed protocols are hard configuration errors.
+Each `node` line is a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link; a bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. A malformed link is skipped with a diagnostic. An unknown or removed scheme, the removed VLESS `vless_mode` parameter, or a standalone `mux` line is a configuration error; set `mux=` on each VLESS link instead.
+
+`direct` and `block` are reserved for the built-in outbounds and cannot name a node. A group cannot share a name with a node.
 
 See the [node reference](./reference/nodes.md).
 
@@ -249,8 +256,26 @@ See the [node reference](./reference/nodes.md).
 Build a group in this order:
 
 1. Select members with `filter: name(...)` for static names, `filter: subtag(...)` for subscription provenance, or `filter: group(...)` for nested groups.
-2. Combine predicates with `&&` for AND and `!` to negate one predicate. Separate `filter:` lines mean OR. With neither filters nor nested groups, a group includes all nodes; nested groups alone do not include all nodes.
+2. Combine `name(...)` and `subtag(...)` predicates with `&&` for AND and `!` to negate one predicate. `group(...)` must be the whole `filter:` value; a line combining it with `&&` or `!` is ignored with a diagnostic. Separate `filter:` lines mean OR. With neither filters nor nested groups, a group includes all nodes; nested groups alone do not include all nodes.
 3. Choose `selector`/`fixed`, `urltest`/`min_moving_avg`, `loadbalance`/`roundrobin`, `fallback`, or `score`. Set `final` for an empty policy selection.
+
+Leave group names unquoted in the group header and after `->` or `fallback:`, even when they contain spaces. Quotes in these positions become part of the name, so `fallback: 'proxy'` does not find group `proxy`. `group(...)`, `final`, and `default` strip the quotes. Put subgroup and node selections on separate filter lines:
+
+```dae
+group {
+    Hong Kong {
+        filter: name(regex: '^edge\.example$')
+    }
+    proxy {
+        filter: group('Hong Kong')
+        filter: name('edge')
+    }
+}
+routing {
+    dport(443) -> Hong Kong
+    fallback: Hong Kong
+}
+```
 
 Selector TCP and UDP follow the chosen member and never switch to a sibling because of health. The same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node.
 
@@ -268,7 +293,7 @@ See the [routing reference](./reference/routing.md).
 
 ## DNS setup
 
-Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://`. Add `-> node-or-group` to force the dial path; every listed transport can use a proxy outbound when the selected leaf supplies its required capability. DoQ and DoH3 require the leaf's UDP-capable `PacketTransport`; a missing proxy registry or packet capability fails closed. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
+Upstream forms are bare `host:port` (UDP) or `udp://`, `tcp://`, `tcp+udp://`/`udp+tcp://`, `tls://`, `https://`, `quic://`, and `h3://` or its alias `http3://`. Add `-> node-or-group` to force the dial path; every listed transport can use a proxy outbound when the selected leaf supplies its required capability. DoQ and DoH3 require the leaf's UDP-capable `PacketTransport`; a missing proxy registry or packet capability fails closed. Request routing chooses `reject`, `asis`, or a named upstream; response routing chooses `accept`, `reject`, or a named upstream for a bounded re-query:
 
 ```dae
 dns {
@@ -311,6 +336,8 @@ See the [subscription reference](./reference/subscription.md).
 **Native API.** `native-api` is opt-in: build with `--features native-api` (or `native-ui`); the full and `-native-api` release artifacts include it. The listener requires `experimental.native_api.enabled: true` and one of a bearer `secret`, `password_auth: true`, or `allow_anonymous_loopback: true` on a loopback `listen`. honk sets no minimum `secret` length; use a long random value. The default address is `127.0.0.1:9527`; explicitly anonymous loopback is for local development only. All effective native fields require restart. An optional `ui` directory needs readable `index.html`; alternatively `--features native-ui` enables `ui: embedded` with pinned real doona. `ui: embedded-lite` selects the lighter doona lite edition (preview) and also requires `native-ui`. None of these modes downloads/builds the UI at runtime. Traffic/memory histories default on and retain at most 600 points/600 seconds. See [native settings](./reference/experimental.md#native_api) and the [API contract](./reference/api.md#native-api).
 
 For a captured `.dae` startup, source metadata, offline validation and real reload operations share the existing engine. Configuration reads return accepted content with only listener-secret values masked, including duplicate/overridden values and their other occurrences; credential-bearing sources remain read-only with original-byte hashes. Source `path` remains relative and `absolute_path` adds the canonical absolute path. Admitted anonymous loopback requests read the same data as bearer-authenticated requests. `config_write` defaults false and requires a nonempty secret or `password_auth`. Main-source node/provider creation and deletion, authorized whole-source PUT and restricted Group PATCH reuse this authority; all accepted noncredential includes qualify for source edits when `config_write` is enabled, but not dedicated entry deletion. Configured geodata updates use verified immutable bytes and the same reload owner. Written bytes are not automatically rolled back after activation failure. Avoid concurrent external edits; see [configuration safety](./reference/api.md#accepted-configuration-and-reload-operations) and [entry and geodata management](./reference/api.md#managed-entries-and-geodata).
+
+With `--store db`, honk runs the active db revision; at startup it imports the `-c` file only when the db is empty. See [configuration db](./reference/api.md#configuration-db---store-db).
 
 **Clash API.** A non-empty `experimental.clash_api.external_controller` enables the server. Keep it on loopback unless a firewall and non-empty `secret` protect it; an empty secret disables API authentication. A relative `external_ui` prefers an existing directory below `data_dir`, then `/var/share/honk`, then the working directory; if none exists, the dashboard is downloaded under `data_dir`. `assets.ui.url` selects the ZIP source, while `assets.ui.route` selects the download route, defaulting to `assets.route`. Without a configured URL or route, the built-in URL and normal traffic routing apply. `HONK_UI_DOWNLOAD_URL` overrides the ZIP URL.
 
