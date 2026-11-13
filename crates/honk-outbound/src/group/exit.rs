@@ -493,6 +493,34 @@ impl GroupManager {
         }
     }
 
+    /// Whether `leaf` carries UDP through `exits`, the resolved exits of the
+    /// groups on its path, outermost first, as `GroupGraph::visit` hands
+    /// them over: its own capability without one, the exit's own when the
+    /// route collapses to it, the tunnel otherwise. A chain leaf whose hops
+    /// this manager could not resolve carries none behind an exit.
+    pub fn carries_udp_via(&self, leaf: &Node, exits: &[Uuid]) -> bool {
+        let Some(known) = self.exits.as_deref().filter(|_| !exits.is_empty()) else {
+            return self.node_carries_udp(leaf);
+        };
+        let leaf_hops = match leaf.protocol() {
+            NodeProtocol::Direct => &[][..],
+            NodeProtocol::Chain => match known.chains.get(&leaf.id) {
+                Some(hops) => hops,
+                None => return false,
+            },
+            _ => std::slice::from_ref(&leaf.id),
+        };
+        match compose(leaf.id, leaf_hops, exits.iter().rev().copied()) {
+            Composed::Direct => self.node_carries_udp(leaf),
+            Composed::Collapsed(node) => self
+                .nodes
+                .get(&node)
+                .is_some_and(|node| carries_udp(UdpPath::Own(node))),
+            Composed::Routed(route) => self.route_carries_udp(&route),
+            Composed::TooLong => false,
+        }
+    }
+
     fn group_has_exit(&self, group: &str) -> bool {
         self.exits
             .as_deref()

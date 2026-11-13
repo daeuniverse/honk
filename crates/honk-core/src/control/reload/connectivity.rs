@@ -1,7 +1,9 @@
+use std::cell::LazyCell;
 use std::collections::BTreeSet;
 use std::ops::ControlFlow;
+use std::sync::LazyLock;
 
-use honk_config::group_graph::{GroupGraph, Leaf, Limits, Step, Visitor};
+use honk_config::group_graph::{ExitEdge, GroupGraph, Leaf, Limits, Step, Visitor};
 
 use super::*;
 
@@ -237,9 +239,10 @@ pub(in crate::control) fn build_outbound_id_map(
 
 type GroupConnectivity = (u8, u32, u32, bool);
 
-/// A sole TCP leaf with no configured fallback remains a userspace last resort:
-/// suppressing it in TC would prevent real traffic from proving recovery.
-pub(in crate::control) fn group_datapath_alive(
+/// One TC slot of `group`. The graph is forced only for a UDP slot.
+pub(in crate::control) fn group_datapath_alive<'a>(
+    graph: &LazyCell<GroupGraph<'a>, impl FnOnce() -> GroupGraph<'a>>,
+    index: usize,
     group: &Group,
     group_manager: &GroupManager,
     alive_set: &crate::outbound::AliveDialerSet,
@@ -247,40 +250,151 @@ pub(in crate::control) fn group_datapath_alive(
     ipver: IpVersion,
 ) -> bool {
     if domain == ProbeDomain::Tcp {
-        return (group.final_outbound.is_none()
-            && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
-            || group_manager
-                .reachable_leaf_nodes_in_group(&group.name)
-                .iter()
-                .any(|node| alive_set.is_alive_for(node.id, domain, ipver));
+        return group_tcp_alive(group, group_manager, alive_set, ipver);
     }
-    group_manager.any_udp_leaf_in_group(&group.name, |node| {
-        (node.protocol() == NodeProtocol::Block
-            || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
-            && alive_set.is_alive_for(node.id, domain, ipver)
-    })
+    group_udp_alive(
+        LazyCell::force(graph),
+        index,
+        group_manager,
+        alive_set,
+        &[(domain, ipver)],
+    ) != 0
 }
+
+/// A sole TCP leaf with no configured fallback remains a userspace last resort:
+/// suppressing it in TC would prevent real traffic from proving recovery.
+fn group_tcp_alive(
+    group: &Group,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+    ipver: IpVersion,
+) -> bool {
+    (group.final_outbound.is_none() && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
+        || group_manager
+            .reachable_leaf_nodes_in_group(&group.name)
+            .iter()
+            .any(|node| alive_set.is_alive_for(node.id, ProbeDomain::Tcp, ipver))
+}
+
+/// One bit per entry of `slots` whose UDP is alive for `group`: some leaf
+/// it reaches carries UDP over what it dials and is alive in that slot.
+/// One walk answers every slot, asking each leaf's capability once.
+fn group_udp_alive(
+    graph: &GroupGraph<'_>,
+    group: usize,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+    slots: &[(ProbeDomain, IpVersion)],
+) -> u8 {
+    let all = (1u8 << slots.len()) - 1;
+    let mut found = 0;
+    let _ = walk_udp_leaves(graph, group, |node, exits| {
+        // `block` reached from a group with an exit means no route there
+        // carries UDP, so it counts only outside every exit.
+        let carries = if node.protocol() == NodeProtocol::Block {
+            exits.is_empty()
+        } else {
+            group_manager.carries_udp_via(node, exits)
+        };
+        if carries {
+            for (bit, &(domain, ipver)) in slots.iter().enumerate() {
+                if alive_set.is_alive_for(node.id, domain, ipver) {
+                    found |= 1 << bit;
+                }
+            }
+        }
+        found == all
+    });
+    found
+}
+
+/// Breaks on the first leaf of `group` that `stop` accepts with the exits
+/// on its path. Walks the configuration's graph, as [`group_leaf_ids`] does,
+/// so a cycle GroupManager's copy cuts only widens what TC passes to
+/// userspace. Nothing behind an exit the configuration cannot resolve is
+/// selectable.
+fn walk_udp_leaves(
+    graph: &GroupGraph<'_>,
+    group: usize,
+    stop: impl FnMut(&Node, &[uuid::Uuid]) -> bool,
+) -> ControlFlow<()> {
+    struct UdpLeaves<'g, 'a, F> {
+        graph: &'g GroupGraph<'a>,
+        path: [&'a str; honk_outbound::group::MAX_GROUP_DEPTH],
+        stop: F,
+    }
+    impl<F: FnMut(&Node, &[uuid::Uuid]) -> bool> Visitor for UdpLeaves<'_, '_, F> {
+        fn enter(&mut self, group: usize, depth: usize, _: &[uuid::Uuid]) -> ControlFlow<(), Step> {
+            let name = self.graph.name(group);
+            if depth >= self.path.len()
+                || self.path[..depth].contains(&name)
+                || self.graph.exit(group) == Some(ExitEdge::Unresolved)
+            {
+                return ControlFlow::Continue(Step::Skip);
+            }
+            self.path[depth] = name;
+            ControlFlow::Continue(Step::Descend)
+        }
+
+        fn leaf(&mut self, leaf: Leaf, exits: &[uuid::Uuid]) -> ControlFlow<()> {
+            static DIRECT: LazyLock<Node> = LazyLock::new(Config::builtin_direct_node);
+            static BLOCK: LazyLock<Node> = LazyLock::new(Config::builtin_block_node);
+            let node = match leaf {
+                Leaf::Node(id) => self.graph.node(id),
+                Leaf::Direct => Some(&*DIRECT),
+                Leaf::Block => Some(&*BLOCK),
+            };
+            if node.is_some_and(|node| (self.stop)(node, exits)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    graph.visit(
+        group,
+        Limits::SELECTION,
+        &mut UdpLeaves {
+            graph,
+            path: [""; honk_outbound::group::MAX_GROUP_DEPTH],
+            stop,
+        },
+    )
+}
+
+/// The UDP slots of a snapshot, in its order.
+const UDP_SLOTS: [(ProbeDomain, IpVersion); 4] = [
+    (ProbeDomain::DnsUdp, IpVersion::V4),
+    (ProbeDomain::DnsUdp, IpVersion::V6),
+    (ProbeDomain::DataUdp, IpVersion::V4),
+    (ProbeDomain::DataUdp, IpVersion::V6),
+];
 
 pub(crate) fn group_connectivity_snapshot(
     config: &Config,
     group_manager: &GroupManager,
     alive_set: &crate::outbound::AliveDialerSet,
 ) -> Vec<GroupConnectivity> {
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
     let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
-        for (domain_index, domain) in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp]
-            .into_iter()
-            .enumerate()
-        {
-            for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
-                snapshot.push((
-                    outbound,
-                    domain_index as u32,
-                    ip_index as u32,
-                    group_datapath_alive(group, group_manager, alive_set, domain, ipver),
-                ));
-            }
+        for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
+            snapshot.push((
+                outbound,
+                0,
+                ip_index as u32,
+                group_tcp_alive(group, group_manager, alive_set, ipver),
+            ));
+        }
+        let udp = group_udp_alive(&graph, index, group_manager, alive_set, &UDP_SLOTS);
+        for (bit, (domain, ipver)) in UDP_SLOTS.into_iter().enumerate() {
+            snapshot.push((
+                outbound,
+                if domain == ProbeDomain::DnsUdp { 1 } else { 2 },
+                ipver as u32,
+                udp & (1 << bit) != 0,
+            ));
         }
     }
     snapshot

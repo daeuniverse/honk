@@ -9,23 +9,14 @@ use super::*;
 #[derive(Clone, Copy)]
 struct LeafWalk {
     include_final: bool,
-    /// Only what UDP selection reaches: it offers nothing from a group
-    /// with an exit, as routes carry TCP only.
-    udp: bool,
 }
 
 impl LeafWalk {
     const MEMBERS: Self = Self {
         include_final: false,
-        udp: false,
     };
     const REACHABLE: Self = Self {
         include_final: true,
-        ..Self::MEMBERS
-    };
-    const UDP: Self = Self {
-        udp: true,
-        ..Self::REACHABLE
     };
 }
 
@@ -371,22 +362,6 @@ impl GroupManager {
         )
     }
 
-    /// Whether `accept` takes a leaf UDP selection can reach through
-    /// membership or explicit final edges, none of them behind an exit.
-    pub fn any_udp_leaf_in_group(
-        &self,
-        group_name: &str,
-        mut accept: impl FnMut(&Node) -> bool,
-    ) -> bool {
-        self.visit_group_leaves(
-            group_name,
-            0,
-            &mut [""; MAX_GROUP_DEPTH],
-            LeafWalk::UDP,
-            &mut accept,
-        )
-    }
-
     fn group_leaf_nodes(&self, group_name: &str, include_final: bool) -> Vec<&Node> {
         let mut out: Vec<&Node> = Vec::new();
         self.visit_group_leaves(
@@ -447,9 +422,6 @@ impl GroupManager {
         let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return false;
         };
-        if walk.udp && group.exit.is_some() {
-            return false;
-        }
         visited[depth] = group.name.as_str();
         group
             .nodes
@@ -467,10 +439,7 @@ impl GroupManager {
                         &group.name,
                         depth + 1,
                         visited,
-                        LeafWalk {
-                            include_final: true,
-                            ..walk
-                        },
+                        LeafWalk::REACHABLE,
                         visit,
                     ),
                     None => false,

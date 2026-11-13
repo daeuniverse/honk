@@ -218,12 +218,17 @@ impl OutboundHealthPublisher {
             *generation = Arc::downgrade(&*config);
             dead_slots.clear();
         }
+        let graph = std::cell::LazyCell::new(|| {
+            honk_config::group_graph::GroupGraph::new(&config.groups, &config.nodes)
+        });
         for (index, group) in config.groups.iter().enumerate() {
             if !group_manager.group_reaches_node(&group.name, node_id) {
                 continue;
             }
             let outbound_idx = honk_ebpf_common::OutboundIndex::UserBase as u8 + index as u8;
             let alive = reload::group_datapath_alive(
+                &graph,
+                index,
                 group,
                 &group_manager,
                 &self.alive_set,

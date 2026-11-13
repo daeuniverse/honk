@@ -687,7 +687,8 @@ fn chain_group_udp_plan(config: &Config) -> Vec<Node> {
 }
 
 /// The configured `final` takes the group's UDP exactly when the chain's exit
-/// cannot carry it; there is no implicit fallback.
+/// cannot carry it; there is no implicit fallback. Without a `final`, the
+/// group publishes UDP connectivity exactly when the chain carries it.
 #[test]
 fn a_chain_group_sends_udp_to_the_final_only_when_the_exit_cannot_carry_it() {
     for (exit_carries_udp, protocol) in [
@@ -700,6 +701,20 @@ fn a_chain_group_sends_udp_to_the_final_only_when_the_exit_cannot_carry_it() {
             [protocol],
             "exit carries UDP: {exit_carries_udp}"
         );
+        let config = chain_group_config(exit_carries_udp, None);
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+        let outbound = OutboundIndex::UserBase as u8;
+        for domain in [1, 2] {
+            assert_eq!(
+                snapshot.contains(&(outbound, domain, 0, true)),
+                exit_carries_udp,
+                "exit carries UDP: {exit_carries_udp}, domain {domain}"
+            );
+        }
+        assert!(snapshot.contains(&(outbound, 0, 0, true)));
     }
 }
 
@@ -4475,9 +4490,9 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
     assert!(!tracing(&cp), "reload");
 }
 
-/// Routes through group exits carry TCP only, so a group whose every leaf
-/// sits behind an exit publishes no UDP connectivity, as UDP selection
-/// offers it no candidate; its TCP connectivity is unchanged.
+/// A group whose every leaf sits behind an exit that cannot tunnel UDP
+/// publishes no UDP connectivity, as UDP selection offers it no candidate;
+/// its TCP connectivity is unchanged.
 #[test]
 fn an_exit_group_without_udp_routes_publishes_no_udp() {
     let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
@@ -4520,8 +4535,11 @@ fn an_exit_group_without_udp_routes_publishes_no_udp() {
     }
 }
 
-/// UDP publication answers what UDP selection offers: nothing from a group
-/// with an exit, its `final` included, while a sibling outside it counts.
+/// UDP publication answers what UDP selection offers: from a group with an
+/// exit, only what the path can carry (a route tunneled by an exit that
+/// frames UDP), while a sibling outside it counts. A `block` that selection
+/// falls to behind an exit means no route there carries UDP, so it does not
+/// count; outside an exit it still does.
 #[test]
 fn publication_and_selection_agree_on_udp_capability() {
     use honk_outbound::alive::{IpVersion, ProbeDomain};
@@ -4530,6 +4548,19 @@ fn publication_and_selection_agree_on_udp_capability() {
     let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
     let other = canonical_socks5("other", "127.0.0.3", 1080, None);
     let exit = canonical_socks5("exit", "127.0.0.2", 1080, None);
+    let dead = canonical_socks5("dead", "127.0.0.5", 1080, None);
+    let mut tunnel = Node {
+        name: "tunnel".into(),
+        address: "127.0.0.4:443".into(),
+        host: "127.0.0.4".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    tunnel.id = tunnel.derive_id();
     let group = |name: &str, nodes: Vec<uuid::Uuid>, groups: &[&str]| Group {
         name: name.into(),
         policy: GroupPolicy::Fallback,
@@ -4542,7 +4573,13 @@ fn publication_and_selection_agree_on_udp_capability() {
         ..group
     };
     let mut config = Config {
-        nodes: vec![leaf.clone(), other.clone(), exit.clone()],
+        nodes: vec![
+            leaf.clone(),
+            other.clone(),
+            exit.clone(),
+            tunnel,
+            dead.clone(),
+        ],
         groups: vec![
             group("plain", vec![leaf.id], &[]),
             exited(group("exited", vec![leaf.id], &[])),
@@ -4560,14 +4597,33 @@ fn publication_and_selection_agree_on_udp_capability() {
                 exit: Some("missing".into()),
                 ..group("unresolved", vec![leaf.id], &[])
             },
+            Group {
+                exit: Some("tunnel".into()),
+                ..group("tunneled", vec![leaf.id], &[])
+            },
+            Group {
+                final_outbound: Some("block".into()),
+                ..group("plain-block", vec![dead.id], &[])
+            },
         ],
         ..Default::default()
     };
     config.ensure_builtin_nodes();
     let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        alive.report_unavailable_forced(dead.id, domain, IpVersion::V4);
+    }
     let manager =
         GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
     let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let behind_exit = |chain: &[String]| {
+        chain.iter().any(|name| {
+            config
+                .groups
+                .iter()
+                .any(|group| group.name == *name && group.exit.is_some())
+        })
+    };
     let mut published = Vec::new();
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
@@ -4583,13 +4639,227 @@ fn publication_and_selection_agree_on_udp_capability() {
             },
             None,
         );
-        assert_eq!(udp, !plan.entries.is_empty(), "{}", group.name);
+        let selected = plan.entries.iter().any(|entry| {
+            entry.node.protocol() != honk_config::types::NodeProtocol::Block
+                || !behind_exit(&entry.selection_chain)
+        });
+        assert_eq!(udp, selected, "{}", group.name);
         published.push(udp);
     }
     assert_eq!(
         published,
-        [true, false, false, true, false, false, false],
-        "plain, exited, outer, mixed, exited-block, exited-final, unresolved"
+        [true, false, false, true, false, false, false, true, true],
+        "plain, exited, outer, mixed, exited-block, exited-final, unresolved, tunneled, plain-block"
+    );
+}
+
+/// UDP publication walks the configuration's graph, not GroupManager's
+/// cycle-cut copy: from `y`, whose edge back to `x` the cut drops, selection
+/// reaches nothing while publication still reaches `x`'s leaf, so TC passes
+/// a superset of what userspace selects, as the leaf id map does.
+#[test]
+fn udp_publication_walks_the_configuration_graph_past_a_cut_cycle() {
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork};
+
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
+    let group = |name: &str, nodes: Vec<uuid::Uuid>, child: &str| Group {
+        name: name.into(),
+        policy: GroupPolicy::Fallback,
+        nodes,
+        groups: vec![child.into()],
+        ..Default::default()
+    };
+    let mut config = Config {
+        nodes: vec![leaf.clone()],
+        groups: vec![group("x", vec![leaf.id], "y"), group("y", Vec::new(), "x")],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    let manager =
+        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let selected = manager
+        .selection_plan_for_target_with_health_fallback(
+            "y",
+            &ScoreSelectionContext {
+                network: SelectionNetwork::Udp,
+                probe_domain: ProbeDomain::DataUdp,
+                target_family: Some(IpVersion::V4),
+                health_family: IpVersion::V4,
+                target: None,
+            },
+            None,
+        )
+        .entries
+        .len();
+    assert_eq!(selected, 0);
+    assert!(snapshot.contains(&(OutboundIndex::UserBase as u8 + 1, 2, 0, true)));
+}
+
+/// Selection, the runtime, datapath publication, the check before a flow
+/// binds and probing give one UDP answer per target: a plain node, a
+/// configured chain, a route through an exit that tunnels UDP or one that
+/// cannot, a TCP-only leaf with and without such an exit, and a group whose
+/// exit does not resolve. Probes dial nodes, never routes, so a route has
+/// four answers.
+#[test]
+fn udp_capability_has_one_answer_per_target() {
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork};
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
+    let front = canonical_socks5("front", "127.0.0.2", 1080, None);
+    let stream_only = canonical_socks5("stream-only", "127.0.0.3", 1080, None);
+    let mut tunnel = Node {
+        name: "tunnel".into(),
+        address: "127.0.0.4:443".into(),
+        host: "127.0.0.4".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    tunnel.id = tunnel.derive_id();
+    let mut vmess = Node {
+        name: "vmess".into(),
+        address: "127.0.0.5:443".into(),
+        host: "127.0.0.5".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    vmess.id = vmess.derive_id();
+    let chain = |name: &str, exit: &str| {
+        let mut chain = Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::Chain {
+                hops: vec!["front".into(), exit.into()],
+            },
+            ..Default::default()
+        };
+        chain.id = chain.derive_id();
+        chain
+    };
+    let (chain_udp, chain_tcp) = (
+        chain("chain-udp", "tunnel"),
+        chain("chain-tcp", "stream-only"),
+    );
+    let group = |name: &str, member: uuid::Uuid, exit: Option<&str>| Group {
+        name: name.into(),
+        policy: GroupPolicy::Selector,
+        nodes: vec![member],
+        exit: exit.map(str::to_owned),
+        ..Default::default()
+    };
+    let mut config = Config {
+        nodes: vec![
+            leaf.clone(),
+            front,
+            stream_only,
+            tunnel,
+            chain_udp.clone(),
+            chain_tcp.clone(),
+            vmess.clone(),
+        ],
+        groups: vec![
+            group("plain", leaf.id, None),
+            group("chain-udp", chain_udp.id, None),
+            group("chain-tcp", chain_tcp.id, None),
+            group("route-udp", leaf.id, Some("tunnel")),
+            group("route-tcp", leaf.id, Some("stream-only")),
+            group("unresolved", leaf.id, Some("missing")),
+            group("tcp-leaf", vmess.id, None),
+            group("tcp-leaf-route", vmess.id, Some("tunnel")),
+        ],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    let manager =
+        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+    let registry = OutboundRuntimeRegistry::build(&config.nodes).expect("runtime registry");
+    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let context = |network, probe_domain| ScoreSelectionContext {
+        network,
+        probe_domain,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: None,
+    };
+    let tcp = context(SelectionNetwork::Tcp, ProbeDomain::Tcp);
+    let udp = context(SelectionNetwork::Udp, ProbeDomain::DataUdp);
+    let mut answers = Vec::new();
+    for (index, group) in config.groups.iter().enumerate() {
+        let name = group.name.as_str();
+        let selection = !manager
+            .selection_plan_for_target_with_health_fallback(name, &udp, None)
+            .entries
+            .is_empty();
+        let outbound = OutboundIndex::UserBase as u8 + index as u8;
+        let publication = snapshot.contains(&(outbound, 2, 0, true));
+        // The runtime and probes answer for the target TCP dials, which
+        // exists whether or not it carries UDP; none exists without an exit.
+        let plan = manager.selection_plan_for_target_with_health_fallback(name, &tcp, None);
+        let bindable = plan.entries.first().is_some_and(|entry| {
+            manager.target_selectable(
+                &manager.own_target(honk_outbound::group::Target {
+                    node: entry.node,
+                    route: entry.route.clone(),
+                }),
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            )
+        });
+        assert_eq!(
+            bindable, selection,
+            "{name}: pre-binding check vs selection"
+        );
+        let (runtime, probe) = match plan.entries.first() {
+            None => (false, None),
+            Some(entry) => match &entry.route {
+                Some(route) => (
+                    registry
+                        .route_runtime(route)
+                        .expect("route runtime")
+                        .udp_capable,
+                    None,
+                ),
+                None => (
+                    registry
+                        .get(&entry.node.id)
+                        .expect("node runtime")
+                        .udp_capable,
+                    Some(registry.udp_capable(entry.node)),
+                ),
+            },
+        };
+        assert_eq!(runtime, selection, "{name}: runtime vs selection");
+        assert_eq!(publication, selection, "{name}: publication vs selection");
+        if let Some(probe) = probe {
+            assert_eq!(probe, selection, "{name}: probe vs selection");
+        }
+        answers.push((name, selection, probe.is_some()));
+    }
+    assert_eq!(
+        answers,
+        [
+            ("plain", true, true),
+            ("chain-udp", true, true),
+            ("chain-tcp", false, true),
+            ("route-udp", true, false),
+            ("route-tcp", false, false),
+            ("unresolved", false, false),
+            ("tcp-leaf", false, true),
+            ("tcp-leaf-route", true, false),
+        ]
     );
 }
 
