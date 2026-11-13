@@ -47,8 +47,8 @@ check_body() {
             {test: ($kind == "issue" and (kept($search) | not)),
                 en: "Keep and check the existing-issue search box.", zh: "请保留并勾选“我已搜索过现有 issue”。"},
             {test: ($kind == "issue" and $bug and (($logs | placeholder) or ($logs | length < 40))),
-                en: "Paste the honk log from startup to the failure, with `log_level: debug`; \"none\" is not accepted.",
-                zh: "请贴出 `log_level: debug` 下 honk 从启动到出问题的日志，不能填“无”。"}
+                en: "Paste the honk log from startup to the failure, with `log_level: debug`; \"none\" is not accepted. Get it with `sudo journalctl -u honk-core -b` under systemd, `logread -e honk` on OpenWrt, or the Logs page in doona.",
+                zh: "请贴出 `log_level: debug` 下 honk 从启动到出问题的日志，不能填“无”。可以用 systemd 的 `sudo journalctl -u honk-core -b`、OpenWrt 的 `logread -e honk`，或 doona 的“日志”页获取。"}
         ] | map(select(.test) | {en, zh}) end'
 }
 
