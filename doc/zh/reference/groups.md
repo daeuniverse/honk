@@ -4,7 +4,7 @@
 
 ## 语法
 
-每个组都是 `group { ... }` 中的命名子节：
+每个组都是 `group { ... }` 中的命名子节。同名声明不会合并，以最后一份为准。不要在包含文件里重复声明同一个组来扩展它。
 
 ```dae
 group {
@@ -12,7 +12,11 @@ group {
         filter: subtag('airport') && name(keyword: 'HK')
         filter: name(regex: '^Hong Kong ')
         policy: min_moving_avg
-        check_url: 'https://www.gstatic.com/generate_204'
+        check_url: 'https://probe.example:8443/check,192.0.2.10,2001:db8::10'
+        icon: 'https://example.com/icon.svg'
+        tolerance: 50
+        idle_timeout: 1800
+        interrupt_connections: true
         final: direct
     }
 
@@ -32,30 +36,59 @@ group {
 | ------- | -------- | ------ | ---- |
 | （子节名） | `name` | 必填 | 在路由和 API 中用作出站的组 tag。 |
 | `policy` | `policy` | `selector` | 成员选择策略；接受的拼写见下表。 |
-| `icon` | `icon` | `null` | 经过校验的绝对 HTTP(S) URL 或 data URI，最多 2048 个字符，无空白或控制字符；HTTP(S) 不得含凭据，data URI 必须含逗号。向原生组摘要和详情返回时遮蔽其中至少 8 字节长的监听凭据值，不推测或下载图标。 |
+| `icon` | `icon` | `null` | 带主机名且不含凭据的绝对 HTTP(S) URL，或 data URI；最多 2048 个字符，不能含空白。其他值会使配置被拒绝。原生组读取会遮蔽至少 8 字节长的监听凭据值，不推测图标。 |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | 按节点名选择节点。解析器把匹配结果解析为节点 UUID。 |
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
 | `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
-| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组嵌套在其他组中时同样生效。Final 节点仍受健康检查约束；缺失或成环的 final 会拒绝，不会隐式直连。 |
-| `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。Selector 会忽略该字段并告警。 |
+| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组被嵌套时同样生效。未知目标会使配置在启动或重载时以 `invalid-group-final-target` 被拒绝。`final` 节点仍受健康检查约束。绕回自身的 `final` 路径不选择任何节点，也不会退回 `direct`。 |
+| `check_url` | `check_url` | `null` | 非 Selector 策略的按组 TCP 健康检查目标。不要在 Selector 上设置：honk 只记录警告，从不探测该 URL，但 Selector 的 TCP 选择仍读取该 URL 的健康状态，而未探测的 URL 视为健康，结果是 TCP 健康检查不再约束该组。 |
 | —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
-| `tolerance` | `tolerance` | `50` | 非负整数毫秒；dae URLTest 组未显式设置时继承 `global.check_tolerance`，显式值优先；运行时有效下限为 1 ms。 |
-| `idle_timeout` | `idle_timeout` | `null` | 非负整数秒，URLTest 不活跃后暂停探测的阈值；省略时健康层使用 1800 秒。 |
-| `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时按捕获的组身份/路径与网络关闭精确旧 TCP/UDP owner，不再仅移除 tracker；共享 XUDP 只退役匹配 view。严格布尔值。 |
+| `tolerance` | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒，写成纯整数：`tolerance: 50`，不能写 `50ms`。dae URLTest 组未显式设置时继承 `global.check_tolerance`。有效下限为 1 ms。 |
+| `idle_timeout` | `idle_timeout` | `null` | URLTest 组持续多少秒没有被选择后暂停成员探测，写成纯整数：`idle_timeout: 1800`，不能写 `30m`。为 `null` 时使用 1800 秒。 |
+| `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时，按捕获的组身份和网络关闭受影响的用户态传输。这会退役传输，而不只是移除跟踪记录；共享 UDP 载体保留未受影响的视图。LoadBalance 轮换从不关闭连接。接受 `true`/`false`、`yes`/`no`、`on`/`off` 或 `1`/`0`，不区分 ASCII 大小写；其他值会使配置被拒绝。 |
 | —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
+
+`filter:` 条目累加。其他键都以最后一次出现的值为准，较早的无效值不会被检查。
+
+`check_url` 接受 HTTP(S) URL；不写协议的目标按 HTTP 处理。URL 后以逗号分隔的条目是 IPv4 或 IPv6 字面地址，使用 URL 的端口，并先于 DNS 返回的地址尝试。无效条目会被忽略。
+
+URLTest 组在首次被选择前处于空闲状态，此后连续 `idle_timeout` 秒没有被选择也会转为空闲。空闲期间暂停成员的周期探测，下一次选择时恢复。`idle_timeout: 0` 表示两次选择之间即为空闲，它不是连接超时。只要还有非 URLTest 组或处于活跃状态的 URLTest 组能到达某个节点，该节点就继续接受探测。
 
 ## 策略
 
 | 规范名 | 接受的 dae 拼写 | 行为 |
 | ------ | --------------- | ---- |
 | `selector` | `selector`、`select`、`fixed`、`fixed(0)` | TCP/UDP 各自维护运行时选择，在健康过滤前依次使用对应网络的选择、`default` 和第一个现存成员。健康状态不会把有效选择替换成兄弟成员；选择可为直接节点或嵌套组 tag。 |
-| `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 使用减半移动平均 `(prev + sample) / 2` 和 tolerance 选择延迟最低的存活成员；TCP 与 UDP 选择相互独立。 |
+| `urltest` | `urltest`、`min_moving_avg`、`min_avg10`、`min_last_delay` | 选择减半移动平均 `(prev + sample) / 2` 最低的存活成员；近期失败尚未恢复的成员排在其他成员之后。`tolerance` 限制切换。TCP 与 UDP 选择相互独立。 |
 | `loadbalance` | `loadbalance`、`roundrobin`、`round_robin`、`balance` | 对存活成员轮询；每个组以及 TCP/UDP 网络各有独立计数器。连向同一目标的相邻连接会从不同节点出去，TCP 与 UDP 也各自轮换，因此把会话绑定到客户端地址的服务会断开：登录状态失效，Cloudflare 的放行记录会被重新质询。需要稳定出口时改用 `urltest` 或 `score`。 |
-| `fallback` | `fallback` | 分别为 TCP 和 UDP 按声明顺序固定第一个存活成员；更靠前的成员恢复后不会立即切回。 |
+| `fallback` | `fallback` | 分别为 TCP 和 UDP 按成员顺序固定第一个存活成员；更靠前的成员恢复后不会立即切回。 |
 | `score` | `score` | 根据实际可靠性、新鲜目标质量与有界验证选择一个存活成员；TCP/UDP 和目标 IPv4/IPv6 证据各自隔离。 |
 
 策略名按 ASCII 大小写不敏感匹配。解析器匹配前会去掉可选的括号后缀，因此接受 `fixed(0)`。无法识别的策略会变为 `selector`，并在诊断信息中注明组名；旧策略名 `honk` 明确无效，必须改用 `score`。
+
+直接成员保持节点列表的顺序，不按过滤器行或参数顺序排列：`filter: name(backup, primary)` 不会把 `backup` 排到前面。嵌套组排在全部直接成员之后，按 tag 的书写顺序排列。这个顺序决定 Selector 的首个成员、Fallback 优先级和 LoadBalance 轮换顺序。
+
+要显式指定 Fallback 优先级，把每个节点放进单独的子组，再按顺序列出这些子组：
+
+```dae
+group {
+    primary-only {
+        filter: name('primary')
+    }
+    backup-only {
+        filter: name('backup')
+    }
+    preferred {
+        filter: group('primary-only', 'backup-only')
+        policy: fallback
+    }
+}
+```
+
+URLTest 组会保留当前成员，直到另一成员的延迟低出 `max(tolerance, 1 ms)` 以上。当前成员没有新测量值或有近期失败时，不享受这一保留。
+
+TCP 按 TCP 探测延迟排序；设置了 `check_url` 时按该组的 `check_url` 探测排序。UDP 先按数据 UDP 探测延迟排序，其次是 DNS UDP；没有 UDP 测量值的成员排在最后，不借用其 TCP 延迟。`check_url` 不影响 UDP。在任何成员有 UDP 测量值之前，UDP 沿用该组的 TCP 选择。
 
 只有在选择缺失或已不属于该组时，才继续使用 `default` 或声明顺序中的第一个成员。现存的已选成员没有合格叶节点时，TCP 和 UDP 都不会回退到兄弟成员：仅可继续执行显式配置的 `final` 或下述同一叶节点的 TCP 最后尝试。选中的嵌套组仍执行自己的策略，因此 URLTest 可以在该子组内部选择其他叶节点。
 
@@ -73,6 +106,10 @@ UDP 资格同时要求协议／配置支持和健康条件；VMess 与显式仅�
 原生 `PUT /api/v1/groups/{groupId}/selection` 接受直接成员的 `member_id` 和必填 `network: "tcp"|"udp"|"both"`，用于更新选择；`both` 一次校验、原子发布，TCP 写入不改变 UDP。Clash 写入映射为 `both`，`now` 明确显示 TCP 选择。两者共用 control/reload 所有者、分网络持久化与预热回调；中断只影响实际发生选择变化的网络，且按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。Selector 固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
 
 组 PATCH 通过解析器记录的来源位置修改可写 `.dae` 的 `policy`、`default`、`final`、`tolerance`、`idle_timeout`、`interrupt_connections` 和 `check_url`，保留其他原文字节并经完整校验、持久写入与真实重载；不是只改内存。需要组 ETag 的强 `If-Match`，与源文件哈希独立校验；写后激活被拒绝不回滚磁盘。`icon` 可在配置或源编辑器修改，不属于受限 PATCH 字段。自动策略组可在运行时固定成员，下次配置激活或通过 DELETE 请求清除固定成员时失效，详见[原生组控制](./api.md#节点与组)。
+
+### URLTest 冷启动
+
+在任何成员有延迟测量值之前，路由到 URLTest 组的连接会让多个成员竞速，采用最先连通的一个。TCP 最多启动三个成员，间隔 200 ms。UDP 在 0、30、80、160 ms 依次启动成员，之后每隔 80 ms 再启动一个，同时最多三个，并在胜出者确定前不发送应用数据。嵌套在其他组中的冷启动 URLTest 组只贡献一个成员，不参与竞速。
 
 ### Score 策略
 
@@ -122,16 +159,39 @@ setup/TX 后的定向 Traffic RX 可在 flow 结束前打开有额度的半开�
 ## 过滤解析
 
 1. 单独的 `group('tag')` 行把嵌套 tag 加入 `groups`，不作为节点谓词求值。嵌套 tag 可以贡献该组当前策略选出的叶节点。包含其他谓词或尾随文本的 `group(...)` 行会被忽略并报告诊断信息；如果组内只有这一条过滤器，该组的成员为空。
-2. `name(...)` 匹配 `Node.name`。`subtag(...)` 把 `Node.subscription_id` 映射到当前订阅 tag 并匹配该 tag。普通参数是精确匹配，`keyword:` 是子串匹配，`regex:` 是原始正则表达式。匹配区分大小写；同一谓词中的多个参数互为候选。
+2. `name(...)` 匹配 `Node.name`。`subtag(...)` 把 `Node.subscription_id` 映射到当前订阅 tag 并匹配该 tag。普通参数是精确匹配，`keyword:` 是子串匹配，`regex:` 使用 [Rust regex 语法](https://docs.rs/regex/latest/regex/#syntax)。匹配区分大小写；同一谓词中的多个参数互为候选。正则表达式无效时，honk 忽略该过滤器行；其他过滤器行仍可提供成员。
 3. 同一行中由 `&&` 连接的谓词按 AND 求值。在谓词前加 `!` 会对其取反。不同 `name(...)` 和 `subtag(...)` `filter:` 行之间按 OR 求值；单独的 `group(...)` 行加入嵌套候选。
 4. 每次订阅刷新后都会重建过滤后的成员关系。因此，节点 UUID 即使不变，也不会在订阅来源变化后保留过期成员关系。
 5. 既没有节点过滤器也没有嵌套组的组会接收当前全部节点。显式 `group()`、空过滤器、空嵌套组或订阅刷新后变空的过滤器均不选择节点。这些空结果在 JSON/YAML/TOML 序列化与重新解析以及刷新后仍保留；有效的同级过滤器继续按 OR 提供候选，`final` 保持独立。
 
 honk 会忽略无法解析的过滤器，并在诊断中注明其在组内节点过滤器中的序号；只有非空的独立 `group(...)` 行不参与计数，混合谓词行仍参与计数。`group()` 产生 `empty-subgroup` 警告。需要全部节点时请删除过滤器；显式 `group()` 现在不选择任何节点。注入的 `direct` 与 `block` 是出站，不是节点池成员：无过滤器的组、`keyword:`、`regex:` 与 `subtag(...)` 都不会选中它们，只有按名字写出的过滤器（`filter: name(direct)`）才会收入。
 
+```dae
+group {
+    paid-nodes {
+        filter: subtag(paid, regex: '^premium-') && !name(keyword: 'Expired')
+    }
+    named-nodes {
+        filter: name('primary', 'backup')
+    }
+    literal-names {
+        filter: name('a&&b', 'a,b', 'keyword: HK')
+    }
+    provider-only {
+        filter: subtag('paid') && !subtag('expired-provider')
+    }
+}
+```
+
+值含 `&&` 或 `,` 时应加引号，例如 `name('a&&b')`。`name(keyword: 'HK')` 匹配子串，`name('keyword: HK')` 则只匹配名字恰好为 `keyword: HK` 的节点。
+
+内联节点等没有当前订阅 tag 的节点永远不匹配 `subtag(...)`，因此会匹配 `!subtag(...)`。只允许订阅节点时，再加一个正向 `subtag(...)`。
+
+嵌套组建议写成 `group('hk', 'jp')`，也可以写 `group(hk|jp)`。引号在这里不保护 `|` 和 `,`：`group('hk|jp')` 仍会加入两个组，并产生 `legacy-quoted-list`。重复的 tag 会被去掉。
+
 ## 嵌套组
 
-嵌套选择深度上限为 8。组管理器构图时会删除每条构成环的边并记录警告；未知的嵌套 tag 不会贡献候选。每个嵌套组贡献其自身策略选出的单个叶节点，因此每次拨号最终都会解析到一个节点。
+嵌套 tag 必须指向已声明的组；未知 tag 会使配置在启动或重载时以 `invalid-nested-group-reference` 被拒绝。组管理器构图时删除每条构成环的边并记录警告。嵌套选择深度上限为 8。每个嵌套组贡献其自身策略选出的单个叶节点，因此每次拨号最终都会解析到一个节点。
 
 面向 Clash 的组输出保留成员 tag：`all` 字段列出直接节点名和嵌套组 tag，而不展开嵌套组。面向叶节点的健康状态与连通性遍历会展开这些 tag 下的实际节点。
 

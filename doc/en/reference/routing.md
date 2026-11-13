@@ -14,10 +14,11 @@ fallback: outbound[(must)] | direct(mark: value[, must])
 - `default:` is an alias of `fallback:`. The fallback target applies when no rule finalizes; if omitted, it defaults to `direct`.
 - Comma-separated arguments inside a matcher are alternatives. Different populated condition groups must all match.
 - A parenthesized argument list may span physical lines within one source file. The statement continues through its closing `)` and `-> outbound`; an included file cannot finish another file's unfinished call.
-- Single or double quotes protect every interior byte, including whitespace, `#`, braces, `,`, `)`, `&&`, and `->`. Quotes open at the start of a token or immediately after an unquoted `(` or `,`; a prefixed argument may quote its value in a separate token, as in `domain(full: 'example.com')`. Backslashes are preserved, not decoded. An opened quote must close on the same physical line; otherwise the configuration fails with `unterminated-quote`.
+- Single or double quotes protect every interior byte, including whitespace, `#`, braces, `,`, `)`, `&&`, and `->`. Quotes open at the start of a token or immediately after an unquoted `(`, `,`, or `:`, so `domain(suffix:'example.com')` equals `domain(suffix: 'example.com')`. Backslashes are preserved, not decoded. An opened quote must close on the same physical line; otherwise the configuration fails with `unterminated-quote`.
 - A leading `!` negates only the single matcher immediately following it. A rule matches when its positive conditions match and none of its negated matchers hits.
-- An unknown or unsniffed domain counts as “not x” for a negated domain or geosite matcher. It does not veto that rule.
-- Unknown nonempty predicates, whitespace before matcher parentheses, and trailing matcher text reject the configuration with a located diagnostic. Unsupported nonempty terms are never removed from a conjunction. Existing empty traffic-term and empty-argument behavior is unchanged.
+- Traffic without domain, process-name, MAC or DSCP metadata misses the matching function, so the negated form matches it: an unsniffed domain satisfies `!domain(...)` and `!geosite:...`, and traffic without a process name satisfies `!pname(...)`.
+- Unknown nonempty predicates, whitespace before matcher parentheses, and trailing matcher text reject the configuration with a located diagnostic. Unsupported nonempty terms are never removed from a conjunction.
+- Empty terms, a lone `!` and empty arguments are skipped: `domain() && dport(443)` is `dport(443)`. A rule left with no condition never matches; use `fallback:` for a catch-all.
 - An unquoted token-head `#` starts a comment; a glued `#` is data. `domain(x) -> proxy#c` targets the literal name `proxy#c` and emits `legacy-glued-hash`. Write `-> proxy # comment` for a comment. The first unquoted arrow separates the action; later arrows remain target data with `legacy-arrow-target`.
 
 ```dae
@@ -34,22 +35,42 @@ routing {
 
 | Function | Accepted arguments | Internal `RoutingCondition` field |
 | --- | --- | --- |
-| `domain(...)` | Bare value or `suffix:` for a suffix; `keyword:` for a substring; `full:` for an exact name; `regex:` for a regular expression; `geosite:` for a geosite code | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
-| `dip(...)` | Destination IP/CIDR; `geoip: code` | `ip`, `geo_ip` |
-| `sip(...)` | Source IP/CIDR | `source_ip` |
-| `dport(...)` | Destination port or inclusive `start-end` range | `port` |
-| `sport(...)` | Source port or inclusive `start-end` range | `source_port` |
-| `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | Substring patterns normalized to 15 bytes, matched against the executable basename from `argv[0]`; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously | `process_name` |
-| `mac(...)` | Source MAC address | `mac` |
-| `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
-| `dscp(...)` | Decimal or `0x`/`0X`-prefixed hexadecimal DSCP value | `dscp` |
+| `domain(...)` | Bare value or `suffix:` for a raw suffix; `keyword:` for a substring; `full:` for a whole-name glob supporting `*` and `?`; `regex:` for a Rust regular expression; `geosite:` for a geosite code | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
+| `dip(...)` | Destination IPv4/IPv6 address or CIDR, not a hostname; `geoip: code`. An address becomes `/32` or `/128`; CIDR host bits are cleared. | `ip`, `geo_ip` |
+| `sip(...)` | Source IPv4/IPv6 address or CIDR, read as in `dip(...)` | `source_ip` |
+| `dport(...)` | Decimal destination port or inclusive `start-end` range from `0` to `65535`, with `start <= end` | `port` |
+| `sport(...)` | Decimal source port or inclusive `start-end` range from `0` to `65535`, with `start <= end` | `source_port` |
+| `l4proto(...)` | `tcp`, `udp`, in any case | `protocol` |
+| `pname(...)` | Substring patterns normalized to 15 bytes, matched against the executable basename from `argv[0]`; when runtime BTF offsets or verifier-safe kernel argv access are unavailable, the cgroup hook uses the calling thread's `comm` synchronously. Matches only processes on the honk host, not applications on LAN clients. | `process_name` |
+| `mac(...)` | Source MAC address as `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff` or `aabbccddeeff`, in any case | `mac` |
+| `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6`, in any case | `ip_version` |
+| `dscp(...)` | Decimal or `0x`/`0X`-prefixed hexadecimal value; packets carry DSCP values `0` to `63` | `dscp` |
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
 
 All domain pattern/suffix/keyword/regex and `geosite` alternatives share one
 condition, so `domain(geosite: netflix, suffix: imgur.com)` matches either. Separate
 `domain(...)` calls in one rule fill the same fields and are alternatives too.
+
+`full:`, `suffix:` and `keyword:` are case-sensitive. `full:` matches the whole name, with `*` for any run of characters and `?` for one character; every other character is literal. `suffix:` compares raw text, so `suffix: example.com` also matches `notexample.com`. To match a domain and its subdomains on label boundaries, use `domain(regex: '(^|\.)example\.com$')`. Geosite entries compare case-insensitively and match suffixes on label boundaries.
+
+`regex:` uses [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax), not glob syntax; an invalid pattern fails when honk builds the router. An empty prefixed value is kept: `domain(suffix: '')` matches every domain, unlike `domain()`.
+
+Standalone `geosite:`, `geoip:`, `domain:`, `suffix:`, `keyword:`, `full:` and `regex:` predicates also accept a leading `!` and conjunctions. `domain:example.com` is a suffix match, not a `full:` match.
+
+```dae
+routing {
+    domain(full: '*.example.com') -> proxy
+    domain(regex: '(^|\.)example\.com$') -> proxy
+    domain(suffix:'example.com') -> proxy
+    !geosite:cn -> proxy
+    fallback: direct
+}
+```
+
+The glob above matches subdomains but not the apex `example.com`; the regex includes both. Unlike `suffix: example.com`, neither matches `notexample.com`.
+
+Invalid addresses in `dip(...)` and `sip(...)`, invalid MAC or DSCP values, and unsupported `l4proto` or `ipversion` values are dropped without an error. A function left with no valid value matches nothing, so its negated form matches all traffic the rule's other conditions allow. A malformed port fails with `Invalid port`, and the kernel routing policy compiler rejects a reversed range such as `443-80`.
 
 A matching `mac(...) -> direct(must)` can exempt a client from transparent DNS; ordinary `direct` does not. LAN/WAN TCP/UDP destination port `53` evaluates the normal ordered traffic policy once after existing ingress and control-plane exclusions, not a separate must-only scan. LAN port `53` skips local-socket probing, even when dnsmasq or `dns.bind` listens on the destination.
 
@@ -153,9 +174,16 @@ The compiled policy admits at most 256 distinct nonzero `direct(mark: ..., must)
 
 See the [global reference](./global.md) for runtime asset resolution. `geoip: private` uses a built-in CIDR set and does not require `geoip.dat`.
 
-If a referenced geo asset is missing, the engine logs a warning naming the file. Unused assets do not produce missing-file warnings.
+`private` covers more than RFC 1918 LAN addresses, including CGNAT, loopback, link-local, documentation and multicast ranges:
 
-A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown category or a selector matching no entries logs a warning, expands to zero matchers, and never matches.
+| Family | CIDRs |
+| --- | --- |
+| IPv4 | `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.0.0.0/24`, `192.0.2.0/24`, `192.88.99.0/24`, `192.168.0.0/16`, `198.18.0.0/15`, `198.51.100.0/24`, `203.0.113.0/24`, `224.0.0.0/4`, `240.0.0.0/4`, `255.255.255.255/32` |
+| IPv6 | `::1/128`, `fc00::/7`, `fe80::/10` |
+
+If a referenced geo asset is missing, the engine logs a warning naming the file and starts with that matcher empty. Unused assets do not produce missing-file warnings. An empty geo matcher matches nothing, so `!domain(geosite: ...)` or `!dip(geoip: ...)` then matches all traffic the rule's other conditions allow: a missing asset widens a negated rule instead of disabling it.
+
+Geosite categories and GeoIP codes are case-insensitive. A geosite code may select an attribute with `category@attr`. Attribute keys compare case-insensitively. Everything after the first `@` is the selector, including any later `@`. An unknown geosite category, an unknown GeoIP code or a selector matching no entries logs a warning and expands to nothing, with the same effect on negated rules.
 
 ## Explicit local rules
 

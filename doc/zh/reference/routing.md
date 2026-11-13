@@ -14,10 +14,11 @@ fallback: outbound[(must)] | direct(mark: value[, must])
 - `default:` 是 `fallback:` 的别名。没有规则最终确定结果时使用 fallback 目标；省略时默认为 `direct`。
 - 同一个匹配器内以逗号分隔的参数互为备选。不同的非空条件组必须全部匹配。
 - 匹配器的括号参数列表可以在同一源文件内跨物理行，语句一直延续到右括号和 `-> outbound`。被包含的文件不能补全另一文件中未完成的调用。
-- 成对的单引号或双引号保留内部的全部字节，包括空白、`#`、花括号、`,`、`)`、`&&` 和 `->`。引号只在词法单元开头，或紧接引号外的 `(`、`,` 时开启；带前缀的参数可把加引号的值写成独立词法单元，例如 `domain(full: 'example.com')`。反斜杠保留原样，不作转义解码。已开启的引号必须在同一物理行闭合，否则配置以 `unterminated-quote` 错误失败。
+- 成对的单引号或双引号保留内部的全部字节，包括空白、`#`、花括号、`,`、`)`、`&&` 和 `->`。引号在词法单元开头，或紧接引号外的 `(`、`,`、`:` 时开启，因此 `domain(suffix:'example.com')` 等同于 `domain(suffix: 'example.com')`。反斜杠保留原样，不作转义解码。已开启的引号必须在同一物理行闭合，否则配置以 `unterminated-quote` 错误失败。
 - 前缀 `!` 只对紧随其后的单个匹配器取反。规则仅在正向条件匹配且所有取反匹配器都未命中时匹配。
-- 对取反的域名或 geosite 匹配器，未知或尚未嗅探到的域名视为“不是 x”，因此不会否决该规则。
-- 未知的非空匹配器、匹配器名称与左括号之间的空格、调用后的多余文本均使配置校验失败，并产生带位置的诊断。合取中不支持的非空条件不会被单独丢弃。空流量条件和空参数的既有行为保持不变。
+- 流量缺少域名、进程名、MAC 或 DSCP 元数据时，对应的匹配函数视为未命中，其取反形式因而命中：尚未嗅探到域名的流量满足 `!domain(...)` 和 `!geosite:...`，没有进程名的流量满足 `!pname(...)`。
+- 未知的非空匹配器、匹配器名称与左括号之间的空格、调用后的多余文本均使配置校验失败，并产生带位置的诊断。合取中不支持的非空条件不会被单独丢弃。
+- 空项、单独的 `!` 和空参数会被跳过：`domain() && dport(443)` 即 `dport(443)`。没有剩余条件的规则永不匹配；兜底请用 `fallback:`。
 - 引号外、词法单元开头的 `#` 才开始注释；紧贴前文的 `#` 是数据。`domain(x) -> proxy#c` 指向字面名称 `proxy#c`，并产生 `legacy-glued-hash` 警告。注释请写成 `-> proxy # comment`。第一个引号外的箭头分隔动作，后续箭头保留在目标名称中，并产生 `legacy-arrow-target` 警告。
 
 ```dae
@@ -34,22 +35,42 @@ routing {
 
 | 函数 | 接受的参数 | 内部 `RoutingCondition` 字段 |
 | --- | --- | --- |
-| `domain(...)` | 裸值或 `suffix:` 表示后缀；`keyword:` 表示子串；`full:` 表示完整名称；`regex:` 表示正则表达式；`geosite:` 表示 geosite 代码 | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
-| `dip(...)` | 目的 IP/CIDR；`geoip: code` | `ip`, `geo_ip` |
-| `sip(...)` | 源 IP/CIDR | `source_ip` |
-| `dport(...)` | 目的端口或闭区间 `start-end` | `port` |
-| `sport(...)` | 源端口或闭区间 `start-end` | `source_port` |
-| `l4proto(...)` | `tcp`, `udp` | `protocol` |
-| `pname(...)` | 按 15 字节规范化的子串模式，匹配 `argv[0]` 的可执行文件 basename；运行时 BTF 偏移或 cgroup verifier 拒绝内核 argv 读取时，cgroup hook 同步使用调用线程的 `comm` | `process_name` |
-| `mac(...)` | 源 MAC 地址 | `mac` |
-| `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
-| `dscp(...)` | 十进制或带 `0x`/`0X` 前缀的十六进制 DSCP 值 | `dscp` |
+| `domain(...)` | 裸值或 `suffix:` 表示原始后缀；`keyword:` 表示子串；`full:` 表示支持 `*` 和 `?` 的整名 glob；`regex:` 表示 Rust 正则表达式；`geosite:` 表示 geosite 代码 | `domain_suffix`, `domain_keyword`, `domain`, `domain_regex`, `geosite` |
+| `dip(...)` | 目的 IPv4/IPv6 地址或 CIDR，不接受主机名；`geoip: code`。单个地址转换为 `/32` 或 `/128`；CIDR 的主机位会被清零。 | `ip`, `geo_ip` |
+| `sip(...)` | 源 IPv4/IPv6 地址或 CIDR，解析方式与 `dip(...)` 相同 | `source_ip` |
+| `dport(...)` | 十进制目的端口或闭区间 `start-end`，范围为 `0` 到 `65535`，且 `start <= end` | `port` |
+| `sport(...)` | 十进制源端口或闭区间 `start-end`，范围为 `0` 到 `65535`，且 `start <= end` | `source_port` |
+| `l4proto(...)` | `tcp`、`udp`，不区分大小写 | `protocol` |
+| `pname(...)` | 按 15 字节规范化的子串模式，匹配 `argv[0]` 的可执行文件 basename；运行时 BTF 偏移或 verifier 安全的内核 argv 访问不可用时，cgroup hook 同步使用调用线程的 `comm`。只匹配 honk 所在主机上的进程，不匹配 LAN 客户端上的应用。 | `process_name` |
+| `mac(...)` | 源 MAC 地址，写作 `aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff`、`aabb.ccdd.eeff` 或 `aabbccddeeff`，不区分大小写 | `mac` |
+| `ipversion(...)` | `4`/`ipv4`、`6`/`ipv6`，不区分大小写 | `ip_version` |
+| `dscp(...)` | 十进制或带 `0x`/`0X` 前缀的十六进制值；数据包的 DSCP 值为 `0` 到 `63` | `dscp` |
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 
 domain 模式、后缀、关键字、正则表达式与 `geosite` 都是同一条件内的备选，
 因此 `domain(geosite: netflix, suffix: imgur.com)` 命中任一即可。同一规则中
 多个 `domain(...)` 调用写入相同字段，同样互为备选。
+
+`full:`、`suffix:` 和 `keyword:` 区分大小写。`full:` 匹配整个名称，`*` 匹配任意字符序列，`?` 匹配一个字符，其他字符都按字面处理。`suffix:` 按原始文本比较后缀，因此 `suffix: example.com` 也会匹配 `notexample.com`。要按标签边界匹配域名本身及其子域名，使用 `domain(regex: '(^|\.)example\.com$')`。geosite 条目不区分大小写，并按标签边界匹配后缀。
+
+`regex:` 使用 [Rust regex 语法](https://docs.rs/regex/latest/regex/#syntax)，不是 glob 语法；无效模式会使 honk 构建路由器时失败。带前缀的空值会保留：`domain(suffix: '')` 匹配所有域名，与 `domain()` 不同。
+
+也接受独立的 `geosite:`、`geoip:`、`domain:`、`suffix:`、`keyword:`、`full:` 和 `regex:` 谓词，支持前缀 `!` 和合取。`domain:example.com` 表示后缀匹配，不是 `full:` 匹配。
+
+```dae
+routing {
+    domain(full: '*.example.com') -> proxy
+    domain(regex: '(^|\.)example\.com$') -> proxy
+    domain(suffix:'example.com') -> proxy
+    !geosite:cn -> proxy
+    fallback: direct
+}
+```
+
+上面的 glob 匹配子域名，但不匹配 `example.com` 本身；正则表达式同时匹配两者。与 `suffix: example.com` 不同，两者均不匹配 `notexample.com`。
+
+`dip(...)` 和 `sip(...)` 中的无效地址、无效的 MAC 或 DSCP 值，以及不支持的 `l4proto` 或 `ipversion` 值，都会被直接丢弃，不报错。没有剩下有效值的匹配函数不匹配任何流量，其取反形式则匹配满足规则其余条件的全部流量。格式错误的端口以 `Invalid port` 失败；内核路由策略编译器会拒绝 `443-80` 这样的反向区间。
 
 `mac(...)` 与其他流量条件一样，可以通过终局 `direct(must)` 规则绕过透明 DNS；普通 `direct` 不会取消 DNS 接管。LAN/WAN TCP/UDP 目的端口 `53` 在既有入口与控制平面排除后，执行一次正常有序流量策略，不单独扫描 must 规则。LAN 端口 `53` 跳过本地套接字探测，即使 dnsmasq 或 `dns.bind` 已监听该目的地址也不例外。
 
@@ -147,9 +168,16 @@ LAN 原生直连在 Linux 转发路由查找前设置 mark。主机/WAN 出站�
 
 运行时资源解析规则见[全局参考](./global.md)。`geoip: private` 使用内建 CIDR 集，不需要 `geoip.dat`。
 
-找不到被引用的 Geo 资源时，引擎会记录包含缺失文件名的警告。未使用的资源不会触发缺失文件警告。
+`private` 不限于 RFC 1918 LAN 地址，还包括 CGNAT、回环、链路本地、文档和组播等范围：
 
-geosite 代码可以用 `category@attr` 选择属性。属性名按大小写不敏感方式比较。第一个 `@` 后的全部内容都是选择器，包括后续的 `@`。未知类目或没有条目命中的选择器会记录告警、展开为零个 matcher，并且永不匹配。
+| 地址族 | CIDR |
+| --- | --- |
+| IPv4 | `10.0.0.0/8`、`100.64.0.0/10`、`127.0.0.0/8`、`169.254.0.0/16`、`172.16.0.0/12`、`192.0.0.0/24`、`192.0.2.0/24`、`192.88.99.0/24`、`192.168.0.0/16`、`198.18.0.0/15`、`198.51.100.0/24`、`203.0.113.0/24`、`224.0.0.0/4`、`240.0.0.0/4`、`255.255.255.255/32` |
+| IPv6 | `::1/128`、`fc00::/7`、`fe80::/10` |
+
+找不到被引用的 Geo 资源时，引擎会记录包含缺失文件名的警告，并以空匹配器启动。未使用的资源不会产生缺失文件警告。空的 Geo 匹配器不匹配任何流量，因此 `!domain(geosite: ...)` 或 `!dip(geoip: ...)` 会匹配满足规则其余条件的全部流量：资源缺失会扩大取反规则的范围，而不是让它失效。
+
+geosite 类目和 GeoIP 代码不区分大小写。geosite 代码可以用 `category@attr` 选择属性，属性键不区分大小写。第一个 `@` 之后的全部内容都是选择器，包括后续的 `@`。未知的 geosite 类目、未知的 GeoIP 代码或不匹配任何条目的选择器会记录警告并展开为空，对取反规则的影响同上。
 
 ## 显式本地路由
 
