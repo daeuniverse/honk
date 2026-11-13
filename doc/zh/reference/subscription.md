@@ -12,7 +12,7 @@ subscription {
     'https://example.com/no_tag_link'
     detailed: 'https://example.org/sub' {
         ua: 'honk/1.0'
-        interval: 10000s
+        interval: 6h
         cache: false
         route: direct
     }
@@ -30,6 +30,12 @@ subscription {
 
 未设置的选项先取 `assets.subscription` 的默认值（出口取 `assets.route`），再取内置默认值。见 [Assets 配置参考](./assets.md)。
 
+`interval` 取整数秒，可不带单位，也可带小写 `s`、`m` 或 `h` 后缀；`ms` 后缀表示毫秒，向上取整到秒。`d`、`1h30m` 这类组合值和 `0.5s` 这类小数无效。无效的 `interval` 会产生警告并变为 `0`，即关闭定期刷新和失败重试，不会回退到继承值。
+
+`cache` 接受 `true`、`yes`、`1`、`on`、`false`、`no`、`0` 和 `off`，不区分大小写。无效的 `cache` 会产生警告并变为 `true`。
+
+`ua: ''` 把继承的 `assets.subscription.ua` 重置为内置的 `honk/<version>`，不会删除 `User-Agent` 标头。`ua` 不是合法的 HTTP 标头值时，拉取失败。
+
 两种旧写法仍可解析，且不产生警告：
 
 | 写法 | 示例 |
@@ -37,7 +43,7 @@ subscription {
 | 带引号的 URL 后追加 `(UA)` | `compatible: 'https://example.net/sub'(honk/1.0 like)` |
 | URL 写在块内 | `detailed: { url: '…' ua: '…' }` |
 
-块内也接受 `download_detour` 作为 `route` 的别名。同时设置两者会产生 `conflicting-subscription-route` 错误。下文的后缀和紧接注释规则适用于 `(UA)` 写法。
+只有 URL 写在块内的写法接受 `download_detour` 作为 `route` 的别名，同时设置两者会产生 `conflicting-subscription-route` 错误。URL 写在条目行上时，`download_detour` 是未知键，会产生警告并被忽略。下文的后缀和紧接注释规则适用于 `(UA)` 写法。
 
 标签可以省略。标签和 URL 都可使用配对的单引号或双引号。
 
@@ -46,6 +52,8 @@ subscription {
 | 裸条目 | 第一个 `:` 之前的文本为标签，除非该冒号属于 `://`。URL 中后续的冒号不会拆分标签。 |
 | 带引号的标签后接 `:` | 显式标签。 |
 | 没有显式标签的带引号 URL | 去除外层引号后，应用首个冒号规则。`'paid:https://example.com/sub'` 的标签为 `paid`；`'https://example.com/sub'` 无标签。 |
+
+整体加引号的 `'paid:https://example.com/sub'` 写法会产生 `legacy-embedded-tag` 警告；应改写为 `paid: 'https://example.com/sub'`。
 
 `(UA)` 后缀要求 URL 带引号，避免与裸 URL 中的括号混淆。两种形式均保留 `sub_type: simple`，自动识别下文支持的正文格式。
 
@@ -68,13 +76,13 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 | 字段 | 类型 | 默认值 | 可在 dae 中设置 | 含义 |
 | --- | --- | --- | --- | --- |
-| `id` | UUID | 随机 UUID | 否 | 运行时订阅身份；SIGHUP 时，若拉取身份（URL + 配置的 `ua` + 标头）与已有订阅匹配则保留该值。 |
+| `id` | UUID | 随机 UUID | 否 | 运行时订阅身份；SIGHUP 时，若拉取身份（URL + 配置的 `ua` + 标头）与已有订阅匹配则保留该值。结构化配置设置 `id` 时，其值不能为 nil，且在所有条目中唯一。 |
 | `name` | string | `""` | 是，作为标签；省略时取 URL 主机名 | 显示标签，也是组 `subtag(...)` 过滤条件和 DNS `subtag(...)` 规则使用的值。 |
 | `url` | string | `""` | 是 | HTTP(S) 拉取 URL。 |
 | `sub_type` | enum | `simple` | 否 | 正文解析器：`simple`、`clash`、`sip008` 或 `custom`。 |
 | `update_interval` | u64 | `86400` | 是，对应 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
-| `user_agent` | string 或 null | `honk/<version>` | 是，对应 `ua` | 可选的 `User-Agent` 覆盖值；未设置时请求标识为 `honk/<version>`。 |
-| `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求标头。 |
+| `user_agent` | string 或 null | null | 是，对应 `ua` | 可选的 `User-Agent` 覆盖值；为 null 或空时发送 `honk/<version>`。 |
+| `headers` | `{key,value}[]` | `[]` | 否 | 有序的额外请求标头；同名标头逐条发送。标头名称或值无效时，拉取失败。 |
 | `download_detour` | string | `""` | 是，对应 `route` | 拉取的出口：空值或 `routing` 遵循路由规则，`direct` 直连主机，组名则始终经过该组。未知组在校验时被拒绝。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不会恢复、拉取或刷新。 |
 | `cache` | bool | `true` | 是，对应 `cache` | 在 `global.store_subscribe` 启用时保存拉取到的正文，供离线启动恢复。设为 `false` 时既不保存也不恢复，维护任务会删除此前保存的正文。 |
@@ -86,7 +94,7 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 
 | `sub_type` | 解析行为 |
 | --- | --- |
-| `simple` | 自动识别分享链接列表、Clash YAML/JSON、SIP008、sing-box JSON 和受支持的客户端记录。 |
+| `simple` | 自动识别分享链接列表、Clash YAML/JSON、SIP008、sing-box JSON/YAML 和受支持的客户端记录。 |
 | `clash` | 带顶层 `proxies` 序列的 YAML 或 JSON。 |
 | `sip008` | SIP008 `servers` 对象或裸服务器数组；不是分享链接列表。 |
 | `custom` | 与 `simple` 使用相同的格式识别。 |
@@ -135,7 +143,8 @@ URL 带引号时，紧贴结束引号或一个完整 `(UA)` 后缀的 `#` 作为
 | 重定向状态码 | 仅跟随 301、302、303、307、308，最多 5 次。 |
 | 重定向目标 | 禁止从 HTTPS 转到 HTTP，或从公网地址转到私有字面地址。前表的重定向限制同样适用。 |
 | URL 用户信息 | 以基本认证发送。 |
-| 协议、主机或端口变化 | 与直连客户端一样，移除 `Authorization`、`Cookie` 和 `Proxy-Authorization`。 |
+| 协议、主机或端口变化 | 移除 `Authorization`、`Cookie`、`Cookie2`、`WWW-Authenticate`、`Proxy-Authorization` 和配置的 `Host`。 |
+| Referer | 设为上一跳 URL，去除 userinfo 和 fragment。 |
 
 未启用 `native-api` 的构建使用相同的订阅拉取路由规则。
 
@@ -196,6 +205,18 @@ subscription {
 
 规范化条目逐个进入准入流程，不保留与正文条目数等大的中间结果列表。每份正文最多保留 128 条非终止诊断，超出时追加一条 `subscription-diagnostics-truncated` 摘要记录省略数量；正文失败的终止错误单独保留。调用方已有的诊断不变，也不占用此限额。结构化、URI 和记录导入均使用该限额，包括 Base64 解码与持久化正文恢复；达到限额不会停止有效节点准入，也不改变重复节点保留第一个可用条目的规则。
 
+`simple` 和 `custom` 会先尝试标准或 URL 安全的 Base64 解码，因此 Base64 可以包裹任何可识别的格式，不限于分享链接列表。`clash` 和 `sip008` 要求未编码的正文。
+
+| 诊断代码 | 结果 |
+| --- | --- |
+| `malformed-subscription-entry` | 跳过字段或语法无效的条目。 |
+| `unsupported-subscription-entry` | 跳过需要不支持的协议或功能的条目。 |
+| `duplicate-subscription-entry` | 跳过节点身份重复的后续条目。 |
+| `subscription-profile-entry` | 忽略配置文件中的非代理内容。 |
+| `invalid-subscription-encoding` | 拒绝不是 UTF-8 的正文，包括 Base64 解码后的内容。 |
+| `invalid-subscription-body` | 拒绝无法解析的结构化正文。 |
+| `empty-subscription-body` | 拒绝没有可用节点的正文。 |
+
 Clash、SIP008 和 sing-box 的凭据标量保留字符串原始字节，并把原生有限数转换为来源格式的规范十进制文本。缺失或 null 表示未提供；布尔值、列表、映射和非有限数会使条目被拒绝。有效别名不能掩盖已提供的无效凭据。数字 UUID 仍无法通过 UUID 校验；空密码仍须满足对应协议的要求。
 
 ### 分享链接列表
@@ -225,13 +246,14 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `username` | `username` | 可选 string。 |
 | `password` | `password` | 可选 string；VLESS 使用下文优先级。 |
 | `cipher` | `encryption` | 可选加密算法；VLESS 的字段优先级见下文。 |
-| `plugin`, `plugin-opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，映射类型的 options 也会被拒绝。 |
+| `plugin`, `plugin-opts`, `plugin_opts` | — | 不支持；任一字段具有非空值时，条目会在发布节点前被跳过，映射类型的 options 也会被拒绝。 |
 | `network` | `transport` 或数据包网络能力 | Trojan/VMess/VLESS 使用流传输（`tcp`、`ws`、`grpc`、`xhttp`）；AnyTLS 使用数据包网络能力。 |
 | `tls` | `tls` | 可选 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 默认启用 TLS，并拒绝显式关闭。 |
 | `servername`、`server-name`、`sni` | `sni` | 空值或纯空白名称视为未指定；非空别名必须逐字节一致。 |
 | `skip-cert-verify`、`skip_cert_verify`、`insecure` | `skip_cert_verify` | 须使用原生布尔值；已提供的别名必须一致。 |
 | `fingerprint`、`pin-sha256`、`pin_sha256` | `tls_pin_sha256` | 叶证书 SHA-256 固定值（十六进制，忽略冒号和空白），取代 PKI 与主机名校验。所有 TLS 协议都会导入 Clash 的 `fingerprint`；无 TLS 协议则跳过该条目。已提供的别名必须一致。 |
 | `alpn` | `tls_alpn` | raw TCP TLS 的有序字符串列表或逗号分隔字符串；XHTTP 只接受 H2，省略时规范化为 `["h2"]`。QUIC 保留下文的协议专属规则。 |
+| `disable-sni`, `disable_sni` | — | `true` 时跳过该条目；`false` 可以接受。 |
 
 #### 协议专属选项
 
@@ -313,7 +335,7 @@ VLESS 字段会在派生节点身份前应用：
 | 启用 `smux`/`multiplex`，并指定 `protocol: h2mux` 或显式 `padding` | auto（被封装接管时不生效） | H2MUX | 除非 `udp: false`，否则开启 |
 | `mux: { enabled: true, ... }` | `auto`，除非显式数据包编码仍能通过 protocol 回退或 `skip` 生效 | Xray Mux.Cool | 除非 `udp: false`，否则开启 |
 
-对 H2MUX，`padding: true` 选择现有 padded 线协议格式，false 选择无填充的 H2MUX。现有 `only-tcp`、Brutal 和非零 `max-connections`/`min-streams`/`max-streams` 限制不变。启用 H2MUX 与 Xray mux、UoT 互斥；启用 UoT 也与 Xray mux 互斥。显式 XUDP 与 H2MUX 或 UoT 冲突；原生/auto 声明只会在封装接管时不生效。
+启用 H2MUX 时须设置 `protocol: h2mux` 或显式的 `padding`；`padding` 默认为 `false`，`true` 选择带填充的 H2MUX。`only-tcp: true`、启用的 Brutal，以及非零的 `max-connections`、`min-streams` 或 `max-streams` 会使条目被拒绝。启用 H2MUX 与 Xray mux、UoT 互斥；启用 UoT 也与 Xray mux 互斥。显式 XUDP 与 H2MUX 或 UoT 冲突；原生/auto 声明只会在封装接管时不生效。
 
 启用的 Clash `mux` 块只接受 `enabled`、有符号 `i16` 的 `concurrency` 和 `xudpConcurrency`，以及 `xudpProxyUDP443` 作为有效设置。未启用的额外设置会被忽略。
 
@@ -329,9 +351,9 @@ VLESS 字段会在派生节点身份前应用：
 
 规范 VLESS 分享链接使用精确的 `packetEncoding=auto|none|xudp|uot-v2`、`mux=off|h2mux|xray` 和 `udp=0|1` 查询参数。已移除的 `vless_mode` 查询参数，以及 `smux`、`udp-over-tcp`、`packet-encoding` 等含义不明确的第三方分享链接拼写会被拒绝，不会猜测其语义。
 
-### SIP008 与 sing-box JSON
+### SIP008 与 sing-box JSON 或 YAML
 
-SIP008 version 1/2 封装（`{"servers":[...]}`）及裸服务器数组会导入 Shadowsocks 的 `server`、`server_port`、`method`、`password` 和 `remarks`。空插件字段不会导致拒绝；有效的插件配置仍不受支持。
+SIP008 和 sing-box 正文可以是 JSON，也可以是等价的 YAML。SIP008 `{"servers":[...]}` 封装及裸服务器数组会导入 Shadowsocks 的 `server`、`server_port`、`method`、`password` 和 `remarks`。封装中的 `version` 必须是整数 `1` 或 `2`。空插件字段不会导致拒绝；有效的插件配置仍不受支持。
 
 sing-box 配置从 `outbounds` 导入受支持的条目：
 
@@ -339,6 +361,8 @@ sing-box 配置从 `outbounds` 导入受支持的条目：
 - 结构性条目，不属于代理节点：`selector`、`urltest`、`direct`、`block`、`dns`。
 
 TLS/SNI、REALITY、WebSocket/gRPC（包括 `Host` 以外的升级标头）、VLESS 数据包选项和受支持的协议调优通过共用节点构建器规范化。
+
+未设置 `tls` 或 `tls.enabled` 时，sing-box TLS 处于关闭状态，因此没有 `tls.enabled: true` 的 Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 条目会被跳过。
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |

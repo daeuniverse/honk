@@ -12,7 +12,7 @@ subscription {
     'https://example.com/no_tag_link'
     detailed: 'https://example.org/sub' {
         ua: 'honk/1.0'
-        interval: 10000s
+        interval: 6h
         cache: false
         route: direct
     }
@@ -30,6 +30,12 @@ The entry block accepts four options:
 
 A missing option uses the `assets.subscription` default, or `assets.route` for the route, before the built-in default. See the [assets reference](./assets.md).
 
+`interval` takes whole seconds, either bare or with a lowercase `s`, `m` or `h` suffix, or milliseconds with `ms`, rounded up to whole seconds. `d`, compound values such as `1h30m` and fractions such as `0.5s` are invalid. An invalid `interval` warns and becomes `0`, which turns off periodic refresh and failure retries; it does not fall back to the inherited value.
+
+`cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off`, in any case. An invalid `cache` warns and becomes `true`.
+
+`ua: ''` resets an inherited `assets.subscription.ua` to the built-in `honk/<version>`; it does not remove the `User-Agent` header. A `ua` that is not a valid HTTP header value fails the fetch.
+
 Two earlier forms still parse without a warning:
 
 | Form | Example |
@@ -37,7 +43,7 @@ Two earlier forms still parse without a warning:
 | `(UA)` suffix after a quoted URL | `compatible: 'https://example.net/sub'(honk/1.0 like)` |
 | URL inside a block | `detailed: { url: '…' ua: '…' }` |
 
-The block also accepts `download_detour` as an alias for `route`. Setting both fails with `conflicting-subscription-route`. The suffix and joined-comment rules below apply to the `(UA)` form.
+Only the URL-inside-a-block form accepts `download_detour` as an alias for `route`; setting both fails with `conflicting-subscription-route`. After a URL on the entry line, `download_detour` is an unknown key and is ignored with a warning. The suffix and joined-comment rules below apply to the `(UA)` form.
 
 Tags are optional. Tags and URLs may use matching single or double quotes.
 
@@ -46,6 +52,8 @@ Tags are optional. Tags and URLs may use matching single or double quotes.
 | Bare entry | Text before the first `:` is the tag, unless that colon begins `://`. Later URL colons do not split a tag. |
 | Quoted tag followed by `:` | Explicit tag. |
 | Quoted URL without an explicit tag | Remove the enclosing quotes, then apply the first-colon rule. `'paid:https://example.com/sub'` has tag `paid`; `'https://example.com/sub'` is tagless. |
+
+The whole-quoted form `'paid:https://example.com/sub'` warns with `legacy-embedded-tag`; write `paid: 'https://example.com/sub'` instead.
 
 The `(UA)` suffix requires a quoted URL, so parentheses in bare URLs remain unambiguous. Both forms retain `sub_type: simple`, which automatically detects the supported body formats below.
 
@@ -68,13 +76,13 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 
 | Field | Type | Default | Settable in dae | Meaning |
 | --- | --- | --- | --- | --- |
-| `id` | UUID | random UUID | No | Runtime subscription identity; SIGHUP preserves it when the fetch identity (URL + configured `ua` + headers) matches an existing subscription. |
+| `id` | UUID | random UUID | No | Runtime subscription identity; SIGHUP preserves it when the fetch identity (URL + configured `ua` + headers) matches an existing subscription. A structured configuration that sets `id` needs a non-nil value unique across all entries. |
 | `name` | string | `""` | Yes, as the tag; otherwise the URL host | Display tag and the value used by group `subtag(...)` filters and DNS `subtag(...)` rules. |
 | `url` | string | `""` | Yes | HTTP(S) fetch URL. |
 | `sub_type` | enum | `simple` | No | Body parser: `simple`, `clash`, `sip008`, or `custom`. |
 | `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
-| `user_agent` | string or null | `honk/<version>` | Yes, as `ua` | Optional `User-Agent` override; otherwise requests identify as `honk/<version>`. |
-| `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers. |
+| `user_agent` | string or null | null | Yes, as `ua` | Optional `User-Agent` override; null or empty sends `honk/<version>`. |
+| `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers; a repeated name is sent repeatedly. An invalid header name or value fails the fetch. |
 | `download_detour` | string | `""` | Yes, as `route` | Fetch route: empty or `routing` follows the routing rules, `direct` connects directly to the host, and a group name forces that group. An unknown group is rejected during validation. |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
 | `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
@@ -86,7 +94,7 @@ Body parser selection:
 
 | `sub_type` | Parser behavior |
 | --- | --- |
-| `simple` | Detects share-link lists, Clash YAML/JSON, SIP008, sing-box JSON, and supported client records. |
+| `simple` | Detects share-link lists, Clash YAML/JSON, SIP008, sing-box JSON/YAML, and supported client records. |
 | `clash` | YAML or JSON with a top-level `proxies` sequence. |
 | `sip008` | SIP008 `servers` objects or a bare server array; not a share-link list. |
 | `custom` | The same format detection as `simple`. |
@@ -135,7 +143,8 @@ Routed requests share route decisions and tunnels with geodata and external UI d
 | Redirect status | Only 301, 302, 303, 307 and 308; at most 5 hops. |
 | Redirect destination | Never HTTPS to HTTP, or a public address to a private literal address. The redirect restrictions in the preceding table also apply. |
 | URL userinfo | Sent as basic authentication. |
-| Change of scheme, host or port | Drop `Authorization`, `Cookie` and `Proxy-Authorization`, as the direct client does. |
+| Change of scheme, host or port | Drop `Authorization`, `Cookie`, `Cookie2`, `WWW-Authenticate`, `Proxy-Authorization` and a configured `Host`. |
+| Referer | Set to the previous URL without userinfo or fragment. |
 
 Builds without `native-api` route subscription fetches identically.
 
@@ -196,6 +205,18 @@ All accepted nodes receive the subscription ID. Duplicate derived node IDs retai
 
 Normalized entries are admitted incrementally, without retaining a body-sized list of outcomes. Each body retains at most 128 nonterminal diagnostics, followed by one `subscription-diagnostics-truncated` summary with the omitted count; a terminal body failure is retained separately. The caller's existing diagnostic prefix is untouched and does not consume this budget. The limit applies to structured, URI, and record imports, including decoded Base64 and restored bodies, and never stops valid-node admission or changes first-usable duplicate selection.
 
+`simple` and `custom` first try standard or URL-safe Base64, so Base64 can wrap any detected format, not only share-link lists. `clash` and `sip008` expect an unencoded body.
+
+| Diagnostic | Outcome |
+| --- | --- |
+| `malformed-subscription-entry` | Skip an entry with invalid fields or syntax. |
+| `unsupported-subscription-entry` | Skip an entry that needs an unsupported protocol or feature. |
+| `duplicate-subscription-entry` | Skip a later entry with the same node identity. |
+| `subscription-profile-entry` | Ignore non-proxy profile content. |
+| `invalid-subscription-encoding` | Reject a body that is not UTF-8, including decoded Base64. |
+| `invalid-subscription-body` | Reject a structured body that does not parse. |
+| `empty-subscription-body` | Reject a body with no usable node. |
+
 Clash, SIP008, and sing-box credential scalars preserve string bytes and convert native finite numbers to the source format's canonical decimal text. Missing or null values are absent; booleans, lists, maps, and nonfinite numbers reject the entry. A valid alias cannot hide an invalid supplied credential. Numeric UUIDs still fail UUID validation; empty passwords remain subject to each protocol's requirements.
 
 ### Share-link lists
@@ -225,13 +246,14 @@ Accepted `type` values are `socks5`, `ss`/`shadowsocks`, `trojan`, `vmess`, `vle
 | `username` | `username` | Optional string. |
 | `password` | `password` | Optional string; VLESS applies the precedence below. |
 | `cipher` | `encryption` | Optional string; VLESS applies the precedence below. |
-| `plugin`, `plugin-opts` | — | Unsupported. An entry with either non-empty value is skipped before node publication; mapping-valued options are rejected too. |
+| `plugin`, `plugin-opts`, `plugin_opts` | — | Unsupported. An entry with any non-empty value is skipped before node publication; mapping-valued options are rejected too. |
 | `network` | `transport` or packet capability | Trojan/VMess/VLESS use a stream transport (`tcp`, `ws`, `grpc`, or `xhttp`); AnyTLS uses packet capability. |
 | `tls` | `tls` | Optional boolean. Trojan, AnyTLS, Hysteria2, TUIC, and Juicity default to TLS and reject explicit disabling. |
 | `servername`, `server-name`, `sni` | `sni` | Empty or whitespace-only names are absent; nonempty aliases must agree byte for byte. |
 | `skip-cert-verify`, `skip_cert_verify`, `insecure` | `skip_cert_verify` | Native booleans; supplied aliases must agree. |
 | `fingerprint`, `pin-sha256`, `pin_sha256` | `tls_pin_sha256` | Leaf-certificate SHA-256 pin (hex; colons and whitespace ignored) that replaces PKI and hostname verification. All TLS protocols import Clash's `fingerprint`; a protocol without TLS skips the entry. Supplied aliases must agree. |
 | `alpn` | `tls_alpn` | Ordered string list (or comma-separated string) for raw-TCP TLS; XHTTP accepts only H2 and normalizes omission to `["h2"]`. QUIC retains the protocol-specific rules below. |
+| `disable-sni`, `disable_sni` | — | `true` skips the entry; `false` is accepted. |
 
 #### Protocol-specific options
 
@@ -313,7 +335,7 @@ Import defaults are source-specific. They do not all mean honk's canonical `pack
 | enabled `smux`/`multiplex` with `protocol: h2mux` or explicit `padding` | auto (inactive while wrapped) | H2MUX | enabled unless `udp: false` |
 | `mux: { enabled: true, ... }` | `auto`, unless an explicit packet encoding remains reachable through protocol fallback or `skip` | Xray Mux.Cool | enabled unless `udp: false` |
 
-For H2MUX, `padding: true` selects the existing padded wire format; false selects unpadded H2MUX. Existing `only-tcp`, Brutal, and nonzero `max-connections`/`min-streams`/`max-streams` restrictions remain. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are inactive behind the selected wrapper.
+Enabled H2MUX needs `protocol: h2mux` or an explicit `padding`; `padding` defaults to `false`, and `true` selects padded H2MUX. `only-tcp: true`, enabled Brutal, and nonzero `max-connections`, `min-streams` or `max-streams` reject the entry. Enabled H2MUX conflicts with Xray mux and UoT; enabled UoT also conflicts with Xray mux. Explicit XUDP conflicts with H2MUX or UoT, while their native/auto declarations are inactive behind the selected wrapper.
 
 An enabled Clash `mux` block accepts active settings only for `enabled`, signed-`i16` `concurrency`, signed-`i16` `xudpConcurrency`, and `xudpProxyUDP443`. Inactive extras are ignored.
 
@@ -329,9 +351,9 @@ Concurrency never specifies a physical-carrier count. UDP/443 policy defaults to
 
 Canonical VLESS share links use exact `packetEncoding=auto|none|xudp|uot-v2`, `mux=off|h2mux|xray`, and `udp=0|1` queries. The removed `vless_mode` query and ambiguous third-party share-link spellings such as `smux`, `udp-over-tcp`, and `packet-encoding` are rejected rather than guessed.
 
-### SIP008 and sing-box JSON
+### SIP008 and sing-box JSON or YAML
 
-SIP008 version 1/2 wrappers (`{"servers":[...]}`) and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. Empty plugin fields are harmless; active plugins remain unsupported.
+SIP008 and sing-box bodies may be JSON or the equivalent YAML. SIP008 `{"servers":[...]}` wrappers and bare server arrays import Shadowsocks `server`, `server_port`, `method`, `password`, and `remarks`. A wrapper `version` must be the integer `1` or `2`. Empty plugin fields are harmless; active plugins remain unsupported.
 
 sing-box profiles import supported entries from `outbounds`:
 
@@ -339,6 +361,8 @@ sing-box profiles import supported entries from `outbounds`:
 - Structural entries, not proxy nodes: `selector`, `urltest`, `direct`, `block`, and `dns`.
 
 TLS/SNI, REALITY, WebSocket/gRPC (including non-`Host` upgrade headers), VLESS packet choices, and supported protocol tuning normalize through the common node builder.
+
+sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2, TUIC, Juicity and AnyTLS entries without `tls.enabled: true` are skipped.
 
 | Source-specific case | Import behavior |
 | --- | --- |
