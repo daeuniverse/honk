@@ -374,36 +374,34 @@ impl DnsService {
             (Some(Err(_)), Some(provider)) => Arc::clone(provider.current().forwarder()),
             _ => self.forwarder(),
         };
-        let alias = forwarder.is_hosts_alias(&domain);
-        let upstream = if !alias {
-            claimed_upstream(&forwarder, &domain)
-        } else {
-            None
-        };
-        if !alias && upstream.is_none() {
+        let Some(claim) = node_host_claim(&forwarder, &domain) else {
             return Ok(None);
-        }
+        };
         let resolve = async {
-            if let Some(upstream) = upstream {
-                return resolve_claimed(self, &forwarder, &domain, upstream).await;
+            if let NodeHostClaim::Upstream(upstream) = claim {
+                return resolve_claimed(self, &forwarder, &domain, upstream)
+                    .await
+                    .map(Some);
             }
             Box::pin(async {
                 let target = match forwarder.node_host_alias(&domain)? {
-                    Some(NodeHostAlias::Addresses(addresses)) => return Ok(addresses),
+                    Some(NodeHostAlias::Addresses(addresses)) => return Ok(Some(addresses)),
                     Some(NodeHostAlias::Name(target)) => target,
-                    None => {
-                        return resolve_claimed(self, &forwarder, &domain, upstream.unwrap()).await;
-                    }
+                    // The claim and the alias walk read the same snapshot, so
+                    // this arm is unreachable; leave the host unclaimed if not.
+                    None => return Ok(None),
                 };
                 if let Some(upstream) = claimed_upstream(&forwarder, &target) {
-                    return resolve_claimed(self, &forwarder, &target, upstream).await;
+                    return resolve_claimed(self, &forwarder, &target, upstream)
+                        .await
+                        .map(Some);
                 }
                 let result = honk_outbound::bootstrap::resolve_with(
                     honk_outbound::bootstrap::global(),
                     &target,
                 )
                 .await;
-                result.map_err(|source| {
+                result.map(Some).map_err(|source| {
                     NameResolutionError::Bootstrap {
                         domain: target,
                         source: source.into(),
@@ -418,7 +416,6 @@ impl DnsService {
             Some(Err(unavailable)) => Err(unavailable.into()),
             None => resolve.await,
         }
-        .map(Some)
     }
 
     /// Whether the current generation's hosts aliases or `subtag()` rules
@@ -427,11 +424,23 @@ impl DnsService {
         let forwarder = self.forwarder();
         let aliases = forwarder.has_hosts_aliases();
         (aliases || !forwarder.node_host_upstreams.is_empty())
-            && normalize_domain(host).is_ok_and(|domain| {
-                (aliases && forwarder.is_hosts_alias(&domain))
-                    || claimed_upstream(&forwarder, &domain).is_some()
-            })
+            && normalize_domain(host)
+                .is_ok_and(|domain| node_host_claim(&forwarder, &domain).is_some())
     }
+}
+
+/// How a node host is claimed: a hosts alias takes precedence over a
+/// `subtag()` rule, so an aliased host never consults the rules.
+enum NodeHostClaim<'f> {
+    Alias,
+    Upstream(&'f str),
+}
+
+fn node_host_claim<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<NodeHostClaim<'f>> {
+    if forwarder.is_hosts_alias(domain) {
+        return Some(NodeHostClaim::Alias);
+    }
+    claimed_upstream(forwarder, domain).map(NodeHostClaim::Upstream)
 }
 
 fn claimed_upstream<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<&'f str> {
