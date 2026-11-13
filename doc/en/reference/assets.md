@@ -18,7 +18,7 @@ assets {
     }
     subscription {
         ua: 'clash.meta'
-        interval: 86400s
+        interval: 6h
         cache: true
     }
 }
@@ -30,22 +30,44 @@ assets {
 | `geodata.geosite` | Built-in URLs (with a state db) | HTTP(S) source for the loaded geosite asset, at most 4096 bytes. Without a state db, updates require a configured URL. |
 | `geodata.geoip` | Built-in URLs (with a state db) | HTTP(S) source for the loaded geoip asset, with the same limits. |
 | `geodata.route` | `assets.route` | Route for geodata downloads, including checksum requests. |
-| `geodata.auto_update` | `true` | Automatic geodata updates. |
+| `geodata.auto_update` | `true` | Automatic updates of the geodata files that routing or DNS loaded; a file that was never loaded is not downloaded. Runs only with the native API enabled and a state db. See [automatic updates](./api.md#geodata-sources-and-automatic-updates). |
 | `geodata.cron` | `0 3 * * *` | When automatic updates run: a five-field cron expression (minute, hour, day of month, month, day of week) in the system's local time zone, plus a random delay of up to an hour. Nonexistent local times are skipped; repeated times fire only at their first occurrence. Fields take numbers, `*`, lists `a,b`, ranges `a-b` and steps `*/n` or `a-b/n`; day of week 0 and 7 are Sunday, and when neither day field starts with `*` a day matching either fires. Parsing is zone-independent: names, macros such as `@daily`, a seconds field, more than four fires a day, and expressions matching no calendar date are refused. |
-| `geodata.checksum` | `true` | Verify each downloaded file against the `.sha256sum` published beside it; `false` accepts files unverified. |
-| `ui.url` | Built-in zashboard URL | External dashboard ZIP source; `HONK_UI_DOWNLOAD_URL` overrides it. A missing or empty configured external-UI directory triggers the download. |
+| `geodata.checksum` | `true` | Fetch the `.sha256sum` published beside each file. A 404 accepts the file unverified. A checksum whose first token does not match the file's SHA-256, or any other failure, rejects that URL and the next one is tried. `false` skips the request and accepts files unverified. |
+| `ui.url` | `https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip` | External dashboard ZIP source; `HONK_UI_DOWNLOAD_URL` overrides it. A missing or empty configured external-UI directory triggers the download. |
 | `ui.route` | `assets.route` | Route for the external UI ZIP download; also accepts a node tag. |
 | `subscription.ua` | `honk/<version>` | Default request User-Agent for subscription entries. |
-| `subscription.interval` | `86400s` | Default periodic refresh interval; `0` disables scheduled refresh. |
-| `subscription.cache` | `true` | Default per-entry body caching, subject to `global.store_subscribe`. |
+| `subscription.interval` | `86400s` | Default periodic refresh interval; `0` disables scheduled refresh. Same grammar as an entry's [`interval`](./subscription.md); an invalid value warns and becomes `0`. |
+| `subscription.cache` | `true` | Default per-entry body caching, subject to `global.store_subscribe`. An invalid value warns and becomes `true`. |
+
+Geodata URLs must be HTTP(S) without userinfo or a fragment, at most 4096 bytes; a query string is allowed. With a state db, each asset falls back to these URLs in order:
+
+| Asset | URLs |
+| --- | --- |
+| `geosite` | `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geosite.dat`, then `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat` |
+| `geoip` | `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.dat`, then `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat` |
+
+A URL set in the file replaces that asset's list; it is not added as a mirror.
 
 With a state db, configured geodata URLs, route, schedule and checksum switch are written into the stored settings at startup; API changes override them until the next startup. `auto_update` and `cron` form one schedule: naming only one takes the default for the other. Removing both restores the default schedule if an earlier file wrote it; removing `checksum` likewise restores its default if file-owned. API-owned settings are kept when the file names no replacement.
+
+Changing any `assets.geodata` setting, or the resolved UI download URL or route, requires a restart; SIGHUP rejects it. Subscription defaults reload with the subscriptions that use them.
 
 Geodata owner startup also rejects an explicit cron with no future occurrence in the actual local zone, even with `auto_update: false`. A retained schedule is checked when enabled; a valid file override can repair an old stored plan. Unavailable plans are not replaced with defaults. See the [API reference](./api.md#geodata-sources-and-automatic-updates) for disabling or repairing a retained plan and handling later zone changes.
 
 On Linux, honk's locked chrono 0.4.45 uses `TZ` when set: an empty value selects UTC, POSIX strings such as `CST-8` need no tzdata, and IANA names require a readable zoneinfo file. When `TZ` is unset, it reads `/etc/localtime`. If that primary load fails, it tries a system zone name discovered by `iana-time-zone` and its zoneinfo file, then falls back to UTC. OpenWrt's `/etc/TZ` must be passed as `TZ` when no usable zoneinfo file is available; the repository's `docker-compose.yml` mounts the host's `/etc/localtime`. Log timestamps use the same zone.
 
-A `geodata.auto_update`, `geodata.cron` or `geodata.checksum` value that does not parse produces a warning and is ignored, as if the key were absent. An entry's options override `assets.subscription` and `assets.route`; `geodata.route` and `ui.route` override `assets.route`. Built-in defaults apply only where neither of them sets a value. See the [subscription reference](./subscription.md) for entry syntax and the [API reference](./api.md#geodata-sources-and-automatic-updates) for stored geodata settings.
+A `geodata.auto_update`, `geodata.cron` or `geodata.checksum` value that does not parse produces a warning and is ignored, as if the key were absent. The switches accept `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off`, in any case. `cron` steps apply only to `*` or a range, and ranges cannot wrap: `0 */6 * * *` is valid, `0 3/2 * * *` and `23-2` are not. An entry's options override `assets.subscription` and `assets.route`; `geodata.route` and `ui.route` override `assets.route`. Built-in defaults apply only where neither of them sets a value. See the [subscription reference](./subscription.md) for entry syntax and the [API reference](./api.md#geodata-sources-and-automatic-updates) for stored geodata settings.
+
+An empty `geodata.route` or `ui.route` inherits `assets.route`. To send geodata through routing while other downloads use a group, set `routing` explicitly:
+
+```dae
+assets {
+    route: Proxy
+    geodata {
+        route: routing
+    }
+}
+```
 
 The parser accepts the following `experimental` fields as aliases. Each occurrence emits a `legacy-assets-key` warning at that line. A nonempty legacy value together with the matching `assets` setting fails with `conflicting-assets-setting`; an empty legacy value does not conflict. A legacy route setting without a corresponding `assets` sub-block route can still override `assets.route`.
 

@@ -21,8 +21,8 @@ honk-core [OPTIONS] [COMMAND]
 | `--disable-timestamp` | Off | Omit the timestamp from console log lines. Use it under systemd or another logger that stamps each line itself; the file selected by `--log-file` or `global.log_file` keeps its timestamps. |
 | `-d`, `--debug` | Off | Select `debug` as the default console filter when `RUST_LOG` does not provide a valid filter. |
 | `--mock-ebpf` | Off | Use `MockEbpfBackend` instead of loading kernel eBPF. If `global.nfqueue_enable: true` is requested, honk logs a warning and disables NFQUEUE staging for this process. |
-| `--store file\|db` | `file` | `db` runs from the revisions in `<data-dir>/state/honk.db` and imports `-c` into an empty db. See the [configuration db](./api.md#configuration-db---store-db). |
-| `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. It must equal `global.data_dir`. Used by `--store db`, `config export` and `admin reset`. |
+| `--store file\|db` | `file` | `db` runs from the revisions in `<data-dir>/state/honk.db` and imports `-c` into an empty db. It needs a `native-api` build. See the [configuration db](./api.md#configuration-db---store-db). |
+| `--data-dir PATH` | `/var/lib/honk` | Data directory holding the state db, `state/honk.db`. Used by `--store db`, `config export` and `admin reset`. With `--store db` it must equal `global.data_dir`; a file-mode start ignores it. |
 
 Both binaries provide `-h`/`--help` and `-v`/`--version`.
 
@@ -59,11 +59,11 @@ Levels carry fixed meanings, so the default `info` stays low-rate:
 | `reload` | Reads the PID from the locked `/run/honk-core.lock` and sends `SIGHUP`. | Reports successful signal delivery only. The running process later logs `applied` or `rejected`. Mock instances do not own the lock. |
 | `mode <rule\|global\|direct>` | Loads `--config`, assigns the supplied string to `experimental.clash_api.default_mode`, and validates before rewriting structured-format files. `.dae` files are rejected unchanged because the writer cannot preserve dae syntax, comments, or includes; edit those sources directly or use `.toml`, `.yaml`, or `.json`. | File-only; it does not contact the running engine or change dial mode. The accepted strings differ from the normal dial-mode values `ip`, `domain`, `domain+`, and `domain++`. |
 | `proxy <group> <node>` | Checks that the group and node names each exist, then prints the requested selection. It does not check membership. | Nothing is written and no running engine is contacted. |
-| `config export --out PATH [--without-secrets]` | Writes the active revision of the configuration db as one `.dae` file, with listener secrets restored unless `--without-secrets`. It reads the db through a query-only connection that opens read-write, whether or not a daemon runs. Closing it never checkpoints or deletes `honk.db-wal`; apart from the `-shm` index SQLite may create, the only write it can cause is rolling back a journal a crash left. It publishes the file only once it is complete. | Creates `PATH` with mode 0600 and refuses an existing file. |
+| `config export --out PATH [--without-secrets]` | Needs a `native-api` build. Writes the active revision of the configuration db as one `.dae` file, with listener secrets restored unless `--without-secrets`. It reads the db through a query-only connection that opens read-write, whether or not a daemon runs. Closing it never checkpoints or deletes `honk.db-wal`; apart from the `-shm` index SQLite may create, the only write it can cause is rolling back a journal a crash left. It publishes the file only once it is complete. | Creates `PATH` with mode 0600 and refuses an existing file. |
 | `admin reset` | Deletes the password-mode administrator from the state db under `--data-dir`, so the next start opens setup again. | Refused while any honk-core, mock mode included, has that state db open. |
-| `delay <node> [-u\|--url HOST:PORT]` | Opens one raw TCP connection with a five-second timeout and prints elapsed milliseconds. Without `--url`, it uses the node server address. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
+| `delay <node> [-u\|--url HOST:PORT]` | Resolves the address, connects over direct TCP and prints the elapsed milliseconds, resolution included. Without `--url`, it uses the node server address. Resolved addresses are raced at most two at a time, 250 ms apart, and each attempt times out after five seconds. | Not proxied, not an HTTP URLTest, and no running engine is contacted. |
 
-With `--store db`, `proxy` and `delay` read the active revision and `mode` refuses.
+With `--store db`, `proxy` and `delay` read the active revision and need a `native-api` build; `mode` refuses.
 
 A real-datapath process holds the lock for its lifetime. `reload` verifies that the file is still locked before trusting its PID; successful `kill(2)` delivery does not mean the candidate configuration passed validation or restart-required checks.
 
@@ -74,9 +74,10 @@ An exhausted [compiled-routing publication counter](../design/routing.md#synchro
 | Variable | Scope | Current behavior |
 | --- | --- | --- |
 | `RUST_LOG` | Both binaries | Tracing filter. It has the effective `honk-core` precedence described above; `honk-tool` otherwise defaults to `warn`. |
+| `NO_COLOR` | `honk-core` console | A nonempty value disables ANSI color. Otherwise color is on only when stdout is a terminal. |
 | `HONK_UI_DOWNLOAD_URL` | `honk-core` with `clash-api` | Highest-precedence dashboard ZIP URL; overrides `assets.ui.url` when a configured external-UI directory needs downloading. |
 | `HONK_POOL_DISABLE=1` | `honk-core` | Bypasses both ready-stream and bare-TCP pools and performs fresh dials. The code also accepts case-insensitive `true`; the value is cached on first use. |
-| `HONK_QUIC_GSO=0\|1` | QUIC outbounds | Forces UDP GSO off/on. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
+| `HONK_QUIC_GSO` | QUIC outbounds | `1` or case-insensitive `true` forces UDP GSO on; any other value, empty included, forces it off. The value is cached on first use. Without an override, the conservative 1252-byte MTU keeps GSO off, while an explicit larger `mtu` enables batches capped at 16 segments. |
 | `HONK_QUIC_BBR=v1\|v3` | QUIC outbounds | Selects the controller behind the `bbr` congestion setting: TUIC `congestion_control: bbr`, Juicity, and Hysteria2 without an upload rate. `v3` is BBRv3. `v1` is quinn's original BBR, which ignores loss; quinn-proto 0.11.16+ receivers can abort its uploads on high-BDP paths with `too many gaps in stream buffer`. The default is `v3`; other values warn and keep the default. |
 | `TOKIO_WORKER_THREADS` | `honk-core` | Tokio's own worker count. `honk-core` builds a default multi-thread runtime, so it follows the core count. It must be a positive integer: `0` or a non-number makes Tokio panic at startup. Every worker keeps its own allocator heap, so a lower value reduces RSS on many-core gateways. In a lab measurement with 120 connections plus DNS on a 4-core host, RSS was about 85 MiB with 16 workers, 66 MiB with 8, and 60 MiB with 4. CPU differences were within noise. The relay path runs on these workers; size the value to the traffic. |
 | `HONK_VMLINUX_BTF` | `honk-core` with `ebpf` | Overrides the raw kernel BTF shared by process-name routing and native UDP receive tracing. The file must match the running kernel. An explicit unreadable or invalid override refuses real-backend startup rather than falling back to another file. TCP ownership proof reads no kernel structures and does not depend on it. |
@@ -147,17 +148,24 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | Argument / option | Default | Meaning |
 | --- | --- | --- |
 | `<url\|file\|->` | Required | HTTP(S) subscription URL, an existing local subscription file, or `-`. `-` reads exactly one HTTP(S) subscription URL from stdin; it does not read a subscription body from stdin. |
-| `--target HOST:PORT` | `cp.cloudflare.com:443` | Host for the family probes' HTTPS request URL (TLS SNI and Host header), and host and port for QUIC. Without `--v4-target`/`--v6-target` address overrides, family probes resolve this host and use this port. `--udp-check` selects the UDP DNS probe target separately. |
+| `--target HOST:PORT` | `cp.cloudflare.com:443` | Host for the family probes' HTTPS request URL, TLS SNI and Host header; host and port for QUIC. The family probes still connect to `--v4-target` and `--v6-target`, so change those with it. `--udp-check` selects the UDP DNS probe target separately. |
 | `--udp-check HOST[:PORT]` | `dns.google:53`, `8.8.8.8`, `2001:4860:4860::8888` | UDP DNS check targets, defaulting to the engine list in `honk-config`. Repeat the flag or use commas. The first IP/socket-address literal is used; otherwise the first entry is resolved only for eligible UDP DNS probes. An omitted port means `53`. |
 | `--url TEST_URL` | `https://www.gstatic.com/generate_204` | Proxied URLTest target. |
-| `--timeout SECS` | `5` | Per-probe timeout. |
-| `--concurrency N` | `10` | Maximum node probe tasks in flight. |
+| `--timeout SECS` | `5` | Per-probe timeout. `0` is a zero timeout, not unlimited. |
+| `--concurrency N` | `10` | Maximum node probe tasks in flight. `0` probes nothing and prints an empty summary; it does not mean unlimited. |
 | `--limit N` | `0` | Probe only the first `N` nodes; `0` means all. |
 | `--ua UA` | Unset | `User-Agent` for a remote subscription fetch. |
 | `--tls-implementation tls\|utls` | `tls` | Process-wide TLS ClientHello implementation for probes. |
 | `--utls-imitate PROFILE` | `chrome_auto` | Fingerprint profile used with `utls`; the current validator accepts only names beginning with `chrome`. |
-| `--v4-target IP:PORT` | `1.1.1.1:443` | Explicit IPv4 address for the v4 connectivity probe. |
-| `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | Explicit IPv6 address for the v6 connectivity probe. |
+| `--v4-target IP:PORT` | `1.1.1.1:443` | Numeric IPv4 address the v4 probe connects to. The address family is not checked. |
+| `--v6-target [IP]:PORT` | `[2606:4700:4700::1111]:443` | Numeric IPv6 address the v6 probe connects to. The address family is not checked. |
+
+A custom target with matching family addresses:
+
+```bash
+honk-tool sub nodes.txt --target one.one.one.one:443 \
+  --v4-target 1.0.0.1:443 --v6-target '[2606:4700:4700::1001]:443'
+```
 
 Remote subscriptions and local files share the engine's automatic format detection:
 
@@ -166,6 +174,8 @@ Remote subscriptions and local files share the engine's automatic format detecti
 - Supported Surge/Surfboard/Loon/Quantumult X records.
 
 Unsupported nodes are skipped without printing their raw input. Source `-` keeps a credential-bearing provider URL out of argv and process listings.
+
+Once the subscription loads, the exit status is `0` even when every probe fails or every node is skipped; a crashed probe task prints `probe task failed` and also leaves it `0`. Scripts must read the summary line to judge connectivity.
 
 For each node, the command reports:
 
@@ -222,7 +232,7 @@ UDP DNS hostname targets use a shared asynchronous resolver with the first numer
 
 VLESS carrier/session reuse follows the runtime and normalized wire shape, so changing the canonical UDP/mux queries can change node identity and pool reuse. Shared physical-carrier capacity is global, while XUDP's 8-byte Global ID is scoped by honk's runtime/client/path/destination source identity rather than treated as a process-wide collision-free NAT key. See the [node reference](./nodes.md#vless-udp-and-multiplexing) and canonical [VLESS outbound design](../design/outbound.md#sourcesession-ownership-and-capacity).
 
-Probe failure codes are `resolve`, `timeout`, `exchange`, `handler`, and `admission`. Credentials, endpoint details, SNI, REALITY keys, URL query data, and raw errors are never rendered.
+Probe failure codes are `resolve`, `timeout`, `exchange`, `handler`, and `admission`. Probe rows never render credentials, endpoint details, SNI, REALITY keys, URL query data, or raw errors. The one exception is stderr: a failed probe runtime cleanup prints `probe runtime cleanup failed: <error>` with the raw error.
 
 ### `bpf`
 
@@ -242,10 +252,12 @@ honk-tool bpf stats [--pin-root PATH]
 
 | `show` map | Decoded contents |
 | --- | --- |
-| `conn-state` | Tuple, outbound, mark, must flag, state, and last-seen timestamp. |
+| `conn-state` | Tuple, outbound, mark, must flag, state, last-seen timestamp, and trace ID. |
 | `redirect-track` | Reply-rewrite source/destination, outbound, WAN direction, interface, and last-seen timestamp. |
 | `domain-routing` | Learned IP and active-policy domain-predicate bitmap indices, from DNS or sniffed evidence; known-zero entries remain visible. |
-| `routing-handoff` | Tuple and pending eBPF-to-control-plane routing result. |
+| `routing-handoff` | Tuple, pending eBPF-to-control-plane routing result, last-seen timestamp, routing generation, and trace ID. |
+
+`conn-state`, `redirect-track` and `routing-handoff` are read with `BPF_MAP_LOOKUP_BATCH` and `BPF_F_LOCK`. A kernel without that support fails with `safe external map snapshot requires BPF_MAP_LOOKUP_BATCH ...`; there is no unlocked fallback.
 
 The commands read pins through raw `bpf(2)` without loading programs or attaching hooks; reads normally require root or suitable BPF capabilities. `stats` prints each counter below on its own labeled line, the `CONN_STATE_OCCUPANCY` insert/delete gauge, and non-zero per-outbound packet/byte counts. `BPF_STATS_MAP` must have nine slots: mixed tool/engine versions fail with `unexpected map layout for BPF_STATS_MAP: expected max_entries=9 found 7` (reversed for an older tool), rather than mislabelling counters. Upgrade the tool with the engine/object.
 
@@ -273,10 +285,12 @@ honk-tool diagnose [--api URL] [--secret TOKEN] [--pin-root PATH] [--tproxy-mark
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--api URL` | `http://127.0.0.1:9090` | Plain-HTTP Clash API base URL. An empty value skips the API check; the built-in client does not support HTTPS. |
+| `--api URL` | `http://127.0.0.1:9090` | Plain-HTTP Clash API base URL. The port is required, as in `http://panel.example:80`; HTTPS is not supported. An empty value skips the API check. |
 | `--secret TOKEN` | `HONK_API_SECRET`, if set | Bearer token for the Clash API. The flag overrides the environment variable. |
 | `--pin-root PATH` | `/sys/fs/bpf` | Root used for pinned-map presence and statistics reads. |
-| `--tproxy-mark VALUE` | `134217728` (`0x08000000`) | Expected fwmark in the `daens` policy rule. |
+| `--tproxy-mark VALUE` | `134217728` (`0x08000000`) | Expected fwmark in the `daens` policy rule, as a decimal 32-bit integer; hexadecimal input is rejected. |
+
+The API check has no timeout, so a stalled peer can hang the command; wrap it in `timeout(1)` or pass `--api ''` when that matters. `diagnose` runs `ip`; if `ip` cannot be executed, it exits nonzero before the remaining checks and the summary.
 
 The check is read-only and inspects:
 
@@ -316,6 +330,8 @@ honk-tool geoip [--file PATH] lookup <ip>
 | `geoip lookup <ip>` | Return every code/CIDR tie at the longest matching prefix. |
 | `--file PATH` | Global per-family override for the corresponding `.dat` file. |
 
+An unknown `show` category or code exits nonzero. A `list`, `find`, or `lookup` that matches nothing prints nothing and exits `0`.
+
 Without `--file`, the tool selects the first existing regular file in this order:
 
 1. `$DAE_LOCATION_ASSET/<name>.dat`
@@ -329,6 +345,13 @@ Without `--file`, the tool selects the first existing regular file in this order
 9. `/etc/dae/<name>.dat`
 
 Unlike `honk-core`, the tool does not load a config to discover a custom `global.data_dir`. Output is one record per line. A closed downstream pipe does not cause a panic.
+
+| Command | Line format |
+| --- | --- |
+| `geosite list` | `CATEGORY ENTRY_COUNT` |
+| `geosite show`, `geosite find` | `CATEGORY KIND VALUE [@ATTR ...]`, where `KIND` is `domain`, `full`, `keyword`, or `regexp` |
+| `geoip list` | `CODE CIDR_COUNT` |
+| `geoip show`, `geoip lookup` | `CODE CIDR` |
 
 ## Related docs
 

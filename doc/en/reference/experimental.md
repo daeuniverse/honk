@@ -10,13 +10,26 @@
 | `cache_file` | Persistence of runtime choices, mode, delay samples, and optional DNS state in the state db |
 | `native_api` | Independent, opt-in observations, bounded diagnostics, runtime/source control and local UI directory |
 
-`udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and copy its value to `global.nfqueue_enable`; new configurations should use the global field directly.
+`udp_nfqueue { enabled: ... }` is a deprecated compatibility section. Dae and structured loaders accept it, print a migration warning, and use its value for `global.nfqueue_enable` only when the global key is absent. `enabled` defaults to `false`, so an empty `udp_nfqueue {}` disables NFQUEUE; delete the section to keep the default-on global setting. New configurations should set the global field directly. Here NFQUEUE stays off because the global key wins:
+
+```dae
+global {
+    nfqueue_enable: false
+}
+experimental {
+    udp_nfqueue {
+        enabled: true
+    }
+}
+```
 
 ## `native_api`
 
 Requires the opt-in `native-api` Cargo feature: build with `--features native-api` or `native-ui`, or use a full or `-native-api` release. It does not require `clash-api`. The listener is disabled by default; enabling it without the feature fails startup.
 
 All effective fields require restart. SIGHUP rejects changes and preserves the active listener and configuration generation. Unknown fields, nested scalar blocks, malformed booleans and empty security-list members are errors.
+
+Boolean fields take `true` or `false`; `yes`/`no`, `1`/`0` and `on`/`off` are also accepted in any case. Any other spelling, such as `t`, is an `invalid-config-value` error.
 
 | Field | Default | Meaning |
 | --- | --- | --- |
@@ -25,7 +38,7 @@ All effective fields require restart. SIGHUP rejects changes and preserves the a
 | `secret` | `""` | Static bearer credential, independent of the Clash credential. A nonempty value selects token mode and cannot be combined with `password_auth`. Listener secrets are masked by value in API responses; a value shorter than 8 bytes is not masked and is reported at startup. |
 | `password_auth` | `false` | Select administrator password login when `secret` is empty. Cannot be combined with `allow_anonymous_loopback`. |
 | `allow_anonymous_loopback` | `false` | Permit credential-free requests only when `secret` is empty, `password_auth` is false and the actual listening IP is loopback. |
-| `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. |
+| `allow_origins` | empty list | Additional explicit HTTP(S) origins, without paths, credentials, query, fragment, `null`, or wildcards. Omitted port means 80 for `http` and 443 for `https`. |
 | `allowed_hosts` | empty list | Additional explicit HTTP Host authorities, without URL schemes, paths, credentials, or wildcards. Omitted port means 80, not the listener's port. |
 | `ui` | `""` | Empty disables hosting; otherwise a trusted local directory with readable `index.html`, or `embedded` / `embedded-lite` with the default-off `native-ui` feature. `embedded-lite` is the lighter doona lite edition (preview). No startup download, extraction or frontend build. |
 | `record_flows` | `true` | Permit bounded userspace flow recording under flow diagnostic demand or an explicit runtime pin. `false` prohibits recording, including runtime pins; configuration changes require restart. |
@@ -74,7 +87,9 @@ Host and Origin checks apply independently of authentication:
 
 Forwarded headers do not grant authorization.
 
-Lists use individually quoted comma-separated entries, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
+A host in either list is an IPv4 address, a bracketed IPv6 address such as `[::1]:9527`, or an ASCII DNS name with letters, digits and inner hyphens only: no underscores, empty labels or trailing dot. An explicit port is 1 to 65535.
+
+Lists are comma-separated, such as `allow_origins: 'http://localhost:3000', 'https://panel.example'`; entries may be quoted individually or left bare. Omit a list to leave it empty; JSON brackets and a single aggregate-quoted list are not accepted.
 
 Relative UI paths follow the existing dependency search: an existing path under `global.data_dir`, then `/var/share/honk`, then the working directory; a missing dependency resolves under `global.data_dir` and startup fails. The administrator owns the directory and any symlink targets. See the [native API contract](./api.md#native-api).
 
@@ -99,9 +114,11 @@ The removed `probe_allowed_cidrs` and `probe_allowed_ports` keys are accepted in
 
 ## `clash_api`
 
+Requires the default-on `clash-api` Cargo feature; a build without it ignores `external_controller`.
+
 | Field | Default | Meaning |
 | --- | --- | --- |
-| `external_controller` | `""` | HTTP listen address. An empty value disables the API server. |
+| `external_controller` | `""` | Listen address as IP and port, such as `127.0.0.1:9090` or `[::1]:9090`; `:9090` means `0.0.0.0:9090`. Hostnames are not accepted. An empty value disables the API server. An invalid address logs a warning and the engine starts without the listener. |
 | `external_ui` | `""` | External dashboard directory. An empty value disables dashboard serving and download. |
 | `secret` | `""` | API authentication secret. An empty value disables authentication. A value shorter than 8 bytes is not masked in native API responses. |
 | `default_mode` | `"Rule"` | Startup mode when native API is disabled: `Rule`, `Global`, or `Direct`; with `cache_file.enabled: true`, a valid cached mode takes precedence. Native-enabled startup uses shared transient rule mode instead. |
@@ -120,13 +137,15 @@ An explicitly enabled non-loopback bind with an empty secret emits `unsafe-api-b
 
 ### External UI
 
-An absolute `external_ui` path is used literally. A relative path selects an existing directory below `global.data_dir` first, then an existing directory below `/var/share/honk`, then an existing working-directory-relative directory; if none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `assets.ui.url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
+An absolute `external_ui` path is used literally. A relative path selects the first existing path, file or directory, below `global.data_dir`, then below `/var/share/honk`, then relative to the working directory; a file found first is not skipped. If none exists, honk creates the target below `global.data_dir`. A missing or empty target triggers a background dashboard ZIP download. A non-empty `assets.ui.url` replaces the built-in zashboard URL; `HONK_UI_DOWNLOAD_URL` has highest precedence over both.
 
 `assets.ui.route` takes precedence over `assets.route` for the initial request and every redirect. `direct` downloads directly, `block` aborts when selected by routing rules, and a group resolves its authoritative leaf for each exchange. With no configured route, each URL follows the normal traffic routing decision. An unavailable tag, download failure, or extraction failure is logged without stopping the engine. The archive is written to an unnamed private file in the target directory rather than memory; the archive is removed after extraction or a failed download. Extraction is refused past 10,000 entries or 128 MiB of content, the same bound as the archive itself. The partly written directory is emptied, so the next start downloads again.
 
+A download follows at most five redirects. Each HTTP exchange has a 30-second timeout; through a proxy, it starts after the tunnel is dialed. When every ZIP entry sits under one top-level directory, that directory is stripped, so `dist/index.html` becomes `index.html`. Entries whose path has an empty, `.` or `..` component or a backslash are skipped.
+
 ### Startup mode
 
-With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct`; with `cache_file.enabled: true`, a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and on accepted explicit activation (including no-op) when the backend reset succeeds, and preservation across provider/network refresh. A reset failure after commit retains the previous mode, closes admission and returns `CommittedDegraded`. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
+With native disabled, `default_mode` accepts `Rule`, `Global`, and `Direct` in any case; with `cache_file.enabled: true`, a valid cached Clash mode takes precedence, and invalid values fall back to `Rule`. With native enabled, both APIs use one transient mode owner: no mode restore/persistence, rule at startup and on accepted explicit activation (including no-op) when the backend reset succeeds, and preservation across provider/network refresh. A reset failure after commit retains the previous mode, closes admission and returns `CommittedDegraded`. Native global mode targets a stable node/group identity and fails closed if refresh removes it. See [runtime mode](./api.md#connection-closing-mode-and-datapath-lifecycle).
 
 ## `cache_file`
 
@@ -140,6 +159,8 @@ Both fields are startup-owned; SIGHUP rejects a candidate configuration that cha
 Upgrade note: omitting `cache_file.enabled` now keeps Selector choices and delay samples by default; opt in with `true` for mode/GLOBAL and, separately, `store_dns: true` for DNS answers. Explicit `false` disables these runtime-cache stores, not unrelated configuration, credential or subscription storage.
 
 `path`, `cache_id` and `store_fakeip` are no longer settings. They still parse, emit a `legacy-cache-file` warning and have no effect, and SIGHUP accepts edits to them. `path` and `cache_id` are read once, to import a legacy `cache.db` (below).
+
+An omitted or empty `path` means `cache.db`, and an omitted `cache_id` means `""`, the unprefixed keys.
 
 ### Persisted state
 
@@ -178,7 +199,7 @@ With `store_dns: true`, each answer is one `dns_answer` row holding an `HDNS` ve
 
 ### Upgrading from `cache.db`
 
-The first start with `enabled` imports the legacy `cache.db` that `path` names, resolved as before: an absolute path is literal; a relative one prefers an existing file below `global.data_dir`, then below `/var/share/honk`, then relative to the original config directory. Only keys under this instance's `cache_id` prefix are read. Per-network Selector choices of Selector groups in the configuration, Clash mode, the Clash GLOBAL selection and delay samples newer than 24 hours of configured nodes are copied; rows already in the state db win. Name-only Selector choices from older releases, DNS answers and FakeIP rows are not imported, so persisted DNS answers are refetched. The import is recorded in the state db, one row per imported path, and never repeated, even if an older binary recreates the file. A `cache.db` that is a symlink, is not a regular file owned by the honk user, is writable by other users, or cannot be read as a `cache.db` is left in place with a warning, and the next start tries again.
+The first start with a state db and `enabled` not `false` imports the legacy `cache.db` that `path` names. An absolute path is literal; a relative one prefers an existing path below `global.data_dir`, then below `/var/share/honk`, then relative to the original config directory. Only keys under this instance's `cache_id` prefix are read. Per-network Selector choices of Selector groups in the configuration and delay samples newer than 24 hours of configured nodes are copied. Clash mode and the Clash GLOBAL selection are copied only when `enabled: true`, native API is disabled and `external_controller` is set in a `clash-api` build. Rows already in the state db win. Name-only Selector choices from older releases, DNS answers and FakeIP rows are not imported, so persisted DNS answers are refetched. The import is recorded in the state db per file and `cache_id` and never repeated, even if an older binary recreates the file; another `cache_id` can still import its own keys from a kept file. A `cache.db` that is a symlink, is not a regular file owned by the honk user, is writable by other users, or cannot be read as a `cache.db` is left in place with a warning, and the next start tries again.
 In db mode this final fallback uses the active revision's original entry directory, even when the current `-c` points elsewhere and is ignored for startup.
 
 With an empty `cache_id`, honk then deletes `cache.db`, its `-wal` and `-shm`; any `cache.db.corrupt-*` copies stay. With a non-empty `cache_id`, another instance may share the file, so it stays and honk logs a warning once. An older binary started afterwards finds no `cache.db` and starts with empty runtime state.
