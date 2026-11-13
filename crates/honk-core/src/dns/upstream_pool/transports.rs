@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use honk_config::types::DnsProtocol;
-use honk_outbound::group::{OwnedTarget, ScoreBusinessGuard};
+use honk_outbound::group::{DialKey, OwnedTarget, ScoreBusinessGuard};
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -77,7 +77,9 @@ impl super::DnsIdleResources {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TransportKey {
-    resolved_leaf: Option<String>,
+    /// A node dialed as itself and as a route's leaf reach the upstream over
+    /// different paths.
+    dialed: Option<DialKey>,
     target: std::net::SocketAddr,
 }
 
@@ -189,7 +191,7 @@ impl UpstreamPool {
         target: std::net::SocketAddr,
     ) -> anyhow::Result<Arc<PooledTransport>> {
         let key = TransportKey {
-            resolved_leaf: proxy_node.map(|target| target.node.name.clone()),
+            dialed: proxy_node.map(OwnedTarget::key),
             target,
         };
         let slot = {

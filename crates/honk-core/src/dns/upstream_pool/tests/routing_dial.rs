@@ -440,3 +440,49 @@ async fn an_exit_group_without_a_group_manager_resolves_to_no_node() {
     let exited = pool.entries.get("exited").unwrap();
     assert!(pool.resolve_dial_leaf(exited).await.is_err());
 }
+
+/// A node dialed as itself and the same node as a route's leaf reach the
+/// upstream over different paths, so they must not share a pooled
+/// transport: the route would otherwise reuse the direct one and skip its
+/// exit, or the other way round.
+#[tokio::test]
+async fn a_routed_and_a_direct_leaf_keep_separate_dns_transports() {
+    use honk_outbound::group::{OwnedTarget, RoutedTarget};
+
+    let leaf = test_node("leaf");
+    let exit = test_node("exit");
+    let pool = UpstreamPool::new_with_proxy(
+        &[make_upstream("tcp", "192.0.2.53:53", DnsProtocol::Tcp)],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+        )),
+        vec![leaf.clone(), exit.clone()],
+        Vec::new(),
+    )
+    .unwrap();
+    let entry = pool.entries.get("tcp").unwrap();
+    let direct = OwnedTarget {
+        node: leaf.clone(),
+        route: None,
+    };
+    let routed = match honk_config::group_graph::compose(leaf.id, &[leaf.id], [exit.id]) {
+        honk_config::group_graph::Composed::Routed(route) => OwnedTarget {
+            node: leaf.clone(),
+            route: Some(Box::new(RoutedTarget {
+                route,
+                hop_names: [leaf.name.clone(), exit.name.clone()].into(),
+            })),
+        },
+        other => panic!("expected a route, got {other:?}"),
+    };
+    let target = "192.0.2.53:53".parse().unwrap();
+    let mut transports = Vec::new();
+    for node in [&direct, &routed, &direct, &routed] {
+        transports.push(pool.get_transport(entry, Some(node), target).await.unwrap());
+    }
+    assert!(!Arc::ptr_eq(&transports[0], &transports[1]));
+    assert!(Arc::ptr_eq(&transports[0], &transports[2]));
+    assert!(Arc::ptr_eq(&transports[1], &transports[3]));
+    pool.close().await;
+}
