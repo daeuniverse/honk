@@ -293,7 +293,8 @@ async fn public_runtime_reload_replaces_hosts_snapshot_and_rejects_invalid_file(
         .expect("reloaded hosts answer");
     assert_eq!(replaced, a_response_with_ttl(&query, [192, 0, 2, 61], 60));
 
-    std::fs::write(file.path(), "full:reload-hosts.test not-an-ip\n").expect("corrupt hosts file");
+    std::fs::write(file.path(), "full:reload-hosts.test 192.0.2.300\n")
+        .expect("corrupt hosts file");
     assert!(!try_reload_current(&control).await);
     let retained = service
         .resolve(&query, IngressProfile::Internal)

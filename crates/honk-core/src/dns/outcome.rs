@@ -198,6 +198,18 @@ impl DnsOutcome {
         self
     }
 
+    /// Carry the target verdict and exchange facts into a local alias answer,
+    /// without transferring its route decision or cache identity.
+    pub(crate) fn with_alias_target(mut self, target: Self) -> Self {
+        self.status = target.status;
+        if self.status == OutcomeStatus::Rejected {
+            self.answer_ips.clear();
+        }
+        self.final_upstream = target.final_upstream;
+        self.requery_history = target.requery_history;
+        self
+    }
+
     pub const fn status(&self) -> OutcomeStatus {
         self.status
     }

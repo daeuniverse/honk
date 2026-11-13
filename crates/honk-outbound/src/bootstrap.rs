@@ -8,8 +8,8 @@
 //! server that honk queries itself on a bypass-marked socket.
 //!
 //! [`resolve`] first offers the host to the installed [`NodeHostResolver`],
-//! which claims only node hosts an explicit `subtag()` DNS rule routes to a
-//! direct upstream. Otherwise it checks the configured bootstrap resolver,
+//! which claims hosts aliases and node hosts explicitly routed by `subtag()`
+//! to a direct upstream. Unclaimed hosts use the configured bootstrap resolver,
 //! then `/etc/hosts` and the first numeric `/etc/resolv.conf` nameserver.
 //! Every DNS socket is bypass-marked; libc NSS/search-suffix resolution is
 //! deliberately not used.

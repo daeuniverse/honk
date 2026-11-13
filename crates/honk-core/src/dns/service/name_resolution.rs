@@ -7,7 +7,7 @@ use tracing::debug;
 
 use super::{DnsService, DnsServiceBackend, OperationToken};
 use crate::dns::forwarder::{
-    CacheAccess, DnsForwarder, ResolveMode, ResolveOptions, build_dns_query,
+    CacheAccess, DnsForwarder, NodeHostAlias, ResolveMode, ResolveOptions, build_dns_query,
 };
 use crate::dns::planner::{PlanError, UpstreamTag};
 use crate::dns::query::{DnsRequestMeta, IngressProfile};
@@ -354,9 +354,11 @@ impl DnsService {
         responses.fail_on_packet_rejection()
     }
 
-    /// Resolve a node server host through the `subtag()` rule that claims it
-    /// in the current generation. `None` when nothing claims it; a claimed
-    /// host never falls back to another resolver.
+    /// Resolve a node server host through the hosts alias or `subtag()` rule
+    /// that claims it in the current generation. An alias target resolves as
+    /// a node host would: through its own `subtag()` claim, else bootstrap.
+    /// `None` when nothing claims the host. Once its alias target or `subtag()`
+    /// path is selected, that path's failure is authoritative.
     pub(crate) async fn resolve_node_host(
         &self,
         domain: &str,
@@ -372,25 +374,73 @@ impl DnsService {
             (Some(Err(_)), Some(provider)) => Arc::clone(provider.current().forwarder()),
             _ => self.forwarder(),
         };
-        let Some(upstream) = claimed_upstream(&forwarder, &domain) else {
+        let Some(claim) = node_host_claim(&forwarder, &domain) else {
             return Ok(None);
         };
-        let resolve = resolve_claimed(self, &forwarder, &domain, upstream);
+        let resolve = async {
+            if let NodeHostClaim::Upstream(upstream) = claim {
+                return resolve_claimed(self, &forwarder, &domain, upstream)
+                    .await
+                    .map(Some);
+            }
+            Box::pin(async {
+                let target = match forwarder.node_host_alias(&domain)? {
+                    Some(NodeHostAlias::Addresses(addresses)) => return Ok(Some(addresses)),
+                    Some(NodeHostAlias::Name(target)) => target,
+                    // The claim and the alias walk read the same snapshot, so
+                    // this arm is unreachable; leave the host unclaimed if not.
+                    None => return Ok(None),
+                };
+                if let Some(upstream) = claimed_upstream(&forwarder, &target) {
+                    return resolve_claimed(self, &forwarder, &target, upstream)
+                        .await
+                        .map(Some);
+                }
+                let result = honk_outbound::bootstrap::resolve_with(
+                    honk_outbound::bootstrap::global(),
+                    &target,
+                )
+                .await;
+                result.map(Some).map_err(|source| {
+                    NameResolutionError::Bootstrap {
+                        domain: target,
+                        source: source.into(),
+                    }
+                    .into()
+                })
+            })
+            .await
+        };
         match lease {
             Some(Ok(lease)) => lease.run(std::pin::pin!(resolve)).await?,
             Some(Err(unavailable)) => Err(unavailable.into()),
             None => resolve.await,
         }
-        .map(Some)
     }
 
-    /// Whether the current generation's `subtag()` rules claim `host`.
+    /// Whether the current generation's hosts aliases or `subtag()` rules
+    /// claim `host`.
     pub(crate) fn claims_node_host(&self, host: &str) -> bool {
         let forwarder = self.forwarder();
-        !forwarder.node_host_upstreams.is_empty()
+        let aliases = forwarder.has_hosts_aliases();
+        (aliases || !forwarder.node_host_upstreams.is_empty())
             && normalize_domain(host)
-                .is_ok_and(|domain| claimed_upstream(&forwarder, &domain).is_some())
+                .is_ok_and(|domain| node_host_claim(&forwarder, &domain).is_some())
     }
+}
+
+/// How a node host is claimed: a hosts alias takes precedence over a
+/// `subtag()` rule, so an aliased host never consults the rules.
+enum NodeHostClaim<'f> {
+    Alias,
+    Upstream(&'f str),
+}
+
+fn node_host_claim<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<NodeHostClaim<'f>> {
+    if forwarder.is_hosts_alias(domain) {
+        return Some(NodeHostClaim::Alias);
+    }
+    claimed_upstream(forwarder, domain).map(NodeHostClaim::Upstream)
 }
 
 fn claimed_upstream<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<&'f str> {

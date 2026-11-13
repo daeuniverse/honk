@@ -210,21 +210,32 @@ async fn pause_cancels_bootstrap_fallback_under_the_original_query_lease() {
     assert_eq!(current.lease_count(), 0);
 }
 
-fn node_host_runtime(generation: u64) -> Arc<DnsRuntime> {
-    let dns = honk_config::parser::parse_dae_config(
+fn node_host_runtime(generation: u64) -> (tempfile::NamedTempFile, Arc<DnsRuntime>) {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(
+        file.path(),
+        "full:literal-alias.example literal.example\n\
+         full:literal.example 192.0.2.80\n\
+         full:bootstrap-alias.example bootstrap-target.example\n",
+    )
+    .unwrap();
+    let mut dns = honk_config::parser::parse_dae_config(
         "dns {\n routing {\n  request {\n   subtag(MyAirport) -> providerdoh\n  }\n }\n}\n",
     )
     .unwrap()
     .dns;
+    dns.hosts = vec![file.path().to_string_lossy().into_owned()];
     let forwarder = Arc::new(
         DnsForwarder::new(
             Arc::new(UnusedPool),
             Arc::new(Mutex::new(DnsCache::new(8))),
             Arc::new(DnsRouter::new_from_dns_config(&dns).unwrap()),
         )
-        .with_node_hosts([("node.example".to_owned(), vec!["MyAirport".to_owned()])].into()),
+        .with_node_hosts([("node.example".to_owned(), vec!["MyAirport".to_owned()])].into())
+        .with_hosts_from_config(&dns)
+        .unwrap(),
     );
-    DnsRuntime::new(DnsRuntimeParts {
+    let runtime = DnsRuntime::new(DnsRuntimeParts {
         generation: RuntimeGeneration::new(generation),
         forwarder,
         routing_projection: Arc::new(RoutingProjectionSnapshot::new(
@@ -233,12 +244,173 @@ fn node_host_runtime(generation: u64) -> Arc<DnsRuntime> {
         )),
         outbound_runtime: None,
         transport: Arc::new(ObservedTransport::default()),
-    })
+    });
+    (file, runtime)
+}
+
+#[tokio::test]
+async fn paused_and_stopped_dns_refuse_literal_and_bootstrap_aliases() {
+    if crate::test_support::run_exact_in_child(
+        "HONK_ALIAS_ADMISSION_TEST_CHILD",
+        "dns::runtime::tests::lifecycle::paused_and_stopped_dns_refuse_literal_and_bootstrap_aliases",
+    ) {
+        return;
+    }
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    honk_outbound::bootstrap::set_global(BootstrapResolver::parse(&format!(
+        "udp://{}",
+        server.local_addr().unwrap()
+    )));
+    for stopped in [false, true] {
+        let (_file, current) = node_host_runtime(1);
+        let provider = Arc::new(DnsServiceProvider::new(Arc::clone(&current)));
+        #[cfg(feature = "native-api")]
+        provider.enable_lifecycle();
+        let service = DnsService::with_provider(Arc::clone(&provider));
+        honk_outbound::bootstrap::set_node_host_resolver(Some(crate::dns::node_host::resolver(
+            &service,
+        )));
+        if stopped {
+            provider.shutdown().await;
+        } else {
+            provider.begin_pause();
+        }
+        for host in ["literal-alias.example", "bootstrap-alias.example"] {
+            let error = service.resolve_node_host(host).await.unwrap_err();
+            assert_eq!(
+                honk_outbound::proxy::packet_rejection(&error),
+                Some(honk_outbound::proxy::PacketRejection::Cancelled),
+                "host={host}, stopped={stopped}: {error:#}"
+            );
+            let error = honk_outbound::bootstrap::resolve(host).await.unwrap_err();
+            assert_eq!(
+                honk_outbound::proxy::packet_rejection(&anyhow::Error::new(error)),
+                Some(honk_outbound::proxy::PacketRejection::Cancelled)
+            );
+        }
+        for unclaimed in [
+            "literal.example",
+            "bootstrap-target.example",
+            "other.example",
+        ] {
+            assert!(
+                service
+                    .resolve_node_host(unclaimed)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        provider.finish_pause().await.unwrap();
+        assert_eq!(current.lease_count(), 0);
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), server.recv_from(&mut [0; 512]))
+            .await
+            .is_err(),
+        "refused aliases must not start bootstrap or fall back to their original names"
+    );
+    honk_outbound::bootstrap::set_node_host_resolver(None);
+    honk_outbound::bootstrap::set_global(None);
+}
+
+#[tokio::test]
+async fn hosts_alias_bootstrap_uses_target_and_pause_cancels_admitted_query() {
+    if crate::test_support::run_exact_in_child(
+        "HONK_ALIAS_BOOTSTRAP_TEST_CHILD",
+        "dns::runtime::tests::lifecycle::hosts_alias_bootstrap_uses_target_and_pause_cancels_admitted_query",
+    ) {
+        return;
+    }
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    honk_outbound::bootstrap::set_global(BootstrapResolver::parse(&format!(
+        "udp://{}",
+        server.local_addr().unwrap()
+    )));
+    let (entered, arrived) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let peer = tokio::spawn(async move {
+        let mut queries = Vec::new();
+        let mut pending = Vec::new();
+        for index in 0..4 {
+            let mut wire = [0; 512];
+            let (length, address) = server.recv_from(&mut wire).await.unwrap();
+            let wire = &wire[..length];
+            let query = crate::dns::query::QueryContext::parse(wire).unwrap();
+            let qtype = query.qtype().unwrap().get();
+            queries.push((query.qname().unwrap().to_domain_name().unwrap(), qtype));
+            let response = if qtype == 1 {
+                answer(wire, [192, 0, 2, 91])
+            } else {
+                crate::dns::forwarder::make_empty_response(wire, &query)
+            };
+            if index < 2 {
+                server.send_to(&response, address).await.unwrap();
+            } else {
+                pending.push((response, address));
+            }
+        }
+        entered.send(queries).unwrap();
+        released.await.unwrap();
+        for (response, address) in pending {
+            server.send_to(&response, address).await.unwrap();
+        }
+        assert_eq!(
+            server.try_recv_from(&mut [0; 512]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "cancelled alias resolution must not issue a fallback query"
+        );
+    });
+    let (_file, current) = node_host_runtime(1);
+    let provider = Arc::new(DnsServiceProvider::new(Arc::clone(&current)));
+    #[cfg(feature = "native-api")]
+    provider.enable_lifecycle();
+    let service = DnsService::with_provider(Arc::clone(&provider));
+    honk_outbound::bootstrap::set_node_host_resolver(Some(crate::dns::node_host::resolver(
+        &service,
+    )));
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            honk_outbound::bootstrap::resolve("bootstrap-alias.example"),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+        [std::net::IpAddr::from([192, 0, 2, 91])]
+    );
+    let query = tokio::spawn(honk_outbound::bootstrap::resolve("bootstrap-alias.example"));
+    let mut queries = tokio::time::timeout(Duration::from_secs(2), arrived)
+        .await
+        .unwrap()
+        .unwrap();
+    queries.sort_unstable();
+    assert_eq!(
+        queries,
+        [1, 1, 28, 28].map(|qtype| ("bootstrap-target.example".to_owned(), qtype))
+    );
+    provider.begin_pause();
+    release.send(()).unwrap();
+    let error = tokio::time::timeout(Duration::from_secs(2), query)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        honk_outbound::proxy::packet_rejection(&anyhow::Error::new(error)),
+        Some(honk_outbound::proxy::PacketRejection::Cancelled)
+    );
+    provider.finish_pause().await.unwrap();
+    assert_eq!(current.lease_count(), 0);
+    peer.await.unwrap();
+    honk_outbound::bootstrap::set_node_host_resolver(None);
+    honk_outbound::bootstrap::set_global(None);
 }
 
 #[tokio::test]
 async fn paused_dns_fails_claimed_node_hosts_and_reload_releases_them() {
-    let provider = Arc::new(DnsServiceProvider::new(node_host_runtime(1)));
+    let (_file, current) = node_host_runtime(1);
+    let provider = Arc::new(DnsServiceProvider::new(current));
     #[cfg(feature = "native-api")]
     provider.enable_lifecycle();
     let service = DnsService::with_provider(Arc::clone(&provider));
@@ -264,7 +436,8 @@ async fn paused_dns_fails_claimed_node_hosts_and_reload_releases_them() {
     );
     provider.finish_pause().await.unwrap();
 
-    let provider = Arc::new(DnsServiceProvider::new(node_host_runtime(1)));
+    let (_replacement_file, current) = node_host_runtime(1);
+    let provider = Arc::new(DnsServiceProvider::new(current));
     let service = DnsService::with_provider(Arc::clone(&provider));
     let hook = crate::dns::node_host::resolver(&service);
     provider.publish(runtime(2, 0).0);

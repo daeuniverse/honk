@@ -50,7 +50,7 @@
 
 ## Hosts 快照（`use_host`）
 
-`use_host` 可以重复配置。不区分大小写的 `true`、`yes`、`1` 或 `on` 加入 `/etc/hosts`。`false`、`no`、`0`、`off` 或空值不加入来源，也不会移除此前的来源。其他值都是路径。`/etc/hosts` 无论由 `true` 加入还是直接写成路径，都使用标准 `IP canonical-name aliases...` 语法；其他路径都是 OxiDNS 兼容的 `matcher IP...` 规则文件。所有来源按声明顺序各读取一次并合并为一个快照；后面的来源会覆盖前面来源中相同的精确名称或 matcher。重复路径只加载一次。
+`use_host` 可以重复配置。不区分大小写的 `true`、`yes`、`1` 或 `on` 加入 `/etc/hosts`。`false`、`no`、`0`、`off` 或空值不加入来源，也不会移除此前的来源。其他值都是路径。`/etc/hosts` 无论由 `true` 加入还是直接写成路径，都使用标准 `IP canonical-name aliases...` 语法；其他路径都是 OxiDNS 兼容的 `matcher target...` 规则文件。所有来源按声明顺序各读取一次并合并为一个快照；后面的来源会覆盖前面来源中相同的精确名称或 matcher。重复路径只加载一次。
 
 ```dae
 dns {
@@ -62,9 +62,9 @@ dns {
 
 绝对路径保持原样。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和工作目录中的已有副本；缺失路径仍定位到 `global.data_dir` 下。查询路径只使用生成的不可变快照，不执行文件 I/O。
 
-自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其地址。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
+自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其目标。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
 
-规则文件每行包含一个 matcher 和至少一个 IPv4 或 IPv6 地址。`#` 总是开始注释，且没有引号机制，因此 matcher 不能包含空白或 `#`。`hosts.txt` 示例：
+规则文件每行包含一个 matcher，后面跟一个或多个 IPv4/IPv6 地址，或恰好一个别名目标主机名。`#` 总是开始注释，且没有引号机制，因此 matcher 不能包含空白或 `#`。`hosts.txt` 示例：
 
 ```text
 full:api.example.com 192.0.2.10 2001:db8::10
@@ -73,7 +73,22 @@ keyword:internal 192.0.2.30
 regexp:^(foo|bar)\.example$ 192.0.2.40 # 共享地址
 ```
 
-在 `ipv4only`/`ipv6only` 的硬地址族过滤之后，已知名称的 IN class A 或 AAAA 查询优先于 request 规则（包括 `reject`）、缓存查询和上游交换。名称存在但没有所请求地址族时，honk 返回 NOERROR/NODATA，且不查询上游。其他 class 和 qtype 继续走正常管线。Hosts 应答使用 60 秒 TTL，并绕过 honk 的 DNS 缓存。
+在 `ipv4only`/`ipv6only` 的硬地址族过滤之后，已知名称的 IN class A 或 AAAA 查询优先于 request 规则（包括 `reject`）、缓存查询和上游交换。地址条目没有所请求地址族时，honk 返回 NOERROR/NODATA，且不查询上游。其他 class 和 qtype 继续走正常管线。本地地址记录使用 60 秒 TTL，hosts 应答绕过 honk 的 DNS 缓存。
+
+作为 honk 对 OxiDNS 格式的扩展，规则可以只写一个域名而不写地址，此时该名称成为这个域名的别名：
+
+```text
+full:a.example b.example
+domain:corp.example gateway.example
+```
+
+目标与 matcher 名称一样归一化，且必须是有效主机名；名称与地址混写、写两个域名，或精确名称以自身为别名，都属于无效规则。查询别名的 A 或 AAAA 时，honk 以相同 qtype 让目标走完整管线（hosts、request 规则、缓存、上游）。应答先给出从查询名称经各级别名到目标的 `CNAME` 记录，再附上目标应答中的 CNAME 和所请求的地址记录。本地别名 CNAME 与本地地址记录使用 60 秒 TTL；来自目标应答的记录保留目标自身的 TTL 策略。合成的应答不缓存；目标查询保留调用者的缓存策略，包括显式绕过缓存。
+
+派生的目标查询要求恰好一个问题（`QD=1`）、answer 与 authority section 为空（`AN=NS=0`），且 additional section 为空或恰好包含一个 OPT（`AR=0` 或 `1`）。派生查询替换 QNAME，保留事务 ID、全部 header flags、QTYPE 和 QCLASS。存在 OPT 时，精确保留其 class、TTL 和选项字节，并独立编码其根名称 owner，不依赖原问题的编码。其他 section 形状会在目标 I/O 前失败；honk 不会静默丢弃记录，也不会回退到查询原始名称。
+
+目标为 NODATA 时返回只含 CNAME 链的 NOERROR；目标为 NXDOMAIN 时按 RFC 6604 返回带 CNAME 链的 NXDOMAIN。其他完整的 12 位 RCODE 不附带 answer 记录：EDNS 客户端收到完整 RCODE，未使用 EDNS 而无法表示该 RCODE 时返回不带记录的 SERVFAIL。目标查询失败则本次查询失败。合成应答保留目标最终应答的 `TC` 位，即使合成后的包未超出客户端的大小限制。
+
+合并全部来源后，每个别名目标都必须在 8 级别名以内到达一个不是别名的名称；环路或更长的链属于无效配置，错误信息会给出对应的 matcher 和目标。经[节点域名 hook](#节点服务器域名) 解析的域名同样遵循别名。
 
 SIGHUP 会构建新快照。任一来源不可读或自定义规则无效时，启动失败；重载时，新运行时代次会在发布前失败，当前运行时代次继续运行。
 
@@ -248,6 +263,8 @@ dns {
 - tag 属于主机名而不是节点：不同订阅中共用同一主机名的节点会合并各自的 tag，因此首条匹配的规则为该主机名选定一个上游。
 - 该规则只能与 `qname()` 组合，且所选上游的每条声明都必须是 `-> direct`，否则校验报错：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
 - 上游自身的域名、ECH 发现和离线 `delay` 子命令仍使用 bootstrap 解析器。
+- 域名匹配 `use_host` 中的[别名](#hosts-快照use_host)时改为解析其目标：别名链终止于地址条目时直接使用这些地址，否则按目标域名作为节点域名的方式解析，即由接管目标的 `subtag()` 规则解析，没有接管时走 bootstrap。直接匹配原始域名的地址条目不会通过此 hook 接管该域名；别名链终点的地址条目会被使用。所有被接管的查询，包括本地地址结果和 bootstrap 目标，都遵守 DNS 运行时准入与取消机制。一旦选定目标或 subtag 路径，该路径的失败就是最终结果。查询执行前重载删除了该别名时，原域名按没有别名的情况解析。
+- 别名匹配所有交给 bootstrap 解析器的域名，不限于节点服务器域名：未指定显式 bootstrap 解析器的订阅、Geo 数据和外部 UI 下载的 URL 域名，SOCKS5 节点的 UDP 中继域名，以及健康检查、延迟测试、连通性探测和内部域名解析回退到 bootstrap 时的域名。DNS 上游自身的域名和 ECH 发现不经过此 hook。
 - 每个 DNS 代次根据订阅 tag 和有序规则预计算节点域名的策略结果，包括未匹配结果。使用这些结果时，原生 flow trace 会以 `not_instrumented` 标记为 `partial`：节点域名的规则决策证据尚未采集。
 
 ### Request 动作
