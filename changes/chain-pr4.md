@@ -1,0 +1,3 @@
+Added
+
+- Chain nodes and routes through a group `exit` carry UDP when the exit is Trojan, or VLESS without multiplexing using `auto` or `native` UDP encoding. A Trojan exit on a chain node shares one association per client source; a VLESS exit sends native UDP, also under `auto`. A leaf without UDP of its own, such as VMess, carries UDP through such an exit. Each UDP flow through a group `exit` opens its own association. Setup failures count against the failing hop; a set-up flow counts for every hop before the exit, and its later traffic counts against the exit. A group's UDP connectivity in the datapath follows the same capability check as UDP selection.

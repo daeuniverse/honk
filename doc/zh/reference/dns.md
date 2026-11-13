@@ -228,7 +228,7 @@ upstream {
 | DoQ | 支持经出站的 UDP-capable `PacketTransport`。 |
 | DoH3 | 支持经出站的 UDP-capable `PacketTransport`。 |
 
-带 [`exit`](./groups.md#出口) 的组经它的路由传输上表中基于 TCP 的上游。这样的组不提供 UDP 候选，所以 DoQ 和 DoH3 上游在其中找不到候选。
+带 [`exit`](./groups.md#出口) 的组经它的路由传输上表中基于 TCP 的上游。DoQ 和 DoH3 上游不经过这类路由，DNS 传输层会拒绝这类拨号。
 
 ## DNS 路由
 

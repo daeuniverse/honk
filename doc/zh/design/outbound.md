@@ -118,7 +118,7 @@ native socket 包在 `PacketTransport` 后面；tunnel 协议在自己的真实 
 | AnyTLS | `network` 缺省或包含 `udp` 时 | 否 | 否 | `AnyTls` | `anytls` |
 | Direct | 是 | 否 | 否 | `None` | 无 |
 | Block | 否 | 否 | 是 | `None` | 无 |
-| Chain | 否 | 否 | 否 | `None` | 无 |
+| Chain | 否；由 `descriptor::carries_udp` 按出口判断 | 否 | 否 | `None` | 无 |
 
 Ready-stream pooling 保存已完成、已绑定目标的握手。Bare-TCP pooling 只保存已经连
 到代理服务器的 socket，目标握手留给之后的 `dial_with_tcp` 完成。TCP multiplex 和
@@ -162,7 +162,7 @@ capability 拒绝，调用方可以继续回退到配置中的冷候选。显式
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
-| `chain` | 经各跳的 handler 逐跳拨号；见[链式节点](#链式节点) | 没有 packet slot；只支持 TCP |
+| `chain` | 经各跳的 handler 逐跳拨号；见[链式节点](#链式节点) | 出口的 `dial_udp_over`（Trojan、VLESS 原生 UDP）；出口为 Trojan 时也可用其 `prepare_shared_source_over` |
 
 Shadowsocks 的传统 AEAD 和 2022 版本用一个 `MultiTargetTransport` 承载同一客户端
 source 的所有目的地。它只有一个连到服务端的带 mark socket 和一份加密状态。2022
@@ -1035,12 +1035,16 @@ SID 的所有目的地。域名目标流，即 `RewriteTo`，仍按原始目的�
 经隧道拨号的某一跳以 `RealityMaskCertificate` 失败时，整条链从入口重拨一次并关闭 hybrid key share，与直接 REALITY 拨号重试一次相同。
 重拨共用原来的期限。入口本身是 REALITY 时，由它自己的 `dial_runtime` 重试。
 
+UDP 走同一条路径，只是最后一跳不同：`dial_chain` 执行上述全部规则，再把出口的 carrier 交给 `PacketOutbound::dial_udp_over` 或 `SharedSourceOutbound::prepare_shared_source_over`。两者都在这个 carrier 上返回协议原有的 transport，所以分帧、`FramePoison` 和回复投影都不变，丢弃 transport 会关闭整条链。
+节点或路由能否承载 UDP 只有一个答案：`descriptor::carries_udp(UdpPath)`。普通节点和折叠成单个节点的路由用 `Own(node)`，链式节点和经组出口的多跳路由用 `Tunneled { exit }`。runtime 的 `udp_capable`、组选路、数据面发布和探测规划都调用它；链式节点 descriptor 的 `supports_udp` 保持 `never`，`Own(chain)` 读到的就是它，所以按链式节点自身询问 UDP 时答案为否；链式节点的实际答案来自 `Tunneled { exit }`。端口策略（`udp_target_allowed`）由实际封装 UDP 的节点回答：节点本身，或出口。
+只有当链式节点有跳，且出口协议登记了 `tunneled_shared` slot（Trojan）时，`ProxyRegistry::has_shared_source_for` 才给它 `Shared` 源路径；经组出口的路由一律按单条 flow 处理。
+
 ### 经组出口的路由
 
 组的 [`exit`](../reference/groups.md#出口) 把选中的叶节点变成一条路由（`honk_config::route::Route`）。
 `group_graph::compose` 把叶节点自己的各跳（节点本身，或链式节点的各跳）与选中路径上各组的出口按从内到外的顺序接起来，重复的出口只进入一次。
 路由是选择结果，不是配置中的节点，所以没有 `NodeRuntime`。
-`ProxyRegistry::dial_ref` 把 `DialRef::Route` 交给 `ChainHandler::dial_route_tcp`，在 `RouteRuntime`（`src/runtime/route.rs`）上拨号，
+`ProxyRegistry::dial_ref` 把 `DialRef::Route` 交给 `ChainHandler::dial_route_tcp`，`ProxyRegistry::dial_udp_route` 把 UDP 交给 `ChainHandler::dial_route_udp`，两者都在 `RouteRuntime`（`src/runtime/route.rs`）上拨号，
 `RouteRuntime` 借用发起拨号的 generation 中各跳的 runtime。每个 generation 最多缓存 `MAX_ROUTE_RUNTIMES`（4096）个，超出后用不缓存的 runtime 拨号。
 上述逐跳规则同样适用。路由不存入连接池，也不触发补充。
 

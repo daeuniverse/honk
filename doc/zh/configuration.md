@@ -277,7 +277,7 @@ routing {
 }
 ```
 
-Selector 的 TCP 和 UDP 都跟随已选成员，不会因为健康状态切到兄弟成员。同一叶节点的 TCP 最后尝试也绕不过嵌套 Selector 的选择。组拨号最终总是解析到一个叶节点。带 [`exit`](./reference/groups.md#出口) 的组让 TCP 连接从该叶节点再经出口节点出去。
+Selector 的 TCP 和 UDP 都跟随已选成员，不会因为健康状态切到兄弟成员。同一叶节点的 TCP 最后尝试也绕不过嵌套 Selector 的选择。组拨号最终总是解析到一个叶节点。带 [`exit`](./reference/groups.md#出口) 的组让连接从该叶节点再经出口节点出去；只有出口能承载 UDP 时，UDP 才走这条路由。
 
 每份配置最多可定义 250 个顶层用户组；更高序号由路由 ABI 保留。
 

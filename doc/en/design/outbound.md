@@ -120,7 +120,7 @@ the Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | AnyTLS | when `network` is absent or contains `udp` | no | no | `AnyTls` | `anytls` |
 | Direct | yes | no | no | `None` | none |
 | Block | no | no | yes | `None` | none |
-| Chain | no | no | no | `None` | none |
+| Chain | no; `descriptor::carries_udp` decides from the exit | no | no | `None` | none |
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP pooling
 stores only a connected proxy-server socket; `dial_with_tcp` then performs the
@@ -173,7 +173,7 @@ is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
-| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | No packet slot; TCP only |
+| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | The exit's `dial_udp_over` (Trojan, VLESS native) or, with a Trojan exit, its `prepare_shared_source_over` |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server and
@@ -1305,6 +1305,25 @@ from the entry with hybrid key shares disabled, as a direct REALITY dial
 retries once. The redial shares the original deadline. A REALITY entry retries
 inside its own `dial_runtime`.
 
+UDP takes the same path with a different last hop: `dial_chain` runs every
+rule above and hands the exit's carrier to `PacketOutbound::dial_udp_over` or
+`SharedSourceOutbound::prepare_shared_source_over`. Both return the protocol's
+existing transport over that carrier, so framing, `FramePoison` and reply
+projection are unchanged, and dropping the transport closes the whole chain.
+Whether a node or a route carries UDP has one answer,
+`descriptor::carries_udp(UdpPath)`: `Own(node)` for a node or a route that
+collapses to one node, `Tunneled { exit }` for a configured chain or a longer
+route through group exits. Runtime `udp_capable`, group selection, datapath
+publication and probe planning all ask it; the chain descriptor's
+`supports_udp` stays `never`, which is what `Own(chain)` reads, so asking a
+chain about its own UDP answers no; a chain's real answer is
+`Tunneled { exit }`. Port
+policy (`udp_target_allowed`) is asked of the node that frames the UDP: the
+node itself, or the exit. `ProxyRegistry::has_shared_source_for` gives a
+configured chain the `Shared` source path only when it has hops and its exit's
+protocol registers a `tunneled_shared` slot (Trojan); a route through group
+exits always takes the per-flow path.
+
 ### Routes through group exits
 
 A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
@@ -1313,8 +1332,9 @@ A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
 selection path, innermost first, and enters a repeated exit once. A route is a
 selection result, not a configured node, so it has no `NodeRuntime`.
 `ProxyRegistry::dial_ref` sends `DialRef::Route` to
-`ChainHandler::dial_route_tcp` over a `RouteRuntime` (`src/runtime/route.rs`),
-which borrows the hop runtimes of the generation that dials it. Each generation
+`ChainHandler::dial_route_tcp`, and `ProxyRegistry::dial_udp_route` sends UDP to
+`ChainHandler::dial_route_udp`, both over a `RouteRuntime`
+(`src/runtime/route.rs`), which borrows the hop runtimes of the generation that dials it. Each generation
 caches at most `MAX_ROUTE_RUNTIMES` (4096) of them and dials past that limit
 over an uncached one. The hop-by-hop rules above apply unchanged. Routes skip
 pool deposit and replenishment.

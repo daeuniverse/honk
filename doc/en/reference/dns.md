@@ -228,7 +228,7 @@ Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI 
 | DoQ | Supported through the outbound's UDP-capable `PacketTransport`. |
 | DoH3 | Supported through the outbound's UDP-capable `PacketTransport`. |
 
-A group with an [`exit`](./groups.md#exit) carries the TCP-based upstreams above over its route. It offers no UDP candidates, so DoQ and DoH3 upstreams find none in it.
+A group with an [`exit`](./groups.md#exit) carries the TCP-based upstreams above over its route. DoQ and DoH3 upstreams do not go through such a route: the DNS transport rejects the dial.
 
 ## DNS routing
 
