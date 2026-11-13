@@ -248,6 +248,9 @@ impl HostsFile {
     /// Every lookup's chain continues through the chain of some alias target,
     /// so bounding those here leaves the query-time bound as a defence only.
     fn check_alias_chains(&self) -> io::Result<()> {
+        if !self.has_aliases {
+            return Ok(());
+        }
         let invalid = |matcher: &dyn std::fmt::Display, first: &str, error: AliasChainError| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
