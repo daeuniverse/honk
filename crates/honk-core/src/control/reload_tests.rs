@@ -4388,3 +4388,319 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
     );
     assert!(!tracing(&cp), "reload");
 }
+
+/// Routes through group exits carry TCP only, so a group whose every leaf
+/// sits behind an exit publishes no UDP connectivity, as UDP selection
+/// offers it no candidate; its TCP connectivity is unchanged.
+#[test]
+fn an_exit_group_without_udp_routes_publishes_no_udp() {
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
+    let exit = canonical_socks5("exit", "127.0.0.2", 1080, None);
+    let group = |name: &str, exit: Option<&str>, groups: Vec<String>| Group {
+        name: name.into(),
+        policy: GroupPolicy::Selector,
+        nodes: if groups.is_empty() {
+            vec![leaf.id]
+        } else {
+            Vec::new()
+        },
+        groups,
+        exit: exit.map(Into::into),
+        ..Default::default()
+    };
+    let config = Config {
+        nodes: vec![leaf.clone(), exit.clone()],
+        groups: vec![
+            group("plain", None, Vec::new()),
+            group("exited", Some("exit"), Vec::new()),
+            group("outer", None, vec!["exited".into()]),
+        ],
+        ..Default::default()
+    };
+    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    let manager =
+        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let published = |group: u8, domain: u32| {
+        snapshot.contains(&(OutboundIndex::UserBase as u8 + group, domain, 0, true))
+    };
+    assert!(published(0, 0) && published(0, 1) && published(0, 2));
+    for group in [1, 2] {
+        assert!(published(group, 0), "group {group} keeps TCP");
+        assert!(
+            !published(group, 1) && !published(group, 2),
+            "group {group}"
+        );
+    }
+}
+
+/// UDP publication answers what UDP selection offers: nothing from a group
+/// with an exit, its `final` included, while a sibling outside it counts.
+#[test]
+fn publication_and_selection_agree_on_udp_capability() {
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork};
+
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
+    let other = canonical_socks5("other", "127.0.0.3", 1080, None);
+    let exit = canonical_socks5("exit", "127.0.0.2", 1080, None);
+    let group = |name: &str, nodes: Vec<uuid::Uuid>, groups: &[&str]| Group {
+        name: name.into(),
+        policy: GroupPolicy::Fallback,
+        nodes,
+        groups: groups.iter().map(|name| (*name).into()).collect(),
+        ..Default::default()
+    };
+    let exited = |group: Group| Group {
+        exit: Some("exit".into()),
+        ..group
+    };
+    let mut config = Config {
+        nodes: vec![leaf.clone(), other.clone(), exit.clone()],
+        groups: vec![
+            group("plain", vec![leaf.id], &[]),
+            exited(group("exited", vec![leaf.id], &[])),
+            group("outer", Vec::new(), &["exited"]),
+            group("mixed", vec![other.id], &["exited"]),
+            Group {
+                final_outbound: Some("block".into()),
+                ..exited(group("exited-block", vec![leaf.id], &[]))
+            },
+            Group {
+                final_outbound: Some("plain".into()),
+                ..exited(group("exited-final", vec![leaf.id], &[]))
+            },
+            Group {
+                exit: Some("missing".into()),
+                ..group("unresolved", vec![leaf.id], &[])
+            },
+        ],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    let manager =
+        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let mut published = Vec::new();
+    for (index, group) in config.groups.iter().enumerate() {
+        let outbound = OutboundIndex::UserBase as u8 + index as u8;
+        let udp = snapshot.contains(&(outbound, 2, 0, true));
+        let plan = manager.selection_plan_for_target_with_health_fallback(
+            &group.name,
+            &ScoreSelectionContext {
+                network: SelectionNetwork::Udp,
+                probe_domain: ProbeDomain::DataUdp,
+                target_family: Some(IpVersion::V4),
+                health_family: IpVersion::V4,
+                target: None,
+            },
+            None,
+        );
+        assert_eq!(udp, !plan.entries.is_empty(), "{}", group.name);
+        published.push(udp);
+    }
+    assert_eq!(
+        published,
+        [true, false, false, true, false, false, false],
+        "plain, exited, outer, mixed, exited-block, exited-final, unresolved"
+    );
+}
+
+/// The leaf walk the connectivity tables used before they shared the group
+/// graph: name lookups, a path guard by name, the group-depth cap and the
+/// first node a `final` names.
+fn reference_leaf_ids(
+    group: &Group,
+    config: &Config,
+    depth: usize,
+    path: &mut Vec<String>,
+    out: &mut std::collections::BTreeSet<uuid::Uuid>,
+) {
+    if depth >= honk_outbound::group::MAX_GROUP_DEPTH || path.contains(&group.name) {
+        return;
+    }
+    let by_name = |name: &str| config.groups.iter().rev().find(|g| g.name == name);
+    path.push(group.name.clone());
+    out.extend(group.nodes.iter().copied());
+    for tag in &group.groups {
+        if let Some(sub) = by_name(tag) {
+            reference_leaf_ids(sub, config, depth + 1, path, out);
+        }
+    }
+    match group.final_outbound.as_deref() {
+        None => {}
+        Some(Config::BUILTIN_DIRECT_NODE) => {
+            out.insert(honk_config::config::DIRECT_NODE_ID);
+        }
+        Some(Config::BUILTIN_BLOCK_NODE) => {
+            out.insert(honk_config::config::BLOCK_NODE_ID);
+        }
+        Some(name) => {
+            if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                out.insert(node.id);
+            } else if let Some(sub) = by_name(name) {
+                reference_leaf_ids(sub, config, depth + 1, path, out);
+            }
+        }
+    }
+    path.pop();
+}
+
+/// Assert the outbound id map, health registrations and URLTest table
+/// against [`reference_leaf_ids`].
+fn assert_connectivity_matches_reference(config: &Config) {
+    let leaves: Vec<std::collections::BTreeSet<uuid::Uuid>> = config
+        .groups
+        .iter()
+        .map(|group| {
+            let mut ids = std::collections::BTreeSet::new();
+            reference_leaf_ids(group, config, 0, &mut Vec::new(), &mut ids);
+            ids
+        })
+        .collect();
+    let mut ids = std::collections::HashMap::new();
+    for (index, set) in leaves.iter().enumerate() {
+        for id in set {
+            ids.entry(*id)
+                .or_insert(OutboundIndex::UserBase as u8 + index as u8);
+        }
+    }
+    assert_eq!(build_outbound_id_map(config), ids, "{config:?}");
+
+    let reached: std::collections::BTreeSet<uuid::Uuid> =
+        leaves.iter().flatten().copied().collect();
+    let checked: std::collections::BTreeSet<uuid::Uuid> = config
+        .nodes
+        .iter()
+        .filter(|node| reached.is_empty() || reached.contains(&node.id))
+        .map(|node| node.id)
+        .collect();
+    let alive = crate::outbound::AliveDialerSet::new();
+    sync_health_check_nodes(&alive, config);
+    assert_eq!(
+        alive
+            .registered_nodes()
+            .into_keys()
+            .collect::<std::collections::BTreeSet<_>>(),
+        checked,
+        "{config:?}"
+    );
+
+    let always: std::collections::BTreeSet<uuid::Uuid> = config
+        .groups
+        .iter()
+        .zip(&leaves)
+        .filter(|(group, _)| group.policy != GroupPolicy::URLTest)
+        .flat_map(|(_, set)| set.iter().copied())
+        .collect();
+    let urltest: Vec<(String, Vec<uuid::Uuid>)> = config
+        .groups
+        .iter()
+        .zip(&leaves)
+        .filter(|(group, _)| group.policy == GroupPolicy::URLTest)
+        .map(|(group, set)| {
+            (
+                group.name.clone(),
+                set.iter()
+                    .copied()
+                    .filter(|id| !always.contains(id))
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        urltest_group_registrations(config)
+            .into_iter()
+            .map(|(name, members, _)| (name, members))
+            .collect::<Vec<_>>(),
+        urltest,
+        "{config:?}"
+    );
+}
+
+/// GroupManager cuts subgroup cycles, but the eBPF outbound ids, health
+/// registrations and URLTest table come from the uncut configuration: with
+/// `b` declared before `a` and `a <-> b` as subgroups, `a`'s leaf keeps
+/// `b`'s slot, which a cut `b -> a` edge would move to `a`'s.
+#[test]
+fn connectivity_leaf_sets_are_unchanged_on_a_cyclic_config() {
+    let a = canonical_socks5("a", "127.0.0.1", 1080, None);
+    let b = canonical_socks5("b", "127.0.0.2", 1080, None);
+    let config = Config {
+        nodes: vec![a.clone(), b.clone()],
+        groups: vec![
+            Group {
+                name: "b".into(),
+                nodes: vec![b.id],
+                groups: vec!["a".into()],
+                ..Default::default()
+            },
+            Group {
+                name: "a".into(),
+                nodes: vec![a.id],
+                groups: vec!["b".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let slot = OutboundIndex::UserBase as u8;
+    assert_eq!(
+        build_outbound_id_map(&config),
+        std::collections::HashMap::from([(a.id, slot), (b.id, slot)])
+    );
+    assert_connectivity_matches_reference(&config);
+
+    // Seeded configurations over cycles, final edges to nodes, namesakes,
+    // groups and builtins, missing names, duplicate group names and depth.
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut next = move |bound: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % bound as u64) as usize
+    };
+    let nodes: Vec<_> = (0..5)
+        .map(|index| {
+            let name = ["n0", "n1", "n2", "n1", "n3"][index];
+            canonical_socks5(name, &format!("127.0.1.{index}"), 1080, None)
+        })
+        .collect();
+    let group_names = ["g0", "g1", "g2", "g3", "g4", "g5", "g6", "g7", "g8", "g9"];
+    for _ in 0..2000 {
+        let count = 1 + next(group_names.len());
+        let name = |index: usize| group_names[index].to_string();
+        let groups = (0..count)
+            .map(|index| Group {
+                name: if next(12) == 0 {
+                    name(next(count))
+                } else {
+                    name(index)
+                },
+                policy: [
+                    GroupPolicy::Selector,
+                    GroupPolicy::URLTest,
+                    GroupPolicy::Fallback,
+                ][next(3)],
+                nodes: (0..next(3)).map(|_| nodes[next(nodes.len())].id).collect(),
+                groups: (0..next(3)).map(|_| name(next(count))).collect(),
+                final_outbound: match next(8) {
+                    0 => Some("direct".into()),
+                    1 => Some("block".into()),
+                    2 | 3 => Some(nodes[next(nodes.len())].name.clone()),
+                    4 | 5 => Some(name(next(count))),
+                    6 => Some("missing".into()),
+                    _ => None,
+                },
+                exit: (next(4) == 0).then(|| nodes[next(nodes.len())].name.clone()),
+                ..Default::default()
+            })
+            .collect();
+        assert_connectivity_matches_reference(&Config {
+            nodes: nodes.clone(),
+            groups,
+            ..Default::default()
+        });
+    }
+}

@@ -5,6 +5,30 @@
 
 use super::*;
 
+/// Which leaves [`GroupManager::visit_group_leaves`] reports.
+#[derive(Clone, Copy)]
+struct LeafWalk {
+    include_final: bool,
+    /// Only what UDP selection reaches: it offers nothing from a group
+    /// with an exit, as routes carry TCP only.
+    udp: bool,
+}
+
+impl LeafWalk {
+    const MEMBERS: Self = Self {
+        include_final: false,
+        udp: false,
+    };
+    const REACHABLE: Self = Self {
+        include_final: true,
+        ..Self::MEMBERS
+    };
+    const UDP: Self = Self {
+        udp: true,
+        ..Self::REACHABLE
+    };
+}
+
 #[cfg(feature = "flow-observation")]
 pub struct GroupSelection<'a> {
     pub member: GroupMember<'a>,
@@ -40,12 +64,18 @@ impl GroupManager {
         if limit == 0 {
             return leaves;
         }
-        self.visit_group_leaves(name, 0, &mut [""; MAX_GROUP_DEPTH], false, &mut |node| {
-            if !leaves.iter().any(|leaf| leaf.id == node.id) {
-                leaves.push(node);
-            }
-            leaves.len() == limit
-        });
+        self.visit_group_leaves(
+            name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            LeafWalk::MEMBERS,
+            &mut |node| {
+                if !leaves.iter().any(|leaf| leaf.id == node.id) {
+                    leaves.push(node);
+                }
+                leaves.len() == limit
+            },
+        );
         leaves
     }
 
@@ -337,8 +367,24 @@ impl GroupManager {
             group_name,
             0,
             &mut [""; MAX_GROUP_DEPTH],
-            true,
+            LeafWalk::REACHABLE,
             &mut |node| node.id == node_id,
+        )
+    }
+
+    /// Whether `accept` takes a leaf UDP selection can reach through
+    /// membership or explicit final edges, none of them behind an exit.
+    pub fn any_udp_leaf_in_group(
+        &self,
+        group_name: &str,
+        mut accept: impl FnMut(&Node) -> bool,
+    ) -> bool {
+        self.visit_group_leaves(
+            group_name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            LeafWalk::UDP,
+            &mut accept,
         )
     }
 
@@ -348,7 +394,10 @@ impl GroupManager {
             group_name,
             0,
             &mut [""; MAX_GROUP_DEPTH],
-            include_final,
+            match include_final {
+                true => LeafWalk::REACHABLE,
+                false => LeafWalk::MEMBERS,
+            },
             &mut |node| {
                 if !out.iter().any(|existing| existing.id == node.id) {
                     out.push(node);
@@ -390,7 +439,7 @@ impl GroupManager {
         group_name: &str,
         depth: usize,
         visited: &mut [&'a str; MAX_GROUP_DEPTH],
-        include_final: bool,
+        walk: LeafWalk,
         visit: &mut impl FnMut(&'a Node) -> bool,
     ) -> bool {
         if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&group_name) {
@@ -399,6 +448,9 @@ impl GroupManager {
         let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return false;
         };
+        if walk.udp && group.exit.is_some() {
+            return false;
+        }
         visited[depth] = group.name.as_str();
         group
             .nodes
@@ -408,13 +460,20 @@ impl GroupManager {
             || group
                 .groups
                 .iter()
-                .any(|tag| self.visit_group_leaves(tag, depth + 1, visited, include_final, visit))
-            || (include_final
+                .any(|tag| self.visit_group_leaves(tag, depth + 1, visited, walk, visit))
+            || (walk.include_final
                 && match self.final_member(group) {
                     Some(GroupMember::Node(node)) => visit(node),
-                    Some(GroupMember::Group(group)) => {
-                        self.visit_group_leaves(&group.name, depth + 1, visited, true, visit)
-                    }
+                    Some(GroupMember::Group(group)) => self.visit_group_leaves(
+                        &group.name,
+                        depth + 1,
+                        visited,
+                        LeafWalk {
+                            include_final: true,
+                            ..walk
+                        },
+                        visit,
+                    ),
                     None => false,
                 })
     }
