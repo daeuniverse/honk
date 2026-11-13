@@ -395,6 +395,7 @@ fn parse_route_matcher(
         "ipversion",
         "mac",
         "dscp",
+        "user",
     ] {
         if let Some(args) = parse_call(matcher, name, ordinal)? {
             match name {
@@ -410,6 +411,7 @@ fn parse_route_matcher(
                         "ipversion" => target.ip_version,
                         "mac" => target.mac,
                         "dscp" => target.dscp,
+                        "user" => target.user,
                         _ => unreachable!(),
                     };
                     field.extend(

@@ -28,6 +28,10 @@ impl Router {
                         | CompiledPredicate::Dscp(_)
                         | CompiledPredicate::ProcessName(_)
                         | CompiledPredicate::Mac(_) => None,
+                        // Intercepted traffic never carries a user, so a
+                        // positive `user()` cannot match it; the negated
+                        // form folds true via `matched != condition.not`.
+                        CompiledPredicate::User(_) => Some(false),
                     };
                     match matched.map(|matched| matched != condition.not) {
                         Some(false) => continue 'rules,

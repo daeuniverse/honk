@@ -57,6 +57,7 @@ fn test_router_empty_config() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&conn), "direct");
 }
@@ -101,6 +102,7 @@ fn test_router_domain_suffix_routing() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&google_conn), "us-proxy");
 
@@ -115,6 +117,7 @@ fn test_router_domain_suffix_routing() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&cn_conn), "direct");
 
@@ -129,6 +132,7 @@ fn test_router_domain_suffix_routing() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&unknown_conn), "proxy");
 }
@@ -164,6 +168,7 @@ fn test_router_ip_cidr_routing() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&private), "direct");
 
@@ -178,6 +183,7 @@ fn test_router_ip_cidr_routing() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&public), "proxy");
 }
@@ -243,6 +249,7 @@ protocol = "udp"
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         assert_eq!(router.route(&connection), expected);
     }
@@ -568,6 +575,7 @@ fn test_routing_edge_cases() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     assert_eq!(router.route(&conn), "direct");
 

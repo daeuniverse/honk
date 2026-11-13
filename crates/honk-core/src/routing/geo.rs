@@ -1413,6 +1413,7 @@ mod scan_tests {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         assert_eq!(router.route(&connection("old.example")), "block");
         assert_eq!(router.route(&connection("new.example")), "direct");
@@ -1915,6 +1916,7 @@ mod scan_tests {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
 
         assert_eq!(

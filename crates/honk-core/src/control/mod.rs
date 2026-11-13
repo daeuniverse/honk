@@ -19,6 +19,7 @@ use nfqueue_runtime::{
 };
 #[cfg(feature = "ebpf")]
 use nfqueue_runtime::{NfqueueRuntime, NfqueueRuntimeEvent, wait_nfqueue_event};
+mod inbound_listener;
 mod lifecycle;
 pub mod packet_sniffer;
 mod preconnect;

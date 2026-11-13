@@ -610,10 +610,11 @@ impl ConnectionObservation {
         domain: Option<&str>,
     ) -> Option<ConnectionAttempt> {
         let record = self.recorded.as_ref()?;
-        let selection = record
-            .selection
-            .as_ref()
-            .expect("captured selection generation");
+        // Inbound proxy flows (SOCKS5, HTTP(S)) dial without a captured
+        // selection generation (the userspace mirror does not run the group
+        // selection capture for them); degrade to no attempt record instead
+        // of aborting the task.
+        let selection = record.selection.as_ref()?;
         let target_kind = target_kind(node, domain);
         let data = OutboundAttempt {
             parent_attempt_id: None,

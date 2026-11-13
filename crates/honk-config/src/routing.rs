@@ -59,6 +59,11 @@ pub struct RoutingCondition {
     pub ip_version: Vec<String>,
     #[serde(default)]
     pub dscp: Vec<String>,
+    /// SOCKS5 inbound username matcher (`user(...)`), the honk counterpart
+    /// of mihomo's `in-user`. Only inbound-authenticated flows carry a user;
+    /// transparently intercepted traffic never matches a positive matcher.
+    #[serde(default)]
+    pub user: Vec<String>,
     /// Negated matchers (dae `!matcher(...)`): a rule matches iff every
     /// positive matcher matches and none of these do.
     #[serde(default)]
@@ -100,6 +105,8 @@ pub struct RoutingNotCondition {
     pub ip_version: Vec<String>,
     #[serde(default)]
     pub dscp: Vec<String>,
+    #[serde(default)]
+    pub user: Vec<String>,
 }
 
 /// Mutable view over one matcher field set. The dae parser dispatches each
@@ -120,6 +127,7 @@ pub(crate) struct ConditionFields<'a> {
     pub geosite: &'a mut Vec<String>,
     pub ip_version: &'a mut Vec<String>,
     pub dscp: &'a mut Vec<String>,
+    pub user: &'a mut Vec<String>,
 }
 
 macro_rules! fields_mut {
@@ -140,6 +148,7 @@ macro_rules! fields_mut {
             geosite: &mut $self.geosite,
             ip_version: &mut $self.ip_version,
             dscp: &mut $self.dscp,
+            user: &mut $self.user,
         }
     };
 }
@@ -174,6 +183,7 @@ impl RoutingCondition {
             ("smac", self.mac.as_slice()),
             ("ip_version", self.ip_version.as_slice()),
             ("dscp", self.dscp.as_slice()),
+            ("user", self.user.as_slice()),
         ]
         .into_iter()
         .filter(|(_, values)| !values.is_empty())
@@ -209,6 +219,7 @@ impl RoutingNotCondition {
             self.geosite.as_slice(),
             self.ip_version.as_slice(),
             self.dscp.as_slice(),
+            self.user.as_slice(),
         ]
         .into_iter()
         .all(|values| values.is_empty())
@@ -257,6 +268,7 @@ fn clash_api_rule_type(kind: &'static str) -> &'static str {
         "process" => "process-name",
         "smac" => "src-mac",
         "ip_version" => "ip-version",
+        "user" => "in-user",
         other => other,
     }
 }

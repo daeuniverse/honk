@@ -164,6 +164,7 @@ pub(super) fn condition_display(
             CompiledPredicate::Dscp(_) => ("dscp", &[("", field!(dscp))]),
             CompiledPredicate::ProcessName(_) => ("pname", &[("", field!(process_name))]),
             CompiledPredicate::Mac(_) => ("mac", &[("", field!(mac))]),
+            CompiledPredicate::User(_) => ("user", &[("", field!(user))]),
         };
         let mut display = String::new();
         if compiled.not {
@@ -297,6 +298,8 @@ pub(crate) fn missing_input(predicate: &CompiledPredicate) -> &'static str {
         CompiledPredicate::Dscp(_) => "dscp",
         CompiledPredicate::ProcessName(_) => "pname",
         CompiledPredicate::Mac(_) => "src_mac",
+        // Trace inputs carry no authenticated user, so user() can never be satisfied here.
+        CompiledPredicate::User(_) => "user",
     }
 }
 

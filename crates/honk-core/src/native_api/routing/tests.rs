@@ -221,6 +221,7 @@ fn known_inputs_agree_with_real_router_and_do_not_change_its_policy() {
             process_name: supplied.pname.clone(),
             mac: None,
             dscp: supplied.dscp,
+            user: None,
         };
         assert_eq!(router.route(&connection), expected);
         let result = trace(&router, &supplied);
@@ -401,6 +402,7 @@ fn connection() -> crate::routing::ConnectionInfo {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     }
 }
 

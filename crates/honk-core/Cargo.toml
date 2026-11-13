@@ -102,7 +102,7 @@ hkdf.workspace = true
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true }
-subtle = { workspace = true, optional = true }
+subtle = { workspace = true }
 hmac = { workspace = true, optional = true }
 serde_path_to_error = { workspace = true, optional = true }
 # The embedded UI keeps only compressed text; clients without gzip or br get it decoded.
@@ -117,7 +117,7 @@ default = ["clash-api", "jemalloc", "rprx"]
 ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
-native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
+native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
 # Embed pinned doona from HONK_DOONA_DIR and doona lite from its -lite sibling.
 native-ui = ["native-api", "dep:brotli", "dep:flate2"]
 # Route the shipped binary's allocations through jemalloc (see main.rs)

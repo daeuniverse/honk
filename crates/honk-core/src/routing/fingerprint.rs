@@ -132,6 +132,10 @@ fn encode_condition(encoder: &mut Encoder<'_>, condition: &CompiledCondition) {
             encoder.tag(9);
             encoder.list(macs, |encoder, mac| encoder.fixed(mac));
         }
+        CompiledPredicate::User(names) => {
+            encoder.tag(10);
+            encoder.list(names, |encoder, name| encoder.string(name));
+        }
     }
 }
 
