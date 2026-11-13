@@ -4,7 +4,7 @@
 
 ## Syntax
 
-Each group is a named subsection of `group { ... }`:
+Each group is a named subsection of `group { ... }`. Declarations with the same name do not merge: the last one wins. Do not repeat a group to extend it from an included file.
 
 ```dae
 group {
@@ -12,7 +12,11 @@ group {
         filter: subtag('airport') && name(keyword: 'HK')
         filter: name(regex: '^Hong Kong ')
         policy: min_moving_avg
-        check_url: 'https://www.gstatic.com/generate_204'
+        check_url: 'https://probe.example:8443/check,192.0.2.10,2001:db8::10'
+        icon: 'https://example.com/icon.svg'
+        tolerance: 50
+        idle_timeout: 1800
+        interrupt_connections: true
         final: direct
     }
 
@@ -32,30 +36,59 @@ group {
 | ------- | -------------- | ------- | ------- |
 | (section name) | `name` | required | Group tag used as an outbound in routing and APIs. |
 | `policy` | `policy` | `selector` | Member-selection policy; accepted spellings are listed below. |
-| `icon` | `icon` | `null` | Validated absolute HTTP(S) URL or data URI, at most 2048 characters; returned by native group reads with listener-secret values of at least 8 bytes masked, never guessed. |
+| `icon` | `icon` | `null` | Absolute HTTP(S) URL with a host and no credentials, or a data URI; at most 2048 characters, without whitespace. Any other value rejects the configuration. Native group reads mask listener-secret values of at least 8 bytes and never guess an icon. |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | Select nodes by node name. The parser resolves matches to node UUIDs. |
 | `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. |
 | `filter: group(...)` | `groups` | `[]` | Add nested group tags. Comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `default` | `null` | Initial or fallback member tag for `selector`. |
-| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection, including when that group is nested. Final nodes remain health-gated; missing or cyclic finals fail closed, never implicitly direct. |
-| `check_url` | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies. A Selector ignores it with a warning. |
+| `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection, including when that group is nested. An unknown target rejects the configuration at startup or reload with `invalid-group-final-target`. Final nodes remain health-gated. A final path that loops back selects nothing; it never falls back to `direct`. |
+| `check_url` | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies. Do not set it on a Selector: honk logs a warning and never probes the URL, yet the Selector still reads that URL's health for TCP, and an unprobed URL counts as healthy, so TCP health stops gating the group. |
 | — (not in dae) | `check_interval` | `null` | Per-group interval field in seconds. The current runtime does not consult it and uses the global interval. |
-| `tolerance` | `tolerance` | `50` | Nonnegative URLTest switch threshold in milliseconds. Without an explicit value, dae URLTest groups inherit `global.check_tolerance`; the runtime applies an effective minimum of 1 ms. |
-| `idle_timeout` | `idle_timeout` | `null` | Nonnegative URLTest probe-suspension threshold after inactivity, in seconds. With `null`, the health layer uses 1800 seconds. |
-| `interrupt_connections` | `interrupt_connections` | `false` | Close affected live userspace transports on selection changes, using captured group identities and network. This is transport retirement, not tracking removal; shared UDP carriers retain unaffected views. |
+| `tolerance` | `tolerance` | `50` | URLTest switch threshold in milliseconds, written as a plain integer: `tolerance: 50`, not `50ms`. Without an explicit value, dae URLTest groups inherit `global.check_tolerance`. The effective minimum is 1 ms. |
+| `idle_timeout` | `idle_timeout` | `null` | Seconds without a selection after which a URLTest group pauses member probes, written as a plain integer: `idle_timeout: 1800`, not `30m`. With `null`, honk uses 1800 seconds. |
+| `interrupt_connections` | `interrupt_connections` | `false` | Close affected live userspace transports on selection changes, using captured group identities and network. This is transport retirement, not tracking removal; shared UDP carriers retain unaffected views. LoadBalance rotation never closes connections. Accepts `true`/`false`, `yes`/`no`, `on`/`off` or `1`/`0` in any ASCII case; any other value rejects the configuration. |
 | — (not in dae) | `id` | random UUID | Internal group identity generated when the field is absent. |
+
+`filter:` entries accumulate. Every other key keeps its last occurrence; an earlier invalid value is not checked.
+
+`check_url` takes an HTTP(S) URL; a target without a scheme uses HTTP. Comma-separated entries after the URL are literal IPv4 or IPv6 addresses on the URL's port, tried before the addresses DNS returns. Invalid entries are ignored.
+
+A URLTest group is idle until its first selection and again after `idle_timeout` seconds without one. Periodic probes of its members pause while it is idle and resume on the next selection. `idle_timeout: 0` makes the group idle between selections; it does not time out connections. A node keeps being probed while any non-URLTest group or any active URLTest group reaches it.
 
 ## Policies
 
 | Canonical name | Accepted dae spellings | Behavior |
 | -------------- | ---------------------- | -------- |
 | `selector` | `selector`, `select`, `fixed`, `fixed(0)` | Independently for TCP and UDP, uses that network's runtime choice, then `default`, then the first existing member before health filtering. Health never replaces a valid choice with a sibling. The choice may be a direct node or nested group. |
-| `urltest` | `urltest`, `min_moving_avg`, `min_avg10`, `min_last_delay` | Selects the lowest-latency alive member using the halving moving average `(prev + sample) / 2` and tolerance; TCP and UDP selections are independent. |
+| `urltest` | `urltest`, `min_moving_avg`, `min_avg10`, `min_last_delay` | Selects the alive member with the lowest halving moving average `(prev + sample) / 2`; members with recent unrecovered failures rank after all others. `tolerance` limits switching. TCP and UDP selections are independent. |
 | `loadbalance` | `loadbalance`, `roundrobin`, `round_robin`, `balance` | Round-robins over alive members with independent counters per group and TCP/UDP network. Consecutive connections to one destination leave through different nodes, and TCP and UDP rotate separately, so a service that ties a session to the client address drops it: sign-ins end, and Cloudflare clearances are challenged again. Use `urltest` or `score` where that matters. |
-| `fallback` | `fallback` | Pins the first alive member in declaration order independently for TCP and UDP; recovery of an earlier member does not immediately fail back. |
+| `fallback` | `fallback` | Pins the first alive member in member order independently for TCP and UDP; recovery of an earlier member does not immediately fail back. |
 | `score` | `score` | Always compiled; chooses one alive member using observed reliability, fresh target quality and bounded validation. TCP/UDP and target IPv4/IPv6 evidence remain separate. |
 
 Policy matching is ASCII case-insensitive. Before matching, the parser removes any parenthesized suffix, so it accepts `fixed(0)`. An unrecognized policy becomes `selector` and a diagnostic names the group. Legacy `honk` is invalid; use `score`.
+
+Direct members keep the order of the node list, not the order of filter lines or arguments: `filter: name(backup, primary)` does not put `backup` first. Nested groups follow all direct members, in the order their tags were written. This order decides the Selector's first member, Fallback preference and LoadBalance rotation.
+
+To set a Fallback preference explicitly, put each node in its own subgroup and list the subgroups in order:
+
+```dae
+group {
+    primary-only {
+        filter: name('primary')
+    }
+    backup-only {
+        filter: name('backup')
+    }
+    preferred {
+        filter: group('primary-only', 'backup-only')
+        policy: fallback
+    }
+}
+```
+
+A URLTest group keeps its current member until another member is faster by more than `max(tolerance, 1 ms)`. A current member without a fresh measurement or with recent failures gets no such hold.
+
+TCP ranks by TCP probe latency, or by the group's `check_url` probes when set. UDP ranks by data UDP probe latency, then DNS UDP; a member without UDP measurements ranks last instead of borrowing its TCP latency. `check_url` does not affect UDP. Until any member has a UDP measurement, UDP reuses the group's TCP choice.
 
 Only missing or no-longer-member choices fall through to `default` or the first declared member. An existing chosen member without an eligible leaf does not fall back to a sibling, on either TCP or UDP: the only continuations are an explicit `final` or the same-leaf TCP last-resort rule below. A chosen nested group still applies its own policy, so URLTest may select another leaf inside that group.
 
@@ -73,6 +106,10 @@ Restricted native Group PATCH edits parser-owned source spans only when the grou
 If a group has exactly one unique leaf, no `final`, and that leaf is excluded by TCP health, honk can still dial the same leaf as a last resort, but only if the current Selector choices lead to it. This cannot bypass a chosen empty sub-group or imply a `direct` fallback. The node remains marked dead until real traffic or probes recover it; UDP keeps normal dead-member exclusion. Last-resort serving logs a rate-limited warning (60s per group).
 
 Every configured Selector TCP proxy leaf stays warm. After resolving its TCP choice, honk retains a reusable multiplexed session, a QUIC client, or one bare server TCP connection according to the leaf protocol; `direct` and `block` need no warm resource. The separate UDP warm set follows UDP selection.
+
+### URLTest cold start
+
+Before any member has a latency measurement, a connection routed to a URLTest group races members and keeps the first that connects. TCP starts at most three members, 200 ms apart. UDP starts members at 0, 30, 80 and 160 ms, then every further 80 ms, with at most three attempts at once, and sends no application data until one wins. A cold URLTest group nested in another group contributes one member and does not race.
 
 ### Score policy
 
@@ -124,16 +161,39 @@ Each challenger's pair with the selection is judged on its own shared blocks; th
 ## Filter resolution
 
 1. A standalone `group('tag')` line adds nested tags to `groups`; it is not evaluated as a node predicate. A nested tag may contribute the leaf selected by that group's current policy. A `group(...)` line containing another predicate or trailing text is reported as a diagnostic and ignored; a group whose only filter is such a line remains empty.
-2. `name(...)` matches `Node.name`. `subtag(...)` maps `Node.subscription_id` to the current subscription tag and matches that tag. Plain arguments are exact matches, `keyword:` is a substring match, and `regex:` is a raw regular expression. Matching is case-sensitive; multiple arguments in one predicate are alternatives.
+2. `name(...)` matches `Node.name`. `subtag(...)` maps `Node.subscription_id` to the current subscription tag and matches that tag. Plain arguments are exact matches, `keyword:` is a substring match, and `regex:` uses [Rust regex syntax](https://docs.rs/regex/latest/regex/#syntax). Matching is case-sensitive; multiple arguments in one predicate are alternatives. An invalid regex makes honk ignore that filter line; other filter lines still contribute members.
 3. `&&` combines predicates on one line with AND. Prefixing a predicate with `!` negates it. Separate `name(...)` and `subtag(...)` `filter:` lines combine with OR; standalone `group(...)` lines add nested candidates.
 4. Filter-derived membership is rebuilt after every subscription refresh. Stable node UUIDs therefore do not retain stale membership after their subscription provenance changes.
 5. A group with neither node filters nor nested groups receives all current nodes. Explicit `group()`, an empty filter, an empty nested group, or a filter emptied by subscription refresh selects nothing. Empty contributions remain explicit through JSON/YAML/TOML round-trips and refresh; valid sibling filters still contribute by OR, and `final` remains independent.
 
 A filter honk cannot parse is ignored and reported by its ordinal among the group's node filters, excluding only nonempty standalone `group(...)` lines; mixed lines are counted. `group()` emits `empty-subgroup`. Remove the filter for all nodes; explicit `group()` now selects none. The injected `direct` and `block` are outbounds, not pool members: an unfiltered group, `keyword:`, `regex:` and `subtag(...)` never select them, and only a filter that spells the name exactly (`filter: name(direct)`) admits one.
 
+```dae
+group {
+    paid-nodes {
+        filter: subtag(paid, regex: '^premium-') && !name(keyword: 'Expired')
+    }
+    named-nodes {
+        filter: name('primary', 'backup')
+    }
+    literal-names {
+        filter: name('a&&b', 'a,b', 'keyword: HK')
+    }
+    provider-only {
+        filter: subtag('paid') && !subtag('expired-provider')
+    }
+}
+```
+
+Quote values that contain `&&` or `,`, as in `name('a&&b')`. `name(keyword: 'HK')` matches a substring, but `name('keyword: HK')` matches a node named exactly `keyword: HK`.
+
+A node without a current subscription tag, such as an inline node, never matches `subtag(...)`, so it does match `!subtag(...)`. Add a positive `subtag(...)` when only subscription nodes should qualify.
+
+For nested groups, prefer `group('hk', 'jp')`; `group(hk|jp)` also works. Quotes do not protect `|` or `,` here: `group('hk|jp')` still adds two groups and emits `legacy-quoted-list`. Repeated tags are dropped.
+
 ## Nested groups
 
-Nested selection is depth-capped at 8. When the group manager builds the graph, it removes each cycle-closing edge and logs a warning; an unknown nested tag contributes no candidate. Each nested group contributes the single leaf selected by its own policy, so every dial ultimately resolves to one node.
+Nested tags must name declared groups; an unknown tag rejects the configuration at startup or reload with `invalid-nested-group-reference`. When the group manager builds the graph, it removes each cycle-closing edge and logs a warning. Nested selection is depth-capped at 8. Each nested group contributes the single leaf selected by its own policy, so every dial ultimately resolves to one node.
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
 
