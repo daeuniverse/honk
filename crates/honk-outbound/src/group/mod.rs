@@ -52,11 +52,11 @@ pub use state::{
     SelectorNetworks, SelectorUpdate,
 };
 
-/// Maximum nesting depth for group → sub-group resolution. Construction-
-/// time cycle breaking keeps the group graph acyclic; this bound (plus the
-/// per-resolution visited set) is defense in depth against pathological
-/// configs.
-pub const MAX_GROUP_DEPTH: usize = 8;
+/// Maximum nesting depth for group → sub-group resolution, shared with
+/// config validation and connectivity. Construction-time cycle breaking
+/// keeps the group graph acyclic; this bound (plus the per-resolution
+/// visited set) is defense in depth against pathological configs.
+pub use honk_config::group::MAX_GROUP_DEPTH;
 const _: () = assert!(MAX_GROUP_DEPTH <= u8::BITS as usize);
 
 /// Network dimension for independent group selections.
@@ -354,7 +354,7 @@ impl GroupManager {
     ) -> Self {
         let mut group_map: HashMap<String, Group> =
             groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
-        resolver::break_group_cycles(&mut group_map);
+        honk_config::group_graph::cut_cycles(&mut group_map);
         for g in groups {
             if g.check_url.is_some() && g.policy == GroupPolicy::Selector {
                 tracing::warn!(

@@ -1,6 +1,7 @@
-//! Group-graph resolution: construction-time cycle breaking, recursive
-//! candidate flattening through nested sub-groups, and the member/leaf
-//! introspection APIs (display tags vs. real nodes) built on top of them.
+//! Group-graph resolution: recursive candidate flattening through nested
+//! sub-groups, and the member/leaf introspection APIs (display tags vs. real
+//! nodes) built on top of it. Cycles are cut at construction by
+//! `honk_config::group_graph::cut_cycles`.
 
 use super::*;
 
@@ -18,7 +19,7 @@ impl GroupManager {
             .iter()
             .map(|group| (group.name.clone(), group.clone()))
             .collect();
-        break_group_cycles(&mut groups);
+        honk_config::group_graph::cut_cycles(&mut groups);
         groups
     }
 
@@ -626,69 +627,6 @@ impl GroupManager {
             choices.iter().any(Option::is_some)
         });
         *self.selector_choice.write() = state;
-    }
-}
-
-/// Break cycles in the sub-group graph before the manager starts
-/// resolving selections.
-///
-/// DFS over `Group.groups` edges; every back edge (an edge pointing at a
-/// group currently on the DFS stack) closes a cycle and is removed from
-/// the parent's `groups` list with a warning. Unknown tags are left in
-/// place — resolution skips them. The recursion paths additionally carry
-/// their own depth/visited guards, so a broken graph can warn but never
-/// hang or panic.
-pub(super) fn break_group_cycles(groups: &mut HashMap<String, Group>) {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum State {
-        Visiting,
-        Done,
-    }
-
-    fn visit(
-        name: &str,
-        groups: &HashMap<String, Group>,
-        states: &mut HashMap<String, State>,
-        cuts: &mut Vec<(String, String)>,
-    ) {
-        states.insert(name.to_string(), State::Visiting);
-        if let Some(group) = groups.get(name) {
-            for child in &group.groups {
-                if !groups.contains_key(child.as_str()) {
-                    continue;
-                }
-                match states.get(child.as_str()) {
-                    None => visit(child, groups, states, cuts),
-                    Some(State::Visiting) => cuts.push((name.to_string(), child.clone())),
-                    Some(State::Done) => {}
-                }
-            }
-        }
-        states.insert(name.to_string(), State::Done);
-    }
-
-    let mut states: HashMap<String, State> = HashMap::new();
-    let mut cuts: Vec<(String, String)> = Vec::new();
-    // Sorted start order keeps edge-cutting deterministic across runs.
-    let mut names: Vec<String> = groups.keys().cloned().collect();
-    names.sort();
-    for name in names {
-        if !states.contains_key(&name) {
-            visit(&name, groups, &mut states, &mut cuts);
-        }
-    }
-    for (parent, child) in cuts {
-        if let Some(group) = groups.get_mut(&parent) {
-            let before = group.groups.len();
-            group.groups.retain(|t| t != &child);
-            if group.groups.len() != before {
-                tracing::warn!(
-                    "nested group cycle detected: cut edge '{}' -> '{}' to break the loop",
-                    parent,
-                    child
-                );
-            }
-        }
     }
 }
 
