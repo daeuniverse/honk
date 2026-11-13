@@ -50,7 +50,7 @@
 
 ## Hosts 快照（`use_host`）
 
-`use_host` 可以重复配置。不区分大小写的 `true`、`yes`、`1` 或 `on` 加入 `/etc/hosts`。`false`、`no`、`0`、`off` 或空值不加入来源，也不会移除此前的来源。其他值都是路径。`/etc/hosts` 无论由 `true` 加入还是直接写成路径，都使用标准 `IP canonical-name aliases...` 语法；其他路径都是 OxiDNS 兼容的 `matcher IP...` 规则文件。所有来源按声明顺序各读取一次并合并为一个快照；后面的来源会覆盖前面来源中相同的精确名称或 matcher。重复路径只加载一次。
+`use_host` 可以重复配置。不区分大小写的 `true`、`yes`、`1` 或 `on` 加入 `/etc/hosts`。`false`、`no`、`0`、`off` 或空值不加入来源，也不会移除此前的来源。其他值都是路径。`/etc/hosts` 无论由 `true` 加入还是直接写成路径，都使用标准 `IP canonical-name aliases...` 语法；其他路径都是 OxiDNS 兼容的 `matcher target...` 规则文件。所有来源按声明顺序各读取一次并合并为一个快照；后面的来源会覆盖前面来源中相同的精确名称或 matcher。重复路径只加载一次。
 
 ```dae
 dns {
@@ -62,9 +62,9 @@ dns {
 
 绝对路径保持原样。相对路径依次优先使用 `global.data_dir` 下、`/var/share/honk` 下和工作目录中的已有副本；缺失路径仍定位到 `global.data_dir` 下。查询路径只使用生成的不可变快照，不执行文件 I/O。
 
-自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其地址。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
+自定义 matcher 支持 `full:example.com`（或无前缀的精确名称）、`domain:example.com`（该名称及标签边界内的所有子域）、`keyword:text` 和 `regexp:pattern`。匹配优先级依次为精确、最长 domain 后缀、首个匹配的 regexp、首个匹配的 keyword；重复定义同一 matcher 时，后者替换其目标。Full、domain 和 keyword 名称按 ASCII 大小写不敏感方式处理，并归一化末尾点。Regexp 保持大小写敏感，匹配不带末尾点的小写名称；需要忽略大小写时使用 `(?i)`。重复地址会去除。
 
-规则文件每行包含一个 matcher 和至少一个 IPv4 或 IPv6 地址。`#` 总是开始注释，且没有引号机制，因此 matcher 不能包含空白或 `#`。`hosts.txt` 示例：
+规则文件每行包含一个 matcher，后面跟一个或多个 IPv4/IPv6 地址，或恰好一个别名目标主机名。`#` 总是开始注释，且没有引号机制，因此 matcher 不能包含空白或 `#`。`hosts.txt` 示例：
 
 ```text
 full:api.example.com 192.0.2.10 2001:db8::10

@@ -50,7 +50,7 @@ Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53
 
 ## Hosts snapshot (`use_host`)
 
-`use_host` is repeatable. `true`, `yes`, `1` or `on` in any case adds `/etc/hosts`. `false`, `no`, `0`, `off` or an empty value adds nothing and does not remove earlier sources. Any other value is a path. `/etc/hosts`, whether added by `true` or written as a path, uses standard `IP canonical-name aliases...` syntax; every other path is an OxiDNS-compatible `matcher IP...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
+`use_host` is repeatable. `true`, `yes`, `1` or `on` in any case adds `/etc/hosts`. `false`, `no`, `0`, `off` or an empty value adds nothing and does not remove earlier sources. Any other value is a path. `/etc/hosts`, whether added by `true` or written as a path, uses standard `IP canonical-name aliases...` syntax; every other path is an OxiDNS-compatible `matcher target...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
 
 ```dae
 dns {
@@ -62,9 +62,9 @@ dns {
 
 Absolute paths remain explicit. Relative paths prefer an existing copy below `global.data_dir`, then an existing `/var/share/honk` copy, then an existing working-directory path. A missing path remains below `global.data_dir`; the query path uses the resulting immutable snapshot and performs no file I/O.
 
-Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its addresses. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
+Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its target. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
-A rule file has one matcher and at least one IPv4 or IPv6 address per line. `#` always starts a comment, and there is no quoting, so a matcher cannot contain whitespace or `#`. An example `hosts.txt`:
+A rule file has one matcher followed by one or more IPv4/IPv6 addresses or exactly one alias hostname per line. `#` always starts a comment, and there is no quoting, so a matcher cannot contain whitespace or `#`. An example `hosts.txt`:
 
 ```text
 full:api.example.com 192.0.2.10 2001:db8::10
