@@ -104,6 +104,48 @@ async fn a_fetch_through_a_chain_crosses_every_hop() {
     assert_eq!(*land.requests.lock(), [address]);
 }
 
+/// A download routed to a group with an `exit` dials the selected node first
+/// and leaves from the exit.
+#[tokio::test]
+async fn a_fetch_through_a_group_exit_leaves_from_the_exit() {
+    use crate::test_support::{socks5_chain, socks5_relay};
+
+    let (address, requests) = server().await;
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let nodes = socks5_chain(&front, &land)[1..].to_vec();
+    let config = Config {
+        groups: vec![Group {
+            name: "proxy".into(),
+            nodes: vec![nodes[0].id],
+            exit: Some("land".into()),
+            ..Default::default()
+        }],
+        nodes,
+        ..Default::default()
+    };
+    let routing = SharedOutbounds {
+        router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+            &config.groups,
+            &config.nodes,
+        )))),
+        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
+        ))),
+        config: Arc::new(RwLock::new(Arc::new(config))),
+        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
+    };
+    let nodes = manager(routing)
+        .fetch(&subscription(address, "proxy"))
+        .await
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(requests.lock().len(), 1);
+    assert_eq!(*front.requests.lock(), [land.addr]);
+    assert_eq!(*land.requests.lock(), [address]);
+}
+
 /// Group `score` holds two nodes dialed through [`Tunnel`], and no rule applies.
 fn scored_routing() -> (SharedOutbounds, Arc<AtomicUsize>, [Node; 2]) {
     let nodes = ["a", "b"].map(|name| {
@@ -173,7 +215,7 @@ async fn decide_score(
 
 async fn selected(routing: &SharedOutbounds) -> uuid::Uuid {
     match decide_score(routing, "127.0.0.1", None).await {
-        crate::download_route::Route::Proxy { node, .. } => node.id,
+        crate::download_route::Route::Proxy { node, .. } => node.node.id,
         _ => panic!("the Score group resolves to a proxy leaf"),
     }
 }

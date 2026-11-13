@@ -2526,7 +2526,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
                 lease.run(std::pin::pin!(async {
                     let observer = honk_outbound::runtime::flow_observation::current().unwrap();
                     let plan = observer.sync_scope(|| {
-                        resolve_outbound_plan_for_target(
+                        resolve_outbound_plan_for_target::<honk_outbound::group::OwnedTarget>(
                             config,
                             manager,
                             "catalog-root",

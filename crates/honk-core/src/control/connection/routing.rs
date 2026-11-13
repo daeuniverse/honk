@@ -3,14 +3,26 @@ use crate::control::*;
 /// Clash-style `chains`, in reverse dial order. A proxy chain node's hops
 /// extend the selection chain, so after the reversal the exit leads, then come
 /// the node and its groups, and the whole path stays visible.
+/// A route through group exits lists the hop names captured with its
+/// selection; a leaf that is its own first hop appears once.
 pub(super) fn connection_chains(
     mut selection_chain: Vec<String>,
     node: &honk_config::node::Node,
+    route_hops: Option<&[String]>,
 ) -> Vec<String> {
     if selection_chain.last() != Some(&node.name) {
         selection_chain.push(node.name.clone());
     }
-    selection_chain.extend(node.chain_hops().into_iter().flatten().cloned());
+    match route_hops {
+        Some(hops) => {
+            let hops = match hops.split_first() {
+                Some((first, rest)) if *first == node.name => rest,
+                _ => hops,
+            };
+            selection_chain.extend(hops.iter().cloned());
+        }
+        None => selection_chain.extend(node.chain_hops().into_iter().flatten().cloned()),
+    }
     selection_chain.reverse();
     selection_chain
 }
@@ -402,7 +414,7 @@ mod chains_tests {
             ..Node::default()
         };
         assert_eq!(
-            connection_chains(vec!["proxy".into(), "via".into()], &node),
+            connection_chains(vec!["proxy".into(), "via".into()], &node, None),
             ["land", "front", "via", "proxy"]
         );
         let leaf = Node {
@@ -410,8 +422,18 @@ mod chains_tests {
             ..Node::default()
         };
         assert_eq!(
-            connection_chains(vec!["proxy".into()], &leaf),
+            connection_chains(vec!["proxy".into()], &leaf, None),
             ["hk", "proxy"]
+        );
+        let route_hops = ["hk".to_owned(), "land".to_owned()];
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "hk".into()], &leaf, Some(&route_hops)),
+            ["land", "hk", "proxy"]
+        );
+        let chain_hops = ["front".to_owned(), "land".to_owned(), "exit".to_owned()];
+        assert_eq!(
+            connection_chains(vec!["proxy".into()], &node, Some(&chain_hops)),
+            ["exit", "land", "front", "via", "proxy"]
         );
     }
 }

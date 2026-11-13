@@ -5,7 +5,8 @@ use honk_config::types::DnsProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::GroupManager;
 use honk_outbound::group::{
-    ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
+    OwnedTarget, ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget,
+    SelectionNetwork, Target,
 };
 use tracing::debug;
 
@@ -15,14 +16,15 @@ use crate::routing::ConnectionInfo;
 
 pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
-    pub(super) node: Option<Node>,
+    /// The selected node or route; `None` dials direct.
+    pub(super) node: Option<OwnedTarget>,
     pub(super) feedback: Option<ScoreAttempt>,
     pub(super) observation: Option<crate::observe::flows::record::OutboundAttempt>,
 }
 
 #[derive(Default)]
 struct SelectedLeaf {
-    node: Option<Node>,
+    node: Option<OwnedTarget>,
     feedback: Option<ScoreAttempt>,
     path: crate::observe::flows::dns::SelectionPath,
 }
@@ -30,7 +32,7 @@ struct SelectedLeaf {
 impl SelectedLeaf {
     fn explicit(node: &Node) -> Self {
         Self {
-            node: Some(node.clone()),
+            node: Some(OwnedTarget::node(node.clone())),
             ..Self::default()
         }
     }
@@ -100,14 +102,17 @@ fn select_group_leaf_for_target(
         .into_iter()
         .next()
         .map(|selected| SelectedLeaf {
-            node: Some(selected.node.clone()),
-            feedback: selected.feedback,
             path: crate::observe::flows::dns::selection_path(
                 &selections,
                 &selected.selection_chain,
                 selected.node,
                 family,
             ),
+            node: Some(group_manager.own_target(Target {
+                node: selected.node,
+                route: selected.route,
+            })),
+            feedback: selected.feedback,
         })
 }
 
@@ -151,8 +156,11 @@ impl UpstreamPool {
         if let Some(node) = self.nodes.iter().find(|node| node.name == outbound) {
             return SelectedLeaf::explicit(node);
         }
+        // Only a GroupManager routes through an exit, so without one an exit
+        // group resolves to no node rather than to its bare first member.
         if self.group_manager.read().is_none()
             && let Some(group) = self.groups.iter().find(|group| group.name == outbound)
+            && group.exit.is_none()
             && let Some(node) = group
                 .nodes
                 .iter()
@@ -204,7 +212,10 @@ impl UpstreamPool {
             debug!(
                 "DNS dial leaf (forced -> {}): {:?}",
                 tag,
-                selected.node.as_ref().map(|node| node.name.as_str())
+                selected
+                    .node
+                    .as_ref()
+                    .map(|target| target.node.name.as_str())
             );
             return Ok(DnsDialRoute {
                 observation: crate::observe::flows::dns::outbound_evidence(
@@ -299,7 +310,10 @@ impl UpstreamPool {
         debug!(
             "DNS dial leaf (routed via {}): {:?}",
             outbound_name,
-            selected.node.as_ref().map(|node| node.name.as_str())
+            selected
+                .node
+                .as_ref()
+                .map(|target| target.node.name.as_str())
         );
         Ok(DnsDialRoute {
             observation: crate::observe::flows::dns::outbound_evidence(
@@ -321,6 +335,10 @@ impl UpstreamPool {
         &self,
         entry: &UpstreamEntry,
     ) -> anyhow::Result<Option<Node>> {
-        Ok(self.resolve_dial_route(entry).await?.node)
+        Ok(self
+            .resolve_dial_route(entry)
+            .await?
+            .node
+            .map(|target| target.node))
     }
 }

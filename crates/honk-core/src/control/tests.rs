@@ -3627,17 +3627,17 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         let context =
             crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
         assert!(
-            super::reload::resolve_outbound_plan_for_target(
+            super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
                 &config,
                 &manager,
                 "selector",
                 &context,
                 crate::control::reload::OutboundConstraint::Any
             )
-            .nodes
+            .targets
             .is_empty()
         );
-        let plan = super::reload::resolve_outbound_plan_for_target(
+        let plan = super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
             &config,
             &manager,
             "selector-final",
@@ -3646,7 +3646,7 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         );
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(
-            plan.nodes
+            plan.targets
                 .iter()
                 .map(|node| node.name.as_str())
                 .collect::<Vec<_>>(),

@@ -13,6 +13,9 @@ pub(in crate::group) struct ScoreSelectionRules<'a> {
     pub(in crate::group) cold_urltest: bool,
     pub(in crate::group) allow_trials: bool,
     pub(in crate::group) excluded: Option<&'a ExcludedScoreLeaf<'a>>,
+    /// The root group's `routes`: false when no group the root reaches has
+    /// an exit, so nested levels skip their exit checks. True when unknown.
+    pub(in crate::group) routes: bool,
 }
 
 impl Default for ScoreSelectionRules<'_> {
@@ -21,6 +24,7 @@ impl Default for ScoreSelectionRules<'_> {
             cold_urltest: false,
             allow_trials: true,
             excluded: None,
+            routes: true,
         }
     }
 }
@@ -36,11 +40,15 @@ impl super::GroupManager {
     /// policy change; new selection creates feedback only for Score groups.
     pub fn publish_score_membership(&self) {
         let groups = self.groups.keys().cloned().collect::<Vec<_>>();
-        let membership = self.groups.values().flat_map(|group| {
-            self.reachable_leaf_nodes_in_group(&group.name)
-                .into_iter()
-                .map(move |node| (group.name.clone(), node.id))
-        });
+        let membership = self
+            .groups
+            .values()
+            .map(|entry| &entry.group)
+            .flat_map(|group| {
+                self.reachable_leaf_nodes_in_group(&group.name)
+                    .into_iter()
+                    .map(move |node| (group.name.clone(), node.id))
+            });
         self.score_state
             .publish_generation(Arc::clone(&self.score_authority), groups, membership);
     }
@@ -56,6 +64,7 @@ impl super::GroupManager {
         let attributions: Vec<_> = self
             .groups
             .values()
+            .map(|entry| &entry.group)
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
             .filter(|group| self.group_reaches_node(&group.name, node_id))
             .map(|group| ScoreAttribution {
@@ -85,6 +94,7 @@ impl super::GroupManager {
         let attributions: Vec<_> = self
             .groups
             .values()
+            .map(|entry| &entry.group)
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
             .filter(|group| group.check_url.as_deref().unwrap_or(default_probe_url) == probe_url)
             .filter(|group| self.group_reaches_node(&group.name, node_id))
@@ -115,6 +125,7 @@ impl super::GroupManager {
     ) -> Option<ScoreFeedback> {
         self.groups
             .get(group_name)
+            .map(|entry| &entry.group)
             .filter(|group| group.policy == honk_config::group::GroupPolicy::Score)
             .filter(|_| self.score_state.is_current_authority(&self.score_authority))
             .map(|group| {
@@ -171,7 +182,7 @@ impl super::GroupManager {
         original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
         observation::capture(|| {
-            let Some(group) = self.groups.get(group_name) else {
+            let Some(entry) = self.groups.get(group_name) else {
                 observation::gap();
                 return super::ScoreSelectionPlan {
                     mode: super::SelectionPlanMode::Authoritative,
@@ -180,6 +191,7 @@ impl super::GroupManager {
                     observation: None,
                 };
             };
+            let group = &entry.group;
             let pinned = group.policy == honk_config::group::GroupPolicy::URLTest
                 && self.selector_member(group, context.network).is_some();
             if group.policy != honk_config::group::GroupPolicy::URLTest || pinned {
@@ -194,6 +206,7 @@ impl super::GroupManager {
                             super::SelectionPlanMode::Authoritative,
                             context,
                             original,
+                            entry.routes,
                         )
                     },
                 );
@@ -212,6 +225,7 @@ impl super::GroupManager {
                         super::SelectionEffects::Peek,
                         ScoreSelectionRules {
                             allow_trials: false,
+                            routes: entry.routes,
                             ..Default::default()
                         },
                     );
@@ -219,7 +233,8 @@ impl super::GroupManager {
                         candidates,
                         context.probe_domain,
                         context.health_family,
-                        group.check_url.as_deref(),
+                        group,
+                        entry.routes,
                     );
                     observation::metric("sorting_latency", None);
                     observation::reason("retry_candidates_pending");
@@ -236,6 +251,7 @@ impl super::GroupManager {
                         .take(3)
                         .map(|mut candidate| {
                             candidate.selection_chain.insert(0, group.name.as_str());
+                            candidate.exit_on_path |= group.exit.is_some();
                             candidate
                         })
                         .collect();
@@ -244,6 +260,7 @@ impl super::GroupManager {
                         super::SelectionPlanMode::Authoritative,
                         context,
                         original,
+                        entry.routes,
                     )
                 },
             )
@@ -283,30 +300,30 @@ impl super::GroupManager {
         mode: super::SelectionPlanMode,
         context: &ScoreSelectionContext,
         original: Option<&ScoreContinuation>,
+        routes: bool,
     ) -> super::ScoreSelectionPlan<'a> {
         let mut opportunity = original.map(|original| Arc::clone(&original.opportunity));
         super::ScoreSelectionPlan {
             mode,
             health_family: context.health_family,
             observation: None,
-            entries: candidates
-                .into_iter()
-                .map(|candidate| {
-                    let attributions: Vec<_> = candidate
-                        .attribution
-                        .into_iter()
-                        .map(|group| ScoreAttribution {
-                            group: group.to_string(),
-                            node_id: candidate.node.id,
-                        })
-                        .collect();
-                    let selection_chain = candidate
-                        .selection_chain
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect();
-                    let feedback =
-                        (!attributions.is_empty()).then(|| {
+            entries: {
+                let mut entry =
+                    |candidate: super::Candidate<'a>, target: crate::group::Target<'a>| {
+                        let attributions: Vec<_> = candidate
+                            .attribution
+                            .into_iter()
+                            .map(|group| ScoreAttribution {
+                                group: group.to_string(),
+                                node_id: candidate.node.id,
+                            })
+                            .collect();
+                        let selection_chain = candidate
+                            .selection_chain
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect();
+                        let feedback = (!attributions.is_empty()).then(|| {
                             ScoreAttempt::planned(
                                 ScoreFeedback::new(
                                     Arc::clone(&self.score_state),
@@ -326,18 +343,45 @@ impl super::GroupManager {
                                 },
                             )
                         });
-                    super::ScoreSelectionEntry {
-                        node: candidate.node,
-                        feedback,
-                        selection_chain,
-                        final_owners: candidate
-                            .final_owners
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect(),
-                    }
-                })
-                .collect(),
+                        super::ScoreSelectionEntry {
+                            node: target.node,
+                            route: target.route,
+                            feedback,
+                            selection_chain,
+                            final_owners: candidate
+                                .final_owners
+                                .into_iter()
+                                .map(str::to_owned)
+                                .collect(),
+                        }
+                    };
+                if routes {
+                    // Sized up front: `filter_map` gives `collect` no exact
+                    // length, so it would grow the Vec instead.
+                    let mut entries = Vec::with_capacity(candidates.len());
+                    entries.extend(candidates.into_iter().filter_map(|candidate| {
+                        let target = self.routed_chain(&candidate, context.network)?;
+                        Some(entry(candidate, target))
+                    }));
+                    entries
+                } else {
+                    // Without a route every candidate dials its leaf, so the
+                    // plan keeps the exact-length collect and no route test.
+                    debug_assert!(
+                        candidates
+                            .iter()
+                            .all(|candidate| self.dials_its_leaf(candidate, context.network)),
+                        "a candidate under a root without routes does not dial its leaf"
+                    );
+                    candidates
+                        .into_iter()
+                        .map(|candidate| {
+                            let target = crate::group::Target::node(candidate.node);
+                            entry(candidate, target)
+                        })
+                        .collect()
+                }
+            },
         }
     }
 
@@ -367,20 +411,21 @@ impl super::GroupManager {
         excluded: Option<&ExcludedScoreLeaf<'_>>,
         original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             observation::gap();
             return self.score_selection_plan(
                 Vec::new(),
                 super::SelectionPlanMode::Authoritative,
                 context,
                 original,
+                false,
             );
         };
         if effects.applies() {
             self.mark_used(group_name);
         }
         let (mode, candidates) = self.selection_candidates_for_target(
-            group,
+            &entry.group,
             context,
             &mut Vec::new(),
             0,
@@ -389,9 +434,10 @@ impl super::GroupManager {
                 cold_urltest: excluded.is_none(),
                 allow_trials: excluded.is_none() && original.is_none(),
                 excluded,
+                routes: entry.routes,
             },
         );
-        self.score_selection_plan(candidates, mode, context, original)
+        self.score_selection_plan(candidates, mode, context, original, entry.routes)
     }
 
     pub(in crate::group) fn selection_candidates_for_target<'a>(
@@ -406,6 +452,12 @@ impl super::GroupManager {
         observation::decision(group, context.health_family, effects, || {
             if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
                 observation::reason("resolution_limit");
+                return (super::SelectionPlanMode::Authoritative, Vec::new());
+            }
+            // Routes are TCP only. Offering none here, before any policy runs,
+            // lets a parent pick a UDP-capable sibling instead.
+            if context.network == SelectionNetwork::Udp && group.exit.is_some() {
+                observation::reason("exit_tcp_only");
                 return (super::SelectionPlanMode::Authoritative, Vec::new());
             }
             let (mut mode, mut candidates, mut ordinary) =
@@ -465,6 +517,7 @@ impl super::GroupManager {
                                 attribution: Vec::new(),
                                 pool_bound: 0,
                                 selection_chain: vec![node.name.as_str()],
+                                exit_on_path: false,
                                 final_owners: Vec::new(),
                                 score_work: Vec::new(),
                             });
@@ -497,6 +550,14 @@ impl super::GroupManager {
                         }
                     }
                 }
+                if group.exit.is_some() {
+                    candidates = self.retain_final_exit_selectable(
+                        candidates,
+                        group,
+                        context.probe_domain,
+                        context.health_family,
+                    );
+                }
                 if mode == super::SelectionPlanMode::ColdUrlTest && !candidates.is_empty() {
                     observation::selected(None, "final_candidates_pending");
                 } else {
@@ -516,6 +577,7 @@ impl super::GroupManager {
                     candidate.attribution.insert(0, group.name.as_str());
                 }
                 candidate.selection_chain.insert(0, group.name.as_str());
+                candidate.exit_on_path |= group.exit.is_some();
             }
             (mode, candidates)
         })
@@ -588,7 +650,8 @@ impl super::GroupManager {
             candidates,
             context.probe_domain,
             context.health_family,
-            group.check_url.as_deref(),
+            group,
+            self.has_exits() && rules.routes,
         );
         let health_filtered =
             before_filter.and_then(|before| super::removed_unique_candidates(before, &candidates));
@@ -743,6 +806,7 @@ impl super::GroupManager {
                 attribution: Vec::new(),
                 pool_bound: 0,
                 selection_chain: vec![node.name.as_str()],
+                exit_on_path: false,
                 final_owners: Vec::new(),
                 score_work: Vec::new(),
             });
@@ -755,7 +819,7 @@ impl super::GroupManager {
             ) {
                 return None;
             }
-            let subgroup = self.groups.get(tag)?;
+            let subgroup = &self.groups.get(tag)?.group;
             self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects, rules)
                 .filter(|candidate| candidate.node.id == node.id)
                 .map(|mut candidate| {
@@ -845,13 +909,14 @@ impl super::GroupManager {
                 attribution: Vec::new(),
                 pool_bound: 0,
                 selection_chain: vec![node.name.as_str()],
+                exit_on_path: false,
                 final_owners: Vec::new(),
                 score_work: Vec::new(),
             })
             .collect();
         let mut withdrawn = Vec::new();
         for tag in &group.groups {
-            let Some(subgroup) = self.groups.get(tag.as_str()) else {
+            let Some(subgroup) = self.groups.get(tag.as_str()).map(|entry| &entry.group) else {
                 observation::gap();
                 continue;
             };
@@ -894,7 +959,8 @@ impl super::GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<(String, ScoreVerificationSnapshot)> {
-        let group = self.groups.get(group_name)?;
+        let entry = self.groups.get(group_name)?;
+        let group = &entry.group;
         if group.policy != honk_config::group::GroupPolicy::Score {
             return None;
         }
@@ -905,13 +971,17 @@ impl super::GroupManager {
             &mut Vec::new(),
             0,
             super::SelectionEffects::Peek,
-            ScoreSelectionRules::default(),
+            ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
         );
         let candidates = self.filter_alive_candidates(
             candidates,
             context.probe_domain,
             context.health_family,
-            group.check_url.as_deref(),
+            group,
+            entry.routes,
         );
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
@@ -943,7 +1013,7 @@ impl super::GroupManager {
         if self
             .groups
             .get(group_name)
-            .is_none_or(|group| group.policy != honk_config::group::GroupPolicy::Score)
+            .is_none_or(|entry| entry.group.policy != honk_config::group::GroupPolicy::Score)
         {
             return ScoreVerificationCounters::default();
         }
@@ -976,16 +1046,19 @@ impl super::GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<String> {
-        let group = self.groups.get(group_name)?;
+        let entry = self.groups.get(group_name)?;
         let context = Self::aggregate_score_context(network);
         let mut visited = Vec::new();
         self.pick_candidate_for_target(
-            group,
+            &entry.group,
             &context,
             &mut visited,
             0,
             super::SelectionEffects::Peek,
-            ScoreSelectionRules::default(),
+            ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
         )
         .map(|candidate| candidate.tag().to_owned())
     }

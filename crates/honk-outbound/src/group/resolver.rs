@@ -24,14 +24,14 @@ impl GroupManager {
     }
 
     pub fn group(&self, name: &str) -> Option<&Group> {
-        self.groups.get(name)
+        self.groups.get(name).map(|entry| &entry.group)
     }
 
     pub fn group_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
         self.groups
             .get(name)
             .into_iter()
-            .flat_map(|group| self.members(group))
+            .flat_map(|entry| self.members(&entry.group))
     }
 
     /// Enumerate unique ordinary leaves, stopping before exceeding the request limit.
@@ -64,7 +64,7 @@ impl GroupManager {
         if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&name) {
             return true;
         }
-        let Some(group) = self.groups.get(name) else {
+        let Some(group) = self.groups.get(name).map(|entry| &entry.group) else {
             return true;
         };
         let cost = 1usize
@@ -125,7 +125,7 @@ impl GroupManager {
         name: &str,
         network: SelectionNetwork,
     ) -> Option<GroupSelection<'_>> {
-        self.peek_selection_inner(self.groups.get(name)?, network, 0)
+        self.peek_selection_inner(&self.groups.get(name)?.group, network, 0)
     }
 
     fn peek_selection_inner<'a>(
@@ -189,10 +189,13 @@ impl GroupManager {
 
 impl GroupManager {
     /// Resolve a group to the single leaf node its policy selects.
-    /// `visited`/`depth` thread the cycle/depth guards through nesting.
+    /// `visited`/`depth` thread the cycle/depth guards through nesting;
+    /// `routes` is the root's, as in `ScoreSelectionRules::routes`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn pick_in_group<'a>(
         &'a self,
         group: &'a Group,
+        routes: bool,
         domain: ProbeDomain,
         ipver: IpVersion,
         visited: &mut Vec<&'a str>,
@@ -209,7 +212,10 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            score::selection::ScoreSelectionRules::default(),
+            score::selection::ScoreSelectionRules {
+                routes,
+                ..Default::default()
+            },
         )
         .map(|candidate| candidate.node)
     }
@@ -253,7 +259,7 @@ impl GroupManager {
                 group
                     .groups
                     .iter()
-                    .filter_map(move |tag| self.groups.get(tag))
+                    .filter_map(move |tag| self.groups.get(tag).map(|entry| &entry.group))
                     .map(GroupMember::Group),
             )
     }
@@ -268,10 +274,11 @@ impl GroupManager {
         match name {
             Config::BUILTIN_DIRECT_NODE => Some(GroupMember::Node(&DIRECT)),
             Config::BUILTIN_BLOCK_NODE => Some(GroupMember::Node(&BLOCK)),
-            _ => self
-                .node_by_name(name)
-                .map(GroupMember::Node)
-                .or_else(|| self.groups.get(name).map(GroupMember::Group)),
+            _ => self.node_by_name(name).map(GroupMember::Node).or_else(|| {
+                self.groups
+                    .get(name)
+                    .map(|entry| GroupMember::Group(&entry.group))
+            }),
         }
     }
 
@@ -296,7 +303,7 @@ impl GroupManager {
     /// appear under their own tag, not expanded to leaves. Use
     /// [`GroupManager::reachable_leaf_nodes_in_group`] for health and connectivity.
     pub fn node_names_in_group(&self, group_name: &str) -> Vec<String> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return vec![];
         };
         self.member_tags(group)
@@ -389,7 +396,7 @@ impl GroupManager {
         if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&group_name) {
             return false;
         }
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return false;
         };
         visited[depth] = group.name.as_str();
@@ -442,7 +449,7 @@ impl GroupManager {
                 let mut result = group.nodes.iter().find_map(|id| self.nodes.get(id));
                 if result.is_none() {
                     for tag in &group.groups {
-                        if let Some(sub) = self.groups.get(tag) {
+                        if let Some(sub) = self.groups.get(tag).map(|entry| &entry.group) {
                             result = self.first_leaf(sub, visited, depth + 1, respect_selectors);
                             if result.is_some() {
                                 break;
@@ -483,7 +490,7 @@ impl GroupManager {
         network: SelectionNetwork,
     ) -> (Vec<String>, Option<&Node>) {
         let mut chain = vec![group_name.to_string()];
-        let Some(mut group) = self.groups.get(group_name) else {
+        let Some(mut group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return (chain, None);
         };
         for _ in 0..MAX_GROUP_DEPTH {
@@ -531,7 +538,7 @@ impl GroupManager {
     /// Nested policies use their stable current selection; a cold/invalid
     /// chain falls back to the production network pick without mutating it.
     pub fn selector_warm_node(&self, group_name: &str, network: SelectionNetwork) -> Option<&Node> {
-        let group = self.groups.get(group_name)?;
+        let group = &self.groups.get(group_name)?.group;
         if group.policy != GroupPolicy::Selector {
             return None;
         }
@@ -563,7 +570,7 @@ impl GroupManager {
 
     /// [`Self::delay_test_members`] keeping each direct member's identity.
     pub fn delay_test_targets(&self, group_name: &str) -> Vec<(GroupMember<'_>, &Node)> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return vec![];
         };
         let mut out: Vec<(GroupMember<'_>, &Node)> = Vec::new();
@@ -577,7 +584,7 @@ impl GroupManager {
             }
         }
         for tag in &group.groups {
-            let Some(sub) = self.groups.get(tag.as_str()) else {
+            let Some(sub) = self.groups.get(tag.as_str()).map(|entry| &entry.group) else {
                 continue;
             };
             let mut visited = Vec::new();
@@ -587,6 +594,7 @@ impl GroupManager {
             let leaf = self
                 .pick_in_group(
                     sub,
+                    true,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
                     &mut visited,

@@ -27,7 +27,12 @@ pub struct ProxyDial {
     /// Immutable outbound generation captured by the owning DNS runtime.
     /// Legacy unit-test pools may omit it and use the node path directly.
     pub generation: Option<Arc<honk_outbound::runtime::OutboundRuntimeRegistry>>,
+    /// The selected node, or a route's leaf.
     pub node: Node,
+    /// The route through group exits `node` dials as, if any. It runs only on
+    /// a captured generation's hop runtimes, and DNS packet transports
+    /// (DoQ, DoH3) reject it.
+    pub route: Option<honk_config::route::Route>,
 }
 
 pub(super) enum PacketAdmission<'a> {
@@ -152,16 +157,16 @@ impl DialContext {
                 |address, budget, _| async move {
                     let dial = async {
                         if let Some(generation) = &proxy.generation {
+                            let dial = match &proxy.route {
+                                Some(route) => honk_outbound::proxy::DialRef::Route(route),
+                                None => honk_outbound::proxy::DialRef::Node(proxy.node.id),
+                            };
                             proxy
                                 .registry
-                                .dial_runtime(
-                                    Arc::clone(generation),
-                                    proxy.node.id,
-                                    address,
-                                    None,
-                                    budget,
-                                )
+                                .dial_ref(Arc::clone(generation), dial, address, None, budget)
                                 .await
+                        } else if proxy.route.is_some() {
+                            anyhow::bail!("a route needs a runtime generation")
                         } else {
                             proxy
                                 .registry
@@ -169,7 +174,11 @@ impl DialContext {
                                 .await
                         }
                     };
-                    let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
+                    let dial = crate::observe::flows::dns::outbound_dial_scope(
+                        &proxy.node,
+                        proxy.route.is_some(),
+                        dial,
+                    );
                     dial.await
                 },
             )
@@ -184,7 +193,10 @@ impl DialContext {
     }
 
     pub(super) fn packet_admission(&self) -> Option<PacketAdmission<'_>> {
-        match self.proxy.as_ref().map(|proxy| proxy.node.protocol()) {
+        match self.proxy.as_ref().map(|proxy| match proxy.route {
+            Some(_) => honk_config::types::NodeProtocol::Chain,
+            None => proxy.node.protocol(),
+        }) {
             None
             | Some(
                 honk_config::types::NodeProtocol::Direct
@@ -205,6 +217,9 @@ impl DialContext {
         let Some(proxy) = &self.proxy else {
             anyhow::bail!("packet transport requested without proxy")
         };
+        if proxy.route.is_some() {
+            anyhow::bail!("DNS packet transport does not support a route through group exits")
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             anyhow::bail!("DNS proxy packet setup deadline elapsed")
@@ -240,7 +255,11 @@ impl DialContext {
                 None => transport,
             })
         };
-        let dial = crate::observe::flows::dns::outbound_dial_scope(&proxy.node, dial);
+        let dial = crate::observe::flows::dns::outbound_dial_scope(
+            &proxy.node,
+            proxy.route.is_some(),
+            dial,
+        );
         dial.await
     }
 }

@@ -85,7 +85,7 @@ pub(crate) mod flows {
         }
 
         #[inline]
-        pub(crate) fn outbound_dial_scope<F: Future>(_node: &Node, future: F) -> F {
+        pub(crate) fn outbound_dial_scope<F: Future>(_node: &Node, _routed: bool, future: F) -> F {
             future
         }
 
@@ -176,7 +176,7 @@ pub(crate) mod flows {
             _outbound: &str,
             _routing_source: crate::observe::vocab::RoutingSource,
             _evaluation_id: Option<String>,
-            _node: Option<&Node>,
+            _dialed: Option<&honk_outbound::group::OwnedTarget>,
             _target: SocketAddr,
             _selection_path: SelectionPath,
         ) -> Option<OutboundAttempt> {

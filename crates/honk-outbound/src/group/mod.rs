@@ -107,7 +107,10 @@ pub struct SelectionPlan<'a> {
 }
 #[derive(Clone)]
 pub struct ScoreSelectionEntry<'a> {
+    /// The configured node to dial, or a route's leaf.
     pub node: &'a Node,
+    /// The route through group exits, when `node` dials as its leaf.
+    pub route: Option<Box<honk_config::route::Route>>,
     pub feedback: Option<ScoreAttempt>,
     pub selection_chain: Vec<String>,
     /// Owners of group-valued final edges traversed by this entry, valid only
@@ -204,6 +207,9 @@ struct Candidate<'a> {
     /// Pool obligations aligned with `attribution`, excluding each owner's explicit final or pin.
     pool_bound: u8,
     selection_chain: Vec<&'a str>,
+    /// Whether a group on `selection_chain` has an exit. Without one the
+    /// candidate dials its leaf, and no exit check has to look it up.
+    exit_on_path: bool,
     final_owners: Vec<&'a str>,
     score_work: Vec<Arc<score::budget::Work>>,
 }
@@ -287,8 +293,27 @@ fn removed_unique_candidates(
     Some(before)
 }
 
+/// A group as this manager selects through it: its cycle-cut copy and
+/// whether selection from it can produce a route (`Exits::build`).
+struct ManagedGroup {
+    group: Group,
+    routes: bool,
+}
+
+impl std::borrow::Borrow<Group> for ManagedGroup {
+    fn borrow(&self) -> &Group {
+        &self.group
+    }
+}
+
+impl std::borrow::BorrowMut<Group> for ManagedGroup {
+    fn borrow_mut(&mut self) -> &mut Group {
+        &mut self.group
+    }
+}
+
 pub struct GroupManager {
-    groups: HashMap<String, Group>,
+    groups: HashMap<String, ManagedGroup>,
     /// Node lookup by UUID.
     nodes: HashMap<uuid::Uuid, Node>,
     node_order: Vec<uuid::Uuid>,
@@ -313,6 +338,8 @@ pub struct GroupManager {
     score_state: Arc<ScorePolicyState>,
     score_authority: Arc<score::ScoreAuthority>,
     transport_quality: RwLock<Vec<score::TransportQualitySource>>,
+    /// Exit edges and chain hops, only when some group has an `exit`.
+    exits: Option<Box<exit::Exits>>,
 }
 
 impl GroupManager {
@@ -320,8 +347,8 @@ impl GroupManager {
         let mut group_names: Vec<_> = self
             .groups
             .values()
-            .filter(|group| group.policy == GroupPolicy::Score)
-            .map(|group| group.name.clone())
+            .filter(|entry| entry.group.policy == GroupPolicy::Score)
+            .map(|entry| entry.group.name.clone())
             .collect();
         group_names.sort_unstable();
         self.score_state.reason_snapshot(group_names)
@@ -352,9 +379,17 @@ impl GroupManager {
         alive_set: Option<Arc<AliveDialerSet>>,
         score_state: Arc<ScorePolicyState>,
     ) -> Self {
-        let mut group_map: HashMap<String, Group> =
-            groups.iter().map(|g| (g.name.clone(), g.clone())).collect();
-        honk_config::group_graph::cut_cycles(&mut group_map);
+        let mut managed: HashMap<String, ManagedGroup> = groups
+            .iter()
+            .map(|group| {
+                let entry = ManagedGroup {
+                    group: group.clone(),
+                    routes: false,
+                };
+                (group.name.clone(), entry)
+            })
+            .collect();
+        honk_config::group_graph::cut_cycles(&mut managed);
         for g in groups {
             if g.check_url.is_some() && g.policy == GroupPolicy::Selector {
                 tracing::warn!(
@@ -364,7 +399,8 @@ impl GroupManager {
             }
         }
         Self {
-            groups: group_map,
+            exits: exit::Exits::build(groups, nodes, &mut managed),
+            groups: managed,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
             node_order: nodes.iter().map(|node| node.id).collect(),
             alive_set,
@@ -402,7 +438,8 @@ impl GroupManager {
         domain: ProbeDomain,
         ipver: IpVersion,
     ) -> Option<&Node> {
-        let group = self.groups.get(group_name)?;
+        let entry = self.groups.get(group_name)?;
+        let group = &entry.group;
         self.mark_used(group_name);
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
@@ -418,6 +455,7 @@ impl GroupManager {
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
             group,
+            entry.routes,
             domain,
             ipver,
             &mut visited,
@@ -488,14 +526,28 @@ impl GroupManager {
         ipver: IpVersion,
         effects: SelectionEffects,
     ) -> SelectionPlan<'_> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             return SelectionPlan {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: vec![],
             };
         };
+        self.selection_plan_for_group(&entry.group, entry.routes, domain, ipver, effects)
+    }
+
+    // Inlined into both callers: an out-of-line call here added about 25
+    // instructions to every direct selector plan.
+    #[inline(always)]
+    fn selection_plan_for_group<'a>(
+        &'a self,
+        group: &'a Group,
+        routes: bool,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        effects: SelectionEffects,
+    ) -> SelectionPlan<'a> {
         if effects.applies() {
-            self.mark_used(group_name);
+            self.mark_used(&group.name);
         }
         if group.policy == GroupPolicy::Selector
             && group.groups.is_empty()
@@ -523,6 +575,7 @@ impl GroupManager {
             effects,
             score::selection::ScoreSelectionRules {
                 cold_urltest: true,
+                routes,
                 ..Default::default()
             },
         );
@@ -537,14 +590,14 @@ impl GroupManager {
 
     /// Get the group's policy.
     pub fn get_group_policy(&self, name: &str) -> Option<GroupPolicy> {
-        self.groups.get(name).map(|g| g.policy)
+        self.groups.get(name).map(|entry| entry.group.policy)
     }
 
     /// Get the `final_outbound` fallback name, if configured.
     pub fn get_final_outbound(&self, group_name: &str) -> Option<String> {
         self.groups
             .get(group_name)
-            .and_then(|g| g.final_outbound.clone())
+            .and_then(|entry| entry.group.final_outbound.clone())
     }
 
     /// First declared node with this display name; finals and API lookups agree
@@ -575,24 +628,37 @@ impl GroupManager {
         if limit == 0 {
             return Vec::new();
         }
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(entry) = self.groups.get(group_name) else {
             return Vec::new();
         };
-        self.ranked_udp_leaves_in_group(group, ipver, limit, &mut Vec::new(), 0)
+        self.ranked_udp_leaves_in_group(
+            &entry.group,
+            entry.routes,
+            ipver,
+            limit,
+            &mut Vec::new(),
+            0,
+        )
     }
 
+    /// `routes` is the root's: when selection from it can produce no route,
+    /// no group under it has an exit to check.
     fn ranked_udp_leaves_in_group<'a>(
         &'a self,
         group: &'a Group,
+        routes: bool,
         ipver: IpVersion,
         limit: usize,
         visited: &mut Vec<&'a str>,
         depth: usize,
     ) -> Vec<&'a Node> {
-        if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
+        if depth >= MAX_GROUP_DEPTH
+            || visited.contains(&group.name.as_str())
+            || group.exit.is_some()
+        {
             return Vec::new();
         }
-        let candidates = self.flatten_candidates(
+        let mut candidates = self.flatten_candidates(
             group,
             ProbeDomain::DataUdp,
             ipver,
@@ -600,12 +666,14 @@ impl GroupManager {
             depth,
             SelectionEffects::Peek,
         );
-        let candidates = self.filter_alive_candidates(
-            candidates,
-            ProbeDomain::DataUdp,
-            ipver,
-            group.check_url.as_deref(),
-        );
+        if routes {
+            candidates.retain(|candidate| {
+                self.routed_chain(candidate, SelectionNetwork::Udp)
+                    .is_some()
+            });
+        }
+        let candidates =
+            self.filter_alive_candidates(candidates, ProbeDomain::DataUdp, ipver, group, routes);
         if candidates.is_empty() {
             return match self.final_member(group) {
                 Some(GroupMember::Node(node)) => self
@@ -617,6 +685,7 @@ impl GroupManager {
                     visited.push(group.name.as_str());
                     let leaves = self.ranked_udp_leaves_in_group(
                         final_group,
+                        routes,
                         ipver,
                         limit,
                         visited,
@@ -646,12 +715,16 @@ impl GroupManager {
     }
 }
 
+mod exit;
 mod filter;
 pub mod observation;
 mod policy;
 mod resolver;
 mod score;
 mod state;
+mod target;
+
+pub use target::{DialKey, OwnedTarget, RoutedTarget, Target};
 
 #[cfg(test)]
 mod tests;
