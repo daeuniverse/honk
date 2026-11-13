@@ -156,6 +156,7 @@ impl Outbounds<'_> {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         let (outbound, rule) = match detour {
             None => {

@@ -45,8 +45,11 @@ routing {
 | `mac(...)` | 源 MAC 地址，写作 `aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff`、`aabb.ccdd.eeff` 或 `aabbccddeeff`，不区分大小写 | `mac` |
 | `ipversion(...)` | `4`/`ipv4`、`6`/`ipv6`，不区分大小写 | `ip_version` |
 | `dscp(...)` | 十进制或带 `0x`/`0X` 前缀的十六进制值；数据包的 DSCP 值为 `0` 到 `63` | `dscp` |
+| `user(...)` | 精确匹配的 `inbound`（`socks5` 或 `http`）认证用户名 | `user` |
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
+
+`user(...)` 只匹配通过认证的入站会话（SOCKS5 或 HTTP(S)，对应 mihomo 的 `in-user`）；透明接管的流量从不携带用户，因此正向 `user(...)` 不可能匹配接管流量，`!user(...)` 则恒匹配接管流量。内核数据路径看不到用户名，`user(...)` 仅在用户态控制平面参与选择出站：要求用户名的规则在 eBPF 匹配器中不可达，其否定形式也不在内核侧构成约束。只有 TCP 流能命中 `user(...)`。
 
 domain 模式、后缀、关键字、正则表达式与 `geosite` 都是同一条件内的备选，
 因此 `domain(geosite: netflix, suffix: imgur.com)` 命中任一即可。同一规则中

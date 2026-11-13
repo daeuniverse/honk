@@ -104,6 +104,7 @@ fn geoip_source_conditions_do_not_expand_into_false_trace_overflow() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
     let observed = router.route_full_observed(&connection, None, MAX_RULE_VALUES);
     assert_eq!(observed.matched.unwrap().action.outbound, "direct");

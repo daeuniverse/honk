@@ -16,7 +16,10 @@ use super::observation::ConnectionObservation;
 use crate::observe::catalog::CatalogIdentity;
 
 mod dial;
+mod http;
+mod proxy;
 mod score;
+mod socks5;
 mod terminal;
 
 use score::{

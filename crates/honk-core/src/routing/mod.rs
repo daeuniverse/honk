@@ -103,6 +103,8 @@ pub struct ConnectionInfo {
     pub process_name: Option<String>,
     pub mac: Option<String>,
     pub dscp: Option<u8>,
+    /// Authenticated SOCKS5 inbound user, absent for intercepted traffic.
+    pub user: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,6 +118,7 @@ pub(crate) struct PredicateInput<'a> {
     pub(crate) process_name: Option<&'a str>,
     pub(crate) mac: Option<&'a str>,
     pub(crate) dscp: Option<u8>,
+    pub(crate) user: Option<&'a str>,
 }
 
 /// Human-readable connection identity for routing debug logs.
@@ -501,6 +504,7 @@ impl Router {
             process_name: conn.process_name.as_deref(),
             mac: conn.mac.as_deref(),
             dscp: conn.dscp,
+            user: conn.user.as_deref(),
         };
         !route.conditions.is_empty()
             && route
@@ -571,6 +575,13 @@ impl Router {
                     bounded_any::<BOUNDED, _>(macs, deadline, |value| *value == mac)
                 })
             }),
+            // Exact-match like mihomo's `in-user`. A missing user is a miss
+            // before negation, so `!user(...)` matches intercepted traffic.
+            CompiledPredicate::User(names) => Some(
+                input
+                    .user
+                    .is_some_and(|user| names.iter().any(|name| name == user)),
+            ),
         }
     }
 
@@ -635,6 +646,7 @@ fn append_conditions(
     let geosites = field!(geosite);
     let ip_versions = field!(ip_version);
     let dscps = field!(dscp);
+    let users = field!(user);
     if !domains.is_empty()
         || !domain_suffixes.is_empty()
         || !domain_keywords.is_empty()
@@ -745,6 +757,14 @@ fn append_conditions(
                             .ok()
                     })
                     .collect(),
+            ),
+        });
+    }
+    if !users.is_empty() {
+        conditions.push(CompiledCondition {
+            not,
+            predicate: CompiledPredicate::User(
+                users.iter().map(|name| name.trim().to_owned()).collect(),
             ),
         });
     }

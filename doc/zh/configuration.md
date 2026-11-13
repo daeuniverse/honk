@@ -11,6 +11,7 @@ honk 使用 dae 配置语法的方言；与 dae 的已知差异见[方言参考]
 | `group` | 在节点与嵌套组之间选择。 | [组参考](./reference/groups.md) |
 | `routing` | 应用有序流量规则与默认出站。 | [路由参考](./reference/routing.md) |
 | `dns` | 配置监听、上游、请求/响应策略与缓存行为。 | [DNS 参考](./reference/dns.md) |
+| `inbound` | 提供经过认证的 SOCKS5 与 HTTP(S) 代理监听，其共享用户表参与路由规则。 | [入站代理监听](#入站代理监听) |
 | `subscription` | 获取远程节点列表。 | [订阅参考](./reference/subscription.md) |
 | `assets` | 为 geodata、外部 UI 和订阅设置下载默认值。 | [Assets 参考](./reference/assets.md) |
 | `experimental` | 启用独立原生 API、Clash API 或持久化缓存。 | [Experimental 参考](./reference/experimental.md) |
@@ -322,6 +323,32 @@ dns {
 `client_subnet` 默认关闭。需要确定性的 ECS 时写固定 IPv4/CIDR；写 `auto` 则无需 DNS 或 HTTP，将公网路径上的首个公网 hop 推断为 `/24`。自动推断会在 reload 与网络变化时刷新；有界探测失败时不生成 ECS。客户端自带的 ECS 始终优先。启用前须阅读参考文档中的隐私警告。
 
 详见 [DNS 参考](./reference/dns.md)。
+
+## 入站代理监听
+
+`inbound` 在主机网络命名空间内提供经过认证的代理监听。LAN 客户端把 SOCKS 或 HTTP 代理指向这些监听后，每条会话都会走与透明接管流量完全相同的路由规则和出站分组。
+
+```dae
+inbound {
+    users {
+        alice: 'replace-me-alice'
+        bob: 'replace-me-bob'
+    }
+    socks5 {
+        bind: '0.0.0.0:7894'
+    }
+    http {
+        bind: '0.0.0.0:7893'
+    }
+}
+```
+
+- `inbound` 层的 `users { ... }` 块由所有未自带 `users` 的监听块共享，一套凭据同时服务 `socks5` 与 `http`；某个块也可以声明自己的 `users` 覆盖共享表。无论哪种方式，监听器都必须有用户：校验阶段会拒绝最终没有用户的监听器，因此不可能误配出开放中继。
+- 每个 `socks5 { ... }` 或 `http { ... }` 块是一个监听器；声明多个即可同时服务多个套接字。任何一条代理字节流动之前会话都必须先通过认证：SOCKS5 走 RFC 1929 用户名/口令（从不提供 RFC 1928 的 no-auth 方法），HTTP 走 `Proxy-Authorization: Basic`（缺失或错误凭据一律返回带新挑战的 `407`）。口令按原样比较；Basic 凭据以 base64 明文过网（base64 是编码不是加密），请保护好配置文件，暴露到 LAN 前设好防火墙或自备 TLS，敏感场景改用 SOCKS5，做法与 `experimental.clash_api` 相同。
+- SOCKS5 仅服务 `CONNECT`，支持 IPv4、IPv6 与域名目标；`BIND` 与 `UDP ASSOCIATE` 会被拒绝，监听器只中继 TCP。域名目标在路由与拨号前先经 honk 自身 DNS 本地解析；选中的代理节点仍会远端解析域名。
+- HTTP(S) 监听器服务 `CONNECT`（TLS 及隧道内一切内容端到端透传）与绝对形请求（`GET http://host/path HTTP/1.1`）：请求行改写为 origin-form，逐跳头剥离，并钉死 `Connection: close` 后经已路由的出站转发——明文 HTTP 无需 TLS 拦截即可工作。origin-form 请求行返回 `400`，其他 URI scheme 返回 `501`。
+- 认证后的用户名就是 `user(...)` 匹配的路由事实（mihomo `in-user` 的对应物）：`user(alice) -> auto`。被接管流量不携带用户，`user(...)` 只会匹配入站会话。见[条件函数](./reference/routing.md#condition-functions)。
+- 监听器并入运行时纪元（epoch）：reload 按新配置重绑，已建立会话随正常停机序列排空。
 
 ## 订阅
 

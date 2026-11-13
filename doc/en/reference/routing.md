@@ -45,8 +45,11 @@ routing {
 | `mac(...)` | Source MAC address as `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff` or `aabbccddeeff`, in any case | `mac` |
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6`, in any case | `ip_version` |
 | `dscp(...)` | Decimal or `0x`/`0X`-prefixed hexadecimal value; packets carry DSCP values `0` to `63` | `dscp` |
+| `user(...)` | Exact authenticated username of an `inbound` session (`socks5` or `http`) | `user` |
 
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
+
+`user(...)` matches only authenticated inbound sessions, SOCKS5 or HTTP(S) (the mihomo `in-user` analogue); intercepted traffic never carries a user, so a positive `user(...)` can never match it and `!user(...)` always matches intercepted traffic. Because the kernel datapath never sees a username, `user(...)` selects outbound in the userspace control plane only: a rule requiring one is unreachable in the eBPF matcher, and its negation imposes no kernel-side constraint. Only TCP flows can reach `user(...)`.
 
 All domain pattern/suffix/keyword/regex and `geosite` alternatives share one
 condition, so `domain(geosite: netflix, suffix: imgur.com)` matches either. Separate

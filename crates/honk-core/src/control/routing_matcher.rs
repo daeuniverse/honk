@@ -375,6 +375,11 @@ impl RoutingPushPlan {
                             names.iter().map(|name| name.as_bytes().to_vec()).collect(),
                         )
                     }
+                    // Intercepted kernel traffic never carries an inbound
+                    // user: lower the matcher to an empty fact set, which
+                    // codegen folds false for a positive condition and
+                    // `runtime_conditions` drops for a negated one.
+                    CompiledPredicate::User(_) => KernelPredicate::DestinationPort(Vec::new()),
                 };
                 conditions.push(KernelCondition {
                     not: condition.not,
