@@ -446,3 +446,60 @@ fn cached_unicode_source_truncation_remains_a_visible_flow_gap() {
         serde_json::json!(["buffer_overflow"])
     );
 }
+
+fn large_policy_fixture(source: &str) -> (Router, honk_config::Config, RoutingPushPlan) {
+    let ids = HashMap::from([
+        ("direct".into(), 0),
+        ("block".into(), 1),
+        ("proxy".into(), 2),
+    ]);
+    let mut config = honk_config::parser::parse_dae_config(source).unwrap();
+    config.groups.push(honk_config::group::Group {
+        name: "proxy".into(),
+        ..Default::default()
+    });
+    let router = Router::from_config(&config.routing).unwrap();
+    let mut plan = RoutingPushPlan::compile(&router, &ids, DialMode::Domain).unwrap();
+    plan.enable_trace(true);
+    (router, config, plan)
+}
+
+#[test]
+fn large_policies_fit_the_widened_dictionary_budgets() {
+    let mut source = String::from("routing {\n");
+    for port in 1000..1129 {
+        source.push_str(&format!("dport({port}) -> proxy(must)\n"));
+    }
+    source.push_str("fallback: block\n}\n");
+    let (router, config, plan) = large_policy_fixture(&source);
+    // Short rules still fill all 256 trace slots: about 85 KB, above the former 64 KiB bound.
+    assert!(KernelTraceDictionary::fits(&router, &config, &plan));
+    let mut store = KernelTraceDictionaries::default();
+    for policy in 1..=16 {
+        let dictionary =
+            KernelTraceDictionary::prepare("instance", u64::from(policy), &router, &config, &plan)
+                .unwrap();
+        assert!(dictionary.bytes > 64 * 1024);
+        store.bind(policy, plan.fingerprint, dictionary);
+    }
+    // Together they exceed the former 1 MiB retained total, so none may be evicted.
+    assert_eq!(store.owners.len(), 16);
+}
+
+#[test]
+fn oversized_policy_is_still_rejected() {
+    let mut source = String::from("routing {\n");
+    // One condition per rule, each text at the 512-byte display cap: far above 128 KiB in total.
+    for rule in 0..128u32 {
+        let ports = (0..100u32)
+            .map(|offset| (1000 + rule * 100 + offset).to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        source.push_str(&format!("dport({ports}) -> proxy(must)\n"));
+    }
+    source.push_str("fallback: block\n}\n");
+    let (router, config, plan) = large_policy_fixture(&source);
+    assert!(plan.trace_layout().is_some());
+    assert!(!KernelTraceDictionary::fits(&router, &config, &plan));
+    assert!(KernelTraceDictionary::prepare("instance", 17, &router, &config, &plan).is_none());
+}
