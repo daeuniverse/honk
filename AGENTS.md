@@ -33,7 +33,7 @@ Maintaining this guide: a rule that binds every change goes in this file; a subs
 - `honk-config` provides shared types/parsers for original dae `{ section { ... } }`, the primary and only documented config syntax.
 - Status: **experimental alpha**. Expect breaking changes.
 - License: **GPL-3.0-only**. Repository: <https://github.com/daeuniverse/honk>
-- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` trees under `doc/`, indexed by bilingual `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), and `operations/` runbooks; per-release configuration changes that affect an existing configuration live in `doc/migration/{en,zh}/<tag>.md` (one file per release tag). Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
+- Docs: `README.md` / `README.zh.md` (bilingual overview, feature checklist, TODO list); matching `doc/en/` / `doc/zh/` / `doc/zh-TW/` trees under `doc/`, indexed by `doc/README.md`. Each has `configuration.md`, `design/` (overview/datapath/routing/nfqueue/control-plane/dns/outbound/groups), `reference/` (global/nodes/groups/routing/dns/subscription/assets/experimental/api/cli), and `operations/` runbooks; per-release configuration changes that affect an existing configuration live in `doc/migration/{en,zh}/<tag>.md` (one file per release tag). Lab benchmark tooling, evidence, and bilingual docs live only on `bench`.
 
 ## Repository layout
 
@@ -213,7 +213,7 @@ Applies to code comments, docs, PR and issue text.
 - **Claims need their line.** A consequence stated in a PR or an issue names the code producing it, or is narrowed until it can; say what you did not check. Line numbers come from `origin/main`, not your working tree.
 - **Label the unverified.** Mark anything not run or not read as such (for example `not run:` in Verified) rather than leaving it implied.
 - **Comment discipline: readable code; comments explain "why", the code says "what".** Allow module `//!` purpose/non-obvious architecture, public-item `///`, and short rationale/invariant/wire-format/upstream-parity/past-bug comments. Narrating/restating code is a defect. Ordinary logic should have near-zero comments (see `crates/honk-core/src/dns/runtime.rs`); prefer descriptive names/small functions. **Before closing each work phase, review touched comments and delete/rewrite stale behavior descriptions**; stale comments are defects.
-- **Language:** code comments and `doc/en/` docs are English; user docs are bilingual (`README.zh.md`, `doc/zh/`); update both when you change documented behavior. Chinese docs use Simplified Chinese, one script per document, with a space between Chinese and Latin letters or digits.
+- **Language:** code comments and `doc/en/` docs are English; user docs are bilingual (`README.zh.md`, `doc/zh/`); update both when you change documented behavior. Chinese docs use Simplified Chinese, one script per document, with a space between Chinese and Latin letters or digits. `doc/zh-TW/` is the Traditional Chinese (Taiwan) copy of `doc/zh/` that daeuniverse.org serves; after changing `doc/zh/`, carry the same change into `doc/zh-TW/` with Taiwan wording.
 
 ## Testing instructions
 
