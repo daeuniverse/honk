@@ -371,11 +371,11 @@ Per-flow condition expressions use the configured source spelling cached with th
 
 For handed-off traffic, kernel rule outcomes come from the compiled program's own branch witness, not from userspace re-evaluation. UDP also requires the received packet's capture ID. The tuple, decision token, routing generation and action must agree with the retained witness.
 
-A later tuple incarnation cannot supply an older packet's evidence. Capture IDs do not wrap. Frozen dictionaries retain at most 16 policies, 64 KiB each and 1 MiB total within the recorder reservation.
+A later tuple incarnation cannot supply an older packet's evidence. Capture IDs do not wrap. Frozen dictionaries retain at most 16 policies, 128 KiB each and 2 MiB total within the recorder reservation.
 
 Partial evidence results from dictionary rejection or eviction, missing witnesses, ambiguous TCP association, or executed overflow beyond 256 rule or condition values. Rules beyond that value ceiling that were not executed do not, by themselves, imply lost execution.
 
-If a policy's kernel trace dictionary would exceed 64 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest possible generation number, so a policy right at the bound may already be published untraced.
+If a policy's kernel trace dictionary would exceed 128 KiB, honk publishes it with kernel route tracing off and logs a warning. This applies at startup and on reload. Its flows report `kernel_trace_not_captured` rather than undecodable witnesses. The check sizes rule identifiers for the longest possible generation number, so a policy right at the bound may already be published untraced.
 
 Native extension fields keep source detail without inventing identities. Route input may carry `ingress`, `domain_fact_bitmap` and `domain_fact_state` instead of fabricated domain rule IDs. DNS-related outbound and connection steps carry `lookup_id`, and known physical peers carry `server_addr`. Selection facts include the health family and whether a decision was applied or only peeked.
 

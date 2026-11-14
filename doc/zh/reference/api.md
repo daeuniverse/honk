@@ -356,11 +356,11 @@ DNS 日志没有 SSE 类型。记录从需求建立时开始，所以第一次�
 
 交接流量的内核规则结果来自编译程序实际执行到的分支 witness，用户态不重算。UDP 还必须用收到报文里带的 capture ID。五元组、decision token、路由 generation 和动作都要与保留的 witness 匹配；同一个五元组后来的 incarnation 不能给旧报文提供证据。
 
-Capture ID 不会回绕。冻结字典最多 16 份，每份 64 KiB，合计 1 MiB，计入记录器的预留。字典被拒绝或淘汰、witness 缺失、TCP 对应关系有歧义，以及实际执行超过 256 个规则或条件值，都会让证据不完整。
+Capture ID 不会回绕。冻结字典最多 16 份，每份 128 KiB，合计 2 MiB，计入记录器的预留。字典被拒绝或淘汰、witness 缺失、TCP 对应关系有歧义，以及实际执行超过 256 个规则或条件值，都会让证据不完整。
 
 如果只是未执行的规则超过这个上限，并不代表执行证据丢了。
 
-如果策略的内核追踪字典会超过 64 KiB，这个策略在启动和 reload 时都会以关闭内核路由追踪的方式发布，并记一条 warning。它的流会报告 `kernel_trace_not_captured`，不再产生无法解码的 witness。检查时按最长的 generation 编号估算规则 ID，所以刚好卡在上限附近的策略，也可能已经按关闭追踪发布。
+如果策略的内核追踪字典会超过 128 KiB，这个策略在启动和 reload 时都会以关闭内核路由追踪的方式发布，并记一条 warning。它的流会报告 `kernel_trace_not_captured`，不再产生无法解码的 witness。检查时按最长的 generation 编号估算规则 ID，所以刚好卡在上限附近的策略，也可能已经按关闭追踪发布。
 
 原生扩展字段保留来源细节，不虚构身份：路由输入可以带 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，但不会伪造域名 rule ID。DNS association 的 outbound/connection step 带 `lookup_id`，已知物理对端带 `server_addr`。选择事实保留健康的地址族，以及这个决策是实际应用还是只 peek。
 
