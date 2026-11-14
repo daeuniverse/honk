@@ -1,6 +1,6 @@
 # Native API, Clash API and `/stats` reference
 
-honk provides a native HTTP API, a Clash-compatible HTTP API and a userspace statistics snapshot. The two APIs are separate: each has its own Cargo features, listener, credentials and HTTP boundary. Both reuse the same engine handles and userspace statistics.
+honk provides a native HTTP API, a Clash-compatible HTTP API and a userspace statistics snapshot. The two APIs are separate: each has its own Cargo features, listener, credentials and HTTP boundary. Both reuse the same engine handles and userspace statistics. The Clash-compatible API starts at [Enablement and authentication](#enablement-and-authentication); its routes are in the [endpoint map](#endpoint-map).
 
 ## Native API
 
@@ -1512,7 +1512,7 @@ The table follows the router in `crates/honk-core/src/clash_api.rs`.
 | GET | `/dns/query` | Resolve `?name=` through honk DNS and return DoH-style JSON; `?type=` defaults to `A`. |
 | POST | `/cache/fakeip/flush` | Compatibility no-op returning 204; no FakeIP mappings are persisted to flush. |
 | POST | `/cache/dns/flush` | Flush the live DNS cache and its persisted DNS state. |
-| GET | `/providers/proxies` | Expose non-empty groups as Clash proxy providers. |
+| GET | `/providers/proxies` | Expose non-empty groups as Clash proxy providers. Each provider is a group, not a subscription; subscription state is under [Provider observations and refresh](#provider-observations-and-refresh). |
 | GET | `/providers/rules` | Return the current stub document `{"providers":[]}`. |
 | GET | `/ui`, `/ui/*` | Redirect `/ui` to `/ui/` and serve the configured external UI directory. |
 

@@ -1,32 +1,66 @@
 # DNS 配置参考
 
-`dns { ... }` 配置段用 dae 语法，运行时行为见下文。
+`dns { ... }` 用 dae 语法配置 DNS，覆盖命名上游、request 和 response 路由、hosts、EDNS Client Subnet、缓存和可选的独立 listener。
 
-## 顶层 key
+## 示例
+
+```dae
+dns {
+    # 省略 bind 可保持独立 listener 关闭。
+    # bind: 'tcp+udp://:1053'
+    use_host: true
+    ipversion_prefer: 4
+
+    upstream {
+        default: 'udp://223.5.5.5:53'
+        cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
+        google_doh: 'https://dns.google/dns-query' -> proxy
+    }
+
+    routing {
+        request {
+            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
+            qname(geosite: category-ads-all) -> reject
+            qname(suffix: cn) -> default
+            qtype(https) -> reject
+            fallback: default
+        }
+        response {
+            upstream(google_doh) -> accept
+            ip(geoip: private) && !qname(geosite: cn) -> google_doh
+            fallback: accept
+        }
+    }
+
+    optimistic_cache: true
+    optimistic_cache_ttl: 600
+    max_cache_size: 10000
+    fixed_domain_ttl {
+        ddns.example.org: 10
+        nocache.test: 0
+    }
+}
+```
+
+## 字段
 
 | Key | 默认值 | 含义 |
 | --- | --- | --- |
-| `bind` | 省略 / `""` | 可选的独立 DNS listener；空值只关掉这个 listener。 |
-| `use_host` | `false` | 可重复配置的 hosts 来源。`true` 或路径 `/etc/hosts` 按标准 hosts 语法读取，其他路径按 OxiDNS 兼容的规则文件读取。 |
-| `client_subnet` | 省略 / `""` | 可选的 EDNS Client Subnet 预设值，可取 IPv4、IPv4 CIDR、`auto` 或 `auto(IPv4)`。 |
-| `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | 命名上游服务器（即 Clash 配置中的 `nameserver`）。第一个显式 `upstream` 块会替换内置条目。 |
-| `routing { ... }` | 无规则；request fallback 为 `default`；response fallback 为 `accept` | 有序的 request 和 response 路由。 |
-| `ipversion_prefer` | 省略：`both` | 写 `4` 选择 `preferipv4`，写 `6` 选择 `preferipv6`。`0` 是 dae 的无偏好，也就是 `both`。honk 解析不了的值保持 `both`，并输出诊断。 |
-| `optimistic_cache` | `true` | 启用正、负缓存的读取和写入。 |
-| `optimistic_cache_ttl` | `600` 秒 | 除 NXDOMAIN、SERVFAIL 和 NODATA 外，把所有应答的缓存 TTL 和报文 TTL 设为固定值；写 `0` 则用上游应答里的最小 TTL。 |
-| `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答使用的 TTL。非零值替换每个非 OPT RR 的 TTL；写 `0` 时保留缓存里已按策略改写的 wire TTL，不用权威 TTL。 |
-| `max_cache_size` | `10000` | 缓存条目数上限，最大 100,000；它也决定下文的分片字节预算。 |
-| `fixed_domain_ttl { ... }` | 空 | 按域名覆盖正应答和 NODATA 的 TTL。写 `0` 时，所有响应码的应答都不缓存，负应答也一样。 |
+| `bind` | `省略`（`""`） | 可选的独立 DNS listener；空值只关掉这个 listener。见 [`bind`](#独立-listenerbind)。 |
+| `use_host` | `省略`（`false`） | 可重复配置的 hosts 来源：`true` 或路径 `/etc/hosts` 按标准 hosts 语法读取，其他路径按 OxiDNS 兼容的规则文件读取。见 [`use_host`](#hosts-快照use_host)。 |
+| `client_subnet` | `省略`（`""`） | 命名上游使用的可选 EDNS Client Subnet 预设值，可取 IPv4、IPv4 CIDR、`auto` 或 `auto(IPv4)`。见 [`client_subnet`](#edns-client-subnetclient_subnet)。 |
+| `upstream { ... }` | `省略`（`default: 'udp://223.5.5.5:53'`） | 命名上游服务器，即 Clash 配置中的 `nameserver`；第一个显式 `upstream` 块会替换内置条目。见 [上游](#上游)。 |
+| `routing { ... }` | `省略`（无规则；request fallback 为 `default`；response fallback 为 `accept`） | 有序的 request 和 response 路由，第一条匹配的规则生效。见 [DNS 路由](#dns-路由)。 |
+| `ipversion_prefer` | `省略`（`both`） | 地址族偏好；honk 解析不了的值保持 `both`，并输出诊断。见 [`ipversion_prefer`](#ipversion_prefer)。 |
+| `optimistic_cache` | `省略`（`true`） | 启用正、负缓存的读取和写入。见 [`optimistic_cache`](#optimistic_cache)。 |
+| `optimistic_cache_ttl` | `省略`（`600` 秒） | 除 NXDOMAIN、SERVFAIL 和 NODATA 外，把所有应答的缓存 TTL 和报文 TTL 设为固定值；写 `0` 用上游应答里的最小 TTL。见 [`optimistic_cache_ttl`](#optimistic_cache_ttl)。 |
+| `optimistic_stale_reply_ttl` | `省略`（`30` 秒） | serve-stale 正应答使用的 TTL；非零值替换每个非 OPT RR 的 TTL，写 `0` 保留缓存里已按策略改写的 wire TTL。见 [`optimistic_stale_reply_ttl`](#optimistic_stale_reply_ttl)。 |
+| `max_cache_size` | `省略`（`10000`） | 缓存条目数上限，最大 100,000；它也决定分片字节预算。见 [`max_cache_size`](#max_cache_size)。 |
+| `fixed_domain_ttl { domain: seconds }` | `省略`（空） | 按域名覆盖正应答和 NODATA 的 TTL；写 `0` 时，所有响应码的应答都不缓存。见 [`fixed_domain_ttl`](#fixed_domain_ttl)。 |
 
-标量值占掉该物理行剩下的部分，只在 key 后面的冒号处切开，所以裸写的 IPv6 地址和 `client_subnet: auto(9.9.9.9)` 都能保持完整。解析器只去掉包围整个值的一对匹配引号。值一旦以引号开头，就必须在同一行闭合，否则配置失败。
+所有 key 都是可选的。默认值栏写 `省略`，表示该 key 可以省略，括号里是它的默认值或等效写法。标量的延伸范围、注释规则和布尔取值见[解析规则](#解析规则)。
 
-标量设置里，只有引号外、词法单元开头的 `#` 才开始注释。`use_host: /tmp/a#b` 选的是字面路径 `/tmp/a#b`，并产生 `legacy-glued-hash` warning；注释要写成 `use_host: /tmp/a # comment`。重复的 `use_host` 声明按来源顺序保留，去重行为与原来一样。`optimistic_cache` 的布尔简写 `t`、`y`、`f`、`n` 仍表示假，但会产生 `legacy-bool-shorthand` warning；应改用 `true` 或 `false`。
-
-`optimistic_cache` 接受 `true`、`yes`、`1`、`on`、`false`、`no`、`0` 和 `off`，不区分大小写。其他值会关掉缓存，并产生诊断。
-
-`hosts_file` 已移除，出现在配置里会以 `removed-dns-hosts-file` 报错；请改用 `use_host` 路径。
-
-`dns` 里的未知 key、块和语句会产生 `unknown-key`、`unknown-block` 或 `unknown-statement` warning，honk 直接忽略。`dns.routing` 只接受 `request` 和 `response` 块。
+SIGHUP reload 会把 `bind` 的主机、端口或传输集合变化当作需重启项并拒绝；见 [`bind`](#独立-listenerbind)。
 
 ## 独立 listener（`bind`）
 
@@ -47,6 +81,12 @@
 listener 归进程所有。SIGHUP reload 接受语义等价的不同写法；但主机、端口或传输集合只要变了，就算需重启项，SIGHUP 会拒绝。通配绑定或绑在 LAN 侧会暴露一个无认证的递归解析器，必须用主机防火墙限制来源，绝不能发布到不可信网络。
 
 监听 `:53` 不会抢在 LAN 流量策略之前收到查询。即使 dnsmasq 或 `dns.bind` 占着这个 socket，不带 `must` 的 LAN TCP/UDP53 查询仍然进入 honk 透明 DNS。主机 loopback 上的查询，以及显式原生 `direct(must)` 交付的查询，仍能到达这个普通 listener；见[listener 矩阵](../design/dns.md#dns-所有权状态机)。
+
+```dae
+dns {
+    bind: 'tcp+udp://127.0.0.1:1053'
+}
+```
 
 ## Hosts 快照（`use_host`）
 
@@ -295,7 +335,145 @@ dns {
 
 一次 response 遍历最多查三个上游，初始上游也算在内；第四次交换 honk 会拒绝。重新查询形成环路时，honk 同样拒绝。
 
-### 旧版转换
+## 地址族策略
+
+### ipversion_prefer
+
+`ipversion_prefer` 设置 A 和 AAAA 查询的地址族偏好。
+
+| dae 设置 | 内部策略 | 行为 |
+| --- | --- | --- |
+| 省略 | `both` | 并发执行符合条件的 A 和 AAAA 查询，不压制任何地址族。 |
+| `ipversion_prefer: 0` | `both` | dae 的无偏好取值，行为与省略相同。 |
+| `ipversion_prefer: 4` | `preferipv4` | 偏好 IPv4，同时保留 IPv6 回退。 |
+| `ipversion_prefer: 6` | `preferipv6` | 偏好 IPv6，同时保留 IPv4 回退。 |
+
+`ipversion_prefer` 默认 `both`。honk 解析不了的值保持 `both`，并输出诊断。内部的 `ipv4only` 和 `ipv6only` 模式无法用 dae 的 `ipversion_prefer` 语法表达。
+
+```dae
+dns {
+    ipversion_prefer: 4
+}
+```
+
+### 偏好族查询
+
+偏好模式下，两个地址族仍可查询。收到非偏好族的 A/AAAA 请求时，honk 会让偏好族的 sibling query 走同一条管线，并保留调用方的逻辑来源、原始目的地址、入口 profile，以及除 QTYPE 外的 wire profile。偏好族有地址时，honk 把非偏好族应答压制为 NODATA；偏好族没有地址，或者 sibling 遇到普通的可用性失败时，就返回非偏好族的应答。typed local packet refusal 会按原始原因终止解析，carrier Capacity 也算在内，honk 不会拿过期缓存应答替换它。相关缓存未命中时，这样做会多出一次上游查询。
+
+### bootstrap 拨号顺序
+
+同一策略也决定上游主机名经 bootstrap 解析后的拨号顺序。`both` 和 `preferipv4` 先拨 IPv4，`preferipv6` 先拨 IPv6。TCP、DoT、DoH、DoQ、DoH3 以及经代理承载的 DNS，在拨号失败后会继续试后面的地址。直连 UDP 把那唯一一次重试优先给另一个地址族，再考虑同族的其他地址，并复用连接成功的 socket。`ipv4only` 和 `ipv6only` 只在兼容格式里可用，会把上游拨号候选限制在对应地址族。
+
+## 缓存与固定 TTL
+
+### optimistic_cache
+
+启用正、负缓存的读取和写入。默认 `true`；设为 `false` 时，回复保留上游 TTL。
+
+```dae
+dns {
+    optimistic_cache: false
+}
+```
+
+### optimistic_cache_ttl
+
+设置除 NXDOMAIN、SERVFAIL 和 NODATA 外所有应答的缓存生命周期和回复里的 RR TTL；这三类响应码按[负应答](#负应答)处理。默认 `600` 秒。写 `0` 用上游应答里的最小 TTL。只接受十进制秒数：`10m` 这类值会产生诊断，并回落到 `60`，不是 `600`。
+
+```dae
+dns {
+    optimistic_cache_ttl: 600
+}
+```
+
+### optimistic_stale_reply_ttl
+
+设置 serve-stale 正应答使用的 TTL。默认 `30` 秒。非零值替换每个非 OPT RR 的 TTL。写 `0` 时保留缓存里已按策略改写的 wire TTL，不用权威 TTL。此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，没有正 TTL 时回落到 60 秒。非零时，即使没有正 TTL，outcome TTL 仍是配置值。值无效会产生诊断，并回落到 `30`。
+
+```dae
+dns {
+    optimistic_stale_reply_ttl: 30
+}
+```
+
+### max_cache_size
+
+设置缓存条目数上限和每个分片的应答字节预算。默认 `10000`。条目上限最多分摊到 16 个分片，每个分片的预算按 `max(条目容量 × 1 KiB, 65,535 字节)` 计算；honk 按 LRU 淘汰，直到两个上限都满足。单条超过 65,535 字节的应答不缓存。大于 100,000 的值会被钳到 100,000，`0` 会被钳成一个条目；两种情况都产生 warning。无法解析的值会触发诊断，并回落到 `10000`。
+
+```dae
+dns {
+    max_cache_size: 20000
+}
+```
+
+### fixed_domain_ttl
+
+按域名覆盖正应答和 NODATA 的 TTL，先于 `optimistic_cache_ttl` 应用。默认空。写 `0` 时，所有响应码的应答都不缓存，NXDOMAIN 和 SERVFAIL 也一样。key 只匹配一个精确名称，用不带末尾点的小写形式，不覆盖子域。
+
+例如，`www.example.com` 需要单独的条目：
+
+```dae
+dns {
+    fixed_domain_ttl {
+        example.com: 120
+        www.example.com: 120
+        ddns.example.org: 10
+        nocache.test: 0
+    }
+}
+```
+
+每个固定 TTL 必须正好是一个无符号 32 位十进制标量。裸值和带引号的值都接受，包括 `0` 和 `4294967295`；新接受的带引号十进制值会产生 `legacy-ttl-quoting` warning。值无效或溢出会产生 `invalid-ttl`，多出词法单元会产生 `trailing-value`，两种情况都会省略该条目。说明文字写在 ` # ` 后面，不要紧贴数值。
+
+### 缓存条目与过期
+
+Request 路由在缓存查询之前执行。查询除事务 ID 外完全相同，走同一类入口，又选中相同的 DNS 策略和相同的上游或 `asis` 目的地址时，客户端才共享缓存条目；原始客户端来源不参与缓存 key。偏好地址族的渲染仍保留来源元数据，所以依赖来源的 sibling 策略不会经由 foreground singleflight 泄漏。
+
+设了 `optimistic_cache_ttl: 0`，又没有 `fixed_domain_ttl` 覆盖时，`NOERROR` 正应答取 answer、authority 和 additional 段里所有非 OPT 记录的最小 TTL。缓存这份应答时，honk 把每个非 OPT 记录的 TTL 改写成这个最小值。只要有一条记录的 TTL 为零，honk 就不缓存该应答，并移除精确缓存槽，避免旧地址或更早的负应答再次返回。非零的配置 TTL 或固定 TTL 仍能覆盖零值。
+
+honk 只在缓存应答时改写回复 TTL；不可缓存的查询，或者 `optimistic_cache: false` 时，保留上游 TTL。除 `NXDOMAIN` 和 `SERVFAIL` 外的失败码，例如 `REFUSED`，按 `optimistic_cache_ttl` 处理，默认缓存 600 秒。
+
+即使响应策略 `reject` 把回复换成合成的 NOERROR，缓存生命周期仍按原始上游应答的分类、响应码和 TTL 决定。所以被拒绝的 REFUSED 保留失败响应码的 TTL 规则；没有配置 TTL 或固定 TTL 覆盖时，被拒绝的 NOERROR 正应答用原始 TTL。
+
+缓存命中时，报文里的记录 TTL 不会递减。这种改写只发生在内存里，已保存的持久化行不会被删。
+
+### 负应答
+
+NXDOMAIN 的缓存时间是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA，或者 SOA 生命周期为零时，honk 不缓存，并移除精确缓存 key 下已有的正、负缓存，避免旧地址又作为过期应答返回。前台结果替换当时已有的写入结果；后台刷新只移除它开始时读到的那一版。`fixed_domain_ttl: 0` 禁止缓存，但已有的条目不删。除此之外，SERVFAIL 仍按 SOA 算出的生命周期处理，默认 60 秒，并限制在 `1..=300` 秒。
+
+这里的 NODATA 指没有 answer 记录的 NOERROR 应答，即 `ANCOUNT=0`。answer 非空时，honk 仍把它归为正应答，只含 CNAME/DNAME 的也算。NODATA 的完整报文留在正缓存槽里，生命周期是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。非零的 `fixed_domain_ttl` 优先于 SOA 和上限，即使缺 SOA 也生效。没有这个覆盖值时，缺 SOA 或生命周期为零的 NODATA 和 NXDOMAIN 一样处理：移除精确缓存槽，新应答不保留。
+
+缓存的 NODATA 仍能作为过期应答返回；过期应答改写的是 SOA 记录 TTL，不是 SOA MINIMUM。对上游 NODATA 套用响应策略 `reject`，会生成空的 NOERROR 报文；它的缓存生命周期按同样的 TTL 规则算，SOA 取被拒绝的应答，不取合成报文。后续请求在这个生命周期内复用合成应答。
+
+### serve-stale 与刷新
+
+过期应答，包括缓存的 `NODATA`，到期后 1 小时内还能用于 serve-stale，除非已经被淘汰。`optimistic_stale_reply_ttl` 只设置回复 TTL，不管这个窗口。缓存命中时，剩余时间不超过 `max(原 TTL / 10, 1)` 秒就启动一次后台刷新。
+
+### 路由投影
+
+不保留缓存不等于关闭 DNS 路由投影。已接受但不可缓存的正应答，`fixed_domain_ttl: 0` 的结果也算，用 wire 里非 OPT 记录的最小正 TTL 作为投影寿命；这些 TTL 全为零时回落到 60 秒。这条规则不改写应答，也不会让应答变得可缓存；缓存命中的剩余寿命和 served-stale 寿命都不变。
+
+## 解析规则
+
+### 标量与注释
+
+标量值占掉该物理行剩下的部分，只在 key 后面的冒号处切开，所以裸写的 IPv6 地址和 `client_subnet: auto(9.9.9.9)` 都能保持完整。解析器只去掉包围整个值的一对匹配引号。值一旦以引号开头，就必须在同一行闭合，否则配置失败。
+
+标量设置里，只有引号外、词法单元开头的 `#` 才开始注释。`use_host: /tmp/a#b` 选的是字面路径 `/tmp/a#b`，并产生 `legacy-glued-hash` warning；注释要写成 `use_host: /tmp/a # comment`。重复的 `use_host` 声明按来源顺序保留，去重行为与原来一样。
+
+### 布尔值
+
+`optimistic_cache` 接受 `true`、`yes`、`1`、`on`、`false`、`no`、`0` 和 `off`，不区分大小写。其他值会关掉缓存，并产生诊断。
+
+对 `optimistic_cache`，布尔简写 `t`、`y`、`f`、`n` 仍表示假，但会产生 `legacy-bool-shorthand` warning；应改用 `true` 或 `false`。
+
+### 未知 key 与已移除的 key
+
+`dns` 里的未知 key、块和语句会产生 `unknown-key`、`unknown-block` 或 `unknown-statement` warning，honk 直接忽略。`dns.routing` 只接受 `request` 和 `response` 块。
+
+`hosts_file` 已移除，改用 `use_host` 路径；配置里仍写着它时，honk 以 `removed-dns-hosts-file` 报错，配置失败。
+
+## 旧版转换
 
 兼容性配置里保留扁平的 `routing.rules` 条目，字段是 `domain` 和 `upstream`，另外还有命名 `fallback`。这些是结构化兼容字段，不是当前 dae 语法里的附加语句。`suffix:`、`keyword:`、`full:` 和 `regex:` 前缀用来选匹配方式；不带前缀的旧版域名按 `full` 精确匹配。
 
@@ -309,114 +487,9 @@ dns {
 
 `"upstream"` 只在第三个分支里当哨兵值忽略；有旧版规则时，它就是普通的上游名称，必须有对应声明。旧版目标按原样精确匹配，不套用 dae 动作的大小写转换规则。
 
-校验诊断保留原始字段路径。新式规则和回退用 `dns.routing.request.rules[i].action`
-和 `dns.routing.request.fallback`；转换后的旧版规则用
-`dns.routing.rules[i].upstream`；转换或提升的回退用 `dns.routing.fallback`。
+校验诊断保留原始字段路径。新式规则和回退用 `dns.routing.request.rules[i].action` 和 `dns.routing.request.fallback`；转换后的旧版规则用 `dns.routing.rules[i].upstream`；转换或提升的回退用 `dns.routing.fallback`。
 
-旧版规则生效时，默认回退的 `upstream` 没声明会报告 `missing-dns-fallback`；空回
-退没有匹配声明会报告 `empty-dns-fallback`；其他没声明的目标会报告
-`unknown-dns-upstream`。诊断保留字段路径，但不回显目标名称，也不列出已声明的名称。
-省略旧版回退等同于显式写 `upstream`，只要声明了该上游，两种写法都有效。没有旧版
-规则时，honk 仍会忽略空值和 `upstream` 哨兵。
-
-## 地址族策略
-
-| dae 设置 | 内部策略 | 行为 |
-| --- | --- | --- |
-| 省略 | `both` | 并发执行符合条件的 A 和 AAAA 查询，不压制任何地址族。 |
-| `ipversion_prefer: 4` | `preferipv4` | 偏好 IPv4，同时保留 IPv6 回退。 |
-| `ipversion_prefer: 6` | `preferipv6` | 偏好 IPv6，同时保留 IPv4 回退。 |
-
-偏好模式下，两个地址族仍可查询。收到非偏好族的 A/AAAA 请求时，honk 会让偏好族的 sibling query 走同一条管线，并保留调用方的逻辑来源、原始目的地址、入口 profile，以及除 QTYPE 外的 wire profile。偏好族有地址时，honk 把非偏好族应答压制为 NODATA；偏好族没有地址，或者 sibling 遇到普通的可用性失败时，就返回非偏好族的应答。typed local packet refusal 会按原始原因终止解析，carrier Capacity 也算在内，honk 不会拿过期缓存应答替换它。相关缓存未命中时，这样做会多出一次上游查询。
-
-同一策略也决定上游主机名经 bootstrap 解析后的拨号顺序。`both` 和 `preferipv4` 先拨 IPv4，`preferipv6` 先拨 IPv6。TCP、DoT、DoH、DoQ、DoH3 以及经代理承载的 DNS，在拨号失败后会继续试后面的地址。直连 UDP 把那唯一一次重试优先给另一个地址族，再考虑同族的其他地址，并复用连接成功的 socket。`ipv4only` 和 `ipv6only` 只在兼容格式里可用，会把上游拨号候选限制在对应地址族。
-
-内部的 `ipv4only` 和 `ipv6only` 模式，在 dae 的 `ipversion_prefer` 语法里表达不出来。
-
-## 缓存与固定 TTL
-
-| Key | 默认值 | 行为 |
-| --- | --- | --- |
-| `optimistic_cache` | `true` | 启用缓存的读取和写入。设为 `false` 时，回复保留上游 TTL。 |
-| `optimistic_cache_ttl` | `600` 秒 | 覆盖缓存生命周期和回复里的 RR TTL；NXDOMAIN、SERVFAIL 和 NODATA 按[负应答](#负应答)处理。写 `0` 则用上游应答里的最小 TTL。只接受十进制秒数：`10m` 这类值会产生诊断，并回落到 `60`，不是 `600`。 |
-| `optimistic_stale_reply_ttl` | `30` 秒 | serve-stale 正应答用这个 TTL。非零值替换每个非 OPT RR 的 TTL。写 `0` 时保留缓存里已按策略改写的 wire TTL，不用权威 TTL；此时 outcome TTL 从该 wire 的 `extract_min_ttl` 得出，没有正 TTL 时回落到 60 秒。非零时，即使没有正 TTL，outcome TTL 仍是配置值。值无效会产生诊断，并回落到 `30`。 |
-| `max_cache_size` | `10000` | 条目上限最多分摊到 16 个分片。每个分片的应答字节预算是 `max(条目容量 × 1 KiB, 65,535 字节)`；honk 按 LRU 淘汰，直到两个上限都满足。单条超过 65,535 字节的应答不缓存。大于 100,000 的值会被钳到 100,000，`0` 会被钳成一个条目；两种情况都产生 warning。无法解析的值会触发诊断，并回落到 `10000`。 |
-| `fixed_domain_ttl { domain: seconds }` | 空 | 按域名覆盖，先于 `optimistic_cache_ttl` 应用。写 `0` 时，所有响应码的应答都不缓存，NXDOMAIN 和 SERVFAIL 也一样。key 只匹配一个精确名称，用不带末尾点的小写形式，不覆盖子域。 |
-
-Request 路由在缓存查询之前执行。查询除事务 ID 外完全相同，走同一类入口，又选中相同的 DNS 策略和相同的上游或 `asis` 目的地址时，客户端才共享缓存条目；原始客户端来源不参与缓存 key。偏好地址族的渲染仍保留来源元数据，所以依赖来源的 sibling 策略不会经由 foreground singleflight 泄漏。
-
-设了 `optimistic_cache_ttl: 0`，又没有 `fixed_domain_ttl` 覆盖时，`NOERROR` 正应答取 answer、authority 和 additional 段里所有非 OPT 记录的最小 TTL。缓存这份应答时，honk 把每个非 OPT 记录的 TTL 改写成这个最小值。只要有一条记录的 TTL 为零，honk 就不缓存该应答，并移除精确缓存槽，避免旧地址或更早的负应答再次返回。非零的配置 TTL 或固定 TTL 仍能覆盖零值。
-
-honk 只在缓存应答时改写回复 TTL；不可缓存的查询，或者 `optimistic_cache: false` 时，保留上游 TTL。除 `NXDOMAIN` 和 `SERVFAIL` 外的失败码，例如 `REFUSED`，按 `optimistic_cache_ttl` 处理，默认缓存 600 秒。
-
-过期应答，包括缓存的 `NODATA`，到期后 1 小时内还能用于 serve-stale，除非已经被淘汰。`optimistic_stale_reply_ttl` 只设置回复 TTL，不管这个窗口。缓存命中时，剩余时间不超过 `max(原 TTL / 10, 1)` 秒就启动一次后台刷新。
-
-不保留缓存不等于关闭 DNS 路由投影。已接受但不可缓存的正应答，`fixed_domain_ttl: 0` 的结果也算，用 wire 里非 OPT 记录的最小正 TTL 作为投影寿命；这些 TTL 全为零时回落到 60 秒。这条规则不改写应答，也不会让应答变得可缓存；缓存命中的剩余寿命和 served-stale 寿命都不变。
-
-### 负应答
-
-NXDOMAIN 的缓存时间是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA，或者 SOA 生命周期为零时，honk 不缓存，并移除精确缓存 key 下已有的正、负缓存，避免旧地址又作为过期应答返回。前台结果替换当时已有的写入结果；后台刷新只移除它开始时读到的那一版。`fixed_domain_ttl: 0` 禁止缓存，但已有的条目不删。除此之外，SERVFAIL 仍按 SOA 算出的生命周期处理，缺省 60 秒，并限制在 `1..=300` 秒。
-
-这里的 NODATA 指没有 answer 记录的 NOERROR 应答，即 `ANCOUNT=0`。answer 非空时，honk 仍把它归为正应答，只含 CNAME/DNAME 的也算。NODATA 的完整报文留在正缓存槽里，生命周期是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。非零的 `fixed_domain_ttl` 优先于 SOA 和上限，即使缺 SOA 也生效。没有这个覆盖值时，缺 SOA 或生命周期为零的 NODATA 和 NXDOMAIN 一样处理：移除精确缓存槽，新应答不保留。
-
-缓存的 NODATA 仍能作为过期应答返回；过期应答改写的是 SOA 记录 TTL，不是 SOA MINIMUM。对上游 NODATA 套用响应策略 `reject`，会生成空的 NOERROR 报文；它的缓存生命周期按同样的 TTL 规则算，SOA 取被拒绝的应答，不取合成报文。后续请求在这个生命周期内复用合成应答。
-
-即使响应策略 `reject` 把回复换成合成的 NOERROR，缓存生命周期仍按原始上游应答的分类、响应码和 TTL 决定。所以被拒绝的 REFUSED 保留失败响应码的 TTL 规则；没有配置 TTL 或固定 TTL 覆盖时，被拒绝的 NOERROR 正应答用原始 TTL。
-
-缓存命中时，报文里的记录 TTL 不会递减。这种改写只发生在内存里，已保存的持久化行不会被删。
-
-例如，`www.example.com` 需要单独的条目：
-
-```dae
-fixed_domain_ttl {
-    example.com: 120
-    www.example.com: 120
-    ddns.example.org: 10
-    nocache.test: 0
-}
-```
-
-每个固定 TTL 必须正好是一个无符号 32 位十进制标量。裸值和带引号的值都接受，包括 `0` 和 `4294967295`；新接受的带引号十进制值会产生 `legacy-ttl-quoting` warning。值无效或溢出会产生 `invalid-ttl`，多出词法单元会产生 `trailing-value`，两种情况都会省略该条目。说明文字写在 ` # ` 后面，不要紧贴数值。
-
-## 示例
-
-```dae
-dns {
-    # 省略 bind 可保持独立 listener 关闭。
-    # bind: 'tcp+udp://:1053'
-    use_host: true
-    ipversion_prefer: 4
-
-    upstream {
-        default: 'udp://223.5.5.5:53'
-        cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
-        google_doh: 'https://dns.google/dns-query' -> proxy
-    }
-
-    routing {
-        request {
-            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
-            qname(geosite: category-ads-all) -> reject
-            qname(suffix: cn) -> default
-            qtype(https) -> reject
-            fallback: default
-        }
-        response {
-            upstream(google_doh) -> accept
-            ip(geoip: private) && !qname(geosite: cn) -> google_doh
-            fallback: accept
-        }
-    }
-
-    optimistic_cache: true
-    optimistic_cache_ttl: 600
-    max_cache_size: 10000
-    fixed_domain_ttl {
-        ddns.example.org: 10
-        nocache.test: 0
-    }
-}
-```
+旧版规则生效时，默认回退的 `upstream` 没声明会报告 `missing-dns-fallback`；空回退没有匹配声明会报告 `empty-dns-fallback`；其他没声明的目标会报告 `unknown-dns-upstream`。诊断保留字段路径，但不回显目标名称，也不列出已声明的名称。省略旧版回退等同于显式写 `upstream`，只要声明了该上游，两种写法都有效。没有旧版规则时，honk 仍会忽略空值和 `upstream` 哨兵。
 
 ## 相关文档
 

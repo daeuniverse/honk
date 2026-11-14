@@ -2,10 +2,6 @@
 
 `group { ... }` 配置代理组及其成员选择规则。每份配置最多可定义 250 个顶层用户组；更高的路由序号由 ABI 保留。
 
-## 语法
-
-每个组都是 `group { ... }` 中的命名子节。同名声明不会合并，以最后一份为准。不要在包含文件里重复声明同一个组来扩展它。
-
 ```dae
 group {
     hk {
@@ -30,32 +26,141 @@ group {
 }
 ```
 
-## Key
+## 字段
 
-| dae key | 内部字段 | 默认值 | 含义 |
-| ------- | -------- | ------ | ---- |
-| （子节名） | `name` | 必填 | 在路由和 API 中用作出站的组 tag。 |
-| `policy` | `policy` | `selector` | 成员选择策略；接受的拼写见下表。 |
-| `icon` | `icon` | `null` | 带主机名且不含凭据的绝对 HTTP(S) URL，或 data URI；最多 2048 个字符，不能含空白。其他值会使配置被拒绝。原生组读取会遮蔽至少 8 字节长的 listener secret 值，不推测图标。 |
-| `filter: name(...)` | `filters` + `nodes` | `[]` | 按节点名选择节点。解析器把匹配结果解析为节点 UUID。 |
-| `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
-| `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
-| `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
-| `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组被嵌套时同样生效。未知目标会使配置在启动或 reload 时以 `invalid-group-final-target` 被拒绝。`final` 节点仍受健康检查约束。绕回自身的 `final` 路径不选择任何节点，也不会退回 `direct`。 |
-| `check_url` | `check_url` | `null` | 给非 Selector 策略用的按组 TCP 健康检查目标。不要在 Selector 上设置：honk 只记一条 warning，从不探测这个 URL；但 Selector 的 TCP 选择仍会读该 URL 的健康状态，未探测即视为健康，于是 TCP 健康检查不再约束该组。 |
-| —（dae 中不可配置） | `check_interval` | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
-| `tolerance` | `tolerance` | `50` | URLTest 切换阈值，单位为毫秒，写成纯整数：`tolerance: 50`，不能写 `50ms`。dae URLTest 组未显式设置时继承 `global.check_tolerance`。有效下限为 1 ms。 |
-| `idle_timeout` | `idle_timeout` | `null` | URLTest 组连续多少秒没有被选用后暂停成员探测，作用类似 Clash 的 `lazy`。写成纯整数：`idle_timeout: 1800`，不能写 `30m`。为 `null` 时使用 1800 秒。 |
-| `interrupt_connections` | `interrupt_connections` | `false` | 选择变化时，按捕获的组身份和网络关闭受影响的用户态传输。这会退役传输，而不只是移除追踪记录；共享 UDP carrier 保留未受影响的视图。LoadBalance 轮换从不关闭连接。接受 `true`/`false`、`yes`/`no`、`on`/`off` 或 `1`/`0`，不区分 ASCII 大小写；其他值会使配置被拒绝。 |
-| —（dae 中不可配置） | `id` | 随机 UUID | 字段缺失时生成的内部组标识。 |
-
-`filter:` 条目累加。其他 key 都以最后一次出现的值为准，较早的无效值不会被检查。
-
-`check_url` 接受 HTTP(S) URL；不写协议的目标按 HTTP 处理。URL 后面可以接逗号分隔的 IPv4 或 IPv6 字面地址，这些地址使用 URL 的端口，并先于 DNS 返回的地址尝试。无效条目会被忽略。
+| Key | 默认值 | 含义 |
+| --- | --- | --- |
+| （子节名） | 必填 | 在路由和 API 中用作出站的组 tag；内部字段为 `name`。 |
+| `policy` | `selector` | 成员选择策略；接受的拼写见[策略](#策略)。 |
+| `filter: name(...)` | `[]` | 按节点名选择节点；结果存入 `filters` 和 `nodes`，匹配项由解析器解析为节点 UUID。 |
+| `filter: subtag(...)` | `[]` | 按产生节点的订阅的当前 tag 选择节点；结果存入 `filters` 和 `nodes`，tag 来自订阅条目，见[内部模型](./subscription.md#内部模型)。 |
+| `filter: group(...)` | `[]` | 把嵌套组 tag 加入 `groups`；接受逗号分隔的参数和竖线分隔的 tag。 |
+| `default` | `null` | `selector` 的初始或回退成员 tag。 |
+| `final` | `null` | 组策略没有合格选择时使用的目标，见 [`final`](#final)。 |
+| `check_url` | `null` | 给非 Selector 策略用的按组 TCP 健康检查目标，见 [`check_url`](#check_url)。 |
+| `tolerance` | `50` | URLTest 切换阈值，单位为毫秒，见 [`tolerance`](#tolerance)。 |
+| `idle_timeout` | `null` | URLTest 组连续多少秒没有被选用后暂停成员探测，见 [`idle_timeout`](#idle_timeout)。 |
+| `interrupt_connections` | `false` | 选择变化时关闭受影响的用户态传输，见 [`interrupt_connections`](#interrupt_connections)。 |
+| `icon` | `null` | 原生组读取返回的组图标，见 [`icon`](#icon)。 |
+| —（`check_interval`，dae 中不可配置） | `null` | 按组间隔字段，单位为秒。当前运行时不读取该字段，而使用全局间隔。 |
+| —（`id`，dae 中不可配置） | 随机 UUID | 字段缺失时生成的内部组标识。 |
 
 本文区分三个词：健康检查是代理组周期性执行的检查；延迟测试是通过 API 或界面按需触发的测试；探测是一次测量，前两者都由探测组成。
 
-URLTest 组在第一次被选中之前保持空闲。之后只要连续 `idle_timeout` 秒没有流量选中它，就再次转入空闲。空闲期间暂停成员的周期探测，下一次选中时恢复。`idle_timeout: 0` 表示两次选择之间就进入空闲，它不是连接超时。只要还有非 URLTest 组，或者有活跃的 URLTest 组能到达某个节点，该节点就继续接受探测。
+### final
+
+组策略没有合格选择时使用的目标；嵌套时同样生效。
+
+取值是节点、组、`direct` 或 `block`。默认 `null`，即没有配置 final 目标；内部字段为 `final_outbound`。
+
+未知目标会使配置在启动或 reload 时以 `invalid-group-final-target` 被拒绝。`final` 节点仍受健康检查约束。绕回自身的 `final` 路径不选择任何节点，也不会退回 `direct`。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        final: direct
+    }
+}
+```
+
+### check_url
+
+给非 Selector 策略用的按组 TCP 健康检查目标。
+
+该值取 HTTP(S) URL；不写协议的目标按 HTTP 处理。URL 后面可以接逗号分隔的 IPv4 或 IPv6 字面地址，这些地址使用 URL 的端口，并先于 DNS 返回的地址尝试；无效条目会被忽略。
+
+默认 `null`。
+
+不要在 Selector 上设置：honk 只记一条 warning，从不探测这个 URL。但 Selector 的 TCP 选择仍会读该 URL 的健康状态，未探测即视为健康，于是 TCP 健康检查不再约束该组。该 key 不影响 UDP。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        policy: urltest
+        check_url: 'https://probe.example:8443/check,192.0.2.10,2001:db8::10'
+    }
+}
+```
+
+### tolerance
+
+另一个 URLTest 成员的延迟要低出多少毫秒，组才切换过去。
+
+该值写成纯整数：`tolerance: 50`，不能写 `50ms`。有效下限为 1 ms。
+
+默认 `50`；dae URLTest 组未显式设置时继承 `global.check_tolerance`。
+
+URLTest 组会保留当前成员，直到另一个成员的延迟比它低出 `max(tolerance, 1 ms)`。当前成员没有新测量值，或近期有失败时，不享受这份保留。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        policy: urltest
+        tolerance: 50
+    }
+}
+```
+
+### idle_timeout
+
+URLTest 组连续多少秒没有被选用后暂停成员探测；作用类似 Clash 的 `lazy`。
+
+该值写成纯整数：`idle_timeout: 1800`，不能写 `30m`。`idle_timeout: 0` 表示两次选择之间就进入空闲，它不是连接超时。
+
+默认 `null`，此时使用 1800 秒。
+
+URLTest 组在第一次被选中之前保持空闲，之后只要连续 `idle_timeout` 秒没有流量选中它，就再次转入空闲。空闲期间暂停成员的周期探测，下一次选中时恢复。只要还有非 URLTest 组，或者有活跃的 URLTest 组能到达某个节点，该节点就继续接受探测。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        policy: urltest
+        idle_timeout: 1800
+    }
+}
+```
+
+### interrupt_connections
+
+选择变化时，按捕获的组身份和网络关闭受影响的用户态传输。
+
+该值接受 `true`/`false`、`yes`/`no`、`on`/`off` 或 `1`/`0`，不区分 ASCII 大小写。上述取值以外的值会使配置被拒绝。
+
+默认 `false`。
+
+这会退役传输，而不只是移除追踪记录；共享 UDP carrier 保留未受影响的视图。LoadBalance 轮换从不关闭连接。只有真正发生选择变化的网络受影响，并按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        interrupt_connections: true
+    }
+}
+```
+
+### icon
+
+原生组读取返回的组图标。
+
+该值取带主机名且不含凭据的绝对 HTTP(S) URL，或 data URI；最多 2048 个字符，不能含空白。
+
+默认 `null`。
+
+不符合上述格式的值会使配置被拒绝。原生组读取会遮蔽至少 8 字节长的 listener secret 值，不推测图标。
+
+```dae
+group {
+    hk {
+        filter: name('HK')
+        icon: 'https://example.com/icon.svg'
+    }
+}
+```
 
 ## 策略
 
@@ -88,8 +193,6 @@ group {
 }
 ```
 
-URLTest 组会保留当前成员，直到另一个成员的延迟比它低出 `max(tolerance, 1 ms)`。当前成员没有新测量值，或近期有失败时，不享受这份保留。
-
 TCP 按 TCP 探测延迟排序；设置了 `check_url` 时，按该组的 `check_url` 探测排序。UDP 先按数据 UDP 探测延迟排序，其次按 DNS UDP；没有 UDP 测量值的成员排在最后，不会借用它的 TCP 延迟。`check_url` 不影响 UDP。在任何成员产生 UDP 测量值之前，UDP 沿用该组的 TCP 选择。
 
 选择缺失，或者选中的成员已不属于该组时，才回落到 `default` 或声明顺序里的第一个成员。选中的成员没有合格叶节点时，TCP 和 UDP 都不会改选兄弟成员：只能继续执行显式配置的 `final`，或下述针对同一叶节点的 TCP 最后尝试。选中的嵌套组仍执行自己的策略，因此 URLTest 可以在该子组内部挑另一个叶节点。
@@ -102,11 +205,11 @@ UDP 资格同时要求协议或配置支持，以及健康条件。VMess 和显�
 
 组只有一个叶节点、没有配置 `final`，而 TCP 健康状态排除了这个节点时，honk 仍可把它作为最后尝试，但当前 Selector 的选择路径必须能到达它。这不能绕过选中的空子组，也不表示回退到 `direct`。节点保持失活，直到真实流量或探测让它恢复；UDP 仍按正常规则排除失活成员。走到这种最后尝试时，honk 会记录限流 warning，每组每 60 秒一条。
 
-每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。
+每个已配置 Selector 的代理叶节点都保持热态。解析嵌套选择后，honk 会按叶节点协议保留可复用的多路复用 session、QUIC client 或一条到服务端的裸 TCP 连接；`direct` 与 `block` 不需要热资源。Selector 的固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
 
-原生 `PUT /api/v1/groups/{groupId}/selection` 用直接成员的 `member_id` 更新选择，`network: "tcp"|"udp"|"both"` 必填。`both` 会一起校验、原子发布，TCP 写入不会连带改变 UDP。Clash 写入映射为 `both`，`now` 明确显示 TCP 选择。两者共用 `control/reload` owner、按网络分开的持久化和预热回调。中断只影响真正发生选择变化的网络，并按既有流量捕获的组路径匹配，不用当前叶节点列表倒推。Selector 的固定预热跟随 TCP 选择，UDP 预热集使用 UDP 选择。
+原生 `PUT /api/v1/groups/{groupId}/selection` 用直接成员的 `member_id` 更新选择，`network: "tcp"|"udp"|"both"` 必填。`both` 会一起校验、原子发布，TCP 写入不会连带改变 UDP。Clash 写入映射为 `both`，`now` 明确显示 TCP 选择。两者共用 `control/reload` owner、按网络分开的持久化和预热回调。按网络的选择在 reload 和持久化后仍然保留，中断只在真正关闭后确认。自动代理组可以在运行时固定成员；下次配置激活，或通过 DELETE 请求清除固定成员时，固定失效。
 
-组 PATCH 按解析器记录的来源位置，改写可写 `.dae` 文件里的 `policy`、`default`、`final`、`tolerance`、`idle_timeout`、`interrupt_connections` 和 `check_url`。其他原文字节保持不变。改动会走完整校验、持久写入和真实 reload，不只停留在内存。请求必须带针对组 ETag 的强 `If-Match`，并独立于源文件 hash 校验。写入后激活被拒绝时，磁盘内容不回滚。`icon` 可以在配置或源编辑器里改，不属于受限 PATCH 字段。自动代理组可以在运行时固定成员；下次配置激活，或通过 DELETE 请求清除固定成员时，固定失效。详见[原生组控制](./api.md#节点与代理组)。
+组 PATCH 按解析器记录的来源位置，改写可写 `.dae` 文件里的 `policy`、`default`、`final`、`tolerance`、`idle_timeout`、`interrupt_connections` 和 `check_url`。其他原文字节保持不变。改动会走完整校验、持久写入和真实 reload，不只停留在内存。请求必须带针对组 ETag 的强 `If-Match`，并独立于源文件 hash 校验。写入后激活被拒绝时，磁盘内容不回滚。`icon` 可以在配置或源编辑器里改，不属于受限 PATCH 字段；`name` 与 `filters` 同样不受支持。详见[原生组控制](./api.md#节点与代理组)。
 
 ### URLTest 冷启动
 
@@ -151,7 +254,9 @@ setup/TX 之后的定向 Traffic RX 可以在流结束前开启一次半开恢�
 
 持续且实际测得的 carrier 压力可以重新打开预算内的比较，但不增加业务失败，也不直接改变赢家。这是一种提示性证据，从 honk 发给代理服务器，不是端到端 UDP 丢包率，也不是首请求保证；无法观测的路径仍保持未知。详见[提示范围](../design/groups.md#score-评分与生命周期)。
 
-所有评分状态都只在当前进程内存里。精确的 node-target cell 用一个容量上限为 4,096 的 LRU，聚合 cell 用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不代表某个服务在语义上已经解锁；需要这种粗粒度 cohort 时，用现有的 routing 或 geosite 规则选出专用的服务 Score 组。成功的进程内 reload 复用同一份共享状态，并移除已删除组或成员的 cell；进程重启则清空状态。评分 cell 和只由 scorer 持有的 domain/IP key 不会写进日志、持久化存储或任何 API 输出。已建立连接的元数据不受影响。Clash 仍把 Score 表示为 `type: "url_test"`，`now` 显示当前聚合后的 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
+所有评分状态都只在当前进程内存里。精确的 node-target cell 用一个容量上限为 4,096 的 LRU，聚合 cell 用另一个 4,096 项 LRU。精确目标证据衡量的是实际 transport 质量，不代表某个服务在语义上已经解锁；需要这种粗粒度 cohort 时，用现有的 routing 或 geosite 规则选出专用的服务 Score 组。成功的进程内 reload 复用同一份共享状态，并移除已删除组或成员的 cell；进程重启则清空状态。评分 cell 和只由 scorer 持有的 domain/IP key 不会写进日志、持久化存储或任何 API 输出。已建立连接的元数据不受影响。
+
+为兼容 Clash，Score 仍由 honk 自动选择，但对外表示为 `type: "url_test"`；`now` 显示当前聚合后的 TCP 胜者，并拒绝对该组执行 `PUT /proxies/{name}`。
 
 独立的比较存储最多有 512 个 cell，逻辑分配上限为 1 MiB，包含所持有 key 与 vector 的容量。这不是进程 RSS 上限，分配器开销和其他状态都不在其中；缺失或被淘汰的支持保持未知。
 
@@ -162,6 +267,12 @@ TCP 建立失败且可重试时，Score 组处理的请求最多再顺序试一�
 采样在共享预算内补上可用性、响应、普通资格和恢复方面的缺口。只有资格／恢复的缺口也补上后，honk 才会对新鲜的等价 cohort 停止强制采样；缺少传输证据时，则等待真实负载出现。`scoreVerification` 区分临时转发、已观测可用性、新鲜的成对 `challengers` 关系、证据问题 `question` 和等待原因 `waitReason`；聚合读取会检查保留的 IPv4/IPv6 等待状态，不花费额度。详见 [API 验证](./api.md#score-验证信息)。这些关系是可撤销的经验观测，不是最优候选识别，也不保证未来的网络行为。
 
 每个挑战者与所选成员的比较，只在各自共享的时间块内判断，不会在挑战者之间联合对齐。可选工作只有一个派发顺序：先派发未训练的成员，再按成员未决问题的进展排序，最后按最久未被选中排序。试用保留业务额度和在途上限，不重放请求。只读的 `question`、`nextAction` 与 `waitReason` 报告这个顺序里的首个成员，不暴露目标身份。
+
+## 声明
+
+每个组都是 `group { ... }` 中的命名子节。同名声明不会合并，以最后一份为准。不要在包含文件里重复声明同一个组来扩展它。
+
+`filter:` 条目累加。其他 key 都以最后一次出现的值为准，较早的无效值不会被检查。
 
 ## 过滤解析
 

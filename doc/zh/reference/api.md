@@ -1,6 +1,6 @@
 # 原生 API、Clash API 与 `/stats` 参考
 
-原生 API 和已实现的 Clash 兼容 HTTP 接口共用同一个引擎 handle 和用户态统计，但两者的 Cargo feature、listener、凭据和 HTTP 边界各自独立。
+原生 API 和已实现的 Clash 兼容 HTTP 接口共用同一个引擎 handle 和用户态统计，但两者的 Cargo feature、listener、凭据和 HTTP 边界各自独立。Clash 兼容接口从[启用与认证](#启用与认证)开始，路由见 [endpoint 表](#endpoint-表)。
 
 ## 原生 API
 
@@ -1412,7 +1412,7 @@ Clash listener 允许任意 CORS 来源，没有原生 API 那样的 Host 和 Or
 | GET | `/dns/query` | 经 honk DNS 解析 `?name=` 并返回 DoH 风格 JSON；`?type=` 默认为 `A`。 |
 | POST | `/cache/fakeip/flush` | 兼容性 no-op，返回 204；没有持久化 FakeIP 映射可清除。 |
 | POST | `/cache/dns/flush` | 清除存活 DNS 缓存及其持久化 DNS 状态。 |
-| GET | `/providers/proxies` | 将非空组暴露为 Clash proxy provider。 |
+| GET | `/providers/proxies` | 将非空组暴露为 Clash proxy provider。每个 provider 是一个代理组，不是订阅；订阅状态见 [Provider 观测与刷新](#provider-观测与刷新)。 |
 | GET | `/providers/rules` | 返回当前空桩文档 `{"providers":[]}`。 |
 | GET | `/ui`, `/ui/*` | 将 `/ui` 重定向到 `/ui/`，并提供已配置的外部 UI 目录。 |
 

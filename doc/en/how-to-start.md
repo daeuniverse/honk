@@ -589,6 +589,7 @@ cargo run --release -p honk-core -- \
 - [Configuration guide](configuration.md)
 - [Global configuration](reference/global.md)
 - [Nodes and protocols](reference/nodes.md)
+- [Subscriptions](reference/subscription.md)
 - [Group policies](reference/groups.md)
 - [Routing rules](reference/routing.md)
 - [DNS configuration](reference/dns.md)

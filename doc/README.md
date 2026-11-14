@@ -23,10 +23,10 @@ Field-by-field configuration and API reference. / 逐字段的配置与 API 参�
 | ---------- | --------- | ------ |
 | `global { }` | [en/reference/global.md](./en/reference/global.md) | [zh/reference/global.md](./zh/reference/global.md) |
 | `node { }` + share links | [en/reference/nodes.md](./en/reference/nodes.md) | [zh/reference/nodes.md](./zh/reference/nodes.md) |
+| `subscription { }` | [en/reference/subscription.md](./en/reference/subscription.md) | [zh/reference/subscription.md](./zh/reference/subscription.md) |
 | `group { }` | [en/reference/groups.md](./en/reference/groups.md) | [zh/reference/groups.md](./zh/reference/groups.md) |
 | `routing { }` | [en/reference/routing.md](./en/reference/routing.md) | [zh/reference/routing.md](./zh/reference/routing.md) |
 | `dns { }` | [en/reference/dns.md](./en/reference/dns.md) | [zh/reference/dns.md](./zh/reference/dns.md) |
-| `subscription { }` | [en/reference/subscription.md](./en/reference/subscription.md) | [zh/reference/subscription.md](./zh/reference/subscription.md) |
 | `assets { }` | [en/reference/assets.md](./en/reference/assets.md) | [zh/reference/assets.md](./zh/reference/assets.md) |
 | `experimental { }` | [en/reference/experimental.md](./en/reference/experimental.md) | [zh/reference/experimental.md](./zh/reference/experimental.md) |
 | Native API, Clash API and `/stats` | [en/reference/api.md](./en/reference/api.md) | [zh/reference/api.md](./zh/reference/api.md) |

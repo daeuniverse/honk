@@ -1,10 +1,6 @@
 # 订阅参考
 
-`subscription {}` 配置远程节点列表。下面说明条目语法、持久化与恢复机制，以及支持的订阅正文格式。
-
-## `subscription {}` 语法
-
-URL 写在条目行上。要给单个订阅覆盖下载设置，可以在带引号的 URL 后面追加一个块，每行一个 key：
+`subscription {}` 配置远程节点列表。
 
 ```dae
 subscription {
@@ -19,24 +15,56 @@ subscription {
 }
 ```
 
-条目块接受四个选项：
+## 字段
 
-| 选项 | 作用 | 内置默认值 |
+给单个订阅设置选项时，在带引号的 URL 后面追加一个块，每行一个 key。四个选项都可省略。省略的选项先取 `assets.subscription` 里对应的默认值（`route` 取 `assets.route`），再取内置默认值。见 [Assets 配置参考](./assets.md)。
+
+| Key | 默认值 | 含义 |
 | --- | --- | --- |
-| `ua` | 覆盖请求的 User-Agent。 | `honk/<version>` |
-| `interval` | 设置刷新间隔；`0` 禁用定期刷新。 | `86400s` |
-| `cache` | `false` 表示该订阅的正文不写入订阅存储。 | 开启 |
-| `route` | 指定拉取出口，见下文。 | `routing` |
+| `ua` | `honk/<version>` | 覆盖请求的 `User-Agent`；见 [`ua`](#ua)。 |
+| `interval` | `86400s` | 设置定期刷新间隔；见 [`interval`](#interval)。 |
+| `cache` | `true` | 把该订阅的正文保存在订阅存储中；见 [`cache`](#cache)。 |
+| `route` | `routing` | 选择拉取出口；见 [`route`](#route)。 |
 
-没设置的选项先取 `assets.subscription` 的默认值，出口则取 `assets.route`，再取内置默认值。见 [Assets 配置参考](./assets.md)。
+### `ua`
 
-`interval` 取整数秒，可以不带单位，也可以带小写的 `s`、`m` 或 `h` 后缀；`ms` 表示毫秒，会向上取整到秒。`d`、`1h30m` 这类组合值，以及 `0.5s` 这类小数都无效。值无效时产生 warning，并把 `interval` 设为 `0`，也就是关闭定期刷新和失败重试，不会回退到继承来的值。
+把该值作为请求的 `User-Agent` 发送。默认是 `honk/<version>`。
 
-`cache` 接受 `true`、`yes`、`1`、`on`、`false`、`no`、`0` 和 `off`，不区分大小写。值无效时产生 warning，并把 `cache` 设为 `true`。
+`ua: ''` 把继承来的 `assets.subscription.ua` 重置为 `honk/<version>`，不会删掉 `User-Agent` header。值不是合法的 HTTP header 值时，拉取失败。
 
-`ua: ''` 会把继承来的 `assets.subscription.ua` 重置为内置的 `honk/<version>`，不会删掉 `User-Agent` header。`ua` 不是合法的 HTTP header 值时，拉取失败。
+### `interval`
 
-两种旧写法仍可解析，且不产生 warning：
+设置刷新间隔。默认是 `86400s`；`0` 关闭定期刷新和失败重试。
+
+取整数秒，可以不带单位，也可以带小写的 `s`、`m` 或 `h` 后缀。`ms` 表示毫秒，向上取整到秒。`d`、`1h30m` 这类组合值，以及 `0.5s` 这类小数都无效。
+
+值无效时产生 warning，并把 `interval` 设为 `0`；honk 不会改用继承来的值。
+
+### `cache`
+
+启用 `global.store_subscribe` 时，把该订阅拉取到的正文保存在订阅存储中，供离线启动恢复使用。默认是 `true`。
+
+`cache` 接受 `true`、`yes`、`1`、`on`、`false`、`no`、`0` 和 `off`，不区分大小写。
+
+`false` 既不保存也不恢复正文，维护任务会删掉此前保存的正文。值无效时产生 warning，并把 `cache` 设为 `true`。
+
+修改 `global.store_subscribe` 需要重启；SIGHUP 会拒绝这项修改。
+
+### `route`
+
+选择拉取该订阅 URL 的出口。默认是 `routing`。
+
+| 出口 | 行为 |
+| --- | --- |
+| 空值或 `routing` | 每个 URL 都按流量路由规则处理，重定向也不例外。规则可以选择节点、组、`direct` 或 `block`。 |
+| 组名 | 强制经过该组。 |
+| `direct` | 使用引导解析器和 bypass mark 直连主机，不经过路由。沿用原来的直连传输。 |
+
+`route` 为空时，所有构建都跟随路由。honk 在校验时拒绝未知组。如果这条出口要在首次启动时就能用，见[首次启动时订阅 URL 被阻断](#首次启动时订阅-url-被阻断)。
+
+## 条目语法
+
+URL 写在条目行上。两种旧写法仍可解析，且不产生 warning：
 
 | 写法 | 示例 |
 | --- | --- |
@@ -76,7 +104,7 @@ URL 带引号时，紧贴结束引号或完整 `(UA)` 后缀的 `#` 会被当作
 
 这种紧贴尾部的兼容截断发生在块结构识别之后，不算词法注释。`sub: 'http://q'(ua)# }` 里独立的 `}` 仍会关闭订阅块，后面的条目就会落到块外。应写成 `(ua) # }`，让花括号变成注释数据。
 
-引号错误和块结构规则见[方言参考](./dialect.md)。`route` 为空时，所有构建都跟随路由。
+引号错误和块结构规则见[方言参考](./dialect.md)。
 
 ## 内部模型
 
@@ -89,9 +117,9 @@ URL 带引号时，紧贴结束引号或完整 `(UA)` 后缀的 `#` 会被当作
 | `update_interval` | u64 | `86400` | 是，对应 `interval` | 定期刷新间隔，单位为秒；`0` 禁用定期刷新。 |
 | `user_agent` | string 或 null | null | 是，对应 `ua` | 可选的 `User-Agent` 覆盖值；为 null 或空时发送 `honk/<version>`。 |
 | `headers` | `{key,value}[]` | `[]` | 否 | 按顺序发送的额外请求 header；同名 header 逐条发送。header 名称或值无效时，拉取失败。 |
-| `download_detour` | string | `""` | 是，对应 `route` | 拉取的出口。空值或 `routing` 按路由规则处理，`direct` 直连主机，组名表示始终经过该组。未知组在校验时被拒绝。 |
+| `download_detour` | string | `""` | 是，对应 `route` | 拉取的出口；见 [`route`](#route)。 |
 | `enabled` | bool | `true` | 否 | 禁用的订阅不恢复、不拉取、不刷新。 |
-| `cache` | bool | `true` | 是，对应 `cache` | `global.store_subscribe` 启用时，保存拉取到的正文，供离线启动恢复。设为 `false` 时既不保存也不恢复，维护任务会删掉此前保存的正文。 |
+| `cache` | bool | `true` | 是，对应 `cache` | 正文缓存，供离线启动恢复；见 [`cache`](#cache)。 |
 | `last_updated` | datetime 或 null | null | 否 | 模型元数据；当前 core 运行时不会更新该字段。 |
 | `node_count` | u32 | `0` | 否 | 模型元数据；当前 core 运行时不会更新该字段。 |
 | `created_at` | datetime | 构造时间 | 否 | 模型构造时间。 |
@@ -133,13 +161,7 @@ URL 带引号时，紧贴结束引号或完整 `(UA)` 后缀的 `#` 会被当作
 
 订阅正文及其产生的节点都属于运行时状态，不会写回 dae 配置。
 
-除非条目的 `route` 或 `assets.route` 另有指定，订阅拉取默认走路由，和 honk 发起的其他下载一样。
-
-| 出口 | 行为 |
-| --- | --- |
-| 空值或 `routing` | 每个 URL 都按流量路由规则处理，重定向也不例外。规则可以选择节点、组、`direct` 或 `block`。 |
-| 组名 | 强制经过该组。 |
-| `direct` | 使用引导解析器和 bypass mark，不经过路由。沿用原来的直连传输。 |
+除非条目的 [`route`](#route) 或 `assets.route` 另有指定，订阅拉取默认走路由，和 honk 发起的其他下载一样。
 
 经路由的请求与 Geo 数据、外部 UI 下载共用路由决策和隧道，并保留同样的 `User-Agent`、header 和下载限制：
 
@@ -178,8 +200,6 @@ SIGHUP 时，拉取身份相同的订阅保留运行时 ID；拉取身份由 URL
 - 不支持或格式错误的节点逐个跳过。共用节点构建器给出的 warning 带从 1 开始的条目索引和固定的拒绝原因。流传输规范化错误还会带上规范字段，例如 `proxies[1].xhttp` 或 `outbounds[1].ws_headers`，不暴露提交的 header 名称、值或凭据。只有剩余可用节点为零时，整个正文才算失败；空结果绝不会清空上一 generation 的节点。
 
 上一次有效正文指通过当前导入规则校验的正文，不是最后一次成功发布的运行时配置。部分条目无效、但还剩一个可用节点的正文，可以替换存储；全部条目无效的不行。恢复正文时，honk 按当前规则重新解析，所以旧版本保存的正文可能被拒绝。写入成功后，如果节点集合校验或发布失败，活动配置不变，但磁盘上可能已经存了新正文。磁盘和活动配置不在同一个事务里。
-
-SIGHUP 会拒绝修改 `global.store_subscribe`，因为该设置需要重启。
 
 ## 首次启动时订阅 URL 被阻断
 
@@ -321,7 +341,7 @@ VLESS 字段会在派生节点身份前应用：
 | `reality-opts.spider-x` | REALITY spider path；缺失或为空时使用 `/`。 |
 | `ws-opts.path` | WebSocket path；回退到扁平别名 `ws-path`。 |
 | `ws-opts.headers.Host` | WebSocket Host header。key 匹配不区分大小写，第一个非空白值优先；字符串保留原始字节，有限数字转成文本。无效或空白的 Host 值，honk 忽略。取值依次回退到 scalar `ws-headers`、`ws-host`，只有前面都没有可用值时才看下一项。 |
-| `ws-opts.headers.<name>` | 附加的 WebSocket 升级 header，所有支持 WebSocket 的代理共用；以小写名称导入，例如 `User-Agent`。null 值忽略，非 scalar 值会让条目被丢弃；保留的握手 header 会按[节点字段约定](./nodes.md#节点字段)拒绝该条目。 |
+| `ws-opts.headers.<name>` | 附加的 WebSocket 升级 header，所有支持 WebSocket 的代理共用；以小写名称导入，例如 `User-Agent`。null 值忽略，非 scalar 值会让条目被丢弃；保留的握手 header 会按[节点字段约定](./nodes.md#字段)拒绝该条目。 |
 | `grpc-opts.grpc-service-name` | gRPC service name；回退到 `grpc-service`。 |
 | `client-fingerprint` | 有意不导入。TLS 指纹由进程级 `global.tls_implementation` 与 `global.utls_imitate` 选择。 |
 
@@ -373,7 +393,7 @@ TLS/SNI、REALITY、WebSocket/gRPC 升级 header、VLESS 数据包选项，以�
 
 | 来源特有情况 | 导入行为 |
 | --- | --- |
-| WebSocket `transport.headers` | `Host` 保留为独立的 string 字段，重复的 Host 别名会被拒绝。其他 string 值原样保留，空字符串也算；null 忽略，其他类型会让条目被拒绝。名称和值遵循[节点 header 约定](./nodes.md#节点字段)。 |
+| WebSocket `transport.headers` | `Host` 保留为独立的 string 字段，重复的 Host 别名会被拒绝。其他 string 值原样保留，空字符串也算；null 忽略，其他类型会让条目被拒绝。名称和值遵循[节点 header 约定](./nodes.md#字段)。 |
 | VLESS 未启用 H2MUX/UoT 封装，且没有显式 `packet_encoding` 选择其他路径 | 使用 Single XUDP 并允许 UDP。这是 sing-box 导入的默认值，不是 Auto 的全局含义。 |
 | gRPC 服务名为空或省略 | 保留 sing-box 的空服务名，不使用 honk 的 `GunService` 默认值。 |
 | Hysteria2 提供 `server_ports`，未提供 `server_port` | 以第一个跳跃端口作为名义 endpoint。 |
