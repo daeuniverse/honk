@@ -2,10 +2,6 @@
 
 `subscription {}` configures remote node lists.
 
-## `subscription {}` syntax
-
-Declare the URL on the entry line. To override download settings for one subscription, add a block after the quoted URL, one key per line:
-
 ```dae
 subscription {
     primary: 'https://example.com/sub'
@@ -19,24 +15,56 @@ subscription {
 }
 ```
 
-The entry block accepts four options:
+## Fields
 
-| Option | Effect | Built-in default |
+To set options for one subscription, add a block after the quoted URL, one key per line. None is required. An omitted option takes the matching `assets.subscription` default, or `assets.route` for `route`, before the built-in default. See the [assets reference](./assets.md).
+
+| Key | Default | Meaning |
 | --- | --- | --- |
-| `ua` | Override the request User-Agent. | `honk/<version>` |
-| `interval` | Set the refresh duration; `0` disables periodic refresh. | `86400s` |
-| `cache` | `false` keeps this subscription's body out of the subscription store. | On |
-| `route` | Select the fetch route (see below). | `routing` |
+| `ua` | `honk/<version>` | Override the request `User-Agent`; see [`ua`](#ua). |
+| `interval` | `86400s` | Set the periodic refresh interval; see [`interval`](#interval). |
+| `cache` | `true` | Keep this subscription's body in the subscription store; see [`cache`](#cache). |
+| `route` | `routing` | Select the fetch route; see [`route`](#route). |
 
-An absent option takes the `assets.subscription` default, or `assets.route` for the route, before the built-in default. See the [assets reference](./assets.md).
+### `ua`
 
-`interval` takes whole seconds, either bare or with a lowercase `s`, `m` or `h` suffix. Milliseconds use the `ms` suffix and round up to whole seconds. `d`, compound values such as `1h30m` and fractions such as `0.5s` are invalid. An invalid `interval` warns and becomes `0`, which turns off periodic refresh and failure retries. It does not fall back to the inherited value.
+Send this value as the request `User-Agent`. It defaults to `honk/<version>`.
 
-`cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off`, in any case. An invalid `cache` warns and becomes `true`.
+`ua: ''` resets an inherited `assets.subscription.ua` to `honk/<version>`; it does not remove the `User-Agent` header. A value that is not a valid HTTP header value fails the fetch.
 
-`ua: ''` resets an inherited `assets.subscription.ua` to the built-in `honk/<version>`. It does not remove the `User-Agent` header. A `ua` that is not a valid HTTP header value fails the fetch.
+### `interval`
 
-Two earlier forms still parse without a warning:
+Set the refresh interval. It defaults to `86400s`; `0` disables periodic refresh and failure retries.
+
+The value is whole seconds, either bare or with a lowercase `s`, `m` or `h` suffix. `ms` values are milliseconds and round up to whole seconds. `d`, compound values such as `1h30m`, and fractions such as `0.5s` are invalid.
+
+An invalid value warns and becomes `0`. It does not fall back to the inherited value.
+
+### `cache`
+
+With `global.store_subscribe`, keep this subscription's fetched body in the subscription store for offline startup. It defaults to `true`.
+
+`cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off`, in any case.
+
+`false` neither stores nor restores the body, and maintenance deletes a body kept earlier. An invalid value warns and becomes `true`.
+
+Changing `global.store_subscribe` requires a restart; SIGHUP rejects the change.
+
+### `route`
+
+Select the route that fetches this subscription's URL. It defaults to `routing`.
+
+| Route | Behavior |
+| --- | --- |
+| Empty or `routing` | Apply traffic-routing rules to each URL, including redirects. Rules may select a node, group, `direct`, or `block`. |
+| Group name | Force that group. |
+| `direct` | Use the bootstrap resolver and bypass mark to connect directly to the host, without routing. This retains the previous direct transport. |
+
+An empty `route` follows routing in every build. honk rejects an unknown group during validation. If the route must work at first start, see [First start when the subscription URL is blocked](#first-start-when-the-subscription-url-is-blocked).
+
+## Entry syntax
+
+Declare the URL on the entry line. Two legacy forms still parse without a warning:
 
 | Form | Example |
 | --- | --- |
@@ -70,7 +98,7 @@ After a quoted URL, a glued `#` immediately after the closing quote or one balan
 
 The glued-tail compatibility handling runs after block recognition. It does not treat the `#` as a lexical comment. In `sub: 'http://q'(ua)# }`, the separated `}` still closes the subscription block, so subsequent entries can fall outside it. Write `(ua) # }` to make the brace comment data instead.
 
-Quote-error and block rules are listed in the [dialect reference](./dialect.md). An empty `route` follows routing in every build.
+Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 
 ## Internal model
 
@@ -83,9 +111,9 @@ Quote-error and block rules are listed in the [dialect reference](./dialect.md).
 | `update_interval` | u64 | `86400` | Yes, as `interval` | Periodic refresh interval in seconds; `0` disables periodic refresh. |
 | `user_agent` | string or null | null | Yes, as `ua` | Optional `User-Agent` override; null or empty sends `honk/<version>`. |
 | `headers` | `{key,value}[]` | `[]` | No | Ordered extra request headers; a repeated name is sent repeatedly. An invalid header name or value fails the fetch. |
-| `download_detour` | string | `""` | Yes, as `route` | Fetch route: empty or `routing` follows the routing rules, `direct` connects directly to the host, and a group name forces that group. An unknown group is rejected during validation. |
+| `download_detour` | string | `""` | Yes, as `route` | Fetch route; see [`route`](#route). |
 | `enabled` | bool | `true` | No | Disabled subscriptions are not restored, fetched, or refreshed. |
-| `cache` | bool | `true` | Yes, as `cache` | With `global.store_subscribe`, keep the fetched body for offline startup. `false` neither stores nor restores it, and maintenance deletes a body kept earlier. |
+| `cache` | bool | `true` | Yes, as `cache` | Body caching for offline startup; see [`cache`](#cache). |
 | `last_updated` | datetime or null | null | No | Model metadata; the current core runtime does not update it. |
 | `node_count` | u32 | `0` | No | Model metadata; the current core runtime does not update it. |
 | `created_at` | datetime | construction time | No | Model construction time. |
@@ -127,13 +155,7 @@ The previous process has exited before import, so its final body writes are copi
 
 Subscription bodies and their nodes remain runtime state. Neither is written back into the dae configuration.
 
-Subscription fetches follow routing unless the entry's `route` or `assets.route` overrides it. This matches other downloads honk initiates.
-
-| Route | Behavior |
-| --- | --- |
-| Empty or `routing` | Apply traffic-routing rules to each URL, including redirects. Rules may select a node, group, `direct`, or `block`. |
-| Group name | Force that group. |
-| `direct` | Use the bootstrap resolver and bypass mark, without routing. This retains the previous direct transport. |
+Subscription fetches follow routing unless the entry's [`route`](#route) or `assets.route` overrides it. This matches other downloads honk initiates.
 
 Routed requests share route decisions and tunnels with geodata and external UI downloads. They retain the same `User-Agent`, headers and download constraints:
 
@@ -172,8 +194,6 @@ Failure handling preserves a usable runtime rather than clearing it:
 - An unsupported or malformed node is skipped individually. The shared node builder's warning includes a one-based entry index and a static rejection reason. Stream-normalization failures also retain the canonical field, such as `proxies[1].xhttp` or `outbounds[1].ws_headers`, without exposing supplied header names, values or credentials. The whole body fails only when no usable nodes remain. An empty result never clears the previous generation.
 
 The last valid body is the last body accepted by the current import policy, not the last successfully published runtime generation. A partial body with one distinct usable node may replace the stored body; an all-invalid body cannot. Restore reparses with the current policy and may reject a body saved by an older version. Runtime collection or publication failure after a successful write retains the active generation but can leave the new body on disk. Disk and active state are not one transaction.
-
-Changing `global.store_subscribe` through SIGHUP is rejected as restart-required.
 
 ## First start when the subscription URL is blocked
 
@@ -314,7 +334,7 @@ VLESS fields are applied before node identity is derived:
 | `reality-opts.spider-x` | REALITY spider path; missing or empty becomes `/`. |
 | `ws-opts.path` | WebSocket path; falls back to flat `ws-path`. |
 | `ws-opts.headers.Host` | WebSocket Host header: the first nonblank case-insensitive Host value wins; strings retain their bytes and finite numbers become text. Invalid or blank Host values are ignored. Falls back to scalar `ws-headers`, then `ws-host`, inspecting each only if no earlier value won. |
-| `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#node-fields). |
+| `ws-opts.headers.<name>` | Additional WebSocket upgrade headers, shared by every WebSocket-capable proxy, imported as lowercase names (for example `User-Agent`). Null values are ignored and non-scalar values drop the entry; reserved handshake headers reject it per the [node field contract](./nodes.md#fields). |
 | `grpc-opts.grpc-service-name` | gRPC service name; falls back to `grpc-service`. |
 | `client-fingerprint` | Intentionally not imported. TLS fingerprint selection is process-wide through `global.tls_implementation` and `global.utls_imitate`. |
 
@@ -366,7 +386,7 @@ sing-box TLS is off when `tls` or `tls.enabled` is absent, so Trojan, Hysteria2,
 
 | Source-specific case | Import behavior |
 | --- | --- |
-| WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#node-fields). |
+| WebSocket `transport.headers` | `Host` remains a dedicated string field; repeated Host aliases reject. Other string values, including empty strings, are preserved; null is ignored and other types reject the entry. Names and values follow the [node header contract](./nodes.md#fields). |
 | VLESS without an enabled H2MUX/UoT wrapper or explicit `packet_encoding` selecting another path | Single XUDP with UDP permitted. This is a sing-box import default, not the global meaning of Auto. |
 | Empty or omitted gRPC service name | Retain sing-box's empty service, not honk's `GunService` default. |
 | Hysteria2 `server_ports` without `server_port` | Use the first hopping port as the nominal endpoint. |

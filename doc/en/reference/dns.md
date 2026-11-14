@@ -1,32 +1,66 @@
 # DNS configuration reference
 
-`dns { ... }` configures DNS in dae syntax.
+`dns { ... }` configures DNS in dae syntax and covers named upstream servers, request and response routing, hosts, EDNS Client Subnet, cache, and the optional standalone listener.
 
-## Top-level keys
+## Example
+
+```dae
+dns {
+    # Omit bind to keep the standalone listener disabled.
+    # bind: 'tcp+udp://:1053'
+    use_host: true
+    ipversion_prefer: 4
+
+    upstream {
+        default: 'udp://223.5.5.5:53'
+        cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
+        google_doh: 'https://dns.google/dns-query' -> proxy
+    }
+
+    routing {
+        request {
+            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
+            qname(geosite: category-ads-all) -> reject
+            qname(suffix: cn) -> default
+            qtype(https) -> reject
+            fallback: default
+        }
+        response {
+            upstream(google_doh) -> accept
+            ip(geoip: private) && !qname(geosite: cn) -> google_doh
+            fallback: accept
+        }
+    }
+
+    optimistic_cache: true
+    optimistic_cache_ttl: 600
+    max_cache_size: 10000
+    fixed_domain_ttl {
+        ddns.example.org: 10
+        nocache.test: 0
+    }
+}
+```
+
+## Fields
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `bind` | absent / `""` | Optional standalone DNS listener; an empty value disables only this listener. |
-| `use_host` | `false` | Repeatable hosts source: `true` or the path `/etc/hosts` reads standard hosts syntax; any other path reads an OxiDNS-compatible rule file. |
-| `client_subnet` | absent / `""` | Optional EDNS Client Subnet preset: IPv4, IPv4 CIDR, `auto`, or `auto(IPv4)`. |
-| `upstream { ... }` | `default: 'udp://223.5.5.5:53'` | Named upstream servers. The first explicit `upstream` block replaces the built-in entry. |
-| `routing { ... }` | no rules; request fallback `default`; response fallback `accept` | Ordered request and response routing. |
-| `ipversion_prefer` | omitted: `both` | `4` selects `preferipv4`; `6` selects `preferipv6`; `0` is dae's no preference, `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. |
-| `optimistic_cache` | `true` | Enables positive and negative cache reads and writes. |
-| `optimistic_cache_ttl` | `600` seconds | Fixed cache and wire TTL for every response except NXDOMAIN, SERVFAIL and NODATA; `0` uses the upstream's minimum TTL. |
-| `optimistic_stale_reply_ttl` | `30` seconds | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL, while `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. |
-| `max_cache_size` | `10000` | Maximum cache entries, at most 100,000; also determines the per-shard byte budget below. |
-| `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
+| `bind` | `omitted` (`""`) | Optional standalone DNS listener; an empty value disables only this listener. See [`bind`](#standalone-listener-bind). |
+| `use_host` | `omitted` (`false`) | Repeatable hosts source: `true` or the path `/etc/hosts` reads standard hosts syntax, and any other path reads an OxiDNS-compatible rule file. See [`use_host`](#hosts-snapshot-use_host). |
+| `client_subnet` | `omitted` (`""`) | Optional EDNS Client Subnet preset for named upstreams: IPv4, IPv4 CIDR, `auto` or `auto(IPv4)`. See [`client_subnet`](#edns-client-subnet-client_subnet). |
+| `upstream { ... }` | `omitted` (`default: 'udp://223.5.5.5:53'`) | Named upstream servers, equivalent to the Clash configuration's `nameserver`; the first explicit block replaces the built-in entry. See [Upstreams](#upstreams). |
+| `routing { ... }` | `omitted` (no rules; request fallback `default`; response fallback `accept`) | Ordered request and response routing; the first matching rule wins. See [DNS routing](#dns-routing). |
+| `ipversion_prefer` | `omitted` (`both`) | Address-family preference for lookups and upstream dialing; an unparsable value keeps `both` and is reported as a diagnostic. See [`ipversion_prefer`](#ipversion_prefer). |
+| `optimistic_cache` | `omitted` (`true`) | Enables positive and negative cache reads and writes. See [`optimistic_cache`](#optimistic_cache). |
+| `optimistic_cache_ttl` | `omitted` (`600` seconds) | Fixed cache and wire TTL for every response except NXDOMAIN, SERVFAIL and NODATA; `0` uses the upstream's minimum TTL. See [`optimistic_cache_ttl`](#optimistic_cache_ttl). |
+| `optimistic_stale_reply_ttl` | `omitted` (`30` seconds) | TTL for served-stale positive answers; a non-zero value replaces every non-OPT RR TTL and `0` keeps cached policy-rewritten wire TTLs. See [`optimistic_stale_reply_ttl`](#optimistic_stale_reply_ttl). |
+| `max_cache_size` | `omitted` (`10000`) | Maximum number of cache entries, at most 100,000; it also sets the per-shard byte budget. See [`max_cache_size`](#max_cache_size). |
+| `fixed_domain_ttl { domain: seconds }` | `omitted` (empty) | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code. See [`fixed_domain_ttl`](#fixed_domain_ttl). |
 
-A scalar value extends to the end of its physical line and splits only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` stay intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line. Malformed quotes fail the configuration.
+All keys are optional. `omitted` in the Default column marks a key you may leave out; the parenthesized text is its default value or equivalent spelling. See [Parsing rules](#parsing-rules) for scalar extent, comments and accepted boolean spellings.
 
-For scalar settings, only an unquoted token-head `#` starts a comment. `use_host: /tmp/a#b` selects the literal path `/tmp/a#b` with `legacy-glued-hash`; write `use_host: /tmp/a # comment` for a comment. Repeated `use_host` declarations retain source order and existing deduplication. For `optimistic_cache`, shorthands `t`, `y`, `f`, and `n` still mean false, but emit `legacy-bool-shorthand`. Use `true` or `false`.
-
-`optimistic_cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off` in any case. Any other value turns the cache off and emits a diagnostic.
-
-`hosts_file` was removed and fails the configuration with `removed-dns-hosts-file`; use `use_host` paths instead.
-
-Unknown keys, blocks and statements inside `dns` produce `unknown-key`, `unknown-block` or `unknown-statement` warnings and are ignored. `dns.routing` accepts only `request` and `response` blocks.
+A SIGHUP reload rejects a change to the `bind` host, port or transport set as restart-required; see [`bind`](#standalone-listener-bind).
 
 ## Standalone listener (`bind`)
 
@@ -34,7 +68,7 @@ The standalone listener uses ordinary, unmarked sockets in the host network name
 
 | Value | Result |
 | --- | --- |
-| absent or `""` | No standalone listener. |
+| `omitted` or `""` | No standalone listener. |
 | Numeric `IP:port`, such as `127.0.0.1:1053` or `[::1]:1053` | UDP listener. |
 | `udp://host:port` | UDP listener. |
 | `tcp://host:port` | TCP listener. |
@@ -47,6 +81,12 @@ A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fr
 Listener ownership is process-scoped. A SIGHUP reload accepts a semantically equivalent spelling but rejects any change to the host, port or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver. Restrict source access with the host firewall and never publish it to an untrusted network.
 
 Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
+
+```dae
+dns {
+    bind: 'tcp+udp://127.0.0.1:1053'
+}
+```
 
 ## Hosts snapshot (`use_host`)
 
@@ -295,7 +335,145 @@ NXDOMAIN and SERVFAIL skip response rules and fallback. When the upstream exchan
 
 A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle.
 
-### Legacy conversion
+## Address-family strategy
+
+### ipversion_prefer
+
+`ipversion_prefer` sets the address-family preference for eligible A and AAAA lookups.
+
+| dae setting | Internal strategy | Behavior |
+| --- | --- | --- |
+| omitted | `both` | Run eligible A and AAAA work concurrently; suppress neither family. |
+| `ipversion_prefer: 0` | `both` | dae's no-preference value; the same behavior as omitted. |
+| `ipversion_prefer: 4` | `preferipv4` | Prefer IPv4 while retaining IPv6 fallback. |
+| `ipversion_prefer: 6` | `preferipv6` | Prefer IPv6 while retaining IPv4 fallback. |
+
+`ipversion_prefer` defaults to `both`. A value honk cannot parse keeps `both` and is reported as a diagnostic. The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipversion_prefer` syntax.
+
+```dae
+dns {
+    ipversion_prefer: 4
+}
+```
+
+### Preferred-family lookups
+
+In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline. It preserves the caller's logical source, original destination, ingress profile, and wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA. If it has none, or the sibling has an ordinary availability failure, the non-preferred answer is returned. A typed local packet refusal, including carrier Capacity, instead terminates resolution with that cause and cannot be replaced by a stale answer. This adds one upstream query on a relevant cache miss.
+
+### Bootstrap dial order
+
+The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
+
+## Cache and fixed TTL
+
+### optimistic_cache
+
+Enables positive and negative cache reads and writes. Defaults to `true`; with `false`, replies keep upstream TTLs.
+
+```dae
+dns {
+    optimistic_cache: false
+}
+```
+
+### optimistic_cache_ttl
+
+Sets the cache lifetime and the returned RR TTLs for every response except NXDOMAIN, SERVFAIL and NODATA; those three follow [Negative answers](#negative-answers). Defaults to `600` seconds. `0` uses the upstream's minimum TTL. The value is decimal seconds only: `10m` emits a diagnostic and selects `60`, not `600`.
+
+```dae
+dns {
+    optimistic_cache_ttl: 600
+}
+```
+
+### optimistic_stale_reply_ttl
+
+Sets the TTL of served-stale positive answers. Defaults to `30` seconds. A non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs. In that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. An invalid value emits a diagnostic and selects `30`.
+
+```dae
+dns {
+    optimistic_stale_reply_ttl: 30
+}
+```
+
+### max_cache_size
+
+Sets the maximum number of cache entries and the per-shard answer-byte budget. Defaults to `10000`. The entry limit is divided across at most 16 shards, and each shard's budget is `max(entry capacity × 1 KiB, 65,535 bytes)`. honk evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` clamps to one entry, each with a warning. An invalid value emits a diagnostic and selects `10000`.
+
+```dae
+dns {
+    max_cache_size: 20000
+}
+```
+
+### fixed_domain_ttl
+
+Overrides the positive and NODATA TTL for one domain, applied before `optimistic_cache_ttl`. Empty by default. `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. Keys match one exact name, written in lowercase without a trailing dot, and they do not cover subdomains.
+
+For example, `www.example.com` needs its own entry:
+
+```dae
+dns {
+    fixed_domain_ttl {
+        example.com: 120
+        www.example.com: 120
+        ddns.example.org: 10
+        nocache.test: 0
+    }
+}
+```
+
+Each fixed TTL requires exactly one unsigned 32-bit decimal scalar. Bare and quoted values are accepted, including `0` and `4294967295`. Newly accepted quoted decimals emit `legacy-ttl-quoting`. Invalid or overflowing values emit `invalid-ttl`, and extra tokens emit `trailing-value`; either omits the entry. Put explanations after ` # `, not directly after the number.
+
+### Cache entries and expiry
+
+Request routing runs before cache lookup. Clients share a cache entry only when their queries are identical apart from the transaction ID. The queries must also arrive through the same ingress type and select the same DNS policy and the same upstream or `asis` destination. The raw client source is not part of the key. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
+
+With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. A cached answer has every non-OPT record TTL rewritten to that minimum. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot. That prevents either an old address or an older negative from returning. A nonzero configured or fixed TTL still overrides that zero.
+
+honk rewrites reply TTLs only for a response it caches. An uncacheable query or `optimistic_cache: false` leaves upstream TTLs unchanged. Failure codes other than NXDOMAIN and SERVFAIL, such as REFUSED, follow `optimistic_cache_ttl` and are cached for 600 seconds by default.
+
+Cache lifetime selection uses the original upstream answer's class, response code, and TTL even when response-policy `reject` replaces the reply with synthetic NOERROR. A rejected REFUSED therefore keeps the failure-code TTL rules. A rejected positive NOERROR uses its original TTLs when no configured or fixed override applies.
+
+Cache hits do not count down wire record TTLs. Supersession affects memory only. It does not delete a saved persistence row.
+
+### Negative answers
+
+NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present. A refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
+
+NODATA here means NOERROR with no answer records (`ANCOUNT=0`). A nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
+
+Cached NODATA remains eligible for serve-stale. The stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire. Its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
+
+### Serve-stale and refresh
+
+Expired answers, including cached NODATA, stay available for serve-stale for one hour unless evicted. `optimistic_stale_reply_ttl` sets the reply TTL, not this window. A cache hit with at most `max(original TTL / 10, 1)` seconds left starts one background refresh.
+
+### Routing projection
+
+Disabling cache retention does not disable DNS routing projection. An accepted uncacheable positive answer (including `fixed_domain_ttl: 0`) uses the minimum positive non-OPT wire TTL for projection, falling back to 60 seconds when all such TTLs are zero. This does not rewrite the reply or make it cacheable. Cache-hit remaining lifetimes and served-stale lifetimes are unchanged.
+
+## Parsing rules
+
+### Scalars and comments
+
+A scalar value extends to the end of its physical line and splits only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` stay intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line. Malformed quotes fail the configuration.
+
+For scalar settings, only an unquoted token-head `#` starts a comment. `use_host: /tmp/a#b` selects the literal path `/tmp/a#b` with `legacy-glued-hash`; write `use_host: /tmp/a # comment` for a comment. Repeated `use_host` declarations retain source order and existing deduplication.
+
+### Boolean values
+
+`optimistic_cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off` in any case. Any other value turns the cache off and emits a diagnostic.
+
+For `optimistic_cache`, the shorthands `t`, `y`, `f` and `n` still mean false, but emit `legacy-bool-shorthand`. Use `true` or `false`.
+
+### Unknown and removed keys
+
+Unknown keys, blocks and statements inside `dns` produce `unknown-key`, `unknown-block` or `unknown-statement` warnings and are ignored. `dns.routing` accepts only `request` and `response` blocks.
+
+`hosts_file` was removed; use `use_host` paths instead. A configuration that still sets it fails with `removed-dns-hosts-file`.
+
+## Legacy conversion
 
 The compatibility schema retains flat `routing.rules` entries with `domain` and `upstream`, plus a named `fallback`. They are structured compatibility fields, not additional statements in the current dae syntax. `suffix:`, `keyword:`, `full:`, and `regex:` prefixes select the matcher; a bare legacy domain is an exact `full` match.
 
@@ -309,107 +487,7 @@ Effective request selection follows this precedence:
 
 The `"upstream"` sentinel is ignored only in the third branch; with legacy rules it is an ordinary named target requiring a declaration. Legacy targets are matched exactly, without dae action normalization.
 
-Validation diagnostics preserve original field paths: new-style rules and fallbacks use `dns.routing.request.rules[i].action` and `dns.routing.request.fallback`; converted legacy rules use `dns.routing.rules[i].upstream`; converted or promoted fallbacks use `dns.routing.fallback`.
-With active legacy rules, an undeclared default `upstream` fallback reports `missing-dns-fallback`, an undeclared empty fallback reports `empty-dns-fallback`, and other undeclared targets report `unknown-dns-upstream`. These diagnostics retain field paths but do not echo target names or list declared names. Omitting the legacy fallback is equivalent to explicitly setting `upstream`; either remains valid when that upstream is declared. Empty and `upstream` sentinels remain ignored when no legacy rules are active.
-
-## Address-family strategy
-
-| dae setting | Internal strategy | Behavior |
-| --- | --- | --- |
-| omitted | `both` | Run eligible A and AAAA work concurrently; suppress neither family. |
-| `ipversion_prefer: 4` | `preferipv4` | Prefer IPv4 while retaining IPv6 fallback. |
-| `ipversion_prefer: 6` | `preferipv6` | Prefer IPv6 while retaining IPv4 fallback. |
-
-In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline. It preserves the caller's logical source, original destination, ingress profile, and wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA. If it has none, or the sibling has an ordinary availability failure, the non-preferred answer is returned. A typed local packet refusal, including carrier Capacity, instead terminates resolution with that cause and cannot be replaced by a stale answer. This adds one upstream query on a relevant cache miss.
-
-The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
-
-The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipversion_prefer` syntax.
-
-## Cache and fixed TTL
-
-| Key | Default | Behavior |
-| --- | --- | --- |
-| `optimistic_cache` | `true` | Enables cache reads and publications. With `false`, replies keep upstream TTLs. |
-| `optimistic_cache_ttl` | `600` seconds | Overrides the cache lifetime and the returned RR TTLs; NXDOMAIN, SERVFAIL and NODATA follow [Negative answers](#negative-answers). `0` uses the upstream's minimum TTL. Decimal seconds only: a value such as `10m` emits a diagnostic and selects `60`, not `600`. |
-| `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. An invalid value emits a diagnostic and selects `30`. |
-| `max_cache_size` | `10000` | Entry limit, divided across at most 16 shards. Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`. It evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` to one entry, each with a warning. An invalid value emits a diagnostic and selects `10000`. |
-| `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`. `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. Keys match one exact name, written in lowercase without a trailing dot. They do not cover subdomains. |
-
-Request routing runs before cache lookup. Clients share a cache entry only when their queries are identical apart from the transaction ID. The queries must also arrive through the same ingress type and select the same DNS policy and the same upstream or `asis` destination. The raw client source is not part of the key. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
-
-With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. A cached answer has every non-OPT record TTL rewritten to that minimum. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot. That prevents either an old address or an older negative from returning. A nonzero configured or fixed TTL still overrides that zero.
-
-honk rewrites reply TTLs only for a response it caches. An uncacheable query or `optimistic_cache: false` leaves upstream TTLs unchanged. Failure codes other than NXDOMAIN and SERVFAIL, such as REFUSED, follow `optimistic_cache_ttl` and are cached for 600 seconds by default.
-
-Expired answers, including cached NODATA, stay available for serve-stale for one hour unless evicted. `optimistic_stale_reply_ttl` sets the reply TTL, not this window. A cache hit with at most `max(original TTL / 10, 1)` seconds left starts one background refresh.
-
-Disabling cache retention does not disable DNS routing projection. An accepted uncacheable positive answer (including `fixed_domain_ttl: 0`) uses the minimum positive non-OPT wire TTL for projection, falling back to 60 seconds when all such TTLs are zero. This does not rewrite the reply or make it cacheable. Cache-hit remaining lifetimes and served-stale lifetimes are unchanged.
-
-### Negative answers
-
-NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present. A refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
-
-NODATA here means NOERROR with no answer records (`ANCOUNT=0`). A nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
-
-Cached NODATA remains eligible for serve-stale. The stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire. Its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
-
-Cache lifetime selection uses the original upstream answer's class, response code, and TTL even when response-policy `reject` replaces the reply with synthetic NOERROR. A rejected REFUSED therefore keeps the failure-code TTL rules. A rejected positive NOERROR uses its original TTLs when no configured or fixed override applies.
-
-Cache hits do not count down wire record TTLs. Supersession affects memory only. It does not delete a saved persistence row.
-
-For example, `www.example.com` needs its own entry:
-
-```dae
-fixed_domain_ttl {
-    example.com: 120
-    www.example.com: 120
-    ddns.example.org: 10
-    nocache.test: 0
-}
-```
-
-Each fixed TTL requires exactly one unsigned 32-bit decimal scalar. Bare and quoted values are accepted, including `0` and `4294967295`. Newly accepted quoted decimals emit `legacy-ttl-quoting`. Invalid or overflowing values emit `invalid-ttl`, and extra tokens emit `trailing-value`; either omits the entry. Put explanations after ` # `, not directly after the number.
-
-## Example
-
-```dae
-dns {
-    # Omit bind to keep the standalone listener disabled.
-    # bind: 'tcp+udp://:1053'
-    use_host: true
-    ipversion_prefer: 4
-
-    upstream {
-        default: 'udp://223.5.5.5:53'
-        cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
-        google_doh: 'https://dns.google/dns-query' -> proxy
-    }
-
-    routing {
-        request {
-            sip(192.168.50.0/24, 100.64.0.0/10) -> google_doh
-            qname(geosite: category-ads-all) -> reject
-            qname(suffix: cn) -> default
-            qtype(https) -> reject
-            fallback: default
-        }
-        response {
-            upstream(google_doh) -> accept
-            ip(geoip: private) && !qname(geosite: cn) -> google_doh
-            fallback: accept
-        }
-    }
-
-    optimistic_cache: true
-    optimistic_cache_ttl: 600
-    max_cache_size: 10000
-    fixed_domain_ttl {
-        ddns.example.org: 10
-        nocache.test: 0
-    }
-}
-```
+Validation diagnostics preserve original field paths: new-style rules and fallbacks use `dns.routing.request.rules[i].action` and `dns.routing.request.fallback`; converted legacy rules use `dns.routing.rules[i].upstream`; converted or promoted fallbacks use `dns.routing.fallback`. With active legacy rules, an undeclared default `upstream` fallback reports `missing-dns-fallback`, an undeclared empty fallback reports `empty-dns-fallback`, and other undeclared targets report `unknown-dns-upstream`. These diagnostics retain field paths but do not echo target names or list declared names. Omitting the legacy fallback is equivalent to explicitly setting `upstream`; either remains valid when that upstream is declared. Empty and `upstream` sentinels remain ignored when no legacy rules are active.
 
 ## Related docs
 
