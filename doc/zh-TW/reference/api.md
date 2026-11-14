@@ -150,7 +150,7 @@ TCP 在 copy 讀取成功或 splice 寫入目標 socket 成功時立即計數，
 
 探測目標在啟動時確定。原因 `restart_required` 表示行程啟動時還沒有 Score 群組，是 reload 之後才加進來的。
 
-就 `pname_routing` 而言，缺少 hook 時 `pname()` 條件拿不到程式名稱：肯定條件永遠不匹配，否定條件則一律匹配。原因 `comm_fallback` 表示該條件用的是執行緒名稱，不是 argv。
+就 `pname_routing` 而言，缺少 hook 時 `pname()` 條件拿不到行程名稱：肯定條件永遠不匹配，否定條件則一律匹配。原因 `comm_fallback` 表示該條件用的是執行緒名稱，不是 argv。
 
 進入 `iface_watch` 降級後，介面協調改為每 60 秒執行一次，不再接收事件通知。錯誤碼是 `interface_watcher_disabled`，原因為 `subscribe_failed` 或 `poll_setup_failed`。
 
@@ -342,11 +342,11 @@ DNS 日誌沒有 SSE 型別。記錄從需求建立時開始，因此第一次�
 
 記錄開啟之前就已經路由的流量，會明確回報核心證據不足。關掉需求不會丟棄已經保留的 witness 與字典，不改變路由或 NFQUEUE 的 authority，也不撤銷操作已經取得的擷取資格。沒有錄製的操作會跳過 witness 解碼。
 
-flow ID 標示的是 incarnation，不是五元組。TCP/UDP flow 記錄會擷取實際執行的路由謂詞與短路、嗅探與驗證、群組選擇、DNS 子查詢、物理嘗試、session 重用與重試，以及終態邊界。撥號失敗或被阻斷時，即使沒有即時 connection，記錄也會保留。
+flow ID 標示的是 incarnation，不是五元組。TCP/UDP flow 記錄會擷取實際執行的路由謂詞與短路、嗅探與驗證、群組選擇、DNS 子查詢、實體嘗試、session 重用與重試，以及終態邊界。撥號失敗或被阻斷時，即使沒有即時 connection，記錄也會保留。
 
-名稱、ID 與 generation 都取自實際使用它們的操作，不會依目前設定或路由模擬重建。DNS lookup 與 parent ID、outbound attempt 與 parent ID 之間保留因果關係。重用 carrier 時記錄為 attachment，不會偽造一次新的物理撥號。
+名稱、ID 與 generation 都取自實際使用它們的操作，不會依目前設定或路由模擬重建。DNS lookup 與 parent ID、outbound attempt 與 parent ID 之間保留因果關係。重用 carrier 時記錄為 attachment，不會偽造一次新的實體撥號。
 
-協議的請求、確認階段旗標必須有真實協議證據；DNS 子步驟就緒不能當作業務目標已確認的證據。TCP/UDP 的終態跟隨所屬的清理邊界。核心 offload 的觀察以 unknown 結束，不會偽造成 closed。
+協定的請求、確認階段旗標必須有真實協定證據；DNS 子步驟就緒不能當作業務目標已確認的證據。TCP/UDP 的終態跟隨所屬的清理邊界。核心 offload 的觀察以 unknown 結束，不會偽造成 closed。
 
 只有該 flow 範圍內、截至目前進度已執行的決策全部被擷取，`trace_status` 與 `trace.status` 才是 `complete`。active、failed、closed 狀態都可以是完整。這不代表 flow 成功，也不代表全域涵蓋。
 
@@ -362,7 +362,7 @@ Capture ID 不會繞回。凍結字典最多 16 份，每份 64 KiB，合計 1 M
 
 如果策略的核心追蹤字典會超過 64 KiB，這個策略在啟動與 reload 時都會以關閉核心路由追蹤的方式發布，並記錄一條 warning。它的 flow 會回報 `kernel_trace_not_captured`，不再產生無法解碼的 witness。檢查時依最長的 generation 編號估算規則 ID，因此剛好卡在上限附近的策略，也可能已經以關閉追蹤的方式發布。
 
-原生擴充欄位保留來源細節，不虛構身分：路由輸入可以帶 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，但不會偽造網域名稱 rule ID。DNS association 的 outbound/connection step 帶 `lookup_id`，已知的物理對端帶 `server_addr`。選擇事實保留健康的位址族，以及這個決策是實際套用還是只 peek。
+原生擴充欄位保留來源細節，不虛構身分：路由輸入可以帶 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，但不會偽造網域名稱 rule ID。DNS association 的 outbound/connection step 帶 `lookup_id`，已知的實體對端帶 `server_addr`。選擇事實保留健康的位址族，以及這個決策是實際套用還是只 peek。
 
 Score 的 `previous_leaf_node_id` 與 `previous_member_id` 分開記錄：只有葉節點歷史，無法重建過去經過的子群組路徑。
 
@@ -673,7 +673,7 @@ weak 標籤語法合法，但永遠不匹配；`*` 匹配已存在的資源。�
 | 寫入條件/結果 | HTTP 語意 |
 | --- | --- |
 | 缺少 `If-Match`（先於 `Content-Type` 與內容檢查） | `428 precondition_required` |
-| 畸形 `If-Match` 語法或非文字值 | `400 invalid_request`；清單、weak、`*` 與多個頭部 field line 本身合法 |
+| 畸形 `If-Match` 語法或非文字值 | `400 invalid_request`；清單、weak、`*` 與多個 header field line 本身合法 |
 | 條件不匹配；偵測到目標/依賴變化後重新求值仍不匹配 | `412 stale_revision`，偵測到的外部內容不覆寫 |
 | 偵測到目標/依賴變化，但條件仍成立（例如 `*` 或匹配清單） | `409 state_conflict`，不覆寫並行變化 |
 | 候選設定或依賴驗證失敗 | `422 unsupported_value`，不寫入磁碟、不 reload |
@@ -1113,7 +1113,7 @@ DELETE 不接受請求內容與查詢參數：帶了任意一個就回傳 `400 i
 
 已放行的匿名 loopback 請求與 Bearer 認證請求會讀到同一份 geodata。geodata 的 GET 依既有的 router-before-config 鎖序讀取流量與 DNS 的保留中繼資料，不掃描磁碟，也不連網。這裡的 hash 與大小屬於已載入的位元組，不是之後在磁碟上做的外部編輯。
 
-`GET /geodata` 回傳 `{observed_at,assets}`。資產為 `{kind,sha256,size_bytes,modified_at,source_redacted}`：`kind` 為 `geosite` 或 `geoip`，`size_bytes` 是十進位字串，`modified_at` 與 `source_redacted` 可空。存在已初始化的 geodata owner 時，每個資產還含 `fetched_url_redacted`、`verified` 與 `download_route`，回應也含下文的更新狀態列位。
+`GET /geodata` 回傳 `{observed_at,assets}`。資產為 `{kind,sha256,size_bytes,modified_at,source_redacted}`：`kind` 為 `geosite` 或 `geoip`，`size_bytes` 是十進位字串，`modified_at` 與 `source_redacted` 可空。存在已初始化的 geodata owner 時，每個資產還含 `fetched_url_redacted`、`verified` 與 `download_route`，回應也含下文的更新狀態欄位。
 
 沒有記錄或前後不一致的修改時間為 null。`source_redacted` 保留了欄位名，在 GET 與成功操作的結果中回傳第一個下載 URL：去掉 userinfo、查詢與片段，可能含憑證的路徑段替換成 `[redacted]`，再遮蔽 listener secret。沒有 URL 的資產，或無法安全顯示的 URL，為 null。
 
@@ -1129,7 +1129,7 @@ HTTPS 會驗證憑證。直連請求只用設定中那個數字位址的 `global
 
 要等全部下載完成、解析並編譯出完整候選之後，才會替換任何檔案。新檔案缺少目前設定用到的分類時，更新以 `asset_validation_failed` 失敗，已載入的檔案保持不變。已載入檔案位於 `global.data_dir` 或 `$DAE_LOCATION_ASSET` 時，就地替換。
 
-已載入檔案來自優先順序更低的位置時，例如軟體包安裝的 `/usr/share/honk`，honk 不會覆寫它，而是改在 `global.data_dir/<file>` 新建檔案；如果這期間該路徑已經出現了檔案，就拒絕替換。此後查詢時會優先使用新檔案。檔案透過不跟隨符號連結的父目錄 FD 與檔案 FD 開啟；別名、位元組、來源或依賴衝突，以及不安全的路徑，都拒絕。
+已載入檔案來自優先順序更低的位置時，例如套件安裝的 `/usr/share/honk`，honk 不會覆寫它，而是改在 `global.data_dir/<file>` 新建檔案；如果這期間該路徑已經出現了檔案，就拒絕替換。此後查詢時會優先使用新檔案。檔案透過不跟隨符號連結的父目錄 FD 與檔案 FD 開啟；別名、位元組、來源或依賴衝突，以及不安全的路徑，都拒絕。
 
 父目錄分量只在安全開啟之後才做身分正規化。各檔案獨立原子替換，並確認耐久，這不是跨多個檔案的原子交易。第一個 rename 之後失敗時，會保留逐資產的 written 與 durability 資訊，不會自動撤回。
 
@@ -1213,7 +1213,7 @@ loopback 主體不能修改 `geodata`，會收到 `403 permission_denied`。所�
 
 如果這個 URL 是因為伺服器回應而失敗，還會給出該回應的 `http_status`，也就是檔案回傳非 200，或校驗檔案回傳非 200 且非 404 的那個狀態。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示伺服器拒絕的是 `.sha256sum`，不是檔案本身。設定檔、已儲存與內建的 geodata URL，包括校驗檔案請求，都不設位址或連接埠白名單。
 
-`verify_checksum` 預設為 `true`。設成 `false` 後，手動與自動更新都不再請求 `.sha256sum`，下載的檔案一律依未校驗處理：`verified` 為 `false`，`sha256` 照常回報。這個設定用於那些缺少校驗檔案時會回傳非 404 狀態、或回傳非校驗內容頁面的映像站。
+`verify_checksum` 預設為 `true`。設成 `false` 後，手動與自動更新都不再請求 `.sha256sum`，下載的檔案一律依未校驗處理：`verified` 為 `false`，`sha256` 照常回報。這個設定用於那些缺少校驗檔案時會回傳非 404 狀態、或回傳非校驗內容頁面的鏡像站。
 
 以 `checksum_unavailable` 或 `checksum_mismatch` 失敗時，日誌中的 warning 會指出這個設定。校驗不會被自動關掉。
 
@@ -1267,26 +1267,26 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 | --- | --- |
 | doona 版本 | `0.1.0-rc.5` |
 | 提交 | `6102778700c6cd15908cf2a76be7121d0355da21` |
-| 壓縮包校驗和 | `DOONA_SHA256`、`DOONA_LITE_SHA256` |
+| 壓縮檔檢查碼 | `DOONA_SHA256`、`DOONA_LITE_SHA256` |
 
 在倉庫根目錄執行 `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`。指令碼依序執行：
 
-1. 從固定發行版本下載兩種程式包。
-2. 分別核對壓縮包的校驗和。
+1. 從固定發行版本下載兩種壓縮檔。
+2. 分別核對壓縮檔的檢查碼。
 3. 檢查各包中的 `THIRD-PARTY-NOTICES.txt` 及其 `NOTICE` 引用的全部 `LICENSES/` 檔案。
 4. 刪除字型，將標準版解壓到指定目錄，將 lite 解壓到其 `-lite` 同級目錄。
 5. 只輸出標準版目錄。
 
 未設定該變數時，`just lint` 與 `just test-ci` 自動執行指令碼。
 
-完整發行產物包含內嵌 UI，精簡的 `-clash-api` 與 `-native-api` 產物不包含。二進位檔中內嵌兩個版本各自的宣告；每個完整發行壓縮包也會在 `doona/` 與 `doona-lite/` 目錄中附帶這些檔案。lite 版使用系統字型。
+完整發行產物包含內嵌 UI，精簡的 `-clash-api` 與 `-native-api` 產物不包含。二進位檔中內嵌兩個版本各自的宣告；每個完整發行壓縮檔也會在 `doona/` 與 `doona-lite/` 目錄中附帶這些檔案。lite 版使用系統字型。
 
 內嵌產物不含 Noto Sans TC 與 SC 字型。doona 的 CSS 用 `font-display: optional` 宣告這些字型，因此字型請求回傳 404 時，瀏覽器會使用系統字型。
 
 需要 Noto Sans 時，可以從以下兩種方式中選一種：
 
 - 從 [doona 發行頁](https://github.com/Zakkaus/doona/releases)下載 `doona-<version>.tar.gz` 與 `doona-fonts-<version>.tar.gz`，解壓到同一目錄，並讓 `ui` 指向該目錄。
-- 安裝 `doona` 與 `doona-fonts` 軟體包，並設定 `ui: /usr/share/doona`。
+- 安裝 `doona` 與 `doona-fonts` 套件，並設定 `ui: /usr/share/doona`。
 
 兩個版本共用的 GPL-3.0-only 原始碼，是 doona 標籤 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。發行流程會把 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式標籤發行與滾動 Debug 發行上。這個包由 `ci/fetch-doona.sh --source` 產生：先確認標籤仍指向固定的提交，再執行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`，使用 GNU gzip。
 
@@ -1645,7 +1645,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | 欄位 | 說明 |
 | --- | --- |
 | `socketAdmission.refused` | Endpoint 網路 bootstrap 需要兩個額度，而整個 DNS socket 分割區不足兩個時被拒絕的次數。 |
-| `socketAdmission.timeouts` | 因 admission 期限耗盡而回傳的必要物理 socket admission 呼叫。 |
+| `socketAdmission.timeouts` | 因 admission 期限耗盡而回傳的必要實體 socket admission 呼叫。 |
 | `proxyAdmission.timeouts` | 因 admission 期限耗盡而回傳的必要代理 stream 或非原始 packet 準備 admission 呼叫。 |
 | `pressure.retiredUdpPools` | 因壓力而選中退役的空閒 UDP socket pool，每個被摘除的 pool 只計一次。 |
 | `pressure.retiredTransports` | 首次因壓力而選中退役的空閒 TCP/TLS/H2/QUIC transport pool；恢復已保留的 teardown 不重複計數。 |
@@ -1657,7 +1657,7 @@ B = { businessStarts, sources: { cold, periodic, recovery }, trialStarts,
 | 欄位 | 說明 |
 | --- | --- |
 | `activeFlows` | 目前持有 TCP admission permit 的透明 TCP flow。 |
-| `limit` | 目前行程級 TCP flow admission 上限；從描述符匯出的下限開始，並隨閒置描述符餘量動態擴縮。 |
+| `limit` | 目前行程級 TCP flow admission 上限；從描述符推導出的下限開始，並隨閒置描述符餘量動態擴縮。 |
 | `capacity.rejected` | 因 TCP 預算已滿而等待 permit 的 accept-loop 單調計數；已接受 socket 保留在核心 backlog 中，不會被丟棄。 |
 
 ### QUIC 欄位
@@ -1691,9 +1691,9 @@ honk 不會因為應用需求低就縮小已經學到的視窗，也不會在使
 | `lostPackets` | 排除 PLPMTUD 探測的遺失封包數 |
 | `sentPlpmtudProbes`、`lostPlpmtudProbes` | 獨立的 PLPMTUD 探測計數 |
 | `txIos`、`rxIos` | 反映批處理效率的 I/O 次數 |
-| `transportTxWouldBlock` | 64 包介面卡佇列已滿的次數；Quinn 會重試 |
+| `transportTxWouldBlock` | 64 包 adapter 佇列已滿的次數；Quinn 會重試 |
 | `transportTxDrops` | 代理傳輸回報壅塞或逾時後主動丟棄的封包數 |
-| `transportRxDrops` | 介面卡接收佇列已滿的次數 |
+| `transportRxDrops` | adapter 接收佇列已滿的次數 |
 | `sessionRxDrops` | TUIC/Hysteria2 的 256 包 session 佇列已滿的次數 |
 | `sendTimeouts` | 啟用指標的連線上，仍計入目前 no-ACK 等待、但傳送期限已到的 UDP 傳送次數 |
 | `pathStalls` | 路徑監視器在完整 no-ACK 寬限期後退役的共享 QUIC 連線數 |
@@ -1728,7 +1728,7 @@ honk 不會因為應用需求低就縮小已經學到的視窗，也不會在使
 
 首次選擇、試用及缺少先前歷史時不增加切換計數。Peek、API 讀取、單例旁路與最後嘗試不增加原因計數。巢狀群組排名與實際出站連線並非一一對應。
 
-對 UDP 來說，`deadFiltered` 還會統計因協議或設定不具備 UDP capability 而被排除的候選。它不是新發生故障的節點數，也不是業務嘗試數；這類排除不會增加 Score 失敗，也不會增加探索退避。
+對 UDP 來說，`deadFiltered` 還會統計因協定或設定不具備 UDP capability 而被排除的候選。它不是新發生故障的節點數，也不是業務嘗試數；這類排除不會增加 Score 失敗，也不會增加探索退避。
 
 `carrierPressure` 統計被已有的群組或網路聚合 cell 接收的新鮮 carrier 位址族事件，不是封包數，也不是失敗連線數。重複的心跳讀取不會增加它。`carrierValidation` 統計的是一種週期驗證選擇：普通贏家身上有比上次驗證更新的 carrier 提示。
 
@@ -1736,7 +1736,7 @@ honk 不會因為應用需求低就縮小已經學到的視窗，也不會在使
 
 carrier 觀測由控制心跳接入，和選路呼叫相互獨立。
 
-`carrierRttPressure` 與 `carrierLossPressure` 保留被接收事件的原因。兩種條件同時滿足時，兩個原因計數都加一，但 `carrierPressure` 只加一次。這些可重疊的計數不會標示具體的 carrier 或傳輸協議，不是應用遺失封包率，也不會增加失敗次數。
+`carrierRttPressure` 與 `carrierLossPressure` 保留被接收事件的原因。兩種條件同時滿足時，兩個原因計數都加一，但 `carrierPressure` 只加一次。這些可重疊的計數不會標示具體的 carrier 或傳輸協定，不是應用遺失封包率，也不會增加失敗次數。
 
 重複或過期的提示都不會增加它們。TCP 的 loss pressure 表示重傳壓力，不代表已經確認有應用封包遺失。
 
@@ -1798,7 +1798,7 @@ carrier 觀測由控制心跳接入，和選路呼叫相互獨立。
 
 `/stats.score.businessStarts` 對巢狀群組去重，統計唯一的原始 Score 業務開始數。`/stats.score.groups[].budget.tcp` 與 `.udp` 聚合的是保留的目標位址族作用域。不要把巢狀群組的總量相加當作唯一業務數。
 
-原始業務被選為試用時仍然計數；延續嘗試即使換了網路或目標位址族，也不會累積另一份原始額度。節點專屬工作在代理 DNS 與物理撥號的 admission 等待之前就開始，和 reporter 的物理、邏輯 I/O 邊界無關。DNS 查詢生命週期的 admission，是在這之前同步檢查池是否開放，不是物理撥號的 admission 等待。
+原始業務被選為試用時仍然計數；延續嘗試即使換了網路或目標位址族，也不會累積另一份原始額度。節點專屬工作在代理 DNS 與實體撥號的 admission 等待之前就開始，和 reporter 的實體、邏輯 I/O 邊界無關。DNS 查詢生命週期的 admission，是在這之前同步檢查池是否開放，不是實體撥號的 admission 等待。
 
 預算計數器反映的是已經記錄的帳本值。唯讀等待與冷啟動判定還會考慮過期未開始預留中可退回的額度，但不更新 `refunded`、`expired` 或其他計數器。
 

@@ -62,7 +62,7 @@ CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 
 `honk_tcp_passive` 會收到主機上每次 TCP `sock_ops` 回呼，每條連線若干次；遇到不屬於 honk 命名空間的 socket 就直接返回。TCP 歸屬證明不需要核心內建 BTF、ftrace 或內建 IPv6，有外部的原始 BTF 檔就夠了。
 
-啟動時一律會載入原始 BTF。eBPF 載入器把它當成目標 BTF，並從中取出程式名稱和接收追蹤所需的偏移。選擇檔案的順序如下：
+啟動時一律會載入原始 BTF。eBPF 載入器把它當成目標 BTF，並從中取出行程名稱和接收追蹤所需的偏移。選擇檔案的順序如下：
 
 1. `HONK_VMLINUX_BTF` 指定的檔案。
 2. 未設定覆寫路徑時，讀取 `/sys/kernel/btf/vmlinux`。
@@ -226,7 +226,7 @@ sudo install -d -m 0700 /etc/honk /var/lib/honk
 sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 ```
 
-預設的執行階段根目錄是 `/var/lib/honk`。舊根目錄 `/var/share/honk` 裡的資源仍可依各路徑規則繼續使用；舊快取和訂閱匯入會把符合條件的狀態複製到 `state/honk.db`。自訂 `data_dir` 也遵循同樣的退回順序。快取、訂閱儲存、ECH/UI 和其他唯讀依賴若是相對路徑，會依序在 `global.data_dir` 選定的執行階段目錄、`/var/share/honk` 和呼叫端的舊位置尋找，取第一個存在的。相對日誌只在該執行階段目錄下建立，不會寫到設定檔所在目錄。
+預設的執行階段根目錄是 `/var/lib/honk`。舊根目錄 `/var/share/honk` 裡的資源仍可依各路徑規則繼續使用；舊快取和訂閱匯入會把符合條件的狀態複製到 `state/honk.db`。自訂 `data_dir` 也遵循同樣的回退順序。快取、訂閱儲存、ECH/UI 和其他唯讀依賴若是相對路徑，會依序在 `global.data_dir` 選定的執行階段目錄、`/var/share/honk` 和呼叫端的舊位置尋找，取第一個存在的。相對日誌只在該執行階段目錄下建立，不會寫到設定檔所在目錄。
 
 在前景啟動：
 
@@ -270,7 +270,7 @@ bootstrap_resolver: '1.1.1.1:53'
 
 honk 不支援這種部署，相關提問和問題回報不予答覆。
 
-單臂閘道器也常被稱為旁路由：`lan_interface` 和 WAN 是同一個介面或橋接器，用戶端把 honk 主機設為閘道器，主機再從同一介面把流量轉給上游路由器。這類主機要設定下列三個核心引數。honk 不會自行設定，`auto_config_kernel_parameter` 也不改這三項，見[全域設定參考](reference/global.md)。
+單臂閘道器也常被稱為旁路由：`lan_interface` 和 WAN 是同一個介面或橋接器，用戶端把 honk 主機設為閘道器，主機再從同一介面把流量轉給上游路由器。這類主機要設定下列三個核心參數。honk 不會自行設定，`auto_config_kernel_parameter` 也不改這三項，見[全域設定參考](reference/global.md)。
 
 - 開啟 `send_redirects` 時，核心會向用戶端送出 ICMP 重新導向，讓用戶端把流量直接送給上游路由器，流量就繞過了 honk。`all` 和介面的值只要有一個是 `1`，核心就會送出重新導向，所以兩者都要設為 `0`。
 - honk 只會把第一個已繫結 LAN 介面的 `rp_filter` 設為 `0`，但核心取 `all` 和介面兩者中較大的值，所以 `all` 上的 `1` 或 `2` 會蓋過這個設定。要把 `all` 設為 `0`。
@@ -446,7 +446,7 @@ sudo docker compose up -d
 sudo docker compose logs -f
 ```
 
-該檔案把主機的 `/sys`、`/etc/honk`、`/var/lib/honk` 掛載進容器，並以唯讀方式掛載 `/etc/localtime`，讓容器的日誌時間戳和 geodata 更新時間跟隨主機時區。主機沒有 `/etc/localtime` 時，請刪除這項掛載，改在服務的 `environment` 裡把 `TZ` 設為 `CST-8` 這類 POSIX 字串。設定目錄的掛載會蓋過映像裡只走直連的預設設定；`/var/lib/honk` 儲存執行階段狀態，例如原生 API 的管理員帳號，重新啟動或升級後仍然保留。要 reload 設定，執行 `sudo docker compose exec honk honk-core reload`。映像自帶 iproute2 和 nftables，容器又和主機共用網路命名空間，所以 `sudo docker compose exec honk ip rule`、`ip route show table all`、`tc filter show dev <網絡卡> ingress` 和 `nft list ruleset` 顯示的就是主機的狀態。
+該檔案把主機的 `/sys`、`/etc/honk`、`/var/lib/honk` 掛載進容器，並以唯讀方式掛載 `/etc/localtime`，讓容器的日誌時間戳和 geodata 更新時間跟隨主機時區。主機沒有 `/etc/localtime` 時，請刪除這項掛載，改在服務的 `environment` 裡把 `TZ` 設為 `CST-8` 這類 POSIX 字串。設定目錄的掛載會蓋過映像裡只走直連的預設設定；`/var/lib/honk` 儲存執行階段狀態，例如原生 API 的管理員帳號，重新啟動或升級後仍然保留。要 reload 設定，執行 `sudo docker compose exec honk honk-core reload`。映像自帶 iproute2 和 nftables，容器又和主機共用網路命名空間，所以 `sudo docker compose exec honk ip rule`、`ip route show table all`、`tc filter show dev <網卡> ingress` 和 `nft list ruleset` 顯示的就是主機的狀態。
 
 鎖定檔的掛載讓容器和原生執行個體共用 `/run/honk-core.lock`，容器因此無法接管正在執行的資料路徑。停止後也要保留這個檔案，不要刪除、替換或截斷仍可能被執行個體持有的鎖定檔。每次開機都要先建立鎖定檔，再啟動容器。使用 systemd 的主機可以設定不截斷既有檔案的開機建立規則：
 
@@ -559,7 +559,7 @@ cargo run --release -p honk-core -- \
 ## 目前 capability 與限制
 
 - 出站支援 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。
-- UDP 支援 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及獨立 packet permission 已開啟的 VLESS。VLESS 的退回編碼和多工 carrier 是兩個獨立選擇；VMess 仍只支援 TCP。見 [VLESS 節點參考](reference/nodes.md#vless-udp-and-multiplexing)。
+- UDP 支援 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及獨立 packet permission 已開啟的 VLESS。VLESS 的回退編碼和多工 carrier 是兩個獨立選擇；VMess 仍只支援 TCP。見 [VLESS 節點參考](reference/nodes.md#vless-udp-and-multiplexing)。
 - 群組支援 Selector、URLTest、LoadBalance、Fallback 和 Score。
 - DNS 上游支援 UDP、TCP、DoT、DoH、DoH3 和 DoQ，也可經由 node/group 出站。
 - `direct` 和 `block` 是內建節點，不要在設定中重複宣告。
@@ -578,7 +578,7 @@ cargo run --release -p honk-core -- \
 | mock 啟動成功但流量不經過 honk | 這是預期行為；改用含 `ebpf` feature 的建置，並以 root 啟動。 |
 | NFQUEUE disabled 或 queue busy | 檢查 nftables/NFQUEUE 核心支援、佇列 320 的佔用者和殘留的 honk 執行個體；確實不需要時設定 `nfqueue_enable: false`。 |
 | LAN 流量未被代理 | `lan_interface` 為空或介面名稱錯誤；honk 不會自動改用 `lo`。介面名稱無誤時看下一項。 |
-| `GET /runtime` 出現 `interface_binding` 降級 | 某個已設定的介面還沒繫結，日誌裡有介面名稱。`pending`：介面不存在，或 `auto` 條目沒有 IPv4 預設路由。`unsupported_type`：連結型別遭拒，例如 `lo`、VRF 裝置或 `dae0`，請改成受支援的介面或其成員。`attach_failed`：TCX link 無法建立、更新或驗證，原因見日誌中的 warning。介面狀態列位見[原生 API 參考](./reference/api.md#原生-api)。 |
+| `GET /runtime` 出現 `interface_binding` 降級 | 某個已設定的介面還沒繫結，日誌裡有介面名稱。`pending`：介面不存在，或 `auto` 條目沒有 IPv4 預設路由。`unsupported_type`：連結型別遭拒，例如 `lo`、VRF 裝置或 `dae0`，請改成受支援的介面或其成員。`attach_failed`：TCX link 無法建立、更新或驗證，原因見日誌中的 warning。介面狀態欄位見[原生 API 參考](./reference/api.md#原生-api)。 |
 | 單臂閘道器的用戶端繞過 honk，或轉送的流量被丟棄 | 把 `all` 和 LAN 介面的 `send_redirects` 設為 `0`，並把 `net.ipv4.conf.all.rp_filter` 設為 `0`，見[單臂閘道器](#單臂閘道器)；直連流量仍不通時，見[直連流量不通](#直連流量不通)。 |
 | VLESS/VMess 回報 `No handler for protocol` | 建置缺少 `rprx`；使用預設 feature，或明確加上 `rprx`。 |
 | Geo 規則載入失敗 | 把 `geoip.dat`/`geosite.dat` 放進設定的 `data_dir`，或檢查文件列出的舊目錄和共用目錄；不需要 Geo 規則就刪掉。 |
@@ -609,7 +609,7 @@ cargo run --release -p honk-core -- \
 
 Cargo 相依性已快取時，`just fuzz-replay` 只需要 stable Rust。它使用與模糊測試目標相同的斷言。重放失敗會印出輸入路徑；輸入處理停滯時，五秒後判定失敗。
 
-設定程式碼、oracle、模糊測試輸入、語料來原始檔或它們的建置輸入有變更時，會執行 `parser` CI 任務；指定 `ci:full` 時也會執行。一般工作區命令不會啟用 `conformance` 和 `fuzz-checks`，所以不需要 Go 或 nightly。
+設定程式碼、oracle、模糊測試輸入、語料來源檔案或它們的建置輸入有變更時，會執行 `parser` CI 任務；指定 `ci:full` 時也會執行。一般工作區命令不會啟用 `conformance` 和 `fuzz-checks`，所以不需要 Go 或 nightly。
 
 每週模糊測試任務使用下列設定：
 

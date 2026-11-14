@@ -22,13 +22,13 @@ global {
 | --- | --- |
 | 經過 LAN TC 後語意尚未明確的新 LAN 轉送 UDP | 啟用且 ready 時，暫存唯一 token 並在 NFQUEUE 中保留原始 skb |
 | 主機發起的 WAN UDP | 保持規範 TPROXY 路徑；主機 egress 不經過這個 `inet prerouting` hook |
-| UDP 連接埠 `53` | 遵循[流量規則所有權](../reference/routing.md#出站目標與-must)；需要控制器或原始代理群組處理的 LAN 分片查詢走下述完整資料包路徑，不建立普通 conn-state 或 decision token |
+| UDP 連接埠 `53` | 遵循[流量規則所有權](../reference/routing.md#出站目標與-must)；需要控制器或原始代理群組處理的 LAN 分片查詢走下述完整 datagram 路徑，不建立普通 conn-state 或 decision token |
 | 內部、特殊或反向流量 | 絕不暫存 |
 | 非 DNS 的 `must` 或 `block` 路由結果 | 視為終態；絕不暫存 |
 | 路由時已經確定安全的 direct 結果 | 走核心 direct 路徑；絕不暫存 |
 | 已啟用但尚未 ready 時的暫存候選 | 丟棄新流；無關的非暫存 UDP 保持正常路徑 |
 
-語意還不明確，是指初步路由結果仍可能被使用者態路由、模式或群組選擇、網域名稱或 QUIC 檢查改變。這條路徑不會只因為初步結果不完整，就把資料包重定向到使用者態 relay。
+語意還不明確，是指初步路由結果仍可能被使用者態路由、模式或群組選擇、網域名稱或 QUIC 檢查改變。這條路徑不會只因為初步結果不完整，就把封包重新導向到使用者態 relay。
 
 ## 持包機制
 
@@ -54,17 +54,17 @@ flowchart LR
 
 服務先繫結佇列 `320`，再發布 nftables 交易。安裝階段在單一實例鎖保護下回收殘留的保留 table。最終有序關閉時，它先 drain 所有已分派的 guard，再關閉佇列，最後刪除自有 table。同一網路命名空間裡的防火牆管理器不得在 honk 執行期間修改這些保留的 nftables 物件。
 
-這套 Linux 機制只在 `honk-core` 的 `ebpf` feature 下使用。解析時只分配一份和資料包同樣大小的緩衝區。core 取樣器和 `StatsManager` 會區分目前實例的佇列深度與跨 hard rebind 累積的行程級丟包數，回報最近一次核心讀取是否成功以及錯誤內容，並始終更新 held-guard/effective-buffer gauge。
+這套 Linux 機制只在 `honk-core` 的 `ebpf` feature 下使用。解析時只分配一份和 datagram 同樣大小的緩衝區。core 取樣器和 `StatsManager` 會區分目前實例的佇列深度與跨 hard rebind 累積的行程級丟包數，回報最近一次核心讀取是否成功以及錯誤內容，並始終更新 held-guard/effective-buffer gauge。
 
 每次取樣核心統計時，先開啟呼叫執行緒所在佇列網路命名空間的 procfs 檔案，再透過繫結到該命名空間的檔案描述符非同步讀取。取樣哪個命名空間，取決於佇列所在的 netns，而不是行程主執行緒或阻塞 worker 的 netns。
 
 ## LAN DNS 分片
 
-TC 依普通流量策略判斷 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精確控制面 mark 保留原動作。需要 DNS 控制器或原始 must 群組處理的查詢，在 host skb mark 裡攜帶路由和 generation，不進入 `daens`；後續分片也留在 host。核心的 IPv4/IPv6 重組在優先順序 `-400` 執行，早於佇列的 `-250` 和 conntrack 的 `-200`。DNS 沒有分片快取；[非 DNS 分片記錄](./datapath.md#重定向封包的分片)由資料路徑維護。
+TC 依普通流量策略判斷 offset-zero 的 UDP/53 首片。原生 `direct(must)`、`block(must)` 和可信的精確控制面 mark 保留原動作。需要 DNS 控制器或原始 must 群組處理的查詢，在 host skb mark 裡攜帶路由和 generation，不進入 `daens`；後續分片也留在 host。核心的 IPv4/IPv6 重組在優先順序 `-400` 執行，早於佇列的 `-250` 和 conntrack 的 `-200`。DNS 沒有分片快取；[非 DNS 分片記錄](./datapath.md#重新導向封包的分片)由資料路徑維護。
 
-不管走成功、飽和還是拒絕路徑，actor 都先區分完整的 DNS 資料包與普通 token 流。它驗證 carrier、目前 generation 和 admission epoch，對原包確認 `NF_DROP` 之後，才把資料包交付到透明 socket 共用的有界 DNS/原始 UDP 管線。回覆沿用既有的 redirect 後設資料恢復原目的位址。分派前會驗證 UDP 檢查碼：IPv4 允許檢查碼為零，並識別核心的 checksum-partial 後設資料；IPv6 沒有該後設資料時，檢查碼為零會被拒絕。
+不管走成功、飽和還是拒絕路徑，actor 都先區分完整的 DNS datagram 與普通 token 流。它驗證 carrier、目前 generation 和 admission epoch，對原包確認 `NF_DROP` 之後，才把 datagram 交付到透明 socket 共用的有界 DNS/原始 UDP 管線。回覆沿用既有的 redirect 後設資料恢復原目的位址。分派前會驗證 UDP 檢查碼：IPv4 允許檢查碼為零，並識別核心的 checksum-partial 後設資料；IPv6 沒有該後設資料時，檢查碼為零會被拒絕。
 
-佇列關閉或尚未 ready 時，需要控制器或原始群組處理的分片會被丟棄，不能退回原生路徑繞過 DNS 策略。未分片的 DNS 仍走 TC 快路徑；這條路徑也不增加 TCP 分片支援。它要經過 host raw hook，和 TC redirect 不同，前置防火牆丟包或改寫 mark 都能阻止 admission。資料包複製被截斷時，丟棄已經識別的封包，不轉送不完整的查詢。
+佇列關閉或尚未 ready 時，需要控制器或原始群組處理的分片會被丟棄，不能退回原生路徑繞過 DNS 策略。未分片的 DNS 仍走 TC 快路徑；這條路徑也不增加 TCP 分片支援。它要經過 host raw hook，和 TC redirect 不同，前置防火牆丟包或改寫 mark 都能阻止 admission。封包複製被截斷時，丟棄已經識別的封包，不轉送不完整的查詢。
 
 需要這條路徑的乙太網路首片必須發給本機，即 `PACKET_HOST`。純二層轉送的候選依 fail-closed 處理，不假設 bridge-to-inet hook 已經啟用。LAN 和 WAN egress 還會丟棄未被消費的 DNS queue carrier，admission 關閉時也一樣。honk 不改寫橋接防火牆 sysctl。橋和 slave 的 MAC 不同時，分片查詢可能被保守拒絕；未分片 DNS 和原生 direct-must 保持原有行為。
 
@@ -123,7 +123,7 @@ retirement 先發布 `RETIRE_ACTIVE`，再用 `BPF_NOEXIST` 插入 `RETIRE_FENCE
 
 WAN 和 LAN 的使用者態 UDP 即使 token 為零也共用同一套 fence。endpoint 保留 admission incarnation，WAN ownership bit 區分帶 mark 的 direct/must 與原生直連。回收順序是先處理匹配的輔助項，再處理 conn；過期清理也走同一順序。外來後設資料會保留；所有權缺失或已被替代時則拒絕。使用者態 [endpoint 退役](./control-plane.md#tcp-中繼與-conn-state-所有權)要求提供實際刪除 conn 的證據。
 
-核心 producer 在成功發布之前失敗時，會記錄一個終態 `Aborted`，裡面包含捕獲的 incarnation 和實際分配的 token；還沒分配 token 時記為零。它不刪除 tuple 項，也不把已完成的 Pending/native/proxy/block 狀態改成 Aborted。Preparing 和 Aborted 的 follower 都不能續期時間戳記。Aborted 不能啟用，也不能轉送，會立即滿足精確 fenced hint/janitor 的清理條件。所有物理 tuple 的回收仍共用後端協定。
+核心 producer 在成功發布之前失敗時，會記錄一個終態 `Aborted`，裡面包含捕獲的 incarnation 和實際分配的 token；還沒分配 token 時記為零。它不刪除 tuple 項，也不把已完成的 Pending/native/proxy/block 狀態改成 Aborted。Preparing 和 Aborted 的 follower 都不能續期時間戳記。Aborted 不能啟用，也不能轉送，會立即滿足精確 fenced hint/janitor 的清理條件。所有實體 tuple 的回收仍共用後端協定。
 
 ## Sequence 耗盡與 generation 輪轉
 

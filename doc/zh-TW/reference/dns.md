@@ -56,9 +56,9 @@ dns {
 | `optimistic_cache_ttl` | `省略`（`600` 秒） | 除 NXDOMAIN、SERVFAIL 和 NODATA 外，把所有應答的快取 TTL 和訊息 TTL 設為固定值；寫 `0` 用上游應答裡的最小 TTL。見 [`optimistic_cache_ttl`](#optimistic_cache_ttl)。 |
 | `optimistic_stale_reply_ttl` | `省略`（`30` 秒） | serve-stale 正應答使用的 TTL；非零值替換每個非 OPT RR 的 TTL，寫 `0` 保留快取裡已按策略改寫的 wire TTL。見 [`optimistic_stale_reply_ttl`](#optimistic_stale_reply_ttl)。 |
 | `max_cache_size` | `省略`（`10000`） | 快取條目數上限，最大 100,000；它也決定分片位元組預算。見 [`max_cache_size`](#max_cache_size)。 |
-| `fixed_domain_ttl { domain: seconds }` | `省略`（空） | 按域名覆寫正應答和 NODATA 的 TTL；寫 `0` 時，所有回應碼的應答都不快取。見 [`fixed_domain_ttl`](#fixed_domain_ttl)。 |
+| `fixed_domain_ttl { domain: seconds }` | `省略`（空） | 按網域覆寫正應答和 NODATA 的 TTL；寫 `0` 時，所有回應碼的應答都不快取。見 [`fixed_domain_ttl`](#fixed_domain_ttl)。 |
 
-所有 key 都是可選的。預設值欄寫 `省略`，表示該 key 可以省略，括號裡是它的預設值或等效寫法。標量的延伸範圍、註釋規則和布林取值見[解析規則](#解析規則)。
+所有 key 都是可選的。預設值欄寫 `省略`，表示該 key 可以省略，括號裡是它的預設值或等效寫法。純量的延伸範圍、註釋規則和布林取值見[解析規則](#解析規則)。
 
 SIGHUP reload 會把 `bind` 的主機、埠或傳輸集合變化當作需重啟項並拒絕；見 [`bind`](#獨立-listenerbind)。
 
@@ -115,26 +115,26 @@ regexp:^(foo|bar)\.example$ 192.0.2.40 # 共用位址
 
 `ipv4only`/`ipv6only` 的硬位址族過濾之後，已知名稱的 IN class A 或 AAAA 查詢優先於 request 規則、快取查詢和上游交換，`reject` 規則也不例外。位址條目沒有所請求的位址族時，honk 返回 NOERROR/NODATA，不查上游。其他 class 和 qtype 照常走正常管線。本機位址記錄用 60 秒 TTL，hosts 應答不走 honk 的 DNS 快取。
 
-honk 在 OxiDNS 格式上做了擴充套件：規則可以只寫域名、不寫位址，此時這個名稱就成為該域名的別名：
+honk 對 OxiDNS 格式做了擴充：規則可以只寫網域、不寫位址，此時這個名稱就成為該網域的別名：
 
 ```text
 full:a.example b.example
 domain:corp.example gateway.example
 ```
 
-目標和 matcher 名稱一樣要正規化，並且必須是有效主機名。名稱與位址混寫、寫兩個域名，或者精確名稱以自身為別名，都是無效規則。查詢別名的 A 或 AAAA 記錄時，honk 用相同 qtype 讓目標走完整管線：hosts、request 規則、快取、上游。應答先給出從查詢名稱經各級別名到目標的 `CNAME` 記錄，再附上目標應答裡的 CNAME 和所請求的位址記錄。本機別名 CNAME 和本機位址記錄用 60 秒 TTL；來自目標應答的記錄沿用目標自己的 TTL 策略。合成的應答不快取；目標查詢保留呼叫者的快取策略，明確繞過快取也一樣。
+目標和 matcher 名稱一樣要正規化，並且必須是有效主機名。名稱與位址混寫、寫兩個網域，或者精確名稱以自身為別名，都是無效規則。查詢別名的 A 或 AAAA 記錄時，honk 用相同 qtype 讓目標走完整管線：hosts、request 規則、快取、上游。應答先給出從查詢名稱經各級別名到目標的 `CNAME` 記錄，再附上目標應答裡的 CNAME 和所請求的位址記錄。本機別名 CNAME 和本機位址記錄用 60 秒 TTL；來自目標應答的記錄沿用目標自己的 TTL 策略。合成的應答不快取；目標查詢保留呼叫者的快取策略，明確繞過快取也一樣。
 
 派生的目標查詢要求恰好一個問題，即 `QD=1`；answer 和 authority section 為空，即 `AN=NS=0`；additional section 為空，或恰好包含一個 OPT，即 `AR=0` 或 `1`。派生查詢替換 QNAME，保留交易 ID、全部 header flags、QTYPE 和 QCLASS。有 OPT 時，精確保留它的 class、TTL 和選項位元組，根名稱 owner 單獨編碼，不依賴原問題的編碼方式。其他 section 形狀會讓查詢在發往目標前就失敗；honk 不會把記錄直接丟棄，也不會退回去查原名稱。
 
-目標為 NODATA 時，honk 返回只含 CNAME 鏈的 NOERROR；目標為 NXDOMAIN 時，按 RFC 6604 返回帶 CNAME 鏈的 NXDOMAIN。其他完整的 12 位 RCODE 不帶 answer 記錄：EDNS 客戶端收到完整 RCODE；客戶端沒用 EDNS、無法表示該 RCODE 時，返回不帶記錄的 SERVFAIL。目標查詢失敗，本次查詢就失敗。合成應答保留目標最終應答的 `TC` 位，即使合成後的封包沒有超出客戶端的大小限制。
+目標為 NODATA 時，honk 返回只含 CNAME 鏈的 NOERROR；目標為 NXDOMAIN 時，按 RFC 6604 返回帶 CNAME 鏈的 NXDOMAIN。其他完整的 12 位 RCODE 不帶 answer 記錄：EDNS 用戶端收到完整 RCODE；用戶端沒用 EDNS、無法表示該 RCODE 時，返回不帶記錄的 SERVFAIL。目標查詢失敗，本次查詢就失敗。合成應答保留目標最終應答的 `TC` 位，即使合成後的封包沒有超出用戶端的大小限制。
 
-全部來源合併後，每個別名目標都必須在 8 級以內走到一個不是別名的名稱。出現環路，或者鏈更長，都算無效設定，錯誤訊息會給出對應的 matcher 和目標。經[節點域名 hook](#節點伺服器域名) 解析的域名也遵守別名規則。
+全部來源合併後，每個別名目標都必須在 8 級以內走到一個不是別名的名稱。出現環路，或者鏈更長，都算無效設定，錯誤訊息會給出對應的 matcher 和目標。經[節點網域 hook](#節點伺服器網域) 解析的網域也遵守別名規則。
 
 SIGHUP 會建構新快照。啟動時任一來源不可讀，或者自訂規則無效，啟動就失敗。reload 時，新的執行時 generation 會在釋出前失敗，目前的執行時 generation 繼續執行。
 
 ## EDNS Client Subnet（`client_subnet`）
 
-ECS 會把近似的客戶端網路告訴上游權威伺服器。只有 CDN 本地性確實需要時才設定 `client_subnet`，否則留空。該設定只作用於命名上游。
+ECS 會把近似的用戶端網路告訴上游權威伺服器。只有 CDN 本地性確實需要時才設定 `client_subnet`，否則留空。該設定只作用於命名上游。
 
 - 明確值：IPv4 位址表示 `/32`；honk 會把 IPv4 CIDR 正規化為網路位址，所以 `203.0.113.7/24` 實際傳送 `203.0.113.0/24`。寫 IPv6、主機名或埠會讓設定失敗。
 - 自動值：不區分大小寫的 `auto` 會帶 bypass mark 向 `1.1.1.1` 的 `33434` 到 `33469` 埠發 UDP 探測；`auto(IPv4)` 只替換目標位址。路由選出的本地位址是公網位址時，honk 直接用它。否則每個 TTL 用 3 個獨立 UDP 流，最多檢查 12 個 TTL，選第一個公網 ICMP 路由跳點。結果總是 `/24`。推斷在 2 秒後放棄。探測不依賴 DNS 或 HTTP 服務。
@@ -148,7 +148,7 @@ dns {
 }
 ```
 
-客戶端自己帶的 ECS，honk 不會覆寫，`/0` 也不覆寫。客戶端查詢只要帶任何 EDNS 選項，包括自帶的 ECS，就既不快取也不合併；honk 自己新增的 ECS 不影響快取。產生的 ECS 按下面的規則走：
+用戶端自己帶的 ECS，honk 不會覆寫，`/0` 也不覆寫。用戶端查詢只要帶任何 EDNS 選項，包括自帶的 ECS，就既不快取也不合併；honk 自己新增的 ECS 不影響快取。產生的 ECS 按下面的規則走：
 
 - 明確 `-> tag` 選擇和普通流量路由都走完後，以最終解析出的撥號路徑為準。直連嘗試可以注入 ECS，`-> direct` 也算；走代理葉節點的嘗試不注入。
 - 每次 UDP 位址重試，honk 都單獨判斷。失敗的直連嘗試帶上的 ECS 不會進入後續代理重試。
@@ -174,7 +174,7 @@ upstream {
 
 ### URI scheme 與預設值
 
-| URI 形式 | 執行時協議 | 預設埠 / path |
+| URI 形式 | 執行時協定 | 預設埠 / path |
 | --- | --- | --- |
 | `host[:port]` 或 `udp://host[:port]` | UDP；應答帶 `TC` 時改用 TCP 重試 | `53` |
 | `tcp://host[:port]` | TCP DNS | `53` |
@@ -195,7 +195,7 @@ upstream {
 }
 ```
 
-基於 TLS 的協議由解析器從主機名派生 `tls_server_name`。憑證驗證需要 DNS 名稱時，IP 字面量 endpoint 要明確寫 query 參數：
+基於 TLS 的協定由解析器從主機名派生 `tls_server_name`。憑證驗證需要 DNS 名稱時，IP 字面量 endpoint 要明確寫 query 參數：
 
 ```dae
 cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
@@ -219,7 +219,7 @@ upstream {
 
 只有引號外的 `->` 和 `outbound:` 字尾才選出站。它們寫在 URI 引號裡仍算資料；如果這種寫法與舊版的拆分結果不同，會產生 `legacy-upstream-separator` warning。引號外的詞法單元開頭出現 `#`，就開始行尾註釋，行為有變化時會產生 `legacy-upstream-comment`。註釋和出站字尾都應寫在 URI 引號外。
 
-| 協議 | 經過選定的節點或群組 |
+| 協定 | 經過選定的節點或群組 |
 | --- | --- |
 | UDP（`udp`、裸位址、`tcp+udp`、`udp+tcp`） | 通過該出站承載為 TCP-DNS。 |
 | TCP | 支援通過出站 TCP stream。 |
@@ -236,7 +236,7 @@ upstream {
 
 未知、格式錯誤或不支援的條件會產生帶位置的 warning，整條規則被省略，不會只丟棄合取裡的一個條件。未知的 QTYPE 名稱產生 `invalid-qtype`，混合清單和取反條件也一樣；應改正名稱或改用數字型別碼。明確寫的 `qtype()` 仍不匹配任何型別。無效的 `qname` 或 `subtag` 正規表示式，以及空的 `sip()`，能通過解析，但會讓啟動或 reload 失敗。
 
-每條完整呼叫和它的動作必須寫在同一物理行上。不完整的非空行會被省略，並產生帶位置的 `incomplete-dns-rule`；DNS 不會把這些行拼起來。完整 matcher 後面多了文字，會產生 `trailing-matcher-text`，整條規則省略。詞法單元開頭和引數位置的引號，都必須在同一行閉合。未閉合引號會產生一條詞法診斷；只有每個區塊都保留了有效的右大括號時，honk 才省略該行並繼續處理，否則整個文件失敗。未閉合引號覆蓋到的右大括號不算區塊結束符。
+每條完整呼叫和它的動作必須寫在同一實體行上。不完整的非空行會被省略，並產生帶位置的 `incomplete-dns-rule`；DNS 不會把這些行拼起來。完整 matcher 後面多了文字，會產生 `trailing-matcher-text`，整條規則省略。詞法單元開頭和引數位置的引號，都必須在同一行閉合。未閉合引號會產生一條詞法診斷；只有每個區塊都保留了有效的右大括號時，honk 才省略該行並繼續處理，否則整個文件失敗。未閉合引號覆蓋到的右大括號不算區塊結束符。
 
 ### 條件
 
@@ -244,12 +244,12 @@ upstream {
 | --- | --- | --- |
 | `qname(suffix: example.com)` | Request 與 response | 點邊界字尾；裸引數也表示字尾。 |
 | `qname(keyword: ads)` | Request 與 response | 子串匹配。 |
-| `qname(full: api.example.com)` | Request 與 response | 精確域名匹配。 |
+| `qname(full: api.example.com)` | Request 與 response | 精確網域匹配。 |
 | `qname(regex: ...)` | Request 與 response | Rust 正規表示式匹配；包含括號時需加引號。 |
-| `qname(geosite: cn)` | Request 與 response | 匹配指定 geosite 類別展開出來的域名；`category@attr` 只保留帶該屬性的條目。 |
+| `qname(geosite: cn)` | Request 與 response | 匹配指定 geosite 類別展開出來的網域；`category@attr` 只保留帶該屬性的條目。 |
 | `qtype(a, aaaa, ...)` | Request 與 response | 匹配 QTYPE 名稱或數字 `u16`。可識別名稱為 `A`、`AAAA`、`CNAME`、`MX`、`TXT`、`NS`、`PTR`、`SOA`、`SRV`、`HTTPS`、`SVCB`、`ANY` 和 `*`。`*` 是 `ANY` 的別名，不是萬用字元。 |
-| `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 僅 request | 把邏輯客戶端來源和列出的任一個 IP 主機位址或 CIDR 匹配。 |
-| `subtag(MyAirport, keyword: Air, regex: ^Paid)` | 僅 request | 匹配[節點伺服器域名](#節點伺服器域名)查詢所屬訂閱的 tag：精確值、`keyword:` 或 `regex:`，區分大小寫。 |
+| `sip(192.168.50.1, 100.64.0.0/10, 2001:db8::/32)` | 僅 request | 把邏輯用戶端來源和列出的任一個 IP 主機位址或 CIDR 匹配。 |
+| `subtag(MyAirport, keyword: Air, regex: ^Paid)` | 僅 request | 匹配[節點伺服器網域](#節點伺服器網域)查詢所屬訂閱的 tag：精確值、`keyword:` 或 `regex:`，區分大小寫。 |
 | `upstream(name, ...)` | 僅 response | 匹配產生目前應答的上游。名稱精確比較，且不像動作目標那樣轉為小寫。 |
 | `ip(192.0.2.0/24, geoip: private, ...)` | 僅 response | 任一應答 IP 屬於所列 CIDR 或 GeoIP 集時匹配。 |
 
@@ -274,13 +274,13 @@ dns {
 
 整個 `subtag` 引數加引號時表示精確 tag：`subtag('keyword: Air')` 匹配名為 `keyword: Air` 的 tag，而 `subtag(keyword: Air)` 匹配包含 `Air` 的任意 tag。
 
-透明 53 埠和 `dns.bind` 入口的邏輯來源是 socket peer。為已通過 admission 的 TCP/UDP 流做 DNS 解析時，邏輯來源是這條流的客戶端位址。內部查詢、bootstrap 查詢、prefetch 和 Clash API 查詢都沒有邏輯來源。來源未知時，正向和取反的 `sip` 條件都是 false，請求路由繼續看下一條規則或 fallback。response 路由不接受 `sip`。
+透明 53 埠和 `dns.bind` 入口的邏輯來源是 socket peer。為已通過 admission 的 TCP/UDP 流做 DNS 解析時，邏輯來源是這條流的用戶端位址。內部查詢、bootstrap 查詢、prefetch 和 Clash API 查詢都沒有邏輯來源。來源未知時，正向和取反的 `sip` 條件都是 false，請求路由繼續看下一條規則或 fallback。response 路由不接受 `sip`。
 
 DNS 的 `sip()` 和 `ip()` 共用同一個 IP/CIDR 解碼器。裸 IPv4 和 IPv6 位址分別表示 `/32` 和 `/128`；honk 會把 CIDR 裡的主機位清零，並產生 `dns-network-host-bits` warning。無效網路會產生帶位置的 `invalid-dns-network` 診斷，整條 dae 規則被省略；用程式碼建構的無效路由則在路由器或策略建構時失敗。等價的網路寫法使用相同的策略識別碼，引數順序不變，重複引數也不會刪除。
 
-### 節點伺服器域名
+### 節點伺服器網域
 
-節點伺服器域名經 `global.bootstrap_resolver`、`/etc/hosts` 和系統 nameserver 解析，不走 DNS 路由。含 `subtag(...)` 的 request 規則會接管匹配訂閱裡節點的伺服器域名，XHTTP 下載域名也包括在內：
+節點伺服器網域經 `global.bootstrap_resolver`、`/etc/hosts` 和系統 nameserver 解析，不走 DNS 路由。含 `subtag(...)` 的 request 規則會接管匹配訂閱裡節點的伺服器網域，XHTTP 下載網域也包括在內：
 
 ```dae
 dns {
@@ -297,28 +297,28 @@ dns {
 }
 ```
 
-- 節點域名只匹配含 `subtag()` 的規則；普通規則、fallback 和沒匹配上的域名仍走 bootstrap 解析。其他查詢不帶訂閱，對它們來說 `subtag()` 和 `!subtag()` 都是 false。
-- 被接管的查詢只發往選中的上游，遵守 `strategy` 和 `use_host`，不走快取和 response 規則，也不回退：查詢失敗就表示物理節點連線或探測連線失敗。
-- 接管按域名生效，不是端到端的下載目標解析策略。下載時為選路而預先解析 URL 域名，只是盡力而為；代理下載的 URL 域名仍由代理解析，而承載代理自身的節點伺服器解析遵守這條規則。明確使用 bootstrap 解析器的下載繞過這個 hook。
+- 節點網域只匹配含 `subtag()` 的規則；普通規則、fallback 和沒匹配上的網域仍走 bootstrap 解析。其他查詢不帶訂閱，對它們來說 `subtag()` 和 `!subtag()` 都是 false。
+- 被接管的查詢只發往選中的上游，遵守 `strategy` 和 `use_host`，不走快取和 response 規則，也不回退：查詢失敗就表示實體節點連線或探測連線失敗。
+- 接管按網域生效，不是端到端的下載目標解析策略。下載時為選路而預先解析 URL 網域，只是盡力而為；代理下載的 URL 網域仍由代理解析，而承載代理自身的節點伺服器解析遵守這條規則。明確使用 bootstrap 解析器的下載繞過這個 hook。
 - tag 屬於主機名，不屬於節點：不同訂閱裡共用同一主機名的節點，各自的 tag 會合併，所以第一條匹配的規則就為這個主機名選定一個上游。
 - 這條規則只能和 `qname()` 組合，而且所選上游的每條宣告都必須是 `-> direct`，否則驗證報錯：`subtag-dns-condition`、`subtag-dns-action` 或 `subtag-dns-upstream-route`。
-- 上游自身的域名、ECH 發現和離線 `delay` 子命令仍使用 bootstrap 解析器。
-- 域名匹配到 `use_host` 中的[別名](#hosts-快照use_host)時，honk 改為解析別名目標。別名鏈停在位址條目上，就直接用這些位址；否則把目標域名當作節點域名解析，也就是交給接管該目標的 `subtag()` 規則，沒有接管就走 bootstrap。直接匹配原始域名的位址條目不會經這個 hook 接管；honk 用的是別名鏈終點的位址條目。所有被接管的查詢，包括本機位址結果和 bootstrap 目標，都遵守 DNS 執行時 admission 與取消機制。目標或 subtag 路徑一旦選定，該路徑失敗就是最終結果。查詢執行前 reload 刪掉了這個別名時，原域名按沒有別名的情況解析。
-- 別名匹配所有交給 bootstrap 解析器的域名，不限於節點伺服器域名：沒有指定明確 bootstrap 解析器的訂閱、Geo 資料和外部 UI 下載的 URL 域名，SOCKS5 節點的 UDP 中繼域名，以及健康檢查、延遲測試、連通性探測和內部解析回退到 bootstrap 時的域名。DNS 上游自身的域名和 ECH 發現不走這個 hook。
-- 每個 DNS generation 根據訂閱 tag 和有序規則，預先算出節點域名的策略結果，包括沒匹配上的結果。用到這些結果時，原生流追蹤會以 `not_instrumented` 標成 `partial`：節點域名的規則決策證據還沒有收集。
+- 上游自身的網域、ECH 發現和離線 `delay` 子命令仍使用 bootstrap 解析器。
+- 網域匹配到 `use_host` 中的[別名](#hosts-快照use_host)時，honk 改為解析別名目標。別名鏈停在位址條目上，就直接用這些位址；否則把目標網域當作節點網域解析，也就是交給接管該目標的 `subtag()` 規則，沒有接管就走 bootstrap。直接匹配原始網域的位址條目不會經這個 hook 接管；honk 用的是別名鏈終點的位址條目。所有被接管的查詢，包括本機位址結果和 bootstrap 目標，都遵守 DNS 執行時 admission 與取消機制。目標或 subtag 路徑一旦選定，該路徑失敗就是最終結果。查詢執行前 reload 刪掉了這個別名時，原網域按沒有別名的情況解析。
+- 別名匹配所有交給 bootstrap 解析器的網域，不限於節點伺服器網域：沒有指定明確 bootstrap 解析器的訂閱、Geo 資料和外部 UI 下載的 URL 網域，SOCKS5 節點的 UDP 中繼網域，以及健康檢查、延遲測試、連通性探測和內部解析回退到 bootstrap 時的網域。DNS 上游自身的網域和 ECH 發現不走這個 hook。
+- 每個 DNS generation 根據訂閱 tag 和有序規則，預先算出節點網域的策略結果，包括沒匹配上的結果。用到這些結果時，原生流追蹤會以 `not_instrumented` 標成 `partial`：節點網域的規則決策證據還沒有收集。
 
 ### Request 動作
 
 | 動作 | 結果 |
 | --- | --- |
 | `reject` | 返回空的成功應答。 |
-| `asis` | 用 honk 自己發起的 socket，向攔截時得到的原始 DNS 目的位址重新查詢，不保留客戶端的網路來源 IP 和埠。透明查詢保留入口 transport；UDP 應答帶 `TC` 時，對同一目的位址改用 TCP 重試。獨立查詢沒有原始目的位址，會直接失敗，不會遞迴撥回 listener。 |
+| `asis` | 用 honk 自己發起的 socket，向攔截時得到的原始 DNS 目的位址重新查詢，不保留用戶端的網路來源 IP 和埠。透明查詢保留入口 transport；UDP 應答帶 `TC` 時，對同一目的位址改用 TCP 重試。獨立查詢沒有原始目的位址，會直接失敗，不會遞迴撥回 listener。 |
 | 上游名 | 查詢該命名上游。 |
 | `fallback: reject\|asis\|<upstream>` | 沒有 request 規則匹配時使用的動作；預設用上游 `default`。 |
 
 兩個路由區塊都接受 `default:` 作為 `fallback:` 的舊版別名。
 
-代表已通過 admission 的流執行、帶有來源的查詢，沒有攔截時得到的 DNS 伺服器原始目的位址。如果它的 request 策略選了 `asis`，解析按 fail-closed 處理，絕不會退回到相容的預設上游。
+對已通過 admission 的流執行、帶有來源的查詢而言，沒有攔截時得到的 DNS 伺服器原始目的位址。如果它的 request 策略選了 `asis`，解析按 fail-closed 處理，絕不會退回到相容的預設上游。
 
 原生 `direct(must)` 的繞過與 `asis` 重新查詢不同；見[DNS 來源/NAT 與投影限制](../design/dns.md#入口路徑)。
 
@@ -408,7 +408,7 @@ dns {
 
 ### fixed_domain_ttl
 
-按域名覆寫正應答和 NODATA 的 TTL，先於 `optimistic_cache_ttl` 應用。預設空。寫 `0` 時，所有回應碼的應答都不快取，NXDOMAIN 和 SERVFAIL 也一樣。key 只匹配一個精確名稱，用不帶末尾點的小寫形式，不覆寫子域。
+按網域覆寫正應答和 NODATA 的 TTL，先於 `optimistic_cache_ttl` 應用。預設空。寫 `0` 時，所有回應碼的應答都不快取，NXDOMAIN 和 SERVFAIL 也一樣。key 只匹配一個精確名稱，用不帶末尾點的小寫形式，不覆寫子域。
 
 例如，`www.example.com` 需要單獨的條目：
 
@@ -423,11 +423,11 @@ dns {
 }
 ```
 
-每個固定 TTL 必須正好是一個無符號 32 位十進位標量。裸值和帶引號的值都接受，包括 `0` 和 `4294967295`；新接受的帶引號十進位值會產生 `legacy-ttl-quoting` warning。值無效或溢位會產生 `invalid-ttl`，多出詞法單元會產生 `trailing-value`，兩種情況都會省略該條目。說明文字寫在 ` # ` 後面，不要緊貼數值。
+每個固定 TTL 必須正好是一個無符號 32 位十進位純量。裸值和帶引號的值都接受，包括 `0` 和 `4294967295`；新接受的帶引號十進位值會產生 `legacy-ttl-quoting` warning。值無效或溢位會產生 `invalid-ttl`，多出詞法單元會產生 `trailing-value`，兩種情況都會省略該條目。說明文字寫在 ` # ` 後面，不要緊貼數值。
 
 ### 快取條目與過期
 
-Request 路由在快取查詢之前執行。查詢除交易 ID 外完全相同，走同一類入口，又選中相同的 DNS 策略和相同的上游或 `asis` 目的位址時，客戶端才共享快取條目；原始客戶端來源不參與快取 key。偏好位址族的渲染仍保留來源中繼資料，所以依賴來源的 sibling 策略不會經由 foreground singleflight 洩漏。
+Request 路由在快取查詢之前執行。查詢除交易 ID 外完全相同，走同一類入口，又選中相同的 DNS 策略和相同的上游或 `asis` 目的位址時，用戶端才共享快取條目；原始用戶端來源不參與快取 key。偏好位址族的渲染仍保留來源中繼資料，所以依賴來源的 sibling 策略不會經由 foreground singleflight 洩漏。
 
 設了 `optimistic_cache_ttl: 0`，又沒有 `fixed_domain_ttl` 覆寫時，`NOERROR` 正應答取 answer、authority 和 additional 段裡所有非 OPT 記錄的最小 TTL。快取這份應答時，honk 把每個非 OPT 記錄的 TTL 改寫成這個最小值。只要有一條記錄的 TTL 為零，honk 就不快取該應答，並移除精確快取槽，避免舊位址或更早的負應答再次返回。非零的設定 TTL 或固定 TTL 仍能覆寫零值。
 
@@ -455,11 +455,11 @@ NXDOMAIN 的快取時間是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA，
 
 ## 解析規則
 
-### 標量與註釋
+### 純量與註釋
 
-標量值佔掉該物理行剩下的部分，只在 key 後面的冒號處切開，所以裸寫的 IPv6 位址和 `client_subnet: auto(9.9.9.9)` 都能保持完整。解析器只去掉包圍整個值的一對匹配引號。值一旦以引號開頭，就必須在同一行閉合，否則設定失敗。
+純量值佔掉該實體行剩下的部分，只在 key 後面的冒號處切開，所以裸寫的 IPv6 位址和 `client_subnet: auto(9.9.9.9)` 都能保持完整。解析器只去掉包圍整個值的一對匹配引號。值一旦以引號開頭，就必須在同一行閉合，否則設定失敗。
 
-標量設定裡，只有引號外、詞法單元開頭的 `#` 才開始註釋。`use_host: /tmp/a#b` 選的是字面路徑 `/tmp/a#b`，並產生 `legacy-glued-hash` warning；註釋要寫成 `use_host: /tmp/a # comment`。重複的 `use_host` 宣告按來源順序保留，去重行為與原來一樣。
+純量設定裡，只有引號外、詞法單元開頭的 `#` 才開始註釋。`use_host: /tmp/a#b` 選的是字面路徑 `/tmp/a#b`，並產生 `legacy-glued-hash` warning；註釋要寫成 `use_host: /tmp/a # comment`。重複的 `use_host` 宣告按來源順序保留，去重行為與原來一樣。
 
 ### 布林值
 
@@ -475,7 +475,7 @@ NXDOMAIN 的快取時間是 `min(SOA TTL, SOA MINIMUM, 300)` 秒。缺少 SOA，
 
 ## 舊版轉換
 
-相容性設定裡保留扁平的 `routing.rules` 條目，欄位是 `domain` 和 `upstream`，另外還有命名 `fallback`。這些是結構化相容欄位，不是目前 dae 語法裡的附加語句。`suffix:`、`keyword:`、`full:` 和 `regex:` 字首用來選匹配方式；不帶字首的舊版域名按 `full` 精確匹配。
+相容性設定裡保留扁平的 `routing.rules` 條目，欄位是 `domain` 和 `upstream`，另外還有命名 `fallback`。這些是結構化相容欄位，不是目前 dae 語法裡的附加語句。`suffix:`、`keyword:`、`full:` 和 `regex:` 字首用來選匹配方式；不帶字首的舊版網域按 `full` 精確匹配。
 
 結構化的 YAML、TOML 或 JSON 輸入不能包含 request 或 response 規則：`dns.routing.request` 和 `dns.routing.response` 必須省略，或者寫成 `null`。這類規則請用 dae 寫。
 

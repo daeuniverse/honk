@@ -14,7 +14,7 @@ IR；受限編譯器把同一份 IR 編譯成原生 eBPF 比較程式碼。核�
 ## 規則語意
 
 規範化的 IR 儲存有序 RuleId、展示資訊、條件和 outbound/mark/must 動作。priority
-越小越先匹配，同優先順序保持穩定的原始碼順序。dae 解析器依原始碼順序配發 `0, 1, ...`，
+越小越先匹配，同優先順序保持穩定的原始碼順序。dae 解析器依原始碼順序分配 `0, 1, ...`，
 流量規則的內容和順序完全由使用者設定決定。啟動、reload 和介面變化都不再注入閘道器
 位址的 `direct(must)` 規則，也沒有隱藏的核心位址白名單。條件之間是 AND，同一條件的
 候選值之間是 OR；否定只作用一次，涵蓋整個條件。fallback 是獨立的終結動作。空展開
@@ -39,7 +39,7 @@ IR；受限編譯器把同一份 IR 編譯成原生 eBPF 比較程式碼。核�
 - 目的 IP 和來源 IP 保留 IPv4/IPv6 身份，涵蓋 `/0`、裸主機位址和重疊字首。
 - 埠區間包含兩端；TCP/UDP 和 IPv4/IPv6 mask 可以同時包含兩種值。
 - pname 保留設定端 15 位元組規範化和子字串匹配語意。核心裡的行程位元組按與 handoff
-  相同的 lossy UTF-8 和 trim 規則轉換，熱路徑不佔用堆積記憶體。
+  相同的 lossy UTF-8 和 trim 規則轉換，熱路徑不配置堆記憶體。
 - 缺失的 pname、MAC、DSCP 不等於一般零值。domain 缺失時不滿足正向條件，也不會
   觸發負向條件的 veto。
 - 設定的 `(must)` 是終結結果：設定顯式的 `must` 決策欄位，並跳過嗅探。Clash 模式
@@ -53,18 +53,18 @@ LAN/WAN 的 TCP/UDP 目的埠 `53` 先經過既有入口和控制面排除，然
 第一條整規則、讓重疊 LPM 遺失祖先 bitmap。這些都不是需要保留的相容行為。共享 IR 和
 獨立的 golden 案例要能阻止這些錯誤，不能把舊缺陷編碼進新後端。
 
-## 唯一 policy 與域名事實
+## 唯一 policy 與網域事實
 
 `CompiledRoute` 儲存中繼資料和 `CompiledCondition` 列表，不再另外維護一組正負
-matcher 欄位。每個條件有一個 `CompiledPredicate` 和一個否定標誌。域名條件引用
+matcher 欄位。每個條件有一個 `CompiledPredicate` 和一個否定標誌。網域條件引用
 policy 內不可變的已編譯 matcher registry。規則名只用於展示，不能當作 bitmap 身份；
-相同的域名謂詞可以在同一個 policy 內共享 PredicateId。
+相同的網域謂詞可以在同一個 policy 內共享 PredicateId。
 
 ### 原始碼組織
 
 - [`crates/honk-core/src/routing/`](../../../crates/honk-core/src/routing/) —
   用戶態 `Router`、按優先順序排序的編譯規則、`route_action`，以及 `BinaryLpmTrie` 和
-  Geo 資源的輔助程式碼。`domain.rs` 負責域名 matcher、`GeositeMatcher` 和建構期的
+  Geo 資源的輔助程式碼。`domain.rs` 負責網域 matcher、`GeositeMatcher` 和建構期的
   內部去重表。`geo.rs` 在每次建構 `Router` 時只解析一次
   `geoip.dat`/`geosite.dat`，而且只解碼被引用到的類別。`category@attr` 在第一個
   `@` 處分開，屬性 key 按不區分大小寫的方式篩選。啟動時，流量路由和 DNS 路由共用
@@ -80,7 +80,7 @@ policy 內不可變的已編譯 matcher registry。規則名只用於展示，�
 - 舊的 sockops/sk_msg 重新導向實驗不屬於目前資料路徑。部分核心版本出現 panic 報告後，
   這些實驗程式碼已被移除。現在只支援 TC 重新導向，載入器只尋找現有的程式名稱。
 
-使用者態參考實作和核心編譯器用的都是這套表示。DNS 和 sniff 產生的是全部域名謂詞的
+使用者態參考實作和核心編譯器用的都是這套表示。DNS 和 sniff 產生的是全部網域謂詞的
 真值位，不是首條命中的完整流量規則。用於否定規則的謂詞也投影自己的正向真值，由
 求值器負責否定。一個已知 domain 即使沒有匹配任何謂詞，也會產生一個存在的零 bitmap；
 這個 IP 的最後一個有效 owner 消失時，才刪除條目。
@@ -105,15 +105,15 @@ caller 從本次執行策略所用的同一份 Rule-mode flags 快照重建 perm
 一次 map。輸入仍是 128 位元組。loader 會拒絕最後一個欄位仍是 `mac_present` 的舊外部
 eBPF 物件，所以用這個使用者態 compiler 之前必須先重建這些物件。
 
-`domain_final` 表示在目前 dial mode 下，後續的域名觀察改變不了這一階段的路由。
-三種情況會成立：policy 裡沒有域名謂詞；停用了域名重路由；或者已經取得完整的
+`domain_final` 表示在目前 dial mode 下，後續的網域觀察改變不了這一階段的路由。
+三種情況會成立：policy 裡沒有網域謂詞；停用了網域重路由；或者已經取得完整的
 learned-domain bitmap。Rule 模式下，如果從首條 live 規則到目前命中規則，包含目前
-這條，字首都不依賴域名，那麼一般的 direct action 也可以成為 final，後置的域名
-規則覆蓋不了 first-match。folded-false 規則不計入字首；正向和取反的域名謂詞都計入。
+這條，字首都不依賴網域，那麼一般的 direct action 也可以成為 final，後置的網域
+規則覆蓋不了 first-match。folded-false 規則不計入字首；正向和取反的網域謂詞都計入。
 fallback 用同一套字首證明。沒有捕獲到 Rule-mode permission 時不套用這個額外證明，
-以保留 Global 模式原有的交接和域名嗅探 authority。
+以保留 Global 模式原有的交接和網域嗅探 authority。
 
-非 DNS 流量裡，非 `must` 的 direct 結果如果域名 finality 還沒確定，交給使用者態時
+非 DNS 流量裡，非 `must` 的 direct 結果如果網域 finality 還沒確定，交給使用者態時
 必須編碼成 `ControlPlaneRouting`；如果照舊寫成最終 direct，TCP/UDP 初始化就會
 跳過嗅探。這條非 DNS 路徑保留已知 direct、must、block 和 mode direct offload 的
 終態語意。埠 53 的所有權按上面的參考處理。
@@ -192,7 +192,7 @@ mark、`must` 和直連 mark 索引；一般 fallback 不增加寫入。
 清零那些馬上就會被覆蓋的位元組。
 
 事實準備先用 hash 合併重複 key，只排序唯一 key，再在原向量裡繼承祖先位並壓縮保留
-容量。內部跳轉由 assembler 自己配發的 ordinal label 標示，只有規則 source record
+容量。內部跳轉由 assembler 自己分配的 ordinal label 標示，只有規則 source record
 保留診斷文字。輸入和輸出偏移從共享 ABI 宣告推導，不再單獨維護一份偏移表。
 
 策略身份 hash 涵蓋帶長度邊界的規範化規則欄位、有序 domain registry key 和選定的
@@ -205,7 +205,7 @@ sniff-only facts。
 每次插入指令前檢查 1,000,000 條指令預算，耗盡時立即傳回錯誤，不再繼續展開指令或
 fixup。
 
-事實位按每個 generation 配發資源：目的 IP、來源 IP、MAC 各有 256 個 ID，按不同的列表計數，不按規則數量計數。引用同一個 IP 列表的規則共享 ID，列表按 interned matcher 身份識別；引用同一個 MAC 列表的規則也共享 ID，列表按值識別，順序敏感。取反仍保留在規則條件上。域名謂詞另有 256 個 ID，規範化 matcher key 相等時就共享。分支距離必須能用一個有符號 16 位指令偏移表示，否則以 `routing jump out of range` 錯誤拒絕發布。
+事實位按每個 generation 分配資源：目的 IP、來源 IP、MAC 各有 256 個 ID，按不同的列表計數，不按規則數量計數。引用同一個 IP 列表的規則共享 ID，列表按 interned matcher 身份識別；引用同一個 MAC 列表的規則也共享 ID，列表按值識別，順序敏感。取反仍保留在規則條件上。網域謂詞另有 256 個 ID，規範化 matcher key 相等時就共享。分支距離必須能用一個有符號 16 位指令偏移表示，否則以 `routing jump out of range` 錯誤拒絕發布。
 
 容量和 verifier 限制都是明確的錯誤，不能截斷規則鏈，也不能把缺失的 outbound 預設
 成 direct。生成源對映記錄 RuleId 和規範化規則描述。raw loader 重用現有的
@@ -231,7 +231,7 @@ domain-map ID。一次路由只取一個 descriptor，再同步呼叫一個槽�
 值，20 位空間最多預留 1,048,575 次，其中包括失敗的發布和只替換 descriptor 的
 NFQUEUE fence。耗盡時保留目前策略、拒絕進一步發布，並讓 NFQUEUE fence 保持關閉；
 只要 host 分片佇列還可能存活，就不能刪除這個 pin。策略沒變可以跳過重編譯，但佇列
-fence 仍會發布新的 descriptor generation。物理攜帶格式見[資料路徑
+fence 仍會發布新的 descriptor generation。實體 carrier 格式見[資料路徑
 ABI](./datapath.md#map-清單)，排隊中繼資料和 generation 生命週期見[控制面
 admission](./control-plane.md#透明代理入口)。
 
@@ -239,7 +239,7 @@ admission](./control-plane.md#透明代理入口)。
 後端自己挑 inactive slot，並在局部持有候選，呼叫方不必選槽，也沒有
 pending-domain 握手。靜態 plan 重用和 DNS projection ownership 仍然是分開的。
 
-發布與現有 reload、DNS publication fence 序列協調：
+發布與現有 reload、DNS publication fence 序列化：
 
 1. 編譯並驗證完整候選，保留 active policy。
 2. 建立並填入本 generation 的事實 maps，包括 learned-domain 快照。

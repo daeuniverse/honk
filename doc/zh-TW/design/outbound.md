@@ -41,7 +41,7 @@
 
 共享狀態仍留在共同的父模組裡，子模組不公開這些欄位。REALITY、TLS、stream
 transport 和 UoT 仍由多個協定共用，不歸 VLESS 獨佔。既有的測試名稱保留在對應協定
-族內。物理檔案、行號和定義模組的 metadata 會隨歸屬變化；公開 reexport 不會保留
+族內。實體檔案、行號和定義模組的 metadata 會隨歸屬變化；公開 reexport 不會保留
 `type_name` 或預設 tracing target。舊的 `quic_boring`、`vless_mux`、
 `shadowsocks_2022` 日誌過濾目標，應改成 `honk_outbound::` 字首下的
 `quic::boring`、`proxy::vless::mux`、`proxy::shadowsocks::aead2022`。
@@ -124,7 +124,7 @@ Ready-stream pooling 儲存已完成、已繫結目標的握手。Bare-TCP pooli
 QUIC 協定不進入這兩種 pool，因為 generation runtime 已經持有複用狀態。Direct 也
 不進入這兩種 pool，因為每條流的 socket 各自帶著規則 mark 或全域 mark。即使設定了
 獨立的僅 UDP Xray pool，direct TCP 的 VLESS 仍可以進入 bare pool。XHTTP 不進入這
-兩類 preconnect pool，物理 H2 複用由它自己的 transport runtime 持有。
+兩類 preconnect pool，實體 H2 複用由它自己的 transport runtime 持有。
 
 Ready stream 按 runtime generation、節點身分和目標分別儲存。只有流所屬
 generation 與被撥號時的 generation 一致，才能取出。reload 發布新 generation 後，
@@ -152,7 +152,7 @@ capability 拒絕，呼叫方可以繼續回退到設定中的冷候選。顯式
 | --- | --- | --- |
 | `direct` | Native 帶 mark 目標連線 | `PacketTransport` 後的 native 帶 mark UDP |
 | `block` | 拒絕 | 顯式拒絕路徑例外；不承載 UDP |
-| `socks5` | SOCKS CONNECT | RFC 1928 UDP association。每個用戶端來源有一條控制流和一個連線到中繼的 socket，供其所有目的地共用。每個 header 寫入自己的目的地，每個應答返回真實線上來源（IPv4-mapped IPv6 規範化為 IPv4）。網域來源僅在等於撥號網域且埠一致時才投影為捕獲的目標，其他名字不經 DNS 直接丟棄。傳送時只寫入撥號網域，其他名字以數值目標發出。被截斷、RSV 非零、分片（`FRAG != 0`）或網域不是 UTF-8 的中繼 datagram 只丟棄該包並記 DEBUG；未知 ATYP 或控制流 EOF 結束 association。協商和認證、ASSOCIATE 請求和應答（含中繼網域解析）各有五秒逾時。 |
+| `socks5` | SOCKS CONNECT | RFC 1928 UDP association。每個用戶端來源有一條控制流和一個連線到中繼的 socket，供其所有目的地共用。每個 header 寫入自己的目的地，每個應答返回真實線路來源（IPv4-mapped IPv6 規範化為 IPv4）。網域來源僅在等於撥號網域且埠一致時才投影為捕獲的目標，其他名字不經 DNS 直接丟棄。傳送時只寫入撥號網域，其他名字以數值目標發出。被截斷、RSV 非零、分片（`FRAG != 0`）或網域不是 UTF-8 的中繼 datagram 只丟棄該包並記 DEBUG；未知 ATYP 或控制流 EOF 結束 association。協商和認證、ASSOCIATE 請求和應答（含中繼網域解析）各有五秒逾時。 |
 | `ss` / Shadowsocks 2022 | Shadowsocks stream | Shadowsocks packet framing；每個用戶端來源一個已連線的伺服器 socket 與加密狀態，可發往任意目的地（見下文） |
 | `trojan` | 共享 transport 上的 Trojan stream | `network` 允許 UDP 時使用 Trojan UDP framing；每個用戶端來源一條 associate 流，每個 frame 自帶對端位址 |
 | `vmess` | VMess stream | 未實作 |
@@ -203,7 +203,7 @@ generation 所有，handler 保持無狀態。
 
 XHTTP 使用獨立的 H2-only profile。規範節點攜帶 `["h2"]`，普通 TLS 和 REALITY 都會設定這個 offer，但不會改變 raw TCP、WS 或 gRPC profile。普通 TLS 在傳送代理位元組之前，會拒絕沒有協商 H2 的對端。認證後的 REALITY 按 transport 契約選擇 H2；官方 Xray 會故意省略伺服器 ALPN。顯式的明文 XHTTP 要求對端支援 H2。規範請求形態以及 TLS/明文安全設定都參與節點身分和 reload 複用。
 
-admission 範圍內的 TCP 回饋只會開始一次：在首個獲准的物理嘗試開始時，或者在複用
+admission 範圍內的 TCP 回饋只會開始一次：在首個獲准的實體嘗試開始時，或者在複用
 session 或 QUIC connection 上開啟邏輯流之前。冷 admission 還在等待時，回饋不會開
 始。已經完成、但沒有經過上述任一邊界的路徑，仍使用完成時的回退機制。
 
@@ -218,7 +218,7 @@ registry 建置 replacement。只有完整節點設定相等時，runtime 才能
 點會保留：
 
 - TUIC、Juicity 和 Hysteria2 的 QUIC client 和連線；
-- AnyTLS 物理 session；
+- AnyTLS 實體 session；
 - 完整的 VLESS runtime，包括 H2/Mux.Cool carrier 和 source-ID key。
 
 退役 generation 首先對新工作變成 terminal。未遷移的 AnyTLS 和 VLESS pool 進入
@@ -235,14 +235,14 @@ private carrier 不進入可複用 session pool。
 
 ### 撥號 admission
 
-direct TCP 與代理的 TCP/QUIC 嘗試都屬於物理出站連線，它們連同協定握手會取得兩個 permit：
+direct TCP 與代理的 TCP/QUIC 嘗試都屬於實體出站連線，它們連同協定握手會取得兩個 permit：
 
 1. 捕獲 generation 的設定撥號 gate；
 2. 所有重疊 reload generation 共享、啟動時固定的行程級 ceiling。
 
 先取得 generation gate，避免低限額 generation 在等待時佔住行程容量。replacement
 可以立刻採用新的 generation 區域性限額，舊的在途工作繼續佔用共享行程 gate。已經預
-熱的 session 上，邏輯 stream 不再執行物理撥號。
+熱的 session 上，邏輯 stream 不再執行實體撥號。
 
 Session pool 自主發起的 replacement dial 只繫結已發布 owner 的 admission。reload
 發布時，會原子地把遷移的 pool 重新繫結到新 generation；遲到的 speculative commit
@@ -269,7 +269,7 @@ prewarm。backend 關閉或從 Active 進入 Draining 時，會通知同一個�
 child permit 仍被持有時 H2 driver 終止。session 在發布或 detached attach 之前綁
 定 pool 通知；手動清理已關閉 carrier 時也會廣播容量變化。
 
-VLESS 物理 carrier 還持有不可變行程級 VLESS-carrier gate 的一個 permit。啟動資源
+VLESS 實體 carrier 還持有不可變行程級 VLESS-carrier gate 的一個 permit。啟動資源
 預算先扣除 DNS socket 分割區，再在計算 UDP endpoint 之前分出
 `min(after_dns / 8, 8192)`；零值保持為零。reload 流量和 DNS runtime fork 共用同
 一個 gate。permit 隨實際 carrier I/O 經過 provisional、active、draining 和 idle
@@ -286,7 +286,7 @@ Trojan、VMess 和 VLESS 共用 `src/proxy/transport.rs`。具體行為由 `node
 TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol header
 ```
 
-`maybe_tls_wrap_concrete` 保留 Vision 需要的具體 TCP/TLS 型別。有 REALITY 引數時，
+`maybe_tls_wrap_concrete` 保留 Vision 需要的具體 TCP/TLS 型別。有 REALITY 參數時，
 它走[有界認證建立過程](#伺服器認證與指紋約束)，不走普通 TLS。因此，同一條共享路
 徑為 Trojan、VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立過程。
 
@@ -305,10 +305,10 @@ writer：寫到一半就停滯的 frame 會終止整個 source，絕不按擁塞
 
 
 `transport_quality` 按 runtime owner 管理 carrier 壓力提示。共享的
-TCP/TLS/REALITY 和 AnyTLS 在物理 I/O 層觀測，Shadowsocks 借用已有的 socket half。
+TCP/TLS/REALITY 和 AnyTLS 在實體 I/O 層觀測，Shadowsocks 借用已有的 socket half。
 Linux `TCP_INFO` 每個活躍秒最多讀一次。各欄位按核心返回的 ABI 長度分別檢查；欄位
 缺失或讀取失敗時保持未知，也不改變 I/O。Vision Direct 和 ready pool 的 FD 存活性
-檢查仍走 socket 路徑。Hy2/TUIC/Juicity 複用已有的每秒物理 QUIC 取樣，隔離握手確
+檢查仍走 socket 路徑。Hy2/TUIC/Juicity 複用已有的每秒實體 QUIC 取樣，隔離握手確
 認或發布之前的歷史，peer 改變時重建基線；邏輯 mux child 不會重複報告同一事件。這
 裡不額外持有 FD，也不建立逐 TCP 定期任務；靜止的 TCP 不會產生新的事件驅動觀測。
 詳見 [Score 壓力語義](./groups.md#score-評分與生命週期)。
@@ -323,7 +323,7 @@ opening request 不設定 `END_STREAM`。TLS 請求使用 `:scheme: https`，且
 protobuf 單 bytes 欄位 envelope。最多允許一個 16 KiB 的應用訊息排隊等待傳送；取
 消不會把已經取得所有權的位元組算進後一次呼叫的 buffer。`h2` 可以把訊息拆到正在傳送
 的視窗裡，視窗小於 envelope 也可以。flush 會同時等待排隊 DATA 和底層 transport
-重新整理完成，不能只看控制幀是否重新整理。請求 shutdown 傳送 `END_STREAM`，但保留回應方
+送出完成，不能只看控制幀是否送出。請求 shutdown 傳送 `END_STREAM`，但保留回應方
 向；拆分後的讀寫任務都能收到 driver 喚醒。
 
 非 200 回應、trailers-only 拒絕、非零 gRPC status、流重設，以及攜帶錯誤或排除當
@@ -336,17 +336,17 @@ VMess 在關閉 duplex 半邊前記錄 relay 返回的錯誤，使回應標頭�
 
 #### XHTTP carrier 與邏輯流所有權
 
-`proxy/transport/xhttp.rs` 把原始 H2 body 適配成已有的 stream 契約，並持有節點級 `SessionPool`。它不是新的代理協定，也不是 loopback relay。開啟下載後會多一個 peer：它有自己的 pool 和撥號節點，只承載 GET。呼叫方傳入的 socket 始終屬於上傳 peer。winner commit 在同一次 lifecycle 鎖內同時持有兩個 pool 鎖，先校驗兩側的 private carrier，再發布；任何一側的 carrier 已經斷開，兩側都不會發布。每個 pool 最多保留兩條可複用物理 carrier。draining carrier 可以在既有的行程 FD/VLESS-carrier gate 下與 replacement 短暫重疊。物理 driver 擁有 socket、觀測和 carrier permit；HTTP 請求和邏輯代理流使用獨立的 reservation。對端公布的並行 stream 上限保持權威，包括零、一和後續的縮小。
+`proxy/transport/xhttp.rs` 把原始 H2 body 適配成已有的 stream 契約，並持有節點級 `SessionPool`。它不是新的代理協定，也不是 loopback relay。開啟下載後會多一個 peer：它有自己的 pool 和撥號節點，只承載 GET。呼叫方傳入的 socket 始終屬於上傳 peer。winner commit 在同一次 lifecycle 鎖內同時持有兩個 pool 鎖，先校驗兩側的 private carrier，再發布；任何一側的 carrier 已經斷開，兩側都不會發布。每個 pool 最多保留兩條可複用實體 carrier。draining carrier 可以在既有的行程 FD/VLESS-carrier gate 下與 replacement 短暫重疊。實體 driver 擁有 socket、觀測和 carrier permit；HTTP 請求和邏輯代理流使用獨立的 reservation。對端公布的並行 stream 上限保持權威，包括零、一和後續的縮小。
 
 每條 carrier 最多保留 2048 個本地 reset 請求，相當於 16 個 admission 視窗。它使用 h2 預設的一秒在途 frame 寬限期，也保留 h2 預設的終身協定錯誤 reset 預算：最多 1024 次。持續的短流 churn 會在舊 reset 狀態過期前取消多個 admission 視窗，所以保留數量必須高於活躍請求上限。
 
-Stream-one 使用一個 POST，stream-up 使用 GET 和流式 POST，packet-up 使用 GET 和有序的有限 POST。建鏈不必等回應標頭，就能返回可寫流。上傳回應裡的 padding 會被持續排空並丟棄，不計入應用 RX。Packet-up 在閒置後的第一批資料到達時立即傳送，不額外等湊批。連續的 POST 遵守 `scMinPostsIntervalMs`。POST 等待節奏間隔、或其 body 正在傳送時接納的位元組，會合併到下一次 POST。每流位元組緩衝和最多八個未完成回應的 POST 一起限制背壓；前一個 body 物理寫完之後，就可以繼續後續 POST，不必等它的回應。
+Stream-one 使用一個 POST，stream-up 使用 GET 和流式 POST，packet-up 使用 GET 和有序的有限 POST。建立連線不必等回應標頭，就能返回可寫流。上傳回應裡的 padding 會被持續排空並丟棄，不計入應用 RX。Packet-up 在閒置後的第一批資料到達時立即傳送，不額外等湊批。連續的 POST 遵守 `scMinPostsIntervalMs`。POST 等待節奏間隔、或其 body 正在傳送時接納的位元組，會合併到下一次 POST。每流位元組緩衝和最多八個未完成回應的 POST 一起限制背壓；前一個 body 實體寫完之後，就可以繼續後續 POST，不必等它的回應。
 
 legacy 上傳 padding 的 Referer 使用設定的基礎 path，query 換成生成的 `x_padding` 值；請求本身仍保留設定的 query。
 
-Stream-one 和 stream-up 的 flush 在目前 H2 流控下，等待位元組所有權釋放和物理 I/O 重新整理。Packet-up 的協定建立 flush 和首次應用寫入 flush，都會等待完整的已接納位元組字首完成物理重新整理，跨多個 POST 也一樣。VLESS Encryption 額外預留一個建立屏障；在恢復的 0-RTT 連線裡，即使握手和協定標頭共用一次 flush，也保留這個屏障。沒有新位元組的 flush 不消耗這些屏障。之後的 packet-up flush 只檢查保留的錯誤，不等待 POST，所以逐 datagram 的 write/flush 迴圈可以跨節奏間隔合併批次。
+Stream-one 和 stream-up 的 flush 在目前 H2 流控下，等待位元組所有權釋放和實體 I/O 送出。Packet-up 的協定建立 flush 和首次應用寫入 flush，都會等待完整的已接納位元組字首完成實體送出，跨多個 POST 也一樣。VLESS Encryption 額外預留一個建立屏障；在恢復的 0-RTT 連線裡，即使握手和協定標頭共用一次 flush，也保留這個屏障。沒有新位元組的 flush 不消耗這些屏障。之後的 packet-up flush 只檢查保留的錯誤，不等待 POST，所以逐 datagram 的 write/flush 迴圈可以跨節奏間隔合併批次。
 
-如果沒調 shutdown 就丟掉 packet-up stream，已經接納但還沒上傳的位元組也會丟；shutdown 是唯一的上傳完成屏障。緩衝的下載位元組先於終止錯誤交付。上傳 shutdown 保留回應方向；stream-up 在請求 END_STREAM 完成物理重新整理後結束，並繼續排空 POST 回應，保留延遲到達的上傳拒絕。Packet-up 的 shutdown 等待每個已接納位元組所屬 POST 的回應完成並檢查狀態，不偽造 EOF 標記。
+如果沒調 shutdown 就丟掉 packet-up stream，已經接納但還沒上傳的位元組也會丟；shutdown 是唯一的上傳完成屏障。緩衝的下載位元組先於終止錯誤交付。上傳 shutdown 保留回應方向；stream-up 在請求 END_STREAM 完成實體送出後結束，並繼續排空 POST 回應，保留延遲到達的上傳拒絕。Packet-up 的 shutdown 等待每個已接納位元組所屬 POST 的回應完成並檢查狀態，不偽造 EOF 標記。
 
 優雅 GOAWAY 停止向該 carrier 開新請求，保留已通過 admission 的 stream；只有未來的新 POST 轉到 replacement，不重放交付狀態不明的應用位元組。退役會關閉新邏輯流 admission，但已經 admission 的 packet 流保留完成所需的請求容量。
 
@@ -378,35 +378,35 @@ idle maintenance 負責，沒有新增協定 janitor，也不產生逐包 teleme
 訂閱和直連 UI 下載也走同樣的帶 mark TCP 撥號，之後用 Hyper HTTP/1 處理幀，並沿用
 既有的 rustls/platform-verifier TLS 策略。掛接 eBPF 之前的首次訂閱抓取也一樣。
 TLS 初始化失敗會返回下載錯誤，不會 panic。訂閱 URL 裡的認證資訊會轉成標記為敏感的
-Basic Authorization header；顯式設定的 Authorization 優先。同源重定向保留認證信
-息；host、埠或 scheme 一旦變化，認證資訊就永久移除，即使之後又跳回原始源也不會
-恢復。重定向 URL 的 userinfo 不會提供新認證資訊。回應內容上限和 HTTP(S) 環境代理連線仍
+Basic Authorization header；顯式設定的 Authorization 優先。同源重新導向保留認證資
+訊；host、埠或 scheme 一旦變化，認證資訊就永久移除，即使之後又跳回原始源也不會
+恢復。重新導向 URL 的 userinfo 不會提供新認證資訊。回應內容上限和 HTTP(S) 環境代理連線仍
 受各自下載邊界的約束。
 
 `bootstrap.rs` 避免代理主機名稱解析依賴 honk 自己攔截的 DNS 路徑。節點撥號點經
 `connect_marked` 或 QUIC 建立呼叫 `bootstrap::resolve`，絕不直接呼叫裸
 `lookup_host`；否則代理主機名稱解析會和 honk 自己攔截的 DNS 路徑形成死鎖。
 `resolve` 先交給 core 的行程級 `NodeHostResolver`。它只接管目前 DNS generation
-中由 [`subtag()` 規則](../reference/dns.md#節點伺服器域名)路由的主機名稱。
+中由 [`subtag()` 規則](../reference/dns.md#節點伺服器網域)路由的主機名稱。
 `resolve_with*` 用於 DNS 上游 endpoint，會跳過它，因此上游自己的網域不會遞迴。其
 餘情況下，設定的 bootstrap resolver 透過帶 bypass mark 的 UDP/TCP 發出查詢。查詢
 失敗時回退到 `/etc/hosts` 及 `/etc/resolv.conf` 中第一個數字 nameserver；DNS
 socket 同樣帶 mark，不呼叫 libc NSS，也不追加搜尋字尾。A 和 AAAA 同時查詢，各自
 有獨立的 3 s 預算。只接受與隨機查詢 ID 及原問題完全匹配的回應；被截斷的 UDP 應答
 會改用帶 mark 的 TCP 重試。`query_ech_config` 透過同一 raw 路徑查詢 DNS HTTPS 記
-錄，`qtype 65`，並提取 SVCB `ech` 引數。
+錄，`qtype 65`，並提取 SVCB `ech` 參數。
 
 解析完成後，`src/address_race.rs` 為代理伺服器的 TCP `connect_marked` 和共享
 QUIC `QuicClient` 安排連線嘗試。IPv4 和 IPv6 穩定交錯，最多同時 race 兩個位址。
 首個位址立即開始，fallback 在 250 ms 後啟動。首個位址更早失敗時會提前 fallback，
-但物理嘗試之間仍至少相隔 10 ms。每個在途的位址嘗試分別持有 generation 和行程級撥
+但實體嘗試之間仍至少相隔 10 ms。每個在途的位址嘗試分別持有 generation 和行程級撥
 號 permit；達到設定上限時，fallback 必須等先前的嘗試結束，所以
 `max_concurrent_dials: 1` 會序列嘗試位址。race 始終發生在已經選定的同一節點內部，
 socket mark 和安全設定保持一致。TCP TLS 建立與 QUIC 協定初始化，包括 QUIC 協定認
 證，只在勝出的 transport 上執行；QUIC TLS 握手也參與位址 race。錯誤按原始位址順
 序確定性地回報。
 
-`crates/honk-outbound/src/util.rs` 提供 `connect_marked`、`connect_outbound` 和 `udp_marked_bind`。`connect_marked` 與 `connect_outbound` 負責 TCP `SO_MARK`、keepalive 和逾時。`marked_udp_socket` 請求 8 MiB 的 `SO_RCVBUF`/`SO_SNDBUF`；Linux 會分別按 `rmem_max`/`wmem_max` 限制，並報告兩倍的記賬值。honk-core 在非 mock 啟動時嘗試把 `net.core.rmem_max`/`wmem_max` 提高到 16 MiB，失敗時只記錄 warning。208 KiB 的預設視窗會讓 QUIC 在 1 ms RTT 下大約受限於 2 Gbps。必須遵守 runtime 的 Bypass mark 不變量，否則 `wan_egress` 會把 socket 迴圈匯入 `daens`。
+`crates/honk-outbound/src/util.rs` 提供 `connect_marked`、`connect_outbound` 和 `udp_marked_bind`。`connect_marked` 與 `connect_outbound` 負責 TCP `SO_MARK`、keepalive 和逾時。`marked_udp_socket` 請求 8 MiB 的 `SO_RCVBUF`/`SO_SNDBUF`；Linux 會分別按 `rmem_max`/`wmem_max` 限制，並報告兩倍的記帳值。honk-core 在非 mock 啟動時嘗試把 `net.core.rmem_max`/`wmem_max` 提高到 16 MiB，失敗時只記錄 warning。208 KiB 的預設視窗會讓 QUIC 在 1 ms RTT 下大約受限於 2 Gbps。必須遵守 runtime 的 Bypass mark 不變量，否則 `wan_egress` 會把 socket 繞回 `daens`。
 
 ## TLS、指紋、ECH 與 pin
 
@@ -424,7 +424,7 @@ REALITY；REALITY 用自己的握手後檢查替代 PKI。
 `tls_implementation = "utls"` 在行程範圍內啟用目前唯一實作的 Chrome-oriented 模
 擬 profile。這個 profile 會設定：
 
-- GREASE 與逐連線擴充套件亂序；
+- GREASE 與逐連線 extension 亂序；
 - 先 `X25519MLKEM768`、後 `X25519` 的 key share；
 - Chrome-derived signature algorithm、curve、cipher 集與 ALPN；
 - brotli 證書壓縮；
@@ -448,7 +448,7 @@ REALITY；REALITY 用自己的握手後檢查替代 PKI。
 fail-open：查詢失敗時，這條連線不使用真實 ECH，Chrome 模式仍可傳送 ECH GREASE。
 
 `pinSHA256`，對應 `tls_pin_sha256`，會比較葉證書的 SHA-256 digest，並替代 PKI
-chain 校驗和主機名稱校驗。無效 pin 一律 fail-closed。TCP TLS 和 QUIC crypto
+chain 檢查碼主機名稱校驗。無效 pin 一律 fail-closed。TCP TLS 和 QUIC crypto
 backend 使用同一規則。
 
 ## REALITY client
@@ -473,8 +473,7 @@ backend 使用同一規則。
 16 位元組的加密 plaintext 加 16 位元組 GCM tag，恰好填滿 session ID。空 short ID 是
 八個零位元組。設定值必須是偶數長度的 hex，最多八位元組，並向右補零。解析或 fixup 失
 敗時，會在傳送未認證 ClientHello 之前中止。callback 只 seal 一次；第二次呼叫會在
-複用 GCM key/nonce 之前中止，HRR 的第二條 ClientHello 也一樣。因此用戶端不聲稱支
-持 HRR。
+複用 GCM key/nonce 之前中止，HRR 的第二條 ClientHello 也一樣。因此用戶端不聲稱支援 HRR。
 
 ### 伺服器認證與指紋約束
 
@@ -505,7 +504,7 @@ JA4 值。
 target 緩衝限制取決於伺服器版本，不是 honk 用戶端統一的證書大小上限。文件中的
 sing-box 1.12 / MetaCubeX-uTLS 1.8.0 peer 使用 [8192 位元組的 target TLS record 緩
 衝區](https://github.com/MetaCubeX/utls/blob/v1.8.0/reality.go)，這個數字包含
-record framing，不是隻限制 DER 證書長度。本次核對的 [XTLS/REALITY 實作](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
+record framing，不是只限制 DER 證書長度。本次核對的 [XTLS/REALITY 實作](https://github.com/XTLS/REALITY/blob/8cdf7bf9c7f0/tls.go)
 使用 17 KiB 緩衝區。應按實際部署的伺服器版本選擇相容的 target。
 
 ## VLESS wire 契約
@@ -554,7 +553,7 @@ transport failure 分開。它們不會降低健康狀態或 Score。候選 admi
 ### H2MUX
 
 `src/proxy/uot.rs` 和 `src/proxy/vless/mux.rs` 實作共享的 UoT v2 framing 和
-sing-box H2MUX。H2MUX 把物理 VLESS 請求發往 `sp.mux.sing-box.arpa:444`，選擇
+sing-box H2MUX。H2MUX 把實體 VLESS 請求發往 `sp.mux.sing-box.arpa:444`，選擇
 backend `2`，然後在 carrier 上執行 HTTP/2。邏輯 stream 承載 TCP 或 UDP。UDP
 stream 設定 sing-mux flags `UDP|Addr`，值為 `3`；在命名第一個目的地的 request 之
 後，雙向都攜帶 `[SOCKS5 地址][連接埠][u16 長度][payload]`，使用 SOCKS5 ATYP，不同
@@ -593,10 +592,10 @@ packet 保持 8 KiB 上限；Single XUDP 保持 7,526 位元組上限。
 reply projection，即 `ActualPeer` 或 `RewriteTo(original destination)`。一個
 owner 持有一條協定 association 和一條 receiver，多個規範五元組 endpoint entry 提
 供序列的 send view。Single XUDP 每個 scope 使用一個私有且未池化的 SID 0。
-Mux.Cool 給各 scope 分配不同的 child SID，這些 SID 可以共享物理 pool。
+Mux.Cool 給各 scope 分配不同的 child SID，這些 SID 可以共享實體 pool。
 
 Hysteria2 在 scope 的不同目的地之間複用一個 Session ID，TUIC 複用一個
-association ID。不同 scope 可以共用物理 QUIC connection，但不共用邏輯
+association ID。不同 scope 可以共用實體 QUIC connection，但不共用邏輯
 association。關閉 `rprx` 時，這些 QUIC source 路徑以及它們的 shutdown join 仍可
 用；只有 VLESS 分支依賴這個 feature。
 
@@ -704,7 +703,7 @@ VLESS UDP、UoT 和 Single XUDP 也使用這個 gate。關閉 `rprx` 時不預�
 | 65,536 | 4,563 | 3,992 | 12.51% |
 | 1,048,576 | 32,768 | 32,768 | 0%（已達 endpoint 封頂） |
 
-這些上限是從描述符推匯出來的，不是預先分配 endpoint 記憶體。啟動時還會按[記憶體](./control-plane.md#queue-與描述符預算)
+這些上限是從描述符推導出來的，不是預先分配 endpoint 記憶體。啟動時還會按[記憶體](./control-plane.md#queue-與描述符預算)
 進一步限制 endpoint。reload 不會重新劃分，也不會擴大啟動時的分割區。
 
 ### Vision 與 VLESS Encryption
@@ -737,7 +736,7 @@ KeyUpdate 確認不會寫入 raw 上行；shutdown 關閉 TCP 寫方向，不傳
 下行 Direct 命令仍只切換讀取，SSL session 已解碼的明文先於 raw 位元組交付。兩個方
 向各自獨立切換。padding 會給每條 Vision 連線增加位元組。與引入上行之前的 relay 做
 loopback A/B 時，短 Vision 連線在上行 1 KiB、下行 4 KiB 的情況下，relay CPU 約增
-加 2.6%，幾乎全部來自 padding；交接記賬的開銷在噪聲範圍內。足夠長、能進入 Direct
+加 2.6%，幾乎全部來自 padding；交接記帳的開銷在噪聲範圍內。足夠長、能進入 Direct
 和 splice 的連線開銷更低；非 Vision relay 不變。
 
 `src/proxy/vless/encryption.rs` 在 VLESS 請求之前包裝選定的 transport。實作的協
@@ -866,7 +865,7 @@ generation 的 `NodeRuntime::AnyTls` 擁有一個 `SessionPool<AnyTlsSession>`�
 `src/session.rs` 定義由節點持有的通用 `SessionPool`，供 AnyTLS、VLESS H2MUX、
 VLESS Mux.Cool 和 XHTTP 使用；QUIC 使用 `quic::QuicClient`。它維護 `Active`、
 `Draining` 和 `Closed` 三種狀態，管理 atomic stream permit、事件驅動的容量等待、
-least-loaded 選擇，以及由 pool 自己負責的物理撥號 single-flight。Draining
+least-loaded 選擇，以及由 pool 自己負責的實體撥號 single-flight。Draining
 session 不計入可複用的 cap，可以在存活 stream 完成期間與 replacement 重疊。pool
 還負責有界重試分類、退避、退役和冪等的強制關閉。
 
@@ -882,10 +881,10 @@ runtime owner 已經終止、撥號任務被拒絕時，pool 會清除該任務�
 標誌。drain worker 被拒絕時，強制關閉保留的 session。Mux.Cool 的 owner 拒絕傳送
 END 時，讓 carrier 失敗。
 
-AnyTLS 設定八條可複用的物理 session，每條承載 128 個 stream。它會把負載 spread
+AnyTLS 設定八條可複用的實體 session，每條承載 128 個 stream。它會把負載 spread
 開：所有 session 都忙，且不足八條時，pool 先建立一條新 session，再增加複用負載，
 然後按 least-loaded 排程，讓並行的 stream 不共享同一條 TCP carrier 的隊頭阻塞。連
-續撥號失敗使用有界 backoff，不會讓每條代理流各做一次物理連線。
+續撥號失敗使用有界 backoff，不會讓每條代理流各做一次實體連線。
 
 v2 server settings 協商完成後，會收到 `CMD_SERVER_SETTINGS`、`v=2`。此後每個複用
 的邏輯 stream，也就是 SID 2 及以後，在 SYN 寫出後就加入按 SID 追蹤的 pending 集
@@ -905,7 +904,7 @@ Session 到 30 分鐘時，會按每個 session 的 jitter 進入 age-based drai
 
 ### 有序 write 路徑
 
-所有 frame 都透過一個 `WriterQueue` 和一個物理 writer task。Data 使用兩種單位的
+所有 frame 都透過一個 `WriterQueue` 和一個實體 writer task。Data 使用兩種單位的
 有界 permit：每個 session 896 個 frame，以及 1 MiB 已排隊或在途的 payload；先到
 上限的那個生效。預算用盡時，寫入的 stream 會被背壓。位元組上限也限制新 stream 的
 SYN 在飽和上傳之後要等多久。control frame 保留 queue headroom，整個 queue 最多
@@ -923,7 +922,7 @@ terminal，不會繼續增長記憶體。
 兩者都不含首幀，然後執行一次 `flush`，不等待湊滿 batch。data frame 在接納
 payload 的那次複製中連同 header 一起序列化。不加 padding 時，writer 直接從這個緩
 衝區寫出完整的 TLS record，只複製 control frame 和不足一個 record 的 data 位元組，
-所以 batch 的 record 邊界與一次連續寫入相同。只有物理 batch 成功，或者 session
+所以 batch 的 record 邊界與一次連續寫入相同。只有實體 batch 成功，或者 session
 變成 terminal，才釋放 data permit 和 confirmed-write completion。
 
 只含控制幀的 batch 有 5 秒 deadline，與 sing-anytls 的 `writeControlFrame` 一致；到期會讓 session 失敗。含資料幀的 batch 沒有 deadline：擁塞只對容量上限施加背壓，不會終止同一 session 中的其他流。
@@ -991,7 +990,7 @@ setup 或破壞邏輯 stream 之前失敗。這樣既避免了一次原本為空
 先解碼位址。數值源位址直接返回，IPv4-mapped IPv6 規範化為 IPv4；開啟時捕獲的網域
 加埠投影回捕獲的 target；其他任何網域 frame 都整體丟棄，釋放標頭和 payload 的
 全部 credit，也不做網域解析；未知 ATYP 是終止錯誤。傳送時，逐包目的位址只有與撥
-號網域相同才寫為網域，其他目的位址使用數值形式。每條流的首次傳送等待物理 flush，
+號網域相同才寫為網域，其他目的位址使用數值形式。每條流的首次傳送等待實體 flush，
 即 `confirmed`；穩態傳送只入隊，`admitted` 在 frame 進入 session writer 佇列時設
 置。佇列和 credit 上限仍是單個 transport 的上限，因此佇列飽和或 EOF 會退役共享該
 SID 的所有目的地。網域目標流，即 `RewriteTo`，仍按原始目的地各自成 scope。
@@ -1002,9 +1001,9 @@ SID 的所有目的地。網域目標流，即 `RewriteTo`，仍按原始目的�
 出站層只保證 preparation 的副作用安全。
 
 Session pool 會原子地返回兩種結果之一：已有共享 session 上的 permit，或者一個計
-入 pool cap、由呼叫方所有的 provisional 物理撥號槽。detached 的 AnyTLS 或 VLESS
+入 pool cap、由呼叫方所有的 provisional 實體撥號槽。detached 的 AnyTLS 或 VLESS
 mux session 會留在可複用 pool 之外，直到 winner commit 發布並啟動 janitor。丟棄
-未勝出的準備結果時，會取消物理撥號、移除受 generation 保護的槽和 SID，並同步關閉
+未勝出的準備結果時，會取消實體撥號、移除受 generation 保護的槽和 SID，並同步關閉
 附著的 session。
 
 QUIC candidate 會建置 detached client。loser 會被 force-close。winner commit 只

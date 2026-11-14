@@ -15,7 +15,7 @@ node {
 
 ## 欄位
 
-Node 模型包含下列欄位。分享連結會從協議方案、userinfo、位址部分、片段和查詢參數填入供使用者設定的欄位；其餘欄位由結構化 loader、匯入或執行時填入。這些欄位都不是 dae `node {}` 裡的獨立 key；節點寫成連結和標籤，見 [`node {}` 宣告](#node--宣告)。
+Node 模型包含下列欄位。分享連結會從協定方案、userinfo、位址部分、片段和查詢參數填入供使用者設定的欄位；其餘欄位由結構化 loader、匯入或執行時填入。這些欄位都不是 dae `node {}` 裡的獨立 key；節點寫成連結和標籤，見 [`node {}` 宣告](#node--宣告)。
 
 扁平結構化輸入必須包含 `name`、`protocol`、`address` 和 `port`，即使已設定 `host`。表中的預設值是模型預設值。
 
@@ -23,12 +23,12 @@ Node 模型包含下列欄位。分享連結會從協議方案、userinfo、位�
 | --- | --- | --- | --- |
 | `id` | UUID | 派生 | 穩定內容身分；執行時不允許 nil。見[節點身分](#節點身分)。 |
 | `name` | string | `""` | dae 標籤、解碼後的片段、`remark` 查詢參數、VMess `ps` 或不含憑據的 `{scheme}-{host}` 回退名稱。 |
-| `protocol` | enum | `ss` | 從分享連結協議方案派生。 |
+| `protocol` | enum | `ss` | 從分享連結協定方案派生。 |
 | `address` | string | `""` | 從連結解析的 `host:port`；它不補充缺失的埠。 |
 | `host` | string | `""` | 明確伺服器端主機；否則 `Node::host()` 從 `address` 派生。 |
 | `port` | u16 | `0` | 伺服器端埠；URL 形連結省略埠時使用 `443`，v2rayN VMess 酬載則必須帶有效埠。 |
-| `username` / `password` | string? | `null` | 協議憑據；扁平 VMess 和 VLESS 從 `password` 讀取使用者 UUID。 |
-| `encryption` | string? | `null` | SS/VMess 加密方式或 VLESS Encryption 客戶端字串；Shadowsocks 省略時在撥號階段回退到 `aes-128-gcm`。見 [Encryption](#encryption)。 |
+| `username` / `password` | string? | `null` | 協定憑據；扁平 VMess 和 VLESS 從 `password` 讀取使用者 UUID。 |
+| `encryption` | string? | `null` | SS/VMess 加密方式或 VLESS Encryption 用戶端字串；Shadowsocks 省略時在撥號階段回退到 `aes-128-gcm`。見 [Encryption](#encryption)。 |
 | `packet_encoding` | `VlessUdpEncoding` | VLESS 為 `auto` | VLESS 回退編碼：`auto`、`native`、`xudp` 或 `uot-v2`；標準 URI 的 `packetEncoding=none` 對映為 `native`。 |
 | `multiplex` | `VlessMultiplex` | VLESS 為 `{"protocol":"off"}` | VLESS carrier 選擇：`off`、`h2` 或 `xray`；形態見 [VLESS UDP 與多路複用](#vless-udp-and-multiplexing)。 |
 | `plugin` / `plugin_opts` | string? | `null` | SIP002 外掛後設資料；代理外掛不受支援，訂閱匯入會拒絕非空值。 |
@@ -44,7 +44,7 @@ Node 模型包含下列欄位。分享連結會從協議方案、userinfo、位�
 | `reality_short_id` | string? | `null` | 來自 `sid` 的 REALITY short ID。 |
 | `reality_spider_x` | string? | `null` | 儲存的 `spx`；REALITY 連結預設設為 `/`。 |
 | `flow` | string? | `null` | VLESS `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`；Shadowrocket `xtls=2` 選擇基礎 flow。 |
-| `network` | string? | `null` | 受支援協議的封包 capability；與 VMess JSON `net` 等流傳輸欄位獨立。 |
+| `network` | string? | `null` | 受支援協定的封包 capability；與 VMess JSON `net` 等流傳輸欄位獨立。 |
 | `ws_path` / `ws_host` | string? | `null` | WebSocket `path` 與 Host header。 |
 | `ws_headers` | object | `{}`；輸出時省略空 map | 附加的 WebSocket 升級 header。見 [`ws_headers`](#ws_headers)。 |
 | `grpc_service` | string? | `null` | gRPC `serviceName` 或 `service_name`。 |
@@ -79,7 +79,7 @@ URL userinfo 中，Trojan、AnyTLS、VLESS 和 VMess 取 `user:pass` 的密碼�
 
 XHTTP 將省略或 `h2` 正規化為 `["h2"]`，包括 REALITY 和明確明文 H2。
 
-其他協議、關閉 TLS 的上下文、REALITY、WS/gRPC 或 QUIC override 帶有非空值時，honk 拒絕該節點。TUIC 保留自己的 `tuic_alpn`。
+其他協定、關閉 TLS 的上下文、REALITY、WS/gRPC 或 QUIC override 帶有非空值時，honk 拒絕該節點。TUIC 保留自己的 `tuic_alpn`。
 
 只有結構化輸入與匯入會設定該清單；XHTTP 以外，分享連結的 `alpn` 僅為相容而接受，不會儲存。
 
@@ -93,7 +93,7 @@ XHTTP 將省略或 `h2` 正規化為 `["h2"]`，包括 REALITY 和明確明文 H
 | --- | --- |
 | `true`、`yes`、`1`、`on` | 關閉 |
 | `false`、`f`、`no`、`n`、`0`、`off`、`t`、`y` | 開啟 |
-| 空文字、未知文字或別名衝突 | 拒絕連結 |
+| 空字串、未知文字或別名衝突 | 拒絕連結 |
 
 **安全行為變更：** `yes` 和 `on` 以前保持驗證開啟，現在會關閉驗證並產生 warning。升級前應檢查這些連結，改用明確的 `true` 或 `false`。結構化布林值仍須使用原生布林型別，不轉換字串或數字。
 
@@ -103,7 +103,7 @@ XHTTP 將省略或 `h2` 正規化為 `["h2"]`，包括 REALITY 和明確明文 H
 
 honk 拒絕以下保留名稱：`host`、`connection`、`upgrade`、`sec-websocket-key`、`sec-websocket-version`、`sec-websocket-extensions`、`sec-websocket-accept`、`sec-websocket-protocol`、`content-length`、`transfer-encoding`。
 
-honk 拒絕非 WebSocket 流傳輸上的非空 map。沒有流傳輸的協議會丟棄該欄位。`null` 無效。
+honk 拒絕非 WebSocket 流傳輸上的非空 map。沒有流傳輸的協定會丟棄該欄位。`null` 無效。
 
 只有訂閱與結構化輸入能提供 header；任何分享連結方言都不攜帶它們。
 
@@ -119,7 +119,7 @@ honk 拒絕非 WebSocket 流傳輸上的非空 map。沒有流傳輸的協議會
 
 選擇 Hysteria2 埠跳躍：`mport` 埠清單與以秒為單位的 `mhop` 跳躍間隔。
 
-`mport` 接受逗號分隔的埠和包含兩端的範圍，例如 `443,5000-5010`；空段略過。重複埠或重疊範圍會在撥號前拒絕該節點，包括 `443,443`；單埠集合仍然有效。官方客戶端把跳躍埠寫進位址部分（`:443,5000-6000`），效果與 `mport` 相同；兩者同時指定會被拒絕，非法的內嵌清單在解析期報錯。位址中的埠清單仍拒絕空項。
+`mport` 接受逗號分隔的埠和包含兩端的範圍，例如 `443,5000-5010`；空段略過。重複埠或重疊範圍會在撥號前拒絕該節點，包括 `443,443`；單埠集合仍然有效。官方用戶端把跳躍埠寫進位址部分（`:443,5000-6000`），效果與 `mport` 相同；兩者同時指定會被拒絕，非法的內嵌清單在解析期報錯。位址中的埠清單仍拒絕空項。
 
 `mhop` 只接受無字尾的無號整數秒：寫 `30`，不能寫 `30s`。`500ms` 和 `1s` 會被忽略，並產生不含原值的 warning。預設值為 `30`；設定值會被限制在上游規定的最小值 `5`。
 
@@ -157,7 +157,7 @@ node {
 
 ### `tls_pin_sha256`
 
-固定葉憑證：符合後，在任何 TLS 或 QUIC 協議上代替憑證鏈與主機名稱驗證。取 64 個十六進位字元，忽略冒號和空白。
+固定葉憑證：符合後，在任何 TLS 或 QUIC 協定上代替憑證鏈與主機名稱驗證。取 64 個十六進位字元，忽略冒號和空白。
 
 連結來源為 `pinSHA256`，缺失時取 `pin_sha256`。預設 `null`。
 
@@ -171,26 +171,26 @@ node {
 
 ### 結構化 loader 相容性
 
-TOML、YAML 與 JSON 繼續使用舊的扁平節點 key。載入時只讀取所選 `protocol` 的欄位。其他協議遺留的非預設欄位會被移除，但不會拒絕節點；一條 warning 列出所有移除的欄位名。例如，`ss` 節點上的 `tls: true` 會被忽略並產生 warning，不會開啟 TLS。
+TOML、YAML 與 JSON 繼續使用舊的扁平節點 key。載入時只讀取所選 `protocol` 的欄位。其他協定遺留的非預設欄位會被移除，但不會拒絕節點；一條 warning 列出所有移除的欄位名。例如，`ss` 節點上的 `tls: true` 會被忽略並產生 warning，不會開啟 TLS。
 
 VMess 和 VLESS 從 `password` 讀取使用者 UUID；`id` 是節點身分，不是憑據。
 
-對 Trojan、VLESS、Hysteria2 和 AnyTLS，`username` 不是憑據別名。缺少該協議實際使用的憑據欄位時，單獨提供的 `username` 會被移除，並觸發一條針對性 warning；舊版行為和 ID 保持不變。
+對 Trojan、VLESS、Hysteria2 和 AnyTLS，`username` 不是憑據別名。缺少該協定實際使用的憑據欄位時，單獨提供的 `username` 會被移除，並觸發一條針對性 warning；舊版行為和 ID 保持不變。
 
-所選協議使用的值仍會正常解析與驗證。honk 自身的輸出仍可安全地再次匯入。啟用 `store_subscribe` 時，原始訂閱正文只在解析成功後持久化；被拒絕的重新整理不會覆蓋上一份有效正文。
+所選協定使用的值仍會正常解析與驗證。honk 自身的輸出仍可安全地再次匯入。啟用 `store_subscribe` 時，原始訂閱正文只在解析成功後持久化；被拒絕的重新整理不會覆蓋上一份有效正文。
 
-VLESS 扁平輸入已刪除 `vless_mode`，改用 `network` 表示封包權限、`packet_encoding` 表示回退、`multiplex` 表示 carrier 選擇。只要原始輸入中出現該欄位，節點就會被拒絕，包括值為 `null` 或任一舊版已知拼寫。唯一保留的 `vless_mode: "legacy"` 是非 VLESS 扁平格式序列化時使用的相容佔位欄位。它不設定 VLESS，非 VLESS 行為與身分保持不變。
+VLESS 扁平輸入已刪除 `vless_mode`，改用 `network` 表示 packet permission、`packet_encoding` 表示回退、`multiplex` 表示 carrier 選擇。只要原始輸入中出現該欄位，節點就會被拒絕，包括值為 `null` 或任一舊版已知拼寫。唯一保留的 `vless_mode: "legacy"` 是非 VLESS 扁平格式序列化時使用的相容佔位欄位。它不設定 VLESS，非 VLESS 行為與身分保持不變。
 
 扁平憑據別名在移除不相容欄位前比較：
 
-| 協議 | 必須一致的別名 |
+| 協定 | 必須一致的別名 |
 | --- | --- |
 | Hysteria2 | `hy2_auth` / `password` |
 | TUIC | `tuic_uuid` / `username`；`tuic_password` / `password` |
 | Juicity | `juicity_uuid` / `username`；`juicity_password` / `password` |
 | AnyTLS | `password` / `anytls_password` |
 
-缺失或 null 表示未提供。已提供的字串須逐位元組一致，空字串和首尾空格也參與比較。空憑據仍須滿足對應協議的要求。扁平憑據欄位仍須使用字串；數字轉換僅適用於訂閱匯入。
+缺失或 null 表示未提供。已提供的字串須逐位元組一致，空字串和首尾空格也參與比較。空憑據仍須滿足對應協定的要求。扁平憑據欄位仍須使用字串；數字轉換僅適用於訂閱匯入。
 
 新增 `tls_alpn` 欄位不沿用舊欄位剝離規則；見 [`tls_alpn`](#tls_alpn)。
 
@@ -212,16 +212,16 @@ sing-box 的 `hop_interval`、`idle_session_timeout` 和 `idle_session_check_int
 
 普通分享連結、VMess JSON、獨立扁平 Node 反序列化和訂閱匯入都在構造完成時驗證節點。
 
-- 使用 UUID 的協議要求有效 UUID。不支援的加密方式、傳輸型別、封包 capability、flow、ALPN 上下文或埠跳躍集合，會在派生身分前被拒絕。
-- 未啟用 VLESS Encryption 時，Vision 要求 TLS 或 REALITY。直接構造的節點也不能帶空 SNI、flow 或 network，這些值本應由介面卡正規化掉。
-- 訂閱格式特有的非空密碼要求仍由對應介面卡執行。SOCKS 可選認證及 handler 支援的空憑據仍然有效。
+- 使用 UUID 的協定要求有效 UUID。不支援的加密方式、傳輸型別、封包 capability、flow、ALPN 上下文或埠跳躍集合，會在派生身分前被拒絕。
+- 未啟用 VLESS Encryption 時，Vision 要求 TLS 或 REALITY。直接構造的節點也不能帶空 SNI、flow 或 network，這些值本應由配接器正規化掉。
+- 訂閱格式特有的非空密碼要求仍由對應配接器執行。SOCKS 可選認證及 handler 支援的空憑據仍然有效。
 - 無效 dae 節點行和訂閱條目仍依原策略略過，有效條目保留。
 - 僅解析 Config 片段的 API 仍不執行整份設定 admission，但片段內的無效節點現在會在構造時被拒絕。
 - 獨立反序列化保留傳入的 ID；執行時身分 admission 是另一項檢查。
 
-直接呼叫 `Node::validate()` 與介面卡完成構造時使用相同的固定去識別化錯誤。驗證錯誤不包含傳入的節點名稱或憑據值。
+直接呼叫 `Node::validate()` 與配接器完成構造時使用相同的固定去識別化錯誤。驗證錯誤不包含傳入的節點名稱或憑據值。
 
-詳細的 Config 載入介面以及設定／登錄檔 admission 會保留節點驗證給出的欄位和原因，並補上從 1 開始的原始節點序號，不再用籠統的無效節點錯誤代替。憑據衝突會指向標準別名欄位，不輸出任何一個值。獨立的 `NodeSeed` 和 Node 反序列化仍傳回去識別化的通用 serde 錯誤。
+詳細的 Config 載入介面以及設定／registry admission 會保留節點驗證給出的欄位和原因，並補上從 1 開始的原始節點序號，不再用籠統的無效節點錯誤代替。憑據衝突會指向標準別名欄位，不輸出任何一個值。獨立的 `NodeSeed` 和 Node 反序列化仍傳回去識別化的通用 serde 錯誤。
 
 VMess JSON 使用 `net: "ws"` 時，缺失或為空的 `host` 會讓 WebSocket 握手使用節點伺服器主機；提供非空 `host` 時仍以它為明確覆蓋值。
 
@@ -249,13 +249,13 @@ VMess JSON 的 `ps` 備註缺失或為空時，節點先以 `vmess-{host}` 通�
 
 | 輸入 | 處理結果 |
 | --- | --- |
-| 協議已識別但格式錯誤的連結 | 丟棄條目並產生 warning。已知無效欄位保留具體的安全原因和模式路徑；未知解析失敗使用 `invalid-node-entry`。 |
-| 未知協議或已刪除的 VLESS `vless_mode` | 拒絕設定。 |
+| 協定已識別但格式錯誤的連結 | 丟棄條目並產生 warning。已知無效欄位保留具體的安全原因和模式路徑；未知解析失敗使用 `invalid-node-entry`。 |
+| 未知協定或已刪除的 VLESS `vless_mode` | 拒絕設定。 |
 | 獨立的 `mux:` 或 `mux=` 行 | 拒絕設定。VLESS 封包與 carrier 選項須使用連結中的精確查詢參數 `packetEncoding=`、`mux=` 和 `udp=`。 |
 
 診斷會保留原始節點條目的序號和來源位置，但不含原始連結、值或節點名稱。傳回資料的介面只把診斷交給呼叫方，不寫日誌；普通介面只報告一次。
 
-被接受的連結只會產生 `legacy-*` 程式碼的 warning；節點條目上出現其他 warning，就說明解析器已丟棄該條目。客戶端可以用 `syntax` 模式驗證單條 `node { name: 'link' }` 宣告，只看診斷程式碼就能區分被略過和被接受的連結。
+被接受的連結只會產生 `legacy-*` 程式碼的 warning；節點條目上出現其他 warning，就說明解析器已丟棄該條目。用戶端可以用 `syntax` 模式驗證單條 `node { name: 'link' }` 宣告，只看診斷程式碼就能區分被略過和被接受的連結。
 
 舊版 `ss://base64(method:password@host:port)` 格式把解碼後的憑據當作字面值，不再做 URL 解碼：`%20` 保持為 `%20`，`?`、`/`、`#`、`:` 和 `@` 仍是密碼字元。憑據與 endpoint 由最後一個 `@` 分隔，userinfo 本身也可以是 `base64(method:password)`。解碼後的酬載缺少 `@`，或憑據拆不出方法和密碼時，解析失敗。URL userinfo 格式仍會對憑據做百分號解碼。endpoint、路徑、查詢參數和片段繼續依 URL 處理，查詢參數包括 `/?plugin=...`。
 
@@ -271,7 +271,7 @@ protocol|host|port|credential-fingerprint|dial-shape
 
 - `sni`、傳輸方式和 WebSocket/gRPC 形態；
 - Hysteria2 混淆、REALITY 參數和 `flow`；
-- 有效的 VLESS TLS 安全設定、UDP 權限、回退編碼和多路複用路徑。
+- 有效的 VLESS TLS 安全設定、UDP permission、回退編碼和多路複用路徑。
 
 明文 VLESS 與 TLS 使用不同身分。REALITY key 選擇認證傳輸，不受冗餘 TLS 旗標影響。
 
@@ -288,7 +288,7 @@ WebSocket 的非空標準 header map 也參與身分派生。header 名稱大小
 
 拼接前，每個原始憑據欄位、撥號形態欄位和有效的 `host` 值都會將 `\` 轉義為 `\\`，將 `|` 轉義為 `\|`。拼接後的指紋不再轉義。通過 `Config::validate` 的節點，不同身分欄位必然產生不同的 hash 輸入。完整設定驗證拒絕的節點不受此保證，即使 `Node::from_share_link` 能為其派生 ID。
 
-**破壞性升級：** 所有成功重新派生身分的 VLESS 節點都會獲得新 ID，包括從未填寫 `vless_mode`、關閉 UDP 或設定 ALPN 的節點。以 ID 為 key 的健康、預熱及 session 狀態會重新建立。同一次遷移裡，其他協議只在一種情況下改變 ID：上文用 `|` 拼接的身分欄位中含有 `|` 或 `\`。ALPN 使用獨立的 JSON 子 UUID 步驟，因此只有 ALPN 含這兩個字元時，不會觸發該變化。
+**破壞性升級：** 所有成功重新派生身分的 VLESS 節點都會獲得新 ID，包括從未填寫 `vless_mode`、關閉 UDP 或設定 ALPN 的節點。以 ID 為 key 的健康、預熱及 session 狀態會重新建立。同一次遷移裡，其他協定只在一種情況下改變 ID：上文用 `|` 拼接的身分欄位中含有 `|` 或 `\`。ALPN 使用獨立的 JSON 子 UUID 步驟，因此只有 ALPN 含這兩個字元時，不會觸發該變化。
 
 **逐包帶位址的 UDP 訊框化：** 有效 UDP 路徑在 53、443 或 54 埠使用 UoT v2 或 H2MUX 的 VLESS 節點會再次獲得新 ID。這包括 `packetEncoding=uot-v2`、`mux=h2mux`，以及回退到這兩條路徑的池，因為這些路徑現在逐包攜帶位址。
 
@@ -304,11 +304,11 @@ Auto、native、XUDP、Mux.Cool 與關閉 UDP 的節點 ID 不變。直接選擇
 
 就緒流原本就隨所屬 generation 退役。`name`/`subtag` 篩選語義不變。
 
-只要可撥號 endpoint 和撥號形態不變，身分在改名、reload 和訂閱重新整理後都保持穩定。設定與執行時組裝會拒絕重複的派生 ID。`Node::default()` 的 ID 為 nil；構造路徑會派生 ID，出站執行時登錄檔會拒絕任何傳入的 nil ID。
+只要可撥號 endpoint 和撥號形態不變，身分在改名、reload 和訂閱重新整理後都保持穩定。設定與執行時組裝會拒絕重複的派生 ID。`Node::default()` 的 ID 為 nil；構造路徑會派生 ID，出站執行時 registry 會拒絕任何傳入的 nil ID。
 
-## 協議
+## 協定
 
-| 協議 | 別名 | TCP | UDP | 說明 |
+| 協定 | 別名 | TCP | UDP | 說明 |
 | --- | --- | --- | --- | --- |
 | `ss` | `shadowsocks`，僅限 Clash 與 sing-box `type` | 是 | 是 | AEAD 與 Shadowsocks 2022 |
 | `trojan` | — | 是 | 是* | TLS；TCP/WS/gRPC/XHTTP 傳輸 |
@@ -319,19 +319,19 @@ Auto、native、XUDP、Mux.Cool 與關閉 UDP 的節點 ID 不變。直接選擇
 | `tuic` | — | 是 | 是 | QUIC 上的 TUIC v5 |
 | `juicity` | — | 是 | 是 | QUIC 上的 Juicity |
 | `anytls` | — | 是 | 是* | 多路複用 TLS session 與 UoT v2 |
-| `direct` | — | 是 | 是 | 保留的內建直連出站；沒有分享連結協議方案 |
-| `block` | — | 否 | 否 | 保留的內建拒絕出站；沒有分享連結協議方案 |
+| `direct` | — | 是 | 是 | 保留的內建直連出站；沒有分享連結協定方案 |
+| `block` | — | 否 | 否 | 保留的內建拒絕出站；沒有分享連結協定方案 |
 
 `network` 可獨立於流傳輸方式關閉 Trojan、AnyTLS 和 VLESS 的封包撥號。VMess UDP 尚未實作。
 
-| 協議 | UDP 行為 |
+| 協定 | UDP 行為 |
 | --- | --- |
-| AnyTLS | 拒絕超過 16 KiB 的酬載，與 anytls-go 0.0.13 的中繼緩衝區一致。非連線模式 UoT v2 逐封包攜帶目的地和伺服器端的真實源位址。一條流服務一個客戶端源的全部目的地；未經請求的回覆也保留真實源位址。 |
-| Trojan | 每個客戶端源使用一條 associate 流承載全部目的地，傳回每個回覆的真實源位址。配合伺服器端可獲得 EIM/EIF 行為。各目的地共享隊頭阻塞，且流故障會影響全部目的地。 |
+| AnyTLS | 拒絕超過 16 KiB 的酬載，與 anytls-go 0.0.13 的中繼緩衝區一致。非連線模式 UoT v2 逐封包攜帶目的地和伺服器端的真實源位址。一條流服務一個用戶端源的全部目的地；未經請求的回覆也保留真實源位址。 |
+| Trojan | 每個用戶端源使用一條 associate 流承載全部目的地，傳回每個回覆的真實源位址。配合伺服器端可獲得 EIM/EIF 行為。各目的地共享隊頭阻塞，且流故障會影響全部目的地。 |
 
-SOCKS5 UDP ASSOCIATE 為每個客戶端源保持一條控制 TCP 連線和一個中繼 socket，該源的所有目的地共用它，並傳回每個應答標頭中的真實遠端對端。從未聯絡過的對端能否到達客戶端取決於伺服器：Dante 預設的 `udp.connectdst: yes` 僅在只使用過單一目的地期間才會連線其出站 socket。
+SOCKS5 UDP ASSOCIATE 為每個用戶端源保持一條控制 TCP 連線和一個中繼 socket，該源的所有目的地共用它，並傳回每個應答標頭中的真實遠端 peer。從未聯絡過的對端能否到達用戶端取決於伺服器：Dante 預設的 `udp.connectdst: yes` 僅在只使用過單一目的地期間才會連線其出站 socket。
 
-以下支援 UDP 的代理協議實作 UDP 全錐形：一個客戶端源的全部目的地共用一個 association，每個回覆都帶上真實的遠端位址。
+以下支援 UDP 的代理協定實作 UDP 全錐形：一個用戶端源的全部目的地共用一個 association，每個回覆都帶上真實的遠端位址。
 
 - Hysteria2、TUIC、Juicity、SOCKS5，以及 AEAD 與 2022 兩種 Shadowsocks；
 - Trojan、AnyTLS；
@@ -339,26 +339,26 @@ SOCKS5 UDP ASSOCIATE 為每個客戶端源保持一條控制 TCP 連線和一個
 
 VLESS 原生 UDP 是例外，其流只指定一個目標。這包括明確 `native`，以及未啟用 Vision 時 UDP/53 和 UDP/443 上的 `auto`。
 
-來自此前未聯絡過的對端的回覆，會保留該對端的源位址。這實作了 RFC 5780 全錐形的客戶端部分。伺服器端還須為每個 association 使用一個未連線 socket，並轉發任意對端的回覆。honk 無法繞過伺服器端過濾；`direct` 流量遵循主機自身的 NAT。限制如下：
+來自此前未聯絡過的對端的回覆，會保留該對端的源位址。這實作了 RFC 5780 全錐形的用戶端部分。伺服器端還須為每個 association 使用一個未連線 socket，並轉發任意對端的回覆。honk 無法繞過伺服器端過濾；`direct` 流量遵循主機自身的 NAT。限制如下：
 
 - 依網域名稱撥號的流會為每個原始目的地各保留一條 association，回覆也投影回該目的地，因此得不到與 endpoint 無關的對映。
 - 一個源的各目的地只在同一節點上共用 association。群組可能把新目的地或 Score 試探流送到另一節點，那裡有自己的對映。
-- 協議回退路徑不由 H2MUX 或 Xray UDP 池承載。未啟用 Vision 的節點裡，`packetEncoding=auto` 在 53 和 443 埠使用已連線的原生 UDP。這類流只指定一個目標，所以這兩個埠無法實作全錐形。Vision 節點和其他埠使用 Single XUDP。設定 `packetEncoding=xudp`，可以在原本走原生路徑的地方明確啟用 Single XUDP。
-- Single XUDP 未設為預設值，原因是測得的效能成本。在 loopback 環境中對 sing-box 1.12.4 使用不限速的 1200 位元組封包時，吞吐約為原生路徑的一半。每 MB 客戶端 CPU 消耗是原生路徑的 1.9–3.3 倍，p99.9 尾延遲也更高。中位數與冷啟動延遲沒有可測量差異。XUDP 還會拒絕超過 7,526 位元組的封包。
-- 當 VLESS 源在不同埠上選了不同路徑時，即使在同一節點上，也會依所選路徑各有一條 association。例如 Xray UDP 池加上 UDP/443 的 `skip`，443 就走協議回退，而不是池。
+- 協定回退路徑不由 H2MUX 或 Xray UDP 池承載。未啟用 Vision 的節點裡，`packetEncoding=auto` 在 53 和 443 埠使用已連線的原生 UDP。這類流只指定一個目標，所以這兩個埠無法實作全錐形。Vision 節點和其他埠使用 Single XUDP。設定 `packetEncoding=xudp`，可以在原本走原生路徑的地方明確啟用 Single XUDP。
+- Single XUDP 未設為預設值，原因是測得的效能成本。在 loopback 環境中對 sing-box 1.12.4 使用不限速的 1200 位元組封包時，吞吐約為原生路徑的一半。每 MB 用戶端 CPU 消耗是原生路徑的 1.9–3.3 倍，p99.9 尾延遲也更高。中位數與冷啟動延遲沒有可測量差異。XUDP 還會拒絕超過 7,526 位元組的封包。
+- 當 VLESS 源在不同埠上選了不同路徑時，即使在同一節點上，也會依所選路徑各有一條 association。例如 Xray UDP 池加上 UDP/443 的 `skip`，443 就走協定回退，而不是池。
 - Trojan、Juicity 和 AnyTLS 把一個源的全部目的地放在一條可靠流上。某個目的地停滯會拖慢同流的其他目的地，寫失敗會終止所有目的地。封包 carrier 沒有這個問題，例如 Hysteria2、TUIC、Shadowsocks 和 SOCKS5。
-- 53 埠的流不會在資料路徑裡釋出客戶端回覆的 framing，因此針對 53 埠流的主動回覆要靠主機轉發。
-- 所有客戶端源共用一個行程級的外來回覆 socket 池，每個對端位址一個 socket。上限依 endpoint 容量算，每個 endpoint 對應七個 socket。達到上限後，新的外來對端會淘汰最久未使用的 socket。清理任務會關閉超過一個 NAT 逾時時間未使用的 socket。
+- 53 埠的流不會在資料路徑裡釋出用戶端回覆的 framing，因此針對 53 埠流的主動回覆要靠主機轉發。
+- 所有用戶端源共用一個行程級的外來回覆 socket 池，每個對端位址一個 socket。上限依 endpoint 容量算，每個 endpoint 對應七個 socket。達到上限後，新的外來對端會淘汰最久未使用的 socket。清理任務會關閉超過一個 NAT 逾時時間未使用的 socket。
 - 一個源最近關閉的 64 個目的地，其回覆會被丟棄，honk 不會把它們當作外來回覆投遞。連線關閉和不可用節點清理都算在內。重新繫結會把目的地移出清單；第 65 次關閉會移除最早的記錄。空閒逾時和傳輸錯誤不加入記錄，因此只要源仍存在，這些對端仍可傳送外來回覆。仍繫結的流不受影響。
 - VMess 沒有 UDP 後端。
 
-在支援 `network` 的協議中，扁平結構化輸入接受逗號分隔的 `tcp`/`udp`，忽略各項首尾空白和 ASCII 大小寫。`tcp` 關閉 UDP；`udp` 與 `tcp,udp` 都允許 UDP。空文字或純空白正規化為未指定，保留協議的預設 capability。`quic` 等未知值，或非空清單中的空項，會使節點被拒絕。該欄位只控制 UDP admission；`udp` 不會額外禁止 TCP。
+在支援 `network` 的協定中，扁平結構化輸入接受逗號分隔的 `tcp`/`udp`，忽略各項首尾空白和 ASCII 大小寫。`tcp` 關閉 UDP；`udp` 與 `tcp,udp` 都允許 UDP。空字串或純空白正規化為未指定，保留協定的預設 capability。`quic` 等未知值，或非空清單中的空項，會使節點被拒絕。該欄位只控制 UDP admission；`udp` 不會額外禁止 TCP。
 
 未啟用 Cargo feature `rprx` 時，VMess 與 VLESS 節點仍能解析，但不會註冊 handler，撥號以 `No handler for protocol` 失敗；未啟用該 feature 的正常建置不會分配 VLESS 池或 carrier 訊號量。`honk-core` 與 `honk-tool` 預設啟用 `rprx`。
 
-`honk-core` 在啟動和 reload 時注入具有固定保留 ID 的 `direct` 與 `block`。使用者節點不得使用這些名稱或協議。群組不會自動從節點池納入它們；只有精確符合名稱的 `filter: name(direct)` 或 `name(block)` 才會選中，見[群組參考](./groups.md#過濾解析)。
+`honk-core` 在啟動和 reload 時注入具有固定保留 ID 的 `direct` 與 `block`。使用者節點不得使用這些名稱或協定。群組不會自動從節點池納入它們；只有精確符合名稱的 `filter: name(direct)` 或 `name(block)` 才會選中，見[群組參考](./groups.md#過濾解析)。
 
-## 協議參數
+## 協定參數
 
 ### Shadowsocks 2022
 
@@ -376,9 +376,9 @@ AES 2022 方法接受在 `password` 中用冒號分隔的 PSK 鏈，從第一個
 
 UDP 重放保護為目前 session 和前一個伺服器端 session 分別保留一個視窗。前一個 session 連續 60 秒沒有活動後，才接受第三個 session。只有在認證和回應標頭驗證成功後，honk 才修改接收 session 狀態；無效封包不能重設重放歷史。
 
-Shadowsocks UDP（傳統 AEAD 與 2022）為每個客戶端源的所有目的地只保留一個面向伺服器端的 socket；2022 在這些目的地之間共用一個 session ID、一個遞增的包計數器和一組重放視窗。
+Shadowsocks UDP（傳統 AEAD 與 2022）為每個用戶端源的所有目的地只保留一個面向伺服器端的 socket；2022 在這些目的地之間共用一個 session ID、一個遞增的包計數器和一組重放視窗。
 
-回覆會帶回伺服器端回報的真實遠端位址，因此只要伺服器端轉發，從未聯絡過的主機也能到達客戶端；宣告為非撥號網域名稱的回覆會被丟棄。
+回覆會帶回伺服器端回報的真實遠端位址，因此只要伺服器端轉發，從未聯絡過的主機也能到達用戶端；宣告為非撥號網域名稱的回覆會被丟棄。
 
 與撥號目標不同的名稱從不逐封包傳送。真實伺服器端，例如 sing-box 1.12.4，會依第一個目的地固定 outbound 形態；之後出現不同名稱就會終止 association，因此這類名稱以數值目標發出。
 
@@ -388,7 +388,7 @@ Shadowsocks UDP（傳統 AEAD 與 2022）為每個客戶端源的所有目的地
 
 | 值 | 傳輸方式 | 欄位對映 |
 | --- | --- | --- |
-| 空文字或 `tcp` | 裸 TCP | — |
+| 空字串或 `tcp` | 裸 TCP | — |
 | `ws` | WebSocket | `path` → `ws_path`；`host` → `ws_host`；升級 header 沒有分享連結欄位 |
 | `grpc` | gRPC | `serviceName` 或 `service_name` → `grpc_service` |
 | `xhttp` 或輸入別名 `splithttp` | XHTTP | 見下文的 H2 相容範圍。 |
@@ -418,7 +418,7 @@ v2rayN JSON 形式要求 `add`、UUID 格式的 `id`，以及 1 到 65535 之間
 
 用 Base64 編碼整個物件，接在 `vmess://` 之後。Base64 後再接 `?query` 或 `#fragment` 會使連結無效；節點名稱用 `ps` 或 dae 標籤指定。
 
-VMess JSON 的 `net` 和 Shadowrocket 傳輸參數只選擇流傳輸方式，不再寫入封包網路 capability 欄位。未指定封包限制時，對有 UDP 後端的協議保留原有預設 UDP capability，VMess 沒有 UDP 後端。已有的有效空傳輸欄位也保留原始寫法。非 XHTTP 傳輸仍沿用舊行為，忽略無關的匯出欄位 `mode`、`extra`；這些欄位不會選擇 XHTTP。傳輸宣告明確衝突時仍會拒絕節點。
+VMess JSON 的 `net` 和 Shadowrocket 傳輸參數只選擇流傳輸方式，不再寫入封包網路 capability 欄位。未指定封包限制時，對有 UDP 後端的協定保留原有預設 UDP capability，VMess 沒有 UDP 後端。已有的有效空傳輸欄位也保留原始寫法。非 XHTTP 傳輸仍沿用舊行為，忽略無關的匯出欄位 `mode`、`extra`；這些欄位不會選擇 XHTTP。傳輸宣告明確衝突時仍會拒絕節點。
 
 VLESS 支援 TCP+REALITY+Vision、TCP+REALITY、TCP+WS、TCP+WS+TLS、TCP+gRPC 與下述 H2 XHTTP 設定方案。未加密 Vision 的 direct-copy 要求使用 TLS 1.3 或 REALITY 的裸 TCP，不能使用 WS/gRPC/XHTTP；加密 Vision 遵循下文的組合規則。
 
@@ -527,7 +527,7 @@ CDN 的機器人過濾規則可能拒絕不含這些 header 的 XHTTP 請求。�
 | Extra 中的 `noSSEHeader`、`scMaxBufferedPosts`、`scStreamUpServerSecs` | 僅作用於 Xray 伺服器端；檢查型別後丟棄。 |
 | `xmux` | 僅在全為零或恰好等於 Xray 的預設 XMUX 填充值時接受並丟棄：`maxConcurrency` 為 1、`hMaxRequestTimes` 為 600–900、`hMaxReusableSecs` 為 1800–3000，其餘為 0。其他值拒絕。 |
 
-未知或不支援的參數會使整個節點被拒絕，即使值為 null 或空值也不例外。這包括其他 session、序號或酬載位置、自訂上傳方法和填充混淆設定。Mihomo 訂閱使用對應的 `xhttp-opts` 欄位。官方 sing-box 和客戶端記錄格式仍不支援 XHTTP 傳輸。
+未知或不支援的參數會使整個節點被拒絕，即使值為 null 或空值也不例外。這包括其他 session、序號或酬載位置、自訂上傳方法和填充混淆設定。Mihomo 訂閱使用對應的 `xhttp-opts` 欄位。官方 sing-box 和用戶端記錄格式仍不支援 XHTTP 傳輸。
 
 Extra 中的 `downloadSettings` 是 Xray StreamConfig，用於把 GET 發往獨立 endpoint。下載端不繼承上傳端的任何設定，包括 header。因此，即使上傳端設定了 `User-Agent`，下載 GET 仍攜帶預設的 Chrome `fetch()` header。
 
@@ -545,7 +545,7 @@ Extra 中的 `downloadSettings` 是 Xray StreamConfig，用於把 GET 發往獨�
 
 每個對端各有獨立的 carrier 池。因此，Trojan 或 VMess 節點最多可持有四條不佔 VLESS 行程 permit 的可重複使用 carrier。延遲探測與 `honk-tool sub` 的位址族列只反映上傳 endpoint。
 
-XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP 權限、封包編碼與 UDP/443 策略不變。Packet-up 的協議裡沒有表示上傳 EOF 的標記：shutdown 會重新整理已經接受的上傳位元組，並保留 GET 等待應用的最終回覆；只有關閉邏輯流才結束該請求。
+XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP permission、封包編碼與 UDP/443 策略不變。Packet-up 的協定裡沒有表示上傳 EOF 的標記：shutdown 會送出已經接受的上傳位元組，並保留 GET 等待應用的最終回覆；只有關閉邏輯流才結束該請求。
 
 
 ### Shadowrocket VLESS
@@ -574,13 +574,13 @@ Clash 匯入會比較 `servername`、`server-name` 和 `sni`；記錄格式還�
 
 | 連結輸入 | 節點欄位 / 行為 |
 | --- | --- |
-| userinfo secret | `hy2_auth`；保留完整 `user:password`，而不是隻取 password |
+| userinfo secret | `hy2_auth`；保留完整 `user:password`，而不是只取 password |
 | `obfs=salamander&obfs-password=...` | 小寫 `salamander` 配合非空密碼設定 `hy2_obfs`。混淆名稱缺失或為空，或密碼缺失或為空時關閉混淆。未知混淆名稱使連結被拒絕。 |
 | `upmbps` / `downmbps` | `hy2_up_mbps` / `hy2_down_mbps`；以 Mbps 為單位的整數，不帶單位。上傳值為正時啟用 Brutal，否則使用 BBR；下載值依 bytes/s 通告。 |
 | `mport` / `mhop` | `hy2_port_hopping` / `hy2_hop_interval`；見 [`hy2_port_hopping` / `hy2_hop_interval`](#hy2_port_hopping--hy2_hop_interval)。 |
 | `pinSHA256` | `tls_pin_sha256`，替代 PKI/主機名稱驗證 |
 | `initStreamReceiveWindow` / `initConnReceiveWindow` | QUIC 接收視窗覆蓋值，單位為位元組 |
-| `disablePathMTUDiscovery` | 值為 `1`/`true` 時關閉 QUIC PMTU 發現 |
+| `disablePathMTUDiscovery` | 值為 `1`/`true` 時關閉 QUIC 路徑 MTU 探索 |
 | `mtu` | 共用 QUIC UDP-payload 上限；只接受 1200–65527 |
 | `sni` / `peer`、insecure 別名、ECH 參數 | 共用 TLS 行為；非空的明確 SNI 別名必須一致 |
 
@@ -594,15 +594,15 @@ node {
 
 ### TUIC 與 Juicity
 
-| 協議 | 連結輸入 | 節點欄位 / 行為 |
+| 協定 | 連結輸入 | 節點欄位 / 行為 |
 | --- | --- | --- |
 | TUIC | `uuid:password` userinfo | 通用 `username` / `password`；供 `tuic_uuid` / `tuic_password` 的 handler 回退使用 |
 | TUIC | `congestion_control` | `cubic`、`new_reno` 或 `bbr`；`bbr` 即 quinn 原有的 BBR 或 BBRv3，由 `HONK_QUIC_BBR` 選擇。省略時為 `cubic`；未知值產生 warning 並回退到 cubic |
 | TUIC | `alpn` | 逗號分隔的 ALPN 覆蓋值；分享連結預設 `tuic`；原始 Clash/Mihomo 匯入使用下述來源預設值 |
 | TUIC | `initStreamReceiveWindow` / `initConnReceiveWindow` | 接收視窗覆蓋值 |
 | Juicity | `uuid:password` userinfo | 通用 `username` / `password`；供 `juicity_uuid` / `juicity_password` 的 handler 回退使用 |
-| Juicity | 協議預設值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收視窗（共享自適應流控可使其增長） |
-| Juicity | UDP | 每個客戶端源一條 QUIC bi 流承載所有目的地；回覆傳回真實的遠端對端，取決於伺服器端自身的 UDP socket 與出口策略 |
+| Juicity | 協定預設值 | ALPN `h3`、BBR，以及 8 MiB / 8 MiB 的初始接收視窗（共享自適應流控可使其增長） |
+| Juicity | UDP | 每個用戶端源一條 QUIC bi 流承載所有目的地；回覆傳回真實的遠端 peer，取決於伺服器端自身的 UDP socket 與出口策略 |
 | 兩者 | `mtu`、`sni`、insecure 別名、pin、ECH | 共用 QUIC/TLS 參數 |
 
 ```dae
@@ -616,7 +616,7 @@ node {
 
 原始 Clash/Mihomo `proxies` 條目中的 TUIC `alpn` 缺失或為 null 時，會補為 `h3`。明確非空清單保留順序；明確空清單或空白字串繼續使用 honk 既有的 `tuic` 回退，並不表示不傳送 ALPN。該來源預設值不適用於原生分享連結、扁平節點、sing-box `outbounds` 或文字記錄格式。
 
-**升級注意：** 依賴此前 `tuic` 回退的匯入節點須明確設定 `alpn: [tuic]` 才能保留舊行為。協議專用 ALPN 不改變節點 UUID，但有效設定變化會為新請求重建執行時；已有流繼續遵循正常的 generation 退休機制。
+**升級注意：** 依賴此前 `tuic` 回退的匯入節點須明確設定 `alpn: [tuic]` 才能保留舊行為。協定專用 ALPN 不改變節點 UUID，但有效設定變化會為新請求重建執行時；已有流繼續遵循正常的 generation 退休機制。
 
 ### AnyTLS
 
@@ -641,7 +641,7 @@ node {
 
 ### UDP 與多路複用
 
-VLESS 有三個獨立選擇。`udp=0|1` 控制是否允許封包撥號，`packetEncoding=auto|none|xudp|uot-v2` 選擇回退封包協議，`mux=off|h2mux|xray` 選擇 TCP/UDP carrier 路徑。這些選擇不會協商。
+VLESS 有三個獨立選擇。`udp=0|1` 控制是否允許封包撥號，`packetEncoding=auto|none|xudp|uot-v2` 選擇回退封包協定，`mux=off|h2mux|xray` 選擇 TCP/UDP carrier 路徑。這些選擇不會協商。
 
 | 標準 URI 查詢參數 | 預設值 | 接受值與作用 |
 | --- | --- | --- |
@@ -650,15 +650,15 @@ VLESS 有三個獨立選擇。`udp=0|1` 控制是否允許封包撥號，`packet
 | `mux` | `off` | `off`、`h2mux` 或 `xray`。 |
 | `padding` | `false` | 只接受精確的 `true` 或 `false`，僅對 `mux=h2mux` 有效；選擇 sing-mux v1 填充。與 `udp` 不同，`1`、`TRUE` 等其他寫法會被拒絕。 |
 | `concurrency` | `0` | 僅對 `mux=xray` 有效的有符號 `i16`：負值關閉 TCP mux；零允許每條 TCP carrier 同時承載 8 個邏輯 child；正值設定每條 carrier 的並行上限，最多 128。它不設定實體 carrier 數量。 |
-| `xudpConcurrency` | `0` | 僅對 `mux=xray` 有效的有符號 `i16`：負值使用協議回退；零在 TCP mux 啟用時共享 TCP 池及其 carrier 並行，否則使用協議回退；正值建立獨立 UDP 池，每條 carrier 的邏輯 child 並行使用該值，最多 128。 |
+| `xudpConcurrency` | `0` | 僅對 `mux=xray` 有效的有符號 `i16`：負值使用協定回退；零在 TCP mux 啟用時共享 TCP 池及其 carrier 並行，否則使用協定回退；正值建立獨立 UDP 池，每條 carrier 的邏輯 child 並行使用該值，最多 128。 |
 | `xudpProxyUDP443` | `allow` | 僅對 `mux=xray` 有效的 `reject`、`skip` 或 `allow`；UDP/443 的精確優先順序見下文。 |
 
 `packetEncoding`、`mux` 與每個 mux 控制項最多出現一次。重複的 `udp` 宣告僅在所有值一致時接受。
 
 | `mux` 值 | TCP 與 UDP 路徑 |
 | --- | --- |
-| `off` | 保留普通 VLESS TCP，UDP 使用 `packetEncoding`。UoT v2 為每個客戶端源建立一條非連線模式流，承載全部目的地並傳回每個回覆的真實源位址。 |
-| `h2mux` | 邏輯 TCP 與 sing-mux PacketAddr UDP 共用節點所屬的 HTTP/2 carrier 池。UDP 每個客戶端源使用一條流，逐封包攜帶位址。`padding=true` 選擇現有的填充 H2MUX 線協議格式。 |
+| `off` | 保留普通 VLESS TCP，UDP 使用 `packetEncoding`。UoT v2 為每個用戶端源建立一條非連線模式流，承載全部目的地並傳回每個回覆的真實源位址。 |
+| `h2mux` | 邏輯 TCP 與 sing-mux PacketAddr UDP 共用節點所屬的 HTTP/2 carrier 池。UDP 每個用戶端源使用一條流，逐封包攜帶位址。`padding=true` 選擇現有的填充 H2MUX 線協定格式。 |
 | `xray` | 兩個並行設定所啟用的連線池分別使用 Xray Mux.Cool。TCP 與 UDP 池化相互獨立。 |
 
 H2MUX 接管兩類路徑，因此回退編碼不會替換其 UDP 路徑。H2MUX 保留現有池策略，不採用 Mux.Cool 在每條 carrier 分配 128 個邏輯 child 後更換連線的行為。
@@ -678,11 +678,11 @@ node {
 
 | 欄位 | 意義 |
 | --- | --- |
-| `network` | 封包權限：`tcp` 關閉 UDP；省略、`udp` 或 `tcp,udp` 允許 UDP。 |
+| `network` | Packet permission：`tcp` 關閉 UDP；省略、`udp` 或 `tcp,udp` 允許 UDP。 |
 | `packet_encoding` | 回退編碼：`auto`、`native`、`xudp`、`uot-v2`。 |
 | `multiplex` | 帶型別標記的 carrier 選擇，具體結構如下。 |
 
-| 多路複用協議 | 結構化形式 |
+| 多路複用協定 | 結構化形式 |
 | --- | --- |
 | 關閉 | `{"protocol":"off"}` |
 | H2 | `{"protocol":"h2","padding":true\|false}` |
@@ -711,7 +711,7 @@ node {
 | `xudp` | `xudp` | `off` | `1` | — |
 | `mux-cool` | `auto` | `xray` | `1` | `concurrency=0&xudpConcurrency=0&xudpProxyUDP443=skip` |
 
-最後一行保留 TCP/UDP 可用性；`skip` 的 UDP/443 目標使用協議回退，而不是 pooled XUDP。現在預設允許 UDP/443，包括 Vision；需要封鎖 QUIC 時使用路由規則。本次升級中所有接納的 VLESS 節點都使用新的身分派生規則，見[節點身分](#節點身分)。
+最後一行保留 TCP/UDP 可用性；`skip` 的 UDP/443 目標使用協定回退，而不是 pooled XUDP。現在預設允許 UDP/443，包括 Vision；需要封鎖 QUIC 時使用路由規則。本次升級中所有接納的 VLESS 節點都使用新的身分派生規則，見[節點身分](#節點身分)。
 
 舊版 `vless_mode` URI 語法會被拒絕。解析器也拒絕 `smux`、`multiplex`、`udp-over-tcp`、`packet-encoding`、`packet_encoding`、`packet-addr`、`xudp`、`only-tcp`、Brutal 控制項與 H2 流數量調校等意義不明確的第三方 URI 拼寫；只有上表中的精確標準參數會設定這些選擇。
 
@@ -727,9 +727,9 @@ node {
 | --- | --- |
 | `reject` | 即使兩個多路複用池均關閉，仍拒絕 UDP/443。 |
 | `skip` | 選擇 `packetEncoding`。 |
-| `allow`（預設） | 使用設定的 UDP 池；沒有池時使用協議回退。 |
+| `allow`（預設） | 使用設定的 UDP 池；沒有池時使用協定回退。 |
 
-`xtls-rprx-vision-udp443` 正規化為基礎 Vision，不再改變權限或身分；線上附加欄位仍為基礎 flow。策略和容量拒絕會終止本次嘗試，且不影響健康狀態或 Score。它們不會觸發其他節點或 `direct` 回退，也不會自動重放封包。
+`xtls-rprx-vision-udp443` 正規化為基礎 Vision，不再改變 permission 或身分；線路上附加的欄位仍為基礎 flow。策略和容量拒絕會終止本次嘗試，且不影響健康狀態或 Score。它們不會觸發其他節點或 `direct` 回退，也不會自動重放封包。
 
 Vision 始終要求 direct TCP 路徑：`mux=off`，或 `mux=xray` 且關閉 TCP mux。所有 H2MUX TCP 組合都無效，包括使用 Encryption 時。
 
@@ -737,13 +737,13 @@ Vision 可以使用僅 UDP 的 Xray 池；`concurrency=-1` 時，用正數 `xudp
 
 未加密 Vision 還要求使用協商 TLS 1.3 或 REALITY 的裸 TCP。加密 Vision 可以保留已選 outer 流傳輸與 random-XOR 處理，但仍不能啟用 TCP mux、H2MUX UDP、原生 UDP 或 UoT v2；XUDP/Xray UDP 或關閉 UDP 均有效。
 
-VLESS carrier slot 和 UDP endpoint slot 都出自行程級的檔案描述符預算。carrier slot 先劃分，所以可重複使用的 carrier 容量和 endpoint 數量會互相排擠。容量耗盡會當成本機容量問題回報，不算遠端協議失敗。honk 還依照自己的可重複使用 source/session 所有權，以及依目的地路由的語義，限定 XUDP Global ID 的 scope。它既不是 Xray 只認來源的身分，也不承諾無衝突的 NAT 身分。標準的生命週期與 scope 定義見[源/session 所有權與容量](../design/outbound.md#sourcesession-ownership-and-capacity)。
+VLESS carrier slot 和 UDP endpoint slot 都出自行程級的檔案描述符預算。carrier slot 先劃分，所以可重複使用的 carrier 容量和 endpoint 數量會互相排擠。容量耗盡會當成本機容量問題回報，不算遠端協定失敗。honk 還依照自己的可重複使用 source/session 所有權，以及依目的地路由的語義，限定 XUDP Global ID 的 scope。它既不是 Xray 只認來源的身分，也不承諾無衝突的 NAT 身分。標準的生命週期與 scope 定義見[源/session 所有權與容量](../design/outbound.md#sourcesession-ownership-and-capacity)。
 
 ### Encryption
 
 `encryption` 省略、為空或為 `none` 時不啟用 VLESS Encryption。其他值必須以 `mlkem768x25519plus.` 開頭；字串其餘部分由 handler 驗證。
 
-`encryption=` 接受的基本客戶端字串形式為：
+`encryption=` 接受的基本用戶端字串形式為：
 
 ```text
 mlkem768x25519plus.<native|xorpub|random>.<1rtt|0rtt>.<base64url-key>
@@ -757,7 +757,7 @@ key 為 Base64url，有無填充均可，解碼後是 32 位元組 X25519 key �
 
 ### REALITY 與 Vision
 
-在 VLESS 與 Trojan URL 連結中，`security=reality` 開啟 TLS 並對映 REALITY 查詢參數欄位，不再靜默回退到普通 PKI TLS。其他分享連結協議方案拒絕 REALITY 意圖；結構化 VMess REALITY 仍受支援。僅 VLESS 使用 `flow` 選擇 Vision。
+在 VLESS 與 Trojan URL 連結中，`security=reality` 開啟 TLS 並對映 REALITY 查詢參數欄位，不再靜默回退到普通 PKI TLS。其他分享連結協定方案拒絕 REALITY 意圖；結構化 VMess REALITY 仍受支援。僅 VLESS 使用 `flow` 選擇 Vision。
 
 | Query | 意義 |
 | --- | --- |
@@ -781,13 +781,13 @@ VLESS 依以下規則選擇 TLS：
 
 標準 VMess 連結改用其 v2rayN JSON `tls` 欄位。
 
-重複的 `security` 與已識別的 `tls` 宣告必須一致，包括別名之間的 TLS 開關。後值不能覆蓋前面的衝突宣告。VLESS 與編碼 VMess 只接受 `tls=0|1`；其他協議方案保留對未識別 `tls` 文字的處理。Trojan 與 AnyTLS 拒絕明確明文宣告，而不是靜默保留強制 TLS。
+重複的 `security` 與已識別的 `tls` 宣告必須一致，包括別名之間的 TLS 開關。後值不能覆蓋前面的衝突宣告。VLESS 與編碼 VMess 只接受 `tls=0|1`；其他協定方案保留對未識別 `tls` 文字的處理。Trojan 與 AnyTLS 拒絕明確明文宣告，而不是靜默保留強制 TLS。
 
 REALITY 僅使用 TLS 1.3，首次嘗試依次通告 hybrid `X25519MLKEM768` 與預設 classic `X25519` share。僅當握手完成後收到非 ed25519 葉憑證，才向同一對端新建一次僅使用 X25519 的連線；新連線仍須通過設定的 REALITY key/HMAC 認證，之後才能傳送代理資料。
 
 兩次嘗試共享 `3 × connect_timeout` 的 setup deadline，不增加設定項。這個觸發結果沒有經過認證，不是伺服器端版本檢測。ed25519 HMAC 錯誤、TLS/IO 錯誤和 HRR 仍然是最終失敗。每條連線只 seal 一次 ClientHello，不復用 key/nonce。參見[相容與認證邊界](../design/outbound.md)。
 
-裸 TCP 池只接納握手前保持靜默的 socket。任何排隊的伺服器端位元組，包括致命 TLS 警報，都會讓該裸連線在接納或取出時被拒絕；沒有 SNI/警報特例，也不會重試握手。已經完成協議準備的就緒流即使緩衝了有效應用資料，也不會因此被拒絕。
+裸 TCP 池只接納握手前保持靜默的 socket。任何排隊的伺服器端位元組，包括致命 TLS 警報，都會讓該裸連線在接納或取出時被拒絕；沒有 SNI/警報特例，也不會重試握手。已經完成協定準備的就緒流即使緩衝了有效應用資料，也不會因此被拒絕。
 
 REALITY 不使用 CA 驗證或 `skip_cert_verify`。目標 TLS 記錄的緩衝限制取決於伺服器端版本。文件中的 sing-box 1.12 / MetaCubeX-uTLS 1.8.0 對端使用 8192 位元組緩衝區，包含訊框開銷，這不是 honk 統一的憑證上限。參見[伺服器端版本約束](../design/outbound.md)。REALITY 設定方案還會加入 ed25519；被忽略的 `fp` 和全域 Chrome-oriented 模式都不承諾精確的瀏覽器身分。
 
@@ -798,7 +798,7 @@ REALITY 不使用 CA 驗證或 `skip_cert_verify`。目標 TLS 記錄的緩衝�
 | 取值 | 行為 |
 | --- | --- |
 | `tls` | 原生 BoringSSL ClientHello |
-| `utls` | Chrome 形 ClientHello，包含 GREASE、擴充套件亂序、Chrome 演算法/曲線、憑證壓縮、ALPS 與 ECH GREASE |
+| `utls` | Chrome 形 ClientHello，包含 GREASE、extension 亂序、Chrome 演算法/曲線、憑證壓縮、ALPS 與 ECH GREASE |
 
 依節點的 ECH 控制項為：
 
@@ -810,7 +810,7 @@ REALITY 不使用 CA 驗證或 `skip_cert_verify`。目標 TLS 記錄的緩衝�
 
 `ech_config` 和 `ech_config_path` 檔案的內容是 Base64 文字，標準或 URL-safe 均可，填充可選；檔案不能是二進位 ECHConfigList。讀取或解碼失敗會使節點被拒絕，不會回退到發現。
 
-靜態設定會提供真實 ECH；ECH 被拒絕時，握手 fail-closed。發現是盡力而為且 fail-open：找不到 ECHConfigList 時，握手不帶真實 ECH 繼續，`utls` 仍傳送 ECH GREASE。發現走 bootstrap resolver，未設定時使用系統第一個 nameserver，並依網域名稱快取結果。同一組控制項也適用於 QUIC 協議。
+靜態設定會提供真實 ECH；ECH 被拒絕時，握手 fail-closed。發現是盡力而為且 fail-open：找不到 ECHConfigList 時，握手不帶真實 ECH 繼續，`utls` 仍傳送 ECH GREASE。發現走 bootstrap resolver，未設定時使用系統第一個 nameserver，並依網域名稱快取結果。同一組控制項也適用於 QUIC 協定。
 
 ## 分享連結 scheme
 
@@ -826,7 +826,7 @@ XHTTP 以外，未知查詢 key 會被忽略，因此拼錯 key 名不會報錯�
 | `hysteria2://` | 上述 Hysteria2 查詢參數對映；也接受 `hysteria://` |
 | `tuic://` | 上述 TUIC userinfo 與 QUIC 調校 |
 | `juicity://` | Juicity userinfo 與共用 QUIC/TLS 查詢參數 |
-| `socks5://` | SOCKS5 userinfo；也接受 `socks4://` 和 `socks4a://`，但仍使用 SOCKS5 協議，因此不能連線僅支援 SOCKS4 的伺服器端 |
+| `socks5://` | SOCKS5 userinfo；也接受 `socks4://` 和 `socks4a://`，但仍使用 SOCKS5 協定，因此不能連線僅支援 SOCKS4 的伺服器端 |
 
 明文 `method:password` userinfo 中的方法本身可以是 Base64，例如 `ss://YWVzLTEyOC1nY20=:password@host:port`。無法得到方法和密碼的 userinfo 會整體當成密碼，方法回退到 `aes-128-gcm`。
 

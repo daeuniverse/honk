@@ -186,7 +186,7 @@ Geodata URL 必須是 HTTP(S)，不能帶 userinfo 和 fragment，長度最多 4
 | `geosite` | `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geosite.dat`，然後 `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat` |
 | `geoip` | `https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/release/geoip.dat`，然後 `https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat` |
 
-在設定檔中設定的 URL 會取代該資產的清單，不會附加成映像。
+在設定檔中設定的 URL 會取代該資產的清單，不會附加成鏡像。
 
 ## 已儲存設定
 

@@ -222,7 +222,7 @@ Geodata 的下載 URL 和出口由 [`assets.geodata`](./assets.md) 設定。載�
 
 能不能讀內容和能不能寫入是兩件事。含認證資訊的來源可以讀，但內容被遮蔽，遮蔽後的內容不能回寫。Selector 寫入、受限群組 PATCH，以及主檔案的建立和刪除，都走同一套來源寫入權限。自動策略裡的固定成員只在執行時生效，不寫回來源。
 
-來源 PUT 的 `If-Match` 依磁碟位元組的 SHA-256 求值，遵循 RFC 9110：strong tag、清單或多個 field line、`*` 都能比對，weak tag 永不比對。寫完後還要執行真正的 reload 操作。寫入成功不代表啟用成功；不與其他編輯者協調的外部編輯器仍可能搶在最後一次檢查和改名之間寫入。受限群組 PATCH 重用同一套來源事務，但要求已接受的群組 ETag 或設定 ETag，並在寫入前和啟用前各檢查一次；來源和依賴分別檢查，這個 revision 不是磁碟 hash。具體怎麼從失敗中恢復，見 [API 契約](./api.md#主檔案項目與-geodata-管理)。
+來源 PUT 的 `If-Match` 依磁碟位元組的 SHA-256 求值，遵循 RFC 9110：strong tag、清單或多個 field line、`*` 都能比對，weak tag 永不比對。寫完後還要執行真正的 reload 操作。寫入成功不代表啟用成功；不與其他編輯者協調的外部編輯器仍可能搶在最後一次檢查和改名之間寫入。受限群組 PATCH 重用同一套來源交易，但要求已接受的群組 ETag 或設定 ETag，並在寫入前和啟用前各檢查一次；來源和依賴分別檢查，這個 revision 不是磁碟 hash。具體怎麼從失敗中恢復，見 [API 契約](./api.md#主檔案項目與-geodata-管理)。
 
 ### 探測目標
 
@@ -283,7 +283,7 @@ experimental {
 
 `assets.ui.route` 優先於 `assets.route`，初始請求和每次重新導向都依這個優先順序。出口寫 `direct` 就直接下載；路由規則選中 `block` 時中止下載；寫群組名稱時，每次請求都解析出該群組最終選用的葉節點。沒設定出口時，每個 URL 都走普通流量路由。標籤不可用、下載失敗或解壓縮失敗只記日誌，不會停掉引擎。
 
-壓縮包寫入一個位於目標目錄、沒有檔名的私有檔案，不放在記憶體中；解壓縮完成或下載失敗後，honk 刪掉這個壓縮包。項目超過 10,000 個或內容超過 128 MiB 時，honk 拒絕繼續解壓縮並清空已寫出的目錄；該上限與壓縮包本身相同。下次啟動會重新下載。
+壓縮檔寫入一個位於目標目錄、沒有檔名的私有檔案，不放在記憶體中；解壓縮完成或下載失敗後，honk 刪掉這個壓縮檔。項目超過 10,000 個或內容超過 128 MiB 時，honk 拒絕繼續解壓縮並清空已寫出的目錄；該上限與壓縮檔本身相同。下次啟動會重新下載。
 
 下載最多跟隨五次重新導向。每次 HTTP 交換逾時 30 秒；經代理時，計時從隧道撥號完成後開始。所有 ZIP 項目都在同一個頂層目錄下時，解壓縮會去掉這一層，`dist/index.html` 變成 `index.html`。路徑裡含空分量、`.`、`..` 或反斜線的項目，honk 會跳過。
 
@@ -341,7 +341,7 @@ experimental {
 
 - 資料庫損毀：honk 取得實例鎖後，把 `honk.db` 和 `honk.db-wal` 改名成 `honk.db.corrupt` 和 `honk.db.corrupt-wal`，再建一個新檔案。
 - 已有 `honk.db.corrupt`：honk 保留這兩份檔案，在刪掉其中一份之前不做持久化。
-- 資料庫不可用、不安全，或被重置操作鎖住：honk 記一條 warning，然後在不做持久化的情況下執行。不安全是指資料庫不是 honk 使用者所有的一般檔案；重置鎖由 `honk-core admin reset` 持有。
+- 資料庫不可用、不安全，或被重置操作鎖住：honk 記一條 warning，然後在不做持久化的情況下執行。不安全是指資料庫不是 honk 使用者所有的私有檔案；重置鎖由 `honk-core admin reset` 持有。
 
 路徑不安全時，`persistence_unavailable` 降級除了 `reason`，還會帶一個 `rule`，取值是 `not_owner`、`group_or_other_bits`、`not_directory`、`not_file`、`symlink` 或 `identity_changed`。日誌裡給出路徑和修復方法。
 
@@ -366,7 +366,7 @@ experimental {
 
 ### DNS 持久化
 
-`store_dns: true` 時，每條應答是 `dns_answer` 表裡的一列，內容是 `HDNS` version 2 編碼，以精確快取 key 的摘要作 primary key。恢復時只接受同時滿足這些條件的列：沒過期，且 key 摘要、正規化 query wire、response wire 識別和目前的 DNS policy 全部符合。精確 key 裡同時有入口 profile、request scope 和 operation，所以不會在不同 DNS 情境之間混用。編碼後超過 4 KiB 的項目不寫入，並計入 `oversize`。
+`store_dns: true` 時，每條應答是 `dns_answer` 表裡的一列，內容是 `HDNS` version 2 編碼，以精確快取 key 的摘要作 primary key。恢復時只接受同時滿足這些條件的列：沒過期，且 key 摘要、正規化 query wire、response wire 身分和目前的 DNS policy 全部符合。精確 key 裡同時有入口 profile、request scope 和 operation，所以不會在不同 DNS 情境之間混用。編碼後超過 4 KiB 的項目不寫入，並計入 `oversize`。
 
 ### 從 `cache.db` 升級
 
@@ -376,7 +376,7 @@ honk 只讀本實例 `cache_id` 字首下的 key，複製設定裡 Selector 群�
 
 honk 依檔案和 `cache_id` 在狀態資料庫裡記錄匯入進度；舊版本即使重新建了該檔案，也不會再匯入一次。其他 `cache_id` 仍能從保留下來的檔案裡匯入各自的 key。如果 `cache.db` 是符號連結、不是 honk 使用者所有的一般檔案、能被其他使用者寫入，或者無法當作 `cache.db` 讀取，honk 會保留該檔案並記一條 warning，下次啟動再試。
 
-資料庫模式下，上述退回使用目前 revision 儲存的原始入口目錄；即使本次 `-c` 指向其他位置、啟動時不讀取它，也不會改變舊快取的位置。
+資料庫模式下，上述回退使用目前 revision 儲存的原始入口目錄；即使本次 `-c` 指向其他位置、啟動時不讀取它，也不會改變舊快取的位置。
 
 `cache_id` 為空時，honk 隨後刪掉 `cache.db` 及其 `-wal`、`-shm`，但保留 `cache.db.corrupt-*` 副本。`cache_id` 非空時，這個檔案可能被其他實例共用，honk 會保留它，只記一條 warning。之後舊版本再啟動時找不到 `cache.db`，執行時狀態從空開始。
 
