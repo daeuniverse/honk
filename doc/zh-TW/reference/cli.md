@@ -15,7 +15,7 @@ honk-core [OPTIONS] [COMMAND]
 | Key | 預設值 | 含義 |
 | --- | --- | --- |
 | `-c`, `--config PATH` | 省略，`/etc/honk/config.dae` | 設定入口檔案。見 [`--config`](#--config)。 |
-| `--log-file PATH` | 省略，未設定 | 覆寫本次引擎程序的 `global.log_file`。見 [`--log-file`](#--log-file)。 |
+| `--log-file PATH` | 省略，未設定 | 覆寫本次引擎行程的 `global.log_file`。見 [`--log-file`](#--log-file)。 |
 | `-b`, `--bpf-object PATH` | 省略，內嵌物件檔 | 替換 `ebpf` 建置內嵌的物件檔；只有真實後端讀取它。 |
 | `--bpf-pin-root PATH` | 省略，`/sys/fs/bpf` | eBPF map 的 pin 根目錄，傳給真實後端。 |
 | `--disable-timestamp` | 省略，關 | 主控台日誌行不再帶時間戳記。見 [`--disable-timestamp`](#--disable-timestamp)。 |
@@ -44,7 +44,7 @@ honk-core --config /etc/honk/config.dae
 honk-core --log-file honk.log
 ```
 
-只覆寫本次引擎程序的 `global.log_file`，不改設定檔。相對路徑在 `global.data_dir` 下解析。
+只覆寫本次引擎行程的 `global.log_file`，不改設定檔。相對路徑在 `global.data_dir` 下解析。
 
 主控台日誌照常啟用。
 
@@ -68,7 +68,7 @@ honk-core --mock-ebpf
 
 使用 `MockEbpfBackend`，不載入核心 eBPF。
 
-設定要求 `global.nfqueue_enable: true` 時，honk 會記一條 warning，然後只在本程序關閉 NFQUEUE 暫存。
+設定要求 `global.nfqueue_enable: true` 時，honk 會記一條 warning，然後只在本行程關閉 NFQUEUE 暫存。
 
 ### --store
 
@@ -107,7 +107,7 @@ honk-core --store db --data-dir /var/lib/honk
 
 | 等級 | 含義 |
 | --- | --- |
-| `error` | 設定要求的功能在人工介入前無法恢復：啟用已提交但 degraded、程序停止、子系統永久停止，或內部不變量被破壞。 |
+| `error` | 設定要求的功能在人工介入前無法恢復：啟用已提交但 degraded、行程停止、子系統永久停止，或內部不變量被破壞。 |
 | `warn` | 降級但仍在執行。honk 會在進入這種狀態時記錄一次：改走備援路徑、資源達到上限、節點或代理群組不可用、新設定被拒而舊設定繼續運作。每次 DNS 查詢都會重複發生的失敗，例如 SERVFAIL 和 singleflight 飽和，最多每 10 秒記一次 warning。 |
 | `info` | 啟動、停止、啟用、維運操作，以及從 warning 狀態恢復。 |
 | `debug` | 單一連線、請求和 DNS 查詢的結果，包括單次撥號和轉發失敗，以及週期性維護結果。原生流也記錄同樣的逐流結果。 |
@@ -116,7 +116,7 @@ honk-core --store db --data-dir /var/lib/honk
 
 | Key | 含義 |
 | --- | --- |
-| `reload` | 向持有引擎鎖的程序送出 `SIGHUP`。見 [`reload`](#reload)。 |
+| `reload` | 向持有引擎鎖的行程送出 `SIGHUP`。見 [`reload`](#reload)。 |
 | `mode` | 把引數字串寫進結構化格式檔案的 `experimental.clash_api.default_mode`。見 [`mode`](#mode)。 |
 | `proxy` | 列印按請求做出的群組和節點選擇。見 [`proxy`](#proxy)。 |
 | `config export` | 把設定資料庫目前的修訂版本寫成一份 `.dae` 檔案。見 [`config export`](#config-export)。 |
@@ -133,9 +133,9 @@ honk-core reload
 
 從已加鎖的 `/run/honk-core.lock` 讀取 PID，送出 `SIGHUP`。
 
-只報告訊號已成功送達；執行中的程序隨後記錄 `applied` 或 `rejected`。mock 執行個體不持有這把鎖。
+只報告訊號已成功送達；執行中的行程隨後記錄 `applied` 或 `rejected`。mock 執行個體不持有這把鎖。
 
-真實資料面程序在整個生命週期裡持有這把鎖，`reload` 會先確認檔案仍被鎖定，再信任裡面的 PID。`kill(2)` 成功送達，並不表示候選設定通過了驗證，也不表示需重啟欄位檢查過。
+真實資料面行程在整個生命週期裡持有這把鎖，`reload` 會先確認檔案仍被鎖定，再信任裡面的 PID。`kill(2)` 成功送達，並不表示候選設定通過了驗證，也不表示需重啟欄位檢查過。
 
 #### mode
 
@@ -208,7 +208,7 @@ honk-core delay <node> [-u|--url HOST:PORT]
 | `HONK_QUIC_GSO` | 省略，未設定 | 強制開啟或關閉 QUIC 出站的 UDP GSO。見 [`HONK_QUIC_GSO`](#honk_quic_gso)。 |
 | `HONK_QUIC_BBR` | 省略，`v3` | 選擇 `congestion_control: bbr` 背後的 BBR 實作。見 [`HONK_QUIC_BBR`](#honk_quic_bbr)。 |
 | `TOKIO_WORKER_THREADS` | 省略，核心數 | `honk-core` 的 Tokio worker 數量。見 [`TOKIO_WORKER_THREADS`](#tokio_worker_threads)。 |
-| `HONK_VMLINUX_BTF` | 省略，`/sys/kernel/btf/vmlinux`，其次 `/usr/lib/debug/boot/vmlinux` | 覆寫程序名路由和原生 UDP 接收追蹤共用的原始核心 BTF。見 [`HONK_VMLINUX_BTF`](#honk_vmlinux_btf)。 |
+| `HONK_VMLINUX_BTF` | 省略，`/sys/kernel/btf/vmlinux`，其次 `/usr/lib/debug/boot/vmlinux` | 覆寫行程名路由和原生 UDP 接收追蹤共用的原始核心 BTF。見 [`HONK_VMLINUX_BTF`](#honk_vmlinux_btf)。 |
 | `DAE_LOCATION_ASSET` | 省略，未設定 | `honk-core` 和 `honk-tool` 最先檢查其中 `geoip.dat` 和 `geosite.dat` 的目錄。 |
 
 ### HONK_UI_DOWNLOAD_URL
@@ -271,7 +271,7 @@ Tokio 的 worker 數量。`honk-core` 使用預設的多執行緒執行期，預
 HONK_VMLINUX_BTF=/path/to/vmlinux.btf honk-core
 ```
 
-覆寫程序名路由和原生 UDP 接收追蹤共用的原始核心 BTF。檔案必須匹配執行中的核心。
+覆寫行程名路由和原生 UDP 接收追蹤共用的原始核心 BTF。檔案必須匹配執行中的核心。
 
 明確指定的檔案不可讀或無效時，honk 會拒絕啟動真實後端，不會自行改用其他檔案。TCP 歸屬證明不讀取核心結構，也不依賴它。
 
@@ -374,7 +374,7 @@ honk-tool sub <url|file|-> [--target HOST:PORT] [--url TEST_URL]
 | `--concurrency N` | 省略，`10` | 並行節點探測任務的上限。`0` 不執行任何探測，只輸出空摘要，不表示不限並行數。 |
 | `--limit N` | 省略，`0` | 僅探測前 `N` 個節點；`0` 表示全部。 |
 | `--ua UA` | 省略，未設定 | 遠端訂閱拉取使用的 `User-Agent`。 |
-| `--tls-implementation tls\|utls` | 省略，`tls` | 探測使用的程序級 TLS ClientHello 實作。 |
+| `--tls-implementation tls\|utls` | 省略，`tls` | 探測使用的行程級 TLS ClientHello 實作。 |
 | `--utls-imitate PROFILE` | 省略，`chrome_auto` | `utls` 使用的指紋設定方案；目前的驗證器只接受以 `chrome` 開頭的名稱。 |
 | `--v4-target IP:PORT` | 省略，`1.1.1.1:443` | v4 探測連線的數字 IPv4 位址，不檢查位址族。 |
 | `--v6-target [IP]:PORT` | 省略，`[2606:4700:4700::1111]:443` | v6 探測連線的數字 IPv6 位址，不檢查位址族。 |
@@ -408,7 +408,7 @@ UDP DNS 檢查目標，預設取自 `honk-config` 裡的引擎列表。可以重
 - Clash YAML/JSON、SIP008 和 sing-box JSON。
 - 受支援的 Surge/Surfboard/Loon/Quantumult X 記錄。
 
-`honk-tool` 跳過不支援的節點，不列印原始輸入。使用 `-` 可以避免把含憑證的 provider URL 放進 argv 和程序列表。
+`honk-tool` 跳過不支援的節點，不列印原始輸入。使用 `-` 可以避免把含憑證的 provider URL 放進 argv 和行程列表。
 
 #### 退出狀態
 
@@ -433,7 +433,7 @@ vless/{plain|tls|reality}/{tcp|ws|grpc|xhttp}[/vision]/tcp={plain|h2mux|mux-cool
 | VLESS 輸出欄位 | 含義 |
 | --- | --- |
 | `tcp=` | 有效 TCP 路徑。 |
-| `udp-fallback=` | 正規化後的退回值，即使 H2MUX 或 Xray 多工已經接管目標 UDP 路徑。 |
+| `udp-fallback=` | 正規化後的回退值，即使 H2MUX 或 Xray 多工已經接管目標 UDP 路徑。 |
 | `udp=disabled` | 禁止封包撥號。 |
 | `padding=` | 僅在 H2MUX 中出現。 |
 | Xray 多工 `TCP` | 每條 TCP carrier 的有效邏輯 child 並行數；`0` 表示關閉。 |
@@ -483,7 +483,7 @@ UDP DNS 的主機名稱目標使用共用的非同步解析器，不做阻塞的
 
 VLESS carrier 和 session 會依執行期與正規化後的線路協定形態重複使用。因此改動標準的 UDP/多工查詢參數，可能改變節點身分和連線池的重複使用。
 
-共用的實體 carrier 容量屬於全域。XUDP 的 8 位元組 Global ID 會依 honk 的執行期、客戶端、路徑和目的地來源身分劃定作用域，不是程序層級、無碰撞的 NAT key。
+共用的實體 carrier 容量屬於全域。XUDP 的 8 位元組 Global ID 會依 honk 的執行期、用戶端、路徑和目的地來源身分劃定作用域，不是行程層級、無碰撞的 NAT key。
 
 見[節點參考](./nodes.md#vless-udp-and-multiplexing)和標準的 [VLESS 出站設計](../design/outbound.md#sourcesession-ownership-and-capacity)。
 
@@ -540,7 +540,7 @@ honk-tool bpf stats [--pin-root PATH]
 | `1` | `tcp_conn_overflow` | TCP conn-state 插入失敗。 |
 | `2` | `redirect_track_insert_failure` | Redirect-track 發布失敗：map 插入失敗，或準備 scratch 不可用。 |
 | `3` | `routing_handoff_insert_failure` | Routing-handoff 發布失敗：map 插入失敗，或準備 scratch 不可用。 |
-| `4` | `socket_identity_capture_failure` | socket 程序身分擷取或儲存失敗。 |
+| `4` | `socket_identity_capture_failure` | socket 行程身分擷取或儲存失敗。 |
 | `5` | `tcp_child_proof_storage_failure` | 已接受 TCP child 的歸屬證明儲存失敗。 |
 | `6` | `tcp_publisher_claim_failure` | TCP SYN 發布的排他宣告插入失敗，不含普通的同 tuple 衝突，也就是 `EEXIST`。 |
 | `7` | `new_flow_rate_limited` | 因單一來源、每 CPU 的新流限制而被丟棄的 LAN 流嘗試。 |
@@ -577,7 +577,7 @@ API 檢查沒有逾時，對端沒有回應時會讓命令一直等待。需要�
 
 該命令為唯讀，檢查以下項目：
 
-- 名為 `honk-core`、`honk` 或 `dae` 的引擎程序；
+- 名為 `honk-core`、`honk` 或 `dae` 的引擎行程；
 - `/var/run/netns/daens` 和 `/sys/class/net/dae0`；
 - `daens` 內的 fwmark 規則；
 - 必需的已固定 map，以及可讀取的佔用/溢位統計；

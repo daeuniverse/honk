@@ -44,7 +44,7 @@ routing {
 | [`pname(...)`](#pname) | 把子串模式按 15 位元組正規化後，匹配 `argv[0]` 裡執行檔的 basename。 | `process_name` |
 | `mac(...)` | 匹配源 MAC 位址，寫作 `aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff`、`aabb.ccdd.eeff` 或 `aabbccddeeff`，不區分大小寫。 | `mac` |
 | `ipversion(...)` | 匹配 `4`/`ipv4` 或 `6`/`ipv6`，不區分大小寫。 | `ip_version` |
-| `dscp(...)` | 匹配十進位或帶 `0x`/`0X` 字首的十六進位 DSCP 值；資料包的取值為 `0` 到 `63`。 | `dscp` |
+| `dscp(...)` | 匹配十進位或帶 `0x`/`0X` 字首的十六進位 DSCP 值；封包的取值為 `0` 到 `63`。 | `dscp` |
 
 每個正向欄位在 `RoutingCondition.not` 下都有對應列表；解析器把 `!matcher(...)` 放入該列表。同一欄位中的多個值互為備選。
 
@@ -86,7 +86,7 @@ routing {
 
 `pname(...)` 把子串模式按 15 位元組正規化，再匹配 `argv[0]` 裡執行檔的 basename。
 
-執行時沒有 BTF 偏移，或沒有 verifier 允許的核心 argv 存取方式時，cgroup hook 同步改用呼叫執行緒的 `comm`。只匹配 honk 所在主機上的程序，不匹配 LAN 客戶端上的應用。
+執行時沒有 BTF 偏移，或沒有 verifier 允許的核心 argv 存取方式時，cgroup hook 同步改用呼叫執行緒的 `comm`。只匹配 honk 所在主機上的行程，不匹配 LAN 用戶端上的應用。
 
 ```dae
 routing {
@@ -108,7 +108,7 @@ fallback: outbound[(must)] | direct(mark: value[, must])
 - matcher 的括號引數列表可以在同一來源檔內跨行。語句一直延續到右括號和 `-> outbound`。被包含的檔案不能補全另一檔案中未完成的呼叫。
 - 成對的單引號或雙引號保留內部的全部位元組，包括空白、`#`、花括號、`,`、`)`、`&&` 和 `->`。引號在詞法單元開頭，或緊接未加引號的 `(`、`,`、`:` 時開啟，因此 `domain(suffix:'example.com')` 等同於 `domain(suffix: 'example.com')`。反斜槓保留原樣，不作轉義解碼。已開啟的引號必須在同一行內閉合，否則設定以 `unterminated-quote` 錯誤失敗。
 - 字首 `!` 只對緊隨其後的單個 matcher 取反。規則僅在正向條件匹配且所有取反 matcher 都未命中時匹配。
-- 流量缺少網域、程序名、MAC 或 DSCP 後設資料時，對應的 matcher 算作未命中，加上 `!` 的寫法反而會命中：尚未嗅探出網域的流量滿足 `!domain(...)` 和 `!geosite:...`，沒有程序名的流量滿足 `!pname(...)`。
+- 流量缺少網域、行程名、MAC 或 DSCP 後設資料時，對應的 matcher 算作未命中，加上 `!` 的寫法反而會命中：尚未嗅探出網域的流量滿足 `!domain(...)` 和 `!geosite:...`，沒有行程名的流量滿足 `!pname(...)`。
 - 未知的非空 matcher、matcher 名稱與左括號之間的空格、呼叫後的多餘文字均使設定驗證失敗，並產生帶位置的診斷。合取中不支援的非空條件不會被單獨丟棄。
 - 空項、單獨的 `!` 和空引數會被跳過：`domain() && dport(443)` 等同於 `dport(443)`。沒有剩餘條件的規則永不匹配；保底請用 `fallback:`。
 - `dip(...)` 和 `sip(...)` 中的無效位址、無效的 MAC 或 DSCP 值，以及不支援的 `l4proto` 或 `ipversion` 值，都會被直接丟棄，不報錯。沒有剩下有效值的 matcher 不匹配任何流量，其取反形式則匹配滿足規則其餘條件的全部流量。
@@ -141,7 +141,7 @@ routing {
 
 ### 埠 53 所有權
 
-`mac(...)` 規則命中後，`direct(must)` 可以讓該客戶端繞過透明 DNS；普通 `direct` 不行。LAN/WAN 的 TCP/UDP 目的埠 `53` 在完成既有入口與控制面排除後，會執行一次正常的有序流量策略，不單獨掃描 must 規則。LAN 埠 `53` 跳過本地 socket 探測，即使 dnsmasq 或 `dns.bind` 已監聽該目的位址也不例外。
+`mac(...)` 規則命中後，`direct(must)` 可以讓該用戶端繞過透明 DNS；普通 `direct` 不行。LAN/WAN 的 TCP/UDP 目的埠 `53` 在完成既有入口與控制面排除後，會執行一次正常的有序流量策略，不單獨掃描 must 規則。LAN 埠 `53` 跳過本地 socket 探測，即使 dnsmasq 或 `dns.bind` 已監聽該目的位址也不例外。
 
 | 流量策略結果 | DNS 所有權 |
 | --- | --- |
@@ -174,11 +174,11 @@ honk 只嗅探資料路徑交給控制面的流量；TC hook 留在 Linux 原生
 
 ## 策略路由 mark
 
-`direct(mark: 512)` 與 `direct(mark: 0x200)` 選擇相同的直連 mark。無字首數字按十進位解析，包括前導零；`0x`/`0X` 字首表示十六進位。範圍為 `0..=0x3fffffff`；`0xc0000000` 位屬於資料路徑，不供使用者策略使用。二進位/八進位字首、下劃線、正負號、溢位、未知選項以及重複的 `mark`/`must` 選項均拒絕設定；與全域 mark 標量不同，格式錯誤的直連 mark 不會靜默變為零。mark 只支援 `direct`，不支援代理目標和群組目標。
+`direct(mark: 512)` 與 `direct(mark: 0x200)` 選擇相同的直連 mark。無字首數字按十進位解析，包括前導零；`0x`/`0X` 字首表示十六進位。範圍為 `0..=0x3fffffff`；`0xc0000000` 位屬於資料路徑，不供使用者策略使用。二進位/八進位字首、底線、正負號、溢位、未知選項以及重複的 `mark`/`must` 選項均拒絕設定；與全域 mark 純量不同，格式錯誤的直連 mark 不會靜默變為零。mark 只支援 `direct`，不支援代理目標和群組目標。
 
 `direct(mark: 0x200, must)` 與 `direct(must, mark: 0x200)` 等價，直連選項列表內部允許空白。`fallback:` 及其別名 `default:` 接受相同形式。合併 include 後，最後出現的 fallback 會替換整個回退動作，普通 `direct` 不保留 mark 與 `must`。fallback 只在全部普通規則之後生效，即使來源檔裡有些規則宣告在它後面。
 
-在 IPv4/IPv6 的 TCP 和 UDP 上，非零直連 mark 替換全域 socket mark 的策略有效位，**不與 `so_mark_from_dae` 或 `0x100` 按位 OR**。原生直連、NFQUEUE 批准的直連以及使用者態直連 socket，會在低 30 位策略值之外額外保留 `CLASSIFIED_MARK`，這個位是 `0x40000000`。例如設定 `0x200` 時可觀測到 `0x40000200`，Linux 策略路由規則必須用遮罩排除保留位。`mark: 0` 表示未指定：使用者態發起的直連 socket 使用全域 mark，原生直連不新增使用者 mark。代理 carrier、bootstrap 和 DNS 控制器上游使用全域值，不繼承被攔截流量規則的 mark。
+在 IPv4/IPv6 的 TCP 和 UDP 上，非零直連 mark 替換全域 socket mark 的策略有效位，**不與 `so_mark_from_dae` 或 `0x100` 按位元 OR**。原生直連、NFQUEUE 批准的直連以及使用者態直連 socket，會在低 30 位策略值之外額外保留 `CLASSIFIED_MARK`，這個位是 `0x40000000`。例如設定 `0x200` 時可觀測到 `0x40000200`，Linux 策略路由規則必須用遮罩排除保留位。`mark: 0` 表示未指定：使用者態發起的直連 socket 使用全域 mark，原生直連不新增使用者 mark。代理 carrier、bootstrap 和 DNS 控制器上游使用全域值，不繼承被攔截流量規則的 mark。
 
 例如，選擇兩個由使用者設定的 WAN 路由表：
 
@@ -199,7 +199,7 @@ ip -4 rule add pref 10001 fwmark 0x300/0x3fffffff lookup 200
 ip -6 rule add pref 10001 fwmark 0x300/0x3fffffff lookup 200
 ```
 
-請為表 `100`、`200` 分別設定對應位址族的直連路由和預設路由，並處理各 WAN 的源位址、NAT 與防火牆權限；honk 不管理這些路由表。LAN 原生直連在 Linux 轉發路由查詢前設定 mark。主機/WAN 出站命中非零直連 mark 時，會經過使用者態直連轉發，由新 socket 觸發帶 mark 的路由查詢，不會保留客戶端的原始源 socket；這條路徑也適用於 `must`，包括原始埠 53 的流量。`must` 仍跳過 DNS 控制器。未指定 mark 的原生 `direct(must)` 保持既有的源位址保留路徑。修改全域 mark 需要重啟，流量規則可以 reload。編譯策略最多允許 256 個不同的非零 `direct(mark: ..., must)` 值，包括帶 mark 的 `must` fallback。WAN 原始 UDP/53 封包攜帶一個 mark 表索引，該索引隨它的路由 generation 固定，不會借用其他封包 tuple handoff 的 mark。
+請為表 `100`、`200` 分別設定對應位址族的直連路由和預設路由，並處理各 WAN 的源位址、NAT 與防火牆權限；honk 不管理這些路由表。LAN 原生直連在 Linux 轉發路由查詢前設定 mark。主機/WAN 出站命中非零直連 mark 時，會經過使用者態直連轉發，由新 socket 觸發帶 mark 的路由查詢，不會保留用戶端的原始源 socket；這條路徑也適用於 `must`，包括原始埠 53 的流量。`must` 仍跳過 DNS 控制器。未指定 mark 的原生 `direct(must)` 保持既有的源位址保留路徑。修改全域 mark 需要重啟，流量規則可以 reload。編譯策略最多允許 256 個不同的非零 `direct(mark: ..., must)` 值，包括帶 mark 的 `must` fallback。WAN 原始 UDP/53 封包攜帶一個 mark 表索引，該索引隨它的路由 generation 固定，不會借用其他封包 tuple handoff 的 mark。
 
 ## Geo 資源
 
@@ -210,7 +210,7 @@ ip -6 rule add pref 10001 fwmark 0x300/0x3fffffff lookup 200
 | 1 | `$DAE_LOCATION_ASSET/<file>` |
 | 2 | `global.data_dir/<file>` |
 | 3 | `/var/share/honk/<file>`（`LEGACY_DATA_DIR`） |
-| 4 | 程序工作目錄中的 `./<file>` |
+| 4 | 行程工作目錄中的 `./<file>` |
 | 5 | `/usr/local/share/honk/<file>` |
 | 6 | `/usr/share/honk/<file>` |
 | 7 | `/usr/local/share/dae/<file>` |
@@ -244,9 +244,9 @@ dip(192.168.50.1, fd00:50::1) && !dport(53) -> direct(must)
 
 檢查在啟動時、成功應用流量路由變化後，以及觀測到網路變化時執行；無變化或僅節點變化的 reload 不會重複檢查。尚不存在的網路卡或尚未取得的位址，會在發現後重新檢查。
 
-這只是提示，不阻止啟動或 reload，也不改變顯式阻斷和規則順序。依賴來源、網域、程序等條件的規則，以及拆分的埠覆蓋，可能是有意設定的合法策略，仍可能被判為無法確認。該 warning 不證明 listener、防火牆或端到端管理存取可達。
+這只是提示，不阻止啟動或 reload，也不改變顯式阻斷和規則順序。依賴來源、網域、行程等條件的規則，以及拆分的埠覆蓋，可能是有意設定的合法策略，仍可能被判為無法確認。該 warning 不證明 listener、防火牆或端到端管理存取可達。
 
-範圍過寬的私網 `direct(must)` 規則也會繞過 LAN 私網 DNS。要保留這部分 DNS 接管，必須在規則裡顯式加上 `&& !dport(53)`；honk 不會改寫這條規則。原生 `direct(must)` 不會由 honk 改寫客戶端源 IP/埠，但是否仍發生 SNAT/MASQUERADE，取決於其他防火牆和網路設定。被繞過的應答如何投影，以及它與 `asis` 有何區別，見[DNS 來源邊界](../design/dns.md#入口路徑)。
+範圍過寬的私網 `direct(must)` 規則也會繞過 LAN 私網 DNS。要保留這部分 DNS 接管，必須在規則裡顯式加上 `&& !dport(53)`；honk 不會改寫這條規則。原生 `direct(must)` 不會由 honk 改寫用戶端源 IP/埠，但是否仍發生 SNAT/MASQUERADE，取決於其他防火牆和網路設定。被繞過的應答如何投影，以及它與 `asis` 有何區別，見[DNS 來源邊界](../design/dns.md#入口路徑)。
 
 ## Fail-closed 行為
 

@@ -128,7 +128,7 @@ URL 帶引號時，緊貼結束引號或完整 `(UA)` 字尾的 `#` 會被當作
 
 | `sub_type` | 解析行為 |
 | --- | --- |
-| `simple` | 自動識別分享連結清單、Clash YAML/JSON、SIP008、sing-box JSON/YAML 和受支援的客戶端記錄。 |
+| `simple` | 自動識別分享連結清單、Clash YAML/JSON、SIP008、sing-box JSON/YAML 和受支援的用戶端記錄。 |
 | `clash` | 帶頂層 `proxies` 序列的 YAML 或 JSON。 |
 | `sip008` | SIP008 `servers` 物件或裸伺服器陣列；不是分享連結清單。 |
 | `custom` | 與 `simple` 使用相同的格式識別。 |
@@ -146,7 +146,7 @@ URL 帶引號時，緊貼結束引號或完整 `(UA)` 字尾的 `#` 會被當作
 | 寫入邊界 | HTTP 請求成功且正文通過匯入驗證後，honk 在一個交易裡儲存完整的原始回應，被拒絕的條目也算在內。 |
 | 容量限制 | 單一正文最多 8 MiB，全部正文合計最多 32 MiB。寫入會讓總量超過 32 MiB 時，honk 先刪除已停用訂閱的正文；仍然超出就拒絕寫入，保留原正文，並在本次抓取中報告 `subscription-store-write-failed`。訂閱連續兩次維護都沒啟用時，honk 刪掉它的正文；維護每 60 秒一次。啟動時 `store_subscribe: false`，但因 `cache_file`、`password_auth` 或 `--store db` 仍開啟了狀態資料庫時，honk 會清空該表。 |
 | 從 `.sub` 升級 | 取得實例鎖後，honk 匯入符合條件的舊正文，步驟見下文。 |
-| 重新導向 | 最多 5 跳。從 `https` 重新導向到其他 scheme，本次抓取失敗。重新導向到 loopback、私有、鏈路本地或未指定的字面位址，也同樣失敗，除非設定的 URL 自己就用了該位址。解析到這類位址的主機名不在檢查範圍內。 |
+| 重新導向 | 最多 5 跳。從 `https` 重新導向到其他 scheme，本次抓取失敗。重新導向到 loopback、私有、連結本機或未指定的字面位址，也同樣失敗，除非設定的 URL 自己就用了該位址。解析到這類位址的主機名不在檢查範圍內。 |
 | 正文大小 | 最多 8 MiB，在讀取過程中判定，不等整個正文緩衝完。 |
 
 啟動時，honk 取得實例鎖，然後按下面的步驟匯入舊 `.sub` 儲存：
@@ -171,7 +171,7 @@ URL 帶引號時，緊貼結束引號或完整 `(UA)` 字尾的 `#` 會被當作
 | 重新導向狀態碼 | 僅跟隨 301、302、303、307、308，最多 5 次。 |
 | 重新導向目標 | 不允許從 HTTPS 轉到 HTTP，也不允許從公網位址轉到私有字面位址。前一張表的重新導向限制同樣適用。 |
 | URL userinfo | URL 中的 userinfo 以基本認證傳送。 |
-| 協議、主機或埠變化 | 協議、主機或埠一變，honk 就去掉 `Authorization`、`Cookie`、`Cookie2`、`WWW-Authenticate`、`Proxy-Authorization` 和設定的 `Host`。 |
+| 協定、主機或埠變化 | 協定、主機或埠一變，honk 就去掉 `Authorization`、`Cookie`、`Cookie2`、`WWW-Authenticate`、`Proxy-Authorization` 和設定的 `Host`。 |
 | Referer | Referer 設為上一跳 URL，並去掉 userinfo 和 fragment。 |
 
 未啟用 `native-api` 的建置使用相同的訂閱抓取路由規則。
@@ -203,7 +203,7 @@ SIGHUP 時，抓取身分相同的訂閱保留執行時 ID；抓取身分由 URL
 
 ## 首次啟動時訂閱 URL 被阻斷
 
-訂閱 URL 被阻斷，或它的域名被 DNS 汙染時，可以先新增一個可達的靜態代理節點，再把
+訂閱 URL 被阻斷，或它的網域被 DNS 汙染時，可以先新增一個可達的靜態代理節點，再把
 訂閱的 `route` 指向只含這個節點的群組。該群組在首次啟動時就能用，不依賴任何訂閱提供
 的節點。範例裡的 SOCKS5 位址要換成能存取 provider 的代理位址，訂閱 URL 換成實際
 位址。
@@ -228,7 +228,7 @@ subscription {
 
 ## 訂閱正文格式
 
-所有被接受的節點都會獲得訂閱 ID。派生出的節點 ID 重複時，保留第一個可用條目；被拒絕的條目不佔身分。後續重複條目的診斷會同時記下兩個原始索引。陣列索引從 1 開始，在正規化前確定；URI 和記錄索引用物理行號，空行和註釋也算在內。解碼後的 Base64 帶一個指向原始正文的子來源，不虛構編碼位元組偏移。匯入完整客戶端設定時只取節點，其中的 DNS、路由、群組和遠端訂閱設定都不匯入。
+所有被接受的節點都會獲得訂閱 ID。派生出的節點 ID 重複時，保留第一個可用條目；被拒絕的條目不佔身分。後續重複條目的診斷會同時記下兩個原始索引。陣列索引從 1 開始，在正規化前確定；URI 和記錄索引用實體行號，空行和註釋也算在內。解碼後的 Base64 帶一個指向原始正文的子來源，不虛構編碼位元組偏移。匯入完整用戶端設定時只取節點，其中的 DNS、路由、群組和遠端訂閱設定都不匯入。
 
 正規化後的條目逐個進入 admission 流程，不保留一個和正文條目數一樣大的中間結果清單。每份正文最多保留 128 條非終止診斷；超出時追加一條 `subscription-diagnostics-truncated` 摘要，記下省略了多少條。導致正文失敗的終止錯誤單獨保留。呼叫方原有的診斷不變，也不佔這個限額。結構化匯入、URI 匯入、記錄匯入都用同一限額，Base64 解碼和持久化正文恢復也不例外；達到限額不會中斷有效節點的 admission，也不改變重複節點保留第一個可用條目的規則。
 
@@ -237,14 +237,14 @@ subscription {
 | 診斷程式碼 | 結果 |
 | --- | --- |
 | `malformed-subscription-entry` | 略過欄位無效或語法錯誤的條目。 |
-| `unsupported-subscription-entry` | 略過依賴不支援的協議或 feature 的條目。 |
+| `unsupported-subscription-entry` | 略過依賴不支援的協定或 feature 的條目。 |
 | `duplicate-subscription-entry` | 略過節點身分重複的後續條目。 |
 | `subscription-profile-entry` | 忽略設定檔中的非代理內容。 |
 | `invalid-subscription-encoding` | 拒絕不是 UTF-8 的正文，包括 Base64 解碼後的內容。 |
 | `invalid-subscription-body` | 拒絕無法解析的結構化正文。 |
 | `empty-subscription-body` | 拒絕沒有可用節點的正文。 |
 
-Clash、SIP008 和 sing-box 的憑據標量保留字串的原始位元組，原生有限數則轉成來源格式的標準十進位文字。缺失或 null 表示未提供。布林值、清單、對映和非有限數會讓條目被拒絕。有效的別名掩蓋不了已提供的無效憑據。數字 UUID 仍然過不了 UUID 驗證；空密碼仍要滿足對應協議的要求。
+Clash、SIP008 和 sing-box 的憑據純量保留字串的原始位元組，原生有限數則轉成來源格式的標準十進位文字。缺失或 null 表示未提供。布林值、清單、對映和非有限數會讓條目被拒絕。有效的別名掩蓋不了已提供的無效憑據。數字 UUID 仍然過不了 UUID 驗證；空密碼仍要滿足對應協定的要求。
 
 ### 分享連結清單
 
@@ -256,13 +256,13 @@ socks5://user:password@127.0.0.1:1080#local
 vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 ```
 
-空行、註釋和 Shadowrocket 的 `REMARKS=`、`STATUS=` 中繼資料行，honk 會忽略，也不產生節點 warning。其餘每行交給 `Node::from_share_link` 解析；不支援或格式錯誤的行會略過並記 warning。honk 不執行代理外掛，所以帶非空外掛值的分享連結也略過。正文裡沒有一個受支援的節點 URI 時，包括只有中繼資料的正文，honk 拒絕整個正文。標準的分享連結欄位和協議見[節點參考](./nodes.md)。
+空行、註釋和 Shadowrocket 的 `REMARKS=`、`STATUS=` 中繼資料行，honk 會忽略，也不產生節點 warning。其餘每行交給 `Node::from_share_link` 解析；不支援或格式錯誤的行會略過並記 warning。honk 不執行代理外掛，所以帶非空外掛值的分享連結也略過。正文裡沒有一個受支援的節點 URI 時，包括只有中繼資料的正文，honk 拒絕整個正文。標準的分享連結欄位和協定見[節點參考](./nodes.md)。
 
 ### Clash YAML 與 JSON
 
 完整設定或 provider 正文必須包含頂層 `proxies` 序列。缺少受支援的 `type`、伺服器位址、有效非零埠或必需憑據的條目，honk 會略過。埠可以是整數，也可以是數字字串。JSON 用原生解碼，支援顯示名稱裡的 UTF-16 代理對跳脫。
 
-可接受的 `type` 有 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity` 和 `anytls`。無關的客戶端中繼資料，honk 會忽略；不支援的傳輸方式、代理外掛，以及相互矛盾的安全設定，也不會被悄悄替換。
+可接受的 `type` 有 `socks5`、`ss`/`shadowsocks`、`trojan`、`vmess`、`vless`、`hysteria2`/`hysteria`、`tuic`、`juicity` 和 `anytls`。無關的用戶端中繼資料，honk 會忽略；不支援的傳輸方式、代理外掛，以及相互矛盾的安全設定，也不會被悄悄替換。
 
 #### 通用代理欄位
 
@@ -278,27 +278,27 @@ vless://00000000-0000-4000-8000-000000000000@example.com:443?security=tls#edge
 | `tls` | `tls` | 可選 bool。Trojan、AnyTLS、Hysteria2、TUIC 和 Juicity 預設啟用 TLS，明確關閉會被拒絕。 |
 | `servername`、`server-name`、`sni` | `sni` | 空值或純空白名稱視為未指定；非空別名必須逐位元組一致。 |
 | `skip-cert-verify`、`skip_cert_verify`、`insecure` | `skip_cert_verify` | 須使用原生布林值；已提供的別名必須一致。 |
-| `fingerprint`、`pin-sha256`、`pin_sha256` | `tls_pin_sha256` | 葉憑證 SHA-256 固定值，十六進位，忽略冒號和空白；它取代 PKI 與主機名稱驗證。所有 TLS 協議都會匯入 Clash 的 `fingerprint`，不帶 TLS 的協議則略過該條目。已提供的別名必須一致。 |
-| `alpn` | `tls_alpn` | raw TCP TLS 的有序字串清單或逗號分隔字串；XHTTP 只接受 H2，省略時正規化為 `["h2"]`。QUIC 保留下文的協議專屬規則。 |
+| `fingerprint`、`pin-sha256`、`pin_sha256` | `tls_pin_sha256` | 葉憑證 SHA-256 固定值，十六進位，忽略冒號和空白；它取代 PKI 與主機名稱驗證。所有 TLS 協定都會匯入 Clash 的 `fingerprint`，不帶 TLS 的協定則略過該條目。已提供的別名必須一致。 |
+| `alpn` | `tls_alpn` | raw TCP TLS 的有序字串清單或逗號分隔字串；XHTTP 只接受 H2，省略時正規化為 `["h2"]`。QUIC 保留下文的協定專屬規則。 |
 | `disable-sni`, `disable_sni` | — | `true` 時略過該條目；`false` 可以接受。 |
 
-#### 協議專屬選項
+#### 協定專屬選項
 
 支援的拼寫別名會在派生節點身分前正規化。
 
-| 協議 | 匯入的選項 |
+| 協定 | 匯入的選項 |
 | --- | --- |
-| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 與 `obfs-password`。支援上傳/下載頻寬、`ports`/`mport` 跳躍埠範圍、`hop-interval`/`mhop`、接收視窗、MTU 與 MTU 發現設定。 |
+| Hysteria2 | `password`/`auth`，以及 `obfs: salamander` 與 `obfs-password`。支援上傳/下載頻寬、`ports`/`mport` 跳躍埠範圍、`hop-interval`/`mhop`、接收視窗、MTU 與 MTU 探索設定。 |
 | TUIC | UUID/密碼、擁塞控制、ALPN、接收視窗、MTU。 |
 | AnyTLS | `idle-session-check-interval`、`idle-session-timeout`、`min-idle-session`。 |
 
-明確關閉的 feature block 按停用處理，honk 不會把它當成已啟用的不支援的 feature。原生支援 UDP 的協議接受 `udp: true`；VMess 沒有 UDP 路徑，honk 忽略這個宣告，節點仍按 TCP 匯入。節點模型保留不了明確 UDP 限制時，honk 拒絕匯入。
+明確關閉的 feature block 按停用處理，honk 不會把它當成已啟用的不支援的 feature。原生支援 UDP 的協定接受 `udp: true`；VMess 沒有 UDP 路徑，honk 忽略這個宣告，節點仍按 TCP 匯入。節點模型保留不了明確 UDP 限制時，honk 拒絕匯入。
 
 TUIC 允許省略密碼或使用空密碼。Hysteria2 和 Juicity 接受與執行時固定選擇一致的 `h3` ALPN。
 
 Juicity 的流接收視窗和連線接收視窗初始都是 8 MiB，自適應流控可以分別把它們調高到最多 32 MiB。匯入時的初始視窗欄位接受缺失、`0` 或 `8388608`，其他覆寫值拒絕。
 
-AnyTLS 按 `anytls-network`、適用的 `network`、`udp` 的順序，一次性解析封包 capability 宣告。空文字或 null 不提供網路宣告。網路字串用逗號分隔 `tcp` 和 `udp`。別名按是否允許 UDP 比較，所以 `udp` 與 `tcp,udp` 一致，`tcp` 與 `udp: true` 衝突。即使已有有效別名，`quic` 這類未知值仍會讓條目被拒絕。等價的宣告保留第一個明確網路欄位的寫法；只給布林值時，才產生 `tcp` 或 `tcp,udp`。
+AnyTLS 按 `anytls-network`、適用的 `network`、`udp` 的順序，一次性解析封包 capability 宣告。空字串或 null 不提供網路宣告。網路字串用逗號分隔 `tcp` 和 `udp`。別名按是否允許 UDP 比較，所以 `udp` 與 `tcp,udp` 一致，`tcp` 與 `udp: true` 衝突。即使已有有效別名，`quic` 這類未知值仍會讓條目被拒絕。等價的宣告保留第一個明確網路欄位的寫法；只給布林值時，才產生 `tcp` 或 `tcp,udp`。
 
 以下 TCP TLS ALPN 規則適用於結構化訂閱匯入和扁平欄位 `tls_alpn`。分享連結的 ALPN 相容行為不變。
 
@@ -335,7 +335,7 @@ VLESS 欄位會在派生節點身分前應用：
 | `uuid`, then `password` | 憑據；`uuid` 優先，`password` 作為回退。 |
 | `encryption`, then `cipher` | VLESS Encryption；`encryption` 優先。 |
 | `flow` | 空值或純空白視為未指定；否則必須為 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。 |
-| `network` | 流傳輸；封包權限仍由獨立的 `udp` 宣告控制。 |
+| `network` | 流傳輸；packet permission 仍由獨立的 `udp` 宣告控制。 |
 | `reality-opts.public-key` | 啟用 REALITY TLS carrier；必須是非空 string。 |
 | `reality-opts.short-id` | 可選 REALITY short ID。 |
 | `reality-opts.spider-x` | REALITY spider path；缺失或為空時使用 `/`。 |
@@ -351,7 +351,7 @@ VLESS 欄位會在派生節點身分前應用：
 
 匯入的預設值取決於來源格式，而且並不都等於 honk 標準的 `packetEncoding=auto` 預設值。
 
-| Clash 表示 | Packet 回退 | Multiplex | UDP 權限 |
+| Clash 表示 | Packet 回退 | Multiplex | UDP permission |
 | --- | --- | --- | --- |
 | 沒有封包宣告且沒有啟用的封裝 | `auto` | off | 關閉 |
 | 只有空/null 封包編碼 | `auto` | off | 關閉 |
@@ -372,7 +372,7 @@ VLESS 欄位會在派生節點身分前應用：
 | 零 | 每條 TCP carrier 允許同時承載 8 個邏輯 child。 | 共用已啟用的 TCP 池和它的逐連線並行值。TCP 多路複用關閉時，走封包回退路徑。 |
 | 正值 | 設定每條 carrier 的邏輯 child 並行上限，最多 128。 | 建立獨立 UDP 池，按該值設定每條 carrier 的邏輯 child 並行上限，最多 128。 |
 
-並行值不表示物理 carrier 數量。UDP/443 策略預設是 `allow`，也接受 `skip` 或 `reject`。優先順序見[節點參考](./nodes.md#vless-udp-and-multiplexing)。
+並行值不表示實體 carrier 數量。UDP/443 策略預設是 `allow`，也接受 `skip` 或 `reject`。優先順序見[節點參考](./nodes.md#vless-udp-and-multiplexing)。
 
 `udp: false` 單獨關閉封包撥號，仍然符合條件的裸 TCP 路徑不受影響。遇到下面這些情況，honk 也會拒絕該 VLESS Clash 條目：別名衝突、重複的 XUDP 表示、啟用的 packet-address 模式、不支援的封包編碼、不支援的 UoT version，以及啟用的 Xray mux 裡無效或不支援的設定。
 
@@ -387,7 +387,7 @@ sing-box 設定從 `outbounds` 匯入受支援的條目：
 - 代理節點：Shadowsocks、SOCKS5、VMess、VLESS、Trojan、Hysteria2、TUIC、Juicity、AnyTLS。
 - 結構性條目，不屬於代理節點：`selector`、`urltest`、`direct`、`block`、`dns`。
 
-TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及受支援的協議調優，都會經過共用的節點建構器正規化。`Host` 以外的升級 header 同樣包括在內。
+TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及受支援的協定調優，都會經過共用的節點建構器正規化。`Host` 以外的升級 header 同樣包括在內。
 
 沒設定 `tls` 或 `tls.enabled` 時，sing-box 的 TLS 處於關閉狀態，所以沒有 `tls.enabled: true` 的 Trojan、Hysteria2、TUIC、Juicity 和 AnyTLS 條目，honk 會略過。
 
@@ -415,19 +415,19 @@ TLS/SNI、REALITY、WebSocket/gRPC 升級 header、VLESS 封包選項，以及�
 
 明確憑據和加密方法別名在轉換前必須一致。具名記錄只有在對應的具名值缺失時，才使用位置參數；有效的明確值不會因為位置參數不同而衝突。Quantumult X 不用位置參數回退。明確空憑據也參與別名比較，不會觸發回退。
 
-允許為空的可選記錄憑據會逐位元組保留空字串和帶引號的空白，包括 SOCKS 使用者名稱和密碼、Hysteria2 認證值、TUIC 密碼。明確空值仍優先於位置參數；要求非空憑據的協議仍然拒絕空值。
+允許為空的可選記錄憑據會逐位元組保留空字串和帶引號的空白，包括 SOCKS 使用者名稱和密碼、Hysteria2 認證值、TUIC 密碼。明確空值仍優先於位置參數；要求非空憑據的協定仍然拒絕空值。
 
-honk 在賦值前比較記錄裡的 `transport`/`network` 流傳輸宣告；重複 key 也比。空文字和 `tcp` 都表示裸 TCP。宣告衝突或含不支援的傳輸方式時，honk 拒絕該條目。
+honk 在賦值前比較記錄裡的 `transport`/`network` 流傳輸宣告；重複 key 也比。空字串和 `tcp` 都表示裸 TCP。宣告衝突或含不支援的傳輸方式時，honk 拒絕該條目。
 
 AnyTLS 記錄裡的 `network` 表示封包 capability，不是流傳輸方式。honk 在選擇前驗證所有重複的 `network`、`udp` 和 `udp-relay` 值。等價宣告保留第一個明確網路值的寫法；只要有一個值無效或衝突，honk 就拒絕該記錄。
 
-VLESS 記錄的 `packet-encoding`/`packet_encoding`/`packetencoding` 值為 `none` 或空時，選擇原生 UDP；值為 `xudp` 時選擇 Single XUDP。重複別名的值必須一致，明確空賦值也算。`udp`/`udp-relay` 單獨控制封包權限。既沒有封包編碼也沒有 `udp: true` 時，記錄保持 UDP 關閉；只有 `udp: true` 時選擇 Single XUDP。記錄格式裡有效的 `mux` 和 UoT 宣告仍不受支援，honk 不會重新解釋它們。
+VLESS 記錄的 `packet-encoding`/`packet_encoding`/`packetencoding` 值為 `none` 或空時，選擇原生 UDP；值為 `xudp` 時選擇 Single XUDP。重複別名的值必須一致，明確空賦值也算。`udp`/`udp-relay` 單獨控制 packet permission。既沒有封包編碼也沒有 `udp: true` 時，記錄保持 UDP 關閉；只有 `udp: true` 時選擇 Single XUDP。記錄格式裡有效的 `mux` 和 UoT 宣告仍不受支援，honk 不會重新解釋它們。
 
-受支援的記錄把憑據、TLS/SNI、WebSocket/gRPC、REALITY 和已實作的協議選項對映到同一個節點模型。Quantumult X 的 `obfs=wss` 會把 `obfs-host` 同時用作 WebSocket Host 和預設 TLS SNI；明確 TLS 主機名優先。SSR、不支援的外掛、混淆和傳輸方式，honk 直接略過，不會當成別的協議匯入。
+受支援的記錄把憑據、TLS/SNI、WebSocket/gRPC、REALITY 和已實作的協定選項對映到同一個節點模型。Quantumult X 的 `obfs=wss` 會把 `obfs-host` 同時用作 WebSocket Host 和預設 TLS SNI；明確 TLS 主機名優先。SSR、不支援的外掛、混淆和傳輸方式，honk 直接略過，不會當成別的協定匯入。
 
-Surge 的 `server-cert-fingerprint-sha256` 對映到 honk 的葉憑證 pin，兩者都替代標準 X.509 驗證。`server-cert-verify-name`、客戶端憑證、`sni=off` 和 Shadow TLS 在 honk 裡表達不出來，honk 會拒絕，不會直接忽略，見 [Surge TLS 參考](https://manual.nssurge.com/policies/tls.html)。
+Surge 的 `server-cert-fingerprint-sha256` 對映到 honk 的葉憑證 pin，兩者都替代標準 X.509 驗證。`server-cert-verify-name`、用戶端憑證、`sni=off` 和 Shadow TLS 在 honk 裡表達不出來，honk 會拒絕，不會直接忽略，見 [Surge TLS 參考](https://manual.nssurge.com/policies/tls.html)。
 
-honk 在賦值前比較記錄裡的 `skip-cert-verify`、`allow-insecure`、`insecure`，以及取反後的 `tls-verification`。`tls-verification=false,insecure=true` 算一致；`tls-verification=true,insecure=true` 時，honk 拒絕該條目。記錄文字只接受不區分大小寫的 `true/yes/1/on` 和 `false/no/0/off`；空文字和 `t/y/f/n` 仍是無效值。憑證固定規則的限制不變。
+honk 在賦值前比較記錄裡的 `skip-cert-verify`、`allow-insecure`、`insecure`，以及取反後的 `tls-verification`。`tls-verification=false,insecure=true` 算一致；`tls-verification=true,insecure=true` 時，honk 拒絕該條目。記錄文字只接受不區分大小寫的 `true/yes/1/on` 和 `false/no/0/off`；空字串和 `t/y/f/n` 仍是無效值。憑證固定規則的限制不變。
 
 Quantumult X 裡有效的 `tls-cert-sha256` / `tls-pubkey-sha256` 固定憑證設定，honk 會拒絕：honk 的葉憑證 pin 替代 PKI，不能替換一個尚未確認等價的外部驗證約定。明確設定 `tls-verification=false` 時，QX 會忽略這兩類 pin，匯入後保留這種停用驗證的行為。有效的 QX REALITY 會按[官方設定](https://github.com/crossutility/Quantumult-X/blob/master/sample.conf)忽略自訂的 `tls-alpn` 和 session-ticket 設定；普通 TLS 沒有這個例外。舊 VMess `aead=false`、啟用的 Shadowsocks UoT/SSR、不支援的 TLS ALPN，以及停用 TLS session 重用，honk 都會拒絕，不會直接忽略。
 

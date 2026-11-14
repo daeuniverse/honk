@@ -42,7 +42,7 @@ honk 使用 dae 設定語法的一個方言。同一段文字在兩者中解析�
 | 訂閱區塊：`paid: {` 之後各佔一行的 `url: …`、`ua: …`、`interval: …` 與 `}` | `ID ':' '{'` 不是宣告 | honk 擴充：訂閱也可以寫成區塊，設定和其他區塊一樣每行一條。 | [dialect-entries-04-block](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-04-block.dae) |
 | 帶引號的訂閱連結後接區塊：`paid: 'url' {` 之後各佔一行的 `ua: …`、`interval: …`、`cache: …` 或 `route: …` 與 `}` | `ID ':' literal` 已結束宣告 | honk 擴充：條目選項，未設定的項取自 `assets.subscription` 和 `assets.route`。`route` 取代舊區塊形式裡的 `download_detour`；兩者同時設定會回報 `conflicting-subscription-route`。 | |
 | `node` 裡冒號前帶空格的裸標籤，`edge : 'socks5://…'` | 標籤為 `edge` | 冒號兩側的空白會被正規化：節點保留下來，標籤為 `edge`，並產生 `entry-tag-normalized` 資訊等級診斷。`edge: …` 和帶引號的標籤也仍然接受。 | [dialect-entries-05-spaced-tag](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-05-spaced-tag.dae) |
-| VLESS 分享連結或扁平序列化 VLESS 節點中的 `vless_mode` | 舊 VLESS mode 選擇器 | 已移除，不接受為別名。分享連結要改用獨立的 `udp=`、`packetEncoding=` 和 `mux=` query 引數。扁平 VLESS 節點拒絕任何形式的 `vless_mode`，包括 `null`，請改用 `network`、`packet_encoding` 和 `multiplex`。 | |
+| VLESS 分享連結或扁平序列化 VLESS 節點中的 `vless_mode` | 舊 VLESS mode 選擇器 | 已移除，不接受為別名。分享連結要改用獨立的 `udp=`、`packetEncoding=` 和 `mux=` 查詢參數。扁平 VLESS 節點拒絕任何形式的 `vless_mode`，包括 `null`，請改用 `network`、`packet_encoding` 和 `multiplex`。 | |
 | 扁平序列化非 VLESS 節點上的 `vless_mode: legacy` | VLESS 之外的舊欄位 | 這只是序列化配接器讀寫用的相容佔位欄位，不影響行為。它是非 VLESS 序列化中唯一的例外，不屬於文件支援的 dae 語法或分享連結語法。 | |
 
 ## 路由
@@ -55,7 +55,7 @@ honk 使用 dae 設定語法的一個方言。同一段文字在兩者中解析�
 | 括號前有空格，`dport (443) -> proxy` | 接受 | 回報帶位置的 `unknown-traffic-predicate` 錯誤。刪掉 matcher 名稱和左括號之間的空格。 | [dialect-routing-04-spaced-call](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-04-spaced-call.dae) |
 | 合取裡的未知 matcher，`dport(443) && domian(x) -> direct` | 文法接受，驗證在文法之外 | 回報帶位置的 `unknown-traffic-predicate` 錯誤，否定的條件也一樣。請改正 matcher；honk 不再無提示地丟棄單一條件。 | [dialect-routing-05-unknown](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-05-unknown.dae), [dialect-routing-05-negated](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-05-negated.dae) |
 | 含多個冒號的引數，`dip(2001:db8::/32)`、`mac(00:11:22:33:44:55)` | 不是字面值，需要加引號 | 引數整體保留，只有可識別的 `prefix:` 才在冒號處分割，例如 `geosite:`、`geoip:`、`domain:`、`suffix:`、`keyword:`、`regex:` 和 `full:`。 | [dialect-routing-06-ipv6](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-06-ipv6.dae), [dialect-routing-06-mac](../../../crates/honk-config/conformance/cases/dialect/dialect-routing-06-mac.dae) |
-| `direct(mark: 10)` / `direct(mark: 0x10)` / `direct(mark: 010)` | 函式引數；dae 型別解碼使用 Go 的 base-0 `ParseUint`，結果為 10 / 16 / 8 | honk 只接受十進位或明確的 `0x`/`0X` 十六進位，結果分別是 10、16、10。二進位和八進位字首、底線、正負號、溢位，以及設定保留位元 `0xc0000000` 的值都會被拒絕。這一點刻意不同於 dae 的 base-0 解碼，也不同於上文 honk 全域 mark 的十六進位優先規則。 | [直連 mark 測試](../../../crates/honk-config/tests/parser_syntax.rs) |
+| `direct(mark: 10)` / `direct(mark: 0x10)` / `direct(mark: 010)` | 函式引數；dae 型別解碼使用 Go 的 base-0 `ParseUint`，結果為 10 / 16 / 8 | honk 只接受十進位或明確的 `0x`/`0X` 十六進位，結果分別是 10、16、10。二進位和八進位字首、底線、正負號、溢位，以及把保留位元 `0xc0000000` 設為 1 的值都會被拒絕。這一點刻意不同於 dae 的 base-0 解碼，也不同於上文 honk 全域 mark 的十六進位優先規則。 | [直連 mark 測試](../../../crates/honk-config/tests/parser_syntax.rs) |
 | `direct(mark: 512, must)` / `direct(must, mark: 512)` 及帶 mark 的 `fallback:` | 選項順序不限 | 直連規則和 fallback 都接受兩種順序，中間的空格也隨意。未知或重複的直連選項會安全地回報錯誤，mark 只有 direct 支援。合併後最終 fallback 的完整動作，包括 mark 和 `must`，在全部一般規則之後生效。 | [解析測試](../../../crates/honk-config/tests/parser_syntax.rs), [include 測試](../../../crates/honk-config/tests/include.rs) |
 
 上游 mark 型別與選項行為的定義見

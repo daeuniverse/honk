@@ -1,6 +1,6 @@
 # 全域設定參考
 
-`global { ... }` 定義程序級設定。
+`global { ... }` 定義行程級設定。
 
 ## 範例
 
@@ -46,11 +46,11 @@ Key 欄以破折號開頭的五列，是 dae 語法無法設定的內部欄位�
 | `tproxy_port` | `tproxy_port` | `12345` | TCP/UDP 透明代理連接埠；見 [`tproxy_port`](#tproxy_port)。 |
 | `tproxy_port_protect` | `tproxy_port_protect` | `true` | 用於避免透明代理連接埠被再次攔截的相容開關；目前的 honk 不讀取它。 |
 | `pprof_port` | `pprof_port` | `0` | pprof HTTP 連接埠相容欄位；見 [`pprof_port`](#pprof_port)。 |
-| `so_mark_from_dae` | `so_mark_from_dae` | `0`（實際 `0x100`） | honk 主動建立的 socket 使用的程序級 `SO_MARK`，資料路徑也用它做精確的旁路比對；見 [socket mark](#socket-mark)。 |
+| `so_mark_from_dae` | `so_mark_from_dae` | `0`（實際 `0x100`） | honk 主動建立的 socket 使用的行程級 `SO_MARK`，資料路徑也用它做精確的旁路比對；見 [socket mark](#socket-mark)。 |
 | `log_level` | `log_level` | `"info"` | 啟動日誌過濾器，語法同 `RUST_LOG`；見 [`log_level`](#log_level)。 |
 | `log_file` | `log_file` | `""` | 以附加方式寫入的日誌路徑；見 [`log_file`](#log_file)。 |
 | `syslog_addr` | `syslog_addr` | `""` | TCP syslog 接收端；見 [`syslog_addr`](#syslog_addr)。 |
-| `syslog_dns_enabled` | `syslog_dns_enabled` | `false` | 透過 RFC 5424 syslog 傳送客戶端 DNS 稽核；見 [`syslog_dns_enabled`](#syslog_dns_enabled)。 |
+| `syslog_dns_enabled` | `syslog_dns_enabled` | `false` | 透過 RFC 5424 syslog 傳送用戶端 DNS 稽核；見 [`syslog_dns_enabled`](#syslog_dns_enabled)。 |
 | `syslog_cee_enabled` | `syslog_cee_enabled` | `false` | 為 JSON 正文加上 `@cee: ` 字首，供支援 CEE 的接收端使用；見 [`syslog_cee_enabled`](#syslog_cee_enabled)。 |
 | `syslog_hostname` | `syslog_hostname` | `""` | RFC 5424 header 中的傳送端主機名稱；見 [`syslog_hostname`](#syslog_hostname)。 |
 | `syslog_app_name` | `syslog_app_name` | `"honk"` | RFC 5424 header 中的應用程式名稱：1–48 位元組、不含空格的可列印 ASCII。 |
@@ -70,7 +70,7 @@ Key 欄以破折號開頭的五列，是 dae 語法無法設定的內部欄位�
 | `dial_mode` | `dial_mode` | `"domain"` | 目的網域探索和路由模式；見 [`dial_mode`](#dial_mode)。 |
 | `allow_insecure` | `allow_insecure` | `false` | 全域 TLS 驗證備援的相容欄位；見 [`allow_insecure`](#allow_insecure)。 |
 | `sniffing_timeout` | `sniffing_timeout_ms` | `30ms` | 嗅探逾時的相容欄位；見 [`sniffing_timeout`](#sniffing_timeout)。 |
-| `tls_implementation` | `tls_implementation` | `"tls"` | 寫 `utls`（不區分大小寫）會啟用 honk 的 Chrome 風格 ClientHello 模擬，不保證精確的瀏覽器身分。其他任何值，包括空值和拼寫錯誤，都會選擇一般 BoringSSL 客戶端設定，不報錯也不產生 warning。 |
+| `tls_implementation` | `tls_implementation` | `"tls"` | 寫 `utls`（不區分大小寫）會啟用 honk 的 Chrome 風格 ClientHello 模擬，不保證精確的瀏覽器身分。其他任何值，包括空值和拼寫錯誤，都會選擇一般 BoringSSL 用戶端設定，不報錯也不產生 warning。 |
 | `utls_imitate` | `utls_imitate` | `"chrome_auto"` | 相容指紋請求；見 [`utls_imitate`](#utls_imitate)。 |
 | `tls_fragment` | `tls_fragment` | `false` | TLS ClientHello 分片相容開關；目前的 TLS connector 不讀取它。 |
 | `tls_fragment_length` | `tls_fragment_length` | `""` | 分片長度範圍的相容欄位；目前的 TLS connector 不讀取它。 |
@@ -129,7 +129,7 @@ TCP syslog 接收端：數字 IP 加連接埠，例如 `192.0.2.10:514` 或 `[20
 
 ### syslog_dns_enabled
 
-需要 `dns-syslog` Cargo feature。啟用後，honk 傳送客戶端 DNS 結果：訊息依 RFC 5424 固定，正文為 JSON，經一條 TCP 長連線傳輸，並以 RFC 6587 的長度字首劃分訊框。
+需要 `dns-syslog` Cargo feature。啟用後，honk 傳送用戶端 DNS 結果：訊息依 RFC 5424 固定，正文為 JSON，經一條 TCP 長連線傳輸，並以 RFC 6587 的長度字首劃分訊框。
 
 稽核獨立於原生 API 歷史記錄和日誌等級。傳送分批進行且有上限，重連會退避；沒有應用層確認，也不會寫入磁碟。
 
@@ -163,13 +163,13 @@ TCP syslog 接收端：數字 IP 加連接埠，例如 `192.0.2.10:514` 或 `[20
 
 把有歧義的 LAN 轉發 UDP 原始封包留在 NFQUEUE，直到使用者空間做出最終決策。此功能需要真實 eBPF 後端。
 
-單一執行個體交接後，固定佇列不可用，或資料路徑 admission 之前佇列、規則、健康檢查失敗時，honk 會記一條 warning，並在本程序內關閉該功能，不改寫設定。安裝階段會回收保留的 nftables table。
+單一執行個體交接後，固定佇列不可用，或資料路徑 admission 之前佇列、規則、健康檢查失敗時，honk 會記一條 warning，並在本行程內關閉該功能，不改寫設定。安裝階段會回收保留的 nftables table。
 
 持久化 token generation 恢復失敗，以及 [admission 後的失敗](../design/nfqueue.md#啟用與範圍)，仍然是 fatal。
 
 `experimental.udp_nfqueue.enabled` 已棄用，改用 `nfqueue_enable`。舊寫法仍被接受，並產生遷移 warning；兩者同時存在時以 `nfqueue_enable` 為準。
 
-只有確實發生過降級時，寫入和 reload 才能繼續請求 `nfqueue_enable: true`，而 NFQUEUE 的生效值保持關閉。省略該 key、採用預設值 `true`，也算這種請求。降級分兩種：啟動早期的降級（mock、不帶 `ebpf` feature，或固定佇列的前置檢查失敗），以及資料路徑 admission 之前較晚發生的佇列、規則或健康檢查降級。請求的來源文字保持原樣，生效值在本程序的整個生命週期內都是 `false`。honk 不會自動重試啟用，只有重啟才會重試。沒有發生降級時，開關的變更仍需重啟。[通用 reload 流程](../design/control-plane.md#reload-與執行時-generation) 會在指紋/no-op 檢查之前正規化生效設定；原生 API 的寫入前檢查與完整驗證使用同一套重啟策略。
+只有確實發生過降級時，寫入和 reload 才能繼續請求 `nfqueue_enable: true`，而 NFQUEUE 的生效值保持關閉。省略該 key、採用預設值 `true`，也算這種請求。降級分兩種：啟動早期的降級（mock、不帶 `ebpf` feature，或固定佇列的前置檢查失敗），以及資料路徑 admission 之前較晚發生的佇列、規則或健康檢查降級。請求的來源文字保持原樣，生效值在本行程的整個生命週期內都是 `false`。honk 不會自動重試啟用，只有重啟才會重試。沒有發生降級時，開關的變更仍需重啟。[通用 reload 流程](../design/control-plane.md#reload-與執行時-generation) 會在指紋/no-op 檢查之前正規化生效設定；原生 API 的寫入前檢查與完整驗證使用同一套重啟策略。
 
 `nfqueue_enable` 同時控制 [LAN UDP/53 分片交付](../design/nfqueue.md#lan-dns-分片)：DNS 控制器和 raw group 處理的分片都要求 NFQUEUE 處於 ready，否則直接丟棄，不能繞過 DNS 策略。原生 `direct(must)` 和未分片的 DNS 不變。
 
@@ -269,7 +269,7 @@ bootstrap 為空或查詢失敗時，honk 先查 `/etc/hosts`，再向 `/etc/res
 
 去掉 scheme 後的同一位址，還會用作週期性 `direct` 健康檢查的目標；無效時退回 `223.5.5.5:53`。
 
-DNS [`subtag()` 規則](./dns.md#節點伺服器域名)可以改為接管某個訂閱的節點主機名稱。
+DNS [`subtag()` 規則](./dns.md#節點伺服器網域)可以改為接管某個訂閱的節點主機名稱。
 
 ```dae
 global {
@@ -295,7 +295,7 @@ global {
 
 請求每個 generation 的實體代理連線和協定握手上限。執行期資源預算可能進一步收緊。
 
-實際值至少為一，最多為 `1024`；更大的設定值會被接受，但會收緊到上限。重疊的 reload generation 還會共用一個由檔案描述元推匯出的上限。
+實際值至少為一，最多為 `1024`；更大的設定值會被接受，但會收緊到上限。重疊的 reload generation 還會共用一個由檔案描述元推導出的上限。
 
 Ready pool 命中、已熱 transport 上的邏輯流以及 `direct`/`block` 不佔 permit。
 
@@ -327,13 +327,13 @@ HTTP 探測會把 `200–499` 的任何最終狀態碼視為成功，因此重�
 
 ## socket mark
 
-`so_mark_from_dae: 0` 或省略該項時，保留歷史上的實際 mark `0x100`。非零值會取代 `0x100`，不會和它按位元 OR。honk 會在 connect/send 之前原樣套用這個 mark，作用於代理 carrier、bootstrap/DNS、健康檢查、訂閱和 UI 下載。資料路徑依設定值做精確的旁路比對；只帶有 `0x100` 這一個位元並不能免於攔截。透明 listener socket 使用同一個 mark 供核心辨識；accept 得到的 TCP 客戶端 socket 會清除這個 mark。獨立的 `dns.bind` 入口仍是普通的無 mark 本機服務。
+`so_mark_from_dae: 0` 或省略該項時，保留歷史上的實際 mark `0x100`。非零值會取代 `0x100`，不會和它按位元 OR。honk 會在 connect/send 之前原樣套用這個 mark，作用於代理 carrier、bootstrap/DNS、健康檢查、訂閱和 UI 下載。資料路徑依設定值做精確的旁路比對；只帶有 `0x100` 這一個位元並不能免於攔截。透明 listener socket 使用同一個 mark 供核心辨識；accept 得到的 TCP 用戶端 socket 會清除這個 mark。獨立的 `dns.bind` 入口仍是普通的無 mark 本機服務。
 
 dae 全域純量沿用 honk 既有的十六進位優先規則：`10` 和 `0x10` 都表示 16。格式錯誤或溢位的文字會產生診斷，並退回原始值 `0`，實際生效的是 `0x100`，建議明確寫出 `0x`。這與[直連規則 mark](./routing.md#策略路由-mark) 不同：後者沒有字首時按十進位解析，錯誤值直接拒絕設定。
 
 全域與規則 mark 的驗證都會拒絕保留位 `0xc0000000`；全域 mark 還會拒絕 TPROXY 位 `0x08000000`，daens 會把該位路由到自己的 listener，因此全域 mark 保留的是 `0xc8000000`。
 
-這個值在啟動網路 I/O 之前確定，作用於整個程序；修改需要重啟，不能透過 SIGHUP 切換。非零的直連規則 mark 會取代該直連流的全域策略路由有效位，代理 carrier 和 bootstrap 仍使用全域值。直連流還會攜帶內部分類中繼資料；請使用 [路由參考](./routing.md#策略路由-mark) 中帶遮罩的 IPv4/IPv6 `ip rule` 範例。honk 不負責安裝使用者的 WAN 策略路由表、路由、來源位址規則或 NAT 設定。
+這個值在啟動網路 I/O 之前確定，作用於整個行程；修改需要重啟，不能透過 SIGHUP 切換。非零的直連規則 mark 會取代該直連流的全域策略路由有效位，代理 carrier 和 bootstrap 仍使用全域值。直連流還會攜帶內部分類中繼資料；請使用 [路由參考](./routing.md#策略路由-mark) 中帶遮罩的 IPv4/IPv6 `ip rule` 範例。honk 不負責安裝使用者的 WAN 策略路由表、路由、來源位址規則或 NAT 設定。
 
 ## reload 健康檢查與 TLS 模式
 
@@ -349,13 +349,13 @@ dae 設定中的 `check_tolerance` 仍可透過 reload 更新 URLTest 群組的�
 
 Score 群組還會對第一個 `tcp_check_url` 發起 QUIC 握手探測。該 URL 必須以小寫 `https://` 開頭，否則此探測會關閉，Score 只使用其他探測，並由 `quic_probe` 降級項報告。QUIC 目標只在啟動時建立，因此 reload 新增第一個 Score 群組時，會報告原因 `restart_required`，直到下次重啟。
 
-UDP DNS 目標在啟動時按健康檢查逾時嘗試初始化。本機拒絕或初始化逾時會讓設定目標保持待定，留給後續健康檢查週期重試；honk 不會替換預設目標，也不會降低節點健康狀態，獨立的 QUIC 檢查仍可繼續。首次成功解析出的位址隨後保持固定。延後的解析和 DNS 交換共用同一次探測的絕對期限；一般解析失敗仍保留既有的預裝置援。
+UDP DNS 目標在啟動時按健康檢查逾時嘗試初始化。本機拒絕或初始化逾時會讓設定目標保持待定，留給後續健康檢查週期重試；honk 不會替換預設目標，也不會降低節點健康狀態，獨立的 QUIC 檢查仍可繼續。首次成功解析出的位址隨後保持固定。延後的解析和 DNS 交換共用同一次探測的絕對期限；一般解析失敗仍保留既有的預設回退。
 
 ## 流量入口與攔截
 
-honk 透過所設定網卡上的 eBPF TC hook 接收流量，不提供供客戶端連線的代理連接埠。
+honk 透過所設定網卡上的 eBPF TC hook 接收流量，不提供供用戶端連線的代理連接埠。
 
-- `lan_interface` 上的 hook 會攔截 LAN 客戶端經本機轉發的流量，例如把本機設為閘道器的客戶端。
+- `lan_interface` 上的 hook 會攔截 LAN 用戶端經本機轉發的流量，例如把本機設為閘道器的用戶端。
 - `wan_interface` 上的 hook 會攔截本機發起的 TCP/UDP。
 - 需要使用者空間處理的流量由資料路徑經 `dae0` 送進 `daens` 命名空間，再由 `sk_lookup` 交給 `tproxy_port` 上的透明代理 TCP 或 UDP listener。有歧義的 LAN 轉發 UDP 則由 NFQUEUE 暫存（`nfqueue_enable`）。
 - 攔截需要真實 eBPF 後端；mock 後端不攔截任何流量。
@@ -410,20 +410,20 @@ IP6GRE 如果只有單播 remote、沒有明確的 local 位址，可能不帶 `
 
 ## 資料目錄與資源路徑
 
-`data_dir` 預設為 `/var/lib/honk`，必須是非空絕對路徑，並在程序內只設定一次。啟動時 honk 會遞迴建立目錄，再用一個私有隨機檔案做 create-new/remove 探測。候選目錄不可用時，只有通過同一探測的程序工作目錄能作為備援；兩者都不可用時，啟動失敗並報告兩項原因。使用 `--store db` 或啟用原生 API 密碼登入時，啟動過程不允許這種備援。舊根目錄是 `/var/share/honk`，也稱 `LEGACY_DATA_DIR`，用於讓既有資源繼續可用。舊快取和訂閱匯入會把符合條件的狀態複製到 `state/honk.db`。即使使用自訂的 `data_dir`，也遵循相同的備援順序。絕對的子路徑保持原樣。
+`data_dir` 預設為 `/var/lib/honk`，必須是非空絕對路徑，並在行程內只設定一次。啟動時 honk 會遞迴建立目錄，再用一個私有隨機檔案做 create-new/remove 探測。候選目錄不可用時，只有通過同一探測的行程工作目錄能作為備援；兩者都不可用時，啟動失敗並報告兩項原因。使用 `--store db` 或啟用原生 API 密碼登入時，啟動過程不允許這種備援。舊根目錄是 `/var/share/honk`，也稱 `LEGACY_DATA_DIR`，用於讓既有資源繼續可用。舊快取和訂閱匯入會把符合條件的狀態複製到 `state/honk.db`。即使使用自訂的 `data_dir`，也遵循相同的備援順序。絕對的子路徑保持原樣。
 
 `geoip.dat` 和 `geosite.dat` 嚴格使用以下順序中第一個已存在的普通檔案：
 
 1. `$DAE_LOCATION_ASSET/<name>`
 2. `<data_dir>/<name>`
 3. `/var/share/honk/<name>`，也就是 `LEGACY_DATA_DIR`
-4. 程序工作目錄中的 `./<name>`
+4. 行程工作目錄中的 `./<name>`
 5. `/usr/local/share/honk/<name>`，然後 `/usr/share/honk/<name>`
 6. `/usr/local/share/dae/<name>`、`/usr/share/dae/<name>`，然後 `/etc/dae/<name>`
 
 其他相對執行期路徑會按下表保留舊安裝。除日誌外，每次查詢會先檢查實際生效資料目錄中已有的副本，再檢查 `/var/share/honk` 中已有的副本，最後檢查各呼叫端既有的舊候選路徑。都不存在時，傳回 `data_dir` 下的路徑供建立使用；絕對路徑保持原樣。
 
-| 路徑 | 解析與舊路徑退回 |
+| 路徑 | 解析與舊路徑回退 |
 | ---- | ---------------- |
 | 節點 `ech_config_path` | 依序優先使用已存在的 `<data_dir>/<path>`、已存在的 `/var/share/honk/<path>`，以及已存在的工作目錄相對路徑。都不存在時解析為 `<data_dir>/<path>`，讓讀取錯誤指出預期位置。 |
 | `global.log_file` | 相對路徑一律透過只供建立使用的路徑 helper 解析為 `<data_dir>/<path>`，啟動時建立父目錄；它不會讀取或遷移 `/var/share/honk` 裡已有的日誌。絕對路徑保持原樣。在 Linux 上，新日誌檔案使用 mode `0600`；符號連結和非普通檔案會被拒絕，既有普通檔案的權限保持不變。honk 以附加方式寫入，檔案達到 10 MiB 時輪轉：目前檔案改名為 `<name>.1`，覆蓋舊副本，然後按相同檢查開啟新檔案，因此日誌最多佔用 20 MiB。重啟交接期間兩個執行個體共用該檔案時，只有檔案仍在原路徑上的執行個體會執行改名，另一個執行個體直接切換到新檔案，所以不會互相覆蓋輪轉副本。輪轉失敗時，例如新檔案打不開，honk 不再嘗試輪轉，繼續寫目前檔案直到 20 MiB，之後丟棄日誌行，並在 stderr 輸出一次 warning，直到重啟。主控台和檔案裡的時間戳記都是主機的本地時間，帶 UTC 偏移，例如 `2026-09-12T02:30:15.123456+10:00`。 |

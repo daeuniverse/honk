@@ -10,7 +10,7 @@ endpoint 連續 120 s 沒有回覆就退役。成功傳送和 carrier keepalive 
 
 核心狀態另有獨立的 [UDP 閒置續期規則](../design/datapath.md#udp-生存期續期)。核心條目還沒過期，不會阻止使用者態的回覆閒置計時到期；使用者態也不會替靜默的核心條目續期。核心狀態被回收時，所屬 endpoint 一併退役，之後的封包需要新建 endpoint。transport keepalive 不會設定外部 NAT/conntrack 狀態。
 
-honk 在達到下列任一上限時丟棄新對映：整個行程 32,768 個 endpoint，兩個位址族合計；啟動時的描述符預算；記憶體預算，即 `MemTotal` 的四分之一，每個 endpoint 按 64 KiB 計，2 GiB 時為 8,192。honk 不淘汰已有對映，也不排隊保留被拒絕的 datagram；NFQUEUE 裡的原始封包同樣丟棄。被拒絕的次數見需驗證的 Clash `GET /stats` 中的 `udp.capacity.rejected`。只有描述符是較小的那個限制時，提高服務的 `RLIMIT_NOFILE` 才有效。[慢路徑/佇列預算](../design/control-plane.md#queue-與描述符預算)可能更早拒絕工作。
+honk 在達到下列任一上限時丟棄新對映：整個行程 32,768 個 endpoint，兩個位址族合計；啟動時的描述符預算；記憶體預算，即 `MemTotal` 的四分之一，每個 endpoint 按 64 KiB 計，2 GiB 時為 8,192。honk 不淘汰已有對映，也不排隊保留被拒絕的 datagram；NFQUEUE 裡的原始封包同樣丟棄。被拒絕的次數見需通過認證的 Clash `GET /stats` 中的 `udp.capacity.rejected`。只有描述符是較小的那個限制時，提高服務的 `RLIMIT_NOFILE` 才有效。[慢路徑/佇列預算](../design/control-plane.md#queue-與描述符預算)可能更早拒絕工作。
 
 ## TCP：閒置不是中繼期限
 
