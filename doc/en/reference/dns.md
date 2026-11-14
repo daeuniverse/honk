@@ -18,9 +18,9 @@
 | `max_cache_size` | `10000` | Maximum cache entries, at most 100,000; also determines the per-shard byte budget below. |
 | `fixed_domain_ttl { ... }` | empty | Per-domain positive and NODATA TTL overrides; `0` disables caching for every response code, including negatives. |
 
-Scalar values own the remainder of their physical line and split only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` remain intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line; malformed quotes fail the configuration.
+A scalar value extends to the end of its physical line and splits only at the key colon, so bare IPv6 endpoints and `client_subnet: auto(9.9.9.9)` stay intact. Exactly one matched enclosing quote pair is removed. An opened scalar quote must close on the same line. Malformed quotes fail the configuration.
 
-For scalar settings, only an unquoted token-head `#` starts a comment. `use_host: /tmp/a#b` selects the literal path `/tmp/a#b` with `legacy-glued-hash`; write `use_host: /tmp/a # comment` for a comment. Repeated `use_host` declarations retain source order and existing deduplication. For `optimistic_cache`, shorthands `t`, `y`, `f`, and `n` still mean false, but emit `legacy-bool-shorthand`; use `true` or `false`.
+For scalar settings, only an unquoted token-head `#` starts a comment. `use_host: /tmp/a#b` selects the literal path `/tmp/a#b` with `legacy-glued-hash`; write `use_host: /tmp/a # comment` for a comment. Repeated `use_host` declarations retain source order and existing deduplication. For `optimistic_cache`, shorthands `t`, `y`, `f`, and `n` still mean false, but emit `legacy-bool-shorthand`. Use `true` or `false`.
 
 `optimistic_cache` accepts `true`, `yes`, `1`, `on`, `false`, `no`, `0` and `off` in any case. Any other value turns the cache off and emits a diagnostic.
 
@@ -42,15 +42,15 @@ The standalone listener uses ordinary, unmarked sockets in the host network name
 
 A hostname requires a scheme, for example `udp://localhost:1053`. IPv6 literals use brackets. An empty host, as in `tcp+udp://:1053`, selects a wildcard address. Every form requires an explicit decimal `u16` port. Port `0` requests an ephemeral port; honk logs the selected address.
 
-A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fragments, backslashes, IPv6 zone identifiers, malformed brackets, unsupported schemes, and out-of-range ports. For a hostname, honk tries addresses in system resolution order and uses the first address on which every requested transport binds. Binding is synchronous and all-or-nothing: any failure closes the other selected sockets and fails startup.
+A bare hostname is invalid. The parser also rejects userinfo, paths, queries, fragments, backslashes, IPv6 zone identifiers, malformed brackets, unsupported schemes, and out-of-range ports. For a hostname, honk tries addresses in system resolution order and uses the first address on which every requested transport binds. Binding is synchronous and all-or-nothing. Any failure closes the other selected sockets and fails startup.
 
-Listener ownership is process-scoped. A SIGHUP reload accepts semantically equivalent spelling, but rejects any change to the host, port, or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver; restrict source access with the host firewall and never publish it to an untrusted network.
+Listener ownership is process-scoped. A SIGHUP reload accepts a semantically equivalent spelling but rejects any change to the host, port or transport set as restart-required. A wildcard or LAN-facing bind exposes an unauthenticated recursive resolver. Restrict source access with the host firewall and never publish it to an untrusted network.
 
 Listening on `:53` does not preempt LAN traffic policy: non-`must` LAN TCP/UDP53 queries use transparent honk DNS even when dnsmasq or `dns.bind` owns the socket. Host-loopback and explicit native `direct(must)` delivery can still reach that ordinary listener; see the [listener matrix](../design/dns.md#dns-ownership-state-machine).
 
 ## Hosts snapshot (`use_host`)
 
-`use_host` is repeatable. `true`, `yes`, `1` or `on` in any case adds `/etc/hosts`. `false`, `no`, `0`, `off` or an empty value adds nothing and does not remove earlier sources. Any other value is a path. `/etc/hosts`, whether added by `true` or written as a path, uses standard `IP canonical-name aliases...` syntax; every other path is an OxiDNS-compatible `matcher target...` rule file. All sources are read once in declaration order and merged into one snapshot; a later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
+`use_host` is repeatable. `true`, `yes`, `1` or `on` in any case adds `/etc/hosts`. `false`, `no`, `0`, `off` or an empty value adds nothing and does not remove earlier sources. Any other value is a path. `/etc/hosts`, whether added by `true` or written as a path, uses standard `IP canonical-name aliases...` syntax. Every other path is an OxiDNS-compatible `matcher target...` rule file. All sources are read once in declaration order and merged into one snapshot. A later source replaces an earlier definition of the same exact name or matcher. Duplicate source paths are loaded once.
 
 ```dae
 dns {
@@ -60,9 +60,9 @@ dns {
 }
 ```
 
-Absolute paths remain explicit. Relative paths prefer an existing copy below `global.data_dir`, then an existing `/var/share/honk` copy, then an existing working-directory path. A missing path remains below `global.data_dir`; the query path uses the resulting immutable snapshot and performs no file I/O.
+An absolute path is used as written. Relative paths prefer an existing copy below `global.data_dir`, then an existing `/var/share/honk` copy, then an existing working-directory path. A missing path still resolves below `global.data_dir`. The query path uses the resulting immutable snapshot and performs no file I/O.
 
-Custom matchers are `full:example.com` (or an unprefixed exact name), `domain:example.com` (the name and all label-boundary subdomains), `keyword:text`, and `regexp:pattern`. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword; redefining the same matcher replaces its target. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot; use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
+Custom matchers are `full:example.com`, `domain:example.com`, `keyword:text`, and `regexp:pattern`. An unprefixed name is an exact match, like `full:`. `domain:` matches the name and all label-boundary subdomains. Matching precedence is exact, longest domain suffix, first matching regexp, then first matching keyword. Redefining the same matcher replaces its target. Full, domain, and keyword names are ASCII case-insensitive and normalize trailing dots. Regexps remain case-sensitive and run against the lowercase name without a trailing dot. Use `(?i)` when a regexp needs case-insensitive matching. Duplicate addresses are removed.
 
 A rule file has one matcher followed by one or more IPv4/IPv6 addresses or exactly one alias hostname per line. `#` always starts a comment, and there is no quoting, so a matcher cannot contain whitespace or `#`. An example `hosts.txt`:
 
@@ -82,15 +82,15 @@ full:a.example b.example
 domain:corp.example gateway.example
 ```
 
-The target is normalized like a matcher name and must be a valid hostname; mixing names with addresses, naming two domains, or an exact name aliasing itself is an invalid rule. An A or AAAA query for an alias resolves the target with the same type through the whole pipeline (hosts, request rules, cache, upstream). The answer contains `CNAME` records from the queried name through any further aliases to the target, followed by the target's CNAME and requested address records. Local alias CNAMEs and local address records use a 60-second TTL; records from the target's answer retain the target's own TTL policy. The composed answer is uncached; the target lookup keeps the caller's cache policy, including an explicit cache bypass.
+The target is normalized like a matcher name and must be a valid hostname. A rule that mixes names with addresses, names two domains, or aliases an exact name to itself is invalid. An A or AAAA query for an alias resolves the target with the same type through the whole pipeline: hosts, request rules, cache, upstream. The answer contains `CNAME` records from the queried name through any further aliases to the target. It then appends the target's CNAME and requested address records. Local alias CNAMEs and local address records use a 60-second TTL. Records from the target's answer retain the target's own TTL policy. The composed answer is uncached. The target lookup keeps the caller's cache policy, including an explicit cache bypass.
 
-The derived target query requires exactly one question (`QD=1`), empty answer and authority sections (`AN=NS=0`), and either no additional records or exactly one OPT (`AR=0` or `1`). It replaces QNAME while preserving the transaction ID, all header flags, QTYPE and QCLASS. When present, the OPT keeps its exact class, TTL and option bytes, with its root owner encoded independently of the original question. Any other section shape fails before target I/O; honk does not silently strip records or fall back to querying the original name.
+The derived target query requires exactly one question (`QD=1`), empty answer and authority sections (`AN=NS=0`), and either no additional records or exactly one OPT (`AR=0` or `1`). It replaces QNAME while preserving the transaction ID, all header flags, QTYPE and QCLASS. When present, the OPT keeps its exact class, TTL and option bytes, with its root owner encoded independently of the original question. Any other section shape fails before target I/O. honk does not strip records or fall back to querying the original name.
 
-A target NODATA answers NOERROR with the CNAME chain only, and a target NXDOMAIN answers NXDOMAIN with the CNAME chain, as RFC 6604 specifies. Other full 12-bit response codes are returned without answer records: EDNS clients receive the full code, while a code that cannot be represented without EDNS becomes SERVFAIL without records. A failed target lookup fails the query. The composed answer preserves the final target response's `TC` bit, even when the composed packet fits within the client's size limit.
+A target NODATA answers NOERROR with the CNAME chain only, and a target NXDOMAIN answers NXDOMAIN with the CNAME chain, as RFC 6604 specifies. Other full 12-bit response codes are returned without answer records. EDNS clients receive the full code, while a code that cannot be represented without EDNS becomes SERVFAIL without records. A failed target lookup fails the query. The composed answer preserves the final target response's `TC` bit, even when the composed packet fits within the client's size limit.
 
-After all sources are merged, every alias target must reach a name that is not an alias within eight aliases: a loop or a longer chain is invalid, and the error names the matcher and target. Aliases also apply to hostnames honk resolves through its [node host hook](#node-server-hosts).
+After all sources are merged, every alias target must reach a name that is not an alias within eight aliases. A loop or a longer chain is invalid, and the error names the matcher and target. Aliases also apply to hostnames honk resolves through its [node host hook](#node-server-hosts).
 
-SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule aborts startup; on reload the replacement generation fails before publication and the active generation remains in use.
+SIGHUP builds a new snapshot. Any unreadable source or invalid custom rule aborts startup. On reload the replacement generation fails before publication and the active generation remains in use.
 
 ## EDNS Client Subnet (`client_subnet`)
 
@@ -108,11 +108,11 @@ dns {
 }
 ```
 
-honk never overrides client-supplied ECS, including `/0`. A client query carrying any EDNS option, ECS included, is neither cached nor coalesced; ECS that honk adds does not affect caching. For generated ECS:
+honk never overrides client-supplied ECS, including `/0`. A client query carrying any EDNS option, ECS included, is neither cached nor coalesced. ECS that honk adds does not affect caching. For generated ECS:
 
 - The resolved dial route applies after both explicit `-> tag` selection and ordinary traffic routing. Direct attempts, including `-> direct`, are eligible; attempts with a proxy leaf omit ECS.
 - honk judges each UDP address retry separately. ECS from a failed direct attempt cannot reach a proxied retry.
-- For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission, validates any echoed ECS, and removes only its injected state before caching or replying.
+- For an eligible named-upstream query without ECS, honk adds the configured option after cache/singleflight admission. It validates any echoed ECS and removes only its injected state before caching or replying.
 - The effective prefix partitions DNS policy identity, so answers cannot cross a changed automatic prefix. `asis` requests remain byte-for-byte unchanged.
 
 ## Upstreams
@@ -126,9 +126,9 @@ upstream {
 }
 ```
 
-Upstream declaration names preserve their spelling. Both request and response dae action parsers trim the token and apply Rust `to_lowercase()` before recognizing keywords or producing an upstream target; lookup then compares that lowercased target exactly with the preserved declaration name. Use lowercase declaration names (for example, `alidns`) so mixed-case dae actions resolve predictably. Legacy structured targets are not normalized and are matched verbatim.
+Upstream declaration names preserve their spelling. The request and response dae action parsers trim the token and apply Rust `to_lowercase()` before they recognize a keyword or produce an upstream target. Lookup then compares that lowercased target exactly with the preserved declaration name. Use lowercase declaration names (for example, `alidns`) so mixed-case dae actions resolve predictably. Legacy structured targets are not normalized and are matched verbatim.
 
-Whole-config validation checks every effective named request and response rule or fallback against the declarations. This check runs at startup and reload, while parse-only loading APIs accept unresolved names for callers that do not validate the whole configuration. The first explicit `upstream` block replaces the built-in `default`: retain a declaration named `default`, select a declared fallback, or use a terminal request fallback such as `reject` or `asis`. A catch-all request rule does not waive fallback validation.
+Whole-config validation checks every effective named request and response rule or fallback against the declarations. It runs at startup and on reload. Parse-only loading APIs accept unresolved names for callers that do not validate the whole configuration. The first explicit `upstream` block replaces the built-in `default`: retain a declaration named `default`, select a declared fallback, or use a terminal request fallback such as `reject` or `asis`. A catch-all request rule does not waive fallback validation.
 
 Later `upstream` blocks append to the first. When a name is declared more than once, the last declaration is used.
 
@@ -144,7 +144,7 @@ Later `upstream` blocks append to the first. When a name is declared more than o
 | `h3://host[:port][/path]` or `http3://host[:port][/path]` | DNS over HTTP/3 (DoH3) | `443`, path `/dns-query` |
 | `quic://host[:port]` | DNS over QUIC (DoQ) | `853` |
 
-Schemes are lowercase only. honk does not reject an unknown or uppercase scheme; it treats the whole string as a UDP address, so check the spelling.
+Schemes are lowercase only. honk does not reject an unknown or uppercase scheme; it treats the whole string as a UDP address. Check the spelling.
 
 An IPv6 literal with a port needs brackets, as in `[2606:4700:4700::1111]:53`; a bare IPv6 literal uses the default port.
 
@@ -161,13 +161,13 @@ For TLS-based protocols, the parser derives `tls_server_name` from a hostname. A
 cloudflare_dot: 'tls://1.1.1.1:853?tls_server_name=cloudflare-dns.com'
 ```
 
-The parameter is removed from the dial address and overrides a hostname-derived value. The key is case-sensitive, its value is not percent-decoded, and the last non-empty occurrence wins. Other query pairs stay in the address; after a DoH or DoH3 path they become part of the request URI.
+The parameter is removed from the dial address and overrides a hostname-derived value. The key is case-sensitive, its value is not percent-decoded, and the last non-empty occurrence wins. Other query pairs stay in the address. After a DoH or DoH3 path they become part of the request URI.
 
-DoH and DoH3 send `POST` requests with `application/dns-message`. The HTTP authority is the endpoint's host and port; `tls_server_name` changes only SNI and certificate validation, so an IP-literal DoH server must accept the IP as authority.
+DoH and DoH3 send `POST` requests with `application/dns-message`. The HTTP authority is the endpoint's host and port. `tls_server_name` changes only SNI and certificate validation, so an IP-literal DoH server must accept the IP as authority.
 
 ### Outbound selection
 
-A trailing `-> tag` forces the upstream through that node or group. `-> direct` dials directly without consulting traffic routing, and `-> block` fails every query. When the tag matches no node or group, or the group has no available node, the query fails; it does not fall back to direct. Without a suffix, honk resolves the upstream destination and applies the ordinary traffic `routing { ... }` rules; that route can still select a proxy leaf. The legacy same-line form `name: 'uri' outbound: tag` remains accepted.
+A trailing `-> tag` forces the upstream through that node or group. `-> direct` dials directly without consulting traffic routing, and `-> block` fails every query. When the tag matches no node or group, or the group has no available node, the query fails. It does not fall back to direct. Without a suffix, honk resolves the upstream destination and applies the ordinary traffic `routing { ... }` rules. That route can still select a proxy leaf. The legacy same-line form `name: 'uri' outbound: tag` remains accepted.
 
 ```dae
 upstream {
@@ -175,7 +175,7 @@ upstream {
 }
 ```
 
-Traffic routing sees the upstream as a honk-originated flow: the upstream hostname when there is one, the resolved IP and port, source `0.0.0.0:0`, and `l4proto` `udp` for UDP, DoQ and DoH3 or `tcp` for TCP, DoT and DoH. A UDP upstream is routed as `udp` even when the selected proxy carries it as TCP-DNS.
+Traffic routing sees the upstream as a honk-originated flow. The flow carries the upstream hostname when there is one, the resolved IP and port, source `0.0.0.0:0`, and `l4proto` `udp` for UDP, DoQ and DoH3 or `tcp` for TCP, DoT and DoH. A UDP upstream is routed as `udp` even when the selected proxy carries it as TCP-DNS.
 
 Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI they remain data; a changed legacy split emits `legacy-upstream-separator`. An unquoted token-head `#` starts a trailing comment, with `legacy-upstream-comment` for the changed interpretation. Put comments and outbound suffixes outside URI quotes.
 
@@ -192,11 +192,11 @@ Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI 
 
 `routing` contains ordered `request` and `response` rules. The first matching rule wins. Arguments inside one condition are OR-ed; conditions joined with `&&` are AND-ed. Prefix a condition with `!` to negate it.
 
-In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Only an unquoted token-head `#` starts a comment, after a space or tab; glued hashes remain data. `//` is not a comment: trailing slash-comment text omits the malformed rule with `legacy-slash-comment`. Replace it with `#`. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types with `legacy-quoted-list`; prefer bare or individually quoted items.
+In request and response rules, single or double quotes protect `,`, `)`, `&&`, `->`, `#`, and `//` inside matcher arguments. Only an unquoted token-head `#` starts a comment, after a space or tab; glued hashes remain data. `//` is not a comment. Trailing slash-comment text omits the malformed rule with `legacy-slash-comment`. Replace it with `#`. A quoted QTYPE list such as `qtype('a,aaaa')` still selects both types with `legacy-quoted-list`. Prefer bare or individually quoted items.
 
-Unknown or malformed conditions and unsupported predicates omit the whole rule with a located warning, never just one conjunct. Unknown QTYPE names produce `invalid-qtype`, including mixed and negated lists; correct the name or use its numeric code. Explicit `qtype()` remains match-nothing. An invalid `qname` or `subtag` regexp and an empty `sip()` pass parsing but fail startup or reload.
+Unknown or malformed conditions and unsupported predicates omit the whole rule with a located warning, never just one conjunct. Unknown QTYPE names produce `invalid-qtype`, including mixed and negated lists. Correct the name or use its numeric code. Explicit `qtype()` remains match-nothing. An invalid `qname` or `subtag` regexp and an empty `sip()` pass parsing but fail startup or reload.
 
-Put each complete call and action on one physical line. Incomplete nonblank lines are omitted with located `incomplete-dns-rule`; DNS never joins them. Text after a complete matcher produces `trailing-matcher-text` and omits the whole rule. Leading and argument-position quotes must close on the same line. An unterminated quote produces one lexical diagnostic and omits the line only if every open block has a surviving closer; otherwise the document fails. Required closers hidden by the malformed quote cannot close blocks.
+Put each complete call and action on one physical line. Incomplete nonblank lines are omitted with located `incomplete-dns-rule`. DNS never joins them. Text after a complete matcher produces `trailing-matcher-text` and omits the whole rule. Leading and argument-position quotes must close on the same line. An unterminated quote produces one lexical diagnostic and omits the line only if every open block has a surviving closer. Otherwise the document fails. Required closers hidden by the malformed quote cannot close blocks.
 
 ### Conditions
 
@@ -230,13 +230,13 @@ dns {
 }
 ```
 
-When `geosite.dat` or `geoip.dat` is unavailable, its expansion matches nothing. An unknown category, code or attribute warns and also matches nothing, so negating it alone makes the condition always true. `geoip: private` is built in and needs no asset file; see [asset locations](./global.md#data-directory-and-asset-paths).
+When `geosite.dat` or `geoip.dat` is unavailable, its expansion matches nothing. An unknown category, code or attribute warns and matches nothing, so negating it alone makes the condition always true. `geoip: private` is built in and needs no asset file; see [asset locations](./global.md#data-directory-and-asset-paths).
 
 A fully quoted `subtag` argument is an exact tag: `subtag('keyword: Air')` matches the tag `keyword: Air`, while `subtag(keyword: Air)` matches any tag containing `Air`.
 
 For transparent port-53 and `dns.bind` ingress, the logical source is the socket peer. DNS resolution for an admitted TCP/UDP flow uses that flow's client address. Internal, bootstrap, prefetch, and Clash API queries have no logical source. An unknown source makes both positive and negated `sip` conditions false, so request routing continues to the next rule or fallback. `sip` is not valid in response routing.
 
-DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresses mean `/32` and `/128`; CIDR host bits are truncated with `dns-network-host-bits`. Malformed networks produce located `invalid-dns-network` diagnostics and omit the whole dae rule; constructed invalid routing fails router/policy construction. Equivalent network spellings use the same policy identity without reordering or deduplicating arguments.
+DNS `sip()` and `ip()` share one IP-or-CIDR decoder. Bare IPv4 and IPv6 addresses mean `/32` and `/128`. CIDR host bits are truncated with `dns-network-host-bits`. Malformed networks produce located `invalid-dns-network` diagnostics and omit the whole dae rule. Constructed invalid routing fails router/policy construction. Equivalent network spellings use the same policy identity without reordering or deduplicating arguments.
 
 ### Node server hosts
 
@@ -257,15 +257,15 @@ dns {
 }
 ```
 
-- Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts keep bootstrap resolution. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
-- A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, skips the cache and response rules, and never falls back: its failure fails the physical node or probe connection.
-- Claims are hostname-based, not an end-to-end download destination policy. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
-- Tags attach to the hostname, not the node: nodes from different subscriptions that share a hostname share the union of their tags, so the first matching rule picks one upstream for that hostname.
-- The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`; otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
+- Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts still use the bootstrap resolver. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
+- A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, and skips the cache and response rules. It never falls back, so its failure fails the physical node or probe connection.
+- A claim applies to the hostname. It is not an end-to-end policy for the download destination. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.
+- Tags attach to the hostname, not the node. Nodes from different subscriptions that share a hostname share the union of their tags, so the first matching rule picks one upstream for that hostname.
+- The rule may combine only with `qname()` and must select an upstream whose every declaration is `-> direct`. Otherwise validation fails with `subtag-dns-condition`, `subtag-dns-action` or `subtag-dns-upstream-route`.
 - The upstream's own hostname, ECH discovery and the offline `delay` subcommand still use the bootstrap resolver.
-- A host matching a `use_host` [alias](#hosts-snapshot-use_host) resolves to its target instead: to the addresses when the alias chain ends at an address entry, otherwise as a node host with that name would, through a `subtag()` rule claiming the target or else bootstrap. A direct address entry matching the original hostname does not claim it through this hook; an address entry at the end of an alias chain is used. Every claimed lookup, including a local address result or a bootstrap target, obeys DNS runtime admission and cancellation. Once the target/subtag path is selected, its failure is authoritative. A reload that removes the alias before the lookup runs resolves the original host as if it had no alias.
-- Aliases are matched against every hostname that reaches the bootstrap resolver, not only node server hosts: the URL host of a subscription, geodata or external UI download that names no explicit bootstrap resolver, a SOCKS5 node's UDP relay host, and the bootstrap fallback of health checks, latency tests, connectivity probes and internal name resolution. DNS upstream hostnames and ECH discovery do not reach the hook.
-- Each DNS generation precomputes node-host policy outcomes, including nonmatching hosts, from the subscription tags and ordered rules. Native flow traces report `partial` with `not_instrumented` when consuming these outcomes: the node-host rule decision is not captured.
+- A host matching a `use_host` [alias](#hosts-snapshot-use_host) resolves to its target instead. If the alias chain ends at an address entry, it resolves to those addresses. Otherwise it resolves as a node host with that name would: through a `subtag()` rule claiming the target, or else bootstrap. A direct address entry matching the original hostname does not claim it through this hook. An address entry at the end of an alias chain is used. Every claimed lookup, including a local address result or a bootstrap target, obeys DNS runtime admission and cancellation. Once the target/subtag path is selected, its failure is authoritative. A reload that removes the alias before the lookup runs resolves the original host as if it had no alias.
+- Aliases are matched against every hostname that reaches the bootstrap resolver, not only node server hosts. That includes the URL host of a subscription, geodata or external UI download that names no explicit bootstrap resolver. It also includes a SOCKS5 node's UDP relay host, and the bootstrap fallback of health checks, latency tests, connectivity probes and internal name resolution. DNS upstream hostnames and ECH discovery do not reach the hook.
+- Each DNS generation precomputes node-host policy outcomes, including nonmatching hosts, from the subscription tags and ordered rules. Native flow traces report `partial` with `not_instrumented` when consuming these outcomes. The node-host rule decision is not captured.
 
 ### Request actions
 
@@ -291,13 +291,13 @@ Native `direct(must)` bypass differs from `asis` re-querying; see [DNS source/NA
 | Upstream name | Re-query through the named upstream, then evaluate response routing again. |
 | `fallback: accept\|reject\|<upstream>` | Verdict or named upstream used when no response rule matches; default is `accept`. |
 
-NXDOMAIN and SERVFAIL skip response rules and fallback. When the upstream exchange fails or returns SERVFAIL for a cacheable query, honk serves a retained [expired answer](#cache-and-fixed-ttl) instead if one exists; a local packet refusal never does.
+NXDOMAIN and SERVFAIL skip response rules and fallback. When the upstream exchange fails or returns SERVFAIL for a cacheable query, honk serves a retained [expired answer](#cache-and-fixed-ttl) instead if one exists. A local packet refusal never does.
 
 A response traversal allows at most three upstreams, including the initial upstream. The planner rejects a fourth exchange and any re-query cycle.
 
 ### Legacy conversion
 
-The compatibility schema retains flat `routing.rules` entries with `domain` and `upstream`, plus a named `fallback`. These are structured compatibility fields, not additional current dae statements. `suffix:`, `keyword:`, `full:`, and `regex:` prefixes select the matcher; a bare legacy domain is an exact `full` match.
+The compatibility schema retains flat `routing.rules` entries with `domain` and `upstream`, plus a named `fallback`. They are structured compatibility fields, not additional statements in the current dae syntax. `suffix:`, `keyword:`, `full:`, and `regex:` prefixes select the matcher; a bare legacy domain is an exact `full` match.
 
 Structured YAML, TOML or JSON input cannot carry request or response rules: `dns.routing.request` and `dns.routing.response` must be absent or `null`. Write those rules in dae.
 
@@ -320,7 +320,7 @@ With active legacy rules, an undeclared default `upstream` fallback reports `mis
 | `ipversion_prefer: 4` | `preferipv4` | Prefer IPv4 while retaining IPv6 fallback. |
 | `ipversion_prefer: 6` | `preferipv6` | Prefer IPv6 while retaining IPv4 fallback. |
 
-In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline while preserving the caller's logical source, original destination, ingress profile, and wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA; if it has none or the sibling has an ordinary availability failure, the non-preferred answer is returned. A typed local packet refusal, including carrier Capacity, instead terminates resolution with that cause and cannot be replaced by a stale answer. This adds one upstream query on a relevant cache miss.
+In a preference mode, both families remain queryable. For a non-preferred A/AAAA request, honk issues the preferred-family sibling query through the same pipeline. It preserves the caller's logical source, original destination, ingress profile, and wire profile except QTYPE. If the preferred family has an address, the non-preferred answer is suppressed as NODATA. If it has none, or the sibling has an ordinary availability failure, the non-preferred answer is returned. A typed local packet refusal, including carrier Capacity, instead terminates resolution with that cause and cannot be replaced by a stale answer. This adds one upstream query on a relevant cache miss.
 
 The same strategy orders bootstrap-resolved addresses for an upstream hostname. `both` and `preferipv4` dial IPv4 first; `preferipv6` dials IPv6 first. TCP, DoT, DoH, DoQ, DoH3, and proxied DNS try subsequent addresses after a failed dial. Direct UDP uses its one retry for the other family before another address in the same family, then reuses the successful socket. The compatibility-only `ipv4only` and `ipv6only` strategies filter upstream dial candidates to that family.
 
@@ -333,30 +333,30 @@ The internal `ipv4only` and `ipv6only` modes are not expressible with dae `ipver
 | `optimistic_cache` | `true` | Enables cache reads and publications. With `false`, replies keep upstream TTLs. |
 | `optimistic_cache_ttl` | `600` seconds | Overrides the cache lifetime and the returned RR TTLs; NXDOMAIN, SERVFAIL and NODATA follow [Negative answers](#negative-answers). `0` uses the upstream's minimum TTL. Decimal seconds only: a value such as `10m` emits a diagnostic and selects `60`, not `600`. |
 | `optimistic_stale_reply_ttl` | `30` seconds | Served-stale positive answers use this TTL; a non-zero value replaces every non-OPT RR TTL. `0` preserves cached policy-rewritten wire TTLs rather than authoritative TTLs; in that case, the outcome TTL derives from `extract_min_ttl` of that wire, falling back to 60 seconds when no positive TTL exists. For a non-zero value, the outcome TTL is the configured value even when no positive TTL exists. An invalid value emits a diagnostic and selects `30`. |
-| `max_cache_size` | `10000` | Entry limit, divided across at most 16 shards. Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`; it evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` to one entry, each with a warning. An invalid value emits a diagnostic and selects `10000`. |
-| `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`; `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. Keys match one exact name, written in lowercase without a trailing dot; they do not cover subdomains. |
+| `max_cache_size` | `10000` | Entry limit, divided across at most 16 shards. Each shard's answer-byte budget is `max(entry capacity × 1 KiB, 65,535 bytes)`. It evicts LRU entries until both limits hold. Individual answers over 65,535 bytes are not cached. Values above 100,000 clamp to 100,000 and `0` to one entry, each with a warning. An invalid value emits a diagnostic and selects `10000`. |
+| `fixed_domain_ttl { domain: seconds }` | empty | Per-domain override applied before `optimistic_cache_ttl`. `0` disables caching for every response code, including NXDOMAIN and SERVFAIL. Keys match one exact name, written in lowercase without a trailing dot. They do not cover subdomains. |
 
-Request routing runs before cache lookup. Clients share a cache entry only when their queries are identical apart from the transaction ID, arrive through the same ingress type, and select the same DNS policy and the same upstream or `asis` destination; the raw client source is not part of the key. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
+Request routing runs before cache lookup. Clients share a cache entry only when their queries are identical apart from the transaction ID. The queries must also arrive through the same ingress type and select the same DNS policy and the same upstream or `asis` destination. The raw client source is not part of the key. Preferred-family rendering still retains source metadata, so source-dependent sibling policy cannot leak through foreground singleflight.
 
-With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. A cached answer has every non-OPT record TTL rewritten to that minimum. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot, preventing either an old address or an older negative from returning. A nonzero configured or fixed TTL still overrides that zero.
+With `optimistic_cache_ttl: 0` and no `fixed_domain_ttl` override, a positive NOERROR answer uses the minimum TTL across all non-OPT answer, authority, and additional records. A cached answer has every non-OPT record TTL rewritten to that minimum. If any such TTL is zero, honk does not cache the response and supersedes the exact cache slot. That prevents either an old address or an older negative from returning. A nonzero configured or fixed TTL still overrides that zero.
 
-honk rewrites reply TTLs only for a response it caches; an uncacheable query or `optimistic_cache: false` leaves upstream TTLs unchanged. Failure codes other than NXDOMAIN and SERVFAIL, such as REFUSED, follow `optimistic_cache_ttl` and are cached for 600 seconds by default.
+honk rewrites reply TTLs only for a response it caches. An uncacheable query or `optimistic_cache: false` leaves upstream TTLs unchanged. Failure codes other than NXDOMAIN and SERVFAIL, such as REFUSED, follow `optimistic_cache_ttl` and are cached for 600 seconds by default.
 
-Expired answers, including cached NODATA, stay available for serve-stale for one hour unless evicted; `optimistic_stale_reply_ttl` sets the reply TTL, not this window. A cache hit with at most `max(original TTL / 10, 1)` seconds left starts one background refresh.
+Expired answers, including cached NODATA, stay available for serve-stale for one hour unless evicted. `optimistic_stale_reply_ttl` sets the reply TTL, not this window. A cache hit with at most `max(original TTL / 10, 1)` seconds left starts one background refresh.
 
-Disabling cache retention does not disable DNS routing projection. An accepted uncacheable positive answer (including `fixed_domain_ttl: 0`) uses the minimum positive non-OPT wire TTL for projection, falling back to 60 seconds when all such TTLs are zero. This does not rewrite the reply or make it cacheable; cache-hit remaining lifetimes and served-stale lifetimes are unchanged.
+Disabling cache retention does not disable DNS routing projection. An accepted uncacheable positive answer (including `fixed_domain_ttl: 0`) uses the minimum positive non-OPT wire TTL for projection, falling back to 60 seconds when all such TTLs are zero. This does not rewrite the reply or make it cacheable. Cache-hit remaining lifetimes and served-stale lifetimes are unchanged.
 
 ### Negative answers
 
-NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present; a refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
+NXDOMAIN is cached for `min(SOA TTL, SOA MINIMUM, 300)` seconds. Missing SOA or a zero SOA lifetime prevents caching and removes the existing positive and negative values for the exact cache key, so an old address cannot return as stale. A foreground result replaces whichever publication is present. A refresh removes only the revision it started from. `fixed_domain_ttl: 0` prevents caching without removing an existing entry. SERVFAIL otherwise retains its SOA-derived lifetime, defaulting to 60 seconds and clamped to `1..=300`.
 
-NODATA here means NOERROR with no answer records (`ANCOUNT=0`); a nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
+NODATA here means NOERROR with no answer records (`ANCOUNT=0`). A nonempty answer, including a CNAME/DNAME-only answer, remains positive. NODATA retains its full wire response in the positive slot for `min(SOA TTL, SOA MINIMUM, 300)` seconds. A nonzero `fixed_domain_ttl` takes precedence over both SOA and the cap, including when SOA is absent. Without that override, missing SOA or zero lifetime supersedes the exact slot without caching, just as for NXDOMAIN.
 
-Cached NODATA remains eligible for serve-stale; the stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire; its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
+Cached NODATA remains eligible for serve-stale. The stale rewrite changes the SOA record TTL, not SOA MINIMUM. A response-policy `reject` applied to upstream NODATA produces an empty NOERROR wire. Its cache lifetime follows the same TTL rules using the rejected answer's SOA, not the synthetic wire. Subsequent requests reuse the synthetic response for that lifetime.
 
-Cache lifetime selection uses the original upstream answer's class, response code, and TTL even when response-policy `reject` replaces the reply with synthetic NOERROR. A rejected REFUSED therefore keeps the failure-code TTL rules; a rejected positive NOERROR uses its original TTLs when no configured or fixed override applies.
+Cache lifetime selection uses the original upstream answer's class, response code, and TTL even when response-policy `reject` replaces the reply with synthetic NOERROR. A rejected REFUSED therefore keeps the failure-code TTL rules. A rejected positive NOERROR uses its original TTLs when no configured or fixed override applies.
 
-Cache hits do not count down wire record TTLs. Supersession affects memory only; it does not delete a saved persistence row.
+Cache hits do not count down wire record TTLs. Supersession affects memory only. It does not delete a saved persistence row.
 
 For example, `www.example.com` needs its own entry:
 
@@ -369,7 +369,7 @@ fixed_domain_ttl {
 }
 ```
 
-Each fixed TTL requires exactly one unsigned 32-bit decimal scalar. Bare and quoted values are accepted, including `0` and `4294967295`; newly accepted quoted decimals emit `legacy-ttl-quoting`. Invalid or overflowing values emit `invalid-ttl`, and extra tokens emit `trailing-value`; either omits the entry. Put explanations after ` # `, not directly after the number.
+Each fixed TTL requires exactly one unsigned 32-bit decimal scalar. Bare and quoted values are accepted, including `0` and `4294967295`. Newly accepted quoted decimals emit `legacy-ttl-quoting`. Invalid or overflowing values emit `invalid-ttl`, and extra tokens emit `trailing-value`; either omits the entry. Put explanations after ` # `, not directly after the number.
 
 ## Example
 
