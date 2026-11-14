@@ -589,6 +589,7 @@ cargo run --release -p honk-core -- \
 - [配置指南](configuration.md)
 - [全局配置](reference/global.md)
 - [节点和协议](reference/nodes.md)
+- [订阅](reference/subscription.md)
 - [分组策略](reference/groups.md)
 - [路由规则](reference/routing.md)
 - [DNS 配置](reference/dns.md)

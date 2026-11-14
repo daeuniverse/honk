@@ -38,7 +38,7 @@ group {
 | `policy` | `policy` | `selector` | Member-selection policy; accepted spellings are listed below. |
 | `icon` | `icon` | `null` | Absolute HTTP(S) URL with a host and no credentials, or a data URI. At most 2048 characters, without whitespace; any other value rejects the configuration. Native group reads mask listener-secret values of at least 8 bytes and never guess an icon. |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | Select nodes by node name. The parser resolves matches to node UUIDs. |
-| `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. |
+| `filter: subtag(...)` | `filters` + `nodes` | `[]` | Select nodes by the current tag of the subscription that produced them. The tag comes from the subscription entry; see [Internal model](./subscription.md#internal-model). |
 | `filter: group(...)` | `groups` | `[]` | Add nested group tags. Comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `default` | `null` | Initial or fallback member tag for `selector`. |
 | `final` | `final_outbound` | `null` | Node, group, `direct`, or `block` used when the group's policy has no eligible selection, including when the group is nested. An unknown target rejects the configuration at startup or reload with `invalid-group-final-target`. Final nodes remain health-gated. A final path that loops back selects nothing and never falls back to `direct`. |

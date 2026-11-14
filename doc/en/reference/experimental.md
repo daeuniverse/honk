@@ -1,6 +1,7 @@
 # Experimental Configuration Reference
 
 `experimental { ... }` configures the APIs and persistent runtime state.
+The section shares its name with the Clash/mihomo `experimental` section but not its keys: honk uses it for its API listeners and persistence.
 
 ## Section overview
 

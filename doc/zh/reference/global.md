@@ -105,6 +105,17 @@ UDP DNS 目标在启动时按健康检查超时尝试初始化。本地拒绝或
 立的 QUIC 检查仍可继续。首次成功解析出的地址随后保持固定。延后的解析和 DNS 交换
 共用同一次探测的绝对期限；普通解析失败保留原有的默认回退。
 
+## 流量入口与拦截
+
+honk 通过所配置网卡上的 eBPF TC hook 接收流量，不提供供客户端连接的代理端口。
+
+- `lan_interface` 上的 hook 拦截 LAN 客户端经本机转发的流量，例如把本机设为网关的客户端。
+- `wan_interface` 上的 hook 拦截本机发起的 TCP/UDP。
+- 需要用户态处理的流量由数据路径经 `dae0` 送进 `daens` 命名空间，再由 `sk_lookup` 交给 `tproxy_port` 上的透明代理 TCP 或 UDP listener。有歧义的 LAN 转发 UDP 则由 NFQUEUE 暂存（`nfqueue_enable`）。
+- 拦截需要真实 eBPF 后端；mock 后端不拦截任何流量。
+
+honk 没有 TUN 入站，也没有 `mixed-port`、`redir-port` 或 HTTP/SOCKS 入站。Clash API 的 `GET /configs` 把 `port`、`socks-port` 和 `mixed-port` 报告为 `0`，把 `tun.enable` 报告为 `false`。除透明代理 listener 外，honk 只监听可选的 [`dns.bind`](./dns.md#独立-listenerbind) 地址，以及 [`experimental`](./experimental.md) 中配置的 API listener。流量经过各个 hook 的过程见[报文路径](../design/overview.md#报文路径)。
+
 ## 网卡语义
 
 `lan_interface` 为空时，honk 不安装 LAN TC hook，也绝不会用 `lo` 替代。WAN-only 网关因此只使用 `wan_interface`；经过这些 WAN hook 的本机 TCP/UDP 流量仍会被代理，但不会额外安装 LAN 拦截。

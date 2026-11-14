@@ -1,6 +1,7 @@
 # Experimental 配置参考
 
 `experimental { ... }` 配置 Clash 兼容 API、原生 API 和运行时状态的持久化。
+它与 Clash/mihomo 的 `experimental` 配置段同名，但字段不同：honk 用它配置 API listener 和持久化。
 
 ## Section 概览
 

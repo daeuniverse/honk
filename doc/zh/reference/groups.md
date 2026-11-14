@@ -38,7 +38,7 @@ group {
 | `policy` | `policy` | `selector` | 成员选择策略；接受的拼写见下表。 |
 | `icon` | `icon` | `null` | 带主机名且不含凭据的绝对 HTTP(S) URL，或 data URI；最多 2048 个字符，不能含空白。其他值会使配置被拒绝。原生组读取会遮蔽至少 8 字节长的 listener secret 值，不推测图标。 |
 | `filter: name(...)` | `filters` + `nodes` | `[]` | 按节点名选择节点。解析器把匹配结果解析为节点 UUID。 |
-| `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。 |
+| `filter: subtag(...)` | `filters` + `nodes` | `[]` | 按产生节点的订阅的当前 tag 选择节点。tag 来自订阅条目，见[内部模型](./subscription.md#内部模型)。 |
 | `filter: group(...)` | `groups` | `[]` | 加入嵌套组 tag。接受逗号分隔的参数和竖线分隔的 tag。 |
 | `default` | `default` | `null` | `selector` 的初始或回退成员 tag。 |
 | `final` | `final_outbound` | `null` | 组策略没有合格选择时使用的节点、组、`direct` 或 `block`，该组被嵌套时同样生效。未知目标会使配置在启动或 reload 时以 `invalid-group-final-target` 被拒绝。`final` 节点仍受健康检查约束。绕回自身的 `final` 路径不选择任何节点，也不会退回 `direct`。 |

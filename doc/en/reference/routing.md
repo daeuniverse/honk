@@ -102,6 +102,22 @@ LAN local-socket precedence applies only to non-53 destinations, independently p
 
 Admission and policy-size limits: [LAN per-source new-flow budget](../design/datapath.md#per-source-new-flow-limit) and [compiled-policy capacity](../design/routing.md#restricted-native-backend).
 
+## Sniffing
+
+honk sniffs only flows that the datapath hands to the control plane. Flows that the TC hooks keep on the native Linux path are never sniffed.
+
+- TCP: honk reads at most 4096 bytes and extracts the TLS SNI or HTTP `Host`. It writes those bytes to the selected outbound before relaying, so sniffing consumes no application data.
+- UDP: honk decrypts QUIC v1/v2 Initial packets and extracts the TLS ClientHello SNI.
+
+honk skips sniffing in these cases:
+
+- `dial_mode` is `ip`.
+- The datapath handoff is already a final `direct` or `block`.
+- The matched rule ends in `(must)`.
+- TCP only: three consecutive failures put the destination/outbound signature in a negative cache for ten minutes.
+
+`dial_mode` decides what honk does with a sniffed name; see [Dial modes](./global.md#dial-modes). In `domain` mode the name must first pass a DNS reality check. `sniffing_timeout` is a compatibility key that the control plane does not read. Limits and timeouts are in [Sniffing and flow initialization](../design/control-plane.md#sniffing-and-flow-initialization).
+
 ## Policy-routing marks
 
 `direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark. An

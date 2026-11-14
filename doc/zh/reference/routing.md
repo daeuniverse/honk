@@ -97,6 +97,22 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` listener socket �
 
 admission 与策略规模限制见 [LAN 单源新流预算](../design/datapath.md#单源新流限制)和[编译策略容量](../design/routing.md#受限原生后端)。
 
+## 嗅探
+
+honk 只嗅探数据路径交给控制面的流量；TC hook 留在 Linux 原生路径上的流量不经过嗅探。
+
+- TCP：最多读取 4096 字节，提取 TLS SNI 或 HTTP `Host`。读到的字节在中继开始前写入选中的出站，所以嗅探不消费应用数据。
+- UDP：解密 QUIC v1/v2 的 Initial packet，提取 TLS ClientHello 的 SNI。
+
+以下情况跳过嗅探：
+
+- `dial_mode` 为 `ip`。
+- 数据路径的 handoff 已是最终的 `direct` 或 `block`。
+- 命中的规则以 `(must)` 结尾。
+- 仅 TCP：同一目的地址和出站签名连续三次失败后进入 negative cache，十分钟内不再嗅探。
+
+嗅探到的名称如何使用取决于 `dial_mode`，见[拨号模式](./global.md#拨号模式)；`domain` 模式下名称要先通过 DNS reality check。`sniffing_timeout` 是兼容字段，控制面不读取它。上限与超时见[嗅探与流初始化](../design/control-plane.md#嗅探与流初始化)。
+
 ## 策略路由 mark
 
 `direct(mark: 512)` 与 `direct(mark: 0x200)` 选择相同的直连 mark。无前缀数字按十进制解析，包括前导零；`0x`/`0X` 前缀表示十六进制。范围为 `0..=0x3fffffff`；`0xc0000000` 位属于数据路径，不供用户策略使用。二进制/八进制前缀、下划线、正负号、溢出、未知选项以及重复的 `mark`/`must` 选项均拒绝配置；与全局 mark 标量不同，格式错误的直连 mark 不会静默变为零。mark 只支持 `direct`，不支持代理目标和组目标。

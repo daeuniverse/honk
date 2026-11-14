@@ -125,6 +125,17 @@ successfully resolved address stays pinned. Deferred resolution and the DNS
 exchange share one probe deadline. Ordinary resolution failures keep the
 existing default fallback.
 
+## Traffic entry and interception
+
+honk receives traffic through eBPF TC hooks on the configured interfaces, not through a proxy port that clients connect to.
+
+- `lan_interface` hooks intercept traffic that LAN clients send through the host, for example clients that use it as their gateway.
+- `wan_interface` hooks intercept TCP and UDP that the host itself originates.
+- The datapath sends flows that need userspace handling through `dae0` into the `daens` namespace. There, `sk_lookup` assigns them to the transparent TCP or UDP listener on `tproxy_port`. NFQUEUE staging (`nfqueue_enable`) holds ambiguous LAN-forwarded UDP instead.
+- Interception requires the real eBPF backend; the mock backend intercepts nothing.
+
+honk has no TUN inbound, no `mixed-port`, no `redir-port`, and no HTTP or SOCKS inbound. The Clash API's `GET /configs` reports `port`, `socks-port` and `mixed-port` as `0` and `tun.enable` as `false`. Besides the transparent listeners, honk listens only on the optional [`dns.bind`](./dns.md#standalone-listener-bind) address and on the API listeners configured in [`experimental`](./experimental.md). The [packet walk](../design/overview.md#packet-walk) follows a flow through the hooks.
+
 ## Interface semantics
 
 An empty `lan_interface` is literal: honk installs no LAN TC hooks and never substitutes `lo`. A WAN-only gateway therefore uses only `wan_interface`; host-originated TCP and UDP that traverse those WAN hooks are still proxied, while no synthetic LAN interception is added.
