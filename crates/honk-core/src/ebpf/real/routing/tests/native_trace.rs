@@ -212,8 +212,8 @@ fn evidence_budget_stops_only_evidence_and_disabled_invocations_do_not_leak() {
             name: "proxy".into(),
             ..Default::default()
         });
-        // The compiler's slot budget is independent of retained dictionary capacity.
-        assert!(KernelTraceDictionary::prepare("instance", 17, &_router, &config, &plan).is_none());
+        // A full 256-slot layout fits one dictionary; this empty store holds none, so capture reports a gap.
+        assert!(KernelTraceDictionary::prepare("instance", 17, &_router, &config, &plan).is_some());
         KernelTraceDictionaries::default()
     };
     for capture in [true, false, true] {

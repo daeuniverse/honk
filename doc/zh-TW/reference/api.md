@@ -356,11 +356,11 @@ flow ID 標示的是 incarnation，不是五元組。TCP/UDP flow 記錄會擷�
 
 轉交流量的核心規則結果來自編譯程式實際執行到的分支 witness，使用者態不重算。UDP 還必須使用收到的封包裡帶的 capture ID。五元組、decision token、路由 generation 與動作都要與保留的 witness 匹配；同一個五元組後來的 incarnation 不能給舊封包提供證據。
 
-Capture ID 不會繞回。凍結字典最多 16 份，每份 64 KiB，合計 1 MiB，計入記錄器的預留。字典被拒絕或淘汰、witness 缺少、TCP 對應關係有歧義，以及實際執行超過 256 個規則或條件值，都會讓證據不完整。
+Capture ID 不會繞回。凍結字典最多 16 份，每份 128 KiB，合計 2 MiB，計入記錄器的預留。字典被拒絕或淘汰、witness 缺少、TCP 對應關係有歧義，以及實際執行超過 256 個規則或條件值，都會讓證據不完整。
 
 如果只是未執行的規則超過這個上限，並不代表執行證據遺失。
 
-如果策略的核心追蹤字典會超過 64 KiB，這個策略在啟動與 reload 時都會以關閉核心路由追蹤的方式發布，並記錄一條 warning。它的 flow 會回報 `kernel_trace_not_captured`，不再產生無法解碼的 witness。檢查時依最長的 generation 編號估算規則 ID，因此剛好卡在上限附近的策略，也可能已經以關閉追蹤的方式發布。
+如果策略的核心追蹤字典會超過 128 KiB，這個策略在啟動與 reload 時都會以關閉核心路由追蹤的方式發布，並記錄一條 warning。它的 flow 會回報 `kernel_trace_not_captured`，不再產生無法解碼的 witness。檢查時依最長的 generation 編號估算規則 ID，因此剛好卡在上限附近的策略，也可能已經以關閉追蹤的方式發布。
 
 原生擴充欄位保留來源細節，不虛構身分：路由輸入可以帶 `ingress`、`domain_fact_bitmap`、`domain_fact_state`，但不會偽造網域名稱 rule ID。DNS association 的 outbound/connection step 帶 `lookup_id`，已知的實體對端帶 `server_addr`。選擇事實保留健康的位址族，以及這個決策是實際套用還是只 peek。
 
