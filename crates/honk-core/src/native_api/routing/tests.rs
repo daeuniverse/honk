@@ -329,27 +329,37 @@ fn empty_rules_share_fallback_identity_with_trace() {
 }
 
 #[test]
+fn trace_limit_follows_the_policy_without_truncation() {
+    let deadline = Instant::now() + TIMEOUT;
+    // Each one-condition rule costs two steps and the whole policy one more.
+    let policy = vec![rule(ip(), "proxy", 0); 3];
+    let router = Router::new(&policy, "direct").unwrap();
+    let steps = router.trace_steps();
+    assert_eq!(steps, 7);
+    let input = destination();
+    let predicates = input.predicates();
+    assert_eq!(
+        router
+            .simulate(predicates, steps, deadline)
+            .unwrap()
+            .rules
+            .len(),
+        4
+    );
+    // The charge is up front: a limit one short rejects instead of hiding the last rule.
+    assert!(matches!(
+        router.simulate(predicates, steps - 1, deadline),
+        Err(TraceError::Steps)
+    ));
+    assert!(matches!(
+        router.simulate(predicates, 0, deadline),
+        Err(TraceError::Steps)
+    ));
+}
+
+#[test]
 fn rule_and_condition_evidence_bounds_reject_without_truncation() {
     let id = RequestId("test".into());
-    let policy = vec![rule(ip(), "proxy", 0); 128];
-    let router = Router::new(&policy[..127], "direct").unwrap();
-    assert_eq!(trace(&router, &destination()).rules.len(), 128);
-    let router = Router::new(&policy, "direct").unwrap();
-    assert_eq!(
-        evaluate(
-            &router,
-            "instance",
-            7,
-            &destination(),
-            Instant::now() + TIMEOUT,
-            &id
-        )
-        .unwrap_err()
-        .into_response()
-        .status(),
-        StatusCode::PAYLOAD_TOO_LARGE
-    );
-
     let policy = vec![rule(ip(), "proxy", 0); MAX_RULES];
     let router = Router::new(&policy[..MAX_RULES - 1], "direct").unwrap();
     assert_eq!(rules(&router).rules.len(), MAX_RULES);
@@ -366,6 +376,31 @@ fn rule_and_condition_evidence_bounds_reject_without_truncation() {
             .status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
+}
+
+#[test]
+fn small_policies_advertise_the_step_floor() {
+    assert_eq!(MIN_STEPS, 4096);
+    let policy = vec![rule(ip(), "proxy", 0); 300];
+    let router = Router::new(&policy, "direct").unwrap();
+    assert_eq!(trace_capability(&router)["max_rule_steps"], 4096);
+    assert_eq!(trace(&router, &destination()).rules.len(), 301);
+    let router = Router::new(&[], "direct").unwrap();
+    assert_eq!(trace_capability(&router)["max_rule_steps"], 4096);
+}
+
+#[test]
+fn policies_beyond_the_step_floor_trace_and_advertise_their_cost() {
+    let policy = vec![rule(ip(), "proxy", 0); 3000];
+    let router = Router::new(&policy, "direct").unwrap();
+    // One fallback step plus two per one-condition rule.
+    assert_eq!(router.trace_steps(), 6001);
+    assert!(router.trace_steps() > MIN_STEPS);
+    assert_eq!(
+        trace_capability(&router)["max_rule_steps"],
+        router.trace_steps()
+    );
+    assert_eq!(trace(&router, &destination()).rules.len(), 3001);
 }
 
 #[test]

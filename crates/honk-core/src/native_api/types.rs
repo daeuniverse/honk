@@ -476,8 +476,13 @@ pub(super) async fn capabilities(state: &super::NativeState) -> Value {
     providers["can_manage"] = json!(config.can_manage());
     providers["create_unfetched"] = json!(true);
     let geodata = super::geodata::capability(state).await;
-    let routing_trace = super::routing::trace_capability();
-    let rules = super::routing::rules_capability(&*state.traffic_router.read().await);
+    let (routing_trace, rules) = {
+        let router = state.traffic_router.read().await;
+        (
+            super::routing::trace_capability(&router),
+            super::routing::rules_capability(&router),
+        )
+    };
     let dns_rules = super::dns::rules_capability(&state.config.read().await.dns.routing);
     json!({
         "observed_at": super::timestamp(std::time::SystemTime::now()),
