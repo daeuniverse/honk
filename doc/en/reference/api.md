@@ -1027,7 +1027,7 @@ A trace does not resolve DNS, dial, probe or mutate group selection. `resolve` d
 
 A request that violates that shape returns 400, while a well-shaped live request returns 422 because live resolution is unsupported. Content-Type, JSON and schema, input and resolve checks precede rate admission. Rejected validation consumes no trace-rate slot.
 
-Limits are one address, 256 rule or condition steps, five seconds and 30 requests per minute for the sole principal and globally.
+Limits are one address, five seconds and 30 requests per minute for the sole principal and globally. The step limit, advertised as `routing_trace.max_rule_steps`, is the larger of 4096 and the loaded policy's cost (1 plus, for each rule, 1 plus its condition count), so every loaded policy can be traced.
 
 The response is a `simulation` pinned to one `instance_id` and `generation_id`, not historical flow evidence. `/rules` returns the complete dictionary including fallback, never truncated. `max_rules` is 4096 or the running dictionary size if larger, and `dns_rules.max_rules` likewise covers the larger DNS list.
 

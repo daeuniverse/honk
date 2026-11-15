@@ -955,7 +955,7 @@ DNS 查詢、快取與日誌的完整 JSON 回應上限都是 262144 位元組�
 
 結構合法但暫時不支援的 `live` 請求回傳 422。`Content-Type`、JSON 與 schema、`input` 與 `resolve` 的驗證先於限流 admission；被驗證拒絕的請求不佔路由模擬的限流名額。
 
-模擬固定目前已編譯的路由器、設定與 generation：不查 DNS，不探測，不推進群組選擇，也不建立連線。缺少的輸入保留 `indeterminate/missing_inputs`，不能當作歷史 flow 證據，也不代表真的會這樣轉發。上限是 1 個位址、256 個規則或條件步驟、5 秒；唯一認證主體與全域各限每分鐘 30 次。
+模擬固定目前已編譯的路由器、設定與 generation：不查 DNS，不探測，不推進群組選擇，也不建立連線。缺少的輸入保留 `indeterminate/missing_inputs`，不能當作歷史 flow 證據，也不代表真的會這樣轉發。上限是 1 個位址、5 秒；唯一認證主體與全域各限每分鐘 30 次。步驟上限透過 `routing_trace.max_rule_steps` 公布，取 4096 與目前策略開銷中較大的那個（開銷是 1，再加上每條規則的 1 與它的條件數），所以任何已載入的策略都能完成模擬。
 
 `GET /rules` 回傳目前完整字典，含 fallback，從不截斷。`max_rules` 取 4096 與目前字典列數中較大的那個；`dns_rules.max_rules` 同樣不小於較長的那個 DNS 清單。fallback 項目的 `expression` 是它的來源語句，例如 `fallback: proxy`。
 

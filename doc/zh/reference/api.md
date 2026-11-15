@@ -955,7 +955,7 @@ DNS 查询、缓存和日志的完整 JSON 响应上限都是 262144 字节。�
 
 结构合法但暂时不支持的 `live` 请求返回 422。`Content-Type`、JSON 与 schema、`input` 和 `resolve` 的校验先于限流 admission；被校验拒绝的请求不占路由模拟的限流名额。
 
-模拟固定当前已编译的路由器、配置和 generation：不查 DNS，不探测，不推进组选择，也不建立连接。缺失的输入保留 `indeterminate/missing_inputs`，不能当作历史流证据，也不代表真的会这样转发。上限是 1 个地址、256 个规则或条件步骤、5 秒；唯一认证主体和全局各限每分钟 30 次。
+模拟固定当前已编译的路由器、配置和 generation：不查 DNS，不探测，不推进组选择，也不建立连接。缺失的输入保留 `indeterminate/missing_inputs`，不能当作历史流证据，也不代表真的会这样转发。上限是 1 个地址、5 秒；唯一认证主体和全局各限每分钟 30 次。步骤上限通过 `routing_trace.max_rule_steps` 公布，取 4096 和当前策略开销中较大的那个（开销是 1，再加上每条规则的 1 和它的条件数），所以任何已加载的策略都能完成模拟。
 
 `GET /rules` 返回当前完整字典，含回退，从不截断。`max_rules` 取 4096 和当前字典行数中较大的那个；`dns_rules.max_rules` 同样不小于较长的那个 DNS 列表。回退条目的 `expression` 是它的源语句，例如 `fallback: proxy`。
 
