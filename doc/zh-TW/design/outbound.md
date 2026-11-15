@@ -287,8 +287,10 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 ```
 
 `maybe_tls_wrap_concrete` 保留 Vision 需要的具體 TCP/TLS 型別。有 REALITY 參數時，
-它走[有界認證建立過程](#伺服器認證與指紋約束)，不走普通 TLS。因此，同一條共享路
-徑為 Trojan、VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立過程。
+它走[有界認證建立過程](#伺服器認證與指紋約束)，不走普通 TLS。一般 TLS 依序把
+明確的 `sni`、WebSocket `Host` 授權（忽略連接埠）、節點主機名稱作為 SNI：CDN 前置
+節點以邊緣 IP 為位址，發佈域名只出現在該 header 中。因此，同一條共享路徑為
+Trojan、VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立過程。
 
 Trojan 冷連線和 pool 中取出的裸連線使用同一套完整 transport。
 

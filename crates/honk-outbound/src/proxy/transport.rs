@@ -230,7 +230,7 @@ pub(crate) async fn maybe_tls_wrap_concrete(
     let mut tcp = ObservedTcp::new(initial_tcp.await?);
     if tls.enabled {
         let connector = crate::tls::build_connector(node)?;
-        let server_name = tls.sni.clone().unwrap_or_else(|| node.host().to_string());
+        let server_name = tls_server_name(node);
         let mut tls_stream = connector.connect(&server_name, tcp).await?;
         if node.is_xhttp() {
             anyhow::ensure!(
@@ -249,6 +249,35 @@ pub(crate) async fn maybe_tls_wrap_concrete(
         crate::runtime::flow_observation::Milestone::TransportReady,
     );
     Ok(MaybeTls::Plain(Box::new(tcp)))
+}
+
+/// TLS server name for a plain-TLS dial: an explicit SNI wins, then the
+/// WebSocket `Host` authority, then the endpoint address.
+///
+/// CDN-fronted nodes carry the edge IP as their address and the distribution
+/// name only in the WebSocket `Host` header. An IP-literal server name sends
+/// no SNI, so the edge answers with a default certificate that cannot match
+/// the distribution and verification fails.
+fn tls_server_name(node: &Node) -> String {
+    if let Some(sni) = node.tls().and_then(|tls| tls.sni.as_deref()) {
+        return sni.to_string();
+    }
+    // The header is an authority, so a `:port` suffix is not SNI; an empty or
+    // unparsable one falls through to the endpoint address.
+    node.transport()
+        .filter(|transport| transport.transport == "ws")
+        .and_then(|transport| transport.ws_host.as_deref())
+        .and_then(|host| host.parse::<http::uri::Authority>().ok())
+        .map(|authority| {
+            // `Authority::host` keeps the brackets of an IPv6 literal; the connector
+            // recognises (and sends no SNI for) only the bare address.
+            authority
+                .host()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
+        })
+        .unwrap_or_else(|| node.host().to_string())
 }
 
 fn encode_uri_path(path: &str) -> PercentEncode<'_> {

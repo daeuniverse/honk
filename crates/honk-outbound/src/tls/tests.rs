@@ -226,6 +226,59 @@ async fn xhttp_tls_rejects_missing_h2_but_raw_tls_preserves_no_alpn() {
     .unwrap();
 }
 
+/// Like `spawn_server`, but returns the SNI the client offered (`None` if absent).
+fn spawn_sni_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Option<String>>) {
+    let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
+    acceptor
+        .set_certificate(&X509::from_pem(cert_pem.as_bytes()).unwrap())
+        .unwrap();
+    acceptor
+        .set_private_key(&PKey::private_key_from_pem(key_pem.as_bytes()).unwrap())
+        .unwrap();
+    let acceptor = acceptor.build();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        let tls = acceptor.accept(stream).ok()?;
+        tls.ssl()
+            .servername(boring::ssl::NameType::HOST_NAME)
+            .map(str::to_owned)
+    });
+    (port, handle)
+}
+
+/// The dial must put the WebSocket `Host` name on the wire as SNI when the
+/// endpoint is an IP literal and no explicit `sni` is set; calling only the
+/// helper would not catch a call site that stops using it.
+#[tokio::test]
+async fn ws_tls_dial_offers_the_host_header_as_sni() {
+    use crate::proxy::transport::maybe_tls_wrap_concrete;
+    use std::time::Duration;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let (cert, key) = server_cert();
+        let (port, server) = spawn_sni_server(&cert, &key);
+        let mut node = test_node();
+        node.host = "127.0.0.1".into();
+        node.port = port;
+        node.tls_mut().unwrap().enabled = true;
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_host = Some("cdn.example:8443".into());
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let stream = maybe_tls_wrap_concrete(&node, Some(tcp), Duration::from_secs(3))
+            .await
+            .unwrap();
+        assert_eq!(server.join().unwrap().as_deref(), Some("cdn.example"));
+        drop(stream);
+    })
+    .await
+    .unwrap();
+}
+
 /// Spawn a server holding real ECH keys (boring test fixtures:
 /// public_name ech.com, DHKEM-P256-SHA256).
 fn spawn_ech_server(cert_pem: &str, key_pem: &str) -> (u16, thread::JoinHandle<Vec<u8>>) {
