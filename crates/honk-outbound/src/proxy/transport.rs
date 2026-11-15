@@ -268,7 +268,15 @@ fn tls_server_name(node: &Node) -> String {
         .filter(|transport| transport.transport == "ws")
         .and_then(|transport| transport.ws_host.as_deref())
         .and_then(|host| host.parse::<http::uri::Authority>().ok())
-        .map(|authority| authority.host().to_string())
+        .map(|authority| {
+            // `Authority::host` keeps the brackets of an IPv6 literal; the connector
+            // recognises (and sends no SNI for) only the bare address.
+            authority
+                .host()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_string()
+        })
         .unwrap_or_else(|| node.host().to_string())
 }
 

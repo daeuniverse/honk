@@ -286,6 +286,9 @@ fn ws_tls_server_name_prefers_the_host_header() {
     node.transport_mut().unwrap().ws_host = Some("cdn.example:8443".into());
     assert_eq!(tls_server_name(&node), "cdn.example");
 
+    node.transport_mut().unwrap().ws_host = Some("[2001:db8::1]:8443".into());
+    assert_eq!(tls_server_name(&node), "2001:db8::1");
+
     node.transport_mut().unwrap().ws_host = Some(String::new());
     assert_eq!(tls_server_name(&node), "127.0.0.1");
 
