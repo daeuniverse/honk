@@ -566,7 +566,7 @@ XHTTP 禁止 TCP Mux.Cool，但保留 UDP-only XUDP carrier。已有 VLESS UDP p
 
 TLS/REALITY、flow 或傳輸宣告相互衝突時會拒絕連結，不會靜默降級。VLESS 的 `obfs` 僅接受空值/`none`、`websocket` 或 `grpc`，不會把不支援的傳輸方式當作 TCP。`host` 和 `serviceName`/`service_name` 保留原有回退順序。明確 SNI 別名在賦值前依原始位元組比較：相同值合併，不同值報錯，不轉換大小寫。空值或純空白的 SNI 和 flow 在派生節點 ID 前正規化為未指定；非空 flow 必須為 `xtls-rprx-vision` 或 `xtls-rprx-vision-udp443`。
 
-Clash 匯入會比較 `servername`、`server-name` 和 `sni`；記錄格式還會比較 `tls-name` 和 `tls-host`，並保留較低優先順序的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。記錄中的 `off` 仍為無效值。分享連結和 VMess JSON 的 WebSocket `host` 僅用作 Host header；非 WebSocket 傳輸則當成較低優先順序的 SNI 回退值。TLS 使用方最終仍可回退到節點主機名稱。
+Clash 匯入會比較 `servername`、`server-name` 和 `sni`；記錄格式還會比較 `tls-name` 和 `tls-host`，並保留較低優先順序的 `obfs_sni` 回退值，包括 Quantumult X 的 WSS Host。記錄中的 `off` 仍為無效值。分享連結和 VMess JSON 的 WebSocket `host` 僅作為 Host header 保存；非 WebSocket 傳輸則當成較低優先順序的 SNI 回退值。一般 TLS 撥號在連線時依序使用明確的 `sni`、非空的 WebSocket `Host` 授權（忽略連接埠）、節點主機名稱，因此 CDN 前置節點驗證的是 header 中的發佈域名憑證，而不是它的邊緣位址。
 
 ### Hysteria2
 

@@ -319,8 +319,11 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 `maybe_tls_wrap_concrete` preserves the concrete TCP/TLS type needed by VLESS
 Vision direct-copy. When REALITY parameters are present, its [bounded
 authenticated setup](#server-authentication-and-fingerprint-constraints)
-replaces ordinary TLS. The shared path therefore gives Trojan, VMess, and VLESS
-consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
+replaces ordinary TLS. Ordinary TLS offers the explicit `sni` as SNI, otherwise
+the WebSocket `Host` authority with any port dropped, otherwise the endpoint
+hostname: a CDN-fronted node keeps the edge IP as its address and names the
+distribution only in that header. The shared path therefore gives Trojan,
+VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
 
 Cold and pooled-bare Trojan streams use that same complete transport stack. TLS
 batching returns bytes already read before surfacing a later I/O error on the
