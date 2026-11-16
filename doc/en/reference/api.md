@@ -1137,7 +1137,7 @@ An unadvertised option, such as `cache` without its store, returns `422 unsuppor
 
 `201` with the live node or provider and its `Location` is returned only after activation and subscription reconciliation. HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
 
-Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters of ASCII letters, digits, `_`, `.` or `-`, with an HTTP(S) URL of at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
+Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters without control characters; a name outside `[A-Za-z0-9_.-]` is written quoted, and one the configuration cannot quote returns `422 unsupported_value`. Provider URLs are HTTP(S) and at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
 
 Duplicate names return 409. Structurally valid but unsupported links, identities, provider URL schemes or options return 422. New providers start with zero nodes, stale status and no update time, even if an old cached body exists.
 

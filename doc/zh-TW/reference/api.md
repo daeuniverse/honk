@@ -1089,7 +1089,7 @@ GET 與成功的 PATCH 回應中有唯讀的 `recording`：`flows`、`logs`、`d
 
 只有啟用與訂閱協調都完成之後，才以 `201` 回傳目前的 Node 或 Provider 與 `Location`。HTTP 斷線不會取消已經入佇列的工作。使用 `--store db` 時，這些操作記錄新修訂，不重寫主檔案。
 
-節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個 ASCII 字母、數字或 `_.-`，HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
+節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個字元，不含控制字元；`[A-Za-z0-9_.-]` 以外的名稱加引號寫入，設定無法加引號的名稱回傳 `422 unsupported_value`。HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
 
 重名回傳 409。結構合法但不支援的連結、身分、provider URL scheme 或選項回傳 422。新 provider 即使有舊的快取內容，也從零節點、`stale`、沒有更新時間的狀態開始。
 
