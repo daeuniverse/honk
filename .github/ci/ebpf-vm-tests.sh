@@ -107,9 +107,14 @@ mark_test=proxy::packet::socket_mark_tests::socket_marks_preserve_global_and_dir
 test "$("$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --list --format terse)" = "$mark_test: test"
 "$HONK_OUTBOUND_TEST_BIN" "$mark_test" --exact --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-outbound-socket-marks.log"
-HONK_XDP_CORE_TEST_BIN="$HONK_CORE_TEST_BIN" HONK_XDP_XSK_TEST_BIN="$HONK_XSK_TEST_BIN" HONK_XDP_ARTIFACT_ROOT="$log_dir" \
-  bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" \
+mkdir -p "$log_dir/complete" "$log_dir/native"
+HONK_XDP_CORE_TEST_BIN="$HONK_CORE_TEST_BIN" HONK_XDP_XSK_TEST_BIN="$HONK_XSK_TEST_BIN" HONK_XDP_ARTIFACT_ROOT="$log_dir/complete" \
+  bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" all \
   2>&1 | tee "$log_dir/honk-xdp-daemon.log"
+env -u HONK_XDP_CORE_TEST_BIN -u HONK_XDP_XSK_TEST_BIN \
+  HONK_XDP_NATIVE_PROFILE=both HONK_XDP_NATIVE_CASE=matrix HONK_XDP_ARTIFACT_ROOT="$log_dir/native" \
+  bash "$repo/.github/ci/xdp-daemon-smoke.sh" "$HONK_XDP_DAEMON" native \
+  2>&1 | tee "$log_dir/honk-xdp-native-daemon.log"
 # TUN uses the same fresh executable, independently of the eBPF Cargo feature.
 for tun_test in \
   tun::setup::tests::kernel_tun_exclusive_fd_and_containment_are_owned \

@@ -227,8 +227,8 @@ global {
 
 ## Capture backend selection
 
-Omitting `datapath` preserves the existing TC backend. Full-XDP is an explicit Linux
-selection, not a fallback when TC or native continuation is unavailable:
+Omitting `datapath` preserves the existing TC backend. XDP is an explicit Linux
+selection:
 
 ```dae
 global {
@@ -245,18 +245,31 @@ datapath {
 }
 ```
 
-`direct` must be `core` (final Direct packets use CoreForward) or `endpoint`
-(Direct TCP terminates and relays). Interface roles are trusted ingress LAN/WAN
-zones, not execution dispositions; every discovered RX queue is required.
+`direct` must be `core` (final Direct packets use CoreForward), `endpoint`
+(Direct TCP terminates and relays), or `native` (eligible final Direct packets
+continue through the Linux stack using XDP candidate `PASS`). Native requires
+real eBPF and `global.nfqueue_enable: false`. It supports physical-interface capture
+or the Host-only mode below, not both together. TC and TUN reject `direct: native`;
+firewall/NAT remain exclusive to `direct: core`. Physical Native acceptance requires
+the TCX final gate and actual capture/return ownership; selecting the profile does
+not establish full V7 acceptance or a passing real-kernel test result.
+
+The current Native consumer requires `dial_mode: ip` and untagged physical ingress.
+Invalidating DNS changes temporarily close every Native-configured ingress while
+reader grace and candidate preparation run. Business packets in that window are
+refused; its bound under real DNS load is not yet measured.
+
+Interface roles are trusted ingress LAN/WAN zones, not execution dispositions;
+every discovered RX queue is required.
 Do not also set `global.lan_interface` or `global.wan_interface` for XDP.
 The backend, Direct profile, effective AF_XDP binding mode, and interface/zone setup
 require restart. Supported firewall/NAT rules use transactional policy publication.
-Unknown settings and native/marked continuation requests are rejected, not ignored.
+Unknown settings and unsupported marked continuation requests are rejected, not ignored.
 Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
 including empty nested blocks, are rejected rather than ignored.
 
-`xsk_mode` accepts `copy` or `zerocopy`; explicit XDP selection defaults to
-`zerocopy` when the field is omitted. ZeroCopy is forced for every selected RX
+Physical `datapath.interface` capture uses `datapath.xsk_mode`, accepting `copy` or
+`zerocopy`; omission defaults to forced ZeroCopy for every selected physical RX
 queue, with no Copy retry or fallback to another backend. Explicit `copy` remains
 supported. Advertised zero-copy/segment capability and complete-packet frame
 commitments are checked for all devices before the first attachment; every
@@ -265,6 +278,14 @@ Queue logs report that observed mode. Omitted and explicit `zerocopy` are equiva
 for reload; changing to or from `copy` requires restart. TC remains the default
 backend and rejects an explicit `xsk_mode`.
 
+`datapath.workers` is an XDP-only integer, either `1` (default) or `2`; changing it
+requires restart. Two workers require at least two actual physical queue owners
+and two CPUs in the effective cpuset. Each owns its queues and Stack shards on an
+OS thread; Host and Core coordination remain on worker 0. The logical realm,
+DNS/UDP source ownership and aggregate memory/flow limits do not multiply.
+Both workers share the existing single optional Busy grant. Calibration includes
+both queue/CPU contexts, so old single-owner evidence does not qualify the new setup.
+
 **Migration from the previous Copy default:** existing XDP configurations that
 omit `xsk_mode` now require working ZeroCopy on every selected queue. To preserve
 Copy behavior, add `xsk_mode: copy` to the existing `datapath` block before
@@ -272,8 +293,9 @@ upgrading. Without it, unsupported ZeroCopy rejects startup rather than silently
 falling back. Configurations that omit `datapath` keep TC unchanged.
 
 Core Direct requires `dial_mode: ip`; domain predicates use only DNS facts learned
-in the exact packet ingress scope, without hostname synthesis or sniffing. Core
-and Endpoint routing do not invent process or per-flow MAC facts. A pre-existing, independently
+in the exact packet ingress scope, without hostname synthesis or sniffing. Physical
+ingress has no authenticated process fact; process predicates require the explicit
+Host capture below. Neither path invents per-flow MAC facts. A pre-existing, independently
 validated bypass-mark routing table must isolate daemon socket traffic onto
 uncaptured uplinks; this example alone does not establish that topology.
 Core's input-context FIB contract currently rejects nonzero IPv6 flow labels and
@@ -281,6 +303,64 @@ router-specific extension/options execution that it cannot preserve. Endpoint IP
 support does not establish equivalent Core authority for those packet combinations.
 See [Full-XDP startup and limitations](../design/datapath.md) for device, VLAN,
 scatter/gather, retained-memory, pinned-guard, and stock-kernel admission boundaries.
+
+### XDP Host Endpoint
+
+Host-originated TCP/UDP capture requires an explicit `host` block and a build with
+`ebpf`. Select `backend: xdp` and `direct: endpoint`:
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    host {
+        xsk_mode: copy
+        interface {
+            eth0
+        }
+    }
+}
+```
+
+`host.interface` requires 1–16 unique explicit Ethernet names, as bare entries
+without roles or bodies. `host.xsk_mode: copy` is mandatory; it controls the owned
+private Host queue independently of the physical `datapath.xsk_mode` default.
+Unknown or duplicate Host fields/blocks are rejected. Physical `interface` capture
+may be omitted or added beside `host`; both use the same global Endpoint Direct
+profile. The complete Host configuration is restart-required. Keep NFQUEUE off,
+TC interface lists empty and the required bypass-mark routing in place.
+
+Admission currently requires x86-64 little endian, matching running-kernel BTF,
+active BPF LSM, exclusive effective root-cgroup hooks and plain source-namespace
+custody. Ordinary operator veths, stacked/mastered/tunnel links and foreign
+reinjection paths are refused; only the daemon's owned private veth pair is excepted.
+Consumers and actual Copy binding must be ready before the one-shot capture gate
+opens. Stale custody receipts refuse restart without adoption. See
+[Host source custody](../design/datapath.md#host-source-custody) for the full limits
+and retained-stop behavior.
+
+Authenticated Host facts may supply process routing. With `direct: endpoint`,
+Direct terminates and creates a new marked outbound; generated replies use ordinary
+Linux demultiplexing, not original socket-operation continuation. TUN's separate
+opt-in HostFacts support is described below.
+
+### XDP Host Native
+
+Use the same `host` block with `direct: native` and omit physical `datapath.interface`
+capture. The owned LOCAL_OUT consumer keeps an eligible original socket operation
+in Linux instead of opening a replacement outbound. Canonical marks distinguish
+Keep from Set, including Set(0) and all 32 bits; Host DNS facts use the real HOST scope.
+The selected socket executor stays frozen. Active TCP keeps its selected effect;
+a genuinely closed, drained Native TCP reconnect renews its attempt identity without
+switching to Endpoint. Ordinary UDP caches expire strictly after 120 seconds of
+inactivity; source-owner and queued-output retention remain independent.
+Live sources can require a guarded-retained stop rather than resource destruction.
+
+Host Native combined with physical Native is not admitted: the current reverse
+lookup cannot prove arbitrary CT zones or recover source indices after pre-CT tuple
+rewrites. TUN Native is also not implemented. Neither limitation is replaced by
+NFQUEUE, a guessed zone, reserved mark bits or a new outbound relay. These supported
+mode boundaries do not imply full V7 or E6/E7 acceptance.
 
 ### Linux TUN Endpoint
 
@@ -300,6 +380,7 @@ datapath {
     tun {
         name: honk0
         mtu: 1500
+        host_facts: true
         address4: 198.18.0.1/32
         address6: fd00:686f:6e6b:100::1/128
         table: 202
@@ -322,6 +403,7 @@ routing {
 | `address4` / `address6` | At least one required; exact host prefixes `/32` and `/128`. Unspecified, multicast, broadcast, mapped IPv6, link-local and duplicate local addresses are rejected. |
 | `table` | Required; `1..=0xfffffffe`, excluding `253..=255`. No existing route or rule may use this dedicated table. |
 | `rule_priority` | Required first priority P; `P >= 1` and checked `P+4 < 32766`. All five priorities `[P,P+4]` must be unused. |
+| `host_facts` | Optional strict boolean, default `false`. `true` requires an `ebpf` build and real source capture; changes require restart. |
 | `capture { ... }` | Required, 1–64 canonical CIDR networks in configured address families. Host bits and mutually containing redundant prefixes are rejected; entries are sorted and deduplicated. Only bare prefixes are accepted, without keyed entries or nested blocks. |
 
 TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
@@ -333,9 +415,9 @@ existing configurations do not change meaning and need no TUN migration.
 
 Run on Linux with `/dev/net/tun`, permission to create/configure TUN and apply
 `SO_MARK`, and no `--mock-ebpf`. Explicitly disable NFQUEUE and leave
-`global.lan_interface`/`wan_interface` empty. Nonzero traffic-rule/default marks,
-MAC and process-name predicates (including their negations) are unsupported.
-All four existing dial modes remain available; the example uses `ip`.
+`global.lan_interface`/`wan_interface` empty. Nonzero traffic-rule/default marks
+and MAC predicates (including negations) are unsupported. Process-name predicates
+are rejected unless `host_facts: true`. All four dial modes remain available.
 
 For every enabled address family honk validates the standard priority-0 local
 rule and installs exactly five owned RPDB rules, where M is the effective
@@ -395,14 +477,21 @@ ambiguous object. See [TUN setup and teardown](../design/datapath.md#linux-tun-e
 
 Direct TCP/UDP is an explicit Endpoint relay: real TUN FD read → scoped Stack →
 canonical Router → new direct/proxy outbound → generated reply → the same FD.
-Bare IP provides no authenticated Host/Transit or process identity, original
-socket, pre-NAT input or Native continuation. HostFacts (S-b), pre-import Native
-(S-c) and captured return (S-d) remain future work; S-a does not complete E6.4.
+With `host_facts: true`, authenticated application-socket records carry their
+original source facts into a separate Host scope; witnessed unattributed records
+remain plain, not proven Transit. Process names are available only for authenticated
+Host sources when present: Missing does not match a positive predicate but matches
+its negation. Both scopes share one 384 MiB capture budget. Standalone DNS learns
+only in the plain scope; transparent DNS learns in its packet's own scope. Neither
+scope borrows HOST DNS facts. Source admission requires real support and fails closed;
+it does not fall back to plain on source errors. The original source expiry is not
+refreshed by read delay. Native bypass (S-c) and captured return (S-d) remain absent;
+generated replies provide no original operation or pre-NAT/TTL equivalence.
 
-The entire canonical TUN setup, backend and Direct profile are restart-only;
-omitted MTU and explicit 1500 compare equal. Policy/group/DNS/subscription/mode
-updates use the existing transaction without reopening the FD or replacing its
-scope. Semantic `dns.bind` changes still require restart. Normal joined stop
+The entire canonical TUN setup, including `host_facts`, backend and Direct profile
+are restart-only; omitted MTU and explicit 1500 compare equal, as do omitted and
+explicit false `host_facts`. Policy/group/DNS/subscription/mode updates retain the
+FD and scopes. Semantic `dns.bind` changes still require restart. Normal joined stop
 removes capture first, drains actual owners, then removes owned rules/guards and
 the receipt to restore main routing. Failure or unconfirmed cleanup retains
 blackholes, rules and receipt for stop-source inspection and exact cleanup;

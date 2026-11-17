@@ -89,8 +89,15 @@ async fn driven_endpoints() -> (
     config.global.preconnect_node_count = 0;
     config.global.udp_warm_node_count = 0;
     let plane = crate::control::tests::support::control_plane(config);
-    let (endpoints, mut owner, mut drivers) =
-        PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1, None).unwrap();
+    let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
+        plane,
+        vec![(scope.clone(), scope_owner)],
+        1,
+        None,
+        ScopeId::HOST,
+    )
+    .await
+    .unwrap();
     let mut driver = drivers.pop().unwrap();
     poll_fn(|cx| {
         driver.service(cx, Instant::now());
@@ -676,6 +683,7 @@ fn vnet_byte_vectors_validate_family_extents_and_partial_udp_without_uso() {
                     offset: 16
                 },
                 flow: None,
+                source: None,
             }
         )
         .unwrap(),
@@ -818,7 +826,7 @@ fn runtime_refuses_unavailable_tun_authority_without_restricting_dial_modes() {
     config.global.wan_interface.push("wan0".into());
     assert!(validate_config(&config).is_err());
     let mut config = base.clone();
-    config.routing.default_mark = 1;
+    config.routing.default_mark = Some(1);
     assert!(validate_config(&config).is_err());
     for predicate in [
         "pname(curl)",
@@ -837,6 +845,95 @@ fn runtime_refuses_unavailable_tun_authority_without_restricting_dial_modes() {
             validate_config(&config).is_err(),
             "accepted unavailable {predicate}"
         );
+        config
+            .datapath
+            .as_mut()
+            .unwrap()
+            .tun
+            .as_mut()
+            .unwrap()
+            .host_facts = true;
+        assert_eq!(
+            validate_config(&config).is_ok(),
+            cfg!(feature = "ebpf") && predicate.contains("pname"),
+            "Host process admission or MAC refusal changed: {predicate}"
+        );
     }
     validate_runtime(&Config::default(), true).unwrap();
+}
+
+#[tokio::test]
+async fn scope_class_groups_share_one_write_attempt_budget_and_keep_later_leases() {
+    let (scope, owner, budget) = scope();
+    let mut groups: [[Option<OutputLease>; BATCH]; 4] =
+        std::array::from_fn(|_| std::array::from_fn(|_| None));
+    for pending in &mut groups {
+        pending[0] = Some(output(&scope).await);
+    }
+    let pointers: Vec<_> = groups
+        .iter()
+        .map(|pending| pending[0].as_ref().unwrap().packet().as_ptr())
+        .collect();
+    let mut attempts = 0;
+    let mut bytes = 0;
+    // Isolate the syscall ceiling from scheduler latency in this unit fixture.
+    let started = Instant::now() + Duration::from_secs(60);
+    let mut calls = 0;
+    assert_eq!(
+        flush_pending(
+            &mut groups[0],
+            &mut attempts,
+            &mut bytes,
+            started,
+            |header, packet| {
+                calls += 1;
+                if calls < BATCH * 2 {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(header.len() + packet.len())
+                }
+            }
+        )
+        .unwrap(),
+        (false, false)
+    );
+    assert_eq!(attempts, BATCH * 2);
+    for group in 1..4 {
+        assert_eq!(
+            flush_pending(
+                &mut groups[group],
+                &mut attempts,
+                &mut bytes,
+                started,
+                |_, _| panic!("later group acquired a fresh syscall budget")
+            )
+            .unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            groups[group][0].as_ref().unwrap().packet().as_ptr(),
+            pointers[group]
+        );
+    }
+    // The next turn starts with the next group, without copying or replacing its lease.
+    attempts = 0;
+    bytes = 0;
+    for group in 1..4 {
+        flush_pending(
+            &mut groups[group],
+            &mut attempts,
+            &mut bytes,
+            Instant::now(),
+            |header, packet| {
+                assert_eq!(packet.as_ptr(), pointers[group]);
+                Ok(header.len() + packet.len())
+            },
+        )
+        .unwrap();
+    }
+    assert!(groups.iter().flatten().all(Option::is_none));
+    scope.shutdown(true);
+    owner.run().await;
+    drop((groups, scope));
+    assert_eq!(budget.used(), 0);
 }

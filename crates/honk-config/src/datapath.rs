@@ -19,6 +19,7 @@ pub enum Backend {
 pub enum DirectProfile {
     Core,
     Endpoint,
+    Native,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +175,8 @@ pub struct TunConfig {
     pub name: String,
     #[serde(default = "default_tun_mtu")]
     pub mtu: u16,
+    #[serde(default)]
+    pub host_facts: bool,
     #[serde(
         default,
         serialize_with = "serialize_address4",
@@ -347,17 +350,49 @@ impl TunConfig {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostConfig {
+    pub interfaces: Vec<String>,
+    pub xsk_mode: XskMode,
+}
+
+impl HostConfig {
+    pub fn validate(&self) -> Result<(), crate::ConfigError> {
+        let invalid =
+            |message: &str| crate::ConfigError::Parse(format!("datapath.host: {message}"));
+        if self.xsk_mode != XskMode::Copy {
+            return Err(invalid("requires explicit xsk_mode: copy"));
+        }
+        if self.interfaces.is_empty() || self.interfaces.len() > 16 {
+            return Err(invalid(
+                "requires between one and sixteen explicit interfaces",
+            ));
+        }
+        for (index, name) in self.interfaces.iter().enumerate() {
+            if !explicit_interface_name(name) || self.interfaces[..index].contains(name) {
+                return Err(invalid(
+                    "interfaces must have unique, explicit Ethernet names",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DatapathConfig {
     pub backend: Backend,
     pub direct: Option<DirectProfile>,
     pub xsk_mode: Option<XskMode>,
+    pub workers: Option<u8>,
     pub poll_mode: Option<PollMode>,
     pub busy_poll: Option<BusyPollConfig>,
     pub interfaces: Vec<XdpInterface>,
     pub firewall: Option<FirewallConfig>,
     pub nat: NatConfig,
     pub tun: Option<TunConfig>,
+    pub host: Option<HostConfig>,
 }
 
 impl Serialize for DatapathConfig {
@@ -371,12 +406,17 @@ impl Serialize for DatapathConfig {
             + usize::from(interfaces)
             + usize::from(self.poll_mode.is_some())
             + usize::from(self.busy_poll.is_some())
-            + usize::from(self.tun.is_some());
+            + usize::from(self.tun.is_some())
+            + usize::from(self.workers.is_some())
+            + usize::from(self.host.is_some());
         let mut output = serializer.serialize_struct("DatapathConfig", fields)?;
         output.serialize_field("backend", &self.backend)?;
         output.serialize_field("direct", &self.direct)?;
         if xsk_mode {
             output.serialize_field("xsk_mode", &self.xsk_mode)?;
+        }
+        if let Some(workers) = self.workers {
+            output.serialize_field("workers", &workers)?;
         }
         if let Some(poll_mode) = &self.poll_mode {
             output.serialize_field("poll_mode", poll_mode)?;
@@ -394,6 +434,9 @@ impl Serialize for DatapathConfig {
         if let Some(tun) = &self.tun {
             output.serialize_field("tun", tun)?;
         }
+        if let Some(host) = &self.host {
+            output.serialize_field("host", host)?;
+        }
         output.end()
     }
 }
@@ -410,6 +453,8 @@ impl<'de> Deserialize<'de> for DatapathConfig {
             #[serde(default, deserialize_with = "present")]
             xsk_mode: Option<Option<XskMode>>,
             #[serde(default, deserialize_with = "present")]
+            workers: Option<u8>,
+            #[serde(default, deserialize_with = "present")]
             poll_mode: Option<PollMode>,
             #[serde(default, deserialize_with = "present")]
             busy_poll: Option<BusyPollConfig>,
@@ -421,6 +466,8 @@ impl<'de> Deserialize<'de> for DatapathConfig {
             nat: NatConfig,
             #[serde(default, deserialize_with = "present")]
             tun: Option<TunConfig>,
+            #[serde(default, deserialize_with = "present")]
+            host: Option<HostConfig>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
@@ -435,12 +482,14 @@ impl<'de> Deserialize<'de> for DatapathConfig {
             backend: wire.backend,
             direct: wire.direct,
             xsk_mode: wire.xsk_mode.flatten(),
+            workers: wire.workers,
             poll_mode: wire.poll_mode,
             busy_poll: wire.busy_poll,
             interfaces: wire.interfaces.unwrap_or_default(),
             firewall: wire.firewall.flatten(),
             nat: wire.nat,
             tun: wire.tun,
+            host: wire.host,
         })
     }
 }
@@ -449,6 +498,27 @@ impl DatapathConfig {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         let invalid = |message: &str| crate::ConfigError::Parse(format!("datapath: {message}"));
         let has_nat = !self.nat.is_empty();
+        if self.workers.is_some()
+            && (self.backend != Backend::Xdp || !matches!(self.workers, Some(1 | 2)))
+        {
+            return Err(invalid("workers requires XDP and must be 1 or 2"));
+        }
+        if self.effective_workers() == 2 && self.interfaces.is_empty() {
+            return Err(invalid("workers: 2 requires physical XDP interfaces"));
+        }
+        if let Some(host) = &self.host {
+            if self.backend != Backend::Xdp
+                || !matches!(
+                    self.direct,
+                    Some(DirectProfile::Endpoint | DirectProfile::Native)
+                )
+            {
+                return Err(invalid(
+                    "Host requires backend: xdp and direct: endpoint or native",
+                ));
+            }
+            host.validate()?;
+        }
         match self.backend {
             Backend::Tc => {
                 if self.direct.is_some()
@@ -472,10 +542,11 @@ impl DatapathConfig {
                 }
                 if self.direct.is_none() {
                     return Err(invalid(
-                        "XDP requires explicit direct: core or direct: endpoint; native continuation is unavailable",
+                        "XDP requires explicit direct: core, direct: endpoint or direct: native",
                     ));
                 }
-                if self.interfaces.is_empty() || self.interfaces.len() > 16 {
+                if (self.interfaces.is_empty() && self.host.is_none()) || self.interfaces.len() > 16
+                {
                     return Err(invalid(
                         "XDP requires between one and sixteen explicit interfaces",
                     ));
@@ -521,6 +592,10 @@ impl DatapathConfig {
         }
     }
 
+    pub fn effective_workers(&self) -> u8 {
+        self.workers.unwrap_or(1)
+    }
+
     pub fn effective_poll_mode(&self) -> PollMode {
         self.poll_mode.unwrap_or_default()
     }
@@ -533,7 +608,9 @@ impl DatapathConfig {
         self.backend == other.backend
             && self.direct == other.direct
             && self.effective_xsk_mode() == other.effective_xsk_mode()
+            && self.effective_workers() == other.effective_workers()
             && self.interfaces == other.interfaces
             && self.tun == other.tun
+            && self.host == other.host
     }
 }

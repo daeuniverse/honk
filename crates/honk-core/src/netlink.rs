@@ -16,13 +16,10 @@ use std::io;
 use std::net::IpAddr;
 #[cfg(feature = "ebpf")]
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use nix::sys::socket::recvfrom;
-use nix::sys::socket::{
-    AddressFamily, MsgFlags, NetlinkAddr, SockFlag, SockProtocol, SockType, bind, recv, send,
-    setsockopt, socket, sockopt,
-};
+use nix::sys::socket::{MsgFlags, NetlinkAddr, bind, recv, send, setsockopt, sockopt};
 use nix::sys::time::TimeVal;
 
 pub(crate) mod fib;
@@ -420,21 +417,30 @@ fn tun_rule(rule: &TunRule, name: &str) -> ([u8; 12], Vec<(u16, Attr)>) {
     (header, attrs)
 }
 
-/// One synchronous NETLINK_ROUTE connection.
+/// One synchronous namespace-bound netlink connection; route is the default.
 pub(crate) struct NlSock {
-    fd: OwnedFd,
-    seq: u32,
+    pub(crate) fd: OwnedFd,
+    pub(crate) seq: u32,
 }
 
 impl NlSock {
     pub(crate) fn new() -> io::Result<Self> {
-        let fd = socket(
-            AddressFamily::Netlink,
-            SockType::Raw,
-            SockFlag::SOCK_CLOEXEC,
-            SockProtocol::NetlinkRoute,
-        )
-        .map_err(io::Error::from)?;
+        Self::from_protocol(libc::NETLINK_ROUTE)
+    }
+
+    pub(crate) fn from_protocol(protocol: i32) -> io::Result<Self> {
+        // SAFETY: socket returns a new descriptor, adopted exactly once below.
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                protocol,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
         setsockopt(&fd, sockopt::ReceiveTimeout, &TimeVal::new(2, 0)).map_err(io::Error::from)?;
         bind(fd.as_raw_fd(), &NetlinkAddr::new(0, 0)).map_err(io::Error::from)?;
         Ok(Self { fd, seq: 0 })
@@ -444,7 +450,7 @@ impl NlSock {
     /// before consuming: reading an oversize datagram straight away would
     /// silently drop its truncated remainder and make the next datagram
     /// look like the retry. EINTR is retried, oversize is a hard error.
-    fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
+    pub(crate) fn recv_one(&self, buf: &mut Vec<u8>) -> io::Result<usize> {
         const MAX_BUF: usize = 1 << 20;
         loop {
             let needed = match recv(
@@ -477,7 +483,7 @@ impl NlSock {
         }
     }
 
-    fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
+    pub(crate) fn send_datagram(&self, buf: &[u8]) -> io::Result<()> {
         let sent = send(self.fd.as_raw_fd(), buf, MsgFlags::empty()).map_err(io::Error::from)?;
         if sent == buf.len() {
             Ok(())

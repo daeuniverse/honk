@@ -735,11 +735,23 @@ impl TunSetup {
     /// Creates the device and its containment: guards and all five rules per
     /// enabled family, without capture routes. The returned watcher was
     /// subscribed after the last own change, so any notice on it is foreign.
-    pub(super) fn prepare(config: &Config) -> anyhow::Result<(Self, TunDevice, Topology)> {
-        Self::prepare_in(config, honk_config::paths::data_dir())
+    pub(super) fn prepare(
+        config: &Config,
+        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+    ) -> anyhow::Result<(Self, TunDevice, Topology)> {
+        Self::prepare_in(
+            config,
+            honk_config::paths::data_dir(),
+            #[cfg(feature = "ebpf")]
+            source,
+        )
     }
 
-    fn prepare_in(config: &Config, data_dir: &Path) -> anyhow::Result<(Self, TunDevice, Topology)> {
+    fn prepare_in(
+        config: &Config,
+        data_dir: &Path,
+        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+    ) -> anyhow::Result<(Self, TunDevice, Topology)> {
         ensure!(
             !SOURCE_SHA.is_empty(),
             "backend tun records the full source commit in its setup receipt, but this binary has none; \
@@ -774,7 +786,10 @@ impl TunSetup {
             journal,
             netlink,
         };
-        match setup.install() {
+        match setup.install(
+            #[cfg(feature = "ebpf")]
+            source,
+        ) {
             Ok((device, guarded)) => {
                 drop(preflight);
                 Ok((setup, device, guarded))
@@ -784,9 +799,16 @@ impl TunSetup {
         }
     }
 
-    fn install(&mut self) -> anyhow::Result<(TunDevice, Topology)> {
+    fn install(
+        &mut self,
+        #[cfg(feature = "ebpf")] source: Option<&mut super::source::Source>,
+    ) -> anyhow::Result<(TunDevice, Topology)> {
         let device = self.create_link()?;
         let ifindex = device.ifindex;
+        #[cfg(feature = "ebpf")]
+        if let Some(source) = source {
+            source.bind(device.as_raw_fd(), ifindex, device.incarnation)?;
+        }
         for (key, value) in self.plan.sysctls() {
             let resource = Resource::Sysctl {
                 key: key.clone(),

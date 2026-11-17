@@ -235,8 +235,12 @@ async fn native_userspace_backend_matches_datapath_contract_without_kernel_claim
 
     let app = TestApp::new(|_| {}).await;
     let admission = Arc::new(AtomicBool::new(false));
-    *app.control.policy_backend_handle().write().await =
-        Box::new(UserspaceBackend::new(Arc::clone(&admission)));
+    *app.control.policy_backend_handle().write().await = Box::new(UserspaceBackend::new(
+        Arc::clone(&admission),
+        Arc::new(parking_lot::RwLock::new(
+            honk_core::ebpf::PnameSupport::Unavailable,
+        )),
+    ));
     let capabilities = response_json(app.get("/api/v1/capabilities").send().await.unwrap()).await;
     assert!(
         capabilities["resources"]["datapath"]["kinds"]

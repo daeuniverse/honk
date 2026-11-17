@@ -11,7 +11,7 @@ use crate::tcp::Tcb;
 use crate::tcp::output::Output;
 use crate::tcp::passive::Gate;
 use crate::wire;
-use crate::{DropReason, FlowId, Rx, Stack, StreamError};
+use crate::{DropReason, FlowId, Rx, SourceContext, Stack, StreamError};
 
 /// Longest a SYN may stay undecided or deferred. The edge classifier's handoff expires at 30 s;
 /// deciding within 25 s keeps the stack's answer from racing it.
@@ -166,12 +166,20 @@ impl Stack {
         }
         let (tuple, seq) = (t.tuple, t.irs);
         t.abort();
+        let source = self.table.source(id.idx);
         let ack = seq.wrapping_add(1);
         match how {
             Refuse::Drop => {}
-            Refuse::Rst => self.control(tuple, 0, ack, wire::tcp::RST | wire::tcp::ACK, Some(id)),
+            Refuse::Rst => self.control(
+                tuple,
+                0,
+                ack,
+                wire::tcp::RST | wire::tcp::ACK,
+                Some(id),
+                source,
+            ),
             Refuse::IcmpUnreachable | Refuse::IcmpAdminProhibited => {
-                self.refusal(id, tuple, seq, how);
+                self.refusal(id, tuple, seq, how, source);
             }
         }
         self.tx_wakeup = true;
@@ -187,6 +195,10 @@ impl Stack {
         h: &wire::tcp::Header,
         dscp: u8,
         reopen: Option<(u32, u32)>,
+        report: &mut crate::stack::SourceReport<
+            '_,
+            impl FnMut(crate::ValidatedSource, Option<SourceContext>) -> bool,
+        >,
     ) -> Option<Rx> {
         if h.flags & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
             != wire::tcp::SYN
@@ -212,9 +224,19 @@ impl Stack {
         if self.table.active >= self.cfg.max_flows
             || self.table.tcp_active >= self.floor_cap
             || !self.table.can_insert(reopen.map(|(index, _)| index))
+            || !self.half_open_release_room()
+            || (self.has_realm_resources() && report.half_open.is_none())
             || !self.pool.admit_floor()
         {
             return Some(self.drop_packet(DropReason::Capacity));
+        }
+        if report
+            .half_open
+            .as_mut()
+            .is_some_and(|admit| !admit(source))
+        {
+            self.pool.release_floor();
+            return Some(self.drop_packet(DropReason::HalfOpen));
         }
         let mut iss = flow::isn(
             &self.cfg.secret,
@@ -233,6 +255,7 @@ impl Stack {
         let mut t = Tcb::new_passive(tuple, &self.cfg, now, self.epoch, iss, offset, h);
         t.dscp = dscp;
         let id = self.table.insert(Flow::Tcp(Box::new(t)));
+        self.table.set_source(id.idx, report.context);
         self.half_open += 1;
         *self.half_open_by_source.entry(source).or_default() += 1;
         self.accept_q.push_back(id);
@@ -248,6 +271,7 @@ impl Stack {
         c: &Control,
         how: Refuse,
         out: &mut [u8],
+        icmp: &mut Option<&mut crate::IcmpState>,
     ) -> Output {
         let mut quote = [0u8; 64];
         let kind = match how {
@@ -255,7 +279,11 @@ impl Stack {
             _ => Reject::HostUnreachable,
         };
         let result = match quote_syn(c.tuple, c.seq, &mut quote) {
-            Some(n) => self.icmp_out.emit(now, kind, &quote[..n], out),
+            Some(n) => {
+                icmp.as_deref_mut()
+                    .unwrap_or(&mut self.icmp_out)
+                    .emit(now, kind, &quote[..n], out)
+            }
             None => IcmpEmit::Suppressed,
         };
         if result == IcmpEmit::TooSmall {
@@ -280,7 +308,14 @@ impl Stack {
     }
 
     /// Queues the ICMP error for a refused SYN.
-    fn refusal(&mut self, id: FlowId, tuple: FourTuple, seq: u32, how: Refuse) {
+    fn refusal(
+        &mut self,
+        id: FlowId,
+        tuple: FourTuple,
+        seq: u32,
+        how: Refuse,
+        source: Option<SourceContext>,
+    ) {
         self.queue_control(Control {
             tuple,
             seq,
@@ -288,6 +323,7 @@ impl Stack {
             flags: 0,
             icmp: Some(how),
             flow: Some(id),
+            source,
         });
     }
 }

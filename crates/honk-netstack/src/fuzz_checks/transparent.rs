@@ -3,12 +3,13 @@
 //! after each operation the whole stack is recounted.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant};
 
 use crate::wire::{self, tcp};
 use crate::{
     AcceptOpts, AcceptWhen, Config, Csum, ExcludeSet, FlowId, GsoKind, GsoRx, Keepalive, Mode,
-    Refuse, Rx, RxMeta, Stack, Transmit, TxCaps, TxCsum,
+    Refuse, Rx, RxMeta, SourceContext, Stack, Transmit, TxCaps, TxCsum,
 };
 
 const MAX_OPS: usize = 192;
@@ -66,6 +67,8 @@ pub(super) mod op {
     pub const CAPS: u8 = 14;
     /// `[kind, length, behavior]`: valid UDP fragments, reordered/duplicated/incomplete/corrupt.
     pub const FRAGMENTS: u8 = 15;
+    /// `[lineage, snapshot]`: zero lineage restores ordinary input; snapshot is nonzero encoded.
+    pub const SOURCE: u8 = 16;
 }
 
 /// One (client, destination) tuple the script plays the client of.
@@ -92,6 +95,7 @@ struct World {
     rx_gso_packets: usize,
     tx_gso_packets: usize,
     reassembled: usize,
+    source: Option<SourceContext>,
 }
 
 fn client(i: usize) -> SocketAddr {
@@ -206,8 +210,10 @@ impl World {
         cfg.shared_budget = Some(crate::MemoryBudget::new(1024 * 1024));
         cfg.tcp_rcv_buf_max = 128 * 1024;
         cfg.tcp_snd_buf_max = 128 * 1024;
+        let mut stack = Stack::new(cfg, base);
+        stack.prepare_source_context().unwrap();
         World {
-            stack: Stack::new(cfg, base),
+            stack,
             base,
             now: base,
             slots: Vec::new(),
@@ -217,6 +223,7 @@ impl World {
             rx_gso_packets: 0,
             tx_gso_packets: 0,
             reassembled: 0,
+            source: None,
         }
     }
 
@@ -268,12 +275,23 @@ impl World {
         if corrupt {
             packet[field] ^= 0x55;
         }
-        let rx = self.stack.receive_with(self.now, packet, meta);
+        let rx = self.receive(packet, meta);
         if meta.gso.is_some() && matches!(rx, Rx::Consumed | Rx::TransparentSplit { .. }) {
             self.rx_gso_packets += 1;
         }
         rx
     }
+    }
+
+    fn receive(&mut self, packet: &[u8], meta: RxMeta) -> Rx {
+        match self.source {
+            Some(source) => {
+                self.stack
+                    .receive_with_context(self.now, packet, meta, source, |_, _| true)
+                    .0
+            }
+            None => self.stack.receive_with(self.now, packet, meta),
+        }
 
     fn plain(&self) -> tcp::Options {
         tcp::Options {
@@ -450,11 +468,38 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
         },
         gso: None,
     };
+    let original_ingress = w.now;
+    let delayed = how & 64 != 0 && w.source.is_none();
+    if delayed {
+        w.now += Duration::from_secs(31);
+    }
     for (index, packet) in packets.iter().enumerate() {
         if omit == Some(index) {
             continue;
         }
-        let rx = w.stack.receive_with(w.now, packet, meta);
+        let source = w.source;
+        if index == 1
+            && how & 128 != 0
+            && let Some(source) = &mut w.source
+        {
+            source.snapshot = NonZeroU64::new(source.snapshot.get() + 1).unwrap();
+        }
+        let ingress_at = original_ingress + Duration::from_secs(if index == 0 { 10 } else { 0 });
+        let rx = if delayed {
+            w.stack
+                .receive_with_realm_admission(
+                    ingress_at,
+                    w.now,
+                    packet,
+                    RxMeta::VERIFY,
+                    |_| true,
+                    |_| true,
+                )
+                .0
+        } else {
+            w.receive(packet, meta)
+        };
+        w.source = source;
         if let Rx::TransparentOwned {
             src: got_src,
             dst: got_dst,
@@ -470,12 +515,43 @@ fn fragments(w: &mut World, kind: u8, len: u8, how: u8) {
             );
             assert_eq!((got_src, got_dst), (src, dst));
             assert_eq!(dscp, 0);
+            assert!(packet.fragment_info().original_ingress <= packet.completion_ingress());
+            assert!(packet.completion_ingress() <= w.now);
+            let fragment = packet.fragment_info();
+            assert_eq!(
+                (
+                    fragment.identity.src,
+                    fragment.identity.dst,
+                    fragment.identity.proto
+                ),
+                (src.ip(), dst.ip(), wire::PROTO_UDP)
+            );
+            assert_eq!(
+                fragment.identity.id,
+                if src.is_ipv4() {
+                    u32::from(ident as u16)
+                } else {
+                    ident
+                }
+            );
+            assert_eq!(fragment.incarnation.is_some(), packets.len() > 1);
             assert_eq!(&packet[range], payload);
             w.reassembled += 1;
         }
         w.stack.check();
         if how & 2 != 0 {
-            w.stack.receive_with(w.now, packet, meta);
+            if delayed {
+                w.stack.receive_with_realm_admission(
+                    ingress_at,
+                    w.now,
+                    packet,
+                    RxMeta::VERIFY,
+                    |_| true,
+                    |_| true,
+                );
+            } else {
+                w.receive(packet, meta);
+            }
             w.stack.check();
         }
     }
@@ -495,7 +571,7 @@ pub fn check(data: &[u8]) {
 }
 
 fn step(w: &mut World, r: &mut Reader) {
-    let opcode = r.u8() % 16;
+    let opcode = r.u8() % 17;
     match opcode {
         op::SYN => {
             let (c, d, mss) = (usize::from(r.u8()) % CLIENTS, usize::from(r.u8()), r.u8());
@@ -766,6 +842,14 @@ fn step(w: &mut World, r: &mut Reader) {
                     check_transmit(&tx, &reply[..tx.len]);
                     w.tx_gso_packets += usize::from(tx.gso.is_some());
                 }
+            } else if let Some(source) = w.source {
+                if let Ok(tx) = w
+                    .stack
+                    .udp_send_from_with_context(d, c, &payload, source, &mut reply)
+                {
+                    assert_eq!(tx.source, Some(source));
+                    check_transmit(&tx, &reply[..tx.len]);
+                }
             } else if let Ok(n) = w.stack.udp_send_from(d, c, &payload, &mut reply) {
                 assert!(wire::parse_ip(&reply[..n]).is_ok());
             }
@@ -787,10 +871,17 @@ fn step(w: &mut World, r: &mut Reader) {
             fragments(w, kind, len, how);
             w.drain();
         }
+        op::SOURCE => {
+            let (lineage, snapshot) = (r.u8(), r.u8());
+            w.source = NonZeroU64::new(u64::from(lineage)).map(|lineage| SourceContext {
+                lineage,
+                snapshot: NonZeroU64::new(u64::from(snapshot) + 1).unwrap(),
+            });
+        }
         _ => {
             let len = usize::from(r.u8() % 64);
             let bytes: Vec<u8> = (0..len).map(|_| r.u8()).collect();
-            w.stack.receive(w.now, &bytes);
+            w.receive(&bytes, RxMeta::VERIFY);
             w.drain();
         }
     }
@@ -832,6 +923,7 @@ pub fn seeds() -> Vec<Vec<u8>> {
         FRAGMENTS, 0, 90, 0, FRAGMENTS, 1, 90, 1,
         FRAGMENTS, 0, 90, 20, FRAGMENTS, 1, 90, 24,
         TCP_GSO, 0, 10, 2, 3, 3, UDP_GSO, 0, 20, 0, 0,
+        FRAGMENTS, 0, 90, 64, FRAGMENTS, 1, 90, 65,
         CAPS, 0, APP, 0, 1, 255,
     ]);
     let mut control = open.clone();
@@ -842,7 +934,14 @@ pub fn seeds() -> Vec<Vec<u8>> {
         CAPS, 160, DATA, 0, 3, 0, CAPS, 128,
         CAPS, 64, APP, 0, 0, 8, CAPS, 0,
     ]);
-    vec![bulk, keepalive, deferred, refuse, close, caps, udp, offloads, control]
+    let mut contextual = vec![SOURCE, 1, 0];
+    contextual.extend(open);
+    contextual.extend([
+        SOURCE, 2, 1, RST, 0, 0, SOURCE, 1, 1, DATA, 0, 2, 0,
+        FRAGMENTS, 0, 90, 128, FRAGMENTS, 1, 90, 1,
+        UDP, 0, 0, UDP, 1, 255, APP, 0, 4, 0,
+    ]);
+    vec![bulk, keepalive, deferred, refuse, close, caps, udp, offloads, control, contextual]
 }
 
 #[cfg(test)]

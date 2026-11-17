@@ -218,6 +218,7 @@ impl VlessRuntime {
         client: SocketAddr,
         path: VlessUdpPath,
         reply_destination: Option<SocketAddr>,
+        packet_source: Option<[u8; 16]>,
     ) -> [u8; 8] {
         let key = self.source_key.get_or_init(rand::random);
         let mut hash = blake3::Hasher::new_keyed(key);
@@ -241,6 +242,10 @@ impl VlessRuntime {
                 hash_socket(&mut hash, normalize_socket(destination));
             }
         };
+        if let Some(source) = packet_source {
+            hash.update(b"\0packet-source-v1\0");
+            hash.update(&source);
+        }
         let mut id = [0; 8];
         id.copy_from_slice(&hash.finalize().as_bytes()[..8]);
         if id == [0; 8] {
@@ -274,4 +279,44 @@ fn hash_socket(hash: &mut blake3::Hasher, address: SocketAddr) {
         }
     }
     hash.update(&address.port().to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn packet_source_extends_only_the_legacy_hash_suffix() {
+        let key = [3; 32];
+        let runtime = VlessRuntime {
+            h2: None,
+            shared_cool: None,
+            separate_cool: None,
+            tcp_warm: None,
+            udp_warm: None,
+            source_key: OnceLock::from(key),
+        };
+        let client = "192.0.2.1:53000".parse().unwrap();
+        let mut bytes = b"honk-vless-xudp-source-v2".to_vec();
+        bytes.extend_from_slice(&42u64.to_be_bytes());
+        bytes.extend_from_slice(&[4, 192, 0, 2, 1]);
+        bytes.extend_from_slice(&53000u16.to_be_bytes());
+        bytes.extend_from_slice(&[2, 0]);
+        for source in [None, Some([9; 16])] {
+            let mut input = bytes.clone();
+            if let Some(source) = source {
+                input.extend_from_slice(b"\0packet-source-v1\0");
+                input.extend_from_slice(&source);
+            }
+            let hash = blake3::keyed_hash(&key, &input);
+            let mut expected: [u8; 8] = hash.as_bytes()[..8].try_into().unwrap();
+            if expected == [0; 8] {
+                expected[7] = 1;
+            }
+            assert_eq!(
+                runtime.source_id(42, client, VlessUdpPath::Xudp, None, source),
+                expected
+            );
+        }
+    }
 }

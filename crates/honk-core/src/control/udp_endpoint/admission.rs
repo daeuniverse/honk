@@ -6,10 +6,11 @@ pub(super) const FLOW_QUEUE_CAPACITY: usize = 64;
 /// All retained payload bytes across UDP flows are bounded exactly by permits.
 pub(super) const GLOBAL_PAYLOAD_CAPACITY: usize = 8 * 1024 * 1024;
 
-/// Key for the endpoint pool: (scope, client address, destination address).
+/// Pool identity: scope, optional original packet lineage, client and destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct EndpointKey {
     pub(super) scope: ScopeId,
+    pub(super) packet_lineage: Option<NonZeroU64>,
     pub(super) client_ip: [u8; 16],
     pub(super) client_port: u16,
     pub(super) dst_ip: [u8; 16],
@@ -17,7 +18,12 @@ pub(super) struct EndpointKey {
 }
 
 impl EndpointKey {
-    pub(super) fn new(scope: ScopeId, client: SocketAddr, dst: SocketAddr) -> Self {
+    pub(super) fn new(
+        scope: ScopeId,
+        client: SocketAddr,
+        dst: SocketAddr,
+        packet_lineage: Option<NonZeroU64>,
+    ) -> Self {
         let mut cip = [0u8; 16];
         let mut dip = [0u8; 16];
         match client.ip() {
@@ -38,6 +44,7 @@ impl EndpointKey {
         }
         Self {
             scope,
+            packet_lineage,
             client_ip: cip,
             client_port: client.port(),
             dst_ip: dip,
@@ -266,6 +273,7 @@ enum PacketAdmissionError {
 }
 pub(super) struct InitializingEndpoint {
     pub(super) owner: UdpFlowOwner,
+    pub(super) packet_source: Option<SourceWork>,
     pub(super) generation: u64,
     pub(super) epoch: u64,
     pub(super) raw_dns_route: Option<RawDnsRoute>,
@@ -342,6 +350,7 @@ pub(super) enum EndpointEntry {
         generation: u64,
         owner: UdpFlowOwner,
         io: Option<Arc<RetirementIo>>,
+        _packet_source: Option<SourceWork>,
         _memory: Option<Arc<super::budget::EntryMemory>>,
         #[cfg(feature = "native-api")]
         native_terminal: Option<observation::SharedTerminal>,
@@ -433,6 +442,14 @@ pub(in crate::control) struct UdpInitLease {
 }
 
 impl UdpInitLease {
+    pub(in crate::control) fn packet_source(&self) -> Option<&SourceWork> {
+        self.initializer.packet_source.as_ref()
+    }
+
+    pub(in crate::control) fn packet_lineage(&self) -> Option<NonZeroU64> {
+        self.key.packet_lineage
+    }
+
     #[cfg(feature = "native-api")]
     pub(in crate::control) fn set_packet_trace_id(&mut self, trace_id: Option<u32>) {
         self.packet_trace_id =
@@ -639,6 +656,11 @@ impl UdpInitLease {
     /// not an insert-after-lookup: a cancelled/old initializer cannot publish
     /// over a newer incarnation.
     pub(in crate::control) fn commit_ready(&mut self, endpoint: Arc<UdpEndpoint>) -> bool {
+        if endpoint.packet_source().map(SourceWork::identity)
+            != self.packet_source().map(SourceWork::identity)
+        {
+            return false;
+        }
         if let EndpointTransport::Source(source) = &endpoint.transport
             && source.scope() != self.key.scope
         {
@@ -719,6 +741,7 @@ impl UdpInitLease {
             generation: self.generation,
             owner: self.owner,
             io: None,
+            _packet_source: self.packet_source().cloned(),
             _memory: self.initializer.memory.clone(),
             #[cfg(feature = "native-api")]
             native_terminal: self.initializer.native_terminal.get().cloned(),
@@ -730,6 +753,7 @@ impl UdpInitLease {
         drop(self.connection_guard.take());
         self.pool.notify_removed(EndpointRemoval {
             scope: self.key.scope,
+            packet_lineage: self.key.packet_lineage,
             client: SocketAddr::new(self.key.client_ip(), self.key.client_port),
             dst: SocketAddr::new(self.key.dst_ip(), self.key.dst_port),
             conn_id,
@@ -939,6 +963,7 @@ impl UdpEndpointPool {
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
         stats: &StatsManager,
+        packet_source: Option<SourceWork>,
     ) -> EndpointReservation {
         if (raw_dns_route.is_some()
             || owner.is_stateless(vacant.key().client_port, vacant.key().dst_port))
@@ -998,6 +1023,7 @@ impl UdpEndpointPool {
         let epoch = *epoch_gate;
         let initializer = Arc::new(InitializingEndpoint {
             owner,
+            packet_source,
             generation,
             epoch,
             raw_dns_route,
@@ -1092,6 +1118,7 @@ impl UdpEndpointPool {
             slow_permit,
             enqueued_at,
             stats,
+            None,
         )
     }
 
@@ -1108,9 +1135,24 @@ impl UdpEndpointPool {
         slow_permit: OwnedSemaphorePermit,
         enqueued_at: u32,
         stats: &StatsManager,
+        packet_source: Option<SourceWork>,
     ) -> EndpointReservation {
         self.reap_tasks();
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(
+            scope,
+            client,
+            dst,
+            packet_source
+                .as_ref()
+                .and_then(SourceWork::optional_context)
+                .map(|source| source.lineage),
+        );
+        if packet_source
+            .as_ref()
+            .is_some_and(|source| source.scope() != scope)
+        {
+            return EndpointReservation::IdentityMismatch;
+        }
         loop {
             if self.terminal.load(Ordering::Acquire) {
                 stats.record_udp_queue_closed();
@@ -1192,6 +1234,7 @@ impl UdpEndpointPool {
                         slow_permit,
                         enqueued_at,
                         stats,
+                        packet_source,
                     );
                 }
             }
@@ -1249,7 +1292,7 @@ impl UdpEndpointPool {
             return EndpointReservation::IdentityMismatch;
         }
 
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(scope, client, dst, None);
         match self.endpoints.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(occupied) => {
                 let Some(generation) = expected_generation else {
@@ -1305,6 +1348,7 @@ impl UdpEndpointPool {
                     slow_permit,
                     enqueued_at,
                     stats,
+                    None,
                 )
             }
         }
@@ -1353,7 +1397,10 @@ impl UdpEndpointPool {
             stats.record_udp_queue_closed();
             return Err(OwnedEnqueueError::QueueClosed);
         }
-        let Some(entry) = self.endpoints.get(&EndpointKey::new(scope, client, dst)) else {
+        let Some(entry) = self
+            .endpoints
+            .get(&EndpointKey::new(scope, client, dst, None))
+        else {
             return Err(OwnedEnqueueError::IdentityMismatch);
         };
         if entry.owner() != owner {
@@ -1446,6 +1493,7 @@ impl UdpEndpointPool {
             raw_dns_route,
             enqueued_at,
             stats,
+            None,
         )
     }
 
@@ -1459,21 +1507,73 @@ impl UdpEndpointPool {
         raw_dns_route: Option<RawDnsRoute<&str>>,
         enqueued_at: u32,
         stats: &StatsManager,
+        packet_lineage: Option<NonZeroU64>,
     ) -> Option<EndpointReservation> {
+        self.enqueue_bound_payload_at(
+            scope,
+            client,
+            dst,
+            data,
+            raw_dns_route,
+            enqueued_at,
+            stats,
+            packet_lineage,
+            None,
+        )
+        .map(|(reservation, _)| reservation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::control) fn enqueue_bound_payload_at(
+        &self,
+        scope: ScopeId,
+        client: SocketAddr,
+        dst: SocketAddr,
+        data: DatagramPayload<'_>,
+        raw_dns_route: Option<RawDnsRoute<&str>>,
+        enqueued_at: u32,
+        stats: &StatsManager,
+        packet_lineage: Option<NonZeroU64>,
+        initializing_epoch: Option<u64>,
+    ) -> Option<(EndpointReservation, bool)> {
         if self.terminal.load(Ordering::Acquire) {
             stats.record_udp_queue_closed();
-            return Some(EndpointReservation::QueueClosed);
+            return Some((EndpointReservation::QueueClosed, false));
         }
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(scope, client, dst, packet_lineage);
         let entry = self.endpoints.get(&key)?;
+        let ready = matches!(entry.value(), EndpointEntry::Ready(_));
         let (result, identity) = match entry.value() {
-            EndpointEntry::Initializing(_) => return None,
+            EndpointEntry::Initializing(initializing) => {
+                let epoch = initializing_epoch?;
+                if initializing.raw_dns_route.as_ref().map(RawDnsRoute::as_ref) != raw_dns_route {
+                    return Some((EndpointReservation::IdentityMismatch, false));
+                }
+                let gate = self.initialization_epoch.lock();
+                if initializing.epoch != epoch || *gate != epoch {
+                    stats.record_udp_queue_closed();
+                    return Some((EndpointReservation::QueueClosed, false));
+                }
+                drop(gate);
+                (
+                    self.enqueue_at(
+                        &initializing.queue_tx,
+                        &initializing.flow_slots,
+                        data,
+                        enqueued_at,
+                        stats,
+                        #[cfg(feature = "native-api")]
+                        initializing.native_terminal.get(),
+                    ),
+                    (initializing.owner.token, initializing.generation),
+                )
+            }
             EndpointEntry::Ready(ready)
                 if ready.alive.load(Ordering::Acquire)
                     && !ready.endpoint.dead.load(Ordering::Acquire) =>
             {
                 if ready.raw_dns_route.as_ref().map(RawDnsRoute::as_ref) != raw_dns_route {
-                    return Some(EndpointReservation::IdentityMismatch);
+                    return Some((EndpointReservation::IdentityMismatch, false));
                 }
                 (
                     self.enqueue_at(
@@ -1494,14 +1594,14 @@ impl UdpEndpointPool {
             ),
             EndpointEntry::Retiring { .. } => {
                 stats.record_udp_queue_closed();
-                return Some(EndpointReservation::QueueClosed);
+                return Some((EndpointReservation::QueueClosed, false));
             }
         };
         drop(entry);
         if matches!(result, EndpointReservation::QueueClosed) {
             self.retire_if_same(key, identity.0, identity.1);
         }
-        Some(result)
+        Some((result, ready))
     }
 
     #[cfg(test)]
@@ -1511,7 +1611,9 @@ impl UdpEndpointPool {
         client: SocketAddr,
         dst: SocketAddr,
     ) -> Option<Arc<UdpEndpoint>> {
-        let entry = self.endpoints.get(&EndpointKey::new(scope, client, dst))?;
+        let entry = self
+            .endpoints
+            .get(&EndpointKey::new(scope, client, dst, None))?;
         match entry.value() {
             EndpointEntry::Ready(ready)
                 if ready.alive.load(Ordering::Acquire)

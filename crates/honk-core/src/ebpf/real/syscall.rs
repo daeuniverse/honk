@@ -17,7 +17,7 @@ pub const BPF_BATCH_CHUNK: usize = 128;
 
 pub type BatchVisitor<'a, K, V> = dyn FnMut(&[(K, V)]) -> bool + 'a;
 
-pub(super) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<c_long, c_long> {
+pub(crate) unsafe fn bpf_syscall(cmd: c_long, attr: &mut bpf_attr) -> Result<c_long, c_long> {
     let ret = unsafe {
         libc::syscall(
             libc::SYS_bpf,
@@ -115,13 +115,13 @@ fn map_raw_fd(map: &aya::maps::Map) -> RawFd {
     data.fd().as_fd().as_raw_fd()
 }
 
-pub(super) fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
+pub(crate) fn map_fd(bpf: &Ebpf, name: &str) -> anyhow::Result<RawFd> {
     bpf.map(name)
         .map(map_raw_fd)
         .ok_or_else(|| anyhow::anyhow!("map '{name}' not found"))
 }
 
-fn raw_map_info(fd: RawFd) -> anyhow::Result<bpf_map_info> {
+pub(crate) fn raw_map_info(fd: RawFd) -> anyhow::Result<bpf_map_info> {
     let mut info: bpf_map_info = unsafe { core::mem::zeroed() };
     let mut attr: bpf_attr = unsafe { core::mem::zeroed() };
     attr.info.bpf_fd = fd as u32;
@@ -263,7 +263,7 @@ pub(super) fn write_udp_decision_sequence_locked(
     )
 }
 
-pub(super) fn validate_map_layout(
+pub(crate) fn validate_map_layout(
     bpf: &Ebpf,
     name: &str,
     type_: bpf_map_type,

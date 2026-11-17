@@ -84,7 +84,7 @@ pub(super) async fn receive_loop(
         let reply_socket = if source == client_dst {
             reply_socket.as_ref()
         } else {
-            match foreign_replies.get(reply_socket.scope(), source) {
+            match foreign_replies.get(reply_socket.scope(), source, endpoint.packet_source()) {
                 Ok(socket) => {
                     foreign = socket;
                     foreign.as_ref()

@@ -64,7 +64,7 @@ impl ControlPlaneHandle {
         let decision = super::routing::RoutingDecision {
             outbound,
             must: true,
-            mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
+            mark: (handoff.mark != 0).then_some(handoff.mark),
             matched_rule: None,
             reroute_by_sniffed_domain: false,
             #[cfg(feature = "native-api")]
@@ -72,6 +72,7 @@ impl ControlPlaneHandle {
         };
         drop(backend);
         Ok(PacketRoutingSnapshot {
+            source: None,
             mode: super::handoff::ModeDecision {
                 name: decision.outbound.clone(),
                 constraint: Default::default(),
@@ -208,6 +209,13 @@ impl ControlPlaneHandle {
                         None,
                     ),
                 };
+                let packet_facts = flow.packet_source().map(|source| source.facts());
+                if let Some(facts) = &packet_facts {
+                    observation.packet_facts(
+                        facts,
+                        packet_dscp.expect("packet stream carries admitted DSCP"),
+                    );
+                }
                 if flow.is_kernel() {
                     observation.handoff(handoff.as_ref(), true);
                 }
@@ -223,6 +231,7 @@ impl ControlPlaneHandle {
                                 original_dst,
                                 "tcp",
                                 packet_dscp.expect("packet stream carries admitted DSCP"),
+                                flow.packet_source(),
                                 #[cfg(feature = "native-api")]
                                 observation.is_recording(),
                             )
@@ -248,6 +257,14 @@ impl ControlPlaneHandle {
                 } else {
                     None
                 };
+                if !flow.is_kernel()
+                    && let Some(snapshot) = &pinned_route
+                {
+                    anyhow::ensure!(
+                        snapshot.source == flow.packet_source().map(|source| source.context()),
+                        "packet TCP routing source changed"
+                    );
+                }
                 if original_dst.port() == 53
                     && !pinned_route
                         .as_ref()
@@ -368,6 +385,9 @@ impl ControlPlaneHandle {
                     "tcp",
                     handoff.as_ref(),
                 );
+                if let Some(facts) = &packet_facts {
+                    conn_info.process_name = super::routing::packet_process_name(facts);
+                }
                 if let Some(dscp) = packet_dscp {
                     conn_info.dscp = Some(dscp);
                 }
@@ -418,6 +438,12 @@ impl ControlPlaneHandle {
                 } else {
                     self.apply_mode_override(&mut route).await
                 };
+                anyhow::ensure!(
+                    route
+                        .mark
+                        .is_none_or(|mark| !honk_ebpf_common::skb_mark_has_reserved_bits(mark)),
+                    "direct rule mark uses a reserved datapath bit"
+                );
                 let outbound_name = mode_decision.name;
                 let mode_constraint = mode_decision.constraint;
                 observation.mode_applied(&outbound_name);
@@ -581,7 +607,7 @@ impl ControlPlaneHandle {
                         target_domain.clone(),
                         &outbound_name,
                         outbound_kind,
-                        route.mark,
+                        route.mark.and_then(honk_outbound::proxy::DirectMark::new),
                         connect_timeout,
                         dial_deadline,
                         Arc::clone(&runtime_generation),
@@ -686,7 +712,7 @@ impl ControlPlaneHandle {
                                         target_domain.clone(),
                                         &outbound_name,
                                         outbound_kind,
-                                        route.mark,
+                                        route.mark.and_then(honk_outbound::proxy::DirectMark::new),
                                         connect_timeout,
                                         retry_deadline,
                                         Arc::clone(&runtime_generation),
@@ -814,7 +840,10 @@ impl ControlPlaneHandle {
                                 start_time: std::time::Instant::now(),
                                 domain: target_domain.clone(),
                                 network: "tcp".to_string(),
-                                process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                                process: match &packet_facts {
+                                    Some(facts) => super::routing::packet_process_name(facts),
+                                    None => handoff.as_ref().and_then(|ho| ho.process_name()),
+                                },
                                 process_path: None,
                             }
                         },

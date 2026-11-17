@@ -81,7 +81,7 @@ mod tests {
             outbound: RoutingOutbound::Simple(outbound.into()),
             priority: 0,
             must: true,
-            mark: 0,
+            mark: None,
         }
     }
 
@@ -235,7 +235,7 @@ mod tests {
             routing.rules = rules;
             routing.default_outbound = fallback.into();
             routing.default_must = must;
-            routing.default_mark = 0x200;
+            routing.default_mark = Some(0x200);
             let router = Router::from_config(&routing).unwrap();
             for address in ["192.168.50.1", "fd00:50::1"] {
                 assert_eq!(

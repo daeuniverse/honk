@@ -251,7 +251,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
                 outbound: RoutingOutbound::Simple(outbound.into()),
                 priority: 0,
                 must: false,
-                mark,
+                mark: Some(mark),
             });
             for (sample_index, (source, hit)) in samples.iter().enumerate() {
                 let mut connection = source.clone();
@@ -436,7 +436,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             outbound: RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: case.must,
-            mark,
+            mark: Some(mark),
         });
         for (sample_index, (connection, hit)) in case.samples.into_iter().enumerate() {
             cases.push(GoldenCase {
@@ -468,7 +468,7 @@ pub(crate) fn fixtures() -> (Router, Vec<GoldenCase>) {
             outbound: RoutingOutbound::Simple(outbound.into()),
             priority,
             must,
-            mark,
+            mark: Some(mark),
         });
     }
     cases.push(GoldenCase {
@@ -532,10 +532,7 @@ fn reference_matches_independent_goldens() {
                         "proxy" => 2,
                         other => panic!("unexpected outbound {other}"),
                     },
-                    result
-                        .action
-                        .mark
-                        .map_or(0, honk_outbound::proxy::DirectMark::get),
+                    result.action.mark.unwrap_or(0),
                     result.action.must,
                 )
             },

@@ -27,7 +27,12 @@ const CHILD: &str = "HONK_QUIC_SOURCE_METRICS_CHILD";
 pub(super) struct BoundReplies(pub(super) HashMap<(ScopeId, SocketAddr), std::net::UdpSocket>);
 
 impl UdpReplySocketFactory for BoundReplies {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        _packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
         let socket = self
             .0
             .get(&(scope, source))
@@ -150,6 +155,7 @@ impl Fixture {
                 Arc::clone(&self.stats),
                 self.family,
                 speculative,
+                None,
             )
             .await
             .unwrap()
@@ -199,7 +205,7 @@ impl Fixture {
         reporter.setup_succeeded();
         let reply = Arc::new(
             self.pool
-                .create_reply_socket(lease.scope(), original)
+                .create_reply_socket(lease.scope(), original, None)
                 .unwrap(),
         );
         let endpoint = UdpEndpoint::new_source_scored(

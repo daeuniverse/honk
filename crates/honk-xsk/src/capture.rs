@@ -25,12 +25,14 @@ pub struct DecodedPacket {
     /// Offset in received bytes; recovered VLAN metadata never adds inline bytes.
     pub l3_offset: usize,
     pub l3_len: usize,
+    pub frame_len: usize,
     pub source_mac: [u8; 6],
     pub destination_mac: [u8; 6],
     pub ether_type: u16,
     pub vlan_tci: [u16; 2],
     pub vlan_proto: [u16; 2],
     pub vlan_count: u8,
+    pub inline_vlan_count: u8,
 }
 
 impl GeneralCapture {
@@ -140,12 +142,14 @@ impl GeneralCapture {
         Ok(DecodedPacket {
             l3_offset: offset,
             l3_len: ip_length,
+            frame_len: length,
             source_mac: header[6..12].try_into().unwrap(),
             destination_mac: header[..6].try_into().unwrap(),
             ether_type,
             vlan_tci,
             vlan_proto,
             vlan_count: vlan_count as u8,
+            inline_vlan_count: (vlan_count - hidden) as u8,
         })
     }
 }
@@ -393,6 +397,8 @@ mod tests {
                     .decode(&[&bytes[..split], &bytes[split..]], &meta, 7)
                     .unwrap();
                 assert_eq!((packet.l3_offset, packet.l3_len), (18, ip_len));
+                assert_eq!(packet.frame_len, bytes.len());
+                assert_eq!(packet.inline_vlan_count, 1);
                 assert_eq!(packet.vlan_tci, [123, 0]);
                 let wire = wire_only
                     .decode(&[&bytes[..split], &bytes[split..]], &[], 7)
@@ -485,6 +491,8 @@ mod tests {
                         .unwrap();
                     assert_eq!(packet.l3_offset, offset);
                     assert_eq!(usize::from(packet.vlan_count), count);
+                    assert_eq!(usize::from(packet.inline_vlan_count), inline);
+                    assert_eq!(packet.frame_len, bytes.len());
                     assert_eq!(&packet.vlan_tci[..count], &tags[..count]);
                     assert_eq!(&packet.vlan_proto[..count], &protocols[..count]);
                 }
@@ -504,6 +512,8 @@ mod tests {
                             .decode(&[&bytes[..split], &bytes[split..]], &meta, 7)
                             .unwrap();
                         assert_eq!((packet.l3_offset, packet.l3_len), (offset, ip_length));
+                        assert_eq!(packet.frame_len, bytes.len());
+                        assert_eq!(usize::from(packet.inline_vlan_count), inline);
                         assert_eq!(usize::from(packet.vlan_count), count);
                     }
                     bytes.push(0);

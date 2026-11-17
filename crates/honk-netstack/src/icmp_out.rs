@@ -85,7 +85,8 @@ struct Target {
     last: Instant,
 }
 
-pub(crate) struct IcmpOut {
+/// Pure ICMP limiter state; a sharded embedding supplies its realm's serialized instance.
+pub struct IcmpOut {
     limits: IcmpLimits,
     /// Global credit in micro-messages (one message costs 1_000_000).
     global: u64,
@@ -103,11 +104,11 @@ impl Default for IcmpOut {
 }
 
 impl IcmpOut {
-    pub(crate) fn overhead_bound(limits: IcmpLimits) -> Option<usize> {
+    pub fn overhead_bound(limits: IcmpLimits) -> Option<usize> {
         crate::budget::collection_peak::<Target>(limits.max_targets)
     }
 
-    pub(crate) fn new(limits: IcmpLimits) -> IcmpOut {
+    pub fn new(limits: IcmpLimits) -> IcmpOut {
         IcmpOut {
             global: u64::from(limits.burst) * MSG,
             limits,
@@ -193,6 +194,7 @@ impl IcmpOut {
 
     /// Both limiters must agree before either is charged.
     fn allow(&mut self, now: Instant, target: IpAddr) -> bool {
+        let now = self.global_last.map_or(now, |last| now.max(last));
         let l = self.limits;
         let cap = u64::from(l.burst) * MSG;
         let global = match self.global_last {
@@ -253,8 +255,25 @@ impl Stack {
         original: &[u8],
         out: &mut [u8],
     ) -> Result<Option<usize>, UdpError> {
+        self.send_icmp_with_state(now, kind, original, out, None)
+    }
+
+    pub(crate) fn send_icmp_with_state(
+        &mut self,
+        now: Instant,
+        kind: Reject,
+        original: &[u8],
+        out: &mut [u8],
+        icmp: Option<&mut IcmpOut>,
+    ) -> Result<Option<usize>, UdpError> {
+        if self.has_realm_resources() && icmp.is_none() {
+            return Err(UdpError::Busy);
+        }
         self.now = now;
-        match self.icmp_out.emit(now, kind, original, out) {
+        match icmp
+            .unwrap_or(&mut self.icmp_out)
+            .emit(now, kind, original, out)
+        {
             IcmpEmit::Sent(n) => {
                 self.counters.tx_packets += 1;
                 Ok(Some(n))
@@ -275,6 +294,18 @@ impl Stack {
     ) -> Result<Option<usize>, UdpError> {
         self.send_icmp(now, Reject::PacketTooBig { mtu }, original, out)
     }
+    }
+
+    /// Emits PTB with the capture realm's serialized state, retaining the normal exemption.
+    pub fn packet_too_big_with_icmp(
+        &mut self,
+        now: Instant,
+        mtu: u32,
+        original: &[u8],
+        out: &mut [u8],
+        icmp: &mut crate::IcmpState,
+    ) -> Result<Option<usize>, UdpError> {
+        self.send_icmp_with_state(now, Reject::PacketTooBig { mtu }, original, out, Some(icmp))
 }
 
 struct Original<'a> {
@@ -735,5 +766,20 @@ mod tests {
             (quote.src_port, quote.dst_port, quote.seq),
             (40_000, 443, Some(0xDEAD_BEEF))
         );
+    }
+    #[test]
+    fn an_out_of_order_service_time_cannot_reissue_limiter_credit() {
+        let now = Instant::now();
+        let mut icmp = IcmpOut::new(IcmpLimits {
+            per_sec: 1,
+            burst: 1,
+            target_burst: 1,
+            ..IcmpLimits::default()
+        });
+        let target = "192.0.2.1".parse().unwrap();
+        assert!(icmp.allow(now, target));
+        assert!(icmp.allow(now + Duration::from_secs(1), target));
+        assert!(!icmp.allow(now, target));
+        assert!(!icmp.allow(now + Duration::from_secs(1), target));
     }
 }

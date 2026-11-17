@@ -233,6 +233,7 @@ impl ReadyBatch {
             removal.dst,
             removal.owner,
             removal.generation,
+            removal.packet_lineage,
         ));
         let pool = Arc::clone(&self.pool);
         let slow_slots = Arc::clone(&self.slow_slots);
@@ -297,6 +298,7 @@ pub fn reserve_rollback_batch(iterations: usize) {
             removal.dst,
             removal.owner,
             removal.generation,
+            removal.packet_lineage,
         ));
         assert_released(&pool, &slow_slots, iterations);
     }

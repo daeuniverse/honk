@@ -31,7 +31,11 @@ use std::{
     time::Instant,
 };
 
+mod endpoint;
 mod reassembly;
+pub(in crate::control) use endpoint::PendingEndpointAdmission;
+#[cfg(target_os = "linux")]
+mod fragment_peer;
 pub use reassembly::GeneratedError;
 
 pub use crate::netlink::fib::FibState;
@@ -95,11 +99,12 @@ pub(super) fn validate_config(config: &honk_config::Config) -> anyhow::Result<()
 fn validate_policy(config: &RoutingConfig) -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(config.default_outbound.as_str(), "direct" | "block")
-            && config.default_mark == 0
+            && config.default_mark.unwrap_or(0) == 0
             && config
                 .rules
                 .iter()
-                .all(|rule| matches!(rule.outbound.as_str(), "direct" | "block") && rule.mark == 0),
+                .all(|rule| matches!(rule.outbound.as_str(), "direct" | "block")
+                    && rule.mark.unwrap_or(0) == 0),
         "routed-only CoreForward requires unmarked direct/block policy; Endpoint/group/native marks are not forwarding actions"
     );
     Ok(())
@@ -252,6 +257,38 @@ struct Registration {
     native: Option<Arc<crate::observe::Observation>>,
 }
 
+#[cfg(feature = "ebpf")]
+pub(crate) enum CapturedDecision {
+    Endpoint(CapturedEndpointCandidate),
+    TryNativeOriginal(crate::ebpf::native::NativeBasis),
+    Refuse,
+}
+
+#[cfg(feature = "ebpf")]
+pub(crate) struct CapturedEndpointCandidate {
+    admission: EndpointAdmission,
+    basis: crate::ebpf::native::NativeCaptureBasis,
+}
+
+#[cfg(feature = "ebpf")]
+impl CapturedEndpointCandidate {
+    pub(crate) fn basis(&self) -> &crate::ebpf::native::NativeCaptureBasis {
+        &self.basis
+    }
+    pub(crate) fn into_admission(
+        self,
+        proof: crate::ebpf::native::CaptureProof,
+    ) -> io::Result<EndpointAdmission> {
+        if !proof.matches(&self.basis) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Capture proof belongs to another candidate",
+            ));
+        }
+        Ok(self.admission)
+    }
+}
+
 impl RoutingAuthority {
     fn admitting(&self) -> bool {
         !self.0.shutdown.requested() && self.0.healthy.load(Ordering::Acquire)
@@ -276,6 +313,200 @@ impl RoutingAuthority {
             config,
         }
     }
+
+    /// Acquire the same publication readers without suspending a borrowed capture turn.
+    pub fn try_read_policy(&self) -> io::Result<PolicyRead<'_>> {
+        let router = self.0.router.try_read().map_err(|_| {
+            io::Error::new(io::ErrorKind::WouldBlock, "routing publication is busy")
+        })?;
+        let config =
+            self.0.config.try_read().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "config publication is busy")
+            })?;
+        Ok(PolicyRead {
+            registration: &self.0,
+            router,
+            config,
+        })
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn capture_original(
+        &self,
+        read: &PolicyRead<'_>,
+        query: RouteQuery,
+        facts: ScopeId,
+        original: &crate::ebpf::native::NativeOriginal<'_>,
+        budget: &Arc<MemoryBudget>,
+    ) -> io::Result<CapturedDecision> {
+        use crate::ebpf::native::{NativeBasis, NativeCaptureBasis};
+        let busy = || {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "original policy basis is busy or stale",
+            )
+        };
+        if !Arc::ptr_eq(read.registration, &self.0)
+            || !self.admitting()
+            || self.0.execution != Execution::MixedEndpoints
+            || facts == ScopeId::HOST
+            || original.facts != facts
+            || original.ingress != query.ingress
+            || original.imported.identity.scope != facts.as_u64()
+            || !matches!(
+                (original.imported.executor, original.imported.state & 15),
+                (
+                    honk_ebpf_common::xdp::NATIVE_EXECUTOR_PENDING,
+                    honk_ebpf_common::xdp::NATIVE_PHASE_PENDING
+                ) | (
+                    honk_ebpf_common::xdp::NATIVE_EXECUTOR_KERNEL,
+                    honk_ebpf_common::xdp::NATIVE_PHASE_ARMED
+                        | honk_ebpf_common::xdp::NATIVE_PHASE_DRAINING
+                )
+            )
+            || original.basis_epoch == 0
+            || original.basis_epoch & 1 == 0
+            || original.candidate == 0
+            || !matches!(query.protocol, 6 | 17)
+            || query.ports.is_none()
+        {
+            return Ok(CapturedDecision::Refuse);
+        }
+        let mode_state = self
+            .0
+            .mode_state
+            .as_ref()
+            .map(|state| state.try_read().ok_or_else(busy))
+            .transpose()?;
+        let generation = self.generation(mode_state.as_deref());
+        let (bitmap, stamp) = {
+            let mut packet_facts = self.0.projection.try_packet_facts().ok_or_else(busy)?;
+            match packet_facts.lookup(facts, query.destination, &read.router, generation.routing) {
+                Ok(fact) => fact,
+                Err(_) => return Err(busy()),
+            }
+        };
+        let Some(action) = route_action(&read.router, query, None, bitmap.as_ref()) else {
+            return Ok(CapturedDecision::Refuse);
+        };
+        #[cfg(feature = "native-api")]
+        let native = self
+            .0
+            .native
+            .as_ref()
+            .map(|native| (generation.routing, native.catalog.snapshot()));
+        let mode = mode_decision(
+            mode_state.as_deref(),
+            &read.config,
+            #[cfg(feature = "native-api")]
+            native.as_ref().map(|(_, catalog)| &**catalog),
+            action.outbound.clone(),
+            action.must,
+        );
+        let literal_direct = mode.name == "direct" && action.mark.is_none();
+        let controller_dns = !action.must
+            && matches!(query.protocol, 6 | 17)
+            && query
+                .ports
+                .is_some_and(|(_, destination)| destination == 53);
+        if mode.name == "block" || action.mark.is_some() {
+            return Ok(CapturedDecision::Refuse);
+        }
+        let basis = NativeCaptureBasis::new(
+            original,
+            generation.routing,
+            read.router.policy_fingerprint(),
+            generation.mode,
+            stamp.identity(),
+        );
+        let decision = if literal_direct && !controller_dns && !original.retained_capture {
+            CapturedDecision::TryNativeOriginal(NativeBasis::new(original, basis))
+        } else {
+            let snapshot = self.endpoint_snapshot(
+                read,
+                query,
+                None,
+                bitmap.as_ref(),
+                #[cfg(feature = "native-api")]
+                generation.routing,
+                mode,
+                #[cfg(feature = "native-api")]
+                native,
+            );
+            CapturedDecision::Endpoint(CapturedEndpointCandidate {
+                admission: EndpointAdmission::pending(
+                    snapshot,
+                    budget,
+                    self.pending_endpoint(
+                        facts,
+                        PolicyGeneration {
+                            facts: Some(stamp),
+                            ..generation
+                        },
+                    ),
+                )?,
+                basis,
+            })
+        };
+        if !self.admitting() || !generation.same_policy(self.generation(mode_state.as_deref())) {
+            return Err(busy());
+        }
+        let mut packet_facts = self.0.projection.try_packet_facts().ok_or_else(busy)?;
+        if !packet_facts.is_current(stamp) {
+            return Err(busy());
+        }
+        Ok(decision)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn endpoint_snapshot(
+        &self,
+        read: &PolicyRead<'_>,
+        query: RouteQuery,
+        source_mac: Option<&str>,
+        bitmap: Option<&DomainRouting>,
+        #[cfg(feature = "native-api")] routing_generation: u64,
+        mode: super::connection::handoff::ModeDecision,
+        #[cfg(feature = "native-api")] native: Option<(
+            u64,
+            Arc<crate::observe::catalog::CatalogIdentity>,
+        )>,
+    ) -> PacketRoutingSnapshot {
+        let (source_port, destination_port) = query.ports.expect("Endpoint transport ports");
+        let input = crate::routing::ConnectionInfo {
+            domain: None,
+            dst_ip: query.destination,
+            dst_port: destination_port,
+            src_ip: query.source,
+            src_port: source_port,
+            protocol: if query.protocol == 6 { "tcp" } else { "udp" },
+            process_name: None,
+            mac: source_mac.map(str::to_owned),
+            dscp: Some(query.traffic_class >> 2),
+        };
+        PacketRoutingSnapshot {
+            decision: RoutingDecision::from_router(
+                &read.router,
+                &input,
+                bitmap,
+                #[cfg(feature = "native-api")]
+                self.0
+                    .native
+                    .as_deref()
+                    .map(|observation| (observation, routing_generation)),
+            ),
+            mode,
+            mode_state: None,
+            admission_final: true,
+            memory: None,
+            source: None,
+            config: Arc::clone(&read.config),
+            group_manager: self.0.group_manager.read().clone(),
+            runtime: self.0.runtime_registry.read().clone(),
+            #[cfg(feature = "native-api")]
+            native,
+        }
+    }
 }
 
 /// Held publication readers of one registration. Core rejects another registration's guards;
@@ -297,9 +528,31 @@ impl ControlPlane {
         &self,
         execution: Execution,
     ) -> anyhow::Result<RoutingAuthority> {
+        self.packet_policy(execution, false).await
+    }
+
+    /// Register Native capture with the canonical mixed-policy publication owner.
+    pub async fn native_packet_policy(&self) -> anyhow::Result<RoutingAuthority> {
+        self.packet_policy(Execution::MixedEndpoints, true).await
+    }
+
+    async fn packet_policy(
+        &self,
+        execution: Execution,
+        native: bool,
+    ) -> anyhow::Result<RoutingAuthority> {
         let _publication = self.reload_lock.lock().await;
         let router = self.router.read().await;
         let config = self.config.read().await;
+        if native {
+            anyhow::ensure!(
+                config.datapath.as_ref().is_some_and(|datapath| {
+                    datapath.backend == honk_config::datapath::Backend::Xdp
+                        && datapath.direct == Some(honk_config::datapath::DirectProfile::Native)
+                }),
+                "Native capture requires XDP DirectProfile::Native"
+            );
+        }
         let configured = config
             .datapath
             .as_ref()
@@ -391,6 +644,8 @@ pub struct RoutedCore {
     reassembly_outputs: Arc<reassembly::Outputs>,
     pending_reassembly_error: Option<reassembly::Pending>,
     reassembly_poll_pending: bool,
+    #[cfg(target_os = "linux")]
+    fragment_peers: Option<fragment_peer::FragmentPeers>,
     counters: RefusalCounters,
     #[cfg(test)]
     after_fact_read: Option<Box<dyn FnOnce() + Send>>,
@@ -451,6 +706,8 @@ impl RoutedCore {
             reassembly_outputs,
             pending_reassembly_error: None,
             reassembly_poll_pending: false,
+            #[cfg(target_os = "linux")]
+            fragment_peers: None,
             counters: RefusalCounters::default(),
             #[cfg(test)]
             after_fact_read: None,
@@ -527,9 +784,19 @@ impl RoutedCore {
         now: Instant,
         bytes: &[u8],
     ) -> anyhow::Result<Option<Packet>> {
+        self.receive_at(ingress, now, now, bytes)
+    }
+
+    pub fn receive_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        bytes: &[u8],
+    ) -> anyhow::Result<Option<Packet>> {
         let packet = self
             .core
-            .receive(ingress, now, bytes)
+            .receive_at(ingress, ingress_at, service_at, bytes)
             .inspect_err(|error| self.counters.core(error))?;
         Ok(self.pin_received(packet))
     }
@@ -540,9 +807,19 @@ impl RoutedCore {
         now: Instant,
         segments: &[&[u8]],
     ) -> anyhow::Result<Option<Packet>> {
+        self.receive_segments_at(ingress, now, now, segments)
+    }
+
+    pub fn receive_segments_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        segments: &[&[u8]],
+    ) -> anyhow::Result<Option<Packet>> {
         let packet = self
             .core
-            .receive_segments(ingress, now, segments)
+            .receive_segments_at(ingress, ingress_at, service_at, segments)
             .inspect_err(|error| self.counters.core(error))?;
         Ok(self.pin_received(packet))
     }
@@ -665,7 +942,7 @@ impl RoutedCore {
         match disposition(
             outbound,
             action.must,
-            action.mark.is_some(),
+            action.mark.is_some_and(|mark| mark != 0),
             query,
             self.authority.0.execution,
             self.core.retains(query, now),
@@ -804,8 +1081,9 @@ impl RoutedCore {
                 action.outbound.clone(),
                 action.must,
             );
-            let marked =
-                action.outbound == "direct" && mode.name == "direct" && action.mark.is_some();
+            let marked = action.outbound == "direct"
+                && mode.name == "direct"
+                && action.mark.is_some_and(|mark| mark != 0);
             let selected = disposition(
                 &mode.name,
                 action.must,
@@ -815,45 +1093,17 @@ impl RoutedCore {
                 self.core.retains(packet.query(), now),
             );
             let admission = if selected == Disposition::Endpoint && packet.permits_new_endpoint() {
-                let (source_port, destination_port) =
-                    packet.query().ports.expect("Endpoint transport ports");
-                let input = crate::routing::ConnectionInfo {
-                    domain: None,
-                    dst_ip: packet.query().destination,
-                    dst_port: destination_port,
-                    src_ip: packet.query().source,
-                    src_port: source_port,
-                    protocol: if packet.query().protocol == 6 {
-                        "tcp"
-                    } else {
-                        "udp"
-                    },
-                    process_name: None,
-                    mac: source_mac.map(str::to_owned),
-                    dscp: Some(packet.query().traffic_class >> 2),
-                };
-                Some(PacketRoutingSnapshot {
-                    decision: RoutingDecision::from_router(
-                        router,
-                        &input,
-                        bitmap.as_ref(),
-                        #[cfg(feature = "native-api")]
-                        self.authority
-                            .0
-                            .native
-                            .as_deref()
-                            .map(|native| (native, generation.routing)),
-                    ),
+                Some(self.authority.endpoint_snapshot(
+                    read,
+                    packet.query(),
+                    source_mac,
+                    bitmap.as_ref(),
+                    #[cfg(feature = "native-api")]
+                    generation.routing,
                     mode,
-                    mode_state: None,
-                    admission_final: true,
-                    memory: None,
-                    config: Arc::clone(config),
-                    group_manager: self.authority.0.group_manager.read().clone(),
-                    runtime: self.authority.0.runtime_registry.read().clone(),
                     #[cfg(feature = "native-api")]
                     native,
-                })
+                ))
             } else {
                 None
             };
@@ -925,7 +1175,19 @@ impl RoutedCore {
             let Some(admission) = admission else {
                 return Ok(Decision::Drop);
             };
-            let admission = match EndpointAdmission::new(admission, &self.budget) {
+            let Some(fact_scope) = self
+                .ingress_bindings
+                .iter()
+                .find(|binding| binding.ingress == packet.query().ingress)
+                .map(|binding| binding.facts)
+            else {
+                return Ok(Decision::Drop);
+            };
+            let admission = match EndpointAdmission::pending(
+                admission,
+                &self.budget,
+                self.authority.pending_endpoint(fact_scope, generation),
+            ) {
                 Ok(admission) => admission,
                 Err(_) => {
                     self.counters.core_capacity = self.counters.core_capacity.saturating_add(1);
@@ -1285,6 +1547,8 @@ impl RoutedCore {
         self.firewall
             .set_fragment_obligations(self.core.fragment_obligations());
         self.firewall.expire(now);
+        #[cfg(target_os = "linux")]
+        self.reap_fragment_peers();
     }
     pub fn has_maintenance(&self) -> bool {
         self.core.has_retained_flows() || self.firewall.has_maintenance()

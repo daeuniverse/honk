@@ -908,7 +908,7 @@ fn datagram_group(
     packet_group(ancillary)
 }
 
-fn completion_error(
+pub(crate) fn completion_error(
     kind: u16,
     flags: u16,
     payload: &[u8],
@@ -1026,7 +1026,7 @@ fn ip_address(family: u8, bytes: &[u8]) -> io::Result<IpAddr> {
     }
 }
 
-fn header(bytes: &[u8]) -> io::Result<(usize, u16, u16, u32)> {
+pub(crate) fn header(bytes: &[u8]) -> io::Result<(usize, u16, u16, u32)> {
     if bytes.len() < 16 {
         return Err(invalid("short netlink header"));
     }
@@ -1042,7 +1042,7 @@ fn header(bytes: &[u8]) -> io::Result<(usize, u16, u16, u32)> {
     ))
 }
 
-fn attributes<'a>(
+pub(crate) fn attributes<'a>(
     mut bytes: &'a [u8],
     mut visit: impl FnMut(u16, &'a [u8]) -> io::Result<()>,
 ) -> io::Result<()> {

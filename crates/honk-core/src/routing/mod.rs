@@ -2,7 +2,6 @@
 
 use honk_config::routing::{RoutingConfig, RoutingRule};
 use honk_ebpf_common::{DomainRouting, ROUTING_FACT_CAPACITY};
-use honk_outbound::proxy::DirectMark;
 use regex::Regex;
 use std::{net::IpAddr, sync::Arc};
 
@@ -44,13 +43,13 @@ fn normalize_process_matcher(name: &str) -> String {
 pub struct RouteAction {
     pub outbound: String,
     pub must: bool,
-    pub mark: Option<DirectMark>,
+    pub mark: Option<u32>,
     pub direct_mark_index: Option<u8>,
 }
 
 impl RouteAction {
     pub fn is_terminal_direct_mark(&self) -> bool {
-        self.must && self.outbound == "direct" && self.mark.is_some()
+        self.must && self.outbound == "direct" && self.mark.is_some_and(|mark| mark != 0)
     }
 }
 
@@ -293,7 +292,7 @@ impl Router {
         let fallback = RouteAction {
             outbound: routing.default_outbound.clone(),
             must: routing.default_must,
-            mark: DirectMark::new(routing.default_mark),
+            mark: routing.default_mark,
             direct_mark_index: None,
         };
         Self::build(&routing.rules, fallback, geo_sources, shared)
@@ -340,7 +339,7 @@ impl Router {
                 action: RouteAction {
                     outbound,
                     must: rule.must,
-                    mark: DirectMark::new(rule.mark),
+                    mark: rule.mark,
                     direct_mark_index: None,
                 },
                 expression: String::new(),
@@ -373,7 +372,7 @@ impl Router {
             .map(|route| &route.action)
             .chain(std::iter::once(&fallback))
             .filter(|action| action.is_terminal_direct_mark())
-            .filter_map(|action| action.mark.map(DirectMark::get))
+            .filter_map(|action| action.mark)
             .collect();
         direct_marks.sort_unstable();
         direct_marks.dedup();
@@ -384,11 +383,8 @@ impl Router {
         );
         let index_for = |action: &mut RouteAction| {
             if action.is_terminal_direct_mark() {
-                action.direct_mark_index = Some(
-                    direct_marks
-                        .binary_search(&action.mark.unwrap().get())
-                        .unwrap() as u8,
-                );
+                action.direct_mark_index =
+                    Some(direct_marks.binary_search(&action.mark.unwrap()).unwrap() as u8);
             }
         };
         for route in &mut compiled {
@@ -425,11 +421,10 @@ impl Router {
     }
 
     pub fn has_direct_marks(&self) -> bool {
-        self.fallback.outbound == "direct" && self.fallback.mark.is_some()
-            || self
-                .routes
-                .iter()
-                .any(|route| route.action.outbound == "direct" && route.action.mark.is_some())
+        self.fallback.outbound == "direct" && self.fallback.mark.is_some_and(|mark| mark != 0)
+            || self.routes.iter().any(|route| {
+                route.action.outbound == "direct" && route.action.mark.is_some_and(|mark| mark != 0)
+            })
     }
 
     /// Whether any rule has a `pname()` condition, positive or negated.
@@ -540,7 +535,7 @@ impl Router {
                 route.name,
                 route.action.outbound,
                 route.action.must,
-                route.action.mark.map_or(0, DirectMark::get)
+                route.action.mark.unwrap_or(0)
             );
             Some(RouteMatch {
                 rule_id: route.id,

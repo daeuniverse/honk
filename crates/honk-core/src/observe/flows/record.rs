@@ -350,6 +350,7 @@ pub(crate) enum StepData {
         rules: Vec<RuleEvaluation>,
         outbound: Option<String>,
         must: Option<bool>,
+        mark_kind: Option<u32>,
         mark: Option<u32>,
         input: Option<EvaluationInput>,
         dns_action: Option<&'static str>,

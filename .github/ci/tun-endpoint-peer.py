@@ -25,8 +25,8 @@ if sys.flags.optimize:
     raise RuntimeError('optimized Python disables required fixture checks')
 
 SCRIPT = str(Path(__file__).resolve())
-ROWS = [f'A-{origin}{family}-{transport}' for origin in 'HT' for family in '46'
-        for transport in ('T', 'Uc', 'Uu')]
+ROWS = [f'{profile}-{origin}{family}-{transport}' for profile in ('A', 'B')
+        for origin in 'HT' for family in '46' for transport in ('T', 'Uc', 'Uu')]
 PORTS = (18080, 18081, 18082, 18083, 18084, 18085, 18086)
 SECRET = 'private-tun-smoke-credential'
 BANNER = b'TUN independent peer\n'
@@ -273,9 +273,9 @@ class Peer:
                         assert sent == len(payload)
                         self.event('echo-sent', transport='udp', length=sent, **values)
 
-    def connection(self, conn, remote, role):
+    def connection(self, conn, remote, role, idle_deadline=None):
         with conn:
-            conn.settimeout(20)
+            conn.settimeout(20 if idle_deadline is None else max(0.001, idle_deadline - time.monotonic()))
             try:
                 if role == 'socks':
                     self.socks(conn)
@@ -302,6 +302,10 @@ class Peer:
                 else:
                     conn.sendall(BANNER)
                     while True:
+                        if idle_deadline is not None:
+                            remaining_idle = idle_deadline - time.monotonic()
+                            assert remaining_idle > 0, 'original peer idle deadline exhausted'
+                            conn.settimeout(remaining_idle)
                         try:
                             count = struct.unpack('!I', exact(conn, 4))[0]
                         except EOFError:
@@ -587,13 +591,17 @@ def dns_client(number, source, target, port, transport, name, empty='false', per
             print(json.dumps(dict(persistent=True, per_frame_reload=True)), flush=True)
 
 
-def one_exchange(number, source, target, port, payload, blocked='false', source_port='0'):
+def one_exchange(number, source, target, port, payload, blocked='false', source_port='0', connected='false'):
     number, port = int(number), int(port)
     with socket.socket(family(number), socket.SOCK_DGRAM) as sock:
         sock.settimeout(0.6 if blocked == 'true' else 8)
         sock.bind((source, int(source_port)))
         try:
-            sock.sendto(payload.encode(), (target, port))
+            if connected == 'true':
+                sock.connect((target, port))
+                sock.send(payload.encode())
+            else:
+                sock.sendto(payload.encode(), (target, port))
             data, remote = sock.recvfrom(65535)
         except (socket.timeout, ConnectionRefusedError, OSError) as error:
             if isinstance(error, OSError) and not isinstance(error, socket.timeout):
@@ -682,7 +690,8 @@ def offload_capture(device, number, host_source, transit_source, target, port):
     summary = dict(records=0, host_kernel_tso=0, transit_stack_tso=0,
                    wire_data=0, wire_checksums=0, maximum_ip=0)
     with socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3)) as capture:
-        capture.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        capture.setsockopt(socket.SOL_SOCKET, 33, 4 << 20)  # SO_RCVBUFFORCE in the root-only VM.
+        assert capture.getsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF) >= 4 << 20
         if vnet:
             capture.setsockopt(263, 15, 1)  # SOL_PACKET, PACKET_VNET_HDR
         capture.bind((device, 0))
@@ -884,6 +893,7 @@ datapath {{
  tun {{
   name: honk0
   mtu: 1500
+  {'host_facts: true' if self.label.startswith('B-') else ''}
   address4: 198.18.0.1/32
   address6: fd00:686f:6e6b:100::1/128
   table: 202
@@ -964,7 +974,11 @@ experimental {{
         argv = ['ip', 'netns', 'exec', namespace]
         if special:
             argv += [sys.executable, SCRIPT, special]
+        elif self.label.startswith('B-'):
+            argv += [sys.executable, SCRIPT, 'source-daemon']
         argv += [self.daemon_path, '-c', str(self.config)]
+        if 'HONK_TUN_BPF_PIN_ROOT' in os.environ:
+            argv += ['--bpf-pin-root', os.environ['HONK_TUN_BPF_PIN_ROOT']]
         return self.track(subprocess.Popen(
             argv, env=environment, stdout=self.open(log or 'daemon.log'), stderr=subprocess.STDOUT))
 
@@ -1448,6 +1462,39 @@ def matrix_row(daemon, root, row, diagnostic_tcp=False):
         fixture.normal_stop()
 
 
+def process_routes(daemon, root, number):
+    with Fixture(daemon, root, f'B-{number}-process', number) as fixture:
+        fixture.start()
+        outcomes = []
+        for negated in (False, True):
+            rule = f" {'!' if negated else ''}pname(tunallow) && dport(18080) -> proxy\n dport(18080) -> block\n"
+            fixture.reload(fixture.text.replace('routing {\n dport(18082)', 'routing {\n' + rule + ' dport(18082)'))
+            for transport in ('T', 'Uc', 'Uu'):
+                for origin, name in (('H', 'tunallow'), ('H', 'tundeny'), ('T', 'tunallow')):
+                    matched = origin == 'H' and name == 'tunallow'
+                    blocked = matched == negated
+                    marker = f'pname-{number}-{transport}-{origin}-{name}-{negated}'
+                    before = len(fixture.peer_events())
+                    result = run('bash', '-c', 'exec -a "$0" "$@"', name, sys.executable, SCRIPT,
+                                 'process-client', name, transport, number,
+                                 fixture.host_source if origin == 'H' else fixture.source,
+                                 TARGETS[number][0], 18080, marker, str(blocked).lower(),
+                                 namespace=fixture.names['dut' if origin == 'H' else 'source'], timeout=30)
+                    events = fixture.peer_events()[before:]
+                    delivered = [event for event in events if event['kind'] == 'echo'
+                                 and event.get('payload') == marker.encode().hex()]
+                    assert len(delivered) == (0 if blocked else 1), (marker, blocked, events)
+                    proxies = [event for event in events if event['kind'] in ('socks-connect', 'socks-udp')
+                               and event.get('target') == [TARGETS[number][0], 18080]]
+                    assert bool(proxies) != blocked, ('process-selected proxy route', marker, events)
+                    if delivered:
+                        assert delivered[0]['remote'][0] == ('198.51.100.250' if number == 4 else 'fd00:2::250')
+                    outcomes.append(dict(marker=marker, client=json.loads(result.stdout), peer=events))
+        (fixture.directory / 'process-routing.json').write_text(json.dumps(outcomes, indent=2))
+        fixture.fence_counters()
+        fixture.normal_stop()
+
+
 def dns_extensions(fixture):
     number = fixture.number
     for transport, name in (('udp', 'bound-udp.test'), ('tcp', 'bound-tcp.test')):
@@ -1797,7 +1844,8 @@ def gate(daemon, root, selected=()):
     fault_names = ('name', 'table', 'priority', 'address', 'main-route', 'rpdb', 'dns-bind', 'no-cap', 'no-tun')
     cases = ROWS + [f'A-{number}-{name}' for number in (4, 6)
                     for name in ('DNS', 'control', 'packets', 'instance-lock', 'close-active', 'strict-rpf',
-                                 'crash-guard', 'topology-fault', *('setup-' + fault for fault in fault_names))]
+                                 'crash-guard', 'topology-fault', *('setup-' + fault for fault in fault_names))] + [
+                                     f'B-{number}-process' for number in (4, 6)]
     assert len(selected) == len(set(selected)), ('duplicate TUN row selection', selected)
     assert all(isinstance(row, str) and row and row in cases for row in selected), ('unknown or empty TUN row selection', selected)
     requested = set(selected or cases)
@@ -1849,6 +1897,7 @@ def gate(daemon, root, selected=()):
     for row in ROWS:
         record(row, lambda row=row: matrix_row(daemon, root, row, diagnostic_tcp=bool(selected)))
     for number in (4, 6):
+        record(f'B-{number}-process', lambda number=number: process_routes(daemon, root, number))
         for name, operation in (('DNS', dns_extensions), ('control', control_extensions), ('packets', packet_extensions)):
             row = f'A-{number}-{name}'
             def extension(number=number, row=row, operation=operation):
@@ -1982,6 +2031,14 @@ def main():
         Peer(*args).serve()
     elif mode == 'traffic':
         traffic(*args)
+    elif mode == 'process-client':
+        name, transport, number, source, target, port, marker, blocked = args
+        # Cover argv-based capture and the kernel's comm-only capability fallback.
+        assert ctypes.CDLL(None).prctl(15, ctypes.c_char_p(name.encode()), 0, 0, 0) == 0
+        if transport == 'T':
+            tcp_policy(number, source, target, port, marker, blocked)
+        else:
+            one_exchange(number, source, target, port, marker, blocked, connected=str(transport == 'Uc').lower())
     elif mode == 'tcp-policy':
         tcp_policy(*args)
     elif mode == 'api':
@@ -2006,6 +2063,10 @@ def main():
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             cookie = struct.unpack('=Q', sock.getsockopt(socket.SOL_SOCKET, 71, 8))[0]
         print(json.dumps(dict(cookie=cookie)), flush=True)
+    elif mode == 'source-daemon':
+        # ip netns exec remounts sysfs; mount securityfs in that final namespace.
+        run('mount', '-t', 'securityfs', 'securityfs', '/sys/kernel/security')
+        os.execv(args[0], args)
     elif mode == 'uncap':
         exec_uncap(args)
     elif mode == 'without-tun':

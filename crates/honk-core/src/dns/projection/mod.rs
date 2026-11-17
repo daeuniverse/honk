@@ -202,6 +202,11 @@ pub(crate) struct FactStamp {
 }
 
 impl FactStamp {
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn identity(&self) -> (ScopeId, u64, Option<tokio::time::Instant>) {
+        (self.scope, self.revision, self.expires_at)
+    }
+
     pub(crate) fn is_unexpired_at(self, now: tokio::time::Instant) -> bool {
         self.expires_at.is_none_or(|expires_at| now < expires_at)
     }
@@ -368,7 +373,17 @@ impl RoutingProjection {
             .reserve(bytes)
             .ok_or_else(|| anyhow::anyhow!("packet DNS scope registration memory capacity"))?;
         let table = scopes.map(state::PacketFactScope::new).collect();
-        self.state.lock().register_packet_scopes(table, charge)
+        self.state
+            .lock()
+            .register_packet_scopes(table, charge, budget)
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(crate) fn install_native(
+        &self,
+        native: Arc<crate::ebpf::native::NativePublication>,
+    ) -> anyhow::Result<()> {
+        self.state.lock().install_native(native)
     }
 
     pub(crate) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
@@ -392,7 +407,7 @@ impl RoutingProjection {
     ) -> anyhow::Result<Option<DomainRouting>> {
         let mut state = self.state.lock();
         check_packet_authority(&state, router, generation)?;
-        Ok(state.bitmap(scope, ip))
+        state.try_bitmap(scope, ip)
     }
 
     /// Defers HOST writes behind publication; packet observations also defer

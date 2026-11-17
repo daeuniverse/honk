@@ -1,6 +1,6 @@
 //! UDP endpoint pool — NAT mapping and connection tracking for UDP relay.
 //!
-//! Each UDP "connection" (identified by scope + client + destination)
+//! Each UDP connection (scope + packet lineage + client + destination)
 //! gets a pooled endpoint that handles bidirectional forwarding and
 //! NAT timeout management. Mirrors the Go `udp_endpoint_pool.go`.
 //!
@@ -9,18 +9,21 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
+use crate::control::netstack::SourceWork;
 use crate::control::task_registry::TaskRegistry;
 use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
 use bytes::Bytes;
 use dashmap::DashMap;
 use honk_datapath::ScopeId;
+use honk_netstack::SourceContext;
 use honk_outbound::group::{ScoreOutcome, ScoreReporter};
 use parking_lot::Mutex;
 pub(in crate::control) use source::UplinkStall;
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -160,6 +163,7 @@ enum EndpointTransport {
 /// A pooled UDP endpoint representing one NAT mapping.
 pub struct UdpEndpoint {
     transport: EndpointTransport,
+    packet_source: Option<SourceWork>,
     /// The relay target address (upstream proxy).
     pub relay_addr: SocketAddr,
     target_is_domain: bool,
@@ -272,6 +276,7 @@ impl UdpEndpoint {
         Self {
             dead: AtomicBool::new(false),
             transport,
+            packet_source: None,
             relay_addr,
             target_is_domain,
             node_id,
@@ -301,6 +306,32 @@ impl UdpEndpoint {
             native: Default::default(),
             retirement: EndpointIoGuard(RetirementIo::new()),
         }
+    }
+
+    pub(in crate::control) fn packet_source(&self) -> Option<&SourceWork> {
+        match &self.transport {
+            EndpointTransport::Flow(_) => self.packet_source.as_ref(),
+            EndpointTransport::Source(source) => source.packet_source(),
+        }
+    }
+
+    pub(in crate::control) fn bind_packet_source(
+        &mut self,
+        source: Option<SourceWork>,
+    ) -> io::Result<()> {
+        if let EndpointTransport::Source(owner) = &self.transport {
+            if owner.packet_source().map(SourceWork::identity)
+                != source.as_ref().map(SourceWork::identity)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UDP source context mismatch",
+                ));
+            }
+        } else {
+            self.packet_source = source;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "native-api")]
@@ -632,10 +663,15 @@ impl UdpEndpoint {
     }
 }
 
-/// Creates a reply transport for the explicitly supplied scope and source.
+/// Creates a reply transport for the supplied scope, address and original packet source.
 /// The pool reserves descriptor credit before invoking FD-using factories.
 pub(super) trait UdpReplySocketFactory: Send + Sync + std::fmt::Debug {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd>;
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd>;
 
     /// False only when creation and transport lifetime require no socket FD.
     fn uses_fd(&self) -> bool {
@@ -645,6 +681,7 @@ pub(super) trait UdpReplySocketFactory: Send + Sync + std::fmt::Debug {
 
 pub(super) struct ReplySocket {
     scope: ScopeId,
+    packet_source: Option<SourceContext>,
     socket: ReplySocketFd,
     _permit: Option<OwnedSemaphorePermit>,
 }
@@ -663,6 +700,7 @@ impl ReplySocket {
         slots: &Arc<Semaphore>,
         scope: ScopeId,
         source: SocketAddr,
+        packet_source: Option<&SourceWork>,
     ) -> io::Result<Self> {
         let permit = if factory.uses_fd() {
             Some(Arc::clone(slots).try_acquire_owned().map_err(|_| {
@@ -671,17 +709,25 @@ impl ReplySocket {
         } else {
             None
         };
-        let socket = factory.create(scope, source)?;
+        if packet_source.is_some_and(|source| source.scope() != scope) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "UDP reply source belongs to another scope",
+            ));
+        }
+        let socket = factory.create(scope, source, packet_source)?;
         if let ReplySocketFd::Packet(sender) = &socket
-            && sender.scope() != scope
+            && (sender.scope() != scope
+                || sender.source_context() != packet_source.and_then(SourceWork::optional_context))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "UDP reply sender belongs to another scope",
+                "UDP reply sender does not match the original scope and source",
             ));
         }
         Ok(Self {
             scope,
+            packet_source: packet_source.and_then(SourceWork::optional_context),
             socket,
             _permit: permit,
         })
@@ -704,6 +750,7 @@ impl ReplySocket {
     fn untracked(scope: ScopeId, socket: Arc<UdpSocket>) -> Self {
         Self {
             scope,
+            packet_source: None,
             socket: ReplySocketFd::Untracked(socket),
             _permit: None,
         }
@@ -714,8 +761,13 @@ impl ReplySocket {
 struct SystemUdpReplySocketFactory;
 
 impl UdpReplySocketFactory for SystemUdpReplySocketFactory {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
-        if scope != ScopeId::HOST {
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
+        if scope != ScopeId::HOST || packet_source.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "kernel UDP reply sockets require the HOST scope",
@@ -730,7 +782,7 @@ pub(in crate::control) struct UdpShutdown {
     pub graceful: bool,
 }
 
-/// Pool state is a single map entry per scoped tuple: Initializing, Ready, or
+/// Pool state is a single entry per scope, packet lineage and tuple: Initializing, Ready, or
 /// the exact Retiring identity that fences reuse until cleanup is acknowledged.
 pub struct UdpEndpointPool {
     endpoints: DashMap<EndpointKey, EndpointEntry>,
@@ -895,8 +947,10 @@ impl UdpEndpointPool {
         &self,
         scope: ScopeId,
         source: SocketAddr,
+        packet_source: Option<&SourceWork>,
     ) -> io::Result<ReplySocket> {
-        self.foreign_replies.create_primary(scope, source)
+        self.foreign_replies
+            .create_primary(scope, source, packet_source)
     }
 
     #[cfg(test)]
@@ -914,9 +968,10 @@ impl UdpEndpointPool {
         scope: ScopeId,
         client: SocketAddr,
         dst: SocketAddr,
+        packet_lineage: Option<NonZeroU64>,
     ) -> bool {
         self.endpoints
-            .contains_key(&EndpointKey::new(scope, client, dst))
+            .contains_key(&EndpointKey::new(scope, client, dst, packet_lineage))
     }
 
     pub(in crate::control) fn retains_source(&self, scope: ScopeId, address: IpAddr) -> bool {
@@ -966,3 +1021,52 @@ use driver::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+fn host_packet_scope() -> (
+    crate::control::netstack::PacketScope,
+    crate::control::netstack::PacketOwner,
+) {
+    let mut config = honk_netstack::Config::new([91; 32]);
+    config.mode = honk_netstack::Mode::Transparent {
+        exclude: Default::default(),
+    };
+    config.max_flows = 4;
+    config.mtu = 1280;
+    config.memory_limit = 2 << 20;
+    config.tcp_rcv_buf_max = 4096;
+    config.tcp_snd_buf_max = 8192;
+    let (scope, owner) = crate::control::netstack::PacketScope::new(
+        config,
+        honk_netstack::MemoryBudget::new(32 << 20),
+        crate::control::netstack::RuntimeLimits {
+            max_slots: 4,
+            control_frames: 2,
+            bulk_frames: 2,
+            max_waiters: 4,
+        },
+        Instant::now(),
+    )
+    .unwrap();
+    scope.prepare_host().unwrap();
+    (scope, owner)
+}
+
+#[cfg(test)]
+fn host_facts(cookie: u64, mark: u32) -> honk_ebpf_common::host::HostSourceFacts {
+    honk_ebpf_common::host::HostSourceFacts {
+        netns_cookie: 1,
+        attachment: 2,
+        socket_cookie: cookie,
+        return_generation: 3,
+        output_ifindex: 4,
+        skb_mark: mark,
+        socket_mark: 0,
+        pid: 0,
+        pname: [0; 16],
+        flags: 1,
+        stage: 1,
+        family: libc::AF_INET as u16,
+        operation_incarnation: 1,
+    }
+}

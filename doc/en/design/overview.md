@@ -73,7 +73,7 @@ Shared configuration schema/parsers. Pure-Rust deps: serde, regex, url, base64, 
 
 ## High-level data path
 
-The diagram and packet walk below describe default TC. Explicit [TUN Endpoint](./datapath.md#linux-tun-endpoint) captures actual L3 through one daemon-owned FD, uses the same scoped Stack, canonical Router and real outbound, then writes generated replies to that FD. Direct is an explicit new-dial relay; no HostFacts, original socket, pre-NAT/TTL equivalence, Native bypass or captured return is claimed. These S-b/S-c/S-d gaps remain; S-a does not complete E6.4. XDP retains its separate device/Core contracts.
+The diagram and packet walk below describe default TC. Explicit [TUN Endpoint](./datapath.md#linux-tun-endpoint) uses one daemon-owned FD, scoped Stack, canonical Router and real outbound. Opt-in socket HostFacts support process routing; Direct is a new-dial relay, not original socket, pre-NAT/TTL, Native bypass or captured return. XDP retains its separate device/Core contracts.
 
 ```mermaid
 flowchart TB
@@ -139,7 +139,7 @@ flowchart TB
 | `jemalloc` | yes | Pulls in `tikv-jemallocator` and installs jemalloc as the `honk-core` binary allocator; the crate builds jemalloc from C source. On Linux, startup disables transparent huge pages for the process before starting Tokio. Runtime options use `_RJEM_MALLOC_CONF`, not `MALLOC_CONF`, because the crate prefixes jemalloc symbols with `_rjem_`. |
 | `rprx` | yes | Enables `honk-outbound/rprx`, which registers the VLESS and VMess handlers, including the supported VLESS Encryption and `xtls-rprx-vision` paths. |
 
-`mock-ebpf` is not a Cargo feature. For default TC, a build without `ebpf` uses `MockEbpfBackend`, and `--mock-ebpf` explicitly selects unprivileged development. Requested NFQUEUE there warns and disables for the process without changing the file. Explicit XDP/TUN use the shared userspace policy backend and their real Linux device owners independently of the `ebpf` feature. TUN requires `/dev/net/tun`, device/route and socket-mark privileges, rejects `--mock-ebpf`, and requires explicit `nfqueue_enable: false`; it never takes a TC/NFQUEUE fallback.
+`mock-ebpf` is not a Cargo feature. Default TC without `ebpf` uses `MockEbpfBackend`; `--mock-ebpf` selects unprivileged development and disables requested NFQUEUE for the process. XDP/TUN use the shared userspace policy backend; TUN `host_facts: true` requires `ebpf`, while false does not. TUN requires `/dev/net/tun`, device/route and socket-mark privileges, rejects mock and requires `nfqueue_enable: false`; it never falls back to TC/NFQUEUE.
 
 When embedding eBPF, `build.rs` rebuilds with the kernel crate's pinned compiler and standalone release policy, not inherited host `RUSTFLAGS`, `CARGO_ENCODED_RUSTFLAGS` or `CARGO_PROFILE_*` profiling overrides. The compiler sidecar must be no older than the embedding build script, so an embedding-policy change invalidates previously built objects. Explicit `--bpf-object` artifacts and manual kernel builds remain the caller's responsibility.
 

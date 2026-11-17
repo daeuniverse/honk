@@ -779,13 +779,17 @@ async fn serve(
 ) -> anyhow::Result<Retired> {
     let deadline = namespace.deadline;
     let admission = Arc::new(AtomicBool::new(false));
+    let pname_support = Arc::new(parking_lot::RwLock::new(
+        crate::ebpf::PnameSupport::Unavailable,
+    ));
     let resolver = crate::dns::DnsResolver::new(&config.dns)?;
     let forwarder = resolver.forwarder();
     let mut plane = ControlPlane::new(
         config.clone(),
-        Box::new(crate::ebpf::userspace::UserspaceBackend::new(Arc::clone(
-            &admission,
-        ))),
+        Box::new(crate::ebpf::userspace::UserspaceBackend::new(
+            Arc::clone(&admission),
+            Arc::clone(&pname_support),
+        )),
         crate::routing::Router::from_config(&config.routing)?,
         Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver()?),
         resolver,
@@ -802,7 +806,7 @@ async fn serve(
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
     let (mut runtime, mut owner) =
-        start_runtime(plane, &config, &pins, &artifacts, admission).await?;
+        start_runtime(plane, &config, &pins, &artifacts, admission, pname_support).await?;
     let binding_failure = record_bindings(&runtime, &config, &namespace, &artifacts).err();
     let control = runtime.polling.test_control();
     let budget = runtime.polling.budget.as_ref().unwrap().clone();
@@ -957,23 +961,8 @@ async fn serve(
     if let Err(error) = result {
         failure.get_or_insert(error);
     }
-    if let Err(error) = drain_transmit(
-        || {
-            let mut outstanding = false;
-            for device in &mut runtime.devices {
-                for queue in &mut device.queues {
-                    let port = queue.io.get_mut();
-                    port.complete(release_completed)?;
-                    port.kick()?;
-                    outstanding |= port.counters().submitted != port.counters().completed;
-                }
-            }
-            Ok(outstanding)
-        },
-        Instant::now(),
-        &mut warned,
-    )
-    .await
+    if let Err(error) =
+        drain_transmit(|| runtime.complete_transmit(), Instant::now(), &mut warned).await
     {
         std::mem::forget((runtime, owner, plane));
         return Err(error.into());
@@ -1014,6 +1003,10 @@ async fn serve(
             .context("owner captured an unowned device")?;
         guards.push((device.info.ifindex, mac, guard));
     }
+    }
+    #[cfg(feature = "ebpf")]
+    if let Some(host) = runtime.host.take() {
+        host.finish()?;
     backend.write().await.cleanup().await?;
     Ok(Retired {
         plane: Some(plane),

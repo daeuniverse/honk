@@ -1,7 +1,10 @@
 //! Raw BTF reader for the few kernel and object layouts aya does not expose.
 
 use anyhow::Context;
+use honk_netstack::{MemoryBudget, MemoryReservation};
+use std::io::Read as _;
 use std::ops::Range;
+use std::sync::Arc;
 
 pub(super) const BTF_HEADER_LEN: usize = 24;
 
@@ -11,7 +14,7 @@ const VMLINUX_BTF_PATH: &str = "/sys/kernel/btf/vmlinux";
 const VMLINUX_BTF_FALLBACK_PATH: &str = "/usr/lib/debug/boot/vmlinux";
 const VMLINUX_BTF_ENV: &str = "HONK_VMLINUX_BTF";
 
-pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
+pub(crate) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
     let data = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
         std::fs::read(&path).with_context(|| {
             format!(
@@ -32,6 +35,145 @@ pub(super) fn load_kernel() -> anyhow::Result<(Vec<u8>, aya::Btf)> {
     Ok((data, btf))
 }
 
+/// Fields drop in declaration order: both representations are released before
+/// their charges, on successful use and every early-error path.
+pub(crate) struct AccountedKernelBtf {
+    pub(crate) data: Vec<u8>,
+    pub(crate) btf: aya::Btf,
+    raw_memory: MemoryReservation,
+    parsed_memory: MemoryReservation,
+}
+
+impl AccountedKernelBtf {
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.raw_memory.bytes() + self.parsed_memory.bytes()
+    }
+}
+
+struct RawKernelBtf {
+    data: Vec<u8>,
+    memory: MemoryReservation,
+}
+
+/// Charge Host raw input and Aya's parsed representation before allocation.
+/// Ordinary TC retains `load_kernel`'s existing behavior.
+pub(crate) fn load_kernel_accounted(
+    budget: &Arc<MemoryBudget>,
+) -> anyhow::Result<AccountedKernelBtf> {
+    let raw = if let Some(path) = std::env::var_os(VMLINUX_BTF_ENV) {
+        read_kernel_accounted_file(std::path::Path::new(&path), budget).with_context(|| {
+            format!(
+                "reading kernel BTF from {VMLINUX_BTF_ENV}={}",
+                std::path::Path::new(&path).display()
+            )
+        })?
+    } else {
+        match read_kernel_accounted_file(std::path::Path::new(VMLINUX_BTF_PATH), budget) {
+            Ok(value) => value,
+            // Match load_kernel: fallback after an I/O failure, including one
+            // during the read, but never after a parse or budget refusal.
+            Err(error) if error.downcast_ref::<std::io::Error>().is_some() => {
+                read_kernel_accounted_file(std::path::Path::new(VMLINUX_BTF_FALLBACK_PATH), budget)
+                    .context("reading fallback Host kernel BTF")?
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    let parsed_bytes = Btf::parse(&raw.data)
+        .and_then(|btf| btf.aya_parse_allocation_bound())
+        .context("Host kernel BTF record/allocation bounds")?;
+    let parsed_memory = budget
+        .reserve(parsed_bytes)
+        .context("Host parsed kernel BTF memory capacity")?;
+    let btf = aya::Btf::parse(&raw.data, Default::default())
+        .context("parsing charged Host kernel BTF")?;
+    Ok(AccountedKernelBtf {
+        data: raw.data,
+        btf,
+        raw_memory: raw.memory,
+        parsed_memory,
+    })
+}
+
+fn read_kernel_accounted_file(
+    path: &std::path::Path,
+    budget: &Arc<MemoryBudget>,
+) -> anyhow::Result<RawKernelBtf> {
+    let mut file = std::fs::File::open(path)?;
+    // sysfs has no reliable size. Derive the exact maximum section end first.
+    let mut header = [0u8; BTF_HEADER_LEN];
+    read_btf_exact(&mut file, &mut header)?;
+    anyhow::ensure!(
+        u16::from_ne_bytes([header[0], header[1]]) == 0xeb9f,
+        "Host kernel BTF endianness differs from the running target"
+    );
+    let extent = declared_extent(&header).context("invalid Host kernel BTF header")?;
+    let raw_bytes = extent
+        .checked_mul(2)
+        .and_then(|bytes| bytes.checked_add(core::mem::size_of::<Vec<u8>>()))
+        .context("Host raw BTF charge overflow")?;
+    let raw = budget
+        .reserve(raw_bytes)
+        .context("Host raw kernel BTF memory capacity")?;
+    let mut data = Vec::new();
+    data.try_reserve_exact(extent)
+        .context("allocating charged Host kernel BTF")?;
+    data.resize(extent, 0);
+    data[..BTF_HEADER_LEN].copy_from_slice(&header);
+    for chunk in data[BTF_HEADER_LEN..].chunks_mut(8192) {
+        read_btf_exact(&mut file, chunk)?;
+    }
+    anyhow::ensure!(
+        file.read(&mut header[..1])? == 0,
+        "Host kernel BTF has undeclared trailing bytes"
+    );
+    Ok(RawKernelBtf { data, memory: raw })
+}
+
+fn read_btf_exact(file: &mut std::fs::File, output: &mut [u8]) -> anyhow::Result<()> {
+    match file.read_exact(output) {
+        Ok(()) => Ok(()),
+        // EOF is a successful short read in fs::read, then a BTF parse error;
+        // it must not change canonical file-selection fallback semantics.
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+            anyhow::bail!("truncated Host kernel BTF")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub(crate) fn declared_extent(header: &[u8; BTF_HEADER_LEN]) -> Option<usize> {
+    let endian = match u16::from_le_bytes(header[..2].try_into().ok()?) {
+        0xeb9f => Endian::Little,
+        0x9feb => Endian::Big,
+        _ => return None,
+    };
+    let header_len = read_u32(header, 4, endian)? as usize;
+    if header_len < BTF_HEADER_LEN {
+        return None;
+    }
+    let type_end = (read_u32(header, 8, endian)? as usize)
+        .checked_add(read_u32(header, 12, endian)? as usize)?;
+    let string_end = (read_u32(header, 16, endian)? as usize)
+        .checked_add(read_u32(header, 20, endian)? as usize)?;
+    header_len
+        .checked_add(type_end.max(string_end))
+        .filter(|&bytes| bytes <= isize::MAX as usize)
+}
+
+fn vector_peak(elements: usize, width: usize) -> Option<usize> {
+    if elements == 0 {
+        return Some(0);
+    }
+    // The pinned Vec growth retains an old and doubled new backing. Three
+    // power-of-two capacities also cover exact-size collect/to_vec paths.
+    elements
+        .max(4)
+        .checked_next_power_of_two()?
+        .checked_mul(width)?
+        .checked_mul(3)
+}
+
 #[derive(Clone, Copy)]
 enum Endian {
     Little,
@@ -47,7 +189,7 @@ impl Endian {
     }
 }
 
-pub(super) struct Btf<'a> {
+pub(crate) struct Btf<'a> {
     data: &'a [u8],
     types: Range<usize>,
     strings: Range<usize>,
@@ -55,7 +197,7 @@ pub(super) struct Btf<'a> {
 }
 
 impl<'a> Btf<'a> {
-    pub(super) fn parse(data: &'a [u8]) -> Option<Self> {
+    pub(crate) fn parse(data: &'a [u8]) -> Option<Self> {
         if data.len() < BTF_HEADER_LEN {
             return None;
         }
@@ -91,18 +233,18 @@ impl<'a> Btf<'a> {
 
     /// Word at an absolute record offset; reads past the type section fail
     /// instead of decoding string-table bytes as type records.
-    pub(super) fn u32_at(&self, offset: usize) -> Option<u32> {
+    pub(crate) fn u32_at(&self, offset: usize) -> Option<u32> {
         if offset.checked_add(4)? > self.types.end {
             return None;
         }
         read_u32(self.data, offset, self.endian)
     }
 
-    pub(super) fn kind(&self, cursor: usize) -> Option<u32> {
+    pub(crate) fn kind(&self, cursor: usize) -> Option<u32> {
         Some((read_u32(self.data, cursor.checked_add(4)?, self.endian)? >> 24) & 0x1f)
     }
 
-    pub(super) fn string(&self, offset: u32) -> Option<&str> {
+    pub(crate) fn string(&self, offset: u32) -> Option<&str> {
         let start = self.strings.start.checked_add(offset as usize)?;
         if start >= self.strings.end {
             return None;
@@ -114,8 +256,46 @@ impl<'a> Btf<'a> {
         std::str::from_utf8(&self.data[start..end]).ok()
     }
 
+    pub(crate) fn aya_parse_allocation_bound(&self) -> Option<usize> {
+        // aya-obj 0.6 owns strings and a growing Vec<BtfType>. BtfType::read
+        // additionally allocates only the arrays of wire-width entries below
+        // and a temporary three-word header Vec, released after each record.
+        let mut cursor = self.types.start;
+        let mut records = 0usize;
+        let mut arrays = 0usize;
+        while cursor < self.types.end {
+            let info = self.u32_at(cursor.checked_add(4)?)?;
+            let kind = (info >> 24) & 0x1f;
+            let vlen = info & 0xffff;
+            let next = cursor
+                .checked_add(12)?
+                .checked_add(type_extra_len(kind, vlen)?)?;
+            if next > self.types.end {
+                return None;
+            }
+            let width = match kind {
+                4 | 5 | 15 | 19 => 12,
+                6 | 13 => 8,
+                _ => 0,
+            };
+            if width != 0 {
+                arrays = arrays.checked_add(vector_peak(vlen as usize, width)?)?;
+            }
+            records = records.checked_add(1)?;
+            cursor = next;
+        }
+        vector_peak(
+            records.checked_add(1)?,
+            core::mem::size_of::<aya_obj::btf::BtfType>(),
+        )?
+        .checked_add(vector_peak(self.strings.len(), 1)?)?
+        .checked_add(arrays)?
+        .checked_add(vector_peak(3, core::mem::size_of::<u32>())?)?
+        .checked_add(core::mem::size_of::<aya::Btf>())
+    }
+
     /// Cursor of the first type of `kind` named `name`.
-    pub(super) fn find_type(&self, kind: u32, name: &str) -> Option<usize> {
+    pub(crate) fn find_type(&self, kind: u32, name: &str) -> Option<usize> {
         let mut cursor = self.types.start;
         while cursor < self.types.end {
             let name_offset = read_u32(self.data, cursor, self.endian)?;
@@ -147,7 +327,7 @@ impl<'a> Btf<'a> {
     }
 
     /// Offset of a complete, non-bitfield member of exactly `width` bytes.
-    pub(super) fn sized_member_offset(
+    pub(crate) fn sized_member_offset(
         &self,
         type_name: &str,
         member_name: &str,
@@ -157,7 +337,7 @@ impl<'a> Btf<'a> {
     }
 
     /// Direct, non-bitfield member: its type id and byte offset.
-    pub(super) fn direct_member(&self, cursor: usize, name: &str) -> Option<(u32, u32)> {
+    pub(crate) fn direct_member(&self, cursor: usize, name: &str) -> Option<(u32, u32)> {
         let info = self.u32_at(cursor.checked_add(4)?)?;
         if self.kind(cursor)? != 4 || info >> 31 != 0 {
             return None;
@@ -240,7 +420,7 @@ impl<'a> Btf<'a> {
         None
     }
 
-    fn type_size(&self, mut type_id: u32) -> Option<u32> {
+    pub(crate) fn type_size(&self, mut type_id: u32) -> Option<u32> {
         let mut elements = 1u32;
         for _ in 0..8 {
             let cursor = self.type_by_id(type_id)?;
@@ -260,13 +440,13 @@ impl<'a> Btf<'a> {
         None
     }
 
-    pub(super) fn resolve_composite(&self, type_id: u32) -> Option<usize> {
+    pub(crate) fn resolve_composite(&self, type_id: u32) -> Option<usize> {
         let cursor = self.resolve_modifiers(type_id)?;
         matches!(self.kind(cursor)?, 4 | 5).then_some(cursor)
     }
 
     /// Follow a bounded typedef/qualifier/type-tag chain to the underlying type.
-    pub(super) fn resolve_modifiers(&self, mut type_id: u32) -> Option<usize> {
+    pub(crate) fn resolve_modifiers(&self, mut type_id: u32) -> Option<usize> {
         for _ in 0..8 {
             let cursor = self.type_by_id(type_id)?;
             if !matches!(self.kind(cursor)?, 8..=11 | 18) {
@@ -277,7 +457,7 @@ impl<'a> Btf<'a> {
         None
     }
 
-    pub(super) fn type_by_id(&self, type_id: u32) -> Option<usize> {
+    pub(crate) fn type_by_id(&self, type_id: u32) -> Option<usize> {
         if type_id == 0 {
             return None;
         }
@@ -299,7 +479,7 @@ fn read_u32(data: &[u8], offset: usize, endian: Endian) -> Option<u32> {
     Some(endian.u32(data.get(offset..offset.checked_add(4)?)?.try_into().ok()?))
 }
 
-fn type_extra_len(kind: u32, vlen: u32) -> Option<usize> {
+pub(crate) fn type_extra_len(kind: u32, vlen: u32) -> Option<usize> {
     let (size, repeated): (usize, bool) = match kind {
         0 | 2 | 7..=12 | 16 | 18 => (0, false),
         1 => (4, false),
@@ -320,6 +500,52 @@ fn type_extra_len(kind: u32, vlen: u32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::Btf;
+
+    #[test]
+    fn aya_allocation_preflight_accounts_payloads_and_rejects_truncated_records() {
+        let fixture = |declared_members: u32, actual_members: u32| {
+            let mut types = Vec::new();
+            for value in [0u32, (4 << 24) | declared_members, 16] {
+                types.extend_from_slice(&value.to_ne_bytes());
+            }
+            for _ in 0..actual_members {
+                for value in [0u32, 0, 0] {
+                    types.extend_from_slice(&value.to_ne_bytes());
+                }
+            }
+            let mut data = Vec::from(0xeb9fu16.to_ne_bytes());
+            data.extend_from_slice(&[1, 0]);
+            for value in [24u32, 0, types.len() as u32, types.len() as u32, 1] {
+                data.extend_from_slice(&value.to_ne_bytes());
+            }
+            data.extend_from_slice(&types);
+            data.push(0);
+            data
+        };
+        let one = fixture(1, 1);
+        let many = fixture(8, 8);
+        let one_bound = Btf::parse(&one)
+            .unwrap()
+            .aya_parse_allocation_bound()
+            .unwrap();
+        let many_bound = Btf::parse(&many)
+            .unwrap()
+            .aya_parse_allocation_bound()
+            .unwrap();
+        assert!(many_bound > one_bound);
+        assert!(many_bound >= 8 * 12 + 2 * core::mem::size_of::<aya_obj::btf::BtfType>());
+        assert!(aya::Btf::parse(&one, Default::default()).is_ok());
+        assert!(aya::Btf::parse(&many, Default::default()).is_ok());
+        let truncated = fixture(9, 8);
+        assert!(
+            Btf::parse(&truncated)
+                .unwrap()
+                .aya_parse_allocation_bound()
+                .is_none()
+        );
+        let header: &[u8; super::BTF_HEADER_LEN] = many[..24].try_into().unwrap();
+        assert_eq!(super::declared_extent(header), Some(many.len()));
+    }
 
     #[test]
     fn array_members_require_exact_bounded_nonoverflowing_width() {

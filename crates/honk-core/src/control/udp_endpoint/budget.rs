@@ -28,8 +28,7 @@ impl PoolMemory {
                 + size_of::<Arc<SourceOwner>>());
         let cached = (MAX_REPLY_SOCKETS_PER_ENDPOINT + 2)
             * (size_of::<ReplySocket>()
-                + size_of::<SocketAddr>()
-                + size_of::<ScopeId>()
+                + size_of::<foreign_reply::ReplyKey>()
                 + size_of::<[usize; 8]>());
         let bytes = capacity
             .checked_mul(16 * (keyed + cached + size_of::<EndpointRemoval>() + 8))
@@ -37,6 +36,13 @@ impl PoolMemory {
                 bytes.checked_add(2 * MAP_SHARDS * 256 + size_of::<UdpEndpointPool>())
             })
             .ok_or_else(capacity_error)?;
+        tracing::debug!(
+            bytes,
+            capacity,
+            used = budget.used(),
+            limit = budget.limit(),
+            "UDP pool map reservation"
+        );
         let maps = budget.reserve(bytes).ok_or_else(capacity_error)?;
         let completed_tasks = Arc::new(AtomicUsize::new(0));
         let source_tasks =

@@ -745,7 +745,7 @@ async fn routing_reload_retires_direct_udp_sockets_but_unrelated_reload_preserve
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0x321,
+            mark: Some(0x321),
         });
     assert!(
         plane
@@ -5143,7 +5143,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     ),
                     priority: 0,
                     must: false,
-                    mark: 0,
+                    mark: None,
                 });
             config
                 .routing
@@ -5159,7 +5159,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
                     ),
                     priority: 0,
                     must: false,
-                    mark: 0,
+                    mark: None,
                 });
             let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
             let mut control = ControlPlane::new(

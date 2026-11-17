@@ -203,6 +203,28 @@ fn plane(config: Config) -> anyhow::Result<ControlPlane> {
 }
 
 #[tokio::test]
+async fn packet_tcp_refuses_reserved_mark_before_legacy_socket_dial() -> anyhow::Result<()> {
+    let upstream = TcpListener::bind("127.0.0.1:0").await?;
+    let (mut wire, flow) = Wire::connect(upstream.local_addr()?)?;
+    let plane = plane(config())?;
+    let handle = plane.spawn_handle();
+    let mut routing = honk_config::routing::RoutingConfig::default();
+    routing.default_outbound = "direct".into();
+    routing.default_mark = Some(honk_ebpf_common::CLASSIFIED_MARK);
+    *handle.router.write().await = Router::from_config(&routing)?;
+    let serving = tokio::spawn(async move { handle.serve_packet_connection(flow).await });
+    wire.settle(&serving).await?;
+    assert!(serving.await?.is_err());
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), upstream.accept())
+            .await
+            .is_err()
+    );
+    wire.finish().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn packet_tcp_routes_real_loopback_and_keeps_close_until_output_release() -> anyhow::Result<()>
 {
     tokio::time::timeout(Duration::from_secs(20), async {
@@ -282,6 +304,7 @@ async fn admitted_packet_tcp_keeps_route_and_mode_after_publication() -> anyhow:
                 flow.local_addr(),
                 "tcp",
                 flow.dscp(),
+                flow.packet_source(),
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -346,7 +369,7 @@ async fn packet_tcp_sniffing_preserves_domain_plus_and_initial_must() -> anyhow:
                 outbound: RoutingOutbound::Simple("block".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             });
             if must {
                 config.routing.rules.push(RoutingRule {
@@ -358,7 +381,7 @@ async fn packet_tcp_sniffing_preserves_domain_plus_and_initial_must() -> anyhow:
                     outbound: RoutingOutbound::Simple("traffic".into()),
                     priority: 0,
                     must: true,
-                    mark: 0,
+                    mark: None,
                 });
             }
             let plane = plane(config)?;
@@ -470,7 +493,7 @@ async fn packet_tcp_dns_policy_precedes_framed_controller_and_must_uses_real_pro
                     outbound: RoutingOutbound::Simple("dns-raw".into()),
                     priority: 0,
                     must: true,
-                    mark: 0,
+                    mark: None,
                 });
             }
             let plane = plane(config)?;
@@ -576,7 +599,7 @@ async fn packet_tcp_uses_dns_learned_domain_without_a_sniffed_name() -> anyhow::
             outbound: RoutingOutbound::Simple("block".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
         let (mut wire, flow) = Wire::connect("198.51.100.53:53".parse()?)?;
         let plane = plane(config)?;

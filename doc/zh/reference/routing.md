@@ -45,6 +45,8 @@ routing {
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | 十进制或带 `0x`/`0X` 前缀的十六进制 DSCP 值 | `dscp` |
 
+TUN 使用 `pname` 要求 `tun.host_facts: true`。进程事实仅在经认证的应用 socket Host 记录确有该信息时可用；plain 或单条记录缺失时不匹配正向谓词，但匹配其否定。plain 不代表已证明 Transit。
+
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 
 domain 模式、后缀、关键字、正则表达式与 `geosite` 都是同一条件内的备选，
@@ -82,24 +84,29 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不
 
 `direct(mark: 512)` 与 `direct(mark: 0x200)` 选择相同的直连 mark。
 无前缀数字按十进制解析（包括前导零），`0x`/`0X` 前缀表示十六进制。
-范围为 `0..=0x3fffffff`；`0xc0000000` 位属于数据路径，不供用户策略使用。
-二进制/八进制前缀、下划线、正负号、溢出、未知选项以及重复的 `mark`/`must`
-选项均拒绝配置。与全局 mark 标量不同，格式错误的直连 mark 不会静默变为零。
+解析保留完整 `u32` 范围，并区分省略 mark（`Keep`）与显式 `mark: 0`（`Set(0)`）。
+实际 backend 仍拒绝不支持的动作：TC 保留 `0xc0000000`，packet Endpoint/Core
+保持原有非零 mark 限制。二进制/八进制前缀、下划线、正负号、溢出、未知选项
+以及重复的 `mark`/`must` 选项均拒绝配置；格式错误的直连 mark 不会静默变为零。
 mark 只支持 `direct`，不支持代理/组目标。
+
+仅 Host 的 XDP Native 在原 operation 上执行 Keep 或精确的完整 32 位 Set，
+不添加 classified/bypass 位。物理 Native 不支持这些显式 Set 动作，包括 Set(0)，
+不能将它们静默投影为 legacy 直连套接字约定。
 
 `direct(mark: 0x200, must)` 与 `direct(must, mark: 0x200)` 等价，
 直连选项列表内部允许空白。`fallback:` 及其别名 `default:` 接受相同形式。
 合并 include 后最后出现的 fallback 替换整个回退动作（普通 `direct` 会清除 mark 与 `must`），
 且只在全部普通规则之后生效，即使部分规则在该 fallback 后面声明。
 
-对于 IPv4/IPv6 的 TCP 和 UDP，非零直连 mark 替换全局套接字 mark 的策略有效位，
-**不会与 `so_mark_from_dae` 或 `0x100` 按位 OR**。原生直连、
-NFQUEUE 批准的直连以及用户态直连套接字，会在低 30 位策略值之外保留
-`CLASSIFIED_MARK`（`0x40000000`）。例如配置 `0x200` 时可观测到
-`0x40000200`，Linux 策略路由规则必须使用掩码排除保留位。
-`mark: 0` 表示未指定：用户态发起的直连套接字使用全局 mark，
-原生直连不添加用户 mark。代理承载连接、bootstrap 和 DNS 控制器上游
-使用全局值，不继承被拦截流量规则的 mark。
+在既有 TC/NFQUEUE 和用户态直连套接字路径中，非零直连 mark 替换全局
+套接字 mark 的策略有效位，**不会与 `so_mark_from_dae` 或 `0x100` 按位 OR**。
+这些路径在低 30 位策略值之外保留 `CLASSIFIED_MARK`（`0x40000000`）。例如
+配置 `0x200` 时可观测到 `0x40000200`，Linux 策略路由规则必须用掩码排除保留位。
+仅在这个 legacy 执行边界，显式零与省略 mark 效果相同：用户态发起的直连
+套接字使用全局 mark，TC 直连不添加用户 mark。配置和 canonical 路由结果
+仍保留两者区别；这层 legacy 投影不是 Native 的完整 32 位 mark 赋值。
+代理承载连接、bootstrap 和 DNS 控制器上游使用全局值，不继承流量规则的 mark。
 
 例如，选择两个由用户配置的 WAN 路由表：
 
@@ -210,6 +217,13 @@ routing {
 ```
 
 这里 `proxy`、`hk` 和 `resilient` 都是组名。
+
+`routing` 的 `direct` 目标使用
+[`datapath.direct`](./global.md#捕获后端选择) 选定的执行方式。公开的
+`direct: native` 选择器要求物理 XDP 捕获、真实 eBPF 与关闭 NFQUEUE；
+符合条件的最终 Direct 数据包使用 XDP candidate `PASS`。TC/TUN/Host Native
+及 Native 防火墙/NAT 组合均拒绝。Host Native 与 captured-first return 尚不可执行。
+验收要求 TCX 最终门禁无跳过通过；该选择器不代表完整 V7，也不宣称真实测试已通过。
 
 ## Core 转发防火墙与 IPv4 NAT
 

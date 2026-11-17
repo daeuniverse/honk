@@ -5,7 +5,7 @@
 
 use crate::ScopeId;
 use honk_netstack::{
-    FragmentLimits, MemoryBudget, MemoryReservation, OwnedPacket,
+    FragmentInfo, FragmentLimits, MemoryBudget, MemoryReservation, OwnedPacket,
     transit::{Ipv6Fragment, Transit, TransitError, unicast},
     wire::{self, IpPacket, ParseError},
 };
@@ -157,6 +157,7 @@ impl Route {
 #[derive(Debug)]
 pub enum ForwardError {
     Packet(ParseError),
+    Fragment(honk_netstack::FragmentError),
     Capacity,
     Provenance,
     Expired,
@@ -171,6 +172,15 @@ impl std::error::Error for ForwardError {}
 impl From<ParseError> for ForwardError {
     fn from(error: ParseError) -> Self {
         Self::Packet(error)
+    }
+}
+
+impl ForwardError {
+    fn packet_only(self) -> Self {
+        match self {
+            Self::Fragment(_) => Self::Packet(ParseError::Fragment),
+            other => other,
+        }
     }
 }
 
@@ -472,23 +482,52 @@ impl CoreForward {
         now: Instant,
         bytes: &[u8],
     ) -> Result<Option<Packet>, ForwardError> {
+        self.receive_at(ingress, now, now, bytes)
+    }
+
+    /// Retains the original input deadline and uses service time for reassembly expiry.
+    pub fn receive_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        bytes: &[u8],
+    ) -> Result<Option<Packet>, ForwardError> {
+        self.receive_with_fragments_at(ingress, ingress_at, service_at, bytes)
+            .map(|(packet, _)| packet)
+            .map_err(ForwardError::packet_only)
+    }
+
+    /// Fragment sidecars follow this exact ingress/key through storage and completion.
+    pub fn receive_with_fragments_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        bytes: &[u8],
+    ) -> Result<(Option<Packet>, Option<FragmentInfo>), ForwardError> {
         let input = self
             .inputs
             .iter_mut()
             .find(|input| input.identity == ingress)
             .ok_or(ForwardError::Provenance)?;
-        let owned = match wire::parse_ip(bytes) {
-            Err(ParseError::Fragment) => match input
-                .transit
-                .reassemble(now, bytes)
-                .map_err(|_| ForwardError::Packet(ParseError::Fragment))?
-            {
-                Some(packet) => Some(packet),
-                None => return Ok(None),
-            },
+        let (owned, fragment) = match wire::parse_ip(bytes) {
+            Err(ParseError::Fragment) => {
+                let report = input
+                    .transit
+                    .reassemble_for_dispatch_at(ingress_at, service_at, bytes)
+                    .map_err(ForwardError::Fragment)?;
+                if report.packet.is_none() {
+                    return Ok((None, Some(report.fragment)));
+                }
+                (report.packet, Some(report.fragment))
+            }
             Err(error) => return Err(error.into()),
-            Ok(_) => None,
+            Ok(_) => (None, None),
         };
+        let ingress_at = owned
+            .as_ref()
+            .map_or(ingress_at, OwnedPacket::completion_ingress);
         let input = owned.as_ref().map_or(bytes, |packet| packet.as_ref());
         let (ip, query) = inspect(ingress, input)?;
         let metadata = self
@@ -505,18 +544,28 @@ impl CoreForward {
                 Bytes::Copied(bytes[..ip.payload.end].into(), charge)
             }
         };
-        Ok(Some(Packet {
-            bytes: storage,
-            ip,
-            query,
-            input_query: query,
-            deadline: now + Duration::from_secs(2),
-            _metadata: metadata,
-            validated: true,
-            binding: None,
-            native: None,
-            native_quote: None,
-        }))
+        Ok((
+            Some(Packet {
+                bytes: storage,
+                ip,
+                query,
+                input_query: query,
+                deadline: ingress_at + Duration::from_secs(2),
+                _metadata: metadata,
+                validated: true,
+                binding: None,
+                native: None,
+                native_quote: None,
+            }),
+            fragment,
+        ))
+    }
+
+    pub fn retains_fragment(&self, ingress: Ingress, fragment: FragmentInfo) -> bool {
+        self.inputs
+            .iter()
+            .find(|input| input.identity == ingress)
+            .is_some_and(|input| input.transit.retains_fragment(fragment))
     }
 
     pub fn prepare(
@@ -826,4 +875,202 @@ fn validate_options(packet: &[u8], ip: &IpPacket) -> Result<(), ParseError> {
         return Err(ParseError::Unsupported);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delayed_scatter_preserves_ingress_deadlines_and_fragment_expiry() {
+        let now = Instant::now();
+        let ingress = Ingress {
+            scope: ScopeId::HOST,
+            namespace: 19,
+            ifindex: 3,
+            attachment: 7,
+            mark: MarkProvenance::BeforeSkb,
+        };
+        let budget = MemoryBudget::new(16 << 20);
+        let mut core = CoreForward::new(&[ingress], Arc::clone(&budget), 4).unwrap();
+        let baseline = budget.used();
+        let source: std::net::Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let destination: std::net::Ipv4Addr = "198.51.100.1".parse().unwrap();
+        let mut input = [0; 64];
+        let n = wire::udp::emit_packet(
+            &mut input,
+            std::net::SocketAddr::new(source.into(), 5000),
+            std::net::SocketAddr::new(destination.into(), 443),
+            &[7; 24],
+        )
+        .unwrap();
+        let packet = core
+            .receive_segments_at(
+                ingress,
+                now,
+                now + Duration::from_secs(1),
+                &[&input[..7], &input[7..n]],
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.received_at(), now);
+        assert_eq!(packet.deadline(), now + Duration::from_secs(2));
+        drop(packet);
+        let fragment = |offset: usize, more: bool| {
+            let mut packet = [0; 36];
+            packet[..20].copy_from_slice(&input[..20]);
+            packet[2..4].copy_from_slice(&36u16.to_be_bytes());
+            packet[4..6].copy_from_slice(&123u16.to_be_bytes());
+            let flags = (offset / 8) as u16 | if more { 0x2000 } else { 0 };
+            packet[6..8].copy_from_slice(&flags.to_be_bytes());
+            packet[10..12].fill(0);
+            let checksum = wire::checksum::checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            packet[20..].copy_from_slice(&input[20 + offset..36 + offset]);
+            packet
+        };
+        let first = fragment(0, true);
+        let last = fragment(16, false);
+        let (pending, first_info) = core
+            .receive_with_fragments_at(ingress, now, now, &first)
+            .unwrap();
+        assert!(pending.is_none());
+        let first_info = first_info.unwrap();
+        assert!(core.retains_fragment(ingress, first_info));
+        let (completed, completed_info) = core
+            .receive_segments_with_fragments_at(
+                ingress,
+                now + Duration::from_secs(1),
+                now + Duration::from_secs(1),
+                &[&last[..9], &last[9..]],
+            )
+            .unwrap();
+        assert_eq!(completed_info, Some(first_info));
+        assert!(!core.retains_fragment(ingress, first_info));
+        let completed = completed.unwrap();
+        assert_eq!(completed.received_at(), now + Duration::from_secs(1));
+        assert_eq!(completed.deadline(), now + Duration::from_secs(3));
+        assert_eq!(completed_info.unwrap().original_ingress, now);
+        drop(completed);
+        let later = now + Duration::from_secs(10);
+        let (pending, before_expiry) = core
+            .receive_with_fragments_at(ingress, later, later, &first)
+            .unwrap();
+        assert!(pending.is_none());
+        let before_expiry = before_expiry.unwrap();
+        let Err(ForwardError::Fragment(rejected)) = core.receive_segments_with_fragments_at(
+            ingress,
+            now,
+            now + Duration::from_secs(30),
+            &[&last[..9], &last[9..]],
+        ) else {
+            panic!("expired fragment preserves its rejection receipt");
+        };
+        let updated = rejected.fragment.unwrap();
+        assert_eq!(updated.incarnation, before_expiry.incarnation);
+        assert_eq!(updated.identity, before_expiry.identity);
+        assert_eq!(updated.original_ingress, now);
+        assert!(core.retains_fragment(ingress, before_expiry));
+        assert!(core.retains_fragment(ingress, updated));
+        assert_eq!(core.poll_reassembly_timeout(), None);
+        let (quoted_ingress, quote) = core.poll_expired_quote().unwrap();
+        assert_eq!(quoted_ingress, ingress);
+        assert!(quote.charged_to(&budget));
+        assert_eq!(quote.fragment_info().original_ingress, now);
+        assert_eq!(quote.fragment_info(), updated);
+        assert!(!core.retains_fragment(ingress, before_expiry));
+        assert_eq!(quote.as_ref(), first.as_slice());
+        assert!(core.fragments_quiescent());
+        assert_eq!(budget.used(), baseline + quote.len());
+        drop(quote);
+        assert_eq!(budget.used(), baseline);
+        drop(core);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn reassembled_routing_window_uses_latest_ingress_in_both_processing_orders() {
+        let now = Instant::now();
+        let earliest = now + Duration::from_secs(119);
+        let completion = now + Duration::from_secs(121);
+        let ingress = Ingress {
+            scope: ScopeId::HOST,
+            namespace: 19,
+            ifindex: 3,
+            attachment: 7,
+            mark: MarkProvenance::BeforeSkb,
+        };
+        let egress = Ingress {
+            ifindex: 4,
+            attachment: 8,
+            ..ingress
+        };
+        let mut cfg = honk_netstack::Config::new([85; 32]);
+        cfg.mtu = 1280;
+        cfg.mode = honk_netstack::Mode::Transparent {
+            exclude: honk_netstack::ExcludeSet::default(),
+        };
+        let mut sender = honk_netstack::Stack::new(cfg, now);
+        let mut out = [0; 1500];
+        let n = sender
+            .udp_send_from(
+                "192.0.2.1:5000".parse().unwrap(),
+                "198.51.100.1:443".parse().unwrap(),
+                &[7; 2000],
+                &mut out,
+            )
+            .unwrap();
+        let first = out[..n].to_vec();
+        let n = sender.poll_transmit(now, &mut out).unwrap();
+        let last = out[..n].to_vec();
+        assert!(sender.poll_transmit(now, &mut out).is_none());
+        for reversed in [false, true] {
+            for lag in [
+                Duration::ZERO,
+                Duration::from_secs(2),
+                Duration::from_secs(3),
+            ] {
+                let budget = MemoryBudget::new(16 << 20);
+                let mut core =
+                    CoreForward::new(&[ingress, egress], Arc::clone(&budget), 4).unwrap();
+                let (input, first_at, final_input, final_at) = if reversed {
+                    (&last, completion, &first, earliest)
+                } else {
+                    (&first, earliest, &last, completion)
+                };
+                let service = completion + lag;
+                assert!(
+                    core.receive_at(ingress, first_at, service, input)
+                        .unwrap()
+                        .is_none()
+                );
+                let (packet, fragment) = core
+                    .receive_with_fragments_at(ingress, final_at, service, final_input)
+                    .unwrap();
+                let packet = packet.unwrap();
+                assert_eq!(fragment.unwrap().original_ingress, earliest);
+                assert_eq!(packet.received_at(), completion);
+                assert_eq!(packet.deadline(), completion + Duration::from_secs(2));
+                let route = Route {
+                    generation: 1,
+                    ifindex: egress.ifindex,
+                    l2: LinkPath::untagged(egress.ifindex),
+                    mtu: 1500,
+                    next_hop: packet.query().destination,
+                    preferred_source: None,
+                    source_mac: [2, 0, 0, 0, 0, 1],
+                    destination_mac: [2, 0, 0, 0, 0, 2],
+                };
+                match core.prepare(packet, route, 1, service) {
+                    Ok(Prepared::Forward(output)) if lag < Duration::from_secs(2) => drop(output),
+                    Err(ForwardError::Expired) if lag >= Duration::from_secs(2) => {}
+                    _ => panic!(
+                        "routing wait uses the real complete input, without reminting at service"
+                    ),
+                }
+                drop(core);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
 }

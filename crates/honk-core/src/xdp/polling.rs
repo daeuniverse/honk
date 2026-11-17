@@ -352,6 +352,10 @@ impl AdaptivePoll {
         }
     }
 
+    pub(in crate::xdp) fn participant(&self) -> Self {
+        Self::new(Arc::clone(&self.publication), self.budget.clone())
+    }
+
     pub(crate) fn revision(&self) -> u64 {
         self.config.revision
     }

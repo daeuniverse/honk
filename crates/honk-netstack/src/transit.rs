@@ -8,8 +8,9 @@ use std::{net::IpAddr, sync::Arc, time::Instant};
 pub use crate::fragment::Ipv6Fragment;
 
 use crate::{
-    DropReason, FragmentLimits, IcmpLimits, MemoryBudget, MemoryReservation, OwnedPacket,
-    fragment::{Push, Reassembler},
+    DropReason, FragmentError, FragmentInfo, FragmentLimits, IcmpLimits, MemoryBudget,
+    MemoryReservation, OwnedPacket, ReassemblyReport,
+    fragment::Reassembler,
     icmp_out::{IcmpEmit, IcmpOut, Reject},
     wire::{self, ParseError},
 };
@@ -73,18 +74,40 @@ impl Transit {
         now: Instant,
         packet: &[u8],
     ) -> Result<Option<OwnedPacket>, DropReason> {
+        self.reassemble_at(now, now, packet)
+    }
+
+    /// Preserves original ingress across a delayed worker handoff.
+    pub fn reassemble_at(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        packet: &[u8],
+    ) -> Result<Option<OwnedPacket>, DropReason> {
+        self.reassemble_for_dispatch_at(ingress_at, service_at, packet)
+            .map(|report| report.packet)
+            .map_err(|error| error.reason)
+    }
+
+    /// Reports the exact retained fragment before the adapter installs its sidecar.
+    pub fn reassemble_for_dispatch_at(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        packet: &[u8],
+    ) -> Result<ReassemblyReport, FragmentError> {
         let fragment = wire::frag::parse(packet).map_err(DropReason::from)?;
         for address in [fragment.src, fragment.dst] {
             if !unicast(address) {
-                return Err(DropReason::Unsupported);
+                return Err(DropReason::Unsupported.into());
             }
         }
-        self.fragments.expire(now);
-        match self.fragments.push(now, fragment) {
-            Push::Pending => Ok(None),
-            Push::Complete(complete) => Ok(Some(complete.packet)),
-            Push::Dropped(reason) => Err(reason),
-        }
+        self.fragments
+            .push_for_dispatch_at(ingress_at, service_at, fragment)
+    }
+
+    pub fn retains_fragment(&self, fragment: FragmentInfo) -> bool {
+        self.fragments.retains_fragment(fragment)
     }
 
     pub fn expire(&mut self, now: Instant) {

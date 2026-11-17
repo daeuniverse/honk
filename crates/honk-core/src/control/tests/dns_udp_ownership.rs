@@ -118,7 +118,7 @@ fn fixture(
         outbound: RoutingOutbound::Simple("beta".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     });
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();
     let (sent, received) = tokio::sync::mpsc::unbounded_channel();
@@ -697,7 +697,7 @@ async fn direct_dns_carrier_pins_packet_mark_not_latest_tuple_handoff() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: true,
-            mark,
+            mark: Some(mark),
         })
         .collect();
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound).unwrap();

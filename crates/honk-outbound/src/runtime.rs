@@ -558,11 +558,12 @@ impl NodeRuntime {
         client: std::net::SocketAddr,
         path: honk_config::node::VlessUdpPath,
         reply_destination: Option<std::net::SocketAddr>,
+        packet_source: Option<[u8; 16]>,
     ) -> anyhow::Result<[u8; 8]> {
         let ProtocolRuntime::Vless(runtime) = &self.runtime else {
             anyhow::bail!("node '{}' has no VLESS runtime", self.node.name);
         };
-        Ok(runtime.source_id(scope, client, path, reply_destination))
+        Ok(runtime.source_id(scope, client, path, reply_destination, packet_source))
     }
 
     #[cfg(any(feature = "rprx", test))]

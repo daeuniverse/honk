@@ -69,6 +69,7 @@ async fn different_sources_share_only_aggregated_carriers() {
                     Arc::clone(&stats),
                     honk_outbound::alive::IpVersion::V4,
                     false,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -158,6 +159,7 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -168,7 +170,10 @@ async fn rewritten_sources_keep_distinct_original_reply_addresses() {
             attachment,
             remote,
             None,
-            Arc::new(pool.create_reply_socket(lease.scope(), original).unwrap()),
+            Arc::new(
+                pool.create_reply_socket(lease.scope(), original, None)
+                    .unwrap(),
+            ),
             stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,
@@ -246,6 +251,7 @@ async fn overlapping_scopes_send_distinct_vless_source_ids_on_the_wire() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap()

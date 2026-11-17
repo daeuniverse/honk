@@ -114,6 +114,7 @@ struct RecordedConnection {
     network: Network,
     source: SocketAddr,
     destination: SocketAddr,
+    packet_facts: Option<(honk_ebpf_common::host::HostSourceFacts, u8)>,
     kernel_evaluation: Option<String>,
     kernel_route: Option<RouteObservation>,
     evaluation: Option<String>,
@@ -148,6 +149,7 @@ impl ConnectionObservation {
                     network,
                     source,
                     destination,
+                    packet_facts: None,
                     kernel_evaluation: None,
                     kernel_route: None,
                     evaluation: None,
@@ -246,6 +248,52 @@ impl ConnectionObservation {
     pub(super) fn shared(&self) -> Option<Arc<Self>> {
         self.is_recording().then(|| Arc::new(self.clone()))
     }
+    }
+
+    pub(in crate::control) fn packet_facts(
+        &mut self,
+        facts: &honk_ebpf_common::host::HostSourceFacts,
+        dscp: u8,
+    ) {
+        let Some(record) = &mut self.recorded else {
+            return;
+        };
+        record.packet_facts = Some((*facts, dscp));
+        let pname = super::routing::packet_process_name(facts);
+        let pid = (facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT != 0)
+            .then_some(facts.pid)
+            .filter(|pid| *pid != 0);
+        record.flow.update_input(
+            None,
+            None,
+            pname.as_deref(),
+            pid,
+            None,
+            Some(dscp),
+            Some(facts.skb_mark),
+        );
+        record.flow.step(
+            None,
+            StepData::Input {
+                source: "packet",
+                values: InputValues {
+                    input: Input {
+                        src: record.source,
+                        dst: record.destination,
+                        domain: None,
+                        domain_source: None,
+                        pid,
+                        process_path: (),
+                        src_mac: None,
+                        ingress: (),
+                        domain_rule_ids: (),
+                        dscp: Some(dscp),
+                        mark: Some(facts.skb_mark),
+                    },
+                    pname,
+                },
+            },
+        );
 
     pub(super) fn handoff(&mut self, handoff: Option<&HandoffResult>, expected: bool) {
         let Some(record) = &mut self.recorded else {
@@ -358,6 +406,7 @@ impl ConnectionObservation {
                 rules: capture.rules,
                 outbound: capture.outbound,
                 must: Some(capture.must),
+                mark_kind: Some(capture.mark_kind),
                 mark: Some(capture.mark),
                 input: Some(EvaluationInput::Traffic(input)),
                 dns_action: None,
@@ -383,8 +432,24 @@ impl ConnectionObservation {
         source: Option<DomainSource>,
         handoff: Option<&HandoffResult>,
     ) {
-        if let Some(flow) = self.flow() {
-            update_input(flow, domain, source, handoff);
+        if let Some(record) = &self.recorded {
+            if let Some((facts, dscp)) = &record.packet_facts {
+                let pname = super::routing::packet_process_name(facts);
+                let pid = (facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT != 0)
+                    .then_some(facts.pid)
+                    .filter(|pid| *pid != 0);
+                record.flow.update_input(
+                    domain,
+                    source,
+                    pname.as_deref(),
+                    pid,
+                    None,
+                    Some(*dscp),
+                    Some(facts.skb_mark),
+                );
+            } else {
+                update_input(&record.flow, domain, source, handoff);
+            }
         }
     }
 
@@ -421,11 +486,12 @@ impl ConnectionObservation {
                     rules: std::mem::take(&mut capture.rules),
                     outbound: Some(decision.outbound.clone()),
                     must: Some(decision.must),
-                    mark: Some(
-                        decision
-                            .mark
-                            .map_or(0, honk_outbound::proxy::DirectMark::get),
-                    ),
+                    mark_kind: Some(if decision.mark.is_some() {
+                        honk_ebpf_common::ROUTING_MARK_SET
+                    } else {
+                        honk_ebpf_common::ROUTING_MARK_KEEP
+                    }),
+                    mark: Some(decision.mark.unwrap_or(0)),
                     input: capture.input.take().map(EvaluationInput::Traffic),
                     dns_action: None,
                 },
@@ -972,5 +1038,43 @@ mod tests {
         );
         assert!(!observation.is_recording());
         assert!(observation.flow().is_none());
+    }
+
+    #[test]
+    fn userspace_route_evidence_distinguishes_keep_zero_and_full_marks() {
+        let native = crate::native_api::observation::NativeObservation::new(&Config::default());
+        native.core.flows.set_recording(true);
+        let source = "192.0.2.1:53000".parse().unwrap();
+        let destination = "198.51.100.1:443".parse().unwrap();
+        let input =
+            super::super::routing::build_connection_info(None, destination, source, "tcp", None);
+        for mark in [None, Some(0), Some(u32::MAX)] {
+            let mut observation =
+                ConnectionObservation::begin(Some(&native.core), Network::Tcp, source, destination);
+            let flow = Arc::clone(observation.flow().unwrap());
+            let mut routing = honk_config::routing::RoutingConfig::default();
+            routing.default_outbound = "direct".into();
+            routing.default_mark = mark;
+            let router = Router::from_config(&routing).unwrap();
+            let mut decision =
+                RoutingDecision::from_router(&router, &input, None, Some((&native.core, 1)));
+            observation.routed(&mut decision);
+            let detail = native.core.flows.test_detail(flow.id());
+            let route = detail["trace"]["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|step| step["stage"] == "route")
+                .unwrap();
+            assert_eq!(
+                route["data"]["mark_kind"],
+                if mark.is_some() {
+                    honk_ebpf_common::ROUTING_MARK_SET
+                } else {
+                    honk_ebpf_common::ROUTING_MARK_KEEP
+                }
+            );
+            assert_eq!(route["data"]["mark"], mark.unwrap_or(0));
+        }
     }
 }

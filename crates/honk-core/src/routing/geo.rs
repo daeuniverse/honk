@@ -1901,7 +1901,7 @@ mod scan_tests {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         let requirements = GeoRequirements::for_traffic(std::slice::from_ref(&rule));
         assert_eq!(

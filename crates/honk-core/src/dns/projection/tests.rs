@@ -43,7 +43,7 @@ fn snapshot(generation: u64, a: u32, b: u32) -> Arc<RoutingProjectionSnapshot> {
                 outbound: RoutingOutbound::Simple("direct".to_owned()),
                 priority: bit,
                 must: false,
-                mark: 0,
+                mark: None,
             }
         })
         .collect::<Vec<_>>();

@@ -279,9 +279,11 @@ impl Fixture {
                 client,
                 SourcePath::Shared,
                 rewrite,
+                None,
             ),
             prepared: PreparedSourceTransport::Shared(PreparedUdpTransport::ready(transport)),
             source_permit: self.pool.source_slots.clone().try_acquire_owned().unwrap(),
+            packet_source: None,
             runtime: Arc::clone(&self.runtime),
             alive_set: Arc::clone(&self.alive),
             stats: Arc::clone(&self.stats),
@@ -305,6 +307,7 @@ impl Fixture {
             client,
             SourcePath::Shared,
             rewrite,
+            None,
         );
         let preparation = if self.pool.sources.contains_key(&scope) {
             self.pool
@@ -323,6 +326,7 @@ impl Fixture {
                     Arc::clone(&self.stats),
                     self.family,
                     false,
+                    None,
                 )
                 .await
                 .unwrap()
@@ -389,7 +393,7 @@ impl Fixture {
         reporter.setup_succeeded();
         let reply = Arc::new(
             self.pool
-                .create_reply_socket(lease.scope(), original)
+                .create_reply_socket(lease.scope(), original, None)
                 .unwrap(),
         );
         let endpoint = Arc::new(UdpEndpoint::new_source_scored(
@@ -532,7 +536,8 @@ async fn shared_source_serves_every_destination_through_one_transport() {
             !f.pool.endpoints.contains_key(&EndpointKey::new(
                 honk_datapath::ScopeId::HOST,
                 client,
-                c
+                c,
+                None,
             )),
             "foreign replies cannot create flow authority"
         );
@@ -632,9 +637,12 @@ async fn shared_source_delivers_replies_of_a_view_whose_driver_ended() {
     // Idle expiry and transport errors leave through this same driver exit.
     driver.abort();
     f.wait_until("ended view to leave the pool", || {
-        !f.pool
-            .endpoints
-            .contains_key(&EndpointKey::new(honk_datapath::ScopeId::HOST, client, b))
+        !f.pool.endpoints.contains_key(&EndpointKey::new(
+            honk_datapath::ScopeId::HOST,
+            client,
+            b,
+            None,
+        ))
     })
     .await;
     transport.reply(b, b"after-end");
@@ -667,7 +675,11 @@ async fn shared_source_forgets_the_oldest_retired_peer() {
     let (client, bound, oldest, recent) = (f.client(), f.target(0), f.target(1), f.target(2));
     let endpoint = f.flow(0, b"bound").await;
     let transport = f.transport();
-    let reply_socket = Arc::new(f.pool.create_reply_socket(ScopeId::HOST, bound).unwrap());
+    let reply_socket = Arc::new(
+        f.pool
+            .create_reply_socket(ScopeId::HOST, bound, None)
+            .unwrap(),
+    );
     let retire = async |target| {
         let view = SourceEndpoint::new(
             f.attach(client, target, None).await,
@@ -1051,5 +1063,110 @@ async fn shared_source_keeps_endpoint_slot_while_an_attachment_outlives_the_last
     })
     .await;
     assert_eq!(f.live.load(Ordering::SeqCst), 0);
+    f.shutdown().await;
+}
+
+#[tokio::test]
+async fn shared_sources_reuse_only_original_host_snapshots() {
+    let f = Fixture::new(false, 4).await;
+    let (scope, _scope_owner) = host_packet_scope();
+    let first = scope.hold_host_source(&host_facts(41, 7)).unwrap();
+    let changed = scope.hold_host_source(&host_facts(41, 8)).unwrap();
+    let other = scope.hold_host_source(&host_facts(42, 7)).unwrap();
+    let client = f.client();
+    let fresh = |source: SourceWork| {
+        let mut preparation = f.fresh(client, None);
+        if let SourcePreparation::Fresh {
+            scope: source_scope,
+            packet_source,
+            ..
+        } = &mut preparation
+        {
+            *source_scope = SourceScope::new(
+                scope.scope(),
+                &f.runtime,
+                client,
+                SourcePath::Shared,
+                None,
+                Some(source.context()),
+            );
+            *packet_source = Some(source);
+        }
+        preparation
+    };
+    let first_attachment = fresh(first.clone()).commit(&f.pool).await.unwrap();
+    let reused = f
+        .pool
+        .prepare_source(
+            scope.scope(),
+            &honk_outbound::proxy::ProxyRegistry::new(),
+            Arc::clone(&f.generation),
+            Arc::clone(&f.runtime),
+            client,
+            SourcePath::Shared,
+            None,
+            f.target(0),
+            None,
+            TEST_TIMEOUT,
+            Arc::clone(&f.alive),
+            Arc::clone(&f.stats),
+            f.family,
+            false,
+            Some(first.clone()),
+        )
+        .await
+        .unwrap()
+        .commit(&f.pool)
+        .await
+        .unwrap();
+    assert!(Arc::ptr_eq(&first_attachment.owner(), &reused.owner()));
+    let changed_attachment = fresh(changed.clone()).commit(&f.pool).await.unwrap();
+    let other_attachment = fresh(other.clone()).commit(&f.pool).await.unwrap();
+    assert!(!Arc::ptr_eq(
+        &first_attachment.owner(),
+        &changed_attachment.owner()
+    ));
+    assert!(!Arc::ptr_eq(
+        &first_attachment.owner(),
+        &other_attachment.owner()
+    ));
+    assert_eq!(f.pool.sources.len(), 3);
+    let reply = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let view = |attachment| {
+        UdpEndpoint::new_source_scored(
+            attachment,
+            f.target(0),
+            None,
+            Arc::new(ReplySocket::untracked(scope.scope(), Arc::clone(&reply))),
+            f.stats
+                .outbound_tracker(&f.node.name, crate::stats::OutboundKind::Node),
+            f.node.id,
+            f.family,
+            None,
+        )
+    };
+    let mut first_view = view(first_attachment);
+    assert!(
+        first_view
+            .bind_packet_source(Some(changed.clone()))
+            .is_err()
+    );
+    first_view.bind_packet_source(Some(first.clone())).unwrap();
+    let changed_view = view(changed_attachment);
+    let other_view = view(other_attachment);
+    let original = first.context();
+    drop((first, changed, other, reused));
+    assert_eq!(first_view.packet_source().unwrap().context(), original);
+    assert_eq!(first_view.packet_source().unwrap().facts().skb_mark, 7);
+    assert_eq!(
+        changed_view.packet_source().unwrap().context().lineage,
+        original.lineage
+    );
+    assert_eq!(changed_view.packet_source().unwrap().facts().skb_mark, 8);
+    assert_ne!(
+        other_view.packet_source().unwrap().context().lineage,
+        original.lineage
+    );
+    drop((first_view, changed_view, other_view));
     f.shutdown().await;
 }

@@ -71,7 +71,7 @@ fn rule(
         outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must,
-        mark,
+        mark: (mark != 0).then_some(mark),
     }
 }
 
@@ -658,7 +658,7 @@ fn large_prefix_fact_policy() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0x500,
+            mark: Some(0x500),
         }],
         "direct",
     )
@@ -723,7 +723,7 @@ fn predicate_bits_and_capacity_limits() {
                 outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
                 priority: 0,
                 must: false,
-                mark: 0x600 + index,
+                mark: Some(0x600 + index),
             })
             .collect::<Vec<_>>();
         let router = Router::new(&rules, "direct").unwrap();
@@ -778,7 +778,7 @@ fn predicate_bits_and_capacity_limits() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
         let rejected = Router::new(&overflow, "direct")
             .and_then(|router| RoutingPushPlan::compile(&router, &ids, DialMode::Ip));
@@ -808,6 +808,7 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let input_structure = name("RoutingInput");
     let input_flags = name("flags");
     let old_mac_present = name("mac_present");
+    let old_padding = name("padding");
     let fields = [
         "outbound",
         "mark",
@@ -821,7 +822,7 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let output_fields = [
         ("decision", offset_of!(KernelRouteOutput, decision)),
         ("flags", offset_of!(KernelRouteOutput, flags)),
-        ("padding", offset_of!(KernelRouteOutput, padding)),
+        ("mark_kind", offset_of!(KernelRouteOutput, mark_kind)),
         ("generation", offset_of!(KernelRouteOutput, generation)),
         ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
         ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
@@ -857,7 +858,6 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     for (index, (field, offset)) in output_fields.into_iter().enumerate() {
         let field_type = match index {
             0 => 2,
-            2 => 10,
             6 => 3,
             _ => 1,
         };
@@ -868,9 +868,8 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
     let prototype_offset = types.len();
     types.extend([0, (13 << 24) | 2, 1, 0, 6, 0, 5]);
     types.extend([slot, (12 << 24) | 1, 7]);
-    // IDs 9/10: the byte element and explicit four-byte padding array.
+    // IDs 9/10 model the rejected old padding ABI.
     types.extend([byte_integer, 1 << 24, 1, 8]);
-    let padding_offset = types.len();
     types.extend([0, 3 << 24, 0, 9, 1, 4]);
     let encode = |types: &[u32]| {
         let mut bytes = vec![0x9f, 0xeb, 1, 0];
@@ -901,10 +900,9 @@ fn routing_output_abi_rejects_stale_layouts_and_malformed_members() {
         (output_offset + 3 + 2, 32),
         (output_offset + 3 + 1, 1),
         (output_offset + 3 + 2 * 3, 0),
-        (output_offset + 3 + 2 * 3 + 1, 1),
+        (output_offset + 3 + 2 * 3, old_padding),
+        (output_offset + 3 + 2 * 3 + 1, 10),
         (output_offset + 3 + 2 * 3 + 2, 29 * 8),
-        (padding_offset + 3, 1),
-        (padding_offset + 5, 3),
         (prototype_offset + 4, 5),
         (prototype_offset + 6, 3),
     ] {

@@ -1047,7 +1047,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("block".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let ctx = test_ctx(&ui_dir, &rules);
         {
@@ -1182,7 +1182,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("block".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let dir = tempfile::tempdir().unwrap();
         let result =
@@ -1215,7 +1215,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("block".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let dir = tempfile::tempdir().unwrap();
 
@@ -1281,7 +1281,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("mock".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let dir = tempfile::tempdir().unwrap();
         let ctx = test_ctx_with_registry(dir.path(), &rules, Arc::new(registry));
@@ -1337,7 +1337,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("ui-parent".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let mut registry = ProxyRegistry::new();
         registry.register(ProtocolEntry::new(
@@ -1435,7 +1435,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("ui-direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }];
         let dir = tempfile::tempdir().unwrap();
         let ctx = UiDownloadContext {

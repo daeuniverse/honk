@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::port::{BindMode, FRAME_SIZE, MAX_SEGMENTS, METADATA_SIZE, Port, PortConfig};
+use crate::port::{BindMode, MAX_SEGMENTS, Port, PortConfig, rx_frame_capacity};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 
 const MAX_UPPER_INTERFACES: usize = 4096;
@@ -91,12 +91,6 @@ impl DeviceInfo {
         if xdp_features & 3 != 3 {
             return Err(unsupported("native XDP basic/redirect support unavailable"));
         }
-        let required = (mtu as usize + 22).div_ceil(FRAME_SIZE - 256 - METADATA_SIZE);
-        if required > 1 && xdp_features & 32 == 0 {
-            return Err(unsupported(
-                "MTU requires advertised native XDP RX scatter/gather",
-            ));
-        }
         Ok(Self {
             name: name.into(),
             ifindex,
@@ -110,18 +104,28 @@ impl DeviceInfo {
         })
     }
 
-    /// Check commitments without allocating UMEM; return the required RX chain length.
-    pub fn validate_port_config(&self, mode: BindMode, config: PortConfig) -> io::Result<usize> {
+    /// Check commitments with exact RX metadata headroom; return the required RX chain length.
+    pub fn validate_port_config(
+        &self,
+        mode: BindMode,
+        config: PortConfig,
+        metadata_len: usize,
+    ) -> io::Result<usize> {
+        let capacity = rx_frame_capacity(metadata_len)?;
         config.validate()?;
-        let required = (self.mtu as usize + 22).div_ceil(FRAME_SIZE - 256 - METADATA_SIZE);
+        let required = (self.mtu as usize + 22).div_ceil(capacity);
         if required > MAX_SEGMENTS
             || config.rx_frames < required
             || config.control_frames < required
             || config.bulk_frames < required
+            || (config.ring_size as usize) < required
         {
             return Err(unsupported(
                 "whole-packet frame commitments cannot cover device MTU",
             ));
+        }
+        if required > 1 && self.xdp_features & 32 == 0 {
+            return Err(unsupported("native XDP RX scatter/gather unavailable"));
         }
         if mode == BindMode::ZeroCopy
             && (self.xdp_features & 8 == 0
@@ -153,10 +157,11 @@ impl DeviceInfo {
         &self,
         mode: BindMode,
         config: PortConfig,
+        metadata_len: usize,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<Vec<Port<L>>> {
         self.validate_current()?;
-        let required = self.validate_port_config(mode, config)?;
+        let required = self.validate_port_config(mode, config, metadata_len)?;
         self.queues
             .iter()
             .map(|&queue| {
@@ -167,6 +172,7 @@ impl DeviceInfo {
                     config,
                     self.mtu,
                     required > 1,
+                    metadata_len,
                     budget,
                 )
             })
@@ -714,6 +720,7 @@ fn xdp_capabilities(ifindex: u32) -> io::Result<(u64, u32, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::port::METADATA_SIZE;
 
     fn driver_fixture(veth: bool) -> [u32; 49] {
         let mut driver = [0; 49];
@@ -879,12 +886,14 @@ mod tests {
             ring_size: 8,
         };
         assert_eq!(
-            device.validate_port_config(BindMode::Copy, config).unwrap(),
+            device
+                .validate_port_config(BindMode::Copy, config, METADATA_SIZE)
+                .unwrap(),
             1
         );
         assert_eq!(
             device
-                .validate_port_config(BindMode::ZeroCopy, config)
+                .validate_port_config(BindMode::ZeroCopy, config, METADATA_SIZE)
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::Unsupported
@@ -892,25 +901,27 @@ mod tests {
         device.xdp_features |= 8;
         assert_eq!(
             device
-                .validate_port_config(BindMode::ZeroCopy, config)
+                .validate_port_config(BindMode::ZeroCopy, config, METADATA_SIZE)
                 .unwrap(),
             1
         );
         device.mtu = 9000;
         assert_eq!(
-            device.validate_port_config(BindMode::Copy, config).unwrap(),
+            device
+                .validate_port_config(BindMode::Copy, config, METADATA_SIZE)
+                .unwrap(),
             3
         );
         device.zerocopy_max_segments = 2;
         assert!(
             device
-                .validate_port_config(BindMode::ZeroCopy, config)
+                .validate_port_config(BindMode::ZeroCopy, config, METADATA_SIZE)
                 .is_err()
         );
         device.zerocopy_max_segments = 3;
         assert_eq!(
             device
-                .validate_port_config(BindMode::ZeroCopy, config)
+                .validate_port_config(BindMode::ZeroCopy, config, METADATA_SIZE)
                 .unwrap(),
             3
         );
@@ -934,15 +945,88 @@ mod tests {
         ] {
             assert!(
                 device
-                    .validate_port_config(BindMode::Copy, insufficient)
+                    .validate_port_config(BindMode::Copy, insufficient, METADATA_SIZE)
                     .is_err()
             );
             assert!(
                 device
-                    .validate_port_config(BindMode::ZeroCopy, insufficient)
+                    .validate_port_config(BindMode::ZeroCopy, insufficient, METADATA_SIZE)
                     .is_err()
             );
         }
+        device.mtu = 3700;
+        for (metadata_len, required) in [(0, 1), (32, 1), (64, 1), (128, 2)] {
+            assert_eq!(
+                device
+                    .validate_port_config(BindMode::Copy, config, metadata_len)
+                    .unwrap(),
+                required,
+            );
+        }
+        device.xdp_features &= !32;
+        assert!(
+            device
+                .validate_port_config(BindMode::Copy, config, 32)
+                .is_ok()
+        );
+        assert!(
+            device
+                .validate_port_config(BindMode::Copy, config, 128)
+                .is_err()
+        );
+        device.xdp_features |= 32;
+        device.zerocopy_max_segments = 1;
+        assert!(
+            device
+                .validate_port_config(BindMode::ZeroCopy, config, 32)
+                .is_ok()
+        );
+        assert!(
+            device
+                .validate_port_config(BindMode::ZeroCopy, config, 128)
+                .is_err()
+        );
+        for metadata_len in [1, 31, 48, 63, 65, 127, 129, usize::MAX] {
+            assert_eq!(
+                device
+                    .validate_port_config(BindMode::Copy, config, metadata_len)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput,
+            );
+        }
+        device.mtu = 65535;
+        let full = PortConfig {
+            rx_frames: MAX_SEGMENTS,
+            control_frames: MAX_SEGMENTS,
+            bulk_frames: MAX_SEGMENTS,
+            ring_size: 64,
+        };
+        assert_eq!(rx_frame_capacity(64).unwrap(), 3776);
+        assert_eq!(
+            device
+                .validate_port_config(BindMode::Copy, full, 64)
+                .unwrap(),
+            MAX_SEGMENTS,
+        );
+        assert_eq!(
+            device
+                .validate_port_config(BindMode::Copy, full, 128)
+                .unwrap(),
+            MAX_SEGMENTS,
+        );
+        assert!(
+            device
+                .validate_port_config(
+                    BindMode::Copy,
+                    PortConfig {
+                        rx_frames: MAX_SEGMENTS - 1,
+                        ..full
+                    },
+                    128
+                )
+                .is_err()
+        );
     }
 
     struct SysfsFixture(std::path::PathBuf);

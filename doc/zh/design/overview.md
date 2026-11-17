@@ -83,7 +83,7 @@ flowchart LR
 
 ## 高层数据路径
 
-下图及报文路径描述默认 TC。显式 [TUN Endpoint](./datapath.md#linux-tun-endpoint) 经 daemon 自有唯一 FD 捕获真实 L3，共用 scoped Stack、canonical Router 与真实 outbound，再把生成回复写回同一 FD。Direct 明确新建 dial 并 relay，不宣称 HostFacts、原 socket、pre-NAT/TTL 等价、Native bypass 或 captured return；S-b/S-c/S-d 缺口保留，S-a 不代表 E6.4 完成。XDP 保持各自 device/Core 合同。
+下图及报文路径描述默认 TC。显式 [TUN Endpoint](./datapath.md#linux-tun-endpoint) 使用 daemon 自有唯一 FD、scoped Stack、canonical Router 与真实 outbound。可选 socket HostFacts 支持进程路由；Direct 新建 dial，不提供原 socket、pre-NAT/TTL 等价、Native bypass 或 captured return。XDP 保持独立 device/Core 合同。
 
 ```mermaid
 flowchart TB
@@ -149,7 +149,7 @@ flowchart TB
 | `jemalloc` | 是 | 引入 `tikv-jemallocator`，并将 jemalloc 安装为 `honk-core` 二进制的 allocator；该 crate 从 C 源码构建 jemalloc。在 Linux 上，程序会在启动 Tokio 前为当前进程禁用透明大页。运行期选项使用 `_RJEM_MALLOC_CONF` 而非 `MALLOC_CONF`：crate 以 `_rjem_` 前缀构建 jemalloc，环境变量名同样被加上该前缀。 |
 | `rprx` | 是 | 启用 `honk-outbound/rprx`，注册 VLESS 与 VMess Handler，包括受支持的 VLESS Encryption 和 `xtls-rprx-vision` 路径。 |
 
-`mock-ebpf` 不是 Cargo feature。默认 TC 在不带 `ebpf` 的构建中使用 `MockEbpfBackend`，`--mock-ebpf` 显式选择无特权开发；该路径请求 NFQUEUE 时告警并仅在进程内禁用，不改文件。显式 XDP/TUN 使用共享 userspace policy backend 与真实 Linux device owner，不依赖 `ebpf` feature。TUN 要求 `/dev/net/tun`、设备/路由与 socket mark 权限，拒绝 `--mock-ebpf`，必须显式设 `nfqueue_enable: false`，绝不回退 TC/NFQUEUE。
+`mock-ebpf` 不是 Cargo feature。默认 TC 无 `ebpf` 时使用 `MockEbpfBackend`，`--mock-ebpf` 选择无特权开发并在进程内禁用所请求的 NFQUEUE。XDP/TUN 使用共享 userspace policy backend；TUN `host_facts: true` 要求 `ebpf`，false 不要求。TUN 要求 `/dev/net/tun`、设备/路由及 socket mark 权限，拒绝 mock，必须设 `nfqueue_enable: false`，不回退 TC/NFQUEUE。
 
 嵌入 eBPF 时，`build.rs` 使用内核 crate 固定的编译器及独立 release 策略重建，不继承 host 的 `RUSTFLAGS`、`CARGO_ENCODED_RUSTFLAGS` 或 `CARGO_PROFILE_*` 性能分析覆盖。编译器 sidecar 还必须不早于嵌入构建脚本，因此修改嵌入策略会使既有对象失效。显式 `--bpf-object` 资产及手动内核构建仍由调用方负责。
 

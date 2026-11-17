@@ -191,7 +191,7 @@ async fn raw_udp53_dscp_change_cannot_reuse_the_previous_outbound() {
             outbound: RoutingOutbound::Simple("beta".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
         let (plane, _health) = plane(config).await;
         let budget = MemoryBudget::new(32 << 20);
@@ -252,7 +252,7 @@ async fn nonfinal_raw_udp53_keeps_sniffing_but_cannot_alias_a_must_route() {
             outbound: RoutingOutbound::Simple("alpha".into()),
             priority: 0,
             must: true,
-            mark: 0,
+            mark: None,
         });
         config.routing.rules.push(RoutingRule {
             name: "sniff-beta".into(),
@@ -263,7 +263,7 @@ async fn nonfinal_raw_udp53_keeps_sniffing_but_cannot_alias_a_must_route() {
             outbound: RoutingOutbound::Simple("beta".into()),
             priority: 1,
             must: false,
-            mark: 0,
+            mark: None,
         });
         let (plane, _health) = plane(config).await;
         let budget = MemoryBudget::new(32 << 20);
@@ -338,7 +338,7 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             });
             if disposition == "must" {
                 config.routing.rules.push(RoutingRule {
@@ -350,7 +350,7 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
                     outbound: RoutingOutbound::Simple("dns-raw".into()),
                     priority: 0,
                     must: true,
-                    mark: 0,
+                    mark: None,
                 });
             }
             let (plane, _health) = plane(config).await;
@@ -388,13 +388,23 @@ async fn packet_udp_dns_policy_and_controller_preserve_wire_reply_ownership() {
             let source = "192.0.2.10:41000".parse().unwrap();
             let destination = "198.51.100.53:53".parse().unwrap();
             let query = dns_query_payload();
-            endpoints
-                .receive(
+            let received = endpoints
+                .receive_with_source(
                     scope.scope(),
                     &packet(source, destination, 0, &query),
                     Instant::now(),
+                    false,
+                    |_, _| true,
                 )
                 .unwrap();
+            assert!(
+                received.taken_over,
+                "actual DNS ingress queue owns {disposition} work"
+            );
+            assert!(
+                !received.qualified_rx,
+                "DNS policy is unresolved at queue takeover"
+            );
             if disposition == "controller" {
                 let mut response = [0; 1024];
                 let (length, sender) = dns.recv_from(&mut response).await.unwrap();
@@ -512,7 +522,7 @@ async fn packet_dns_learned_domain_blocks_new_numeric_udp_only_in_its_scope() {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: true,
-                mark: 0,
+                mark: None,
             },
             RoutingRule {
                 name: "learned-block".into(),
@@ -524,7 +534,7 @@ async fn packet_dns_learned_domain_blocks_new_numeric_udp_only_in_its_scope() {
                 outbound: RoutingOutbound::Simple("block".into()),
                 priority: 1,
                 must: false,
-                mark: 0,
+                mark: None,
             },
         ];
         let (plane, _health) = plane(config).await;
@@ -718,7 +728,9 @@ fn owned_reassembly_bytes_outlive_initializer_pool_and_stack_without_copy() {
     let pool = Arc::new(
         UdpEndpointPool::with_packet_reply_factory(
             1,
-            Arc::new(Replies(Arc::from([scope.clone()]))),
+            Arc::new(Replies(Arc::from([
+                PacketRealm::singleton(scope.clone()).unwrap()
+            ]))),
             Arc::clone(&budget),
         )
         .unwrap(),
@@ -739,6 +751,7 @@ fn owned_reassembly_bytes_outlive_initializer_pool_and_stack_without_copy() {
             .unwrap(),
         super::super::super::udp_endpoint::queue_now(),
         &stats,
+        None,
     ) else {
         panic!("owned packet admission refused")
     };
@@ -858,6 +871,7 @@ async fn admitted_udp_keeps_route_and_mode_after_publication() {
                 destination,
                 "udp",
                 0,
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -1007,6 +1021,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 destination,
                 "udp",
                 0,
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )
@@ -1030,6 +1045,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 destination,
                 "udp",
                 0,
+                None,
                 #[cfg(feature = "native-api")]
                 false,
             )

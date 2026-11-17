@@ -73,7 +73,7 @@ fn test_router_domain_suffix_routing() {
             outbound: routing::RoutingOutbound::Simple("us-proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         },
         routing::RoutingRule {
             name: "china-direct".into(),
@@ -84,7 +84,7 @@ fn test_router_domain_suffix_routing() {
             outbound: routing::RoutingOutbound::Simple("direct".into()),
             priority: 10,
             must: false,
-            mark: 0,
+            mark: None,
         },
     ];
 
@@ -148,7 +148,7 @@ fn test_router_ip_cidr_routing() {
         outbound: routing::RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -463,7 +463,7 @@ async fn test_merge_subscription_nodes_full_pipeline() {
         outbound: routing::RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let rules = config.routing.rules.clone();
 
@@ -578,7 +578,7 @@ fn test_routing_edge_cases() {
         outbound: routing::RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::new(&rules, "direct").unwrap();
     assert_eq!(router.route(&conn), "direct"); // Should not match empty rule

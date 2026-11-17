@@ -19,10 +19,26 @@ use honk_datapath::ScopeId;
 use honk_datapath::buffer::{FrameConfig, FrameLease, FrameLedger, TxClass};
 use honk_netstack::{
     AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready, Rx,
-    RxMeta, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
+    RxMeta, SourceContext, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
 };
 use parking_lot::Mutex;
 use tokio::sync::Notify;
+
+#[cfg(target_os = "linux")]
+mod fragment_peer;
+mod realm;
+mod realm_receive;
+#[cfg(target_os = "linux")]
+pub(in crate::control) use fragment_peer::FragmentPeer;
+#[cfg(target_os = "linux")]
+pub(crate) use realm::capture_realm;
+use realm::{HalfOpenHold, RealmResources};
+pub(crate) use realm::{PacketRealm, PacketRealmPlan};
+
+mod source;
+pub use source::HostIngress;
+pub(in crate::control) use source::SourceWork;
+use source::Sources;
 
 mod stream;
 pub use stream::{FlowIo, FlowRetirement};
@@ -35,7 +51,7 @@ const BATCH: usize = 64;
 const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[cfg(target_os = "linux")]
-pub(crate) const CAPTURE_MEMORY: usize = 256 << 20;
+pub(crate) const CAPTURE_MEMORY: usize = 384 << 20;
 
 #[cfg(target_os = "linux")]
 pub(crate) fn capture_scope(
@@ -63,28 +79,20 @@ pub(crate) fn capture_scope_with_output(
     caps: TxCaps,
     budget: &Arc<MemoryBudget>,
 ) -> anyhow::Result<(PacketScope, PacketOwner)> {
-    // ponytail: fixed per-realm partitions; rebalance only if measured tenant skew needs it.
-    let slots = (4096 / realms).min(1024);
-    let mut stack = Config::new(rand::random());
-    stack.mode = Mode::Transparent {
-        exclude: Default::default(),
-    };
-    stack.mtu = u16::try_from(mtu)?;
-    stack.max_flows = slots as u32;
-    stack.memory_limit = CAPTURE_MEMORY / 2 / realms;
-    Ok(PacketScope::new_with_output(
-        stack,
-        Arc::clone(budget),
-        RuntimeLimits {
-            max_slots: slots,
-            control_frames: 32,
-            bulk_frames,
-            max_waiters: 256,
-        },
-        Instant::now(),
-        caps,
+    let (mut scopes, mut owners) = realm::capture_partition(
+        mtu,
+        realms,
+        bulk_frames,
+        1,
         output_capacity,
-    )?)
+        caps,
+        budget,
+        false,
+    )?;
+    Ok((
+        scopes.pop().expect("singleton realm scope"),
+        owners.pop().expect("singleton realm owner"),
+    ))
 }
 
 /// Fixed metadata and frame ceilings for one scope, all funded by the supplied shared budget.
@@ -120,6 +128,8 @@ impl fmt::Debug for PacketScope {
 
 struct Shared {
     scope: ScopeId,
+    worker: usize,
+    workers: usize,
     budget: Arc<MemoryBudget>,
     inner: Mutex<Inner>,
     owner_wake: Notify,
@@ -148,6 +158,7 @@ struct FlowSlot {
     accepted: bool,
     rx_admitted: bool,
     routing: Option<super::packet_endpoint::EndpointAdmission>,
+    source: Option<SourceContext>,
 }
 
 struct RetirementCallback {
@@ -181,7 +192,9 @@ struct Inner {
     ledger: FrameLedger<Option<FlowId>>,
     frames: Box<[Option<Box<[u8]>>]>,
     output_peers: Box<[Option<IpAddr>]>,
-    source_work: Box<[Option<(IpAddr, usize)>]>,
+    #[cfg(target_os = "linux")]
+    output_peer_holds: Box<[Option<crate::xdp::worker::PeerHold>]>,
+    source_work: Sources,
     queue: Box<[Option<Queued>]>,
     head: usize,
     queued: usize,
@@ -189,6 +202,13 @@ struct Inner {
     cpu_tx_caps: TxCaps,
     next_tx: TxClass,
     slots: Box<[Option<FlowSlot>]>,
+    half_open: Box<[Option<(FlowId, HalfOpenHold)>]>,
+    resources: Option<Arc<RealmResources>>,
+    capture_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
+    #[cfg(target_os = "linux")]
+    peers: Box<[Option<crate::xdp::worker::PeerHold>]>,
+    #[cfg(target_os = "linux")]
+    fragment_peers: Box<[Option<FragmentPeer>]>,
     pending_closes: usize,
     closed_apps: usize,
     pending_routing: usize,
@@ -197,6 +217,7 @@ struct Inner {
     closing: bool,
     aborted: bool,
     finished: bool,
+    endpoint_prepared: bool,
     // Frame bytes are freed before this reservation, including bytes returned by OutputLease.
     _storage: MemoryReservation,
 }
@@ -231,12 +252,32 @@ impl PacketScope {
     }
 
     pub(crate) fn new_with_output(
+        cfg: Config,
+        budget: Arc<MemoryBudget>,
+        limits: RuntimeLimits,
+        now: Instant,
+        caps: TxCaps,
+        frame_size: usize,
+    ) -> io::Result<(Self, PacketOwner)> {
+        let scope = ScopeId::allocate().ok_or_else(|| invalid("scope identities exhausted"))?;
+        Self::new_partition(
+            cfg, budget, limits, now, caps, frame_size, scope, 0, 1, None, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_partition(
         mut cfg: Config,
         budget: Arc<MemoryBudget>,
         limits: RuntimeLimits,
         now: Instant,
         caps: TxCaps,
         frame_size: usize,
+        scope: ScopeId,
+        worker: usize,
+        workers: usize,
+        resources: Option<Arc<RealmResources>>,
+        capture: bool,
     ) -> io::Result<(Self, PacketOwner)> {
         if !matches!(cfg.mode, Mode::Transparent { .. }) {
             return Err(invalid(
@@ -258,6 +299,17 @@ impl PacketScope {
             .max_slots
             .checked_add(tx_frames)
             .ok_or_else(|| invalid("flow retention capacity overflow"))?;
+        let peer_capacity = if capture {
+            aliases
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(frame_count))
+                .and_then(|n| n.checked_add(128 / workers + usize::from(worker < 128 % workers)))
+                .and_then(|n| n.checked_add(if worker == 0 { 64 } else { 0 }))
+                .ok_or_else(|| invalid("peer retention capacity overflow"))?
+                .min(4096)
+        } else {
+            0
+        };
         let frame_config = FrameConfig {
             base_address: 0,
             frame_size,
@@ -280,9 +332,23 @@ impl PacketScope {
         let metadata_bytes = size_of::<Shared>()
             .checked_add(2 * size_of::<usize>())
             .and_then(|n| n.checked_add(aliases.checked_mul(size_of::<Option<FlowSlot>>())?))
+            .and_then(|n| {
+                n.checked_add(
+                    resources
+                        .as_ref()
+                        .map_or(0, |_| limits.max_slots)
+                        .checked_mul(size_of::<Option<(FlowId, HalfOpenHold)>>())?,
+                )
+            })
+            .and_then(|n| {
+                n.checked_add(Self::peer_bytes(
+                    peer_capacity + if capture { frame_count } else { 0 },
+                )?)
+            })
+            .and_then(|n| n.checked_add(Self::fragment_peer_bytes(capture && worker == 0)))
             .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<Box<[u8]>>>())?))
             .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<IpAddr>>())?))
-            .and_then(|n| n.checked_add(aliases.checked_mul(size_of::<Option<(IpAddr, usize)>>())?))
+            .and_then(|n| n.checked_add(Sources::bytes(aliases)?))
             .and_then(|n| n.checked_add(tx_frames.checked_mul(size_of::<Option<Queued>>())?))
             .and_then(|n| {
                 n.checked_add(limits.max_waiters.checked_mul(size_of::<Option<Waker>>())?)
@@ -293,14 +359,25 @@ impl PacketScope {
         let storage = budget.reserve(storage_bytes).ok_or_else(capacity)?;
         let ledger = FrameLedger::new(frame_config, &budget).map_err(io::Error::other)?;
         cfg.shared_budget = Some(Arc::clone(&budget));
-        let stack = Stack::new_accounted(cfg, now, limits.max_slots).map_err(io::Error::other)?;
-        let scope =
-            ScopeId::allocate().ok_or_else(|| io::Error::other("scope identities exhausted"))?;
+        let stack = match &resources {
+            Some(shared) => Stack::new_accounted_shard(
+                cfg,
+                now,
+                limits.max_slots,
+                worker,
+                workers,
+                Arc::clone(&shared.udp_pending),
+            ),
+            None => Stack::new_accounted(cfg, now, limits.max_slots),
+        }
+        .map_err(io::Error::other)?;
         let frames = (0..frame_count)
             .map(|_| Some(vec![0; frame_size].into_boxed_slice()))
             .collect();
         let shared = Arc::new(Shared {
             scope,
+            worker,
+            workers,
             budget,
             inner: Mutex::new(Inner {
                 rights: Rights::Task,
@@ -308,7 +385,11 @@ impl PacketScope {
                 ledger,
                 frames,
                 output_peers: (0..frame_count).map(|_| None).collect(),
-                source_work: (0..aliases).map(|_| None).collect(),
+                #[cfg(target_os = "linux")]
+                output_peer_holds: (0..if capture { frame_count } else { 0 })
+                    .map(|_| None)
+                    .collect(),
+                source_work: Sources::new(aliases),
                 queue: (0..tx_frames).map(|_| None).collect(),
                 head: 0,
                 queued: 0,
@@ -316,6 +397,17 @@ impl PacketScope {
                 cpu_tx_caps: caps,
                 next_tx: TxClass::Control,
                 slots: (0..aliases).map(|_| None).collect(),
+                half_open: (0..resources.as_ref().map_or(0, |_| limits.max_slots))
+                    .map(|_| None)
+                    .collect(),
+                #[cfg(target_os = "linux")]
+                peers: (0..peer_capacity).map(|_| None).collect(),
+                #[cfg(target_os = "linux")]
+                fragment_peers: (0..if capture && worker == 0 { 80 } else { 0 })
+                    .map(|_| None)
+                    .collect(),
+                resources,
+                capture_admission: None,
                 pending_closes: 0,
                 closed_apps: 0,
                 pending_routing: 0,
@@ -324,6 +416,7 @@ impl PacketScope {
                 closing: false,
                 aborted: false,
                 finished: false,
+                endpoint_prepared: false,
                 _storage: storage,
             }),
             owner_wake: Notify::new(),
@@ -346,6 +439,7 @@ impl PacketScope {
                 return Err(invalid("packet scope is already in use"));
             }
             stack.set_accepting(false);
+            inner.endpoint_prepared = true;
             Ok(inner.slots.len())
         })
     }
@@ -385,6 +479,42 @@ impl PacketScope {
         self.0.scope
     }
 
+    pub(crate) fn worker(&self) -> usize {
+        self.0.worker
+    }
+
+    pub(crate) fn same_owner(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    fn peer_bytes(aliases: usize) -> Option<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            aliases.checked_mul(size_of::<Option<crate::xdp::worker::PeerHold>>())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = aliases;
+            Some(0)
+        }
+    }
+
+    fn fragment_peer_bytes(physical_owner_zero: bool) -> usize {
+        #[cfg(target_os = "linux")]
+        {
+            if physical_owner_zero {
+                80 * size_of::<Option<FragmentPeer>>()
+            } else {
+                0
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = physical_owner_zero;
+            0
+        }
+    }
+
     pub fn budget(&self) -> Arc<MemoryBudget> {
         Arc::clone(&self.0.budget)
     }
@@ -392,9 +522,19 @@ impl PacketScope {
     /// Borrowed `Rx` ranges index `packet`: consume/copy them before recycling input storage.
     /// Closing admission does not stop delivery to existing TCP/TIME_WAIT incarnations.
     pub fn receive(&self, packet: &[u8], now: Instant) -> Rx {
-        self.0.with(|inner| match &mut inner.stack {
-            Some(stack) => stack.receive(now, packet),
-            None => Rx::Dropped(DropReason::Stale),
+        self.0.with(|inner| {
+            if inner.source_work.is_host() {
+                return Rx::Dropped(DropReason::NotForUs);
+            }
+            if inner.resources.is_some() {
+                return inner
+                    .receive_checked(packet, RxMeta::VERIFY, now, now, |_| true)
+                    .0;
+            }
+            match &mut inner.stack {
+                Some(stack) => stack.receive(now, packet),
+                None => Rx::Dropped(DropReason::Stale),
+            }
         })
     }
 
@@ -422,13 +562,12 @@ impl PacketScope {
         mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
     ) -> (Rx, super::packet_endpoint::PacketReceive) {
         self.0.with(|inner| {
+            if inner.source_work.is_host() {
+                return (Rx::Dropped(DropReason::NotForUs), Default::default());
+            }
             let pending = check_output && inner.pending_source_output(packet);
-            let Some(stack) = &mut inner.stack else {
-                return (Rx::Dropped(DropReason::Stale), Default::default());
-            };
-            let (rx, report) = stack.receive_with_meta_tcp_admission(now, packet, meta, |source| {
-                on_source(source, pending)
-            });
+            let (rx, report) =
+                inner.receive_checked(packet, meta, now, now, |source| on_source(source, pending));
             (rx, inner.receive_result(report))
         })
     }
@@ -438,16 +577,7 @@ impl PacketScope {
         source: SocketAddr,
         destination: SocketAddr,
     ) -> bool {
-        let inner = self.0.inner.lock();
-        inner
-            .stack
-            .as_ref()
-            .is_some_and(|stack| stack.retains_tcp(source, destination))
-            || inner
-                .slots
-                .iter()
-                .flatten()
-                .any(|slot| slot.client == source && slot.destination == destination)
+        self.retains_tcp_with_lineage(source, destination, None)
     }
 
     pub(crate) fn retains_source(&self, address: IpAddr) -> bool {
@@ -462,47 +592,48 @@ impl PacketScope {
                 .flatten()
                 .any(|slot| slot.client.ip() == address)
             || inner.output_peers.contains(&Some(address))
-            || inner
-                .source_work
-                .iter()
-                .flatten()
-                .any(|(peer, _)| *peer == address)
+            || inner.source_work.retains_address(address)
     }
 
-    pub(in crate::control) fn hold_source(&self, address: IpAddr) -> io::Result<SourceWork> {
-        let mut inner = self.0.inner.lock();
-        if inner.closing || inner.finished {
-            return Err(closed());
-        }
-        let index = inner
-            .source_work
-            .iter()
-            .position(|entry| entry.is_some_and(|(peer, _)| peer == address))
-            .or_else(|| inner.source_work.iter().position(Option::is_none))
-            .ok_or_else(capacity)?;
-        let entry = inner.source_work[index].get_or_insert((address, 0));
-        entry.1 = entry.1.checked_add(1).ok_or_else(capacity)?;
-        Ok(SourceWork {
-            scope: self.clone(),
-            index,
-        })
-    }
-
+    #[cfg(test)]
     pub(in crate::control) fn receive_admitted_with_source(
         &self,
         packet: &[u8],
         now: Instant,
         admission: &mut Option<super::packet_endpoint::EndpointAdmission>,
         check_output: bool,
+        on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
+    ) -> (Rx, super::packet_endpoint::PacketReceive) {
+        let result = self.receive_admitted_deferred_with_source(
+            packet,
+            now,
+            now,
+            admission,
+            check_output,
+            on_source,
+        );
+        self.after_receive();
+        result
+    }
+
+    pub(in crate::control) fn receive_admitted_deferred_with_source(
+        &self,
+        packet: &[u8],
+        now: Instant,
+        service_at: Instant,
+        admission: &mut Option<super::packet_endpoint::EndpointAdmission>,
+        check_output: bool,
         mut on_source: impl FnMut(honk_netstack::ValidatedSource, bool) -> bool,
     ) -> (Rx, super::packet_endpoint::PacketReceive) {
-        self.0.with(|inner| {
+        self.0.with_silent(|inner| {
+            if inner.source_work.is_host() {
+                return (Rx::Dropped(DropReason::NotForUs), Default::default());
+            }
             let pending = check_output && inner.pending_source_output(packet);
-            let Some(stack) = &mut inner.stack else {
-                return (Rx::Dropped(DropReason::Stale), Default::default());
-            };
             let (rx, report) =
-                stack.receive_with_tcp_admission(now, packet, |source| on_source(source, pending));
+                inner.receive_checked(packet, RxMeta::VERIFY, now, service_at, |source| {
+                    on_source(source, pending)
+                });
             if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
                 if let Some(vacant) = inner.slots.iter().position(Option::is_none) {
                     let source = report
@@ -522,11 +653,19 @@ impl PacketScope {
                         accepted: false,
                         rx_admitted: false,
                         routing: admission.take(),
+                        source: None,
                     });
                     inner.pending_routing += 1;
                 } else {
-                    stack.tcp_refuse(id, honk_netstack::Refuse::Drop);
+                    inner
+                        .stack
+                        .as_mut()
+                        .expect("live scope stack")
+                        .tcp_refuse(id, honk_netstack::Refuse::Drop);
                 }
+            }
+            if inner.resources.is_some() {
+                inner.advance(service_at);
             }
             (rx, inner.receive_result(report))
         })
@@ -585,11 +724,23 @@ impl PacketScope {
                     accepted: true,
                     rx_admitted: false,
                     routing: None,
+                    source: None,
                 });
                 None
             };
             let mut flow = FlowIo::new(self.clone(), syn);
             flow.set_routing(routing);
+            if let Some(context) = inner
+                .slots
+                .iter()
+                .flatten()
+                .find(|slot| slot.id == syn.id)
+                .and_then(|slot| slot.source)
+            {
+                let work = SourceWork::retained(self, &mut inner.source_work, context)
+                    .expect("admitted TCP source owner");
+                flow.set_packet_source(work);
+            }
             Some((syn, flow))
         })
     }
@@ -598,6 +749,8 @@ impl PacketScope {
         DatagramSender {
             scope: self.clone(),
             source,
+            packet_source: None,
+            realm: None,
         }
     }
 
@@ -692,6 +845,10 @@ impl PacketScope {
 }
 
 impl Shared {
+    fn with_silent<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        f(&mut self.inner.lock())
+    }
+
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         let (result, closed_apps, device) = {
             let mut inner = self.inner.lock();
@@ -788,9 +945,16 @@ impl Inner {
             && !self.finished
             && matches!(report.outcome, honk_netstack::ReceiveOutcome::TcpAccepted(id)
                 if self.slots.iter().flatten().any(|slot| slot.id == id && slot.rx_admitted));
+        let taken_over = !self.closing
+            && !self.finished
+            && matches!(report.outcome,
+                honk_netstack::ReceiveOutcome::TcpNew(id) | honk_netstack::ReceiveOutcome::TcpAccepted(id)
+                    if self.slots.iter().flatten().any(|slot| slot.id == id));
         super::packet_endpoint::PacketReceive {
             source: report.source,
+            source_context: report.source_context,
             qualified_rx,
+            taken_over,
         }
     }
 
@@ -896,12 +1060,43 @@ impl Inner {
         tx: Transmit,
         class: TxClass,
         destination: IpAddr,
+        fragment: Option<honk_netstack::FragmentInfo>,
     ) -> io::Result<Queued> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = fragment;
+        if let Some(context) = tx.source {
+            assert!(
+                self.source_work.facts(context).is_some(),
+                "emitted original Host source"
+            );
+        }
         let index = self.index(lease);
         self.ledger
             .submit_tx(lease, tx.len, tx.flow)
             .map_err(io::Error::other)?;
         self.output_peers[index] = Some(destination);
+        #[cfg(target_os = "linux")]
+        if let Some(output) = self.output_peer_holds.get_mut(index) {
+            *output = match fragment {
+                Some(info) => self
+                    .fragment_peers
+                    .iter()
+                    .flatten()
+                    .find(|peer| {
+                        info.incarnation.is_some() && peer.info.incarnation == info.incarnation
+                    })
+                    .and_then(|peer| peer.peer.clone()),
+                None => self
+                    .peers
+                    .iter()
+                    .flatten()
+                    .find(|peer| peer.address() == destination)
+                    .cloned(),
+            };
+        }
+        if let Some(context) = tx.source {
+            self.source_work.retain_output(context);
+        }
         if let Some(id) = tx.flow
             && let Some(slot) = self.slot(id)
         {
@@ -910,7 +1105,13 @@ impl Inner {
         Ok(Queued { lease, tx, class })
     }
 
-    fn publish(&mut self, lease: FrameLease, tx: Transmit, class: TxClass) {
+    fn publish(
+        &mut self,
+        lease: FrameLease,
+        tx: Transmit,
+        class: TxClass,
+        fragment: Option<honk_netstack::FragmentInfo>,
+    ) {
         let index = self.index(lease);
         let destination = honk_netstack::wire::packet_addresses(
             &self.frames[index]
@@ -920,7 +1121,7 @@ impl Inner {
         .expect("stack output has IP addresses")
         .1;
         let queued = self
-            .install(lease, tx, class, destination)
+            .install(lease, tx, class, destination, fragment)
             .expect("reserved complete output frame");
         self.push(queued);
     }
@@ -928,11 +1129,18 @@ impl Inner {
     fn release(&mut self, queued: Queued) {
         let index = self.index(queued.lease);
         self.output_peers[index] = None;
+        #[cfg(target_os = "linux")]
+        if let Some(peer) = self.output_peer_holds.get_mut(index) {
+            peer.take();
+        }
         let owner = self
             .ledger
             .release_tx(queued.lease)
             .expect("unique local output lease release");
         assert_eq!(owner, queued.tx.flow);
+        if let Some(context) = queued.tx.source {
+            self.source_work.release_output(context);
+        }
         if let Some(id) = owner
             && let Some(slot) = self.slot(id)
         {
@@ -964,12 +1172,10 @@ impl Inner {
         let out = self.frames[index]
             .as_mut()
             .expect("free frame owns storage");
-        let tx = match class {
-            TxClass::Control => stack.poll_control_transmit(now, out),
-            TxClass::Bulk => stack.poll_transmit_with(now, out, self.cpu_tx_caps),
-        };
-        if let Some(tx) = tx {
-            self.publish(lease, tx, class);
+        let tx =
+            Self::transmit_accounted(stack, &self.resources, now, class, out, self.cpu_tx_caps);
+        if let Some((tx, fragment)) = tx {
+            self.publish(lease, tx, class, fragment);
             true
         } else {
             self.ledger
@@ -992,6 +1198,7 @@ impl Inner {
                 self.pending_closes = 0;
             }
         }
+        self.drain_half_open();
     }
 
     fn fill(&mut self, now: Instant) -> bool {
@@ -1025,6 +1232,7 @@ impl Inner {
     }
 
     fn events(&mut self) {
+        self.drain_half_open();
         if self.pending_routing != 0 {
             for slot in self.slots.iter_mut().flatten() {
                 if !slot.accepted
@@ -1059,6 +1267,8 @@ impl Inner {
                 }
             }
         }
+        #[cfg(target_os = "linux")]
+        self.reap_peers();
     }
 
     fn wake_waiters(&mut self) {
@@ -1071,6 +1281,9 @@ impl Inner {
         self.aborted = true;
         // Dropping the stack is explicit protocol disposal, never a fabricated device return.
         self.stack = None;
+        for grant in &mut self.half_open {
+            grant.take();
+        }
         while let Some(queued) = self.pop(None) {
             self.release(queued);
         }
@@ -1090,15 +1303,25 @@ impl Inner {
 
     fn finish(&mut self) -> bool {
         let protocol_empty = self.stack.as_ref().is_none_or(Stack::is_quiescent);
+        if self.closing && protocol_empty && self.slots.iter().all(Option::is_none) {
+            self.source_work
+                .reclaim(self.stack.as_ref(), &self.slots)
+                .expect("retained source identities remain valid through close");
+        }
         if self.closing
             && protocol_empty
             && self.slots.iter().all(Option::is_none)
             && self.queued == 0
-            && self.source_work.iter().all(Option::is_none)
+            && self.source_work.is_empty()
             && self.ledger.outstanding_tx().next().is_none()
         {
             self.finished = true;
             self.stack = None;
+            for grant in &mut self.half_open {
+                grant.take();
+            }
+            #[cfg(target_os = "linux")]
+            self.reap_peers();
             self.ledger.close();
             if let Some(waker) = self.output_waker.take() {
                 waker.wake();
@@ -1119,6 +1342,10 @@ impl PacketOwner {
     pub fn scope(&self) -> ScopeId {
         self.scope.scope()
     }
+    }
+    pub(crate) async fn shutdown(self) {
+        self.scope.shutdown(true);
+        self.run().await;
 
     /// The validated endpoint start's one-time Task → Driven transfer. This original owner
     /// keeps the joined finish obligation: park it in `reclaim`, then run it.
@@ -1221,6 +1448,10 @@ pub(crate) struct PacketDriver {
 impl PacketDriver {
     pub(crate) fn scope(&self) -> ScopeId {
         self.scope.scope()
+    }
+
+    pub(crate) fn worker(&self) -> usize {
+        self.scope.worker()
     }
 
     /// The protocol or conditional refund-readiness deadline found by the last service.
@@ -1344,20 +1575,29 @@ impl PacketDriver {
             inner: &mut inner,
             lease: Some(lease),
         };
-        let stack = reservation.inner.stack.as_mut().expect("live driven stack");
         let packet = &mut l3[..frame_size];
-        let tx = match class {
-            TxClass::Control => stack.poll_control_transmit(now, packet),
-            TxClass::Bulk => stack.poll_transmit_with(now, packet, TxCaps::NONE),
+        let resources = reservation.inner.resources.clone();
+        let tx = Inner::transmit_accounted(
+            reservation.inner.stack.as_mut().expect("live driven stack"),
+            &resources,
+            now,
+            class,
+            packet,
+            TxCaps::NONE,
+        );
+        reservation.inner.drain_half_open();
+        let Some((tx, fragment)) = tx else {
+            return Ok(None);
         };
-        let Some(tx) = tx else { return Ok(None) };
         if tx.len == 0 || tx.len > frame_size {
             return Err(io::Error::other("invalid direct output extent"));
         }
         let destination = honk_netstack::wire::packet_addresses(&packet[..tx.len])
             .map_err(io::Error::other)?
             .1;
-        let queued = reservation.inner.install(lease, tx, class, destination)?;
+        let queued = reservation
+            .inner
+            .install(lease, tx, class, destination, fragment)?;
         reservation.lease = None;
         drop(reservation);
         drop(inner);
@@ -1416,6 +1656,14 @@ impl OutputLease {
     pub(crate) fn transmit(&self) -> Transmit {
         self.0.queued.expect("live output lease").tx
     }
+    #[cfg(any(feature = "ebpf", test))]
+    pub(crate) fn host_return(&self) -> Option<honk_ebpf_common::host::HostSourceFacts> {
+        self.0.host_return()
+    }
+    #[cfg(target_os = "linux")]
+    pub(crate) fn peer_hold(&self) -> Option<crate::xdp::worker::PeerHold> {
+        self.0.peer_hold()
+    }
     pub fn flow_id(&self) -> Option<FlowId> {
         self.0.flow_id()
     }
@@ -1449,6 +1697,31 @@ impl OutputLease {
 impl OutputOwner {
     pub(crate) fn len(&self) -> usize {
         self.queued.expect("live output").tx.len
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn peer_hold(&self) -> Option<crate::xdp::worker::PeerHold> {
+        let queued = self.queued?;
+        let inner = self.scope.0.inner.lock();
+        inner
+            .output_peer_holds
+            .get(inner.index(queued.lease))
+            .and_then(Clone::clone)
+    }
+
+    #[cfg(any(feature = "ebpf", test))]
+    pub(crate) fn host_return(&self) -> Option<honk_ebpf_common::host::HostSourceFacts> {
+        let context = self.queued.as_ref()?.tx.source?;
+        Some(
+            *self
+                .scope
+                .0
+                .inner
+                .lock()
+                .source_work
+                .facts(context)
+                .expect("output retains original Host source"),
+        )
     }
 
     fn flow_id(&self) -> Option<FlowId> {
@@ -1520,30 +1793,12 @@ impl Drop for OutputOwner {
     }
 }
 
-pub(in crate::control) struct SourceWork {
-    scope: PacketScope,
-    index: usize,
-}
-
-impl Drop for SourceWork {
-    fn drop(&mut self) {
-        self.scope.0.with(|inner| {
-            let count = &mut inner.source_work[self.index]
-                .as_mut()
-                .expect("retained source work")
-                .1;
-            *count -= 1;
-            if *count == 0 {
-                inner.source_work[self.index] = None;
-            }
-        });
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct DatagramSender {
     scope: PacketScope,
     source: SocketAddr,
+    packet_source: Option<SourceWork>,
+    realm: Option<PacketRealm>,
 }
 
 impl DatagramSender {
@@ -1551,15 +1806,39 @@ impl DatagramSender {
         self.scope.scope()
     }
 
+    pub(in crate::control) fn source_context(&self) -> Option<SourceContext> {
+        self.packet_source
+            .as_ref()
+            .and_then(SourceWork::optional_context)
+    }
+
     /// Acceptance happens once, only after reserving the first frame and descriptor.
     /// Later fragments stay in the accounted stack queue and are never re-sent here.
     /// Fragment-queue/shared-budget exhaustion is a terminal capacity refusal, not acceptance.
     pub async fn send_to(&self, payload: &[u8], client: SocketAddr) -> io::Result<usize> {
-        let mut waiter = Waiter::new(self.scope.clone());
+        if self
+            .packet_source
+            .as_ref()
+            .and_then(SourceWork::plain_address)
+            .is_some_and(|address| address.to_canonical() != client.ip().to_canonical())
+        {
+            return Err(invalid("exact UDP source belongs to another client"));
+        }
+        let scope = self.realm.as_ref().map_or(&self.scope, |realm| {
+            &realm.owners()[realm.worker_for_udp(client.ip())]
+        });
+        let mut waiter = Waiter::new(scope.clone());
         poll_fn(|cx| {
-            self.scope.0.with(|inner| {
+            scope.0.with(|inner| {
                 if inner.closing {
                     return Poll::Ready(Err(closed()));
+                }
+                if self.packet_source.is_none() && inner.source_work.is_host() {
+                    return Poll::Ready(Err(invalid("Host output requires original source")));
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(peer) = self.packet_source.as_ref().and_then(SourceWork::peer) {
+                    inner.remember_peer(peer);
                 }
                 let lease = match inner.ledger.reserve_tx(TxClass::Bulk) {
                     Ok(lease) => lease,
@@ -1572,30 +1851,30 @@ impl DatagramSender {
                     Err(error) => return Poll::Ready(Err(io::Error::other(error))),
                 };
                 let index = inner.index(lease);
-                let result = inner
-                    .stack
+                let stack = inner.stack.as_mut().expect("open scope stack");
+                let out = inner.frames[index]
                     .as_mut()
-                    .expect("open scope stack")
-                    .udp_send_from(
-                        self.source,
-                        client,
-                        payload,
-                        inner.frames[index]
-                            .as_mut()
-                            .expect("reserved frame storage"),
-                    );
+                    .expect("reserved frame storage");
+                let result = if let Some(context) = self
+                    .packet_source
+                    .as_ref()
+                    .and_then(SourceWork::optional_context)
+                {
+                    stack.udp_send_from_with_context(self.source, client, payload, context, out)
+                } else {
+                    stack
+                        .udp_send_from(self.source, client, payload, out)
+                        .map(|len| Transmit {
+                            len,
+                            gso: None,
+                            csum: honk_netstack::TxCsum::Full,
+                            flow: None,
+                            source: None,
+                        })
+                };
                 match result {
-                    Ok(len) => {
-                        inner.publish(
-                            lease,
-                            Transmit {
-                                len,
-                                gso: None,
-                                csum: honk_netstack::TxCsum::Full,
-                                flow: None,
-                            },
-                            TxClass::Bulk,
-                        );
+                    Ok(tx) => {
+                        inner.publish(lease, tx, TxClass::Bulk, None);
                         Poll::Ready(Ok(payload.len()))
                     }
                     Err(error) => {

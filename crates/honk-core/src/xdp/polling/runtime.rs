@@ -39,6 +39,24 @@ pub(in crate::xdp) fn polling_segment_stop(
 impl Runtime {
     #[cfg(test)]
     pub(in crate::xdp) fn polling_test_snapshot(&self) -> super::testing::Snapshot {
+        let queues = self.devices.iter().flat_map(|device| {
+            device
+                .queues
+                .iter()
+                .map(move |queue| super::testing::Queue {
+                    device: device.info.name.clone(),
+                    id: queue.id,
+                    counters: queue.io.get_ref().counters(),
+                    rings: queue.io.get_ref().rings(),
+                })
+        });
+        #[cfg(feature = "ebpf")]
+        let queues = queues.chain(self.host.iter().map(|host| super::testing::Queue {
+            device: host.capture.private_device().name.clone(),
+            id: 0,
+            counters: host.queue.io.get_ref().counters(),
+            rings: host.queue.io.get_ref().rings(),
+        }));
         let polling = &self.polling;
         super::testing::Snapshot {
             mode: polling.config.mode,
@@ -61,21 +79,7 @@ impl Runtime {
                 .and_then(|budget| budget.executable_sha256().map(str::to_owned)),
             context_sha256: polling.context_sha256.clone(),
             parameter_sha256: polling.parameter_sha256.clone(),
-            queues: self
-                .devices
-                .iter()
-                .flat_map(|device| {
-                    device
-                        .queues
-                        .iter()
-                        .map(move |queue| super::testing::Queue {
-                            device: device.info.name.clone(),
-                            id: queue.id,
-                            counters: queue.io.get_ref().counters(),
-                            rings: queue.io.get_ref().rings(),
-                        })
-                })
-                .collect(),
+            queues: queues.collect(),
             cursors: (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class),
             pollable: self.has_pollable_obligation(),
             waiting: self.waiting.len(),
@@ -98,29 +102,25 @@ impl Runtime {
             .test_control
             .note_pending(super::testing::PendingWait {
                 reading,
-                driver_deadline: self
-                    .realms
-                    .iter()
-                    .filter_map(|realm| realm.driver.deadline())
-                    .min(),
+                driver_deadline: self.scope_deadline(),
                 armed_deadline: timer.get_ref().as_ref().map(tokio::time::Sleep::deadline),
-                idle_ports: self
-                    .devices
-                    .iter()
-                    .flat_map(|device| &device.queues)
-                    .all(|queue| {
-                        let port = queue.io.get_ref();
-                        port.counters().submitted == port.counters().completed
-                            && !port.needs_service_retry()
-                    }),
-                pending_outputs: self
-                    .realms
-                    .iter()
-                    .any(|realm| realm.pending.iter().any(Option::is_some)),
+                idle_ports: self.queues().all(|queue| {
+                    let port = queue.io.get_ref();
+                    port.counters().submitted == port.counters().completed
+                        && !port.needs_service_retry()
+                }),
+                pending_outputs: self.has_pending_outputs(),
             });
     }
 
     pub(in crate::xdp) fn refresh_polling_context(&mut self) {
+        #[cfg(feature = "ebpf")]
+        if self.host.is_some() {
+            self.polling_affinity = None;
+            self.workers.polling_context(0, Err("context_unavailable"));
+            self.polling.context(Err("context_unavailable"));
+            return;
+        }
         let context = (|| {
             let mut context = self.polling_prefix.clone()?;
             let affinity = owner_affinity()?;
@@ -169,7 +169,12 @@ impl Runtime {
             self.polling_affinity = Some(affinity);
             Ok(context.finish())
         })();
-        self.polling.context(context);
+        self.workers.polling_context(0, context.clone());
+        self.polling.context(if self.workers.workers == 1 {
+            context
+        } else {
+            self.workers.combined_polling_context()
+        });
     }
 
     pub(in crate::xdp) fn rebuild_polling_context(&mut self) {
@@ -187,27 +192,31 @@ impl Runtime {
     pub(in crate::xdp) fn observe_polling_round(&mut self) -> bool {
         let mut transmitted = 0u64;
         let mut progress = false;
-        for device in &mut self.devices {
-            for queue in &mut device.queues {
-                let counters = queue.io.get_ref().counters();
-                let rings = queue.io.get_ref().rings();
-                match counters
-                    .published_packets
-                    .checked_sub(queue.observed.published_packets)
-                    .and_then(|delta| transmitted.checked_add(delta))
-                {
-                    Some(value) => transmitted = value,
-                    None => self.qualification_unavailable = true,
-                }
-                self.qualification_unavailable |= counters.publication_count_unavailable;
-                progress |= counters.rx != queue.observed.rx
-                    || counters.published_packets != queue.observed.published_packets
-                    || counters.completed != queue.observed.completed
-                    || counters.fill != queue.observed.fill
-                    || rings != queue.observed_rings;
-                queue.observed = counters;
-                queue.observed_rings = rings;
+        let queues = self
+            .devices
+            .iter_mut()
+            .flat_map(|device| &mut device.queues);
+        #[cfg(feature = "ebpf")]
+        let queues = queues.chain(self.host.iter_mut().map(|host| &mut host.queue));
+        for queue in queues {
+            let counters = queue.io.get_ref().counters();
+            let rings = queue.io.get_ref().rings();
+            match counters
+                .published_packets
+                .checked_sub(queue.observed.published_packets)
+                .and_then(|delta| transmitted.checked_add(delta))
+            {
+                Some(value) => transmitted = value,
+                None => self.qualification_unavailable = true,
             }
+            self.qualification_unavailable |= counters.publication_count_unavailable;
+            progress |= counters.rx != queue.observed.rx
+                || counters.published_packets != queue.observed.published_packets
+                || counters.completed != queue.observed.completed
+                || counters.fill != queue.observed.fill
+                || rings != queue.observed_rings;
+            queue.observed = counters;
+            queue.observed_rings = rings;
         }
         if self.qualification_unavailable {
             self.polling.counter_unavailable();
@@ -222,14 +231,33 @@ impl Runtime {
         progress
     }
 
+    fn queues(&self) -> impl Iterator<Item = &crate::xdp::Queue> {
+        let queues = self.devices.iter().flat_map(|device| &device.queues);
+        #[cfg(feature = "ebpf")]
+        let queues = queues.chain(self.host.iter().map(|host| &host.queue));
+        queues
+    }
+
+    #[cfg(test)]
+    fn has_pending_outputs(&self) -> bool {
+        let pending = self
+            .realms
+            .iter()
+            .any(|realm| realm.pending.iter().any(Option::is_some));
+        #[cfg(feature = "ebpf")]
+        let pending = pending
+            || self
+                .host
+                .as_ref()
+                .is_some_and(|host| host.pending.iter().any(Option::is_some));
+        pending
+    }
+
     fn has_pollable_obligation(&self) -> bool {
         !self.closing
-            && self.devices.iter().any(|device| {
-                device
-                    .queues
-                    .iter()
-                    .any(|queue| queue.io.get_ref().needs_service_retry())
-            })
+            && self
+                .queues()
+                .any(|queue| queue.io.get_ref().needs_service_retry())
     }
 
     fn scan_polling_features(
@@ -238,6 +266,10 @@ impl Runtime {
         shutdown: &ShutdownIntent,
         reading: bool,
     ) -> Result<(), &'static str> {
+        #[cfg(feature = "ebpf")]
+        if self.host.is_some() {
+            return Err("context_unavailable");
+        }
         let deadline = self.next_deadline(Instant::now(), !reading);
         if owner_affinity().ok() != self.polling_affinity {
             return Err("calibration_context_mismatch");
@@ -317,7 +349,9 @@ impl Runtime {
         reading: bool,
         notification: Pin<&mut OwnedNotified>,
     ) -> Poll<anyhow::Result<()>> {
-        self.polling.poll_change(notification, cx);
+        if self.polling.poll_change(notification, cx) {
+            self.workers.wake_worker(1);
+        }
         self.polling.synchronize();
         #[cfg(test)]
         self.polling
@@ -327,6 +361,9 @@ impl Runtime {
             && (self.polling.revision() != self.context_revision || self.context_recheck)
         {
             self.rebuild_polling_context();
+        }
+        if self.workers.workers == 2 {
+            self.workers.apply_polling_context(0, &mut self.polling);
         }
         let had_clock = self.polling.last_clock.is_some();
         self.polling.boundary(0, 0);
@@ -387,9 +424,7 @@ impl Runtime {
             let start_cursors = (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class);
             #[cfg(test)]
             let start_rx = self
-                .devices
-                .iter()
-                .flat_map(|device| &device.queues)
+                .queues()
                 .map(|queue| queue.io.get_ref().counters().rx)
                 .sum();
             #[cfg(test)]
@@ -454,9 +489,7 @@ impl Runtime {
                 reason,
                 probe_rounds: self.polling.busy_probe_rounds,
                 published_packets: self
-                    .devices
-                    .iter()
-                    .flat_map(|device| &device.queues)
+                    .queues()
                     .map(|queue| queue.io.get_ref().counters().published_packets)
                     .sum(),
                 settlement,
@@ -464,9 +497,7 @@ impl Runtime {
                 cursors: (self.rx_device, self.rx_queue, self.tx_realm, self.tx_class),
                 start_rx,
                 rx_packets: self
-                    .devices
-                    .iter()
-                    .flat_map(|device| &device.queues)
+                    .queues()
                     .map(|queue| queue.io.get_ref().counters().rx)
                     .sum(),
             });

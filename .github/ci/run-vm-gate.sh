@@ -56,6 +56,7 @@ vng -r "$kernel_dir/root/boot/vmlinuz-$release" \
   --rwdir "$GITHUB_WORKSPACE" \
   --cpus 2 \
   --memory 4G \
+  --append 'lsm=landlock,lockdown,yama,integrity,apparmor,bpf' \
   -- \
   env \
     GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \

@@ -189,7 +189,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                         .get(&EndpointKey::new(
                             honk_datapath::ScopeId::HOST,
                             source,
-                            destination
+                            destination,
+                            None,
                         ))
                         .unwrap()
                         .value(),
@@ -240,7 +241,8 @@ async fn udp_close_waits_for_driver_and_exact_backend_ack() {
                     source,
                     destination,
                     101,
-                    generation
+                    generation,
+                    None,
                 ));
                 assert!(replacement.still_initializing());
                 drop(replacement);
@@ -275,6 +277,7 @@ async fn udp_close_without_exact_pool_owner_completes_all_claims() {
                     action: CloseAction::Udp {
                         pool: weak_pool,
                         scope: ScopeId::HOST,
+                        packet_lineage: None,
                         client: source,
                         destination,
                         token: 101,
@@ -433,14 +436,16 @@ async fn udp_exact_ack_completes_claim_before_tombstone_disappears() {
             source,
             destination,
             removal.owner,
-            generation
+            generation,
+            removal.packet_lineage,
         ));
         assert!(!pool.close_exact(
             honk_datapath::ScopeId::HOST,
             source,
             destination,
             101,
-            generation
+            generation,
+            None,
         ));
         assert_eq!(pending.wait().await, CloseOutcome::Closed);
         signal.finish(false);

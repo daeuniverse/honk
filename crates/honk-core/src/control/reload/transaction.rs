@@ -640,6 +640,29 @@ impl ControlPlane {
         }
 
         let route_count = new_router.route_count();
+        #[cfg(feature = "ebpf")]
+        let mut native_publication = match self.ebpf.read().await.native_publication() {
+            Some(publication) => {
+                let preparation = match publication.preflight_host_plan(&new_plan) {
+                    Ok(preparation) => preparation,
+                    Err(error) => {
+                        warn!(%error, "reload rejected: Host Native plan exceeds admission limits");
+                        self.stop_reload_rejection_if_healthy(drain);
+                        return Ok(ReloadOutcome::Rejected);
+                    }
+                };
+                match publication
+                    .write_prepared_plan(crate::ebpf::native::NativeReason::Reload, preparation)
+                {
+                    Ok(writer) => Some(writer),
+                    Err(error) => {
+                        error!(%error, "reload rejected: Native publication could not be withdrawn");
+                        return Ok(ReloadOutcome::Rejected);
+                    }
+                }
+            }
+            None => None,
+        };
         let datapath_flags = if let Some(handle) = self.datapath_flags.clone() {
             handle
         } else {
@@ -670,8 +693,13 @@ impl ControlPlane {
             self.close_and_drain_pending_udp_admission().await;
             // Nothing was torn down yet: restore the old flags and keep
             // serving instead of rejecting new connections forever.
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(feature = "ebpf")]
+                native_publication.take(),
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         drain.start_rejecting();
@@ -681,8 +709,13 @@ impl ControlPlane {
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(feature = "ebpf")]
+                native_publication.take(),
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "ebpf")]
@@ -691,12 +724,19 @@ impl ControlPlane {
         }
         if !self.udp_pool.wait_for_retirements().await {
             warn!("UDP endpoint retirements did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(feature = "ebpf")]
+                native_publication.take(),
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
+        #[cfg(feature = "ebpf")]
+        let mut native_candidate_started = false;
         let old_registry_result = {
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
@@ -748,6 +788,12 @@ impl ControlPlane {
                 if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
                     let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                     error!(%error, ?restore, "Failed to open group connectivity for reload transition");
+                    if restore.is_err() {
+                        self.datapath_healthy
+                            .store(false, std::sync::atomic::Ordering::Release);
+                        self.drain_tracker.start_rejecting();
+                        drain.start_rejecting();
+                    }
                     break 'publication Err(());
                 }
                 if routing_publication_needed {
@@ -757,6 +803,10 @@ impl ControlPlane {
                         .collect::<Vec<_>>();
                     new_domain_routes
                         .sort_unstable_by_key(|(key, _)| crate::ebpf::maps::lpm_key_bytes(key));
+                    #[cfg(feature = "ebpf")]
+                    {
+                        native_candidate_started = true;
+                    }
                     if let Err(error) = ebpf.publish_routing_plan(&new_plan, &new_domain_routes) {
                         match publish_group_connectivity(ebpf.as_mut(), &old_connectivity) {
                             Ok(()) => error!(
@@ -890,14 +940,27 @@ impl ControlPlane {
                     projection_snapshot,
                     routing_publication_needed.then_some(new_projection),
                 );
+                #[cfg(feature = "ebpf")]
+                if let Some(publication) = native_publication.take() {
+                    publication.commit();
+                }
                 Ok(old_registry)
             }
         };
         let old_registry = match old_registry_result {
             Ok(old_registry) => old_registry,
             Err(()) => {
-                self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                    .await;
+                self.restore_datapath_flags_after_rejected_reload(
+                    &datapath_flags,
+                    drain,
+                    #[cfg(feature = "ebpf")]
+                    if native_candidate_started {
+                        None
+                    } else {
+                        native_publication.take()
+                    },
+                )
+                .await;
                 return Ok(ReloadOutcome::Rejected);
             }
         };
@@ -976,6 +1039,7 @@ impl ControlPlane {
         &self,
         datapath_flags: &crate::mode::DatapathFlagsHandle,
         drain: &DrainTracker,
+        #[cfg(feature = "ebpf")] native_publication: Option<crate::ebpf::native::NativeWrite>,
     ) {
         if !self.is_datapath_healthy() {
             drain.start_rejecting();
@@ -996,6 +1060,10 @@ impl ControlPlane {
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
             return;
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(publication) = native_publication {
+            publication.commit();
         }
         drain.stop_rejecting();
     }

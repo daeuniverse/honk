@@ -27,7 +27,7 @@ fn kernel_rule(
         action: KernelAction {
             outbound,
             must,
-            mark,
+            mark: (mark != 0).then_some(mark),
             direct_mark_index: None,
         },
     }
@@ -126,11 +126,12 @@ fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
         fallback: KernelAction {
             outbound: 0,
             must: false,
-            mark: 0,
+            mark: None,
             direct_mark_index: None,
         },
         features: 0,
         fingerprint: [0; 32],
+        policy_fingerprint: [0; 32],
         has_domain_rules: false,
         domain_predicate_count: 0,
         trace_enabled: false,

@@ -8,8 +8,8 @@
 
 use super::super::driver::UdpDriverHandle;
 use super::super::{
-    EndpointReservation, ReplySocket, ReplySocketFd, ScopeId, UdpEndpoint, UdpEndpointPool,
-    UdpInitLease, UdpReplySocketFactory, queue_now,
+    EndpointReservation, ReplySocket, ReplySocketFd, ScopeId, SourceWork, UdpEndpoint,
+    UdpEndpointPool, UdpInitLease, UdpReplySocketFactory, queue_now,
 };
 use crate::stats::StatsManager;
 use honk_outbound::alive::{AliveDialerSet, IpVersion};
@@ -37,7 +37,12 @@ const FLOW_NODE: uuid::Uuid = uuid::Uuid::from_u128(1);
 struct BoundReplies(HashMap<SocketAddr, std::net::UdpSocket>);
 
 impl UdpReplySocketFactory for BoundReplies {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        _packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
         if scope != ScopeId::HOST {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -126,7 +131,7 @@ impl IoHarness {
             IpVersion::V4,
             None,
         ));
-        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target)?);
+        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target, None)?);
         self.start(lease, endpoint, target, reply).await
     }
 

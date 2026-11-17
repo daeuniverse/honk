@@ -166,6 +166,7 @@ async fn recv_and_ack(
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     Some(removal)
 }
@@ -181,6 +182,7 @@ fn try_recv_and_ack(
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     Ok(removal)
 }
@@ -509,7 +511,12 @@ impl InjectedReplySocketFactory {
 }
 
 impl UdpReplySocketFactory for InjectedReplySocketFactory {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        _packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
         let socket = self
             .sockets
             .lock()
@@ -534,6 +541,7 @@ fn kernel_reply_factory_rejects_non_host_scope_and_refunds_credit() {
         &slots,
         ScopeId::allocate().unwrap(),
         make_addr("127.0.0.1", 12345),
+        None,
     ) else {
         panic!("kernel factory accepted a foreign scope");
     };
@@ -553,13 +561,13 @@ async fn foreign_reply_transports_isolate_scopes_under_one_global_cap() {
             .map(|scope| (*scope, socket.try_clone().unwrap())),
     ));
     let pool = UdpEndpointPool::with_reply_socket_factory(1, factory.clone());
-    let primary = pool.create_reply_socket(scopes[0], source).unwrap();
+    let primary = pool.create_reply_socket(scopes[0], source, None).unwrap();
     let foreign = &pool.foreign_replies;
-    let first = foreign.get(scopes[1], source).unwrap();
-    let second = foreign.get(scopes[2], source).unwrap();
+    let first = foreign.get(scopes[1], source, None).unwrap();
+    let second = foreign.get(scopes[2], source, None).unwrap();
     assert!(Arc::ptr_eq(
         &first,
-        &foreign.get(scopes[1], source).unwrap()
+        &foreign.get(scopes[1], source, None).unwrap()
     ));
     assert!(!Arc::ptr_eq(&first, &second));
     assert_eq!((first.scope(), second.scope()), (scopes[1], scopes[2]));
@@ -584,10 +592,10 @@ async fn foreign_reply_transports_isolate_scopes_under_one_global_cap() {
     }
     drop((first, second));
     for &scope in &scopes[3..full] {
-        foreign.get(scope, source).unwrap();
+        foreign.get(scope, source, None).unwrap();
     }
     assert_eq!(foreign.available_slots(), 0);
-    foreign.get(scopes[full], source).unwrap();
+    foreign.get(scopes[full], source, None).unwrap();
     let mut expected: Vec<_> = scopes[1..full]
         .iter()
         .map(|scope| (*scope, source))
@@ -616,17 +624,20 @@ async fn reply_socket_credits_cover_retained_teardown_sockets() {
     let pool = UdpEndpointPool::with_reply_socket_factory(1, factory.clone());
     let mut retained: Vec<_> = sources[..MAX_REPLY_SOCKETS_PER_ENDPOINT]
         .iter()
-        .map(|source| pool.create_reply_socket(ScopeId::HOST, *source).unwrap())
+        .map(|source| {
+            pool.create_reply_socket(ScopeId::HOST, *source, None)
+                .unwrap()
+        })
         .collect();
     let Err(error) =
-        pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT])
+        pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT], None)
     else {
         panic!("reply socket budget admitted a ninth retained descriptor");
     };
     assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     assert_eq!(factory.created().len(), MAX_REPLY_SOCKETS_PER_ENDPOINT);
     retained.pop();
-    pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT])
+    pool.create_reply_socket(ScopeId::HOST, sources[MAX_REPLY_SOCKETS_PER_ENDPOINT], None)
         .unwrap();
 }
 
@@ -643,19 +654,21 @@ async fn foreign_reply_sockets_share_reuse_and_yield_to_primaries() {
         1,
         Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
-    let primary = pool.create_reply_socket(ScopeId::HOST, sources[0]).unwrap();
+    let primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[0], None)
+        .unwrap();
     let foreign = &pool.foreign_replies;
     assert_eq!(foreign.available_slots(), full - 1);
 
-    let first = foreign.get(ScopeId::HOST, sources[1]).unwrap();
+    let first = foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     assert!(Arc::ptr_eq(
         &first,
-        &foreign.get(ScopeId::HOST, sources[1]).unwrap()
+        &foreign.get(ScopeId::HOST, sources[1], None).unwrap()
     ));
     for source in &sources[2..full] {
-        foreign.get(ScopeId::HOST, *source).unwrap();
+        foreign.get(ScopeId::HOST, *source, None).unwrap();
     }
-    foreign.get(ScopeId::HOST, sources[1]).unwrap();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     let mut expected: Vec<_> = sources[1..full]
         .iter()
         .map(|source| (ScopeId::HOST, *source))
@@ -664,7 +677,7 @@ async fn foreign_reply_sockets_share_reuse_and_yield_to_primaries() {
     assert_eq!(foreign.cached(), expected);
 
     // Primary + full cache use every permit: the new peer closes the oldest.
-    foreign.get(ScopeId::HOST, sources[full]).unwrap();
+    foreign.get(ScopeId::HOST, sources[full], None).unwrap();
     expected.remove(0);
     expected.push((ScopeId::HOST, sources[full]));
     assert_eq!(foreign.cached(), expected);
@@ -672,7 +685,7 @@ async fn foreign_reply_sockets_share_reuse_and_yield_to_primaries() {
 
     // A primary that finds no permit takes one from the least recent foreign socket.
     let second_primary = pool
-        .create_reply_socket(ScopeId::HOST, sources[full + 1])
+        .create_reply_socket(ScopeId::HOST, sources[full + 1], None)
         .unwrap();
     expected.remove(0);
     assert_eq!(foreign.cached(), expected);
@@ -694,17 +707,19 @@ async fn foreign_reply_sockets_reclaim_past_a_pinned_victim() {
         1,
         Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
-    let primary = pool.create_reply_socket(ScopeId::HOST, sources[0]).unwrap();
+    let primary = pool
+        .create_reply_socket(ScopeId::HOST, sources[0], None)
+        .unwrap();
     let foreign = &pool.foreign_replies;
     // Holding this Arc keeps the least recently used socket's permit occupied
     // even after the cache evicts it, so one eviction cannot admit a primary.
-    let pinned = foreign.get(ScopeId::HOST, sources[1]).unwrap();
+    let pinned = foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     for source in &sources[2..full] {
-        foreign.get(ScopeId::HOST, *source).unwrap();
+        foreign.get(ScopeId::HOST, *source, None).unwrap();
     }
     assert_eq!(foreign.available_slots(), 0);
     let second_primary = pool
-        .create_reply_socket(ScopeId::HOST, sources[full])
+        .create_reply_socket(ScopeId::HOST, sources[full], None)
         .unwrap();
     assert_eq!(
         foreign.cached(),
@@ -729,10 +744,10 @@ async fn foreign_reply_sockets_expire_when_a_peer_stops_replying() {
         Arc::new(InjectedReplySocketFactory::new(ScopeId::HOST, sockets)),
     );
     let foreign = &pool.foreign_replies;
-    foreign.get(ScopeId::HOST, sources[0]).unwrap();
-    foreign.get(ScopeId::HOST, sources[1]).unwrap();
+    foreign.get(ScopeId::HOST, sources[0], None).unwrap();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     tokio::time::advance(DEFAULT_NAT_TIMEOUT).await;
-    foreign.get(ScopeId::HOST, sources[1]).unwrap();
+    foreign.get(ScopeId::HOST, sources[1], None).unwrap();
     assert_eq!(pool.janitor_cycle(), 0);
     assert_eq!(foreign.cached(), vec![(ScopeId::HOST, sources[1])]);
     tokio::time::advance(DEFAULT_NAT_TIMEOUT).await;
@@ -779,16 +794,19 @@ fn test_endpoint_key() {
         honk_datapath::ScopeId::HOST,
         make_addr("1.2.3.4", 80),
         make_addr("5.6.7.8", 443),
+        None,
     );
     let b = EndpointKey::new(
         honk_datapath::ScopeId::HOST,
         make_addr("1.2.3.4", 80),
         make_addr("5.6.7.8", 443),
+        None,
     );
     let c = EndpointKey::new(
         honk_datapath::ScopeId::HOST,
         make_addr("1.2.3.5", 80),
         make_addr("5.6.7.8", 443),
+        None,
     );
     assert_eq!(a, b);
     assert_ne!(a, c);
@@ -800,11 +818,13 @@ fn test_endpoint_key_ipv6() {
         honk_datapath::ScopeId::HOST,
         make_addr("[2001:db8::1]", 8080),
         make_addr("[2001:db8::2]", 9090),
+        None,
     );
     let b = EndpointKey::new(
         honk_datapath::ScopeId::HOST,
         make_addr("[2001:db8::1]", 8080),
         make_addr("[2001:db8::2]", 9090),
+        None,
     );
     assert_eq!(a, b);
 }
@@ -1184,7 +1204,7 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
     let dst = make_addr("8.8.8.8", 443);
     let (removed_tx, mut removed_rx) = mpsc::channel(4);
     pool.set_remove_sink(removed_tx);
-    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst));
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst, None));
     let slow_permit = Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
     let lease = match pool.reserve_owned_or_enqueue(
         honk_datapath::ScopeId::HOST,
@@ -1201,13 +1221,13 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
     };
     let generation = lease.generation();
     assert!(
-        pool.contains(honk_datapath::ScopeId::HOST, client, dst),
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst, None),
         "Initializing already owns Endpoint execution"
     );
     assert!(pool.retire_staged_identity(honk_datapath::ScopeId::HOST, client, dst, 77, generation));
     assert!(!lease.still_initializing());
     assert!(
-        pool.contains(honk_datapath::ScopeId::HOST, client, dst),
+        pool.contains(honk_datapath::ScopeId::HOST, client, dst, None),
         "Retiring must not migrate to Core"
     );
     assert!(matches!(
@@ -1226,14 +1246,16 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         client,
         dst,
         UdpFlowOwner::new(78, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
     assert!(!pool.complete_removal(
         honk_datapath::ScopeId::HOST,
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation + 1
+        generation + 1,
+        None,
     ));
     let removal = removed_rx.try_recv().unwrap();
     assert_eq!(removal.owner.token, 77);
@@ -1243,9 +1265,10 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
-    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst));
+    assert!(!pool.contains(honk_datapath::ScopeId::HOST, client, dst, None));
 
     let replacement = match pool.reserve_or_enqueue(
         honk_datapath::ScopeId::HOST,
@@ -1264,7 +1287,8 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         client,
         dst,
         UdpFlowOwner::new(77, None).unwrap(),
-        generation
+        generation,
+        None,
     ));
     assert!(replacement.still_initializing());
     drop(replacement);
@@ -1275,6 +1299,7 @@ fn udp_retiring_tombstone_requires_exact_ack_before_tuple_reuse() {
         replacement_removal.dst,
         replacement_removal.owner,
         replacement_removal.generation,
+        replacement_removal.packet_lineage,
     ));
 }
 
@@ -1329,6 +1354,7 @@ fn udp_kernel_incarnation_survives_ready_and_dirty_retirement() {
         first_dst,
         UdpFlowOwner::new(0, Some(42)).unwrap(),
         first.generation,
+        None,
     ));
     pool.finish_removal(&first, true);
     pool.flush_removal_dirty();
@@ -1474,7 +1500,14 @@ fn udp_kernel_handoff_preserves_terminal_identity_until_ack() {
         ),
         EndpointReservation::QueueClosed
     ));
-    assert!(pool.complete_removal(removal.scope, client, dst, removal.owner, generation));
+    assert!(pool.complete_removal(
+        removal.scope,
+        client,
+        dst,
+        removal.owner,
+        generation,
+        removal.packet_lineage
+    ));
 }
 
 #[tokio::test]
@@ -1512,6 +1545,7 @@ async fn udp_exact_retirement_cancels_matching_initializer() {
         removal.dst,
         removal.owner,
         removal.generation,
+        removal.packet_lineage,
     ));
     drop(lease);
 }
@@ -2265,7 +2299,10 @@ async fn udp_endpoint_reply_sources_follow_target_policy() {
             _ => panic!("reply-source fixture must initialize"),
         };
         let queue_rx = lease.take_queue_receiver().unwrap();
-        let reply_socket = Arc::new(pool.create_reply_socket(lease.scope(), source_a).unwrap());
+        let reply_socket = Arc::new(
+            pool.create_reply_socket(lease.scope(), source_a, None)
+                .unwrap(),
+        );
         let mut driver = pool.spawn_driver(
             honk_datapath::ScopeId::HOST,
             client,
@@ -2390,7 +2427,10 @@ async fn start_ordinary_flow(
         _ => panic!("reply-source fixture must initialize"),
     };
     let queue_rx = lease.take_queue_receiver().unwrap();
-    let reply_socket = Arc::new(pool.create_reply_socket(lease.scope(), primary).unwrap());
+    let reply_socket = Arc::new(
+        pool.create_reply_socket(lease.scope(), primary, None)
+            .unwrap(),
+    );
     let mut driver = pool.spawn_driver(
         honk_datapath::ScopeId::HOST,
         client,
@@ -2934,6 +2974,7 @@ async fn udp_endpoint_driver_reply_idle_timeout_cleans_up_once() {
         recv_and_ack(&pool, &mut removed_rx).await,
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3043,6 +3084,7 @@ async fn udp_endpoint_pool_shutdown_joins_blocked_ready_driver() {
         removal,
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3128,6 +3170,7 @@ async fn udp_endpoint_pool_shutdown_aborts_stuck_initializer_task() {
         removal,
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3214,6 +3257,7 @@ async fn udp_endpoint_driver_receive_and_reply_errors_clean_up() {
             recv_and_ack(&pool, &mut removed_rx).await,
             Some(EndpointRemoval {
                 scope: ScopeId::HOST,
+                packet_lineage: None,
                 client,
                 dst,
                 owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3311,6 +3355,7 @@ async fn udp_endpoint_receive_failure_cancels_blocked_steady_send_and_releases_p
         recv_and_ack(&pool, &mut removed_rx).await,
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3538,6 +3583,7 @@ async fn udp_endpoint_worker_failure_removes_tracker_once() {
             .unwrap(),
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3610,6 +3656,7 @@ async fn udp_endpoint_driver_panic_releases_all_resources_exactly_once() {
             .expect("panic cleanup must notify the removal sink"),
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3690,6 +3737,7 @@ async fn udp_endpoint_driver_abort_releases_ready_mapping_and_allows_reuse() {
             .expect("aborted driver must notify the removal sink"),
         Some(EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3780,6 +3828,7 @@ async fn udp_endpoint_worker_old_generation_cannot_remove_replacement() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3847,6 +3896,7 @@ async fn udp_endpoint_node_death_before_dial_sends_nothing() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3917,6 +3967,7 @@ async fn udp_endpoint_node_death_during_dial_sends_nothing() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -3996,6 +4047,7 @@ async fn udp_endpoint_node_death_before_commit_sends_nothing() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -4068,6 +4120,7 @@ async fn udp_endpoint_node_death_before_driver_start_sends_nothing() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -4203,6 +4256,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client: node_client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),
@@ -4232,6 +4286,7 @@ async fn udp_endpoint_node_and_janitor_cleanup_notify_tracker_once() {
         try_recv_and_ack(&pool, &mut removed_rx).unwrap(),
         EndpointRemoval {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client: janitor_client,
             dst,
             owner: UdpFlowOwner::new(0, None).unwrap(),

@@ -346,5 +346,6 @@ pub fn plain(len: usize, flow: Option<FlowId>) -> Transmit {
         gso: None,
         csum: TxCsum::Full,
         flow,
+        source: None,
     }
 }

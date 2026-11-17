@@ -38,6 +38,16 @@
 //! Neither a new SYN nor protocol acceptance proves a successful outbound admission.
 //! [`Stack::receive_with_meta_tcp_admission`] combines the same report with driver [`RxMeta`]
 //! through the shared parser; Endpoint retains its strict metadata rejection.
+//! [`Stack::receive_with_context`] carries an embedding's opaque [`SourceContext`] through
+//! actual transport, fragment and output owners. TCP keeps its first snapshot and rejects
+//! foreign source lineages; a legal RFC 6191 reopen may bind a new source. Reassembly requires
+//! one exact snapshot and retains killed entries' identity until their actual removal.
+//! [`Stack::visit_retained_source_contexts`] visits these owners without mutating the Stack.
+//! Contextual intake/output requires [`Stack::prepare_source_context`] on an empty stack
+//! with a shared budget. It funds one bounded parallel flow-context array before admission;
+//! ordinary stacks keep the compact flow slots and allocate no context array. An ordinary
+//! embedding that opts in binds its slab-slot ceiling to [`Config::max_flows`]; accounted
+//! stacks keep their supplied ceiling. Unprepared contextual input/output consumes nothing.
 //! [`Stack::retains_tcp`] classifies existing scoped transport ownership through pending
 //! opens, TIME_WAIT and flow-owned controls; adapters must additionally retain their own
 //! queued/exported output leases. It neither validates input nor mutates protocol state.
@@ -150,6 +160,18 @@
 //! [`Stack::set_accepting`] closes new passive admission without disabling existing delivery.
 //! Completed reassembly returns [`OwnedPacket`], whose [`MemoryReservation`] remains owned
 //! through consumer release, even if the Stack has already been dropped.
+//! [`Stack::new_accounted_shard`] enables the concrete accounted capture embedding: split control
+//! capacity, one caller-supplied 512 KiB UDP pending budget, borrowed realm [`IcmpState`],
+//! and bounded exact-ID half-open releases. The caller grants only new valid SYNs and drains
+//! [`Stack::poll_half_open_released`] before another admission or adapter-slot reap.
+//! [`Stack::reassemble_for_dispatch`] keeps fragments on owner zero without selecting that
+//! owner's transport; ingress/service timestamps cannot renew an old assembly's deadline.
+//! Earliest ingress remains in [`FragmentInfo`] for reassembly expiry and return snapshots;
+//! [`OwnedPacket::completion_ingress`] is the maximum real fragment ingress used when the
+//! complete datagram enters transport or routing. Service time starts neither deadline.
+//! Direct ICMP producers use [`Stack::udp_refuse_with_icmp`] and
+//! [`Stack::packet_too_big_with_icmp`] with that same realm state. Too-small output consumes
+//! no limiter credit; PTB retains its normal exemption.
 //!
 //! Endpoint UDP has no queue: [`Rx::Datagram`] borrows a range of the input packet, and
 //! [`Stack::udp_send`] writes straight into the caller's output buffer. Datagram payloads
@@ -179,13 +201,16 @@ mod udp_t;
 
 pub use accept::{AcceptOpts, AcceptWhen, Keepalive, MAX_DEFERRED, Refuse, SynInfo};
 pub use budget::{MemoryBudget, MemoryReservation};
-pub use fragment::{FragmentLimits, OwnedPacket};
-pub use icmp_out::IcmpLimits;
+pub use fragment::{
+    FragmentError, FragmentIdentity, FragmentInfo, FragmentLimits, OwnedPacket, ReassemblyReport,
+};
+pub use icmp_out::{IcmpLimits, IcmpOut as IcmpState};
 pub use mode::{ExcludeSet, Mode};
-pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, Transmit, TxCaps, TxCsum};
+pub use offload::{Csum, GsoKind, GsoRx, GsoTx, RxMeta, SourceContext, Transmit, TxCaps, TxCsum};
 pub use stack::{
-    BindError, Config, ConnectError, ConstructionError, DropReason, FlowId, Ready, ReceiveOutcome,
-    ReceiveReport, Rx, Stack, StackStats, StreamError, UdpError, ValidatedSource,
+    AccountedTransmit, BindError, Config, ConnectError, ConstructionError, DropReason, FlowId,
+    Ready, ReceiveOutcome, ReceiveReport, Rx, Stack, StackStats, StreamError, UdpError,
+    ValidatedSource,
 };
 pub use tcp::{TcpState, TcpStats};
 pub use udp_t::UdpRefuse;

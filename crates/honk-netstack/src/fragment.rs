@@ -13,6 +13,7 @@
 
 use std::collections::VecDeque;
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,7 +21,7 @@ use std::time::{Duration, Instant};
 use crate::icmp_out::{IcmpEmit, IcmpOut, Reject};
 use crate::tcp::output::Output;
 use crate::wire::frag::{self, Fragment};
-use crate::{DropReason, MemoryBudget, MemoryReservation, Rx};
+use crate::{DropReason, MemoryBudget, MemoryReservation, Rx, SourceContext, Transmit};
 
 /// Fixed bookkeeping charged per datagram next to its data, header and range storage.
 const ENTRY_OVERHEAD: usize = 256;
@@ -57,15 +58,82 @@ pub struct Ipv6Fragment {
     pub max_size: usize,
 }
 
+/// One IP datagram within its caller's exact ingress/realm identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FragmentIdentity {
+    pub src: IpAddr,
+    pub dst: IpAddr,
+    pub proto: u8,
+    pub id: u32,
+}
+
+impl FragmentIdentity {
+    fn from_fragment(fragment: &Fragment<'_>) -> Self {
+        Self {
+            src: fragment.src,
+            dst: fragment.dst,
+            proto: fragment.proto,
+            id: fragment.id,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FragmentInfo {
+    pub identity: FragmentIdentity,
+    pub original_ingress: Instant,
+    /// Scoped to this reassembler; atomic datagrams have no retained incarnation.
+    pub incarnation: Option<NonZeroU64>,
+}
+
+#[derive(Debug)]
+pub struct ReassemblyReport {
+    pub packet: Option<OwnedPacket>,
+    pub fragment: FragmentInfo,
+}
+
+/// An affected assembly may retain a tombstone or timeout quote after rejection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("fragment reassembly rejected: {reason:?}")]
+pub struct FragmentError {
+    pub reason: DropReason,
+    pub fragment: Option<FragmentInfo>,
+}
+
+impl From<DropReason> for FragmentError {
+    fn from(reason: DropReason) -> Self {
+        Self {
+            reason,
+            fragment: None,
+        }
+    }
+}
+
 /// Reassembled bytes whose capacity charge follows their lifetime, including beyond Stack drop.
 #[derive(Debug)]
 pub struct OwnedPacket {
     bytes: Box<[u8]>,
     ipv6_fragment: Option<Ipv6Fragment>,
+    fragment: FragmentInfo,
+    completion_ingress: Instant,
     _reservation: Option<MemoryReservation>,
 }
 
 impl OwnedPacket {
+    /// Maximum original ingress of the packet's underlying fragments, independent of service.
+    pub fn completion_ingress(&self) -> Instant {
+        self.completion_ingress
+    }
+
+    /// Original IP fragment identity, including on an exported timeout quote.
+    pub fn fragment_identity(&self) -> FragmentIdentity {
+        self.fragment.identity
+    }
+
+    pub fn fragment_info(&self) -> FragmentInfo {
+        self.fragment
+    }
+
     /// Original IPv6 fragmentation facts; timeout quotes and IPv4 completions have none.
     pub fn ipv6_fragment(&self) -> Option<Ipv6Fragment> {
         self.ipv6_fragment
@@ -110,7 +178,7 @@ impl Eq for OwnedPacket {}
 #[derive(Debug)]
 pub(crate) enum Push {
     /// Stored (or absorbed by a tombstone); nothing to process yet.
-    Pending,
+    Pending(FragmentInfo),
     Complete(Reassembled),
     Dropped(DropReason),
 }
@@ -119,6 +187,7 @@ pub(crate) enum Push {
 #[derive(Debug)]
 pub(crate) struct Reassembled {
     pub packet: OwnedPacket,
+    pub source: Option<SourceContext>,
 }
 
 impl Reassembled {
@@ -158,6 +227,18 @@ struct Key {
     dst: IpAddr,
     id: u32,
     proto: u8,
+    lineage: Option<NonZeroU64>,
+}
+
+impl Key {
+    fn identity(self) -> FragmentIdentity {
+        FragmentIdentity {
+            src: self.src,
+            dst: self.dst,
+            proto: self.proto,
+            id: self.id,
+        }
+    }
 }
 
 struct Live {
@@ -191,30 +272,43 @@ impl Live {
 
 struct Entry {
     key: Key,
+    /// Kept on killed entries so their original lineage cannot be reclaimed early.
+    source: Option<SourceContext>,
     created: Instant,
+    latest_ingress: Instant,
+    incarnation: NonZeroU64,
     /// `None` is a tombstone: the datagram died (overlap or inconsistency).
     live: Option<Live>,
     /// What `Reassembler::bytes` currently holds for this entry.
     charged: usize,
 }
 
+struct ExpiredQuote {
+    bytes: Vec<u8>,
+    source: Option<SourceContext>,
+    fragment: FragmentInfo,
+    latest_ingress: Instant,
+}
+
 pub(crate) struct Reassembler {
     limits: FragmentLimits,
     transit_quotes: bool,
-    /// Oldest first.
+    /// Arrival order; age follows each datagram's earliest original ingress.
     entries: Vec<Entry>,
     bytes: usize,
     /// The process-wide budget `bytes` is also charged to (and refunded to on drop).
     budget: Option<Arc<MemoryBudget>>,
     /// Quotes of timed-out datagrams that had fragment 0.
-    expired: VecDeque<Vec<u8>>,
+    expired: VecDeque<ExpiredQuote>,
+    last_incarnation: u64,
     pub(crate) stats: FragmentStats,
 }
 
 impl Reassembler {
     pub(crate) fn overhead_bound(limits: FragmentLimits) -> Option<usize> {
-        crate::budget::collection_peak::<Entry>(limits.max_entries)?
-            .checked_add(crate::budget::collection_peak::<Vec<u8>>(MAX_PENDING_ICMP)?)
+        crate::budget::collection_peak::<Entry>(limits.max_entries)?.checked_add(
+            crate::budget::collection_peak::<ExpiredQuote>(MAX_PENDING_ICMP)?,
+        )
     }
 
     pub(crate) fn scratch_bound(limits: FragmentLimits) -> Option<usize> {
@@ -256,6 +350,7 @@ impl Reassembler {
             bytes: 0,
             budget: None,
             expired: VecDeque::new(),
+            last_incarnation: 0,
             stats: FragmentStats::default(),
         }
     }
@@ -295,7 +390,70 @@ impl Reassembler {
     }
 
     /// Feeds one decoded fragment after the stack applies its destination filter.
-    pub(crate) fn push(&mut self, now: Instant, f: Fragment<'_>) -> Push {
+    pub(crate) fn push(
+        &mut self,
+        now: Instant,
+        f: Fragment<'_>,
+        source: Option<SourceContext>,
+    ) -> Push {
+        self.push_at(now, now, f, source)
+    }
+
+    pub(crate) fn push_for_dispatch_at(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        fragment: Fragment<'_>,
+    ) -> Result<ReassemblyReport, FragmentError> {
+        let mut receipt = None;
+        let pushed = self.push_at_inner(ingress_at, service_at, fragment, None, Some(&mut receipt));
+        match pushed {
+            Push::Complete(complete) => Ok(ReassemblyReport {
+                fragment: complete.packet.fragment,
+                packet: Some(complete.packet),
+            }),
+            Push::Pending(fragment) => Ok(ReassemblyReport {
+                packet: None,
+                fragment,
+            }),
+            Push::Dropped(reason) => Err(FragmentError {
+                reason,
+                fragment: receipt,
+            }),
+        }
+    }
+
+    pub(crate) fn retains_fragment(&self, fragment: FragmentInfo) -> bool {
+        let Some(incarnation) = fragment.incarnation else {
+            return false;
+        };
+        self.entries
+            .iter()
+            .any(|entry| entry.incarnation == incarnation)
+            || self
+                .expired
+                .iter()
+                .any(|quote| quote.fragment.incarnation == Some(incarnation))
+    }
+
+    pub(crate) fn push_at(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        f: Fragment<'_>,
+        source: Option<SourceContext>,
+    ) -> Push {
+        self.push_at_inner(ingress_at, service_at, f, source, None)
+    }
+
+    fn push_at_inner(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        f: Fragment<'_>,
+        source: Option<SourceContext>,
+        mut receipt: Option<&mut Option<FragmentInfo>>,
+    ) -> Push {
         let end = f.offset + f.data.len();
         if f.data.is_empty() || (f.more && !f.data.len().is_multiple_of(8)) || end > f.max_total() {
             self.stats.invalid += 1;
@@ -307,17 +465,62 @@ impl Reassembler {
                 id: f.id,
                 max_size: f.head.len() + f.data.len(),
             });
-            return self.finish(f.head, f.data, provenance, false);
+            let fragment = FragmentInfo {
+                identity: FragmentIdentity::from_fragment(&f),
+                original_ingress: ingress_at,
+                incarnation: None,
+            };
+            if let Some(receipt) = receipt.as_deref_mut() {
+                *receipt = Some(fragment);
+            }
+            return self.finish(
+                f.head,
+                f.data,
+                provenance,
+                false,
+                source,
+                (fragment, ingress_at),
+            );
         }
         let key = Key {
             src: f.src,
             dst: f.dst,
             id: f.id,
             proto: f.proto,
+            lineage: source.map(|source| source.lineage),
         };
         let idx = match self.entries.iter().position(|e| e.key == key) {
-            Some(i) => i,
+            Some(i) => {
+                self.entries[i].created = self.entries[i].created.min(ingress_at);
+                self.entries[i].latest_ingress = self.entries[i].latest_ingress.max(ingress_at);
+                if let Some(receipt) = receipt.as_deref_mut() {
+                    *receipt = Some(FragmentInfo {
+                        identity: self.entries[i].key.identity(),
+                        original_ingress: self.entries[i].created,
+                        incarnation: Some(self.entries[i].incarnation),
+                    });
+                }
+                if service_at >= self.entries[i].created + self.limits.timeout {
+                    self.expire(service_at);
+                    if service_at < ingress_at + self.limits.timeout {
+                        return self.push_at_inner(ingress_at, service_at, f, source, receipt);
+                    }
+                    return Push::Dropped(DropReason::Fragment);
+                }
+                i
+            }
             None => {
+                if service_at >= ingress_at + self.limits.timeout {
+                    return Push::Dropped(DropReason::Fragment);
+                }
+                let Some(incarnation) = self
+                    .last_incarnation
+                    .checked_add(1)
+                    .and_then(NonZeroU64::new)
+                else {
+                    return Push::Dropped(DropReason::Capacity);
+                };
+                self.expire(service_at);
                 if self.limits.max_entries == 0 {
                     return Push::Dropped(DropReason::Capacity);
                 }
@@ -332,7 +535,10 @@ impl Reassembler {
                 }
                 self.entries.push(Entry {
                     key,
-                    created: now,
+                    source,
+                    created: ingress_at,
+                    latest_ingress: ingress_at,
+                    incarnation,
                     live: Some(Live {
                         data: Vec::new(),
                         ranges: Vec::new(),
@@ -343,14 +549,32 @@ impl Reassembler {
                     }),
                     charged: ENTRY_OVERHEAD,
                 });
+                self.last_incarnation = incarnation.get();
+                if let Some(receipt) = receipt.as_deref_mut() {
+                    *receipt = Some(FragmentInfo {
+                        identity: key.identity(),
+                        original_ingress: ingress_at,
+                        incarnation: Some(incarnation),
+                    });
+                }
                 self.entries.len() - 1
             }
         };
         if self.entries[idx].live.is_none() {
             return Push::Dropped(DropReason::Fragment);
         }
+        if self.entries[idx].source != source {
+            self.stats.invalid += 1;
+            self.kill(idx);
+            return Push::Dropped(DropReason::Fragment);
+        }
+        let fragment = FragmentInfo {
+            identity: self.entries[idx].key.identity(),
+            original_ingress: self.entries[idx].created,
+            incarnation: Some(self.entries[idx].incarnation),
+        };
         match self.store(idx, &f, end) {
-            Ok(None) => Push::Pending,
+            Ok(None) => Push::Pending(fragment),
             Ok(Some(done)) => done,
             Err(()) => Push::Dropped(DropReason::Fragment),
         }
@@ -459,7 +683,21 @@ impl Reassembler {
                 id: entry.key.id,
                 max_size: live.max_fragment_size,
             });
-            let result = self.finish(&live.head, &live.data, provenance, live.ecn & (1 << 3) != 0);
+            let result = self.finish(
+                &live.head,
+                &live.data,
+                provenance,
+                live.ecn & (1 << 3) != 0,
+                entry.source,
+                (
+                    FragmentInfo {
+                        identity: entry.key.identity(),
+                        original_ingress: entry.created,
+                        incarnation: Some(entry.incarnation),
+                    },
+                    entry.latest_ingress,
+                ),
+            );
             drop(live);
             self.shrink(charged);
             return Ok(Some(result));
@@ -473,6 +711,8 @@ impl Reassembler {
         data: &[u8],
         ipv6_fragment: Option<Ipv6Fragment>,
         ce: bool,
+        source: Option<SourceContext>,
+        (fragment, completion_ingress): (FragmentInfo, Instant),
     ) -> Push {
         let v6 = ipv6_fragment.is_some();
         let Some(len) = frag::reassembled_len(head.len(), v6, data.len()) else {
@@ -493,9 +733,12 @@ impl Reassembler {
         debug_assert_eq!(bytes.len(), len);
         self.stats.completed += 1;
         Push::Complete(Reassembled {
+            source,
             packet: OwnedPacket {
                 bytes,
                 ipv6_fragment,
+                fragment,
+                completion_ingress,
                 _reservation: reservation,
             },
         })
@@ -512,7 +755,13 @@ impl Reassembler {
 
     /// Silently evicts the oldest entry other than `keep`.
     fn evict_oldest(&mut self, keep: Option<Key>) {
-        let Some(i) = self.entries.iter().position(|e| Some(e.key) != keep) else {
+        let Some((i, _)) = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| Some(entry.key) != keep)
+            .min_by_key(|(_, entry)| entry.created)
+        else {
             return;
         };
         let entry = self.entries.remove(i);
@@ -540,10 +789,27 @@ impl Reassembler {
             .filter(|entry| entry.live.is_some())
             .map(|entry| (entry.key.src, entry.key.dst, entry.key.proto))
             .chain(self.expired.iter().filter_map(|quote| {
-                crate::icmp_out::quote_metadata(quote)
+                crate::icmp_out::quote_metadata(&quote.bytes)
                     .map(|quote| (quote.source, quote.destination, quote.protocol))
             }))
     }
+    }
+
+    pub(crate) fn retains_source_output_with_lineage(&self, lineage: NonZeroU64) -> bool {
+        self.expired
+            .iter()
+            .any(|quote| quote.source.is_some_and(|source| source.lineage == lineage))
+    }
+
+    pub(crate) fn visit_retained_source_contexts(&self, mut visit: impl FnMut(SourceContext)) {
+        for source in self
+            .entries
+            .iter()
+            .filter_map(|entry| entry.source)
+            .chain(self.expired.iter().filter_map(|quote| quote.source))
+        {
+            visit(source);
+        }
 
     /// Drops datagrams older than the timeout; those with fragment 0 queue an ICMP quote.
     pub(crate) fn expire(&mut self, now: Instant) {
@@ -576,7 +842,16 @@ impl Reassembler {
                 quote.extend_from_slice(&live.data[..l4]);
                 let quote = quote.into_boxed_slice().into_vec();
                 retained = quote.capacity();
-                self.expired.push_back(quote);
+                self.expired.push_back(ExpiredQuote {
+                    bytes: quote,
+                    source: entry.source,
+                    fragment: FragmentInfo {
+                        identity: entry.key.identity(),
+                        original_ingress: entry.created,
+                        incarnation: Some(entry.incarnation),
+                    },
+                    latest_ingress: entry.latest_ingress,
+                });
             }
             self.shrink(entry.charged - retained);
         }
@@ -585,38 +860,58 @@ impl Reassembler {
     /// Transfers a queued quote's existing charge; exporting it needs no extra budget headroom.
     pub(crate) fn take_expired(&mut self) -> Option<OwnedPacket> {
         let quote = self.expired.pop_front()?;
-        let charged = quote.capacity();
+        let charged = quote.bytes.capacity();
         let reservation = self
             .budget
             .as_ref()
             .map(|budget| MemoryReservation::from_charged(Arc::clone(budget), charged));
         self.bytes -= charged;
         Some(OwnedPacket {
-            bytes: quote.into_boxed_slice(),
+            bytes: quote.bytes.into_boxed_slice(),
             ipv6_fragment: None,
+            fragment: quote.fragment,
+            completion_ingress: quote.latest_ingress,
             _reservation: reservation,
         })
     }
 
     /// Emits queued Time Exceeded errors, one packet per call.
-    pub(crate) fn poll_icmp(&mut self, now: Instant, icmp: &mut IcmpOut, out: &mut [u8]) -> Output {
+    pub(crate) fn poll_icmp(
+        &mut self,
+        now: Instant,
+        icmp: &mut IcmpOut,
+        out: &mut [u8],
+        tx: &mut Transmit,
+    ) -> Output {
+        self.poll_icmp_with_fragment(now, icmp, out, tx).0
+    }
+
+    pub(crate) fn poll_icmp_with_fragment(
+        &mut self,
+        now: Instant,
+        icmp: &mut IcmpOut,
+        out: &mut [u8],
+        tx: &mut Transmit,
+    ) -> (Output, Option<FragmentInfo>) {
         while let Some(quote) = self.expired.front() {
-            let result = icmp.emit(now, Reject::TimeExceeded, quote, out);
+            let result = icmp.emit(now, Reject::TimeExceeded, &quote.bytes, out);
             if result == IcmpEmit::TooSmall {
-                return Output::Blocked;
+                return (Output::Blocked, None);
             }
             let quote = self.expired.pop_front().expect("front");
-            let charged = quote.capacity();
+            let charged = quote.bytes.capacity();
+            let source = quote.source;
+            let fragment = quote.fragment;
             drop(quote);
             self.shrink(charged);
             if let IcmpEmit::Sent(n) = result {
-                return Output::Sent(n);
+                tx.source = source;
+                return (Output::Sent(n), Some(fragment));
             }
         }
-        Output::None
+        (Output::None, None)
     }
 
-    #[cfg(test)]
     pub(crate) fn pending_icmp(&self) -> bool {
         !self.expired.is_empty()
     }
@@ -638,8 +933,40 @@ impl Reassembler {
         assert!(self.entries.len() <= self.limits.max_entries);
         assert!(self.bytes <= self.limits.max_bytes);
         assert!(self.expired.len() <= MAX_PENDING_ICMP);
-        let mut sum = self.expired.iter().map(Vec::capacity).sum::<usize>();
-        for e in &self.entries {
+        for (index, quote) in self.expired.iter().enumerate() {
+            assert!(quote.fragment.original_ingress <= quote.latest_ingress);
+            let incarnation = quote
+                .fragment
+                .incarnation
+                .expect("only retained entries time out");
+            assert!(incarnation.get() <= self.last_incarnation);
+            assert!(
+                self.entries
+                    .iter()
+                    .all(|entry| entry.incarnation != incarnation)
+            );
+            assert!(
+                self.expired
+                    .iter()
+                    .skip(index + 1)
+                    .all(|other| other.fragment.incarnation != Some(incarnation))
+            );
+        }
+        let mut sum = self
+            .expired
+            .iter()
+            .map(|quote| quote.bytes.capacity())
+            .sum::<usize>();
+        for (index, e) in self.entries.iter().enumerate() {
+            assert!(e.created <= e.latest_ingress);
+            assert!(e.incarnation.get() <= self.last_incarnation);
+            assert!(
+                self.entries
+                    .iter()
+                    .skip(index + 1)
+                    .all(|other| other.incarnation != e.incarnation)
+            );
+            assert_eq!(e.key.lineage, e.source.map(|source| source.lineage));
             let expect = e.live.as_ref().map_or(ENTRY_OVERHEAD, Live::charge);
             assert_eq!(e.charged, expect);
             sum += e.charged;
@@ -743,12 +1070,12 @@ mod tests {
     }
 
     fn pending(r: Push) {
-        assert!(matches!(r, Push::Pending), "{r:?}");
+        assert!(matches!(r, Push::Pending(_)), "{r:?}");
     }
 
     fn push(r: &mut Reassembler, now: Instant, packet: &[u8]) -> Push {
         match frag::parse(packet) {
-            Ok(fragment) => r.push(now, fragment),
+            Ok(fragment) => r.push(now, fragment, None),
             Err(e) => Push::Dropped(e.into()),
         }
     }
@@ -869,7 +1196,7 @@ mod tests {
             r.expire(late);
             assert!(!r.pending_icmp(), "no fragment 0, no Time Exceeded");
             assert!(matches!(
-                r.poll_icmp(late, &mut icmp, &mut out),
+                r.poll_icmp(late, &mut icmp, &mut out, &mut Transmit::plain(0)),
                 Output::None
             ));
             r.assert_idle();
@@ -879,7 +1206,8 @@ mod tests {
             pending(push(&mut r, t, &f[0]));
             pending(push(&mut r, t, &f[2]));
             r.expire(late);
-            let Output::Sent(n) = r.poll_icmp(late, &mut icmp, &mut out) else {
+            let Output::Sent(n) = r.poll_icmp(late, &mut icmp, &mut out, &mut Transmit::plain(0))
+            else {
                 panic!("no Time Exceeded")
             };
             let ip = wire::parse_ip(&out[..n]).unwrap();
@@ -891,7 +1219,7 @@ mod tests {
             let quote = if src.is_ipv4() { 20 + 8 } else { 40 + 8 + 8 };
             assert_eq!(&msg[8..], &f[0][..quote]);
             assert!(matches!(
-                r.poll_icmp(late, &mut icmp, &mut out),
+                r.poll_icmp(late, &mut icmp, &mut out, &mut Transmit::plain(0)),
                 Output::None
             ));
             r.assert_idle();

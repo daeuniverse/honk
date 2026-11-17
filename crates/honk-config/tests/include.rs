@@ -183,10 +183,12 @@ fn marked_fallback_follows_all_included_rules_and_last_fallback_wins() {
         "include { child.dae }\nrouting {\n fallback: direct(mark: 0x100, must)\n dport(80) -> block\n}",
     );
     for (child_fallback, expected_mark, expected_must) in [
-        ("", 0x100, true),
-        ("fallback: direct(mark: 512)", 512, false),
-        ("default: direct(must, mark: 0x300)", 0x300, true),
-        ("fallback: direct", 0, false),
+        ("", Some(0x100), true),
+        ("fallback: direct(mark: 512)", Some(512), false),
+        ("default: direct(must, mark: 0x300)", Some(0x300), true),
+        ("fallback: direct(mark: 0)", Some(0), false),
+        ("fallback: direct(mark: 0xffffffff)", Some(u32::MAX), false),
+        ("fallback: direct", None, false),
     ] {
         write(
             &root.join("child.dae"),

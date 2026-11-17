@@ -940,6 +940,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         None
     };
     let packet_admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let pname_support = Arc::new(parking_lot::RwLock::new(ebpf::PnameSupport::Unavailable));
 
     // Console, optional file, and Clash API output use independent layers.
     // With no `/logs` subscription, the API layer contributes no callsite interest.
@@ -1148,9 +1149,10 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
             {
                 _dae0_guard = None;
             }
-            Box::new(ebpf::userspace::UserspaceBackend::new(Arc::clone(
-                &packet_admission,
-            )))
+            Box::new(ebpf::userspace::UserspaceBackend::new(
+                Arc::clone(&packet_admission),
+                Arc::clone(&pname_support),
+            ))
         }
         Backend::Tc if cli.mock_ebpf => {
             #[cfg(feature = "ebpf")]
@@ -1281,7 +1283,9 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         routing::Router::from_config_sharing(&config.routing, &geo_sources, &mut shared)?;
     router.bind_firewall(&config, None, &geo_sources, &mut shared)?;
     info!("Router ready with {} compiled routes", router.route_count());
-    ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
+    if backend == Backend::Tc {
+        ebpf::record_pname_routing(&router, ebpf_backend.as_ref(), &degradations);
+    }
 
     let proxy_registry = std::sync::Arc::new(proxy::ProxyRegistry::default_resolver()?);
     info!(
@@ -1699,7 +1703,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Backend::Xdp => {
             #[cfg(target_os = "linux")]
             {
-                xdp::run(control_plane, &cli.bpf_pin_root, packet_admission).await
+                xdp::run(
+                    control_plane,
+                    &cli.bpf_pin_root,
+                    packet_admission,
+                    pname_support,
+                )
+                .await
             }
             #[cfg(not(target_os = "linux"))]
             unreachable!("XDP admission requires Linux")
@@ -1707,7 +1717,13 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
         Backend::Tun => {
             #[cfg(target_os = "linux")]
             {
-                tun::run(control_plane, packet_admission).await
+                tun::run(
+                    control_plane,
+                    &cli.bpf_pin_root,
+                    packet_admission,
+                    pname_support,
+                )
+                .await
             }
             #[cfg(not(target_os = "linux"))]
             unreachable!("TUN admission requires Linux")

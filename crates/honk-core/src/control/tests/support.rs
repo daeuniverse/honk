@@ -217,6 +217,7 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for UdpTestReplySocketF
         &self,
         scope: honk_datapath::ScopeId,
         _original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
     ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
         if scope != honk_datapath::ScopeId::HOST {
             return Err(std::io::Error::new(
@@ -240,6 +241,7 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for KernelUdpReplySocke
         &self,
         scope: honk_datapath::ScopeId,
         original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
     ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
         if scope != honk_datapath::ScopeId::HOST {
             return Err(std::io::Error::new(
@@ -274,6 +276,7 @@ impl crate::control::udp_endpoint::UdpReplySocketFactory for FailingUdpTestReply
         &self,
         scope: honk_datapath::ScopeId,
         _original_dst: SocketAddr,
+        _packet_source: Option<&crate::control::netstack::SourceWork>,
     ) -> std::io::Result<crate::control::udp_endpoint::ReplySocketFd> {
         if scope != honk_datapath::ScopeId::HOST {
             return Err(std::io::Error::new(
@@ -707,7 +710,7 @@ pub(in crate::control) fn changed_routing_config() -> Config {
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
     config
 }
@@ -738,7 +741,7 @@ pub(in crate::control) fn score_reload_config(revision: u64) -> Config {
             outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
     config.nodes = nodes.to_vec();
     config.groups = vec![Group {

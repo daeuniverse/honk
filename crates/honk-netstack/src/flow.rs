@@ -5,7 +5,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use crate::tcp::{TIME_WAIT, Tcb};
-use crate::{FlowId, Ready};
+use crate::{ConstructionError, FlowId, MemoryBudget, MemoryReservation, Ready, SourceContext};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct FourTuple {
@@ -33,6 +33,11 @@ pub struct Slot {
     pub dirty: bool,
 }
 
+struct SourceSlots {
+    cells: Box<[Option<SourceContext>]>,
+    _memory: MemoryReservation,
+}
+
 pub struct Table {
     pub slots: Vec<Slot>,
     pub tcp: HashMap<FourTuple, u32>,
@@ -42,6 +47,7 @@ pub struct Table {
     pub active: u32,
     pub tcp_active: u32,
     max_slots: Option<usize>,
+    sources: Option<SourceSlots>,
 }
 
 impl Table {
@@ -55,6 +61,7 @@ impl Table {
             active: 0,
             tcp_active: 0,
             max_slots: None,
+            sources: None,
         }
     }
 
@@ -62,6 +69,65 @@ impl Table {
         Self {
             max_slots: Some(max_slots),
             ..Self::new()
+        }
+    }
+
+    pub(crate) fn prepare_sources(
+        &mut self,
+        fallback_limit: usize,
+        budget: &std::sync::Arc<MemoryBudget>,
+    ) -> Result<(), ConstructionError> {
+        if self.sources.is_some() {
+            return Ok(());
+        }
+        if !self.slots.is_empty() {
+            return Err(ConstructionError::InUse);
+        }
+        let limit = self.max_slots.unwrap_or(fallback_limit);
+        u32::try_from(limit).map_err(|_| ConstructionError::Overflow)?;
+        let bytes = limit
+            .checked_mul(std::mem::size_of::<Option<SourceContext>>())
+            .and_then(|bytes| bytes.checked_mul(2))
+            .filter(|bytes| *bytes <= isize::MAX as usize)
+            .ok_or(ConstructionError::Overflow)?;
+        let memory = budget.reserve(bytes).ok_or(ConstructionError::Capacity)?;
+        let mut cells = Vec::new();
+        cells
+            .try_reserve_exact(limit)
+            .map_err(|_| ConstructionError::Capacity)?;
+        cells.resize(limit, None);
+        self.sources = Some(SourceSlots {
+            cells: cells.into_boxed_slice(),
+            _memory: memory,
+        });
+        self.max_slots = Some(limit);
+        Ok(())
+    }
+
+    pub(crate) fn has_sources(&self) -> bool {
+        self.sources.is_some()
+    }
+
+    pub(crate) fn source_reserved(&self) -> usize {
+        self.sources
+            .as_ref()
+            .map_or(0, |sources| sources._memory.bytes())
+    }
+
+    pub(crate) fn source(&self, index: u32) -> Option<SourceContext> {
+        self.sources
+            .as_ref()?
+            .cells
+            .get(index as usize)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) fn set_source(&mut self, index: u32, source: Option<SourceContext>) {
+        if let Some(sources) = &mut self.sources {
+            sources.cells[index as usize] = source;
+        } else {
+            assert!(source.is_none(), "contextual flow storage must be prepared");
         }
     }
 
@@ -153,6 +219,9 @@ impl Table {
     pub fn remove(&mut self, idx: u32) -> Option<Flow> {
         let slot = &mut self.slots[idx as usize];
         let flow = slot.flow.take()?;
+        if let Some(sources) = &mut self.sources {
+            sources.cells[idx as usize] = None;
+        }
         match &flow {
             Flow::Tcp(t) => {
                 self.tcp.remove(&t.tuple);
@@ -206,6 +275,7 @@ impl Table {
         assert!(self.max_slots.is_none_or(|max| self.slots.len() <= max));
         let (mut tcp, mut udp, mut timewait, mut exhausted) = (0, 0, 0, 0);
         for (i, slot) in self.slots.iter().enumerate() {
+            assert!(slot.flow.is_some() || self.source(i as u32).is_none());
             let i = i as u32;
             match &slot.flow {
                 Some(Flow::Tcp(t)) => {

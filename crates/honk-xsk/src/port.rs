@@ -1,12 +1,15 @@
 //! One AF_XDP socket and ledger owner. CQ returns retained outputs, not delivery receipts.
 //!
-//! UMEM and its reservation survive in-process close/drop. Occupied TX sidecars also survive
-//! drop: socket close is not an observed deferred-DMA-release fence (B-UMEM-RELEASE).
+//! UMEM and its reservation survive in-process close/drop. Occupied RX slots and TX sidecars
+//! also survive drop: socket close is not a completion or deferred-DMA-release fence.
 
 use std::alloc::Layout;
+use std::cell::Cell;
 use std::io;
+use std::mem::ManuallyDrop;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use honk_datapath::buffer::{
     DrainState, FrameConfig, FrameLease, FrameLedger, LedgerError, OutstandingTx, TxClass,
@@ -21,6 +24,181 @@ use ring::{Descriptor, Rings, Umem};
 pub const FRAME_SIZE: usize = 4096;
 pub const MAX_SEGMENTS: usize = 18;
 pub const METADATA_SIZE: usize = 32;
+
+pub(crate) fn rx_frame_capacity(metadata_len: usize) -> io::Result<usize> {
+    if !matches!(metadata_len, 0 | 32 | 64 | 128) {
+        return Err(invalid_config(
+            "RX metadata length must be 0, 32, 64, or 128",
+        ));
+    }
+    Ok(FRAME_SIZE - 256 - metadata_len)
+}
+
+static NEXT_PORT: AtomicU64 = AtomicU64::new(1);
+const NO_RX_SLOT: usize = usize::MAX;
+const RETAINED_RX_SLOT_BYTES: usize = 1024;
+
+/// Packet identity only; copies never release or expose frame storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedRxHandle {
+    port: u64,
+    port_generation: u64,
+    slot: u64,
+    generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RetainedRxIdentity {
+    pub port: u64,
+    pub port_generation: u64,
+    pub slot: u64,
+    pub slot_generation: u64,
+}
+
+impl RetainedRxHandle {
+    pub fn receipt_identity(&self) -> RetainedRxIdentity {
+        RetainedRxIdentity {
+            port: self.port,
+            port_generation: self.port_generation,
+            slot: self.slot,
+            slot_generation: self.generation,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxDisposition {
+    Release,
+    Retain,
+}
+
+/// Released frame custody with the packet generation still pinned in its original slot.
+#[derive(Debug)]
+#[must_use = "acknowledge this exact completion through complete_retained_rx"]
+pub struct RxCompletion {
+    handle: RetainedRxHandle,
+}
+
+impl RxCompletion {
+    pub fn handle(&self) -> RetainedRxHandle {
+        self.handle
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RxPhase {
+    Free,
+    Held,
+    CompletionPending,
+}
+
+struct RetainedRxSlot {
+    leases: [Option<FrameLease>; MAX_SEGMENTS],
+    lengths: [u32; MAX_SEGMENTS],
+    count: usize,
+    metadata_len: usize,
+    length: usize,
+    generation: u64,
+    next_free: usize,
+    phase: RxPhase,
+}
+
+const _: () = {
+    assert!(size_of::<RetainedRxHandle>() <= 32);
+    assert!(size_of::<RxCompletion>() <= 32);
+    assert!(size_of::<RetainedRxSlot>() <= RETAINED_RX_SLOT_BYTES);
+    assert!(align_of::<RetainedRxSlot>() <= align_of::<u64>());
+};
+
+struct RetainedRxSlots {
+    slots: Box<[RetainedRxSlot]>,
+    free: usize,
+    port: u64,
+    port_generation: u64,
+    held: usize,
+    completions: usize,
+    reservation: Option<MemoryReservation>,
+}
+
+impl RetainedRxSlots {
+    fn layout(config: PortConfig) -> io::Result<(usize, usize)> {
+        let count = config.rx_frames.min(config.ring_size as usize);
+        let layout = Layout::array::<RetainedRxSlot>(count)
+            .map_err(|_| invalid_config("retained RX array extent overflow"))?;
+        let bytes = count
+            .checked_mul(RETAINED_RX_SLOT_BYTES)
+            .filter(|&bytes| bytes <= isize::MAX as usize)
+            .ok_or_else(|| invalid_config("retained RX reservation overflow"))?;
+        if count == 0 || layout.size() > bytes || layout.align() > align_of::<u64>() {
+            return Err(invalid_config("invalid retained RX layout"));
+        }
+        Ok((count, bytes))
+    }
+
+    fn new(config: PortConfig, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let (count, bytes) = Self::layout(config)?;
+        // Runtime separately funds R * 192 before opening any Port; this funds the other R * 1024.
+        let reservation = reserve(budget, bytes)?;
+        let port = NEXT_PORT
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| invalid_config("Port identity exhausted"))?;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(count).map_err(|_| {
+            io::Error::new(io::ErrorKind::OutOfMemory, "retained RX allocation failed")
+        })?;
+        for index in 0..count {
+            slots.push(RetainedRxSlot {
+                leases: [None; MAX_SEGMENTS],
+                lengths: [0; MAX_SEGMENTS],
+                count: 0,
+                metadata_len: 0,
+                length: 0,
+                generation: 0,
+                next_free: if index + 1 == count {
+                    NO_RX_SLOT
+                } else {
+                    index + 1
+                },
+                phase: RxPhase::Free,
+            });
+        }
+        Ok(Self {
+            slots: slots.into_boxed_slice(),
+            free: 0,
+            port,
+            port_generation: 1,
+            held: 0,
+            completions: 0,
+            reservation: Some(reservation),
+        })
+    }
+
+    fn check(&self, handle: RetainedRxHandle, phase: RxPhase) -> io::Result<usize> {
+        let index = usize::try_from(handle.slot).ok();
+        if handle.port != self.port
+            || handle.port_generation != self.port_generation
+            || index
+                .and_then(|index| self.slots.get(index))
+                .is_none_or(|slot| slot.generation != handle.generation || slot.phase != phase)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "foreign or stale retained RX handle",
+            ));
+        }
+        Ok(index.expect("checked retained RX index"))
+    }
+}
+
+impl Drop for RetainedRxSlots {
+    fn drop(&mut self) {
+        if self.held != 0 || self.completions != 0 {
+            // Dropping tokens or closing the socket is not a custody/completion acknowledgment.
+            std::mem::forget(std::mem::replace(&mut self.slots, Box::new([])));
+            std::mem::forget(self.reservation.take());
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BindMode {
@@ -77,6 +255,7 @@ impl PortConfig {
         }
         self.umem_bytes()?;
         FrameLedger::<u32>::metadata_bytes(self.frame_config()).map_err(io::Error::other)?;
+        RetainedRxSlots::layout(self)?;
         Ok(())
     }
 
@@ -154,7 +333,7 @@ fn invalid_config(message: &'static str) -> io::Error {
 fn reserve(budget: &Arc<MemoryBudget>, bytes: usize) -> io::Result<MemoryReservation> {
     budget
         .reserve(bytes)
-        .ok_or_else(|| io::Error::other("AF_XDP memory budget exhausted"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "AF_XDP memory budget exhausted"))
 }
 
 fn class_index(class: TxClass) -> usize {
@@ -221,9 +400,11 @@ pub struct Port<L> {
     zerocopy: bool,
     mtu: u32,
     scatter_gather: bool,
+    metadata_len: usize,
     umem: Umem,
     rings: Rings,
-    ledger: FrameLedger<u32>,
+    ledger: ManuallyDrop<FrameLedger<u32>>,
+    retained_rx: RetainedRxSlots,
     sidecar: Sidecar<L>,
     rx_consumer: u32,
     tx_producer: u32,
@@ -231,10 +412,10 @@ pub struct Port<L> {
     fill_consumer: u32,
     cq_consumer: u32,
     tx_free: [usize; 2],
-    closed: bool,
+    closed: Cell<bool>,
     tx_batch_active: bool,
     counters: PortCounters,
-    _bookkeeping: MemoryReservation,
+    _bookkeeping: Option<MemoryReservation>,
 }
 
 struct TxReservation<'a, L> {
@@ -274,6 +455,39 @@ impl<L> Drop for TxBatchGuard<'_, L> {
     }
 }
 
+struct RxCallbackGuard<'a, L> {
+    port: &'a mut Port<L>,
+}
+
+impl<L> Drop for RxCallbackGuard<'_, L> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.port.close();
+        }
+    }
+}
+
+struct RxBorrowGuard<'a>(&'a Cell<bool>);
+
+impl Drop for RxBorrowGuard<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.set(true);
+        }
+    }
+}
+
+impl<L> Drop for Port<L> {
+    fn drop(&mut self) {
+        if self.retained_rx.held == 0 && self.retained_rx.completions == 0 {
+            // SAFETY: this is the sole ledger owner, and no retained RX slot references it.
+            unsafe { ManuallyDrop::drop(&mut self.ledger) };
+        } else {
+            std::mem::forget(self._bookkeeping.take());
+        }
+    }
+}
+
 impl<L> Port<L> {
     pub fn open(
         ifindex: u32,
@@ -282,9 +496,22 @@ impl<L> Port<L> {
         config: PortConfig,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<Self> {
-        Self::open_device(ifindex, queue, mode, config, 1500, false, budget)
+        Self::open_device(
+            ifindex,
+            queue,
+            mode,
+            config,
+            1500,
+            false,
+            METADATA_SIZE,
+            budget,
+        )
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "device-negotiated metadata is not a configurable buffer capacity"
+    )]
     pub fn open_device(
         ifindex: u32,
         queue: u32,
@@ -292,33 +519,55 @@ impl<L> Port<L> {
         config: PortConfig,
         mtu: u32,
         scatter_gather: bool,
+        metadata_len: usize,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<Self> {
-        if !(68..=65535).contains(&mtu)
-            || (mtu as usize + 22 > FRAME_SIZE - 256 - METADATA_SIZE && !scatter_gather)
-        {
+        let capacity = rx_frame_capacity(metadata_len)?;
+        let required = (mtu as usize + 22).div_ceil(capacity);
+        if !(68..=65535).contains(&mtu) || (required > 1 && !scatter_gather) {
             return Err(invalid_config("MTU requires negotiated scatter/gather"));
         }
         config.validate()?;
+        if required > MAX_SEGMENTS
+            || config.rx_frames < required
+            || config.control_frames < required
+            || config.bulk_frames < required
+            || (config.ring_size as usize) < required
+        {
+            return Err(invalid_config(
+                "whole-packet commitments cannot cover device MTU",
+            ));
+        }
         if ifindex == 0 {
             return Err(invalid_config("AF_XDP requires a nonzero ifindex"));
         }
         crate::device::validate_queue(ifindex, queue)?;
         let bookkeeping = reserve(budget, size_of::<Self>() - size_of::<FrameLedger<u32>>())?;
+        let retained_rx = RetainedRxSlots::new(config, budget)?;
         let ledger = FrameLedger::new(config.frame_config(), budget).map_err(io::Error::other)?;
         let sidecar = Sidecar::new(config, budget)?;
         let umem = Umem::map(config.umem_bytes()?, budget)?;
-        let (socket, rings, zerocopy) =
-            ring::open(ifindex, queue, mode, config, scatter_gather, &umem, budget)?;
+        let (socket, rings, zerocopy) = ring::open(
+            ifindex,
+            queue,
+            mode,
+            config,
+            scatter_gather,
+            metadata_len,
+            &umem,
+            budget,
+        )?;
         Ok(Self {
             socket: Some(socket),
             config,
             zerocopy,
             mtu,
             scatter_gather,
+            metadata_len,
             umem,
             rings,
-            ledger,
+            ledger: ManuallyDrop::new(ledger),
+            retained_rx,
             sidecar,
             rx_consumer: 0,
             tx_producer: 0,
@@ -326,35 +575,64 @@ impl<L> Port<L> {
             fill_consumer: 0,
             cq_consumer: 0,
             tx_free: [config.control_frames, config.bulk_frames],
-            closed: false,
+            closed: Cell::new(false),
             tx_batch_active: false,
             counters: PortCounters::default(),
-            _bookkeeping: bookkeeping,
+            _bookkeeping: Some(bookkeeping),
         })
     }
 
-    /// Borrow a packet and, when required by the selected capture mode, its producer metadata.
+    /// Borrow a packet with exactly 0, 32, 64, or 128 bytes of selected producer metadata.
     /// `Ok(0)` may leave RX queued pending FILL consumer publication; callers must retry later.
     pub fn receive_segments(
         &mut self,
         batch: usize,
-        require_metadata: bool,
+        metadata_len: usize,
         mut f: impl FnMut(&[&[u8]], &[u8]),
     ) -> io::Result<usize> {
-        self.receive_segments_with(batch, require_metadata, |segments, metadata, _| {
+        self.receive_segments_with(batch, metadata_len, |segments, metadata, _| {
             f(segments, metadata)
         })
     }
 
     /// The restricted sink permits same-port forwarding without releasing borrowed RX frames.
     /// `Ok(0)` may leave RX queued pending FILL consumer publication; callers must retry later.
-    /// A wire-only capture must select false up front; missing metadata is never a fallback.
+    /// Zero exports no metadata; a nonzero length must match the admitted UMEM headroom.
     pub fn receive_segments_with(
         &mut self,
         batch: usize,
-        require_metadata: bool,
+        metadata_len: usize,
         mut f: impl FnMut(&[&[u8]], &[u8], &mut TxSink<'_, L>),
     ) -> io::Result<usize> {
+        self.receive_segments_owned(batch, metadata_len, |_, segments, metadata, tx| {
+            f(segments, metadata, tx);
+            RxDisposition::Release
+        })
+    }
+
+    /// Install whole-chain custody before calling the synchronous packet consumer.
+    pub fn receive_segments_owned(
+        &mut self,
+        batch: usize,
+        metadata_len: usize,
+        f: impl FnMut(RetainedRxHandle, &[&[u8]], &[u8], &mut TxSink<'_, L>) -> RxDisposition,
+    ) -> io::Result<usize> {
+        self.receive_segments_inner(batch, metadata_len, self.scatter_gather, f)
+    }
+
+    fn receive_segments_inner(
+        &mut self,
+        batch: usize,
+        metadata_len: usize,
+        scatter_gather: bool,
+        mut f: impl FnMut(RetainedRxHandle, &[&[u8]], &[u8], &mut TxSink<'_, L>) -> RxDisposition,
+    ) -> io::Result<usize> {
+        rx_frame_capacity(metadata_len)?;
+        if metadata_len != 0 && metadata_len != self.metadata_len {
+            return Err(invalid_config(
+                "RX metadata length differs from admitted headroom",
+            ));
+        }
         self.observe_fill()?;
         let available = ring::distance(
             self.rings.rx.producer(),
@@ -376,9 +654,9 @@ impl<L> Port<L> {
             let mut ready = true;
             loop {
                 if consumed + count as u32 == available {
-                    if available == self.config.ring_size {
+                    if count as u32 == self.config.ring_size {
                         return Err(
-                            self.invalid(io::Error::other("unterminated RX chain fills ring"))
+                            self.rx_invalid(io::Error::other("unterminated RX chain fills ring"))
                         );
                     }
                     self.rings.rx.publish_consumer(self.rx_consumer);
@@ -386,7 +664,7 @@ impl<L> Port<L> {
                     return Ok(packets);
                 }
                 if count == MAX_SEGMENTS {
-                    return Err(self.invalid(io::Error::other("RX chain exceeds segment limit")));
+                    return Err(self.rx_invalid(io::Error::other("RX chain exceeds segment limit")));
                 }
                 let descriptor = self
                     .rings
@@ -394,30 +672,27 @@ impl<L> Port<L> {
                     .read(self.rx_consumer.wrapping_add(count as u32));
                 if descriptor.len == 0
                     || descriptor.options & !1 != 0
-                    || (descriptor.options != 0 && !self.scatter_gather)
+                    || (descriptor.options != 0 && !scatter_gather)
                 {
-                    return Err(self.invalid(io::Error::other("invalid RX chain descriptor")));
+                    return Err(self.rx_invalid(io::Error::other("invalid RX chain descriptor")));
                 }
                 length += descriptor.len as usize;
                 if length > self.mtu as usize + 22 {
-                    return Err(self.invalid(io::Error::other("RX chain exceeds device MTU")));
+                    return Err(self.rx_invalid(io::Error::other("RX chain exceeds device MTU")));
                 }
                 if descriptors[..count].iter().any(|previous| {
                     previous.addr / FRAME_SIZE as u64 == descriptor.addr / FRAME_SIZE as u64
                 }) {
-                    return Err(self.invalid(io::Error::other("duplicate RX frame in chain")));
+                    return Err(self.rx_invalid(io::Error::other("duplicate RX frame in chain")));
                 }
                 // xsk_flush publishes RX before the corresponding FILL consumer advance.
                 ready &= self
                     .ledger
                     .rx_ready(descriptor.addr, descriptor.len as usize)
                     .map_err(io::Error::other)
-                    .map_err(|error| self.invalid(error))?;
-                if require_metadata
-                    && count == 0
-                    && descriptor.addr % (FRAME_SIZE as u64) < METADATA_SIZE as u64
-                {
-                    return Err(self.invalid(io::Error::other("RX metadata headroom missing")));
+                    .map_err(|error| self.rx_invalid(error))?;
+                if count == 0 && descriptor.addr % (FRAME_SIZE as u64) < metadata_len as u64 {
+                    return Err(self.rx_invalid(io::Error::other("RX metadata headroom missing")));
                 }
                 descriptors[count] = descriptor;
                 count += 1;
@@ -426,61 +701,188 @@ impl<L> Port<L> {
                 }
             }
             let first = descriptors[0].addr;
-            let metadata_ptr = if require_metadata {
+            let metadata_ptr = if metadata_len != 0 {
                 Some(
                     self.umem
-                        .frame_pointer(first - METADATA_SIZE as u64, METADATA_SIZE)
-                        .map_err(|error| self.invalid(error))?,
+                        .frame_pointer(first - metadata_len as u64, metadata_len)
+                        .map_err(|error| self.rx_invalid(error))?,
                 )
             } else {
                 None
             };
-            if !ready {
+            let mut pointers = [std::ptr::null_mut(); MAX_SEGMENTS];
+            for (index, descriptor) in descriptors[..count].iter().enumerate() {
+                pointers[index] = self
+                    .umem
+                    .frame_pointer(descriptor.addr, descriptor.len as usize)
+                    .map_err(|error| self.rx_invalid(error))?;
+            }
+            if !ready || self.ledger.rx_credit() < count || self.retained_rx.free == NO_RX_SLOT {
                 break;
             }
-            let result = (|| {
-                let mut leases = [None; MAX_SEGMENTS];
-                for (index, descriptor) in descriptors[..count].iter().enumerate() {
-                    leases[index] = Some(
-                        self.ledger
-                            .receive_rx(descriptor.addr, descriptor.len as usize)
-                            .map_err(io::Error::other)?,
-                    );
-                }
-                // SAFETY: every RX chunk is ledger-leased until this callback returns. TxSink
-                // can write only the disjoint TX partition and cannot receive/refill/release RX.
-                let metadata = match metadata_ptr {
-                    Some(pointer) => unsafe { std::slice::from_raw_parts(pointer, METADATA_SIZE) },
-                    None => &[],
-                };
-                let mut segments: [&[u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
-                for (index, descriptor) in descriptors[..count].iter().enumerate() {
-                    let pointer = self
-                        .umem
-                        .frame_pointer(descriptor.addr, descriptor.len as usize)?;
-                    // SAFETY: the complete RX chain was acquired above, disjoint from TX storage.
-                    segments[index] =
-                        unsafe { std::slice::from_raw_parts(pointer, descriptor.len as usize) };
-                }
-                f(&segments[..count], metadata, &mut TxSink { port: self });
-                for lease in leases[..count].iter_mut() {
-                    self.ledger
-                        .relinquish_rx(lease.take().expect("acquired chain"))
-                        .map_err(io::Error::other)?;
-                }
-                Ok(())
-            })();
-            if let Err(error) = result {
-                return Err(self.invalid(error));
+            let index = self.retained_rx.free;
+            let slot = &mut self.retained_rx.slots[index];
+            let Some(generation) = slot.generation.checked_add(1) else {
+                return Err(self.rx_invalid(io::Error::other("retained RX generation exhausted")));
+            };
+            self.retained_rx.free = slot.next_free;
+            slot.generation = generation;
+            slot.phase = RxPhase::Held;
+            slot.count = count;
+            slot.metadata_len = metadata_len;
+            slot.length = length;
+            self.retained_rx.held += 1;
+            let handle = RetainedRxHandle {
+                port: self.retained_rx.port,
+                port_generation: self.retained_rx.port_generation,
+                slot: index as u64,
+                generation,
+            };
+            for (part, descriptor) in descriptors[..count].iter().enumerate() {
+                let lease = self
+                    .ledger
+                    .receive_rx(descriptor.addr, descriptor.len as usize)
+                    .map_err(io::Error::other)
+                    .map_err(|error| self.rx_invalid(error))?;
+                self.retained_rx.slots[index].leases[part] = Some(lease);
+                self.retained_rx.slots[index].lengths[part] = descriptor.len;
             }
             self.rx_consumer = self.rx_consumer.wrapping_add(count as u32);
             consumed += count as u32;
             self.counters.rx += 1;
             packets += 1;
+            self.rings.rx.publish_consumer(self.rx_consumer);
+            // SAFETY: all extents were checked before any lease, and the installed slot owns
+            // every RX frame through the callback, including unwind. TX is disjoint.
+            let metadata = metadata_ptr.map_or(&[][..], |pointer| unsafe {
+                std::slice::from_raw_parts(pointer, metadata_len)
+            });
+            let mut segments: [&[u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
+            for part in 0..count {
+                // SAFETY: the complete RX chain remains leased by this slot.
+                segments[part] = unsafe {
+                    std::slice::from_raw_parts(pointers[part], descriptors[part].len as usize)
+                };
+            }
+            let disposition = {
+                let guard = RxCallbackGuard { port: self };
+                f(
+                    handle,
+                    &segments[..count],
+                    metadata,
+                    &mut TxSink { port: guard.port },
+                )
+            };
+            if disposition == RxDisposition::Release {
+                let completion = self.release_retained_rx(handle)?;
+                self.complete_retained_rx(completion)?;
+            }
         }
         self.rings.rx.publish_consumer(self.rx_consumer);
         self.refill()?;
         Ok(packets)
+    }
+
+    /// The callback and its result cannot carry a borrow of the retained packet.
+    pub fn with_retained_rx<R>(
+        &self,
+        handle: RetainedRxHandle,
+        f: impl FnOnce(&[&[u8]], &[u8]) -> R,
+    ) -> io::Result<R> {
+        let index = self
+            .retained_rx
+            .check(handle, RxPhase::Held)
+            .map_err(|error| self.retained_rx_invalid(error))?;
+        let slot = &self.retained_rx.slots[index];
+        if slot.count == 0
+            || slot.count > MAX_SEGMENTS
+            || slot.lengths[..slot.count]
+                .iter()
+                .map(|&length| length as usize)
+                .sum::<usize>()
+                != slot.length
+        {
+            return Err(self.retained_rx_invalid(io::Error::other("invalid retained RX extent")));
+        }
+        let mut segments: [&[u8]; MAX_SEGMENTS] = [&[]; MAX_SEGMENTS];
+        for (part, segment) in segments[..slot.count].iter_mut().enumerate() {
+            let lease = slot.leases[part].ok_or_else(|| {
+                self.retained_rx_invalid(io::Error::other("incomplete retained RX custody"))
+            })?;
+            *segment = self
+                .umem
+                .frame(lease.address(), slot.lengths[part] as usize)
+                .map_err(|error| self.retained_rx_invalid(error))?;
+        }
+        let metadata = if slot.metadata_len == 0 {
+            &[][..]
+        } else {
+            let first = slot.leases[0]
+                .expect("checked complete retained chain")
+                .address();
+            let address = first.checked_sub(slot.metadata_len as u64).ok_or_else(|| {
+                self.retained_rx_invalid(io::Error::other("invalid retained metadata extent"))
+            })?;
+            self.umem
+                .frame(address, slot.metadata_len)
+                .map_err(|error| self.retained_rx_invalid(error))?
+        };
+        let _guard = RxBorrowGuard(&self.closed);
+        Ok(f(&segments[..slot.count], metadata))
+    }
+
+    /// Release the frame chain while pinning its identity until exact completion acknowledgment.
+    pub fn release_retained_rx(&mut self, handle: RetainedRxHandle) -> io::Result<RxCompletion> {
+        let index = self
+            .retained_rx
+            .check(handle, RxPhase::Held)
+            .map_err(|error| self.rx_invalid(error))?;
+        for part in 0..self.retained_rx.slots[index].count {
+            let lease = self.retained_rx.slots[index].leases[part].ok_or_else(|| {
+                self.rx_invalid(io::Error::other("incomplete retained RX custody"))
+            })?;
+            self.ledger
+                .relinquish_rx(lease)
+                .map_err(io::Error::other)
+                .map_err(|error| self.rx_invalid(error))?;
+            self.retained_rx.slots[index].leases[part] = None;
+        }
+        self.retained_rx.slots[index].phase = RxPhase::CompletionPending;
+        self.retained_rx.held -= 1;
+        self.retained_rx.completions += 1;
+        self.refill()?;
+        Ok(RxCompletion { handle })
+    }
+
+    pub fn complete_retained_rx(&mut self, completion: RxCompletion) -> io::Result<()> {
+        let index = self
+            .retained_rx
+            .check(completion.handle, RxPhase::CompletionPending)
+            .map_err(|error| self.rx_invalid(error))?;
+        let slot = &mut self.retained_rx.slots[index];
+        slot.phase = RxPhase::Free;
+        slot.count = 0;
+        slot.next_free = self.retained_rx.free;
+        self.retained_rx.free = index;
+        self.retained_rx.completions -= 1;
+        Ok(())
+    }
+
+    pub fn retained_rx_count(&self) -> usize {
+        self.retained_rx.held
+    }
+
+    pub fn rx_completion_count(&self) -> usize {
+        self.retained_rx.completions
+    }
+
+    fn retained_rx_invalid(&self, error: io::Error) -> io::Error {
+        self.closed.set(true);
+        io::Error::new(io::ErrorKind::InvalidData, error)
+    }
+
+    fn rx_invalid(&mut self, error: io::Error) -> io::Error {
+        self.invalid(io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     /// Defer per-packet wakeups only until this synchronous operation returns.
@@ -699,7 +1101,7 @@ impl<L> Port<L> {
 
     pub fn refill(&mut self) -> io::Result<usize> {
         self.observe_fill()?;
-        if self.closed {
+        if self.closed.get() {
             return Ok(0);
         }
         let used = ring::distance(
@@ -738,58 +1140,10 @@ impl<L> Port<L> {
     /// Borrow single-buffer packets, recycling their frames after the callback returns.
     /// `Ok(0)` may leave RX queued pending FILL consumer publication; callers must retry later.
     pub fn receive(&mut self, batch: usize, mut f: impl FnMut(&[u8])) -> io::Result<usize> {
-        self.observe_fill()?;
-        let producer = self.rings.rx.producer();
-        let available = ring::distance(producer, self.rx_consumer, self.config.ring_size)
-            .map_err(|error| self.invalid(error))?;
-        self.observe_fill()?;
-        let mut count = 0;
-        for _ in 0..(available as usize).min(batch) {
-            let descriptor = self.rings.rx.read(self.rx_consumer);
-            match self.receive_one(descriptor, &mut f) {
-                Ok(true) => {}
-                Ok(false) => break,
-                Err(error) => {
-                    self.rings.rx.publish_consumer(self.rx_consumer);
-                    return Err(self.invalid(error));
-                }
-            }
-            self.rx_consumer = self.rx_consumer.wrapping_add(1);
-            self.counters.rx += 1;
-            count += 1;
-        }
-        self.rings.rx.publish_consumer(self.rx_consumer);
-        self.refill()?;
-        Ok(count)
-    }
-
-    fn receive_one(
-        &mut self,
-        descriptor: Descriptor,
-        f: &mut impl FnMut(&[u8]),
-    ) -> io::Result<bool> {
-        if descriptor.options != 0 || descriptor.len == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "unsupported or empty RX descriptor",
-            ));
-        }
-        let length = usize::try_from(descriptor.len)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "RX length overflow"))?;
-        if !self
-            .ledger
-            .rx_ready(descriptor.addr, length)
-            .map_err(io::Error::other)?
-        {
-            return Ok(false);
-        }
-        let lease = self
-            .ledger
-            .receive_rx(descriptor.addr, length)
-            .map_err(io::Error::other)?;
-        f(self.umem.frame(descriptor.addr, length)?);
-        self.ledger.relinquish_rx(lease).map_err(io::Error::other)?;
-        Ok(true)
+        self.receive_segments_inner(batch, 0, false, |_, segments, _, _| {
+            f(segments[0]);
+            RxDisposition::Release
+        })
     }
 
     pub fn tx_credit(&self, class: TxClass) -> bool {
@@ -819,7 +1173,7 @@ impl<L> Port<L> {
             self.config.ring_size,
         )
         .map_err(|error| self.invalid(error))?;
-        Ok(if self.closed {
+        Ok(if self.closed.get() {
             0
         } else {
             self.tx_free[class_index(class)].min(self.config.ring_size as usize - used as usize)
@@ -840,7 +1194,7 @@ impl<L> Port<L> {
     }
 
     fn tx_chain_credit(&self, class: TxClass, count: usize, used: u32) -> bool {
-        !self.closed
+        !self.closed.get()
             && self.tx_free[class_index(class)] >= count
             && self.config.ring_size as usize - used as usize >= count
     }
@@ -1077,12 +1431,16 @@ impl<L> Port<L> {
     }
 
     pub fn drain_state(&self) -> DrainState {
-        self.ledger.drain_state()
+        let mut state = self.ledger.drain_state();
+        state.closed |= self.closed.get();
+        state.rx_completions = self.retained_rx.completions;
+        state
     }
 
     pub fn close(&mut self) -> DrainState {
-        self.closed = true;
-        self.ledger.close()
+        self.closed.set(true);
+        self.ledger.close();
+        self.drain_state()
     }
 
     pub fn counters(&self) -> PortCounters {
@@ -1183,15 +1541,18 @@ mod tests {
         config.validate().unwrap();
         let bookkeeping =
             reserve(budget, size_of::<Port<L>>() - size_of::<FrameLedger<u32>>()).unwrap();
+        let retained_rx = RetainedRxSlots::new(config, budget).unwrap();
         Port {
             socket: None,
             config,
             zerocopy: false,
             mtu: 1500,
             scatter_gather: false,
+            metadata_len: METADATA_SIZE,
             umem: Umem::fake(config.umem_bytes().unwrap(), budget),
             rings: Rings::fake(config.ring_size, budget),
-            ledger: FrameLedger::new(config.frame_config(), budget).unwrap(),
+            ledger: ManuallyDrop::new(FrameLedger::new(config.frame_config(), budget).unwrap()),
+            retained_rx,
             sidecar: Sidecar::new(config, budget).unwrap(),
             rx_consumer: 0,
             tx_producer: 0,
@@ -1199,10 +1560,560 @@ mod tests {
             fill_consumer: 0,
             cq_consumer: 0,
             tx_free: [config.control_frames, config.bulk_frames],
-            closed: false,
+            closed: Cell::new(false),
             tx_batch_active: false,
             counters: PortCounters::default(),
-            _bookkeeping: bookkeeping,
+            _bookkeeping: Some(bookkeeping),
+        }
+    }
+
+    fn queue_rx(port: &mut Port<()>, lengths: &[usize], metadata_len: usize) {
+        let fill = port.rings.fill.consumer();
+        let rx = port.rings.rx.producer();
+        for (part, &length) in lengths.iter().enumerate() {
+            let address =
+                port.rings.fill.read(fill.wrapping_add(part as u32)) + 256 + metadata_len as u64;
+            if part == 0 && metadata_len != 0 {
+                port.umem
+                    .write_bytes(address - metadata_len as u64, &[0xa5; 128][..metadata_len]);
+            }
+            port.umem
+                .write_bytes(address, &[(part + 1) as u8; FRAME_SIZE][..length]);
+            port.rings.rx.write(
+                rx.wrapping_add(part as u32),
+                Descriptor {
+                    addr: address,
+                    len: length as u32,
+                    options: u32::from(part + 1 != lengths.len()),
+                },
+            );
+        }
+        port.rings
+            .fill
+            .publish_consumer(fill.wrapping_add(lengths.len() as u32));
+        port.rings
+            .rx
+            .publish_producer(rx.wrapping_add(lengths.len() as u32));
+    }
+
+    fn retain_rx(port: &mut Port<()>, metadata_len: usize) -> RetainedRxHandle {
+        let mut handle = None;
+        assert_eq!(
+            port.receive_segments_owned(1, metadata_len, |owned, _, _, tx| {
+                assert_eq!(tx.port.retained_rx_count(), 1);
+                handle = Some(owned);
+                RxDisposition::Retain
+            })
+            .unwrap(),
+            1
+        );
+        handle.unwrap()
+    }
+
+    #[test]
+    fn retained_rx_whole_chain_credit_precedes_first_lease() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(
+            PortConfig {
+                rx_frames: 4,
+                control_frames: 4,
+                bulk_frames: 4,
+                ring_size: 8,
+            },
+            &budget,
+        );
+        let mut frames = port.config.frame_config();
+        frames.rx_capacity = 2;
+        // SAFETY: this fixture has not posted frames or acquired any leases.
+        unsafe { ManuallyDrop::drop(&mut port.ledger) };
+        port.ledger = ManuallyDrop::new(FrameLedger::new(frames, &budget).unwrap());
+        port.mtu = 9000;
+        port.scatter_gather = true;
+        port.metadata_len = 64;
+        port.refill().unwrap();
+        queue_rx(&mut port, &[60], 64);
+        let first = retain_rx(&mut port, 64);
+        queue_rx(&mut port, &[3000, 3000], 64);
+        let consumer = port.rings().rx_consumer;
+        let fill = port.rings().fill_producer;
+        let free = port.retained_rx.free;
+        assert_eq!(port.ledger.rx_credit(), 1);
+        assert_eq!(
+            port.receive_segments_owned(1, 64, |_, _, _, _| { panic!("half-leased RX chain") })
+                .unwrap(),
+            0
+        );
+        assert_eq!(port.rings().rx_consumer, consumer);
+        assert_eq!(port.rings().fill_producer, fill);
+        assert_eq!(port.drain_state().rx_leased, 1);
+        assert_eq!(port.retained_rx.free, free);
+        assert!(!port.drain_state().closed);
+        let first_done = port.release_retained_rx(first).unwrap();
+        assert_eq!(port.rx_completion_count(), 1);
+        let second = retain_rx(&mut port, 64);
+        assert_ne!(first.slot, second.slot);
+        assert_eq!(port.drain_state().rx_leased, 2);
+        port.with_retained_rx(second, |parts, metadata| {
+            assert_eq!(parts, &[&[1; 3000][..], &[2; 3000][..]]);
+            assert_eq!(metadata, &[0xa5; 64]);
+        })
+        .unwrap();
+        let second_done = port.release_retained_rx(second).unwrap();
+        port.complete_retained_rx(second_done).unwrap();
+        port.complete_retained_rx(first_done).unwrap();
+
+        let mut port = fake::<()>(config(), &budget);
+        port.scatter_gather = true;
+        port.refill().unwrap();
+        let mut completions = Vec::new();
+        for _ in 0..2 {
+            queue_rx(&mut port, &[60], 0);
+            let handle = retain_rx(&mut port, 0);
+            completions.push(port.release_retained_rx(handle).unwrap());
+        }
+        assert_eq!(port.retained_rx.free, NO_RX_SLOT);
+        assert_eq!(port.ledger.rx_credit(), 2);
+        queue_rx(&mut port, &[60, 60], 0);
+        let consumer = port.rings().rx_consumer;
+        assert_eq!(
+            port.receive_segments_owned(1, 0, |_, _, _, _| panic!("slot full"))
+                .unwrap(),
+            0
+        );
+        assert_eq!(port.rings().rx_consumer, consumer);
+        assert_eq!(port.drain_state().rx_leased, 0);
+        assert_eq!(port.rx_completion_count(), 2);
+        port.complete_retained_rx(completions.pop().unwrap())
+            .unwrap();
+        let handle = retain_rx(&mut port, 0);
+        let done = port.release_retained_rx(handle).unwrap();
+        port.complete_retained_rx(done).unwrap();
+        port.complete_retained_rx(completions.pop().unwrap())
+            .unwrap();
+
+        let mut port = fake::<()>(
+            PortConfig {
+                rx_frames: 4,
+                control_frames: 2,
+                bulk_frames: 2,
+                ring_size: 4,
+            },
+            &budget,
+        );
+        port.scatter_gather = true;
+        port.refill().unwrap();
+        queue_rx(&mut port, &[60; 4], 0);
+        for index in 0..4 {
+            let mut descriptor = port.rings.rx.read(index);
+            descriptor.options = u32::from(index == 3);
+            port.rings.rx.write(index, descriptor);
+        }
+        assert_eq!(
+            port.receive_segments_owned(4, 0, |_, _, _, _| RxDisposition::Release)
+                .unwrap(),
+            3
+        );
+        assert_eq!(port.rings().rx_consumer, 3);
+        assert_eq!(port.drain_state().rx_leased, 0);
+        assert!(!port.drain_state().closed);
+        queue_rx(&mut port, &[60], 0);
+        assert_eq!(
+            port.receive_segments_owned(1, 0, |_, parts, _, _| {
+                assert_eq!(parts.len(), 2);
+                RxDisposition::Release
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(port.rings().rx_consumer, 5);
+    }
+
+    #[test]
+    fn retained_rx_generation_survives_completion_and_callback_panic() {
+        for panic_on_borrow in [false, true] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.mtu = 9000;
+            port.scatter_gather = true;
+            port.metadata_len = 64;
+            port.refill().unwrap();
+            queue_rx(&mut port, &[3000, 3000], 64);
+            let fill = port.rings().fill_producer;
+            let mut handle = None;
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                port.receive_segments_owned(1, 64, |owned, parts, metadata, tx| {
+                    handle = Some(owned);
+                    assert_eq!(tx.port.retained_rx_count(), 1);
+                    assert_eq!(tx.port.drain_state().rx_leased, 2);
+                    assert_eq!(parts.len(), 2);
+                    assert_eq!(metadata, &[0xa5; 64]);
+                    if !panic_on_borrow {
+                        panic!("RX callback unwind");
+                    }
+                    RxDisposition::Retain
+                })
+                .unwrap();
+                port.with_retained_rx(handle.unwrap(), |_, _| panic!("writev unwind"))
+                    .unwrap();
+            }));
+            assert!(panic.is_err());
+            let handle = handle.unwrap();
+            assert!(port.drain_state().closed);
+            assert!(!port.tx_credit(TxClass::Bulk));
+            assert_eq!(port.rings().rx_consumer, 2);
+            assert_eq!(port.rings().fill_producer, fill);
+            assert_eq!(port.retained_rx_count(), 1);
+            assert_eq!(port.rx_completion_count(), 0);
+            port.with_retained_rx(handle, |parts, metadata| {
+                assert_eq!(parts, &[&[1; 3000][..], &[2; 3000][..]]);
+                assert_eq!(metadata, &[0xa5; 64]);
+            })
+            .unwrap();
+            let completion = port.release_retained_rx(handle).unwrap();
+            assert_eq!(completion.handle(), handle);
+            assert_eq!(port.retained_rx_count(), 0);
+            assert_eq!(port.rx_completion_count(), 1);
+            assert_eq!(port.drain_state().rx_leased, 0);
+            assert!(!port.close().ready_for_backend_teardown());
+            drop(completion);
+            let retained = port.umem_bytes()
+                + port.ledger.charged_bytes()
+                + port.retained_rx.reservation.as_ref().unwrap().bytes()
+                + port._bookkeeping.as_ref().unwrap().bytes();
+            drop(port);
+            assert_eq!(budget.used(), retained);
+        }
+        for receive_api in 0..3 {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.refill().unwrap();
+            queue_rx(&mut port, &[60], 32);
+            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                match receive_api {
+                    0 => port.receive_segments(1, 32, |_, _| panic!("borrowed RX unwind")),
+                    1 => port.receive_segments_with(1, 32, |_, _, _| panic!("RX sink unwind")),
+                    _ => port.receive(1, |_| panic!("single-buffer RX unwind")),
+                }
+                .unwrap();
+            }));
+            assert!(panic.is_err());
+            assert!(port.drain_state().closed);
+            assert_eq!(port.retained_rx_count(), 1);
+            assert_eq!(port.drain_state().rx_leased, 1);
+            assert_eq!(port.rings().rx_consumer, 1);
+            assert_eq!(port.rings().fill_producer, 2);
+            assert!(!port.close().ready_for_backend_teardown());
+        }
+
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(config(), &budget);
+        port.refill().unwrap();
+        queue_rx(&mut port, &[60], 0);
+        let handle = retain_rx(&mut port, 0);
+        port.rings.fill.set_wakeup();
+        assert_eq!(
+            port.release_retained_rx(handle).unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(port.retained_rx_count(), 0);
+        assert_eq!(port.rx_completion_count(), 1);
+        assert!(!port.close().ready_for_backend_teardown());
+        assert_eq!(
+            port.release_retained_rx(handle).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+
+        for invalid in ["borrow", "release", "completion"] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.refill().unwrap();
+            queue_rx(&mut port, &[60], 0);
+            let first = retain_rx(&mut port, 0);
+            let first_done = port.release_retained_rx(first).unwrap();
+            assert_eq!(first_done.handle(), first);
+            queue_rx(&mut port, &[60], 0);
+            let second = retain_rx(&mut port, 0);
+            assert_ne!(first.slot, second.slot);
+            let second_done = port.release_retained_rx(second).unwrap();
+            port.complete_retained_rx(second_done).unwrap();
+            port.complete_retained_rx(first_done).unwrap();
+            queue_rx(&mut port, &[60], 0);
+            let current = retain_rx(&mut port, 0);
+            assert_eq!(current.slot, first.slot);
+            assert_ne!(current, first);
+            assert_eq!(
+                current.receipt_identity(),
+                RetainedRxIdentity {
+                    port: current.port,
+                    port_generation: current.port_generation,
+                    slot: current.slot,
+                    slot_generation: current.generation,
+                }
+            );
+            let pending = if invalid == "completion" {
+                Some(port.release_retained_rx(current).unwrap())
+            } else {
+                None
+            };
+            let error = match invalid {
+                "borrow" => port
+                    .with_retained_rx(first, |_, _| panic!("stale borrow"))
+                    .unwrap_err(),
+                "release" => port.release_retained_rx(first).unwrap_err(),
+                "completion" => port
+                    .complete_retained_rx(RxCompletion { handle: first })
+                    .unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(port.drain_state().closed);
+            assert_eq!(port.retained_rx_count(), usize::from(pending.is_none()));
+            assert_eq!(port.drain_state().rx_leased, usize::from(pending.is_none()));
+            let completion = pending.unwrap_or_else(|| port.release_retained_rx(current).unwrap());
+            assert_eq!(
+                port.release_retained_rx(current).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(port.rx_completion_count(), 1);
+            port.complete_retained_rx(completion).unwrap();
+            assert_eq!(port.rx_completion_count(), 0);
+            assert!(port.close().ready_for_backend_teardown());
+        }
+
+        for operation in ["borrow", "release", "completion"] {
+            for identity in ["port", "port-generation"] {
+                let budget = MemoryBudget::new(1 << 20);
+                let mut port = fake::<()>(config(), &budget);
+                let mut foreign = fake::<()>(config(), &budget);
+                port.refill().unwrap();
+                foreign.refill().unwrap();
+                queue_rx(&mut port, &[60], 0);
+                queue_rx(&mut foreign, &[60], 0);
+                let source = retain_rx(&mut port, 0);
+                let destination = retain_rx(&mut foreign, 0);
+                assert_eq!(source.slot, destination.slot);
+                assert_eq!(source.generation, destination.generation);
+                assert_eq!(source.port_generation, destination.port_generation);
+                assert_ne!(source.port, destination.port);
+                let token = if identity == "port" {
+                    source
+                } else {
+                    RetainedRxHandle {
+                        port_generation: destination.port_generation + 1,
+                        ..destination
+                    }
+                };
+                let completions = if operation == "completion" {
+                    Some((
+                        port.release_retained_rx(source).unwrap(),
+                        foreign.release_retained_rx(destination).unwrap(),
+                    ))
+                } else {
+                    None
+                };
+                let phase = if completions.is_some() {
+                    RxPhase::CompletionPending
+                } else {
+                    RxPhase::Held
+                };
+                assert!(port.retained_rx.slots[source.slot as usize].phase == phase);
+                assert!(foreign.retained_rx.slots[destination.slot as usize].phase == phase);
+                let error = match operation {
+                    "borrow" => foreign.with_retained_rx(token, |_, _| ()).unwrap_err(),
+                    "release" => foreign.release_retained_rx(token).unwrap_err(),
+                    "completion" => foreign
+                        .complete_retained_rx(RxCompletion { handle: token })
+                        .unwrap_err(),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::InvalidData,
+                    "{operation}/{identity}"
+                );
+                assert!(foreign.drain_state().closed);
+                assert!(foreign.retained_rx.slots[destination.slot as usize].phase == phase);
+                let (source_done, destination_done) = completions.unwrap_or_else(|| {
+                    (
+                        port.release_retained_rx(source).unwrap(),
+                        foreign.release_retained_rx(destination).unwrap(),
+                    )
+                });
+                port.complete_retained_rx(source_done).unwrap();
+                foreign.complete_retained_rx(destination_done).unwrap();
+                assert!(port.close().ready_for_backend_teardown());
+                assert!(foreign.close().ready_for_backend_teardown());
+            }
+        }
+
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake::<()>(config(), &budget);
+        port.retained_rx.slots[0].generation = u64::MAX;
+        port.refill().unwrap();
+        queue_rx(&mut port, &[60], 0);
+        assert_eq!(
+            port.receive_segments_owned(1, 0, |_, _, _, _| panic!("wrapped slot generation"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(port.rings().rx_consumer, 0);
+        assert_eq!(port.drain_state().rx_leased, 0);
+        assert_eq!(port.retained_rx.slots[0].generation, u64::MAX);
+        assert!(port.drain_state().closed);
+    }
+
+    #[test]
+    fn retained_rx_reserves_layout_before_umem() {
+        for (rx_frames, ring_size) in [(2, 4), (256, 512), (512, 256)] {
+            let config = PortConfig {
+                rx_frames,
+                ring_size,
+                control_frames: 1,
+                bulk_frames: 1,
+            };
+            let count = rx_frames.min(ring_size as usize);
+            let bytes = count * 1024;
+            assert_eq!(RetainedRxSlots::layout(config).unwrap(), (count, bytes));
+            let layout = Layout::array::<RetainedRxSlot>(count).unwrap();
+            assert!(layout.size() <= bytes);
+            assert_eq!(layout.align(), align_of::<RetainedRxSlot>());
+            assert!(size_of::<RetainedRxHandle>() <= 32);
+            assert!(size_of::<RxCompletion>() <= 32);
+            let budget = MemoryBudget::new(bytes - 1);
+            assert_eq!(
+                RetainedRxSlots::new(config, &budget).err().unwrap().kind(),
+                io::ErrorKind::OutOfMemory
+            );
+            assert_eq!(budget.used(), 0);
+            let budget = MemoryBudget::new(bytes);
+            let slots = RetainedRxSlots::new(config, &budget).unwrap();
+            assert_eq!(slots.slots.len(), count);
+            assert_eq!(budget.used(), bytes);
+            assert_eq!(slots.slots.as_ptr() as usize % layout.align(), 0);
+            drop(slots);
+            assert_eq!(budget.used(), 0);
+        }
+        // SAFETY: the name is a static NUL-terminated string.
+        let ifindex = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(ifindex, 0);
+        let bytes = size_of::<Port<()>>() - size_of::<FrameLedger<u32>>() + 2 * 1024 - 1;
+        let budget = MemoryBudget::new(bytes);
+        assert_eq!(
+            Port::<()>::open_device(
+                ifindex,
+                0,
+                BindMode::Copy,
+                config(),
+                1500,
+                false,
+                64,
+                &budget
+            )
+            .err()
+            .unwrap()
+            .kind(),
+            io::ErrorKind::OutOfMemory
+        );
+        assert_eq!(budget.used(), 0);
+        assert!(
+            PortConfig {
+                rx_frames: usize::MAX,
+                ..config()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_metadata64_sg_capacity_rejects_48() {
+        assert_eq!(rx_frame_capacity(64).unwrap(), 3776);
+        assert_eq!(
+            rx_frame_capacity(48).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            (65535usize + 22).div_ceil(rx_frame_capacity(64).unwrap()),
+            MAX_SEGMENTS
+        );
+        let budget = MemoryBudget::new(1 << 20);
+        let config = PortConfig {
+            rx_frames: 32,
+            control_frames: 18,
+            bulk_frames: 18,
+            ring_size: 64,
+        };
+        let mut port = fake::<()>(config, &budget);
+        port.mtu = 65535;
+        port.scatter_gather = true;
+        port.metadata_len = 64;
+        port.refill().unwrap();
+        let mut lengths = [3776; MAX_SEGMENTS];
+        lengths[MAX_SEGMENTS - 1] = 65535 + 22 - 3776 * (MAX_SEGMENTS - 1);
+        queue_rx(&mut port, &lengths, 64);
+        assert_eq!(
+            port.receive_segments_owned(1, 48, |_, _, _, _| panic!("legacy metadata"))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(port.rings().rx_consumer, 0);
+        let handle = retain_rx(&mut port, 64);
+        port.with_retained_rx(handle, |parts, metadata| {
+            assert_eq!(parts.len(), MAX_SEGMENTS);
+            assert_eq!(parts.iter().map(|part| part.len()).sum::<usize>(), 65557);
+            for (part, bytes) in parts.iter().enumerate() {
+                assert_eq!(bytes.len(), lengths[part]);
+                assert!(bytes.iter().all(|&byte| byte == (part + 1) as u8));
+            }
+            assert_eq!(metadata, &[0xa5; 64]);
+        })
+        .unwrap();
+        let completion = port.release_retained_rx(handle).unwrap();
+        port.complete_retained_rx(completion).unwrap();
+
+        for malformed in ["metadata", "frame", "mtu", "segments", "duplicate", "sg"] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config, &budget);
+            port.mtu = 65535;
+            port.scatter_gather = true;
+            port.metadata_len = 64;
+            port.refill().unwrap();
+            let lengths = if malformed == "segments" {
+                &[60; 19][..]
+            } else {
+                &[60, 60][..]
+            };
+            queue_rx(&mut port, lengths, 64);
+            let mut first = port.rings.rx.read(0);
+            match malformed {
+                "metadata" => first.addr = first.addr / FRAME_SIZE as u64 * FRAME_SIZE as u64 + 48,
+                "frame" => first.len = 3777,
+                "mtu" => {
+                    port.mtu = 68;
+                    first.len = 60;
+                }
+                "segments" => {}
+                "duplicate" => {
+                    let mut second = port.rings.rx.read(1);
+                    second.addr = first.addr;
+                    port.rings.rx.write(1, second);
+                }
+                "sg" => port.scatter_gather = false,
+                _ => unreachable!(),
+            }
+            port.rings.rx.write(0, first);
+            assert_eq!(
+                port.receive_segments_owned(1, 64, |_, _, _, _| panic!("{malformed} admitted"))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidData
+            );
+            assert_eq!(port.rings().rx_consumer, 0);
+            assert_eq!(port.drain_state().rx_leased, 0);
+            assert_eq!(port.retained_rx_count(), 0);
+            assert!(port.drain_state().closed);
         }
     }
 
@@ -1316,6 +2227,121 @@ mod tests {
     }
 
     #[test]
+    fn exact_metadata_lengths_preserve_whole_sg_callback_leases() {
+        for metadata_len in [0, 32, 64, 128] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.metadata_len = metadata_len;
+            port.mtu = 9000;
+            port.scatter_gather = true;
+            port.refill().unwrap();
+            let first = port.rings.fill.read(0) + 256;
+            let second = port.rings.fill.read(1) + 256;
+            let expected = [9; 128];
+            if metadata_len != 0 {
+                port.umem.write_bytes(first, &expected[..metadata_len]);
+            }
+            port.umem
+                .write_bytes(first + metadata_len as u64, &[1; 3000]);
+            port.umem
+                .write_bytes(second + metadata_len as u64, &[2; 3000]);
+            for (index, address) in [first, second].into_iter().enumerate() {
+                port.rings.rx.write(
+                    index as u32,
+                    Descriptor {
+                        addr: address + metadata_len as u64,
+                        len: 3000,
+                        options: u32::from(index == 0),
+                    },
+                );
+            }
+            port.rings.rx.publish_producer(2);
+            assert_eq!(
+                port.receive_segments(1, metadata_len, |_, _| {
+                    panic!("FILL still owns the complete chain")
+                })
+                .unwrap(),
+                0
+            );
+            port.rings.fill.publish_consumer(2);
+            let mut callbacks = 0;
+            assert_eq!(
+                port.receive_segments_with(1, metadata_len, |parts, metadata, _| {
+                    assert_eq!(parts, &[&[1; 3000][..], &[2; 3000][..]]);
+                    assert_eq!(metadata, &expected[..metadata_len]);
+                    callbacks += 1;
+                })
+                .unwrap(),
+                1
+            );
+            assert_eq!(callbacks, 1);
+            assert_eq!(port.rings().rx_consumer, 2);
+            assert_eq!(port.drain_state().rx_leased, 0);
+        }
+    }
+
+    #[test]
+    fn host_metadata_never_falls_back_to_shorter_headroom() {
+        for prefix in [0, 32, 127] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.metadata_len = 128;
+            port.refill().unwrap();
+            let base = port.rings.fill.read(0);
+            port.rings.rx.write(
+                0,
+                Descriptor {
+                    addr: base + prefix,
+                    len: 3,
+                    options: 0,
+                },
+            );
+            port.rings.rx.publish_producer(1);
+            port.rings.fill.publish_consumer(1);
+            assert!(
+                port.receive_segments(1, 128, |_, _| {
+                    panic!("missing Host metadata was admitted")
+                })
+                .is_err()
+            );
+            assert_eq!(port.rings().rx_consumer, 0);
+            assert_eq!(port.drain_state().rx_leased, 0);
+            assert!(port.drain_state().closed);
+        }
+        for (admitted, requested) in [(0, 32), (32, 128), (128, 32), (128, 127)] {
+            let budget = MemoryBudget::new(1 << 20);
+            let mut port = fake::<()>(config(), &budget);
+            port.metadata_len = admitted;
+            assert_eq!(
+                port.receive_segments(1, requested, |_, _| {
+                    panic!("wrong metadata contract reached callback")
+                })
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::InvalidInput
+            );
+            assert_eq!(port.rings().rx_consumer, 0);
+        }
+        for metadata_len in [1, 31, 127, 129, usize::MAX] {
+            let budget = MemoryBudget::new(1 << 20);
+            assert!(
+                Port::<()>::open_device(
+                    0,
+                    0,
+                    BindMode::Copy,
+                    config(),
+                    1500,
+                    false,
+                    metadata_len,
+                    &budget,
+                )
+                .is_err()
+            );
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
     fn wire_only_receive_neither_requires_nor_exports_a_metadata_prefix() {
         for prefix in [0, METADATA_SIZE] {
             let budget = MemoryBudget::new(1 << 20);
@@ -1336,13 +2362,13 @@ mod tests {
             );
             port.rings.rx.publish_producer(1);
             assert_eq!(
-                port.receive_segments(1, false, |_, _| panic!("FILL still owns the frame"))
+                port.receive_segments(1, 0, |_, _| panic!("FILL still owns the frame"))
                     .unwrap(),
                 0
             );
             port.rings.fill.publish_consumer(1);
             assert_eq!(
-                port.receive_segments(1, false, |segments, metadata| {
+                port.receive_segments(1, 0, |segments, metadata| {
                     assert_eq!(segments.len(), 1);
                     assert_eq!(segments[0], &[1, 2, 3]);
                     assert!(metadata.is_empty());
@@ -1369,7 +2395,7 @@ mod tests {
         port.rings.rx.publish_producer(1);
         port.rings.fill.publish_consumer(1);
         assert!(
-            port.receive_segments(1, true, |_, _| panic!("missing required metadata"))
+            port.receive_segments(1, METADATA_SIZE, |_, _| panic!("missing required metadata"))
                 .is_err()
         );
         assert_eq!(port.counters().rx, 0);
@@ -1883,7 +2909,9 @@ mod tests {
             if shortage == "descriptor" {
                 let mut frames = port.config.frame_config();
                 frames.bulk_descriptors = 1;
-                port.ledger = FrameLedger::new(frames, &budget).unwrap();
+                // SAFETY: no RX custody exists in this credit-shortage fixture.
+                unsafe { ManuallyDrop::drop(&mut port.ledger) };
+                port.ledger = ManuallyDrop::new(FrameLedger::new(frames, &budget).unwrap());
             }
             let mut held = None;
             match shortage {
@@ -2018,7 +3046,9 @@ mod tests {
                 "extent" => {
                     let mut frames = config().frame_config();
                     frames.base_address = port.umem_bytes() as u64;
-                    port.ledger = FrameLedger::new(frames, &budget).unwrap();
+                    // SAFETY: no RX custody exists in this invalid-extent fixture.
+                    unsafe { ManuallyDrop::drop(&mut port.ledger) };
+                    port.ledger = ManuallyDrop::new(FrameLedger::new(frames, &budget).unwrap());
                 }
                 _ => unreachable!(),
             }
@@ -2639,8 +3669,10 @@ mod tests {
         );
         port.rings.rx.publish_producer(2);
         assert_eq!(
-            port.receive_segments_with(1, true, |_, _, _| panic!("FILL consumer not published"))
-                .unwrap(),
+            port.receive_segments_with(1, METADATA_SIZE, |_, _, _| panic!(
+                "FILL consumer not published"
+            ))
+            .unwrap(),
             0
         );
         assert_ne!(port.rings().rx_producer, port.rings().rx_consumer);
@@ -2650,7 +3682,7 @@ mod tests {
         assert!(!port.drain_state().closed);
         port.rings.fill.publish_consumer(1);
         assert_eq!(
-            port.receive_segments(1, true, |_, _| panic!(
+            port.receive_segments(1, METADATA_SIZE, |_, _| panic!(
                 "only part of FILL consumption published"
             ))
             .unwrap(),
@@ -2666,7 +3698,7 @@ mod tests {
         port.rings.fill.publish_consumer(2);
         let mut delivered = 0;
         assert_eq!(
-            port.receive_segments_with(1, true, |parts, metadata, tx| {
+            port.receive_segments_with(1, METADATA_SIZE, |parts, metadata, tx| {
                 assert_eq!(parts.len(), 2);
                 assert_eq!(parts[0], &[1; 3000]);
                 assert_eq!(parts[1], &[2; 3000]);
@@ -2691,7 +3723,7 @@ mod tests {
         assert_eq!(port.counters().invalid, 0);
         assert!(!port.drain_state().closed);
         assert_eq!(
-            port.receive_segments(1, true, |_, _| panic!("duplicate RX chain"))
+            port.receive_segments(1, METADATA_SIZE, |_, _| panic!("duplicate RX chain"))
                 .unwrap(),
             0
         );
@@ -2790,8 +3822,10 @@ mod tests {
             port.rings.rx.write(1, descriptor);
             port.rings.rx.publish_producer(2);
             assert!(
-                port.receive_segments_with(1, true, |_, _, _| panic!("invalid RX chain borrowed"))
-                    .is_err()
+                port.receive_segments_with(1, METADATA_SIZE, |_, _, _| panic!(
+                    "invalid RX chain borrowed"
+                ))
+                .is_err()
             );
             assert_eq!(port.rings().rx_consumer, 0);
             assert_eq!(port.drain_state().rx_leased, 0);
@@ -2832,7 +3866,7 @@ mod tests {
         );
         port.rings.rx.publish_producer(1);
         assert_eq!(
-            port.receive_segments(1, true, |_, _| panic!("partial RX packet"))
+            port.receive_segments(1, METADATA_SIZE, |_, _| panic!("partial RX packet"))
                 .unwrap(),
             0
         );
@@ -2851,7 +3885,7 @@ mod tests {
         );
         port.rings.rx.publish_producer(2);
         assert_eq!(
-            port.receive_segments_with(1, true, |parts, metadata, tx| {
+            port.receive_segments_with(1, METADATA_SIZE, |parts, metadata, tx| {
                 assert_eq!(parts.len(), 2);
                 assert_eq!(metadata, &[9; METADATA_SIZE]);
                 tx.transmit_segments(TxClass::Bulk, parts, ()).unwrap();
@@ -3187,7 +4221,7 @@ mod tests {
         port.rings.rx.publish_producer(2);
         port.rings.tx.set_wakeup();
         let (work, kick) = port.transmit_batch(|port| {
-            port.receive_segments_with(2, false, |parts, _, tx| {
+            port.receive_segments_with(2, 0, |parts, _, tx| {
                 tx.transmit_segments(TxClass::Bulk, parts, Retained::new(&drops))
                     .unwrap();
                 tx.transmit_with(TxClass::Control, 60, Retained::new(&drops), |_, target| {

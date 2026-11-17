@@ -1,5 +1,6 @@
 use super::*;
-use honk_netstack::{ValidatedSource, wire};
+use honk_netstack::{ReceiveOutcome, RxMeta, SourceContext, TxCaps, ValidatedSource, wire};
+use std::num::NonZeroU64;
 
 fn fragmented(packet: &[u8], id: u32) -> Vec<Vec<u8>> {
     let ip = wire::parse_ip(packet).unwrap();
@@ -381,4 +382,257 @@ fn active_open_reports_only_valid_handshake_or_exact_reset() {
         );
         assert_eq!(reported.tcp_state(id), ordinary.tcp_state(id));
     }
+}
+
+fn context(lineage: u64, snapshot: u64) -> SourceContext {
+    SourceContext {
+        lineage: NonZeroU64::new(lineage).unwrap(),
+        snapshot: NonZeroU64::new(snapshot).unwrap(),
+    }
+}
+
+fn contextual_stack(now: Instant) -> Stack {
+    let mut cfg = transparent();
+    cfg.shared_budget = Some(honk_netstack::MemoryBudget::new(cfg.memory_limit));
+    let mut stack = Stack::new(cfg, now);
+    stack.prepare_source_context().unwrap();
+    stack
+}
+
+#[test]
+fn tcp_keeps_original_snapshot_and_rejects_foreign_lineage_before_mutation() {
+    for (source, destination) in [
+        (addr(CLIENT), addr(DST)),
+        (addr("[fd00::2]:40000"), addr("[2001:db8::9]:443")),
+    ] {
+        let now = Instant::now();
+        let mut stack = contextual_stack(now);
+        let original = context(1, 1);
+        let newer = context(1, 2);
+        let foreign = context(2, 3);
+        let syn = packet(source, destination, wire::PROTO_TCP);
+        let (_, report) =
+            stack.receive_with_context(now, &syn, RxMeta::VERIFY, original, |_, effective| {
+                assert_eq!(effective, original);
+                true
+            });
+        let ReceiveOutcome::TcpNew(id) = report.outcome else {
+            panic!("missing contextual passive open")
+        };
+        assert_eq!(report.source_context, Some(original));
+        assert!(stack.retains_tcp_with_lineage(source, destination, Some(original.lineage)));
+        assert!(!stack.retains_tcp_with_lineage(source, destination, Some(foreign.lineage)));
+        assert!(!stack.retains_tcp(source, destination));
+        let (_, report) =
+            stack.receive_with_context(now, &syn, RxMeta::VERIFY, newer, |_, effective| {
+                assert_eq!(effective, original);
+                true
+            });
+        assert_eq!(report.source_context, Some(original));
+        assert_eq!(stack.receive(now, &syn), Rx::Dropped(DropReason::NotForUs));
+        assert_eq!(stack.poll_accept().unwrap().id, id);
+        stack.tcp_accept(id, AcceptOpts::default()).unwrap();
+        let mut output = [0; 8192];
+        let tx = stack
+            .poll_transmit_with(now, &mut output, TxCaps::NONE)
+            .unwrap();
+        assert_eq!((tx.flow, tx.source), (Some(id), Some(original)));
+        let server = decode(&output[..tx.len]).h.seq.wrapping_add(1);
+        let ack = build(
+            source,
+            destination,
+            101,
+            server,
+            ACK,
+            Options::default(),
+            &[],
+        );
+        let (_, report) =
+            stack.receive_with_context(now, &ack, RxMeta::VERIFY, newer, |_, effective| {
+                assert_eq!(effective, original);
+                true
+            });
+        assert_eq!(report.outcome, ReceiveOutcome::TcpAccepted(id));
+        for input in [
+            syn,
+            build(
+                source,
+                destination,
+                101,
+                server,
+                RST | ACK,
+                Options::default(),
+                &[],
+            ),
+            build(
+                source,
+                destination,
+                101,
+                server,
+                ACK,
+                Options::default(),
+                b"foreign",
+            ),
+        ] {
+            let (rx, report) =
+                stack.receive_with_context(now, &input, RxMeta::VERIFY, foreign, |_, _| true);
+            assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
+            assert_eq!(report.outcome, ReceiveOutcome::Unqualified);
+        }
+        assert_eq!(stack.tcp_state(id), Some(TcpState::Established));
+        assert_eq!(
+            stack.tcp_read(id, &mut [0; 8]),
+            Err(StreamError::WouldBlock)
+        );
+        let data = build(
+            source,
+            destination,
+            101,
+            server,
+            ACK,
+            Options::default(),
+            b"x",
+        );
+        let (_, report) =
+            stack.receive_with_context(now, &data, RxMeta::VERIFY, newer, |_, effective| {
+                assert_eq!(effective, original);
+                true
+            });
+        assert_eq!(report.source_context, Some(original));
+        assert_eq!(stack.tcp_read(id, &mut [0; 1]), Ok(1));
+        assert_eq!(stack.tcp_write(id, &[7; 4096]), Ok(4096));
+        let caps = TxCaps {
+            tso4: true,
+            tso6: true,
+            ..TxCaps::NONE
+        };
+        let tx = stack.poll_transmit_with(now, &mut output, caps).unwrap();
+        assert!(tx.gso.is_some());
+        assert_eq!((tx.flow, tx.source), (Some(id), Some(original)));
+        let mut retained = Vec::new();
+        stack.visit_retained_source_contexts(|source| retained.push(source));
+        assert_eq!(retained, [original]);
+    }
+}
+
+#[test]
+fn completed_context_is_reported_only_after_full_transport_validation() {
+    for (source, destination) in [
+        (addr(CLIENT), addr(DST)),
+        (addr("[fd00::2]:40000"), addr("[2001:db8::9]:443")),
+    ] {
+        for protocol in [wire::PROTO_TCP, wire::PROTO_UDP] {
+            let now = Instant::now();
+            let original = context(7, 9);
+            let mut stack = contextual_stack(now);
+            let mut fragments = fragmented(&packet(source, destination, protocol), 71);
+            fragments.reverse();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let mut called = false;
+                let (rx, report) = stack.receive_with_context(
+                    now,
+                    fragment,
+                    RxMeta::VERIFY,
+                    original,
+                    |_, context| {
+                        called = true;
+                        assert_eq!(context, original);
+                        true
+                    },
+                );
+                let complete = index + 1 == fragments.len();
+                assert_eq!(called, complete);
+                assert_eq!(report.source_context, complete.then_some(original));
+                if complete && protocol == wire::PROTO_UDP {
+                    assert!(matches!(rx, Rx::TransparentOwned { .. }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn refusal_and_unknown_reset_output_keep_their_original_sources() {
+    let now = Instant::now();
+    for how in [Refuse::Rst, Refuse::IcmpUnreachable] {
+        let mut stack = contextual_stack(now);
+        let source = context(1, 1);
+        let successor = context(2, 2);
+        let syn = packet(addr(CLIENT), addr(DST), wire::PROTO_TCP);
+        stack.receive_with_context(now, &syn, RxMeta::VERIFY, source, |_, _| true);
+        let old = stack.poll_accept().unwrap().id;
+        stack.tcp_refuse(old, how);
+        stack.receive_with_context(now, &syn, RxMeta::VERIFY, successor, |_, _| true);
+        let new = stack.poll_accept().unwrap().id;
+        assert_ne!(old, new);
+        let mut output = [0; 1500];
+        let tx = stack
+            .poll_transmit_with(now, &mut output, TxCaps::NONE)
+            .unwrap();
+        assert_eq!((tx.flow, tx.source), (Some(old), Some(source)));
+        let mut retained = Vec::new();
+        stack.visit_retained_source_contexts(|source| retained.push(source));
+        assert_eq!(retained, [successor]);
+    }
+    let mut stack = contextual_stack(now);
+    let source = context(3, 3);
+    let ack = build(
+        addr(CLIENT),
+        addr(DST),
+        100,
+        200,
+        ACK,
+        Options::default(),
+        &[],
+    );
+    stack.receive_with_context(now, &ack, RxMeta::VERIFY, source, |_, _| true);
+    let mut retained = Vec::new();
+    stack.visit_retained_source_contexts(|source| retained.push(source));
+    assert_eq!(retained, [source]);
+    let tx = stack
+        .poll_transmit_with(now, &mut [0; 1500], TxCaps::NONE)
+        .unwrap();
+    assert_eq!((tx.flow, tx.source), (None, Some(source)));
+    stack.visit_retained_source_contexts(|_| panic!("emitted unknown reset still pins source"));
+}
+
+#[test]
+fn contextual_operations_require_preparation_without_consuming_input_or_output() {
+    let now = Instant::now();
+    let mut cfg = transparent();
+    let budget = honk_netstack::MemoryBudget::new(cfg.memory_limit);
+    cfg.shared_budget = Some(budget.clone());
+    let mut stack = Stack::new(cfg, now);
+    let original = context(1, 1);
+    for protocol in [wire::PROTO_TCP, wire::PROTO_UDP] {
+        let input = packet(addr(CLIENT), addr(DST), protocol);
+        let (rx, report) =
+            stack.receive_with_context(now, &input, RxMeta::VERIFY, original, |_, _| {
+                panic!("unprepared receive reached source callback")
+            });
+        assert_eq!(rx, Rx::Dropped(DropReason::Capacity));
+        assert_eq!(report.outcome, ReceiveOutcome::Unqualified);
+        assert_eq!(report.source_context, None);
+    }
+    let mut output = [0xA5; 1500];
+    assert!(matches!(
+        stack.udp_send_from_with_context(addr(DST), addr(CLIENT), b"reply", original, &mut output,),
+        Err(honk_netstack::UdpError::Busy)
+    ));
+    assert!(output.iter().all(|&byte| byte == 0xA5));
+    assert_eq!(budget.used(), 0);
+    assert!(stack.poll_accept().is_none());
+    assert!(stack.poll_transmit(now, &mut output).is_none());
+    stack.visit_retained_source_contexts(|_| panic!("unprepared operation retained a source"));
+    stack.prepare_source_context().unwrap();
+
+    let mut cfg = transparent();
+    let budget = honk_netstack::MemoryBudget::new(0);
+    cfg.shared_budget = Some(budget.clone());
+    let mut stack = Stack::new(cfg, now);
+    assert_eq!(
+        stack.prepare_source_context(),
+        Err(honk_netstack::ConstructionError::Capacity)
+    );
+    assert_eq!(budget.used(), 0);
 }

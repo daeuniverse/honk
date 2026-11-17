@@ -353,7 +353,7 @@ fn run_child(case: &str) -> anyhow::Result<()> {
                         outbound: RoutingOutbound::Simple("direct".into()),
                         priority: 0,
                         must: true,
-                        mark: 0,
+                        mark: None,
                     });
                 }
                 config

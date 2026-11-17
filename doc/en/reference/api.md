@@ -2,6 +2,28 @@
 
 honk provides a native HTTP API, a Clash-compatible HTTP API and a userspace statistics snapshot. The native and Clash APIs have independent features, listeners, credentials, and HTTP boundaries. Both reuse the same engine handles and userspace statistics.
 
+## Native publication artifact
+
+The intended Native XDP transition contract exports a separate root-owned mode-0600 file at `<data_dir>/state/native-publication/<pid>-<starttime_ticks>-<publication_serial>.json`. It works without native/Clash HTTP features or diagnostic recording demand. Existing 64 KiB datapath detail responses are latest bounded snapshots, not continuous transition history; neither they nor the 2 MiB Native event stream contain the full publication ring. No history endpoint or new configuration knob is introduced. The implementation's focused exporter/consumer and real-hook checks are **NOT_RUN** in this handoff; the contract is not a runtime acceptance claim.
+
+Before any Native attachment, atomically published initial schema `native-publication/v1` manifest binds boot ID, PID/starttime, publication serial, root map/build identity, limits and epoch-zero initial state with `final=false`. Startup rejects unavailable recording/export prerequisites and announces the exact path in structured startup/readiness output. Full-width integers, including identities, epochs, sequences, counts and nanosecond times, are decimal strings. Clock metadata explicitly declares `CLOCK_BOOTTIME`, unit `ns`; consumers preserve store brackets rather than treating a clock read as the exact store instant.
+
+Fixed admission limits are 32 registered hook identities / 16 target identities and a 1,024-byte `data_dir` path cap, with no truncation. Exceeding either limit must explicitly refuse startup before any Native attachment. Identity-capacity overflow sets sticky `recording_error` and refuses new evidence-capable operations. The startup manifest exports all capacities, including the event ring, identity table and path cap; consumers must not infer unlimited capacity from a short retained history.
+
+The bounded export includes collection start/end, initial/final epochs and flags, readiness/failure/terminal state, `hooks_joined`, independent hook identity coverage, ordered immutable events, sealed counter-generation markers and sticky recording/clock/accounting/overflow faults. Ring metadata exposes capacity 4,096, `first_retained_seq`, `last_seq`, `total_appended` and `overwritten_events`. Unknown schema/kinds/flags, nonzero reserved fields, malformed/truncated JSON, duplicate/out-of-order sequences, unmatched store/grace/outcome records, mismatched counter tags or contradictory headers are unsupported/incomplete evidence.
+
+After actual terminal detach/join plus reader grace and counter finalization, the owner streams the ring into a same-directory temporary file, flushes/syncs it, atomically renames over the initial manifest, then syncs the directory before releasing recording resources. A separate structured shutdown field `export_publication_result` has these meanings, including shutdown paths returning an error:
+
+| Result | Meaning |
+| --- | --- |
+| `NOT_PUBLISHED` | Failure before successful replacement rename; the initial incomplete manifest remains. |
+| `PUBLISHED_DURABILITY_UNKNOWN` | Rename succeeded but directory sync failed; the visible replacement may already contain `final=true`, without confirmed durability. |
+| `PUBLISHED_DURABLE` | Replacement and directory sync succeeded. This alone does not establish complete history or joined hooks. |
+
+The shutdown result binds publication identity/path and, when published, the streamed artifact digest. The renamed file cannot certify its own later directory sync. A consumer claiming whole-run completeness must retain a **matching `PUBLISHED_DURABLE` result**, verify the published artifact's matching digest, and establish `final=true`, collection end after the requested work, terminal hook join/finalization, complete identity coverage, all covered counters sealed, matched intents/stores/graces/writer outcomes, `first_retained_seq=1`, contiguous events `1..last_seq`, `total_appended=last_seq=count(events)`, `overwritten_events=0` and no recording/clock/accounting/counter overflow. `final=true` alone, unknown durability, an absent/unbound/contradictory result, provisional counters or an initial manifest fails this requirement.
+
+Reachable failed-retained exits attempt `final=false`, `complete=false` partial export and log its publication result before forgetting owners; unproved joins remain `hooks_joined=false`. Ring eviction preserves only a detectable suffix; crash/power loss may leave the initial manifest, and a post-rename failure may leave visible terminal JSON without durable-result custody. There is no continuously fsynced crash journal or guaranteed retention duration. These records count per-hook closed-branch executions, not deduplicated packets, flows, wire arrivals or packet causality. See [counter semantics and budget](../design/datapath.md#native-closed-epoch-counters), [publication ordering](../design/control-plane.md#native-publication-transition-recording) and the [collection runbook](../operations/long-connections.md#collecting-native-publication-evidence).
+
 ## Native API
 
 Enable the opt-in `native-api` Cargo feature with `--features native-api` (or `native-ui`). `--no-default-features --features native-api` works without Clash. Choose the release artifact by the interfaces you need:
@@ -133,6 +155,8 @@ For `quic_probe`, target/client failure means one of:
 The probe target is chosen at startup. Reason `restart_required` means a reload added a Score group to a process that started without one.
 
 For `pname_routing`, absent hooks leave `pname()` conditions without a process name: positive conditions never match, and negated conditions always match. Reason `comm_fallback` means conditions use the thread name instead of argv.
+
+For an admitted packet Host source, process support is Host-only, not a global capability: code `pname_routing_host_only` has reason `host_only`, or `host_only_comm_fallback` when only thread names are available. Plain records and Host records missing a usable name retain the same Missing/negation behavior.
 
 With `iface_watch`, reconciliation runs every 60 seconds without event notifications. Its code is `interface_watcher_disabled`; its reason is `subscribe_failed` or `poll_setup_failed`.
 

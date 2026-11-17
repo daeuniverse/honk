@@ -191,6 +191,11 @@ mod routing_syntax {
             ("direct(mark:\n 0x200,\n must)", 512, true),
             ("direct(mark: 0x3fffffff)", 0x3fff_ffff, false),
             ("direct(mark: 0)", 0, false),
+            ("direct(mark: 0x40000000)", 0x4000_0000, false),
+            ("direct(mark: 0x80000000)", 0x8000_0000, false),
+            ("direct(mark: 0xc0000000)", 0xc000_0000, false),
+            ("direct(mark: 0xffffffff)", u32::MAX, false),
+            ("direct(mark: 4294967295)", u32::MAX, false),
         ] {
             let config = parse_dae_config_with_detailed_diagnostics(
                 &format!("routing {{\n domain(example.net) -> {target}\n fallback: {target}\n}}"),
@@ -199,7 +204,7 @@ mod routing_syntax {
             .unwrap();
             let rule = &config.routing.rules[0];
             assert_eq!(rule.outbound.as_str(), "direct", "{target}");
-            assert_eq!((rule.mark, rule.must), (mark, must), "{target}");
+            assert_eq!((rule.mark, rule.must), (Some(mark), must), "{target}");
             let routing = &config.routing;
             assert_eq!(routing.rules.len(), 1, "{target}");
             assert_eq!(
@@ -208,7 +213,7 @@ mod routing_syntax {
                     routing.default_mark,
                     routing.default_must
                 ),
-                ("direct", mark, must),
+                ("direct", Some(mark), must),
                 "{target}"
             );
         }
@@ -223,9 +228,8 @@ mod routing_syntax {
             "direct(mark: +1)",
             "direct(mark: 4294967296)",
             "direct(mark: 0x100000000)",
-            "direct(mark: 0x40000000)",
-            "direct(mark: 0x80000000)",
-            "direct(mark: 0xc0000000)",
+            "direct(mark: 0x)",
+            "direct(mark: 0x+1)",
             "direct(mark: 0b10)",
             "direct(mark: 0o10)",
             "direct(mark: 1_000)",

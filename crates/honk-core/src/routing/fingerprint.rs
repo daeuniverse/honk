@@ -12,7 +12,7 @@ pub(super) fn policy(
     geo_fingerprint: [u8; 32],
 ) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(b"honk.routing-policy.v2\0");
+    hash.update(b"honk.routing-policy.v3\0");
     let mut encoder = Encoder { hash: &mut hash };
     encode_action(&mut encoder, fallback);
     encoder.fixed(&geo_fingerprint);
@@ -80,7 +80,8 @@ fn encode_route(encoder: &mut Encoder<'_>, route: &CompiledRoute) {
 fn encode_action(encoder: &mut Encoder<'_>, action: &RouteAction) {
     encoder.string(&action.outbound);
     encoder.bool(action.must);
-    encoder.u32(action.mark.map_or(0, honk_outbound::proxy::DirectMark::get));
+    encoder.bool(action.mark.is_some());
+    encoder.u32(action.mark.unwrap_or(0));
 }
 
 fn encode_condition(encoder: &mut Encoder<'_>, condition: &CompiledCondition) {
@@ -282,7 +283,7 @@ mod tests {
         let mut changed = base.clone();
         changed.rule_payload = "tcp".into();
         changed.action.must = true;
-        changed.action.mark = honk_outbound::proxy::DirectMark::new(7);
+        changed.action.mark = Some(7);
         assert_ne!(
             digest(std::slice::from_ref(&base), &[]),
             digest(&[changed], &[])
@@ -299,7 +300,11 @@ mod tests {
                 ..plain.clone()
             },
             RouteAction {
-                mark: honk_outbound::proxy::DirectMark::new(7),
+                mark: Some(7),
+                ..plain.clone()
+            },
+            RouteAction {
+                mark: Some(0),
                 ..plain.clone()
             },
         ] {
@@ -328,7 +333,7 @@ mod tests {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         let first =
             crate::routing::Router::new(&[make_rule("abcdefghijklmnop-first")], "direct").unwrap();

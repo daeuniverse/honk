@@ -143,6 +143,20 @@ ACK 取得进展时，同时撤销旧 PTO deadline 与已到期但尚未物化�
 
 CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ batch 内按精确 scope 混合归还。TCP 重传 ring 和 ACK 生命周期仍与 UMEM/CQ 分离：ACK 不能释放在途 DMA owner，CQ 不能确认 TCP。既有 CPU backing 与进程生命周期 UMEM 仍完整计费。符合资格的直接生成输出只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制；TCP payload 复制/校验和及 socket/relay 复制仍存在。这不是免 payload 复制的 TCP、通用 UDP zero-copy、更低常驻内存或已测性能收益；既有 E3.1 driver handoff 不变。
 
+物理 XDP 的每个逻辑入口在同一 `PacketRealm` 下使用一个或两个独立 Stack owner。
+队列永久归属 `queue_id % workers`；TCP 按不可变 keyed tuple 分片，UDP 按
+client 地址分片。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与
+CQ 则保留精确 owner 和 FlowId。跨 worker 交接共用 64 个已计费 cell，每个目的
+队列最多等待 32 项，借用 RX 不会逃出 callback。Core、Host 与 Native 协调留在
+worker 0；远端原包在真实 completion 与确认前始终由原 Port 持有。drain 确认
+绑定该轮开始前观察到的 epoch，不能借用后来发布的 barrier。
+
+重组通过本地不回绕 incarnation 将身份保留到完成包及 timeout 输出。最早输入
+时间控制原 fragment deadline 和返回快照；最晚实际分片输入时间才是完整报文
+开始协议处理及原两秒 Core 路由等待窗的时间。排队服务不会重启任一期限。
+realm 的半开、control、UDP 与 ICMP 总限额仍共享；下述 singleton capture
+helper 保留原总量，物理 capture 仅在其 Stack owner 之间分配，不复制上限。
+
 XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。阻塞 scope 保留原有 100ms 共享预算后备，已设期限直到服务才重置，不被无关轮询延后。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
 
 AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_WAKEUP 检查合并到轮次出口，独立发送仍立即 kick。每个正常出口保留工作错误和最终 kick 错误，批次不跨 await。panic 只关闭准入，不在析构中执行 I/O 或释放已发布 owner；这些 owner 只能由真实 CQ 归还。
@@ -153,23 +167,42 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 已接受的 packet DNS 应答写入同一 scope 的 canonical [路由投影](./dns.md#路由投影)，新建数值目标的 TCP/UDP 流无需嗅探名称即可消费这些事实。它们不授予 HOST/内核投影权威。
 
+XDP `direct: native` 让选择 Kernel 执行的原包通过真实 PASS 绕过 Stack。被捕获且选择 group 的原包必须先校验精确共享 Capture owner，再获得规范 Endpoint snapshot；之后变成字面 Native Direct 的决定在协议修改前拒绝。Capture 退役以 `PacketEndpoints::retains` 为准，包括控制器 DNS 查询/output 尾部释放前真实持有的 `SourceWork`。执行排他仍由同一 driver、source pool 和 output/CQ owner 保持。Early PASS 不新增 retained frame lease，也不实现已捕获原包返回。
+
 正常关闭先关闭准入并发布同一个控制面 shutdown signal，再启动协议 abort，随后等待正在执行的 selector 精确退休。应用关闭以及已导出/CQ 持有输出的实际释放仍必须完成；命令完成或空 scope owner 退出都不能伪造这些释放。
 
-TUN 以保留的 `Option<PreparedDnsBind>` 和唯一真实非 HOST scope 调用 `start_driven(plane, scopes, udp_capacity, prepared_dns_addresses)`；XDP 传 `None`。公开 `PacketEndpoints::new()` 嵌入构造器不变。两个 configured packet 后端共用 subscription/command/flags/DNS supervisor，不另建 Router 或 flow executor。
+TUN 向 driven supervisor 传入保留的 DNS bind 候选和明确的 plain 独立 DNS scope。false 使用一个 scope，true 增加独立 Host scope；XDP 和普通嵌入保留 HOST 独立 DNS。两个后端共用 supervisor 和 Router。
 
-`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` 与 `CAPTURE_MEMORY` 让 XDP 或 TUN 的 scope 和设备/runtime 存储共用一个 256 MiB capture 预算。准入 `R` 个 realm 时，每个 Stack 的 limit 为 `128 MiB / R`，flow/slot 上限为 `min(4096 / R, 1024)`；每个 scope 保留 32 个 control frame 和 256 个 waiter。bulk 容量由调用方选择。默认 CPU backing 在分配前按每 scope `(32 + bulk_frames) * mtu.max(1280)` 字节计费：bulk 128 对应 160 个 frame，bulk 256 对应 288 个 frame。内部 `capture_scope_with_output` 可以选择单独计费的输出容量和能力，不改变逻辑 MTU。metadata 和 Stack 存储仍在同一共享预算内计费。两个 helper 都选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
+`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` 与 `CAPTURE_MEMORY` 让 XDP 或 TUN 的 scope 和设备/runtime 存储共用一个 384 MiB capture 预算。准入 `R` 个 realm 时，每个 Stack 的 limit 为 `192 MiB / R`，flow/slot 上限为 `min(4096 / R, 1024)`；每个 scope 保留 32 个 control frame 和 256 个 waiter。bulk 容量由调用方选择。默认 CPU backing 在分配前按每 scope `(32 + bulk_frames) * mtu.max(1280)` 字节计费：bulk 128 对应 160 个 frame，bulk 256 对应 288 个 frame。内部 `capture_scope_with_output` 可以选择单独计费的输出容量和能力，不改变逻辑 MTU。metadata 和 Stack 存储仍在同一共享预算内计费。两个 helper 都选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
 
 XDP 按每个物理设备经过溢出检查的 `physical_mtu + 22 <= FRAME_SIZE`（4096 字节）选择容量，覆盖 Ethernet 和最多两层 VLAN tag。满足条件的设备采用 RX/control/bulk 为 256/32/480 frame 的 Port 分区和 512 项 ring，其上每个 realm 使用 256 个 bulk frame。每个此类 Port 预留 3 MiB、保留至进程退出的 UMEM，另行计费的 metadata 和 ring 不包含在内。超过此界限的设备，包括带较小逻辑 realm 的 jumbo 设备，保持原有显式容量：Port 分区 256/32/224、256 项 ring、scope bulk 128，每 Port 的 UMEM 为 2 MiB。两条路径使用同一后端，RX SG 能力与 bind 校验不变；此界限只证明 TX 为单 frame。单个 scope 的 256 个 bulk owner 会留下 224 个 Port bulk frame，而原有 128/224 容量留下 96 个；其他 realm 和 Core 输出仍可使用这些余量。调度及每轮每 realm 每类别 32 个输出的限制不变，不承诺普遍公平性或已测吞吐收益。
 
-优化后的 Port 与 scope 预留更大，因此在固定 256 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
+优化后的 Port 与 scope 预留更大，因此在 384 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
 
-TUN 选择 bulk 128，固定一个 realm，采用配置的逻辑 MTU（默认 1500），UDP capacity 保持非零 `min(64, resource_budget.udp_endpoints)`。其 160 个 CPU frame 各自拥有单独计费的 65,535 字节输出容量（总 backing 为 10,485,600 字节），并启用 TCPv4/TCPv6 TSO 能力。该容量不改变通告 MSS/PMTU 或普通 UDP 的 MTU 行为。
+TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个 realm，true 使用两个。每个 scope 的 160 个 CPU frame 各计费 65,535 字节（总计 10,485,600 字节）；共用 384 MiB 预算和一个 UDP pool，不改变 MSS/PMTU 或普通 UDP MTU。
 
 [TUN owner](./datapath.md#fd-报文管线) 保留 CPU-backed `OutputLease` 及原始 `Transmit`。setup 要求独占、单队列、非 persistent 的 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`，设置并回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。
 
-Control/Bulk 各最多 32 个 pending lease。一次 `writev` 将 vnet 头与不可变 lease IP 字节作为完整 record 提交，包括普通 ACK/UDP/control 输出。EAGAIN/EINTR 保留精确 lease、metadata、bytes、scope 和原 FlowId 直到 writable；短/零写为终止错误，不写 suffix、不重放整条 record。完整写仅释放本地所有权，没有 CQ 或远端交付声明。就绪与 joined close 期间持续服务 driver，包括失败启动。正常 stop 处置 closing output，先 join 真实 owner 再删 route/receipt；失败保留路由 guard 与 receipt。归还/Drop driver 不代表 joined cleanup ack。
+每个 scope/class 最多保留 32 个 pending lease。一次 `writev` 提交不可变 record；EAGAIN/EINTR 保留原 lease，短/零写为终止错误，不重放。就绪和 joined close 期间服务所有 driver。独立 DNS 在 plain scope 学习，透明 DNS 使用各 packet 的 scope，均不借用 HOST 事实。Socket HostFacts 保留原始来源有效期与所有权；plain 不提供进程或 Native 权威。Native bypass 和 captured return 仍未实现。
 
-TUN packet DNS 与独立 listener 都在真实注册 realm 学习，包括 Host socket 发出的流量，绝不借用 HOST 事实。Scope/L3 不提供经认证的 origin/process fact、原 socket 或 Native 权威；S-b HostFacts、S-c 导入前 bypass、S-d captured return 均未实现。S-a 不代表 E6.4 完成、性能结果或 VM 实测验收。
+显式 XDP [Host 捕获](./datapath.md#host-来源托管) 在 Endpoint 启动前准备单独的
+认证 scope，导入前检查有效 source receipt。source lineage 包含 namespace、
+attachment、socket cookie、operation incarnation 及原 return identity；不可变
+fact snapshot 还会在 mark/process fact 改变时分隔执行。既有精确 TCP FlowId、
+UDP initializer/source owner、重组及排队/导出的 `OutputLease` 保留该 context；
+tuple 复用或更新 snapshot 都不能把旧工作重新指向新来源。路由使用实际进程是否存在
+的事实，不伪造身份。普通 Direct/proxy 新建带 mark 的 outbound，生成回复由普通
+Linux demultiplexing 交付，不恢复原 socket operation，也不授予 Native 续行。
+
+Host source-context cell/index 在 scope 冷准备时计费并分配，准入与 generation
+exhaustion 有界；活动 protocol、fragment、work 和 output owner 阻止回收。冷启动
+namespace setup 保留绑定该 namespace 的 custody socket，后续查询不再切换 namespace。
+Host 为 fixed map/loader storage 预留 96 MiB，验证实际 kernel allocation 不超过
+64 MiB，并为 running-BTF 准备峰值及有界 source/child custody snapshot 单独计费。
+这些与私有 Copy Port、UMEM、scope 和 output storage 共用 384 MiB capture
+预算；这是预留契约，不是整个进程的 RSS 测量。BTF 准备存储在 setup 后释放，retained
+fixed kernel 与 UMEM 计费持续到进程退出，包括资源移除后或创建 pin 后 setup 失败时。
+此 XDP 路径本身不授予 Native 或 TUN 能力，也不代表完整 V7、E6/E7、physical 或 13-size 验收。
 
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
 不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出
@@ -511,7 +544,7 @@ TUN smoke 通过原始客户端 socket 成功 `SHUT_WR`、完整保留尾部的�
 
 以下内容目前不在 `crates/honk-netstack/src` 中，或不在仓库中；这份清单就是本页论断的边界。
 
-- Netmap、Windows 后端仍未实现。Linux TUN 仅提供 daemon-owned S-a Endpoint capture；经认证 HostFacts（S-b）、导入前 Native（S-c）、原 operation custody 及 FD read 后 captured return（S-d）均未实现。Scope/mark/tuple 或将生成包写回 TUN 均不提供这些能力。S-a 不代表 E6.4 完成，实现也不代表 VM 实测、生产或硬件验收。
+- Netmap、Windows、Native 续行、原 operation custody 和 captured return 仍未实现。TUN 可选提供 socket HostFacts，不提供 Native 权威；实现不代表 VM 实测、生产或硬件验收。
 - eBPF/TC 一侧：classifier 的投递位、把流导向栈的 steering、必须比 TIME_WAIT 活得更久的投递状态（[关闭语义](#关闭语义)），以及在 TC 层代理非首分片。
 - ICMP 代理：在客户端与真实上游之间转发 echo 或错误。栈只会针对未确认的 TCP 序号消费 ICMP，并生成上文列出的错误。
 - 透明模式的任何性能门槛或实测数字。
@@ -551,7 +584,7 @@ driver 位于 `honk-outbound/src/proxy/wireguard/`；规范在[出站设计](./o
 | 接收 | 每流最多 32 个乱序区间；ACK 拉伸受 64 包接收批次限制。 |
 | 规模 | 空闲的已建立流约占 1.4 KiB 堆（无 chunk）；每条隧道 4096 个流，每条被接纳的流从进程预算预留约 33 KiB 的 floor；预算即份额（默认 256 MiB，honk 取内存的 1/8，限制在 64 MiB..4 GiB），所有隧道的栈共同使用，64 MiB / 256 MiB / 1 GiB 下仅 floor 约可容纳 2,000 / 8,000 / 32,000 条流；活动隧道数由其固定开销限制，`share / 4 MiB`，夹在 1..128；`max_flows` 统计 UDP 关联；每条隧道一把锁、一个 owner 任务，因此单条隧道受限于一个核。 |
 | WireGuard | 每条隧道恰好一个 peer；无入站连接；IPv4 与 IPv6 各自需要配置隧道地址；endpoint 域名只在握手尝试超时之后的下一次获取时重新解析，已有会话时端点集合不变；每个 control plane 每个（密钥对，端点）只有一条隧道（不带 runtime 的拨号共用一个单独的进程级 registry），每个 registry 的活动隧道最多 `share / 4 MiB` 条（1..128，见规模）；共享密钥对与端点的节点必须所有隧道设置一致，否则互相替换，主机名与 IP 字面量写法的同一端点是不同的隧道；内层 MTU 至多 65472，使外层数据报装得进一个 UDP 载荷。 |
-| 透明 | core packet 嵌入与 Linux XDP/TUN Endpoint 后端；无 netmap/Windows、Android/VpnService 集成、经认证 HostFacts、Native 续行或 captured return。约 9 KiB floor 不是 accepted/idle 总承诺。TUN 使用带 checksum/TCP offload 的独占单队列，无外部/persistent FD、UFO、USO 或 TSO ECN。设备集成需要真实内核验证，不宣称实验室性能收益。 |
+| 透明 | core packet 嵌入与 Linux XDP/TUN Endpoint 后端；无 netmap/Windows、Android/VpnService、Native 续行或 captured return。TUN 可选接纳 socket HostFacts。独占单队列使用 checksum/TCP offload，无外部/persistent FD、UFO、USO 或 TSO ECN。设备集成需要真实内核验证，不宣称实验室性能收益。 |
 | 验证 | 没有对非 Linux TCP 实现的互通测试，没有 ARM 实测，也没有跑 `test-routing`/`test-netns` 虚拟机门槛。设计阈值在一台 x86-64 4-vCPU 虚拟机上以内核 WireGuard + 内核 TCP 为对照实测（不是设计里的同一外层引擎 + TUN 对照臂，且 honk 一侧多一跳本地中继）：G1–G4 通过，G5 下行公平性按中位数通过，G5 空闲内存（含驱动与中继状态约每流 4 KiB）未达到 1 KiB 目标；证据在 `bench` 分支的 `bench/netstack/results/` 下。 |
 
 ## 设计验证（P1）

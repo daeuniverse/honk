@@ -3,10 +3,9 @@
 //! Embeds the release tag or Git description for the CLI and Clash API, and
 //! the full source commit that TUN setup receipts record.
 //!
-//! When the `ebpf` feature is enabled, this script ensures the eBPF object
-//! file is available and copies it into `OUT_DIR` so `lib.rs` can embed it
-//! via `include_bytes!`.  If the object does not exist yet, it is built
-//! automatically using the nightly toolchain.
+//! When the `ebpf` feature is enabled, this script ensures the eBPF objects
+//! are available and copies them into `OUT_DIR` for `include_bytes!`.
+//! Missing or stale objects are built together using the nightly toolchain.
 
 fn main() {
     emit_version();
@@ -272,7 +271,12 @@ fn embed_ebpf_object() {
     );
     let ebpf_crate = manifest_dir.join("../honk-ebpf");
     let ebpf_common_crate = manifest_dir.join("../honk-ebpf-common");
-    let ebpf_target = ebpf_crate.join("target/bpfel-unknown-none/release/honk-ebpf");
+    let target_dir = ebpf_crate.join("target/bpfel-unknown-none/release");
+    let targets = [
+        target_dir.join("honk-ebpf"),
+        target_dir.join("honk-host"),
+        target_dir.join("honk-tun"),
+    ];
     let toolchain_file = ebpf_crate.join("rust-toolchain.toml");
     println!("cargo:rerun-if-changed={}", toolchain_file.display());
     let toolchain =
@@ -324,131 +328,147 @@ fn embed_ebpf_object() {
         newest
     }
 
-    fn object_stale(obj: &Path, src_dirs: &[&Path]) -> bool {
+    fn object_stale(obj: &Path, sources: &[PathBuf]) -> bool {
         let Ok(obj_mtime) = obj.metadata().and_then(|m| m.modified()) else {
             return true;
         };
-        src_dirs
+        sources
             .iter()
-            .filter_map(|d| newest_mtime(d))
-            .any(|src_mtime| src_mtime > obj_mtime)
+            .any(|source| newest_mtime(source).is_none_or(|mtime| mtime > obj_mtime))
     }
 
-    let candidates = [
-        ebpf_target.clone(),
-        manifest_dir.join("../../target/honk-core.o"),
-    ];
+    fn object_receipt(path: &Path, channel: &str) -> Option<String> {
+        let metadata = path.metadata().ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(format!(
+            "{channel}\n{}:{}",
+            metadata.len(),
+            modified.as_nanos()
+        ))
+    }
 
-    let obj = candidates.iter().find(|p| p.exists()).cloned();
-    let src_dirs = [
+    let sources = [
         ebpf_crate.join("src"),
         ebpf_common_crate.join("src"),
+        ebpf_crate.join("Cargo.toml"),
         toolchain_file,
     ];
-
-    let obj = match obj {
-        Some(p)
-            if object_has_btf(&p)
-                // A restored object may have a newer mtime than the changed pin.
-                && std::fs::read_to_string(p.with_extension("toolchain"))
-                    .is_ok_and(|built_channel| built_channel == channel)
-                && !object_stale(
-                    &p.with_extension("toolchain"),
-                    &[manifest_dir.join("build.rs").as_path()],
-                )
-                && !object_stale(
-                    &p,
-                    &src_dirs.iter().map(|d| d.as_path()).collect::<Vec<_>>(),
-                ) =>
-        {
-            println!("cargo:rerun-if-changed={}", p.display());
-            p
-        }
-        stale => {
-            if let Some(p) = &stale
-                && p.exists()
-                && object_has_btf(p)
-            {
-                println!(
-                    "cargo:warning=eBPF object at {} has stale sources or toolchain — rebuilding with {channel}",
-                    p.display()
-                );
-            }
-            // Missing, or stale without .BTF (e.g. built while an environment
-            // RUSTFLAGS overrode crates/honk-ebpf/.cargo/config.toml): (re)build.
-            println!("cargo:warning=Building eBPF object with {channel}...");
-            let status = {
-                let mut command = Command::new("cargo");
-                for (key, _) in std::env::vars_os() {
-                    if key.as_encoded_bytes().starts_with(b"CARGO_PROFILE_") {
-                        command.env_remove(key);
-                    }
+    let build_script = manifest_dir.join("build.rs");
+    let mut objects = [
+        [
+            targets[0].clone(),
+            manifest_dir.join("../../target/honk-core.o"),
+        ]
+        .into_iter()
+        .find(|path| path.exists())
+        .unwrap_or_else(|| targets[0].clone()),
+        targets[1].clone(),
+        targets[2].clone(),
+    ];
+    if objects.iter().any(|path| {
+        !object_has_btf(path)
+            // A partial cache restore must not pair old bytes with a newer receipt.
+            || !std::fs::read_to_string(path.with_extension("toolchain"))
+                .is_ok_and(|receipt| Some(receipt) == object_receipt(path, channel))
+            || object_stale(
+                &path.with_extension("toolchain"),
+                std::slice::from_ref(&build_script),
+            )
+            // Cargo may relink only one binary when a shared source tree changes.
+            || object_stale(&path.with_extension("toolchain"), &sources)
+    }) {
+        println!(
+            "cargo:warning=Building honk-ebpf, honk-host and honk-tun objects with {channel}..."
+        );
+        let status = {
+            let mut command = Command::new("cargo");
+            for (key, _) in std::env::vars_os() {
+                if key.as_encoded_bytes().starts_with(b"CARGO_PROFILE_") {
+                    command.env_remove(key);
                 }
-                command
             }
-            .arg(format!("+{channel}"))
-            .args([
-                "build",
-                "--release",
-                "-Zbuild-std=core",
-                "--target",
-                "bpfel-unknown-none",
-            ])
-            // Cargo exports its absolute host rustc path to build scripts.
-            // Let the selected nightly resolve its own compiler and sysroot.
-            .env_remove("RUSTC")
-            // An inherited RUSTFLAGS would override the crate's
-            // .cargo/config.toml rustflags (--btf, debuginfo) and silently
-            // produce a BTF-less object again.
-            .env_remove("RUSTFLAGS")
-            .env_remove("CARGO_ENCODED_RUSTFLAGS")
-            // Parent workspace analysis must not turn this separate build into clippy.
-            .env_remove("RUSTC_WORKSPACE_WRAPPER")
-            .env_remove("CLIPPY_ARGS")
-            .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
-            .current_dir(&ebpf_crate)
-            .status()
-            .expect("failed to build eBPF object");
-
-            if !status.success() {
-                panic!(
-                    "eBPF build failed. Build manually:\n  \
-                     cd crates/honk-ebpf && cargo +{channel} build --release \
-                     -Zbuild-std=core --target bpfel-unknown-none"
-                );
-            }
-            if !object_has_btf(&ebpf_target) {
-                panic!(
-                    "eBPF object at {} has no .BTF section — aya cannot load it. \
-                     Rebuild manually:\n  \
-                     cd crates/honk-ebpf && cargo +{channel} build --release \
-                     -Zbuild-std=core --target bpfel-unknown-none",
-                    ebpf_target.display()
-                );
-            }
-            std::fs::write(ebpf_target.with_extension("toolchain"), channel)
-                .expect("failed to record eBPF object toolchain");
-            println!("cargo:rerun-if-changed={}", ebpf_target.display());
-            ebpf_target
+            command
         }
-    };
+        .arg(format!("+{channel}"))
+        .args([
+            "build",
+            "--release",
+            "-Zbuild-std=core",
+            "--target",
+            "bpfel-unknown-none",
+            "--bin",
+            "honk-ebpf",
+            "--bin",
+            "honk-host",
+            "--bin",
+            "honk-tun",
+        ])
+        // Cargo exports its absolute host rustc path to build scripts.
+        // Let the selected nightly resolve its own compiler and sysroot.
+        .env_remove("RUSTC")
+        // An inherited RUSTFLAGS would override the crate's
+        // .cargo/config.toml rustflags (--btf, debuginfo) and silently
+        // produce a BTF-less object again.
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        // Parent workspace analysis must not turn this separate build into clippy.
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CLIPPY_ARGS")
+        .env("CARGO_TARGET_DIR", ebpf_crate.join("target"))
+        .current_dir(&ebpf_crate)
+        .status()
+        .expect("failed to build eBPF objects");
 
+        if !status.success() {
+            panic!(
+                "eBPF build failed. Build manually:\n  \
+                 cd crates/honk-ebpf && cargo +{channel} build --release \
+                 -Zbuild-std=core --target bpfel-unknown-none --bin honk-ebpf --bin honk-host --bin honk-tun"
+            );
+        }
+        for path in &targets {
+            if !object_has_btf(path) {
+                panic!(
+                    "eBPF object at {} is missing or has no .BTF section after building",
+                    path.display()
+                );
+            }
+        }
+        for path in &targets {
+            std::fs::write(
+                path.with_extension("toolchain"),
+                object_receipt(path, channel).expect("failed to inspect built eBPF object"),
+            )
+            .expect("failed to record eBPF object toolchain");
+        }
+        objects = targets;
+    }
+
+    for source in &sources {
+        println!("cargo:rerun-if-changed={}", source.display());
+    }
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let dest = out_dir.join("honk-ebpf.o");
-    std::fs::copy(&obj, &dest)
-        .unwrap_or_else(|e| panic!("copy {} -> {}: {}", obj.display(), dest.display(), e));
-
-    println!(
-        "cargo:rerun-if-changed={}",
-        ebpf_crate.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        ebpf_common_crate.join("src").display()
-    );
-    println!("cargo:rustc-env=HONK_EBPF_OBJECT={}", dest.display());
-    println!(
-        "cargo:warning=eBPF object embedded ({} bytes)",
-        obj.metadata().map(|m| m.len()).unwrap_or(0)
-    );
+    for (object, (name, env_key)) in objects.iter().zip([
+        ("honk-ebpf.o", "HONK_EBPF_OBJECT"),
+        ("honk-host.o", "HONK_HOST_EBPF_OBJECT"),
+        ("honk-tun.o", "HONK_TUN_EBPF_OBJECT"),
+    ]) {
+        let dest = out_dir.join(name);
+        std::fs::copy(object, &dest)
+            .unwrap_or_else(|e| panic!("copy {} -> {}: {}", object.display(), dest.display(), e));
+        println!("cargo:rerun-if-changed={}", object.display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            object.with_extension("toolchain").display()
+        );
+        println!("cargo:rustc-env={env_key}={}", dest.display());
+        println!(
+            "cargo:warning={name} embedded ({} bytes)",
+            object.metadata().map(|m| m.len()).unwrap_or(0)
+        );
+    }
 }

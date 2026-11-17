@@ -272,6 +272,7 @@ impl Tcb {
                     offset: 16,
                 },
                 flow: None,
+                source: None,
             };
         }
         if flags & (ACK | SYN) != 0 && flags & RST == 0 {

@@ -32,6 +32,7 @@ async fn packet_plane_with(
                 address6: Some("fd00:686f:6e6b:100::1".parse().unwrap()),
                 table: 202,
                 rule_priority: 10000,
+                host_facts: false,
                 capture: vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()],
             }),
             ..Default::default()
@@ -40,6 +41,51 @@ async fn packet_plane_with(
         *accepted = Arc::new(config);
     }
     (plane, health)
+}
+async fn start_packet(
+    plane: ControlPlane,
+    scopes: Vec<(PacketScope, PacketOwner)>,
+    capacity: usize,
+) -> anyhow::Result<(PacketEndpoints, PacketEndpointOwner, Vec<PacketDriver>)> {
+    let tun = plane
+        .config
+        .read()
+        .await
+        .datapath
+        .as_ref()
+        .is_some_and(|datapath| datapath.backend == Backend::Tun);
+    if !tun {
+        let (endpoints, owner) = PacketEndpoints::new(plane, scopes, capacity).await?;
+        return Ok((endpoints, owner, Vec::new()));
+    }
+    let dns_scope = scopes[0].0.scope();
+    let (endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, scopes, capacity, None, dns_scope).await?;
+    std::future::poll_fn(|cx| {
+        for driver in &mut drivers {
+            driver.service(cx, Instant::now());
+        }
+        owner.poll_ready(cx)
+    })
+    .await?;
+    Ok((endpoints, owner, drivers))
+}
+
+async fn join_packet(
+    endpoints: PacketEndpoints,
+    mut owner: PacketEndpointOwner,
+    mut drivers: Vec<PacketDriver>,
+) {
+    endpoints.close();
+    let (_, result) = std::future::poll_fn(|cx| {
+        for driver in &mut drivers {
+            driver.service(cx, Instant::now());
+        }
+        owner.poll_join_plane(cx)
+    })
+    .await
+    .unwrap();
+    result.unwrap();
 }
 
 #[cfg(all(feature = "native-api", feature = "clash-api", target_os = "linux"))]
@@ -96,9 +142,10 @@ async fn configured_packet_startup_initializes_exact_mode_flags_before_capture()
                 let policy = Arc::clone(&plane.ebpf);
                 let flags = plane.datapath_flags_handle().unwrap();
                 let restored = flags.snapshot();
-                let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
-                    .await
-                    .unwrap();
+                let (endpoints, owner, drivers) =
+                    start_packet(plane, vec![(scope, scope_owner)], 1)
+                        .await
+                        .unwrap();
                 assert_eq!(policy.read().await.datapath_flags_write_log(), [expected]);
                 flags.fence_nfqueue().await.unwrap();
                 flags.reopen_nfqueue().await.unwrap();
@@ -108,8 +155,7 @@ async fn configured_packet_startup_initializes_exact_mode_flags_before_capture()
                     [expected; 3]
                 );
                 endpoints.capture_ready().unwrap();
-                endpoints.shutdown().await.unwrap();
-                owner.run().await.unwrap();
+                join_packet(endpoints, owner, drivers).await;
             }
         }
     })
@@ -129,11 +175,7 @@ async fn configured_packet_flag_failure_retains_cleanup_until_output_returns() {
             let policy = Arc::clone(&plane.ebpf);
             let mut held_backend = policy.write().await;
             held_backend.arm_datapath_flags_write_fault(1).unwrap();
-            let mut opening = Box::pin(PacketEndpoints::new(
-                plane,
-                vec![(scope.clone(), scope_owner)],
-                1,
-            ));
+            let mut opening = Box::pin(start_packet(plane, vec![(scope.clone(), scope_owner)], 1));
             assert!(futures::poll!(&mut opening).is_pending());
             scope
                 .datagram_sender("198.51.100.1:53".parse().unwrap())
@@ -401,9 +443,12 @@ async fn configured_packet_running_waits_for_actual_capture_activation() {
             let (mut plane, _health) = packet_plane(backend, "Rule", "block").await;
             *plane.ebpf.write().await = Box::new(crate::ebpf::userspace::UserspaceBackend::new(
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(parking_lot::RwLock::new(
+                    crate::ebpf::PnameSupport::Unavailable,
+                )),
             ));
             let mut phase = plane.observe_phase();
-            let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+            let (endpoints, owner, drivers) = start_packet(plane, vec![(scope, scope_owner)], 1)
                 .await
                 .unwrap();
             assert_eq!(*phase.borrow(), super::super::super::EnginePhase::Starting);
@@ -412,8 +457,7 @@ async fn configured_packet_running_waits_for_actual_capture_activation() {
             while *phase.borrow() != super::super::super::EnginePhase::Running {
                 phase.changed().await.unwrap();
             }
-            endpoints.shutdown().await.unwrap();
-            owner.run().await.unwrap();
+            join_packet(endpoints, owner, drivers).await;
         }
     })
     .await
@@ -442,7 +486,7 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
                 outbound: RoutingOutbound::Simple("block".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             });
             let (endpoints, owner) =
                 PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 4)
@@ -527,7 +571,7 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
             let late_source = "192.0.2.10:41002".parse().unwrap();
             let queue_initializer = |source| {
                 endpoints
-                    .queue_datagram(scope.scope(), source, destination, 0, None, |budget| {
+                    .queue_datagram(&scope, source, destination, 0, None, None, |budget| {
                         FundedDatagram::copy_from(b"cancelled", budget)
                     })
                     .unwrap();
@@ -622,10 +666,16 @@ async fn driven_start_keeps_the_ordinary_pairing_and_budget_validation() {
     let (first, first_owner) = scope(&budget);
     let (_second, second_owner) = scope(&budget);
     let (plane, _health) = local_plane().await;
-    let swapped =
-        PacketEndpoints::start_driven(plane, vec![(first.clone(), second_owner)], 1, None)
-            .err()
-            .expect("a swapped owner must not receive a driver");
+    let swapped = PacketEndpoints::start_driven(
+        plane,
+        vec![(first.clone(), second_owner)],
+        1,
+        None,
+        ScopeId::HOST,
+    )
+    .await
+    .err()
+    .expect("a swapped owner must not receive a driver");
     assert!(format!("{swapped:#}").contains("owner mismatch"));
     let foreign = MemoryBudget::new(32 << 20);
     let (other, other_owner) = scope(&foreign);
@@ -635,7 +685,9 @@ async fn driven_start_keeps_the_ordinary_pairing_and_budget_validation() {
         vec![(first, first_owner), (other, other_owner)],
         1,
         None,
+        ScopeId::HOST,
     )
+    .await
     .err()
     .expect("a foreign budget must not receive a driver");
     assert!(format!("{mixed:#}").contains("one memory ceiling"));
@@ -651,9 +703,15 @@ async fn driven_startup_failure_keeps_drivers_serviceable_and_reports_abandonmen
             let budget = MemoryBudget::new(32 << 20);
             let (scope, scope_owner) = scope(&budget);
             let (plane, _health) = local_plane().await;
-            let (endpoints, mut owner, mut drivers) =
-                PacketEndpoints::start_driven(plane, vec![(scope.clone(), scope_owner)], 1, None)
-                    .unwrap();
+            let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
+                plane,
+                vec![(scope.clone(), scope_owner)],
+                1,
+                None,
+                ScopeId::HOST,
+            )
+            .await
+            .unwrap();
             let mut driver = drivers.pop();
             scope
                 .datagram_sender("198.51.100.1:53".parse().unwrap())
@@ -727,7 +785,9 @@ async fn driven_task_admission_failure_keeps_unspawned_owner_until_output_return
             vec![(first.clone(), first_owner), (second.clone(), second_owner)],
             1,
             None,
+            ScopeId::HOST,
         )
+        .await
         .unwrap();
         let mut held = Vec::new();
         for (index, scope) in [&first, &second].into_iter().enumerate() {
@@ -808,7 +868,7 @@ async fn configured_packet_reload_authorizes_subscription_workers() {
             };
             let id = subscription.id;
             candidate.subscriptions.push(subscription);
-            let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
+            let (endpoints, owner, drivers) = start_packet(plane, vec![(scope, scope_owner)], 1)
                 .await
                 .unwrap();
             let (result, reply) = tokio::sync::oneshot::channel();
@@ -848,12 +908,141 @@ async fn configured_packet_reload_authorizes_subscription_workers() {
                     worker_revision == revision
                 );
             }
-            endpoints.shutdown().await.unwrap();
-            owner.run().await.unwrap();
+            join_packet(endpoints, owner, drivers).await;
         }
     })
     .await
     .expect("configured packet commands must retain subscription authorization");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_dual_capture_cold_start_fits_with_retained_producer_charge() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_scope_with_output};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        // Retain the producer's declared fixture charge throughout startup and joined teardown.
+        let producer_bytes = 32 << 20;
+        let producer = budget.reserve(producer_bytes).unwrap();
+        let caps = honk_netstack::TxCaps {
+            tso4: true,
+            tso6: true,
+            uso4: false,
+            uso6: false,
+        };
+        let plain =
+            capture_scope_with_output(1500, 2, 128, u16::MAX as usize, caps, &budget).unwrap();
+        let host =
+            capture_scope_with_output(1500, 2, 128, u16::MAX as usize, caps, &budget).unwrap();
+        host.0.prepare_host().unwrap();
+        let dns_scope = plain.0.scope();
+        let (plane, _health) = packet_plane(Backend::Tun, "Rule", "block").await;
+        {
+            let mut accepted = plane.config.write().await;
+            let mut config = (**accepted).clone();
+            config
+                .datapath
+                .as_mut()
+                .unwrap()
+                .tun
+                .as_mut()
+                .unwrap()
+                .host_facts = true;
+            *accepted = Arc::new(config);
+        }
+        let projection = plane.dns_controller.routing_projection();
+        let capacity = plane.packet_udp_capacity();
+        let (endpoints, mut owner, mut drivers) =
+            PacketEndpoints::start_driven(plane, vec![plain, host], capacity, None, dns_scope)
+                .await
+                .unwrap();
+        std::future::poll_fn(|cx| {
+            for driver in &mut drivers {
+                driver.service(cx, Instant::now());
+            }
+            owner.poll_ready(cx)
+        })
+        .await
+        .unwrap();
+        assert_eq!(drivers.len(), 2);
+        assert!(budget.used() <= CAPTURE_MEMORY);
+        join_packet(endpoints, owner, drivers).await;
+        projection.shutdown(Duration::from_secs(1)).await;
+        drop(projection);
+        assert_eq!(budget.used(), producer_bytes);
+        drop(producer);
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("real dual capture scopes and the shared supervisor must fit and join");
+}
+
+#[tokio::test]
+async fn tun_driven_startup_requires_configured_host_and_plain_dns_identity() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        for (host_facts, include_host, dns_identity, succeeds) in [
+            (true, true, 0, true),
+            (false, true, 0, false),
+            (false, false, 2, false),
+            (true, false, 0, false),
+            (true, true, 1, false),
+            (true, true, 2, false),
+        ] {
+            let budget = MemoryBudget::new(32 << 20);
+            let (plain, plain_owner) = scope(&budget);
+            let (host, host_owner) = scope(&budget);
+            host.prepare_host().unwrap();
+            let dns_scope = match dns_identity {
+                0 => plain.scope(),
+                1 => host.scope(),
+                _ => ScopeId::HOST,
+            };
+            let (plane, _health) = packet_plane(Backend::Tun, "Rule", "block").await;
+            {
+                let mut accepted = plane.config.write().await;
+                let mut config = (**accepted).clone();
+                config
+                    .datapath
+                    .as_mut()
+                    .unwrap()
+                    .tun
+                    .as_mut()
+                    .unwrap()
+                    .host_facts = host_facts;
+                *accepted = Arc::new(config);
+            }
+            let mut scopes = vec![(plain, plain_owner)];
+            if include_host {
+                scopes.push((host, host_owner));
+            } else {
+                drop((host, host_owner));
+            }
+            let (endpoints, mut owner, mut drivers) =
+                PacketEndpoints::start_driven(plane, scopes, 1, None, dns_scope)
+                    .await
+                    .unwrap();
+            let ready = std::future::poll_fn(|cx| {
+                for driver in &mut drivers {
+                    driver.service(cx, Instant::now());
+                }
+                owner.poll_ready(cx)
+            })
+            .await;
+            if succeeds {
+                ready.unwrap();
+                join_packet(endpoints, owner, drivers).await;
+            } else {
+                let error = ready.expect_err("invalid TUN scopes must reject startup");
+                assert!(
+                    format!("{error:#}")
+                        .contains("TUN requires its plain scope and configured Host scope")
+                );
+            }
+        }
+    })
+    .await
+    .expect("TUN scope startup and teardown must finish");
 }
 
 #[tokio::test]
@@ -864,10 +1053,19 @@ async fn tun_dns_bind_requires_preparation_before_startup() {
         config.dns.bind = "tcp+udp://localhost:0".into();
     })
     .await;
-    let error = PacketEndpoints::new(plane, vec![(scope, scope_owner)], 1)
-        .await
-        .err()
-        .expect("TUN cannot resolve a bind endpoint after routing setup");
+    let dns_scope = scope.scope();
+    let (_endpoints, mut owner, mut drivers) =
+        PacketEndpoints::start_driven(plane, vec![(scope, scope_owner)], 1, None, dns_scope)
+            .await
+            .unwrap();
+    let error = std::future::poll_fn(|cx| {
+        for driver in &mut drivers {
+            driver.service(cx, Instant::now());
+        }
+        owner.poll_ready(cx)
+    })
+    .await
+    .expect_err("TUN cannot resolve a bind endpoint after routing setup");
     assert!(format!("{error:#}").contains("addresses prepared before routing setup"));
 }
 
@@ -893,9 +1091,16 @@ async fn configured_dns_startup(backend: Backend) {
     };
     let budget = MemoryBudget::new(32 << 20);
     let (scope, scope_owner) = scope(&budget);
+    let dns_scope = if backend == Backend::Tun {
+        scope.scope()
+    } else {
+        ScopeId::HOST
+    };
     drop(reservation);
     let (endpoints, mut owner, mut drivers) =
-        PacketEndpoints::start_driven(plane, vec![(scope, scope_owner)], 1, prepared).unwrap();
+        PacketEndpoints::start_driven(plane, vec![(scope, scope_owner)], 1, prepared, dns_scope)
+            .await
+            .unwrap();
     let mut driver = drivers.pop().unwrap();
     std::future::poll_fn(|cx| {
         driver.service(cx, Instant::now());

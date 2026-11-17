@@ -26,9 +26,14 @@ current_netns=$(stat -Lc %i /proc/self/ns/net)
 [[ $current_netns != "${HONK_TUN_PARENT_NETNS:?missing outer guest guard}" &&
    $current_netns != "$(stat -Lc %i /proc/1/ns/net)" ]] || fail 'refusing initial network namespace'
 mount --make-rprivate /
+[[ -r /sys/kernel/security/lsm ]] || mount -t securityfs securityfs /sys/kernel/security
 mount -t tmpfs -o mode=0755 tmpfs /run
 mkdir -m 700 /run/honk-tun-state
 mkdir /run/netns
+mkdir -m 700 /run/honk-tun-cgroup /run/honk-tun-bpf
+mount -t cgroup2 cgroup2 /run/honk-tun-cgroup
+mount -t bpf bpf /run/honk-tun-bpf
+export HONK_TUN_BPF_PIN_ROOT=/run/honk-tun-bpf
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 work=$(mktemp -d "${HONK_TUN_ARTIFACT_ROOT:-/tmp}/honk-tun-daemon.XXXXXX")
 printf 'TUN smoke artifacts: %s\n' "$work"

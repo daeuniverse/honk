@@ -5,7 +5,7 @@ use honk_ebpf_common::DaeParam;
 use std::convert::TryInto;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PnameCaptureMode {
+pub(crate) enum PnameCaptureMode {
     Argv0,
     Comm,
 }
@@ -55,6 +55,11 @@ fn probe_pair(
         Ok(bpf) => bpf,
         Err(_) => return false,
     };
+    load_pair(&mut bpf, sock_name, sock_addr_name)
+}
+
+/// Load the actual selected capture pair before attaching either program.
+pub(crate) fn load_pair(bpf: &mut aya::Ebpf, sock_name: &str, sock_addr_name: &str) -> bool {
     let sock_ok = bpf
         .program_mut(sock_name)
         .and_then(|program| {

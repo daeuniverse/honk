@@ -58,18 +58,18 @@ async fn overlapping_scopes_keep_real_associations_replies_and_close_independent
             .unwrap();
         assert_eq!(received(&f.client).await, (b"foreign-a".to_vec(), foreign));
         assert!(pending_b.still_initializing());
-        assert!(!f.pool.contains(scopes[0], client, foreign));
+        assert!(!f.pool.contains(scopes[0], client, foreign, None));
         assert_eq!(a.download.load(Ordering::Relaxed), 7);
         assert_eq!(b.download.load(Ordering::Relaxed), 0);
         drop(pending_b);
 
         assert!(
             f.pool
-                .close_exact(scopes[0], client, target, 0, generation_a)
+                .close_exact(scopes[0], client, target, 0, generation_a, None)
         );
         assert!(
             !f.pool
-                .close_exact(scopes[0], client, target, 0, generation_a)
+                .close_exact(scopes[0], client, target, 0, generation_a, None)
         );
         assert!(f.pool.get(scopes[1], client, target).is_some());
         f.targets[0]
@@ -116,7 +116,11 @@ async fn source_attachment_cannot_publish_in_another_scope() {
         attachment,
         target,
         None,
-        Arc::new(f.pool.create_reply_socket(ScopeId::HOST, target).unwrap()),
+        Arc::new(
+            f.pool
+                .create_reply_socket(ScopeId::HOST, target, None)
+                .unwrap(),
+        ),
         f.stats
             .outbound_tracker(&f.peer.node.name, crate::stats::OutboundKind::Node),
         f.peer.node.id,

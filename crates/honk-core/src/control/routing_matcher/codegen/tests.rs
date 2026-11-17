@@ -25,7 +25,7 @@ fn rule(condition: serde_json::Value, outbound: &str) -> RoutingRule {
         outbound: RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }
 }
 
@@ -100,7 +100,7 @@ fn readiness_mask_and_lazy_areas_start_as_verifier_unknown_zeros() {
         .iter()
         .position(|insn| fields(insn) == (BPF_ST | BPF_W | BPF_MEM, R7, 0, MARK, 0))
         .unwrap();
-    let mask = zeroed + 4;
+    let mask = zeroed + 5;
     assert!(insns[zeroed + 1..mask].iter().all(|insn| {
         insn.code as u32 == BPF_ST | BPF_W | BPF_MEM && insn.dst_reg() == R7 && insn.off != MARK
     }));

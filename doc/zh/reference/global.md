@@ -219,8 +219,7 @@ global {
 
 ## 捕获后端选择
 
-省略 `datapath` 会保持现有 TC 后端。完整 XDP 是 Linux 上的显式选择，
-不是 TC 或原生续送不可用时的自动回退：
+省略 `datapath` 会保持现有 TC 后端。XDP 是 Linux 上的显式选择：
 
 ```dae
 global {
@@ -237,22 +236,40 @@ datapath {
 }
 ```
 
-`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）或
-`endpoint`（Direct TCP 终止后中继）。接口角色是可信的 LAN/WAN 入站分区，
-不是执行方式；必须绑定发现的全部 RX 队列。XDP 不可同时配置
+`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）、
+`endpoint`（Direct TCP 终止后中继）或 `native`（符合条件的最终 Direct
+数据包经 XDP candidate `PASS` 继续进入 Linux 协议栈）。Native 要求真实 eBPF
+与 `global.nfqueue_enable: false`，可选择物理接口捕获或下述仅 Host 模式，
+两者不能同时启用。TC、TUN 拒绝 `direct: native`；防火墙/NAT 仍仅限
+`direct: core`。物理 Native 验收还需要 TCX 最终门禁及真实 capture/return
+所有权；选择 profile 本身不代表完整 V7 验收或真实内核测试通过。
+
+当前 Native 消费端要求 `dial_mode: ip` 与无 VLAN 的物理入口。
+使事实失效的 DNS 修改会在 reader grace 与 candidate 准备期间暂时关闭全部 Native
+配置入口；该窗口内的业务包被拒绝，真实 DNS 负载下的窗口上界尚未测量。
+
+接口角色是可信的 LAN/WAN 入站分区，不是执行方式；必须绑定发现的全部 RX 队列。
+XDP 不可同时配置
 `global.lan_interface` 或 `global.wan_interface`。
 后端、Direct 方式、有效 AF_XDP 绑定模式及接口/分区变更需要重启；受支持的
-防火墙/NAT 规则沿用事务式发布。未知字段及原生续送、非零标记续送请求会被拒绝，
+防火墙/NAT 规则沿用事务式发布。未知字段及不支持的非零标记续送请求会被拒绝，
 不会被静默忽略。
 接口条目只能是 `名称: lan` 或 `名称: wan`；携带子块（包括空子块）会被拒绝，
 不会忽略其中的设置。
 
-`xsk_mode` 接受 `copy` 或 `zerocopy`；显式选择 XDP 时，省略该字段默认使用
-`zerocopy`，对全部选中 RX 队列强制启用 ZeroCopy，绝不重试 Copy 或回退到其他
-后端。显式 `copy` 仍受支持。在首次挂载之前，对全部设备检查 zero-copy/segment
+物理 `datapath.interface` 捕获使用 `datapath.xsk_mode`，接受 `copy` 或
+`zerocopy`；省略时对全部选中物理 RX 队列强制使用 ZeroCopy，绝不重试 Copy
+或回退到其他后端。显式 `copy` 仍受支持。首次挂载前检查 zero-copy/segment
 能力通告和完整包 frame 承诺；成功 bind 后还必须与内核 `XDP_OPTIONS_ZEROCOPY`
 回读一致。queue 日志报告实际观察到的模式。省略与显式 `zerocopy` 在 reload 时
 等价；切换到或离开 `copy` 必须重启。默认后端仍为 TC，且拒绝显式 `xsk_mode`。
+
+`datapath.workers` 是仅限 XDP 的整数，只接受 `1`（默认）或 `2`，修改需要重启。
+双 worker 要求至少两个真实物理队列 owner，且有效 cpuset 至少有两个 CPU。
+每个 worker 在 OS 线程上独占其队列和 Stack 分片；Host 与 Core 协调仍在
+worker 0。逻辑 realm、DNS/UDP source 所有权及内存/流总上限不会翻倍。
+两个 worker 共享原有单个可选 Busy grant；校准包含双方队列/CPU context，
+旧单 owner 的校准证据不能使新配置获得资格。
 
 **从原 Copy 默认值迁移：**已有 XDP 配置若省略 `xsk_mode`，现在要求全部选中
 队列实际支持 ZeroCopy。若要保留 Copy 行为，请在升级前向原有 `datapath` 块加入
@@ -260,14 +277,65 @@ datapath {
 `datapath` 的配置仍使用 TC，不受影响。
 
 Core Direct 要求 `dial_mode: ip`；域名谓词只使用精确 packet 入口 scope 内学到的
-DNS 事实，不虚构 hostname 或依赖嗅探。Core 与 Endpoint 都不会伪造进程或逐流
-MAC 事实。部署必须预先配置并通过独立验证的 bypass-mark
-路由表，将守护进程自身的套接字流量隔离到未捕获的上联；上述示例本身不构成
+DNS 事实，不虚构 hostname 或依赖嗅探。物理入口没有经认证的进程事实；进程谓词
+要求下述显式 Host 捕获，两条路径都不伪造逐流 MAC 事实。部署必须预先配置并通过
+独立验证的 bypass-mark 路由表，将守护进程自身的套接字流量隔离到未捕获的上联；上述示例本身不构成
 拓扑证明。设备、VLAN、散布/聚集、保留内存、固定丢弃保护及原生内核准入限制，
 请参阅[完整 XDP 启动与限制](../design/datapath.md)。
 Core 当前的带输入上下文 FIB 契约会拒绝非零 IPv6 flow label，以及无法保持语义的
 路由器专用扩展头/options 执行。Endpoint 支持 IPv6 并不证明这些数据包组合在
 Core 中具有等价执行授权。
+
+### XDP Host Endpoint
+
+捕获 Host 发起的 TCP/UDP 必须显式配置 `host` 块，并使用启用 `ebpf` 的构建。
+选择 `backend: xdp` 与 `direct: endpoint`：
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    host {
+        xsk_mode: copy
+        interface {
+            eth0
+        }
+    }
+}
+```
+
+`host.interface` 要求 1–16 个不重复的明确 Ethernet 名称，仅接受无角色、无子块
+的裸条目。`host.xsk_mode: copy` 必填，单独控制自有私有 Host queue，不受物理
+`datapath.xsk_mode` 默认值影响。未知或重复的 Host 字段/块均拒绝。可以省略物理
+`interface` 捕获，也可与 `host` 同时配置；两者使用同一个全局 Endpoint Direct
+profile。完整 Host 配置变更要求重启。必须关闭 NFQUEUE、清空 TC 接口列表，并保留
+所需的 bypass-mark 路由。
+
+当前准入要求 x86-64 小端、匹配运行内核的 BTF、活动 BPF LSM、独占的有效根 cgroup
+hook 及 plain source namespace 托管。拒绝普通 operator veth、堆叠/mastered/tunnel
+link 及外部 reinjection 路径；仅 daemon 自有私有 veth pair 例外。consumer 和真实
+Copy bind 就绪后才一次性打开 capture gate。陈旧 custody receipt 会拒绝重启，不接管
+旧资源。完整限制及保留式停止行为见[Host 来源托管](../design/datapath.md#host-来源托管)。
+
+经认证的 Host 事实可提供进程路由。`direct: endpoint` 仍终止原流并新建带 mark
+的 outbound；生成回复由普通 Linux demultiplexing 交付，不代表原 socket
+operation 续行。TUN 的独立可选 HostFacts 支持见下文。
+
+### XDP Host Native
+
+沿用同一个 `host` 块，将 `direct` 设为 `native`，并省略物理 `datapath.interface`
+捕获。自有 LOCAL_OUT 消费端让符合条件的原 socket operation 留在 Linux 中，
+而不是打开替代 outbound。规范 mark 区分 Keep 与 Set，包括 Set(0) 和完整
+32 位值；Host DNS 事实使用真实 HOST scope。
+已选 socket executor 保持冻结，Active TCP 保留选定效果；真正关闭且排空的
+Native TCP 重连更新 attempt 身份，但不会切换到 Endpoint。普通 UDP 缓存在
+不活动严格超过 120 秒后过期，source owner 与在途输出的保留条件相互独立。
+仍存活的来源可能要求 guarded-retained 停止，而不能销毁资源。
+
+Host Native 与物理 Native 不可同时启用：当前反向查询无法证明任意 CT zone，
+也不能在 pre-CT tuple 改写后恢复原 source 索引。TUN Native 同样尚未实现。
+不会用 NFQUEUE、猜测 zone、保留 mark 位或新 outbound relay 替代这些缺失能力。
+这些模式边界不代表完整 V7 或 E6/E7 验收。
 
 ### Linux TUN Endpoint
 
@@ -286,6 +354,7 @@ datapath {
     tun {
         name: honk0
         mtu: 1500
+        host_facts: true
         address4: 198.18.0.1/32
         address6: fd00:686f:6e6b:100::1/128
         table: 202
@@ -308,6 +377,7 @@ routing {
 | `address4` / `address6` | 至少配置一个，严格使用 `/32`、`/128` 主机前缀。拒绝 unspecified、multicast、broadcast、mapped IPv6、link-local 及重复的本地地址。 |
 | `table` | 必填；`1..=0xfffffffe`，排除 `253..=255`。任何现存 route/rule 都不得使用此专用表。 |
 | `rule_priority` | 必填，首优先级 P；`P >= 1` 且 checked `P+4 < 32766`。五个优先级 `[P,P+4]` 必须全部空闲。 |
+| `host_facts` | 可选严格布尔值，默认 `false`。`true` 要求 `ebpf` 构建和真实来源捕获；变更需重启。 |
 | `capture { ... }` | 必填，1–64 条已配置地址族内的规范 CIDR 网络。拒绝 host bits 及互相包含的冗余前缀；排序并去重。仅接受裸前缀，不接受键值条目或嵌套块。 |
 
 TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
@@ -318,8 +388,8 @@ TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`�
 
 要求 Linux、`/dev/net/tun`、创建/配置 TUN 和应用 `SO_MARK` 的权限，不能传
 `--mock-ebpf`。必须显式关闭 NFQUEUE，并保持 `global.lan_interface`/
-`wan_interface` 为空。拒绝非零 traffic rule/default mark、MAC 与进程名谓词
-（包括否定谓词）。既有四种 dial mode 均可使用；示例选择 `ip`。
+`wan_interface` 为空。拒绝非零 traffic rule/default mark、MAC 谓词及其否定；
+只有 `host_facts: true` 才允许进程名谓词。既有四种 dial mode 均可使用。
 
 对每个已启用地址族，honk 验证系统 priority-0 local rule，并安装恰好五条自有
 RPDB rule；M 为有效 `global.so_mark_from_dae`，T 为 `tun.table`，P 为
@@ -371,14 +441,18 @@ rule key。每次外部变更前先持久化 Intent；ACK 与 Removed 状态均�
 详见 [TUN setup 与拆卸](../design/datapath.md#linux-tun-endpoint)。
 
 Direct TCP/UDP 明确使用 Endpoint relay：真实 TUN FD read → scoped Stack →
-canonical Router → 新建 direct/proxy outbound → 生成回复 → 同一 FD。裸 IP
-不提供经认证的 Host/Transit 或进程身份、原 socket、pre-NAT 输入或 Native
-续行。HostFacts（S-b）、导入前 Native（S-c）与 captured return（S-d）仍未交付；
-S-a 不代表 E6.4 完成。
+canonical Router → 新建 direct/proxy outbound → 生成回复 → 同一 FD。启用
+`host_facts: true` 时，经认证的应用 socket 记录携带原始来源事实进入独立 Host
+scope；见证过但无归属的记录仍走 plain，不代表已证明 Transit。进程名仅在经认证
+Host 来源且存在时可用；Missing 不匹配正向谓词，但匹配其否定。两个 scope 共用
+384 MiB capture 预算。独立 DNS 只在 plain scope 学习，透明 DNS 使用对应 packet
+scope；均不借用 HOST DNS 事实。来源准入要求真实支持，来源错误不能回退 plain；
+读取延迟不刷新原始来源有效期。Native bypass（S-c）和 captured return（S-d）
+仍未实现；生成回复不提供原 operation 或 pre-NAT/TTL 等价。
 
-整个规范 TUN setup、backend 与 Direct profile 都需重启；省略 MTU 与显式 1500
-等价。policy/group/DNS/订阅/mode 更新沿用既有事务，不重开 FD 或替换 scope；
-`dns.bind` 的语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
+整个规范 TUN setup（含 `host_facts`）、backend 与 Direct profile 都需重启；
+省略 MTU 与显式 1500 等价，省略 `host_facts` 与显式 false 也等价。
+policy/group/DNS/订阅/mode 更新沿用既有 FD 与 scope；`dns.bind` 语义变化仍需重启。正常 joined stop 先撤销 capture，等待真实 owner
 退出，再移除自有 rule/guard 与 receipt，恢复 main 路由。失败或未确认清理时保留
 blackhole、rule 与 receipt，供停源后核对并精确清理；不自动重开、接管或回退后端。
 

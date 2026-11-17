@@ -56,7 +56,8 @@ async fn quic_source_reuses_one_association_across_targets() {
                 !f.pool.endpoints.contains_key(&EndpointKey::new(
                     honk_datapath::ScopeId::HOST,
                     f.client(),
-                    c
+                    c,
+                    None,
                 )),
                 "foreign replies cannot create flow authority"
             );
@@ -145,6 +146,7 @@ async fn quic_source_partitions_clients_runtimes_and_rewrites() {
                 Arc::clone(&f.stats),
                 f.family,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -270,6 +272,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                 Arc::clone(&f.stats),
                 f.family,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -318,7 +321,8 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                 removed.client,
                 removed.dst,
                 removed.owner,
-                removed.generation
+                removed.generation,
+                removed.packet_lineage,
             ));
             if removed.dst == f.target(0) {
                 break;
@@ -349,6 +353,7 @@ async fn quic_source_foreign_reply_requires_vacant_live_scope() {
                     removed.dst,
                     removed.owner,
                     removed.generation,
+                    removed.packet_lineage,
                 ));
             }
         });

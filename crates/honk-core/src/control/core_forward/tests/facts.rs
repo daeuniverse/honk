@@ -434,7 +434,41 @@ async fn core_endpoint_admission_uses_scoped_bitmap() {
     else {
         panic!("scoped domain rule did not select Endpoint");
     };
-    assert_eq!(admission.into_snapshot().decision.outbound, "proxy");
+    assert_eq!(admission.captured_snapshot().decision.outbound, "proxy");
+}
+
+#[tokio::test]
+async fn pending_endpoint_rejects_fact_withdrawal_after_capture_without_policy_replay() {
+    let (_plane, mut core, ingresses, scopes, snapshot) = fact_core("proxy").await;
+    let authority = core.authority();
+    let ip = "198.51.100.2".parse().unwrap();
+    authority.0.projection.submit(
+        scopes[0],
+        Arc::clone(&snapshot),
+        positive_fact("proxied.test", &[ip]),
+    );
+    let now = Instant::now();
+    let packet = core.receive(ingresses[0], now, &syn()).unwrap().unwrap();
+    let Decision::Endpoint(_, admission) = core
+        .decide(&authority.read_policy().await, packet, None, now)
+        .unwrap()
+    else {
+        panic!("scoped fact must produce a pending Endpoint admission");
+    };
+    authority
+        .0
+        .projection
+        .submit(scopes[0], snapshot, clear_fact("proxied.test"));
+    let mut admission = Some(admission);
+    let result: io::Result<()> =
+        EndpointAdmission::commit_pending(&mut admission, scopes[0], |_| {
+            panic!("withdrawn original fact must not reach transport mutation")
+        });
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert!(
+        admission.is_none(),
+        "rejected handoff is disposed, not reclassified"
+    );
 }
 
 #[tokio::test]
@@ -480,7 +514,7 @@ async fn core_endpoint_admission_commits_only_current_facts() {
             panic!("fresh bound facts did not commit Endpoint");
         };
         assert_eq!(packet.deadline(), deadline);
-        assert_eq!(admission.into_snapshot().decision.outbound, "proxy");
+        assert_eq!(admission.captured_snapshot().decision.outbound, "proxy");
     }
 }
 

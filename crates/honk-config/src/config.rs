@@ -846,7 +846,7 @@ impl Config {
             ));
         }
         for (index, rule) in self.routing.rules.iter().enumerate() {
-            if rule.mark & reserved != 0 {
+            if rule.mark.is_some_and(|mark| mark & reserved != 0) {
                 return Err(config_validation_error(
                     source,
                     SettingPath::new("routing")
@@ -858,7 +858,11 @@ impl Config {
                 ));
             }
         }
-        if self.routing.default_mark & reserved != 0 {
+        if self
+            .routing
+            .default_mark
+            .is_some_and(|mark| mark & reserved != 0)
+        {
             return Err(config_validation_error(
                 source,
                 SettingPath::new("routing").field("fallback"),
@@ -1613,11 +1617,11 @@ mod builtin_nodes_tests {
             outbound: crate::routing::RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         });
 
         for reserved_bit in [0x4000_0000, 0x8000_0000] {
-            config.routing.rules[0].mark = reserved_bit;
+            config.routing.rules[0].mark = Some(reserved_bit);
             let error = config
                 .validate_detailed()
                 .expect_err("reserved routing mark must fail");
@@ -1629,7 +1633,7 @@ mod builtin_nodes_tests {
         }
 
         // Direct rule marks may use the TPROXY bit; the global listener mark may not.
-        config.routing.rules[0].mark = 0x3fff_ffff;
+        config.routing.rules[0].mark = Some(0x3fff_ffff);
         for global in [
             0x8000_0000,
             DEFAULT_TPROXY_MARK,
@@ -1800,7 +1804,7 @@ mod builtin_nodes_tests {
             outbound: crate::routing::RoutingOutbound::Simple(outbound.into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }
     }
 

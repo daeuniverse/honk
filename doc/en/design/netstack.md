@@ -143,6 +143,24 @@ Both actual Port capacity and scope frame/descriptor credit are reserved before 
 
 CPU and generated output share `Retained::Endpoint(OutputOwner)` and the same exact-scope mixed CQ batch return. TCP's retransmission ring and ACK lifetime remain separate from UMEM/CQ: ACK cannot release outstanding DMA ownership, and CQ cannot acknowledge TCP. Existing CPU backing and process-lifetime UMEM remain fully charged. This removes only one intermediate Endpoint CPU-IP-frame-to-UMEM copy for eligible generated output; TCP payload copying/checksums and socket/relay copies remain. It is not payload-copy-free TCP, universal UDP zero-copy, lower resident memory or a measured performance gain. The existing E3.1 driver handoff is unchanged.
 
+Each physical XDP logical ingress uses one `PacketRealm` with one or two independent Stack owners.
+Queues belong permanently to `queue_id % workers`; TCP uses immutable keyed tuple
+placement and UDP uses client-address placement. Peer, DNS and UDP source identity
+remain realm-scoped, while application, retirement and CQ retain the exact owner
+and FlowId. Cross-worker handoff has 64 funded cells overall and 32 queued entries
+per destination; borrowed RX never escapes its callback. Core, Host and Native
+coordination stay on worker 0, and a remote original stays owned by its actual Port
+until real completion and acknowledgement. Drain acknowledgements identify the
+epoch observed before the pass, not a later barrier.
+
+Reassembly keeps a local nonwrapping incarnation through completion and timeout
+output. Its earliest input time controls the original fragment deadline and return
+snapshot; the latest actual fragment input time starts complete-datagram protocol
+processing and the existing two-second Core route wait. Queue service never restarts
+either deadline. Realm-wide half-open, control, UDP and ICMP limits remain shared;
+the singleton capture helpers below retain their existing totals, which physical
+capture partitions between its Stack owners rather than duplicating.
+
 The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. A blocked scope keeps its existing 100ms shared-budget fallback, armed until serviced rather than postponed by unrelated polls. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
 
 AF_XDP TX still publishes each packet immediately. A concrete synchronous device turn may defer only its per-packet NEED_WAKEUP check until the turn exits; standalone sends still kick immediately. Every normal exit preserves both work and final-kick errors, and no batch spans an await. Panic closes admission without issuing I/O or releasing published owners; only real CQ can return those owners.
@@ -153,23 +171,48 @@ Class output export fills at most 64 caller-owned empty lease cells, preserving 
 
 Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
 
+With XDP `direct: native`, Kernel-selected originals bypass Stack through actual PASS. A captured group-selected original must first present its exact shared Capture owner and receive a canonical Endpoint snapshot; a later literal Native Direct choice is refused before protocol mutation. Capture retirement uses `PacketEndpoints::retains`, including real controller-DNS `SourceWork` until its query/output tail drops. The same existing driver, source pool and output/CQ owners keep execution exclusive. Early PASS adds no retained frame lease, and does not implement return of an already-captured original.
+
 Normal close closes admission and publishes the same control-plane shutdown signal before protocol abort and before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
 
-TUN uses `start_driven(plane, scopes, udp_capacity, prepared_dns_addresses)` with its retained `Option<PreparedDnsBind>` and one real non-HOST scope; XDP passes `None`. The public `PacketEndpoints::new()` embedder constructor is unchanged. Both configured packet backends retain the common subscription/command/flags/DNS supervisor rather than a second Router or flow executor.
+TUN passes retained DNS bind candidates and an explicit plain standalone DNS scope to the driven supervisor. False uses one scope; true adds a separate Host scope. XDP and ordinary embeddings retain HOST standalone DNS. Both configured packet backends retain the common supervisor and Router.
 
-`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` and `CAPTURE_MEMORY` share one 256 MiB capture budget between XDP or TUN scopes and their device/runtime storage. With `R` admitted realms, each Stack has a `128 MiB / R` limit and `min(4096 / R, 1024)` flow/slot ceiling; each scope has 32 control frames and 256 waiters. The caller selects bulk capacity. Default CPU backing is charged before allocation at `(32 + bulk_frames) * mtu.max(1280)` bytes per scope: 160 frames for bulk 128 or 288 frames for bulk 256. The internal `capture_scope_with_output` can select separately funded output capacity and capabilities without changing logical MTU. Metadata and Stack storage remain charged within the same shared budget. Both helpers select `Mode::Transparent { exclude: Default::default() }`; the Direct **Endpoint execution profile** is not WireGuard's `Mode::Endpoint`. Original manual embedding and WireGuard defaults remain unchanged, and the progress floor is not total accepted-flow commitment.
+`control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` and `CAPTURE_MEMORY` share one 384 MiB capture budget between XDP or TUN scopes and their device/runtime storage. With `R` admitted realms, each Stack has a `192 MiB / R` limit and `min(4096 / R, 1024)` flow/slot ceiling; each scope has 32 control frames and 256 waiters. The caller selects bulk capacity. Default CPU backing is charged before allocation at `(32 + bulk_frames) * mtu.max(1280)` bytes per scope: 160 frames for bulk 128 or 288 frames for bulk 256. The internal `capture_scope_with_output` can select separately funded output capacity and capabilities without changing logical MTU. Metadata and Stack storage remain charged within the same shared budget. Both helpers select `Mode::Transparent { exclude: Default::default() }`; the Direct **Endpoint execution profile** is not WireGuard's `Mode::Endpoint`. Original manual embedding and WireGuard defaults remain unchanged, and the progress floor is not total accepted-flow commitment.
 
 XDP selects capacity per physical device from the checked bound `physical_mtu + 22 <= FRAME_SIZE` (4096 bytes), covering Ethernet and at most two VLAN tags. A qualifying device uses RX/control/bulk Port partitions of 256/32/480 frames and 512-entry rings, with 256 bulk frames in every realm on that device. Each such Port reserves 3 MiB of process-lifetime UMEM, excluding its separately charged metadata and rings. Devices above the bound, including jumbo devices with smaller logical realms, retain the explicit previous Port partitions of 256/32/224, 256-entry rings and scope bulk 128: 2 MiB UMEM per Port. Both paths use the same backend and unchanged RX SG capability and bind validation; the bound proves single-frame TX only. A sole scope's 256 bulk owners leave 224 Port bulk frames, compared with 96 under the previous 128/224 capacities; other realms and Core output can consume that headroom. Scheduling and the 32-output class/realm turn limit are unchanged, without a universal fairness or measured throughput claim.
 
-The larger optimized Port and scope reservations reduce startup headroom for many selected queues/realms under the unchanged 256 MiB budget. Successfully mapped UMEM remains charged until process exit, including after a later startup failure, and also counts against the unchanged 512 MiB process-wide retained-UMEM ceiling. Restarting capture in the same process does not reclaim it.
+The larger optimized Port and scope reservations reduce startup headroom for many selected queues/realms under the 384 MiB budget. Successfully mapped UMEM remains charged until process exit, including after a later startup failure, and also counts against the unchanged 512 MiB process-wide retained-UMEM ceiling. Restarting capture in the same process does not reclaim it.
 
-TUN selects bulk 128, uses one realm and its configured logical MTU (default 1500), and retains nonzero UDP capacity `min(64, resource_budget.udp_endpoints)`. Its 160 CPU frames each have 65,535 bytes of separately funded output capacity (10,485,600 bytes total backing), with TCPv4/TCPv6 TSO capabilities. This capacity changes neither advertised MSS/PMTU nor ordinary UDP MTU behavior.
+TUN selects bulk 128 and its configured logical MTU (default 1500), with one realm for false or two for true. Each scope funds 160 CPU frames of 65,535 bytes (10,485,600 bytes); both share the same 384 MiB budget and one UDP pool. This does not change MSS/PMTU or ordinary UDP MTU.
 
 The [TUN owner](./datapath.md#fd-packet-pipeline) retains CPU-backed `OutputLease`s and their original `Transmit`. Setup requires exclusive single-queue nonpersistent `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`, selects and reads back a 10-byte little-endian vnet header, and enables only `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`; unsupported setup fails explicitly. RX reserves 65,586 bytes: 10 vnet bytes, the 65,575-byte maximum ordinary IPv6 packet, and one truncation sentinel. It rejects full-buffer reads, incomplete/padded IP records, unknown flags, unsupported GSO types/families and invalid header/checksum extents before the combined metadata/source/admission path. GSO `hdr_len` is Linux's linear-head hint and may include payload; it must cover the parsed TCP header and stay inside the IP record. Ordinary UDP `CHECKSUM_PARTIAL` is accepted without USO. Borrowed UDP is accepted/copied before recycling the sole RX buffer.
 
-Control/Bulk each retain at most 32 pending leases. One `writev` submits the vnet header and immutable leased IP bytes as a whole record, including plain ACK/UDP/control output. EAGAIN/EINTR preserves the exact lease, metadata, bytes, scope and original FlowId until writable; short/zero writes are terminal without suffix or whole-record replay. Complete writes release only local ownership, with no CQ or remote-delivery claim. Driver service continues through readiness and joined close, including failed startup. Normal stop disposes closing output then joins real owners before route/receipt deletion; failure retains routing guards and receipt. Returning or dropping the driver is not a joined-cleanup acknowledgement.
+Each scope/class retains at most 32 pending leases. One `writev` submits each immutable record; EAGAIN/EINTR retains its exact lease and short/zero writes are terminal without replay. All drivers continue through readiness and joined close. Standalone DNS learns in the plain scope; transparent DNS learns in the packet's own scope. Neither borrows HOST facts. Socket HostFacts retain original source expiry and ownership; plain input grants no process or Native authority. Native bypass and captured return remain absent.
 
-TUN packet DNS and its standalone listener both learn in that actual registered realm, including traffic emitted by a Host socket. They never borrow HOST facts. Scope/L3 bytes provide no authenticated origin/process fact, original socket or Native authority: S-b HostFacts, S-c pre-import bypass and S-d captured return remain absent. S-a is not E6.4 completion, a performance result or empirical VM acceptance.
+Explicit XDP [Host capture](./datapath.md#host-source-custody) prepares a separate
+authenticated scope before Endpoint starts. A valid source receipt is checked
+before import; source lineage includes namespace, attachment, socket cookie,
+operation incarnation and original return identity. Immutable fact snapshots also
+partition execution when marks/process facts change. The existing exact TCP
+FlowId, UDP initializer/source owners, reassembly and queued/exported `OutputLease`
+retain that context; a reused tuple or newer snapshot cannot retarget earlier work.
+Routing consumes actual process presence, never a fabricated identity. Ordinary
+Direct/proxy execution creates new marked outbounds and generated replies use normal
+Linux demultiplexing, with no original socket-operation or Native continuation.
+
+Host source-context cells and indexes are funded and allocated during cold scope
+preparation, with bounded admission and generation exhaustion; live protocol,
+fragment, work and output owners prevent reclamation. Cold namespace setup retains
+namespace-bound custody sockets rather than switching namespace for later queries.
+Host reserves 96 MiB for fixed maps/loader storage, verifies observed kernel
+allocations within 64 MiB, and separately charges running-BTF preparation peaks
+and bounded source/child custody snapshots. These share the 384 MiB
+capture budget with the private Copy Port, UMEM, scope and output storage; this is
+a reservation contract, not a whole-process RSS measurement. BTF preparation
+storage drops after setup; retained fixed kernel and UMEM charges last until
+process exit, including after resource removal or failed setup after pin creation.
+This XDP path itself grants no Native or TUN capability, or full V7, E6/E7,
+physical or 13-size acceptance.
 
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install
@@ -556,7 +599,7 @@ Errors are generated only by transparent-mode paths: `Refuse::IcmpUnreachable`/`
 
 Everything below is absent from `crates/honk-netstack/src` or from the repository today; the list is the boundary of this page's claims.
 
-- Netmap and Windows backends remain absent. Linux TUN supplies only daemon-owned S-a Endpoint capture: authenticated HostFacts (S-b), pre-import Native (S-c), original-operation custody and captured return after FD read (S-d) remain absent. Scope/mark/tuple or writing a generated packet into TUN supplies none of them. S-a does not complete E6.4; implementation is not empirical VM, production or hardware acceptance.
+- Netmap, Windows, Native continuation, original-operation custody and captured return remain absent. TUN optionally supplies socket HostFacts, not Native authority; implementation is not empirical VM, production or hardware acceptance.
 - The eBPF/TC side: the classifier delivery bit, steering of flows to the stack, the delivery state that must outlive TIME_WAIT ([Close semantics](#close-semantics)), and proxying of non-first fragments at the TC layer.
 - ICMP proxying: relaying echo or errors between the client and a real upstream. The stack only consumes ICMP for outstanding TCP sequences and generates the errors listed above.
 - Any performance gate or measured number for transparent mode.
@@ -596,7 +639,7 @@ The driver lives in `honk-outbound/src/proxy/wireguard/`; [Outbound design](./ou
 | Receive | At most 32 out-of-order ranges per flow; ACK stretching limited by the 64-packet receive batch. |
 | Scale | An idle established flow costs about 1.4 KiB of heap (no chunks); per tunnel 4096 flows, each admitted flow reserving a floor of about 33 KiB from the process budget (the share: 256 MiB by default, one eighth of RAM within 64 MiB..4 GiB in honk) that all tunnel stacks draw from together, so about 2,000 / 8,000 / 32,000 floor-only flows fit at 64 MiB / 256 MiB / 1 GiB; live tunnels are bounded by their fixed cost, `share / 4 MiB` within 1..128; `max_flows` counts UDP associations; one lock and one owner task per tunnel, so one tunnel is limited to one core. |
 | WireGuard | Exactly one peer per tunnel; no inbound connections; IPv4 and IPv6 each need a configured tunnel address; the endpoint name is re-resolved only on the next acquire after a handshake attempt timed out, and the endpoint set is fixed while a session exists; one tunnel per (key pair, endpoint) per control plane (runtime-less dials share a separate process-wide registry), at most `share / 4 MiB` (1..128) tunnels live per registry (see Scale); nodes that share a key pair and endpoint must share every tunnel setting or they replace each other, and a hostname and an IP literal of one endpoint are separate tunnels; inner MTU at most 65472 so an outer datagram fits one UDP payload. |
-| Transparent | Core packet embedding and Linux XDP/TUN Endpoint backends; no netmap/Windows, Android/VpnService integration, authenticated HostFacts, Native continuation or captured return. The roughly 9 KiB floor is not total accepted/idle commitment. TUN uses one exclusive queue with checksum/TCP offload and no external/persistent FD, UFO, USO or TSO ECN. Device integration requires real-kernel validation; no lab performance gain is claimed. |
+| Transparent | Core packet embedding and Linux XDP/TUN Endpoint backends; no netmap/Windows, Android/VpnService, Native continuation or captured return. TUN optionally admits socket HostFacts. It uses one exclusive queue with checksum/TCP offload and no external/persistent FD, UFO, USO or TSO ECN. Device integration requires real-kernel validation; no lab performance gain is claimed. |
 | Verification | No interop run against non-Linux TCP implementations, no ARM run and no `test-routing`/`test-netns` VM gate. The design thresholds were measured on one x86-64 4-vCPU VM against kernel WireGuard + kernel TCP (not the design's same-engine TUN arm, with an extra loopback relay hop on the honk side): G1–G4 pass, G5 download fairness passes on the median, and G5 idle memory (about 4 KiB per flow including driver and relay state) misses its 1 KiB target; evidence lives on the `bench` branch under `bench/netstack/results/`. |
 
 ## Design validation (P1)

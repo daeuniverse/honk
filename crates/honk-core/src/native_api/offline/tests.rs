@@ -66,11 +66,11 @@ fn tun_offline_admission_uses_the_runtime_policy_validator() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         match fact {
-            "default_mark" => candidate.config.routing.default_mark = 1,
-            "rule_mark" => rule.mark = 1,
+            "default_mark" => candidate.config.routing.default_mark = Some(1),
+            "rule_mark" => rule.mark = Some(1),
             "pname" => rule.condition.process_name = vec!["curl".into()],
             "not_pname" => rule.condition.not.process_name = vec!["curl".into()],
             "mac" => rule.condition.mac = vec!["02:00:00:00:00:01".into()],
@@ -86,6 +86,30 @@ fn tun_offline_admission_uses_the_runtime_policy_validator() {
             .expect("unavailable TUN facts must fail offline admission");
         assert_eq!(error.diagnostic.code, "invalid-datapath-config", "{fact}");
     }
+    }
+    for negated in [false, true] {
+        let mut candidate = loaded.clone();
+        candidate
+            .config
+            .datapath
+            .as_mut()
+            .unwrap()
+            .tun
+            .as_mut()
+            .unwrap()
+            .host_facts = true;
+        let condition = honk_config::parser::parse_dae_config(&format!(
+            "routing {{ {}pname(curl) -> block\n fallback: direct }}",
+            if negated { "!" } else { "" }
+        ))
+        .unwrap()
+        .routing;
+        candidate.config.routing = condition;
+        assert_eq!(
+            admit(candidate, &active).is_ok(),
+            cfg!(feature = "ebpf"),
+            "offline Host process admission must use the executable's real build boundary"
+        );
     assert!(!temp.path().join("state").exists());
 }
 

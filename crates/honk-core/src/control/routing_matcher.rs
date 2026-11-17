@@ -65,7 +65,7 @@ impl KernelPredicate {
 pub struct KernelAction {
     pub outbound: u8,
     pub must: bool,
-    pub mark: u32,
+    pub mark: Option<u32>,
     pub direct_mark_index: Option<u8>,
 }
 
@@ -91,7 +91,7 @@ impl KernelAction {
                 outbound
             },
             must: action.must,
-            mark: action.mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+            mark: action.mark,
             direct_mark_index: action.direct_mark_index,
         })
     }
@@ -106,7 +106,7 @@ pub struct KernelRule {
 }
 
 impl KernelRule {
-    fn folded_false(&self) -> bool {
+    pub(crate) fn folded_false(&self) -> bool {
         self.conditions.is_empty()
             || self
                 .conditions
@@ -114,7 +114,9 @@ impl KernelRule {
                 .any(|condition| !condition.not && condition.predicate.is_empty())
     }
 
-    fn runtime_conditions(&self) -> impl Iterator<Item = (usize, &KernelCondition)> + Clone {
+    pub(crate) fn runtime_conditions(
+        &self,
+    ) -> impl Iterator<Item = (usize, &KernelCondition)> + Clone {
         let live = self
             .conditions
             .iter()
@@ -185,6 +187,7 @@ pub struct RoutingPushPlan {
     pub(crate) fallback: KernelAction,
     pub(crate) features: u32,
     pub(crate) fingerprint: [u8; 32],
+    pub(crate) policy_fingerprint: [u8; 32],
     pub has_domain_rules: bool,
     pub(crate) domain_predicate_count: usize,
     pub(crate) trace_enabled: bool,
@@ -196,6 +199,7 @@ impl RoutingPushPlan {
             && self.features == other.features
             && self.trace_enabled == other.trace_enabled
             && self.fingerprint == other.fingerprint
+            && self.policy_fingerprint == other.policy_fingerprint
             && self.has_domain_rules == other.has_domain_rules
             && self.domain_predicate_count == other.domain_predicate_count
             && self.rules == other.rules
@@ -433,6 +437,7 @@ impl RoutingPushPlan {
             fallback,
             features,
             fingerprint: hash.finalize().into(),
+            policy_fingerprint: router.policy_fingerprint(),
             has_domain_rules: has_domain,
             domain_predicate_count,
             trace_enabled: false,
@@ -653,6 +658,11 @@ mod tests {
         ] {
             assert!(!compile(fallback).semantically_eq(&marked), "{fallback}");
         }
+        let keep = compile("direct");
+        let zero = compile("direct(mark: 0)");
+        assert_eq!(keep.fallback.mark, None);
+        assert_eq!(zero.fallback.mark, Some(0));
+        assert!(!keep.semantically_eq(&zero));
     }
 
     #[test]
@@ -709,7 +719,7 @@ mod fact_sharing_tests {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             })
             .collect();
         let router = Router::new(&rules, "direct").unwrap();

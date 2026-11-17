@@ -8,8 +8,8 @@ Linux capture delivers traffic to the shared userspace policy and outbound path.
 [global reference](../reference/global.md#linux-tun-endpoint) gives the full syntax,
 required resource values, validation and exact five RPDB rules. TUN is a real FD
 consumer of the existing scoped Stack, canonical Router, DNS projector and
-outbound flow initializers. It creates no TC hooks, NFQUEUE, `dae0` or `daens`,
-and does not depend on the `ebpf` feature. It rejects `--mock-ebpf`.
+outbound flow initializers. It creates no TC hooks, NFQUEUE, `dae0` or `daens`.
+Only `host_facts: true` requires the `ebpf` feature. It rejects `--mock-ebpf`.
 
 A single `TunDevice` owns `/dev/net/tun`, opened `O_RDWR|O_NONBLOCK|O_CLOEXEC`.
 `TUNSETIFF` requests `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR|IFF_TUN_EXCL`;
@@ -25,8 +25,9 @@ external-FD input or pre-existing-link adoption. UFO, USO and TSO ECN are not en
 1. Complete static/runtime admission, take the real instance lock and initialize
    the required exact bypass mark M. `prepare_dns_bind(&Config)` resolves and
    retains the enabled bind endpoint's actual `SocketAddr` candidates; disabled
-   listening returns `None`. Fund runtime/RX storage and one non-HOST
-   `PacketScope` with its original owner before any link or routing mutation.
+   listening returns `None`. Fund runtime/RX storage and the plain non-HOST
+   `PacketScope`; true additionally funds a separate Host scope and source owner,
+   all under the same 384 MiB budget before capture activation.
 2. Verify the required mark on actual TCP/UDP sockets, subscribe to rtnetlink and
    snapshot. Refuse occupied name/table/all five priorities and unsupported
    RPDB/main/default topology. Create the private setup receipt and persist the
@@ -41,13 +42,11 @@ external-FD input or pre-existing-link adoption. UFO, USO and TSO ECN are not en
 3. Write each mutation intent ahead of installing capture-prefix blackholes
    (static, metric 32760) and the five rules. Do not install unicast capture yet:
    selected prefixes are contained while Endpoint startup is incomplete.
-4. Pass the already-funded scope and original owner to
-   `PacketEndpoints::start_driven(plane, scopes, udp_capacity,
-   prepared_dns_addresses)`. The final argument is the retained
-   `Option<PreparedDnsBind>` containing endpoint and resolved candidates, not a
-   boolean or a request to resolve again. Keep the unique `PacketDriver` servicing
-   timers/output while waiting for `owner.poll_ready`, including failed-startup
-   cleanup. DNS bind, software flags and subscription authorizations must be ready.
+4. Pass the funded scopes and original owners to the driven packet supervisor,
+   with retained prepared DNS candidates and explicit plain standalone DNS scope.
+   Service every driver during readiness and failed-startup cleanup. DNS bind,
+   software flags and subscription authorizations must be ready. Bind the true-mode
+   source owner to the actual FD and attachment before capture becomes active.
 5. Read back link/address/rules, install and read back metric-1024 capture
    routes, then establish the final `Topology::admit_tun` subscription and full
    snapshot while retaining the old watch. Only after successful final admission
@@ -80,14 +79,13 @@ route writes, and retained guards are not a whole-host firewall kill switch.
 ### FD packet pipeline
 
 Kernel egress appears on FD read; FD write injects a **new interface-ingress
-packet**, never the original skb. Host- and Transit-generated TCP/UDP selected by
-capture follow actual FD read → vnet decode → `receive_with_meta_source` in the
-registered scope → Stack → canonical initializer/Router → real outbound → generated
-output lease and retained Transmit → one vnet+IP `writev` to the same FD.
-Direct explicitly terminates and makes a new dial. Policy sees the
-captured L3 source/destination/DSCP; scope, tuple, mark and TUN address authenticate
-neither Host origin nor process identity. No pre-DNAT/pre-SNAT or original-socket
-semantics are recovered. Capture/reply legs must not rewrite that policy input.
+packet**, never the original skb. Plain records follow the existing plain scope;
+with `host_facts: true`, the exact read's authenticated application-socket facts
+select the Host scope, while witnessed unattributed records remain plain. Source
+failures never become plain records. Both paths use decoded vnet metadata, the
+canonical initializer/Router, real outbound and generated output lease on the same
+FD. Direct makes a new dial; neither scope/tuple/mark nor generated replies grant
+original-operation, pre-NAT/TTL, Native bypass or captured-return authority.
 
 RX uses one funded 65,586-byte buffer (10 vnet + 65,575 ordinary IPv6 + 1 sentinel)
 and one ingress timestamp per turn. A full-buffer read is rejected as possibly
@@ -104,13 +102,10 @@ UDP MTU behavior do not increase. Every output includes a 10-byte vnet header,
 including plain ACK/UDP/control records. One writev submits that header and the
 immutable lease bytes; the kernel segments TSO and completes partial checksums.
 
-The owner services driver deadlines before and after bounded RX. RX is limited to
-32 syscall attempts/packets, 1 MiB or 1 ms per turn; EINTR counts, time is checked
-at most every eight packets, and one final full record may exceed the byte bound
-by at most 65,585 record bytes. TX alternates the first Control/Bulk class, services at
-most 32 outputs per class and preserves fixed pending lease cells, with its own
-bounded syscall/byte/time turn. Limits are scheduler bounds, not preemptible
-syscall deadlines. Pending output is retried before new exports of that class.
+The owner services every driver before and after bounded RX. RX is limited to 32
+syscall attempts/packets, 1 MiB or 1 ms per turn. TX rotates scope/class groups,
+retaining pending leases and sharing one bounded syscall/byte/time output turn.
+EINTR counts; limits are scheduler bounds, not preemptible syscall deadlines.
 
 | TUN write result | Ownership |
 | --- | --- |
@@ -137,7 +132,8 @@ TCP/UDP initializers, sources/receivers, retirement, DNS and original scope owne
 actually join. `shutdown_wait_connections` supplies no natural-completion grace.
 
 After the supervisor returns its real `(ControlPlane, result)`, close the only FD,
-confirm owned-link disappearance, and remove only receipt-backed objects still
+drain the source owner while its required resources remain live, confirm owned-link
+disappearance, and remove only receipt-backed objects still
 proven to belong to this instance. Once business cleanup succeeds, remove P+4
 first, then guards/table and bypass/return rules, and finally the receipt. This
 explicit stop restores ordinary main routing. Software policy cleanup and the
@@ -150,9 +146,8 @@ closes local admission/endpoints, disposes local leases, returns driving rights
 and closes the FD; it performs no rtnetlink cleanup or successful-cleanup ack.
 The original supervisor retains joined cleanup on its original Tokio runtime,
 which an embedder must keep alive. There is no automatic FD reopen, resource
-adoption, TC/XDP fallback or Native continuation. HostFacts (S-b), pre-import
-Native (S-c) and FD-read captured return (S-d) remain unimplemented; this S-a
-Endpoint path does not complete E6.4.
+adoption, TC/XDP fallback or Native continuation. Opt-in socket HostFacts do not
+implement pre-import Native (S-c) or captured return (S-d), or complete E6.4.
 
 ## Full-XDP startup
 
@@ -177,9 +172,47 @@ routing {
 }
 ```
 
-Use `direct: endpoint` to terminate Direct TCP/UDP through the existing packet Endpoint and outbound relay; `direct: core` preserves transit through the Core forwarding owner and input-context kernel FIB. `lan`/`wan` (`Lan`/`Wan` in the model) describe interface roles, not execution profiles. XDP selection requires `backend: xdp` and an explicit Direct profile; invalid admission is rejected before kernel attachment. Do not combine this selection with the TC `global.lan_interface`/`wan_interface` settings. All RX queues of every selected interface are opened, with one ring owner per queue and one routing-domain owner across ports/queues. Backend, profile and device changes require restart; firewall/NAT policy uses transactional generation publication, retaining the previous policy on rejected updates.
+Use `direct: endpoint` to terminate Direct TCP/UDP through the existing packet Endpoint and outbound relay; `direct: core` preserves transit through the Core forwarding owner and input-context kernel FIB. `lan`/`wan` (`Lan`/`Wan` in the model) describe physical interface roles, not execution profiles. XDP selection requires `backend: xdp` and an explicit Direct profile; invalid admission is rejected before kernel attachment. Do not combine this selection with the TC `global.lan_interface`/`wan_interface` settings. All RX queues of every selected physical interface are opened, with one ring owner per queue and one routing-domain owner across ports/queues. Backend, profile and device changes require restart; firewall/NAT policy uses transactional generation publication, retaining the previous policy on rejected updates.
 
-Before startup, provision an exact effective-bypass-mark RPDB rule before `main`, selecting a dedicated table with a default route for every enabled source-address family through an **uncaptured** uplink. `so_mark_from_dae` supplies that mark (the example uses `0x100`); it is not `CLASSIFIED_MARK` and cannot restore an original captured skb. Captured Ethernet ports must be unnumbered, including IPv6 link-local addresses. Core transit routes and neighbors belong in the kernel routing domain. Stock native continuation, nonzero native rule marks, unsupported socket/process predicates and native local/wildcard-listener assumptions are not silently translated to Core or Endpoint: a FIB Local result alone is not local-socket authority. DNS53 still follows canonical policy.
+`direct: native` requires the real `ebpf` build, `dial_mode: ip`, NFQUEUE disabled and untagged physical capture. It compiles the same `RoutingPushPlan` into XDP and a required ingress TCX gate. Eligible final Direct traffic returns actual `XDP_PASS` before XSK; the original Ethernet/IP bytes enter Linux for routing, TTL/HL, conntrack and NAT. Both hooks retain the current publication and final-deadline checks; new admissions use current canonical routing. This profile does not create a replacement outbound socket. Configured groups retain the ordinary Endpoint executor, including a group whose selected leaf is Direct.
+
+Before Native hook attachment, startup retains a byte-for-byte, independent-inode checkpoint in `state/native-publication-initial/`, separate from the mutable latest artifact in `state/native-publication/`. Both files and their directory entries must be durable before startup proceeds; the checkpoint stays unchanged through later exports and shutdown. Startup verification binds its bytes to the first producer result's digest and identity, while stop verification still uses the final mutable artifact. Several legitimate pre-ready exports do not replace the original startup evidence.
+
+Native XDP and the ingress TCX gate walk up to eight IPv6 Hop-by-Hop, Destination Options or routing (segments left 0) extension headers to locate the TCP/UDP tuple and the remaining payload length. The original bytes are never rewritten, so an admitted Direct packet reaches Linux unchanged and Linux applies its own extension handling, including ICMPv6 Parameter Problem generation when required by an unrecognized option's action bits; honk synthesizes no ICMP. A ninth extension header, Fragment, AH/ESP, No Next Header, an unknown next header, a routing header with segments left and a zero payload length remain refused as before. Packets on the Endpoint path keep the Stack's existing bounded parser.
+
+The bounded non-LRU ordinary exclusion map holds Pending capture/import ownership, committed Capture and Kernel claims. Only an authenticated ordinary UDP Kernel/Active claim with zero outstanding uses the cached zero-mark Direct decision: while valid, it continues Direct across ordinary routing, mode and scoped-DNS fact changes, including a new Block or proxy decision. New tuples use current policy. Neither a bare CT/socket hit nor a tuple without an authenticated claim supplies this cached decision; either UDP port being 53 excludes this shortcut. Armed/Draining do not use it. Reply completion keeps its separate checks. TCP reload/lifecycle alignment is not established by this UDP behavior.
+
+Kernel UDP activity uses MONOTONIC time with updates only after more than one second. Idle strictly greater than 120 seconds refuses the expired hit without refreshing or replacing it. The runtime closes publication, joins admitted readers and drains RX/CQ before retirement. An expired ordinary UDP cache can be removed only when its real CT/socket query confirms absence, `PacketEndpoints::retains` is false, and the complete claim, including its last activity, still matches. A live or unknown owner retains exclusion. This retires a logical decision cache, not a kernel packet or socket reference; it does not prove physical PASS/build or held-first completion. Live entries are never evicted to admit another flow.
+
+Periodic maintenance first performs a bounded read-only candidate scan. A complete scan under one unchanged open epoch can skip closing when the map is empty or contains only fresh ordinary UDP and retained Capture claims. Insertions or endpoint retirement after visitation may wait for the next existing one-second turn. This hint never authorizes deletion: possible candidates or an uncertain scan still enter the closed rescan and retirement checks; map-read errors fail closed.
+
+Retirement translates userspace MONOTONIC samples back to the kernel clock domain using the admitted time-namespace offset; it does not compare namespaced time directly with BPF timestamps. Existing Host/TUN zero-offset admission is unchanged.
+
+Import authenticates the producing epoch, owner incarnation, actual packet fact scope and retained Port/queue before Stack/Core mutation. Native metadata is 64 bytes (the 32-byte envelope and 32-byte import); the non-LRU claim map has 56-byte keys and 72-byte values, and the single private operation record is 264 bytes. Transit keys use the actual capture namespace and TransitDefault zone; Transit rejects Host owner fields and any mark other than Keep/0. A joined cold restart replaces maps, programs and metadata together; old 40-byte key/value objects, 48-byte metadata and old readers are rejected, never adopted. Capture exclusions follow protocol/TIME_WAIT, initializers, source and output/CQ tails rather than the Kernel UDP idle rule. Gate queries do not refresh activity.
+
+For a newly captured Pending original, the first consumer selects before any protocol or Core mutation. Group/proxy and ordinary controller DNS commit Capture before Endpoint admission; committed executors cannot migrate. A literal Direct candidate retains the complete original Port scatter-gather chain and its producer expiry for a single private TAP write. The TAP XDP gate reruns the same-generation canonical body and checks finality, owner, extent, queue liveness, epoch and expiry; userspace Direct alone is not permission. Ordinary early PASS stays available. Pending, Armed and Draining redirects reserve bounded outstanding credits before redirect; only COUNTED completions settle their own credit. After the first target entry and a newly started same-publication Grace, followers proceed in import order; Kernel/Active requires first ordering, zero outstanding and no held original or private flight. Kernel packets gain no permanent Native permission sidecar.
+
+The private TAP is exclusive, nonpersistent, single-queue, nonblocking, in the original ingress namespace, with no vnet/GSO or NAPI. Preparation reserves memory, calls `admit_captured_layout` to parse and admit running-kernel BTF once inside that reservation while holding `/dev/net/tun`, then creates the TAP; unknown layout prevents creation. At most 480 captured targets are admitted (`honk-xsk/src/bpf/native/captured.rs`: `MAX_CAPTURED_TARGETS`, `captured_preparation_bytes`, `admit_captured_layout`; called by `honk-core/src/xdp/native/captured.rs::CapturedReturn::prepare`). Setup and each original submission check the private receive prerequisites: exact flags/MTU, one RX queue, zero RPS mask and flow count, and `rx_batched=0`. The newly created exclusive stock TAP has no PHY or provider configuration operations; timestamp readback is a consistency check, not independent proof that no provider exists. Address/route/IPv6 and injection containment checks remain required.
+
+The exclusive Ethernet TAP uses administrative MTU `min(max_physical_ip_mtu, 65521)`, with its stock maximum verified once during cold configuration. Physical admission, retained frame funding and operation extents continue to use the original physical MTU; the private administrative value does not truncate a 65535-byte IP packet or its 65549-byte untagged Ethernet frame. Receipts distinguish administrative MTU, physical IP MTU and the conservative full-frame capacity. Existing live FD/device/flags/MTU checks remain, without a new per-original geometry query.
+
+Setup installs terminal NETDEV-ingress DROP, then TCX redirect/guard, then pre-tap XDP guard/data. TCX saves scratch and redirects to the original physical ingress; the target chain is exactly `[owned_scratch_restorer, existing_honk_nat_gate]`, with restorer NEXT and existing gate finality. Entry at target `_one_core` is authenticated before taps; only its matching receipt followed by a fresh same-publication Grace proves transfer. A full or failed write alone proves neither transfer nor refusal. Missing entry, failed Grace or uncertain post-redirect custody retains the bounded Runtime/Port, operation, charges and guards; it does not replay or decrement on timeout.
+
+Full readback of an active captured owner requires its actual target-entry tracing link and program to remain pinned and FD-owned with their installed identities; a missing witness cannot pass by appearing as an already unpinned inventory item.
+
+The admitted namespace topology watcher remains live through private teardown and later physical-guard checks. Owned TAP dispatch-to-guard replacement, guard detachment and the last exclusive FD close use separate exact transactions, not an ifindex exemption. Deletion requires an authenticated UP/carrier-on/XDP-absent pre-state, the kernel's bounded DOWN then DELETE transitions, and exact-ifindex `ENODEV` afterward. Extra, missing, malformed or foreign notifications remain sticky failures, including after the TAP disappears; an uninvoked close callback keeps the FD, and a consumed FD is never retried.
+
+Each Port reserves `R * 1024` bytes for retained RX slots, where `R = min(rx_frames, ring_size)`; Runtime reserves another `R * 192` per admitted queue for held-original metadata. These use the same 384 MiB `CAPTURE_MEMORY` budget as UMEM, publication and private-return resources, with no second budget or payload pool (see `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` and `honk-core/src/xdp.rs::prepare`).
+
+Captured preparation reserves all common resources plus the larger of the BTF parser and static-loader envelopes, not their sum: admission returns scalar layout data before loading starts. The module guard, cold/device allowances, original-frame capacity, operation-cell charges and installed-reservation overlap remain funded under the same budget.
+
+After captured programs load, a measured installed-inventory reservation replaces the BTF preparation allowance; the replacement is secured before releasing the old charge. Canonical candidates have an installation-local, nonwrapping serial in their pin names, independent of the closed publication epoch: several scope updates may prepare replacements under one writer. The existing two-candidate-per-realm bound and exact owned-pin cleanup remain unchanged; an existing foreign pin is never adopted or overwritten.
+
+Captured return currently drops reply/NAT-translated inputs whose wire key differs from CT ORIGINAL, and cross-realm inputs for Pending/Armed/Draining whose receiving scope differs from the claim. They are rejected before outstanding reservation or redirect and have no separate drop counter (`honk-xsk/src/bpf/native.rs::captured_wire_identity` and the `selected_kernel` scope check). Replies during Draining, such as TCP SYN-ACK, need retransmission. These lanes remain unsupported and NOT_RUN; existing Active continuation is a separate path. A negative `writev` result after admission also remains NOT_RUN; the test fault for a downstream drop with a possibly full write does not cover it.
+
+Native continues to refuse Host, Core firewall/NAT, VLAN continuation and unsupported packet representations. A Direct decision requiring TCP sniff after Endpoint commitment has no pre-executor original consumer. Enforced TAP synchronization checks and packet-level proofs do not by themselves establish complete floor/recent lifecycle acceptance. All65 and E7 remain unverified for this consumer; this implementation does not establish full Native acceptance.
+
+Before physical capture startup, provision an exact effective-bypass-mark RPDB rule before `main`, selecting a dedicated table with a default route for every enabled source-address family through an **uncaptured** uplink. `so_mark_from_dae` supplies that mark (the example uses `0x100`); it is not `CLASSIFIED_MARK` and cannot restore an original captured skb. Captured physical Ethernet ports must be unnumbered, including IPv6 link-local addresses. Core transit routes and neighbors belong in the kernel routing domain. Stock native continuation, nonzero native rule marks, unsupported socket/process predicates and native local/wildcard-listener assumptions are not silently translated to Core or Endpoint: a FIB Local result alone is not local-socket authority. Process predicates require explicit Host capture below; physical ingress supplies no authenticated process identity. DNS53 still follows canonical policy.
 
 Captured physical roots and bypass-table Ethernet uplinks must be administratively
 up, standalone and have carrier (`IFF_UP | IFF_LOWER_UP`); captured logical
@@ -189,8 +222,16 @@ notifications for only the captured physical roots to regain carrier, with one
 10-second deadline across all roots and final admission. Other topology refusals
 remain immediate, including a down or carrier-less bypass uplink. An expired
 carrier wait names the interface and reports `no carrier after XDP attach`;
-startup fails with the existing guard custody. Later link notifications still
-close capture and require restart.
+startup fails with the existing guard custody.
+
+After startup, an owner XDP replacement accounts for exactly one matching link
+notification under the retained Native topology watcher. The interface, retained
+program identities and complete non-statistical link configuration must match the
+expected replacement. Any other link, address, route or rule notification, a
+missing or extra notification, receive loss or malformed observation permanently
+closes capture and requires restart. There is no elapsed-time exception or live
+watcher readmission, and no allowance survives the operation. This is not an
+atomic fence against external privileged topology writes.
 
 During that startup wait only, the existing native IPv6 `ff00::/8` multicast
 route may carry the sole `RTNH_F_LINKDOWN` flag when its output is a captured
@@ -204,8 +245,7 @@ IPv6 extension-header replies do not receive the connected-socket native exempti
 if they arrive on a captured port, the selected packet policy still applies. Keep
 their return path on the uncaptured uplink: this unsupported topology is not made
 equivalent by XDP socket-lookup helpers. Wildcard lookup alone cannot distinguish
-transit from LocalInput. Route/address/link/rule notification loss or change closes
-capture; this is not an atomic kernel route-mutation fence.
+transit from LocalInput.
 
 Endpoint reply identities use a shared 4096-entry table keyed by logical scope and
 source IP. Reclamation considers only entries no longer retained by protocol state,
@@ -242,8 +282,8 @@ L2 group addresses cannot grant unicast IP a native socket exemption. Existing
 native ARP/ND and IP special-address handling remains; directed broadcasts come
 from at most 64 exact local-table `RTN_BROADCAST` routes, never suffix guesses.
 
-Explicit XDP selection defaults to forced AF_XDP ZeroCopy for every selected
-queue; `datapath.xsk_mode: copy` remains an explicitly supported mode. The default
+Physical XDP capture defaults to forced AF_XDP ZeroCopy for every selected
+queue; `datapath.xsk_mode: copy` remains an explicitly supported physical mode. The default
 backend is still TC. Every RX queue must have a corresponding TX queue; shared
 preflight checks device/frame commitments before any guard attaches. Queue
 admission then rechecks device facts and verifies the actual bind result; a late
@@ -254,7 +294,19 @@ add `xsk_mode: copy` to preserve their previous Copy behavior; see the
 [configuration migration note](../reference/global.md#capture-backend-selection).
 
 
-Start a freshly built real daemon with `honk-core -c config.dae --bpf-pin-root <private-bpffs-directory>`, without `--mock-ebpf`. Readiness is `XDP datapath ready`. The XDP path creates neither TC hooks, NFQUEUE, `dae0` nor `daens`. Software checksums remain the default.
+Start a freshly built real daemon with `honk-core -c config.dae --bpf-pin-root <private-bpffs-directory>`, without `--mock-ebpf`. Readiness is `XDP datapath ready`. Endpoint/Core physical capture creates no TC hooks. Each Native device pins `guard`, `data` and `native-gate-prog` under `xdp-<ifindex>/`; new runs have no `native-xdp-link` or `native-gate-link`. Guard and data are pinned before installing the driver-mode guard through `RTM_SETLINK` with `XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST`. The netdev holds the installed XDP program independently of creator FDs. XDP replacements use `RTM_SETLINK` with `DRV | REPLACE` and the exact expected-old program FD, followed by exact native-mode/program-ID readback; they never enter a program array. The owned `data-next` staging pin is atomically renamed to `data`, and the old FD remains charged until the second reader grace. A matching negative ACK leaves the previous selection unchanged; uncertain completion retains both candidate pins and owners, keeps the epoch closed and prohibits further publication. Generic/SKB mode has no fallback. Explicit Host adds its separate source/return TCX hooks below. These paths create no NFQUEUE, `dae0` or `daens`.
+
+After the exact XDP bootstrap guard is installed, Native pins the non-link SCHED_CLS ingress dispatcher `honk_nat_gate` as `native-gate-prog` and attaches it with freshly queried TCX revision. Captured setup adds `native-return-restorer-prog` and `native-return-restorer-link` under the same `xdp-<ifindex>/` directory. Ready ingress must read back exactly `[owned_scratch_restorer, existing_honk_nat_gate]`; the gate remains non-link with link ID zero, egress is empty and all pins identify the exact installed objects. Static private-return pins live in sibling `native-return-<attachment>/`, with generation-specific realm gate pins recorded in the publication artifact. The dispatcher retains its TC-only program array and shared device/publication owner. Ordinary reload keeps that dispatcher and replaces candidates under the closed-root/reader-grace protocol. Prepared-only pins do not provide protection; an attach/readback/registration failure retains the installed prefix and returns failure, without automatic retry.
+
+Pins retain the last programs after owner death, but an odd epoch alone cannot grant business PASS: the Native gate also requires a live owned XSKMAP entry before its final epoch/deadline frontier. Last XSK file close removes those entries; fresh invocations then refuse even if the root remains odd. An invocation which already observed a live socket may finish its entered operation. This interlock and the real owner-death wire behavior require floor/recent VM evidence; retained pins do not prove joined kernel cleanup.
+
+Joined shutdown seals Native permission and restores the physical guard before XSK withdrawal. A successful private operation/hook join detaches and unpins the restorer, removes private pins/TAP and records the durable joined proof, leaving the physical XDP custody and non-link Native gate for explicit recovery. Unresolved work instead retains the two-program chain, operation and charges. Closing local FDs alone does not detach physical custody, including attach-success/readback-failure paths. Device/namespace teardown, reboot and privileged detach remain outside this custody contract. There is no guarded guarantee before initial XDP installation succeeds, and crash survival of selected data still has the live-XSK limits above. Program existence, actual attachment and valid business permission are separate facts; all65/E7 and floor/recent owner-death behavior remain NOT_RUN.
+
+Restart refuses predecessor state. Explicit cold recovery first stops external sources, joins or confirms death of prior daemon/XSK/source/device owners, and preserves namespace/device/run/capture-generation identities. It prechecks all devices and the full static/dynamic inventory described in [control-plane recovery](./control-plane.md#startup-and-shutdown). An unresolved two-program chain is not a clean recovery candidate. The joined gate singleton is accepted only with the durable joined file, its digest-matched `CAPTURED_JOINED_ACK` and live absence of the restorer/private resources; loader-only singleton state does not qualify. Recovery detaches XDP using `DRV | REPLACE`, FD `-1` and the exact expected-old FD, requiring matching ACK and all-mode absence; it then requeries TCX revision and detaches the exact retained nonzero gate FD using `BPF_PROG_DETACH`. FD zero must first be duplicated with `F_DUPFD_CLOEXEC` to at least one and retained through syscall/readback. Confirm both TCX directions empty before unlinking known physical pins and directories; delete joined records last, after all their named gates are removed. Unknown pins, stale revision, foreign items, missing proof or partial failure stop cleanup with custody retained. Prepared-only and old link states require their separate identity checks; no missing identity is invented.
+
+Old link formats require separate source-quiesced recovery. For `native-gate-link`, verify the TCX link kind, device, ingress attach type and program against actual query, close all owner FDs, release only that owned link pin and confirm the item disappears; `BPF_PROG_DETACH` must not be used to remove a link item. For `native-xdp-link`, verify its XDP link type, device and program identity, close all owner FDs, release only that owned link pin and confirm XDP absence before releasing remaining program pins. Legacy netlink detach cannot replace a live XDP link; no live link-to-netdev conversion or automatic stale adopter is provided.
+
+NAT is owned by Linux. Lookup uses the actual wire tuple and the returned conntrack direction; exclusion checks use the actual conntrack ORIGINAL tuple, including across SNAT/DNAT. A reply does not create a reversed permission entry or rewrite the ordinary claim key.
 
 SG/multi-buffer capability advertisement and successful binding are not runtime
 proof of jumbo traffic. The manual veth smoke exercises MTU 1500 and 9000 in Copy
@@ -267,7 +319,7 @@ Endpoint output is generated directly into one reserved UMEM frame only for admi
 
 `Port::transmit_generated(class, max_length, generate)` reserves actual single-frame/ring/sidecar capacity before invoking its synchronous generator; scope credit is also reserved before Stack emission. Private guards cancel unpublished reservations on no output, error or panic. Original FlowId retention is installed under the scope mutex, then exact peer/header completion runs unlocked without await or RX service. Only the actual length, padded with zeroes to the Ethernet minimum, is published at the unshifted frame base; published ownership survives later errors until real CQ. CPU and direct Endpoint owners share mixed exact-scope CQ batch return. The existing 32 considered outputs/class/realm and 64 CQ-descriptor bounds, independent ACK/retransmission/CQ lifetimes, E3.1 handoff and process-lifetime UMEM charges remain. Eligible driver turns skip only CPU pulling and finalize timers/events/close/deadlines after direct emission; they add no busy polling. Only one intermediate Endpoint CPU-IP-frame-to-UMEM copy is removed, not TCP payload/checksum or relay copies; this is not universal UDP zero-copy, a resident-memory reduction or measured gains.
 
-XDP owns canonical in-memory routing, domain and health publication, not a Mock or TC backend. The native API reports datapath kind `userspace` without claiming hardware counters or program/attachment inventory; actual capture admission comes from the runtime's shared gate. Kernel witness recording and TC/listener/token APIs are unsupported. Software flag publication remains canonical; only native UDP staging and witness admission are skipped for this backend.
+XDP owns canonical routing, domain and health publication through the userspace backend. Native adds a concrete kernel publication consumer there, with immutable compiled maps/programs and one aligned epoch shared by XDP and TCX; it does not construct the TC backend. The native API still reports datapath kind `userspace` without claiming hardware counters or program/attachment inventory. TC listener/token and kernel witness APIs remain unsupported.
 
 Fixed aggregate counters distinguish queue/credit/capacity refusals from native-ID
 history precision loss and successful peer reclamation. Only actual refusal
@@ -275,8 +327,9 @@ episodes emit a warning; recurring pressure is summarized at debug level rather
 than logged per packet.
 The same owner sampler acquires each queue's six kernel socket counters and raw
 ring indices outside DEBUG filtering, at most once per second on existing owner
-turns. DEBUG reuses that sample and reports port counters. Normal close takes a
-final sample before socket teardown. There is no new idle sampling timer.
+turns. DEBUG reuses that sample and reports port counters. Readiness takes one
+initial sample and normal close takes a final sample before socket teardown.
+There is no new idle sampling timer.
 `StatsManager` shares only the latest bounded observations with native
 `/api/v1/datapath` (`x-honk.xdp`) and Clash `/stats` (`xdp`); neither GET samples
 the kernel or changes polling. Exact admitted queue storage and its shared
@@ -288,6 +341,22 @@ starting/active/closing/closed/failed-retained lifecycle remain explicit.
 Reads are sequential, not atomic across rings or queues. Empty-FILL events and
 wakeup errors are not additive packet-loss counts; a current populated FILL
 ring cannot disprove earlier starvation. See the [API semantics](../reference/api.md#connection-closing-mode-and-datapath-lifecycle).
+
+### Native closed-epoch counters
+
+The intended transition-recording contract adds one dedicated ARRAY map per Native target, shared by its XDP and ingress TCX programs across candidate replacement. Existing queue/capture counters and their `queue_count+4` ABI remain unchanged. The new map has 513 entries of 32 bytes: 256 tagged generations for each of two hooks and one sticky accounting-fault cell. For the full even epoch E read from `NativeRoot`, index `((E >> 1) & 255) * 2 + h` selects XDP (`h=0`) or TCX (`h=1`). Before attachment at epoch zero and before each closed store, userspace initializes the destination cells with E and zero count/overflow/reserved fields.
+
+Only ordinary executions taking the closed-epoch branch increment `ordinary_drops`, including unparsed frames reaching that gate. The marked read-only TC query bypasses counting. Root-lookup, parsing, policy, stale final-CAS, queue and other drops do not contribute. BPF preserves the full sampled epoch, checks the cell's epoch/reserved fields, atomically increments the 64-bit count and returns the existing hook drop action. Wrap sets sticky overflow; an invalid tag/cell sets an accounting fault and still drops. Neither is an ordinary zero or complete evidence.
+
+A successful close grace after storing a *different* epoch seals prior even epochs that could still have readers; `CLOSED_COUNTS_FINAL` records each covered hook/epoch, including real zero values. That same grace does **not** finalize the current closed epoch: it can still receive increments. Reopen adds no grace. Its just-ended closed epoch stays provisional until the next required close grace, or terminal detach/join plus grace. An invocation delayed across reopen counts against the full epoch it actually read, not inferred arrival time. Reusing a cell requires the old tag to be sealed and its final events appended; failure keeps publication closed and retains the old cell. Polling/subtracting cumulative counters cannot replace sealing.
+
+Hook identities bind publication/target serial, hook kind, scope, namespace cookie, ifindex, attachment generation and counter map ID; replacements record old/new program identity. IDs never follow recycled ifindex alone or silently reset on replacement. Final counts require every counter-referencing program to be detached or replaced by a guard without that reference, then actually joined/drained with reader grace. Retained/pinned accounting hooks keep counts provisional and `hooks_joined=false`. Per-hook sums are hook executions: one packet may reach both hooks in different epochs. They are not deduplicated packets, per-flow loss or proof that any traffic reached a zero-count hook.
+
+The bounded event contract uses 13 kinds, including `PROGRAM_REPLACED=13`, while retaining the 128-byte event and 16-byte root layouts. For kind 13, `hook_id` names the registered hook identity; `counter_value` carries the old program ID and `counter_epoch` carries the new program ID. These fields represent program identities for this kind, not a drop count or root epoch. Replacement outcomes are `PENDING=0`, `COMMITTED=1` and `FAILED=2`. The replacement chain starts from the registered program identity, requires each old program ID to match the preceding current identity, and advances current identity only on committed replacement. Failed outcomes remain recorded; pending replacement or a lost replacement event prevents completeness. Consumers reject unknown kinds above 13 rather than skipping them.
+
+The unchanged incremental reservation floor is **598,016 + 100,516*T bytes** for T targets: 524,288 for the 4,096×128-byte ring, 8,192 for publication bookkeeping including the fixed identity table, and 65,536 for streaming export; each target adds 92,324 for its counter map and 8,192 for core counter-generation bookkeeping and target metadata. The identity table holds at most 32 hooks / 16 targets inside the publication's fixed 8,192-byte bookkeeping reservation. One target is 698,532 bytes, two are 799,048. Higher measured map memory and actual owner allocations require top-up; generated instruction/preparation buffers and old/new program overlap remain additionally charged. No CPU/queue multiplier applies to these shared per-hook counters. The existing 384 MiB capture budget is not raised, and recorder/UMEM/optional-CPU trie charges are not borrowed or omitted. Charges survive export and actual owner retirement as applicable. This is a reservation floor, not measured kernel memory or proof that a configuration fits.
+
+All focused ABI, counter, race/reuse, budget, export and floor/recent real-hook checks are **NOT_RUN** for this handoff. Store brackets and sealed counts support bounded publication observations; they do not identify an application packet, establish packet causality or delivery, bound close duration, or repair attachment custody. See [publication recording](./control-plane.md#native-publication-transition-recording) and the [separate artifact](../reference/api.md#native-publication-artifact).
 
 ### Event and bounded adaptive service
 
@@ -329,6 +398,77 @@ cleanup. This source coverage requires a passing rig execution before any run
 is accepted; it establishes no virtio equivalence, physical-NIC performance or
 DMA-release result. Existing Copy and virtio Event profiles remain separate.
 
+
+### Host source custody
+
+The explicit [Host block](../reference/global.md#xdp-host-endpoint) adds ordinary
+Host TCP/UDP Endpoint capture, alone or beside physical Transit capture. Both use
+global `direct: endpoint`; Host cannot be combined with Core Direct. Host requires
+the `ebpf` build feature, active `bpf` in the kernel LSM list and the mandatory
+`sk_free_security` link, running-kernel BTF with admitted socket/skb layout and
+visible `sock_wfree`, and x86-64 little endian. Current, worker and children time
+namespaces must agree with zero MONOTONIC offset. Root cgroup2 create/connect/
+sendmsg and egress-selector hooks must remain the exact effective hooks throughout
+the inspected descendant tree; foreign competing hooks refuse startup. An identity
+canary must observe actual socket creation and final retirement.
+
+`HostCapture` prepares its owned private namespace/veth pair, source TCX capture,
+private XDP/AF_XDP queue and return TCX path with capture closed. The private queue
+always uses verified Copy, independently of physical binding mode. Admission checks
+the actual owned XSK/namespace, ready Endpoint consumer, complete source/child
+custody and reader grace before opening the one-shot gate. The journal at
+`data_dir/state/host-<source-netns-cookie>.json` records mutation intent before
+ACK/readback, with pins under `<bpf-pin-root>/host-<cookie>/`. An existing receipt
+refuses restart; resources are never automatically adopted.
+
+Custody covers the whole source namespace, not just listed Host interfaces. Only
+plain Ethernet and loopback plus the exact owned private pair are admitted.
+Ordinary operator veths are currently refused, as are mastered/stacked/lower/tunnel
+links, route encapsulation, foreign XDP/TCX or legacy TC filters/actions, XFRM state
+or policy and nftables tables. Even dormant nftables tables refuse admission.
+Missing, malformed, lost or over-limit inventory evidence fails closed.
+
+The sole nonempty netfilter exception is the kernel-origin built-in
+`apparmor_ip_postroute` record for IPv4/IPv6 POSTROUTING, with active AppArmor,
+exact family/hook and priority -225, and at most one record per applicable family.
+Native NFNL metadata derives the symbol from the registered callback pointer;
+device, module and NFT/BPF chain descriptors, duplicate/missing/unknown/flagged
+attributes and malformed records are refused. All other hooks, NAT/transforms,
+QUEUE and reinjection compositions remain refused. This relies on trusted stock
+kernel symbolization: `%ps` omits offsets and supplies no code attestation.
+
+Ordinary AppArmor POSTROUTING processing remains before source TCX capture;
+denials retain their encoded error and never become successful captures.
+Generated replies remain new packets entering ordinary Linux ingress and security
+processing, without reconstructing the original socket label/secmark or promising
+an identical AppArmor permission decision.
+
+Cold namespace entry prepares snapshots and namespace-bound netlink sockets;
+later custody queries use those retained sockets. Both namespace inventories
+retain actual hook counts and complete native records; full inventory comparisons
+reject additions, removals and identity/priority drift. Detected topology, hook or
+offload invalidation closes capture. Fast checks without RTNL activity may skip
+netfilter queries. The owner contract excludes concurrent privileged topology/hook
+or code replacement; notification delivery is not an atomic mutation fence.
+
+Authenticated source receipts bind namespace, attachment, socket and operation
+incarnation, process presence and original output/return identity before Stack
+import. No tuple guess grants Host identity. Ordinary Direct creates a new marked
+outbound; generated replies enter normal Linux demultiplexing through the admitted
+interface, without selecting a recipient FD or resuming the original socket
+operation. Native continuation remains absent; native API observations are separate.
+
+Close fences new capture with the gate, source/private guards and reader grace,
+then joins Endpoint output/CQ work. Confirmed stop with selected external socket
+owners records `guarded-retained` and keeps custody, hooks, pins and receipt: this
+is a completed guarded stop, not full resource removal. With no such owners,
+confirmed teardown removes the owned pair, pins/hooks and receipt. Crash or
+ambiguous/failed cleanup retains custody without claiming completed cleanup.
+Neither FD close nor resource removal refunds retained kernel/UMEM charges before
+process exit. XDP Host itself grants no TUN capability or Native continuation and
+does not establish full V7, E6/E7, physical or 13-size acceptance.
+
+### Physical capture guards and smoke
 
 Stop traffic sources before removing custody. Normal shutdown reports `XDP admission closed; UMEM retained until process exit`; the netdev XDP attachment remains a fail-closed guard, with `guard`/`data` program pins under `<bpf-pin-root>/xdp-<ifindex>/`. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Startup refuses an interface that still has an XDP attachment. After stopping sources and verifying the attached program ID belongs to this instance's guard, remove that attachment (`ip link set dev <interface> xdp off`), then only its owned pins. There is no automatic zero-resident hot reopen: retained UMEM remains charged against the process-lifetime **512 MiB** ceiling; close and empty rings are not DMA-release evidence.
 

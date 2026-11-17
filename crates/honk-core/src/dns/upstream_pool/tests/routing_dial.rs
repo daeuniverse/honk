@@ -19,7 +19,7 @@ fn route(ip: &str, outbound: &str) -> RoutingRule {
         outbound: RoutingOutbound::Simple(outbound.into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }
 }
 
@@ -162,7 +162,7 @@ async fn implicit_quic_routes_use_data_udp_health() {
                 outbound: RoutingOutbound::Simple("proxy".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             }],
             "direct",
         )
@@ -216,7 +216,7 @@ async fn implicit_udp_route_follows_tcp_carrier_health() {
                 outbound: RoutingOutbound::Simple("proxy".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             }],
             "direct",
         )

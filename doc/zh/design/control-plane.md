@@ -45,11 +45,29 @@
 10. 检查 NFQUEUE 健康状态，发布其 ready 状态，开放 pending verdict 准入，最后把 `DATAPATH_STATE_MAP[0]` 设为 ready。随后 TCP accept loop 在控制面 supervisor 中运行。
 `RealEbpfBackend` 负责 aya program、map、link、持久分配器处理和真实 NFQUEUE 集成。`MockEbpfBackend` 在没有特权内核资源时提供相同控制面接口。请求的 NFQUEUE 路径无法通过锁交接后的固定队列前置检查，或随后准入前的队列/规则/健康检查时，会记录 warning 并关闭；该启动降级在重载后仍生效（见[全局配置参考](../reference/global.md)）。持久化 token generation 恢复失败与服务准入后的失败仍为 fatal。
 
-编译路由、已学习域名 map、连通性、模式标志、接纳及清理使用共同接口。真实与 mock TC backend 通过 `tc()` / `tc_mut()` 暴露既有对象；软件 backend 以 `Unsupported` 拒绝该能力，包括在绑定任何透明 listener 前拒绝。可选内核观测保持不可用，不伪造事实。共享 policy publication 本身不授予 HostFacts、native 续行或 captured return；具体 TUN owner 仅提供 S-a Endpoint capture。
+编译路由、已学习域名、连通性、模式标志、准入与清理共用接口。软件 backend 以 `Unsupported` 拒绝 TC 能力；共享策略发布本身不授予 HostFacts、Native 续行或 captured return。TUN owner 可在真实来源就绪后提供经认证的应用 socket 事实。
 
 配置为 XDP 和 TUN 的 daemon 共用 packet supervisor、mode/flags coordinator、订阅 authorization 及完整 control-command dispatch。软件 flags 在 scope 准入前以禁用 NFQUEUE 的状态初始化，保持恢复后的 mode；发布失败进入 joined startup cleanup。这两条路径不创建 TC listener 或 NFQUEUE helper；原 `PacketEndpoints::new()` 嵌入生命周期保持不变。
 
 TUN 在改路前准备 DNS bind 候选，把保留的 `Option<PreparedDnsBind>` 交给 `start_driven`；XDP 传 `None`。两个设备 runtime 在等待 `owner.poll_ready` 或失败启动清理时都持续服务唯一 `PacketDriver`。Supervisor ready 不等于 capture ready：只有真实设备/拓扑提交后调用 `capture_ready()`，才允许 lifecycle Running。TUN 的 setup/FD owner 与[保留 guard 的停止顺序](./datapath.md#停止与失败保留)不属于共享 policy backend。
+
+Native XDP 在 packet scope 准入前，把真实 publisher 安装到同一个 `UserspaceBackend`。规范 plan 发布先准备全部 target，再提交软件状态；部分外部发布失败使 Native 保持关闭。完整 reload 在 flags/drain 前取得计数式关闭，直到 Router/config/diagnostics 与 scoped projection 全部提交才结束。Runtime mode 和 no-op activation reset 使用同一个 writer，Rule/Direct/Rule 不会复活旧权威。Shutdown intent 在唤醒 capture 清理前关闭 Native。只有最后一个成功的重叠 writer 能打开新的不回绕 epoch；失败与终止关闭均保持关闭。
+
+Native 先安装 netdev 持有的 XDP bootstrap guard，再 pin 并附着非 link ingress TCX gate。Device 与 Native publisher target 共享同一结构化 gate owner。Captured return 将目标 ingress 链扩展为严格的 `[owned_scratch_restorer, existing_honk_nat_gate]`；激活和发布要求程序身份、pin 与链顺序精确匹配，不能再假设只有 singleton gate。Restorer 返回 NEXT，既有 gate 保持最终裁决。普通 reload 保留 dispatcher，沿用既有 candidate 发布与 reader-grace 协议；非 link custody 不提供新的 reader grace。Capture 关闭时先恢复 DRV guard 再撤回 XSK。普通退出或最后一个 owner Drop 只关闭本进程 FD，不能据此认定已 detach 或 unlink，attach 成功但回读失败后也如此。下述 TC backend 清理不认领 Native 附着及其 pin。
+
+关闭意图本身不允许释放原包。Runtime 的终止捕获证明初始为 Unproven，只有全部物理 guard/XSK 撤出、私有封闭及 guard 后 reader Grace 成功才变为 Proven；该 owner 的 Failed 不可逆。终态 Payload、Flight、Completing 服务（包括已经取得的 proof）没有此证明就不能释放、refill、acknowledge Port 存储或结算 credit。私有 close 的每个失败或未决结果都锁存既有失败状态，恢复记录不能重新取得销毁或 joined archive 权限。即使没有 payload，Owner Drop 也先 quiesce Native 再执行 guard；正常 Drop 先于 operator recovery 和拓扑恢复。
+
+尚未完成的终态记录会尝试全部物理 recording hook 撤出，即使撤出失败仍执行 reader Grace。保留最初与后续错误，成功 Grace 不能替代缺失的 hook 证明。只有撤出与 Grace 均成功，并满足既有 terminal、clock、accounting 条件，才封存 counter、标记 hooks-joined 和 collection complete。已经完成的记录继续保持不再写入的契约。
+
+启动严格拒绝残留 attachment、设备 pin 目录、混合格式及未知或外来状态，不继承前任权威。完整 join 后冷重启同时创建匹配的 map、程序和 metadata；不接管旧对象或 reader。显式[冷恢复](./datapath.md)核验物理 XDP guard/data、Native gate/restorer、operation 和 realm-dispatch map、TAP XDP guard/dispatcher 与规范 realm gate、private TCX redirect/guard、terminal DROP、entry observer 及 attachment、pin 和 receipt 的精确身份。在线与未决状态要求精确的双程序目标链。只有 joined close 成功才记录 restorer link 的 Detached 与 Unpinned 以及 restorer program 的 Unpinned，留下保留的物理 gate 单例。Recovery 先预检全部设备身份，再核对 joined 证据，随后用 expected-old XDP FD 及精确非零 TCX program FD 和新查询的 `expected_revision` detach；prepared-only pin 与旧 link 格式分别核验身份。未解决的 operation 或 hook 有界保留其 owner、pin 和费用。
+
+`CapturedReturn::finish_close` 写入终态清单并 fsync，以不覆盖已有文件的方式改名为 `native-return-<namespace>-<attachment>.joined.json`，再 fsync 文件和目录，最后才返回实际路径与 SHA-256。只有此成功结果允许 publication 产物中的 `CAPTURED_JOINED_ACK`。Recovery 同时要求 joined 文件、摘要匹配的 ACK 和一致的实时内核状态：保存的 gate 单例精确匹配、restorer 缺席、private pin 缺席。仅凭文件名不能确认持久化或干净关闭。启动不删除或接管旧 joined/active receipt；recovery 只在移除文件列出的全部 gate 后才删除 joined 文件。见 `honk-core/src/xdp/native/captured.rs::{Receipt::archive_joined,CapturedReturn::finish_close}`、`honk-core/src/ebpf/native.rs::acknowledge_captured_join` 与 `.github/ci/xdp-ipv4-options.py::{native_joined_ack,native_cleanup}`。本次交接尚未执行这些路径。
+
+Captured-return 证据预先计费 256 条固定 `CapturedReceipt` 记录（含上限 255 字节的 joined-proof 文件名及 SHA-256）和 128 条最新 `CapturedRealm` 清单记录，每条路径上限 4,096 字节。Cell binding 在加载 map/TAP 前另一次性预留 `128 * (size_of::<CapturedGateIdentity>() + 4096) + 4 pages`，覆盖清单/路径 scratch 与失败 owner metadata。全部预留使用既有 384 MiB 预算；规范 candidate staging 失败时保留 compiler/loader 预留及 Facts/domain owner。持久产物在 writer 提交、失败及部分完成时刷新规范清单；只有 operation owner 的持久 joined proof 完成后才记录 `CAPTURED_JOINED_ACK`。这些有界记录不提供逐包日志，也不构成验证；相关检查全部仍为 NOT_RUN。
+
+初始 Native publisher 在每次使事实失效的 DNS 修改期间撤销全部 Native 配置入口。Reader grace 与 candidate 准备期间到达的业务包会被拒绝，直到发布重新打开；此窗口尚无实测上界。因此 Native 验收还要求在真实 DNS 负载下测量丢包窗口。Native 发布失败时保持关闭，但规范 HOST/TC/scoped DNS 的 observation、到期与 snapshot 修改继续执行。
+
+地址集合及 bitmap 不变的正向 expiry 延长只更新规范 owner，不关闭 Native。待处理延长共用固定续期唤醒点：installed deadline 减去 `min(1s, remaining/2)`；重复 refresh 不推迟它，现有 DNS worker 一批发布最新 pending facts。已安装剩余有效期至少两秒时，下次延长批次至少等待一秒；更短有效期在剩余时间的一半处续期。Clear、缩短及 facts 改变仍在修改前撤销。Ownership query 被拒绝时保留 bridge，稍后重试，不终止捕获。
 
 TUN 的有效进程 mark 是 required：初始化存储一致的 `(mark, required)`，用真实 TCP/UDP socket 回读，并传播后续 mark 失败。独立 DNS 及两个管理 API listener 均在 bind/listen 前设置并回读 M，让握手期间的 accepted child 就已继承；TC 透明 accepted socket 清 mark 的规则不适用于这些普通 TUN 服务 socket。Clash bind/mark 失败报告 API unavailable，native API 失败拒绝启动；授权不变。`/configs.tun` 投影已接受的 backend/device/MTU/stack 及由 address6 决定的 IPv6，不证明 runtime 健康；native datapath summary 仍为 unknown，无内核可见性。
 
@@ -61,9 +79,23 @@ XDP 的可选轮询资源由进程启动点持有，与不可变的 `ResourceBud
 
 真实 backend 在 pin map 后启动失败时，启动 guard 只删除本次成功创建的临时 pin。未能替换的已有 pin 与无关的已有 pin 不归本次所有。`UDP_DECISION_SEQUENCE` 和 `ROUTING_GENERATION_SEQUENCE` 在启动失败和普通清理后都会保留；启动成功时，临时 pin 的所有权转交 backend 清理。
 
-关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher（等待进行中的批次完成）、卸载 BPF hook，按[业务连接宽限等待](../reference/global.md#关闭)规则执行可选等待，再关闭剩余连接、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通清理保留固定分配器。随后 listener 和 `daens`/link-pair 所有权离开作用域。
+关闭时在资源消失前逆序释放所有权：fence NFQUEUE、关闭数据路径准入、拒绝新的用户态工作、取消并排空持有的 verdict 和 UDP initializer、停止 UDP driver 和 removal 处理、停止接口 watcher（等待进行中的批次完成）、卸载 TC backend 的 BPF hook，按[业务连接宽限等待](../reference/global.md#关闭)规则执行可选等待，再关闭剩余连接、退役出站运行时、停止 NFQUEUE、停止 DNS controller 和 persistence，并清理 generation 持有的 BPF 状态。普通 TC backend 清理保留固定分配器；Native 遵循上述保留附着的关闭契约。随后 listener 和 `daens`/link-pair 所有权离开作用域。
 
 UDP receive-priority 辅助元数据不可用时，真实 backend 持有 receive-trace fallback 的 link 与 map。每个地址族都必须具备完整的 enter/exit 对：失败时卸载该对，不会禁用另一个地址族。两个地址族都依赖 `__skb_recv_udp` 上共享的 hook；它失败时两者都不可用。注册会检查 socket 地址族，因此缺少对应 hook 对的 listener 会报告不可用，而不是无证据地静默注册。每个 backend 只尝试一次 fallback，失败或部分成功也不例外。Listener 重载会重新检查原生辅助元数据支持和注册结果，但不会重试挂载；修改内核/BTF 支持后需重启。追踪缺失只影响已记录的内核路由证据，不改变路由或 UDP 交付。`cleanup()` 先卸载 ingress hook，join ring consumer，再于 BPF 对象释放前 drop `receive_trace`；即使 backend 自身仍存活，也会释放这些资源，不等到其 Drop。普通清理仍保留两个持久化 sequence pin。
+
+### Native 发布转换记录
+
+Native 记录的预期契约是必需的生命周期记账，不依赖 HTTP feature、诊断需求或日志级别。本次实现交接的定向回归、真实 hook 封存及最终导出消费端检查均为 **NOT_RUN**；本节不是运行证据，也不代表 `MISSING_PUBLICATION_TRANSITION_EVIDENCE` 已解决。
+
+`NativePublication` 持有预先计费的 ring：4,096 个不可变的 128 字节 event，16 字节 `NativeRoot` ABI 不变。挂载前记录关闭的 epoch 零初态。统一 publication mutex 串行化 event、writer 记账与全部 epoch store，包括 quiesce、map 读取失败、epoch 耗尽和 owner Drop。publication 内 seq、operation ID、writer ID 从一开始且不回绕。嵌套 participant 保留外层 writer ID，同时具有自己的 operation ID 与有界 reason；reason 区分 startup、policy、flags、ready、capture-ready、scoped-DNS、reload、mode、runtime-maintenance、shutdown 以及记账/owner 故障。
+
+Close 分别记录 intent、实际关闭 store、reader grace 与 writer outcome，保留重叠 writer 和 even-to-even store。每次实际 SeqCst epoch store 前后读取新的 `CLOCK_BOOTTIME` 纳秒值；实际 store 位于该时间区间内。Close start 是前样本，close complete 在 grace 成功后采样。Grace 失败时 complete 缺失且 Native 保持关闭。最后一个成功 writer 记录 reopen intent 与实际 closed-to-odd store 区间，reopen 时间为后样本。Commit 仅说明该 writer 成功，不保证 reopen 或包成功；其他 writer、ready/capture-ready 缺失或 plan/target/scope 缺失可推迟 reopen。取消/未 commit 的 Drop 记录失败；重复终止关闭不能虚构未改变 epoch 的 store。
+
+Clock、身份或记录耗尽是 sticky 故障，使完整证据失效并禁止之后 evidence-complete 的 reopen/准入，但必须继续执行安全关闭。Event 保留 flags、前后 epoch 和显式有效性；不可用时钟不能伪装成有效零时间戳。[按 hook 标记的计数](./datapath.md#native-closed-epoch-计数)与 close grace 分别完成终结。
+
+Ring 满后覆盖最旧 event，在 ring 外保留 `first_retained_seq`、`last_seq`、`total_appended`、`overwritten_events` 与 sticky 故障。身份表独立保留且有界，超过已计费容量则拒绝新的 evidence-capable 操作。连续后缀只证明该后缀的顺序。不保证固定保留秒数，不持续写磁盘 journal，也不是逐包因果轨迹。Crash、断电、owner 内存丢失或淘汰使整次运行证据不完整；首尾 epoch 相同不能证明中间没有转换。
+
+Startup 在挂载前发布初始不完整 manifest 和精确发现路径。Joined shutdown 先关闭 publication，卸载计数 hook 或替换为不引用 counter map 的 guard，join/drain reader 并终结全部计数，再记录 terminal state/collection end，最后在释放 map/journal 计费前导出。任何仍附着的计数 candidate，包括经保留的 non-link gate 的 program array 可达的 candidate，都禁止最终计数或 `hooks_joined=true` 声明；仅保管 dispatcher 不能 join reader。可达的 failed-retained 退出必须显式尝试 `final=false`、`complete=false`、`hooks_joined=false` 的部分导出，即使关闭已经返回错误也记录结果；被 forget 的 owner 不能依赖 Drop。持久结果保管见[产物契约](../reference/api.md#native-publication-产物)与[采集步骤](../operations/long-connections.md#采集-native-publication-证据)。时间重叠只是相关性，不能证明超时原因、socket custody 或交付。
 
 ## 透明代理入口
 
@@ -278,6 +310,8 @@ SIGHUP 为每次尝试单独收集诊断。无论加载和配置校验成功与�
 
 `control/reload/transaction.rs` 在候选准备与提交外层持有 `reload_lock`。新代发布依次取得 `router` → `config` → `datapath_flags.publication()`（仅原生显式源激活）→ `ebpf`，随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 延后到 backend staging 完成后、紧接着在 registry 权限替换之前取得，仍持有到原有 DNS pointer 提交点。因此 backend staging 不再占用 provider 准入锁，而 registry 转移、回调安装和 Score 权限发布仍阻止新的旧代 DNS 准入。原生 no-op 激活取得 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 独立 mode/fence 更新按 flags mutex → `ebpf`；`reset_for_activation` 不重新取得这两者，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 外运行。这只是记录既有锁边，不授权新增锁边；变更仍须遵守 CONTRIBUTING §2/§11 与人工审查。
 
+实际 Native XDP 替换的最内层锁顺序是现有外层 publication guard → `NativePublication.state` → `NativeXdp` → `NativeWatch`。替换在保留的 watcher 下核对恰好一条匹配的链路通知后才返回。Watch 代码只执行底层 query、update、receive 和 decode 操作；不得回调 publication 或其他 owner，不得持有 `NativeWatch` 时取得 `NativeXdp`，也不得持有 watch 或 mutation 锁跨越 await。没有执行 XDP 替换的 writer 不获得通知容许额度。
+
 `RoutingPushPlan::compile` 是唯一用户态 lowering 路径；调用方不选择 slot，也没有独立 domain-publication handshake。`routing_policy.rs` ABI 分别为 `RoutingInput` 128 字节、`RoutingDecision` 24 字节与 `RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取前检查 `pname_len`，以符合 6.12 verifier。已加载路由 slot 的 BTF 必须暴露当前输出布局。
 
 提交前失败保留活动代码与事实，不再重放旧路由计划。Fence 后发布被拒绝时，控制器恢复组连通性并重开旧 generation；连通性恢复失败则继续拒绝准入。Root 切换成功后新 generation 已提交，之后若 NFQUEUE 重开失败，保留已发布的新 generation 并继续 fence 准入，直到后续成功 reload 修复。
@@ -314,7 +348,7 @@ Selector 与 UDP warm 所有权仍绑定 generation，见[预热所有权](./gro
 
 UI 与 geodata 的生效设置包含从 `assets.route` 继承的值；该默认出口的变更若影响任一启动阶段持有的下载出口，则需重启。`assets.subscription` 默认值与订阅条目设置交由订阅协调处理。
 
-TUN startup、SIGHUP 和 native offline/save 准入使用同一 runtime-policy validator。`same_device_setup` 比较整个规范 `TunConfig`（name、应用默认值后的 MTU、地址、排序去重后的 capture prefix、table、首 rule priority）、backend 与 Direct profile；有效设备值变化一律需重启。省略 MTU 与显式 1500 等价，既有省略/显式 TC 与 XDP 省略/显式 ZeroCopy 等价关系保留。policy/group/DNS/订阅/mode 发布保留活动 TUN FD 与 scope，不重建；候选被拒绝时保留活动 generation 与设备。`dns.bind` 语义变化仍需重启。
+TUN startup、SIGHUP 和 native offline/save 共用 runtime-policy validator。`same_device_setup` 比较整个规范 `TunConfig`（含 `host_facts`）、backend 与 Direct profile；有效变化需重启。省略与显式 false 等价，MTU 省略与 1500 也等价。策略更新保留 FD 与 scope；拒绝候选保留活动 generation。`dns.bind` 语义变化仍需重启。
 
 当旧值和新值都能解析时，`dns.bind` 的语义比较使用解析后的 bind endpoint，因此描述同一 endpoint 的纯拼写变更不会强制重启。
 

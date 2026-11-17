@@ -45,6 +45,7 @@ pub(in crate::control) struct SourceScope {
     client: SocketAddr,
     path: SourcePath,
     reply: ReplyProjection,
+    packet_source: Option<SourceContext>,
 }
 
 impl SourceScope {
@@ -58,9 +59,11 @@ impl SourceScope {
         client: SocketAddr,
         path: SourcePath,
         reply_destination: Option<SocketAddr>,
+        packet_source: Option<SourceContext>,
     ) -> Self {
         Self {
             domain,
+            packet_source,
             runtime: Arc::as_ptr(runtime) as usize,
             client: normalize_socket_addr(client),
             path,
@@ -124,6 +127,7 @@ pub(super) struct SourceOwner {
     id: u64,
     scope: SourceScope,
     transport: SourceTransport,
+    packet_source: Option<SourceWork>,
     _runtime: Arc<NodeRuntime>,
     state: Mutex<SourceState>,
     ready: AtomicBool,
@@ -164,6 +168,7 @@ impl SourceOwner {
         node_tracker: OutboundTracker,
         stats: Arc<StatsManager>,
         source_permit: OwnedSemaphorePermit,
+        packet_source: Option<SourceWork>,
     ) -> Result<Arc<Self>, honk_outbound::proxy::PacketRejection> {
         let memory = match &pool.memory_budget {
             Some(budget) => Some(
@@ -181,6 +186,7 @@ impl SourceOwner {
             id,
             scope,
             transport,
+            packet_source,
             _runtime: runtime,
             state: Mutex::new(SourceState {
                 retirement: None,
@@ -474,6 +480,10 @@ struct SourceEndpointBinding {
 }
 
 impl SourceEndpoint {
+    pub(super) fn packet_source(&self) -> Option<&SourceWork> {
+        self.owner.packet_source.as_ref()
+    }
+
     pub(super) fn new(
         attachment: SourceAttachment,
         target: SocketAddr,
@@ -815,8 +825,26 @@ impl UdpEndpointPool {
         stats: Arc<StatsManager>,
         health_family: honk_outbound::alive::IpVersion,
         speculative: bool,
+        packet_source: Option<SourceWork>,
     ) -> anyhow::Result<SourcePreparation> {
-        let scope = SourceScope::new(domain, &runtime, client, path, reply_destination);
+        if packet_source
+            .as_ref()
+            .is_some_and(|source| source.scope() != domain)
+        {
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidInput, "UDP source scope mismatch").into(),
+            );
+        }
+        let scope = SourceScope::new(
+            domain,
+            &runtime,
+            client,
+            path,
+            reply_destination,
+            packet_source
+                .as_ref()
+                .and_then(SourceWork::optional_context),
+        );
         loop {
             if generation.is_shutdown() || self.terminal.load(Ordering::Acquire) {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
@@ -827,6 +855,15 @@ impl UdpEndpointPool {
                 .get(&scope)
                 .map(|entry| Arc::clone(entry.value()))
             {
+                if owner.packet_source.as_ref().map(SourceWork::identity)
+                    != packet_source.as_ref().map(SourceWork::identity)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "shared UDP source execution owner mismatch",
+                    )
+                    .into());
+                }
                 if let Some(attachment) = owner.attach() {
                     return Ok(SourcePreparation::Reused(attachment));
                 }
@@ -848,6 +885,13 @@ impl UdpEndpointPool {
                                 scope.client,
                                 path,
                                 reply_destination,
+                                scope.packet_source.map(|source| {
+                                    let mut bytes = [0u8; 16];
+                                    bytes[..8].copy_from_slice(&source.lineage.get().to_be_bytes());
+                                    bytes[8..]
+                                        .copy_from_slice(&source.snapshot.get().to_be_bytes());
+                                    bytes
+                                }),
                             )?;
                             VLessHandler::prepare_source_udp(
                                 Arc::clone(&runtime),
@@ -902,6 +946,7 @@ impl UdpEndpointPool {
                 scope,
                 prepared,
                 source_permit,
+                packet_source,
                 runtime: Arc::clone(&runtime),
                 alive_set,
                 stats,

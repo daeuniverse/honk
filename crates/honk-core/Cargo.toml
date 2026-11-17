@@ -117,7 +117,7 @@ zip = { workspace = true, optional = true }
 [features]
 default = ["clash-api", "jemalloc", "rprx"]
 # Enable real eBPF support (requires Linux kernel 6.12+)
-ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue"]
+ebpf = ["aya", "aya-obj", "aya-log", "dep:honk-nfqueue", "honk-xsk/host"]
 # Enable the Clash-compatible REST API (experimental.clash_api)
 clash-api = ["dep:axum", "axum/ws", "dep:tower-http", "dep:zip"]
 native-api = ["dep:axum", "dep:tower", "dep:tower-http", "dep:subtle", "dep:hmac", "dep:serde_path_to_error", "honk-outbound/flow-observation", "honk-outbound/owned-tasks"]
@@ -160,6 +160,9 @@ jsonschema = { version = "0.59", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 honk-xsk.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+honk-xsk = { workspace = true, features = ["captured-fault"] }
 
 [[bench]]
 name = "dns"

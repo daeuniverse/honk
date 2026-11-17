@@ -1,8 +1,8 @@
 use super::{ParseFailure, cursor::Segment, diagnostics::ParserDiagnostics, read};
 use crate::datapath::{
-    Backend, BusyPollConfig, CalibrationStatus, DatapathConfig, DirectProfile, InterfaceRole,
-    PollCalibration, PollMode, TunConfig, XdpInterface, XskMode, canonical_tun_capture,
-    default_tun_mtu, parse_tun_address4, parse_tun_address6,
+    Backend, BusyPollConfig, CalibrationStatus, DatapathConfig, DirectProfile, HostConfig,
+    InterfaceRole, PollCalibration, PollMode, TunConfig, XdpInterface, XskMode,
+    canonical_tun_capture, default_tun_mtu, parse_tun_address4, parse_tun_address6,
 };
 
 fn invalid(message: &str) -> ParseFailure {
@@ -14,7 +14,7 @@ pub(super) fn parse_section(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<DatapathConfig, ParseFailure> {
     let mut config = DatapathConfig::default();
-    let mut seen = [false; 9];
+    let mut seen = [false; 11];
     for section in sections {
         for child in section.body().ok_or_else(|| invalid("expected block"))? {
             if let Some(header) = read::block_header(&child) {
@@ -24,6 +24,7 @@ pub(super) fn parse_section(
                     "nat" => 4,
                     "busy_poll" => 7,
                     "tun" => 8,
+                    "host" => 9,
                     _ => return Err(invalid("unknown nested block")),
                 };
                 if std::mem::replace(&mut seen[index], true) {
@@ -78,6 +79,7 @@ pub(super) fn parse_section(
                     }
                     7 => config.busy_poll = Some(parse_busy_poll(&child)?),
                     8 => config.tun = Some(parse_tun(&child)?),
+                    9 => config.host = Some(parse_host(&child)?),
                     _ => unreachable!(),
                 }
             } else {
@@ -89,6 +91,7 @@ pub(super) fn parse_section(
                     "direct" => 1,
                     "xsk_mode" => 5,
                     "poll_mode" => 6,
+                    "workers" => 10,
                     _ => return Err(invalid("unknown setting")),
                 };
                 if std::mem::replace(&mut seen[index], true) {
@@ -107,10 +110,9 @@ pub(super) fn parse_section(
                         config.direct = Some(match value.unquote().raw() {
                             "core" => DirectProfile::Core,
                             "endpoint" => DirectProfile::Endpoint,
+                            "native" => DirectProfile::Native,
                             _ => {
-                                return Err(invalid(
-                                    "direct must be core or endpoint; native continuation is unavailable",
-                                ));
+                                return Err(invalid("direct must be core, endpoint or native"));
                             }
                         })
                     }
@@ -128,6 +130,13 @@ pub(super) fn parse_section(
                             _ => return Err(invalid("poll_mode must be event or adaptive")),
                         });
                     }
+                    10 => {
+                        config.workers = Some(match value.unquote().raw() {
+                            "1" => 1,
+                            "2" => 2,
+                            _ => return Err(invalid("workers must be 1 or 2")),
+                        });
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -140,6 +149,57 @@ pub(super) fn parse_section(
     Ok(config)
 }
 
+fn parse_host(section: &Segment<'_, '_>) -> Result<HostConfig, ParseFailure> {
+    let mut interfaces = None;
+    let mut xsk_mode = None;
+    for child in section
+        .body()
+        .ok_or_else(|| invalid("expected host block"))?
+    {
+        if let Some(header) = read::block_header(&child) {
+            if header.raw() != "interface" {
+                return Err(invalid("unknown host block"));
+            }
+            if interfaces.is_some() {
+                return Err(invalid("duplicate host interface block"));
+            }
+            let mut names = Vec::new();
+            for entry in child
+                .body()
+                .ok_or_else(|| invalid("expected host interface block"))?
+            {
+                if entry.is_block() || entry.body().is_some() {
+                    return Err(invalid(
+                        "host interface entries must be bare names without a body",
+                    ));
+                }
+                names.push(read::Text::segment(&entry).unquote().raw().to_owned());
+            }
+            interfaces = Some(names);
+        } else {
+            let (key, value) = read::Text::segment(&child)
+                .kv()
+                .ok_or_else(|| invalid("expected host setting: value"))?;
+            if key.raw() != "xsk_mode" {
+                return Err(invalid("unknown host setting"));
+            }
+            if xsk_mode.is_some() {
+                return Err(invalid("duplicate host xsk_mode"));
+            }
+            if value.unquote().raw() != "copy" {
+                return Err(invalid("host requires explicit xsk_mode: copy"));
+            }
+            xsk_mode = Some(XskMode::Copy);
+        }
+    }
+    let config = HostConfig {
+        interfaces: interfaces.ok_or_else(|| invalid("host.interface is required"))?,
+        xsk_mode: xsk_mode.ok_or_else(|| invalid("host.xsk_mode is required"))?,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
 fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
     let keys = [
         "name",
@@ -148,8 +208,9 @@ fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
         "address6",
         "table",
         "rule_priority",
+        "host_facts",
     ];
-    let mut values = [None; 6];
+    let mut values = [None; 7];
     let mut capture = None;
     for child in section
         .body()
@@ -200,6 +261,14 @@ fn parse_tun(section: &Segment<'_, '_>) -> Result<TunConfig, ParseFailure> {
             .map(|value| value.parse().map_err(|_| invalid("invalid tun MTU")))
             .transpose()?
             .unwrap_or_else(default_tun_mtu),
+        host_facts: values[6]
+            .map(|value| {
+                value
+                    .parse()
+                    .map_err(|_| invalid("tun.host_facts must be true or false"))
+            })
+            .transpose()?
+            .unwrap_or(false),
         address4: values[2].map(parse_tun_address4).transpose()?,
         address6: values[3].map(parse_tun_address6).transpose()?,
         table: values[4]

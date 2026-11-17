@@ -1,6 +1,8 @@
 //! Daemon-owned Linux TUN capture into the existing scoped packet Endpoint executor.
 
 mod setup;
+#[cfg(feature = "ebpf")]
+mod source;
 
 use crate::control::{
     ControlPlane,
@@ -9,7 +11,7 @@ use crate::control::{
 };
 use anyhow::{Context as _, ensure};
 use honk_config::{Config, datapath::Backend};
-use honk_datapath::buffer::TxClass;
+use honk_datapath::{ScopeId, buffer::TxClass};
 use honk_netstack::{
     Csum, GsoKind, GsoRx, MemoryBudget, MemoryReservation, RxMeta, Transmit, TxCaps, TxCsum, wire,
 };
@@ -60,7 +62,12 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
         "TUN does not accept global LAN/WAN capture interfaces"
     );
     ensure!(
-        config.routing.default_mark == 0 && config.routing.rules.iter().all(|rule| rule.mark == 0),
+        config.routing.default_mark.unwrap_or(0) == 0
+            && config
+                .routing
+                .rules
+                .iter()
+                .all(|rule| rule.mark.unwrap_or(0) == 0),
         "TUN Endpoint cannot preserve traffic rule marks"
     );
     let mark = config.global.effective_so_mark();
@@ -68,14 +75,19 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
         mark != 0 && mark & 0xc800_0000 == 0,
         "TUN requires an exact nonreserved bypass mark"
     );
+    let host_facts = datapath.tun.as_ref().is_some_and(|tun| tun.host_facts);
+    ensure!(
+        !host_facts || cfg!(feature = "ebpf"),
+        "TUN host_facts requires the built ebpf feature and actual source admission"
+    );
     for rule in &config.routing.rules {
         let condition = &rule.condition;
         ensure!(
-            condition.process_name.is_empty()
-                && condition.not.process_name.is_empty()
+            (host_facts
+                || (condition.process_name.is_empty() && condition.not.process_name.is_empty()))
                 && condition.mac.is_empty()
                 && condition.not.mac.is_empty(),
-            "TUN Endpoint has no process/socket or MAC authority; predicate admission refused"
+            "TUN process predicates require host_facts; MAC predicates are unavailable"
         );
     }
     Ok(())
@@ -98,14 +110,22 @@ struct Runtime {
     io: Option<AsyncFd<TunDevice>>,
     topology: AsyncFd<Topology>,
     setup: Option<TunSetup>,
-    driver: Option<PacketDriver>,
+    drivers: Vec<PacketDriver>,
+    plain_scope: ScopeId,
+    host_scope: Option<ScopeId>,
+    #[cfg(feature = "ebpf")]
+    source: Option<source::Source>,
+    pname_support: crate::ebpf::PnameSupportCell,
     endpoints: PacketEndpoints,
     owner: PacketEndpointOwner,
     admission: Arc<AtomicBool>,
     rx: Box<[u8]>,
-    pending: [[Option<OutputLease>; BATCH]; 2],
-    first_class: usize,
+    pending: [[[Option<OutputLease>; BATCH]; 2]; 2],
+    first_group: usize,
     closing: bool,
+    malformed_records: u64,
+    expired_sources: u64,
+    host_capacity_refusals: u64,
     _memory: MemoryReservation,
 }
 
@@ -120,6 +140,9 @@ enum Turn {
 
 impl Runtime {
     fn close_capture(&mut self) -> anyhow::Result<()> {
+        *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
+        #[cfg(feature = "ebpf")]
+        let source_close = self.source.as_mut().map(source::Source::close).transpose();
         self.admission.store(false, Ordering::Release);
         let result = self
             .setup
@@ -129,13 +152,22 @@ impl Runtime {
         self.closing = true;
         self.endpoints.close();
         self.dispose_pending();
+        #[cfg(feature = "ebpf")]
+        if let Err(error) = source_close {
+            return match result {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(error.context(cleanup)),
+            };
+        }
         result
     }
 
     fn dispose_pending(&mut self) {
-        for class in &mut self.pending {
-            for output in class {
-                drop(output.take());
+        for scope in &mut self.pending {
+            for class in scope {
+                for output in class {
+                    drop(output.take());
+                }
             }
         }
     }
@@ -193,36 +225,31 @@ impl Runtime {
             }
         }
         let now = Instant::now();
-        let mut driver = self.driver.take().expect("live packet driver");
-        let serviced = service_turn(&mut driver, cx, now, |driver, cx| {
+        let mut drivers = std::mem::take(&mut self.drivers);
+        let serviced = service_turn(&mut drivers, cx, now, |drivers, cx| {
             let mut more = false;
             if active && !self.closing {
-                more |= self.read_batch(cx, now, driver.scope())?;
+                more |= self.read_batch(cx, now)?;
             }
-            more |= driver.service(cx, Instant::now());
+            for driver in drivers.iter_mut() {
+                more |= driver.service(cx, Instant::now());
+            }
             if active || self.closing {
-                more |= self.outputs(driver, cx)?;
+                more |= self.outputs(drivers, cx)?;
             }
             Ok(more)
         });
-        self.driver = Some(driver);
+        self.drivers = drivers;
         let more = serviced? || topology_more;
-        if more
-            || poll_deadline(timer.as_mut(), self.driver.as_ref().unwrap().deadline(), cx)
-                .is_ready()
-        {
+        let deadline = self.drivers.iter().filter_map(PacketDriver::deadline).min();
+        if more || poll_deadline(timer.as_mut(), deadline, cx).is_ready() {
             Poll::Ready(Ok(()))
         } else {
             Poll::Pending
         }
     }
 
-    fn read_batch(
-        &mut self,
-        cx: &mut Context<'_>,
-        ingress: Instant,
-        scope: honk_datapath::ScopeId,
-    ) -> anyhow::Result<bool> {
+    fn read_batch(&mut self, cx: &mut Context<'_>, ingress: Instant) -> anyhow::Result<bool> {
         let io = self.io.as_ref().expect("live TUN FD");
         let mut ready = match io.poll_read_ready(cx) {
             Poll::Ready(result) => result?,
@@ -237,11 +264,23 @@ impl Runtime {
             if turn_limit(attempt, bytes, started, BATCH) {
                 return Ok(true);
             }
-            let length = match ready
-                .try_io(|inner| read_packet(inner.get_ref().as_raw_fd(), &mut self.rx))
-            {
-                Ok(Ok(length)) => length,
+            let (length, host): (usize, Option<crate::control::netstack::HostIngress>) = match ready
+                .try_io(|inner| {
+                    #[cfg(feature = "ebpf")]
+                    if let Some(source) = &mut self.source {
+                        return source
+                            .read(inner.get_ref().as_raw_fd(), &mut self.rx)
+                            .map(|read| (read.len, read.host));
+                    }
+                    read_packet(inner.get_ref().as_raw_fd(), &mut self.rx).map(|len| (len, None))
+                }) {
+                Ok(Ok(read)) => read,
                 Ok(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+                #[cfg(feature = "ebpf")]
+                Ok(Err(error)) if source::is_expired(&error) => {
+                    self.expired_sources = self.expired_sources.saturating_add(1);
+                    continue;
+                }
                 Err(_) => {
                     return match io.poll_read_ready(cx) {
                         Poll::Ready(Ok(_)) => Ok(true),
@@ -258,25 +297,79 @@ impl Runtime {
             );
             bytes += length;
             let Some((packet, meta)) = decode_record(&self.rx[..length]) else {
+                self.malformed_records = self.malformed_records.saturating_add(1);
                 continue;
             };
-            admit_packet(&self.endpoints, scope, packet, meta, ingress, |_, _| {
-                self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing()
-            })?;
+            if let Some(host) = host {
+                let scope = self
+                    .host_scope
+                    .context("Host read without prepared Host scope")?;
+                let result = self.endpoints.receive_host_with_source(
+                    scope,
+                    packet,
+                    meta,
+                    ingress,
+                    &host,
+                    None,
+                    false,
+                    |_, _, _, _| {
+                        self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing()
+                    },
+                );
+                match result {
+                    Ok(_) => {}
+                    Err(error)
+                        if error.kind() == io::ErrorKind::TimedOut
+                            && Instant::now() >= host.source_horizon =>
+                    {
+                        self.expired_sources = self.expired_sources.saturating_add(1);
+                    }
+                    Err(_) if self.endpoints.is_closing() => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
+                        ) =>
+                    {
+                        self.host_capacity_refusals = self.host_capacity_refusals.saturating_add(1);
+                    }
+                    Err(error) => return Err(error).context("TUN Host Endpoint admission"),
+                }
+            } else {
+                admit_packet(
+                    &self.endpoints,
+                    self.plain_scope,
+                    packet,
+                    meta,
+                    ingress,
+                    |_, _| self.admission.load(Ordering::Acquire) && !self.endpoints.is_closing(),
+                )?;
+            }
         }
         Ok(true)
     }
 
-    fn outputs(&mut self, driver: &mut PacketDriver, cx: &mut Context<'_>) -> anyhow::Result<bool> {
+    fn outputs(
+        &mut self,
+        drivers: &mut [PacketDriver],
+        cx: &mut Context<'_>,
+    ) -> anyhow::Result<bool> {
         let started = Instant::now();
         let mut attempts = 0;
         let mut bytes = 0;
         let mut more = false;
-        let first = self.first_class;
-        self.first_class ^= 1;
-        for offset in 0..2 {
-            let class = (first + offset) % 2;
-            let pending = &mut self.pending[class];
+        let groups = drivers.len() * 2;
+        let first = self.first_group;
+        self.first_group = (first + 1) % groups;
+        for offset in 0..groups {
+            if !self.closing && turn_limit(attempts, bytes, started, BATCH * 2) {
+                return Ok(true);
+            }
+            let group = (first + offset) % groups;
+            let scope = group / 2;
+            let class = group % 2;
+            let driver = &mut drivers[scope];
+            let pending = &mut self.pending[scope][class];
             if pending.iter().all(Option::is_none) {
                 match driver.poll_outputs_class(
                     cx,
@@ -316,9 +409,14 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.admission.store(false, Ordering::Release);
+        *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
+        #[cfg(feature = "ebpf")]
+        if let Some(source) = &mut self.source {
+            let _ = source.close();
+        }
         self.endpoints.close();
         self.dispose_pending();
-        drop(self.driver.take());
+        self.drivers.clear();
         drop(self.io.take());
     }
 }
@@ -372,15 +470,20 @@ fn turn_limit(attempts: usize, bytes: usize, started: Instant, maximum: usize) -
 }
 
 pub(crate) fn service_turn(
-    driver: &mut PacketDriver,
+    drivers: &mut [PacketDriver],
     cx: &mut Context<'_>,
     now: Instant,
-    io: impl FnOnce(&mut PacketDriver, &mut Context<'_>) -> anyhow::Result<bool>,
+    io: impl FnOnce(&mut [PacketDriver], &mut Context<'_>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<bool> {
-    let more = driver.service(cx, now);
-    let result = io(driver, cx);
+    let mut more = false;
+    for driver in drivers.iter_mut() {
+        more |= driver.service(cx, now);
+    }
+    let result = io(drivers, cx);
     // No materialization after the output pass: overdue work retains its next-turn deadline.
-    driver.finish_turn(cx, Instant::now());
+    for driver in drivers {
+        driver.finish_turn(cx, Instant::now());
+    }
     result.map(|progress| more || progress)
 }
 
@@ -628,10 +731,12 @@ fn poll_deadline(
 
 pub(crate) async fn run(
     plane: ControlPlane,
+    pin_root: &std::path::Path,
     admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     let backend = plane.policy_backend_handle();
-    let (plane, result) = run_owned(plane, admission).await;
+    let (plane, result) = run_owned(plane, pin_root, admission, pname_support).await;
     let result = match (result, backend.write().await.cleanup().await) {
         (Ok(()), cleanup) => cleanup,
         (Err(error), Ok(())) => Err(error),
@@ -650,40 +755,87 @@ fn finish_failed_setup(setup: TunSetup, error: anyhow::Error) -> anyhow::Error {
     }
 }
 
+fn finish_startup(
+    setup: Option<TunSetup>,
+    #[cfg(feature = "ebpf")] source: Option<source::Source>,
+    mut error: anyhow::Error,
+) -> anyhow::Error {
+    #[cfg(feature = "ebpf")]
+    if let Some(mut source) = source {
+        if let Err(close) = source.close() {
+            error = error.context(close);
+        }
+        if let Err(finish) = source.finish() {
+            error = error.context(finish);
+        }
+    }
+    if let Some(setup) = setup {
+        error = finish_failed_setup(setup, error);
+    }
+    error
+}
+
 async fn run_owned(
     plane: ControlPlane,
+    _pin_root: &std::path::Path,
     admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     let config = plane.config_handle().read().await.as_ref().clone();
     let shutdown = plane.shutdown_intent();
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let prepared = (|| -> anyhow::Result<_> {
         validate_config(&config)?;
         let dns = PacketEndpoints::prepare_dns_bind(&config)?;
         let capacity = plane.packet_udp_capacity();
         ensure!(capacity != 0, "TUN requires a funded UDP endpoint capacity");
-        let budget = MemoryBudget::new(CAPTURE_MEMORY);
         let memory = budget
-            .reserve(size_of::<Runtime>() + RX_BYTES)
+            .reserve(
+                size_of::<Runtime>()
+                    + RX_BYTES
+                    + 4 * size_of::<(
+                        crate::control::netstack::PacketScope,
+                        crate::control::netstack::PacketOwner,
+                    )>(),
+            )
             .context("TUN receive and pending metadata capacity")?;
-        let tun = config
-            .datapath
-            .as_ref()
-            .and_then(|value| value.tun.as_ref())
-            .context("TUN configuration missing")?;
-        let pair = capture_scope_with_output(
-            u32::from(tun.mtu),
-            1,
-            128,
-            u16::MAX as usize,
-            TX_CAPS,
-            &budget,
-        )?;
-        let (setup, device, topology) = TunSetup::prepare(&config)?;
-        Ok((dns, capacity, memory, pair, setup, device, topology))
+        Ok((dns, capacity, memory))
     })();
-    let (dns, capacity, memory, pair, setup, device, topology) = match prepared {
+    let (dns, capacity, memory) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => return (Some(plane), Err(error)),
+    };
+    let tun = config
+        .datapath
+        .as_ref()
+        .and_then(|value| value.tun.as_ref())
+        .unwrap();
+    #[cfg(feature = "ebpf")]
+    let mut source = if tun.host_facts {
+        match source::Source::prepare(&config, &budget, _pin_root) {
+            Ok(source) => Some(source),
+            Err(error) => return (Some(plane), Err(error)),
+        }
+    } else {
+        None
+    };
+    let (setup, device, topology) = match TunSetup::prepare(
+        &config,
+        #[cfg(feature = "ebpf")]
+        source.as_mut(),
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return (
+                Some(plane),
+                Err(finish_startup(
+                    None,
+                    #[cfg(feature = "ebpf")]
+                    source,
+                    error,
+                )),
+            );
+        }
     };
     // SAFETY: these concrete owners never replace their descriptors while registered.
     let io = match unsafe { AsyncFd::register(device) } {
@@ -691,7 +843,15 @@ async fn run_owned(
         Err(error) => {
             let (device, error) = error.into_parts();
             drop(device);
-            return (Some(plane), Err(finish_failed_setup(setup, error.into())));
+            return (
+                Some(plane),
+                Err(finish_startup(
+                    Some(setup),
+                    #[cfg(feature = "ebpf")]
+                    source,
+                    error.into(),
+                )),
+            );
         }
     };
     // SAFETY: the subscribed watcher retains its descriptor unchanged while registered.
@@ -701,38 +861,138 @@ async fn run_owned(
             let (topology, error) = error.into_parts();
             drop(topology);
             drop(io);
-            return (Some(plane), Err(finish_failed_setup(setup, error.into())));
+            return (
+                Some(plane),
+                Err(finish_startup(
+                    Some(setup),
+                    #[cfg(feature = "ebpf")]
+                    source,
+                    error.into(),
+                )),
+            );
         }
     };
-    let (endpoints, owner, mut drivers) =
-        match PacketEndpoints::start_driven(plane, vec![pair], capacity, dns) {
+    let mut pairs = Vec::with_capacity(1 + usize::from(tun.host_facts));
+    let prepared_scopes = (|| -> anyhow::Result<_> {
+        let realms = 1 + usize::from(tun.host_facts);
+        let pair = capture_scope_with_output(
+            u32::from(tun.mtu),
+            realms,
+            128,
+            u16::MAX as usize,
+            TX_CAPS,
+            &budget,
+        )?;
+        let plain_scope = pair.0.scope();
+        pairs.push(pair);
+        let host_scope = if tun.host_facts {
+            let pair = capture_scope_with_output(
+                u32::from(tun.mtu),
+                realms,
+                128,
+                u16::MAX as usize,
+                TX_CAPS,
+                &budget,
+            )?;
+            let scope = pair.0.scope();
+            pairs.push(pair);
+            pairs.last().unwrap().0.prepare_host()?;
+            Some(scope)
+        } else {
+            None
+        };
+        Ok((plain_scope, host_scope))
+    })();
+    let (plain_scope, host_scope) = match prepared_scopes {
+        Ok(scopes) => scopes,
+        Err(error) => {
+            for (scope, _) in &pairs {
+                scope.shutdown(true);
+            }
+            for (_, owner) in pairs {
+                owner.run().await;
+            }
+            drop(io);
+            return (
+                Some(plane),
+                Err(finish_startup(
+                    Some(setup),
+                    #[cfg(feature = "ebpf")]
+                    source,
+                    error,
+                )),
+            );
+        }
+    };
+    let (endpoints, owner, drivers) =
+        match PacketEndpoints::start_driven(plane, pairs, capacity, dns, plain_scope).await {
             Ok(started) => started,
             Err(error) => {
                 drop(io);
-                return (None, Err(finish_failed_setup(setup, error)));
+                return (
+                    None,
+                    Err(finish_startup(
+                        Some(setup),
+                        #[cfg(feature = "ebpf")]
+                        source,
+                        error,
+                    )),
+                );
             }
         };
     let mut runtime = Runtime {
         io: Some(io),
         topology,
         setup: Some(setup),
-        driver: drivers.pop(),
+        drivers,
+        plain_scope,
+        host_scope,
+        #[cfg(feature = "ebpf")]
+        source,
+        pname_support,
         endpoints,
         owner,
         admission,
         rx: vec![0; RX_BYTES].into_boxed_slice(),
-        pending: std::array::from_fn(|_| std::array::from_fn(|_| None)),
-        first_class: 0,
+        pending: std::array::from_fn(|_| std::array::from_fn(|_| std::array::from_fn(|_| None))),
+        first_group: 0,
         closing: false,
+        malformed_records: 0,
+        expired_sources: 0,
+        host_capacity_refusals: 0,
         _memory: memory,
     };
     let timer = None;
     tokio::pin!(timer);
-    if let Err(error) = poll_fn(|cx| runtime.poll_startup(cx, timer.as_mut())).await {
-        runtime.admission.store(false, Ordering::Release);
+    if let Err(mut error) = poll_fn(|cx| runtime.poll_startup(cx, timer.as_mut())).await {
+        if let Err(close) = runtime.close_capture() {
+            error = error.context(close);
+        }
+        while !runtime.owner.is_joined() {
+            match poll_fn(|cx| runtime.poll_turn(cx, timer.as_mut())).await {
+                Turn::Joined(result) => {
+                    if let Err(cleanup) = result.and_then(|(_, result)| result) {
+                        error = error.context(cleanup);
+                    }
+                }
+                Turn::Serviced(Err(cleanup)) => {
+                    error = error.context(cleanup);
+                }
+                Turn::Serviced(Ok(())) => {}
+            }
+            tokio::task::yield_now().await;
+        }
+        runtime.drivers.clear();
         drop(runtime.io.take());
-        let error = finish_failed_setup(runtime.setup.take().unwrap(), error);
-        return (None, Err(error));
+        return (
+            None,
+            Err(finish_startup(
+                runtime.setup.take(),
+                #[cfg(feature = "ebpf")]
+                runtime.source.take(),
+                error,
+            )),
+        );
     }
     let activated = (|| -> anyhow::Result<()> {
         let topology = runtime
@@ -750,6 +1010,11 @@ async fn run_owned(
             !runtime.endpoints.is_closing() && !shutdown.requested(),
             "TUN closed before capture publication"
         );
+        #[cfg(feature = "ebpf")]
+        if let Some(source) = &mut runtime.source {
+            source.activate()?;
+            *runtime.pname_support.write() = source.pname_support();
+        }
         runtime.admission.store(true, Ordering::Release);
         runtime.endpoints.capture_ready()?;
         Ok(())
@@ -804,8 +1069,14 @@ async fn run_owned(
         }
     };
     runtime.dispose_pending();
-    drop(runtime.driver.take());
+    runtime.drivers.clear();
     drop(runtime.io.take());
+    #[cfg(feature = "ebpf")]
+    if let Some(source) = runtime.source.take()
+        && let Err(error) = source.finish()
+    {
+        failure.get_or_insert(error);
+    }
     if let Err(error) = runtime.setup.take().unwrap().finish(failure.is_none()) {
         failure.get_or_insert(error);
     }

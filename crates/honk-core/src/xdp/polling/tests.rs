@@ -332,3 +332,60 @@ fn event_totals_need_no_default_pps_window_and_survive_parameter_publication() {
     assert_eq!(consumer.qualified_rx_total, u64::MAX);
     assert!(!consumer.status.high);
 }
+
+#[test]
+fn capture_worker_participants_share_one_actual_process_grant() {
+    use crate::control::poll_budget::PollBudgetBinding;
+    let config = configuration(PollMode::Adaptive);
+    let binding = PollBudgetBinding::Publisher(ProcessPollBudget::test_publisher(false));
+    let quota = QuotaPolicy::from_config(
+        config
+            .datapath
+            .as_ref()
+            .unwrap()
+            .busy_poll
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+    let revision = binding.publish_policy(Some(quota)).unwrap();
+    let first = AdaptivePoll::new(
+        PollingPublication::new(&config),
+        Some(binding.participant_handle()),
+    );
+    let second = first.participant();
+    let held = first
+        .budget
+        .as_ref()
+        .unwrap()
+        .try_reserve(quota, revision, 100_000, None)
+        .unwrap();
+    assert_eq!(
+        second
+            .budget
+            .as_ref()
+            .unwrap()
+            .try_reserve(quota, revision, 100_000, None)
+            .unwrap_err(),
+        "busy_interval_outstanding"
+    );
+    first.budget.as_ref().unwrap().set_test_time(50_000);
+    assert_eq!(held.finish().unwrap().charged_ns, 50_000);
+    let next = second
+        .budget
+        .as_ref()
+        .unwrap()
+        .try_reserve(quota, revision, 100_000, None)
+        .unwrap();
+    second.budget.as_ref().unwrap().set_test_time(100_000);
+    next.finish().unwrap();
+    assert!(
+        first
+            .budget
+            .as_ref()
+            .unwrap()
+            .snapshot()
+            .active_id
+            .is_none()
+    );
+}

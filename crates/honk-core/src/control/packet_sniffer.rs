@@ -70,10 +70,11 @@ impl QuicSniffOutcome {
     }
 }
 
-/// A scoped QUIC flow family; identical tuples in other domains share no state.
+/// A scoped QUIC source family; distinct packet lineages share no state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PacketSnifferKey {
     pub scope: honk_datapath::ScopeId,
+    pub packet_lineage: Option<std::num::NonZeroU64>,
     pub src_ip: [u8; 16],
     pub src_port: u16,
     pub dst_ip: [u8; 16],
@@ -81,7 +82,12 @@ pub struct PacketSnifferKey {
 }
 
 impl PacketSnifferKey {
-    pub fn new(scope: honk_datapath::ScopeId, src: SocketAddr, dst: SocketAddr) -> Self {
+    pub fn new(
+        scope: honk_datapath::ScopeId,
+        src: SocketAddr,
+        dst: SocketAddr,
+        packet_lineage: Option<std::num::NonZeroU64>,
+    ) -> Self {
         let mut src_ip = [0u8; 16];
         let mut dst_ip = [0u8; 16];
         match src.ip() {
@@ -102,6 +108,7 @@ impl PacketSnifferKey {
         }
         Self {
             scope,
+            packet_lineage,
             src_ip,
             src_port: src.port(),
             dst_ip,
@@ -400,6 +407,7 @@ mod tests {
             honk_datapath::ScopeId::HOST,
             "10.0.0.1:12345".parse().unwrap(),
             "8.8.8.8:443".parse().unwrap(),
+            None,
         )
     }
 
@@ -417,6 +425,35 @@ mod tests {
         );
         assert_eq!(
             pool.feed_quic_initial(second, b"not QUIC"),
+            QuicSniffOutcome::NotQuic
+        );
+        assert_eq!(
+            pool.feed_quic_initial(first, b"not QUIC"),
+            QuicSniffOutcome::Domain("example.com".into())
+        );
+    }
+
+    #[test]
+    fn completed_sni_is_not_reused_in_another_packet_lineage() {
+        let pool = PacketSnifferPool::new();
+        let first = PacketSnifferKey {
+            packet_lineage: std::num::NonZeroU64::new(1),
+            ..test_key()
+        };
+        let second = PacketSnifferKey {
+            packet_lineage: std::num::NonZeroU64::new(2),
+            ..first
+        };
+        assert_eq!(
+            pool.feed_quic_initial(first, &test_utils::rfc9001_client_initial()),
+            QuicSniffOutcome::Domain("example.com".into())
+        );
+        assert_eq!(
+            pool.feed_quic_initial(second, b"not QUIC"),
+            QuicSniffOutcome::NotQuic
+        );
+        assert_eq!(
+            pool.feed_quic_initial(test_key(), b"not QUIC"),
             QuicSniffOutcome::NotQuic
         );
         assert_eq!(

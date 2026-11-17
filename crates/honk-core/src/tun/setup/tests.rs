@@ -263,7 +263,13 @@ fn kernel_tun_exclusive_fd_and_containment_are_owned() {
         )
         .unwrap();
         let root = tempfile::tempdir().unwrap();
-        let (mut setup, device, guarded) = TunSetup::prepare_in(&config, root.path()).unwrap();
+        let (mut setup, device, guarded) = TunSetup::prepare_in(
+            &config,
+            root.path(),
+            #[cfg(feature = "ebpf")]
+            None,
+        )
+        .unwrap();
         for (request, expected) in [(libc::TUNGETVNETHDRSZ, 10), (libc::TUNGETVNETLE, 1)] {
             let mut actual: libc::c_int = -1;
             // SAFETY: both readbacks write one int to actual and device retains its FD.

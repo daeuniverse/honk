@@ -37,6 +37,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
             Arc::clone(&stats),
             honk_outbound::alive::IpVersion::V4,
             false,
+            None,
         )
         .await
         .unwrap()
@@ -83,6 +84,7 @@ async fn pending_attachment_survives_last_binding_retirement() {
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
         None,
     );
     wait_source_removed(&pool, &scope).await;

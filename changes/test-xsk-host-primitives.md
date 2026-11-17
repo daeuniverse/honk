@@ -1,0 +1,7 @@
+Added
+
+- Add explicit XDP Host TCP/UDP Endpoint capture with mandatory private Copy mode, authenticated process/source ownership, strict plain-namespace and active BPF LSM/cgroup admission, setup receipts and retained guards. Direct creates a new marked outbound and replies use ordinary Linux demultiplexing; Native continuation and TUN HostFacts/Native/captured return remain unavailable.
+- Keep guest-only private Host XSK carrier checks separate from production admission: ordinary operator veths are currently refused by source-namespace custody, and primitive checks do not establish production business-scenario or full V7 acceptance.
+- Support active AppArmor without disabling its ordinary security processing: admit only native kernel-reported built-in IPv4/IPv6 POSTROUTING hooks at the exact AppArmor priority, retain observed hook records, and keep unknown hooks, transforms, QUEUE and reinjection paths refused. This compatibility does not provide Native equivalence.
+- Raise the shared XDP/TUN capture memory budget from 256 MiB to 384 MiB (per-realm Stack limit `192 MiB / R`) so Host's fixed 96 MiB reservation, its private Copy Port and scope, and the bounded UDP endpoint pool fit together; the 512 MiB retained-UMEM ceiling is unchanged.
+- Take one initial XDP queue observation at readiness so a Host-only capture publishes socket and ring diagnostics before any traffic, without an idle sampling timer.

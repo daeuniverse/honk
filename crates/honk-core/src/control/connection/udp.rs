@@ -140,6 +140,17 @@ impl ControlPlaneHandle {
         }
         let client_addr = lease.client_addr();
         let original_dst = lease.original_dst();
+        let packet_facts = lease
+            .packet_source()
+            .and_then(|source| source.optional_facts());
+        if let Some(facts) = &packet_facts {
+            observation.packet_facts(
+                facts,
+                lease
+                    .packet_dscp
+                    .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+            );
+        }
         let data = lease.first_payload();
         let raw_dns_route = lease.raw_dns_route();
         let mut packet_routing = if lease.owner().has_kernel_capture() {
@@ -156,6 +167,7 @@ impl ControlPlaneHandle {
                         lease
                             .packet_dscp
                             .ok_or_else(|| anyhow::anyhow!("packet UDP has no admitted DSCP"))?,
+                        lease.packet_source(),
                         #[cfg(feature = "native-api")]
                         observation.is_recording(),
                     )
@@ -163,6 +175,15 @@ impl ControlPlaneHandle {
                 }
             })
         };
+        if let Some(snapshot) = &packet_routing {
+            anyhow::ensure!(
+                snapshot.source
+                    == lease
+                        .packet_source()
+                        .and_then(|source| source.optional_context()),
+                "packet UDP routing source changed"
+            );
+        }
         #[cfg(feature = "ebpf")]
         let pending = if lease.decision_token() == 0 {
             None
@@ -300,6 +321,7 @@ impl ControlPlaneHandle {
                 lease.scope(),
                 client_addr,
                 original_dst,
+                lease.packet_lineage(),
             );
             let mut outcome = self.sniffer_pool.feed_quic_initial(sniffer_key, &data);
             // A fragmented ClientHello: collect the rest of the Initial
@@ -338,6 +360,9 @@ impl ControlPlaneHandle {
             let mut input =
                 build_connection_info(quic_domain.clone(), original_dst, client_addr, "udp", None);
             input.dscp = lease.packet_dscp;
+            input.process_name = packet_facts
+                .as_ref()
+                .and_then(super::routing::packet_process_name);
             self.route_packet_with_sniffed(
                 snapshot,
                 dial_mode,
@@ -362,10 +387,7 @@ impl ControlPlaneHandle {
         } else if let Some(raw_dns_route) = raw_dns_route {
             let (outbound, mark) = match raw_dns_route {
                 RawDnsRoute::Group(name) => (name.to_string(), None),
-                RawDnsRoute::Direct(mark) => (
-                    "direct".to_owned(),
-                    honk_outbound::proxy::DirectMark::new(mark),
-                ),
+                RawDnsRoute::Direct(mark) => ("direct".to_owned(), (mark != 0).then_some(mark)),
                 RawDnsRoute::FallbackGroup(_) | RawDnsRoute::FallbackDirect(_) => {
                     anyhow::bail!("packet fallback identity requires captured routing")
                 }
@@ -422,6 +444,10 @@ impl ControlPlaneHandle {
         observation.mode_applied(&outbound_name);
         observation.udp_dial_mode(dial_mode, quic_domain.as_deref(), domain_verification, None);
         let mark = route.mark;
+        anyhow::ensure!(
+            mark.is_none_or(|mark| !honk_ebpf_common::skb_mark_has_reserved_bits(mark)),
+            "direct rule mark uses a reserved datapath bit"
+        );
         self.stats
             .record_udp_route_latency(route_started_at.elapsed());
         #[cfg(feature = "ebpf")]
@@ -432,7 +458,8 @@ impl ControlPlaneHandle {
                         .activate_direct(
                             *identity,
                             lease,
-                            mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+                            mark.and_then(honk_outbound::proxy::DirectMark::new)
+                                .map_or(0, honk_outbound::proxy::DirectMark::get),
                         )
                         .await
                         .inspect_err(|_| {
@@ -489,7 +516,8 @@ impl ControlPlaneHandle {
                             *identity,
                             &lease,
                             final_outbound,
-                            mark.map_or(0, honk_outbound::proxy::DirectMark::get),
+                            mark.and_then(honk_outbound::proxy::DirectMark::new)
+                                .map_or(0, honk_outbound::proxy::DirectMark::get),
                         )
                         .await
                         .inspect_err(|_| {
@@ -656,8 +684,9 @@ impl ControlPlaneHandle {
         let Some((node, prepared)) = self
             .prepare_udp_candidates(
                 lease.scope(),
+                lease.packet_source().cloned(),
                 plan,
-                mark,
+                mark.and_then(honk_outbound::proxy::DirectMark::new),
                 client_addr,
                 original_dst,
                 target_domain.clone(),
@@ -807,10 +836,11 @@ impl ControlPlaneHandle {
         // after the winner is finalized and before the only first send. Any
         // failure is fail-closed; there is no listener-socket fallback.
         let reply_ready_started = std::time::Instant::now();
-        let reply_socket = match self
-            .udp_pool
-            .create_reply_socket(lease.scope(), original_dst)
-        {
+        let reply_socket = match self.udp_pool.create_reply_socket(
+            lease.scope(),
+            original_dst,
+            lease.packet_source(),
+        ) {
             Ok(socket) => Arc::new(socket),
             Err(error) => {
                 if let Some(terminal) = &native_terminal {
@@ -853,6 +883,7 @@ impl ControlPlaneHandle {
                 score_reporter,
             ),
         };
+        endpoint.bind_packet_source(lease.packet_source().cloned())?;
         endpoint.native.set_flow(
             observation.take_flow(),
             &self.udp_pool,
@@ -955,7 +986,10 @@ impl ControlPlaneHandle {
                         start_time: std::time::Instant::now(),
                         domain: quic_domain.clone(),
                         network: "udp".to_string(),
-                        process: handoff.as_ref().and_then(|ho| ho.process_name()),
+                        process: match &packet_facts {
+                            Some(facts) => super::routing::packet_process_name(facts),
+                            None => handoff.as_ref().and_then(|ho| ho.process_name()),
+                        },
                         process_path: None,
                     }
                 },

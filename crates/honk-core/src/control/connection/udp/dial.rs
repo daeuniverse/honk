@@ -12,6 +12,10 @@ pub(super) struct PreparedEndpoint {
     pub(super) attempt: Option<super::super::observation::ConnectionAttempt>,
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep source preparation inline without a per-attempt allocation"
+)]
 pub(super) enum PreparedEndpointTransport {
     Flow(honk_outbound::proxy::PreparedUdpTransport),
     Source(crate::control::udp_endpoint::SourcePreparation),
@@ -56,6 +60,7 @@ impl ControlPlaneHandle {
     pub(super) async fn prepare_udp_candidates(
         &self,
         scope: honk_datapath::ScopeId,
+        packet_source: Option<crate::control::netstack::SourceWork>,
         plan: ResolvedUdpPlan,
         mark: Option<honk_outbound::proxy::DirectMark>,
         client_addr: SocketAddr,
@@ -97,6 +102,8 @@ impl ControlPlaneHandle {
                 let udp_pool = Arc::clone(&udp_pool);
                 let alive_set = Arc::clone(&alive_set);
                 let target_domain = target_domain.clone();
+                let path = source_path(&registry, &node, original_dst.port());
+                let packet_source = path.and_then(|_| packet_source.clone());
                 #[cfg(feature = "native-api")]
                 let native = native.clone();
                 Box::pin(async move {
@@ -145,7 +152,7 @@ impl ControlPlaneHandle {
                         .map(PreparedEndpointTransport::Flow)
                     };
                     let operation = async {
-                        if let Some(path) = source_path(&registry, &node, original_dst.port()) {
+                        if let Some(path) = path {
                             let runtime = runtime_generation.get(&node.id).ok_or_else(|| {
                                 anyhow::anyhow!(
                                     "node {} is not in the captured runtime generation",
@@ -168,6 +175,7 @@ impl ControlPlaneHandle {
                                     Arc::clone(&stats),
                                     scheduler_ipver,
                                     plan_mode == SelectionPlanMode::ColdUrlTest,
+                                    packet_source,
                                 )
                                 .await
                                 .map(PreparedEndpointTransport::Source)

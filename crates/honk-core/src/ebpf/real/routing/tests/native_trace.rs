@@ -383,3 +383,49 @@ fn capture_preserves_every_golden_decision_before_and_after_dns_override() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT"]
+fn canonical_mark_effect_survives_rule_fallback_and_dns_projection() {
+    use honk_ebpf_common::{ROUTING_MARK_KEEP, ROUTING_MARK_SET};
+    let mut backend =
+        RealEbpfBackend::load_routing_test_fixture(&object(), DaeParam::default()).unwrap();
+    for (source, kind, value) in [
+        ("direct(must)", ROUTING_MARK_KEEP, 0),
+        ("direct(must, mark: 0)", ROUTING_MARK_SET, 0),
+        (
+            "direct(must, mark: 0x3fffffff)",
+            ROUTING_MARK_SET,
+            0x3fff_ffff,
+        ),
+    ] {
+        for fallback in [false, true] {
+            let (_, plan) = compile(&if fallback {
+                format!("routing {{ fallback: {source} }}")
+            } else {
+                format!("routing {{ dport(53, 443) -> {source}\n fallback: block }}")
+            });
+            backend.publish_routing_plan(&plan, &[]).unwrap();
+            for flags in [0, DATAPATH_FLAG_TRACE_ENABLED] {
+                backend.set_datapath_flags(flags).unwrap();
+                for port in [53, 443] {
+                    let mut connection = golden::connection();
+                    connection.dst_port = port;
+                    let actual = backend.run_routing_test(&input(&connection)).unwrap();
+                    assert_eq!(actual.status, 0);
+                    assert_eq!(
+                        (actual.trace.mark_kind, actual.trace.decision.mark),
+                        (kind, value)
+                    );
+                    assert_eq!(actual.decision.mark, value);
+                    assert_eq!(
+                        actual.decision.direct_mark_index,
+                        if value == 0 { u32::MAX } else { 0 }
+                    );
+                }
+            }
+        }
+    }
+    let (_, rejected) = compile("routing { fallback: direct(mark: 0x80000000) }");
+    assert!(backend.publish_routing_plan(&rejected, &[]).is_err());
+}

@@ -4,6 +4,8 @@
 //! Only a [`Mode::Transparent`](crate::Mode) stack accepts any of it (a TUN driver reading from the
 //! kernel); an endpoint stack, i.e. the WireGuard driver, only ever sees verified, single packets.
 
+use std::num::NonZeroU64;
+
 use crate::wire::{PROTO_TCP, PROTO_UDP};
 use crate::{DropReason, FlowId};
 
@@ -153,6 +155,13 @@ pub enum TxCsum {
     Partial { start: u16, offset: u16 },
 }
 
+/// Opaque embedding identity for an original source and its immutable captured facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SourceContext {
+    pub lineage: NonZeroU64,
+    pub snapshot: NonZeroU64,
+}
+
 /// A packet written to the caller's buffer by [`Stack::poll_transmit_with`](crate::Stack).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Transmit {
@@ -163,6 +172,8 @@ pub struct Transmit {
     /// Local to the producing Stack; `None` for stateless or unknown-flow output.
     /// Register the packet's in-flight ownership before checking `Stack::tcp_retained`.
     pub flow: Option<FlowId>,
+    /// Original source snapshot retained by the actual protocol/output owner.
+    pub source: Option<SourceContext>,
 }
 
 impl Transmit {
@@ -172,6 +183,7 @@ impl Transmit {
             gso: None,
             csum: TxCsum::Full,
             flow: None,
+            source: None,
         }
     }
 }

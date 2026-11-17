@@ -141,6 +141,7 @@ fn tun_restart_identity_covers_every_owned_device_value() {
     assert_eq!(tun.mtu, 1500);
     let mut explicit = serde_json::to_value(&current).unwrap();
     explicit["datapath"]["tun"]["mtu"] = serde_json::json!(1500);
+    explicit["datapath"]["tun"]["host_facts"] = serde_json::json!(false);
     let explicit: Config = serde_json::from_value(explicit).unwrap();
     assert!(restart_required_changes(&current, &explicit).is_empty());
     let mut policy = current.clone();
@@ -154,6 +155,7 @@ fn tun_restart_identity_covers_every_owned_device_value() {
         "table",
         "rule_priority",
         "capture",
+        "host_facts",
     ] {
         let mut candidate = current.clone();
         let tun = candidate.datapath.as_mut().unwrap().tun.as_mut().unwrap();
@@ -165,6 +167,7 @@ fn tun_restart_identity_covers_every_owned_device_value() {
             "table" => tun.table = 203,
             "rule_priority" => tun.rule_priority = 10010,
             "capture" => tun.capture = vec!["0.0.0.0/1".parse().unwrap(), "::/1".parse().unwrap()],
+            "host_facts" => tun.host_facts = true,
             _ => unreachable!(),
         }
         assert_eq!(
@@ -224,11 +227,11 @@ async fn tun_reload_rejects_unavailable_packet_facts_before_publication() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         };
         match fact {
-            "default_mark" => candidate.routing.default_mark = 1,
-            "rule_mark" => rule.mark = 1,
+            "default_mark" => candidate.routing.default_mark = Some(1),
+            "rule_mark" => rule.mark = Some(1),
             "pname" => rule.condition.process_name = vec!["curl".into()],
             "not_pname" => rule.condition.not.process_name = vec!["curl".into()],
             "mac" => rule.condition.mac = vec!["02:00:00:00:00:01".into()],
@@ -1159,7 +1162,7 @@ async fn core_forward_rejects_marked_reload_before_policy_publication() {
         .store(1, std::sync::atomic::Ordering::Release);
     let mut candidate = before.as_ref().clone();
     candidate.global.dial_mode = "ip".into();
-    candidate.routing.default_mark = 0x42;
+    candidate.routing.default_mark = Some(0x42);
     candidate.routing.default_must = true;
     assert!(matches!(
         cp.apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
@@ -4622,33 +4625,77 @@ async fn subscription_refresh_stale_id_reports_one_safe_rejection() {
 
 #[tokio::test]
 async fn pname_routing_is_reported_only_while_an_applied_rule_uses_pname() {
-    let mut backend = MockEbpfBackend::new();
-    backend.pname_support = crate::ebpf::PnameSupport::Unavailable;
-    let cp = test_cp_with_backend(backend, false).await;
-    let pname = || {
-        cp.degradations
-            .get(crate::degradations::Component::PnameRouting)
-    };
-    let without = changed_routing_config();
-    let mut with = without.clone();
-    with.routing.rules[0].condition.process_name = vec!["curl".into()];
-    for (config, degraded) in [(&with, true), (&without, false)] {
-        let outcome = cp
-            .apply_resolved_runtime_config_locked(
-                config.clone(),
-                &DrainTracker::new(),
-                crate::config_diagnostics::DiagnosticUpdate::Preserve,
-                None,
-                #[cfg(feature = "native-api")]
-                None,
-            )
-            .await
-            .unwrap();
-        assert!(outcome.accepted());
-        assert_eq!(
-            pname().map(|issue| issue.reason),
-            degraded.then_some("cgroup_unavailable")
-        );
+    use crate::ebpf::PnameSupport;
+    for (support, expected) in [
+        (PnameSupport::Full, None),
+        (
+            PnameSupport::ThreadName,
+            Some(("pname_routing_reduced", "comm_fallback")),
+        ),
+        (
+            PnameSupport::Unavailable,
+            Some(("pname_routing_disabled", "cgroup_unavailable")),
+        ),
+        (
+            PnameSupport::HostFull,
+            Some(("pname_routing_host_only", "host_only")),
+        ),
+        (
+            PnameSupport::HostThreadName,
+            Some(("pname_routing_host_only", "host_only_comm_fallback")),
+        ),
+    ] {
+        let mut backend = MockEbpfBackend::new();
+        backend.pname_support = support;
+        let cp = test_cp_with_backend(backend, false).await;
+        let pname = || {
+            cp.degradations
+                .get(crate::degradations::Component::PnameRouting)
+        };
+        let without = changed_routing_config();
+        let mut positive = without.clone();
+        positive.routing.rules[0].condition.process_name = vec!["curl".into()];
+        let mut negative = without.clone();
+        negative.routing.rules[0].condition.not.process_name = vec!["curl".into()];
+        for (config, uses_pname) in [(&positive, true), (&negative, true), (&without, false)] {
+            let outcome = cp
+                .apply_resolved_runtime_config_locked(
+                    config.clone(),
+                    &DrainTracker::new(),
+                    crate::config_diagnostics::DiagnosticUpdate::Preserve,
+                    None,
+                    #[cfg(feature = "native-api")]
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(outcome.accepted());
+            assert_eq!(
+                pname().map(|issue| (issue.code, issue.reason)),
+                if uses_pname { expected } else { None },
+                "{support:?}",
+            );
+            let before = cp.config.read().await.clone();
+            let issue = pname();
+            cp.ebpf
+                .write()
+                .await
+                .inject_routing_fault(RoutingPushPhase::Root, 1)
+                .unwrap();
+            let mut rejected = without.clone();
+            rejected.global.check_tolerance_ms += 1;
+            assert_eq!(
+                cp.apply_runtime_config(rejected, Default::default(), &DrainTracker::new())
+                    .await,
+                ReloadOutcome::Rejected,
+            );
+            assert!(Arc::ptr_eq(&before, &*cp.config.read().await));
+            assert_eq!(
+                pname(),
+                issue,
+                "rejected reload changed {support:?} diagnostics"
+            );
+        }
     }
 }
 

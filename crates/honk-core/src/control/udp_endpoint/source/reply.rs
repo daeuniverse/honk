@@ -29,12 +29,18 @@ impl UdpEndpointPool {
         peer: SocketAddr,
     ) -> SourceReplyTarget {
         let key = match owner.scope.reply {
-            ReplyProjection::ActualPeer => {
-                EndpointKey::new(owner.scope.domain, owner.scope.client, peer)
-            }
-            ReplyProjection::RewriteTo(original) => {
-                EndpointKey::new(owner.scope.domain, owner.scope.client, original)
-            }
+            ReplyProjection::ActualPeer => EndpointKey::new(
+                owner.scope.domain,
+                owner.scope.client,
+                peer,
+                owner.scope.packet_source.map(|source| source.lineage),
+            ),
+            ReplyProjection::RewriteTo(original) => EndpointKey::new(
+                owner.scope.domain,
+                owner.scope.client,
+                original,
+                owner.scope.packet_source.map(|source| source.lineage),
+            ),
         };
         let Some(entry) = self.endpoints.get(&key) else {
             return match owner.scope.reply {
@@ -88,6 +94,7 @@ impl UdpEndpointPool {
             owner.scope.domain,
             owner.scope.client,
             peer,
+            owner.scope.packet_source.map(|source| source.lineage),
         ));
         if !matches!(entry, dashmap::mapref::entry::Entry::Vacant(_)) {
             return None;
@@ -165,7 +172,11 @@ pub(super) async fn deliver_source_reply(
             if source.is_ipv4() != owner.scope.client.is_ipv4() {
                 return SourceReplyDisposition::Drop;
             }
-            let socket = match pool.foreign_replies.get(owner.scope.domain, source) {
+            let socket = match pool.foreign_replies.get(
+                owner.scope.domain,
+                source,
+                owner.packet_source.as_ref(),
+            ) {
                 Ok(socket) => socket,
                 Err(error) => {
                     debug!("UDP foreign reply socket creation failed: {}", error);

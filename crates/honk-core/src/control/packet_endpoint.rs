@@ -7,7 +7,10 @@ use super::ControlPlane;
 use super::connection::{ConnectionGuard, ControlPlaneHandle};
 use super::dns_control::DnsUdpReply;
 use super::dns_listener::{BoundDnsListener, PreparedDnsBind};
-use super::netstack::{FlowIo, PacketDriver, PacketOwner, PacketScope, SourceWork};
+use super::netstack::{
+    FlowIo, HostIngress, PacketDriver, PacketOwner, PacketRealm, PacketRealmPlan, PacketScope,
+    SourceWork,
+};
 use super::task_registry::TaskRegistry;
 use super::udp_endpoint::{
     DatagramPayload, EndpointReservation, FundedDatagram, RawDnsRoute, ReplySocketFd,
@@ -15,9 +18,11 @@ use super::udp_endpoint::{
 };
 use futures::FutureExt;
 use honk_datapath::ScopeId;
-use honk_netstack::{MemoryBudget, MemoryReservation, Rx, RxMeta, ValidatedSource};
+use honk_ebpf_common::host::HostSourceFacts;
+use honk_netstack::{MemoryBudget, MemoryReservation, Rx, RxMeta, SourceContext, ValidatedSource};
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroU64;
 use std::sync::atomic::AtomicBool;
 use std::sync::{
     Arc,
@@ -28,6 +33,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, mpsc};
 
 const INGRESS_CAPACITY: usize = 64;
 const MAX_SCOPES: usize = 64;
+const MAX_OWNERS: usize = 128;
 const STARTING: u8 = 0;
 const READY: u8 = 1;
 const CLOSING: u8 = 2;
@@ -41,17 +47,52 @@ fn report_tcp_completion(result: Result<(), tokio::task::JoinError>) {
 }
 
 #[derive(Debug)]
-struct Replies(Arc<[PacketScope]>);
+struct Replies(Arc<[PacketRealm]>);
 
 impl UdpReplySocketFactory for Replies {
-    fn create(&self, scope: ScopeId, source: SocketAddr) -> io::Result<ReplySocketFd> {
-        self.0
+    fn create(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        packet_source: Option<&SourceWork>,
+    ) -> io::Result<ReplySocketFd> {
+        let owned = self
+            .0
             .iter()
             .find(|item| item.scope() == scope)
-            .map(|item| ReplySocketFd::Packet(item.datagram_sender(source)))
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "packet reply scope is not owned")
-            })
+            })?;
+        match packet_source {
+            Some(source_work) => {
+                let exact = source_work.owner();
+                if !owned.owners().iter().any(|item| item.same_owner(exact)) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "reply source belongs to another packet owner",
+                    ));
+                }
+                if source_work
+                    .plain_address()
+                    .is_some_and(|address| owned.worker_for_udp(address) != exact.worker())
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "UDP source does not own its fixed realm worker",
+                    ));
+                }
+                exact
+                    .datagram_sender_for(source, source_work.clone())
+                    .map(ReplySocketFd::Packet)
+            }
+            None if !owned.owners()[0].is_host() => {
+                Ok(ReplySocketFd::Packet(owned.datagram_sender(source)))
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Host reply requires source facts",
+            )),
+        }
     }
 
     fn uses_fd(&self) -> bool {
@@ -69,6 +110,30 @@ struct Datagram {
     source_work: SourceWork,
 }
 
+enum PacketSource<'a> {
+    Captured {
+        context: SourceContext,
+        facts: &'a HostSourceFacts,
+    },
+    Completed(SourceWork),
+}
+
+impl PacketSource<'_> {
+    fn lineage(&self) -> Option<NonZeroU64> {
+        match self {
+            Self::Captured { context, .. } => Some(context.lineage),
+            Self::Completed(work) => work.optional_context().map(|context| context.lineage),
+        }
+    }
+
+    fn hold(self, scope: &PacketScope) -> io::Result<SourceWork> {
+        match self {
+            Self::Captured { facts, .. } => scope.hold_host_source(facts),
+            Self::Completed(work) => Ok(work),
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 enum Work {
     Tcp(FlowIo, OwnedSemaphorePermit),
@@ -77,6 +142,7 @@ enum Work {
 
 struct Shared {
     scopes: Arc<[PacketScope]>,
+    realms: Arc<[PacketRealm]>,
     budget: Arc<MemoryBudget>,
     udp_pool: Arc<UdpEndpointPool>,
     tcp_slots: Arc<tokio::sync::Semaphore>,
@@ -84,7 +150,6 @@ struct Shared {
     stats: Arc<crate::stats::StatsManager>,
     admission: AtomicU8,
     shutdown: Arc<super::ShutdownIntent>,
-    #[cfg(feature = "native-api")]
     capture_ready: AtomicBool,
     changed: Notify,
     closed: Arc<crate::connection_tracker::CloseSignal>,
@@ -112,6 +177,7 @@ impl Shared {
 /// An owning canonical route/config/runtime/mode decision, captured before ingress.
 pub struct EndpointAdmission {
     snapshot: Box<super::connection::routing::PacketRoutingSnapshot>,
+    pending: Option<super::core_forward::PendingEndpointAdmission>,
     _memory: MemoryReservation,
 }
 
@@ -122,12 +188,47 @@ impl std::fmt::Debug for EndpointAdmission {
 }
 
 impl EndpointAdmission {
+    pub(in crate::control) fn source_context(&self) -> Option<SourceContext> {
+        self.snapshot.source
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn captured_snapshot(
+        &self,
+    ) -> &super::connection::routing::PacketRoutingSnapshot {
+        &self.snapshot
+    }
+    #[cfg(test)]
+    pub(in crate::control) fn captured_snapshot_mut(
+        &mut self,
+    ) -> &mut super::connection::routing::PacketRoutingSnapshot {
+        &mut self.snapshot
+    }
+
+    #[cfg(test)]
     pub(in crate::control) fn new(
         snapshot: super::connection::routing::PacketRoutingSnapshot,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<Self> {
+        Self::allocate(snapshot, budget, None)
+    }
+
+    pub(in crate::control) fn pending(
+        snapshot: super::connection::routing::PacketRoutingSnapshot,
+        budget: &Arc<MemoryBudget>,
+        pending: super::core_forward::PendingEndpointAdmission,
+    ) -> io::Result<Self> {
+        Self::allocate(snapshot, budget, Some(pending))
+    }
+
+    fn allocate(
+        snapshot: super::connection::routing::PacketRoutingSnapshot,
+        budget: &Arc<MemoryBudget>,
+        pending: Option<super::core_forward::PendingEndpointAdmission>,
+    ) -> io::Result<Self> {
         let bytes = size_of::<super::connection::routing::PacketRoutingSnapshot>()
             + 2 * size_of::<usize>()
+            + size_of::<Option<super::core_forward::PendingEndpointAdmission>>()
             + snapshot.decision.retained_bytes()
             + snapshot.mode.name.capacity()
             + snapshot.mode_state.as_ref().map_or(0, |state| {
@@ -143,24 +244,51 @@ impl EndpointAdmission {
         })?;
         Ok(Self {
             snapshot: Box::new(snapshot),
+            pending,
             _memory: memory,
         })
     }
+    }
+
+    pub(in crate::control) fn commit_pending<R>(
+        admission: &mut Option<Self>,
+        scope: ScopeId,
+        commit: impl FnOnce(&mut Option<Self>) -> R,
+    ) -> io::Result<R> {
+        match admission
+            .as_mut()
+            .and_then(|admission| admission.pending.take())
+        {
+            Some(pending) => {
+                let result = pending.commit(scope, || commit(admission));
+                if result.is_err() {
+                    admission.take();
+                }
+                result
+            }
+            None => Ok(commit(admission)),
+        }
 
     pub(in crate::control) fn into_snapshot(
         self,
     ) -> super::connection::routing::PacketRoutingSnapshot {
+        assert!(
+            self.pending.is_none(),
+            "packet policy must commit before use"
+        );
         let mut snapshot = *self.snapshot;
         snapshot.memory = Some(self._memory);
         snapshot
     }
 }
 
-/// Source validity and proven admission for this input are independent facts.
+/// Source validity, ownership transfer and polling qualification are independent facts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PacketReceive {
     pub source: Option<ValidatedSource>,
+    pub source_context: Option<SourceContext>,
     pub qualified_rx: bool,
+    pub taken_over: bool,
 }
 
 /// A bounded ingress handle. Copies share admission, scopes and one core UDP pool.
@@ -187,6 +315,7 @@ struct EndpointRuntime {
     // Driven scopes park their original owners until the device returns or abandons them.
     driven: bool,
     prepared_dns_addresses: Option<PreparedDnsBind>,
+    standalone_dns_scope: ScopeId,
     scope_tasks: TaskRegistry,
     tcp_tasks: TaskRegistry,
     startup: Option<tokio::sync::oneshot::Sender<()>>,
@@ -208,8 +337,8 @@ async fn run_driven_scope(
 }
 
 impl PacketEndpoints {
-    /// Read-only execution ownership, including protocol/output and retirement tails.
-    /// Classification does not validate a packet; receive must still verify its checksum.
+    /// Claim-retirement ownership, including source-wide controller DNS work.
+    /// Use `retained_transport` when deciding whether a packet already owns execution.
     pub fn retains(
         &self,
         scope: ScopeId,
@@ -217,17 +346,48 @@ impl PacketEndpoints {
         destination: SocketAddr,
         protocol: u8,
     ) -> bool {
-        let Some(owned) = self
-            .shared
-            .scopes
-            .iter()
-            .find(|owned| owned.scope() == scope)
-        else {
+        self.retained_transport(scope, source, destination, protocol)
+            || (protocol == 17
+                && destination.port() == 53
+                && self
+                    .shared
+                    .scopes
+                    .iter()
+                    .any(|owned| owned.scope() == scope && owned.retains_source(source.ip())))
+    }
+
+    /// Exact tuple/protocol ownership; unrelated source work never bypasses admission.
+    pub(crate) fn retained_transport(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        protocol: u8,
+    ) -> bool {
+        self.retains_with_lineage(scope, source, destination, protocol, None)
+    }
+
+    pub(crate) fn retains_with_lineage(
+        &self,
+        scope: ScopeId,
+        source: SocketAddr,
+        destination: SocketAddr,
+        protocol: u8,
+        packet_lineage: Option<NonZeroU64>,
+    ) -> bool {
+        let Some(realm) = self.realm(scope) else {
             return false;
         };
+        let owned = &realm.owners()[realm.worker_for_tcp(source, destination)];
         match protocol {
-            6 => owned.retains_tcp(source, destination),
-            17 => self.shared.udp_pool.contains(scope, source, destination),
+            6 => match packet_lineage {
+                None => owned.retains_tcp(source, destination),
+                Some(_) => owned.retains_tcp_with_lineage(source, destination, packet_lineage),
+            },
+            17 => self
+                .shared
+                .udp_pool
+                .contains(scope, source, destination, packet_lineage),
             _ => false,
         }
     }
@@ -238,8 +398,7 @@ impl PacketEndpoints {
         self.shared
             .scopes
             .iter()
-            .find(|owned| owned.scope() == scope)
-            .is_some_and(|owned| owned.retains_source(address))
+            .any(|owned| owned.scope() == scope && owned.retains_source(address))
             || self.shared.udp_pool.retains_source(scope, address)
     }
 
@@ -261,7 +420,8 @@ impl PacketEndpoints {
         scopes: Vec<(PacketScope, PacketOwner)>,
         udp_capacity: usize,
     ) -> anyhow::Result<(Self, PacketEndpointOwner)> {
-        let (endpoints, mut owner, _) = Self::start(plane, scopes, udp_capacity, false, None)?;
+        let (endpoints, mut owner, _) =
+            Self::start(plane, scopes, udp_capacity, false, None, ScopeId::HOST).await?;
         std::future::poll_fn(|cx| owner.poll_ready(cx)).await?;
         Ok((endpoints, owner))
     }
@@ -269,38 +429,136 @@ impl PacketEndpoints {
     /// `new` for a capture owner that drives these scopes itself: the same validation,
     /// with one exclusive driver per scope in `scopes` order before readiness. Service
     /// them while polling `PacketEndpointOwner::poll_ready`; failed-start cleanup needs it.
-    pub(crate) fn start_driven(
+    pub(crate) async fn start_driven<P: Into<PacketRealmPlan>>(
         plane: ControlPlane,
-        scopes: Vec<(PacketScope, PacketOwner)>,
+        scopes: Vec<P>,
         udp_capacity: usize,
         prepared_dns_addresses: Option<PreparedDnsBind>,
+        standalone_dns_scope: ScopeId,
     ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
-        Self::start(plane, scopes, udp_capacity, true, prepared_dns_addresses)
+        Self::start(
+            plane,
+            scopes,
+            udp_capacity,
+            true,
+            prepared_dns_addresses,
+            standalone_dns_scope,
+        )
+        .await
     }
 
-    fn start(
-        mut plane: ControlPlane,
-        scopes: Vec<(PacketScope, PacketOwner)>,
+    async fn start<P: Into<PacketRealmPlan>>(
+        plane: ControlPlane,
+        plans: Vec<P>,
         udp_capacity: usize,
         driven: bool,
         prepared_dns_addresses: Option<PreparedDnsBind>,
+        standalone_dns_scope: ScopeId,
     ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
+        let mut scopes = Vec::new();
+        let mut realms = Vec::new();
+        let mut invalid_plan = None;
+        for plan in plans {
+            let plan = plan.into();
+            match plan.realm {
+                Ok(realm) => {
+                    if plan.owners.len() != realm.owners().len()
+                        || plan
+                            .owners
+                            .iter()
+                            .zip(realm.owners())
+                            .any(|(owner, scope)| !owner.owns(scope))
+                    {
+                        invalid_plan = Some(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "packet realm owner mismatch",
+                        ));
+                    }
+                    for owner in plan.owners {
+                        scopes.push((owner.packet_scope().clone(), owner));
+                    }
+                    realms.push(realm);
+                }
+                Err(error) => {
+                    invalid_plan = Some(error);
+                    for owner in plan.owners {
+                        scopes.push((owner.packet_scope().clone(), owner));
+                    }
+                }
+            }
+        }
+        if let Some(error) = invalid_plan {
+            for (scope, _) in &scopes {
+                scope.shutdown(true);
+            }
+            for (_, owner) in scopes {
+                owner.shutdown().await;
+            }
+            return Err(error.into());
+        }
+        let result = Self::prepare_start(
+            plane,
+            &mut scopes,
+            realms,
+            udp_capacity,
+            driven,
+            prepared_dns_addresses,
+            standalone_dns_scope,
+        );
+        if result.is_err() {
+            for (scope, _) in &scopes {
+                scope.shutdown(true);
+            }
+            for (_, owner) in scopes {
+                owner.shutdown().await;
+            }
+        }
+        result
+    }
+
+    fn prepare_start(
+        mut plane: ControlPlane,
+        pending_scopes: &mut Vec<(PacketScope, PacketOwner)>,
+        realms: Vec<PacketRealm>,
+        udp_capacity: usize,
+        driven: bool,
+        prepared_dns_addresses: Option<PreparedDnsBind>,
+        standalone_dns_scope: ScopeId,
+    ) -> anyhow::Result<(Self, PacketEndpointOwner, Vec<PacketDriver>)> {
+        let scopes = &*pending_scopes;
         anyhow::ensure!(
             plane.command_rx.is_some() && plane.health_task.is_none(),
             "packet endpoints require an unstarted control plane"
         );
         anyhow::ensure!(
-            !scopes.is_empty() && scopes.len() <= MAX_SCOPES,
-            "invalid packet scope count"
+            !realms.is_empty() && realms.len() <= MAX_SCOPES && scopes.len() <= MAX_OWNERS,
+            "invalid packet realm/owner count"
         );
         anyhow::ensure!(
             udp_capacity != 0 && udp_capacity <= plane.resource_budget.udp_endpoints,
             "invalid shared UDP endpoint capacity"
         );
         let budget = scopes[0].0.budget();
+        for (index, realm) in realms.iter().enumerate() {
+            anyhow::ensure!(
+                !realms[..index]
+                    .iter()
+                    .any(|earlier| earlier.scope() == realm.scope()),
+                "duplicate packet realm"
+            );
+            anyhow::ensure!(
+                realm
+                    .owners()
+                    .iter()
+                    .enumerate()
+                    .all(|(worker, owner)| owner.scope() == realm.scope()
+                        && owner.worker() == worker),
+                "invalid packet realm owner partition"
+            );
+        }
         for (index, (scope, owner)) in scopes.iter().enumerate() {
             anyhow::ensure!(
-                scope.scope() != ScopeId::HOST && scope.scope() == owner.scope(),
+                scope.scope() != ScopeId::HOST && owner.owns(scope),
                 "packet scope owner mismatch"
             );
             anyhow::ensure!(
@@ -310,26 +568,43 @@ impl PacketEndpoints {
             anyhow::ensure!(
                 !scopes[..index]
                     .iter()
-                    .any(|(earlier, _)| earlier.scope() == scope.scope()),
-                "duplicate packet scope"
+                    .any(|(earlier, _)| earlier.same_owner(scope)),
+                "duplicate packet owner"
             );
         }
         let mut tcp_capacity = 0usize;
-        for (scope, _) in &scopes {
+        for (scope, _) in scopes {
             tcp_capacity = tcp_capacity
                 .checked_add(scope.prepare_endpoint()?)
                 .ok_or_else(|| anyhow::anyhow!("packet flow capacity overflow"))?;
         }
-        let scope_tasks = TaskRegistry::accounted(scopes.len(), &budget)?;
-        let tcp_tasks = TaskRegistry::accounted(
-            tcp_capacity.min(plane.resource_budget.elastic_tcp_flows(0, 0)),
-            &budget,
-        )?;
+        tracing::debug!(
+            used = budget.used(),
+            limit = budget.limit(),
+            scopes = scopes.len(),
+            tcp_capacity,
+            udp_capacity,
+            "packet endpoints start: budget before registries"
+        );
+        let scope_tasks = TaskRegistry::accounted(scopes.len(), &budget).map_err(|error| {
+            anyhow::anyhow!(
+                "packet scope task registry ({} scopes): {error}",
+                scopes.len()
+            )
+        })?;
+        let tcp_task_slots = tcp_capacity.min(plane.resource_budget.elastic_tcp_flows(0, 0));
+        let tcp_tasks = TaskRegistry::accounted(tcp_task_slots, &budget).map_err(|error| {
+            anyhow::anyhow!(
+                "packet TCP task registry ({tcp_task_slots} slots, budget {}/{}): {error}",
+                budget.used(),
+                budget.limit()
+            )
+        })?;
         let bytes = (INGRESS_CAPACITY + 32)
             .checked_mul(4 * (size_of::<Work>() + size_of::<UdpInitLease>()))
             .and_then(|n| {
                 n.checked_add(
-                    MAX_SCOPES
+                    MAX_OWNERS
                         * (size_of::<PacketScope>()
                             + size_of::<PacketOwner>()
                             + size_of::<PacketDriver>()),
@@ -340,17 +615,40 @@ impl PacketEndpoints {
         let memory = budget
             .reserve(bytes)
             .ok_or_else(|| anyhow::anyhow!("packet ingress memory capacity"))?;
-        let (scopes, owners): (Vec<_>, Vec<_>) = scopes.into_iter().unzip();
-        let scopes: Arc<[PacketScope]> = scopes.into();
-        plane.dns_controller.register_packet_scopes(&scopes)?;
-        plane.udp_pool = Arc::new(UdpEndpointPool::with_packet_reply_factory(
-            udp_capacity,
-            Arc::new(Replies(Arc::clone(&scopes))),
-            Arc::clone(&budget),
-        )?);
+        let logical_scopes: Vec<_> = realms
+            .iter()
+            .map(|realm| realm.owners()[0].clone())
+            .collect();
+        plane
+            .dns_controller
+            .register_packet_scopes(&logical_scopes)?;
+        let scopes: Arc<[PacketScope]> = scopes.iter().map(|(scope, _)| scope.clone()).collect();
+        let realms: Arc<[PacketRealm]> = realms.into();
+        #[cfg(feature = "ebpf")]
+        if let Some(publication) = plane.shutdown_intent().native_publication() {
+            plane
+                .dns_controller
+                .routing_projection()
+                .install_native(publication)?;
+        }
+        plane.udp_pool = Arc::new(
+            UdpEndpointPool::with_packet_reply_factory(
+                udp_capacity,
+                Arc::new(Replies(Arc::clone(&realms))),
+                Arc::clone(&budget),
+            )
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "packet UDP endpoint pool ({udp_capacity} endpoints, budget {}/{}): {error}",
+                    budget.used(),
+                    budget.limit()
+                )
+            })?,
+        );
         plane.install_node_death_callback();
         let shared = Arc::new(Shared {
             scopes,
+            realms,
             budget,
             udp_pool: Arc::clone(&plane.udp_pool),
             tcp_slots: Arc::clone(&plane.concurrency_limit),
@@ -358,7 +656,6 @@ impl PacketEndpoints {
             stats: Arc::clone(&plane.stats),
             admission: AtomicU8::new(STARTING),
             shutdown: plane.shutdown_intent(),
-            #[cfg(feature = "native-api")]
             capture_ready: AtomicBool::new(false),
             changed: Notify::new(),
             closed: crate::connection_tracker::CloseSignal::new(),
@@ -370,41 +667,57 @@ impl PacketEndpoints {
         let (sender, receiver) = mpsc::channel(INGRESS_CAPACITY);
         let (initializers, initializer_rx) = mpsc::channel(INGRESS_CAPACITY);
         let (started, ready) = tokio::sync::oneshot::channel();
-        let drivers = if driven {
-            owners.iter().map(PacketOwner::hand_off).collect()
-        } else {
-            Vec::new()
-        };
-        let runtime = EndpointRuntime {
+        let mut drivers = Vec::new();
+        let mut runtime = EndpointRuntime {
             shared: Arc::clone(&shared),
             plane,
             receiver,
             initializers: initializer_rx,
-            owners,
+            owners: Vec::new(),
             driven,
             prepared_dns_addresses,
+            standalone_dns_scope,
             scope_tasks,
             tcp_tasks,
             startup: Some(started),
         };
-        let completed = Arc::clone(&shared.closed);
-        let commands_closed = Arc::clone(&shared.commands_closed);
-        let operation = async move {
-            let _completion = crate::connection_tracker::CloseCompletion(Arc::clone(&completed));
-            let _commands = crate::connection_tracker::CloseCompletion(commands_closed);
-            let (plane, result) = runtime.run().await;
-            completed.finish(result.is_ok());
-            (plane, result)
-        };
-        let bytes = size_of_val(&operation)
-            .checked_add(super::task_registry::TASK_BOOKKEEPING)
-            .ok_or_else(|| anyhow::anyhow!("packet supervisor capacity overflow"))?;
-        let memory = shared
-            .budget
-            .reserve(bytes)
-            .ok_or_else(|| anyhow::anyhow!("packet supervisor memory capacity"))?;
-        assert!(shared.supervisor_memory.set(memory).is_ok());
-        let task = tokio::spawn(operation);
+        // As with scope-task factories, fund the concrete future before taking any owner.
+        fn spawn_supervisor<F>(
+            shared: &Arc<Shared>,
+            create: impl FnOnce() -> F,
+        ) -> anyhow::Result<tokio::task::JoinHandle<F::Output>>
+        where
+            F: Future<Output = (ControlPlane, anyhow::Result<()>)> + Send + 'static,
+        {
+            let bytes = size_of::<F>()
+                .checked_add(super::task_registry::TASK_BOOKKEEPING)
+                .ok_or_else(|| anyhow::anyhow!("packet supervisor capacity overflow"))?;
+            let memory = shared
+                .budget
+                .reserve(bytes)
+                .ok_or_else(|| anyhow::anyhow!("packet supervisor memory capacity"))?;
+            assert!(shared.supervisor_memory.set(memory).is_ok());
+            Ok(tokio::spawn(create()))
+        }
+        let task = spawn_supervisor(&shared, || {
+            runtime.owners = std::mem::take(pending_scopes)
+                .into_iter()
+                .map(|(_, owner)| owner)
+                .collect();
+            if driven {
+                drivers = runtime.owners.iter().map(PacketOwner::hand_off).collect();
+            }
+            let completed = Arc::clone(&shared.closed);
+            let commands_closed = Arc::clone(&shared.commands_closed);
+            async move {
+                let _completion =
+                    crate::connection_tracker::CloseCompletion(Arc::clone(&completed));
+                let _commands = crate::connection_tracker::CloseCompletion(commands_closed);
+                let (plane, result) = runtime.run().await;
+                completed.finish(result.is_ok());
+                (plane, result)
+            }
+        })?;
         let owner = PacketEndpointOwner {
             shared: Arc::clone(&shared),
             task: Some(task),
@@ -424,9 +737,16 @@ impl PacketEndpoints {
     /// Receive one verified IP packet. A receive batch supplies one `now` value.
     /// Queue pressure drops only that UDP datagram; established TCP still progresses.
     pub fn receive(&self, scope: ScopeId, packet: &[u8], now: Instant) -> io::Result<()> {
-        self.receive_inner::<false>(scope, (packet, RxMeta::VERIFY), now, None, false, |_, _| {
-            true
-        })
+        self.receive_inner::<false>(
+            scope,
+            (packet, RxMeta::VERIFY),
+            now,
+            now,
+            None,
+            None,
+            false,
+            |_, _, _, _| true,
+        )
         .map(|_| ())
     }
 
@@ -453,9 +773,18 @@ impl PacketEndpoints {
         meta: RxMeta,
         now: Instant,
         check_output: bool,
-        on_source: impl FnMut(ValidatedSource, bool) -> bool,
+        mut on_source: impl FnMut(ValidatedSource, bool) -> bool,
     ) -> io::Result<PacketReceive> {
-        self.receive_inner::<true>(scope, (packet, meta), now, None, check_output, on_source)
+        self.receive_inner::<true>(
+            scope,
+            (packet, meta),
+            now,
+            now,
+            None,
+            None,
+            check_output,
+            |source, _, _, pending| on_source(source, pending),
+        )
     }
 
     /// Admit with the execution decision captured by the canonical Core classifier.
@@ -466,40 +795,177 @@ impl PacketEndpoints {
         now: Instant,
         admission: EndpointAdmission,
         check_output: bool,
-        on_source: impl FnMut(ValidatedSource, bool) -> bool,
+        mut on_source: impl FnMut(ValidatedSource, bool) -> bool,
     ) -> io::Result<PacketReceive> {
         self.receive_inner::<true>(
             scope,
             (packet, RxMeta::VERIFY),
             now,
+            now,
             Some(admission),
+            None,
             check_output,
-            on_source,
+            |source, _, _, pending| on_source(source, pending),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_host_with_source(
+        &self,
+        scope: ScopeId,
+        packet: &[u8],
+        meta: RxMeta,
+        packet_now: Instant,
+        ingress: &HostIngress,
+        admission: Option<EndpointAdmission>,
+        check_output: bool,
+        mut on_source: impl FnMut(ValidatedSource, SourceContext, &HostSourceFacts, bool) -> bool,
+    ) -> io::Result<PacketReceive> {
+        self.receive_inner::<true>(
+            scope,
+            (packet, meta),
+            packet_now,
+            packet_now,
+            admission,
+            Some(ingress),
+            check_output,
+            |source, context, facts, pending| {
+                on_source(
+                    source,
+                    context.expect("Host source context"),
+                    facts.expect("Host source facts"),
+                    pending,
+                )
+            },
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn receive_inner<const REPORT: bool>(
         &self,
         scope: ScopeId,
         (packet, meta): (&[u8], RxMeta),
         now: Instant,
+        service_at: Instant,
         mut admission: Option<EndpointAdmission>,
+        host: Option<&HostIngress>,
         check_output: bool,
-        on_source: impl FnMut(ValidatedSource, bool) -> bool,
+        mut on_source: impl FnMut(
+            ValidatedSource,
+            Option<SourceContext>,
+            Option<&HostSourceFacts>,
+            bool,
+        ) -> bool,
     ) -> io::Result<PacketReceive> {
-        let scope = self
-            .shared
-            .scopes
-            .iter()
-            .find(|item| item.scope() == scope)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unowned packet scope"))?;
+        if host.is_none()
+            && self
+                .realm(scope)
+                .is_some_and(|realm| realm.owners().len() > 1)
+            && matches!(
+                honk_netstack::wire::parse_ip(packet),
+                Err(honk_netstack::wire::ParseError::Fragment)
+            )
+        {
+            let owner = &self.realm(scope).expect("owned realm").owners()[0];
+            return match owner.reassemble_for_dispatch(packet, now, service_at) {
+                Ok(Some(complete)) => self.receive_inner::<REPORT>(
+                    scope,
+                    (&complete, RxMeta::VERIFY),
+                    complete.completion_ingress(),
+                    service_at,
+                    admission,
+                    None,
+                    check_output,
+                    on_source,
+                ),
+                Ok(None) | Err(_) => Ok(PacketReceive::default()),
+            };
+        }
+        let scope =
+            self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
         self.shared.udp_pool.reap_tasks();
-        let (rx, mut received) = if admission.is_some() {
-            scope.receive_admitted_with_source(packet, now, &mut admission, check_output, on_source)
-        } else if REPORT {
-            scope.receive_with_meta_source(packet, meta, now, check_output, on_source)
+        let mut receive = |admission: &mut Option<EndpointAdmission>| -> io::Result<_> {
+            Ok(if let Some(ingress) = host {
+                scope.receive_host_deferred_with_source(
+                    (packet, meta),
+                    now,
+                    ingress,
+                    admission,
+                    check_output,
+                    |source, context, facts, pending| {
+                        on_source(source, Some(context), Some(facts), pending)
+                    },
+                )?
+            } else if admission.is_some()
+                || self
+                    .realm(scope.scope())
+                    .is_some_and(|realm| realm.owners().len() > 1)
+            {
+                let (rx, received) = scope.receive_admitted_deferred_with_source(
+                    packet,
+                    now,
+                    service_at,
+                    admission,
+                    check_output,
+                    |source, pending| on_source(source, None, None, pending),
+                );
+                (rx, received, None)
+            } else if REPORT {
+                let (rx, received) = scope.receive_with_meta_source(
+                    packet,
+                    meta,
+                    now,
+                    check_output,
+                    |source, pending| on_source(source, None, None, pending),
+                );
+                (rx, received, None)
+            } else {
+                (scope.receive(packet, now), PacketReceive::default(), None)
+            })
+        };
+        let tcp = honk_netstack::wire::parse_ip(packet)
+            .is_ok_and(|ip| ip.proto == honk_netstack::wire::PROTO_TCP);
+        let (rx, received, completion) = if tcp {
+            EndpointAdmission::commit_pending(&mut admission, scope.scope(), receive)??
         } else {
-            (scope.receive(packet, now), PacketReceive::default())
+            receive(&mut admission)?
+        };
+        scope.after_receive();
+        self.dispatch_received::<REPORT>(
+            scope, packet, rx, received, completion, admission, host, None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_received<const REPORT: bool>(
+        &self,
+        scope: &PacketScope,
+        packet: &[u8],
+        rx: Rx,
+        mut received: PacketReceive,
+        mut completion: Option<SourceWork>,
+        mut admission: Option<EndpointAdmission>,
+        host: Option<&HostIngress>,
+        physical: Option<&SourceWork>,
+    ) -> io::Result<PacketReceive> {
+        if host.is_some()
+            && received.source_context.is_none()
+            && matches!(
+                &rx,
+                Rx::Transparent { .. } | Rx::TransparentOwned { .. } | Rx::TransparentSplit { .. }
+            )
+        {
+            return Err(io::Error::other(
+                "Host UDP completion lost its source context",
+            ));
+        }
+        let captured = || {
+            host.zip(received.source_context)
+                .map(|(ingress, context)| PacketSource::Captured {
+                    context,
+                    facts: &ingress.facts,
+                })
+                .or_else(|| physical.cloned().map(PacketSource::Completed))
         };
         let result = match rx {
             Rx::Transparent {
@@ -507,18 +973,35 @@ impl PacketEndpoints {
                 dst,
                 dscp,
                 payload,
-            } => self.queue_datagram(scope.scope(), src, dst, dscp, admission.take(), |budget| {
-                FundedDatagram::copy_from(&packet[payload], budget)
-            }),
+            } => self.queue_datagram(
+                scope,
+                src,
+                dst,
+                dscp,
+                admission.take(),
+                captured(),
+                |budget| FundedDatagram::copy_from(&packet[payload], budget),
+            ),
             Rx::TransparentOwned {
                 src,
                 dst,
                 dscp,
                 packet,
                 payload,
-            } => self.queue_datagram(scope.scope(), src, dst, dscp, admission.take(), |budget| {
-                FundedDatagram::from_packet(packet, payload, budget)
-            }),
+            } => {
+                let source = match completion.take() {
+                    Some(source) => Some(PacketSource::Completed(source)),
+                    None if host.is_some() => {
+                        return Err(io::Error::other(
+                            "Host reassembly completion lost its source owner",
+                        ));
+                    }
+                    None => physical.cloned().map(PacketSource::Completed),
+                };
+                self.queue_datagram(scope, src, dst, dscp, admission.take(), source, |budget| {
+                    FundedDatagram::from_packet(packet, payload, budget)
+                })
+            }
             Rx::TransparentSplit {
                 src,
                 dst,
@@ -528,41 +1011,49 @@ impl PacketEndpoints {
             } => {
                 let mut failure = None;
                 let mut qualified = true;
+                let mut taken_over = false;
                 for payload in packet[payload].chunks(usize::from(size)) {
                     match self.queue_datagram(
-                        scope.scope(),
+                        scope,
                         src,
                         dst,
                         dscp,
                         admission.take(),
+                        captured(),
                         |budget| FundedDatagram::copy_from(payload, budget),
                     ) {
-                        Ok(enqueued) => qualified &= enqueued,
+                        Ok((enqueued, owned)) => {
+                            qualified &= enqueued;
+                            taken_over |= owned;
+                        }
                         Err(error) => {
                             failure.get_or_insert(error);
                         }
                     }
                 }
-                failure.map_or(Ok(qualified), Err)
+                failure.map_or(Ok((qualified, taken_over)), Err)
             }
-            _ => Ok(received.qualified_rx),
+            _ => Ok((received.qualified_rx, received.taken_over)),
         };
         self.accept_ready(scope);
-        result.map(|qualified_rx| {
+        result.map(|(qualified_rx, taken_over)| {
             received.qualified_rx = REPORT && qualified_rx;
+            received.taken_over = taken_over;
             received
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn queue_datagram(
         &self,
-        scope: ScopeId,
+        scope: &PacketScope,
         source: SocketAddr,
         destination: SocketAddr,
         dscp: u8,
-        routing: Option<EndpointAdmission>,
+        mut routing: Option<EndpointAdmission>,
+        packet_source: Option<PacketSource<'_>>,
         make: impl FnOnce(&Arc<MemoryBudget>) -> Option<FundedDatagram>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<(bool, bool)> {
         if self.shared.is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
@@ -576,18 +1067,21 @@ impl PacketEndpoints {
             io::Error::new(io::ErrorKind::WouldBlock, "packet ingress memory capacity")
         })?;
         if destination.port() != 53 {
+            let packet_lineage = packet_source.as_ref().and_then(PacketSource::lineage);
             let pool = &self.shared.udp_pool;
             let now = super::udp_endpoint::queue_now();
             if let Some(reservation) = pool.fast_path_enqueue_payload_at(
-                scope,
+                scope.scope(),
                 source,
                 destination,
                 DatagramPayload::Funded(bytes.clone()),
                 None,
                 now,
                 &self.shared.stats,
+                packet_lineage,
             ) {
-                return Ok(matches!(reservation, EndpointReservation::Enqueued));
+                let enqueued = matches!(reservation, EndpointReservation::Enqueued);
+                return Ok((enqueued, enqueued));
             }
             let initializer = self.initializers.try_reserve().map_err(|_| {
                 io::Error::new(
@@ -599,45 +1093,81 @@ impl PacketEndpoints {
                 &self.shared.stats,
                 &self.shared.udp_slots,
             ) else {
-                return Ok(false);
+                return Ok((false, false));
             };
-            if let EndpointReservation::Initializing(mut lease) = pool
-                .reserve_payload_or_enqueue_at(
-                    scope,
-                    source,
-                    destination,
-                    DatagramPayload::Funded(bytes),
-                    None,
-                    crate::ebpf::UdpFlowOwner::packet(),
-                    pool.initialization_epoch(),
-                    slow,
-                    now,
-                    &self.shared.stats,
-                )
-            {
-                lease.packet_routing = routing.map(EndpointAdmission::into_snapshot);
-                lease.packet_dscp = Some(dscp);
-                initializer.send(lease);
+            let epoch = pool.initialization_epoch();
+            if let Some((reservation, ready)) = pool.enqueue_bound_payload_at(
+                scope.scope(),
+                source,
+                destination,
+                DatagramPayload::Funded(bytes.clone()),
+                None,
+                now,
+                &self.shared.stats,
+                packet_lineage,
+                Some(epoch),
+            ) {
+                let enqueued = matches!(reservation, EndpointReservation::Enqueued);
+                return Ok((ready && enqueued, enqueued));
             }
-            return Ok(false);
+            let packet_source = match packet_source {
+                Some(source) => Some(source.hold(scope)?),
+                None => Some(scope.hold_source(source.ip())?),
+            };
+            let retained_source = packet_source.clone();
+            let reservation =
+                EndpointAdmission::commit_pending(&mut routing, scope.scope(), |_| {
+                    pool.reserve_payload_or_enqueue_at(
+                        scope.scope(),
+                        source,
+                        destination,
+                        DatagramPayload::Funded(bytes),
+                        None,
+                        crate::ebpf::UdpFlowOwner::packet(),
+                        epoch,
+                        slow,
+                        now,
+                        &self.shared.stats,
+                        packet_source,
+                    )
+                })?;
+            drop(retained_source);
+            return match reservation {
+                EndpointReservation::Initializing(mut lease) => {
+                    lease.packet_routing = routing.map(EndpointAdmission::into_snapshot);
+                    lease.packet_dscp = Some(dscp);
+                    initializer.send(lease);
+                    Ok((false, true))
+                }
+                EndpointReservation::Enqueued => Ok((false, true)),
+                _ => Ok((false, false)),
+            };
         }
-        let source_work = self
-            .shared
-            .scopes
-            .iter()
-            .find(|owned| owned.scope() == scope)
-            .expect("owned packet scope")
-            .hold_source(source.ip())?;
-        permit.send(Work::Udp(Datagram {
-            scope,
-            source,
-            destination,
-            dscp,
-            routing,
-            bytes,
-            source_work,
-        }));
-        Ok(false)
+        let source_work = match packet_source {
+            Some(source) => source.hold(scope)?,
+            None => scope.hold_source(source.ip())?,
+        };
+        if routing
+            .as_ref()
+            .is_some_and(|admission| admission.source_context() != source_work.optional_context())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "packet routing source changed before DNS admission",
+            ));
+        }
+        let datagram =
+            EndpointAdmission::commit_pending(&mut routing, scope.scope(), |routing| Datagram {
+                scope: scope.scope(),
+                source,
+                destination,
+                dscp,
+                routing: routing.take(),
+                bytes,
+                source_work,
+            })?;
+        permit.send(Work::Udp(datagram));
+        Ok((false, true))
     }
 
     fn accept_ready(&self, scope: &PacketScope) {
@@ -667,11 +1197,8 @@ impl PacketEndpoints {
                 "packet endpoint admission is not ready",
             ));
         }
-        #[cfg(feature = "native-api")]
-        {
-            self.shared.capture_ready.store(true, Ordering::Release);
-            self.shared.changed.notify_one();
-        }
+        self.shared.capture_ready.store(true, Ordering::Release);
+        self.shared.changed.notify_one();
         Ok(())
     }
 
@@ -707,6 +1234,10 @@ impl PacketEndpointOwner {
 
     pub(crate) async fn join_plane(mut self) -> anyhow::Result<(ControlPlane, anyhow::Result<()>)> {
         std::future::poll_fn(|cx| self.poll_join_plane(cx)).await
+    }
+
+    pub(crate) fn is_joined(&self) -> bool {
+        self.task.is_none()
     }
 
     pub(crate) fn poll_join_plane(
@@ -871,45 +1402,68 @@ impl EndpointRuntime {
             }
         }
         let fallback_fatal = (!self.owners.is_empty()).then(|| fatal.clone());
-        let (configured_packet, egress_mark, mut authorizations, endpoint) = if failure.is_none()
-            && !self.shared.is_closing()
-        {
-            let config = self.plane.config.read().await;
-            let backend = config.datapath.as_ref().map(|datapath| datapath.backend);
-            let configured_packet = matches!(
-                backend,
-                Some(honk_config::datapath::Backend::Xdp | honk_config::datapath::Backend::Tun)
-            );
-            let tun = backend == Some(honk_config::datapath::Backend::Tun);
-            if tun && self.shared.scopes.len() != 1 {
-                failure = Some(anyhow::anyhow!("TUN requires exactly one packet scope"));
-            }
-            let egress_mark = tun.then(|| config.global.effective_so_mark());
-            let authorizations = if configured_packet {
-                match crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions) {
-                    Ok(authorizations) => Some(authorizations),
-                    Err(error) => {
-                        failure = Some(error);
-                        None
+        let (configured_packet, egress_mark, mut authorizations, endpoint) =
+            if failure.is_none() && !self.shared.is_closing() {
+                let config = self.plane.config.read().await;
+                let backend = config.datapath.as_ref().map(|datapath| datapath.backend);
+                let configured_packet = matches!(
+                    backend,
+                    Some(honk_config::datapath::Backend::Xdp | honk_config::datapath::Backend::Tun)
+                );
+                let tun = backend == Some(honk_config::datapath::Backend::Tun);
+                if tun {
+                    let host_facts = config
+                        .datapath
+                        .as_ref()
+                        .and_then(|value| value.tun.as_ref())
+                        .is_some_and(|tun| tun.host_facts);
+                    let plain = self
+                        .shared
+                        .scopes
+                        .iter()
+                        .filter(|scope| !scope.is_host())
+                        .count();
+                    let host = self
+                        .shared
+                        .scopes
+                        .iter()
+                        .filter(|scope| scope.is_host())
+                        .count();
+                    if plain != 1
+                        || host != usize::from(host_facts)
+                        || !self.shared.scopes.iter().any(|scope| {
+                            scope.scope() == self.standalone_dns_scope && !scope.is_host()
+                        })
+                    {
+                        failure = Some(anyhow::anyhow!(
+                            "TUN requires its plain scope and configured Host scope"
+                        ));
                     }
                 }
+                let egress_mark = tun.then(|| config.global.effective_so_mark());
+                let authorizations = if configured_packet {
+                    match crate::subscription::SubscriptionAuthorizations::new(
+                        &config.subscriptions,
+                    ) {
+                        Ok(authorizations) => Some(authorizations),
+                        Err(error) => {
+                            failure = Some(error);
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let endpoint = if configured_packet {
+                    config.dns.bind_endpoint().map_err(anyhow::Error::from)
+                } else {
+                    Ok(None)
+                };
+                (configured_packet, egress_mark, authorizations, endpoint)
             } else {
-                None
+                (false, None, None, Ok(None))
             };
-            let endpoint = if configured_packet {
-                config.dns.bind_endpoint().map_err(anyhow::Error::from)
-            } else {
-                Ok(None)
-            };
-            (configured_packet, egress_mark, authorizations, endpoint)
-        } else {
-            (false, None, None, Ok(None))
-        };
-        let fact_scope = if egress_mark.is_some() {
-            self.shared.scopes[0].scope()
-        } else {
-            ScopeId::HOST
-        };
+        let fact_scope = self.standalone_dns_scope;
         if configured_packet
             && failure.is_none()
             && !self.shared.is_closing()
@@ -988,7 +1542,6 @@ impl EndpointRuntime {
                 }
             }
         }
-        #[cfg(feature = "native-api")]
         let mut running_published = false;
         // This CAS commits readiness; a later close overlaps an already-started runtime.
         if failure.is_none()
@@ -1011,8 +1564,12 @@ impl EndpointRuntime {
             if failure.is_some() || self.shared.is_closing() {
                 break;
             }
-            #[cfg(feature = "native-api")]
             if !running_published && self.shared.capture_ready.load(Ordering::Acquire) {
+                let router = self.plane.router.read().await;
+                let backend = self.plane.ebpf.read().await;
+                crate::ebpf::record_pname_routing(&router, &**backend, &self.plane.degradations);
+                drop((backend, router));
+                #[cfg(feature = "native-api")]
                 self.plane.publish_phase(super::EnginePhase::Running);
                 running_published = true;
             }
@@ -1171,6 +1728,7 @@ impl EndpointRuntime {
             source_work,
         } = datagram;
         let pool = &self.plane.udp_pool;
+        let packet_source = Some(&source_work);
         let epoch = pool.initialization_epoch();
         let mut raw_route = None;
         let mut packet_routing = routing.map(EndpointAdmission::into_snapshot);
@@ -1187,6 +1745,12 @@ impl EndpointRuntime {
                         destination,
                     ),
                 );
+                if let Some(facts) = source_work.optional_facts() {
+                    packet_observation
+                        .as_mut()
+                        .unwrap()
+                        .packet_facts(&facts, dscp);
+                }
                 packet_observation.as_ref().unwrap().routing_started();
             }
             #[cfg_attr(not(feature = "native-api"), allow(unused_mut))]
@@ -1199,6 +1763,7 @@ impl EndpointRuntime {
                         destination,
                         "udp",
                         dscp,
+                        packet_source,
                         #[cfg(feature = "native-api")]
                         packet_observation.as_ref().unwrap().is_recording(),
                     )
@@ -1232,13 +1797,16 @@ impl EndpointRuntime {
                 #[cfg(feature = "native-api")]
                 let observer =
                     observation.observer(|| handle.diagnostics.read().generation, "client_dns");
-                let sender = self
-                    .shared
-                    .scopes
-                    .iter()
-                    .find(|item| item.scope() == scope)
-                    .expect("admitted scope")
-                    .datagram_sender(destination);
+                let sender = match source_work
+                    .owner()
+                    .datagram_sender_for(destination, source_work.clone())
+                {
+                    Ok(sender) => sender,
+                    Err(error) => {
+                        tracing::debug!(%error, "packet DNS reply source refused");
+                        return;
+                    }
+                };
                 let dns = Arc::clone(&self.plane.dns_controller);
                 let budget = Arc::clone(&self.shared.budget);
                 let Some(response_memory) = budget.reserve(65536) else {
@@ -1349,10 +1917,7 @@ impl EndpointRuntime {
                 return;
             }
             raw_route = Some(if snapshot.mode.name == "direct" {
-                let mark = snapshot
-                    .decision
-                    .mark
-                    .map_or(0, honk_outbound::proxy::DirectMark::get);
+                let mark = snapshot.decision.mark.unwrap_or(0);
                 if snapshot.decision.must {
                     RawDnsRoute::Direct(mark)
                 } else {
@@ -1374,6 +1939,9 @@ impl EndpointRuntime {
                 raw_route.as_ref().map(RawDnsRoute::as_ref),
                 super::udp_endpoint::queue_now(),
                 &self.plane.stats,
+                packet_source
+                    .and_then(SourceWork::optional_context)
+                    .map(|source| source.lineage),
             )
             .is_some()
         {
@@ -1409,6 +1977,7 @@ impl EndpointRuntime {
             permit,
             super::udp_endpoint::queue_now(),
             &self.plane.stats,
+            Some(source_work),
         ) {
             lease.packet_routing = packet_routing;
             lease.packet_dscp = Some(dscp);
@@ -1433,6 +2002,7 @@ impl EndpointRuntime {
 }
 
 mod maintenance;
+mod realm;
 
 #[cfg(test)]
 mod tests;

@@ -45,6 +45,8 @@ routing {
 | `ipversion(...)` | `4`/`ipv4`, `6`/`ipv6` | `ip_version` |
 | `dscp(...)` | Decimal or `0x`/`0X`-prefixed hexadecimal DSCP value | `dscp` |
 
+For TUN, `pname` requires `tun.host_facts: true`. Process facts exist only for authenticated application-socket Host records when present; plain or individually missing facts do not match a positive predicate and do match its negation. This does not prove plain input is Transit.
+
 Every positive field has a corresponding list under `RoutingCondition.not`; the parser sends `!matcher(...)` there. Within one field, listed values are alternatives.
 
 All domain pattern/suffix/keyword/regex and `geosite` alternatives share one
@@ -84,24 +86,33 @@ Admission and policy-size limits: [LAN per-source new-flow budget](../design/dat
 
 `direct(mark: 512)` and `direct(mark: 0x200)` select the same direct mark.
 Unprefixed numbers are decimal (including leading zeroes); `0x`/`0X` selects
-hexadecimal. The range is `0..=0x3fffffff`: bits `0xc0000000` belong to the
-datapath, not user policy. Binary/octal prefixes, underscores, signs, overflow,
-unknown options and duplicate `mark`/`must` options reject the configuration.
+hexadecimal. Parsing preserves the full `u32` range and distinguishes an omitted
+mark (`Keep`) from an explicit `mark: 0` (`Set(0)`). Backend admission still rejects
+unsupported effects: TC reserves `0xc0000000`, while packet Endpoint/Core paths
+retain their nonzero-mark restrictions. Binary/octal prefixes, underscores, signs,
+overflow, unknown options and duplicate `mark`/`must` options reject the configuration.
 Unlike the global mark scalar, a malformed direct mark never silently becomes zero.
 Marks are supported on `direct`, not proxy/group targets.
+
+Host-only XDP Native applies Keep or the exact full-width Set value to the original
+operation, without adding classified/bypass bits. Physical Native does not support
+these explicit Set effects, including Set(0); it must not silently project them
+onto the legacy direct-socket convention.
 
 `direct(mark: 0x200, must)` and `direct(must, mark: 0x200)` are equivalent;
 whitespace inside the direct option list is allowed; `fallback:`/`default:`
 accept the same forms. The last merged fallback replaces the whole action (a plain
 `direct` clears mark and `must`) and applies after every ordinary rule, even later ones.
 
-For IPv4/IPv6 TCP and UDP, a nonzero direct mark replaces the global socket-mark
-payload; it is **not OR-ed with `so_mark_from_dae` or `0x100`**. On native direct,
-NFQUEUE-approved direct and userspace direct sockets, honk retains
-`CLASSIFIED_MARK` (`0x40000000`) alongside this low-30-bit policy payload.
-For example, a configured `0x200` can appear as `0x40000200`; Linux policy rules
-must mask off the reserved bits. `mark: 0` means unspecified: userspace-originated
-direct sockets use the global mark, while native direct adds no user mark.
+On the legacy TC/NFQUEUE and userspace direct-socket paths, a nonzero direct mark
+replaces the global socket-mark payload; it is **not OR-ed with `so_mark_from_dae`
+or `0x100`**. These paths retain `CLASSIFIED_MARK` (`0x40000000`) alongside the
+low-30-bit policy payload. For example, a configured `0x200` can appear as
+`0x40000200`; Linux policy rules must mask off the reserved bits. At this legacy
+execution boundary, explicit zero has the same effect as an omitted mark:
+userspace-originated direct sockets use the global mark, while TC direct adds no
+user mark. The canonical configuration and routing result retain the distinction;
+this legacy projection is not a full-width Native mark assignment.
 Proxy carriers, bootstrap and DNS-controller upstreams use the global mark,
 not a mark from the intercepted traffic rule.
 
@@ -218,6 +229,14 @@ routing {
 ```
 
 `proxy`, `hk`, and `resilient` are group names.
+
+The `routing` target `direct` uses the execution profile selected by
+[`datapath.direct`](./global.md#capture-backend-selection). The public
+`direct: native` selector requires physical XDP capture and real eBPF with
+NFQUEUE disabled; eligible final Direct packets use XDP candidate `PASS`.
+TC/TUN/Host Native and Native firewall/NAT compositions are rejected. Host Native
+and captured-first return are not executable. A non-skipping TCX final gate is
+required for acceptance; this selector does not claim full V7 or passing real tests.
 
 ## Core forwarding firewall and IPv4 NAT
 

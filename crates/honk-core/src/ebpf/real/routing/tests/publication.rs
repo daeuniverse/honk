@@ -30,7 +30,7 @@ fn publication_failure_recovery_and_frozen_root() {
             outbound: honk_config::routing::RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0x600 + index,
+            mark: Some(0x600 + index),
         })
         .collect::<Vec<_>>();
     let initial_router = Router::new(&initial_rules, "direct").unwrap();
@@ -82,7 +82,7 @@ fn publication_failure_recovery_and_frozen_root() {
         outbound: honk_config::routing::RoutingOutbound::Simple("block".into()),
         priority: 0,
         must: false,
-        mark: 0x700,
+        mark: Some(0x700),
     };
     let recovery_router = Router::new(std::slice::from_ref(&recovery_rule), "direct").unwrap();
     let recovery = RoutingPushPlan::compile(&recovery_router, &ids, DialMode::Ip).unwrap();
@@ -162,7 +162,7 @@ fn publication_failure_recovery_and_frozen_root() {
     let mut root_candidate_rule = recovery_rule;
     root_candidate_rule.name = "root-failure".into();
     root_candidate_rule.outbound = honk_config::routing::RoutingOutbound::Simple("proxy".into());
-    root_candidate_rule.mark = 0x701;
+    root_candidate_rule.mark = Some(0x701);
     let root_candidate_router =
         Router::new(std::slice::from_ref(&root_candidate_rule), "direct").unwrap();
     let root_candidate =

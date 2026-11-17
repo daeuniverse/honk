@@ -60,7 +60,10 @@ impl Stack {
         &mut self,
         ip: &IpPacket,
         packet: &[u8],
-        report: &mut crate::stack::SourceReport<impl FnMut(crate::ValidatedSource) -> bool>,
+        report: &mut crate::stack::SourceReport<
+            '_,
+            impl FnMut(crate::ValidatedSource, Option<crate::SourceContext>) -> bool,
+        >,
     ) -> Rx {
         let dgram = &packet[ip.payload.clone()];
         let (src, dst, payload) = match wire::udp::parse(dgram) {

@@ -244,7 +244,7 @@ fn port_plan(port: u16, outbound: &str, must: bool) -> anyhow::Result<RoutingPus
             outbound: honk_config::routing::RoutingOutbound::Simple(outbound.into()),
             priority: 0,
             must,
-            mark: 0,
+            mark: None,
         });
     let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
     ControlPlane::compile_routing_plan(&config, &router)

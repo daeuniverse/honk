@@ -1,11 +1,11 @@
-use crate::maps::PARAM;
 use aya_ebpf::Global;
 use aya_ebpf_bindings::helpers::{
-    bpf_get_current_task, bpf_loop, bpf_probe_read_kernel, bpf_probe_read_user_str,
+    bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_get_current_task, bpf_loop,
+    bpf_probe_read_kernel, bpf_probe_read_user_str,
 };
 use aya_ebpf_cty::c_void;
 use core::mem;
-use honk_ebpf_common::TASK_COMM_LEN;
+use honk_ebpf_common::{TASK_COMM_LEN, redirect_need::SocketIdentity};
 
 const MAX_ARG_LEN: usize = 128;
 
@@ -37,8 +37,43 @@ extern "C" fn find_basename(index: u32, data: *mut c_void) -> i32 {
 }
 
 #[inline(always)]
-pub fn read_argv0_basename(pname: &mut [u8; TASK_COMM_LEN]) -> bool {
-    if PARAM.load().has_bpf_get_current_task == 0 {
+pub(crate) fn capture(
+    argv0: bool,
+    has_bpf_get_current_task: bool,
+    task_mm_offset: u32,
+    mm_arg_start_offset: u32,
+) -> Option<SocketIdentity> {
+    let mut identity = SocketIdentity {
+        pid: (unsafe { bpf_get_current_pid_tgid() } >> 32) as u32,
+        pname: [0; TASK_COMM_LEN],
+    };
+    if (!argv0
+        || !read_argv0_basename(
+            &mut identity.pname,
+            has_bpf_get_current_task,
+            task_mm_offset,
+            mm_arg_start_offset,
+        ))
+        && unsafe {
+            bpf_get_current_comm(
+                identity.pname.as_mut_ptr().cast(),
+                identity.pname.len() as u32,
+            )
+        } != 0
+    {
+        return None;
+    }
+    Some(identity)
+}
+
+#[inline(always)]
+fn read_argv0_basename(
+    pname: &mut [u8; TASK_COMM_LEN],
+    has_bpf_get_current_task: bool,
+    task_mm_offset: u32,
+    mm_arg_start_offset: u32,
+) -> bool {
+    if !has_bpf_get_current_task {
         return false;
     }
 
@@ -52,7 +87,7 @@ pub fn read_argv0_basename(pname: &mut [u8; TASK_COMM_LEN]) -> bool {
         bpf_probe_read_kernel(
             &mut mm as *mut _ as *mut c_void,
             mem::size_of::<usize>() as u32,
-            task.wrapping_add(TASK_MM_OFFSET.load() as usize) as *const c_void,
+            task.wrapping_add(task_mm_offset as usize) as *const c_void,
         )
     } < 0
         || mm == 0
@@ -65,7 +100,7 @@ pub fn read_argv0_basename(pname: &mut [u8; TASK_COMM_LEN]) -> bool {
         bpf_probe_read_kernel(
             &mut arg_start as *mut _ as *mut c_void,
             mem::size_of::<usize>() as u32,
-            mm.wrapping_add(MM_ARG_START_OFFSET.load() as usize) as *const c_void,
+            mm.wrapping_add(mm_arg_start_offset as usize) as *const c_void,
         )
     } < 0
         || arg_start == 0

@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+host = []
+captured-fault = []
+
 [dependencies]
 libc.workspace = true
 aya-obj.workspace = true

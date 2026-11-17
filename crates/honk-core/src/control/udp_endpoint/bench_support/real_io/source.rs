@@ -175,6 +175,7 @@ impl IoHarness {
                 Arc::clone(&self.stats),
                 IpVersion::V4,
                 false,
+                None,
             )
             .await
             .map_err(io::Error::other)?;
@@ -199,6 +200,7 @@ impl IoHarness {
             self.client_addr,
             SourcePath::Shared,
             None,
+            None,
         );
         let preparation = if self.pool.sources.contains_key(&scope) {
             self.pool
@@ -217,12 +219,14 @@ impl IoHarness {
                     Arc::clone(&self.stats),
                     IpVersion::V4,
                     false,
+                    None,
                 )
                 .await
                 .map_err(io::Error::other)?
         } else {
             SourcePreparation::Fresh {
                 scope,
+                packet_source: None,
                 prepared: PreparedSourceTransport::Shared(PreparedUdpTransport::ready(transport)),
                 source_permit: self
                     .pool
@@ -253,7 +257,7 @@ impl IoHarness {
             .commit(&self.pool)
             .await
             .map_err(io::Error::other)?;
-        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target)?);
+        let reply = Arc::new(self.pool.create_reply_socket(lease.scope(), target, None)?);
         let endpoint = Arc::new(UdpEndpoint::new_source_scored(
             attachment,
             target,

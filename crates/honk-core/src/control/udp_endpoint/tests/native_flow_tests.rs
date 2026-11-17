@@ -571,7 +571,8 @@ async fn native_udp_received_reply_survives_client_send_failure_until_cleanup() 
                 removal.client,
                 removal.dst,
                 removal.owner,
-                removal.generation
+                removal.generation,
+                removal.packet_lineage,
             ));
         }
         assert!(pool.shutdown().await.joined);

@@ -5,9 +5,11 @@ use crate::dae_ip::In6Addr;
 pub mod conn;
 pub mod dae_ip;
 pub mod event;
+pub mod host;
 pub mod receive_trace;
 pub mod redirect_need;
 pub mod routing_policy;
+pub mod tun;
 pub mod xdp;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
@@ -27,9 +29,9 @@ pub use routing_policy::{
     ROUTE_TRACE_SKIPPED, ROUTE_TRACE_UNAVAILABLE, ROUTE_TRACE_VALUES, ROUTE_TRACE_VERSION,
     ROUTE_TRACE_VERSION_MASK, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
     ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
-    ROUTING_INPUT_MAC_PRESENT, ROUTING_POLICY_ROOT_NAME, ROUTING_PROCESS_MAX_LEN,
-    ROUTING_SLOT_NAMES, RoutingDecision, RoutingInput, RoutingPolicyDescriptor, RoutingTestResult,
-    normalize_process_name,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_MARK_KEEP, ROUTING_MARK_SET, ROUTING_POLICY_ROOT_NAME,
+    ROUTING_PROCESS_MAX_LEN, ROUTING_SLOT_NAMES, RoutingDecision, RoutingInput,
+    RoutingPolicyDescriptor, RoutingTestResult, normalize_process_name,
 };
 
 pub const TASK_COMM_LEN: usize = 16;

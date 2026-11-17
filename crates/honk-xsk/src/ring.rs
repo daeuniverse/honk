@@ -495,17 +495,23 @@ fn get_option<T>(fd: BorrowedFd<'_>, name: libc::c_int, value: &mut T) -> io::Re
     Ok(())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "socket setup keeps device negotiation separate from buffer ownership"
+)]
 pub(super) fn open(
     ifindex: u32,
     queue: u32,
     mode: BindMode,
     config: PortConfig,
     scatter_gather: bool,
+    metadata_len: usize,
     umem: &Umem,
     budget: &Arc<MemoryBudget>,
 ) -> io::Result<(OwnedFd, Rings, bool)> {
     use std::os::fd::AsFd;
 
+    super::rx_frame_capacity(metadata_len)?;
     // SAFETY: socket has no pointer arguments. There is no implicit bind-mode fallback.
     let raw_fd = unsafe {
         libc::socket(
@@ -527,7 +533,7 @@ pub(super) fn open(
             .map_err(|_| invalid("UMEM pointer overflow"))?,
         len: u64::try_from(umem.bytes).map_err(|_| invalid("UMEM length overflow"))?,
         chunk_size: FRAME_SIZE as u32,
-        headroom: super::METADATA_SIZE as u32,
+        headroom: metadata_len as u32,
         flags: 0,
         tx_metadata_len: 0,
     };

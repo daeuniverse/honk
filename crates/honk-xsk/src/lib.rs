@@ -12,9 +12,20 @@ mod port;
 pub mod topology;
 
 pub use bpf::{
-    Attachment, CaptureCounters, PersistentAttachment, Programs, XdpState, xdp_absent, xdp_state,
+    Attachment, CaptureCounters, CapturedGateIdentity, CapturedLayout, CapturedProgramConfig,
+    CapturedPrograms, CapturedResource, CapturedResourceState, CapturedTarget, NativeProgramConfig,
+    NativePrograms, NativeTarget, NativeTcxAttachment, PersistentAttachment, Programs, XdpState,
+    xdp_absent, xdp_state,
+};
+#[cfg(feature = "host")]
+pub use bpf::{
+    HostNativeCandidate, HostNativeConfig, HostNativeHook, HostNativeLayout,
+    HostNativeLayoutAdmission, HostNativeMaps, HostNativePrograms, HostPrograms, HostSourceConfig,
+    HostSourcePrograms, HostTcxAttachment, TunKernelOffsets, TunMaps, TunProgramConfig,
+    TunPrograms, TunTraceTarget,
 };
 pub use capture::{Capture, DecodeError, DecodedPacket, GeneralCapture, Protocol, Reject};
 pub use port::{
-    BindMode, FRAME_SIZE, Port, PortConfig, PortCounters, RingSnapshot, SocketStats, TxSink,
+    BindMode, FRAME_SIZE, MAX_SEGMENTS, Port, PortConfig, PortCounters, RetainedRxHandle,
+    RetainedRxIdentity, RingSnapshot, RxCompletion, RxDisposition, SocketStats, TxSink,
 };

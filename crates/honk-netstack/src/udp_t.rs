@@ -17,7 +17,7 @@ use crate::icmp_out::Reject;
 use crate::offload::{GsoKind, GsoTx, MAX_USO_RX, MAX_USO_TX, RxMeta, Transmit, TxCaps, TxCsum};
 use crate::tcp::output::Output;
 use crate::wire::{self, IpPacket, ipv4, ipv6};
-use crate::{DropReason, MemoryBudget, Rx, Stack, UdpError};
+use crate::{DropReason, MemoryBudget, Rx, SourceContext, Stack, UdpError};
 
 /// Why a transparent UDP datagram is refused (ICMP mapping of the design, §3.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,6 +38,7 @@ struct Pending {
     src: IpAddr,
     dst: IpAddr,
     id: u32,
+    source: Option<SourceContext>,
     /// UDP header, payload and checksum.
     datagram: Vec<u8>,
     /// Offset of the next fragment within `datagram`.
@@ -92,6 +93,7 @@ pub(crate) struct UdpTx {
     queue: VecDeque<Pending>,
     bytes: usize,
     budget: Option<Arc<MemoryBudget>>,
+    pending_budget: Option<Arc<MemoryBudget>>,
     /// Next IP identification; sequential from a keyed start, so ids never repeat within 2^16
     /// datagrams (IPv4) while still not starting at a guessable value.
     ident: u32,
@@ -103,6 +105,9 @@ impl Drop for UdpTx {
         if let Some(budget) = &self.budget
             && self.bytes != 0
         {
+            budget.refund(self.bytes);
+        }
+        if let Some(budget) = &self.pending_budget {
             budget.refund(self.bytes);
         }
     }
@@ -121,6 +126,7 @@ impl UdpTx {
             queue: VecDeque::new(),
             bytes: 0,
             budget,
+            pending_budget: None,
             ident: u32::from_le_bytes([
                 h.as_bytes()[0],
                 h.as_bytes()[1],
@@ -129,6 +135,11 @@ impl UdpTx {
             ]),
         }
     }
+    }
+
+    pub(crate) fn with_pending_budget(&mut self, budget: Arc<MemoryBudget>) {
+        debug_assert_eq!(self.bytes, 0);
+        self.pending_budget = Some(budget);
 
     pub(crate) fn pending(&self) -> bool {
         !self.queue.is_empty()
@@ -138,6 +149,22 @@ impl UdpTx {
         self.queue.iter().any(|pending| pending.dst == address)
     }
 
+    pub(crate) fn retains_source_output_with_lineage(&self, lineage: std::num::NonZeroU64) -> bool {
+        self.queue.iter().any(|pending| {
+            pending
+                .source
+                .is_some_and(|source| source.lineage == lineage)
+        })
+    }
+
+    pub(crate) fn visit_retained_source_contexts(&self, mut visit: impl FnMut(SourceContext)) {
+        for pending in &self.queue {
+            if let Some(source) = pending.source {
+                visit(source);
+            }
+        }
+    }
+
     /// Writes the datagram (or its first fragment) to `out`. Errors consume nothing.
     pub(crate) fn send_from(
         &mut self,
@@ -145,8 +172,9 @@ impl UdpTx {
         src: SocketAddr,
         dst: SocketAddr,
         payload: &[u8],
+        source: Option<SourceContext>,
         out: &mut [u8],
-    ) -> Result<usize, UdpError> {
+    ) -> Result<Transmit, UdpError> {
         if src.is_ipv4() != dst.is_ipv4() {
             return Err(UdpError::FamilyMismatch);
         }
@@ -165,7 +193,10 @@ impl UdpTx {
             }
             let n = Self::whole(src, dst, payload, id, out, packet)?;
             self.ident = self.ident.wrapping_add(1);
-            return Ok(n);
+            return Ok(Transmit {
+                source,
+                ..Transmit::plain(n)
+            });
         }
         let frag_extra = if v6 { ipv6::FRAGMENT_HEADER_LEN } else { 0 };
         let chunk = (mtu.saturating_sub(ip_len + frag_extra)) & !7;
@@ -178,7 +209,17 @@ impl UdpTx {
         if out.len() < ip_len + frag_extra + chunk.min(udp_len) {
             return Err(UdpError::BufferTooSmall);
         }
+        if self
+            .pending_budget
+            .as_ref()
+            .is_some_and(|b| !b.try_charge(udp_len))
+        {
+            return Err(UdpError::Busy);
+        }
         if self.budget.as_ref().is_some_and(|b| !b.try_charge(udp_len)) {
+            if let Some(budget) = &self.pending_budget {
+                budget.refund(udp_len);
+            }
             return Err(UdpError::Busy);
         }
         let mut datagram = vec![0u8; udp_len].into_boxed_slice().into_vec();
@@ -188,6 +229,7 @@ impl UdpTx {
             src: src.ip(),
             dst: dst.ip(),
             id,
+            source,
             datagram,
             next: 0,
             chunk,
@@ -196,7 +238,10 @@ impl UdpTx {
         self.ident = self.ident.wrapping_add(1);
         self.bytes += udp_len;
         self.queue.push_back(p);
-        Ok(n)
+        Ok(Transmit {
+            source,
+            ..Transmit::plain(n)
+        })
     }
 
     /// An unfragmented datagram: no DF, identification set, like a kernel UDP socket.
@@ -277,22 +322,27 @@ impl UdpTx {
                 offset: 6,
             },
             flow: None,
+            source: None,
         })
     }
 
     /// Next queued fragment. `Blocked` keeps it queued for a larger buffer.
-    pub(crate) fn poll(&mut self, out: &mut [u8]) -> Output {
+    pub(crate) fn poll(&mut self, out: &mut [u8], tx: &mut Transmit) -> Output {
         let Some(p) = self.queue.front_mut() else {
             return Output::None;
         };
         let Some(n) = p.emit(out) else {
             return Output::Blocked;
         };
+        tx.source = p.source;
         if p.done() {
             let p = self.queue.pop_front().expect("front");
             let freed = p.datagram.capacity();
             self.bytes -= freed;
             if let Some(budget) = &self.budget {
+                budget.refund(freed);
+            }
+            if let Some(budget) = &self.pending_budget {
                 budget.refund(freed);
             }
         }
@@ -305,6 +355,10 @@ impl UdpTx {
         assert_eq!(sum, self.bytes);
         assert!(self.queue.iter().all(|p| !p.done()));
         assert!(self.queue.len() <= 1 || self.bytes <= MAX_PENDING_BYTES);
+        if let Some(budget) = &self.pending_budget {
+            assert!(self.bytes <= budget.used());
+            assert!(budget.used() <= MAX_PENDING_BYTES);
+        }
     }
 }
 
@@ -320,14 +374,42 @@ impl Stack {
         payload: &[u8],
         out: &mut [u8],
     ) -> Result<usize, UdpError> {
-        let n = self
-            .udp_tx
-            .send_from(usize::from(self.cfg.mtu), src, dst, payload, out)?;
+        self.send_udp_from(src, dst, payload, None, out)
+            .map(|tx| tx.len)
+    }
+
+    /// Sends a reply with its original immutable source on the first and all later fragments.
+    /// Requires `prepare_source_context`; refusal consumes no packet or output storage.
+    pub fn udp_send_from_with_context(
+        &mut self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+        source: SourceContext,
+        out: &mut [u8],
+    ) -> Result<Transmit, UdpError> {
+        if !self.table.has_sources() {
+            return Err(UdpError::Busy);
+        }
+        self.send_udp_from(src, dst, payload, Some(source), out)
+    }
+
+    fn send_udp_from(
+        &mut self,
+        src: SocketAddr,
+        dst: SocketAddr,
+        payload: &[u8],
+        source: Option<SourceContext>,
+        out: &mut [u8],
+    ) -> Result<Transmit, UdpError> {
+        let tx =
+            self.udp_tx
+                .send_from(usize::from(self.cfg.mtu), src, dst, payload, source, out)?;
         self.counters.tx_packets += 1;
         if self.udp_tx.pending() {
             self.tx_wakeup = true;
         }
-        Ok(n)
+        Ok(tx)
     }
 
     /// [`Stack::udp_send_from`] for a driver with UDP segmentation offload (`caps.uso4` / `uso6`,
@@ -378,17 +460,40 @@ impl Stack {
         original: &[u8],
         out: &mut [u8],
     ) -> Result<Option<usize>, UdpError> {
+        self.send_udp_refusal(now, how, original, out, None)
+    }
+
+    /// Emits a refusal using the capture realm's shared, externally serialized limiter.
+    pub fn udp_refuse_with_icmp(
+        &mut self,
+        now: Instant,
+        how: UdpRefuse,
+        original: &[u8],
+        out: &mut [u8],
+        icmp: &mut crate::IcmpState,
+    ) -> Result<Option<usize>, UdpError> {
+        self.send_udp_refusal(now, how, original, out, Some(icmp))
+    }
+
+    fn send_udp_refusal(
+        &mut self,
+        now: Instant,
+        how: UdpRefuse,
+        original: &[u8],
+        out: &mut [u8],
+        icmp: Option<&mut crate::IcmpState>,
+    ) -> Result<Option<usize>, UdpError> {
         let kind = match how {
             UdpRefuse::PortUnreachable => Reject::Unreachable,
             UdpRefuse::HostUnreachable => Reject::HostUnreachable,
             UdpRefuse::AdminProhibited => Reject::AdminProhibited,
         };
-        self.send_icmp(now, kind, original, out)
+        self.send_icmp_with_state(now, kind, original, out, icmp)
     }
 
     /// Pulls the next fragment of an earlier oversized `udp_send_from`.
-    pub(crate) fn poll_udp_frag(&mut self, out: &mut [u8]) -> Output {
-        let r = self.udp_tx.poll(out);
+    pub(crate) fn poll_udp_frag(&mut self, out: &mut [u8], tx: &mut Transmit) -> Output {
+        let r = self.udp_tx.poll(out, tx);
         if matches!(r, Output::Sent(_)) {
             self.counters.tx_packets += 1;
         }
@@ -476,7 +581,7 @@ mod tests {
     fn drain(s: &mut Stack, first: Vec<u8>) -> Vec<Vec<u8>> {
         let mut all = vec![first];
         let mut out = vec![0u8; 2000];
-        while let Output::Sent(n) = s.poll_udp_frag(&mut out) {
+        while let Output::Sent(n) = s.poll_udp_frag(&mut out, &mut Transmit::plain(0)) {
             all.push(out[..n].to_vec());
         }
         all
@@ -487,8 +592,8 @@ mod tests {
         let now = Instant::now();
         let mut done = None;
         for p in packets {
-            match r.push(now, wire::frag::parse(p).unwrap()) {
-                Push::Pending => {}
+            match r.push(now, wire::frag::parse(p).unwrap(), None) {
+                Push::Pending(_) => {}
                 Push::Complete(c) => done = Some(c.packet.to_vec()),
                 Push::Dropped(d) => panic!("dropped {d:?}"),
             }
@@ -752,11 +857,17 @@ mod tests {
         let mut out = vec![0u8; 1280];
         let n = s.udp_send_from(src, dst, &payload, &mut out).unwrap();
         let mut tiny = [0u8; 100];
-        assert!(matches!(s.poll_udp_frag(&mut tiny), Output::Blocked));
+        assert!(matches!(
+            s.poll_udp_frag(&mut tiny, &mut Transmit::plain(0)),
+            Output::Blocked
+        ));
         assert!(s.udp_tx.pending());
         let packets = drain(&mut s, out[..n].to_vec());
         assert_eq!(reassemble(&packets).len(), 20 + 8 + 5000);
-        assert!(matches!(s.poll_udp_frag(&mut out), Output::None));
+        assert!(matches!(
+            s.poll_udp_frag(&mut out, &mut Transmit::plain(0)),
+            Output::None
+        ));
     }
 
     #[test]
@@ -788,7 +899,10 @@ mod tests {
             let retained = a.udp_tx.queue.front().unwrap().datagram.capacity();
             assert_eq!(retained, 3008);
             assert_eq!(budget.used(), retained);
-            assert!(matches!(a.poll_udp_frag(&mut [0; 1]), Output::Blocked));
+            assert!(matches!(
+                a.poll_udp_frag(&mut [0; 1], &mut Transmit::plain(0)),
+                Output::Blocked
+            ));
             assert_eq!(budget.used(), retained);
             out.fill(0xA5);
             assert_eq!(
@@ -799,7 +913,7 @@ mod tests {
             assert_eq!(budget.used(), retained);
             assert!(!b.udp_tx.pending());
             b.udp_send_from(src, dst, b"small", &mut out).unwrap();
-            while let Output::Sent(_) = a.poll_udp_frag(&mut out) {
+            while let Output::Sent(_) = a.poll_udp_frag(&mut out, &mut Transmit::plain(0)) {
                 assert_eq!(budget.used(), if a.udp_tx.pending() { retained } else { 0 });
                 a.udp_tx.check();
             }
@@ -858,6 +972,58 @@ mod tests {
                         .unwrap()
                         .is_some()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn contextual_udp_keeps_source_on_first_pending_and_final_fragments() {
+        let source = SourceContext {
+            lineage: std::num::NonZeroU64::new(7).unwrap(),
+            snapshot: std::num::NonZeroU64::new(9).unwrap(),
+        };
+        for v6 in [false, true] {
+            let (src, dst) = addrs(v6);
+            for len in [0, 7, 5000, 65_500] {
+                let mut cfg = Config::new([9; 32]);
+                cfg.mtu = 1280;
+                cfg.shared_budget = Some(crate::MemoryBudget::new(cfg.memory_limit));
+                let mut stack = Stack::new(cfg, Instant::now());
+                stack.prepare_source_context().unwrap();
+                let payload = Rng::new(19).bytes(len);
+                let mut out = [0; 1280];
+                let first = stack
+                    .udp_send_from_with_context(src, dst, &payload, source, &mut out)
+                    .unwrap();
+                assert_eq!((first.flow, first.source), (None, Some(source)));
+                let mut packets = vec![out[..first.len].to_vec()];
+                let mut retained = Vec::new();
+                stack.visit_retained_source_contexts(|source| retained.push(source));
+                assert_eq!(retained, if len > 1280 { vec![source] } else { vec![] });
+                assert!(
+                    stack
+                        .poll_transmit_with(Instant::now(), &mut [0; 1], TxCaps::NONE)
+                        .is_none()
+                );
+                while let Some(tx) =
+                    stack.poll_transmit_with(Instant::now(), &mut out, TxCaps::NONE)
+                {
+                    assert_eq!((tx.flow, tx.source), (None, Some(source)));
+                    packets.push(out[..tx.len].to_vec());
+                }
+                stack.visit_retained_source_contexts(|_| {
+                    panic!("final UDP fragment still pins source")
+                });
+                let packet = if packets.len() == 1 {
+                    packets.pop().unwrap()
+                } else {
+                    reassemble(&packets)
+                };
+                let ip = parse_ip(&packet).unwrap();
+                let datagram = &packet[ip.payload];
+                assert!(udp::verify_checksum(src.ip(), dst.ip(), datagram));
+                let (_, _, range) = udp::parse(datagram).unwrap();
+                assert_eq!(&datagram[range], payload);
             }
         }
     }

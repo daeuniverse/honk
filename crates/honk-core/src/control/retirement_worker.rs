@@ -437,6 +437,7 @@ mod tests {
         ] {
             let job = Retirement::Udp(EndpointRemoval {
                 scope,
+                packet_lineage: None,
                 client,
                 dst,
                 owner,

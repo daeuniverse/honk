@@ -108,7 +108,7 @@ fn test_domain_suffix_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -141,7 +141,7 @@ fn test_sniffed_domain_miss_falls_through_to_ip_rule() {
             outbound: RoutingOutbound::Simple("proxy".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         },
         RoutingRule {
             name: "https-by-port".into(),
@@ -152,7 +152,7 @@ fn test_sniffed_domain_miss_falls_through_to_ip_rule() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 1,
             must: false,
-            mark: 0,
+            mark: None,
         },
     ];
     let router = Router::new(&rules, "block").unwrap();
@@ -182,7 +182,7 @@ fn test_ip_cidr_route() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -226,7 +226,7 @@ fn test_port_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -271,7 +271,7 @@ fn test_priority_ordering() {
             outbound: RoutingOutbound::Simple("proxy1".into()),
             priority: 100,
             must: false,
-            mark: 0,
+            mark: None,
         },
         RoutingRule {
             name: "high-priority".into(),
@@ -282,7 +282,7 @@ fn test_priority_ordering() {
             outbound: RoutingOutbound::Simple("proxy2".into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         },
     ];
 
@@ -332,7 +332,7 @@ fn test_geosite_cn_route() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -398,7 +398,7 @@ fn test_mac_route_matching() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -437,7 +437,7 @@ fn test_process_name_route_matching() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -463,7 +463,7 @@ fn test_mac_and_process_name_combined() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -520,7 +520,7 @@ fn test_domain_exact_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -543,7 +543,7 @@ fn test_domain_keyword_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -566,7 +566,7 @@ fn test_domain_regex_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -589,7 +589,7 @@ fn test_domain_glob_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -612,7 +612,7 @@ fn test_source_ip_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -635,7 +635,7 @@ fn test_source_port_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -658,7 +658,7 @@ fn test_protocol_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -681,7 +681,7 @@ fn test_ip_version_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -703,7 +703,7 @@ fn test_mixed_family_ip_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -729,7 +729,7 @@ fn test_dscp_route() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -755,7 +755,7 @@ fn test_geoip_private_route() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -858,7 +858,7 @@ fn test_geosite_route() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -955,7 +955,7 @@ fn test_must_flag_on_rule() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: true,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "proxy").unwrap();
@@ -978,7 +978,7 @@ fn test_route_action_must() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: 0,
             must: true,
-            mark: 0,
+            mark: None,
         },
         RoutingRule {
             name: "plain-proxy".into(),
@@ -989,7 +989,7 @@ fn test_route_action_must() {
             outbound: RoutingOutbound::Simple("proxy".into()),
             priority: 1,
             must: false,
-            mark: 0,
+            mark: None,
         },
     ];
     let router = Router::new(&rules, "proxy").unwrap();
@@ -1022,7 +1022,7 @@ fn test_mark_propagation() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 42,
+        mark: Some(42),
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -1030,7 +1030,7 @@ fn test_mark_propagation() {
     conn.dst_port = 443;
     let result = router.route_full(&conn).unwrap();
     assert_eq!(result.action.outbound, "proxy");
-    assert_eq!(result.action.mark.map(DirectMark::get), Some(42));
+    assert_eq!(result.action.mark, Some(42));
 }
 
 #[test]
@@ -1062,11 +1062,32 @@ fn terminal_direct_mark_indexes_are_deduplicated_and_generation_owned() {
     );
 
     let mut changed = config.routing.rules;
-    changed[0].mark = 1;
+    changed[0].mark = Some(1);
     let replacement = Router::new(&changed, "direct").unwrap();
     assert_eq!(replacement.direct_mark(0), Some(1));
     assert_eq!(router.direct_mark(0), Some(512));
     assert_eq!(router.clone().direct_mark(1), Some(0x3fff_ffff));
+}
+
+#[test]
+fn explicit_zero_keeps_canonical_identity_without_a_legacy_mark_slot() {
+    let build = |effect: &str| {
+        let config = honk_config::parser::parse_dae_config(&format!(
+            "routing {{ dport(53) -> {effect}\n fallback: {effect} }}"
+        ))
+        .unwrap();
+        Router::from_config(&config.routing).unwrap()
+    };
+    let keep = build("direct(must)");
+    let zero = build("direct(must, mark: 0)");
+    assert_eq!(keep.fallback().mark, None);
+    assert_eq!(zero.fallback().mark, Some(0));
+    assert_eq!(zero.compiled_routes()[0].action.mark, Some(0));
+    assert_ne!(keep.policy_fingerprint(), zero.policy_fingerprint());
+    assert!(!zero.has_direct_marks());
+    assert_eq!(zero.direct_mark(0), None);
+    assert_eq!(zero.fallback().direct_mark_index, None);
+    assert_eq!(zero.compiled_routes()[0].action.direct_mark_index, None);
 }
 
 #[test]
@@ -1081,7 +1102,7 @@ fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
             outbound: RoutingOutbound::Simple("direct".into()),
             priority: index,
             must: true,
-            mark: 0x3fff_ff00 + index,
+            mark: Some(0x3fff_ff00 + index),
         })
         .collect();
     let duplicate = rules[0].clone();
@@ -1089,11 +1110,11 @@ fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
     for index in 1..=257 {
         let mut ordinary = rules[0].clone();
         ordinary.must = false;
-        ordinary.mark = index;
+        ordinary.mark = Some(index);
         rules.push(ordinary);
         let mut proxy = rules[0].clone();
         proxy.outbound = RoutingOutbound::Simple("proxy".into());
-        proxy.mark = index;
+        proxy.mark = Some(index);
         rules.push(proxy);
     }
     let router = Router::new(&rules, "direct").unwrap();
@@ -1107,7 +1128,7 @@ fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
     assert_eq!(
         plan.rules
             .iter()
-            .find(|rule| rule.action.mark == 0x3fff_ffff)
+            .find(|rule| rule.action.mark == Some(0x3fff_ffff))
             .unwrap()
             .action
             .direct_mark_index,
@@ -1116,7 +1137,7 @@ fn terminal_direct_mark_capacity_counts_distinct_terminal_marks_only() {
     assert_eq!(router.direct_mark(0), Some(0x3fff_ff00));
     assert_eq!(router.direct_mark(255), Some(0x3fff_ffff));
     let mut excess = rules[0].clone();
-    excess.mark = 1;
+    excess.mark = Some(1);
     rules.push(excess);
     assert!(Router::new(&rules, "direct").is_err());
 }
@@ -1137,11 +1158,7 @@ fn parsed_marked_fallback_routes_unmatched_ipv4_and_ipv6() {
             connection.dst_port = 80;
             let (action, matched) = router.route_action(&connection);
             assert_eq!(
-                (
-                    action.outbound.as_str(),
-                    action.must,
-                    action.mark.map(DirectMark::get)
-                ),
+                (action.outbound.as_str(), action.must, action.mark),
                 ("direct", true, Some(512))
             );
             assert!(matched.is_none());
@@ -1164,7 +1181,7 @@ fn test_combined_conditions_and_semantics() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
 
     let router = Router::new(&rules, "direct").unwrap();
@@ -1255,7 +1272,7 @@ fn geosite_policy_fingerprint_covers_the_exact_expansion() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::new(&rules, "proxy").unwrap();
     let requirements = GeoRequirements::for_traffic(&rules);
@@ -1292,7 +1309,7 @@ fn test_domain_bitmap_does_not_claim_default_as_match() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::new(&rules, "🍥 final").unwrap();
     assert_eq!(router.domain_predicate_count(), 1);
@@ -1336,7 +1353,7 @@ fn domain_bitmap_covers_full_regex_and_negative_compound_conditions() {
         outbound: RoutingOutbound::Simple("proxy".into()),
         priority: 0,
         must: false,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::new(&rules, "direct").unwrap();
     assert_eq!(router.domain_predicate_count(), 2);
@@ -1377,7 +1394,7 @@ mod negation {
             outbound: RoutingOutbound::Simple(outbound.into()),
             priority: 0,
             must: false,
-            mark: 0,
+            mark: None,
         }
     }
 
@@ -1568,7 +1585,7 @@ mod negation {
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: true,
-                mark: 0,
+                mark: None,
             },
             RoutingRule {
                 name: "catch-all".into(),
@@ -1579,7 +1596,7 @@ mod negation {
                 outbound: RoutingOutbound::Simple("proxy".into()),
                 priority: 1,
                 must: false,
-                mark: 0,
+                mark: None,
             },
         ];
         let router = Router::new(&rules, "block").unwrap();
@@ -1627,7 +1644,7 @@ fn bare_ip_in_dip_sip_parses_as_host_route() {
         outbound: RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: true,
-        mark: 0,
+        mark: None,
     }];
     let router = Router::new(&rules, "proxy").unwrap();
     let hit = |ip: &str, sip: &str| {

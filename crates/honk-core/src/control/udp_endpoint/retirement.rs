@@ -87,6 +87,7 @@ pub(crate) enum RemovalReason {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct EndpointRemoval {
     pub(crate) scope: ScopeId,
+    pub(crate) packet_lineage: Option<NonZeroU64>,
     pub(crate) client: SocketAddr,
     pub(crate) dst: SocketAddr,
     pub(in crate::control) owner: UdpFlowOwner,
@@ -118,7 +119,15 @@ impl UdpEndpointPool {
     ) -> Result<Option<String>, ()> {
         let entry = self
             .endpoints
-            .get(&EndpointKey::new(scope, client, dst))
+            .get(&EndpointKey::new(
+                scope,
+                client,
+                dst,
+                endpoint
+                    .packet_source()
+                    .and_then(SourceWork::optional_context)
+                    .map(|source| source.lineage),
+            ))
             .ok_or(())?;
         if !matches!(entry.value(), EndpointEntry::Ready(ready)
             if ready.generation == generation && ready.owner.token == token
@@ -139,6 +148,10 @@ impl UdpEndpointPool {
                 action: crate::connection_tracker::CloseAction::Udp {
                     pool: Arc::downgrade(self),
                     scope,
+                    packet_lineage: endpoint
+                        .packet_source()
+                        .and_then(SourceWork::optional_context)
+                        .map(|source| source.lineage),
                     client,
                     destination: dst,
                     token,
@@ -156,8 +169,9 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         token: u32,
         generation: u64,
+        packet_lineage: Option<NonZeroU64>,
     ) -> bool {
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(scope, client, dst, packet_lineage);
         self.close_if_same(key, token, generation)
             || self.endpoints.get(&key).is_some_and(|entry| {
                 matches!(entry.value(), EndpointEntry::Retiring { generation: found, owner, .. }
@@ -172,6 +186,7 @@ impl UdpEndpointPool {
                 removal.scope,
                 removal.client,
                 removal.dst,
+                removal.packet_lineage,
             ))
             .and_then(|entry| match entry.value() {
                 EndpointEntry::Retiring { io, .. } if removal.matches(entry.value()) => io.clone(),
@@ -190,6 +205,7 @@ impl UdpEndpointPool {
                 removal.scope,
                 removal.client,
                 removal.dst,
+                removal.packet_lineage,
             ))
             .and_then(|entry| match entry.value() {
                 EndpointEntry::Retiring { io, .. } if removal.matches(entry.value()) => io.clone(),
@@ -201,6 +217,7 @@ impl UdpEndpointPool {
                 removal.scope,
                 removal.client,
                 removal.dst,
+                removal.packet_lineage,
             ))
             && let EndpointEntry::Retiring {
                 native_terminal: Some(terminal),
@@ -217,6 +234,7 @@ impl UdpEndpointPool {
                 removal.dst,
                 removal.owner,
                 removal.generation,
+                removal.packet_lineage,
             );
         if let Some(io) = io {
             io.close.finish(acknowledged);
@@ -261,6 +279,7 @@ impl UdpEndpointPool {
                 removal.dst,
                 removal.owner,
                 removal.generation,
+                removal.packet_lineage,
             );
             return;
         }
@@ -276,7 +295,7 @@ impl UdpEndpointPool {
 
     /// Begin exact retirement of the currently observed incarnation.
     pub fn remove(&self, scope: ScopeId, client: SocketAddr, dst: SocketAddr) {
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(scope, client, dst, None);
         let identity = self.endpoints.get(&key).and_then(|entry| {
             (!matches!(entry.value(), EndpointEntry::Retiring { .. }))
                 .then(|| (entry.value().owner().token, entry.value().generation()))
@@ -299,6 +318,7 @@ impl UdpEndpointPool {
         }
         let key = EndpointKey {
             scope: ScopeId::HOST,
+            packet_lineage: None,
             client_ip: unsafe { flow.src_ip.u6_addr8 },
             client_port: flow.src_port,
             dst_ip: unsafe { flow.dst_ip.u6_addr8 },
@@ -324,7 +344,7 @@ impl UdpEndpointPool {
     ) -> bool {
         decision_token != 0
             && self.retire_if_same(
-                EndpointKey::new(scope, client, dst),
+                EndpointKey::new(scope, client, dst, None),
                 decision_token,
                 generation,
             )
@@ -375,10 +395,16 @@ impl UdpEndpointPool {
                     EndpointEntry::Ready(entry) => entry.memory.clone(),
                     EndpointEntry::Retiring { .. } => None,
                 };
+                let packet_source = match occupied.get() {
+                    EndpointEntry::Initializing(entry) => entry.packet_source.clone(),
+                    EndpointEntry::Ready(entry) => entry.endpoint.packet_source().cloned(),
+                    EndpointEntry::Retiring { .. } => None,
+                };
                 occupied.insert(EndpointEntry::Retiring {
                     generation,
                     owner,
                     io,
+                    _packet_source: packet_source,
                     _memory: memory,
                     #[cfg(feature = "native-api")]
                     native_terminal,
@@ -392,6 +418,7 @@ impl UdpEndpointPool {
         drop(entry);
         self.notify_removed(EndpointRemoval {
             scope: key.scope,
+            packet_lineage: key.packet_lineage,
             client: SocketAddr::new(key.client_ip(), key.client_port),
             dst: SocketAddr::new(key.dst_ip(), key.dst_port),
             conn_id,
@@ -414,8 +441,9 @@ impl UdpEndpointPool {
         dst: SocketAddr,
         owner: UdpFlowOwner,
         generation: u64,
+        packet_lineage: Option<NonZeroU64>,
     ) -> bool {
-        let key = EndpointKey::new(scope, client, dst);
+        let key = EndpointKey::new(scope, client, dst, packet_lineage);
         let removed = match self.endpoints.entry(key) {
             dashmap::mapref::entry::Entry::Occupied(occupied)
                 if matches!(
@@ -436,11 +464,11 @@ impl UdpEndpointPool {
                 if let EndpointEntry::Retiring { io: Some(io), .. } = occupied.get() {
                     io.close.finish(true);
                 }
-                occupied.remove();
-                true
+                Some(occupied.remove())
             }
-            _ => false,
+            _ => None,
         };
+        let removed = removed.is_some();
         if removed && self.active_retirements.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.retirements_empty.notify_waiters();
         }

@@ -51,7 +51,7 @@ fn reclaimed_flow_retires_only_the_endpoint_of_that_incarnation() {
         );
         let other = "192.0.2.11:40000".parse().unwrap();
         assert!(!pool.retire_reclaimed(&flow(other, destination, 17), 7));
-        assert!(pool.contains(honk_datapath::ScopeId::HOST, client, destination));
+        assert!(pool.contains(honk_datapath::ScopeId::HOST, client, destination, None));
 
         assert_eq!(pool.retire_reclaimed(&udp, 7), incarnation.is_some());
         assert_eq!(pool.is_empty(), incarnation.is_some());

@@ -137,6 +137,10 @@ impl DesiredState {
                 deadline = Some(deadline.map_or(next, |current| current.min(next)));
             }
         }
+        #[cfg(feature = "ebpf")]
+        if let Some(next) = self.native_refresh.deadline() {
+            deadline = Some(deadline.map_or(next, |current| current.min(next)));
+        }
         deadline
     }
 }

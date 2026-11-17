@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::num::NonZeroU64;
 use std::ops::{BitOr, BitOrAssign, Range};
 use std::sync::Arc;
 use std::time::Instant;
@@ -11,7 +12,7 @@ use crate::flow::{self, Flow, FourTuple, Ports, Table, TimeWait};
 use crate::fragment::{FragmentLimits, Push};
 use crate::icmp_out::IcmpLimits;
 use crate::mode::{Mode, is_unicast};
-use crate::offload::{RxMeta, Transmit, TxCaps};
+use crate::offload::{RxMeta, SourceContext, Transmit, TxCaps};
 use crate::tcp::output::Output;
 use crate::tcp::ring::{self, Pool};
 use crate::tcp::{Tcb, TcpState, TcpStats};
@@ -174,21 +175,30 @@ pub enum ReceiveOutcome {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReceiveReport {
     pub source: Option<ValidatedSource>,
+    pub source_context: Option<SourceContext>,
     pub outcome: ReceiveOutcome,
 }
 
-pub(crate) struct SourceReport<F> {
+pub(crate) struct SourceReport<'a, F> {
     source: Option<ValidatedSource>,
+    pub(crate) context: Option<SourceContext>,
+    source_context: Option<SourceContext>,
     pub(crate) outcome: ReceiveOutcome,
     accept: F,
+    pub(crate) half_open: Option<&'a mut dyn FnMut(IpAddr) -> bool>,
+    service_at: Option<Instant>,
 }
 
-impl<F: FnMut(ValidatedSource) -> bool> SourceReport<F> {
-    fn new(accept: F) -> Self {
+impl<F: FnMut(ValidatedSource, Option<SourceContext>) -> bool> SourceReport<'_, F> {
+    fn new(context: Option<SourceContext>, accept: F) -> Self {
         Self {
             source: None,
+            context,
+            source_context: None,
             outcome: ReceiveOutcome::Unqualified,
             accept,
+            half_open: None,
+            service_at: None,
         }
     }
 
@@ -207,7 +217,8 @@ impl<F: FnMut(ValidatedSource) -> bool> SourceReport<F> {
                 tcp_flags,
             };
             self.source = Some(source);
-            (self.accept)(source)
+            self.source_context = self.context;
+            (self.accept)(source, self.context)
         } else {
             true
         }
@@ -318,8 +329,25 @@ pub(crate) struct Control {
     /// An ICMP error for a refused SYN instead of a TCP segment.
     pub(crate) icmp: Option<Refuse>,
     pub(crate) flow: Option<FlowId>,
+    pub(crate) source: Option<SourceContext>,
 }
 const CONTROL_LIMIT: usize = 128;
+
+/// A sharded owner borrows its realm's ICMP limiter only for actual ICMP output.
+pub enum AccountedTransmit {
+    Packet(Transmit),
+    NeedsIcmp,
+    Idle,
+}
+
+struct ShardResources {
+    control_limit: usize,
+    release_limit: usize,
+    icmp_class: Option<u8>,
+    reassembly_owner: bool,
+    fragment_output: Option<crate::FragmentInfo>,
+    half_open_released: VecDeque<FlowId>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConstructionError {
@@ -329,6 +357,8 @@ pub enum ConstructionError {
     Overflow,
     #[error("shared memory budget cannot fund stack capacity")]
     Capacity,
+    #[error("source context preparation requires an unused stack")]
+    InUse,
 }
 
 pub struct Stack {
@@ -362,6 +392,7 @@ pub struct Stack {
     pub(crate) counters: StackStats,
     pub(crate) reasm: crate::fragment::Reassembler,
     pub(crate) accepting: bool,
+    shard: Option<Box<ShardResources>>,
     // Declared last: every funded collection and the TCP pool are dropped before the refund.
     overhead: Option<MemoryReservation>,
 }
@@ -413,6 +444,7 @@ impl Stack {
             half_open_by_source: HashMap::new(),
             counters: StackStats::default(),
             accepting: true,
+            shard: None,
             overhead: None,
         }
     }
@@ -424,13 +456,60 @@ impl Stack {
         now: Instant,
         max_slots: usize,
     ) -> Result<Self, ConstructionError> {
+        Self::new_accounted_inner(cfg, now, max_slots, None)
+    }
+
+    /// Creates one exact owner of a realm. Flow, slot and TCP-memory shares are supplied
+    /// by the caller; control capacity is partitioned here and only owner zero reassembles.
+    pub fn new_accounted_shard(
+        mut cfg: Config,
+        now: Instant,
+        max_slots: usize,
+        worker: usize,
+        workers: usize,
+        udp_pending: Arc<MemoryBudget>,
+    ) -> Result<Self, ConstructionError> {
+        if !matches!(workers, 1 | 2)
+            || worker >= workers
+            || udp_pending.limit() != crate::udp_t::MAX_PENDING_BYTES
+        {
+            return Err(ConstructionError::Capacity);
+        }
+        if worker != 0 {
+            cfg.fragment_limits.max_entries = 0;
+            cfg.fragment_limits.max_bytes = 0;
+        }
+        let shard = ShardResources {
+            control_limit: CONTROL_LIMIT / workers + usize::from(worker < CONTROL_LIMIT % workers),
+            release_limit: max_slots,
+            icmp_class: None,
+            reassembly_owner: worker == 0,
+            fragment_output: None,
+            half_open_released: VecDeque::new(),
+        };
+        let mut stack = Self::new_accounted_inner(cfg, now, max_slots, Some(shard))?;
+        stack.udp_tx.with_pending_budget(udp_pending);
+        Ok(stack)
+    }
+
+    fn new_accounted_inner(
+        cfg: Config,
+        now: Instant,
+        max_slots: usize,
+        shard: Option<ShardResources>,
+    ) -> Result<Self, ConstructionError> {
         let budget = cfg
             .shared_budget
             .as_ref()
             .ok_or(ConstructionError::MissingBudget)?;
-        let bound = Self::overhead_bound(&cfg, max_slots).ok_or(ConstructionError::Overflow)?;
+        let bound = Self::overhead_bound(&cfg, max_slots, shard.as_ref())
+            .ok_or(ConstructionError::Overflow)?;
         let overhead = budget.reserve(bound).ok_or(ConstructionError::Capacity)?;
         let mut stack = Self::new(cfg, now);
+        stack.shard = shard.map(|mut shard| {
+            shard.half_open_released = VecDeque::with_capacity(shard.release_limit);
+            Box::new(shard)
+        });
         stack.table = Table::bounded(max_slots);
         stack.floor_cap = stack.floor_cap.min(max_slots as u32);
         let floors = stack.floor_cap as usize * ring::floor(stack.cfg.chunk());
@@ -442,9 +521,40 @@ impl Stack {
         Ok(stack)
     }
 
+    /// Exact lifecycle deltas; drain before admitting another SYN or reaping adapter slots.
+    pub fn poll_half_open_released(&mut self) -> Option<FlowId> {
+        self.shard.as_mut()?.half_open_released.pop_front()
+    }
+
+    pub(crate) fn half_open_release_room(&self) -> bool {
+        self.shard.as_ref().is_none_or(|shard| {
+            shard.half_open_released.len() + (self.half_open as usize) < shard.release_limit
+        })
+    }
+
+    pub(crate) fn has_realm_resources(&self) -> bool {
+        self.shard.is_some()
+    }
+
     /// Fixed conservative capacity reservation, not measured resident memory or RSS.
     pub fn overhead_reserved(&self) -> usize {
-        self.overhead.as_ref().map_or(0, MemoryReservation::bytes)
+        self.overhead.as_ref().map_or(0, MemoryReservation::bytes) + self.table.source_reserved()
+    }
+
+    /// Funds fixed contextual flow storage before input, without changing ordinary stacks.
+    /// Requires a shared budget and an empty, quiescent table. Unbounded embeddings opt in
+    /// to `Config::max_flows` as their slab-slot ceiling; accounted stacks keep their ceiling.
+    pub fn prepare_source_context(&mut self) -> Result<(), ConstructionError> {
+        let budget = self
+            .cfg
+            .shared_budget
+            .as_ref()
+            .ok_or(ConstructionError::MissingBudget)?;
+        if !self.is_quiescent() {
+            return Err(ConstructionError::InUse);
+        }
+        self.table
+            .prepare_sources(self.cfg.max_flows as usize, budget)
     }
 
     /// Gates only new passive TCP admission; existing delivery and output remain active.
@@ -462,7 +572,11 @@ impl Stack {
             && self.reasm.is_quiescent()
     }
 
-    fn overhead_bound(cfg: &Config, max_slots: usize) -> Option<usize> {
+    fn overhead_bound(
+        cfg: &Config,
+        max_slots: usize,
+        shard: Option<&ShardResources>,
+    ) -> Option<usize> {
         use crate::budget::collection_peak;
         u32::try_from(max_slots).ok()?;
         let tcp = max_slots
@@ -484,14 +598,22 @@ impl Stack {
             .checked_add(tcp.checked_mul(Tcb::overhead_bound()?)?)?
             .checked_add(collection_peak::<FlowId>(queues)?.checked_mul(6)?)?
             .checked_add(Timers::overhead_bound(max_slots)?)?
-            .checked_add(collection_peak::<Control>(CONTROL_LIMIT)?)?
-            .checked_add(crate::icmp_out::IcmpOut::overhead_bound(cfg.icmp_limits)?)?
-            .checked_add(crate::fragment::Reassembler::overhead_bound(
-                cfg.fragment_limits,
+            .checked_add(collection_peak::<Control>(
+                shard.map_or(CONTROL_LIMIT, |s| s.control_limit),
             )?)?
-            .checked_add(crate::fragment::Reassembler::scratch_bound(
-                cfg.fragment_limits,
-            )?)?
+            .checked_add(if shard.is_none() {
+                crate::icmp_out::IcmpOut::overhead_bound(cfg.icmp_limits)?
+            } else {
+                std::mem::size_of::<ShardResources>()
+                    .checked_add(collection_peak::<FlowId>(max_slots)?)?
+            })?
+            .checked_add(if shard.is_some_and(|shard| !shard.reassembly_owner) {
+                0
+            } else {
+                crate::fragment::Reassembler::overhead_bound(cfg.fragment_limits)?.checked_add(
+                    crate::fragment::Reassembler::scratch_bound(cfg.fragment_limits)?,
+                )?
+            })?
             .checked_add(crate::udp_t::UdpTx::overhead_bound(usize::from(mtu))?)?
             .checked_add(Pool::overhead_bound(cfg.memory_limit)?)?
             .checked_add(prefixes)
@@ -507,7 +629,7 @@ impl Stack {
             now,
             packet,
             RxMeta::VERIFY,
-            &mut SourceReport::new(|_| true),
+            &mut SourceReport::new(None, |_, _| true),
         )
     }
 
@@ -542,19 +664,120 @@ impl Stack {
         now: Instant,
         packet: &[u8],
         meta: RxMeta,
-        on_source: impl FnMut(ValidatedSource) -> bool,
+        mut on_source: impl FnMut(ValidatedSource) -> bool,
+    ) -> (Rx, ReceiveReport) {
+        self.receive_reporting(now, packet, meta, None, |source, _| on_source(source))
+    }
+
+    /// Carries an embedding's immutable source identity through actual protocol owners.
+    /// Completed reassembly and existing TCP input report their original retained snapshot.
+    /// Call `prepare_source_context` first; unprepared input is refused without mutation.
+    pub fn receive_with_context(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        meta: RxMeta,
+        context: SourceContext,
+        mut on_source: impl FnMut(ValidatedSource, SourceContext) -> bool,
+    ) -> (Rx, ReceiveReport) {
+        if !self.table.has_sources() {
+            return (
+                self.drop_packet(DropReason::Capacity),
+                ReceiveReport::default(),
+            );
+        }
+        self.receive_reporting(now, packet, meta, Some(context), |source, context| {
+            on_source(
+                source,
+                context.expect("contextual input retains its source"),
+            )
+        })
+    }
+
+    fn receive_reporting(
+        &mut self,
+        now: Instant,
+        packet: &[u8],
+        meta: RxMeta,
+        context: Option<SourceContext>,
+        on_source: impl FnMut(ValidatedSource, Option<SourceContext>) -> bool,
     ) -> (Rx, ReceiveReport) {
         self.now = now;
         self.counters.rx_packets += 1;
-        let mut report = SourceReport::new(on_source);
+        let mut report = SourceReport::new(context, on_source);
         let rx = self.receive_packet::<true>(now, packet, meta, &mut report);
         (
             rx,
             ReceiveReport {
                 source: report.source,
+                source_context: report.source_context,
                 outcome: report.outcome,
             },
         )
+    }
+
+    /// Physical shard receive; the caller services due timers and drains lifecycle deltas
+    /// before this call and after binding any returned `TcpNew` grant.
+    pub fn receive_with_realm_admission(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        packet: &[u8],
+        meta: RxMeta,
+        mut on_source: impl FnMut(ValidatedSource) -> bool,
+        mut on_half_open: impl FnMut(IpAddr) -> bool,
+    ) -> (Rx, ReceiveReport) {
+        self.now = ingress_at;
+        self.counters.rx_packets += 1;
+        let mut report = SourceReport::new(None, |source, _| on_source(source));
+        report.half_open = Some(&mut on_half_open);
+        report.service_at = Some(service_at);
+        let rx = self.receive_packet::<true>(ingress_at, packet, meta, &mut report);
+        self.now = service_at;
+        (
+            rx,
+            ReceiveReport {
+                source: report.source,
+                source_context: report.source_context,
+                outcome: report.outcome,
+            },
+        )
+    }
+
+    /// Owner zero reassembles before selecting the completed datagram's transport owner.
+    /// Complete bytes remain charged; this method never mutates TCP or UDP state.
+    pub fn reassemble_for_dispatch(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        packet: &[u8],
+    ) -> Result<crate::ReassemblyReport, crate::FragmentError> {
+        if !self.transparent() {
+            return Err(DropReason::Fragment.into());
+        }
+        if self
+            .shard
+            .as_ref()
+            .is_some_and(|shard| !shard.reassembly_owner)
+        {
+            return Err(DropReason::Fragment.into());
+        }
+        let fragment = wire::frag::parse(packet).map_err(DropReason::from)?;
+        if let Some(reason) = self.refuses(fragment.src, fragment.dst) {
+            return Err(reason.into());
+        }
+        self.reasm
+            .push_for_dispatch_at(ingress_at, service_at, fragment)
+    }
+
+    /// Includes live assemblies, tombstones and queued timeout quotes in this exact owner.
+    pub fn retains_fragment(&self, fragment: crate::FragmentInfo) -> bool {
+        self.reasm.retains_fragment(fragment)
+    }
+
+    /// Read immediately after a successful pull, before installing the output's sidecar.
+    pub fn take_fragment_output(&mut self) -> Option<crate::FragmentInfo> {
+        self.shard.as_mut()?.fragment_output.take()
     }
 
     /// Receives one IP packet with what the driver knows about it: a trusted L4 checksum
@@ -572,7 +795,7 @@ impl Stack {
     pub fn receive_with(&mut self, now: Instant, packet: &[u8], meta: RxMeta) -> Rx {
         self.now = now;
         self.counters.rx_packets += 1;
-        self.receive_packet::<false>(now, packet, meta, &mut SourceReport::new(|_| true))
+        self.receive_packet::<false>(now, packet, meta, &mut SourceReport::new(None, |_, _| true))
     }
 
     fn receive_packet<const REPORT: bool>(
@@ -580,7 +803,7 @@ impl Stack {
         now: Instant,
         packet: &[u8],
         meta: RxMeta,
-        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
+        report: &mut SourceReport<'_, impl FnMut(ValidatedSource, Option<SourceContext>) -> bool>,
     ) -> Rx {
         if meta != RxMeta::VERIFY && !self.transparent() {
             return self.drop_packet(DropReason::Unsupported);
@@ -588,6 +811,13 @@ impl Stack {
         let ip = match wire::parse_ip(packet) {
             Ok(ip) => ip,
             Err(ParseError::Fragment) if self.transparent() => {
+                if self
+                    .shard
+                    .as_ref()
+                    .is_some_and(|shard| !shard.reassembly_owner)
+                {
+                    return self.drop_packet(DropReason::Fragment);
+                }
                 if meta.gso.is_some() {
                     return self.drop_packet(DropReason::Malformed);
                 }
@@ -598,12 +828,22 @@ impl Stack {
                 if let Some(reason) = self.refuses(fragment.src, fragment.dst) {
                     return self.drop_packet(reason);
                 }
-                return match self.reasm.push(now, fragment) {
-                    Push::Pending => Rx::Consumed,
+                let pushed = match report.service_at {
+                    Some(service_at) => {
+                        self.reasm
+                            .push_at(now, service_at, fragment, report.context)
+                    }
+                    None => self.reasm.push(now, fragment, report.context),
+                };
+                return match pushed {
+                    Push::Pending(_) => Rx::Consumed,
                     Push::Dropped(reason) => self.drop_packet(reason),
                     // The whole datagram goes through the normal checks, destination included,
                     // and its checksum is verified: no fragment's metadata vouches for the rest.
                     Push::Complete(r) => {
+                        report.context = r.source;
+                        let now = r.packet.completion_ingress();
+                        self.now = now;
                         let rx = match wire::parse_ip(&r.packet) {
                             Ok(ip) => self.receive_ip::<REPORT>(
                                 now,
@@ -629,7 +869,7 @@ impl Stack {
         ip: wire::IpPacket,
         packet: &[u8],
         meta: RxMeta,
-        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
+        report: &mut SourceReport<'_, impl FnMut(ValidatedSource, Option<SourceContext>) -> bool>,
     ) -> Rx {
         if let Some(reason) = self.refuses(ip.src, ip.dst) {
             return self.drop_packet(reason);
@@ -665,7 +905,7 @@ impl Stack {
         ip: &wire::IpPacket,
         packet: &[u8],
         meta: RxMeta,
-        report: &mut SourceReport<impl FnMut(ValidatedSource) -> bool>,
+        report: &mut SourceReport<'_, impl FnMut(ValidatedSource, Option<SourceContext>) -> bool>,
     ) -> Rx {
         let seg = &packet[ip.payload.clone()];
         let (h, off) = match wire::tcp::parse(seg) {
@@ -678,14 +918,6 @@ impl Stack {
         };
         if verify && !wire::tcp::verify_checksum(ip.src, ip.dst, seg) {
             return self.drop_packet(DropReason::Checksum);
-        }
-        if !report.record::<REPORT>(
-            SocketAddr::new(ip.src, h.src_port),
-            SocketAddr::new(ip.dst, h.dst_port),
-            wire::PROTO_TCP,
-            Some(h.flags),
-        ) {
-            return self.drop_packet(DropReason::NotForUs);
         }
         let tuple = FourTuple {
             local: SocketAddr::new(ip.dst, h.dst_port),
@@ -701,6 +933,28 @@ impl Stack {
             })
             .map(|(_, id)| id.idx)
             .or_else(|| self.table.tcp.get(&tuple).copied());
+        let reopen = self.timewait_reopen(tuple, &h);
+        let owner = index.or_else(|| {
+            if reopen.is_none() {
+                self.table.timewait.get(&tuple).copied()
+            } else {
+                None
+            }
+        });
+        let same_source = owner.is_none_or(|index| {
+            let original = self.table.source(index);
+            let same = original.map(|source| source.lineage)
+                == report.context.map(|source| source.lineage);
+            if same {
+                report.context = original;
+            }
+            same
+        });
+        if !report.record::<REPORT>(tuple.remote, tuple.local, wire::PROTO_TCP, Some(h.flags))
+            || !same_source
+        {
+            return self.drop_packet(DropReason::NotForUs);
+        }
         if let Some(index) = index {
             let slot = &mut self.table.slots[index as usize];
             let id = FlowId {
@@ -714,13 +968,12 @@ impl Stack {
                     report.outcome = ReceiveOutcome::TcpAccepted(id);
                 }
                 if let Some((seq, ack, flags)) = input.reset {
-                    self.control(tuple, seq, ack, flags, Some(id));
+                    self.control(tuple, seq, ack, flags, Some(id), report.context);
                 }
             }
             self.sync(index, now);
             return Rx::Consumed;
         }
-        let reopen = self.timewait_reopen(tuple, &h);
         if reopen.is_none()
             && let Some(&index) = self.table.timewait.get(&tuple)
         {
@@ -763,7 +1016,7 @@ impl Stack {
             return Rx::Consumed;
         }
         if self.transparent()
-            && let Some(rx) = self.passive_open(now, tuple, &h, ip.dscp, reopen)
+            && let Some(rx) = self.passive_open(now, tuple, &h, ip.dscp, reopen, report)
         {
             if REPORT
                 && matches!(rx, Rx::Consumed)
@@ -778,14 +1031,21 @@ impl Stack {
         }
         if h.flags & wire::tcp::RST == 0 {
             if h.flags & wire::tcp::ACK != 0 {
-                self.control(tuple, h.ack, 0, wire::tcp::RST, None);
+                self.control(tuple, h.ack, 0, wire::tcp::RST, None, report.context);
             } else {
                 let ack = h.seq.wrapping_add(
                     (seg.len() - off) as u32
                         + u32::from(h.flags & wire::tcp::SYN != 0)
                         + u32::from(h.flags & wire::tcp::FIN != 0),
                 );
-                self.control(tuple, 0, ack, wire::tcp::RST | wire::tcp::ACK, None);
+                self.control(
+                    tuple,
+                    0,
+                    ack,
+                    wire::tcp::RST | wire::tcp::ACK,
+                    None,
+                    report.context,
+                );
             }
         }
         self.drop_packet(DropReason::NoFlow)
@@ -813,12 +1073,23 @@ impl Stack {
         out: &mut [u8],
         caps: TxCaps,
     ) -> Option<Transmit> {
-        self.poll_transmit_filtered(now, out, caps, false)
+        match self.poll_transmit_filtered(now, out, caps, false, None) {
+            AccountedTransmit::Packet(tx) => Some(tx),
+            AccountedTransmit::NeedsIcmp | AccountedTransmit::Idle => None,
+        }
     }
 
     /// Pulls only protocol control output: no TCP payload or UDP datagrams/fragments.
     /// A driver reserves control credit before this call; payload readiness stays queued.
     pub fn poll_control_transmit(&mut self, now: Instant, out: &mut [u8]) -> Option<Transmit> {
+        self.prepare_control_queue();
+        match self.poll_transmit_filtered(now, out, TxCaps::NONE, true, None) {
+            AccountedTransmit::Packet(tx) => Some(tx),
+            AccountedTransmit::NeedsIcmp | AccountedTransmit::Idle => None,
+        }
+    }
+
+    fn prepare_control_queue(&mut self) {
         if self.control_ready.is_none() {
             let mut queue = VecDeque::with_capacity(self.ready.len());
             for &id in &self.ready {
@@ -833,7 +1104,21 @@ impl Stack {
             }
             self.control_ready = Some(queue);
         }
-        self.poll_transmit_filtered(now, out, TxCaps::NONE, true)
+    }
+
+    /// Retry `NeedsIcmp` under the realm's ICMP lock using the current service time.
+    /// No control or limiter state is consumed before that retry.
+    pub fn poll_transmit_accounted(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        control_only: bool,
+        icmp: Option<&mut crate::IcmpState>,
+    ) -> AccountedTransmit {
+        if control_only {
+            self.prepare_control_queue();
+        }
+        self.poll_transmit_filtered(now, out, TxCaps::NONE, control_only, icmp)
     }
 
     fn poll_transmit_filtered(
@@ -842,28 +1127,66 @@ impl Stack {
         out: &mut [u8],
         caps: TxCaps,
         control_only: bool,
-    ) -> Option<Transmit> {
+        mut icmp: Option<&mut crate::IcmpState>,
+    ) -> AccountedTransmit {
         self.now = now;
+        if let Some(shard) = &mut self.shard {
+            shard.fragment_output = None;
+        }
+        let icmp_retry = self.shard.is_some() && icmp.is_some();
+        let retry_class = if icmp_retry {
+            let Some(class) = self
+                .shard
+                .as_mut()
+                .and_then(|shard| shard.icmp_class.take())
+            else {
+                return AccountedTransmit::Idle;
+            };
+            Some(class)
+        } else {
+            None
+        };
         let caps = if self.transparent() && !control_only {
             caps
         } else {
             TxCaps::NONE
         };
         let mut tx = Transmit::plain(0);
-        let first_class = if control_only {
+        let first_class = if let Some(class) = retry_class {
+            class
+        } else if control_only {
             self.control_class
         } else {
             self.class
         };
-        for step in 0..5 {
+        for step in 0..if icmp_retry { 1 } else { 5 } {
             let class = (first_class + step) % 5;
+            let needs_icmp = (class == 0
+                && self.controls.front().is_some_and(|c| c.icmp.is_some()))
+                || (class == 4 && self.reasm.pending_icmp());
+            if self.shard.is_some() && icmp.is_none() && needs_icmp {
+                self.shard.as_mut().expect("sharded output").icmp_class = Some(class);
+                return AccountedTransmit::NeedsIcmp;
+            }
             let result = match class {
-                0 => self.emit_control(now, out, &mut tx),
+                0 => self.emit_control(now, out, &mut tx, &mut icmp),
                 1 => self.emit_timewait(now, out, &mut tx),
                 2 => self.emit_flow(now, out, caps, &mut tx, control_only),
-                3 if !control_only => self.poll_udp_frag(out),
+                3 if !control_only => self.poll_udp_frag(out, &mut tx),
                 3 => Output::None,
-                _ => self.reasm.poll_icmp(now, &mut self.icmp_out, out),
+                _ => match &mut self.shard {
+                    Some(shard) => {
+                        let (output, fragment) = self.reasm.poll_icmp_with_fragment(
+                            now,
+                            icmp.as_deref_mut().unwrap_or(&mut self.icmp_out),
+                            out,
+                            &mut tx,
+                        );
+                        shard.fragment_output = fragment;
+                        output
+                    }
+                    None => self.reasm.poll_icmp(now, &mut self.icmp_out, out, &mut tx),
+                },
             };
             match result {
                 Output::Sent(n) => {
@@ -877,22 +1200,32 @@ impl Stack {
                         self.counters.tx_packets += 1;
                     }
                     tx.len = n;
-                    return Some(tx);
+                    return AccountedTransmit::Packet(tx);
                 }
-                Output::Blocked => return None,
+                Output::Blocked => return AccountedTransmit::Idle,
                 Output::Deferred | Output::None => {}
             }
         }
-        None
+        AccountedTransmit::Idle
     }
 
-    fn emit_control(&mut self, now: Instant, out: &mut [u8], tx: &mut Transmit) -> Output {
+    fn emit_control(
+        &mut self,
+        now: Instant,
+        out: &mut [u8],
+        tx: &mut Transmit,
+        icmp: &mut Option<&mut crate::IcmpState>,
+    ) -> Output {
         while let Some(c) = self.controls.front().copied() {
+            if icmp.is_some() && c.icmp.is_none() {
+                return Output::None;
+            }
             if let Some(how) = c.icmp {
-                match self.emit_refusal(now, &c, how, out) {
+                match self.emit_refusal(now, &c, how, out, icmp) {
                     Output::None => continue,
                     Output::Sent(n) => {
                         tx.flow = c.flow;
+                        tx.source = c.source;
                         return Output::Sent(n);
                     }
                     result => return result,
@@ -918,6 +1251,7 @@ impl Stack {
                 Some(n) => {
                     self.controls.pop_front();
                     tx.flow = c.flow;
+                    tx.source = c.source;
                     Output::Sent(n)
                 }
                 None => Output::Blocked,
@@ -928,6 +1262,7 @@ impl Stack {
 
     fn emit_timewait(&mut self, now: Instant, out: &mut [u8], tx: &mut Transmit) -> Output {
         while let Some(id) = self.timewait_ready.front().copied() {
+            let source = self.table.source(id.idx);
             let slot = &mut self.table.slots[id.idx as usize];
             if slot.generation != id.generation || !matches!(slot.flow, Some(Flow::TimeWait(_))) {
                 self.timewait_ready.pop_front();
@@ -970,6 +1305,7 @@ impl Stack {
                         idx: id.idx,
                         generation: t.handle_generation,
                     });
+                    tx.source = source;
                     t.ack_due = false;
                     self.timewait_ready.pop_front();
                     Output::Sent(n)
@@ -1000,6 +1336,7 @@ impl Stack {
                 self.ready.pop_front()
             };
             let Some(id) = id else { break };
+            let source = self.table.source(id.idx);
             let slot = &mut self.table.slots[id.idx as usize];
             let queued = if control_only {
                 slot.on_control
@@ -1031,6 +1368,7 @@ impl Stack {
             match result {
                 Output::Sent(n) => {
                     tx.flow = Some(id);
+                    tx.source = source;
                     if control_only {
                         slot.on_control = true;
                         self.control_ready.as_mut().unwrap().push_back(id);
@@ -1285,19 +1623,53 @@ impl Stack {
             || self.controls.iter().any(|control| control.flow == Some(id))
     }
 
+    /// Visits actual retained owners, including killed fragment identity tombstones.
+    /// The visitor must not re-enter the embedding's owner; repeated contexts are allowed.
+    pub fn visit_retained_source_contexts(&self, mut visit: impl FnMut(SourceContext)) {
+        for (index, slot) in self.table.slots.iter().enumerate() {
+            if matches!(slot.flow, Some(Flow::Tcp(_) | Flow::TimeWait(_)))
+                && let Some(source) = self.table.source(index as u32)
+            {
+                visit(source);
+            }
+        }
+        for control in &self.controls {
+            if let Some(source) = control.source {
+                visit(source);
+            }
+        }
+        self.udp_tx.visit_retained_source_contexts(&mut visit);
+        self.reasm.visit_retained_source_contexts(visit);
+    }
+
     /// Read-only execution ownership through pending TCP, TIME_WAIT and flow-owned
     /// control output. This is not packet validation or admission authority.
     pub fn retains_tcp(&self, source: SocketAddr, destination: SocketAddr) -> bool {
+        self.retains_tcp_with_lineage(source, destination, None)
+    }
+
+    /// Selects only the requested source lineage; `None` selects non-contextual owners.
+    pub fn retains_tcp_with_lineage(
+        &self,
+        source: SocketAddr,
+        destination: SocketAddr,
+        lineage: Option<NonZeroU64>,
+    ) -> bool {
         let tuple = FourTuple {
             local: destination,
             remote: source,
         };
-        self.table.tcp.contains_key(&tuple)
-            || self.table.timewait.contains_key(&tuple)
-            || self
-                .controls
-                .iter()
-                .any(|control| control.flow.is_some() && control.tuple == tuple)
+        self.table
+            .tcp
+            .get(&tuple)
+            .into_iter()
+            .chain(self.table.timewait.get(&tuple))
+            .any(|&index| self.table.source(index).map(|source| source.lineage) == lineage)
+            || self.controls.iter().any(|control| {
+                control.flow.is_some()
+                    && control.tuple == tuple
+                    && control.source.map(|source| source.lineage) == lineage
+            })
     }
 
     /// Whether this peer still owns protocol state or an unpulled reply. Packets already
@@ -1335,6 +1707,26 @@ impl Stack {
                 .obligations()
                 .any(|(source, _, _)| source == address)
     }
+
+    /// Pending output for one original source lineage, excluding identity-only tombstones.
+    pub fn retains_source_output_with_lineage(&self, lineage: NonZeroU64) -> bool {
+        self.table.slots.iter().enumerate().any(|(index, slot)| {
+            self.table
+                .source(index as u32)
+                .is_some_and(|source| source.lineage == lineage)
+                && match &slot.flow {
+                    Some(Flow::Tcp(_)) => slot.on_tx || slot.on_control,
+                    Some(Flow::TimeWait(t)) => t.ack_due,
+                    _ => false,
+                }
+        }) || self.controls.iter().any(|control| {
+            control
+                .source
+                .is_some_and(|source| source.lineage == lineage)
+        }) || self.udp_tx.retains_source_output_with_lineage(lineage)
+            || self.reasm.retains_source_output_with_lineage(lineage)
+    }
+
     pub fn tcp_stats(&self, id: FlowId) -> Option<TcpStats> {
         match self.table.get(id)? {
             Flow::Tcp(t) => Some(t.stats(self.pool.chunk())),
@@ -1407,6 +1799,10 @@ impl Stack {
         }
         if let Some(source) = left_half_open {
             self.leave_half_open(source);
+            if let Some(shard) = &mut self.shard {
+                assert!(shard.half_open_released.len() < shard.release_limit);
+                shard.half_open_released.push_back(id);
+            }
         }
         let retired = remove || compact.is_some();
         if remove {
@@ -1557,13 +1953,33 @@ impl Stack {
             self.timers.len() <= 2 * self.table.slots.len().max(16) + 1,
             "the timer heap outgrew its rebuild bound"
         );
-        assert!(self.controls.len() <= CONTROL_LIMIT);
+        assert!(
+            self.controls.len()
+                <= self
+                    .shard
+                    .as_ref()
+                    .map_or(CONTROL_LIMIT, |s| s.control_limit)
+        );
+        if let Some(shard) = &self.shard {
+            assert!(
+                shard.half_open_released.len() + self.half_open as usize <= shard.release_limit
+            );
+            for (index, id) in shard.half_open_released.iter().enumerate() {
+                assert!(
+                    !shard
+                        .half_open_released
+                        .iter()
+                        .skip(index + 1)
+                        .any(|other| other == id)
+                );
+            }
+        }
         self.reasm.check();
         self.udp_tx.check();
         assert!(self.stats().memory_committed <= self.cfg.memory_limit);
     }
 
-    /// After every flow, handle and TIME_WAIT entry is gone, nothing may remain charged.
+    /// After protocol release, only this Stack's retained fixed metadata may remain charged.
     #[cfg(feature = "fuzz-checks")]
     pub(crate) fn assert_released(&self) {
         self.check();
@@ -1580,7 +1996,11 @@ impl Stack {
         assert_eq!(self.stats().memory_committed, 0);
         self.pool.assert_idle();
         if let Some(budget) = &self.cfg.shared_budget {
-            assert_eq!(budget.used(), 0, "the shared budget still holds a charge");
+            assert_eq!(
+                budget.used(),
+                self.overhead_reserved(),
+                "the shared budget still holds dynamic work"
+            );
         }
     }
 
@@ -1591,6 +2011,7 @@ impl Stack {
         ack: u32,
         flags: u8,
         flow: Option<FlowId>,
+        source: Option<SourceContext>,
     ) {
         self.queue_control(Control {
             tuple,
@@ -1599,11 +2020,17 @@ impl Stack {
             flags,
             icmp: None,
             flow,
+            source,
         });
     }
 
     pub(crate) fn queue_control(&mut self, c: Control) {
-        if self.controls.len() == CONTROL_LIMIT {
+        if self.controls.len()
+            == self
+                .shard
+                .as_ref()
+                .map_or(CONTROL_LIMIT, |s| s.control_limit)
+        {
             self.counters.control_dropped += 1;
             return;
         }

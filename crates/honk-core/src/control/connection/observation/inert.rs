@@ -62,6 +62,14 @@ impl ConnectionObservation {
     }
 
     #[inline]
+    pub(in crate::control) fn packet_facts(
+        &mut self,
+        _facts: &honk_ebpf_common::host::HostSourceFacts,
+        _dscp: u8,
+    ) {
+    }
+
+    #[inline]
     pub(super) fn handoff(&mut self, _handoff: Option<&HandoffResult>, _expected: bool) {}
 
     #[inline]

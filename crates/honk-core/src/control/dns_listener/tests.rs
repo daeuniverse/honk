@@ -764,7 +764,7 @@ async fn packet_scoped_bound_dns_keeps_udp_and_each_tcp_frame_current() {
                     outbound: RoutingOutbound::Simple("block".into()),
                     priority: 0,
                     must: false,
-                    mark: 0,
+                    mark: None,
                 }],
                 "direct",
             )

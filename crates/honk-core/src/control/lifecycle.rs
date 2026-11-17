@@ -900,9 +900,12 @@ mod policy_capability_tests {
         let admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut plane = ControlPlane::new(
             config.clone(),
-            Box::new(crate::ebpf::userspace::UserspaceBackend::new(Arc::clone(
-                &admission,
-            ))),
+            Box::new(crate::ebpf::userspace::UserspaceBackend::new(
+                Arc::clone(&admission),
+                Arc::new(parking_lot::RwLock::new(
+                    crate::ebpf::PnameSupport::Unavailable,
+                )),
+            )),
             Router::new(&[], "direct")?,
             Arc::new(ProxyRegistry::default_resolver()?),
             DnsResolver::new(&config.dns)?,

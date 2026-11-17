@@ -400,7 +400,15 @@ impl UdpEndpointPool {
         outbound_tracker: OutboundTracker,
     ) -> UdpDriverHandle {
         let reply_socket = reply_socket.into().into_socket(scope);
-        let key = EndpointKey::new(scope, client_addr, client_dst);
+        let key = EndpointKey::new(
+            scope,
+            client_addr,
+            client_dst,
+            endpoint
+                .packet_source()
+                .and_then(SourceWork::optional_context)
+                .map(|source| source.lineage),
+        );
         let (ready_tx, ready) = oneshot::channel();
         let (start, start_rx) = oneshot::channel();
         let (first_ack_tx, first_ack) = oneshot::channel();
@@ -411,7 +419,12 @@ impl UdpEndpointPool {
                 debug!("UDP endpoint driver join failed: {}", error);
             }
         }
-        if drivers.closed {
+        if drivers.closed
+            || reply_socket.packet_source
+                != endpoint
+                    .packet_source()
+                    .and_then(SourceWork::optional_context)
+        {
             drop(ready_tx);
             drop(start_rx);
             drop(first_ack_tx);

@@ -24,7 +24,7 @@ For scalar settings, only an unquoted token-head `#` starts a comment. `use_host
 
 ## Standalone listener (`bind`)
 
-The standalone listener uses ordinary host-netns sockets, unmarked for TC/XDP and ordinary embeddings. With `backend: tun`, each listener strictly sets and reads back the effective `global.so_mark_from_dae` before bind/listen; accepted TCP children inherit it so remote replies escape capture. TUN resolves and retains hostname bind candidates before any routing change, then binds after its configured addresses exist. Answers from both standalone transports belong to TUN's actual registered packet realm, even on loopback/LAN binds; they do not populate HOST facts. Persistent TCP rechecks current packet admission per frame. Disabling the listener does not disable captured TCP/UDP port-53 DNS, which follows [traffic-rule ownership](./routing.md#outbound-targets-and-must) and the selected Direct execution profile. See [TUN DNS ownership](../design/dns.md#ingress-paths).
+The standalone listener uses ordinary host-netns sockets, unmarked for TC/XDP and ordinary embeddings. With `backend: tun`, listeners strictly set/read back the effective `global.so_mark_from_dae` before bind/listen; accepted TCP children inherit it. TUN retains hostname bind candidates before routing changes and binds after its addresses exist. Both standalone transports learn in the registered plain scope, including loopback/LAN binds; transparent DNS learns in its packet's own plain or Host scope. Neither borrows HOST facts. Persistent TCP rechecks admission per frame. Disabling the listener does not disable captured TCP/UDP port-53 DNS; see [TUN DNS ownership](../design/dns.md#ingress-paths).
 
 | Value | Result |
 | --- | --- |

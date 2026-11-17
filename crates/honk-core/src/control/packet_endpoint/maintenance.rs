@@ -473,7 +473,7 @@ mod tests {
         let scope = honk_datapath::ScopeId::allocate().unwrap();
         let client = "192.0.2.1:40000".parse().unwrap();
         let target = "192.0.2.2:443".parse().unwrap();
-        let key = PacketSnifferKey::new(scope, client, target);
+        let key = PacketSnifferKey::new(scope, client, target, None);
         assert_eq!(
             plane.sniffer_pool.feed_quic_initial(
                 key,

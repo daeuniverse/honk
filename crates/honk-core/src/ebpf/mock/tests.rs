@@ -398,7 +398,7 @@ fn routing_plan(tag: u8) -> crate::control::routing_matcher::RoutingPushPlan {
         outbound: honk_config::routing::RoutingOutbound::Simple("direct".into()),
         priority: 0,
         must: false,
-        mark: u32::from(tag),
+        mark: Some(u32::from(tag)),
     };
     let router = crate::routing::Router::new(&[rule], "direct").unwrap();
     crate::control::routing_matcher::RoutingPushPlan::compile(

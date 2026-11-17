@@ -1,10 +1,14 @@
 //! eBPF backend abstraction.
 
 #[cfg(feature = "ebpf")]
+pub(crate) mod host_bank;
+#[cfg(feature = "ebpf")]
 pub(crate) mod interface;
 pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
+#[cfg(feature = "ebpf")]
+pub mod native;
 mod policy_state;
 pub mod probe;
 mod retirement;
@@ -428,10 +432,16 @@ pub enum PnameSupport {
     Full,
     /// Kernel argv capture is unavailable; rules see the thread name.
     ThreadName,
+    /// Argv-derived names are available only on authenticated Host sources.
+    HostFull,
+    /// Thread names are available only on authenticated Host sources.
+    HostThreadName,
     /// The cgroup hooks are not attached; `pname()` never matches and
     /// `!pname()` always does.
     Unavailable,
 }
+
+pub type PnameSupportCell = std::sync::Arc<parking_lot::RwLock<PnameSupport>>;
 
 /// Lists `pname_routing` while `router` has a `pname()` rule that `backend` reduces.
 pub(crate) fn record_pname_routing(
@@ -447,6 +457,16 @@ pub(crate) fn record_pname_routing(
             code: "pname_routing_reduced",
             message: "Kernel argv capture is unavailable; process-name rules match the thread name.",
             reason: "comm_fallback",
+        }),
+        PnameSupport::HostFull => Some(Issue {
+            code: "pname_routing_host_only",
+            message: "Process names are available only on authenticated Host sources; plain sources and Host sources without a process name retain Missing semantics.",
+            reason: "host_only",
+        }),
+        PnameSupport::HostThreadName => Some(Issue {
+            code: "pname_routing_host_only",
+            message: "Kernel argv capture is unavailable; process-name rules match thread names only on authenticated Host sources. Plain sources and Host sources without a process name retain Missing semantics.",
+            reason: "host_only_comm_fallback",
         }),
         PnameSupport::Unavailable => Some(Issue {
             code: "pname_routing_disabled",
@@ -465,6 +485,19 @@ pub(crate) fn record_pname_routing(
 pub trait PolicyBackend: Send + Sync {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
     fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
+
+    #[cfg(feature = "ebpf")]
+    fn native_publication(&self) -> Option<std::sync::Arc<native::NativePublication>> {
+        None
+    }
+
+    #[cfg(feature = "ebpf")]
+    fn install_native_publication(
+        &mut self,
+        _publication: std::sync::Arc<native::NativePublication>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("Native publication requires the packet policy backend")
+    }
 
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {

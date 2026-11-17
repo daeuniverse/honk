@@ -12,7 +12,7 @@ pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &st
 pub(in crate::control) struct RoutingDecision {
     pub(in crate::control) outbound: String,
     pub(in crate::control) must: bool,
-    pub(in crate::control) mark: Option<honk_outbound::proxy::DirectMark>,
+    pub(in crate::control) mark: Option<u32>,
     pub(in crate::control) matched_rule: Option<(String, String)>,
     pub(in crate::control) reroute_by_sniffed_domain: bool,
     #[cfg(feature = "native-api")]
@@ -20,6 +20,7 @@ pub(in crate::control) struct RoutingDecision {
 }
 
 pub(in crate::control) struct PacketRoutingSnapshot {
+    pub(in crate::control) source: Option<honk_netstack::SourceContext>,
     pub(in crate::control) mode: super::handoff::ModeDecision,
     pub(in crate::control) mode_state: Option<crate::mode::ModeState>,
     pub(in crate::control) admission_final: bool,
@@ -137,6 +138,22 @@ pub(super) fn build_connection_info(
         mac: handoff.and_then(|ho| ho.mac_address()),
         dscp: handoff.map(|ho| ho.dscp),
     }
+}
+
+pub(super) fn packet_process_name(
+    facts: &honk_ebpf_common::host::HostSourceFacts,
+) -> Option<String> {
+    if facts.flags & honk_ebpf_common::host::HOST_PROCESS_PRESENT == 0 {
+        return None;
+    }
+    let end = facts
+        .pname
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(facts.pname.len());
+    let name = String::from_utf8_lossy(&facts.pname[..end]);
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 impl ControlPlaneHandle {
@@ -272,6 +289,7 @@ impl ControlPlaneHandle {
                 .unwrap_or(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn prepare_packet_routing_snapshot(
         &self,
         scope: honk_datapath::ScopeId,
@@ -279,11 +297,15 @@ impl ControlPlaneHandle {
         destination: SocketAddr,
         protocol: &'static str,
         dscp: u8,
+        packet_source: Option<&crate::control::netstack::SourceWork>,
         #[cfg(feature = "native-api")] record_route: bool,
     ) -> anyhow::Result<PacketRoutingSnapshot> {
         let config = Arc::clone(&*self.config.read().await);
         let mut input = build_connection_info(None, destination, client, protocol, None);
         input.dscp = Some(dscp);
+        input.process_name = packet_source
+            .and_then(|source| source.optional_facts())
+            .and_then(|facts| packet_process_name(&facts));
         let decision = {
             let router = self.router.read().await;
             let current = self.config.read().await;
@@ -331,6 +353,7 @@ impl ControlPlaneHandle {
             decision.must,
         );
         Ok(PacketRoutingSnapshot {
+            source: packet_source.and_then(crate::control::netstack::SourceWork::optional_context),
             mode,
             mode_state,
             admission_final: false,
@@ -408,7 +431,7 @@ impl ControlPlaneHandle {
             return RoutingDecision {
                 outbound: self.outbound_index_to_name(handoff.outbound).await,
                 must: handoff.must != 0,
-                mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
+                mark: (handoff.mark != 0).then_some(handoff.mark),
                 matched_rule: None,
                 reroute_by_sniffed_domain: false,
                 #[cfg(feature = "native-api")]
@@ -482,7 +505,7 @@ impl ControlPlaneHandle {
                     (
                         self.outbound_index_to_name(ho.outbound).await,
                         ho.must != 0,
-                        honk_outbound::proxy::DirectMark::new(ho.mark),
+                        (ho.mark != 0).then_some(ho.mark),
                     )
                 }
             }

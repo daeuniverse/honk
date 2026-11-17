@@ -280,7 +280,7 @@ fn parse_routing_rule(
     let (outbound, must, mark) = parse_outbound(right, ordinal)?;
     let condition = parse_condition(left, ordinal)?;
     let complex =
-        must || mark != 0 || left.find("&&").is_some() || condition.needs_complex_display();
+        must || mark.is_some() || left.find("&&").is_some() || condition.needs_complex_display();
     let rule = RoutingRule {
         name: format!("rule-{index}"),
         condition,
@@ -324,7 +324,7 @@ fn parse_condition_inner(
 fn parse_outbound(
     target: Expression<'_, '_, '_>,
     ordinal: usize,
-) -> Result<(String, bool, u32), DetailedConfigError> {
+) -> Result<(String, bool, Option<u32>), DetailedConfigError> {
     let invalid_options = || {
         target.error(
             "invalid-direct-options",
@@ -369,18 +369,17 @@ fn parse_outbound(
                     u32::from_str_radix(digits, radix)
                         .ok()
                         .filter(|_| !digits.starts_with('+'))
-                        .filter(|mark| mark & crate::routing::DATAPATH_RESERVED_MARK_MASK == 0)
                         .ok_or_else(|| {
                             option.error(
                                 "invalid-routing-mark",
-                                "mark must be decimal or 0x hexadecimal without datapath-reserved bits",
+                                "mark must be a decimal or 0x hexadecimal u32",
                                 ordinal,
                             )
                         })?,
                 );
             }
         }
-        return Ok(("direct".into(), must, mark.unwrap_or(0)));
+        return Ok(("direct".into(), must, mark));
     }
     let mut outbound = target.display();
     let must = outbound.ends_with("(must)");
@@ -388,7 +387,7 @@ fn parse_outbound(
         outbound.truncate(outbound.len() - "(must)".len());
         outbound.truncate(outbound.trim_end().len());
     }
-    Ok((outbound, must, 0))
+    Ok((outbound, must, None))
 }
 
 fn parse_route_matcher(

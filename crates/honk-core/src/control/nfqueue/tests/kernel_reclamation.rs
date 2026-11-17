@@ -95,10 +95,12 @@ impl Fixture {
 
     async fn wait_until_endpoint_gone(&self, key: FlowKey) {
         tokio::time::timeout(Duration::from_secs(2), async {
-            while self
-                .endpoints
-                .contains(honk_datapath::ScopeId::HOST, key.client, key.destination)
-            {
+            while self.endpoints.contains(
+                honk_datapath::ScopeId::HOST,
+                key.client,
+                key.destination,
+                None,
+            ) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -216,7 +218,8 @@ async fn hint_retirement_preserves_foreign_endpoint_incarnations() {
         assert!(fixture.endpoints.contains(
             honk_datapath::ScopeId::HOST,
             foreign.client,
-            foreign.destination
+            foreign.destination,
+            None,
         ));
         assert_eq!(
             fixture

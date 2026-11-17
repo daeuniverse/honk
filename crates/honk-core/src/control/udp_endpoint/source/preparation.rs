@@ -1,11 +1,16 @@
 use super::*;
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep admitted source ownership inline without another allocation"
+)]
 pub(in crate::control) enum SourcePreparation {
     Reused(SourceAttachment),
     Fresh {
         scope: SourceScope,
         prepared: PreparedSourceTransport,
         source_permit: OwnedSemaphorePermit,
+        packet_source: Option<SourceWork>,
         runtime: Arc<NodeRuntime>,
         alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
         stats: Arc<StatsManager>,
@@ -41,6 +46,7 @@ impl SourcePreparation {
                 scope,
                 prepared,
                 source_permit,
+                packet_source,
                 runtime,
                 alive_set,
                 stats,
@@ -60,6 +66,15 @@ impl SourcePreparation {
                         .get(&scope)
                         .map(|entry| Arc::clone(entry.value()))
                     {
+                        if owner.packet_source.as_ref().map(SourceWork::identity)
+                            != packet_source.as_ref().map(SourceWork::identity)
+                        {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "shared UDP source execution owner mismatch",
+                            )
+                            .into());
+                        }
                         if let Some(attachment) = owner.attach() {
                             owner.transport.observe_reuse();
                             return Ok(attachment);
@@ -108,6 +123,7 @@ impl SourcePreparation {
                                     ),
                                     stats,
                                     source_permit,
+                                    packet_source,
                                 )?;
                                 let receiver =
                                     run_source_receiver(Arc::clone(pool), Arc::clone(&owner));

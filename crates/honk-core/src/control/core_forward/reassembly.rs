@@ -58,6 +58,8 @@ pub(super) struct Pending {
     deadline: Instant,
     retry_at: Instant,
     fragment: Option<FragmentLease>,
+    #[cfg(target_os = "linux")]
+    peer: Option<crate::xdp::worker::PeerHold>,
 }
 
 /// `out[..len]` was materialized by poll_reassembly_error. Keep its funded byte storage
@@ -70,7 +72,15 @@ pub struct GeneratedError {
     pub len: usize,
     _quote: OwnedPacket,
     _fragment: Option<FragmentLease>,
+    #[cfg(target_os = "linux")]
+    peer: Option<crate::xdp::worker::PeerHold>,
     outputs: Arc<Outputs>,
+}
+impl GeneratedError {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn peer_hold(&self) -> Option<crate::xdp::worker::PeerHold> {
+        self.peer.clone()
+    }
 }
 impl Drop for GeneratedError {
     fn drop(&mut self) {
@@ -140,6 +150,8 @@ impl RoutedCore {
                     Pending {
                         fragment,
                         ingress,
+                        #[cfg(target_os = "linux")]
+                        peer: self.fragment_peer(ingress, quote.fragment_info()),
                         quote,
                         deadline: now + Duration::from_secs(2),
                         retry_at: now,
@@ -201,8 +213,9 @@ impl RoutedCore {
                     action.outbound.clone(),
                     action.must,
                 );
-                let marked =
-                    action.outbound == "direct" && mode.name == "direct" && action.mark.is_some();
+                let marked = action.outbound == "direct"
+                    && mode.name == "direct"
+                    && action.mark.is_some_and(|mark| mark != 0);
                 if disposition(
                     &mode.name,
                     action.must,
@@ -300,6 +313,8 @@ impl RoutedCore {
                 len,
                 _quote: pending.quote,
                 _fragment: pending.fragment,
+                #[cfg(target_os = "linux")]
+                peer: pending.peer,
                 outputs: Arc::clone(&self.reassembly_outputs),
             }));
         }
@@ -408,6 +423,7 @@ mod tests {
             deadline,
             retry_at: now,
             fragment: None,
+            peer: None,
         });
         let pending = core.pending_reassembly_error.as_mut().unwrap();
         assert_eq!(pending.deadline, deadline);

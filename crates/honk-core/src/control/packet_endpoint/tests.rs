@@ -3,6 +3,8 @@ use super::*;
 use honk_netstack::{Config as StackConfig, ExcludeSet, Mode, wire};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+mod realm;
 mod source;
 mod startup;
 mod udp;
@@ -171,6 +173,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
             destination,
             "tcp",
             0,
+            None,
             #[cfg(feature = "native-api")]
             false,
         )
@@ -179,13 +182,17 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
     let original = first_snapshot.config.clone();
     let mut first_admission = Some(EndpointAdmission::new(first_snapshot, &budget).unwrap());
     let now = Instant::now();
-    assert_eq!(
-        scope
-            .receive_admitted_with_source(&syn(first), now, &mut first_admission, false, |_, _| {
-                true
-            })
-            .0,
-        Rx::Consumed
+    let (received, first_receive) = scope.receive_admitted_with_source(
+        &syn(first),
+        now,
+        &mut first_admission,
+        false,
+        |_, _| true,
+    );
+    assert_eq!(received, Rx::Consumed);
+    assert!(
+        first_receive.taken_over,
+        "new TCP slot owns the admitted original"
     );
     assert!(first_admission.is_none());
     let mut next = (*original).clone();
@@ -198,6 +205,7 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
             destination,
             "tcp",
             0,
+            None,
             #[cfg(feature = "native-api")]
             false,
         )
@@ -210,8 +218,18 @@ async fn tcp_routing_binds_receive_incarnation_not_accept_queue_order() {
         second_admission.is_some(),
         "a SYN retransmit cannot replace first admission"
     );
-    scope
-        .receive_admitted_with_source(&syn(second), now, &mut second_admission, false, |_, _| true);
+    let (received, second_receive) = scope.receive_admitted_with_source(
+        &syn(second),
+        now,
+        &mut second_admission,
+        false,
+        |_, _| true,
+    );
+    assert_eq!(received, Rx::Consumed);
+    assert!(
+        second_receive.taken_over,
+        "second TCP incarnation owns its admitted original"
+    );
     assert!(second_admission.is_none());
     let (_, mut first_flow) = scope.poll_accept().unwrap();
     let (_, mut second_flow) = scope.poll_accept().unwrap();
@@ -320,15 +338,15 @@ async fn real_udp_outbound_replies_stay_in_their_original_scope() {
 async fn kernel_reply_descriptors_are_not_needed_by_packet_reply_factory() {
     let budget = MemoryBudget::new(32 << 20);
     let (scope, owner) = scope(&budget);
-    let factory = Replies(Arc::from([scope.clone()]));
+    let factory = Replies(Arc::from([PacketRealm::singleton(scope.clone()).unwrap()]));
     assert!(!factory.uses_fd());
     assert!(
         factory
-            .create(ScopeId::HOST, "192.0.2.1:53".parse().unwrap())
+            .create(ScopeId::HOST, "192.0.2.1:53".parse().unwrap(), None)
             .is_err()
     );
     let ReplySocketFd::Packet(sender) = factory
-        .create(scope.scope(), "198.51.100.1:53".parse().unwrap())
+        .create(scope.scope(), "198.51.100.1:53".parse().unwrap(), None)
         .unwrap()
     else {
         panic!("packet factory created a socket")
@@ -393,7 +411,9 @@ fn retained_udp_bytes_keep_their_charge_after_lease_and_pool_drop() {
     let pool = Arc::new(
         UdpEndpointPool::with_packet_reply_factory(
             1,
-            Arc::new(Replies(Arc::from([scope.clone()]))),
+            Arc::new(Replies(Arc::from([
+                PacketRealm::singleton(scope.clone()).unwrap()
+            ]))),
             Arc::clone(&budget),
         )
         .unwrap(),
@@ -435,7 +455,9 @@ fn retirement_metadata_stays_reserved_until_exact_removal_completion() {
     let pool = Arc::new(
         UdpEndpointPool::with_packet_reply_factory(
             1,
-            Arc::new(Replies(Arc::from([scope.clone()]))),
+            Arc::new(Replies(Arc::from([
+                PacketRealm::singleton(scope.clone()).unwrap()
+            ]))),
             Arc::clone(&budget),
         )
         .unwrap(),
@@ -585,7 +607,9 @@ fn already_funded_followers_remain_admissible_at_the_memory_ceiling() {
     let pool = Arc::new(
         UdpEndpointPool::with_packet_reply_factory(
             1,
-            Arc::new(Replies(Arc::from([scope.clone()]))),
+            Arc::new(Replies(Arc::from([
+                PacketRealm::singleton(scope.clone()).unwrap()
+            ]))),
             Arc::clone(&budget),
         )
         .unwrap(),
@@ -609,6 +633,7 @@ fn already_funded_followers_remain_admissible_at_the_memory_ceiling() {
                 .unwrap(),
             super::super::udp_endpoint::queue_now(),
             &stats,
+            None,
         )
     };
     let first = FundedDatagram::copy_from(b"first", &budget).unwrap();
@@ -694,7 +719,7 @@ async fn idle_udp_task_credit_is_returned_by_periodic_maintenance() {
     let pool = Arc::new(
         UdpEndpointPool::with_packet_reply_factory(
             1,
-            Arc::new(Replies(Arc::from([scope]))),
+            Arc::new(Replies(Arc::from([PacketRealm::singleton(scope).unwrap()]))),
             Arc::clone(&budget),
         )
         .unwrap(),

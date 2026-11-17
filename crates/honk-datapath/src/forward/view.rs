@@ -108,6 +108,30 @@ impl CoreForward {
         now: Instant,
         segments: &[&[u8]],
     ) -> Result<Option<Packet>, ForwardError> {
+        self.receive_segments_at(ingress, now, now, segments)
+    }
+
+    /// Scatter input retains the same ingress and service times as contiguous input.
+    pub fn receive_segments_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        segments: &[&[u8]],
+    ) -> Result<Option<Packet>, ForwardError> {
+        self.receive_segments_with_fragments_at(ingress, ingress_at, service_at, segments)
+            .map(|(packet, _)| packet)
+            .map_err(ForwardError::packet_only)
+    }
+
+    /// Reports fragment ownership from the existing contiguous reassembly decoder.
+    pub fn receive_segments_with_fragments_at(
+        &mut self,
+        ingress: Ingress,
+        ingress_at: Instant,
+        service_at: Instant,
+        segments: &[&[u8]],
+    ) -> Result<(Option<Packet>, Option<FragmentInfo>), ForwardError> {
         let view = PacketView::new(segments)?;
         if view.len() > 65575 {
             return Err(ParseError::Malformed.into());
@@ -120,9 +144,9 @@ impl CoreForward {
             let mut bytes = vec![0; view.len()].into_boxed_slice();
             view.copy_to(0..view.len(), &mut bytes)
                 .ok_or(ParseError::Malformed)?;
-            return self.receive(ingress, now, &bytes);
+            return self.receive_with_fragments_at(ingress, ingress_at, service_at, &bytes);
         }
-        let input = self.validate_view(ingress, now, view)?;
+        let input = self.validate_view(ingress, ingress_at, view)?;
         let metadata = self
             .budget
             .reserve(size_of::<Packet>() + 32)
@@ -134,18 +158,21 @@ impl CoreForward {
         let mut bytes = vec![0; input.ip.payload.end].into_boxed_slice();
         view.copy_to(0..bytes.len(), &mut bytes)
             .ok_or(ParseError::Malformed)?;
-        Ok(Some(Packet {
-            bytes: Bytes::Copied(bytes, charge),
-            ip: input.ip,
-            query: input.query,
-            input_query: input.query,
-            deadline: input.deadline,
-            validated: true,
-            _metadata: metadata,
-            binding: None,
-            native: None,
-            native_quote: None,
-        }))
+        Ok((
+            Some(Packet {
+                bytes: Bytes::Copied(bytes, charge),
+                ip: input.ip,
+                query: input.query,
+                input_query: input.query,
+                deadline: input.deadline,
+                validated: true,
+                _metadata: metadata,
+                binding: None,
+                native: None,
+                native_quote: None,
+            }),
+            None,
+        ))
     }
 
     /// None requests the cold ICMP path. No packet bytes or flow claims are consumed then.

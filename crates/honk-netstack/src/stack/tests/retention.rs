@@ -1,10 +1,16 @@
 use super::*;
 use std::time::Duration;
 
-fn pair(now: Instant) -> (Stack, Stack, FlowId, FlowId) {
+fn pair(now: Instant, contextual: bool) -> (Stack, Stack, FlowId, FlowId) {
     let mut cfg = Config::new([4; 32]);
     cfg.local_v4 = Some("192.0.2.1".parse().unwrap());
+    if contextual {
+        cfg.shared_budget = Some(crate::MemoryBudget::new(cfg.memory_limit));
+    }
     let mut client = Stack::new(cfg, now);
+    if contextual {
+        client.prepare_source_context().unwrap();
+    }
     let mut cfg = Config::new([5; 32]);
     cfg.mode = Mode::Transparent {
         exclude: crate::ExcludeSet::default(),
@@ -29,8 +35,11 @@ fn pair(now: Instant) -> (Stack, Stack, FlowId, FlowId) {
     (client, server, id, accepted)
 }
 
-fn retained_time_wait(now: Instant) -> (Stack, FlowId, Vec<u8>) {
-    let (mut client, mut server, id, accepted) = pair(now);
+fn retained_time_wait(now: Instant, source: Option<SourceContext>) -> (Stack, FlowId, Vec<u8>) {
+    let (mut client, mut server, id, accepted) = pair(now, source.is_some());
+    if let Some(source) = source {
+        client.table.set_source(id.idx, Some(source));
+    }
     client.tcp_shutdown(id).unwrap();
     let mut packet = [0; 2000];
     let n = client.poll_transmit(now, &mut packet).unwrap();
@@ -45,7 +54,17 @@ fn retained_time_wait(now: Instant) -> (Stack, FlowId, Vec<u8>) {
             if h.flags & wire::tcp::FIN != 0 {
                 fin = Some(packet[..n].to_vec());
             }
-            assert_eq!(client.receive(now, &packet[..n]), Rx::Consumed);
+            let rx = match source {
+                Some(source) => {
+                    client
+                        .receive_with_context(now, &packet[..n], RxMeta::VERIFY, source, |_, _| {
+                            true
+                        })
+                        .0
+                }
+                None => client.receive(now, &packet[..n]),
+            };
+            assert_eq!(rx, Rx::Consumed);
         }
         while let Some(n) = client.poll_transmit(now, &mut packet) {
             server.receive(now, &packet[..n]);
@@ -79,7 +98,7 @@ fn exhausted_application_slot_cannot_alias_an_old_handle() {
 fn exhaustion_at_compaction_or_expiry_keeps_time_wait_delivery() {
     for generation in [u32::MAX - 1, u32::MAX] {
         let now = Instant::now();
-        let (mut stack, original, fin) = retained_time_wait(now);
+        let (mut stack, original, fin) = retained_time_wait(now, None);
         stack.table.slots[original.idx as usize].generation = generation;
         let id = FlowId {
             generation,
@@ -120,7 +139,7 @@ fn exhaustion_at_compaction_or_expiry_keeps_time_wait_delivery() {
 fn active_reopen_retires_the_old_protocol_but_never_reuses_an_exhausted_slot() {
     for exhausted in [false, true] {
         let now = Instant::now();
-        let (mut stack, original, _) = retained_time_wait(now);
+        let (mut stack, original, _) = retained_time_wait(now, None);
         let id = if exhausted {
             stack.table.slots[original.idx as usize].generation = u32::MAX;
             FlowId {
@@ -148,5 +167,132 @@ fn active_reopen_retires_the_old_protocol_but_never_reuses_an_exhausted_slot() {
         assert_eq!(tx.flow, Some(new));
         #[cfg(feature = "fuzz-checks")]
         stack.check();
+    }
+}
+
+#[test]
+fn source_survives_retained_and_exhausted_time_wait_until_a_legal_reopen() {
+    let source = SourceContext {
+        lineage: std::num::NonZeroU64::new(1).unwrap(),
+        snapshot: std::num::NonZeroU64::new(1).unwrap(),
+    };
+    let newer = SourceContext {
+        snapshot: std::num::NonZeroU64::new(2).unwrap(),
+        ..source
+    };
+    let foreign = SourceContext {
+        lineage: std::num::NonZeroU64::new(2).unwrap(),
+        snapshot: std::num::NonZeroU64::new(3).unwrap(),
+    };
+    for exhausted in [false, true] {
+        let now = Instant::now();
+        let (mut stack, original, fin) = retained_time_wait(now, Some(source));
+        stack.cfg.mode = Mode::Transparent {
+            exclude: crate::ExcludeSet::default(),
+        };
+        let generation = if exhausted {
+            u32::MAX
+        } else {
+            original.generation
+        };
+        stack.table.slots[original.idx as usize].generation = generation;
+        let id = FlowId {
+            generation,
+            ..original
+        };
+        let (rx, _) = stack.receive_with_context(now, &fin, RxMeta::VERIFY, foreign, |_, _| true);
+        assert_eq!(rx, Rx::Dropped(DropReason::NotForUs));
+        stack.receive_with_context(now, &fin, RxMeta::VERIFY, newer, |_, effective| {
+            assert_eq!(effective, source);
+            true
+        });
+        let mut packet = [0; 2000];
+        let retained = stack
+            .poll_transmit_with(now, &mut packet, TxCaps::NONE)
+            .unwrap();
+        assert_eq!((retained.flow, retained.source), (Some(id), Some(source)));
+        stack.tcp_close(id);
+        assert_eq!(stack.stats().timewait_entries, 1);
+        let mut contexts = Vec::new();
+        stack.visit_retained_source_contexts(|source| contexts.push(source));
+        assert_eq!(contexts, [source]);
+        let late = now + Duration::from_secs(30);
+        assert_eq!(
+            stack
+                .receive_with_context(late, &fin, RxMeta::VERIFY, foreign, |_, _| true)
+                .0,
+            Rx::Dropped(DropReason::NotForUs)
+        );
+        stack.receive_with_context(late, &fin, RxMeta::VERIFY, newer, |_, effective| {
+            assert_eq!(effective, source);
+            true
+        });
+        let old_output = stack
+            .poll_transmit_with(late, &mut packet, TxCaps::NONE)
+            .unwrap();
+        assert_eq!(
+            (old_output.flow, old_output.source),
+            (Some(id), Some(source))
+        );
+        let Some(Flow::TimeWait(tw)) = &stack.table.slots[id.idx as usize].flow else {
+            panic!("missing compact TIME_WAIT")
+        };
+        let tuple = tw.tuple;
+        let sequence = tw.rcv_nxt;
+        let timestamp = tw.ts_recent.unwrap();
+        let syn = |seq, ts| {
+            let mut packet = [0; 128];
+            let header = wire::tcp::Header {
+                src_port: tuple.remote.port(),
+                dst_port: tuple.local.port(),
+                seq,
+                ack: 0,
+                flags: wire::tcp::SYN,
+                window: 60_000,
+                urgent: 0,
+                options: wire::tcp::Options {
+                    timestamps: Some((ts, 0)),
+                    ..Default::default()
+                },
+            };
+            let len = wire::tcp::emit_packet(
+                &mut packet,
+                tuple.remote.ip(),
+                tuple.local.ip(),
+                &header,
+                [&[], &[]],
+            )
+            .unwrap();
+            packet[..len].to_vec()
+        };
+        let stale = syn(sequence.wrapping_sub(1), timestamp);
+        assert_eq!(
+            stack
+                .receive_with_context(late, &stale, RxMeta::VERIFY, foreign, |_, _| true)
+                .0,
+            Rx::Dropped(DropReason::NotForUs)
+        );
+        assert!(stack.tcp_retained(id));
+        let fresh = syn(sequence.wrapping_add(100_000), timestamp.wrapping_add(1));
+        let (rx, report) =
+            stack.receive_with_context(late, &fresh, RxMeta::VERIFY, foreign, |_, effective| {
+                assert_eq!(effective, foreign);
+                true
+            });
+        assert_eq!(rx, Rx::Consumed);
+        let ReceiveOutcome::TcpNew(new) = report.outcome else {
+            panic!("legal SYN did not reopen TIME_WAIT")
+        };
+        assert_ne!(new, id);
+        assert!(!stack.tcp_retained(id));
+        stack.tcp_accept(new, crate::AcceptOpts::default()).unwrap();
+        let tx = stack
+            .poll_transmit_with(late, &mut packet, TxCaps::NONE)
+            .unwrap();
+        assert_eq!((tx.flow, tx.source), (Some(new), Some(foreign)));
+        assert_eq!(
+            (old_output.flow, old_output.source),
+            (Some(id), Some(source))
+        );
     }
 }

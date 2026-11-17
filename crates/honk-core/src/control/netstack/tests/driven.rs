@@ -39,7 +39,8 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
             writer.set_nonblocking(true).unwrap();
             reader.set_nonblocking(true).unwrap();
             let mut cx = context();
-            let more = crate::tun::service_turn(&mut driver, &mut cx, now, |driver, cx| {
+            let more = crate::tun::service_turn(std::slice::from_mut(&mut driver), &mut cx, now, |drivers, cx| {
+                let driver = &mut drivers[0];
                 for class in [TxClass::Control, TxClass::Bulk] {
                     assert!(exported(driver, cx, class).is_none());
                 }
@@ -58,7 +59,8 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
 
             tokio::time::sleep_until(tokio::time::Instant::from_std(driver.deadline().unwrap())).await;
             let mut emitted = 0;
-            crate::tun::service_turn(&mut driver, &mut cx, Instant::now(), |driver, cx| {
+            crate::tun::service_turn(std::slice::from_mut(&mut driver), &mut cx, Instant::now(), |drivers, cx| {
+                let driver = &mut drivers[0];
                 for class in [TxClass::Control, TxClass::Bulk] {
                     if let Some(output) = exported(driver, cx, class) {
                         assert_eq!(writer.send(output.packet())?, output.packet().len());
@@ -86,6 +88,100 @@ async fn tun_turn_preserves_expiry_after_the_last_output_pass() {
     })
     .await
     .expect("expiry after the output pass must reach the next turn without fresh input");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn tun_dual_turn_services_timers_and_close_while_shared_output_is_blocked() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let now = Instant::now();
+        let due = now + Duration::from_millis(20);
+        let budget = MemoryBudget::new(32 << 20);
+        let mut scopes = Vec::new();
+        let mut owners = Vec::new();
+        let mut drivers = Vec::new();
+        for port in [40000, 40001] {
+            let source = SocketAddr::from(([10, 0, 0, 2], port));
+            let destination = "203.0.113.9:443".parse().unwrap();
+            let mut cfg = config();
+            cfg.fragment_limits.timeout = Duration::from_millis(20);
+            let (scope, owner) = PacketScope::new(cfg, Arc::clone(&budget), limits(), now).unwrap();
+            let mut peer = Stack::new(config(), now);
+            let mut packet = [0; 1280];
+            let length = peer
+                .udp_send_from(source, destination, &[7; 4000], &mut packet)
+                .unwrap();
+            assert_eq!(scope.receive(&packet[..length], now), Rx::Consumed);
+            scope
+                .datagram_sender(destination)
+                .send_to(b"pending", source)
+                .await
+                .unwrap();
+            drivers.push(owner.hand_off());
+            owners.push(owner);
+            scopes.push(scope);
+        }
+        let (writer, reader) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        writer.set_nonblocking(true).unwrap();
+        reader.set_nonblocking(true).unwrap();
+        loop {
+            match writer.send(&[0; 1280]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill shared output: {error}"),
+            }
+        }
+        let mut pending = Vec::new();
+        crate::tun::service_turn(&mut drivers, &mut context(), now, |drivers, cx| {
+            for driver in drivers {
+                let output = exported(driver, cx, TxClass::Bulk).unwrap();
+                assert_eq!(
+                    writer.send(output.packet()).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                pending.push(output);
+                assert_eq!(driver.deadline(), Some(due));
+            }
+            Ok(false)
+        })
+        .unwrap();
+        crate::tun::service_turn(&mut drivers, &mut context(), due, |drivers, cx| {
+            for driver in drivers {
+                let output = exported(driver, cx, TxClass::Control)
+                    .expect("each scope must expire its fragment behind blocked bulk output");
+                assert_eq!(
+                    writer.send(output.packet()).unwrap_err().kind(),
+                    io::ErrorKind::WouldBlock
+                );
+                pending.push(output);
+            }
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(pending.len(), 4);
+        for scope in &scopes {
+            scope.shutdown(true);
+        }
+        crate::tun::service_turn(&mut drivers, &mut context(), due, |_, _| Ok(false)).unwrap();
+        for scope in &scopes {
+            assert!(
+                !scope.0.inner.lock().finished,
+                "blocked output retains its original scope"
+            );
+        }
+        for output in pending {
+            output.release();
+        }
+        crate::tun::service_turn(&mut drivers, &mut context(), due, |_, _| Ok(false)).unwrap();
+        for owner in owners {
+            assert!(owner.reclaim().await);
+            owner.run().await;
+        }
+        drop((drivers, scopes));
+        assert_eq!(budget.used(), 0);
+    })
+    .await
+    .expect("both original scopes must finish without writable output or fresh ingress");
 }
 
 #[tokio::test]

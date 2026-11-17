@@ -208,3 +208,94 @@ fn checksum_rejection_releases_the_completed_packet_charge() {
         assert_eq!(stack.stats().flows, 0);
     }
 }
+
+fn context(lineage: u64, snapshot: u64) -> SourceContext {
+    SourceContext {
+        lineage: NonZeroU64::new(lineage).unwrap(),
+        snapshot: NonZeroU64::new(snapshot).unwrap(),
+    }
+}
+
+#[test]
+fn incompatible_snapshot_kills_and_pins_the_first_nonzero_fragment_identity() {
+    let now = Instant::now();
+    let original = context(1, 1);
+    let changed = context(1, 2);
+    let foreign = context(2, 3);
+    for (src, dst) in families() {
+        let fragments = split(&datagram(src, dst, 1200, 7), 51, 400);
+        let mut reasm = Reassembler::default();
+        pending(reasm.push(now, frag::parse(&fragments[1]).unwrap(), Some(original)));
+        assert!(matches!(
+            reasm.push(now, frag::parse(&fragments[0]).unwrap(), Some(changed)),
+            Push::Dropped(DropReason::Fragment)
+        ));
+        assert_eq!(reasm.bytes(), ENTRY_OVERHEAD);
+        assert!(reasm.obligations().next().is_none());
+        assert!(!reasm.retains_source_output_with_lineage(original.lineage));
+        let mut retained = Vec::new();
+        reasm.visit_retained_source_contexts(|source| retained.push(source));
+        assert_eq!(retained, [original]);
+        assert!(matches!(
+            reasm.push(now, frag::parse(&fragments[0]).unwrap(), Some(changed)),
+            Push::Dropped(DropReason::Fragment)
+        ));
+        for (index, fragment) in fragments.iter().enumerate() {
+            let result = reasm.push(now, frag::parse(fragment).unwrap(), Some(foreign));
+            if index + 1 == fragments.len() {
+                let Push::Complete(completed) = result else {
+                    panic!("foreign lineage must remain independent")
+                };
+                assert_eq!(completed.source, Some(foreign));
+            } else {
+                pending(result);
+            }
+        }
+        retained.clear();
+        reasm.visit_retained_source_contexts(|source| retained.push(source));
+        assert_eq!(retained, [original]);
+        reasm.expire(now + Duration::from_secs(30));
+        reasm.assert_idle();
+        reasm.visit_retained_source_contexts(|_| panic!("expired tombstone still pins source"));
+    }
+}
+
+#[test]
+fn timeout_quotes_keep_source_until_actual_output_or_suppression() {
+    let now = Instant::now();
+    let source = context(7, 9);
+    for (src, dst) in families() {
+        for burst in [0, 1] {
+            let mut reasm = Reassembler::default();
+            let fragments = split(&datagram(src, dst, 1200, 8), 52, 400);
+            pending(reasm.push(now, frag::parse(&fragments[0]).unwrap(), Some(source)));
+            let late = now + Duration::from_secs(30);
+            reasm.expire(late);
+            let mut retained = Vec::new();
+            reasm.visit_retained_source_contexts(|source| retained.push(source));
+            assert_eq!(retained, [source]);
+            assert!(reasm.retains_source_output_with_lineage(source.lineage));
+            let mut icmp = IcmpOut::new(crate::IcmpLimits {
+                burst,
+                ..crate::IcmpLimits::default()
+            });
+            let mut tx = Transmit::plain(0);
+            assert!(matches!(
+                reasm.poll_icmp(late, &mut icmp, &mut [0; 1], &mut tx),
+                Output::Blocked
+            ));
+            assert_eq!(tx.source, None);
+            let result = reasm.poll_icmp(late, &mut icmp, &mut [0; 1500], &mut tx);
+            if burst == 1 {
+                assert!(matches!(result, Output::Sent(_)));
+                assert_eq!(tx.source, Some(source));
+            } else {
+                assert!(matches!(result, Output::None));
+                assert_eq!(tx.source, None);
+            }
+            reasm.visit_retained_source_contexts(|_| panic!("disposed quote still pins source"));
+            assert!(!reasm.retains_source_output_with_lineage(source.lineage));
+            reasm.assert_idle();
+        }
+    }
+}

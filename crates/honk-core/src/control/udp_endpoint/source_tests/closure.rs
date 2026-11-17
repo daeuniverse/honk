@@ -58,6 +58,7 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -162,7 +163,8 @@ async fn close_source_view_drains_admitted_io_without_aborting_sibling() {
             client_addr,
             target_a,
             identity_a.0,
-            identity_a.1
+            identity_a.1,
+            None,
         ));
         replacement
             .send_packet(b"replacement", false)

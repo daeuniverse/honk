@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Disposable-virtme-guest gate. Never invoke on the host; no downloads/builds.
-# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon]
+# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon|native]
 set -euo pipefail
 
 fail() { printf 'xdp-daemon-smoke: %s\n' "$*" >&2; exit 1; }
+if [[ ${HONK_XDP_NATIVE_CASE:-matrix} == ipv6-extensions && ${HONK_XDP_NATIVE_PROFILE:-both} != native ]]; then
+    fail 'ipv6-extensions selection requires profile native (HONK_XDP_NATIVE_PROFILE=native)'
+fi
 [[ $(id -u) == 0 ]] || fail 'requires guest root'
 [[ $(uname -s) == Linux ]] || fail 'requires Linux'
 read -r cmdline </proc/cmdline
@@ -33,6 +36,7 @@ case $smoke_scope in
     all) ;;
     runtime) [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]] || fail 'runtime scope requires the complete Core test executable' ;;
     daemon) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'daemon scope cannot ignore supplied test executables' ;;
+    native) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'native scope cannot ignore supplied test executables' ;;
     *) fail 'unknown smoke scope' ;;
 esac
 read -r smoke_started _ </proc/uptime
@@ -63,6 +67,23 @@ mount -t bpf bpf "$work/bpf"
 export HONK_XDP_PIN_ROOT="$work/bpf"
 server_pid= daemon_pid=
 adaptive_active=false
+native_active=false
+native_artifact_prefix=
+native_artifact_collected=false
+native_artifact_reasons=()
+native_collect() {
+    [[ -n $native_artifact_prefix && $native_artifact_collected == false ]] || return 0
+    # Retain the bound result, bytes and digest before validation or namespace teardown,
+    # including when wait reports the daemon's existing fatal shutdown error.
+    native_artifact_collected=true
+    local -a capture_environment=(env -u HONK_XDP_CAPTURE_SCHEDULE)
+    if [[ -f $native_artifact_prefix.captured-schedule.json ]]; then
+        capture_environment=(env "HONK_XDP_CAPTURE_SCHEDULE=$native_artifact_prefix.captured-schedule.json")
+    fi
+    ip netns exec dut "${capture_environment[@]}" python3 "$script_dir/native-publication.py" collect \
+        "$native_artifact_prefix.daemon.log" "$native_artifact_prefix.publication" "$1" \
+        "${native_artifact_reasons[@]}" >"$native_artifact_prefix.publication.consumer.log" 2>&1
+}
 namespaces=()
 stop_sources() {
     if [[ -n $server_pid ]]; then
@@ -79,13 +100,13 @@ stop_sources() {
     ip -n server link set s0 down 2>/dev/null || true
     ip -n server link set su down 2>/dev/null || true
 }
-retain_adaptive_custody() {
+retain_custody() {
     python3 - <<'PY'
 import os, signal
 held = [os.open('/proc/thread-self/ns/mnt', os.O_RDONLY)]
 for name in os.listdir('/run/netns'):
     held.append(os.open('/run/netns/' + name, os.O_RDONLY))
-print('unresolved adaptive owner custody retained until VM teardown', flush=True)
+print('unresolved fixture ownership retained until VM teardown', flush=True)
 while True:
     signal.pause()
 PY
@@ -96,21 +117,61 @@ cleanup() {
     trap - EXIT
     mark_phase cleanup "begin-status-$status"
     stop_sources
-    if [[ $adaptive_active == true && ! -f $work/adaptive-runtime.joined ]]; then
-        # A failed join cannot authorize namespace/pin teardown. This guest-only
-        # custodian retains the private mount/nsfs/bpffs until the VM is destroyed.
-        retain_adaptive_custody </dev/null >"$work/adaptive-custodian.log" 2>&1 &
-        printf '%s\n' "$!" >"$work/adaptive-custodian.pid"
-        printf 'Retaining unresolved adaptive ownership: %s (exit %s)\n' "$work" "$status" >&2
+    if [[ $native_active == true ]] || [[ $adaptive_active == true && ! -f $work/adaptive-runtime.joined ]]; then
+        # Unresolved ownership cannot authorize namespace/pin teardown. This
+        # guest-only custodian retains private mount/nsfs/bpffs until VM teardown.
+        custody=adaptive
+        if [[ $native_active == true ]]; then custody=native; fi
+        retain_custody </dev/null >"$work/$custody-custodian.log" 2>&1 &
+        printf '%s\n' "$!" >"$work/$custody-custodian.pid"
+        printf 'Retaining unresolved %s ownership: %s (exit %s)\n' "$custody" "$work" "$status" >&2
         [[ $status != 0 ]] || status=1
+        # Daemon may still be live: keep bound custody facts; the consumer rejects this as incomplete.
+        native_collect "$status" || true
+        cp -a /run/honk-xdp-state "$work/state" 2>/dev/null || true
+        cp -a /run/honk-tc-state "$work/tc-state" 2>/dev/null || true
         exit "$status"
     fi
     ip netns exec dut nft -j list ruleset >"$work/final.nft.json" 2>"$work/final.nft.stderr" || true
     ip -n dut -j -d link show >"$work/final.links.json" 2>"$work/final.links.stderr" || true
     if [[ -n $daemon_pid ]]; then
+        if [[ -n $native_artifact_prefix && ! -f $native_artifact_prefix.publication.shutdown.json ]]; then
+            python3 "$script_dir/native-publication.py" shutdown "$native_artifact_prefix.publication" || status=1
+        fi
         kill -TERM "$daemon_pid" 2>/dev/null || true
         timeout 20s tail --pid="$daemon_pid" -f /dev/null 2>/dev/null || kill -KILL "$daemon_pid" 2>/dev/null || true
-        wait "$daemon_pid" 2>/dev/null || true
+        shutdown_status=0
+        wait "$daemon_pid" 2>/dev/null || shutdown_status=$?
+        native_collect "$shutdown_status" || status=1
+    else
+        native_collect unknown || status=1
+    fi
+    shopt -s nullglob
+    retained_receipts=("$work"/captured-*.retained.json)
+    if (( ${#retained_receipts[@]} )); then
+        cp -a /run/honk-xdp-state "$work/state" || status=1
+        cp -a /run/honk-tc-state "$work/tc-state" || status=1
+        python3 - "$work/bpf" "${retained_receipts[@]}" <<'PY'
+import json, os, pathlib, sys
+root = pathlib.Path(sys.argv[1]).resolve()
+assert 1 <= len(sys.argv[2:]) <= 8, 'retained negative fixture bound'
+for path in sys.argv[2:]:
+    proof = json.loads(pathlib.Path(path).read_text())
+    assert proof['format'] == 1 and proof['assertions'] == 'passed' and proof['cleanup'] == 'FailedRetained', proof
+    assert proof['outcome'] in ('Ambiguous', 'RefusedBeforeTransfer'), proof
+    assert proof['retained_rx'] >= 1 and proof['claim_outstanding'] > 0 and proof['charge_bytes'] > 0 and proof['replay_attempts'] == 0, proof
+    assert proof['rx_completion'] == (1 if proof.get('terminal_phase') == 'Completing' else 0), proof
+    pid = proof['pid']
+    assert type(pid) is int and pid > 0 and pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[0] not in ('Z', 'X'), 'retained operation owner died'
+    assert os.stat(f'/proc/{pid}/ns/net').st_ino == proof['netns_inode'], 'retained operation namespace changed'
+    assert os.stat('/run/netns/' + proof['namespace']).st_ino == proof['netns_inode'], 'retained namespace pin changed'
+    pins = pathlib.Path(proof['pin_root']).resolve()
+    assert pins.is_relative_to(root) and pins != root and any(pins.rglob('*')), 'retained private hook inventory absent'
+print('Expected negative assertions passed; actual operation owners remain FailedRetained until disposable VM teardown', flush=True)
+PY
+        mark_phase cleanup "expected-negative-FailedRetained-status-$status"
+        printf 'Retaining negative fixture operation owners and bpffs: %s (exit %s)\n' "$work" "$status"
+        exit "$status"
     fi
     # Remove only this smoke's private pins, after ingress is down.
     find "$work/bpf" -type f -delete
@@ -132,8 +193,8 @@ for ns in dut client server; do
     ip netns exec "$ns" sysctl -qw net.ipv6.auto_flowlabels=0
     ip -n "$ns" link set lo up
 done
-ip -n dut link add dut0 numrxqueues 2 numtxqueues 2 type veth peer name c0 netns client
-ip -n dut link add dut1 numrxqueues 2 numtxqueues 2 type veth peer name s0 netns server
+ip -n dut link add dut0 numrxqueues 2 numtxqueues 2 type veth peer name c0 numrxqueues 2 numtxqueues 2 netns client
+ip -n dut link add dut1 numrxqueues 2 numtxqueues 2 type veth peer name s0 numrxqueues 2 numtxqueues 2 netns server
 ip -n dut link add name up type veth peer name su netns server
 for spec in 'dut dut0' 'dut dut1' 'dut up' 'client c0' 'server s0' 'server su'; do
     read -r ns dev <<<"$spec"
@@ -197,12 +258,22 @@ mark_phase native-baseline begin
 python3 "$HONK_XDP_PROBE" native-baseline | tee "$work/native-baseline.log"
 mark_phase native-baseline complete
 ip netns exec dut sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0 net.ipv4.ip_early_demux=0 net.ipv4.conf.all.accept_source_route=1 net.ipv4.conf.dut0.accept_source_route=1
+native_hbh_baseline=
+if [[ $smoke_scope == native && ${HONK_XDP_NATIVE_PROFILE:-both} != native-nat && ${HONK_XDP_NATIVE_CASE:-matrix} != plain-udp4 ]]; then
+    native_hbh_baseline="$work/native-hbh-baseline.json"
+    mark_phase native-hbh-baseline begin
+    python3 "$HONK_XDP_PROBE" native-hbh-baseline | tee "$native_hbh_baseline"
+    mark_phase native-hbh-baseline complete
+fi
 ip netns exec dut nft add table inet honk_smoke_native
 ip netns exec dut nft 'add chain inet honk_smoke_native forward { type filter hook forward priority -300; policy accept; }'
 
 cat >"$work/check.py" <<'PY'
 import json, os, pathlib, subprocess, sys
 mode = sys.argv[1]
+native = mode in ('native', 'native-guard')
+if native:
+    mode = 'data' if mode == 'native' else 'guard'
 def command(*args):
     return subprocess.check_output(args, text=True)
 links = json.loads(command('ip', '-j', '-d', 'link', 'show'))
@@ -212,52 +283,129 @@ if mode == 'tc':
     assert not any(link.get('xdp', {}).get('prog', {}).get('id', 0) or link.get('xdp', {}).get('prog_id', 0) for link in links), 'default TC installed XDP'
     print('kernel contract: omitted datapath uses real TC', flush=True)
     sys.exit(0)
-assert not any(x['ifname'].startswith('dae0') or x.get('linkinfo', {}).get('info_kind') == 'tun' for x in links), links
+private_tap = None
+if native and mode == 'data':
+    inventory = json.loads(command(sys.executable, os.environ['HONK_XDP_PROBE'], 'native-return',
+                                   os.environ['HONK_XDP_NATIVE_DAEMON_PID'], os.environ['HONK_XDP_NATIVE_PUBLICATION_PREFIX']))
+    tap = next(resource for resource in inventory['receipt']['resources'] if resource['role'] == 'private-tap')
+    private_tap = (tap['identity']['name'], inventory['tap_ifindex'])
+    owned = [link for link in links if (link['ifname'], link['ifindex']) == private_tap]
+    assert len(owned) == 1 and owned[0].get('linkinfo', {}).get('info_kind') == 'tun', 'receipt-owned private TAP is absent or replaced'
+assert not any(x['ifname'].startswith('dae0') or (x.get('linkinfo', {}).get('info_kind') == 'tun' and (x['ifname'], x['ifindex']) != private_tap) for x in links), links
 assert not pathlib.Path('/run/netns/daens').exists(), 'legacy daens created'
 assert 'queue' not in command('nft', 'list', 'ruleset'), 'NFQUEUE rules created'
 queue = pathlib.Path('/proc/net/netfilter/nfnetlink_queue')
 assert not queue.exists() or not queue.read_text().strip(), 'NFQUEUE bound'
 for link in links:
-    if mode == 'absent':
-        assert not link.get('xdp', {}).get('prog', {}).get('id', 0) and not link.get('xdp', {}).get('prog_id', 0), link
     dev = link['ifname']
+    owned_private_tap = private_tap == (dev, link['ifindex'])
+    if dev not in ('dut0', 'dut1') and not owned_private_tap and mode != 'absent':
+        subprocess.run([sys.executable, os.environ['HONK_XDP_PROBE'], 'xdp-absent', dev], check=True)
+    if mode == 'absent':
+        subprocess.run([sys.executable, os.environ['HONK_XDP_PROBE'], 'xdp-absent', dev], check=True)
+        subprocess.run([sys.executable, os.environ['HONK_XDP_PROBE'], 'native-gate', dev, '0', 'none'], check=True)
     assert not any(q['kind'] in ('clsact', 'ingress') for q in json.loads(command('tc', '-j', 'qdisc', 'show', 'dev', dev))), dev
     for direction in ('ingress', 'egress'):
         assert not json.loads(command('tc', '-j', 'filter', 'show', 'dev', dev, direction)), dev
+    if native and not owned_private_tap:
+        gate = [sys.executable, os.environ['HONK_XDP_PROBE'], 'native-gate', dev]
+        if dev in ('dut0', 'dut1'):
+            if mode == 'guard':
+                saved_gate = pathlib.Path(f'{sys.argv[2]}.{dev}.native-gate-program.json')
+                recorded_pid = json.loads(saved_gate.read_text())['owner_pid']
+                assert type(recorded_pid) is int and recorded_pid > 0, 'saved Native gate has no owner PID'
+                gate += [str(recorded_pid), str(saved_gate)]
+            else:
+                gate += [os.environ['HONK_XDP_NATIVE_DAEMON_PID']]
+        else:
+            gate += ['0', 'none']
+        subprocess.run(gate, check=True)
     if dev in ('dut0', 'dut1'):
         assert not json.loads(command('ip', '-j', 'addr', 'show', 'dev', dev))[0]['addr_info'], 'captured port is numbered'
         assert link['num_rx_queues'] == 2, link
         xdp = link.get('xdp', {})
         program_id = xdp.get('prog', {}).get('id', 0) or xdp.get('prog_id', 0)
-        if mode == 'absent':
-            assert not program_id and xdp.get('attached') in (None, 'off'), xdp
-        else:
+        if mode != 'absent':
             assert program_id, xdp
             identity = [sys.executable, os.environ['HONK_XDP_PROBE'], 'identity', dev, mode]
             if mode == 'guard':
                 identity.append(pathlib.Path(f'{sys.argv[2]}.{dev}.guard-id').read_text().strip())
-            subprocess.run(identity, check=True)
+            subprocess.run(identity, check=True, env=dict(os.environ, **({'HONK_XDP_EXPECT_NAME': 'honk_nat_xdp'} if native and mode == 'data' else {})))
 print('kernel contract:', mode, flush=True)
 if mode == 'data':
     rules = json.loads(command('nft', '-j', 'list', 'chain', 'inet', 'honk_smoke_native', 'forward'))['nftables']
     expressions = [item['rule']['expr'] for item in rules if 'rule' in item]
-    assert len(expressions) == 1 and expressions[0][-1] == {'drop': None}, expressions
-    counter = next(item['counter'] for item in expressions[0] if 'counter' in item)
-    assert counter['packets'] == 0, ('native forwarding attempted during consumer proof', counter)
-    print('independent native-forward fence:', counter, flush=True)
+    if native:
+        assert not expressions, ('Native proof requires real kernel forwarding', expressions)
+    else:
+        assert len(expressions) == 1 and expressions[0][-1] == {'drop': None}, expressions
+        counter = next(item['counter'] for item in expressions[0] if 'counter' in item)
+        assert counter['packets'] == 0, ('native forwarding attempted during consumer proof', counter)
+        print('independent native-forward fence:', counter, flush=True)
 PY
 if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
     [[ $HONK_XDP_XSK_TEST_BIN == /* && -x $HONK_XDP_XSK_TEST_BIN ]] || fail 'invalid XSK test executable'
     for test in \
         bpf::general::tests::kernel_group_unicast_cannot_borrow_connected_socket_exemption \
         bpf::general::tests::kernel_native_destinations_and_metadata_counter_are_distinct \
-        bpf::general::tests::kernel_legacy_capture_keeps_rejection_counters_and_xsk_miss_closed; do
+        bpf::general::tests::kernel_legacy_capture_keeps_rejection_counters_and_xsk_miss_closed \
+        bpf::general::tests::kernel_native_counter_reference_admission_survives_prog_info_reuse \
+        bpf::general::tests::kernel_native_udp_claim_activity_reload_expiry_and_readonly_query \
+        bpf::general::tests::kernel_native_gate_survives_creator_death_after_attach \
+        bpf::general::tests::kernel_native_gate_failure_points_retain_custody \
+        bpf::general::tests::kernel_native_gate_pre_tap_and_pre_ip_boundaries \
+        bpf::general::tests::kernel_native_gate_reload_and_missing_gate_refusal \
+        bpf::general::tests::kernel_native_gate_stale_foreign_partial_recovery \
+        bpf::general::tests::kernel_native_gate_production_kernel_compare_rejections \
+        bpf::general::tests::kernel_native_gate_abi_negative_controls \
+        bpf::general::tests::kernel_native_gate_creator_death_custody_survives \
+        bpf::general::tests::kernel_native_gate_normal_stop_final_owner_drop \
+        bpf::general::tests::kernel_native_gate_live_xsk_frontier_pre_tap \
+        bpf::general::tests::kernel_native_v2_projection_import_rejections \
+        bpf::general::tests::kernel_native_gate_unlink_is_not_detach; do
         [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored XSK regression: $test"
     done
     ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" bpf::general::tests::kernel_ --ignored --test-threads=1 --nocapture | tee "$work/xsk-kernel.log"
+    for test in \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_owner_replacements_and_strict_isolation \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_staging_noops_and_recording_withdrawal \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_foreign_mutations_are_sticky \
+        bpf::general::tests::native_watch::kernel_native_gate_setlink_up_down_and_rejected_ack_cardinality \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_real_receive_loss_is_terminal \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_guard_errors_preserve_terminal_withdrawal \
+        bpf::general::tests::native_watch::kernel_native_gate_watched_activation_error_retains_actual_selection \
+        bpf::general::tests::native_watch::kernel_native_captured_watched_terminal_transitions \
+        bpf::general::tests::native_watch::kernel_native_captured_watched_foreign_close_is_sticky \
+        bpf::general::tests::native_watch::kernel_native_captured_watched_tap_close_custody \
+        bpf::general::tests::native_watch::kernel_native_captured_watched_composition_failure_contains_independently; do
+        [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored watched XSK regression: $test"
+        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/${test##*::}.log"
+    done
+    for test in \
+        bpf::general::tests::host::kernel_captured_return_scratch_and_downstream_outcomes; do
+        [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored captured XSK regression: $test"
+        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/${test##*::}.log"
+    done
 fi
 if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     [[ $HONK_XDP_CORE_TEST_BIN == /* && -x $HONK_XDP_CORE_TEST_BIN ]] || fail 'invalid Core test executable'
+    modprobe nf_conntrack
+    native_retirement_test=xdp::native::tests::real_map_udp_retirement_preserves_active_owned_and_late_activity_claims
+    [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$native_retirement_test" --exact --ignored --list --format terse) == "$native_retirement_test: test" ]] || fail "missing ignored Native retirement regression: $native_retirement_test"
+    ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$native_retirement_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/native-retirement.log"
+    for test in \
+        xdp::tests::retention::kernel_captured_return_small_jumbo_entry_and_fresh_grace \
+        xdp::tests::retention::kernel_captured_return_missing_entry_retains_owner \
+        xdp::tests::retention::kernel_captured_return_full_length_write_refused_after_admission \
+        xdp::tests::retention::kernel_captured_return_private_prerequisite_refusal \
+        xdp::tests::retention::native_committed_executors_never_return_original \
+        xdp::tests::retention::native_nonready_port_retains_runtime_before_take \
+        xdp::tests::retention::kernel_captured_return_terminal_proof_failures_retain_phases \
+        xdp::tests::retention::kernel_captured_return_failed_finish_close_stays_retained \
+        xdp::tests::retention::kernel_captured_return_empty_runtime_drop_quiesces_publication; do
+        [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored captured Core regression: $test"
+        ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/${test##*::}.log"
+    done
     ip -n dut route replace 198.51.100.99/32 dev dut1 src 203.0.113.1
     ip -n dut -6 route replace fd00:2::99/128 dev dut1 src fd00:77::1
     ip -n dut route replace 192.0.2.2/32 dev dut0 src 203.0.113.1
@@ -267,6 +415,7 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     ip -n dut route replace prohibit 198.51.100.98/32
     ip -n dut -6 route replace prohibit fd00:2::98/128
     driven_test=xdp::tests::driven_kernel::policy_publication_keeps_real_endpoint_app_timer_and_close_owned
+    multiqueue_test=xdp::tests::driven_kernel::two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned
     adaptive_test=xdp::tests::driven_kernel::adaptive::actual_owner_clock_budget_fairness_and_live_features
     for test in \
         control::core_forward::tests::firewall_capacity_refusal_keeps_packet_owner_alive \
@@ -274,7 +423,7 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
         control::core_forward::tests::generated_reassembly_error_keeps_scoped_nat_and_funding_through_completion \
         control::core_forward::tests::plain_output_history_survives_first_nat_enable_and_cq_owners \
         control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity \
-        "$driven_test" "$adaptive_test"; do
+        "$driven_test" "$multiqueue_test" "$adaptive_test"; do
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
     done
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" control::core_forward::tests:: --ignored --test-threads=1 --nocapture | tee "$work/core-forward.log"
@@ -282,9 +431,15 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     ip netns exec client nft add table inet honk_smoke_driven
     ip netns exec client nft 'add chain inet honk_smoke_driven prerouting { type filter hook prerouting priority -300; policy accept; }'
     ip netns exec client nft add rule inet honk_smoke_driven prerouting ip daddr 192.0.2.99 drop
-    ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work" "$HONK_XDP_CORE_TEST_BIN" "$driven_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/driven-runtime.log"
-    ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$work/driven-runtime.native-fence.json"
-    python3 - "$work/driven-runtime.native-fence.json" <<'PY'
+    for test in "$driven_test" "$multiqueue_test"; do
+        driven_work=$work
+        if [[ $test == "$multiqueue_test" ]]; then
+            driven_work="$work/multiqueue"
+            mkdir "$driven_work"
+        fi
+    ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$driven_work" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$driven_work/driven-runtime.log"
+    ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$driven_work/driven-runtime.native-fence.json"
+    python3 - "$driven_work/driven-runtime.native-fence.json" <<'PY'
 import json, pathlib, sys
 items = json.loads(pathlib.Path(sys.argv[1]).read_text())['nftables']
 rules = [item['rule']['expr'] for item in items if 'rule' in item]
@@ -294,13 +449,14 @@ assert counter['packets'] == 0, ('native forwarding masked real Runtime evidence
 PY
     for dev in dut0 dut1; do
         ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
-        guard_id=$(<"$work/driven-runtime.$dev.guard-id")
+        guard_id=$(<"$driven_work/driven-runtime.$dev.guard-id")
         ip netns exec dut env HONK_XDP_PIN_ROOT="$work/bpf/driven-runtime" python3 "$HONK_XDP_PROBE" identity "$dev" guard "$guard_id"
         ip -n dut link set "$dev" xdp off
         rm "$work/bpf/driven-runtime/xdp-$ifindex/guard" "$work/bpf/driven-runtime/xdp-$ifindex/data"
         rmdir "$work/bpf/driven-runtime/xdp-$ifindex"
     done
     rmdir "$work/bpf/driven-runtime"
+    done
     ip netns exec client nft delete table inet honk_smoke_driven
     ip netns exec dut nft flush chain inet honk_smoke_native forward
     ip netns exec dut python3 "$work/check.py" absent
@@ -682,7 +838,7 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
         print(mode, family, kind, 'echo verified', flush=True)
 PY
 write_config() {
-    local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= polling= log_level=info dns="dns { bind: '' }"
+    local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= polling= extra= log_level=info dns="dns { bind: '' }"
     if [[ -n ${5:-} ]]; then binding="xsk_mode: $5"; fi
     if [[ ${4:-} == snat || ${4:-} == masquerade ]]; then
         # Separate daemon profiles must not reuse the peer's retained TIME_WAIT tuple.
@@ -704,6 +860,26 @@ write_config() {
 }"
         packet_policy="dport(18083) -> direct(must)
     domain(packet-path.test) -> block"
+    fi
+    if [[ ${4:-} == native* ]]; then
+        dns="dns {
+    bind: ''
+    optimistic_cache_ttl: 0
+    upstream { default: 'udp://10.77.0.2:15353' }
+}"
+        packet_policy="dport(18083) -> direct(must)
+    domain(packet-path.test) -> block"
+        extra="node { fixture: 'socks5://10.77.0.2:11080' }
+group {
+    proxy {
+        filter: name(fixture)
+        policy: select
+    }
+}
+experimental {
+    clash_api { external_controller: '127.0.0.1:19090' }
+    cache_file { enabled: false }
+}"
     fi
     if [[ ${4:-} == endpoint ]]; then
         log_level=debug
@@ -746,8 +922,10 @@ routing {
     $packet_policy
     fallback: direct
 }
+$extra
 EOF
 }
+if [[ $smoke_scope != native ]]; then
 write_config "$work/asymmetric.dae" 'backend: xdp' 'direct: endpoint' '' 'copy'
 mark_phase admission begin
 python3 - "$work/asymmetric.dae" <<'PY'
@@ -850,14 +1028,31 @@ for profile in endpoint core; do
 done
 ip -n dut link del lowmtu
 mark_phase admission complete
-for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo; do
+fi
+python3 "$HONK_XDP_PROBE" native-coverage >"$work/native.acceptance.json"
+profiles=(endpoint endpoint-candidate-unflagged core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo)
+if [[ $smoke_scope == native ]]; then
+    case ${HONK_XDP_NATIVE_PROFILE:-both} in
+        both) profiles=(native native-nat) ;;
+        native|native-nat) profiles=("$HONK_XDP_NATIVE_PROFILE") ;;
+        *) fail 'invalid HONK_XDP_NATIVE_PROFILE' ;;
+    esac
+fi
+for profile in "${profiles[@]}"; do
+    if [[ $profile == native* ]]; then
+        native_active=true
+        export HONK_XDP_NATIVE_RUN=1
+        export HONK_XDP_NATIVE_PUBLICATION_PREFIX="$work/$profile.publication"
+    else
+        unset HONK_XDP_NATIVE_RUN HONK_XDP_NATIVE_PUBLICATION_PREFIX
+    fi
     mark_phase "$profile" setup-begin
     for spec in 'client c0' 'server s0' 'server su'; do
         read -r ns dev <<<"$spec"
         ip -n "$ns" link set lo up
         ip -n "$ns" link set "$dev" up
     done
-    if [[ $profile == *-jumbo ]]; then
+    if [[ $profile == *-jumbo || $profile == native* ]]; then
         for spec in 'dut dut0' 'dut dut1' 'dut up' 'client c0' 'server s0' 'server su'; do
             read -r ns dev <<<"$spec"
             ip -n "$ns" link set dev "$dev" mtu 9000
@@ -896,9 +1091,39 @@ for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoi
         ip netns exec dut sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
     fi
     mark_phase "$profile" guard-positive-complete
-    ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
+    if [[ $profile != native* ]]; then
+        ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
+    fi
     direct=core
     if [[ $profile == endpoint* ]]; then direct=endpoint; fi
+    if [[ $profile == native* ]]; then direct=native; fi
+    check_mode=data
+    if [[ $profile == native* ]]; then check_mode=native; fi
+    if [[ $profile == native-nat ]]; then
+        ip -n client -6 route replace fd00:2::99/128 dev c0
+        ip -n client -6 neigh replace fd00:2::99 lladdr 02:00:00:00:00:10 nud permanent dev c0
+        ip -n dut -6 addr replace fd00:99::1/128 dev lo nodad
+        ip -n server -6 route replace fd00:99::1/128 dev s0
+        ip -n server -6 neigh replace fd00:99::1 lladdr 02:00:00:00:00:11 nud permanent dev s0
+        ip netns exec dut nft -f - <<'NFT'
+table inet honk_smoke_nat {
+    chain prerouting {
+        type nat hook prerouting priority dstnat; policy accept;
+        ip daddr 198.51.100.99 dnat ip to 198.51.100.2
+        ip6 daddr fd00:2::99 dnat ip6 to fd00:2::2
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr 192.0.2.2 ip daddr 198.51.100.2 snat ip to 203.0.113.1
+        ip6 saddr fd00:1::2 ip6 daddr fd00:2::2 snat ip6 to fd00:99::1
+    }
+}
+NFT
+    fi
+    if [[ $profile == native* ]]; then
+        ip -n server addr replace 198.51.100.250/32 dev lo
+        ip -n server -6 addr replace fd00:2::250/128 dev lo nodad
+    fi
     write_config "$work/$profile.dae" 'backend: xdp' "direct: $direct" "$profile" 'copy'
     polling_args=()
     if [[ $profile == endpoint ]]; then
@@ -908,18 +1133,40 @@ for profile in endpoint endpoint-candidate-unflagged core snat masquerade endpoi
     fi
     ip -n dut -j address show >"$work/$profile.addresses.json"
     mark_phase "$profile" readiness-begin
-    ip netns exec server python3 "$work/echo.py" "$profile" "$work/$profile.server-ready" >"$work/$profile.server.log" 2>&1 &
-    server_pid=$!
+    if [[ $profile != native* ]]; then
+        ip netns exec server python3 "$work/echo.py" "$profile" "$work/$profile.server-ready" >"$work/$profile.server.log" 2>&1 &
+        server_pid=$!
+    fi
+    native_artifact_prefix=
+    native_artifact_collected=false
+    native_artifact_reasons=()
+    if [[ $profile == native* ]]; then
+        native_artifact_prefix="$work/$profile"
+        # Maintenance is real runtime work for every Native selection. The existing
+        # native/matrix probes additionally publish reload, mode and scoped DNS.
+        native_artifact_reasons=(9)
+        if [[ $profile == native && ${HONK_XDP_NATIVE_CASE:-matrix} == matrix ]]; then
+            native_artifact_reasons+=(7 8 6)
+        fi
+        if [[ $profile == native && ${HONK_XDP_NATIVE_CASE:-matrix} == ipv6-extensions ]]; then
+            native_artifact_reasons+=(7)
+        fi
+    fi
     ip netns exec dut "$daemon" -c "$work/$profile.dae" --bpf-pin-root "$work/bpf" "${polling_args[@]}" >"$work/$profile.daemon.log" 2>&1 &
     daemon_pid=$!
+    if [[ $profile == native* ]]; then export HONK_XDP_NATIVE_DAEMON_PID=$daemon_pid; fi
     ready=false
     for ((attempt=0; attempt<200; attempt++)); do
         kill -0 "$daemon_pid" 2>/dev/null || fail "$profile daemon exited; see $work/$profile.daemon.log"
-        kill -0 "$server_pid" 2>/dev/null || fail "$profile server exited"
-        if [[ -f $work/$profile.server-ready ]] && grep -q 'XDP datapath ready' "$work/$profile.daemon.log"; then ready=true; break; fi
+        if [[ -n $server_pid ]]; then kill -0 "$server_pid" 2>/dev/null || fail "$profile server exited"; fi
+        if { [[ $profile == native* ]] || [[ -f $work/$profile.server-ready ]]; } && grep -q 'XDP datapath ready' "$work/$profile.daemon.log"; then ready=true; break; fi
         sleep 0.1
     done
     [[ $ready == true ]] || fail "$profile readiness deadline"
+    if [[ $profile == native* ]]; then
+        ip netns exec dut python3 "$script_dir/native-publication.py" bind \
+            "$work/$profile.daemon.log" "$daemon_pid" "$work/$profile.publication"
+    fi
     mark_phase "$profile" ready
     python3 - "$work/$profile.daemon.log" <<'PY'
 import pathlib, re, sys
@@ -934,20 +1181,37 @@ for interface in ('dut0', 'dut1'):
 print('all selected RX queues bound before readiness')
 PY
     mark_phase "$profile" pre-client-check-begin
-    ip netns exec dut python3 "$work/check.py" data
+    ip netns exec dut python3 "$work/check.py" "$check_mode"
     for dev in dut0 dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" pin-id "$dev" guard >"$work/$profile.$dev.guard-id"; done
+    if [[ $profile == native* ]]; then
+        for dev in dut0 dut1; do
+            ip netns exec dut python3 "$HONK_XDP_PROBE" native-gate "$dev" "$daemon_pid" >"$work/$profile.$dev.native-gate-program.json"
+        done
+        ip netns exec dut python3 "$HONK_XDP_PROBE" native-return "$daemon_pid" "$work/$profile.publication" >"$work/$profile.native-return.json"
+    fi
     ip -n dut -j -d link show >"$work/$profile.links.json"
     mark_phase "$profile" client-begin
-    ip netns exec client python3 "$work/client.py" "$profile" "$work/$profile.dae" "$work/$profile.daemon.log" "$daemon_pid" | tee "$work/$profile.client.log"
+    if [[ $profile == native* ]]; then
+        python3 "$HONK_XDP_PROBE" native-daemon "$profile" "$work/$profile.dae" "$work/$profile.daemon.log" "$daemon_pid" "${HONK_XDP_NATIVE_CASE:-matrix}" "$native_hbh_baseline" | tee "$work/$profile.client.log"
+    else
+        ip netns exec client python3 "$work/client.py" "$profile" "$work/$profile.dae" "$work/$profile.daemon.log" "$daemon_pid" | tee "$work/$profile.client.log"
+    fi
     mark_phase "$profile" client-complete
-    ip netns exec dut python3 "$work/check.py" data
-    wait "$server_pid"
-    server_pid=
+    ip netns exec dut python3 "$work/check.py" "$check_mode"
+    if [[ -n $server_pid ]]; then
+        wait "$server_pid"
+        server_pid=
+    fi
     mark_phase "$profile" server-joined
-    for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
-    mark_phase "$profile" producers-settled
+    if [[ $profile != native* ]]; then
+        for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+        mark_phase "$profile" producers-settled
+    fi
     if [[ $profile == endpoint || $profile == core ]]; then
         python3 "$HONK_XDP_PROBE" domain "$profile" | tee "$work/$profile.domain-routing.log"
+    fi
+    if [[ $profile == native && ${HONK_XDP_NATIVE_CASE:-matrix} == matrix ]]; then
+        python3 "$HONK_XDP_PROBE" domain native | tee "$work/$profile.domain-routing.log"
     fi
     if [[ $profile == snat || $profile == masquerade ]]; then
         ip netns exec server cat /proc/net/tcp >"$work/$profile.server-tcp.txt"
@@ -961,32 +1225,67 @@ PY
     if [[ $profile == core-vlan-single-offload ]]; then
         HONK_XDP_SINGLE_VLAN=1 python3 "$HONK_XDP_PROBE" padding | tee "$work/$profile.padded-vlan.log"
     fi
+    if [[ $profile == native* ]]; then
+        ip netns exec dut python3 "$HONK_XDP_PROBE" native-return "$daemon_pid" "$work/$profile.publication" >"$work/$profile.native-return.after.json"
+    fi
     mark_phase "$profile" probes-complete
-    ip netns exec dut python3 "$work/check.py" data
+    ip netns exec dut python3 "$work/check.py" "$check_mode"
     mark_phase "$profile" shutdown-begin
+    if [[ $profile == native* ]]; then
+        python3 "$script_dir/native-publication.py" shutdown "$work/$profile.publication"
+    fi
     kill -TERM "$daemon_pid"
     timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'daemon shutdown deadline (guard custody retained)'
-    wait "$daemon_pid"
+    daemon_status=0
+    wait "$daemon_pid" || daemon_status=$?
     daemon_pid=
+    native_collect "$daemon_status" || fail "Native stop artifact incomplete; see $work/$profile.publication.consumer.log"
+    [[ $daemon_status == 0 ]] || fail "$profile daemon exited with status $daemon_status; stop artifact retained"
     mark_phase "$profile" daemon-joined
+    if [[ $profile == native* ]]; then
+        # The daemon's warm pool owns the SOCKS peer's remaining TCP half.
+        for ns in client server; do ip netns exec "$ns" python3 "$HONK_XDP_PROBE" settled; done
+        mark_phase "$profile" producers-settled
+    fi
+    if [[ $profile == native-nat ]]; then
+        ip netns exec dut nft -j list table inet honk_smoke_nat >"$work/$profile.nft.json"
+        ip netns exec dut nft delete table inet honk_smoke_nat
+    fi
     ip netns exec dut nft flush chain inet honk_smoke_native forward
     grep -q 'XDP admission closed; UMEM retained until process exit' "$work/$profile.daemon.log" || fail 'missing shutdown admission fence'
     mark_phase "$profile" guard-negative-begin
-    ip netns exec dut python3 "$work/check.py" guard "$work/$profile"
+    guard_check=guard
+    if [[ $profile == native* ]]; then guard_check=native-guard; fi
+    ip netns exec dut python3 "$work/check.py" "$guard_check" "$work/$profile"
     python3 "$HONK_XDP_PROBE" guard refused "$client_dev" "$server_dev" | tee "$work/$profile.guard-negative.log"
     mark_phase "$profile" guard-negative-complete
     stop_sources
     # Deliberate operator removal with traffic already stopped; never automatic hot reopen.
-    for dev in dut0 dut1; do
-        ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
-        [[ -f $work/bpf/xdp-$ifindex/guard && -f $work/bpf/xdp-$ifindex/data ]] || fail 'missing persistent program pins'
-        ip -n dut link set "$dev" xdp off
-        rm "$work/bpf/xdp-$ifindex/guard" "$work/bpf/xdp-$ifindex/data"
-        rmdir "$work/bpf/xdp-$ifindex"
-    done
+    if [[ $profile == native* ]]; then
+        ip netns exec dut python3 "$HONK_XDP_PROBE" native-cleanup "$work/$profile" dut0 dut1
+    else
+        for dev in dut0 dut1; do
+            ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
+            [[ -f $work/bpf/xdp-$ifindex/guard && -f $work/bpf/xdp-$ifindex/data ]] || fail 'missing persistent program pins'
+            ip -n dut link set "$dev" xdp off
+            rm "$work/bpf/xdp-$ifindex/guard" "$work/bpf/xdp-$ifindex/data"
+            rmdir "$work/bpf/xdp-$ifindex"
+        done
+    fi
     ip netns exec dut python3 "$work/check.py" absent
+    if [[ $profile == native* ]]; then native_active=false; fi
     mark_phase "$profile" detached
+    if [[ $profile == *-jumbo || $profile == native* ]]; then
+        for spec in 'dut dut0' 'dut dut1' 'dut up' 'client c0' 'server s0' 'server su'; do
+            read -r ns dev <<<"$spec"
+            ip -n "$ns" link set dev "$dev" mtu 1500
+        done
+    fi
 done
+if [[ $smoke_scope == native ]]; then
+    printf 'Native selected real-daemon cases completed; all65 acceptance remains separate.\n'
+    exit 0
+fi
 mark_phase tc setup-begin
 for spec in 'dut lans' 'dut wans' 'client clis' 'server srvs'; do
     read -r ns dev <<<"$spec"

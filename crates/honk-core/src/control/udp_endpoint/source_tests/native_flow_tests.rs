@@ -51,6 +51,7 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap()
@@ -61,7 +62,10 @@ async fn native_shared_source_idle_keeps_reply_evidence_per_flow_view() {
             attachment,
             target,
             None,
-            Arc::new(pool.create_reply_socket(lease.scope(), target).unwrap()),
+            Arc::new(
+                pool.create_reply_socket(lease.scope(), target, None)
+                    .unwrap(),
+            ),
             stats.outbound_tracker("core-source-vless", crate::stats::OutboundKind::Node),
             node.id,
             honk_outbound::alive::IpVersion::V4,

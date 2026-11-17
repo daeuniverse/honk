@@ -24,7 +24,7 @@
 
 ## 独立监听器（`bind`）
 
-独立监听器使用普通 host-netns socket，TC/XDP 与普通嵌入不设置 mark。`backend: tun` 时，每个 listener 在 bind/listen 前严格设置并回读有效 `global.so_mark_from_dae`，accepted TCP child 继承它，使远端回复旁路 capture。TUN 在任何改路前解析并保留 hostname bind 候选，配置地址存在后再 bind。UDP/TCP 独立应答都写入 TUN 的真实已注册 packet realm，loopback/LAN bind 也不写 HOST 事实；持久 TCP 每帧重查当前 packet admission。关闭监听不关闭捕获的 TCP/UDP53 DNS，后者遵循[流量规则所有权](./routing.md#出站目标与-must)及所选 Direct 执行 profile。见 [TUN DNS 所有权](../design/dns.md#入口路径)。
+独立 listener 使用普通 host-netns socket，TC/XDP 与普通嵌入不设置 mark。`backend: tun` 时，listener 在 bind/listen 前严格设置并回读有效 `global.so_mark_from_dae`，accepted TCP child 继承它。TUN 在改路前保留 hostname bind 候选，配置地址存在后再 bind。两种独立传输均在已注册 plain scope 学习，包括 loopback/LAN bind；透明 DNS 在各自 packet 的 plain 或 Host scope 学习，两者均不借用 HOST 事实。持久 TCP 每帧重查准入。关闭监听不关闭捕获的 TCP/UDP53 DNS；见 [TUN DNS 所有权](../design/dns.md#入口路径)。
 
 | 值 | 结果 |
 | --- | --- |

@@ -21,9 +21,9 @@ pub struct RoutingRule {
     /// outbound and tells the control plane to skip TLS/HTTP sniffing.
     #[serde(default)]
     pub must: bool,
-    /// fwmark to set on matched connections (0 = no mark).
+    /// Explicit fwmark operation; `None` keeps the incoming mark and `Some(0)` sets zero.
     #[serde(default)]
-    pub mark: u32,
+    pub mark: Option<u32>,
 }
 
 /// Conditions for matching traffic.
@@ -289,9 +289,9 @@ pub struct RoutingConfig {
     /// Makes the fallback action terminal, like a matched `must` rule.
     #[serde(default)]
     pub default_must: bool,
-    /// Fallback direct mark (0 = no mark).
+    /// Explicit fallback fwmark operation; `None` keeps the incoming mark and `Some(0)` sets zero.
     #[serde(default)]
-    pub default_mark: u32,
+    pub default_mark: Option<u32>,
     #[serde(skip)]
     complex_rule_sources: HashMap<String, String>,
 }
@@ -306,7 +306,7 @@ impl Default for RoutingConfig {
             rules: vec![],
             default_outbound: "direct".to_string(),
             default_must: false,
-            default_mark: 0,
+            default_mark: None,
             complex_rule_sources: HashMap::new(),
         }
     }

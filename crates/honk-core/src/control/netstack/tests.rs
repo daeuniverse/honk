@@ -8,8 +8,11 @@ use honk_netstack::{ExcludeSet, Mode};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 mod driven;
+mod host;
 mod offload;
 mod progress;
+#[cfg(target_os = "linux")]
+mod realm;
 
 fn config() -> Config {
     let mut cfg = Config::new([37; 32]);

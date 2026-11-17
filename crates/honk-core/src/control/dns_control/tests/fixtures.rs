@@ -129,7 +129,7 @@ pub(super) fn projection_controller(
                 outbound: RoutingOutbound::Simple("direct".into()),
                 priority: 0,
                 must: false,
-                mark: 0,
+                mark: None,
             }],
             "direct",
         )

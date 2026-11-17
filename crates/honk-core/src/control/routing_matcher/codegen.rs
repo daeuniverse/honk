@@ -16,7 +16,8 @@ use honk_ebpf_common::{
     ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES,
     ROUTE_TRACE_VERSION, ROUTE_TRACE_WORDS, ROUTING_FACT_CAPACITY, ROUTING_FEATURE_DOMAIN,
     ROUTING_FEATURE_DOMAIN_REROUTE, ROUTING_FEATURE_PROCESS, ROUTING_INPUT_ALLOW_DIRECT_FINALITY,
-    ROUTING_INPUT_MAC_PRESENT, ROUTING_PROCESS_MAX_LEN, RoutingDecision, RoutingInput,
+    ROUTING_INPUT_MAC_PRESENT, ROUTING_MARK_KEEP, ROUTING_MARK_SET, ROUTING_PROCESS_MAX_LEN,
+    RoutingDecision, RoutingInput,
 };
 
 const R0: u8 = 0;
@@ -56,6 +57,7 @@ const MUST: i16 = std::mem::offset_of!(RoutingDecision, must) as i16;
 const DOMAIN_FINAL: i16 = std::mem::offset_of!(RoutingDecision, domain_final) as i16;
 const RULE_ID: i16 = std::mem::offset_of!(RoutingDecision, rule_id) as i16;
 const TRACE_FLAGS: i16 = std::mem::offset_of!(KernelRouteOutput, flags) as i16;
+const MARK_KIND: i16 = std::mem::offset_of!(KernelRouteOutput, mark_kind) as i16;
 const TRACE_FACT_STATE: i16 = std::mem::offset_of!(KernelRouteOutput, fact_state) as i16;
 const TRACE_INPUT: i16 = std::mem::offset_of!(KernelRouteOutput, input) as i16;
 const TRACE_DOMAIN: i16 = std::mem::offset_of!(KernelRouteOutput, domain_bitmap) as i16;
@@ -112,6 +114,7 @@ struct Assembler {
     labels: Vec<Option<usize>>,
     fixups: Vec<(usize, Label)>,
     trace_layout: Option<KernelTraceLayout>,
+    host_scratch: bool,
 }
 
 impl Assembler {
@@ -122,6 +125,7 @@ impl Assembler {
             labels: Vec::new(),
             fixups: Vec::new(),
             trace_layout: None,
+            host_scratch: false,
         }
     }
 
@@ -148,6 +152,26 @@ impl Assembler {
             self.insns.len() < BPF_INSTRUCTION_CAPACITY,
             "routing program exceeds BPF instruction capacity"
         );
+        let (dst, src) = if self.host_scratch {
+            if dst == R10 {
+                ensure!(
+                    matches!(code & 7, BPF_ST | BPF_STX),
+                    "unexpected Host frame-pointer destination"
+                );
+            }
+            if src == R10 {
+                ensure!(
+                    code & 7 == BPF_LDX || code == (BPF_ALU64 | BPF_MOV | BPF_X),
+                    "unexpected Host frame-pointer source"
+                );
+            }
+            (
+                if dst == R10 { R9 } else { dst },
+                if src == R10 { R9 } else { src },
+            )
+        } else {
+            (dst, src)
+        };
         let insn = bpf_insn {
             code: code as u8,
             _bitfield_1: bpf_insn::new_bitfield_1(dst, src),
@@ -271,6 +295,23 @@ pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
+    emit_routing_program_inner(plan, fds, false)
+}
+
+/// Host callers reserve the output's unused trace payload as scratch under their busy guard.
+/// This shares canonical routing while leaving no additional BPF stack frame or trace output.
+pub fn emit_host_routing_program(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+) -> anyhow::Result<RoutingBytecode> {
+    emit_routing_program_inner(plan, fds, true)
+}
+
+fn emit_routing_program_inner(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+    host_scratch: bool,
+) -> anyhow::Result<RoutingBytecode> {
     validate_plan(plan)?;
     for (name, fd) in [
         ("destination_v4", fds.destination_v4),
@@ -284,7 +325,12 @@ pub fn emit_routing_program(
     }
 
     let mut asm = Assembler::new();
-    asm.trace_layout = plan.trace_layout();
+    asm.host_scratch = host_scratch;
+    asm.trace_layout = if host_scratch {
+        None
+    } else {
+        plan.trace_layout()
+    };
     asm.source(0, "routing function prologue");
     for register in [R1, R2] {
         let nonnull = asm.label();
@@ -295,9 +341,16 @@ pub fn emit_routing_program(
     }
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
+    if host_scratch {
+        const END: i16 = TRACE_INPUT - STACK_DOMAIN_KEY;
+        const _: () = assert!(END as usize <= std::mem::size_of::<KernelRouteOutput>());
+        asm.mov_reg(R9, R2)?;
+        asm.add_imm(R9, i32::from(END))?;
+    }
     asm.st_imm(R7, DIRECT_MARK_INDEX, u32::MAX as i32)?;
     asm.st_imm(R7, OUTBOUND, plan.fallback.outbound as i32)?;
     asm.st_imm(R7, MARK, 0)?;
+    asm.st_imm(R7, MARK_KIND, ROUTING_MARK_KEEP as i32)?;
     asm.st_imm(R7, MUST, 0)?;
     asm.st_imm(
         R7,
@@ -399,9 +452,16 @@ fn emit_action(
     if rule_id.is_some() {
         asm.st_imm(R7, OUTBOUND, action.outbound as i32)?;
     }
-    if rule_id.is_some() || action.mark != 0 {
-        asm.st_imm(R7, MARK, action.mark as i32)?;
-    }
+    asm.st_imm(R7, MARK, action.mark.unwrap_or(0) as i32)?;
+    asm.st_imm(
+        R7,
+        MARK_KIND,
+        if action.mark.is_some() {
+            ROUTING_MARK_SET
+        } else {
+            ROUTING_MARK_KEEP
+        } as i32,
+    )?;
     if rule_id.is_some() || action.must {
         asm.st_imm(R7, MUST, action.must as i32)?;
     }

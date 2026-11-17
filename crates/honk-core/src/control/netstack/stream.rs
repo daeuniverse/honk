@@ -20,6 +20,7 @@ pub struct FlowIo {
     dscp: u8,
     open: bool,
     routing: Option<crate::control::packet_endpoint::EndpointAdmission>,
+    packet_source: Option<super::SourceWork>,
 }
 
 impl FlowIo {
@@ -32,6 +33,7 @@ impl FlowIo {
             dscp: syn.dscp,
             open: true,
             routing: None,
+            packet_source: None,
         }
     }
 
@@ -50,6 +52,14 @@ impl FlowIo {
     pub fn flow_id(&self) -> FlowId {
         self.id
     }
+    }
+
+    pub(in crate::control) fn packet_source(&self) -> Option<&super::SourceWork> {
+        self.packet_source.as_ref()
+    }
+
+    pub(super) fn set_packet_source(&mut self, source: super::SourceWork) {
+        self.packet_source = Some(source);
 
     /// Mark only a successfully selected non-Block outbound stream, never pending routing.
     pub(in crate::control) fn mark_rx_admitted(&self) {

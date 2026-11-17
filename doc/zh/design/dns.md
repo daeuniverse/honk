@@ -64,7 +64,7 @@ flowchart LR
 
 每个 TUN listener socket 先创建，严格设置并回读有效 bypass mark M，再 bind/listen、转换为 Tokio。Accepted TCP 继承 M，UDP 保留 packet-info 源选择。bind 仍是普通 host-netns 服务，从 peer 取得 source，`original_dst=None`。TC/XDP/普通嵌入继续使用无 mark 独立 socket。Clash/native API listener 遵循同样的 TUN pre-bind/listen mark 顺序，使面向 capture 内远端客户端的回复经 main 旁路。
 
-配置 TUN 的 listener 使用唯一真实、已注册的非 HOST `PacketScope` 作为 `fact_scope`，即使 bind 在 loopback/LAN 地址也一样。UDP 使用该 scope 的当前 packet-query admission，持久 TCP 每帧重新检查当前 packet admission。透明 packet UDP53/TCP DNS 同样使用实际 realm；Host 发起的捕获包也不例外，裸 L3 不是 HostFacts，不能选择 `ScopeId::HOST`。TC/XDP/非 TUN 独立调用者明确保持 HOST。不新增 tuple 永久 DNS permit cache、HOST bitmap 副本、第二个 server 或 projector。
+配置 TUN 的独立 listener 使用已注册的 plain 非 HOST scope，即使绑定 loopback/LAN 也一样。UDP 使用当前 packet-query admission，持久 TCP 每帧重查。透明 DNS 使用实际 packet scope，包括启用时独立的认证 Host scope。两者均不借用 HOST 事实；TC/XDP/非 TUN 独立调用者保留 HOST。不新增 tuple 永久 permit cache 或第二个 projector。
 
 独立监听器具有以下生命周期与准入不变量：
 
@@ -305,6 +305,8 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
 Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
+
+Native XDP 消费同一组非 HOST scoped facts 的不可变导出。Observation、同集 TTL 缩短、clear、共享容量淘汰、snapshot rebuild 与到期清理，都在首次权威修改前关闭 kernel publication。导出绑定真实 scope revision、snapshot generation、Router policy fingerprint 与所有贡献 owner 的最早原始 expiry。内核 deadline 使用保守 BOOTTIME 换算，检测到 clock domain 变化则拒绝，不因重新准备延长原始有效期。增量 HOST map worker 仍是独立消费端，不能重新打开 scoped Native 权限。
 
 新建数值目标的 packet TCP/UDP 路由通过 canonical Router 消费同一 scope 尚未过期的 bitmap，不虚构 hostname，并保留规则顺序、mode 与终态 `must`/`block` 语义。已接纳的 transport 保留原有路由所有权；配置允许的真实嗅探名称重路由仍使用既有语义。软件查询要求已提交的 routing generation 与 policy fingerprint 同时匹配，不匹配时失败，而不是当作缺失域名事实回退。
 

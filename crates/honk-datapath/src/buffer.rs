@@ -161,6 +161,8 @@ pub struct DrainState {
     /// Published FILL descriptors not yet observed consumed; a subset of `fill_posted`.
     pub fill_queued: usize,
     pub rx_leased: usize,
+    /// Adapter-held packet identities awaiting completion acknowledgment after lease release.
+    pub rx_completions: usize,
     pub control_free: usize,
     pub control_reserved: usize,
     pub control_outstanding: usize,
@@ -185,6 +187,7 @@ impl DrainState {
     fn cpu_tx_drained(self) -> bool {
         self.fill_reserved == 0
             && self.rx_leased == 0
+            && self.rx_completions == 0
             && self.control_reserved == 0
             && self.control_outstanding == 0
             && self.bulk_reserved == 0
@@ -363,6 +366,11 @@ impl<O: Copy> FrameLedger<O> {
         self.fill_used -= 1;
         self.release_frame(index);
         Ok(())
+    }
+
+    /// Available CPU receive leases, independent of posted FILL descriptor credit.
+    pub fn rx_credit(&self) -> usize {
+        self.config.rx_capacity - self.rx_leased
     }
 
     /// Validate RX geometry and ownership without acquiring a lease or spending RX credit.
@@ -821,6 +829,24 @@ mod tests {
         assert_eq!(foreign.release_tx(next), Err(LedgerError::ForeignLease));
         assert_eq!(ledger.release_tx(next), Ok(42));
         assert!(ledger.drain_state().is_drained());
+        assert_eq!(ledger.rx_credit(), config().rx_capacity);
+        let fill = ledger.reserve_fill().unwrap();
+        let address = ledger.submit_fill(fill).unwrap();
+        ledger.consume_fill(1).unwrap();
+        let rx = ledger.receive_rx(address, 64).unwrap();
+        assert_eq!(ledger.rx_credit(), 0);
+        assert_eq!(foreign.relinquish_rx(rx), Err(LedgerError::ForeignLease));
+        ledger.relinquish_rx(rx).unwrap();
+        assert_eq!(ledger.rx_credit(), config().rx_capacity);
+        let reused = ledger.reserve_fill().unwrap();
+        assert_eq!(reused.address(), address);
+        ledger.submit_fill(reused).unwrap();
+        ledger.consume_fill(1).unwrap();
+        let current = ledger.receive_rx(address, 64).unwrap();
+        assert_eq!(ledger.relinquish_rx(rx), Err(LedgerError::StaleLease));
+        assert_eq!(ledger.rx_credit(), 0);
+        ledger.relinquish_rx(current).unwrap();
+        assert_eq!(ledger.rx_credit(), config().rx_capacity);
     }
 
     #[test]

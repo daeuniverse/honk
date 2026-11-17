@@ -144,7 +144,7 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
     let output_fields = [
         ("decision", offset_of!(KernelRouteOutput, decision)),
         ("flags", offset_of!(KernelRouteOutput, flags)),
-        ("padding", offset_of!(KernelRouteOutput, padding)),
+        ("mark_kind", offset_of!(KernelRouteOutput, mark_kind)),
         ("generation", offset_of!(KernelRouteOutput, generation)),
         ("policy_id", offset_of!(KernelRouteOutput, policy_id)),
         ("fact_state", offset_of!(KernelRouteOutput, fact_state)),
@@ -165,14 +165,8 @@ fn routing_decision_layout(btf: &btf::Btf, slot: &str) -> Option<()> {
         if btf.string(read(member)?) != Some(name) || read(member + 8)? != offset as u32 * 8 {
             return None;
         }
-        if name == "padding" {
-            let padding = btf.resolve_modifiers(read(member + 4)?)?;
-            if btf.kind(padding)? != 3
-                || read(padding + 20)? != 4
-                || !btf.unsigned_integer_width(read(padding + 12)?, 1)
-            {
-                return None;
-            }
+        if name == "mark_kind" && !btf.unsigned_integer_width(read(member + 4)?, 4) {
+            return None;
         }
         if name == "input" {
             let input = btf.resolve_composite(read(member + 4)?)?;
@@ -529,6 +523,16 @@ impl RealEbpfBackend {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            plan.rules
+                .iter()
+                .map(|rule| rule.action.mark)
+                .chain(std::iter::once(plan.fallback.mark))
+                .all(|mark| mark.is_none_or(|value| value
+                    & honk_config::routing::DATAPATH_RESERVED_MARK_MASK
+                    == 0)),
+            "TC routing cannot execute marks with datapath-reserved bits"
+        );
         let generation = self.reserve_routing_generation()?;
         let trace_policy = if plan.trace_enabled() {
             self.next_trace_policy = self.next_trace_policy.saturating_add(1);

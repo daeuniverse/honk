@@ -65,6 +65,7 @@ async fn queued_source_view_timeout_is_local_congestion() {
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
         None,
+        None,
     );
     let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
     let endpoint_b = install_source(&pool, lease_b, attachment_b, target_b, &stats, node.id);
@@ -304,6 +305,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
             Arc::clone(&stats),
             honk_outbound::alive::IpVersion::V4,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -312,6 +314,7 @@ async fn retired_source_preparation_is_typed_and_score_neutral() {
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
         None,
     );
 
@@ -635,6 +638,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
         None,
+        None,
     );
     drop(endpoint_a);
     drop(endpoint_b);
@@ -689,6 +693,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
                 Arc::clone(&stats),
                 honk_outbound::alive::IpVersion::V4,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -696,6 +701,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
             scope: prepared_scope,
             prepared: source::PreparedSourceTransport::Vless(prepared),
             source_permit,
+            packet_source,
             runtime: prepared_runtime,
             alive_set,
             stats: prepared_stats,
@@ -713,6 +719,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
                 honk_outbound::proxy::PreparedUdpTransport::ready(Arc::clone(&transport)),
             ),
             source_permit,
+            packet_source,
             runtime: prepared_runtime,
             alive_set,
             stats: prepared_stats,
@@ -740,6 +747,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
             &runtime,
             client_addr,
             SourcePath::Vless(VlessUdpPath::Xudp),
+            None,
             None,
         );
         let endpoint_a = install_source(&pool, lease_a, attachment_a, target_a, &stats, node.id);
@@ -779,7 +787,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
         );
         let identity_b = endpoint_identity(&pool, client_addr, target_b).unwrap();
         assert!(pool.retire_if_same(
-            EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_b),
+            EndpointKey::new(honk_datapath::ScopeId::HOST, client_addr, target_b, None),
             identity_b.0,
             identity_b.1,
         ));
@@ -814,6 +822,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
                 removed.dst,
                 removed.owner,
                 removed.generation,
+                removed.packet_lineage,
             ));
         }
         drop(endpoint_a);
@@ -901,6 +910,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
         &runtime,
         client_addr,
         SourcePath::Vless(VlessUdpPath::Xudp),
+        None,
         None,
     );
     let owner = Arc::clone(pool.sources.get(&scope).unwrap().value());
