@@ -2,28 +2,6 @@
 
 原生 API 与已实现的 Clash 兼容 HTTP 接口共用底层引擎句柄及用户态统计，但功能开关、监听器、凭据及 HTTP 边界相互独立。
 
-## Native publication 产物
-
-Native XDP 转换的预期契约导出独立 root-owned、0600 文件：`<data_dir>/state/native-publication/<pid>-<starttime_ticks>-<publication_serial>.json`，不依赖 native/Clash HTTP feature 或诊断采集需求。既有 64 KiB datapath detail 响应只是最新有界快照，不是连续转换历史；它与 2 MiB Native event stream 均不包含完整 publication ring。不增加 history endpoint 或配置 knob。本次交接的 exporter/consumer 定向检查与真实 hook 检查均为 **NOT_RUN**；契约说明不等于运行验收。
-
-任何 Native 挂载前，原子发布 schema 为 `native-publication/v1` 的初始 manifest，绑定 boot ID、PID/starttime、publication serial、root map/build 身份、limits 和 epoch-zero 初态，并标记 `final=false`。记录/导出前提不可用时拒绝启动；structured startup/readiness 输出公布精确路径。身份、epoch、seq、count、纳秒时间等完整宽度整数均为十进制字符串。Clock 显式声明 `CLOCK_BOOTTIME`、单位 `ns`；消费端保留 store 的前后时间区间，不能把一次读时钟当成精确 store 时刻。
-
-固定准入上限为 32 个已注册 hook 身份 / 16 个 target 身份，`data_dir` 路径上限为 1,024 字节，不允许截断。超过任一上限都必须在任何 Native 挂载前显式拒绝启动。身份容量溢出设置 sticky `recording_error`，拒绝新的 evidence-capable 操作。Startup manifest 导出全部容量，包括 event ring、身份表与路径上限；消费端不能因保留历史较短就推断容量无限。
-
-有界导出包含 collection start/end、初始/最终 epoch 与 flags、ready/failure/terminal 状态、`hooks_joined`、独立的 hook 身份覆盖、不可变有序 event、已封存 counter generation 标记，以及 sticky recording/clock/accounting/overflow 故障。Ring metadata 公布容量 4,096、`first_retained_seq`、`last_seq`、`total_appended`、`overwritten_events`。未知 schema/kind/flag、非零 reserved、JSON 损坏/截断、seq 重复/乱序、store/grace/outcome 不匹配、counter tag 错误或 header 矛盾均不构成受支持的完整证据。
-
-在真实终止 detach/join 加 reader grace 和 counter finalization 后，owner 将 ring 流式写入同目录临时文件，flush/sync 文件、原子 rename 替换初始 manifest，再 sync 目录，最后释放记录资源。独立 structured shutdown 字段 `export_publication_result` 的含义如下，关闭返回错误时也必须记录：
-
-| 结果 | 含义 |
-| --- | --- |
-| `NOT_PUBLISHED` | 成功替换 rename 前失败，初始不完整 manifest 保留。 |
-| `PUBLISHED_DURABILITY_UNKNOWN` | Rename 已成功但目录 sync 失败；可见替换文件可能已含 `final=true`，持久性未确认。 |
-| `PUBLISHED_DURABLE` | 替换与目录 sync 成功；单凭此结果仍不能证明历史完整或 hook 已 join。 |
-
-Shutdown result 绑定 publication 身份/路径，发布成功时还绑定流式产物 digest。被 rename 的文件不能证明之后的目录 sync。声称整次运行完整的消费端必须保留**匹配的 `PUBLISHED_DURABLE` 结果**并验证产物 digest 一致，还须建立 `final=true`、collection end 晚于所请求工作、终止 hook join/finalization、完整身份覆盖、所有 covered counter 已封存、intent/store/grace/writer outcome 匹配、`first_retained_seq=1`、event 连续为 `1..last_seq`、`total_appended=last_seq=count(events)`、`overwritten_events=0` 且无 recording/clock/accounting/counter overflow。仅有 `final=true`、未知持久性、结果缺失/未绑定/矛盾、provisional counter 或初始 manifest 均不满足要求。
-
-可达 failed-retained 退出在 forget owner 前尝试 `final=false`、`complete=false` 部分导出并记录 publication result；未证明 join 时保持 `hooks_joined=false`。Ring 淘汰只保留可检测的后缀；crash/断电可能仅留下初始 manifest，rename 后失败可能留下可见 terminal JSON 却无持久结果保管。不提供持续 fsync 的 crash journal 或固定保留时长。记录计量逐 hook closed 分支执行，不是去重包、流、wire arrival 或逐包因果关系。见[计数语义与预算](../design/datapath.md#native-closed-epoch-计数)、[发布顺序](../design/control-plane.md#native-发布转换记录)与[采集步骤](../operations/long-connections.md#采集-native-publication-证据)。
-
 ## 原生 API
 
 原生 API 需要显式启用 `native-api` Cargo 功能：以 `--features native-api`（或 `native-ui`）构建。`--no-default-features --features native-api` 可脱离 Clash 使用。按所需接口选择发布产物：

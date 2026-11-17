@@ -245,19 +245,8 @@ datapath {
 }
 ```
 
-`direct` must be `core` (final Direct packets use CoreForward), `endpoint`
-(Direct TCP terminates and relays), or `native` (eligible final Direct packets
-continue through the Linux stack using XDP candidate `PASS`). Native requires
-real eBPF and `global.nfqueue_enable: false`. It supports physical-interface capture
-or the Host-only mode below, not both together. TC and TUN reject `direct: native`;
-firewall/NAT remain exclusive to `direct: core`. Physical Native acceptance requires
-the TCX final gate and actual capture/return ownership; selecting the profile does
-not establish full V7 acceptance or a passing real-kernel test result.
-
-The current Native consumer requires `dial_mode: ip` and untagged physical ingress.
-Invalidating DNS changes temporarily close every Native-configured ingress while
-reader grace and candidate preparation run. Business packets in that window are
-refused; its bound under real DNS load is not yet measured.
+`direct` must be `core` (final Direct packets use CoreForward) or `endpoint`
+(Direct TCP terminates and relays). Firewall/NAT remain exclusive to `direct: core`.
 
 Interface roles are trusted ingress LAN/WAN zones, not execution dispositions;
 every discovered RX queue is required.
@@ -344,24 +333,6 @@ Direct terminates and creates a new marked outbound; generated replies use ordin
 Linux demultiplexing, not original socket-operation continuation. TUN's separate
 opt-in HostFacts support is described below.
 
-### XDP Host Native
-
-Use the same `host` block with `direct: native` and omit physical `datapath.interface`
-capture. The owned LOCAL_OUT consumer keeps an eligible original socket operation
-in Linux instead of opening a replacement outbound. Canonical marks distinguish
-Keep from Set, including Set(0) and all 32 bits; Host DNS facts use the real HOST scope.
-The selected socket executor stays frozen. Active TCP keeps its selected effect;
-a genuinely closed, drained Native TCP reconnect renews its attempt identity without
-switching to Endpoint. Ordinary UDP caches expire strictly after 120 seconds of
-inactivity; source-owner and queued-output retention remain independent.
-Live sources can require a guarded-retained stop rather than resource destruction.
-
-Host Native combined with physical Native is not admitted: the current reverse
-lookup cannot prove arbitrary CT zones or recover source indices after pre-CT tuple
-rewrites. TUN Native is also not implemented. Neither limitation is replaced by
-NFQUEUE, a guessed zone, reserved mark bits or a new outbound relay. These supported
-mode boundaries do not imply full V7 or E6/E7 acceptance.
-
 ### Linux TUN Endpoint
 
 Select TUN explicitly with `backend: tun` and `direct: endpoint`. honk creates and
@@ -408,7 +379,7 @@ routing {
 
 TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
 `interface`, `xsk_mode`, explicit `poll_mode`, `busy_poll`, `firewall`, nonempty
-`nat`, and `direct: core` or `native`.
+`nat`, and `direct: core`.
 Unknown fields and duplicate scalars/blocks reject across merged sections and
 includes. Structured input uses the same validation. This is an opt-in addition;
 existing configurations do not change meaning and need no TUN migration.
@@ -485,8 +456,8 @@ its negation. Both scopes share one 384 MiB capture budget. Standalone DNS learn
 only in the plain scope; transparent DNS learns in its packet's own scope. Neither
 scope borrows HOST DNS facts. Source admission requires real support and fails closed;
 it does not fall back to plain on source errors. The original source expiry is not
-refreshed by read delay. Native bypass (S-c) and captured return (S-d) remain absent;
-generated replies provide no original operation or pre-NAT/TTL equivalence.
+refreshed by read delay. Generated replies provide no original operation or
+pre-NAT/TTL equivalence.
 
 The entire canonical TUN setup, including `host_facts`, backend and Direct profile
 are restart-only; omitted MTU and explicit 1500 compare equal, as do omitted and

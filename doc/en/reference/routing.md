@@ -94,11 +94,6 @@ overflow, unknown options and duplicate `mark`/`must` options reject the configu
 Unlike the global mark scalar, a malformed direct mark never silently becomes zero.
 Marks are supported on `direct`, not proxy/group targets.
 
-Host-only XDP Native applies Keep or the exact full-width Set value to the original
-operation, without adding classified/bypass bits. Physical Native does not support
-these explicit Set effects, including Set(0); it must not silently project them
-onto the legacy direct-socket convention.
-
 `direct(mark: 0x200, must)` and `direct(must, mark: 0x200)` are equivalent;
 whitespace inside the direct option list is allowed; `fallback:`/`default:`
 accept the same forms. The last merged fallback replaces the whole action (a plain
@@ -111,8 +106,7 @@ low-30-bit policy payload. For example, a configured `0x200` can appear as
 `0x40000200`; Linux policy rules must mask off the reserved bits. At this legacy
 execution boundary, explicit zero has the same effect as an omitted mark:
 userspace-originated direct sockets use the global mark, while TC direct adds no
-user mark. The canonical configuration and routing result retain the distinction;
-this legacy projection is not a full-width Native mark assignment.
+user mark. The canonical configuration and routing result retain the distinction.
 Proxy carriers, bootstrap and DNS-controller upstreams use the global mark,
 not a mark from the intercepted traffic rule.
 
@@ -231,12 +225,7 @@ routing {
 `proxy`, `hk`, and `resilient` are group names.
 
 The `routing` target `direct` uses the execution profile selected by
-[`datapath.direct`](./global.md#capture-backend-selection). The public
-`direct: native` selector requires physical XDP capture and real eBPF with
-NFQUEUE disabled; eligible final Direct packets use XDP candidate `PASS`.
-TC/TUN/Host Native and Native firewall/NAT compositions are rejected. Host Native
-and captured-first return are not executable. A non-skipping TCX final gate is
-required for acceptance; this selector does not claim full V7 or passing real tests.
+[`datapath.direct`](./global.md#capture-backend-selection).
 
 ## Core forwarding firewall and IPv4 NAT
 

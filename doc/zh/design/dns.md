@@ -306,8 +306,6 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
 
-Native XDP 消费同一组非 HOST scoped facts 的不可变导出。Observation、同集 TTL 缩短、clear、共享容量淘汰、snapshot rebuild 与到期清理，都在首次权威修改前关闭 kernel publication。导出绑定真实 scope revision、snapshot generation、Router policy fingerprint 与所有贡献 owner 的最早原始 expiry。内核 deadline 使用保守 BOOTTIME 换算，检测到 clock domain 变化则拒绝，不因重新准备延长原始有效期。增量 HOST map worker 仍是独立消费端，不能重新打开 scoped Native 权限。
-
 新建数值目标的 packet TCP/UDP 路由通过 canonical Router 消费同一 scope 尚未过期的 bitmap，不虚构 hostname，并保留规则顺序、mode 与终态 `must`/`block` 语义。已接纳的 transport 保留原有路由所有权；配置允许的真实嗅探名称重路由仍使用既有语义。软件查询要求已提交的 routing generation 与 policy fingerprint 同时匹配，不匹配时失败，而不是当作缺失域名事实回退。
 
 共享投影最多保留 10,000 个 `(scope, name, family)` owner 和 49,152 个 `(scope, canonical IP)` desired key，零 bitmap 另有 32,768 个 key 的上限。这些限制由全部 scope 共享，不按 scope 倍增。只有 HOST key 进入容量为 65,536 的 domain map，仍为 sniff 写入保留不供 DNS 投影使用的 16,384 个槽位；等待成功删除的过时零值 key 可暂时突破零值子上限，但仍受 applied 总上限约束。同一 scope 内 IPv4 与 mapped-IPv6 owner 共用一个 key，并按 OR 合并事实。增量协调与 reload 使用同一准入策略：先淘汰零 bitmap，同一优先级内淘汰最大的 IP/scope key。被省略的 owner 仍可在后续策略 generation 重新参与投影；普通刷新也可在空间可用时重新准入被省略的 key。容量压力会产生警告。全局回收 HOST owner 时仍经正常 worker 删除与 publication fence。

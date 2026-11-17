@@ -71,7 +71,7 @@ FD read 接收 kernel egress；FD write 注入**新的 interface ingress 包**�
 经认证应用 socket 事实选择 Host scope，见证过但无归属的记录仍为 plain。来源
 错误不能变成 plain。两条路径均使用解码 vnet metadata、canonical Router、真实
 outbound 和同一 FD 的生成 output lease。Direct 新建 dial；scope/tuple/mark 或
-生成回复不授予原 operation、pre-NAT/TTL、Native bypass 或 captured return 权威。
+生成回复不提供原 operation 或 pre-NAT/TTL 等价。
 
 RX 复用一个已计费的 65,586 字节 buffer（10 字节 vnet + 65,575 字节普通 IPv6
 以及一个字节 sentinel），一轮共用同一个入口时间戳。读满 buffer 可能截断，直接拒绝；
@@ -122,9 +122,8 @@ Runtime failure、crash 或未确认清理时保留 blackhole/rule 与 receipt�
 先停源并核对精确归属再由操作者清理，不按名称/表盲删后重启。Drop 只同步关闭
 本地 admission/endpoint、处置本地 lease、归还驱动权并关闭 FD，不做 rtnetlink
 清理或成功 ack。原 supervisor 在原 Tokio runtime 上继续持有 joined cleanup，
-嵌入方必须保持该 runtime 存活。不自动重开 FD、接管资源、回退 TC/XDP 或执行
-Native 续行。可选 socket HostFacts 不实现导入前 Native（S-c）或 captured return
-（S-d），也不代表 E6.4 完成。
+嵌入方必须保持该 runtime 存活。不自动重开 FD、接管资源或回退 TC/XDP。
+
 ## Full-XDP 启动
 
 未配置 `datapath` 时仍默认使用 TC。Full-XDP 是显式选择的真实 daemon 后端，不是 XSK fixture，也不会回退到 TC/NFQUEUE/TUN：
@@ -150,45 +149,9 @@ routing {
 
 `direct: endpoint` 通过现有 packet Endpoint 终止 Direct TCP/UDP，再使用 outbound relay；`direct: core` 则通过 Core forwarding owner 与带输入上下文的内核 FIB 保留 transit 语义。`lan`/`wan`（模型中的 `Lan`/`Wan`）是物理接口角色，不是执行模式。选择 XDP 必须指定 `backend: xdp` 与显式 Direct profile；无效配置在内核挂载前拒绝。不要同时使用 TC 的 `global.lan_interface`/`wan_interface`。所有选中物理接口的全部 RX 队列均打开，每队列一个 ring owner，跨端口/队列共享一个 routing-domain owner。后端、profile 与设备变化要求重启；firewall/NAT 规则通过事务式 generation 发布，拒绝更新时保留原有效策略。
 
-`direct: native` 要求真实 `ebpf` 构建、`dial_mode: ip`、关闭 NFQUEUE 及无 VLAN 的物理捕获。它把同一个 `RoutingPushPlan` 编译到 XDP 和必需的 ingress TCX gate。符合终局 Direct 条件的流量在 XSK 前真正返回 `XDP_PASS`，原始 Ethernet/IP 字节进入 Linux，由内核执行路由、TTL/HL、conntrack 与 NAT。两个 hook 保留当前 publication 和最终 deadline 检查，新准入使用当前规范路由。此 profile 不新建替代 outbound socket。配置选择 group 的流量仍由普通 Endpoint 执行，包括 group 最终选择 Direct leaf 的情况。
+每个 Port 为 retained RX slot 预留 `R * 1024` 字节，其中 `R = min(rx_frames, ring_size)`。这些内存与 UMEM 及其他 capture 资源共用 384 MiB `CAPTURE_MEMORY` 预算（见 `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` 与 `honk-core/src/xdp.rs::prepare`）。
 
-Native hook 挂载前，启动过程在 `state/native-publication-initial/` 保存逐字节一致、独立 inode 的初始 checkpoint，与 `state/native-publication/` 中可更新的最新 artifact 分开。两份文件及其目录项均完成耐久化后才继续启动；后续 export 和 shutdown 不改写 checkpoint。启动验证以首个 producer result 的摘要与身份绑定原始字节，停止验证仍使用最终 mutable artifact。多个合法的 pre-ready export 不替代最初的启动证据。
-
-Native XDP 与 ingress TCX gate 最多遍历八个 IPv6 Hop-by-Hop、Destination Options 或 routing（剩余段数为 0）扩展头，以定位 TCP/UDP tuple 和剩余载荷长度。原始字节从不被改写，已准入的 Direct 数据包原样进入 Linux，由 Linux 自行处理扩展头，包括在无法识别的选项的动作位要求时生成 ICMPv6 Parameter Problem；honk 不合成 ICMP。第九个扩展头、Fragment、AH/ESP、No Next Header、未知 next header、剩余段数非零的 routing 头以及零载荷长度仍按原行为拒绝。走 Endpoint 路径的包继续使用 Stack 现有的有界解析器。
-
-有界、非 LRU 的普通排他表保存 Pending capture/import owner、已提交 Capture 与 Kernel claim。只有经认证、outstanding 为零的普通 UDP Kernel/Active claim 使用缓存的零 mark Direct 决定：缓存有效时，普通 routing、mode 与 scoped DNS 事实变化不会重判旧流，即使新决定变为 Block 或 proxy，旧流仍继续 Direct；新 tuple 使用当前策略。单独的 CT/socket 命中或没有经认证 claim 的 tuple 不提供历史决定；UDP 任一端口为 53 时不走此捷径。Armed/Draining 不使用此缓存。回复完成保留独立检查。本次 UDP 行为不证明 TCP 的 reload/生命周期已对齐。
-
-Kernel UDP 活动采用 MONOTONIC 时间，仅在间隔严格大于一秒时刷新。空闲严格超过 120 秒后拒绝过期 hit，不刷新或原地替换。Runtime 先关闭 publication、join 已准入读者并排空 RX/CQ；只有真实 CT/socket 查询确认不存在、`PacketEndpoints::retains` 为 false，且完整 claim（含最后活动时间）仍匹配，才能删除已过期普通 UDP 缓存。真实 owner 存活或查询未知时保留排他。这只退役逻辑路由缓存，不退役内核包/socket引用，也不证明 physical PASS/build 或 held-first 完成；不为新流驱逐存活条目。
-
-周期维护先执行有界只读候选扫描。同一未变化的开放 epoch 下，完整扫描若发现空表，或只有未过期普通 UDP 与 Endpoint 仍保留的 Capture claim，可跳过关闭。游标经过后的新插入或 Endpoint 退役，可等现有下一次一秒维护。此提示不授权删除：可能存在候选或扫描不确定时，仍进入关闭后的重新扫描与退役检查；map 读取错误仍失败关闭。
-
-退役先使用准入时取得的 time-namespace 偏移，把用户态 MONOTONIC 采样还原到内核时钟域，再与 BPF 活动时间比较；不直接混用两个时钟值。现有 Host/TUN 的零偏移准入规则不变。
-
-导入在任何 Stack/Core 修改前认证 producer epoch、owner incarnation、实际 packet fact scope 及保留的 Port/queue。Native metadata 为 64 字节（32 字节 envelope 加 32 字节 import）；非 LRU claim map 的 key 为 56 字节、value 为 72 字节，唯一 private operation record 为 264 字节。Transit key 使用实际 capture namespace 与 TransitDefault zone；Transit 拒绝 Host owner 字段和 Keep/0 以外的 mark。完整 join 后冷重启同时替换 map、程序和 metadata；旧 40 字节 key/value 对象、48 字节 metadata 及旧 reader 一律拒绝，不接管。Capture 排他仍跟随 protocol/TIME_WAIT、initializer、source 及 output/CQ 尾部，不套用 Kernel UDP 空闲规则。Gate 查询不刷新活动时间。
-
-新捕获的 Pending 原包在任何 protocol 或 Core 修改前由首个消费者选择。Group/proxy 和普通 controller DNS 在 Endpoint admission 前提交 Capture；已提交的 executor 不能迁移。Literal Direct 候选保留 Port 的完整原始 scatter-gather 链及 producer 原始期限，执行一次 private TAP write。TAP XDP gate 重新运行同代规范路由，核对 finality、owner、extent、queue 存活、epoch 与期限；用户态 Direct 判断本身不授予权限。普通 early PASS 仍可使用。Pending、Armed 和 Draining 在 redirect 前预留有界 outstanding credit；只有 COUNTED 完成可结清自己的 credit。首包到达目标入口并完成随后新发起的同 publication Grace 后，followers 按 import 顺序继续；只有首包已排序、outstanding 为零且没有 held original 或 private flight 时才能进入 Kernel/Active。Kernel packet 不因此获得永久 Native permission sidecar。
-
-Private TAP 独占、非持久、单队列、非阻塞，位于原入口 namespace，不使用 vnet/GSO 或 NAPI。准备顺序是先预留内存，再在预留内调用 `admit_captured_layout`，持有 `/dev/net/tun` 时只解析并准入一次运行内核 BTF，最后创建 TAP；未知布局阻止创建。最多准入 480 个 captured target（见 `honk-xsk/src/bpf/native/captured.rs` 的 `MAX_CAPTURED_TARGETS`、`captured_preparation_bytes`、`admit_captured_layout`，由 `honk-core/src/xdp/native/captured.rs::CapturedReturn::prepare` 调用）。Setup 与每次原包提交均检查 private receive 前提：flags/MTU 精确匹配、只有一个 RX queue、RPS mask 和 flow count 为零、`rx_batched=0`。新建独占 stock TAP 没有 PHY，也没有配置 provider 的操作；timestamp 回读仅检查一致性，不能独立证明 provider 不存在。地址、路由、IPv6 与注入 containment 检查仍为必需。
-
-独占 Ethernet TAP 的管理 MTU 为 `min(max_physical_ip_mtu, 65521)`，stock 最大值只在冷配置阶段读取验证一次。物理准入、原帧保管费用与 operation extent 仍采用原物理 MTU；私有管理值不截短 65535 字节 IP 包或其 65549 字节无标签 Ethernet 帧。Receipt 分别记录管理 MTU、物理 IP MTU 和保守的完整帧容量；既有 live FD/device/flags/MTU 检查保留，不新增逐 original 的几何查询。
-
-Setup 依次安装 terminal NETDEV-ingress DROP、TCX redirect/guard、pre-tap XDP guard/data。TCX 保存 scratch 并 redirect 到原物理入口；目标链严格为 `[owned_scratch_restorer, existing_honk_nat_gate]`，restorer 返回 NEXT，既有 gate 保持最终裁决。目标 `_one_core` 入口在 taps 前认证；只有匹配的入口 receipt 及其后新发起的同 publication Grace 才证明转交。完整或失败的 write 本身都不证明转交或拒绝。缺入口、Grace 失败或 redirect 后托管不确定时，有界保留 Runtime/Port、operation、费用与 guard；不重放，也不按超时减少计数。
-
-活动 captured owner 的完整读回要求真实 target-entry tracing link 与 program 仍保有 pin、所属 FD 和已安装身份；缺失的 witness 不能借清单中的 Unpinned 状态跳过检查。
-
-已准入的 namespace topology watcher 在私有资源拆除及后续物理 guard 检查期间保持 live。自有 TAP 的 dispatcher→guard、guard detach 与最后一个独占 FD close 分别执行精确事务，不按 ifindex 豁免通知。删除前必须认证 UP、carrier-on、XDP 已缺席，随后核对内核有界的 DOWN→DELETE 转换，并通过精确 ifindex 查询得到 `ENODEV`。多余、缺失、畸形或外来通知仍粘滞失败，包括 TAP 消失后的变化；未执行的 close callback 保留 FD，已消费的 FD 绝不重试。
-
-每个 Port 为 retained RX slot 预留 `R * 1024` 字节，其中 `R = min(rx_frames, ring_size)`；Runtime 为每个已准入 queue 的 held-original metadata 另预留 `R * 192`。这些内存与 UMEM、publication 及 private-return 资源共用同一个 384 MiB `CAPTURE_MEMORY` 预算，不新建第二份预算或 payload pool（见 `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` 与 `honk-core/src/xdp.rs::prepare`）。
-
-Captured 准备阶段预留全部共同资源，加上 BTF parser 与 static loader 两个 envelope 的较大值，而不是二者之和：准入返回 scalar layout 后才开始加载。模块 guard、cold/device 允量、原帧容量、operation cell 费用和 installed 新旧预留重叠仍由同一预算承担。
-
-Captured 程序加载后，以实测已安装清单的预留替换 BTF 准备额度；先取得新预留，再释放旧费用。Canonical 候选的 pin 名包含 installation 内不回绕的独立序号，不把 closed publication epoch 当作唯一候选身份：同一个 writer 可以因多个 scope 更新而多次准备替换。每 realm 最多两份候选和精确自有 pin 清理边界不变，绝不接管或覆盖已有的外来 pin。
-
-Captured return 当前丢弃线上 key 与 CT ORIGINAL 不同的 reply/NAT 翻译后输入，以及 Pending/Armed/Draining 中接收 scope 与 claim 不同的跨 realm 输入。它们在 outstanding 预留和 redirect 前拒绝，没有单独丢弃计数器（见 `honk-xsk/src/bpf/native.rs::captured_wire_identity` 与 `selected_kernel` 的 scope 检查）。Draining 期间的反向包（例如 TCP SYN-ACK）需要重传。这些 lane 仍不支持且为 NOT_RUN；既有 Active 续行属于独立路径。准入后 `writev` 返回负值的情况也仍为 NOT_RUN；下游丢弃且 write 可能返回完整长度的测试故障不覆盖它。
-
-Native 继续拒绝 Host、Core firewall/NAT、VLAN 续行及不支持的包表示。需要在 Endpoint 提交后通过 TCP sniff 才能决定 Direct 的输入仍没有提交 executor 前的原包消费者。强制 TAP 同步检查和包级证明本身不构成完整 floor/recent 生命周期验收。此消费者的 all65 与 E7 仍未验证；该实现不构成完整 Native 验收通过。
-
-物理捕获启动前必须准备与有效 bypass mark 精确匹配、优先于 `main` 的 RPDB rule，指向专用表；对每个已启用源地址族，该表都须有经过**未捕获** uplink 的默认路由。`so_mark_from_dae` 指定此 mark（示例为 `0x100`）；它不是 `CLASSIFIED_MARK`，也不能恢复已捕获的原始 skb。捕获的物理以太网端口必须完全无地址，包括 IPv6 link-local。Core transit 路由及邻居由内核 routing domain 管理。stock 内核 native continuation、非零 native rule mark、不支持的 socket/process 条件及 native local/wildcard listener 假设不会被悄悄替换成 Core 或 Endpoint；仅有 FIB Local 结果不足以证明本地 socket 归属。进程谓词要求下述显式 Host 捕获，物理入口不提供经认证的进程身份。DNS53 仍走规范策略。
+物理捕获启动前必须准备与有效 bypass mark 精确匹配、优先于 `main` 的 RPDB rule，指向专用表；对每个已启用源地址族，该表都须有经过**未捕获** uplink 的默认路由。`so_mark_from_dae` 指定此 mark（示例为 `0x100`）；它不是 `CLASSIFIED_MARK`，也不能恢复已捕获的原始 skb。捕获的物理以太网端口必须完全无地址，包括 IPv6 link-local。Core transit 路由及邻居由内核 routing domain 管理。不支持的 socket/process 条件及 local/wildcard listener 假设不会被悄悄替换成 Core 或 Endpoint；仅有 FIB Local 结果不足以证明本地 socket 归属。进程谓词要求下述显式 Host 捕获，物理入口不提供经认证的进程身份。DNS53 仍走规范策略。
 
 捕获的物理根接口与 bypass 表中的以太网 uplink 必须处于管理 UP、独立且有 carrier
 的状态（`IFF_UP | IFF_LOWER_UP`）；捕获的逻辑接口仍须完全无地址。部分原生驱动
@@ -197,12 +160,6 @@ Native 继续拒绝 Host、Core firewall/NAT、VLAN 续行及不支持的包表�
 其他拓扑拒绝仍立即失败，包括管理 DOWN 或无 carrier 的 bypass uplink。carrier
 等待超时会指出接口名并报告 `no carrier after XDP attach`；启动失败保留现有 guard
 托管行为。
-
-启动完成后，自有 XDP 替换在保留的 Native 拓扑 watcher 下核对恰好一条匹配的链路
-通知。接口、保留的程序身份及完整的非统计链路配置必须符合本次替换的预期。任何其他
-链路、地址、路由或 rule 通知、缺失或额外的通知、接收丢失或损坏观察都会粘性关闭
-捕获并要求重启。不设置时间容忍窗口，不在运行中重新准入 watcher，操作结束后也不
-保留任何容许额度。这不是针对外部特权拓扑写入的原子屏障。
 
 仅在这段启动等待期间，既有原生 IPv6 `ff00::/8` 组播路由可携带唯一的
 `RTNH_F_LINKDOWN` flag，且出口必须是仍在等待 carrier 的捕获物理根接口。
@@ -249,19 +206,7 @@ guard，不重试 Copy 或其他后端。省略与显式 ZeroCopy 具有相同�
 保留原有 Copy 行为，参阅[配置迁移说明](../reference/global.md#捕获后端选择)。
 
 
-使用新构建的真实 daemon：`honk-core -c config.dae --bpf-pin-root <私有-bpffs-目录>`，不要传 `--mock-ebpf`。就绪日志为 `XDP datapath ready`。Endpoint/Core 物理捕获不创建 TC hook。每个 Native 设备在 `xdp-<ifindex>/` 下 pin `guard`、`data` 和 `native-gate-prog`；新格式不创建 `native-xdp-link` 或 `native-gate-link`。先 pin guard/data，再通过 `RTM_SETLINK`、`XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST` 安装 driver-mode guard。Netdev 独立于创建进程的 FD 持有已安装的 XDP 程序。XDP 替换通过 `RTM_SETLINK`、`DRV | REPLACE` 和精确 expected-old 程序 FD 完成，再回读确认 native 模式和程序 ID；绝不进入 program array。自有 `data-next` staging pin 原子 rename 为 `data`，旧 FD 持续计费到第二次 reader grace。匹配的负 ACK 保持原选择；结果不确定时保留两个 candidate pin 及 owner，保持 epoch 关闭并禁止后续发布。不回退 generic/SKB 模式。显式 Host 另有下述 source/return TCX hook。这些路径均不创建 NFQUEUE、`dae0` 或 `daens`。
-
-安装精确 XDP bootstrap guard 后，Native 将非 link SCHED_CLS ingress dispatcher `honk_nat_gate` pin 为 `native-gate-prog`，使用新查询的 TCX revision 附着。Captured setup 在同一 `xdp-<ifindex>/` 目录增加 `native-return-restorer-prog` 和 `native-return-restorer-link`。就绪 ingress 必须精确回读为 `[owned_scratch_restorer, existing_honk_nat_gate]`；gate 保持非 link、link ID 为零，egress 为空，全部 pin 指向精确已安装对象。静态 private-return pin 位于同级 `native-return-<attachment>/`，带代际的 realm gate pin 记录在 publication 产物中。Dispatcher 保留只含 TC 程序的 program array 和 device/publication 共享 owner。普通 reload 保留 dispatcher，按 closed-root/reader-grace 协议替换 candidate。Prepared-only pin 不提供保护；attach、回读或注册失败保留已安装前缀并报错，不自动重试。
-
-Owner 死亡后 pin 保留最后程序，但仅有 odd epoch 不能授予业务 PASS：Native gate 在最终 epoch/deadline frontier 前还要求自有 XSKMAP 条目存活。最后一个 XSK file 关闭会删除条目，之后的新 invocation 即使看到 odd root 也会拒绝。已经观察到存活 socket 的 invocation 可以完成其已进入的 operation。该联锁与真实 owner-death wire 行为仍需 floor/recent VM 证据；保留 pin 不代表内核清理已经 join。
-
-Joined shutdown 先关闭 Native 权限，在撤回 XSK 前恢复物理 guard。Private operation/hook 成功 join 后 detach 并 unpin restorer，移除 private pin/TAP，记录持久 joined proof，留下物理 XDP custody 和非 link Native gate 供显式恢复。未解决的工作则保留双程序链、operation 与费用。仅关闭本进程 FD 不 detach 物理 custody，attach 成功但回读失败时也如此。设备/namespace 销毁、重启及特权 detach 不在本契约内。首次 XDP 安装成功前不保证 guard 覆盖；已选 data 程序在崩溃后的行为仍受上述 live-XSK 限制。程序存在、实际附着与业务权限有效是不同事实；all65/E7 与 floor/recent owner-death 行为仍为 NOT_RUN。
-
-重启拒绝前任状态。显式冷恢复先停止外部来源，join 或确认旧 daemon/XSK/source/device owner 已死亡，并保留 namespace/device/run/capture-generation 身份。先预检全部设备及[控制面恢复](./control-plane.md#启动与关闭)列出的完整静态/动态清单。未解决的双程序链不是干净恢复候选。只有持久 joined 文件、摘要匹配的 `CAPTURED_JOINED_ACK` 和 restorer/private 资源实时缺席同时成立，才接纳 joined gate 单例；loader-only 单例不满足条件。Recovery 通过 `DRV | REPLACE`、FD `-1` 和精确 expected-old FD detach XDP，要求匹配 ACK 并确认全部模式为空；随后重新查询 TCX revision，用精确保留的非零 gate FD 执行 `BPF_PROG_DETACH`。FD 为零时先以 `F_DUPFD_CLOEXEC` 复制到至少一并保留到 syscall/readback 结束。确认双向 TCX 为空后才 unlink 已知物理 pin 与目录；joined 记录在其列出的全部 gate 移除后最后删除。未知 pin、stale revision、外来项、证明缺失或部分失败均停止清理并保留 custody。Prepared-only 和旧 link 状态分别核验身份，不虚构缺失 identity。
-
-旧 link 格式需要独立的来源静默恢复。对于 `native-gate-link`，按实际 query 核验 TCX link kind、设备、ingress attach type 和程序，关闭所有 owner FD，仅释放该自有 link pin 并确认项消失；不能用 `BPF_PROG_DETACH` 移除 link 项。对于 `native-xdp-link`，核验 XDP link 类型、设备及程序 identity，关闭所有 owner FD，仅释放该自有 link pin 并确认 XDP 为空，再释放剩余程序 pin。Legacy netlink detach 不能替换存活的 XDP link；不提供 live link-to-netdev 转换或自动残留接管。
-
-NAT 归 Linux 所有。Lookup 使用真实 wire tuple 及返回的 conntrack direction；排他检查使用真实 conntrack ORIGINAL tuple，SNAT/DNAT 后也保持如此。Reply 不创建反向 permission 条目，也不改写普通 claim key。
+使用新构建的真实 daemon：`honk-core -c config.dae --bpf-pin-root <私有-bpffs-目录>`，不要传 `--mock-ebpf`。就绪日志为 `XDP datapath ready`。Endpoint/Core 物理捕获不创建 TC hook。每个设备在 `xdp-<ifindex>/` 下 pin `guard` 和 `data`，再通过 `RTM_SETLINK`、`XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST` 安装 driver-mode guard。Netdev 独立于创建进程的 FD 持有已安装的 XDP 程序。XDP 替换通过 `RTM_SETLINK`、`DRV | REPLACE` 和精确 expected-old 程序 FD 完成，再回读确认 driver 模式和程序 ID。不回退 generic/SKB 模式。显式 Host 另有下述 source/return TCX hook。这些路径均不创建 NFQUEUE、`dae0` 或 `daens`。
 
 SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 veth smoke
 在 Copy 模式覆盖 MTU 1500 和 9000：每次 UDP 回复必须是单个完整数据报，
@@ -272,7 +217,7 @@ jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096
 
 `Port::transmit_generated(class, max_length, generate)` 先预留真实单帧/ring/sidecar 容量，再调用同步 generator；scope credit 也早于 Stack emitter 预留。私有 guard 在无输出、错误或 panic 时取消未发布预留。原始 FlowId 持有先在 scope mutex 内安装，随后在锁外完成精确 peer/header，中间不 await 或服务 RX。只按实际长度补零到以太网最小帧，并以未偏移的 frame base 发布；后续错误不释放已发布 owner，仍须真实 CQ。CPU 与直接 Endpoint owner 共用按精确 scope 混合归还的 CQ batch。既有每 realm 每类别 32 个候选输出、64 个 CQ descriptor 的上限、相互独立的 ACK/重传/CQ 生命周期、E3.1 handoff 及进程生命周期 UMEM 计费不变。符合资格的 driver 轮次只跳过 CPU 拉取，在直接输出后完成 timer/event/close/deadline 收尾，不增加 busy polling。只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制，TCP payload/校验和与 relay 复制仍存在；这不是通用 UDP zero-copy、常驻内存减少或已测收益。
 
-XDP 通过 userspace backend 拥有规范 routing、domain 与 health 发布。Native 在同一 owner 内增加真实 kernel publication consumer：不可变编译 map/program，以及 XDP/TCX 共用的对齐 epoch；不构造 TC backend。native API 仍报告 datapath kind `userspace`，不声称拥有硬件计数器或 program/attachment 清单。TC listener/token 及 kernel witness API 仍不支持。
+XDP 通过 userspace backend 拥有规范 routing、domain 与 health 发布。native API 报告 datapath kind `userspace`，不声称拥有硬件计数器或 program/attachment 清单。TC listener/token 及 kernel witness API 仍不支持。
 
 固定聚合计数区分队列/credit/容量拒绝、native-ID 历史精度下降及成功 peer 回收。
 只有实际拒绝 episode 会告警，持续压力以 debug 汇总，不逐包写日志。
@@ -287,22 +232,6 @@ XDP 通过 userspace backend 拥有规范 routing、domain 与 health 发布。N
 starting/active/closing/closed/failed-retained 生命周期。各 ring/队列顺序读取，
 不是原子快照。空 FILL 事件和 wakeup 错误不能相加当成丢包；当前 FILL 有内容
 不能否定历史饥饿。详见 [API 语义](../reference/api.md#连接关闭模式与数据面生命周期)。
-
-### Native closed-epoch 计数
-
-预期转换记录契约为每个 Native target 增加独立 ARRAY map，由其 XDP 与 ingress TCX 程序共享，candidate 替换不重置。既有 queue/capture 计数及 `queue_count+4` ABI 不变。新 map 有 513 个 32 字节条目：每个 hook 256 个带 epoch tag 的 generation，加一个 sticky 记账故障 cell。使用从 `NativeRoot` 读取的完整偶数 epoch E，以 `((E >> 1) & 255) * 2 + h` 选取 XDP（`h=0`）或 TCX（`h=1`）。epoch 零挂载前及每次关闭 store 前，用户态将目的 cell 初始化为 E，count/overflow/reserved 清零。
-
-只有走 closed-epoch 分支的普通执行递增 `ordinary_drops`，包含到达该 gate 的未解析 frame。带 mark 的 TC 只读 query 绕过计数。Root lookup、parser、policy、stale final-CAS、queue 等其他丢弃不计入。BPF 保留完整采样 epoch，检查 cell 的 epoch/reserved，原子递增 64 位计数并返回既有 hook drop action。回绕设置 sticky overflow；无效 tag/cell 设置记账故障且继续 drop。两者均不能当成普通零或完整证据。
-
-存入*不同* epoch 后，成功 close grace 封存可能仍有 reader 的旧偶数 epoch；`CLOSED_COUNTS_FINAL` 逐 covered hook/epoch 记录，包括真实零值。同一次 grace **不**终结当前 closed epoch，其计数仍可增长。Reopen 不增加 grace，刚结束的 closed epoch 直到下次必需的 close grace，或终止 detach/join 加 grace 后才最终确定。跨 reopen 延迟的 invocation 按实际读到的完整 epoch 计数，不推断到达时间。Cell 复用要求旧 tag 已封存且最终 event 已追加；失败则保持 publication 关闭并保留旧 cell。累计计数的轮询/相减不能代替封存。
-
-Hook 身份绑定 publication/target serial、hook kind、scope、namespace cookie、ifindex、attachment generation 和 counter map ID；替换记录旧/新 program 身份。ID 不仅跟随可复用的 ifindex，也不随替换静默重置。最终计数要求卸载所有引用 counter 的程序，或换成无此引用的 guard，再真实 join/drain reader 并完成 grace。保留/pin 的计数 hook 使计数保持 provisional 且 `hooks_joined=false`。逐 hook 求和是 hook 执行次数：同一个包可在不同 epoch 到达两个 hook。它不是去重包数、逐流丢包，也不能由零计数证明流量到达过 hook。
-
-有界 event 契约使用 13 种 kind，包含 `PROGRAM_REPLACED=13`，同时保持 128 字节 event 与 16 字节 root 布局。对于 kind 13，`hook_id` 指向已注册的 hook 身份；`counter_value` 承载旧 program ID，`counter_epoch` 承载新 program ID。该 kind 复用的字段表示 program 身份，不是 drop count 或 root epoch。替换 outcome 为 `PENDING=0`、`COMMITTED=1`、`FAILED=2`。替换链从注册的 program 身份开始，每次旧 program ID 必须匹配前一 current identity，仅 committed 替换推进 current identity。失败 outcome 仍保留；pending 替换或替换 event 丢失使完整性失效。消费端拒绝大于 13 的未知 kind，不能跳过。
-
-增量预留下限保持 **598,016 + 100,516*T 字节**，T 为 target 数：4,096×128 字节 ring 占 524,288，包含固定身份表的 publication bookkeeping 占 8,192，streaming export 占 65,536；每 target 的 counter map 占 92,324，core counter-generation bookkeeping 与 target metadata 占 8,192。身份表最多容纳 32 个 hook / 16 个 target，存放并计费于 publication 固定的 8,192 字节 bookkeeping 预留内。一个 target 为 698,532，两个为 799,048。实测 map 内存或实际 owner 分配更大时追加计费；生成 instruction/preparation buffer 与旧/新 program 重叠仍另计。共享逐 hook 计数不乘 CPU/queue 数。不提高既有 384 MiB capture budget，不借用 recorder/UMEM 额度或省略 optional-CPU trie 计费。计费按实际情况保留到 export 和 owner 真实退役。这是预留下限，不是内核内存实测，也不证明某配置能容纳。
-
-本次交接的 ABI、counter、race/reuse、budget、export 定向检查及 floor/recent 真实 hook 检查全部 **NOT_RUN**。Store 时间区间和封存计数仅支持有界 publication 观测，不能识别应用包、证明逐包因果或交付、限定关闭时长或修复挂载 custody。见[发布记录](./control-plane.md#native-发布转换记录)与[独立产物](../reference/api.md#native-publication-产物)。
 
 ### Event 与有限 adaptive 服务
 
@@ -352,6 +281,8 @@ create/connect/sendmsg 与 egress selector hook 必须在整个已检查 descend
 中保持精确有效；外部竞争 hook 拒绝启动。identity canary 必须观察真实 socket
 创建与最终退休。
 
+Host Endpoint 在共享 384 MiB capture 预算内固定计费 96 MiB。
+
 `HostCapture` 在 capture 关闭时准备自有私有 namespace/veth pair、source TCX 捕获、
 私有 XDP/AF_XDP queue 与 return TCX 路径。私有 queue 始终使用经过回读验证的 Copy，
 独立于物理绑定模式。准入检查真实自有 XSK/namespace、就绪 Endpoint consumer、完整
@@ -386,16 +317,15 @@ netfilter 查询。owner 契约排除并发 privileged topology/hook 变更或�
 经认证的 source receipt 在导入 Stack 前绑定 namespace、attachment、socket/operation
 incarnation、进程是否存在以及原 output/return identity，不能靠 tuple 猜测 Host 身份。
 普通 Direct 新建带 mark 的 outbound；生成回复经已准入接口进入普通 Linux
-demultiplexing，不选择 recipient FD，也不恢复原 socket operation。Native 续行仍未
-实现；native API 观测与此不同。
+demultiplexing，不选择 recipient FD，也不恢复原 socket operation。
 
 关闭先通过 gate、source/private guard 与 reader grace 围住新 capture，再 join
 Endpoint output/CQ。确认停止时若仍有已选中的 external socket owner，会记录
 `guarded-retained`，保留 custody、hook、pin 及 receipt；这是完成的 guarded stop，
 不代表完整资源移除。无此类 owner 时，确认拆卸会移除自有 pair、pin/hook 及 receipt。
 crash 或歧义/失败清理保留 custody，不宣称清理完成。FD close 或资源移除都不在进程
-退出前归还 retained kernel/UMEM 计费。此 XDP 路径不授予 TUN 或 Native 能力，
-也不代表完整 V7、E6/E7、physical 或 13-size 验收。
+退出前归还 retained kernel/UMEM 计费。此 XDP 路径不授予 TUN 能力，也不代表
+physical 或 13-size 验收。
 
 ### 物理捕获 guard 与 smoke
 

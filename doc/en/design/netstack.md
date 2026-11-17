@@ -1,6 +1,6 @@
 # Userspace network stack and WireGuard tunnel
 
-`honk-netstack` is a sans-I/O IPv4/IPv6 TCP/UDP stack. `Mode::Endpoint` remains the default WireGuard client behavior. `Mode::Transparent` provides passive TCP, stateless UDP, bounded reassembly and ICMP generation. Core's packet embedding and explicitly configured [XDP](./datapath.md#full-xdp-startup)/[TUN Endpoint](./datapath.md#linux-tun-endpoint) consume it; the Stack API itself grants no capture or native-continuation authority. Unless stated otherwise, this page describes unchanged Endpoint behavior. Like the other userspace subsystems, this code is largely AI-authored and requires maintainer review.
+`honk-netstack` is a sans-I/O IPv4/IPv6 TCP/UDP stack. `Mode::Endpoint` remains the default WireGuard client behavior. `Mode::Transparent` provides passive TCP, stateless UDP, bounded reassembly and ICMP generation. Core's packet embedding and explicitly configured [XDP](./datapath.md#full-xdp-startup)/[TUN Endpoint](./datapath.md#linux-tun-endpoint) consume it; the Stack API itself grants no capture authority. Unless stated otherwise, this page describes unchanged Endpoint behavior. Like the other userspace subsystems, this code is largely AI-authored and requires maintainer review.
 
 The outbound-side behavior (registry, flows, failure provenance) is summarized from the stack's point of view below and specified in [Outbound design](./outbound.md#wireguard-tunnel). Node fields and share links are in the [node reference](../reference/nodes.md).
 
@@ -148,10 +148,9 @@ Queues belong permanently to `queue_id % workers`; TCP uses immutable keyed tupl
 placement and UDP uses client-address placement. Peer, DNS and UDP source identity
 remain realm-scoped, while application, retirement and CQ retain the exact owner
 and FlowId. Cross-worker handoff has 64 funded cells overall and 32 queued entries
-per destination; borrowed RX never escapes its callback. Core, Host and Native
-coordination stay on worker 0, and a remote original stays owned by its actual Port
-until real completion and acknowledgement. Drain acknowledgements identify the
-epoch observed before the pass, not a later barrier.
+per destination; borrowed RX never escapes its callback. Core and Host coordination
+stay on worker 0. Drain acknowledgements identify the epoch observed before the
+pass, not a later barrier.
 
 Reassembly keeps a local nonwrapping incarnation through completion and timeout
 output. Its earliest input time controls the original fragment deadline and return
@@ -171,7 +170,7 @@ Class output export fills at most 64 caller-owned empty lease cells, preserving 
 
 Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
 
-With XDP `direct: native`, Kernel-selected originals bypass Stack through actual PASS. A captured group-selected original must first present its exact shared Capture owner and receive a canonical Endpoint snapshot; a later literal Native Direct choice is refused before protocol mutation. Capture retirement uses `PacketEndpoints::retains`, including real controller-DNS `SourceWork` until its query/output tail drops. The same existing driver, source pool and output/CQ owners keep execution exclusive. Early PASS adds no retained frame lease, and does not implement return of an already-captured original.
+Capture retirement uses `PacketEndpoints::retains`, including real controller-DNS `SourceWork` until its query/output tail drops. The existing driver, source pool and output/CQ owners keep execution exclusive.
 
 Normal close closes admission and publishes the same control-plane shutdown signal before protocol abort and before waiting for an active selector's exact retirement. It still waits for application closure and actual release of exported/CQ-held output; neither command completion nor an empty scope-owner join fabricates that release.
 
@@ -187,7 +186,7 @@ TUN selects bulk 128 and its configured logical MTU (default 1500), with one rea
 
 The [TUN owner](./datapath.md#fd-packet-pipeline) retains CPU-backed `OutputLease`s and their original `Transmit`. Setup requires exclusive single-queue nonpersistent `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`, selects and reads back a 10-byte little-endian vnet header, and enables only `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`; unsupported setup fails explicitly. RX reserves 65,586 bytes: 10 vnet bytes, the 65,575-byte maximum ordinary IPv6 packet, and one truncation sentinel. It rejects full-buffer reads, incomplete/padded IP records, unknown flags, unsupported GSO types/families and invalid header/checksum extents before the combined metadata/source/admission path. GSO `hdr_len` is Linux's linear-head hint and may include payload; it must cover the parsed TCP header and stay inside the IP record. Ordinary UDP `CHECKSUM_PARTIAL` is accepted without USO. Borrowed UDP is accepted/copied before recycling the sole RX buffer.
 
-Each scope/class retains at most 32 pending leases. One `writev` submits each immutable record; EAGAIN/EINTR retains its exact lease and short/zero writes are terminal without replay. All drivers continue through readiness and joined close. Standalone DNS learns in the plain scope; transparent DNS learns in the packet's own scope. Neither borrows HOST facts. Socket HostFacts retain original source expiry and ownership; plain input grants no process or Native authority. Native bypass and captured return remain absent.
+Each scope/class retains at most 32 pending leases. One `writev` submits each immutable record; EAGAIN/EINTR retains its exact lease and short/zero writes are terminal without replay. All drivers continue through readiness and joined close. Standalone DNS learns in the plain scope; transparent DNS learns in the packet's own scope. Neither borrows HOST facts. Socket HostFacts retain original source expiry and ownership; plain input grants no process authority. Direct creates a new dial and does not preserve the original socket operation or pre-NAT/TTL behavior.
 
 Explicit XDP [Host capture](./datapath.md#host-source-custody) prepares a separate
 authenticated scope before Endpoint starts. A valid source receipt is checked
@@ -198,7 +197,7 @@ FlowId, UDP initializer/source owners, reassembly and queued/exported `OutputLea
 retain that context; a reused tuple or newer snapshot cannot retarget earlier work.
 Routing consumes actual process presence, never a fabricated identity. Ordinary
 Direct/proxy execution creates new marked outbounds and generated replies use normal
-Linux demultiplexing, with no original socket-operation or Native continuation.
+Linux demultiplexing, without preserving the original socket operation or pre-NAT/TTL behavior.
 
 Host source-context cells and indexes are funded and allocated during cold scope
 preparation, with bounded admission and generation exhaustion; live protocol,
@@ -211,8 +210,7 @@ capture budget with the private Copy Port, UMEM, scope and output storage; this 
 a reservation contract, not a whole-process RSS measurement. BTF preparation
 storage drops after setup; retained fixed kernel and UMEM charges last until
 process exit, including after resource removal or failed setup after pin creation.
-This XDP path itself grants no Native or TUN capability, or full V7, E6/E7,
-physical or 13-size acceptance.
+This XDP path does not grant TUN capability or constitute full V7, E6, physical or 13-size acceptance.
 
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install
@@ -247,7 +245,7 @@ Readiness commits atomically against cancellation; a close that wins before that
 
 Packet TCP write shutdown waits for handshake completion instead of turning temporary `WouldBlock` into reset. Flush remains a local no-op, not an ACK/delivery promise, but explicit scope abort makes it fail. Raw/non-DNS UDP/53 endpoint identity includes the initial outbound/mark and finality: a changed decision cannot reuse the old transport, while non-final fallback still permits configured sniffing. Valid non-must DNS continues through the controller; must remains raw and fixed.
 
-The supplied budget accounts packet storage/reservations, not whole-process RSS or every pre-existing outbound runtime allocation. Kernel socket buffers remain separate. This embedding is an explicit Endpoint path, **not** native forwarding, capture metadata validation, a production backend publication gate or a performance result.
+The supplied budget accounts packet storage/reservations, not whole-process RSS or every pre-existing outbound runtime allocation. Kernel socket buffers remain separate. This embedding is an explicit Endpoint path, not kernel forwarding, capture metadata validation or a performance result.
 
 ### Experimental AF_XDP consumer
 
@@ -257,8 +255,8 @@ a daemon backend or a production configuration option. Its frozen fixture uses
 one IPv4 TCP or UDP tuple, one discovered queue, untagged Ethernet and MTU 1500.
 DISCOVER drops test traffic; DATA redirects with a DROP fallback. Fragments and
 IPv4 options are dropped across the declared address/protocol domain, which
-must be exclusive to the experiment. Direct remains a real socket relay, not
-native continuation. PF0 requires zero-copy; explicit copy mode is restricted
+must be exclusive to the experiment. Direct remains a real socket relay that creates
+a new dial; it does not preserve the original operation or pre-NAT/TTL behavior. PF0 requires zero-copy; explicit copy mode is restricted
 to the `dut0` virtual-interface fixture in a virtme guest, never an automatic fallback.
 
 The device owner observes FILL consumption before RX, consumes borrowed IP bytes
@@ -273,8 +271,7 @@ independent upstream before detaching, including on consumer failure.
 UMEM mappings and their budget charges remain retained until process exit.
 Neither socket close nor empty rings prove deferred pool release or DMA quiescence;
 this is not a production release fence or a zero-resident in-process close.
-Hardware zero-copy, full X0 acceptance, TC A/B, multi-queue, SG/offload and native
-continuation require separate execution evidence.
+Hardware zero-copy, full X0 acceptance, TC A/B, multi-queue and SG/offload require separate execution evidence.
 
 ### Explicit routed-only CoreForward
 
@@ -283,8 +280,7 @@ continuation require separate execution evidence.
 joins it to the canonical Router and the existing router/config publication barrier.
 The routed-only fixture selects `execution: "routed-only"` and `nat: false`; the
 daemon selects `MixedEndpoints` and may enable the separately compiled firewall/NAT.
-Native continuation, required kernel firewall/qdisc processing and skb classification
-remain unsupported requirements. Routed-only policy uses `dial_mode: ip` and unmarked
+Required kernel firewall/qdisc processing and skb classification remain unsupported requirements. Routed-only policy uses `dial_mode: ip` and unmarked
 `direct`/`block` actions. Incompatible reloads preserve the previous generation.
 
 `ControlPlane::core_forward_policy(Execution)` returns a narrow registered
@@ -599,7 +595,7 @@ Errors are generated only by transparent-mode paths: `Refuse::IcmpUnreachable`/`
 
 Everything below is absent from `crates/honk-netstack/src` or from the repository today; the list is the boundary of this page's claims.
 
-- Netmap, Windows, Native continuation, original-operation custody and captured return remain absent. TUN optionally supplies socket HostFacts, not Native authority; implementation is not empirical VM, production or hardware acceptance.
+- Netmap, Windows and original-operation custody remain absent. TUN optionally supplies socket HostFacts; Direct creates a new dial without original-operation or pre-NAT/TTL equivalence. Implementation is not empirical VM, production or hardware acceptance.
 - The eBPF/TC side: the classifier delivery bit, steering of flows to the stack, the delivery state that must outlive TIME_WAIT ([Close semantics](#close-semantics)), and proxying of non-first fragments at the TC layer.
 - ICMP proxying: relaying echo or errors between the client and a real upstream. The stack only consumes ICMP for outstanding TCP sequences and generates the errors listed above.
 - Any performance gate or measured number for transparent mode.
@@ -639,7 +635,7 @@ The driver lives in `honk-outbound/src/proxy/wireguard/`; [Outbound design](./ou
 | Receive | At most 32 out-of-order ranges per flow; ACK stretching limited by the 64-packet receive batch. |
 | Scale | An idle established flow costs about 1.4 KiB of heap (no chunks); per tunnel 4096 flows, each admitted flow reserving a floor of about 33 KiB from the process budget (the share: 256 MiB by default, one eighth of RAM within 64 MiB..4 GiB in honk) that all tunnel stacks draw from together, so about 2,000 / 8,000 / 32,000 floor-only flows fit at 64 MiB / 256 MiB / 1 GiB; live tunnels are bounded by their fixed cost, `share / 4 MiB` within 1..128; `max_flows` counts UDP associations; one lock and one owner task per tunnel, so one tunnel is limited to one core. |
 | WireGuard | Exactly one peer per tunnel; no inbound connections; IPv4 and IPv6 each need a configured tunnel address; the endpoint name is re-resolved only on the next acquire after a handshake attempt timed out, and the endpoint set is fixed while a session exists; one tunnel per (key pair, endpoint) per control plane (runtime-less dials share a separate process-wide registry), at most `share / 4 MiB` (1..128) tunnels live per registry (see Scale); nodes that share a key pair and endpoint must share every tunnel setting or they replace each other, and a hostname and an IP literal of one endpoint are separate tunnels; inner MTU at most 65472 so an outer datagram fits one UDP payload. |
-| Transparent | Core packet embedding and Linux XDP/TUN Endpoint backends; no netmap/Windows, Android/VpnService, Native continuation or captured return. TUN optionally admits socket HostFacts. It uses one exclusive queue with checksum/TCP offload and no external/persistent FD, UFO, USO or TSO ECN. Device integration requires real-kernel validation; no lab performance gain is claimed. |
+| Transparent | Core packet embedding and Linux XDP/TUN Endpoint backends; no netmap/Windows or Android/VpnService. TUN optionally admits socket HostFacts; Direct creates a new dial without original-operation or pre-NAT/TTL equivalence. It uses one exclusive queue with checksum/TCP offload and no external/persistent FD, UFO, USO or TSO ECN. Device integration requires real-kernel validation; no lab performance gain is claimed. |
 | Verification | No interop run against non-Linux TCP implementations, no ARM run and no `test-routing`/`test-netns` VM gate. The design thresholds were measured on one x86-64 4-vCPU VM against kernel WireGuard + kernel TCP (not the design's same-engine TUN arm, with an extra loopback relay hop on the honk side): G1–G4 pass, G5 download fairness passes on the median, and G5 idle memory (about 4 KiB per flow including driver and relay state) misses its 1 KiB target; evidence lives on the `bench` branch under `bench/netstack/results/`. |
 
 ## Design validation (P1)

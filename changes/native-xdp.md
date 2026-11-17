@@ -1,6 +1,0 @@
-Added
-
-- Add explicit `direct: native` selection under `datapath` with `backend: xdp` for eligible physical-interface Direct traffic through XDP candidate `PASS`, requiring real eBPF and disabled NFQUEUE. TC, TUN and Core firewall/NAT combinations reject Native; Host Native is a separate Host-only mode, never a simultaneous Host/physical composition. Omitted AF_XDP binding mode remains forced ZeroCopy and explicit Copy remains available.
-- Document distinct physical and Host-only Native boundaries. Native acceptance still requires its actual final gate and ownership consumers; selecting the profile alone does not establish full V7 acceptance or passing real-kernel tests.
-- Publish the canonical compiled policy and each real packet DNS scope to XDP and the required ingress TCX gate under counted epoch withdrawal. Preserve ordinary Endpoint/source/TIME_WAIT/output ownership through authenticated imports and exact RX/CQ retirement; mode, reload, DNS mutation and shutdown participate in the same publication fence.
-- Refuse retained kernel-owned original operations when the current canonical decision requires capture, resample time before admitting an unfenced DNS expiry extension, charge LPM fact tries by node allocation and per-CPU cache bound, and keep a replaced publication generation charged until the next successful publication.

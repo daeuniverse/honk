@@ -236,17 +236,8 @@ datapath {
 }
 ```
 
-`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）、
-`endpoint`（Direct TCP 终止后中继）或 `native`（符合条件的最终 Direct
-数据包经 XDP candidate `PASS` 继续进入 Linux 协议栈）。Native 要求真实 eBPF
-与 `global.nfqueue_enable: false`，可选择物理接口捕获或下述仅 Host 模式，
-两者不能同时启用。TC、TUN 拒绝 `direct: native`；防火墙/NAT 仍仅限
-`direct: core`。物理 Native 验收还需要 TCX 最终门禁及真实 capture/return
-所有权；选择 profile 本身不代表完整 V7 验收或真实内核测试通过。
-
-当前 Native 消费端要求 `dial_mode: ip` 与无 VLAN 的物理入口。
-使事实失效的 DNS 修改会在 reader grace 与 candidate 准备期间暂时关闭全部 Native
-配置入口；该窗口内的业务包被拒绝，真实 DNS 负载下的窗口上界尚未测量。
+`direct` 必须显式选择 `core`（最终 Direct 数据包由 CoreForward 转发）或
+`endpoint`（Direct TCP 终止后中继）。防火墙/NAT 仍仅限 `direct: core`。
 
 接口角色是可信的 LAN/WAN 入站分区，不是执行方式；必须绑定发现的全部 RX 队列。
 XDP 不可同时配置
@@ -321,22 +312,6 @@ Copy bind 就绪后才一次性打开 capture gate。陈旧 custody receipt 会�
 的 outbound；生成回复由普通 Linux demultiplexing 交付，不代表原 socket
 operation 续行。TUN 的独立可选 HostFacts 支持见下文。
 
-### XDP Host Native
-
-沿用同一个 `host` 块，将 `direct` 设为 `native`，并省略物理 `datapath.interface`
-捕获。自有 LOCAL_OUT 消费端让符合条件的原 socket operation 留在 Linux 中，
-而不是打开替代 outbound。规范 mark 区分 Keep 与 Set，包括 Set(0) 和完整
-32 位值；Host DNS 事实使用真实 HOST scope。
-已选 socket executor 保持冻结，Active TCP 保留选定效果；真正关闭且排空的
-Native TCP 重连更新 attempt 身份，但不会切换到 Endpoint。普通 UDP 缓存在
-不活动严格超过 120 秒后过期，source owner 与在途输出的保留条件相互独立。
-仍存活的来源可能要求 guarded-retained 停止，而不能销毁资源。
-
-Host Native 与物理 Native 不可同时启用：当前反向查询无法证明任意 CT zone，
-也不能在 pre-CT tuple 改写后恢复原 source 索引。TUN Native 同样尚未实现。
-不会用 NFQUEUE、猜测 zone、保留 mark 位或新 outbound relay 替代这些缺失能力。
-这些模式边界不代表完整 V7 或 E6/E7 验收。
-
 ### Linux TUN Endpoint
 
 通过 `backend: tun` 和 `direct: endpoint` 显式选择 TUN。honk 新建并独占一个
@@ -382,7 +357,7 @@ routing {
 
 TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
 `xsk_mode`、显式 `poll_mode`、`busy_poll`、`firewall`、非空 `nat` 及
-`direct: core` 或 `native`。未知字段以及
+`direct: core`。未知字段以及
 合并 sections/includes 后重复的标量/块均拒绝；结构化输入使用同一校验。
 这是新增的显式选择，既有配置不改变含义，无须 TUN 迁移。
 
@@ -447,8 +422,7 @@ scope；见证过但无归属的记录仍走 plain，不代表已证明 Transit�
 Host 来源且存在时可用；Missing 不匹配正向谓词，但匹配其否定。两个 scope 共用
 384 MiB capture 预算。独立 DNS 只在 plain scope 学习，透明 DNS 使用对应 packet
 scope；均不借用 HOST DNS 事实。来源准入要求真实支持，来源错误不能回退 plain；
-读取延迟不刷新原始来源有效期。Native bypass（S-c）和 captured return（S-d）
-仍未实现；生成回复不提供原 operation 或 pre-NAT/TTL 等价。
+读取延迟不刷新原始来源有效期。生成回复不提供原 operation 或 pre-NAT/TTL 等价。
 
 整个规范 TUN setup（含 `host_facts`）、backend 与 Direct profile 都需重启；
 省略 MTU 与显式 1500 等价，省略 `host_facts` 与显式 false 也等价。

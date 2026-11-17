@@ -31,5 +31,4 @@ Added
 - Negotiate verified 10-byte little-endian TUN vnet headers for TCP receive aggregation and transmit segmentation, preserving logical MTU, checksum provenance, source admission, funded output capacity and whole-record lease retries; WireGuard and XDP offload behavior remain unchanged.
 - Cancel expired unmaterialized TCP tail probes on ACK progress, preserve original output ownership across FIN acknowledgement, and prove TUN smoke close with correlated original-socket and independent-peer byte/EOF/shutdown evidence rather than persistent external Linux TIME_WAIT.
 - Add explicit one/two-worker XDP processing with exclusive queue owners, shared realm limits, bounded handoff and joined shutdown; default remains one worker, with no performance claim or old-flow migration.
-- Add Host-only Native original-operation routing with full-width Keep/Set marks and guarded source retirement; TUN Native and simultaneous Host/physical Native remain unsupported.
 - Preserve legitimate fragment reassembly lifetimes without consuming the complete packet's routing/protocol wait window, including reordered cross-worker input.

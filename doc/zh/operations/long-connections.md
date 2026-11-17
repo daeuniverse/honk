@@ -32,15 +32,3 @@ Hysteria2/TUIC/Juicity 在本地未使用连接空闲 120 s 后回收，不切�
 - 区分计时器到期、[出站健康门控](../design/datapath.md#出站存活状态)与容量拒绝。
 - 单独检查外部防火墙/NAT 与远端应用的空闲策略。
 
-## 采集 Native publication 证据
-
-调查 Native policy/DNS/mode 发布或 runtime maintenance 期间的中断时，使用预期的 [Native publication 产物契约](../reference/api.md#native-publication-产物)。本次实现交接中，本流程及 exporter/consumer、故障注入、真实 hook 检查均为 **NOT_RUN**。在绑定实际 build 的证据证明之前，保留原有 timeout/failure 判定。
-
-1. 在 attempt 前保留公布精确 `<data_dir>/state/native-publication/<pid>-<starttime_ticks>-<publication_serial>.json` 路径的 structured startup/readiness 输出。复制初始 `final=false` manifest，将 boot ID、PID/starttime、publication serial 和 root map 身份绑定到本次运行。另行保留 executable hash、source/build/object receipt 和 attached program/map 身份；自报 build version 不能认证二进制。Manifest/path 缺失或记录初始化失败属于前提缺失，不能当成零转换。
-2. 保留本地 `CLOCK_BOOTTIME`/`CLOCK_MONOTONIC` 的 attempt 与 shutdown 时间区间，以及有界 peer-clock 关联。Suspend、跨主机误差、capture loss 和 peer snapshot 缺失必须显式保留。不能由时间重叠推断某个丢包，也不能把 hook 计数相加当成去重包数。
-3. 移除 custody 前先停止流量源。请求正常 daemon shutdown，保留完整 structured result，**包括 Err 结果**。在 map/journal owner 仍存活时，等待真实 terminal closure、卸载引用 counter 的 hook 或替换为无引用 guard、join/drain 加 reader grace、counter 封存与 final export 完成。最后 writer commit、link FD 关闭、`honk-core stopped` 日志或 pin 存活都不足以证明 join。
-4. 在 namespace/pin/artifact teardown 或下一次运行前，复制发现路径的产物并计算 hash，将 structured shutdown result 持久保留并绑定同一 publication 身份/路径。发布成功时验证 result 的 streaming digest 与采集字节一致，将 digest 与副本一同保留。同时保留 shutdown 原错误及独立 export 错误；可达 failed-retained 路径必须在 forget owner 前尝试不完整部分导出。Failed-retained custody 仍遵循既有精确 owner 清理流程。
-5. 完整证据必须有匹配的 `export_publication_result=PUBLISHED_DURABLE`。`NOT_PUBLISHED` 留下初始不完整 manifest；`PUBLISHED_DURABILITY_UNKNOWN` 表示 rename 成功但目录 sync 失败，可见替换 JSON 可能已含 `final=true`。拒绝未知持久性、结果缺失/未绑定/矛盾或 digest 不匹配。即使结果为 `PUBLISHED_DURABLE`，仍须 `final=true`、`hooks_joined=true`、collection end 晚于工作、身份完整、event 匹配、所有 covered hook/epoch 已封存、seq 连续为 `1..last_seq`、`total_appended=last_seq=count(events)`、`first_retained_seq=1`、`overwritten_events=0`，且无 recording/clock/accounting/overflow 故障。保留十进制字符串，不经浮点数转换。
-
-4,096 条 ring 可能淘汰早期历史，不保证固定保留秒数。连续后缀或 provisional 计数不能满足整次运行完整性。Crash/SIGKILL/断电可能只留下初始 manifest，或可见 terminal JSON 却无匹配持久结果；不承诺 crash 后存活的连续 journal。将这些观测标为 incomplete。即使完整产物也仅证明已记录的转换顺序和封存后的精确 closed 分支 hook 执行次数：零不证明流量到达 hook，计数不证明 socket custody、应用交付、没有其他丢弃或超时原因。
-

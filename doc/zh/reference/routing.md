@@ -90,10 +90,6 @@ TCP/UDP 目的端口 `53` 的接管权限如下；本地 `:53` 监听 socket 不
 以及重复的 `mark`/`must` 选项均拒绝配置；格式错误的直连 mark 不会静默变为零。
 mark 只支持 `direct`，不支持代理/组目标。
 
-仅 Host 的 XDP Native 在原 operation 上执行 Keep 或精确的完整 32 位 Set，
-不添加 classified/bypass 位。物理 Native 不支持这些显式 Set 动作，包括 Set(0)，
-不能将它们静默投影为 legacy 直连套接字约定。
-
 `direct(mark: 0x200, must)` 与 `direct(must, mark: 0x200)` 等价，
 直连选项列表内部允许空白。`fallback:` 及其别名 `default:` 接受相同形式。
 合并 include 后最后出现的 fallback 替换整个回退动作（普通 `direct` 会清除 mark 与 `must`），
@@ -105,7 +101,7 @@ mark 只支持 `direct`，不支持代理/组目标。
 配置 `0x200` 时可观测到 `0x40000200`，Linux 策略路由规则必须用掩码排除保留位。
 仅在这个 legacy 执行边界，显式零与省略 mark 效果相同：用户态发起的直连
 套接字使用全局 mark，TC 直连不添加用户 mark。配置和 canonical 路由结果
-仍保留两者区别；这层 legacy 投影不是 Native 的完整 32 位 mark 赋值。
+仍保留两者区别。
 代理承载连接、bootstrap 和 DNS 控制器上游使用全局值，不继承流量规则的 mark。
 
 例如，选择两个由用户配置的 WAN 路由表：
@@ -219,11 +215,7 @@ routing {
 这里 `proxy`、`hk` 和 `resilient` 都是组名。
 
 `routing` 的 `direct` 目标使用
-[`datapath.direct`](./global.md#捕获后端选择) 选定的执行方式。公开的
-`direct: native` 选择器要求物理 XDP 捕获、真实 eBPF 与关闭 NFQUEUE；
-符合条件的最终 Direct 数据包使用 XDP candidate `PASS`。TC/TUN/Host Native
-及 Native 防火墙/NAT 组合均拒绝。Host Native 与 captured-first return 尚不可执行。
-验收要求 TCX 最终门禁无跳过通过；该选择器不代表完整 V7，也不宣称真实测试已通过。
+[`datapath.direct`](./global.md#捕获后端选择) 选定的执行方式。
 
 ## Core 转发防火墙与 IPv4 NAT
 
