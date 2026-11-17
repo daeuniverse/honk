@@ -354,6 +354,11 @@ fn capture_worker_participants_share_one_actual_process_grant() {
         Some(binding.participant_handle()),
     );
     let second = first.participant();
+    first
+        .budget
+        .as_ref()
+        .unwrap()
+        .set_test_time(quota.window_ns);
     let held = first
         .budget
         .as_ref()
@@ -369,7 +374,11 @@ fn capture_worker_participants_share_one_actual_process_grant() {
             .unwrap_err(),
         "busy_interval_outstanding"
     );
-    first.budget.as_ref().unwrap().set_test_time(50_000);
+    first
+        .budget
+        .as_ref()
+        .unwrap()
+        .set_test_time(quota.window_ns + 50_000);
     assert_eq!(held.finish().unwrap().charged_ns, 50_000);
     let next = second
         .budget
@@ -377,7 +386,11 @@ fn capture_worker_participants_share_one_actual_process_grant() {
         .unwrap()
         .try_reserve(quota, revision, 100_000, None)
         .unwrap();
-    second.budget.as_ref().unwrap().set_test_time(100_000);
+    second
+        .budget
+        .as_ref()
+        .unwrap()
+        .set_test_time(quota.window_ns + 100_000);
     next.finish().unwrap();
     assert!(
         first
