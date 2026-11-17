@@ -233,7 +233,8 @@ impl EndpointAdmission {
             + snapshot.mode.name.capacity()
             + snapshot.mode_state.as_ref().map_or(0, |state| {
                 state.mode.capacity() + state.global_selection().len()
-            });
+            })
+            + snapshot.source_mac.as_ref().map_or(0, String::capacity);
         #[cfg(feature = "native-api")]
         let bytes = bytes + snapshot.mode.group_id.as_ref().map_or(0, String::capacity);
         let memory = budget.reserve(bytes).ok_or_else(|| {
@@ -394,7 +395,6 @@ impl PacketEndpoints {
 
     /// Includes protocol, initializer/retirement, queued work and actual output owners.
     /// Call outside the receive callback, which already holds the scope mutex.
-    #[cfg(test)]
     pub(crate) fn retains_source(&self, scope: ScopeId, address: std::net::IpAddr) -> bool {
         self.shared
             .scopes

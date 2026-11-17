@@ -105,6 +105,15 @@ pub struct RoutingBytecode {
     pub trace_layout: Option<KernelTraceLayout>,
 }
 
+/// Gateway function body: R1 is LAN input, R2 is caller-guarded host scratch.
+/// Return 1 for a proven static direct, 0 for Endpoint, or a negative input error.
+#[derive(Debug, Clone)]
+pub struct GatewayBytecode {
+    pub insns: Vec<bpf_insn>,
+    pub source_lines: Vec<RoutingSourceLine>,
+    pub policy_fingerprint: [u8; 32],
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Label(usize);
 
@@ -202,12 +211,12 @@ impl Assembler {
                 .get(label.0)
                 .and_then(|target| *target)
                 .with_context(|| format!("unresolved jump label ordinal {}", label.0))?;
-            let delta = target as isize - index as isize - 1;
-            ensure!(
-                i16::try_from(delta).is_ok(),
-                "routing jump out of range: {index} -> {target}"
-            );
-            self.insns[index].off = delta as i16;
+            let delta = i64::try_from(target)?
+                .checked_sub(i64::try_from(index)?)
+                .and_then(|delta| delta.checked_sub(1))
+                .context("routing jump offset overflow")?;
+            self.insns[index].off = i16::try_from(delta)
+                .with_context(|| format!("routing jump out of range: {index} -> {target}"))?;
         }
         Ok(RoutingBytecode {
             insns: self.insns,
@@ -295,7 +304,7 @@ pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, false)
+    emit_routing_program_inner(plan, fds, false, false)
 }
 
 /// Host callers reserve the output's unused trace payload as scratch under their busy guard.
@@ -304,25 +313,79 @@ pub fn emit_host_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, true)
+    emit_routing_program_inner(plan, fds, true, false)
 }
 
-fn emit_routing_program_inner(
+/// Emit LAN gateway classification using canonical predicates and map-backed scratch.
+/// The caller supplies a complete TCP SYN/UDP input and owns the scratch busy guard;
+/// LAN process identity is always Missing, regardless of the input's pname bytes.
+/// The caller captures mode authority in the input's ALLOW_DIRECT_FINALITY bit.
+pub fn emit_gateway_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
-    host_scratch: bool,
-) -> anyhow::Result<RoutingBytecode> {
-    validate_plan(plan)?;
+) -> std::io::Result<GatewayBytecode> {
+    let bytecode =
+        emit_routing_program_inner(plan, fds, true, true).map_err(std::io::Error::other)?;
+    Ok(GatewayBytecode {
+        insns: bytecode.insns,
+        source_lines: bytecode.lines,
+        policy_fingerprint: plan.policy_fingerprint,
+    })
+}
+
+fn emit_gateway_terminal(asm: &mut Assembler, action: KernelAction) -> anyhow::Result<()> {
+    let direct = action.outbound == honk_ebpf_common::OutboundIndex::Direct as u8
+        && !action.mark.is_some_and(|mark| mark != 0);
+    if !direct {
+        asm.mov_imm(R0, 0)?;
+        return asm.exit();
+    }
+    let denied = asm.label();
+    if !action.must {
+        asm.ldx_w(R0, R6, INPUT_FLAGS)?;
+        asm.and_imm(R0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32)?;
+        asm.jump(BPF_JEQ, R0, 0, denied)?;
+        asm.ldx_w(R0, R7, DOMAIN_FINAL)?;
+        asm.jump(BPF_JEQ, R0, 0, denied)?;
+        asm.ldx_w(R0, R6, INPUT_DST_PORT)?;
+        asm.jump(BPF_JEQ, R0, 53, denied)?;
+    }
+    asm.mov_imm(R0, 1)?;
+    asm.exit()?;
+    if !action.must {
+        asm.bind(denied);
+        asm.mov_imm(R0, 0)?;
+        asm.exit()?;
+    }
+    Ok(())
+}
+
+fn validate_map_fds(fds: &RoutingMapFds, domain: bool) -> anyhow::Result<()> {
     for (name, fd) in [
         ("destination_v4", fds.destination_v4),
         ("destination_v6", fds.destination_v6),
         ("source_v4", fds.source_v4),
         ("source_v6", fds.source_v6),
         ("mac", fds.mac),
-        ("domain", fds.domain),
     ] {
         ensure!(fd >= 0, "invalid {name} routing map fd {fd}");
     }
+    ensure!(
+        !domain || fds.domain >= 0,
+        "invalid domain routing map fd {}",
+        fds.domain
+    );
+    Ok(())
+}
+
+fn emit_routing_program_inner(
+    plan: &RoutingPushPlan,
+    fds: RoutingMapFds,
+    host_scratch: bool,
+    gateway: bool,
+) -> anyhow::Result<RoutingBytecode> {
+    validate_plan(plan)?;
+    validate_map_fds(&fds, !gateway)?;
 
     let mut asm = Assembler::new();
     asm.host_scratch = host_scratch;
@@ -341,7 +404,7 @@ fn emit_routing_program_inner(
     }
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
-    if host_scratch {
+    if asm.host_scratch {
         const END: i16 = TRACE_INPUT - STACK_DOMAIN_KEY;
         const _: () = assert!(END as usize <= std::mem::size_of::<KernelRouteOutput>());
         asm.mov_reg(R9, R2)?;
@@ -367,7 +430,7 @@ fn emit_routing_program_inner(
     }
     emit_trace_init(&mut asm)?;
 
-    if plan.has_domain_rules {
+    if plan.has_domain_rules && !gateway {
         emit_fact_lookup(&mut asm, FactKind::Domain, &fds)?;
     }
 
@@ -384,8 +447,33 @@ fn emit_routing_program_inner(
         asm.source(rule.id + 1, rule.source.as_str());
         let fail = asm.label();
         let mut conditional = false;
+        let mut missing_process = false;
+        let mut domain_barrier = false;
+        if gateway {
+            domain_prefix |= rule
+                .runtime_conditions()
+                .any(|(_, condition)| matches!(condition.predicate, KernelPredicate::Domain(_)));
+        }
         for (rank, (_, condition)) in rule.runtime_conditions().enumerate() {
             domain_prefix |= matches!(condition.predicate, KernelPredicate::Domain(_));
+            if gateway {
+                match condition.predicate {
+                    KernelPredicate::Domain(_) => {
+                        domain_barrier = true;
+                        break;
+                    }
+                    KernelPredicate::ProcessName(_) => {
+                        if !condition.not {
+                            asm.ja(fail)?;
+                            conditional = true;
+                            missing_process = true;
+                            break;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             let pass = asm.label();
             if plan.trace_enabled {
                 let missed = asm.label();
@@ -400,16 +488,26 @@ fn emit_routing_program_inner(
             asm.bind(pass);
             emit_trace_outcome(&mut asm, rule_slot + 1 + rank, ROUTE_TRACE_MATCHED)?;
         }
-        emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
-        emit_action(
-            &mut asm,
-            rule.action,
-            Some(rule.id),
-            domain_reroute && !domain_prefix,
-        )?;
-        emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
-        asm.mov_imm(R0, 0)?;
-        asm.exit()?;
+        if domain_barrier {
+            // Current domain facts cannot prove that a future sniffed domain will miss.
+            asm.mov_imm(R0, 0)?;
+            asm.exit()?;
+        } else if !missing_process {
+            emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_MATCHED)?;
+            emit_action(
+                &mut asm,
+                rule.action,
+                Some(rule.id),
+                domain_reroute && !domain_prefix,
+            )?;
+            emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
+            if gateway {
+                emit_gateway_terminal(&mut asm, rule.action)?;
+            } else {
+                asm.mov_imm(R0, 0)?;
+                asm.exit()?;
+            }
+        }
         if !conditional {
             return asm.finish();
         }
@@ -427,8 +525,12 @@ fn emit_routing_program_inner(
         domain_reroute && !domain_prefix,
     )?;
     emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
-    asm.mov_imm(R0, 0)?;
-    asm.exit()?;
+    if gateway {
+        emit_gateway_terminal(&mut asm, plan.fallback)?;
+    } else {
+        asm.mov_imm(R0, 0)?;
+        asm.exit()?;
+    }
     asm.finish()
 }
 

@@ -11,8 +11,10 @@ use aya_obj::btf::{Btf, BtfKind};
 use crate::{Capture, Protocol};
 mod attachment;
 mod ct;
-pub use attachment::{Attachment, PersistentAttachment};
+pub use attachment::{Attachment, OwnedXdpLink, PersistentAttachment};
+pub mod gateway;
 mod general;
+use gateway::{GatewayLoad, GatewayMaps};
 #[cfg(feature = "host")]
 mod host;
 pub use ct::ConntrackKfuncs;
@@ -27,6 +29,32 @@ pub use host::{HostPrograms, HostTcxAttachment};
 pub use source::{HostSourceConfig, HostSourcePrograms};
 #[cfg(feature = "host")]
 pub use tun::{TunKernelOffsets, TunMaps, TunProgramConfig, TunPrograms, TunTraceTarget};
+fn fdinfo_memlock(info: &str) -> io::Result<usize> {
+    let mut charge = None;
+    for line in info.lines() {
+        if let Some(value) = line.strip_prefix("memlock:") {
+            let value = value.trim();
+            if charge.is_some()
+                || value.is_empty()
+                || !value.bytes().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(invalid_data("invalid or duplicate BPF fdinfo memlock"));
+            }
+            charge = Some(
+                value
+                    .parse::<usize>()
+                    .map_err(|_| invalid_data("BPF fdinfo memlock overflow"))?,
+            );
+        }
+    }
+    // Empty LPM tries report zero (kernel/bpf/lpm_trie.c, 6.12 and 7.2.5).
+    charge.ok_or_else(|| invalid_data("BPF fdinfo memlock missing"))
+}
+
+pub fn kernel_memory_bytes(fd: BorrowedFd<'_>) -> io::Result<usize> {
+    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
+    fdinfo_memlock(&info)
+}
 
 const BPF_MAP_CREATE: u32 = 0;
 const BPF_MAP_LOOKUP_ELEM: u32 = 1;
@@ -174,6 +202,12 @@ fn map_attr(fd: BorrowedFd<'_>, key: &u32, value: u64) -> MapElemAttr {
     }
 }
 
+struct GatewayProgramConfig {
+    capture: crate::capture::GeneralCapture,
+    queues: u32,
+    ipv4_broadcasts: Vec<Ipv4Addr>,
+}
+
 pub struct Programs {
     counters: OwnedFd,
     xsks: OwnedFd,
@@ -182,9 +216,121 @@ pub struct Programs {
     discover_id: u32,
     data_id: u32,
     queues: u32,
+    _gateway_fds: Vec<OwnedFd>,
+    gateway_config: Option<std::sync::Arc<GatewayProgramConfig>>,
 }
 
 impl Programs {
+    pub fn object_fds(&self) -> [BorrowedFd<'_>; 4] {
+        [&self.counters, &self.xsks, &self.discover, &self.data].map(AsFd::as_fd)
+    }
+
+    pub fn load_general_gateway(
+        capture: &crate::capture::GeneralCapture,
+        queues: u32,
+        ipv4_broadcasts: &[Ipv4Addr],
+        gateway: gateway::GatewayLoad<'_>,
+    ) -> io::Result<Self> {
+        validate_queues(queues)?;
+        if !capture.authority.is_valid()
+            || capture.bypass_mark == 0
+            || capture.bypass_mark & honk_ebpf_common::CLASSIFIED_MARK != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid gateway capture authority",
+            ));
+        }
+        let config = std::sync::Arc::new(GatewayProgramConfig {
+            capture: capture.clone(),
+            queues,
+            ipv4_broadcasts: ipv4_broadcasts.to_vec(),
+        });
+        Self::load_gateway_with_maps(
+            config,
+            create_map(2, 8, queues + 4, b"honk_xdp_count")?,
+            create_map(17, 4, queues, b"honk_xdp_xsks")?,
+            gateway,
+        )
+    }
+
+    pub fn reload_general_gateway(&self, gateway: gateway::GatewayLoad<'_>) -> io::Result<Self> {
+        let config = self
+            .gateway_config
+            .as_ref()
+            .ok_or_else(|| invalid_data("not a gateway program"))?;
+        Self::load_gateway_with_maps(
+            std::sync::Arc::clone(config),
+            self.counters.try_clone()?,
+            self.xsks.try_clone()?,
+            gateway,
+        )
+    }
+
+    fn load_gateway_with_maps(
+        config: std::sync::Arc<GatewayProgramConfig>,
+        counters: OwnedFd,
+        xsks: OwnedFd,
+        gateway: gateway::GatewayLoad<'_>,
+    ) -> io::Result<Self> {
+        let retained = gateway.validate_and_retain()?;
+        let capture = &config.capture;
+        let vlan_kfunc = if capture.vlan_metadata {
+            Some(
+                Btf::from_sys_fs()
+                    .and_then(|btf| {
+                        btf.id_by_type_name_kind("bpf_xdp_metadata_rx_vlan_tag", BtfKind::Func)
+                    })
+                    .map_err(|error| {
+                        io::Error::new(io::ErrorKind::Unsupported, error.to_string())
+                    })?,
+            )
+        } else {
+            None
+        };
+        let mut log = vec![0; 1 << 20];
+        let mut build = |data| -> io::Result<(OwnedFd, u32)> {
+            let mut program = general::build_gateway(
+                capture,
+                &config.ipv4_broadcasts,
+                config.queues,
+                counters.as_raw_fd(),
+                xsks.as_raw_fd(),
+                data,
+                vlan_kfunc,
+                &gateway,
+            )?;
+            program.kfunc_btf = gateway
+                .conntrack
+                .btf
+                .as_ref()
+                .map(OwnedFd::try_clone)
+                .transpose()?;
+            load_program(
+                &program,
+                if data {
+                    b"honk_gw_data"
+                } else {
+                    b"honk_gw_boot"
+                },
+                &mut log,
+            )
+        };
+        let (discover, discover_id) = build(false)?;
+        let (data, data_id) = build(true)?;
+        Ok(Self {
+            counters,
+            xsks,
+            discover,
+            data,
+            discover_id,
+            data_id,
+            queues: config.queues,
+            _gateway_fds: retained,
+            gateway_config: Some(config),
+        })
+    }
+
     pub fn load_general(
         capture: &crate::capture::GeneralCapture,
         queues: u32,
@@ -253,6 +399,8 @@ impl Programs {
             discover_id,
             data_id,
             queues,
+            _gateway_fds: Vec::new(),
+            gateway_config: None,
         })
     }
 }
@@ -301,6 +449,8 @@ impl Programs {
             discover_id,
             data_id,
             queues,
+            _gateway_fds: Vec::new(),
+            gateway_config: None,
         })
     }
 
@@ -310,6 +460,14 @@ impl Programs {
 
     pub fn data_prog_id(&self) -> u32 {
         self.data_id
+    }
+
+    pub fn discover_fd(&self) -> BorrowedFd<'_> {
+        self.discover.as_fd()
+    }
+
+    pub fn data_fd(&self) -> BorrowedFd<'_> {
+        self.data.as_fd()
     }
 
     pub fn counters(&self) -> io::Result<CaptureCounters> {
@@ -405,7 +563,8 @@ fn load_typed_program(
     ];
     let mut attr = ProgLoadAttr {
         prog_type: kind,
-        insn_cnt: program.len as u32,
+        insn_cnt: u32::try_from(program.len)
+            .map_err(|_| invalid_data("XDP instruction count overflow"))?,
         insns: program.insns.as_ptr() as u64,
         license: c"GPL".as_ptr() as u64,
         log_level: 1,
@@ -532,6 +691,7 @@ fn xdp_update_request(ifindex: u32, program: RawFd, expected: Option<RawFd>) -> 
     (request, length)
 }
 
+#[derive(Debug)]
 pub(crate) enum XdpUpdateError {
     Rejected(io::Error),
     Uncertain(io::Error),
@@ -1005,6 +1165,7 @@ struct Builder {
     labels: [usize; 9],
     jumps: [(usize, Label); 512],
     jump_count: usize,
+    error: Option<io::Error>,
 }
 
 impl Builder {
@@ -1020,6 +1181,7 @@ impl Builder {
             labels: [usize::MAX; 9],
             jumps: [(0, Label::Pass); 512],
             jump_count: 0,
+            error: None,
         }
     }
 
@@ -1032,12 +1194,18 @@ impl Builder {
 
     fn jump(&mut self, instruction: Insn, target: Label) {
         let at = self.emit(instruction);
-        self.jumps[self.jump_count] = (at, target);
-        self.jump_count += 1;
+        if let Some(slot) = self.jumps.get_mut(self.jump_count) {
+            *slot = (at, target);
+            self.jump_count += 1;
+        } else {
+            self.error = Some(io::Error::other("too many XDP program jumps"));
+        }
     }
 
     fn label(&mut self, label: Label) {
-        assert_eq!(self.labels[label as usize], usize::MAX);
+        if self.labels[label as usize] != usize::MAX {
+            self.error = Some(io::Error::other("duplicate XDP program label"));
+        }
         self.labels[label as usize] = self.program.len;
     }
 
@@ -1063,14 +1231,20 @@ impl Builder {
     }
 
     fn finish(mut self) -> io::Result<Program> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
         for &(at, label) in &self.jumps[..self.jump_count] {
             let target = self.labels[label as usize];
             if target >= self.program.len {
                 return Err(io::Error::other("unresolved XDP program label"));
             }
-            let offset = isize::try_from(target).unwrap() - isize::try_from(at).unwrap() - 1;
-            self.program.insns[at].off = i16::try_from(offset)
-                .map_err(|_| io::Error::other("XDP jump offset exceeds i16"))?;
+            let offset = target
+                .checked_sub(at)
+                .and_then(|n| n.checked_sub(1))
+                .and_then(|n| i16::try_from(n).ok())
+                .ok_or_else(|| io::Error::other("XDP jump offset exceeds i16 or is backward"))?;
+            self.program.insns[at].off = offset;
         }
         Ok(self.program)
     }

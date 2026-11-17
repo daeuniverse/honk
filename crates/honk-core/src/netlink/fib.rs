@@ -62,6 +62,7 @@ struct Neighbor {
 struct Address {
     index: u32,
     ip: IpAddr,
+    preferred: bool,
 }
 #[derive(Clone, Copy)]
 struct Forwarding {
@@ -170,41 +171,6 @@ impl Fib {
         self.address_generation
     }
 
-    pub(crate) fn logical_links(&self) -> impl Iterator<Item = LogicalLink> + '_ {
-        self.links
-            .iter()
-            .filter_map(|link| logical_link(&self.links, link.index))
-    }
-
-    pub(crate) fn validate_capture(&self, physical: &[u32]) -> io::Result<()> {
-        if physical.iter().any(|&index| {
-            logical_link(&self.links, index)
-                .is_none_or(|link| link.path != LinkPath::untagged(index))
-        }) {
-            return Err(invalid("capture root lacks plain Ethernet authority"));
-        }
-        for link in &self.links {
-            let mut current = link;
-            for _ in 0..self.links.len() {
-                if physical.contains(&current.index) {
-                    if logical_link(&self.links, link.index).is_none() {
-                        return Err(invalid("capture has an unsupported VLAN/upper descendant"));
-                    }
-                    break;
-                }
-                let Some(parent) = self
-                    .links
-                    .iter()
-                    .find(|parent| parent.index == current.parent)
-                else {
-                    break;
-                };
-                current = parent;
-            }
-        }
-        Ok(())
-    }
-
     fn invalidate_address(&mut self) -> io::Result<()> {
         let Some(next) = self.address_generation.checked_add(1) else {
             self.state = FibState::Desynchronized;
@@ -275,6 +241,34 @@ impl Fib {
     }
 
     pub(crate) fn synchronize(&mut self) -> io::Result<()> {
+        self.synchronize_with(Self::dump_round)
+    }
+
+    fn dump_round(&mut self) -> io::Result<()> {
+        for (kind, family, size) in [
+            (RTM_GETLINK, 0, 16),
+            (RTM_GETADDR, 0, 8),
+            (RTM_GETROUTE, AF_INET as u8, 12),
+            (RTM_GETROUTE, AF_INET6 as u8, 12),
+            (RTM_GETRULE, AF_INET as u8, 12),
+            (RTM_GETRULE, AF_INET6 as u8, 12),
+            (82, AF_INET as u8, 4),
+            (82, AF_INET6 as u8, 4),
+            (RTM_GETNEXTHOP, 0, 8),
+            (RTM_GETNEIGH, 0, 12),
+        ] {
+            let mut body = [0; 16];
+            body[0] = family;
+            self.exchange(kind, NLM_F_REQUEST | 0x300, &body[..size], &[], true)?;
+        }
+        self.poll_changes()?;
+        Ok(())
+    }
+
+    fn synchronize_with(
+        &mut self,
+        mut round: impl FnMut(&mut Self) -> io::Result<()>,
+    ) -> io::Result<()> {
         if self.state == FibState::Desynchronized {
             return Err(invalid("FIB owner desynchronized; recreate owner"));
         }
@@ -287,27 +281,14 @@ impl Fib {
             self.neighbors.clear();
             self.addresses.clear();
             self.forwarding.clear();
-            let result = (|| {
-                for (kind, family, size) in [
-                    (RTM_GETLINK, 0, 16),
-                    (RTM_GETADDR, 0, 8),
-                    (RTM_GETROUTE, AF_INET as u8, 12),
-                    (RTM_GETROUTE, AF_INET6 as u8, 12),
-                    (RTM_GETRULE, AF_INET as u8, 12),
-                    (RTM_GETRULE, AF_INET6 as u8, 12),
-                    (82, AF_INET as u8, 4),
-                    (82, AF_INET6 as u8, 4),
-                    (RTM_GETNEXTHOP, 0, 8),
-                    (RTM_GETNEIGH, 0, 12),
-                ] {
-                    let mut body = [0; 16];
-                    body[0] = family;
-                    self.exchange(kind, NLM_F_REQUEST | 0x300, &body[..size], &[], true)?;
-                }
-                self.poll_changes()?;
-                Ok(())
-            })();
+            let result = round(self);
             if let Err(error) = result {
+                if error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<DumpInterrupted>())
+                {
+                    continue;
+                }
                 return self.fail(error);
             }
             if self.generation == generation {
@@ -337,7 +318,13 @@ impl Fib {
     }
 
     pub(crate) fn is_local(&self, address: IpAddr) -> bool {
-        self.addresses.iter().any(|entry| entry.ip == address)
+        self.addresses
+            .iter()
+            .any(|entry| entry.ip == address && entry.preferred)
+    }
+
+    pub(crate) fn local_addresses(&self) -> impl Iterator<Item = IpAddr> + '_ {
+        self.addresses.iter().map(|entry| entry.ip)
     }
 
     pub(crate) fn lookup(&mut self, query: RouteQuery) -> io::Result<Resolution> {
@@ -684,6 +671,7 @@ impl Fib {
             dump,
             messages: 0,
             complete: false,
+            interrupted: false,
             error: None,
             route: None,
         };
@@ -714,14 +702,20 @@ impl Fib {
             }
             let (length, response, response_flags, response_sequence) =
                 header(&self.receive[at..n])?;
-            if response_flags & NLM_F_DUMP_INTR != 0 {
-                return Err(invalid("FIB dump interrupted"));
-            }
             if multicast_notification(group, response)? {
                 self.notified(response)?;
+                if response_flags & NLM_F_DUMP_INTR != 0 {
+                    return Err(invalid("interrupted FIB notification"));
+                }
             } else if response_sequence != sequence || exchange.complete {
                 return Err(invalid("late or mismatched FIB reply"));
             } else {
+                if response_flags & NLM_F_DUMP_INTR != 0 {
+                    if !exchange.dump {
+                        return Err(invalid("interrupted non-dump FIB reply"));
+                    }
+                    exchange.interrupted = true;
+                }
                 let payload = &self.receive[at + 16..at + length];
                 match response {
                     2 | 3 => {
@@ -811,14 +805,29 @@ struct Exchange<'a> {
     dump: bool,
     messages: usize,
     complete: bool,
+    interrupted: bool,
     error: Option<io::Error>,
     route: Option<SelectedRoute>,
 }
+
+#[derive(Debug)]
+struct DumpInterrupted;
+
+impl std::fmt::Display for DumpInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FIB dump interrupted")
+    }
+}
+
+impl std::error::Error for DumpInterrupted {}
 
 impl Exchange<'_> {
     fn finish(self) -> io::Result<Option<SelectedRoute>> {
         match self.error {
             Some(error) => Err(error),
+            None if self.interrupted => {
+                Err(io::Error::new(io::ErrorKind::Interrupted, DumpInterrupted))
+            }
             None => Ok(self.route),
         }
     }
@@ -1283,21 +1292,31 @@ fn parse_address(bytes: &[u8]) -> io::Result<Option<Address>> {
     let mut ip = None;
     let mut local = None;
     let mut flags = u32::from(bytes[2]);
+    let mut valid = true;
+    let mut preferred = true;
     attributes(&bytes[8..], |kind, data| {
         match kind {
             IFA_ADDRESS => ip = Some(ip_address(bytes[0], data)?),
             IFA_LOCAL => local = Some(ip_address(bytes[0], data)?),
+            6 => {
+                if data.len() != 16 {
+                    return Err(invalid("invalid address cache info"));
+                }
+                preferred = u32_attr(&data[..4])? != 0;
+                valid = u32_attr(&data[4..8])? != 0;
+            }
             8 => flags = u32_attr(data)?,
             _ => {}
         }
         Ok(())
     })?;
-    if flags & (8 | 32 | 64) != 0 {
+    if flags & (8 | 64) != 0 || !valid {
         return Ok(None);
     }
     Ok(local.or(ip).map(|ip| Address {
         index: u32::from_ne_bytes(bytes[4..8].try_into().unwrap()),
         ip,
+        preferred: preferred && flags & 32 == 0,
     }))
 }
 
@@ -1333,6 +1352,138 @@ mod tests {
         let mut fib = Fib::new(&MemoryBudget::new(4 << 20), namespace).unwrap();
         fib.state = FibState::Ready;
         fib
+    }
+
+    #[test]
+    fn deprecated_valid_address_is_local_but_not_source_candidate() {
+        let mut fib = ready_fib();
+        let ip: IpAddr = "2001:db8::42".parse().unwrap();
+        let mut body = vec![0; 8];
+        body[0] = AF_INET6 as u8;
+        body[4..8].copy_from_slice(&2u32.to_ne_bytes());
+        put_attr(&mut body, IFA_ADDRESS, &ip_attr(ip));
+        let mut cache = vec![0; 16];
+        cache[4..8].copy_from_slice(&60u32.to_ne_bytes());
+        put_attr(&mut body, 6, &Attr::Bytes(cache));
+        fib.addresses.push(parse_address(&body).unwrap().unwrap());
+        assert!(fib.local_addresses().any(|address| address == ip));
+        assert!(!fib.is_local(ip));
+        let mut expired = body[..8].to_vec();
+        put_attr(&mut expired, IFA_ADDRESS, &ip_attr(ip));
+        put_attr(&mut expired, 6, &Attr::Bytes(vec![0; 16]));
+        assert!(parse_address(&expired).unwrap().is_none());
+    }
+
+    #[test]
+    fn synchronizing_preserves_last_local_address_snapshot() {
+        let mut fib = ready_fib();
+        let old: IpAddr = "2001:db8::42".parse().unwrap();
+        fib.addresses.push(Address {
+            index: 2,
+            ip: old,
+            preferred: false,
+        });
+        fib.notified(RTM_NEWADDR).unwrap();
+        assert_eq!(fib.state(), FibState::Synchronizing);
+        assert_eq!(fib.local_addresses().collect::<Vec<_>>(), [old]);
+        let new: IpAddr = "2001:db8::43".parse().unwrap();
+        fib.synchronize_with(|fib| {
+            fib.addresses.push(Address {
+                index: 2,
+                ip: new,
+                preferred: true,
+            });
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(fib.state(), FibState::Ready);
+        assert_eq!(fib.local_addresses().collect::<Vec<_>>(), [new]);
+    }
+
+    #[test]
+    fn dump_interrupted_consumes_matching_completion_before_retry() {
+        let mut fib = ready_fib();
+        let mut round = 0;
+        fib.synchronize_with(|fib| {
+            round += 1;
+            let sequence = 40 + round;
+            let request = message(RTM_GETLINK, NLM_F_REQUEST | 0x300, sequence, &[0; 16]);
+            let mut exchange = exchange_state(&request, 16, true);
+            if round == 1 {
+                let data = message(
+                    RTM_NEWLINK,
+                    NLM_F_DUMP_INTR,
+                    sequence,
+                    &link_bytes(2, None, None),
+                );
+                feed_exchange(fib, &data, 0, &mut exchange)?;
+                assert!(!exchange.complete);
+                let mut address = vec![0; 8];
+                address[0] = AF_INET as u8;
+                address[1] = 32;
+                address[4..8].copy_from_slice(&2u32.to_ne_bytes());
+                put_attr(
+                    &mut address,
+                    IFA_ADDRESS,
+                    &ip_attr("192.0.2.7".parse().unwrap()),
+                );
+                feed_exchange(fib, &message(RTM_NEWADDR, 0, 0, &address), 5, &mut exchange)?;
+                let mut residue = message(RTM_NEWLINK, 2, sequence, &link_bytes(3, None, None));
+                residue.extend_from_slice(&message(3, 2, sequence, &0i32.to_ne_bytes()));
+                feed_exchange(fib, &residue, 0, &mut exchange)?;
+            } else {
+                assert!(fib.links.is_empty());
+                let mut success = message(RTM_NEWLINK, 2, sequence, &link_bytes(4, None, None));
+                success.extend_from_slice(&message(3, 2, sequence, &0i32.to_ne_bytes()));
+                feed_exchange(fib, &success, 0, &mut exchange)?;
+            }
+            assert!(exchange.complete);
+            exchange.finish().map(|_| ())
+        })
+        .unwrap();
+        assert_eq!(round, 2);
+        assert_eq!(fib.state(), FibState::Ready);
+        assert_eq!(fib.links.len(), 1);
+        assert_eq!(fib.links[0].index, 4);
+    }
+
+    #[test]
+    fn interrupted_dumps_retry_twice_then_desynchronize_on_third() {
+        for interrupted_rounds in 0..=3 {
+            let mut fib = ready_fib();
+            let mut rounds = 0;
+            let result = fib.synchronize_with(|fib| {
+                rounds += 1;
+                let request = message(RTM_GETLINK, NLM_F_REQUEST | 0x300, rounds, &[0; 16]);
+                let mut exchange = exchange_state(&request, 16, true);
+                let interrupted = rounds <= interrupted_rounds;
+                let data = message(
+                    RTM_NEWLINK,
+                    if interrupted { NLM_F_DUMP_INTR } else { 2 },
+                    rounds,
+                    &link_bytes(rounds + 1, None, None),
+                );
+                feed_exchange(fib, &data, 0, &mut exchange)?;
+                let mut tail =
+                    message(RTM_NEWLINK, 2, rounds, &link_bytes(rounds + 10, None, None));
+                tail.extend_from_slice(&message(3, 2, rounds, &0i32.to_ne_bytes()));
+                feed_exchange(fib, &tail, 0, &mut exchange)?;
+                assert!(exchange.complete);
+                exchange.finish().map(|_| ())
+            });
+            assert_eq!(rounds, (interrupted_rounds + 1).min(3));
+            assert_eq!(result.is_ok(), interrupted_rounds < 3);
+            assert_eq!(
+                fib.state(),
+                if interrupted_rounds < 3 {
+                    FibState::Ready
+                } else {
+                    FibState::Desynchronized
+                }
+            );
+            assert_eq!(fib.links.len(), 2);
+            assert_eq!(fib.links[0].index, rounds + 1);
+        }
     }
 
     fn message(kind: u16, flags: u16, sequence: u32, payload: &[u8]) -> Vec<u8> {
@@ -1379,6 +1530,7 @@ mod tests {
             dump,
             messages: 0,
             complete: false,
+            interrupted: false,
             error: None,
             route: None,
         }
@@ -1434,6 +1586,7 @@ mod tests {
         fib.addresses.push(Address {
             index: 9,
             ip: query(&fib, ipv6).source,
+            preferred: true,
         });
         fib.neighbors.push(Neighbor {
             index: 9,

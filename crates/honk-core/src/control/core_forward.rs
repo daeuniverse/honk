@@ -325,6 +325,7 @@ impl RoutingAuthority {
             dscp: Some(query.traffic_class >> 2),
         };
         PacketRoutingSnapshot {
+            source_mac: input.mac.clone(),
             decision: RoutingDecision::from_router(
                 &read.router,
                 &input,

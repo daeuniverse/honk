@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn path() -> ReturnPath {
     ReturnPath {
+        realm: 1,
         device: 0,
         mac: [2, 3, 4, 5, 6, 7],
         vlan_tci: [0xa00c, 45],
@@ -169,6 +170,8 @@ fn output_realm(driver: PacketDriver, reply: ReturnPath, mtu: usize) -> Realm {
         },
     };
     Realm {
+        realm_id: reply.realm,
+        members: vec![reply.device],
         ingress: Ingress {
             scope: driver.scope(),
             namespace: 1,
@@ -1155,6 +1158,8 @@ async fn endpoint_realms_keep_each_output_on_its_actual_device_and_vlan_path() {
             reply_path.vlan_tci[0] += device as u16;
             let ifindex = device as u32 + 10;
             let mut realm = Realm {
+                realm_id: reply_path.realm,
+                members: vec![device],
                 ingress: Ingress {
                     scope: scope.scope(),
                     namespace: 1,
@@ -1235,6 +1240,8 @@ async fn realm_capacity_fallback_and_pending_head_never_export_a_suffix() {
         let (endpoints, owner, driver) = driven(scope.clone(), owner, plane).await;
         let reply_path = path();
         let mut realm = Realm {
+            realm_id: reply_path.realm,
+            members: vec![0],
             ingress: Ingress {
                 scope: scope.scope(),
                 namespace: 1,
@@ -1979,4 +1986,32 @@ async fn generated_empty_turns_do_not_create_protocol_deadlines() {
         assert!(realm.driver.deadline().is_none());
     }
     join_driven(endpoints, owner, &mut realm.driver).await;
+}
+
+#[tokio::test]
+async fn gateway_hold_retains_real_queued_exported_and_cq_output() {
+    for (client, remote) in [
+        ("192.0.2.10:41000", "198.51.100.9:443"),
+        ("[2001:db8::10]:41000", "[2001:db8::20]:443"),
+    ] {
+        let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+        let client: SocketAddr = client.parse().unwrap();
+        let remote: SocketAddr = remote.parse().unwrap();
+        let address = client.ip();
+        assert!(!endpoints.retains_source(scope.scope(), address));
+        let sender = scope.datagram_sender(remote);
+        sender.send_to(b"reply", client).await.unwrap();
+        assert!(endpoints.retains_source(scope.scope(), address));
+        assert!(!endpoints.retains_source(ScopeId::allocate().unwrap(), address));
+        let exported = scope.next_output().await.unwrap();
+        scope.shutdown(true);
+        assert!(endpoints.retains_source(scope.scope(), address));
+        let mut retained = Retained::Endpoint(exported.into_owner());
+        assert!(endpoints.retains_source(scope.scope(), address));
+        release_completed(&mut [Some(&mut retained)]);
+        assert!(!endpoints.retains_source(scope.scope(), address));
+        drop((retained, sender));
+        endpoints.shutdown().await.unwrap();
+        owner.run().await.unwrap();
+    }
 }

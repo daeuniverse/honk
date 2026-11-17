@@ -5,12 +5,24 @@ use std::sync::{Barrier, mpsc as sync_channel};
 
 fn path() -> ReturnPath {
     ReturnPath {
+        realm: 1,
         device: 0,
         mac: [2; 6],
         vlan_tci: [7, 0],
         vlan_proto: [0x8100, 0],
         vlan_count: 1,
     }
+}
+
+#[test]
+fn peer_identity_uses_logical_realm_not_member_or_priority() {
+    let first = path();
+    let mut next = first;
+    next.device = 1;
+    next.vlan_tci[0] |= 0xa000;
+    assert!(first.same_identity(next));
+    next.realm += 1;
+    assert!(!first.same_identity(next));
 }
 
 fn source(port: u16, flags: Option<u8>) -> honk_netstack::ValidatedSource {
@@ -106,6 +118,33 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         "a full destination returns the actual owned envelope"
     );
     drop(refused);
+}
+
+#[test]
+fn bond_peer_moves_future_replies_without_rewriting_retained_output() {
+    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let scope = ScopeId::allocate().unwrap();
+    let now = Instant::now();
+    let original = peers
+        .retain(scope, source(4000, Some(tcp::SYN)), path(), now, false)
+        .unwrap();
+    let exported = original.clone();
+    let mut next = path();
+    next.device = 1;
+    let current = peers
+        .retain(scope, source(4000, Some(tcp::ACK)), next, now, false)
+        .unwrap();
+    assert_eq!(current.original_path(), next);
+    assert_eq!(exported.original_path(), path());
+    let mut foreign = next;
+    foreign.realm += 1;
+    assert!(
+        peers
+            .retain(scope, source(4000, Some(tcp::ACK)), foreign, now, false)
+            .is_none()
+    );
+    assert_eq!(exported.original_path().device, 0);
+    assert_eq!(current.original_path().device, 1);
 }
 
 #[test]

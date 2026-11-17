@@ -358,16 +358,10 @@ async fn xdp_policy_rejection_preserves_files_database_and_runtime() {
         } else {
             None
         };
-        let mut candidates: Vec<_> = [
-            "dport(443) -> direct(mark: 512)",
-            "pname(browser) -> direct",
-            "!pname(browser) -> direct",
-            "mac(02:00:00:00:00:01) -> direct",
-            "!mac(02:00:00:00:00:01) -> direct",
-        ]
-        .into_iter()
-        .map(|rule| original.replace("fallback: direct", &format!("{rule}\n fallback: direct")))
-        .collect();
+        let mut candidates: Vec<_> = ["dport(443) -> direct(mark: 512)"]
+            .into_iter()
+            .map(|rule| original.replace("fallback: direct", &format!("{rule}\n fallback: direct")))
+            .collect();
         candidates.extend([
             original.replace("fallback: direct", "fallback: direct(mark: 512)"),
             original.replace("dial_mode: ip", "dial_mode: domain"),

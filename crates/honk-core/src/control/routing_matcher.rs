@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-#[cfg(feature = "ebpf")]
 pub mod codegen;
 
 /// A condition in the native rule representation.

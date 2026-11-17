@@ -205,6 +205,7 @@ impl WorkerRuntime {
                                     return Ok(());
                                 };
                                 let path = ReturnPath {
+                                    realm: placement.realm_id,
                                     device: device.index,
                                     mac: decoded.source_mac,
                                     vlan_tci: decoded.vlan_tci,
@@ -316,6 +317,37 @@ impl WorkerRuntime {
             let realm_index = (start_realm + offset) % self.realms.len();
             self.tx_realm = (realm_index + 1) % self.realms.len();
             let realm = &mut self.realms[realm_index];
+            if realm.members.len() > 1 {
+                realm.driver.service(cx, now);
+                let devices = &mut self.devices;
+                progress |= service_member_output(
+                    realm,
+                    cx,
+                    self.closing,
+                    &self.endpoints,
+                    |realm, class, path, output| {
+                        let device = devices
+                            .iter_mut()
+                            .find(|device| device.index == path.device)
+                            .ok_or_else(|| {
+                                io::Error::other("retained worker output member missing")
+                            })?;
+                        let ifindex = device.info.ifindex;
+                        let queue = device.queues.first_mut().ok_or_else(|| {
+                            io::Error::other("retained worker output queue missing")
+                        })?;
+                        submit_member_output(
+                            realm,
+                            queue.io.get_mut(),
+                            ifindex,
+                            class,
+                            path,
+                            output,
+                        )
+                    },
+                )? != 0;
+                continue;
+            }
             let device = self
                 .devices
                 .iter_mut()

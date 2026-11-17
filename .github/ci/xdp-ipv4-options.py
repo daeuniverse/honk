@@ -348,6 +348,10 @@ def bpf(operation, attr):
 
 def program_fd(device, role):
     assert role in ('data', 'guard')
+    if role == 'data' and not os.environ.get('HONK_XDP_EXPECT_NAME'):
+        state = xdp_state(device)
+        require_xdp_identity(state, state['prog_id'])
+        return bpf(13, Id(id=state['prog_id']))
     index = socket.if_nametoindex(device)
     name = C.create_string_buffer(str(Path(os.environ['HONK_XDP_PIN_ROOT']) / f'xdp-{index}' / role).encode())
     return bpf(7, ObjectGet(pathname=C.addressof(name)))
@@ -523,14 +527,37 @@ def domain_peer(profile):
         raise TimeoutError('domain peer did not receive its completion barrier')
 
 
+def forward_fence_packets():
+    items = json.loads(subprocess.check_output(['ip', 'netns', 'exec', 'dut', 'nft', '-j', 'list', 'chain', 'inet', 'honk_smoke_native', 'forward'], text=True))['nftables']
+    rules = [item['rule']['expr'] for item in items if 'rule' in item]
+    assert len(rules) == 1 and rules[0][-1] == {'drop': None}, rules
+    return next(item['counter']['packets'] for item in rules[0] if 'counter' in item)
+
+
+def dut_reply_evidence():
+    def read(*args):
+        return subprocess.check_output(['ip', 'netns', 'exec', 'dut', *args], text=True, timeout=5)
+    wanted = {'Ip6InReceives', 'Ip6InDiscards', 'Ip6InNoRoutes', 'Ip6InAddrErrors', 'Ip6InDelivers',
+              'Udp6InDatagrams', 'Udp6NoPorts', 'Udp6InErrors', 'Udp6RcvbufErrors'}
+    snmp6 = dict(line.split() for line in read('cat', '/proc/net/snmp6').splitlines() if line.strip())
+    sockets = [fields for fields in (line.split() for line in read('cat', '/proc/net/udp6').splitlines()[1:])]
+    xdp = [line.strip() for line in read('ethtool', '-S', 'dut1').splitlines() if 'xdp' in line or 'drop' in line]
+    return {'snmp6': {name: int(value) for name, value in snmp6.items() if name in wanted},
+            'udp6': [(fields[1], fields[4], fields[-1]) for fields in sockets], 'dut1': xdp}
+
+
 def domain_client(profile='endpoint'):
     for family, address, qtype, label in ((socket.AF_INET, '198.51.100.2', 1, '4'), (socket.AF_INET6, 'fd00:2::2', 28, '6')):
         with socket.socket(family, socket.SOCK_DGRAM) as original, socket.socket(family, socket.SOCK_DGRAM) as fresh:
             original.settimeout(5)
             original.connect((address, 18082))
             before = ('before-' + label).encode()
+            evidence = dut_reply_evidence()
             original.send(before)
-            assert original.recv(4096) == before
+            try:
+                assert original.recv(4096) == before
+            except TimeoutError as error:
+                raise AssertionError(('original reply missing', label, original.getsockname(), evidence, dut_reply_evidence())) from error
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as query:
                 query.settimeout(5)
                 query.connect(('198.51.100.99', 53))
@@ -558,9 +585,22 @@ def domain_client(profile='endpoint'):
                 must.settimeout(5)
                 must.connect((address, 18083))
                 payload = ('must-' + label).encode()
-                must.send(payload)
-                assert must.recv(4096) == payload
-        print(json.dumps({'packet_domain_family': label, 'before': 'direct', 'after': 'blocked', 'earlier_must': 'direct'}), flush=True)
+                if profile == 'endpoint':
+                    captured = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
+                    forwarded = forward_fence_packets()
+                    must.send(payload)
+                    try:
+                        reply = must.recv(4096)
+                    except socket.timeout:
+                        pass
+                    else:
+                        raise AssertionError(('D1 direct-must bypassed the kernel forwarding fence', reply))
+                    assert forward_fence_packets() == forwarded + 1, 'direct-must never reached kernel forwarding'
+                    assert json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5)) == captured, 'direct-must entered Endpoint'
+                else:
+                    must.send(payload)
+                    assert must.recv(4096) == payload
+        print(json.dumps({'packet_domain_family': label, 'before': 'direct', 'after': 'blocked', 'earlier_must': 'kernel-fence' if profile == 'endpoint' else 'direct'}), flush=True)
 
 
 def domain_check(profile):
@@ -578,11 +618,14 @@ def domain_check(profile):
         assert peer.returncode == 0, peer.stderr.read()
         print(client.stdout, end='', flush=True)
         assert client.returncode == 0, (client.stdout, client.stderr, observed)
-        expected = ['before-4', 'before-6', 'must-4', 'must-6']
+        expected = ['before-4', 'before-6'] if profile == 'endpoint' else ['before-4', 'before-6', 'must-4', 'must-6']
         assert sorted(observed['received']) == sorted(expected), observed
         assert observed['queries'] == 2, observed
         after = json.loads(subprocess.check_output(command('dut', 'count', 'dut0'), text=True, timeout=5))
-        assert sum(after) - sum(before) >= 8, ('domain probe lacked actual capture', before, after)
+        minimum_captured = 6 if profile == 'endpoint' else 8
+        assert sum(after) - sum(before) >= minimum_captured, ('domain probe lacked actual capture', before, after)
+        if profile == 'endpoint':
+            assert forward_fence_packets() == 2, 'direct-must did not produce two kernel forwarding attempts'
         print(json.dumps({'packet_dns_domain_routing': 'PASS', 'profile': profile, 'peer': observed, 'capture_delta': sum(after) - sum(before)}), flush=True)
     finally:
         stop(peer)
@@ -718,8 +761,11 @@ def program_identity(fd, device, role, saved_guard=None):
     info = C.create_string_buffer(80)
     bpf(15, Info(fd, len(info), C.addressof(info)))
     kind, identity = struct.unpack_from('=II', info)
-    name = os.environ.get('HONK_XDP_EXPECT_NAME') or f'honk_xdp_{role}'
-    assert kind == 6 and identity != 0 and info.raw[64:80].rstrip(b'\0') == name.encode(), ('unexpected pinned XDP program', device, role, kind, identity, info.raw[64:80])
+    # A configured gateway loads honk_gw_{data,boot}; without one the general honk_xdp_{data,guard} load.
+    names = {os.environ['HONK_XDP_EXPECT_NAME']} if os.environ.get('HONK_XDP_EXPECT_NAME') else {
+        'data': {'honk_xdp_data', 'honk_gw_data'}, 'guard': {'honk_xdp_guard', 'honk_gw_boot'}}[role]
+    actual = info.raw[64:80].rstrip(b'\0').decode(errors='replace')
+    assert kind == 6 and identity != 0 and actual in names, ('unexpected pinned XDP program', device, role, kind, identity, actual)
     if saved_guard is not None:
         assert role == 'guard' and identity == int(saved_guard), ('guard pin changed since readiness', device, identity, saved_guard)
     return identity
@@ -732,6 +778,25 @@ if mode == 'decoder-selftest':
     decoder_selftest()
 elif mode == 'xdp-absent':
     require_xdp_absent(xdp_state(sys.argv[2]))
+elif mode == 'foreign-xdp-rejected':
+    device = sys.argv[2]
+    before = kernel_xdp_state(device)
+    fd = program_fd(device, 'data')
+    try:
+        request = bytearray(xdp_detach_request(socket.if_nametoindex(device), fd))
+        struct.pack_into('=i', request, 40, fd)
+        with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, socket.NETLINK_ROUTE) as sock:
+            sock.bind((0, 0))
+            assert sock.sendto(request, (0, 0)) == len(request)
+            try:
+                decode_setlink_ack(netlink_reply(sock, time.monotonic() + 2), request)
+            except OSError as error:
+                assert error.errno == 16, ('foreign XDP replacement failed for an unexpected reason', error)
+            else:
+                raise AssertionError('foreign XDP replacement changed an FD-owned link')
+        assert kernel_xdp_state(device) == before, 'foreign XDP attempt changed capture'
+    finally:
+        os.close(fd)
 elif mode == 'hold':
     ipv6 = sys.argv[3] == '6'
     with socket.socket(socket.AF_INET6 if ipv6 else socket.AF_INET, socket.SOCK_DGRAM) as sock:

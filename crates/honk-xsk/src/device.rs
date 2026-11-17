@@ -1,4 +1,4 @@
-//! Fail-closed Ethernet root discovery; upper interfaces require canonical FIB admission.
+//! Read-only physical Ethernet/veth discovery; logical roots are admitted by topology.
 
 use std::ffi::CString;
 use std::fs;
@@ -11,14 +11,13 @@ use std::sync::Arc;
 use crate::port::{BindMode, MAX_SEGMENTS, Port, PortConfig, rx_frame_capacity};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 mod features;
-pub use features::FeatureQuery;
-use features::{NAMED_FEATURES, feature_count, read_feature_names, read_features, string_bytes};
+pub use features::{FeatureQuery, VlanOffload, prepare_vlan_offload, select_xsk_mode};
 
 const MAX_UPPER_INTERFACES: usize = 4096;
 // Attaching our guard may publish these NDO-XMIT flags; AF_XDP TX does not use them.
 const NDO_XMIT_FEATURES: u64 = 4 | 64;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DeviceInfo {
     pub name: String,
     pub ifindex: u32,
@@ -64,7 +63,7 @@ impl DeviceInfo {
         let physical = path.join("device").try_exists()? && number("iflink")? == ifindex;
         if number("type")? != 1 || !(physical || veth) {
             return Err(unsupported(
-                "only standalone physical Ethernet or proven veth topology is admitted",
+                "only physical Ethernet or proven veth capture members are admitted",
             ));
         }
         let upper_ifindices = upper_ifindices(&path, ifindex)?;
@@ -87,9 +86,6 @@ impl DeviceInfo {
         let vlan_metadata = rx_metadata & 4 != 0;
         if veth && !vlan_metadata {
             return Err(unsupported("veth requires authoritative RX VLAN metadata"));
-        }
-        if !vlan_metadata {
-            reject_vlan_stripping(name)?;
         }
         if xdp_features & 3 != 3 {
             return Err(unsupported("native XDP basic/redirect support unavailable"));
@@ -139,7 +135,7 @@ impl DeviceInfo {
         Ok(required)
     }
 
-    /// Recheck immutable admission facts, including the wire-only stripping-off proof.
+    /// Recheck device identity and capabilities before opening capture queues.
     pub fn validate_current(&self) -> io::Result<()> {
         let fresh = Self::discover(&self.name)?;
         if fresh.ifindex != self.ifindex
@@ -236,7 +232,13 @@ fn upper_ifindices(path: &Path, root: u32) -> io::Result<Vec<u32>> {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name == "master" || name == "bridge" || name == "bonding" || name.starts_with("lower_") {
+        if name == "master" {
+            if !entry.path().join("bonding").is_dir() {
+                return Err(unsupported("XDP member has a non-bond master"));
+            }
+            continue;
+        }
+        if name == "bridge" || name == "bonding" || name.starts_with("lower_") {
             return Err(unsupported(
                 "stacked, bridged, bonded or enslaved XDP root topology",
             ));
@@ -303,33 +305,6 @@ fn query_named(
     request.ifr_ifru.ifru_data = words.as_mut_ptr().cast();
     if unsafe { libc::ioctl(fd.as_raw_fd(), 0x8946, &mut request) } < 0 {
         return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn reject_vlan_stripping(name: &str) -> io::Result<()> {
-    let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
-    let name = interface_name(name)?;
-    let count = feature_count(&fd, &name)?;
-    let mut names = vec![0; 3 + count * 8];
-    read_feature_names(&fd, &name, count, &mut names)?;
-    let mut features = vec![0; 2 + count.div_ceil(32) * 4];
-    read_features(&fd, &name, count, &mut features)?;
-    let mut found_vlan = 0;
-    for index in 0..count {
-        let bytes = string_bytes(&names[3 + index * 8..3 + (index + 1) * 8]);
-        let feature = &bytes[..bytes.iter().position(|&byte| byte == 0).unwrap_or(32)];
-        if feature == NAMED_FEATURES[0] || feature == NAMED_FEATURES[1] {
-            found_vlan |= if feature == NAMED_FEATURES[0] { 1 } else { 2 };
-            if features[4 + index / 32 * 4] & (1 << (index % 32)) != 0 {
-                return Err(unsupported(
-                    "active RX VLAN stripping has no admitted metadata recovery",
-                ));
-            }
-        }
-    }
-    if found_vlan != 3 {
-        return Err(unsupported("RX VLAN stripping facts unavailable"));
     }
     Ok(())
 }
@@ -721,6 +696,15 @@ mod tests {
         }
         fs::remove_file(fixture.0.join("upper_b/ifindex")).unwrap();
         assert!(upper_ifindices(&fixture.0, 2).is_err());
+    }
+
+    #[test]
+    fn bond_master_is_allowed_but_other_masters_are_rejected() {
+        let fixture = SysfsFixture::new();
+        fs::create_dir(fixture.0.join("master")).unwrap();
+        assert!(upper_ifindices(&fixture.0, 2).is_err());
+        fs::create_dir(fixture.0.join("master/bonding")).unwrap();
+        assert_eq!(upper_ifindices(&fixture.0, 2).unwrap(), []);
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub enum DirectProfile {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum XskMode {
+    Auto,
     Copy,
     #[default]
     ZeroCopy,
@@ -550,7 +551,7 @@ impl DatapathConfig {
                             .any(|earlier| earlier.name == interface.name)
                     {
                         return Err(invalid(
-                            "interfaces must have unique, explicit Ethernet names",
+                            "interfaces must have unique, explicit interface names",
                         ));
                     }
                 }

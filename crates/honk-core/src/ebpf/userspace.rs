@@ -11,6 +11,9 @@ pub struct UserspaceBackend {
     policy: PolicyState,
     admission: Arc<AtomicBool>,
     pname_support: PnameSupportCell,
+    mode_flags: u32,
+    #[cfg(target_os = "linux")]
+    gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
 }
 
 impl UserspaceBackend {
@@ -21,12 +24,35 @@ impl UserspaceBackend {
             policy: PolicyState::default(),
             admission,
             pname_support,
+            mode_flags: 0,
+            #[cfg(target_os = "linux")]
+            gateway: None,
         }
+    }
+
+    pub(crate) fn mode_flags(&self) -> u32 {
+        self.mode_flags
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn install_gateway(
+        &mut self,
+        gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
+    ) -> anyhow::Result<()> {
+        if let Some(publisher) = &gateway {
+            publisher.set_mode_flags(self.mode_flags)?;
+        }
+        self.gateway = gateway;
+        Ok(())
     }
 }
 
 #[async_trait]
 impl PolicyBackend for UserspaceBackend {
+    fn userspace_mut(&mut self) -> anyhow::Result<&mut UserspaceBackend> {
+        Ok(self)
+    }
+
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -68,7 +94,26 @@ impl PolicyBackend for UserspaceBackend {
         plan: &crate::control::routing_matcher::RoutingPushPlan,
         learned_domains: &[(LpmKey, DomainRouting)],
     ) -> anyhow::Result<()> {
-        self.policy.publish(plan, learned_domains, |_, _| Ok(()))
+        #[cfg(target_os = "linux")]
+        if let Some(gateway) = &self.gateway {
+            gateway.publish(plan)?;
+        }
+        if let Err(error) = self.policy.publish(plan, learned_domains, |_, _| Ok(())) {
+            #[cfg(target_os = "linux")]
+            if let Some(gateway) = &self.gateway
+                && let Err(rollback_error) = gateway.rollback()
+            {
+                return Err(anyhow::anyhow!(
+                    "software policy publication failed: {error}; gateway rollback failed: {rollback_error}"
+                ));
+            }
+            return Err(error);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(gateway) = &self.gateway {
+            gateway.commit();
+        }
+        Ok(())
     }
 
     fn routing_policy_generation(&self) -> u64 {
@@ -114,6 +159,11 @@ impl PolicyBackend for UserspaceBackend {
                 == 0,
             "packet software policy cannot enable NFQUEUE or kernel route witnesses"
         );
+        self.mode_flags = flags;
+        #[cfg(target_os = "linux")]
+        if let Some(gateway) = &self.gateway {
+            gateway.set_mode_flags(flags)?;
+        }
         Ok(())
     }
 

@@ -503,7 +503,7 @@ impl Object {
             };
             let rounded = backing.checked_add(4095).context("TUN map rounding")? / 4096 * 4096;
             // A 64 KiB per-map slab/header ceiling covers the admitted ARRAY/QUEUE kinds.
-            add(sys::memory_bytes(fd)?
+            add(honk_xsk::kernel_memory_bytes(fd)?
                 .max(rounded)
                 .checked_add(65536 + 8192)
                 .context("TUN map allocation overhead")?)?;
@@ -568,7 +568,7 @@ fn program_allocation(fd: BorrowedFd<'_>) -> anyhow::Result<usize> {
             && info.jited_len <= 1 << 20,
         "TUN program allocation readback unavailable/out of bound"
     );
-    let reported = sys::memory_bytes(fd)?;
+    let reported = honk_xsk::kernel_memory_bytes(fd)?;
     usize::try_from(info.translated_len)?
         .checked_mul(3)
         .and_then(|x| x.checked_add(info.jited_len as usize))

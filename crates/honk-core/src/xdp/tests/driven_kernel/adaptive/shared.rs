@@ -121,14 +121,17 @@ async fn parked(owner: &Owner) -> anyhow::Result<(State, PendingWait)> {
             && wait.idle_ports
             && !wait.pending_outputs
         {
-            ensure!(
-                wait.driver_deadline.is_none_or(|due| due > Instant::now())
-                    && wait
-                        .armed_deadline
-                        .is_none_or(|due| due.into_std() > Instant::now()),
-                "preexisting timer was already due at the actual Pending boundary: {wait:?}"
-            );
-            return Ok((state, wait));
+            let horizon = Instant::now() + Duration::from_millis(100);
+            if wait.driver_deadline.is_none_or(|due| due > horizon)
+                && wait
+                    .armed_deadline
+                    .is_none_or(|due| due.into_std() > horizon)
+            {
+                return Ok((state, wait));
+            }
+            // A timer this close could outrun the reload round trip and be mistaken for the
+            // publication wake; let it fire and take the next Pending.
+            owner.ready.control.clear_pending();
         }
         ensure!(
             Instant::now() < owner.deadline,
@@ -340,14 +343,31 @@ async fn idle_and_endpoint_publication(rig: &mut Rig) -> anyhow::Result<()> {
         PollMode::Adaptive,
     )
     .await?;
+    let client: std::net::SocketAddrV4 = "192.0.3.2:47000".parse()?;
+    let target: std::net::SocketAddrV4 = "198.51.100.2:18084".parse()?;
+    // Both peers need the same real server listener. A has finished its exchanges.
+    rig.tcp
+        .take()
+        .context("A TCP peer is missing")?
+        .join()
+        .await?;
+    let hold_deadline = rig
+        .deadline
+        .min(Instant::now() + crate::xdp::gateway::hold::HOLD_IDLE);
+    rig.pump
+        .tcp_stimulus(&format!("SEED {client}:{}", target.port()), hold_deadline)
+        .await?;
+    rig.tcp = Some(TcpPeer::spawn(rig.deadline).await?);
     qualified(rig.b(), &initial).await?;
     let control = Arc::clone(&rig.b().ready.control);
     let idle_before = control.idle_high();
     rig.pump.set("b", false).await?;
     rig.b().wait_for(drained).await?;
-    // Valid unmatched RSTs produce actual RX service rounds, but no admitted
-    // receive or full TX packet. Idle observation requests are not the stimulus.
-    rig.pump.low("b").await?;
+    // The gateway still captures the closed tuple while Endpoint no longer owns it.
+    rig.b()
+        .wait_for_retired_tcp_hold(client, target, hold_deadline)
+        .await?;
+    rig.pump.tcp_stimulus("LOW b", hold_deadline).await?;
     let mut returned_empty = false;
     let low = loop {
         let state = rig.b().state().await?;
@@ -723,15 +743,35 @@ fn feature<'a>(output: &'a str, name: &str) -> Option<(&'a str, bool)> {
     })
 }
 
-/// Join the topology-failed B, then retire it through the same controller frontier.
-async fn topology_retired(rig: &mut Rig) -> anyhow::Result<()> {
-    let mut retired = rig
-        .b
-        .take()
-        .unwrap()
-        .join()
-        .await
-        .context("live topology transition did not genuinely close/join B")?;
+/// P2 treats a GRO or interface-name change as a non-identity notification: B must keep
+/// serving Event traffic instead of closing on PermissionDenied.
+async fn still_serving(rig: &mut Rig) -> anyhow::Result<()> {
+    let before = rig.pump.status().await?;
+    rig.pump.set("b", true).await?;
+    loop {
+        let status = rig.pump.status().await?;
+        if wire_count(&status, "b", "received")? > wire_count(&before, "b", "received")?
+            && wire_count(&status, "b", "upstream")? > wire_count(&before, "b", "upstream")?
+        {
+            return Ok(());
+        }
+        ensure!(
+            Instant::now() < rig.deadline,
+            "B stopped serving Event traffic after a non-identity topology change"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
+/// Normal stop of the still-running B, then the same controller release frontier.
+async fn stop_b(rig: &mut Rig) -> anyhow::Result<()> {
+    rig.pump.set("b", false).await?;
+    let mut retired = rig.b.take().unwrap().stop().await?;
+    ensure!(
+        retired.failure.is_none(),
+        "participant retirement failed: {:?}",
+        retired.failure
+    );
     ensure!(
         retired
             .state
@@ -739,19 +779,7 @@ async fn topology_retired(rig: &mut Rig) -> anyhow::Result<()> {
             .queues
             .iter()
             .all(|queue| queue.counters.submitted == queue.counters.completed),
-        "topology-failed participant returned before actual CQ drain"
-    );
-    // PermissionDenied can also come from capture cleanup. The caller's actual
-    // feature/name evidence and this join without Shutdown narrow, not uniquely identify, it.
-    ensure!(
-        Instant::now() < rig.deadline
-            && retired
-                .failure
-                .as_ref()
-                .and_then(|error| error.downcast_ref::<io::Error>())
-                .is_some_and(|error| error.kind() == io::ErrorKind::PermissionDenied),
-        "changed topology did not autonomously close with the observed permission failure: {:?}",
-        retired.failure
+        "participant returned before actual CQ drain"
     );
     retired.release(&mut rig.pump, None).await
 }
@@ -828,7 +856,8 @@ async fn feature_change(rig: &mut Rig) -> anyhow::Result<()> {
         settlement.elapsed_ns >= held_for.as_nanos() as u64 && settlement.overrun_ns > 0,
         "retained live-feature query pause escaped real elapsed accounting: {settlement:?}"
     );
-    topology_retired(rig).await?;
+    still_serving(rig).await?;
+    stop_b(rig).await?;
     owned(rig, &["ethtool", "-K", "dut2", name, previous]).await?;
     let restored = owned(rig, &["ethtool", "-k", "dut2"]).await?;
     ensure!(
@@ -896,12 +925,13 @@ async fn feature_query_error(rig: &mut Rig) -> anyhow::Result<()> {
             && exit.settlement.unwrap().overrun_ns > 0,
         "failed retained ioctl was not fully charged: {exit:?}"
     );
-    topology_retired(rig).await?;
+    still_serving(rig).await?;
     owned(
         rig,
         &["ip", "link", "set", "dev", "e4-ioctl", "name", "dut2"],
     )
     .await?;
+    stop_b(rig).await?;
     let restored = owned(rig, &["ip", "-j", "link", "show", "dev", "dut2"]).await?;
     let restored_link: serde_json::Value = serde_json::from_slice(&restored.stdout)?;
     ensure!(

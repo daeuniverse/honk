@@ -47,6 +47,14 @@ impl PeerHold {
     pub(crate) fn original_path(&self) -> ReturnPath {
         self.path
     }
+    #[cfg(test)]
+    pub(crate) fn for_test(address: IpAddr, path: ReturnPath) -> Self {
+        Self::unlearned(
+            PeerAuthority::new(Arc::new(AtomicBool::new(true))),
+            address,
+            path,
+        )
+    }
     fn unlearned(authority: Arc<PeerAuthority>, address: IpAddr, path: ReturnPath) -> Self {
         Self {
             authority,
@@ -326,6 +334,7 @@ impl CellPool {
 }
 #[derive(Clone)]
 pub(super) struct Placement {
+    pub(super) realm_id: u32,
     pub(super) realm: crate::control::netstack::PacketRealm,
     pub(super) ingress: Ingress,
     pub(super) device: usize,

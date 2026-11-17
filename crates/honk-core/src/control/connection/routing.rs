@@ -21,6 +21,7 @@ pub(in crate::control) struct RoutingDecision {
 
 pub(in crate::control) struct PacketRoutingSnapshot {
     pub(in crate::control) source: Option<honk_netstack::SourceContext>,
+    pub(in crate::control) source_mac: Option<String>,
     pub(in crate::control) mode: super::handoff::ModeDecision,
     pub(in crate::control) mode_state: Option<crate::mode::ModeState>,
     pub(in crate::control) admission_final: bool,
@@ -306,6 +307,12 @@ impl ControlPlaneHandle {
         input.process_name = packet_source
             .and_then(|source| source.optional_facts())
             .and_then(|facts| packet_process_name(&facts));
+        #[cfg(target_os = "linux")]
+        {
+            input.mac = packet_source
+                .and_then(crate::control::netstack::SourceWork::source_mac)
+                .map(crate::xdp::routing_input::mac_string);
+        }
         let decision = {
             let router = self.router.read().await;
             let current = self.config.read().await;
@@ -354,6 +361,7 @@ impl ControlPlaneHandle {
         );
         Ok(PacketRoutingSnapshot {
             source: packet_source.and_then(crate::control::netstack::SourceWork::optional_context),
+            source_mac: input.mac,
             mode,
             mode_state,
             admission_final: false,
@@ -384,10 +392,12 @@ impl ControlPlaneHandle {
         {
             return Ok(());
         }
+        let mut conn_info = conn_info.clone();
+        conn_info.mac.clone_from(&snapshot.source_mac);
         snapshot.decision = self
             .prepare_routing(
                 dial_mode,
-                conn_info,
+                &conn_info,
                 domain_verified,
                 None,
                 #[cfg(feature = "native-api")]
@@ -626,5 +636,70 @@ mod native_tests {
         assert_eq!(decision.outbound, "direct");
         assert!(decision.matched_rule.is_none());
         handle.connection_tracker.disable_native();
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod packet_mac_tests {
+    use super::*;
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_scope};
+    use crate::xdp::routing_input::test_peer;
+
+    #[tokio::test]
+    async fn tcp_syn_udp_initializer_and_sniff_keep_original_mac() {
+        let mut config = honk_config::parser::parse_dae_config(
+            "routing { mac(02:02:02:02:02:02) -> direct\n fallback: block }",
+        )
+        .unwrap();
+        config.ensure_builtin_nodes();
+        let plane = crate::control::tests::support::control_plane(config);
+        let handle = plane.spawn_handle();
+        let budget = honk_netstack::MemoryBudget::new(CAPTURE_MEMORY);
+        let (scope, owner) = capture_scope(1280, 1, 16, &budget).unwrap();
+        let client: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+        let destination: SocketAddr = "198.51.100.1:443".parse().unwrap();
+        let work = scope
+            .hold_source(client.ip())
+            .unwrap()
+            .with_peer(test_peer(1, 0, [2; 6], 7));
+        for protocol in ["tcp", "udp"] {
+            let mut snapshot = handle
+                .prepare_packet_routing_snapshot(
+                    scope.scope(),
+                    client,
+                    destination,
+                    protocol,
+                    0,
+                    Some(&work),
+                    #[cfg(feature = "native-api")]
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot.decision.outbound, "direct");
+            assert_eq!(snapshot.source_mac.as_deref(), Some("02:02:02:02:02:02"));
+            let input = build_connection_info(
+                Some("example.test".into()),
+                destination,
+                client,
+                protocol,
+                None,
+            );
+            assert!(input.mac.is_none());
+            handle
+                .route_packet_with_sniffed(
+                    &mut snapshot,
+                    DialMode::DomainPlusPlus,
+                    &input,
+                    false,
+                    #[cfg(feature = "native-api")]
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(snapshot.decision.outbound, "direct");
+        }
+        drop(work);
+        owner.shutdown().await;
     }
 }

@@ -532,6 +532,16 @@ impl SourceWork {
     pub(in crate::control) fn optional_context(&self) -> Option<SourceContext> {
         self.context
     }
+    pub(in crate::control) fn source_mac(&self) -> Option<[u8; 6]> {
+        #[cfg(target_os = "linux")]
+        {
+            self.peer.as_ref().map(|peer| peer.original_path().mac)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
     pub(in crate::control) fn plain_address(&self) -> Option<IpAddr> {
         if self.context.is_some() {
             return None;
@@ -775,5 +785,54 @@ impl PacketScope {
                     && slot.destination == destination
                     && slot.source.map(|source| source.lineage) == lineage
             })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod mac_tests {
+    use super::*;
+    use crate::xdp::routing_input::test_peer;
+
+    #[tokio::test]
+    async fn source_mac_uses_retained_peer_and_host_tun_remain_missing() {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (scope, owner) = capture_scope(1280, 1, 16, &budget).unwrap();
+        let work = scope.hold_source("192.0.2.1".parse().unwrap()).unwrap();
+        assert_eq!(work.source_mac(), None);
+        let work = work.with_peer(test_peer(1, 0, [2; 6], 7));
+        let cloned = work.clone();
+        assert_eq!(work.source_mac(), Some([2; 6]));
+        let changed = scope
+            .hold_source("192.0.2.1".parse().unwrap())
+            .unwrap()
+            .with_peer(test_peer(1, 1, [4; 6], 7));
+        assert_eq!(cloned.source_mac(), Some([2; 6]));
+        assert_eq!(changed.source_mac(), Some([4; 6]));
+        drop((work, cloned, changed));
+        owner.shutdown().await;
+
+        let mut config = Config::new([37; 32]);
+        config.mode = Mode::Transparent {
+            exclude: honk_netstack::ExcludeSet::default(),
+        };
+        let (scope, owner) =
+            PacketScope::new(config, budget, RuntimeLimits::default(), Instant::now()).unwrap();
+        scope.prepare_host().unwrap();
+        let facts = HostSourceFacts {
+            netns_cookie: 7,
+            attachment: 11,
+            socket_cookie: 29,
+            return_generation: 13,
+            output_ifindex: 19,
+            flags: 1,
+            stage: 1,
+            family: 2,
+            operation_incarnation: 23,
+            ..Default::default()
+        };
+        let work = scope.hold_host_source(&facts).unwrap();
+        assert_eq!(work.source_mac(), None);
+        drop(work);
+        owner.shutdown().await;
     }
 }

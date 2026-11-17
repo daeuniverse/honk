@@ -214,8 +214,8 @@ impl Grace {
         Ok(grace)
     }
     pub fn memory_bytes(&self) -> anyhow::Result<usize> {
-        memory_bytes(self.outer.as_fd())?
-            .checked_add(memory_bytes(self.inner.as_fd())?)
+        honk_xsk::kernel_memory_bytes(self.outer.as_fd())?
+            .checked_add(honk_xsk::kernel_memory_bytes(self.inner.as_fd())?)
             .ok_or_else(|| anyhow::anyhow!("Host reader-grace memory overflow"))
     }
     pub fn barrier(&self) -> anyhow::Result<()> {
@@ -352,20 +352,4 @@ impl Cgroups {
         }
         Ok(())
     }
-}
-
-pub(crate) fn memory_bytes(fd: BorrowedFd<'_>) -> anyhow::Result<usize> {
-    let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
-    let mut values = info
-        .lines()
-        .filter_map(|line| line.strip_prefix("memlock:").map(str::trim));
-    let value = values
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Host kernel memory readback unavailable"))?
-        .parse::<usize>()?;
-    ensure!(
-        values.next().is_none() && value != 0,
-        "ambiguous Host kernel memory readback"
-    );
-    Ok(value)
 }

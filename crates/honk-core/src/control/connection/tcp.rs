@@ -73,6 +73,7 @@ impl ControlPlaneHandle {
         drop(backend);
         Ok(PacketRoutingSnapshot {
             source: None,
+            source_mac: None,
             mode: super::handoff::ModeDecision {
                 name: decision.outbound.clone(),
                 constraint: Default::default(),
@@ -209,7 +210,9 @@ impl ControlPlaneHandle {
                         None,
                     ),
                 };
-                let packet_facts = flow.packet_source().map(|source| source.facts());
+                let packet_facts = flow
+                    .packet_source()
+                    .and_then(|source| source.optional_facts());
                 if let Some(facts) = &packet_facts {
                     observation.packet_facts(
                         facts,
@@ -261,7 +264,10 @@ impl ControlPlaneHandle {
                     && let Some(snapshot) = &pinned_route
                 {
                     anyhow::ensure!(
-                        snapshot.source == flow.packet_source().map(|source| source.context()),
+                        snapshot.source
+                            == flow
+                                .packet_source()
+                                .and_then(|source| source.optional_context()),
                         "packet TCP routing source changed"
                     );
                 }

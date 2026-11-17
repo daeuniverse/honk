@@ -5,7 +5,30 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+mod gateway;
 mod host;
+
+#[test]
+fn forward_jump_overflow_returns_error() {
+    let mut builder = Builder::new();
+    let at = forward(&mut builder, JA, 0, 0, 0);
+    for _ in 0..=i16::MAX {
+        builder.emit(Insn::default());
+    }
+    patch(&mut builder, at);
+    assert!(builder.finish().is_err());
+}
+
+#[test]
+fn jump_table_overflow_returns_error() {
+    let mut builder = Builder::new();
+    for _ in 0..513 {
+        builder.jump(Insn::new(JA, 0, 0, 0, 0), Label::Pass);
+    }
+    builder.label(Label::Pass);
+    builder.emit(Insn::new(EXIT, 0, 0, 0, 0));
+    assert!(builder.finish().is_err());
+}
 
 fn capture() -> GeneralCapture {
     GeneralCapture {
@@ -83,9 +106,13 @@ fn run(program: &OwnedFd, frame: &[u8], metadata_len: usize) -> (u32, Vec<u8>, V
     };
     bpf(10, &mut attr).unwrap();
     assert_eq!(result[2], 0);
-    assert_eq!(result[1], attr.output_len);
+    // TEST_RUN flattens SG output, while data_end still denotes only the linear head.
+    assert!(result[0] <= result[1]);
+    assert!(result[1] <= attr.output_len);
+    assert!(attr.output_len as usize <= output.len());
+    assert_eq!(attr.output_len - result[0], frame.len() as u32);
     let metadata = output[..result[0] as usize].to_vec();
-    let packet = output[result[0] as usize..result[1] as usize].to_vec();
+    let packet = output[result[0] as usize..attr.output_len as usize].to_vec();
     (attr.action, metadata, packet)
 }
 

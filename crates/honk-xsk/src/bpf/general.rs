@@ -10,7 +10,16 @@ const JEQ32_K: u8 = 0x16;
 const OR_K: u8 = 0x47;
 
 fn patch(b: &mut Builder, at: usize) {
-    b.program.insns[at].off = (b.program.len - at - 1) as i16;
+    let offset = b
+        .program
+        .len
+        .checked_sub(at)
+        .and_then(|n| n.checked_sub(1))
+        .and_then(|n| i16::try_from(n).ok());
+    match (offset, b.program.insns.get_mut(at)) {
+        (Some(offset), Some(insn)) => insn.off = offset,
+        _ => b.error = Some(io::Error::other("invalid or oversized XDP forward jump")),
+    }
 }
 
 fn forward(b: &mut Builder, code: u8, dst: u8, src: u8, imm: i32) -> usize {
@@ -383,6 +392,9 @@ pub(super) fn build(
     selected(&mut b, queues, counters, xsks, data, capture.vlan_metadata);
     b.finish()
 }
+
+mod gateway;
+pub(super) use gateway::build as build_gateway;
 
 #[cfg(test)]
 mod tests;

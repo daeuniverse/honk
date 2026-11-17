@@ -974,7 +974,6 @@ impl UdpEndpointPool {
             .contains_key(&EndpointKey::new(scope, client, dst, packet_lineage))
     }
 
-    #[cfg(test)]
     pub(in crate::control) fn retains_source(
         &self,
         scope: ScopeId,

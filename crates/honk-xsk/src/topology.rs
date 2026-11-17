@@ -1,19 +1,12 @@
-//! Read-only admission for preprovisioned own-socket uplink routing.
+//! Read-only capture layout, startup default-route safety and RTNL identity watches.
 //!
-//! A dedicated exact-bypass-mark RPDB table isolates socket output from captured
-//! ports without replacing CoreForward's input FIB. Notifications remain sticky;
-//! RTNL observation is not an external-write fence.
-//! Kernel IPv6 ff00::/8 multicast routes remain outside native unicast capture.
-//!
-//! TUN admission instead proves only what the daemon created: one link, its exact
-//! addresses, the five per-family rules at `[P, P+4]` and the dedicated capture table,
-//! beside operator main routing it can represent completely. Unknown selectors, actions,
-//! nexthop forms and attributes are refused rather than interpreted.
+//! Physical XDP ignores carrier and unrelated device changes. TUN separately proves
+//! its owned link, addresses, exact RPDB rules and capture routes.
 
 use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::time::{Duration, Instant};
 
 use crate::bpf::{attributes, wait_netlink};
@@ -27,7 +20,6 @@ const IFA_F_TENTATIVE: u32 = 0x40;
 const IFA_F_PERMANENT: u32 = 0x80;
 const IFA_F_NOPREFIXROUTE: u32 = 0x200;
 const FIB_RULE_IIF_DETACHED: u32 = 0x08;
-const RTNH_F_LINKDOWN: u32 = 0x10;
 const FR_ACT_PROHIBIT: u8 = 8;
 const RTN_BLACKHOLE: u8 = 6;
 const RTPROT_STATIC: u8 = 4;
@@ -236,87 +228,469 @@ impl TunSpec<'_> {
     }
 }
 
-pub struct Topology {
+#[derive(Clone, Debug)]
+pub struct CaptureRealm {
+    pub realm_id: u32,
+    pub name: String,
+    pub logical_ifindex: u32,
+    pub mtu: u32,
+    pub mac: [u8; 6],
+    pub vlan_count: u32,
+    pub tpid: [u16; 2],
+    pub vid: [u16; 2],
+    pub members: Vec<String>,
+}
+
+fn link_name(link: &Link) -> io::Result<String> {
+    let name = link
+        .name
+        .ok_or_else(|| malformed("capture link has no name"))?;
+    let end = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name.len());
+    std::str::from_utf8(&name[..end])
+        .map(str::to_owned)
+        .map_err(|_| malformed("invalid capture link name"))
+}
+
+pub fn capture_layout(names: &[String]) -> io::Result<Vec<CaptureRealm>> {
+    if names.len() > 16 {
+        return Err(unsupported("capture exceeds 16 configured roots"));
+    }
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fd = route_socket(false)?;
+    let mut snapshot = snapshot(fd.as_fd(), None)?;
+    dump(
+        fd.as_fd(),
+        5,
+        106,
+        8,
+        &mut snapshot,
+        Instant::now() + Duration::from_secs(2),
+    )?;
+    snapshot.links.sort_unstable_by_key(|link| link.index);
+    capture_layout_snapshot(&snapshot, names)
+}
+
+pub fn check_gateway_defaults(captured: &[u32]) -> io::Result<()> {
+    let fd = route_socket(false)?;
+    let mut observed = snapshot(fd.as_fd(), None)?;
+    dump(
+        fd.as_fd(),
+        5,
+        106,
+        8,
+        &mut observed,
+        Instant::now() + Duration::from_secs(2),
+    )?;
+    check_gateway_defaults_snapshot(&observed, captured)
+}
+
+fn check_gateway_defaults_snapshot(snapshot: &Snapshot, captured: &[u32]) -> io::Result<()> {
+    snapshot.gateway_defaults(captured)
+}
+
+fn capture_layout_snapshot(snapshot: &Snapshot, names: &[String]) -> io::Result<Vec<CaptureRealm>> {
+    let veth_kind = interface_name(b"veth")?;
+    let mut realms = Vec::new();
+    let mut captured = Vec::new();
+    for name in names {
+        let key = interface_name(name.as_bytes())?;
+        let root = snapshot
+            .links
+            .iter()
+            .find(|link| link.name == Some(key))
+            .ok_or_else(|| unsupported("configured capture link is absent"))?;
+        if root.master != 0 || root.arphrd != 1 {
+            return Err(unsupported("capture root is not independent Ethernet"));
+        }
+        let members: Vec<_> = if root.kind == Some(interface_name(b"bond")?) {
+            if root
+                .bond
+                .is_none_or(|(mode, hash)| mode != 4 || !matches!(hash, 0..=4))
+            {
+                return Err(unsupported(
+                    "bond capture requires 802.3ad and a supported transmit hash policy",
+                ));
+            }
+            snapshot
+                .links
+                .iter()
+                .filter(|link| link.master == root.index)
+                .collect()
+        } else {
+            if root.kind.is_some() && root.kind != Some(interface_name(b"veth")?) {
+                return Err(unsupported("unsupported capture root kind"));
+            }
+            vec![root]
+        };
+        if members.is_empty() || members.len() > 64 {
+            return Err(unsupported(
+                "bond has no admitted members or exceeds 64 members",
+            ));
+        }
+        for member in &members {
+            if member.arphrd != 1
+                || (member.kind.is_some() && member.kind != Some(interface_name(b"veth")?))
+            {
+                return Err(unsupported("bond member is not physical Ethernet or veth"));
+            }
+            if captured.contains(&member.index) {
+                return Err(unsupported("capture roots overlap"));
+            }
+            captured.push(member.index);
+        }
+        if realms.len() == 64 {
+            return Err(unsupported("capture exceeds 64 logical realms"));
+        }
+        let member_names: Vec<_> = members
+            .iter()
+            .map(|link| link_name(link))
+            .collect::<io::Result<_>>()?;
+        let start = realms.len();
+        realms.push(CaptureRealm {
+            realm_id: (realms.len() + 1) as u32,
+            name: name.clone(),
+            logical_ifindex: root.index,
+            mtu: root.mtu.ok_or_else(|| malformed("missing capture MTU"))?,
+            mac: root.mac,
+            vlan_count: 0,
+            tpid: [0; 2],
+            vid: [0; 2],
+            members: member_names.clone(),
+        });
+        let mut cursor = start;
+        while cursor < realms.len() {
+            let parent = realms[cursor].clone();
+            for link in snapshot.links.iter().filter(|link| {
+                link.parent == parent.logical_ifindex
+                    && link.index != parent.logical_ifindex
+                    && link.kind != Some(veth_kind)
+            }) {
+                if link.master != 0 || parent.vlan_count == 2 || link.vlan.is_none() {
+                    return Err(unsupported("unsupported capture upper or VLAN depth"));
+                }
+                if realms
+                    .iter()
+                    .any(|realm| realm.logical_ifindex == link.index)
+                {
+                    return Err(unsupported("cyclic or overlapping capture upper"));
+                }
+                if realms.len() == 64 {
+                    return Err(unsupported("capture exceeds 64 logical realms"));
+                }
+                let (protocol, id) = link
+                    .vlan
+                    .ok_or_else(|| unsupported("invalid capture VLAN"))?;
+                let mut realm = CaptureRealm {
+                    realm_id: (realms.len() + 1) as u32,
+                    name: link_name(link)?,
+                    logical_ifindex: link.index,
+                    mtu: parent
+                        .mtu
+                        .min(link.mtu.ok_or_else(|| malformed("missing VLAN MTU"))?),
+                    mac: link.mac,
+                    vlan_count: parent.vlan_count + 1,
+                    tpid: parent.tpid,
+                    vid: parent.vid,
+                    members: member_names.clone(),
+                };
+                realm.tpid[parent.vlan_count as usize] = protocol;
+                realm.vid[parent.vlan_count as usize] = id;
+                realms.push(realm);
+            }
+            cursor += 1;
+        }
+    }
+    for link in &snapshot.links {
+        if captured.contains(&link.parent)
+            && link.index != link.parent
+            && link.kind != Some(veth_kind)
+            && !realms
+                .iter()
+                .any(|realm| realm.logical_ifindex == link.index)
+        {
+            return Err(unsupported(
+                "physical capture member has an unadmitted upper",
+            ));
+        }
+    }
+    if realms
+        .iter()
+        .any(|realm| realm.mtu < 1280 || realm.mac == [0; 6] || realm.mac[0] & 1 != 0)
+    {
+        return Err(unsupported(
+            "capture realm requires unicast MAC and MTU >=1280",
+        ));
+    }
+    Ok(realms)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureWatchEvent {
+    Quiet,
+    AddressDirty,
+}
+
+pub struct CaptureWatch {
     fd: OwnedFd,
-    watch: WatchState,
+    links: Vec<Link>,
+    programs: Vec<(u32, u32)>,
+    invalidated: bool,
     ipv4_broadcasts: [Ipv4Addr; MAX_BROADCASTS],
     broadcast_count: usize,
 }
 
+impl CaptureWatch {
+    pub fn new(indices: &[u32]) -> io::Result<Self> {
+        let fd = route_socket(true)?;
+        let dump_fd = route_socket(false)?;
+        let current = snapshot(dump_fd.as_fd(), None)?;
+        let mut links = Vec::new();
+        for index in indices {
+            if links.iter().any(|link: &Link| link.index == *index) {
+                continue;
+            }
+            links.push(
+                current
+                    .links
+                    .iter()
+                    .find(|link| link.index == *index)
+                    .ok_or_else(|| unsupported("captured link disappeared"))?
+                    .clone(),
+            );
+        }
+        let (ipv4_broadcasts, broadcast_count) = current.ipv4_broadcasts()?;
+        Ok(Self {
+            fd,
+            links,
+            programs: Vec::new(),
+            invalidated: false,
+            ipv4_broadcasts,
+            broadcast_count,
+        })
+    }
+
+    pub fn ipv4_broadcasts(&self) -> &[Ipv4Addr] {
+        &self.ipv4_broadcasts[..self.broadcast_count]
+    }
+
+    pub fn expect_program(&mut self, ifindex: u32, program_id: u32) {
+        if let Some((_, expected)) = self
+            .programs
+            .iter_mut()
+            .find(|(index, _)| *index == ifindex)
+        {
+            *expected = program_id;
+        } else {
+            self.programs.push((ifindex, program_id));
+        }
+    }
+
+    pub fn check(&mut self) -> io::Result<CaptureWatchEvent> {
+        self.check_with(Self::receive)
+    }
+
+    fn check_with(
+        &mut self,
+        receive: impl FnOnce(&mut Self) -> io::Result<CaptureWatchEvent>,
+    ) -> io::Result<CaptureWatchEvent> {
+        if self.invalidated {
+            return Err(unsupported("captured topology lost authority"));
+        }
+        let result = receive(self);
+        if result.is_err() {
+            self.invalidated = true;
+        }
+        result
+    }
+
+    fn receive(&mut self) -> io::Result<CaptureWatchEvent> {
+        let mut dirty = false;
+        let mut buffer = [0u8; 65536];
+        for _ in 0..64 {
+            // SAFETY: recvfrom writes only the provided buffer and sockaddr extent.
+            let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+            let mut length = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+            let n = unsafe {
+                libc::recvfrom(
+                    self.fd.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                    (&mut source as *mut libc::sockaddr_nl).cast(),
+                    &mut length,
+                )
+            };
+            if n < 0 {
+                let error = io::Error::last_os_error();
+                match error.kind() {
+                    io::ErrorKind::WouldBlock => {
+                        return Ok(if dirty {
+                            CaptureWatchEvent::AddressDirty
+                        } else {
+                            CaptureWatchEvent::Quiet
+                        });
+                    }
+                    io::ErrorKind::Interrupted => continue,
+                    _ => return Err(error),
+                }
+            }
+            if n == 0
+                || n as usize > buffer.len()
+                || length as usize != size_of::<libc::sockaddr_nl>()
+                || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
+                || source.nl_pid != 0
+            {
+                return Err(malformed("invalid capture notification sender or extent"));
+            }
+            dirty |= self.datagram(&buffer[..n as usize], crate::bpf::xdp_state)?;
+        }
+        Err(malformed("capture notification drain bound exceeded"))
+    }
+
+    fn datagram(
+        &self,
+        mut bytes: &[u8],
+        mut program: impl FnMut(u32) -> io::Result<crate::XdpState>,
+    ) -> io::Result<bool> {
+        let mut dirty = false;
+        let bond_kind = interface_name(b"bond")?;
+        while !bytes.is_empty() {
+            if bytes.len() < 16 {
+                return Err(malformed("short capture notification"));
+            }
+            let length = u32_at(bytes, 0)? as usize;
+            if length < 16 || length > bytes.len() || ((length + 3) & !3) > bytes.len() {
+                return Err(malformed("truncated capture notification"));
+            }
+            if u16::from_ne_bytes([bytes[6], bytes[7]]) & 0x10 != 0 {
+                return Err(malformed("interrupted capture notification"));
+            }
+            let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
+            let normalized = match kind {
+                16 | 17 => 16,
+                20 | 21 => 20,
+                24 | 25 => 24,
+                32 | 33 => 32,
+                _ => return Err(malformed("unexpected capture notification")),
+            };
+            let mut parsed = Snapshot::default();
+            if matches!(normalized, 24 | 32) {
+                if length < 28 {
+                    return Err(malformed("short route or rule notification"));
+                }
+                attributes(&bytes[28..length], |_, _| Ok(()))?;
+            } else {
+                parsed.push(normalized, &bytes[16..length])?;
+            }
+            if normalized == 20 {
+                dirty = true;
+            }
+            for link in &parsed.links {
+                if let Some(old) = self.links.iter().find(|old| old.index == link.index) {
+                    if kind == 17 || !same_capture_identity(old, link) {
+                        return Err(unsupported("captured link identity changed"));
+                    }
+                    let expected = self
+                        .programs
+                        .iter()
+                        .find(|(index, _)| *index == link.index)
+                        .map_or(0, |(_, id)| *id);
+                    let state = program(link.index)?;
+                    if state.prog_id != expected
+                        || state.drv_prog_id != expected
+                        || state.skb_prog_id != 0
+                        || state.hw_prog_id != 0
+                        || state.attached != u8::from(expected != 0)
+                    {
+                        return Err(unsupported("captured XDP program changed"));
+                    }
+                } else if kind == 16
+                    && self
+                        .links
+                        .iter()
+                        .any(|old| old.index == link.master && old.kind == Some(bond_kind))
+                {
+                    return Err(unsupported("captured link identity changed"));
+                }
+            }
+            bytes = &bytes[(length + 3) & !3..];
+        }
+        Ok(dirty)
+    }
+}
+
+fn same_capture_identity(a: &Link, b: &Link) -> bool {
+    a.index == b.index
+        && a.mtu == b.mtu
+        && a.master == b.master
+        && a.mac == b.mac
+        && a.rx_queues == b.rx_queues
+        && a.tx_queues == b.tx_queues
+        && a.parent == b.parent
+        && a.kind == b.kind
+        && a.vlan == b.vlan
+        && a.bond == b.bond
+}
+
+impl AsFd for CaptureWatch {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_fd()
+    }
+}
+impl AsRawFd for CaptureWatch {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+pub struct Topology {
+    fd: OwnedFd,
+    watch: WatchState,
+}
+
 enum WatchState {
-    Strict { invalidated: bool },
+    Strict {
+        invalidated: bool,
+    },
+    Tun {
+        spec: TunWatch,
+        owned: (u32, TunStage),
+        invalidated: bool,
+    },
+}
+
+struct TunWatch {
+    name: String,
+    mtu: u32,
+    address4: Option<Ipv4Addr>,
+    address6: Option<Ipv6Addr>,
+    table: u32,
+    rule_priority: u32,
+    bypass_mark: u32,
+    capture: Vec<(IpAddr, u8)>,
+}
+
+impl TunWatch {
+    fn spec(&self) -> TunSpec<'_> {
+        TunSpec {
+            name: &self.name,
+            mtu: self.mtu,
+            address4: self.address4,
+            address6: self.address6,
+            table: self.table,
+            rule_priority: self.rule_priority,
+            bypass_mark: self.bypass_mark,
+            capture: &self.capture,
+        }
+    }
 }
 
 impl Topology {
-    /// Requires operator-provisioned mark rules/tables; never writes host routes.
-    /// Call before attaching capture, then retain and watch this descriptor for
-    /// the whole attachment lifetime. Any invalidation requires closing admission.
-    /// Physical roots and every canonical-FIB-proven VLAN descendant belong in
-    /// `captured_logical`; discovering a sysfs upper never authorizes it here.
-    pub fn admit(
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-    ) -> io::Result<Self> {
-        Self::admit_until(captured_physical, captured_logical, bypass_mark, None)
-    }
-
-    /// Native drivers may renegotiate carrier after their first XDP attachment.
-    pub fn admit_after_xdp_attach(
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-    ) -> io::Result<Self> {
-        validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let fd = route_socket(false)?;
-        settle_xdp_carrier(
-            deadline,
-            |deadline| {
-                let watch = route_socket(true)?;
-                let current = snapshot(fd.as_fd(), Some(deadline))?;
-                let pending = current
-                    .pending_xdp_carrier(captured_physical, captured_logical, bypass_mark)?
-                    .map(|link| PendingCarrier {
-                        index: link.index,
-                        name: link.name,
-                    });
-                Ok((watch, pending))
-            },
-            |watch: OwnedFd, deadline| wait_netlink(watch.as_fd(), libc::POLLIN, deadline),
-            |deadline| {
-                Self::admit_until(captured_physical, captured_logical, bypass_mark, deadline)
-            },
-            Instant::now,
-        )
-    }
-
-    fn admit_until(
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-        deadline: Option<Instant>,
-    ) -> io::Result<Self> {
-        validate_capture_sets(captured_physical, captured_logical, bypass_mark)?;
-        check_xdp_admission_deadline(deadline)?;
-        let fd = route_socket(true)?;
-        let dump_fd = deadline.map(|_| route_socket(false)).transpose()?;
-        let snapshot = snapshot(dump_fd.as_ref().unwrap_or(&fd).as_fd(), deadline)?;
-        snapshot.admit(captured_physical, captured_logical, bypass_mark)?;
-        let (ipv4_broadcasts, broadcast_count) = snapshot.ipv4_broadcasts()?;
-        let mut topology = Self {
-            fd,
-            watch: WatchState::Strict { invalidated: false },
-            ipv4_broadcasts,
-            broadcast_count,
-        };
-        if topology.check_changed()? {
-            return Err(unsupported("routing topology changed during admission"));
-        }
-        check_xdp_admission_deadline(deadline)?;
-        Ok(topology)
-    }
-
     /// Before creating the TUN: subscribes, then proves the name, addresses, capture
     /// table and `[P, P+4]` are free and each enabled family has an operator uplink.
     pub fn preflight_tun(spec: &TunSpec<'_>) -> io::Result<Self> {
@@ -359,9 +733,23 @@ impl Topology {
         snapshot(fd.as_fd(), None)?.admit_tun(spec, name, owned)?;
         let mut topology = Self {
             fd,
-            watch: WatchState::Strict { invalidated: false },
-            ipv4_broadcasts: [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS],
-            broadcast_count: 0,
+            watch: match owned {
+                Some(owned) => WatchState::Tun {
+                    spec: TunWatch {
+                        name: spec.name.to_owned(),
+                        mtu: spec.mtu,
+                        address4: spec.address4,
+                        address6: spec.address6,
+                        table: spec.table,
+                        rule_priority: spec.rule_priority,
+                        bypass_mark: spec.bypass_mark,
+                        capture: spec.capture.to_vec(),
+                    },
+                    owned,
+                    invalidated: false,
+                },
+                None => WatchState::Strict { invalidated: false },
+            },
         };
         if topology.check_changed()? {
             return Err(unsupported("routing topology changed during admission"));
@@ -369,16 +757,15 @@ impl Topology {
         Ok(topology)
     }
 
-    /// Exact local-table broadcast destinations from this watched namespace.
-    pub fn ipv4_broadcasts(&self) -> &[Ipv4Addr] {
-        &self.ipv4_broadcasts[..self.broadcast_count]
-    }
-
-    /// Sticky fail-closed invalidation, including receive loss and malformed
-    /// notifications. No drain/re-admit loop can silently restore old authority.
+    /// Sticky invalidation on lost authority or an owned TUN object change.
+    /// TUN notifications concerning other objects trigger an admission recheck.
     pub fn check_changed(&mut self) -> io::Result<bool> {
+        if matches!(self.watch, WatchState::Tun { .. }) {
+            return self.check_tun_changed();
+        }
         let invalidated = match &mut self.watch {
             WatchState::Strict { invalidated } => invalidated,
+            WatchState::Tun { .. } => unreachable!(),
         };
         if *invalidated {
             return Ok(true);
@@ -409,6 +796,116 @@ impl Topology {
             }
         }
     }
+
+    /// Classifies notifications and rechecks the admitted TUN dependencies.
+    pub fn check_tun_changed(&mut self) -> io::Result<bool> {
+        let WatchState::Tun {
+            spec,
+            owned,
+            invalidated,
+        } = &mut self.watch
+        else {
+            return Err(unsupported("watcher has no admitted TUN custody"));
+        };
+        if *invalidated {
+            return Ok(true);
+        }
+        let result = (|| {
+            let mut changed = false;
+            let mut buffer = [0u8; 65536];
+            for turn in 0..64 {
+                // SAFETY: source and buffer are writable for their specified lengths.
+                let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+                let mut source_len = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+                let n = unsafe {
+                    libc::recvfrom(
+                        self.fd.as_raw_fd(),
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len(),
+                        libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+                        (&mut source as *mut libc::sockaddr_nl).cast(),
+                        &mut source_len,
+                    )
+                };
+                if n < 0 {
+                    let error = io::Error::last_os_error();
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => continue,
+                        _ => return Err(error),
+                    }
+                }
+                if n == 0
+                    || n as usize > buffer.len()
+                    || source_len as usize != size_of::<libc::sockaddr_nl>()
+                    || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
+                    || source.nl_pid != 0
+                {
+                    return Err(malformed("invalid topology notification sender or extent"));
+                }
+                if tun_notifications(&buffer[..n as usize], spec, owned.0)? {
+                    return Ok(true);
+                }
+                changed = true;
+                if turn == 63 {
+                    return Err(malformed("topology notification drain bound exceeded"));
+                }
+            }
+            if changed {
+                let fd = route_socket(false)?;
+                let current = snapshot(fd.as_fd(), None)?;
+                current.admit_tun(&spec.spec(), spec.spec().validate()?, Some(*owned))?;
+            }
+            Ok(false)
+        })();
+        if !matches!(result, Ok(false)) {
+            *invalidated = true;
+        }
+        result
+    }
+}
+
+fn tun_notifications(mut bytes: &[u8], spec: &TunWatch, ifindex: u32) -> io::Result<bool> {
+    let mut owned_changed = false;
+    while !bytes.is_empty() {
+        if bytes.len() < 16 {
+            return Err(malformed("short topology notification"));
+        }
+        let length = u32_at(bytes, 0)? as usize;
+        if length < 16 || length > bytes.len() || ((length + 3) & !3) > bytes.len() {
+            return Err(malformed("invalid topology notification length"));
+        }
+        let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
+        let flags = u16::from_ne_bytes([bytes[6], bytes[7]]);
+        if flags & 0x10 != 0 {
+            return Err(malformed("interrupted topology notification"));
+        }
+        let body = &bytes[16..length];
+        let normalized = match kind {
+            16 | 17 => 16,
+            20 | 21 => 20,
+            24 | 25 => 24,
+            32 | 33 => 32,
+            _ => return Err(malformed("unexpected topology notification")),
+        };
+        let mut parsed = Snapshot::default();
+        parsed.push(normalized, body)?;
+        owned_changed |= parsed.links.iter().any(|link| link.index == ifindex)
+            || parsed
+                .addresses
+                .iter()
+                .any(|address| address.index == ifindex)
+            || parsed
+                .routes
+                .iter()
+                .any(|route| route.table == spec.table || route.output == ifindex)
+            || parsed.rules.iter().any(|rule| {
+                rule.table == spec.table
+                    || (spec.rule_priority..=spec.rule_priority + 4).contains(&rule.priority)
+            });
+        bytes = &bytes[(length + 3) & !3..];
+    }
+    Ok(owned_changed)
 }
 
 impl AsFd for Topology {
@@ -431,68 +928,6 @@ fn malformed(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
-fn check_xdp_admission_deadline(deadline: Option<Instant>) -> io::Result<()> {
-    if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "XDP topology admission deadline expired",
-        ));
-    }
-    Ok(())
-}
-
-struct PendingCarrier {
-    index: u32,
-    name: Option<[u8; 16]>,
-}
-
-fn settle_xdp_carrier<W, T>(
-    deadline: Instant,
-    mut snapshot: impl FnMut(Instant) -> io::Result<(W, Option<PendingCarrier>)>,
-    mut wait: impl FnMut(W, Instant) -> io::Result<()>,
-    admit: impl FnOnce(Option<Instant>) -> io::Result<T>,
-    mut now: impl FnMut() -> Instant,
-) -> io::Result<T> {
-    let mut previous = None::<PendingCarrier>;
-    loop {
-        let (watch, pending) = snapshot(deadline).map_err(|error| {
-            if error.kind() == io::ErrorKind::TimedOut
-                && now() >= deadline
-                && let Some(link) = &previous
-            {
-                xdp_carrier_timeout(link)
-            } else {
-                error
-            }
-        })?;
-        let Some(link) = pending else {
-            return admit(Some(deadline));
-        };
-        if now() >= deadline {
-            return Err(xdp_carrier_timeout(&link));
-        }
-        wait(watch, deadline).map_err(|error| {
-            if error.kind() == io::ErrorKind::TimedOut {
-                xdp_carrier_timeout(&link)
-            } else {
-                error
-            }
-        })?;
-        previous = Some(link);
-    }
-}
-
-fn xdp_carrier_timeout(link: &PendingCarrier) -> io::Error {
-    let message = match &link.name {
-        Some(name) => format!(
-            "{}: no carrier after XDP attach",
-            String::from_utf8_lossy(name).trim_end_matches('\0')
-        ),
-        None => format!("ifindex {}: no carrier after XDP attach", link.index),
-    };
-    io::Error::new(io::ErrorKind::TimedOut, message)
-}
-
 fn u32_at(bytes: &[u8], offset: usize) -> io::Result<u32> {
     Ok(u32::from_ne_bytes(
         bytes
@@ -513,35 +948,6 @@ fn unicast_source(family: u8, bytes: &[u8]) -> io::Result<bool> {
         && !address.is_unspecified()
         && !address.is_multicast()
         && !matches!(address, IpAddr::V4(ip) if ip.is_broadcast()))
-}
-
-fn validate_capture_sets(
-    captured_physical: &[u32],
-    captured_logical: &[u32],
-    bypass_mark: u32,
-) -> io::Result<()> {
-    if captured_physical.is_empty() != captured_logical.is_empty()
-        || bypass_mark == 0
-        || bypass_mark & honk_ebpf_common::CLASSIFIED_MARK != 0
-        || captured_physical.len() > MAX_OBJECTS
-        || captured_logical.len() > MAX_OBJECTS
-    {
-        return Err(unsupported(
-            "invalid physical/logical capture sets or bypass mark",
-        ));
-    }
-    let physical: HashSet<_> = captured_physical.iter().copied().collect();
-    let logical: HashSet<_> = captured_logical.iter().copied().collect();
-    if physical.len() != captured_physical.len()
-        || logical.len() != captured_logical.len()
-        || logical.contains(&0)
-        || !physical.is_subset(&logical)
-    {
-        return Err(unsupported(
-            "invalid physical/logical capture sets or bypass mark",
-        ));
-    }
-    Ok(())
 }
 
 /// Reads cleanup evidence without requiring the topology to remain admissible.
@@ -810,7 +1216,7 @@ fn dump(
                     done = true;
                 }
                 4 => return Err(malformed("topology netlink overrun")),
-                16 | 20 | 24 | 32 if !done && message == kind - 2 && flags & 2 != 0 => {
+                16 | 20 | 24 | 32 | 104 if !done && message == kind - 2 && flags & 2 != 0 => {
                     snapshot.push(message, body)?
                 }
                 _ => return Err(malformed("unexpected topology dump message")),
@@ -833,12 +1239,12 @@ struct Snapshot {
     addresses: Vec<Address>,
     rules: Vec<Rule>,
     routes: Vec<Route>,
+    nexthops: Vec<Nexthop>,
 }
 
 #[derive(Clone)]
 struct Link {
     index: u32,
-    plain_up_ethernet: bool,
     loopback: bool,
     name: Option<[u8; 16]>,
     mtu: Option<u32>,
@@ -846,6 +1252,12 @@ struct Link {
     flags: u32,
     master: u32,
     arphrd: u16,
+    parent: u32,
+    mac: [u8; 6],
+    rx_queues: u32,
+    tx_queues: u32,
+    vlan: Option<(u16, u16)>,
+    bond: Option<(u8, u8)>,
 }
 #[derive(Clone)]
 struct Address {
@@ -869,7 +1281,6 @@ struct Rule {
     table: u32,
     mark: Option<u32>,
     mask: u32,
-    simple: bool,
     action: u8,
     iif: Option<[u8; 16]>,
     flags: u32,
@@ -884,7 +1295,6 @@ struct Route {
     kind: u8,
     simple: bool,
     native_multicast: bool,
-    native_multicast_linkdown: bool,
     ipv4_destination: Option<Ipv4Addr>,
     destination: Option<IpAddr>,
     prefix_len: u8,
@@ -896,9 +1306,85 @@ struct Route {
     source: Option<IpAddr>,
     preference: u8,
     unsupported: bool,
+    outputs: Vec<u32>,
+    nexthop: Option<u32>,
+    gateway_unsupported: bool,
+}
+
+struct Nexthop {
+    id: u32,
+    output: u32,
+    group: Vec<u32>,
+    unsupported: bool,
 }
 
 impl Snapshot {
+    fn gateway_defaults(&self, captured: &[u32]) -> io::Result<()> {
+        for family in [2, 10] {
+            let enabled = self.addresses.iter().any(|address| {
+                address.family == family && address.scope == 0 && address.unicast_source
+            });
+            let mut found = false;
+            for route in self
+                .routes
+                .iter()
+                .filter(|route| route.family == family && route.default)
+            {
+                if route.gateway_unsupported {
+                    return Err(unsupported("unrepresentable default route"));
+                }
+                if matches!(route.kind, 6..=9) {
+                    continue;
+                }
+                if route.kind != 1 {
+                    return Err(unsupported("unsupported default route action"));
+                }
+                found = true;
+                if captured.contains(&route.output)
+                    || route.outputs.iter().any(|output| captured.contains(output))
+                {
+                    return Err(unsupported("default route traverses captured port"));
+                }
+                if let Some(id) = route.nexthop {
+                    self.check_gateway_nexthop(id, captured, &mut Vec::new())?;
+                } else if route.output == 0 && route.outputs.is_empty() {
+                    return Err(unsupported("default route has no verifiable output"));
+                }
+            }
+            if enabled && !found {
+                return Err(unsupported("enabled address family has no default route"));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_gateway_nexthop(
+        &self,
+        id: u32,
+        captured: &[u32],
+        path: &mut Vec<u32>,
+    ) -> io::Result<()> {
+        if path.len() == 16 || path.contains(&id) {
+            return Err(unsupported("recursive gateway nexthop"));
+        }
+        let mut matches = self.nexthops.iter().filter(|next| next.id == id);
+        let next = matches
+            .next()
+            .ok_or_else(|| unsupported("missing gateway nexthop"))?;
+        if matches.next().is_some() || next.unsupported {
+            return Err(unsupported("unrepresentable gateway nexthop"));
+        }
+        if captured.contains(&next.output) {
+            return Err(unsupported("gateway nexthop traverses captured port"));
+        }
+        path.push(id);
+        for child in &next.group {
+            self.check_gateway_nexthop(*child, captured, path)?;
+        }
+        path.pop();
+        Ok(())
+    }
+
     fn ipv4_broadcasts(&self) -> io::Result<([Ipv4Addr; MAX_BROADCASTS], usize)> {
         let mut addresses = [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS];
         let mut count = 0;
@@ -937,12 +1423,57 @@ impl Snapshot {
     }
 
     fn push(&mut self, kind: u16, body: &[u8]) -> io::Result<()> {
-        if self.links.len() + self.addresses.len() + self.rules.len() + self.routes.len()
+        if self.links.len()
+            + self.addresses.len()
+            + self.rules.len()
+            + self.routes.len()
+            + self.nexthops.len()
             >= MAX_OBJECTS
         {
             return Err(unsupported("topology snapshot exceeds bounded capacity"));
         }
         match kind {
+            104 => {
+                if body.len() < 8 {
+                    return Err(malformed("short nexthop"));
+                }
+                let mut next = Nexthop {
+                    id: 0,
+                    output: 0,
+                    group: Vec::new(),
+                    unsupported: false,
+                };
+                let mut blackhole = false;
+                let mut seen = 0;
+                attributes(&body[8..], |kind, value| {
+                    unique_attribute(&mut seen, kind)?;
+                    match kind {
+                        1 => next.id = exact_u32(value)?,
+                        2 => {
+                            if value.is_empty() || !value.len().is_multiple_of(8) {
+                                return Err(malformed("invalid nexthop group"));
+                            }
+                            for child in value.as_chunks::<8>().0 {
+                                if child[5..] != [0, 0, 0] {
+                                    next.unsupported = true;
+                                }
+                                next.group.push(u32_at(child, 0)?);
+                            }
+                        }
+                        3 if value.len() == 2 && u16::from_ne_bytes([value[0], value[1]]) == 0 => {}
+                        4 if value.is_empty() => blackhole = true,
+                        5 => next.output = exact_u32(value)?,
+                        6 => {
+                            ip_address(body[0], value)?;
+                        }
+                        _ => next.unsupported = true,
+                    }
+                    Ok(())
+                })?;
+                next.unsupported |=
+                    next.id == 0 || (!blackhole && next.output == 0 && next.group.is_empty());
+                self.nexthops.push(next);
+            }
             16 => {
                 if body.len() < 16 {
                     return Err(malformed("short topology link"));
@@ -952,7 +1483,6 @@ impl Snapshot {
                 let arphrd = u16::from_ne_bytes([body[2], body[3]]);
                 let mut link = Link {
                     index,
-                    plain_up_ethernet: arphrd == 1 && flags & 1 != 0,
                     loopback: flags & 8 != 0,
                     name: None,
                     mtu: None,
@@ -960,21 +1490,35 @@ impl Snapshot {
                     flags,
                     master: 0,
                     arphrd,
+                    parent: index,
+                    mac: [0; 6],
+                    rx_queues: 0,
+                    tx_queues: 0,
+                    vlan: None,
+                    bond: None,
                 };
                 let mut parent = index;
                 let mut seen = 0;
+                let mut info_data = None;
                 attributes(&body[16..], |kind, value| {
                     match kind {
-                        3 | 4 | 5 | 10 | 18 => unique_attribute(&mut seen, kind)?,
+                        1 | 3 | 4 | 5 | 10 | 18 | 31 | 32 => unique_attribute(&mut seen, kind)?,
                         _ => {}
                     }
                     match kind {
+                        1 if arphrd == 1 => {
+                            if value.len() != 6 {
+                                return Err(malformed("invalid link MAC"));
+                            }
+                            link.mac.copy_from_slice(value);
+                        }
+                        31 => link.tx_queues = exact_u32(value)?,
+                        32 => link.rx_queues = exact_u32(value)?,
                         3 => link.name = Some(netlink_name(value)?),
                         4 => link.mtu = Some(exact_u32(value)?),
                         5 => parent = exact_u32(value)?,
                         10 => {
                             link.master = exact_u32(value)?;
-                            link.plain_up_ethernet &= link.master == 0;
                         }
                         18 => {
                             let mut seen_info = 0;
@@ -983,6 +1527,9 @@ impl Snapshot {
                                     unique_attribute(&mut seen_info, kind)?;
                                     link.kind = Some(netlink_name(value)?);
                                 }
+                                if kind == 2 {
+                                    info_data = Some(value);
+                                }
                                 Ok(())
                             })?;
                         }
@@ -990,11 +1537,51 @@ impl Snapshot {
                     }
                     Ok(())
                 })?;
-                link.plain_up_ethernet &= match link.kind {
-                    Some(name) if name == interface_name(b"veth")? => true,
-                    None => parent == index,
-                    _ => false,
-                };
+                link.parent = parent;
+                if let Some(data) = info_data {
+                    if link.kind == Some(interface_name(b"vlan")?) {
+                        let mut id = None;
+                        let mut protocol = 0x8100;
+                        let mut supported = true;
+                        attributes(data, |kind, value| {
+                            match kind {
+                                1 if value.len() == 2 => {
+                                    id = Some(u16::from_ne_bytes([value[0], value[1]]))
+                                }
+                                5 if value.len() == 2 => {
+                                    protocol = u16::from_be_bytes([value[0], value[1]])
+                                }
+                                2 if value.len() == 8 => supported &= u32_at(value, 0)? & !1 == 0,
+                                3 | 4 => attributes(value, |_, mapping| {
+                                    if mapping.len() != 8 {
+                                        return Err(malformed("invalid VLAN QoS mapping"));
+                                    }
+                                    supported &= u32_at(mapping, 4)? == 0;
+                                    Ok(())
+                                })?,
+                                _ => supported = false,
+                            }
+                            Ok(())
+                        })?;
+                        link.vlan = id
+                            .filter(|id| {
+                                supported && *id < 4095 && matches!(protocol, 0x8100 | 0x88a8)
+                            })
+                            .map(|id| (protocol, id));
+                    } else if link.kind == Some(interface_name(b"bond")?) {
+                        let mut mode = None;
+                        let mut hash = None;
+                        attributes(data, |kind, value| {
+                            match kind {
+                                1 if value.len() == 1 => mode = Some(value[0]),
+                                14 if value.len() == 1 => hash = Some(value[0]),
+                                _ => {}
+                            }
+                            Ok(())
+                        })?;
+                        link.bond = mode.zip(hash);
+                    }
+                }
                 self.links.push(link);
             }
             20 => {
@@ -1066,7 +1653,6 @@ impl Snapshot {
                     table: u32::from(body[4]),
                     mark: None,
                     mask: 0,
-                    simple: body[1..4] == [0, 0, 0] && body[7] == 1 && flags == 0,
                     action: body[7],
                     iif: None,
                     flags,
@@ -1078,7 +1664,6 @@ impl Snapshot {
                     match kind {
                         3 => {
                             rule.iif = Some(netlink_name(value)?);
-                            rule.simple = false;
                         }
                         6 => rule.priority = exact_u32(value)?,
                         10 => rule.mark = Some(exact_u32(value)?),
@@ -1088,7 +1673,6 @@ impl Snapshot {
                         18 if value.is_empty() => {}
                         21 if value.len() == 1 => {}
                         _ => {
-                            rule.simple = false;
                             rule.unsupported = true;
                         }
                     }
@@ -1108,7 +1692,6 @@ impl Snapshot {
                     kind: body[7],
                     simple: body[2] == 0 && body[3] == 0,
                     native_multicast: body[0] == 10 && body[1] == 8 && body[7] == 5,
-                    native_multicast_linkdown: false,
                     ipv4_destination: None,
                     destination: unspecified(body[0]),
                     prefix_len: body[1],
@@ -1120,6 +1703,9 @@ impl Snapshot {
                     source: None,
                     preference: 0,
                     unsupported: body[2] != 0 || body[3] != 0,
+                    outputs: Vec::new(),
+                    nexthop: None,
+                    gateway_unsupported: false,
                 };
                 let mut multicast_destination = None;
                 let mut seen = 0;
@@ -1143,6 +1729,37 @@ impl Snapshot {
                             }
                         }
                         4 => route.output = exact_u32(value)?,
+                        9 => {
+                            let mut rest = value;
+                            while !rest.is_empty() {
+                                if rest.len() < 8 {
+                                    return Err(malformed("short multipath nexthop"));
+                                }
+                                let len = u16::from_ne_bytes([rest[0], rest[1]]) as usize;
+                                if len < 8 || len > rest.len() || ((len + 3) & !3) > rest.len() {
+                                    return Err(malformed("invalid multipath nexthop"));
+                                }
+                                let index = u32_at(rest, 4)?;
+                                route.gateway_unsupported |= index == 0;
+                                attributes(&rest[8..len], |kind, value| {
+                                    if kind != 5 {
+                                        route.gateway_unsupported = true;
+                                        return Ok(());
+                                    }
+                                    ip_address(route.family, value)?;
+                                    Ok(())
+                                })?;
+                                route.outputs.push(index);
+                                rest = &rest[(len + 3) & !3..];
+                            }
+                            route.simple = false;
+                            route.unsupported = true;
+                        }
+                        30 => {
+                            route.nexthop = Some(exact_u32(value)?);
+                            route.simple = false;
+                            route.unsupported = true;
+                        }
                         5 => route.gateway = Some(ip_address(route.family, value)?),
                         6 => route.metric = exact_u32(value)?,
                         7 => route.source = Some(ip_address(route.family, value)?),
@@ -1160,6 +1777,7 @@ impl Snapshot {
                         _ => {
                             route.simple = false;
                             route.unsupported = true;
+                            route.gateway_unsupported = true;
                         }
                     }
                     Ok(())
@@ -1169,9 +1787,6 @@ impl Snapshot {
                     .is_none_or(|ip| !network_address(ip, route.prefix_len))
                     || (route.prefix_len != 0 && multicast_destination.is_none());
                 route.native_multicast &= route.simple && multicast_destination == Some(true);
-                // The first native XDP attachment can temporarily mark this route LINKDOWN.
-                route.native_multicast_linkdown =
-                    route.native_multicast && !route.unsupported && route.flags == RTNH_F_LINKDOWN;
                 route.simple &= route.flags == 0;
                 route.native_multicast &= route.simple;
                 self.routes.push(route);
@@ -1606,153 +2221,6 @@ impl Snapshot {
         }
         Ok(readback)
     }
-
-    fn admit(
-        &self,
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-    ) -> io::Result<()> {
-        self.admit_with_carrier(captured_physical, captured_logical, bypass_mark, true)
-    }
-
-    fn pending_xdp_carrier(
-        &self,
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-    ) -> io::Result<Option<&Link>> {
-        self.admit_with_carrier(captured_physical, captured_logical, bypass_mark, false)?;
-        self.ipv4_broadcasts()?;
-        Ok(self
-            .links
-            .iter()
-            .find(|link| captured_physical.contains(&link.index) && link.flags & 0x10000 == 0))
-    }
-
-    fn admit_with_carrier(
-        &self,
-        captured_physical: &[u32],
-        captured_logical: &[u32],
-        bypass_mark: u32,
-        require_capture_carrier: bool,
-    ) -> io::Result<()> {
-        for &index in captured_physical {
-            if !self.links.iter().any(|link| {
-                link.index == index
-                    && link.plain_up_ethernet
-                    && (!require_capture_carrier || link.flags & 0x10000 != 0)
-            }) {
-                return Err(unsupported(
-                    "capture requires unnumbered, up, standalone Ethernet roots",
-                ));
-            }
-        }
-        for &index in captured_logical {
-            if !self.links.iter().any(|link| link.index == index)
-                || self.addresses.iter().any(|address| address.index == index)
-            {
-                return Err(unsupported(
-                    "logical capture interfaces must exist and remain unnumbered",
-                ));
-            }
-        }
-        if self.routes.iter().any(|route| {
-            matches!(route.family, 2 | 10)
-                && route.table == 255
-                && !(route.native_multicast
-                    || (!require_capture_carrier
-                        && route.native_multicast_linkdown
-                        && captured_physical.contains(&route.output)
-                        && self
-                            .links
-                            .iter()
-                            .any(|link| link.index == route.output && link.flags & 0x10000 == 0)))
-                && (route.kind == 1 || captured_logical.contains(&route.output))
-        }) {
-            return Err(unsupported(
-                "local routing table can select a captured interface",
-            ));
-        }
-        let mut enabled = false;
-        for family in [2, 10] {
-            let family_enabled = self
-                .addresses
-                .iter()
-                .any(|address| address.family == family && address.unicast_source);
-            if !family_enabled {
-                continue;
-            }
-            enabled = true;
-            let mut local = 0;
-            let mut mark_rule = None;
-            for rule in self.rules.iter().filter(|rule| rule.family == family) {
-                if !rule.simple {
-                    return Err(unsupported(
-                        "own-socket uplink proof rejects RPDB selectors, VRFs and rule actions",
-                    ));
-                }
-                match rule.mark {
-                    Some(mark)
-                        if mark == bypass_mark
-                            && rule.mask == u32::MAX
-                            && rule.priority > 0
-                            && rule.priority < 32766
-                            && rule.table != 0
-                            && !(253..=255).contains(&rule.table) =>
-                    {
-                        if mark_rule.replace(rule).is_some() {
-                            return Err(unsupported("duplicate bypass mark rules"));
-                        }
-                    }
-                    None if rule.mask == 0 && rule.priority == 0 && rule.table == 255 => local += 1,
-                    None if rule.mask == 0
-                        && ((rule.priority == 32766 && rule.table == 254)
-                            || (rule.priority == 32767 && rule.table == 253)) => {}
-                    _ => {
-                        return Err(unsupported(
-                            "RPDB is not local, exact bypass mark, then main/default",
-                        ));
-                    }
-                }
-            }
-            if local != 1 {
-                return Err(unsupported("missing unique priority-zero local rule"));
-            }
-            let rule = mark_rule.ok_or_else(|| unsupported("provision an exact bypass-mark rule before main with a dedicated uncaptured uplink table"))?;
-            let mut default = false;
-            for route in self
-                .routes
-                .iter()
-                .filter(|route| route.family == family && route.table == rule.table)
-            {
-                if !route.simple
-                    || route.kind != 1
-                    || captured_logical.contains(&route.output)
-                    || !self.links.iter().any(|link| {
-                        link.index == route.output
-                            && link.plain_up_ethernet
-                            && link.flags & 0x10000 != 0
-                            && !link.loopback
-                    })
-                {
-                    return Err(unsupported(
-                        "bypass table must contain only unicast routes on uncaptured standalone Ethernet uplinks",
-                    ));
-                }
-                default |= route.default;
-            }
-            if !default {
-                return Err(unsupported(
-                    "bypass uplink table lacks a covering default for an enabled address family",
-                ));
-            }
-        }
-        if !enabled {
-            return Err(unsupported("no non-loopback unicast source address family"));
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -1760,6 +2228,334 @@ mod tests {
     use super::*;
 
     mod tun;
+
+    fn capture_notification(kind: u16, body: &[u8]) -> Vec<u8> {
+        let length = 16 + body.len();
+        let mut bytes = vec![0; 16];
+        bytes[..4].copy_from_slice(&(length as u32).to_ne_bytes());
+        bytes[4..6].copy_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(body);
+        bytes.resize((length + 3) & !3, 0);
+        bytes
+    }
+
+    fn capture_link_body(index: u32, mtu: u32, flags: u32) -> Vec<u8> {
+        let mut body = vec![0; 16];
+        body[2..4].copy_from_slice(&1u16.to_ne_bytes());
+        body[4..8].copy_from_slice(&index.to_ne_bytes());
+        body[8..12].copy_from_slice(&flags.to_ne_bytes());
+        attribute(&mut body, 1, &[2; 6]);
+        attribute(&mut body, 4, &mtu.to_ne_bytes());
+        attribute(&mut body, 31, &2u32.to_ne_bytes());
+        attribute(&mut body, 32, &2u32.to_ne_bytes());
+        body
+    }
+
+    #[test]
+    fn numbered_bond_members_share_logical_vlan_realms() {
+        let mut snapshot = topology();
+        let mut root = capture_link_body(10, 1500, 1);
+        attribute(&mut root, 3, b"bond0\0");
+        let mut data = Vec::new();
+        attribute(&mut data, 1, &[4]);
+        attribute(&mut data, 14, &[2]);
+        let mut info = Vec::new();
+        attribute(&mut info, 1, b"bond\0");
+        attribute(&mut info, 2, &data);
+        attribute(&mut root, 18, &info);
+        snapshot.push(16, &root).unwrap();
+        for (index, name) in [(11, b"member0\0"), (12, b"member1\0")] {
+            let mut member = capture_link_body(index, 1500, 1);
+            attribute(&mut member, 3, name);
+            attribute(&mut member, 10, &10u32.to_ne_bytes());
+            snapshot.push(16, &member).unwrap();
+        }
+        let mut vlan = capture_link_body(13, 1400, 1);
+        attribute(&mut vlan, 3, b"bond0.7\0");
+        attribute(&mut vlan, 5, &10u32.to_ne_bytes());
+        let mut vlan_data = Vec::new();
+        attribute(&mut vlan_data, 1, &7u16.to_ne_bytes());
+        let mut vlan_info = Vec::new();
+        attribute(&mut vlan_info, 1, b"vlan\0");
+        attribute(&mut vlan_info, 2, &vlan_data);
+        attribute(&mut vlan, 18, &vlan_info);
+        snapshot.push(16, &vlan).unwrap();
+        snapshot.addresses.push(xdp_address(2, 10));
+        let realms = capture_layout_snapshot(&snapshot, &["bond0".into()]).unwrap();
+        assert_eq!(realms.len(), 2);
+        assert_eq!(realms[0].logical_ifindex, 10);
+        assert_eq!(realms[0].members, ["member0", "member1"]);
+        assert_eq!(realms[1].members, realms[0].members);
+        assert_eq!(realms[1].logical_ifindex, 13);
+        assert_eq!(realms[1].vlan_count, 1);
+        assert_eq!(realms[1].tpid, [0x8100, 0]);
+        assert_eq!(realms[1].vid, [7, 0]);
+        snapshot
+            .links
+            .iter_mut()
+            .find(|link| link.index == 10)
+            .unwrap()
+            .bond = Some((4, 5));
+        assert!(capture_layout_snapshot(&snapshot, &["bond0".into()]).is_err());
+    }
+
+    #[test]
+    fn capture_watch_ignores_carrier_statistics_and_other_devices() {
+        let mut snapshot = Snapshot::default();
+        snapshot
+            .push(16, &capture_link_body(2, 1500, 0x10001))
+            .unwrap();
+        let watch = CaptureWatch {
+            fd: route_socket(false).unwrap(),
+            links: snapshot.links,
+            programs: Vec::new(),
+            invalidated: false,
+            ipv4_broadcasts: [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS],
+            broadcast_count: 0,
+        };
+        let mut carrier = capture_link_body(2, 1500, 1);
+        attribute(&mut carrier, 23, &[0; 32]);
+        assert!(
+            !watch
+                .datagram(&capture_notification(16, &carrier), |_| Ok(
+                    crate::XdpState::default()
+                ))
+                .unwrap()
+        );
+        for kind in [16, 17] {
+            let mut other = vec![0; 16];
+            other[2..4].copy_from_slice(&512u16.to_ne_bytes());
+            other[4..8].copy_from_slice(&9u32.to_ne_bytes());
+            attribute(&mut other, 3, b"pppoe0\0");
+            assert!(
+                !watch
+                    .datagram(&capture_notification(kind, &other), |_| panic!(
+                        "unrelated program readback"
+                    ))
+                    .unwrap()
+            );
+        }
+        let address = address_body(10, 9, &[0x20; 16], None);
+        assert!(
+            watch
+                .datagram(&capture_notification(20, &address), |_| panic!(
+                    "address program readback"
+                ))
+                .unwrap()
+        );
+        for kind in [24, 25, 32, 33] {
+            let mut body = vec![0; 12];
+            body[0] = 2;
+            attribute(&mut body, 99, &[1, 2, 3, 4]);
+            assert!(
+                !watch
+                    .datagram(&capture_notification(kind, &body), |_| panic!(
+                        "route or rule program readback"
+                    ))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn capture_watch_rejects_new_captured_bond_member() {
+        let mut snapshot = Snapshot::default();
+        let mut bond = capture_link_body(10, 1500, 1);
+        let mut info = Vec::new();
+        attribute(&mut info, 1, b"bond\0");
+        attribute(&mut bond, 18, &info);
+        snapshot.push(16, &bond).unwrap();
+        let watch = CaptureWatch {
+            fd: route_socket(false).unwrap(),
+            links: snapshot.links,
+            programs: Vec::new(),
+            invalidated: false,
+            ipv4_broadcasts: [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS],
+            broadcast_count: 0,
+        };
+        assert!(
+            !watch
+                .datagram(&capture_notification(16, &bond), |_| Ok(
+                    crate::XdpState::default()
+                ))
+                .unwrap()
+        );
+        let mut member = capture_link_body(11, 1500, 1);
+        attribute(&mut member, 10, &10u32.to_ne_bytes());
+        assert!(
+            watch
+                .datagram(&capture_notification(16, &member), |_| panic!(
+                    "unknown program readback"
+                ))
+                .is_err()
+        );
+        let mut other = capture_link_body(11, 1500, 1);
+        attribute(&mut other, 10, &12u32.to_ne_bytes());
+        assert!(
+            !watch
+                .datagram(&capture_notification(16, &other), |_| panic!(
+                    "unknown program readback"
+                ))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn capture_watch_rejects_identity_loss_and_unregistered_programs() {
+        let mut snapshot = Snapshot::default();
+        let baseline = capture_link_body(2, 1500, 1);
+        snapshot.push(16, &baseline).unwrap();
+        let mut watch = CaptureWatch {
+            fd: route_socket(false).unwrap(),
+            links: snapshot.links,
+            programs: Vec::new(),
+            invalidated: false,
+            ipv4_broadcasts: [Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS],
+            broadcast_count: 0,
+        };
+        assert!(
+            watch
+                .datagram(
+                    &capture_notification(16, &capture_link_body(2, 9000, 1)),
+                    |_| Ok(crate::XdpState::default())
+                )
+                .is_err()
+        );
+        for range in [20..26, 40..44, 48..52] {
+            let mut changed = baseline.clone();
+            changed[range].fill(7);
+            assert!(
+                watch
+                    .datagram(&capture_notification(16, &changed), |_| Ok(
+                        crate::XdpState::default()
+                    ))
+                    .is_err()
+            );
+        }
+        let mut mastered = baseline.clone();
+        attribute(&mut mastered, 10, &9u32.to_ne_bytes());
+        assert!(
+            watch
+                .datagram(&capture_notification(16, &mastered), |_| Ok(
+                    crate::XdpState::default()
+                ))
+                .is_err()
+        );
+        assert!(
+            watch
+                .datagram(&capture_notification(17, &baseline), |_| Ok(
+                    crate::XdpState::default()
+                ))
+                .is_err()
+        );
+        assert!(
+            watch
+                .datagram(&[0; 7], |_| Ok(crate::XdpState::default()))
+                .is_err()
+        );
+        let owned = crate::XdpState {
+            attached: 1,
+            prog_id: 17,
+            drv_prog_id: 17,
+            ..crate::XdpState::default()
+        };
+        assert!(
+            watch
+                .datagram(&capture_notification(16, &baseline), |_| Ok(owned))
+                .is_err()
+        );
+        watch.expect_program(2, 17);
+        assert!(
+            !watch
+                .datagram(&capture_notification(16, &baseline), |_| Ok(owned))
+                .unwrap()
+        );
+        let foreign = crate::XdpState {
+            prog_id: 18,
+            drv_prog_id: 18,
+            ..owned
+        };
+        assert!(
+            watch
+                .datagram(&capture_notification(16, &baseline), |_| Ok(foreign))
+                .is_err()
+        );
+        assert_eq!(
+            watch
+                .check_with(|_| Err(io::Error::from_raw_os_error(libc::ENOBUFS)))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ENOBUFS)
+        );
+        assert!(
+            watch
+                .check_with(|_| panic!("lost watch cannot regain authority"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn gateway_checks_defaults_in_every_table_and_nexthop_member() {
+        let mut snapshot = topology();
+        assert!(check_gateway_defaults_snapshot(&snapshot, &[2]).is_ok());
+        snapshot.routes.push(xdp_route(2, 900, 2, true, 1));
+        assert!(check_gateway_defaults_snapshot(&snapshot, &[2]).is_err());
+        snapshot.routes.pop();
+        let mut route = xdp_route(2, 900, 0, true, 1);
+        route.nexthop = Some(40);
+        snapshot.routes.push(route);
+        snapshot.nexthops.push(Nexthop {
+            id: 40,
+            output: 0,
+            group: vec![41, 42],
+            unsupported: false,
+        });
+        snapshot.nexthops.push(Nexthop {
+            id: 41,
+            output: 3,
+            group: Vec::new(),
+            unsupported: false,
+        });
+        snapshot.nexthops.push(Nexthop {
+            id: 42,
+            output: 2,
+            group: Vec::new(),
+            unsupported: false,
+        });
+        assert!(check_gateway_defaults_snapshot(&snapshot, &[2]).is_err());
+        snapshot.nexthops[2].output = 3;
+        assert!(check_gateway_defaults_snapshot(&snapshot, &[2]).is_ok());
+        snapshot.nexthops[2].group.push(40);
+        assert!(check_gateway_defaults_snapshot(&snapshot, &[2]).is_err());
+    }
+
+    #[test]
+    fn tun_notifications_distinguish_unrelated_and_owned_objects() {
+        let spec = TunWatch {
+            name: "tun0".into(),
+            mtu: 1500,
+            address4: Some(Ipv4Addr::new(192, 0, 2, 1)),
+            address6: None,
+            table: 100,
+            rule_priority: 1000,
+            bypass_mark: 128,
+            capture: vec![(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)],
+        };
+        let message = |kind: u16, body: &[u8]| {
+            let length = 16 + body.len();
+            let mut bytes = vec![0; 16];
+            bytes[..4].copy_from_slice(&(length as u32).to_ne_bytes());
+            bytes[4..6].copy_from_slice(&kind.to_ne_bytes());
+            bytes.extend_from_slice(body);
+            bytes.resize((length + 3) & !3, 0);
+            bytes
+        };
+        let other = address_body(2, 3, &[198, 51, 100, 1], None);
+        let owned = address_body(2, 9, &[192, 0, 2, 1], None);
+        assert!(!tun_notifications(&message(20, &other), &spec, 9).unwrap());
+        assert!(tun_notifications(&message(21, &owned), &spec, 9).unwrap());
+        assert!(tun_notifications(&[1, 2, 3], &spec, 9).is_err());
+    }
 
     fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
         let length = value.len() + 4;
@@ -1807,14 +2603,13 @@ mod tests {
             body[4] = table;
             body[24..28].copy_from_slice(&3u32.to_ne_bytes());
             snapshot.push(24, &body).unwrap();
-            snapshot.admit(&[2], &[2], 128).unwrap();
             let (broadcasts, count) = snapshot.ipv4_broadcasts().unwrap();
             assert_eq!(count, usize::from(expected));
             if expected {
                 assert_eq!(broadcasts[0], Ipv4Addr::from(address));
             }
         }
-        for mutation in 0..5 {
+        for mutation in [0, 1, 2, 4] {
             let mut snapshot = topology();
             let mut body = local_route_body(2, 32, 3, Some(&address));
             body[24..28].copy_from_slice(&3u32.to_ne_bytes());
@@ -1832,12 +2627,7 @@ mod tests {
                 }
             }
             snapshot.push(24, &body).unwrap();
-            assert!(
-                snapshot
-                    .admit(&[2], &[2], 128)
-                    .and_then(|()| snapshot.ipv4_broadcasts().map(|_| ()))
-                    .is_err()
-            );
+            assert!(snapshot.ipv4_broadcasts().is_err());
         }
         let mut canonical = topology();
         for address in [[192, 0, 9, 255], [192, 0, 2, 255], [192, 0, 9, 255]] {
@@ -1861,147 +2651,6 @@ mod tests {
             }
         }
         assert!(snapshot.ipv4_broadcasts().is_err());
-    }
-
-    #[test]
-    fn only_exact_simple_ipv6_multicast_routes_bypass_local_capture_refusal() {
-        let multicast = Ipv6Addr::from(0xff00u128 << 112).octets();
-        let unicast = "2001:db8::".parse::<Ipv6Addr>().unwrap().octets();
-        let mut host_bits = multicast;
-        host_bits[15] = 1;
-        for (family, prefix, kind, destination, allowed) in [
-            (10, 8, 5, Some(multicast.as_slice()), true),
-            (10, 8, 1, Some(multicast.as_slice()), false),
-            (10, 8, 2, Some(multicast.as_slice()), false),
-            (10, 8, 5, Some(unicast.as_slice()), false),
-            (10, 0, 5, Some(multicast.as_slice()), false),
-            (10, 128, 5, Some(multicast.as_slice()), false),
-            (2, 8, 5, Some(multicast.as_slice()), false),
-            (10, 8, 5, Some(&multicast[..15]), false),
-            (10, 8, 5, Some(host_bits.as_slice()), false),
-            (10, 8, 5, None, false),
-        ] {
-            let mut snapshot = topology();
-            snapshot
-                .push(24, &local_route_body(family, prefix, kind, destination))
-                .unwrap();
-            assert_eq!(snapshot.routes.last().unwrap().native_multicast, allowed);
-            assert_eq!(snapshot.admit(&[2], &[2], 128).is_ok(), allowed);
-        }
-        for mutation in 0..3 {
-            let mut body = local_route_body(10, 8, 5, Some(&multicast));
-            match mutation {
-                0 => body[2] = 1,
-                1 => body[8] = 1,
-                _ => attribute(&mut body, 99, &0u32.to_ne_bytes()),
-            }
-            let mut snapshot = topology();
-            snapshot.push(24, &body).unwrap();
-            assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        }
-        let mut duplicate = local_route_body(10, 8, 5, Some(&multicast));
-        attribute(&mut duplicate, 1, &unicast);
-        assert!(Snapshot::default().push(24, &duplicate).is_err());
-    }
-
-    #[test]
-    fn xdp_attach_multicast_linkdown_requires_its_own_pending_physical_root() {
-        let multicast = Ipv6Addr::from(0xff00u128 << 112).octets();
-        let flags = std::iter::once(RTNH_F_LINKDOWN).chain((0..32).flat_map(|bit| {
-            let other = 1u32 << bit;
-            [other, other | RTNH_F_LINKDOWN]
-        }));
-        for flags in flags {
-            for (root_flags, output, other_physical, allowed) in [
-                (1, 2u32, false, flags == RTNH_F_LINKDOWN),
-                (0x10001, 2, false, false),
-                (0x10001, 2, true, false),
-                (1, 4, false, false),
-            ] {
-                let mut current = topology();
-                current.links[0].flags = root_flags;
-                current.links.push(xdp_link(4, true, false));
-                current.links[2].flags = 1;
-                let mut body = local_route_body(10, 8, 5, Some(&multicast));
-                body[8..12].copy_from_slice(&flags.to_ne_bytes());
-                let output_at = body.len() - 12;
-                body[output_at..output_at + 4].copy_from_slice(&output.to_ne_bytes());
-                let mut cache = [0u8; 32];
-                cache[0] = 1;
-                cache[16] = 1;
-                attribute(&mut body, 12, &cache);
-                current.push(24, &body).unwrap();
-                let route = current.routes.last().unwrap();
-                assert!(!route.simple);
-                assert!(!route.native_multicast);
-                assert_eq!(route.native_multicast_linkdown, flags == RTNH_F_LINKDOWN);
-                let physical = if other_physical {
-                    &[2, 4][..]
-                } else {
-                    &[2][..]
-                };
-                let pending = current.pending_xdp_carrier(physical, &[2, 4], 128);
-                if allowed {
-                    let root = pending
-                        .expect("sole LINKDOWN must not hide a pending root's multicast route")
-                        .expect("attached physical root must still await carrier");
-                    assert_eq!(root.index, 2);
-                } else {
-                    assert!(pending.is_err(), "flags={flags:#x}, output={output}");
-                }
-                assert!(current.admit(physical, &[2, 4], 128).is_err());
-            }
-        }
-        let mut recovered = topology();
-        recovered
-            .push(24, &local_route_body(10, 8, 5, Some(&multicast)))
-            .unwrap();
-        assert!(recovered.admit(&[2], &[2], 128).is_ok());
-    }
-
-    #[test]
-    fn xdp_attach_linkdown_preserves_multicast_shape_and_attribute_refusals() {
-        let multicast = Ipv6Addr::from(0xff00u128 << 112).octets();
-        let unicast = "2001:db8::".parse::<Ipv6Addr>().unwrap().octets();
-        let mut host_bits = multicast;
-        host_bits[15] = 1;
-        for mutation in 0..16 {
-            let mut current = topology();
-            current.links[0].flags = 1;
-            let mut body = local_route_body(10, 8, 5, Some(&multicast));
-            match mutation {
-                0 => body[0] = 2,
-                1 => body[7] = 1,
-                2 => body[1] = 128,
-                3 => body = local_route_body(10, 8, 5, None),
-                4 => body = local_route_body(10, 8, 5, Some(&multicast[..15])),
-                5 => body = local_route_body(10, 8, 5, Some(&unicast)),
-                6 => body = local_route_body(10, 8, 5, Some(&host_bits)),
-                7 => body[2] = 1,
-                8 => body[3] = 1,
-                9 => attribute(&mut body, 99, &0u32.to_ne_bytes()),
-                10 => attribute(&mut body, 8, &[]),
-                11 => attribute(&mut body, 23, &[]),
-                12 | 13 => {
-                    let mut cache = [0u8; 32];
-                    cache[if mutation == 12 { 8 } else { 12 }] = 1;
-                    attribute(&mut body, 12, &cache);
-                }
-                14 => attribute(&mut body, 1, &multicast),
-                _ => attribute(&mut body, 12, &[0; 31]),
-            }
-            body[8..12].copy_from_slice(&RTNH_F_LINKDOWN.to_ne_bytes());
-            if let Err(error) = current.push(24, &body) {
-                assert!(matches!(mutation, 14 | 15));
-                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-                continue;
-            }
-            let route = current.routes.last().unwrap();
-            assert!(!route.simple);
-            assert!(!route.native_multicast);
-            assert!(!route.native_multicast_linkdown, "mutation {mutation}");
-            assert!(current.pending_xdp_carrier(&[2], &[2], 128).is_err());
-        }
     }
 
     #[test]
@@ -2050,73 +2699,6 @@ mod tests {
         let mut duplicate = address_body(2, 1, &[192, 0, 2, 1], None);
         attribute(&mut duplicate, 1, &[127, 0, 0, 1]);
         assert!(Snapshot::default().push(20, &duplicate).is_err());
-    }
-
-    #[test]
-    fn global_ipv6_host_address_on_loopback_requires_ipv6_bypass_proof() {
-        let mut snapshot = topology();
-        snapshot.links.push(xdp_link(1, false, true));
-        snapshot
-            .push(20, &address_body(2, 1, &[127, 0, 0, 1], None))
-            .unwrap();
-        snapshot
-            .push(
-                20,
-                &address_body(10, 1, &Ipv6Addr::LOCALHOST.octets(), None),
-            )
-            .unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_ok());
-        let global = "2001:db8::1".parse::<Ipv6Addr>().unwrap().octets();
-        snapshot
-            .push(20, &address_body(10, 1, &global, None))
-            .unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        let ipv6_rules: Vec<_> = snapshot
-            .rules
-            .iter()
-            .map(|rule| Rule {
-                family: 10,
-                ..rule.clone()
-            })
-            .collect();
-        snapshot.rules.extend(ipv6_rules);
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        let mut default = vec![0; 12];
-        default[0] = 10;
-        default[4] = 100;
-        default[7] = 1;
-        attribute(&mut default, 4, &3u32.to_ne_bytes());
-        snapshot.push(24, &default).unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_ok());
-        snapshot
-            .push(
-                20,
-                &address_body(10, 2, &Ipv6Addr::LOCALHOST.octets(), None),
-            )
-            .unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-    }
-
-    #[test]
-    fn rule_dump_keeps_masks_and_rejects_input_selectors() {
-        let mut body = vec![0u8; 12];
-        body[0] = 2;
-        body[4] = 100;
-        body[7] = 1;
-        for (kind, value) in [(6u16, 100u32), (10, 128), (16, u32::MAX), (14, u32::MAX)] {
-            body.extend_from_slice(&8u16.to_ne_bytes());
-            body.extend_from_slice(&kind.to_ne_bytes());
-            body.extend_from_slice(&value.to_ne_bytes());
-        }
-        let mut parsed = Snapshot::default();
-        parsed.push(32, &body).unwrap();
-        let mut snapshot = topology();
-        snapshot.rules[1] = parsed.rules.pop().unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_ok());
-        attribute(&mut body, 3, b"lo\0");
-        parsed.push(32, &body).unwrap();
-        snapshot.rules[1] = parsed.rules.pop().unwrap();
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
     }
 
     fn xdp_link(index: u32, plain: bool, loopback: bool) -> Link {
@@ -2190,278 +2772,7 @@ mod tests {
                 xdp_route(2, 100, 3, true, 1),
                 xdp_route(2, 254, 2, false, 1),
             ],
-        }
-    }
-
-    #[test]
-    fn xdp_attach_carrier_settle_preserves_strict_admission() {
-        let link_body = |index: u32, flags: u32| {
-            let mut body = vec![0; 16];
-            body[2..4].copy_from_slice(&1u16.to_ne_bytes());
-            body[4..8].copy_from_slice(&index.to_ne_bytes());
-            body[8..12].copy_from_slice(&flags.to_ne_bytes());
-            attribute(&mut body, 3, b"dut0\0");
-            body
-        };
-        for flags in [1, 0x10001, 0x10000, 0] {
-            let mut current = topology();
-            current.push(16, &link_body(2, flags)).unwrap();
-            current.links[0] = current.links.pop().unwrap();
-            assert_eq!(current.admit(&[2], &[2], 128).is_ok(), flags == 0x10001);
-            let pending = current.pending_xdp_carrier(&[2], &[2], 128);
-            if flags & 1 == 0 {
-                assert!(pending.is_err(), "admin-down roots cannot wait for carrier");
-            } else if flags & 0x10000 == 0 {
-                let link = pending.unwrap().expect("attached root must await carrier");
-                assert_eq!(link.index, 2);
-                let error = xdp_carrier_timeout(&PendingCarrier {
-                    index: link.index,
-                    name: link.name,
-                });
-                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-                assert_eq!(error.to_string(), "dut0: no carrier after XDP attach");
-            } else {
-                assert!(pending.unwrap().is_none());
-            }
-        }
-        for mutation in 0..7 {
-            let mut current = topology();
-            let mut body = link_body(2, 1);
-            match mutation {
-                0 => attribute(&mut body, 10, &9u32.to_ne_bytes()),
-                1 => {
-                    let mut info = Vec::new();
-                    attribute(&mut info, 1, b"vlan\0");
-                    attribute(&mut body, 18, &info);
-                }
-                2 => body[2..4].copy_from_slice(&0xfffeu16.to_ne_bytes()),
-                3 => current.addresses.push(xdp_address(2, 2)),
-                4 => {
-                    current.push(16, &link_body(3, 1)).unwrap();
-                    current.links[1] = current.links.pop().unwrap();
-                }
-                5 => current.rules[1].mask = 255,
-                _ => {
-                    for subnet in 0..=MAX_BROADCASTS {
-                        let mut route =
-                            local_route_body(2, 32, 3, Some(&[192, 0, subnet as u8, 255]));
-                        route[24..28].copy_from_slice(&3u32.to_ne_bytes());
-                        current.push(24, &route).unwrap();
-                    }
-                }
-            }
-            current.push(16, &body).unwrap();
-            current.links[0] = current.links.pop().unwrap();
-            assert!(
-                current.pending_xdp_carrier(&[2], &[2], 128).is_err(),
-                "non-carrier refusal {mutation} must be immediate"
-            );
-        }
-        let mut current = topology();
-        current.push(16, &link_body(4, 1)).unwrap();
-        assert!(
-            current
-                .pending_xdp_carrier(&[2], &[2], 128)
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn xdp_attach_settle_coordinator_preserves_deadline_and_failures() {
-        let start = Instant::now();
-        let deadline = start + Duration::from_secs(10);
-        let reads = std::cell::Cell::new(0);
-        let mut waited = Vec::new();
-        settle_xdp_carrier(
-            deadline,
-            |seen| {
-                assert_eq!(seen, deadline);
-                let stage = reads.get();
-                reads.set(stage + 1);
-                let mut current = topology();
-                current.links.push(xdp_link(4, true, false));
-                if stage == 0 {
-                    current.links[0].flags = 1;
-                }
-                if stage < 2 {
-                    current.links[2].flags = 1;
-                }
-                let pending = current
-                    .pending_xdp_carrier(&[2, 4], &[2, 4], 128)?
-                    .map(|link| PendingCarrier {
-                        index: link.index,
-                        name: link.name,
-                    });
-                let notification = pending.as_ref().map_or(0, |link| link.index);
-                Ok((notification, pending))
-            },
-            |notification, seen| {
-                assert_eq!(seen, deadline);
-                waited.push(notification);
-                Ok(())
-            },
-            |seen| {
-                assert_eq!(seen, Some(deadline));
-                Ok(())
-            },
-            || start,
-        )
-        .unwrap();
-        assert_eq!(waited, [2, 4]);
-        assert_eq!(reads.get(), 3);
-
-        let reads = std::cell::Cell::new(0);
-        let clock = std::cell::Cell::new(start);
-        let error = settle_xdp_carrier::<_, ()>(
-            deadline,
-            |seen| {
-                assert_eq!(seen, deadline);
-                reads.set(reads.get() + 1);
-                if reads.get() == 1 {
-                    Ok((
-                        (),
-                        Some(PendingCarrier {
-                            index: 2,
-                            name: Some(interface_name(b"dut0").unwrap()),
-                        }),
-                    ))
-                } else {
-                    clock.set(deadline);
-                    Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "topology dump deadline expired",
-                    ))
-                }
-            },
-            |(), seen| {
-                assert_eq!(seen, deadline);
-                Ok(())
-            },
-            |_| panic!("expired resnapshot must not reach final admission"),
-            || clock.get(),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(error.to_string(), "dut0: no carrier after XDP attach");
-
-        let error = settle_xdp_carrier::<_, ()>(
-            deadline,
-            |_| Ok(((), None)),
-            |(), _| panic!("ready roots must not wait"),
-            |seen| {
-                assert_eq!(seen, Some(deadline));
-                Err(unsupported("routing topology changed during admission"))
-            },
-            || start,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
-        assert_eq!(
-            error.to_string(),
-            "routing topology changed during admission"
-        );
-    }
-
-    #[test]
-    fn xdp_final_admission_preserves_expired_startup_deadline() {
-        let error = Topology::admit_until(&[2], &[2], 128, Some(Instant::now()))
-            .err()
-            .expect("expired startup must fail before opening a topology socket");
-        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-        assert_eq!(error.to_string(), "XDP topology admission deadline expired");
-    }
-
-    #[test]
-    fn marked_uplink_isolation_preserves_core_downstream_routes() {
-        let mut snapshot = topology();
-        assert!(snapshot.admit(&[2], &[2], 128).is_ok());
-        snapshot.routes[0].output = 2;
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        snapshot.routes[0].output = 3;
-        snapshot.addresses.push(xdp_address(10, 2));
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        snapshot.addresses.pop();
-        snapshot.rules[1].mask = 255;
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-        snapshot.rules[1].mask = u32::MAX;
-        snapshot.addresses.push(xdp_address(10, 3));
-        assert!(snapshot.admit(&[2], &[2], 128).is_err());
-    }
-
-    #[test]
-    fn capture_sets_require_unique_nonzero_roots_inside_logical_realm() {
-        assert!(validate_capture_sets(&[2], &[4, 2], 128).is_ok());
-        assert!(validate_capture_sets(&[], &[], 128).is_ok());
-        let mut snapshot = topology();
-        assert!(snapshot.admit(&[], &[], 128).is_ok());
-        snapshot.rules[1].mask = 255;
-        assert!(snapshot.admit(&[], &[], 128).is_err());
-        snapshot.rules[1].mask = u32::MAX;
-        snapshot.routes[0].output = 0;
-        assert!(snapshot.admit(&[], &[], 128).is_err());
-        assert!(validate_capture_sets(&[], &[], 0).is_err());
-        assert!(validate_capture_sets(&[], &[], honk_ebpf_common::CLASSIFIED_MARK).is_err());
-        for (physical, logical) in [
-            (&[][..], &[2][..]),
-            (&[2][..], &[][..]),
-            (&[0][..], &[0][..]),
-            (&[2][..], &[2, 0][..]),
-            (&[2, 2][..], &[2][..]),
-            (&[2][..], &[2, 2][..]),
-            (&[2][..], &[4][..]),
-        ] {
-            assert!(validate_capture_sets(physical, logical, 128).is_err());
-        }
-        assert!(validate_capture_sets(&[2], &[2], 0).is_err());
-        assert!(validate_capture_sets(&[2], &[2], honk_ebpf_common::CLASSIFIED_MARK).is_err());
-    }
-
-    #[test]
-    fn captured_vlan_marked_routes_are_refused_regardless_of_link_shape() {
-        for plain_up_ethernet in [false, true] {
-            let mut snapshot = topology();
-            snapshot.links.push(xdp_link(4, plain_up_ethernet, false));
-            snapshot.routes[0].output = 4;
-            assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
-        }
-    }
-
-    #[test]
-    fn external_uplink_accepts_unnumbered_captured_vlan_downstream() {
-        let mut snapshot = topology();
-        snapshot.links.push(xdp_link(4, false, false));
-        snapshot.routes.push(xdp_route(2, 254, 4, false, 1));
-        assert!(snapshot.admit(&[2], &[2, 4], 128).is_ok());
-        for family in [2, 10] {
-            snapshot.addresses.push(xdp_address(family, 4));
-            assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
-            snapshot.addresses.pop();
-        }
-        snapshot.routes.push(xdp_route(2, 255, 4, false, 2));
-        assert!(snapshot.admit(&[2], &[2, 4], 128).is_err());
-    }
-
-    #[test]
-    fn root_link_parser_distinguishes_veth_peer_from_stacked_parent() {
-        for (kind, allowed) in [
-            (b"veth\0".as_slice(), true),
-            (b"vlan\0".as_slice(), false),
-            (b"macvlan\0".as_slice(), false),
-        ] {
-            let mut body = vec![0; 16];
-            body[2..4].copy_from_slice(&1u16.to_ne_bytes());
-            body[4..8].copy_from_slice(&2u32.to_ne_bytes());
-            body[8..12].copy_from_slice(&0x10001u32.to_ne_bytes());
-            attribute(&mut body, 5, &9u32.to_ne_bytes());
-            let mut info = Vec::new();
-            attribute(&mut info, 1, kind);
-            attribute(&mut body, 18, &info);
-            let mut parsed = Snapshot::default();
-            parsed.push(16, &body).unwrap();
-            let mut snapshot = topology();
-            snapshot.links[0] = parsed.links.pop().unwrap();
-            assert_eq!(snapshot.admit(&[2], &[2], 128).is_ok(), allowed);
+            nexthops: Vec::new(),
         }
     }
 }

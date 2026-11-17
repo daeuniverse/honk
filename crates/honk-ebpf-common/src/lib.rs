@@ -11,6 +11,7 @@ pub mod redirect_need;
 pub mod routing_policy;
 pub mod tun;
 pub mod xdp;
+pub mod xdp_gateway;
 
 // Re-export types moved to sub-modules (for honk-core compatibility)
 pub use crate::conn::{

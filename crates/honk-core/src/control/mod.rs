@@ -481,6 +481,12 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
+    pub(crate) fn active_routing_plan_handle(
+        &self,
+    ) -> Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>> {
+        Arc::clone(&self.active_routing_plan)
+    }
+
     pub(crate) fn compile_routing_plan(
         config: &Config,
         router: &Router,

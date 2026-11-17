@@ -468,7 +468,7 @@ pub(crate) fn record_pname_routing(
         }),
         PnameSupport::Unavailable => Some(Issue {
             code: "pname_routing_disabled",
-            message: "cgroup v2 is unavailable; pname() conditions see no process name, so positive ones never match and negated ones always match.",
+            message: "Process names are unavailable because cgroup hooks are missing or XDP Host capture is not enabled; pname() conditions see no process name, so positive ones never match and negated ones always match.",
             reason: "cgroup_unavailable",
         }),
     };
@@ -483,6 +483,10 @@ pub(crate) fn record_pname_routing(
 pub trait PolicyBackend: Send + Sync {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
     fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
+
+    fn userspace_mut(&mut self) -> anyhow::Result<&mut userspace::UserspaceBackend> {
+        anyhow::bail!("policy backend is not the userspace backend")
+    }
 
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {

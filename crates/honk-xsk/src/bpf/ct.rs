@@ -152,7 +152,11 @@ impl Types {
             .bytes
             .get(at..at + 4)
             .ok_or_else(|| invalid_data("short kernel BTF"))?;
-        Ok(u32::from_ne_bytes(bytes.try_into().unwrap()))
+        Ok(u32::from_ne_bytes(
+            bytes
+                .try_into()
+                .map_err(|_| invalid_data("short kernel BTF word"))?,
+        ))
     }
 
     fn name(&self, offset: u32) -> io::Result<&str> {
@@ -389,7 +393,7 @@ impl Types {
                     .get(at..at + 4)
                     .ok_or_else(|| invalid_data("short split BTF"))?
                     .try_into()
-                    .unwrap(),
+                    .map_err(|_| invalid_data("short split BTF word"))?,
             ) as usize)
         };
         if module.get(..4) != Some(&[0x9f, 0xeb, 1, 0]) {

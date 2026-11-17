@@ -117,9 +117,10 @@ pub(super) fn parse_section(
                     }
                     5 => {
                         config.xsk_mode = Some(match value.unquote().raw() {
+                            "auto" => XskMode::Auto,
                             "copy" => XskMode::Copy,
                             "zerocopy" => XskMode::ZeroCopy,
-                            _ => return Err(invalid("xsk_mode must be copy or zerocopy")),
+                            _ => return Err(invalid("xsk_mode must be auto, copy or zerocopy")),
                         });
                     }
                     6 => {

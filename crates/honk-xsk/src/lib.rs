@@ -11,9 +11,10 @@ pub mod device;
 mod port;
 pub mod topology;
 
+pub use bpf::gateway::{GatewayLoad, GatewayMaps, HoldValue};
 pub use bpf::{
-    Attachment, CaptureCounters, ConntrackKfuncs, PersistentAttachment, Programs, XdpState,
-    xdp_absent, xdp_state,
+    Attachment, CaptureCounters, ConntrackKfuncs, OwnedXdpLink, PersistentAttachment, Programs,
+    XdpState, kernel_memory_bytes, xdp_absent, xdp_state,
 };
 #[cfg(feature = "host")]
 pub use bpf::{

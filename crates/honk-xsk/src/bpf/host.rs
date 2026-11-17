@@ -116,6 +116,8 @@ impl HostPrograms {
                 discover_id,
                 data_id,
                 queues: 1,
+                _gateway_fds: Vec::new(),
+                gateway_config: None,
             },
             terminal,
             terminal_id,
@@ -141,9 +143,10 @@ impl HostPrograms {
         ]
         .into_iter()
         .try_fold(0usize, |total, fd| {
-            let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))?;
+            // SAFETY: this descriptor remains owned by self throughout the readback.
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
             total
-                .checked_add(fdinfo_memlock(&info)?)
+                .checked_add(kernel_memory_bytes(borrowed)?)
                 .ok_or_else(|| invalid_data("Host kernel memory extent overflow"))
         })
     }
@@ -167,27 +170,6 @@ impl HostPrograms {
         }
         link.guard(self.terminal.as_fd(), self.terminal_guard.as_fd())
     }
-}
-
-fn fdinfo_memlock(info: &str) -> io::Result<usize> {
-    let mut charge = None;
-    for line in info.lines() {
-        if let Some(value) = line.strip_prefix("memlock:") {
-            let value = value.trim();
-            if charge.is_some()
-                || value.is_empty()
-                || !value.bytes().all(|byte| byte.is_ascii_digit())
-            {
-                return Err(invalid_data("invalid or duplicate BPF fdinfo memlock"));
-            }
-            charge = Some(
-                value
-                    .parse::<usize>()
-                    .map_err(|_| invalid_data("BPF fdinfo memlock overflow"))?,
-            );
-        }
-    }
-    charge.ok_or_else(|| invalid_data("BPF fdinfo memlock missing"))
 }
 
 /// Pinned TCX custody survives Drop; only the joined capture owner removes its pins.

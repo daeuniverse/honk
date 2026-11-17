@@ -9,7 +9,7 @@ use tokio::{
 mod adaptive;
 
 const PEER: &str = r#"
-import contextlib, os, socket, struct, sys, time
+import contextlib, ctypes, os, socket, struct, sys, time
 
 home = os.open('/proc/self/ns/net', os.O_RDONLY)
 @contextlib.contextmanager
@@ -27,6 +27,11 @@ with namespace('client'):
     client.bind(('c0', 0))
     # The UDP pump must not fill the TCP witness queue with local transmissions.
     client.setsockopt(263, 23, 1)
+    # Nor with incoming pump replies: keep only IPv4 TCP from 198.51.100.2, the only frames reply() reads.
+    witness = ctypes.create_string_buffer(b''.join(struct.pack('HBBI', *insn) for insn in (
+        (0x28, 0, 0, 12), (0x15, 0, 5, 0x0800), (0x30, 0, 0, 23), (0x15, 0, 3, 6),
+        (0x20, 0, 0, 26), (0x15, 0, 1, 0xc6336402), (0x06, 0, 0, 0x40000), (0x06, 0, 0, 0))))
+    client.setsockopt(socket.SOL_SOCKET, 26, struct.pack('HL', 8, ctypes.addressof(witness)))
 with namespace('server'):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -55,9 +60,14 @@ def send(protocol, body, source='192.0.2.99'):
     ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
     client.send(bytes.fromhex('0200000000100200000000200800') + ip + body)
 
+def backlog_drops():
+    with open('/proc/net/softnet_stat') as stat:
+        return sum(int(line.split()[1], 16) for line in stat)
+
 def receive(sock, protocol, source, destination, deadline=None):
     deadline = time.monotonic() + 8 if deadline is None else deadline
     observed = 0
+    backlog = backlog_drops()
     while True:
         try:
             left = deadline - time.monotonic()
@@ -70,7 +80,7 @@ def receive(sock, protocol, source, destination, deadline=None):
             packets, dropped = struct.unpack('=II', sock.getsockopt(263, 6, 8))
             raise RuntimeError(('packet witness timeout', protocol, source, destination,
                                 'observed', observed, 'socket_packets', packets,
-                                'socket_drops', dropped)) from error
+                                'socket_drops', dropped, 'backlog_drops', backlog_drops() - backlog)) from error
         if peer[2] == 4 or packet[12:14] != b'\x08\x00':
             continue
         ip = packet[14:]
@@ -297,12 +307,23 @@ async fn start_runtime(
     let (polling_publication, process_polling) =
         plane.polling_runtime().expect("explicit XDP fixture");
     let shutdown = plane.shutdown_intent();
+    let backend = plane.policy_backend_handle();
+    let active_plan = plane.active_routing_plan_handle();
     let prepared = prepare(&plane, config, pins, Arc::clone(&admission)).await?;
     #[cfg(feature = "ebpf")]
     let host = prepared.host;
     let PreparedRuntime {
         devices,
         topology,
+        capture_plan,
+        gateway,
+        gateway_maps,
+        zones,
+        local_addresses,
+        local_memory,
+        kernel_memory,
+        realm_scopes,
+        plan_memory,
         realms: plans,
         scope_pairs: scopes,
         workers,
@@ -310,7 +331,7 @@ async fn start_runtime(
         core,
         memory,
         staging,
-        mut links,
+        links,
         polling_prefix,
         polling_budget,
         diagnostics,
@@ -329,11 +350,27 @@ async fn start_runtime(
             else {
                 continue;
             };
+            let members: Vec<usize> = workers
+                .placements
+                .lock()
+                .iter()
+                .filter(|placement| placement.realm.scope() == scope)
+                .map(|placement| placement.device)
+                .collect();
+            let generated = (members.len() == 1)
+                .then(|| generated_layout(link))
+                .flatten();
             let realm = Realm {
+                realm_id: *realm_scopes
+                    .iter()
+                    .find(|(_, value)| **value == scope)
+                    .expect("prepared scope realm")
+                    .0,
+                members,
                 ingress,
                 device,
                 link,
-                generated: generated_layout(link),
+                generated,
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             };
@@ -351,6 +388,18 @@ async fn start_runtime(
     let mut runtime = Runtime {
         devices,
         topology,
+        capture_plan: Some(capture_plan),
+        capture_plan_memory: Some(plan_memory),
+        topology_lost: false,
+        gateway,
+        gateway_maps,
+        zones,
+        links,
+        local_addresses,
+        local_memory,
+        _kernel_memory: kernel_memory,
+        realm_scopes,
+        hold_collector: HoldCollector,
         #[cfg(feature = "ebpf")]
         host,
         admission,
@@ -413,39 +462,49 @@ async fn start_runtime(
     }
     for device in &mut runtime.devices {
         std::fs::write(
-            artifacts.join(format!("driven-runtime.{}.guard-id", device.info.name)),
-            device.programs.discover_prog_id().to_string(),
+            artifacts.join(format!("driven-runtime.{}.data-id", device.info.name)),
+            device.programs.data_prog_id().to_string(),
         )?;
-        device.attachment.replace(&device.programs)?;
+        device
+            .attachment
+            .as_ref()
+            .context("owned XDP link")?
+            .replace(device.programs.discover_fd(), device.programs.data_fd())?;
+        if let Some(publisher) = &runtime.gateway {
+            publisher.register(
+                device.info.ifindex,
+                device.attachment.take().context("owned XDP link")?,
+                Arc::clone(&device.programs),
+                GatewayReload {
+                    capture: device.capture.clone(),
+                    queues: device.info.queues.last().copied().context("RX queues")? + 1,
+                    ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
+                },
+            );
+        }
         device.active = true;
     }
     runtime.diagnostics.lifecycle(Lifecycle::Active);
-    let indices: Vec<_> = runtime
-        .devices
-        .iter()
-        .map(|device| device.info.ifindex)
-        .collect();
-    let logical: Vec<_> = runtime
-        .realms
-        .iter()
-        .map(|realm| realm.ingress.ifindex)
-        .collect();
-    let topology =
-        runtime.admit_final_topology(&indices, &logical, config.global.effective_so_mark())?;
+    let topology = runtime.admit_final_topology()?;
     ensure!(topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts());
-    // SAFETY: this is the same owned, stable Topology descriptor used by production run.
+    // SAFETY: production and the fixture retain the watcher's stable descriptor.
     runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-    links.synchronize()?;
-    links.validate_capture(&indices)?;
-    assert_eq!(
-        links
-            .logical_links()
-            .filter(|link| indices.contains(&link.path.physical_ifindex))
-            .count(),
-        runtime.realms.len()
-    );
-    for realm in &runtime.realms {
-        assert!(links.logical_links().any(|link| link == realm.link));
+    for device in &runtime.devices {
+        runtime
+            .topology
+            .get_mut()
+            .expect_program(device.info.ifindex, device.programs.data_prog_id());
+    }
+    if let Some(publisher) = &runtime.gateway {
+        let mut backend = backend.write().await;
+        let plan = active_plan.read().clone();
+        if plan.policy_fingerprint != publisher.fingerprint() {
+            publisher.publish(&plan)?;
+        }
+        backend
+            .userspace_mut()?
+            .install_gateway(Some(Arc::clone(publisher)))?;
+        publisher.commit();
     }
     let zero_copy = config
         .datapath
@@ -465,10 +524,20 @@ async fn start_runtime(
             );
         }
     }
-    ensure!(!runtime.topology.get_mut().check_changed()?);
+    current_topology(
+        &mut runtime.topology,
+        runtime.gateway.as_deref(),
+        &runtime.devices,
+        &mut runtime.topology_lost,
+    )?;
+    runtime.capture_plan.take();
+    runtime.capture_plan_memory.take();
     runtime.rebuild_polling_context();
     #[cfg(feature = "ebpf")]
     if let Some(host) = &mut runtime.host {
+        if let Some(publisher) = &runtime.gateway {
+            host.capture.set_gateway(Arc::clone(publisher))?;
+        }
         host.admit(&runtime.pname_support)?;
     }
     runtime.admission.store(true, Ordering::Release);
@@ -484,6 +553,16 @@ struct PolicyWait<'a, R> {
     resumed: Option<u64>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Hold {
+    Released,
+    /// The writer is held and the cold packet was just sent: its ingress may still be in
+    /// flight or in the worker handoff, so keep driving until the real reader is pending.
+    Contend,
+    /// Contention is established; stream work must neither resolve nor replace the reader.
+    Held,
+}
+
 async fn drive_until<'policy, T, R>(
     runtime: &mut Runtime,
     owner: &mut PacketEndpointOwner,
@@ -491,7 +570,7 @@ async fn drive_until<'policy, T, R>(
     acquire: impl Fn() -> R,
     shutdown: &crate::control::ShutdownIntent,
     event: impl Future<Output = anyhow::Result<T>>,
-    held_publication: bool,
+    hold: Hold,
 ) -> anyhow::Result<T>
 where
     R: Future<Output = PolicyRead<'policy>>,
@@ -503,7 +582,7 @@ where
     let mut pending_reader = false;
     let mut armed_driver_timer = false;
     let control = runtime.polling.test_control();
-    if held_publication {
+    if hold != Hold::Released {
         control.clear_pending();
     }
     loop {
@@ -516,8 +595,13 @@ where
         {
             armed_driver_timer = true;
         }
-        if output.is_some() && (held_publication || policy.reader.is_none()) {
-            if held_publication {
+        let finished = match hold {
+            Hold::Released => policy.reader.is_none(),
+            Hold::Contend => false,
+            Hold::Held => true,
+        };
+        if output.is_some() && finished {
+            if hold == Hold::Held {
                 assert!(
                     pending_reader,
                     "the real Core reader must contend during stream work"
@@ -533,7 +617,9 @@ where
             }
             return Ok(output.take().unwrap());
         }
-        if held_publication && let Some(read) = policy.reader.as_mut().as_pin_mut() {
+        if hold != Hold::Released
+            && let Some(read) = policy.reader.as_mut().as_pin_mut()
+        {
             assert!(
                 futures::poll!(read).is_pending(),
                 "actual publication reader escaped its writer"
@@ -544,6 +630,9 @@ where
                 policy.blocked = Some(policy.started);
             }
             pending_reader = true;
+        }
+        if hold == Hold::Contend && pending_reader && output.is_some() {
+            return Ok(output.take().unwrap());
         }
         let retained_core = runtime.waiting.len();
         let started = std::cell::Cell::new(policy.started);
@@ -562,6 +651,9 @@ where
                     anyhow::bail!("real endpoint supervisor ended before capture close");
                 }
             }
+            // A turn that acquired the reader awaits it or new device work; with the writer
+            // held and no stream traffic yet, neither arrives, so re-check from outside.
+            () = tokio::time::sleep(Duration::from_millis(1)), if hold == Hold::Contend && output.is_some() => {}
         }
         policy.started = started.get();
         if policy.blocked == Some(policy.started)
@@ -569,7 +661,7 @@ where
             && runtime.waiting.is_empty()
             && policy.reader.is_none()
         {
-            assert!(!held_publication, "the real writer is still held");
+            assert!(hold == Hold::Released, "the real writer is still held");
             policy.resumed = Some(policy.started);
         }
     }
@@ -662,15 +754,31 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         };
         for label in ["router", "config"] {
             peer.command("CONNECT", label).await?;
-            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("CONNECTED {label}")), false).await?;
+            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("CONNECTED {label}")), Hold::Released).await?;
             let client = format!("192.0.2.99:{}", selected_ports[usize::from(label == "config")]).parse().unwrap();
             let destination = "198.51.100.2:18084".parse().unwrap();
             assert!(runtime.realms.iter().any(|realm| runtime.endpoints.retains(realm.driver.scope(), client, destination, 6)), "real captured TCP belongs to Endpoint, not native/Core forwarding");
             let router_writer = if label == "router" { Some(router.write().await) } else { None };
             let config_writer = if label == "config" { Some(publication.write().await) } else { None };
-            let active = async {
+            let cold = async {
                 peer.command("COLD", label).await?;
-                peer.expect(&format!("COLD {label}")).await?;
+                peer.expect(&format!("COLD {label}")).await
+            };
+            tokio::time::timeout(
+                Duration::from_secs(8),
+                drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, cold, Hold::Contend),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the cold Core packet never reached the held policy reader: waiting={} pending={} reader={} pressure={:?}",
+                    runtime.waiting.len(),
+                    runtime.pending.len(),
+                    policy.reader.is_some(),
+                    runtime.pressure.counters,
+                )
+            })??;
+            let active = async {
                 peer.command("APP", label).await?;
                 peer.expect(&format!("APP {label}")).await?;
                 peer.command("RETRANSMIT", label).await?;
@@ -678,7 +786,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
                 peer.command("CLOSE", label).await?;
                 peer.expect(&format!("CLOSED {label}")).await
             };
-            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, active, true).await?;
+            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, active, Hold::Held).await?;
             assert_eq!(runtime.waiting.len(), 1, "the captured cold Core packet remains behind publication while the stream finishes");
             let queued = policy.blocked.expect("the publication writer queued a real reader");
             assert_eq!(policy.started, queued);
@@ -686,7 +794,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
             assert_ne!(policy.resumed, Some(queued));
             drop((router_writer, config_writer));
             peer.command("FORWARDED", label).await?;
-            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("FORWARDED {label}")), false).await?;
+            drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("FORWARDED {label}")), Hold::Released).await?;
             assert_eq!(policy.resumed, Some(queued), "the original queued acquisition completed after writer release, not a replacement reader");
         }
         }
@@ -712,13 +820,14 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         ).await?;
         if let Some(worker) = &mut runtime.worker { worker.join().await?; }
         for device in &mut runtime.devices {
-            assert_eq!(honk_xsk::xdp_state(device.info.ifindex)?.prog_id, device.programs.discover_prog_id());
+            assert!(honk_xsk::xdp_absent(device.info.ifindex)?);
             for queue in device.queues.drain(..) {
                 let mut port = queue.io.into_inner();
                 assert_eq!(port.counters().submitted, port.counters().completed);
                 assert!(port.close().ready_for_backend_teardown());
                 port.close_socket();
             }
+            device.vlan_offload.restore()?;
         }
         #[cfg(feature = "ebpf")]
         if let Some(host) = runtime.host.take() {

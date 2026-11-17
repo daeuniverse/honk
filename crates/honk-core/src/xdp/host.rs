@@ -360,18 +360,18 @@ impl HostCapture {
         for (_, program) in object.bpf.programs() {
             if let Ok(fd) = program.fd() {
                 kernel_bytes = kernel_bytes
-                    .checked_add(sys::memory_bytes(fd.as_fd())?)
+                    .checked_add(honk_xsk::kernel_memory_bytes(fd.as_fd())?)
                     .context("Host program memory overflow")?;
             }
         }
         for (name, _) in object.bpf.maps() {
             kernel_bytes = kernel_bytes
-                .checked_add(sys::memory_bytes(object.map(name)?)?)
+                .checked_add(honk_xsk::kernel_memory_bytes(object.map(name)?)?)
                 .context("Host map memory overflow")?;
         }
         for fd in [source.source().0, source.guard().0, source.selector().0] {
             kernel_bytes = kernel_bytes
-                .checked_add(sys::memory_bytes(fd)?)
+                .checked_add(honk_xsk::kernel_memory_bytes(fd)?)
                 .context("Host raw program memory overflow")?;
         }
         ensure!(
@@ -573,6 +573,12 @@ impl HostCapture {
         .encode(&mut header[14..54])
         .context("Host return header extent")?;
         Ok(54)
+    }
+    pub(super) fn set_gateway(
+        &self,
+        publisher: Arc<crate::xdp::gateway::GatewayPublisher>,
+    ) -> anyhow::Result<()> {
+        self.custody[0].set_gateway(publisher)
     }
 
     pub(super) fn validate_current(&mut self) -> anyhow::Result<()> {

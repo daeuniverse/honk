@@ -1,5 +1,5 @@
 use super::*;
-use crate::control::netstack::FragmentPeer;
+use crate::control::netstack::{FragmentPeer, fragment_offset_zero};
 use crate::xdp::worker::PeerHold;
 use honk_netstack::FragmentInfo;
 
@@ -62,6 +62,9 @@ impl RoutedCore {
             }
         };
         if let Some(info) = fragment.filter(|info| info.incarnation.is_some()) {
+            let is_offset_zero = fragment_offset_zero(segments).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid fragment header")
+            })?;
             let peers = self
                 .fragment_peers
                 .as_mut()
@@ -78,9 +81,9 @@ impl RoutedCore {
                         .expect("exact fragment peer incarnation")
                         .1
                 }
-                None => FragmentPeer::new(info, peer.take()),
+                None => FragmentPeer::new(info, None),
             };
-            entry.observe(info, ingress_at, peer.take());
+            let poisoned = entry.observe(info, is_offset_zero, peer.take()).is_err();
             for cell in &mut peers.cells {
                 if cell.as_ref().is_some_and(|(owned, retained)| {
                     !self.core.retains_fragment(*owned, retained.info)
@@ -89,6 +92,9 @@ impl RoutedCore {
                 }
             }
             if packet.is_some() {
+                if poisoned {
+                    return Ok(None);
+                }
                 peer = entry.peer;
             } else if self.core.retains_fragment(ingress, info) {
                 let cell = peers
@@ -99,6 +105,9 @@ impl RoutedCore {
                         io::Error::new(io::ErrorKind::WouldBlock, "Core fragment peer capacity")
                     })?;
                 *cell = Some((ingress, entry));
+            }
+            if poisoned {
+                return Ok(None);
             }
         }
         self.reap_fragment_peers();
@@ -136,6 +145,143 @@ impl RoutedCore {
                     cell.take();
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xdp::routing_input::{test_fragments, test_peer};
+    use std::time::Duration;
+
+    async fn core() -> (RoutedCore, Ingress) {
+        let mut config = honk_config::Config::default();
+        config.global.dial_mode = "ip".into();
+        config.ensure_builtin_nodes();
+        let plane = crate::control::tests::support::control_plane(config);
+        let authority = plane
+            .core_forward_policy(Execution::MixedEndpoints)
+            .await
+            .unwrap();
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None).unwrap();
+        let ingress = Ingress {
+            scope: honk_datapath::ScopeId::allocate().unwrap(),
+            namespace: socket_namespace(std::os::fd::AsFd::as_fd(&socket)).unwrap(),
+            ifindex: 2,
+            attachment: 1,
+            mark: MarkProvenance::BeforeSkb,
+        };
+        let budget = MemoryBudget::new(32 << 20);
+        let mut core =
+            super::super::tests::unsynchronized_core(authority, &[ingress], &budget, None);
+        core.prepare_fragment_peers().unwrap();
+        (core, ingress)
+    }
+
+    #[tokio::test]
+    async fn core_mixed_mac_completion_never_dispatches_and_poison_expires() {
+        let (mut core, ingress) = core().await;
+        let now = Instant::now();
+        let fragments = test_fragments();
+        for (index, mac) in [(0, [2; 6]), (1, [4; 6]), (2, [2; 6])] {
+            assert!(
+                core.receive_segments_with_peer_at(
+                    ingress,
+                    now,
+                    now,
+                    &[&fragments[index]],
+                    Some(test_peer(1, 0, mac, 7))
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        assert!(core.fragments_quiescent());
+        assert!(
+            core.fragment_peers
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .all(Option::is_none)
+        );
+        for (index, mac) in [(1, [2; 6]), (2, [4; 6])] {
+            assert!(
+                core.receive_segments_with_peer_at(
+                    ingress,
+                    now,
+                    now,
+                    &[&fragments[index]],
+                    Some(test_peer(1, 0, mac, 7))
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let retained = core.budget.used();
+        core.core.retire(now + Duration::from_secs(31));
+        core.reap_fragment_peers();
+        assert!(core.fragments_quiescent());
+        assert!(
+            core.budget.used() < retained,
+            "bounded reassembler reclaims poisoned bytes"
+        );
+        assert!(
+            core.fragment_peers
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    #[tokio::test]
+    async fn core_fragment_zero_selects_original_member_and_rejects_other_realms() {
+        let (mut core, ingress) = core().await;
+        let now = Instant::now();
+        let fragments = test_fragments();
+        for index in [1, 0] {
+            let fragment = &fragments[index];
+            let segments = [&fragment[..7], &fragment[7..]];
+            assert!(
+                core.receive_segments_with_peer_at(
+                    ingress,
+                    now,
+                    now,
+                    &segments,
+                    Some(test_peer(1, index, [2; 6], 7))
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let (packet, peer) = core
+            .receive_segments_with_peer_at(
+                ingress,
+                now,
+                now,
+                &[&fragments[2]],
+                Some(test_peer(1, 2, [2; 6], 7)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(peer.unwrap().original_path().device, 0);
+        drop(packet);
+        for (index, realm) in [(0, 1), (1, 2), (2, 1)] {
+            assert!(
+                core.receive_segments_with_peer_at(
+                    ingress,
+                    now,
+                    now,
+                    &[&fragments[index]],
+                    Some(test_peer(realm, index, [2; 6], 7))
+                )
+                .unwrap()
+                .is_none()
+            );
         }
     }
 }

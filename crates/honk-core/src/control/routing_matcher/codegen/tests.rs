@@ -4,6 +4,8 @@ use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
 use honk_config::types::DialMode;
 use serde_json::json;
 
+mod gateway;
+
 fn fields(insn: &bpf_insn) -> (u32, u8, u8, i16, i32) {
     (
         insn.code as u32,

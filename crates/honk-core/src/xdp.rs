@@ -1,11 +1,15 @@
 //! One Linux capture owner for every selected RX queue and one routing domain.
-//! Retained attachments and program pins guard selected traffic after shutdown; UMEM stays until exit.
+//! Physical links are owned by FDs: exit detaches them and the kernel resumes forwarding; UMEM stays until exit.
 
+pub(crate) mod gateway;
 #[cfg(feature = "ebpf")]
 pub(crate) mod host;
 #[cfg(feature = "ebpf")]
 mod host_runtime;
 pub(crate) mod polling;
+pub(crate) mod routing_input;
+pub(crate) mod timens;
+mod topology;
 pub(crate) mod worker;
 use crate::control::poll_budget::BusyInterval;
 #[cfg(feature = "ebpf")]
@@ -30,6 +34,7 @@ use crate::control::{
 use crate::netlink::fib::{Fib, LogicalLink};
 use crate::stats::xdp::{Diagnostics, Lifecycle, QueueObservation};
 use anyhow::{Context as _, ensure};
+use gateway::{GatewayPolicy, GatewayPublisher, GatewayReload, HoldCollector, ZoneAdmission};
 use honk_config::{
     Config,
     datapath::{Backend, DirectProfile, XskMode},
@@ -42,15 +47,15 @@ use honk_datapath::{
     },
 };
 use honk_ebpf_common::xdp::{CaptureAuthority, METADATA_LEN};
+use honk_ebpf_common::xdp_gateway::LocalAddressKey;
 use honk_netstack::{
     MemoryBudget, MemoryReservation,
     wire::{self, PacketView},
 };
 use honk_xsk::{
-    BindMode, DecodedPacket, FRAME_SIZE, GeneralCapture, PersistentAttachment, Port, PortConfig,
+    BindMode, DecodedPacket, FRAME_SIZE, GeneralCapture, OwnedXdpLink, Port, PortConfig,
     PortCounters, Programs, RingSnapshot,
-    device::{DeviceInfo, FeatureQuery},
-    topology::Topology,
+    device::{DeviceInfo, FeatureQuery, VlanOffload, prepare_vlan_offload, select_xsk_mode},
 };
 use std::{
     collections::VecDeque,
@@ -68,6 +73,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 use tokio::io::unix::AsyncFd;
+use topology::{CapturePlan, CaptureTopology, TopologyEvent};
 
 const PENDING: usize = 64;
 const PEERS: usize = 4096;
@@ -122,17 +128,6 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
                 .all(|rule| rule.mark.unwrap_or(0) == 0),
         "XDP cannot execute traffic mark effects"
     );
-    for rule in &config.routing.rules {
-        let condition = &rule.condition;
-        ensure!(
-            condition.mac.is_empty()
-                && condition.not.mac.is_empty()
-                && (datapath.host.is_some()
-                    || (condition.process_name.is_empty()
-                        && condition.not.process_name.is_empty())),
-            "XDP routing requires Host capture for process predicates and has no per-flow MAC authority"
-        );
-    }
     let security_conditions = datapath
         .firewall
         .iter()
@@ -249,13 +244,44 @@ struct Device {
     info: Arc<DeviceInfo>,
     capture: GeneralCapture,
     programs: Arc<Programs>,
-    attachment: Arc<PersistentAttachment>,
+    attachment: Option<OwnedXdpLink>,
+    vlan_offload: VlanOffload,
     queues: Vec<Queue>,
     active: bool,
     metadata_checked: Instant,
     features: Option<FeatureQuery>,
     port_config: PortConfig,
     role: honk_config::datapath::InterfaceRole,
+}
+
+struct StartupDevices(Vec<Device>);
+
+impl std::ops::Deref for StartupDevices {
+    type Target = Vec<Device>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for StartupDevices {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for StartupDevices {
+    fn drop(&mut self) {
+        for device in self.0.iter_mut().rev() {
+            if let Some(link) = device.attachment.take()
+                && let Err(error) = link.detach()
+            {
+                tracing::error!(%error, "XDP startup link detach failed");
+            }
+            if let Err(error) = device.vlan_offload.restore() {
+                tracing::error!(%error, "XDP startup VLAN restore failed");
+            }
+        }
+    }
 }
 
 struct Waiting {
@@ -276,16 +302,17 @@ struct Pending {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ReturnPath {
-    device: usize,
-    mac: [u8; 6],
-    vlan_tci: [u16; 2],
-    vlan_proto: [u16; 2],
-    vlan_count: u8,
+    pub(crate) realm: u32,
+    pub(crate) device: usize,
+    pub(crate) mac: [u8; 6],
+    pub(crate) vlan_tci: [u16; 2],
+    pub(crate) vlan_proto: [u16; 2],
+    pub(crate) vlan_count: u8,
 }
 
 impl ReturnPath {
-    fn same_identity(self, other: Self) -> bool {
-        self.device == other.device
+    pub(crate) fn same_identity(self, other: Self) -> bool {
+        self.realm == other.realm
             && self.mac == other.mac
             && self.vlan_proto == other.vlan_proto
             && self.vlan_count == other.vlan_count
@@ -454,6 +481,8 @@ impl Pressure {
     }
 }
 struct Realm {
+    realm_id: u32,
+    members: Vec<usize>,
     ingress: Ingress,
     device: usize,
     link: LogicalLink,
@@ -503,8 +532,9 @@ impl Realm {
         physical_ifindex: u32,
         ipv6: bool,
     ) -> io::Result<honk_datapath::forward::EthernetHeader> {
-        if path.device != self.device
-            || physical_ifindex != self.link.path.physical_ifindex
+        if path.realm != self.realm_id
+            || !self.members.contains(&path.device)
+            || (self.members.len() == 1 && physical_ifindex != self.link.path.physical_ifindex)
             || path.vlan_count != self.link.path.vlan_count
             || path.vlan_proto != self.link.path.vlan_proto
             || !path
@@ -583,9 +613,90 @@ fn fold_capture_result(failure: &mut Option<anyhow::Error>, result: anyhow::Resu
     }
 }
 
+fn service_member_output(
+    realm: &mut Realm,
+    cx: &mut Context<'_>,
+    closing: bool,
+    endpoints: &PacketEndpoints,
+    mut submit: impl FnMut(&Realm, TxClass, ReturnPath, OutputLease) -> io::Result<Option<OutputLease>>,
+) -> anyhow::Result<usize> {
+    let mut serviced = 0;
+    for (index, class) in [TxClass::Control, TxClass::Bulk].into_iter().enumerate() {
+        for _ in 0..BATCH {
+            let mut outputs = [None];
+            let (selected, retained_path) = realm.poll_outputs(cx, class, 1, &mut outputs);
+            match selected {
+                Poll::Ready(Some(1)) => {}
+                Poll::Ready(None) if !closing && !endpoints.is_closing() => {
+                    anyhow::bail!("XDP packet scope ended before endpoint close")
+                }
+                _ => break,
+            }
+            let output = outputs[0].take().expect("one selected Endpoint output");
+            let path = retained_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()));
+            if closing || path.is_none() {
+                serviced += 1;
+                continue;
+            }
+            let path = path.expect("checked retained return path");
+            if let Some(output) = submit(realm, class, path, output)? {
+                realm.pending[index] = Some((output, path));
+                break;
+            }
+            serviced += 1;
+        }
+    }
+    Ok(serviced)
+}
+
+fn submit_member_output(
+    realm: &Realm,
+    port: &mut Port<Retained>,
+    ifindex: u32,
+    class: TxClass,
+    path: ReturnPath,
+    output: OutputLease,
+) -> io::Result<Option<OutputLease>> {
+    let header = realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
+    let length = header.len() + output.packet().len();
+    if !port.tx_packet_credit(class, length) {
+        return Ok(Some(output));
+    }
+    port.transmit_with(
+        class,
+        length,
+        Retained::Endpoint(output.into_owner()),
+        |owner, target| {
+            let Retained::Endpoint(owner) = owner else {
+                return Err(io::Error::other("wrong Endpoint output owner"));
+            };
+            fill_output(
+                target,
+                &header,
+                owner
+                    .packet()
+                    .ok_or_else(|| io::Error::other("missing Endpoint CPU packet"))?,
+            )
+        },
+    )?;
+    Ok(None)
+}
+
 struct Runtime {
     devices: Vec<Device>,
-    topology: AsyncFd<Topology>,
+    topology: AsyncFd<CaptureTopology>,
+    topology_lost: bool,
+    capture_plan: Option<CapturePlan>,
+    capture_plan_memory: Option<MemoryReservation>,
+    gateway: Option<Arc<GatewayPublisher>>,
+    gateway_maps: Option<Arc<honk_xsk::GatewayMaps>>,
+    zones: Option<ZoneAdmission>,
+    links: Fib,
+    local_addresses: Vec<LocalAddressKey>,
+    local_memory: Option<MemoryReservation>,
+    _kernel_memory: Vec<MemoryReservation>,
+    hold_collector: HoldCollector,
+    realm_scopes: std::collections::HashMap<u32, ScopeId>,
     #[cfg(feature = "ebpf")]
     host: Option<HostRuntime>,
     admission: Arc<AtomicBool>,
@@ -622,13 +733,83 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn admit_final_topology(
-        &self,
-        physical: &[u32],
-        logical: &[u32],
-        mark: u32,
-    ) -> io::Result<Topology> {
-        Topology::admit_after_xdp_attach(physical, logical, mark)
+    fn admit_final_topology(&self) -> io::Result<CaptureTopology> {
+        CaptureTopology::admit(
+            self.capture_plan
+                .as_ref()
+                .ok_or_else(|| io::Error::other("capture plan already released"))?,
+        )
+    }
+
+    fn refresh_local_addresses(&mut self) -> anyhow::Result<()> {
+        self.links.poll_changes()?;
+        match self.links.state() {
+            crate::netlink::fib::FibState::Desynchronized => {
+                anyhow::bail!("XDP local address authority desynchronized")
+            }
+            crate::netlink::fib::FibState::Synchronizing => self.links.synchronize()?,
+            crate::netlink::fib::FibState::Ready => {}
+        }
+        let Some(maps) = &self.gateway_maps else {
+            return Ok(());
+        };
+        let mut addresses: Vec<_> = self
+            .links
+            .local_addresses()
+            .map(LocalAddressKey::from)
+            .collect();
+        addresses.sort_unstable_by_key(|key| (key.family, key.address));
+        addresses.dedup();
+        if addresses != self.local_addresses {
+            let bytes = honk_xsk::kernel_memory_bytes(maps.local_map_fd()?.as_fd())?;
+            let memory = self
+                .polling_budget
+                .reserve(bytes)
+                .context("gateway local map replacement capacity")?;
+            maps.replace_local_addresses(&addresses)?;
+            self.local_memory = Some(memory);
+            self.local_addresses = addresses;
+        }
+        Ok(())
+    }
+
+    fn maintain_gateway(&mut self, now: Instant) -> anyhow::Result<()> {
+        if self.gateway_maps.is_none()
+            || now.duration_since(self.core_maintenance_checked) < Duration::from_secs(1)
+        {
+            return Ok(());
+        }
+        if let Some(zones) = &mut self.zones {
+            zones.revalidate(&self.polling_budget)?;
+        }
+        self.refresh_local_addresses()?;
+        let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
+        // SAFETY: clock_gettime initializes one timespec on success.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, clock.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error().into());
+        }
+        // SAFETY: the successful syscall initialized clock.
+        let clock = unsafe { clock.assume_init() };
+        let now_ns = u64::try_from(clock.tv_sec)?
+            .checked_mul(1_000_000_000)
+            .and_then(|seconds| seconds.checked_add(clock.tv_nsec as u64))
+            .context("MONOTONIC clock overflow")?;
+        if let Some(maps) = &self.gateway_maps {
+            ensure!(
+                maps.lookup_errors()? == 0,
+                "conntrack lookup contract failure"
+            );
+            let scopes = &self.realm_scopes;
+            let endpoints = &self.endpoints;
+            self.hold_collector
+                .sweep(maps, now_ns, &mut |realm, source| {
+                    scopes
+                        .get(&realm)
+                        .is_none_or(|scope| endpoints.retains_source(*scope, source))
+                })?;
+        }
+        self.core_maintenance_checked = now;
+        Ok(())
     }
 
     fn sample_queues(&self) {
@@ -676,6 +857,11 @@ impl Runtime {
     }
 
     fn close_capture(&mut self) -> anyhow::Result<()> {
+        if self.topology_lost {
+            for device in &mut self.devices {
+                device.vlan_offload.abandon();
+            }
+        }
         self.admission.store(false, Ordering::Release);
         self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
@@ -685,14 +871,17 @@ impl Runtime {
         self.context_recheck = false;
         self.polling.leave("closing");
         let mut failure: Option<anyhow::Error> = None;
-        for device in &mut self.devices {
+        if let Some(gateway) = &self.gateway {
+            fold_capture_result(&mut failure, gateway.detach_all().map_err(Into::into));
+        }
+        for device in self.devices.iter_mut().rev() {
             let result = close_device_capture_with(
                 device,
                 |device| {
-                    if device_needs_guard(device) {
-                        device.attachment.guard(&device.programs)?;
-                        device.active = false;
+                    if let Some(link) = device.attachment.take() {
+                        link.detach()?;
                     }
+                    device.active = false;
                     Ok(())
                 },
                 |device| {
@@ -750,11 +939,33 @@ impl Runtime {
             if let Err(error) = arm_read(&self.topology, cx) {
                 return Poll::Ready(Err(error.into()));
             }
-            if let Err(error) = current_topology(&mut self.topology) {
-                return Poll::Ready(Err(error.into()));
+            match current_topology(
+                &mut self.topology,
+                self.gateway.as_deref(),
+                &self.devices,
+                &mut self.topology_lost,
+            ) {
+                Ok(TopologyEvent::AddressDirty) => {
+                    if let Err(error) = self.refresh_local_addresses() {
+                        for device in &mut self.devices {
+                            device.vlan_offload.abandon();
+                        }
+                        return Poll::Ready(Err(error));
+                    }
+                }
+                Ok(TopologyEvent::Quiet) => {}
+                Err(error) => {
+                    for device in &mut self.devices {
+                        device.vlan_offload.abandon();
+                    }
+                    return Poll::Ready(Err(error.into()));
+                }
             }
         }
         let now = Instant::now();
+        if !self.closing {
+            self.maintain_gateway(now)?;
+        }
         let mut progress = self.poll_handoffs(cx, now)?;
         self.round_cut_short = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
@@ -835,12 +1046,12 @@ impl Runtime {
                             return;
                         };
                         if decoded.destination_mac[0] & 1 != 0 { return; }
-                        let Some(realm) = realms.iter().find(|realm| realm.device == device_index && realm.link.path.vlan_count == decoded.vlan_count
+                        let Some(realm) = realms.iter().find(|realm| realm.members.contains(&device_index) && realm.link.path.vlan_count == decoded.vlan_count
                             && realm.link.path.vlan_proto == decoded.vlan_proto && realm.link.path.vlan_tci.iter().zip(decoded.vlan_tci).all(|(configured, captured)| configured & 0x0fff == captured & 0x0fff)) else { return; };
                         if decoded.destination_mac != realm.link.mac { return; }
                         let scope = realm.driver.scope();
                         let ingress = realm.ingress;
-                        let path = ReturnPath { device: device_index, mac: decoded.source_mac, vlan_tci: decoded.vlan_tci, vlan_proto: decoded.vlan_proto, vlan_count: decoded.vlan_count };
+                        let path = ReturnPath { realm: realm.realm_id, device: device_index, mac: decoded.source_mac, vlan_tci: decoded.vlan_tci, vlan_proto: decoded.vlan_proto, vlan_count: decoded.vlan_count };
                         let mut l3 = [&[][..]; 18];
                         let Some(count) = l3_segments(segments, decoded, &mut l3) else { return; };
                         let Ok(view) = PacketView::new(&l3[..count]) else { return; };
@@ -984,6 +1195,35 @@ impl Runtime {
             }
             let realm_count = self.realms.len();
             let realm = &mut self.realms[realm_index];
+            if realm.members.len() > 1 {
+                let devices = &mut self.devices;
+                progress += service_member_output(
+                    realm,
+                    cx,
+                    self.closing,
+                    &self.endpoints,
+                    |realm, class, path, output| {
+                        let device = devices
+                            .get_mut(path.device)
+                            .ok_or_else(|| io::Error::other("retained output member missing"))?;
+                        let ifindex = device.info.ifindex;
+                        let queue = device
+                            .queues
+                            .first_mut()
+                            .ok_or_else(|| io::Error::other("retained output queue missing"))?;
+                        submit_member_output(
+                            realm,
+                            queue.io.get_mut(),
+                            ifindex,
+                            class,
+                            path,
+                            output,
+                        )
+                    },
+                )?;
+                self.tx_realm = (realm_index + 1) % realm_count;
+                continue;
+            }
             let device = &mut self.devices[realm.device];
             let ifindex = device.info.ifindex;
             let (work, kick) = device.queues[0].io.get_mut().transmit_batch(|port| {
@@ -1197,6 +1437,9 @@ impl Runtime {
                 include(device.metadata_checked + Duration::from_secs(1));
             }
         }
+        if !self.closing && self.gateway_maps.is_some() {
+            include(self.core_maintenance_checked + Duration::from_secs(1));
+        }
         #[cfg(feature = "ebpf")]
         if let Some(host) = &self.host {
             let port = host.queue.io.get_ref();
@@ -1281,7 +1524,12 @@ impl Runtime {
     /// One bounded turn under the actual router/config readers acquired beside device
     /// service; nothing here awaits, so no reader or scope lock crosses a suspension.
     fn resolve(&mut self, read: &PolicyRead<'_>) -> anyhow::Result<()> {
-        current_topology(&mut self.topology)?;
+        current_topology(
+            &mut self.topology,
+            self.gateway.as_deref(),
+            &self.devices,
+            &mut self.topology_lost,
+        )?;
         let Some(core) = &mut self.core else {
             return Ok(());
         };
@@ -1331,7 +1579,12 @@ impl Runtime {
                 Some(std::str::from_utf8(&mac).unwrap()),
                 now,
             )?;
-            current_topology(&mut self.topology)?;
+            current_topology(
+                &mut self.topology,
+                self.gateway.as_deref(),
+                &self.devices,
+                &mut self.topology_lost,
+            )?;
             match decision {
                 Decision::Wait(packet) => self.waiting.push_back(Waiting {
                     packet,
@@ -1385,6 +1638,12 @@ impl Runtime {
                         Err(error) if error.kind() == io::ErrorKind::WouldBlock => None,
                         Err(error) => return Err(error.into()),
                     };
+                    current_topology(
+                        &mut self.topology,
+                        self.gateway.as_deref(),
+                        &self.devices,
+                        &mut self.topology_lost,
+                    )?;
                     if let Some(route) = route
                         && selected_egress(&self.realms, route)
                         && let Some(device) = self
@@ -1405,7 +1664,6 @@ impl Runtime {
                             None => route.ethernet_header(packet.ip().src.is_ipv6())?,
                         };
                         core.submit(read, route, generation, || {
-                            current_topology(&mut self.topology)?;
                             if !packet.is_current(Instant::now()) {
                                 return Ok(None);
                             }
@@ -1438,6 +1696,12 @@ impl Runtime {
             if !selected_egress(&self.realms, route) {
                 continue;
             }
+            current_topology(
+                &mut self.topology,
+                self.gateway.as_deref(),
+                &self.devices,
+                &mut self.topology_lost,
+            )?;
             let Some(device) = self
                 .devices
                 .iter_mut()
@@ -1466,7 +1730,6 @@ impl Runtime {
                 continue;
             }
             let submitted = core.submit(read, route, work.generation, || {
-                current_topology(&mut self.topology)?;
                 if !lease
                     .retained_packet()
                     .expect("owned forwarding cursor")
@@ -1500,6 +1763,12 @@ impl Runtime {
         }
         if let Some(error) = core.poll_reassembly_error(read, now, &mut self.staging)? {
             let route = error.route;
+            current_topology(
+                &mut self.topology,
+                self.gateway.as_deref(),
+                &self.devices,
+                &mut self.topology_lost,
+            )?;
             if selected_egress(&self.realms, route)
                 && error.peer_hold().is_none_or(|peer| peer.learned())
                 && let Some(device) = self
@@ -1519,7 +1788,6 @@ impl Runtime {
                 let port = device.queues[0].io.get_mut();
                 if port.tx_packet_credit(TxClass::Control, header.len() + error.len) {
                     core.submit(read, route, error.generation, || {
-                        current_topology(&mut self.topology)?;
                         port.transmit_segments(
                             TxClass::Control,
                             &[&header, &self.staging[..error.len]],
@@ -1544,12 +1812,12 @@ impl Drop for Runtime {
         self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
         self.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        for device in &self.devices {
-            if device_needs_guard(device)
-                && let Err(error) = device.attachment.guard(&device.programs)
-            {
-                tracing::error!(%error, "XDP pinned capture guard failed; socket-map misses remain drop");
-            }
+        if let Some(gateway) = &self.gateway {
+            let _ = gateway.detach_all();
+        }
+        for device in &mut self.devices {
+            device.vlan_offload.abandon();
+            device.attachment.take();
         }
         #[cfg(feature = "ebpf")]
         if let Some(host) = &mut self.host
@@ -1573,10 +1841,6 @@ impl Drop for Runtime {
             std::mem::forget(self.host.take());
         }
     }
-}
-
-fn device_needs_guard(device: &Device) -> bool {
-    device.active
 }
 
 fn close_device_capture_with<T>(
@@ -1917,14 +2181,42 @@ fn return_header(
     .map_err(io::Error::other)
 }
 
-fn current_topology(topology: &mut AsyncFd<Topology>) -> io::Result<()> {
-    if topology.get_mut().check_changed()? {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "XDP topology authority changed; restart required",
-        ));
+fn current_topology(
+    topology: &mut AsyncFd<CaptureTopology>,
+    gateway: Option<&GatewayPublisher>,
+    devices: &[Device],
+    lost: &mut bool,
+) -> io::Result<TopologyEvent> {
+    let result = (|| {
+        if let Some(gateway) = gateway {
+            return gateway.validate_programs(|programs| {
+                for &(ifindex, program) in programs {
+                    topology.get_mut().expect_program(ifindex, program);
+                }
+                topology.get_mut().check()
+            });
+        }
+        for device in devices {
+            let program = if device.active {
+                device.programs.data_prog_id()
+            } else {
+                device.programs.discover_prog_id()
+            };
+            let link = device
+                .attachment
+                .as_ref()
+                .ok_or_else(|| io::Error::other("Core XDP link already detached"))?;
+            link.verify(program)?;
+            topology
+                .get_mut()
+                .expect_program(device.info.ifindex, program);
+        }
+        topology.get_mut().check()
+    })();
+    if result.is_err() {
+        *lost = true;
     }
-    Ok(())
+    result
 }
 
 /// Tokio takes the reader waker when it delivers readiness and a cached Ready installs none,
@@ -2167,6 +2459,7 @@ async fn run_capture(
     let config = plane.config_handle().read().await.as_ref().clone();
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
+    let active_routing_plan = plane.active_routing_plan_handle();
     let (polling_publication, process_polling) = plane
         .polling_runtime()
         .expect("validated XDP polling consumer");
@@ -2181,6 +2474,15 @@ async fn run_capture(
     let PreparedRuntime {
         devices,
         topology,
+        capture_plan,
+        plan_memory,
+        gateway,
+        gateway_maps,
+        zones,
+        local_addresses,
+        local_memory,
+        kernel_memory,
+        realm_scopes,
         realms,
         scope_pairs,
         workers,
@@ -2188,12 +2490,13 @@ async fn run_capture(
         core,
         memory,
         staging,
-        links: mut link_proof,
+        links,
         polling_prefix,
         polling_budget,
         diagnostics,
         ..
     } = prepared;
+    let mut devices = StartupDevices(devices);
     plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) = match shared_runtime
         .spawn(PacketEndpoints::start_driven(
@@ -2237,11 +2540,29 @@ async fn run_capture(
             else {
                 continue;
             };
+            // One statement per lock: a guard inside the struct literal would live to its end
+            // and the next lock() on the same non-reentrant mutex would self-deadlock.
+            let members: Vec<usize> = workers
+                .placements
+                .lock()
+                .iter()
+                .filter(|placement| placement.realm.scope() == scope)
+                .map(|placement| placement.device)
+                .collect();
+            let generated = (members.len() == 1)
+                .then(|| generated_layout(link))
+                .flatten();
             let realm = Realm {
+                realm_id: *realm_scopes
+                    .iter()
+                    .find(|(_, value)| **value == scope)
+                    .expect("prepared capture scope retains its realm")
+                    .0,
+                members,
                 ingress,
                 device,
                 link,
-                generated: generated_layout(link),
+                generated,
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
             };
@@ -2261,8 +2582,20 @@ async fn run_capture(
     );
     let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
-        devices,
+        devices: std::mem::take(&mut devices.0),
         topology,
+        topology_lost: false,
+        capture_plan: Some(capture_plan),
+        capture_plan_memory: Some(plan_memory),
+        gateway,
+        gateway_maps,
+        zones,
+        links,
+        local_addresses,
+        local_memory,
+        _kernel_memory: kernel_memory,
+        realm_scopes,
+        hold_collector: HoldCollector,
         #[cfg(feature = "ebpf")]
         host,
         admission,
@@ -2330,66 +2663,86 @@ async fn run_capture(
     let activate = if startup_failure.is_some() {
         Ok(())
     } else {
-        (|| -> anyhow::Result<()> {
-            for device in &mut runtime.devices {
-                device.attachment.replace(&device.programs)?;
-                device.active = true;
+        async {
+            if let Some(zones) = &mut runtime.zones {
+                zones.revalidate(&runtime.polling_budget)?;
             }
-            // Bootstrap carrier changes precede the final uninterrupted authority.
-            let indices: Vec<_> = runtime
-                .devices
-                .iter()
-                .map(|device| device.info.ifindex)
-                .collect();
-            let logical: Vec<_> = runtime
-                .realms
-                .iter()
-                .map(|realm| realm.ingress.ifindex)
-                .collect();
-            let topology = runtime.admit_final_topology(
-                &indices,
-                &logical,
-                config.global.effective_so_mark(),
-            )?;
+            let topology = runtime.admit_final_topology()?;
             ensure!(
                 topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
                 "XDP broadcast classification changed before publication"
             );
-            // SAFETY: Topology keeps its owned descriptor unchanged until AsyncFd drops it.
+            // SAFETY: the watcher owns a stable descriptor until AsyncFd drops it.
             runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-            for device in &runtime.devices {
-                device.info.validate_current()?;
+            for device in &mut runtime.devices {
+                let link = device
+                    .attachment
+                    .as_ref()
+                    .context("XDP link already detached")?;
+                link.replace(device.programs.discover_fd(), device.programs.data_fd())?;
+                runtime
+                    .topology
+                    .get_mut()
+                    .expect_program(device.info.ifindex, device.programs.data_prog_id());
+                device.active = true;
+                if let Some(publisher) = &runtime.gateway {
+                    let queues = device
+                        .info
+                        .queues
+                        .last()
+                        .copied()
+                        .context("XDP queues vanished")?
+                        .checked_add(1)
+                        .context("XDP queue overflow")?;
+                    publisher.register(
+                        device.info.ifindex,
+                        device
+                            .attachment
+                            .take()
+                            .context("XDP link already detached")?,
+                        Arc::clone(&device.programs),
+                        GatewayReload {
+                            capture: device.capture.clone(),
+                            queues,
+                            ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
+                        },
+                    );
+                }
             }
-            link_proof.synchronize()?;
-            link_proof.validate_capture(&indices)?;
-            ensure!(
-                link_proof
-                    .logical_links()
-                    .filter(|link| indices.contains(&link.path.physical_ifindex))
-                    .count()
-                    == runtime.realms.len()
-                    && runtime
-                        .realms
-                        .iter()
-                        .all(|realm| link_proof.logical_links().any(|link| link == realm.link)),
-                "logical capture identity changed before publication"
-            );
-            ensure!(
-                !runtime.topology.get_mut().check_changed()?,
-                "capture topology changed before publication"
-            );
+            if let Some(publisher) = &runtime.gateway {
+                let mut backend = backend.write().await;
+                let plan = active_routing_plan.read().clone();
+                if plan.policy_fingerprint != publisher.fingerprint() {
+                    publisher.publish(&plan)?;
+                }
+                backend
+                    .userspace_mut()?
+                    .install_gateway(Some(Arc::clone(publisher)))?;
+                publisher.commit();
+            }
+            current_topology(
+                &mut runtime.topology,
+                runtime.gateway.as_deref(),
+                &runtime.devices,
+                &mut runtime.topology_lost,
+            )?;
             runtime.rebuild_polling_context();
             #[cfg(feature = "ebpf")]
             if let Some(host) = &mut runtime.host {
+                if let Some(publisher) = &runtime.gateway {
+                    host.capture.set_gateway(Arc::clone(publisher))?;
+                }
                 host.admit(&runtime.pname_support)?;
             }
             runtime.admission.store(true, Ordering::Release);
             runtime.endpoints.capture_ready()?;
             Ok(())
-        })()
+        }
+        .await
     };
-    drop(link_proof);
     let mut failure = startup_failure.or_else(|| activate.err());
+    runtime.capture_plan.take();
+    runtime.capture_plan_memory.take();
     if failure.is_none() {
         runtime.diagnostics.lifecycle(Lifecycle::Active);
         tracing::info!(interfaces = runtime.devices.len(), "XDP datapath ready");
@@ -2410,6 +2763,18 @@ async fn run_capture(
         if (failure.is_some() || shutdown.requested()) && !runtime.closing {
             // Cleanup never resolves Core again; a queued reader must not stall publication.
             reader.set(None);
+            if let Some(publisher) = &runtime.gateway {
+                let mut backend = backend.write().await;
+                if let Err(error) = backend
+                    .userspace_mut()
+                    .and_then(|backend| backend.install_gateway(None))
+                {
+                    failure.get_or_insert(error);
+                }
+                if let Err(error) = publisher.detach_all() {
+                    failure.get_or_insert(error.into());
+                }
+            }
             if let Err(error) = runtime.close_capture() {
                 failure.get_or_insert(error);
             }
@@ -2505,6 +2870,9 @@ async fn run_capture(
             debug_assert!(port.close().ready_for_backend_teardown());
             port.close_socket();
         }
+        if let Err(error) = device.vlan_offload.restore() {
+            failure.get_or_insert(error.into());
+        }
     }
     #[cfg(feature = "ebpf")]
     if let Some(host) = runtime.host.take()
@@ -2538,7 +2906,16 @@ type RealmPlan = (Ingress, usize, LogicalLink, ScopeId);
 
 struct PreparedRuntime {
     devices: Vec<Device>,
-    topology: AsyncFd<Topology>,
+    topology: AsyncFd<CaptureTopology>,
+    capture_plan: CapturePlan,
+    plan_memory: MemoryReservation,
+    gateway: Option<Arc<GatewayPublisher>>,
+    gateway_maps: Option<Arc<honk_xsk::GatewayMaps>>,
+    zones: Option<ZoneAdmission>,
+    local_addresses: Vec<LocalAddressKey>,
+    local_memory: Option<MemoryReservation>,
+    kernel_memory: Vec<MemoryReservation>,
+    realm_scopes: std::collections::HashMap<u32, ScopeId>,
     #[cfg(feature = "ebpf")]
     host: Option<PreparedHost>,
     realms: Vec<RealmPlan>,
@@ -2577,138 +2954,298 @@ fn device_sizing(mtu: u32) -> (PortConfig, usize) {
     )
 }
 
+fn member_admission_issues(
+    info: &DeviceInfo,
+    requested_mode: Option<BindMode>,
+    metadata_len: usize,
+    absent: io::Result<bool>,
+) -> [Option<(&'static str, String)>; 2] {
+    let (port_config, _) = device_sizing(info.mtu);
+    let mode = select_xsk_mode(info, requested_mode, port_config, metadata_len)
+        .err()
+        .map(|error| ("xsk_mode", error.to_string()));
+    let attachment = match absent {
+        Ok(true) => None,
+        Ok(false) => Some((
+            "foreign_xdp",
+            "XDP interface already has a foreign attachment; explicit operator cleanup is required"
+                .into(),
+        )),
+        Err(error) => Some(("xdp_readback", error.to_string())),
+    };
+    [mode, attachment]
+}
+
+fn layout_admission_issues(error: &io::Error) -> [(&'static str, String); 2] {
+    [
+        ("capture_layout", error.to_string()),
+        ("NOT_CHECKED", "member mode, foreign XDP, workers, logical MTU, uplink and topology checks depend on capture_layout".into()),
+    ]
+}
+
+fn admission_failure(issues: &[(&'static str, String, String)], omitted: usize) -> String {
+    use std::fmt::Write as _;
+    let mut message = String::from("XDP startup admission failed");
+    for (reason, device, details) in issues {
+        let _ = write!(message, "\nreason={reason} device={device}: {details}");
+    }
+    if omitted != 0 {
+        let _ = write!(message, "\nomitted={omitted}");
+    }
+    message
+}
+
+fn gateway_time_namespace_issue(
+    offset: anyhow::Result<Option<i128>>,
+) -> Option<(&'static str, String)> {
+    let details = match offset {
+        Ok(None | Some(0)) => return None,
+        Ok(Some(offset)) => format!("nonzero monotonic namespace offset: {offset} ns"),
+        Err(error) => format!("{error:#}"),
+    };
+    Some(("time_namespace_offset", details))
+}
+
+fn realm_worker_count(workers: usize, queues: impl Iterator<Item = usize>) -> usize {
+    workers.min(queues.min().unwrap_or(0))
+}
+
 async fn prepare(
     plane: &ControlPlane,
     config: &Config,
     pin_root: &Path,
     admission: Arc<AtomicBool>,
 ) -> anyhow::Result<PreparedRuntime> {
-    validate_config(config)?;
+    #[cfg(not(feature = "ebpf"))]
+    let _ = pin_root;
     let datapath = config
         .datapath
         .as_ref()
         .context("XDP configuration missing")?;
-    let metadata_len = METADATA_LEN;
-    let binding_mode = match datapath.effective_xsk_mode() {
-        XskMode::Copy => BindMode::Copy,
-        XskMode::ZeroCopy => BindMode::ZeroCopy,
+    let mut issues: Vec<(&'static str, String, String)> = Vec::with_capacity(256);
+    let mut omitted = 0usize;
+    let mut record = |reason: &'static str, device: &str, details: String| {
+        if issues.len() < 256 {
+            issues.push((reason, device.to_owned(), details));
+        } else {
+            omitted += 1;
+        }
     };
-    let infos: Vec<_> = datapath
+    if let Err(error) = validate_config(config) {
+        record("configuration", "capture", format!("{error:#}"));
+    }
+    let metadata_len = METADATA_LEN;
+    let requested_mode = match datapath.effective_xsk_mode() {
+        XskMode::Auto => None,
+        XskMode::Copy => Some(BindMode::Copy),
+        XskMode::ZeroCopy => Some(BindMode::ZeroCopy),
+    };
+    let names: Vec<_> = datapath
         .interfaces
         .iter()
-        .map(|interface| DeviceInfo::discover(&interface.name))
-        .collect::<io::Result<_>>()?;
-    worker::admit(datapath.effective_workers(), &infos)?;
-    for info in &infos {
-        let (port_config, _) = device_sizing(info.mtu);
-        info.validate_port_config(binding_mode, port_config, metadata_len)
-            .with_context(|| format!("XDP device {} {binding_mode:?} admission", info.name))?;
-        ensure!(
-            honk_xsk::xdp_absent(info.ifindex)?,
-            "XDP interface already attached; stop sources, join prior owners and identify the owned guard/data/data-next and attachment format before explicit cold cleanup; stale state is not adopted"
+        .map(|interface| interface.name.clone())
+        .collect();
+    let plan = match CapturePlan::discover(&names) {
+        Ok(plan) => Some(plan),
+        Err(error) => {
+            for (reason, details) in layout_admission_issues(&error) {
+                record(reason, "capture", details);
+            }
+            None
+        }
+    };
+    let gateway_enabled = datapath.direct == Some(DirectProfile::Endpoint) && !names.is_empty();
+    if gateway_enabled
+        && let Some((reason, details)) =
+            gateway_time_namespace_issue(timens::monotonic_namespace_offset())
+    {
+        record(reason, "namespace", details);
+    }
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let mut zones = if gateway_enabled {
+        match ZoneAdmission::read(&budget) {
+            Ok(zones) => Some(zones),
+            Err(error) => {
+                record("conntrack_zones", "namespace", error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let conntrack = if gateway_enabled {
+        match honk_xsk::ConntrackKfuncs::read() {
+            Ok(conntrack) => Some(Arc::new(conntrack)),
+            Err(error) => {
+                record("conntrack_btf", "namespace", error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let infos: Vec<_> = plan
+        .as_ref()
+        .map(|plan| {
+            plan.members()
+                .iter()
+                .map(|member| member.info.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let topology = if let Some(plan) = &plan {
+        if gateway_enabled && let Err(error) = plan.check_gateway_defaults() {
+            record("gateway_uplink", "namespace", error.to_string());
+        }
+        if let Err(error) = worker::admit(datapath.effective_workers(), &infos) {
+            record("workers", "capture", format!("{error:#}"));
+        }
+        for info in &infos {
+            for (reason, details) in member_admission_issues(
+                info,
+                requested_mode,
+                metadata_len,
+                honk_xsk::xdp_absent(info.ifindex),
+            )
+            .into_iter()
+            .flatten()
+            {
+                record(reason, &info.name, details);
+            }
+        }
+        for realm in plan.realms().iter().filter(|realm| realm.mtu < 1280) {
+            record(
+                "logical_mtu",
+                &realm.name,
+                "logical MTU must be at least 1280".into(),
+            );
+        }
+        match CaptureTopology::admit(plan) {
+            Ok(topology) => Some(topology),
+            Err(error) => {
+                record("capture_topology", "capture", error.to_string());
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let realm_count =
+        plan.as_ref().map_or(0, |plan| plan.realms().len()) + usize::from(datapath.host.is_some());
+    if plan.is_some() && !(1..=64).contains(&realm_count) {
+        record(
+            "realm_capacity",
+            "capture",
+            "logical capture realm capacity exceeded".into(),
         );
     }
-    let indices: Vec<_> = infos.iter().map(|info| info.ifindex).collect();
-    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let plan_memory = if let Some(plan) = &plan {
+        match budget.reserve(plan.memory_bytes()) {
+            Some(memory) => Some(memory),
+            None => {
+                record(
+                    "capture_budget",
+                    "capture",
+                    "capture plan memory capacity".into(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     let extent = infos
         .iter()
         .map(|info| info.mtu as usize + 22 + metadata_len)
         .max()
         .unwrap_or(65536);
-    let (workers, inboxes) = worker::Shared::new(
-        datapath.effective_workers(),
-        extent,
-        infos.iter().map(|info| info.queues.len()).sum(),
-        &budget,
-        Arc::clone(&admission),
-    )?;
-    let polling_prefix = ContextDigest::platform(&budget);
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-    let namespace = socket_namespace(socket.as_fd())?;
-    let mut links = Fib::new(&budget, namespace)?;
-    links.synchronize()?;
-    links.validate_capture(&indices)?;
-    ensure!(
-        links
-            .logical_links()
-            .filter(|link| indices.contains(&link.path.physical_ifindex))
-            .all(|link| link.mtu >= 1280),
-        "XDP logical MTU must be at least 1280 for packet Endpoint handoffs"
-    );
-    let physical_realm_count = links
-        .logical_links()
-        .filter(|link| indices.contains(&link.path.physical_ifindex))
-        .count();
-    let realm_count = physical_realm_count + usize::from(datapath.host.is_some());
-    ensure!(
-        (1..=64).contains(&realm_count),
-        "logical capture realm capacity exceeded"
-    );
-    for info in &infos {
-        ensure!(
-            links
-                .logical_links()
-                .any(|link| link.ifindex == info.ifindex
-                    && link.mac == info.mac
-                    && link.mtu == info.mtu)
-                && info
-                    .upper_ifindices
-                    .iter()
-                    .all(
-                        |index| links.logical_links().any(|link| link.ifindex == *index
-                            && link.path.physical_ifindex == info.ifindex
-                            && link.path.vlan_count != 0)
-                    ),
-            "device and canonical logical-link discovery disagree"
-        );
+    let workers = if plan.is_some() {
+        match worker::Shared::new(
+            datapath.effective_workers(),
+            extent,
+            infos.iter().map(|info| info.queues.len()).sum(),
+            &budget,
+            Arc::clone(&admission),
+        ) {
+            Ok(workers) => Some(workers),
+            Err(error) => {
+                record(
+                    "capture_budget",
+                    "capture",
+                    format!("worker handoff: {error:#}"),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let fib = (|| -> anyhow::Result<_> {
+        let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+        let namespace = socket_namespace(socket.as_fd())?;
+        let mut links = Fib::new(&budget, namespace)?;
+        links.synchronize()?;
+        Ok((namespace, links))
+    })();
+    if let Err(error) = &fib {
+        record("local_addresses", "namespace", format!("{error:#}"));
     }
-    let logical: Vec<_> = links
-        .logical_links()
-        .filter(|link| indices.contains(&link.path.physical_ifindex))
-        .map(|link| link.ifindex)
-        .collect();
-    let topology = Topology::admit(&indices, &logical, config.global.effective_so_mark())?;
-    // SAFETY: Topology never closes or replaces its descriptor while registered.
-    let topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-    std::fs::create_dir_all(pin_root)?;
-    let metadata = std::fs::symlink_metadata(pin_root)?;
-    ensure!(
-        metadata.is_dir() && !metadata.file_type().is_symlink(),
-        "XDP pin root must be a real private bpffs directory"
-    );
     let max_mtu = infos.iter().map(|info| info.mtu).max().unwrap_or(65535) as usize;
     #[cfg(feature = "ebpf")]
     let host_memory = usize::from(datapath.host.is_some()) * size_of::<PreparedHost>();
     #[cfg(not(feature = "ebpf"))]
     let host_memory = 0;
-    let memory = budget
-        .reserve(
-            max_mtu
-                + 65536
-                + size_of::<Runtime>()
-                + size_of::<Topology>()
-                + host_memory
-                + PENDING * (size_of::<Waiting>() + size_of::<Pending>())
-                + realm_count
-                    * usize::from(datapath.effective_workers())
-                    * (size_of::<Realm>()
-                        + size_of::<RealmPlan>()
-                        + size_of::<PacketDriver>()
-                        + size_of::<(PacketScope, crate::control::netstack::PacketOwner)>()
-                        + size_of::<Ingress>()
-                        + size_of::<IngressBinding>())
-                + infos.len() * size_of::<Device>()
-                + infos
-                    .iter()
-                    .map(|info| {
-                        info.queues.len() * size_of::<Queue>()
-                            + info.name.capacity()
-                            + (info.queues.capacity() + info.upper_ifindices.capacity())
-                                * size_of::<u32>()
-                    })
-                    .sum::<usize>(),
-        )
-        .context("XDP metadata and staging memory capacity")?;
+    let memory = if plan.is_some() {
+        let bytes = max_mtu
+            + 65536
+            + size_of::<Runtime>()
+            + size_of::<CaptureTopology>()
+            + host_memory
+            + PENDING * (size_of::<Waiting>() + size_of::<Pending>())
+            + realm_count
+                * usize::from(datapath.effective_workers())
+                * (size_of::<Realm>()
+                    + size_of::<RealmPlan>()
+                    + size_of::<PacketDriver>()
+                    + size_of::<(PacketScope, crate::control::netstack::PacketOwner)>()
+                    + size_of::<Ingress>()
+                    + size_of::<IngressBinding>())
+            + infos.len() * size_of::<Device>()
+            + infos
+                .iter()
+                .map(|info| {
+                    info.queues.len() * size_of::<Queue>()
+                        + info.name.capacity()
+                        + (info.queues.capacity() + info.upper_ifindices.capacity())
+                            * size_of::<u32>()
+                })
+                .sum::<usize>();
+        match budget.reserve(bytes) {
+            Some(memory) => Some(memory),
+            None => {
+                record(
+                    "capture_budget",
+                    "capture",
+                    "metadata and staging memory capacity".into(),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !issues.is_empty() {
+        anyhow::bail!(admission_failure(&issues, omitted));
+    }
+    let plan = plan.context("capture layout was not checked")?;
+    let plan_memory = plan_memory.context("capture plan budget was not checked")?;
+    let memory = memory.context("capture metadata budget was not checked")?;
+    let (workers, inboxes) = workers.context("capture workers were not checked")?;
+    let (namespace, links) = fib?;
+    let topology = topology.context("capture topology was not checked")?;
+    // SAFETY: the watcher keeps its descriptor until AsyncFd drops it.
+    let topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
+    let polling_prefix = ContextDigest::platform(&budget);
     tracing::debug!(
         used = budget.used(),
         limit = budget.limit(),
@@ -2724,9 +3261,64 @@ async fn prepare(
     } else {
         None
     };
-    let mut devices = Vec::with_capacity(infos.len());
+    let policy = if gateway_enabled {
+        Some(GatewayPolicy::prepare(
+            &plane.active_routing_plan_handle().read(),
+        )?)
+    } else {
+        None
+    };
+    let mut local_addresses: Vec<_> = links.local_addresses().map(LocalAddressKey::from).collect();
+    local_addresses.sort_unstable_by_key(|key| (key.family, key.address));
+    local_addresses.dedup();
+    let gateway_maps = if policy.is_some() {
+        Some(Arc::new(honk_xsk::GatewayMaps::new(
+            &plan.realm_keys(),
+            &local_addresses,
+        )?))
+    } else {
+        None
+    };
+    let mut kernel_memory = Vec::new();
+    let mut local_memory = None;
+    if let Some(maps) = &gateway_maps {
+        kernel_memory.push(
+            budget
+                .reserve(maps.memory_bytes())
+                .context("gateway counter scratch memory capacity")?,
+        );
+        let backend = plane.policy_backend_handle();
+        maps.set_mode_flags(backend.write().await.userspace_mut()?.mode_flags())?;
+        let bytes =
+            maps.object_fds()
+                .into_iter()
+                .try_fold(0usize, |total, fd| -> io::Result<usize> {
+                    total
+                        .checked_add(honk_xsk::kernel_memory_bytes(fd)?)
+                        .ok_or_else(|| io::Error::other("gateway memory overflow"))
+                })?;
+        kernel_memory.push(
+            budget
+                .reserve(bytes)
+                .context("gateway map memory capacity")?,
+        );
+        local_memory = Some(
+            budget
+                .reserve(honk_xsk::kernel_memory_bytes(maps.local_map_fd()?.as_fd())?)
+                .context("gateway local map memory capacity")?,
+        );
+    }
+    if let Some(zones) = &mut zones {
+        zones.revalidate(&budget)?;
+    }
+    let mut devices = StartupDevices(Vec::with_capacity(infos.len()));
     for (device_index, info) in infos.into_iter().enumerate() {
         let (port_config, _) = device_sizing(info.mtu);
+        let binding_mode = select_xsk_mode(&info, requested_mode, port_config, metadata_len)?;
+        let vlan_offload = prepare_vlan_offload(&info, &budget)?;
+        // A device without a complete feature identity (virtio reports no firmware version)
+        // only stays ineligible for busy polling; each polling context rebuild queries it again.
+        let features = FeatureQuery::new(&info, &budget).ok();
         let incarnation = ScopeId::allocate()
             .context("XDP attachment identity exhausted")?
             .as_u64();
@@ -2746,15 +3338,38 @@ async fn prepare(
             .queues
             .last()
             .copied()
-            .unwrap()
+            .context("XDP device has no RX queues")?
             .checked_add(1)
             .context("XDP queue identity overflow")?;
         let programs =
-            Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?;
-        use std::os::unix::fs::DirBuilderExt;
-        let pins = pin_root.join(format!("xdp-{}", info.ifindex));
-        std::fs::DirBuilder::new().mode(0o700).create(&pins)?;
-        let attachment = PersistentAttachment::create(info.ifindex, &programs, &pins)?;
+            if let (Some(policy), Some(maps), Some(ct)) = (&policy, &gateway_maps, &conntrack) {
+                Programs::load_general_gateway(
+                    &capture,
+                    queues,
+                    topology.get_ref().ipv4_broadcasts(),
+                    honk_xsk::GatewayLoad {
+                        routing: &policy.bytecode.insns,
+                        maps,
+                        conntrack: ct,
+                    },
+                )?
+            } else {
+                Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?
+            };
+        let bytes = programs.object_fds().into_iter().try_fold(
+            0usize,
+            |total, fd| -> io::Result<usize> {
+                total
+                    .checked_add(honk_xsk::kernel_memory_bytes(fd)?)
+                    .ok_or_else(|| io::Error::other("XDP program memory overflow"))
+            },
+        )?;
+        kernel_memory.push(
+            budget
+                .reserve(bytes)
+                .context("XDP program memory capacity")?,
+        );
+        let attachment = OwnedXdpLink::create(info.ifindex, programs.discover_fd())?;
         let ports =
             info.open_ports::<Retained>(binding_mode, port_config, metadata_len, &budget)?;
         ensure!(
@@ -2787,15 +3402,32 @@ async fn prepare(
             info: Arc::new(info),
             capture,
             programs: Arc::new(programs),
-            attachment: Arc::new(attachment),
+            attachment: Some(attachment),
+            vlan_offload,
             queues,
             active: false,
             metadata_checked: Instant::now(),
-            features: None,
+            features,
             port_config,
-            role: datapath.interfaces[device_index].role,
+            role: datapath
+                .interfaces
+                .iter()
+                .find(|interface| {
+                    interface.name == plan.realm_name(plan.members()[device_index].realm_id)
+                })
+                .context("capture member role missing")?
+                .role,
         });
     }
+    let gateway = match (policy, gateway_maps.as_ref(), conntrack) {
+        (Some(policy), Some(maps), Some(ct)) => Some(Arc::new(GatewayPublisher::new(
+            policy,
+            Arc::clone(maps),
+            ct,
+            Arc::clone(&budget),
+        )?)),
+        _ => None,
+    };
     #[cfg(feature = "ebpf")]
     let host = if let Some(host) = &datapath.host {
         let source_xdp_capacity = devices.len() * 2;
@@ -2803,7 +3435,7 @@ async fn prepare(
             .reserve(source_xdp_capacity * size_of::<(u32, u32)>())
             .context("Host source XDP identity memory capacity")?;
         let mut source_xdp = Vec::with_capacity(source_xdp_capacity);
-        for device in &devices {
+        for device in devices.iter() {
             source_xdp.push((device.info.ifindex, device.programs.discover_prog_id()));
             source_xdp.push((device.info.ifindex, device.programs.data_prog_id()));
         }
@@ -2835,36 +3467,70 @@ async fn prepare(
     } else {
         None
     };
-    for (device_index, device) in devices.iter().enumerate() {
+    let mut realm_scopes = std::collections::HashMap::new();
+    let realm_keys = plan.realm_keys();
+    for logical in plan.realms() {
+        let members: Vec<_> = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, device)| {
+                realm_keys.iter().any(|(key, id)| {
+                    *id == logical.realm_id && key.physical_ifindex == device.info.ifindex
+                })
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let device_index = *members
+            .first()
+            .context("logical capture realm has no physical member")?;
+        let device = &devices[device_index];
         let (_, scope_bulk_frames) = device_sizing(device.info.mtu);
-        for link in links
-            .logical_links()
-            .filter(|link| link.path.physical_ifindex == device.info.ifindex)
-        {
-            let ingress = Ingress {
-                scope: routing_scope,
-                namespace,
-                ifindex: link.ifindex,
-                attachment: device.capture.authority.attachment_generation,
-                mark: MarkProvenance::BeforeSkb,
-            };
-            let (realm, owners) = capture_realm(
-                link.mtu,
-                realm_count,
-                scope_bulk_frames,
-                usize::from(datapath.effective_workers()).min(device.info.queues.len()),
-                &budget,
-            )?;
-            realm.install_admission_fence(Arc::clone(&admission))?;
-            realms.push((ingress, device_index, link, realm.scope()));
+        let link = LogicalLink {
+            ifindex: logical.logical_ifindex,
+            mtu: logical.mtu,
+            mac: logical.mac,
+            path: LinkPath {
+                physical_ifindex: device.info.ifindex,
+                vlan_tci: logical.vid,
+                vlan_proto: logical.tpid,
+                vlan_count: u8::try_from(logical.vlan_count)?,
+            },
+        };
+        let ingress = Ingress {
+            scope: routing_scope,
+            namespace,
+            ifindex: link.ifindex,
+            attachment: device.capture.authority.attachment_generation,
+            mark: MarkProvenance::BeforeSkb,
+        };
+        let worker_count = realm_worker_count(
+            usize::from(datapath.effective_workers()),
+            members
+                .iter()
+                .map(|index| devices[*index].info.queues.len()),
+        );
+        let (realm, owners) = capture_realm(
+            link.mtu,
+            realm_count,
+            scope_bulk_frames,
+            worker_count,
+            &budget,
+        )?;
+        realm.install_admission_fence(Arc::clone(&admission))?;
+        realm_scopes.insert(logical.realm_id, realm.scope());
+        realms.push((ingress, device_index, link, realm.scope()));
+        for member in members {
+            let mut member_link = link;
+            member_link.path.physical_ifindex = devices[member].info.ifindex;
             workers.placements.lock().push(worker::Placement {
+                realm_id: logical.realm_id,
                 realm: realm.clone(),
                 ingress,
-                device: device_index,
-                link,
+                device: member,
+                link: member_link,
             });
-            scope_pairs.push((realm, owners));
         }
+        scope_pairs.push((realm, owners));
     }
     #[cfg(feature = "ebpf")]
     let host = match host {
@@ -2900,7 +3566,7 @@ async fn prepare(
             .iter()
             .map(|(ingress, device, _, facts)| IngressBinding {
                 ingress: *ingress,
-                role: datapath.interfaces[*device].role,
+                role: devices[*device].role,
                 facts: *facts,
             })
             .collect();
@@ -2911,8 +3577,17 @@ async fn prepare(
         None
     };
     Ok(PreparedRuntime {
-        devices,
+        devices: std::mem::take(&mut devices.0),
         topology,
+        capture_plan: plan,
+        plan_memory,
+        gateway,
+        gateway_maps,
+        zones,
+        local_addresses,
+        local_memory,
+        kernel_memory,
+        realm_scopes,
         #[cfg(feature = "ebpf")]
         host,
         realms,
@@ -2935,6 +3610,62 @@ mod tests {
 
     mod driven_kernel;
     mod retention;
+
+    #[test]
+    fn bond_realm_workers_fit_every_member() {
+        assert_eq!(realm_worker_count(2, [1, 2].into_iter()), 1);
+    }
+
+    #[test]
+    fn readonly_admission_reports_nonzero_gateway_time_offset() {
+        assert!(gateway_time_namespace_issue(Ok(None)).is_none());
+        assert!(gateway_time_namespace_issue(Ok(Some(0))).is_none());
+        for offset in [-1_000_000_000, 1_000_000_000] {
+            let (reason, details) = gateway_time_namespace_issue(Ok(Some(offset))).unwrap();
+            let summary = admission_failure(&[(reason, "namespace".into(), details)], 0);
+            assert!(summary.contains("reason=time_namespace_offset device=namespace"));
+            assert!(summary.contains(&format!("{offset} ns")));
+        }
+    }
+
+    #[test]
+    fn readonly_admission_reports_foreign_xdp_and_mode_failure_together() {
+        let info = DeviceInfo {
+            name: "eth-test".into(),
+            ifindex: 1,
+            upper_ifindices: Vec::new(),
+            queues: vec![0],
+            mtu: 9000,
+            mac: [2; 6],
+            xdp_features: 3,
+            zerocopy_max_segments: 0,
+            vlan_metadata: false,
+        };
+        let issues: Vec<_> =
+            member_admission_issues(&info, Some(BindMode::ZeroCopy), METADATA_LEN, Ok(false))
+                .into_iter()
+                .flatten()
+                .map(|(reason, details)| (reason, info.name.clone(), details))
+                .collect();
+        let summary = admission_failure(&issues, 0);
+        assert_eq!(issues.len(), 2);
+        assert!(summary.contains("reason=xsk_mode device=eth-test"));
+        assert!(summary.contains("reason=foreign_xdp device=eth-test"));
+    }
+
+    #[test]
+    fn readonly_layout_failure_marks_dependent_checks_not_checked() {
+        let issues: Vec<_> = layout_admission_issues(&io::Error::other("injected layout failure"))
+            .into_iter()
+            .map(|(reason, details)| (reason, "capture".into(), details))
+            .collect();
+        let summary = admission_failure(&issues, 0);
+        assert!(summary.contains("reason=capture_layout device=capture: injected layout failure"));
+        assert!(summary.contains("reason=NOT_CHECKED device=capture"));
+        assert!(summary.contains("depend on capture_layout"));
+        assert!(!summary.contains("reason=xsk_mode"));
+        assert!(!summary.contains("reason=foreign_xdp"));
+    }
 
     #[test]
     fn native_guard_observation_failure_never_skips_xsk_withdrawal() {
@@ -3039,6 +3770,7 @@ mod tests {
     #[test]
     fn sg_l3_and_vlan_output_keep_exact_bytes() {
         let path = ReturnPath {
+            realm: 1,
             device: 0,
             mac: [2; 6],
             vlan_tci: [0xa00c, 34],

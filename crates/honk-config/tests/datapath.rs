@@ -35,6 +35,20 @@ fn explicit_xdp_profile_and_zone_survive_both_adapters() {
 }
 
 #[test]
+fn bond_interface_with_auto_round_trips_and_requires_restart() {
+    let source = "datapath {\n backend: xdp\n direct: endpoint\n xsk_mode: auto\n interface { bond0: lan }\n}";
+    let config = honk_config::parser::parse_dae_config(source).unwrap();
+    let datapath = config.datapath.as_ref().unwrap();
+    assert_eq!(datapath.effective_xsk_mode(), XskMode::Auto);
+    assert_eq!(datapath.interfaces[0].name, "bond0");
+    let decoded: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+    assert_eq!(decoded.datapath, config.datapath);
+    let mut changed = datapath.clone();
+    changed.xsk_mode = Some(XskMode::ZeroCopy);
+    assert!(!datapath.same_device_setup(&changed));
+}
+
+#[test]
 fn workers_are_strict_xdp_presence_and_restart_identity() {
     let source = |setting: &str| {
         format!(
@@ -156,6 +170,7 @@ fn xdp_binding_adapters_preserve_copy_opt_in_and_effective_restart_identity() {
             .unwrap();
         for (mode, expected) in [
             (None, XskMode::ZeroCopy),
+            (Some("auto"), XskMode::Auto),
             (Some("copy"), XskMode::Copy),
             (Some("zerocopy"), XskMode::ZeroCopy),
         ] {
@@ -200,11 +215,12 @@ fn xdp_binding_adapters_preserve_copy_opt_in_and_effective_restart_identity() {
                 assert_eq!(null.datapath.unwrap(), omitted);
             }
         }
-        for setting in ["xsk_mode: auto", "xsk_mode: copy\n xsk_mode: zerocopy"] {
-            assert!(honk_config::parser::parse_dae_config(&source(setting)).is_err());
-        }
+        assert!(
+            honk_config::parser::parse_dae_config(&source("xsk_mode: copy\n xsk_mode: zerocopy"))
+                .is_err()
+        );
     }
-    for mode in ["copy", "zerocopy"] {
+    for mode in ["auto", "copy", "zerocopy"] {
         assert!(
             honk_config::parser::parse_dae_config(&format!(
                 "datapath {{\n backend: tc\n xsk_mode: {mode}\n}}"
@@ -230,6 +246,7 @@ fn included_xsk_mode_preserves_explicit_copy_and_rejects_duplicate_claims() {
     let source = "include { child.dae }\ndatapath {\n backend: xdp\n direct: core\n interface { dut0: lan }\n}";
     std::fs::write(&entry, source).unwrap();
     for (setting, expected) in [
+        ("xsk_mode: auto", XskMode::Auto),
         ("", XskMode::ZeroCopy),
         ("xsk_mode: copy", XskMode::Copy),
         ("xsk_mode: zerocopy", XskMode::ZeroCopy),

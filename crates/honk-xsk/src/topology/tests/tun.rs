@@ -462,7 +462,16 @@ fn tun_parser_refuses_unrepresented_route_and_rule_execution() {
         let mut snapshot = fixture(&spec, Some(TunStage::Active));
         let route = spec.capture_routes(17)[0];
         let mut body = route_body(route);
-        attribute(&mut body, kind, &[0; 8]);
+        match kind {
+            9 => {
+                let mut nexthop = [0; 8];
+                nexthop[..2].copy_from_slice(&8u16.to_ne_bytes());
+                nexthop[4..].copy_from_slice(&17u32.to_ne_bytes());
+                attribute(&mut body, kind, &nexthop);
+            }
+            30 => attribute(&mut body, kind, &1u32.to_ne_bytes()),
+            _ => attribute(&mut body, kind, &[0; 8]),
+        }
         snapshot.routes.pop();
         snapshot.push(24, &body).unwrap();
         assert!(

@@ -57,6 +57,64 @@ mark_phase() {
     read -r uptime idle </proc/uptime
     printf '%s\t%s\t%s\n' "$uptime" "$1" "$2" >>"$work/phases.tsv"
 }
+check_kernel_recovery() {
+    python3 - <<'PY'
+import select, subprocess, sys
+server = r'''
+import socket, sys
+family, kind = map(int, sys.argv[1:3])
+with socket.socket(family, kind) as sock:
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.settimeout(10)
+    sock.bind((sys.argv[3], 18091))
+    if kind == socket.SOCK_STREAM:
+        sock.listen(1)
+    print('READY', flush=True)
+    if kind == socket.SOCK_STREAM:
+        conn, _ = sock.accept()
+        with conn:
+            conn.settimeout(10)
+            payload = b''
+            while len(payload) < len(b'fresh-kernel-connection'):
+                part = conn.recv(128)
+                assert part, 'kernel recovery TCP request ended early'
+                payload += part
+            conn.sendall(payload)
+    else:
+        payload, peer = sock.recvfrom(128)
+        sock.sendto(payload, peer)
+'''
+client = r'''
+import socket, sys
+family, kind = map(int, sys.argv[1:3])
+with socket.socket(family, kind) as sock:
+    sock.settimeout(10)
+    sock.bind((sys.argv[3], 0))
+    sock.connect((sys.argv[4], 18091))
+    sock.sendall(b'fresh-kernel-connection')
+    payload = b''
+    while len(payload) < len(b'fresh-kernel-connection'):
+        part = sock.recv(128)
+        assert part, 'kernel recovery reply ended early'
+        payload += part
+    assert payload == b'fresh-kernel-connection'
+'''
+for family, source, destination in [(2, '192.0.2.2', '198.51.100.2'), (10, 'fd00:1::2', 'fd00:2::2')]:
+    for kind in (1, 2):
+        peer = subprocess.Popen(['ip', 'netns', 'exec', 'server', sys.executable, '-c', server, str(family), str(kind), destination], stdout=subprocess.PIPE, text=True)
+        try:
+            assert select.select([peer.stdout], [], [], 5)[0], 'kernel recovery server readiness deadline'
+            assert peer.stdout.readline().strip() == 'READY'
+            subprocess.run(['ip', 'netns', 'exec', 'client', sys.executable, '-c', client, str(family), str(kind), source, destination], check=True, timeout=15)
+            assert peer.wait(timeout=5) == 0
+            print('kernel new connection:', family, kind, 'PASS', flush=True)
+        finally:
+            if peer.poll() is None:
+                peer.kill()
+                peer.wait()
+PY
+}
+
 mkdir "$work/bpf"
 mount -t bpf bpf "$work/bpf"
 [[ $(stat -f -c %T "$work/bpf") == bpf_fs ]] || fail 'requires bpffs'
@@ -70,7 +128,7 @@ stop_sources() {
         wait "$server_pid" 2>/dev/null || true
         server_pid=
     fi
-    # Quiesce ingress before stopping the daemon or removing its fail-closed guards.
+    # Quiesce producers before fixture namespace teardown.
     for ns in client server; do
         ip -n "$ns" link set lo down 2>/dev/null || true
     done
@@ -237,8 +295,6 @@ for link in links:
         if mode != 'absent':
             assert program_id, xdp
             identity = [sys.executable, os.environ['HONK_XDP_PROBE'], 'identity', dev, mode]
-            if mode == 'guard':
-                identity.append(pathlib.Path(f'{sys.argv[2]}.{dev}.guard-id').read_text().strip())
             subprocess.run(identity, check=True)
 print('kernel contract:', mode, flush=True)
 if mode == 'data':
@@ -246,7 +302,8 @@ if mode == 'data':
     expressions = [item['rule']['expr'] for item in rules if 'rule' in item]
     assert len(expressions) == 1 and expressions[0][-1] == {'drop': None}, expressions
     counter = next(item['counter'] for item in expressions[0] if 'counter' in item)
-    assert counter['packets'] == 0, ('native forwarding attempted during consumer proof', counter)
+    expected = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    assert counter['packets'] == expected, ('unexpected native forwarding during consumer proof', expected, counter)
     print('independent native-forward fence:', counter, flush=True)
 PY
 if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
@@ -254,10 +311,41 @@ if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
     for test in \
         bpf::general::tests::kernel_group_unicast_cannot_borrow_connected_socket_exemption \
         bpf::general::tests::kernel_native_destinations_and_metadata_counter_are_distinct \
-        bpf::general::tests::kernel_legacy_capture_keeps_rejection_counters_and_xsk_miss_closed; do
+        bpf::general::tests::kernel_legacy_capture_keeps_rejection_counters_and_xsk_miss_closed \
+        bpf::general::tests::gateway::kernel_gateway_tcp_non_syn_miss_and_monotonic_hold_refresh \
+        bpf::general::tests::gateway::kernel_gateway_local_then_hold_then_real_conntrack_and_reverse_quote \
+        bpf::general::tests::gateway::kernel_gateway_required_prefix_options_and_scatter_payload \
+        bpf::general::tests::gateway::kernel_gateway_fragment_verdict_ttl_and_post_hold_late_fragment \
+        bpf::general::tests::gateway::kernel_gateway_ipv6_fragment_then_destination_options_and_extension_bounds \
+        bpf::general::tests::gateway::kernel_gateway_canonical_call_input_and_runtime_rule_permission \
+        bpf::general::tests::gateway::kernel_gateway_reload_preserves_xsk_and_counter_map_identity \
+        bpf::general::tests::gateway::kernel_gateway_vlan_realm_masks_pcp_dei_and_rejects_unknown_vid \
+        bpf::general::tests::gateway::kernel_gateway_local_dns_exception_and_full_hold_drop \
+        bpf::gateway::tests::kernel_hold_sweep_retains_output_and_reread_changes \
+        bpf::gateway::tests::kernel_gateway_lookup_errors_sum_possible_cpu_values \
+        bpf::gateway::tests::kernel_hold_sweep_bounds_turn_and_preserves_cursor \
+        bpf::attachment::tests::kernel_owned_links_replace_foreign_rejection_and_queue_failure_unwind \
+        bpf::attachment::tests::kernel_owned_link_sigkill_detaches_without_pins; do
         [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored XSK regression: $test"
     done
     ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" bpf::general::tests::kernel_ --ignored --test-threads=1 --nocapture | tee "$work/xsk-kernel.log"
+    for prefix in bpf::general::tests::gateway::kernel_ bpf::gateway::tests::kernel_ bpf::attachment::tests::kernel_owned_; do
+        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$prefix" --ignored --test-threads=1 --nocapture | tee "$work/${prefix//::/-}.log"
+    done
+    vlan_test=device::features::kernel_vlan_tests::kernel_vlan_no_upper_normal_failure_and_sigkill_boundaries
+    [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$vlan_test" --exact --ignored --list --format terse) == "$vlan_test: test" ]] || fail "missing ignored XSK regression: $vlan_test"
+    ip -n dut link add honkvlan0 type veth peer name honkvlan1
+    vlan_features=$(ip netns exec dut ethtool -k honkvlan0)
+    if printf '%s\n' "$vlan_features" | awk '
+        /(rx-vlan-hw-parse|rx-vlan-offload):/ { ctag = ($2 == "on" && $0 !~ /\[fixed\]/) }
+        /rx-vlan-stag-hw-parse:/ { stag = ($2 == "on" && $0 !~ /\[fixed\]/) }
+        END { exit !(ctag && stag) }
+    '; then
+        ip netns exec dut env HONK_XDP_VLAN_TEST_DEVICE=honkvlan0 "$HONK_XDP_XSK_TEST_BIN" "$vlan_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/vlan-offload.log"
+    else
+        printf '%s\n' 'NOT_RUN: vlan offload bits not writable on veth'
+    fi
+    ip -n dut link delete honkvlan0
 fi
 if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     [[ $HONK_XDP_CORE_TEST_BIN == /* && -x $HONK_XDP_CORE_TEST_BIN ]] || fail 'invalid Core test executable'
@@ -273,15 +361,23 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     driven_test=xdp::tests::driven_kernel::policy_publication_keeps_real_endpoint_app_timer_and_close_owned
     multiqueue_test=xdp::tests::driven_kernel::two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned
     adaptive_test=xdp::tests::driven_kernel::adaptive::actual_owner_clock_budget_fairness_and_live_features
+    full_gateway_test=xdp::gateway::policy::tests::kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets
     for test in \
         control::core_forward::tests::firewall_capacity_refusal_keeps_packet_owner_alive \
         control::core_forward::tests::unresolved_forward_neighbor_does_not_delay_transit_errors \
         control::core_forward::tests::generated_reassembly_error_keeps_scoped_nat_and_funding_through_completion \
         control::core_forward::tests::plain_output_history_survives_first_nat_enable_and_cq_owners \
         control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity \
-        "$driven_test" "$multiqueue_test" "$adaptive_test"; do
+        "$full_gateway_test" "$driven_test" "$multiqueue_test" "$adaptive_test"; do
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
     done
+    ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$full_gateway_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/gateway-full-program.log"
+    retention_test=xdp::tests::retention::gateway_hold_retains_real_queued_exported_and_cq_output
+    [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --list --format terse) == "$retention_test: test" ]] || fail "missing Core retention regression: $retention_test"
+    ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --test-threads=1 --nocapture | tee "$work/gateway-retention.log"
+    zone_test=xdp::gateway::zones::tests::kernel_gateway_zone_startup_refuses_nft_and_legacy
+    [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$zone_test" --exact --ignored --list --format terse) == "$zone_test: test" ]] || fail "missing ignored Core regression: $zone_test"
+    ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$zone_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/gateway-zone.log"
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" control::core_forward::tests:: --ignored --test-threads=1 --nocapture | tee "$work/core-forward.log"
     ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
     ip netns exec client nft add table inet honk_smoke_driven
@@ -304,14 +400,9 @@ counter = next(item['counter'] for item in rules[0] if 'counter' in item)
 assert counter['packets'] == 0, ('native forwarding masked real Runtime evidence', counter)
 PY
     for dev in dut0 dut1; do
-        ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
-        guard_id=$(<"$driven_work/driven-runtime.$dev.guard-id")
-        ip netns exec dut env HONK_XDP_PIN_ROOT="$work/bpf/driven-runtime" python3 "$HONK_XDP_PROBE" identity "$dev" guard "$guard_id"
-        ip -n dut link set "$dev" xdp off
-        rm "$work/bpf/driven-runtime/xdp-$ifindex/guard" "$work/bpf/driven-runtime/xdp-$ifindex/data"
-        rmdir "$work/bpf/driven-runtime/xdp-$ifindex"
+        ip netns exec dut python3 "$HONK_XDP_PROBE" xdp-absent "$dev"
     done
-    rmdir "$work/bpf/driven-runtime"
+    [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'driven runtime left physical program pins'
     done
     ip netns exec client nft delete table inet honk_smoke_driven
     ip netns exec dut nft flush chain inet honk_smoke_native forward
@@ -717,6 +808,15 @@ write_config() {
         packet_policy="dport(18083) -> direct(must)
     domain(packet-path.test) -> block"
     fi
+    if [[ $direct == 'direct: endpoint' && -z $packet_policy ]]; then
+        # endpoint-candidate-unflagged needs a barrier because D1 passes static Direct to the kernel.
+        # endpoint-crash needs a barrier to establish Endpoint traffic before SIGKILL.
+        # endpoint-vlan needs a barrier to test the Endpoint VLAN consumer rather than D1 PASS.
+        # endpoint-vlan-offload needs a barrier to test recovered tags in Endpoint.
+        # endpoint-vlan-single-offload needs a barrier to keep its tagged traffic in Endpoint.
+        # endpoint-jumbo needs a barrier to test real Endpoint SG consumption rather than D1 PASS.
+        packet_policy='domain(endpoint-consumer.invalid) -> block'
+    fi
     if [[ ${4:-} == endpoint ]]; then
         log_level=debug
         polling="poll_mode: event
@@ -798,19 +898,15 @@ PY
         done
         [[ $ready == true ]] || fail 'RX1/TX2 readiness deadline'
         for dev in asym dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" identity "$dev" data; done
-        for dev in asym dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" pin-id "$dev" guard >"$work/asymmetric.$dev.guard-id"; done
         kill -TERM "$daemon_pid"
         timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'RX1/TX2 shutdown deadline'
         wait "$daemon_pid"
         daemon_pid=
         stop_sources
         for dev in asym dut1; do
-            ip netns exec dut python3 "$HONK_XDP_PROBE" identity "$dev" guard "$(<"$work/asymmetric.$dev.guard-id")"
-            ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
-            ip -n dut link set "$dev" xdp off
-            rm "$work/bpf/xdp-$ifindex/guard" "$work/bpf/xdp-$ifindex/data"
-            rmdir "$work/bpf/xdp-$ifindex"
+            ip netns exec dut python3 "$HONK_XDP_PROBE" xdp-absent "$dev"
         done
+        [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'asymmetric capture left physical program pins'
         ip netns exec dut python3 "$work/check.py" absent
     fi
     ip -n dut link del asym
@@ -856,14 +952,15 @@ for profile in endpoint core; do
     status=$?
     set -e
     [[ $status != 0 && $status != 124 && $status != 137 ]] || fail 'low logical MTU did not reject startup'
-    grep -q 'XDP logical MTU must be at least 1280' "$work/low-mtu-$profile.log" || fail 'low-MTU rejection missed its contract'
+    # The gateway's capture_layout admission now refuses MTU <1280 before the logical-MTU check runs.
+    grep -qE 'capture realm requires unicast MAC and MTU >=1280|XDP logical MTU must be at least 1280' "$work/low-mtu-$profile.log" || fail 'low-MTU rejection missed its contract'
     if grep -q 'XDP queue bound' "$work/low-mtu-$profile.log"; then fail 'low MTU reached device startup'; fi
     ip netns exec dut python3 "$work/check.py" absent
     [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'low MTU left pinned kernel objects'
 done
 ip -n dut link del lowmtu
 mark_phase admission complete
-profiles=(endpoint endpoint-candidate-unflagged core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo)
+profiles=(endpoint endpoint-candidate-unflagged endpoint-crash core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo)
 for profile in "${profiles[@]}"; do
     mark_phase "$profile" setup-begin
     for spec in 'client c0' 'server s0' 'server su'; do
@@ -902,18 +999,19 @@ for profile in "${profiles[@]}"; do
         provision_routes c0 s0 dut0 dut1
     fi
     ip netns exec dut nft flush chain inet honk_smoke_native forward
-    mark_phase "$profile" guard-positive-begin
-    python3 "$HONK_XDP_PROBE" guard delivered "$client_dev" "$server_dev" | tee "$work/$profile.guard-positive.log"
+    mark_phase "$profile" kernel-baseline-begin
+    python3 "$HONK_XDP_PROBE" guard delivered "$client_dev" "$server_dev" | tee "$work/$profile.kernel-baseline.log"
     if [[ $profile == endpoint-vlan ]]; then
         ip netns exec dut sysctl -qw net.ipv4.ip_forward=0 net.ipv6.conf.all.forwarding=0
         HONK_XDP_INLINE_QINQ=1 python3 "$HONK_XDP_PROBE" native-baseline | tee "$work/native-qinq-baseline.log"
         ip netns exec dut sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
     fi
-    mark_phase "$profile" guard-positive-complete
+    mark_phase "$profile" kernel-baseline-complete
     ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
     direct=core
     if [[ $profile == endpoint* ]]; then direct=endpoint; fi
     check_mode=data
+    native_fence_expected=0
     write_config "$work/$profile.dae" 'backend: xdp' "direct: $direct" "$profile" 'copy'
     polling_args=()
     if [[ $profile == endpoint ]]; then
@@ -950,7 +1048,7 @@ print('all selected RX queues bound before readiness')
 PY
     mark_phase "$profile" pre-client-check-begin
     ip netns exec dut python3 "$work/check.py" "$check_mode"
-    for dev in dut0 dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" pin-id "$dev" guard >"$work/$profile.$dev.guard-id"; done
+    for dev in dut0 dut1; do ip netns exec dut python3 "$HONK_XDP_PROBE" foreign-xdp-rejected "$dev"; done
     ip -n dut -j -d link show >"$work/$profile.links.json"
     mark_phase "$profile" client-begin
     ip netns exec client python3 "$work/client.py" "$profile" "$work/$profile.dae" "$work/$profile.daemon.log" "$daemon_pid" | tee "$work/$profile.client.log"
@@ -965,6 +1063,7 @@ PY
     mark_phase "$profile" producers-settled
     if [[ $profile == endpoint || $profile == core ]]; then
         python3 "$HONK_XDP_PROBE" domain "$profile" | tee "$work/$profile.domain-routing.log"
+        if [[ $profile == endpoint ]]; then native_fence_expected=2; fi
     fi
     if [[ $profile == snat || $profile == masquerade ]]; then
         ip netns exec server cat /proc/net/tcp >"$work/$profile.server-tcp.txt"
@@ -979,32 +1078,30 @@ PY
         HONK_XDP_SINGLE_VLAN=1 python3 "$HONK_XDP_PROBE" padding | tee "$work/$profile.padded-vlan.log"
     fi
     mark_phase "$profile" probes-complete
-    ip netns exec dut python3 "$work/check.py" "$check_mode"
+    ip netns exec dut python3 "$work/check.py" "$check_mode" "$native_fence_expected"
     mark_phase "$profile" shutdown-begin
-    kill -TERM "$daemon_pid"
-    timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'daemon shutdown deadline (guard custody retained)'
+    if [[ $profile == endpoint-crash ]]; then kill -KILL "$daemon_pid"; else kill -TERM "$daemon_pid"; fi
+    timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'daemon shutdown deadline'
     daemon_status=0
     wait "$daemon_pid" || daemon_status=$?
     daemon_pid=
-    [[ $daemon_status == 0 ]] || fail "$profile daemon exited with status $daemon_status"
+    if [[ $profile == endpoint-crash ]]; then
+        [[ $daemon_status == 137 ]] || fail "$profile did not terminate through SIGKILL: $daemon_status"
+    else
+        [[ $daemon_status == 0 ]] || fail "$profile daemon exited with status $daemon_status"
+    fi
     mark_phase "$profile" daemon-joined
     ip netns exec dut nft flush chain inet honk_smoke_native forward
-    grep -q 'XDP admission closed; UMEM retained until process exit' "$work/$profile.daemon.log" || fail 'missing shutdown admission fence'
-    mark_phase "$profile" guard-negative-begin
-    guard_check=guard
-    ip netns exec dut python3 "$work/check.py" "$guard_check" "$work/$profile"
-    python3 "$HONK_XDP_PROBE" guard refused "$client_dev" "$server_dev" | tee "$work/$profile.guard-negative.log"
-    mark_phase "$profile" guard-negative-complete
-    stop_sources
-    # Deliberate operator removal with traffic already stopped; never automatic hot reopen.
-    for dev in dut0 dut1; do
-        ifindex=$(ip netns exec dut cat "/sys/class/net/$dev/ifindex")
-        [[ -f $work/bpf/xdp-$ifindex/guard && -f $work/bpf/xdp-$ifindex/data ]] || fail 'missing persistent program pins'
-        ip -n dut link set "$dev" xdp off
-        rm "$work/bpf/xdp-$ifindex/guard" "$work/bpf/xdp-$ifindex/data"
-        rmdir "$work/bpf/xdp-$ifindex"
-    done
+    if [[ $profile != endpoint-crash ]]; then
+        grep -q 'XDP admission closed; UMEM retained until process exit' "$work/$profile.daemon.log" || fail 'missing shutdown admission fence'
+    fi
+    mark_phase "$profile" kernel-recovery-begin
     ip netns exec dut python3 "$work/check.py" absent
+    [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'FD capture left persistent physical pins'
+    python3 "$HONK_XDP_PROBE" guard delivered "$client_dev" "$server_dev" | tee "$work/$profile.kernel-wire.log"
+    check_kernel_recovery | tee "$work/$profile.kernel-connections.log"
+    mark_phase "$profile" kernel-recovery-complete
+    stop_sources
     mark_phase "$profile" detached
     if [[ $profile == *-jumbo ]]; then
         for spec in 'dut dut0' 'dut dut1' 'dut up' 'client c0' 'server s0' 'server su'; do
@@ -1072,5 +1169,5 @@ stop_sources
 ip netns exec dut python3 "$work/check.py" absent
 mark_phase tc complete
 printf 'PASS: omitted-datapath real TC startup, IPv4/IPv6 TCP/UDP and new-flow Block/Direct SIGHUP reload.\n'
-printf 'PASS: real capture and Endpoint/Core consumption for IPv4/IPv6 TCP/UDP, QinQ, IPv4 NAT, binding-mode admission/reload, selected guard wire refusal, and veth MTU 1500/9000.\n'
+printf 'PASS: real capture and Endpoint/Core consumption for IPv4/IPv6 TCP/UDP, QinQ, IPv4 NAT, binding-mode admission/reload, FD close kernel recovery, foreign-XDP rejection, and veth MTU 1500/9000.\n'
 printf 'IPv6 Core uses flow-label zero; veth copy/SG results do not establish physical zero-copy, jumbo performance or DMA release.\n'

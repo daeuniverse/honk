@@ -37,6 +37,20 @@ struct Link {
     xdp: u32,
 }
 
+fn normalize_owned_xdp(
+    before: &Link,
+    after: &mut Link,
+    initial: &[(u32, u32)],
+    expected: &[(u32, u32)],
+) {
+    if before.ifindex == after.ifindex
+        && initial.contains(&(before.ifindex, before.xdp))
+        && expected.contains(&(after.ifindex, after.xdp))
+    {
+        after.xdp = before.xdp;
+    }
+}
+
 struct Inventory {
     links: Vec<Link>,
     records: Vec<Vec<u8>>,
@@ -172,6 +186,7 @@ pub(crate) struct CustodySnapshot {
     tcx_fds: Vec<OwnedFd>,
     xdp: Vec<(u32, u32)>,
     owned_programs: Vec<u32>,
+    gateway: Mutex<Option<Arc<crate::xdp::gateway::GatewayPublisher>>>,
     _charge: MemoryReservation,
 }
 
@@ -309,8 +324,20 @@ impl CustodySnapshot {
             tcx_fds,
             xdp: expected_xdp.to_vec(),
             owned_programs: owned_program_ids.to_vec(),
+            gateway: Mutex::new(None),
             _charge: charge,
         })
+    }
+    pub(super) fn set_gateway(
+        &self,
+        publisher: Arc<crate::xdp::gateway::GatewayPublisher>,
+    ) -> anyhow::Result<()> {
+        publisher.validate_programs(|_| Ok(()))?;
+        *self
+            .gateway
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Host gateway custody lock poisoned"))? = Some(publisher);
+        Ok(())
     }
 
     pub(crate) fn revalidate(&self) -> anyhow::Result<()> {
@@ -359,20 +386,31 @@ impl CustodySnapshot {
             }
             Ok(())
         })?;
-        let mut current = channels.inventory(self.private_pair, &self.selected, &self.xdp)?;
-        current.seal()?;
-        for (before, after) in self.inventory.links.iter().zip(&mut current.links) {
-            if before.ifindex == after.ifindex
-                && self.xdp.contains(&(before.ifindex, before.xdp))
-                && self.xdp.contains(&(after.ifindex, after.xdp))
-            {
-                after.xdp = before.xdp;
+        let gateway = self
+            .gateway
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Host gateway custody lock poisoned"))?;
+        let mut validate = |physical: &[(u32, u32)]| -> io::Result<()> {
+            let mut expected = self.xdp.clone();
+            expected.retain(|binding| !physical.iter().any(|current| current.0 == binding.0));
+            expected.extend_from_slice(physical);
+            let mut current = channels
+                .inventory(self.private_pair, &self.selected, &expected)
+                .map_err(io::Error::other)?;
+            current.seal()?;
+            for (before, after) in self.inventory.links.iter().zip(&mut current.links) {
+                normalize_owned_xdp(before, after, &self.xdp, &expected);
             }
+            if current.links != self.inventory.links || current.records != self.inventory.records {
+                return Err(invalid("Host namespace custody inventory changed"));
+            }
+            Ok(())
+        };
+        if let Some(publisher) = gateway.as_ref() {
+            publisher.validate_programs(validate)?;
+        } else {
+            validate(&[])?;
         }
-        ensure!(
-            current.links == self.inventory.links && current.records == self.inventory.records,
-            "Host namespace custody inventory changed"
-        );
         for (&binding, fd) in self.tcx.iter().zip(&self.tcx_fds) {
             check_link(fd.as_fd(), binding)?;
         }
@@ -1239,6 +1277,36 @@ fn check_link(fd: BorrowedFd<'_>, expected: TcxBinding) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_owned_link_reload_preserves_host_custody_and_rejects_foreign_program() {
+        let link = |program, expected: &[(u32, u32)]| {
+            let mut body = vec![0; 16];
+            body[2..4].copy_from_slice(&1u16.to_ne_bytes());
+            body[4..8].copy_from_slice(&2u32.to_ne_bytes());
+            put_attribute(&mut body, 1, &[2, 0, 0, 0, 0, 1]);
+            put_attribute(&mut body, 3, b"eth0\0");
+            put_attribute(&mut body, 4, &1500u32.to_ne_bytes());
+            let mut xdp = Vec::new();
+            put_attribute(&mut xdp, 2, &[1]);
+            put_attribute(&mut xdp, 4, &u32::to_ne_bytes(program));
+            put_attribute(&mut xdp, 5, &u32::to_ne_bytes(program));
+            put_attribute(&mut body, 43, &xdp);
+            parse_link(&body, [10, 0], expected)
+        };
+        let initial = [(2, 5)];
+        let owned_readback = [(2, 7)];
+        let before = link(5, &initial).unwrap();
+        let mut after = link(7, &owned_readback).unwrap();
+        assert_ne!(before, after);
+        normalize_owned_xdp(&before, &mut after, &initial, &owned_readback);
+        assert_eq!(before, after);
+        assert!(link(9, &owned_readback).is_err());
+        let mut changed_mtu = link(7, &owned_readback).unwrap();
+        changed_mtu.mtu = 9000;
+        normalize_owned_xdp(&before, &mut changed_mtu, &initial, &owned_readback);
+        assert_ne!(before, changed_mtu);
+    }
 
     #[test]
     fn apparmor_hook_record_boundary() {

@@ -63,6 +63,37 @@ struct State {
     clock_events: polling::testing::ClockEvents,
 }
 
+impl State {
+    fn diagnostic(&self) -> serde_json::Value {
+        let state = &self.polling;
+        serde_json::json!({
+            "high": state.high, "low": state.low, "qualified_rx": state.qualified_rx,
+            "published_tx": state.published_tx, "rx_high_windows": state.rx_high_windows,
+            "tx_high_windows": state.tx_high_windows, "probe_rounds": state.probe_rounds,
+            "reason": state.reason, "pollable": state.pollable,
+            "local_revision": state.local_revision, "process_revision": state.process_revision,
+            "mode": format!("{:?}", state.mode), "busy_entries": state.busy_entries,
+            "waiting": state.waiting, "pending": state.pending, "cursors": state.cursors,
+            "clock": format!("{:?}", state.clock), "clock_error": state.clock_error,
+            "attempts": {"started": self.attempts.started, "completed": self.attempts.completed, "canceled": self.attempts.canceled},
+            "fair_turns": self.fair_turns,
+            "missing_queue_data": state.queues.is_empty().then_some("polling_test_snapshot contains no queue observations"),
+            "queues": state.queues.iter().map(|queue| serde_json::json!({
+                "device": queue.device, "queue": queue.id, "rx": queue.counters.rx,
+                "tx": queue.counters.published_packets, "submitted": queue.counters.submitted,
+                "completed": queue.counters.completed, "fill": queue.counters.fill,
+                "invalid": queue.counters.invalid, "rx_kicks": queue.counters.rx_kicks,
+                "tx_kicks": queue.counters.tx_kicks, "wakeup_errors": queue.counters.wakeup_errors,
+                "publication_count_unavailable": queue.counters.publication_count_unavailable,
+                "rings": {"rx_producer": queue.rings.rx_producer, "rx_consumer": queue.rings.rx_consumer,
+                    "tx_producer": queue.rings.tx_producer, "tx_consumer": queue.rings.tx_consumer,
+                    "fill_producer": queue.rings.fill_producer, "fill_consumer": queue.rings.fill_consumer,
+                    "cq_producer": queue.rings.cq_producer, "cq_consumer": queue.rings.cq_consumer}
+            })).collect::<Vec<_>>()
+        })
+    }
+}
+
 struct Retired {
     plane: Option<ControlPlane>,
     state: State,
@@ -71,13 +102,11 @@ struct Retired {
     failure: Option<anyhow::Error>,
 }
 
-/// Exact persistent guards a joined owner leaves installed. `serve` never detaches or
-/// unpins; only `Retired::release` may, after real producer quiescence.
+/// Joined capture owners retain fixture namespace custody until their producers exit.
 struct Terminal {
     namespace: OwnedNamespace,
     source: &'static str,
-    guards: Vec<(u32, &'static str, u32)>,
-    pins: PathBuf,
+    devices: Vec<(u32, &'static str)>,
     custody: Arc<std::sync::Mutex<Option<NamespaceCustody>>>,
     released: bool,
 }
@@ -85,7 +114,7 @@ struct Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if !self.released {
-            // Unreleased guards/pins keep their nsfs/mount custody until process exit.
+            // Unreleased fixture namespaces stay owned until process exit.
             std::mem::forget(Arc::clone(&self.custody));
             std::mem::forget(Arc::clone(&self.namespace.net));
         }
@@ -96,23 +125,28 @@ impl Drop for Terminal {
 struct TcpExited(());
 
 impl Retired {
-    /// The controller's sole teardown frontier. Any error leaves every unreleased guard,
-    /// pin and namespace custody in place, and the joined marker is never written.
+    /// Namespace teardown still waits for actual producer completion after capture detaches.
     async fn release(&mut self, pump: &mut Pump, tcp: Option<&TcpExited>) -> anyhow::Result<()> {
         let terminal = &mut self.terminal;
         ensure!(!terminal.released, "terminal bundle released twice");
         ensure!(
             terminal.source == "b" || tcp.is_some(),
-            "A guard teardown requires the actual TCP peer exit"
+            "A namespace teardown requires the actual TCP peer exit"
         );
         // A's real STOP reply covers both LAN and WAN streams.
         pump.set(terminal.source, false).await?;
         let namespace = &terminal.namespace;
-        let mut names = Vec::new();
-        for &(ifindex, mac, guard) in &terminal.guards {
-            let directory = terminal.pins.join(format!("xdp-{ifindex}"));
+        for &(ifindex, mac) in &terminal.devices {
             let (name, _) = owned_link(namespace, ifindex, mac).await?;
-            exact_guard(namespace, ifindex, guard, &directory).await?;
+            let state = owned_xdp_state(namespace, ifindex).await?;
+            ensure!(
+                state.attached == 0
+                    && state.prog_id == 0
+                    && state.drv_prog_id == 0
+                    && state.skb_prog_id == 0
+                    && state.hw_prog_id == 0,
+                "FD-owned XDP survived capture close: {state:?}"
+            );
             owned_command(
                 namespace,
                 &["ip", "link", "set", "dev", name.as_str(), "down"],
@@ -123,31 +157,7 @@ impl Retired {
                 down == name && !up,
                 "owned capture device {name} did not read back administratively down"
             );
-            exact_guard(namespace, ifindex, guard, &directory).await?;
-            names.push((name, ifindex, directory));
         }
-        // Every device is quiesced and still guarded; only now detach and unpin.
-        for (name, ifindex, directory) in names {
-            owned_command(
-                namespace,
-                &["ip", "link", "set", "dev", name.as_str(), "xdp", "off"],
-            )
-            .await?;
-            let state = guard_state(namespace, ifindex).await?;
-            ensure!(
-                state.attached == 0
-                    && state.prog_id == 0
-                    && state.drv_prog_id == 0
-                    && state.skb_prog_id == 0
-                    && state.hw_prog_id == 0,
-                "exact owned guard survived detach: {state:?}"
-            );
-            for file in ["guard", "data"] {
-                std::fs::remove_file(directory.join(file))?;
-            }
-            std::fs::remove_dir(directory)?;
-        }
-        std::fs::remove_dir(&terminal.pins)?;
         terminal.released = true;
         Ok(())
     }
@@ -185,32 +195,8 @@ async fn owned_link(
     Ok((name, up))
 }
 
-async fn exact_guard(
-    namespace: &OwnedNamespace,
-    ifindex: u32,
-    guard: u32,
-    pins: &Path,
-) -> anyhow::Result<()> {
-    let state = guard_state(namespace, ifindex).await?;
-    ensure!(
-        state.attached == 1
-            && state.prog_id == guard
-            && state.drv_prog_id == guard
-            && state.skb_prog_id == 0
-            && state.hw_prog_id == 0,
-        "exact owned native guard changed before teardown: {state:?}"
-    );
-    for file in ["guard", "data"] {
-        ensure!(
-            std::fs::symlink_metadata(pins.join(file))?.is_file(),
-            "owned {file} pin changed before teardown"
-        );
-    }
-    Ok(())
-}
-
 /// Real netlink readback inside the retained namespace, on a thread owning nothing else.
-async fn guard_state(
+async fn owned_xdp_state(
     namespace: &OwnedNamespace,
     ifindex: u32,
 ) -> anyhow::Result<honk_xsk::XdpState> {
@@ -269,6 +255,11 @@ async fn within<T>(
 enum Request {
     State(oneshot::Sender<State>),
     Gap(Duration, oneshot::Sender<()>),
+    TcpHold(
+        std::net::SocketAddrV4,
+        std::net::SocketAddrV4,
+        oneshot::Sender<anyhow::Result<bool>>,
+    ),
 }
 
 struct Ready {
@@ -287,6 +278,13 @@ struct Owner {
     finished: oneshot::Receiver<anyhow::Result<Retired>>,
     thread: Option<std::thread::JoinHandle<()>>,
     custody: Arc<std::sync::Mutex<Option<NamespaceCustody>>>,
+    label: &'static str,
+    artifacts: PathBuf,
+    last_state: std::sync::Mutex<Option<State>>,
+    request_timing: std::sync::Mutex<serde_json::Value>,
+    last_state_timing: std::sync::Mutex<serde_json::Value>,
+    diagnostic_pump: std::sync::Weak<tokio::sync::Mutex<PumpIo>>,
+    diagnostic_written: AtomicBool,
 }
 
 impl Owner {
@@ -302,6 +300,16 @@ impl Owner {
         let (finished, mut done) = oneshot::channel();
         let owner_config = config.clone();
         let custody = Arc::new(std::sync::Mutex::new(None));
+        let diagnostic_artifacts = artifacts.clone();
+        let label = if config
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.direct == Some(DirectProfile::Core))
+        {
+            "a"
+        } else {
+            "b"
+        };
         let thread_custody = Arc::clone(&custody);
         let thread = std::thread::Builder::new()
             .name(format!("e4-{}", namespace.name))
@@ -394,34 +402,142 @@ impl Owner {
             finished: done,
             thread: Some(thread),
             custody,
+            label,
+            artifacts: diagnostic_artifacts,
+            last_state: std::sync::Mutex::new(None),
+            request_timing: std::sync::Mutex::new(serde_json::Value::Null),
+            last_state_timing: std::sync::Mutex::new(serde_json::Value::Null),
+            diagnostic_pump: std::sync::Weak::new(),
+            diagnostic_written: AtomicBool::new(false),
         })
     }
 
     async fn state(&self) -> anyhow::Result<State> {
         let (send, receive) = oneshot::channel();
-        within(self.deadline, "actual owner observation", async {
+        *self.request_timing.lock().unwrap() = serde_json::json!({"clock": "std::time::Instant", "started": format!("{:?}", Instant::now()), "sent": null, "reply": null});
+        let result = within(self.deadline, "actual owner observation", async {
             self.ready
                 .requests
                 .send(Request::State(send))
                 .await
                 .map_err(|_| anyhow::anyhow!("actual owner ended before state observation"))?;
+            self.request_timing.lock().unwrap()["sent"] =
+                serde_json::json!(format!("{:?}", Instant::now()));
             receive.await.context("actual owner observation closed")
         })
-        .await
+        .await;
+        if let Ok(state) = &result {
+            self.request_timing.lock().unwrap()["reply"] =
+                serde_json::json!(format!("{:?}", Instant::now()));
+            *self.last_state_timing.lock().unwrap() = self.request_timing.lock().unwrap().clone();
+            *self.last_state.lock().unwrap() = Some(state.clone());
+        }
+        result
     }
 
     async fn wait_for(&self, predicate: impl Fn(&State) -> bool) -> anyhow::Result<State> {
         loop {
-            let state = self.state().await?;
+            let state = match self.state().await {
+                Ok(state) => state,
+                Err(error) => return Err(self.diagnostic_error(error).await),
+            };
             if predicate(&state) {
                 return Ok(state);
             }
-            ensure!(
-                Instant::now() < self.deadline,
-                "actual owner condition exceeded fixture deadline: {state:?}"
-            );
+            if Instant::now() >= self.deadline {
+                return Err(self
+                    .diagnostic_error(anyhow::anyhow!(
+                        "actual owner condition exceeded fixture deadline: {state:?}"
+                    ))
+                    .await);
+            }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+    }
+
+    async fn wait_for_retired_tcp_hold(
+        &self,
+        client: std::net::SocketAddrV4,
+        target: std::net::SocketAddrV4,
+        deadline: Instant,
+    ) -> anyhow::Result<()> {
+        within(
+            deadline,
+            "B TCP retirement with a live gateway hold",
+            async {
+                loop {
+                    let (send, receive) = oneshot::channel();
+                    self.ready
+                        .requests
+                        .send(Request::TcpHold(client, target, send))
+                        .await
+                        .map_err(|_| anyhow::anyhow!("B ended before TCP retirement readback"))?;
+                    if receive
+                        .await
+                        .context("B TCP retirement readback closed")??
+                    {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            },
+        )
+        .await
+    }
+
+    async fn diagnostic_error(&self, error: anyhow::Error) -> anyhow::Error {
+        let path = self
+            .artifacts
+            .join(format!("adaptive-last-state-{}.json", self.label));
+        if self.diagnostic_written.load(Ordering::SeqCst) {
+            return error.context(format!(
+                "adaptive last state already recorded: {}",
+                path.display()
+            ));
+        }
+        let last_state = self.last_state.lock().unwrap().clone();
+        let request_timing = self.request_timing.lock().unwrap().clone();
+        let last_state_timing = self.last_state_timing.lock().unwrap().clone();
+        let diagnostic_started = Instant::now();
+        let diagnostic_deadline = diagnostic_started + Duration::from_secs(2);
+        let pump = if let Some(pump) = self.diagnostic_pump.upgrade() {
+            match tokio::time::timeout_at(
+                tokio::time::Instant::from_std(diagnostic_deadline),
+                pump.lock(),
+            )
+            .await
+            {
+                Ok(mut pump) => pump.diagnostic_status(diagnostic_deadline).await,
+                Err(error) => {
+                    serde_json::json!({"error": format!("STATUS transport diagnostic deadline: {error}"), "sent": null, "reply": null})
+                }
+            }
+        } else {
+            serde_json::json!({"error": "STATUS unavailable: the pump has not started or its transport has been released"})
+        };
+        let diagnostic = serde_json::json!({
+            "owner": self.label, "last_state": last_state.as_ref().map(State::diagnostic),
+            "missing_state_reason": last_state.is_none().then_some("owner has not acknowledged any State request"),
+            "queue_coverage": if self.config.datapath.as_ref().is_some_and(|datapath| datapath.effective_workers() > 1) {
+                "polling_test_snapshot exposes only this owner; worker 1 queue RX/TX/rings are unavailable"
+            } else { "all queue observations exported by polling_test_snapshot" },
+            "state_request": request_timing, "pump": pump, "failure": format!("{error:#}"),
+            "last_successful_state_request": last_state_timing,
+            "verdict": "FAIL", "fixture_window_seconds": WINDOW.as_secs(),
+            "fixture_deadline": format!("{:?}", self.deadline),
+            "diagnostic_started": format!("{diagnostic_started:?}"),
+            "diagnostic_deadline": format!("{diagnostic_deadline:?}"),
+            "diagnostic_budget_ms": 2000,
+            "diagnostic_after_fixture_deadline": diagnostic_started >= self.deadline,
+        });
+        // Claimed only here, after the last await: the fixture-wide timeout can cancel an
+        // inner wait_for's attempt, and that must not suppress the outer record.
+        self.diagnostic_written.store(true, Ordering::SeqCst);
+        let write_error = std::fs::write(&path, diagnostic.to_string()).err();
+        error.context(format!(
+            "adaptive last state: artifact={}; write_error={write_error:?}; {diagnostic}",
+            path.display()
+        ))
     }
 
     async fn gap(&self, duration: Duration) -> anyhow::Result<()> {
@@ -910,6 +1026,27 @@ async fn serve(
                     tokio::time::sleep_until(tokio::time::Instant::from_std(until)).await;
                     let _ = reply.send(());
                 }
+                Some(Request::TcpHold(client, target, reply)) => {
+                    let observed = (|| {
+                        let [realm] = runtime.realms.as_slice() else {
+                            anyhow::bail!("B TCP witness requires one capture realm");
+                        };
+                        let key = honk_ebpf_common::xdp_gateway::GatewayKey {
+                            realm_id: realm.realm_id,
+                            family: 4,
+                            src: client.ip().to_ipv6_mapped().octets(),
+                            dst: target.ip().to_ipv6_mapped().octets(),
+                            sport: client.port().to_be(),
+                            dport: target.port().to_be(),
+                            proto: wire::PROTO_TCP,
+                            reserved: [0; 3],
+                        };
+                        let maps = runtime.gateway_maps.as_ref().context("B gateway hold map")?;
+                        ensure!(maps.lookup_hold(&key)?.is_some(), "missing live B TCP hold: {client} -> {target}");
+                        Ok(!runtime.endpoints.retains(realm.driver.scope(), client.into(), target.into(), wire::PROTO_TCP))
+                    })();
+                    let _ = reply.send(observed);
+                }
                 None => {
                     failure.get_or_insert_with(|| anyhow::anyhow!("fixture controller left an active owner"));
                 }
@@ -975,14 +1112,12 @@ async fn serve(
         fair_thread: *fair_thread.lock().unwrap(),
         clock_events: control.clock_events(),
     };
-    // Autonomous closure only drains local owners; exact guards and pins stay installed.
     let source = if runtime.core.is_some() { "a" } else { "b" };
-    let mut guards = Vec::new();
+    let mut devices = Vec::new();
     for device in &mut runtime.devices {
-        let guard = device.programs.discover_prog_id();
         ensure!(
-            honk_xsk::xdp_state(device.info.ifindex)?.prog_id == guard,
-            "owned guard identity changed before retirement"
+            honk_xsk::xdp_absent(device.info.ifindex)?,
+            "FD-owned capture survived close"
         );
         for queue in device.queues.drain(..) {
             let mut port = queue.io.into_inner();
@@ -996,12 +1131,13 @@ async fn serve(
             );
             port.close_socket();
         }
+        device.vlan_offload.restore()?;
         let &(_, mac) = namespace
             .devices
             .iter()
             .find(|(name, _)| *name == device.info.name)
             .context("owner captured an unowned device")?;
-        guards.push((device.info.ifindex, mac, guard));
+        devices.push((device.info.ifindex, mac));
     }
     #[cfg(feature = "ebpf")]
     if let Some(host) = runtime.host.take() {
@@ -1015,8 +1151,7 @@ async fn serve(
         terminal: Terminal {
             namespace,
             source,
-            guards,
-            pins,
+            devices,
             custody,
             released: false,
         },
@@ -1107,7 +1242,7 @@ impl Rig {
         );
         retired.release(&mut self.pump, None).await?;
         self.restore_b_link().await?;
-        let owner = Owner::start(
+        let mut owner = Owner::start(
             config,
             PollBudgetBinding::Participant(self.budget.clone()),
             self.b_namespace.clone(),
@@ -1116,6 +1251,7 @@ impl Rig {
             self.deadline,
         )
         .await?;
+        owner.diagnostic_pump = Arc::downgrade(&self.pump.io);
         let state = owner.state().await?;
         self.b = Some(owner);
         Ok((retired, state))
@@ -1278,7 +1414,6 @@ with namespace('server'):
     server.bind(('198.51.100.2', 18086))
     server.setblocking(False)
 select.register(server, selectors.EVENT_READ, 'server')
-os.close(home)
 destination = socket.inet_aton('198.51.100.2')
 
 def send(label, state):
@@ -1293,15 +1428,43 @@ def send(label, state):
     state['transmit'][sequence % 2].send(state['ethernet'] + ip + body)
     state['sent'] += 1
 
-def low(label, state):
-    # Fully valid, unmatched RST input has no admitted flow and elicits no RST.
-    # Real RX rounds can close zero-qualified-packet windows without an idle timer.
+low_tuple = None
+
+def seed_tcp(client_address, target_address):
+    with namespace('server'):
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with namespace('b'):
+        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    with listener, client:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(target_address)
+        listener.listen(1)
+        listener.settimeout(min(8, deadline - time.monotonic()))
+        client.settimeout(min(8, deadline - time.monotonic()))
+        client.bind(client_address)
+        client.connect(target_address)
+        upstream, address = listener.accept()
+        with upstream:
+            assert address[0] == '10.78.0.1', ('not the actual B Endpoint dial', address)
+            upstream.settimeout(min(8, deadline - time.monotonic()))
+            client.sendall(b'B')
+            assert upstream.recv(1) == b'B', 'B lost client TCP data'
+            upstream.sendall(b'R')
+            assert client.recv(1) == b'R', 'B lost upstream TCP data'
+            # B must receive the first FIN so its Endpoint closes through LAST_ACK.
+            client.shutdown(socket.SHUT_WR)
+            assert upstream.recv(1) == b'', 'B did not forward the client FIN'
+            upstream.shutdown(socket.SHUT_WR)
+            assert client.recv(1) == b'', 'B did not forward the upstream FIN'
+
+def low(state):
+    source, sport, dport = low_tuple
     state['sequence'] += 1
     sequence = state['sequence']
-    body = struct.pack('!HHIIBBHHH', 47000 + sequence % 64, 18084, sequence, 0, 5 << 4, 4, 0, 0, 0)
-    pseudo = state['source'] + destination + struct.pack('!BBH', 0, 6, len(body))
+    body = struct.pack('!HHIIBBHHH', sport, dport, sequence, 0, 5 << 4, 4, 0, 0, 0)
+    pseudo = source + destination + struct.pack('!BBH', 0, 6, len(body))
     body = body[:16] + struct.pack('!H', checksum(pseudo + body)) + body[18:]
-    ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(body), sequence % 65536, 0, 64, 6, 0, state['source'], destination)
+    ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(body), sequence % 65536, 0, 64, 6, 0, source, destination)
     ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
     state['transmit'][sequence % 2].send(state['ethernet'] + ip + body)
     state['sent'] += 1
@@ -1315,7 +1478,7 @@ while running:
     if now >= next_send:
         for label, state in owners.items():
             if state['running'] == 'low':
-                low(label, state)
+                low(state)
             elif state['running']:
                 for _ in range(64):
                     send(label, state)
@@ -1326,9 +1489,21 @@ while running:
             line = sys.stdin.readline()
             assert line, 'UDP controller vanished before QUIT'
             command, target = line.strip().split()
-            if command in ['RUN', 'STOP', 'LOW']:
+            if command == 'SEED':
+                client_ip, client_port, target_port = target.split(':')
+                sport, dport = int(client_port), int(target_port)
+                seed_tcp((client_ip, sport), (socket.inet_ntoa(destination), dport))
+                low_tuple = (socket.inet_aton(client_ip), sport, dport)
+                print(command + ' ' + target, flush=True)
+            elif command == 'LOW':
+                assert target == 'b' and low_tuple is not None
+                owners[target]['running'] = 'low'
+                low(owners[target])
+                next_send = time.monotonic() + 0.002
+                print(command + ' ' + target, flush=True)
+            elif command in ['RUN', 'STOP']:
                 for name in (['a', 'w'] if target == 'a' else [target]):
-                    owners[name]['running'] = 'low' if command == 'LOW' else command == 'RUN'
+                    owners[name]['running'] = command == 'RUN'
                 print(command + ' ' + target, flush=True)
             elif command == 'STATUS':
                 counts = {name: {field: state[field] for field in ['sent', 'received', 'upstream']}
@@ -1383,14 +1558,75 @@ for state in owners.values():
         sock.close()
 server.close()
 select.close()
+os.close(home)
 "#;
 
 struct Pump {
     child: Child,
+    io: Arc<tokio::sync::Mutex<PumpIo>>,
+    deadline: Instant,
+    _namespaces: Vec<std::fs::File>,
+}
+
+struct PumpIo {
     input: ChildStdin,
     output: Lines<BufReader<ChildStdout>>,
     deadline: Instant,
-    _namespaces: Vec<std::fs::File>,
+    status_timing: serde_json::Value,
+    diagnostic_status: Option<serde_json::Value>,
+}
+
+impl PumpIo {
+    async fn diagnostic_status(&mut self, deadline: Instant) -> serde_json::Value {
+        if let Some(status) = &self.diagnostic_status {
+            return status.clone();
+        }
+        let status = match self.status_before(deadline).await {
+            Ok(status) => serde_json::json!({"status": status, "request": self.status_timing}),
+            Err(error) => {
+                serde_json::json!({"error": format!("{error:#}"), "request": self.status_timing})
+            }
+        };
+        self.diagnostic_status = Some(status.clone());
+        status
+    }
+
+    async fn line(&mut self) -> anyhow::Result<String> {
+        self.line_before(self.deadline).await
+    }
+
+    async fn line_before(&mut self, deadline: Instant) -> anyhow::Result<String> {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.output.next_line(),
+        )
+        .await
+        .context("actual UDP peer reply deadline")??
+        .context("actual UDP peer exited")
+    }
+
+    async fn status(&mut self) -> anyhow::Result<serde_json::Value> {
+        self.status_before(self.deadline).await
+    }
+
+    async fn status_before(&mut self, deadline: Instant) -> anyhow::Result<serde_json::Value> {
+        self.status_timing = serde_json::json!({"started": format!("{:?}", Instant::now()), "sent": null, "reply": null, "clock": "std::time::Instant"});
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            self.input.write_all(b"STATUS all\n"),
+        )
+        .await
+        .context("actual UDP status command deadline")??;
+        self.status_timing["sent"] = serde_json::json!(format!("{:?}", Instant::now()));
+        let reply = self.line_before(deadline).await?;
+        self.status_timing["reply"] = serde_json::json!(format!("{:?}", Instant::now()));
+        serde_json::from_str(
+            reply
+                .strip_prefix("STATUS ")
+                .context("actual UDP peer status missing")?,
+        )
+        .map_err(Into::into)
+    }
 }
 
 impl Pump {
@@ -1435,8 +1671,13 @@ impl Pump {
         let output = BufReader::new(child.stdout.take().unwrap()).lines();
         let mut pump = Self {
             child,
-            input,
-            output,
+            io: Arc::new(tokio::sync::Mutex::new(PumpIo {
+                input,
+                output,
+                deadline,
+                status_timing: serde_json::Value::Null,
+                diagnostic_status: None,
+            })),
             deadline,
             _namespaces: retained,
         };
@@ -1446,25 +1687,20 @@ impl Pump {
     }
 
     async fn line(&mut self) -> anyhow::Result<String> {
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.deadline),
-            self.output.next_line(),
-        )
-        .await
-        .context("actual UDP peer reply deadline")??
-        .context("actual UDP peer exited")
+        self.io.lock().await.line().await
     }
 
     async fn set(&mut self, label: &str, running: bool) -> anyhow::Result<()> {
         ensure!(matches!(label, "a" | "b"), "unknown actual UDP owner");
         let command = format!("{} {label}", if running { "RUN" } else { "STOP" });
+        let mut io = self.io.lock().await;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
-            self.input.write_all(format!("{command}\n").as_bytes()),
+            io.input.write_all(format!("{command}\n").as_bytes()),
         )
         .await
         .context("actual UDP peer command deadline")??;
-        let reply = self.line().await?;
+        let reply = io.line().await?;
         ensure!(
             reply == command,
             "actual UDP peer command mismatch: {reply}"
@@ -1472,52 +1708,38 @@ impl Pump {
         Ok(())
     }
 
-    async fn low(&mut self, label: &str) -> anyhow::Result<()> {
-        ensure!(
-            matches!(label, "a" | "b"),
-            "unknown actual unadmitted-input owner"
-        );
-        let command = format!("LOW {label}");
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.deadline),
-            self.input.write_all(format!("{command}\n").as_bytes()),
-        )
+    async fn tcp_stimulus(&mut self, command: &str, deadline: Instant) -> anyhow::Result<()> {
+        within(deadline, "actual unadmitted-input stimulus", async {
+            let mut io = self.io.lock().await;
+            io.input
+                .write_all(format!("{command}\n").as_bytes())
+                .await?;
+            ensure!(
+                io.line_before(deadline).await? == command,
+                "actual unadmitted-input peer command mismatch"
+            );
+            Ok(())
+        })
         .await
-        .context("actual unadmitted-input command deadline")??;
-        ensure!(
-            self.line().await? == command,
-            "actual unadmitted-input peer command mismatch"
-        );
-        Ok(())
     }
 
     async fn status(&mut self) -> anyhow::Result<serde_json::Value> {
-        tokio::time::timeout_at(
-            tokio::time::Instant::from_std(self.deadline),
-            self.input.write_all(b"STATUS all\n"),
-        )
-        .await
-        .context("actual UDP status command deadline")??;
-        let reply = self.line().await?;
-        serde_json::from_str(
-            reply
-                .strip_prefix("STATUS ")
-                .context("actual UDP peer status missing")?,
-        )
-        .map_err(Into::into)
+        self.io.lock().await.status().await
     }
 
     async fn stop(mut self) -> anyhow::Result<()> {
+        let mut io = self.io.lock().await;
         tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
-            self.input.write_all(b"QUIT all\n"),
+            io.input.write_all(b"QUIT all\n"),
         )
         .await
         .context("actual UDP stop command deadline")??;
         ensure!(
-            self.line().await? == "STOPPED all",
+            io.line().await? == "STOPPED all",
             "actual UDP peer did not stop"
         );
+        drop(io);
         let status = tokio::time::timeout_at(
             tokio::time::Instant::from_std(self.deadline),
             self.child.wait(),
@@ -1600,6 +1822,8 @@ async fn actual_zerocopy_owner_clock_budget_fairness_and_live_features() -> anyh
 async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
     let deadline = Instant::now() + WINDOW;
     let pins = guarded_pin_root().join("adaptive");
+    // P2 no longer creates the pin root; empty directories keep the leftover-pin check below.
+    std::fs::create_dir_all(&pins)?;
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
     std::fs::OpenOptions::new()
         .write(true)
@@ -1618,7 +1842,7 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
     );
     let publisher = ProcessPollBudget::initialize_process(true)?;
     let budget = publisher.participant_handle();
-    let a = Owner::start(
+    let mut a = Owner::start(
         configuration(true, xsk_mode)?,
         PollBudgetBinding::Publisher(publisher),
         a_namespace,
@@ -1627,7 +1851,7 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
         deadline,
     )
     .await?;
-    let b = Owner::start(
+    let mut b = Owner::start(
         configuration(false, xsk_mode)?,
         PollBudgetBinding::Participant(budget.clone()),
         b_namespace.clone(),
@@ -1641,6 +1865,8 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
         Ok(pump) => pump,
         Err(error) => return Err(tcp.abort(error).await),
     };
+    a.diagnostic_pump = Arc::downgrade(&pump.io);
+    b.diagnostic_pump = Arc::downgrade(&pump.io);
     let mut rig = Rig {
         a: Some(a),
         b: Some(b),
@@ -1697,6 +1923,15 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
     .unwrap_or_else(|error| {
         Err(anyhow::Error::new(error).context("combined actual-owner fixture window"))
     });
+    let result = match result {
+        Ok(()) => Ok(()),
+        Err(mut error) => {
+            for owner in [rig.a.as_ref(), rig.b.as_ref()].into_iter().flatten() {
+                error = owner.diagnostic_error(error).await;
+            }
+            Err(error)
+        }
+    };
     if result.is_err() {
         for (label, owner) in [("a", rig.a.as_ref()), ("b", rig.b.as_ref())] {
             if let Some(owner) = owner
@@ -1709,8 +1944,7 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
             }
         }
     }
-    // Successful scenarios released every owner at its own frontier. Anything left only
-    // drains: its exact guards, pins and namespace custody stay retained, with no marker.
+    // Namespace cleanup still waits for each original producer and joined owner.
     let Rig {
         a,
         b,
@@ -1741,8 +1975,8 @@ async fn actual_owner_fixture(xsk_mode: XskMode) -> anyhow::Result<()> {
     if let Some(error) = cleanup_error {
         return Err(error);
     }
-    std::fs::remove_dir(&pins)?;
-    std::fs::remove_dir(pins.parent().unwrap())?;
+    std::fs::remove_dir(&pins).context("remove adaptive pin directory")?;
+    std::fs::remove_dir(pins.parent().unwrap()).context("remove adaptive pin root")?;
     std::fs::write(
         artifacts.join("adaptive-runtime.joined"),
         "all real scope/CQ owners, peers, workers and OS threads joined\n",

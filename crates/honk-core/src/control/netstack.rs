@@ -29,7 +29,7 @@ mod fragment_peer;
 mod realm;
 mod realm_receive;
 #[cfg(target_os = "linux")]
-pub(in crate::control) use fragment_peer::FragmentPeer;
+pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
 #[cfg(target_os = "linux")]
 pub(crate) use realm::capture_realm;
 use realm::{HalfOpenHold, RealmResources};

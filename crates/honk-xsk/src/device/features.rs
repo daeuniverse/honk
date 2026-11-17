@@ -15,6 +15,278 @@ pub(super) const NAMED_FEATURES: [&[u8]; 10] = [
 ];
 const CONTEXT_HEADER: usize = 8 + 160 + 2 + 4 + NAMED_FEATURES.len() * 4;
 
+/// Select Auto per device; explicit requests remain strict.
+pub fn select_xsk_mode(
+    info: &DeviceInfo,
+    requested: Option<BindMode>,
+    config: PortConfig,
+    metadata_len: usize,
+) -> io::Result<BindMode> {
+    if info.xdp_features & 3 != 3 {
+        return Err(unsupported("native XDP basic/redirect support unavailable"));
+    }
+    match requested {
+        Some(mode) => {
+            info.validate_port_config(mode, config, metadata_len)?;
+            Ok(mode)
+        }
+        None => {
+            info.validate_port_config(BindMode::Copy, config, metadata_len)?;
+            if info
+                .validate_port_config(BindMode::ZeroCopy, config, metadata_len)
+                .is_ok()
+            {
+                Ok(BindMode::ZeroCopy)
+            } else {
+                Ok(BindMode::Copy)
+            }
+        }
+    }
+}
+
+/// Restores only RX VLAN feature bits changed by this process.
+pub struct VlanOffload {
+    fd: OwnedFd,
+    name: [libc::c_char; libc::IFNAMSIZ],
+    ifindex: u32,
+    count: usize,
+    words: Vec<u32>,
+    changed: [Option<usize>; 2],
+    restore_allowed: bool,
+    _reservation: MemoryReservation,
+}
+
+/// Call after read-only admission and before constructing the FeatureQuery baseline.
+pub fn prepare_vlan_offload(
+    info: &DeviceInfo,
+    budget: &Arc<MemoryBudget>,
+) -> io::Result<VlanOffload> {
+    let bookkeeping = budget
+        .reserve(size_of::<VlanOffload>())
+        .ok_or_else(|| io::Error::other("VLAN feature owner memory budget exhausted"))?;
+    let name = interface_name(&info.name)?;
+    // SAFETY: interface_name returns a terminated name; no resource is changed here.
+    if unsafe { libc::if_nametoindex(name.as_ptr()) } != info.ifindex {
+        return Err(unsupported(
+            "device identity changed before VLAN preparation",
+        ));
+    }
+    let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
+    let count = feature_count(&fd, &name)?;
+    let retained = (4 + count.div_ceil(32) * 6) * size_of::<u32>();
+    let reservation = budget
+        .reserve(size_of::<VlanOffload>() + retained)
+        .ok_or_else(|| io::Error::other("VLAN feature owner memory budget exhausted"))?;
+    drop(bookkeeping);
+    let _scratch = budget
+        .reserve(
+            (3 + count * 8) * 4
+                + 2 * MAX_UPPER_INTERFACES * (size_of::<String>() + libc::IFNAMSIZ + 8)
+                + 4096,
+        )
+        .ok_or_else(|| io::Error::other("VLAN feature scratch memory budget exhausted"))?;
+    let mut names = vec![0; 3 + count * 8];
+    read_feature_names(&fd, &name, count, &mut names)?;
+    let mut words = vec![0; 2 + count.div_ceil(32) * 4];
+    read_features(&fd, &name, count, &mut words)?;
+    let mut indices = [None; 2];
+    for index in 0..count {
+        let bytes = string_bytes(&names[3 + index * 8..3 + (index + 1) * 8]);
+        let end = bytes.iter().position(|&b| b == 0).unwrap_or(32);
+        for (slot, feature) in NAMED_FEATURES[..2].iter().enumerate() {
+            if &bytes[..end] == *feature && indices[slot].replace(index).is_some() {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        }
+    }
+    if !info.vlan_metadata && indices.iter().any(Option::is_none) {
+        return Err(unsupported("RX VLAN stripping facts unavailable"));
+    }
+    let has_vlan_upper = vlan_upper(&info.name, &info.upper_ifindices)?;
+    let mut guard = VlanOffload {
+        fd,
+        name,
+        ifindex: info.ifindex,
+        count,
+        words,
+        changed: [None; 2],
+        restore_allowed: true,
+        _reservation: reservation,
+    };
+    for (slot, index) in indices.into_iter().enumerate() {
+        let Some(index) = index else { continue };
+        let block = index / 32;
+        let bit = 1u32 << (index % 32);
+        if guard.words[4 + block * 4] & bit == 0 {
+            continue;
+        }
+        if has_vlan_upper {
+            if !info.vlan_metadata {
+                return Err(unsupported(
+                    "VLAN upper requires authoritative RX VLAN metadata",
+                ));
+            }
+            continue;
+        }
+        if guard.words[2 + block * 4] & bit == 0 || guard.words[5 + block * 4] & bit != 0 {
+            return Err(unsupported("active RX VLAN stripping cannot be disabled"));
+        }
+        guard.changed[slot] = Some(index);
+    }
+    guard.set_changed(false)?;
+    Ok(guard)
+}
+
+fn vlan_upper(name: &str, expected: &[u32]) -> io::Result<bool> {
+    let root = Path::new("/sys/class/net").join(name);
+    let root_index = fs::read_to_string(root.join("ifindex"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| unsupported("invalid device identity"))?;
+    if upper_ifindices(&root, root_index)? != expected {
+        return Err(unsupported(
+            "upper interfaces changed before VLAN admission",
+        ));
+    }
+    let mut pending = Vec::with_capacity(MAX_UPPER_INTERFACES);
+    pending.push(name.to_owned());
+    let mut seen = Vec::with_capacity(MAX_UPPER_INTERFACES);
+    seen.push(root_index);
+    let mut vlan = false;
+    while let Some(name) = pending.pop() {
+        for entry in fs::read_dir(Path::new("/sys/class/net").join(name))? {
+            let entry = entry?;
+            let entry_name = entry.file_name();
+            let Some(name) = entry_name.to_str().and_then(|s| s.strip_prefix("upper_")) else {
+                continue;
+            };
+            interface_name(name)?;
+            let upper = entry.path();
+            let index = fs::read_to_string(upper.join("ifindex"))?
+                .trim()
+                .parse::<u32>()
+                .map_err(|_| unsupported("invalid upper interface identity"))?;
+            if seen.contains(&index) {
+                continue;
+            }
+            if seen.len() == MAX_UPPER_INTERFACES {
+                return Err(unsupported("VLAN upper graph exceeds bounded capacity"));
+            }
+            seen.push(index);
+            vlan |= fs::read_to_string(upper.join("uevent"))?
+                .lines()
+                .any(|line| line == "DEVTYPE=vlan");
+            pending.push(name.to_owned());
+        }
+    }
+    Ok(vlan)
+}
+
+impl VlanOffload {
+    fn set_changed(&mut self, enabled: bool) -> io::Result<()> {
+        change_vlan_features(
+            self.count,
+            &self.changed,
+            enabled,
+            &mut self.words,
+            |words| query_named(&self.fd, &self.name, words),
+        )
+    }
+
+    /// Disable restoration after identity change or lost topology authority.
+    pub fn abandon(&mut self) {
+        self.restore_allowed = false;
+    }
+
+    pub fn restore(&mut self) -> io::Result<()> {
+        if !self.restore_allowed || self.changed.iter().all(Option::is_none) {
+            return Ok(());
+        }
+        self.restore_allowed = false;
+        // SAFETY: interface_name produces a NUL-terminated name.
+        if unsafe { libc::if_nametoindex(self.name.as_ptr()) } != self.ifindex {
+            return Err(unsupported(
+                "device identity changed before VLAN restoration",
+            ));
+        }
+        restore_vlan_features(self.count, &mut self.changed, &mut self.words, |words| {
+            query_named(&self.fd, &self.name, words)
+        })?;
+        Ok(())
+    }
+}
+
+impl Drop for VlanOffload {
+    fn drop(&mut self) {
+        if let Err(error) = self.restore() {
+            eprintln!("failed to restore RX VLAN features: {error}");
+        }
+    }
+}
+
+fn query_vlan_features(
+    count: usize,
+    words: &mut [u32],
+    query: &mut impl FnMut(&mut [u32]) -> io::Result<()>,
+) -> io::Result<()> {
+    words.fill(0);
+    words[0] = 0x3a;
+    words[1] = count.div_ceil(32) as u32;
+    query(words)?;
+    validate_features(count, words)
+}
+
+fn change_vlan_features(
+    count: usize,
+    changed: &[Option<usize>; 2],
+    enabled: bool,
+    words: &mut [u32],
+    mut query: impl FnMut(&mut [u32]) -> io::Result<()>,
+) -> io::Result<()> {
+    let blocks = count.div_ceil(32);
+    let mut request = vec![0u32; 2 + blocks * 2];
+    request[0] = 0x3b;
+    request[1] = blocks as u32;
+    for &index in changed.iter().flatten() {
+        let bit = 1u32 << (index % 32);
+        request[2 + index / 32 * 2] |= bit;
+        if enabled {
+            request[3 + index / 32 * 2] |= bit;
+        }
+    }
+    if changed.iter().any(Option::is_some) {
+        query(&mut request)?;
+    }
+    query_vlan_features(count, words, &mut query)?;
+    if changed
+        .iter()
+        .flatten()
+        .any(|&index| (words[4 + index / 32 * 4] & (1 << (index % 32)) != 0) != enabled)
+    {
+        return Err(unsupported("RX VLAN feature change readback failed"));
+    }
+    Ok(())
+}
+
+fn restore_vlan_features(
+    count: usize,
+    changed: &mut [Option<usize>; 2],
+    words: &mut [u32],
+    mut query: impl FnMut(&mut [u32]) -> io::Result<()>,
+) -> io::Result<()> {
+    query_vlan_features(count, words, &mut query)?;
+    for slot in changed.iter_mut() {
+        if let Some(index) = *slot
+            && words[4 + index / 32 * 4] & (1 << (index % 32)) != 0
+        {
+            *slot = None;
+        }
+    }
+    change_vlan_features(count, changed, true, words, query)?;
+    *changed = [None; 2];
+    Ok(())
+}
+
 /// Cold-funded ethtool state. Runtime checks never rediscover a device or allocate.
 pub struct FeatureQuery {
     fd: OwnedFd,
@@ -379,6 +651,210 @@ mod tests {
         assert!(query.observe().unwrap());
         assert_eq!(query.context(), admitted);
         drop(query);
+        assert_eq!(budget.used(), 0);
+    }
+}
+
+#[cfg(test)]
+mod gateway_tests {
+    use super::*;
+
+    fn device() -> DeviceInfo {
+        DeviceInfo {
+            name: "fixture0".into(),
+            ifindex: 1,
+            upper_ifindices: vec![],
+            queues: vec![0],
+            mtu: 9000,
+            mac: [2; 6],
+            xdp_features: 3 | 8 | 32,
+            zerocopy_max_segments: 8,
+            vlan_metadata: false,
+        }
+    }
+
+    #[test]
+    fn auto_selects_copy_only_for_insufficient_zerocopy_capability() {
+        let mut info = device();
+        let config = PortConfig {
+            rx_frames: 256,
+            control_frames: 32,
+            bulk_frames: 224,
+            ring_size: 256,
+        };
+        assert_eq!(
+            select_xsk_mode(&info, None, config, 0).unwrap(),
+            BindMode::ZeroCopy
+        );
+        info.zerocopy_max_segments = 1;
+        assert_eq!(
+            select_xsk_mode(&info, None, config, 0).unwrap(),
+            BindMode::Copy
+        );
+        assert!(select_xsk_mode(&info, Some(BindMode::ZeroCopy), config, 0).is_err());
+        info.xdp_features &= !8;
+        assert_eq!(
+            select_xsk_mode(&info, None, config, 0).unwrap(),
+            BindMode::Copy
+        );
+        assert_eq!(
+            select_xsk_mode(&info, Some(BindMode::Copy), config, 0).unwrap(),
+            BindMode::Copy
+        );
+        info.xdp_features &= !32;
+        assert!(select_xsk_mode(&info, None, config, 0).is_err());
+        info.mtu = 1500;
+        assert_eq!(
+            select_xsk_mode(&info, None, config, 0).unwrap(),
+            BindMode::Copy
+        );
+        info.xdp_features &= !1;
+        assert!(select_xsk_mode(&info, None, config, 0).is_err());
+    }
+
+    #[test]
+    fn vlan_disable_and_restore_touch_only_owned_bits_and_verify_readback() {
+        let mut active = 0b111u32;
+        let mut writes = Vec::new();
+        let mut words = [0u32; 6];
+        let mut changed = [Some(0), Some(1)];
+        let mut query = |request: &mut [u32]| -> io::Result<()> {
+            match request[0] {
+                0x3b => {
+                    writes.push((request[2], request[3]));
+                    active = (active & !request[2]) | (request[3] & request[2]);
+                }
+                0x3a => {
+                    request[2] = 7;
+                    request[4] = active;
+                }
+                _ => panic!("unexpected ethtool command"),
+            }
+            Ok(())
+        };
+        change_vlan_features(3, &changed, false, &mut words, &mut query).unwrap();
+        assert_eq!(words[4], 0b100);
+        restore_vlan_features(3, &mut changed, &mut words, &mut query).unwrap();
+        assert_eq!(words[4], 0b111);
+        assert_eq!(changed, [None; 2]);
+        assert_eq!(writes, [(3, 0), (3, 3)]);
+
+        let mut changed = [Some(0), Some(1)];
+        let mut writes = Vec::new();
+        // An external writer already enabled bit 0; restoration must not write it.
+        let mut active = 0b101;
+        restore_vlan_features(3, &mut changed, &mut words, |request| {
+            if request[0] == 0x3b {
+                writes.push((request[2], request[3]));
+                active |= request[3];
+            } else {
+                request[2] = 7;
+                request[4] = active;
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(writes, [(2, 2)]);
+        assert_eq!(words[4], 0b111);
+
+        assert!(
+            change_vlan_features(3, &[Some(0), Some(1)], false, &mut words, |request| {
+                if request[0] == 0x3a {
+                    request[2] = 7;
+                    request[4] = 7;
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod kernel_vlan_tests {
+    use super::*;
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::MetadataExt;
+    use std::process::{Child, Command, Stdio};
+
+    struct ChildOwner(Child);
+    impl Drop for ChildOwner {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires disposable virtme guest private netns and HONK_XDP_VLAN_TEST_DEVICE with both writable RX VLAN bits enabled"]
+    fn kernel_vlan_no_upper_normal_failure_and_sigkill_boundaries() {
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        assert!(
+            fs::read_to_string("/proc/cmdline")
+                .unwrap()
+                .contains("virtme.")
+        );
+        assert_ne!(
+            fs::metadata("/proc/self/ns/net").unwrap().ino(),
+            fs::metadata("/proc/1/ns/net").unwrap().ino()
+        );
+        let name = std::env::var("HONK_XDP_VLAN_TEST_DEVICE")
+            .expect("requires a VLAN-offload capable disposable fixture");
+        let info = DeviceInfo::discover(&name).unwrap();
+        assert!(!vlan_upper(&name, &info.upper_ifindices).unwrap());
+        let budget = MemoryBudget::new(4 << 20);
+        if std::env::var_os("HONK_TEST_VLAN_KILL_CHILD").is_some() {
+            let owner = prepare_vlan_offload(&info, &budget).unwrap();
+            assert!(owner.changed.iter().all(Option::is_some));
+            println!("VLAN_OFFLOAD_DISABLED");
+            std::io::stdout().flush().unwrap();
+            loop {
+                std::thread::park();
+            }
+        }
+        let mut owner = prepare_vlan_offload(&info, &budget).unwrap();
+        let changed = owner.changed;
+        assert!(changed.iter().all(Option::is_some));
+        let mut baseline = FeatureQuery::new(&info, &budget).unwrap();
+        assert!(baseline.check().unwrap());
+        owner.restore().unwrap();
+        assert!(!baseline.check().unwrap());
+        drop(baseline);
+        let failed = (|| -> io::Result<()> {
+            let _owner = prepare_vlan_offload(&info, &budget)?;
+            Err(io::Error::other("injected subsequent startup failure"))
+        })();
+        assert!(failed.is_err());
+        let mut after_failure = prepare_vlan_offload(&info, &budget).unwrap();
+        assert_eq!(after_failure.changed, changed);
+        after_failure.restore().unwrap();
+        drop(after_failure);
+        // The parent owns cleanup of this test's deliberately killed child.
+        owner.changed = changed;
+        owner.restore_allowed = true;
+        let mut child = ChildOwner(Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "device::features::kernel_vlan_tests::kernel_vlan_no_upper_normal_failure_and_sigkill_boundaries", "--ignored", "--nocapture"])
+            .env("HONK_TEST_VLAN_KILL_CHILD", "1").stdout(Stdio::piped()).spawn().unwrap());
+        let mut output = std::io::BufReader::new(child.0.stdout.take().unwrap());
+        loop {
+            let mut line = String::new();
+            assert_ne!(
+                output.read_line(&mut line).unwrap(),
+                0,
+                "child exited before disabling VLAN offload"
+            );
+            if line.contains("VLAN_OFFLOAD_DISABLED") {
+                break;
+            }
+        }
+        child.0.kill().unwrap();
+        assert!(!child.0.wait().unwrap().success());
+        read_features(&owner.fd, &owner.name, owner.count, &mut owner.words).unwrap();
+        for index in changed.into_iter().flatten() {
+            assert_eq!(owner.words[4 + index / 32 * 4] & (1 << (index % 32)), 0);
+        }
+        owner.restore().unwrap();
+        drop(owner);
         assert_eq!(budget.used(), 0);
     }
 }

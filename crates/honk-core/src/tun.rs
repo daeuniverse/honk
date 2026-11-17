@@ -214,7 +214,7 @@ impl Runtime {
             if self.endpoints.is_closing() || !self.admission.load(Ordering::Acquire) {
                 return Poll::Ready(Ok(()));
             }
-            match poll_topology(&mut self.topology, cx, Topology::check_changed)? {
+            match poll_topology(&mut self.topology, cx, Topology::check_tun_changed)? {
                 Poll::Ready(true) => {
                     return Poll::Ready(Err(anyhow::anyhow!(
                         "TUN routing topology changed; capture closed and restart required"

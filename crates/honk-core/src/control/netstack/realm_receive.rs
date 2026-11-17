@@ -81,6 +81,7 @@ impl PacketScope {
                 }
                 inner.remember_peer(peer);
             }
+            let input = packet;
             let (packet, fragment, failure) = match inner
                 .stack
                 .as_mut()
@@ -107,16 +108,29 @@ impl PacketScope {
                     .as_ref()
                     .is_some_and(|entry| entry.info.incarnation == fragment.incarnation)
             });
-            let mut peer = peer;
+            if peer.is_none() && previous.is_none() {
+                return match packet {
+                    Some(packet) => Ok(Some((packet, None))),
+                    None => match failure {
+                        Some(reason) => Err(reason),
+                        None => Ok(None),
+                    },
+                };
+            }
+            let is_offset_zero = super::fragment_peer::fragment_offset_zero(&[input])
+                .ok_or(DropReason::Malformed)?;
             let mut entry = match previous {
                 Some(index) => inner.fragment_peers[index]
                     .take()
                     .expect("exact fragment return snapshot"),
-                None => FragmentPeer::new(fragment, peer.take()),
+                None => FragmentPeer::new(fragment, None),
             };
-            entry.observe(fragment, ingress_at, peer.take());
+            let poisoned = entry.observe(fragment, is_offset_zero, peer).is_err();
             inner.reap_fragment_peers();
             if let Some(packet) = packet {
+                if poisoned {
+                    return Err(DropReason::NotForUs);
+                }
                 return Ok(Some((packet, entry.peer)));
             }
             if inner
@@ -131,6 +145,9 @@ impl PacketScope {
                     .find(|cell| cell.is_none())
                     .ok_or(DropReason::Capacity)?;
                 *cell = Some(entry);
+            }
+            if poisoned {
+                return Err(DropReason::NotForUs);
             }
             match failure {
                 Some(reason) => Err(reason),
@@ -393,5 +410,205 @@ impl Drop for AdmissionUnwind<'_> {
         {
             admission.store(false, std::sync::atomic::Ordering::Release);
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod fragment_tests {
+    use super::*;
+    use crate::xdp::routing_input::{test_fragments, test_peer};
+    use std::time::Duration;
+
+    fn physical_scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
+        let (mut scopes, mut owners) =
+            realm::capture_partition(1280, 1, 16, 1, 1280, TxCaps::NONE, budget, true).unwrap();
+        (scopes.pop().unwrap(), owners.pop().unwrap())
+    }
+
+    #[tokio::test]
+    async fn realm_mixed_mac_completion_never_dispatches_and_poison_expires() {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (scope, owner) = physical_scope(&budget);
+        let now = Instant::now();
+        let fragments = test_fragments();
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[0],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [2; 6], 7))
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[1],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [4; 6], 7))
+                )
+                .is_err()
+        );
+        let retained = budget.used();
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[2],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [2; 6], 7))
+                )
+                .is_err()
+        );
+        assert!(
+            budget.used() < retained,
+            "poisoned OwnedPacket is released at completion"
+        );
+        assert!(
+            scope
+                .0
+                .inner
+                .lock()
+                .fragment_peers
+                .iter()
+                .all(Option::is_none)
+        );
+        owner.shutdown().await;
+
+        let (scope, owner) = physical_scope(&budget);
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[1],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [2; 6], 7))
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[2],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [4; 6], 7))
+                )
+                .is_err()
+        );
+        let retained = budget.used();
+        scope.drive(now + Duration::from_secs(31));
+        assert!(
+            budget.used() < retained,
+            "bounded reassembler reclaims pending poisoned bytes"
+        );
+        assert!(
+            scope
+                .0
+                .inner
+                .lock()
+                .fragment_peers
+                .iter()
+                .all(Option::is_none)
+        );
+        owner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn realm_fragment_zero_selects_original_member_and_rejects_other_realms() {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (scope, owner) = physical_scope(&budget);
+        let now = Instant::now();
+        let fragments = test_fragments();
+        for index in [1, 0] {
+            assert!(
+                scope
+                    .reassemble_for_dispatch_with_peer(
+                        &fragments[index],
+                        now,
+                        now,
+                        Some(test_peer(
+                            1,
+                            index,
+                            [2; 6],
+                            7 | if index == 0 { 0xa000 } else { 0 }
+                        ))
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (packet, peer) = scope
+            .reassemble_for_dispatch_with_peer(
+                &fragments[2],
+                now,
+                now,
+                Some(test_peer(1, 2, [2; 6], 7)),
+            )
+            .unwrap()
+            .unwrap();
+        let path = peer.unwrap().original_path();
+        assert_eq!(path.device, 0);
+        assert_eq!(path.vlan_tci[0], 0xa007);
+        drop(packet);
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[0],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [2; 6], 7))
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[1],
+                    now,
+                    now,
+                    Some(test_peer(2, 1, [2; 6], 7))
+                )
+                .is_err()
+        );
+        assert!(
+            scope
+                .reassemble_for_dispatch_with_peer(
+                    &fragments[2],
+                    now,
+                    now,
+                    Some(test_peer(1, 0, [2; 6], 7))
+                )
+                .is_err()
+        );
+        owner.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn tun_fragment_completion_keeps_mac_missing() {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (scope, owner) = capture_scope(1280, 1, 16, &budget).unwrap();
+        let now = Instant::now();
+        let fragments = test_fragments();
+        for index in [1, 0] {
+            assert!(
+                scope
+                    .reassemble_for_dispatch_with_peer(&fragments[index], now, now, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        let (packet, peer) = scope
+            .reassemble_for_dispatch_with_peer(&fragments[2], now, now, None)
+            .unwrap()
+            .unwrap();
+        assert!(peer.is_none());
+        drop(packet);
+        owner.shutdown().await;
     }
 }
