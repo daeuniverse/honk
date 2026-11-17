@@ -1,4 +1,4 @@
-//! Locked TCP pre-connect admission and drained Native-attempt renewal.
+//! Locked TCP pre-connect admission and drained-attempt renewal.
 //!
 //! The owner admits the complete plain-Ethernet prefix before opening HOST_GATE.
 //! No timeout, tuple guess, or per-connect replacement of a Host executor is used.
@@ -10,7 +10,7 @@ use aya_ebpf_bindings::helpers::{
 use core::ptr;
 use honk_ebpf_common::host::{
     HOST_ID_MAX, HOST_SOCKET_BUCKETS, HOST_SOCKET_CANDIDATE, HOST_SOCKET_ENDPOINT,
-    HOST_SOCKET_NATIVE, HOST_SOCKET_TRANSITION, HostConnectLayout, HostSocketEntry,
+    HOST_SOCKET_TRANSITION, HostConnectLayout, HostSocketEntry,
 };
 
 use crate::{
@@ -103,9 +103,8 @@ pub(crate) fn admit_connect(ctx: &SockAddrContext) -> i32 {
         return 0;
     };
     let previous = lookup(cookie, address);
-    let native = previous.is_some_and(|entry| entry.selection == HOST_SOCKET_NATIVE);
     let bypass = HOST_BYPASS_MARK.load();
-    if bypass != 0 && mark == bypass && !native {
+    if bypass != 0 && mark == bypass {
         return 1;
     }
     if !ready()
@@ -190,10 +189,8 @@ pub(crate) fn admit_connect(ctx: &SockAddrContext) -> i32 {
                 }
                 (&raw mut (*target).operation_incarnation).write_volatile(incarnation);
                 (&raw mut (*target).disconnect_generation).write_volatile(disconnect_generation);
-                if !native {
-                    (&raw mut (*target).output_ifindex).write_volatile(0);
-                    (&raw mut (*target).selection).write_volatile(HOST_SOCKET_CANDIDATE);
-                }
+                (&raw mut (*target).output_ifindex).write_volatile(0);
+                (&raw mut (*target).selection).write_volatile(HOST_SOCKET_CANDIDATE);
                 end_write(bucket, version);
             } else {
                 exhausted = true;
