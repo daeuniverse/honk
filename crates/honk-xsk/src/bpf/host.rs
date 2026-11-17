@@ -1,3 +1,4 @@
+use super::attachment::{LinkUpdateAttr, pin_program, private_bpffs};
 use super::*;
 use honk_ebpf_common::host::{
     HOST_CAPTURE_HORIZON_NS, HOST_FACT_SLOTS, HOST_METADATA_LEN, HOST_METADATA_VERSION,

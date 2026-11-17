@@ -1,5 +1,6 @@
 //! One guest-only IPv4 UDP-L4 materialization experiment; no production Host authority.
 use super::*;
+use crate::bpf::attachment::{LinkCreateAttr, LinkInfo, LinkUpdateAttr};
 use crate::{BindMode, Port, PortConfig};
 use honk_datapath::buffer::TxClass;
 use honk_netstack::MemoryBudget;
