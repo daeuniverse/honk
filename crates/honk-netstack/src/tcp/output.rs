@@ -110,25 +110,27 @@ impl Tcb {
                 if budget > 0
                     && (data != 0 || fin)
                     && (data as u32 + u32::from(fin) == len || self.sent.ensure_room(pool, 1))
-                    && self.pace_ok(now, data as u32, mss, tso_max)
                 {
-                    let (mut data, mut segs) = (data, 1);
-                    // A run of lost whole segments goes out as one TSO packet.
-                    if tso_max >= 2 && !fin && data == cap && data as u32 == len {
-                        let n = self.tso_segs(cap, tso_max, budget);
-                        if n > 1 {
-                            let (count, end) = self.sent.lost_run(i, cap as u32, n);
-                            segs = count;
-                            data = end.wrapping_sub(start) as usize;
+                    let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
+                    if self.pace_ok(now, data as u32, mss, tso_max, rate) {
+                        let (mut data, mut segs) = (data, 1);
+                        // A run of lost whole segments goes out as one TSO packet.
+                        if tso_max >= 2 && !fin && data == cap && data as u32 == len {
+                            let n = self.tso_segs(cap, tso_max, budget, rate);
+                            if n > 1 {
+                                let (count, end) = self.sent.lost_run(i, cap as u32, n);
+                                segs = count;
+                                data = end.wrapping_sub(start) as usize;
+                            }
                         }
+                        kind = Some(Kind::Retransmit {
+                            index: i,
+                            start,
+                            data,
+                            fin,
+                            segs,
+                        });
                     }
-                    kind = Some(Kind::Retransmit {
-                        index: i,
-                        start,
-                        data,
-                        fin,
-                        segs,
-                    });
                 }
             }
             if kind.is_none() && can_send_new && (payload_allowed || unsent == 0) {
@@ -143,27 +145,26 @@ impl Tcb {
                 } else if data != 0 && budget == 0 {
                     self.cwnd_limited = true;
                 }
-                if budget > 0
-                    && (data != 0 || fin)
-                    && self.sent.ensure_room(pool, 2)
-                    && self.pace_ok(now, data as u32, mss, tso_max)
-                {
-                    let (mut data, mut fin, mut segs) = (data, fin, 1);
-                    if tso_max >= 2 && data == cap && unsent > data && rwnd > data {
-                        let n = self
-                            .tso_segs(cap, tso_max, budget)
-                            .min(unsent.min(rwnd).div_ceil(cap));
-                        if n > 1 && self.sent.ensure_room(pool, n + 1) {
-                            data = unsent.min(rwnd).min(n * cap);
-                            segs = data.div_ceil(cap);
-                            fin = self.fin_requested
-                                && self.fin_seq.is_none()
-                                && data == unsent
-                                && rwnd > data;
+                if budget > 0 && (data != 0 || fin) && self.sent.ensure_room(pool, 2) {
+                    let rate = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain());
+                    if self.pace_ok(now, data as u32, mss, tso_max, rate) {
+                        let (mut data, mut fin, mut segs) = (data, fin, 1);
+                        if tso_max >= 2 && data == cap && unsent > data && rwnd > data {
+                            let n = self
+                                .tso_segs(cap, tso_max, budget, rate)
+                                .min(unsent.min(rwnd).div_ceil(cap));
+                            if n > 1 && self.sent.ensure_room(pool, n + 1) {
+                                data = unsent.min(rwnd).min(n * cap);
+                                segs = data.div_ceil(cap);
+                                fin = self.fin_requested
+                                    && self.fin_seq.is_none()
+                                    && data == unsent
+                                    && rwnd > data;
+                            }
                         }
+                        unsent_left = unsent - data;
+                        kind = Some(Kind::New { data, fin, segs });
                     }
-                    unsent_left = unsent - data;
-                    kind = Some(Kind::New { data, fin, segs });
                 }
             }
             if kind.is_none() && self.ack_due != 0 {
@@ -487,8 +488,15 @@ impl Tcb {
     /// Pacing gate; records when the next segment may leave if it may not leave now. With TSO
     /// (`tso_max` segments per packet) the bucket holds up to one full TSO packet, still bounded
     /// by two milliseconds of traffic.
-    fn pace_ok(&mut self, now: Instant, bytes: u32, mss: u32, tso_max: usize) -> bool {
-        let Some(rate) = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain()) else {
+    fn pace_ok(
+        &mut self,
+        now: Instant,
+        bytes: u32,
+        mss: u32,
+        tso_max: usize,
+        rate: Option<u64>,
+    ) -> bool {
+        let Some(rate) = rate else {
             self.pacing_deadline = None;
             return true;
         };
@@ -509,9 +517,9 @@ impl Tcb {
     /// one): bounded by the congestion `budget` (a started segment counts, as for single
     /// segments), by the pacer's tokens (called right after `pace_ok` admitted the first segment),
     /// and by roughly one millisecond of traffic at the pacing rate, as Linux's TSO autosizing.
-    fn tso_segs(&self, cap: usize, max: usize, budget: usize) -> usize {
+    fn tso_segs(&self, cap: usize, max: usize, budget: usize, rate: Option<u64>) -> usize {
         let mut n = max.min(budget.div_ceil(cap));
-        if let Some(rate) = Pacer::rate(self.cc.cwnd(), self.rtt.srtt(), self.cc.pacing_gain()) {
+        if let Some(rate) = rate {
             let by_tokens = usize::try_from(self.pacer.tokens() / cap as u64).unwrap_or(usize::MAX);
             let by_size = usize::try_from(rate / 1000 / cap as u64).unwrap_or(usize::MAX);
             n = n.min(by_tokens).min(by_size.max(2));
