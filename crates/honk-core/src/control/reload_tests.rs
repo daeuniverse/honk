@@ -4682,7 +4682,11 @@ async fn pname_routing_is_reported_only_while_an_applied_rule_uses_pname() {
                 .await
                 .inject_routing_fault(RoutingPushPhase::Root, 1)
                 .unwrap();
-            let mut rejected = without.clone();
+            let mut rejected = if uses_pname {
+                without.clone()
+            } else {
+                positive.clone()
+            };
             rejected.global.check_tolerance_ms += 1;
             assert_eq!(
                 cp.apply_runtime_config(rejected, Default::default(), &DrainTracker::new())
