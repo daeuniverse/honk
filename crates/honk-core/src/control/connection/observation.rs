@@ -248,7 +248,6 @@ impl ConnectionObservation {
     pub(super) fn shared(&self) -> Option<Arc<Self>> {
         self.is_recording().then(|| Arc::new(self.clone()))
     }
-    }
 
     pub(in crate::control) fn packet_facts(
         &mut self,
@@ -294,6 +293,7 @@ impl ConnectionObservation {
                 },
             },
         );
+    }
 
     pub(super) fn handoff(&mut self, handoff: Option<&HandoffResult>, expected: bool) {
         let Some(record) = &mut self.recorded else {

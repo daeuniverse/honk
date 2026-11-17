@@ -281,7 +281,6 @@ impl World {
         }
         rx
     }
-    }
 
     fn receive(&mut self, packet: &[u8], meta: RxMeta) -> Rx {
         match self.source {
@@ -292,6 +291,7 @@ impl World {
             }
             None => self.stack.receive_with(self.now, packet, meta),
         }
+    }
 
     fn plain(&self) -> tcp::Options {
         tcp::Options {

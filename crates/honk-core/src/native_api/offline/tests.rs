@@ -86,7 +86,6 @@ fn tun_offline_admission_uses_the_runtime_policy_validator() {
             .expect("unavailable TUN facts must fail offline admission");
         assert_eq!(error.diagnostic.code, "invalid-datapath-config", "{fact}");
     }
-    }
     for negated in [false, true] {
         let mut candidate = loaded.clone();
         candidate
@@ -110,6 +109,7 @@ fn tun_offline_admission_uses_the_runtime_policy_validator() {
             cfg!(feature = "ebpf"),
             "offline Host process admission must use the executable's real build boundary"
         );
+    }
     assert!(!temp.path().join("state").exists());
 }
 

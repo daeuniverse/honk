@@ -793,7 +793,6 @@ impl Reassembler {
                     .map(|quote| (quote.source, quote.destination, quote.protocol))
             }))
     }
-    }
 
     pub(crate) fn retains_source_output_with_lineage(&self, lineage: NonZeroU64) -> bool {
         self.expired
@@ -810,6 +809,7 @@ impl Reassembler {
         {
             visit(source);
         }
+    }
 
     /// Drops datagrams older than the timeout; those with fragment 0 queue an ICMP quote.
     pub(crate) fn expire(&mut self, now: Instant) {

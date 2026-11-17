@@ -36,13 +36,13 @@ impl TcpFlow {
     pub(super) fn is_kernel(&self) -> bool {
         matches!(self, Self::Kernel(_))
     }
-    }
 
     pub(super) fn packet_source(&self) -> Option<&crate::control::netstack::SourceWork> {
         match self {
             Self::Kernel(_) => None,
             Self::Packet(flow) => flow.stream.packet_source(),
         }
+    }
 
     pub(super) fn mark_packet_rx_admitted(&self) {
         if let Self::Packet(flow) = self {

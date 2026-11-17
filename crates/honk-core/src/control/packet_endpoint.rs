@@ -248,7 +248,6 @@ impl EndpointAdmission {
             _memory: memory,
         })
     }
-    }
 
     pub(in crate::control) fn commit_pending<R>(
         admission: &mut Option<Self>,
@@ -268,6 +267,7 @@ impl EndpointAdmission {
             }
             None => Ok(commit(admission)),
         }
+    }
 
     pub(in crate::control) fn into_snapshot(
         self,

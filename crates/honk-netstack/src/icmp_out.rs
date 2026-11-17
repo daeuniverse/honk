@@ -294,7 +294,6 @@ impl Stack {
     ) -> Result<Option<usize>, UdpError> {
         self.send_icmp(now, Reject::PacketTooBig { mtu }, original, out)
     }
-    }
 
     /// Emits PTB with the capture realm's serialized state, retaining the normal exemption.
     pub fn packet_too_big_with_icmp(
@@ -306,6 +305,7 @@ impl Stack {
         icmp: &mut crate::IcmpState,
     ) -> Result<Option<usize>, UdpError> {
         self.send_icmp_with_state(now, Reject::PacketTooBig { mtu }, original, out, Some(icmp))
+    }
 }
 
 struct Original<'a> {

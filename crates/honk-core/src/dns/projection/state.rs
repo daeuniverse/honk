@@ -485,13 +485,13 @@ impl DesiredState {
                 .any(|entry| entry.scope == stamp.scope && entry.revision == stamp.revision)
             && stamp.is_unexpired_at(now)
     }
-    }
 
     #[cfg(all(test, feature = "ebpf"))]
     pub(super) fn install_closed_native_for_test(&mut self, native: Arc<NativePublication>) {
         assert!(native.terminal());
         assert!(self.native.is_none());
         self.native = Some(native);
+    }
 
     #[cfg(test)]
     pub(super) fn set_packet_fact_revision_for_test(&mut self, scope: ScopeId, revision: u64) {

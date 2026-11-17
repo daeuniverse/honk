@@ -1342,10 +1342,10 @@ impl PacketOwner {
     pub fn scope(&self) -> ScopeId {
         self.scope.scope()
     }
-    }
     pub(crate) async fn shutdown(self) {
         self.scope.shutdown(true);
         self.run().await;
+    }
 
     /// The validated endpoint start's one-time Task → Driven transfer. This original owner
     /// keeps the joined finish obligation: park it in `reclaim`, then run it.

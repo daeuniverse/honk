@@ -135,11 +135,11 @@ impl UdpTx {
             ]),
         }
     }
-    }
 
     pub(crate) fn with_pending_budget(&mut self, budget: Arc<MemoryBudget>) {
         debug_assert_eq!(self.bytes, 0);
         self.pending_budget = Some(budget);
+    }
 
     pub(crate) fn pending(&self) -> bool {
         !self.queue.is_empty()

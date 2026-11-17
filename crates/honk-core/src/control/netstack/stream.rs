@@ -52,7 +52,6 @@ impl FlowIo {
     pub fn flow_id(&self) -> FlowId {
         self.id
     }
-    }
 
     pub(in crate::control) fn packet_source(&self) -> Option<&super::SourceWork> {
         self.packet_source.as_ref()
@@ -60,6 +59,7 @@ impl FlowIo {
 
     pub(super) fn set_packet_source(&mut self, source: super::SourceWork) {
         self.packet_source = Some(source);
+    }
 
     /// Mark only a successfully selected non-Block outbound stream, never pending routing.
     pub(in crate::control) fn mark_rx_admitted(&self) {

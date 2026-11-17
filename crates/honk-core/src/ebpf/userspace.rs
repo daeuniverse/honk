@@ -33,7 +33,6 @@ impl UserspaceBackend {
             native: None,
         }
     }
-    }
 
     #[cfg(feature = "ebpf")]
     pub fn native_publication(&self) -> Option<Arc<super::native::NativePublication>> {
@@ -58,6 +57,7 @@ impl UserspaceBackend {
         self.native = Some(publication);
         writer.commit();
         Ok(())
+    }
 }
 
 #[async_trait]

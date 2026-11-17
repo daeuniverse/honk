@@ -1003,10 +1003,10 @@ async fn serve(
             .context("owner captured an unowned device")?;
         guards.push((device.info.ifindex, mac, guard));
     }
-    }
     #[cfg(feature = "ebpf")]
     if let Some(host) = runtime.host.take() {
         host.finish()?;
+    }
     backend.write().await.cleanup().await?;
     Ok(Retired {
         plane: Some(plane),
