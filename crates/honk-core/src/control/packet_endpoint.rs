@@ -394,6 +394,7 @@ impl PacketEndpoints {
 
     /// Includes protocol, initializer/retirement, queued work and actual output owners.
     /// Call outside the receive callback, which already holds the scope mutex.
+    #[cfg(test)]
     pub(crate) fn retains_source(&self, scope: ScopeId, address: std::net::IpAddr) -> bool {
         self.shared
             .scopes

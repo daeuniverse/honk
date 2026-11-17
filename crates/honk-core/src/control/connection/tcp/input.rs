@@ -4,6 +4,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+// Boxing the packet stream would allocate for each packet-backed TCP flow.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum TcpInput {
     Kernel(TcpStream),
     Packet(FlowIo),

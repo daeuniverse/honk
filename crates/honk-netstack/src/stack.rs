@@ -1164,8 +1164,11 @@ impl Stack {
             let needs_icmp = (class == 0
                 && self.controls.front().is_some_and(|c| c.icmp.is_some()))
                 || (class == 4 && self.reasm.pending_icmp());
-            if self.shard.is_some() && icmp.is_none() && needs_icmp {
-                self.shard.as_mut().expect("sharded output").icmp_class = Some(class);
+            if icmp.is_none()
+                && needs_icmp
+                && let Some(shard) = self.shard.as_mut()
+            {
+                shard.icmp_class = Some(class);
                 return AccountedTransmit::NeedsIcmp;
             }
             let result = match class {

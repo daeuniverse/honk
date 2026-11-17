@@ -164,6 +164,8 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+// Boxing retained owners would allocate on the packet output path.
+#[allow(clippy::large_enum_variant)]
 enum Retained {
     Endpoint(OutputOwner),
     Forward {

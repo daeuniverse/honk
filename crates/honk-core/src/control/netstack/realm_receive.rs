@@ -263,10 +263,10 @@ impl Inner {
                 grant.is_some()
             },
         );
-        if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome {
-            if let Some(grant) = grant {
-                self.half_open[vacant.expect("funded half-open cell")] = Some((id, grant));
-            }
+        if let honk_netstack::ReceiveOutcome::TcpNew(id) = report.outcome
+            && let Some(grant) = grant
+        {
+            self.half_open[vacant.expect("funded half-open cell")] = Some((id, grant));
         }
         (rx, report)
     }
@@ -388,10 +388,10 @@ impl PacketOwner {
 struct AdmissionUnwind<'a>(Option<&'a std::sync::atomic::AtomicBool>);
 impl Drop for AdmissionUnwind<'_> {
     fn drop(&mut self) {
-        if std::thread::panicking() {
-            if let Some(admission) = self.0 {
-                admission.store(false, std::sync::atomic::Ordering::Release);
-            }
+        if std::thread::panicking()
+            && let Some(admission) = self.0
+        {
+            admission.store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }

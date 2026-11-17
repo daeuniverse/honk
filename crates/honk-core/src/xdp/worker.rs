@@ -340,6 +340,8 @@ pub(super) enum Payload {
     },
 }
 
+// Boxing packet bodies would allocate on the packet dispatch path.
+#[allow(clippy::large_enum_variant)]
 pub(super) enum PacketBody {
     Core(Packet),
     Reassembled(honk_netstack::OwnedPacket),
@@ -410,8 +412,10 @@ impl Shared {
         ))
     }
 
+    // Boxing the returned envelope would allocate when packet dispatch is full.
+    #[allow(clippy::result_large_err)]
     pub(super) fn send(&self, destination: usize, mut envelope: Envelope) -> Result<(), Envelope> {
-        match self.senders[destination as usize].try_send(envelope) {
+        match self.senders[destination].try_send(envelope) {
             Ok(()) => {
                 self.wake[destination].notify_one();
                 self.wakers[destination].wake();
@@ -504,6 +508,7 @@ impl Shared {
             .clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn receive(
         &self,
         endpoints: &PacketEndpoints,
@@ -545,6 +550,7 @@ impl Shared {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn endpoint(
         &self,
         worker: usize,
@@ -717,6 +723,7 @@ struct WorkerRuntime {
 }
 
 impl Worker {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn start(
         shared: Arc<Shared>,
         devices: &mut [Device],
@@ -867,6 +874,7 @@ impl Worker {
 }
 
 impl Shared {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn endpoint_packet(
         &self,
         endpoints: &PacketEndpoints,

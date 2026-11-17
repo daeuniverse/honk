@@ -49,7 +49,8 @@ pub(in crate::control) struct SourceScope {
 }
 
 impl SourceScope {
-    pub(super) fn owns_client(&self, domain: ScopeId, address: IpAddr) -> bool {
+    #[cfg(test)]
+    pub(super) fn owns_client(&self, domain: ScopeId, address: std::net::IpAddr) -> bool {
         self.domain == domain && self.client.ip() == address
     }
 

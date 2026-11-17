@@ -550,7 +550,7 @@ impl Reassembler {
                     charged: ENTRY_OVERHEAD,
                 });
                 self.last_incarnation = incarnation.get();
-                if let Some(receipt) = receipt.as_deref_mut() {
+                if let Some(receipt) = receipt {
                     *receipt = Some(FragmentInfo {
                         identity: key.identity(),
                         original_ingress: ingress_at,
