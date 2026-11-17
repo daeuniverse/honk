@@ -7,7 +7,6 @@ repository.workspace = true
 
 [features]
 host = []
-captured-fault = []
 
 [dependencies]
 libc.workspace = true

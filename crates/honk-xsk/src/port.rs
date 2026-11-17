@@ -137,7 +137,6 @@ impl RetainedRxSlots {
 
     fn new(config: PortConfig, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
         let (count, bytes) = Self::layout(config)?;
-        // Runtime separately funds R * 192 before opening any Port; this funds the other R * 1024.
         let reservation = reserve(budget, bytes)?;
         let port = NEXT_PORT
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))

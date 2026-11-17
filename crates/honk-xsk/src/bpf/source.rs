@@ -2,8 +2,6 @@
 use super::*;
 use honk_ebpf_common::host::*;
 
-pub(super) mod native;
-
 const LDX_DW: u8 = 0x79;
 const STX_DW: u8 = 0x7b;
 const ST_H: u8 = 0x6a;
@@ -434,10 +432,6 @@ fn producer(c: &HostSourceConfig, maps: Maps, cast: u32, closed: bool) -> io::Re
         Label::Pass,
     );
     b.jump(
-        Insn::new(JEQ_K, 0, 0, 0, HOST_SOCKET_NATIVE as i32),
-        Label::Pass,
-    );
-    b.jump(
         Insn::new(JEQ_K, 0, 0, 0, HOST_SOCKET_UNSELECTED as i32),
         Label::Pass,
     );
@@ -623,15 +617,15 @@ fn producer(c: &HostSourceConfig, maps: Maps, cast: u32, closed: bool) -> io::Re
 }
 
 /// Match the stack's eight-header bound without pulling or copying the packet body.
-fn first_syn(b: &mut Builder, native: Option<&native::Selection<'_>>) {
+fn first_syn(b: &mut Builder) {
     const HEADER: i16 = -384;
     const OFFSET: i16 = -388;
     const END: i16 = -392;
     const NEXT: i16 = -396;
     const EXT: i16 = -400;
-    packet_load(b, native, Some(0), HEADER, 20);
+    packet_load(b, Some(0), HEADER, 20);
     b.jump(Insn::new(JNE_K, 0, 0, 0, 0), Label::Drop);
-    packet_word(b, native, 0, 16);
+    packet_word(b, 0, 16);
     let ipv6 = ahead(b, JNE_K, 0, 0, 0x0800u16.to_be() as i32);
     require(b, LDX_B, 10, HEADER + 9, 6);
     b.emit(Insn::new(LDX_B, 0, 10, HEADER, 0));
@@ -657,7 +651,7 @@ fn first_syn(b: &mut Builder, native: Option<&native::Selection<'_>>) {
     b.emit(Insn::new(BE16, 0, 0, 0, 16));
     b.emit(Insn::new(ADD_K, 0, 0, 0, 40));
     b.emit(Insn::new(STX_W, 10, 0, END, 0));
-    packet_word(b, native, 1, 0);
+    packet_word(b, 1, 0);
     b.jump(Insn::new(JGT_X, 0, 1, 0, 0), Label::Drop);
     b.emit(Insn::new(ST_W, 10, 0, OFFSET, 40));
     b.emit(Insn::new(LDX_B, 0, 10, HEADER + 6, 0));
@@ -679,7 +673,7 @@ fn first_syn(b: &mut Builder, native: Option<&native::Selection<'_>>) {
         b.emit(Insn::new(ADD_K, 0, 0, 0, 4));
         b.emit(Insn::new(LDX_W, 1, 10, END, 0));
         b.jump(Insn::new(JGT_X, 0, 1, 0, 0), Label::Drop);
-        packet_load(b, native, None, EXT, 4);
+        packet_load(b, None, EXT, 4);
         b.jump(Insn::new(JNE_K, 0, 0, 0, 0), Label::Drop);
         b.emit(Insn::new(LDX_W, 0, 10, NEXT, 0));
         let not_routing = ahead(b, JNE_K, 0, 0, 43);
@@ -702,14 +696,14 @@ fn first_syn(b: &mut Builder, native: Option<&native::Selection<'_>>) {
     }
     patch(b, ipv4_tcp);
     b.emit(Insn::new(LDX_W, 0, 10, END, 0));
-    packet_word(b, native, 1, 0);
+    packet_word(b, 1, 0);
     b.jump(Insn::new(JGT_X, 0, 1, 0, 0), Label::Drop);
     b.jump(Insn::new(JGT_K, 0, 0, 0, 65535), Label::Drop);
     b.emit(Insn::new(LDX_W, 2, 10, OFFSET, 0));
     b.emit(Insn::new(MOV_X, 1, 2, 0, 0));
     b.emit(Insn::new(ADD_K, 1, 0, 0, 20));
     b.jump(Insn::new(JGT_X, 1, 0, 0, 0), Label::Drop);
-    packet_load(b, native, None, HEADER, 20);
+    packet_load(b, None, HEADER, 20);
     b.jump(Insn::new(JNE_K, 0, 0, 0, 0), Label::Drop);
     b.emit(Insn::new(LDX_B, 0, 10, HEADER + 12, 0));
     b.emit(Insn::new(RSH_K, 0, 0, 0, 4));
@@ -724,51 +718,23 @@ fn first_syn(b: &mut Builder, native: Option<&native::Selection<'_>>) {
     b.jump(Insn::new(JNE_K, 0, 0, 0, 2), Label::Drop);
 }
 
-fn packet_word(b: &mut Builder, native: Option<&native::Selection<'_>>, reg: u8, offset: i16) {
-    if let Some(native) = native {
-        native.packet_word(b, reg, offset);
-    } else {
-        b.emit(Insn::new(LDX_W, reg, 9, offset, 0));
-    }
+fn packet_word(b: &mut Builder, reg: u8, offset: i16) {
+    b.emit(Insn::new(LDX_W, reg, 9, offset, 0));
 }
 
-fn packet_load(
-    b: &mut Builder,
-    native: Option<&native::Selection<'_>>,
-    offset: Option<i32>,
-    dest: i16,
-    size: i32,
-) {
-    if let Some(native) = native {
-        native.packet_load(b, offset, dest, size);
-    } else {
-        b.emit(Insn::new(MOV_X, 1, 9, 0, 0));
-        if let Some(offset) = offset {
-            b.emit(Insn::new(MOV_K, 2, 0, 0, offset));
-        }
-        stack(b, 3, dest);
-        b.emit(Insn::new(MOV_K, 4, 0, 0, size));
-        b.emit(Insn::new(CALL, 0, 0, 0, 26));
+fn packet_load(b: &mut Builder, offset: Option<i32>, dest: i16, size: i32) {
+    b.emit(Insn::new(MOV_X, 1, 9, 0, 0));
+    if let Some(offset) = offset {
+        b.emit(Insn::new(MOV_K, 2, 0, 0, offset));
     }
+    stack(b, 3, dest);
+    b.emit(Insn::new(MOV_K, 4, 0, 0, size));
+    b.emit(Insn::new(CALL, 0, 0, 0, 26));
 }
 
 fn selector(c: &HostSourceConfig, maps: Maps, cast: u32) -> io::Result<Program> {
-    selector_with(c, maps, cast, None)
-}
-
-fn selector_with(
-    c: &HostSourceConfig,
-    maps: Maps,
-    cast: u32,
-    native: Option<&native::Selection<'_>>,
-) -> io::Result<Program> {
     let mut b = Builder::new();
-    if let Some(native) = native {
-        native.reserve(&mut b)?;
-        native.origin(&mut b);
-    } else {
-        origin(&mut b, c, cast, true);
-    }
+    origin(&mut b, c, cast, true);
     gate(&mut b, maps.gate);
     b.emit(Insn::new(ST_W, 10, 0, DEVICE, 0));
     b.emit(Insn::new(LDX_W, 0, 10, M + 64, 0));
@@ -792,16 +758,9 @@ fn selector_with(
         Insn::new(JEQ_K, 0, 0, 0, HOST_SOCKET_TRANSITION as i32),
         Label::Drop,
     );
-    if let Some(native) = native {
-        native.prepare(&mut b);
-    }
     b.jump(
         Insn::new(JEQ_K, 0, 0, 0, HOST_SOCKET_ENDPOINT as i32),
         Label::Selected,
-    );
-    b.jump(
-        Insn::new(JEQ_K, 0, 0, 0, HOST_SOCKET_NATIVE as i32),
-        Label::Pass,
     );
     b.emit(Insn::new(LDX_W, 1, 10, M + 72, 0));
     b.jump(Insn::new(0x16, 1, 0, 0, c.bypass_mark as i32), Label::Pass);
@@ -820,29 +779,15 @@ fn selector_with(
     // Validate the actual first active-open header before selecting Endpoint. No ISN authority.
     b.emit(Insn::new(LDX_W, 0, 10, DEVICE, 0));
     let kernel = ahead(&mut b, JEQ_K, 0, 0, 0);
-    first_syn(&mut b, native);
+    first_syn(&mut b);
     patch(&mut b, kernel);
-    if let Some(native) = native {
-        native.tcp_pending(&mut b);
-    }
     // Serialize the first publication; a competing reader cannot choose another executor.
     bank_lock(&mut b, true);
     find_entry(&mut b);
     b.emit(Insn::new(MOV_K, 7, 0, 0, 0));
     let absent = ahead(&mut b, JEQ_K, 5, 0, 0);
     b.emit(Insn::new(LDX_W, 0, 5, 52, 0));
-    let changed = if native.is_some() {
-        b.emit(Insn::new(LDX_W, 1, 10, DEVICE, 0));
-        let ordinary = ahead(&mut b, JEQ_K, 1, 0, 0);
-        b.emit(Insn::new(MOV_K, 2, 0, 0, HOST_SOCKET_TRANSITION as i32));
-        let selected = ahead(&mut b, JA, 0, 0, 0);
-        patch(&mut b, ordinary);
-        b.emit(Insn::new(MOV_K, 2, 0, 0, HOST_SOCKET_CANDIDATE as i32));
-        patch(&mut b, selected);
-        ahead(&mut b, JNE_X, 0, 2, 0)
-    } else {
-        ahead(&mut b, JNE_K, 0, 0, HOST_SOCKET_CANDIDATE as i32)
-    };
+    let changed = ahead(&mut b, JNE_K, 0, 0, HOST_SOCKET_CANDIDATE as i32);
     b.emit(Insn::new(LDX_DW, 0, 5, 40, 0));
     b.emit(Insn::new(LDX_DW, 1, 10, E + 40, 0));
     let replaced = ahead(&mut b, JNE_X, 0, 1, 0);
@@ -852,11 +797,7 @@ fn selector_with(
     begin_write(&mut b, Label::Drop);
     b.emit(Insn::new(LDX_W, 0, 10, DEVICE, 0));
     let choose_kernel = ahead(&mut b, JEQ_K, 0, 0, 0);
-    if let Some(native) = native {
-        native.commit_choice(&mut b);
-    } else {
-        b.emit(Insn::new(ST_W, 5, 0, 52, HOST_SOCKET_ENDPOINT as i32));
-    }
+    b.emit(Insn::new(ST_W, 5, 0, 52, HOST_SOCKET_ENDPOINT as i32));
     b.emit(Insn::new(LDX_W, 0, 10, M + 64, 0));
     b.emit(Insn::new(STX_W, 5, 0, 56, 0));
     let chosen = ahead(&mut b, JA, 0, 0, 0);
@@ -915,9 +856,6 @@ fn selector_with(
     b.emit(Insn::new(STX_DW, 5, 0, 40, 0));
     b.emit(Insn::new(ST_W, 5, 0, 52, HOST_SOCKET_TRANSITION as i32));
     end_write(&mut b);
-    if let Some(native) = native {
-        native.transition(&mut b);
-    }
     b.emit(Insn::new(ST_W, 10, 0, GOOD, 1));
     patch(&mut b, full);
     patch(&mut b, changed);
@@ -980,10 +918,6 @@ fn selector_with(
     b.emit(Insn::new(LDX_W, 0, 10, SCRATCH, 0));
     b.jump(Insn::new(JNE_K, 0, 0, 0, 1), Label::Malformed);
     patch(&mut b, born);
-    if let Some(native) = native {
-        native.pending(&mut b);
-        native.restore_bank(&mut b);
-    }
     // Probe/closed-gate failures restore the old executor but never publish this packet.
     gate(&mut b, maps.gate);
     b.emit(Insn::new(LDX_W, 0, 10, READY, 0));
@@ -1009,23 +943,17 @@ fn selector_with(
     b.emit(Insn::new(LDX_DW, 0, 10, GATE_POINTER, 0));
     b.emit(Insn::new(LDX_W, 0, 0, 0, 0));
     let closed = ahead(&mut b, JNE_K, 0, 0, 1);
-    if let Some(native) = native {
-        native.commit_choice(&mut b);
-    } else {
-        b.emit(Insn::new(ST_W, 5, 0, 52, HOST_SOCKET_ENDPOINT as i32));
-    }
+    b.emit(Insn::new(ST_W, 5, 0, 52, HOST_SOCKET_ENDPOINT as i32));
     b.emit(Insn::new(LDX_W, 0, 10, M + 64, 0));
     b.emit(Insn::new(STX_W, 5, 0, 56, 0));
     b.emit(Insn::new(MOV_K, 7, 0, 0, 1));
     let committed = ahead(&mut b, JA, 0, 0, 0);
     patch(&mut b, abort);
     patch(&mut b, closed);
-    if native.is_none() {
-        b.emit(Insn::new(LDX_W, 0, 10, E + 52, 0));
-        b.emit(Insn::new(STX_W, 5, 0, 52, 0));
-        b.emit(Insn::new(LDX_DW, 0, 10, E + 40, 0));
-        b.emit(Insn::new(STX_DW, 5, 0, 40, 0));
-    }
+    b.emit(Insn::new(LDX_W, 0, 10, E + 52, 0));
+    b.emit(Insn::new(STX_W, 5, 0, 52, 0));
+    b.emit(Insn::new(LDX_DW, 0, 10, E + 40, 0));
+    b.emit(Insn::new(STX_DW, 5, 0, 40, 0));
     patch(&mut b, committed);
     end_write(&mut b);
     patch(&mut b, missing);
@@ -1043,7 +971,6 @@ fn selector_with(
     b.emit(Insn::new(LDX_W, 0, 5, 52, 0));
     let host = ahead(&mut b, JEQ_K, 0, 0, HOST_SOCKET_ENDPOINT as i32);
     let transition = ahead(&mut b, JEQ_K, 0, 0, HOST_SOCKET_TRANSITION as i32);
-    let frozen_native = ahead(&mut b, JEQ_K, 0, 0, HOST_SOCKET_NATIVE as i32);
     b.emit(Insn::new(LDX_W, 1, 10, E + 52, 0));
     let changed = ahead(&mut b, JNE_X, 0, 1, 0);
     b.emit(Insn::new(LDX_DW, 0, 5, 40, 0));
@@ -1060,7 +987,6 @@ fn selector_with(
     b.emit(Insn::new(MOV_K, 7, 0, 0, 1));
     patch(&mut b, host);
     patch(&mut b, transition);
-    patch(&mut b, frozen_native);
     patch(&mut b, changed);
     patch(&mut b, replaced);
     patch(&mut b, closed);
@@ -1071,13 +997,8 @@ fn selector_with(
     require(&mut b, LDX_W, 10, DEVICE, 1);
     require(&mut b, LDX_W, 10, READY, 1);
     b.jump(Insn::new(JA, 0, 0, 0, 0), Label::Pass);
-    if let Some(native) = native {
-        native.end(&mut b, true);
-        native.finish(b.finish()?)
-    } else {
-        end(&mut b, true);
-        b.finish()
-    }
+    end(&mut b, true);
+    b.finish()
 }
 
 #[cfg(test)]

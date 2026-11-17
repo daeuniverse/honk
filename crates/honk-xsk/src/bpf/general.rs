@@ -98,70 +98,42 @@ fn selected(
     xsks: RawFd,
     data: bool,
     metadata: bool,
-    native: Option<Program>,
-) -> io::Result<()> {
+) {
     b.label(Label::Selected);
     b.jump(Insn::new(JGE_K, 8, 0, 0, queues as i32), Label::Drop);
-    let native_entry = if native.is_some() {
+    if data && metadata {
         b.emit(Insn::new(MOV_X, 1, 9, 0, 0));
-        Some(forward(b, JA, 0, 0, 0))
-    } else {
-        if data && metadata {
-            b.emit(Insn::new(MOV_X, 1, 9, 0, 0));
-            b.emit(Insn::new(MOV_K, 2, 0, 0, -(METADATA_LEN as i32)));
-            b.emit(Insn::new(CALL, 0, 0, 0, 54));
-            b.jump(Insn::new(JNE_K, 0, 0, 0, 0), Label::CountDrop);
-            b.emit(Insn::new(LDX_W, 6, 9, 8, 0));
-            b.emit(Insn::new(LDX_W, 7, 9, 0, 0));
-            b.bound(METADATA_LEN as i32, Label::CountDrop);
-            for offset in (0..METADATA_LEN as i16).step_by(4) {
-                b.emit(Insn::new(LDX_W, 0, 10, -64 + offset, 0));
-                b.emit(Insn::new(STX_W, 6, 0, offset, 0));
-            }
+        b.emit(Insn::new(MOV_K, 2, 0, 0, -(METADATA_LEN as i32)));
+        b.emit(Insn::new(CALL, 0, 0, 0, 54));
+        b.jump(Insn::new(JNE_K, 0, 0, 0, 0), Label::CountDrop);
+        b.emit(Insn::new(LDX_W, 6, 9, 8, 0));
+        b.emit(Insn::new(LDX_W, 7, 9, 0, 0));
+        b.bound(METADATA_LEN as i32, Label::CountDrop);
+        for offset in (0..METADATA_LEN as i16).step_by(4) {
+            b.emit(Insn::new(LDX_W, 0, 10, -64 + offset, 0));
+            b.emit(Insn::new(STX_W, 6, 0, offset, 0));
         }
-        b.emit(Insn::new(STX_W, 10, 8, -4, 0));
+    }
+    b.emit(Insn::new(STX_W, 10, 8, -4, 0));
+    b.count(counters);
+    if data {
+        b.map_fd(xsks);
+        b.emit(Insn::new(MOV_X, 2, 8, 0, 0));
+        b.emit(Insn::new(MOV_K, 3, 0, 0, XDP_DROP));
+        b.emit(Insn::new(CALL, 0, 0, 0, 51));
+        b.emit(Insn::new(EXIT, 0, 0, 0, 0));
+    }
+    if data && metadata {
+        b.label(Label::CountDrop);
+        b.emit(Insn::new(ST_W, 10, 0, -4, (queues + 3) as i32));
         b.count(counters);
-        if data {
-            b.map_fd(xsks);
-            b.emit(Insn::new(MOV_X, 2, 8, 0, 0));
-            b.emit(Insn::new(MOV_K, 3, 0, 0, XDP_DROP));
-            b.emit(Insn::new(CALL, 0, 0, 0, 51));
-            b.emit(Insn::new(EXIT, 0, 0, 0, 0));
-        }
-        if data && metadata {
-            b.label(Label::CountDrop);
-            b.emit(Insn::new(ST_W, 10, 0, -4, (queues + 3) as i32));
-            b.count(counters);
-        }
-        None
-    };
+    }
     b.label(Label::Drop);
     b.emit(Insn::new(MOV_K, 0, 0, 0, XDP_DROP));
     b.emit(Insn::new(EXIT, 0, 0, 0, 0));
     b.label(Label::Pass);
     b.emit(Insn::new(MOV_K, 0, 0, 0, XDP_PASS));
     b.emit(Insn::new(EXIT, 0, 0, 0, 0));
-    if let Some(mut native) = native {
-        if native.flags != b.program.flags || native.ifindex != b.program.ifindex {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Native XDP attachment flags differ from control prefix",
-            ));
-        }
-        patch(b, native_entry.expect("Native entry jump"));
-        b.reserve(native.len)?;
-        b.program
-            .insns
-            .extend_from_slice(&native.insns[..native.len]);
-        b.program.len += native.len;
-        b.program.kfunc_btf = native.kfunc_btf.take();
-    }
-    Ok(())
-}
-
-pub(super) struct Input<'a> {
-    pub capture: &'a GeneralCapture,
-    pub ipv4_broadcasts: &'a [std::net::Ipv4Addr],
 }
 
 pub(super) fn build(
@@ -172,51 +144,6 @@ pub(super) fn build(
     xsks: RawFd,
     data: bool,
     vlan_kfunc: Option<u32>,
-) -> io::Result<Program> {
-    build_inner(
-        Input {
-            capture,
-            ipv4_broadcasts,
-        },
-        queues,
-        counters,
-        xsks,
-        data,
-        vlan_kfunc,
-        None,
-    )
-}
-
-pub(super) fn build_with_native(
-    input: Input<'_>,
-    queues: u32,
-    counters: RawFd,
-    xsks: RawFd,
-    vlan_kfunc: Option<u32>,
-    native: Program,
-) -> io::Result<Program> {
-    build_inner(
-        input,
-        queues,
-        counters,
-        xsks,
-        true,
-        vlan_kfunc,
-        Some(native),
-    )
-}
-
-fn build_inner(
-    Input {
-        capture,
-        ipv4_broadcasts,
-    }: Input<'_>,
-    queues: u32,
-    counters: RawFd,
-    xsks: RawFd,
-    data: bool,
-    vlan_kfunc: Option<u32>,
-    native: Option<Program>,
 ) -> io::Result<Program> {
     validate_queues(queues)?;
     if ipv4_broadcasts.len() > crate::topology::MAX_BROADCASTS {
@@ -453,15 +380,7 @@ fn build_inner(
     b.emit(Insn::new(MOV_X, 2, 6, 0, 0));
     b.emit(Insn::new(ADD_K, 2, 0, 0, 40));
     own_socket(&mut b, true, capture.bypass_mark);
-    selected(
-        &mut b,
-        queues,
-        counters,
-        xsks,
-        data,
-        capture.vlan_metadata,
-        native,
-    )?;
+    selected(&mut b, queues, counters, xsks, data, capture.vlan_metadata);
     b.finish()
 }
 

@@ -15,7 +15,7 @@ const TCX_INGRESS: u32 = 46;
 const XDP_FRAGS_DEVICE_BOUND: u32 = (1 << 5) | (1 << 6);
 const SNAPSHOT: i16 = -(HOST_METADATA_LEN as i16);
 
-/// Native private-XDP capture and the source-private terminal. The capture owner owns pins.
+/// Private-XDP capture and the source-private terminal. The capture owner owns pins.
 pub struct HostPrograms {
     programs: Programs,
     terminal: OwnedFd,
@@ -113,7 +113,6 @@ impl HostPrograms {
                 discover,
                 data,
                 discover_id,
-                native_dispatch: None,
                 data_id,
                 queues: 1,
             },
