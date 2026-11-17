@@ -574,6 +574,61 @@ async fn an_under_load_cookie_reply_neither_moves_the_endpoint_nor_reaches_the_p
     echo_roundtrip(&mut stream, b"still the peer").await;
 }
 
+#[tokio::test]
+async fn received_cookie_reply_does_not_roam() {
+    use boringtun::noise::{TunnResult, rate_limiter::RateLimiter};
+    use boringtun::x25519::PublicKey;
+    use tokio::net::UdpSocket;
+
+    let reserved = [1, 2, 3];
+    let fixture = Fixture::with(Some(reserved), |_| {}).await;
+    let original = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let foreign = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let original_addr = original.local_addr().unwrap();
+    let foreign_addr = foreign.local_addr().unwrap();
+    let registry = Registry::new();
+    let config = TunnelConfig::from_node(&fixture.node).unwrap();
+    let tunnel = registry
+        .install(config, vec![original_addr], &Limits::new(DEFAULT_SHARE))
+        .unwrap();
+    tunnel.0.with(|inner| inner.request_handshake());
+    tunnel.0.wake_owner();
+
+    let mut packet = [0u8; 2048];
+    let (len, client) = tokio::time::timeout(TIMEOUT, original.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(packet[0], 1);
+    assert_eq!(&packet[1..4], &reserved);
+    packet[1..4].fill(0);
+    let limiter = RateLimiter::new(&PublicKey::from(fixture.peer.public), 0);
+    let mut reply = [0u8; 64];
+    let cookie = match limiter.verify_packet(Some(client.ip()), &packet[..len], &mut reply) {
+        Err(TunnResult::WriteToNetwork(cookie)) => cookie,
+        result => panic!("expected cookie reply, got {result:?}"),
+    };
+    assert_eq!(cookie[0], 3);
+    cookie[1..4].copy_from_slice(&reserved);
+    foreign.send_to(cookie, client).await.unwrap();
+
+    let (received_at, len) = tokio::time::timeout(TIMEOUT, async {
+        tokio::select! {
+            result = original.recv_from(&mut packet) => (original_addr, result.unwrap().0),
+            result = foreign.recv_from(&mut reply) => (foreign_addr, result.unwrap().0),
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        received_at, original_addr,
+        "cookie reply must not move the endpoint"
+    );
+    assert_eq!(tunnel.endpoint(), original_addr);
+    assert_eq!(packet[0], 1);
+    assert!(packet[len - 16..len].iter().any(|byte| *byte != 0));
+}
+
 /// A tunnel whose peer never answers, with its own key pair: it costs the registry a slot and the
 /// budget whatever flows its stack admits.
 fn silent(

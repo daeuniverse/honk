@@ -635,9 +635,10 @@ impl Inner {
         }
         // Datagrams that fail to authenticate are dropped silently, like the kernel does: the
         // source address is spoofable, so a flood of junk must not be able to end the tunnel.
+        let is_cookie_reply = data.first() == Some(&COOKIE_REPLY);
         let authentic = match tunn.decapsulate(Some(src.ip()), data, rx_scratch) {
             TunnResult::Err(_) => return,
-            TunnResult::Done => true,
+            TunnResult::Done => !is_cookie_reply,
             TunnResult::WriteToNetwork(reply) => {
                 // Under load boringtun answers an unauthenticated, merely mac1-valid handshake
                 // with a cookie reply. That proves nothing about the sender, and our output only
