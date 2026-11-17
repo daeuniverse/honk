@@ -172,7 +172,6 @@ pub(crate) struct CustodySnapshot {
     tcx_fds: Vec<OwnedFd>,
     xdp: Vec<(u32, u32)>,
     owned_programs: Vec<u32>,
-    native: Mutex<Option<std::sync::Weak<super::native::HostNativeTarget>>>,
     _charge: MemoryReservation,
 }
 
@@ -186,7 +185,6 @@ impl CustodySnapshot {
         selected_ifindices: &[u32],
         expected_tcx: &[TcxBinding],
         expected_xdp: &[(u32, u32)],
-        native: Option<Arc<super::native::HostNativeTarget>>,
         budget: &Arc<MemoryBudget>,
     ) -> anyhow::Result<Self> {
         ensure!(
@@ -279,15 +277,7 @@ impl CustodySnapshot {
                 .context("Host custody NETLINK_NETFILTER unavailable")?,
             receive: vec![0; MAX_DATAGRAM],
         };
-        if let Some(owner) = &native {
-            owner.check()?;
-        }
-        let mut inventory = channels.inventory(
-            private_pair,
-            selected_ifindices,
-            expected_xdp,
-            native.as_deref(),
-        )?;
+        let mut inventory = channels.inventory(private_pair, selected_ifindices, expected_xdp)?;
         for link in &inventory.links {
             check_tcx(link.ifindex, expected_tcx)?;
         }
@@ -319,45 +309,12 @@ impl CustodySnapshot {
             tcx_fds,
             xdp: expected_xdp.to_vec(),
             owned_programs: owned_program_ids.to_vec(),
-            native: Mutex::new(native.as_ref().map(Arc::downgrade)),
             _charge: charge,
         })
     }
 
-    pub(super) fn register_native(
-        &self,
-        owner: &Arc<super::native::HostNativeTarget>,
-    ) -> anyhow::Result<()> {
-        let mut native = self
-            .native
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Host Native custody lock poisoned"))?;
-        ensure!(native.is_none(), "Host Native custody already registered");
-        *native = Some(Arc::downgrade(owner));
-        Ok(())
-    }
-
-    fn native_owner(&self) -> anyhow::Result<Option<Arc<super::native::HostNativeTarget>>> {
-        let native = self
-            .native
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Host Native custody lock poisoned"))?
-            .as_ref()
-            .map(|owner| {
-                owner
-                    .upgrade()
-                    .context("Host Native custody owner disappeared")
-            })
-            .transpose()?;
-        if let Some(owner) = &native {
-            owner.check()?;
-        }
-        Ok(native)
-    }
-
     pub(crate) fn revalidate(&self) -> anyhow::Result<()> {
-        let native = self.native_owner()?;
-        if !monitor_pending(self.monitor.as_fd())? && native.is_none() {
+        if !monitor_pending(self.monitor.as_fd())? {
             return Ok(());
         }
         let stat = nix::sys::stat::fstat(&self.namespace)?;
@@ -402,12 +359,7 @@ impl CustodySnapshot {
             }
             Ok(())
         })?;
-        let mut current = channels.inventory(
-            self.private_pair,
-            &self.selected,
-            &self.xdp,
-            native.as_deref(),
-        )?;
+        let mut current = channels.inventory(self.private_pair, &self.selected, &self.xdp)?;
         current.seal()?;
         for (before, after) in self.inventory.links.iter().zip(&mut current.links) {
             if before.ifindex == after.ifindex
@@ -470,7 +422,6 @@ impl CustodySnapshot {
             .context("Host XDP acknowledgement does not match owned old program")?;
         let mut expected = self.xdp.clone();
         expected[slot].1 = new;
-        let native = self.native_owner()?;
         let mut channels = self
             .channels
             .lock()
@@ -496,12 +447,7 @@ impl CustodySnapshot {
             }
             Ok(())
         })?;
-        let mut current = channels.inventory(
-            self.private_pair,
-            &self.selected,
-            &expected,
-            native.as_deref(),
-        )?;
+        let mut current = channels.inventory(self.private_pair, &self.selected, &expected)?;
         current.seal()?;
         ensure!(
             current.records == self.inventory.records
@@ -565,7 +511,7 @@ impl CustodySnapshot {
             "immutable_records_hex": records,
             "xfrm_states": 0,
             "xfrm_policies": 0,
-            "nftables_tables": self.native.lock().ok().and_then(|owner| owner.as_ref().and_then(|owner| owner.upgrade())).map_or(0, |owner| owner.tables().len()),
+            "nftables_tables": 0,
             "netfilter_hooks": self.inventory.netfilter_hooks,
             "legacy_tc_filters": 0,
             "privileged_mutation_excluded": true,
@@ -587,7 +533,6 @@ impl Channels {
         private_pair: [u32; 2],
         selected: &[u32],
         xdp: &[(u32, u32)],
-        native: Option<&super::native::HostNativeTarget>,
     ) -> anyhow::Result<Inventory> {
         let mut inventory = Inventory::new();
         dump(
@@ -704,26 +649,20 @@ impl Channels {
         empty_dump(&mut self.xfrm, &mut self.receive, 21, 19, &[])
             .context("Host XFRM_MSG_GETPOLICY must complete empty")?;
         inventory.empty_queries += 2;
-        if let Some(owner) = native {
-            self.native_tables(owner)?;
-        } else {
-            empty_dump(
-                &mut self.netfilter,
-                &mut self.receive,
-                0x0a01,
-                0x0a00,
-                &[0; 4],
-            )
-            .context("Host NFT_MSG_GETTABLE must complete empty for every family")?;
-            inventory.empty_queries += 1;
-        }
+        empty_dump(
+            &mut self.netfilter,
+            &mut self.receive,
+            0x0a01,
+            0x0a00,
+            &[0; 4],
+        )
+        .context("Host NFT_MSG_GETTABLE must complete empty for every family")?;
+        inventory.empty_queries += 1;
         let active = super::object::Object::active_lsm()?;
         let apparmor = active.trim().split(',').any(|name| name == "apparmor");
         for (family, hooks) in [(2, 5), (10, 5), (3, 3), (7, 5)] {
             for hook in 0..hooks {
-                if matches!(family, 2 | 10) && native.is_some() {
-                    self.native_hooks(family, hook, apparmor, native.unwrap(), &mut inventory)?;
-                } else if matches!(family, 2 | 10) && hook == 4 {
+                if matches!(family, 2 | 10) && hook == 4 {
                     self.apparmor_hook(family, apparmor, &mut inventory)?;
                 } else {
                     self.empty_hook(family, hook, None)?;
@@ -740,96 +679,6 @@ impl Channels {
         Ok(inventory)
     }
 
-    fn native_tables(&mut self, owner: &super::native::HostNativeTarget) -> anyhow::Result<()> {
-        let tables = owner.tables();
-        let mut seen = vec![false; tables.len()];
-        dump(
-            &mut self.netfilter,
-            &mut self.receive,
-            0x0a01,
-            0x0a00,
-            &[0; 4],
-            |body| {
-                if body.len() < 4 {
-                    return Err(invalid("short owned Host nft table"));
-                }
-                let attrs = unique_attrs::<8>(&body[4..])?;
-                let name = string(attrs[1].ok_or_else(|| invalid("missing Host nft table name"))?)?;
-                let at = tables
-                    .iter()
-                    .position(|(family, table, owner)| {
-                        *family == body[0] && table == name && attrs[6] == Some(owner.as_slice())
-                    })
-                    .ok_or_else(|| invalid("foreign Host nft table"))?;
-                if seen[at] {
-                    return Err(invalid("duplicate owned Host nft table"));
-                }
-                seen[at] = true;
-                Ok(())
-            },
-        )?;
-        ensure!(seen.iter().all(|seen| *seen), "owned Host nft table absent");
-        Ok(())
-    }
-    fn native_hooks(
-        &mut self,
-        family: u8,
-        hook: u32,
-        apparmor: bool,
-        owner: &super::native::HostNativeTarget,
-        inventory: &mut Inventory,
-    ) -> anyhow::Result<()> {
-        let hooks = owner.hooks();
-        let tables = owner.tables();
-        let anchored = tables.iter().any(|(f, _, _)| *f == family);
-        let mut seen = Vec::with_capacity(10);
-        let mut body = vec![family, 0, 0, 0];
-        put_attribute(&mut body, 1 | 0x4000, &hook.to_be_bytes());
-        dump(
-            &mut self.netfilter,
-            &mut self.receive,
-            0x0c00,
-            0x0c00,
-            &body,
-            |record| {
-                let identity =
-                    owned_hook(record, family, hook, apparmor, &hooks, &tables, anchored)?;
-                if seen.contains(&identity) {
-                    return Err(invalid("duplicate owned Host netfilter registration"));
-                }
-                if identity == -225 {
-                    inventory.record_hook(family, hook, apparmor, record)?;
-                }
-                seen.push(identity);
-                Ok(())
-            },
-        )?;
-        let mut expected = hooks
-            .iter()
-            .filter(|h| h.family == family && h.hook == hook)
-            .map(|h| h.priority)
-            .collect::<Vec<_>>();
-        if anchored {
-            if hook == 3 {
-                expected.push(-451);
-            }
-            if matches!(hook, 0 | 3) {
-                expected.extend([-400, -200]);
-            }
-            if matches!(hook, 1 | 4) {
-                expected.push(if family == 10 && hook == 1 {
-                    i32::MAX - 1
-                } else {
-                    i32::MAX
-                });
-            }
-        }
-        ensure!(
-            expected.iter().all(|p| seen.contains(p)),
-            "owned Host netfilter/CT anchor registration absent"
-        );
-        Ok(())
-    }
     fn empty_hook(&mut self, family: u8, hook: u32, device: Option<&str>) -> anyhow::Result<()> {
         let mut body = Vec::with_capacity(40);
         body.extend_from_slice(&[family, 0, 0, 0]);
@@ -873,115 +722,6 @@ impl Channels {
         }
         Ok(())
     }
-}
-
-fn unique_attrs<const N: usize>(bytes: &[u8]) -> io::Result<[Option<&[u8]>; N]> {
-    let mut values = [None; N];
-    attributes(bytes, |kind, value| {
-        let slot = values
-            .get_mut(kind as usize)
-            .filter(|_| kind != 0)
-            .ok_or_else(|| invalid("unsupported Host Native attribute"))?;
-        if slot.replace(value).is_some() {
-            return Err(invalid("duplicate Host Native attribute"));
-        }
-        Ok(())
-    })?;
-    Ok(values)
-}
-fn owned_hook(
-    record: &[u8],
-    family: u8,
-    hook: u32,
-    apparmor: bool,
-    hooks: &[honk_xsk::HostNativeHook],
-    tables: &[(u8, String, [u8; 16])],
-    anchored: bool,
-) -> io::Result<i32> {
-    if record.get(..4) != Some(&[family, 0, 0, 0]) {
-        return Err(invalid("Host Native hook family mismatch"));
-    }
-    let attrs = unique_attrs::<7>(&record[4..])?;
-    if attrs[1] != Some(hook.to_be_bytes().as_slice()) || attrs[3].is_some() {
-        return Err(invalid("Host Native hook stage/device mismatch"));
-    }
-    let priority = i32::from_be_bytes(
-        attrs[2]
-            .ok_or_else(|| invalid("Host Native priority absent"))?
-            .try_into()
-            .map_err(|_| invalid("invalid Host Native priority"))?,
-    );
-    let function = string(attrs[4].ok_or_else(|| invalid("Host Native hook function absent"))?)?;
-    let module = attrs[5].map(string).transpose()?;
-    if let Some(info) = attrs[6] {
-        let info = unique_attrs::<3>(info)?;
-        let desc = unique_attrs::<4>(
-            info[1].ok_or_else(|| invalid("Host Native hook description absent"))?,
-        )?;
-        if info[2] == Some(2u32.to_be_bytes().as_slice()) {
-            if function != "nf_hook_run_bpf"
-                || module.is_some()
-                || desc[2].is_some()
-                || desc[3].is_some()
-            {
-                return Err(invalid("Host Native BPF callback mismatch"));
-            }
-            let id = desc[1].ok_or_else(|| invalid("Host Native BPF identity absent"))?;
-            if !hooks.iter().any(|h| {
-                h.family == family
-                    && h.hook == hook
-                    && h.priority == priority
-                    && h.flags == 0
-                    && id == h.program_id.to_be_bytes()
-            }) {
-                return Err(invalid("foreign Host Native BPF registration"));
-            }
-        } else if info[2] == Some(1u32.to_be_bytes().as_slice()) {
-            let table = string(desc[1].ok_or_else(|| invalid("Host Native table absent"))?)?;
-            let chain = string(desc[3].ok_or_else(|| invalid("Host Native chain absent"))?)?;
-            if !anchored
-                || hook != 3
-                || priority != -451
-                || desc[2] != Some([family].as_slice())
-                || chain != honk_nfqueue::native::CHAIN_NAME
-                || !tables
-                    .iter()
-                    .any(|(f, name, _)| *f == family && name == table)
-                || function
-                    != if family == 2 {
-                        "nf_route_table_hook4"
-                    } else {
-                        "nf_route_table_hook6"
-                    }
-                || module.is_some_and(|m| m != "nf_tables")
-            {
-                return Err(invalid("foreign Host Native nft route hook"));
-            }
-        } else {
-            return Err(invalid("unsupported Host Native hook owner"));
-        }
-    } else {
-        let expected = match (family, hook, priority) {
-            (_, 4, -225) if apparmor => ("apparmor_ip_postroute", None),
-            (2, 0 | 3, -400) if anchored => ("ipv4_conntrack_defrag", Some("nf_defrag_ipv4")),
-            (10, 0 | 3, -400) if anchored => ("ipv6_defrag", Some("nf_defrag_ipv6")),
-            (2, 0, -200) if anchored => ("ipv4_conntrack_in", Some("nf_conntrack")),
-            (2, 3, -200) if anchored => ("ipv4_conntrack_local", Some("nf_conntrack")),
-            (10, 0, -200) if anchored => ("ipv6_conntrack_in", Some("nf_conntrack")),
-            (10, 3, -200) if anchored => ("ipv6_conntrack_local", Some("nf_conntrack")),
-            (10, 1, p) if anchored && p == i32::MAX - 1 => ("nf_confirm", Some("nf_conntrack")),
-            (_, 1 | 4, i32::MAX) if anchored => ("nf_confirm", Some("nf_conntrack")),
-            _ => {
-                return Err(invalid(
-                    "foreign Host netfilter hook outside owned composition",
-                ));
-            }
-        };
-        if function != expected.0 || module.is_some_and(|m| Some(m) != expected.1) {
-            return Err(invalid("Host Native stock hook provenance mismatch"));
-        }
-    }
-    Ok(priority)
 }
 
 fn invalid(message: &'static str) -> io::Error {
@@ -1499,45 +1239,6 @@ fn check_link(fd: BorrowedFd<'_>, expected: TcxBinding) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn native_hook_requires_exact_program_and_stock_anchor() {
-        let expected = honk_xsk::HostNativeHook {
-            family: 2,
-            hook: 3,
-            priority: -452,
-            flags: 0,
-            program_id: 123,
-            link_id: 456,
-        };
-        let bpf = |id: u32, priority: i32| {
-            let mut desc = Vec::new();
-            put_attribute(&mut desc, 1, &id.to_be_bytes());
-            let mut info = Vec::new();
-            put_attribute(&mut info, 2, &2u32.to_be_bytes());
-            put_attribute(&mut info, 1 | 0x8000, &desc);
-            let mut record = vec![2, 0, 0, 0];
-            put_attribute(&mut record, 1, &3u32.to_be_bytes());
-            put_attribute(&mut record, 2, &priority.to_be_bytes());
-            put_attribute(&mut record, 4, b"nf_hook_run_bpf\0");
-            put_attribute(&mut record, 6 | 0x8000, &info);
-            record
-        };
-        assert_eq!(
-            owned_hook(&bpf(123, -452), 2, 3, false, &[expected], &[], false).unwrap(),
-            -452
-        );
-        assert!(owned_hook(&bpf(124, -452), 2, 3, false, &[expected], &[], false).is_err());
-        assert!(owned_hook(&bpf(123, -199), 2, 3, false, &[expected], &[], false).is_err());
-        let mut stock = vec![2, 0, 0, 0];
-        put_attribute(&mut stock, 1, &3u32.to_be_bytes());
-        put_attribute(&mut stock, 2, &(-200i32).to_be_bytes());
-        put_attribute(&mut stock, 4, b"ipv4_conntrack_local\0");
-        put_attribute(&mut stock, 5, b"nf_conntrack\0");
-        assert!(owned_hook(&stock, 2, 3, false, &[], &[], true).is_ok());
-        assert!(owned_hook(&stock, 2, 3, false, &[], &[], false).is_err());
-        put_attribute(&mut stock, 2, &(-200i32).to_be_bytes());
-        assert!(owned_hook(&stock, 2, 3, false, &[], &[], true).is_err());
-    }
 
     #[test]
     fn apparmor_hook_record_boundary() {

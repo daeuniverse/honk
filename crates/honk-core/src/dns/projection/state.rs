@@ -6,12 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(feature = "ebpf")]
-use std::time::Duration;
 use tokio::time::Instant;
-
-#[cfg(feature = "ebpf")]
-use crate::ebpf::native::{NativePublication, NativeWrite};
 
 use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
 type OwnerKey = Arc<str>;
@@ -193,41 +188,6 @@ impl PacketFactScope {
     }
 }
 
-/// One fixed wake for all pending expiry extensions, derived from the installed horizon.
-/// Refreshes never move it. A fresh remaining horizon >=2s waits at least 1s;
-/// shorter horizons wait half their remaining duration, without extending it.
-#[cfg(feature = "ebpf")]
-#[derive(Debug, Default)]
-pub(super) struct NativeRefresh {
-    at: Option<Instant>,
-    pending: bool,
-}
-
-#[cfg(feature = "ebpf")]
-impl NativeRefresh {
-    pub(super) fn published(&mut self, horizon: Option<Instant>, now: Instant) {
-        self.at = horizon.map(|deadline| {
-            let remaining = deadline.saturating_duration_since(now);
-            deadline - (remaining / 2).min(Duration::from_secs(1))
-        });
-        self.pending = false;
-    }
-
-    pub(super) fn defer(&mut self) {
-        // A publication may have omitted every fact before this extension arrived.
-        self.at.get_or_insert_with(Instant::now);
-        self.pending = true;
-    }
-
-    pub(super) fn deadline(&self) -> Option<Instant> {
-        self.at.filter(|_| self.pending)
-    }
-
-    fn due(&self, now: Instant) -> bool {
-        self.deadline().is_some_and(|deadline| deadline <= now)
-    }
-}
-
 fn advance_revision(scopes: &mut [PacketFactScope], scope: u64) {
     if let Some(entry) = scopes
         .iter_mut()
@@ -265,14 +225,6 @@ pub(super) struct DesiredState {
     /// Set once: removing the table would allow a retained stamp's revision to be reissued.
     packet_scopes: Box<[PacketFactScope]>,
     _packet_scope_charge: Option<honk_netstack::MemoryReservation>,
-    #[cfg(feature = "ebpf")]
-    packet_scope_budget: Option<Arc<honk_netstack::MemoryBudget>>,
-    #[cfg(feature = "ebpf")]
-    native: Option<Arc<NativePublication>>,
-    #[cfg(feature = "ebpf")]
-    native_failure_logged: bool,
-    #[cfg(feature = "ebpf")]
-    pub(super) native_refresh: NativeRefresh,
 }
 
 impl DesiredState {
@@ -294,14 +246,6 @@ impl DesiredState {
             structure: Arc::new(AtomicU64::new(0)),
             packet_scopes: Box::default(),
             _packet_scope_charge: None,
-            #[cfg(feature = "ebpf")]
-            packet_scope_budget: None,
-            #[cfg(feature = "ebpf")]
-            native: None,
-            #[cfg(feature = "ebpf")]
-            native_failure_logged: false,
-            #[cfg(feature = "ebpf")]
-            native_refresh: NativeRefresh::default(),
         }
     }
 
@@ -309,7 +253,6 @@ impl DesiredState {
         &mut self,
         scopes: Box<[PacketFactScope]>,
         charge: honk_netstack::MemoryReservation,
-        budget: &Arc<honk_netstack::MemoryBudget>,
     ) -> anyhow::Result<()> {
         if !self.packet_scopes.is_empty() {
             // Parameters otherwise drop the charge before the rejected table.
@@ -318,113 +261,7 @@ impl DesiredState {
         }
         self.packet_scopes = scopes;
         self._packet_scope_charge = Some(charge);
-        #[cfg(feature = "ebpf")]
-        {
-            self.packet_scope_budget = Some(Arc::clone(budget));
-        }
-        #[cfg(not(feature = "ebpf"))]
-        let _ = budget;
         Ok(())
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(super) fn install_native(&mut self, native: Arc<NativePublication>) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.native.is_none(),
-            "native DNS publication is already installed"
-        );
-        anyhow::ensure!(
-            !self.packet_scopes.is_empty(),
-            "native DNS publication requires registered packet scopes"
-        );
-        self.native = Some(native);
-        self.mutate(|state| state.expire_inner(Instant::now()))
-    }
-
-    fn mutate<R>(&mut self, operation: impl FnOnce(&mut Self) -> R) -> anyhow::Result<R> {
-        #[cfg(feature = "ebpf")]
-        let write = match self
-            .native
-            .as_ref()
-            .map(|native| native.write(crate::ebpf::native::NativeReason::ScopedDns))
-            .transpose()
-        {
-            Ok(write) => write,
-            Err(error) => {
-                self.native_refresh.published(None, Instant::now());
-                self.log_native_failure(&error);
-                None
-            }
-        };
-        let result = operation(self);
-        #[cfg(feature = "ebpf")]
-        if let Some(write) = write {
-            match self.export_native(&write) {
-                Ok(()) => write.commit(),
-                Err(error) => {
-                    self.native_refresh.published(None, Instant::now());
-                    self.log_native_failure(&error);
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn log_native_failure(&mut self, error: &anyhow::Error) {
-        if !self.native_failure_logged {
-            tracing::error!(%error, "native DNS publication failed; native forwarding remains closed");
-            self.native_failure_logged = true;
-        }
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn export_native(&mut self, writer: &NativeWrite) -> anyhow::Result<()> {
-        let native = Arc::clone(
-            self.native
-                .as_ref()
-                .expect("installed native DNS publication"),
-        );
-        let capacity = self.desired.keys().filter(|key| !key.is_host()).count();
-        let bytes =
-            std::alloc::Layout::array::<(IpAddr, DomainRouting, Option<Instant>)>(capacity)?.size();
-        let _charge = self
-            .packet_scope_budget
-            .as_ref()
-            .expect("registered packet DNS scope budget")
-            .reserve(bytes)
-            .ok_or_else(|| anyhow::anyhow!("native DNS export memory capacity"))?;
-        let mut facts = Vec::with_capacity(capacity);
-        for entry in &self.packet_scopes {
-            anyhow::ensure!(
-                entry.revision != u64::MAX,
-                "packet DNS fact revision is exhausted"
-            );
-            facts.clear();
-            facts.extend(self.native_scope_facts(entry.scope));
-            native.update_scope(
-                entry.scope,
-                entry.revision,
-                self.snapshot.generation(),
-                self.snapshot.matcher.policy_fingerprint(),
-                &facts,
-                writer,
-            )?;
-        }
-        self.native_refresh
-            .published(native.renewal_deadline()?, Instant::now());
-        Ok(())
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(super) fn native_scope_facts(
-        &self,
-        scope: ScopeId,
-    ) -> impl Iterator<Item = (IpAddr, DomainRouting, Option<Instant>)> + '_ {
-        self.desired
-            .iter()
-            .filter(move |(key, _)| key.scope == scope.as_u64())
-            .map(|(key, bitmap)| (key.address, *bitmap, self.fact_expiry(key)))
     }
 
     pub(super) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
@@ -486,13 +323,6 @@ impl DesiredState {
             && stamp.is_unexpired_at(now)
     }
 
-    #[cfg(all(test, feature = "ebpf"))]
-    pub(super) fn install_closed_native_for_test(&mut self, native: Arc<NativePublication>) {
-        assert!(native.terminal());
-        assert!(self.native.is_none());
-        self.native = Some(native);
-    }
-
     #[cfg(test)]
     pub(super) fn set_packet_fact_revision_for_test(&mut self, scope: ScopeId, revision: u64) {
         self.packet_scopes
@@ -506,83 +336,12 @@ impl DesiredState {
         if snapshot.generation() <= self.snapshot.generation() {
             return snapshot.generation() == self.snapshot.generation();
         }
-        self.mutate(|state| {
-            state.snapshot = Arc::clone(snapshot);
-            state.rebuild_all();
-        })
-        .is_ok()
+        self.snapshot = Arc::clone(snapshot);
+        self.rebuild_all();
+        true
     }
 
     pub(super) fn observe(
-        &mut self,
-        scope: ScopeId,
-        observation: ProjectionObservation<'_>,
-        now: Instant,
-    ) -> u64 {
-        #[cfg(feature = "ebpf")]
-        if self.native.is_some() && self.native_extension_only(scope, observation, now) {
-            // Expiry may withdraw a different owner; close for that mutation first.
-            if let Err(error) = self.try_expire(now) {
-                self.log_native_failure(&error);
-            }
-            // Publication can outlive the old expiry; admission must use its completion time.
-            let now = Instant::now().max(now);
-            self.advance_extended_wakes(now);
-            let expiry_due = self
-                .expiry_deadlines
-                .peek()
-                .is_some_and(|entry| entry.0.at <= now);
-            if !expiry_due && self.native_extension_only(scope, observation, now) {
-                let evicted = self.observe_inner(scope, observation, now);
-                if let Some(entry) = self.packet_scopes.iter().find(|entry| entry.scope == scope) {
-                    let current = self
-                        .native
-                        .as_ref()
-                        .expect("installed native DNS publication")
-                        .scope_is_current(
-                            scope,
-                            entry.revision,
-                            self.snapshot.generation(),
-                            self.snapshot.matcher.policy_fingerprint(),
-                            self.native_scope_facts(scope),
-                        );
-                    if !current {
-                        self.native_refresh.defer();
-                    }
-                }
-                return evicted;
-            }
-            return self
-                .mutate(|state| state.observe_inner(scope, observation, now))
-                .unwrap_or(0);
-        }
-        self.mutate(|state| state.observe_inner(scope, observation, now))
-            .unwrap_or(0)
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(super) fn native_extension_only(
-        &self,
-        scope: ScopeId,
-        observation: ProjectionObservation<'_>,
-        now: Instant,
-    ) -> bool {
-        let ProjectionObservation::Positive {
-            domain,
-            family,
-            ips,
-            expires_at,
-        } = observation
-        else {
-            return false;
-        };
-        self.unchanged_owner(scope.as_u64(), family as usize, domain, ips)
-            .is_some_and(|owner| {
-                now < owner.expires_at && now < expires_at && expires_at >= owner.expires_at
-            })
-    }
-
-    fn observe_inner(
         &mut self,
         scope: ScopeId,
         observation: ProjectionObservation<'_>,
@@ -1063,52 +822,16 @@ impl DesiredState {
 
     pub(super) fn try_expire(&mut self, now: Instant) -> anyhow::Result<()> {
         self.prune_stale_expiry_heads();
-        #[cfg(feature = "ebpf")]
-        if self.native.is_some() {
-            self.advance_extended_wakes(now);
-        }
-        #[cfg(feature = "ebpf")]
-        let native_due = self.native_refresh.due(now);
-        #[cfg(not(feature = "ebpf"))]
-        let native_due = false;
-        if native_due
-            || self
-                .expiry_deadlines
-                .peek()
-                .is_some_and(|entry| entry.0.at <= now)
+        if self
+            .expiry_deadlines
+            .peek()
+            .is_some_and(|entry| entry.0.at <= now)
         {
-            self.mutate(|state| state.expire_inner(now))
+            self.expire_inner(now);
+            Ok(())
         } else {
             self.compact_owner_heaps_if_needed();
             Ok(())
-        }
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn advance_extended_wakes(&mut self, now: Instant) {
-        loop {
-            self.prune_stale_expiry_heads();
-            let Some(Reverse(deadline)) = self.expiry_deadlines.peek() else {
-                break;
-            };
-            if deadline.at > now {
-                break;
-            }
-            let expires_at = self.owners[deadline.family]
-                .get(&deadline.scope)
-                .and_then(|owners| owners.get(&deadline.domain))
-                .expect("pruned expiry owner disappeared")
-                .expires_at;
-            if expires_at <= now {
-                break;
-            }
-            // An extension retained this earlier heap wake; only queue metadata changes.
-            let Reverse(mut deadline) = self
-                .expiry_deadlines
-                .pop()
-                .expect("expiry wake disappeared");
-            deadline.at = expires_at;
-            self.expiry_deadlines.push(Reverse(deadline));
         }
     }
 
@@ -1227,144 +950,4 @@ pub(super) fn same_address_set<'a>(
     let mut sorted = ips.iter().map(IpAddr::to_canonical).collect::<Vec<_>>();
     sorted.sort_unstable();
     sorted.iter().eq(known)
-}
-
-#[cfg(all(test, feature = "ebpf"))]
-mod native_tests {
-    use super::*;
-    use crate::routing::Router;
-    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
-    use honk_netstack::MemoryBudget;
-
-    fn registered_state(
-        scopes: &[ScopeId],
-    ) -> (
-        DesiredState,
-        Arc<RoutingProjectionSnapshot>,
-        Arc<MemoryBudget>,
-    ) {
-        let router = Router::new(
-            &[RoutingRule {
-                name: "domains".into(),
-                condition: RoutingCondition {
-                    domain: vec!["a.test".into(), "b.test".into()],
-                    ..Default::default()
-                },
-                outbound: RoutingOutbound::Simple("direct".into()),
-                priority: 0,
-                must: false,
-                mark: None,
-            }],
-            "direct",
-        )
-        .unwrap();
-        let snapshot = Arc::new(RoutingProjectionSnapshot::new(1, Arc::new(router)));
-        let mut state = DesiredState::new(Arc::clone(&snapshot), 16);
-        let budget = MemoryBudget::new(1 << 20);
-        state
-            .register_packet_scopes(
-                scopes.iter().copied().map(PacketFactScope::new).collect(),
-                budget.reserve(4096).unwrap(),
-                &budget,
-            )
-            .unwrap();
-        (state, snapshot, budget)
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn extension_rechecks_time_after_expiry_publication() {
-        let scope = ScopeId::allocate().unwrap();
-        let (mut state, snapshot, budget) = registered_state(&[scope]);
-        let start = Instant::now();
-        let ips = ["192.0.2.1".parse().unwrap()];
-        let positive = |domain, expires_at| ProjectionObservation::Positive {
-            domain,
-            family: IpVersion::V4,
-            ips: &ips,
-            expires_at,
-        };
-        for (domain, seconds) in [("a.test", 3), ("b.test", 1)] {
-            state.observe(
-                scope,
-                positive(domain, start + Duration::from_secs(seconds)),
-                start,
-            );
-        }
-        let native = NativePublication::closed_for_test(budget).unwrap();
-        state.install_native(Arc::clone(&native)).unwrap();
-        let writes = native.write_attempts_for_test();
-        let revision = state.packet_scopes[0].revision;
-        let captured = start + Duration::from_secs(2);
-        tokio::time::advance(Duration::from_secs(4)).await;
-        let extended = start + Duration::from_secs(60);
-
-        // A refused publication clears the horizon too, without requiring kernel hooks.
-        state.observe(scope, positive("a.test", extended), captured);
-
-        assert_eq!(native.write_attempts_for_test(), writes + 2);
-        assert_eq!(state.packet_scopes[0].revision, revision + 3);
-        assert_eq!(state.owner_domains(), ["a.test"]);
-        assert_eq!(
-            state.native_scope_facts(scope).collect::<Vec<_>>(),
-            [(
-                ips[0],
-                snapshot.bitmap_for("a.test").unwrap(),
-                Some(extended)
-            )]
-        );
-        assert_eq!(state.next_deadline(), Some(extended));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn extension_fences_siblings_expiring_during_publication() {
-        let scope = ScopeId::allocate().unwrap();
-        let sibling = ScopeId::allocate().unwrap();
-        let (mut state, _, budget) = registered_state(&[scope, sibling]);
-        let start = Instant::now();
-        let ips = ["192.0.2.1".parse().unwrap()];
-        let positive = |domain, expires_at| ProjectionObservation::Positive {
-            domain,
-            family: IpVersion::V4,
-            ips: &ips,
-            expires_at,
-        };
-        for (owner_scope, domain, seconds) in [
-            (scope, "a.test", 30),
-            (scope, "b.test", 1),
-            (sibling, "b.test", 3),
-        ] {
-            state.observe(
-                owner_scope,
-                positive(domain, start + Duration::from_secs(seconds)),
-                start,
-            );
-        }
-        let native = NativePublication::closed_for_test(budget).unwrap();
-        state.install_native(Arc::clone(&native)).unwrap();
-        let writes = native.write_attempts_for_test();
-        let revision = state.packet_scopes[1].revision;
-        let captured = start + Duration::from_secs(2);
-        tokio::time::advance(Duration::from_secs(4)).await;
-
-        state.observe(
-            scope,
-            positive("a.test", start + Duration::from_secs(30)),
-            captured,
-        );
-
-        assert_eq!(native.write_attempts_for_test(), writes + 2);
-        assert_eq!(state.packet_scopes[1].revision, revision + 1);
-        assert!(state.native_scope_facts(sibling).next().is_none());
-        assert_eq!(state.owner_domains(), ["a.test"]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn extension_without_an_installed_horizon_gets_an_immediate_wake() {
-        let now = Instant::now();
-        let mut refresh = NativeRefresh::default();
-        refresh.published(None, now);
-        refresh.defer();
-        assert_eq!(refresh.deadline(), Some(now));
-        assert!(refresh.due(now));
-    }
 }

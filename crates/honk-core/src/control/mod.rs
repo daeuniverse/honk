@@ -144,46 +144,16 @@ pub(crate) enum EnginePhase {
 pub(crate) struct ShutdownIntent {
     requested: std::sync::atomic::AtomicBool,
     changed: tokio::sync::Notify,
-    #[cfg(feature = "ebpf")]
-    native: parking_lot::Mutex<Option<Arc<crate::ebpf::native::NativePublication>>>,
 }
 
 impl ShutdownIntent {
-    #[cfg(feature = "ebpf")]
-    pub(crate) fn install_native(
-        &self,
-        publication: Arc<crate::ebpf::native::NativePublication>,
-    ) -> anyhow::Result<()> {
-        let mut native = self.native.lock();
-        if self.requested() {
-            publication.quiesce(crate::ebpf::native::NativeReason::Shutdown)?;
-            anyhow::bail!("Native shutdown already requested");
-        }
-        anyhow::ensure!(native.is_none(), "Native shutdown owner already installed");
-        *native = Some(publication);
-        Ok(())
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(crate) fn native_publication(&self) -> Option<Arc<crate::ebpf::native::NativePublication>> {
-        self.native.lock().clone()
-    }
-
     pub(crate) fn requested(&self) -> bool {
         self.requested.load(std::sync::atomic::Ordering::Acquire)
     }
 
     pub(crate) fn request(&self) {
-        #[cfg(feature = "ebpf")]
-        let native = self.native.lock();
         self.requested
             .store(true, std::sync::atomic::Ordering::Release);
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = native.as_ref()
-            && let Err(error) = publication.quiesce(crate::ebpf::native::NativeReason::Shutdown)
-        {
-            tracing::error!(%error, "Native admission withdrawn with retained shutdown failure");
-        }
         self.changed.notify_waiters();
     }
 

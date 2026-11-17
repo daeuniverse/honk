@@ -110,9 +110,8 @@ pub(super) fn parse_section(
                         config.direct = Some(match value.unquote().raw() {
                             "core" => DirectProfile::Core,
                             "endpoint" => DirectProfile::Endpoint,
-                            "native" => DirectProfile::Native,
                             _ => {
-                                return Err(invalid("direct must be core, endpoint or native"));
+                                return Err(invalid("direct must be core or endpoint"));
                             }
                         })
                     }

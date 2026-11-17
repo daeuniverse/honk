@@ -94,58 +94,16 @@ fn workers_are_strict_xdp_presence_and_restart_identity() {
 }
 
 #[test]
-fn native_is_explicit_xdp_and_reuses_common_admission() {
-    use honk_config::datapath::DatapathConfig;
-
-    let source = "datapath {\n backend: xdp\n direct: native\n interface { eth0: lan }\n}";
-    let config = honk_config::parser::parse_dae_config(source).unwrap();
-    let native = config.datapath.unwrap();
-    assert_eq!(native.direct, Some(DirectProfile::Native));
-    let value = serde_json::to_value(&native).unwrap();
-    assert_eq!(value["direct"], "native");
-    let decoded: DatapathConfig = serde_json::from_value(value.clone()).unwrap();
-    decoded.validate().unwrap();
-    assert_eq!(decoded, native);
-
-    for (body, mut rejected) in [
-        (
-            "backend: tc\n direct: native",
-            serde_json::json!({"backend": "tc", "direct": "native"}),
-        ),
-        (
-            "backend: tun\n direct: native",
-            serde_json::json!({"backend": "tun", "direct": "native"}),
-        ),
-        (
-            "backend: xdp\n direct: native",
-            serde_json::json!({"backend": "xdp", "direct": "native"}),
-        ),
-        (
-            "backend: xdp\n direct: native\n interface { eth0: lan }\n firewall { original { default: allow } }",
-            serde_json::json!({"firewall": {"original": {"default": "allow"}}}),
-        ),
-        (
-            "backend: xdp\n direct: native\n interface { eth0: lan }\n nat { postrouting { sip(10.0.0.0/24) -> masquerade() } }",
-            serde_json::json!({"nat": {"postrouting": [{
-                "condition": {"source_ip": ["10.0.0.0/24"]},
-                "action": {"kind": "masquerade", "ports": {"first": 1024, "last": 65535}}
-            }]}}),
-        ),
-    ] {
-        assert!(
-            honk_config::parser::parse_dae_config(&format!("datapath {{\n {body}\n }}")).is_err(),
-            "accepted {body}"
-        );
-        if rejected.get("backend").is_none() {
-            let mut merged = value.clone();
-            for (key, field) in rejected.as_object().unwrap() {
-                merged[key] = field.clone();
-            }
-            rejected = merged;
-        }
-        let rejected: DatapathConfig = serde_json::from_value(rejected).unwrap();
-        assert!(rejected.validate().is_err());
-    }
+fn native_direct_profile_is_rejected_by_both_adapters() {
+    let source = |direct: &str| {
+        format!("datapath {{\n backend: xdp\n direct: {direct}\n interface {{\n eth0: lan\n }}\n}}")
+    };
+    honk_config::parser::parse_dae_config(&source("endpoint")).unwrap();
+    assert!(honk_config::parser::parse_dae_config(&source("native")).is_err());
+    assert!(serde_json::from_value::<honk_config::datapath::DatapathConfig>(
+        serde_json::json!({"backend": "xdp", "direct": "native", "interfaces": [{"name": "eth0", "role": "lan"}]})
+    )
+    .is_err());
 }
 
 #[test]
@@ -186,7 +144,7 @@ fn interface_entries_reject_nested_settings_and_empty_blocks() {
 
 #[test]
 fn xdp_binding_adapters_preserve_copy_opt_in_and_effective_restart_identity() {
-    for direct in ["core", "endpoint", "native"] {
+    for direct in ["core", "endpoint"] {
         let source = |setting: &str| {
             format!(
                 "datapath {{\n backend: xdp\n direct: {direct}\n {setting}\n interface {{ dut0: lan }}\n}}"

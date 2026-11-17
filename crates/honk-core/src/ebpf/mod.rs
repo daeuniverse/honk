@@ -7,8 +7,6 @@ pub(crate) mod interface;
 pub mod map_snapshot;
 pub mod maps;
 pub mod mock;
-#[cfg(feature = "ebpf")]
-pub mod native;
 mod policy_state;
 pub mod probe;
 mod retirement;
@@ -485,19 +483,6 @@ pub(crate) fn record_pname_routing(
 pub trait PolicyBackend: Send + Sync {
     fn tc(&self) -> anyhow::Result<&(dyn EbpfBackend + 'static)>;
     fn tc_mut(&mut self) -> anyhow::Result<&mut (dyn EbpfBackend + 'static)>;
-
-    #[cfg(feature = "ebpf")]
-    fn native_publication(&self) -> Option<std::sync::Arc<native::NativePublication>> {
-        None
-    }
-
-    #[cfg(feature = "ebpf")]
-    fn install_native_publication(
-        &mut self,
-        _publication: std::sync::Arc<native::NativePublication>,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("Native publication requires the packet policy backend")
-    }
 
     /// Bounded readonly kernel/owner facts; never repairs or reopens the datapath.
     fn observe_datapath(&self) -> DatapathObservation {

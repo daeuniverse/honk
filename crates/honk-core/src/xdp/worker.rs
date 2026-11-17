@@ -1,13 +1,10 @@
 use super::*;
 use futures::FutureExt as _;
 mod adaptive;
-#[cfg(feature = "ebpf")]
-pub(super) mod native;
 mod runtime;
 #[cfg(test)]
 mod tests;
 use parking_lot::Mutex;
-use std::sync::atomic::AtomicU64;
 use tokio::sync::{Notify, mpsc};
 
 const CELLS: usize = 64;
@@ -240,24 +237,12 @@ struct CellPool {
 pub(super) struct Cell {
     pool: Arc<CellPool>,
     slot: usize,
-    retained: bool,
     bytes: Option<Box<[u8]>>,
     length: usize,
     metadata: usize,
 }
 
 impl Cell {
-    #[cfg(feature = "ebpf")]
-    pub(in crate::xdp) fn transfer(&mut self) -> Self {
-        Self {
-            pool: Arc::clone(&self.pool),
-            slot: self.slot,
-            retained: self.retained,
-            bytes: self.bytes.take(),
-            length: self.length,
-            metadata: self.metadata,
-        }
-    }
     fn copy(&mut self, segments: &[&[u8]], metadata: &[u8]) -> io::Result<()> {
         let bytes = self.bytes.as_mut().expect("owned handoff storage");
         let length = segments
@@ -280,20 +265,12 @@ impl Cell {
     pub(super) fn packet(&self) -> &[u8] {
         &self.bytes.as_ref().unwrap()[self.metadata..self.length]
     }
-    pub(super) fn metadata(&self) -> &[u8] {
-        &self.bytes.as_ref().unwrap()[..self.metadata]
-    }
 }
 
 impl Drop for Cell {
     fn drop(&mut self) {
         if let Some(bytes) = self.bytes.take() {
-            if self.retained {
-                std::mem::forget(bytes);
-                std::mem::forget(Arc::clone(&self.pool));
-            } else {
-                self.pool.free.lock().push((self.slot, bytes));
-            }
+            self.pool.free.lock().push((self.slot, bytes));
         }
     }
 }
@@ -305,10 +282,6 @@ impl CellPool {
         ports: usize,
         budget: &Arc<MemoryBudget>,
     ) -> io::Result<Arc<Self>> {
-        #[cfg(feature = "ebpf")]
-        let original_bytes = CELLS * size_of::<native::RemoteOriginal>();
-        #[cfg(not(feature = "ebpf"))]
-        let original_bytes = 0;
         let bytes = extent
             .checked_mul(CELLS)
             .and_then(|bytes| {
@@ -320,8 +293,7 @@ impl CellPool {
                         + size_of::<Shared>()
                         + PEERS * size_of::<PeerSlot>()
                         + 64 * size_of::<Placement>()
-                        + 65536
-                        + original_bytes,
+                        + 65536,
                 )
             })
             .ok_or_else(|| io::Error::other("worker storage overflow"))?;
@@ -346,7 +318,6 @@ impl CellPool {
         self.free.lock().pop().map(|(slot, bytes)| Cell {
             pool: Arc::clone(self),
             slot,
-            retained: false,
             bytes: Some(bytes),
             length: 0,
             metadata: 0,
@@ -367,17 +338,6 @@ pub(super) enum Payload {
         owner: PacketScope,
         admission: Option<EndpointAdmission>,
     },
-    #[cfg(feature = "ebpf")]
-    NativeEndpoint {
-        owner: PacketScope,
-        admission: Option<EndpointAdmission>,
-        slot: usize,
-    },
-    #[cfg(feature = "ebpf")]
-    Original {
-        handle: honk_xsk::RetainedRxHandle,
-        imported: crate::ebpf::native::ImportedOriginal,
-    },
 }
 
 pub(super) enum PacketBody {
@@ -385,8 +345,6 @@ pub(super) enum PacketBody {
     Reassembled(honk_netstack::OwnedPacket),
 }
 pub(super) struct Envelope {
-    pub(super) device: usize,
-    pub(super) queue: u32,
     pub(super) ingress: Ingress,
     pub(super) scope: ScopeId,
     pub(super) path: ReturnPath,
@@ -404,7 +362,6 @@ struct State {
     ready: bool,
     closing: bool,
     stop: bool,
-    drained: u64,
     exited: bool,
     failure: Option<anyhow::Error>,
 }
@@ -414,13 +371,10 @@ pub(super) struct Shared {
     senders: [mpsc::Sender<Envelope>; 2],
     states: [Mutex<State>; 2],
     wake: [Arc<Notify>; 2],
-    barrier: AtomicU64,
     admission: Arc<AtomicBool>,
     peers: Arc<PeerAuthority>,
     pub(super) workers: u8,
     pub(super) placements: Mutex<Vec<Placement>>,
-    #[cfg(feature = "ebpf")]
-    pub(super) native: native::Slots,
     wakers: [futures::task::AtomicWaker; 2],
     pub(super) diagnostics: Mutex<Option<Arc<Diagnostics>>>,
     contexts: Mutex<[Option<Result<String, &'static str>>; 2]>,
@@ -443,7 +397,6 @@ impl Shared {
                 senders: [send0, send1],
                 states: std::array::from_fn(|_| Mutex::new(State::default())),
                 wake: std::array::from_fn(|_| Arc::new(Notify::new())),
-                barrier: AtomicU64::new(0),
                 peers: PeerAuthority::new(Arc::clone(&admission)),
                 admission,
                 workers,
@@ -452,8 +405,6 @@ impl Shared {
                 diagnostics: Mutex::new(None),
                 contexts: Mutex::new([None, None]),
                 context_changed: std::array::from_fn(|_| AtomicBool::new(true)),
-                #[cfg(feature = "ebpf")]
-                native: native::Slots::new(),
             }),
             [receive0, receive1],
         ))
@@ -504,30 +455,6 @@ impl Shared {
             .failure
             .get_or_insert(error);
         self.close();
-    }
-
-    pub(super) fn barrier(&self, epoch: u64) {
-        if self.barrier.swap(epoch, Ordering::AcqRel) == epoch {
-            return;
-        }
-        for worker in 0..usize::from(self.workers) {
-            self.wake_worker(worker);
-        }
-    }
-
-    pub(super) fn drain_epoch(&self) -> u64 {
-        self.barrier.load(Ordering::Acquire)
-    }
-
-    pub(super) fn both_drained(&self, epoch: u64) -> bool {
-        (0..usize::from(self.workers)).all(|worker| {
-            let state = self.states[worker].lock();
-            state.failure.is_none() && state.drained == epoch
-        }) && self
-            .senders
-            .iter()
-            .all(|sender| sender.capacity() == DESTINATION)
-            && self.barrier.load(Ordering::Acquire) == epoch
     }
 }
 
@@ -660,8 +587,6 @@ impl Shared {
                 .or_else(|| self.pool.take())
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
             let envelope = Envelope {
-                device: placement.device,
-                queue: 0,
                 ingress: placement.ingress,
                 scope,
                 path,
@@ -701,8 +626,6 @@ impl Shared {
         };
         cell.copy(&[packet], &[])?;
         let envelope = Envelope {
-            device: placement.device,
-            queue: 0,
             ingress: placement.ingress,
             scope,
             path,
@@ -761,8 +684,6 @@ struct WorkerDevice {
     capture: GeneralCapture,
     queues: Vec<Queue>,
     features: Option<FeatureQuery>,
-    #[cfg(feature = "ebpf")]
-    native: bool,
 }
 
 pub(super) struct Worker {
@@ -829,8 +750,6 @@ impl Worker {
                 },
                 queues,
                 features: None,
-                #[cfg(feature = "ebpf")]
-                native: device.native_enabled(),
             });
         }
         let thread_shared = Arc::clone(&shared);
@@ -976,8 +895,6 @@ impl Shared {
             .or_else(|| self.pool.take())
             .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
         let envelope = Envelope {
-            device: placement.device,
-            queue: 0,
             ingress: placement.ingress,
             scope,
             path,
@@ -1042,27 +959,6 @@ impl Shared {
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
         Ok(PacketReceive::default())
     }
-
-    pub(super) fn note_drained(&self, worker: usize, epoch: u64, drained: bool) {
-        if epoch == 0 {
-            return;
-        }
-        let mut state = self.states[worker].lock();
-        let value = if drained && self.barrier.load(Ordering::Acquire) == epoch {
-            epoch
-        } else {
-            0
-        };
-        let changed = state.drained != value;
-        state.drained = value;
-        if self.barrier.load(Ordering::Acquire) != epoch {
-            state.drained = 0;
-        }
-        drop(state);
-        if changed && worker != 0 {
-            self.wake_worker(0);
-        }
-    }
 }
 
 impl Runtime {
@@ -1079,13 +975,6 @@ impl Runtime {
                 Poll::Ready(Some(envelope)) => envelope,
                 _ => break,
             };
-            #[cfg(feature = "ebpf")]
-            if matches!(envelope.payload, Payload::Original { .. }) {
-                let original = native::RemoteOriginal::new(envelope);
-                self.remote_originals.push_back(original);
-                progress += 1;
-                continue;
-            }
             if self.closing {
                 progress += 1;
                 continue;
@@ -1158,8 +1047,6 @@ impl Runtime {
                         self.workers.dispatch_envelope(&self.endpoints, envelope)
                     }
                 }
-                #[cfg(feature = "ebpf")]
-                Payload::Original { .. } | Payload::NativeEndpoint { .. } => unreachable!(),
             };
             match result {
                 Ok(report) if report.qualified_rx => {

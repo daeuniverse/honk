@@ -390,22 +390,6 @@ fi
 if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     [[ $HONK_XDP_CORE_TEST_BIN == /* && -x $HONK_XDP_CORE_TEST_BIN ]] || fail 'invalid Core test executable'
     modprobe nf_conntrack
-    native_retirement_test=xdp::native::tests::real_map_udp_retirement_preserves_active_owned_and_late_activity_claims
-    [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$native_retirement_test" --exact --ignored --list --format terse) == "$native_retirement_test: test" ]] || fail "missing ignored Native retirement regression: $native_retirement_test"
-    ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$native_retirement_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/native-retirement.log"
-    for test in \
-        xdp::tests::retention::kernel_captured_return_small_jumbo_entry_and_fresh_grace \
-        xdp::tests::retention::kernel_captured_return_missing_entry_retains_owner \
-        xdp::tests::retention::kernel_captured_return_full_length_write_refused_after_admission \
-        xdp::tests::retention::kernel_captured_return_private_prerequisite_refusal \
-        xdp::tests::retention::native_committed_executors_never_return_original \
-        xdp::tests::retention::native_nonready_port_retains_runtime_before_take \
-        xdp::tests::retention::kernel_captured_return_terminal_proof_failures_retain_phases \
-        xdp::tests::retention::kernel_captured_return_failed_finish_close_stays_retained \
-        xdp::tests::retention::kernel_captured_return_empty_runtime_drop_quiesces_publication; do
-        [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored captured Core regression: $test"
-        ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/${test##*::}.log"
-    done
     ip -n dut route replace 198.51.100.99/32 dev dut1 src 203.0.113.1
     ip -n dut -6 route replace fd00:2::99/128 dev dut1 src fd00:77::1
     ip -n dut route replace 192.0.2.2/32 dev dut0 src 203.0.113.1

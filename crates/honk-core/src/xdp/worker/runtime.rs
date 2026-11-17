@@ -91,7 +91,6 @@ impl WorkerRuntime {
         cx: &mut Context<'_>,
         interval: Option<&BusyInterval>,
     ) -> anyhow::Result<bool> {
-        let observed_barrier = self.shared.drain_epoch();
         let now = Instant::now();
         self.shared.wakers[1].register(cx.waker());
         let mut progress = false;
@@ -105,14 +104,8 @@ impl WorkerRuntime {
                 _ => break,
             };
             let payload = std::mem::replace(&mut envelope.payload, Payload::Ingress);
-            let (owner, admission, native_slot) = match payload {
-                Payload::Endpoint { owner, admission } => (owner, admission, None),
-                #[cfg(feature = "ebpf")]
-                Payload::NativeEndpoint {
-                    owner,
-                    admission,
-                    slot,
-                } => (owner, admission, Some(slot)),
+            let (owner, admission) = match payload {
+                Payload::Endpoint { owner, admission } => (owner, admission),
                 _ => anyhow::bail!("worker 1 received coordinator-only ingress"),
             };
             let mut report = PacketReceive::default();
@@ -139,17 +132,6 @@ impl WorkerRuntime {
             if report.qualified_rx {
                 qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
             }
-            #[cfg(feature = "ebpf")]
-            if let Some(slot) = native_slot {
-                self.shared.native.ports[slot]
-                    .lock()
-                    .as_mut()
-                    .context("Native Endpoint slot absent")?
-                    .phase = super::native::Phase::EndpointDone(envelope.cell, report);
-                self.shared.wake_worker(0);
-            }
-            #[cfg(not(feature = "ebpf"))]
-            let _: Option<usize> = native_slot;
             if let Some(error) = failed {
                 return Err(error.into());
             }
@@ -177,30 +159,6 @@ impl WorkerRuntime {
                 arm_read(&queue.io, cx)?;
                 let port = queue.io.get_mut();
                 progress |= port.complete(release_completed)? != 0;
-                #[cfg(feature = "ebpf")]
-                {
-                    progress |= self.shared.native.service_port(
-                        &self.shared,
-                        device.index,
-                        queue.id,
-                        port,
-                    )?;
-                }
-                #[cfg(feature = "ebpf")]
-                if device.native && (self.closing || self.shared.admission.load(Ordering::Acquire))
-                {
-                    progress |= super::native::receive_remote_originals(
-                        &self.shared,
-                        device.index,
-                        &device.capture,
-                        queue.id,
-                        port,
-                        now,
-                    )? != 0;
-                    port.refill()?;
-                    port.kick()?;
-                    continue;
-                }
                 if !self.closing && self.shared.admission.load(Ordering::Acquire) {
                     let shared = &self.shared;
                     let endpoints = &self.endpoints;
@@ -303,8 +261,6 @@ impl WorkerRuntime {
                                         None
                                     };
                                     let envelope = Envelope {
-                                        device: device.index,
-                                        queue: queue.id,
                                         ingress: placement.ingress,
                                         scope: placement.realm.scope(),
                                         path,
@@ -403,8 +359,6 @@ impl WorkerRuntime {
                 }
             }
         }
-        self.shared
-            .note_drained(1, observed_barrier, self.drained());
         Ok(progress)
     }
 }

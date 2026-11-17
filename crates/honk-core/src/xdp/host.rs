@@ -3,7 +3,6 @@ pub(crate) mod custody;
 mod features;
 pub(crate) mod kernel;
 mod namespace;
-pub(crate) mod native;
 mod object;
 pub(crate) mod receipt;
 pub(crate) mod sys;
@@ -34,7 +33,6 @@ pub(super) struct HostPrepare<'a> {
     pub pin_root: &'a Path,
     pub data_dir: &'a Path,
     pub budget: Arc<MemoryBudget>,
-    pub native: Option<Arc<crate::ebpf::native::NativePublication>>,
 }
 
 pub(super) struct HostPacket {
@@ -73,10 +71,6 @@ pub(super) struct HostCapture {
     xsk: RefCell<Option<OwnedFd>>,
     grace: sys::Grace,
     receipt: Arc<parking_lot::Mutex<receipt::Receipt>>,
-    native: Option<(
-        Arc<crate::ebpf::native::NativePublication>,
-        Arc<native::HostNativeTarget>,
-    )>,
     pins: PathBuf,
     budget: Arc<MemoryBudget>,
     memory: Option<MemoryReservation>,
@@ -334,50 +328,9 @@ impl HostCapture {
             &selected,
             &expected_tcx,
             spec.source_xdp,
-            None,
             &spec.budget,
         )?);
         let receipt = Arc::new(parking_lot::Mutex::new(receipt));
-        let native_write = spec
-            .native
-            .as_ref()
-            .map(|p| p.write(crate::ebpf::native::NativeReason::Startup))
-            .transpose()?;
-        let native_target = if let Some(publication) = &spec.native {
-            let [root, claims, scratch] = publication.host_map_fds();
-            let target = native::HostNativeTarget::load(
-                source_config,
-                spec.authority.scope,
-                &layout,
-                honk_xsk::HostNativeMaps {
-                    root,
-                    claims,
-                    scratch,
-                    gate: object.map("HOST_GATE")?,
-                    sequence: object.map("HOST_SEQUENCE")?,
-                    sockets: object.map("HOST_SOCKETS")?,
-                    socket_locks: object.map("HOST_SOCKET_LOCKS")?,
-                    returns: object.map("HOST_RETURNS")?,
-                },
-                receipt.clone(),
-                &spec.budget,
-                &pins,
-            )?;
-            publication.register_host(
-                target.clone(),
-                native_write
-                    .as_ref()
-                    .context("Host Native writer missing")?,
-            )?;
-            Some(target)
-        } else {
-            None
-        };
-        if let Some(target) = &native_target {
-            source_custody.register_native(target)?;
-            target.set_custody(source_custody.clone())?;
-            source_custody.revalidate()?;
-        }
         tracing::debug!("Host prepare_closed: source_custody done, child_custody via in_namespace");
         let child_custody = in_namespace(&pair.namespace, || {
             Ok(Arc::new(CustodySnapshot::capture(
@@ -390,7 +343,6 @@ impl HostCapture {
                 &[],
                 &[],
                 &[(pair.device.ifindex, programs.programs().discover_prog_id())],
-                None,
                 &spec.budget,
             )?))
         })?;
@@ -433,9 +385,6 @@ impl HostCapture {
         receipt.lock().acknowledge(memory_intent,serde_json::json!({"kernel_bytes":kernel_bytes,"retained_fixed_reservation_bytes":retained_memory.bytes(),"userspace_allowance_bytes":32*1024*1024,"userspace_allowance_includes_kernel_btf":false,"cold_kernel_btf_peak_reserved_bytes":layout.memory_bytes(),"cold_kernel_btf_retained_after_prepare":false}))?;
         tracing::debug!("Host prepare_closed: kernel_bytes done, receipt.phase closed");
         receipt.lock().phase("closed")?;
-        if let Some(writer) = native_write {
-            writer.commit();
-        }
         Ok(Self {
             authority: spec.authority,
             state: State::Prepared,
@@ -456,7 +405,6 @@ impl HostCapture {
             xsk: RefCell::new(None),
             grace,
             receipt,
-            native: spec.native.zip(native_target),
             pins,
             budget: spec.budget,
             memory: Some(unsafe { std::mem::ManuallyDrop::take(&mut retained_memory) }),
@@ -762,10 +710,6 @@ impl HostCapture {
             "Host custody unresolved; receipt retained"
         );
         self.state = State::Retained;
-        if let Some((publication, _)) = &self.native {
-            publication.quiesce(crate::ebpf::native::NativeReason::Shutdown)?;
-            publication.close_host_admission()?;
-        }
         self.object.gate(0)?;
         self.receipt.lock().phase("closing")?;
         for link in &mut self.source_links {
@@ -805,24 +749,15 @@ impl HostCapture {
                 })
                 .count();
         }
-        let native_source_owners = match &self.native {
-            Some((_, target)) => target
-                .retained_sources()
-                .context("Host Native source retirement was not observed")?,
-            None => 0,
-        };
-        if selected != 0 || native_source_owners != 0 {
+        if selected != 0 {
             let intent = self.receipt.lock().intent(
                 "guarded_stop",
-                serde_json::json!({"external_socket_owners":selected,"native_source_owners":native_source_owners}),
+                serde_json::json!({"external_socket_owners":selected}),
             )?;
-            self.receipt.lock().acknowledge(intent,serde_json::json!({"gate":0,"source_guards":true,"return_guard":true,"reader_grace":true,"external_socket_owners":selected,"native_source_owners":native_source_owners}))?;
+            self.receipt.lock().acknowledge(intent,serde_json::json!({"gate":0,"source_guards":true,"return_guard":true,"reader_grace":true,"external_socket_owners":selected}))?;
             self.receipt.lock().phase("guarded-retained")?;
             self.state = State::Retained;
             return Ok(());
-        }
-        if let Some((_, target)) = &self.native {
-            target.finish_close()?;
         }
         self.pair.remove(&mut self.receipt.lock())?;
         self.receipt.lock().retire_pins(&self.pins)?;

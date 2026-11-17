@@ -5,8 +5,6 @@
 pub(crate) mod host;
 #[cfg(feature = "ebpf")]
 mod host_runtime;
-#[cfg(feature = "ebpf")]
-mod native;
 pub(crate) mod polling;
 pub(crate) mod worker;
 use crate::control::poll_budget::BusyInterval;
@@ -15,6 +13,8 @@ use host_runtime::{HostRuntime, PreparedHost};
 use polling::runtime::polling_segment_stop;
 use polling::{AdaptivePoll, ContextDigest};
 
+#[cfg(all(target_os = "linux", any(test, feature = "ebpf")))]
+use crate::control::netstack::capture_scope;
 use crate::control::{
     ControlPlane,
     core_forward::{
@@ -23,7 +23,7 @@ use crate::control::{
     },
     netstack::{
         CAPTURE_MEMORY, OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope,
-        capture_realm, capture_scope,
+        capture_realm,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -102,16 +102,8 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     };
     datapath.validate()?;
     ensure!(
-        datapath.direct != Some(DirectProfile::Native) || config.global.data_dir.len() <= 1024,
-        "XDP Native requested global.data_dir exceeds the 1024-byte publication path bound"
-    );
-    ensure!(
         datapath.host.is_none() || cfg!(feature = "ebpf"),
         "XDP Host capture requires the built ebpf feature and actual Host runtime admission"
-    );
-    ensure!(
-        datapath.direct != Some(DirectProfile::Native) || cfg!(feature = "ebpf"),
-        "XDP Native requires the built ebpf feature and actual canonical kernel publication"
     );
     ensure!(
         !config.global.nfqueue_enable,
@@ -122,20 +114,13 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
         "XDP interfaces and trusted LAN/WAN roles belong only in datapath.interface"
     );
     ensure!(
-        if datapath.direct == Some(DirectProfile::Native) && !datapath.interfaces.is_empty() {
-            config.routing.default_mark.is_none()
-                && config.routing.rules.iter().all(|rule| rule.mark.is_none())
-        } else if datapath.direct == Some(DirectProfile::Native) && datapath.host.is_some() {
-            true
-        } else {
-            config.routing.default_mark.unwrap_or(0) == 0
-                && config
-                    .routing
-                    .rules
-                    .iter()
-                    .all(|rule| rule.mark.unwrap_or(0) == 0)
-        },
-        "XDP cannot execute traffic mark effects; physical Native requires Keep"
+        config.routing.default_mark.unwrap_or(0) == 0
+            && config
+                .routing
+                .rules
+                .iter()
+                .all(|rule| rule.mark.unwrap_or(0) == 0),
+        "XDP cannot execute traffic mark effects"
     );
     for rule in &config.routing.rules {
         let condition = &rule.condition;
@@ -170,10 +155,7 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
             "XDP firewall/NAT cannot bind process or original-datagram MAC facts across reassembly"
         );
     }
-    if matches!(
-        datapath.direct,
-        Some(DirectProfile::Core | DirectProfile::Native)
-    ) {
+    if datapath.direct == Some(DirectProfile::Core) {
         ensure!(
             config.global.dial_mode == "ip",
             "Core Direct requires dial_mode: ip; TCP termination is not a Core forwarding fallback"
@@ -267,24 +249,11 @@ struct Device {
     programs: Arc<Programs>,
     attachment: Arc<PersistentAttachment>,
     queues: Vec<Queue>,
-    #[cfg(feature = "ebpf")]
-    native_target: Option<Arc<honk_xsk::NativeTarget>>,
-    #[cfg(feature = "ebpf")]
-    _native_gate: Option<Arc<honk_xsk::NativeTcxAttachment>>,
-    #[cfg(feature = "ebpf")]
-    _native_memory: Option<MemoryReservation>,
     active: bool,
     metadata_checked: Instant,
     features: Option<FeatureQuery>,
     port_config: PortConfig,
     role: honk_config::datapath::InterfaceRole,
-}
-
-impl Device {
-    #[cfg(feature = "ebpf")]
-    fn native_enabled(&self) -> bool {
-        self.native_target.is_some()
-    }
 }
 
 struct Waiting {
@@ -612,14 +581,6 @@ fn fold_capture_result(failure: &mut Option<anyhow::Error>, result: anyhow::Resu
     }
 }
 
-#[cfg(feature = "ebpf")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeCaptureClose {
-    Unproven,
-    Proven,
-    Failed,
-}
-
 struct Runtime {
     devices: Vec<Device>,
     topology: AsyncFd<Topology>,
@@ -633,30 +594,6 @@ struct Runtime {
     inbox: tokio::sync::mpsc::Receiver<worker::Envelope>,
     endpoints: PacketEndpoints,
     core: Option<RoutedCore>,
-    #[cfg(feature = "ebpf")]
-    native: Option<Arc<crate::ebpf::native::NativePublication>>,
-    #[cfg(feature = "ebpf")]
-    native_policy: Option<crate::control::core_forward::RoutingAuthority>,
-    #[cfg(feature = "ebpf")]
-    native_writer: Option<crate::ebpf::native::NativeWrite>,
-    #[cfg(feature = "ebpf")]
-    native_capture_close: NativeCaptureClose,
-    #[cfg(feature = "ebpf")]
-    native_next: Instant,
-    #[cfg(feature = "ebpf")]
-    next_candidate: u64,
-    #[cfg(feature = "ebpf")]
-    captured: Option<native::CapturedReturn>,
-    #[cfg(feature = "ebpf")]
-    originals: VecDeque<native::HeldOriginal>,
-    #[cfg(feature = "ebpf")]
-    original_outcome: Option<native::OriginalProof>,
-    #[cfg(feature = "ebpf")]
-    remote_originals: VecDeque<worker::native::RemoteOriginal>,
-    #[cfg(feature = "ebpf")]
-    original_worker: bool,
-    #[cfg(feature = "ebpf")]
-    _original_memory: Option<MemoryReservation>,
     waiting: VecDeque<Waiting>,
     pending: VecDeque<Pending>,
     staging: Vec<u8>,
@@ -689,10 +626,6 @@ impl Runtime {
         logical: &[u32],
         mark: u32,
     ) -> io::Result<Topology> {
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = &self.native {
-            return publication.admit_topology(physical, logical, mark, &self.polling_budget);
-        }
         Topology::admit_after_xdp_attach(physical, logical, mark)
     }
 
@@ -741,10 +674,6 @@ impl Runtime {
     }
 
     fn close_capture(&mut self) -> anyhow::Result<()> {
-        #[cfg(feature = "ebpf")]
-        let eligible =
-            std::mem::replace(&mut self.native_capture_close, NativeCaptureClose::Failed)
-                != NativeCaptureClose::Failed;
         self.admission.store(false, Ordering::Release);
         self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
@@ -754,17 +683,6 @@ impl Runtime {
         self.context_recheck = false;
         self.polling.leave("closing");
         let mut failure: Option<anyhow::Error> = None;
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = &self.native {
-            fold_capture_result(
-                &mut failure,
-                publication.quiesce(crate::ebpf::native::NativeReason::Shutdown),
-            );
-        }
-        #[cfg(feature = "ebpf")]
-        if let Some(writer) = self.native_writer.take() {
-            writer.commit();
-        }
         for device in &mut self.devices {
             let result = close_device_capture_with(
                 device,
@@ -799,12 +717,6 @@ impl Runtime {
             fold_capture_result(&mut failure, result.map_err(Into::into));
         }
         #[cfg(feature = "ebpf")]
-        if let Some(captured) = &mut self.captured {
-            fold_capture_result(&mut failure, captured.seal());
-        } else if let Some(publication) = &self.native {
-            fold_capture_result(&mut failure, publication.original_grace());
-        }
-        #[cfg(feature = "ebpf")]
         if let Some(host) = &mut self.host {
             fold_capture_result(&mut failure, host.capture.close_capture());
             host.pending = [None, None];
@@ -814,19 +726,6 @@ impl Runtime {
         self.pending.clear();
         for realm in &mut self.realms {
             realm.pending = [None, None];
-        }
-        #[cfg(feature = "ebpf")]
-        if self.native.is_some() && !eligible {
-            fold_capture_result(
-                &mut failure,
-                Err(anyhow::anyhow!(
-                    "Native capture close remains failed-retained"
-                )),
-            );
-        }
-        #[cfg(feature = "ebpf")]
-        if eligible && failure.is_none() {
-            self.native_capture_close = NativeCaptureClose::Proven;
         }
         failure.map_or(Ok(()), Err)
     }
@@ -854,14 +753,6 @@ impl Runtime {
             }
         }
         let now = Instant::now();
-        #[cfg(feature = "ebpf")]
-        self.begin_native_turn(now)?;
-        #[cfg(feature = "ebpf")]
-        if let Some(writer) = &self.native_writer {
-            self.workers.barrier(writer.epoch());
-        }
-        #[cfg(feature = "ebpf")]
-        let observed_barrier = self.workers.drain_epoch();
         let mut progress = self.poll_handoffs(cx, now)?;
         self.round_cut_short = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
@@ -903,8 +794,6 @@ impl Runtime {
                 } else {
                     device_index
                 };
-                #[cfg(feature = "ebpf")]
-                let native_enabled = device.native_enabled();
                 let queue = &mut device.queues[queue_index];
                 if !self.closing
                     && let Err(error) = arm_read(&queue.io, cx)
@@ -918,26 +807,6 @@ impl Runtime {
                         return Poll::Ready(Err(error.into()));
                     }
                 };
-                #[cfg(feature = "ebpf")]
-                if native_enabled {
-                    progress += usize::from(self.workers.native.service_port(
-                        &self.workers,
-                        device_index,
-                        queue.id,
-                        port,
-                    )?);
-                    progress += worker::native::receive_remote_originals(
-                        &self.workers,
-                        device_index,
-                        &device.capture,
-                        queue.id,
-                        port,
-                        now,
-                    )?;
-                    port.refill()?;
-                    port.kick()?;
-                    continue;
-                }
                 let mut backpressure = None;
                 let (received, kick) = port.transmit_batch(|port| {
                     if self.closing { return Ok(0); }
@@ -1052,7 +921,7 @@ impl Runtime {
                         } else {
                             workers.copy(segments, metadata).and_then(|cell| {
                                 let owner = workers.owner(scope, bytes)?;
-                                workers.send(1, worker::Envelope { device: device_index, queue: queue.id,
+                                workers.send(1, worker::Envelope {
                                     ingress, scope, path, ingress_at: now, cell,
                                     body: None, peer: None,
                                     l3_offset: decoded.l3_offset, l3_length: decoded.l3_len,
@@ -1084,10 +953,6 @@ impl Runtime {
             }
             self.rx_device = (device_index + 1) % (before.len() + 1 + after.len());
             self.rx_queue = 0;
-        }
-        #[cfg(feature = "ebpf")]
-        {
-            progress += self.service_all_native_originals(cx, now)?;
         }
         #[cfg(feature = "ebpf")]
         if let Some(host) = &mut self.host {
@@ -1260,8 +1125,6 @@ impl Runtime {
                 realm.driver.finish_turn(cx, now);
             }
         }
-        #[cfg(feature = "ebpf")]
-        self.finish_native_turn(now, observed_barrier)?;
         if progress == 0 {
             Poll::Pending
         } else {
@@ -1352,16 +1215,6 @@ impl Runtime {
         for realm in &self.realms {
             if let Some(due) = realm.driver.deadline() {
                 include(due);
-            }
-        }
-        #[cfg(feature = "ebpf")]
-        if self.native.is_some() && !self.closing {
-            if let Some(writer) = &self.native_writer {
-                if self.workers.both_drained(writer.epoch()) {
-                    include(now);
-                }
-            } else {
-                include(self.native_next);
             }
         }
         if self.closing {
@@ -1689,12 +1542,6 @@ impl Drop for Runtime {
         self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
         self.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = &self.native
-            && let Err(error) = publication.quiesce(crate::ebpf::native::NativeReason::OwnerDrop)
-        {
-            tracing::error!(%error, "Native owner could not join publication readers before capture guards");
-        }
         for device in &self.devices {
             if device_needs_guard(device)
                 && let Err(error) = device.attachment.guard(&device.programs)
@@ -1709,8 +1556,6 @@ impl Drop for Runtime {
             tracing::error!(%error, "Host capture fence failed; retaining fail-closed source custody");
         }
         self.endpoints.close();
-        #[cfg(feature = "ebpf")]
-        self.retain_native_drop();
         if std::thread::panicking() {
             std::mem::forget((
                 std::mem::take(&mut self.devices),
@@ -1729,20 +1574,7 @@ impl Drop for Runtime {
 }
 
 fn device_needs_guard(device: &Device) -> bool {
-    #[cfg(feature = "ebpf")]
-    return needs_guard(device.native_target.is_some(), device.active);
-    #[cfg(not(feature = "ebpf"))]
-    needs_guard(false, device.active)
-}
-
-fn needs_guard(has_native_target: bool, active: bool) -> bool {
-    #[cfg(feature = "ebpf")]
-    if has_native_target {
-        return true;
-    }
-    #[cfg(not(feature = "ebpf"))]
-    let _ = has_native_target;
-    active
+    device.active
 }
 
 fn close_device_capture_with<T>(
@@ -2352,16 +2184,6 @@ async fn run_capture(
         workers,
         inboxes,
         core,
-        #[cfg(feature = "ebpf")]
-        native,
-        #[cfg(feature = "ebpf")]
-        native_policy,
-        #[cfg(feature = "ebpf")]
-        captured,
-        #[cfg(feature = "ebpf")]
-        originals,
-        #[cfg(feature = "ebpf")]
-        original_memory,
         memory,
         staging,
         links: mut link_proof,
@@ -2449,30 +2271,6 @@ async fn run_capture(
         inbox,
         endpoints,
         core,
-        #[cfg(feature = "ebpf")]
-        native,
-        #[cfg(feature = "ebpf")]
-        native_policy,
-        #[cfg(feature = "ebpf")]
-        native_writer: None,
-        #[cfg(feature = "ebpf")]
-        native_capture_close: NativeCaptureClose::Unproven,
-        #[cfg(feature = "ebpf")]
-        native_next: Instant::now() + Duration::from_secs(1),
-        #[cfg(feature = "ebpf")]
-        next_candidate: 1,
-        #[cfg(feature = "ebpf")]
-        captured,
-        #[cfg(feature = "ebpf")]
-        originals,
-        #[cfg(feature = "ebpf")]
-        original_outcome: None,
-        #[cfg(feature = "ebpf")]
-        remote_originals: VecDeque::with_capacity(64),
-        #[cfg(feature = "ebpf")]
-        original_worker: false,
-        #[cfg(feature = "ebpf")]
-        _original_memory: original_memory,
         waiting: VecDeque::with_capacity(PENDING),
         pending: VecDeque::with_capacity(PENDING),
         staging,
@@ -2585,15 +2383,6 @@ async fn run_capture(
             }
             runtime.admission.store(true, Ordering::Release);
             runtime.endpoints.capture_ready()?;
-            #[cfg(feature = "ebpf")]
-            if let Some(publication) = &runtime.native {
-                publication.set_ready(true)?;
-                publication.set_capture_ready(true)?;
-                if shutdown.requested() {
-                    publication.quiesce(crate::ebpf::native::NativeReason::Shutdown)?;
-                    anyhow::bail!("Native shutdown raced capture activation");
-                }
-            }
             Ok(())
         })()
     };
@@ -2646,8 +2435,6 @@ async fn run_capture(
                     tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
                     failure.get_or_insert(error);
                     runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-                    #[cfg(feature = "ebpf")]
-                    runtime.export_native_recording(false, false, "terminal_io_join", &mut failure);
                     std::mem::forget((runtime, owner));
                     return (None, Err(failure.unwrap()));
                 }
@@ -2690,17 +2477,6 @@ async fn run_capture(
         if let Err(error) = owner.fail_control().await {
             failure.get_or_insert(error);
         }
-        #[cfg(feature = "ebpf")]
-        runtime.export_native_recording(false, false, "transmit_drain", &mut failure);
-        std::mem::forget((runtime, joined));
-        return (None, Err(failure.unwrap()));
-    }
-    #[cfg(feature = "ebpf")]
-    if let Err(error) = runtime.drain_all_native_originals(&shutdown).await {
-        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        tracing::error!(%error, "Native terminal RX custody did not drain; retaining original owners");
-        failure.get_or_insert(error);
-        runtime.export_native_recording(false, false, "native_original_rx_drain", &mut failure);
         std::mem::forget((runtime, joined));
         return (None, Err(failure.unwrap()));
     }
@@ -2718,8 +2494,6 @@ async fn run_capture(
         failure
             .get_or_insert_with(|| anyhow::anyhow!("XDP ledger did not reach terminal ownership"));
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        #[cfg(feature = "ebpf")]
-        runtime.export_native_recording(false, false, "nonready_port", &mut failure);
         std::mem::forget((runtime, joined));
         return (None, Err(failure.unwrap()));
     }
@@ -2731,37 +2505,10 @@ async fn run_capture(
         }
     }
     #[cfg(feature = "ebpf")]
-    if let Some(publication) = &runtime.native
-        && let Err(error) = publication.retire_closed_host_sources(|key, claim| {
-            runtime.endpoints.retains_host_source(
-                key.namespace_cookie,
-                claim.owner_cookie,
-                claim.owner_incarnation,
-                claim.attachment_generation,
-                native::address(key.src_ip, 0).ip(),
-            )
-        })
-    {
-        failure.get_or_insert(error);
-        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        runtime.export_native_recording(false, false, "native_host_source_drain", &mut failure);
-        std::mem::forget((runtime, joined));
-        return (None, Err(failure.unwrap()));
-    }
-    #[cfg(feature = "ebpf")]
     if let Some(host) = runtime.host.take()
         && let Err(error) = host.finish()
     {
         failure.get_or_insert(error);
-    }
-    #[cfg(feature = "ebpf")]
-    if let Some(publication) = &runtime.native
-        && let Err(error) = publication.retire_closed_claims()
-    {
-        failure.get_or_insert(error);
-        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        std::mem::forget((runtime, joined));
-        return (None, Err(failure.unwrap()));
     }
     runtime.diagnostics.lifecycle(Lifecycle::Closed);
     if let Err(error) = backend.write().await.cleanup().await {
@@ -2780,17 +2527,6 @@ async fn run_capture(
             None
         }
     };
-    #[cfg(feature = "ebpf")]
-    if let Err(error) = runtime.finalize_native_recording() {
-        tracing::error!(%error, "Native accounting hooks did not finalize; retaining shutdown owners");
-        failure.get_or_insert(error);
-        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        runtime.export_native_recording(false, false, "native_hook_finalization", &mut failure);
-        std::mem::forget((runtime, plane));
-        return (None, Err(failure.unwrap()));
-    }
-    #[cfg(feature = "ebpf")]
-    runtime.export_native_recording(true, true, "joined_shutdown", &mut failure);
     runtime.finished = true;
     (plane, failure.map_or(Ok(()), Err))
 }
@@ -2808,16 +2544,6 @@ struct PreparedRuntime {
     inboxes: [tokio::sync::mpsc::Receiver<worker::Envelope>; 2],
     scope_pairs: Vec<(PacketRealm, Vec<crate::control::netstack::PacketOwner>)>,
     core: Option<RoutedCore>,
-    #[cfg(feature = "ebpf")]
-    native: Option<Arc<crate::ebpf::native::NativePublication>>,
-    #[cfg(feature = "ebpf")]
-    native_policy: Option<crate::control::core_forward::RoutingAuthority>,
-    #[cfg(feature = "ebpf")]
-    captured: Option<native::CapturedReturn>,
-    #[cfg(feature = "ebpf")]
-    originals: VecDeque<native::HeldOriginal>,
-    #[cfg(feature = "ebpf")]
-    original_memory: Option<MemoryReservation>,
     memory: MemoryReservation,
     staging: Vec<u8>,
     links: Fib,
@@ -2860,12 +2586,7 @@ async fn prepare(
         .datapath
         .as_ref()
         .context("XDP configuration missing")?;
-    let native_enabled = datapath.direct == Some(DirectProfile::Native);
-    let metadata_len = if native_enabled {
-        honk_ebpf_common::xdp::NATIVE_METADATA_LEN
-    } else {
-        METADATA_LEN
-    };
+    let metadata_len = METADATA_LEN;
     let binding_mode = match datapath.effective_xsk_mode() {
         XskMode::Copy => BindMode::Copy,
         XskMode::ZeroCopy => BindMode::ZeroCopy,
@@ -2899,78 +2620,6 @@ async fn prepare(
         &budget,
         Arc::clone(&admission),
     )?;
-    #[cfg(feature = "ebpf")]
-    let (original_memory, originals) = if native_enabled {
-        let capacity = infos.iter().try_fold(0usize, |total, info| {
-            let (port, _) = device_sizing(info.mtu);
-            ensure!(
-                info.queues.len() <= u16::MAX as usize,
-                "Native queue index exceeds retained representation"
-            );
-            port.rx_frames
-                .min(port.ring_size as usize)
-                .checked_mul(info.queues.len())
-                .and_then(|count| total.checked_add(count))
-                .context("Native original slot capacity overflow")
-        })?;
-        let layout = std::alloc::Layout::array::<native::HeldOriginal>(capacity)?;
-        let bytes = capacity
-            .checked_mul(192)
-            .context("Native held slot reservation overflow")?;
-        ensure!(
-            layout.size() <= bytes,
-            "Native held slot layout exceeds reservation"
-        );
-        let memory = budget
-            .reserve(bytes)
-            .context("Native held original memory capacity")?;
-        let mut originals = VecDeque::new();
-        originals.try_reserve_exact(capacity)?;
-        ensure!(
-            originals
-                .capacity()
-                .checked_mul(size_of::<native::HeldOriginal>())
-                .is_some_and(|actual| actual <= bytes),
-            "Native held allocation exceeds reservation"
-        );
-        (Some(memory), originals)
-    } else {
-        (None, VecDeque::new())
-    };
-    #[cfg(feature = "ebpf")]
-    let native = if native_enabled {
-        let pending = infos
-            .iter()
-            .try_fold(0usize, |total, info| {
-                let (port, _) = device_sizing(info.mtu);
-                port.rx_frames
-                    .checked_mul(info.queues.len())
-                    .and_then(|count| total.checked_add(count))
-            })
-            .context("Native pending RX capacity overflow")?;
-        let capacity = pending
-            .checked_add(4096 + 64 + 4096)
-            .and_then(|capacity| {
-                capacity.checked_add(usize::from(datapath.host.is_some()) * 4 * 4096)
-            })
-            .context("Native ordinary owner capacity overflow")?;
-        Some(crate::ebpf::native::NativePublication::new_with_capacity(
-            Arc::clone(&budget),
-            u32::try_from(capacity)?,
-        )?)
-    } else {
-        None
-    };
-    #[cfg(feature = "ebpf")]
-    {
-        *workers.native.publication.lock() = native.clone();
-    }
-    #[cfg(feature = "ebpf")]
-    if let Some(publication) = &native {
-        let path = publication.initialize_export(honk_config::paths::data_dir())?;
-        tracing::info!(native_publication_path = %path.display(), final_export = false,
-            "Native publication manifest ready before attachment");
-    }
     let polling_prefix = ContextDigest::platform(&budget);
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     let namespace = socket_namespace(socket.as_fd())?;
@@ -2988,12 +2637,6 @@ async fn prepare(
         .logical_links()
         .filter(|link| indices.contains(&link.path.physical_ifindex))
         .count();
-    ensure!(
-        !native_enabled || links.logical_links()
-            .filter(|link| indices.contains(&link.path.physical_ifindex))
-            .all(|link| link.path.vlan_count == 0 && link.ifindex == link.path.physical_ifindex),
-        "XDP Native currently requires untagged physical ingress; VLAN continuation is unavailable"
-    );
     let realm_count = physical_realm_count + usize::from(datapath.host.is_some());
     ensure!(
         (1..=64).contains(&realm_count),
@@ -3079,12 +2722,6 @@ async fn prepare(
     } else {
         None
     };
-    #[cfg(feature = "ebpf")]
-    let native_policy = if native_enabled {
-        Some(plane.native_packet_policy().await?)
-    } else {
-        None
-    };
     let mut devices = Vec::with_capacity(infos.len());
     for (device_index, info) in infos.into_iter().enumerate() {
         let (port_config, _) = device_sizing(info.mtu);
@@ -3110,55 +2747,12 @@ async fn prepare(
             .unwrap()
             .checked_add(1)
             .context("XDP queue identity overflow")?;
-        #[cfg(feature = "ebpf")]
-        let native_memory = if native_enabled {
-            Some(
-                budget
-                    .reserve(1 << 20)
-                    .context("Native dispatch memory capacity")?,
-            )
-        } else {
-            None
-        };
-        let native_bootstrap_memory = if native_enabled && capture.vlan_metadata {
-            Some(
-                budget
-                    .reserve(Programs::native_preparation_memory_bytes()?)
-                    .context("Native bootstrap BTF memory capacity")?,
-            )
-        } else {
-            None
-        };
-        let programs = if native_enabled {
-            Programs::load_general_native(&capture, queues, topology.get_ref().ipv4_broadcasts())?
-        } else {
-            Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?
-        };
-        drop(native_bootstrap_memory);
+        let programs =
+            Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?;
         use std::os::unix::fs::DirBuilderExt;
         let pins = pin_root.join(format!("xdp-{}", info.ifindex));
         std::fs::DirBuilder::new().mode(0o700).create(&pins)?;
         let attachment = PersistentAttachment::create(info.ifindex, &programs, &pins)?;
-        #[cfg(feature = "ebpf")]
-        let native_gate = if native_enabled {
-            Some(programs.attach_native_gate(&attachment, &pins)?)
-        } else {
-            None
-        };
-        #[cfg(feature = "ebpf")]
-        let native_target = if native_enabled {
-            ensure!(
-                programs.native_memory_bytes()? <= 1 << 20,
-                "Native dispatch allocation exceeded admitted memory"
-            );
-            Some(programs.native_target(
-                &capture,
-                topology.get_ref().ipv4_broadcasts(),
-                &attachment,
-            )?)
-        } else {
-            None
-        };
         let ports =
             info.open_ports::<Retained>(binding_mode, port_config, metadata_len, &budget)?;
         ensure!(
@@ -3193,12 +2787,6 @@ async fn prepare(
             programs: Arc::new(programs),
             attachment: Arc::new(attachment),
             queues,
-            #[cfg(feature = "ebpf")]
-            native_target,
-            #[cfg(feature = "ebpf")]
-            _native_gate: native_gate,
-            #[cfg(feature = "ebpf")]
-            _native_memory: native_memory,
             active: false,
             metadata_checked: Instant::now(),
             features: None,
@@ -3236,7 +2824,6 @@ async fn prepare(
             honk_config::paths::data_dir(),
             realm_count,
             &budget,
-            native.clone(),
         )?;
         tracing::debug!(
             used = budget.used(),
@@ -3321,58 +2908,6 @@ async fn prepare(
     } else {
         None
     };
-    #[cfg(feature = "ebpf")]
-    if let Some(publication) = &native {
-        for (_, device, _, scope) in &realms {
-            publication.register(
-                Arc::clone(
-                    devices[*device]
-                        .native_target
-                        .as_ref()
-                        .expect("Native target prepared"),
-                ),
-                *scope,
-            )?;
-        }
-        plane
-            .policy_backend_handle()
-            .write()
-            .await
-            .install_native_publication(Arc::clone(publication))?;
-        plane
-            .shutdown_intent()
-            .install_native(Arc::clone(publication))?;
-    }
-    #[cfg(feature = "ebpf")]
-    let captured = if let Some(publication) = native.as_ref().filter(|_| !realms.is_empty()) {
-        let _targets_memory = budget
-            .reserve(
-                realms
-                    .len()
-                    .checked_mul(size_of::<honk_xsk::CapturedTarget>())
-                    .context("Native captured target inventory overflow")?,
-            )
-            .context("Native captured target inventory memory")?;
-        let targets: Vec<_> = realms
-            .iter()
-            .enumerate()
-            .map(|(index, (_, device, link, _))| honk_xsk::CapturedTarget {
-                realm_index: index as u32,
-                logical_ifindex: link.ifindex,
-                target: Arc::clone(devices[*device].native_target.as_ref().unwrap()),
-            })
-            .collect();
-        Some(native::CapturedReturn::prepare(
-            Arc::clone(publication),
-            &targets,
-            Arc::clone(&budget),
-            pin_root,
-            honk_config::paths::data_dir(),
-        )?)
-    } else {
-        None
-    };
-    tracing::debug!(used = budget.used(), "XDP prepare: after captured return");
     Ok(PreparedRuntime {
         devices,
         topology,
@@ -3383,16 +2918,6 @@ async fn prepare(
         workers,
         inboxes,
         core,
-        #[cfg(feature = "ebpf")]
-        native,
-        #[cfg(feature = "ebpf")]
-        native_policy,
-        #[cfg(feature = "ebpf")]
-        captured,
-        #[cfg(feature = "ebpf")]
-        originals,
-        #[cfg(feature = "ebpf")]
-        original_memory,
         memory,
         staging: vec![0; max_mtu.max(65536)],
         links,
@@ -3408,125 +2933,6 @@ mod tests {
 
     mod driven_kernel;
     mod retention;
-
-    #[cfg(feature = "ebpf")]
-    #[test]
-    fn physical_native_refuses_set_zero_and_preserves_endpoint_zero_projection() {
-        let mut config = Config::default();
-        config.global.nfqueue_enable = false;
-        config.global.dial_mode = "ip".into();
-        config.datapath = Some(honk_config::datapath::DatapathConfig {
-            backend: Backend::Xdp,
-            direct: Some(DirectProfile::Native),
-            interfaces: vec![honk_config::datapath::XdpInterface {
-                name: "native0".into(),
-                role: honk_config::datapath::InterfaceRole::Lan,
-            }],
-            ..Default::default()
-        });
-        validate_config(&config).unwrap();
-        for source in [
-            "routing { fallback: direct(mark: 0) }",
-            "routing { dport(443) -> direct(mark: 0) }",
-        ] {
-            config.routing = honk_config::parser::parse_dae_config(source)
-                .unwrap()
-                .routing;
-            config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Native);
-            assert!(
-                validate_config(&config)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("physical Native requires Keep")
-            );
-            config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Endpoint);
-            validate_config(&config).unwrap();
-        }
-    }
-
-    #[cfg(feature = "ebpf")]
-    #[test]
-    fn native_target_identity_capacity_rejects_seventeenth_interface_before_attachment() {
-        let mut config = Config::default();
-        config.global.nfqueue_enable = false;
-        config.global.dial_mode = "ip".into();
-        config.datapath = Some(honk_config::datapath::DatapathConfig {
-            backend: Backend::Xdp,
-            direct: Some(DirectProfile::Native),
-            interfaces: (0..16)
-                .map(|index| honk_config::datapath::XdpInterface {
-                    name: format!("native{index}"),
-                    role: honk_config::datapath::InterfaceRole::Lan,
-                })
-                .collect(),
-            ..Default::default()
-        });
-        validate_config(&config).unwrap();
-        config
-            .datapath
-            .as_mut()
-            .unwrap()
-            .interfaces
-            .push(honk_config::datapath::XdpInterface {
-                name: "native16".into(),
-                role: honk_config::datapath::InterfaceRole::Lan,
-            });
-        let error = validate_config(&config).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("between one and sixteen explicit interfaces")
-        );
-    }
-
-    #[cfg(feature = "ebpf")]
-    #[test]
-    fn native_requested_data_directory_accepts_1024_bytes_and_rejects_1025_before_attachment() {
-        let mut config = Config::default();
-        config.global.nfqueue_enable = false;
-        config.global.dial_mode = "ip".into();
-        config.global.data_dir = format!("/{}", "a/".repeat(511)) + "a";
-        config.datapath = Some(honk_config::datapath::DatapathConfig {
-            backend: Backend::Xdp,
-            direct: Some(DirectProfile::Native),
-            interfaces: vec![honk_config::datapath::XdpInterface {
-                name: "native0".into(),
-                role: honk_config::datapath::InterfaceRole::Lan,
-            }],
-            ..Default::default()
-        });
-        assert_eq!(config.global.data_dir.len(), 1024);
-        validate_config(&config).unwrap();
-        config.global.data_dir.push('b');
-        assert_eq!(config.global.data_dir.len(), 1025);
-        let error = validate_config(&config).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("requested global.data_dir exceeds the 1024-byte")
-        );
-        config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Endpoint);
-        validate_config(&config).unwrap();
-    }
-
-    #[cfg(feature = "ebpf")]
-    #[test]
-    fn native_guard_is_required_before_runtime_activation_when_native_target_exists() {
-        assert!(needs_guard(true, false));
-    }
-
-    #[test]
-    fn native_guard_decision_preserves_ordinary_device_activation() {
-        assert!(!needs_guard(false, false));
-        assert!(needs_guard(false, true));
-    }
-
-    #[cfg(not(feature = "ebpf"))]
-    #[test]
-    fn native_guard_decision_without_ebpf_uses_only_runtime_activation() {
-        assert!(!needs_guard(true, false));
-        assert!(needs_guard(true, true));
-    }
 
     #[test]
     fn native_guard_observation_failure_never_skips_xsk_withdrawal() {

@@ -173,14 +173,6 @@ pub(crate) struct Grace {
     inner: OwnedFd,
 }
 impl Grace {
-    #[cfg(test)]
-    pub(crate) fn closed_for_test() -> anyhow::Result<Self> {
-        Ok(Self {
-            outer: File::open("/dev/null")?.into(),
-            inner: File::open("/dev/null")?.into(),
-        })
-    }
-
     pub fn new() -> anyhow::Result<Self> {
         #[repr(C)]
         struct Attr {

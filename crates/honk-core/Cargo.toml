@@ -161,8 +161,6 @@ jsonschema = { version = "0.59", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 honk-xsk.workspace = true
 
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-honk-xsk = { workspace = true, features = ["captured-fault"] }
 
 [[bench]]
 name = "dns"

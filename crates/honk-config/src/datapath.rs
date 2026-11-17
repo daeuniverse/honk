@@ -19,7 +19,6 @@ pub enum Backend {
 pub enum DirectProfile {
     Core,
     Endpoint,
-    Native,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,15 +506,8 @@ impl DatapathConfig {
             return Err(invalid("workers: 2 requires physical XDP interfaces"));
         }
         if let Some(host) = &self.host {
-            if self.backend != Backend::Xdp
-                || !matches!(
-                    self.direct,
-                    Some(DirectProfile::Endpoint | DirectProfile::Native)
-                )
-            {
-                return Err(invalid(
-                    "Host requires backend: xdp and direct: endpoint or native",
-                ));
+            if self.backend != Backend::Xdp || self.direct != Some(DirectProfile::Endpoint) {
+                return Err(invalid("Host requires backend: xdp and direct: endpoint"));
             }
             host.validate()?;
         }
@@ -542,7 +534,7 @@ impl DatapathConfig {
                 }
                 if self.direct.is_none() {
                     return Err(invalid(
-                        "XDP requires explicit direct: core, direct: endpoint or direct: native",
+                        "XDP requires explicit direct: core or direct: endpoint",
                     ));
                 }
                 if (self.interfaces.is_empty() && self.host.is_none()) || self.interfaces.len() > 16

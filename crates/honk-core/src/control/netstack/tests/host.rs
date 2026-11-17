@@ -25,12 +25,7 @@ async fn host_retirement_keeps_exact_socket_work_without_a_transport_or_output()
     scope.prepare_host().unwrap();
     let facts = facts(29);
     let work = scope.hold_host_source(&facts).unwrap();
-    assert!(scope.retains_host_source(7, 29, 23, 11));
-    assert!(!scope.retains_host_source(7, 29, 24, 11));
-    assert!(!scope.retains_host_source(8, 29, 23, 11));
-    assert!(!scope.retains_host_source(7, 29, 23, 12));
     drop(work);
-    assert!(!scope.retains_host_source(7, 29, 23, 11));
     owner.shutdown().await;
 }
 

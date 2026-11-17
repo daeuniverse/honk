@@ -308,16 +308,6 @@ async fn start_runtime(
         workers,
         inboxes,
         core,
-        #[cfg(feature = "ebpf")]
-        native,
-        #[cfg(feature = "ebpf")]
-        native_policy,
-        #[cfg(feature = "ebpf")]
-        captured,
-        #[cfg(feature = "ebpf")]
-        originals,
-        #[cfg(feature = "ebpf")]
-        original_memory,
         memory,
         staging,
         mut links,
@@ -371,30 +361,6 @@ async fn start_runtime(
         inbox,
         endpoints,
         core,
-        #[cfg(feature = "ebpf")]
-        native,
-        #[cfg(feature = "ebpf")]
-        native_policy,
-        #[cfg(feature = "ebpf")]
-        native_writer: None,
-        #[cfg(feature = "ebpf")]
-        native_capture_close: NativeCaptureClose::Unproven,
-        #[cfg(feature = "ebpf")]
-        native_next: Instant::now() + Duration::from_secs(1),
-        #[cfg(feature = "ebpf")]
-        next_candidate: 1,
-        #[cfg(feature = "ebpf")]
-        captured,
-        #[cfg(feature = "ebpf")]
-        originals,
-        #[cfg(feature = "ebpf")]
-        original_outcome: None,
-        #[cfg(feature = "ebpf")]
-        remote_originals: VecDeque::with_capacity(64),
-        #[cfg(feature = "ebpf")]
-        original_worker: false,
-        #[cfg(feature = "ebpf")]
-        _original_memory: original_memory,
         waiting: VecDeque::with_capacity(PENDING),
         pending: VecDeque::with_capacity(PENDING),
         staging,

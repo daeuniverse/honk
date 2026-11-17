@@ -32,8 +32,6 @@ fn envelope(shared: &Shared, number: u8, scope: ScopeId, at: Instant) -> Envelop
     let metadata = [number + 2; 8];
     let cell = shared.copy(&[&first, &last], &metadata).unwrap();
     Envelope {
-        device: 0,
-        queue: 3,
         ingress: Ingress {
             scope,
             namespace: 1,
@@ -80,8 +78,7 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         "dequeue does not refund storage still being processed"
     );
     assert_eq!(processing.ingress_at, at);
-    assert_eq!(processing.queue, 3);
-    assert_eq!(processing.cell.metadata(), &[2; 8]);
+    assert_eq!(&processing.cell.bytes.as_ref().unwrap()[..8], &[2; 8]);
     assert_eq!(processing.ip(), &[0, 0, 0, 0, 1, 1, 1]);
     drop(processing);
     let returned = shared.pool.take().unwrap();
@@ -109,20 +106,6 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         "a full destination returns the actual owned envelope"
     );
     drop(refused);
-    shared.barrier(7);
-    shared.note_drained(0, 7, true);
-    shared.note_drained(1, 7, true);
-    assert!(
-        !shared.both_drained(7),
-        "queued producer work prevents the common negative proof"
-    );
-    while first.try_recv().is_ok() {}
-    assert!(shared.both_drained(7));
-    shared.barrier(9);
-    assert!(
-        !shared.both_drained(9),
-        "the previous epoch cannot acknowledge a new writer"
-    );
 }
 
 #[test]
@@ -366,36 +349,6 @@ fn peer_unwind_closes_common_admission_before_refunding_identity() {
     assert!(result.is_err());
     assert!(!admission.load(Ordering::Acquire));
     assert_eq!(peers.0.lock()[0].holds, 0);
-}
-
-#[test]
-fn drain_observation_cannot_acknowledge_a_later_writer_epoch() {
-    let budget = MemoryBudget::new(32 << 20);
-    let (shared, _) = Shared::new(2, 128, 2, &budget, Arc::new(AtomicBool::new(false))).unwrap();
-    let before_writer = shared.drain_epoch();
-    let empty_before_grace = shared
-        .senders
-        .iter()
-        .all(|sender| sender.capacity() == DESTINATION);
-    shared.barrier(7);
-    shared.note_drained(0, 7, true);
-    shared.note_drained(1, before_writer, empty_before_grace);
-    assert!(
-        !shared.both_drained(7),
-        "a pre-grace empty observation cannot acknowledge the new writer"
-    );
-    let observed = shared.drain_epoch();
-    shared.note_drained(1, observed, true);
-    assert!(shared.both_drained(7));
-    shared.barrier(9);
-    shared.note_drained(0, 9, true);
-    shared.note_drained(1, observed, true);
-    assert!(
-        !shared.both_drained(9),
-        "an old pass stays bound to its original epoch"
-    );
-    shared.note_drained(1, shared.drain_epoch(), true);
-    assert!(shared.both_drained(9));
 }
 
 #[tokio::test]

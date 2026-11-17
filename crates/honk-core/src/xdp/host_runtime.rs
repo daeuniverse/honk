@@ -27,7 +27,6 @@ impl PreparedHost {
         data_dir: &Path,
         realm_count: usize,
         budget: &Arc<MemoryBudget>,
-        native: Option<Arc<crate::ebpf::native::NativePublication>>,
     ) -> anyhow::Result<(Self, (PacketScope, crate::control::netstack::PacketOwner))> {
         let capture = HostCapture::prepare_closed(HostPrepare {
             source_interfaces: interfaces,
@@ -38,7 +37,6 @@ impl PreparedHost {
             pin_root,
             data_dir,
             budget: Arc::clone(budget),
-            native,
         })?;
         tracing::debug!(used = budget.used(), "Host runtime: after prepare_closed");
         let mtu = capture.output_mtu();
@@ -162,17 +160,6 @@ impl HostRuntime {
         self.capture.admit(self.queue.io.get_ref().as_fd(), true)?;
         *support.write() = self.capture.pname_support();
         Ok(())
-    }
-
-    pub(super) fn native_retirement_drained(&self) -> bool {
-        let port = self.queue.io.get_ref();
-        let rings = port.rings();
-        rings.rx_producer == rings.rx_consumer
-            && rings.cq_producer == rings.cq_consumer
-            && port.counters().submitted == port.counters().completed
-            && port.retained_rx_count() == 0
-            && port.rx_completion_count() == 0
-            && self.pending.iter().all(Option::is_none)
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -624,36 +624,6 @@ impl Drop for SourceWork {
 }
 
 impl PacketScope {
-    pub(crate) fn retains_host_source(
-        &self,
-        namespace_cookie: u64,
-        cookie: u64,
-        incarnation: u64,
-        attachment: u64,
-    ) -> bool {
-        let mut inner = self.0.inner.lock();
-        let Inner {
-            source_work,
-            stack,
-            slots,
-            ..
-        } = &mut *inner;
-        if source_work.reclaim(stack.as_ref(), slots).is_err() {
-            return true;
-        }
-        source_work.host().is_some_and(|host| {
-            host.cells
-                .iter()
-                .filter_map(|cell| cell.entry.as_ref())
-                .any(|source| {
-                    source.facts.netns_cookie == namespace_cookie
-                        && source.facts.socket_cookie == cookie
-                        && source.facts.operation_incarnation == incarnation
-                        && source.facts.attachment == attachment
-                })
-        })
-    }
-
     #[cfg(test)]
     pub(in crate::control) fn receive_host_with_source(
         &self,

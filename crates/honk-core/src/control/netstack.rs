@@ -53,7 +53,7 @@ const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_millis
 #[cfg(target_os = "linux")]
 pub(crate) const CAPTURE_MEMORY: usize = 384 << 20;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", any(test, feature = "ebpf")))]
 pub(crate) fn capture_scope(
     mtu: u32,
     realms: usize,

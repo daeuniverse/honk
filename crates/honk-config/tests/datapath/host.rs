@@ -18,38 +18,34 @@ fn admitted(value: serde_json::Value) -> bool {
 #[test]
 fn host_only_and_mixed_adapters_preserve_private_copy_and_physical_defaults() {
     for physical in [false, true] {
-        for direct in ["endpoint", "native"] {
-            let mut dae = source("xsk_mode: copy\n interface {\n eth1\n eth0\n }");
-            let mut value = structured(serde_json::json!({
-                "interfaces": ["eth1", "eth0"], "xsk_mode": "copy"
-            }));
-            dae = dae.replace("direct: endpoint", &format!("direct: {direct}"));
-            value["direct"] = direct.into();
-            if physical {
-                dae.push_str("\ndatapath { interface { lan0: lan } }");
-                value["interfaces"] = serde_json::json!([{"name": "lan0", "role": "lan"}]);
-            }
-            let parsed = honk_config::parser::parse_dae_config(&dae)
-                .unwrap()
-                .datapath
-                .unwrap();
-            let decoded: DatapathConfig = serde_json::from_value(value).unwrap();
-            decoded.validate().unwrap();
-            assert_eq!(parsed, decoded);
-            assert_eq!(
-                parsed.host,
-                Some(HostConfig {
-                    interfaces: vec!["eth1".into(), "eth0".into()],
-                    xsk_mode: XskMode::Copy,
-                })
-            );
-            assert_eq!(parsed.xsk_mode, None);
-            assert_eq!(parsed.effective_xsk_mode(), XskMode::ZeroCopy);
-            assert_eq!(parsed.interfaces.len(), usize::from(physical));
-            let roundtrip: DatapathConfig =
-                serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
-            assert_eq!(roundtrip, parsed);
+        let mut dae = source("xsk_mode: copy\n interface {\n eth1\n eth0\n }");
+        let mut value = structured(serde_json::json!({
+            "interfaces": ["eth1", "eth0"], "xsk_mode": "copy"
+        }));
+        if physical {
+            dae.push_str("\ndatapath { interface { lan0: lan } }");
+            value["interfaces"] = serde_json::json!([{"name": "lan0", "role": "lan"}]);
         }
+        let parsed = honk_config::parser::parse_dae_config(&dae)
+            .unwrap()
+            .datapath
+            .unwrap();
+        let decoded: DatapathConfig = serde_json::from_value(value).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(parsed, decoded);
+        assert_eq!(
+            parsed.host,
+            Some(HostConfig {
+                interfaces: vec!["eth1".into(), "eth0".into()],
+                xsk_mode: XskMode::Copy,
+            })
+        );
+        assert_eq!(parsed.xsk_mode, None);
+        assert_eq!(parsed.effective_xsk_mode(), XskMode::ZeroCopy);
+        assert_eq!(parsed.interfaces.len(), usize::from(physical));
+        let roundtrip: DatapathConfig =
+            serde_json::from_value(serde_json::to_value(&parsed).unwrap()).unwrap();
+        assert_eq!(roundtrip, parsed);
     }
     assert!(
         serde_json::to_value(DatapathConfig::default())
@@ -141,7 +137,7 @@ fn host_backend_direct_and_presence_boundaries_are_strict() {
             value["direct"] = serde_json::json!(direct);
             assert_eq!(
                 admitted(value),
-                backend == "xdp" && matches!(direct, Some("endpoint" | "native"))
+                backend == "xdp" && direct == Some("endpoint")
             );
             let direct = direct
                 .map(|direct| format!("direct: {direct}\n"))
@@ -151,8 +147,7 @@ fn host_backend_direct_and_presence_boundaries_are_strict() {
             );
             assert_eq!(
                 honk_config::parser::parse_dae_config(&dae).is_ok(),
-                backend == "xdp"
-                    && matches!(direct.as_str(), "direct: endpoint\n" | "direct: native\n")
+                backend == "xdp" && direct.as_str() == "direct: endpoint\n"
             );
         }
         let mut value = structured(serde_json::Value::Null);
@@ -242,22 +237,19 @@ fn host_exact_identity_is_restart_only_and_independent_of_physical_copy() {
 
 #[test]
 fn host_only_cannot_claim_two_physical_workers() {
-    for direct in ["endpoint", "native"] {
-        let body = source("xsk_mode: copy\n interface { eth0 }")
-            .replace("direct: endpoint", &format!("direct: {direct}"));
-        assert!(
-            honk_config::parser::parse_dae_config(&format!("{body}\n datapath {{ workers: 1 }}"))
-                .is_ok()
-        );
-        assert!(
-            honk_config::parser::parse_dae_config(&format!("{body}\n datapath {{ workers: 2 }}"))
-                .is_err()
-        );
-        assert!(
-            honk_config::parser::parse_dae_config(&format!(
-                "{body}\n datapath {{ workers: 2\n interface {{ lan0: lan }} }}"
-            ))
+    let body = source("xsk_mode: copy\n interface { eth0 }");
+    assert!(
+        honk_config::parser::parse_dae_config(&format!("{body}\n datapath {{ workers: 1 }}"))
             .is_ok()
-        );
-    }
+    );
+    assert!(
+        honk_config::parser::parse_dae_config(&format!("{body}\n datapath {{ workers: 2 }}"))
+            .is_err()
+    );
+    assert!(
+        honk_config::parser::parse_dae_config(&format!(
+            "{body}\n datapath {{ workers: 2\n interface {{ lan0: lan }} }}"
+        ))
+        .is_ok()
+    );
 }

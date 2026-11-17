@@ -2,19 +2,6 @@ use super::*;
 use honk_netstack::wire::{self, PacketView};
 
 impl PacketEndpoints {
-    pub(crate) fn retains_host_source(
-        &self,
-        namespace_cookie: u64,
-        cookie: u64,
-        incarnation: u64,
-        attachment: u64,
-        _source_ip: std::net::IpAddr,
-    ) -> bool {
-        self.shared.scopes.iter().any(|scope| {
-            scope.retains_host_source(namespace_cookie, cookie, incarnation, attachment)
-        })
-    }
-
     pub(crate) fn realm(&self, scope: ScopeId) -> Option<&PacketRealm> {
         self.shared
             .realms

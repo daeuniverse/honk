@@ -456,22 +456,8 @@ impl DatapathFlagsHandle {
                 .context("runtime mode revision exhausted")?;
         }
         let flags = state.compose(&mode);
-        #[cfg(feature = "ebpf")]
-        let mut native_publication = None;
         let quiescence = {
             let mut backend = inner.backend.write().await;
-            #[cfg(feature = "ebpf")]
-            if let Some(publication) = backend
-                .native_publication()
-                .filter(|publication| !publication.terminal())
-            {
-                let reason = if mode != *inner.mode_state.read() {
-                    crate::ebpf::native::NativeReason::Mode
-                } else {
-                    crate::ebpf::native::NativeReason::Flags
-                };
-                native_publication = Some(publication.write(reason)?);
-            }
             backend
                 .set_datapath_flags(flags)
                 .with_context(|| format!("failed to publish datapath flags {flags:#010x}"))?;
@@ -492,10 +478,6 @@ impl DatapathFlagsHandle {
         }
         inner.state = state;
         *inner.mode_state.write() = mode.clone();
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = native_publication {
-            publication.commit();
-        }
         // The flags write already fenced READY even if staged-state cleanup failed.
         quiescence?;
         #[cfg(feature = "native-api")]
@@ -663,19 +645,10 @@ impl DatapathFlagsPublication<'_> {
             .revision
             .checked_add(1)
             .context("runtime mode revision exhausted")?;
-        #[cfg(feature = "ebpf")]
-        let native_publication = backend
-            .native_publication()
-            .map(|publication| publication.write(crate::ebpf::native::NativeReason::Mode))
-            .transpose()?;
         backend
             .set_datapath_flags(self.inner.state.compose(&mode))
             .context("failed to reset runtime mode")?;
         *self.inner.mode_state.write() = mode;
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = native_publication {
-            publication.commit();
-        }
         Ok(())
     }
 }

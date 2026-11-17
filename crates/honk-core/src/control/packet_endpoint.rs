@@ -624,13 +624,6 @@ impl PacketEndpoints {
             .register_packet_scopes(&logical_scopes)?;
         let scopes: Arc<[PacketScope]> = scopes.iter().map(|(scope, _)| scope.clone()).collect();
         let realms: Arc<[PacketRealm]> = realms.into();
-        #[cfg(feature = "ebpf")]
-        if let Some(publication) = plane.shutdown_intent().native_publication() {
-            plane
-                .dns_controller
-                .routing_projection()
-                .install_native(publication)?;
-        }
         plane.udp_pool = Arc::new(
             UdpEndpointPool::with_packet_reply_factory(
                 udp_capacity,

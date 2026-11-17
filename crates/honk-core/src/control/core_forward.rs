@@ -257,38 +257,6 @@ struct Registration {
     native: Option<Arc<crate::observe::Observation>>,
 }
 
-#[cfg(feature = "ebpf")]
-pub(crate) enum CapturedDecision {
-    Endpoint(CapturedEndpointCandidate),
-    TryNativeOriginal(crate::ebpf::native::NativeBasis),
-    Refuse,
-}
-
-#[cfg(feature = "ebpf")]
-pub(crate) struct CapturedEndpointCandidate {
-    admission: EndpointAdmission,
-    basis: crate::ebpf::native::NativeCaptureBasis,
-}
-
-#[cfg(feature = "ebpf")]
-impl CapturedEndpointCandidate {
-    pub(crate) fn basis(&self) -> &crate::ebpf::native::NativeCaptureBasis {
-        &self.basis
-    }
-    pub(crate) fn into_admission(
-        self,
-        proof: crate::ebpf::native::CaptureProof,
-    ) -> io::Result<EndpointAdmission> {
-        if !proof.matches(&self.basis) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "Capture proof belongs to another candidate",
-            ));
-        }
-        Ok(self.admission)
-    }
-}
-
 impl RoutingAuthority {
     fn admitting(&self) -> bool {
         !self.0.shutdown.requested() && self.0.healthy.load(Ordering::Acquire)
@@ -328,134 +296,6 @@ impl RoutingAuthority {
             router,
             config,
         })
-    }
-
-    #[cfg(feature = "ebpf")]
-    pub(crate) fn capture_original(
-        &self,
-        read: &PolicyRead<'_>,
-        query: RouteQuery,
-        facts: ScopeId,
-        original: &crate::ebpf::native::NativeOriginal<'_>,
-        budget: &Arc<MemoryBudget>,
-    ) -> io::Result<CapturedDecision> {
-        use crate::ebpf::native::{NativeBasis, NativeCaptureBasis};
-        let busy = || {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "original policy basis is busy or stale",
-            )
-        };
-        if !Arc::ptr_eq(read.registration, &self.0)
-            || !self.admitting()
-            || self.0.execution != Execution::MixedEndpoints
-            || facts == ScopeId::HOST
-            || original.facts != facts
-            || original.ingress != query.ingress
-            || original.imported.identity.scope != facts.as_u64()
-            || !matches!(
-                (original.imported.executor, original.imported.state & 15),
-                (
-                    honk_ebpf_common::xdp::NATIVE_EXECUTOR_PENDING,
-                    honk_ebpf_common::xdp::NATIVE_PHASE_PENDING
-                ) | (
-                    honk_ebpf_common::xdp::NATIVE_EXECUTOR_KERNEL,
-                    honk_ebpf_common::xdp::NATIVE_PHASE_ARMED
-                        | honk_ebpf_common::xdp::NATIVE_PHASE_DRAINING
-                )
-            )
-            || original.basis_epoch == 0
-            || original.basis_epoch & 1 == 0
-            || original.candidate == 0
-            || !matches!(query.protocol, 6 | 17)
-            || query.ports.is_none()
-        {
-            return Ok(CapturedDecision::Refuse);
-        }
-        let mode_state = self
-            .0
-            .mode_state
-            .as_ref()
-            .map(|state| state.try_read().ok_or_else(busy))
-            .transpose()?;
-        let generation = self.generation(mode_state.as_deref());
-        let (bitmap, stamp) = {
-            let mut packet_facts = self.0.projection.try_packet_facts().ok_or_else(busy)?;
-            match packet_facts.lookup(facts, query.destination, &read.router, generation.routing) {
-                Ok(fact) => fact,
-                Err(_) => return Err(busy()),
-            }
-        };
-        let Some(action) = route_action(&read.router, query, None, bitmap.as_ref()) else {
-            return Ok(CapturedDecision::Refuse);
-        };
-        #[cfg(feature = "native-api")]
-        let native = self
-            .0
-            .native
-            .as_ref()
-            .map(|native| (generation.routing, native.catalog.snapshot()));
-        let mode = mode_decision(
-            mode_state.as_deref(),
-            &read.config,
-            #[cfg(feature = "native-api")]
-            native.as_ref().map(|(_, catalog)| &**catalog),
-            action.outbound.clone(),
-            action.must,
-        );
-        let literal_direct = mode.name == "direct" && action.mark.is_none();
-        let controller_dns = !action.must
-            && matches!(query.protocol, 6 | 17)
-            && query
-                .ports
-                .is_some_and(|(_, destination)| destination == 53);
-        if mode.name == "block" || action.mark.is_some() {
-            return Ok(CapturedDecision::Refuse);
-        }
-        let basis = NativeCaptureBasis::new(
-            original,
-            generation.routing,
-            read.router.policy_fingerprint(),
-            generation.mode,
-            stamp.identity(),
-        );
-        let decision = if literal_direct && !controller_dns && !original.retained_capture {
-            CapturedDecision::TryNativeOriginal(NativeBasis::new(original, basis))
-        } else {
-            let snapshot = self.endpoint_snapshot(
-                read,
-                query,
-                None,
-                bitmap.as_ref(),
-                #[cfg(feature = "native-api")]
-                generation.routing,
-                mode,
-                #[cfg(feature = "native-api")]
-                native,
-            );
-            CapturedDecision::Endpoint(CapturedEndpointCandidate {
-                admission: EndpointAdmission::pending(
-                    snapshot,
-                    budget,
-                    self.pending_endpoint(
-                        facts,
-                        PolicyGeneration {
-                            facts: Some(stamp),
-                            ..generation
-                        },
-                    ),
-                )?,
-                basis,
-            })
-        };
-        if !self.admitting() || !generation.same_policy(self.generation(mode_state.as_deref())) {
-            return Err(busy());
-        }
-        let mut packet_facts = self.0.projection.try_packet_facts().ok_or_else(busy)?;
-        if !packet_facts.is_current(stamp) {
-            return Err(busy());
-        }
-        Ok(decision)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -528,31 +368,9 @@ impl ControlPlane {
         &self,
         execution: Execution,
     ) -> anyhow::Result<RoutingAuthority> {
-        self.packet_policy(execution, false).await
-    }
-
-    /// Register Native capture with the canonical mixed-policy publication owner.
-    pub async fn native_packet_policy(&self) -> anyhow::Result<RoutingAuthority> {
-        self.packet_policy(Execution::MixedEndpoints, true).await
-    }
-
-    async fn packet_policy(
-        &self,
-        execution: Execution,
-        native: bool,
-    ) -> anyhow::Result<RoutingAuthority> {
         let _publication = self.reload_lock.lock().await;
         let router = self.router.read().await;
         let config = self.config.read().await;
-        if native {
-            anyhow::ensure!(
-                config.datapath.as_ref().is_some_and(|datapath| {
-                    datapath.backend == honk_config::datapath::Backend::Xdp
-                        && datapath.direct == Some(honk_config::datapath::DirectProfile::Native)
-                }),
-                "Native capture requires XDP DirectProfile::Native"
-            );
-        }
         let configured = config
             .datapath
             .as_ref()

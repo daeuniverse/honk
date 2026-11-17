@@ -1,32 +1,5 @@
 use super::*;
 
-#[cfg(feature = "ebpf")]
-#[tokio::test]
-async fn rejected_reload_reopens_native_only_after_healthy_restoration() {
-    use crate::ebpf::native::{NativePublication, NativeReason};
-
-    for healthy in [true, false] {
-        let mut cp = crate::control::tests::support::control_plane(Config::default());
-        cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
-            crate::mode::ModeState::new("Rule", ""),
-        )));
-        cp.start_datapath_flags_coordinator().unwrap();
-        cp.initialize_datapath_flags(false, false).await.unwrap();
-        let flags = cp.datapath_flags.as_ref().unwrap().clone();
-        let publication =
-            NativePublication::recording_for_test(honk_netstack::MemoryBudget::new(64 << 20))
-                .unwrap();
-        publication.open_for_test().unwrap();
-        let writer = publication.write(NativeReason::Reload).unwrap();
-        cp.datapath_healthy
-            .store(healthy, std::sync::atomic::Ordering::Release);
-        cp.drain_tracker.start_rejecting();
-        cp.restore_datapath_flags_after_rejected_reload(&flags, &cp.drain_tracker, Some(writer))
-            .await;
-        assert_eq!(publication.epoch_for_test() & 1, u64::from(healthy));
-    }
-}
-
 fn subscription(id: u128, name: &str, ua: Option<&str>) -> honk_config::subscription::Subscription {
     honk_config::subscription::Subscription {
         id: uuid::Uuid::from_u128(id),
