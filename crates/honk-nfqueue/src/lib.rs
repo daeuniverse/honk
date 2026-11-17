@@ -1,4 +1,3 @@
-pub mod native;
 mod netlink;
 mod packet;
 mod queue;
