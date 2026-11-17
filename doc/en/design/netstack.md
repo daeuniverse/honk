@@ -375,9 +375,7 @@ neighbor/nexthop/netconf dumps. It sends real input `RTM_GETROUTE` requests with
 transit UID absent. The kernel executes RPDB; no rules are mirrored. Link MTU,
 kernel forwarding permission and usable neighbor MACs come from kernel replies;
 missing neighbors request native ARP/ND through `NTF_USE`, never a fabricated MAC.
-Notifications invalidate all route leases. ENOBUFS, truncated/malformed messages,
-interrupted dumps, late replies or synchronization-bound exhaustion close the
-provider. A one-second lease horizon also forces resynchronization; no indefinite
+Notifications invalidate all route leases. Interrupted baseline dumps retry within three synchronization rounds; ENOBUFS, truncated/malformed messages, late replies or synchronization-bound exhaustion close the provider. A one-second lease horizon also forces resynchronization; no indefinite
 authorization cache exists. Cold misses perform bounded synchronous work and must
 run on a dedicated owner, not the packet hot path. Submission rechecks the provider
 and policy generation under the existing publication readers.

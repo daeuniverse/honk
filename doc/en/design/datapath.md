@@ -175,31 +175,11 @@ Use `direct: endpoint` to terminate Direct TCP/UDP through the existing packet E
 
 Each Port reserves `R * 1024` bytes for retained RX slots, where `R = min(rx_frames, ring_size)`. These share the 384 MiB `CAPTURE_MEMORY` budget with UMEM and other capture resources (see `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` and `honk-core/src/xdp.rs::prepare`).
 
-Before physical capture startup, provision an exact effective-bypass-mark RPDB rule before `main`, selecting a dedicated table with a default route for every enabled source-address family through an **uncaptured** uplink. `so_mark_from_dae` supplies that mark (the example uses `0x100`); it is not `CLASSIFIED_MARK` and cannot restore an original captured skb. Captured physical Ethernet ports must be unnumbered, including IPv6 link-local addresses. Core transit routes and neighbors belong in the kernel routing domain. Unsupported socket/process predicates and local/wildcard-listener assumptions are not silently translated to Core or Endpoint: a FIB Local result alone is not local-socket authority. Process predicates require explicit Host capture below; physical ingress supplies no authenticated process identity. DNS53 still follows canonical policy.
+For Endpoint, startup checks every installed default route in every table, including multipath and nexthop objects, and refuses any possible output through a captured port or its descendants. The operator must maintain this condition: route changes are not monitored at runtime. Captured Ethernet and bond interfaces may have addresses. Core has its own input-context FIB requirements. Physical ingress has no authenticated process identity; without Host capture, router-originated connections stay in the kernel.
 
-Captured physical roots and bypass-table Ethernet uplinks must be administratively
-up, standalone and have carrier (`IFF_UP | IFF_LOWER_UP`); captured logical
-interfaces must remain unnumbered. Some native drivers renegotiate carrier when
-the first XDP program attaches. After its own attachments, honk waits on netlink
-notifications for only the captured physical roots to regain carrier, with one
-10-second deadline across all roots and final admission. Other topology refusals
-remain immediate, including a down or carrier-less bypass uplink. An expired
-carrier wait names the interface and reports `no carrier after XDP attach`;
-startup fails with the existing guard custody.
+Endpoint's local-address set includes all valid namespace addresses, including deprecated but valid IPv6 addresses. Classifiable TCP/UDP to a local address passes to the kernel except port 53, which still evaluates policy. Later fragments use the first-fragment verdict; a later fragment arriving first is dropped. This matters for unconnected UDP and replies with options, extensions or fragments; configure an ordered static `direct(must)` rule when a local DNS listener should receive port 53 traffic.
 
-During that startup wait only, the existing native IPv6 `ff00::/8` multicast
-route may carry the sole `RTNH_F_LINKDOWN` flag when its output is a captured
-physical root still awaiting carrier. A recovered root, a logical-only output,
-additional flags or unsupported route facts remain refusals. Final strict
-admission still requires the multicast route's flags to be zero.
-
-The marked-table preflight proves **output-route isolation**, not the remote network's
-asymmetric return path. Own unconnected UDP, fragmented replies, IPv4 options and
-IPv6 extension-header replies do not receive the connected-socket native exemption;
-if they arrive on a captured port, the selected packet policy still applies. Keep
-their return path on the uncaptured uplink: this unsupported topology is not made
-equivalent by XDP socket-lookup helpers. Wildcard lookup alone cannot distinguish
-transit from LocalInput.
+TUN uses a separate watcher: unrelated link/address/route/rule changes trigger dependency rechecks without closing TUN, while changes to its owned link, addresses, routes or rules and malformed or lost notifications remain fatal.
 
 Endpoint reply identities use a shared 4096-entry table keyed by logical scope and
 source IP. Reclamation considers only entries no longer retained by protocol state,
@@ -236,19 +216,19 @@ L2 group addresses cannot grant unicast IP a native socket exemption. Existing
 native ARP/ND and IP special-address handling remains; directed broadcasts come
 from at most 64 exact local-table `RTN_BROADCAST` routes, never suffix guesses.
 
-Physical XDP capture defaults to forced AF_XDP ZeroCopy for every selected
-queue; `datapath.xsk_mode: copy` remains an explicitly supported physical mode. The default
-backend is still TC. Every RX queue must have a corresponding TX queue; shared
-preflight checks device/frame commitments before any guard attaches. Queue
-admission then rechecks device facts and verifies the actual bind result; a late
-failure retains fail-closed guard custody rather than retrying Copy or another
-backend. Omitted and explicit ZeroCopy have the same device setup; changing the
-effective mode requires restart. Existing omitted-mode XDP configurations must
-add `xsk_mode: copy` to preserve their previous Copy behavior; see the
-[configuration migration note](../reference/global.md#capture-backend-selection).
+Physical capture defaults to forced ZeroCopy; `xsk_mode: copy` requests Copy and `xsk_mode: auto` selects per member using advertised capabilities and required segments. Auto does not retry Copy after a selected ZeroCopy bind fails. Every bind is read back; mode changes require restart. The private Host queue remains Copy.
 
+Read-only startup admission collects up to 256 issues, reporting omitted counts and `NOT_CHECKED` for checks whose prerequisites failed. It checks capture layout, queues, device capabilities, foreign XDP, topology, memory, and, for Endpoint, zone-0 CT and uplink prerequisites. Only after admission does it prepare VLAN features, load programs, create FD-owned links and bind queues; supervisor readiness and topology validation precede activation. Failure unwinds previously created links, including failure on a later queue. Physical Endpoint/Core links and programs are not pinned; foreign XDP is refused. Normal stop detaches before joining output and CQ; process exit or SIGKILL closes link FDs and restores kernel forwarding, although existing proxy sessions may need to reconnect. Host retains its separate persistent custody.
 
-Start a freshly built real daemon with `honk-core -c config.dae --bpf-pin-root <private-bpffs-directory>`, without `--mock-ebpf`. Readiness is `XDP datapath ready`. Endpoint/Core physical capture creates no TC hooks. Each device pins `guard` and `data` under `xdp-<ifindex>/` before installing the driver-mode guard through `RTM_SETLINK` with `XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST`. The netdev holds the installed XDP program independently of creator FDs. XDP replacements use `RTM_SETLINK` with `DRV | REPLACE` and the exact expected-old program FD, followed by driver-mode/program-ID readback. Generic/SKB mode has no fallback. Explicit Host adds its separate source/return TCX hooks below. These paths create no NFQUEUE, `dae0` or `daens`.
+With no VLAN upper, honk disables the two RX VLAN stripping features it changes and restores them on normal stop or startup failure. SIGKILL leaves them off; the kernel handles VLAN in software. An identity-loss failure abandons restoration because the device may have been replaced. Veth still requires VLAN metadata.
+
+Endpoint classification follows local non-53, Endpoint hold, zone-0 conntrack, fragment verdict, D1 and XSK. Hold precedes CT; CT lookup contract errors drop the packet and cause fatal shutdown. TCP reaches D1 only on a pure SYN; a non-SYN miss goes to the kernel. UDP evaluates D1 per hold/CT miss. Non-TCP/UDP normally passes; ICMP errors inspect the quoted flow. Unclassifiable transport headers drop. First-fragment verdicts last 30 seconds; a later fragment arriving before the first has no verdict and is dropped.
+
+Only zone 0 is supported: startup refuses nonzero or unprovable nft and legacy zones. Runtime watches nft changes and fails on unsafe zone state; legacy zone changes are not monitored, so stop honk before changing them and restart afterward.
+
+An admitted 802.3ad bond is one logical realm, with XDP on its physical Ethernet or veth members; other bond modes and unsupported hash policies are refused. A peer can move between members of that realm; already exported output keeps its original member. Multi-member realms use CPU output rather than generated output, a performance cost; a single-member bond may use generated output. Realm workers are limited by the smallest member queue count. Captured identity changes, a new bond member, ENOBUFS or `Desynchronized` are fatal; carrier, LACP state, statistics and unrelated device changes are ignored. Address updates refresh the local set; the published map remains until successful resynchronization, and failure is fatal. Interrupted FIB dumps are retried within three synchronization rounds.
+
+Kernel map/program memory is charged alongside UMEM to the shared 384 MiB capture budget; reload temporarily charges old and new generations. See [reload limitations](./control-plane.md#reload-and-runtime-generations).
 
 SG/multi-buffer capability advertisement and successful binding are not runtime
 proof of jumbo traffic. The manual veth smoke exercises MTU 1500 and 9000 in Copy
@@ -257,7 +237,7 @@ also require complete, unfragmented IP packets larger than 4096 bytes in both
 directions at the client interface. Physical-NIC zero-copy, jumbo performance
 and DMA release still need their own evidence.
 
-Endpoint output is generated directly into one reserved UMEM frame only for admitted realms whose checked `14 + 4 * vlan_count + logical_mtu.max(1280)` fits `FRAME_SIZE`, without relaxing the physical-port maximum. Jumbo/ineligible realms retain CPU output and whole-chain SG, even for control packets. Application UDP first packets/fragments, unfragmented and zero-length datagrams and controller DNS replies remain real funded CPU output; older CPU prefixes cannot be bypassed by later direct fragments, with the ordering rechecked atomically under the scope lock.
+Endpoint output is generated directly into one reserved UMEM frame only for eligible single-member realms whose checked `14 + 4 * vlan_count + logical_mtu.max(1280)` fits `FRAME_SIZE`. Multi-member and jumbo/ineligible realms retain CPU output and whole-chain SG, even for control packets. Application UDP first packets/fragments, unfragmented and zero-length datagrams and controller DNS replies remain funded CPU output; older CPU prefixes cannot be bypassed by later direct fragments.
 
 `Port::transmit_generated(class, max_length, generate)` reserves actual single-frame/ring/sidecar capacity before invoking its synchronous generator; scope credit is also reserved before Stack emission. Private guards cancel unpublished reservations on no output, error or panic. Original FlowId retention is installed under the scope mutex, then exact peer/header completion runs unlocked without await or RX service. Only the actual length, padded with zeroes to the Ethernet minimum, is published at the unshifted frame base; published ownership survives later errors until real CQ. CPU and direct Endpoint owners share mixed exact-scope CQ batch return. The existing 32 considered outputs/class/realm and 64 CQ-descriptor bounds, independent ACK/retransmission/CQ lifetimes, E3.1 handoff and process-lifetime UMEM charges remain. Eligible driver turns skip only CPU pulling and finalize timers/events/close/deadlines after direct emission; they add no busy polling. Only one intermediate Endpoint CPU-IP-frame-to-UMEM copy is removed, not TCP payload/checksum or relay copies; this is not universal UDP zero-copy, a resident-memory reduction or measured gains.
 
@@ -319,8 +299,7 @@ per-queue RX advancement satisfies the queue witness. Under
 and B four times. Each records its actual capture incarnation (`startup_id`),
 namespace/inode, driver, device/ifindex, configured mode and every observed
 queue bind mode. `adaptive-runtime.joined` is written only after actual peer,
-scope/CQ, socket, worker and OS-thread joins, exact guard detach and owned-pin
-cleanup. This source coverage requires a passing rig execution before any run
+scope/CQ, socket, worker and OS-thread joins and owned link detach. This source coverage requires a passing rig execution before any run
 is accepted; it establishes no virtio equivalence, physical-NIC performance or
 DMA-release result. Existing Copy and virtio Event profiles remain separate.
 
@@ -396,11 +375,11 @@ Neither FD close nor resource removal refunds retained kernel/UMEM charges befor
 process exit. XDP Host itself grants no TUN capability and does not establish
 physical or 13-size acceptance.
 
-### Physical capture guards and smoke
+### Physical capture and smoke
 
-Stop traffic sources before removing custody. Normal shutdown reports `XDP admission closed; UMEM retained until process exit`; the netdev XDP attachment remains a fail-closed guard, with `guard`/`data` program pins under `<bpf-pin-root>/xdp-<ifindex>/`. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Startup refuses an interface that still has an XDP attachment. After stopping sources and verifying the attached program ID belongs to this instance's guard, remove that attachment (`ip link set dev <interface> xdp off`), then only its owned pins. There is no automatic zero-resident hot reopen: retained UMEM remains charged against the process-lifetime **512 MiB** ceiling; close and empty rings are not DMA-release evidence.
+Physical link FDs detach on shutdown or process exit. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Foreign XDP attachment is refused; no physical guard or program pins need manual removal.
 
-`.github/ci/xdp-daemon-smoke.sh` runs inside the complete floor/recent disposable-VM gate with prebuilt matching daemon, Core and XSK test executables; it remains directly runnable in a provisioned guest. It requires guest root, Linux 6.12+, namespaces, AF_XDP/native-XDP veth, bpffs, iproute2, nft, ethtool and Python 3, and performs no builds/installations/downloads. Every Core/VLAN/jumbo scenario combines actual capture counters and peer payload checks with a private native-forwarding drop fence. Shutdown compares the attached program to the owned guard ID and tests selected traffic refusal against a same-path positive baseline before owned detach. The gate also covers asymmetric queues, native control traffic, padded VLAN frames and an omitted-datapath real TC startup/traffic/reload cycle. Passing these virtual scenarios is not physical-NIC, all-queue/RSS or performance certification.
+`.github/ci/xdp-daemon-smoke.sh` belongs to the disposable floor/recent VM gate with matching prebuilt daemon and test executables. The D3 contract checks link detachment and kernel forwarding after process exit or SIGKILL, and unwinds all links on a later queue startup failure. Retain the separate Host custody lane and TC/NFQUEUE selections. Virtual coverage does not certify physical NIC performance or DMA release.
 
 The smoke keeps daemon state on its private `/run` tmpfs, then archives it after
 shutdown. Its guest cgroup2 mount lives outside `/sys`, so `ip netns exec` cannot

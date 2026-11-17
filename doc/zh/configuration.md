@@ -51,6 +51,24 @@ include {
 
 严格的 `datapath` 配置段不采用标量覆盖合并：在所有合并的分段中（包括被包含文件），`backend`、`direct`、`xsk_mode`、`interface`、`firewall`、`nat` 各最多声明一次。重复声明会导致配置被拒绝，而非覆盖或追加。
 
+XDP Endpoint 网关配置逻辑 LAN 接口（允许带地址的以太网接口或 bond），也可为每个成员选择 Auto：
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    xsk_mode: auto
+    interface { bond0: lan }
+}
+routing {
+    dip(10.10.10.1) && dport(53) -> direct(must)
+    fallback: direct
+}
+```
+
+只有该地址的本机 listener 应接收 53 流量时才需要 DNS 规则，并须放在域名规则之前。见[网关准入与限制](./design/datapath.md#full-xdp-启动)。
+
 ## 运行时数据目录
 
 `global.data_dir` 是运行时状态与相对运行时资源的进程级根目录，默认值为 `/var/lib/honk`，必须是非空绝对路径。修改后需重启。

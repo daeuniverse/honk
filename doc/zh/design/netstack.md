@@ -340,8 +340,7 @@ neighbor/nexthop/netconf dump 前先订阅，真正发送包含 `RTA_IIF`、源/
 protocol、ports、已证明 mark 的 input `RTM_GETROUTE`，transit 不伪造 UID。RPDB
 由内核执行，不镜像规则；MTU、forwarding 开关和 neighbor MAC 来自真实回复。
 缺 neighbor 时通过 `NTF_USE` 请求内核 ARP/ND，绝不编造 MAC。事件使全部 route
-lease 失效；ENOBUFS、截断/畸形消息、dump interruption、迟到回复或同步上限耗尽
-均关闭 provider。一秒 lease 上限也触发重新同步，授权不无限缓存。冷 miss 的有界
+lease 失效；baseline dump 中断在三轮同步内重试，ENOBUFS、截断/畸形消息、迟到回复或同步上限耗尽均关闭 provider。一秒 lease 上限也触发重新同步，授权不无限缓存。冷 miss 的有界
 同步 netlink 工作必须由独立 owner 执行，不属于逐包热路径。实际提交时在既有发布
 读锁下同时复核 FIB 和策略 generation。
 组播通知以 `NETLINK_PKTINFO` 判别，不假定 sequence 为零。合法 blackhole

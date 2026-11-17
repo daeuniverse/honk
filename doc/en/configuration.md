@@ -51,6 +51,24 @@ The entry file's own sections merge first regardless of where its `include` bloc
 
 The strict `datapath` section is an exception to scalar override merging: its `backend`, `direct`, `xsk_mode`, `interface`, `firewall`, and `nat` declarations may each occur at most once across all merged sections, including included files. Duplicate declarations reject the configuration rather than overriding or appending.
 
+For an XDP Endpoint gateway, configure the logical LAN interface (a numbered Ethernet interface or bond is allowed) and optionally select Auto per member:
+
+```dae
+global { nfqueue_enable: false }
+datapath {
+    backend: xdp
+    direct: endpoint
+    xsk_mode: auto
+    interface { bond0: lan }
+}
+routing {
+    dip(10.10.10.1) && dport(53) -> direct(must)
+    fallback: direct
+}
+```
+
+The DNS rule is only needed when that address and local listener should receive port 53; put it before domain rules. See [gateway admission and limits](./design/datapath.md#full-xdp-startup).
+
 ## Runtime data directory
 
 `global.data_dir` is the process-wide root for runtime state and relative runtime-supplied files. It defaults to `/var/lib/honk` and must be a non-empty absolute path. Changing it requires restart.

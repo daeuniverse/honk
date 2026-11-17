@@ -2,6 +2,12 @@
 
 `routing { ... }` defines ordered traffic matchers and their outbound targets.
 
+## XDP Endpoint gateway
+
+D1 follows the authored rule order and passes only proven static terminal Direct. Non-must Direct requires Rule mode, a non-53 destination and direct finality. A statically decidable `direct(must)` also covers port 53. An earlier block/proxy or an unresolved positive or negative domain/geosite predicate prevents passing a later Direct. Source MAC, IP, ports, protocol and DSCP are available; LAN pname is Missing, so a positive pname does not match and its negation does. Without Host, pname rules are reported through `pname_routing` degradation and local-origin flows remain kernel traffic. TCP uses D1 only for a pure SYN after hold/CT miss; UDP evaluates every miss. Mode is read at runtime.
+
+For a local DNS listener, place an appropriate static rule before domain rules, for example `dip(10.10.10.1) && dport(53) -> direct(must)`; honk does not synthesize this rule.
+
 ## Rule grammar
 
 ```text

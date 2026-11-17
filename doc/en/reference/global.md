@@ -63,7 +63,7 @@ On the TC backend, setting `shutdown_wait_connections: true` gives accepted conn
 
 Shutdown uses the latest accepted configuration; rejected reloads preserve the previous value. The flag does not change reload retirement, DNS/state persistence, NFQUEUE/eBPF cleanup or the native API's independent [five-second HTTP grace](./api.md#native-api).
 
-The XDP backend closes capture admission and installs its guard before aborting packet endpoints and joining their output/CQ teardown. This flag does not provide natural-completion grace for XDP packet TCP connections; joined teardown is still required.
+The XDP backend closes capture admission and detaches its physical links before joining packet endpoint output/CQ teardown. This flag does not provide natural-completion grace for XDP packet TCP connections.
 
 TUN closes admission and removes its active capture routes before joined Endpoint
 cleanup, retaining blackhole guards throughout the drain. Normal confirmed stop
@@ -257,15 +257,7 @@ Unknown settings and unsupported marked continuation requests are rejected, not 
 Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
 including empty nested blocks, are rejected rather than ignored.
 
-Physical `datapath.interface` capture uses `datapath.xsk_mode`, accepting `copy` or
-`zerocopy`; omission defaults to forced ZeroCopy for every selected physical RX
-queue, with no Copy retry or fallback to another backend. Explicit `copy` remains
-supported. Advertised zero-copy/segment capability and complete-packet frame
-commitments are checked for all devices before the first attachment; every
-successful bind must also agree with the kernel's `XDP_OPTIONS_ZEROCOPY` readback.
-Queue logs report that observed mode. Omitted and explicit `zerocopy` are equivalent
-for reload; changing to or from `copy` requires restart. TC remains the default
-backend and rejects an explicit `xsk_mode`.
+`datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. The private Host queue requires Copy independently.
 
 `datapath.workers` is an XDP-only integer, either `1` (default) or `2`; changing it
 requires restart. Two workers require at least two actual physical queue owners
@@ -281,17 +273,9 @@ Copy behavior, add `xsk_mode: copy` to the existing `datapath` block before
 upgrading. Without it, unsupported ZeroCopy rejects startup rather than silently
 falling back. Configurations that omit `datapath` keep TC unchanged.
 
-Core Direct requires `dial_mode: ip`; domain predicates use only DNS facts learned
-in the exact packet ingress scope, without hostname synthesis or sniffing. Physical
-ingress has no authenticated process fact; process predicates require the explicit
-Host capture below. Neither path invents per-flow MAC facts. A pre-existing, independently
-validated bypass-mark routing table must isolate daemon socket traffic onto
-uncaptured uplinks; this example alone does not establish that topology.
-Core's input-context FIB contract currently rejects nonzero IPv6 flow labels and
-router-specific extension/options execution that it cannot preserve. Endpoint IPv6
-support does not establish equivalent Core authority for those packet combinations.
-See [Full-XDP startup and limitations](../design/datapath.md) for device, VLAN,
-scatter/gather, retained-memory, pinned-guard, and stock-kernel admission boundaries.
+Core Direct requires `dial_mode: ip`; domain predicates use facts learned in the packet ingress scope. Physical ingress supplies the source MAC but no authenticated process fact. Without Host capture, pname uses Missing semantics and reports the existing `pname_routing` degradation; router-originated flows remain in the kernel. Endpoint permits numbered Ethernet and bond interfaces and checks all default routes for captured outputs at startup; the operator must maintain that condition at runtime. Physical FD-owned links detach on process exit; VLAN RX stripping bits changed by honk are restored on normal stop or startup failure, but remain off after SIGKILL. See [Full-XDP startup and limitations](../design/datapath.md).
+
+Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-specific extension/options execution it cannot preserve; Endpoint IPv6 support does not establish equivalent Core authority.
 
 ### XDP Host Endpoint
 

@@ -63,7 +63,7 @@ TC 后端仅在设为 `shutdown_wait_connections: true`，且正常关闭、数�
 
 关闭使用最近接受的配置；重载被拒绝时保留旧值。此开关不改变 reload 退役、DNS/状态持久化、NFQUEUE/eBPF 清理或原生 API 独立的[五秒 HTTP 宽限期](./api.md#原生-api)。
 
-XDP 后端先关闭抓包准入并安装 guard，再中止 packet endpoint 并等待其输出/CQ 拆卸完成。此开关不为 XDP packet TCP 连接提供自然结束的宽限期；仍须等待所持有的拆卸工作完成。
+XDP 后端先关闭抓包准入并 detach 物理 link，再等待 packet endpoint 输出/CQ 拆卸完成。此开关不为 XDP packet TCP 连接提供自然结束宽限期。
 
 TUN 先关闭准入、移除活动 capture route，再 join Endpoint 清理，整个排空期间
 保留 blackhole guard。正常确认停止后才移除自有策略资源；失败时保留 guard 与
@@ -248,12 +248,7 @@ XDP 不可同时配置
 接口条目只能是 `名称: lan` 或 `名称: wan`；携带子块（包括空子块）会被拒绝，
 不会忽略其中的设置。
 
-物理 `datapath.interface` 捕获使用 `datapath.xsk_mode`，接受 `copy` 或
-`zerocopy`；省略时对全部选中物理 RX 队列强制使用 ZeroCopy，绝不重试 Copy
-或回退到其他后端。显式 `copy` 仍受支持。首次挂载前检查 zero-copy/segment
-能力通告和完整包 frame 承诺；成功 bind 后还必须与内核 `XDP_OPTIONS_ZEROCOPY`
-回读一致。queue 日志报告实际观察到的模式。省略与显式 `zerocopy` 在 reload 时
-等价；切换到或离开 `copy` 必须重启。默认后端仍为 TC，且拒绝显式 `xsk_mode`。
+物理捕获的 `datapath.xsk_mode` 接受 `copy`、`zerocopy` 或 `auto`。省略仍强制 ZeroCopy；Auto 按每个成员的能力与所需 segment 选择。每次 bind 均回读验证，选定模式失败不会重试其他模式。省略与显式 `zerocopy` 在重载时等价，模式变更需重启。TC 和 TUN 拒绝显式模式；Host 私有 queue 独立要求 Copy。
 
 `datapath.workers` 是仅限 XDP 的整数，只接受 `1`（默认）或 `2`，修改需要重启。
 双 worker 要求至少两个真实物理队列 owner，且有效 cpuset 至少有两个 CPU。
@@ -267,15 +262,9 @@ worker 0。逻辑 realm、DNS/UDP source 所有权及内存/流总上限不会�
 `xsk_mode: copy`。否则，不支持 ZeroCopy 会拒绝启动，不会静默降级。省略
 `datapath` 的配置仍使用 TC，不受影响。
 
-Core Direct 要求 `dial_mode: ip`；域名谓词只使用精确 packet 入口 scope 内学到的
-DNS 事实，不虚构 hostname 或依赖嗅探。物理入口没有经认证的进程事实；进程谓词
-要求下述显式 Host 捕获，两条路径都不伪造逐流 MAC 事实。部署必须预先配置并通过
-独立验证的 bypass-mark 路由表，将守护进程自身的套接字流量隔离到未捕获的上联；上述示例本身不构成
-拓扑证明。设备、VLAN、散布/聚集、保留内存、固定丢弃保护及原生内核准入限制，
-请参阅[完整 XDP 启动与限制](../design/datapath.md)。
-Core 当前的带输入上下文 FIB 契约会拒绝非零 IPv6 flow label，以及无法保持语义的
-路由器专用扩展头/options 执行。Endpoint 支持 IPv6 并不证明这些数据包组合在
-Core 中具有等价执行授权。
+Core Direct 要求 `dial_mode: ip`；域名谓词使用 packet 入口 scope 内学到的事实。物理入口提供源 MAC，但没有经认证的进程事实。未启用 Host 时 pname 使用 Missing 语义，并通过现有 `pname_routing` 报告降级；路由器本机发起的流留在内核。Endpoint 接受带地址的以太网和 bond 接口，启动时检查所有默认路由不能从捕获口输出；运行期由操作者保持。物理 link 由 FD 持有，进程退出时 detach；honk 修改的 VLAN RX stripping 位在正常停止或启动失败时恢复，SIGKILL 后保持关闭。参阅[完整 XDP 启动与限制](../design/datapath.md)。
+
+Core 的输入上下文 FIB 契约拒绝非零 IPv6 flow label 及无法保持语义的路由器扩展头/options；Endpoint 支持 IPv6 不证明 Core 对这些组合具有等价授权。
 
 ### XDP Host Endpoint
 

@@ -151,26 +151,11 @@ routing {
 
 每个 Port 为 retained RX slot 预留 `R * 1024` 字节，其中 `R = min(rx_frames, ring_size)`。这些内存与 UMEM 及其他 capture 资源共用 384 MiB `CAPTURE_MEMORY` 预算（见 `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` 与 `honk-core/src/xdp.rs::prepare`）。
 
-物理捕获启动前必须准备与有效 bypass mark 精确匹配、优先于 `main` 的 RPDB rule，指向专用表；对每个已启用源地址族，该表都须有经过**未捕获** uplink 的默认路由。`so_mark_from_dae` 指定此 mark（示例为 `0x100`）；它不是 `CLASSIFIED_MARK`，也不能恢复已捕获的原始 skb。捕获的物理以太网端口必须完全无地址，包括 IPv6 link-local。Core transit 路由及邻居由内核 routing domain 管理。不支持的 socket/process 条件及 local/wildcard listener 假设不会被悄悄替换成 Core 或 Endpoint；仅有 FIB Local 结果不足以证明本地 socket 归属。进程谓词要求下述显式 Host 捕获，物理入口不提供经认证的进程身份。DNS53 仍走规范策略。
+Endpoint 启动时检查所有路由表中已安装的默认路由，包括 multipath 和 nexthop，拒绝任何可能经捕获端口及其下层出口的路由。运行时不监测这一条件，操作者须自行保持。捕获的以太网和 bond 接口允许有地址；Core 有自己的输入上下文 FIB 要求。物理入口没有经认证的进程身份；未启用 Host 时路由器本机发起的连接留在内核。
 
-捕获的物理根接口与 bypass 表中的以太网 uplink 必须处于管理 UP、独立且有 carrier
-的状态（`IFF_UP | IFF_LOWER_UP`）；捕获的逻辑接口仍须完全无地址。部分原生驱动
-首次挂载 XDP 程序时会重新协商 carrier。完成自身挂载后，honk 通过 netlink 通知
-仅等待捕获的物理根接口恢复 carrier，所有根接口及最终准入共用一个 10 秒 deadline。
-其他拓扑拒绝仍立即失败，包括管理 DOWN 或无 carrier 的 bypass uplink。carrier
-等待超时会指出接口名并报告 `no carrier after XDP attach`；启动失败保留现有 guard
-托管行为。
+Endpoint 的本机地址集合包含命名空间所有有效地址，包括 deprecated 但仍有效的 IPv6 地址。可分类的本机 TCP/UDP 目的地址交给内核，端口 53 例外，仍须经过策略。后续分片使用首片判定；后片先到时会丢弃。未连接 UDP 以及带 options、扩展头或分片的回复也依赖这一行为；如需本机 DNS listener 接收 53 流量，请按顺序配置静态 `direct(must)` 规则。
 
-仅在这段启动等待期间，既有原生 IPv6 `ff00::/8` 组播路由可携带唯一的
-`RTNH_F_LINKDOWN` flag，且出口必须是仍在等待 carrier 的捕获物理根接口。
-已恢复 carrier 的根接口、仅属于逻辑捕获的出口、额外 flag 或不支持的路由事实
-仍立即拒绝。最终严格准入仍要求该组播路由的 flags 为零。
-
-mark 专用表预检只证明**出站路由隔离**，不能证明远端网络不会非对称回程。
-自身未连接 UDP、分片、IPv4 options 和 IPv6 扩展头回复不会获得 connected-socket
-原生豁免；若进入捕获端口，仍按所选 packet policy 处理。必须把自身回程放在未捕获
-uplink；XDP socket-lookup helper 不会让这种不支持的拓扑自动等价。wildcard 查询
-不能区分 transit 与 LocalInput。
+TUN 使用独立 watcher：无关 link/address/route/rule 变化触发依赖复查，不关闭 TUN；自有 link、地址、路由或规则变化以及畸形或丢失通知仍为致命错误。
 
 Endpoint 回复身份以逻辑 scope 和源 IP 为键，共用 4096 项表。只有不再被协议状态、
 TIME_WAIT、initializer/source receiver、DNS 工作及排队/已导出输出持有的条目才可
@@ -197,23 +182,26 @@ device-bound 程序必须以真实入站验证，不能使用 `BPF_PROG_TEST_RUN
 L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和 IP 特殊地址
 处理保留；定向广播取自最多 64 条精确的本地表 `RTN_BROADCAST` 路由，不猜后缀。
 
-物理 XDP 捕获默认对所有选中队列强制使用 AF_XDP ZeroCopy；
-`datapath.xsk_mode: copy` 仍是正式支持的显式物理模式。默认后端仍为 TC。
-每条 RX 队列必须有对应 TX 队列；共用预检在挂载任何 guard 前检查设备/frame
-承诺。实际队列准入仍复核设备事实及 bind 回读。较晚失败时保留 fail-closed
-guard，不重试 Copy 或其他后端。省略与显式 ZeroCopy 具有相同设备设置；有效
-模式变化要求重启。已有省略模式的 XDP 配置必须加入 `xsk_mode: copy` 才能
-保留原有 Copy 行为，参阅[配置迁移说明](../reference/global.md#捕获后端选择)。
+物理捕获默认强制 ZeroCopy；`xsk_mode: copy` 指定 Copy，`xsk_mode: auto` 根据每个成员的能力与所需 segment 数选择模式。Auto 选择 ZeroCopy 后 bind 失败不会重试 Copy。每次 bind 均回读验证；模式变更需重启。Host 私有 queue 始终为 Copy。
 
+只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。正常停止先 detach 再等待输出和 CQ；进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 保留独立的持久托管。
 
-使用新构建的真实 daemon：`honk-core -c config.dae --bpf-pin-root <私有-bpffs-目录>`，不要传 `--mock-ebpf`。就绪日志为 `XDP datapath ready`。Endpoint/Core 物理捕获不创建 TC hook。每个设备在 `xdp-<ifindex>/` 下 pin `guard` 和 `data`，再通过 `RTM_SETLINK`、`XDP_FLAGS_DRV_MODE | XDP_FLAGS_UPDATE_IF_NOEXIST` 安装 driver-mode guard。Netdev 独立于创建进程的 FD 持有已安装的 XDP 程序。XDP 替换通过 `RTM_SETLINK`、`DRV | REPLACE` 和精确 expected-old 程序 FD 完成，再回读确认 driver 模式和程序 ID。不回退 generic/SKB 模式。显式 Host 另有下述 source/return TCX hook。这些路径均不创建 NFQUEUE、`dae0` 或 `daens`。
+没有 VLAN upper 时，honk 关闭它所修改的两个 RX VLAN stripping feature，并在正常停止或启动失败时恢复。SIGKILL 后这两位保持关闭，内核软件处理 VLAN。设备身份失权时不再恢复，以免写入已替换的设备。veth 仍需 VLAN metadata。
+
+Endpoint 判定顺序为本机非 53、Endpoint hold、zone-0 conntrack、分片判定、D1、XSK。hold 优先于 CT；CT lookup 合同错误丢包并导致致命退出。TCP 仅纯 SYN 进入 D1，非 SYN miss 交内核；UDP 每个 hold/CT miss 包都求 D1。非 TCP/UDP 通常交内核；ICMP 错误检查引用的流。无法分类的传输层头丢弃。首片判定保存 30 秒，后片先于首片到达时没有判定，会被丢弃。
+
+仅支持 zone 0：启动拒绝非零或无法证明安全的 nft 和 legacy zone。运行期监测 nft 变化，不安全时退出；不监测 legacy zone 变化，修改前须停止 honk，修改后重启。
+
+准入的 802.3ad bond 是一个逻辑 realm，XDP 挂在物理以太网或 veth 成员上；其他 bond 模式或不支持的哈希策略被拒绝。同 realm 的 peer 可以换成员，已导出输出保持原成员。多成员 realm 使用 CPU 输出而不使用 generated output，有性能代价；单成员 bond 可以使用 generated output。realm worker 数受成员中最小队列数限制。捕获身份变化、新成员加入 bond、ENOBUFS 或 `Desynchronized` 为致命错误；carrier、LACP 状态、统计及其他设备变化忽略。地址更新刷新本机集合；成功重同步前保持已发布 map，重同步失败为致命错误。FIB dump 中断在三轮同步内重试。
+
+内核 map/program 内存与 UMEM 一同计入共享 384 MiB 捕获预算；重载期间新旧 generation 同时计费。见[重载限制](./control-plane.md#reload-与运行时-generation)。
 
 SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 veth smoke
 在 Copy 模式覆盖 MTU 1500 和 9000：每次 UDP 回复必须是单个完整数据报，
 jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096 字节、完整且
 未分片的 IP 包。物理 NIC zero-copy、jumbo 性能与 DMA 释放仍需各自证据。
 
-仅当已准入 realm 经溢出检查的 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才直接在一个已预留 UMEM frame 内生成输出，不放宽物理端口最大长度。jumbo/不符合资格的 realm 继续 CPU 输出和整链 SG，控制包也一样。应用 UDP 首包/首分片、未分片和零长度数据报及控制器 DNS 回复仍是真实计费的 CPU 输出；后续直接分片不能越过更早 CPU 前缀，此顺序在 scope 锁内原子复查。
+仅符合条件的单成员 realm 且经检查的 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才直接在已预留 UMEM frame 内生成输出。多成员、jumbo 和其他不符合条件的 realm 继续使用 CPU 输出和整链 SG，包括控制包。应用 UDP 首包/首分片、未分片和零长度数据报及控制器 DNS 回复仍为计费的 CPU 输出；后续直接分片不能越过更早 CPU 前缀。
 
 `Port::transmit_generated(class, max_length, generate)` 先预留真实单帧/ring/sidecar 容量，再调用同步 generator；scope credit 也早于 Stack emitter 预留。私有 guard 在无输出、错误或 panic 时取消未发布预留。原始 FlowId 持有先在 scope mutex 内安装，随后在锁外完成精确 peer/header，中间不 await 或服务 RX。只按实际长度补零到以太网最小帧，并以未偏移的 frame base 发布；后续错误不释放已发布 owner，仍须真实 CQ。CPU 与直接 Endpoint owner 共用按精确 scope 混合归还的 CQ batch。既有每 realm 每类别 32 个候选输出、64 个 CQ descriptor 的上限、相互独立的 ACK/重传/CQ 生命周期、E3.1 handoff 及进程生命周期 UMEM 计费不变。符合资格的 driver 轮次只跳过 CPU 拉取，在直接输出后完成 timer/event/close/deadline 收尾，不增加 busy polling。只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制，TCP payload/校验和与 relay 复制仍存在；这不是通用 UDP zero-copy、常驻内存减少或已测收益。
 
@@ -264,8 +252,7 @@ udp4 sdfn` 与 `ethtool -X DEV equal 2`）。producer 变化 64 个 UDP 源端�
 记录保留五次启动：A 一次、B 四次。每条记录包含实际 capture incarnation
 （`startup_id`）、namespace/inode、driver、device/ifindex、配置模式及每个队列
 的实际 bind 模式。只有真实 peer、scope/CQ、socket、worker 与 OS thread
-完成 join，精确 guard 已 detach 且自有 pin 已清理后，才写
-`adaptive-runtime.joined`。这些源码覆盖仍须 rig 实际通过才能接受某次运行；
+完成 join 且自有 link 已 detach 后，才写 `adaptive-runtime.joined`。这些源码覆盖仍须 rig 实际通过才能接受某次运行；
 不构成 virtio 等价、物理 NIC 性能或 DMA 释放结论。既有 Copy 与 virtio Event
 profile 仍作为独立结果。
 
@@ -327,11 +314,11 @@ crash 或歧义/失败清理保留 custody，不宣称清理完成。FD close �
 退出前归还 retained kernel/UMEM 计费。此 XDP 路径不授予 TUN 能力，也不代表
 physical 或 13-size 验收。
 
-### 物理捕获 guard 与 smoke
+### 物理捕获与 smoke
 
-移除 custody 前先停止流量源。正常关闭报告 `XDP admission closed; UMEM retained until process exit`；netdev 上的 XDP 挂载作为 fail-closed guard 保留，`guard`/`data` program pin 位于 `<bpf-pin-root>/xdp-<ifindex>/`。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。接口仍有 XDP 挂载时启动会拒绝。停源并确认当前程序 ID 属于本实例 guard 后，先移除该挂载（`ip link set dev <接口> xdp off`），再只删除其自有 pin。不存在自动零驻留热重开：保留 UMEM 仍计入进程生命周期 **512 MiB** 上限；close 或空 ring 不证明 DMA 释放。
+物理 link FD 在正常停止或进程退出时 detach。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。启动拒绝外来 XDP，无须手工移除物理 guard 或程序 pin。
 
-`.github/ci/xdp-daemon-smoke.sh` 已由完整 floor/recent disposable-VM gate 使用匹配的预构建 daemon、Core 和 XSK 测试程序执行，也可在已准备好的 guest 中直接运行。它要求 guest root、Linux 6.12+、namespace、AF_XDP/native-XDP veth、bpffs、iproute2、nft、ethtool 与 Python 3，不构建、安装或下载。每个 Core/VLAN/jumbo 场景同时验证真实 capture 计数、对端载荷及私有 native-forwarding 丢弃围栏；关闭后核对自有 guard 程序 ID，并用同路径正向基线对照受选流量的拒绝，之后才移除自有挂载。门禁还覆盖不对称队列、原生控制流量、带填充 VLAN 帧，以及省略 datapath 的真实 TC 启动/流量/reload。虚拟场景通过不等于物理 NIC、逐队列/RSS 或性能认证。
+`.github/ci/xdp-daemon-smoke.sh` 属于使用匹配预构建 daemon 和测试程序的 floor/recent disposable VM gate。D3 合同检查进程退出或 SIGKILL 后 link detach 和内核转发恢复，以及后续队列启动失败时全部 link 的撤销。保留独立 Host custody 与 TC/NFQUEUE 选择。虚拟覆盖不等于物理 NIC 性能或 DMA 释放认证。
 
 smoke 将 daemon 状态保存在私有 `/run` tmpfs，关闭后再归档。guest cgroup2
 挂载放在 `/sys` 之外，避免 `ip netns exec` 为 TC 回归重挂 sysfs 时隐藏该层级。
