@@ -107,11 +107,18 @@ def exact(sock, expected):
 print('READY', flush=True)
 connection = None
 connections = 0
+selected_ports = {}
 for line in sys.stdin:
     command, label = line.strip().split()
+    if command == 'PORT':
+        name, number = label.split(':')
+        selected_ports[name] = int(number)
+        print('PORT ' + label, flush=True)
+        continue
     if command == 'CONNECT':
         connections += 1
         port = 41084 if label == 'router' else 41085 if label == 'config' else 42000 + connections
+        port = selected_ports.get(label, port)
         sequence, acknowledgment = 100 if label == 'router' else 10000 if label == 'config' else connections * 20000, 0
         tcp(2)
         print(label + ': SYN sent', file=sys.stderr, flush=True)
@@ -285,55 +292,114 @@ async fn start_runtime(
     pins: &Path,
     artifacts: &Path,
     admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
 ) -> anyhow::Result<(Runtime, PacketEndpointOwner)> {
     let (polling_publication, process_polling) =
         plane.polling_runtime().expect("explicit XDP fixture");
-    let (
+    let shutdown = plane.shutdown_intent();
+    let prepared = prepare(&plane, config, pins, Arc::clone(&admission)).await?;
+    #[cfg(feature = "ebpf")]
+    let host = prepared.host;
+    let PreparedRuntime {
         devices,
         topology,
-        plans,
-        scopes,
+        realms: plans,
+        scope_pairs: scopes,
+        workers,
+        inboxes,
         core,
+        #[cfg(feature = "ebpf")]
+        native,
+        #[cfg(feature = "ebpf")]
+        native_policy,
+        #[cfg(feature = "ebpf")]
+        captured,
+        #[cfg(feature = "ebpf")]
+        originals,
+        #[cfg(feature = "ebpf")]
+        original_memory,
         memory,
         staging,
         mut links,
         polling_prefix,
         polling_budget,
         diagnostics,
-    ) = prepare(&plane, config, pins).await?;
+        ..
+    } = prepared;
     plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) =
-        PacketEndpoints::start_driven(plane, scopes, 64, None)?;
-    let realms = plans
-        .into_iter()
-        .map(|(ingress, device, link, scope)| {
-            let index = drivers
+        PacketEndpoints::start_driven(plane, scopes, 64, None, ScopeId::HOST).await?;
+    let mut realms = Vec::with_capacity(plans.len());
+    let mut remote_realms = Vec::with_capacity(plans.len());
+    for (ingress, device, link, scope) in plans {
+        for worker_index in 0..usize::from(workers.workers) {
+            let Some(index) = drivers
                 .iter()
-                .position(|driver| driver.scope() == scope)
-                .unwrap();
-            Realm {
+                .position(|driver| driver.scope() == scope && driver.worker() == worker_index)
+            else {
+                continue;
+            };
+            let realm = Realm {
                 ingress,
                 device,
                 link,
                 generated: generated_layout(link),
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
+            };
+            if worker_index == 0 {
+                realms.push(realm);
+            } else {
+                remote_realms.push(realm);
             }
-        })
-        .collect();
+        }
+    }
+    #[cfg(feature = "ebpf")]
+    let host = host.map(|host| host.start(&mut drivers));
     assert!(drivers.is_empty());
+    let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
         devices,
         topology,
+        #[cfg(feature = "ebpf")]
+        host,
         admission,
+        pname_support,
         realms,
+        workers,
+        worker: None,
+        inbox,
         endpoints,
         core,
+        #[cfg(feature = "ebpf")]
+        native,
+        #[cfg(feature = "ebpf")]
+        native_policy,
+        #[cfg(feature = "ebpf")]
+        native_writer: None,
+        #[cfg(feature = "ebpf")]
+        native_capture_close: NativeCaptureClose::Unproven,
+        #[cfg(feature = "ebpf")]
+        native_next: Instant::now() + Duration::from_secs(1),
+        #[cfg(feature = "ebpf")]
+        next_candidate: 1,
+        #[cfg(feature = "ebpf")]
+        captured,
+        #[cfg(feature = "ebpf")]
+        originals,
+        #[cfg(feature = "ebpf")]
+        original_outcome: None,
+        #[cfg(feature = "ebpf")]
+        remote_originals: VecDeque::with_capacity(64),
+        #[cfg(feature = "ebpf")]
+        original_worker: false,
+        #[cfg(feature = "ebpf")]
+        _original_memory: original_memory,
         waiting: VecDeque::with_capacity(PENDING),
         pending: VecDeque::with_capacity(PENDING),
-        peers: Vec::with_capacity(PEERS),
         staging,
         closing: false,
+        finished: false,
         pressure: Pressure::new(Instant::now()),
         diagnostics,
         core_maintenance_checked: Instant::now(),
@@ -351,13 +417,31 @@ async fn start_runtime(
         policy_recheck: false,
         context_recheck: false,
         context_revision: 0,
-        _memory: memory,
+        _memory: Some(memory),
     };
+    if runtime.workers.workers == 2 {
+        runtime.worker = Some(worker::Worker::start(
+            Arc::clone(&runtime.workers),
+            &mut runtime.devices,
+            remote_realms,
+            runtime.endpoints.clone(),
+            remote_inbox,
+            runtime.core.is_some(),
+            runtime.polling.participant(),
+            Arc::clone(&runtime.polling_budget),
+            shutdown,
+        )?);
+    }
+    runtime.workers.ready(0);
+    let readiness = Arc::clone(&runtime.workers);
     let timer = None;
     tokio::pin!(timer);
     loop {
         tokio::select! {
-            ready = poll_fn(|cx| owner.poll_ready(cx)) => { ready?; break; }
+            ready = async {
+                poll_fn(|cx| owner.poll_ready(cx)).await?;
+                poll_fn(|cx| readiness.all_ready(cx)).await
+            } => { ready?; break; }
             () = poll_fn(|cx| runtime.poll_scopes(cx, timer.as_mut())) => tokio::task::yield_now().await,
         }
     }
@@ -381,7 +465,7 @@ async fn start_runtime(
         .map(|realm| realm.ingress.ifindex)
         .collect();
     let topology =
-        Topology::admit_after_xdp_attach(&indices, &logical, config.global.effective_so_mark())?;
+        runtime.admit_final_topology(&indices, &logical, config.global.effective_so_mark())?;
     ensure!(topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts());
     // SAFETY: this is the same owned, stable Topology descriptor used by production run.
     runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
@@ -417,6 +501,10 @@ async fn start_runtime(
     }
     ensure!(!runtime.topology.get_mut().check_changed()?);
     runtime.rebuild_polling_context();
+    #[cfg(feature = "ebpf")]
+    if let Some(host) = &mut runtime.host {
+        host.admit(&runtime.pname_support)?;
+    }
     runtime.admission.store(true, Ordering::Release);
     runtime.endpoints.capture_ready()?;
     Ok((runtime, owner))
@@ -524,6 +612,17 @@ where
 #[tokio::test]
 #[ignore = "requires the daemon smoke's private disposable-VM namespace and real AF_XDP"]
 async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> anyhow::Result<()> {
+    publication_owned_case(1).await
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's private disposable-VM namespace, two physical RX queues and two allowed CPUs"]
+async fn two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned() -> anyhow::Result<()>
+{
+    publication_owned_case(2).await
+}
+
+async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
     let pins = guarded_pin_root();
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
     let mut peer = Peer::spawn()?;
@@ -535,6 +634,7 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
              datapath { backend: xdp\n direct: core\n xsk_mode: copy\n interface { dut0: lan\n dut1: wan } }\n\
              routing { dport(18084) -> packet-proof\n fallback: direct }",
         )?;
+        config.datapath.as_mut().unwrap().workers = Some(workers);
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
         config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
@@ -551,9 +651,12 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
         let resolver = crate::dns::DnsResolver::new(&config.dns)?;
         let forwarder = resolver.forwarder();
         let admission = Arc::new(AtomicBool::new(false));
+        let pname_support = Arc::new(parking_lot::RwLock::new(crate::ebpf::PnameSupport::Unavailable));
         let mut plane = ControlPlane::new(
             config.clone(),
-            Box::new(crate::ebpf::userspace::UserspaceBackend::new(Arc::clone(&admission))),
+            Box::new(crate::ebpf::userspace::UserspaceBackend::new(
+                Arc::clone(&admission), Arc::clone(&pname_support),
+            )),
             crate::routing::Router::from_config(&config.routing)?,
             Arc::new(honk_outbound::proxy::ProxyRegistry::default_resolver()?),
             resolver,
@@ -565,7 +668,19 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
         let publication = plane.config_handle();
         let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_intent();
-        let (mut runtime, mut owner) = start_runtime(plane, &config, &pins, &artifacts, admission).await?;
+        let (mut runtime, mut owner) = start_runtime(plane, &config, &pins, &artifacts, admission, pname_support).await?;
+        let mut selected_ports = [41084u16, 41085];
+        if workers == 2 {
+            let scope = runtime.realms.iter().find(|realm| realm.link.path.physical_ifindex == runtime.devices[0].info.ifindex).unwrap().driver.scope();
+            let realm = runtime.workers.placement(scope)?.realm;
+            for (worker, selected) in selected_ports.iter_mut().enumerate() {
+                *selected = (41084..60000).find(|port| realm.worker_for_tcp(
+                    format!("192.0.2.99:{port}").parse().unwrap(), "198.51.100.2:18084".parse().unwrap()) == worker).unwrap();
+                let request = format!("{}:{}", ["router", "config"][worker], selected);
+                peer.command("PORT", &request).await?;
+                peer.expect(&format!("PORT {request}")).await?;
+            }
+        }
         let authority = runtime.core.as_ref().unwrap().authority();
         let acquire = || authority.read_policy();
         let reader = None;
@@ -582,7 +697,7 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
         for label in ["router", "config"] {
             peer.command("CONNECT", label).await?;
             drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("CONNECTED {label}")), false).await?;
-            let client = format!("192.0.2.99:{}", if label == "router" { 41084 } else { 41085 }).parse().unwrap();
+            let client = format!("192.0.2.99:{}", selected_ports[usize::from(label == "config")]).parse().unwrap();
             let destination = "198.51.100.2:18084".parse().unwrap();
             assert!(runtime.realms.iter().any(|realm| runtime.endpoints.retains(realm.driver.scope(), client, destination, 6)), "real captured TCP belongs to Endpoint, not native/Core forwarding");
             let router_writer = if label == "router" { Some(router.write().await) } else { None };
@@ -625,21 +740,11 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
         ).await??;
         result?;
         drain_transmit(
-            || {
-                let mut pending = false;
-                for device in &mut runtime.devices {
-                    for queue in &mut device.queues {
-                        let port = queue.io.get_mut();
-                        port.complete(release_completed)?;
-                        port.kick()?;
-                        pending |= port.counters().submitted != port.counters().completed;
-                    }
-                }
-                Ok(pending)
-            },
+            || runtime.complete_transmit(),
             Instant::now(),
             &mut warned,
         ).await?;
+        if let Some(worker) = &mut runtime.worker { worker.join().await?; }
         for device in &mut runtime.devices {
             assert_eq!(honk_xsk::xdp_state(device.info.ifindex)?.prog_id, device.programs.discover_prog_id());
             for queue in device.queues.drain(..) {
@@ -649,7 +754,12 @@ async fn policy_publication_keeps_real_endpoint_app_timer_and_close_owned() -> a
                 port.close_socket();
             }
         }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = runtime.host.take() {
+            host.finish()?;
+        }
         backend.write().await.cleanup().await?;
+        runtime.finished = true;
         println!("real AF_XDP Endpoint app bytes, identical timer retransmission, close and Core publication recovery: router/config PASS");
         Ok::<(), anyhow::Error>(())
     }).await;

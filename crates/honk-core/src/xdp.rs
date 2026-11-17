@@ -1,8 +1,17 @@
 //! One Linux capture owner for every selected RX queue and one routing domain.
-//! Pinned links remain fail-closed after shutdown; UMEM is retained until process exit.
+//! Retained attachments and program pins guard selected traffic after shutdown; UMEM stays until exit.
 
+#[cfg(feature = "ebpf")]
+pub(crate) mod host;
+#[cfg(feature = "ebpf")]
+mod host_runtime;
+#[cfg(feature = "ebpf")]
+mod native;
 pub(crate) mod polling;
+pub(crate) mod worker;
 use crate::control::poll_budget::BusyInterval;
+#[cfg(feature = "ebpf")]
+use host_runtime::{HostRuntime, PreparedHost};
 use polling::runtime::polling_segment_stop;
 use polling::{AdaptivePoll, ContextDigest};
 
@@ -13,7 +22,8 @@ use crate::control::{
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{
-        CAPTURE_MEMORY, OutputLease, OutputOwner, PacketDriver, PacketScope, capture_scope,
+        CAPTURE_MEMORY, OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope,
+        capture_realm, capture_scope,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -31,7 +41,7 @@ use honk_datapath::{
         ForwardLease, ForwardPacket, Ingress, LinkPath, MarkProvenance, Packet, Prepared, Route,
     },
 };
-use honk_ebpf_common::xdp::CaptureAuthority;
+use honk_ebpf_common::xdp::{CaptureAuthority, METADATA_LEN};
 use honk_netstack::{
     MemoryBudget, MemoryReservation,
     wire::{self, PacketView},
@@ -92,6 +102,18 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
     };
     datapath.validate()?;
     ensure!(
+        datapath.direct != Some(DirectProfile::Native) || config.global.data_dir.len() <= 1024,
+        "XDP Native requested global.data_dir exceeds the 1024-byte publication path bound"
+    );
+    ensure!(
+        datapath.host.is_none() || cfg!(feature = "ebpf"),
+        "XDP Host capture requires the built ebpf feature and actual Host runtime admission"
+    );
+    ensure!(
+        datapath.direct != Some(DirectProfile::Native) || cfg!(feature = "ebpf"),
+        "XDP Native requires the built ebpf feature and actual canonical kernel publication"
+    );
+    ensure!(
         !config.global.nfqueue_enable,
         "XDP requires global.nfqueue_enable: false; NFQUEUE is not an XDP fallback"
     );
@@ -100,17 +122,30 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
         "XDP interfaces and trusted LAN/WAN roles belong only in datapath.interface"
     );
     ensure!(
-        config.routing.default_mark == 0 && config.routing.rules.iter().all(|rule| rule.mark == 0),
-        "XDP cannot preserve nonzero rule marks or native skb classification"
+        if datapath.direct == Some(DirectProfile::Native) && !datapath.interfaces.is_empty() {
+            config.routing.default_mark.is_none()
+                && config.routing.rules.iter().all(|rule| rule.mark.is_none())
+        } else if datapath.direct == Some(DirectProfile::Native) && datapath.host.is_some() {
+            true
+        } else {
+            config.routing.default_mark.unwrap_or(0) == 0
+                && config
+                    .routing
+                    .rules
+                    .iter()
+                    .all(|rule| rule.mark.unwrap_or(0) == 0)
+        },
+        "XDP cannot execute traffic mark effects; physical Native requires Keep"
     );
     for rule in &config.routing.rules {
         let condition = &rule.condition;
         ensure!(
-            condition.process_name.is_empty()
-                && condition.not.process_name.is_empty()
-                && condition.mac.is_empty()
-                && condition.not.mac.is_empty(),
-            "XDP Endpoint routing has no process/socket or per-flow MAC authority; predicate admission refused"
+            condition.mac.is_empty()
+                && condition.not.mac.is_empty()
+                && (datapath.host.is_some()
+                    || (condition.process_name.is_empty()
+                        && condition.not.process_name.is_empty())),
+            "XDP routing requires Host capture for process predicates and has no per-flow MAC authority"
         );
     }
     let security_conditions = datapath
@@ -135,7 +170,10 @@ pub(crate) fn validate_config(config: &Config) -> anyhow::Result<()> {
             "XDP firewall/NAT cannot bind process or original-datagram MAC facts across reassembly"
         );
     }
-    if datapath.direct == Some(DirectProfile::Core) {
+    if matches!(
+        datapath.direct,
+        Some(DirectProfile::Core | DirectProfile::Native)
+    ) {
         ensure!(
             config.global.dial_mode == "ip",
             "Core Direct requires dial_mode: ip; TCP termination is not a Core forwarding fallback"
@@ -148,9 +186,11 @@ enum Retained {
     Endpoint(OutputOwner),
     Forward {
         _owner: ForwardLease,
+        _peer: Option<worker::PeerHold>,
     },
     Error {
         _binding: Option<honk_datapath::firewall::BindingLease>,
+        _peer: Option<worker::PeerHold>,
     },
     Generated {
         _owner: GeneratedError,
@@ -168,37 +208,103 @@ fn release_completed(completed: &mut [Option<&mut Retained>]) {
     }
     OutputOwner::release_batch(&mut outputs[..count]);
 }
+enum QueueIo {
+    Prepared(Port<Retained>),
+    Registered(AsyncFd<Port<Retained>>),
+}
+
+impl QueueIo {
+    fn register(self) -> io::Result<Self> {
+        match self {
+            Self::Prepared(port) => {
+                // The socket is closed only after this registration is consumed.
+                unsafe { AsyncFd::register(port) }
+                    .map(Self::Registered)
+                    .map_err(io::Error::from)
+            }
+            registered => Ok(registered),
+        }
+    }
+    fn get_ref(&self) -> &Port<Retained> {
+        match self {
+            Self::Prepared(port) => port,
+            Self::Registered(io) => io.get_ref(),
+        }
+    }
+    fn get_mut(&mut self) -> &mut Port<Retained> {
+        match self {
+            Self::Prepared(port) => port,
+            Self::Registered(io) => io.get_mut(),
+        }
+    }
+    fn into_inner(self) -> Port<Retained> {
+        match self {
+            Self::Prepared(port) => port,
+            Self::Registered(io) => io.into_inner(),
+        }
+    }
+}
+
+impl std::ops::Deref for QueueIo {
+    type Target = AsyncFd<Port<Retained>>;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Registered(io) => io,
+            Self::Prepared(_) => panic!("Port not registered on owner runtime"),
+        }
+    }
+}
+
 struct Queue {
     id: u32,
-    io: AsyncFd<Port<Retained>>,
+    io: QueueIo,
     observed: PortCounters,
     observed_rings: RingSnapshot,
 }
 struct Device {
-    info: DeviceInfo,
+    info: Arc<DeviceInfo>,
     capture: GeneralCapture,
-    programs: Programs,
-    attachment: PersistentAttachment,
+    programs: Arc<Programs>,
+    attachment: Arc<PersistentAttachment>,
     queues: Vec<Queue>,
+    #[cfg(feature = "ebpf")]
+    native_target: Option<Arc<honk_xsk::NativeTarget>>,
+    #[cfg(feature = "ebpf")]
+    _native_gate: Option<Arc<honk_xsk::NativeTcxAttachment>>,
+    #[cfg(feature = "ebpf")]
+    _native_memory: Option<MemoryReservation>,
     active: bool,
     metadata_checked: Instant,
     features: Option<FeatureQuery>,
     port_config: PortConfig,
     role: honk_config::datapath::InterfaceRole,
 }
+
+impl Device {
+    #[cfg(feature = "ebpf")]
+    fn native_enabled(&self) -> bool {
+        self.native_target.is_some()
+    }
+}
+
 struct Waiting {
     packet: Packet,
     mac: [u8; 6],
     retry: Instant,
     scope: ScopeId,
     path: ReturnPath,
+    ingress_at: Instant,
+    cell: Option<worker::Cell>,
+    peer: Option<worker::PeerHold>,
 }
 struct Pending {
     output: ForwardPacket,
+    _cell: Option<worker::Cell>,
+    _peer: Option<worker::PeerHold>,
     generation: PolicyGeneration,
 }
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ReturnPath {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReturnPath {
     device: usize,
     mac: [u8; 6],
     vlan_tci: [u16; 2],
@@ -224,10 +330,12 @@ struct Peer {
     scope: ScopeId,
     address: IpAddr,
     path: ReturnPath,
+    #[cfg(test)]
     last_seen: Instant,
     conflict: Option<Instant>,
 }
 
+#[cfg(test)]
 #[derive(Default)]
 struct PeerPolicy {
     retained: bool,
@@ -251,30 +359,41 @@ struct PressureCounters {
     capture_rejected: u64,
 }
 
-fn diagnostics(devices: &[Device], budget: &Arc<MemoryBudget>) -> io::Result<Arc<Diagnostics>> {
+fn diagnostics(
+    devices: &[Device],
+    budget: &Arc<MemoryBudget>,
+    host: Option<QueueObservation>,
+) -> io::Result<Arc<Diagnostics>> {
     Diagnostics::new(
         budget,
-        devices.iter().map(|device| device.queues.len()).sum(),
-        devices.iter().flat_map(|device| {
-            device.queues.iter().map(|queue| QueueObservation {
-                namespace: device.capture.authority.namespace_cookie,
-                attachment: device.capture.authority.attachment_generation,
-                ifindex: device.info.ifindex,
-                queue: queue.id,
-                zero_copy: queue.io.get_ref().zerocopy(),
-                ring_capacity: device.port_config.ring_size,
-                rx_frames: device.port_config.rx_frames,
-                control_frames: device.port_config.control_frames,
-                bulk_frames: device.port_config.bulk_frames,
-                sequence: 0,
-                attempted_at: None,
-                succeeded_at: None,
-                socket: None,
-                errno: None,
-                read_errors: 0,
-                rings: None,
+        devices
+            .iter()
+            .map(|device| device.queues.len())
+            .sum::<usize>()
+            + usize::from(host.is_some()),
+        devices
+            .iter()
+            .flat_map(|device| {
+                device.queues.iter().map(|queue| QueueObservation {
+                    namespace: device.capture.authority.namespace_cookie,
+                    attachment: device.capture.authority.attachment_generation,
+                    ifindex: device.info.ifindex,
+                    queue: queue.id,
+                    zero_copy: queue.io.get_ref().zerocopy(),
+                    ring_capacity: device.port_config.ring_size,
+                    rx_frames: device.port_config.rx_frames,
+                    control_frames: device.port_config.control_frames,
+                    bulk_frames: device.port_config.bulk_frames,
+                    sequence: 0,
+                    attempted_at: None,
+                    succeeded_at: None,
+                    socket: None,
+                    errno: None,
+                    read_errors: 0,
+                    rings: None,
+                })
             })
-        }),
+            .chain(host),
     )
 }
 
@@ -289,9 +408,15 @@ fn sample_queues(devices: &[Device], diagnostics: &Diagnostics) {
             tracing::debug!(interface = %device.info.name, queue = queue.id,
                 socket = ?socket, rings = ?rings, counters = ?port.counters(),
                 "XDP queue pressure");
-            diagnostics.sample(index, at, socket, rings);
-            index += 1;
+            let queue_index = device
+                .info
+                .queues
+                .iter()
+                .position(|id| *id == queue.id)
+                .expect("original queue identity");
+            diagnostics.sample(index + queue_index, at, socket, rings);
         }
+        index += device.info.queues.len();
     }
 }
 
@@ -453,7 +578,11 @@ impl Realm {
         *emitted = true;
         let packet = &l3[..owner.len()];
         let (_, destination) = wire::packet_addresses(packet).map_err(io::Error::other)?;
-        let Some(path) = peer_return_path(peers, owner.scope(), destination) else {
+        let Some(path) = owner
+            .peer_hold()
+            .and_then(|hold| hold.path())
+            .or_else(|| peer_return_path(peers, owner.scope(), destination))
+        else {
             return Ok(None);
         };
         let header = self.output_header(path, physical_ifindex, packet[0] >> 4 == 6)?;
@@ -474,18 +603,65 @@ fn finish_transmit<T>(work: anyhow::Result<T>, kick: io::Result<()>) -> anyhow::
     }
 }
 
+fn fold_capture_result(failure: &mut Option<anyhow::Error>, result: anyhow::Result<()>) {
+    if let Err(error) = result {
+        *failure = Some(match failure.take() {
+            Some(previous) => previous.context(format!("capture close also failed: {error:#}")),
+            None => error,
+        });
+    }
+}
+
+#[cfg(feature = "ebpf")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeCaptureClose {
+    Unproven,
+    Proven,
+    Failed,
+}
+
 struct Runtime {
     devices: Vec<Device>,
     topology: AsyncFd<Topology>,
+    #[cfg(feature = "ebpf")]
+    host: Option<HostRuntime>,
     admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
     realms: Vec<Realm>,
+    workers: Arc<worker::Shared>,
+    worker: Option<worker::Worker>,
+    inbox: tokio::sync::mpsc::Receiver<worker::Envelope>,
     endpoints: PacketEndpoints,
     core: Option<RoutedCore>,
+    #[cfg(feature = "ebpf")]
+    native: Option<Arc<crate::ebpf::native::NativePublication>>,
+    #[cfg(feature = "ebpf")]
+    native_policy: Option<crate::control::core_forward::RoutingAuthority>,
+    #[cfg(feature = "ebpf")]
+    native_writer: Option<crate::ebpf::native::NativeWrite>,
+    #[cfg(feature = "ebpf")]
+    native_capture_close: NativeCaptureClose,
+    #[cfg(feature = "ebpf")]
+    native_next: Instant,
+    #[cfg(feature = "ebpf")]
+    next_candidate: u64,
+    #[cfg(feature = "ebpf")]
+    captured: Option<native::CapturedReturn>,
+    #[cfg(feature = "ebpf")]
+    originals: VecDeque<native::HeldOriginal>,
+    #[cfg(feature = "ebpf")]
+    original_outcome: Option<native::OriginalProof>,
+    #[cfg(feature = "ebpf")]
+    remote_originals: VecDeque<worker::native::RemoteOriginal>,
+    #[cfg(feature = "ebpf")]
+    original_worker: bool,
+    #[cfg(feature = "ebpf")]
+    _original_memory: Option<MemoryReservation>,
     waiting: VecDeque<Waiting>,
     pending: VecDeque<Pending>,
-    peers: Vec<Peer>,
     staging: Vec<u8>,
     closing: bool,
+    finished: bool,
     pressure: Pressure,
     diagnostics: Arc<Diagnostics>,
     core_maintenance_checked: Instant,
@@ -503,32 +679,135 @@ struct Runtime {
     policy_recheck: bool,
     context_recheck: bool,
     context_revision: u64,
-    _memory: MemoryReservation,
+    _memory: Option<MemoryReservation>,
 }
 
 impl Runtime {
+    fn admit_final_topology(
+        &self,
+        physical: &[u32],
+        logical: &[u32],
+        mark: u32,
+    ) -> io::Result<Topology> {
+        #[cfg(feature = "ebpf")]
+        if let Some(publication) = &self.native {
+            return publication.admit_topology(physical, logical, mark, &self.polling_budget);
+        }
+        Topology::admit_after_xdp_attach(physical, logical, mark)
+    }
+
+    fn sample_queues(&self) {
+        sample_queues(&self.devices, &self.diagnostics);
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &self.host {
+            let port = host.queue.io.get_ref();
+            let index = self
+                .devices
+                .iter()
+                .map(|device| device.info.queues.len())
+                .sum();
+            self.diagnostics
+                .sample(index, SystemTime::now(), port.stats(), port.rings());
+        }
+    }
+
+    fn ports_ready_for_backend_teardown(&mut self) -> bool {
+        let mut ready = true;
+        for queue in self
+            .devices
+            .iter_mut()
+            .flat_map(|device| &mut device.queues)
+        {
+            ready &= queue.io.get_mut().close().ready_for_backend_teardown();
+        }
+        ready
+    }
+
+    fn complete_transmit(&mut self) -> io::Result<bool> {
+        let queues = self
+            .devices
+            .iter_mut()
+            .flat_map(|device| &mut device.queues);
+        #[cfg(feature = "ebpf")]
+        let queues = queues.chain(self.host.iter_mut().map(|host| &mut host.queue));
+        let mut outstanding = false;
+        for queue in queues {
+            let port = queue.io.get_mut();
+            port.complete(release_completed)?;
+            port.kick()?;
+            outstanding |= port.counters().submitted != port.counters().completed;
+        }
+        Ok(outstanding)
+    }
+
     fn close_capture(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "ebpf")]
+        let eligible =
+            std::mem::replace(&mut self.native_capture_close, NativeCaptureClose::Failed)
+                != NativeCaptureClose::Failed;
         self.admission.store(false, Ordering::Release);
+        self.workers.close();
+        *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
         self.closing = true;
         self.diagnostics.lifecycle(Lifecycle::Closing);
         self.policy_recheck = false;
         self.context_recheck = false;
         self.polling.leave("closing");
-        let mut failure = None;
+        let mut failure: Option<anyhow::Error> = None;
+        #[cfg(feature = "ebpf")]
+        if let Some(publication) = &self.native {
+            fold_capture_result(
+                &mut failure,
+                publication.quiesce(crate::ebpf::native::NativeReason::Shutdown),
+            );
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(writer) = self.native_writer.take() {
+            writer.commit();
+        }
         for device in &mut self.devices {
-            if device.active {
-                match device.attachment.guard(&device.programs) {
-                    Ok(()) => device.active = false,
-                    Err(error) => {
-                        failure.get_or_insert(error);
+            let result = close_device_capture_with(
+                device,
+                |device| {
+                    if device_needs_guard(device) {
+                        device.attachment.guard(&device.programs)?;
+                        device.active = false;
                     }
-                }
-            }
-            for queue in &device.queues {
-                if let Err(error) = device.programs.delete_xsk(queue.id) {
-                    failure.get_or_insert(error);
-                }
-            }
+                    Ok(())
+                },
+                |device| {
+                    let mut failure: Option<io::Error> = None;
+                    for queue in &device.info.queues {
+                        if let Err(error) = device.programs.delete_xsk(*queue) {
+                            failure = Some(match failure {
+                                Some(previous) => {
+                                    let kind = previous.kind();
+                                    let message =
+                                        format!("{previous}; XSK withdrawal also failed: {error}");
+                                    io::Error::new(
+                                        kind,
+                                        anyhow::Error::new(previous).context(message),
+                                    )
+                                }
+                                None => error,
+                            });
+                        }
+                    }
+                    failure.map_or(Ok(()), Err)
+                },
+            );
+            fold_capture_result(&mut failure, result.map_err(Into::into));
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(captured) = &mut self.captured {
+            fold_capture_result(&mut failure, captured.seal());
+        } else if let Some(publication) = &self.native {
+            fold_capture_result(&mut failure, publication.original_grace());
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &mut self.host {
+            fold_capture_result(&mut failure, host.capture.close_capture());
+            host.pending = [None, None];
         }
         self.endpoints.close();
         self.waiting.clear();
@@ -536,7 +815,20 @@ impl Runtime {
         for realm in &mut self.realms {
             realm.pending = [None, None];
         }
-        failure.map_or(Ok(()), |error| Err(error.into()))
+        #[cfg(feature = "ebpf")]
+        if self.native.is_some() && !eligible {
+            fold_capture_result(
+                &mut failure,
+                Err(anyhow::anyhow!(
+                    "Native capture close remains failed-retained"
+                )),
+            );
+        }
+        #[cfg(feature = "ebpf")]
+        if eligible && failure.is_none() {
+            self.native_capture_close = NativeCaptureClose::Proven;
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     fn poll_io(
@@ -562,7 +854,15 @@ impl Runtime {
             }
         }
         let now = Instant::now();
-        let mut progress = 0;
+        #[cfg(feature = "ebpf")]
+        self.begin_native_turn(now)?;
+        #[cfg(feature = "ebpf")]
+        if let Some(writer) = &self.native_writer {
+            self.workers.barrier(writer.epoch());
+        }
+        #[cfg(feature = "ebpf")]
+        let observed_barrier = self.workers.drain_epoch();
+        let mut progress = self.poll_handoffs(cx, now)?;
         self.round_cut_short = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
         for realm in &mut self.realms {
@@ -603,6 +903,8 @@ impl Runtime {
                 } else {
                     device_index
                 };
+                #[cfg(feature = "ebpf")]
+                let native_enabled = device.native_enabled();
                 let queue = &mut device.queues[queue_index];
                 if !self.closing
                     && let Err(error) = arm_read(&queue.io, cx)
@@ -616,15 +918,33 @@ impl Runtime {
                         return Poll::Ready(Err(error.into()));
                     }
                 };
+                #[cfg(feature = "ebpf")]
+                if native_enabled {
+                    progress += usize::from(self.workers.native.service_port(
+                        &self.workers,
+                        device_index,
+                        queue.id,
+                        port,
+                    )?);
+                    progress += worker::native::receive_remote_originals(
+                        &self.workers,
+                        device_index,
+                        &device.capture,
+                        queue.id,
+                        port,
+                        now,
+                    )?;
+                    port.refill()?;
+                    port.kick()?;
+                    continue;
+                }
                 let mut backpressure = None;
                 let (received, kick) = port.transmit_batch(|port| {
-                    if self.closing {
-                        return Ok(0);
-                    }
+                    if self.closing { return Ok(0); }
                     let capture = &device.capture;
                     let core = &mut self.core;
                     let waiting = &mut self.waiting;
-                    let peers = &mut self.peers;
+                    let workers = &self.workers;
                     let staging = &mut self.staging;
                     let endpoints = &self.endpoints;
                     let pressure = &mut self.pressure.counters;
@@ -633,9 +953,13 @@ impl Runtime {
                     let qualification_unavailable = &mut self.qualification_unavailable;
                     let mut failure = None;
                     let ifindex = device.info.ifindex;
-                    let received = port.receive_segments_with(BATCH, capture.vlan_metadata, |segments, metadata, same_port| {
+                    let metadata_len = if capture.vlan_metadata { METADATA_LEN } else { 0 };
+                    let received = port.receive_segments_with(BATCH, metadata_len, |segments, metadata, same_port| {
                         if failure.is_some() { return; }
-                        let Ok(decoded) = capture.decode(segments, metadata, queue.id) else {
+                        let capture_metadata = if capture.vlan_metadata {
+                            &metadata[..METADATA_LEN.min(metadata.len())]
+                        } else { &[] };
+                        let Ok(decoded) = capture.decode(segments, capture_metadata, queue.id) else {
                             pressure.capture_rejected = pressure.capture_rejected.saturating_add(1);
                             return;
                         };
@@ -651,12 +975,12 @@ impl Runtime {
                         let Ok(view) = PacketView::new(&l3[..count]) else { return; };
                         if let Some(core) = core && !retained_endpoint(endpoints, scope, view) {
                             let mac = mac_text(decoded.source_mac);
-                            let cached = core.forward_cached(ingress, view, Some(std::str::from_utf8(&mac).unwrap()), now, |route, output| {
+                            let cached = if queue.id != 0 { Ok(CachedDecision::Cold) } else { core.forward_cached(ingress, view, Some(std::str::from_utf8(&mac).unwrap()), now, |route, output| {
                                 let header = route.ethernet_header(decoded.ether_type == 0x86dd).map_err(io::Error::other)?;
                                 if !selected_egress(realms, route) { return Ok(None); }
                                 if route.l2.physical_ifindex == ifindex {
                                     while let Some(length) = output.next_len() {
-                                        same_port.transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease() }, |_, target| {
+                                        same_port.transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease(), _peer: None }, |_, target| {
                                             output.write_next_segments(target, &header).map(|_| ()).ok_or_else(|| io::Error::other("Core SG materialization refused"))
                                         })?;
                                     }
@@ -665,7 +989,7 @@ impl Runtime {
                                         .ok_or_else(|| io::Error::new(io::ErrorKind::Unsupported, "Core egress is not a selected XDP interface"))?;
                                     let (work, kick) = egress.queues[0].io.get_mut().transmit_batch(|port| -> io::Result<()> {
                                         while let Some(length) = output.next_len() {
-                                            port.transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease() }, |_, target| {
+                                            port.transmit_with(TxClass::Bulk, header.len() + length, Retained::Forward { _owner: output.lease(), _peer: None }, |_, target| {
                                                 output.write_next_segments(target, &header).map(|_| ()).ok_or_else(|| io::Error::other("Core SG materialization refused"))
                                             })?;
                                         }
@@ -678,7 +1002,7 @@ impl Runtime {
                                     work?;
                                 }
                                 Ok(Some(()))
-                            });
+                            }) };
                             if failure.is_some() { return; }
                             match cached {
                                 Ok(CachedDecision::Forwarded(())) => { qualify_packet(qualified_rx, qualification_unavailable); return; }
@@ -689,10 +1013,23 @@ impl Runtime {
                                         pressure.refused = true;
                                         return;
                                     }
-                                    match core.receive_segments(ingress, now, &l3[..count]) {
-                                        Ok(Some(packet)) => waiting.push_back(Waiting { packet, mac: decoded.source_mac, retry: now, scope, path }),
+                                    let peer = if matches!(view.parse_ip(), Err(wire::ParseError::Fragment)) {
+                                        if decoded.l3_len > staging.len() || view.copy_to(0..decoded.l3_len,
+                                            &mut staging[..decoded.l3_len]).is_none() { return; }
+                                        match workers.fragment_peer(scope, &staging[..decoded.l3_len], path) {
+                                            Ok(peer) => peer,
+                                            Err(_) => return,
+                                        }
+                                    } else { None };
+                                    match core.receive_segments_with_peer_at(ingress, now, now, &l3[..count], peer.clone()) {
+                                        Ok(Some((packet, peer))) => {
+                                            let ingress_at = packet.received_at();
+                                            let path = peer.as_ref().map(worker::PeerHold::original_path).unwrap_or(path);
+                                            waiting.push_back(Waiting { packet, mac: path.mac, retry: now, scope, path, ingress_at, cell: None, peer });
+                                        }
                                         Ok(None) => {}
-                                        Err(_) => pressure.core_ingress_refused = pressure.core_ingress_refused.saturating_add(1),
+                                        Err(error) if error.downcast_ref::<honk_datapath::forward::ForwardError>().is_some() => pressure.core_ingress_refused = pressure.core_ingress_refused.saturating_add(1),
+                                        Err(error) => failure = Some(error),
                                     }
                                     return;
                                 }
@@ -710,7 +1047,21 @@ impl Runtime {
                             if view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return; }
                             &staging[..decoded.l3_len]
                         };
-                        match receive_endpoint(endpoints, peers, pressure, scope, bytes, now, path, None) {
+                        let result = (|| { if workers.owner(scope, bytes)?.worker() == 0 {
+                            workers.endpoint(0, endpoints, scope, bytes, now, path, None, None)
+                        } else {
+                            workers.copy(segments, metadata).and_then(|cell| {
+                                let owner = workers.owner(scope, bytes)?;
+                                workers.send(1, worker::Envelope { device: device_index, queue: queue.id,
+                                    ingress, scope, path, ingress_at: now, cell,
+                                    body: None, peer: None,
+                                    l3_offset: decoded.l3_offset, l3_length: decoded.l3_len,
+                                    payload: worker::Payload::Endpoint { owner, admission: None } })
+                                    .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+                                Ok(PacketReceive::default())
+                            })
+                        } })();
+                        match result {
                             Ok(report) if report.qualified_rx => qualify_packet(qualified_rx, qualification_unavailable),
                             Ok(_) => {}
                             Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) => {}
@@ -733,6 +1084,23 @@ impl Runtime {
             }
             self.rx_device = (device_index + 1) % (before.len() + 1 + after.len());
             self.rx_queue = 0;
+        }
+        #[cfg(feature = "ebpf")]
+        {
+            progress += self.service_all_native_originals(cx, now)?;
+        }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &mut self.host {
+            progress += host.poll_io(
+                cx,
+                now,
+                self.closing,
+                &self.endpoints,
+                &mut self.staging,
+                &mut self.pressure.counters,
+                &mut self.qualified_rx,
+                &mut self.qualification_unavailable,
+            )?;
         }
         for realm in &mut self.realms {
             if realm.generated.is_none() && realm.driver.service(cx, now) {
@@ -804,7 +1172,7 @@ impl Runtime {
                                             now,
                                             class,
                                             ifindex,
-                                            &self.peers,
+                                            &[],
                                             frame,
                                             &mut emitted,
                                         )
@@ -831,8 +1199,8 @@ impl Runtime {
                         let mut blocked = false;
                         for output in &mut outputs[..count] {
                             let output = output.take().expect("selected Endpoint output");
-                            let Some(path) =
-                                pending_path.or_else(|| endpoint_return_path(&self.peers, &output))
+                            let Some(path) = pending_path
+                                .or_else(|| output.peer_hold().and_then(|hold| hold.path()))
                             else {
                                 serviced += 1;
                                 continue;
@@ -892,6 +1260,8 @@ impl Runtime {
                 realm.driver.finish_turn(cx, now);
             }
         }
+        #[cfg(feature = "ebpf")]
+        self.finish_native_turn(now, observed_barrier)?;
         if progress == 0 {
             Poll::Pending
         } else {
@@ -905,6 +1275,10 @@ impl Runtime {
         for realm in &mut self.realms {
             more |= realm.driver.service(cx, now);
         }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &mut self.host {
+            more |= host.driver.service(cx, now);
+        }
         more
     }
 
@@ -917,12 +1291,22 @@ impl Runtime {
     ) -> Poll<()> {
         let now = Instant::now();
         let more = self.service_scopes(cx, now);
+        let deadline = self.scope_deadline();
+        poll_deadline(timer, if more { Some(now) } else { deadline }, now, cx)
+    }
+
+    fn scope_deadline(&self) -> Option<Instant> {
         let deadline = self
             .realms
             .iter()
             .filter_map(|realm| realm.driver.deadline())
             .min();
-        poll_deadline(timer, if more { Some(now) } else { deadline }, now, cx)
+        #[cfg(feature = "ebpf")]
+        let deadline = deadline
+            .into_iter()
+            .chain(self.host.as_ref().and_then(|host| host.driver.deadline()))
+            .min();
+        deadline
     }
 
     /// `core` false while a publication-reader acquisition is already pending: its
@@ -948,9 +1332,36 @@ impl Runtime {
                 include(device.metadata_checked + Duration::from_secs(1));
             }
         }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &self.host {
+            let port = host.queue.io.get_ref();
+            if if self.closing {
+                port.counters().submitted != port.counters().completed
+            } else {
+                port.needs_service_retry()
+            } {
+                include(now + Duration::from_millis(1));
+            }
+            if !self.closing {
+                include(host.metadata_checked + Duration::from_secs(1));
+            }
+            if let Some(due) = host.driver.deadline() {
+                include(due);
+            }
+        }
         for realm in &self.realms {
             if let Some(due) = realm.driver.deadline() {
                 include(due);
+            }
+        }
+        #[cfg(feature = "ebpf")]
+        if self.native.is_some() && !self.closing {
+            if let Some(writer) = &self.native_writer {
+                if self.workers.both_drained(writer.epoch()) {
+                    include(now);
+                }
+            } else {
+                include(self.native_next);
             }
         }
         if self.closing {
@@ -1038,15 +1449,15 @@ impl Runtime {
                 PacketView::from_slice(work.packet.as_ref()),
             ) {
                 if let Err(error) = qualify_receive(
-                    receive_endpoint(
+                    self.workers.endpoint_packet(
                         &self.endpoints,
-                        &mut self.peers,
-                        &mut self.pressure.counters,
                         work.scope,
-                        work.packet.as_ref(),
-                        now,
+                        work.packet,
+                        work.ingress_at,
                         work.path,
                         None,
+                        work.cell,
+                        work.peer,
                     ),
                     &mut self.qualified_rx,
                     &mut self.qualification_unavailable,
@@ -1073,19 +1484,22 @@ impl Runtime {
                     mac: work.mac,
                     scope: work.scope,
                     path: work.path,
+                    ingress_at: work.ingress_at,
+                    cell: work.cell,
+                    peer: work.peer,
                 }),
                 Decision::Drop | Decision::LocalInput => {}
                 Decision::Endpoint(packet, admission) => {
                     if let Err(error) = qualify_receive(
-                        receive_endpoint(
+                        self.workers.endpoint_packet(
                             &self.endpoints,
-                            &mut self.peers,
-                            &mut self.pressure.counters,
                             work.scope,
-                            packet.as_ref(),
-                            now,
+                            packet,
+                            work.ingress_at,
                             work.path,
                             Some(admission),
+                            work.cell,
+                            work.peer,
                         ),
                         &mut self.qualified_rx,
                         &mut self.qualification_unavailable,
@@ -1098,7 +1512,12 @@ impl Runtime {
                 }
                 Decision::Forward(Prepared::Forward(output), generation) => {
                     if self.pending.len() < PENDING {
-                        self.pending.push_back(Pending { output, generation });
+                        self.pending.push_back(Pending {
+                            output,
+                            generation,
+                            _cell: work.cell,
+                            _peer: work.peer,
+                        });
                     } else {
                         self.pressure.counters.pending_full =
                             self.pressure.counters.pending_full.saturating_add(1);
@@ -1121,7 +1540,15 @@ impl Runtime {
                         && let Some(length) =
                             core.error(now, &packet, error, route, &mut self.staging)?
                     {
-                        let header = route.ethernet_header(packet.ip().src.is_ipv6())?;
+                        let header = match work.peer.as_ref().and_then(|peer| peer.path()) {
+                            Some(path) => return_header(
+                                path,
+                                route.source_mac,
+                                route.l2.physical_ifindex,
+                                packet.ip().src.is_ipv6(),
+                            )?,
+                            None => route.ethernet_header(packet.ip().src.is_ipv6())?,
+                        };
                         core.submit(read, route, generation, || {
                             current_topology(&mut self.topology)?;
                             if !packet.is_current(Instant::now()) {
@@ -1135,6 +1562,7 @@ impl Runtime {
                                     &[&header, &self.staging[..length]],
                                     Retained::Error {
                                         _binding: packet.into_binding(),
+                                        _peer: work.peer,
                                     },
                                 )
                                 .map(Some)
@@ -1194,7 +1622,10 @@ impl Runtime {
                 port.transmit_with(
                     TxClass::Bulk,
                     header.len() + length,
-                    Retained::Forward { _owner: lease },
+                    Retained::Forward {
+                        _owner: lease,
+                        _peer: work._peer.clone(),
+                    },
                     |_, target| {
                         work.output
                             .write_next_segments(target, &header)
@@ -1215,12 +1646,21 @@ impl Runtime {
         if let Some(error) = core.poll_reassembly_error(read, now, &mut self.staging)? {
             let route = error.route;
             if selected_egress(&self.realms, route)
+                && error.peer_hold().is_none_or(|peer| peer.learned())
                 && let Some(device) = self
                     .devices
                     .iter_mut()
                     .find(|device| device.info.ifindex == route.l2.physical_ifindex)
             {
-                let header = route.ethernet_header(self.staging[0] >> 4 == 6)?;
+                let header = match error.peer_hold().and_then(|peer| peer.path()) {
+                    Some(path) => return_header(
+                        path,
+                        route.source_mac,
+                        route.l2.physical_ifindex,
+                        self.staging[0] >> 4 == 6,
+                    )?,
+                    None => route.ethernet_header(self.staging[0] >> 4 == 6)?,
+                };
                 let port = device.queues[0].io.get_mut();
                 if port.tx_packet_credit(TxClass::Control, header.len() + error.len) {
                     core.submit(read, route, error.generation, || {
@@ -1242,16 +1682,87 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         self.admission.store(false, Ordering::Release);
+        self.workers.close();
+        *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
         self.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        #[cfg(feature = "ebpf")]
+        if let Some(publication) = &self.native
+            && let Err(error) = publication.quiesce(crate::ebpf::native::NativeReason::OwnerDrop)
+        {
+            tracing::error!(%error, "Native owner could not join publication readers before capture guards");
+        }
         for device in &self.devices {
-            if device.active
+            if device_needs_guard(device)
                 && let Err(error) = device.attachment.guard(&device.programs)
             {
                 tracing::error!(%error, "XDP pinned capture guard failed; socket-map misses remain drop");
             }
         }
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &mut self.host
+            && let Err(error) = host.capture.close_capture()
+        {
+            tracing::error!(%error, "Host capture fence failed; retaining fail-closed source custody");
+        }
         self.endpoints.close();
+        #[cfg(feature = "ebpf")]
+        self.retain_native_drop();
+        if std::thread::panicking() {
+            std::mem::forget((
+                std::mem::take(&mut self.devices),
+                std::mem::take(&mut self.realms),
+                std::mem::take(&mut self.waiting),
+                std::mem::take(&mut self.pending),
+                self.worker.take(),
+                self._memory.take(),
+                self.endpoints.clone(),
+                Arc::clone(&self.workers),
+            ));
+            #[cfg(feature = "ebpf")]
+            std::mem::forget(self.host.take());
+        }
+    }
+}
+
+fn device_needs_guard(device: &Device) -> bool {
+    #[cfg(feature = "ebpf")]
+    return needs_guard(device.native_target.is_some(), device.active);
+    #[cfg(not(feature = "ebpf"))]
+    needs_guard(false, device.active)
+}
+
+fn needs_guard(has_native_target: bool, active: bool) -> bool {
+    #[cfg(feature = "ebpf")]
+    if has_native_target {
+        return true;
+    }
+    #[cfg(not(feature = "ebpf"))]
+    let _ = has_native_target;
+    active
+}
+
+fn close_device_capture_with<T>(
+    device: &mut T,
+    guard: impl FnOnce(&mut T) -> io::Result<()>,
+    withdraw: impl FnOnce(&mut T) -> io::Result<()>,
+) -> io::Result<()> {
+    let guarded = guard(device);
+    let withdrawn = withdraw(device);
+    match (guarded, withdrawn) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(guard), Err(withdraw)) => {
+            let kind = guard.kind();
+            let message = format!("{guard}; XSK withdrawal also failed: {withdraw}");
+            Err(io::Error::new(
+                kind,
+                anyhow::Error::new(guard).context(message),
+            ))
+        }
     }
 }
 
@@ -1260,8 +1771,15 @@ fn l3_segments<'a>(
     packet: DecodedPacket,
     output: &mut [&'a [u8]; 18],
 ) -> Option<usize> {
-    let mut skip = packet.l3_offset;
-    let mut left = packet.l3_len;
+    l3_segments_at(segments, packet.l3_offset, packet.l3_len, output)
+}
+
+fn l3_segments_at<'a>(
+    segments: &[&'a [u8]],
+    mut skip: usize,
+    mut left: usize,
+    output: &mut [&'a [u8]; 18],
+) -> Option<usize> {
     let mut count = 0;
     for segment in segments {
         if skip >= segment.len() {
@@ -1282,6 +1800,7 @@ fn l3_segments<'a>(
     }
     None
 }
+#[cfg(test)]
 fn peer_policy(
     peers: &[Peer],
     endpoints: &PacketEndpoints,
@@ -1323,6 +1842,7 @@ fn peer_policy(
     }
 }
 
+#[cfg(test)]
 fn remember_peer(
     peers: &mut Vec<Peer>,
     scope: ScopeId,
@@ -1406,6 +1926,7 @@ fn remember_peer(
     true
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn receive_endpoint(
     endpoints: &PacketEndpoints,
@@ -1480,7 +2001,7 @@ fn retained_endpoint(endpoints: &PacketEndpoints, scope: ScopeId, view: PacketVi
     {
         return false;
     }
-    endpoints.retains(
+    endpoints.retained_transport(
         scope,
         std::net::SocketAddr::new(ip.src, u16::from_be_bytes([ports[0], ports[1]])),
         std::net::SocketAddr::new(ip.dst, u16::from_be_bytes([ports[2], ports[3]])),
@@ -1533,6 +2054,7 @@ fn retained_icmp(
         )
 }
 
+#[cfg(test)]
 fn endpoint_return_path(peers: &[Peer], output: &OutputLease) -> Option<ReturnPath> {
     let (_, destination) = wire::packet_addresses(output.packet()).ok()?;
     peer_return_path(peers, output.scope(), destination)
@@ -1722,9 +2244,9 @@ where
         runtime.core.as_ref(),
         runtime.waiting.len(),
         runtime.pending.len(),
-        runtime.peers.len(),
+        runtime.workers.peer_count(),
     ) {
-        sample_queues(&runtime.devices, &runtime.diagnostics);
+        runtime.sample_queues();
     }
     if reader.is_none() && runtime.core.is_some() && runtime.core_due(Instant::now()) {
         reader.set(acquire());
@@ -1795,7 +2317,19 @@ pub(crate) async fn run(
     plane: ControlPlane,
     pin_root: &Path,
     admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
+    worker::run_coordinator(plane, pin_root, admission, pname_support).await
+}
+
+async fn run_capture(
+    plane: ControlPlane,
+    pin_root: &Path,
+    admission: Arc<AtomicBool>,
+    pname_support: crate::ebpf::PnameSupportCell,
+    shared_runtime: tokio::runtime::Handle,
+) -> (Option<ControlPlane>, anyhow::Result<()>) {
+    *pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
     let config = plane.config_handle().read().await.as_ref().clone();
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
@@ -1804,62 +2338,146 @@ pub(crate) async fn run(
         .expect("validated XDP polling consumer");
     let notification = polling_publication.notification();
     tokio::pin!(notification);
-    let prepared = prepare(&plane, &config, pin_root).await;
-    let (
+    let prepared = match prepare(&plane, &config, pin_root, Arc::clone(&admission)).await {
+        Ok(prepared) => prepared,
+        Err(error) => return (Some(plane), Err(error)),
+    };
+    #[cfg(feature = "ebpf")]
+    let host = prepared.host;
+    let PreparedRuntime {
         devices,
         topology,
         realms,
         scope_pairs,
+        workers,
+        inboxes,
         core,
+        #[cfg(feature = "ebpf")]
+        native,
+        #[cfg(feature = "ebpf")]
+        native_policy,
+        #[cfg(feature = "ebpf")]
+        captured,
+        #[cfg(feature = "ebpf")]
+        originals,
+        #[cfg(feature = "ebpf")]
+        original_memory,
         memory,
         staging,
-        mut link_proof,
+        links: mut link_proof,
         polling_prefix,
         polling_budget,
         diagnostics,
-    ) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => return (Some(plane), Err(error)),
-    };
+        ..
+    } = prepared;
     plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
-    let (endpoints, mut owner, mut drivers) =
-        match PacketEndpoints::start_driven(plane, scope_pairs, 64, None) {
-            Ok(started) => started,
-            Err(error) => {
-                diagnostics.lifecycle(Lifecycle::FailedRetained);
-                return (None, Err(error));
+    let (endpoints, mut owner, mut drivers) = match shared_runtime
+        .spawn(PacketEndpoints::start_driven(
+            plane,
+            scope_pairs,
+            64,
+            None,
+            ScopeId::HOST,
+        ))
+        .await
+    {
+        Ok(Ok(started)) => started,
+        result => {
+            let error = match result {
+                Ok(Err(error)) => error,
+                Err(error) => error.into(),
+                Ok(Ok(_)) => unreachable!(),
+            };
+            diagnostics.lifecycle(Lifecycle::FailedRetained);
+            #[cfg(feature = "ebpf")]
+            if let Some(host) = host
+                && let Err(close) = host.finish()
+            {
+                return (
+                    None,
+                    Err(error
+                        .context(close)
+                        .context("Host unpublished teardown also failed")),
+                );
             }
-        };
-    let realms = realms
-        .into_iter()
-        .map(|(ingress, device, link, scope)| {
-            // Installed by the exact handed-off scope identity, not by position.
-            let index = drivers
+            return (None, Err(error));
+        }
+    };
+    let mut local_realms = Vec::with_capacity(realms.len());
+    let mut remote_realms = Vec::with_capacity(realms.len());
+    for (ingress, device, link, scope) in realms {
+        for worker_index in 0..usize::from(workers.workers) {
+            let Some(index) = drivers
                 .iter()
-                .position(|driver| driver.scope() == scope)
-                .expect("start_driven returns one driver per validated scope");
-            Realm {
+                .position(|driver| driver.scope() == scope && driver.worker() == worker_index)
+            else {
+                continue;
+            };
+            let realm = Realm {
                 ingress,
                 device,
                 link,
                 generated: generated_layout(link),
                 driver: drivers.swap_remove(index),
                 pending: [None, None],
+            };
+            if worker_index == 0 {
+                local_realms.push(realm);
+            } else {
+                remote_realms.push(realm);
             }
-        })
-        .collect();
+        }
+    }
+    let realms = local_realms;
+    #[cfg(feature = "ebpf")]
+    let host = host.map(|host| host.start(&mut drivers));
+    assert!(
+        drivers.is_empty(),
+        "every prepared scope has its exact service owner"
+    );
+    let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
         devices,
         topology,
+        #[cfg(feature = "ebpf")]
+        host,
         admission,
+        pname_support,
         realms,
+        workers: Arc::clone(&workers),
+        worker: None,
+        inbox,
         endpoints,
         core,
+        #[cfg(feature = "ebpf")]
+        native,
+        #[cfg(feature = "ebpf")]
+        native_policy,
+        #[cfg(feature = "ebpf")]
+        native_writer: None,
+        #[cfg(feature = "ebpf")]
+        native_capture_close: NativeCaptureClose::Unproven,
+        #[cfg(feature = "ebpf")]
+        native_next: Instant::now() + Duration::from_secs(1),
+        #[cfg(feature = "ebpf")]
+        next_candidate: 1,
+        #[cfg(feature = "ebpf")]
+        captured,
+        #[cfg(feature = "ebpf")]
+        originals,
+        #[cfg(feature = "ebpf")]
+        original_outcome: None,
+        #[cfg(feature = "ebpf")]
+        remote_originals: VecDeque::with_capacity(64),
+        #[cfg(feature = "ebpf")]
+        original_worker: false,
+        #[cfg(feature = "ebpf")]
+        _original_memory: original_memory,
         waiting: VecDeque::with_capacity(PENDING),
         pending: VecDeque::with_capacity(PENDING),
-        peers: Vec::with_capacity(PEERS),
         staging,
         closing: false,
+        finished: false,
         pressure: Pressure::new(Instant::now()),
         diagnostics,
         core_maintenance_checked: Instant::now(),
@@ -1877,78 +2495,114 @@ pub(crate) async fn run(
         policy_recheck: false,
         context_recheck: false,
         context_revision: 0,
-        _memory: memory,
+        _memory: Some(memory),
     };
+    if workers.workers == 2 {
+        match worker::Worker::start(
+            Arc::clone(&workers),
+            &mut runtime.devices,
+            remote_realms,
+            runtime.endpoints.clone(),
+            remote_inbox,
+            runtime.core.is_some(),
+            runtime.polling.participant(),
+            Arc::clone(&runtime.polling_budget),
+            Arc::clone(&shutdown),
+        ) {
+            Ok(worker) => runtime.worker = Some(worker),
+            Err(error) => workers.failed(1, error.into()),
+        }
+    }
+    workers.ready(0);
     let timer = None;
     tokio::pin!(timer);
     // The drivers already exist: a failed start's supervisor cleanup waits on their service.
     let ready = loop {
         tokio::select! {
-            ready = poll_fn(|cx| owner.poll_ready(cx)) => break ready,
+            ready = async {
+                poll_fn(|cx| owner.poll_ready(cx)).await?;
+                poll_fn(|cx| workers.all_ready(cx)).await
+            } => break ready,
             () = poll_fn(|cx| runtime.poll_scopes(cx, timer.as_mut())) => tokio::task::yield_now().await,
         }
     };
-    if let Err(error) = ready {
-        return (None, Err(error));
-    }
-    let activate = (|| -> anyhow::Result<()> {
-        for device in &mut runtime.devices {
-            device.attachment.replace(&device.programs)?;
-            device.active = true;
-        }
-        // Reconcile notifications caused by our own link attachments before admitting packets.
-        let indices: Vec<_> = runtime
-            .devices
-            .iter()
-            .map(|device| device.info.ifindex)
-            .collect();
-        let logical: Vec<_> = runtime
-            .realms
-            .iter()
-            .map(|realm| realm.ingress.ifindex)
-            .collect();
-        let topology = Topology::admit_after_xdp_attach(
-            &indices,
-            &logical,
-            config.global.effective_so_mark(),
-        )?;
-        ensure!(
-            topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
-            "XDP broadcast classification changed before publication"
-        );
-        // SAFETY: Topology keeps its owned descriptor unchanged until AsyncFd drops it.
-        runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-        for device in &runtime.devices {
-            device.info.validate_current()?;
-        }
-        link_proof.synchronize()?;
-        link_proof.validate_capture(&indices)?;
-        ensure!(
-            link_proof
-                .logical_links()
-                .filter(|link| indices.contains(&link.path.physical_ifindex))
-                .count()
-                == runtime.realms.len()
-                && runtime
-                    .realms
-                    .iter()
-                    .all(|realm| link_proof.logical_links().any(|link| link == realm.link)),
-            "logical capture identity changed before publication"
-        );
-        ensure!(
-            !runtime.topology.get_mut().check_changed()?,
-            "capture topology changed before publication"
-        );
-        runtime.rebuild_polling_context();
-        runtime.admission.store(true, Ordering::Release);
-        runtime.endpoints.capture_ready()?;
+    let startup_failure = ready.err();
+    let activate = if startup_failure.is_some() {
         Ok(())
-    })();
+    } else {
+        (|| -> anyhow::Result<()> {
+            for device in &mut runtime.devices {
+                device.attachment.replace(&device.programs)?;
+                device.active = true;
+            }
+            // Bootstrap carrier changes precede the final uninterrupted authority.
+            let indices: Vec<_> = runtime
+                .devices
+                .iter()
+                .map(|device| device.info.ifindex)
+                .collect();
+            let logical: Vec<_> = runtime
+                .realms
+                .iter()
+                .map(|realm| realm.ingress.ifindex)
+                .collect();
+            let topology = runtime.admit_final_topology(
+                &indices,
+                &logical,
+                config.global.effective_so_mark(),
+            )?;
+            ensure!(
+                topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
+                "XDP broadcast classification changed before publication"
+            );
+            // SAFETY: Topology keeps its owned descriptor unchanged until AsyncFd drops it.
+            runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
+            for device in &runtime.devices {
+                device.info.validate_current()?;
+            }
+            link_proof.synchronize()?;
+            link_proof.validate_capture(&indices)?;
+            ensure!(
+                link_proof
+                    .logical_links()
+                    .filter(|link| indices.contains(&link.path.physical_ifindex))
+                    .count()
+                    == runtime.realms.len()
+                    && runtime
+                        .realms
+                        .iter()
+                        .all(|realm| link_proof.logical_links().any(|link| link == realm.link)),
+                "logical capture identity changed before publication"
+            );
+            ensure!(
+                !runtime.topology.get_mut().check_changed()?,
+                "capture topology changed before publication"
+            );
+            runtime.rebuild_polling_context();
+            #[cfg(feature = "ebpf")]
+            if let Some(host) = &mut runtime.host {
+                host.admit(&runtime.pname_support)?;
+            }
+            runtime.admission.store(true, Ordering::Release);
+            runtime.endpoints.capture_ready()?;
+            #[cfg(feature = "ebpf")]
+            if let Some(publication) = &runtime.native {
+                publication.set_ready(true)?;
+                publication.set_capture_ready(true)?;
+                if shutdown.requested() {
+                    publication.quiesce(crate::ebpf::native::NativeReason::Shutdown)?;
+                    anyhow::bail!("Native shutdown raced capture activation");
+                }
+            }
+            Ok(())
+        })()
+    };
     drop(link_proof);
-    let mut failure = activate.err();
+    let mut failure = startup_failure.or_else(|| activate.err());
     if failure.is_none() {
         runtime.diagnostics.lifecycle(Lifecycle::Active);
         tracing::info!(interfaces = runtime.devices.len(), "XDP datapath ready");
+        runtime.sample_queues();
         if let Err(error) =
             libsystemd::daemon::notify(false, &[libsystemd::daemon::NotifyState::Ready])
         {
@@ -1992,6 +2646,8 @@ pub(crate) async fn run(
                     tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
                     failure.get_or_insert(error);
                     runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+                    #[cfg(feature = "ebpf")]
+                    runtime.export_native_recording(false, false, "terminal_io_join", &mut failure);
                     std::mem::forget((runtime, owner));
                     return (None, Err(failure.unwrap()));
                 }
@@ -2022,18 +2678,7 @@ pub(crate) async fn run(
     }
     // An endpoint join cannot release Core TX leases; drain those same descriptor owners too.
     if let Err(error) = drain_transmit(
-        || {
-            let mut outstanding = false;
-            for device in &mut runtime.devices {
-                for queue in &mut device.queues {
-                    let port = queue.io.get_mut();
-                    port.complete(release_completed)?;
-                    port.kick()?;
-                    outstanding |= port.counters().submitted != port.counters().completed;
-                }
-            }
-            Ok(outstanding)
-        },
+        || runtime.complete_transmit(),
         close_started.unwrap_or_else(Instant::now),
         &mut warned,
     )
@@ -2045,53 +2690,141 @@ pub(crate) async fn run(
         if let Err(error) = owner.fail_control().await {
             failure.get_or_insert(error);
         }
+        #[cfg(feature = "ebpf")]
+        runtime.export_native_recording(false, false, "transmit_drain", &mut failure);
         std::mem::forget((runtime, joined));
         return (None, Err(failure.unwrap()));
     }
-    sample_queues(&runtime.devices, &runtime.diagnostics);
+    #[cfg(feature = "ebpf")]
+    if let Err(error) = runtime.drain_all_native_originals(&shutdown).await {
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        tracing::error!(%error, "Native terminal RX custody did not drain; retaining original owners");
+        failure.get_or_insert(error);
+        runtime.export_native_recording(false, false, "native_original_rx_drain", &mut failure);
+        std::mem::forget((runtime, joined));
+        return (None, Err(failure.unwrap()));
+    }
+    if let Some(worker) = &mut runtime.worker
+        && let Err(error) = worker.join().await
+    {
+        failure.get_or_insert(error);
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        std::mem::forget((runtime, joined));
+        return (None, Err(failure.unwrap()));
+    }
+    runtime.sample_queues();
+    let ports_ready = runtime.ports_ready_for_backend_teardown();
+    if !ports_ready {
+        failure
+            .get_or_insert_with(|| anyhow::anyhow!("XDP ledger did not reach terminal ownership"));
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        #[cfg(feature = "ebpf")]
+        runtime.export_native_recording(false, false, "nonready_port", &mut failure);
+        std::mem::forget((runtime, joined));
+        return (None, Err(failure.unwrap()));
+    }
     for device in &mut runtime.devices {
         for queue in device.queues.drain(..) {
             let mut port = queue.io.into_inner();
-            if !port.close().ready_for_backend_teardown() {
-                failure.get_or_insert_with(|| {
-                    anyhow::anyhow!("XDP ledger did not reach terminal ownership")
-                });
-            }
+            debug_assert!(port.close().ready_for_backend_teardown());
             port.close_socket();
         }
+    }
+    #[cfg(feature = "ebpf")]
+    if let Some(publication) = &runtime.native
+        && let Err(error) = publication.retire_closed_host_sources(|key, claim| {
+            runtime.endpoints.retains_host_source(
+                key.namespace_cookie,
+                claim.owner_cookie,
+                claim.owner_incarnation,
+                claim.attachment_generation,
+                native::address(key.src_ip, 0).ip(),
+            )
+        })
+    {
+        failure.get_or_insert(error);
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        runtime.export_native_recording(false, false, "native_host_source_drain", &mut failure);
+        std::mem::forget((runtime, joined));
+        return (None, Err(failure.unwrap()));
+    }
+    #[cfg(feature = "ebpf")]
+    if let Some(host) = runtime.host.take()
+        && let Err(error) = host.finish()
+    {
+        failure.get_or_insert(error);
+    }
+    #[cfg(feature = "ebpf")]
+    if let Some(publication) = &runtime.native
+        && let Err(error) = publication.retire_closed_claims()
+    {
+        failure.get_or_insert(error);
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        std::mem::forget((runtime, joined));
+        return (None, Err(failure.unwrap()));
     }
     runtime.diagnostics.lifecycle(Lifecycle::Closed);
     if let Err(error) = backend.write().await.cleanup().await {
         failure.get_or_insert(error);
     }
     tracing::info!("XDP admission closed; UMEM retained until process exit");
-    match joined {
+    let plane = match joined {
         Ok((plane, result)) => {
             if let Err(error) = result {
                 failure.get_or_insert(error);
             }
-            (Some(plane), failure.map_or(Ok(()), Err))
+            Some(plane)
         }
-        Err(error) => (None, Err(failure.unwrap_or(error))),
+        Err(error) => {
+            failure.get_or_insert(error);
+            None
+        }
+    };
+    #[cfg(feature = "ebpf")]
+    if let Err(error) = runtime.finalize_native_recording() {
+        tracing::error!(%error, "Native accounting hooks did not finalize; retaining shutdown owners");
+        failure.get_or_insert(error);
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        runtime.export_native_recording(false, false, "native_hook_finalization", &mut failure);
+        std::mem::forget((runtime, plane));
+        return (None, Err(failure.unwrap()));
     }
+    #[cfg(feature = "ebpf")]
+    runtime.export_native_recording(true, true, "joined_shutdown", &mut failure);
+    runtime.finished = true;
+    (plane, failure.map_or(Ok(()), Err))
 }
 
 /// A realm before validated endpoint start hands it the driver of this exact scope.
 type RealmPlan = (Ingress, usize, LogicalLink, ScopeId);
 
-type PreparedRuntime = (
-    Vec<Device>,
-    AsyncFd<Topology>,
-    Vec<RealmPlan>,
-    Vec<(PacketScope, crate::control::netstack::PacketOwner)>,
-    Option<RoutedCore>,
-    MemoryReservation,
-    Vec<u8>,
-    Fib,
-    Result<ContextDigest, &'static str>,
-    Arc<MemoryBudget>,
-    Arc<Diagnostics>,
-);
+struct PreparedRuntime {
+    devices: Vec<Device>,
+    topology: AsyncFd<Topology>,
+    #[cfg(feature = "ebpf")]
+    host: Option<PreparedHost>,
+    realms: Vec<RealmPlan>,
+    workers: Arc<worker::Shared>,
+    inboxes: [tokio::sync::mpsc::Receiver<worker::Envelope>; 2],
+    scope_pairs: Vec<(PacketRealm, Vec<crate::control::netstack::PacketOwner>)>,
+    core: Option<RoutedCore>,
+    #[cfg(feature = "ebpf")]
+    native: Option<Arc<crate::ebpf::native::NativePublication>>,
+    #[cfg(feature = "ebpf")]
+    native_policy: Option<crate::control::core_forward::RoutingAuthority>,
+    #[cfg(feature = "ebpf")]
+    captured: Option<native::CapturedReturn>,
+    #[cfg(feature = "ebpf")]
+    originals: VecDeque<native::HeldOriginal>,
+    #[cfg(feature = "ebpf")]
+    original_memory: Option<MemoryReservation>,
+    memory: MemoryReservation,
+    staging: Vec<u8>,
+    links: Fib,
+    polling_prefix: Result<ContextDigest, &'static str>,
+    polling_budget: Arc<MemoryBudget>,
+    diagnostics: Arc<Diagnostics>,
+}
 
 #[cold]
 fn device_sizing(mtu: u32) -> (PortConfig, usize) {
@@ -2120,12 +2853,19 @@ async fn prepare(
     plane: &ControlPlane,
     config: &Config,
     pin_root: &Path,
+    admission: Arc<AtomicBool>,
 ) -> anyhow::Result<PreparedRuntime> {
     validate_config(config)?;
     let datapath = config
         .datapath
         .as_ref()
         .context("XDP configuration missing")?;
+    let native_enabled = datapath.direct == Some(DirectProfile::Native);
+    let metadata_len = if native_enabled {
+        honk_ebpf_common::xdp::NATIVE_METADATA_LEN
+    } else {
+        METADATA_LEN
+    };
     let binding_mode = match datapath.effective_xsk_mode() {
         XskMode::Copy => BindMode::Copy,
         XskMode::ZeroCopy => BindMode::ZeroCopy,
@@ -2135,17 +2875,102 @@ async fn prepare(
         .iter()
         .map(|interface| DeviceInfo::discover(&interface.name))
         .collect::<io::Result<_>>()?;
+    worker::admit(datapath.effective_workers(), &infos)?;
     for info in &infos {
         let (port_config, _) = device_sizing(info.mtu);
-        info.validate_port_config(binding_mode, port_config)
+        info.validate_port_config(binding_mode, port_config, metadata_len)
             .with_context(|| format!("XDP device {} {binding_mode:?} admission", info.name))?;
         ensure!(
             honk_xsk::xdp_absent(info.ifindex)?,
-            "XDP interface already attached; stop sources and remove only its owned stale guard before restart"
+            "XDP interface already attached; stop sources, join prior owners and identify the owned guard/data/data-next and attachment format before explicit cold cleanup; stale state is not adopted"
         );
     }
     let indices: Vec<_> = infos.iter().map(|info| info.ifindex).collect();
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let extent = infos
+        .iter()
+        .map(|info| info.mtu as usize + 22 + metadata_len)
+        .max()
+        .unwrap_or(65536);
+    let (workers, inboxes) = worker::Shared::new(
+        datapath.effective_workers(),
+        extent,
+        infos.iter().map(|info| info.queues.len()).sum(),
+        &budget,
+        Arc::clone(&admission),
+    )?;
+    #[cfg(feature = "ebpf")]
+    let (original_memory, originals) = if native_enabled {
+        let capacity = infos.iter().try_fold(0usize, |total, info| {
+            let (port, _) = device_sizing(info.mtu);
+            ensure!(
+                info.queues.len() <= u16::MAX as usize,
+                "Native queue index exceeds retained representation"
+            );
+            port.rx_frames
+                .min(port.ring_size as usize)
+                .checked_mul(info.queues.len())
+                .and_then(|count| total.checked_add(count))
+                .context("Native original slot capacity overflow")
+        })?;
+        let layout = std::alloc::Layout::array::<native::HeldOriginal>(capacity)?;
+        let bytes = capacity
+            .checked_mul(192)
+            .context("Native held slot reservation overflow")?;
+        ensure!(
+            layout.size() <= bytes,
+            "Native held slot layout exceeds reservation"
+        );
+        let memory = budget
+            .reserve(bytes)
+            .context("Native held original memory capacity")?;
+        let mut originals = VecDeque::new();
+        originals.try_reserve_exact(capacity)?;
+        ensure!(
+            originals
+                .capacity()
+                .checked_mul(size_of::<native::HeldOriginal>())
+                .is_some_and(|actual| actual <= bytes),
+            "Native held allocation exceeds reservation"
+        );
+        (Some(memory), originals)
+    } else {
+        (None, VecDeque::new())
+    };
+    #[cfg(feature = "ebpf")]
+    let native = if native_enabled {
+        let pending = infos
+            .iter()
+            .try_fold(0usize, |total, info| {
+                let (port, _) = device_sizing(info.mtu);
+                port.rx_frames
+                    .checked_mul(info.queues.len())
+                    .and_then(|count| total.checked_add(count))
+            })
+            .context("Native pending RX capacity overflow")?;
+        let capacity = pending
+            .checked_add(4096 + 64 + 4096)
+            .and_then(|capacity| {
+                capacity.checked_add(usize::from(datapath.host.is_some()) * 4 * 4096)
+            })
+            .context("Native ordinary owner capacity overflow")?;
+        Some(crate::ebpf::native::NativePublication::new_with_capacity(
+            Arc::clone(&budget),
+            u32::try_from(capacity)?,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(feature = "ebpf")]
+    {
+        *workers.native.publication.lock() = native.clone();
+    }
+    #[cfg(feature = "ebpf")]
+    if let Some(publication) = &native {
+        let path = publication.initialize_export(honk_config::paths::data_dir())?;
+        tracing::info!(native_publication_path = %path.display(), final_export = false,
+            "Native publication manifest ready before attachment");
+    }
     let polling_prefix = ContextDigest::platform(&budget);
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     let namespace = socket_namespace(socket.as_fd())?;
@@ -2159,10 +2984,17 @@ async fn prepare(
             .all(|link| link.mtu >= 1280),
         "XDP logical MTU must be at least 1280 for packet Endpoint handoffs"
     );
-    let realm_count = links
+    let physical_realm_count = links
         .logical_links()
         .filter(|link| indices.contains(&link.path.physical_ifindex))
         .count();
+    ensure!(
+        !native_enabled || links.logical_links()
+            .filter(|link| indices.contains(&link.path.physical_ifindex))
+            .all(|link| link.path.vlan_count == 0 && link.ifindex == link.path.physical_ifindex),
+        "XDP Native currently requires untagged physical ingress; VLAN continuation is unavailable"
+    );
+    let realm_count = physical_realm_count + usize::from(datapath.host.is_some());
     ensure!(
         (1..=64).contains(&realm_count),
         "logical capture realm capacity exceeded"
@@ -2199,20 +3031,21 @@ async fn prepare(
         metadata.is_dir() && !metadata.file_type().is_symlink(),
         "XDP pin root must be a real private bpffs directory"
     );
-    let max_mtu = infos
-        .iter()
-        .map(|info| info.mtu)
-        .max()
-        .context("no selected interfaces")? as usize;
+    let max_mtu = infos.iter().map(|info| info.mtu).max().unwrap_or(65535) as usize;
+    #[cfg(feature = "ebpf")]
+    let host_memory = usize::from(datapath.host.is_some()) * size_of::<PreparedHost>();
+    #[cfg(not(feature = "ebpf"))]
+    let host_memory = 0;
     let memory = budget
         .reserve(
             max_mtu
                 + 65536
                 + size_of::<Runtime>()
                 + size_of::<Topology>()
-                + PEERS * size_of::<Peer>()
+                + host_memory
                 + PENDING * (size_of::<Waiting>() + size_of::<Pending>())
                 + realm_count
+                    * usize::from(datapath.effective_workers())
                     * (size_of::<Realm>()
                         + size_of::<RealmPlan>()
                         + size_of::<PacketDriver>()
@@ -2231,12 +3064,24 @@ async fn prepare(
                     .sum::<usize>(),
         )
         .context("XDP metadata and staging memory capacity")?;
+    tracing::debug!(
+        used = budget.used(),
+        limit = budget.limit(),
+        realm_count,
+        "XDP prepare: after metadata reservation"
+    );
     let routing_scope = ScopeId::allocate().context("XDP routing domain exhausted")?;
     let mut realms = Vec::with_capacity(realm_count);
     let mut scope_pairs = Vec::with_capacity(realm_count);
     let config_generation = plane.diagnostics_handle().read().generation;
     let authority = if datapath.direct == Some(DirectProfile::Core) {
         Some(plane.core_forward_policy(Execution::MixedEndpoints).await?)
+    } else {
+        None
+    };
+    #[cfg(feature = "ebpf")]
+    let native_policy = if native_enabled {
+        Some(plane.native_packet_policy().await?)
     } else {
         None
     };
@@ -2258,21 +3103,64 @@ async fn prepare(
             bypass_mark: config.global.effective_so_mark(),
             vlan_metadata: info.vlan_metadata,
         };
-        let programs = Programs::load_general(
-            &capture,
-            info.queues
-                .last()
-                .copied()
-                .unwrap()
-                .checked_add(1)
-                .context("XDP queue identity overflow")?,
-            topology.get_ref().ipv4_broadcasts(),
-        )?;
+        let queues = info
+            .queues
+            .last()
+            .copied()
+            .unwrap()
+            .checked_add(1)
+            .context("XDP queue identity overflow")?;
+        #[cfg(feature = "ebpf")]
+        let native_memory = if native_enabled {
+            Some(
+                budget
+                    .reserve(1 << 20)
+                    .context("Native dispatch memory capacity")?,
+            )
+        } else {
+            None
+        };
+        let native_bootstrap_memory = if native_enabled && capture.vlan_metadata {
+            Some(
+                budget
+                    .reserve(Programs::native_preparation_memory_bytes()?)
+                    .context("Native bootstrap BTF memory capacity")?,
+            )
+        } else {
+            None
+        };
+        let programs = if native_enabled {
+            Programs::load_general_native(&capture, queues, topology.get_ref().ipv4_broadcasts())?
+        } else {
+            Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?
+        };
+        drop(native_bootstrap_memory);
         use std::os::unix::fs::DirBuilderExt;
         let pins = pin_root.join(format!("xdp-{}", info.ifindex));
         std::fs::DirBuilder::new().mode(0o700).create(&pins)?;
         let attachment = PersistentAttachment::create(info.ifindex, &programs, &pins)?;
-        let ports = info.open_ports::<Retained>(binding_mode, port_config, &budget)?;
+        #[cfg(feature = "ebpf")]
+        let native_gate = if native_enabled {
+            Some(programs.attach_native_gate(&attachment, &pins)?)
+        } else {
+            None
+        };
+        #[cfg(feature = "ebpf")]
+        let native_target = if native_enabled {
+            ensure!(
+                programs.native_memory_bytes()? <= 1 << 20,
+                "Native dispatch allocation exceeded admitted memory"
+            );
+            Some(programs.native_target(
+                &capture,
+                topology.get_ref().ipv4_broadcasts(),
+                &attachment,
+            )?)
+        } else {
+            None
+        };
+        let ports =
+            info.open_ports::<Retained>(binding_mode, port_config, metadata_len, &budget)?;
         ensure!(
             ports
                 .iter()
@@ -2291,17 +3179,26 @@ async fn prepare(
                 id,
                 observed,
                 observed_rings,
-                // SAFETY: close_socket is called only after AsyncFd::into_inner deregisters it.
-                io: unsafe { AsyncFd::register(port) }.map_err(io::Error::from)?,
+                io: if id % u32::from(datapath.effective_workers()) == 0 {
+                    QueueIo::Prepared(port).register()?
+                } else {
+                    QueueIo::Prepared(port)
+                },
             });
             tracing::info!(interface = %info.name, ifindex = info.ifindex, queue = id, zero_copy, vlan_metadata = capture.vlan_metadata, "XDP queue bound");
         }
         devices.push(Device {
-            info,
+            info: Arc::new(info),
             capture,
-            programs,
-            attachment,
+            programs: Arc::new(programs),
+            attachment: Arc::new(attachment),
             queues,
+            #[cfg(feature = "ebpf")]
+            native_target,
+            #[cfg(feature = "ebpf")]
+            _native_gate: native_gate,
+            #[cfg(feature = "ebpf")]
+            _native_memory: native_memory,
             active: false,
             metadata_checked: Instant::now(),
             features: None,
@@ -2309,7 +3206,46 @@ async fn prepare(
             role: datapath.interfaces[device_index].role,
         });
     }
-    let diagnostics = diagnostics(&devices, &budget)?;
+    #[cfg(feature = "ebpf")]
+    let host = if let Some(host) = &datapath.host {
+        let source_xdp_capacity = devices.len() * 2;
+        let _source_xdp_memory = budget
+            .reserve(source_xdp_capacity * size_of::<(u32, u32)>())
+            .context("Host source XDP identity memory capacity")?;
+        let mut source_xdp = Vec::with_capacity(source_xdp_capacity);
+        for device in &devices {
+            source_xdp.push((device.info.ifindex, device.programs.discover_prog_id()));
+            source_xdp.push((device.info.ifindex, device.programs.data_prog_id()));
+        }
+        let attachment = ScopeId::allocate()
+            .context("Host attachment identity exhausted")?
+            .as_u64();
+        let (host, scope) = PreparedHost::prepare(
+            &host.interfaces,
+            &source_xdp,
+            CaptureAuthority {
+                namespace_cookie: namespace,
+                attachment_generation: attachment,
+                scope: routing_scope.as_u64(),
+                config_generation,
+                ifindex: 0,
+                reserved: 0,
+            },
+            config.global.effective_so_mark(),
+            pin_root,
+            honk_config::paths::data_dir(),
+            realm_count,
+            &budget,
+            native.clone(),
+        )?;
+        tracing::debug!(
+            used = budget.used(),
+            "XDP prepare: after PreparedHost::prepare"
+        );
+        Some((host, scope))
+    } else {
+        None
+    };
     for (device_index, device) in devices.iter().enumerate() {
         let (_, scope_bulk_frames) = device_sizing(device.info.mtu);
         for link in links
@@ -2323,12 +3259,39 @@ async fn prepare(
                 attachment: device.capture.authority.attachment_generation,
                 mark: MarkProvenance::BeforeSkb,
             };
-            let (scope, scope_owner) =
-                capture_scope(link.mtu, realm_count, scope_bulk_frames, &budget)?;
-            realms.push((ingress, device_index, link, scope.scope()));
-            scope_pairs.push((scope, scope_owner));
+            let (realm, owners) = capture_realm(
+                link.mtu,
+                realm_count,
+                scope_bulk_frames,
+                usize::from(datapath.effective_workers()).min(device.info.queues.len()),
+                &budget,
+            )?;
+            realm.install_admission_fence(Arc::clone(&admission))?;
+            realms.push((ingress, device_index, link, realm.scope()));
+            workers.placements.lock().push(worker::Placement {
+                realm: realm.clone(),
+                ingress,
+                device: device_index,
+                link,
+            });
+            scope_pairs.push((realm, owners));
         }
     }
+    #[cfg(feature = "ebpf")]
+    let host = match host {
+        Some((host, (scope, owner))) => {
+            scope_pairs.push((PacketRealm::singleton(scope)?, vec![owner]));
+            Some(host)
+        }
+        None => None,
+    };
+    #[cfg(feature = "ebpf")]
+    let host_observation = host.as_ref().map(PreparedHost::observation);
+    #[cfg(not(feature = "ebpf"))]
+    let host_observation = None;
+    let diagnostics = diagnostics(&devices, &budget, host_observation)?;
+    *workers.diagnostics.lock() = Some(Arc::clone(&diagnostics));
+    tracing::debug!(used = budget.used(), "XDP prepare: after diagnostics");
     let ingresses: Vec<_> = realms.iter().map(|(ingress, ..)| *ingress).collect();
     let core = if let Some(authority) = authority {
         let mut core = RoutedCore::new(
@@ -2353,23 +3316,90 @@ async fn prepare(
             })
             .collect();
         core.set_ingress_bindings(&bindings)?;
+        core.prepare_fragment_peers()?;
         Some(core)
     } else {
         None
     };
-    Ok((
+    #[cfg(feature = "ebpf")]
+    if let Some(publication) = &native {
+        for (_, device, _, scope) in &realms {
+            publication.register(
+                Arc::clone(
+                    devices[*device]
+                        .native_target
+                        .as_ref()
+                        .expect("Native target prepared"),
+                ),
+                *scope,
+            )?;
+        }
+        plane
+            .policy_backend_handle()
+            .write()
+            .await
+            .install_native_publication(Arc::clone(publication))?;
+        plane
+            .shutdown_intent()
+            .install_native(Arc::clone(publication))?;
+    }
+    #[cfg(feature = "ebpf")]
+    let captured = if let Some(publication) = native.as_ref().filter(|_| !realms.is_empty()) {
+        let _targets_memory = budget
+            .reserve(
+                realms
+                    .len()
+                    .checked_mul(size_of::<honk_xsk::CapturedTarget>())
+                    .context("Native captured target inventory overflow")?,
+            )
+            .context("Native captured target inventory memory")?;
+        let targets: Vec<_> = realms
+            .iter()
+            .enumerate()
+            .map(|(index, (_, device, link, _))| honk_xsk::CapturedTarget {
+                realm_index: index as u32,
+                logical_ifindex: link.ifindex,
+                target: Arc::clone(devices[*device].native_target.as_ref().unwrap()),
+            })
+            .collect();
+        Some(native::CapturedReturn::prepare(
+            Arc::clone(publication),
+            &targets,
+            Arc::clone(&budget),
+            pin_root,
+            honk_config::paths::data_dir(),
+        )?)
+    } else {
+        None
+    };
+    tracing::debug!(used = budget.used(), "XDP prepare: after captured return");
+    Ok(PreparedRuntime {
         devices,
         topology,
+        #[cfg(feature = "ebpf")]
+        host,
         realms,
         scope_pairs,
+        workers,
+        inboxes,
         core,
+        #[cfg(feature = "ebpf")]
+        native,
+        #[cfg(feature = "ebpf")]
+        native_policy,
+        #[cfg(feature = "ebpf")]
+        captured,
+        #[cfg(feature = "ebpf")]
+        originals,
+        #[cfg(feature = "ebpf")]
+        original_memory,
         memory,
-        vec![0; max_mtu.max(65536)],
+        staging: vec![0; max_mtu.max(65536)],
         links,
         polling_prefix,
-        budget,
+        polling_budget: budget,
         diagnostics,
-    ))
+    })
 }
 
 #[cfg(test)]
@@ -2378,6 +3408,173 @@ mod tests {
 
     mod driven_kernel;
     mod retention;
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn physical_native_refuses_set_zero_and_preserves_endpoint_zero_projection() {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.dial_mode = "ip".into();
+        config.datapath = Some(honk_config::datapath::DatapathConfig {
+            backend: Backend::Xdp,
+            direct: Some(DirectProfile::Native),
+            interfaces: vec![honk_config::datapath::XdpInterface {
+                name: "native0".into(),
+                role: honk_config::datapath::InterfaceRole::Lan,
+            }],
+            ..Default::default()
+        });
+        validate_config(&config).unwrap();
+        for source in [
+            "routing { fallback: direct(mark: 0) }",
+            "routing { dport(443) -> direct(mark: 0) }",
+        ] {
+            config.routing = honk_config::parser::parse_dae_config(source)
+                .unwrap()
+                .routing;
+            config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Native);
+            assert!(
+                validate_config(&config)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("physical Native requires Keep")
+            );
+            config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Endpoint);
+            validate_config(&config).unwrap();
+        }
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn native_target_identity_capacity_rejects_seventeenth_interface_before_attachment() {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.dial_mode = "ip".into();
+        config.datapath = Some(honk_config::datapath::DatapathConfig {
+            backend: Backend::Xdp,
+            direct: Some(DirectProfile::Native),
+            interfaces: (0..16)
+                .map(|index| honk_config::datapath::XdpInterface {
+                    name: format!("native{index}"),
+                    role: honk_config::datapath::InterfaceRole::Lan,
+                })
+                .collect(),
+            ..Default::default()
+        });
+        validate_config(&config).unwrap();
+        config
+            .datapath
+            .as_mut()
+            .unwrap()
+            .interfaces
+            .push(honk_config::datapath::XdpInterface {
+                name: "native16".into(),
+                role: honk_config::datapath::InterfaceRole::Lan,
+            });
+        let error = validate_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("between one and sixteen explicit interfaces")
+        );
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn native_requested_data_directory_accepts_1024_bytes_and_rejects_1025_before_attachment() {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.global.dial_mode = "ip".into();
+        config.global.data_dir = format!("/{}", "a/".repeat(511)) + "a";
+        config.datapath = Some(honk_config::datapath::DatapathConfig {
+            backend: Backend::Xdp,
+            direct: Some(DirectProfile::Native),
+            interfaces: vec![honk_config::datapath::XdpInterface {
+                name: "native0".into(),
+                role: honk_config::datapath::InterfaceRole::Lan,
+            }],
+            ..Default::default()
+        });
+        assert_eq!(config.global.data_dir.len(), 1024);
+        validate_config(&config).unwrap();
+        config.global.data_dir.push('b');
+        assert_eq!(config.global.data_dir.len(), 1025);
+        let error = validate_config(&config).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requested global.data_dir exceeds the 1024-byte")
+        );
+        config.datapath.as_mut().unwrap().direct = Some(DirectProfile::Endpoint);
+        validate_config(&config).unwrap();
+    }
+
+    #[cfg(feature = "ebpf")]
+    #[test]
+    fn native_guard_is_required_before_runtime_activation_when_native_target_exists() {
+        assert!(needs_guard(true, false));
+    }
+
+    #[test]
+    fn native_guard_decision_preserves_ordinary_device_activation() {
+        assert!(!needs_guard(false, false));
+        assert!(needs_guard(false, true));
+    }
+
+    #[cfg(not(feature = "ebpf"))]
+    #[test]
+    fn native_guard_decision_without_ebpf_uses_only_runtime_activation() {
+        assert!(!needs_guard(true, false));
+        assert!(needs_guard(true, true));
+    }
+
+    #[test]
+    fn native_guard_observation_failure_never_skips_xsk_withdrawal() {
+        for failure in [
+            "strict precheck",
+            "already invalidated",
+            "post-ACK observation",
+        ] {
+            let mut calls = Vec::new();
+            let result = close_device_capture_with(
+                &mut calls,
+                |calls| {
+                    calls.push("guard");
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, failure))
+                },
+                |calls| {
+                    calls.push("XSK withdrawal");
+                    Err(io::Error::other("injected XSK withdrawal failure"))
+                },
+            );
+            let message = result.unwrap_err().to_string();
+            assert!(message.contains(failure));
+            assert!(message.contains("injected XSK withdrawal failure"));
+            assert_eq!(calls, ["guard", "XSK withdrawal"]);
+        }
+    }
+
+    #[test]
+    fn capture_close_folds_later_errors_without_losing_original_cause() {
+        let mut failure = None;
+        fold_capture_result(
+            &mut failure,
+            Err(io::Error::from_raw_os_error(libc::EPERM).into()),
+        );
+        fold_capture_result(&mut failure, Ok(()));
+        for stage in ["XSK withdrawal", "private seal", "post-guard grace"] {
+            fold_capture_result(&mut failure, Err(anyhow::anyhow!(stage)));
+        }
+        let error = failure.unwrap();
+        assert_eq!(
+            error.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+            Some(libc::EPERM)
+        );
+        let message = format!("{error:#}");
+        for stage in ["XSK withdrawal", "private seal", "post-guard grace"] {
+            assert!(message.contains(stage));
+        }
+    }
 
     #[test]
     fn pressure_deadline_ends_after_the_recovery_sample() {
@@ -2453,6 +3650,7 @@ mod tests {
         let mut c = [0; 830];
         fill_output(&mut [&mut a, &mut b, &mut c], &header, &payload).unwrap();
         let packet = DecodedPacket {
+            frame_len: length + payload.len(),
             l3_offset: length,
             l3_len: payload.len(),
             source_mac: [4; 6],
@@ -2461,6 +3659,7 @@ mod tests {
             vlan_tci: path.vlan_tci,
             vlan_proto: path.vlan_proto,
             vlan_count: 2,
+            inline_vlan_count: 2,
         };
         let mut slices = [&[][..]; 18];
         let segments = [&a[..], &b[..], &c[..]];
