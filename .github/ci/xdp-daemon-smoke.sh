@@ -415,7 +415,7 @@ PY
     ip -n dut -6 route del prohibit fd00:2::98/128
     provision_routes c0 s0 dut0 dut1
 
-    # A separate 45-second combined-consumer window; the original Event/E32
+    # A separate 180-second combined-consumer window; the original Event/E32
     # selection and every later daemon profile keep their original bounds.
     ip -n client -j -d link show dev c0 >"$work/adaptive-original-c0.json"
     ip -n server -j -d link show dev s0 >"$work/adaptive-original-s0.json"

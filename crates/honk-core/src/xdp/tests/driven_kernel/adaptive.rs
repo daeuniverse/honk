@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, oneshot, watch};
 mod clocks;
 mod shared;
 
-const WINDOW: Duration = Duration::from_secs(45);
+// One combined window for every scenario; 45 s ran out mid-way on the 2-vCPU floor VM.
+const WINDOW: Duration = Duration::from_secs(180);
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Attempts {
