@@ -7,6 +7,7 @@ use tokio::{
 };
 
 mod adaptive;
+pub(super) mod gateway;
 
 const PEER: &str = r#"
 import contextlib, ctypes, os, socket, struct, sys, time

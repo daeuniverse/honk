@@ -312,15 +312,19 @@ if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
         bpf::general::tests::kernel_group_unicast_cannot_borrow_connected_socket_exemption \
         bpf::general::tests::kernel_native_destinations_and_metadata_counter_are_distinct \
         bpf::general::tests::kernel_legacy_capture_keeps_rejection_counters_and_xsk_miss_closed \
-        bpf::general::tests::gateway::kernel_gateway_tcp_non_syn_miss_and_monotonic_hold_refresh \
+        bpf::general::tests::gateway::kernel_gateway_g17_tcp_non_syn_miss_and_monotonic_hold_refresh \
         bpf::general::tests::gateway::kernel_gateway_local_then_hold_then_real_conntrack_and_reverse_quote \
-        bpf::general::tests::gateway::kernel_gateway_required_prefix_options_and_scatter_payload \
+        bpf::general::tests::gateway::kernel_gateway_g12_ihl_and_required_prefix_test_run_not_physical_sg \
         bpf::general::tests::gateway::kernel_gateway_fragment_verdict_ttl_and_post_hold_late_fragment \
-        bpf::general::tests::gateway::kernel_gateway_ipv6_fragment_then_destination_options_and_extension_bounds \
+        bpf::general::tests::gateway::kernel_gateway_g12_ipv6_fragment_then_destination_options_and_extension_bounds \
         bpf::general::tests::gateway::kernel_gateway_canonical_call_input_and_runtime_rule_permission \
         bpf::general::tests::gateway::kernel_gateway_reload_preserves_xsk_and_counter_map_identity \
         bpf::general::tests::gateway::kernel_gateway_vlan_realm_masks_pcp_dei_and_rejects_unknown_vid \
         bpf::general::tests::gateway::kernel_gateway_local_dns_exception_and_full_hold_drop \
+        bpf::general::tests::gateway::kernel_gateway_g02_non_transport_quotes_pass \
+        bpf::general::tests::gateway::kernel_gateway_g02_dnat_reverse_quote_ct_alias_miss_selects_xsk \
+        bpf::general::tests::gateway::kernel_gateway_g17_production_capacity_hold_full_drops_before_xsk \
+        bpf::gateway::tests::kernel_gateway_g17_sweep_strict_idle_boundary_and_retention_callback \
         bpf::gateway::tests::kernel_hold_sweep_retains_output_and_reread_changes \
         bpf::gateway::tests::kernel_gateway_lookup_errors_sum_possible_cpu_values \
         bpf::gateway::tests::kernel_hold_sweep_bounds_turn_and_preserves_cursor \

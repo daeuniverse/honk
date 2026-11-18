@@ -18,6 +18,16 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         require_vm();
+        assert!(matches!(
+            std::env::var("HONK_CI_VM_LANE").as_deref(),
+            Ok("floor" | "recent")
+        ));
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap()
+                .trim(),
+            std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap()
+        );
         let maps = GatewayMaps::new(
             &[(
                 CaptureRealmKey {
@@ -266,7 +276,13 @@ fn frame_for(key: GatewayKey) -> Vec<u8> {
 }
 
 fn icmp_quote(quoted: GatewayKey) -> Vec<u8> {
-    let inner = frame_for(quoted);
+    let mut inner = frame_for(quoted);
+    if quoted.family == 4 {
+        inner[23] = quoted.proto;
+        ipv4_checksum(&mut inner, 20);
+    } else {
+        inner[20] = quoted.proto;
+    }
     let mut frame = frame_for(reverse(quoted));
     let header = if quoted.family == 4 { 20 } else { 40 };
     let start = 14 + header;
@@ -298,7 +314,7 @@ fn icmp_quote(quoted: GatewayKey) -> Vec<u8> {
 
 #[test]
 #[ignore = "requires root in a disposable virtme guest private netns"]
-fn kernel_gateway_tcp_non_syn_miss_and_monotonic_hold_refresh() {
+fn kernel_gateway_g17_tcp_non_syn_miss_and_monotonic_hold_refresh() {
     let fixture = Fixture::new();
     let program = fixture.load(false);
     let (key, mut ack) = tcp(43001, 0x10);
@@ -332,6 +348,14 @@ fn kernel_gateway_tcp_non_syn_miss_and_monotonic_hold_refresh() {
         "VM paused across the refresh interval"
     );
     assert_eq!(fixture.maps.lookup_hold(&key).unwrap().unwrap(), refreshed);
+    assert_eq!(
+        fixture
+            .maps
+            .retire_if_unretained(now(), std::time::Duration::from_secs(30), |_| false)
+            .unwrap(),
+        0
+    );
+    assert_eq!(fixture.maps.lookup_hold(&key).unwrap(), Some(refreshed));
     let future = EndpointHold {
         last_seen_ns: now() + 60 * HOLD_REFRESH_NS,
         ..refreshed
@@ -398,19 +422,96 @@ fn kernel_gateway_local_then_hold_then_real_conntrack_and_reverse_quote() {
 
 #[test]
 #[ignore = "requires root in a disposable virtme guest private netns"]
-fn kernel_gateway_required_prefix_options_and_scatter_payload() {
+fn kernel_gateway_g02_non_transport_quotes_pass() {
+    let fixture = Fixture::new();
+    let program = fixture.load(false);
+    let (key4, _) = udp(43300);
+    let key6 = tuple_key(
+        "[2001:db8::41]:43300".parse().unwrap(),
+        "[2001:db8::42]:443".parse().unwrap(),
+        17,
+    );
+    for key in [key4, key6] {
+        for proto in [47, 50] {
+            let quoted = GatewayKey { proto, ..key };
+            assert_eq!(run(&program, &icmp_quote(quoted), 0).0, XDP_PASS as u32);
+        }
+    }
+    assert_eq!(fixture.stat(GatewayReason::PassNonTransport), 4);
+    assert_eq!(fixture.stat(GatewayReason::IcmpQuoteUnresolved), 0);
+    assert_eq!(fixture.stat(GatewayReason::D1Evaluated), 0);
+    let mut redirects = 0u64;
+    get(
+        fixture.counters.as_fd(),
+        &0u32,
+        &mut redirects as *mut _ as u64,
+    );
+    assert_eq!(redirects, 0);
+}
+
+#[test]
+#[ignore = "requires root in a disposable virtme guest private netns"]
+fn kernel_gateway_g02_dnat_reverse_quote_ct_alias_miss_selects_xsk() {
+    let fixture = Fixture::new();
+    let program = fixture.load(false);
+    let original = tuple_key(
+        "192.0.2.41:43301".parse().unwrap(),
+        "198.51.100.41:443".parse().unwrap(),
+        17,
+    );
+    let reply = tuple_key(
+        "192.0.2.42:8443".parse().unwrap(),
+        "192.0.2.41:43301".parse().unwrap(),
+        17,
+    );
+    insert_conntrack_aliases(original, reply);
+    assert_eq!(run(&program, &frame_for(original), 0).0, XDP_PASS as u32);
+    assert_eq!(run(&program, &frame_for(reply), 0).0, XDP_PASS as u32);
+    assert_eq!(fixture.stat(GatewayReason::PassCtOriginal), 1);
+    assert_eq!(fixture.stat(GatewayReason::PassCtReply), 1);
+    let lookup = reverse(reply);
+    assert_ne!(lookup, original);
+    assert_ne!(lookup, reply);
+    assert_eq!(fixture.maps.lookup_hold(&lookup).unwrap(), None);
+    // The real CT aliases model DNAT; only the smoke proves NAT execution and PTB wire direction.
+    assert_eq!(run(&program, &icmp_quote(reply), 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.stat(GatewayReason::IcmpQuoteUnresolved), 1);
+    assert_eq!(fixture.stat(GatewayReason::PassCtOriginal), 1);
+    assert_eq!(fixture.stat(GatewayReason::PassCtReply), 1);
+    assert_eq!(fixture.stat(GatewayReason::D1Evaluated), 0);
+    let mut redirects = 0u64;
+    get(
+        fixture.counters.as_fd(),
+        &0u32,
+        &mut redirects as *mut _ as u64,
+    );
+    assert_eq!(redirects, 1, "empty XSK map drops the selected XSK path");
+    assert_eq!(fixture.maps.lookup_hold(&lookup).unwrap(), None);
+}
+
+#[test]
+#[ignore = "requires root in a disposable virtme guest private netns"]
+/// Test-run payload scattering does not prove a physical first-buffer boundary; smoke owns real SG.
+fn kernel_gateway_g12_ihl_and_required_prefix_test_run_not_physical_sg() {
     let fixture = Fixture::new();
     let program = fixture.load(false);
     let (zero_key, zero_payload) = udp(43003);
     assert_eq!(run(&program, &zero_payload, 0).0, XDP_DROP as u32);
     assert!(fixture.maps.lookup_hold(&zero_key).unwrap().is_some());
-    let (options_key, mut options) = udp(43004);
-    options.splice(34..34, [1u8; 40]);
-    options[14] = 0x4f;
-    options[16..18].copy_from_slice(&68u16.to_be_bytes());
-    ipv4_checksum(&mut options, 60);
-    assert_eq!(run(&program, &options, 0).0, XDP_DROP as u32);
-    assert!(fixture.maps.lookup_hold(&options_key).unwrap().is_some());
+    for ihl in 5u8..=15 {
+        let (options_key, mut options) = udp(43400 + u16::from(ihl));
+        let extra = usize::from(ihl - 5) * 4;
+        options.splice(34..34, std::iter::repeat_n(1u8, extra));
+        options[14] = 0x40 | ihl;
+        options[16..18].copy_from_slice(&((28 + extra) as u16).to_be_bytes());
+        ipv4_checksum(&mut options, usize::from(ihl) * 4);
+        assert_eq!(run(&program, &options, 0).0, XDP_DROP as u32, "IHL={ihl}");
+        assert!(fixture.maps.lookup_hold(&options_key).unwrap().is_some());
+        assert_eq!(
+            fixture.input(43400 + u32::from(ihl)).l4proto,
+            L4ProtoType::Udp as u32
+        );
+    }
     let (sg_key, mut sg) = udp(43005);
     sg.resize(9014, 0);
     sg[16..18].copy_from_slice(&9000u16.to_be_bytes());
@@ -437,7 +538,10 @@ fn kernel_gateway_required_prefix_options_and_scatter_payload() {
     assert_eq!(run(&program, &first_prefix, 0).0, XDP_DROP as u32);
     assert_eq!(fixture.stat(GatewayReason::XskEndpointHold), 1);
     assert_eq!(fixture.stat(GatewayReason::UnclassifiableHeader), 1);
-    let mut short_options = options[..14 + 59].to_vec();
+    let (_, mut short_options) = udp(43416);
+    short_options.splice(34..34, [1u8; 40]);
+    short_options[14] = 0x4f;
+    short_options.truncate(14 + 59);
     short_options[16..18].copy_from_slice(&59u16.to_be_bytes());
     assert_eq!(run(&program, &short_options, 0).0, XDP_DROP as u32);
     assert_eq!(fixture.stat(GatewayReason::UnclassifiableHeader), 2);
@@ -524,7 +628,7 @@ fn v6_extensions(port: u16, protocols: &[u8], lengths: &[usize]) -> (GatewayKey,
 
 #[test]
 #[ignore = "requires root in a disposable virtme guest private netns"]
-fn kernel_gateway_ipv6_fragment_then_destination_options_and_extension_bounds() {
+fn kernel_gateway_g12_ipv6_fragment_then_destination_options_and_extension_bounds() {
     let fixture = Fixture::new();
     let program = fixture.load(false);
     let (key, frame) = v6_extensions(43008, &[44, 60], &[8, 8]);
@@ -543,6 +647,10 @@ fn kernel_gateway_ipv6_fragment_then_destination_options_and_extension_bounds() 
     later[56..58].copy_from_slice(&8u16.to_be_bytes());
     assert_eq!(run(&program, &later, 0).0, XDP_DROP as u32);
     assert_eq!(fixture.stat(GatewayReason::XskFragment), 1);
+    let (chain_key, chain) = v6_extensions(43417, &[0, 43, 44, 60], &[8, 8, 8, 8]);
+    assert_eq!(run(&program, &chain, 0).0, XDP_DROP as u32);
+    assert!(fixture.maps.lookup_hold(&chain_key).unwrap().is_some());
+    assert_eq!(fixture.input(43417).l4proto, L4ProtoType::Udp as u32);
     let (bounded_key, bounded) = v6_extensions(43009, &[60; 8], &[32; 8]);
     assert_eq!(run(&program, &bounded, 0).0, XDP_DROP as u32);
     assert!(fixture.maps.lookup_hold(&bounded_key).unwrap().is_some());
@@ -556,7 +664,7 @@ fn kernel_gateway_ipv6_fragment_then_destination_options_and_extension_bounds() 
     atomic[57] = 0;
     atomic[58..62].copy_from_slice(&106u32.to_be_bytes());
     assert_eq!(run(&program, &atomic, 0).0, XDP_DROP as u32);
-    assert_eq!(fixture.stat(GatewayReason::XskNewFlow), 3);
+    assert_eq!(fixture.stat(GatewayReason::XskNewFlow), 4);
     assert_eq!(fixture.stat(GatewayReason::PassNonTransport), 0);
     let atomic_fragment = fragment_key(atomic_key, u32::from_ne_bytes(106u32.to_be_bytes()));
     let error = bpf(
@@ -681,6 +789,10 @@ fn ct_tuple(key: GatewayKey) -> Vec<u8> {
 }
 
 fn insert_conntrack(key: GatewayKey) {
+    insert_conntrack_aliases(key, reverse(key));
+}
+
+fn insert_conntrack_aliases(key: GatewayKey, reply: GatewayKey) {
     let raw = unsafe {
         libc::socket(
             libc::AF_NETLINK,
@@ -701,7 +813,7 @@ fn insert_conntrack(key: GatewayKey) {
         0,
     ];
     body.extend(attr(1 | 0x8000, &ct_tuple(key)));
-    body.extend(attr(2 | 0x8000, &ct_tuple(reverse(key))));
+    body.extend(attr(2 | 0x8000, &ct_tuple(reply)));
     // ctnetlink confirms the new entry before applying CTA_STATUS, which cannot clear CONFIRMED.
     let status = (1u32 << 1) | (1u32 << 3); // IPS_SEEN_REPLY | IPS_CONFIRMED
     body.extend(attr(3, &status.to_be_bytes()));
@@ -844,6 +956,7 @@ fn kernel_gateway_vlan_realm_masks_pcp_dei_and_rejects_unknown_vid() {
 
 #[test]
 #[ignore = "requires root in a disposable virtme guest private netns"]
+/// The capacity-one map covers small-capacity behavior; G17 separately fills the production map.
 fn kernel_gateway_local_dns_exception_and_full_hold_drop() {
     let mut fixture = Fixture::new();
     fixture.maps.hold = bpf_fd(
@@ -889,4 +1002,109 @@ fn kernel_gateway_local_dns_exception_and_full_hold_drop() {
     let mut count = 0u64;
     get(fixture.counters.as_fd(), &0u32, &mut count as *mut _ as u64);
     assert_eq!(count, 1, "hold insertion failure must precede redirect");
+}
+
+#[test]
+#[ignore = "requires root in a disposable virtme guest private netns and the full production hold map"]
+fn kernel_gateway_g17_production_capacity_hold_full_drops_before_xsk() {
+    let fixture = Fixture::new();
+    let program = fixture.load(false);
+    let mut info = [0u32; 6];
+    object_info(fixture.maps.hold.as_fd(), &mut info).unwrap();
+    assert_eq!(info[0], 1, "production hold must remain a non-LRU hash");
+    let capacity = info[4];
+    assert_eq!(capacity, 65536);
+    let (base, _) = udp(0);
+    let inserted_at = now();
+    let initial = EndpointHold {
+        first_seen_ns: inserted_at,
+        last_seen_ns: inserted_at,
+    };
+    for port in 0..capacity {
+        let key = GatewayKey {
+            sport: (port as u16).to_be(),
+            ..base
+        };
+        fixture
+            .maps
+            .insert_hold(&key, initial.first_seen_ns)
+            .unwrap();
+    }
+    let entries = || {
+        let mut cursor: Option<GatewayKey> = None;
+        let mut count = 0u32;
+        loop {
+            let mut next = GatewayKey::default();
+            match bpf(
+                4,
+                &mut MapElemAttr {
+                    map_fd: fixture.maps.hold.as_raw_fd() as u32,
+                    reserved: 0,
+                    key: cursor.as_ref().map_or(0, |key| key as *const _ as u64),
+                    value: &mut next as *mut _ as u64,
+                    flags: 0,
+                },
+            ) {
+                Ok(_) => {
+                    count += 1;
+                    assert!(count <= capacity);
+                    assert_eq!(fixture.maps.lookup_hold(&next).unwrap(), Some(initial));
+                    cursor = Some(next);
+                }
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::ENOENT));
+                    return count;
+                }
+            }
+        }
+    };
+    let before_entries = entries();
+    assert_eq!(before_entries, capacity);
+    let candidate = GatewayKey {
+        dport: 444u16.to_be(),
+        ..base
+    };
+    let before_failed = fixture.stat(GatewayReason::HoldInsertFailed);
+    let before_xsk = fixture.stat(GatewayReason::XskNewFlow);
+    let mut before_redirects = 0u64;
+    get(
+        fixture.counters.as_fd(),
+        &0u32,
+        &mut before_redirects as *mut _ as u64,
+    );
+    assert_eq!(run(&program, &frame_for(candidate), 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.maps.lookup_hold(&candidate).unwrap(), None);
+    assert_eq!(
+        fixture.stat(GatewayReason::HoldInsertFailed),
+        before_failed + 1
+    );
+    assert_eq!(fixture.stat(GatewayReason::XskNewFlow), before_xsk);
+    let mut after_redirects = 0u64;
+    get(
+        fixture.counters.as_fd(),
+        &0u32,
+        &mut after_redirects as *mut _ as u64,
+    );
+    assert_eq!(
+        after_redirects, before_redirects,
+        "full hold must fail before redirect"
+    );
+    let after_entries = entries();
+    assert_eq!(after_entries, capacity);
+    for port in 0..capacity {
+        assert_eq!(
+            fixture
+                .maps
+                .lookup_hold(&GatewayKey {
+                    sport: (port as u16).to_be(),
+                    ..base
+                })
+                .unwrap(),
+            Some(initial),
+            "existing entry {port} was evicted or rewritten"
+        );
+    }
+    println!(
+        "G17 production hold capacity={capacity} entries_before={before_entries} entries_after={after_entries} hold_insert_failed_delta=1 redirect_delta=0"
+    );
 }

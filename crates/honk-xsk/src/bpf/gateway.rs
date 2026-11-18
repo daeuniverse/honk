@@ -449,6 +449,16 @@ mod tests {
             std::fs::metadata("/proc/self/ns/net").unwrap().ino(),
             std::fs::metadata("/proc/1/ns/net").unwrap().ino()
         );
+        assert!(matches!(
+            std::env::var("HONK_CI_VM_LANE").as_deref(),
+            Ok("floor" | "recent")
+        ));
+        assert_eq!(
+            std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .unwrap()
+                .trim(),
+            std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap()
+        );
     }
 
     fn maps() -> GatewayMaps {
@@ -558,6 +568,58 @@ mod tests {
         })
         .unwrap();
         assert_eq!(visited.len(), 75);
+    }
+
+    #[test]
+    #[ignore = "requires disposable VM root and private network namespace"]
+    fn kernel_gateway_g17_sweep_strict_idle_boundary_and_retention_callback() {
+        require_vm();
+        let maps = maps();
+        let idle = Duration::from_nanos(HOLD_IDLE_NS);
+        let now_ns = HOLD_IDLE_NS + 100;
+        let boundary = key(1235);
+        let recent = key(1236);
+        let retained = key(1237);
+        let unowned = key(1238);
+        for (key, last_seen_ns) in [
+            (boundary, 100),
+            (recent, 101),
+            (retained, 99),
+            (unowned, 99),
+        ] {
+            update(
+                maps.hold.as_fd(),
+                &key,
+                &EndpointHold {
+                    first_seen_ns: 1,
+                    last_seen_ns,
+                },
+                1,
+            )
+            .unwrap();
+        }
+        let mut queried = std::collections::HashSet::new();
+        assert_eq!(
+            maps.retire_if_unretained(now_ns, idle, |key| {
+                queried.insert(*key);
+                *key == retained
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(queried, [retained, unowned].into_iter().collect());
+        assert!(maps.lookup_hold(&boundary).unwrap().is_some());
+        assert!(maps.lookup_hold(&recent).unwrap().is_some());
+        assert!(maps.lookup_hold(&retained).unwrap().is_some());
+        assert_eq!(maps.lookup_hold(&unowned).unwrap(), None);
+        assert_eq!(
+            maps.retire_if_unretained(now_ns + 1, idle, |_| false)
+                .unwrap(),
+            2
+        );
+        assert_eq!(maps.lookup_hold(&boundary).unwrap(), None);
+        assert_eq!(maps.lookup_hold(&retained).unwrap(), None);
+        assert!(maps.lookup_hold(&recent).unwrap().is_some());
     }
 
     #[test]

@@ -1990,6 +1990,17 @@ async fn generated_empty_turns_do_not_create_protocol_deadlines() {
 
 #[tokio::test]
 async fn gateway_hold_retains_real_queued_exported_and_cq_output() {
+    gateway_output_owners().await;
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's guarded disposable-VM namespace for G17 owner evidence"]
+async fn gateway_g17_real_queued_exported_and_simulated_completion() {
+    super::driven_kernel::gateway::guard();
+    gateway_output_owners().await;
+}
+
+async fn gateway_output_owners() {
     for (client, remote) in [
         ("192.0.2.10:41000", "198.51.100.9:443"),
         ("[2001:db8::10]:41000", "[2001:db8::20]:443"),
@@ -2003,15 +2014,244 @@ async fn gateway_hold_retains_real_queued_exported_and_cq_output() {
         sender.send_to(b"reply", client).await.unwrap();
         assert!(endpoints.retains_source(scope.scope(), address));
         assert!(!endpoints.retains_source(ScopeId::allocate().unwrap(), address));
+        assert!(scope.retains_source(address));
+        println!(
+            "G17 real_owner stage=queued scope={:?} source={address} retained=true",
+            scope.scope()
+        );
         let exported = scope.next_output().await.unwrap();
         scope.shutdown(true);
         assert!(endpoints.retains_source(scope.scope(), address));
+        assert!(scope.retains_source(address));
+        println!(
+            "G17 real_owner stage=exported scope={:?} source={address} retained=true",
+            scope.scope()
+        );
         let mut retained = Retained::Endpoint(exported.into_owner());
         assert!(endpoints.retains_source(scope.scope(), address));
+        println!(
+            "G17 simulated_completion stage=before_release_completed scope={:?} source={address} retained=true nic_tx=false",
+            scope.scope()
+        );
         release_completed(&mut [Some(&mut retained)]);
         assert!(!endpoints.retains_source(scope.scope(), address));
+        assert!(!scope.retains_source(address));
+        println!(
+            "G17 simulated_completion stage=after_release_completed scope={:?} source={address} retained=false nic_tx=false",
+            scope.scope()
+        );
         drop((retained, sender));
         endpoints.shutdown().await.unwrap();
         owner.run().await.unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's guarded disposable-VM namespace and real UDP sockets"]
+async fn gateway_g17_real_scope_and_udp_pool_owners() -> anyhow::Result<()> {
+    super::driven_kernel::gateway::guard();
+    println!(
+        "G17 accepted_limit: a pre-admission RX/worker stall of about 29 seconds may outlive the hold before source retention exists; this fixture adds no admission timing guarantee"
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+        let client: SocketAddr = "192.0.2.10:41117".parse()?;
+        let remote: SocketAddr = "198.51.100.9:443".parse()?;
+        scope.receive(&segment(client, remote, 100, 0, tcp::SYN), Instant::now());
+        let (_, mut flow) = scope.poll_accept().unwrap();
+        assert!(scope.retains_source(client.ip()));
+        assert!(endpoints.retains(scope.scope(), client, remote, 6));
+        assert!(endpoints.retains_source(scope.scope(), client.ip()));
+        assert!(!endpoints.retains_source(ScopeId::allocate().unwrap(), client.ip()));
+        println!("G17 real_owner stage=scope_tcp scope={:?} tuple={client}->{remote}/tcp retained=true", scope.scope());
+        flow.abort();
+        drop(flow);
+        endpoints.shutdown().await?;
+        owner.run().await?;
+
+        let (scope, scope_owner, _budget, plane, _slots) = fixture_parts();
+        let health = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        plane.alive_set().set_direct_check_addr(health.local_addr()?.to_string());
+        let (endpoints, owner) = PacketEndpoints::new(plane, vec![(scope.clone(), scope_owner)], 4).await?;
+        let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let target = upstream.local_addr()?;
+        assert!(!scope.retains_source(client.ip()));
+        assert!(!endpoints.retains_source(scope.scope(), client.ip()));
+        endpoints.receive(
+            scope.scope(),
+            &datagram(client, target, b"G17/pool-owner"),
+            Instant::now(),
+        )?;
+        let mut bytes = [0; 128];
+        let (length, sender) = upstream.recv_from(&mut bytes).await?;
+        assert_eq!(&bytes[..length], b"G17/pool-owner");
+        assert!(endpoints.retains(scope.scope(), client, target, 17));
+        assert!(endpoints.retains_source(scope.scope(), client.ip()));
+        assert!(scope.retains_source(client.ip()));
+        println!("G17 real_owner stage=udp_pool scope={:?} tuple={client}->{target}/udp retained=true scope_retained=true upstream_source={sender}", scope.scope());
+        upstream.send_to(b"G17/pool-reply", sender).await?;
+        let output = scope.next_output().await.unwrap();
+        assert!(output.packet().ends_with(b"G17/pool-reply"));
+        assert!(scope.retains_source(client.ip()));
+        output.release();
+        assert!(scope.retains_source(client.ip()));
+        assert!(endpoints.retains_source(scope.scope(), client.ip()));
+        assert!(endpoints.retains(scope.scope(), client, target, 17));
+        println!("G17 real_owner stage=udp_pool_after_output_release scope={:?} source={} retained=true scope_retained=true", scope.scope(), client.ip());
+        println!("NOT_RUN: G17 source_receiver: ordinary Direct UDP uses its endpoint receive loop; no real shared-source proxy receiver is installed by this fixture");
+        endpoints.shutdown().await?;
+        owner.run().await?;
+        assert!(!endpoints.retains_source(scope.scope(), client.ip()));
+        assert!(!scope.retains_source(client.ip()));
+        Ok(())
+    })
+    .await
+    .expect("G17 scope/pool owner fixture must join")
+}
+
+pub(super) async fn gateway_g17_port_outputs(
+    port: &mut Port<Retained>,
+    ifindex: u32,
+) -> anyhow::Result<(PacketEndpoints, PacketEndpointOwner)> {
+    let client: SocketAddr = "192.0.2.2:41117".parse()?;
+    let remote: SocketAddr = "198.51.100.9:443".parse()?;
+    let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+    scope
+        .datagram_sender(remote)
+        .send_to(b"G17/early-release", client)
+        .await?;
+    let output = scope.next_output().await.unwrap();
+    scope.shutdown(true);
+    assert!(endpoints.retains_source(scope.scope(), client.ip()));
+    let before = port.counters();
+    let error = port
+        .transmit_with(
+            TxClass::Bulk,
+            0,
+            Retained::Endpoint(output.into_owner()),
+            |_, _| panic!("invalid packet extent must release before materialization"),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(port.counters(), before);
+    assert!(!endpoints.retains_source(scope.scope(), client.ip()));
+    println!(
+        "G17 real_port stage=transmit_with_early_release device=dut0 ifindex={ifindex} source={} retained=false submitted_delta=0 completed_delta=0 cause=invalid_extent nic_tx=false",
+        client.ip()
+    );
+    endpoints.shutdown().await?;
+    owner.run().await?;
+
+    let (endpoints, owner, scope, _budget, _slots) = fixture().await;
+    scope
+        .datagram_sender(remote)
+        .send_to(b"G17/physical-cq", client)
+        .await?;
+    assert!(scope.retains_source(client.ip()));
+    let output = scope.next_output().await.unwrap();
+    let mut header = [0; 14];
+    header[..6].copy_from_slice(&[2, 0, 0, 0, 0, 0x20]);
+    header[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 0x10]);
+    header[12..].copy_from_slice(&0x0800u16.to_be_bytes());
+    let mut frame = header.to_vec();
+    frame.extend_from_slice(output.packet());
+    let expected: String = frame.iter().map(|byte| format!("{byte:02x}")).collect();
+    let script = r#"
+import os, select, socket, sys, time
+fd = os.open('/run/netns/client', os.O_RDONLY)
+os.setns(fd, 0)
+os.close(fd)
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+sock.bind(('c0', 0))
+expected = bytes.fromhex(sys.argv[1])
+print('READY', flush=True)
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    if not select.select([sock], [], [], max(0, deadline - time.monotonic()))[0]:
+        break
+    packet, peer = sock.recvfrom(65535)
+    if peer[2] != 4 and b'G17/physical-cq' in packet:
+        assert packet[:len(expected)] == expected, packet.hex()
+        print('WIRE G17/physical-cq', flush=True)
+        break
+else:
+    pass
+sock.close()
+"#;
+    let mut child = tokio::process::Command::new("python3")
+        .args(["-u", "-c", script, &expected])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut lines =
+        tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(child.stdout.take().unwrap()));
+    assert_eq!(lines.next_line().await?.as_deref(), Some("READY"));
+    scope.shutdown(true);
+    let before = port.counters();
+    assert_eq!(
+        before.submitted, before.completed,
+        "G17 owns an idle physical TX queue"
+    );
+    let rings_before = port.rings();
+    port.transmit_with(
+        TxClass::Bulk,
+        frame.len(),
+        Retained::Endpoint(output.into_owner()),
+        |retained, target| {
+            let Retained::Endpoint(owner) = retained else {
+                return Err(io::Error::other("wrong G17 output owner"));
+            };
+            fill_output(target, &header, owner.packet().unwrap())
+        },
+    )?;
+    assert_eq!(port.counters().submitted - before.submitted, 1);
+    assert_eq!(port.counters().completed, before.completed);
+    assert!(endpoints.retains_source(scope.scope(), client.ip()));
+    println!(
+        "G17 real_port stage=submitted device=dut0 ifindex={ifindex} tuple={remote}->{client}/udp retained=true counters={:?} rings_before={rings_before:?} rings_after={:?}",
+        port.counters(),
+        port.rings()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut released = false;
+    while !released && Instant::now() < deadline {
+        port.kick()?;
+        port.complete(|completed| {
+            if completed.iter().any(Option::is_some) {
+                assert!(endpoints.retains_source(scope.scope(), client.ip()));
+                release_completed(completed);
+                assert!(!endpoints.retains_source(scope.scope(), client.ip()));
+                released = true;
+            }
+        })?;
+        if !released {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    if released {
+        assert_eq!(port.counters().completed - before.completed, 1);
+        println!(
+            "G17 real_port stage=cq_released device=dut0 ifindex={ifindex} tuple={remote}->{client}/udp retained=false counters={:?} rings={:?} evidence=actual_kernel_cq_not_delivery_receipt",
+            port.counters(),
+            port.rings()
+        );
+    } else {
+        println!(
+            "NOT_RUN: G17 nic_cq: no completed descriptor observed in the bounded real-veth interval; normal capture teardown retains and drains the outstanding owner"
+        );
+    }
+    let wire = lines.next_line().await?;
+    anyhow::ensure!(child.wait().await?.success(), "G17 wire witness failed");
+    if wire.as_deref() == Some("WIRE G17/physical-cq") {
+        println!(
+            "G17 real_wire device=dut0 peer=c0 tuple={remote}->{client}/udp payload=G17/physical-cq exact_frame=true"
+        );
+    } else {
+        println!(
+            "NOT_RUN: G17 nic_wire: real AF_PACKET peer did not observe the exact submitted frame in its bounded interval"
+        );
+    }
+    endpoints.close();
+    Ok((endpoints, owner))
 }

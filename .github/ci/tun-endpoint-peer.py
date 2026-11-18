@@ -630,6 +630,31 @@ def live_client(number, source):
         tcp_close(tcp)
 
 
+def notification_client(number, source, progress):
+    number = int(number)
+    target = TARGETS[number][0]
+    with tcp_open(number, source, target, 18081) as tcp, socket.socket(family(number), socket.SOCK_DGRAM) as udp, Path(progress).open('w', buffering=1) as output:
+        udp.settimeout(8)
+        udp.bind((source, 22003))
+        udp.connect((target, 18081))
+        sequence = 0
+        while True:
+            payload = f'G18-{number}-{sequence}'.encode()
+            started = time.monotonic_ns()
+            tcp_exchange(tcp, payload)
+            assert udp.send(payload) == len(payload)
+            assert udp.recv(4096) == payload
+            output.write(json.dumps(dict(sequence=sequence, payload=payload.hex(),
+                                         started_ns=started, monotonic_ns=time.monotonic_ns(),
+                                         tcp=endpoint(tcp.getsockname()), udp=endpoint(udp.getsockname()))) + '\n')
+            sequence += 1
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                assert sys.stdin.readline().strip() == 'stop'
+                break
+        tcp_close(tcp)
+    print(json.dumps(dict(exchanges=sequence, closed=True)), flush=True)
+
+
 def checksum(data):
     if len(data) & 1:
         data += b'\0'
@@ -1677,13 +1702,91 @@ def packet_extensions(fixture):
     fixture.fence_counters()
 
 
-def crash_fault(daemon, root, number, topology=False):
-    label = f'A-{number}-' + ('topology-fault' if topology else 'crash-guard')
+def unrelated_notifications(fixture):
+    dut, number = fixture.names['dut'], fixture.number
+    option = '-' + str(number)
+    address = '203.0.113.1/24' if number == 4 else 'fd00:318::1/64'
+    destination = '203.0.114.0/24' if number == 4 else 'fd00:319::/64'
+    progress = fixture.directory / 'G18-payload.jsonl'
+    process = child(fixture, fixture.names['source'], 'notification-client', number, fixture.source, progress,
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=fixture.open('G18-payload.stderr'))
+    pid, starttime = fixture.daemon.pid, fixture.starttime
+    evidence = []
+
+    def latest():
+        assert process.poll() is None, 'G18 continuous bidirectional payload client exited'
+        assert fixture.daemon.poll() is None, 'unrelated notification closed TUN capture'
+        rows = progress.read_text().split('\n')[:-1] if progress.exists() else []
+        return json.loads(rows[-1]) if rows else None
+
+    try:
+        initial = eventually(latest, 'G18 continuous payload did not start')
+        sockets = initial['tcp'], initial['udp']
+        steps = (
+            ('link-add', ('link', 'add', 'gunrel0', 'type', 'veth', 'peer', 'name', 'gunrel1')),
+            ('link-up', ('link', 'set', 'gunrel0', 'addrgenmode', 'none', 'up')),
+            ('link-down', ('link', 'set', 'gunrel0', 'down')),
+            ('link-up-again', ('link', 'set', 'gunrel0', 'up')),
+            ('address-add', (option, 'address', 'add', address, 'dev', 'gunrel0', *([] if number == 4 else ['nodad']))),
+            ('route-add', (option, 'route', 'add', destination, 'dev', 'gunrel0', 'table', '203')),
+            ('route-delete', (option, 'route', 'del', destination, 'dev', 'gunrel0', 'table', '203')),
+            ('address-delete', (option, 'address', 'del', address, 'dev', 'gunrel0')),
+            ('link-delete', ('link', 'del', 'gunrel0')),
+        )
+        for name, args in steps:
+            before = fixture.counters()
+            ip(dut, *args)
+            completed = time.monotonic_ns()
+
+            def advanced():
+                observed = latest()
+                return observed if observed and observed['started_ns'] > completed else None
+
+            observed = eventually(advanced, 'G18 payload stopped after ' + name)
+            assert (observed['tcp'], observed['udp']) == sockets, 'G18 payload sockets were replaced'
+            assert fixture.daemon.pid == pid
+            assert int(Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]) == starttime
+            assert fixture.device_identity() == fixture.identity, 'unrelated notification replaced TUN capture'
+            fixture.check_active()
+            after = fixture.counters()
+            assert all(after[direction] > before[direction] for direction in ('tx', 'rx')), (name, before, after)
+            events = [event for event in fixture.peer_events()
+                      if event['kind'] == 'echo' and event.get('payload') == observed['payload']]
+            assert {event['transport'] for event in events} == {'tcp', 'udp'}, (name, observed, events)
+            evidence.append(dict(step=name, argv=list(args), completed_ns=completed, payload=observed,
+                                 daemon_pid=pid, starttime=starttime, identity=fixture.identity,
+                                 counters_before=before, counters_after=after, peer_events=events))
+            (fixture.directory / 'G18-unrelated.json').write_text(json.dumps(evidence, indent=2) + '\n')
+            fixture.snapshot('G18-' + name)
+            print(f'PASS: G18 IPv{number} unrelated {name}: PID, TUN FD and bidirectional TCP/UDP payload preserved', flush=True)
+        process.stdin.write('stop\n')
+        process.stdin.flush()
+        assert line(process)['closed']
+        assert process.wait(timeout=15) == 0
+        fixture.fence_counters()
+    finally:
+        stop(process)
+
+
+def crash_fault(daemon, root, number, topology=False, owned=None):
+    label = f'A-{number}-' + ('G18-owned-' + owned if owned else ('topology-fault' if topology else 'crash-guard'))
     with Fixture(daemon, root, label, number) as fixture:
         fixture.start()
         fixture.exchange('before-fatal')
-        if topology:
+        if owned:
+            dut, option = fixture.names['dut'], '-' + str(number)
+            fixture.snapshot('G18-before-owned-' + owned)
+            if owned == 'route':
+                ip(dut, option, 'route', 'del', 'default', 'dev', 'honk0', 'table', '202', 'proto', 'static', 'metric', '1024')
+            elif owned == 'rule':
+                ip(dut, option, 'rule', 'del', 'priority', '10000', 'fwmark', '0x100/0xffffffff', 'lookup', 'main')
+            else:
+                assert owned == 'address'
+                address = '198.18.0.1/32' if number == 4 else 'fd00:686f:6e6b:100::1/128'
+                ip(dut, option, 'address', 'del', address, 'dev', 'honk0')
+        elif topology:
             ip(fixture.names['dut'], '-' + str(number), 'route', 'del', 'default')
+        if topology or owned:
             assert fixture.daemon.wait(timeout=20) != 0, 'topology failure returned success'
             assert 'TUN owner failed closed' in fixture.log.read_text(), 'missing fatal owner outcome'
         else:
@@ -1694,7 +1797,9 @@ def crash_fault(daemon, root, number, topology=False):
         fixture.check_receipt()
         for current in (4, 6):
             rules = json_ip(dut, '-' + str(current), 'rule', 'show')
-            assert len([rule for rule in rules if 10000 <= rule.get('priority', -1) <= 10004]) == 5
+            expected = [priority for priority in range(10000, 10005)
+                        if not (owned == 'rule' and current == number and priority == 10000)]
+            assert [rule['priority'] for rule in rules if 10000 <= rule.get('priority', -1) <= 10004] == expected, rules
             routes = json_ip(dut, '-' + str(current), 'route', 'show', 'table', '202')
             assert len(routes) == 1 and routes[0].get('type') == 'blackhole' and routes[0].get('metric') == 32760, routes
             assert ip(dut, '-' + str(current), 'route', 'get', TARGETS[current][0], check=False).returncode != 0, 'capture fell through to native main route'
@@ -1711,6 +1816,9 @@ def crash_fault(daemon, root, number, topology=False):
         assert 'TUN datapath ready' not in (fixture.directory / 'restart-rejected.log').read_text()
         fixture.snapshot('retained-guards')
         fixture.fence_counters()
+        if owned:
+            assert 'TUN capture guards, policy rules and setup receipt retained' in fixture.log.read_text()
+            print(f'PASS: G18 IPv{number} owned {owned}: fatal, TUN FD closed, remaining custody retained, traffic blocked and restart refused', flush=True)
 
 
 def setup_fault(daemon, root, number, fault):
@@ -1843,9 +1951,9 @@ def gate(daemon, root, selected=()):
     root = Path(root)
     fault_names = ('name', 'table', 'priority', 'address', 'main-route', 'rpdb', 'dns-bind', 'no-cap', 'no-tun')
     cases = ROWS + [f'A-{number}-{name}' for number in (4, 6)
-                    for name in ('DNS', 'control', 'packets', 'instance-lock', 'close-active', 'strict-rpf',
-                                 'crash-guard', 'topology-fault', *('setup-' + fault for fault in fault_names))] + [
-                                     f'B-{number}-process' for number in (4, 6)]
+                    for name in ('DNS', 'control', 'packets', 'G18-unrelated', 'instance-lock', 'close-active', 'strict-rpf',
+                                 'crash-guard', 'topology-fault', *('G18-owned-' + kind for kind in ('route', 'rule', 'address')),
+                                 *('setup-' + fault for fault in fault_names))] + [f'B-{number}-process' for number in (4, 6)]
     assert len(selected) == len(set(selected)), ('duplicate TUN row selection', selected)
     assert all(isinstance(row, str) and row and row in cases for row in selected), ('unknown or empty TUN row selection', selected)
     requested = set(selected or cases)
@@ -1892,13 +2000,26 @@ def gate(daemon, root, selected=()):
             'reason': 'No deterministic external TUN write(EAGAIN) forcing seam; interface counters prove FD traffic only.',
             'separate_regression': 'tun::tests::writable_readiness_retries_the_same_lease_without_new_input uses a real saturated datagram socketpair and the production flush function.'
         },
+        'G18_malformed_netlink': {
+            'status': 'NOT_RUN',
+            'reason': 'The kernel cannot reliably emit a malformed route notification for this fixture; synthetic messages are not kernel evidence.'
+        },
+        'G18_ENOBUFS': {
+            'status': 'NOT_RUN',
+            'reason': 'Cannot deterministically induce and causally observe loss on the actual daemon netlink socket; no synthetic overflow is injected.'
+        },
         'oversize_datagram_boundary': 'The ordinary UDP length ceiling is rejected by the source kernel; this is not a claim of TUN FD jumbogram rejection.'
     }, indent=2) + '\n')
+    if any('-G18-' in row for row in requested):
+        print('NOT_APPLICABLE: G18 unrelated rule: TUN admission accepts only standard local/main/default operator rules (topology.rs:1917-1920); a foreign rule is custody-relevant, not unrelated', flush=True)
+        print('NOT_RUN: G18 malformed netlink: kernel cannot reliably emit malformed route notifications; no synthetic messages', flush=True)
+        print('NOT_RUN: G18 ENOBUFS: cannot reliably induce and correlate loss on the actual daemon netlink socket', flush=True)
     for row in ROWS:
         record(row, lambda row=row: matrix_row(daemon, root, row, diagnostic_tcp=bool(selected)))
     for number in (4, 6):
         record(f'B-{number}-process', lambda number=number: process_routes(daemon, root, number))
-        for name, operation in (('DNS', dns_extensions), ('control', control_extensions), ('packets', packet_extensions)):
+        for name, operation in (('DNS', dns_extensions), ('control', control_extensions), ('packets', packet_extensions),
+                                ('G18-unrelated', unrelated_notifications)):
             row = f'A-{number}-{name}'
             def extension(number=number, row=row, operation=operation):
                 with Fixture(daemon, root, row, number) as fixture:
@@ -1915,6 +2036,9 @@ def gate(daemon, root, selected=()):
         for topology in (False, True):
             record(f'A-{number}-' + ('topology-fault' if topology else 'crash-guard'),
                    lambda number=number, topology=topology: crash_fault(daemon, root, number, topology))
+        for owned in ('route', 'rule', 'address'):
+            record(f'A-{number}-G18-owned-{owned}',
+                   lambda number=number, owned=owned: crash_fault(daemon, root, number, owned=owned))
     assert all(results[row]['status'] != 'NOT_RUN' for row in requested)
     assert not failures, ('TUN scenarios failed; inspect independent row artifacts', failures)
 
@@ -2051,6 +2175,8 @@ def main():
         one_exchange(*args)
     elif mode == 'live':
         live_client(*args)
+    elif mode == 'notification-client':
+        notification_client(*args)
     elif mode == 'inject':
         inject(*args)
     elif mode == 'mtu':
