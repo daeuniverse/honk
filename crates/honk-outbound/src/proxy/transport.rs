@@ -322,12 +322,12 @@ pub(crate) async fn wrap_tunnel(
             Box::new(crate::tls::BatchRead::new(tls_stream))
         } else if tls.enabled {
             let connector = crate::tls::build_connector(node)?;
+            let server_name = tls_server_name(node);
             // Discovery would send this hop's server name to the local
             // resolver, outside the tunnel.
-            if connector.discovers_ech() {
+            if connector.discovers_ech(&server_name) {
                 return Err(crate::proxy::TunnelUnsupported("tls ech discovery").into());
             }
-            let server_name = tls_server_name(node);
             let tls_stream = connector.connect(&server_name, carrier).await?;
             Box::new(crate::tls::BatchRead::new(tls_stream))
         } else {

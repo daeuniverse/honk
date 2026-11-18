@@ -78,26 +78,38 @@ async fn tls_server(stream: DuplexStream) -> tokio_boring::SslStream<DuplexStrea
 
 #[tokio::test]
 async fn tls_runs_over_a_tunneled_carrier() {
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let server = tokio::spawn(async move {
-        let mut tls = tls_server(server).await;
-        let mut request = [0; 4];
-        tls.read_exact(&mut request).await.unwrap();
-        assert_eq!(&request, b"ping");
-        tls.write_all(b"pong").await.unwrap();
-        tls.flush().await.unwrap();
-    });
+    // A literal IP gives ECH discovery no name to query, so it is allowed.
+    let ech_with_sni = |sni: &str| TlsOptions {
+        ech_enabled: true,
+        sni: Some(sni.into()),
+        ..skip_verify_tls()
+    };
+    for tls in [
+        skip_verify_tls(),
+        ech_with_sni("127.0.0.1"),
+        ech_with_sni("[::1]"),
+    ] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut tls = tls_server(server).await;
+            let mut request = [0; 4];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            tls.write_all(b"pong").await.unwrap();
+            tls.flush().await.unwrap();
+        });
 
-    let node = tls_node(skip_verify_tls());
-    let mut stream = tokio::time::timeout(
-        TIMEOUT,
-        wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    ping_pong(&mut stream).await;
-    server.await.unwrap();
+        let node = tls_node(tls);
+        let mut stream = tokio::time::timeout(
+            TIMEOUT,
+            wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        ping_pong(&mut stream).await;
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -210,9 +210,9 @@ impl TlsConnector {
         Ok(cfg)
     }
 
-    /// Whether `connect` may query DNS for the server's ECHConfigList.
-    pub(crate) fn discovers_ech(&self) -> bool {
-        self.ech_discovery
+    /// Whether `connect` to `domain` may query DNS for its ECHConfigList.
+    pub(crate) fn discovers_ech(&self, domain: &str) -> bool {
+        self.ech_discovery && ech_discoverable(domain)
     }
 
     /// TLS client handshake over `stream`, verifying the peer against
@@ -436,15 +436,22 @@ static ECH_DISCOVERY_CACHE: LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
 > = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
+/// DNS can publish an ECHConfigList only for a domain name, not an address.
+fn ech_discoverable(domain: &str) -> bool {
+    let name = domain.trim_end_matches('.');
+    let host = name.trim_start_matches('[').trim_end_matches(']');
+    !name.is_empty() && host.parse::<std::net::IpAddr>().is_err()
+}
+
 /// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
 /// cached per domain (positive: record TTL clamped to 60s..1d; negative:
 /// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
 /// explicit `ech_config` which is fail-closed.
 pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
-    if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
+    if !ech_discoverable(domain) {
         return None;
     }
+    let key = domain.trim_end_matches('.').to_ascii_lowercase();
     if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
         && hit.expires > std::time::Instant::now()
     {
