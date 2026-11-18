@@ -1727,6 +1727,8 @@ def unrelated_notifications(fixture):
             ('link-up', ('link', 'set', 'gunrel0', 'addrgenmode', 'none', 'up')),
             ('link-down', ('link', 'set', 'gunrel0', 'down')),
             ('link-up-again', ('link', 'set', 'gunrel0', 'up')),
+            # Without carrier, address-add installs a LINKDOWN main route and must fail revalidation.
+            ('peer-up', ('link', 'set', 'gunrel1', 'addrgenmode', 'none', 'up')),
             ('address-add', (option, 'address', 'add', address, 'dev', 'gunrel0', *([] if number == 4 else ['nodad']))),
             ('route-add', (option, 'route', 'add', destination, 'dev', 'gunrel0', 'table', '203')),
             ('route-delete', (option, 'route', 'del', destination, 'dev', 'gunrel0', 'table', '203')),
