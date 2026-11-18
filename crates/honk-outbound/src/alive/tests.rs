@@ -2707,3 +2707,111 @@ async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error
         assert!(matches!(set.acquire_health_probe(), Err(error) if error == expected));
     }
 }
+
+/// A proxy chain registers without an address. With no HTTP check there is
+/// nothing to connect to, so a probe keeps its state instead of killing it.
+#[tokio::test]
+async fn test_raw_probe_keeps_the_state_of_a_node_without_an_address() {
+    let set = AliveDialerSet::new();
+    let node = id(7);
+    set.register_node(node, "via".into(), String::new());
+    set.node_registered_at
+        .write()
+        .insert(node, Instant::now() - GRACE_PERIOD);
+    for _ in 0..3 {
+        assert!(set.probe_node(node, Duration::from_millis(10)).await);
+    }
+    assert!(set.is_alive_for(node, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(
+        set.get_probe_history(node, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+
+    set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V4);
+    set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V6);
+    assert!(!set.probe_node(node, Duration::from_millis(10)).await);
+    assert!(!set.is_alive_for(node, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// Dials the probed node through its generation, as the core prober does, and
+/// counts a delivered stream as a successful check.
+struct GenerationDialProber {
+    registry: Arc<crate::proxy::ProxyRegistry>,
+    generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+}
+
+impl HttpProber for GenerationDialProber {
+    fn probe_http(
+        &self,
+        node_id: Uuid,
+        addr: std::net::SocketAddr,
+        _url: &str,
+        timeout: Duration,
+        _cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+        let registry = Arc::clone(&self.registry);
+        let generation = Arc::clone(&self.generation);
+        Box::pin(async move {
+            match registry
+                .dial_runtime(generation, node_id, addr, None, timeout)
+                .await
+            {
+                Ok(_) => HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into(),
+                Err(error) => HttpProbeResult::SetupFailure(format!("{error:#}")).into(),
+            }
+        })
+    }
+}
+
+/// With an HTTP check, a proxy chain is probed through all of its hops: it
+/// dies when its exit refuses the check target and revives when the exit
+/// carries it again.
+#[tokio::test]
+async fn test_http_probe_moves_a_chain_between_dead_and_alive() {
+    use crate::test_support::{chain, socks5, socks5_relay};
+    use std::sync::atomic::Ordering;
+
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let check = target.local_addr().unwrap();
+    let exit = socks5_relay(Vec::new(), true).await;
+    let entry = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", entry.addr.port());
+    let land = socks5("land", "127.0.0.1", exit.addr.port());
+    let via = chain(&[&front, &land]);
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap(),
+    );
+    let set = AliveDialerSet::new();
+    set.set_http_probe(
+        Arc::new(GenerationDialProber {
+            registry: Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
+            generation,
+        }),
+        format!("http://{check}/"),
+        "HEAD".into(),
+    )
+    .await;
+    set.register_node(via.id, via.name.clone(), String::new());
+    set.node_registered_at
+        .write()
+        .insert(via.id, Instant::now() - GRACE_PERIOD);
+    let alive = || set.is_alive_for(via.id, ProbeDomain::Tcp, IpVersion::V4);
+    let probe = || set.probe_node(via.id, Duration::from_secs(1));
+
+    for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+        assert!(!probe().await);
+    }
+    assert!(!alive());
+
+    exit.refuse.store(false, Ordering::SeqCst);
+    for _ in 0..RECOVERY_SUCCESSES_NEEDED {
+        assert!(probe().await);
+    }
+    assert!(alive());
+
+    exit.refuse.store(true, Ordering::SeqCst);
+    for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+        assert!(!probe().await);
+    }
+    assert!(!alive());
+}

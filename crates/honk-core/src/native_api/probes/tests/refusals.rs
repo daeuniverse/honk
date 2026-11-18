@@ -2,10 +2,22 @@ use super::*;
 
 #[tokio::test]
 async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
-    let proxy = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
+    let mut proxy = Node::from_share_link("socks5://127.0.0.1:1080").unwrap();
+    proxy.name = "front".into();
     let proxy_id = proxy.id.to_string();
+    let mut land = Node::from_share_link("socks5://127.0.0.1:1081").unwrap();
+    land.name = "land".into();
+    let mut chain = Node {
+        name: "via".into(),
+        outbound: honk_config::node::OutboundConfig::Chain {
+            hops: vec!["front".into(), "land".into()],
+        },
+        ..Node::default()
+    };
+    chain.id = chain.derive_id();
+    let chain_id = chain.id.to_string();
     let mut config = Config::default();
-    config.nodes.push(proxy);
+    config.nodes.extend([proxy, land, chain]);
     config.global.tcp_check_url = vec!["http://127.0.0.1:8080/PRIVATE".into()];
     config.global.udp_check_dns = Vec::new();
     let state = state(config).await;
@@ -26,6 +38,11 @@ async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
         (
             request(node(&direct), "tcp_connect", json!(["tcp"]), "ipv4"),
             "TCP connect probes do not apply to direct or block nodes",
+            json!({"field":"kind","allowed":["http","dns"]}),
+        ),
+        (
+            request(node(&chain_id), "tcp_connect", json!(["tcp"]), "ipv4"),
+            "TCP connect probes need a node address, which chain nodes do not have",
             json!({"field":"kind","allowed":["http","dns"]}),
         ),
         (

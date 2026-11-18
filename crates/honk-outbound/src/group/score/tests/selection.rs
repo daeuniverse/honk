@@ -583,7 +583,7 @@ fn publication_between_ranking_and_plan_construction_refuses_node_work() {
     );
     replacement.publish_score_membership();
     let published = replacement.score_budget_counters("score", SelectionNetwork::Tcp);
-    let plan = manager.score_selection_plan(candidates, mode, &context, None);
+    let plan = manager.score_selection_plan(candidates, mode, &context, None, manager.has_exits());
     assert!(
         !plan.entries[0]
             .feedback

@@ -1,8 +1,24 @@
-//! Group-graph resolution: construction-time cycle breaking, recursive
-//! candidate flattening through nested sub-groups, and the member/leaf
-//! introspection APIs (display tags vs. real nodes) built on top of them.
+//! Group-graph resolution: recursive candidate flattening through nested
+//! sub-groups, and the member/leaf introspection APIs (display tags vs. real
+//! nodes) built on top of it. Cycles are cut at construction by
+//! `honk_config::group_graph::cut_cycles`.
 
 use super::*;
+
+/// Which leaves [`GroupManager::visit_group_leaves`] reports.
+#[derive(Clone, Copy)]
+struct LeafWalk {
+    include_final: bool,
+}
+
+impl LeafWalk {
+    const MEMBERS: Self = Self {
+        include_final: false,
+    };
+    const REACHABLE: Self = Self {
+        include_final: true,
+    };
+}
 
 #[cfg(feature = "flow-observation")]
 pub struct GroupSelection<'a> {
@@ -18,19 +34,19 @@ impl GroupManager {
             .iter()
             .map(|group| (group.name.clone(), group.clone()))
             .collect();
-        break_group_cycles(&mut groups);
+        honk_config::group_graph::cut_cycles(&mut groups);
         groups
     }
 
     pub fn group(&self, name: &str) -> Option<&Group> {
-        self.groups.get(name)
+        self.groups.get(name).map(|entry| &entry.group)
     }
 
     pub fn group_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
         self.groups
             .get(name)
             .into_iter()
-            .flat_map(|group| self.members(group))
+            .flat_map(|entry| self.members(&entry.group))
     }
 
     /// Enumerate unique ordinary leaves, stopping before exceeding the request limit.
@@ -39,12 +55,18 @@ impl GroupManager {
         if limit == 0 {
             return leaves;
         }
-        self.visit_group_leaves(name, 0, &mut [""; MAX_GROUP_DEPTH], false, &mut |node| {
-            if !leaves.iter().any(|leaf| leaf.id == node.id) {
-                leaves.push(node);
-            }
-            leaves.len() == limit
-        });
+        self.visit_group_leaves(
+            name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            LeafWalk::MEMBERS,
+            &mut |node| {
+                if !leaves.iter().any(|leaf| leaf.id == node.id) {
+                    leaves.push(node);
+                }
+                leaves.len() == limit
+            },
+        );
         leaves
     }
 
@@ -63,7 +85,7 @@ impl GroupManager {
         if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&name) {
             return true;
         }
-        let Some(group) = self.groups.get(name) else {
+        let Some(group) = self.groups.get(name).map(|entry| &entry.group) else {
             return true;
         };
         let cost = 1usize
@@ -113,8 +135,7 @@ impl GroupManager {
             }
         };
         (node.protocol() != honk_config::types::NodeProtocol::Block
-            && (domain == ProbeDomain::Tcp
-                || (crate::descriptor::descriptor(node.protocol()).supports_udp)(node)))
+            && (domain == ProbeDomain::Tcp || self.node_carries_udp(node)))
         .then_some(node)
     }
 
@@ -124,7 +145,7 @@ impl GroupManager {
         name: &str,
         network: SelectionNetwork,
     ) -> Option<GroupSelection<'_>> {
-        self.peek_selection_inner(self.groups.get(name)?, network, 0)
+        self.peek_selection_inner(&self.groups.get(name)?.group, network, 0)
     }
 
     fn peek_selection_inner<'a>(
@@ -188,10 +209,13 @@ impl GroupManager {
 
 impl GroupManager {
     /// Resolve a group to the single leaf node its policy selects.
-    /// `visited`/`depth` thread the cycle/depth guards through nesting.
+    /// `visited`/`depth` thread the cycle/depth guards through nesting;
+    /// `routes` is the root's, as in `ScoreSelectionRules::routes`.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn pick_in_group<'a>(
         &'a self,
         group: &'a Group,
+        routes: bool,
         domain: ProbeDomain,
         ipver: IpVersion,
         visited: &mut Vec<&'a str>,
@@ -208,7 +232,10 @@ impl GroupManager {
             visited,
             depth,
             effects,
-            score::selection::ScoreSelectionRules::default(),
+            score::selection::ScoreSelectionRules {
+                routes,
+                ..Default::default()
+            },
         )
         .map(|candidate| candidate.node)
     }
@@ -252,7 +279,7 @@ impl GroupManager {
                 group
                     .groups
                     .iter()
-                    .filter_map(move |tag| self.groups.get(tag))
+                    .filter_map(move |tag| self.groups.get(tag).map(|entry| &entry.group))
                     .map(GroupMember::Group),
             )
     }
@@ -267,10 +294,11 @@ impl GroupManager {
         match name {
             Config::BUILTIN_DIRECT_NODE => Some(GroupMember::Node(&DIRECT)),
             Config::BUILTIN_BLOCK_NODE => Some(GroupMember::Node(&BLOCK)),
-            _ => self
-                .node_by_name(name)
-                .map(GroupMember::Node)
-                .or_else(|| self.groups.get(name).map(GroupMember::Group)),
+            _ => self.node_by_name(name).map(GroupMember::Node).or_else(|| {
+                self.groups
+                    .get(name)
+                    .map(|entry| GroupMember::Group(&entry.group))
+            }),
         }
     }
 
@@ -295,7 +323,7 @@ impl GroupManager {
     /// appear under their own tag, not expanded to leaves. Use
     /// [`GroupManager::reachable_leaf_nodes_in_group`] for health and connectivity.
     pub fn node_names_in_group(&self, group_name: &str) -> Vec<String> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return vec![];
         };
         self.member_tags(group)
@@ -329,7 +357,7 @@ impl GroupManager {
             group_name,
             0,
             &mut [""; MAX_GROUP_DEPTH],
-            true,
+            LeafWalk::REACHABLE,
             &mut |node| node.id == node_id,
         )
     }
@@ -340,7 +368,10 @@ impl GroupManager {
             group_name,
             0,
             &mut [""; MAX_GROUP_DEPTH],
-            include_final,
+            match include_final {
+                true => LeafWalk::REACHABLE,
+                false => LeafWalk::MEMBERS,
+            },
             &mut |node| {
                 if !out.iter().any(|existing| existing.id == node.id) {
                     out.push(node);
@@ -382,13 +413,13 @@ impl GroupManager {
         group_name: &str,
         depth: usize,
         visited: &mut [&'a str; MAX_GROUP_DEPTH],
-        include_final: bool,
+        walk: LeafWalk,
         visit: &mut impl FnMut(&'a Node) -> bool,
     ) -> bool {
         if depth >= MAX_GROUP_DEPTH || visited[..depth].contains(&group_name) {
             return false;
         }
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return false;
         };
         visited[depth] = group.name.as_str();
@@ -400,13 +431,17 @@ impl GroupManager {
             || group
                 .groups
                 .iter()
-                .any(|tag| self.visit_group_leaves(tag, depth + 1, visited, include_final, visit))
-            || (include_final
+                .any(|tag| self.visit_group_leaves(tag, depth + 1, visited, walk, visit))
+            || (walk.include_final
                 && match self.final_member(group) {
                     Some(GroupMember::Node(node)) => visit(node),
-                    Some(GroupMember::Group(group)) => {
-                        self.visit_group_leaves(&group.name, depth + 1, visited, true, visit)
-                    }
+                    Some(GroupMember::Group(group)) => self.visit_group_leaves(
+                        &group.name,
+                        depth + 1,
+                        visited,
+                        LeafWalk::REACHABLE,
+                        visit,
+                    ),
                     None => false,
                 })
     }
@@ -441,7 +476,7 @@ impl GroupManager {
                 let mut result = group.nodes.iter().find_map(|id| self.nodes.get(id));
                 if result.is_none() {
                     for tag in &group.groups {
-                        if let Some(sub) = self.groups.get(tag) {
+                        if let Some(sub) = self.groups.get(tag).map(|entry| &entry.group) {
                             result = self.first_leaf(sub, visited, depth + 1, respect_selectors);
                             if result.is_some() {
                                 break;
@@ -482,7 +517,7 @@ impl GroupManager {
         network: SelectionNetwork,
     ) -> (Vec<String>, Option<&Node>) {
         let mut chain = vec![group_name.to_string()];
-        let Some(mut group) = self.groups.get(group_name) else {
+        let Some(mut group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return (chain, None);
         };
         for _ in 0..MAX_GROUP_DEPTH {
@@ -530,7 +565,7 @@ impl GroupManager {
     /// Nested policies use their stable current selection; a cold/invalid
     /// chain falls back to the production network pick without mutating it.
     pub fn selector_warm_node(&self, group_name: &str, network: SelectionNetwork) -> Option<&Node> {
-        let group = self.groups.get(group_name)?;
+        let group = &self.groups.get(group_name)?.group;
         if group.policy != GroupPolicy::Selector {
             return None;
         }
@@ -562,7 +597,7 @@ impl GroupManager {
 
     /// [`Self::delay_test_members`] keeping each direct member's identity.
     pub fn delay_test_targets(&self, group_name: &str) -> Vec<(GroupMember<'_>, &Node)> {
-        let Some(group) = self.groups.get(group_name) else {
+        let Some(group) = self.groups.get(group_name).map(|entry| &entry.group) else {
             return vec![];
         };
         let mut out: Vec<(GroupMember<'_>, &Node)> = Vec::new();
@@ -576,7 +611,7 @@ impl GroupManager {
             }
         }
         for tag in &group.groups {
-            let Some(sub) = self.groups.get(tag.as_str()) else {
+            let Some(sub) = self.groups.get(tag.as_str()).map(|entry| &entry.group) else {
                 continue;
             };
             let mut visited = Vec::new();
@@ -586,6 +621,7 @@ impl GroupManager {
             let leaf = self
                 .pick_in_group(
                     sub,
+                    true,
                     ProbeDomain::Tcp,
                     IpVersion::V4,
                     &mut visited,
@@ -626,69 +662,6 @@ impl GroupManager {
             choices.iter().any(Option::is_some)
         });
         *self.selector_choice.write() = state;
-    }
-}
-
-/// Break cycles in the sub-group graph before the manager starts
-/// resolving selections.
-///
-/// DFS over `Group.groups` edges; every back edge (an edge pointing at a
-/// group currently on the DFS stack) closes a cycle and is removed from
-/// the parent's `groups` list with a warning. Unknown tags are left in
-/// place — resolution skips them. The recursion paths additionally carry
-/// their own depth/visited guards, so a broken graph can warn but never
-/// hang or panic.
-pub(super) fn break_group_cycles(groups: &mut HashMap<String, Group>) {
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum State {
-        Visiting,
-        Done,
-    }
-
-    fn visit(
-        name: &str,
-        groups: &HashMap<String, Group>,
-        states: &mut HashMap<String, State>,
-        cuts: &mut Vec<(String, String)>,
-    ) {
-        states.insert(name.to_string(), State::Visiting);
-        if let Some(group) = groups.get(name) {
-            for child in &group.groups {
-                if !groups.contains_key(child.as_str()) {
-                    continue;
-                }
-                match states.get(child.as_str()) {
-                    None => visit(child, groups, states, cuts),
-                    Some(State::Visiting) => cuts.push((name.to_string(), child.clone())),
-                    Some(State::Done) => {}
-                }
-            }
-        }
-        states.insert(name.to_string(), State::Done);
-    }
-
-    let mut states: HashMap<String, State> = HashMap::new();
-    let mut cuts: Vec<(String, String)> = Vec::new();
-    // Sorted start order keeps edge-cutting deterministic across runs.
-    let mut names: Vec<String> = groups.keys().cloned().collect();
-    names.sort();
-    for name in names {
-        if !states.contains_key(&name) {
-            visit(&name, groups, &mut states, &mut cuts);
-        }
-    }
-    for (parent, child) in cuts {
-        if let Some(group) = groups.get_mut(&parent) {
-            let before = group.groups.len();
-            group.groups.retain(|t| t != &child);
-            if group.groups.len() != before {
-                tracing::warn!(
-                    "nested group cycle detected: cut edge '{}' -> '{}' to break the loop",
-                    parent,
-                    child
-                );
-            }
-        }
     }
 }
 

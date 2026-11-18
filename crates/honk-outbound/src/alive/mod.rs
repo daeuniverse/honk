@@ -682,6 +682,10 @@ impl AliveDialerSet {
         states.entry(node_id).or_insert_with(fresh_states);
     }
 
+    pub fn is_registered(&self, node_id: Uuid) -> bool {
+        self.registered.read().contains_key(&node_id)
+    }
+
     /// Snapshot of currently registered nodes (NodeId → name/address), used
     /// by config reload to diff and re-register only what changed.
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {

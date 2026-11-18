@@ -26,6 +26,7 @@ fn group(name: &str, policy: GroupPolicy, nodes: &[Node]) -> Group {
         groups: Vec::new(),
         default: None,
         final_outbound: None,
+        exit: None,
         check_url: None,
         check_interval: None,
         tolerance: 50,

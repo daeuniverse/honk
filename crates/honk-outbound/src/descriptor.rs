@@ -209,7 +209,43 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
+    // Every flow redoes each hop's handshake over the first hop's connection,
+    // so neither the stream nor its first-hop socket is poolable, and the
+    // hops own any warm session state themselves. UDP depends on the exit,
+    // which a chain node does not hold, so [`carries_udp`] answers it as
+    // [`UdpPath::Tunneled`]; `never` is only the fail-closed default.
+    ProtocolDescriptor {
+        protocol: NodeProtocol::Chain,
+        supports_udp: never,
+        pool_ready_streams: never,
+        pool_bare_tcp: never,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &[],
+    },
 ];
+
+/// How a node's UDP leaves: over its own protocol, or tunneled by `exit`,
+/// the last hop of a configured chain or a multi-hop route, over the stream
+/// the hops before it opened.
+#[derive(Clone, Copy, Debug)]
+pub enum UdpPath<'a> {
+    Own(&'a Node),
+    Tunneled { exit: &'a Node },
+}
+
+/// Whether `path` carries UDP: the one answer selection, runtimes,
+/// connectivity publication and probes share. Earlier hops of a tunneled
+/// path need only TCP. Destination-port policy is [`udp_target_allowed`].
+#[inline]
+pub fn carries_udp(path: UdpPath<'_>) -> bool {
+    match path {
+        UdpPath::Own(node) => (descriptor(node.protocol()).supports_udp)(node),
+        UdpPath::Tunneled { exit } => {
+            exit.supports_tunneled_udp() && (descriptor(exit.protocol()).supports_udp)(exit)
+        }
+    }
+}
 
 /// Target policy only; absent UDP capability is handled separately by callers.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {
@@ -242,6 +278,7 @@ mod tests {
             NodeProtocol::AnyTLS,
             NodeProtocol::Direct,
             NodeProtocol::Block,
+            NodeProtocol::Chain,
         ] {
             assert_eq!(descriptor(protocol).protocol, protocol);
         }

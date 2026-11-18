@@ -239,10 +239,21 @@ async fn attempt_wire(
     };
     // Disposable runtime identity remains the canonical node's identity. Only its
     // inherited dial scope pins the previously validated physical server address.
-    let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
-        return AttemptOutcome::refused();
+    // A chain instead dials through its hops' runtimes in this generation: a
+    // disposable chain runtime would have no hops. A cold chain probe therefore
+    // reuses any warm session a hop holds; that is a documented limit.
+    let mut ephemeral = None;
+    let runtime = if candidate.node.protocol() == honk_config::types::NodeProtocol::Chain {
+        let Some(runtime) = plan.registry.get(&candidate.node.id) else {
+            return AttemptOutcome::refused();
+        };
+        runtime
+    } else {
+        let Ok(owner) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
+            return AttemptOutcome::refused();
+        };
+        ephemeral.insert(owner).runtime()
     };
-    let runtime = ephemeral.runtime();
     let operation = async {
         if plan.spec.kind == Kind::Http {
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -307,7 +318,9 @@ async fn attempt_wire(
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver
     // admitted before the request deadline, even when the HTTP caller is gone.
-    outcome.cleanup = ephemeral.close().await;
+    if let Some(ephemeral) = &mut ephemeral {
+        outcome.cleanup = ephemeral.close().await;
+    }
     outcome
 }
 

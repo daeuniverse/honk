@@ -197,18 +197,10 @@ fn plan(
     for member in members {
         let member_id = member_id(member, &identity).ok_or_else(not_found)?;
         if let GroupMember::Node(node) = member {
-            if request.kind == Kind::TcpConnect
-                && matches!(
-                    node.protocol(),
-                    honk_config::types::NodeProtocol::Direct
-                        | honk_config::types::NodeProtocol::Block
-                )
-            {
-                return Err(direct_or_block());
+            if request.kind == Kind::TcpConnect && (group.is_none() || !is_chain(node)) {
+                tcp_connect_target(node)?;
             }
-            if request.transport.contains(&Transport::Udp)
-                && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
-            {
+            if request.transport.contains(&Transport::Udp) && !registry.udp_capable(node) {
                 return Err(tcp_only());
             }
         }
@@ -220,6 +212,15 @@ fn plan(
                     ProbeDomain::DnsUdp
                 };
                 let leaf = manager.probe_leaf(member, domain, family.ip());
+                // A chain in a group gets its own row rather than failing the
+                // other members' TCP connect probes.
+                let unavailable = match leaf {
+                    None => Some("no_eligible_leaf"),
+                    Some(node) if request.kind == Kind::TcpConnect && is_chain(node) => {
+                        Some("no_node_address")
+                    }
+                    Some(_) => None,
+                };
                 let index = rows.len();
                 rows.push(ResultRow {
                     member_id: member_id.clone(),
@@ -229,29 +230,19 @@ fn plan(
                     transport,
                     ip_version: family,
                     warmth: "unknown",
-                    state: if leaf.is_some() {
-                        "unknown"
-                    } else {
+                    state: if unavailable.is_some() {
                         "unavailable"
+                    } else {
+                        "unknown"
                     },
                     latency_ms: None,
                     health_updated: false,
-                    error: Some(if leaf.is_some() {
-                        "not_started"
-                    } else {
-                        "no_eligible_leaf"
-                    }),
+                    error: Some(unavailable.unwrap_or("not_started")),
                     observed_at: timestamp(SystemTime::now()),
                 });
-                if let Some(node) = leaf {
-                    if request.kind == Kind::TcpConnect
-                        && matches!(
-                            node.protocol(),
-                            honk_config::types::NodeProtocol::Direct
-                                | honk_config::types::NodeProtocol::Block
-                        )
-                    {
-                        return Err(direct_or_block());
+                if let Some(node) = leaf.filter(|_| unavailable.is_none()) {
+                    if request.kind == Kind::TcpConnect {
+                        tcp_connect_target(node)?;
                     }
                     if request.kind != Kind::TcpConnect {
                         let entry =
@@ -262,7 +253,7 @@ fn plan(
                                 )
                             })?;
                         if transport == Transport::Udp
-                            && (!(entry.descriptor.supports_udp)(node) || entry.packet.is_none())
+                            && (!registry.udp_capable(node) || entry.packet.is_none())
                         {
                             return Err(tcp_only());
                         }
@@ -381,6 +372,24 @@ fn direct_or_block() -> ApiError {
     )
 }
 
+/// A TCP connect probe measures the node's own server address.
+fn tcp_connect_target(node: &honk_config::node::Node) -> Result<(), ApiError> {
+    match node.protocol() {
+        honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block => {
+            Err(direct_or_block())
+        }
+        honk_config::types::NodeProtocol::Chain => Err(unsupported(
+            "TCP connect probes need a node address, which chain nodes do not have",
+            json!({"field":"kind","allowed":["http","dns"]}),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn is_chain(node: &honk_config::node::Node) -> bool {
+    node.protocol() == honk_config::types::NodeProtocol::Chain
+}
+
 fn tcp_only() -> ApiError {
     unsupported(
         "The probed node does not carry UDP",
@@ -442,8 +451,13 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
             .copied()
             .find(|&ip| candidate.family.matches(ip))
             .map(|ip| SocketAddr::new(ip, port));
+        // Direct dials the destination itself, and a chain's first hop resolves
+        // its own server inside the chain dial.
         let needs_server = context.spec.kind != Kind::TcpConnect
-            && candidate.node.protocol() != honk_config::types::NodeProtocol::Direct;
+            && !matches!(
+                candidate.node.protocol(),
+                honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Chain
+            );
         let server = if needs_server {
             let ips = resolve(
                 &context.dns,

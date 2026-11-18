@@ -10,7 +10,7 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::validate_node_collection;
+pub use validation::{MAX_CHAIN_HOPS, ResolvedChain, resolve_chain_hops, validate_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
@@ -103,6 +103,74 @@ impl Default for Node {
 impl Node {
     pub fn protocol(&self) -> NodeProtocol {
         self.outbound.protocol()
+    }
+
+    /// Hop names of a proxy chain node, entry first.
+    pub fn chain_hops(&self) -> Option<&[String]> {
+        self.outbound.chain_hops()
+    }
+
+    /// Whether this node's handshake can run over a stream tunneled through
+    /// an earlier chain hop. A chain's first hop dials as usual; every later
+    /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
+    /// in step with this table.
+    pub fn supports_tunneled_dial(&self) -> bool {
+        match &self.outbound {
+            OutboundConfig::Socks5(_) | OutboundConfig::Shadowsocks(_) => true,
+            OutboundConfig::Trojan(_) | OutboundConfig::Vmess(_) => !self.is_xhttp(),
+            OutboundConfig::Vless(config) => {
+                !self.is_xhttp()
+                    && !config.is_vision()
+                    && !config.is_encrypted()
+                    && config.tcp_path() == VlessTcpPath::Direct
+            }
+            OutboundConfig::Hysteria2(_)
+            | OutboundConfig::Tuic(_)
+            | OutboundConfig::Juicity(_)
+            | OutboundConfig::AnyTls(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block
+            | OutboundConfig::Chain { .. } => false,
+        }
+    }
+
+    /// Whether this node, as a chain's exit, can carry UDP over the stream
+    /// tunneled to it. honk-outbound keeps each handler's `dial_udp_over` in
+    /// step with this table. A VLESS exit sends native UDP even under `Auto`,
+    /// which would pick XUDP on most ports: XUDP rides a Mux.Cool session the
+    /// tunneled hop does not own. Any multiplexing is refused, since the
+    /// UDP/443 policy lives only there.
+    pub fn supports_tunneled_udp(&self) -> bool {
+        match &self.outbound {
+            OutboundConfig::Trojan(_) => {
+                !self.is_xhttp()
+                    && self.network().is_none_or(|network| {
+                        matches!(
+                            crate::options::vocab::packet_network(network),
+                            Ok(Some(true))
+                        )
+                    })
+            }
+            OutboundConfig::Vless(config) => {
+                self.supports_tunneled_dial()
+                    && config.multiplex == VlessMultiplex::Off
+                    && config.udp_enabled()
+                    && matches!(
+                        config.udp_encoding,
+                        VlessUdpEncoding::Auto | VlessUdpEncoding::Native
+                    )
+            }
+            OutboundConfig::Socks5(_)
+            | OutboundConfig::Shadowsocks(_)
+            | OutboundConfig::Vmess(_)
+            | OutboundConfig::Hysteria2(_)
+            | OutboundConfig::Tuic(_)
+            | OutboundConfig::Juicity(_)
+            | OutboundConfig::AnyTls(_)
+            | OutboundConfig::Direct
+            | OutboundConfig::Block
+            | OutboundConfig::Chain { .. } => false,
+        }
     }
 
     pub fn is_xhttp(&self) -> bool {
@@ -384,6 +452,10 @@ pub struct Group {
     /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
     pub final_outbound: Option<String>,
+    /// Exit node every connection through this group leaves from: the
+    /// selected leaf becomes the first hop of a chain ending at this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<String>,
     /// URL for health checks (overrides global tcp_check_url).
     pub check_url: Option<String>,
     /// Retained interval metadata; runtime checks use the global interval.
@@ -418,6 +490,7 @@ impl Default for Group {
             groups: Vec::new(),
             default: None,
             final_outbound: None,
+            exit: None,
             check_url: None,
             check_interval: None,
             tolerance: default_tolerance(),
@@ -483,6 +556,8 @@ impl<'de> Deserialize<'de> for Group {
             #[serde(default)]
             final_outbound: Option<String>,
             #[serde(default)]
+            exit: Option<String>,
+            #[serde(default)]
             check_url: Option<String>,
             #[serde(default)]
             check_interval: Option<u64>,
@@ -506,6 +581,7 @@ impl<'de> Deserialize<'de> for Group {
             groups: wire.groups,
             default: wire.default,
             final_outbound: wire.final_outbound,
+            exit: wire.exit,
             check_url: wire.check_url,
             check_interval: wire.check_interval,
             tolerance: wire.tolerance.unwrap_or_else(default_tolerance),

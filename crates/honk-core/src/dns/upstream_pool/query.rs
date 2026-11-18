@@ -409,7 +409,7 @@ impl UpstreamPool {
             debug!(
                 "DNS upstream '{}' (udp via proxy {}) returned {} bytes",
                 upstream_name,
-                node.name,
+                node.node.name,
                 response.len()
             );
             Ok(response)
@@ -665,7 +665,7 @@ impl UpstreamPool {
             debug!(
                 "DNS upstream '{}' dial leaf={:?} (forced={})",
                 upstream_name,
-                route.node.as_ref().map(|node| node.name.as_str()),
+                route.node.as_ref().map(|target| target.node.name.as_str()),
                 entry.outbound.is_some()
             );
             let injected = if route.node.is_none() {
@@ -693,7 +693,7 @@ impl UpstreamPool {
                         route
                             .node
                             .as_ref()
-                            .map(|node| node.name.as_str())
+                            .map(|target| target.node.name.as_str())
                             .unwrap_or("direct"),
                         response.len()
                     );
@@ -711,7 +711,7 @@ impl UpstreamPool {
                         upstream = upstream_name,
                         protocol = ?entry.protocol,
                         server = %route.target,
-                        leaf = ?route.node.as_ref().map(|node| node.name.as_str()),
+                        leaf = ?route.node.as_ref().map(|target| target.node.name.as_str()),
                         error = %error,
                         "DNS upstream route failed"
                     );

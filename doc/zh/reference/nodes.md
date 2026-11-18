@@ -15,15 +15,15 @@ node {
 
 ## 字段
 
-Node 模型包含下列字段。分享链接会从协议方案、userinfo、地址部分、片段和查询参数填充供用户配置的字段；其余字段由结构化 loader、导入或运行时填充。这些字段都不是 dae `node {}` 里的独立 key；节点写成链接和标签，见 [`node {}` 声明](#node--声明)。
+Node 模型包含下列字段。分享链接会从协议方案、userinfo、地址部分、片段和查询参数填充供用户配置的字段；其余字段由结构化 loader、导入或运行时填充。这些字段都不是 dae `node {}` 里的独立 key；节点写成带标签的链接或[链式节点](#链式节点)，见 [`node {}` 声明](#node--声明)。
 
-扁平结构化输入必须包含 `name`、`protocol`、`address` 和 `port`，即使已设置 `host`。表中的默认值是模型默认值。
+扁平结构化输入必须包含 `name`、`protocol`、`address` 和 `port`，即使已设置 `host`。链式节点写 `protocol: chain`、`address: ""`、`port: 0` 和 `hops` 列表。表中的默认值是模型默认值。
 
 | Key | 类型 | 默认值 | 含义 |
 | --- | --- | --- | --- |
 | `id` | UUID | 派生 | 稳定内容身份；运行时不允许 nil。见[节点身份](#节点身份)。 |
 | `name` | string | `""` | dae 标签、解码后的片段、`remark` 查询参数、VMess `ps` 或不含凭据的 `{scheme}-{host}` 回退名称。 |
-| `protocol` | enum | `ss` | 从分享链接协议方案派生。 |
+| `protocol` | enum | `ss` | 从分享链接协议方案派生；链式节点为 `chain`。 |
 | `address` | string | `""` | 从链接解析的 `host:port`；它不补充缺失的端口。 |
 | `host` | string | `""` | 显式服务端主机；否则 `Node::host()` 从 `address` 派生。 |
 | `port` | u16 | `0` | 服务端端口；URL 形链接省略端口时使用 `443`，v2rayN VMess 载荷则必须带有效端口。 |
@@ -64,12 +64,13 @@ Node 模型包含下列字段。分享链接会从协议方案、userinfo、地�
 | `anytls_min_idle_session` | usize? | `null` | 来自 `min_idle_session` 的空闲 session 目标下限；有效默认值 `0`，受八条 session 的池上限约束。 |
 | `anytls_idle_session_check_interval` | u64? | `null` | 解析后的 `idle_session_check_interval` 秒数；当前运行时 janitor 周期仍固定为 30 秒。 |
 | `anytls_idle_session_timeout` | u64? | `null` | 来自 `idle_session_timeout` 的空闲驱逐；有效默认值 30 秒。 |
+| `hops` | string[] | 省略 | 链式节点从入口到出口的各跳节点名；只有 `chain` 读取，其他协议携带时会被移除并产生 warning。 |
 | `mark` | u32? | `null` | 结构化模型中的出站 `SO_MARK`；不是 dae 分享链接查询参数。 |
 | `tags` | string[] | `[]` | 分类元数据；不是 dae 分享链接查询参数。 |
 | `subscription_id` / `group_id` | UUID? | `null` | 导入与运行时归属元数据。 |
 | `created_at` / `updated_at` | datetime | 当前时间 | 运行时元数据。 |
 
-节点自身校验要求非空名称、有效主机和显式非零 `port`。`address` 不会补充缺失的端口；仅提供 IPv6 地址时须显式设置 `host`。只有身份与注入规则完全一致的 `direct`/`block` 内置节点可省略 endpoint。
+节点自身校验要求非空名称、有效主机和显式非零 `port`。`address` 不会补充缺失的端口；仅提供 IPv6 地址时须显式设置 `host`。只有身份与注入规则完全一致的 `direct`/`block` 内置节点可省略 endpoint。链式节点则必须留空 endpoint，见[链式节点](#链式节点)。
 
 URL userinfo 中，Trojan、AnyTLS、VLESS 和 VMess 取 `user:pass` 的密码部分，没有冒号时取整个 userinfo。Hysteria2 保留完整的 `user:pass`，TUIC 和 Juicity 读取 `uuid:password`，SOCKS5 分别保留两部分。凭据会进行百分号解码，结果必须是有效 UTF-8。secret 中的字面 `:` 或 `@` 须写成 `%3A` 或 `%40`。
 
@@ -321,6 +322,7 @@ Auto、native、XUDP、Mux.Cool 与关闭 UDP 的节点 ID 不变。直接选择
 | `anytls` | — | 是 | 是* | 多路复用 TLS session 与 UoT v2 |
 | `direct` | — | 是 | 是 | 保留的内置直连出站；没有分享链接协议方案 |
 | `block` | — | 否 | 否 | 保留的内置拒绝出站；没有分享链接协议方案 |
+| `chain` | — | 是 | 取决于出口 | 依次经过其他节点拨号；没有分享链接协议方案；见[链式节点](#链式节点) |
 
 `network` 可独立于流传输方式关闭 Trojan、AnyTLS 和 VLESS 的数据包拨号。VMess UDP 尚未实现。
 
@@ -812,6 +814,65 @@ REALITY 不使用 CA 校验或 `skip_cert_verify`。目标 TLS 记录的缓冲�
 
 静态配置会提供真实 ECH；ECH 被拒绝时，握手 fail-closed。发现是尽力而为且 fail-open：找不到 ECHConfigList 时，握手不带真实 ECH 继续，`utls` 仍发送 ECH GREASE。发现走 bootstrap resolver，未配置时使用系统首个 nameserver，并按域名缓存结果。同一组控制项也适用于 QUIC 协议。
 
+## 链式节点
+
+链式节点依次经过其他节点到达目的地。按从入口到出口的顺序列出各跳的节点名，以 `->` 分隔：
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    'hk: east': 'ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@hk.example.com:8388'
+    land: 'trojan://secret@land.example.com:443?sni=land.example.com'
+
+    via_hk: front -> 'hk: east' -> land
+}
+```
+
+honk 像连接其他节点一样连接入口的服务器。之后每一跳都在前面各跳建立的流里完成自己的握手，最后由出口连接目的地。链式节点是普通节点：组可以用 `filter` 或组的 `final` 选中它，路由规则通过这样的组到达它，API 列出它时协议为 `chain`（Clash 类型为 `Chain`）。
+
+这种条目写法是 honk 的扩展，见[方言参考](./dialect.md#node-与-subscription-条目)。
+
+| 输入 | 处理结果 |
+| --- | --- |
+| 引号外的 `->` | 链式节点。`->` 两侧的空格可以省略。 |
+| 跳名含 `->`、`://` 或空白之后的 `#` | 给该跳加引号：`front -> 'a->b'`。不加引号时，`->` 会拆开该跳，`://` 让整个值成为分享链接，` #` 开始注释。跳名中的 `:` 和空格不需要引号。 |
+| 值中有引号外的 `://` | 即使含 `->` 也是分享链接，所以 `land: trojan://…#hk->jp` 是 Trojan 节点。分享链接从第一个 `->` 起的文本会被忽略。 |
+| 整个值加引号，`via: 'front -> land'` | 视为一条协议未知的链接，条目被丢弃并产生 `invalid-node-entry`。 |
+| 引号外没有 `->`，`via: front` | 不是链式节点：值按分享链接解析，条目被丢弃并产生 `invalid-node-entry`。 |
+| 没有标签、多于四跳、某跳为空、以链式节点自己的名字为跳 | 拒绝配置。与格式错误的分享链接不同，无效的链式节点条目不会被跳过。 |
+
+静态节点与订阅节点组装完成后，各跳按名称解析。配置、重载或订阅刷新未通过以下任一检查时会被拒绝，正在运行的配置保持不变：
+
+| 检查 | 诊断代码 |
+| --- | --- |
+| 每一跳恰好对应一个节点 | 没有匹配时为 `invalid-chain-hop-reference`，匹配多个时为 `ambiguous-chain-hop-reference` |
+| 跳不是 `direct`、`block` 或另一个链式节点 | `unsupported-chain-hop` |
+| 入口之后的每一跳都支持隧道拨号（见下表） | `unsupported-chain-hop` |
+
+跳只能是节点，不能是组。订阅刷新可能改名或产生重名节点，因此引用订阅节点的链式节点会让每次改动这些名称的刷新失败。
+
+| 位置 | 支持的节点 |
+| --- | --- |
+| 入口 | 任意代理节点，按原方式拨号 |
+| 之后各跳，包括出口 | SOCKS5；Shadowsocks；不使用 XHTTP 的 Trojan 与 VMess；不使用 Vision、Encryption、XHTTP 或 TCP 多路复用（`mux=h2mux` 或 Mux.Cool）的 VLESS |
+
+Hysteria2、TUIC、Juicity 与 AnyTLS 只能作入口。VMess 与 VLESS 跳需要 `rprx` feature，与普通 VMess、VLESS 节点相同。
+
+链式节点没有地址、端口、凭据或分享链接。它的[身份](#节点身份)由协议 `chain` 与按顺序排列的跳名派生：给链式节点改名不改变 ID；修改跳名、调整各跳顺序、增加或删除跳，都会改变 ID。因此两个链式节点只要各跳及顺序相同，不论名称是否相同都得到同一个 ID，配置会以 `duplicate-node-id` 被拒绝，与两条相同的分享链接一样。JSON、YAML 与 TOML 把它写成 `protocol: chain` 加一个按入口到出口顺序排列的 `hops` 列表；少于两跳的列表会被拒绝。
+
+限制：
+
+- UDP 取决于出口：出口在通往其服务器的流里完成自己的 UDP 握手，之前的各跳只需要 TCP。出口是不带 XHTTP 且 `network` 允许 UDP 的 Trojan，或不带多路复用、UDP 编码为 `auto` 或 `native` 的 VLESS 时，才能承载 UDP（对后面各跳的其他要求仍然适用）。除非有能承载 UDP 的组 [`exit`](./groups.md#经出口的-udp) 把它包进隧道，否则组为 UDP 选择节点时跳过其他链式节点；成员只有这类链式节点的组不向数据面发布 UDP 存活；路由到这类链式节点的 UDP 流会被拒绝，与 VMess 相同。
+- VLESS 出口即使在 `auto` 下也发送原生 UDP，因为 XUDP 需要 Mux.Cool 会话，而经隧道的一跳没有这种会话。直连的 VLESS 节点在 `auto` 下只对 53 和 443 端口使用原生 UDP。原生 UDP 是 connected 的：只接受来自该流自身目的地的回复，所以游戏和 P2P 流量会遇到 address-dependent NAT。每条 UDP 流都会重做每一跳的握手。
+- 出口为 Trojan 的链式节点把同一客户端源的所有目的地放在一个 association 上，与 Trojan 节点相同。
+- 链式节点不使用连接池，也不预热。每条连接都新开一条第一跳的流，并重做之后每一跳的握手，包括出口的握手。
+- 入口之后某一跳的服务器是域名时，honk 把域名交给前一跳，由前一跳的服务器解析，不在本地解析。入口的服务器与普通节点一样解析。
+- 没有节点过滤器的组会收入全部节点，因此也会收入每个链式节点及其各跳。出口不能直连时，用 `filter` 把它排除。
+- 拨号结果、健康状态与 Score 都记在链式节点自己的 ID 下，UDP 与 TCP 相同。配置了 HTTP 检测目标时，探测经整条链拨号。没有时（`tcp_check_url` 为空），原始 TCP 探测不为链式节点记录任何结果，因此链式节点因连接失败而失活后，只有三种方式能恢复：仍经过它的连接成功，两次 Clash 延迟测试成功，或重载修改了它的跳、使它得到新 ID。组中包含链式节点时，请保留 HTTP 检测。只设置 `host` 和 `port`、`address` 为空的扁平结构化节点也是如此：没有 HTTP 检测时它不做原始 TCP 探测，保持原有状态。原生 API 拒绝以链式节点为目标的 `tcp_connect` 探测，探测组时把其中的链式节点成员报告为不可用；`delay` 子命令测试链式节点时须提供 `--url`。原生 API 对链式节点的 `cold` 探测仍经当前 generation 中各跳的运行时拨号，因此会复用某一跳已预热的会话，例如 AnyTLS 入口的会话。
+- 链式流量的 transport quality 证据记在各跳自己的节点上，不记在链式节点上。因此链式流量可能给入口节点带来压力，而包含该链式节点的 Score 组看不到它的传输压力。
+- 原生 API 的节点接口只能用分享链接创建节点，也拒绝删除链式节点；请在配置中管理链式节点。
+- Clash 连接的 `chains` 先列出各跳（出口在前），再列出链式节点及其所在的组。
+
 ## 分享链接 scheme
 
 XHTTP 以外，未知查询 key 会被忽略，因此拼错 key 名不会报错。XHTTP 链接拒绝未知 key，VLESS 拒绝上文列出的第三方写法。
@@ -834,7 +895,7 @@ honk 不运行 Shadowsocks 插件。`plugin=name;options`、`plugin-opts` 和 `p
 
 SOCKS5 只在链接同时带有用户名和密码时提供用户名/密码认证，两者各不得超过 255 字节。
 
-写成 `a -> b` 的链只解析 `a`。节点名称来自 dae 标签、`#fragment`、`remark`、VMess `ps` 或 `{scheme}-{host}`，从不使用原始 URI 或 userinfo，因此名称不会泄露凭据。
+分享链接从第一个 `->` 起的文本会被忽略。节点名称来自 dae 标签、`#fragment`、`remark`、VMess `ps` 或 `{scheme}-{host}`，从不使用原始 URI 或 userinfo，因此名称不会泄露凭据。
 
 ## 相关文档
 

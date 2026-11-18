@@ -1,51 +1,52 @@
+use std::cell::LazyCell;
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
+use std::sync::LazyLock;
+
+use honk_config::group_graph::{ExitEdge, GroupGraph, Leaf, Limits, Step, Visitor};
+
 use super::*;
 
-/// Collect reachable leaf ids through membership and explicit final edges.
-/// Config retains cycles cut from GroupManager's copy, so both walks use
-/// a path guard and the shared group-depth cap.
-pub(in crate::control) fn collect_group_leaf_ids<'a>(
-    group: &'a Group,
-    config: &'a Config,
-    groups_by_name: &std::collections::HashMap<&'a str, &'a Group>,
-    depth: usize,
-    visited: &mut Vec<&'a str>,
-    out: &mut std::collections::BTreeSet<uuid::Uuid>,
-) {
-    if depth >= honk_outbound::group::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
-        return;
+/// Leaf ids `group` reaches through membership and explicit final edges.
+/// This walks the configuration's graph, whose cycles GroupManager's copy
+/// cuts, so the leaf sets (and the eBPF outbound ids built from them) do
+/// not depend on which back edge that cut removed. Exits are not followed:
+/// health is registered on leaves only.
+fn group_leaf_ids(graph: &GroupGraph<'_>, group: usize) -> BTreeSet<uuid::Uuid> {
+    struct Leaves<'g, 'a> {
+        graph: &'g GroupGraph<'a>,
+        path: Vec<&'a str>,
+        ids: BTreeSet<uuid::Uuid>,
     }
-    visited.push(group.name.as_str());
-    out.extend(group.nodes.iter().copied());
-    for tag in &group.groups {
-        if let Some(sub) = groups_by_name.get(tag.as_str()) {
-            collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+    impl Visitor for Leaves<'_, '_> {
+        // Groups of one name share a path entry, as when groups were
+        // looked up by name.
+        fn enter(&mut self, group: usize, depth: usize, _: &[uuid::Uuid]) -> ControlFlow<(), Step> {
+            let name = self.graph.name(group);
+            self.path.truncate(depth);
+            if self.path.contains(&name) {
+                return ControlFlow::Continue(Step::Skip);
+            }
+            self.path.push(name);
+            ControlFlow::Continue(Step::Descend)
         }
-    }
-    if let Some(final_name) = group.final_outbound.as_deref() {
-        match final_name {
-            Config::BUILTIN_DIRECT_NODE => {
-                out.insert(honk_config::config::DIRECT_NODE_ID);
-            }
-            Config::BUILTIN_BLOCK_NODE => {
-                out.insert(honk_config::config::BLOCK_NODE_ID);
-            }
-            name => {
-                if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
-                    out.insert(node.id);
-                } else if let Some(sub) = groups_by_name.get(name) {
-                    collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
-                }
-            }
-        }
-    }
-    visited.pop();
-}
 
-/// Group lookup by name for [`collect_group_leaf_ids`].
-pub(in crate::control) fn groups_by_name(
-    config: &Config,
-) -> std::collections::HashMap<&str, &Group> {
-    config.groups.iter().map(|g| (g.name.as_str(), g)).collect()
+        fn leaf(&mut self, leaf: Leaf, _: &[uuid::Uuid]) -> ControlFlow<()> {
+            self.ids.insert(match leaf {
+                Leaf::Node(id) => id,
+                Leaf::Direct => honk_config::config::DIRECT_NODE_ID,
+                Leaf::Block => honk_config::config::BLOCK_NODE_ID,
+            });
+            ControlFlow::Continue(())
+        }
+    }
+    let mut leaves = Leaves {
+        graph,
+        path: Vec::with_capacity(honk_outbound::group::MAX_GROUP_DEPTH),
+        ids: BTreeSet::new(),
+    };
+    let _ = graph.visit(group, Limits::SELECTION, &mut leaves);
+    leaves.ids
 }
 
 /// Nodes reachable through group membership or explicit finals are probed
@@ -55,15 +56,9 @@ pub(in crate::control) fn groups_by_name(
 pub(in crate::control) fn health_check_targets(
     config: &Config,
 ) -> Vec<(uuid::Uuid, String, String)> {
-    let by_name = groups_by_name(config);
-    let group_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
-        .groups
-        .iter()
-        .flat_map(|g| {
-            let mut ids = std::collections::BTreeSet::new();
-            collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
-            ids
-        })
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
+    let group_node_ids: BTreeSet<uuid::Uuid> = (0..graph.len())
+        .flat_map(|group| group_leaf_ids(&graph, group))
         .collect();
     config
         .nodes
@@ -116,24 +111,21 @@ pub(in crate::control) fn sync_health_check_nodes(
 pub(in crate::control) fn urltest_group_registrations(
     config: &Config,
 ) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
-    let by_name = groups_by_name(config);
-    let leaf_ids = |g: &Group| {
-        let mut ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
-        ids
-    };
-    let always_probed_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
+    let always_probed_node_ids: BTreeSet<uuid::Uuid> = config
         .groups
         .iter()
-        .filter(|g| g.policy != GroupPolicy::URLTest)
-        .flat_map(&leaf_ids)
+        .enumerate()
+        .filter(|(_, g)| g.policy != GroupPolicy::URLTest)
+        .flat_map(|(index, _)| group_leaf_ids(&graph, index))
         .collect();
     config
         .groups
         .iter()
-        .filter(|g| g.policy == GroupPolicy::URLTest)
-        .map(|group| {
-            let members: Vec<uuid::Uuid> = leaf_ids(group)
+        .enumerate()
+        .filter(|(_, g)| g.policy == GroupPolicy::URLTest)
+        .map(|(index, group)| {
+            let members: Vec<uuid::Uuid> = group_leaf_ids(&graph, index)
                 .into_iter()
                 .filter(|id| !always_probed_node_ids.contains(id))
                 .collect();
@@ -234,13 +226,11 @@ pub(in crate::control) fn install_selector_warm_callback(
 pub(in crate::control) fn build_outbound_id_map(
     config: &Config,
 ) -> std::collections::HashMap<uuid::Uuid, u8> {
-    let by_name = groups_by_name(config);
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
     let mut map = std::collections::HashMap::new();
-    for (i, group) in config.groups.iter().enumerate() {
+    for i in 0..config.groups.len() {
         let id = OutboundIndex::UserBase as u8 + i as u8;
-        let mut leaf_ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(group, config, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
-        for node_id in leaf_ids {
+        for node_id in group_leaf_ids(&graph, i) {
             map.entry(node_id).or_insert(id);
         }
     }
@@ -249,49 +239,162 @@ pub(in crate::control) fn build_outbound_id_map(
 
 type GroupConnectivity = (u8, u32, u32, bool);
 
-/// A sole TCP leaf with no configured fallback remains a userspace last resort:
-/// suppressing it in TC would prevent real traffic from proving recovery.
-pub(in crate::control) fn group_datapath_alive(
+/// One TC slot of `group`. The graph is forced only for a UDP slot.
+pub(in crate::control) fn group_datapath_alive<'a>(
+    graph: &LazyCell<GroupGraph<'a>, impl FnOnce() -> GroupGraph<'a>>,
+    index: usize,
     group: &Group,
     group_manager: &GroupManager,
     alive_set: &crate::outbound::AliveDialerSet,
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> bool {
-    (domain == ProbeDomain::Tcp
-        && group.final_outbound.is_none()
-        && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
+    if domain == ProbeDomain::Tcp {
+        return group_tcp_alive(group, group_manager, alive_set, ipver);
+    }
+    group_udp_alive(
+        LazyCell::force(graph),
+        index,
+        group_manager,
+        alive_set,
+        &[(domain, ipver)],
+    ) != 0
+}
+
+/// A sole TCP leaf with no configured fallback remains a userspace last resort:
+/// suppressing it in TC would prevent real traffic from proving recovery.
+fn group_tcp_alive(
+    group: &Group,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+    ipver: IpVersion,
+) -> bool {
+    (group.final_outbound.is_none() && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
         || group_manager
             .reachable_leaf_nodes_in_group(&group.name)
             .iter()
-            .any(|node| {
-                (domain == ProbeDomain::Tcp
-                    || node.protocol() == NodeProtocol::Block
-                    || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
-                    && alive_set.is_alive_for(node.id, domain, ipver)
-            })
+            .any(|node| alive_set.is_alive_for(node.id, ProbeDomain::Tcp, ipver))
 }
+
+/// One bit per entry of `slots` whose UDP is alive for `group`: some leaf
+/// it reaches carries UDP over what it dials and is alive in that slot.
+/// One walk answers every slot, asking each leaf's capability once.
+fn group_udp_alive(
+    graph: &GroupGraph<'_>,
+    group: usize,
+    group_manager: &GroupManager,
+    alive_set: &crate::outbound::AliveDialerSet,
+    slots: &[(ProbeDomain, IpVersion)],
+) -> u8 {
+    let all = (1u8 << slots.len()) - 1;
+    let mut found = 0;
+    let _ = walk_udp_leaves(graph, group, |node, exits| {
+        // `block` reached from a group with an exit means no route there
+        // carries UDP, so it counts only outside every exit.
+        let carries = if node.protocol() == NodeProtocol::Block {
+            exits.is_empty()
+        } else {
+            group_manager.carries_udp_via(node, exits)
+        };
+        if carries {
+            for (bit, &(domain, ipver)) in slots.iter().enumerate() {
+                if alive_set.is_alive_for(node.id, domain, ipver) {
+                    found |= 1 << bit;
+                }
+            }
+        }
+        found == all
+    });
+    found
+}
+
+/// Breaks on the first leaf of `group` that `stop` accepts with the exits
+/// on its path. Walks the configuration's graph, as [`group_leaf_ids`] does,
+/// so a cycle GroupManager's copy cuts only widens what TC passes to
+/// userspace. Nothing behind an exit the configuration cannot resolve is
+/// selectable.
+fn walk_udp_leaves(
+    graph: &GroupGraph<'_>,
+    group: usize,
+    stop: impl FnMut(&Node, &[uuid::Uuid]) -> bool,
+) -> ControlFlow<()> {
+    struct UdpLeaves<'g, 'a, F> {
+        graph: &'g GroupGraph<'a>,
+        path: [&'a str; honk_outbound::group::MAX_GROUP_DEPTH],
+        stop: F,
+    }
+    impl<F: FnMut(&Node, &[uuid::Uuid]) -> bool> Visitor for UdpLeaves<'_, '_, F> {
+        fn enter(&mut self, group: usize, depth: usize, _: &[uuid::Uuid]) -> ControlFlow<(), Step> {
+            let name = self.graph.name(group);
+            if depth >= self.path.len()
+                || self.path[..depth].contains(&name)
+                || self.graph.exit(group) == Some(ExitEdge::Unresolved)
+            {
+                return ControlFlow::Continue(Step::Skip);
+            }
+            self.path[depth] = name;
+            ControlFlow::Continue(Step::Descend)
+        }
+
+        fn leaf(&mut self, leaf: Leaf, exits: &[uuid::Uuid]) -> ControlFlow<()> {
+            static DIRECT: LazyLock<Node> = LazyLock::new(Config::builtin_direct_node);
+            static BLOCK: LazyLock<Node> = LazyLock::new(Config::builtin_block_node);
+            let node = match leaf {
+                Leaf::Node(id) => self.graph.node(id),
+                Leaf::Direct => Some(&*DIRECT),
+                Leaf::Block => Some(&*BLOCK),
+            };
+            if node.is_some_and(|node| (self.stop)(node, exits)) {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
+        }
+    }
+    graph.visit(
+        group,
+        Limits::SELECTION,
+        &mut UdpLeaves {
+            graph,
+            path: [""; honk_outbound::group::MAX_GROUP_DEPTH],
+            stop,
+        },
+    )
+}
+
+/// The UDP slots of a snapshot, in its order.
+const UDP_SLOTS: [(ProbeDomain, IpVersion); 4] = [
+    (ProbeDomain::DnsUdp, IpVersion::V4),
+    (ProbeDomain::DnsUdp, IpVersion::V6),
+    (ProbeDomain::DataUdp, IpVersion::V4),
+    (ProbeDomain::DataUdp, IpVersion::V6),
+];
 
 pub(crate) fn group_connectivity_snapshot(
     config: &Config,
     group_manager: &GroupManager,
     alive_set: &crate::outbound::AliveDialerSet,
 ) -> Vec<GroupConnectivity> {
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
     let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
-        for (domain_index, domain) in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp]
-            .into_iter()
-            .enumerate()
-        {
-            for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
-                snapshot.push((
-                    outbound,
-                    domain_index as u32,
-                    ip_index as u32,
-                    group_datapath_alive(group, group_manager, alive_set, domain, ipver),
-                ));
-            }
+        for (ip_index, ipver) in [IpVersion::V4, IpVersion::V6].into_iter().enumerate() {
+            snapshot.push((
+                outbound,
+                0,
+                ip_index as u32,
+                group_tcp_alive(group, group_manager, alive_set, ipver),
+            ));
+        }
+        let udp = group_udp_alive(&graph, index, group_manager, alive_set, &UDP_SLOTS);
+        for (bit, (domain, ipver)) in UDP_SLOTS.into_iter().enumerate() {
+            snapshot.push((
+                outbound,
+                if domain == ProbeDomain::DnsUdp { 1 } else { 2 },
+                ipver as u32,
+                udp & (1 << bit) != 0,
+            ));
         }
     }
     snapshot

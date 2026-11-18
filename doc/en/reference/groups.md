@@ -37,6 +37,7 @@ group {
 | `filter: group(...)` | `[]` | Add nested group tags to `groups`; comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `null` | Initial or fallback member tag for `selector`. |
 | `final` | `null` | Target used when the policy has no eligible selection; see [`final`](#final). |
+| `exit` | `null` | Proxy node every connection through this group leaves from: the route is the selected leaf's own hops, then one hop per exit, from the innermost group with an `exit` out. `final` goes through the exit too, except `block`. It must name exactly one node that supports tunneled dial (SOCKS5; Shadowsocks; Trojan and VMess without XHTTP; VLESS without XHTTP, Vision, Encryption, or TCP multiplexing (`mux=h2mux` or Mux.Cool)), not a group, chain, `direct` or `block`; anything else rejects the configuration. A route carries UDP only when its outermost exit can carry it over a stream; a member whose route cannot is skipped for UDP, and a group whose routes cannot offers no UDP candidates, so its parent picks among its other members. See [Exit](#exit). Experimental. |
 | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies; see [`check_url`](#check_url). |
 | `tolerance` | `50` | URLTest switch threshold in milliseconds; see [`tolerance`](#tolerance). |
 | `idle_timeout` | `null` | Seconds without a selection after which a URLTest group pauses member probes; see [`idle_timeout`](#idle_timeout). |
@@ -199,7 +200,7 @@ Only missing or no-longer-member choices fall through to `default` or the first 
 
 Each selected subgroup resolves its own explicit `final` before returning an empty result to its parent. This does not allow the parent to choose a different Selector sibling or to retry a terminal protocol refusal. For IPv6 targets, an ordinary selected leaf reachable through IPv4 proxy health is tried before a final route.
 
-UDP eligibility requires protocol/configuration support as well as health. VMess and explicitly TCP-only leaves are excluded before selection and Score comparison; TCP remains unaffected. An incapable Selector choice does not authorize a sibling, and built-in `block` remains terminal. This capability filter does not bypass a selected node's target-specific UDP policy refusal.
+UDP eligibility requires protocol/configuration support as well as health. VMess and explicitly TCP-only leaves are excluded before selection and Score comparison unless a group [exit](#udp-through-an-exit) carries UDP for them; TCP remains unaffected. An incapable Selector choice does not authorize a sibling, and built-in `block` remains terminal. This capability filter does not bypass a selected node's target-specific UDP policy refusal.
 
 When distinct nodes share a display tag, name-based defaults and Clash writes bind the first matching member's `NodeId` in declaration order before health filtering. Native member IDs can select a particular direct member. Health cannot retarget either choice to a healthy same-name sibling.
 Named `final` nodes likewise resolve the first matching configuration declaration; a healthy duplicate cannot replace it. Selection and final-node health registration use that same identity.
@@ -313,6 +314,64 @@ For nested groups, prefer `group('hk', 'jp')`; `group(hk|jp)` also works. Quotes
 Nested tags must name declared groups. An unknown tag rejects the configuration at startup or reload with `invalid-nested-group-reference`. When the group manager builds the graph, it removes each cycle-closing edge and logs a warning. Nested selection is capped at depth 8. Each nested group contributes the single leaf selected by its own policy, so every dial ends at one node.
 
 Clash-facing group output preserves member tags: the `all` field lists direct node names and nested group tags rather than expanding nested groups. Leaf-facing health and connectivity traversal expands the real nodes below those tags.
+
+## Exit
+
+A group with `exit: E` dials its selected leaf as a route: the leaf, then the exit of each group it was selected through, from the innermost group out.
+
+- A route is available only while its leaf and its exit are both alive. When no route is, the group falls back to `final` as it does when its leaves are down. `final` goes through the exit too, so while the exit is down the group drops it like any other route: only `final: block` remains, and it ends the connection. A `block` member does not go through the exit either, so it stays a candidate. The exception is the sole-leaf TCP last resort: a root group whose only member is one TCP leaf and that has no `final` keeps dialing that leaf through its exit whatever the exit's state.
+- A parent treats every route through a dead exit as a dead member, including one a nested group returns from its `final` or its sole-leaf TCP last resort, and picks another member.
+- The exit's state is consulted only while the health checker probes it; see [Exit liveness](#exit-liveness).
+- A failed dial counts against the hop that failed. A hop that answers that it cannot reach the next hop's server (a SOCKS5 reply, or an AnyTLS, Hysteria2 or VLESS mux target error) leaves the failure with that next hop. Shadowsocks, Trojan and VMess fronts send no such answer, so the same outage counts against the exit when its handshake then fails. The hops of a chain leaf count against that chain node. A deadline that expires with no hop at fault counts against neither. Score feedback stays with the leaf, and a Score retry excludes the leaf.
+- A successful dial counts as available traffic for every node a failure of the route could count against (the leaf or chain leaf, and each exit), which ends their failure streaks. Its latency counts against the outermost exit alone. The latency covers the whole route, and every leaf behind one exit shares the exit's average. While the exit is probed, three route dials in a row slower than 250 ms and than the lesser of twice that average and the average plus 500 ms mark the exit unavailable and start a probe of it. This is likely when the exit is also a member that is dialed directly, which keeps its average low.
+- DNS upstreams and shared downloads (subscriptions, geodata, the external UI) whose outbound is the group take the route too: UDP, TCP, DoT and DoH upstreams run over the route's TCP stream. DoQ and DoH3 upstreams do not take the route; see [UDP through an exit](#udp-through-an-exit).
+- Probes, delay tests and the latency shown for the group measure the leaf alone. Flows and DNS flows report the leaf captured when the route was selected; the Clash connection chain also lists the route's hops.
+- `final: direct` dials the exit itself, so its health and a Score retry's exclusion land on the exit, and the connection's chain lists the exit, then `direct`, then the group.
+- A leaf that is the exit, a chain leaf whose last hop is the exit, and nested groups that name the same exit all enter it once instead of tunneling it through itself.
+- Validation rejects a route longer than four hops. It uses selection's limits (eight nested groups at most, each group once on a path, only the first node a `final` names) but is stricter than selection: it walks the groups before cycles are cut, starts from every declared group, shadowed namesakes included, and counts a group's exit stack even when the group has no leaf. So it can reject a route selection never dials.
+
+### UDP through an exit
+
+- A route is a UDP candidate only when its outermost exit carries UDP over the stream to it, as for a [chain node](./nodes.md#proxy-chains): Trojan, or VLESS sending native UDP. A route that collapses to one node, such as `final: direct`, uses that node's own UDP. A member whose route cannot carry UDP is skipped before the policy picks, as a dead member is, so UDP goes to another member or to `final`. A group whose routes cannot carry UDP offers no UDP candidates, and its parent picks among its other members.
+- A UDP route needs the leaf's own UDP to be alive, though the leaf carries only the TCP stream and need not support UDP itself, and every exit on its path to be alive: by its UDP state when it has one, by its TCP state otherwise. When no route qualifies the group falls back to `final`. The flow checks the leaf and the outermost exit again just before it binds.
+- Every UDP flow through a route opens its own association and repeats every hop's handshake, whatever the exit. DNS packet transports (DoQ and DoH3) do not go through a group exit route yet: the DNS transport rejects the dial. UDP warm-up skips routes: a route holds no state to warm.
+- A UDP flow's setup failure counts against the hop that failed, by the rules for TCP above, in that hop's UDP health, including when the hop is the leaf's TCP connection.
+- A flow whose route is set up counts as available UDP traffic for every hop before the outermost exit (the leaf or chain leaf, and each inner exit), which ends their failure streaks. Setup records no latency.
+- After setup the flow is bound to the outermost exit: its traffic successes and transport failures count against the exit's UDP health, even when an earlier hop broke the carrier, since the flow cannot tell which hop did.
+
+A leaf can stop serving UDP flows in two ways, with different effects:
+
+- **Health marks the leaf dead**, from probes or failures counted against it. New UDP flows skip routes through it, so the group picks another member or `final`. Flows already set up through it continue: they are bound to the exit, and a node's death retires only the UDP flows bound to that node.
+- **The leaf's connection breaks.** Every flow through it loses its carrier, and each counts one transport failure against the exit's UDP health. Fifty in a row on one IP family, with no reply through the exit in between, mark the exit's UDP dead, so more than 50 live flows through one broken leaf, such as QUIC browsing, are enough. That death retires every UDP flow bound to the exit, its own direct flows and every route's, unless the exit's DNS UDP state is explicitly alive; see [Exit liveness](#exit-liveness).
+
+### How many routes
+
+A route is composed only when a candidate is selected, and each runtime generation caches at most 4096 of them; a dial past that limit builds its route without caching it. The number of routes a configuration can produce is not linear in its size: nested exit groups multiply. Three levels of n groups, each group connected to every group of the next level and the lowest level sharing one leaf, give n³ distinct routes.
+
+The group manager keeps only each group's exit and each chain node's hops. Validation walks each group once per distinct nearest outer exit, so it costs (members + nested-group edges) × (distinct exits + 1). A subtree that a cycle or the depth limit cut short is walked again on every path that reaches it, so a wide configuration with cycles can cost one walk per simple path of up to eight groups.
+
+### Exit liveness
+
+honk does not probe a node because it is an exit. A probe dials its node directly, and an exit is often reachable only through the hops in front of it, so a direct probe could mark a working exit dead.
+
+Whether routes through an exit count as alive depends on whether the health checker probes that node for another reason:
+
+- The checker probes the members and `final` nodes of every group (every node, when no group reaches any). An exit that is also one of these is probed directly, as that member. Routes through it are available only while it is alive. Failed probes mark it dead as for any member, and so do ten TCP failures counted against it on one IP family with no successful dial through it or probe on that family in between. A successful dial through it revives it at once, and probes revive it after two successes in a row.
+- An exit the checker does not probe counts as alive for selection: routes through it stay available whatever its own state, and a group left without candidates does not probe it. Its state is still kept. Ten TCP failures counted against it on one IP family with no successful dial through it on that family in between mark it dead, and so do the 50 UDP flow failures described in [UDP through an exit](#udp-through-an-exit). Each such death logs `Node '<exit UUID>' marked dead` once at WARN, with `domain=Tcp` or `domain=DataUdp`, drops the exit's pooled connections and retires every UDP flow bound to the exit, while new connections keep selecting routes through it. A UDP death skips the drop and the retirement while the exit's other UDP domain is explicitly alive. The log names the exit by its UUID because the checker registers names only for the nodes it probes. One success through it in the same domain, a dial for TCP or a reply for UDP, revives it at once and logs `revived` at INFO.
+
+Route traffic reaches both kinds as described above: a failure counts against the failing hop, a TCP success counts for every hop with its latency against the outermost exit alone, and a UDP setup counts for every hop but the outermost exit, whose UDP health follows the flow's traffic.
+
+So when an exit that is not probed stops working, its group keeps selecting routes through it. The failures land on the exit, not on the leaves, so the leaves stay alive and the group does not fall back to `final`. Every connection through the group fails until the exit recovers or the configuration changes. The main sign is the WARN line `Node '<exit UUID>' marked dead` after ten failed dials or 50 failed UDP flows on one IP family. Other signs: the group's `errors` counter in the native API's `/api/v1/runtime/outbounds` rises, native flow records show failed attempts whose error is the failing hop's own error, and DEBUG logs report `All N candidate(s) failed to dial`. Making the exit also a member or `final` of some group puts it under probes, which only works if a direct dial to it can succeed.
+
+### Exit validation
+
+A configuration, reload, or subscription refresh that fails one of these checks is rejected and the running configuration stays:
+
+| Check | Diagnostic code |
+| --- | --- |
+| `exit` names exactly one assembled node | `invalid-group-exit-target` when none matches, `ambiguous-group-exit-target` when several do |
+| The exit is not a group, `direct`, `block` or a chain, and supports tunneled dial | `unsupported-group-exit-target` |
+| No member's route is longer than four hops | `group-exit-route-too-long` |
 
 ## Related docs
 

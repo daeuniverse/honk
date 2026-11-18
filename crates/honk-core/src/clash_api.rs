@@ -418,6 +418,7 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
         NodeProtocol::AnyTLS => "AnyTLS",
         NodeProtocol::Direct => "Direct",
         NodeProtocol::Block => "Reject",
+        NodeProtocol::Chain => "Chain",
     }
 }
 

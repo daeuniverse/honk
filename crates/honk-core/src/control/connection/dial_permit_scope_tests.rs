@@ -1,4 +1,5 @@
 use super::*;
+use honk_outbound::group::DialKey;
 
 #[tokio::test]
 async fn dns_wait_timeout_remains_retryable_with_free_admission() {
@@ -33,7 +34,8 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
     honk_outbound::bootstrap::set_global(honk_outbound::bootstrap::BootstrapResolver::parse(
         &dns.local_addr().unwrap().to_string(),
     ));
-    let candidates = [&node];
+    let candidate = OwnedTarget::node(node.clone());
+    let candidates = [&candidate];
     #[cfg(feature = "native-api")]
     let selection_chains = HashMap::new();
     #[cfg(feature = "native-api")]
@@ -46,7 +48,7 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
     };
     let manager = crate::group::GroupManager::new(&[score_group], std::slice::from_ref(&node));
     let feedback = HashMap::from([(
-        node.id,
+        DialKey::Node(node.id),
         manager
             .feedback_for_group_node(
                 "score",
@@ -230,10 +232,10 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
     let context = tcp_score_context(target, None, IpVersion::V4);
     let feedback = manager.feedback_for_node(node.id, context.clone()).unwrap();
     for _ in 0..2 {
-        let feedback = HashMap::from([(node.id, feedback.business())]);
+        let feedback = HashMap::from([(DialKey::Node(node.id), feedback.business())]);
         let result = handle
             .race_candidates(
-                &[&node],
+                &[&OwnedTarget::node(node.clone())],
                 target,
                 None,
                 "score",
@@ -448,7 +450,7 @@ async fn direct_race_preserves_per_flow_marks() {
         ] {
             let winner = handle
                 .race_candidates(
-                    &[&node],
+                    &[&OwnedTarget::node(node.clone())],
                     target,
                     None,
                     "direct",

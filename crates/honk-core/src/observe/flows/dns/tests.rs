@@ -1129,3 +1129,123 @@ async fn truncated_udp_keeps_both_wire_lookups_and_tcp_fallback_reason() {
         server.await.unwrap();
     }
 }
+
+/// A DNS dial through a group's exit reports the leaf its selection
+/// captured, by its own node ID, and dials a proxy, so it has no server
+/// address of the target's own.
+#[tokio::test]
+async fn a_routed_dns_flow_reports_the_leaf_not_the_route() {
+    use honk_outbound::{
+        alive::{IpVersion, ProbeDomain},
+        group::{GroupManager, ScoreSelectionContext, SelectionNetwork, Target},
+    };
+    let mut config = honk_config::Config::default();
+    config.ensure_builtin_nodes();
+    let socks5 = |name: &str, port: u16| {
+        let mut node = honk_config::node::Node {
+            name: name.into(),
+            outbound: honk_config::node::OutboundConfig::from_protocol(
+                honk_config::types::NodeProtocol::Socks5,
+            ),
+            address: format!("127.0.0.1:{port}"),
+            host: "127.0.0.1".into(),
+            port,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    config
+        .nodes
+        .extend([socks5("inner-exit", 1080), socks5("outer-exit", 1081)]);
+    config.groups.push(honk_config::group::Group {
+        name: "inner".into(),
+        nodes: vec![honk_config::config::DIRECT_NODE_ID],
+        exit: Some("inner-exit".into()),
+        ..Default::default()
+    });
+    config.groups.push(honk_config::group::Group {
+        name: "dns-root".into(),
+        groups: vec!["inner".into()],
+        exit: Some("outer-exit".into()),
+        ..Default::default()
+    });
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance.clone())),
+    ));
+    let api = recorder(instance, &store);
+    let (_flow, observer) = observer(&store);
+    let target: SocketAddr = "192.0.2.53:53".parse().unwrap();
+    let evidence = scope_api(
+        Arc::downgrade(&api),
+        observer.scope(async {
+            let plan = manager.selection_plan_for_target_with_health_fallback(
+                "dns-root",
+                &ScoreSelectionContext {
+                    network: SelectionNetwork::Tcp,
+                    probe_domain: ProbeDomain::Tcp,
+                    target_family: Some(IpVersion::V4),
+                    health_family: IpVersion::V4,
+                    target: None,
+                },
+                None,
+            );
+            let picked = plan.entries.into_iter().next().unwrap();
+            let dialed = manager.own_target(Target {
+                node: picked.node,
+                route: picked.route,
+            });
+            assert!(dialed.route.is_some(), "the leaf dials through the exit");
+            outbound_evidence(
+                "dns-root",
+                crate::observe::vocab::RoutingSource::Forced,
+                None,
+                Some(&dialed),
+                target,
+                Default::default(),
+            )
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        evidence.leaf_node_id.as_deref(),
+        Some(honk_config::config::DIRECT_NODE_ID.to_string().as_str())
+    );
+    assert_eq!(evidence.leaf_node_name.as_deref(), Some("direct"));
+    assert_eq!(evidence.server_addr, None);
+}
+
+/// A route whose leaf is `direct` still dials its exits, so the dial's own
+/// lookups are a proxy server's.
+#[tokio::test]
+async fn a_routed_direct_leaf_dials_as_a_proxy_server() {
+    let mut config = honk_config::Config::default();
+    config.ensure_builtin_nodes();
+    let direct = config
+        .nodes
+        .iter()
+        .find(|node| node.id == honk_config::config::DIRECT_NODE_ID)
+        .unwrap()
+        .clone();
+    let instance = Uuid::new_v4().to_string();
+    let store = Arc::new(FlowStore::new(
+        instance.clone(),
+        Arc::new(EventHub::new(instance)),
+    ));
+    let (_flow, observer) = observer(&store);
+    let purpose = |routed: bool| {
+        let direct = direct.clone();
+        observer.scope(async move {
+            outbound_dial_scope(&direct, routed, async {
+                flow_observation::current().map(|observer| observer.context().dns_purpose)
+            })
+            .await
+        })
+    };
+    assert_eq!(purpose(true).await, Some("proxy_server"));
+    assert_ne!(purpose(false).await, Some("proxy_server"));
+}

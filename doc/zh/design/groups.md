@@ -34,7 +34,7 @@ honk 将代理组解析为叶子出站，追踪其健康状态，并限制预热
 
 唯一的多候选例外是没有测量值的顶层 URLTest 组。已有测量值的 URLTest，以及所有非 URLTest 计划，都是权威的单叶节点计划。未配置 `final` 的组如果只剩一个唯一叶节点，而 TCP 存活性过滤把它排除了，那么只有当当前 Selector 选择路径能到达该节点时，才会把它作为权威的最后尝试。此时健康状态仍是 dead，但真实拨号可以证明恢复，而且不会泄漏到其他成员或 `direct`。UDP 仍执行正常的存活性排除。最后尝试服务会记一条限流 warning，每组 60 秒一条；预热 peek 保持静默。
 
-UDP 选择会先排除规范协议或配置不支持 UDP 的转发叶节点，即使还没有健康观测也一样。TCP 存活不能让 VMess 或只支持 TCP 的节点获得 UDP 资格。这些叶节点也不参与 Score 验证，发布组连通性时不能拿它们当作既有 capability 又存活的依据。`block` 仍是终态动作。Selector 已选的节点不具备 UDP capability 时，只能按原规则走显式 `final`，不能改选兄弟成员。VLESS UDP/443 拒绝这类目标相关策略仍在 admission 处终止，不能靠候选过滤绕过去。
+在不经过组 `exit` 的路径上，UDP 选择会先排除规范协议或配置不支持 UDP 的转发叶节点，即使还没有健康观测也一样。在这类路径上，TCP 存活不能让 VMess 或只支持 TCP 的节点获得 UDP 资格。这些叶节点也不参与 Score 验证，发布组连通性时不能拿它们当作既有 capability 又存活的依据。经过组 `exit` 的路由，只有最外层 `exit` 能经流承载 UDP 时才保留为 UDP 候选，与叶节点自身协议无关（见[经出口的 UDP](../reference/groups.md#经出口的-udp)）；叶节点只经由不能承载 UDP 的路由到达时，也不作为 UDP 依据。`block` 仍是终态动作。Selector 已选的节点不具备 UDP capability 时，只能按原规则走显式 `final`，不能改选兄弟成员。VLESS UDP/443 拒绝这类目标相关策略仍在 admission 处终止，不能靠候选过滤绕过去。
 
 ## 策略语义
 
@@ -191,7 +191,7 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 `Group.groups` 指定子组。每个子组只贡献一个候选：该子组策略针对当前网络和地址族选出的叶节点。父组将其作为一个成员排名或固定，不把所有后代合并进父策略。
 
-解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，切断每条形成环的边并打印 warning，防止异常组图阻塞选择或内省。
+解析受 `MAX_GROUP_DEPTH = 8` 和每次遍历的 visited set 限制。构造阶段还会对组边执行 DFS，切断每条形成环的边并打印 warning，防止异常组图阻塞选择或内省。分配 eBPF outbound ID、登记健康检查和构建 URLTest 空闲表时，都遍历配置自身的组图（`honk_config::group_graph`），深度上限相同，也按路径防环，但不切边，所以被切掉的边不会把叶节点挪到另一个 outbound 槽位。
 
 成员边与显式 `final` 边使用同一个有界递归解析器。子组策略没有合格选择时，
 只沿自己的配置 final 继续；父组仍把该子组视为已选成员。Final 链保留选择链和

@@ -187,7 +187,7 @@ Refused while any honk-core, mock mode included, has that state db open.
 honk-core delay <node> [-u|--url HOST:PORT]
 ```
 
-Resolves the address, connects over direct TCP and prints the elapsed milliseconds, resolution included. Without `--url`, it uses the node server address.
+Resolves the address, connects over direct TCP and prints the elapsed milliseconds, resolution included. Without `--url`, it uses the node server address. A [proxy chain](./nodes.md#proxy-chains) has no server address of its own, so `delay` refuses one without `--url`.
 
 Resolved addresses are raced at most two at a time, 250 ms apart, and each attempt times out after five seconds.
 

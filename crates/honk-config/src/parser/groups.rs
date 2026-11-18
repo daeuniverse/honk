@@ -74,6 +74,7 @@ pub(super) fn parse_group_section(
                     "filter",
                     "policy",
                     "final",
+                    "exit",
                     "default",
                     "check_url",
                     "icon",
@@ -108,6 +109,9 @@ pub(super) fn parse_group_section(
             }
             if let Some(value) = fields.get("final").copied() {
                 group.final_outbound = Some(value.raw().to_owned());
+            }
+            if let Some(value) = fields.get("exit").copied() {
+                group.exit = Some(value.raw().to_owned());
             }
             if let Some(value) = fields.get("default").copied() {
                 group.default = Some(value.raw().to_owned());

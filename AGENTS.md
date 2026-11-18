@@ -118,7 +118,7 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 | `cycle`                                                                         | `clean-all` + `build-core`                                                                                                                                                                                                                   |
 | `watch-core`                                                                    | `cargo watch` rebuild                                                                                                                                                                                                                        |
 
-`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the two public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
+`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the three public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
 
 ## Current validation guidance
 
@@ -234,6 +234,7 @@ Behaviour that looks like a defect but is deliberate. Reviewers skip these unles
 | VLESS permits UDP/443 by default, including base Vision | users block QUIC through routing | `.agents/rules/configuration.md` |
 | VLESS Auto keeps native UDP on 53/443 without Vision instead of Single XUDP | Single XUDP measured about half the goodput and 1.9-3.3× the CPU per MB | `.agents/rules/outbound.md` (UDP transport invariant) |
 | A dead outbound drops new flows; there is no implicit `direct` fallback | fail-closed | Runtime invariants: Fail-closed on dead outbounds |
+| A group `exit` is never probed because it is an exit; an exit no probe registered counts as alive, so its group keeps dialing through it after traffic marks it dead | a direct probe can mark dead an exit that is reachable only through the hops in front of it | maintainer, 2026-11-13; `.agents/rules/outbound.md` |
 | Real LAN self-protection only warns; it rejects no configuration and synthesizes no rules | advisory, not a connectivity guarantee | `.agents/rules/configuration.md` (Interface modes) |
 | Native probes, geodata and shared downloads have no address or port allowlist | whoever writes the configuration or controls subscription content decides those targets; provider content is trusted configuration | `.agents/rules/configuration.md`, `.agents/rules/security.md` |
 | Listener-secret values shorter than eight bytes are neither masked nor refused | not recorded | `.agents/rules/security.md` (Native source writes) |

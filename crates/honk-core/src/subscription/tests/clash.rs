@@ -47,10 +47,9 @@ fn clash_vmess_udp_claim_imports_the_tcp_node() {
     );
     assert_eq!(nodes[0].vmess().unwrap().network, None);
     assert_eq!(nodes[1].vmess().unwrap().network.as_deref(), Some("tcp"));
-    assert!(!(honk_outbound::descriptor::descriptor(
-        NodeProtocol::VMess
-    )
-    .supports_udp)(&nodes[0]));
+    assert!(!honk_outbound::descriptor::carries_udp(
+        honk_outbound::descriptor::UdpPath::Own(&nodes[0])
+    ));
 }
 
 #[test]
@@ -884,7 +883,11 @@ fn c11_clash_anytls_network_aliases_resolve_before_udp() {
     assert_eq!(
         nodes
             .iter()
-            .map(|node| (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+            .map(|node| {
+                honk_outbound::descriptor::carries_udp(honk_outbound::descriptor::UdpPath::Own(
+                    node,
+                ))
+            })
             .collect::<Vec<_>>(),
         [true, true, true, false, true]
     );

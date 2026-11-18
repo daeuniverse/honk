@@ -121,6 +121,7 @@ fn test_group(
         groups: vec![],
         default: None,
         final_outbound: None,
+        exit: None,
         check_url: None,
         check_interval: None,
         tolerance: 50,

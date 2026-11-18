@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::anytls::AnyTlsHandler;
 use super::block::BlockHandler;
+use super::chain::ChainHandler;
 use super::direct::DirectHandler;
 use super::hysteria2::Hysteria2Handler;
 use super::juicity::JuicityHandler;
@@ -33,6 +34,10 @@ pub struct ProtocolEntry {
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
     pub shared: Option<Arc<dyn SharedSourceOutbound>>,
+    /// Shares one association per client source when this protocol is a
+    /// chain's exit; only a handler implementing
+    /// [`SharedSourceOutbound::prepare_shared_source_over`] registers it.
+    pub tunneled_shared: Option<Arc<dyn SharedSourceOutbound>>,
 }
 
 impl ProtocolEntry {
@@ -44,6 +49,7 @@ impl ProtocolEntry {
             warmable: None,
             probeable: None,
             shared: None,
+            tunneled_shared: None,
         }
     }
 
@@ -67,6 +73,14 @@ impl ProtocolEntry {
         self
     }
 
+    pub fn with_tunneled_shared<T: SharedSourceOutbound + 'static>(
+        mut self,
+        handler: Arc<T>,
+    ) -> Self {
+        self.tunneled_shared = Some(handler);
+        self
+    }
+
     /// Every capability enabled by the descriptor's default node must have an
     /// implementation slot. Node-dependent descriptors may keep an extra slot;
     /// dispatch checks the concrete node before calling it.
@@ -76,7 +90,9 @@ impl ProtocolEntry {
             outbound: honk_config::node::OutboundConfig::from_protocol(protocol),
             ..Default::default()
         };
-        if (self.descriptor.supports_udp)(&default_node) && self.packet.is_none() {
+        if crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(&default_node))
+            && self.packet.is_none()
+        {
             panic!(
                 "protocol {} declares UDP without a packet handler",
                 protocol.as_str()
@@ -101,12 +117,24 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    /// The chain handler, also registered for `NodeProtocol::Chain`, for
+    /// routes through group exits, which have no protocol entry of their own.
+    chain: Option<Arc<ChainHandler>>,
+}
+
+/// What a runtime-pinned dial goes through: a node of the generation, or a
+/// route over the generation's hop runtimes.
+#[derive(Clone, Copy, Debug)]
+pub enum DialRef<'a> {
+    Node(uuid::Uuid),
+    Route(&'a honk_config::route::Route),
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            chain: None,
         }
     }
 
@@ -137,6 +165,7 @@ impl ProxyRegistry {
             ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
                 .with_packet(trojan.clone())
                 .with_shared(trojan.clone())
+                .with_tunneled_shared(trojan.clone())
                 .with_warmable(trojan.clone())
                 .with_probeable(trojan),
         );
@@ -194,6 +223,27 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
+        // A chain dials its hops through the handlers registered above.
+        let hop_handlers = registry
+            .entries
+            .iter()
+            .map(|entry| ProtocolEntry {
+                descriptor: entry.descriptor,
+                tcp: Arc::clone(&entry.tcp),
+                packet: entry.packet.clone(),
+                warmable: None,
+                probeable: None,
+                shared: entry.shared.clone(),
+                tunneled_shared: entry.tunneled_shared.clone(),
+            })
+            .collect();
+        let chain = Arc::new(ChainHandler::new(hop_handlers));
+        registry.register(
+            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain))
+                .with_packet(chain.clone())
+                .with_shared(chain.clone()),
+        );
+        registry.chain = Some(chain);
         for entry in &registry.entries {
             entry.validate_consistency();
         }
@@ -254,6 +304,62 @@ impl ProxyRegistry {
             })
         })
         .await
+    }
+
+    /// Dial a node or a route through the captured generation.
+    pub async fn dial_ref(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        dial: DialRef<'_>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        match dial {
+            DialRef::Node(node_id) => {
+                self.dial_runtime(generation, node_id, target, target_domain, connect_timeout)
+                    .await
+            }
+            DialRef::Route(route) => {
+                self.dial_route(generation, route, target, target_domain, connect_timeout)
+                    .await
+            }
+        }
+    }
+
+    /// Dial a route over the captured generation's hop runtimes. The dial's
+    /// tasks have no owner of their own; each hop scopes its own to its
+    /// runtime, as for a configured chain.
+    async fn dial_route(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        route: &honk_config::route::Route,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+        let runtime = generation
+            .route_runtime(route)
+            .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        let result = generation
+            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_tcp(
+                &runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )))
+            .await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during dial");
+        }
+        Ok(result)
     }
 
     /// Dial a direct flow with a nonzero mark in the captured generation.
@@ -406,7 +512,9 @@ impl ProxyRegistry {
         {
             return Err(PacketRejection::Policy.into());
         }
-        if protocol != NodeProtocol::Block && !(entry.descriptor.supports_udp)(node) {
+        if protocol != NodeProtocol::Block
+            && !crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node))
+        {
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
         let packet = entry.packet.as_ref().ok_or_else(|| {
@@ -415,6 +523,49 @@ impl ProxyRegistry {
         packet
             .dial_udp_transport(node, target, target_domain, connect_timeout)
             .await
+    }
+
+    /// Generation-pinned UDP over a route through group exits: its exit
+    /// tunnels UDP over the stream the earlier hops open. The exit answers
+    /// the destination-port policy, as the node that frames the UDP. A route
+    /// never shares a source: its runtime is not a node of the generation.
+    pub async fn dial_udp_route(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        route: &honk_config::route::Route,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+        let runtime = generation
+            .route_runtime(route)
+            .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        let exit = runtime.hops().last().map(|exit| &exit.node);
+        if !exit.is_some_and(|exit| crate::descriptor::udp_target_allowed(exit, target.port())) {
+            return Err(PacketRejection::Policy.into());
+        }
+        if !runtime.udp_capable {
+            anyhow::bail!("UDP not supported through this route's exit");
+        }
+        let result = generation
+            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_udp(
+                &runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )))
+            .await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during dial");
+        }
+        Ok(result)
     }
 
     /// Generation-pinned framed UDP transport for an authoritative flow.
@@ -497,6 +648,21 @@ impl ProxyRegistry {
     pub fn has_shared_source(&self, protocol: NodeProtocol) -> bool {
         self.find(protocol)
             .is_some_and(|entry| entry.shared.is_some())
+    }
+
+    /// [`Self::has_shared_source`] for a captured runtime. A chain shares
+    /// one association only through an exit registered as a tunneled shared
+    /// source; a chain without hops in its generation shares nothing.
+    pub fn has_shared_source_for(&self, runtime: &crate::runtime::NodeRuntime) -> bool {
+        let protocol = runtime.node.protocol();
+        if protocol != NodeProtocol::Chain {
+            return self.has_shared_source(protocol);
+        }
+        runtime.udp_capable
+            && runtime.chain_hops().last().is_some_and(|exit| {
+                self.find(exit.node.protocol())
+                    .is_some_and(|entry| entry.tunneled_shared.is_some())
+            })
     }
 
     /// Shared-source association for a captured runtime. The caller owns the

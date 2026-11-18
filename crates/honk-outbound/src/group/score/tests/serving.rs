@@ -725,7 +725,7 @@ fn pool_preflight_is_readonly_and_rejects_stale_authority() {
     let pick = |manager: &GroupManager, effects| {
         manager
             .pick_candidate_for_target(
-                &manager.groups["score"],
+                &manager.groups["score"].group,
                 &target,
                 &mut Vec::new(),
                 0,

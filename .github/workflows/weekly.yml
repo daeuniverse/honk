@@ -99,7 +99,7 @@ jobs:
           readelf -S target/bpfel-unknown-none/release/honk-ebpf | grep '\.BTF'
 
   public-vless-loopback:
-    name: Public VLESS and shared-source loopback interop (4 cases)
+    name: Public VLESS and shared-source loopback interop (5 cases)
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -154,13 +154,14 @@ jobs:
           test "${{ runner.environment }}" = github-hosted
           sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 net.ipv4.ip_unprivileged_port_start=0
           ip -6 address show dev lo scope host | grep -F '::1/128'
-      - name: Run exactly two public ignored loopback cases
+      - name: Run exactly three public ignored loopback cases
         run: |
           set -euo pipefail
           test -x "$HONK_XRAY_BIN"
           test -x "$HONK_SING_BOX_BIN"
           ci/run-exact-ignored-tests.sh --test vless_udp \
             official_xray_and_sing_box_vless_udp_loopback_interop \
+            'chain::official_xray_carries_auto_udp_through_a_chain' \
             'reality::official_xray_reality_authenticates_first_connection_and_rejects_wrong_key'
       - name: Run the official Vision uplink Direct case
         run: |

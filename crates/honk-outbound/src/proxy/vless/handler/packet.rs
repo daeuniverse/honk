@@ -535,6 +535,31 @@ impl PacketOutbound for VLessHandler {
             .await
     }
 
+    /// Native UDP only: XUDP and the multiplexed paths need sessions owned
+    /// by this node's runtime, which a tunneled hop does not dial.
+    async fn dial_udp_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: crate::proxy::TunnelDialOptions,
+    ) -> anyhow::Result<Arc<dyn PacketTransport>> {
+        if !runtime.node.supports_tunneled_udp() {
+            return Err(crate::proxy::TunnelUnsupported("vless udp").into());
+        }
+        let stream = Self::start_tunneled(
+            &runtime.node,
+            carrier,
+            CMD_UDP,
+            target,
+            target_domain,
+            options,
+        )
+        .await?;
+        Ok(Arc::new(VlessConnectedTransport::new(stream, target)))
+    }
+
     async fn dial_udp_transport_speculative_runtime(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,
