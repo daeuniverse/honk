@@ -316,6 +316,8 @@ physical 或 13-size 验收。
 
 ### 物理捕获与 smoke
 
+物理 UDP 包若在 Endpoint 关闭准入前刚通过校验，校验得到的源信息仍然有效。若队列因准入已关闭而拒收该包，它不算被接管，也不计入有效 RX；这次拒收不会导致设备 owner 失败。
+
 物理 link FD 在正常停止或进程退出时 detach。非法 CQ/completion 是致命错误，不算成功排空；未归还 buffer 和 owner 保留到进程退出。启动拒绝外来 XDP，无须手工移除物理 guard 或程序 pin。
 
 `.github/ci/xdp-daemon-smoke.sh` 属于使用匹配预构建 daemon 和测试程序的 floor/recent disposable VM gate。D3 合同检查进程退出或 SIGKILL 后 link detach 和内核转发恢复，以及后续队列启动失败时全部 link 的撤销。保留独立 Host custody 与 TC/NFQUEUE 选择。虚拟覆盖不等于物理 NIC 性能或 DMA 释放认证。

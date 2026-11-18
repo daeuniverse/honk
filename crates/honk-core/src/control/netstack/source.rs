@@ -462,22 +462,17 @@ impl PacketScope {
 
     pub(in crate::control) fn hold_source(&self, address: IpAddr) -> io::Result<SourceWork> {
         self.0.with(|inner| {
-            if inner.closing || inner.finished {
-                return Err(closed());
+            let work = SourceWork::plain(self, inner, address)?;
+            #[cfg(target_os = "linux")]
+            if let Some(peer) = inner
+                .peers
+                .iter()
+                .flatten()
+                .find(|peer| peer.address() == address)
+            {
+                return Ok(work.with_peer(peer.clone()));
             }
-            let index = inner.source_work.hold_address(address)?;
-            Ok(SourceWork {
-                scope: self.clone(),
-                index,
-                context: None,
-                #[cfg(target_os = "linux")]
-                peer: inner
-                    .peers
-                    .iter()
-                    .flatten()
-                    .find(|peer| peer.address() == address)
-                    .cloned(),
-            })
+            Ok(work)
         })
     }
 
@@ -508,6 +503,23 @@ pub(in crate::control) struct SourceWork {
 }
 
 impl SourceWork {
+    pub(super) fn plain(
+        scope: &PacketScope,
+        inner: &mut Inner,
+        address: IpAddr,
+    ) -> io::Result<Self> {
+        if inner.closing || inner.finished {
+            return Err(closed());
+        }
+        Ok(Self {
+            index: inner.source_work.hold_address(address)?,
+            scope: scope.clone(),
+            context: None,
+            #[cfg(target_os = "linux")]
+            peer: None,
+        })
+    }
+
     pub(super) fn retained(
         scope: &PacketScope,
         sources: &mut Sources,

@@ -33,3 +33,4 @@ Added
 - Add explicit one/two-worker XDP processing with exclusive queue owners, shared realm limits, bounded handoff and joined shutdown; default remains one worker, with no performance claim or old-flow migration.
 - Preserve legitimate fragment reassembly lifetimes without consuming the complete packet's routing/protocol wait window, including reordered cross-worker input.
 - Support XDP Endpoint home gateways with ordered static-direct D1, FD-owned physical links, per-member Auto binding, bond realms and zone-0 conntrack admission. UDP without confirmed CT, concurrent first packets and reload publication retain documented executor windows; legacy zone and uplink changes require operator coordination.
+- Keep a physical UDP datagram refused by closing Endpoint admission from failing XDP shutdown; device errors and completion-queue failures remain fatal.

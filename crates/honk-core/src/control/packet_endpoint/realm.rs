@@ -84,25 +84,14 @@ impl PacketEndpoints {
                 on_source,
             )
         };
-        let (rx, received, peer) =
+        let (rx, received, physical) =
             if wire::parse_ip(packet).is_ok_and(|ip| ip.proto == wire::PROTO_TCP) {
                 EndpointAdmission::commit_pending(&mut admission, owner.scope(), receive)?
             } else {
                 receive(&mut admission)
-            };
-        let physical = if matches!(
-            &rx,
-            Rx::Transparent { .. } | Rx::TransparentOwned { .. } | Rx::TransparentSplit { .. }
-        ) {
-            match peer.as_ref().filter(|peer| peer.learned()) {
-                Some(peer) => Some(owner.hold_source(peer.address())?.with_peer(peer.clone())),
-                None => None,
-            }
-        } else {
-            None
-        };
+            }?;
         owner.after_receive();
-        self.dispatch_received::<true>(
+        match self.dispatch_received::<true>(
             owner,
             packet,
             rx,
@@ -111,7 +100,16 @@ impl PacketEndpoints {
             admission,
             None,
             physical.as_ref(),
-        )
+        ) {
+            Err(error)
+                if error
+                    .get_ref()
+                    .is_some_and(|cause| cause.is::<DatagramAdmissionClosed>()) =>
+            {
+                Ok(received)
+            }
+            result => result,
+        }
     }
 }
 

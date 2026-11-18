@@ -377,6 +377,8 @@ physical or 13-size acceptance.
 
 ### Physical capture and smoke
 
+A physical UDP datagram validated just before Endpoint admission closes keeps its validated source. If the queue refuses it because admission has closed, it is neither taken over nor counted as qualified RX. That refusal does not fail the device owner.
+
 Physical link FDs detach on shutdown or process exit. An invalid CQ/completion is fatal, not a successful drain: unreturned buffers and their owners remain retained through process exit. Foreign XDP attachment is refused; no physical guard or program pins need manual removal.
 
 `.github/ci/xdp-daemon-smoke.sh` belongs to the disposable floor/recent VM gate with matching prebuilt daemon and test executables. The D3 contract checks link detachment and kernel forwarding after process exit or SIGKILL, and unwinds all links on a later queue startup failure. Retain the separate Host custody lane and TC/NFQUEUE selections. Virtual coverage does not certify physical NIC performance or DMA release.

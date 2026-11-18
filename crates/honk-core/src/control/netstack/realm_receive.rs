@@ -168,11 +168,11 @@ impl PacketScope {
             honk_netstack::ValidatedSource,
             bool,
         ) -> Option<crate::xdp::worker::PeerHold>,
-    ) -> (
+    ) -> io::Result<(
         Rx,
         super::super::packet_endpoint::PacketReceive,
-        Option<crate::xdp::worker::PeerHold>,
-    ) {
+        Option<SourceWork>,
+    )> {
         self.0.with_silent(|inner| {
             inner.advance(service_at);
             inner.drain_half_open();
@@ -232,7 +232,20 @@ impl PacketScope {
             }
             inner.advance(service_at);
             inner.drain_half_open();
-            (rx, inner.receive_result(report), peer)
+            // Shutdown can abort the scope as soon as this receive releases its lock.
+            let physical = match &rx {
+                Rx::Transparent { src, .. }
+                | Rx::TransparentOwned { src, .. }
+                | Rx::TransparentSplit { src, .. } => {
+                    let work = SourceWork::plain(self, inner, src.ip())?;
+                    Some(match peer.filter(|peer| peer.learned()) {
+                        Some(peer) => work.with_peer(peer),
+                        None => work,
+                    })
+                }
+                _ => None,
+            };
+            Ok((rx, inner.receive_result(report), physical))
         })
     }
 }

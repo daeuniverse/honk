@@ -110,6 +110,10 @@ struct Datagram {
     source_work: SourceWork,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("packet endpoint admission is closed")]
+struct DatagramAdmissionClosed;
+
 enum PacketSource<'a> {
     Captured {
         context: SourceContext,
@@ -1051,7 +1055,7 @@ impl PacketEndpoints {
         if self.shared.is_closing() {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
-                "packet endpoint admission is closed",
+                DatagramAdmissionClosed,
             ));
         }
         let permit = self.sender.try_reserve().map_err(|_| {

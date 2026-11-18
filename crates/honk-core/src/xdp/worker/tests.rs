@@ -14,6 +14,52 @@ fn path() -> ReturnPath {
     }
 }
 
+#[tokio::test]
+async fn physical_udp_close_during_source_validation_retires_cleanly() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let plane = crate::control::tests::support::control_plane(Config::default());
+    let (endpoints, supervisor) =
+        PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 4)
+            .await
+            .unwrap();
+    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let tuple = source(41000, None);
+    let mut packet = [0; 128];
+    let len = wire::udp::emit_packet(&mut packet, tuple.src, tuple.dst, b"in flight").unwrap();
+    let now = Instant::now();
+    let received = std::thread::scope(|threads| {
+        endpoints.receive_on_timed(
+            scope,
+            &packet[..len],
+            now,
+            now,
+            None,
+            false,
+            |src, pending| {
+                let peer = peers
+                    .retain(scope.scope(), src, path(), now, pending)
+                    .unwrap();
+                threads.spawn(|| endpoints.close());
+                // Close publishes admission before taking the scope lock held by this callback.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !endpoints.is_closing() {
+                    assert!(Instant::now() < deadline, "close did not reach admission");
+                    std::thread::yield_now();
+                }
+                Some(peer)
+            },
+        )
+    });
+    assert!(endpoints.is_closing());
+    supervisor.run().await.unwrap();
+    let received =
+        received.expect("shutdown must refuse late UDP without failing the device owner");
+    assert_eq!(received.source, Some(tuple));
+    assert!(!received.taken_over && !received.qualified_rx);
+}
+
 #[test]
 fn peer_identity_uses_logical_realm_not_member_or_priority() {
     let first = path();
