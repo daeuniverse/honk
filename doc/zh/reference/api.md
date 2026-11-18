@@ -1089,7 +1089,7 @@ GET 和成功的 PATCH 响应里有只读的 `recording`：`flows`、`logs`、`d
 
 只有激活和订阅协调都完成之后，才以 `201` 返回当前的 Node 或 Provider 和 `Location`。HTTP 断连不会取消已经入队的工作。使用 `--store db` 时，这些操作记录新修订，不重写主文件。
 
-节点名 1–64 字符，链接最多 8192 字符。provider 名是 1–64 个 ASCII 字母、数字或 `_.-`，HTTP(S) URL 最多 4096 字符。违反结构定义里的长度、匹配模式、枚举或边界要求时，返回 `400 invalid_request`。
+节点名 1–64 字符，链接最多 8192 字符。provider 名是 1–64 个字符，不含控制字符；`[A-Za-z0-9_.-]` 以外的名称加引号写入，配置无法加引号的名称返回 `422 unsupported_value`。HTTP(S) URL 最多 4096 字符。违反结构定义里的长度、匹配模式、枚举或边界要求时，返回 `400 invalid_request`。
 
 重名返回 409。结构合法但不支持的链接、身份、provider URL scheme 或选项返回 422。新 provider 即使有旧的缓存正文，也从零节点、`stale`、没有更新时间的状态开始。
 

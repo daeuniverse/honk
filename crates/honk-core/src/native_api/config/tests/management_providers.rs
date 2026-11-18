@@ -281,7 +281,8 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
         json!({"kind":"other"}),
         json!({"name":""}),
         json!({"name":"n".repeat(65)}),
-        json!({"name":"invalid tag"}),
+        json!({"name":"机".repeat(65)}),
+        json!({"name":"bad\ttag"}),
         json!({"url":""}),
         json!({"url":format!("https://example.test/{}", "x".repeat(4096))}),
         json!({"update_interval": 31_536_001}),
@@ -309,7 +310,13 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
         } else {
             (StatusCode::BAD_REQUEST, "invalid_request")
         };
-        error(response, status, code).await;
+        let body = error(response, status, code).await;
+        if invalid.get("name").is_some() {
+            assert_eq!(
+                rejected(&body),
+                json!({"resource":"/providers","field":"name"})
+            );
+        }
     }
     // Printable ASCII passes validation, but no dae quote can hold both quote characters.
     let unquotable = fixture
@@ -358,6 +365,35 @@ async fn managed_provider_options_are_advertised_validated_and_written() {
         ),
         "{main}"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_provider_names_outside_bare_tags_are_written_quoted() {
+    let fixture = Fixture::new(Access::Admin, false).await;
+    let longest = "机".repeat(64);
+    for (name, url) in [
+        ("机场", "https://example.test/airport"),
+        (longest.as_str(), "https://example.test/longest"),
+    ] {
+        let provider = created(
+            fixture
+                .request(Method::POST, PROVIDERS)
+                .json(&json!({"name":name,"kind":"subscription","url":url}))
+                .send()
+                .await
+                .unwrap(),
+            "providers",
+        )
+        .await;
+        assert_eq!(provider["name"], name);
+        let main = std::fs::read_to_string(fixture.path("main.dae")).unwrap();
+        assert!(main.contains(&format!("    '{name}': '{url}'\n")), "{main}");
+        let path = format!("{PROVIDERS}/{}", provider["id"].as_str().unwrap());
+        assert_eq!(fixture.get(&path).await["name"], name);
+        reload(&fixture).await;
+        assert_eq!(fixture.get(&path).await["name"], name);
+    }
     fixture.shutdown().await;
 }
 
