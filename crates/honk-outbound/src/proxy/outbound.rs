@@ -102,10 +102,14 @@ pub trait TcpOutbound: Send + Sync {
     /// to its server through earlier hops. The carrier's physical connection
     /// owns dial admission and transport observation (`TransportAttached`,
     /// `TransportReady`). This hop still emits its target milestones as a
-    /// direct dial does: `TargetRequestSent` once every carrier below,
-    /// including relay tasks of earlier hops, has delivered the request, and
-    /// `TargetConfirmed` once a protocol reply confirms the target. A caller
-    /// chaining several hops suppresses them on every hop but the last.
+    /// direct dial does: `TargetRequestSent` once the carriers below have
+    /// delivered the request, and `TargetConfirmed` once a protocol reply
+    /// confirms the target. Relay tasks of earlier hops (WS bridge, VMess)
+    /// and a gRPC connection driver defer delivery to their physical write;
+    /// a first hop that hands writes to its own session writer (AnyTLS,
+    /// VLESS mux, XHTTP) may report delivery once that writer accepts them.
+    /// A caller chaining several hops suppresses them on every hop but the
+    /// last.
     /// Protocols that cannot run over a tunneled stream keep the default, a
     /// [`TunnelUnsupported`] error.
     async fn dial_over(

@@ -4,7 +4,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite, DuplexStream};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::runtime::flow_observation::{
     FlowContext, FlowEvent, FlowObserver, Milestone, RequestWrite,
@@ -42,14 +42,14 @@ pub(super) type PendingRequest = Arc<parking_lot::Mutex<Option<(RequestWrite, u6
 /// Defers the request event until the test reports delivery, as an
 /// observed frame transport does.
 #[derive(Debug)]
-pub(super) struct DeferringCarrier {
-    inner: DuplexStream,
+pub(super) struct DeferringCarrier<T> {
+    inner: T,
     accepted: u64,
     request: PendingRequest,
 }
 
-impl DeferringCarrier {
-    pub(super) fn new(inner: DuplexStream) -> (Self, PendingRequest) {
+impl<T> DeferringCarrier<T> {
+    pub(super) fn new(inner: T) -> (Self, PendingRequest) {
         let request = PendingRequest::default();
         let carrier = Self {
             inner,
@@ -60,7 +60,7 @@ impl DeferringCarrier {
     }
 }
 
-impl AsyncRead for DeferringCarrier {
+impl<T: AsyncRead + Unpin> AsyncRead for DeferringCarrier<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -70,7 +70,7 @@ impl AsyncRead for DeferringCarrier {
     }
 }
 
-impl AsyncWrite for DeferringCarrier {
+impl<T: AsyncWrite + Unpin> AsyncWrite for DeferringCarrier<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

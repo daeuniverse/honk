@@ -549,6 +549,85 @@ async fn grpc_read_driver_wakes_a_different_tasks_pending_flush() {
     .expect("read driver failed to wake the flushing task");
 }
 
+/// DATA a request queued may be written by the read side's poll; the carrier
+/// below still sees that request and can defer its event, and control frames
+/// either side's poll writes afterwards do not extend it.
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn grpc_request_written_by_the_read_driver_stays_deferrable() {
+    use crate::proxy::request_observation_support::{DeferringCarrier, milestones, observed};
+    use crate::proxy::transport::write_request;
+    use crate::runtime::flow_observation::Milestone;
+
+    let (client, mut server) = tokio::io::duplex(4096);
+    let control = Arc::new(IoControl::default());
+    let (carrier, pending) = DeferringCarrier::new(ControlledIo {
+        inner: client,
+        control: control.clone(),
+        dribble: false,
+    });
+    let stream = tokio::time::timeout(
+        Duration::from_secs(3),
+        wrap_grpc(&grpc_node(), Box::new(carrier)),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), read_request(&mut server))
+        .await
+        .unwrap();
+    server.write_all(&frame(SETTINGS, 0, 0, &[])).await.unwrap();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (observer, events) = observed();
+
+    control.mode.store(1, Ordering::Release);
+    let mut request = std::pin::pin!(observer.scope(write_request(&mut writer, b"request")));
+    assert!(futures_util::poll!(request.as_mut()).is_pending());
+    control.mode.store(0, Ordering::Release);
+    let mut byte = [0];
+    assert!(futures_util::poll!(std::pin::pin!(reader.read(&mut byte))).is_pending());
+    let end = || pending.lock().as_ref().map(|(_, end)| *end);
+    let request_end = end().expect("the carrier saw the request");
+
+    const PING: u8 = 6;
+    const ACK: u8 = 1;
+    async fn acked(server: &mut tokio::io::DuplexStream) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !matches!(read_frame(server).await, (PING, ACK, 0, _)) {}
+        })
+        .await
+        .expect("the PING is answered");
+    }
+    server.write_all(&frame(PING, 0, 0, &[0; 8])).await.unwrap();
+    assert!(futures_util::poll!(std::pin::pin!(reader.read(&mut byte))).is_pending());
+    acked(&mut server).await;
+    assert_eq!(
+        end(),
+        Some(request_end),
+        "the reader's PING ACK extended the request"
+    );
+
+    server.write_all(&frame(PING, 0, 0, &[1; 8])).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), request)
+        .await
+        .unwrap()
+        .unwrap();
+    acked(&mut server).await;
+    assert_eq!(
+        end(),
+        Some(request_end),
+        "the writer's PING ACK extended the request"
+    );
+    assert_eq!(
+        milestones(&events.lock(), Milestone::TargetRequestSent),
+        0,
+        "sent before the carrier delivered the DATA the read side wrote"
+    );
+    let (deferred, position) = pending.lock().take().unwrap();
+    deferred.delivered(position);
+    assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
+}
+
 #[tokio::test]
 async fn grpc_receive_window_allows_response_beyond_http2_default() {
     let (client, server) = tokio::io::duplex(4096);

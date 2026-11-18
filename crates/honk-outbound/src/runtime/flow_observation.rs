@@ -210,7 +210,7 @@ impl FlowObserver {
 tokio::task_local! {
     static FLOW_OBSERVER: Option<FlowObserver>;
     static SUPPRESSED: bool;
-    static REQUEST_WRITE: RequestWrite;
+    static REQUEST_WRITE: Option<RequestWrite>;
 }
 
 #[cfg(feature = "flow-observation")]
@@ -261,7 +261,7 @@ pub(crate) struct RequestWrite {
 enum RequestTarget {
     Flow(FlowObserver),
     /// A relay task carrying an upper request's bytes up to this position.
-    Relay(Box<RequestWrite>, u64),
+    Relay(Arc<RequestWrite>, u64),
 }
 
 #[cfg(feature = "flow-observation")]
@@ -285,7 +285,7 @@ impl RequestWrite {
         if is_suppressed() {
             return None;
         }
-        REQUEST_WRITE.try_with(Clone::clone).ok()
+        REQUEST_WRITE.try_with(Clone::clone).ok().flatten()
     }
 
     pub(crate) fn defer(&self, position: u64) {
@@ -327,7 +327,7 @@ async fn scoped<T, E>(
     request: RequestWrite,
     write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
 ) -> Result<T, E> {
-    let result = REQUEST_WRITE.scope(request.clone(), write).await;
+    let result = REQUEST_WRITE.scope(Some(request.clone()), write).await;
     if result.is_ok() {
         request.finish();
     }
@@ -419,8 +419,39 @@ impl RelayedRequest {
         self,
         write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
     ) -> Result<T, E> {
-        let upper = RequestTarget::Relay(Box::new(self.request), self.end);
+        let upper = RequestTarget::Relay(Arc::new(self.request), self.end);
         scoped(RequestWrite::new(upper), write).await
+    }
+}
+
+/// Request delivery through a connection driver that either side of a split
+/// stream may poll: bytes queued while a request is current are written to
+/// the carrier with that request current, so the carrier can defer it, and
+/// nothing else the driver writes is attributed to the poller's request.
+#[cfg(feature = "flow-observation")]
+#[derive(Debug)]
+pub(crate) struct DriverRequest(Option<RequestWrite>);
+
+#[cfg(feature = "flow-observation")]
+impl DriverRequest {
+    pub(crate) const fn new() -> Self {
+        Self(None)
+    }
+
+    /// Before queueing bytes for the driver.
+    pub(crate) fn capture(&mut self) {
+        if let Some(request) = RequestWrite::current() {
+            self.0 = Some(request);
+        }
+    }
+
+    pub(crate) fn drive<T>(&self, poll: impl FnOnce() -> T) -> T {
+        REQUEST_WRITE.sync_scope(self.0.clone(), poll)
+    }
+
+    /// Once every queued byte has been written to the carrier and flushed.
+    pub(crate) fn release(&mut self) {
+        self.0 = None;
     }
 }
 
@@ -706,6 +737,27 @@ mod inert {
         }
     }
 
+    #[derive(Debug)]
+    pub(crate) struct DriverRequest;
+
+    impl DriverRequest {
+        #[inline]
+        pub(crate) const fn new() -> Self {
+            Self
+        }
+
+        #[inline]
+        pub(crate) fn capture(&mut self) {}
+
+        #[inline]
+        pub(crate) fn drive<T>(&self, poll: impl FnOnce() -> T) -> T {
+            poll()
+        }
+
+        #[inline]
+        pub(crate) fn release(&mut self) {}
+    }
+
     #[inline]
     pub(crate) fn request_write<F: Future>(future: Pin<&mut F>) -> Pin<&mut F> {
         future
@@ -747,17 +799,18 @@ mod inert {
     const _: () = assert!(size_of::<Option<FlowObserver>>() == 0);
     const _: () = assert!(size_of::<Option<TransportAttempt>>() == 0);
     const _: () = assert!(size_of::<RelayedPipe>() == 0);
+    const _: () = assert!(size_of::<DriverRequest>() == 0);
 }
 
 #[cfg(all(not(feature = "flow-observation"), feature = "rprx"))]
 pub(crate) use inert::scope;
 #[cfg(not(feature = "flow-observation"))]
+pub(crate) use inert::{DriverRequest, RelayedPipe, is_suppressed, request_write};
+#[cfg(not(feature = "flow-observation"))]
 pub use inert::{
     FlowObserver, LookupSelection, TransportAttempt, current, milestone, observe_resolution,
     without,
 };
-#[cfg(not(feature = "flow-observation"))]
-pub(crate) use inert::{RelayedPipe, is_suppressed, request_write};
 
 #[cfg(all(test, feature = "flow-observation"))]
 mod tests;
