@@ -163,13 +163,17 @@ Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in 
 
 Holds ambiguous LAN-forwarded UDP originals in NFQUEUE until userspace reaches a terminal decision. The setting requires the real eBPF backend.
 
+The startup downgrade logs `NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled` with a `reason` field: `the mock eBPF backend was selected`, `honk-core was built without the ebpf feature`, or the fixed-queue preflight error. honk leaves the configuration file unchanged and keeps the setting off for the process.
+
 After the singleton instance handoff, honk logs a warning and disables the setting for the process, without rewriting the configuration, when the fixed queue is unavailable or a pre-admission queue, rules or health check fails. Installing the queue reclaims the reserved nftables table.
 
 Persistent token-generation recovery failures and [post-admission failures](../design/nfqueue.md#activation-and-scope) remain fatal.
 
 `experimental.udp_nfqueue.enabled` is deprecated; use `nfqueue_enable` instead. The old spelling is accepted with a migration warning, and `nfqueue_enable` wins when both are present.
 
-A write or reload may still request `nfqueue_enable: true` while the effective value stays disabled, but only after an actual downgrade. A request that omits the key counts too, because its default is `true`. The downgrade is either an early startup downgrade (mock, no `ebpf` feature, or a failed fixed-queue preflight) or a late queue, rules or health downgrade before datapath admission. The requested source stays unchanged, but effective `false` persists for the process lifetime. Nothing retries activation automatically, so a restart is required to try again. Without a downgrade, toggles remain restart-only. [Common reload normalization](../design/control-plane.md#reload-and-runtime-generations) runs before fingerprint/no-op checks; native pre-write checks and full validation share the same restart policy.
+A write or reload may still request `nfqueue_enable: true` while the effective value stays disabled, but only after an actual downgrade. A request that omits the key counts too, because its default is `true`. The downgrade is either an early startup downgrade (mock, no `ebpf` feature, or a failed fixed-queue preflight) or a late queue, rules or health downgrade before datapath admission. The requested source stays unchanged, but effective `false` persists for the process lifetime. Nothing retries activation automatically, so a restart is required to try again. Without a downgrade, toggles remain restart-only. [Common reload normalization](../design/control-plane.md#reload-and-runtime-generations) runs before fingerprint/no-op checks; native pre-write checks apply the same rule.
+
+In `0.1.0-beta.4` and earlier, an actual startup downgrade did not relax the restart-required check for this field. A write or reload that requested `true`, including one that omitted the key, was refused as needing a restart, also after a restart. Setting `nfqueue_enable: false` in the source was the only way to write.
 
 `nfqueue_enable` also controls [fragmented LAN UDP/53 delivery](../design/nfqueue.md#fragmented-lan-dns): controller/raw-group fragments require ready NFQUEUE and otherwise drop, without bypassing DNS policy. Native `direct(must)` and unfragmented DNS are unchanged.
 
