@@ -1728,6 +1728,71 @@ async fn tcp_proxy_protocols_pass_domain_without_local_resolution() -> anyhow::R
     Ok(())
 }
 
+/// A transparently proxied TCP flow selected onto a chain reaches its
+/// destination through each hop in order, and its bytes count once.
+#[tokio::test]
+async fn tcp_flow_over_a_chain_crosses_every_hop() -> anyhow::Result<()> {
+    use crate::test_support::{socks5_chain, socks5_relay};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let destination = listener.local_addr()?;
+    let mut client = TcpStream::connect(destination).await?;
+    let (accepted, peer) = listener.accept().await?;
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.nodes.extend(socks5_chain(&front, &land));
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "G".into();
+    config.groups.push(Group {
+        name: "G".into(),
+        nodes: config.nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    });
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    plane
+        .group_manager()
+        .read()
+        .set_selector_choice("G", "via", honk_outbound::group::SelectorNetworks::Both)
+        .unwrap();
+    let handle = plane.spawn_handle();
+    let retirement = support::TestRetirement::start(&handle);
+    store_active_tcp_flow(&handle, destination, peer).await?;
+    let worker = handle.clone();
+    let task = tokio::spawn(async move { worker.serve_connection(accepted, peer).await });
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    client.write_all(b"upload").await?;
+    let mut received = [0; 6];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(&received, b"upload");
+    upstream.write_all(b"download").await?;
+    let mut received = [0; 8];
+    client.read_exact(&mut received).await?;
+    assert_eq!(&received, b"download");
+    assert_eq!(*front.requests.lock(), [land.addr]);
+    assert_eq!(*land.requests.lock(), [destination]);
+
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    let totals = handle.stats.snapshot();
+    assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (6, 8));
+    retirement.join(&handle).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn native_tcp_accounting_updates_before_close() -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -4370,6 +4435,34 @@ fn preconnect_candidates_prefer_group_selections_then_config_order() {
         picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
         vec!["trojan", "ss", "vmess"],
         "the group's current pick leads; config order fills the rest"
+    );
+}
+
+/// A selected proxy chain is passed over; its hops stay eligible on their own.
+#[test]
+fn preconnect_candidates_skip_chain_nodes() {
+    let ss = preconnect_test_node("ss", NodeProtocol::SS);
+    let trojan = preconnect_test_node("trojan", NodeProtocol::Trojan);
+    let mut via = preconnect_test_node("via", NodeProtocol::Chain);
+    via.address = String::new();
+    via.outbound = honk_config::node::OutboundConfig::Chain {
+        hops: vec!["ss".into(), "trojan".into()],
+    };
+    let config = Config {
+        nodes: vec![via.clone(), ss, trojan],
+        groups: vec![preconnect_test_group(
+            "g",
+            GroupPolicy::Selector,
+            vec![via.id],
+        )],
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    let picked = preconnect_candidates(&config, &manager, 8);
+    assert_eq!(
+        picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        vec!["ss", "trojan"]
     );
 }
 

@@ -209,6 +209,18 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
+    // TCP only. Every flow redoes each hop's handshake over the first hop's
+    // connection, so neither the stream nor its first-hop socket is poolable,
+    // and the hops own any warm session state themselves.
+    ProtocolDescriptor {
+        protocol: NodeProtocol::Chain,
+        supports_udp: never,
+        pool_ready_streams: never,
+        pool_bare_tcp: never,
+        supports_warm: no_warm,
+        generation_runtime: GenerationRuntime::None,
+        share_link_schemes: &[],
+    },
 ];
 
 /// Target policy only; absent UDP capability is handled separately by callers.
@@ -242,6 +254,7 @@ mod tests {
             NodeProtocol::AnyTLS,
             NodeProtocol::Direct,
             NodeProtocol::Block,
+            NodeProtocol::Chain,
         ] {
             assert_eq!(descriptor(protocol).protocol, protocol);
         }

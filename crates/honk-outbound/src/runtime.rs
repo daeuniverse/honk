@@ -363,6 +363,9 @@ pub struct NodeRuntime {
     warm_retention: Arc<tokio::sync::Mutex<u8>>,
     #[cfg(any(feature = "rprx", test))]
     vless_carriers: Arc<tokio::sync::Semaphore>,
+    /// A proxy chain's hop runtimes from the same generation, entry first.
+    /// Empty for every other node and for a chain outside any generation.
+    chain_hops: Vec<Arc<NodeRuntime>>,
 }
 
 impl NodeRuntime {
@@ -379,6 +382,7 @@ impl NodeRuntime {
         ephemeral: bool,
         #[cfg(feature = "owned-tasks")] task_owner: Option<Arc<tasks::TaskOwner>>,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
+        chain_hops: Vec<Arc<NodeRuntime>>,
     ) -> Arc<Self> {
         let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
         let build = || {
@@ -396,6 +400,7 @@ impl NodeRuntime {
                 warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carriers,
+                chain_hops,
             })
         };
         #[cfg(feature = "owned-tasks")]
@@ -415,6 +420,7 @@ impl NodeRuntime {
             Some(Arc::new(tasks::TaskOwner::default())),
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
+            Vec::new(),
         )
     }
 
@@ -481,6 +487,11 @@ impl NodeRuntime {
             return owner.task_scope();
         }
         TaskScope::default()
+    }
+
+    /// A proxy chain's hop runtimes, entry first; empty for other nodes.
+    pub fn chain_hops(&self) -> &[Arc<NodeRuntime>] {
+        &self.chain_hops
     }
 
     /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
@@ -904,10 +915,12 @@ impl OutboundRuntimeRegistry {
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         honk_config::node::validate_node_collection(nodes)
             .map_err(RuntimeRegistryError::Admission)?;
+        let chains = honk_config::node::resolve_chain_hops(nodes)
+            .map_err(RuntimeRegistryError::Admission)?;
         let own_tasks = cfg!(feature = "owned-tasks") && own_tasks;
         let mut map = HashMap::with_capacity(nodes.len());
         let mut reused = HashSet::new();
-        for node in nodes {
+        for node in nodes.iter().filter(|node| node.chain_hops().is_none()) {
             // Validate cheap, fail-closed TLS inputs before publishing the
             // generation. The heavyweight SSL_CTX/root store stays lazy.
             if node
@@ -950,8 +963,25 @@ impl OutboundRuntimeRegistry {
                     own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
                     #[cfg(any(feature = "rprx", test))]
                     Arc::clone(&vless_carrier_semaphore),
+                    Vec::new(),
                 ),
             };
+            map.insert(node.id, runtime);
+        }
+        // A chain holds its hops' runtimes from this pass, so it is rebuilt in
+        // every generation and never keeps a predecessor's hops alive.
+        for chain in chains {
+            let node = &nodes[chain.index];
+            let hops = chain.hops.iter().map(|hop| Arc::clone(&map[hop])).collect();
+            let runtime = NodeRuntime::build(
+                node,
+                false,
+                #[cfg(feature = "owned-tasks")]
+                own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
+                #[cfg(any(feature = "rprx", test))]
+                Arc::clone(&vless_carrier_semaphore),
+                hops,
+            );
             map.insert(node.id, runtime);
         }
         Ok((

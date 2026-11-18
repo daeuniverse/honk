@@ -708,7 +708,7 @@ impl ControlPlaneHandle {
                                 rule_payload,
                                 chains: connection_chains(
                                     selection_chains.remove(&node.id).unwrap_or_default(),
-                                    &node.name,
+                                    &node,
                                 ),
                                 upload: conn_upload.clone(),
                                 download: conn_download.clone(),

@@ -840,7 +840,7 @@ HTTP 使用設定中的檢查 URL，不跟隨重新導向。DNS 執行真實的 
 
 能夠寫入設定或控制訂閱內容的人，決定這些目標是什麼。provider 內容屬於可信的設定。
 
-對 `direct` 或 `block` 節點做 `tcp_connect`，或對不支援 UDP 的節點做 UDP 探測，會在這項測量開始之前回傳 `422 unsupported_value`。
+對 `direct`、`block` 節點做 `tcp_connect`、以[鏈式節點](./nodes.md#鏈式節點)為目標做 `tcp_connect`，或對不支援 UDP 的節點做 UDP 探測，會在這項測量開始之前回傳 `422 unsupported_value`。對群組做 `tcp_connect` 探測時，其他成員照常測量；鏈式節點成員結果列的 `state` 為 `unavailable`，`error` 為 `no_node_address`，因為鏈式節點沒有自己的伺服器位址。
 
 | 探測預算 | 上限 |
 | --- | --- |
@@ -1099,7 +1099,7 @@ GET 與成功的 PATCH 回應中有唯讀的 `recording`：`flows`、`logs`、`d
 
 DELETE 不接受請求內容與查詢參數：帶了任意一個就回傳 `400 invalid_request`；內容超限回傳 `413 request_too_large`。兩種都不帶 `Retry-After`。未知 ID 回傳 `{"deleted":0}`，不寫入。成功刪除則在啟用之後回傳 `{"deleted":1}`。
 
-內建節點、訂閱派生節點、非主檔案項目，以及不支援或有歧義的歸屬，都回傳 `404 capability_not_supported`。靜態 include 仍然在 inline 檢視中可見。固定的用戶端契約沒有逐節點的 `writable` 欄位，所以介面上的刪除按鈕仍可能被拒絕。
+內建節點、鏈式節點、訂閱派生節點、非主檔案項目，以及不支援或有歧義的歸屬，都回傳 `404 capability_not_supported`。靜態 include 仍然在 inline 檢視中可見。固定的用戶端契約沒有逐節點的 `writable` 欄位，所以介面上的刪除按鈕仍可能被拒絕。
 
 刪除被某個群組用作 `final` 的節點回傳 `409 state_conflict`，`details.groups` 列出這些群組的 ID。其他仍被引用的項目要先改掉引用，否則寫入前的驗證會失敗。主檔案讀取之後又在磁碟上被改動時，回傳 `409 state_conflict`。
 
@@ -1451,11 +1451,11 @@ Clash listener 允許任意 CORS 來源，沒有原生 API 那樣的 Host 與 Or
 
 `GET /proxies` 回傳 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 回傳單一文件。節點文件含 `name`、`type`、`udp: true` 與 `history`。群組文件含 `name`、`type`、成員名稱清單 `all`、TCP 選擇 `now` 與 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 與 `now`，沒有 `history`。
 
-節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。
+節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。
 
 `GET /rules` 回傳 `{"rules":[{"type","payload","proxy"}]}`，由設定的路由規則產生，不含原生規則 ID，也沒有 fallback 列。
 
-`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。
+`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。`chains` 從撥號的節點倒推到規則的目標：先是節點，再是選中它的各層群組。[鏈式節點](./nodes.md#鏈式節點)前面先列出它的各跳，出口在前。
 
 WebSocket 連線上，`?interval=` 設定推送間隔，單位毫秒，預設 1000。它會向上取整到 100、200、500、1000、2000、5000、10000、30000 或 60000，最大 60000。
 
@@ -1525,7 +1525,7 @@ bucket 的順序列出已通過 admission 的非 worker 訂閱；各來源表內
 
 兩輪最終回應的解碼狀態都必須是有效的 200–499。第二輪傳輸失敗或逾時時，可以退回已經驗證過的第一輪樣本。HTTP/1 的部分回應即使逾時也不退回；正常的 HTTP/2 GOAWAY 則可以退回。
 
-每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。session 預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。針對冷的可重用 generation 的探測，使用帶 guard 的臨時執行時，結束後關閉。
+每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。session 預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。針對冷的可重用 generation 的探測，使用帶 guard 的臨時執行時，結束後關閉。鏈式節點例外：它的探測經當前 generation 中各跳的執行時撥號，因此冷探測會重用某一跳已預熱的 session。
 
 HTTP/2 驅動任務在完成或取消後釋放，因此群組掃描不會為每個已測試節點留下新的常駐可重用執行時。
 

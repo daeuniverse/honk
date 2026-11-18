@@ -1141,7 +1141,9 @@ impl Config {
     /// This retains the operator validator's global, DNS, routing, and
     /// subscription checks, then verifies references materialized by runtime
     /// providers. The latter must run after membership rebuilding so a failed
-    /// refresh cannot publish dangling direct or nested-group members.
+    /// refresh cannot publish dangling direct or nested-group members. Proxy
+    /// chain hops resolve by name here too, so a renamed or duplicated hop
+    /// rejects the whole snapshot as a dangling group `final` does.
     pub fn validate_assembled(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
@@ -1214,6 +1216,7 @@ impl Config {
                 ));
             }
         }
+        crate::node::resolve_chain_hops(&self.nodes)?;
         for (upstream_index, upstream) in self.dns.upstream.iter().enumerate() {
             if let Some(outbound) = upstream.outbound.as_deref()
                 && !target_exists(outbound)

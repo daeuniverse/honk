@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use crate::transport_quality::tcp::TcpPressure;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -29,22 +29,65 @@ const RECV_BUF_CAP: usize = RELAY_BATCH + 8192;
 /// server's salt + fixed header (+ first payload chunk) from the read
 /// path, not inline in `dial` — servers only answer after the first client
 /// payload chunk, so reading the response in `dial` deadlocks.
-type PrologueFuture = Pin<
-    Box<
-        dyn std::future::Future<Output = io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)>>
-            + Send,
-    >,
+type PrologueFuture<R> = Pin<
+    Box<dyn std::future::Future<Output = io::Result<(R, AeadCipher, Vec<u8>, Vec<u8>)>> + Send>,
 >;
+
+/// Carrier an [`SsStream`] runs over. A `TcpStream` splits into owned
+/// halves and keeps its pressure sampler; a boxed stream (e.g. an inner
+/// proxy hop) splits through `tokio::io::split` and has no physical socket
+/// to sample.
+pub(crate) trait SsTransport: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    type Read: AsyncRead + Unpin + Send + 'static;
+    type Write: AsyncWrite + Unpin + Send + 'static;
+
+    fn into_parts(self) -> (Self::Read, Self::Write, TcpPressure);
+
+    /// The physical socket behind the write half, if any.
+    fn socket(write: &Self::Write) -> Option<&TcpStream>;
+}
+
+impl SsTransport for TcpStream {
+    type Read = OwnedReadHalf;
+    type Write = OwnedWriteHalf;
+
+    fn into_parts(self) -> (OwnedReadHalf, OwnedWriteHalf, TcpPressure) {
+        let pressure = TcpPressure::new(&self);
+        let (read_half, write_half) = self.into_split();
+        (read_half, write_half, pressure)
+    }
+
+    fn socket(write: &OwnedWriteHalf) -> Option<&TcpStream> {
+        Some(write.as_ref())
+    }
+}
+
+impl<S> SsTransport for Box<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized + 'static,
+{
+    type Read = ReadHalf<Self>;
+    type Write = WriteHalf<Self>;
+
+    fn into_parts(self) -> (Self::Read, Self::Write, TcpPressure) {
+        let (read_half, write_half) = tokio::io::split(self);
+        (read_half, write_half, TcpPressure::default())
+    }
+
+    fn socket(_: &Self::Write) -> Option<&TcpStream> {
+        None
+    }
+}
 
 /// Stream state for one Shadowsocks TCP connection after the salt/header
 /// prologue (which `dial` completes before returning this type).
-pub(crate) struct SsStream {
-    write_half: OwnedWriteHalf,
+pub(crate) struct SsStream<T: SsTransport = TcpStream> {
+    write_half: T::Write,
     pressure: TcpPressure,
     peer_authenticated: bool,
     /// Read half, parked inside the pending 2022 prologue future until the
     /// response header has been consumed.
-    read_half: Option<OwnedReadHalf>,
+    read_half: Option<T::Read>,
     send_cipher: AeadCipher,
     send_nonce: Vec<u8>,
     /// Sealed output waiting to be flushed (poll_write seals once, then
@@ -54,7 +97,7 @@ pub(crate) struct SsStream {
     recv_cipher: Option<AeadCipher>,
     recv_nonce: Vec<u8>,
     /// 2022 only: pending response prologue (salt + fixed header).
-    recv_prologue: Option<PrologueFuture>,
+    recv_prologue: Option<PrologueFuture<T::Read>>,
     recv_pending_len: Option<u16>,
     /// Raw inbound bytes: plaintext at the front (`plain_start..plain_end`),
     /// undecrypted carry right after it (`carry` bytes).
@@ -64,17 +107,16 @@ pub(crate) struct SsStream {
     carry: usize,
 }
 
-impl SsStream {
+impl<T: SsTransport> SsStream<T> {
     #[cfg(test)]
     pub(crate) fn new(
-        inner: TcpStream,
+        inner: T,
         send_cipher: AeadCipher,
         send_nonce: Vec<u8>,
         recv_cipher: AeadCipher,
         recv_nonce: Vec<u8>,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
+        let (read_half, write_half, pressure) = inner.into_parts();
         Self {
             write_half,
             pressure,
@@ -98,14 +140,13 @@ impl SsStream {
     /// 2022 constructor: the response prologue is deferred to the read
     /// path (see [`PrologueFuture`]).
     pub(crate) fn new_2022(
-        inner: TcpStream,
+        inner: T,
         send_cipher: AeadCipher,
         send_nonce: Vec<u8>,
         prologue: Ss2022Prologue,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
-        let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
+        let (read_half, write_half, pressure) = inner.into_parts();
+        let recv_prologue: PrologueFuture<T::Read> = Box::pin(prologue.run(read_half));
         Self {
             write_half,
             pressure,
@@ -129,14 +170,13 @@ impl SsStream {
     /// Legacy constructor: only the request side (salt + header chunk) is
     /// written in `dial`; the response salt is read from the read path.
     pub(crate) fn new_legacy(
-        inner: TcpStream,
+        inner: T,
         send_cipher: AeadCipher,
         send_nonce: Vec<u8>,
         prologue: LegacyPrologue,
     ) -> Self {
-        let pressure = TcpPressure::new(&inner);
-        let (read_half, write_half) = inner.into_split();
-        let recv_prologue: PrologueFuture = Box::pin(prologue.run(read_half));
+        let (read_half, write_half, pressure) = inner.into_parts();
+        let recv_prologue: PrologueFuture<T::Read> = Box::pin(prologue.run(read_half));
         Self {
             write_half,
             pressure,
@@ -168,9 +208,15 @@ impl SsStream {
         self.plain_start = 0;
         self.plain_end = data.len();
     }
+
+    fn observe_pressure(&mut self) {
+        if let Some(socket) = T::socket(&self.write_half) {
+            self.pressure.observe(socket);
+        }
+    }
 }
 
-impl std::fmt::Debug for SsStream {
+impl<T: SsTransport> std::fmt::Debug for SsStream<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SsStream")
             .field("send_pending", &(self.send_buf.len() - self.send_off))
@@ -180,7 +226,7 @@ impl std::fmt::Debug for SsStream {
     }
 }
 
-impl AsyncRead for SsStream {
+impl<T: SsTransport> AsyncRead for SsStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -199,7 +245,7 @@ impl AsyncRead for SsStream {
                     this.prefill_plaintext(&first_payload);
                     if !first_payload.is_empty() {
                         this.peer_authenticated = true;
-                        this.pressure.observe(this.write_half.as_ref());
+                        this.observe_pressure();
                     }
                 }
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -247,7 +293,7 @@ impl AsyncRead for SsStream {
             }
             if out_len > 0 {
                 this.peer_authenticated = true;
-                this.pressure.observe(this.write_half.as_ref());
+                this.observe_pressure();
                 out.advance(out_len);
                 return Poll::Ready(Ok(()));
             }
@@ -315,7 +361,7 @@ impl AsyncRead for SsStream {
             })?;
             if out_len > 0 {
                 this.peer_authenticated = true;
-                this.pressure.observe(this.write_half.as_ref());
+                this.observe_pressure();
             }
             this.plain_start = 0;
             this.plain_end = out_len;
@@ -345,7 +391,7 @@ impl AsyncRead for SsStream {
     }
 }
 
-impl AsyncWrite for SsStream {
+impl<T: SsTransport> AsyncWrite for SsStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -394,7 +440,7 @@ impl AsyncWrite for SsStream {
     }
 }
 
-impl SsStream {
+impl<T: SsTransport> SsStream<T> {
     /// Drive the sealed buffer toward the socket; `Ok(())` means fully
     /// drained (buffer reset).
     fn poll_flush_ciphertext(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -414,7 +460,7 @@ impl SsStream {
             };
             self.send_off += n;
             if self.peer_authenticated {
-                self.pressure.observe(self.write_half.as_ref());
+                self.observe_pressure();
             }
         }
         self.send_buf.clear();
@@ -432,10 +478,10 @@ pub(crate) struct LegacyPrologue {
 }
 
 impl LegacyPrologue {
-    async fn run(
+    async fn run<R: AsyncRead + Unpin>(
         self,
-        mut read_half: OwnedReadHalf,
-    ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        mut read_half: R,
+    ) -> io::Result<(R, AeadCipher, Vec<u8>, Vec<u8>)> {
         let mut recv_salt = vec![0u8; self.conf.salt_len];
         read_half.read_exact(&mut recv_salt).await?;
         let mut recv_subkey = vec![0u8; self.conf.key_len];
@@ -455,10 +501,10 @@ pub(crate) struct Ss2022Prologue {
 }
 
 impl Ss2022Prologue {
-    async fn run(
+    async fn run<R: AsyncRead + Unpin>(
         self,
-        mut read_half: OwnedReadHalf,
-    ) -> io::Result<(OwnedReadHalf, AeadCipher, Vec<u8>, Vec<u8>)> {
+        mut read_half: R,
+    ) -> io::Result<(R, AeadCipher, Vec<u8>, Vec<u8>)> {
         use super::aead2022::{NONCE_LEN, TAG_LEN, unix_timestamp};
         use super::increment_nonce;
         use anyhow::anyhow;
@@ -518,8 +564,8 @@ impl Ss2022Prologue {
 }
 
 /// Flush helper for the legacy prologue path (one-shot sealed write).
-pub(crate) async fn write_all_sealed(
-    inner: &mut TcpStream,
+pub(crate) async fn write_all_sealed<W: AsyncWrite + Unpin + ?Sized>(
+    inner: &mut W,
     cipher: &AeadCipher,
     nonce: &mut [u8],
     payload: &[u8],

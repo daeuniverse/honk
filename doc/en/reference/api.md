@@ -902,7 +902,7 @@ Target hosts resolve through the running DNS configuration. When that configurat
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
-`tcp_connect` on a `direct` or `block` node, and a UDP probe of a node without UDP, return `422 unsupported_value` before measuring.
+`tcp_connect` on a `direct` or `block` node or a targeted [chain](./nodes.md#proxy-chains) node, and a UDP probe of a node without UDP, return `422 unsupported_value` before measuring. A group's `tcp_connect` probe still measures its other members; a chain member's row has `state` `unavailable` and `error` `no_node_address`, because a chain has no server address of its own.
 
 | Probe budget | Limit |
 | --- | --- |
@@ -1145,7 +1145,7 @@ The exact source specification stays deferred through unrelated edits and reload
 
 DELETE takes no body or query. Sending one returns `400 invalid_request`, and a body over the limit returns `413 request_too_large`, both without `Retry-After`. Unknown IDs return `{"deleted":0}` without a write.
 
-Successful removal returns `{"deleted":1}` only after activation. Builtins, subscription-derived nodes, declarations outside the main source and unsupported or ambiguous ownership return `404 capability_not_supported`. Static includes remain visible under `inline`.
+Successful removal returns `{"deleted":1}` only after activation. Builtins, chain nodes, subscription-derived nodes, declarations outside the main source and unsupported or ambiguous ownership return `404 capability_not_supported`. Static includes remain visible under `inline`.
 
 The fixed client contract has no per-node writable flag, so a displayed removal action may still be refused. Deleting a node that a group names as its `final` returns `409 state_conflict` with those group IDs in `details.groups`. Other still-referenced entries fail validation before writing.
 
@@ -1552,11 +1552,11 @@ Each subscriber's level filter runs after the shared queue. Lagged clients skip 
 
 `GET /proxies` returns `{"proxies":{"<name>":<document>}}`; `GET /proxies/{name}` returns one document. A node document has `name`, `type`, `udp: true` and `history`. A group document has `name`, `type`, member names in `all`, its TCP choice in `now` and `history`; Score adds `scoreVerification`. `GLOBAL` has `type: "selector"`, `all` and `now` but no `history`.
 
-Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`, `Tuic`, `Juicity`, `AnyTLS`, `Direct` or `Reject` (for `block`). Group `type` is `selector`, `url_test`, `load_balance` or `fallback`; Score reports `url_test`. A `history` entry is `{time,delay}` from the latest real TCP IPv4 measurement.
+Node `type` is `Shadowsocks`, `Trojan`, `Vmess`, `Vless`, `Socks5`, `Hysteria2`, `Tuic`, `Juicity`, `AnyTLS`, `Chain`, `Direct` or `Reject` (for `block`). Group `type` is `selector`, `url_test`, `load_balance` or `fallback`; Score reports `url_test`. A `history` entry is `{time,delay}` from the latest real TCP IPv4 measurement.
 
 `GET /rules` returns `{"rules":[{"type","payload","proxy"}]}`, built from the configured routing rules, without native rule IDs or a fallback row.
 
-`GET /connections` returns `{downloadTotal,uploadTotal,connections,memory}`. The totals sum the current rows, and `memory` is process RSS in bytes. A row is `{id,metadata,upload,download,start,chains,rule,rulePayload}`. `metadata` has `network`, `type`, `sourceIP`, `destinationIP`, `sourcePort` and `destinationPort` as strings, `host`, `dnsMode: "normal"`, `process` and `processPath`; unknown values are `""`.
+`GET /connections` returns `{downloadTotal,uploadTotal,connections,memory}`. The totals sum the current rows, and `memory` is process RSS in bytes. A row is `{id,metadata,upload,download,start,chains,rule,rulePayload}`. `metadata` has `network`, `type`, `sourceIP`, `destinationIP`, `sourcePort` and `destinationPort` as strings, `host`, `dnsMode: "normal"`, `process` and `processPath`; unknown values are `""`. `chains` runs from the dialed node back to the rule's target: the node, then each group it was selected through. A [proxy chain](./nodes.md#proxy-chains) node is preceded by its hops, exit first.
 
 On a WebSocket, `?interval=` sets the push period in milliseconds (default 1000), rounded up to 100, 200, 500, 1000, 2000, 5000, 10000, 30000 or 60000 and capped at 60000.
 
@@ -1631,7 +1631,7 @@ Both final responses must have valid decoded 200–499 statuses. A measured-roun
 
 HTTP/1 informational and final response heads share a 16 KiB per-round cap. HTTP/2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, HTTP/2 startup and each request have separate timeout budgets.
 
-Cold reusable generation probes use guarded temporary runtimes that close afterward. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
+Cold reusable generation probes use guarded temporary runtimes that close afterward. A chain node is the exception: its probe dials through the hop runtimes of the running generation, so a cold probe reuses any warm session a hop holds. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
 
 Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results. Arbitrary manual test targets do not advance real-dial failure streaks.
 

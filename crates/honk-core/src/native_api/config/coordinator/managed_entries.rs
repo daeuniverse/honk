@@ -70,6 +70,7 @@ impl Worker {
                         node.protocol(),
                         honk_config::types::NodeProtocol::Direct
                             | honk_config::types::NodeProtocol::Block
+                            | honk_config::types::NodeProtocol::Chain
                     )
                 {
                     return Err(management::unsupported());

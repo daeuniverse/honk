@@ -64,6 +64,46 @@ async fn a_group_override_goes_through_the_group_whatever_the_rules_say() {
     assert_eq!(requests.lock().len(), 1);
 }
 
+/// A download routed to a proxy chain reaches the provider through each hop.
+#[tokio::test]
+async fn a_fetch_through_a_chain_crosses_every_hop() {
+    use crate::test_support::{socks5_chain, socks5_relay};
+
+    let (address, requests) = server().await;
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let nodes = socks5_chain(&front, &land).to_vec();
+    let config = Config {
+        groups: vec![Group {
+            name: "proxy".into(),
+            nodes: vec![nodes[0].id],
+            ..Default::default()
+        }],
+        nodes,
+        ..Default::default()
+    };
+    let routing = SharedOutbounds {
+        router: Arc::new(RwLock::new(Router::new(&[], "direct").unwrap())),
+        group_manager: Arc::new(parking_lot::RwLock::new(Arc::new(GroupManager::new(
+            &config.groups,
+            &config.nodes,
+        )))),
+        runtime_registry: Arc::new(parking_lot::RwLock::new(Arc::new(
+            honk_outbound::runtime::OutboundRuntimeRegistry::build(&config.nodes).unwrap(),
+        ))),
+        config: Arc::new(RwLock::new(Arc::new(config))),
+        proxy_registry: Arc::new(ProxyRegistry::default_resolver().unwrap()),
+    };
+    let nodes = manager(routing)
+        .fetch(&subscription(address, "proxy"))
+        .await
+        .unwrap();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(requests.lock().len(), 1);
+    assert_eq!(*front.requests.lock(), [land.addr]);
+    assert_eq!(*land.requests.lock(), [address]);
+}
+
 /// Group `score` holds two nodes dialed through [`Tunnel`], and no rule applies.
 fn scored_routing() -> (SharedOutbounds, Arc<AtomicUsize>, [Node; 2]) {
     let nodes = ["a", "b"].map(|name| {

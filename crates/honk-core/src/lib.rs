@@ -69,6 +69,79 @@ pub(crate) mod test_support {
         );
         true
     }
+
+    /// A no-auth SOCKS5 server that relays IPv4 CONNECT requests over real
+    /// sockets and records each requested target.
+    pub(crate) struct Socks5Relay {
+        pub(crate) addr: std::net::SocketAddr,
+        pub(crate) requests: std::sync::Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>>,
+    }
+
+    pub(crate) async fn socks5_relay() -> Socks5Relay {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let requests: std::sync::Arc<parking_lot::Mutex<Vec<_>>> = std::sync::Arc::default();
+        let log = std::sync::Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut client, _) = listener.accept().await.unwrap();
+                let log = std::sync::Arc::clone(&log);
+                tokio::spawn(async move {
+                    let mut greeting = [0u8; 2];
+                    client.read_exact(&mut greeting).await.unwrap();
+                    let mut methods = vec![0u8; greeting[1] as usize];
+                    client.read_exact(&mut methods).await.unwrap();
+                    client.write_all(&[5, 0]).await.unwrap();
+                    let mut request = [0u8; 10];
+                    client.read_exact(&mut request).await.unwrap();
+                    assert_eq!(request[..4], [5, 1, 0, 1], "IPv4 CONNECT");
+                    let target = std::net::SocketAddr::from((
+                        [request[4], request[5], request[6], request[7]],
+                        u16::from_be_bytes([request[8], request[9]]),
+                    ));
+                    log.lock().push(target);
+                    let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+                    client
+                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                });
+            }
+        });
+        Socks5Relay { addr, requests }
+    }
+
+    /// A chain `via` from a SOCKS5 `front` to a SOCKS5 `land`, then its hops.
+    pub(crate) fn socks5_chain(
+        front: &Socks5Relay,
+        land: &Socks5Relay,
+    ) -> [honk_config::node::Node; 3] {
+        use honk_config::node::{Node, OutboundConfig};
+
+        let socks5 = |name: &str, relay: &Socks5Relay| {
+            let mut node = Node {
+                name: name.into(),
+                address: relay.addr.to_string(),
+                port: relay.addr.port(),
+                outbound: OutboundConfig::Socks5(Default::default()),
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
+        };
+        let mut via = Node {
+            name: "via".into(),
+            outbound: OutboundConfig::Chain {
+                hops: vec!["front".into(), "land".into()],
+            },
+            ..Default::default()
+        };
+        via.id = via.derive_id();
+        [via, socks5("front", front), socks5("land", land)]
+    }
 }
 
 pub use honk_outbound::alive as outbound;
@@ -377,6 +450,11 @@ pub async fn handle_clash_command(cli: &Cli) -> anyhow::Result<()> {
 
             let addr = if let Some(u) = url {
                 u.clone()
+            } else if target_node.chain_hops().is_some() {
+                anyhow::bail!(
+                    "Node '{}' is a proxy chain with no address of its own; pass a URL",
+                    node
+                );
             } else {
                 format!("{}:{}", target_node.host(), target_node.port)
             };
@@ -1990,5 +2068,22 @@ mod startup_lifecycle_tests {
         let rendered = error.to_string();
         assert!(rendered.contains("node ID duplicates another node"));
         assert!(!rendered.contains("configuration validation failed"));
+    }
+
+    #[tokio::test]
+    async fn delay_without_a_url_refuses_a_chain() {
+        let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
+        std::fs::write(
+            file.path(),
+            "node {\n front: 'socks5://127.0.0.1:1080'\n land: 'socks5://127.0.0.1:1081'\n via: front -> land\n}\n",
+        )
+        .unwrap();
+        let config = file.path().to_str().unwrap();
+        let cli = Cli::try_parse_from(["honk-core", "-c", config, "delay", "via"]).unwrap();
+        let error = super::handle_clash_command(&cli).await.unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Node 'via' is a proxy chain with no address of its own; pass a URL"
+        );
     }
 }
