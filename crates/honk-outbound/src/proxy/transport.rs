@@ -441,6 +441,21 @@ impl tokio::io::AsyncWrite for ObservedWs {
             .poll_write(|| std::pin::Pin::new(inner).poll_write(cx, buf))
     }
 
+    fn poll_write_vectored(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        this.pipe
+            .poll_write(|| std::pin::Pin::new(inner).poll_write_vectored(cx, bufs))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
