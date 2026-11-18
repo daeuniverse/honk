@@ -13,6 +13,9 @@ kernel_dir="${RUNNER_TEMP:?}/kernel-$lane"
 log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/$lane"
 mkdir -p "$kernel_dir" "$log_dir"
 
+# Real-kernel fixtures bound busy polling to 1 ms intervals; on Linux 6.12 the unoptimized
+# test build never completed a round inside them, so the adaptive fixture counted no probe.
+export CARGO_PROFILE_DEV_OPT_LEVEL=2
 {
   cargo build -p honk-core --features ebpf,native-api --bin honk-core --message-format=json
   cargo test -p honk-core --features ebpf,native-api --lib --test ebpf_datapath_test --no-run --message-format=json
