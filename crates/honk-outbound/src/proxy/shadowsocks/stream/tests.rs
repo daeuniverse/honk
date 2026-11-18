@@ -17,7 +17,11 @@ fn ciphers(master: &[u8], c2s_salt: &[u8], s2c_salt: &[u8]) -> (AeadCipher, Aead
     )
 }
 
-fn legacy_stream(server: TcpStream, send_cipher: AeadCipher, recv_cipher: AeadCipher) -> SsStream {
+fn legacy_stream(
+    server: TcpStream,
+    send_cipher: AeadCipher,
+    recv_cipher: AeadCipher,
+) -> SsStream<TcpStream> {
     SsStream::new(
         server,
         send_cipher,

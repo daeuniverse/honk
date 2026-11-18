@@ -9,6 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::proxy::AsyncReadWrite;
 use crate::transport_quality::tcp::TcpPressure;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -62,10 +63,7 @@ impl SsTransport for TcpStream {
     }
 }
 
-impl<S> SsTransport for Box<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized + 'static,
-{
+impl SsTransport for Box<dyn AsyncReadWrite> {
     type Read = ReadHalf<Self>;
     type Write = WriteHalf<Self>;
 
@@ -81,7 +79,7 @@ where
 
 /// Stream state for one Shadowsocks TCP connection after the salt/header
 /// prologue (which `dial` completes before returning this type).
-pub(crate) struct SsStream<T: SsTransport = TcpStream> {
+pub(crate) struct SsStream<T: SsTransport> {
     write_half: T::Write,
     pressure: TcpPressure,
     peer_authenticated: bool,
