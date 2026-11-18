@@ -480,6 +480,9 @@ fn test_udp_2022_failed_server_packet_does_not_mutate_replay_state() {
     }
 }
 
+const TCP_TARGET: &str = "93.184.216.34:443";
+const TCP_TARGET_HEADER: [u8; 7] = [1, 93, 184, 216, 34, 0x01, 0xbb];
+
 /// Mock Shadowsocks 2022 server: parses the request (including EIH),
 /// then echoes every received chunk payload back inside a proper
 /// response stream.
@@ -487,15 +490,17 @@ async fn mock_2022_server(
     listener: tokio::net::TcpListener,
     password: &'static str,
     method_name: &'static str,
+    expected_target: &[u8],
 ) {
     let (stream, _) = listener.accept().await.unwrap();
-    serve_mock_2022(stream, password, method_name).await;
+    serve_mock_2022(stream, password, method_name, expected_target).await;
 }
 
 async fn serve_mock_2022<S: AsyncRead + AsyncWrite>(
     stream: S,
     password: &'static str,
     method_name: &'static str,
+    expected_target: &[u8],
 ) {
     let method = Ss2022Method::new(method_name, password).unwrap();
     let (mut rd, mut wr) = tokio::io::split(stream);
@@ -534,6 +539,7 @@ async fn serve_mock_2022<S: AsyncRead + AsyncWrite>(
     let var = cipher.open(&nonce, &var).unwrap();
     increment_nonce(&mut nonce);
     let addr_len = addr_len(&var);
+    assert_eq!(&var[..addr_len], expected_target, "target address");
     let padding_len = u16::from_be_bytes([var[addr_len], var[addr_len + 1]]) as usize;
     assert!(padding_len > 0, "padding must be present without payload");
     assert_eq!(var.len(), addr_len + 2 + padding_len);
@@ -593,7 +599,12 @@ async fn serve_mock_2022<S: AsyncRead + AsyncWrite>(
 async fn tcp_roundtrip(method_name: &'static str, password: &'static str) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let server_addr = listener.local_addr().unwrap();
-    tokio::spawn(mock_2022_server(listener, password, method_name));
+    tokio::spawn(mock_2022_server(
+        listener,
+        password,
+        method_name,
+        &TCP_TARGET_HEADER,
+    ));
 
     let node = Node {
         name: "test-ss2022".into(),
@@ -609,7 +620,7 @@ async fn tcp_roundtrip(method_name: &'static str, password: &'static str) {
         ..Default::default()
     };
     let handler = ShadowsocksHandler::new();
-    let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = handler
         .dial(&node, target, None, std::time::Duration::from_secs(3))
         .await
@@ -660,7 +671,12 @@ async fn tcp_2022_roundtrip_over_a_non_tcp_stream() {
     let method_name = "2022-blake3-aes-128-gcm";
     let password = "AAECAwQFBgcICQoLDA0ODw==";
     let (client, server) = tokio::io::duplex(64 * 1024);
-    tokio::spawn(serve_mock_2022(server, password, method_name));
+    tokio::spawn(serve_mock_2022(
+        server,
+        password,
+        method_name,
+        &TCP_TARGET_HEADER,
+    ));
 
     let mut node = Node {
         name: "test-ss2022-tunnel".into(),
@@ -678,7 +694,7 @@ async fn tcp_2022_roundtrip_over_a_non_tcp_stream() {
     };
     node.id = node.derive_id();
     let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
-    let target: SocketAddr = "93.184.216.34:443".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = ShadowsocksHandler::new()
         .dial_over(
             runtime,

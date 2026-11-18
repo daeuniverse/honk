@@ -204,9 +204,13 @@ fn test_batched_decrypt_split_feeds() {
     assert_eq!(received, payload);
 }
 
-/// Mock legacy-AEAD TCP server (salt + chunk codec): echoes every payload
-/// byte uppercased after skipping the 7-byte IPv4 target header.
-async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S) {
+const TCP_TARGET: &str = "93.184.216.34:80";
+const TCP_TARGET_HEADER: [u8; 7] = [1, 93, 184, 216, 34, 0, 80];
+
+async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
+    mut server: S,
+    mut expected_target: &[u8],
+) {
     let method = "aes-128-gcm";
     let password = "test-password";
     let conf = CipherConf::for_method(method).unwrap();
@@ -230,10 +234,6 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S
     let mut s2c_nonce = vec![0u8; conf.nonce_len];
 
     // Echo loop: decrypt chunks, uppercase the payload, re-seal.
-    // The first plaintext bytes are the target header (own chunk);
-    // skip them, echo the rest.
-    let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
-    let mut skip = header_len;
     let mut buf = vec![0u8; 262144];
     let mut carry = 0usize;
     let mut pending_len = None;
@@ -253,8 +253,9 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S
         )
         .unwrap();
         if out_len > 0 {
-            let start = skip.min(out_len);
-            skip -= start;
+            let start = expected_target.len().min(out_len);
+            assert_eq!(&buf[..start], &expected_target[..start], "target address");
+            expected_target = &expected_target[start..];
             if start < out_len {
                 let upper: Vec<u8> = buf[start..out_len]
                     .iter()
@@ -304,7 +305,7 @@ async fn test_dial_tcp_legacy_end_to_end() {
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        mock_legacy_tcp_server(server).await;
+        mock_legacy_tcp_server(server, &TCP_TARGET_HEADER).await;
     });
 
     let node = Node {
@@ -321,7 +322,7 @@ async fn test_dial_tcp_legacy_end_to_end() {
         ..Default::default()
     };
     let handler = ShadowsocksHandler::new();
-    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = handler
         .dial(&node, target, None, std::time::Duration::from_secs(3))
         .await
@@ -335,7 +336,7 @@ async fn test_dial_tcp_legacy_end_to_end() {
 async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     // Large enough to hold the whole echo while the client is still writing.
     let (client, server) = tokio::io::duplex(4 << 20);
-    tokio::spawn(mock_legacy_tcp_server(server));
+    tokio::spawn(mock_legacy_tcp_server(server, &TCP_TARGET_HEADER));
 
     let mut node = Node {
         name: "test-ss-tunnel".into(),
@@ -353,7 +354,7 @@ async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     };
     node.id = node.derive_id();
     let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
-    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = ShadowsocksHandler::new()
         .dial_over(
             runtime,
