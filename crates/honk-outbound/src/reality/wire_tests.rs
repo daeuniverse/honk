@@ -188,13 +188,13 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
     Captured { peer, hello }
 }
 
-/// Answer one REALITY handshake on `tcp` and return the ClientHello.
+/// Answer one REALITY handshake on `stream` and return the captured ClientHello.
 async fn serve_stream(
-    mut tcp: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
     reply: Reply,
     key: &PKey<Private>,
 ) -> Vec<u8> {
-    let record = read_hello(&mut tcp).await;
+    let record = read_hello(&mut stream).await;
     let hello = record[5..].to_vec();
     let auth_key = if matches!(reply, Reply::Authenticated | Reply::InvalidHmac) {
         authenticate_hello(&hello, key)
@@ -202,11 +202,11 @@ async fn serve_stream(
         [0; 32]
     };
     if matches!(reply, Reply::TlsAlert) {
-        tcp.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
+        stream.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
         let mut received = Vec::new();
-        tcp.read_to_end(&mut received).await.ok();
+        stream.read_to_end(&mut received).await.ok();
     } else {
-        let (read, write) = tokio::io::split(tcp);
+        let (read, write) = tokio::io::split(stream);
         let replay = tokio::io::join(Cursor::new(record).chain(read), write);
         let mut tls = tokio_boring::accept(&acceptor(reply, &auth_key, None), replay)
             .await
@@ -601,8 +601,6 @@ fn repeated_client_hello_is_rejected_without_resealing() {
     assert_eq!(hello, sealed);
 }
 
-/// A tunneled hop authenticates over a non-TCP carrier, and disabling
-/// `reality_key_shares` drops the hybrid share from its ClientHello.
 #[tokio::test]
 async fn tunneled_handshake_authenticates_and_follows_the_key_share_option() {
     for (offer_hybrid, groups) in [(true, &[0x11ec, 29][..]), (false, &[29][..])] {
