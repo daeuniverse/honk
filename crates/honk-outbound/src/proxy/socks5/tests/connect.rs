@@ -214,7 +214,7 @@ async fn dial_over_relays_through_the_carrier() {
 mod request_observation {
     use super::*;
     use crate::proxy::request_observation_support::{DeferringCarrier, milestones, observed};
-    use crate::runtime::flow_observation::Milestone;
+    use crate::runtime::flow_observation::{FlowEvent, Milestone};
 
     #[tokio::test]
     async fn direct_handshake_publishes_request_sent_once() {
@@ -236,9 +236,18 @@ mod request_observation {
             .await
             .unwrap();
         server.await.unwrap();
-        let events = events.lock();
-        assert_eq!(milestones(&events, Milestone::TargetRequestSent), 1);
-        assert_eq!(milestones(&events, Milestone::TargetConfirmed), 1);
+        let published_milestones: Vec<_> = events
+            .lock()
+            .iter()
+            .filter_map(|event| match event {
+                FlowEvent::Milestone { milestone } => Some(*milestone),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published_milestones,
+            [Milestone::TargetRequestSent, Milestone::TargetConfirmed]
+        );
     }
 
     #[tokio::test]
