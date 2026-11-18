@@ -283,6 +283,14 @@ class Peer:
             conn.settimeout(20 if idle_deadline is None else max(0.001, idle_deadline - time.monotonic()))
             try:
                 if role == 'socks':
+                    # A bare preconnect need not send a SOCKS greeting until checkout.
+                    try:
+                        first = conn.recv(1, socket.MSG_PEEK)
+                    except TimeoutError:
+                        self.event('socks-idle', remote=endpoint(remote), listener=conn.getsockname()[1])
+                        return
+                    if not first:
+                        return
                     self.socks(conn)
                 elif role == 'http':
                     request = bytearray()
