@@ -58,6 +58,8 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
+`nfnetlink_queue` 和 `nft_queue` 由内核的模块自动加载机制加载。如果系统关闭了自动加载，用 `modprobe` 手动加载这两个模块，并写进 `/etc/modules-load.d/`。
+
 必须启用 cgroup v2 和 `CONFIG_CGROUP_BPF`。真实数据路径会在根 cgroup 上挂接 socket 身份 hook 和 TCP `sock_ops` 程序 `honk_tcp_passive`。两项缺任何一项，启动都会失败。根 cgroup 的 `sock_ops` 槽位如果已经被 flags=0 的旧式程序占着，启动同样会失败，用 `bpftool cgroup attach` 挂上的程序也算。
 
 `honk_tcp_passive` 会收到主机上每次 TCP `sock_ops` 回调，每条连接若干次；遇到不属于 honk 命名空间的 socket 就直接返回。TCP 归属证明不需要内核自带 BTF、ftrace 或内置 IPv6，有外部原始 BTF 文件就够了。
@@ -722,6 +724,7 @@ cargo run --release -p honk-core -- \
 | mock 启动成功但流量不经过 honk | 这是预期行为；改用含 `ebpf` feature 的构建，并以 root 启动。 |
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、队列 320 的占用者和残留的 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
 | 停止 OpenWrt 防火墙后流量不通 | 停止防火墙可能删掉 honk 的 `inet honk_nfqueue` table 和 `udp_decision` chain。重新启动防火墙，然后重启 honk 服务。honk 运行期间，防火墙管理器必须保留这两个对象。 |
+| NFQUEUE 启动警告为 `nfnetlink_queue is unavailable; the module may need loading` | 内核没能加载该模块。执行 `modprobe nfnetlink_queue nft_queue`，并把这两个模块写进 `/etc/modules-load.d/`；模块不存在时启用 `CONFIG_NETFILTER_NETLINK_QUEUE`。 |
 | LAN 流量未被代理 | `lan_interface` 为空或接口名错误；honk 不会自动改用 `lo`。接口名无误时看下一项。 |
 | `GET /runtime` 出现 `interface_binding` 降级 | 某个已配置的接口还没绑定，日志里有接口名。`pending`：接口不存在，或 `auto` 条目没有 IPv4 默认路由。`unsupported_type`：链路类型被拒绝，例如 `lo`、VRF 设备或 `dae0`，请改成受支持的接口或其成员。`attach_failed`：TCX link 无法创建、更新或校验，原因见日志中的 warning。接口状态字段见[原生 API 参考](./reference/api.md#原生-api)。 |
 | 旁路由的客户端绕过 honk，或转发的流量被丢弃 | 把 `all` 和 LAN 接口的 `send_redirects` 设为 `0`，并把 `net.ipv4.conf.all.rp_filter` 设为 `0`，见[旁路由](#旁路由)；直连流量仍不通时，见[直连流量不通](#直连流量不通)。 |

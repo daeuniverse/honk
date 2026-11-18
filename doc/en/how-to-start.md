@@ -58,6 +58,8 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
+honk relies on kernel module autoloading for `nfnetlink_queue` and `nft_queue`. On a system with autoloading disabled, load both with `modprobe` and list them in `/etc/modules-load.d/`.
+
 cgroup v2 with `CONFIG_CGROUP_BPF` is required. The real datapath attaches socket-identity hooks and the TCP `sock_ops` program `honk_tcp_passive` to the root cgroup. Startup fails if either is unavailable. A legacy program with flags=0 that occupies the root cgroup's `sock_ops` slot also prevents startup, even one attached with `bpftool cgroup attach`.
 
 `honk_tcp_passive` receives every host TCP `sock_ops` callback, several per connection. It returns immediately for sockets outside honk's namespace. TCP ownership proof needs no in-kernel BTF, ftrace, or built-in IPv6 support; an external raw BTF file is enough.
@@ -722,6 +724,7 @@ cargo run --release -p honk-core -- \
 | Mock mode starts but traffic bypasses honk | This is expected. Build with the `ebpf` feature and run as root. |
 | NFQUEUE is disabled or queue 320 is busy | Check nftables/NFQUEUE kernel support, the queue owner, and stale honk instances. Set `nfqueue_enable: false` only when staging is intentionally unnecessary. |
 | Traffic fails after stopping OpenWrt's firewall | Stopping the firewall can remove honk's `inet honk_nfqueue` table and `udp_decision` chain. Start the firewall again, then restart the honk service. The firewall manager must leave both objects intact while honk runs. |
+| The NFQUEUE startup warning says `nfnetlink_queue is unavailable; the module may need loading` | The kernel could not load the module. Run `modprobe nfnetlink_queue nft_queue` and list both in `/etc/modules-load.d/`; if the module is missing, enable `CONFIG_NETFILTER_NETLINK_QUEUE`. |
 | LAN traffic is not intercepted | `lan_interface` is empty or names the wrong interface. honk does not substitute `lo`. If the interface is named correctly, see the next row. |
 | `GET /runtime` shows an `interface_binding` degradation | A configured interface is not bound yet; the logs name it. `pending`: it does not exist or an `auto` entry has no IPv4 default route. `unsupported_type`: the link type is refused (for example `lo`, a VRF device or `dae0`); name a supported interface or a member. `attach_failed`: the TCX link could not be created, updated or verified; see the warning in the logs. See the [native API reference](./reference/api.md#native-api) for interface-state fields. |
 | On a single-arm gateway, clients bypass honk or forwarded traffic is dropped | Set `send_redirects` to `0` for `all` and the LAN interface, and `net.ipv4.conf.all.rp_filter` to `0`. See [Single-arm gateways](#single-arm-gateways); if direct traffic still fails, see [Direct traffic fails](#direct-traffic-fails). |
