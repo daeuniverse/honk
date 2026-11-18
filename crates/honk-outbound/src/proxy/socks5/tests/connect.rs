@@ -133,6 +133,43 @@ async fn handshake_flushes_a_carrier_that_buffers_writes() {
     assert_eq!(server.await.unwrap(), EXAMPLE_COM_80);
 }
 
+#[tokio::test(start_paused = true)]
+async fn handshake_flushes_credentials_over_a_buffering_carrier() {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut client = tokio::io::BufWriter::with_capacity(4096, client);
+        let target = "93.184.216.34:80".parse().unwrap();
+        let peer = async {
+            let mut greeting = [0; 4];
+            server.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [0x05, 0x02, 0x00, 0x02]);
+            server.write_all(&[0x05, 0x02]).await.unwrap();
+
+            let mut auth = [0; 11];
+            server.read_exact(&mut auth).await.unwrap();
+            assert_eq!(&auth, b"\x01\x04user\x04pass");
+            server.write_all(&[0x01, 0x00]).await.unwrap();
+
+            let mut request = [0; 10];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(
+                request,
+                [0x05, 0x01, 0x00, 0x01, 93, 184, 216, 34, 0x00, 0x50]
+            );
+            server
+                .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await
+                .unwrap();
+        };
+        let handshake =
+            Socks5Handler::handshake(&mut client, target, None, Some("user"), Some("pass"));
+        let (result, ()) = tokio::join!(handshake, peer);
+        result.unwrap();
+    })
+    .await
+    .expect("SOCKS5 credential handshake timed out");
+}
+
 #[tokio::test]
 async fn dial_over_relays_through_the_carrier() {
     let (client, mut server) = tokio::io::duplex(4096);
