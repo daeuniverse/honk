@@ -210,6 +210,11 @@ impl TlsConnector {
         Ok(cfg)
     }
 
+    /// Whether `connect` may query DNS for the server's ECHConfigList.
+    pub(crate) fn discovers_ech(&self) -> bool {
+        self.ech_discovery
+    }
+
     /// TLS client handshake over `stream`, verifying the peer against
     /// `domain` (unless the node skips verification).
     pub async fn connect<S>(&self, domain: &str, stream: S) -> anyhow::Result<TlsStream<S>>

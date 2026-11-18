@@ -289,10 +289,9 @@ fn tls_server_name(node: &Node) -> String {
 }
 
 /// Apply TLS or REALITY and `node.transport` over `carrier`, a stream already
-/// connected to this node's server through earlier hops. The carrier's
-/// physical connection owns admission and observation, so nothing here
-/// connects or retries: a REALITY mask certificate stays the returned error
-/// for the caller to redial with `reality_key_shares` disabled.
+/// connected to this node's server through earlier hops. Nothing here
+/// connects, resolves or retries: a REALITY mask certificate stays the
+/// returned error for the caller to redial with `reality_key_shares` disabled.
 pub(crate) async fn wrap_tunnel(
     node: &Node,
     carrier: Box<dyn AsyncReadWrite>,
@@ -323,6 +322,11 @@ pub(crate) async fn wrap_tunnel(
             Box::new(crate::tls::BatchRead::new(tls_stream))
         } else if tls.enabled {
             let connector = crate::tls::build_connector(node)?;
+            // Discovery would send this hop's server name to the local
+            // resolver, outside the tunnel.
+            if connector.discovers_ech() {
+                return Err(crate::proxy::TunnelUnsupported("tls ech discovery").into());
+            }
             let server_name = tls_server_name(node);
             let tls_stream = connector.connect(&server_name, carrier).await?;
             Box::new(crate::tls::BatchRead::new(tls_stream))
