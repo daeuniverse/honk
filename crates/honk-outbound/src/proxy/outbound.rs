@@ -21,6 +21,8 @@ pub enum WarmOutcome {
 /// Settings for a hop dialed over a stream tunneled through earlier hops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunnelDialOptions {
+    /// Base of the REALITY handshake budget (three times this value). Other
+    /// handshakes are bounded by the caller's deadline for the whole chain.
     pub connect_timeout: Duration,
     /// Offer hybrid post-quantum key shares in a REALITY ClientHello. A
     /// caller redials with `false` after a REALITY mask certificate.
