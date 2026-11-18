@@ -226,15 +226,11 @@ async fn websocket_request_event_waits_for_real_frame_flush() {
         )
         .await;
         let (client, server) = tokio::io::duplex(65536);
-        let progress = Arc::new(parking_lot::Mutex::new(WsWriteProgress::default()));
-        let bridge = tokio::spawn(ws_bridge_relay(
-            websocket,
-            server,
-            Some(Arc::clone(&progress)),
-        ));
+        let pipe = crate::runtime::flow_observation::RelayedPipe::new();
+        let bridge = tokio::spawn(ws_bridge_relay(websocket, server, pipe.clone()));
         let mut stream = ObservedWs {
             inner: client,
-            progress,
+            pipe,
         };
         let request = vec![0x5a; 4096];
         observer

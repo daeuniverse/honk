@@ -18,7 +18,8 @@ use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
 use super::{
-    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, TunnelDialOptions,
+    WarmRequirement, WarmableOutbound,
 };
 
 /// VMess protocol version byte.
@@ -185,6 +186,7 @@ struct VmessStream {
     inner: tokio::io::DuplexStream,
     relay: tokio::task::AbortHandle,
     failure: RelayFailure,
+    pipe: crate::runtime::flow_observation::RelayedPipe,
 }
 
 impl VmessStream {
@@ -203,8 +205,9 @@ async fn vmess_relay_recorded(
     header_wire: Vec<u8>,
     session: Session,
     failure: RelayFailure,
+    pipe: crate::runtime::flow_observation::RelayedPipe,
 ) {
-    if let Err(error) = vmess_relay(server, &mut client, header_wire, session).await {
+    if let Err(error) = vmess_relay(server, &mut client, header_wire, session, &pipe).await {
         let kind = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -244,12 +247,14 @@ impl AsyncRead for VmessStream {
 
 impl AsyncWrite for VmessStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match Pin::new(&mut self.inner).poll_write(cx, buf) {
-            Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        match this.pipe.poll_write(|| Pin::new(inner).poll_write(cx, buf)) {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(this.relay_error().unwrap_or(error))),
             other => other,
         }
     }
@@ -443,8 +448,15 @@ impl VmessHandler {
 
         let (client_half, server_half) = tokio::io::duplex(65536);
         let failure = RelayFailure::default();
-        let relay_future =
-            vmess_relay_recorded(stream, server_half, header_wire, session, failure.clone());
+        let pipe = crate::runtime::flow_observation::RelayedPipe::new();
+        let relay_future = vmess_relay_recorded(
+            stream,
+            server_half,
+            header_wire,
+            session,
+            failure.clone(),
+            pipe.clone(),
+        );
         let relay_future = crate::runtime::flow_observation::scope(
             crate::runtime::flow_observation::current(),
             relay_future,
@@ -457,6 +469,7 @@ impl VmessHandler {
                 inner: client_half,
                 relay,
                 failure,
+                pipe,
             }),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
@@ -508,6 +521,19 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(&runtime.node)?;
         let stream =
             super::transport::wrap_transport_runtime(&runtime, None, connect_timeout).await?;
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+    }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let uuid = uuid(&runtime.node)?;
+        let stream = super::transport::wrap_tunnel(&runtime.node, carrier, options).await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 }
@@ -636,6 +662,7 @@ async fn vmess_relay(
     client: &mut tokio::io::DuplexStream,
     header_wire: Vec<u8>,
     session: Session,
+    pipe: &crate::runtime::flow_observation::RelayedPipe,
 ) -> anyhow::Result<()> {
     let (mut server_read, mut server_write) = tokio::io::split(server);
     let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -645,6 +672,7 @@ async fn vmess_relay(
 
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
+        let mut relayed = 0u64;
         loop {
             let n = match client_read.read(&mut buf).now_or_never() {
                 Some(read) => read?,
@@ -656,8 +684,18 @@ async fn vmess_relay(
             if n == 0 {
                 break;
             }
+            relayed += n as u64;
             let chunk = body.seal_chunk(&buf[..n]);
-            server_write.write_all(&chunk).await?;
+            match pipe.take(relayed) {
+                Some(request) => {
+                    let write = async {
+                        server_write.write_all(&chunk).await?;
+                        server_write.flush().await
+                    };
+                    request.write(std::pin::pin!(write)).await?;
+                }
+                None => server_write.write_all(&chunk).await?,
+            }
         }
         let term = body.seal_chunk(&[]);
         server_write.write_all(&term).await?;

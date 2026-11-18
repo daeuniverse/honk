@@ -428,3 +428,139 @@ async fn vision_rejects_tls12_before_vless_header() {
         .expect_err("TLS 1.2 Vision must fail");
     assert!(!server.join().unwrap(), "VLESS header leaked over TLS 1.2");
 }
+
+const TUNNEL_UUID: &str = "b5bc10a6-5c72-4fd0-9f62-15c2b9f8a7d3";
+
+fn tunnel_runtime(
+    configure: impl FnOnce(&mut honk_config::node::VlessConfig),
+) -> Arc<crate::runtime::NodeRuntime> {
+    let mut node = Node {
+        name: "vless-tunnel".into(),
+        address: "198.51.100.1:443".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 443,
+        ..vless_node(TUNNEL_UUID)
+    };
+    configure(node.vless_mut().unwrap());
+    node.id = node.derive_id();
+    crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap()
+}
+
+#[tokio::test]
+async fn dial_over_sends_the_plain_request_through_the_carrier() {
+    assert_plain_tunnel_request(tunnel_runtime(|_| {})).await;
+}
+
+#[tokio::test]
+async fn dial_over_uses_plain_tcp_with_udp_only_xray_mux() {
+    let runtime = tunnel_runtime(|vless| {
+        vless.multiplex = honk_config::node::VlessMultiplex::Xray {
+            tcp: None,
+            udp: honk_config::node::VlessUdpMux::Separate(std::num::NonZeroU16::new(8).unwrap()),
+            udp443: honk_config::node::Udp443Policy::Reject,
+        };
+    });
+    assert_plain_tunnel_request(runtime).await;
+}
+
+async fn assert_plain_tunnel_request(runtime: Arc<crate::runtime::NodeRuntime>) {
+    let (client, mut server) = tokio::io::duplex(4096);
+    let server = tokio::spawn(async move {
+        let mut head = [0u8; 19 + 7];
+        server.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[0], VLESS_VERSION);
+        assert_eq!(
+            &head[1..17],
+            &VLessHandler::parse_uuid(TUNNEL_UUID).unwrap()
+        );
+        assert_eq!(head[17], 0x00);
+        assert_eq!(head[18], CMD_TCP);
+        assert_eq!(&head[19..], &[0x00, 0x50, ATYP_IPV4, 93, 184, 216, 34]);
+        let mut payload = [0u8; 4];
+        server.read_exact(&mut payload).await.unwrap();
+        assert_eq!(&payload, b"ping");
+        server.write_all(&[0x00, 0x00]).await.unwrap();
+        server.write_all(b"pong").await.unwrap();
+    });
+
+    let mut stream = VLessHandler::new()
+        .dial_over(
+            runtime,
+            Box::new(client),
+            "93.184.216.34:80".parse().unwrap(),
+            None,
+            TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+    stream.stream.write_all(b"ping").await.unwrap();
+    stream.stream.flush().await.unwrap();
+    let mut reply = [0u8; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.stream.read_exact(&mut reply),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&reply, b"pong");
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn dial_over_refuses_shapes_that_need_a_physical_dial() {
+    use crate::proxy::TunnelUnsupported;
+
+    type Configure = fn(&mut honk_config::node::VlessConfig);
+    let shapes: [(&str, Configure); 5] = [
+        ("vless vision", |vless| {
+            vless.flow = Some("xtls-rprx-vision".into());
+            vless.tls.enabled = true;
+            vless.tls.sni = Some("localhost".into());
+        }),
+        ("vless encryption", |vless| {
+            vless.encryption = Some(
+                "mlkem768x25519plus.native.1rtt.100-35-35.BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc"
+                    .into(),
+            );
+        }),
+        ("vless mux", |vless| {
+            vless.multiplex = honk_config::node::VlessMultiplex::H2 { padding: false };
+        }),
+        ("vless mux", |vless| {
+            vless.multiplex = honk_config::node::VlessMultiplex::Xray {
+                tcp: std::num::NonZeroU16::new(8),
+                udp: honk_config::node::VlessUdpMux::SharedTcp,
+                udp443: honk_config::node::Udp443Policy::Reject,
+            };
+        }),
+        ("xhttp", |vless| {
+            vless.transport.transport = "xhttp".into();
+            vless.transport.xhttp = Some(Default::default());
+            vless.tls.alpn = vec!["h2".into()];
+        }),
+    ];
+    let handler = VLessHandler::new();
+    for (shape, configure) in shapes {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let dial = handler.dial_over(
+            tunnel_runtime(configure),
+            Box::new(client),
+            "93.184.216.34:80".parse().unwrap(),
+            None,
+            TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        );
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), dial)
+            .await
+            .expect("a refused shape must not wait on the carrier")
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<TunnelUnsupported>(),
+            Some(&TunnelUnsupported(shape)),
+            "{error:#}"
+        );
+        let mut written = Vec::new();
+        server.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty(), "{shape} wrote to the carrier");
+    }
+}

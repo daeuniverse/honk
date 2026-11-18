@@ -1,11 +1,11 @@
-use honk_config::node::Node;
+use honk_config::node::{Node, VlessTcpPath};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 
 use super::stream::start;
 use super::{CMD_TCP, VLessHandler};
-use crate::proxy::{AsyncReadWrite, ProxyStream};
+use crate::proxy::{AsyncReadWrite, ProxyStream, TunnelDialOptions, TunnelUnsupported};
 
 impl VLessHandler {
     /// Build the connected stream for a dial. Encrypted Vision keeps the
@@ -86,6 +86,45 @@ impl VLessHandler {
             vless.wire_flow(),
         )?;
         let operation = self.dial_carrier(node, uuid, header, tcp, connect_timeout, None);
+        let stream =
+            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    /// Vision needs this hop's own TLS socket. Tunnels refuse VLESS Encryption and TCP mux
+    /// (H2 or Cool). UDP-only mux keeps the plain TCP request over `carrier`.
+    pub(super) async fn dial_tunneled(
+        &self,
+        node: &Node,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let vless = node.vless().unwrap();
+        if vless.is_vision() {
+            return Err(TunnelUnsupported("vless vision").into());
+        }
+        if vless.is_encrypted() {
+            return Err(TunnelUnsupported("vless encryption").into());
+        }
+        if vless.tcp_path() != VlessTcpPath::Direct {
+            return Err(TunnelUnsupported("vless mux").into());
+        }
+        let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
+        let header = Self::build_request_header(
+            &uuid,
+            CMD_TCP,
+            Some(target),
+            target_domain,
+            vless.wire_flow(),
+        )?;
+        let stream = crate::proxy::transport::wrap_tunnel(node, carrier, options).await?;
+        let operation = start(stream, &header, None);
         let stream =
             crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
         Ok(ProxyStream {

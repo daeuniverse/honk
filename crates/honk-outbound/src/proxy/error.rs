@@ -8,6 +8,12 @@ pub struct TargetFailure(#[source] pub anyhow::Error);
 #[error("{0}")]
 pub struct NodeFailure(#[source] pub anyhow::Error);
 
+/// A protocol or transport whose handshake cannot run over a stream tunneled
+/// through an earlier hop.
+#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[error("{0} cannot run over a tunneled stream")]
+pub struct TunnelUnsupported(pub &'static str);
+
 fn next_cause<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a (dyn std::error::Error + 'static)> {
@@ -66,6 +72,12 @@ pub fn node_failure(error: &anyhow::Error) -> bool {
 
 pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {
     find_cause::<NodeFailure>(error).is_some()
+}
+
+/// Whether any cause of `error`, including one inside an `io::Error`, is a
+/// [`TunnelUnsupported`] refusal.
+pub fn tunnel_unsupported(error: &anyhow::Error) -> bool {
+    find_cause::<TunnelUnsupported>(error.as_ref()).is_some()
 }
 
 // Only proxy-owned QUIC carriers may add node provenance. End-to-end QUIC

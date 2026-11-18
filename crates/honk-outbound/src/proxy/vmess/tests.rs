@@ -269,6 +269,7 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
             &mut relay_client,
             header.to_vec(),
             fixed_session(),
+            &crate::runtime::flow_observation::RelayedPipe::new(),
         )
         .await
     });
@@ -640,4 +641,116 @@ async fn deferred_request_observation_follows_relay_write_not_stream_constructio
     drop(stream);
     let mut remaining = Vec::new();
     peer.read_to_end(&mut remaining).await.unwrap();
+}
+
+/// A minimal AEAD server on the far end of a tunneled carrier: it opens the
+/// sealed request and one body chunk, then answers with a response header
+/// and one body chunk.
+#[tokio::test]
+async fn dial_over_relays_through_the_carrier() {
+    let (client, mut server) = tokio::io::duplex(64 * 1024);
+    let server = tokio::spawn(async move {
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+        let cmd_key = VmessHandler::derive_cmd_key(uuid.as_bytes());
+        let mut prefix = [0u8; 16 + 18 + 8];
+        server.read_exact(&mut prefix).await.unwrap();
+        let auth_id: [u8; 16] = prefix[..16].try_into().unwrap();
+        let conn_nonce: [u8; 8] = prefix[34..].try_into().unwrap();
+        let extra: [&[u8]; 2] = [&auth_id, &conn_nonce];
+        let len_plain = VmessHandler::open_aad(
+            &kdf16(&cmd_key, KDF_SALT_HEADER_LEN_KEY, &extra),
+            &kdf12(&cmd_key, KDF_SALT_HEADER_LEN_IV, &extra),
+            &prefix[16..34],
+            &auth_id,
+        )
+        .unwrap();
+        let header_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+        let mut sealed = vec![0u8; header_len + GCM_TAG_LEN];
+        server.read_exact(&mut sealed).await.unwrap();
+        let header = VmessHandler::open_aad(
+            &kdf16(&cmd_key, KDF_SALT_HEADER_KEY, &extra),
+            &kdf12(&cmd_key, KDF_SALT_HEADER_IV, &extra),
+            &sealed,
+            &auth_id,
+        )
+        .unwrap();
+        assert_eq!(
+            &header[37..45],
+            &[CMD_TCP, 0x00, 0x50, addr::ATYP_VMESS.ipv4, 93, 184, 216, 34]
+        );
+        let req_iv: [u8; 16] = header[1..17].try_into().unwrap();
+        let req_key: [u8; 16] = header[17..33].try_into().unwrap();
+        let resp_key: [u8; 16] = Sha256::digest(req_key)[..16].try_into().unwrap();
+        let resp_iv: [u8; 16] = Sha256::digest(req_iv)[..16].try_into().unwrap();
+
+        let mut upload = BodyChunks::new(&req_key, &req_iv).unwrap();
+        let mut len = [0u8; 2];
+        server.read_exact(&mut len).await.unwrap();
+        let mut chunk = vec![0u8; upload.decode_len(len) as usize];
+        server.read_exact(&mut chunk).await.unwrap();
+        let size = upload.open_chunk(&mut chunk).unwrap();
+        assert_eq!(&chunk[..size], b"ping");
+
+        let response = [header[33], 0, 0, 0];
+        let mut reply = VmessHandler::seal_aad(
+            &kdf16(&resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+            &kdf12(&resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+            &(response.len() as u16).to_be_bytes(),
+            &[],
+        );
+        reply.extend(VmessHandler::seal_aad(
+            &kdf16(&resp_key, KDF_SALT_RESP_KEY, &[]),
+            &kdf12(&resp_iv, KDF_SALT_RESP_IV, &[]),
+            &response,
+            &[],
+        ));
+        reply.extend(
+            BodyChunks::new(&resp_key, &resp_iv)
+                .unwrap()
+                .seal_chunk(b"pong"),
+        );
+        server.write_all(&reply).await.unwrap();
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.ok();
+    });
+
+    let mut node = Node {
+        name: "vmess-tunnel".into(),
+        address: "198.51.100.1:443".into(),
+        host: "must-not-resolve.invalid".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Vmess(honk_config::node::VmessConfig {
+            uuid: Some(UUID.into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+    let mut stream = VmessHandler::new()
+        .dial_over(
+            runtime,
+            Box::new(client),
+            "93.184.216.34:80".parse().unwrap(),
+            None,
+            TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+        )
+        .await
+        .unwrap();
+    stream.stream.write_all(b"ping").await.unwrap();
+    stream.stream.flush().await.unwrap();
+    let mut reply = [0u8; 4];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        stream.stream.read_exact(&mut reply),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(&reply, b"pong");
+    drop(stream);
+    tokio::time::timeout(std::time::Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
 }

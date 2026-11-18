@@ -27,16 +27,16 @@ mod registry;
 pub use direct::DirectMark;
 pub use error::{
     FrameInterrupted, NodeFailure, PacketErrorClass, PacketRejection, TargetFailure,
-    is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class, packet_rejection,
-    target_failure,
+    TunnelUnsupported, is_frame_interrupted, is_packet_rejection, node_failure, packet_error_class,
+    packet_rejection, target_failure, tunnel_unsupported,
 };
 pub(crate) use error::{
     io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
     quic_carrier_io_error, send_size_refusal,
 };
 pub use outbound::{
-    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, WarmOutcome,
-    WarmRequirement, WarmableOutbound,
+    PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
+    WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 use packet::prepare_detached_quic_transport;
 pub(crate) use packet::{FramePoison, MuxSession};
@@ -224,6 +224,8 @@ impl ProxyStream {
     }
 }
 
+#[cfg(all(test, feature = "flow-observation"))]
+mod request_observation_support;
 #[cfg(test)]
 mod tests;
 

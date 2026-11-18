@@ -183,8 +183,18 @@ fn acceptor(reply: Reply, auth_key: &[u8; 32], alpn: Option<&'static [u8]>) -> S
 }
 
 async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Captured {
-    let (mut tcp, peer) = listener.accept().await.unwrap();
-    let record = read_hello(&mut tcp).await;
+    let (tcp, peer) = listener.accept().await.unwrap();
+    let hello = serve_stream(tcp, reply, key).await;
+    Captured { peer, hello }
+}
+
+/// Answer one REALITY handshake on `stream` and return the captured ClientHello.
+async fn serve_stream(
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + std::fmt::Debug,
+    reply: Reply,
+    key: &PKey<Private>,
+) -> Vec<u8> {
+    let record = read_hello(&mut stream).await;
     let hello = record[5..].to_vec();
     let auth_key = if matches!(reply, Reply::Authenticated | Reply::InvalidHmac) {
         authenticate_hello(&hello, key)
@@ -192,11 +202,11 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
         [0; 32]
     };
     if matches!(reply, Reply::TlsAlert) {
-        tcp.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
+        stream.write_all(&[21, 3, 3, 0, 2, 2, 80]).await.unwrap();
         let mut received = Vec::new();
-        tcp.read_to_end(&mut received).await.ok();
+        stream.read_to_end(&mut received).await.ok();
     } else {
-        let (read, write) = tcp.into_split();
+        let (read, write) = tokio::io::split(stream);
         let replay = tokio::io::join(Cursor::new(record).chain(read), write);
         let mut tls = tokio_boring::accept(&acceptor(reply, &auth_key, None), replay)
             .await
@@ -215,7 +225,7 @@ async fn serve(listener: &TcpListener, reply: Reply, key: &PKey<Private>) -> Cap
             );
         }
     }
-    Captured { peer, hello }
+    hello
 }
 
 async fn exchange(node: &Node, tcp: Option<TcpStream>) -> anyhow::Result<Vec<u8>> {
@@ -589,4 +599,38 @@ fn repeated_client_hello_is_rejected_without_resealing() {
         0
     );
     assert_eq!(hello, sealed);
+}
+
+#[tokio::test]
+async fn tunneled_handshake_authenticates_and_follows_the_key_share_option() {
+    for (offer_hybrid, groups) in [(true, &[0x11ec, 29][..]), (false, &[29][..])] {
+        let key = PKey::generate(Id::X25519).unwrap();
+        let node = node(SocketAddr::from(([198, 51, 100, 1], 443)), &key, true);
+        let options = crate::proxy::TunnelDialOptions {
+            reality_key_shares: offer_hybrid,
+            ..crate::proxy::TunnelDialOptions::new(CONNECT_TIMEOUT)
+        };
+        let (carrier, server) = tokio::io::duplex(64 * 1024);
+        let client = async {
+            let mut stream =
+                crate::proxy::transport::wrap_tunnel(&node, Box::new(carrier), options).await?;
+            stream.write_all(CLIENT_DATA).await?;
+            let mut received = vec![0; SERVER_DATA.len()];
+            stream.read_exact(&mut received).await?;
+            anyhow::Ok(received)
+        };
+        let (result, hello) = timeout(Duration::from_secs(10), async {
+            tokio::join!(client, serve_stream(server, Reply::Authenticated, &key))
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap(), SERVER_DATA);
+        assert_eq!(
+            key_shares(&hello)
+                .iter()
+                .map(|(group, _)| *group)
+                .collect::<Vec<_>>(),
+            groups
+        );
+    }
 }
