@@ -216,7 +216,6 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
     let conf = CipherConf::for_method(method).unwrap();
     let master = ShadowsocksHandler::master_key(password, conf.key_len);
 
-    // Read the client salt + derive the c2s cipher.
     let mut c2s_salt = vec![0u8; conf.salt_len];
     server.read_exact(&mut c2s_salt).await.unwrap();
     let mut c2s_subkey = vec![0u8; conf.key_len];
@@ -224,7 +223,6 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
     let c2s_cipher = AeadCipher::new(method, &c2s_subkey).unwrap();
     let mut c2s_nonce = vec![0u8; conf.nonce_len];
 
-    // Send our salt back.
     let mut s2c_salt = vec![0u8; conf.salt_len];
     rand::rng().fill_bytes(&mut s2c_salt);
     server.write_all(&s2c_salt).await.unwrap();
@@ -233,7 +231,6 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
     let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
     let mut s2c_nonce = vec![0u8; conf.nonce_len];
 
-    // Echo loop: decrypt chunks, uppercase the payload, re-seal.
     let mut buf = vec![0u8; 262144];
     let mut carry = 0usize;
     let mut pending_len = None;
@@ -273,7 +270,6 @@ async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
-/// Writes ~1MB in 8 uneven writes and expects it back uppercased.
 async fn assert_legacy_bulk_echo<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(stream: &mut S) {
     let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
     let mut off = 0;
@@ -330,8 +326,6 @@ async fn test_dial_tcp_legacy_end_to_end() {
     assert_legacy_bulk_echo(&mut stream.stream).await;
 }
 
-/// The legacy dial over a non-TCP carrier: same wire codec, no physical
-/// socket underneath.
 #[tokio::test]
 async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     // Large enough to hold the whole echo while the client is still writing.
@@ -422,8 +416,7 @@ mod tunneled_request_observation {
             .unwrap()
     }
 
-    /// The request is sent only once the carrier has flushed it, so a
-    /// buffered carrier holds no part of the prologue when the event fires.
+    /// After `dial_over` returns, the request event is present and the peer can read the salt.
     #[tokio::test]
     async fn request_sent_follows_the_buffered_carrier_flush() {
         for (method, password) in METHODS {

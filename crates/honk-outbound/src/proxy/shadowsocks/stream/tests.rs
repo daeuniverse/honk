@@ -259,8 +259,6 @@ async fn truncated_tail_is_unexpected_eof() {
     assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
 }
 
-/// A TCP carrier keeps its pressure sampler: authenticated I/O samples the
-/// socket.
 #[tokio::test]
 async fn tcp_carrier_samples_transport_pressure() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

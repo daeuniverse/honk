@@ -483,9 +483,6 @@ fn test_udp_2022_failed_server_packet_does_not_mutate_replay_state() {
 const TCP_TARGET: &str = "93.184.216.34:443";
 const TCP_TARGET_HEADER: [u8; 7] = [1, 93, 184, 216, 34, 0x01, 0xbb];
 
-/// Mock Shadowsocks 2022 server: parses the request (including EIH),
-/// then echoes every received chunk payload back inside a proper
-/// response stream.
 async fn mock_2022_server(
     listener: tokio::net::TcpListener,
     password: &'static str,
@@ -496,6 +493,7 @@ async fn mock_2022_server(
     serve_mock_2022(stream, password, method_name, expected_target).await;
 }
 
+/// Validates the request headers and EIH before echoing payloads in SS2022 response frames.
 async fn serve_mock_2022<S: AsyncRead + AsyncWrite>(
     stream: S,
     password: &'static str,
@@ -664,8 +662,6 @@ async fn test_tcp_2022_chacha_roundtrip() {
     .await;
 }
 
-/// The 2022 dial over a non-TCP carrier: same wire codec, no physical
-/// socket underneath.
 #[tokio::test]
 async fn tcp_2022_roundtrip_over_a_non_tcp_stream() {
     let method_name = "2022-blake3-aes-128-gcm";
