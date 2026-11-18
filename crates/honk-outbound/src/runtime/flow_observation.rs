@@ -251,8 +251,17 @@ pub fn milestone(milestone: Milestone) {
 #[cfg(feature = "flow-observation")]
 #[derive(Clone, Debug)]
 pub(crate) struct RequestWrite {
-    observer: FlowObserver,
+    target: RequestTarget,
     state: Arc<parking_lot::Mutex<RequestWriteState>>,
+}
+
+/// Who learns that every byte of a request write has been delivered.
+#[cfg(feature = "flow-observation")]
+#[derive(Clone, Debug)]
+enum RequestTarget {
+    Flow(FlowObserver),
+    /// A relay task carrying an upper request's bytes up to this position.
+    Relay(Box<RequestWrite>, u64),
 }
 
 #[cfg(feature = "flow-observation")]
@@ -265,6 +274,13 @@ struct RequestWriteState {
 
 #[cfg(feature = "flow-observation")]
 impl RequestWrite {
+    fn new(target: RequestTarget) -> Self {
+        Self {
+            target,
+            state: Arc::default(),
+        }
+    }
+
     pub(crate) fn current() -> Option<Self> {
         if is_suppressed() {
             return None;
@@ -283,7 +299,7 @@ impl RequestWrite {
             state.finished && state.delivered >= state.required
         };
         if publish {
-            self.observer.milestone_once(Milestone::TargetRequestSent);
+            self.publish();
         }
     }
 
@@ -294,9 +310,28 @@ impl RequestWrite {
             state.delivered >= state.required
         };
         if publish {
-            self.observer.milestone_once(Milestone::TargetRequestSent);
+            self.publish();
         }
     }
+
+    fn publish(&self) {
+        match &self.target {
+            RequestTarget::Flow(observer) => observer.milestone_once(Milestone::TargetRequestSent),
+            RequestTarget::Relay(upper, position) => upper.delivered(*position),
+        }
+    }
+}
+
+#[cfg(feature = "flow-observation")]
+async fn scoped<T, E>(
+    request: RequestWrite,
+    write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
+) -> Result<T, E> {
+    let result = REQUEST_WRITE.scope(request.clone(), write).await;
+    if result.is_ok() {
+        request.finish();
+    }
+    result
 }
 
 #[cfg(feature = "flow-observation")]
@@ -307,16 +342,88 @@ pub(crate) async fn request_write<T, E>(
     let Some(observer) = current() else {
         return future.await;
     };
-    let request = RequestWrite {
-        observer,
-        state: Arc::new(parking_lot::Mutex::new(RequestWriteState::default())),
-    };
-    let result = REQUEST_WRITE.scope(request.clone(), future).await;
-    if result.is_ok() {
-        request.finish();
-    }
-    result
+    scoped(RequestWrite::new(RequestTarget::Flow(observer)), future).await
 }
+
+/// Request delivery across an in-memory pipe drained by a relay task. A write
+/// accepted by the pipe is delivered only once the relay has handed its bytes
+/// to the carrier below and that carrier has delivered them in turn.
+#[cfg(feature = "flow-observation")]
+#[derive(Clone, Debug)]
+pub(crate) struct RelayedPipe(Arc<RelayedPipeState>);
+
+#[cfg(feature = "flow-observation")]
+#[derive(Debug, Default)]
+struct RelayedPipeState {
+    accepted: std::sync::atomic::AtomicU64,
+    request: parking_lot::Mutex<Option<RelayedRequest>>,
+}
+
+#[cfg(feature = "flow-observation")]
+impl RelayedPipe {
+    pub(crate) fn new() -> Self {
+        Self(Arc::default())
+    }
+
+    /// Writer side: `write` puts bytes into the pipe.
+    pub(crate) fn poll_write(
+        &self,
+        write: impl FnOnce() -> std::task::Poll<std::io::Result<usize>>,
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(request) = RequestWrite::current() else {
+            let result = write();
+            if let std::task::Poll::Ready(Ok(size)) = result {
+                self.0.accepted.fetch_add(size as u64, Relaxed);
+            }
+            return result;
+        };
+        // Held across the write so the relay cannot drain these bytes before
+        // it can see the request they belong to.
+        let mut pending = self.0.request.lock();
+        let result = write();
+        if let std::task::Poll::Ready(Ok(size)) = result
+            && size != 0
+        {
+            let end = self.0.accepted.fetch_add(size as u64, Relaxed) + size as u64;
+            request.defer(end);
+            *pending = Some(RelayedRequest { request, end });
+        }
+        result
+    }
+
+    /// Relay side, after draining the pipe's bytes through `relayed`: the
+    /// request those bytes complete, if any.
+    pub(crate) fn take(&self, relayed: u64) -> Option<RelayedRequest> {
+        let mut pending = self.0.request.lock();
+        if pending.as_ref()?.end <= relayed {
+            return pending.take();
+        }
+        None
+    }
+}
+
+/// A request whose last bytes a relay task is handing to its carrier.
+#[cfg(feature = "flow-observation")]
+#[derive(Debug)]
+pub(crate) struct RelayedRequest {
+    request: RequestWrite,
+    end: u64,
+}
+
+#[cfg(feature = "flow-observation")]
+impl RelayedRequest {
+    /// `write` must leave those bytes with the carrier, flushed: a carrier
+    /// that defers their delivery defers the request.
+    pub(crate) async fn write<T, E>(
+        self,
+        write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
+    ) -> Result<T, E> {
+        let upper = RequestTarget::Relay(Box::new(self.request), self.end);
+        scoped(RequestWrite::new(upper), write).await
+    }
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "Synchronous callbacks avoid a separate allocation for every DNS event"
@@ -569,22 +676,33 @@ mod inert {
     pub fn milestone(_milestone: Milestone) {}
 
     #[derive(Clone, Debug)]
-    pub(crate) enum RequestWrite {}
+    pub(crate) struct RelayedPipe;
 
-    impl RequestWrite {
+    impl RelayedPipe {
         #[inline]
-        pub(crate) fn current() -> Option<Self> {
+        pub(crate) const fn new() -> Self {
+            Self
+        }
+
+        #[inline]
+        pub(crate) fn poll_write(
+            &self,
+            write: impl FnOnce() -> std::task::Poll<std::io::Result<usize>>,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            write()
+        }
+
+        #[inline]
+        pub(crate) fn take(&self, _relayed: u64) -> Option<RelayedRequest> {
             None
         }
+    }
 
-        #[inline]
-        pub(crate) fn defer(&self, _position: u64) {
-            match *self {}
-        }
+    pub(crate) enum RelayedRequest {}
 
-        #[inline]
-        pub(crate) fn delivered(&self, _position: u64) {
-            match *self {}
+    impl RelayedRequest {
+        pub(crate) async fn write<F: Future>(self, _write: Pin<&mut F>) -> F::Output {
+            match self {}
         }
     }
 
@@ -628,6 +746,7 @@ mod inert {
 
     const _: () = assert!(size_of::<Option<FlowObserver>>() == 0);
     const _: () = assert!(size_of::<Option<TransportAttempt>>() == 0);
+    const _: () = assert!(size_of::<RelayedPipe>() == 0);
 }
 
 #[cfg(all(not(feature = "flow-observation"), feature = "rprx"))]
@@ -638,7 +757,7 @@ pub use inert::{
     without,
 };
 #[cfg(not(feature = "flow-observation"))]
-pub(crate) use inert::{RequestWrite, is_suppressed, request_write};
+pub(crate) use inert::{RelayedPipe, is_suppressed, request_write};
 
 #[cfg(all(test, feature = "flow-observation"))]
 mod tests;

@@ -102,11 +102,12 @@ pub trait TcpOutbound: Send + Sync {
     /// to its server through earlier hops. The carrier's physical connection
     /// owns dial admission and transport observation (`TransportAttached`,
     /// `TransportReady`). This hop still emits its target milestones as a
-    /// direct dial does: `TargetRequestSent` through `request_write`, so a
-    /// carrier that defers delivery defers the event, and `TargetConfirmed`
-    /// directly once a protocol reply confirms the target. A caller chaining
-    /// several hops must suppress them on every hop but the last. Protocols that cannot run over a tunneled
-    /// stream keep the default, a [`TunnelUnsupported`] error.
+    /// direct dial does: `TargetRequestSent` once every carrier below,
+    /// including relay tasks of earlier hops, has delivered the request, and
+    /// `TargetConfirmed` once a protocol reply confirms the target. A caller
+    /// chaining several hops suppresses them on every hop but the last.
+    /// Protocols that cannot run over a tunneled stream keep the default, a
+    /// [`TunnelUnsupported`] error.
     async fn dial_over(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,

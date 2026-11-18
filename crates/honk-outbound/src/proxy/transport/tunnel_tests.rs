@@ -245,3 +245,101 @@ async fn default_dial_over_refuses_the_tunnel() {
         Some(&TunnelUnsupported("trojan"))
     );
 }
+
+#[cfg(all(feature = "rprx", feature = "flow-observation"))]
+mod relayed_request {
+    use futures_util::StreamExt;
+    use honk_config::node::VmessConfig;
+
+    use super::*;
+    use crate::proxy::request_observation_support::{milestones, observed};
+    use crate::proxy::transport::write_request;
+    use crate::proxy::vmess::VmessHandler;
+    use crate::runtime::flow_observation::Milestone;
+
+    fn vmess_over_websocket() -> Node {
+        let mut node = Node {
+            name: "vmess-ws".into(),
+            address: "198.51.100.1:443".into(),
+            host: "must-not-resolve.invalid".into(),
+            port: 443,
+            outbound: OutboundConfig::Vmess(VmessConfig {
+                uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_path = Some("/".into());
+        node.id = node.derive_id();
+        node
+    }
+
+    /// The last hop writes its request into a VMess hop whose relay task
+    /// feeds a WebSocket bridge task, which writes to a physical connection
+    /// the peer stops reading. The request counts as sent only once the
+    /// physical write completes, and never if it fails.
+    #[tokio::test]
+    async fn request_sent_waits_for_every_relay_below_it() {
+        for physical_write_completes in [true, false] {
+            // Room for the WebSocket upgrade, but not for the request below.
+            let (client, server) = tokio::io::duplex(4096);
+            let (open, opened) = tokio::sync::oneshot::channel::<bool>();
+            let peer = tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(server).await.unwrap();
+                if opened.await.unwrap() {
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+            });
+
+            let runtime =
+                crate::runtime::NodeRuntime::try_ephemeral(&vmess_over_websocket()).unwrap();
+            let handler = VmessHandler::new();
+            let hop = handler.dial_over(
+                runtime,
+                Box::new(client),
+                "192.0.2.1:443".parse().unwrap(),
+                None,
+                TunnelDialOptions::new(TIMEOUT),
+            );
+            let mut hop =
+                tokio::time::timeout(TIMEOUT, crate::runtime::flow_observation::without(hop))
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+            let (observer, events) = observed();
+            observer
+                .scope(write_request(&mut hop.stream, &[0x42; 16 * 1024]))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(events.lock().is_empty(), "sent before the physical write");
+
+            open.send(physical_write_completes).unwrap();
+            if physical_write_completes {
+                tokio::time::timeout(TIMEOUT, async {
+                    while events.lock().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let events = events.lock();
+                assert_eq!(events.len(), 1, "{events:?}");
+                assert_eq!(milestones(&events, Milestone::TargetRequestSent), 1);
+            } else {
+                // The failed physical write tears down both relays.
+                let _ = tokio::time::timeout(TIMEOUT, hop.stream.read(&mut [0; 1]))
+                    .await
+                    .unwrap();
+                assert!(
+                    events.lock().is_empty(),
+                    "sent after a failed physical write"
+                );
+            }
+            peer.abort();
+        }
+    }
+}

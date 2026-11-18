@@ -269,6 +269,7 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
             &mut relay_client,
             header.to_vec(),
             fixed_session(),
+            &crate::runtime::flow_observation::RelayedPipe::new(),
         )
         .await
     });

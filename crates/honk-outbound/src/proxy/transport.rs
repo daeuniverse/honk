@@ -403,31 +403,20 @@ async fn wrap_ws(
         .map_err(|e| anyhow::anyhow!("WebSocket upgrade failed: {}", e))?;
 
     let (client_half, server_half) = tokio::io::duplex(65536);
-    let progress = crate::runtime::flow_observation::current()
-        .map(|_| std::sync::Arc::new(parking_lot::Mutex::new(WsWriteProgress::default())));
-
-    let _ = crate::runtime::spawn_owned(ws_bridge_relay(ws_stream, server_half, progress.clone()));
-
-    if let Some(progress) = progress {
-        return Ok(Box::new(ObservedWs {
-            inner: client_half,
-            progress,
-        }));
-    }
-    Ok(Box::new(client_half))
-}
-
-#[derive(Debug, Default)]
-struct WsWriteProgress {
-    accepted: u64,
-    flushed: u64,
-    request: Option<(crate::runtime::flow_observation::RequestWrite, u64)>,
+    // Tracked even without an observer: a later hop may write its request
+    // over this stream inside an observed flow.
+    let pipe = crate::runtime::flow_observation::RelayedPipe::new();
+    let _ = crate::runtime::spawn_owned(ws_bridge_relay(ws_stream, server_half, pipe.clone()));
+    Ok(Box::new(ObservedWs {
+        inner: client_half,
+        pipe,
+    }))
 }
 
 #[derive(Debug)]
 struct ObservedWs {
     inner: tokio::io::DuplexStream,
-    progress: std::sync::Arc<parking_lot::Mutex<WsWriteProgress>>,
+    pipe: crate::runtime::flow_observation::RelayedPipe,
 }
 
 impl tokio::io::AsyncRead for ObservedWs {
@@ -447,18 +436,9 @@ impl tokio::io::AsyncWrite for ObservedWs {
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let mut progress = this.progress.lock();
-        let result = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(size)) = result {
-            progress.accepted += size as u64;
-            if size != 0
-                && let Some(request) = crate::runtime::flow_observation::RequestWrite::current()
-            {
-                request.defer(progress.accepted);
-                progress.request = Some((request, progress.accepted));
-            }
-        }
-        result
+        let inner = &mut this.inner;
+        this.pipe
+            .poll_write(|| std::pin::Pin::new(inner).poll_write(cx, buf))
     }
 
     fn poll_flush(
@@ -483,7 +463,7 @@ impl tokio::io::AsyncWrite for ObservedWs {
 async fn ws_bridge_relay(
     ws: tokio_tungstenite::WebSocketStream<Box<dyn AsyncReadWrite>>,
     server: tokio::io::DuplexStream,
-    progress: Option<std::sync::Arc<parking_lot::Mutex<WsWriteProgress>>>,
+    pipe: crate::runtime::flow_observation::RelayedPipe,
 ) {
     let (mut ws_sink, mut ws_stream) = ws.split();
     let (mut server_read, mut server_write) = tokio::io::split(server);
@@ -491,6 +471,7 @@ async fn ws_bridge_relay(
     // server → ws
     let s2w = async {
         let mut buf = vec![0u8; 65536];
+        let mut relayed = 0u64;
         loop {
             use tokio::io::AsyncReadExt;
             let n = server_read
@@ -500,26 +481,15 @@ async fn ws_bridge_relay(
             if n == 0 {
                 break;
             }
-            ws_sink
-                .send(tokio_tungstenite::tungstenite::Message::Binary(
-                    buf[..n].to_vec().into(),
-                ))
-                .await
-                .map_err(|e| anyhow::anyhow!("ws bridge send: {}", e))?;
-            if let Some(progress) = &progress {
-                let delivered = {
-                    let mut progress = progress.lock();
-                    progress.flushed += n as u64;
-                    progress
-                        .request
-                        .as_ref()
-                        .filter(|(_, end)| *end <= progress.flushed)
-                        .map(|(request, _)| (request.clone(), progress.flushed))
-                };
-                if let Some((request, position)) = delivered {
-                    request.delivered(position);
-                }
-            }
+            relayed += n as u64;
+            let mut send = ws_sink.send(tokio_tungstenite::tungstenite::Message::Binary(
+                buf[..n].to_vec().into(),
+            ));
+            let sent = match pipe.take(relayed) {
+                Some(request) => request.write(std::pin::Pin::new(&mut send)).await,
+                None => send.await,
+            };
+            sent.map_err(|e| anyhow::anyhow!("ws bridge send: {}", e))?;
         }
         let _ = ws_sink.close().await;
         Ok::<_, anyhow::Error>(())
