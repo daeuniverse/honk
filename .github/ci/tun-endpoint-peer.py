@@ -111,10 +111,15 @@ def line(process):
     return json.loads(text)
 
 
-def exact(sock, count):
+def exact(sock, count, field=None):
     result = bytearray()
     while len(result) < count:
-        data = sock.recv(count - len(result))
+        try:
+            data = sock.recv(count - len(result))
+        except TimeoutError as error:
+            if field is None:
+                raise
+            raise TimeoutError(f'{field}: received {len(result)}/{count} bytes') from error
         if not data:
             if not result:
                 raise EOFError()
@@ -152,7 +157,7 @@ def unpack_address(data, offset=0):
 def stream_address(sock, kind):
     size = {1: 4, 4: 16}.get(kind)
     assert size is not None, ('expected numeric SOCKS5 target', kind)
-    data = bytes([kind]) + exact(sock, size + 2)
+    data = bytes([kind]) + exact(sock, size + 2, 'SOCKS address and port')
     address, port, _ = unpack_address(data)
     return address, port
 
@@ -335,10 +340,10 @@ class Peer:
                     self.event('echo-closed', remote=endpoint(remote), target=endpoint(conn.getsockname()))
 
     def socks(self, conn):
-        version, count = exact(conn, 2)
-        assert version == 5 and 0 in exact(conn, count)
+        version, count = exact(conn, 2, 'SOCKS greeting header')
+        assert version == 5 and 0 in exact(conn, count, 'SOCKS greeting methods')
         conn.sendall(b'\x05\x00')
-        version, command, reserved, kind = exact(conn, 4)
+        version, command, reserved, kind = exact(conn, 4, 'SOCKS request header')
         assert version == 5 and reserved == 0
         address, port = stream_address(conn, kind)
         if command == 1:
@@ -1168,7 +1173,8 @@ experimental {{
 
     def peer_events(self):
         events = [json.loads(text) for text in (self.directory / 'peer-events.jsonl').read_text().split('\n')[:-1]]
-        assert not [event for event in events if event['kind'] == 'peer-error'], events[-5:]
+        errors = [event for event in events if event['kind'] == 'peer-error']
+        assert not errors, errors[:5]
         return events
 
     def probe(self, *args, origin='T', timeout=40):
