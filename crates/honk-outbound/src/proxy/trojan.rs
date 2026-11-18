@@ -12,8 +12,8 @@ use tokio::net::TcpStream;
 use super::addr;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
-    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, WarmRequirement,
-    WarmableOutbound,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
+    WarmRequirement, WarmableOutbound,
 };
 
 const CRLF: &[u8] = b"\r\n";
@@ -54,10 +54,21 @@ impl TrojanHandler {
     ) -> anyhow::Result<ProxyStream> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let header = Self::build_request_header(password, target, target_domain)?;
-        let (mut stream, preparation) =
+        let (stream, preparation) =
             Self::prepare_transport(node, runtime, tcp, connect_timeout).await?;
         preparation.commit()?;
-        super::transport::write_request(&mut stream, &header).await?;
+        Self::send_request(stream, &header, target, target_domain).await
+    }
+
+    /// Sends a request header built before the transport was opened, so an
+    /// unencodable target fails without dialing.
+    async fn send_request(
+        mut stream: Box<dyn AsyncReadWrite>,
+        header: &[u8],
+        target: SocketAddr,
+        target_domain: Option<&str>,
+    ) -> anyhow::Result<ProxyStream> {
+        super::transport::write_request(&mut stream, header).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -236,6 +247,21 @@ impl TcpOutbound for TrojanHandler {
             connect_timeout,
         )
         .await
+    }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let node = &runtime.node;
+        let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
+        let header = Self::build_request_header(password, target, target_domain)?;
+        let stream = super::transport::wrap_tunnel(node, carrier, options).await?;
+        Self::send_request(stream, &header, target, target_domain).await
     }
 }
 
@@ -480,6 +506,57 @@ mod tests {
             .dial_with_tcp(&node, target, None, tcp, std::time::Duration::from_secs(3))
             .await
             .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dial_over_sends_the_request_through_the_carrier() {
+        let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+        let password = "tunnel-secret";
+        let (client, mut server) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            // hex(sha224("tunnel-secret")) | CRLF | CONNECT | ATYP=domain |
+            // LEN | "example.com" | port 80 | CRLF, then the payload.
+            let mut expected = b"e18a99df762a533a40db57010c34dde76778a0ca43091577bf581b2b".to_vec();
+            expected.extend_from_slice(b"\r\n\x01\x03\x0bexample.com\x00\x50\r\nping");
+            let mut request = vec![0; expected.len()];
+            server.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, expected);
+            server.write_all(b"pong").await.unwrap();
+        });
+
+        let mut node = Node {
+            name: "trojan-tunnel".into(),
+            address: "198.51.100.1:443".into(),
+            host: "must-not-resolve.invalid".into(),
+            port: 443,
+            outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+                password: Some(password.into()),
+                tls: honk_config::node::TlsOptions {
+                    enabled: false,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
+        let mut stream = TrojanHandler::new()
+            .dial_over(
+                runtime,
+                Box::new(client),
+                target,
+                Some("example.com"),
+                TunnelDialOptions::new(std::time::Duration::from_secs(3)),
+            )
+            .await
+            .unwrap();
+        stream.stream.write_all(b"ping").await.unwrap();
+        stream.stream.flush().await.unwrap();
+        let mut reply = [0; 4];
+        stream.stream.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply, b"pong");
         server.await.unwrap();
     }
 }

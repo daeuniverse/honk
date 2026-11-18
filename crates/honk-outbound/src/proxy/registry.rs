@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::anytls::AnyTlsHandler;
 use super::block::BlockHandler;
+use super::chain::ChainHandler;
 use super::direct::DirectHandler;
 use super::hysteria2::Hysteria2Handler;
 use super::juicity::JuicityHandler;
@@ -101,12 +102,24 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    /// The chain handler, also registered for `NodeProtocol::Chain`, for
+    /// routes through group exits, which have no protocol entry of their own.
+    chain: Option<Arc<ChainHandler>>,
+}
+
+/// What a runtime-pinned dial goes through: a node of the generation, or a
+/// route over the generation's hop runtimes.
+#[derive(Clone, Copy, Debug)]
+pub enum DialRef<'a> {
+    Node(uuid::Uuid),
+    Route(&'a honk_config::route::Route),
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            chain: None,
         }
     }
 
@@ -194,6 +207,15 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
+        // A chain dials its hops through the handlers registered above.
+        let hop_handlers = registry
+            .entries
+            .iter()
+            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
+            .collect();
+        let chain = Arc::new(ChainHandler::new(hop_handlers));
+        registry.register(ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)));
+        registry.chain = Some(chain);
         for entry in &registry.entries {
             entry.validate_consistency();
         }
@@ -254,6 +276,62 @@ impl ProxyRegistry {
             })
         })
         .await
+    }
+
+    /// Dial a node or a route through the captured generation.
+    pub async fn dial_ref(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        dial: DialRef<'_>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        match dial {
+            DialRef::Node(node_id) => {
+                self.dial_runtime(generation, node_id, target, target_domain, connect_timeout)
+                    .await
+            }
+            DialRef::Route(route) => {
+                self.dial_route(generation, route, target, target_domain, connect_timeout)
+                    .await
+            }
+        }
+    }
+
+    /// Dial a route over the captured generation's hop runtimes. The dial's
+    /// tasks have no owner of their own; each hop scopes its own to its
+    /// runtime, as for a configured chain.
+    async fn dial_route(
+        &self,
+        generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+        route: &honk_config::route::Route,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        connect_timeout: Duration,
+    ) -> anyhow::Result<ProxyStream> {
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation is shut down");
+        }
+        let chain = self
+            .chain
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+        let runtime = generation
+            .route_runtime(route)
+            .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        let result = generation
+            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_tcp(
+                &runtime,
+                target,
+                target_domain,
+                connect_timeout,
+            )))
+            .await?;
+        if generation.is_shutdown() {
+            anyhow::bail!("outbound runtime generation shut down during dial");
+        }
+        Ok(result)
     }
 
     /// Dial a direct flow with a nonzero mark in the captured generation.

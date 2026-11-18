@@ -256,6 +256,11 @@ pub enum OutboundConfig {
     AnyTls(AnyTlsConfig),
     Direct,
     Block,
+    /// Hop node names from entry to exit, resolved against the assembled
+    /// node collection. A chain owns no endpoint of its own.
+    Chain {
+        hops: Vec<String>,
+    },
 }
 
 impl Default for OutboundConfig {
@@ -278,6 +283,7 @@ impl OutboundConfig {
             NodeProtocol::AnyTLS => Self::AnyTls(AnyTlsConfig::default()),
             NodeProtocol::Direct => Self::Direct,
             NodeProtocol::Block => Self::Block,
+            NodeProtocol::Chain => Self::Chain { hops: Vec::new() },
         }
     }
 
@@ -294,6 +300,7 @@ impl OutboundConfig {
             Self::AnyTls(_) => NodeProtocol::AnyTLS,
             Self::Direct => NodeProtocol::Direct,
             Self::Block => NodeProtocol::Block,
+            Self::Chain { .. } => NodeProtocol::Chain,
         }
     }
 
@@ -306,7 +313,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain { .. } => None,
         }
     }
 
@@ -319,7 +330,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain { .. } => None,
         }
     }
 
@@ -347,6 +362,14 @@ impl OutboundConfig {
             Self::Vmess(config) => config.network.as_deref(),
             Self::Vless(config) => config.network.as_deref(),
             Self::AnyTls(config) => config.network.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Hop names of a proxy chain, entry first.
+    pub fn chain_hops(&self) -> Option<&[String]> {
+        match self {
+            Self::Chain { hops } => Some(hops),
             _ => None,
         }
     }
@@ -393,6 +416,9 @@ impl OutboundConfig {
             ]),
             Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
             Self::Direct | Self::Block => String::new(),
+            Self::Chain { hops } => {
+                identity_join(&hops.iter().map(String::as_str).collect::<Vec<_>>())
+            }
         }
     }
 

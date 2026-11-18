@@ -188,6 +188,7 @@ impl GroupManager {
         let group = self
             .groups
             .get(group_name)
+            .map(|entry| &entry.group)
             .ok_or(SelectorError::GroupNotFound)?;
         if group.policy != GroupPolicy::Selector {
             return Err(SelectorError::NotSelector);
@@ -290,6 +291,7 @@ impl GroupManager {
         let group = self
             .groups
             .get(group_name)
+            .map(|entry| &entry.group)
             .ok_or(SelectorError::GroupNotFound)?;
         if group.policy == GroupPolicy::Selector {
             return Err(SelectorError::IsSelector);
@@ -370,7 +372,7 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<SelectorMember> {
-        self.selector_member(self.groups.get(group_name)?, network)
+        self.selector_member(&self.groups.get(group_name)?.group, network)
             .map(GroupMember::identity)
     }
 
@@ -381,7 +383,7 @@ impl GroupManager {
         group_name: &str,
         network: SelectionNetwork,
     ) -> Option<String> {
-        let group = self.groups.get(group_name)?;
+        let group = &self.groups.get(group_name)?.group;
         let state = self.selector_choice.read();
         let choices = if group.policy == GroupPolicy::Selector {
             &state.choices
@@ -413,7 +415,7 @@ impl GroupManager {
     pub fn has_interrupt_connections(&self) -> bool {
         self.groups
             .values()
-            .any(|group| group.interrupt_connections)
+            .any(|entry| entry.group.interrupt_connections)
     }
 
     /// Wake URLTest health checks when a group serves traffic.
@@ -429,7 +431,7 @@ impl GroupManager {
         let interrupt = self
             .groups
             .get(group_name)
-            .map(|g| g.interrupt_connections)
+            .map(|entry| entry.group.interrupt_connections)
             .unwrap_or(false);
         if !interrupt {
             return;

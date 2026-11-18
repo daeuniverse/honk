@@ -1,8 +1,27 @@
 use super::handoff::HandoffResult;
 use crate::control::*;
-pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &str) -> Vec<String> {
-    if selection_chain.last().map(String::as_str) != Some(node_name) {
-        selection_chain.push(node_name.to_owned());
+/// Clash-style `chains`, in reverse dial order. A proxy chain node's hops
+/// extend the selection chain, so after the reversal the exit leads, then come
+/// the node and its groups, and the whole path stays visible.
+/// A route through group exits lists the hop names captured with its
+/// selection; a leaf that is its own first hop appears once.
+pub(super) fn connection_chains(
+    mut selection_chain: Vec<String>,
+    node: &honk_config::node::Node,
+    route_hops: Option<&[String]>,
+) -> Vec<String> {
+    if selection_chain.last() != Some(&node.name) {
+        selection_chain.push(node.name.clone());
+    }
+    match route_hops {
+        Some(hops) => {
+            let hops = match hops.split_first() {
+                Some((first, rest)) if *first == node.name => rest,
+                _ => hops,
+            };
+            selection_chain.extend(hops.iter().cloned());
+        }
+        None => selection_chain.extend(node.chain_hops().into_iter().flatten().cloned()),
     }
     selection_chain.reverse();
     selection_chain
@@ -379,6 +398,45 @@ pub(in crate::control) fn domain_reality_outcome(
 #[cfg(test)]
 #[path = "sniffed_domain_routing_tests.rs"]
 mod sniffed_domain_routing_tests;
+
+#[cfg(test)]
+mod chains_tests {
+    use super::connection_chains;
+    use honk_config::node::{Node, OutboundConfig};
+
+    #[test]
+    fn chain_hops_follow_the_selected_node_with_the_exit_first() {
+        let node = Node {
+            name: "via".into(),
+            outbound: OutboundConfig::Chain {
+                hops: vec!["front".into(), "land".into()],
+            },
+            ..Node::default()
+        };
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "via".into()], &node, None),
+            ["land", "front", "via", "proxy"]
+        );
+        let leaf = Node {
+            name: "hk".into(),
+            ..Node::default()
+        };
+        assert_eq!(
+            connection_chains(vec!["proxy".into()], &leaf, None),
+            ["hk", "proxy"]
+        );
+        let route_hops = ["hk".to_owned(), "land".to_owned()];
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "hk".into()], &leaf, Some(&route_hops)),
+            ["land", "hk", "proxy"]
+        );
+        let chain_hops = ["front".to_owned(), "land".to_owned(), "exit".to_owned()];
+        assert_eq!(
+            connection_chains(vec!["proxy".into()], &node, Some(&chain_hops)),
+            ["exit", "land", "front", "via", "proxy"]
+        );
+    }
+}
 
 #[cfg(all(test, feature = "native-api"))]
 mod native_tests {

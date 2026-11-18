@@ -464,6 +464,39 @@ async fn management_rejects_duplicate_invalid_and_foreign_source_entries_without
 }
 
 #[tokio::test]
+async fn deleting_a_chain_from_the_main_source_is_refused_without_writing() {
+    let fixture = Fixture::new_custom(Access::Admin, false, |_, originals| {
+        originals.get_mut("main.dae").unwrap().push_str(
+            "node {\n front: 'socks5://127.0.0.1:11081'\n land: 'socks5://127.0.0.1:11082'\n via: front -> land\n}\n",
+        );
+    })
+    .await;
+    let original = disk(fixture.directory.path());
+    let rows = fixture.get(NODES).await;
+    let chain = rows["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "via")
+        .unwrap();
+    error(
+        fixture
+            .request(
+                Method::DELETE,
+                &format!("{NODES}/{}", chain["id"].as_str().unwrap()),
+            )
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "capability_not_supported",
+    )
+    .await;
+    assert_eq!(disk(fixture.directory.path()), original);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn delete_request_errors_and_source_drift_are_not_retryable() {
     let fixture = Fixture::new(Access::Admin, false).await;
     for path in [format!("{NODES}/unknown"), format!("{PROVIDERS}/unknown")] {

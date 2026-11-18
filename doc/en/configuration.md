@@ -245,7 +245,7 @@ See the [global reference](./reference/global.md).
 
 ## Declaring nodes
 
-Each `node` line is a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link. A bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. A malformed link is skipped with a diagnostic. An unknown or removed scheme, the removed VLESS `vless_mode` parameter, or a standalone `mux` line is a configuration error. Set `mux=` on each VLESS link instead.
+A `node` line is usually a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link. A bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. A malformed link is skipped with a diagnostic. An unknown or removed scheme, the removed VLESS `vless_mode` parameter, or a standalone `mux` line is a configuration error. Set `mux=` on each VLESS link instead. A tagged line of node names joined by unquoted `->`, such as `via: front -> land`, declares a [proxy chain](./reference/nodes.md#proxy-chains) instead; an invalid chain is a configuration error.
 
 `direct` and `block` are reserved for the built-in outbounds and cannot name a node. A group cannot share a name with a node.
 
@@ -277,7 +277,7 @@ routing {
 }
 ```
 
-Selector TCP and UDP follow the chosen member and never switch to a sibling because of health. The same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node.
+Selector TCP and UDP follow the chosen member and never switch to a sibling because of health. The same-leaf TCP last resort does not bypass nested Selector choices. Group dials always resolve to one leaf node. A group with [`exit`](./reference/groups.md#exit) sends TCP connections from that leaf on through the exit node.
 
 A configuration may define at most 250 top-level user groups; the routing ABI reserves higher ordinals.
 

@@ -522,6 +522,134 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
     udp_peer.await.unwrap();
 }
 
+/// A chain is probed through its hops' runtimes in this generation: the HTTP
+/// check and the TCP DNS check both cross the front hop to the land hop.
+#[tokio::test]
+async fn http_and_tcp_dns_probes_of_a_chain_cross_every_hop() {
+    use crate::test_support::{socks5_chain, socks5_relay};
+
+    let http = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http.local_addr().unwrap();
+    let http_peer = tokio::spawn(async move {
+        let (mut socket, _) = http.accept().await.unwrap();
+        receive_headers(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let dns = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns_addr = dns.local_addr().unwrap();
+    let dns_peer = tokio::spawn(async move {
+        let (mut socket, _) = dns.accept().await.unwrap();
+        let length = socket.read_u16().await.unwrap();
+        let mut query = vec![0; usize::from(length)];
+        socket.read_exact(&mut query).await.unwrap();
+        query[2] |= 0x80;
+        socket.write_u16(length).await.unwrap();
+        socket.write_all(&query).await.unwrap();
+    });
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let nodes = socks5_chain(&front, &land);
+    let via = nodes[0].id;
+    let mut config = Config::default();
+    config.nodes.extend(nodes);
+    config.global.tcp_check_url = vec![format!("http://{http_addr}/check")];
+    config.global.udp_check_dns = vec![dns_addr.to_string()];
+    let state = state(config).await;
+
+    for kind in ["http", "dns"] {
+        let input = request(
+            json!({"type":"node","node_id":via.to_string()}),
+            kind,
+            json!(["tcp"]),
+            "ipv4",
+        );
+        let plan = capture(&state, serde_json::from_value(input).unwrap())
+            .await
+            .unwrap();
+        let mut plan = prepare(plan).await.unwrap();
+        let (_stop, receiver) = watch::channel(false);
+        execute(
+            &state,
+            &mut plan,
+            Instant::now() + Duration::from_secs(2),
+            receiver,
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.result.results.len(), 1, "{kind}");
+        let row = &plan.result.results[0];
+        assert!(row.state == "healthy" && row.latency_ms.is_some(), "{kind}");
+    }
+    http_peer.await.unwrap();
+    dns_peer.await.unwrap();
+    let front = front.requests.lock().clone();
+    assert!(!front.is_empty() && front.iter().all(|target| *target == land.addr));
+    assert_eq!(*land.requests.lock(), [http_addr, dns_addr]);
+}
+
+#[tokio::test]
+async fn a_group_tcp_connect_probe_reports_its_chain_member_unavailable() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut front = node(listener.local_addr().unwrap());
+    front.name = "front".into();
+    let mut land = Node::from_share_link("socks5://127.0.0.1:1081").unwrap();
+    land.name = "land".into();
+    let mut via = Node {
+        name: "via".into(),
+        outbound: honk_config::node::OutboundConfig::Chain {
+            hops: vec!["front".into(), "land".into()],
+        },
+        ..Node::default()
+    };
+    via.id = via.derive_id();
+    let (front_id, via_id) = (front.id, via.id);
+    let mut config = Config::default();
+    config.nodes.extend([front, land, via]);
+    config
+        .groups
+        .push(serde_json::from_value(json!({"name":"pool","nodes":[front_id, via_id]})).unwrap());
+    let state = state(config).await;
+    let identity = state.observation.core.catalog.snapshot();
+    let input = request(
+        json!({"type":"group","group_id":identity.groups["pool"]}),
+        "tcp_connect",
+        json!(["tcp"]),
+        "ipv4",
+    );
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
+        .await
+        .unwrap();
+    let mut plan = prepare(plan).await.unwrap();
+    let (_stop, receiver) = watch::channel(false);
+    execute(
+        &state,
+        &mut plan,
+        Instant::now() + Duration::from_secs(2),
+        receiver,
+    )
+    .await
+    .unwrap();
+    let row = |id: Uuid| {
+        plan.result
+            .results
+            .iter()
+            .find(|row| row.resolved_leaf_node_id == Some(id.to_string()))
+            .unwrap()
+    };
+    assert_eq!(plan.result.results.len(), 2);
+    let measured = row(front_id);
+    assert!(measured.state == "healthy" && measured.latency_ms.is_some());
+    let chain = row(via_id);
+    assert_eq!(
+        (chain.state, chain.error, chain.latency_ms),
+        ("unavailable", Some("no_node_address"), None)
+    );
+    let _connection = listener.accept().await.unwrap();
+}
+
 #[tokio::test]
 async fn group_http_probe_measures_loopback_node_and_custom_check_port() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

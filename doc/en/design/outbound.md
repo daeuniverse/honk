@@ -120,6 +120,7 @@ the Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | AnyTLS | when `network` is absent or contains `udp` | no | no | `AnyTls` | `anytls` |
 | Direct | yes | no | no | `None` | none |
 | Block | no | no | yes | `None` | none |
+| Chain | no | no | no | `None` | none |
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP pooling
 stores only a connected proxy-server socket; `dial_with_tcp` then performs the
@@ -172,6 +173,7 @@ is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
+| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | No packet slot; TCP only |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server and
@@ -1246,6 +1248,76 @@ sends only enqueue, and `admitted` is set when the frame is queued to the
 session writer. The queue and credit limits are those of a single transport, so
 queue saturation or EOF retires every destination sharing the SID. Domain-target
 flows (`RewriteTo`) keep one scope per original destination.
+
+## Proxy chains
+
+A chain node (`OutboundConfig::Chain`) dials through other nodes of the same
+generation; the [node reference](../reference/nodes.md#proxy-chains) covers its
+syntax, validation and limits. `ProxyRegistry::default_resolver` registers
+`ChainHandler` (`src/proxy/chain.rs`) last, with the TCP handler of every
+protocol registered before it, so each hop runs on the handler instance the
+registry dispatches to.
+
+`build_reusing_with_admission` first builds or reuses every ordinary node, then
+builds each chain runtime from that pass's hop runtimes. Chain runtimes never
+enter the reuse set: a chain is rebuilt in every generation and never keeps a
+predecessor's hops alive. DNS runtime forks take the same path.
+`honk_config::node::resolve_chain_hops` resolves the hop names once and returns
+each chain's hop IDs, which the build looks up. `Config::validate_assembled`
+runs the same function, so an unresolved hop fails runtime admission. A plain `dial` without a generation runtime refuses a chain.
+
+`ChainHandler::dial_runtime` dials hop by hop:
+
+1. The entry dials the second hop's server with its ordinary `dial_runtime`.
+   An IP server is passed as the address. A domain goes in `target_domain`
+   with an unspecified address that carries only the port, so the entry's
+   server resolves it, as for any proxied target domain.
+2. Each later hop calls `dial_over` on the stream the hops before it opened.
+   Only the last hop targets the real destination.
+3. Each hop runs inside its own runtime's `scope_tasks` and transport-quality
+   scope, as a registry dial does. Later hops open no socket, and nested
+   dispatch keeps the dial scope it inherits, so the chain holds only the
+   entry's dial admission. Carrier pressure from chain traffic is therefore
+   recorded on the hops' runtimes: it can mark the entry node, and the chain
+   runtime's own `TransportQuality` stays empty, so a Score group holding the
+   chain never sees transport pressure for it.
+
+One deadline, `connect_timeout × 3`, covers the whole chain; it is the bound
+the caller already applies to one candidate. Each hop gets the smaller of the
+remaining time and `connect_timeout`. Expiry fails the dial with a timed-out
+I/O error.
+
+`dial_over` leaves milestone suppression to the caller that chains it: every
+hop reports its own target milestones. Hops before the last run under
+`without_target_milestones`, which drops `TargetRequestSent` and
+`TargetConfirmed` and forwards transport events and every other milestone,
+including `TransportReady`. `TransportAttached` therefore names the entry's
+physical connection, and `TargetRequestSent` marks the request for the real
+destination.
+
+A hop before the last targets the next hop's server, so a `TargetFailure` from
+it becomes a `NodeFailure` of the chain with the same message. The last hop's
+`TargetFailure` stays a target failure, and a packet policy rejection keeps
+its class wherever it occurs.
+
+When a tunneled hop fails with `RealityMaskCertificate`, the chain redials once
+from the entry with hybrid key shares disabled, as a direct REALITY dial
+retries once. The redial shares the original deadline. A REALITY entry retries
+inside its own `dial_runtime`.
+
+### Routes through group exits
+
+A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
+(`honk_config::route::Route`). `group_graph::compose` joins the leaf's own hops
+(the node itself, or a chain's hops) with the exits of the groups on its
+selection path, innermost first, and enters a repeated exit once. A route is a
+selection result, not a configured node, so it has no `NodeRuntime`.
+`ProxyRegistry::dial_ref` sends `DialRef::Route` to
+`ChainHandler::dial_route_tcp` over a `RouteRuntime` (`src/runtime/route.rs`),
+which borrows the hop runtimes of the generation that dials it. Each generation
+caches at most `MAX_ROUTE_RUNTIMES` (4096) of them and dials past that limit
+over an uncached one. The hop-by-hop rules above apply unchanged. Routes skip
+pool deposit and replenishment.
 
 ## Cold URLTest speculative preparation
 

@@ -18,7 +18,8 @@ use tokio::net::TcpStream;
 
 use super::addr::{self, SocksAddr};
 use super::{
-    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, WarmRequirement, WarmableOutbound,
+    AsyncReadWrite, ProbeableOutbound, ProxyStream, TcpOutbound, TunnelDialOptions,
+    WarmRequirement, WarmableOutbound,
 };
 
 /// VMess protocol version byte.
@@ -508,6 +509,19 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(&runtime.node)?;
         let stream =
             super::transport::wrap_transport_runtime(&runtime, None, connect_timeout).await?;
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+    }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let uuid = uuid(&runtime.node)?;
+        let stream = super::transport::wrap_tunnel(&runtime.node, carrier, options).await?;
         Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
     }
 }

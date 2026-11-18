@@ -66,7 +66,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
     for _ in 0..2 {
         let result = handle
             .race_candidates(
-                &[&blocked, &alternate],
+                &[
+                    &OwnedTarget::node(blocked.clone()),
+                    &OwnedTarget::node(alternate.clone()),
+                ],
                 "192.0.2.1:443".parse().unwrap(),
                 None,
                 "proxy",
@@ -148,7 +151,10 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
         .await;
     let result = handle
         .race_candidates(
-            &[&alternate, &blocked],
+            &[
+                &OwnedTarget::node(alternate.clone()),
+                &OwnedTarget::node(blocked.clone()),
+            ],
             target,
             None,
             "proxy",

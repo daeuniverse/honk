@@ -191,6 +191,7 @@ mod tests {
                 registry: Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
                 generation: Some(generation),
                 node,
+                route: None,
             }),
         };
         let pool = TcpPool::new(dial.clone());

@@ -23,7 +23,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use honk_config::Config;
-use honk_config::node::Node;
 use honk_outbound::group::{
     ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreReporter,
     SharedGroupManager,
@@ -377,7 +376,7 @@ enum ProxiedFetch {
 /// One proxied GET of `url` through `node`'s tunnel to `host:port`.
 async fn fetch_proxied(
     ctx: &UiDownloadContext,
-    node: &Node,
+    node: &honk_outbound::group::OwnedTarget,
     feedback: Option<ScoreAttempt>,
     (url, host, port): (&reqwest::Url, &str, u16),
     archive: &mut ArchiveFile,
@@ -693,6 +692,7 @@ fn remove_all_in_directory(directory: &Path) {
 mod tests {
     use super::*;
     use honk_config::group::{Group, GroupPolicy};
+    use honk_config::node::Node;
     use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
     use honk_config::types::NodeProtocol;
     use honk_outbound::alive::{IpVersion, ProbeDomain};
@@ -1365,7 +1365,7 @@ mod tests {
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[0].id);
+        assert_eq!(node.node.id, nodes[0].id);
         let feedback = feedback.expect("Score route must carry feedback");
         assert_eq!(
             feedback
@@ -1396,7 +1396,7 @@ mod tests {
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[1].id);
+        assert_eq!(node.node.id, nodes[1].id);
         let reporter = feedback.unwrap().begin().unwrap().start();
         reporter.setup_succeeded();
         reporter.finish(ScoreOutcome::Success);
@@ -1407,7 +1407,7 @@ mod tests {
         else {
             panic!("Score group must resolve to a proxy leaf");
         };
-        assert_eq!(node.id, nodes[0].id);
+        assert_eq!(node.node.id, nodes[0].id);
     }
 
     #[tokio::test]

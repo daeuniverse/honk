@@ -666,7 +666,8 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             &config,
         );
         let generation = fixture.handle.runtime_registry.read().clone();
-        let candidates = [node];
+        let candidate = honk_outbound::group::OwnedTarget::node(node.clone());
+        let candidates = [&candidate];
         let feedback = HashMap::new();
         let chains = HashMap::new();
         let race = fixture.handle.race_candidates(
@@ -715,6 +716,86 @@ async fn native_tcp_overall_deadline_retains_cancelled_started_attempt() -> anyh
             step["data"]["milestone"].as_str(),
             Some("target_confirmed" | "first_reply")
         )));
+        observation.finish(
+            crate::observe::vocab::ConnectionState::Failed,
+            "dial_failed",
+        );
+        fixture.finish_removals().await?;
+        fixture.server.shutdown().await;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await?
+}
+
+/// A routed attempt reports the leaf its selection captured, by its own
+/// node ID, and dials as a proxy whatever the leaf's protocol.
+#[tokio::test]
+async fn a_routed_flow_reports_the_captured_leaf() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut fixture = Fixture::new("block", "ip").await?;
+        (&mut fixture.task).await??;
+        let config = fixture.handle.config.read().await.clone();
+        let native = fixture.handle.native.as_ref().unwrap();
+        let peer = config
+            .nodes
+            .iter()
+            .find(|node| node.name == "peer")
+            .unwrap();
+        let direct = honk_config::Config::builtin_direct_node();
+        let absent = uuid::Uuid::from_u128(7);
+        let route = match honk_config::group_graph::compose(direct.id, &[], [peer.id, absent]) {
+            honk_config::group_graph::Composed::Routed(route) => route,
+            other => panic!("expected a route, got {other:?}"),
+        };
+        let candidate = honk_outbound::group::OwnedTarget {
+            node: direct.clone(),
+            route: Some(Box::new(honk_outbound::group::RoutedTarget {
+                route,
+                hop_names: ["peer".to_owned(), "absent".to_owned()].into(),
+            })),
+        };
+        let target = fixture.listener.local_addr()?;
+        let mut observation = ConnectionObservation::begin(
+            Some(native),
+            crate::observe::vocab::Network::Tcp,
+            fixture.client.local_addr()?,
+            target,
+        );
+        observation.pin_selection(
+            fixture.handle.diagnostics.read().generation,
+            &native.catalog.snapshot(),
+            &config,
+        );
+        let generation = fixture.handle.runtime_registry.read().clone();
+        let result = fixture
+            .handle
+            .race_candidates(
+                &[&candidate],
+                target,
+                Some("example.com".to_owned()),
+                "outer",
+                crate::stats::OutboundKind::Group,
+                None,
+                Duration::from_secs(5),
+                tokio::time::Instant::now() + Duration::from_secs(5),
+                generation,
+                IpVersion::V4,
+                &HashMap::new(),
+                false,
+                &HashMap::new(),
+                &observation,
+            )
+            .await;
+        assert!(result?.is_none(), "a route over an absent exit fails");
+        let flow = fixture.flow("observed").await?;
+        let attempts = leaf_attempts(&flow);
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1]["data"]["status"], "failed");
+        for attempt in &attempts {
+            assert_eq!(attempt["data"]["leaf_node_id"], direct.id.to_string());
+            assert_eq!(attempt["data"]["leaf_node_name"], "direct");
+            assert_eq!(attempt["data"]["target_kind"], "domain", "{attempt}");
+        }
         observation.finish(
             crate::observe::vocab::ConnectionState::Failed,
             "dial_failed",

@@ -874,3 +874,28 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     assert_udp_selection(&manager, "level-0", None);
     assert_udp_selection(&manager, "level-1", Some("direct"));
 }
+
+/// Proxy chains carry TCP only: UDP selection passes over them, TCP does not.
+#[test]
+fn udp_selection_skips_chain_nodes() {
+    let front = make_node(nid("front"), "front");
+    let mut chain = make_node(nid("via"), "via");
+    chain.outbound = honk_config::node::OutboundConfig::Chain {
+        hops: vec!["front".into(), "land".into()],
+    };
+    let nodes = vec![chain.clone(), front.clone()];
+    let m = GroupManager::with_alive_set(
+        &[make_group(
+            "relay",
+            GroupPolicy::Fallback,
+            vec![chain.id, front.id],
+        )],
+        &nodes,
+        None,
+    );
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(!m.is_node_selectable_for_domain(chain.id, domain, IpVersion::V4));
+        assert!(m.is_node_selectable_for_domain(front.id, domain, IpVersion::V4));
+    }
+    assert!(m.is_node_selectable_for_domain(chain.id, ProbeDomain::Tcp, IpVersion::V4));
+}

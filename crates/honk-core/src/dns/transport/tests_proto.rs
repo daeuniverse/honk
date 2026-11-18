@@ -309,6 +309,7 @@ fn proxied_quic_fixture_for_protocol(
                 registry: Arc::new(registry),
                 generation: Some(generation),
                 node,
+                route: None,
             }),
         },
         active,

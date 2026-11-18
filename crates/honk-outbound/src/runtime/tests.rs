@@ -1,6 +1,8 @@
 use super::*;
 use honk_config::types::NodeProtocol;
+mod chain_runtime;
 mod dial_admission;
+mod route_runtime;
 mod vless_runtime;
 mod xhttp_runtime;
 

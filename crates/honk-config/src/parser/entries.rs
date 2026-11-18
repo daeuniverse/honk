@@ -114,6 +114,16 @@ fn parse_node_entry(
         (None, value)
     };
 
+    if let Some(hops) = chain_hops(uri) {
+        let node = chain_node(tag.map(|tag| tag.raw()), hops);
+        diagnostics
+            .validate_entry_node(&node)
+            .map_err(super::ParseFailure::Detailed)?;
+        on_entry(&node, text.source.span(text.span.start, text.span.end));
+        nodes.push(node);
+        return Ok(());
+    }
+
     let Some((uri, end)) = complete_quoted_value(uri, diagnostics) else {
         return Ok(());
     };
@@ -148,6 +158,32 @@ fn parse_node_entry(
         }
     }
     Ok(())
+}
+
+/// Hop names of a proxy chain entry: `->` outside quotes, as in routing
+/// rules. Share links never reach here: a hop name with `://` must be quoted,
+/// so an unquoted `://` marks the value as a link whose text holds `->`.
+fn chain_hops(value: Text<'_, '_>) -> Option<Vec<String>> {
+    value.find("->")?;
+    if value.find("://").is_some() {
+        return None;
+    }
+    Some(
+        value
+            .split("->")
+            .map(|hop| hop.unquote().raw().to_owned())
+            .collect(),
+    )
+}
+
+fn chain_node(name: Option<&str>, hops: Vec<String>) -> Node {
+    let mut node = Node {
+        name: name.unwrap_or_default().to_owned(),
+        outbound: crate::node::OutboundConfig::Chain { hops },
+        ..Node::default()
+    };
+    node.id = node.derive_id();
+    node
 }
 
 fn complete_quoted_value<'d, 'a>(

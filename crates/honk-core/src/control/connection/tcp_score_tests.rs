@@ -369,7 +369,10 @@ fn unpack_tcp_score_plan_deduplicates_shared_leaf_metadata() {
     };
     let plan = crate::control::reload::ResolvedScorePlan {
         mode: SelectionPlanMode::ColdUrlTest,
-        nodes: vec![node.clone(), node],
+        targets: vec![
+            honk_outbound::group::OwnedTarget::node(node.clone()),
+            honk_outbound::group::OwnedTarget::node(node),
+        ],
         health_family: IpVersion::V4,
         feedback: vec![None, None],
         selection_chains: vec![
@@ -386,7 +389,7 @@ fn unpack_tcp_score_plan_deduplicates_shared_leaf_metadata() {
     assert_eq!(mode, SelectionPlanMode::ColdUrlTest);
     assert!(feedback.is_empty());
     assert_eq!(
-        selection_chains[&nodes[0].id],
+        selection_chains[&nodes[0].key()],
         ["outer".to_owned(), "shared".to_owned()]
     );
     assert_eq!(family, IpVersion::V4);

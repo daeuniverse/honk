@@ -1,51 +1,50 @@
+use std::collections::BTreeSet;
+use std::ops::ControlFlow;
+
+use honk_config::group_graph::{GroupGraph, Leaf, Limits, Step, Visitor};
+
 use super::*;
 
-/// Collect reachable leaf ids through membership and explicit final edges.
-/// Config retains cycles cut from GroupManager's copy, so both walks use
-/// a path guard and the shared group-depth cap.
-pub(in crate::control) fn collect_group_leaf_ids<'a>(
-    group: &'a Group,
-    config: &'a Config,
-    groups_by_name: &std::collections::HashMap<&'a str, &'a Group>,
-    depth: usize,
-    visited: &mut Vec<&'a str>,
-    out: &mut std::collections::BTreeSet<uuid::Uuid>,
-) {
-    if depth >= honk_outbound::group::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
-        return;
+/// Leaf ids `group` reaches through membership and explicit final edges.
+/// This walks the configuration's graph, whose cycles GroupManager's copy
+/// cuts, so the leaf sets (and the eBPF outbound ids built from them) do
+/// not depend on which back edge that cut removed. Exits are not followed:
+/// health is registered on leaves only.
+fn group_leaf_ids(graph: &GroupGraph<'_>, group: usize) -> BTreeSet<uuid::Uuid> {
+    struct Leaves<'g, 'a> {
+        graph: &'g GroupGraph<'a>,
+        path: Vec<&'a str>,
+        ids: BTreeSet<uuid::Uuid>,
     }
-    visited.push(group.name.as_str());
-    out.extend(group.nodes.iter().copied());
-    for tag in &group.groups {
-        if let Some(sub) = groups_by_name.get(tag.as_str()) {
-            collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
+    impl Visitor for Leaves<'_, '_> {
+        // Groups of one name share a path entry, as when groups were
+        // looked up by name.
+        fn enter(&mut self, group: usize, depth: usize, _: &[uuid::Uuid]) -> ControlFlow<(), Step> {
+            let name = self.graph.name(group);
+            self.path.truncate(depth);
+            if self.path.contains(&name) {
+                return ControlFlow::Continue(Step::Skip);
+            }
+            self.path.push(name);
+            ControlFlow::Continue(Step::Descend)
         }
-    }
-    if let Some(final_name) = group.final_outbound.as_deref() {
-        match final_name {
-            Config::BUILTIN_DIRECT_NODE => {
-                out.insert(honk_config::config::DIRECT_NODE_ID);
-            }
-            Config::BUILTIN_BLOCK_NODE => {
-                out.insert(honk_config::config::BLOCK_NODE_ID);
-            }
-            name => {
-                if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
-                    out.insert(node.id);
-                } else if let Some(sub) = groups_by_name.get(name) {
-                    collect_group_leaf_ids(sub, config, groups_by_name, depth + 1, visited, out);
-                }
-            }
-        }
-    }
-    visited.pop();
-}
 
-/// Group lookup by name for [`collect_group_leaf_ids`].
-pub(in crate::control) fn groups_by_name(
-    config: &Config,
-) -> std::collections::HashMap<&str, &Group> {
-    config.groups.iter().map(|g| (g.name.as_str(), g)).collect()
+        fn leaf(&mut self, leaf: Leaf, _: &[uuid::Uuid]) -> ControlFlow<()> {
+            self.ids.insert(match leaf {
+                Leaf::Node(id) => id,
+                Leaf::Direct => honk_config::config::DIRECT_NODE_ID,
+                Leaf::Block => honk_config::config::BLOCK_NODE_ID,
+            });
+            ControlFlow::Continue(())
+        }
+    }
+    let mut leaves = Leaves {
+        graph,
+        path: Vec::with_capacity(honk_outbound::group::MAX_GROUP_DEPTH),
+        ids: BTreeSet::new(),
+    };
+    let _ = graph.visit(group, Limits::SELECTION, &mut leaves);
+    leaves.ids
 }
 
 /// Nodes reachable through group membership or explicit finals are probed
@@ -55,15 +54,9 @@ pub(in crate::control) fn groups_by_name(
 pub(in crate::control) fn health_check_targets(
     config: &Config,
 ) -> Vec<(uuid::Uuid, String, String)> {
-    let by_name = groups_by_name(config);
-    let group_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
-        .groups
-        .iter()
-        .flat_map(|g| {
-            let mut ids = std::collections::BTreeSet::new();
-            collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
-            ids
-        })
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
+    let group_node_ids: BTreeSet<uuid::Uuid> = (0..graph.len())
+        .flat_map(|group| group_leaf_ids(&graph, group))
         .collect();
     config
         .nodes
@@ -116,24 +109,21 @@ pub(in crate::control) fn sync_health_check_nodes(
 pub(in crate::control) fn urltest_group_registrations(
     config: &Config,
 ) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
-    let by_name = groups_by_name(config);
-    let leaf_ids = |g: &Group| {
-        let mut ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
-        ids
-    };
-    let always_probed_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
+    let always_probed_node_ids: BTreeSet<uuid::Uuid> = config
         .groups
         .iter()
-        .filter(|g| g.policy != GroupPolicy::URLTest)
-        .flat_map(&leaf_ids)
+        .enumerate()
+        .filter(|(_, g)| g.policy != GroupPolicy::URLTest)
+        .flat_map(|(index, _)| group_leaf_ids(&graph, index))
         .collect();
     config
         .groups
         .iter()
-        .filter(|g| g.policy == GroupPolicy::URLTest)
-        .map(|group| {
-            let members: Vec<uuid::Uuid> = leaf_ids(group)
+        .enumerate()
+        .filter(|(_, g)| g.policy == GroupPolicy::URLTest)
+        .map(|(index, group)| {
+            let members: Vec<uuid::Uuid> = group_leaf_ids(&graph, index)
                 .into_iter()
                 .filter(|id| !always_probed_node_ids.contains(id))
                 .collect();
@@ -234,13 +224,11 @@ pub(in crate::control) fn install_selector_warm_callback(
 pub(in crate::control) fn build_outbound_id_map(
     config: &Config,
 ) -> std::collections::HashMap<uuid::Uuid, u8> {
-    let by_name = groups_by_name(config);
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
     let mut map = std::collections::HashMap::new();
-    for (i, group) in config.groups.iter().enumerate() {
+    for i in 0..config.groups.len() {
         let id = OutboundIndex::UserBase as u8 + i as u8;
-        let mut leaf_ids = std::collections::BTreeSet::new();
-        collect_group_leaf_ids(group, config, &by_name, 0, &mut Vec::new(), &mut leaf_ids);
-        for node_id in leaf_ids {
+        for node_id in group_leaf_ids(&graph, i) {
             map.entry(node_id).or_insert(id);
         }
     }
@@ -258,18 +246,19 @@ pub(in crate::control) fn group_datapath_alive(
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> bool {
-    (domain == ProbeDomain::Tcp
-        && group.final_outbound.is_none()
-        && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
-        || group_manager
-            .reachable_leaf_nodes_in_group(&group.name)
-            .iter()
-            .any(|node| {
-                (domain == ProbeDomain::Tcp
-                    || node.protocol() == NodeProtocol::Block
-                    || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
-                    && alive_set.is_alive_for(node.id, domain, ipver)
-            })
+    if domain == ProbeDomain::Tcp {
+        return (group.final_outbound.is_none()
+            && group_manager.leaf_nodes_in_group(&group.name).len() == 1)
+            || group_manager
+                .reachable_leaf_nodes_in_group(&group.name)
+                .iter()
+                .any(|node| alive_set.is_alive_for(node.id, domain, ipver));
+    }
+    group_manager.any_udp_leaf_in_group(&group.name, |node| {
+        (node.protocol() == NodeProtocol::Block
+            || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+            && alive_set.is_alive_for(node.id, domain, ipver)
+    })
 }
 
 pub(crate) fn group_connectivity_snapshot(

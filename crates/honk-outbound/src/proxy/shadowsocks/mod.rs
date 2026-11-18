@@ -43,8 +43,8 @@ use tracing::debug;
 
 use super::addr;
 use super::{
-    MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport, ProbeableOutbound,
-    ProxyStream, SharedSourceOutbound, TcpOutbound,
+    AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
+    ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
 };
 use aead2022::{Ss2022Method, Ss2022UdpSession};
 
@@ -335,56 +335,57 @@ impl ShadowsocksHandler {
     }
 
     /// Shared dial tail: run the cipher-family prologue on the connected
-    /// socket and return the inline codec stream (no relay task).
-    async fn start_relay(
+    /// server stream and return the inline codec stream (no relay task).
+    async fn start_relay<T: stream::SsTransport>(
         &self,
         method: &str,
         password: &str,
-        server: TcpStream,
+        server: T,
         header: Vec<u8>,
         target: SocketAddr,
         target_domain: Option<&str>,
     ) -> anyhow::Result<ProxyStream> {
-        crate::runtime::flow_observation::milestone(
-            crate::runtime::flow_observation::Milestone::TransportReady,
-        );
-        let stream: Box<dyn super::AsyncReadWrite> = if is_2022_method(method) {
-            let method_2022 = Ss2022Method::new(method, password)?;
-            Box::new(aead2022::dial_stream(server, method_2022, header).await?)
-        } else {
-            let conf = CipherConf::for_method(method)?;
-            let master_key = Self::master_key(password, conf.key_len);
-            let mut server = server;
+        let prologue = async {
+            let stream: Box<dyn AsyncReadWrite> = if is_2022_method(method) {
+                let method_2022 = Ss2022Method::new(method, password)?;
+                Box::new(aead2022::dial_stream(server, method_2022, header).await?)
+            } else {
+                let conf = CipherConf::for_method(method)?;
+                let master_key = Self::master_key(password, conf.key_len);
+                let mut server = server;
 
-            // Legacy prologue: send salt and the header chunk, then return.
-            // The response salt is read from the read path (2022 parity) —
-            // servers may delay it until the first target payload, so
-            // reading it here would deadlock dial().
-            let mut send_salt = vec![0u8; conf.salt_len];
-            rand::rng().fill_bytes(&mut send_salt);
-            let mut send_subkey = vec![0u8; conf.key_len];
-            hkdf_sha1_derive(&master_key, &send_salt, &mut send_subkey);
-            let send_cipher = AeadCipher::new(method, &send_subkey)?;
-            server.write_all(&send_salt).await?;
+                // Legacy prologue: send salt and the header chunk, then return.
+                // The response salt is read from the read path (2022 parity) —
+                // servers may delay it until the first target payload, so
+                // reading it here would deadlock dial().
+                let mut send_salt = vec![0u8; conf.salt_len];
+                rand::rng().fill_bytes(&mut send_salt);
+                let mut send_subkey = vec![0u8; conf.key_len];
+                hkdf_sha1_derive(&master_key, &send_salt, &mut send_subkey);
+                let send_cipher = AeadCipher::new(method, &send_subkey)?;
+                server.write_all(&send_salt).await?;
 
-            let mut send_nonce = vec![0u8; conf.nonce_len];
-            stream::write_all_sealed(&mut server, &send_cipher, &mut send_nonce, &header).await?;
+                let mut send_nonce = vec![0u8; conf.nonce_len];
+                stream::write_all_sealed(&mut server, &send_cipher, &mut send_nonce, &header)
+                    .await?;
+                server.flush().await?;
 
-            let prologue = stream::LegacyPrologue {
-                conf,
-                master_key,
-                method: method.to_string(),
+                let prologue = stream::LegacyPrologue {
+                    conf,
+                    master_key,
+                    method: method.to_string(),
+                };
+                Box::new(stream::SsStream::new_legacy(
+                    server,
+                    send_cipher,
+                    send_nonce,
+                    prologue,
+                ))
             };
-            Box::new(stream::SsStream::new_legacy(
-                server,
-                send_cipher,
-                send_nonce,
-                prologue,
-            ))
+            anyhow::Ok(stream)
         };
-        crate::runtime::flow_observation::milestone(
-            crate::runtime::flow_observation::Milestone::TargetRequestSent,
-        );
+        let stream =
+            crate::runtime::flow_observation::request_write(std::pin::pin!(prologue)).await?;
         Ok(ProxyStream {
             stream,
             target_addr: target,
@@ -417,6 +418,9 @@ impl TcpOutbound for ShadowsocksHandler {
         let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
 
         let header = addr::encode_address(target, target_domain)?;
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         self.start_relay(method, password, server, header, target, target_domain)
             .await
     }
@@ -433,7 +437,26 @@ impl TcpOutbound for ShadowsocksHandler {
         let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
         let password = config.password.as_deref().unwrap_or("");
         let header = addr::encode_address(target, target_domain)?;
+        crate::runtime::flow_observation::milestone(
+            crate::runtime::flow_observation::Milestone::TransportReady,
+        );
         self.start_relay(method, password, server, header, target, target_domain)
+            .await
+    }
+
+    async fn dial_over(
+        &self,
+        runtime: Arc<crate::runtime::NodeRuntime>,
+        carrier: Box<dyn AsyncReadWrite>,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        _options: TunnelDialOptions,
+    ) -> anyhow::Result<ProxyStream> {
+        let config = runtime.node.shadowsocks().unwrap();
+        let method = config.encryption.as_deref().unwrap_or("aes-128-gcm");
+        let password = config.password.as_deref().unwrap_or("");
+        let header = addr::encode_address(target, target_domain)?;
+        self.start_relay(method, password, carrier, header, target, target_domain)
             .await
     }
 }

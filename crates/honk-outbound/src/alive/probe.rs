@@ -438,6 +438,14 @@ impl AliveDialerSet {
         registration: Option<&Arc<RegisteredNode>>,
         cancel: &ProbeCancellation,
     ) -> bool {
+        // A proxy chain, or a flat node given only `host` and `port`, registers
+        // an empty address. This probe records nothing for it, so only traffic
+        // or a Clash delay test changes its state.
+        if node_addr.is_empty() {
+            return [IpVersion::V4, IpVersion::V6]
+                .into_iter()
+                .any(|ipver| self.is_alive_for(node_id, ProbeDomain::Tcp, ipver));
+        }
         let addr = node_addr.to_string();
         let (host, port) = match addr.rsplit_once(':') {
             Some((h, p)) => match p.parse::<u16>() {

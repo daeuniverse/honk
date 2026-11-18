@@ -11,12 +11,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use honk_config::Config;
-use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
 use honk_outbound::alive::{IpVersion, ProbeDomain};
 use honk_outbound::group::{
-    ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome, ScoreSelectionContext,
-    ScoreTarget, SelectionNetwork, SharedGroupManager,
+    OwnedTarget, ScoreAttempt, ScoreBusinessGuard, ScoreContinuation, ScoreOutcome,
+    ScoreSelectionContext, ScoreTarget, SelectionNetwork, SharedGroupManager, Target,
 };
 use honk_outbound::proxy::{AsyncReadWrite, ProxyRegistry, TcpOutbound};
 use honk_outbound::runtime::{
@@ -76,7 +75,7 @@ pub(crate) enum Route {
     },
     Block,
     Proxy {
-        node: Box<Node>,
+        node: Box<OwnedTarget>,
         feedback: Option<ScoreAttempt>,
     },
 }
@@ -114,7 +113,7 @@ fn parse_host_ip(host: &str) -> Option<IpAddr> {
         .or_else(|| host.strip_prefix('[')?.strip_suffix(']')?.parse().ok())
 }
 
-impl Outbounds<'_> {
+impl<'a> Outbounds<'a> {
     /// Runs `host:port` through `detour`, or through the routing rules when it
     /// is `None`: `Router::route_action` for the outbound name, then the
     /// authoritative group/leaf resolution for the node to dial. `setting`
@@ -210,7 +209,14 @@ impl Outbounds<'_> {
                 let plan = group_manager
                     .selection_plan_for_target_with_health_fallback(&outbound, &context, original);
                 match plan.entries.into_iter().next() {
-                    Some(entry) => (Some(entry.node.clone()), entry.feedback, group),
+                    Some(entry) => (
+                        Some(group_manager.own_target(Target {
+                            node: entry.node,
+                            route: entry.route,
+                        })),
+                        entry.feedback,
+                        group,
+                    ),
                     None => (None, None, group),
                 }
             } else {
@@ -227,8 +233,8 @@ impl Outbounds<'_> {
         let Some(node) = node else {
             return Err(anyhow::Error::new(NoUsableNode { outbound }).context(purpose.to_owned()));
         };
-        let route = match node.protocol() {
-            NodeProtocol::Direct => Route::Direct { feedback },
+        let route = match node.node.protocol() {
+            NodeProtocol::Direct if node.route.is_none() => Route::Direct { feedback },
             NodeProtocol::Block => Route::Block,
             _ => Route::Proxy {
                 node: Box::new(node),
@@ -241,21 +247,22 @@ impl Outbounds<'_> {
             via = match &route {
                 Route::Direct { .. } => "direct",
                 Route::Block => "block",
-                Route::Proxy { node, .. } => node.name.as_str(),
+                Route::Proxy { node, .. } => node.node.name.as_str(),
             },
             "{purpose} routed"
         );
         Ok(Decision { route, group })
     }
 
-    /// Prepares a tunnel through `node` to `host:port`. Tunnel handlers dial
+    /// Prepares a tunnel through `target` to `host:port`. Tunnel handlers dial
     /// by domain, so the node's egress resolves it and local DNS poisoning
     /// does not matter; the address is only a fallback for handlers that need one.
     pub(crate) async fn tunnel(
         &self,
-        node: &Node,
+        target: &OwnedTarget,
         (host, port): (&str, u16),
-    ) -> anyhow::Result<Tunnel> {
+    ) -> anyhow::Result<Tunnel<'a>> {
+        let node = &target.node;
         let protocol = node.protocol();
         let entry = self
             .proxy_registry
@@ -271,16 +278,28 @@ impl Outbounds<'_> {
             ),
         };
         let generation = self.runtime_registry.read().clone();
-        let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
-            &generation,
-            node,
-            honk_outbound::proxy::WarmRequirement::Session,
-        )?;
+        // A route runs only on its generation's hop runtimes.
+        let via = match target.route() {
+            Some(route) => TunnelVia::Route {
+                registry: self.proxy_registry,
+                route: *route,
+            },
+            None => {
+                let (runtime, guard) = honk_outbound::urltest::try_probe_runtime(
+                    &generation,
+                    node,
+                    honk_outbound::proxy::WarmRequirement::Session,
+                )?;
+                TunnelVia::Node {
+                    runtime,
+                    guard,
+                    tcp: std::sync::Arc::clone(&entry.tcp),
+                }
+            }
+        };
         Ok(Tunnel {
             generation,
-            runtime,
-            guard,
-            tcp: std::sync::Arc::clone(&entry.tcp),
+            via,
             connect_timeout,
             addr,
             domain,
@@ -288,34 +307,62 @@ impl Outbounds<'_> {
     }
 }
 
-/// A node's tunnel to one target. The disposable runtime it may own lives
-/// until [`Tunnel::close`], after the stream is done.
-pub(crate) struct Tunnel {
+/// A node's or a route's tunnel to one target. The disposable runtime a
+/// node's tunnel may own lives until [`Tunnel::close`], after the stream is
+/// done.
+pub(crate) struct Tunnel<'a> {
     generation: std::sync::Arc<OutboundRuntimeRegistry>,
-    runtime: std::sync::Arc<NodeRuntime>,
-    guard: Option<EphemeralRuntimeGuard>,
-    tcp: std::sync::Arc<dyn TcpOutbound>,
+    via: TunnelVia<'a>,
     connect_timeout: Duration,
     addr: SocketAddr,
     domain: Option<String>,
 }
 
-impl Tunnel {
+enum TunnelVia<'a> {
+    Node {
+        runtime: std::sync::Arc<NodeRuntime>,
+        guard: Option<EphemeralRuntimeGuard>,
+        tcp: std::sync::Arc<dyn TcpOutbound>,
+    },
+    Route {
+        registry: &'a ProxyRegistry,
+        route: honk_config::route::Route,
+    },
+}
+
+impl Tunnel<'_> {
     pub(crate) async fn dial(&self) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
-        let proxy = self
-            .generation
-            .scope_dials(self.tcp.dial_runtime(
-                std::sync::Arc::clone(&self.runtime),
-                self.addr,
-                self.domain.as_deref(),
-                self.connect_timeout,
-            ))
-            .await?;
+        let proxy = match &self.via {
+            TunnelVia::Node { runtime, tcp, .. } => {
+                self.generation
+                    .scope_dials(tcp.dial_runtime(
+                        std::sync::Arc::clone(runtime),
+                        self.addr,
+                        self.domain.as_deref(),
+                        self.connect_timeout,
+                    ))
+                    .await?
+            }
+            TunnelVia::Route { registry, route } => {
+                registry
+                    .dial_ref(
+                        std::sync::Arc::clone(&self.generation),
+                        honk_outbound::proxy::DialRef::Route(route),
+                        self.addr,
+                        self.domain.as_deref(),
+                        self.connect_timeout,
+                    )
+                    .await?
+            }
+        };
         Ok(proxy.stream)
     }
 
     pub(crate) async fn close(mut self) -> anyhow::Result<()> {
-        if let Some(guard) = self.guard.as_mut() {
+        if let TunnelVia::Node {
+            guard: Some(guard), ..
+        } = &mut self.via
+        {
             guard.close().await?;
         }
         Ok(())
@@ -430,7 +477,7 @@ impl Outbounds<'_> {
             purpose,
         )?;
         let via = node.as_ref().map(|node| Via {
-            node: node.name.clone(),
+            node: node.node.name.clone(),
             group: decision.group.clone(),
         });
         let reply = match node {
@@ -449,7 +496,7 @@ impl Outbounds<'_> {
 
     async fn fetch_through(
         &self,
-        node: &Node,
+        target: &OwnedTarget,
         purpose: &str,
         request: &Request<'_>,
     ) -> Result<Reply, &'static str> {
@@ -459,7 +506,8 @@ impl Outbounds<'_> {
             .port_or_known_default()
             .ok_or("invalid_source")?;
         let by = request.deadline.headers;
-        let tunnel = match timeout_at(by, self.tunnel(node, (host, port))).await {
+        let node = &target.node;
+        let tunnel = match timeout_at(by, self.tunnel(target, (host, port))).await {
             Err(_) => return Err("download_timeout"),
             Ok(Err(error)) => {
                 debug!(%error, node = %node.name, "{purpose} tunnel setup failed");

@@ -45,13 +45,29 @@ impl GroupManager {
     ///
     /// Capable, unprobed UDP leaves inherit TCP liveness; explicit failures in
     /// both UDP domains exclude them even while TCP remains alive.
+    ///
+    /// `routes` is false when selection from the root can produce no route,
+    /// so no exit on any candidate's path needs checking.
     pub(super) fn filter_alive_candidates<'a>(
         &self,
-        candidates: Vec<Candidate<'a>>,
+        mut candidates: Vec<Candidate<'a>>,
         domain: ProbeDomain,
         ipver: IpVersion,
-        check_url: Option<&str>,
+        group: &Group,
+        routes: bool,
     ) -> Vec<Candidate<'a>> {
+        if routes {
+            candidates = self.retain_exit_selectable(candidates, group, domain, ipver);
+        } else {
+            debug_assert!(group.exit.is_none(), "group '{}' has an exit", group.name);
+            debug_assert!(
+                candidates.iter().all(|candidate| self
+                    .dials_its_leaf(candidate, SelectionNetwork::from_probe_domain(domain))),
+                "group '{}' has a candidate that does not dial its leaf",
+                group.name
+            );
+        }
+        let check_url = group.check_url.as_deref();
         if domain == ProbeDomain::Tcp
             && let Some(url) = check_url
             && let Some(alive) = &self.alive_set

@@ -245,7 +245,7 @@ experimental {
 
 ## 声明节点
 
-每个 `node` 行都是一条分享链接，写作 `tag: 'scheme://...'`，或者只写带引号的链接。显式 tag 会成为路由和 API 中使用的名称，并覆盖链接里内嵌的名称；没有 tag 的链接使用 fragment 或生成的协议/主机名。凭据、TLS/REALITY、传输和协议调优都放在链接的 userinfo 与 query 参数里。格式错误的链接会附上诊断后跳过。未知或已移除的协议、已移除的 VLESS `vless_mode` 参数，以及单独的 `mux` 行，都是配置错误；`mux=` 要写在每条 VLESS 链接上。
+`node` 行通常是一条分享链接，写作 `tag: 'scheme://...'`，或者只写带引号的链接。显式 tag 会成为路由和 API 中使用的名称，并覆盖链接里内嵌的名称；没有 tag 的链接使用 fragment 或生成的协议/主机名。凭据、TLS/REALITY、传输和协议调优都放在链接的 userinfo 与 query 参数里。格式错误的链接会附上诊断后跳过。未知或已移除的协议、已移除的 VLESS `vless_mode` 参数，以及单独的 `mux` 行，都是配置错误；`mux=` 要写在每条 VLESS 链接上。用不带引号的 `->` 连接节点名的带 tag 行（如 `via: front -> land`）声明的是[链式节点](./reference/nodes.md#链式节点)；无效的链式节点是配置错误。
 
 `direct` 和 `block` 保留给内置出站，不能用作节点名。组名不能和节点名相同。
 
@@ -277,7 +277,7 @@ routing {
 }
 ```
 
-Selector 的 TCP 和 UDP 都跟随已选成员，不会因为健康状态切到兄弟成员。同一叶节点的 TCP 最后尝试也绕不过嵌套 Selector 的选择。组拨号最终总是解析到一个叶节点。
+Selector 的 TCP 和 UDP 都跟随已选成员，不会因为健康状态切到兄弟成员。同一叶节点的 TCP 最后尝试也绕不过嵌套 Selector 的选择。组拨号最终总是解析到一个叶节点。带 [`exit`](./reference/groups.md#出口) 的组让 TCP 连接从该叶节点再经出口节点出去。
 
 每份配置最多可定义 250 个顶层用户组；更高序号由路由 ABI 保留。
 

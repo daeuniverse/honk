@@ -12,6 +12,7 @@
 //! - [`wrap_transport`]: cold or supplied TCP/TLS wrapping, including one-shot XHTTP,
 //! - [`wrap_transport_runtime`]: XHTTP physical reuse owned by the node generation,
 //! - [`maybe_tls_wrap`]: just the TCP/TLS step, preserving the same setup budget.
+//! - [`wrap_tunnel`]: TLS and transport over a stream tunneled through earlier hops.
 //! - [`grpc`]: gRPC gun framing over a connection-owned HTTP/2 client.
 //! - [`xhttp`]: raw XHTTP bodies over bounded node-owned HTTP/2 carriers.
 
@@ -137,19 +138,26 @@ pub(crate) enum MaybeTls {
     Plain(Box<ObservedTcp>),
 }
 
-pub(crate) async fn maybe_tls_wrap_concrete(
-    node: &Node,
-    tcp: Option<TcpStream>,
-    connect_timeout: std::time::Duration,
-) -> anyhow::Result<MaybeTls> {
-    let tls = node.tls().unwrap();
-    if !tls.alpn.is_empty()
+/// Run the protocol validator when the node sets a TLS ALPN or WebSocket
+/// headers, for both the physical and the tunneled TLS path.
+fn validate_stream_options(node: &Node) -> anyhow::Result<()> {
+    if node.tls().is_some_and(|tls| !tls.alpn.is_empty())
         || node
             .transport()
             .is_some_and(|transport| !transport.ws_headers.is_empty())
     {
         node.validate_protocol()?;
     }
+    Ok(())
+}
+
+pub(crate) async fn maybe_tls_wrap_concrete(
+    node: &Node,
+    tcp: Option<TcpStream>,
+    connect_timeout: std::time::Duration,
+) -> anyhow::Result<MaybeTls> {
+    let tls = node.tls().unwrap();
+    validate_stream_options(node)?;
     let cold = tcp.is_none();
     let initial_tcp = async {
         match tcp {
@@ -278,6 +286,50 @@ fn tls_server_name(node: &Node) -> String {
                 .to_string()
         })
         .unwrap_or_else(|| node.host().to_string())
+}
+
+/// Apply TLS or REALITY and `node.transport` over `carrier`, a stream already
+/// connected to this node's server through earlier hops. The carrier's
+/// physical connection owns admission and observation, so nothing here
+/// connects or retries: a REALITY mask certificate stays the returned error
+/// for the caller to redial with `reality_key_shares` disabled.
+pub(crate) async fn wrap_tunnel(
+    node: &Node,
+    carrier: Box<dyn AsyncReadWrite>,
+    options: crate::proxy::TunnelDialOptions,
+) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+    // XHTTP needs a node-owned pool of physical H2 carriers.
+    if node.is_xhttp() {
+        return Err(crate::proxy::TunnelUnsupported("xhttp").into());
+    }
+    let (Some(tls), Some(_)) = (node.tls(), node.transport()) else {
+        return Err(crate::proxy::TunnelUnsupported(node.protocol().as_str()).into());
+    };
+    validate_stream_options(node)?;
+    let stream: Box<dyn AsyncReadWrite> =
+        if let Some(reality) = crate::reality::parse_reality_config(node)? {
+            let handshake = crate::reality::reality_connect_with_key_shares(
+                carrier,
+                &reality,
+                crate::tls::chrome_mode(),
+                options.reality_key_shares,
+                None,
+            );
+            let tls_stream = tokio::time::timeout(options.connect_timeout * 3, handshake)
+                .await
+                .map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::TimedOut, "REALITY setup timeout")
+                })??;
+            Box::new(crate::tls::BatchRead::new(tls_stream))
+        } else if tls.enabled {
+            let connector = crate::tls::build_connector(node)?;
+            let server_name = tls_server_name(node);
+            let tls_stream = connector.connect(&server_name, carrier).await?;
+            Box::new(crate::tls::BatchRead::new(tls_stream))
+        } else {
+            carrier
+        };
+    wrap_after_tls(node, stream).await
 }
 
 fn encode_uri_path(path: &str) -> PercentEncode<'_> {
@@ -508,4 +560,6 @@ mod grpc;
 mod h2_io;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tunnel_tests;
 pub(crate) mod xhttp;

@@ -228,6 +228,8 @@ upstream {
 | DoQ | 支持经出站的 UDP-capable `PacketTransport`。 |
 | DoH3 | 支持经出站的 UDP-capable `PacketTransport`。 |
 
+带 [`exit`](./groups.md#出口) 的组经它的路由传输上表中基于 TCP 的上游。这样的组不提供 UDP 候选，所以 DoQ 和 DoH3 上游在其中找不到候选。
+
 ## DNS 路由
 
 `routing` 里是排好序的 `request` 和 `response` 规则，第一条匹配的生效。同一个条件里的参数按 OR 组合；用 `&&` 连起来的条件按 AND 组合。条件前加 `!` 表示取反。

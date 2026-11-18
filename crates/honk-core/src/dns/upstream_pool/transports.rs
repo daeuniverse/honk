@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use honk_config::node::Node;
 use honk_config::types::DnsProtocol;
-use honk_outbound::group::ScoreBusinessGuard;
+use honk_outbound::group::{DialKey, OwnedTarget, ScoreBusinessGuard};
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
@@ -78,7 +77,9 @@ impl super::DnsIdleResources {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(super) struct TransportKey {
-    resolved_leaf: Option<String>,
+    /// A node dialed as itself and as a route's leaf reach the upstream over
+    /// different paths.
+    dialed: Option<DialKey>,
     target: std::net::SocketAddr,
 }
 
@@ -136,7 +137,7 @@ impl UpstreamPool {
     pub(super) fn dial_context(
         &self,
         entry: &UpstreamEntry,
-        proxy_node: Option<&Node>,
+        proxy_node: Option<&OwnedTarget>,
         target: std::net::SocketAddr,
     ) -> anyhow::Result<DialContext> {
         let proxy = match (proxy_node, self.proxy_registry.as_ref()) {
@@ -145,10 +146,11 @@ impl UpstreamPool {
                     "DNS proxy node selected without a proxy registry"
                 ));
             }
-            (Some(node), Some(registry)) => Some(ProxyDial {
+            (Some(target), Some(registry)) => Some(ProxyDial {
                 registry: Arc::clone(registry),
                 generation: self.runtime_generation.get().cloned(),
-                node: node.clone(),
+                node: target.node.clone(),
+                route: target.route().copied(),
             }),
             _ => None,
         };
@@ -164,7 +166,7 @@ impl UpstreamPool {
     async fn build_transport(
         &self,
         entry: &UpstreamEntry,
-        proxy_node: Option<&Node>,
+        proxy_node: Option<&OwnedTarget>,
         target: std::net::SocketAddr,
     ) -> anyhow::Result<PooledTransport> {
         let dial = self.dial_context(entry, proxy_node, target)?;
@@ -185,11 +187,11 @@ impl UpstreamPool {
     pub(super) async fn get_transport(
         &self,
         entry: &UpstreamEntry,
-        proxy_node: Option<&Node>,
+        proxy_node: Option<&OwnedTarget>,
         target: std::net::SocketAddr,
     ) -> anyhow::Result<Arc<PooledTransport>> {
         let key = TransportKey {
-            resolved_leaf: proxy_node.map(|node| node.name.clone()),
+            dialed: proxy_node.map(OwnedTarget::key),
             target,
         };
         let slot = {

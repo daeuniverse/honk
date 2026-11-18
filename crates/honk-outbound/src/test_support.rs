@@ -1,0 +1,218 @@
+//! Fixtures shared by test suites of different modules. A suite's own
+//! helpers stay with that suite.
+
+use crate::proxy::shadowsocks::{
+    AeadCipher, CipherConf, ShadowsocksHandler, decrypt_chunks_in_place, hkdf_sha1_derive,
+    seal_chunks_into,
+};
+use honk_config::node::{Node, OutboundConfig};
+use rand::Rng;
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+pub(crate) fn node(name: &str, host: &str, port: u16, outbound: OutboundConfig) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        address: format!("{host}:{port}"),
+        host: host.into(),
+        port,
+        outbound,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+pub(crate) fn socks5(name: &str, host: &str, port: u16) -> Node {
+    node(name, host, port, OutboundConfig::Socks5(Default::default()))
+}
+
+pub(crate) fn chain(hops: &[&Node]) -> Node {
+    let mut node = Node {
+        name: "via".into(),
+        outbound: OutboundConfig::Chain {
+            hops: hops.iter().map(|hop| hop.name.clone()).collect(),
+        },
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// A no-auth SOCKS5 server that relays CONNECT over real sockets, resolving
+/// domains through `hosts`, or refuses every request with "connection
+/// refused" while `refuse` is set. Records each requested target as written
+/// on the wire.
+pub(crate) struct Socks5Relay {
+    pub(crate) addr: SocketAddr,
+    pub(crate) refuse: Arc<AtomicBool>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl Socks5Relay {
+    pub(crate) fn requests(&self) -> Vec<String> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+pub(crate) async fn socks5_relay(
+    hosts: Vec<(&'static str, SocketAddr)>,
+    refuse: bool,
+) -> Socks5Relay {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&requests);
+    let refuse = Arc::new(AtomicBool::new(refuse));
+    let refusing = Arc::clone(&refuse);
+    tokio::spawn(async move {
+        loop {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let hosts = hosts.clone();
+            let log = Arc::clone(&log);
+            let refuse = refusing.load(Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut greeting = [0u8; 2];
+                client.read_exact(&mut greeting).await.unwrap();
+                let mut methods = vec![0u8; greeting[1] as usize];
+                client.read_exact(&mut methods).await.unwrap();
+                client.write_all(&[5, 0]).await.unwrap();
+                let mut head = [0u8; 4];
+                client.read_exact(&mut head).await.unwrap();
+                let (host, upstream) = match head[3] {
+                    1 => {
+                        let mut raw = [0u8; 4];
+                        client.read_exact(&mut raw).await.unwrap();
+                        let port = client.read_u16().await.unwrap();
+                        let addr = SocketAddr::from((raw, port));
+                        (addr.to_string(), addr)
+                    }
+                    3 => {
+                        let len = client.read_u8().await.unwrap();
+                        let mut domain = vec![0u8; len as usize];
+                        client.read_exact(&mut domain).await.unwrap();
+                        let domain = String::from_utf8(domain).unwrap();
+                        let port = client.read_u16().await.unwrap();
+                        let (_, upstream) = *hosts
+                            .iter()
+                            .find(|(name, _)| *name == domain)
+                            .expect("test relay knows every domain");
+                        (format!("{domain}:{port}"), upstream)
+                    }
+                    other => panic!("unexpected SOCKS5 address type {other}"),
+                };
+                log.lock().unwrap().push(host);
+                if refuse {
+                    client
+                        .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+                        .await
+                        .unwrap();
+                    return;
+                }
+                let mut upstream = TcpStream::connect(upstream).await.unwrap();
+                client
+                    .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            });
+        }
+    });
+    Socks5Relay {
+        addr,
+        refuse,
+        requests,
+    }
+}
+
+/// Mock legacy-AEAD TCP server (salt + chunk codec): echoes every payload
+/// byte uppercased after skipping the 7-byte IPv4 target header.
+pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S) {
+    let method = "aes-128-gcm";
+    let password = "test-password";
+    let conf = CipherConf::for_method(method).unwrap();
+    let master = ShadowsocksHandler::master_key(password, conf.key_len);
+
+    let mut c2s_salt = vec![0u8; conf.salt_len];
+    server.read_exact(&mut c2s_salt).await.unwrap();
+    let mut c2s_subkey = vec![0u8; conf.key_len];
+    hkdf_sha1_derive(&master, &c2s_salt, &mut c2s_subkey);
+    let c2s_cipher = AeadCipher::new(method, &c2s_subkey).unwrap();
+    let mut c2s_nonce = vec![0u8; conf.nonce_len];
+
+    let mut s2c_salt = vec![0u8; conf.salt_len];
+    rand::rng().fill_bytes(&mut s2c_salt);
+    server.write_all(&s2c_salt).await.unwrap();
+    let mut s2c_subkey = vec![0u8; conf.key_len];
+    hkdf_sha1_derive(&master, &s2c_salt, &mut s2c_subkey);
+    let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
+    let mut s2c_nonce = vec![0u8; conf.nonce_len];
+
+    // The first plaintext bytes are the target header (own chunk).
+    let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
+    let mut skip = header_len;
+    let mut buf = vec![0u8; 262144];
+    let mut carry = 0usize;
+    let mut pending_len = None;
+    loop {
+        let n = server.read(&mut buf[carry..]).await.unwrap();
+        if n == 0 {
+            return;
+        }
+        let total = carry + n;
+        let (out_len, rest) = decrypt_chunks_in_place(
+            &c2s_cipher,
+            &mut c2s_nonce,
+            &mut pending_len,
+            &mut buf,
+            total,
+            conf.tag_len,
+        )
+        .unwrap();
+        if out_len > 0 {
+            let start = skip.min(out_len);
+            skip -= start;
+            if start < out_len {
+                let upper: Vec<u8> = buf[start..out_len]
+                    .iter()
+                    .map(|b| b.to_ascii_uppercase())
+                    .collect();
+                let mut sealed = Vec::new();
+                seal_chunks_into(&s2c_cipher, &mut s2c_nonce, &upper, &mut sealed).unwrap();
+                server.write_all(&sealed).await.unwrap();
+            }
+        }
+        if rest > 0 {
+            buf.copy_within(out_len..out_len + rest, 0);
+        }
+        carry = rest;
+    }
+}
+
+/// Writes ~1MB in 8 uneven writes and expects it back uppercased.
+pub(crate) async fn assert_legacy_bulk_echo<S: AsyncRead + AsyncWrite + Unpin + ?Sized>(
+    stream: &mut S,
+) {
+    let payload: Vec<u8> = (0..1_000_000u32).map(|i| (i % 251) as u8).collect();
+    let mut off = 0;
+    for chunk in [3usize, 65536, 17, 262144, 999, 400_000, 131071, 271_329] {
+        let end = (off + chunk).min(payload.len());
+        stream.write_all(&payload[off..end]).await.unwrap();
+        off = end;
+    }
+    assert_eq!(off, payload.len());
+
+    let mut received = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_exact(&mut received),
+    )
+    .await
+    .expect("echo timed out")
+    .unwrap();
+    let expected: Vec<u8> = payload.iter().map(|b| b.to_ascii_uppercase()).collect();
+    assert_eq!(received, expected);
+}

@@ -118,6 +118,7 @@ native socket 包在 `PacketTransport` 后面；tunnel 协议在自己的真实 
 | AnyTLS | `network` 缺省或包含 `udp` 时 | 否 | 否 | `AnyTls` | `anytls` |
 | Direct | 是 | 否 | 否 | `None` | 无 |
 | Block | 否 | 否 | 是 | `None` | 无 |
+| Chain | 否 | 否 | 否 | `None` | 无 |
 
 Ready-stream pooling 保存已完成、已绑定目标的握手。Bare-TCP pooling 只保存已经连
 到代理服务器的 socket，目标握手留给之后的 `dial_with_tcp` 完成。TCP multiplex 和
@@ -161,6 +162,7 @@ capability 拒绝，调用方可以继续回退到配置中的冷候选。显式
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
+| `chain` | 经各跳的 handler 逐跳拨号；见[链式节点](#链式节点) | 没有 packet slot；只支持 TCP |
 
 Shadowsocks 的传统 AEAD 和 2022 版本用一个 `MultiTargetTransport` 承载同一客户端
 source 的所有目的地。它只有一个连到服务端的带 mark socket 和一份加密状态。2022
@@ -997,6 +999,50 @@ setup 或破坏逻辑 stream 之前失败。这样既避免了一次原本为空
 即 `confirmed`；稳态发送只入队，`admitted` 在 frame 进入 session writer 队列时设
 置。队列和 credit 上限仍是单个 transport 的上限，因此队列饱和或 EOF 会退役共享该
 SID 的所有目的地。域名目标流，即 `RewriteTo`，仍按原始目的地各自成 scope。
+
+## 链式节点
+
+链式节点（`OutboundConfig::Chain`）经同一 generation 中的其他节点拨号；语法、校验与限制见[节点参考](../reference/nodes.md#链式节点)。
+`ProxyRegistry::default_resolver` 最后注册 `ChainHandler`（`src/proxy/chain.rs`），并把此前注册的每个协议的 TCP handler 交给它，
+因此每一跳使用的都是 registry 分派时的同一个 handler 实例。
+
+`build_reusing_with_admission` 先构建或重用所有普通节点，再用这一轮得到的各跳 runtime 构建链式节点的 runtime。
+链式节点的 runtime 不进入重用集合：它在每个 generation 都重建，不会让上一代的跳继续存活。DNS runtime 分叉走同一条路径。
+`honk_config::node::resolve_chain_hops` 把各跳名称解析一次，返回每条链各跳的 ID，构建时按 ID 取各跳 runtime。`Config::validate_assembled` 调用的也是这个函数，因此无法解析的跳会让 runtime 准入失败。
+没有 generation runtime 的普通 `dial` 拒绝链式节点。
+
+`ChainHandler::dial_runtime` 逐跳拨号：
+
+1. 入口用它原本的 `dial_runtime` 连接第二跳的服务器。服务器是 IP 时直接作为地址传入；
+   是域名时放进 `target_domain`，地址只携带端口、IP 为未指定地址，由入口的服务器解析，与其他经代理的目标域名相同。
+2. 之后每一跳在前面各跳建立的 stream 上调用 `dial_over`。只有最后一跳以真正的目的地为目标。
+3. 每一跳都在自己 runtime 的 `scope_tasks` 与 transport quality 范围内执行，与经 registry 的拨号相同。
+   之后各跳不打开 socket，嵌套分派沿用继承的拨号范围，因此整条链只占用入口的拨号准入。
+   链式流量的 carrier 压力因此记在各跳的 runtime 上：它可能标记入口节点，而链式节点 runtime 自己的
+   `TransportQuality` 始终为空，包含该链式节点的 Score 组看不到它的传输压力。
+
+整条链共用一个期限 `connect_timeout × 3`，即调用方本来对单个候选施加的上限。
+每一跳取剩余时间与 `connect_timeout` 中的较小值。期限到达时拨号以超时 I/O 错误失败。
+
+`dial_over` 自身不屏蔽 milestone，屏蔽由串联各跳的调用方负责：每一跳照常报告自己的目标 milestone。
+最后一跳之前的各跳在 `without_target_milestones` 中执行，它丢弃 `TargetRequestSent` 与 `TargetConfirmed`，
+转发 transport 事件和其他所有 milestone，包括 `TransportReady`。
+因此 `TransportAttached` 指向入口的物理连接，`TargetRequestSent` 标记对真正目的地发出请求的时间。
+
+最后一跳之前的跳以下一跳的服务器为目标，所以它们的 `TargetFailure` 会改判为链式节点的 `NodeFailure`，消息不变。
+最后一跳的 `TargetFailure` 仍是目标失败；数据包策略拒绝无论出现在哪一跳都保留原类别。
+
+经隧道拨号的某一跳以 `RealityMaskCertificate` 失败时，整条链从入口重拨一次并关闭 hybrid key share，与直接 REALITY 拨号重试一次相同。
+重拨共用原来的期限。入口本身是 REALITY 时，由它自己的 `dial_runtime` 重试。
+
+### 经组出口的路由
+
+组的 [`exit`](../reference/groups.md#出口) 把选中的叶节点变成一条路由（`honk_config::route::Route`）。
+`group_graph::compose` 把叶节点自己的各跳（节点本身，或链式节点的各跳）与选中路径上各组的出口按从内到外的顺序接起来，重复的出口只进入一次。
+路由是选择结果，不是配置中的节点，所以没有 `NodeRuntime`。
+`ProxyRegistry::dial_ref` 把 `DialRef::Route` 交给 `ChainHandler::dial_route_tcp`，在 `RouteRuntime`（`src/runtime/route.rs`）上拨号，
+`RouteRuntime` 借用发起拨号的 generation 中各跳的 runtime。每个 generation 最多缓存 `MAX_ROUTE_RUNTIMES`（4096）个，超出后用不缓存的 runtime 拨号。
+上述逐跳规则同样适用。路由不存入连接池，也不触发补充。
 
 ## 冷 URLTest speculative preparation
 

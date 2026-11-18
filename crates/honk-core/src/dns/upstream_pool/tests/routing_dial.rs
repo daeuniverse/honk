@@ -180,7 +180,10 @@ async fn implicit_quic_routes_use_data_udp_health() {
 
     for name in ["quic", "h3"] {
         let route = pool.resolve_dial_route(&pool.entries[name]).await.unwrap();
-        assert_eq!(route.node.as_ref().expect("UDP traffic route").id, node.id);
+        assert_eq!(
+            route.node.as_ref().expect("UDP traffic route").node.id,
+            node.id
+        );
         let context = route.feedback.expect("Score feedback").context().clone();
         assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Udp);
         assert_eq!(
@@ -230,7 +233,10 @@ async fn implicit_udp_route_follows_tcp_carrier_health() {
             .with_traffic_router(traffic);
 
     let route = pool.resolve_dial_route(&pool.entries["udp"]).await.unwrap();
-    assert_eq!(route.node.as_ref().expect("TCP-carried route").id, node.id);
+    assert_eq!(
+        route.node.as_ref().expect("TCP-carried route").node.id,
+        node.id
+    );
     let context = route.feedback.expect("Score feedback").context().clone();
     assert_eq!(context.network, honk_outbound::group::SelectionNetwork::Tcp);
     assert_eq!(context.probe_domain, honk_outbound::alive::ProbeDomain::Tcp);
@@ -320,7 +326,7 @@ async fn forced_score_route_keeps_target_and_nested_attribution() {
         .await
         .unwrap();
     assert_eq!(route.target, "192.0.2.53:53".parse().unwrap());
-    assert_eq!(route.node.unwrap().id, node.id);
+    assert_eq!(route.node.unwrap().node.id, node.id);
     let feedback = route.feedback.expect("score attribution");
     assert_eq!(
         feedback
@@ -401,6 +407,82 @@ async fn implicit_score_route_keeps_target_and_attribution() {
         .await
         .unwrap();
     assert_eq!(route.target, "192.0.2.53:53".parse().unwrap());
-    assert_eq!(route.node.unwrap().id, node.id);
+    assert_eq!(route.node.unwrap().node.id, node.id);
     assert_eq!(route.feedback.unwrap().attributions()[0].group, "proxy");
+}
+
+#[tokio::test]
+async fn an_exit_group_without_a_group_manager_resolves_to_no_node() {
+    let leaf = test_node("leaf");
+    let exit = test_node("exit");
+    let plain = test_group("plain", GroupPolicy::Selector, vec![leaf.id]);
+    let exited = honk_config::group::Group {
+        exit: Some("exit".into()),
+        ..test_group("exited", GroupPolicy::Selector, vec![leaf.id])
+    };
+    let upstream = |name: &str, outbound: &str| DnsUpstream {
+        outbound: Some(outbound.into()),
+        ..make_upstream(name, "8.8.8.8:53", DnsProtocol::Udp)
+    };
+    let pool = UpstreamPool::new_with_proxy(
+        &[upstream("plain", "plain"), upstream("exited", "exited")],
+        make_router(),
+        None,
+        vec![leaf, exit],
+        vec![plain, exited],
+    )
+    .unwrap();
+    let plain = pool.entries.get("plain").unwrap();
+    assert_eq!(
+        pool.resolve_dial_leaf(plain).await.unwrap().unwrap().name,
+        "leaf"
+    );
+    let exited = pool.entries.get("exited").unwrap();
+    assert!(pool.resolve_dial_leaf(exited).await.is_err());
+}
+
+/// A node dialed as itself and the same node as a route's leaf reach the
+/// upstream over different paths, so they must not share a pooled
+/// transport: the route would otherwise reuse the direct one and skip its
+/// exit, or the other way round.
+#[tokio::test]
+async fn a_routed_and_a_direct_leaf_keep_separate_dns_transports() {
+    use honk_outbound::group::{OwnedTarget, RoutedTarget};
+
+    let leaf = test_node("leaf");
+    let exit = test_node("exit");
+    let pool = UpstreamPool::new_with_proxy(
+        &[make_upstream("tcp", "192.0.2.53:53", DnsProtocol::Tcp)],
+        make_router(),
+        Some(Arc::new(
+            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+        )),
+        vec![leaf.clone(), exit.clone()],
+        Vec::new(),
+    )
+    .unwrap();
+    let entry = pool.entries.get("tcp").unwrap();
+    let direct = OwnedTarget {
+        node: leaf.clone(),
+        route: None,
+    };
+    let routed = match honk_config::group_graph::compose(leaf.id, &[leaf.id], [exit.id]) {
+        honk_config::group_graph::Composed::Routed(route) => OwnedTarget {
+            node: leaf.clone(),
+            route: Some(Box::new(RoutedTarget {
+                route,
+                hop_names: [leaf.name.clone(), exit.name.clone()].into(),
+            })),
+        },
+        other => panic!("expected a route, got {other:?}"),
+    };
+    let target = "192.0.2.53:53".parse().unwrap();
+    let mut transports = Vec::new();
+    for node in [&direct, &routed, &direct, &routed] {
+        transports.push(pool.get_transport(entry, Some(node), target).await.unwrap());
+    }
+    assert!(!Arc::ptr_eq(&transports[0], &transports[1]));
+    assert!(Arc::ptr_eq(&transports[0], &transports[2]));
+    assert!(Arc::ptr_eq(&transports[1], &transports[3]));
+    pool.close().await;
 }

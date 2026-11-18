@@ -87,7 +87,7 @@ impl ConnectionObservation {
         _configured: DialMode,
         _sniff: &crate::sniffing::SniffResult,
         _verification: &'static str,
-        _candidates: &[Node],
+        _candidates: &[honk_outbound::group::OwnedTarget],
         _domain: Option<&str>,
     ) {
     }
