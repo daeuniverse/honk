@@ -214,8 +214,11 @@ provision_routes() {
     ip -n server -6 addr replace fd00:2::2/128 dev "$server_dev" nodad
     ip -n dut addr replace 10.77.0.1/24 brd + dev up
     ip -n dut -6 addr replace fd00:77::1/64 dev up nodad
+    # Kernel NUD probes on the ordinary uplink need a link-local source after idle.
+    ip -n dut -6 addr replace fe80::1/64 dev up nodad
     ip -n server addr replace 10.77.0.2/24 dev su
     ip -n server -6 addr replace fd00:77::2/64 dev su nodad
+    ip -n server -6 addr replace fe80::2/64 dev su nodad
     ip -n dut addr replace 203.0.113.1/32 dev lo scope global
     ip -n client route replace 198.51.100.99/32 dev "$client_dev"
     ip -n client neigh replace 198.51.100.99 lladdr 02:00:00:00:00:10 nud permanent dev "$client_dev"
