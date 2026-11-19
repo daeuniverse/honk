@@ -46,6 +46,7 @@ pub struct Table {
     free: Vec<u32>,
     pub active: u32,
     pub tcp_active: u32,
+    pub(crate) tcp_retention_changed: bool,
     max_slots: Option<usize>,
     sources: Option<SourceSlots>,
 }
@@ -60,6 +61,7 @@ impl Table {
             free: Vec::new(),
             active: 0,
             tcp_active: 0,
+            tcp_retention_changed: false,
             max_slots: None,
             sources: None,
         }
@@ -227,6 +229,7 @@ impl Table {
                 self.tcp.remove(&t.tuple);
                 self.active -= 1;
                 self.tcp_active -= 1;
+                self.tcp_retention_changed = true;
             }
             Flow::Udp { port } => {
                 self.udp.remove(port);
@@ -234,6 +237,7 @@ impl Table {
             }
             Flow::TimeWait(t) => {
                 self.timewait.remove(&t.tuple);
+                self.tcp_retention_changed = true;
             }
         }
         if slot.generation != 0 {

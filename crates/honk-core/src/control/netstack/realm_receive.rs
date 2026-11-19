@@ -317,6 +317,7 @@ impl Inner {
             .or_else(|| self.peers.iter().position(Option::is_none));
         if let Some(index) = index {
             self.peers[index] = Some(hold.clone());
+            self.peer_end = self.peer_end.max(index + 1);
         }
     }
 
@@ -335,7 +336,7 @@ impl Inner {
     #[cfg(target_os = "linux")]
     pub(super) fn reap_peers(&mut self) {
         self.reap_fragment_peers();
-        for peer in &mut self.peers {
+        for peer in &mut self.peers[..self.peer_end] {
             let Some(held) = peer else { continue };
             let address = held.address();
             if !self
@@ -352,6 +353,9 @@ impl Inner {
             {
                 peer.take();
             }
+        }
+        while self.peer_end != 0 && self.peers[self.peer_end - 1].is_none() {
+            self.peer_end -= 1;
         }
     }
 

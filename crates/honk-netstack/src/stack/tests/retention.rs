@@ -107,6 +107,7 @@ fn exhaustion_at_compaction_or_expiry_keeps_time_wait_delivery() {
         stack.tcp_close(id);
         assert!(stack.tcp_retained(id));
         assert!(!stack.tcp_retained(original));
+        assert!(!stack.take_tcp_retention_change());
         assert_eq!(stack.stats().timewait_entries, 1);
         let late = now + Duration::from_secs(30);
         assert_eq!(stack.receive(late, &fin), Rx::Consumed);
@@ -120,8 +121,10 @@ fn exhaustion_at_compaction_or_expiry_keeps_time_wait_delivery() {
         assert_eq!(h.flags, wire::tcp::ACK);
         stack.handle_timeout(now + Duration::from_secs(60));
         assert!(stack.tcp_retained(id));
+        assert!(!stack.take_tcp_retention_change());
         stack.handle_timeout(late + Duration::from_secs(60));
         assert!(!stack.tcp_retained(id));
+        assert!(stack.take_tcp_retention_change());
         assert_eq!(stack.table.slots[id.idx as usize].generation, 0);
         let new = stack
             .tcp_connect(
@@ -151,6 +154,7 @@ fn active_reopen_retires_the_old_protocol_but_never_reuses_an_exhausted_slot() {
         };
         stack.tcp_close(id);
         assert!(stack.tcp_retained(id));
+        assert!(!stack.take_tcp_retention_change());
         stack.ports = Ports::new(&stack.cfg.secret);
         let later = now + Duration::from_secs(1);
         let new = stack
@@ -160,6 +164,7 @@ fn active_reopen_retires_the_old_protocol_but_never_reuses_an_exhausted_slot() {
         assert_eq!(new.idx != id.idx, exhausted);
         assert!(!stack.tcp_retained(id));
         assert!(stack.tcp_retained(new));
+        assert!(stack.take_tcp_retention_change());
         let mut packet = [0; 2000];
         let tx = stack
             .poll_transmit_with(later, &mut packet, TxCaps::NONE)

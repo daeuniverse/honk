@@ -614,6 +614,44 @@ fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
     ));
 }
 
+#[test]
+fn abort_drains_closed_flows_during_reentrant_callback() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let accept = |port| {
+        let client = SocketAddr::from(([10, 0, 0, 2], port));
+        assert_eq!(
+            scope.receive(&segment(client, 100, 0, tcp::SYN, &[]), now),
+            Rx::Consumed
+        );
+        scope.poll_accept().unwrap().1
+    };
+    let mut first = accept(40000);
+    let mut second = accept(40001);
+    let retired = Arc::new(AtomicUsize::new(0));
+    let callback_scope = scope.clone();
+    let first_retired = Arc::clone(&retired);
+    first
+        .set_retirement_callback(move || {
+            assert_eq!(first_retired.fetch_add(1, Ordering::SeqCst), 0);
+            assert!(callback_scope.poll_accept().is_none());
+            assert_eq!(first_retired.load(Ordering::SeqCst), 2);
+        })
+        .unwrap();
+    let second_retired = Arc::clone(&retired);
+    second
+        .set_retirement_callback(move || {
+            assert_eq!(second_retired.fetch_add(1, Ordering::SeqCst), 1);
+        })
+        .unwrap();
+
+    drop((first, second));
+    assert_eq!(retired.load(Ordering::SeqCst), 0);
+    scope.shutdown(true);
+    assert_eq!(retired.load(Ordering::SeqCst), 2);
+    assert!(scope.is_protocol_quiescent());
+}
+
 #[tokio::test]
 async fn datagram_credit_wait_is_cancel_safe_and_fragment_payload_is_accepted_once() {
     let now = Instant::now();

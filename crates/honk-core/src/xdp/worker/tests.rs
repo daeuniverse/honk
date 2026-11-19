@@ -60,6 +60,119 @@ async fn physical_udp_close_during_source_validation_retires_cleanly() {
     assert!(!received.taken_over && !received.qualified_rx);
 }
 
+#[tokio::test]
+async fn physical_peer_slots_reap_across_a_hole_and_relearn() {
+    use futures::FutureExt as _;
+
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let plane = crate::control::tests::support::control_plane(Config::default());
+    let (endpoints, supervisor) =
+        PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 1)
+            .await
+            .unwrap();
+    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let now = Instant::now();
+    let destination = source(41000, None).dst;
+    let sender = scope.datagram_sender(destination);
+    let client = |host| SocketAddr::from(([192, 0, 2, host], 41000));
+    let receive = |client, path| {
+        let mut packet = [0; 128];
+        let len = wire::udp::emit_packet(&mut packet, client, destination, b"request").unwrap();
+        let received = endpoints
+            .receive_on_timed(
+                scope,
+                &packet[..len],
+                now,
+                now,
+                None,
+                false,
+                |src, pending| peers.retain(scope.scope(), src, path, now, pending),
+            )
+            .unwrap();
+        assert_eq!(received.source.unwrap().src, client);
+        received.taken_over
+    };
+    let reply = |client| {
+        let sent = sender
+            .send_to(b"reply", client)
+            .now_or_never()
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent, 5);
+        let output = scope.next_output().now_or_never().unwrap().unwrap();
+        assert_eq!(
+            wire::packet_addresses(output.packet()).unwrap().1,
+            client.ip()
+        );
+        output
+    };
+
+    // The pending initializer owns the only UDP endpoint through this synchronous packet script.
+    // The other peers therefore depend on their exported frames to retain their realm slots.
+    assert!(receive(client(1), path()));
+    assert!(scope.retains_source(client(1).ip()));
+    let mut frames: Vec<_> = (2..=17)
+        .map(|host| {
+            let frame = reply(client(host));
+            assert!(!receive(client(host), path()));
+            frame
+        })
+        .collect();
+    let high = client(17);
+    frames.remove(0).release();
+    assert!(scope.peer_hold(client(2).ip()).is_none());
+    let old_reply = reply(high);
+    frames.pop().unwrap().release();
+    assert_eq!(old_reply.peer_hold().unwrap().original_path(), path());
+
+    for device in [1, 2] {
+        let moved = ReturnPath { device, ..path() };
+        assert!(!receive(high, moved));
+        assert_eq!(scope.peer_hold(high.ip()).unwrap().original_path(), moved);
+    }
+    assert_eq!(old_reply.peer_hold().unwrap().original_path(), path());
+    let high_holds = peers
+        .0
+        .lock()
+        .iter()
+        .find(|peer| peer.address == high.ip())
+        .unwrap()
+        .holds;
+    assert_eq!(high_holds, 2, "one realm slot and one exported reply");
+
+    let newcomer = client(18);
+    let reused = reply(newcomer);
+    assert!(!receive(newcomer, path()));
+    assert!(scope.peer_hold(newcomer.ip()).is_some());
+    assert_eq!(
+        scope.peer_hold(high.ip()).unwrap().original_path().device,
+        2
+    );
+    old_reply.release();
+    assert!(scope.peer_hold(high.ip()).is_none());
+    drop(frames);
+    reused.release();
+    for host in 2..=18 {
+        assert!(scope.peer_hold(client(host).ip()).is_none());
+    }
+
+    let keep = reply(high);
+    let relearned = ReturnPath {
+        device: 3,
+        ..path()
+    };
+    assert!(!receive(high, relearned));
+    let output = reply(high);
+    assert_eq!(output.peer_hold().unwrap().original_path(), relearned);
+    drop((keep, output));
+    assert!(scope.peer_hold(high.ip()).is_none());
+
+    endpoints.close();
+    supervisor.run().await.unwrap();
+}
+
 #[test]
 fn peer_identity_uses_logical_realm_not_member_or_priority() {
     let first = path();

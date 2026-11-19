@@ -207,10 +207,14 @@ struct Inner {
     capture_admission: Option<Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(target_os = "linux")]
     peers: Box<[Option<crate::xdp::worker::PeerHold>]>,
+    // All slots at or beyond this bound are vacant; holes inside it retain their indices.
+    #[cfg(target_os = "linux")]
+    peer_end: usize,
     #[cfg(target_os = "linux")]
     fragment_peers: Box<[Option<FragmentPeer>]>,
     pending_closes: usize,
     closed_apps: usize,
+    reap_pending: bool,
     pending_routing: usize,
     waiters: Box<[Option<Waker>]>,
     output_waker: Option<Waker>,
@@ -403,6 +407,8 @@ impl PacketScope {
                 #[cfg(target_os = "linux")]
                 peers: (0..peer_capacity).map(|_| None).collect(),
                 #[cfg(target_os = "linux")]
+                peer_end: 0,
+                #[cfg(target_os = "linux")]
                 fragment_peers: (0..if capture && worker == 0 { 80 } else { 0 })
                     .map(|_| None)
                     .collect(),
@@ -410,6 +416,7 @@ impl PacketScope {
                 capture_admission: None,
                 pending_closes: 0,
                 closed_apps: 0,
+                reap_pending: false,
                 pending_routing: 0,
                 waiters: (0..limits.max_waiters).map(|_| None).collect(),
                 output_waker: None,
@@ -874,6 +881,13 @@ impl Shared {
                 if inner.closed_apps == 0 {
                     return;
                 }
+                let protocol_changed = inner
+                    .stack
+                    .as_mut()
+                    .is_some_and(Stack::take_tcp_retention_change);
+                if !inner.reap_pending && !protocol_changed {
+                    return;
+                }
                 let found = inner.slots.iter().position(|slot| {
                     slot.as_ref().is_some_and(|slot| {
                         !slot.app_open
@@ -885,7 +899,12 @@ impl Shared {
                                 .is_some_and(|stack| stack.tcp_retained(slot.id))
                     })
                 });
-                let Some(index) = found else { return };
+                let Some(index) = found else {
+                    inner.reap_pending = false;
+                    return;
+                };
+                // An unlocked callback can re-enter and drain the remaining eligible slots.
+                inner.reap_pending = true;
                 let slot = inner.slots[index].as_mut().expect("retiring exact slot");
                 slot.retiring = true;
                 (index, slot.id, slot.callback.take())
@@ -1145,6 +1164,9 @@ impl Inner {
             && let Some(slot) = self.slot(id)
         {
             slot.outputs = slot.outputs.checked_sub(1).expect("original output owner");
+            if slot.outputs == 0 && !slot.app_open {
+                self.reap_pending = true;
+            }
         }
     }
 
@@ -1245,6 +1267,7 @@ impl Inner {
                     slot.app_open = false;
                     slot.routing.take();
                     self.closed_apps += 1;
+                    self.reap_pending = true;
                     self.pending_routing -= 1;
                 }
             }
@@ -1281,6 +1304,7 @@ impl Inner {
         self.aborted = true;
         // Dropping the stack is explicit protocol disposal, never a fabricated device return.
         self.stack = None;
+        self.reap_pending = true;
         for grant in &mut self.half_open {
             grant.take();
         }

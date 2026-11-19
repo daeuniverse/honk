@@ -378,7 +378,7 @@ pub struct Stack {
     control_ready: Option<VecDeque<FlowId>>,
     writers: VecDeque<FlowId>,
     timewait_ready: VecDeque<FlowId>,
-    pub(crate) controls: VecDeque<Control>,
+    controls: VecDeque<Control>,
     pub(crate) tx_wakeup: bool,
     class: u8,
     control_class: u8,
@@ -1252,7 +1252,7 @@ impl Stack {
                 [&[], &[]],
             ) {
                 Some(n) => {
-                    self.controls.pop_front();
+                    self.pop_control();
                     tx.flow = c.flow;
                     tx.source = c.source;
                     Output::Sent(n)
@@ -1624,6 +1624,14 @@ impl Stack {
                 _ => false,
             })
             || self.controls.iter().any(|control| control.flow == Some(id))
+    }
+
+    /// Takes and clears the coalesced hint that a TCP or TIME_WAIT owner was removed, or a
+    /// queued flow-owned control reply was emitted or suppressed, since the last take.
+    /// A true result asks the caller to recheck [`Self::tcp_retained`] for its original handles
+    /// and to honor any ownership already handed to the driver.
+    pub fn take_tcp_retention_change(&mut self) -> bool {
+        std::mem::take(&mut self.table.tcp_retention_changed)
     }
 
     /// Visits actual retained owners, including killed fragment identity tombstones.
@@ -2038,6 +2046,12 @@ impl Stack {
             return;
         }
         self.controls.push_back(c);
+    }
+
+    pub(crate) fn pop_control(&mut self) {
+        if self.controls.pop_front().is_some_and(|c| c.flow.is_some()) {
+            self.table.tcp_retention_changed = true;
+        }
     }
 
     pub(crate) fn local_for(&self, remote: IpAddr) -> Option<IpAddr> {

@@ -289,7 +289,7 @@ impl Stack {
         if result == IcmpEmit::TooSmall {
             return Output::Blocked;
         }
-        self.controls.pop_front();
+        self.pop_control();
         match result {
             IcmpEmit::Sent(n) => Output::Sent(n),
             _ => Output::None,

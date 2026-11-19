@@ -176,6 +176,7 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
         let old = info_of(&mut stack).id;
         stack.tcp_refuse(old, how);
         assert_eq!(stack.tcp_state(old), None);
+        assert!(stack.take_tcp_retention_change());
         assert_eq!(stack.tcp_retained(old), how != Refuse::Drop);
         assert_eq!(
             stack.retains_tcp(peer.client, peer.dst),
@@ -193,6 +194,7 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
                 .is_none()
         );
         assert_eq!(stack.tcp_retained(old), how != Refuse::Drop);
+        assert!(!stack.take_tcp_retention_change());
         if how != Refuse::Drop {
             let (tx, packet) = pull(&mut stack, now).unwrap();
             assert_eq!(tx.flow, Some(old));
@@ -200,6 +202,7 @@ fn refusal_output_retains_its_old_owner_across_slot_and_tuple_reuse() {
             assert_eq!(ip.proto, if how == Refuse::Rst { 6 } else { 1 });
         }
         assert!(!stack.tcp_retained(old));
+        assert_eq!(stack.take_tcp_retention_change(), how != Refuse::Drop);
         stack.tcp_close(old);
         assert!(stack.tcp_retained(new));
         stack.tcp_refuse(new, Refuse::Drop);
@@ -229,11 +232,15 @@ fn rate_limited_refusal_releases_only_its_queued_local_obligation() {
     let second = info_of(&mut stack).id;
     stack.tcp_refuse(second, Refuse::IcmpUnreachable);
     assert!(stack.tcp_retained(first) && stack.tcp_retained(second));
+    assert!(stack.take_tcp_retention_change());
+    assert!(!stack.take_tcp_retention_change());
     assert_eq!(pull(&mut stack, now).unwrap().0.flow, Some(first));
     assert!(!stack.tcp_retained(first));
     assert!(stack.tcp_retained(second));
+    assert!(stack.take_tcp_retention_change());
     assert!(pull(&mut stack, now).is_none());
     assert!(!stack.tcp_retained(second));
+    assert!(stack.take_tcp_retention_change());
 }
 
 #[test]
@@ -255,6 +262,7 @@ fn reopened_tuple_does_not_reattribute_an_already_returned_packet() {
     c.stack.receive(closed + ms(1), &old_fin);
     let old_output = pull(&mut c.stack, closed + ms(1)).unwrap().0;
     assert_eq!(old_output.flow, Some(c.id));
+    assert!(!c.stack.take_tcp_retention_change());
     c.peer.seq += 100_000;
     c.peer.ts += 100;
     c.peer.syn(&mut c.stack, closed + ms(2), 1460);
@@ -262,6 +270,7 @@ fn reopened_tuple_does_not_reattribute_an_already_returned_packet() {
     assert_ne!(new, c.id);
     assert!(!c.stack.tcp_retained(c.id));
     assert!(c.stack.tcp_retained(new));
+    assert!(c.stack.take_tcp_retention_change());
     c.stack.tcp_accept(new, AcceptOpts::default()).unwrap();
     assert_eq!(
         pull(&mut c.stack, closed + ms(2)).unwrap().0.flow,
@@ -295,6 +304,7 @@ fn known_handshake_reset_is_attributed_but_an_unknown_flow_reset_is_not() {
     let (tx, packet) = pull(&mut stack, now + ms(1)).unwrap();
     assert_eq!(tx.flow, Some(id));
     assert_eq!(decode(&packet).h.flags, RST);
+    assert!(stack.take_tcp_retention_change());
     let unknown = build(
         addr("203.0.113.9:444"),
         syn.src,
@@ -311,4 +321,5 @@ fn known_handshake_reset_is_attributed_but_an_unknown_flow_reset_is_not() {
     let (tx, packet) = pull(&mut stack, now + ms(2)).unwrap();
     assert_eq!(tx.flow, None);
     assert_eq!(decode(&packet).h.flags, RST);
+    assert!(!stack.take_tcp_retention_change());
 }

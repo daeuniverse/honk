@@ -128,6 +128,7 @@ impl FlowIo {
                 slot.tx = None;
                 inner.pending_closes += 1;
                 inner.closed_apps += 1;
+                inner.reap_pending = true;
             }
         });
     }
