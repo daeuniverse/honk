@@ -236,6 +236,7 @@ impl UpstreamPool {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         let (outbound_name, evaluation_id) =
             if let Some(router) = self.traffic_router_snapshot.read().as_ref() {

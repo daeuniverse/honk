@@ -160,7 +160,25 @@ pub(crate) fn cases() -> Vec<ParsedCase> {
     cases.extend(destination_overlap_cases());
     cases.extend(cross_function_cases());
     cases.extend(scalar_cases());
+    cases.extend(user_cases());
     cases
+}
+
+/// `user()` goldens stay user-free: intercepted traffic never carries a
+/// user, so positive matchers fold false and negations fold true exactly
+/// like the native compiler lowering. Authenticated-flow matching is covered
+/// by userspace tests in `routing::tests`.
+fn user_cases() -> Vec<ParsedCase> {
+    vec![
+        ParsedCase::new("user-absent", "user(alice)").with(false, |_| {}),
+        ParsedCase::new("user-negated-absent", "!user(alice)").with(true, |_| {}),
+        ParsedCase::new("user-plus-port", "user(alice) && dport(8443)")
+            .with(false, |_| {})
+            .with(false, |c| c.dst_port = 8080),
+        ParsedCase::new("user-negated-plus-port", "!user(alice) && dport(8443)")
+            .with(true, |_| {})
+            .with(false, |c| c.dst_port = 8080),
+    ]
 }
 
 fn single_domain_cases() -> Vec<ParsedCase> {

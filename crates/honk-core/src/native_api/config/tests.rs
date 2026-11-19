@@ -609,6 +609,7 @@ async fn route(fixture: &Fixture, domain: &str, ip: &str) -> String {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         })
         .to_owned()
 }

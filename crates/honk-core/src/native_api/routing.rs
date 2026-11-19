@@ -120,6 +120,8 @@ impl TraceInput {
             process_name: self.pname.as_deref(),
             mac: None,
             dscp: self.dscp,
+            // Traced traffic is never SOCKS5-inbound, so no user is ever present.
+            user: None,
         }
     }
 }
