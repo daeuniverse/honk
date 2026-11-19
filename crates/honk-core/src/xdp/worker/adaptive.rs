@@ -49,7 +49,13 @@ impl WorkerRuntime {
             self.polling_prefix = ContextDigest::platform(&self.polling_budget);
         }
         for device in &mut self.devices {
+            if self.shared.is_closing() {
+                return;
+            }
             device.features = FeatureQuery::new(&device.info, &self.polling_budget).ok();
+        }
+        if self.shared.is_closing() {
+            return;
         }
         let context = (|| {
             let mut context = self.polling_prefix.clone()?;
@@ -139,25 +145,27 @@ impl WorkerRuntime {
         progressed
     }
 
-    pub(super) fn next_deadline(&self, now: Instant) -> Option<Instant> {
+    pub(super) fn needs_service_retry(&self) -> bool {
+        self.devices
+            .iter()
+            .flat_map(|device| &device.queues)
+            .any(|queue| queue.io.get_ref().needs_service_retry())
+    }
+
+    pub(super) fn next_deadline(&self, now: Instant, retry: bool) -> Option<Instant> {
         self.realms
             .iter()
             .filter_map(|realm| realm.driver.deadline())
-            .chain(
-                self.devices
-                    .iter()
-                    .flat_map(|device| &device.queues)
-                    .filter(|queue| queue.io.get_ref().needs_service_retry())
-                    .map(|_| now + Duration::from_millis(1)),
-            )
+            .chain(retry.then(|| now + Duration::from_millis(1)))
             .min()
     }
 
     pub(super) fn poll_service(&mut self, cx: &mut Context<'_>) -> anyhow::Result<bool> {
+        if self.shared.is_closing() {
+            return Ok(false);
+        }
         self.polling.synchronize();
-        if !self.closing
-            && (self.context_revision != self.polling.revision() || self.context_recheck)
-        {
+        if self.context_revision != self.polling.revision() || self.context_recheck {
             self.rebuild_polling_context();
         }
         self.shared.apply_polling_context(1, &mut self.polling);
@@ -168,13 +176,20 @@ impl WorkerRuntime {
             return Ok(true);
         }
         let initial = self.poll(cx, None)?;
+        if self.shared.is_closing() {
+            return Ok(initial);
+        }
         self.observe_round();
-        if self.closing || self.shutdown.requested() || self.context_recheck {
+        if !self.shared.admission.load(Ordering::Acquire)
+            || self.shutdown.requested()
+            || self.context_recheck
+        {
             self.polling.leave("closing_or_clock_change");
             return Ok(initial);
         }
         let now = Instant::now();
-        let deadline = self.next_deadline(now);
+        let pollable = self.needs_service_retry();
+        let deadline = self.next_deadline(now, pollable);
         let deadline_ns = deadline
             .zip(self.polling.last_clock)
             .and_then(|(due, clock)| {
@@ -182,16 +197,14 @@ impl WorkerRuntime {
                     .ok()
                     .and_then(|left| clock.boot_ns.checked_add(left))
             });
-        let pollable = self
-            .devices
-            .iter()
-            .flat_map(|device| &device.queues)
-            .any(|queue| queue.io.get_ref().needs_service_retry());
         let Some(interval) = self.polling.begin(pollable, deadline_ns) else {
             return Ok(initial);
         };
         let mut failure = None;
-        let reason = loop {
+        let reason = 'busy: loop {
+            if self.shared.is_closing() {
+                break "closing";
+            }
             if let Some(reason) =
                 polling_segment_stop(&self.polling, Some(&interval), &self.shutdown, deadline)
             {
@@ -203,6 +216,9 @@ impl WorkerRuntime {
             }
             let mut changed = None;
             for device in &mut self.devices {
+                if self.shared.is_closing() {
+                    break 'busy "closing";
+                }
                 if let Some(reason) =
                     polling_segment_stop(&self.polling, Some(&interval), &self.shutdown, deadline)
                 {
@@ -230,10 +246,16 @@ impl WorkerRuntime {
                 self.context_recheck = true;
                 break reason;
             }
+            if self.shared.is_closing() {
+                break "closing";
+            }
             self.polling.enter();
             if let Err(error) = self.poll(cx, Some(&interval)) {
                 failure = Some(error);
                 break "device_failure";
+            }
+            if self.shared.is_closing() {
+                break "closing";
             }
             let progressed = self.observe_round();
             if self.context_recheck {
@@ -242,12 +264,7 @@ impl WorkerRuntime {
             if let Some(reason) = self.polling.probed(progressed) {
                 break reason;
             }
-            if !self
-                .devices
-                .iter()
-                .flat_map(|device| &device.queues)
-                .any(|queue| queue.io.get_ref().needs_service_retry())
-            {
+            if !self.needs_service_retry() {
                 break "no_pollable_work";
             }
         };

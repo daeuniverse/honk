@@ -143,6 +143,8 @@ Both actual Port capacity and scope frame/descriptor credit are reserved before 
 
 CPU and generated output share `Retained::Endpoint(OutputOwner)` and the same exact-scope mixed CQ batch return. TCP's retransmission ring and ACK lifetime remain separate from UMEM/CQ: ACK cannot release outstanding DMA ownership, and CQ cannot acknowledge TCP. Existing CPU backing and process-lifetime UMEM remain fully charged. This removes only one intermediate Endpoint CPU-IP-frame-to-UMEM copy for eligible generated output; TCP payload copying/checksums and socket/relay copies remain. It is not payload-copy-free TCP, universal UDP zero-copy, lower resident memory or a measured performance gain. The existing E3.1 driver handoff is unchanged.
 
+During physical XDP shutdown the driver discards queued, unpublished CPU output without filling the device. Published descriptors keep their original owners until a real completion; stopping a worker is not a substitute.
+
 Each physical XDP logical ingress uses one `PacketRealm` with one or two independent Stack owners.
 Queues belong permanently to `queue_id % workers`; TCP uses immutable keyed tuple
 placement and UDP uses client-address placement. Peer, DNS and UDP source identity

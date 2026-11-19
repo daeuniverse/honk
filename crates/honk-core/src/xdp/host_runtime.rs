@@ -174,27 +174,35 @@ impl HostRuntime {
         qualified: &mut u64,
         unavailable: &mut bool,
     ) -> anyhow::Result<usize> {
-        if !closing {
-            for watch in &self.watches {
-                arm_read(watch, cx)?;
-            }
-            self.capture.validate_current()?;
-            let capture = &self.capture;
-            check_metadata(
-                &mut self.metadata_checked,
-                packet_now,
-                &capture.private_device().name,
-                || capture.metadata_failures(),
-            )?;
-            arm_read(&self.queue.io, cx)?;
+        if closing {
+            self.pending = [None, None];
+            let port = self.queue.io.get_mut();
+            let completed = port.complete(release_completed).and_then(|completed| {
+                // The private Copy backend stays attached while its published TX drains.
+                port.kick_outstanding_tx()?;
+                Ok(completed)
+            });
+            let serviced = self.driver.service_closing(cx, packet_now);
+            return Ok(completed? + usize::from(serviced));
         }
+        for watch in &self.watches {
+            arm_read(watch, cx)?;
+        }
+        self.capture.validate_current()?;
+        let capture = &self.capture;
+        check_metadata(
+            &mut self.metadata_checked,
+            packet_now,
+            &capture.private_device().name,
+            || capture.metadata_failures(),
+        )?;
+        arm_read(&self.queue.io, cx)?;
         if self.generated.is_some() {
             self.driver.begin_turn(packet_now);
         }
         let work = self.service(
             cx,
             packet_now,
-            closing,
             endpoints,
             staging,
             pressure,
@@ -212,7 +220,6 @@ impl HostRuntime {
         &mut self,
         cx: &mut Context<'_>,
         packet_now: Instant,
-        closing: bool,
         endpoints: &PacketEndpoints,
         staging: &mut [u8],
         pressure: &mut PressureCounters,
@@ -227,8 +234,7 @@ impl HostRuntime {
         let generated = self.generated;
         let tx_class = &mut self.tx_class;
         let (work, kick) = port.transmit_batch(|port| -> anyhow::Result<usize> {
-            let mut serviced = 0;
-            if !closing {
+            let mut serviced = {
                 let mut failure = None;
                 let received = port.receive_segments_with(
                     BATCH,
@@ -319,8 +325,8 @@ impl HostRuntime {
                         Err(rx) => error.context(rx).context("Host RX also failed"),
                     });
                 }
-                serviced += received?;
-            }
+                received?
+            };
             if generated.is_none() && driver.service(cx, packet_now) {
                 serviced += 1;
             }
@@ -332,11 +338,7 @@ impl HostRuntime {
                 *tx_class = (index + 1) % 2;
                 let mut considered = 0;
                 while considered < BATCH {
-                    let capacity = if closing {
-                        BATCH - considered
-                    } else {
-                        port.tx_packet_capacity(class)?
-                    };
+                    let capacity = port.tx_packet_capacity(class)?;
                     let selected = if let Some(output) = pending[index].take() {
                         outputs[0] = Some(output);
                         Poll::Ready(Some(1))
@@ -346,11 +348,11 @@ impl HostRuntime {
                     };
                     let count = match selected {
                         Poll::Ready(Some(count)) => count,
-                        Poll::Ready(None) if !closing && !endpoints.is_closing() => {
+                        Poll::Ready(None) if !endpoints.is_closing() => {
                             anyhow::bail!("Host packet scope ended before endpoint close")
                         }
                         _ => {
-                            let Some(max_length) = generated.filter(|_| !closing) else {
+                            let Some(max_length) = generated else {
                                 break;
                             };
                             let mut emitted = false;
@@ -400,10 +402,6 @@ impl HostRuntime {
                     let mut blocked = false;
                     for output in &mut outputs[..count] {
                         let output = output.take().expect("selected Host Endpoint output");
-                        if closing {
-                            serviced += 1;
-                            continue;
-                        }
                         let length = RETURN_HEADER + output.packet().len();
                         if count == 1 && !port.tx_packet_credit(class, length) {
                             pending[index] = Some(output);

@@ -368,6 +368,7 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     driven_test=xdp::tests::driven_kernel::policy_publication_keeps_real_endpoint_app_timer_and_close_owned
     multiqueue_test=xdp::tests::driven_kernel::two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned
     adaptive_test=xdp::tests::driven_kernel::adaptive::actual_owner_clock_budget_fairness_and_live_features
+    detach_test=xdp::tests::driven_kernel::gateway::gateway_close_detaches_links_after_backend_unregister_timeout
     full_gateway_test=xdp::gateway::policy::tests::kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets
     for test in \
         control::core_forward::tests::firewall_capacity_refusal_keeps_packet_owner_alive \
@@ -375,10 +376,12 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
         control::core_forward::tests::generated_reassembly_error_keeps_scoped_nat_and_funding_through_completion \
         control::core_forward::tests::plain_output_history_survives_first_nat_enable_and_cq_owners \
         control::core_forward::tests::unbound_native_quote_cannot_authorize_a_reused_nat_identity \
-        "$full_gateway_test" "$driven_test" "$multiqueue_test" "$adaptive_test"; do
+        "$full_gateway_test" "$detach_test" "$driven_test" "$multiqueue_test" "$adaptive_test"; do
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
     done
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$full_gateway_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/gateway-full-program.log"
+    mkdir "$work/detach-timeout"
+    ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work/detach-timeout" "$HONK_XDP_CORE_TEST_BIN" "$detach_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/detach-timeout/result.log"
     retention_test=xdp::tests::retention::gateway_hold_retains_real_queued_exported_and_cq_output
     [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --list --format terse) == "$retention_test: test" ]] || fail "missing Core retention regression: $retention_test"
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --test-threads=1 --nocapture | tee "$work/gateway-retention.log"

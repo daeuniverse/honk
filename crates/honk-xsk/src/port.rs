@@ -1425,6 +1425,15 @@ impl<L> Port<L> {
         rx.and(tx)
     }
 
+    /// Service only TX NEED_WAKEUP after consuming available CQ entries.
+    /// Published descriptors awaiting completion remain eligible after [`Self::close`].
+    pub fn kick_outstanding_tx(&mut self) -> io::Result<()> {
+        if self.counters.submitted == self.counters.completed {
+            return Ok(());
+        }
+        self.kick_tx()
+    }
+
     pub fn outstanding(&self) -> impl Iterator<Item = OutstandingTx<u32>> + '_ {
         self.ledger.outstanding_tx()
     }
@@ -3391,6 +3400,50 @@ mod tests {
         port.rings.cq.publish_producer(1);
         assert_eq!(port.complete(|_| {}).unwrap(), 1);
         assert_eq!(drops.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn outstanding_tx_kick_follows_cq_debt_and_skips_rx_wakeup() {
+        let budget = MemoryBudget::new(1 << 20);
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut port = fake(config(), &budget);
+        for class in [TxClass::Bulk, TxClass::Control] {
+            port.transmit_retained(class, &[0; 14], Retained::new(&drops))
+                .unwrap();
+        }
+        port.close();
+        port.rings.tx.publish_consumer(2);
+        port.rings.cq.write(0, port.rings.tx.read(0).addr);
+        port.rings.cq.publish_producer(1);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 1)).unwrap(),
+            1
+        );
+
+        port.rings.fill.set_wakeup();
+        port.kick_outstanding_tx().unwrap();
+        port.rings.tx.set_wakeup();
+        assert_eq!(
+            port.kick_outstanding_tx().unwrap_err().raw_os_error(),
+            Some(libc::EBADF)
+        );
+        assert_eq!(port.counters().rx_kicks, 0);
+        assert_eq!(port.counters().tx_kicks, 1);
+        assert_eq!(port.counters().wakeup_errors, 1);
+        assert_eq!(port.counters().completed, 1);
+        assert_eq!(port.outstanding().count(), 1);
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+
+        port.rings.cq.write(1, port.rings.tx.read(1).addr);
+        port.rings.cq.publish_producer(2);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 1)).unwrap(),
+            1
+        );
+        let drained = port.counters();
+        port.kick_outstanding_tx().unwrap();
+        assert_eq!(port.counters(), drained);
+        assert_eq!(drops.load(Ordering::Relaxed), 2);
     }
 
     #[test]

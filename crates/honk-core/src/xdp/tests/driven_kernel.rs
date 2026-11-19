@@ -481,7 +481,7 @@ async fn start_runtime(
                     queues: device.info.queues.last().copied().context("RX queues")? + 1,
                     ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
                 },
-            );
+            )?;
         }
         device.active = true;
     }
@@ -801,7 +801,12 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         }
         reader.set(None);
         timer.set(None);
-        runtime.close_capture()?;
+        runtime.close_capture(&backend).await?;
+        let wakeups = |runtime: &Runtime| runtime.devices.iter().flat_map(|device| &device.queues).map(|queue| {
+            let counters = queue.io.get_ref().counters();
+            (counters.rx_kicks, counters.tx_kicks)
+        }).collect::<Vec<_>>();
+        let after_detach = wakeups(&runtime);
         peer.command("STOP", "owned").await?;
         peer.expect("STOPPED owned").await?;
         let mut warned = false;
@@ -820,6 +825,7 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
             &mut warned,
         ).await?;
         if let Some(worker) = &mut runtime.worker { worker.join().await?; }
+        assert_eq!(wakeups(&runtime), after_detach, "physical wakeup after detach");
         for device in &mut runtime.devices {
             assert!(honk_xsk::xdp_absent(device.info.ifindex)?);
             for queue in device.queues.drain(..) {

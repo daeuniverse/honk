@@ -368,10 +368,28 @@ pub(super) struct Envelope {
     pub(super) payload: Payload,
 }
 
+#[derive(Clone, Copy, Default)]
+enum Drain {
+    #[default]
+    Unarmed,
+    Until(Instant),
+    Revoked,
+    Quiesced,
+}
+
+impl Drain {
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct State {
     ready: bool,
-    closing: bool,
+    drain: Drain,
     stop: bool,
     exited: bool,
     failure: Option<anyhow::Error>,
@@ -383,6 +401,7 @@ pub(super) struct Shared {
     states: [Mutex<State>; 2],
     wake: [Arc<Notify>; 2],
     admission: Arc<AtomicBool>,
+    closing: AtomicBool,
     peers: Arc<PeerAuthority>,
     pub(super) workers: u8,
     pub(super) placements: Mutex<Vec<Placement>>,
@@ -410,6 +429,7 @@ impl Shared {
                 wake: std::array::from_fn(|_| Arc::new(Notify::new())),
                 peers: PeerAuthority::new(Arc::clone(&admission)),
                 admission,
+                closing: AtomicBool::new(false),
                 workers,
                 placements: Mutex::new(Vec::with_capacity(64)),
                 wakers: std::array::from_fn(|_| futures::task::AtomicWaker::new()),
@@ -451,14 +471,70 @@ impl Shared {
         self.wakers[worker].wake();
     }
 
-    pub(super) fn close(&self) {
+    fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub(super) fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
         self.admission.store(false, Ordering::Release);
-        for (state, wake) in self.states.iter().zip(&self.wake) {
-            state.lock().closing = true;
-            wake.notify_one();
+        self.wake_worker(0);
+        self.wake_worker(1);
+    }
+
+    pub(super) fn close(&self) {
+        self.states[1].lock().drain = Drain::Revoked;
+        self.begin_close();
+    }
+
+    pub(super) fn quiesce(&self, deadline: Instant) {
+        let mut state = self.states[1].lock();
+        if matches!(state.drain, Drain::Unarmed) {
+            state.drain = Drain::Until(deadline);
         }
-        for waker in &self.wakers {
-            waker.wake();
+        drop(state);
+        self.begin_close();
+    }
+
+    fn can_kick_outstanding(&self) -> bool {
+        let state = self.states[1].lock();
+        state.failure.is_none()
+            && state
+                .drain
+                .deadline()
+                .is_some_and(|deadline| Instant::now() < deadline)
+    }
+
+    fn acknowledge_quiescence(&self) {
+        let mut state = self.states[1].lock();
+        if state.failure.is_none()
+            && state
+                .drain
+                .deadline()
+                .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            state.drain = Drain::Quiesced;
+            drop(state);
+            self.wake_worker(0);
+        }
+    }
+
+    pub(super) fn poll_quiesced(&self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        if self.workers == 1 {
+            return Poll::Ready(Ok(()));
+        }
+        self.wakers[0].register(cx.waker());
+        let state = self.states[1].lock();
+        if let Some(error) = &state.failure {
+            Poll::Ready(Err(anyhow::anyhow!("{error:#}")))
+        } else if matches!(state.drain, Drain::Quiesced) {
+            Poll::Ready(Ok(()))
+        } else if state.exited {
+            Poll::Ready(Err(anyhow::anyhow!(
+                "XDP worker 1 exited before quiescence"
+            )))
+        } else {
+            Poll::Pending
         }
     }
 
@@ -716,7 +792,6 @@ struct WorkerRuntime {
     staging: Vec<u8>,
     sampled: Instant,
     closing: bool,
-    stop: bool,
     polling: AdaptivePoll,
     polling_budget: Arc<MemoryBudget>,
     polling_prefix: Result<ContextDigest, &'static str>,
@@ -801,7 +876,6 @@ impl Worker {
                         staging: vec![0; 65536],
                         sampled: Instant::now(),
                         closing: false,
-                        stop: false,
                         polling,
                         polling_prefix: ContextDigest::platform(&polling_budget),
                         polling_budget,
@@ -855,7 +929,7 @@ impl Worker {
     pub(super) async fn join(&mut self) -> anyhow::Result<()> {
         {
             let mut state = self.shared.states[1].lock();
-            state.closing = true;
+            self.shared.closing.store(true, Ordering::Release);
             state.stop = true;
         }
         self.shared.wake_worker(1);

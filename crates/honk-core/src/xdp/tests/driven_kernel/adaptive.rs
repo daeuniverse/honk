@@ -1001,7 +1001,7 @@ async fn serve(
         }
         if (failure.is_some() || shutdown.requested()) && !runtime.closing {
             reader.set(None);
-            if let Err(error) = runtime.close_capture() {
+            if let Err(error) = runtime.close_capture(&backend).await {
                 failure.get_or_insert(error);
             }
         }
@@ -1057,7 +1057,7 @@ async fn serve(
                 match joined {
                     Ok(Some(joined)) => {
                         reader.set(None);
-                        if let Err(error) = runtime.close_capture() { failure.get_or_insert(error); }
+                        if let Err(error) = runtime.close_capture(&backend).await { failure.get_or_insert(error); }
                         joined_plane = Some(joined);
                         break;
                     }

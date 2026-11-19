@@ -550,6 +550,88 @@ fn peer_unwind_closes_common_admission_before_refunding_identity() {
 }
 
 #[tokio::test]
+async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let admission = Arc::new(AtomicBool::new(true));
+    let (shared, [_, receiver]) = Shared::new(2, 128, 2, &budget, Arc::clone(&admission)).unwrap();
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap().clone();
+    let config = Config::default();
+    let polling = AdaptivePoll::new(polling::PollingPublication::new(&config), None);
+    let plane = crate::control::tests::support::control_plane(config);
+    let shutdown = plane.shutdown_intent();
+    let (endpoints, supervisor) =
+        PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 4)
+            .await
+            .unwrap();
+
+    shared.begin_close();
+    assert!(!admission.load(Ordering::Acquire));
+    let quiescing = poll_fn(|cx| shared.poll_quiesced(cx));
+    tokio::pin!(quiescing);
+    assert!(futures::poll!(quiescing.as_mut()).is_pending());
+
+    let mut worker = Worker::start(
+        Arc::clone(&shared),
+        &mut [],
+        Vec::new(),
+        endpoints.clone(),
+        receiver,
+        false,
+        polling,
+        budget,
+        shutdown,
+    )
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), shared.senders[1].closed())
+        .await
+        .unwrap();
+    assert!(futures::poll!(quiescing.as_mut()).is_pending());
+    shared.quiesce(Instant::now() + Duration::from_secs(5));
+    tokio::time::timeout(Duration::from_secs(5), quiescing)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let rejected = shared.send(1, envelope(&shared, 7, scope.scope(), Instant::now()));
+    assert!(rejected.is_err());
+    assert!(!shared.states[1].lock().exited);
+    endpoints.close();
+    supervisor.run().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), worker.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[test]
+fn emergency_close_revokes_worker_drain_permission() {
+    let budget = MemoryBudget::new(32 << 20);
+    let (shared, _) = Shared::new(2, 128, 2, &budget, Arc::new(AtomicBool::new(true))).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    shared.quiesce(deadline);
+    assert!(shared.can_kick_outstanding());
+
+    shared.close();
+    shared.quiesce(deadline);
+    assert!(!shared.can_kick_outstanding());
+    shared.acknowledge_quiescence();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(shared.poll_quiesced(&mut cx).is_pending());
+}
+
+#[test]
+fn elapsed_quiesce_deadline_prevents_a_late_acknowledgement() {
+    let budget = MemoryBudget::new(32 << 20);
+    let (shared, _) = Shared::new(2, 128, 2, &budget, Arc::new(AtomicBool::new(true))).unwrap();
+    shared.quiesce(Instant::now());
+    assert!(!shared.can_kick_outstanding());
+    shared.acknowledge_quiescence();
+    let mut cx = Context::from_waker(std::task::Waker::noop());
+    assert!(shared.poll_quiesced(&mut cx).is_pending());
+}
+
+#[tokio::test]
 async fn failed_retained_worker_reports_before_joining_its_live_thread() {
     let budget = MemoryBudget::new(32 << 20);
     let (shared, _) = Shared::new(2, 128, 2, &budget, Arc::new(AtomicBool::new(true))).unwrap();
@@ -569,6 +651,10 @@ async fn failed_retained_worker_reports_before_joining_its_live_thread() {
         shared: Arc::clone(&shared),
         thread: Some(thread),
     };
+    shared.quiesce(Instant::now() + Duration::from_secs(5));
+    let quiescing = poll_fn(|cx| shared.poll_quiesced(cx));
+    tokio::pin!(quiescing);
+    assert!(futures::poll!(quiescing.as_mut()).is_pending());
     let result = {
         let joining = worker.join();
         tokio::pin!(joining);
@@ -578,7 +664,10 @@ async fn failed_retained_worker_reports_before_joining_its_live_thread() {
         })
         .await;
         fail.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), joining.as_mut()).await
+        tokio::time::timeout(Duration::from_secs(1), async {
+            (quiescing.as_mut().await, joining.as_mut().await)
+        })
+        .await
     };
     let retained_thread = worker
         .thread
@@ -593,14 +682,15 @@ async fn failed_retained_worker_reports_before_joining_its_live_thread() {
             .unwrap()
             .unwrap();
     }
-    let error = result
-        .expect("failure notification must not wait for retained thread exit")
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("injected retained worker failure")
-    );
+    let (quiesced, joined) = result.expect("failure must wake both waits before thread exit");
+    for result in [quiesced, joined] {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("injected retained worker failure")
+        );
+    }
     assert!(
         retained_thread && still_nonterminal,
         "failure keeps the actual live thread in its owner"

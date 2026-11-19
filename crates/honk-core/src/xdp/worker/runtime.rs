@@ -5,6 +5,10 @@ impl WorkerRuntime {
         for device in &mut self.devices {
             let prepared = std::mem::take(&mut device.queues);
             for queue in prepared {
+                if self.shared.is_closing() {
+                    device.queues.push(queue);
+                    continue;
+                }
                 let Queue {
                     id,
                     io,
@@ -12,8 +16,12 @@ impl WorkerRuntime {
                     observed_rings,
                 } = queue;
                 let mut io = io.register()?;
-                io.get_mut().refill()?;
-                io.get_mut().kick()?;
+                if !self.shared.is_closing() {
+                    io.get_mut().refill()?;
+                }
+                if !self.shared.is_closing() {
+                    io.get_mut().kick()?;
+                }
                 device.queues.push(Queue {
                     id,
                     io,
@@ -30,26 +38,23 @@ impl WorkerRuntime {
         tokio::pin!(timer);
         loop {
             notification.as_mut().enable();
-            let serviced = poll_fn(|cx| {
-                self.closing = self.shared.states[1].lock().closing;
-                self.stop = self.shared.states[1].lock().stop;
-                let mut progress = self.poll_service(cx)?;
-                if self.closing && self.stop && self.drained() {
-                    for device in &mut self.devices {
-                        for queue in &mut device.queues {
-                            if !queue.io.get_mut().close().ready_for_backend_teardown() {
-                                return Poll::Ready(Err(anyhow::anyhow!(
-                                    "worker 1 Port ownership is not terminal"
-                                )));
-                            }
-                        }
-                        for queue in device.queues.drain(..) {
-                            let mut port = queue.io.into_inner();
-                            port.close_socket();
-                        }
+            let serviced = poll_fn(|cx| -> Poll<anyhow::Result<bool>> {
+                let (closing, stop, drain_until) = {
+                    let state = self.shared.states[1].lock();
+                    (self.shared.is_closing(), state.stop, state.drain.deadline())
+                };
+                let (mut progress, outstanding) = if closing {
+                    let draining = drain_until.is_some_and(|deadline| Instant::now() < deadline);
+                    let (progress, outstanding, mailbox_closed) =
+                        self.poll_closing(cx, draining)?;
+                    if stop && !outstanding && mailbox_closed {
+                        self.close_sockets()?;
+                        return Poll::Ready(Ok(false));
                     }
-                    return Poll::Ready(Ok(false));
-                }
+                    (progress, outstanding)
+                } else {
+                    (self.poll_service(cx)?, false)
+                };
                 if notification.as_mut().poll(cx).is_ready() {
                     notification.set(wake.notified());
                     progress = true;
@@ -58,7 +63,16 @@ impl WorkerRuntime {
                     return Poll::Ready(Ok(true));
                 }
                 let now = Instant::now();
-                let deadline = self.next_deadline(now);
+                let retry = if closing {
+                    outstanding
+                } else {
+                    self.needs_service_retry()
+                };
+                let deadline = self
+                    .next_deadline(now, retry)
+                    .into_iter()
+                    .chain(drain_until.filter(|&deadline| outstanding && now < deadline))
+                    .min();
                 poll_deadline(timer.as_mut(), deadline, now, cx).map(|()| Ok(true))
             })
             .await?;
@@ -69,21 +83,92 @@ impl WorkerRuntime {
         }
     }
 
-    fn drained(&self) -> bool {
-        self.receiver.is_empty()
-            && self
+    fn poll_closing(
+        &mut self,
+        cx: &mut Context<'_>,
+        draining: bool,
+    ) -> anyhow::Result<(bool, bool, bool)> {
+        let entering = !self.closing;
+        if entering {
+            self.closing = true;
+            self.receiver.close();
+            self.polling.leave("closing");
+            for queue in self
                 .devices
-                .iter()
-                .flat_map(|device| &device.queues)
-                .all(|queue| {
-                    let port = queue.io.get_ref();
-                    let rings = port.rings();
-                    rings.rx_producer == rings.rx_consumer
-                        && rings.cq_producer == rings.cq_consumer
-                        && port.counters().submitted == port.counters().completed
-                        && port.retained_rx_count() == 0
-                        && port.rx_completion_count() == 0
-                })
+                .iter_mut()
+                .flat_map(|device| &mut device.queues)
+            {
+                queue.io.get_mut().close();
+            }
+        }
+
+        let mut progress = false;
+        let mut outstanding = false;
+        for queue in self
+            .devices
+            .iter_mut()
+            .flat_map(|device| &mut device.queues)
+        {
+            let port = queue.io.get_mut();
+            progress |= port.complete(release_completed)? != 0;
+            let counters = port.counters();
+            if counters.submitted != counters.completed {
+                outstanding = true;
+                // Check permission per attempt without holding the status lock over the syscall.
+                if draining && self.shared.can_kick_outstanding() {
+                    port.kick_outstanding_tx()?;
+                }
+            }
+        }
+        if draining && !outstanding {
+            self.shared.acknowledge_quiescence();
+        }
+
+        let mut mailbox_closed = false;
+        for _ in 0..BATCH {
+            match self.receiver.poll_recv(cx) {
+                Poll::Ready(Some(_)) => progress = true,
+                Poll::Ready(None) => {
+                    mailbox_closed = true;
+                    break;
+                }
+                Poll::Pending => break,
+            }
+        }
+        let now = Instant::now();
+        for realm in &mut self.realms {
+            if entering {
+                realm.pending = [None, None];
+            }
+            progress |= realm.driver.service_closing(cx, now);
+        }
+        Ok((progress, outstanding, mailbox_closed))
+    }
+
+    fn close_sockets(&mut self) -> anyhow::Result<()> {
+        for device in &self.devices {
+            for queue in &device.queues {
+                ensure!(
+                    queue
+                        .io
+                        .get_ref()
+                        .drain_state()
+                        .ready_for_backend_teardown(),
+                    "XDP worker 1 device {} queue {} ownership is not terminal",
+                    device.info.name,
+                    queue.id
+                );
+            }
+        }
+        for queue in self
+            .devices
+            .iter_mut()
+            .flat_map(|device| device.queues.drain(..))
+        {
+            let mut port = queue.io.into_inner();
+            port.close_socket();
+        }
+        Ok(())
     }
 
     pub(super) fn poll(
@@ -94,8 +179,11 @@ impl WorkerRuntime {
         let now = Instant::now();
         self.shared.wakers[1].register(cx.waker());
         let mut progress = false;
-        let deadline = self.next_deadline(now);
+        let deadline = interval.and_then(|_| self.next_deadline(now, self.needs_service_retry()));
         for _ in 0..BATCH {
+            if self.shared.is_closing() {
+                return Ok(progress);
+            }
             if polling_segment_stop(&self.polling, interval, &self.shutdown, deadline).is_some() {
                 break;
             }
@@ -108,32 +196,25 @@ impl WorkerRuntime {
                 Payload::Endpoint { owner, admission } => (owner, admission),
                 _ => anyhow::bail!("worker 1 received coordinator-only ingress"),
             };
-            let mut report = PacketReceive::default();
-            let mut failed = None;
-            if !self.closing {
-                match self.shared.receive(
-                    &self.endpoints,
-                    &owner,
-                    envelope.ip(),
-                    envelope.ingress_at,
-                    now,
-                    envelope.path,
-                    admission,
-                ) {
-                    Ok(received) => report = received,
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
-                        ) => {}
-                    Err(error) => failed = Some(error),
+            match self.shared.receive(
+                &self.endpoints,
+                &owner,
+                envelope.ip(),
+                envelope.ingress_at,
+                now,
+                envelope.path,
+                admission,
+            ) {
+                Ok(report) if report.qualified_rx => {
+                    qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
                 }
-            }
-            if report.qualified_rx {
-                qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
-            }
-            if let Some(error) = failed {
-                return Err(error.into());
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory
+                    ) => {}
+                Err(error) => return Err(error.into()),
             }
             progress = true;
         }
@@ -144,6 +225,9 @@ impl WorkerRuntime {
             let device = &mut self.devices[device_index];
             let start_queue = if offset == 0 { self.rx_queue } else { 0 };
             for offset in 0..device.queues.len() {
+                if self.shared.is_closing() {
+                    return Ok(progress);
+                }
                 if polling_segment_stop(&self.polling, interval, &self.shutdown, deadline).is_some()
                 {
                     break;
@@ -159,7 +243,7 @@ impl WorkerRuntime {
                 arm_read(&queue.io, cx)?;
                 let port = queue.io.get_mut();
                 progress |= port.complete(release_completed)? != 0;
-                if !self.closing && self.shared.admission.load(Ordering::Acquire) {
+                if self.shared.admission.load(Ordering::Acquire) && !self.shared.is_closing() {
                     let shared = &self.shared;
                     let endpoints = &self.endpoints;
                     let staging = &mut self.staging;
@@ -294,23 +378,21 @@ impl WorkerRuntime {
                         return Err(error.into());
                     }
                 }
-                if self.closing {
-                    progress |= port.receive_segments_with(
-                        BATCH,
-                        if device.capture.vlan_metadata {
-                            METADATA_LEN
-                        } else {
-                            0
-                        },
-                        |_, _, _| {},
-                    )? != 0;
+                if self.shared.is_closing() {
+                    return Ok(progress);
                 }
                 port.refill()?;
+                if self.shared.is_closing() {
+                    return Ok(progress);
+                }
                 port.kick()?;
             }
         }
         let start_realm = self.tx_realm;
         for offset in 0..self.realms.len() {
+            if self.shared.is_closing() {
+                return Ok(progress);
+            }
             if polling_segment_stop(&self.polling, interval, &self.shutdown, deadline).is_some() {
                 break;
             }
@@ -319,13 +401,18 @@ impl WorkerRuntime {
             let realm = &mut self.realms[realm_index];
             if realm.members.len() > 1 {
                 realm.driver.service(cx, now);
+                if self.shared.is_closing() {
+                    return Ok(progress);
+                }
                 let devices = &mut self.devices;
                 progress |= service_member_output(
                     realm,
                     cx,
-                    self.closing,
                     &self.endpoints,
                     |realm, class, path, output| {
+                        if self.shared.is_closing() {
+                            return Ok(Some(output));
+                        }
                         let device = devices
                             .iter_mut()
                             .find(|device| device.index == path.device)
@@ -363,8 +450,8 @@ impl WorkerRuntime {
                 queue.io.get_mut(),
                 cx,
                 now,
-                self.closing,
                 &self.endpoints,
+                &self.shared,
             )? != 0;
         }
         if now.saturating_duration_since(self.sampled) >= Duration::from_secs(1) {
@@ -373,6 +460,9 @@ impl WorkerRuntime {
                 let mut base = 0;
                 for device in &self.devices {
                     for queue in &device.queues {
+                        if self.shared.is_closing() {
+                            return Ok(progress);
+                        }
                         let index = device
                             .info
                             .queues
@@ -400,37 +490,38 @@ fn service_output(
     port: &mut Port<Retained>,
     cx: &mut Context<'_>,
     now: Instant,
-    closing: bool,
     endpoints: &PacketEndpoints,
+    shared: &Shared,
 ) -> anyhow::Result<usize> {
     if realm.generated.is_some() {
         realm.driver.begin_turn(now);
     } else {
         realm.driver.service(cx, now);
     }
+    if shared.is_closing() {
+        if realm.generated.is_some() {
+            realm.driver.finish_turn(cx, now);
+        }
+        return Ok(0);
+    }
     let (work, kick) = port.transmit_batch(|port| -> anyhow::Result<usize> {
         let mut serviced = 0;
         for (class_index, class) in [TxClass::Control, TxClass::Bulk].into_iter().enumerate() {
+            if shared.is_closing() {
+                break;
+            }
             let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
-            let capacity = if closing {
-                BATCH
-            } else {
-                port.tx_packet_capacity(class)?
-            };
+            let capacity = port.tx_packet_capacity(class)?;
             let (selected, pending_path) = realm.poll_outputs(cx, class, capacity, &mut outputs);
             let count = match selected {
                 Poll::Ready(Some(count)) => count,
-                Poll::Ready(None) if !closing && !endpoints.is_closing() => {
+                Poll::Ready(None) if !endpoints.is_closing() => {
                     anyhow::bail!("worker 1 Stack ended before common close")
                 }
                 _ => 0,
             };
             for output in &mut outputs[..count] {
                 let output = output.take().unwrap();
-                if closing {
-                    serviced += 1;
-                    continue;
-                }
                 let path = pending_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()));
                 let Some(path) = path else {
                     serviced += 1;
@@ -463,9 +554,6 @@ fn service_output(
                     },
                 )?;
                 serviced += 1;
-            }
-            if closing {
-                continue;
             }
             if let Some((_, max_length)) = realm.generated {
                 for _ in count..BATCH {

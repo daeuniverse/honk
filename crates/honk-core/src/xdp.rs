@@ -79,6 +79,7 @@ const PENDING: usize = 64;
 const PEERS: usize = 4096;
 const PEER_CONFLICT_HOLD: Duration = Duration::from_secs(60);
 const BATCH: usize = 32;
+const DETACH_BUDGET: Duration = Duration::from_millis(100);
 
 fn qualify_packet(count: &mut u64, unavailable: &mut bool) {
     match count.checked_add(1) {
@@ -613,10 +614,25 @@ fn fold_capture_result(failure: &mut Option<anyhow::Error>, result: anyhow::Resu
     }
 }
 
+fn joined_plane(
+    joined: anyhow::Result<(ControlPlane, anyhow::Result<()>)>,
+    failure: &mut Option<anyhow::Error>,
+) -> Option<ControlPlane> {
+    match joined {
+        Ok((plane, result)) => {
+            fold_capture_result(failure, result);
+            Some(plane)
+        }
+        Err(error) => {
+            fold_capture_result(failure, Err(error));
+            None
+        }
+    }
+}
+
 fn service_member_output(
     realm: &mut Realm,
     cx: &mut Context<'_>,
-    closing: bool,
     endpoints: &PacketEndpoints,
     mut submit: impl FnMut(&Realm, TxClass, ReturnPath, OutputLease) -> io::Result<Option<OutputLease>>,
 ) -> anyhow::Result<usize> {
@@ -627,18 +643,18 @@ fn service_member_output(
             let (selected, retained_path) = realm.poll_outputs(cx, class, 1, &mut outputs);
             match selected {
                 Poll::Ready(Some(1)) => {}
-                Poll::Ready(None) if !closing && !endpoints.is_closing() => {
+                Poll::Ready(None) if !endpoints.is_closing() => {
                     anyhow::bail!("XDP packet scope ended before endpoint close")
                 }
                 _ => break,
             }
             let output = outputs[0].take().expect("one selected Endpoint output");
-            let path = retained_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()));
-            if closing || path.is_none() {
+            let Some(path) =
+                retained_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()))
+            else {
                 serviced += 1;
                 continue;
-            }
-            let path = path.expect("checked retained return path");
+            };
             if let Some(output) = submit(realm, class, path, output)? {
                 realm.pending[index] = Some((output, path));
                 break;
@@ -839,31 +855,46 @@ impl Runtime {
         ready
     }
 
-    fn complete_transmit(&mut self) -> io::Result<bool> {
+    fn complete_physical_tx(&mut self, kick_until: Option<Instant>) -> io::Result<bool> {
         let queues = self
             .devices
             .iter_mut()
             .flat_map(|device| &mut device.queues);
-        #[cfg(feature = "ebpf")]
-        let queues = queues.chain(self.host.iter_mut().map(|host| &mut host.queue));
         let mut outstanding = false;
         for queue in queues {
             let port = queue.io.get_mut();
             port.complete(release_completed)?;
-            port.kick()?;
+            if kick_until.is_some_and(|deadline| Instant::now() < deadline) {
+                port.kick_outstanding_tx()?;
+            }
             outstanding |= port.counters().submitted != port.counters().completed;
         }
         Ok(outstanding)
     }
 
-    fn close_capture(&mut self) -> anyhow::Result<()> {
+    fn complete_transmit(&mut self) -> io::Result<bool> {
+        let outstanding = self.complete_physical_tx(None)?;
+        #[cfg(feature = "ebpf")]
+        if let Some(host) = &mut self.host {
+            let port = host.queue.io.get_mut();
+            port.complete(release_completed)?;
+            port.kick_outstanding_tx()?;
+            return Ok(outstanding || port.counters().submitted != port.counters().completed);
+        }
+        Ok(outstanding)
+    }
+
+    async fn close_capture(
+        &mut self,
+        backend: &tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>,
+    ) -> anyhow::Result<()> {
+        let deadline = Instant::now() + DETACH_BUDGET;
+        self.workers.begin_close();
         if self.topology_lost {
             for device in &mut self.devices {
                 device.vlan_offload.abandon();
             }
         }
-        self.admission.store(false, Ordering::Release);
-        self.workers.close();
         *self.pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
         self.closing = true;
         self.diagnostics.lifecycle(Lifecycle::Closing);
@@ -871,41 +902,84 @@ impl Runtime {
         self.context_recheck = false;
         self.polling.leave("closing");
         let mut failure: Option<anyhow::Error> = None;
+        if let Some(gateway) = &self.gateway
+            && !self.topology_lost
+        {
+            let unregister = async {
+                backend
+                    .write()
+                    .await
+                    .userspace_mut()?
+                    .install_gateway(None)?;
+                loop {
+                    match gateway.verify_attachments() {
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        result => break result.map_err(Into::into),
+                    }
+                }
+            };
+            let result = tokio::time::timeout_at(deadline.into(), unregister)
+                .await
+                .context("gateway publisher busy at physical detach deadline")
+                .and_then(|result| result);
+            fold_capture_result(&mut failure, result);
+        }
+        if self.topology_lost {
+            fold_capture_result(
+                &mut failure,
+                Err(anyhow::anyhow!("physical XDP topology lost before drain")),
+            );
+        }
+        for device in &mut self.devices {
+            if let Some(link) = &device.attachment {
+                let program = if device.active {
+                    device.programs.data_prog_id()
+                } else {
+                    device.programs.discover_prog_id()
+                };
+                fold_capture_result(&mut failure, link.verify(program).map_err(Into::into));
+            }
+            for id in &device.info.queues {
+                fold_capture_result(
+                    &mut failure,
+                    device.programs.delete_xsk(*id).map_err(Into::into),
+                );
+            }
+            for queue in &mut device.queues {
+                queue.io.get_mut().close();
+            }
+        }
+        if failure.is_none() {
+            self.workers.quiesce(deadline);
+            let workers = Arc::clone(&self.workers);
+            let has_worker = self.worker.is_some();
+            let result = drain_before_detach(
+                deadline,
+                || self.complete_physical_tx(Some(deadline)),
+                poll_fn(|cx| {
+                    if has_worker {
+                        workers.poll_quiesced(cx)
+                    } else {
+                        Poll::Ready(Ok(()))
+                    }
+                }),
+            )
+            .await;
+            fold_capture_result(&mut failure, result);
+        }
+        if failure.is_some() {
+            self.workers.close();
+        }
         if let Some(gateway) = &self.gateway {
             fold_capture_result(&mut failure, gateway.detach_all().map_err(Into::into));
         }
         for device in self.devices.iter_mut().rev() {
-            let result = close_device_capture_with(
-                device,
-                |device| {
-                    if let Some(link) = device.attachment.take() {
-                        link.detach()?;
-                    }
-                    device.active = false;
-                    Ok(())
-                },
-                |device| {
-                    let mut failure: Option<io::Error> = None;
-                    for queue in &device.info.queues {
-                        if let Err(error) = device.programs.delete_xsk(*queue) {
-                            failure = Some(match failure {
-                                Some(previous) => {
-                                    let kind = previous.kind();
-                                    let message =
-                                        format!("{previous}; XSK withdrawal also failed: {error}");
-                                    io::Error::new(
-                                        kind,
-                                        anyhow::Error::new(previous).context(message),
-                                    )
-                                }
-                                None => error,
-                            });
-                        }
-                    }
-                    failure.map_or(Ok(()), Err)
-                },
-            );
-            fold_capture_result(&mut failure, result.map_err(Into::into));
+            if let Some(link) = device.attachment.take() {
+                fold_capture_result(&mut failure, link.detach().map_err(Into::into));
+            }
+            device.active = false;
         }
         #[cfg(feature = "ebpf")]
         if let Some(host) = &mut self.host {
@@ -970,7 +1044,7 @@ impl Runtime {
         self.round_cut_short = false;
         let deadline = interval.and_then(|_| self.next_deadline(now, !reading));
         for realm in &mut self.realms {
-            if realm.generated.is_some() {
+            if !self.closing && realm.generated.is_some() {
                 realm.driver.begin_turn(now);
             }
         }
@@ -1020,9 +1094,11 @@ impl Runtime {
                         return Poll::Ready(Err(error.into()));
                     }
                 };
+                if self.closing {
+                    continue;
+                }
                 let mut backpressure = None;
                 let (received, kick) = port.transmit_batch(|port| {
-                    if self.closing { return Ok(0); }
                     let capture = &device.capture;
                     let core = &mut self.core;
                     let waiting = &mut self.waiting;
@@ -1181,7 +1257,7 @@ impl Runtime {
             )?;
         }
         for realm in &mut self.realms {
-            if realm.generated.is_none() && realm.driver.service(cx, now) {
+            if !self.closing && realm.generated.is_none() && realm.driver.service(cx, now) {
                 progress += 1;
             }
         }
@@ -1195,12 +1271,16 @@ impl Runtime {
             }
             let realm_count = self.realms.len();
             let realm = &mut self.realms[realm_index];
+            if self.closing {
+                progress += usize::from(realm.driver.service_closing(cx, now));
+                finalized[realm_index] = true;
+                continue;
+            }
             if realm.members.len() > 1 {
                 let devices = &mut self.devices;
                 progress += service_member_output(
                     realm,
                     cx,
-                    self.closing,
                     &self.endpoints,
                     |realm, class, path, output| {
                         let device = devices
@@ -1250,11 +1330,7 @@ impl Runtime {
                     serviced_classes += 1;
                     let mut considered = 0;
                     while considered < BATCH {
-                        let capacity = if self.closing {
-                            BATCH - considered
-                        } else {
-                            port.tx_packet_capacity(class)?
-                        };
+                        let capacity = port.tx_packet_capacity(class)?;
                         let (selected, pending_path) = realm.poll_outputs(
                             cx,
                             class,
@@ -1263,13 +1339,11 @@ impl Runtime {
                         );
                         let count = match selected {
                             Poll::Ready(Some(count)) => count,
-                            Poll::Ready(None) if !self.closing && !self.endpoints.is_closing() => {
+                            Poll::Ready(None) if !self.endpoints.is_closing() => {
                                 anyhow::bail!("XDP packet scope ended before endpoint close");
                             }
                             _ => {
-                                let Some((_, max_length)) =
-                                    realm.generated.filter(|_| !self.closing)
-                                else {
+                                let Some((_, max_length)) = realm.generated else {
                                     break;
                                 };
                                 let mut emitted = false;
@@ -1312,10 +1386,6 @@ impl Runtime {
                                 serviced += 1;
                                 continue;
                             };
-                            if self.closing {
-                                serviced += 1;
-                                continue;
-                            }
                             let header =
                                 realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
                             let length = header.len();
@@ -1843,27 +1913,6 @@ impl Drop for Runtime {
     }
 }
 
-fn close_device_capture_with<T>(
-    device: &mut T,
-    guard: impl FnOnce(&mut T) -> io::Result<()>,
-    withdraw: impl FnOnce(&mut T) -> io::Result<()>,
-) -> io::Result<()> {
-    let guarded = guard(device);
-    let withdrawn = withdraw(device);
-    match (guarded, withdrawn) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(guard), Err(withdraw)) => {
-            let kind = guard.kind();
-            let message = format!("{guard}; XSK withdrawal also failed: {withdraw}");
-            Err(io::Error::new(
-                kind,
-                anyhow::Error::new(guard).context(message),
-            ))
-        }
-    }
-}
-
 fn l3_segments<'a>(
     segments: &[&'a [u8]],
     packet: DecodedPacket,
@@ -2276,6 +2325,24 @@ fn check_metadata(
         failures == 0,
         "XDP device {name} cannot carry capture metadata (bpf_xdp_adjust_meta unsupported); capture failed closed"
     );
+    Ok(())
+}
+
+async fn drain_before_detach(
+    deadline: Instant,
+    mut outstanding: impl FnMut() -> io::Result<bool>,
+    worker: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<()> {
+    let local = async {
+        while outstanding()? {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok(())
+    };
+    // The deadline bounds retries, not an in-flight syscall. A timeout is never a CQ or an ACK.
+    tokio::time::timeout_at(deadline.into(), async { tokio::try_join!(local, worker) })
+        .await
+        .context("physical XDP transmit/worker quiescence timed out before detach")??;
     Ok(())
 }
 
@@ -2706,7 +2773,7 @@ async fn run_capture(
                             queues,
                             ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
                         },
-                    );
+                    )?;
                 }
             }
             if let Some(publisher) = &runtime.gateway {
@@ -2754,58 +2821,13 @@ async fn run_capture(
         }
     }
     let mut warned = false;
-    let mut close_started = None;
     // One clone of the existing registration; each acquisition yields real guards only.
     let authority = runtime.core.as_ref().map(RoutedCore::authority);
     let reader = None;
     tokio::pin!(reader);
     let joined = loop {
-        if (failure.is_some() || shutdown.requested()) && !runtime.closing {
-            // Cleanup never resolves Core again; a queued reader must not stall publication.
-            reader.set(None);
-            if let Some(publisher) = &runtime.gateway {
-                let mut backend = backend.write().await;
-                if let Err(error) = backend
-                    .userspace_mut()
-                    .and_then(|backend| backend.install_gateway(None))
-                {
-                    failure.get_or_insert(error);
-                }
-                if let Err(error) = publisher.detach_all() {
-                    failure.get_or_insert(error.into());
-                }
-            }
-            if let Err(error) = runtime.close_capture() {
-                failure.get_or_insert(error);
-            }
-            close_started = Some(Instant::now());
-        }
-        if runtime.closing {
-            match join_endpoints(
-                &mut owner,
-                |cx| {
-                    runtime.poll_service(
-                        cx,
-                        &shutdown,
-                        timer.as_mut(),
-                        false,
-                        notification.as_mut(),
-                    )
-                },
-                close_started.unwrap(),
-                &mut warned,
-            )
-            .await
-            {
-                Ok(joined) => break joined,
-                Err(error) => {
-                    tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
-                    failure.get_or_insert(error);
-                    runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-                    std::mem::forget((runtime, owner));
-                    return (None, Err(failure.unwrap()));
-                }
-            }
+        if failure.is_some() || shutdown.requested() {
+            break None;
         }
         match owner_step(
             &mut runtime,
@@ -2818,50 +2840,74 @@ async fn run_capture(
         )
         .await
         {
-            Ok(Some(result)) => break result,
+            Ok(Some(result)) => break Some(joined_plane(result, &mut failure)),
             Ok(None) => {}
             Err(error) => {
                 failure.get_or_insert(error);
             }
         }
     };
-    if !runtime.closing
-        && let Err(error) = runtime.close_capture()
-    {
-        failure.get_or_insert(error);
+    // Release any queued Core reader before revoking the gateway publisher.
+    reader.set(None);
+    let close_started = Instant::now();
+    if let Err(error) = runtime.close_capture(&backend).await {
+        tracing::error!(%error, "XDP capture close failed; retaining runtime and supervisor until process exit");
+        fold_capture_result(&mut failure, Err(error));
+        fold_capture_result(&mut failure, owner.fail_control().await);
+        runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+        std::mem::forget((runtime, owner, joined));
+        return (None, Err(failure.unwrap()));
     }
+    let plane = match joined {
+        Some(plane) => plane,
+        None => match join_endpoints(
+            &mut owner,
+            |cx| runtime.poll_service(cx, &shutdown, timer.as_mut(), false, notification.as_mut()),
+            close_started,
+            &mut warned,
+        )
+        .await
+        {
+            Ok(joined) => joined_plane(joined, &mut failure),
+            Err(error) => {
+                tracing::error!(%error, "XDP terminal I/O failed; retaining runtime and supervisor until process exit");
+                fold_capture_result(&mut failure, Err(error));
+                runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
+                std::mem::forget((runtime, owner));
+                return (None, Err(failure.unwrap()));
+            }
+        },
+    };
     // An endpoint join cannot release Core TX leases; drain those same descriptor owners too.
-    if let Err(error) = drain_transmit(
-        || runtime.complete_transmit(),
-        close_started.unwrap_or_else(Instant::now),
-        &mut warned,
-    )
-    .await
+    if let Err(error) =
+        drain_transmit(|| runtime.complete_transmit(), close_started, &mut warned).await
     {
         tracing::error!(%error, "XDP terminal drain failed; retaining owners and UMEM until process exit");
-        failure.get_or_insert(error.into());
+        fold_capture_result(&mut failure, Err(error.into()));
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        if let Err(error) = owner.fail_control().await {
-            failure.get_or_insert(error);
-        }
-        std::mem::forget((runtime, joined));
+        fold_capture_result(&mut failure, owner.fail_control().await);
+        std::mem::forget((runtime, plane));
         return (None, Err(failure.unwrap()));
     }
     if let Some(worker) = &mut runtime.worker
         && let Err(error) = worker.join().await
     {
-        failure.get_or_insert(error);
+        fold_capture_result(&mut failure, Err(error));
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        std::mem::forget((runtime, joined));
+        std::mem::forget((runtime, plane));
         return (None, Err(failure.unwrap()));
     }
     runtime.sample_queues();
     let ports_ready = runtime.ports_ready_for_backend_teardown();
     if !ports_ready {
-        failure
-            .get_or_insert_with(|| anyhow::anyhow!("XDP ledger did not reach terminal ownership"));
+        fold_capture_result(
+            &mut failure,
+            Err(anyhow::anyhow!(
+                "XDP ledger did not reach terminal ownership"
+            )),
+        );
         runtime.diagnostics.lifecycle(Lifecycle::FailedRetained);
-        std::mem::forget((runtime, joined));
+        std::mem::forget((runtime, plane));
         return (None, Err(failure.unwrap()));
     }
     for device in &mut runtime.devices {
@@ -2885,18 +2931,6 @@ async fn run_capture(
         failure.get_or_insert(error);
     }
     tracing::info!("XDP admission closed; UMEM retained until process exit");
-    let plane = match joined {
-        Ok((plane, result)) => {
-            if let Err(error) = result {
-                failure.get_or_insert(error);
-            }
-            Some(plane)
-        }
-        Err(error) => {
-            failure.get_or_insert(error);
-            None
-        }
-    };
     runtime.finished = true;
     (plane, failure.map_or(Ok(()), Err))
 }
@@ -3667,30 +3701,28 @@ mod tests {
         assert!(!summary.contains("reason=foreign_xdp"));
     }
 
-    #[test]
-    fn native_guard_observation_failure_never_skips_xsk_withdrawal() {
-        for failure in [
-            "strict precheck",
-            "already invalidated",
-            "post-ACK observation",
-        ] {
-            let mut calls = Vec::new();
-            let result = close_device_capture_with(
-                &mut calls,
-                |calls| {
-                    calls.push("guard");
-                    Err(io::Error::new(io::ErrorKind::PermissionDenied, failure))
-                },
-                |calls| {
-                    calls.push("XSK withdrawal");
-                    Err(io::Error::other("injected XSK withdrawal failure"))
-                },
-            );
-            let message = result.unwrap_err().to_string();
-            assert!(message.contains(failure));
-            assert!(message.contains("injected XSK withdrawal failure"));
-            assert_eq!(calls, ["guard", "XSK withdrawal"]);
-        }
+    #[tokio::test(start_paused = true)]
+    async fn stalled_worker_cannot_extend_the_physical_detach_budget() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let result = drain_before_detach(deadline, || Ok(false), std::future::pending()).await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_tx_cannot_extend_the_worker_deadline() {
+        let deadline = Instant::now() + Duration::from_millis(5);
+        let result = drain_before_detach(deadline, || Ok(true), std::future::ready(Ok(()))).await;
+        assert!(
+            result
+                .unwrap_err()
+                .downcast_ref::<tokio::time::error::Elapsed>()
+                .is_some()
+        );
     }
 
     #[test]

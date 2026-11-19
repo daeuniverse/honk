@@ -184,7 +184,9 @@ L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和
 
 物理捕获默认强制 ZeroCopy；`xsk_mode: copy` 指定 Copy，`xsk_mode: auto` 根据每个成员的能力与所需 segment 数选择模式。Auto 选择 ZeroCopy 后 bind 失败不会重试 Copy。每次 bind 均回读验证；模式变更需重启。Host 私有 queue 始终为 Copy。
 
-只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。正常停止先 detach 再等待输出和 CQ；进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 保留独立的持久托管。
+只读启动准入最多汇总 256 条问题，额外问题计入 omitted，前置条件失败导致无法检查的项目标为 `NOT_CHECKED`。检查包含捕获布局、队列、设备能力、外来 XDP、拓扑、内存，以及 Endpoint 的 zone-0 CT 和上联条件。通过后才准备 VLAN feature、加载程序、创建 FD 持有的 link 并绑定队列；supervisor 就绪和拓扑验证之后激活。后续队列失败也会撤销已创建 link。物理 Endpoint/Core link 和程序不 pin；外来 XDP 会被拒绝。进程退出或 SIGKILL 关闭 link FD，内核恢复转发，但已有代理会话可能需要重连。Host 保留独立的持久托管。
+
+停止时，honk 先禁止物理 worker 开始新的收发，再撤销 XSK 映射。从进入抓包关闭流程起，撤销策略发布、等待物理 TX 完成和第二个 worker 确认共用 100 ms 等待预算。只有尚有未完成描述符的 TX 才可请求唤醒。超时或设备报错仍会尝试拆除 link，并将关停记为失败，不当作完成。拆除后，物理队列只回收真实 CQ 条目。该预算不限制已经进入内核的调用，也不保证从 SIGTERM 到内核恢复转发的实际耗时。
 
 没有 VLAN upper 时，honk 关闭它所修改的两个 RX VLAN stripping feature，并在正常停止或启动失败时恢复。SIGKILL 后这两位保持关闭，内核软件处理 VLAN。设备身份失权时不再恢复，以免写入已替换的设备。veth 仍需 VLAN metadata。
 

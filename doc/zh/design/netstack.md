@@ -143,6 +143,8 @@ ACK 取得进展时，同时撤销旧 PTO deadline 与已到期但尚未物化�
 
 CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ batch 内按精确 scope 混合归还。TCP 重传 ring 和 ACK 生命周期仍与 UMEM/CQ 分离：ACK 不能释放在途 DMA owner，CQ 不能确认 TCP。既有 CPU backing 与进程生命周期 UMEM 仍完整计费。符合资格的直接生成输出只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制；TCP payload 复制/校验和及 socket/relay 复制仍存在。这不是免 payload 复制的 TCP、通用 UDP zero-copy、更低常驻内存或已测性能收益；既有 E3.1 driver handoff 不变。
 
+物理 XDP 关停时，driver 可丢弃仍在 CPU 队列、尚未发布的输出，不再向设备补包。已发布的描述符保留原 owner，只有真实 CQ 才能归还；停止 worker 不能代替完成。
+
 物理 XDP 的每个逻辑入口在同一 `PacketRealm` 下使用一个或两个独立 Stack owner。
 队列永久归属 `queue_id % workers`；TCP 按不可变 keyed tuple 分片，UDP 按
 client 地址分片。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与

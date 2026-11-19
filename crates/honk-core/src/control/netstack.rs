@@ -1485,17 +1485,17 @@ impl PacketDriver {
 
     /// Complete CPU service for startup-only driving and realms using the CPU/SG path.
     pub(crate) fn service(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
-        let more = self.begin(now, true);
+        let more = self.begin(now, |inner| inner.fill(now));
         self.finish_turn(cx, now);
         more
     }
 
     /// Advance timers and pending closes before a bounded direct-output turn.
     pub(crate) fn begin_turn(&mut self, now: Instant) {
-        self.begin(now, false);
+        self.begin(now, |_| false);
     }
 
-    fn begin(&mut self, now: Instant, cpu_output: bool) -> bool {
+    fn begin(&mut self, now: Instant, output: impl FnOnce(&mut Inner) -> bool) -> bool {
         let mut inner = self.scope.0.inner.lock();
         if inner.rights != Rights::Driven {
             self.deadline = None;
@@ -1507,7 +1507,7 @@ impl PacketDriver {
             inner.wake_waiters();
         }
         inner.advance(now);
-        let more = cpu_output && inner.fill(now);
+        let more = output(&mut inner);
         inner.output_waker = armed;
         more
     }
@@ -1553,6 +1553,20 @@ impl PacketDriver {
         .into_iter()
         .flatten()
         .min();
+    }
+
+    /// Discard only locally queued packets. Exported owners still need their actual CQ.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn service_closing(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
+        let more = self.begin(now, |inner| {
+            for _ in 0..BATCH {
+                let Some(queued) = inner.pop(None) else { break };
+                inner.release(queued);
+            }
+            inner.queued != 0
+        });
+        self.finish_turn(cx, now);
+        more
     }
 
     /// Emit into the device's already-reserved full L3 frame; never finish L2 under this lock.

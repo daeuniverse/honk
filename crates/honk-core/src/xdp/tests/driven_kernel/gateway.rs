@@ -132,7 +132,11 @@ impl Fixture {
     }
 
     async fn finish(mut self) -> anyhow::Result<()> {
-        self.runtime.close_capture()?;
+        self.runtime.close_capture(&self.backend).await?;
+        self.finish_after_capture_close().await
+    }
+
+    async fn finish_after_capture_close(&mut self) -> anyhow::Result<()> {
         let timer = None;
         tokio::pin!(timer);
         let notification = self.runtime.polling.notification();
@@ -163,12 +167,15 @@ impl Fixture {
         if let Some(worker) = &mut self.runtime.worker {
             worker.join().await?;
         }
+        ensure!(
+            self.runtime.ports_ready_for_backend_teardown(),
+            "XDP queues still own buffers at fixture teardown"
+        );
         for device in &mut self.runtime.devices {
             assert!(honk_xsk::xdp_absent(device.info.ifindex)?);
             for queue in device.queues.drain(..) {
                 let mut port = queue.io.into_inner();
                 assert_eq!(port.counters().submitted, port.counters().completed);
-                assert!(port.close().ready_for_backend_teardown());
                 port.close_socket();
             }
             device.vlan_offload.restore()?;
@@ -433,4 +440,67 @@ async fn gateway_g17_real_veth_transmit_cq_and_early_release() -> anyhow::Result
     })
     .await
     .context("G17 bounded real-veth fixture")?
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's private disposable-VM namespaces and real Endpoint AF_XDP"]
+async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyhow::Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // If terminal ownership cannot be proven, retain the fixture until the test process exits.
+        let mut owned = std::mem::ManuallyDrop::new(Fixture::start().await?);
+        let fixture = &mut *owned;
+        ensure!(
+            fixture.runtime.devices.len() == 2,
+            "expected both DUT devices"
+        );
+        for device in &fixture.runtime.devices {
+            let state = honk_xsk::xdp_state(device.info.ifindex)
+                .with_context(|| format!("reading {} XDP state before close", device.info.name))?;
+            let expected = device.programs.data_prog_id();
+            ensure!(
+                expected != 0 && state.prog_id == expected,
+                "{} XDP program before close: expected {expected}, got {state:?}",
+                device.info.name
+            );
+        }
+
+        {
+            let mut writer = fixture.backend.write().await;
+            let started = Instant::now();
+            let error = fixture
+                .runtime
+                .close_capture(&fixture.backend)
+                .await
+                .expect_err("capture close succeeded with the backend writer held");
+            let elapsed = started.elapsed();
+            ensure!(
+                error
+                    .downcast_ref::<tokio::time::error::Elapsed>()
+                    .is_some(),
+                "expected the gateway unregister timeout, got {error:#}"
+            );
+            ensure!(
+                elapsed >= Duration::from_millis(100),
+                "gateway unregister timed out after only {elapsed:?}"
+            );
+            for device in &fixture.runtime.devices {
+                let absent = honk_xsk::xdp_absent(device.info.ifindex).with_context(|| {
+                    format!("reading {} XDP state after close", device.info.name)
+                })?;
+                ensure!(
+                    absent,
+                    "{} XDP link survived capture close",
+                    device.info.name
+                );
+            }
+
+            // The deadline prevented unregistering the now-detached publisher.
+            writer.userspace_mut()?.install_gateway(None)?;
+        }
+        fixture.finish_after_capture_close().await?;
+        drop(std::mem::ManuallyDrop::into_inner(owned));
+        Ok(())
+    })
+    .await
+    .context("bounded gateway unregister timeout fixture")?
 }
