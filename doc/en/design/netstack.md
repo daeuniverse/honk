@@ -133,7 +133,7 @@ Payload storage is a pool of chunks organized in two rings per TCP flow (send, r
 
 Ordinary embeddings run `PacketOwner`; XDP and TUN transfer driving rights to one non-cloneable `PacketDriver` per scope in their device runtime. The original funded owner task stays parked, then runs and joins actual finish or abandoned-driver cleanup. App/output mutations wake the active driver; its own scans and exports do not self-notify. The shared mutex and unlocked retirement callbacks remain. Returning driving rights is neither completion nor a CQ, and device owners must keep servicing the driver while waiting for readiness or joined cleanup.
 
-TCP read/write readiness is delivered after releasing the scope mutex, in batches of at most 64 registrations. A generated-output turn can defer its device wake until its last check; a later producer or an interrupted turn must still schedule the driver.
+TCP read/write readiness is delivered after releasing the scope mutex, in batches of at most 64 registrations. A generated-output turn can defer its device wake until its last check; a later producer or an interrupted turn must still schedule the driver. Graceful scope shutdown preserves that wake so output accepted after the last check can drain without new ingress.
 
 TCP retirement observers and blocked UDP senders share the scope's bounded waiter table. Each retirement observer wakes after the original `FlowId` has released its application, protocol and output references and its callback has returned or unwound. Polling or cancelling a retirement wait leaves the packet driver asleep. UDP credit waits and blocked TCP writers can arm the 100 ms readiness fallback.
 

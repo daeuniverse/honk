@@ -886,11 +886,11 @@ impl PacketScope {
         let mut inner = self.0.inner.lock();
         let wake_credit = !inner.closing && inner.credit_waiters != 0;
         inner.closing = true;
-        inner.turn_needs_scan = None;
         if let Some(stack) = &mut inner.stack {
             stack.set_accepting(false);
         }
         let output = if abort {
+            inner.turn_needs_scan = None;
             let output = inner.output_waker.take();
             inner.abort();
             output

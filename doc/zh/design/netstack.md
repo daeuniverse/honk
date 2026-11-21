@@ -133,7 +133,7 @@ ACK 取得进展时，同时撤销旧 PTO deadline 与已到期但尚未物化�
 
 普通嵌入运行 `PacketOwner`；XDP/TUN 将每个 scope 的驱动权交给设备 runtime 内唯一且不可 Clone 的 `PacketDriver`。原已计费 owner task 保持停放，随后执行并 join 真实 finish 或 abandoned-driver cleanup。应用/输出变更唤醒 active driver，自身扫描和导出不自通知。共享 mutex 与锁外 retirement callback 不变；归还驱动权不是完成或 CQ，等待 ready/joined cleanup 期间仍须服务 driver。
 
-TCP 读写就绪通知在释放 scope 锁后交付，每批最多 64 个注册。生成输出的轮次可以把设备唤醒推迟到最后一次检查；若之后有新输出或轮次被中断，仍须唤醒 driver。
+TCP 读写就绪通知在释放 scope 锁后交付，每批最多 64 个注册。生成输出的轮次可以把设备唤醒推迟到最后一次检查；若之后有新输出或轮次被中断，仍须唤醒 driver。scope 优雅关闭时保留这次唤醒，最后一次检查之后已接受的输出无需等待新入包就能排空。
 
 TCP 退役观察者和等待发送额度的 UDP 发送者共用 scope 的有界等待表。原始 `FlowId` 的应用、协议和输出引用全部释放，且回调已返回或因 panic 退出后，才唤醒该流的每个退役观察者。轮询或取消退役等待不会唤醒包驱动。等待发送额度的 UDP 发送者和阻塞的 TCP 写入者仍可启动 100 毫秒的就绪重试定时器。
 

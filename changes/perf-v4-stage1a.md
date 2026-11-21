@@ -6,3 +6,4 @@ Internal
 - Publish borrowed RX packets once per batch without allocating retained slots, preserving frame custody on a callback panic.
 - Share a bounded scope lock across eligible physical Endpoint TCP input and deliver stream readiness after unlocking; mixed packets still follow per-packet admission.
 - Generate physical Endpoint replies from the retained return path without reacquiring the scope lock; queued CPU output keeps priority.
+- Drain already accepted output on graceful packet-scope shutdown without waiting for unrelated ingress.

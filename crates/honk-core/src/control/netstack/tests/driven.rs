@@ -22,6 +22,15 @@ impl std::task::Wake for DeviceWakes {
 
 #[tokio::test]
 async fn generated_turn_rescans_work_arriving_after_its_last_pull() {
+    late_turn_output(false).await;
+}
+
+#[tokio::test]
+async fn graceful_close_delivers_output_queued_after_the_last_pull() {
+    late_turn_output(true).await;
+}
+
+async fn late_turn_output(graceful_close: bool) {
     let now = Instant::now();
     let (scope, owner) = PacketScope::new(
         config(),
@@ -93,10 +102,18 @@ async fn generated_turn_rescans_work_arriving_after_its_last_pull() {
         MaterializedOutput::Idle
     ));
     assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    if graceful_close {
+        scope.shutdown(false);
+    }
     driver.finish_turn(&mut cx, now);
     assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
     let output = exported(&mut driver, &mut cx, TxClass::Bulk).unwrap();
     assert!(output.packet().ends_with(b"late"));
+    output.release();
+    if graceful_close {
+        driver.finish_turn(&mut cx, now);
+        assert!(owner.reclaim().await);
+    }
 }
 
 #[cfg(target_os = "linux")]
