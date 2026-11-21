@@ -960,20 +960,20 @@ impl Inner {
         &self,
         report: honk_netstack::ReceiveReport,
     ) -> super::packet_endpoint::PacketReceive {
-        let qualified_rx = !self.closing
-            && !self.finished
-            && matches!(report.outcome, honk_netstack::ReceiveOutcome::TcpAccepted(id)
-                if self.slots.iter().flatten().any(|slot| slot.id == id && slot.rx_admitted));
-        let taken_over = !self.closing
-            && !self.finished
-            && matches!(report.outcome,
-                honk_netstack::ReceiveOutcome::TcpNew(id) | honk_netstack::ReceiveOutcome::TcpAccepted(id)
-                    if self.slots.iter().flatten().any(|slot| slot.id == id));
+        use honk_netstack::ReceiveOutcome::{TcpAccepted, TcpNew};
+
+        let owner = match report.outcome {
+            TcpAccepted(id) | TcpNew(id) if !self.closing && !self.finished => {
+                self.slots.iter().flatten().find(|slot| slot.id == id)
+            }
+            _ => None,
+        };
         super::packet_endpoint::PacketReceive {
             source: report.source,
             source_context: report.source_context,
-            qualified_rx,
-            taken_over,
+            qualified_rx: matches!(report.outcome, TcpAccepted(_))
+                && owner.is_some_and(|slot| slot.rx_admitted),
+            taken_over: owner.is_some(),
         }
     }
 
