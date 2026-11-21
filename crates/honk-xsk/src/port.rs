@@ -342,29 +342,79 @@ fn class_index(class: TxClass) -> usize {
     }
 }
 
+const NO_TX_OWNER: u32 = u32::MAX;
+const _: () = assert!(MAX_SEGMENTS <= u8::MAX as usize);
+
+// Keep the tag and count together in front of the aligned owner.
+#[repr(u8)]
+enum TxOwnerSlot<L> {
+    Free(u32),
+    Occupied { remaining: u8, retained: L },
+}
+
 struct Sidecar<L> {
-    slots: Box<[Option<(L, usize)>]>,
+    slots: Box<[TxOwnerSlot<L>]>,
+    free: u32,
     reservation: Option<MemoryReservation>,
 }
 
 impl<L> Sidecar<L> {
     fn new(config: PortConfig, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
         let count = config.control_frames + config.bulk_frames;
-        let bytes = Layout::array::<Option<(L, usize)>>(count)
+        let bytes = Layout::array::<TxOwnerSlot<L>>(count)
             .map_err(|_| invalid_config("TX sidecar extent overflow"))?
             .size();
         let reservation = reserve(budget, bytes)?;
-        let slots = (0..count).map(|_| None).collect();
+        let slots = (1..count as u32)
+            .chain([NO_TX_OWNER])
+            .map(TxOwnerSlot::Free)
+            .collect();
         Ok(Self {
             slots,
+            free: 0,
             reservation: Some(reservation),
+        })
+    }
+
+    fn occupy(&mut self, retained: L, remaining: u8) -> u32 {
+        let index = self.free;
+        let slot = &mut self.slots[index as usize];
+        let TxOwnerSlot::Free(next) = slot else {
+            unreachable!("TX sidecar free list points to an occupied slot");
+        };
+        self.free = *next;
+        *slot = TxOwnerSlot::Occupied {
+            remaining,
+            retained,
+        };
+        index
+    }
+
+    fn release(&mut self, index: u32) {
+        let next = self.free;
+        self.free = index;
+        self.slots[index as usize] = TxOwnerSlot::Free(next);
+    }
+
+    #[cfg(test)]
+    fn occupied(&self) -> impl Iterator<Item = (&L, u8)> {
+        self.slots.iter().filter_map(|slot| match slot {
+            TxOwnerSlot::Free(_) => None,
+            TxOwnerSlot::Occupied {
+                remaining,
+                retained,
+            } => Some((retained, *remaining)),
         })
     }
 }
 
 impl<L> Drop for Sidecar<L> {
     fn drop(&mut self) {
-        if self.slots.iter().any(Option::is_some) {
+        if self
+            .slots
+            .iter()
+            .any(|slot| matches!(slot, TxOwnerSlot::Occupied { .. }))
+        {
             // No CQ or device-release fence: dropping retained values would falsely dispose
             // core outputs. Keep their separately funded storage through process exit too.
             std::mem::forget(std::mem::replace(&mut self.slots, Box::new([])));
@@ -374,21 +424,20 @@ impl<L> Drop for Sidecar<L> {
 }
 
 struct CompletedOwners<'a, L> {
-    slots: &'a mut [Option<(L, usize)>],
-    indices: &'a [usize],
+    sidecar: &'a mut Sidecar<L>,
+    indices: &'a [u32],
 }
 
 impl<L> Drop for CompletedOwners<'_, L> {
     fn drop(&mut self) {
         for &index in self.indices {
-            self.slots[index] = None;
+            self.sidecar.release(index);
         }
     }
 }
 
 struct PreparedTx {
     lease: FrameLease,
-    slot: usize,
     length: u32,
     class: TxClass,
 }
@@ -952,12 +1001,9 @@ impl<L> Port<L> {
                 "whole TX chain unavailable",
             ));
         }
-        let owner = self
-            .sidecar
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(|| io::Error::other("no TX sidecar"))?;
+        if self.sidecar.free == NO_TX_OWNER {
+            return Err(io::Error::other("no TX sidecar"));
+        }
         let mut leases = [None; MAX_SEGMENTS];
         for index in 0..count {
             match self.ledger.reserve_tx(class) {
@@ -994,12 +1040,12 @@ impl<L> Port<L> {
             }
             return Err(error);
         }
-        self.sidecar.slots[owner] = Some((retained, count));
+        let owner = self.sidecar.occupy(retained, count as u8);
         for (index, lease) in leases[..count].iter_mut().enumerate() {
             let bytes = (wire_length - index * FRAME_SIZE).min(FRAME_SIZE);
             let address = self
                 .ledger
-                .submit_tx(lease.take().expect("reserved chain"), bytes, owner as u32)
+                .submit_tx(lease.take().expect("reserved chain"), bytes, owner)
                 .map_err(io::Error::other)
                 .map_err(|error| self.invalid(error))?;
             self.rings.tx.write(
@@ -1206,15 +1252,9 @@ impl<L> Port<L> {
         )
         .map_err(|error| self.invalid(error))?;
         let blocked = || io::Error::new(io::ErrorKind::WouldBlock, "single TX frame unavailable");
-        if !self.tx_chain_credit(class, 1, used) {
+        if !self.tx_chain_credit(class, 1, used) || self.sidecar.free == NO_TX_OWNER {
             return Err(blocked());
         }
-        let slot = self
-            .sidecar
-            .slots
-            .iter()
-            .position(Option::is_none)
-            .ok_or_else(blocked)?;
         let lease = match self.ledger.reserve_tx(class) {
             Ok(lease) => lease,
             Err(LedgerError::NoFrame | LedgerError::NoDescriptor) => return Err(blocked()),
@@ -1222,7 +1262,6 @@ impl<L> Port<L> {
         };
         Ok(PreparedTx {
             lease,
-            slot,
             length: 0,
             class,
         })
@@ -1253,9 +1292,7 @@ impl<L> Port<L> {
     }
 
     fn publish_tx(&mut self, prepared: PreparedTx, retained: L) -> io::Result<()> {
-        self.sidecar.slots[prepared.slot] = Some((retained, 1));
-        let owner = u32::try_from(prepared.slot)
-            .map_err(|_| self.invalid(io::Error::other("TX sidecar index overflow")))?;
+        let owner = self.sidecar.occupy(retained, 1);
         let address = self
             .ledger
             .submit_tx(prepared.lease, prepared.length as usize, owner)
@@ -1326,13 +1363,14 @@ impl<L> Port<L> {
         for _ in 0..count {
             let address = self.rings.cq.read(self.cq_consumer);
             let owner = match self.ledger.complete_tx(address) {
-                Ok(owner) => owner as usize,
+                Ok(owner) => owner,
                 Err(error) => {
                     failure = Some(self.invalid(io::Error::other(error)));
                     break;
                 }
             };
-            let Some((_, remaining)) = self.sidecar.slots.get_mut(owner).and_then(Option::as_mut)
+            let Some(TxOwnerSlot::Occupied { remaining, .. }) =
+                self.sidecar.slots.get_mut(owner as usize)
             else {
                 failure =
                     Some(self.invalid(io::Error::other("CQ owner has no retained TX sidecar")));
@@ -1353,17 +1391,21 @@ impl<L> Port<L> {
         let indices = &mut indices[..owners];
         indices.sort_unstable();
         let cleanup = CompletedOwners {
-            slots: &mut self.sidecar.slots,
+            sidecar: &mut self.sidecar,
             indices,
         };
         {
             let mut outputs: [Option<&mut L>; 64] = std::array::from_fn(|_| None);
-            let mut slots = &mut *cleanup.slots;
+            let mut slots = &mut *cleanup.sidecar.slots;
             let mut start = 0;
             for (output, &index) in outputs.iter_mut().zip(cleanup.indices) {
+                let index = index as usize;
                 let (_, suffix) = slots.split_at_mut(index - start);
                 let (slot, suffix) = suffix.split_first_mut().expect("completed sidecar index");
-                *output = Some(&mut slot.as_mut().expect("completed TX sidecar").0);
+                let TxOwnerSlot::Occupied { retained, .. } = slot else {
+                    unreachable!("completed TX sidecar");
+                };
+                *output = Some(retained);
                 slots = suffix;
                 start = index + 1;
             }
@@ -2677,7 +2719,7 @@ mod tests {
             assert_eq!(port.tx_free, [1, 0]);
             assert_eq!(port.rings().tx_producer, 1);
             assert_eq!(port.counters().submitted, 1);
-            assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
+            assert_eq!(port.sidecar.occupied().count(), 1);
             let prefix = port.rings.tx.read(0);
             assert_eq!(port.umem.frame(prefix.addr, 60).unwrap(), &[9; 60]);
             port.rings.tx.publish_consumer(1);
@@ -2805,11 +2847,11 @@ mod tests {
             assert_eq!(port.outstanding().count(), 2);
             assert!(port.outstanding().any(|tx| tx.address == first.addr));
             assert!(port.outstanding().any(|tx| tx.address == pending.addr));
-            assert_eq!(port.sidecar.slots.iter().flatten().count(), 2);
-            let pending_owner = port.sidecar.slots.iter().flatten().last().unwrap();
+            assert_eq!(port.sidecar.occupied().count(), 2);
+            let pending_owner = port.sidecar.occupied().last().unwrap();
             assert_eq!(pending_owner.0.bytes, [4; 28]);
             assert_eq!(pending_owner.1, 1);
-            let retained = port.sidecar.slots.iter().flatten().next().unwrap();
+            let retained = port.sidecar.occupied().next().unwrap();
             assert_eq!(retained.0.bytes, [3; 28]);
             assert_eq!(retained.1, 1);
             assert_eq!(
@@ -2855,7 +2897,7 @@ mod tests {
         assert_eq!(port.outstanding().count(), 0);
         assert_eq!(port.rings().tx_producer, 0);
         assert_eq!(port.counters().submitted, 0);
-        assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
+        assert_eq!(port.sidecar.occupied().count(), 1);
         assert_eq!(port.umem.frame(address, 60).unwrap(), &[9; 60]);
         assert_eq!(drops.load(Ordering::Relaxed), 0);
         assert!(
@@ -2939,8 +2981,8 @@ mod tests {
                     held = Some(port.ledger.reserve_tx(TxClass::Bulk).unwrap());
                 }
                 "sidecar" => {
-                    for slot in &mut port.sidecar.slots {
-                        *slot = Some((Retained::new(&drops), 1));
+                    for _ in 0..port.sidecar.slots.len() {
+                        port.sidecar.occupy(Retained::new(&drops), 1);
                     }
                 }
                 "ring" => {
@@ -3000,9 +3042,7 @@ mod tests {
                         );
                     }
                 }
-                "sidecar" => {
-                    drop(port.sidecar.slots[0].take());
-                }
+                "sidecar" => port.sidecar.release(0),
                 "ring" => port.rings.tx.publish_consumer(1),
                 _ => unreachable!(),
             }
@@ -3027,7 +3067,7 @@ mod tests {
             );
             assert_eq!(port.drain_state().bulk_reserved, 0);
             if shortage == "sidecar" {
-                drop(port.sidecar.slots[1].take());
+                port.sidecar.release(1);
             }
             port.rings.tx.publish_consumer(port.tx_producer);
             let cq = port.cq_consumer;
@@ -3039,7 +3079,7 @@ mod tests {
             assert_eq!(port.complete(|_| {}).unwrap(), addresses.len());
             assert_eq!(port.outstanding().count(), 0);
             assert_eq!(port.tx_free, [1, port.config.bulk_frames]);
-            assert!(port.sidecar.slots.iter().all(Option::is_none));
+            assert!(port.sidecar.occupied().next().is_none());
         }
     }
 
@@ -3074,7 +3114,7 @@ mod tests {
             assert_eq!(port.rings().tx_producer, 0);
             assert_eq!(port.outstanding().count(), 0);
             assert_eq!(port.tx_free, [1, 1]);
-            assert!(port.sidecar.slots.iter().all(Option::is_none));
+            assert!(port.sidecar.occupied().next().is_none());
             assert_eq!(port.counters().invalid, u64::from(failure != "closed"));
         }
     }
@@ -3137,7 +3177,7 @@ mod tests {
             assert_eq!(port.outstanding().count(), 0);
             assert_eq!(port.drain_state().bulk_reserved, 0);
             assert_eq!(port.tx_free, [1, 1]);
-            assert!(port.sidecar.slots.iter().all(Option::is_none));
+            assert!(port.sidecar.occupied().next().is_none());
             assert!(!port.drain_state().closed);
             assert!(!port.needs_service_retry());
             assert!(
@@ -3187,7 +3227,7 @@ mod tests {
         assert_eq!(port.drain_state().bulk_reserved, 0);
         assert_eq!(port.rings().tx_producer, 0);
         assert_eq!(port.counters().submitted, 0);
-        assert!(port.sidecar.slots.iter().all(Option::is_none));
+        assert!(port.sidecar.occupied().next().is_none());
         for class in [TxClass::Control, TxClass::Bulk] {
             assert!(
                 port.transmit_generated(class, 14, |frame| {
@@ -3535,8 +3575,8 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 2);
         assert_eq!(port.outstanding().count(), 1);
         assert!(port.complete(|owners| assert!(owners.is_empty())).is_err());
-        assert_eq!(port.sidecar.slots.iter().flatten().count(), 1);
-        assert_eq!(port.sidecar.slots.iter().flatten().next().unwrap().1, 1);
+        assert_eq!(port.sidecar.occupied().count(), 1);
+        assert_eq!(port.sidecar.occupied().next().unwrap().1, 1);
         let retained = port.umem_bytes() + std::mem::size_of_val(&*port.sidecar.slots);
         port.close_socket();
         drop(port);
@@ -4023,9 +4063,77 @@ mod tests {
             );
         }
         assert_eq!(port.tx_free[1], 4);
-        assert!(port.sidecar.slots.iter().all(Option::is_none));
+        assert!(port.sidecar.occupied().next().is_none());
         assert!(port.tx_packet_credit(TxClass::Bulk, 9000));
         assert_eq!(port.counters().published_packets, 1);
+    }
+
+    #[test]
+    fn sg_owner_survives_first_frame_reuse_after_out_of_order_cq() {
+        let budget = MemoryBudget::new(1 << 20);
+        let mut port = fake(
+            PortConfig {
+                bulk_frames: 3,
+                ..config()
+            },
+            &budget,
+        );
+        port.mtu = 9000;
+        port.scatter_gather = true;
+        port.transmit_segments(TxClass::Bulk, &[&[1; 9000]], 1u8)
+            .unwrap();
+        let [first, middle, last] =
+            std::array::from_fn(|index| port.rings.tx.read(index as u32).addr);
+        port.rings.tx.publish_consumer(3);
+        port.rings.cq.write(0, first);
+        port.rings.cq.publish_producer(1);
+        assert_eq!(
+            port.complete(|owners| assert!(owners.is_empty())).unwrap(),
+            1
+        );
+
+        assert!(
+            port.transmit_generated(TxClass::Bulk, 60, |frame| {
+                frame.fill(2);
+                Ok(Some((60, 2)))
+            })
+            .unwrap()
+        );
+        assert_eq!(port.rings.tx.read(3).addr, first);
+        port.rings.tx.publish_consumer(4);
+        port.rings.cq.write(1, last);
+        port.rings.cq.write(2, first);
+        port.rings.cq.publish_producer(3);
+        assert_eq!(
+            port.complete(|owners| assert!(matches!(owners, [Some(v)] if **v == 2)))
+                .unwrap(),
+            2
+        );
+        port.rings.cq.write(3, middle);
+        port.rings.cq.publish_producer(4);
+        assert_eq!(
+            port.complete(|owners| assert!(matches!(owners, [Some(v)] if **v == 1)))
+                .unwrap(),
+            1
+        );
+
+        for class in [
+            TxClass::Control,
+            TxClass::Bulk,
+            TxClass::Bulk,
+            TxClass::Bulk,
+        ] {
+            port.transmit_segments(class, &[&[3; 60]], 3).unwrap();
+        }
+        for index in 4..8 {
+            port.rings.cq.write(index, port.rings.tx.read(index).addr);
+        }
+        port.rings.tx.publish_consumer(8);
+        port.rings.cq.publish_producer(8);
+        assert_eq!(
+            port.complete(|owners| assert_eq!(owners.len(), 4)).unwrap(),
+            4
+        );
     }
 
     #[test]
