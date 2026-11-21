@@ -139,9 +139,9 @@ TCP 读写就绪通知在释放 scope 锁后交付，每批最多 64 个注册�
 
 对于已准入的 XDP realm，仅当经过溢出检查的完整长度 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才在最终单个 UMEM frame 内生成输出；既有物理端口最大长度限制继续生效。Stack 使用完整 scope L3 容量和 `TxCaps::NONE`，不能缩短容量以强行满足资格。符合资格的 driver 只禁用 CPU 拉取：timer、pending close、event、唤醒注册、退休和真实 finish 继续运行。有界直接输出轮次结束后才刷新最终 deadline/event/reap/finish 状态，包括无输出和本地处置的结果。普通 owner、显式时钟 CPU drive 及不符合资格/jumbo realm 继续 CPU 物化，包括控制输出和 SG 提交。
 
-应用 UDP 仍生成真实且已计费的 CPU 首包/首分片，包括未分片、零长度数据报和控制器 DNS 回复。每个类别内，暂存 pending CPU 输出先于已导出的 CPU 前缀，再处理更早排队的 CPU 输出，最后才直接生成新输出。直接 emitter 在与发包相同的 scope 互斥锁内复查更早 CPU 队列，因此应用在外层判空和加锁之间发送数据，也不会让后续分片越过 fragment zero。阻塞的 CPU 前缀只阻塞自身类别。
+应用 UDP 的首包或首分片仍由 CPU 生成并计费，包括未分片、零长度数据报和控制器 DNS 回复。每个类别内，先发送暂存的队头和已导出的 CPU 包。物理 driver 没有暂存队头时可直接尝试生成：在 scope 锁内、拉取 Stack 之前检查同类的旧 CPU 输出。发现旧输出就先发送它；阻塞的前缀只阻塞本类别。
 
-调用 Stack emitter 前先预留真实 Port 容量和 scope frame/descriptor credit，私有同步 guard 在无输出、错误或 unwind 时只取消未发布预留。原始 `Transmit::flow`、peer 持有和精确 slot 计数在 scope 锁内安装，早于任何 retention/reap 查询。解锁后，同一个同步设备 callback 查找精确 scope 下无冲突的 peer，验证物理设备/VLAN/header identity，并原地补齐 MAC、完整 VLAN TCI 与 EtherType；scope 锁内没有 L2 callback，中间不 await 或处理 RX。缺失/冲突 peer 在锁外处置已生成 owner，不重试、不回滚序号；header/长度不一致是真实错误。后续 peer QoS 更新不能改动已发布字节。
+Stack 发包前，Port 与 scope 均先预留 frame 和 descriptor credit；无输出、错误或 unwind 时取消未发布预留。driver 在 scope 锁内安装原始 `Transmit::flow`、peer 和 slot 所有权，并从已持有的 peer 取得物理回程路径快照与报文地址族。随后由同一回调在锁外校验设备、VLAN 并填写以太网头，中间不 await 或处理 RX。没有 peer 所有权则处置输出，不重放；头部或长度不符是错误。后续 QoS 变更不能改动已发布字节。
 
 CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ batch 内按精确 scope 混合归还。TCP 重传 ring 和 ACK 生命周期仍与 UMEM/CQ 分离：ACK 不能释放在途 DMA owner，CQ 不能确认 TCP。既有 CPU backing 与进程生命周期 UMEM 仍完整计费。符合资格的直接生成输出只移除一次中间 Endpoint CPU-IP-frame 到 UMEM 的复制；TCP payload 复制/校验和及 socket/relay 复制仍存在。这不是免 payload 复制的 TCP、通用 UDP zero-copy、更低常驻内存或已测性能收益；既有 E3.1 driver handoff 不变。
 

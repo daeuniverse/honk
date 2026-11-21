@@ -113,10 +113,11 @@ fn materialized(
     class: TxClass,
     packet: &mut [u8],
 ) -> OutputOwner {
-    let owner = driver
-        .materialize_into(now, class, packet)
-        .unwrap()
-        .expect("actual direct stack output");
+    let MaterializedOutput::Packet(output) = driver.materialize_into(now, class, packet).unwrap()
+    else {
+        panic!("expected actual direct stack output");
+    };
+    let owner = output.owner;
     assert_eq!(owner.class(), class);
     assert!(owner.packet().is_none());
     owner

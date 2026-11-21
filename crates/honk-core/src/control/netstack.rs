@@ -1220,6 +1220,7 @@ impl Inner {
     fn install(
         &mut self,
         lease: FrameLease,
+        index: usize,
         tx: Transmit,
         class: TxClass,
         destination: IpAddr,
@@ -1233,7 +1234,6 @@ impl Inner {
                 "emitted original Host source"
             );
         }
-        let index = self.index(lease);
         self.ledger
             .submit_tx(lease, tx.len, tx.flow)
             .map_err(io::Error::other)?;
@@ -1285,7 +1285,7 @@ impl Inner {
         .expect("stack output has IP addresses")
         .1;
         let queued = self
-            .install(lease, tx, class, destination, fragment)
+            .install(lease, index, tx, class, destination, fragment)
             .expect("reserved complete output frame");
         self.push(queued);
     }
@@ -1600,6 +1600,23 @@ impl Drop for PacketOwner {
     }
 }
 
+pub(crate) enum MaterializedOutput {
+    Idle,
+    Closed,
+    CpuQueuePending,
+    Packet(DirectOutput),
+}
+
+pub(crate) struct DirectOutput {
+    pub(crate) owner: OutputOwner,
+    #[cfg(target_os = "linux")]
+    pub(crate) path: Option<crate::xdp::ReturnPath>,
+    #[cfg(target_os = "linux")]
+    pub(crate) ipv6: bool,
+    #[cfg(all(target_os = "linux", test))]
+    pub(crate) destination: IpAddr,
+}
+
 /// The exclusive driving right handed to one device owner. Not Clone; only `hand_off` makes
 /// one. Keep it in the outer device owner, never inside a scope callback or lock holder.
 pub(crate) struct PacketDriver {
@@ -1740,19 +1757,20 @@ impl PacketDriver {
         more
     }
 
-    /// Emit into the device's already-reserved full L3 frame; never finish L2 under this lock.
+    /// Emit into an already-reserved L3 frame, only after older CPU work of this class.
     pub(crate) fn materialize_into(
         &mut self,
         now: Instant,
         class: TxClass,
         l3: &mut [u8],
-    ) -> io::Result<Option<OutputOwner>> {
+    ) -> io::Result<MaterializedOutput> {
         let mut inner = self.scope.0.inner.lock();
-        if inner.rights != Rights::Driven || inner.aborted || inner.finished {
-            return Ok(None);
-        }
-        if inner.stack.is_none() {
-            return Ok(None);
+        if inner.rights != Rights::Driven
+            || inner.aborted
+            || inner.finished
+            || inner.stack.is_none()
+        {
+            return Ok(MaterializedOutput::Closed);
         }
         let frame_size = inner.frame_size;
         if l3.len() < frame_size {
@@ -1765,19 +1783,20 @@ impl PacketDriver {
                 .flatten()
                 .any(|queued| queued.class == class)
         {
-            let wake = inner.take_output_wake();
-            drop(inner);
-            if let Some(wake) = wake {
+            if let Some(rescan) = &mut inner.turn_needs_scan {
+                rescan[usize::from(class == TxClass::Bulk)] = true;
+            } else if let Some(wake) = inner.output_waker.take() {
+                drop(inner);
                 wake.wake();
             }
-            return Ok(None);
+            return Ok(MaterializedOutput::CpuQueuePending);
         }
         let lease = match inner.ledger.reserve_tx(class) {
             Ok(lease) => lease,
             Err(
                 honk_datapath::buffer::LedgerError::NoFrame
                 | honk_datapath::buffer::LedgerError::NoDescriptor,
-            ) => return Ok(None),
+            ) => return Ok(MaterializedOutput::Idle),
             Err(error) => return Err(io::Error::other(error)),
         };
         let mut reservation = OutputReservation {
@@ -1785,16 +1804,16 @@ impl PacketDriver {
             lease: Some(lease),
         };
         let packet = &mut l3[..frame_size];
-        let resources = reservation.inner.resources.clone();
+        let state = &mut *reservation.inner;
         let tx = Inner::transmit_accounted(
-            reservation.inner.stack.as_mut().expect("live driven stack"),
-            &resources,
+            state.stack.as_mut().expect("live driven stack"),
+            &state.resources,
             now,
             class,
             packet,
             TxCaps::NONE,
         );
-        reservation.inner.drain_half_open();
+        state.drain_half_open();
         let Some((tx, fragment)) = tx else {
             // The CPU prefix and this protocol class were both checked under this lock.
             // Only advance() can service a newly pending close.
@@ -1804,7 +1823,7 @@ impl PacketDriver {
             {
                 rescan[usize::from(class == TxClass::Bulk)] = false;
             }
-            return Ok(None);
+            return Ok(MaterializedOutput::Idle);
         };
         if tx.len == 0 || tx.len > frame_size {
             return Err(io::Error::other("invalid direct output extent"));
@@ -1812,16 +1831,33 @@ impl PacketDriver {
         let destination = honk_netstack::wire::packet_addresses(&packet[..tx.len])
             .map_err(io::Error::other)?
             .1;
+        let index = reservation.inner.index(lease);
         let queued = reservation
             .inner
-            .install(lease, tx, class, destination, fragment)?;
+            .install(lease, index, tx, class, destination, fragment)?;
         reservation.lease = None;
+        #[cfg(target_os = "linux")]
+        let path = reservation
+            .inner
+            .output_peer_holds
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|hold| hold.learned())
+            .map(|hold| hold.original_path());
         drop(reservation);
         drop(inner);
-        Ok(Some(OutputOwner {
-            scope: self.scope.clone(),
-            queued: Some(queued),
-            bytes: None,
+        Ok(MaterializedOutput::Packet(DirectOutput {
+            owner: OutputOwner {
+                scope: self.scope.clone(),
+                queued: Some(queued),
+                bytes: None,
+            },
+            #[cfg(target_os = "linux")]
+            path,
+            #[cfg(target_os = "linux")]
+            ipv6: destination.is_ipv6(),
+            #[cfg(all(target_os = "linux", test))]
+            destination,
         }))
     }
 

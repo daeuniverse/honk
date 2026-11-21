@@ -358,18 +358,20 @@ impl HostRuntime {
                             let mut emitted = false;
                             let result = port.transmit_generated(class, max_length, |frame| {
                                 let (header, l3) = frame.split_at_mut(RETURN_HEADER);
-                                let Some(owner) = driver.materialize_into(packet_now, class, l3)?
+                                let MaterializedOutput::Packet(output) =
+                                    driver.materialize_into(packet_now, class, l3)?
                                 else {
                                     return Ok(None);
                                 };
                                 emitted = true;
+                                let owner = output.owner;
                                 let facts = owner.host_return().ok_or_else(|| {
                                     io::Error::other(
                                         "Host generated output lost original return owner",
                                     )
                                 })?;
                                 let length = capture
-                                    .encode_return(&facts, owner.len(), l3[0] >> 4 == 6, header)
+                                    .encode_return(&facts, owner.len(), output.ipv6, header)
                                     .map_err(io::Error::other)?;
                                 if length != RETURN_HEADER {
                                     return Err(io::Error::other(

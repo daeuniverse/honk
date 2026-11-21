@@ -205,12 +205,12 @@ fn generate(
 ) -> (Vec<u8>, Retained) {
     let (_, capacity) = realm.generated.expect("eligible realm");
     let mut frame = vec![0xa5; capacity];
-    let mut emitted = false;
+    let mut attempt = GeneratedAttempt::Idle;
     let (length, owner) = realm
-        .generate_output(now, class, 10, peers, &mut frame, &mut emitted)
+        .generate_output(now, class, 10, peers, &mut frame, &mut attempt)
         .unwrap()
         .expect("actual Stack output");
-    assert!(emitted);
+    assert_eq!(attempt, GeneratedAttempt::Emitted);
     let Retained::Endpoint(output) = &owner else {
         panic!("generated Endpoint owner");
     };
@@ -1516,14 +1516,15 @@ async fn generated_fragments_follow_atomic_cpu_and_saved_heads_for_both_families
         // The app accepts fragment zero after the outer CPU-empty observation.
         sender.send_to(&payload, client).await.unwrap();
         let mut frame = vec![0xa5; realm.generated.unwrap().1];
-        let mut emitted = false;
+        let mut attempt = GeneratedAttempt::Idle;
         assert!(
             realm
-                .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut attempt)
                 .unwrap()
                 .is_none()
         );
-        assert!(!emitted);
+        assert_eq!(attempt, GeneratedAttempt::CpuQueuePending);
+        assert!(frame.iter().all(|&byte| byte == 0xa5));
         assert_eq!(
             realm
                 .poll_outputs(&mut cx, TxClass::Bulk, 0, &mut outputs)
@@ -1536,14 +1537,21 @@ async fn generated_fragments_follow_atomic_cpu_and_saved_heads_for_both_families
         assert!(more);
         let mut datagram = bytes.to_vec();
         realm.pending[1] = Some((first, path()));
+        let short = b"older CPU output";
+        sender.send_to(short, client).await.unwrap();
         for _ in 0..2 {
+            attempt = GeneratedAttempt::Idle;
             assert!(
                 realm
-                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut attempt)
                     .unwrap()
                     .is_none()
             );
-            assert!(!emitted, "a saved CPU head blocks direct generation");
+            assert_eq!(
+                attempt,
+                GeneratedAttempt::Idle,
+                "a saved CPU head blocks direct generation"
+            );
         }
         let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs);
         assert_eq!(selected, Poll::Ready(Some(1)));
@@ -1555,6 +1563,19 @@ async fn generated_fragments_follow_atomic_cpu_and_saved_heads_for_both_families
         fill_output(&mut [&mut first_wire], &header, first.packet()).unwrap();
         assert_eq!(fragment_bytes(&first_wire[22..]).1, 0);
         let mut completed = [Some(Retained::Endpoint(first.into_owner()))];
+        assert!(
+            realm
+                .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut attempt)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(attempt, GeneratedAttempt::CpuQueuePending);
+        let (selected, saved) = realm.poll_outputs(&mut cx, TxClass::Bulk, 0, &mut outputs);
+        assert_eq!(selected, Poll::Ready(Some(1)));
+        assert!(saved.is_none());
+        let output = outputs[0].take().unwrap();
+        assert!(output.packet().ends_with(short));
+        output.release();
         loop {
             let (wire, owner) = generate(&mut realm, now, TxClass::Bulk, &peers);
             assert_eq!(
@@ -1580,14 +1601,14 @@ async fn generated_fragments_follow_atomic_cpu_and_saved_heads_for_both_families
         drop(completed);
         for payload in [b"".as_slice(), b"ordinary CPU reply".as_slice()] {
             sender.send_to(payload, client).await.unwrap();
-            emitted = false;
+            attempt = GeneratedAttempt::Idle;
             assert!(
                 realm
-                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut attempt)
                     .unwrap()
                     .is_none()
             );
-            assert!(!emitted);
+            assert_eq!(attempt, GeneratedAttempt::CpuQueuePending);
             assert_eq!(
                 realm
                     .poll_outputs(&mut cx, TxClass::Bulk, 1, &mut outputs)
@@ -1651,7 +1672,7 @@ async fn generated_local_disposal_and_header_errors_retire_unlocked_and_refresh_
             _ => unreachable!(),
         }
         let mut frame = vec![0xa5; realm.generated.unwrap().1];
-        let mut emitted = false;
+        let mut attempt = GeneratedAttempt::Idle;
         realm.driver.begin_turn(now);
         let result = realm.generate_output(
             now,
@@ -1659,10 +1680,11 @@ async fn generated_local_disposal_and_header_errors_retire_unlocked_and_refresh_
             physical_ifindex,
             &peers,
             &mut frame,
-            &mut emitted,
+            &mut attempt,
         );
-        assert!(
-            emitted,
+        assert_eq!(
+            attempt,
+            GeneratedAttempt::Emitted,
             "an emitted-but-disposed packet spends the bounded work budget"
         );
         if failure < 2 {
@@ -1680,7 +1702,7 @@ async fn generated_local_disposal_and_header_errors_retire_unlocked_and_refresh_
         assert!(!endpoints.retains(scope.scope(), client, server, 6));
         assert!(scope.is_protocol_quiescent());
         let deadline = realm.driver.deadline();
-        emitted = false;
+        attempt = GeneratedAttempt::Idle;
         assert!(
             realm
                 .generate_output(
@@ -1689,12 +1711,12 @@ async fn generated_local_disposal_and_header_errors_retire_unlocked_and_refresh_
                     physical_ifindex,
                     &peers,
                     &mut frame,
-                    &mut emitted
+                    &mut attempt
                 )
                 .unwrap()
                 .is_none()
         );
-        assert!(!emitted);
+        assert_eq!(attempt, GeneratedAttempt::Idle);
         realm.driver.finish_turn(&mut cx, now);
         assert_eq!(realm.driver.deadline(), deadline);
         assert_eq!(retired.load(Ordering::SeqCst), 1);
@@ -1714,14 +1736,14 @@ async fn generated_missing_peer_synack_keeps_its_real_retransmission_deadline() 
     let (_, flow) = scope.poll_accept().unwrap();
     realm.driver.begin_turn(now);
     let mut frame = vec![0; realm.generated.unwrap().1];
-    let mut emitted = false;
+    let mut attempt = GeneratedAttempt::Idle;
     assert!(
         realm
-            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut emitted)
+            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut attempt)
             .unwrap()
             .is_none()
     );
-    assert!(emitted);
+    assert_eq!(attempt, GeneratedAttempt::Emitted);
     let ip = wire::parse_ip(&frame[22..]).unwrap();
     let (original, _) = tcp::parse(&frame[22 + ip.payload.start..22 + ip.payload.end]).unwrap();
     let original_seq = original.seq;
@@ -1732,14 +1754,14 @@ async fn generated_missing_peer_synack_keeps_its_real_retransmission_deadline() 
         .deadline()
         .expect("disposed SYNACK still arms the actual protocol timer");
     assert!(due > now);
-    emitted = false;
+    attempt = GeneratedAttempt::Idle;
     assert!(
         realm
-            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut emitted)
+            .generate_output(now, TxClass::Control, 10, &[], &mut frame, &mut attempt)
             .unwrap()
             .is_none()
     );
-    assert!(!emitted);
+    assert_eq!(attempt, GeneratedAttempt::Idle);
     realm.driver.finish_turn(&mut cx, now);
     assert_eq!(realm.driver.deadline(), Some(due));
     realm.driver.begin_turn(due);
@@ -1893,14 +1915,14 @@ async fn just_over_generated_limit_keeps_full_cpu_tcp_extent_and_sg_writer() {
             let mut cx = Context::from_waker(std::task::Waker::noop());
             let mut outputs = [None];
             let mut frame = [0xa5; honk_xsk::FRAME_SIZE];
-            let mut emitted = false;
+            let mut attempt = GeneratedAttempt::Idle;
             assert!(
                 realm
-                    .generate_output(now, TxClass::Control, 10, &peers, &mut frame, &mut emitted)
+                    .generate_output(now, TxClass::Control, 10, &peers, &mut frame, &mut attempt)
                     .unwrap()
                     .is_none()
             );
-            assert!(!emitted);
+            assert_eq!(attempt, GeneratedAttempt::Idle);
             realm.driver.service(&mut cx, now);
             assert_eq!(
                 realm
@@ -1921,11 +1943,11 @@ async fn just_over_generated_limit_keeps_full_cpu_tcp_extent_and_sg_writer() {
             flow.write_all(&payload).await.unwrap();
             assert!(
                 realm
-                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut emitted)
+                    .generate_output(now, TxClass::Bulk, 10, &peers, &mut frame, &mut attempt)
                     .unwrap()
                     .is_none()
             );
-            assert!(!emitted);
+            assert_eq!(attempt, GeneratedAttempt::Idle);
             realm.driver.service(&mut cx, now);
             assert_eq!(
                 realm
@@ -1973,14 +1995,14 @@ async fn generated_empty_turns_do_not_create_protocol_deadlines() {
     for _ in 0..4 {
         realm.driver.begin_turn(now);
         for class in [TxClass::Control, TxClass::Bulk] {
-            let mut emitted = false;
+            let mut attempt = GeneratedAttempt::Idle;
             assert!(
                 realm
-                    .generate_output(now, class, 10, &[], &mut frame, &mut emitted)
+                    .generate_output(now, class, 10, &[], &mut frame, &mut attempt)
                     .unwrap()
                     .is_none()
             );
-            assert!(!emitted);
+            assert_eq!(attempt, GeneratedAttempt::Idle);
         }
         realm.driver.finish_turn(&mut cx, now);
         assert!(realm.driver.deadline().is_none());

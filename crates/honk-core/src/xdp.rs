@@ -26,8 +26,8 @@ use crate::control::{
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{
-        CAPTURE_MEMORY, OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope,
-        capture_realm,
+        CAPTURE_MEMORY, MaterializedOutput, OutputLease, OutputOwner, PacketDriver, PacketRealm,
+        PacketScope, capture_realm,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -327,11 +327,11 @@ impl ReturnPath {
     }
 }
 
+#[cfg(test)]
 struct Peer {
     scope: ScopeId,
     address: IpAddr,
     path: ReturnPath,
-    #[cfg(test)]
     last_seen: Instant,
     conflict: Option<Instant>,
 }
@@ -483,6 +483,14 @@ impl Pressure {
         true
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+enum GeneratedAttempt {
+    Idle,
+    Closed,
+    CpuQueuePending,
+    Emitted,
+}
+
 struct Realm {
     realm_id: u32,
     members: Vec<usize>,
@@ -553,14 +561,55 @@ impl Realm {
         return_header(path, self.link.mac, physical_ifindex, ipv6)
     }
 
+    fn transmit_cpu_outputs(
+        &mut self,
+        port: &mut Port<Retained>,
+        class: TxClass,
+        physical_ifindex: u32,
+        pending_path: Option<ReturnPath>,
+        outputs: &mut [Option<OutputLease>],
+    ) -> io::Result<bool> {
+        let singleton = outputs.len() == 1;
+        for output in outputs {
+            let output = output.take().expect("selected Endpoint output");
+            let Some(path) =
+                pending_path.or_else(|| output.peer_hold().and_then(|hold| hold.path()))
+            else {
+                continue;
+            };
+            let header =
+                self.output_header(path, physical_ifindex, output.packet()[0] >> 4 == 6)?;
+            let length = header.len() + output.packet().len();
+            if singleton && !port.tx_packet_credit(class, length) {
+                self.pending[usize::from(class == TxClass::Bulk)] = Some((output, path));
+                return Ok(false);
+            }
+            port.transmit_with(
+                class,
+                length,
+                Retained::Endpoint(output.into_owner()),
+                |owner, target| {
+                    let Retained::Endpoint(owner) = owner else {
+                        return Err(io::Error::other("wrong Endpoint TX owner"));
+                    };
+                    let packet = owner
+                        .packet()
+                        .ok_or_else(|| io::Error::other("missing Endpoint CPU packet"))?;
+                    fill_output(target, &header, packet)
+                },
+            )?;
+        }
+        Ok(true)
+    }
+
     fn generate_output(
         &mut self,
         now: Instant,
         class: TxClass,
         physical_ifindex: u32,
-        peers: &[Peer],
+        #[cfg(test)] peers: &[Peer],
         frame: &mut [u8],
-        emitted: &mut bool,
+        attempt: &mut GeneratedAttempt,
     ) -> io::Result<Option<(usize, Retained)>> {
         let Some((l2_len, max_length)) = self.generated else {
             return Ok(None);
@@ -576,26 +625,101 @@ impl Realm {
             return Err(io::Error::other("invalid generated Endpoint reservation"));
         }
         let (l2, l3) = frame.split_at_mut(l2_len);
-        let Some(owner) = self.driver.materialize_into(now, class, l3)? else {
+        let output = match self.driver.materialize_into(now, class, l3)? {
+            MaterializedOutput::Idle => return Ok(None),
+            MaterializedOutput::Closed => {
+                *attempt = GeneratedAttempt::Closed;
+                return Ok(None);
+            }
+            MaterializedOutput::CpuQueuePending => {
+                *attempt = GeneratedAttempt::CpuQueuePending;
+                return Ok(None);
+            }
+            MaterializedOutput::Packet(output) => output,
+        };
+        *attempt = GeneratedAttempt::Emitted;
+        let owner = output.owner;
+        let path = output.path;
+        // Plain scope fixtures supply their own peers without a physical peer hold.
+        #[cfg(test)]
+        let path = path.or_else(|| peer_return_path(peers, owner.scope(), output.destination));
+        let Some(path) = path else {
             return Ok(None);
         };
-        *emitted = true;
-        let packet = &l3[..owner.len()];
-        let (_, destination) = wire::packet_addresses(packet).map_err(io::Error::other)?;
-        let Some(path) = owner
-            .peer_hold()
-            .and_then(|hold| hold.path())
-            .or_else(|| peer_return_path(peers, owner.scope(), destination))
-        else {
-            return Ok(None);
-        };
-        let header = self.output_header(path, physical_ifindex, packet[0] >> 4 == 6)?;
+        let header = self.output_header(path, physical_ifindex, output.ipv6)?;
         if header.len() != l2_len {
             return Err(io::Error::other("generated Endpoint header length changed"));
         }
         l2.copy_from_slice(&header);
         Ok(Some((l2_len + owner.len(), Retained::Endpoint(owner))))
     }
+}
+
+fn service_generated_output(
+    realm: &mut Realm,
+    port: &mut Port<Retained>,
+    cx: &mut Context<'_>,
+    now: Instant,
+    class: TxClass,
+    ifindex: u32,
+    endpoints: &PacketEndpoints,
+) -> anyhow::Result<(usize, bool)> {
+    let class_index = usize::from(class == TxClass::Bulk);
+    let (_, max_length) = realm.generated.expect("eligible generated Endpoint output");
+    let mut outputs = None;
+    let mut serviced = 0;
+    while serviced < BATCH {
+        let mut no_credit = false;
+        if realm.pending[class_index].is_none() {
+            let mut attempt = GeneratedAttempt::Idle;
+            match port.transmit_generated(class, max_length, |frame| {
+                realm.generate_output(
+                    now,
+                    class,
+                    ifindex,
+                    #[cfg(test)]
+                    &[],
+                    frame,
+                    &mut attempt,
+                )
+            }) {
+                Ok(_) => match attempt {
+                    GeneratedAttempt::Emitted => {
+                        serviced += 1;
+                        continue;
+                    }
+                    GeneratedAttempt::Idle => break,
+                    GeneratedAttempt::Closed => {
+                        ensure!(
+                            endpoints.is_closing(),
+                            "XDP packet scope ended before endpoint close"
+                        );
+                        break;
+                    }
+                    GeneratedAttempt::CpuQueuePending => {}
+                },
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => no_credit = true,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        // A conservative zero still needs a singleton check for the oldest CPU packet.
+        let capacity = port.tx_packet_capacity(class)?;
+        let outputs = outputs.get_or_insert_with(|| std::array::from_fn::<_, BATCH, _>(|_| None));
+        let (selected, pending_path) =
+            realm.poll_outputs(cx, class, capacity, &mut outputs[..BATCH - serviced]);
+        let count = match selected {
+            Poll::Ready(Some(count)) => count,
+            Poll::Ready(None) if !endpoints.is_closing() => {
+                anyhow::bail!("XDP packet scope ended before endpoint close");
+            }
+            _ => return Ok((serviced, no_credit)),
+        };
+        if !realm.transmit_cpu_outputs(port, class, ifindex, pending_path, &mut outputs[..count])? {
+            return Ok((serviced, true));
+        }
+        serviced += count;
+    }
+    Ok((serviced, false))
 }
 
 fn finish_transmit<T>(work: anyhow::Result<T>, kick: io::Result<()>) -> anyhow::Result<T> {
@@ -1393,6 +1517,24 @@ impl Runtime {
                         realm_index
                     };
                     serviced_classes += 1;
+                    if realm.generated.is_some() {
+                        let (count, blocked) = service_generated_output(
+                            realm,
+                            port,
+                            cx,
+                            now,
+                            class,
+                            ifindex,
+                            &self.endpoints,
+                        )?;
+                        serviced += count;
+                        if blocked {
+                            self.pressure.counters.tx_credit =
+                                self.pressure.counters.tx_credit.saturating_add(1);
+                            self.pressure.counters.refused = true;
+                        }
+                        continue;
+                    }
                     let mut considered = 0;
                     while considered < BATCH {
                         let capacity = port.tx_packet_capacity(class)?;
@@ -1407,82 +1549,22 @@ impl Runtime {
                             Poll::Ready(None) if !self.endpoints.is_closing() => {
                                 anyhow::bail!("XDP packet scope ended before endpoint close");
                             }
-                            _ => {
-                                let Some((_, max_length)) = realm.generated else {
-                                    break;
-                                };
-                                let mut emitted = false;
-                                let generated =
-                                    port.transmit_generated(class, max_length, |frame| {
-                                        realm.generate_output(
-                                            now,
-                                            class,
-                                            ifindex,
-                                            &[],
-                                            frame,
-                                            &mut emitted,
-                                        )
-                                    });
-                                if emitted {
-                                    considered += 1;
-                                    serviced += 1;
-                                }
-                                match generated {
-                                    Ok(true) => continue,
-                                    Ok(false) if emitted => continue,
-                                    Ok(false) => break,
-                                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                        self.pressure.counters.tx_credit =
-                                            self.pressure.counters.tx_credit.saturating_add(1);
-                                        self.pressure.counters.refused = true;
-                                        break;
-                                    }
-                                    Err(error) => return Err(error.into()),
-                                }
-                            }
+                            _ => break,
                         };
                         considered += count;
-                        let mut blocked = false;
-                        for output in &mut outputs[..count] {
-                            let output = output.take().expect("selected Endpoint output");
-                            let Some(path) = pending_path
-                                .or_else(|| output.peer_hold().and_then(|hold| hold.path()))
-                            else {
-                                serviced += 1;
-                                continue;
-                            };
-                            let header =
-                                realm.output_header(path, ifindex, output.packet()[0] >> 4 == 6)?;
-                            let length = header.len();
-                            if count == 1
-                                && !port.tx_packet_credit(class, length + output.packet().len())
-                            {
-                                self.pressure.counters.tx_credit =
-                                    self.pressure.counters.tx_credit.saturating_add(1);
-                                self.pressure.counters.refused = true;
-                                realm.pending[class_index] = Some((output, path));
-                                blocked = true;
-                                break;
-                            }
-                            port.transmit_with(
-                                class,
-                                length + output.packet().len(),
-                                Retained::Endpoint(output.into_owner()),
-                                |owner, target| {
-                                    let Retained::Endpoint(output) = owner else {
-                                        return Err(io::Error::other("wrong endpoint TX owner"));
-                                    };
-                                    let packet = output.packet().ok_or_else(|| {
-                                        io::Error::other("Endpoint CPU writer has no packet")
-                                    })?;
-                                    fill_output(target, &header[..length], packet)
-                                },
-                            )?;
-                            serviced += 1;
-                        }
-                        if blocked {
+                        if !realm.transmit_cpu_outputs(
+                            port,
+                            class,
+                            ifindex,
+                            pending_path,
+                            &mut outputs[..count],
+                        )? {
+                            self.pressure.counters.tx_credit =
+                                self.pressure.counters.tx_credit.saturating_add(1);
+                            self.pressure.counters.refused = true;
                             break;
                         }
+                        serviced += count;
                     }
                 }
                 if serviced_classes == 2 {
@@ -2275,6 +2357,7 @@ fn endpoint_return_path(peers: &[Peer], output: &OutputLease) -> Option<ReturnPa
     peer_return_path(peers, output.scope(), destination)
 }
 
+#[cfg(test)]
 fn peer_return_path(peers: &[Peer], scope: ScopeId, destination: IpAddr) -> Option<ReturnPath> {
     peers
         .iter()

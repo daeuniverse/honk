@@ -135,12 +135,13 @@ fn direct_rack_deferral_preserves_deadline_credit_and_original_retransmissions()
             driver.begin_turn(*now);
             let before = packets.len();
             for _ in 0..32 {
-                let Some(owner) = driver
+                let MaterializedOutput::Packet(output) = driver
                     .materialize_into(*now, TxClass::Bulk, &mut frame)
                     .unwrap()
                 else {
                     break;
                 };
+                let owner = output.owner;
                 assert!(owner.packet().is_none());
                 packets.push(decode_packet(&frame[..owner.len()]));
                 drop(owner);
@@ -280,12 +281,10 @@ fn direct_rack_deferral_preserves_deadline_credit_and_original_retransmissions()
     for _ in 0..3 {
         driver.begin_turn(now);
         for class in [TxClass::Control, TxClass::Bulk] {
-            assert!(
-                driver
-                    .materialize_into(now, class, &mut frame)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(matches!(
+                driver.materialize_into(now, class, &mut frame).unwrap(),
+                MaterializedOutput::Idle
+            ));
         }
         driver.finish_turn(&mut context(), now);
         assert_eq!(driver.deadline(), deadline);

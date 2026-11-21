@@ -533,6 +533,13 @@ fn service_output(
             if shared.is_closing() {
                 break;
             }
+            if realm.generated.is_some() {
+                let ifindex = realm.link.path.physical_ifindex;
+                let (count, _) =
+                    service_generated_output(realm, port, cx, now, class, ifindex, endpoints)?;
+                serviced += count;
+                continue;
+            }
             let mut outputs: [Option<OutputLease>; BATCH] = std::array::from_fn(|_| None);
             let capacity = port.tx_packet_capacity(class)?;
             let (selected, pending_path) = realm.poll_outputs(cx, class, capacity, &mut outputs);
@@ -577,28 +584,6 @@ fn service_output(
                     },
                 )?;
                 serviced += 1;
-            }
-            if let Some((_, max_length)) = realm.generated {
-                for _ in count..BATCH {
-                    let mut emitted = false;
-                    let result = port.transmit_generated(class, max_length, |frame| {
-                        realm.generate_output(
-                            now,
-                            class,
-                            realm.link.path.physical_ifindex,
-                            &[],
-                            frame,
-                            &mut emitted,
-                        )
-                    });
-                    match result {
-                        Ok(true) => serviced += 1,
-                        Ok(false) if emitted => serviced += 1,
-                        Ok(false) => break,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                        Err(error) => return Err(error.into()),
-                    }
-                }
             }
         }
         Ok(serviced)

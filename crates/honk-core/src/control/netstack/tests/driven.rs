@@ -23,51 +23,78 @@ impl std::task::Wake for DeviceWakes {
 #[tokio::test]
 async fn generated_turn_rescans_work_arriving_after_its_last_pull() {
     let now = Instant::now();
-    let (scope, owner, _) = runtime(now);
+    let (scope, owner) = PacketScope::new(
+        config(),
+        MemoryBudget::new(32 << 20),
+        RuntimeLimits {
+            bulk_frames: 2,
+            ..limits()
+        },
+        now,
+    )
+    .unwrap();
     let mut driver = owner.hand_off();
     let wakes = Arc::new(DeviceWakes(AtomicUsize::new(0)));
     let waker = Waker::from(Arc::clone(&wakes));
     let mut cx = Context::from_waker(&waker);
     let mut frame = [0; 1280];
     let client = "10.0.0.2:40000".parse().unwrap();
+    let sender = scope.datagram_sender("203.0.113.9:53".parse().unwrap());
+    sender.send_to(b"queued", client).await.unwrap();
     driver.finish_turn(&mut cx, now);
     driver.begin_turn(now);
-    assert!(exported(&mut driver, &mut cx, TxClass::Control).is_none());
-    scope.receive(&segment(client, 1, 700, tcp::ACK, &[]), now);
-    drop(materialized(&mut driver, now, TxClass::Control, &mut frame));
-    for class in [TxClass::Control, TxClass::Bulk] {
-        assert!(
-            driver
-                .materialize_into(now, class, &mut frame)
-                .unwrap()
-                .is_none()
-        );
-    }
+    assert!(matches!(
+        driver
+            .materialize_into(now, TxClass::Control, &mut frame)
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
+    assert!(matches!(
+        driver
+            .materialize_into(now, TxClass::Bulk, &mut frame)
+            .unwrap(),
+        MaterializedOutput::CpuQueuePending
+    ));
+    let prefix = exported(&mut driver, &mut cx, TxClass::Bulk).unwrap();
+    assert!(prefix.packet().ends_with(b"queued"));
+    assert!(matches!(
+        driver
+            .materialize_into(now, TxClass::Bulk, &mut frame)
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     driver.finish_turn(&mut cx, now);
     assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
 
+    sender.send_to(b"first wake", client).await.unwrap();
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    prefix.release();
     driver.begin_turn(now);
-    assert!(exported(&mut driver, &mut cx, TxClass::Bulk).is_none());
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut frame)
-            .unwrap()
-            .is_none()
-    );
-    scope
-        .datagram_sender("203.0.113.9:53".parse().unwrap())
-        .send_to(b"late", client)
-        .await
-        .unwrap();
-    assert!(
+            .unwrap(),
+        MaterializedOutput::CpuQueuePending
+    ));
+    let prefix = exported(&mut driver, &mut cx, TxClass::Bulk).unwrap();
+    assert!(prefix.packet().ends_with(b"first wake"));
+    prefix.release();
+    assert!(matches!(
+        driver
+            .materialize_into(now, TxClass::Bulk, &mut frame)
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
+    sender.send_to(b"late", client).await.unwrap();
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Control, &mut frame)
-            .unwrap()
-            .is_none()
-    );
-    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
-    driver.finish_turn(&mut cx, now);
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    driver.finish_turn(&mut cx, now);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 2);
     let output = exported(&mut driver, &mut cx, TxClass::Bulk).unwrap();
     assert!(output.packet().ends_with(b"late"));
 }
@@ -564,12 +591,10 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     let before = scope.stats().unwrap().tx_packets;
     for class in [TxClass::Control, TxClass::Bulk] {
         for _ in 0..3 {
-            assert!(
-                driver
-                    .materialize_into(now, class, &mut packet)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(matches!(
+                driver.materialize_into(now, class, &mut packet).unwrap(),
+                MaterializedOutput::Idle
+            ));
             assert_eq!(packet, [0xa5; 1280]);
             let mut inner = scope.0.inner.lock();
             let lease = inner.ledger.reserve_tx(class).unwrap();
@@ -597,12 +622,12 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
         .ledger
         .reserve_tx(TxClass::Bulk)
         .unwrap();
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     assert_eq!(scope.stats().unwrap().tx_packets, before);
     assert_eq!(packet, [0xa5; 1280]);
     let stranger = "10.0.0.3:40001".parse().unwrap();
@@ -625,12 +650,12 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
         Poll::Ready(Ok(n)) if n == next.len()
     ));
     let before = scope.stats().unwrap().tx_packets;
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     assert_eq!(scope.stats().unwrap().tx_packets, before);
     assert_eq!(packet, original);
     {
@@ -679,12 +704,12 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     assert_eq!(decode_packet(&packet[..tx.len]).1, pending);
     scope.shutdown(true);
     drop(io);
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Closed
+    ));
     driver.finish_turn(&mut context(), now);
     assert!(scope.0.inner.lock().finished);
 }
@@ -716,12 +741,12 @@ async fn direct_udp_observes_atomic_cpu_fragment_prefix_for_both_families() {
         let before = scope.stats().unwrap().tx_packets;
         let mut packet = [0xa5; 1280];
         driver.begin_turn(now);
-        assert!(
+        assert!(matches!(
             driver
                 .materialize_into(now, TxClass::Bulk, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            MaterializedOutput::CpuQueuePending
+        ));
         assert_eq!(scope.stats().unwrap().tx_packets, before);
         assert_eq!(scope.0.inner.lock().queued, 1);
         assert_eq!(packet, [0xa5; 1280]);
@@ -779,20 +804,20 @@ async fn direct_udp_observes_atomic_cpu_fragment_prefix_for_both_families() {
         }
         assert!(completed);
         assert_eq!(offset, payload.len() + 8);
-        assert!(
+        assert!(matches!(
             driver
                 .materialize_into(now, TxClass::Bulk, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+                .unwrap(),
+            MaterializedOutput::Idle
+        ));
         for payload in [b"".as_slice(), b"ordinary".as_slice()] {
             sender.send_to(payload, client).await.unwrap();
-            assert!(
+            assert!(matches!(
                 driver
                     .materialize_into(now, TxClass::Bulk, &mut packet)
-                    .unwrap()
-                    .is_none()
-            );
+                    .unwrap(),
+                MaterializedOutput::CpuQueuePending
+            ));
             let cpu = exported(&mut driver, &mut context(), TxClass::Bulk).unwrap();
             let ip = wire::parse_ip(cpu.packet()).unwrap();
             assert_eq!(
@@ -1005,12 +1030,12 @@ fn direct_ack_before_output_return_keeps_original_credit_and_retirement() {
         0
     );
     let mut scratch = [0xa5; 1280];
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut scratch)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     assert_eq!(scope.0.inner.lock().ledger.outstanding_tx().count(), 1);
     io.abort();
     drop(io);
@@ -1074,10 +1099,11 @@ fn direct_output_return_before_ack_preserves_original_retransmit_bytes() {
             .max(time);
         assert!(time <= now + Duration::from_secs(2));
         driver.begin_turn(time);
-        if let Some(retransmit) = driver
+        if let MaterializedOutput::Packet(output) = driver
             .materialize_into(time, TxClass::Bulk, &mut frame)
             .unwrap()
         {
+            let retransmit = output.owner;
             let (header, bytes) = decode_packet(&frame[..retransmit.len()]);
             assert_eq!(
                 (header.seq, bytes.as_slice()),
@@ -1160,12 +1186,12 @@ fn direct_turn_refreshes_synack_app_ack_and_pending_close_before_last_disposal()
     drop(synack);
     let early = due - Duration::from_millis(1);
     driver.begin_turn(early);
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(early, TxClass::Control, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     driver.finish_turn(&mut cx, early);
     assert_eq!(driver.deadline(), Some(due));
     driver.begin_turn(due);
@@ -1283,12 +1309,10 @@ fn direct_blocked_turn_keeps_the_shared_budget_deadline_until_serviced() {
     for time in [now, now + READINESS_FALLBACK / 2] {
         driver.begin_turn(time);
         for class in [TxClass::Control, TxClass::Bulk] {
-            assert!(
-                driver
-                    .materialize_into(time, class, &mut packet)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(matches!(
+                driver.materialize_into(time, class, &mut packet).unwrap(),
+                MaterializedOutput::Idle
+            ));
         }
         driver.finish_turn(&mut cx, time);
         assert_eq!(driver.deadline(), Some(now + READINESS_FALLBACK));
@@ -1297,24 +1321,22 @@ fn direct_blocked_turn_keeps_the_shared_budget_deadline_until_serviced() {
     let due = now + READINESS_FALLBACK;
     driver.begin_turn(due);
     for class in [TxClass::Control, TxClass::Bulk] {
-        assert!(
-            driver
-                .materialize_into(due, class, &mut packet)
-                .unwrap()
-                .is_none()
-        );
+        assert!(matches!(
+            driver.materialize_into(due, class, &mut packet).unwrap(),
+            MaterializedOutput::Idle
+        ));
     }
     driver.finish_turn(&mut cx, due);
     assert_eq!(driver.deadline(), Some(due + READINESS_FALLBACK));
     drop(refund);
     let due = due + READINESS_FALLBACK;
     driver.begin_turn(due);
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(due, TxClass::Control, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     driver.finish_turn(&mut cx, due);
     assert!(matches!(
         std::pin::Pin::new(&mut io).poll_write(&mut writer_cx, &[9]),
@@ -1362,12 +1384,13 @@ fn direct_paced_none_refreshes_deadline_without_consuming_the_next_payload() {
     driver.begin_turn(now);
     let mut emitted = 0;
     for _ in 0..32 {
-        let Some(owner) = driver
+        let MaterializedOutput::Packet(output) = driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
             .unwrap()
         else {
             break;
         };
+        let owner = output.owner;
         let (header, bytes) = decode_packet(&packet[..owner.len()]);
         assert_eq!(header.seq, server_seq.wrapping_add(emitted as u32));
         assert_eq!(bytes, payload[emitted..emitted + bytes.len()]);
@@ -1375,12 +1398,12 @@ fn direct_paced_none_refreshes_deadline_without_consuming_the_next_payload() {
         drop(owner);
     }
     assert!(emitted > 0 && emitted < payload.len());
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     driver.finish_turn(&mut cx, now);
     let due = driver
         .deadline()
@@ -1391,12 +1414,12 @@ fn direct_paced_none_refreshes_deadline_without_consuming_the_next_payload() {
         scope.0.inner.lock().stack.as_ref().unwrap().poll_timeout()
     );
     driver.begin_turn(now);
-    assert!(
+    assert!(matches!(
         driver
             .materialize_into(now, TxClass::Bulk, &mut packet)
-            .unwrap()
-            .is_none()
-    );
+            .unwrap(),
+        MaterializedOutput::Idle
+    ));
     driver.finish_turn(&mut cx, now);
     assert_eq!(driver.deadline(), Some(due));
     driver.begin_turn(due);
