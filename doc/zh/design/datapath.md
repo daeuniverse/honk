@@ -151,6 +151,8 @@ routing {
 
 每个 Port 为 retained RX slot 预留 `R * 1024` 字节，其中 `R = min(rx_frames, ring_size)`。这些内存与 UMEM 及其他 capture 资源共用 384 MiB `CAPTURE_MEMORY` 预算（见 `honk-xsk/src/port.rs::RetainedRxSlots::{layout,new}` 与 `honk-core/src/xdp.rs::prepare`）。
 
+借用 RX 不占用 retained slot。Port 校验并取得整包的全部帧后才调用回调，在批末发布 RX consumer 并补充 FILL。后缀有误只提交已接纳的前缀；回调 panic 时关闭 Port，不发布该批，也不回收被中断包的帧。关闭后再次调用接收接口不能改变这个结果。即使先完成的 TX 帧已被复用，原包的 owner 槽也要等最后一个描述符完成后才归还空闲链表。
+
 Endpoint 启动时检查所有路由表中已安装的默认路由，包括 multipath 和 nexthop，拒绝任何可能经捕获端口及其下层出口的路由。运行时不监测这一条件，操作者须自行保持。捕获的以太网和 bond 接口允许有地址；Core 有自己的输入上下文 FIB 要求。物理入口没有经认证的进程身份；未启用 Host 时路由器本机发起的连接留在内核。
 
 Endpoint 的本机地址集合包含命名空间所有有效地址，包括 deprecated 但仍有效的 IPv6 地址。可分类的本机 TCP/UDP 目的地址交给内核，端口 53 例外，仍须经过策略。后续分片使用首片判定；后片先到时会丢弃。未连接 UDP 以及带 options、扩展头或分片的回复也依赖这一行为；如需本机 DNS listener 接收 53 流量，请按顺序配置静态 `direct(must)` 规则。
