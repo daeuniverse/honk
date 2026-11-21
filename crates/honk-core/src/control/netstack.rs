@@ -13,6 +13,9 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
 
@@ -129,6 +132,79 @@ impl fmt::Debug for PacketScope {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DirectRelayOwner {
+    pub(in crate::control) runtime: tokio::runtime::Handle,
+    pub(in crate::control) fence: Arc<DirectRelayFence>,
+}
+
+const RELAY_CLOSED: usize = 1 << (usize::BITS - 1);
+
+pub(crate) struct DirectRelayFence {
+    state: AtomicUsize,
+    changed: Notify,
+    _memory: MemoryReservation,
+}
+
+pub(in crate::control) struct DirectRelayLease<'a>(&'a DirectRelayFence);
+
+impl Drop for DirectRelayLease<'_> {
+    fn drop(&mut self) {
+        if self.0.state.fetch_sub(1, Ordering::AcqRel) == RELAY_CLOSED + 1 {
+            self.0.changed.notify_waiters();
+        }
+    }
+}
+
+impl DirectRelayFence {
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) fn new(budget: &Arc<MemoryBudget>) -> io::Result<Arc<Self>> {
+        let memory = budget
+            .reserve(size_of::<Self>() + 2 * size_of::<usize>())
+            .ok_or_else(capacity)?;
+        Ok(Arc::new(Self {
+            state: AtomicUsize::new(0),
+            changed: Notify::new(),
+            _memory: memory,
+        }))
+    }
+
+    pub(in crate::control) fn try_join_lease(&self) -> Option<DirectRelayLease<'_>> {
+        self.state
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                (state < RELAY_CLOSED - 1).then(|| state + 1)
+            })
+            .ok()?;
+        Some(DirectRelayLease(self))
+    }
+
+    /// Wait while holding an active join lease. Calls after closure return immediately.
+    pub(in crate::control) async fn wait_closed(&self) {
+        let notified = self.changed.notified();
+        if self.state.load(Ordering::Acquire) & RELAY_CLOSED == 0 {
+            notified.await;
+        }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) async fn close_and_join(&self) {
+        let previous = self.state.fetch_or(RELAY_CLOSED, Ordering::AcqRel);
+        if previous & !RELAY_CLOSED == 0 {
+            return;
+        }
+        if previous & RELAY_CLOSED == 0 {
+            self.changed.notify_waiters();
+        }
+        loop {
+            let notified = self.changed.notified();
+            if self.state.load(Ordering::Acquire) == RELAY_CLOSED {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 struct Shared {
     scope: ScopeId,
     worker: usize,
@@ -136,6 +212,8 @@ struct Shared {
     budget: Arc<MemoryBudget>,
     inner: Mutex<Inner>,
     owner_wake: Notify,
+    #[cfg(target_os = "linux")]
+    direct_relay_runtime: OnceLock<DirectRelayOwner>,
     #[cfg(all(test, feature = "native-api"))]
     startup_pause: Mutex<
         Option<(
@@ -440,6 +518,8 @@ impl PacketScope {
                 _storage: storage,
             }),
             owner_wake: Notify::new(),
+            #[cfg(target_os = "linux")]
+            direct_relay_runtime: OnceLock::new(),
             #[cfg(all(test, feature = "native-api"))]
             startup_pause: Mutex::new(None),
             _metadata: metadata,
@@ -505,6 +585,18 @@ impl PacketScope {
 
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn publish_direct_relay_runtime(
+        &self,
+        runtime: tokio::runtime::Handle,
+        fence: Arc<DirectRelayFence>,
+    ) -> io::Result<()> {
+        self.0
+            .direct_relay_runtime
+            .set(DirectRelayOwner { runtime, fence })
+            .map_err(|_| invalid("direct relay runtime already published"))
     }
 
     fn peer_bytes(aliases: usize) -> Option<usize> {

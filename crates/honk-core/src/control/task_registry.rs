@@ -1,3 +1,8 @@
+use futures::{
+    FutureExt,
+    future::{AbortHandle, AbortRegistration},
+    task::AtomicWaker,
+};
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use std::io;
 use std::pin::Pin;
@@ -8,6 +13,9 @@ use std::task::{Context, Poll};
 // Tokio task headers, JoinSet links and alignment; the future and buffers are charged separately.
 pub(super) const TASK_BOOKKEEPING: usize = 512;
 
+// The abort pair shares an Arc allocation for the waker and flag, including header and padding.
+const ABORT_PAIR_MEMORY: usize = size_of::<AtomicWaker>() + 5 * size_of::<usize>();
+
 #[derive(Default)]
 pub(super) struct TaskRegistry {
     pub(super) closed: bool,
@@ -16,9 +24,32 @@ pub(super) struct TaskRegistry {
 }
 
 struct TaskCharge {
-    id: tokio::task::Id,
-    result: Option<Result<(), tokio::task::JoinError>>,
+    state: TaskState,
     _memory: MemoryReservation,
+}
+
+enum TaskState {
+    Ordinary(tokio::task::AbortHandle),
+    Scoped(tokio::task::Id, AbortHandle),
+    Joined(tokio::task::Id),
+    JoinError(tokio::task::JoinError),
+}
+
+impl TaskCharge {
+    fn id(&self) -> tokio::task::Id {
+        match &self.state {
+            TaskState::Ordinary(handle) => handle.id(),
+            TaskState::Scoped(id, _) | TaskState::Joined(id) => *id,
+            TaskState::JoinError(error) => error.id(),
+        }
+    }
+}
+
+fn joined_id(result: &Result<(tokio::task::Id, ()), tokio::task::JoinError>) -> tokio::task::Id {
+    match result {
+        Ok((id, ())) => *id,
+        Err(error) => error.id(),
+    }
 }
 
 struct TaskCharges {
@@ -33,39 +64,27 @@ struct TaskCharges {
 struct TaskReaper {
     tasks: tokio::task::JoinSet<()>,
     charges: TaskCharges,
-    next: usize,
 }
 
 impl Future for TaskReaper {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let Self {
-            tasks,
-            charges,
-            next,
-        } = self.get_mut();
-        while let Some(entry) = charges.entries.get_mut(*next) {
-            let Some(slot) = entry else {
-                *next += 1;
-                continue;
+        let Self { tasks, charges } = self.get_mut();
+        while let Some(result) = std::task::ready!(tasks.poll_join_next_with_id(cx)) {
+            let key = Some(joined_id(&result));
+            let index = charges
+                .entries
+                .binary_search_by_key(&key, |slot| slot.as_ref().map(TaskCharge::id))
+                .expect("accounted task charge");
+            // A panic payload may panic on Drop, so retain every result until all joins.
+            charges.entries[index].as_mut().unwrap().state = match result {
+                Ok((id, ())) => TaskState::Joined(id),
+                Err(error) => TaskState::JoinError(error),
             };
-            match tasks.poll_join_next_with_id(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => break,
-                Poll::Ready(Some(result)) => {
-                    // A panic payload may panic on Drop, so retain every result until all joins.
-                    slot.result = Some(result.map(|(_, ())| ()));
-                    charges.completed.fetch_sub(1, Ordering::AcqRel);
-                    *next += 1;
-                }
-            }
+            charges.completed.fetch_sub(1, Ordering::AcqRel);
         }
-        if tasks.is_empty() {
-            Poll::Ready(())
-        } else {
-            Poll::Pending
-        }
+        Poll::Ready(())
     }
 }
 
@@ -74,20 +93,20 @@ impl Drop for TaskRegistry {
         if self.tasks.is_empty() || self.charges.is_none() {
             return;
         }
-        self.tasks.abort_all();
+        self.abort_all();
         let tasks = std::mem::take(&mut self.tasks);
-        let charges = self.charges.take().expect("accounted registry");
+        let mut charges = self.charges.take().expect("accounted registry");
+        // Index live handles and retained results in place so the reaper needs no extra table.
+        charges
+            .entries
+            .sort_unstable_by_key(|slot| slot.as_ref().map(TaskCharge::id));
         // The embedding must keep this runtime running until owned cleanup completes.
         let runtime = charges
             .runtime
             .as_ref()
             .expect("accounted task runtime")
             .clone();
-        drop(runtime.spawn(TaskReaper {
-            tasks,
-            charges,
-            next: 0,
-        }));
+        drop(runtime.spawn(TaskReaper { tasks, charges }));
     }
 }
 struct Completed(Arc<AtomicUsize>);
@@ -144,7 +163,17 @@ impl TaskRegistry {
         self.tasks.is_empty()
     }
     pub(super) fn abort_all(&mut self) {
-        self.tasks.abort_all();
+        if let Some(charges) = &self.charges {
+            for task in charges.entries.iter().flatten() {
+                match &task.state {
+                    TaskState::Ordinary(handle) => handle.abort(),
+                    TaskState::Scoped(_, handle) => handle.abort(),
+                    TaskState::Joined(_) | TaskState::JoinError(_) => {}
+                }
+            }
+        } else {
+            self.tasks.abort_all();
+        }
     }
 
     #[cfg(test)]
@@ -175,58 +204,105 @@ impl TaskRegistry {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.check_open()?;
+        if self.charges.is_none() {
+            return Ok(self.tasks.spawn(create()));
+        }
+        self.spawn_accounted(
+            |completed| {
+                let future = create();
+                let completed = Completed(completed);
+                (future.map(move |()| drop(completed)), None)
+            },
+            buffers,
+            Some(size_of::<F>() + size_of::<Completed>()),
+        )
+        .map(|task| task.expect("ordinary task abort handle"))
+    }
+
+    /// The registration cancels the work while the funded task can still join its owner.
+    pub(super) fn spawn_scoped_with<F>(
+        &mut self,
+        create: impl FnOnce(AbortRegistration) -> F,
+        buffers: usize,
+    ) -> io::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.check_open()?;
+        let buffers = buffers
+            .checked_add(ABORT_PAIR_MEMORY)
+            .ok_or_else(capacity_error)?;
+        self.spawn_accounted(
+            |completed| {
+                let (abort, registration) = AbortHandle::new_pair();
+                let future = create(registration);
+                let completed = Completed(completed);
+                (future.map(move |()| drop(completed)), Some(abort))
+            },
+            buffers,
+            None,
+        )
+        .map(|_| ())
+    }
+
+    fn check_open(&self) -> io::Result<()> {
         if self.closed {
             return Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "task admission closed",
             ));
         }
-        let Some(charges) = &mut self.charges else {
-            return Ok(self.tasks.spawn(create()));
-        };
+        Ok(())
+    }
+
+    fn spawn_accounted<F>(
+        &mut self,
+        create: impl FnOnce(Arc<AtomicUsize>) -> (F, Option<AbortHandle>),
+        buffers: usize,
+        ordinary_future_bytes: Option<usize>,
+    ) -> io::Result<Option<tokio::task::AbortHandle>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let charges = self.charges.as_mut().ok_or_else(capacity_error)?;
         let index = charges
             .entries
             .iter()
             .position(Option::is_none)
             .ok_or_else(capacity_error)?;
-        let bytes = size_of::<F>()
-            .checked_add(TASK_BOOKKEEPING + size_of::<Completed>())
+        let bytes = ordinary_future_bytes
+            .unwrap_or(size_of::<F>())
+            .checked_add(TASK_BOOKKEEPING)
             .and_then(|n| n.checked_add(buffers))
             .ok_or_else(capacity_error)?;
         let memory = charges.budget.reserve(bytes).ok_or_else(capacity_error)?;
         let runtime = charges
             .runtime
             .get_or_insert_with(tokio::runtime::Handle::current);
-        let future = create();
-        let completed = Completed(Arc::clone(&charges.completed));
-        let task = self.tasks.spawn_on(
-            async move {
-                future.await;
-                drop(completed);
-            },
-            runtime,
-        );
+        let (future, scoped_abort) = create(Arc::clone(&charges.completed));
+        let task = self.tasks.spawn_on(future, runtime);
+        let (state, exposed) = match scoped_abort {
+            Some(handle) => (TaskState::Scoped(task.id(), handle), None),
+            None => (TaskState::Ordinary(task.clone()), Some(task)),
+        };
         charges.entries[index] = Some(TaskCharge {
-            id: task.id(),
-            result: None,
+            state,
             _memory: memory,
         });
-        Ok(task)
+        Ok(exposed)
     }
 
     fn joined(
         &mut self,
         result: Result<(tokio::task::Id, ()), tokio::task::JoinError>,
     ) -> Result<(), tokio::task::JoinError> {
-        let id = match &result {
-            Ok((id, _)) => *id,
-            Err(error) => error.id(),
-        };
+        let id = joined_id(&result);
         if let Some(charges) = &mut self.charges
             && let Some(slot) = charges
                 .entries
                 .iter_mut()
-                .find(|slot| slot.as_ref().is_some_and(|charge| charge.id == id))
+                .find(|slot| slot.as_ref().is_some_and(|charge| charge.id() == id))
         {
             slot.take();
             assert!(charges.completed.fetch_sub(1, Ordering::AcqRel) != 0);
@@ -294,6 +370,119 @@ mod tests {
         drop(task);
         tasks.join_next().await.unwrap().unwrap();
         drop(tasks);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn scoped_admission_refusal_keeps_owners_for_shared_admission() {
+        let budget = MemoryBudget::new(4096);
+        let mut tasks = TaskRegistry::accounted(1, &budget).unwrap();
+        let ordinary_bytes =
+            TASK_BOOKKEEPING + size_of::<Completed>() + size_of::<std::future::Ready<()>>();
+        let _competitor = budget
+            .reserve(budget.limit() - budget.used() - ordinary_bytes)
+            .unwrap();
+        let baseline = budget.used();
+        let mut owners = Some(Box::new(42));
+        let create = |owners: &mut Option<Box<u8>>| {
+            assert_eq!(*owners.take().unwrap(), 42);
+            std::future::ready(())
+        };
+
+        let error = tasks
+            .spawn_scoped_with(|_| create(&mut owners), 0)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert!(owners.is_some());
+        assert_eq!(budget.used(), baseline);
+
+        drop(tasks.spawn_with(|| create(&mut owners), 0).unwrap());
+        assert!(owners.is_none());
+        assert_eq!(budget.used(), budget.limit());
+        tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(budget.used(), baseline);
+    }
+
+    #[test]
+    fn dropped_registry_cancels_scoped_work_and_funds_joined_cleanup() {
+        use futures::future::Abortable;
+        use std::future::pending;
+        use std::time::Duration;
+        use tokio::runtime::{Builder, Handle};
+
+        let shared = Builder::new_current_thread().enable_time().build().unwrap();
+        let owner = Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let owner_handle = owner.handle().clone();
+        let (started, ready) = oneshot::channel();
+        let (cancelled, cancelling) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let (cleaned, cleanup) = oneshot::channel();
+        let (ordinary, ordinary_dropped) = oneshot::channel::<()>();
+        let budget = MemoryBudget::new(256 << 10);
+        let mut tasks = TaskRegistry::accounted(2, &budget).unwrap();
+        let timeout = Duration::from_secs(3);
+        let buffers = 65536;
+
+        shared.block_on(async {
+            tasks
+                .spawn(
+                    async move {
+                        pending::<()>().await;
+                        drop(ordinary);
+                    },
+                    0,
+                )
+                .map(drop)
+                .unwrap();
+            tasks
+                .spawn_scoped_with(
+                    |registration| async move {
+                        owner_handle
+                            .spawn(async move {
+                                let held = vec![0x5a_u8; buffers];
+                                let work = async move {
+                                    started.send(Handle::current().id()).unwrap();
+                                    pending::<()>().await;
+                                };
+                                assert!(Abortable::new(work, registration).await.is_err());
+                                cancelled.send(()).unwrap();
+                                released.await.unwrap();
+                                std::hint::black_box(held);
+                            })
+                            .await
+                            .unwrap();
+                        cleaned.send(Handle::current().id()).unwrap();
+                    },
+                    buffers,
+                )
+                .unwrap();
+            let owner_id = tokio::time::timeout(timeout, ready).await.unwrap().unwrap();
+            assert_eq!(owner_id, owner.handle().id());
+        });
+        let funded = budget.used();
+        let competitor = budget.reserve(budget.limit() - funded).unwrap();
+
+        drop(tasks);
+
+        shared.block_on(async {
+            tokio::time::timeout(timeout, async {
+                cancelling.await.unwrap();
+                assert!(ordinary_dropped.await.is_err());
+                assert_eq!(budget.used(), budget.limit());
+                assert!(budget.reserve(1).is_none());
+                release.send(()).unwrap();
+                assert_eq!(cleanup.await.unwrap(), shared.handle().id());
+                while budget.used() != budget.limit() - funded {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        drop(competitor);
         assert_eq!(budget.used(), 0);
     }
 

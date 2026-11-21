@@ -1,5 +1,8 @@
 use super::*;
-use crate::control::netstack::{FlowIo, OutputLease, PacketOwner, PacketScope, RuntimeLimits};
+use crate::control::netstack::{
+    DirectRelayFence, DirectRelayOwner, FlowIo, OutputLease, PacketOwner, PacketScope,
+    RuntimeLimits,
+};
 use crate::control::tests::support::{canonical_socks5, dns_query_payload};
 use anyhow::Context as _;
 use honk_netstack::{ExcludeSet, FlowId, MemoryBudget, Mode, Stack, StreamError, TcpState};
@@ -23,6 +26,13 @@ struct Wire {
 
 impl Wire {
     fn connect(destination: SocketAddr) -> anyhow::Result<(Self, FlowIo)> {
+        Self::connect_with_send_limit(destination, 64 << 10)
+    }
+
+    fn connect_with_send_limit(
+        destination: SocketAddr,
+        send_limit: usize,
+    ) -> anyhow::Result<(Self, FlowIo)> {
         let now = std::time::Instant::now();
         let budget = MemoryBudget::new(64 << 20);
         let mut cfg = honk_netstack::Config::new([31; 32]);
@@ -30,7 +40,7 @@ impl Wire {
         cfg.memory_limit = 2 << 20;
         cfg.half_open_max = 8;
         cfg.tcp_rcv_buf_max = 64 << 10;
-        cfg.tcp_snd_buf_max = 64 << 10;
+        cfg.tcp_snd_buf_max = send_limit;
         cfg.mode = Mode::Transparent {
             exclude: ExcludeSet::default(),
         };
@@ -166,6 +176,13 @@ impl Wire {
         .await
     }
 
+    fn relay_owner(&self, runtime: &tokio::runtime::Handle) -> anyhow::Result<DirectRelayOwner> {
+        Ok(DirectRelayOwner {
+            runtime: runtime.clone(),
+            fence: DirectRelayFence::new(&self.budget)?,
+        })
+    }
+
     async fn finish(mut self) {
         self.held = None;
         self.scope.shutdown(true);
@@ -175,6 +192,641 @@ impl Wire {
         drop(self);
         assert_eq!(budget.used(), 0);
     }
+}
+
+const RELAY_WAIT: Duration = Duration::from_secs(5);
+const MEASURED_SELECTOR: &str = "measured_direct";
+const RELAY_MEMORY: usize = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
+
+fn select_leaf(config: &mut Config, leaf: uuid::Uuid) {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    config.groups.push(Group {
+        name: MEASURED_SELECTOR.into(),
+        policy: honk_config::group::GroupPolicy::Selector,
+        nodes: vec![leaf],
+        ..Default::default()
+    });
+    config.routing.rules.push(RoutingRule {
+        name: "packet-tcp".into(),
+        condition: RoutingCondition {
+            protocol: vec!["tcp".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple(MEASURED_SELECTOR.into()),
+        priority: 0,
+        must: false,
+        mark: None,
+    });
+    config.routing.default_outbound = "block".into();
+}
+
+fn relay_runtime() -> std::io::Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+}
+
+fn wait_synchronously(reason: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + RELAY_WAIT;
+    while !ready() {
+        assert!(std::time::Instant::now() < deadline, "{reason}");
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn owned_packet_cancel_during_sniff_needs_no_owner_or_packet_driver() -> anyhow::Result<()> {
+    let owner = relay_runtime()?;
+    let shared = relay_runtime()?;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    shared.block_on(async {
+        let (wire, flow) = Wire::connect(listener.local_addr()?)?;
+        let funding = flow.reserve_memory(RELAY_MEMORY)?;
+        let target = wire.relay_owner(owner.handle())?;
+        let fence = Arc::clone(&target.fence);
+        let mut config = config();
+        config.global.dial_mode = "domain+".into();
+        select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
+        let plane = plane(config)?;
+        let handle = plane.spawn_handle();
+        handle.connection_tracker.enable();
+        let (abort, registration) = futures::future::AbortHandle::new_pair();
+        {
+            let serving = handle.serve_owned_packet_connection(flow, target, registration);
+            tokio::pin!(serving);
+            assert!(futures::poll!(&mut serving).is_pending());
+            abort.abort();
+            tokio::time::timeout(RELAY_WAIT, serving).await??;
+        }
+        assert!(futures::poll!(std::pin::pin!(fence.close_and_join())).is_ready());
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(handle.connection_tracker.snapshot().is_empty());
+        let stats = handle
+            .stats
+            .outbound_tracker(MEASURED_SELECTOR, crate::stats::OutboundKind::Group)
+            .snapshot();
+        assert_eq!(
+            (stats.total_conns, stats.tx_bytes, stats.rx_bytes),
+            (0, 0, 0)
+        );
+        assert_eq!(wire.qualified_rx, 0);
+        drop(fence);
+        drop(funding);
+        tokio::time::timeout(RELAY_WAIT, wire.finish()).await?;
+        Ok(())
+    })
+}
+
+#[test]
+fn owned_packet_direct_relays_with_shared_thread_frozen_and_joins_on_abort() -> anyhow::Result<()> {
+    owned_packet_direct_relay(DirectRelayCase::RegistryAbort)
+}
+
+#[test]
+fn owned_packet_direct_writes_sniffed_http_prefix_on_owner_once() -> anyhow::Result<()> {
+    owned_packet_direct_relay(DirectRelayCase::SniffedPrefix)
+}
+
+#[test]
+fn owned_packet_direct_tracker_close_stops_owner_before_packet_retirement() -> anyhow::Result<()> {
+    owned_packet_direct_relay(DirectRelayCase::TrackerClose)
+}
+
+enum DirectRelayCase {
+    RegistryAbort,
+    SniffedPrefix,
+    TrackerClose,
+}
+
+async fn accept_tracked_direct(
+    listener: &TcpListener,
+    handle: &ControlPlaneHandle,
+    serving: impl Future<Output = anyhow::Result<()>>,
+) -> anyhow::Result<std::net::TcpStream> {
+    let ready = async {
+        let (peer, _) = listener.accept().await?;
+        while handle.connection_tracker.snapshot().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        peer.into_std()
+    };
+    let peer = tokio::select! {
+        biased;
+        result = serving => anyhow::bail!("relay ended before transfer: {result:?}"),
+        peer = tokio::time::timeout(RELAY_WAIT, ready) => peer??,
+    };
+    let tracked = handle.connection_tracker.snapshot();
+    assert_eq!(tracked.len(), 1);
+    assert_eq!(
+        tracked[0].chains,
+        [Config::BUILTIN_DIRECT_NODE, MEASURED_SELECTOR]
+    );
+    Ok(peer)
+}
+
+fn owned_packet_direct_relay(case: DirectRelayCase) -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+
+    const WINDOW: usize = 4096;
+    let (dial_mode, prefix): (&str, &[u8]) = match case {
+        DirectRelayCase::SniffedPrefix => (
+            "domain+",
+            b"GET /prefix HTTP/1.1\r\nHost: prefix.example\r\n\r\n",
+        ),
+        _ => ("ip", b""),
+    };
+    let tracker_close = matches!(case, DirectRelayCase::TrackerClose);
+    let shared = relay_runtime()?;
+    let owner = relay_runtime()?;
+    let owner_handle = owner.handle().clone();
+    assert_ne!(owner_handle.id(), shared.handle().id());
+    std::thread::scope(|threads| {
+        // The sender drops before the scoped join, including during assertion unwinds.
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let owner_runtime = &owner;
+        shared.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let (mut wire, flow) = Wire::connect_with_send_limit(listener.local_addr()?, WINDOW)?;
+            let flow_id = flow.flow_id();
+            let funding = flow.reserve_memory(RELAY_MEMORY)?;
+            let mut config = config();
+            config.global.dial_mode = dial_mode.into();
+            select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
+            let plane = plane(config)?;
+            let handle = plane.spawn_handle();
+            handle.connection_tracker.enable();
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            let mut serving = Box::pin(handle.serve_owned_packet_connection(
+                flow,
+                wire.relay_owner(&owner_handle)?,
+                registration,
+            ));
+            if !prefix.is_empty() {
+                wire.send(prefix);
+            }
+            let mut peer = accept_tracked_direct(&listener, &handle, serving.as_mut()).await?;
+            if !prefix.is_empty() {
+                let tracked = handle.connection_tracker.snapshot();
+                assert_eq!(tracked[0].domain.as_deref(), Some("prefix.example"));
+                assert_eq!(tracked[0].upload, 0);
+                assert_eq!(
+                    peer.read(&mut [0]).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "shared wrote the sniff prefix before the owner was polled"
+                );
+            }
+            peer.set_nonblocking(false)?;
+            peer.set_read_timeout(Some(RELAY_WAIT))?;
+            peer.set_write_timeout(Some(RELAY_WAIT))?;
+
+            wire.send(b"a");
+            // Dial and winner publication completed on shared while the owner was unpolled.
+            threads.spawn(move || {
+                let _ = owner_runtime.block_on(stopped);
+            });
+            if !prefix.is_empty() {
+                let mut received = vec![0; prefix.len()];
+                peer.read_exact(&mut received)?;
+                assert_eq!(received, prefix);
+            }
+            // Shared stays frozen until the peer and packet client have received their bytes.
+            let mut singleton = [0];
+            peer.read_exact(&mut singleton)
+                .context("first Direct byte did not reach upstream while shared was frozen")?;
+            assert_eq!(&singleton, b"a");
+
+            let response: Vec<_> = (0..2 * WINDOW + 1).map(|i| (i % 251) as u8).collect();
+            let outbound = handle
+                .stats
+                .outbound_tracker(MEASURED_SELECTOR, crate::stats::OutboundKind::Group);
+            peer.write_all(&response)?;
+            // The tracker counts socket reads. Once it exceeds the window, the next owner
+            // turn proves the relay has actually parked on an unacknowledged packet write.
+            wait_synchronously("relay did not read beyond the packet send buffer", || {
+                outbound.snapshot().rx_bytes > WINDOW as u64
+            });
+            let (turn, ran) = mpsc::channel();
+            owner_handle.spawn(async move {
+                let _ = turn.send(());
+            });
+            ran.recv_timeout(RELAY_WAIT)?;
+            assert!(wire.received.is_empty());
+            wire.hold_data = true;
+            let half_close = !prefix.is_empty();
+            if half_close {
+                peer.shutdown(std::net::Shutdown::Write)?;
+            }
+            // Queue the reverse byte while the download is window-blocked. The half-closed
+            // peer must still receive it even when the test thread is descheduled.
+            wire.send(b"b");
+            peer.read_exact(&mut singleton)?;
+            assert_eq!(&singleton, b"b");
+            wait_synchronously("ACKs did not resume the download", || {
+                wire.pump();
+                wire.received.len() == response.len() && (!half_close || wire.eof)
+            });
+            assert_eq!(wire.received, response);
+            assert_eq!(wire.held.as_ref().unwrap().flow_id(), Some(flow_id));
+            assert_eq!(wire.eof, half_close);
+            let state = if half_close {
+                TcpState::CloseWait
+            } else {
+                TcpState::Established
+            };
+            assert_eq!(wire.client.tcp_state(wire.id), Some(state));
+            assert!(wire.qualified_rx > 0);
+
+            let id = handle
+                .connection_tracker
+                .snapshot()
+                .pop()
+                .expect("live Direct connection")
+                .id;
+            let closing = handle.connection_tracker.close_id(&id);
+            tokio::pin!(closing);
+            if tracker_close {
+                peer.set_nonblocking(true)?;
+                assert_eq!(
+                    peer.peek(&mut singleton)
+                        .expect_err("upstream must still be open before tracker close")
+                        .kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                peer.set_nonblocking(false)?;
+                assert!(futures::poll!(&mut closing).is_pending());
+                // The owner must stop the socket while the shared connection task is unpolled.
+                assert_eq!(
+                    peer.read(&mut singleton)
+                        .context("tracker close did not stop the owner socket")?,
+                    0,
+                    "expected upstream EOF before resuming shared"
+                );
+
+                tokio::time::timeout(RELAY_WAIT, async {
+                    loop {
+                        assert!(futures::poll!(&mut serving).is_pending());
+                        wire.pump();
+                        if wire.eof {
+                            assert_eq!(wire.client.tcp_state(wire.id), Some(TcpState::CloseWait));
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .context("joined relay did not send a packet FIN")?;
+
+                wire.client.tcp_shutdown(wire.id)?;
+                wait_synchronously("packet FIN/ACK did not reach TIME_WAIT", || {
+                    wire.pump();
+                    wire.client.tcp_state(wire.id) == Some(TcpState::Closed)
+                        && wire.scope.stats().unwrap().timewait_entries == 1
+                });
+                // Expire the protocol owner so only the exported lease can hold close open.
+                wire.now += Duration::from_secs(60);
+                wire.pump();
+                let protocol = wire.scope.stats().unwrap();
+                assert_eq!((protocol.flows, protocol.timewait_entries), (0, 0));
+                assert!(futures::poll!(&mut serving).is_pending());
+            } else if half_close {
+                abort.abort();
+            } else {
+                let (park, parked) = mpsc::channel();
+                let (resume, resumed) = mpsc::channel::<()>();
+                let blocker = owner_handle.spawn(async move {
+                    park.send((
+                        tokio::runtime::Handle::current().id(),
+                        std::thread::current().id(),
+                    ))
+                    .unwrap();
+                    resumed.recv_timeout(RELAY_WAIT)
+                });
+                let (runtime, thread) = parked.recv_timeout(RELAY_WAIT)?;
+                assert_eq!(runtime, owner_handle.id());
+                assert_ne!(thread, std::thread::current().id());
+                abort.abort();
+                assert!(
+                    futures::poll!(&mut serving).is_pending(),
+                    "abort must join the parked owner"
+                );
+                resume.send(())?;
+                tokio::time::timeout(RELAY_WAIT, blocker).await???;
+            }
+            if !tracker_close {
+                tokio::time::timeout(RELAY_WAIT, &mut serving).await??;
+                assert_eq!(peer.read(&mut singleton)?, 0);
+            }
+            wire.pump();
+
+            let tracked = handle.connection_tracker.snapshot();
+            assert_eq!(tracked.len(), 1);
+            assert_eq!(tracked[0].id, id);
+            let bytes = response.len() as u64;
+            let upload = prefix.len() as u64 + 2;
+            assert_eq!((tracked[0].upload, tracked[0].download), (upload, bytes));
+            assert!(
+                futures::poll!(&mut closing).is_pending(),
+                "an exported packet still owns the flow"
+            );
+            let stats = outbound.snapshot();
+            assert_eq!((stats.active_conns, stats.total_conns), (1, 1));
+            wire.held.take().unwrap().release();
+            wire.pump();
+            if tracker_close {
+                tokio::time::timeout(RELAY_WAIT, &mut serving).await??;
+                assert!(wire.scope.is_protocol_quiescent());
+            }
+            drop(serving);
+            assert_eq!(
+                tokio::time::timeout(RELAY_WAIT, closing).await?,
+                crate::connection_tracker::CloseOutcome::Closed
+            );
+            assert!(handle.connection_tracker.snapshot().is_empty());
+            let stats = outbound.snapshot();
+            assert_eq!((stats.active_conns, stats.total_conns), (0, 1));
+            assert_eq!((stats.tx_bytes, stats.rx_bytes), (upload, bytes));
+            drop(funding);
+            tokio::time::timeout(RELAY_WAIT, wire.finish()).await?;
+            Ok(())
+        })
+    })
+}
+
+#[test]
+fn owned_packet_direct_completed_reset_survives_logical_abort() -> anyhow::Result<()> {
+    use tokio::sync::mpsc::{UnboundedSender, error::TryRecvError, unbounded_channel};
+
+    struct JoinWake(UnboundedSender<()>);
+    impl futures::task::ArcWake for JoinWake {
+        fn wake_by_ref(wake: &Arc<Self>) {
+            let _ = wake.0.send(());
+        }
+    }
+
+    let shared = relay_runtime()?;
+    let owner = relay_runtime()?;
+    assert_ne!(owner.handle().id(), shared.handle().id());
+    let listener = shared.block_on(TcpListener::bind("127.0.0.1:0"))?;
+    let (mut wire, flow) = Wire::connect(listener.local_addr()?)?;
+    let funding = flow.reserve_memory(RELAY_MEMORY)?;
+    let flow_id = flow.flow_id();
+    let mut retirement = flow.retirement();
+    let mut config = config();
+    select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
+    let plane = shared.block_on(async { plane(config) })?;
+    let handle = plane.spawn_handle();
+    handle.connection_tracker.enable();
+    let outbound = handle
+        .stats
+        .outbound_tracker(MEASURED_SELECTOR, crate::stats::OutboundKind::Group);
+    let (abort, registration) = futures::future::AbortHandle::new_pair();
+    let mut serving = Box::pin(handle.serve_owned_packet_connection(
+        flow,
+        wire.relay_owner(owner.handle())?,
+        registration,
+    ));
+    let peer = shared.block_on(accept_tracked_direct(&listener, &handle, serving.as_mut()))?;
+    // No cancellation or fence close can wake this fresh join waiter before the peer resets.
+    let (notify, mut wakes) = unbounded_channel();
+    let waker = futures::task::waker(Arc::new(JoinWake(notify)));
+    {
+        let _entered = shared.enter();
+        assert!(
+            serving
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+    }
+    owner.block_on(async {
+        let mut peer = tokio::net::TcpStream::from_std(peer)?;
+        wire.send(b"x");
+        let mut byte = [0];
+        tokio::time::timeout(RELAY_WAIT, peer.read_exact(&mut byte)).await??;
+        assert_eq!(&byte, b"x");
+        wire.hold_data = true;
+        tokio::time::timeout(RELAY_WAIT, peer.write_all(b"y")).await??;
+        wire.until(|wire| wire.held.is_some()).await?;
+        assert_eq!(wire.received, b"y");
+        assert_eq!(wire.held.as_ref().unwrap().flow_id(), Some(flow_id));
+        assert!(matches!(wakes.try_recv(), Err(TryRecvError::Empty)));
+        socket2::SockRef::from(&peer).set_linger(Some(Duration::ZERO))?;
+        drop(peer);
+        tokio::time::timeout(RELAY_WAIT, wakes.recv())
+            .await?
+            .context("owner join waker was dropped")?;
+        Ok::<_, anyhow::Error>(())
+    })?;
+    assert_eq!(outbound.snapshot().errors, 0);
+    abort.abort();
+    shared.block_on(async {
+        tokio::time::timeout(RELAY_WAIT, &mut serving).await??;
+        drop(serving);
+        assert_eq!(
+            outbound.snapshot().errors,
+            1,
+            "completed owner reset must count once"
+        );
+        wire.pump();
+        assert_eq!(outbound.snapshot().active_conns, 1);
+        {
+            let wait = retirement.wait();
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+            wire.held.take().unwrap().release();
+            wire.pump();
+            tokio::time::timeout(RELAY_WAIT, wait).await??;
+        }
+        drop(retirement);
+        drop(funding);
+        tokio::time::timeout(RELAY_WAIT, wire.finish()).await?;
+        assert!(handle.connection_tracker.snapshot().is_empty());
+        let stats = outbound.snapshot();
+        assert_eq!(
+            (stats.total_conns, stats.active_conns, stats.errors),
+            (1, 0, 1)
+        );
+        assert_eq!((stats.tx_bytes, stats.rx_bytes), (1, 1));
+        Ok(())
+    })
+}
+
+#[test]
+fn fatal_fence_joins_blocked_direct_owner_before_packet_retirement() -> anyhow::Result<()> {
+    use std::io::{ErrorKind, Read};
+
+    const WINDOW: usize = 4096;
+    let shared = relay_runtime()?;
+    let owner = relay_runtime()?;
+    let listener = shared.block_on(TcpListener::bind("127.0.0.1:0"))?;
+    let (mut wire, flow) = Wire::connect_with_send_limit(listener.local_addr()?, WINDOW)?;
+    let funding = flow.reserve_memory(RELAY_MEMORY)?;
+    let target = wire.relay_owner(owner.handle())?;
+    let fence = Arc::clone(&target.fence);
+    let flow_id = flow.flow_id();
+    let mut config = config();
+    select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
+    let plane = shared.block_on(async { plane(config) })?;
+    let handle = plane.spawn_handle();
+    handle.connection_tracker.enable();
+    let outbound = handle
+        .stats
+        .outbound_tracker(MEASURED_SELECTOR, crate::stats::OutboundKind::Group);
+    let worker = handle.clone();
+    let (_abort, registration) = futures::future::AbortHandle::new_pair();
+    let mut serving = shared.spawn(async move {
+        worker
+            .serve_owned_packet_connection(flow, target, registration)
+            .await
+    });
+    let peer = shared.block_on(accept_tracked_direct(&listener, &handle, async {
+        (&mut serving).await?
+    }))?;
+    let mut peer = owner.block_on(async {
+        let mut peer = tokio::net::TcpStream::from_std(peer)?;
+        wire.hold_data = true;
+        tokio::time::timeout(RELAY_WAIT, peer.write_all(b"y")).await??;
+        wire.until(|wire| wire.held.is_some()).await?;
+        assert_eq!(wire.held.as_ref().unwrap().flow_id(), Some(flow_id));
+        assert_eq!(wire.received, b"y");
+        // Stop pumping ACKs. Leave more socket data than the original flow can accept.
+        tokio::time::timeout(RELAY_WAIT, peer.write_all(&[7; WINDOW * 2])).await??;
+        tokio::time::timeout(RELAY_WAIT, async {
+            while outbound.snapshot().rx_bytes <= WINDOW as u64 + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        Ok::<_, anyhow::Error>(peer.into_std()?)
+    })?;
+
+    std::thread::scope(|threads| {
+        let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let owner_runtime = &owner;
+        shared.block_on(async {
+            {
+                let drain = fence.close_and_join();
+                tokio::pin!(drain);
+                assert!(
+                    futures::poll!(&mut drain).is_pending(),
+                    "fatal close returned before the parked owner joined"
+                );
+                tokio::task::yield_now().await;
+                assert!(
+                    futures::poll!(&mut drain).is_pending(),
+                    "owner is still parked"
+                );
+                threads.spawn(move || {
+                    let _ = owner_runtime.block_on(stopped);
+                });
+                tokio::time::timeout(RELAY_WAIT, drain).await?;
+            }
+            peer.set_nonblocking(false)?;
+            peer.set_read_timeout(Some(RELAY_WAIT))?;
+            match peer.read(&mut [0]) {
+                Ok(0) => {}
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => {}
+                result => panic!("joined relay still owns its peer socket: {result:?}"),
+            }
+            wire.pump();
+            assert_eq!(wire.held.as_ref().unwrap().flow_id(), Some(flow_id));
+            let tracked = handle.connection_tracker.snapshot();
+            assert_eq!(tracked.len(), 1);
+            assert_eq!(outbound.snapshot().active_conns, 1);
+            let closing = handle.connection_tracker.close_id(&tracked[0].id);
+            tokio::pin!(closing);
+            assert!(futures::poll!(&mut closing).is_pending());
+            wire.held.take().unwrap().release();
+            wire.pump();
+            wire.settle(&serving).await?;
+            serving.await??;
+            assert_eq!(
+                tokio::time::timeout(RELAY_WAIT, closing).await?,
+                crate::connection_tracker::CloseOutcome::Closed
+            );
+            assert!(handle.connection_tracker.snapshot().is_empty());
+            assert_eq!(outbound.snapshot().active_conns, 0);
+            drop(fence);
+            drop(funding);
+            tokio::time::timeout(RELAY_WAIT, wire.finish()).await?;
+            Ok(())
+        })
+    })
+}
+
+#[test]
+fn owned_packet_raw_socks5_winner_relays_while_owner_is_unpolled() -> anyhow::Result<()> {
+    let owner = relay_runtime()?;
+    let shared = relay_runtime()?;
+    assert_ne!(owner.handle().id(), shared.handle().id());
+    shared.block_on(async {
+        tokio::time::timeout(RELAY_WAIT, async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let (mut wire, flow) = Wire::connect("192.0.2.1:443".parse()?)?;
+            let funding = flow.reserve_memory(RELAY_MEMORY)?;
+            let mut config = config();
+            let node = canonical_socks5(
+                "raw-socks",
+                "127.0.0.1",
+                listener.local_addr()?.port(),
+                None,
+            );
+            select_leaf(&mut config, node.id);
+            config.nodes.push(node);
+            let plane = plane(config)?;
+            let handle = plane.spawn_handle();
+            handle.connection_tracker.enable();
+            let worker = handle.clone();
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            let target = wire.relay_owner(owner.handle())?;
+            let serving = tokio::spawn(async move {
+                worker
+                    .serve_owned_packet_connection(flow, target, registration)
+                    .await
+            });
+            let (mut peer, _) = listener.accept().await?;
+            let mut greeting = [0; 3];
+            peer.read_exact(&mut greeting).await?;
+            assert_eq!(greeting, [5, 1, 0]);
+            peer.write_all(&[5, 0]).await?;
+            let mut connect = [0; 10];
+            peer.read_exact(&mut connect).await?;
+            assert_eq!(connect, [5, 1, 0, 1, 192, 0, 2, 1, 1, 187]);
+            peer.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).await?;
+            while handle.connection_tracker.snapshot().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                handle.connection_tracker.snapshot()[0].chains,
+                ["raw-socks", MEASURED_SELECTOR]
+            );
+            assert_eq!(
+                owner.metrics().num_alive_tasks(),
+                0,
+                "SOCKS5 CONNECT published work on the unpolled Direct owner"
+            );
+            // Stock SOCKS5 hands back its concrete TcpStream after CONNECT. Only shared can poll it.
+            wire.send(b"s");
+            let mut singleton = [0];
+            peer.read_exact(&mut singleton).await?;
+            assert_eq!(&singleton, b"s");
+            peer.write_all(b"r").await?;
+            wire.until(|wire| !wire.received.is_empty()).await?;
+            assert_eq!(wire.received, b"r");
+            abort.abort();
+            serving.await??;
+            drop(funding);
+            wire.finish().await;
+            Ok(())
+        })
+        .await?
+    })
 }
 
 fn config() -> Config {

@@ -53,6 +53,17 @@ impl FlowIo {
         self.id
     }
 
+    pub(in crate::control) fn direct_relay_runtime(&self) -> Option<&super::DirectRelayOwner> {
+        #[cfg(target_os = "linux")]
+        {
+            self.scope.0.direct_relay_runtime.get()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
     pub(in crate::control) fn packet_source(&self) -> Option<&super::SourceWork> {
         self.packet_source.as_ref()
     }
@@ -93,7 +104,11 @@ impl FlowIo {
     }
 
     pub fn reserve_memory(&self, bytes: usize) -> io::Result<MemoryReservation> {
-        self.scope.0.budget.reserve(bytes).ok_or_else(capacity)
+        self.try_reserve_memory(bytes).ok_or_else(capacity)
+    }
+
+    pub(in crate::control) fn try_reserve_memory(&self, bytes: usize) -> Option<MemoryReservation> {
+        self.scope.0.budget.reserve(bytes)
     }
 
     /// The guard aborts on cancellation; exact completion is still owned by the runtime.
@@ -328,4 +343,109 @@ impl AsyncWrite for FlowIo {
             }
         })
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn direct_relay_runtime_belongs_to_the_original_flow_scope() {
+    use honk_netstack::{MemoryBudget, Rx, wire::tcp};
+    use std::time::Instant;
+    use tokio::runtime::Builder;
+
+    let coordinator = Builder::new_current_thread().build().unwrap();
+    let shared = Builder::new_current_thread().build().unwrap();
+    let budget = MemoryBudget::new(32 << 20);
+    let (realm, mut owners) = super::capture_realm(1280, 64, 1, 1, &budget).unwrap();
+    let coordinator_owner = owners.pop().unwrap();
+    let driver = coordinator_owner.hand_off();
+    let scope = realm.owner(0).unwrap();
+    let (other_scope, _other_owner) = super::capture_scope(1280, 64, 1, &budget).unwrap();
+    let fence = super::DirectRelayFence::new(&budget).unwrap();
+
+    {
+        let _entered = coordinator.enter();
+        driver
+            .sole_owner()
+            .unwrap()
+            .publish_direct_relay_runtime(tokio::runtime::Handle::current(), fence.clone())
+            .unwrap();
+    }
+    let _entered = shared.enter();
+    assert!(
+        scope
+            .publish_direct_relay_runtime(tokio::runtime::Handle::current(), fence.clone())
+            .is_err()
+    );
+
+    let mut packet = [0; 60];
+    let len = tcp::emit_packet(
+        &mut packet,
+        "192.0.2.10".parse().unwrap(),
+        "203.0.113.9".parse().unwrap(),
+        &tcp::Header {
+            src_port: 40000,
+            dst_port: 443,
+            seq: 100,
+            ack: 0,
+            flags: tcp::SYN,
+            window: 1024,
+            urgent: 0,
+            options: tcp::Options::default(),
+        },
+        [&[], &[]],
+    )
+    .unwrap();
+    let now = Instant::now();
+    assert_eq!(scope.receive(&packet[..len], now), Rx::Consumed);
+    assert_eq!(other_scope.receive(&packet[..len], now), Rx::Consumed);
+    let (_, flow) = scope.poll_accept().unwrap();
+    let (_, other_flow) = other_scope.poll_accept().unwrap();
+
+    assert_ne!(flow.scope(), other_flow.scope());
+    assert_eq!(flow.flow_id(), other_flow.flow_id());
+    let owner = flow.direct_relay_runtime().unwrap();
+    assert_eq!(owner.runtime.id(), coordinator.handle().id());
+    assert!(std::sync::Arc::ptr_eq(&owner.fence, &fence));
+    assert!(other_flow.direct_relay_runtime().is_none());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn direct_relay_close_waits_for_existing_lease_and_bars_new_owners() {
+    let budget = honk_netstack::MemoryBudget::new(4096);
+    let fence = super::DirectRelayFence::new(&budget).unwrap();
+    let (started, active) = tokio::sync::oneshot::channel();
+    let (observed, closing) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let owner = fence.clone();
+    let relay = tokio::spawn(async move {
+        let _lease = owner.try_join_lease().unwrap();
+        started.send(()).unwrap();
+        owner.wait_closed().await;
+        observed.send(()).unwrap();
+        released.await.unwrap();
+    });
+    active.await.unwrap();
+    let last_lease = fence.try_join_lease().unwrap();
+    {
+        let join = fence.close_and_join();
+        tokio::pin!(join);
+        assert!(futures::poll!(&mut join).is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(3), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(futures::poll!(std::pin::pin!(fence.wait_closed())).is_ready());
+        assert!(fence.try_join_lease().is_none());
+        assert!(futures::poll!(&mut join).is_pending());
+        release.send(()).unwrap();
+        relay.await.unwrap();
+        assert!(futures::poll!(&mut join).is_pending());
+        drop(last_lease);
+        join.await;
+    }
+    assert!(fence.try_join_lease().is_none());
+    assert!(budget.used() > 0);
+    drop(fence);
+    assert_eq!(budget.used(), 0);
 }

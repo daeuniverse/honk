@@ -102,12 +102,14 @@ impl ProtocolEntry {
 
 pub struct ProxyRegistry {
     pub(super) entries: Vec<ProtocolEntry>,
+    stock_direct: bool,
 }
 
 impl ProxyRegistry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
+            stock_direct: false,
         }
     }
 
@@ -127,6 +129,8 @@ impl ProxyRegistry {
                 .with_packet(direct.clone())
                 .with_probeable(direct),
         );
+        // Registration only appends; the first Direct handler remains authoritative.
+        registry.stock_direct = true;
         let block = Arc::new(BlockHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Block, block.clone())
@@ -211,6 +215,11 @@ impl ProxyRegistry {
 
     pub fn register(&mut self, entry: ProtocolEntry) {
         self.entries.push(entry);
+    }
+
+    /// The first Direct entry is the built-in unpooled OS TCP connector.
+    pub fn has_stock_direct(&self) -> bool {
+        self.stock_direct
     }
 
     pub fn find(&self, protocol: NodeProtocol) -> Option<&ProtocolEntry> {

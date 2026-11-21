@@ -1365,26 +1365,34 @@ pub(super) async fn run_coordinator(
                     return;
                 }
             };
-            let result = runtime
-                .block_on(
-                    std::panic::AssertUnwindSafe(super::run_capture(
-                        plane,
-                        &pin_root,
-                        thread_admission,
-                        pname_support,
-                        runtime_handle,
-                    ))
-                    .catch_unwind(),
+            let mut relay_fence = None;
+            let outcome = runtime.block_on(
+                std::panic::AssertUnwindSafe(super::run_capture(
+                    plane,
+                    &pin_root,
+                    thread_admission,
+                    pname_support,
+                    runtime_handle,
+                    &mut relay_fence,
+                ))
+                .catch_unwind(),
+            );
+            let retained = match &outcome {
+                Ok((plane, result)) => plane.is_none() && result.is_err(),
+                Err(_) => true,
+            };
+            if retained && let Some(fence) = relay_fence {
+                // Command quiescence can precede socket cleanup on the shared runtime.
+                runtime.block_on(fence.close_and_join());
+            }
+            let result = outcome.unwrap_or_else(|_| {
+                (
+                    None,
+                    Err(anyhow::anyhow!(
+                        "XDP coordinator panicked; retaining actual owners"
+                    )),
                 )
-                .unwrap_or_else(|_| {
-                    (
-                        None,
-                        Err(anyhow::anyhow!(
-                            "XDP coordinator panicked; retaining actual owners"
-                        )),
-                    )
-                });
-            let retained = result.0.is_none() && result.1.is_err();
+            });
             let _ = send.send(result);
             if retained {
                 runtime.block_on(std::future::pending::<()>());

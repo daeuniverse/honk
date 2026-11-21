@@ -1,5 +1,8 @@
 use super::*;
 use crate::control::netstack::{FlowIo, FlowRetirement};
+use honk_outbound::ProxyStream;
+#[cfg(feature = "native-api")]
+use honk_outbound::runtime::flow_observation::{self, FlowObserver};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -130,9 +133,89 @@ impl TcpFlow {
         }
     }
 
-    pub(super) async fn relay(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn relay_owned(
+        mut self,
+        direct: Option<&mut DirectRelay<'_>>,
+        mut proxy: ProxyStream,
+        client: SocketAddr,
+        destination: SocketAddr,
+        progress: relay::RelayProgress,
+        prefix: SniffPrefix,
+        close: Option<&Arc<CloseSignal>>,
+        #[cfg(feature = "native-api")] observer: Option<&FlowObserver>,
+    ) -> Option<(Self, RelayCompletion)> {
+        let on_owner = move |mut flow: PacketFlow, proxy: ProxyStream, progress, prefix| {
+            let stream = proxy.stream;
+            let close = close.cloned();
+            #[cfg(feature = "native-api")]
+            let observer = observer.cloned().or_else(flow_observation::current);
+            async move {
+                let operation = async {
+                    let socket = match stream.into_any().downcast::<TcpStream>() {
+                        Ok(socket) => *socket,
+                        Err(_) => unreachable!("relay admission proved a raw TCP socket"),
+                    };
+                    // into_std deregisters through the socket's original registration.
+                    let mut upstream = match socket.into_std().and_then(TcpStream::from_std) {
+                        Ok(upstream) => upstream,
+                        Err(error) => return RelayCompletion::LocalError(error),
+                    };
+                    if let Err(early) =
+                        write_prefix(&mut upstream, &prefix, &progress, close.as_ref()).await
+                    {
+                        return early;
+                    }
+                    drop(prefix);
+                    // Each copy turn consumes Tokio's socket budget on upstream reads or writes.
+                    relay_until_close(
+                        close.as_ref(),
+                        relay::splice::relay_auto(
+                            &mut flow.stream,
+                            upstream,
+                            client,
+                            destination,
+                            Some(progress),
+                        ),
+                    )
+                    .await
+                };
+                #[cfg(feature = "native-api")]
+                let operation = observe_relay(observer.as_ref(), operation);
+                let result = operation.await;
+                (Self::Packet(flow), result)
+            }
+        };
+
+        if let Some(direct) = direct
+            && let Self::Packet(flow) = &self
+            && let Some((memory, join_lease)) =
+                direct.reserve(&flow.stream, &proxy, &prefix, &on_owner)
+        {
+            let Self::Packet(flow) = self else {
+                unreachable!("only a packet flow can transfer its relay");
+            };
+            return direct
+                .run(memory, join_lease, on_owner(flow, proxy, progress, prefix))
+                .await;
+        }
+
+        let operation = async {
+            if let Err(early) = write_prefix(&mut *proxy.stream, &prefix, &progress, close).await {
+                return early;
+            }
+            drop(prefix);
+            relay_until_close(close, self.relay(proxy, client, destination, progress)).await
+        };
+        #[cfg(feature = "native-api")]
+        let operation = observe_relay(observer, operation);
+        let result = operation.await;
+        Some((self, result))
+    }
+
+    async fn relay(
         &mut self,
-        proxy: honk_outbound::ProxyStream,
+        proxy: ProxyStream,
         client: SocketAddr,
         destination: SocketAddr,
         progress: relay::RelayProgress,
@@ -180,6 +263,28 @@ impl TcpFlow {
                 true
             }
         }
+    }
+}
+
+async fn relay_until_close(
+    close: Option<&Arc<CloseSignal>>,
+    relay: impl Future<Output = anyhow::Result<relay::RelayStats>>,
+) -> RelayCompletion {
+    tokio::select! {
+        biased;
+        _ = wait_for_close(close) => RelayCompletion::Closed,
+        result = relay => RelayCompletion::Relayed(result),
+    }
+}
+
+#[cfg(feature = "native-api")]
+async fn observe_relay<T>(
+    observer: Option<&FlowObserver>,
+    operation: impl Future<Output = T>,
+) -> T {
+    match observer {
+        Some(observer) => observer.scope(operation).await,
+        None => operation.await,
     }
 }
 

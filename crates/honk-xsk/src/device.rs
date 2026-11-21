@@ -1,6 +1,6 @@
 //! Read-only physical Ethernet/veth discovery; logical roots are admitted by topology.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -29,6 +29,8 @@ pub struct DeviceInfo {
     pub xdp_features: u64,
     pub zerocopy_max_segments: u32,
     pub vlan_metadata: bool,
+    /// Discovery found the i40e PCI physical-function profile measured for Direct relay.
+    pub direct_relay_physical: bool,
 }
 
 fn unsupported(message: impl Into<String>) -> io::Error {
@@ -48,26 +50,18 @@ impl DeviceInfo {
             ));
         }
         let path = Path::new("/sys/class/net").join(name);
-        let number = |file: &str| -> io::Result<u32> {
-            fs::read_to_string(path.join(file))?
-                .trim()
-                .parse()
-                .map_err(|_| unsupported(format!("invalid {file}")))
-        };
-        let ifindex = number("ifindex")?;
-        let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
-        let mut driver = [0u32; 49];
-        driver[0] = 3; // ETHTOOL_GDRVINFO
-        query(&fd, name, &mut driver)?;
+        let ifindex = device_number(&path, "ifindex")?;
+        let driver = driver_info(name)?;
         let veth = driver[1].to_ne_bytes() == *b"veth" && driver[2].to_ne_bytes()[0] == 0;
-        let physical = path.join("device").try_exists()? && number("iflink")? == ifindex;
-        if number("type")? != 1 || !(physical || veth) {
+        let physical =
+            path.join("device").try_exists()? && device_number(&path, "iflink")? == ifindex;
+        if device_number(&path, "type")? != 1 || !(physical || veth) {
             return Err(unsupported(
                 "only physical Ethernet or proven veth capture members are admitted",
             ));
         }
         let upper_ifindices = upper_ifindices(&path, ifindex)?;
-        let mtu = number("mtu")?;
+        let mtu = device_number(&path, "mtu")?;
         if !(68..=65535).contains(&mtu) {
             return Err(unsupported("unsupported device MTU"));
         }
@@ -100,6 +94,7 @@ impl DeviceInfo {
             xdp_features,
             zerocopy_max_segments,
             vlan_metadata,
+            direct_relay_physical: physical && i40e_physical_function(&path, &driver),
         })
     }
 
@@ -137,7 +132,21 @@ impl DeviceInfo {
 
     /// Recheck device identity and capabilities before opening capture queues.
     pub fn validate_current(&self) -> io::Result<()> {
-        let fresh = Self::discover(&self.name)?;
+        self.validate_recheck(&Self::discover(&self.name)?)
+    }
+
+    /// Recheck the optional Direct relay hardware proof immediately before publication.
+    pub fn supports_direct_relay_now(&self) -> bool {
+        if !self.direct_relay_physical {
+            return false;
+        }
+        let path = Path::new("/sys/class/net").join(&self.name);
+        device_number(&path, "ifindex").is_ok_and(|ifindex| ifindex == self.ifindex)
+            && device_number(&path, "iflink").is_ok_and(|iflink| iflink == self.ifindex)
+            && driver_info(&self.name).is_ok_and(|driver| i40e_physical_function(&path, &driver))
+    }
+
+    fn validate_recheck(&self, fresh: &Self) -> io::Result<()> {
         if fresh.ifindex != self.ifindex
             || fresh.upper_ifindices != self.upper_ifindices
             || fresh.queues != self.queues
@@ -177,6 +186,42 @@ impl DeviceInfo {
             })
             .collect()
     }
+}
+
+fn device_number(path: &Path, file: &str) -> io::Result<u32> {
+    fs::read_to_string(path.join(file))?
+        .trim()
+        .parse()
+        .map_err(|_| unsupported(format!("invalid {file}")))
+}
+
+fn driver_info(name: &str) -> io::Result<[u32; 49]> {
+    let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0)?;
+    let mut driver = [0u32; 49];
+    driver[0] = 3; // ETHTOOL_GDRVINFO
+    query(&fd, name, &mut driver)?;
+    Ok(driver)
+}
+
+fn i40e_physical_function(path: &Path, driver: &[u32; 49]) -> bool {
+    if driver[1].to_ne_bytes() != *b"i40e" || driver[2].to_ne_bytes()[0] != 0 {
+        return false;
+    }
+    let bus = features::string_bytes(&driver[25..33]);
+    let Ok(bus) = CStr::from_bytes_until_nul(&bus) else {
+        return false;
+    };
+    let device = path.join("device");
+    let bus_matches = fs::read_link(&device).is_ok_and(|target| {
+        target
+            .file_name()
+            .is_some_and(|name| name.as_bytes() == bus.to_bytes())
+    });
+    bus_matches
+        && fs::read_link(device.join("subsystem")).is_ok_and(|target| target.ends_with("bus/pci"))
+        && fs::symlink_metadata(device.join("physfn"))
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        && fs::read_to_string(device.join("vendor")).is_ok_and(|vendor| vendor.trim() == "0x8086")
 }
 
 fn bidirectional_queues(path: &Path) -> io::Result<Vec<u32>> {
@@ -469,9 +514,8 @@ mod tests {
     use super::*;
     use crate::port::METADATA_SIZE;
 
-    #[test]
-    fn binding_preflight_requires_real_zero_copy_and_complete_chains() {
-        let mut device = DeviceInfo {
+    fn device() -> DeviceInfo {
+        DeviceInfo {
             name: "test0".into(),
             ifindex: 2,
             upper_ifindices: vec![],
@@ -481,7 +525,24 @@ mod tests {
             xdp_features: 3 | 32,
             zerocopy_max_segments: 0,
             vlan_metadata: false,
+            direct_relay_physical: true,
+        }
+    }
+
+    #[test]
+    fn optional_direct_relay_proof_does_not_change_capture_recheck() {
+        let candidate = device();
+        let unproven = DeviceInfo {
+            direct_relay_physical: false,
+            ..candidate.clone()
         };
+        assert!(candidate.validate_recheck(&unproven).is_ok());
+        assert!(!unproven.supports_direct_relay_now());
+    }
+
+    #[test]
+    fn binding_preflight_requires_real_zero_copy_and_complete_chains() {
+        let mut device = device();
         let config = PortConfig {
             rx_frames: 4,
             control_frames: 4,
@@ -655,6 +716,60 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    #[test]
+    fn direct_relay_requires_the_i40e_pci_physical_function_proof() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = SysfsFixture::new();
+        let bdf = "0000:02:00.1";
+        let device = fixture.0.join(bdf);
+        fs::create_dir(&device).unwrap();
+        symlink(bdf, fixture.0.join("device")).unwrap();
+        symlink("../../../bus/pci", device.join("subsystem")).unwrap();
+        fs::write(device.join("vendor"), "0x8086\n").unwrap();
+
+        let driver_info = |name: &[u8], bus: &[u8]| {
+            let mut driver = [0; 49];
+            driver[0] = 3;
+            for (start, text) in [(1, name), (25, bus)] {
+                let mut bytes = [0; 32];
+                bytes[..text.len()].copy_from_slice(text);
+                for (word, chunk) in driver[start..start + 8]
+                    .iter_mut()
+                    .zip(bytes.as_chunks::<4>().0)
+                {
+                    *word = u32::from_ne_bytes(*chunk);
+                }
+            }
+            driver
+        };
+        let pf = driver_info(b"i40e", bdf.as_bytes());
+        assert!(i40e_physical_function(&fixture.0, &pf));
+        for driver in [b"virtio_net".as_slice(), b"iavf", b"veth", b"i40evf"] {
+            assert!(!i40e_physical_function(
+                &fixture.0,
+                &driver_info(driver, bdf.as_bytes())
+            ));
+        }
+        assert!(!i40e_physical_function(
+            &fixture.0,
+            &driver_info(b"i40e", b"0000:02:00.0")
+        ));
+
+        let physfn = device.join("physfn");
+        symlink("../0000:02:00.0", &physfn).unwrap();
+        assert!(!i40e_physical_function(&fixture.0, &pf));
+        fs::remove_file(physfn).unwrap();
+        let subsystem = device.join("subsystem");
+        fs::remove_file(&subsystem).unwrap();
+        symlink("../../../bus/virtio", &subsystem).unwrap();
+        assert!(!i40e_physical_function(&fixture.0, &pf));
+        fs::remove_file(&subsystem).unwrap();
+        symlink("../../../bus/pci", &subsystem).unwrap();
+        fs::remove_file(device.join("vendor")).unwrap();
+        assert!(!i40e_physical_function(&fixture.0, &pf));
     }
 
     #[test]

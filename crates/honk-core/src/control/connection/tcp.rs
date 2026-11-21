@@ -14,10 +14,12 @@ use crate::connection_tracker::{
 use super::observation::ConnectionObservation;
 
 mod dial;
+mod direct_relay;
 mod input;
 mod score;
 mod terminal;
 
+use direct_relay::{DirectRelay, RelayPublication};
 use input::{TcpFlow, TcpInput};
 
 use score::{
@@ -27,6 +29,46 @@ use score::{
 #[cfg(feature = "native-api")]
 use terminal::TcpTerminal;
 use terminal::{wait_for_close, write_sniff_prefix};
+
+struct SniffPrefix {
+    bytes: Vec<u8>,
+    reporter: Option<crate::group::ScoreReporter>,
+    #[cfg(feature = "native-api")]
+    flow: Option<Arc<crate::observe::flows::FlowGuard>>,
+}
+
+enum RelayCompletion {
+    Closed,
+    PrefixFailed(std::io::Error),
+    LocalError(std::io::Error),
+    Relayed(anyhow::Result<relay::RelayStats>),
+}
+
+async fn write_prefix(
+    stream: &mut (impl tokio::io::AsyncWrite + Unpin + ?Sized),
+    prefix: &SniffPrefix,
+    progress: &relay::RelayProgress,
+    close: Option<&Arc<CloseSignal>>,
+) -> Result<(), RelayCompletion> {
+    tokio::select! {
+        biased;
+        _ = wait_for_close(close) => Err(RelayCompletion::Closed),
+        result = write_sniff_prefix(stream, &prefix.bytes, |bytes| {
+            use std::sync::atomic::Ordering::Relaxed;
+            progress.upload.fetch_add(bytes as u64, Relaxed);
+            if let Some(outbound) = &progress.outbound_upload {
+                outbound.fetch_add(bytes as u64, Relaxed);
+            }
+            #[cfg(feature = "native-api")]
+            if let Some(flow) = &prefix.flow {
+                flow.accepted_send();
+            }
+            if let Some(reporter) = &prefix.reporter {
+                reporter.tx(bytes as u64);
+            }
+        }) => result.map_err(RelayCompletion::PrefixFailed),
+    }
+}
 
 /// Block nodes "dial" by failing and the dial path reports no other signal,
 /// so a failure where every tried node is a block node is the policy's doing.
@@ -135,7 +177,7 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-        self.serve_tcp_input(TcpInput::Kernel(stream), client_addr, original_dst)
+        self.serve_tcp_input(TcpInput::Kernel(stream), client_addr, original_dst, None)
             .await
     }
 
@@ -145,8 +187,58 @@ impl ControlPlaneHandle {
     ) -> anyhow::Result<()> {
         let client = stream.peer_addr();
         let destination = stream.local_addr();
-        self.serve_tcp_input(TcpInput::Packet(stream), client, destination)
+        self.serve_tcp_input(TcpInput::Packet(stream), client, destination, None)
             .await
+    }
+
+    pub(in crate::control) async fn serve_owned_packet_connection(
+        &self,
+        stream: crate::control::netstack::FlowIo,
+        owner: crate::control::netstack::DirectRelayOwner,
+        cancel: futures::future::AbortRegistration,
+    ) -> anyhow::Result<()> {
+        let client = stream.peer_addr();
+        let destination = stream.local_addr();
+        let publication = RelayPublication::default();
+        let mut relay = DirectRelay::new(owner.runtime, &publication, &owner.fence);
+        let result = std::panic::AssertUnwindSafe(async {
+            let mut operation = std::pin::pin!(self.serve_tcp_input(
+                TcpInput::Packet(stream),
+                client,
+                destination,
+                Some(&mut relay),
+            ));
+            let mut stop = std::pin::pin!(futures::future::Abortable::new(
+                std::future::pending::<()>(),
+                cancel,
+            ));
+            let mut stopping = false;
+            std::future::poll_fn(|cx| {
+                if !stopping && stop.as_mut().poll(cx).is_ready() {
+                    stopping = true;
+                    if !publication.cancel_active() {
+                        return std::task::Poll::Ready(Ok(()));
+                    }
+                }
+                // A completed owner may have won the abort. Let the original caller settle
+                // that result before cancelling its next wait (usually exact retirement).
+                let result = operation.as_mut().poll(cx);
+                if stopping && result.is_pending() && !publication.active() {
+                    std::task::Poll::Ready(Ok(()))
+                } else {
+                    result
+                }
+            })
+            .await
+        })
+        .catch_unwind()
+        .await;
+        // Even an unwind or logical abort must join the original remote socket owner.
+        relay.cancel_and_join().await;
+        match result {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 
     async fn serve_tcp_input(
@@ -154,6 +246,7 @@ impl ControlPlaneHandle {
         mut input: TcpInput,
         client_addr: SocketAddr,
         original_dst: SocketAddr,
+        direct: Option<&mut DirectRelay<'_>>,
     ) -> anyhow::Result<()> {
         let admitted_route = match &mut input {
             TcpInput::Packet(stream) => stream.take_routing(),
@@ -767,7 +860,7 @@ impl ControlPlaneHandle {
                         }
                     }
                 };
-                let mut proxy_stream = winner.stream;
+                let proxy_stream = winner.stream;
                 let node = winner.node;
                 let score_reporter = winner.reporter;
                 if node.protocol() != honk_config::types::NodeProtocol::Block {
@@ -877,72 +970,12 @@ impl ControlPlaneHandle {
                     "TCP connection: {} <-> {}", client_addr, original_dst,
                 );
 
-                let mut intentionally_closed = false;
-                let prefix_result = {
-                    let operation = async {
-                        tokio::select! {
-                            biased;
-                            _ = wait_for_close(close_signal.as_ref()) => {
-                                intentionally_closed = true;
-                                Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "connection closed"))
-                            }
-                            result = write_sniff_prefix(
-                                &mut *proxy_stream.stream, &sniff_result.buffered, |bytes| {
-                                    conn_upload.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-                                    outbound_upload.fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
-                                    #[cfg(feature = "native-api")]
-                                    if let Some(flow) = observation.flow() {
-                                        flow.accepted_send();
-                                    }
-                                    if let Some(reporter) = &score_reporter {
-                                        reporter.tx(bytes as u64);
-                                    }
-                                },
-                            ) => result,
-                        }
-                    };
+                let has_prefix = !sniff_result.buffered.is_empty();
+                let prefix = SniffPrefix {
+                    bytes: sniff_result.buffered,
+                    reporter: score_reporter.as_ref().filter(|_| has_prefix).cloned(),
                     #[cfg(feature = "native-api")]
-                    let operation = async {
-                        match &winner_observer {
-                            Some(observer) => observer.scope(operation).await,
-                            None => operation.await,
-                        }
-                    };
-                    operation.await
-                };
-                match prefix_result {
-                    Ok(()) => {}
-                    Err(error) => {
-                        #[cfg(feature = "native-api")]
-                        {
-                            terminal = Some(if intentionally_closed {
-                                TcpTerminal::IntentionalRetirement
-                            } else {
-                                TcpTerminal::PrefixWriteFailed
-                            });
-                        }
-                        if !intentionally_closed {
-                            debug!("Failed to write sniffed bytes to proxy: {}", error);
-                            self.stats.record_error(&outbound_name, outbound_kind);
-                        }
-                        if let Some(reporter) = &score_reporter {
-                            reporter.finish(if intentionally_closed {
-                                crate::group::ScoreOutcome::Cancelled
-                            } else {
-                                crate::group::ScoreOutcome::from_io_error(&error)
-                            });
-                        }
-                        drop(proxy_stream);
-                        anyhow::ensure!(
-                            flow.retire(RetireAck {
-                                close: close.take(),
-                                outbound: outbound_guard.take()
-                            })
-                            .await,
-                            "TCP retirement failed"
-                        );
-                        return Ok(());
-                    }
+                    flow: observation.flow().filter(|_| has_prefix).cloned(),
                 };
 
                 let first_response = score_reporter.as_ref().map(|reporter| {
@@ -985,59 +1018,67 @@ impl ControlPlaneHandle {
                     first_response,
                     on_transfer,
                 };
-                let relay_result = {
-                    let operation = async {
-                        tokio::select! {
-                            biased;
-                            _ = wait_for_close(close_signal.as_ref()) => None,
-                            result = flow.relay(
-                                proxy_stream, client_addr, original_dst, conn_progress,
-                            ) => Some(result),
-                        }
-                    };
-                    #[cfg(feature = "native-api")]
-                    let operation = async {
-                        match &winner_observer {
-                            Some(observer) => observer.scope(operation).await,
-                            None => operation.await,
-                        }
-                    };
-                    operation.await
-                };
-                let Some(relay_result) = relay_result else {
-                    if let Some(reporter) = &score_reporter {
-                        reporter.finish(crate::group::ScoreOutcome::Cancelled);
-                    }
-                    #[cfg(feature = "native-api")]
-                    {
-                        terminal = Some(TcpTerminal::IntentionalRetirement);
-                    }
-                    anyhow::ensure!(
-                        flow.retire(RetireAck {
-                            close: close.take(),
-                            outbound: outbound_guard.take()
-                        })
-                        .await,
-                        "TCP retirement failed"
-                    );
+                let direct = direct.filter(|_| {
+                    let protocol = honk_config::types::NodeProtocol::Direct;
+                    node.protocol() == protocol
+                        && self.proxy_registry.has_stock_direct()
+                        && runtime_generation
+                            .get(&node.id)
+                            .is_none_or(|runtime| runtime.node.protocol() == protocol)
+                });
+                let Some((flow, relay_result)) = flow
+                    .relay_owned(
+                        direct,
+                        proxy_stream,
+                        client_addr,
+                        original_dst,
+                        conn_progress,
+                        prefix,
+                        close_signal.as_ref(),
+                        #[cfg(feature = "native-api")]
+                        winner_observer.as_ref(),
+                    )
+                    .await
+                else {
                     return Ok(());
                 };
                 #[cfg(feature = "native-api")]
                 {
-                    terminal = Some(if relay_result.is_ok() {
-                        TcpTerminal::RelayClosed
-                    } else {
-                        TcpTerminal::RelayFailed
+                    terminal = Some(match &relay_result {
+                        RelayCompletion::Closed => TcpTerminal::IntentionalRetirement,
+                        RelayCompletion::PrefixFailed(_) => TcpTerminal::PrefixWriteFailed,
+                        RelayCompletion::LocalError(_) => TcpTerminal::ConnectionFailed,
+                        RelayCompletion::Relayed(Ok(_)) => TcpTerminal::RelayClosed,
+                        RelayCompletion::Relayed(Err(_)) => TcpTerminal::RelayFailed,
                     });
                 }
-                let relay_succeeded = relay_result.is_ok();
+                let relay_succeeded = matches!(&relay_result, RelayCompletion::Relayed(Ok(_)));
                 match relay_result {
-                    Ok(_) => {
+                    RelayCompletion::Closed => {
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(crate::group::ScoreOutcome::Cancelled);
+                        }
+                    }
+                    RelayCompletion::LocalError(error) => {
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(crate::group::ScoreOutcome::Rejected);
+                        }
+                        return Err(anyhow::Error::new(error)
+                            .context("moving Direct TCP socket between reactors"));
+                    }
+                    RelayCompletion::PrefixFailed(error) => {
+                        debug!(%error, "Failed to write sniffed bytes to proxy");
+                        self.stats.record_error(&outbound_name, outbound_kind);
+                        if let Some(reporter) = &score_reporter {
+                            reporter.finish(crate::group::ScoreOutcome::from_io_error(&error));
+                        }
+                    }
+                    RelayCompletion::Relayed(Ok(_)) => {
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(crate::group::ScoreOutcome::Success);
                         }
                     }
-                    Err(e) => {
+                    RelayCompletion::Relayed(Err(e)) => {
                         let io_err = e.downcast_ref::<std::io::Error>();
                         if let Some(io_err) = io_err {
                             if relay::is_ignorable_connection_error(io_err) {

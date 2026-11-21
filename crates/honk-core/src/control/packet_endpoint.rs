@@ -1606,20 +1606,52 @@ impl EndpointRuntime {
                             report_tcp_completion(result);
                         }
                         self.plane.udp_pool.reap_tasks();
-                        let handle = handle.clone();
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
-                        let mut flow = Some(flow);
-                        let admitted = self.tcp_tasks.spawn_with(|| {
-                            let flow = flow.take().unwrap();
-                            async move {
-                                let (_permit, _guard) = (permit, guard);
-                                if let Err(error) = handle.serve_packet_connection(flow).await {
-                                    tracing::debug!(%error, "packet TCP endpoint ended");
-                                }
+                        let owner = flow.direct_relay_runtime().cloned();
+                        let mut connection = Some((handle.clone(), permit, guard, flow));
+                        let buffers = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
+                        let scoped = owner.map(|owner_handle| {
+                            self.tcp_tasks.spawn_scoped_with(
+                                |registration| {
+                                    let (handle, permit, guard, flow) = connection.take().unwrap();
+                                    async move {
+                                        let (_permit, _guard) = (permit, guard);
+                                        if let Err(error) = handle
+                                            .serve_owned_packet_connection(flow, owner_handle, registration)
+                                            .await
+                                        {
+                                            tracing::debug!(%error, "packet TCP endpoint ended");
+                                        }
+                                    }
+                                },
+                                buffers,
+                            )
+                        });
+                        let admitted = match scoped {
+                            Some(Ok(())) => Ok(()),
+                            Some(Err(error)) if error.kind() != io::ErrorKind::OutOfMemory => {
+                                Err(error)
                             }
-                        }, crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY);
+                            _ => {
+                                self.tcp_tasks
+                                    .spawn_with(
+                                        || {
+                                            let (handle, permit, guard, flow) = connection.take().unwrap();
+                                            async move {
+                                                let (_permit, _guard) = (permit, guard);
+                                                if let Err(error) = handle.serve_packet_connection(flow).await {
+                                                    tracing::debug!(%error, "packet TCP endpoint ended");
+                                                }
+                                            }
+                                        },
+                                        buffers,
+                                    )
+                                    .map(drop)
+                            }
+                        };
                         if let Err(error) = admitted {
-                            flow.as_mut().unwrap().abort();
+                            let (_, _, _, flow) = connection.as_mut().unwrap();
+                            flow.abort();
                             tracing::debug!(%error, "packet TCP task admission refused");
                         }
                     }

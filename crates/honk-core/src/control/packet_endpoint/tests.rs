@@ -7,6 +7,8 @@ use std::time::Duration;
 mod realm;
 mod source;
 mod startup;
+#[cfg(target_os = "linux")]
+mod tcp_budget;
 mod udp;
 
 fn scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {

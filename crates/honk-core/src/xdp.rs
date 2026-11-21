@@ -26,8 +26,8 @@ use crate::control::{
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{
-        CAPTURE_MEMORY, MaterializedOutput, OutputLease, OutputOwner, PacketDriver, PacketRealm,
-        PacketScope, capture_realm,
+        CAPTURE_MEMORY, DirectRelayFence, MaterializedOutput, OutputLease, OutputOwner,
+        PacketDriver, PacketRealm, PacketScope, capture_realm,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -2692,6 +2692,7 @@ async fn run_capture(
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
     shared_runtime: tokio::runtime::Handle,
+    relay_fence: &mut Option<Arc<DirectRelayFence>>,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     *pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
     let config = plane.config_handle().read().await.as_ref().clone();
@@ -2973,6 +2974,31 @@ async fn run_capture(
                 }
                 host.admit(&runtime.pname_support)?;
             }
+            let direct = config
+                .datapath
+                .as_ref()
+                .and_then(|datapath| datapath.direct);
+            for realm in &runtime.realms {
+                if direct_relay_eligible(direct, workers.workers, realm.members.len(), || {
+                    runtime.devices[realm.device]
+                        .info
+                        .supports_direct_relay_now()
+                }) && let Some(scope) = realm.driver.sole_owner()
+                {
+                    let fence = match relay_fence {
+                        Some(fence) => fence,
+                        None => match DirectRelayFence::new(&scope.budget()) {
+                            Ok(fence) => relay_fence.insert(fence),
+                            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => break,
+                            Err(error) => return Err(error.into()),
+                        },
+                    };
+                    scope.publish_direct_relay_runtime(
+                        tokio::runtime::Handle::current(),
+                        Arc::clone(fence),
+                    )?;
+                }
+            }
             runtime.admission.store(true, Ordering::Release);
             runtime.endpoints.capture_ready()?;
             Ok(())
@@ -3214,6 +3240,15 @@ fn gateway_time_namespace_issue(
 
 fn realm_worker_count(workers: usize, queues: impl Iterator<Item = usize>) -> usize {
     workers.min(queues.min().unwrap_or(0))
+}
+
+fn direct_relay_eligible(
+    direct: Option<DirectProfile>,
+    workers: u8,
+    members: usize,
+    supported_device: impl FnOnce() -> bool,
+) -> bool {
+    direct == Some(DirectProfile::Endpoint) && workers == 1 && members == 1 && supported_device()
 }
 
 async fn prepare(
@@ -3823,6 +3858,28 @@ mod tests {
     }
 
     #[test]
+    fn direct_relay_requires_one_global_worker_and_one_physical_endpoint_member() {
+        let endpoint = Some(DirectProfile::Endpoint);
+        let unexpected_device_check = || panic!("ineligible realm queried device capability");
+        assert!(direct_relay_eligible(endpoint, 1, 1, || true));
+        assert!(!direct_relay_eligible(endpoint, 1, 1, || false));
+        for (profile, workers, members) in [
+            (endpoint, 2, 1),
+            (endpoint, 1, 2),
+            (endpoint, 1, 0),
+            (Some(DirectProfile::Core), 1, 1),
+            (None, 1, 1),
+        ] {
+            assert!(!direct_relay_eligible(
+                profile,
+                workers,
+                members,
+                unexpected_device_check
+            ));
+        }
+    }
+
+    #[test]
     fn readonly_admission_reports_nonzero_gateway_time_offset() {
         assert!(gateway_time_namespace_issue(Ok(None)).is_none());
         assert!(gateway_time_namespace_issue(Ok(Some(0))).is_none());
@@ -3846,6 +3903,7 @@ mod tests {
             xdp_features: 3,
             zerocopy_max_segments: 0,
             vlan_metadata: false,
+            direct_relay_physical: true,
         };
         let issues: Vec<_> =
             member_admission_issues(&info, Some(BindMode::ZeroCopy), METADATA_LEN, Ok(false))

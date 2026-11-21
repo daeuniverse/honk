@@ -239,6 +239,7 @@ mod tests {
                 xdp_features: 3,
                 zerocopy_max_segments: 0,
                 vlan_metadata: false,
+                direct_relay_physical: true,
             },
         };
         let realm = |realm_id, vlan_count, vid| CaptureRealm {
