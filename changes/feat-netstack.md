@@ -35,3 +35,4 @@ Added
 - Support XDP Endpoint home gateways with ordered static-direct D1, FD-owned physical links, per-member Auto binding, bond realms and zone-0 conntrack admission. UDP without confirmed CT, concurrent first packets and reload publication retain documented executor windows; legacy zone and uplink changes require operator coordination.
 - Keep a physical UDP datagram refused by closing Endpoint admission from failing XDP shutdown; device errors and completion-queue failures remain fatal.
 - Stop waking physical AF_XDP queues after link detach; give pending TX and worker quiescence one bounded wait before returning forwarding to the kernel.
+- Use 512 AF_XDP RX frames per queue on eligible single-member, single-realm forced-ZeroCopy Endpoint gateways with sufficient capture memory; other devices retain their existing capacities.

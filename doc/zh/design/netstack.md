@@ -188,7 +188,15 @@ TUN 向 driven supervisor 传入保留的 DNS bind 候选和明确的 plain 独�
 
 `control::netstack::capture_scope(mtu, realms, bulk_frames, &budget)` 与 `CAPTURE_MEMORY` 让 XDP 或 TUN 的 scope 和设备/runtime 存储共用一个 384 MiB capture 预算。准入 `R` 个 realm 时，每个 Stack 的 limit 为 `192 MiB / R`，flow/slot 上限为 `min(4096 / R, 1024)`；每个 scope 保留 32 个 control frame 和 256 个 waiter。bulk 容量由调用方选择。默认 CPU backing 在分配前按每 scope `(32 + bulk_frames) * mtu.max(1280)` 字节计费：bulk 128 对应 160 个 frame，bulk 256 对应 288 个 frame。内部 `capture_scope_with_output` 可以选择单独计费的输出容量和能力，不改变逻辑 MTU。metadata 和 Stack 存储仍在同一共享预算内计费。两个 helper 都选择 `Mode::Transparent { exclude: Default::default() }`；Direct 的 **Endpoint 执行 profile** 不等于 WireGuard 的 `Mode::Endpoint`。原手工嵌入及 WireGuard 默认值不变，进展 floor 也不是 accepted-flow 总承诺。
 
-XDP 按每个物理设备经过溢出检查的 `physical_mtu + 22 <= FRAME_SIZE`（4096 字节）选择容量，覆盖 Ethernet 和最多两层 VLAN tag。满足条件的设备采用 RX/control/bulk 为 256/32/480 frame 的 Port 分区和 512 项 ring，其上每个 realm 使用 256 个 bulk frame。每个此类 Port 预留 3 MiB、保留至进程退出的 UMEM，另行计费的 metadata 和 ring 不包含在内。超过此界限的设备，包括带较小逻辑 realm 的 jumbo 设备，保持原有显式容量：Port 分区 256/32/224、256 项 ring、scope bulk 128，每 Port 的 UMEM 为 2 MiB。两条路径使用同一后端，RX SG 能力与 bind 校验不变；此界限只证明 TX 为单 frame。单个 scope 的 256 个 bulk owner 会留下 224 个 Port bulk frame，而原有 128/224 容量留下 96 个；其他 realm 和 Core 输出仍可使用这些余量。调度及每轮每 realm 每类别 32 个输出的限制不变，不承诺普遍公平性或已测吞吐收益。
+XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢出且不超过 4096 字节时，TX 可用单帧（Ethernet 加最多两层 VLAN 标签）。这不代表 RX 也一定是单帧；仍须校验分散聚集（SG）能力和实际绑定。
+
+| 物理 Port | RX / control / bulk 帧数 | 每个 AF_XDP ring 的项数 | 每队列 UMEM | 每个 realm 的 bulk 帧数 |
+|---|---:|---:|---:|---:|
+| 单帧，较大 RX 档 | 512 / 32 / 480 | 1024 | 4 MiB | 256 |
+| 其他单帧设备 | 256 / 32 / 480 | 512 | 3 MiB | 256 |
+| 超过 MTU 界限，即使逻辑 realm 较小 | 256 / 32 / 224 | 256 | 2 MiB | 128 |
+
+较大 RX 档仅用于 `direct: endpoint` 网关：一个物理成员、一个逻辑 realm、强制 ZeroCopy（不能是 Auto）、无 `datapath.host`，且有 1–8 个队列。从 384 MiB 捕获预算中为协议栈留出一半后，每队列还须有至少 8 MiB 余量。这是启动筛选条件，不是实际分配 8 MiB UMEM：每个 Port 的 UMEM、元数据和 ring 各按实际额度预留。打开设备前重新选择档位，运行中不调整。UMEM 保留至进程退出。网卡硬件 ring 和每轮每 realm 每类别 32 个输出的限制不变。单帧 scope 的 256 个 bulk owner 会留下 224 个 Port bulk 帧，其他 realm 和 Core 输出也可使用，不承诺吞吐或公平性。
 
 优化后的 Port 与 scope 预留更大，因此在 384 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
 
