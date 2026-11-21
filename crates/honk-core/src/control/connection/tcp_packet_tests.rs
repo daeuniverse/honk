@@ -176,11 +176,16 @@ impl Wire {
         .await
     }
 
-    fn relay_owner(&self, runtime: &tokio::runtime::Handle) -> anyhow::Result<DirectRelayOwner> {
-        Ok(DirectRelayOwner {
+    fn relay_owner(
+        &self,
+        runtime: &tokio::runtime::Handle,
+    ) -> anyhow::Result<(DirectRelayOwner, honk_netstack::MemoryReservation)> {
+        DirectRelayOwner {
             runtime: runtime.clone(),
             fence: DirectRelayFence::new(&self.budget)?,
-        })
+        }
+        .with_completion_credit(&self.budget)
+        .context("packet completion credit")
     }
 
     async fn finish(mut self) {
@@ -245,7 +250,7 @@ fn owned_packet_cancel_during_sniff_needs_no_owner_or_packet_driver() -> anyhow:
         let (wire, flow) = Wire::connect(listener.local_addr()?)?;
         let funding = flow.reserve_memory(RELAY_MEMORY)?;
         let target = wire.relay_owner(owner.handle())?;
-        let fence = Arc::clone(&target.fence);
+        let fence = Arc::clone(&target.0.fence);
         let mut config = config();
         config.global.dial_mode = "domain+".into();
         select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);
@@ -668,7 +673,7 @@ fn fatal_fence_joins_blocked_direct_owner_before_packet_retirement() -> anyhow::
     let (mut wire, flow) = Wire::connect_with_send_limit(listener.local_addr()?, WINDOW)?;
     let funding = flow.reserve_memory(RELAY_MEMORY)?;
     let target = wire.relay_owner(owner.handle())?;
-    let fence = Arc::clone(&target.fence);
+    let fence = Arc::clone(&target.0.fence);
     let flow_id = flow.flow_id();
     let mut config = config();
     select_leaf(&mut config, honk_config::config::DIRECT_NODE_ID);

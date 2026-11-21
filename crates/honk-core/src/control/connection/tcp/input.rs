@@ -1,5 +1,6 @@
 use super::*;
-use crate::control::netstack::{FlowIo, FlowRetirement};
+use crate::control::netstack::{DirectRelayOwner, FlowIo, FlowRetirement};
+use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_outbound::ProxyStream;
 #[cfg(feature = "native-api")]
 use honk_outbound::runtime::flow_observation::{self, FlowObserver};
@@ -25,6 +26,62 @@ pub(super) struct PacketFlow {
     tracker: Arc<ConnectionTracker>,
     tracker_id: Option<uuid::Uuid>,
     completion_installed: bool,
+}
+
+struct PacketCompletion {
+    tracked: Option<(Arc<ConnectionTracker>, uuid::Uuid)>,
+    ack: RetireAck,
+}
+
+impl PacketCompletion {
+    fn finish(self) {
+        if let Some((tracker, id)) = self.tracked {
+            tracker.remove(
+                id.as_hyphenated()
+                    .encode_lower(&mut uuid::Uuid::encode_buffer()),
+            );
+        }
+        finish_packet_ack(self.ack);
+    }
+}
+
+fn finish_packet_ack(ack: RetireAck) {
+    drop(ack.outbound);
+    if let Some(close) = ack.close {
+        close.0.finish(true);
+    }
+}
+
+impl DirectRelayOwner {
+    pub(in crate::control) fn with_completion_credit(
+        &self,
+        budget: &Arc<MemoryBudget>,
+    ) -> Option<(Self, MemoryReservation)> {
+        // The optional parent must not spend the bytes its original flow needs to retire.
+        let credit = budget.reserve(size_of::<PacketCompletion>())?;
+        Some((self.clone(), credit))
+    }
+}
+
+impl PacketFlow {
+    fn install_completion(
+        &mut self,
+        ack: RetireAck,
+        id: Option<uuid::Uuid>,
+        credit: Option<MemoryReservation>,
+    ) -> std::io::Result<()> {
+        if credit.is_none() && id.is_none() {
+            return self
+                .stream
+                .set_retirement_callback(move || finish_packet_ack(ack));
+        }
+        let completion = PacketCompletion {
+            tracked: id.map(|id| (Arc::clone(&self.tracker), id)),
+            ack,
+        };
+        self.stream
+            .set_retirement_callback_with_credit(credit, move || completion.finish())
+    }
 }
 
 impl TcpFlow {
@@ -80,32 +137,17 @@ impl TcpFlow {
         &mut self,
         close: &mut Option<CloseCompletion>,
         outbound: &mut Option<crate::stats::ActiveConnectionGuard>,
+        credit: Option<MemoryReservation>,
     ) -> std::io::Result<()> {
         let Self::Packet(flow) = self else {
             return Ok(());
         };
-        let identity_memory = if flow.tracker.is_enabled() {
-            Some(flow.stream.reserve_memory(uuid::fmt::Hyphenated::LENGTH)?)
-        } else {
-            None
-        };
-        let tracker_id = identity_memory.as_ref().map(|_| uuid::Uuid::new_v4());
-        let retired_id = tracker_id.map(|id| id.to_string());
-        let tracker = Arc::clone(&flow.tracker);
+        let tracker_id = flow.tracker.is_enabled().then(uuid::Uuid::new_v4);
         let ack = RetireAck {
             close: close.take(),
             outbound: outbound.take(),
         };
-        flow.stream.set_retirement_callback(move || {
-            if let Some(id) = retired_id {
-                tracker.remove(&id);
-            }
-            drop(ack.outbound);
-            if let Some(close) = ack.close {
-                close.0.finish(true);
-            }
-            drop(identity_memory);
-        })?;
+        flow.install_completion(ack, tracker_id, credit)?;
         flow.tracker_id = tracker_id;
         flow.completion_installed = true;
         Ok(())
@@ -237,17 +279,12 @@ impl TcpFlow {
         }
     }
 
-    pub(super) async fn retire(self, ack: RetireAck) -> bool {
+    pub(super) async fn retire(self, ack: RetireAck, credit: Option<MemoryReservation>) -> bool {
         match self {
             Self::Kernel(flow) => flow.retire(ack).await,
             Self::Packet(mut flow) => {
                 if !flow.completion_installed
-                    && let Err(error) = flow.stream.set_retirement_callback(move || {
-                        drop(ack.outbound);
-                        if let Some(close) = ack.close {
-                            close.0.finish(true);
-                        }
-                    })
+                    && let Err(error) = flow.install_completion(ack, None, credit)
                 {
                     error!(%error, "packet TCP completion reservation failed");
                     return false;

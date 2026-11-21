@@ -55,6 +55,7 @@ async fn exchange_byte_and_fin(
     client: SocketAddr,
     flow_id: FlowId,
     initial_ack: u32,
+    pressure: Option<honk_netstack::MemoryReservation>,
 ) {
     let mut peer = drive(driver, async {
         loop {
@@ -73,6 +74,7 @@ async fn exchange_byte_and_fin(
         }
     })
     .await;
+    drop(pressure);
     let destination = listener.local_addr().unwrap();
     // An unread upload would be aborted again during refusal cleanup before
     // the driver could emit the original reset.
@@ -138,12 +140,14 @@ async fn dispatch_charge(
     listener: &TcpListener,
     parked_owner: Option<&Handle>,
     headroom: Option<usize>,
+    hold_to_dial: bool,
 ) -> usize {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let (realm, owners) = capture_realm(1280, 1, 2, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap().clone();
     let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
     assert!(plane.proxy_registry.has_stock_direct());
+    assert!(!plane.connection_tracker.is_enabled());
     let router = Arc::clone(&plane.router);
     let draining = Arc::clone(&plane.drain_tracker);
     let permit_target = Arc::clone(&plane.tcp_admission_target);
@@ -194,14 +198,21 @@ async fn dispatch_charge(
     );
     let after_dispatch = budget.used();
     let occupied_slots = permit_target.load(Ordering::Acquire) - slots.available_permits();
-    drop(pressure);
 
     if let Some(ordinary) = headroom {
         drop(route_gate);
-        exchange_byte_and_fin(driver, &scope, listener, client, id, ack).await;
+        let pressure = if hold_to_dial {
+            pressure
+        } else {
+            drop(pressure);
+            None
+        };
+        exchange_byte_and_fin(driver, &scope, listener, client, id, ack, pressure).await;
         drive(driver, retirement.wait()).await.unwrap();
         assert!(scope.is_protocol_quiescent());
-        assert_eq!(after_dispatch - before_dispatch, ordinary);
+        if !hold_to_dial {
+            assert_eq!(after_dispatch - before_dispatch, ordinary);
+        }
         assert_eq!(occupied_slots, 1);
     } else {
         assert_eq!(draining.active_count(), 1, "calibration must fund one task");
@@ -237,13 +248,13 @@ fn owned_packet_scoped_task_budget_refusal_relays_original_tcp_on_shared() {
     shared.block_on(async {
         tokio::time::timeout(Duration::from_secs(15), async {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let ordinary = dispatch_charge(&listener, None, None).await;
-            let scoped = dispatch_charge(&listener, Some(owner.handle()), None).await;
+            let ordinary = dispatch_charge(&listener, None, None, false).await;
+            let scoped = dispatch_charge(&listener, Some(owner.handle()), None, false).await;
             assert!(
                 ordinary > 0 && ordinary < scoped,
                 "ordinary {ordinary}, scoped {scoped}"
             );
-            dispatch_charge(&listener, Some(owner.handle()), Some(ordinary)).await;
+            dispatch_charge(&listener, Some(owner.handle()), Some(ordinary), false).await;
             let listener = listener.into_std().unwrap();
             assert_eq!(
                 listener.accept().unwrap_err().kind(),
@@ -253,5 +264,30 @@ fn owned_packet_scoped_task_budget_refusal_relays_original_tcp_on_shared() {
         })
         .await
         .expect("the original Direct flow must exchange bytes and retire with the owner unpolled");
+    });
+}
+
+#[test]
+fn optional_relay_owner_does_not_displace_required_tcp_completion() {
+    let owner = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let shared = Builder::new_current_thread().enable_all().build().unwrap();
+    shared.block_on(async {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let available = dispatch_charge(&listener, Some(owner.handle()), None, false).await;
+            for runtime in [None, Some(owner.handle())] {
+                dispatch_charge(&listener, runtime, Some(available), true).await;
+            }
+            assert_eq!(
+                listener.into_std().unwrap().accept().unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        })
+        .await
+        .expect("the original flow must complete at the same headroom with or without an owner");
     });
 }

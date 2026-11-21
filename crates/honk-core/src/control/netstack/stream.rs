@@ -127,7 +127,15 @@ impl FlowIo {
         &mut self,
         callback: F,
     ) -> io::Result<()> {
-        set_callback(&self.scope, self.id, callback)
+        self.set_retirement_callback_with_credit(None, callback)
+    }
+
+    pub(in crate::control) fn set_retirement_callback_with_credit<F: FnOnce() + Send + 'static>(
+        &mut self,
+        credit: Option<MemoryReservation>,
+        callback: F,
+    ) -> io::Result<()> {
+        set_callback(&self.scope, self.id, credit, callback)
     }
 
     fn close(&mut self) {
@@ -193,7 +201,7 @@ impl FlowRetirement {
     }
 
     pub fn on_retired<F: FnOnce() + Send + 'static>(&self, callback: F) -> io::Result<()> {
-        set_callback(&self.scope, self.id, callback)
+        set_callback(&self.scope, self.id, None, callback)
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
@@ -214,13 +222,20 @@ impl Drop for FlowRetirement {
 fn set_callback<F: FnOnce() + Send + 'static>(
     scope: &PacketScope,
     id: FlowId,
+    credit: Option<MemoryReservation>,
     callback: F,
 ) -> io::Result<()> {
-    let memory = scope
-        .0
-        .budget
-        .reserve(size_of::<F>())
-        .ok_or_else(capacity)?;
+    let memory = match credit {
+        Some(credit) => {
+            assert_eq!(credit.bytes(), size_of::<F>());
+            credit
+        }
+        None => scope
+            .0
+            .budget
+            .reserve(size_of::<F>())
+            .ok_or_else(capacity)?,
+    };
     let mut callback = Some(RetirementCallback {
         callback: Box::new(callback),
         _memory: memory,

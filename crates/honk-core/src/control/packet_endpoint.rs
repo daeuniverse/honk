@@ -1607,7 +1607,8 @@ impl EndpointRuntime {
                         }
                         self.plane.udp_pool.reap_tasks();
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
-                        let owner = flow.direct_relay_runtime().cloned();
+                        let owner = flow.direct_relay_runtime()
+                            .and_then(|owner| owner.with_completion_credit(&self.shared.budget));
                         let mut connection = Some((handle.clone(), permit, guard, flow));
                         let buffers = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
                         let scoped = owner.map(|owner_handle| {

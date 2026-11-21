@@ -182,6 +182,8 @@ Class output export fills at most 64 caller-owned empty lease cells, preserving 
 
 The private single-worker XDP Endpoint experiment runs an established Direct TCP relay on the XDP event loop only for a realm with one validated Intel `i40e` PCI physical function. The startup hardware check scopes this experiment; it does not grant TCP ownership or reject another NIC. Routing, candidate dials and connection tracking stay on the shared runtime. After the stock Direct handler wins, the parent hands the connected plain socket and the original packet flow to their exact owner once, not once per packet. The owner registers the same socket with its reactor and writes any sniffed prefix before relaying. An unfunded handoff or a different transport keeps the shared relay. Cancellation joins the owner before refunding the TCP task; even fatal capture failure waits for outstanding socket joins, not for the selector or an exported packet's CQ.
 
+Before admitting the optional relay task on the shared runtime, the supervisor reserves the original packet flow's retirement callback. If the callback and the optional task do not both fit, the smaller ordinary task can still serve that same flow. Once installed, the callback keeps its reservation through actual flow retirement.
+
 Accepted packet DNS answers populate the same scope's canonical [routing projection](./dns.md#routing-projection), which fresh numeric TCP/UDP flows consume without requiring a sniffed name. These facts grant no HOST/kernel projection authority.
 
 Capture retirement uses `PacketEndpoints::retains`, including real controller-DNS `SourceWork` until its query/output tail drops. The existing driver, source pool and output/CQ owners keep execution exclusive.

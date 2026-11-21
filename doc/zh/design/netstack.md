@@ -178,6 +178,8 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 本次私有单 worker XDP Endpoint 实验仅对唯一成员已核实为 Intel `i40e` PCI 物理功能（PF）的 realm，把已连接的 Direct TCP 流放到 XDP 事件循环转发。启动期硬件检查只界定实验范围，不授予 TCP 所有权，也不拒绝其他网卡。路由、候选拨号和连接跟踪仍在共享 runtime。内建 Direct 处理器胜出后，父任务把已连接的普通 socket 与原 packet flow 一次性交给它们的确切 owner，而非逐包交接。owner 把同一 socket 注册到自己的 reactor，先写出已嗅探的前缀，再双向转发。交接预算不足或选中其他传输时仍由共享 runtime 转发。取消须等待 owner 结束再退还 TCP 任务额度；即便捕获致命失败，也只等已交接 socket 的真实 join，不等 selector 或已导出包的 CQ。
 
+在共享 runtime 接纳可选的 relay 父任务前，supervisor 先为原 packet flow 的退役回调预留额度。如果预算不能同时容纳回调和可选任务，占用更小的普通任务仍可接手同一条流。回调安装后持有这份额度，直到该流实际退役。
+
 已接受的 packet DNS 应答写入同一 scope 的 canonical [路由投影](./dns.md#路由投影)，新建数值目标的 TCP/UDP 流无需嗅探名称即可消费这些事实。它们不授予 HOST/内核投影权威。
 
 Capture 退役以 `PacketEndpoints::retains` 为准，包括控制器 DNS 查询/output 尾部释放前真实持有的 `SourceWork`。执行排他仍由既有 driver、source pool 和 output/CQ owner 保持。

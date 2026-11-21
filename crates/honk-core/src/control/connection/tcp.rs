@@ -194,7 +194,10 @@ impl ControlPlaneHandle {
     pub(in crate::control) async fn serve_owned_packet_connection(
         &self,
         stream: crate::control::netstack::FlowIo,
-        owner: crate::control::netstack::DirectRelayOwner,
+        (owner, credit): (
+            crate::control::netstack::DirectRelayOwner,
+            honk_netstack::MemoryReservation,
+        ),
         cancel: futures::future::AbortRegistration,
     ) -> anyhow::Result<()> {
         let client = stream.peer_addr();
@@ -206,7 +209,7 @@ impl ControlPlaneHandle {
                 TcpInput::Packet(stream),
                 client,
                 destination,
-                Some(&mut relay),
+                Some((&mut relay, credit)),
             ));
             let mut stop = std::pin::pin!(futures::future::Abortable::new(
                 std::future::pending::<()>(),
@@ -246,8 +249,9 @@ impl ControlPlaneHandle {
         mut input: TcpInput,
         client_addr: SocketAddr,
         original_dst: SocketAddr,
-        direct: Option<&mut DirectRelay<'_>>,
+        direct: Option<(&mut DirectRelay<'_>, honk_netstack::MemoryReservation)>,
     ) -> anyhow::Result<()> {
+        let (direct, credit) = direct.unzip();
         let admitted_route = match &mut input {
             TcpInput::Packet(stream) => stream.take_routing(),
             TcpInput::Kernel(_) => None,
@@ -379,10 +383,13 @@ impl ControlPlaneHandle {
                         terminal = Some(TcpTerminal::DnsInterceptCompleted);
                     }
                     anyhow::ensure!(
-                        flow.retire(RetireAck {
-                            close: close.take(),
-                            outbound: None
-                        })
+                        flow.retire(
+                            RetireAck {
+                                close: close.take(),
+                                outbound: None
+                            },
+                            credit
+                        )
                         .await,
                         "TCP DNS retirement failed"
                     );
@@ -603,7 +610,7 @@ impl ControlPlaneHandle {
                     crate::stats::OutboundKind::routed(&generation_group_manager, &outbound_name);
                 let mut outbound_guard =
                     Some(self.stats.track_connection(&outbound_name, outbound_kind));
-                flow.hold_packet_completion(&mut close, &mut outbound_guard)?;
+                flow.hold_packet_completion(&mut close, &mut outbound_guard, credit)?;
                 #[cfg(feature = "native-api")]
                 let close_catalog = pinned_native
                     .as_ref()
@@ -1102,10 +1109,13 @@ impl ControlPlaneHandle {
                     }
                 }
                 anyhow::ensure!(
-                    flow.retire(RetireAck {
-                        close: close.take(),
-                        outbound: outbound_guard.take()
-                    })
+                    flow.retire(
+                        RetireAck {
+                            close: close.take(),
+                            outbound: outbound_guard.take()
+                        },
+                        None
+                    )
                     .await,
                     "TCP retirement failed"
                 );
