@@ -135,6 +135,8 @@ ACK 取得进展时，同时撤销旧 PTO deadline 与已到期但尚未物化�
 
 TCP 读写就绪通知在释放 scope 锁后交付，每批最多 64 个注册。生成输出的轮次可以把设备唤醒推迟到最后一次检查；若之后有新输出或轮次被中断，仍须唤醒 driver。
 
+TCP 退役观察者和等待发送额度的 UDP 发送者共用 scope 的有界等待表。原始 `FlowId` 的应用、协议和输出引用全部释放，且回调已返回或因 panic 退出后，才唤醒该流的每个退役观察者。轮询或取消退役等待不会唤醒包驱动。等待发送额度的 UDP 发送者和阻塞的 TCP 写入者仍可启动 100 毫秒的就绪重试定时器。
+
 只有任务计费成功后才从原列表取走 scope owner。接纳失败时，已计费 supervisor 保留所有未启动 owner，在 producer、应用和退休工作结束后完成其真实清理；任何已导出输出尚未归还时，就绪等待都不能结束。panic payload 保留到全部原 owner 和已接纳任务 join 完成。
 
 对于已准入的 XDP realm，仅当经过溢出检查的完整长度 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才在最终单个 UMEM frame 内生成输出；既有物理端口最大长度限制继续生效。Stack 使用完整 scope L3 容量和 `TxCaps::NONE`，不能缩短容量以强行满足资格。符合资格的 driver 只禁用 CPU 拉取：timer、pending close、event、唤醒注册、退休和真实 finish 继续运行。有界直接输出轮次结束后才刷新最终 deadline/event/reap/finish 状态，包括无输出和本地处置的结果。普通 owner、显式时钟 CPU drive 及不符合资格/jumbo realm 继续 CPU 物化，包括控制输出和 SG 提交。

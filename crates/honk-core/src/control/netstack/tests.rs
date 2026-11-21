@@ -124,6 +124,16 @@ fn materialized(
 }
 
 fn handshake(scope: &PacketScope, now: Instant, client: SocketAddr, seq: u32) -> (FlowIo, u32) {
+    handshake_with_class(scope, now, client, seq, TxClass::Control)
+}
+
+fn handshake_with_class(
+    scope: &PacketScope,
+    now: Instant,
+    client: SocketAddr,
+    seq: u32,
+    class: TxClass,
+) -> (FlowIo, u32) {
     assert_eq!(
         scope.receive(&segment(client, seq, 0, tcp::SYN, &[]), now),
         Rx::Consumed
@@ -139,7 +149,7 @@ fn handshake(scope: &PacketScope, now: Instant, client: SocketAddr, seq: u32) ->
     scope.drive(now);
     let reply = output(scope);
     assert_eq!(reply.flow_id(), Some(syn.id));
-    assert_eq!(reply.class(), TxClass::Control);
+    assert_eq!(reply.class(), class);
     let (header, payload) = decode(&reply);
     assert_eq!(header.flags & (tcp::SYN | tcp::ACK), tcp::SYN | tcp::ACK);
     assert_eq!(header.ack, seq + 1);
@@ -480,22 +490,23 @@ async fn class_batch_exports_bounded_wrapped_bulk_without_consuming_control() {
     assert!(scope.poll_output(&mut context()).is_pending());
 }
 
+struct Wakes {
+    scope: PacketScope,
+    count: AtomicUsize,
+}
+
+impl std::task::Wake for Wakes {
+    fn wake(self: Arc<Self>) {
+        assert!(
+            self.scope.0.inner.try_lock().is_some(),
+            "wake under scope lock"
+        );
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 #[test]
 fn shutdown_waits_for_handshake_connected_readiness_before_emitting_fin() {
-    struct Wakes {
-        scope: PacketScope,
-        count: AtomicUsize,
-    }
-    impl std::task::Wake for Wakes {
-        fn wake(self: Arc<Self>) {
-            assert!(
-                self.scope.0.inner.try_lock().is_some(),
-                "stream wake under scope lock"
-            );
-            self.count.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
     let now = Instant::now();
     let (scope, _owner, _) = runtime(now);
     let client = "10.0.0.2:40000".parse().unwrap();
@@ -578,25 +589,14 @@ fn flush_is_a_noop_until_scope_abort_discards_queued_output() {
     }
 }
 
-#[test]
-fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
-    let now = Instant::now();
-    let (scope, _owner, _) = runtime(now);
-    let client = "10.0.0.2:40000".parse().unwrap();
-    let (mut io, _) = handshake(&scope, now, client, 100);
-    let id = io.flow_id();
-    let retired = Arc::new(AtomicUsize::new(0));
-    let observed = Arc::clone(&retired);
-    io.set_retirement_callback(move || {
-        observed.fetch_add(1, Ordering::SeqCst);
-    })
-    .unwrap();
+fn export_final_ack(scope: &PacketScope, io: &mut FlowIo, now: Instant) -> OutputLease {
+    let client = io.peer_addr();
     assert!(matches!(
-        std::pin::Pin::new(&mut io).poll_shutdown(&mut context()),
+        std::pin::Pin::new(&mut *io).poll_shutdown(&mut context()),
         Poll::Ready(Ok(()))
     ));
     scope.drive(now);
-    let fin = output(&scope);
+    let fin = output(scope);
     let (header, _) = decode(&fin);
     assert_ne!(header.flags & tcp::FIN, 0);
     let ack = header.seq.wrapping_add(1);
@@ -606,8 +606,24 @@ fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
         Rx::Consumed
     );
     scope.drive(now);
-    let final_ack = output(&scope);
-    assert_eq!(final_ack.flow_id(), Some(id));
+    let final_ack = output(scope);
+    assert_eq!(final_ack.flow_id(), Some(io.flow_id()));
+    final_ack
+}
+
+#[test]
+fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
+    let now = Instant::now();
+    let (scope, _owner, _) = runtime(now);
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let (mut io, _) = handshake(&scope, now, client, 100);
+    let retired = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&retired);
+    io.set_retirement_callback(move || {
+        observed.fetch_add(1, Ordering::SeqCst);
+    })
+    .unwrap();
+    let final_ack = export_final_ack(&scope, &mut io, now);
     let retiring = io.retire();
     let mut retiring = pin!(retiring);
     assert!(retiring.as_mut().poll(&mut context()).is_pending());
@@ -623,6 +639,190 @@ fn compact_timewait_and_exported_final_ack_both_gate_retirement() {
         retiring.as_mut().poll(&mut context()),
         Poll::Ready(Ok(()))
     ));
+}
+
+#[test]
+fn retirement_wait_only_wakes_after_exact_timewait_and_output_completion() {
+    let now = Instant::now();
+    let (scope, owner) = PacketScope::new(
+        config(),
+        MemoryBudget::new(32 << 20),
+        RuntimeLimits {
+            // The final ACK stays exported while the other flow sends data.
+            bulk_frames: 2,
+            ..limits()
+        },
+        now,
+    )
+    .unwrap();
+    let client = "10.0.0.2:40000".parse().unwrap();
+    let other_client = "10.0.0.2:40001".parse().unwrap();
+    let (mut io, _) = handshake(&scope, now, client, 100);
+    let (mut other, server) = handshake_with_class(&scope, now, other_client, 100, TxClass::Bulk);
+    let other_id = other.flow_id();
+    let mut first = io.retirement();
+    let mut second = io.retirement();
+    let mut cancelled = io.retirement();
+    let final_ack = export_final_ack(&scope, &mut io, now);
+    drop(io);
+    let mut driver = owner.hand_off();
+    let counts = [(); 5].map(|()| {
+        Arc::new(Wakes {
+            scope: scope.clone(),
+            count: AtomicUsize::new(0),
+        })
+    });
+    let [device, old, current, sibling, cancel] =
+        counts.each_ref().map(|c| Waker::from(Arc::clone(c)));
+    let counts = || counts.each_ref().map(|c| c.count.load(Ordering::SeqCst));
+    let mut device_cx = Context::from_waker(&device);
+    driver.service(&mut device_cx, now);
+    assert_eq!(scope.stats().unwrap().timewait_entries, 1);
+
+    let mut first = pin!(first.wait());
+    let mut second = pin!(second.wait());
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&old))
+            .is_pending()
+    );
+    assert_eq!(
+        counts()[0],
+        0,
+        "retirement registration woke the packet driver before exact completion"
+    );
+    assert!(
+        first
+            .as_mut()
+            .poll(&mut Context::from_waker(&current))
+            .is_pending()
+    );
+    assert!(
+        second
+            .as_mut()
+            .poll(&mut Context::from_waker(&sibling))
+            .is_pending()
+    );
+    {
+        let mut waiting = pin!(cancelled.wait());
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&cancel))
+                .is_pending()
+        );
+    }
+    assert_eq!(
+        counts(),
+        [0; 5],
+        "retirement repoll or cancellation notified the driver"
+    );
+    driver.finish_turn(&mut device_cx, now);
+    assert!(
+        driver.fallback.is_none(),
+        "retirement armed a readiness timer"
+    );
+
+    assert!(matches!(
+        std::pin::Pin::new(&mut other).poll_write(&mut context(), b"other"),
+        Poll::Ready(Ok(5))
+    ));
+    driver.service(&mut device_cx, now);
+    let mut bulk = output(&scope);
+    assert_eq!(bulk.flow_id(), Some(other_id));
+    assert_eq!(decode(&bulk).1, b"other");
+    OutputLease::release_batch(&mut [Some(&mut bulk)]);
+    assert_eq!(
+        scope.receive(&segment(other_client, 101, server, tcp::RST, &[]), now),
+        Rx::Consumed
+    );
+    drop(other);
+    driver.service(&mut device_cx, now);
+    assert!(scope.0.inner.lock().slot(other_id).is_none());
+    driver.service(&mut device_cx, now + Duration::from_secs(59));
+    assert_eq!(scope.stats().unwrap().timewait_entries, 1);
+    driver.service(&mut device_cx, now + Duration::from_secs(61));
+    assert_eq!(scope.stats().unwrap().timewait_entries, 0);
+    assert_eq!(
+        &counts()[1..],
+        &[0; 4],
+        "retirement woke before its final output returned"
+    );
+    final_ack.release();
+    assert_eq!(&counts()[1..], &[0, 1, 1, 0]);
+    assert!(matches!(
+        first.as_mut().poll(&mut context()),
+        Poll::Ready(Ok(()))
+    ));
+    assert!(matches!(
+        second.as_mut().poll(&mut context()),
+        Poll::Ready(Ok(()))
+    ));
+}
+
+#[tokio::test]
+async fn completed_retirement_keeps_shared_credit_cell_until_observed() {
+    for abort in [false, true] {
+        let now = Instant::now();
+        let (scope, _owner) = PacketScope::new(
+            config(),
+            MemoryBudget::new(32 << 20),
+            RuntimeLimits {
+                max_waiters: 1,
+                ..limits()
+            },
+            now,
+        )
+        .unwrap();
+        let client = "10.0.0.2:40000".parse().unwrap();
+        let (io, server) = handshake(&scope, now, client, 100);
+        let id = io.flow_id();
+        let mut retirement = io.retirement();
+        let mut retiring = pin!(retirement.wait());
+        assert!(retiring.as_mut().poll(&mut context()).is_pending());
+        assert_eq!(
+            scope.receive(&segment(client, 101, server, tcp::RST, &[]), now),
+            Rx::Consumed
+        );
+        drop(io);
+        scope.drive(now);
+        let (successor, _) = handshake_with_class(&scope, now, client, 200, TxClass::Bulk);
+        assert_ne!(id, successor.flow_id());
+
+        let sender = scope.datagram_sender("203.0.113.9:53".parse().unwrap());
+        sender.send_to(b"held", client).await.unwrap();
+        let held = output(&scope);
+        let mut refused = pin!(sender.send_to(b"refused", client));
+        assert!(
+            matches!(refused.as_mut().poll(&mut context()), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::OutOfMemory)
+        );
+        assert!(matches!(
+            retiring.as_mut().poll(&mut context()),
+            Poll::Ready(Ok(()))
+        ));
+
+        let wakes = Arc::new(Wakes {
+            scope: scope.clone(),
+            count: AtomicUsize::new(0),
+        });
+        let waker = Waker::from(Arc::clone(&wakes));
+        let mut credit = pin!(sender.send_to(b"blocked", client));
+        assert!(
+            credit
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        scope.shutdown(abort);
+        assert_eq!(wakes.count.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(credit.as_mut().poll(&mut context()), Poll::Ready(Err(error))
+            if error.kind() == io::ErrorKind::ConnectionAborted)
+        );
+        held.release();
+    }
 }
 
 #[test]
@@ -739,6 +939,8 @@ fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
     let waiter = sleeper(Arc::new(AtomicBool::new(false)));
     let output = sleeper(Arc::new(AtomicBool::new(false)));
     let mut retirement = flows[0].retirement();
+    let sibling = sleeper(Arc::new(AtomicBool::new(true)));
+    let mut sibling_retirement = flows[0].retirement();
     {
         let mut waiting = pin!(retirement.wait());
         let waker = Waker::from(Arc::clone(&waiter));
@@ -746,6 +948,14 @@ fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
             waiting
                 .as_mut()
                 .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut sibling_wait = pin!(sibling_retirement.wait());
+        let sibling_waker = Waker::from(Arc::clone(&sibling));
+        assert!(
+            sibling_wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&sibling_waker))
                 .is_pending()
         );
         let waker = Waker::from(Arc::clone(&output));
@@ -761,16 +971,29 @@ fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
                 .iter()
                 .all(|sleeper| sleeper.notified.load(Ordering::SeqCst) == 1)
         );
-        assert_eq!(waiter.notified.load(Ordering::SeqCst), 1);
+        assert_eq!(waiter.notified.load(Ordering::SeqCst), 0);
         assert_eq!(output.notified.load(Ordering::SeqCst), 1);
         scope.shutdown(true);
-        assert_eq!(waiter.notified.load(Ordering::SeqCst), 2);
+        assert_eq!(waiter.notified.load(Ordering::SeqCst), 0);
         assert_eq!(output.notified.load(Ordering::SeqCst), 1);
         assert!(
             sleepers
                 .iter()
                 .all(|sleeper| sleeper.notified.load(Ordering::SeqCst) == 1)
         );
+        assert_eq!(sibling.notified.load(Ordering::SeqCst), 0);
+        let panic = catch_unwind(AssertUnwindSafe(|| drop(flows.remove(0)))).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"first terminal wake"));
+        assert_eq!(waiter.notified.load(Ordering::SeqCst), 1);
+        assert_eq!(sibling.notified.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            waiting.as_mut().poll(&mut context()),
+            Poll::Ready(Ok(()))
+        ));
+        assert!(matches!(
+            sibling_wait.as_mut().poll(&mut context()),
+            Poll::Ready(Ok(()))
+        ));
     }
     drop(flows);
     assert!(scope.is_protocol_quiescent());

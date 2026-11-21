@@ -299,7 +299,8 @@ struct Inner {
     closed_apps: usize,
     reap_pending: bool,
     pending_routing: usize,
-    waiters: Box<[Option<Waker>]>,
+    waiters: Box<[Option<Registration>]>,
+    credit_waiters: usize,
     output_waker: Option<Waker>,
     // While a generated turn owns service, mutations record a rescan instead of waking it.
     turn_needs_scan: Option<[bool; 2]>,
@@ -442,7 +443,11 @@ impl PacketScope {
             .and_then(|n| n.checked_add(Sources::bytes(aliases)?))
             .and_then(|n| n.checked_add(tx_frames.checked_mul(size_of::<Option<Queued>>())?))
             .and_then(|n| {
-                n.checked_add(limits.max_waiters.checked_mul(size_of::<Option<Waker>>())?)
+                n.checked_add(
+                    limits
+                        .max_waiters
+                        .checked_mul(size_of::<Option<Registration>>())?,
+                )
             })
             .filter(|&n| n <= isize::MAX as usize)
             .ok_or_else(|| invalid("runtime metadata overflow"))?;
@@ -508,6 +513,7 @@ impl PacketScope {
                 reap_pending: false,
                 pending_routing: 0,
                 waiters: (0..limits.max_waiters).map(|_| None).collect(),
+                credit_waiters: 0,
                 output_waker: None,
                 turn_needs_scan: None,
                 abort_wake_end: 0,
@@ -878,29 +884,28 @@ impl PacketScope {
     /// disposes queued CPU packets/protocol state, but cannot reclaim exported output leases.
     pub fn shutdown(&self, abort: bool) {
         let mut inner = self.0.inner.lock();
+        let wake_credit = !inner.closing && inner.credit_waiters != 0;
         inner.closing = true;
         inner.turn_needs_scan = None;
         if let Some(stack) = &mut inner.stack {
             stack.set_accepting(false);
         }
-        if !abort {
-            self.0.finish_with(inner);
-            return;
-        }
-
-        let output = inner.output_waker.take();
-        let notify_owner = inner.rights != Rights::Driven;
-        inner.abort();
+        let output = if abort {
+            let output = inner.output_waker.take();
+            inner.abort();
+            output
+        } else {
+            None
+        };
         let mut wakes = Shared::events(&mut inner, None);
-        Shared::wake_abort_waiters(&mut inner, &mut wakes);
+        if wake_credit {
+            Shared::wake_terminal_waiters(&mut inner, WaitFor::Credit, &mut wakes);
+        }
+        let device = inner.device_wake();
         let reap = inner.closed_apps != 0;
         drop(inner);
         deliver_wakes(output.into_iter(), &mut wakes);
-        if notify_owner {
-            wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| {
-                self.0.owner_wake.notify_one()
-            })));
-        }
+        wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.0.wake_owner(device))));
         if reap {
             wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.0.reap())));
         }
@@ -1019,13 +1024,13 @@ impl Shared {
         mut inner: MutexGuard<'_, Inner>,
         first: Option<[Option<Waker>; 2]>,
     ) {
-        let wakes = Self::events(&mut inner, first);
+        let mut wakes = Self::events(&mut inner, first);
         let closed_apps = inner.closed_apps != 0;
         let device = inner.device_wake();
         drop(inner);
-        self.wake_owner(device);
+        wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.wake_owner(device))));
         if closed_apps {
-            self.reap();
+            wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.reap())));
         }
         resume_wake_panic(wakes);
     }
@@ -1064,34 +1069,43 @@ impl Shared {
         delivered
     }
 
-    fn wake_abort_waiters(inner: &mut MutexGuard<'_, Inner>, wakes: &mut std::thread::Result<()>) {
-        // Retirement can still wait for an exported lease. Keep each registration in its
-        // original cell until that waiter cancels or observes its own completion.
+    fn wake_terminal_waiters(
+        inner: &mut MutexGuard<'_, Inner>,
+        reason: WaitFor,
+        wakes: &mut std::thread::Result<()>,
+    ) {
+        // Each future keeps its cell until it observes completion or cancels, even
+        // while an unlocked waker re-enters the scope and registers another wait.
         for start in (0..inner.waiters.len()).step_by(BATCH) {
-            let end = (start + BATCH).min(inner.waiters.len());
-            let registrations = &inner.waiters[start..end];
-            if registrations.iter().all(Option::is_none) {
-                continue;
-            }
+            let mut matches = inner.waiters[start..]
+                .iter()
+                .take(BATCH)
+                .flatten()
+                .filter(|registration| registration.reason == reason);
             let mut batch = [const { None }; BATCH];
-            batch[..registrations.len()].clone_from_slice(registrations);
-            MutexGuard::unlocked(inner, || deliver_wakes(batch.into_iter().flatten(), wakes));
+            for (cell, registration) in batch.iter_mut().zip(&mut matches) {
+                *cell = Some(registration.waker.clone());
+            }
+            if batch[0].is_some() {
+                MutexGuard::unlocked(inner, || deliver_wakes(batch.into_iter().flatten(), wakes));
+            }
         }
     }
 
     fn reap(&self) {
+        let mut wakes = Ok(());
         loop {
             let (index, id, callback) = {
                 let mut inner = self.inner.lock();
                 if inner.closed_apps == 0 {
-                    return;
+                    break;
                 }
                 let protocol_changed = inner
                     .stack
                     .as_mut()
                     .is_some_and(Stack::take_tcp_retention_change);
                 if !inner.reap_pending && !protocol_changed {
-                    return;
+                    break;
                 }
                 let found = inner.slots.iter().position(|slot| {
                     slot.as_ref().is_some_and(|slot| {
@@ -1106,7 +1120,7 @@ impl Shared {
                 });
                 let Some(index) = found else {
                     inner.reap_pending = false;
-                    return;
+                    break;
                 };
                 // An unlocked callback can re-enter and drain the remaining eligible slots.
                 inner.reap_pending = true;
@@ -1114,16 +1128,21 @@ impl Shared {
                 slot.retiring = true;
                 (index, slot.id, slot.callback.take())
             };
-            let completion = RetirementCompletion {
-                shared: self,
-                index,
-                id,
-            };
             if let Some(callback) = callback {
-                (callback.callback)();
+                wakes = wakes.and(catch_unwind(AssertUnwindSafe(callback.callback)));
             }
-            drop(completion);
+            let mut inner = self.inner.lock();
+            let slot = inner.slots[index]
+                .take()
+                .expect("retirement callback owns exact slot");
+            assert_eq!(slot.id, id);
+            inner.closed_apps -= 1;
+            let device = inner.device_wake();
+            Self::wake_terminal_waiters(&mut inner, WaitFor::Retirement(id), &mut wakes);
+            drop(inner);
+            wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.wake_owner(device))));
         }
+        resume_wake_panic(wakes);
     }
 
     /// Applies `Inner::device_wake` after unlocking. Notify carries a permit even if the
@@ -1135,39 +1154,6 @@ impl Shared {
             Some(None) => {}
             None => self.owner_wake.notify_one(),
         }
-    }
-}
-
-struct RetirementCompletion<'a> {
-    shared: &'a Shared,
-    index: usize,
-    id: FlowId,
-}
-
-impl Drop for RetirementCompletion<'_> {
-    fn drop(&mut self) {
-        let device = {
-            let mut inner = self.shared.inner.lock();
-            let slot = inner.slots[self.index]
-                .take()
-                .expect("retirement callback owns exact slot");
-            assert_eq!(slot.id, self.id);
-            inner.closed_apps -= 1;
-            if inner.aborted {
-                // A retirement callback may itself be unwinding. Its completion must leave
-                // persistent waiters registered and preserve that original panic.
-                let device = inner.device_wake();
-                let mut wakes = Ok(());
-                Shared::wake_abort_waiters(&mut inner, &mut wakes);
-                drop(inner);
-                let owner = catch_unwind(AssertUnwindSafe(|| self.shared.wake_owner(device)));
-                resume_wake_panic(wakes.and(owner));
-                return;
-            }
-            inner.wake_waiters();
-            inner.device_wake()
-        };
-        self.shared.wake_owner(device);
     }
 }
 
@@ -1478,7 +1464,7 @@ impl Inner {
             sent += 1;
         }
         if sent != 0 {
-            self.wake_waiters();
+            self.wake_credit_waiters();
         }
         sent == BATCH
     }
@@ -1537,9 +1523,13 @@ impl Inner {
         None
     }
 
-    fn wake_waiters(&mut self) {
-        for waker in self.waiters.iter_mut().flatten() {
-            waker.wake_by_ref();
+    fn wake_credit_waiters(&self) {
+        if self.credit_waiters != 0 && !self.closing {
+            for registration in self.waiters.iter().flatten() {
+                if registration.reason == WaitFor::Credit {
+                    registration.waker.wake_by_ref();
+                }
+            }
         }
     }
 
@@ -1581,10 +1571,6 @@ impl Inner {
             #[cfg(target_os = "linux")]
             self.reap_peers();
             self.ledger.close();
-            if let Some(waker) = self.output_waker.take() {
-                waker.wake();
-            }
-            self.wake_waiters();
         }
         self.finished
     }
@@ -1653,7 +1639,7 @@ impl PacketOwner {
                 let more = inner.drive(now);
                 resume_wake_panic(Shared::events(&mut inner, None));
                 let mut deadline = inner.stack.as_ref().and_then(Stack::poll_timeout);
-                if inner.waiters.iter().any(Option::is_some)
+                if inner.credit_waiters != 0
                     || inner.slots.iter().flatten().any(|slot| slot.tx.is_some())
                 {
                     let readiness = now + READINESS_FALLBACK;
@@ -1662,8 +1648,16 @@ impl PacketOwner {
                 (more, deadline)
             };
             self.scope.0.reap();
-            if self.scope.0.inner.lock().finish() {
-                return;
+            {
+                let mut inner = self.scope.0.inner.lock();
+                if inner.finish() {
+                    let output = inner.output_waker.take();
+                    drop(inner);
+                    if let Some(waker) = output {
+                        waker.wake();
+                    }
+                    return;
+                }
             }
             if more {
                 tokio::task::yield_now().await;
@@ -1673,7 +1667,7 @@ impl PacketOwner {
                 tokio::select! {
                     _ = &mut notified => {},
                     _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                        self.scope.0.inner.lock().wake_waiters();
+                        self.scope.0.inner.lock().wake_credit_waiters();
                     },
                 }
             } else {
@@ -1761,7 +1755,7 @@ impl PacketDriver {
         let armed = inner.output_waker.take();
         if self.fallback.is_some_and(|due| due <= now) {
             self.fallback = None;
-            inner.wake_waiters();
+            inner.wake_credit_waiters();
         }
         inner.advance(now);
         let more = output(&mut inner);
@@ -1799,8 +1793,8 @@ impl PacketDriver {
         }
         inner.output_waker = armed;
         register(&mut inner.output_waker, cx.waker());
-        let blocked = inner.waiters.iter().any(Option::is_some)
-            || inner.slots.iter().flatten().any(|slot| slot.tx.is_some());
+        let blocked =
+            inner.credit_waiters != 0 || inner.slots.iter().flatten().any(|slot| slot.tx.is_some());
         self.fallback = blocked.then(|| self.fallback.unwrap_or(now + READINESS_FALLBACK));
         self.deadline = [
             inner.stack.as_ref().and_then(Stack::poll_timeout),
@@ -2105,7 +2099,7 @@ impl OutputOwner {
                     let queued = output.queued.take().expect("live output");
                     inner.release_output(queued, output.bytes.take());
                 }
-                inner.wake_waiters();
+                inner.wake_credit_waiters();
             });
         }
     }
@@ -2133,7 +2127,7 @@ impl Drop for OutputOwner {
             let bytes = self.bytes.take();
             self.scope.0.with(|inner| {
                 inner.release_output(queued, bytes);
-                inner.wake_waiters();
+                inner.wake_credit_waiters();
             });
         }
     }
@@ -2173,7 +2167,7 @@ impl DatagramSender {
         let scope = self.realm.as_ref().map_or(&self.scope, |realm| {
             &realm.owners()[realm.worker_for_udp(client.ip())]
         });
-        let mut waiter = Waiter::new(scope.clone());
+        let mut waiter = Waiter::new(scope);
         poll_fn(|cx| {
             scope.0.with(|inner| {
                 if inner.closing {
@@ -2192,7 +2186,7 @@ impl DatagramSender {
                         honk_datapath::buffer::LedgerError::NoFrame
                         | honk_datapath::buffer::LedgerError::NoDescriptor,
                     ) => {
-                        return waiter.pending(inner, cx);
+                        return waiter.pending(inner, cx, WaitFor::Credit);
                     }
                     Err(error) => return Poll::Ready(Err(io::Error::other(error))),
                 };
@@ -2242,36 +2236,59 @@ impl DatagramSender {
     }
 }
 
-struct Waiter {
-    scope: PacketScope,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WaitFor {
+    Credit,
+    Retirement(FlowId),
+}
+
+struct Registration {
+    reason: WaitFor,
+    waker: Waker,
+}
+
+struct Waiter<'a> {
+    scope: &'a PacketScope,
     index: Option<usize>,
 }
 
-impl Waiter {
-    fn new(scope: PacketScope) -> Self {
+impl<'a> Waiter<'a> {
+    fn new(scope: &'a PacketScope) -> Self {
         Self { scope, index: None }
     }
 
-    fn pending<T>(&mut self, inner: &mut Inner, cx: &Context<'_>) -> Poll<io::Result<T>> {
-        let index = match self.index {
-            Some(index) => index,
-            None => {
-                let Some(index) = inner.waiters.iter().position(Option::is_none) else {
-                    return Poll::Ready(Err(capacity()));
-                };
-                self.index = Some(index);
-                index
-            }
-        };
-        register(&mut inner.waiters[index], cx.waker());
+    fn pending<T>(
+        &mut self,
+        inner: &mut Inner,
+        cx: &Context<'_>,
+        reason: WaitFor,
+    ) -> Poll<io::Result<T>> {
+        if let Some(index) = self.index {
+            let registration = inner.waiters[index].as_mut().expect("registered waiter");
+            registration.waker.clone_from(cx.waker());
+        } else {
+            let Some(index) = inner.waiters.iter().position(Option::is_none) else {
+                return Poll::Ready(Err(capacity()));
+            };
+            inner.waiters[index] = Some(Registration {
+                reason,
+                waker: cx.waker().clone(),
+            });
+            inner.credit_waiters += usize::from(reason == WaitFor::Credit);
+            self.index = Some(index);
+        }
         Poll::Pending
     }
 }
 
-impl Drop for Waiter {
+impl Drop for Waiter<'_> {
     fn drop(&mut self) {
         if let Some(index) = self.index {
-            self.scope.0.with(|inner| inner.waiters[index] = None);
+            let mut inner = self.scope.0.inner.lock();
+            let registration = inner.waiters[index].take().expect("registered waiter");
+            inner.credit_waiters -= usize::from(registration.reason == WaitFor::Credit);
+            drop(inner);
+            drop(registration);
         }
     }
 }

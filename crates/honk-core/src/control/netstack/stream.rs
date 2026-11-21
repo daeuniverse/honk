@@ -8,7 +8,7 @@ use honk_datapath::ScopeId;
 use honk_netstack::{FlowId, MemoryReservation, StreamError, SynInfo};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::{PacketScope, RetirementCallback, Waiter, capacity, closed, register};
+use super::{PacketScope, RetirementCallback, WaitFor, Waiter, capacity, closed, register};
 
 /// Application ownership of an original, Stack-local TCP incarnation.
 #[derive(Debug)]
@@ -239,13 +239,13 @@ fn set_callback<F: FnOnce() + Send + 'static>(
 }
 
 async fn wait(scope: &PacketScope, id: FlowId) -> io::Result<()> {
-    let mut waiter = Waiter::new(scope.clone());
+    let mut waiter = Waiter::new(scope);
     poll_fn(|cx| {
-        scope.0.with(|inner| {
+        scope.0.with_silent(|inner| {
             if inner.slot(id).is_none() {
                 Poll::Ready(Ok(()))
             } else {
-                waiter.pending(inner, cx)
+                waiter.pending(inner, cx, WaitFor::Retirement(id))
             }
         })
     })
