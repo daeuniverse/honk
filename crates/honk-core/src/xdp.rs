@@ -3165,19 +3165,32 @@ struct PreparedRuntime {
 
 #[cold]
 fn device_sizing(mtu: u32) -> (PortConfig, usize) {
+    queue_sizing(mtu, 0, 0)
+}
+
+#[cold]
+fn queue_sizing(mtu: u32, eligible_queues: usize, remaining: usize) -> (PortConfig, usize) {
+    const RX_TIER: usize = 512;
     // Two VLAN tags bound TX extent; RX keeps its independent SG admission.
     let single_frame = usize::try_from(mtu)
         .ok()
         .and_then(|mtu| mtu.checked_add(22))
         .is_some_and(|length| length <= FRAME_SIZE);
-    let (bulk_frames, ring_size, scope_bulk_frames) = if single_frame {
-        (480, 512, 256)
+    // Leave the stack half untouched and screen for UMEM plus per-queue bookkeeping.
+    // The real reservations in Port::open_device remain authoritative.
+    let (rx_frames, bulk_frames, ring_size, scope_bulk_frames) = if !single_frame {
+        (256, 224, 256, 128)
+    } else if (1..=8).contains(&eligible_queues)
+        && remaining.saturating_sub(CAPTURE_MEMORY / 2)
+            >= eligible_queues * 2 * (RX_TIER + 32 + 480) * FRAME_SIZE
+    {
+        (RX_TIER, 480, 1024, 256)
     } else {
-        (224, 256, 128)
+        (256, 480, 512, 256)
     };
     (
         PortConfig {
-            rx_frames: 256,
+            rx_frames,
             control_frames: 32,
             bulk_frames,
             ring_size,
@@ -3188,11 +3201,11 @@ fn device_sizing(mtu: u32) -> (PortConfig, usize) {
 
 fn member_admission_issues(
     info: &DeviceInfo,
+    port_config: PortConfig,
     requested_mode: Option<BindMode>,
     metadata_len: usize,
     absent: io::Result<bool>,
 ) -> [Option<(&'static str, String)>; 2] {
-    let (port_config, _) = device_sizing(info.mtu);
     let mode = select_xsk_mode(info, requested_mode, port_config, metadata_len)
         .err()
         .map(|error| ("xsk_mode", error.to_string()));
@@ -3334,6 +3347,25 @@ async fn prepare(
                 .collect()
         })
         .unwrap_or_default();
+    let eligible_queues = match infos.as_slice() {
+        [device]
+            if gateway_enabled
+                && requested_mode == Some(BindMode::ZeroCopy)
+                && datapath.host.is_none()
+                && plan.as_ref().is_some_and(|plan| plan.realms().len() == 1) =>
+        {
+            device.queues.len()
+        }
+        _ => 0,
+    };
+    let physical_config = |mtu| {
+        queue_sizing(
+            mtu,
+            eligible_queues,
+            budget.limit().saturating_sub(budget.used()),
+        )
+        .0
+    };
     let topology = if let Some(plan) = &plan {
         if gateway_enabled && let Err(error) = plan.check_gateway_defaults() {
             record("gateway_uplink", "namespace", error.to_string());
@@ -3344,6 +3376,7 @@ async fn prepare(
         for info in &infos {
             for (reason, details) in member_admission_issues(
                 info,
+                physical_config(info.mtu),
                 requested_mode,
                 metadata_len,
                 honk_xsk::xdp_absent(info.ifindex),
@@ -3554,7 +3587,7 @@ async fn prepare(
     }
     let mut devices = StartupDevices(Vec::with_capacity(infos.len()));
     for (device_index, info) in infos.into_iter().enumerate() {
-        let (port_config, _) = device_sizing(info.mtu);
+        let port_config = physical_config(info.mtu);
         let binding_mode = select_xsk_mode(&info, requested_mode, port_config, metadata_len)?;
         let vlan_offload = prepare_vlan_offload(&info, &budget)?;
         // A device without a complete feature identity (virtio reports no firmware version)
@@ -3880,6 +3913,44 @@ mod tests {
     }
 
     #[test]
+    fn rx_capacity_preserves_small_budget_and_many_queue_admission() {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let sizing = |mtu, queues| queue_sizing(mtu, queues, budget.limit() - budget.used());
+        let umem = |mtu, queues| sizing(mtu, queues).0.umem_bytes().unwrap();
+        let base = 3 * 1024 * 1024;
+        let (wide, scope_bulk) = sizing(1500, 8);
+        wide.validate().unwrap();
+        assert_eq!(
+            (wide.control_frames, wide.bulk_frames, scope_bulk),
+            (32, 480, 256)
+        );
+        assert_eq!(wide.ring_size, 1024);
+        assert!(wide.rx_frames > 256 && wide.umem_bytes().unwrap() > base);
+        assert_eq!(umem(9000, 1), 2 * 1024 * 1024);
+        assert_eq!(umem(1500, 0), base);
+        assert_eq!(umem(1500, 9), base);
+        for queues in [1, 8] {
+            let cutoff = CAPTURE_MEMORY / 2 + queues * 2 * wide.umem_bytes().unwrap();
+            assert_eq!(queue_sizing(4074, queues, cutoff - 1).0.rx_frames, 256);
+            assert_eq!(
+                queue_sizing(4074, queues, cutoff).0.rx_frames,
+                wide.rx_frames
+            );
+            assert_eq!(
+                queue_sizing(4074, queues, cutoff + 1).0.rx_frames,
+                wide.rx_frames
+            );
+            assert_eq!(queue_sizing(4075, queues, cutoff + 1).0.ring_size, 256);
+        }
+        let _other_owners = budget.reserve(CAPTURE_MEMORY - base).unwrap();
+        let constrained = sizing(1500, 1).0;
+        assert_eq!((constrained.rx_frames, constrained.ring_size), (256, 512));
+        assert!(budget.reserve(wide.umem_bytes().unwrap()).is_none());
+        let _port = budget.reserve(constrained.umem_bytes().unwrap()).unwrap();
+        assert_eq!(budget.used(), budget.limit());
+    }
+
+    #[test]
     fn readonly_admission_reports_nonzero_gateway_time_offset() {
         assert!(gateway_time_namespace_issue(Ok(None)).is_none());
         assert!(gateway_time_namespace_issue(Ok(Some(0))).is_none());
@@ -3905,12 +3976,17 @@ mod tests {
             vlan_metadata: false,
             direct_relay_physical: true,
         };
-        let issues: Vec<_> =
-            member_admission_issues(&info, Some(BindMode::ZeroCopy), METADATA_LEN, Ok(false))
-                .into_iter()
-                .flatten()
-                .map(|(reason, details)| (reason, info.name.clone(), details))
-                .collect();
+        let issues: Vec<_> = member_admission_issues(
+            &info,
+            device_sizing(info.mtu).0,
+            Some(BindMode::ZeroCopy),
+            METADATA_LEN,
+            Ok(false),
+        )
+        .into_iter()
+        .flatten()
+        .map(|(reason, details)| (reason, info.name.clone(), details))
+        .collect();
         let summary = admission_failure(&issues, 0);
         assert_eq!(issues.len(), 2);
         assert!(summary.contains("reason=xsk_mode device=eth-test"));
