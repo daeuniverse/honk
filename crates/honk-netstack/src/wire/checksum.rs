@@ -126,6 +126,16 @@ impl Checksum {
     /// Callers must pass addresses of one family; a mismatch is a bug, not input.
     pub fn pseudo(src: IpAddr, dst: IpAddr, proto: u8, upper_len: usize) -> Checksum {
         debug_assert_eq!(src.is_ipv4(), dst.is_ipv4());
+        if let (IpAddr::V4(src), IpAddr::V4(dst)) = (src, dst) {
+            // Folding a network-order u32 sums its two 16-bit words.
+            return Self {
+                acc: u64::from(u32::from(src))
+                    + u64::from(u32::from(dst))
+                    + u64::from(proto)
+                    + u64::from(upper_len as u16),
+                odd: None,
+            };
+        }
         let mut c = Checksum::new();
         for a in [src, dst] {
             match a {
