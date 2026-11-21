@@ -59,7 +59,8 @@ impl<'a> RealmRxBatch<'a> {
                 || inner.queued != 0
                 || inner.source_work.is_host()
                 || inner.resources.is_none()
-                || inner.output_peers.iter().any(Option::is_some)
+                // Exported output owns its path. A sole owner still checks the full RX path below.
+                || (owner.0.workers != 1 && inner.output_peers.iter().any(Option::is_some))
                 || inner.slots.iter().all(Option::is_some))
             || inner
                 .capture_admission

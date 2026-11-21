@@ -1,4 +1,5 @@
 use super::*;
+use crate::xdp::{ReturnPath, worker::PeerAuthority};
 
 fn client_for(realm: &PacketRealm, worker: usize) -> SocketAddr {
     let destination = "203.0.113.9:443".parse().unwrap();
@@ -17,16 +18,13 @@ fn udp_clients(realm: &PacketRealm) -> [SocketAddr; 2] {
     })
 }
 
-#[tokio::test]
-async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
-    use crate::xdp::{ReturnPath, worker::PeerAuthority};
-
-    let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+fn physical_synack(
+    realm: &PacketRealm,
+    peers: &Arc<PeerAuthority>,
+    now: Instant,
+) -> (ReturnPath, FlowIo, OutputLease) {
     let scope = realm.owner(0).unwrap();
-    let now = Instant::now();
-    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
-    let client = client_for(&realm, 0);
+    let client = client_for(realm, 0);
     let path = ReturnPath {
         realm: 1,
         device: 0,
@@ -44,7 +42,18 @@ async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
     scope.after_receive();
     let (_, flow) = scope.poll_accept().unwrap();
     scope.drive(now);
-    let reply = output(scope);
+    (path, flow, output(scope))
+}
+
+#[tokio::test]
+async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let now = Instant::now();
+    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let (path, flow, reply) = physical_synack(&realm, &peers, now);
+    let client = flow.peer_addr();
     let server = decode(&reply).0.seq.wrapping_add(1);
     reply.release();
     let ack = segment(client, 101, server, tcp::ACK, &[]);
@@ -197,6 +206,103 @@ async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
     drop(flow);
     for owner in owners {
         owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn physical_tcp_batch_preserves_exported_output() {
+    for workers in [1, 2] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, owners) = capture_realm(1280, 1, 16, workers, &budget).unwrap();
+        let scope = realm.owner(0).unwrap();
+        assert_eq!(scope.0.workers, workers);
+        let now = Instant::now();
+        let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
+        let original = synack.packet().to_vec();
+        let server = decode(&synack).0.seq.wrapping_add(1);
+        let client = flow.peer_addr();
+        let ack = segment(client, 101, server, tcp::ACK, &[]);
+        scope
+            .receive_realm_timed(&ack, now, now, &mut None, false, |source, pending| {
+                peers.retain(scope.scope(), source, path, now, pending)
+            })
+            .unwrap();
+        scope.after_receive();
+        flow.mark_rx_admitted();
+        let now = now + honk_netstack::MAX_DEFERRED;
+        scope.drive(now);
+        while let Poll::Ready(Some(output)) = scope.poll_output(&mut context()) {
+            output.release();
+        }
+
+        let data = segment(client, 101, server, tcp::ACK, b"data");
+        let receive = |path| {
+            RealmRxBatch::receive(&mut None, scope, &data, (now, now), path, &peers, || true)
+        };
+        scope
+            .datagram_sender(flow.local_addr())
+            .send_to(b"queued", client)
+            .await
+            .unwrap();
+        assert!(
+            receive(path).is_none(),
+            "queued CPU output still needs service"
+        );
+        let queued = output(scope);
+        assert!(queued.packet().ends_with(b"queued"));
+        queued.release();
+        for other in [
+            ReturnPath { device: 1, ..path },
+            ReturnPath {
+                vlan_tci: [path.vlan_tci[0] | (5 << 13), 0],
+                ..path
+            },
+        ] {
+            assert!(
+                receive(other).is_none(),
+                "a changed path requires scalar RX"
+            );
+        }
+
+        {
+            let inner = scope.0.inner.lock();
+            assert_eq!(inner.queued, 0);
+            assert!(inner.output_peers.contains(&Some(client.ip())));
+            assert!(
+                inner
+                    .stack
+                    .as_ref()
+                    .unwrap()
+                    .poll_timeout()
+                    .is_none_or(|due| due > now)
+            );
+        }
+        let report = receive(path);
+        if workers == 1 {
+            let report = report.expect("single owner must batch with an exported output lease");
+            assert!(report.taken_over && report.qualified_rx);
+        } else {
+            assert!(report.is_none(), "sharded scope must wait for the export");
+        }
+        assert_eq!(synack.packet(), original);
+        assert_eq!(synack.flow_id(), Some(flow.flow_id()));
+        assert_eq!(synack.peer_hold().unwrap().original_path(), path);
+        synack.release();
+        if workers == 2 {
+            assert!(receive(path).unwrap().qualified_rx);
+        }
+        let mut bytes = [0; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(matches!(
+            std::pin::Pin::new(&mut flow).poll_read(&mut context(), &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"data");
+        drop(flow);
+        for owner in owners {
+            owner.shutdown().await;
+        }
     }
 }
 
