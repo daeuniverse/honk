@@ -99,12 +99,14 @@ impl UdpEndpointPool {
         })))
     }
 
-    pub(in crate::control) fn reap_tasks(&self) {
-        if self
-            .completed_tasks
+    pub(in crate::control) fn has_completed_tasks(&self) -> bool {
+        self.completed_tasks
             .as_ref()
-            .is_none_or(|count| count.load(Ordering::Acquire) == 0)
-        {
+            .is_some_and(|count| count.load(Ordering::Acquire) != 0)
+    }
+
+    pub(in crate::control) fn reap_tasks(&self) {
+        if !self.has_completed_tasks() {
             return;
         }
         for registry in [&self.slow_tasks, &self.drivers, &self.source_tasks] {

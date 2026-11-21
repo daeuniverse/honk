@@ -120,17 +120,17 @@ impl FlowIo {
             return;
         }
         self.open = false;
-        self.scope.0.with(|inner| {
-            if let Some(slot) = inner.slot(self.id) {
-                slot.app_open = false;
-                slot.close_pending = true;
-                slot.rx = None;
-                slot.tx = None;
-                inner.pending_closes += 1;
-                inner.closed_apps += 1;
-                inner.reap_pending = true;
-            }
+        let registrations = self.scope.0.with(|inner| {
+            let slot = inner.slot(self.id)?;
+            slot.app_open = false;
+            slot.close_pending = true;
+            let registrations = [slot.rx.take(), slot.tx.take()];
+            inner.pending_closes += 1;
+            inner.closed_apps += 1;
+            inner.reap_pending = true;
+            Some(registrations)
         });
+        drop(registrations);
     }
 
     pub fn abort(&mut self) {
@@ -166,19 +166,15 @@ pub struct FlowRetirement {
 
 impl FlowRetirement {
     pub fn abort(&self) {
-        self.scope.0.with(|inner| {
-            if let Some(stack) = &mut inner.stack {
-                stack.tcp_abort(self.id);
-            }
-            if let Some(slot) = inner.slot(self.id) {
-                if let Some(waker) = slot.rx.take() {
-                    waker.wake();
-                }
-                if let Some(waker) = slot.tx.take() {
-                    waker.wake();
-                }
-            }
-        });
+        let mut inner = self.scope.0.inner.lock();
+        if let Some(stack) = &mut inner.stack {
+            stack.tcp_abort(self.id);
+        }
+        let wakers = inner
+            .slot(self.id)
+            .filter(|slot| slot.rx.is_some() || slot.tx.is_some())
+            .map(|slot| [slot.rx.take(), slot.tx.take()]);
+        self.scope.0.finish_with_wakers(inner, wakers);
     }
 
     pub fn on_retired<F: FnOnce() + Send + 'static>(&self, callback: F) -> io::Result<()> {

@@ -133,6 +133,8 @@ ACK 取得进展时，同时撤销旧 PTO deadline 与已到期但尚未物化�
 
 普通嵌入运行 `PacketOwner`；XDP/TUN 将每个 scope 的驱动权交给设备 runtime 内唯一且不可 Clone 的 `PacketDriver`。原已计费 owner task 保持停放，随后执行并 join 真实 finish 或 abandoned-driver cleanup。应用/输出变更唤醒 active driver，自身扫描和导出不自通知。共享 mutex 与锁外 retirement callback 不变；归还驱动权不是完成或 CQ，等待 ready/joined cleanup 期间仍须服务 driver。
 
+TCP 读写就绪通知在释放 scope 锁后交付，每批最多 64 个注册。生成输出的轮次可以把设备唤醒推迟到最后一次检查；若之后有新输出或轮次被中断，仍须唤醒 driver。
+
 只有任务计费成功后才从原列表取走 scope owner。接纳失败时，已计费 supervisor 保留所有未启动 owner，在 producer、应用和退休工作结束后完成其真实清理；任何已导出输出尚未归还时，就绪等待都不能结束。panic payload 保留到全部原 owner 和已接纳任务 join 完成。
 
 对于已准入的 XDP realm，仅当经过溢出检查的完整长度 `14 + 4 * vlan_count + logical_mtu.max(1280)` 不超过 `FRAME_SIZE` 时，Endpoint 才在最终单个 UMEM frame 内生成输出；既有物理端口最大长度限制继续生效。Stack 使用完整 scope L3 容量和 `TxCaps::NONE`，不能缩短容量以强行满足资格。符合资格的 driver 只禁用 CPU 拉取：timer、pending close、event、唤醒注册、退休和真实 finish 继续运行。有界直接输出轮次结束后才刷新最终 deadline/event/reap/finish 状态，包括无输出和本地处置的结果。普通 owner、显式时钟 CPU drive 及不符合资格/jumbo realm 继续 CPU 物化，包括控制输出和 SG 提交。
@@ -151,6 +153,10 @@ client 地址分片。peer、DNS 和 UDP source 身份仍属于逻辑 realm，�
 CQ 则保留精确 owner 和 FlowId。跨 worker 交接共用 64 个已计费 cell，每个目的
 队列最多等待 32 项，借用 RX 不会逃出 callback。Core 与 Host 协调留在 worker 0；
 drain 确认绑定该轮开始前观察到的 epoch，不能借用后来发布的 barrier。
+
+物理 Endpoint RX 可在同一个 scope 锁下处理队列本轮剩余额度内的报文，上限为 32 个。每个已建立连接的 TCP 报文仍须通过报头、校验和、来源准入及 Stack 对原始 FlowId 的判定。对于已持有的同一 peer，完整返回路径和 ingress 时间相同时，首个通过校验的报文执行 `last_seen = max(last_seen, ingress_at)`。同时间的后续报文重复更新会得到相同结果，因此每包在来源校验后读取 peer 权威的版本，版本相同即可复用。路径或冲突变化后必须加锁复查，版本饱和后始终加锁。批末不写回路径，因而保留其他 worker 更新的成员设备和 VLAN 优先级。
+
+两个 worker 都保留报文的原始 ingress 时间。对于普通本地包，worker 0 在等待 scope 锁之前读取一次服务时钟，TCP 处理、定时期限检查和逐包回退共用这个时间。worker 1 沿用本轮服务时间。定时器到期则结束前一批次，在处理下一包之前推进定时器。每个候选报文在 scope 锁内检查准入是否正在关闭，以及已完成的 UDP 任务是否仍占用共享预算。命中任一条件就解锁并走逐包接收。已完成的 UDP 任务在报文准入前以及 TCP supervisor 为新流任务预留预算前回收。即使没有后续流量，定期维护及关停也会回收已完成的工作。
 
 重组通过本地不回绕 incarnation 将身份保留到完成包及 timeout 输出。最早输入
 时间控制原 fragment deadline 和返回快照；最晚实际分片输入时间才是完整报文

@@ -1,4 +1,5 @@
 use super::*;
+use crate::control::netstack::RealmRxBatch;
 use futures::FutureExt as _;
 mod adaptive;
 mod runtime;
@@ -22,8 +23,72 @@ struct PeerSlot {
     conflict: Option<Instant>,
 }
 
+impl PeerSlot {
+    fn observe(
+        &mut self,
+        authority: &PeerAuthority,
+        path: ReturnPath,
+        now: Instant,
+        opens: bool,
+        rst: bool,
+        pending: bool,
+    ) -> bool {
+        let changed = self.conflict.is_some() || (!pending && !rst && self.path != path);
+        if !self.path.same_identity(path) || self.conflict.is_some() {
+            if rst || !opens || self.holds != 0 {
+                return false;
+            }
+            if !self
+                .conflict
+                .is_some_and(|at| now.saturating_duration_since(at) >= PEER_CONFLICT_HOLD)
+            {
+                if self.conflict != Some(now) {
+                    self.conflict = Some(now);
+                    authority.invalidate();
+                }
+                return false;
+            }
+            self.conflict = None;
+        }
+        if !rst {
+            if !pending {
+                self.path = path;
+            }
+            self.last_seen = self.last_seen.max(now);
+        }
+        if changed {
+            authority.invalidate();
+        }
+        true
+    }
+
+    fn pin(&mut self, authority: &PeerAuthority) -> Option<()> {
+        self.holds = self.holds.checked_add(1)?;
+        if self.holds == usize::MAX {
+            authority.invalidate();
+        }
+        Some(())
+    }
+}
+
 #[derive(Debug)]
-pub(super) struct PeerAuthority(Mutex<Vec<PeerSlot>>, Arc<AtomicBool>);
+pub(crate) struct PeerAuthority {
+    slots: Mutex<Vec<PeerSlot>>,
+    admission: Arc<AtomicBool>,
+    revision: std::sync::atomic::AtomicU64,
+}
+
+/// Repeating last_seen = max(last_seen, ingress_at) at the same timestamp is idempotent.
+/// Observe the first checked packet immediately; batch end never writes a potentially older path.
+pub(crate) struct PeerObservation<'a> {
+    authority: &'a PeerAuthority,
+    scope: ScopeId,
+    slot: usize,
+    generation: u64,
+    path: ReturnPath,
+    ingress_at: Instant,
+    revision: u64,
+}
 
 #[derive(Debug)]
 pub(crate) struct PeerHold {
@@ -71,12 +136,10 @@ impl Clone for PeerHold {
         if !self.learned() {
             return Self::unlearned(Arc::clone(&self.authority), self.address, self.path);
         }
-        let mut peers = self.authority.0.lock();
+        let mut peers = self.authority.slots.lock();
         let peer = &mut peers[self.slot];
         assert_eq!(peer.generation, self.generation);
-        peer.holds = peer
-            .holds
-            .checked_add(1)
+        peer.pin(&self.authority)
             .expect("peer hold count exhausted");
         Self {
             authority: Arc::clone(&self.authority),
@@ -91,12 +154,12 @@ impl Clone for PeerHold {
 impl Drop for PeerHold {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.authority.1.store(false, Ordering::Release);
+            self.authority.admission.store(false, Ordering::Release);
         }
         if !self.learned() {
             return;
         }
-        let mut peers = self.authority.0.lock();
+        let mut peers = self.authority.slots.lock();
         let peer = &mut peers[self.slot];
         assert_eq!(peer.generation, self.generation);
         peer.holds = peer.holds.checked_sub(1).expect("peer hold underflow");
@@ -104,11 +167,22 @@ impl Drop for PeerHold {
 }
 
 impl PeerAuthority {
-    fn new(admission: Arc<AtomicBool>) -> Arc<Self> {
-        Arc::new(Self(Mutex::new(Vec::with_capacity(PEERS)), admission))
+    pub(crate) fn new(admission: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            slots: Mutex::new(Vec::with_capacity(PEERS)),
+            admission,
+            revision: 0.into(),
+        })
     }
 
-    fn retain(
+    // All writers hold the slots mutex. Saturation permanently disables optimistic reuse.
+    fn invalidate(&self) {
+        let revision = self.revision.load(Ordering::Relaxed);
+        self.revision
+            .store(revision.saturating_add(1), Ordering::Release);
+    }
+
+    pub(crate) fn retain(
         self: &Arc<Self>,
         scope: ScopeId,
         source: honk_netstack::ValidatedSource,
@@ -128,30 +202,13 @@ impl PeerAuthority {
                 flags & (wire::tcp::SYN | wire::tcp::ACK | wire::tcp::RST | wire::tcp::FIN)
                     == wire::tcp::SYN
             });
-        let mut peers = self.0.lock();
+        let mut peers = self.slots.lock();
         let slot = if let Some(slot) = peers
             .iter()
             .position(|peer| peer.scope == scope && peer.address == address)
         {
-            let peer = &mut peers[slot];
-            if !peer.path.same_identity(path) || peer.conflict.is_some() {
-                if rst || !opens || peer.holds != 0 {
-                    return None;
-                }
-                if !peer
-                    .conflict
-                    .is_some_and(|at| now.saturating_duration_since(at) >= PEER_CONFLICT_HOLD)
-                {
-                    peer.conflict = Some(now);
-                    return None;
-                }
-                peer.conflict = None;
-            }
-            if !pending && !rst {
-                peer.path = path;
-            }
-            if !rst {
-                peer.last_seen = peer.last_seen.max(now);
+            if !peers[slot].observe(self, path, now, opens, rst, pending) {
+                return None;
             }
             slot
         } else {
@@ -193,10 +250,11 @@ impl PeerAuthority {
             } else {
                 peers[slot] = peer;
             }
+            self.invalidate();
             slot
         };
         let peer = &mut peers[slot];
-        peer.holds = peer.holds.checked_add(1)?;
+        peer.pin(self)?;
         Some(PeerHold {
             authority: Arc::clone(self),
             slot,
@@ -206,13 +264,68 @@ impl PeerAuthority {
         })
     }
 
+    /// A live realm hold pins this exact generation. Other workers can still change its path.
+    pub(crate) fn confirm_tcp<'a>(
+        &'a self,
+        held: &PeerHold,
+        scope: ScopeId,
+        source: honk_netstack::ValidatedSource,
+        path: ReturnPath,
+        now: Instant,
+        checked: &mut Option<PeerObservation<'a>>,
+    ) -> bool {
+        if !std::ptr::eq(self, held.authority.as_ref())
+            || !held.learned()
+            || held.address != source.src.ip()
+            || held.path != path
+            || source.protocol != wire::PROTO_TCP
+            || !source.tcp_flags.is_some_and(|flags| {
+                flags & (wire::tcp::SYN | wire::tcp::FIN | wire::tcp::RST | wire::tcp::ACK)
+                    == wire::tcp::ACK
+            })
+        {
+            return false;
+        }
+        if checked.as_ref().is_some_and(|previous| {
+            std::ptr::eq(previous.authority, self)
+                && previous.scope == scope
+                && previous.slot == held.slot
+                && previous.generation == held.generation
+                && previous.path == path
+                && previous.ingress_at == now
+                && previous.revision != u64::MAX
+                && previous.revision == self.revision.load(Ordering::Acquire)
+        }) {
+            return true;
+        }
+        let mut peers = self.slots.lock();
+        let peer = &mut peers[held.slot];
+        if peer.scope != scope
+            || peer.generation != held.generation
+            || !peer.observe(self, path, now, false, false, false)
+            || peer.holds == usize::MAX
+        {
+            return false;
+        }
+        *checked = Some(PeerObservation {
+            authority: self,
+            scope,
+            slot: held.slot,
+            generation: held.generation,
+            path,
+            ingress_at: now,
+            revision: self.revision.load(Ordering::Relaxed),
+        });
+        true
+    }
+
     fn pin_fragment(
         self: &Arc<Self>,
         scope: ScopeId,
         address: IpAddr,
         path: ReturnPath,
     ) -> io::Result<Option<PeerHold>> {
-        let mut peers = self.0.lock();
+        let mut peers = self.slots.lock();
         let Some(slot) = peers
             .iter()
             .position(|peer| peer.scope == scope && peer.address == address)
@@ -223,9 +336,7 @@ impl PeerAuthority {
         if !peer.path.same_identity(path) || peer.conflict.is_some() {
             return Err(io::Error::from(io::ErrorKind::WouldBlock));
         }
-        peer.holds = peer
-            .holds
-            .checked_add(1)
+        peer.pin(self)
             .ok_or_else(|| io::Error::other("peer hold exhausted"))?;
         Ok(Some(PeerHold {
             authority: Arc::clone(self),
@@ -299,6 +410,7 @@ impl CellPool {
                             * (THREAD_STACK + 256 * 1024 + size_of::<WorkerRuntime>())
                         + ports * 4096
                         + size_of::<Shared>()
+                        + size_of::<PeerAuthority>()
                         + PEERS * size_of::<PeerSlot>()
                         + 64 * size_of::<Placement>()
                         + 65536,
@@ -573,6 +685,29 @@ impl Envelope {
     }
 }
 
+/// Port drops this closure before replenishing FILL or kicking the socket, even on partial RX.
+/// Only the scope lock lives across callbacks. Each packet borrow ends inside its callback.
+pub(super) fn receive_batch<'a>(
+    port: &mut Port<Retained>,
+    limit: usize,
+    metadata_len: usize,
+    mut packet: impl FnMut(
+        &mut Option<RealmRxBatch<'a>>,
+        &[&[u8]],
+        &[u8],
+        &mut honk_xsk::TxSink<'_, Retained>,
+    ),
+) -> io::Result<usize> {
+    let mut batch = None;
+    port.receive_segments_with(
+        limit.min(BATCH),
+        metadata_len,
+        move |segments, metadata, sink| {
+            packet(&mut batch, segments, metadata, sink);
+        },
+    )
+}
+
 impl Shared {
     pub(super) fn placement(&self, scope: ScopeId) -> io::Result<Placement> {
         self.placements
@@ -583,14 +718,18 @@ impl Shared {
             .ok_or_else(|| io::Error::other("unregistered physical realm"))
     }
 
-    pub(super) fn owner(&self, scope: ScopeId, packet: &[u8]) -> io::Result<PacketScope> {
-        let placement = self.placement(scope)?;
-        let worker = selected_worker(&placement.realm, PacketView::from_slice(packet));
-        Ok(placement
-            .realm
-            .owner(worker)
-            .expect("fixed realm worker")
-            .clone())
+    pub(super) fn established<'a>(
+        &'a self,
+        batch: &mut Option<RealmRxBatch<'a>>,
+        owner: &'a PacketScope,
+        packet: &[u8],
+        times: (Instant, Instant),
+        path: ReturnPath,
+        endpoints: &PacketEndpoints,
+    ) -> Option<PacketReceive> {
+        RealmRxBatch::receive(batch, owner, packet, times, path, &self.peers, || {
+            endpoints.can_batch_tcp()
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -647,11 +786,13 @@ impl Shared {
         admission: Option<EndpointAdmission>,
         cell: Option<Cell>,
     ) -> io::Result<PacketReceive> {
-        let placement = self.placement(scope)?;
+        let realm = endpoints
+            .realm(scope)
+            .ok_or_else(|| io::Error::other("unregistered physical realm"))?;
         if matches!(wire::parse_ip(packet), Err(wire::ParseError::Fragment)) {
             let peer = self.fragment_peer(scope, packet, path)?;
             let (packet, peer) = match endpoints.reassemble_for_dispatch_on(
-                placement.realm.owner(0).unwrap(),
+                realm.owner(0).expect("owner zero"),
                 packet,
                 ingress_at,
                 Instant::now(),
@@ -662,11 +803,12 @@ impl Shared {
             };
             let path = peer.as_ref().map(PeerHold::original_path).unwrap_or(path);
             let ingress_at = packet.completion_ingress();
-            let owner = self.owner(scope, packet.as_ref())?;
+            let owner =
+                &realm.owners()[realm.worker_for_packet(PacketView::from_slice(packet.as_ref()))];
             if owner.worker() == worker {
                 return self.receive(
                     endpoints,
-                    &owner,
+                    owner,
                     packet.as_ref(),
                     ingress_at,
                     Instant::now(),
@@ -678,7 +820,7 @@ impl Shared {
                 .or_else(|| self.pool.take())
                 .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
             let envelope = Envelope {
-                ingress: placement.ingress,
+                ingress: self.placement(scope)?.ingress,
                 scope,
                 path,
                 ingress_at,
@@ -696,11 +838,11 @@ impl Shared {
                 .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
             return Ok(PacketReceive::default());
         }
-        let owner = self.owner(scope, packet)?;
+        let owner = &realm.owners()[realm.worker_for_packet(PacketView::from_slice(packet))];
         if owner.worker() == worker {
             return self.receive(
                 endpoints,
-                &owner,
+                owner,
                 packet,
                 ingress_at,
                 Instant::now(),
@@ -717,7 +859,7 @@ impl Shared {
         };
         cell.copy(&[packet], &[])?;
         let envelope = Envelope {
-            ingress: placement.ingress,
+            ingress: self.placement(scope)?.ingress,
             scope,
             path,
             ingress_at,
@@ -969,11 +1111,11 @@ impl Shared {
         cell: Option<Cell>,
         peer: Option<PeerHold>,
     ) -> io::Result<PacketReceive> {
-        let owner = self.owner(scope, packet.as_ref())?;
+        let owner = endpoints.execution_owner(scope, PacketView::from_slice(packet.as_ref()))?;
         if owner.worker() == 0 {
             return self.receive(
                 endpoints,
-                &owner,
+                owner,
                 packet.as_ref(),
                 ingress_at,
                 Instant::now(),
@@ -995,7 +1137,10 @@ impl Shared {
             peer,
             l3_offset: 0,
             l3_length: 0,
-            payload: Payload::Endpoint { owner, admission },
+            payload: Payload::Endpoint {
+                owner: owner.clone(),
+                admission,
+            },
         };
         self.send(1, envelope)
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
@@ -1030,11 +1175,12 @@ impl Shared {
             envelope.ingress_at = packet.completion_ingress();
             envelope.body = Some(PacketBody::Reassembled(packet));
         }
-        let owner = self.owner(envelope.scope, envelope.ip())?;
+        let owner =
+            endpoints.execution_owner(envelope.scope, PacketView::from_slice(envelope.ip()))?;
         if owner.worker() == 0 {
             return self.receive(
                 endpoints,
-                &owner,
+                owner,
                 envelope.ip(),
                 envelope.ingress_at,
                 Instant::now(),
@@ -1043,7 +1189,7 @@ impl Shared {
             );
         }
         envelope.payload = Payload::Endpoint {
-            owner,
+            owner: owner.clone(),
             admission: None,
         };
         self.send(1, envelope)
@@ -1294,6 +1440,6 @@ impl Shared {
 
 impl Shared {
     pub(super) fn peer_count(&self) -> usize {
-        self.peers.0.lock().len()
+        self.peers.slots.lock().len()
     }
 }

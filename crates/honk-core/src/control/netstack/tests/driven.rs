@@ -12,6 +12,112 @@ fn exported(
     }
 }
 
+struct DeviceWakes(AtomicUsize);
+
+impl std::task::Wake for DeviceWakes {
+    fn wake(self: Arc<Self>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[tokio::test]
+async fn generated_turn_rescans_work_arriving_after_its_last_pull() {
+    let now = Instant::now();
+    let (scope, owner, _) = runtime(now);
+    let mut driver = owner.hand_off();
+    let wakes = Arc::new(DeviceWakes(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    let mut frame = [0; 1280];
+    let client = "10.0.0.2:40000".parse().unwrap();
+    driver.finish_turn(&mut cx, now);
+    driver.begin_turn(now);
+    assert!(exported(&mut driver, &mut cx, TxClass::Control).is_none());
+    scope.receive(&segment(client, 1, 700, tcp::ACK, &[]), now);
+    drop(materialized(&mut driver, now, TxClass::Control, &mut frame));
+    for class in [TxClass::Control, TxClass::Bulk] {
+        assert!(
+            driver
+                .materialize_into(now, class, &mut frame)
+                .unwrap()
+                .is_none()
+        );
+    }
+    driver.finish_turn(&mut cx, now);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+
+    driver.begin_turn(now);
+    assert!(exported(&mut driver, &mut cx, TxClass::Bulk).is_none());
+    assert!(
+        driver
+            .materialize_into(now, TxClass::Bulk, &mut frame)
+            .unwrap()
+            .is_none()
+    );
+    scope
+        .datagram_sender("203.0.113.9:53".parse().unwrap())
+        .send_to(b"late", client)
+        .await
+        .unwrap();
+    assert!(
+        driver
+            .materialize_into(now, TxClass::Control, &mut frame)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    driver.finish_turn(&mut cx, now);
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    let output = exported(&mut driver, &mut cx, TxClass::Bulk).unwrap();
+    assert!(output.packet().ends_with(b"late"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn interrupted_generated_turn_rearms_before_close() {
+    let now = Instant::now();
+    let (scope, owner, _) = runtime(now);
+    let mut driver = owner.hand_off();
+    let wakes = Arc::new(DeviceWakes(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    driver.begin_turn(now);
+    assert!(
+        driver
+            .materialize_into(now, TxClass::Bulk, &mut [])
+            .is_err()
+    );
+    driver.interrupt_turn(&cx);
+    let resumed = wakes.0.load(Ordering::SeqCst);
+    assert!(resumed > 0);
+    scope.shutdown(false);
+    assert!(wakes.0.load(Ordering::SeqCst) > resumed);
+    driver.service_closing(&mut cx, now);
+    assert!(owner.reclaim().await);
+}
+
+#[test]
+fn unwinding_owner_aborts_an_unfinished_generated_turn() {
+    let now = Instant::now();
+    let (_scope, owner, _) = runtime(now);
+    let mut driver = owner.hand_off();
+    let wakes = Arc::new(DeviceWakes(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&wakes));
+    let mut cx = Context::from_waker(&waker);
+    driver.finish_turn(&mut cx, now);
+    driver.begin_turn(now);
+    let panic = catch_unwind(AssertUnwindSafe(move || {
+        let _owner = owner;
+        panic!("interrupted device owner");
+    }))
+    .unwrap_err();
+    assert_eq!(
+        panic.downcast_ref::<&str>(),
+        Some(&"interrupted device owner")
+    );
+    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn tun_turn_preserves_expiry_after_the_last_output_pass() {

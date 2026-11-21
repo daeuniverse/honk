@@ -481,10 +481,17 @@ async fn class_batch_exports_bounded_wrapped_bulk_without_consuming_control() {
 
 #[test]
 fn shutdown_waits_for_handshake_connected_readiness_before_emitting_fin() {
-    struct Wakes(AtomicUsize);
+    struct Wakes {
+        scope: PacketScope,
+        count: AtomicUsize,
+    }
     impl std::task::Wake for Wakes {
         fn wake(self: Arc<Self>) {
-            self.0.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                self.scope.0.inner.try_lock().is_some(),
+                "stream wake under scope lock"
+            );
+            self.count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -503,7 +510,10 @@ fn shutdown_waits_for_handshake_connected_readiness_before_emitting_fin() {
     let server_seq = header.seq.wrapping_add(1);
     synack.release();
 
-    let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+    let wakes = Arc::new(Wakes {
+        scope: scope.clone(),
+        count: AtomicUsize::new(0),
+    });
     let waker = Waker::from(Arc::clone(&wakes));
     let mut cx = Context::from_waker(&waker);
     assert!(
@@ -511,14 +521,14 @@ fn shutdown_waits_for_handshake_connected_readiness_before_emitting_fin() {
             .poll_shutdown(&mut cx)
             .is_pending()
     );
-    assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
+    assert_eq!(wakes.count.load(Ordering::SeqCst), 0);
     scope.drive(now);
     assert!(scope.poll_output(&mut context()).is_pending());
     assert_eq!(
         scope.receive(&segment(client, 101, server_seq, tcp::ACK, &[]), now),
         Rx::Consumed
     );
-    assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+    assert_eq!(wakes.count.load(Ordering::SeqCst), 1);
     assert!(matches!(
         std::pin::Pin::new(&mut io).poll_shutdown(&mut cx),
         Poll::Ready(Ok(()))
@@ -649,6 +659,119 @@ fn abort_drains_closed_flows_during_reentrant_callback() {
     assert_eq!(retired.load(Ordering::SeqCst), 0);
     scope.shutdown(true);
     assert_eq!(retired.load(Ordering::SeqCst), 2);
+    assert!(scope.is_protocol_quiescent());
+}
+
+#[test]
+fn abort_wakes_both_directions_of_every_flow_after_a_stream_waker_panics() {
+    use std::sync::atomic::AtomicBool;
+
+    struct Sleeper {
+        notified: AtomicUsize,
+        scope: PacketScope,
+        first: Arc<AtomicBool>,
+    }
+    impl std::task::Wake for Sleeper {
+        fn wake(self: Arc<Self>) {
+            assert!(
+                self.scope.0.inner.try_lock().is_some(),
+                "terminal wake under scope lock"
+            );
+            self.notified.fetch_add(1, Ordering::SeqCst);
+            if !self.first.swap(true, Ordering::SeqCst) {
+                panic!("first terminal wake");
+            }
+        }
+    }
+
+    const FLOWS: usize = 33;
+    let now = Instant::now();
+    let mut cfg = config();
+    cfg.max_flows = FLOWS as u32;
+    let (scope, _owner) = PacketScope::new(
+        cfg,
+        MemoryBudget::new(32 << 20),
+        RuntimeLimits {
+            max_slots: FLOWS,
+            ..limits()
+        },
+        now,
+    )
+    .unwrap();
+    let first = Arc::new(AtomicBool::new(false));
+    let sleeper = |first| {
+        Arc::new(Sleeper {
+            notified: AtomicUsize::new(0),
+            scope: scope.clone(),
+            first,
+        })
+    };
+    let sleepers: Vec<_> = (0..2 * FLOWS)
+        .map(|_| sleeper(Arc::clone(&first)))
+        .collect();
+    let mut flows = Vec::new();
+    for (index, pair) in sleepers.as_chunks::<2>().0.iter().enumerate() {
+        let client = SocketAddr::from(([10, 0, 0, 2], 40000 + index as u16));
+        assert_eq!(
+            scope.receive(&segment(client, 100, 0, tcp::SYN, &[]), now),
+            Rx::Consumed
+        );
+        let (_, mut io) = scope.poll_accept().unwrap();
+        let mut byte = [0];
+        let mut buf = tokio::io::ReadBuf::new(&mut byte);
+        let reader = Waker::from(Arc::clone(&pair[0]));
+        let writer = Waker::from(Arc::clone(&pair[1]));
+        let mut io_pin = std::pin::Pin::new(&mut io);
+        assert!(
+            io_pin
+                .as_mut()
+                .poll_read(&mut Context::from_waker(&reader), &mut buf)
+                .is_pending()
+        );
+        assert!(
+            io_pin
+                .poll_shutdown(&mut Context::from_waker(&writer))
+                .is_pending()
+        );
+        flows.push(io);
+    }
+    let waiter = sleeper(Arc::new(AtomicBool::new(false)));
+    let output = sleeper(Arc::new(AtomicBool::new(false)));
+    let mut retirement = flows[0].retirement();
+    {
+        let mut waiting = pin!(retirement.wait());
+        let waker = Waker::from(Arc::clone(&waiter));
+        assert!(
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let waker = Waker::from(Arc::clone(&output));
+        assert!(
+            scope
+                .poll_output(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let panic = catch_unwind(AssertUnwindSafe(|| scope.shutdown(true))).unwrap_err();
+        assert_eq!(panic.downcast_ref::<&str>(), Some(&"first terminal wake"));
+        assert!(
+            sleepers
+                .iter()
+                .all(|sleeper| sleeper.notified.load(Ordering::SeqCst) == 1)
+        );
+        assert_eq!(waiter.notified.load(Ordering::SeqCst), 1);
+        assert_eq!(output.notified.load(Ordering::SeqCst), 1);
+        scope.shutdown(true);
+        assert_eq!(waiter.notified.load(Ordering::SeqCst), 2);
+        assert_eq!(output.notified.load(Ordering::SeqCst), 1);
+        assert!(
+            sleepers
+                .iter()
+                .all(|sleeper| sleeper.notified.load(Ordering::SeqCst) == 1)
+        );
+    }
+    drop(flows);
     assert!(scope.is_protocol_quiescent());
 }
 

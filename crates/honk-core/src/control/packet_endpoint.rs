@@ -921,8 +921,9 @@ impl PacketEndpoints {
                 (scope.receive(packet, now), PacketReceive::default(), None)
             })
         };
-        let tcp = honk_netstack::wire::parse_ip(packet)
-            .is_ok_and(|ip| ip.proto == honk_netstack::wire::PROTO_TCP);
+        let tcp = admission.is_some()
+            && honk_netstack::wire::parse_ip(packet)
+                .is_ok_and(|ip| ip.proto == honk_netstack::wire::PROTO_TCP);
         let (rx, received, completion) = if tcp {
             EndpointAdmission::commit_pending(&mut admission, scope.scope(), receive)??
         } else {

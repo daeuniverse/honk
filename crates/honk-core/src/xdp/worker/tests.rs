@@ -134,7 +134,7 @@ async fn physical_peer_slots_reap_across_a_hole_and_relearn() {
     }
     assert_eq!(old_reply.peer_hold().unwrap().original_path(), path());
     let high_holds = peers
-        .0
+        .slots
         .lock()
         .iter()
         .find(|peer| peer.address == high.ip())
@@ -388,7 +388,59 @@ fn peer_holds_keep_original_qos_and_prevent_identity_replacement() {
         )
         .unwrap();
     assert!(!rst.learned());
-    assert_eq!(peers.0.lock().len(), 1);
+    assert_eq!(peers.slots.lock().len(), 1);
+}
+
+#[test]
+fn checked_peer_reuses_one_timestamp_until_another_worker_moves_the_path() {
+    let peers = PeerAuthority::new(Arc::new(AtomicBool::new(true)));
+    let scope = ScopeId::allocate().unwrap();
+    let now = Instant::now();
+    let ack = source(4000, Some(tcp::ACK));
+    let original = peers
+        .retain(scope, source(4000, Some(tcp::SYN)), path(), now, false)
+        .unwrap();
+    let mut checked = None;
+    assert!(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked));
+
+    // A validated steady ACK completes even while another thread owns the authority mutex.
+    let (sent, received) = sync_channel::channel();
+    std::thread::scope(|threads| {
+        let guard = peers.slots.lock();
+        threads.spawn(|| {
+            sent.send(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked))
+                .unwrap()
+        });
+        let result = received.recv_timeout(Duration::from_secs(3));
+        drop(guard);
+        assert_eq!(result, Ok(true));
+    });
+    let later = now + Duration::from_millis(1);
+    let mut moved = path();
+    moved.device = 1;
+    moved.vlan_tci[0] |= 5 << 13;
+    for saturated in [false, true] {
+        if saturated {
+            let _slots = peers.slots.lock();
+            peers.revision.store(u64::MAX, Ordering::Release);
+        }
+        // The second move exercises a proof that was itself issued at saturation.
+        for _ in 0..2 {
+            std::thread::scope(|threads| {
+                threads
+                    .spawn(|| drop(peers.retain(scope, ack, moved, later, false).unwrap()))
+                    .join()
+                    .unwrap();
+            });
+            assert_eq!(peers.slots.lock()[original.slot].path, moved);
+            assert!(!peers.confirm_tcp(&original, scope, ack, moved, now, &mut checked));
+            assert!(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked));
+            let slots = peers.slots.lock();
+            assert_eq!(slots[original.slot].path, path());
+            assert_eq!(slots[original.slot].last_seen, later);
+            assert_eq!(slots[original.slot].holds, 1);
+        }
+    }
 }
 
 fn syn(client: SocketAddr, destination: SocketAddr) -> Vec<u8> {
@@ -546,7 +598,7 @@ fn peer_unwind_closes_common_admission_before_refunding_identity() {
     }));
     assert!(result.is_err());
     assert!(!admission.load(Ordering::Acquire));
-    assert_eq!(peers.0.lock()[0].holds, 0);
+    assert_eq!(peers.slots.lock()[0].holds, 0);
 }
 
 #[tokio::test]

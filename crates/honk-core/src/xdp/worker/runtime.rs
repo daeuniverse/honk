@@ -251,14 +251,15 @@ impl WorkerRuntime {
                     let qualified = &mut self.qualified_rx;
                     let unavailable = &mut self.qualification_unavailable;
                     let mut failure = None;
-                    let received = port.receive_segments_with(
+                    let received = receive_batch(
+                        port,
                         BATCH,
                         if device.capture.vlan_metadata {
                             METADATA_LEN
                         } else {
                             0
                         },
-                        |segments, metadata, _| {
+                        |batch, segments, metadata, _| {
                             let result = (|| -> io::Result<()> {
                                 let decoded =
                                     device
@@ -286,6 +287,7 @@ impl WorkerRuntime {
                                     })
                                     .cloned();
                                 let Some(placement) = placement else {
+                                    batch.take();
                                     return Ok(());
                                 };
                                 let path = ReturnPath {
@@ -312,6 +314,7 @@ impl WorkerRuntime {
                                     let bytes = if count == 1 {
                                         l3[0]
                                     } else {
+                                        batch.take();
                                         view.copy_to(
                                             0..decoded.l3_len,
                                             &mut staging[..decoded.l3_len],
@@ -321,19 +324,36 @@ impl WorkerRuntime {
                                         )?;
                                         &staging[..decoded.l3_len]
                                     };
-                                    let report = shared.receive(
-                                        endpoints,
-                                        placement.realm.owner(1).unwrap(),
-                                        bytes,
-                                        now,
-                                        now,
-                                        path,
-                                        None,
-                                    )?;
+                                    let owner = endpoints
+                                        .realm(placement.realm.scope())
+                                        .and_then(|realm| realm.owner(1))
+                                        .ok_or_else(|| {
+                                            io::Error::other("unregistered physical worker")
+                                        })?;
+                                    if !mixed
+                                        && count == 1
+                                        && let Some(report) = shared.established(
+                                            batch,
+                                            owner,
+                                            bytes,
+                                            (now, now),
+                                            path,
+                                            endpoints,
+                                        )
+                                    {
+                                        if report.qualified_rx {
+                                            qualify_packet(qualified, unavailable);
+                                        }
+                                        return Ok(());
+                                    }
+                                    batch.take();
+                                    let report = shared
+                                        .receive(endpoints, owner, bytes, now, now, path, None)?;
                                     if report.qualified_rx {
                                         qualify_packet(qualified, unavailable);
                                     }
                                 } else {
+                                    batch.take();
                                     let cell = shared.copy(segments, metadata)?;
                                     let ip = &cell.packet()
                                         [decoded.l3_offset..decoded.l3_offset + decoded.l3_len];
@@ -361,6 +381,9 @@ impl WorkerRuntime {
                                 }
                                 Ok(())
                             })();
+                            if result.is_err() {
+                                batch.take();
+                            }
                             if let Err(error) = result
                                 && !matches!(
                                     error.kind(),

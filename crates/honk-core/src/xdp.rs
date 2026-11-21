@@ -1006,6 +1006,23 @@ impl Runtime {
         shutdown: &crate::control::ShutdownIntent,
         reading: bool,
     ) -> Poll<anyhow::Result<()>> {
+        let result = self.poll_io_turn(cx, interval, shutdown, reading);
+        if matches!(result, Poll::Ready(Err(_))) {
+            // All generated realms began before RX; an early device error can skip their TX pass.
+            for realm in &mut self.realms {
+                realm.driver.interrupt_turn(cx);
+            }
+        }
+        result
+    }
+
+    fn poll_io_turn(
+        &mut self,
+        cx: &mut Context<'_>,
+        interval: Option<&BusyInterval>,
+        shutdown: &crate::control::ShutdownIntent,
+        reading: bool,
+    ) -> Poll<anyhow::Result<()>> {
         if polling_segment_stop(&self.polling, interval, shutdown, None).is_some() {
             self.round_cut_short = true;
             return Poll::Pending;
@@ -1141,26 +1158,27 @@ impl Runtime {
                     let mut failure = None;
                     let ifindex = device.info.ifindex;
                     let metadata_len = if capture.vlan_metadata { METADATA_LEN } else { 0 };
-                    let batch = if queue.id == 0 { queue_zero_batch } else { BATCH };
-                    let received = port.receive_segments_with(batch, metadata_len, |segments, metadata, same_port| {
+                    let limit = if queue.id == 0 { queue_zero_batch } else { BATCH };
+                    let received = worker::receive_batch(port, limit, metadata_len, |batch, segments, metadata, same_port| {
                         if failure.is_some() { return; }
                         let capture_metadata = if capture.vlan_metadata {
                             &metadata[..METADATA_LEN.min(metadata.len())]
                         } else { &[] };
                         let Ok(decoded) = capture.decode(segments, capture_metadata, queue.id) else {
                             pressure.capture_rejected = pressure.capture_rejected.saturating_add(1);
+                            batch.take();
                             return;
                         };
-                        if decoded.destination_mac[0] & 1 != 0 { return; }
+                        if decoded.destination_mac[0] & 1 != 0 { batch.take(); return; }
                         let Some(realm) = realms.iter().find(|realm| realm.members.contains(&device_index) && realm.link.path.vlan_count == decoded.vlan_count
-                            && realm.link.path.vlan_proto == decoded.vlan_proto && realm.link.path.vlan_tci.iter().zip(decoded.vlan_tci).all(|(configured, captured)| configured & 0x0fff == captured & 0x0fff)) else { return; };
-                        if decoded.destination_mac != realm.link.mac { return; }
+                            && realm.link.path.vlan_proto == decoded.vlan_proto && realm.link.path.vlan_tci.iter().zip(decoded.vlan_tci).all(|(configured, captured)| configured & 0x0fff == captured & 0x0fff)) else { batch.take(); return; };
+                        if decoded.destination_mac != realm.link.mac { batch.take(); return; }
                         let scope = realm.driver.scope();
                         let ingress = realm.ingress;
                         let path = ReturnPath { realm: realm.realm_id, device: device_index, mac: decoded.source_mac, vlan_tci: decoded.vlan_tci, vlan_proto: decoded.vlan_proto, vlan_count: decoded.vlan_count };
                         let mut l3 = [&[][..]; 18];
-                        let Some(count) = l3_segments(segments, decoded, &mut l3) else { return; };
-                        let Ok(view) = PacketView::new(&l3[..count]) else { return; };
+                        let Some(count) = l3_segments(segments, decoded, &mut l3) else { batch.take(); return; };
+                        let Ok(view) = PacketView::new(&l3[..count]) else { batch.take(); return; };
                         if let Some(core) = core && !retained_endpoint(endpoints, scope, view) {
                             let mac = mac_text(decoded.source_mac);
                             let cached = if queue.id != 0 { Ok(CachedDecision::Cold) } else { core.forward_cached(ingress, view, Some(std::str::from_utf8(&mac).unwrap()), now, |route, output| {
@@ -1231,29 +1249,46 @@ impl Runtime {
                             }
                         }
                         let bytes = if count == 1 { l3[0] } else {
+                            batch.take();
                             if decoded.l3_len > staging.len() { return; }
                             if view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return; }
                             &staging[..decoded.l3_len]
                         };
-                        let result = (|| { if workers.owner(scope, bytes)?.worker() == 0 {
-                            workers.endpoint(0, endpoints, scope, bytes, now, path, None, None)
-                        } else {
-                            workers.copy(segments, metadata).and_then(|cell| {
-                                let owner = workers.owner(scope, bytes)?;
-                                workers.send(1, worker::Envelope {
-                                    ingress, scope, path, ingress_at: now, cell,
-                                    body: None, peer: None,
-                                    l3_offset: decoded.l3_offset, l3_length: decoded.l3_len,
-                                    payload: worker::Payload::Endpoint { owner, admission: None } })
-                                    .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-                                Ok(PacketReceive::default())
-                            })
-                        } })();
+                        let result = (|| {
+                            let owner = match realm.driver.sole_owner() {
+                                Some(owner) => owner,
+                                None => endpoints.execution_owner(scope, PacketView::from_slice(bytes))?,
+                            };
+                            if owner.worker() == 0 {
+                                if matches!(wire::parse_ip(bytes), Err(wire::ParseError::Fragment)) {
+                                    batch.take();
+                                    return workers.endpoint(0, endpoints, scope, bytes, now, path, None, None);
+                                }
+                                // Keep the scalar pre-lock timestamp even when batch admission falls back.
+                                let service_at = Instant::now();
+                                if core.is_none() && count == 1
+                                    && let Some(report) = workers.established(batch, owner, bytes, (now, service_at), path, endpoints)
+                                {
+                                    return Ok(report);
+                                }
+                                batch.take();
+                                return workers.receive(endpoints, owner, bytes, now, service_at, path, None);
+                            }
+                            batch.take();
+                            let cell = workers.copy(segments, metadata)?;
+                            workers.send(1, worker::Envelope {
+                                ingress, scope, path, ingress_at: now, cell,
+                                body: None, peer: None,
+                                l3_offset: decoded.l3_offset, l3_length: decoded.l3_len,
+                                payload: worker::Payload::Endpoint { owner: owner.clone(), admission: None },
+                            }).map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+                            Ok(PacketReceive::default())
+                        })();
                         match result {
                             Ok(report) if report.qualified_rx => qualify_packet(qualified_rx, qualification_unavailable),
                             Ok(_) => {}
                             Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::OutOfMemory) => {}
-                            Err(error) => failure = Some(error.into()),
+                            Err(error) => { batch.take(); failure = Some(error.into()); }
                         }
                     });
                     if let Some(error) = failure {

@@ -1,6 +1,59 @@
 use super::*;
 
 #[tokio::test]
+async fn physical_syn_admission_reclaims_completed_udp_task_credit() {
+    use crate::control::netstack::{CAPTURE_MEMORY, capture_realm};
+    use crate::xdp::{ReturnPath, worker::PeerAuthority};
+
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, mut owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let (plane, _health) = local_plane().await;
+    let (endpoints, supervisor) =
+        PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 1)
+            .await
+            .unwrap();
+    let (done, completed) = tokio::sync::oneshot::channel();
+    let payload = [7u8; 65_536];
+    assert!(endpoints.shared.udp_pool.spawn_slow_path(async move {
+        std::hint::black_box(payload);
+        done.send(()).unwrap();
+    }));
+    completed.await.unwrap();
+    assert!(!endpoints.can_batch_tcp());
+    let ceiling = budget.reserve(budget.limit() - budget.used()).unwrap();
+    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let path = ReturnPath {
+        realm: 1,
+        device: 0,
+        mac: [2; 6],
+        vlan_tci: [0; 2],
+        vlan_proto: [0; 2],
+        vlan_count: 0,
+    };
+    let mut packet = [0; 128];
+    let n = syn_packet("203.0.113.9:443".parse().unwrap(), &mut packet);
+    let now = Instant::now();
+    let report = endpoints
+        .receive_on_timed(
+            scope,
+            &packet[..n],
+            now,
+            now,
+            None,
+            false,
+            |source, pending| peers.retain(scope.scope(), source, path, now, pending),
+        )
+        .unwrap();
+    assert!(report.taken_over && !report.qualified_rx);
+    assert_eq!(scope.stats().unwrap().flows, 1);
+    assert!(endpoints.can_batch_tcp());
+    drop(ceiling);
+    endpoints.shutdown().await.unwrap();
+    supervisor.run().await.unwrap();
+}
+
+#[tokio::test]
 async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);

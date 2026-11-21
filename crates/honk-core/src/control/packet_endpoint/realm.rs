@@ -55,6 +55,11 @@ impl PacketEndpoints {
     }
 
     #[cfg(target_os = "linux")]
+    pub(crate) fn can_batch_tcp(&self) -> bool {
+        !self.is_closing() && !self.shared.udp_pool.has_completed_tasks()
+    }
+
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn receive_on_timed(
         &self,
@@ -84,12 +89,13 @@ impl PacketEndpoints {
                 on_source,
             )
         };
-        let (rx, received, physical) =
-            if wire::parse_ip(packet).is_ok_and(|ip| ip.proto == wire::PROTO_TCP) {
-                EndpointAdmission::commit_pending(&mut admission, owner.scope(), receive)?
-            } else {
-                receive(&mut admission)
-            }?;
+        let (rx, received, physical) = if admission.is_some()
+            && wire::parse_ip(packet).is_ok_and(|ip| ip.proto == wire::PROTO_TCP)
+        {
+            EndpointAdmission::commit_pending(&mut admission, owner.scope(), receive)?
+        } else {
+            receive(&mut admission)
+        }?;
         owner.after_receive();
         match self.dispatch_received::<true>(
             owner,

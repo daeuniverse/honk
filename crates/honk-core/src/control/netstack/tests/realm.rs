@@ -18,6 +18,189 @@ fn udp_clients(realm: &PacketRealm) -> [SocketAddr; 2] {
 }
 
 #[tokio::test]
+async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
+    use crate::xdp::{ReturnPath, worker::PeerAuthority};
+
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap();
+    let now = Instant::now();
+    let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let client = client_for(&realm, 0);
+    let path = ReturnPath {
+        realm: 1,
+        device: 0,
+        mac: [2; 6],
+        vlan_tci: [7, 0],
+        vlan_proto: [0x8100, 0],
+        vlan_count: 1,
+    };
+    let syn = segment(client, 100, 0, tcp::SYN, &[]);
+    scope
+        .receive_realm_timed(&syn, now, now, &mut None, false, |source, _| {
+            peers.retain(scope.scope(), source, path, now, false)
+        })
+        .unwrap();
+    scope.after_receive();
+    let (_, flow) = scope.poll_accept().unwrap();
+    scope.drive(now);
+    let reply = output(scope);
+    let server = decode(&reply).0.seq.wrapping_add(1);
+    reply.release();
+    let ack = segment(client, 101, server, tcp::ACK, &[]);
+    let slow = |packet: &[u8], ingress_at, service_at| {
+        let (_, report, _) = scope
+            .receive_realm_timed(
+                packet,
+                ingress_at,
+                service_at,
+                &mut None,
+                false,
+                |source, pending| peers.retain(scope.scope(), source, path, ingress_at, pending),
+            )
+            .unwrap();
+        scope.after_receive();
+        report.qualified_rx
+    };
+    assert!(!slow(&ack, now, now));
+    flow.mark_rx_admitted();
+    // Clear retired handshake timers before arming the independent SYN-ACK deadline below.
+    let now = now + honk_netstack::MAX_DEFERRED;
+    scope.drive(now);
+    while let Poll::Ready(Some(reply)) = scope.poll_output(&mut context()) {
+        reply.release();
+    }
+    let before = scope.stats().unwrap().rx_packets;
+    let mut batch = None;
+    let admitted = || {
+        assert!(scope.0.inner.try_lock().is_none());
+        true
+    };
+    let accepted =
+        RealmRxBatch::receive(&mut batch, scope, &ack, (now, now), path, &peers, admitted).unwrap();
+    assert!(accepted.qualified_rx && accepted.taken_over);
+    assert_eq!(accepted.source.unwrap().tcp_flags, Some(tcp::ACK));
+    assert!(scope.0.inner.try_lock().is_none());
+    assert_eq!(
+        RealmRxBatch::receive(&mut batch, scope, &ack, (now, now), path, &peers, admitted),
+        Some(accepted)
+    );
+    let mut corrupt = ack.clone();
+    let offset = wire::parse_ip(&ack).unwrap().payload.start;
+    corrupt[offset + 16] ^= 1;
+    assert_eq!(
+        RealmRxBatch::receive(
+            &mut batch,
+            scope,
+            &corrupt,
+            (now, now),
+            path,
+            &peers,
+            admitted
+        ),
+        Some(Default::default())
+    );
+    let moved = ReturnPath { device: 1, ..path };
+    assert_eq!(
+        RealmRxBatch::receive(&mut batch, scope, &ack, (now, now), moved, &peers, admitted),
+        None
+    );
+    let rst = segment(client, 101, server, tcp::RST, &[]);
+    assert_eq!(
+        RealmRxBatch::receive(&mut batch, scope, &rst, (now, now), path, &peers, admitted),
+        None
+    );
+    drop(batch);
+    assert_eq!(scope.stats().unwrap().rx_packets - before, 3);
+
+    // A second connection arms a real SYN-ACK retransmission on this same Stack.
+    let other = SocketAddr::new(client.ip(), client.port() + 1);
+    assert_eq!(
+        scope.receive(&segment(other, 200, 0, tcp::SYN, &[]), now),
+        Rx::Consumed
+    );
+    let (_, waiting) = scope.poll_accept().unwrap();
+    scope.drive(now);
+    let synack = output(scope);
+    let original = decode(&synack).0;
+    assert_eq!(
+        (original.dst_port, original.flags),
+        (other.port(), tcp::SYN | tcp::ACK)
+    );
+    synack.release();
+    let due = scope
+        .0
+        .inner
+        .lock()
+        .stack
+        .as_ref()
+        .unwrap()
+        .poll_timeout()
+        .unwrap();
+    assert!(due > now);
+    let mut batch = None;
+    let early = due - Duration::from_nanos(1);
+    assert_eq!(
+        RealmRxBatch::receive(
+            &mut batch,
+            scope,
+            &ack,
+            (now, early),
+            path,
+            &peers,
+            admitted
+        ),
+        Some(accepted)
+    );
+    let denied = || {
+        assert!(scope.0.inner.try_lock().is_none());
+        false
+    };
+    assert_eq!(
+        RealmRxBatch::receive(&mut batch, scope, &ack, (now, early), path, &peers, denied),
+        None
+    );
+    drop(batch.take());
+    assert!(slow(&ack, now, early));
+    assert_eq!(
+        scope.0.inner.lock().stack.as_ref().unwrap().poll_timeout(),
+        Some(due)
+    );
+    assert_eq!(
+        RealmRxBatch::receive(
+            &mut batch,
+            scope,
+            &ack,
+            (now, early),
+            path,
+            &peers,
+            admitted
+        ),
+        Some(accepted)
+    );
+    assert_eq!(
+        RealmRxBatch::receive(&mut batch, scope, &ack, (now, due), path, &peers, admitted),
+        None
+    );
+    drop(batch);
+    assert!(slow(&ack, now, due));
+    scope.drive(due);
+    let retry = output(scope);
+    let header = decode(&retry).0;
+    assert_eq!(
+        (header.dst_port, header.seq, header.ack, header.flags),
+        (other.port(), original.seq, original.ack, original.flags)
+    );
+    retry.release();
+    assert!(slow(&rst, now, due));
+    drop(waiting);
+    drop(flow);
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
 async fn identical_local_flow_ids_and_completions_keep_exact_realm_owners() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let (realm, owners) = capture_realm(1280, 1, 16, 2, &budget).unwrap();

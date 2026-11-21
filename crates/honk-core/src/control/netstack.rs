@@ -11,6 +11,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 use std::time::Instant;
@@ -21,7 +22,7 @@ use honk_netstack::{
     AcceptOpts, Config, DropReason, FlowId, MemoryBudget, MemoryReservation, Mode, Ready, Rx,
     RxMeta, SourceContext, Stack, StackStats, SynInfo, Transmit, TxCaps, UdpError,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 use tokio::sync::Notify;
 
 #[cfg(target_os = "linux")]
@@ -34,6 +35,8 @@ pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
 pub(crate) use realm::capture_realm;
 use realm::{HalfOpenHold, RealmResources};
 pub(crate) use realm::{PacketRealm, PacketRealmPlan};
+#[cfg(target_os = "linux")]
+pub(crate) use realm_receive::RealmRxBatch;
 
 mod source;
 pub use source::HostIngress;
@@ -212,12 +215,18 @@ struct Inner {
     peer_end: usize,
     #[cfg(target_os = "linux")]
     fragment_peers: Box<[Option<FragmentPeer>]>,
+    #[cfg(target_os = "linux")]
+    fragment_peer_count: usize,
     pending_closes: usize,
     closed_apps: usize,
     reap_pending: bool,
     pending_routing: usize,
     waiters: Box<[Option<Waker>]>,
     output_waker: Option<Waker>,
+    // While a generated turn owns service, mutations record a rescan instead of waking it.
+    turn_needs_scan: Option<[bool; 2]>,
+    // After protocol disposal, each slot below this cursor still needs its terminal wake.
+    abort_wake_end: usize,
     closing: bool,
     aborted: bool,
     finished: bool,
@@ -412,6 +421,8 @@ impl PacketScope {
                 fragment_peers: (0..if capture && worker == 0 { 80 } else { 0 })
                     .map(|_| None)
                     .collect(),
+                #[cfg(target_os = "linux")]
+                fragment_peer_count: 0,
                 resources,
                 capture_admission: None,
                 pending_closes: 0,
@@ -420,6 +431,8 @@ impl PacketScope {
                 pending_routing: 0,
                 waiters: (0..limits.max_waiters).map(|_| None).collect(),
                 output_waker: None,
+                turn_needs_scan: None,
+                abort_wake_end: 0,
                 closing: false,
                 aborted: false,
                 finished: false,
@@ -772,15 +785,34 @@ impl PacketScope {
     /// Graceful shutdown preserves protocol timers and existing ingress. Abort explicitly
     /// disposes queued CPU packets/protocol state, but cannot reclaim exported output leases.
     pub fn shutdown(&self, abort: bool) {
-        self.0.with(|inner| {
-            inner.closing = true;
-            if let Some(stack) = &mut inner.stack {
-                stack.set_accepting(false);
-            }
-            if abort {
-                inner.abort();
-            }
-        });
+        let mut inner = self.0.inner.lock();
+        inner.closing = true;
+        inner.turn_needs_scan = None;
+        if let Some(stack) = &mut inner.stack {
+            stack.set_accepting(false);
+        }
+        if !abort {
+            self.0.finish_with(inner);
+            return;
+        }
+
+        let output = inner.output_waker.take();
+        let notify_owner = inner.rights != Rights::Driven;
+        inner.abort();
+        let mut wakes = Shared::events(&mut inner, None);
+        Shared::wake_abort_waiters(&mut inner, &mut wakes);
+        let reap = inner.closed_apps != 0;
+        drop(inner);
+        deliver_wakes(output.into_iter(), &mut wakes);
+        if notify_owner {
+            wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| {
+                self.0.owner_wake.notify_one()
+            })));
+        }
+        if reap {
+            wakes = wakes.and(catch_unwind(AssertUnwindSafe(|| self.0.reap())));
+        }
+        resume_wake_panic(wakes);
     }
 
     /// Explicit-clock driving for an embedding owner or deterministic packet script.
@@ -851,27 +883,108 @@ impl PacketScope {
     }
 }
 
+fn deliver_wakes(mut wakers: impl Iterator<Item = Waker>, delivered: &mut std::thread::Result<()>) {
+    // The iterator advances before calling arbitrary application code. A panicking wake
+    // cannot consume its siblings; report the first failure after delivering the rest.
+    while let Err(panic) = catch_unwind(AssertUnwindSafe(|| {
+        for waker in wakers.by_ref() {
+            waker.wake();
+        }
+    })) {
+        if delivered.is_ok() {
+            *delivered = Err(panic);
+        }
+    }
+}
+
+fn resume_wake_panic(delivered: std::thread::Result<()>) {
+    // Scope or stream Drop may already be unwinding the original actor's panic.
+    if let Err(panic) = delivered
+        && !std::thread::panicking()
+    {
+        resume_unwind(panic);
+    }
+}
+
 impl Shared {
     fn with_silent<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
         f(&mut self.inner.lock())
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
-        let (result, closed_apps, device) = {
-            let mut inner = self.inner.lock();
-            let result = f(&mut inner);
-            inner.events();
-            if let Some(stack) = &mut inner.stack {
-                stack.take_tx_wakeup();
-            }
-            // Every reapable slot is a closed app, and its transition's actor reaps it.
-            (result, inner.closed_apps != 0, inner.device_wake())
-        };
+        let mut inner = self.inner.lock();
+        let result = f(&mut inner);
+        self.finish_with(inner);
+        result
+    }
+
+    fn finish_with(&self, inner: MutexGuard<'_, Inner>) {
+        self.finish_with_wakers(inner, None);
+    }
+
+    fn finish_with_wakers(
+        &self,
+        mut inner: MutexGuard<'_, Inner>,
+        first: Option<[Option<Waker>; 2]>,
+    ) {
+        let wakes = Self::events(&mut inner, first);
+        let closed_apps = inner.closed_apps != 0;
+        let device = inner.device_wake();
+        drop(inner);
         self.wake_owner(device);
         if closed_apps {
             self.reap();
         }
-        result
+        resume_wake_panic(wakes);
+    }
+
+    fn events(
+        inner: &mut MutexGuard<'_, Inner>,
+        mut first: Option<[Option<Waker>; 2]>,
+    ) -> std::thread::Result<()> {
+        inner.drain_stream_state();
+        let mut delivered = Ok(());
+        while let Some(first) = first.take().or_else(|| inner.next_stream_wakers()) {
+            // Reserve both directions before consuming another coalesced Stack event.
+            let mut batch = [const { [None, None] }; BATCH / 2];
+            batch[0] = first;
+            let mut count = 1;
+            for cell in &mut batch[1..] {
+                let Some(pair) = inner.next_stream_wakers() else {
+                    break;
+                };
+                *cell = pair;
+                count += 1;
+            }
+            MutexGuard::unlocked(inner, || {
+                deliver_wakes(
+                    batch.into_iter().take(count).flatten().flatten(),
+                    &mut delivered,
+                );
+            });
+            if count < BATCH / 2 {
+                break;
+            }
+        }
+        if let Some(stack) = &mut inner.stack {
+            stack.take_tx_wakeup();
+        }
+        delivered
+    }
+
+    fn wake_abort_waiters(inner: &mut MutexGuard<'_, Inner>, wakes: &mut std::thread::Result<()>) {
+        // Retirement can still wait for an exported lease. Keep each registration in its
+        // original cell until that waiter cancels or observes its own completion.
+        for start in (0..inner.waiters.len()).step_by(BATCH) {
+            let end = (start + BATCH).min(inner.waiters.len());
+            let registrations = &inner.waiters[start..end];
+            if registrations.iter().all(Option::is_none) {
+                continue;
+            }
+            let mut batch = [const { None }; BATCH];
+            batch[..registrations.len()].clone_from_slice(registrations);
+            MutexGuard::unlocked(inner, || deliver_wakes(batch.into_iter().flatten(), wakes));
+        }
     }
 
     fn reap(&self) {
@@ -926,7 +1039,7 @@ impl Shared {
     fn wake_owner(&self, device: Option<Option<Waker>>) {
         match device {
             Some(Some(waker)) => waker.wake(),
-            // Already woken, or not armed before its first service: it will rescan anyway.
+            // The driver is scheduled, entering its first service, or recording a turn rescan.
             Some(None) => {}
             None => self.owner_wake.notify_one(),
         }
@@ -948,6 +1061,17 @@ impl Drop for RetirementCompletion<'_> {
                 .expect("retirement callback owns exact slot");
             assert_eq!(slot.id, self.id);
             inner.closed_apps -= 1;
+            if inner.aborted {
+                // A retirement callback may itself be unwinding. Its completion must leave
+                // persistent waiters registered and preserve that original panic.
+                let device = inner.device_wake();
+                let mut wakes = Ok(());
+                Shared::wake_abort_waiters(&mut inner, &mut wakes);
+                drop(inner);
+                let owner = catch_unwind(AssertUnwindSafe(|| self.shared.wake_owner(device)));
+                resume_wake_panic(wakes.and(owner));
+                return;
+            }
             inner.wake_waiters();
             inner.device_wake()
         };
@@ -968,11 +1092,20 @@ impl Inner {
             }
             _ => None,
         };
+        Self::receive_from_slot(report, owner)
+    }
+
+    fn receive_from_slot(
+        report: honk_netstack::ReceiveReport,
+        owner: Option<&FlowSlot>,
+    ) -> super::packet_endpoint::PacketReceive {
         super::packet_endpoint::PacketReceive {
             source: report.source,
             source_context: report.source_context,
-            qualified_rx: matches!(report.outcome, TcpAccepted(_))
-                && owner.is_some_and(|slot| slot.rx_admitted),
+            qualified_rx: matches!(
+                report.outcome,
+                honk_netstack::ReceiveOutcome::TcpAccepted(_)
+            ) && owner.is_some_and(|slot| slot.rx_admitted),
             taken_over: owner.is_some(),
         }
     }
@@ -980,7 +1113,16 @@ impl Inner {
     /// Under this mutex: the driving device's wake, or `None` to notify the original owner.
     /// Returned/Abandoned progress goes to the original owner, never a stale device task.
     fn device_wake(&mut self) -> Option<Option<Waker>> {
-        (self.rights == Rights::Driven).then(|| self.output_waker.take())
+        (self.rights == Rights::Driven).then(|| self.take_output_wake())
+    }
+
+    fn take_output_wake(&mut self) -> Option<Waker> {
+        if let Some(rescan) = &mut self.turn_needs_scan {
+            *rescan = [true; 2];
+            None
+        } else {
+            self.output_waker.take()
+        }
     }
 
     /// The one CPU-output consumer body, shared by `Shared::with` and the device driver.
@@ -1016,7 +1158,9 @@ impl Inner {
         if self.finished || self.aborted {
             return Poll::Ready(None);
         }
-        register(&mut self.output_waker, cx.waker());
+        if self.turn_needs_scan.is_none() {
+            register(&mut self.output_waker, cx.waker());
+        }
         Poll::Pending
     }
 
@@ -1051,7 +1195,7 @@ impl Inner {
         let tail = (self.head + self.queued) % self.queue.len();
         self.queue[tail] = Some(queued);
         self.queued += 1;
-        if let Some(waker) = self.output_waker.take() {
+        if let Some(waker) = self.take_output_wake() {
             waker.wake();
         }
     }
@@ -1097,7 +1241,7 @@ impl Inner {
         #[cfg(target_os = "linux")]
         if let Some(output) = self.output_peer_holds.get_mut(index) {
             *output = match fragment {
-                Some(info) => self
+                Some(info) if self.fragment_peer_count != 0 => self
                     .fragment_peers
                     .iter()
                     .flatten()
@@ -1105,6 +1249,7 @@ impl Inner {
                         info.incarnation.is_some() && peer.info.incarnation == info.incarnation
                     })
                     .and_then(|peer| peer.peer.clone()),
+                Some(_) => None,
                 None => self
                     .peers
                     .iter()
@@ -1248,12 +1393,10 @@ impl Inner {
 
     fn drive(&mut self, now: Instant) -> bool {
         self.advance(now);
-        let more = self.fill(now);
-        self.events();
-        more
+        self.fill(now)
     }
 
-    fn events(&mut self) {
+    fn drain_stream_state(&mut self) {
         self.drain_half_open();
         if self.pending_routing != 0 {
             for slot in self.slots.iter_mut().flatten() {
@@ -1272,26 +1415,34 @@ impl Inner {
                 }
             }
         }
-        while let Some((id, ready)) = self.stack.as_mut().and_then(Stack::poll_event) {
-            if let Some(slot) = self.slot(id) {
-                if (ready.contains(Ready::READABLE)
-                    || ready.contains(Ready::READ_CLOSED)
-                    || ready.contains(Ready::ERROR))
-                    && let Some(waker) = slot.rx.take()
-                {
-                    waker.wake();
-                }
-                if (ready.contains(Ready::WRITABLE)
-                    || ready.contains(Ready::CONNECTED)
-                    || ready.contains(Ready::ERROR))
-                    && let Some(waker) = slot.tx.take()
-                {
-                    waker.wake();
-                }
-            }
-        }
         #[cfg(target_os = "linux")]
         self.reap_peers();
+    }
+
+    fn next_stream_wakers(&mut self) -> Option<[Option<Waker>; 2]> {
+        while self.abort_wake_end != 0 {
+            self.abort_wake_end -= 1;
+            if let Some(slot) = &mut self.slots[self.abort_wake_end]
+                && (slot.rx.is_some() || slot.tx.is_some())
+            {
+                return Some([slot.rx.take(), slot.tx.take()]);
+            }
+        }
+        while let Some((id, ready)) = self.stack.as_mut().and_then(Stack::poll_event) {
+            let Some(slot) = self.slot(id) else { continue };
+            let rx = ready.contains(Ready::READABLE)
+                || ready.contains(Ready::READ_CLOSED)
+                || ready.contains(Ready::ERROR);
+            let tx = ready.contains(Ready::WRITABLE)
+                || ready.contains(Ready::CONNECTED)
+                || ready.contains(Ready::ERROR);
+            let rx = rx.then(|| slot.rx.take()).flatten();
+            let tx = tx.then(|| slot.tx.take()).flatten();
+            if rx.is_some() || tx.is_some() {
+                return Some([rx, tx]);
+            }
+        }
+        None
     }
 
     fn wake_waiters(&mut self) {
@@ -1301,6 +1452,9 @@ impl Inner {
     }
 
     fn abort(&mut self) {
+        if !self.aborted {
+            self.abort_wake_end = self.slots.len();
+        }
         self.aborted = true;
         // Dropping the stack is explicit protocol disposal, never a fabricated device return.
         self.stack = None;
@@ -1310,18 +1464,6 @@ impl Inner {
         }
         while let Some(queued) = self.pop(None) {
             self.release(queued);
-        }
-        for slot in self.slots.iter_mut().flatten() {
-            if let Some(waker) = slot.rx.take() {
-                waker.wake();
-            }
-            if let Some(waker) = slot.tx.take() {
-                waker.wake();
-            }
-        }
-        self.wake_waiters();
-        if let Some(waker) = self.output_waker.take() {
-            waker.wake();
         }
     }
 
@@ -1417,9 +1559,7 @@ impl PacketOwner {
                 let mut inner = self.scope.0.inner.lock();
                 let now = Instant::now();
                 let more = inner.drive(now);
-                if let Some(stack) = &mut inner.stack {
-                    stack.take_tx_wakeup();
-                }
+                resume_wake_panic(Shared::events(&mut inner, None));
                 let mut deadline = inner.stack.as_ref().and_then(Stack::poll_timeout);
                 if inner.waiters.iter().any(Option::is_some)
                     || inner.slots.iter().flatten().any(|slot| slot.tx.is_some())
@@ -1470,6 +1610,11 @@ pub(crate) struct PacketDriver {
 }
 
 impl PacketDriver {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn sole_owner(&self) -> Option<&PacketScope> {
+        (self.scope.0.workers == 1).then_some(&self.scope)
+    }
+
     pub(crate) fn scope(&self) -> ScopeId {
         self.scope.scope()
     }
@@ -1492,7 +1637,10 @@ impl PacketDriver {
 
     /// Advance timers and pending closes before a bounded direct-output turn.
     pub(crate) fn begin_turn(&mut self, now: Instant) {
-        self.begin(now, |_| false);
+        self.begin(now, |inner| {
+            inner.turn_needs_scan.get_or_insert([false; 2]);
+            false
+        });
     }
 
     fn begin(&mut self, now: Instant, output: impl FnOnce(&mut Inner) -> bool) -> bool {
@@ -1512,33 +1660,32 @@ impl PacketDriver {
         more
     }
 
-    /// Finalize after the last emission, including None and local disposal. Do not self-wake.
+    /// Rearm after the last emission or disposal, preserving any unserviced mutation.
     pub(crate) fn finish_turn(&mut self, cx: &mut Context<'_>, now: Instant) {
         let shared = &self.scope.0;
-        {
+        let wakes = {
             let mut inner = shared.inner.lock();
             if inner.rights != Rights::Driven {
                 self.deadline = None;
                 return;
             }
-            let armed = inner.output_waker.take();
-            inner.events();
-            if let Some(stack) = &mut inner.stack {
-                stack.take_tx_wakeup();
+            if inner.turn_needs_scan.is_none() {
+                register(&mut inner.output_waker, cx.waker());
             }
-            inner.output_waker = armed;
-            register(&mut inner.output_waker, cx.waker());
-        }
+            Shared::events(&mut inner, None)
+        };
         shared.reap();
         let mut inner = shared.inner.lock();
         let armed = inner.output_waker.take();
         if inner.finish() {
+            inner.turn_needs_scan = None;
             inner.rights = Rights::Returned;
             drop(inner);
             drop(armed);
             self.fallback = None;
             self.deadline = None;
             shared.owner_wake.notify_one();
+            resume_wake_panic(wakes);
             return;
         }
         inner.output_waker = armed;
@@ -1553,6 +1700,30 @@ impl PacketDriver {
         .into_iter()
         .flatten()
         .min();
+        // A mutation after either class's last empty pull (or its budget cutoff) needs
+        // one more poll. Later producers see the registration under the same mutex.
+        if inner
+            .turn_needs_scan
+            .take()
+            .is_some_and(|classes| classes.contains(&true))
+        {
+            let wake = inner.output_waker.take().expect("armed driving device");
+            drop(inner);
+            wake.wake();
+        }
+        resume_wake_panic(wakes);
+    }
+
+    /// A failed synchronous device round can enter asynchronous teardown before service resumes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn interrupt_turn(&mut self, cx: &Context<'_>) {
+        let mut inner = self.scope.0.inner.lock();
+        if inner.turn_needs_scan.take().is_some() {
+            register(&mut inner.output_waker, cx.waker());
+            drop(inner);
+            // Even a clean output scan may have advanced a protocol deadline since the last arm.
+            cx.waker().wake_by_ref();
+        }
     }
 
     /// Discard only locally queued packets. Exported owners still need their actual CQ.
@@ -1594,7 +1765,7 @@ impl PacketDriver {
                 .flatten()
                 .any(|queued| queued.class == class)
         {
-            let wake = inner.output_waker.take();
+            let wake = inner.take_output_wake();
             drop(inner);
             if let Some(wake) = wake {
                 wake.wake();
@@ -1625,6 +1796,14 @@ impl PacketDriver {
         );
         reservation.inner.drain_half_open();
         let Some((tx, fragment)) = tx else {
+            // The CPU prefix and this protocol class were both checked under this lock.
+            // Only advance() can service a newly pending close.
+            if reservation.inner.pending_closes == 0
+                && !reservation.inner.closing
+                && let Some(rescan) = &mut reservation.inner.turn_needs_scan
+            {
+                rescan[usize::from(class == TxClass::Bulk)] = false;
+            }
             return Ok(None);
         };
         if tx.len == 0 || tx.len > frame_size {
@@ -1670,6 +1849,7 @@ impl Drop for PacketDriver {
                 return;
             }
             inner.rights = Rights::Abandoned;
+            inner.turn_needs_scan = None;
             inner.output_waker.take()
         };
         drop(stale);

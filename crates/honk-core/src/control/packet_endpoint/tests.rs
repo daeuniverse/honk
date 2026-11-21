@@ -74,10 +74,9 @@ async fn local_plane_with(
         .set_direct_check_addr(health.local_addr().unwrap().to_string());
     (plane, health)
 }
-fn pending_tcp(scope: &PacketScope, destination: SocketAddr) -> FlowIo {
-    let mut packet = [0; 128];
-    let length = wire::tcp::emit_packet(
-        &mut packet,
+fn syn_packet(destination: SocketAddr, packet: &mut [u8]) -> usize {
+    wire::tcp::emit_packet(
+        packet,
         "192.0.2.10".parse().unwrap(),
         destination.ip(),
         &wire::tcp::Header {
@@ -92,7 +91,12 @@ fn pending_tcp(scope: &PacketScope, destination: SocketAddr) -> FlowIo {
         },
         [&[], &[]],
     )
-    .unwrap();
+    .unwrap()
+}
+
+fn pending_tcp(scope: &PacketScope, destination: SocketAddr) -> FlowIo {
+    let mut packet = [0; 128];
+    let length = syn_packet(destination, &mut packet);
     assert_eq!(
         scope.receive(&packet[..length], Instant::now()),
         Rx::Consumed
