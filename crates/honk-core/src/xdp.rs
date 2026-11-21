@@ -80,6 +80,7 @@ const PEERS: usize = 4096;
 const PEER_CONFLICT_HOLD: Duration = Duration::from_secs(60);
 const BATCH: usize = 32;
 const DETACH_BUDGET: Duration = Duration::from_millis(100);
+const LINK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 fn qualify_packet(count: &mut u64, unavailable: &mut bool) {
     match count.checked_add(1) {
@@ -702,6 +703,7 @@ struct Runtime {
     devices: Vec<Device>,
     topology: AsyncFd<CaptureTopology>,
     topology_lost: bool,
+    link_check_at: Instant,
     capture_plan: Option<CapturePlan>,
     capture_plan_memory: Option<MemoryReservation>,
     gateway: Option<Arc<GatewayPublisher>>,
@@ -754,6 +756,7 @@ impl Runtime {
             self.capture_plan
                 .as_ref()
                 .ok_or_else(|| io::Error::other("capture plan already released"))?,
+            &self.polling_budget,
         )
     }
 
@@ -1006,38 +1009,59 @@ impl Runtime {
             self.round_cut_short = true;
             return Poll::Pending;
         }
+        let mut now = Instant::now();
+        let mut queue_zero_batch = BATCH;
         if !self.closing {
             if !self.admission.load(Ordering::Acquire) {
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
-            if let Err(error) = arm_read(&self.topology, cx) {
-                return Poll::Ready(Err(error.into()));
+            let readable =
+                arm_read(&self.topology, cx).inspect_err(|_| self.topology_lost = true)?;
+            // A Core queue-zero RX callback can submit a cached decision without visiting resolve().
+            let full = readable
+                || (self.core.is_some()
+                    && self.devices.iter().any(|device| {
+                        device.queues.first().is_some_and(|queue| {
+                            queue.id == 0 && queue.io.get_ref().has_pending_rx()
+                        })
+                    }));
+            if self.core.is_some() && !full {
+                // RX arriving after this sample is still in the ring for the next checked turn.
+                queue_zero_batch = 0;
             }
-            match current_topology(
-                &mut self.topology,
-                self.gateway.as_deref(),
-                &self.devices,
-                &mut self.topology_lost,
-            ) {
-                Ok(TopologyEvent::AddressDirty) => {
-                    if let Err(error) = self.refresh_local_addresses() {
+            if full || (!self.devices.is_empty() && now >= self.link_check_at) {
+                let event = if full {
+                    current_topology(
+                        &mut self.topology,
+                        self.gateway.as_deref(),
+                        &self.devices,
+                        &mut self.topology_lost,
+                    )
+                } else {
+                    verify_link_fds(self.gateway.as_deref(), &self.devices)
+                        .map(|()| TopologyEvent::Quiet)
+                };
+                match event {
+                    Ok(TopologyEvent::AddressDirty) => {
+                        if let Err(error) = self.refresh_local_addresses() {
+                            for device in &mut self.devices {
+                                device.vlan_offload.abandon();
+                            }
+                            return Poll::Ready(Err(error));
+                        }
+                    }
+                    Ok(TopologyEvent::Quiet) => {}
+                    Err(error) => {
+                        self.topology_lost = true;
                         for device in &mut self.devices {
                             device.vlan_offload.abandon();
                         }
-                        return Poll::Ready(Err(error));
+                        return Poll::Ready(Err(error.into()));
                     }
                 }
-                Ok(TopologyEvent::Quiet) => {}
-                Err(error) => {
-                    for device in &mut self.devices {
-                        device.vlan_offload.abandon();
-                    }
-                    return Poll::Ready(Err(error.into()));
-                }
+                now = Instant::now();
+                self.link_check_at = now + LINK_CHECK_INTERVAL;
             }
-        }
-        let now = Instant::now();
-        if !self.closing {
             self.maintain_gateway(now)?;
         }
         let mut progress = self.poll_handoffs(cx, now)?;
@@ -1112,7 +1136,8 @@ impl Runtime {
                     let mut failure = None;
                     let ifindex = device.info.ifindex;
                     let metadata_len = if capture.vlan_metadata { METADATA_LEN } else { 0 };
-                    let received = port.receive_segments_with(BATCH, metadata_len, |segments, metadata, same_port| {
+                    let batch = if queue.id == 0 { queue_zero_batch } else { BATCH };
+                    let received = port.receive_segments_with(batch, metadata_len, |segments, metadata, same_port| {
                         if failure.is_some() { return; }
                         let capture_metadata = if capture.vlan_metadata {
                             &metadata[..METADATA_LEN.min(metadata.len())]
@@ -1506,6 +1531,9 @@ impl Runtime {
             if !self.closing && device.capture.vlan_metadata {
                 include(device.metadata_checked + Duration::from_secs(1));
             }
+        }
+        if !self.closing && !self.devices.is_empty() {
+            include(self.link_check_at);
         }
         if !self.closing && self.gateway_maps.is_some() {
             include(self.core_maintenance_checked + Duration::from_secs(1));
@@ -2230,6 +2258,32 @@ fn return_header(
     .map_err(io::Error::other)
 }
 
+impl Device {
+    fn core_link(&self) -> io::Result<(&OwnedXdpLink, u32)> {
+        let link = self
+            .attachment
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Core XDP link already detached"))?;
+        let program = if self.active {
+            self.programs.data_prog_id()
+        } else {
+            self.programs.discover_prog_id()
+        };
+        Ok((link, program))
+    }
+}
+
+fn verify_link_fds(gateway: Option<&GatewayPublisher>, devices: &[Device]) -> io::Result<()> {
+    if let Some(gateway) = gateway {
+        return gateway.verify_link_fds();
+    }
+    for device in devices {
+        let (link, program) = device.core_link()?;
+        link.verify_fd(program)?;
+    }
+    Ok(())
+}
+
 fn current_topology(
     topology: &mut AsyncFd<CaptureTopology>,
     gateway: Option<&GatewayPublisher>,
@@ -2246,15 +2300,7 @@ fn current_topology(
             });
         }
         for device in devices {
-            let program = if device.active {
-                device.programs.data_prog_id()
-            } else {
-                device.programs.discover_prog_id()
-            };
-            let link = device
-                .attachment
-                .as_ref()
-                .ok_or_else(|| io::Error::other("Core XDP link already detached"))?;
+            let (link, program) = device.core_link()?;
             link.verify(program)?;
             topology
                 .get_mut()
@@ -2271,11 +2317,13 @@ fn current_topology(
 /// Tokio takes the reader waker when it delivers readiness and a cached Ready installs none,
 /// so a single clear can park an empty pass with nothing to wake it. Pending registers this
 /// task (or schedules a coop-budget continuation) before the caller drains.
-fn arm_read<T: AsRawFd>(io: &AsyncFd<T>, cx: &mut Context<'_>) -> io::Result<()> {
+fn arm_read<T: AsRawFd>(io: &AsyncFd<T>, cx: &mut Context<'_>) -> io::Result<bool> {
+    let mut readable = false;
     while let Poll::Ready(ready) = io.poll_read_ready(cx) {
         ready?.clear_ready();
+        readable = true;
     }
-    Ok(())
+    Ok(readable)
 }
 
 fn selected_egress(realms: &[Realm], route: Route) -> bool {
@@ -2681,6 +2729,7 @@ async fn run_capture(
         pressure: Pressure::new(Instant::now()),
         diagnostics,
         core_maintenance_checked: Instant::now(),
+        link_check_at: Instant::now() + LINK_CHECK_INTERVAL,
         polling: AdaptivePoll::new(polling_publication, process_polling),
         polling_prefix,
         polling_budget,
@@ -3154,7 +3203,7 @@ async fn prepare(
                 "logical MTU must be at least 1280".into(),
             );
         }
-        match CaptureTopology::admit(plan) {
+        match CaptureTopology::admit(plan, &budget) {
             Ok(topology) => Some(topology),
             Err(error) => {
                 record("capture_topology", "capture", error.to_string());
@@ -3854,6 +3903,7 @@ mod tests {
         let reader = unsafe { AsyncFd::register(reader) }
             .map_err(io::Error::from)
             .unwrap();
+        assert!(!arm_read(&reader, &mut Context::from_waker(std::task::Waker::noop())).unwrap());
         writer.send(b"drained").unwrap();
         // A previous pass consumed the packet whose event is still cached as Ready.
         reader.readable().await.unwrap().retain_ready();
@@ -3862,7 +3912,9 @@ mod tests {
         let worker = tokio::spawn(async move {
             let mut armed = Some(armed);
             poll_fn(|cx| {
-                arm_read(&reader, cx).unwrap();
+                if !arm_read(&reader, cx).unwrap() {
+                    return Poll::Pending;
+                }
                 match reader.get_ref().recv(&mut [0; 16]) {
                     Ok(_) => Poll::Ready(()),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {

@@ -30,20 +30,25 @@ struct Fixture {
     diagnostics: crate::config_diagnostics::SharedDiagnostics,
     backend: Arc<tokio::sync::RwLock<Box<dyn crate::ebpf::PolicyBackend>>>,
     authority: crate::control::core_forward::RoutingAuthority,
+    router: Arc<tokio::sync::RwLock<crate::routing::Router>>,
     shutdown: Arc<crate::control::ShutdownIntent>,
 }
 
 impl Fixture {
-    async fn start() -> anyhow::Result<Self> {
+    async fn start(direct: DirectProfile) -> anyhow::Result<Self> {
         guard();
         let pins = guarded_pin_root();
         let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
-        let mut config = honk_config::parser::parse_dae_config(
-            "global { dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }\n\
-             dns { bind: '' }\n\
-             datapath { backend: xdp\n direct: endpoint\n xsk_mode: copy\n interface { dut0: lan\n dut1: wan } }\n\
-             routing { fallback: direct }",
-        )?;
+        let profile = match direct {
+            DirectProfile::Core => "core",
+            DirectProfile::Endpoint => "endpoint",
+        };
+        let mut config = honk_config::parser::parse_dae_config(&format!(
+            "global {{ dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }}\n\
+             dns {{ bind: '' }}\n\
+             datapath {{ backend: xdp\n direct: {profile}\n xsk_mode: copy\n interface {{ dut0: lan\n dut1: wan }} }}\n\
+             routing {{ fallback: direct }}",
+        ))?;
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
         config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
@@ -82,17 +87,12 @@ impl Fixture {
         let diagnostics = plane.diagnostics_handle();
         let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_intent();
+        let router = plane.traffic_router();
         let authority = plane.core_forward_policy(Execution::MixedEndpoints).await?;
         let (runtime, owner) =
             start_runtime(plane, &config, &pins, &artifacts, admission, pname).await?;
-        ensure!(
-            runtime.gateway.is_some(),
-            "Endpoint gateway publisher missing"
-        );
-        ensure!(
-            runtime.core.is_none(),
-            "gateway fixture requires Endpoint Direct"
-        );
+        ensure!(runtime.gateway.is_some() == (direct == DirectProfile::Endpoint));
+        ensure!(runtime.core.is_some() == (direct == DirectProfile::Core));
         Ok(Self {
             runtime,
             owner,
@@ -101,6 +101,7 @@ impl Fixture {
             diagnostics,
             backend,
             authority,
+            router,
             shutdown,
         })
     }
@@ -331,7 +332,7 @@ async fn observations(
 async fn gateway_g08_real_publication_observes_packet_and_generation_windows() -> anyhow::Result<()>
 {
     tokio::time::timeout(Duration::from_secs(45), async {
-        let mut fixture = Fixture::start().await?;
+        let mut fixture = Fixture::start(DirectProfile::Endpoint).await?;
         let _notrack = Notrack::install()?;
         let device = fixture.runtime.devices.iter().find(|device| device.info.name == "dut0").context("dut0")?;
         let ifindex = device.info.ifindex;
@@ -422,7 +423,7 @@ async fn gateway_g08_real_publication_observes_packet_and_generation_windows() -
 #[ignore = "requires the daemon smoke's private disposable-VM namespaces, real veth AF_XDP transmit and CQ"]
 async fn gateway_g17_real_veth_transmit_cq_and_early_release() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
-        let mut fixture = Fixture::start().await?;
+        let mut fixture = Fixture::start(DirectProfile::Endpoint).await?;
         let device = fixture
             .runtime
             .devices
@@ -447,7 +448,7 @@ async fn gateway_g17_real_veth_transmit_cq_and_early_release() -> anyhow::Result
 async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         // If terminal ownership cannot be proven, retain the fixture until the test process exits.
-        let mut owned = std::mem::ManuallyDrop::new(Fixture::start().await?);
+        let mut owned = std::mem::ManuallyDrop::new(Fixture::start(DirectProfile::Endpoint).await?);
         let fixture = &mut *owned;
         ensure!(
             fixture.runtime.devices.len() == 2,
@@ -503,4 +504,161 @@ async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyh
     })
     .await
     .context("bounded gateway unregister timeout fixture")?
+}
+
+// Use the fixture's own link, independently of where Gateway or Core stores its FD.
+fn revoke_fixture_link(device: &Device) -> anyhow::Result<()> {
+    let ifindex = format!("ifindex:\t{}", device.info.ifindex);
+    let program = format!("prog_id:\t{}", device.programs.data_prog_id());
+    let mut owned = None;
+    for entry in std::fs::read_dir("/proc/self/fdinfo")? {
+        let entry = entry?;
+        let info = match std::fs::read_to_string(entry.path()) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            result => result?,
+        };
+        if ["link_type:\txdp", &ifindex, &program]
+            .iter()
+            .all(|field| info.lines().any(|line| line == *field))
+        {
+            ensure!(owned.is_none(), "ambiguous fixture link FD");
+            owned = Some(entry.file_name().to_string_lossy().parse::<u32>()?);
+        }
+    }
+    let fd = owned.context("no fixture link FD")?;
+    // SAFETY: the fixture holds this exact XDP link across the synchronous syscall;
+    // the BPF_LINK_DETACH attribute is one initialized u32 and never closes the FD.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_bpf,
+            aya_obj::generated::bpf_cmd::BPF_LINK_DETACH as u32,
+            &fd,
+            size_of_val(&fd),
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error().into());
+    }
+    ensure!(honk_xsk::xdp_absent(device.info.ifindex)?);
+    Ok(())
+}
+
+async fn quiet_link_loss(direct: DirectProfile) -> anyhow::Result<()> {
+    let mut f = Fixture::start(direct).await?;
+    {
+        let _writer = f.router.write().await;
+        let reader = (direct == DirectProfile::Core).then(|| f.authority.read_policy());
+        let timer = None;
+        let notification = f.runtime.polling.notification();
+        tokio::pin!(reader, timer, notification);
+        if let Some(read) = reader.as_mut().as_pin_mut() {
+            assert!(futures::poll!(read).is_pending());
+        }
+        let initial = f.runtime.link_check_at;
+        tokio::time::timeout(
+            Duration::from_secs(4),
+            poll_fn(|cx| {
+                match f.runtime.poll_service(
+                    cx,
+                    &f.shutdown,
+                    timer.as_mut(),
+                    reader.is_some(),
+                    notification.as_mut(),
+                ) {
+                    Poll::Ready(result) => {
+                        result?;
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Pending
+                        if f.runtime.link_check_at > initial
+                            && f.runtime
+                                .devices
+                                .iter()
+                                .flat_map(|d| &d.queues)
+                                .all(|q| !q.io.get_ref().needs_service_retry()) =>
+                    {
+                        return Poll::Ready(Ok::<_, anyhow::Error>(()));
+                    }
+                    Poll::Pending => {}
+                }
+                Poll::Pending
+            }),
+        )
+        .await
+        .context("quiet owner did not rearm its link check")??;
+        let due = f.runtime.link_check_at;
+        let armed = timer
+            .as_ref()
+            .as_pin_ref()
+            .context("quiet owner parked without a timer")?;
+        ensure!(
+            armed.deadline().into_std() <= due,
+            "parked past physical link deadline"
+        );
+        let device = f
+            .runtime
+            .devices
+            .iter()
+            .find(|d| d.info.name == "dut0")
+            .context("dut0")?;
+        revoke_fixture_link(device)?;
+        let error = tokio::time::timeout_at((due + Duration::from_secs(1)).into(), async {
+            loop {
+                match owner_step(
+                    &mut f.runtime,
+                    &mut f.owner,
+                    reader.as_mut(),
+                    || None,
+                    &f.shutdown,
+                    timer.as_mut(),
+                    notification.as_mut(),
+                )
+                .await
+                {
+                    Err(error) => return Ok(error),
+                    Ok(Some(_)) => {
+                        anyhow::bail!("endpoint owner ended before link loss was reported")
+                    }
+                    Ok(None) => {}
+                }
+            }
+        })
+        .await
+        .context("owner missed revoked physical link")??;
+        ensure!(
+            f.runtime.topology_lost
+                && error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::InvalidData),
+            "unexpected owner outcome: {error:#}"
+        );
+        if direct == DirectProfile::Core {
+            assert!(futures::poll!(reader.as_mut().as_pin_mut().unwrap()).is_pending());
+        }
+        println!(
+            "{direct:?} revoked link detected {} standby deadline",
+            if Instant::now() < due {
+                "before"
+            } else {
+                "at/after"
+            }
+        );
+    }
+    ensure!(
+        f.runtime.close_capture(&f.backend).await.is_err(),
+        "lost authority reported a clean capture close"
+    );
+    f.finish_after_capture_close().await
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's private disposable-VM interfaces"]
+async fn quiet_core_detects_revoked_link_with_a_blocked_reader() -> anyhow::Result<()> {
+    quiet_link_loss(DirectProfile::Core).await
+}
+
+#[tokio::test]
+#[ignore = "requires the daemon smoke's private disposable-VM interfaces"]
+async fn quiet_gateway_detects_revoked_link() -> anyhow::Result<()> {
+    quiet_link_loss(DirectProfile::Endpoint).await
 }

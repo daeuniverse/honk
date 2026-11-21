@@ -419,6 +419,7 @@ async fn start_runtime(
         pressure: Pressure::new(Instant::now()),
         diagnostics,
         core_maintenance_checked: Instant::now(),
+        link_check_at: Instant::now() + LINK_CHECK_INTERVAL,
         polling: AdaptivePoll::new(polling_publication, process_polling),
         polling_prefix,
         polling_budget,

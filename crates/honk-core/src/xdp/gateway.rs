@@ -335,6 +335,17 @@ impl GatewayPublisher {
         Ok(value)
     }
 
+    pub(super) fn verify_link_fds(&self) -> io::Result<()> {
+        drop(self.state.open_links()?);
+        let inner = self.state.inner.lock();
+        for (index, member) in inner.members.iter().enumerate() {
+            self.state.open_links()?[index].verify_fd(member.programs.data_prog_id())?;
+        }
+        // Withdrawal can start between the FD reads without the policy lock.
+        let _links = self.state.open_links()?;
+        Ok(())
+    }
+
     pub(super) fn verify_attachments(&self) -> io::Result<()> {
         let inner = self.state.inner.try_lock().ok_or_else(publisher_busy)?;
         drop(self.state.try_open_links()?);

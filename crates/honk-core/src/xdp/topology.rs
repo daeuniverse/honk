@@ -1,9 +1,11 @@
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd},
+    sync::Arc,
 };
 
 use honk_ebpf_common::xdp_gateway::CaptureRealmKey;
+use honk_netstack::MemoryBudget;
 use honk_xsk::{
     device::DeviceInfo,
     topology::{CaptureWatch, CaptureWatchEvent, capture_layout},
@@ -159,14 +161,14 @@ pub(crate) enum TopologyEvent {
 }
 
 impl CaptureTopology {
-    pub(crate) fn admit(plan: &CapturePlan) -> io::Result<Self> {
+    pub(crate) fn admit(plan: &CapturePlan, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
         let indices: Vec<_> = plan
             .members
             .iter()
             .map(|member| member.info.ifindex)
             .chain(plan.realms.iter().map(|realm| realm.logical_ifindex))
             .collect();
-        let watch = CaptureWatch::new(&indices)?;
+        let watch = CaptureWatch::new(&indices, budget)?;
         let names: Vec<_> = plan
             .realms
             .iter()

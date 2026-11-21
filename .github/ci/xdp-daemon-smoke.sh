@@ -382,6 +382,12 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$full_gateway_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/gateway-full-program.log"
     mkdir "$work/detach-timeout"
     ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work/detach-timeout" "$HONK_XDP_CORE_TEST_BIN" "$detach_test" --exact --ignored --test-threads=1 --nocapture | tee "$work/detach-timeout/result.log"
+    for name in quiet_gateway_detects_revoked_link quiet_core_detects_revoked_link_with_a_blocked_reader; do
+        test="xdp::tests::driven_kernel::gateway::$name"
+        [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
+        mkdir "$work/$name"
+        ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work/$name" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/$name/result.log"
+    done
     retention_test=xdp::tests::retention::gateway_hold_retains_real_queued_exported_and_cq_output
     [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --list --format terse) == "$retention_test: test" ]] || fail "missing Core retention regression: $retention_test"
     ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --test-threads=1 --nocapture | tee "$work/gateway-retention.log"

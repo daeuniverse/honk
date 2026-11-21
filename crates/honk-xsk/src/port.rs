@@ -1455,12 +1455,17 @@ impl<L> Port<L> {
         self.counters
     }
 
+    /// RX was published after this owner last consumed the ring.
+    pub fn has_pending_rx(&self) -> bool {
+        self.rings.rx.producer() != self.rx_consumer
+    }
+
     /// Retry published TX/CQ work or RX blocked by a partial chain/FILL visibility.
     /// A populated FILL ring without queued RX is an ordinary idle receive reservation.
     pub fn needs_service_retry(&self) -> bool {
         self.counters.submitted != self.counters.completed
             || self.tx_producer != self.rings.tx.consumer()
-            || self.rings.rx.producer() != self.rx_consumer
+            || self.has_pending_rx()
     }
 
     pub fn stats(&self) -> io::Result<SocketStats> {

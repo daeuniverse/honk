@@ -88,6 +88,14 @@ impl OwnedXdpLink {
     }
 
     pub fn verify(&self, program_id: u32) -> io::Result<()> {
+        self.verify_fd(program_id)?;
+        require_native(xdp_state(self.ifindex)?, program_id)?;
+        Ok(())
+    }
+
+    /// Checks the owned link's identity through its FD. Use [`Self::verify`]
+    /// for full native XDP mode validation.
+    pub fn verify_fd(&self, program_id: u32) -> io::Result<()> {
         let mut info = LinkInfo::default();
         object_info(self.fd.as_fd(), &mut info)?;
         if info.kind != BPF_LINK_TYPE_XDP
@@ -98,7 +106,6 @@ impl OwnedXdpLink {
         {
             return Err(invalid_data("native XDP link identity readback mismatch"));
         }
-        require_native(xdp_state(self.ifindex)?, program_id)?;
         Ok(())
     }
 
@@ -454,6 +461,11 @@ mod tests {
         link.verify(old_id).unwrap();
         link.replace(old.as_fd(), new.as_fd()).unwrap();
         link.verify(new_id).unwrap();
+        link.verify_fd(new_id).unwrap();
+        assert_eq!(
+            link.verify_fd(old_id).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
         assert!(Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "bpf::attachment::tests::kernel_owned_links_replace_foreign_rejection_and_queue_failure_unwind", "--ignored"])
             .env("HONK_TEST_LINK_EXEC_FD", link.fd.as_raw_fd().to_string()).status().unwrap().success());
@@ -476,6 +488,16 @@ mod tests {
         }
         require_native(xdp_state(devices[2].1).unwrap(), foreign_id).unwrap();
         set_xdp(devices[2].1, -1, Some(foreign.as_raw_fd())).unwrap();
+
+        let [device, ..] = devices;
+        let link = OwnedXdpLink::create(device.1, old.as_fd()).unwrap();
+        link.verify_fd(old_id).unwrap();
+        // Netdev removal leaves the BPF FD live but clears its attached ifindex.
+        drop(device);
+        assert_eq!(
+            link.verify_fd(old_id).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
     }
     use std::io::{BufRead, Write};
     use std::process::{Child, Stdio};

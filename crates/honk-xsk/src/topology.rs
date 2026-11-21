@@ -7,11 +7,15 @@ use std::collections::HashSet;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use honk_netstack::{MemoryBudget, MemoryReservation};
 
 use crate::bpf::{attributes, wait_netlink};
 
 const MAX_OBJECTS: usize = 65_536;
+const RTNL_BUFFER_BYTES: usize = 65_536;
 pub(crate) const MAX_BROADCASTS: usize = 64;
 
 const IFA_F_NODAD: u32 = 0x02;
@@ -435,8 +439,30 @@ pub enum CaptureWatchEvent {
     AddressDirty,
 }
 
+struct CaptureBuffer {
+    bytes: Box<[u8]>,
+    // Field drop order keeps the charge until the backing storage is freed.
+    _memory: MemoryReservation,
+}
+
+impl CaptureBuffer {
+    fn new(budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let memory = budget.reserve(RTNL_BUFFER_BYTES).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "capture RTNL buffer budget exhausted",
+            )
+        })?;
+        Ok(Self {
+            bytes: vec![0; RTNL_BUFFER_BYTES].into_boxed_slice(),
+            _memory: memory,
+        })
+    }
+}
+
 pub struct CaptureWatch {
     fd: OwnedFd,
+    buffer: CaptureBuffer,
     links: Vec<Link>,
     programs: Vec<(u32, u32)>,
     invalidated: bool,
@@ -445,10 +471,11 @@ pub struct CaptureWatch {
 }
 
 impl CaptureWatch {
-    pub fn new(indices: &[u32]) -> io::Result<Self> {
+    pub fn new(indices: &[u32], budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let mut buffer = CaptureBuffer::new(budget)?;
         let fd = route_socket(true)?;
         let dump_fd = route_socket(false)?;
-        let current = snapshot(dump_fd.as_fd(), None)?;
+        let current = snapshot_with_buffer(dump_fd.as_fd(), None, &mut buffer.bytes)?;
         let mut links = Vec::new();
         for index in indices {
             if links.iter().any(|link: &Link| link.index == *index) {
@@ -466,6 +493,7 @@ impl CaptureWatch {
         let (ipv4_broadcasts, broadcast_count) = current.ipv4_broadcasts()?;
         Ok(Self {
             fd,
+            buffer,
             links,
             programs: Vec::new(),
             invalidated: false,
@@ -510,7 +538,6 @@ impl CaptureWatch {
 
     fn receive(&mut self) -> io::Result<CaptureWatchEvent> {
         let mut dirty = false;
-        let mut buffer = [0u8; 65536];
         for _ in 0..64 {
             // SAFETY: recvfrom writes only the provided buffer and sockaddr extent.
             let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
@@ -518,8 +545,8 @@ impl CaptureWatch {
             let n = unsafe {
                 libc::recvfrom(
                     self.fd.as_raw_fd(),
-                    buffer.as_mut_ptr().cast(),
-                    buffer.len(),
+                    self.buffer.bytes.as_mut_ptr().cast(),
+                    self.buffer.bytes.len(),
                     libc::MSG_DONTWAIT | libc::MSG_TRUNC,
                     (&mut source as *mut libc::sockaddr_nl).cast(),
                     &mut length,
@@ -540,14 +567,14 @@ impl CaptureWatch {
                 }
             }
             if n == 0
-                || n as usize > buffer.len()
+                || n as usize > self.buffer.bytes.len()
                 || length as usize != size_of::<libc::sockaddr_nl>()
                 || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
                 || source.nl_pid != 0
             {
                 return Err(malformed("invalid capture notification sender or extent"));
             }
-            dirty |= self.datagram(&buffer[..n as usize], crate::bpf::xdp_state)?;
+            dirty |= self.datagram(&self.buffer.bytes[..n as usize], crate::bpf::xdp_state)?;
         }
         Err(malformed("capture notification drain bound exceeded"))
     }
@@ -959,15 +986,24 @@ pub fn tun_readback(spec: &TunSpec<'_>, ifindex: u32) -> io::Result<TunReadback>
 }
 
 fn snapshot(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<Snapshot> {
+    snapshot_with_buffer(fd, deadline, &mut [0; RTNL_BUFFER_BYTES])
+}
+
+fn snapshot_with_buffer(
+    fd: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+    buffer: &mut [u8],
+) -> io::Result<Snapshot> {
     let mut snapshot = Snapshot::default();
     for (sequence, kind, body_len) in [(1, 18, 16), (2, 22, 8), (3, 34, 12), (4, 26, 12)] {
-        dump(
+        dump_with_buffer(
             fd,
             sequence,
             kind,
             body_len,
             &mut snapshot,
             deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(2)),
+            buffer,
         )?;
     }
     Ok(snapshot)
@@ -1098,6 +1134,26 @@ fn dump(
     snapshot: &mut Snapshot,
     deadline: Instant,
 ) -> io::Result<()> {
+    dump_with_buffer(
+        fd,
+        sequence,
+        kind,
+        body_len,
+        snapshot,
+        deadline,
+        &mut [0; RTNL_BUFFER_BYTES],
+    )
+}
+
+fn dump_with_buffer(
+    fd: BorrowedFd<'_>,
+    sequence: u32,
+    kind: u16,
+    body_len: usize,
+    snapshot: &mut Snapshot,
+    deadline: Instant,
+    buffer: &mut [u8],
+) -> io::Result<()> {
     let mut request = [0u8; 32];
     let length = 16 + body_len;
     request[..4].copy_from_slice(&(length as u32).to_ne_bytes());
@@ -1140,7 +1196,6 @@ fn dump(
         }
         wait_netlink(fd, libc::POLLOUT, deadline)?;
     }
-    let mut buffer = [0u8; 65_536];
     loop {
         if Instant::now() >= deadline {
             return Err(io::Error::new(
@@ -2307,6 +2362,7 @@ mod tests {
             .unwrap();
         let watch = CaptureWatch {
             fd: route_socket(false).unwrap(),
+            buffer: CaptureBuffer::new(&MemoryBudget::new(RTNL_BUFFER_BYTES)).unwrap(),
             links: snapshot.links,
             programs: Vec::new(),
             invalidated: false,
@@ -2367,6 +2423,7 @@ mod tests {
         snapshot.push(16, &bond).unwrap();
         let watch = CaptureWatch {
             fd: route_socket(false).unwrap(),
+            buffer: CaptureBuffer::new(&MemoryBudget::new(RTNL_BUFFER_BYTES)).unwrap(),
             links: snapshot.links,
             programs: Vec::new(),
             invalidated: false,
@@ -2407,6 +2464,7 @@ mod tests {
         snapshot.push(16, &baseline).unwrap();
         let mut watch = CaptureWatch {
             fd: route_socket(false).unwrap(),
+            buffer: CaptureBuffer::new(&MemoryBudget::new(RTNL_BUFFER_BYTES)).unwrap(),
             links: snapshot.links,
             programs: Vec::new(),
             invalidated: false,
@@ -2492,6 +2550,27 @@ mod tests {
                 .check_with(|_| panic!("lost watch cannot regain authority"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn capture_watch_buffer_budget_covers_overlap_and_returns_on_drop() {
+        let budget = MemoryBudget::new(2 * RTNL_BUFFER_BYTES);
+        let occupied = budget.reserve(1).unwrap();
+        let first = CaptureBuffer::new(&budget).unwrap();
+        assert_eq!(first.bytes.len(), RTNL_BUFFER_BYTES);
+        assert_eq!(budget.used(), RTNL_BUFFER_BYTES + 1);
+
+        let error = CaptureBuffer::new(&budget).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+        assert_eq!(budget.used(), RTNL_BUFFER_BYTES + 1);
+
+        drop(occupied);
+        let replacement = CaptureBuffer::new(&budget).unwrap();
+        assert_eq!(budget.used(), 2 * RTNL_BUFFER_BYTES);
+        drop(first);
+        assert_eq!(budget.used(), RTNL_BUFFER_BYTES);
+        drop(replacement);
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]
