@@ -81,6 +81,7 @@ const PEER_CONFLICT_HOLD: Duration = Duration::from_secs(60);
 const BATCH: usize = 32;
 const DETACH_BUDGET: Duration = Duration::from_millis(100);
 const LINK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const STANDBY_LINK_CHECK: &str = "checking idle physical XDP link identity";
 
 fn qualify_packet(count: &mut u64, unavailable: &mut bool) {
     match count.checked_add(1) {
@@ -1056,7 +1057,11 @@ impl Runtime {
                         for device in &mut self.devices {
                             device.vlan_offload.abandon();
                         }
-                        return Poll::Ready(Err(error.into()));
+                        return Poll::Ready(Err(if full {
+                            error.into()
+                        } else {
+                            anyhow::Error::new(error).context(STANDBY_LINK_CHECK)
+                        }));
                     }
                 }
                 now = Instant::now();

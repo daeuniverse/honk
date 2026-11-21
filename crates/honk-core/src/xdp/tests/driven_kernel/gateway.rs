@@ -545,7 +545,22 @@ fn revoke_fixture_link(device: &Device) -> anyhow::Result<()> {
 
 async fn quiet_link_loss(direct: DirectProfile) -> anyhow::Result<()> {
     let mut f = Fixture::start(direct).await?;
-    {
+    let secondary = {
+        // Leave only this fixture's link multicast group so RTM_NEWLINK cannot mask a missing timer.
+        let group: libc::c_int = 1; // RTNLGRP_LINK
+        // SAFETY: the fixture owns this subscribed socket and group is a live integer.
+        if unsafe {
+            libc::setsockopt(
+                f.runtime.topology.get_ref().as_raw_fd(),
+                libc::SOL_NETLINK,
+                libc::NETLINK_DROP_MEMBERSHIP,
+                (&group as *const libc::c_int).cast(),
+                size_of_val(&group) as libc::socklen_t,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
         let _writer = f.router.write().await;
         let reader = (direct == DirectProfile::Core).then(|| f.authority.read_policy());
         let timer = None;
@@ -627,6 +642,7 @@ async fn quiet_link_loss(direct: DirectProfile) -> anyhow::Result<()> {
         .context("owner missed revoked physical link")??;
         ensure!(
             f.runtime.topology_lost
+                && error.downcast_ref::<&str>().copied() == Some(STANDBY_LINK_CHECK)
                 && error
                     .downcast_ref::<io::Error>()
                     .is_some_and(|e| e.kind() == io::ErrorKind::InvalidData),
@@ -635,18 +651,20 @@ async fn quiet_link_loss(direct: DirectProfile) -> anyhow::Result<()> {
         if direct == DirectProfile::Core {
             assert!(futures::poll!(reader.as_mut().as_pin_mut().unwrap()).is_pending());
         }
-        println!(
-            "{direct:?} revoked link detected {} standby deadline",
-            if Instant::now() < due {
-                "before"
-            } else {
-                "at/after"
-            }
-        );
-    }
+        println!("{direct:?} revoked link detected by the standby FD check");
+        (direct == DirectProfile::Core)
+            .then(|| error.downcast_ref::<io::Error>().unwrap().to_string())
+    };
+    let close = f
+        .runtime
+        .close_capture(&f.backend)
+        .await
+        .expect_err("lost capture authority");
+    // Non-gateway close rechecks each physical link, including the one just revoked.
     ensure!(
-        f.runtime.close_capture(&f.backend).await.is_err(),
-        "lost authority reported a clean capture close"
+        close.chain().count() == 1 + usize::from(secondary.is_some())
+            && secondary.is_none_or(|expected| close.to_string().ends_with(&expected)),
+        "unexpected additional capture close failure: {close:#}"
     );
     f.finish_after_capture_close().await
 }

@@ -386,7 +386,7 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
         test="xdp::tests::driven_kernel::gateway::$name"
         [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored Core regression: $test"
         mkdir "$work/$name"
-        ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work/$name" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/$name/result.log"
+        timeout -k 5 40 ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$work/$name" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$work/$name/result.log"
     done
     retention_test=xdp::tests::retention::gateway_hold_retains_real_queued_exported_and_cq_output
     [[ $(ip netns exec dut "$HONK_XDP_CORE_TEST_BIN" "$retention_test" --exact --list --format terse) == "$retention_test: test" ]] || fail "missing Core retention regression: $retention_test"
