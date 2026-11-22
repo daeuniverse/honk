@@ -316,7 +316,8 @@ pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     pub name: String,
-    pub address: String,
+    /// Configured raw TCP endpoint. Virtual chains have no endpoint of their own.
+    pub raw_probe_address: Option<String>,
 }
 
 /// A single probe record for history/API consumption.
@@ -672,9 +673,15 @@ impl AliveDialerSet {
         Arc::clone(&arr[idx])
     }
 
-    pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
+    pub fn register_node(&self, node_id: Uuid, name: String, raw_probe_address: Option<String>) {
         let mut registered = self.registered.write();
-        registered.insert(node_id, Arc::new(RegisteredNode { name, address }));
+        registered.insert(
+            node_id,
+            Arc::new(RegisteredNode {
+                name,
+                raw_probe_address,
+            }),
+        );
         self.node_registered_at
             .write()
             .insert(node_id, Instant::now());
@@ -682,8 +689,8 @@ impl AliveDialerSet {
         states.entry(node_id).or_insert_with(fresh_states);
     }
 
-    /// Snapshot of currently registered nodes (NodeId → name/address), used
-    /// by config reload to diff and re-register only what changed.
+    /// Snapshot of current health-check registrations, used by config reload
+    /// to re-register only what changed.
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
         self.registered
             .read()

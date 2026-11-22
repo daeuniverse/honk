@@ -309,7 +309,7 @@ fn group_health_falls_back_by_member_and_full_measurement_key() {
     let identity = Catalog::new(&config).snapshot();
     let alive = AliveDialerSet::new();
     alive.enable_health_history();
-    alive.register_node(node.id, node.name.clone(), "127.0.0.1:1".into());
+    alive.register_node(node.id, node.name.clone(), Some("127.0.0.1:1".into()));
     let ticket = alive.probe_ticket(node.id);
     let tcp = HealthObservation::probe(
         ProbeDomain::Tcp,

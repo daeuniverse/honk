@@ -251,7 +251,7 @@ fn score_udp_capability_filters_selection_verification_and_nested_finals() {
     let groups = [score, incapable, terminal, parent];
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
 
     for alive_set in [Some(alive), None] {
@@ -330,7 +330,7 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["selector"]);
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
     for alive_set in [Some(alive), None] {
         let manager =

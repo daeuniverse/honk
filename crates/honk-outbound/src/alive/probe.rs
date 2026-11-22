@@ -93,7 +93,7 @@ impl AliveDialerSet {
                 .probe_node_tcp(
                     node_id,
                     "direct",
-                    &target,
+                    Some(&target),
                     timeout,
                     registration.as_ref(),
                     &cancel,
@@ -114,7 +114,7 @@ impl AliveDialerSet {
             self.probe_node_tcp(
                 node_id,
                 &registered.name,
-                &registered.address,
+                registered.raw_probe_address.as_deref(),
                 timeout,
                 Some(&registered),
                 &cancel,
@@ -135,25 +135,12 @@ impl AliveDialerSet {
     ) -> bool {
         let node_name = registered.name.as_str();
         let check_url = self.check_url.read().clone();
-        if check_url.is_empty() {
-            return self
-                .probe_node_tcp(
-                    node_id,
-                    node_name,
-                    &registered.address,
-                    timeout,
-                    Some(registered),
-                    cancel,
-                )
-                .await;
-        }
-
         let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
             return self
                 .probe_node_tcp(
                     node_id,
                     node_name,
-                    &registered.address,
+                    registered.raw_probe_address.as_deref(),
                     timeout,
                     Some(registered),
                     cancel,
@@ -290,7 +277,7 @@ impl AliveDialerSet {
                 "Node '{}' failed HTTP health check for '{}' through proxy endpoint {}",
                 node_name,
                 check_url,
-                registered.address
+                registered.raw_probe_address.as_deref().unwrap_or_default()
             );
         }
 
@@ -428,33 +415,28 @@ impl AliveDialerSet {
         any_ok
     }
 
-    /// Raw TCP connect health check (fallback when no HTTP prober configured).
+    /// Raw TCP connect health check when no HTTP prober or check URL is configured.
     async fn probe_node_tcp(
         &self,
         node_id: Uuid,
         node_name: &str,
-        node_addr: &str,
+        node_addr: Option<&str>,
         timeout: Duration,
         registration: Option<&Arc<RegisteredNode>>,
         cancel: &ProbeCancellation,
     ) -> bool {
-        // A proxy chain, or a flat node given only `host` and `port`, registers
-        // an empty address. This probe records nothing for it, so only traffic
-        // or a Clash delay test changes its state.
-        if node_addr.is_empty() {
+        // A virtual chain has no endpoint of its own. With no raw target,
+        // leave both families' health state alone.
+        let Some(addr) = node_addr else {
             return [IpVersion::V4, IpVersion::V6]
                 .into_iter()
                 .any(|ipver| self.is_alive_for(node_id, ProbeDomain::Tcp, ipver));
-        }
-        let addr = node_addr.to_string();
-        let (host, port) = match addr.rsplit_once(':') {
-            Some((h, p)) => match p.parse::<u16>() {
-                Ok(port) => (h.to_string(), port),
-                Err(_) => (addr.clone(), 80),
-            },
-            None => (addr.clone(), 80),
         };
-        let addrs = match self.resolve_host(&host, port).await {
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((host, port)) => port.parse::<u16>().map_or((addr, 80), |port| (host, port)),
+            None => (addr, 80),
+        };
+        let addrs = match self.resolve_host(host, port).await {
             Ok(addrs) if !addrs.is_empty() => addrs,
             Ok(_) => {
                 tracing::debug!(

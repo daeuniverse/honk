@@ -1,10 +1,13 @@
 use super::support::{
     UdpTestHandler, UdpTestMode, canonical_socks5, control_plane, score_reload_config,
 };
-use crate::control::{ControlPlane, drain::DrainTracker, probers::UdpDnsProbeTarget};
+use crate::control::{
+    ControlPlane, drain::DrainTracker, probers::UdpDnsProbeTarget, reload::sync_health_check_nodes,
+};
 use honk_config::{Config, node::Node, parser::parse_dae_config, types::NodeProtocol};
 use honk_outbound::alive::{
-    HttpProbeOutcome, HttpProbeResult, HttpProber, IpVersion, ProbeDomain, UdpProber,
+    AliveDialerSet, HttpProbeOutcome, HttpProbeResult, HttpProber, IpVersion, ProbeDomain,
+    UdpProber,
 };
 use honk_outbound::proxy::{ProtocolEntry, ProxyRegistry, ProxyStream, TcpOutbound};
 use parking_lot::Mutex;
@@ -51,6 +54,69 @@ impl HttpProber for PeriodProbe {
     ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
         let _ = self.0.send(tokio::time::Instant::now());
         Box::pin(async { HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into() })
+    }
+}
+
+#[tokio::test]
+async fn raw_health_only_skips_virtual_chains() {
+    let mut config = Config::from_json_str(
+        r#"{
+            "global": { "tcp_check_url": [] },
+            "nodes": [
+                { "name": "front", "protocol": "socks5", "address": "", "host": "127.0.0.1", "port": 1080 },
+                { "name": "land", "protocol": "socks5", "address": "", "host": "::1", "port": 1080 }
+            ]
+        }"#,
+    )
+    .unwrap();
+    let via = Node::chain_from_nodes("via", &[&config.nodes[0], &config.nodes[1]]).unwrap();
+    let chain_id = via.id;
+    config.nodes.push(via);
+    config.validate_assembled().unwrap();
+    assert!(config.nodes.iter().all(|node| node.address.is_empty()));
+
+    for check_url in [None, Some("")] {
+        let alive = Arc::new(AliveDialerSet::new());
+        let (http_attempts, mut probed) = tokio::sync::mpsc::unbounded_channel();
+        if let Some(url) = check_url {
+            alive
+                .set_http_probe(
+                    Arc::new(PeriodProbe(http_attempts)),
+                    url.into(),
+                    "HEAD".into(),
+                )
+                .await;
+        }
+        alive.set_resolver(Arc::new(|host, port| {
+            assert_eq!((host.as_str(), port), ("", 80));
+            // Give the legacy empty-address lookup two local, unusable endpoints.
+            Box::pin(async {
+                Ok(vec![
+                    "127.0.0.1:0".parse().unwrap(),
+                    "[::1]:0".parse().unwrap(),
+                ])
+            })
+        }));
+        assert_eq!(sync_health_check_nodes(&alive, &config), (3, 0));
+        assert_eq!(sync_health_check_nodes(&alive, &config), (0, 0));
+
+        alive
+            .run_health_check_cycle_concurrent(Duration::from_secs(1), 1)
+            .await;
+        assert!(probed.try_recv().is_err());
+        for family in [IpVersion::V4, IpVersion::V6] {
+            assert!(alive.is_alive_for(chain_id, ProbeDomain::Tcp, family));
+            assert!(
+                alive
+                    .get_probe_history(chain_id, ProbeDomain::Tcp, family)
+                    .is_empty()
+            );
+            for node in &config.nodes[..2] {
+                let history = alive.get_probe_history(node.id, ProbeDomain::Tcp, family);
+                assert_eq!(history.len(), 1, "{} {family:?} {check_url:?}", node.name);
+                assert!(!history[0].success);
+            }
+        }
     }
 }
 
@@ -378,7 +444,7 @@ async fn udp_dns_target_recovers_after_capacity_refusal_and_pins_success() {
         UdpTestMode::DnsResponseCaptureTarget(capture.clone()),
     );
     let alive = cp.alive_set();
-    alive.register_node(node.id, node.name.clone(), "127.0.0.1:9".into());
+    alive.register_node(node.id, node.name.clone(), Some("127.0.0.1:9".into()));
     alive.set_udp_probe(prober);
 
     assert!(!alive.probe_node_udp(node.id, Duration::from_secs(1)).await);
@@ -443,7 +509,7 @@ async fn udp_dns_initialization_timeout_is_neutral_and_retryable() {
         UdpTestMode::DnsResponseCaptureTarget(capture.clone()),
     );
     let alive = cp.alive_set();
-    alive.register_node(node.id, node.name.clone(), "127.0.0.1:9".into());
+    alive.register_node(node.id, node.name.clone(), Some("127.0.0.1:9".into()));
     alive.set_udp_probe(prober);
     assert!(
         !tokio::time::timeout(

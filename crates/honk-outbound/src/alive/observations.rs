@@ -481,7 +481,7 @@ mod tests {
         let set = AliveDialerSet::new();
         let node = Uuid::from_u128(1);
         set.enable_health_history();
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         let at = |second| SystemTime::UNIX_EPOCH + Duration::from_secs(second);
         let probe = |latency: Option<u64>, second| {
             HealthObservation::probe(
@@ -535,11 +535,11 @@ mod tests {
         set.enable_health_history();
         let missing = set.probe_ticket(node);
         assert!(!set.complete_probe(&missing, None, sample()));
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         assert!(!set.complete_probe(&missing, None, sample()));
         let ticket = set.probe_ticket(node);
         assert!(set.complete_probe(&ticket, None, sample()));
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         let context = GroupProbeContext {
             group_id: Uuid::from_u128(2),
             member_id: node,
@@ -559,7 +559,7 @@ mod tests {
     fn native_ticket_rejects_invalidated_group_epoch_and_older_samples() {
         let set = AliveDialerSet::new();
         let node = Uuid::from_u128(1);
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         let disabled = set.probe_ticket(node);
         assert!(!set.complete_probe(&disabled, None, sample()));
         set.enable_health_history();
@@ -599,7 +599,7 @@ mod tests {
         let set = AliveDialerSet::new();
         let node = Uuid::from_u128(1);
         set.enable_health_history();
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         let context = GroupProbeContext {
             group_id: Uuid::from_u128(2),
             member_id: node,
@@ -631,7 +631,7 @@ mod tests {
         for node in [Uuid::from_u128(1), honk_config::config::DIRECT_NODE_ID] {
             let set = AliveDialerSet::new();
             if node != honk_config::config::DIRECT_NODE_ID {
-                set.register_node(node, "node".into(), "127.0.0.1:1".into());
+                set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
             }
             let disabled = set.probe_ticket(node);
             set.enable_health_history();
@@ -663,7 +663,7 @@ mod tests {
         let set = AliveDialerSet::new();
         let node = Uuid::from_u128(1);
         set.enable_health_history();
-        set.register_node(node, "node".into(), "127.0.0.1:1".into());
+        set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
         let ticket = set.probe_ticket(node);
         let context = GroupProbeContext {
             group_id: Uuid::from_u128(2),

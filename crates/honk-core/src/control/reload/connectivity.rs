@@ -51,10 +51,7 @@ pub(in crate::control) fn groups_by_name(
 /// Nodes reachable through group membership or explicit finals are probed
 /// for alive display and recovery, including Selector leaves. Ungrouped
 /// nodes are skipped unless no reachable leaves exist.
-/// Returns `(NodeId, node name, address)` triples.
-pub(in crate::control) fn health_check_targets(
-    config: &Config,
-) -> Vec<(uuid::Uuid, String, String)> {
+fn health_check_targets(config: &Config) -> impl Iterator<Item = &Node> {
     let by_name = groups_by_name(config);
     let group_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
         .groups
@@ -68,42 +65,37 @@ pub(in crate::control) fn health_check_targets(
     config
         .nodes
         .iter()
-        .filter(|n| group_node_ids.is_empty() || group_node_ids.contains(&n.id))
-        .map(|n| (n.id, n.name.clone(), n.address.clone()))
-        .collect()
+        .filter(move |n| group_node_ids.is_empty() || group_node_ids.contains(&n.id))
 }
 
 /// Synchronize alive-set health-check registrations with the config's
-/// group membership: register nodes that are new or whose name/address
-/// changed, remove nodes that left the checked set. Unchanged
-/// registrations keep their probe state and grace period. Returns
-/// `(added, removed)` counts.
+/// group membership. Unchanged registrations keep their probe state and
+/// grace period. Returns `(added, removed)` counts.
 pub(in crate::control) fn sync_health_check_nodes(
     alive_set: &AliveDialerSet,
     config: &Config,
 ) -> (usize, usize) {
-    let desired: std::collections::HashMap<uuid::Uuid, (String, String)> =
-        health_check_targets(config)
-            .into_iter()
-            .map(|(id, name, addr)| (id, (name, addr)))
-            .collect();
-    let current = alive_set.registered_nodes();
-    let mut added = 0usize;
-    for (id, (name, addr)) in &desired {
-        let unchanged = current
-            .get(id)
-            .is_some_and(|r| &r.name == name && &r.address == addr);
+    let mut current = alive_set.registered_nodes();
+    let mut added = 0;
+    for node in health_check_targets(config) {
+        let raw_probe_address =
+            (node.protocol() != NodeProtocol::Chain).then_some(node.address.as_str());
+        let unchanged = current.remove(&node.id).is_some_and(|registered| {
+            registered.name == node.name
+                && registered.raw_probe_address.as_deref() == raw_probe_address
+        });
         if !unchanged {
-            alive_set.register_node(*id, name.clone(), addr.clone());
+            alive_set.register_node(
+                node.id,
+                node.name.clone(),
+                raw_probe_address.map(str::to_owned),
+            );
             added += 1;
         }
     }
-    let mut removed = 0usize;
-    for id in current.keys() {
-        if !desired.contains_key(id) {
-            alive_set.remove_node(*id);
-            removed += 1;
-        }
+    let removed = current.len();
+    for id in current.into_keys() {
+        alive_set.remove_node(id);
     }
     (added, removed)
 }
