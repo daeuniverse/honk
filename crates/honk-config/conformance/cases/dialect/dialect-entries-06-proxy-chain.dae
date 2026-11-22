@@ -1,0 +1,5 @@
+node {
+    front: 'socks5://127.0.0.1:1080'
+    land: 'socks5://127.0.0.1:1081'
+    via: front -> land
+}

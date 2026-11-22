@@ -875,7 +875,6 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     assert_udp_selection(&manager, "level-1", Some("direct"));
 }
 
-/// Proxy chains carry TCP only: UDP selection passes over them, TCP does not.
 #[test]
 fn udp_selection_skips_chain_nodes() {
     let front = make_node(nid("front"), "front");

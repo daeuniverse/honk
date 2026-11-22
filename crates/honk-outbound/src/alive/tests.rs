@@ -2710,14 +2710,9 @@ async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error
 
 #[tokio::test]
 async fn test_raw_probe_keeps_chain_health() {
-    use crate::test_support::{chain, socks5};
-
     let set = AliveDialerSet::new();
-    let front = socks5("front", "127.0.0.1", 1080);
-    let land = socks5("land", "127.0.0.1", 1081);
-    let via = chain(&[&front, &land]);
-    let node = via.id;
-    set.register_node(node, via.name, None);
+    let node = Uuid::new_v4();
+    set.register_node(node, "via".into(), None);
     set.set_resolver(Arc::new(|_, _| panic!("a chain has no raw TCP endpoint")));
     set.node_registered_at
         .write()
@@ -2748,8 +2743,7 @@ async fn test_raw_probe_keeps_chain_health() {
     }
 }
 
-/// Dials the probed node through its generation, as the core prober does, and
-/// counts a delivered stream as a successful check.
+/// Use a successful chain dial as the HTTP probe's sample.
 struct GenerationDialProber {
     registry: Arc<crate::proxy::ProxyRegistry>,
     generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
@@ -2778,9 +2772,7 @@ impl HttpProber for GenerationDialProber {
     }
 }
 
-/// With an HTTP check, a proxy chain is probed through all of its hops: it
-/// dies when its exit refuses the check target and revives when the exit
-/// carries it again.
+/// Exit refusal and a subsequent successful dial are liveness evidence.
 #[tokio::test]
 async fn test_http_probe_moves_a_chain_between_dead_and_alive() {
     use crate::test_support::{chain, socks5, socks5_relay};

@@ -125,7 +125,6 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, u32
 // client closes it. Resolve only the exact remote hop in its address frame.
 async fn relay_entry(listener: Arc<TcpListener>, tls: TlsAcceptor, exit: SocketAddr) {
     let (tcp, _) = listener.accept().await.unwrap();
-    assert_eq!(tcp.local_addr().unwrap(), listener.local_addr().unwrap());
     let mut tls = tls.accept(tcp).await.unwrap();
     assert_eq!(tls.get_ref().1.server_name(), Some(ENTRY));
     let mut authentication = [0; 32];

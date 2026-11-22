@@ -570,7 +570,7 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
     udp_peer.await.unwrap();
 }
 
-/// Both the HTTP and TCP DNS check cross the private chain's front and land hops.
+/// Both probes use a private chain runtime.
 #[tokio::test]
 async fn http_and_tcp_dns_probes_of_a_chain_cross_every_hop() {
     use crate::test_support::{socks5_chain, socks5_relay};

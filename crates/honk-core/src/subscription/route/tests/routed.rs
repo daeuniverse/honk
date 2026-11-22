@@ -64,7 +64,6 @@ async fn a_group_override_goes_through_the_group_whatever_the_rules_say() {
     assert_eq!(requests.lock().len(), 1);
 }
 
-/// A download routed to a proxy chain reaches the provider through each hop.
 #[tokio::test]
 async fn a_fetch_through_a_chain_crosses_every_hop() {
     use crate::test_support::{socks5_chain, socks5_relay};

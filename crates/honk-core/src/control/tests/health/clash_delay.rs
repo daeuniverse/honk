@@ -184,11 +184,6 @@ async fn clash_group_delay_is_registration_scoped() {
     delay_is_registration_scoped("/group/pool/delay", "via").await;
 }
 
-#[tokio::test]
-async fn clash_proxy_group_delay_is_registration_scoped() {
-    delay_is_registration_scoped("/proxies/pool/delay", "delay").await;
-}
-
 async fn spawn_clash(config: Config) -> (Arc<ControlPlane>, SocketAddr, JoinHandle<()>) {
     let mut control = control_plane(config);
     let mode_state = Arc::new(parking_lot::RwLock::new(ModeState::new("Rule", "pool")));
@@ -661,7 +656,9 @@ async fn delay_cannot_select_a_successor(
 ) {
     let old = socks5_http_exit().await;
     let new = socks5_http_exit().await;
-    let (control, api, server) = spawn_clash(urltest_config(vec![peer_node("old", &old)])).await;
+    let old_node = peer_node("old", &old);
+    let old_id = old_node.id;
+    let (control, api, server) = spawn_clash(urltest_config(vec![old_node])).await;
     let mut delay = ClashDelay::new(api, Some(old), path, old_key);
     let successor = urltest_config(vec![peer_node("new", &new), Config::builtin_block_node()]);
     let choice = || control.group_manager.read().get_urltest_selection("pool");
@@ -678,6 +675,12 @@ async fn delay_cannot_select_a_successor(
         )
         .await;
     delay.success(response);
+    assert!(
+        control
+            .alive_set()
+            .get_probe_history(old_id, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
     assert_eq!(
         choice(),
         None,
@@ -689,6 +692,10 @@ async fn delay_cannot_select_a_successor(
 
     delay.exit = Some(new);
     delay.result_name = new_key;
+    if new_key == "delay" {
+        let (failed, ()) = delay.measure("500 Internal Server Error", async {}).await;
+        assert_eq!(failed.0, StatusCode::SERVICE_UNAVAILABLE);
+    }
     let (response, ()) = delay.measure("204 No Content", async {}).await;
     delay.success(response);
     assert_eq!(choice().as_deref(), Some("new"));

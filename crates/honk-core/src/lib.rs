@@ -2057,18 +2057,40 @@ mod startup_lifecycle_tests {
 
     #[tokio::test]
     async fn delay_without_a_url_refuses_a_chain() {
+        let front = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        front.set_nonblocking(true).unwrap();
+        let front_addr = front.local_addr().unwrap();
         let file = tempfile::Builder::new().suffix(".dae").tempfile().unwrap();
         std::fs::write(
             file.path(),
-            "node {\n front: 'socks5://127.0.0.1:1080'\n land: 'socks5://127.0.0.1:1081'\n via: front -> land\n}\n",
+            format!(
+                "node {{\n front: 'socks5://{front_addr}'\n land: 'socks5://127.0.0.1:1'\n via: front -> land\n}}\n"
+            ),
         )
         .unwrap();
         let config = file.path().to_str().unwrap();
         let cli = Cli::try_parse_from(["honk-core", "-c", config, "delay", "via"]).unwrap();
-        let error = super::handle_clash_command(&cli).await.unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "Node 'via' is a proxy chain with no address of its own; pass a URL"
+        let error = super::handle_clash_command(&cli)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("proxy chain") && error.contains("URL"),
+            "{error}"
         );
+        assert_eq!(
+            front.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = target.local_addr().unwrap().to_string();
+        let cli = Cli::try_parse_from(["honk-core", "-c", config, "delay", "via", "--url", &url])
+            .unwrap();
+        super::handle_clash_command(&cli).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), target.accept())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

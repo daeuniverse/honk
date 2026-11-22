@@ -202,6 +202,7 @@ jobs:
           fetch "$VIRTME_NG_WHEEL_URL" "$VIRTME_NG_SHA256" virtme-ng.whl
           fetch "https://github.com/XTLS/Xray-core/releases/download/v$XRAY_VERSION/Xray-linux-64.zip" "$XRAY_SHA256" Xray-linux-64.zip
           fetch "https://github.com/SagerNet/sing-box/releases/download/v$SING_BOX_VERSION/sing-box-$SING_BOX_VERSION-linux-amd64-musl.tar.gz" "$SING_BOX_SHA256" sing-box.tar.gz
+          fetch "https://github.com/juicity/juicity-rs/releases/download/v$JUICITY_VERSION/juicity-x86_64-unknown-linux-musl.zip" "$JUICITY_SHA256" juicity.zip
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_IMAGE" "$KERNEL_FLOOR_IMAGE_SHA256" "$KERNEL_FLOOR_IMAGE"
           fetch "$KERNEL_FLOOR_BASE/$KERNEL_FLOOR_MODULES" "$KERNEL_FLOOR_MODULES_SHA256" "$KERNEL_FLOOR_MODULES"
           fetch "$KERNEL_RECENT_BASE/$KERNEL_RECENT_IMAGE" "$KERNEL_RECENT_IMAGE_SHA256" "$KERNEL_RECENT_IMAGE"

@@ -248,6 +248,7 @@ async fn websocket_close_waits_for_the_vmess_upload_not_its_response() {
 #[tokio::test]
 async fn websocket_close_returns_the_lower_shutdown_error() {
     use tokio::io::{AsyncWrite, DuplexStream, WriteHalf};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
 
     #[derive(Debug)]
     struct ResetOnShutdown(WriteHalf<DuplexStream>);
@@ -271,17 +272,11 @@ async fn websocket_close_returns_the_lower_shutdown_error() {
             // Only one byte of the six-byte masked Close fits before the peer reads.
             let (client, peer) = tokio::io::duplex(if peer_first { 1 } else { 4096 });
             let (rd, wr) = tokio::io::split(client);
-            let node = transport_node(80);
-            let (app, peer) = tokio::join!(
-                wrap_ws(
-                    &node,
-                    Box::new(tokio::io::join(rd, ResetOnShutdown(wr))),
-                    true
-                ),
-                tokio_tungstenite::accept_async(peer)
-            );
-            let mut app = app.unwrap();
-            let mut peer = peer.unwrap();
+            let socket: Box<dyn AsyncReadWrite> =
+                Box::new(tokio::io::join(rd, ResetOnShutdown(wr)));
+            let ws = WebSocketStream::from_raw_socket(socket, Role::Client, None).await;
+            let mut app = ObservedWs::bridge(ws, true).unwrap();
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Server, None).await;
             if peer_first {
                 peer.send(Message::Close(None)).await.unwrap();
                 peer.get_mut().shutdown().await.unwrap();
