@@ -440,11 +440,11 @@ impl NodeHostResolver for RefuseLocalNames {
     }
 }
 
-async fn exchange(
-    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     send: &[u8],
     expect: &[u8],
-) -> Result<()> {
+) -> Result<S> {
     stream.write_all(send).await?;
     stream.flush().await?;
     let mut received = vec![0; expect.len()];
@@ -454,7 +454,8 @@ async fn exchange(
         "payload differs ({} bytes)",
         received.len()
     );
-    Ok(())
+    // Dropping a mux stream can cancel queued data before the other peer reads it.
+    Ok(stream)
 }
 
 async fn roundtrip(
