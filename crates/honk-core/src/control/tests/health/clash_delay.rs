@@ -93,12 +93,12 @@ impl ClashDelay {
         }
     }
 
-    async fn measure<T>(
+    fn measure<T>(
         &self,
         status: &str,
         while_pending: impl Future<Output = T>,
-    ) -> ((StatusCode, Value), T) {
-        self.measure_with_reply(Some(status), while_pending).await
+    ) -> impl Future<Output = ((StatusCode, Value), T)> {
+        self.measure_with_reply(Some(status), while_pending)
     }
 
     async fn measure_with_reply<T>(
