@@ -193,6 +193,7 @@ pub async fn urltest_node(
         &ProbeCancellation::default(),
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 async fn urltest_request_impl(
@@ -201,7 +202,7 @@ async fn urltest_request_impl(
     request: &http::Request<()>,
     timeout: Duration,
     cancel: &ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let host = target.host();
@@ -220,7 +221,6 @@ async fn urltest_request_impl(
         None,
     )
     .await
-    .map(|measurement| measurement.latency)
 }
 
 async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -333,7 +333,7 @@ pub async fn urltest_node_in_generation_with_feedback(
     timeout: Duration,
     group_manager: &GroupManager,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     urltest_node_in_generation_impl(
         generation,
         node,
@@ -357,7 +357,7 @@ async fn urltest_node_in_generation_impl(
     timeout: Duration,
     group_manager: Option<&GroupManager>,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     if cancel.is_cancelled() {
         return Err(crate::proxy::PacketRejection::Cancelled.into());
     }
@@ -641,9 +641,10 @@ async fn urltest_group_impl(
                 }
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
-            if let Ok(latency) = &result {
-                alive_set.record_urltest_latency(&published, &generation, &ticket, *latency);
-            }
+            let result = result.map(|measurement| {
+                alive_set.record_urltest_latency(&published, &generation, &ticket, measurement);
+                measurement.latency
+            });
             (node.name.clone(), result)
         });
     }

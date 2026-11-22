@@ -374,6 +374,10 @@ pub struct NodeRuntime {
 }
 
 impl NodeRuntime {
+    pub(crate) fn matches_config(&self, node: &Node) -> bool {
+        self.node.as_ref() == node || same_node_config(&self.node, node)
+    }
+
     fn build_xhttp(node: &Node) -> Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>> {
         #[cfg(not(any(feature = "rprx", test)))]
         if node.protocol() == honk_config::types::NodeProtocol::VLess {
@@ -836,7 +840,7 @@ impl OutboundRuntimeRegistry {
             .filter(|runtime| {
                 matches!(&runtime.runtime, ProtocolRuntime::Chain(_))
                     && runtime.node.resolved_chain_hops() == node.resolved_chain_hops()
-                    && (runtime.node.as_ref() == node || same_node_config(&runtime.node, node))
+                    && runtime.matches_config(node)
             })
             .ok_or(RuntimeRegistryError::ChainBinding)
     }
@@ -1116,7 +1120,11 @@ impl OutboundRuntimeRegistry {
     }
 
     pub fn get(&self, id: &uuid::Uuid) -> Option<Arc<NodeRuntime>> {
-        self.nodes.get(id).map(Arc::clone)
+        self.get_ref(id).cloned()
+    }
+
+    pub(crate) fn get_ref(&self, id: &uuid::Uuid) -> Option<&Arc<NodeRuntime>> {
+        self.nodes.get(id)
     }
 
     /// Chains rebuild their wrapper at every publication. Their physical owners

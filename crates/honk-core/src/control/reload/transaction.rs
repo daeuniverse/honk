@@ -638,6 +638,8 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
         let old_registry_result = {
+            #[cfg(all(test, feature = "clash-api"))]
+            let _after_unlock = self.clash_publication_pause.lock().take();
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
             #[cfg(feature = "native-api")]
@@ -739,7 +741,10 @@ impl ControlPlane {
                 new_runtime_registry.activate_background_dial_admission();
                 // A node can retain its runtime while leaving all health-checked groups.
                 // Publish its registration under the same fence as the runtime swap.
-                self.alive_set.sync_registrations(health_targets);
+                self.alive_set
+                    .sync_registrations_retaining_delays(health_targets, |id| {
+                        reused_runtime_ids.contains(id)
+                    });
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.

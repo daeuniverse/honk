@@ -2086,7 +2086,7 @@ fn native_observations_exclude_legacy_and_preserve_zero_and_failures() {
     let set = AliveDialerSet::new();
     let node = id(1);
     set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
-    let registration = set.registered.read().get(&node).cloned().unwrap();
+    let registration = set.registered.read().nodes.get(&node).cloned().unwrap();
     // In the past, so a later failure is not mistaken for a pre-step sample.
     let at = std::time::SystemTime::now() - Duration::from_secs(60);
     let zero = HealthObservation::probe(
@@ -2274,7 +2274,7 @@ fn native_group_retention_has_a_fixed_slot_bound() {
     let node = id(1);
     let group = id(2);
     set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
-    let registration = set.registered.read().get(&node).cloned().unwrap();
+    let registration = set.registered.read().nodes.get(&node).cloned().unwrap();
     let epoch = set.health_epoch().unwrap();
     let observation = HealthObservation::probe(
         ProbeDomain::Tcp,
@@ -2308,7 +2308,7 @@ fn native_group_publication_invalidates_evidence_before_target_sync() {
     set.enable_health_history();
     set.register_node(id(1), "node".into(), Some("127.0.0.1:1".into()));
     set.sync_group_check_urls(&[("group".into(), "http://old.example/".into())]);
-    let registration = set.registered.read().get(&id(1)).cloned().unwrap();
+    let registration = set.registered.read().nodes.get(&id(1)).cloned().unwrap();
     let context = GroupProbeContext {
         group_id: id(2),
         member_id: id(1),

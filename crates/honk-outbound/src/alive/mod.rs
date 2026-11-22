@@ -321,6 +321,20 @@ pub struct RegisteredNode {
     pub raw_probe_address: Option<String>,
 }
 
+#[derive(Default)]
+struct Registrations {
+    nodes: HashMap<Uuid, Arc<RegisteredNode>>,
+    manual_delays: std::collections::BTreeMap<Uuid, ManualDelay>,
+}
+
+struct ManualDelay {
+    owner: std::sync::Weak<crate::runtime::NodeRuntime>,
+    ticket: Arc<()>,
+    sample: Option<ProbeMeasurement>,
+    /// A legacy sample this slot superseded when the wall clock stepped back.
+    superseded_legacy: Option<(Duration, std::time::SystemTime)>,
+}
+
 /// A single probe record for history/API consumption.
 #[derive(Debug, Clone)]
 pub struct ProbeRecord {
@@ -349,7 +363,7 @@ pub struct AliveDialerSet {
     states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
-    registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+    registered: RwLock<Registrations>,
     /// DIRECT also accepts delay evidence without a periodic registration.
     /// Removing its history invalidates those tickets under the registration lock.
     direct_removals: AtomicU64,
@@ -445,7 +459,7 @@ impl AliveDialerSet {
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
-            registered: RwLock::new(HashMap::new()),
+            registered: RwLock::default(),
             direct_removals: AtomicU64::new(0),
             health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
@@ -685,12 +699,13 @@ impl AliveDialerSet {
 
     fn register_node_locked(
         &self,
-        registered: &mut HashMap<Uuid, Arc<RegisteredNode>>,
+        registered: &mut Registrations,
         node_id: Uuid,
         name: String,
         raw_probe_address: Option<String>,
     ) {
-        registered.insert(
+        registered.manual_delays.remove(&node_id);
+        registered.nodes.insert(
             node_id,
             Arc::new(RegisteredNode {
                 name,
@@ -710,15 +725,27 @@ impl AliveDialerSet {
         &self,
         targets: HashMap<Uuid, (&str, Option<&str>)>,
     ) -> (usize, usize) {
+        self.sync_registrations_retaining_delays(targets, |_| true)
+    }
+
+    /// Publish registrations and invalidate manual delays whose ordinary leaf was replaced.
+    /// `retain` uses the caller's immutable publication data under the registration lock.
+    pub fn sync_registrations_retaining_delays(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+        mut retain: impl FnMut(&Uuid) -> bool,
+    ) -> (usize, usize) {
         let mut registered = self.registered.write();
-        let before = registered.len();
-        if registered.keys().any(|id| !targets.contains_key(id)) {
+        registered.manual_delays.retain(|id, _| retain(id));
+        let before = registered.nodes.len();
+        if registered.nodes.keys().any(|id| !targets.contains_key(id)) {
             if let Some(observations) = self.health_observations.write().as_mut() {
                 // DIRECT can have samples even if it was never registered.
-                observations
-                    .remove_nodes(|id| registered.contains_key(id) && !targets.contains_key(id));
+                observations.remove_nodes(|id| {
+                    registered.nodes.contains_key(id) && !targets.contains_key(id)
+                });
             }
-            registered.retain(|id, _| {
+            registered.nodes.retain(|id, _| {
                 if targets.contains_key(id) {
                     return true;
                 }
@@ -726,10 +753,10 @@ impl AliveDialerSet {
                 false
             });
         }
-        let removed = before - registered.len();
+        let removed = before - registered.nodes.len();
         let mut added = 0;
         for (id, (name, raw_address)) in targets {
-            if registered.get(&id).is_some_and(|node| {
+            if registered.nodes.get(&id).is_some_and(|node| {
                 node.name == name && node.raw_probe_address.as_deref() == raw_address
             }) {
                 continue;
@@ -749,6 +776,7 @@ impl AliveDialerSet {
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
         self.registered
             .read()
+            .nodes
             .iter()
             .map(|(id, node)| (*id, node.as_ref().clone()))
             .collect()
@@ -759,6 +787,7 @@ impl AliveDialerSet {
     pub fn node_name(&self, node_id: Uuid) -> String {
         self.registered
             .read()
+            .nodes
             .get(&node_id)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| node_id.to_string())
@@ -766,7 +795,8 @@ impl AliveDialerSet {
 
     pub fn remove_node(&self, node_id: Uuid) {
         let mut registered = self.registered.write();
-        registered.remove(&node_id);
+        registered.manual_delays.remove(&node_id);
+        registered.nodes.remove(&node_id);
         if let Some(observations) = self.health_observations.write().as_mut() {
             observations.remove_node(node_id);
         }
@@ -797,7 +827,7 @@ impl AliveDialerSet {
     /// fail-closed until a fresh probe succeeds, but let that verified
     /// success satisfy the recovery hysteresis immediately.
     pub fn notify_network_change(&self) {
-        let node_ids: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let node_ids: Vec<Uuid> = self.registered.read().nodes.keys().copied().collect();
         let now = Instant::now();
         {
             let mut states = self.states.write();

@@ -42,7 +42,7 @@ impl AliveDialerSet {
         latency: Option<Duration>,
     ) {
         let registered = self.registered.read();
-        if !Self::same_registration(registered.get(&node_id), registration) {
+        if !Self::same_registration(registered.nodes.get(&node_id), registration) {
             return;
         }
         let changed = match latency {
@@ -60,7 +60,7 @@ impl AliveDialerSet {
         drop(registered);
         if changed {
             self.notify_health_change(node_id, domain, ipver, latency.is_some(), || {
-                Self::same_registration(self.registered.read().get(&node_id), registration)
+                Self::same_registration(self.registered.read().nodes.get(&node_id), registration)
             });
         }
     }
@@ -87,7 +87,7 @@ impl AliveDialerSet {
         // latency ranking but never the liveness verdict (see
         // mark_unavailable_internal).
         if node_id == honk_config::config::DIRECT_NODE_ID {
-            let registration = self.registered.read().get(&node_id).cloned();
+            let registration = self.registered.read().nodes.get(&node_id).cloned();
             let target = self.direct_check_addr.read().clone();
             return self
                 .probe_node_tcp(
@@ -100,7 +100,7 @@ impl AliveDialerSet {
                 )
                 .await;
         }
-        let registered = self.registered.read().get(&node_id).cloned();
+        let registered = self.registered.read().nodes.get(&node_id).cloned();
         let Some(registered) = registered else {
             return false;
         };
@@ -315,7 +315,7 @@ impl AliveDialerSet {
             self.mark_url_probe_succeeded(tag, url);
             return true;
         }
-        let registration = self.registered.read().get(&leaf).cloned();
+        let registration = self.registered.read().nodes.get(&leaf).cloned();
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -613,7 +613,7 @@ impl AliveDialerSet {
     /// legacy TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
-        let registration = self.registered.read().get(&node_id).cloned();
+        let registration = self.registered.read().nodes.get(&node_id).cloned();
         self.probe_node_udp_registered(node_id, timeout, registration)
             .await
     }
@@ -627,7 +627,10 @@ impl AliveDialerSet {
         let Ok(permit) = self.acquire_health_probe() else {
             return false;
         };
-        if !Self::same_registration(self.registered.read().get(&node_id), registration.as_ref()) {
+        if !Self::same_registration(
+            self.registered.read().nodes.get(&node_id),
+            registration.as_ref(),
+        ) {
             return false;
         }
         // direct/block UDP liveness carries no verdict: the builtins are

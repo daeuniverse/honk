@@ -274,7 +274,8 @@ async fn cold_quic_warm_time_is_not_reported() {
             Default::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .latency;
 
         assert!(elapsed < Duration::from_millis(50), "{name}: {elapsed:?}");
     }

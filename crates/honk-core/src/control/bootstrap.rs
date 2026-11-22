@@ -327,6 +327,8 @@ impl ControlPlane {
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             pre_dns_publication_hook: parking_lot::Mutex::new(None),
+            #[cfg(all(test, feature = "clash-api"))]
+            clash_publication_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "ebpf")]
             iface_watcher: None,
         };

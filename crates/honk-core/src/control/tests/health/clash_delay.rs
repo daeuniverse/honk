@@ -98,6 +98,14 @@ impl ClashDelay {
         status: &str,
         while_pending: impl Future<Output = T>,
     ) -> ((StatusCode, Value), T) {
+        self.measure_with_reply(Some(status), while_pending).await
+    }
+
+    async fn measure_with_reply<T>(
+        &self,
+        status: Option<&str>,
+        while_pending: impl Future<Output = T>,
+    ) -> ((StatusCode, Value), T) {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = target.local_addr().unwrap();
         let probe = async {
@@ -124,8 +132,10 @@ impl ClashDelay {
                 .unwrap();
             read_head(&mut peer).await;
             let result = while_pending.await;
-            let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
-            peer.write_all(response.as_bytes()).await.unwrap();
+            if let Some(status) = status {
+                let response = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n");
+                peer.write_all(response.as_bytes()).await.unwrap();
+            }
             result
         };
         tokio::time::timeout(Duration::from_secs(10), async { tokio::join!(probe, peer) })
@@ -141,10 +151,9 @@ impl ClashDelay {
         delay
     }
 
-    async fn visible_delay(&self, name: &str) -> Option<u64> {
-        let node: Value = self
-            .client
-            .get(format!("http://{}/proxies/{name}", self.api))
+    async fn document(&self, path: &str) -> Value {
+        self.client
+            .get(format!("http://{}{path}", self.api))
             .send()
             .await
             .unwrap()
@@ -152,8 +161,11 @@ impl ClashDelay {
             .unwrap()
             .json()
             .await
-            .unwrap();
-        node["history"]
+            .unwrap()
+    }
+
+    async fn visible_delay(&self, name: &str) -> Option<u64> {
+        self.document(&format!("/proxies/{name}")).await["history"]
             .as_array()
             .unwrap()
             .first()
@@ -549,24 +561,318 @@ async fn clash_node_delay_keeps_only_retained_physical_health() {
     assert_eq!(delay.visible_delay("steady").await, Some(measured));
 
     config.groups[0].nodes = vec![honk_config::config::DIRECT_NODE_ID];
-    let warm = control.udp_warm_task.lock().await;
-    let (response, reload) = delay
-        .measure(
-            "204 No Content",
-            publish_while_warm_blocked(&control, config, || {
-                assert!(
-                    Arc::ptr_eq(&retained, &runtime()),
-                    "membership alone changed"
-                );
-                assert!(!control.alive_set.registered_nodes().contains_key(&id));
-            }),
-        )
+    let (unlocked, resume) = pause_after_publication(&control);
+    let (response, (reload, before_completion)) = delay
+        .measure("204 No Content", async {
+            let executor = tokio::runtime::Handle::current();
+            let plane = Arc::clone(&control);
+            let reload = tokio::task::spawn_blocking(move || {
+                executor.block_on(plane.reload_runtime_config(config, Default::default()))
+            });
+            unlocked.notified().await;
+            assert!(
+                Arc::ptr_eq(&retained, &runtime()),
+                "membership alone changed"
+            );
+            (reload, history().len())
+        })
         .await;
     delay.success(response);
+    assert_eq!(
+        history().len(),
+        before_completion,
+        "old delay wrote after publication"
+    );
     assert!(history().is_empty());
     assert_eq!(delay.visible_delay("steady").await, None);
-    drop(warm);
+    resume.send(()).unwrap();
     assert!(reload.await.unwrap());
+    server.abort();
+}
+
+fn pause_after_publication(
+    control: &ControlPlane,
+) -> (Arc<tokio::sync::Notify>, std::sync::mpsc::Sender<()>) {
+    let unlocked = Arc::new(tokio::sync::Notify::new());
+    let (resume_tx, resume) = std::sync::mpsc::channel();
+    *control.clash_publication_pause.lock() = Some(crate::control::ClashPublicationPause {
+        unlocked: Arc::clone(&unlocked),
+        resume,
+    });
+    (unlocked, resume_tx)
+}
+
+#[tokio::test]
+async fn clash_ungrouped_delay_only_updates_display_history() {
+    let exit = socks5_http_exit().await;
+    let node = peer_node("measured", &exit);
+    let id = node.id;
+    let mut config = urltest_config(vec![Config::builtin_block_node()]);
+    config.nodes.push(node);
+    let (control, api, server) = spawn_clash(config).await;
+    let delay = ClashDelay::new(api, Some(exit), "/proxies/measured/delay", "delay");
+    let alive = control.alive_set();
+    let (domain, family) = (ProbeDomain::Tcp, IpVersion::V4);
+    assert!(!alive.registered_nodes().contains_key(&id));
+    alive.report_unavailable_forced(id, domain, family);
+    alive.set_outbound_resolver(None);
+    alive.set_ebpf_callback(Box::new(move |node, _, _, _, _| {
+        assert_ne!(
+            node, id,
+            "display-only delay emitted a liveness notification"
+        );
+    }));
+    let average = alive.get_moving_average(id, domain, family);
+    let score = control.group_manager.read().score_cache_snapshot();
+    assert_eq!(delay.visible_delay("measured").await, None);
+
+    let mut measured = 0;
+    for _ in 0..2 {
+        let (response, ()) = delay.measure("204 No Content", async {}).await;
+        measured = delay.success(response);
+        assert_eq!(delay.visible_delay("measured").await, Some(measured));
+    }
+    let list = delay.document("/proxies").await;
+    let history = &list["proxies"]["measured"]["history"];
+    assert_eq!(history.as_array().unwrap().len(), 1);
+    assert_eq!(history[0]["delay"], measured);
+    assert!(history[0]["time"].as_str().is_some());
+    let (failed, ()) = delay.measure("503 Service Unavailable", async {}).await;
+    assert_eq!(failed.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        &delay.document("/proxies/measured").await["history"],
+        history
+    );
+    assert!(!alive.registered_nodes().contains_key(&id));
+    assert!(!alive.is_alive_for(id, domain, family));
+    assert_eq!(alive.get_moving_average(id, domain, family), average);
+    let health = alive.get_probe_history(id, domain, family);
+    assert_eq!(health.len(), 1);
+    assert!(!health[0].success);
+    assert_eq!(control.group_manager.read().score_cache_snapshot(), score);
+
+    let (response, successor) = delay
+        .measure("204 No Content", async {
+            alive.register_node(id, "measured".into(), Some("127.0.0.1:1".into()));
+            assert_eq!(delay.visible_delay("measured").await, None);
+            assert_eq!(alive.get_last_real_sample(id, domain, family), None);
+            alive.remove_node(id);
+            assert_eq!(delay.visible_delay("measured").await, None);
+            let (fresh, ()) = delay.measure("204 No Content", async {}).await;
+            let fresh = delay.success(fresh);
+            let successor = delay.document("/proxies/measured").await;
+            assert_eq!(successor["history"][0]["delay"], fresh);
+            successor
+        })
+        .await;
+    delay.success(response);
+    assert_eq!(
+        delay.document("/proxies/measured").await["history"],
+        successor["history"]
+    );
+    assert!(alive.get_probe_history(id, domain, family).is_empty());
+    server.abort();
+}
+
+#[tokio::test]
+async fn clash_ungrouped_delay_survives_publications_that_retain_its_physical_leaf() {
+    let exit = socks5_http_exit().await;
+    let node = peer_node("measured", &exit);
+    let id = node.id;
+    let mut config = urltest_config(vec![Config::builtin_block_node()]);
+    config.nodes.push(node);
+    let (control, api, server) = spawn_clash(config.clone()).await;
+    let delay = ClashDelay::new(api, Some(exit), "/proxies/measured/delay", "delay");
+    let restored = Duration::from_millis(394);
+    let restored_at = std::time::SystemTime::now() + Duration::from_secs(3600);
+    control.alive_set.restore_latency(id, restored, restored_at);
+    assert_eq!(delay.visible_delay("measured").await, Some(394));
+    // A's first HEAD has already succeeded. B publishes before A's second HEAD
+    // receives EOF, so A returns its own earlier first-round measurement.
+    let (fallback, newer) = delay
+        .measure_with_reply(None, async {
+            let (response, ()) = delay.measure("204 No Content", async {}).await;
+            let measured = delay.success(response);
+            let node = delay.document("/proxies/measured").await;
+            let history = node["history"].clone();
+            assert_eq!(history[0]["delay"], measured);
+            assert_ne!(
+                history[0]["time"],
+                chrono::DateTime::<chrono::Utc>::from(restored_at).to_rfc3339()
+            );
+            history
+        })
+        .await;
+    delay.success(fallback);
+    assert_eq!(delay.document("/proxies/measured").await["history"], newer);
+    assert_eq!(
+        delay.document("/proxies").await["proxies"]["measured"]["history"],
+        newer
+    );
+
+    for full_reload in [false, true] {
+        let before = delay.document("/proxies/measured").await;
+        let generation = control.runtime_registry.read().generation();
+        let (response, ()) = delay
+            .measure("204 No Content", async {
+                if full_reload {
+                    config.nodes.push(Config::builtin_direct_node());
+                    reload(&control, config.clone()).await;
+                } else {
+                    control.reload_group_manager().await;
+                }
+                assert_eq!(
+                    control.runtime_registry.read().generation() != generation,
+                    full_reload
+                );
+                assert!(!control.alive_set.registered_nodes().contains_key(&id));
+                assert_eq!(
+                    delay.document("/proxies/measured").await["history"],
+                    before["history"]
+                );
+            })
+            .await;
+        let measured = delay.success(response);
+        let after = delay.document("/proxies/measured").await;
+        assert_eq!(after["history"][0]["delay"], measured);
+        assert_ne!(after["history"][0]["time"], before["history"][0]["time"]);
+    }
+    assert_eq!(
+        control
+            .alive_set
+            .get_last_real_sample(id, ProbeDomain::Tcp, IpVersion::V4),
+        Some((restored, restored_at))
+    );
+    assert!(
+        control
+            .alive_set
+            .get_probe_history(id, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn clash_ungrouped_delay_cannot_credit_a_replaced_or_removed_leaf() {
+    let exit = socks5_http_exit().await;
+    let mut config = urltest_config(vec![Config::builtin_block_node()]);
+    config.nodes.push(peer_node("measured", &exit));
+    let id = config.nodes[1].id;
+    let (control, api, server) = spawn_clash(config.clone()).await;
+    let delay = ClashDelay::new(api, Some(exit), "/proxies/measured/delay", "delay");
+    let (response, ()) = delay.measure("204 No Content", async {}).await;
+    let measured = delay.success(response);
+    assert_eq!(delay.visible_delay("measured").await, Some(measured));
+    config.nodes[1].tags.push("replacement".into());
+    let (response, ()) = delay
+        .measure("204 No Content", async {
+            reload(&control, config.clone()).await;
+            assert_eq!(delay.visible_delay("measured").await, None);
+        })
+        .await;
+    delay.success(response);
+    assert_eq!(delay.visible_delay("measured").await, None);
+    let (response, ()) = delay.measure("204 No Content", async {}).await;
+    let measured = delay.success(response);
+    assert_eq!(delay.visible_delay("measured").await, Some(measured));
+
+    // Only the manager changes. Removing and restoring the leaf here keeps
+    // the same registry runtime throughout, so a runtime check alone would pass.
+    let (response, ()) = delay
+        .measure("204 No Content", async {
+            let mut absent = config.clone();
+            absent.nodes.retain(|node| node.id != id);
+            *control.config.write().await = Arc::new(absent);
+            control.reload_group_manager().await;
+            *control.config.write().await = Arc::new(config.clone());
+            control.reload_group_manager().await;
+        })
+        .await;
+    delay.success(response);
+    assert_eq!(delay.visible_delay("measured").await, None);
+
+    let (response, ()) = delay
+        .measure("204 No Content", async {
+            let mut removed = config.clone();
+            removed.nodes.retain(|node| node.id != id);
+            reload(&control, removed).await;
+        })
+        .await;
+    delay.success(response);
+    let removed = delay
+        .client
+        .get(format!("http://{api}/proxies/measured"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::NOT_FOUND);
+    reload(&control, config).await;
+    assert_eq!(delay.visible_delay("measured").await, None);
+    assert!(
+        control
+            .alive_set
+            .get_probe_history(id, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild() {
+    let old_exit = socks5_http_exit().await;
+    let new_exit = socks5_http_exit().await;
+    let old = peer_node("old", &old_exit);
+    let new = peer_node("new", &new_exit);
+    let (old_id, new_id) = (old.id, new.id);
+    let mut config = urltest_config(vec![old]);
+    config.nodes.push(new);
+    let (control, api, server) = spawn_clash(config).await;
+    let mut delay = ClashDelay::new(api, Some(old_exit), "/group/pool/delay", "old");
+    let generation = control.runtime_registry.read().generation();
+    let (unlocked, resume_tx) = pause_after_publication(&control);
+    let (response, rebuild) = delay
+        .measure("204 No Content", async {
+            Arc::make_mut(&mut *control.config.write().await).groups[0].nodes = vec![new_id];
+            let runtime = tokio::runtime::Handle::current();
+            let plane = Arc::clone(&control);
+            let rebuild = tokio::task::spawn_blocking(move || {
+                runtime.block_on(plane.reload_group_manager());
+            });
+            unlocked.notified().await;
+            rebuild
+        })
+        .await;
+    delay.success(response);
+    assert_eq!(control.runtime_registry.read().generation(), generation);
+    assert_eq!(delay.visible_delay("old").await, None);
+    assert!(
+        control
+            .alive_set
+            .get_probe_history(old_id, ProbeDomain::Tcp, IpVersion::V4)
+            .is_empty()
+    );
+    assert_eq!(
+        control.group_manager.read().get_urltest_selection("pool"),
+        None
+    );
+    assert!(control.alive_set.is_urltest_group_idle("pool"));
+    resume_tx.send(()).unwrap();
+    rebuild.await.unwrap();
+
+    delay.exit = Some(new_exit);
+    delay.result_name = "new";
+    let (response, ()) = delay.measure("204 No Content", async {}).await;
+    let measured = delay.success(response);
+    assert_eq!(delay.visible_delay("new").await, Some(measured));
+    assert_eq!(
+        control
+            .group_manager
+            .read()
+            .get_urltest_selection("pool")
+            .as_deref(),
+        Some("new")
+    );
+    assert!(!control.alive_set.is_urltest_group_idle("pool"));
     server.abort();
 }
 

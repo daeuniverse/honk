@@ -335,10 +335,16 @@ impl ControlPlane {
         }
         let targets = health_registrations(&config, &build_outbound_id_map(&config));
         let (added, removed) = {
+            // Drop in reverse declaration order so the paused test observes an unlocked manager.
+            #[cfg(all(test, feature = "clash-api"))]
+            let _after_unlock = self.clash_publication_pause.lock().take();
             let mut group_manager = self.group_manager.write();
             new_gm.publish_score_membership();
             *group_manager = Arc::new(new_gm);
-            self.alive_set.sync_registrations(targets)
+            self.alive_set
+                .sync_registrations_retaining_delays(targets, |id| {
+                    group_manager.retains_manual_delay(id, &runtimes)
+                })
         };
 
         // Refresh the URLTest idle table to match the published membership.

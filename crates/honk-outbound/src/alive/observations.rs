@@ -1,4 +1,6 @@
-use super::{AliveDialerSet, IpVersion, ProbeDomain, RegisteredNode};
+use super::{AliveDialerSet, IpVersion, ManualDelay, ProbeDomain, RegisteredNode, Registrations};
+use crate::runtime::{NodeRuntime, OutboundRuntimeRegistry, SharedRuntimeRegistry};
+use honk_config::{node::Node, types::NodeProtocol};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -77,6 +79,7 @@ pub struct GroupProbeContext {
 pub struct ProbeTicket {
     node: Uuid,
     registration: Option<Arc<RegisteredNode>>,
+    manual_delay: Option<Arc<()>>,
     direct_removals: u64,
     group_epoch: Option<Uuid>,
 }
@@ -153,8 +156,12 @@ pub(super) struct HealthHistory {
 
 /// An earlier wall time is a stale completion, unless the retained sample is
 /// itself in the future: the clock stepped back since it was taken.
-fn stale(observation: &HealthObservation, retained: &HealthObservation) -> bool {
-    observation.observed_at < retained.observed_at && retained.observed_at <= SystemTime::now()
+fn stale(
+    observed_at: SystemTime,
+    retained_at: SystemTime,
+    now: impl FnOnce() -> SystemTime,
+) -> bool {
+    observed_at < retained_at && retained_at <= now()
 }
 
 impl HealthHistory {
@@ -167,7 +174,11 @@ impl HealthHistory {
         });
         match hit {
             Some(index) => {
-                if stale(&sample.observation, &self.groups[index].observation) {
+                if stale(
+                    sample.observation.observed_at,
+                    self.groups[index].observation.observed_at,
+                    SystemTime::now,
+                ) {
                     return false;
                 }
                 self.groups[index] = sample;
@@ -261,6 +272,39 @@ impl HealthObservation {
     }
 }
 
+impl ManualDelay {
+    fn new(owner: &Arc<NodeRuntime>) -> Self {
+        Self {
+            owner: Arc::downgrade(owner),
+            ticket: Arc::new(()),
+            sample: None,
+            superseded_legacy: None,
+        }
+    }
+
+    fn belongs_to(&self, runtime: &Arc<NodeRuntime>) -> bool {
+        std::ptr::eq(self.owner.as_ptr(), Arc::as_ptr(runtime))
+    }
+
+    fn record(
+        &mut self,
+        measurement: ProbeMeasurement,
+        legacy: Option<(Duration, SystemTime)>,
+        now: SystemTime,
+    ) {
+        if self
+            .sample
+            .is_some_and(|last| stale(measurement.observed_at, last.observed_at, || now))
+        {
+            return;
+        }
+        if legacy != self.superseded_legacy {
+            self.superseded_legacy = legacy.filter(|(_, at)| *at > now);
+        }
+        self.sample = Some(measurement);
+    }
+}
+
 impl AliveDialerSet {
     /// Allocate retention only for an enabled native listener.
     pub fn enable_health_history(&self) {
@@ -273,10 +317,14 @@ impl AliveDialerSet {
     }
 
     pub fn probe_ticket(&self, node: Uuid) -> ProbeTicket {
-        let registered = self.registered.read();
+        self.probe_ticket_locked(node, &self.registered.read())
+    }
+
+    fn probe_ticket_locked(&self, node: Uuid, registered: &Registrations) -> ProbeTicket {
         ProbeTicket {
             node,
-            registration: registered.get(&node).cloned(),
+            registration: registered.nodes.get(&node).cloned(),
+            manual_delay: None,
             direct_removals: if node == honk_config::config::DIRECT_NODE_ID {
                 self.direct_removals.load(Ordering::Relaxed)
             } else {
@@ -286,6 +334,62 @@ impl AliveDialerSet {
         }
     }
 
+    /// Capture a scalar Clash request against its published physical leaf. An
+    /// ephemeral URL-test runtime cannot authorize a new history entry.
+    pub fn clash_node_ticket(
+        &self,
+        node: &Node,
+        published: &SharedRuntimeRegistry,
+    ) -> (Arc<OutboundRuntimeRegistry>, ProbeTicket) {
+        let current = published.read();
+        let ticket = self.probe_ticket(node.id);
+        if ticket.registration.is_some()
+            || matches!(
+                node.protocol(),
+                NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Chain
+            )
+        {
+            return (Arc::clone(&current), ticket);
+        }
+        let Some(runtime) = current.get_ref(&node.id).filter(|r| r.matches_config(node)) else {
+            return (Arc::clone(&current), ticket);
+        };
+        let mut registered = self.registered.write();
+        let mut ticket = self.probe_ticket_locked(node.id, &registered);
+        if ticket.registration.is_none() {
+            let slot = registered
+                .manual_delays
+                .entry(node.id)
+                .or_insert_with(|| ManualDelay::new(runtime));
+            if !slot.belongs_to(runtime) {
+                *slot = ManualDelay::new(runtime);
+            }
+            ticket.manual_delay = Some(Arc::clone(&slot.ticket));
+        }
+        (Arc::clone(&current), ticket)
+    }
+
+    /// The scalar Clash history may also contain a restored or traffic sample.
+    pub fn clash_node_latency(
+        &self,
+        node: Uuid,
+        current: &OutboundRuntimeRegistry,
+    ) -> Option<(Duration, SystemTime)> {
+        let registered = self.registered.read();
+        let legacy = self.get_last_real_sample(node, ProbeDomain::Tcp, IpVersion::V4);
+        if let Some(slot) = registered.manual_delays.get(&node)
+            && let Some(sample) = slot.sample
+            && current
+                .get_ref(&node)
+                .is_some_and(|runtime| slot.belongs_to(runtime))
+            && (legacy == slot.superseded_legacy
+                || legacy.is_none_or(|(_, at)| at <= sample.observed_at))
+        {
+            return Some((sample.latency, sample.observed_at));
+        }
+        legacy
+    }
+
     /// A retained node keeps its delay evidence across an unrelated reload.
     /// Both its physical dial path and its health registration must still match.
     pub fn record_urltest_latency(
@@ -293,8 +397,22 @@ impl AliveDialerSet {
         published: &crate::runtime::SharedRuntimeRegistry,
         generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
         ticket: &ProbeTicket,
-        latency: Duration,
+        measurement: ProbeMeasurement,
     ) {
+        if let Some(captured) = &ticket.manual_delay {
+            let current = published.read();
+            let mut registered = self.registered.write();
+            if let Some(slot) = registered.manual_delays.get_mut(&ticket.node)
+                && Arc::ptr_eq(captured, &slot.ticket)
+                && let Some(runtime) = current.get_ref(&ticket.node)
+                && slot.belongs_to(runtime)
+            {
+                let legacy =
+                    self.get_last_real_sample(ticket.node, ProbeDomain::Tcp, IpVersion::V4);
+                slot.record(measurement, legacy, SystemTime::now());
+            }
+            return;
+        }
         let current = || {
             let runtime = published.read();
             if !runtime.retains_dial_path(generation, &ticket.node) {
@@ -314,7 +432,13 @@ impl AliveDialerSet {
         };
         let domain = ProbeDomain::Tcp;
         let family = IpVersion::V4;
-        let revived = self.record_probe_latency_state(ticket.node, domain, family, latency, false);
+        let revived = self.record_probe_latency_state(
+            ticket.node,
+            domain,
+            family,
+            measurement.latency,
+            false,
+        );
         drop(authority);
         if revived {
             self.notify_health_change(ticket.node, domain, family, true, || current().is_some());
@@ -325,9 +449,9 @@ impl AliveDialerSet {
         &self,
         node: Uuid,
         captured: Option<&Arc<RegisteredNode>>,
-    ) -> Option<parking_lot::RwLockReadGuard<'_, HashMap<Uuid, Arc<RegisteredNode>>>> {
+    ) -> Option<parking_lot::RwLockReadGuard<'_, Registrations>> {
         let registered = self.registered.read();
-        (Self::same_registration(registered.get(&node), captured)
+        (Self::same_registration(registered.nodes.get(&node), captured)
             && (captured.is_some() || node == honk_config::config::DIRECT_NODE_ID))
             .then_some(registered)
     }
@@ -421,7 +545,11 @@ impl AliveDialerSet {
             .iter_mut()
             .find(|old| old.observation.same_key(&observation))
         {
-            if stale(&observation, &previous.observation) {
+            if stale(
+                observation.observed_at,
+                previous.observation.observed_at,
+                SystemTime::now,
+            ) {
                 return false;
             }
             // A replay at the same instant must not weigh twice.
@@ -521,6 +649,94 @@ impl AliveDialerSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clash_manual_delay_stays_ahead_of_the_same_restored_sample_after_clock_catches_up() {
+        let node = Node::from_share_link("socks5://127.0.0.1:1080#measured").unwrap();
+        let set = AliveDialerSet::new();
+        let published = OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap()
+            .into_shared();
+        let (generation, ticket) = set.clash_node_ticket(&node, &published);
+        let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+        let ms = Duration::from_millis;
+        set.restore_latency(node.id, ms(394), at(20));
+        let legacy = set.get_last_real_sample(node.id, ProbeDomain::Tcp, IpVersion::V4);
+        let manual = ProbeMeasurement {
+            latency: ms(17),
+            observed_at: at(10),
+        };
+        set.registered
+            .write()
+            .manual_delays
+            .get_mut(&node.id)
+            .unwrap()
+            .record(manual, legacy, at(11));
+
+        // Both wall times are now in the past. Reads must honor the decision made at 11.
+        let displayed = || set.clash_node_latency(node.id, &published.read());
+        assert_eq!(displayed(), Some((ms(17), at(10))));
+        let later = ProbeMeasurement {
+            latency: ms(19),
+            observed_at: at(12),
+        };
+        set.record_urltest_latency(&published, &generation, &ticket, later);
+        assert_eq!(displayed(), Some((ms(19), at(12))));
+
+        // A different real sample may legitimately have the same wall time.
+        set.restore_latency(node.id, ms(225), at(20));
+        assert_eq!(displayed(), Some((ms(225), at(20))));
+    }
+
+    #[test]
+    fn clash_display_slots_require_a_matching_published_runtime_and_prune_without_reads() {
+        let node = Node::from_share_link("socks5://127.0.0.1:1080#measured").unwrap();
+        let set = AliveDialerSet::new();
+        let build = || OutboundRuntimeRegistry::build(std::slice::from_ref(&node)).unwrap();
+        let published = build().into_shared();
+        let mut missing = node.clone();
+        missing.id = Uuid::new_v4();
+        let mut changed = node.clone();
+        changed.tags.push("other-owner".into());
+        for unadmitted in [missing, changed] {
+            let (_, ticket) = set.clash_node_ticket(&unadmitted, &published);
+            assert!(ticket.manual_delay.is_none());
+        }
+        assert!(set.registered.read().manual_delays.is_empty());
+
+        let (generation, ticket) = set.clash_node_ticket(&node, &published);
+        let newer = ProbeMeasurement {
+            latency: Duration::from_millis(17),
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(2),
+        };
+        let older = ProbeMeasurement {
+            latency: Duration::from_millis(31),
+            observed_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        set.record_urltest_latency(&published, &generation, &ticket, newer);
+        set.record_urltest_latency(&published, &generation, &ticket, older);
+        let first = (newer.latency, newer.observed_at);
+        assert_eq!(
+            set.clash_node_latency(node.id, &published.read()),
+            Some(first)
+        );
+        *published.write() = Arc::new(build());
+        assert_eq!(set.clash_node_latency(node.id, &published.read()), None);
+        let after_swap = ProbeMeasurement {
+            observed_at: SystemTime::now(),
+            ..older
+        };
+        set.record_urltest_latency(&published, &generation, &ticket, after_swap);
+        let kept = set.registered.read().manual_delays[&node.id]
+            .sample
+            .unwrap();
+        assert_eq!((kept.latency, kept.observed_at), first);
+
+        let (_, pending) = set.clash_node_ticket(&node, &published);
+        assert!(pending.manual_delay.is_some());
+        set.sync_registrations_retaining_delays(HashMap::new(), |_| false);
+        assert!(set.registered.read().manual_delays.is_empty());
+    }
 
     fn sample() -> HealthObservation {
         HealthObservation::probe(
@@ -703,7 +919,7 @@ mod tests {
             assert!(!set.complete_probe(&ticket, None, newer));
             assert!(!set.complete_probe(&invalidated, None, newer));
             assert_eq!(set.health_observations(node), [sample()]);
-            let registration = set.registered.read().get(&node).cloned();
+            let registration = set.registered.read().nodes.get(&node).cloned();
             set.record_health_observation(node, registration.as_ref(), newer);
             assert_eq!(set.health_observations(node), [newer]);
             set.sync_group_check_urls(&[]);

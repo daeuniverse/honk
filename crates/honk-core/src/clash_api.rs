@@ -501,16 +501,18 @@ fn build_group_proxy_info(
 ///
 /// Includes the per-node delay history (clash `{time, delay}` shape) so
 /// dashboards can render per-node latencies — group members included.
-fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json::Value {
+fn build_node_proxy_info(
+    node: &Node,
+    alive: &AliveDialerSet,
+    registry: &honk_outbound::runtime::OutboundRuntimeRegistry,
+) -> serde_json::Value {
     let mut info = serde_json::json!({
         "name": node.name,
         "type": clash_protocol_type(node.protocol()),
         "udp": true,
         "history": [],
     });
-    if let Some((latency, at)) =
-        alive_set.get_last_real_sample(node.id, ProbeDomain::Tcp, IpVersion::V4)
-    {
+    if let Some((latency, at)) = alive.clash_node_latency(node.id, registry) {
         let ms = latency.as_millis() as u64;
         info["history"] = serde_json::json!([delay_history_entry(ms, at)]);
     }
@@ -564,9 +566,14 @@ async fn get_proxies(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     // Emit every node as a top-level proxy — including group members. Clash
     // dashboards resolve group members through these entries to display node
     // names and per-node delay history (real Clash behaves the same way).
+    let registry = s.runtime_registry.read();
     for node in &config.nodes {
-        proxies.insert(node.name.clone(), build_node_proxy_info(node, &s.alive_set));
+        proxies.insert(
+            node.name.clone(),
+            build_node_proxy_info(node, &s.alive_set, &registry),
+        );
     }
+    drop(registry);
 
     for group in &config.groups {
         proxies.insert(
@@ -597,7 +604,12 @@ async fn get_proxy(State(s): State<Arc<ClashState>>, Path(name): Path<String>) -
     }
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name) {
-        return Json(build_node_proxy_info(node, &s.alive_set)).into_response();
+        return Json(build_node_proxy_info(
+            node,
+            &s.alive_set,
+            &s.runtime_registry.read(),
+        ))
+        .into_response();
     }
 
     error_response(StatusCode::NOT_FOUND, "proxy not found")
@@ -744,9 +756,8 @@ fn reselect_urltest(s: &ClashState, captured: &Arc<GroupManager>, name: &str) {
 }
 
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
-/// through the node / group members). Successes for current registrations
-/// refresh the alive-set history. Errors return 503 without changing real
-/// dial failure streaks.
+/// through the node / group members). Successful scalar measurements of an
+/// unregistered ordinary leaf are display-only. Errors return 503.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -768,9 +779,11 @@ async fn proxy_delay(
     let config = s.config.read().await;
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
-        let group_manager = s.group_manager.read().clone();
-        let generation = s.runtime_registry.read().clone();
-        let ticket = s.alive_set.probe_ticket(node.id);
+        let (group_manager, generation, ticket) = {
+            let manager = s.group_manager.read();
+            let (generation, ticket) = s.alive_set.clash_node_ticket(&node, &s.runtime_registry);
+            (Arc::clone(&manager), generation, ticket)
+        };
         drop(config);
         let Some(entry) = s.proxy_registry.find(node.protocol()) else {
             return error_response(
@@ -792,14 +805,14 @@ async fn proxy_delay(
         )
         .await;
         return match measured {
-            Ok(latency) => {
+            Ok(measurement) => {
                 s.alive_set.record_urltest_latency(
                     &s.runtime_registry,
                     &generation,
                     &ticket,
-                    latency,
+                    measurement,
                 );
-                Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
+                Json(serde_json::json!({"delay": delay_ms(measurement.latency)})).into_response()
             }
             Err(e) => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -851,13 +864,17 @@ async fn group_delay(
         };
         return error_response(StatusCode::NOT_FOUND, reason);
     }
-    let group_manager = s.group_manager.read().clone();
-    let members = group_manager.delay_test_members(name);
+    let members;
+    let (group_manager, generation, leaves) = {
+        let manager = s.group_manager.read();
+        let registry = s.runtime_registry.read();
+        members = manager.delay_test_members(name);
+        let leaves = capture_delay_leaves(&s.alive_set, &members);
+        (Arc::clone(&manager), Arc::clone(&registry), leaves)
+    };
     if members.is_empty() && matches!(view, GroupDelayView::Selected) {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
     }
-    let leaves = capture_delay_leaves(&s.alive_set, &members);
-    let generation = s.runtime_registry.read().clone();
     drop(config);
     let results = urltest_group_with_feedback(
         &leaves,
@@ -1714,6 +1731,7 @@ async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_jso
     let config = s.config.read().await;
     let gm = s.group_manager.read().clone();
     let mut providers = serde_json::Map::new();
+    let registry = s.runtime_registry.read();
 
     for group in &config.groups {
         let members = gm.delay_test_members(&group.name);
@@ -1724,7 +1742,7 @@ async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_jso
         let proxies: Vec<serde_json::Value> = members
             .iter()
             .map(|(tag, leaf)| {
-                let mut info = build_node_proxy_info(leaf, &s.alive_set);
+                let mut info = build_node_proxy_info(leaf, &s.alive_set, &registry);
                 info["name"] = serde_json::Value::String(tag.clone());
                 info
             })
