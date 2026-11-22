@@ -3,9 +3,10 @@ use futures::FutureExt;
 use std::future::{Future, pending};
 use tokio::io::BufWriter;
 use tokio::sync::{mpsc, oneshot};
-use tokio::time::{Instant, sleep, timeout};
+use tokio::time::{Instant, sleep, sleep_until, timeout};
 
 const WINDOW: Duration = splice::DRAIN_DEADLINE;
+const DEADLINE_MARGIN: Duration = Duration::from_millis(10);
 // Step past each 100 ms idle sample, including the timer's millisecond rounding.
 const SAMPLE_STEP: Duration = Duration::from_millis(101);
 const LAST: &[u8] = b"ok";
@@ -289,7 +290,12 @@ async fn idle_before_eof_stays_open_and_accepted_short_writes_renew_the_drain() 
 
 #[tokio::test(start_paused = true)]
 async fn a_read_without_a_write_renews_once_and_the_cut_reports_only_accepted_bytes() {
-    for upload in [true, false] {
+    for (upload, read_delay) in [
+        (true, WINDOW * 3 / 4),
+        (false, WINDOW * 3 / 4),
+        (true, WINDOW * 2),
+        (false, WINDOW * 2),
+    ] {
         let (mut receiver, destination) = tokio::io::duplex(3);
         let (source, mut sender) = tokio::io::duplex(64);
         let (client, proxy) = if upload {
@@ -307,19 +313,23 @@ async fn a_read_without_a_write_renews_once_and_the_cut_reports_only_accepted_by
         counters.assert_counts(accepted, accepted);
 
         receiver.shutdown().await.unwrap();
-        assert_pending_for(relay.as_mut(), WINDOW * 3 / 4).await;
+        assert!(futures::poll!(relay.as_mut()).is_pending());
+        // Hold the relay unpolled until fresh bytes arrive, even past the initial deadline.
+        sleep(read_delay).await;
         let read_at = Instant::now();
         sender.write_all(b"45678").await.unwrap();
         assert!(futures::poll!(relay.as_mut()).is_pending());
         let live = directional_counts(upload, 25, 0);
         counters.assert_counts(live, accepted);
-        assert_pending_for(relay.as_mut(), WINDOW / 2).await;
+        sleep_until(read_at + WINDOW - DEADLINE_MARGIN).await;
+        assert!(futures::poll!(relay.as_mut()).is_pending());
 
-        let stats = timeout(WINDOW * 3 / 4, relay)
-            .await
-            .expect("a blocked write extended the renewed window again")
+        sleep_until(read_at + WINDOW).await;
+        let stats = relay
+            .as_mut()
+            .now_or_never()
+            .expect("a blocked write extended the renewed deadline")
             .unwrap();
-        assert!(read_at.elapsed() >= WINDOW);
         assert_eq!(
             (stats.client_to_proxy, stats.proxy_to_client),
             directional_counts(upload, 3, 0)
@@ -468,21 +478,21 @@ async fn final_flush_reset_ready_at_idle_expiry_keeps_its_errno_and_origin() {
         tokio::pin!(silent, reset);
 
         let start = Instant::now();
-        let control = loop {
-            if let Some(result) = silent.as_mut().now_or_never() {
-                break result.unwrap();
-            }
-            assert!(reset.as_mut().now_or_never().is_none());
-            assert!(
-                start.elapsed() < WINDOW * 3 / 2,
-                "silent relay did not cut off"
-            );
-            sleep(SAMPLE_STEP).await;
-        };
-        assert!(start.elapsed() >= WINDOW);
+        assert!(silent.as_mut().now_or_never().is_none());
+        assert!(reset.as_mut().now_or_never().is_none());
+        sleep_until(start + WINDOW - DEADLINE_MARGIN).await;
+        assert!(silent.as_mut().now_or_never().is_none());
+        assert!(reset.as_mut().now_or_never().is_none());
+
+        sleep_until(start + WINDOW).await;
+        let control = silent
+            .as_mut()
+            .now_or_never()
+            .expect("a delayed idle sample moved the first EOF deadline")
+            .unwrap();
         assert_eq!(control.total_bytes, LAST.len() as u64);
 
-        // Time stays frozen between the control cutoff and the reset relay's same sample.
+        // Both the reset and the cutoff are ready at this same deadline.
         release_reset.send(()).unwrap();
         let result = reset
             .as_mut()

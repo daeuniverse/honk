@@ -479,8 +479,7 @@ where
     let cutoff = async {
         // Reset the idle budget only for byte movement at the copy boundary.
         eof.notified().await;
-        let progress = || (upload.snapshot(), download.snapshot());
-        drain_idle(progress(), progress).await;
+        drain::drain_copy_idle(&upload, &download).await;
     };
     // A pending codec can exhaust the copy task's budget before the timer is polled.
     tokio::select! {
