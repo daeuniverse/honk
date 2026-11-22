@@ -136,6 +136,11 @@ async fn establish(client: &Endpoint, server: &Endpoint) -> (Connection, Connect
 }
 
 async fn connected() -> (Connection, Connection, Arc<Gate>) {
+    let (_, client, server, gate) = connected_with_endpoint().await;
+    (client, server, gate)
+}
+
+async fn connected_with_endpoint() -> (Endpoint, Connection, Connection, Arc<Gate>) {
     let runtime = quinn::default_runtime().unwrap();
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     socket.set_nonblocking(true).unwrap();
@@ -153,7 +158,7 @@ async fn connected() -> (Connection, Connection, Arc<Gate>) {
             .unwrap();
     let (server, _) = quic::testutil::server_endpoint(&[b"h3"], true).unwrap();
     let (client, server) = establish(&endpoint, &server).await;
-    (client, server, gate)
+    (endpoint, client, server, gate)
 }
 
 async fn stream(client: &Connection) -> QuicBiStream {
@@ -839,5 +844,6 @@ async fn full_task_owner_survives_observed_final_quic_write() {
 }
 
 mod grpc;
+mod pending_error;
 #[cfg(feature = "rprx")]
 mod vmess;
