@@ -213,27 +213,25 @@ impl Node {
         Ok(())
     }
 
+    pub fn xhttp_download(&self) -> Option<&XhttpDownload> {
+        self.transport()?.xhttp.as_ref()?.download.as_deref()
+    }
+
     /// The XHTTP download peer as its own dial target. Only protocol
     /// credentials and upload-only request options carry over; TLS is rebuilt
     /// so upload pins, insecure verification, ECH and REALITY never apply.
     pub fn xhttp_download_view(&self) -> Option<Node> {
-        let download = self
-            .transport()?
-            .xhttp
-            .as_ref()?
-            .download
-            .as_deref()?
-            .clone();
+        self.xhttp_download()?;
         let mut view = self.clone();
-        view.address = format!("{}:{}", download.address, download.port);
-        view.host = download.address;
-        view.port = download.port;
         let options = view.transport_mut()?.xhttp.as_mut()?;
+        let download = options.download.take()?;
         options.path = download.path;
         options.host = download.host;
         options.headers.clear();
         options.x_padding_bytes = download.x_padding_bytes;
-        options.download = None;
+        view.address = format!("{}:{}", download.address, download.port);
+        view.host = download.address;
+        view.port = download.port;
         *view.tls_mut()? = TlsOptions {
             enabled: true,
             sni: download.server_name,

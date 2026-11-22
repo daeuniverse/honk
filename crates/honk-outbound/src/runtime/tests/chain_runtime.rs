@@ -92,3 +92,58 @@ fn unresolved_hops_fail_admission() {
         Err(RuntimeRegistryError::Admission(_))
     ));
 }
+
+#[cfg(feature = "owned-tasks")]
+#[tokio::test]
+async fn private_chain_close_joins_hop_work_and_leaves_reused_registry_children_live() {
+    use futures_util::FutureExt as _;
+
+    let nodes = nodes();
+    let (first, _) =
+        OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(&nodes, 1, 1, 1, true, None)
+            .unwrap();
+    let mut stale = Node::chain_from_nodes("via", &[&nodes[2], &nodes[1]]).unwrap();
+    stale.id = nodes[0].id;
+    assert!(matches!(
+        first.try_ephemeral_guarded(&stale),
+        Err(RuntimeRegistryError::ChainBinding)
+    ));
+    let mut guard = first.try_ephemeral_guarded(&nodes[0]).unwrap();
+    let private = guard.runtime();
+    let admitted = first.get(&nodes[0].id).unwrap();
+    assert!(!Arc::ptr_eq(&private, &admitted));
+    assert_eq!(private.chain_hops().len(), admitted.chain_hops().len());
+    for (hop, live) in private.chain_hops().iter().zip(admitted.chain_hops()) {
+        assert_eq!(hop.node.id, live.node.id);
+        assert!(!Arc::ptr_eq(hop, live));
+    }
+
+    let (started, ready) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let worker = private.chain_hops()[1]
+        .task_owner
+        .as_ref()
+        .unwrap()
+        .spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = released.recv();
+        })
+        .unwrap();
+    let live = admitted.chain_hops()[0]
+        .task_scope()
+        .spawn(std::future::pending())
+        .unwrap();
+    ready.await.unwrap();
+    assert!(guard.close().now_or_never().is_none());
+    release.send(()).unwrap();
+    guard.close().await.unwrap();
+    assert!(worker.is_finished());
+
+    let (next, reused) = OutboundRuntimeRegistry::build_reusing(&nodes, 1, Some(&first)).unwrap();
+    first.mark_moved_out(reused);
+    first.retire_reusable_state().await;
+    first.shutdown().await;
+    assert!(!live.is_finished());
+    next.shutdown().await;
+    assert!(live.is_finished());
+}

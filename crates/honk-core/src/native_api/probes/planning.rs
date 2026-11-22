@@ -2,6 +2,7 @@ use super::*;
 use crate::dns::PinnedNameResolver;
 use crate::observe::catalog::member_id;
 use honk_config::group::GroupPolicy;
+use honk_outbound::runtime::PinnedServers;
 
 pub(super) struct Specification {
     pub(super) target: Target,
@@ -19,7 +20,7 @@ pub(super) struct Candidate {
 pub(super) struct Attempt {
     pub(super) candidate: Candidate,
     pub(super) addr: SocketAddr,
-    pub(super) server: Option<IpAddr>,
+    pub(super) servers: PinnedServers,
 }
 pub(super) struct AddressUnavailable {
     pub(super) rows: Vec<usize>,
@@ -93,7 +94,9 @@ pub(super) async fn capture(state: &NativeState, request: ProbeRequest) -> Resul
     let identity = state.observation.core.catalog.snapshot();
     let dns = state
         .dns
-        .pin_name_resolution()
+        .pin_name_resolution(honk_outbound::bootstrap::BootstrapResolver::parse(
+            &config.global.bootstrap_resolver,
+        ))
         .map_err(|_| state.require_running().err().unwrap_or_else(unavailable))?;
     let result = plan(state, request, config, manager, registry, identity, dns);
     drop(config_guard);
@@ -420,13 +423,19 @@ pub(super) fn selections(
     }
 }
 
+#[derive(Default)]
+struct ResolvedHosts {
+    ordinary: HashMap<String, Vec<IpAddr>>,
+    physical_aliases: HashMap<String, Vec<IpAddr>>,
+}
+
 pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
     let Plan {
         context,
         result,
         candidates,
     } = plan;
-    let mut resolved = HashMap::new();
+    let mut resolved = ResolvedHosts::default();
     let mut attempts = Vec::with_capacity(candidates.len());
     let mut skipped = Vec::new();
     for candidate in candidates {
@@ -445,6 +454,7 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
             &context.dns,
             &mut resolved,
             host,
+            false,
             "Resolving the probe destination was refused locally",
         )
         .await?;
@@ -453,24 +463,28 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
             .copied()
             .find(|&ip| candidate.family.matches(ip))
             .map(|ip| SocketAddr::new(ip, port));
-        // Direct dials the destination itself, and a chain's first hop resolves
-        // its own server inside the chain dial.
+        // Only the physical entry dials a node server locally. Later hops are
+        // reached through their preceding hop, which handles any domain name.
         let needs_server = context.spec.kind != Kind::TcpConnect
-            && !matches!(
-                candidate.node.protocol(),
-                honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Chain
-            );
-        let server = if needs_server {
-            let ips = resolve(
-                &context.dns,
-                &mut resolved,
-                candidate.node.host(),
-                "Resolving the probed node's server was refused locally",
-            )
-            .await?;
-            ips.first().copied()
+            && candidate.node.protocol() != honk_config::types::NodeProtocol::Direct;
+        let servers = if needs_server {
+            let chain = if is_chain(&candidate.node) {
+                Some(
+                    context
+                        .registry
+                        .get(&candidate.node.id)
+                        .ok_or_else(missing_entry)?,
+                )
+            } else {
+                None
+            };
+            let entry = match &chain {
+                Some(chain) => chain.chain_entry_node().ok_or_else(missing_entry)?,
+                None => &candidate.node,
+            };
+            resolve_servers(&context.dns, &mut resolved, entry).await?
         } else {
-            None
+            Some(PinnedServers::default())
         };
         if candidate.transport == Transport::Udp
             && !honk_outbound::descriptor::udp_target_allowed(&candidate.node, port)
@@ -480,14 +494,12 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 json!({"field":"transport","allowed":["tcp"]}),
             ));
         }
-        match addr {
-            Some(addr) if !needs_server || server.is_some() => {
-                attempts.push(Attempt {
-                    candidate,
-                    addr,
-                    server,
-                });
-            }
+        match (addr, servers) {
+            (Some(addr), Some(servers)) => attempts.push(Attempt {
+                candidate,
+                addr,
+                servers,
+            }),
             _ => skipped.push(AddressUnavailable {
                 rows: candidate.rows,
                 observed_at: SystemTime::now(),
@@ -502,17 +514,70 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
     })
 }
 
+fn missing_entry() -> ApiError {
+    unsupported(
+        "The probed chain has no admitted entry node",
+        json!({"field":"target"}),
+    )
+}
+
+async fn resolve_servers(
+    dns: &PinnedNameResolver,
+    resolved: &mut ResolvedHosts,
+    entry: &Node,
+) -> Result<Option<PinnedServers>, ApiError> {
+    const REFUSED: &str = "Resolving the probed node's server was refused locally";
+    let upload = entry.host();
+    let upload_ip = resolve(dns, resolved, upload, true, REFUSED)
+        .await?
+        .first()
+        .copied();
+    let download = entry.xhttp_download().map(|peer| peer.address.as_str());
+    // Physical server families are chosen by the resolver, independently of the
+    // requested application destination family and of one another.
+    let download_pin = match download {
+        Some(host)
+            if host
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(upload.trim_end_matches('.')) =>
+        {
+            upload_ip.map(|ip| (host, ip))
+        }
+        Some(host) => {
+            let Some(&ip) = resolve(dns, resolved, host, true, REFUSED).await?.first() else {
+                return Ok(None);
+            };
+            Some((host, ip))
+        }
+        None => None,
+    };
+    Ok(upload_ip.map(|ip| PinnedServers::new((upload, ip), download_pin)))
+}
+
 async fn resolve<'a>(
     dns: &PinnedNameResolver,
-    resolved: &'a mut HashMap<String, Vec<IpAddr>>,
+    resolved: &'a mut ResolvedHosts,
     host: &str,
+    physical: bool,
     refused: &'static str,
 ) -> Result<&'a [IpAddr], ApiError> {
+    // Only physical aliases have a different DNS authority from the destination.
+    let physical_alias = physical && dns.has_physical_alias(host);
+    let resolved = if physical_alias {
+        &mut resolved.physical_aliases
+    } else {
+        &mut resolved.ordinary
+    };
     if !resolved.contains_key(host) {
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             vec![ip]
         } else {
-            match dns.resolve_node_server(host).await {
+            let result = if physical_alias {
+                dns.resolve_physical_alias(host).await
+            } else {
+                dns.resolve_node_server(host).await
+            };
+            match result {
                 Ok(addresses) => addresses,
                 Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
                     return Err(unsupported(refused, json!({"check":"resolution"})));

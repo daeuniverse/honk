@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use honk_config::config::Config;
 use honk_config::dns::DnsCond;
-use honk_config::node::Node;
 
 use super::DnsService;
 
@@ -34,9 +33,8 @@ pub(crate) fn index(config: &Config) -> NodeHosts {
         if tags.is_empty() {
             continue;
         }
-        // An XHTTP download peer dials its own server host.
-        let download = node.xhttp_download_view();
-        for host in std::iter::once(node.host()).chain(download.as_ref().map(Node::host)) {
+        let download = node.xhttp_download().map(|peer| peer.address.as_str());
+        for host in std::iter::once(node.host()).chain(download) {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
             if host.is_empty() || host.parse::<IpAddr>().is_ok() {
                 continue;
@@ -97,6 +95,7 @@ impl honk_outbound::bootstrap::NodeHostResolver for NodeHostRouting {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use honk_config::node::Node;
 
     #[test]
     fn indexes_named_hosts_of_subscription_nodes_under_a_subtag_rule() {

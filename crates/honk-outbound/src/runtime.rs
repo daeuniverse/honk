@@ -23,6 +23,8 @@ pub(crate) use tasks::{
 #[cfg(any(feature = "rprx", test))]
 mod vless;
 
+#[cfg(feature = "owned-tasks")]
+pub use admission::PinnedServers;
 pub(crate) use admission::pinned_server_address;
 pub(crate) use admission::{
     CapturedDialAdmission, admit_physical_dial, admit_replacement_dial, capture_dial_admission,
@@ -518,11 +520,17 @@ impl NodeRuntime {
     }
 
     /// A proxy chain's hop runtimes, entry first; empty for other nodes.
-    pub fn chain_hops(&self) -> &[Arc<NodeRuntime>] {
+    pub(crate) fn chain_hops(&self) -> &[Arc<NodeRuntime>] {
         match &self.runtime {
             ProtocolRuntime::Chain(chain) => &chain.0,
             _ => &[],
         }
+    }
+
+    /// Configuration of the physical entry, without exposing its live runtime.
+    #[cfg(feature = "owned-tasks")]
+    pub fn chain_entry_node(&self) -> Option<&Node> {
+        self.chain_hops().first().map(|entry| entry.node.as_ref())
     }
 
     /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
@@ -705,13 +713,11 @@ impl EphemeralRuntimeGuard {
         let Some(runtime) = self.runtime.take() else {
             return;
         };
-        #[cfg(feature = "owned-tasks")]
-        if let Some(owner) = &runtime.task_owner {
-            owner.abort();
-        }
-        runtime.shutdown_pools();
-        if matches!(&runtime.runtime, ProtocolRuntime::Quic(_))
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        runtime.request_close();
+        if matches!(
+            &runtime.runtime,
+            ProtocolRuntime::Quic(_) | ProtocolRuntime::Chain(_)
+        ) && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
             handle.spawn(async move { runtime.close().await });
         }
@@ -841,6 +847,28 @@ impl OutboundRuntimeRegistry {
         &self,
         node: &Node,
     ) -> Result<EphemeralRuntimeGuard, RuntimeRegistryError> {
+        if node.chain_hops().is_some() {
+            let admitted = self.admitted_chain_runtime(node)?;
+            let owner = Arc::new(tasks::TaskOwner::default());
+            let build = |node: &Node, hops| {
+                NodeRuntime::build(
+                    node,
+                    true,
+                    Some(Arc::clone(&owner)),
+                    #[cfg(any(feature = "rprx", test))]
+                    Arc::clone(&self.vless_carrier_semaphore),
+                    hops,
+                )
+            };
+            let hops = admitted
+                .chain_hops()
+                .iter()
+                .map(|hop| build(&hop.node, None))
+                .collect();
+            return Ok(EphemeralRuntimeGuard {
+                runtime: Some(build(&admitted.node, Some(hops))),
+            });
+        }
         NodeRuntime::validate_for_ephemeral(node)?;
         Ok(self.ephemeral_guarded_after_admission(node))
     }
