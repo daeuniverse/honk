@@ -370,7 +370,7 @@ impl AsyncWrite for Hy2TcpStream {
         if let Some(request) = self.request.take() {
             let request_len = request.len();
             let mut chunks = [request, Bytes::copy_from_slice(input)];
-            match self.inner.poll_write_chunks(cx, &mut chunks) {
+            match self.inner.poll_write_chunks(cx, &mut chunks, request_len) {
                 Poll::Pending => {
                     self.request = Some(chunks[0].clone());
                     Poll::Pending
@@ -406,8 +406,9 @@ impl AsyncWrite for Hy2TcpStream {
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if let Some(request) = self.request.take() {
+            let unobserved = request.len();
             let mut chunks = [request];
-            match self.inner.poll_write_chunks(cx, &mut chunks) {
+            match self.inner.poll_write_chunks(cx, &mut chunks, unobserved) {
                 Poll::Pending => {
                     self.request = Some(chunks[0].clone());
                     return Poll::Pending;

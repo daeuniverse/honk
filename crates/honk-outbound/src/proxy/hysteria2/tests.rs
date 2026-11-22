@@ -1557,4 +1557,5 @@ fn test_hop_state_rotation() {
     assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }
 
+mod quic_submission;
 mod source_udp;

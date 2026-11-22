@@ -506,8 +506,8 @@ mod relayed_request {
         let mut bytes = [0; 4];
         peer.read_exact(&mut bytes).await.unwrap();
         assert_eq!(&bytes, b"last");
-        let (request, position) = pending.lock().take().unwrap();
-        request.delivered(position);
+        let (request, _) = pending.lock().take().unwrap();
+        request.confirm();
         assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
     }
 
@@ -597,3 +597,6 @@ mod relayed_request {
         }
     }
 }
+
+#[cfg(feature = "flow-observation")]
+mod quic_submission;

@@ -368,8 +368,8 @@ mod tunneled_request_observation {
                 events.lock().is_empty(),
                 "{method}: published before delivery"
             );
-            let (request, position) = request.lock().take().expect(method);
-            request.delivered(position);
+            let (request, _) = request.lock().take().expect(method);
+            request.confirm();
             assert!(request_sent(&events.lock()), "{method}");
         }
     }

@@ -7,7 +7,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::runtime::flow_observation::{
-    FlowContext, FlowEvent, FlowObserver, Milestone, RequestWrite,
+    FlowContext, FlowEvent, FlowObserver, Milestone, RequestDelivery, RequestWrite,
 };
 
 pub(super) type Events = Arc<parking_lot::Mutex<Vec<FlowEvent>>>;
@@ -37,7 +37,18 @@ pub(super) fn milestones(events: &[FlowEvent], expected: Milestone) -> usize {
         .count()
 }
 
-pub(super) type PendingRequest = Arc<parking_lot::Mutex<Option<(RequestWrite, u64)>>>;
+pub(super) type PendingRequest = Arc<parking_lot::Mutex<Option<(CapturedWrites, u64)>>>;
+
+#[derive(Debug, Default)]
+pub(super) struct CapturedWrites(Vec<RequestDelivery>);
+
+impl CapturedWrites {
+    pub(super) fn confirm(self) {
+        for write in self.0 {
+            write.complete();
+        }
+    }
+}
 
 /// Defers the request event until the test reports delivery, as an
 /// observed frame transport does.
@@ -83,8 +94,10 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeferringCarrier<T> {
             if size != 0
                 && let Some(request) = RequestWrite::current()
             {
-                request.defer(this.accepted);
-                *this.request.lock() = Some((request, this.accepted));
+                let mut captured = this.request.lock();
+                let (writes, end) = captured.get_or_insert_with(Default::default);
+                writes.0.push(request.pending());
+                *end = this.accepted;
             }
         }
         result

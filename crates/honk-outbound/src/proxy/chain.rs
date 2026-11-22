@@ -74,11 +74,20 @@ impl ChainHandler {
                 reality_key_shares,
             };
             let Some(next) = rest.get(index + 1) else {
-                return hop_scope(
-                    hop,
-                    handler.dial_over(Arc::clone(hop), carrier, target, target_domain, options),
-                )
-                .await
+                let dial =
+                    handler.dial_over(Arc::clone(hop), carrier, target, target_domain, options);
+                return if matches!(
+                    first.node.protocol(),
+                    NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+                ) {
+                    hop_scope(
+                        hop,
+                        crate::runtime::flow_observation::observe_chain_request(dial),
+                    )
+                    .await
+                } else {
+                    hop_scope(hop, dial).await
+                }
                 .map_err(at(index + 1));
             };
             let (server, server_domain) = server_target(&next.node);

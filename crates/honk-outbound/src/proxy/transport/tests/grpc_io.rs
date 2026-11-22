@@ -623,8 +623,8 @@ async fn grpc_request_written_by_the_read_driver_stays_deferrable() {
         0,
         "sent before the carrier delivered the DATA the read side wrote"
     );
-    let (deferred, position) = pending.lock().take().unwrap();
-    deferred.delivered(position);
+    let (deferred, _) = pending.lock().take().unwrap();
+    deferred.confirm();
     assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
 }
 

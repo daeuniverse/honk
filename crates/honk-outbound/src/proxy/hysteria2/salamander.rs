@@ -198,6 +198,25 @@ impl Hy2UdpSocket {
             hop: Mutex::new(hop.map(|(ports, interval)| HopState::new(ports, interval))),
         }
     }
+
+    fn send_one(&self, transmit: &quinn::udp::Transmit) -> io::Result<bool> {
+        let destination = match &mut *self.hop.lock() {
+            Some(hop) => SocketAddr::new(
+                transmit.destination.ip(),
+                hop.port(transmit.destination.port()),
+            ),
+            None => transmit.destination,
+        };
+        let send = |bytes: &[u8]| Ok(self.socket.try_send_to(bytes, destination)? == bytes.len());
+        match (&self.obfs, &self.obfs_send) {
+            (Some(password), Some(buffer)) => {
+                let mut packet = buffer.lock();
+                salamander_seal_into(password, transmit.contents, &mut packet);
+                send(&packet)
+            }
+            _ => send(transmit.contents),
+        }
+    }
 }
 
 /// Client-side port hopping state: every `interval` the next outbound
@@ -283,24 +302,18 @@ impl AsyncUdpSocket for Hy2UdpSocket {
     }
 
     fn try_send(&self, transmit: &quinn::udp::Transmit) -> io::Result<()> {
-        let destination = match &mut *self.hop.lock() {
-            Some(hop) => SocketAddr::new(
-                transmit.destination.ip(),
-                hop.port(transmit.destination.port()),
-            ),
-            None => transmit.destination,
-        };
-        match (&self.obfs, &self.obfs_send) {
-            (Some(password), Some(send_buffer)) => {
-                let mut packet = send_buffer.lock();
-                salamander_seal_into(password, transmit.contents, &mut packet);
-                self.socket.try_send_to(&packet, destination)?;
-            }
-            _ => {
-                self.socket.try_send_to(transmit.contents, destination)?;
-            }
+        self.send_one(transmit).map(|_| ())
+    }
+
+    fn try_send_with_status(&self, transmit: &quinn::udp::Transmit) -> io::Result<bool> {
+        // Obfuscation and port hopping operate on one wire datagram at a time.
+        if transmit
+            .segment_size
+            .is_some_and(|stride| stride == 0 || stride < transmit.contents.len())
+        {
+            return Ok(false);
         }
-        Ok(())
+        self.send_one(transmit)
     }
 
     fn poll_recv(
