@@ -846,6 +846,8 @@ impl OutboundRuntimeRegistry {
     }
 
     /// Admit a private one-shot runtime using this generation's carrier budget.
+    /// A chain owns fresh runtimes for only its admitted physical hops. The
+    /// caller scopes dials to this registry and closes the returned guard.
     #[cfg(feature = "owned-tasks")]
     pub fn try_ephemeral_guarded(
         &self,

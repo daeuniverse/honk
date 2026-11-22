@@ -1,8 +1,6 @@
 use super::handoff::HandoffResult;
 use crate::control::*;
-/// Clash-style `chains`, in reverse dial order. A proxy chain node's hops
-/// extend the selection chain, so after the reversal the exit leads, then come
-/// the node and its groups, and the whole path stays visible.
+/// Clash-style `chains` lists the hops exit first, then the selected node and its groups.
 pub(super) fn connection_chains(
     mut selection_chain: Vec<String>,
     node: &honk_config::node::Node,

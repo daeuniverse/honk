@@ -377,7 +377,6 @@ fn direct_or_block() -> ApiError {
     )
 }
 
-/// A TCP connect probe measures the node's own server address.
 fn tcp_connect_target(node: &honk_config::node::Node) -> Result<(), ApiError> {
     match node.protocol() {
         honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block => {

@@ -19,7 +19,7 @@ honk follows the design of dae's eBPF datapath and configuration syntax, and of 
 ## Capabilities
 
 - Transparent TCP/UDP for LAN-forwarded and host-originated traffic through TC eBPF, `dae0`/`daens`, and compiled routing.
-- Outbounds: SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, `direct`, and `block`. Trojan/VMess/VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`); VMess is TCP-only. [Proxy chains](doc/en/reference/nodes.md#proxy-chains) (`front -> land`) carry TCP through two to four nodes. See [protocol limits](doc/en/reference/nodes.md).
+- Outbounds include SOCKS5, Shadowsocks/2022, Trojan, AnyTLS, Hysteria2, TUIC, Juicity, VMess, VLESS, `direct`, and `block`. Trojan, VMess, and VLESS support H2 XHTTP (`packet-up`, `stream-up`, `stream-one`). VMess is TCP-only. [Proxy chains](doc/en/reference/nodes.md#proxy-chains) (`front -> land`) carry TCP through two to four supported proxies. See [protocol limits](doc/en/reference/nodes.md).
 - Groups: Selector (the default), URLTest, LoadBalance, Fallback, and Score. Score uses business observations and bounded validation; see [group policies](doc/en/reference/groups.md#score-policy).
 - DNS: UDP, TCP, DoT, DoH, DoQ, and DoH3 upstreams, optionally through a node or group, with routing and caching.
 - Configuration and control: dae syntax, subscriptions, reload, a Clash-compatible REST/WebSocket API, and the `honk-tool` CLI toolbox.

@@ -160,9 +160,8 @@ fn parse_node_entry(
     Ok(())
 }
 
-/// Hop names of a proxy chain entry: `->` outside quotes, as in routing
-/// rules. Share links never reach here: a hop name with `://` must be quoted,
-/// so an unquoted `://` marks the value as a link whose text holds `->`.
+/// Split on unquoted `->`. An unquoted `://` takes precedence as a share link,
+/// so a hop name containing `://` must be quoted.
 fn chain_hops(value: Text<'_, '_>) -> Option<Vec<String>> {
     value.find("->")?;
     if value.find("://").is_some() {

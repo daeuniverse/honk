@@ -898,11 +898,17 @@ Targets come only from accepted configuration:
 
 Requests accept no caller URL, and a probe never follows redirects. Probes apply no address or port policy checks to configured targets or node servers.
 
-Target hosts resolve through the running DNS configuration. When that configuration cannot answer, for example under `asis` routing, they fall back to bootstrap DNS. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while the HTTP Host and TLS SNI keep the configured name. Private and loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
+Probe targets and node server names resolve with the DNS configuration captured at admission. If it cannot answer, for example under `asis` routing, the probe uses that configuration's bootstrap resolver, not one published by a later reload. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while HTTP Host and TLS SNI keep the configured name. Probes, geodata and shared downloads use configured targets without an address or port allowlist, including private or loopback addresses and nondefault ports.
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
-`tcp_connect` on a `direct` or `block` node or a targeted [chain](./nodes.md#proxy-chains) node, and a UDP probe of a node without UDP, return `422 unsupported_value` before measuring. A group's `tcp_connect` probe still measures its other members; a chain member's row has `state` `unavailable` and `error` `no_node_address`, because a chain has no server address of its own.
+A node-targeted `tcp_connect` probe of `direct`, `block`, or a [proxy chain](./nodes.md#proxy-chains) returns `422 unsupported_value` before measuring. A UDP probe of a node without UDP returns the same error. A group's `tcp_connect` probe still measures its other members. A chain member has `state` `unavailable` and `error` `no_node_address` because the chain has no server endpoint of its own.
+
+Native HTTP and framed TCP DNS probes of a chain use private runtimes for both the chain and its physical hops. They share the generation and process dial limits and applicable VLESS carrier budget, without borrowing or populating live sessions. The captured DNS configuration pins the entry server address separately from the configured probe destination. Later hop hostnames are passed to the preceding proxy. The operation joins private runtime cleanup, including after cancellation or expiry.
+
+A hosts alias for an upload or split-download peer follows [the alias target's node-host policy](./dns.md#node-server-hosts). A check URL with the same hostname still uses the probe destination's DNS policy; the two lookups do not share an alias result.
+
+For native HTTP, `cold` times the dial, target TLS when used, and one validated request. `warm` times the configured request after a validated HEAD on the privately opened connection and can return that first sample on an eligible transport failure. The chain uses private hop runtimes in either mode.
 
 | Probe budget | Limit |
 | --- | --- |
@@ -1631,11 +1637,11 @@ Both final responses must have valid decoded 200–499 statuses. A measured-roun
 
 HTTP/1 informational and final response heads share a 16 KiB per-round cap. HTTP/2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, HTTP/2 startup and each request have separate timeout budgets.
 
-Cold reusable generation probes use guarded temporary runtimes that close afterward. A chain node is the exception: its probe dials through the hop runtimes of the running generation, so a cold probe reuses any warm session a hop holds. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
+For ordinary nodes with reusable transports, a cold generation probe uses a guarded temporary runtime that closes afterward. Clash delay tests and periodic HTTP checks use the admitted live chain runtime for chain nodes, as does legacy generation URLTest. These paths can reuse a session on the physical first hop. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new temporary runtime per tested node. See [native probe ownership](#bounded-probes).
 
-Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results. Arbitrary manual test targets do not advance real-dial failure streaks.
+A measurement admitted before reload can still return its result. Registered nodes update health history only while their registration and physical dial path still match. A successful single-node test of an unregistered ordinary node updates only its Clash display history, not health or Score. The sample and pending tests survive unrelated reloads while the same physical node remains continuously unregistered. Failures return `503` for a single node and are omitted from group results. Manual test failures do not advance real-dial failure streaks.
 
-`/proxies/{name}/delay` returns `{"delay":12}`. `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. On a URLTest group, either route can switch its selection using the new measurements.
+`/proxies/{name}/delay` returns `{"delay":12}`. `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. Either route can reselect a URLTest group only while its original group manager is still current.
 
 On-demand delay exchanges retain Alive and API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server or session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
 

@@ -108,11 +108,8 @@ impl ChainHandler {
     }
 }
 
-/// A hop's background tasks and transport evidence belong to its own runtime,
-/// as for a direct dial through the registry. Carrier pressure from chain
-/// traffic therefore lands on the hops, the entry's node included, and the
-/// chain runtime's own `TransportQuality` stays empty. The first hop's
-/// physical connection inherits the chain's dial admission scope.
+/// Each hop owns its tasks and transport evidence, leaving the chain's
+/// `TransportQuality` empty. The entry inherits the chain's dial admission scope.
 fn hop_scope(
     hop: &Arc<NodeRuntime>,
     dial: impl Future<Output = anyhow::Result<ProxyStream>>,
@@ -229,11 +226,9 @@ impl TcpOutbound for ChainHandler {
         )
     }
 
-    /// One deadline covers the whole chain, the caller's per-candidate bound;
-    /// each hop gets what remains of it, capped at `connect_timeout`. A REALITY
-    /// mask certificate on a tunneled hop redials the chain once without
-    /// hybrid key shares, as a direct REALITY dial retries once. The first hop
-    /// dials directly and has already had that retry, so its failure stands.
+    /// Each hop gets the remaining chain deadline, capped at `connect_timeout`.
+    /// A tunneled REALITY mask certificate redials the chain once without hybrid
+    /// key shares. The direct entry's own dial already handles that retry.
     async fn dial_runtime(
         &self,
         runtime: Arc<NodeRuntime>,

@@ -135,10 +135,9 @@ impl Node {
         self.id = self.derive_id();
     }
 
-    /// Whether this node's handshake can run over a stream tunneled through
-    /// an earlier chain hop. A chain's first hop dials as usual; every later
-    /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
-    /// in step with this table.
+    /// Whether this node can handshake over an earlier hop's carrier.
+    /// Later hops require this capability. Domain-based TLS ECH discovery
+    /// needs a local DNS lookup, which the tunneled path refuses.
     pub fn supports_tunneled_dial(&self) -> bool {
         if let Some(tls) = self.tls()
             && tls.enabled

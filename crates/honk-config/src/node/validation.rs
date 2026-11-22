@@ -6,8 +6,7 @@ use crate::node::{Node, OutboundConfig};
 use crate::options::vocab::{
     optional_flow, packet_network, parse_port_hopping, vmess_cipher, xhttp_stream_transport,
 };
-/// Longest accepted proxy chain. Each hop adds a round trip and a handshake
-/// to every connection.
+/// Bound chain length to limit per-connection handshake work.
 pub const MAX_CHAIN_HOPS: usize = 4;
 
 pub(super) fn semantic_error(

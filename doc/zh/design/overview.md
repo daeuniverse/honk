@@ -68,7 +68,7 @@ flowchart LR
 - `src/node/wire.rs` 是唯一的扁平 serde 适配器。VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与身份派生，因此切换规范模型会改变 VLESS `Node.id`，但不会改变 VMess 的行为或身份。
 - 行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 - `src/experimental.rs`：`ExperimentalConfig` 持有 `clash_api: ClashApiConfig`、`cache_file: CacheFileConfig` 和 `native_api`。原生设置严格校验、独立启用，而且都需要重启。`native-api` 要显式编译，可用 `--features native-api` 或 `native-ui` 构建，full 与 `-native-api` 发布产物都包含它。它提供用户态观测、有界历史、由源文件管理的组 PATCH 和主文件条目管理，以及已验证 geodata 的激活。listener 仍默认关闭。`.dae` 仍是唯一的配置权威。原文披露与写入权限各自独立。带凭据的来源只读。接口返回正文时会遮蔽 listener secret 的值，而不是省略整段正文。按网络的自动策略 pin/clear 已启用；pin 归属于当前 `GroupManager`，激活后失效。原生 mode 与完整内核透明仍未开放。`native-ui` 默认关闭，打包时通过 `ci/fetch-doona.sh` 和 `.github/ci/pins.env` 获取带许可及版本记录的 doona 发行资产。`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，运行时不会获取资产或构建前端。dae 解析器目前显式允许 `clash_api` 和 `cache_file` 这两个嵌套节。旧的 `udp_nfqueue` 只作为迁移输入：解析时发出 warning，且只在没有配置 `global.nfqueue_enable` 时，把 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
-- `src/subscription.rs`、`src/types.rs`、`src/error.rs`。`src/types.rs` 里 `NodeProtocol` 有 12 个变体，Direct/Block 留给内置节点，Chain 用于链式节点；`DialMode` 为 ip/domain/domain+/domain++；还有 `SubscriptionType`、`DnsProtocol` 以及共享的 `default_true`/`parse_duration_secs` helper。`src/error.rs` 定义 `ConfigError`。
+- `src/subscription.rs`、`src/types.rs`、`src/error.rs`。`src/types.rs` 里 `NodeProtocol` 的 `Direct` 和 `Block` 留给内置节点，`Chain` 用于链式节点。`DialMode` 为 `ip`、`domain`、`domain+` 或 `domain++`。该文件还定义 `SubscriptionType`、`DnsProtocol` 以及共享的 `default_true`/`parse_duration_secs` helper。`src/error.rs` 定义 `ConfigError`。
 
 ## 高层数据路径
 

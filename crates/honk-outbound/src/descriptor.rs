@@ -209,9 +209,7 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
-    // TCP only. Every flow redoes each hop's handshake over the first hop's
-    // connection, so neither the stream nor its first-hop socket is poolable,
-    // and the hops own any warm session state themselves.
+    // Each flow builds its own TCP chain. Any reusable sessions belong to the hops.
     ProtocolDescriptor {
         protocol: NodeProtocol::Chain,
         supports_udp: never,
