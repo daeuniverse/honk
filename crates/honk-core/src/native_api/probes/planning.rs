@@ -425,7 +425,7 @@ pub(super) fn selections(
 #[derive(Default)]
 struct ResolvedHosts {
     ordinary: HashMap<String, Vec<IpAddr>>,
-    physical_aliases: HashMap<String, Vec<IpAddr>>,
+    physical: HashMap<String, Option<IpAddr>>,
 }
 
 pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
@@ -449,14 +449,7 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 json!({"check":"port"}),
             ));
         }
-        let ips = resolve(
-            &context.dns,
-            &mut resolved,
-            host,
-            false,
-            "Resolving the probe destination was refused locally",
-        )
-        .await?;
+        let ips = resolve_destination(&context.dns, &mut resolved, host).await?;
         let addr = ips
             .iter()
             .copied()
@@ -526,12 +519,8 @@ async fn resolve_servers(
     resolved: &mut ResolvedHosts,
     entry: &Node,
 ) -> Result<Option<PinnedServers>, ApiError> {
-    const REFUSED: &str = "Resolving the probed node's server was refused locally";
     let upload = entry.host();
-    let upload_ip = resolve(dns, resolved, upload, true, REFUSED)
-        .await?
-        .first()
-        .copied();
+    let upload_ip = resolve_server(dns, resolved, upload).await?;
     let download = entry.xhttp_download().map(|peer| peer.address.as_str());
     // Physical server families are chosen by the resolver, independently of the
     // requested application destination family and of one another.
@@ -544,7 +533,7 @@ async fn resolve_servers(
             upload_ip.map(|ip| (host, ip))
         }
         Some(host) => {
-            let Some(&ip) = resolve(dns, resolved, host, true, REFUSED).await?.first() else {
+            let Some(ip) = resolve_server(dns, resolved, host).await? else {
                 return Ok(None);
             };
             Some((host, ip))
@@ -554,39 +543,20 @@ async fn resolve_servers(
     Ok(upload_ip.map(|ip| PinnedServers::new((upload, ip), download_pin)))
 }
 
-async fn resolve<'a>(
+async fn resolve_destination<'a>(
     dns: &PinnedNameResolver,
     resolved: &'a mut ResolvedHosts,
     host: &str,
-    physical: bool,
-    refused: &'static str,
 ) -> Result<&'a [IpAddr], ApiError> {
-    // Only physical aliases have a different DNS authority from the destination.
-    let physical_alias = physical && dns.has_physical_alias(host);
-    let resolved = if physical_alias {
-        &mut resolved.physical_aliases
-    } else {
-        &mut resolved.ordinary
-    };
-    if !resolved.contains_key(host) {
+    if !resolved.ordinary.contains_key(host) {
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             vec![ip]
         } else {
-            let result = if physical_alias {
-                dns.resolve_physical_alias(host).await
-            } else {
-                dns.resolve_node_server(host).await
-            };
-            match result {
-                Ok(addresses) => addresses,
-                Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
-                    return Err(unsupported(refused, json!({"check":"resolution"})));
-                }
-                Err(error) => {
-                    tracing::warn!(host, error = %format_args!("{error:#}"), "probe target resolution failed");
-                    Vec::new()
-                }
-            }
+            resolution_result(
+                host,
+                dns.resolve_node_server(host).await,
+                "Resolving the probe destination was refused locally",
+            )?
         };
         let mut unique = Vec::with_capacity(addresses.len());
         for ip in addresses.into_iter().map(|ip| ip.to_canonical()) {
@@ -594,7 +564,45 @@ async fn resolve<'a>(
                 unique.push(ip);
             }
         }
-        resolved.insert(host.to_owned(), unique);
+        resolved.ordinary.insert(host.to_owned(), unique);
     }
-    Ok(&resolved[host])
+    Ok(&resolved.ordinary[host])
+}
+
+async fn resolve_server(
+    dns: &PinnedNameResolver,
+    resolved: &mut ResolvedHosts,
+    host: &str,
+) -> Result<Option<IpAddr>, ApiError> {
+    if let Some(&ip) = resolved.physical.get(host) {
+        return Ok(ip);
+    }
+    let destination_ip = resolved
+        .ordinary
+        .get(host)
+        .and_then(|ips| ips.first().copied());
+    let ip = resolution_result(
+        host,
+        dns.resolve_physical_server(host, destination_ip).await,
+        "Resolving the probed node's server was refused locally",
+    )?;
+    resolved.physical.insert(host.to_owned(), ip);
+    Ok(ip)
+}
+
+fn resolution_result<T: Default>(
+    host: &str,
+    result: anyhow::Result<T>,
+    refused: &'static str,
+) -> Result<T, ApiError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
+            Err(unsupported(refused, json!({"check":"resolution"})))
+        }
+        Err(error) => {
+            tracing::warn!(host, error = %format_args!("{error:#}"), "probe target resolution failed");
+            Ok(T::default())
+        }
+    }
 }
