@@ -839,3 +839,5 @@ async fn full_task_owner_survives_observed_final_quic_write() {
 }
 
 mod grpc;
+#[cfg(feature = "rprx")]
+mod vmess;

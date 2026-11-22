@@ -17,13 +17,7 @@ pub(crate) trait FlushProgress {
 }
 
 pub(crate) trait DataProgress {
-    fn released(&self);
-}
-
-impl<P: DataProgress> DataProgress for Arc<P> {
-    fn released(&self) {
-        self.as_ref().released();
-    }
+    fn released(&self, remaining: usize);
 }
 
 #[derive(Debug)]
@@ -103,6 +97,6 @@ impl<P: DataProgress> Buf for QueuedData<P> {
 
 impl<P: DataProgress> Drop for QueuedData<P> {
     fn drop(&mut self) {
-        self.progress.released();
+        self.progress.released(self.bytes.len());
     }
 }

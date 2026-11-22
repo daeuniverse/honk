@@ -111,6 +111,10 @@ pub(crate) async fn wrap_after_tls(
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     match node.transport().unwrap().transport.as_str() {
         "" | "tcp" => Ok(stream), // raw TCP/TLS
+        #[cfg(feature = "rprx")]
+        "ws" if node.protocol() == honk_config::types::NodeProtocol::VMess => {
+            wrap_ws(node, ws_close_wire::WsCloseWire::new(stream), false).await
+        }
         "ws" => wrap_ws(node, stream, false).await,
         "grpc" => wrap_grpc(node, stream).await,
         // Unknown transport must not silently degrade to raw TCP — a
@@ -333,12 +337,78 @@ fn encode_uri_path(path: &str) -> PercentEncode<'_> {
     utf8_percent_encode(path, ENCODE_SET)
 }
 
+// Only the physical VMess upgrade instantiates the wire witness. Other WS
+// bridges carry a unit completion and drive their original socket directly.
+trait WsCarrier:
+    tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + std::fmt::Debug + 'static
+{
+    type End: Copy + Default + Send + Unpin + std::fmt::Debug + 'static;
+    const TRACK_PEER_END: bool = false;
+
+    fn finish_upgrade(&mut self) {}
+    fn completion(&self, _clean: bool, _forwarded: u64, _rejected: bool) -> Self::End {
+        Self::End::default()
+    }
+    fn shutdown_result(_end: Self::End) -> io::Result<()> {
+        Ok(())
+    }
+    #[cfg(feature = "rprx")]
+    fn forwarded(_end: Self::End) -> Option<u64> {
+        None
+    }
+}
+
+impl<S: AsyncReadWrite + ?Sized + 'static> WsCarrier for Box<S> {
+    type End = ();
+}
+
+#[cfg(feature = "rprx")]
+type FlatVmessWire = ws_close_wire::WsCloseWire<Box<dyn AsyncReadWrite>>;
+
+#[cfg(feature = "rprx")]
+#[derive(Debug, Default, Copy, Clone)]
+struct FlatWsEnd {
+    forwarded: Option<u64>,
+    rejected_terminator: bool,
+}
+
+#[cfg(feature = "rprx")]
+impl WsCarrier for FlatVmessWire {
+    type End = FlatWsEnd;
+    const TRACK_PEER_END: bool = true;
+
+    fn finish_upgrade(&mut self) {
+        ws_close_wire::WsCloseWire::finish_upgrade(self);
+    }
+
+    fn completion(&self, clean: bool, forwarded: u64, rejected_terminator: bool) -> FlatWsEnd {
+        FlatWsEnd {
+            forwarded: (clean && self.eligible_close()).then_some(forwarded),
+            rejected_terminator,
+        }
+    }
+
+    fn shutdown_result(end: FlatWsEnd) -> io::Result<()> {
+        if end.rejected_terminator {
+            use tokio_tungstenite::tungstenite::error::ProtocolError;
+            return Err(io::Error::other(WsError::Protocol(
+                ProtocolError::SendAfterClosing,
+            )));
+        }
+        Ok(())
+    }
+
+    fn forwarded(end: FlatWsEnd) -> Option<u64> {
+        end.forwarded
+    }
+}
+
 /// Upgrade an already-connected (optionally TLS-wrapped) stream to
 /// WebSocket, then bridge through a duplex so the caller gets a
 /// plain `AsyncRead + AsyncWrite` handle.
-async fn wrap_ws(
+async fn wrap_ws<S: WsCarrier>(
     node: &Node,
-    stream: Box<dyn AsyncReadWrite>,
+    stream: S,
     retain_carrier_failure: bool,
 ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -380,26 +450,93 @@ async fn wrap_ws(
         );
     }
 
-    let (ws_stream, _response) = tokio_tungstenite::client_async(request, stream)
+    let (mut ws_stream, _response) = tokio_tungstenite::client_async(request, stream)
         .await
         .map_err(|error| anyhow::Error::new(error).context("WebSocket upgrade failed"))?;
+    ws_stream.get_mut().finish_upgrade();
 
-    let (client_half, server_half) = tokio::io::duplex(65536);
-    // Tracked even without an observer: a later hop may write its request
-    // over this stream inside an observed flow.
-    let pipe = crate::runtime::flow_observation::RelayedPipe::new();
-    let failure = retain_carrier_failure.then(Arc::default);
-    let _ = crate::runtime::spawn_owned(ws_bridge_relay(
+    Ok(Box::new(ObservedWs::bridge(
         ws_stream,
-        server_half,
-        pipe.clone(),
-        failure.clone(),
-    ));
-    Ok(Box::new(ObservedWs {
-        inner: client_half,
-        pipe,
-        failure,
-    }))
+        retain_carrier_failure,
+    )?))
+}
+
+#[derive(Clone)]
+struct RelayWork(Arc<parking_lot::Mutex<Option<futures_util::future::BoxFuture<'static, ()>>>>);
+
+impl RelayWork {
+    fn poll(&self, cx: &mut Context<'_>) -> Poll<()> {
+        match &mut *self.0.lock() {
+            Some(relay) => relay.as_mut().poll(cx),
+            None => Poll::Ready(()),
+        }
+    }
+}
+
+impl Drop for RelayWork {
+    fn drop(&mut self) {
+        // Either owner can retire first. Finish destruction under the same lock
+        // so the other cannot return while a nested bridge still owns its writer.
+        *self.0.lock() = None;
+    }
+}
+
+pub(super) struct RelayTask {
+    _work: RelayWork,
+    task: tokio::task::AbortHandle,
+}
+
+impl std::fmt::Debug for RelayTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.task, f)
+    }
+}
+
+impl RelayTask {
+    pub(super) fn spawn(relay: impl Future<Output = ()> + Send + 'static) -> anyhow::Result<Self> {
+        let work = RelayWork(Arc::new(parking_lot::Mutex::new(Some(Box::pin(relay)))));
+        let worker = work.clone();
+        let task = crate::runtime::spawn_owned(std::future::poll_fn(move |cx| worker.poll(cx)))
+            .ok_or(crate::proxy::PacketRejection::Cancelled)?;
+        Ok(Self { _work: work, task })
+    }
+}
+
+impl Drop for RelayTask {
+    fn drop(&mut self) {
+        // A queued Tokio abort cannot prevent a nested transport resuming first.
+        // Dispose of the lower carrier and any pending send between polls.
+        self.task.abort();
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum UploadEnd<T = ()> {
+    Waiting(tokio::sync::oneshot::Receiver<io::Result<T>>),
+    Finished(Result<T, Arc<io::Error>>),
+}
+
+impl<T: Copy> UploadEnd<T> {
+    pub(super) fn channel() -> (tokio::sync::oneshot::Sender<io::Result<T>>, Self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        (tx, Self::Waiting(rx))
+    }
+
+    pub(super) fn poll(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        if let Self::Waiting(rx) = self {
+            let result = std::task::ready!(Pin::new(rx).poll(cx))
+                .unwrap_or_else(|_| Err(io::ErrorKind::BrokenPipe.into()));
+            *self = Self::Finished(result.map_err(Arc::new));
+        }
+        match self {
+            Self::Finished(Err(error)) => Poll::Ready(Err(match error.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(error.kind(), error.clone()),
+            })),
+            Self::Finished(Ok(end)) => Poll::Ready(Ok(*end)),
+            Self::Waiting(_) => unreachable!(),
+        }
+    }
 }
 
 type WsRelayResult = Arc<OnceLock<WsRelayFailure>>;
@@ -417,20 +554,124 @@ impl WsRelayFailure {
     }
 }
 
+#[cfg(feature = "rprx")]
 #[derive(Debug)]
-struct ObservedWs {
-    inner: tokio::io::DuplexStream,
-    pipe: crate::runtime::flow_observation::RelayedPipe,
-    failure: Option<WsRelayResult>,
+pub(super) struct WsPeerEnd(std::sync::Weak<relay_upload::MarkerSlot>);
+
+#[cfg(feature = "rprx")]
+#[derive(Debug, thiserror::Error)]
+#[error("WebSocket peer closed with {unforwarded} accepted bytes unsent")]
+struct WsOmission {
+    owner: WsPeerEnd,
+    unforwarded: u64,
 }
 
-impl ObservedWs {
-    fn relay_failure(&self) -> Option<&WsRelayFailure> {
-        self.failure.as_ref()?.get()
+#[cfg(feature = "rprx")]
+impl WsPeerEnd {
+    pub(super) fn for_stream(stream: &dyn AsyncReadWrite) -> Option<Self> {
+        let ws = stream
+            .as_any()
+            .downcast_ref::<ObservedWs<FlatVmessWire>>()?;
+        Some(Self(ws.pipe.owner()))
+    }
+
+    pub(super) fn omitted(&self, error: &io::Error, accepted_terminator_bytes: usize) -> bool {
+        // Only this immediate socket can issue the error. Walking the source
+        // chain could use a buffered descendant's completion as our own.
+        error
+            .get_ref()
+            .and_then(|cause| cause.downcast_ref::<WsOmission>())
+            .is_some_and(|end| {
+                self.0.ptr_eq(&end.owner.0)
+                    && usize::try_from(end.unforwarded) == Ok(accepted_terminator_bytes)
+            })
     }
 }
 
-impl tokio::io::AsyncRead for ObservedWs {
+#[derive(Debug)]
+struct ObservedWs<S: WsCarrier> {
+    _relay: RelayTask,
+    inner: tokio::io::DuplexStream,
+    pipe: relay_upload::Writer,
+    failure: Option<WsRelayResult>,
+    finished: UploadEnd<S::End>,
+}
+
+impl<S: WsCarrier> ObservedWs<S> {
+    fn bridge(
+        ws: tokio_tungstenite::WebSocketStream<S>,
+        retain_carrier_failure: bool,
+    ) -> anyhow::Result<Self> {
+        let (inner, server) = tokio::io::duplex(65536);
+        // A later observed hop may write its request over this stream.
+        let (pipe, reader) = relay_upload::pipe();
+        let failure = retain_carrier_failure.then(Arc::default);
+        let relay = ws_bridge_relay(ws, server, reader, failure.clone());
+        let (done, finished) = UploadEnd::channel();
+        let task = RelayTask::spawn(async move {
+            let _ = done.send(relay.await);
+        })?;
+        Ok(Self {
+            inner,
+            pipe,
+            failure,
+            _relay: task,
+            finished,
+        })
+    }
+
+    fn relay_failure(&self) -> Option<&WsRelayFailure> {
+        self.failure.as_ref()?.get()
+    }
+
+    fn poll_upload_error<T>(
+        &mut self,
+        cx: &mut Context<'_>,
+        error: io::Error,
+    ) -> Poll<io::Result<T>> {
+        let end = std::task::ready!(self.finished.poll(cx))?;
+        #[cfg(feature = "rprx")]
+        if S::TRACK_PEER_END
+            && relay_upload::is_terminator()
+            && let Some(unforwarded) = S::forwarded(end).and_then(|n| self.pipe.unforwarded(n))
+        {
+            return Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                WsOmission {
+                    owner: WsPeerEnd(self.pipe.owner()),
+                    unforwarded,
+                },
+            )));
+        }
+        S::shutdown_result(end)?;
+        Poll::Ready(Err(error))
+    }
+
+    fn poll_pipe_write(
+        &mut self,
+        cx: &mut Context<'_>,
+        write: impl FnOnce(
+            Pin<&mut tokio::io::DuplexStream>,
+            &mut Context<'_>,
+        ) -> Poll<io::Result<usize>>,
+    ) -> Poll<io::Result<usize>> {
+        let inner = &mut self.inner;
+        match self.pipe.poll_write(cx, |cx| write(Pin::new(inner), cx)) {
+            Poll::Ready(Err(error)) => {
+                if let Some(failure) = self.relay_failure() {
+                    return Poll::Ready(Err(failure.io_error()));
+                }
+                if S::TRACK_PEER_END && relay_upload::is_terminator() {
+                    return self.poll_upload_error(cx, error);
+                }
+                Poll::Ready(Err(error))
+            }
+            result => result,
+        }
+    }
+}
+
+impl<S: WsCarrier> tokio::io::AsyncRead for ObservedWs<S> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -461,17 +702,14 @@ impl tokio::io::AsyncRead for ObservedWs {
     }
 }
 
-impl tokio::io::AsyncWrite for ObservedWs {
+impl<S: WsCarrier> tokio::io::AsyncWrite for ObservedWs<S> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let inner = &mut this.inner;
-        this.pipe
-            .poll_write(|| Pin::new(inner).poll_write(cx, buf))
-            .map_err(|error| this.relay_failure().map_or(error, WsRelayFailure::io_error))
+        self.get_mut()
+            .poll_pipe_write(cx, |inner, cx| inner.poll_write(cx, buf))
     }
 
     fn poll_write_vectored(
@@ -479,11 +717,8 @@ impl tokio::io::AsyncWrite for ObservedWs {
         cx: &mut Context<'_>,
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        let inner = &mut this.inner;
-        this.pipe
-            .poll_write(|| Pin::new(inner).poll_write_vectored(cx, bufs))
-            .map_err(|error| this.relay_failure().map_or(error, WsRelayFailure::io_error))
+        self.get_mut()
+            .poll_pipe_write(cx, |inner, cx| inner.poll_write_vectored(cx, bufs))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -494,11 +729,15 @@ impl tokio::io::AsyncWrite for ObservedWs {
         if let Some(failure) = self.relay_failure() {
             return Poll::Ready(Err(failure.io_error()));
         }
+        if let Err(error) = std::task::ready!(self.pipe.poll_flush(cx)) {
+            return self.poll_upload_error(cx, error);
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        std::task::ready!(Pin::new(&mut self.inner).poll_shutdown(cx))?;
+        Poll::Ready(std::task::ready!(self.finished.poll(cx)).and_then(S::shutdown_result))
     }
 }
 
@@ -506,52 +745,49 @@ impl tokio::io::AsyncWrite for ObservedWs {
 /// Reads binary/text messages from the WebSocket and writes them to
 /// the duplex; reads from the duplex and sends as binary WebSocket
 /// messages.
-async fn ws_bridge_relay(
-    ws: tokio_tungstenite::WebSocketStream<Box<dyn AsyncReadWrite>>,
+async fn ws_bridge_relay<S: WsCarrier>(
+    ws: tokio_tungstenite::WebSocketStream<S>,
     server: tokio::io::DuplexStream,
-    pipe: crate::runtime::flow_observation::RelayedPipe,
+    pipe: relay_upload::Reader,
     failure: Option<WsRelayResult>,
-) {
+) -> io::Result<S::End> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
 
     let (mut ws_sink, mut ws_stream) = ws.split();
     let (mut server_read, mut server_write) = tokio::io::split(server);
 
-    // server → ws
-    let s2w = async {
-        let mut buf = vec![0u8; 65536];
-        let mut relayed = 0u64;
-        loop {
-            let n = server_read.read(&mut buf).await?;
-            if n == 0 {
-                break;
-            }
-            relayed += n as u64;
-            let mut send = ws_sink.send(Message::Binary(buf[..n].to_vec().into()));
-            let sent = match pipe.take(relayed) {
-                Some(request) => request.write(Pin::new(&mut send)).await,
-                None => send.await,
-            };
-            sent?;
-        }
-        ws_sink.close().await
-    };
-
-    // ws → server
     // Keep the unforwarded part of a decoded frame if the upload fails while
     // the download is waiting for space in the duplex.
     let mut buffered = Bytes::new();
-    let w2s = async {
+    // Shared by two futures in the same Send task, and touched only on close.
+    let normal_close = AtomicBool::new(false);
+    let download = async {
         loop {
             buffered = match ws_stream.next().await {
                 Some(Ok(Message::Binary(data))) => data,
                 Some(Ok(Message::Text(data))) => data.into(),
+                Some(Ok(Message::Close(frame))) => {
+                    if S::TRACK_PEER_END {
+                        use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+                        normal_close.store(
+                            frame.is_none_or(|frame| frame.code == CloseCode::Normal),
+                            Ordering::Relaxed,
+                        );
+                    }
+                    // The peer has finished sending. A flow-controlled Close
+                    // reply must not hide EOF from the copy drain supervisor.
+                    server_write.shutdown().await?;
+                    continue;
+                }
                 Some(Ok(_)) => continue,
                 Some(Err(error)) => {
                     tracing::debug!(%error, "ws bridge recv error");
                     return Err(error);
                 }
-                None => break,
+                // A closed download also interrupts a still-unflushed upload.
+                None => return Err(WsError::ConnectionClosed),
             };
             while !buffered.is_empty() {
                 let n = server_write.write(&buffered).await?;
@@ -562,35 +798,119 @@ async fn ws_bridge_relay(
             }
             buffered = Bytes::new();
         }
-        Ok(())
     };
 
-    let result = tokio::select! {
-        result = s2w => result,
-        result = w2s => result,
+    let mut relayed = 0u64;
+    let mut certain = true;
+    let mut rejected_terminator = false;
+    let result = async {
+        let mut download = std::pin::pin!(download);
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = tokio::select! {
+                result = download.as_mut() => return result,
+                n = server_read.read(&mut buf) => n?,
+            };
+            if n == 0 {
+                certain = false;
+                return tokio::select! {
+                    result = download.as_mut() => result,
+                    result = ws_sink.close() => result,
+                };
+            }
+            let through = relayed + n as u64;
+            let send = async {
+                // Start the frame before a Pong or Close can flush its remainder
+                // from a read poll. Both halves then drive the same request.
+                tokio::select! {
+                    biased;
+                    result = ws_sink.send(Message::Binary(buf[..n].to_vec().into())) => {
+                        // This direct codec error precedes queuing the Binary. An I/O
+                        // error with the same nested source never establishes that.
+                        rejected_terminator = S::TRACK_PEER_END
+                            && matches!(result, Err(WsError::Protocol(ProtocolError::SendAfterClosing)))
+                            && normal_close.load(Ordering::Relaxed)
+                            && relay_upload::is_terminator();
+                        result
+                    },
+                    result = download.as_mut() => result,
+                }
+            };
+            if let Err(error) = pipe.forward(through, |_| send).await {
+                // The reader can flush part of an interrupted send. Only a
+                // direct prequeue rejection leaves its wire extent known.
+                certain = rejected_terminator;
+                return Err(error);
+            }
+            relayed = through;
+        }
+    }
+    .await;
+    let result = async {
+        let peer_closing = match result {
+            Ok(()) => false,
+            Err(WsError::ConnectionClosed) => true,
+            Err(WsError::Protocol(ProtocolError::SendAfterClosing)) if rejected_terminator => true,
+            Err(error) => return Err(error),
+        };
+        let mut ws = ws_sink
+            .reunite(ws_stream)
+            .expect("both halves of the same websocket");
+        if peer_closing {
+            // The reciprocal Close can still be buffered when the reader sees FIN.
+            ws.flush().await?;
+        }
+        ws.get_mut().shutdown().await.map_err(WsError::Io)?;
+        // A peer can wait for our TCP FIN before sending its own. Its Close
+        // already ruled out any further messages, but a reset must still fail.
+        if rejected_terminator && ws.next().await.transpose()?.is_some() {
+            return Err(WsError::Protocol(ProtocolError::ReceivedAfterClosing));
+        }
+        Ok(ws.get_ref().completion(
+            S::TRACK_PEER_END && peer_closing && certain && normal_close.load(Ordering::Relaxed),
+            relayed,
+            rejected_terminator,
+        ))
+    }
+    .await;
+    let error = match result {
+        Ok(end) => return Ok(end),
+        Err(WsError::Io(error)) => error,
+        Err(error) => return Err(io::Error::other(error)),
     };
-    if let (Some(failure), Err(WsError::Io(error))) = (failure, result) {
+    #[cfg(feature = "rprx")]
+    let error = if S::TRACK_PEER_END {
+        ws_close_wire::restore_reset(error)
+    } else {
+        error
+    };
+    if let Some(failure) = failure {
         let error = if super::error::io_node_failure(&error) || super::io_target_failure(&error) {
             // We own the error and can keep provenance outside a shared cause too.
             error
         } else if let Some(error) = super::retain_typed_io_error(&error) {
             error
         } else {
-            return;
+            return Err(error);
         };
         // Publish before the duplex halves drop and wake a waiter with EOF or BrokenPipe.
-        let _ = failure.set(WsRelayFailure {
+        let failure = failure.get_or_init(|| WsRelayFailure {
             kind: error.kind(),
             cause: crate::SharedError::new(error.into()),
             buffered: parking_lot::Mutex::new(buffered),
         });
+        return Err(failure.io_error());
     }
+    Err(error)
 }
 
 mod grpc;
 mod h2_io;
+pub(super) mod relay_upload;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod tunnel_tests;
+#[cfg(feature = "rprx")]
+mod ws_close_wire;
 pub(crate) mod xhttp;

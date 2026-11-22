@@ -1,12 +1,6 @@
+use super::test_support::{HEADER_WIRE, fixed_session, hex};
 use super::*;
 use std::io;
-
-fn hex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
 
 // Byte-level regression vectors produced by running the actual
 // Xray-core/sing-vmess Go code (aead/kdf.go, aead/authid.go,
@@ -16,26 +10,13 @@ const CMD_KEY: &str = "b50d916ac0cec067981af8e5f38a758f";
 const AUTH_ID_KEY: &str = "1415ba74ca8b3d041a8f583fb4116315";
 const AUTH_ID: &str = "7997d3314952dc37e0b284331b6bb2e7"; // ts=1700000000, rand=deadbeef
 const HEADER_PLAIN: &str = "0122222222222222222222222222222222111111111111111111111111111111115a053300010050015db8d822aabbcc15eba2f4";
-const HEADER_WIRE: &str = "7997d3314952dc37e0b284331b6bb2e71a963074b6c9f5cd7c0825ace93c69df311f0102030405060708301fcaedd9021cf0eaab9deb25afab08b13d78f0b0ff69acfc123dd0ba0d9b6c24d5edbfbcd20d23d7fd0a9f3d59a64835ccd0253af09feb22cc2affb2942c159c5acdc2";
 const CHUNK0: &str = "cce0f4cf6e664ef12db2501e5fc2333f0d54118144ce186c4913a9a33a";
 const CHUNK1: &str = "821e7f5df60be7f0159bdf89de3bda5c55c920d471fda4d17d24ddb5fd";
 const CHUNK_TERM: &str = "f25f875b48011300760c657294fca053c869";
-const RESP_KEY: &str = "b8f12ea8c9a95d4b4641b03d9fa5a71a";
-const RESP_IV: &str = "3dc30fbac8417f76943e9c10e15eeacb";
 const RESP_HEADER_WIRE: &str =
     "1ed5e218e618e8c5350363b980c93de5efa06015b5dc7a63f67ab72353ff9aa4f47a9ee044da";
 const RCHUNK0: &str = "a519478d162a2f176b9d3e71216983fc910451176407bbc97aa4daccb61c4740c0";
 const RCHUNK1: &str = "7baab45ea2ec0a90ad19bc5cacb263341906c9224a32ff3ce1dd65f2c0f7817120";
-
-fn fixed_session() -> Session {
-    Session {
-        req_key: [0x11; 16],
-        req_iv: [0x22; 16],
-        resp_key: hex(RESP_KEY).try_into().unwrap(),
-        resp_iv: hex(RESP_IV).try_into().unwrap(),
-        resp_header: 0x5a,
-    }
-}
 
 fn fixed_cmd_key() -> [u8; 16] {
     hex(CMD_KEY).try_into().unwrap()
@@ -269,7 +250,9 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
             &mut relay_client,
             header.to_vec(),
             fixed_session(),
-            &crate::runtime::flow_observation::RelayedPipe::new(),
+            &super::super::transport::relay_upload::pipe().1,
+            &mut None,
+            &mut Vec::new(),
         )
         .await
     });
@@ -656,23 +639,12 @@ async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() 
     ] {
         let kind = failure.as_ref().map(io::Error::kind);
         let (physical, mut peer) = tokio::io::duplex(4096);
-        let (inner, relay_half) = tokio::io::duplex(4096);
-        let failure_state = RelayFailure::default();
-        let pipe = crate::runtime::flow_observation::RelayedPipe::new();
-        let relay = tokio::spawn(vmess_relay_recorded(
+        let mut stream = VmessStream::start(
             Box::new(ErrorOnEof(physical, failure)),
-            relay_half,
             hex(HEADER_WIRE),
             fixed_session(),
-            failure_state.clone(),
-            pipe.clone(),
-        ));
-        let mut stream = VmessStream {
-            inner,
-            relay: relay.abort_handle(),
-            failure: failure_state,
-            pipe,
-        };
+        )
+        .unwrap();
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             peer.write_all(&hex(RESP_HEADER_WIRE)).await.unwrap();
@@ -701,8 +673,14 @@ async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() 
                 assert_eq!(ScoreOutcome::from_io_error(&error), expected);
             } else {
                 assert_eq!(result.unwrap(), 0);
+                stream.shutdown().await.unwrap();
+                let mut expected = hex(HEADER_WIRE);
+                let mut upload = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+                expected.extend(upload.seal_chunk(&[]));
+                let mut sent = Vec::new();
+                peer.read_to_end(&mut sent).await.unwrap();
+                assert_eq!(sent, expected);
             }
-            relay.await.unwrap();
         })
         .await
         .expect("VMess payload and terminal read must settle");
@@ -866,3 +844,5 @@ async fn dial_over_relays_through_the_carrier() {
         .unwrap()
         .unwrap();
 }
+
+mod websocket;

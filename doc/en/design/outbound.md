@@ -327,6 +327,12 @@ hostname: a CDN-fronted node keeps the edge IP as its address and names the
 distribution only in that header. The shared path therefore gives Trojan,
 VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
 
+If a physical WebSocket peer closes normally before VMess can send its empty
+upload terminator, the relay can finish cleanly only after validating the
+complete response and confirming that it forwarded all application bytes.
+The omitted terminator is not counted as sent. A writable carrier must still
+send and flush it.
+
 Cold and pooled-bare Trojan streams use that same complete transport stack. TLS
 batching returns bytes already read before surfacing a later I/O error on the
 next non-empty read. It never converts that error into EOF.

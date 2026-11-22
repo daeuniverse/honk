@@ -294,6 +294,10 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 節點以邊緣 IP 為位址，發佈域名只出現在該 header 中。因此，同一條共享路徑為
 Trojan、VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立過程。
 
+如果實體 WebSocket 連線的對端先正常關閉，VMess 就無法再送出空的上行結束記錄。
+只有在完整回應通過驗證、所有應用資料都已轉送時，中繼才會視為正常結束。
+未送出的結束記錄不會計為已傳送；連線仍可寫入時，仍須送出該記錄並清空寫入緩衝區。
+
 Trojan 冷連線和 pool 中取出的裸連線使用同一套完整 transport。
 
 Trojan UDP 讓一個用戶端來源的所有目的地共用一條 UDP-associate 流。header 指定首個

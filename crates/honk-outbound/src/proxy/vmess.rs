@@ -11,6 +11,7 @@ use sha2::Sha256;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -182,13 +183,45 @@ impl Session {
 type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
 struct VmessStream {
+    _relay: super::transport::RelayTask,
     inner: tokio::io::DuplexStream,
-    relay: tokio::task::AbortHandle,
     failure: RelayFailure,
-    pipe: crate::runtime::flow_observation::RelayedPipe,
+    pipe: super::transport::relay_upload::Writer,
+    upload_done: super::transport::UploadEnd,
 }
 
 impl VmessStream {
+    fn start(
+        stream: Box<dyn AsyncReadWrite>,
+        header_wire: Vec<u8>,
+        session: Session,
+    ) -> anyhow::Result<Self> {
+        let (inner, server) = tokio::io::duplex(65536);
+        let failure = RelayFailure::default();
+        let (pipe, reader) = super::transport::relay_upload::pipe();
+        let (uploaded, upload_done) = super::transport::UploadEnd::channel();
+        let relay = vmess_relay_recorded(
+            stream,
+            server,
+            header_wire,
+            session,
+            failure.clone(),
+            reader,
+            uploaded,
+        );
+        let relay = crate::runtime::flow_observation::scope(
+            crate::runtime::flow_observation::current(),
+            relay,
+        );
+        Ok(Self {
+            _relay: super::transport::RelayTask::spawn(relay)?,
+            inner,
+            failure,
+            pipe,
+            upload_done,
+        })
+    }
+
     fn relay_error(&self) -> Option<std::io::Error> {
         self.failure
             .get()
@@ -204,9 +237,22 @@ async fn vmess_relay_recorded(
     header_wire: Vec<u8>,
     session: Session,
     failure: RelayFailure,
-    pipe: crate::runtime::flow_observation::RelayedPipe,
+    pipe: super::transport::relay_upload::Reader,
+    uploaded: tokio::sync::oneshot::Sender<std::io::Result<()>>,
 ) {
-    if let Err(error) = vmess_relay(server, &mut client, header_wire, session, &pipe).await {
+    let mut uploaded = Some(uploaded);
+    let mut tail = Vec::new();
+    if let Err(error) = vmess_relay(
+        server,
+        &mut client,
+        header_wire,
+        session,
+        &pipe,
+        &mut uploaded,
+        &mut tail,
+    )
+    .await
+    {
         let kind = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -217,7 +263,18 @@ async fn vmess_relay_recorded(
             crate::SharedError::new(error.context("VMess relay failed")),
         ));
     }
-    drop(client);
+    if let Some(uploaded) = uploaded {
+        let result = match failure.get() {
+            Some((kind, cause)) => Err(std::io::Error::new(*kind, cause.clone())),
+            None => Ok(()),
+        };
+        let _ = uploaded.send(result);
+    }
+    drop(pipe);
+    if !tail.is_empty() {
+        // Shutdown can now return even if the application has yet to read.
+        let _ = client.write_all(&tail).await;
+    }
 }
 
 impl std::fmt::Debug for VmessStream {
@@ -252,13 +309,21 @@ impl AsyncWrite for VmessStream {
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
         let inner = &mut this.inner;
-        match this.pipe.poll_write(|| Pin::new(inner).poll_write(cx, buf)) {
+        match this
+            .pipe
+            .poll_write(cx, |cx| Pin::new(inner).poll_write(cx, buf))
+        {
             Poll::Ready(Err(error)) => Poll::Ready(Err(this.relay_error().unwrap_or(error))),
             other => other,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if std::task::ready!(self.pipe.poll_flush(cx)).is_err() {
+            std::task::ready!(self.upload_done.poll(cx))
+                .map_err(|error| self.relay_error().unwrap_or(error))?;
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
             other => other,
@@ -266,13 +331,10 @@ impl AsyncWrite for VmessStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl Drop for VmessStream {
-    fn drop(&mut self) {
-        self.relay.abort();
+        std::task::ready!(Pin::new(&mut self.inner).poll_shutdown(cx))?;
+        self.upload_done
+            .poll(cx)
+            .map_err(|error| self.relay_error().unwrap_or(error))
     }
 }
 
@@ -445,31 +507,8 @@ impl VmessHandler {
             Self::build_header_plain(&session, padding_len, &padding, target, target_domain)?;
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
-        let (client_half, server_half) = tokio::io::duplex(65536);
-        let failure = RelayFailure::default();
-        let pipe = crate::runtime::flow_observation::RelayedPipe::new();
-        let relay_future = vmess_relay_recorded(
-            stream,
-            server_half,
-            header_wire,
-            session,
-            failure.clone(),
-            pipe.clone(),
-        );
-        let relay_future = crate::runtime::flow_observation::scope(
-            crate::runtime::flow_observation::current(),
-            relay_future,
-        );
-        let relay = crate::runtime::spawn_owned(relay_future)
-            .ok_or(crate::proxy::PacketRejection::Cancelled)?;
-
         Ok(ProxyStream {
-            stream: Box::new(VmessStream {
-                inner: client_half,
-                relay,
-                failure,
-                pipe,
-            }),
+            stream: Box::new(VmessStream::start(stream, header_wire, session)?),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -661,8 +700,12 @@ async fn vmess_relay(
     client: &mut tokio::io::DuplexStream,
     header_wire: Vec<u8>,
     session: Session,
-    pipe: &crate::runtime::flow_observation::RelayedPipe,
+    pipe: &super::transport::relay_upload::Reader,
+    uploaded: &mut Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    tail: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
+    let peer_end = super::transport::WsPeerEnd::for_stream(server.as_ref());
+    let omitted = AtomicBool::new(false);
     let (mut server_read, mut server_write) = tokio::io::split(server);
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
@@ -685,31 +728,47 @@ async fn vmess_relay(
             }
             relayed += n as u64;
             let chunk = body.seal_chunk(&buf[..n]);
-            match pipe.take(relayed) {
-                Some(request) => {
-                    let write = async {
-                        server_write.write_all(&chunk).await?;
-                        server_write.flush().await
-                    };
-                    request.write(std::pin::pin!(write)).await?;
+            let writer = &mut server_write;
+            let bytes = &chunk;
+            pipe.forward(relayed, |flush| async move {
+                writer.write_all(bytes).await?;
+                if flush {
+                    writer.flush().await?;
                 }
-                None => server_write.write_all(&chunk).await?,
-            }
+                Ok::<_, std::io::Error>(())
+            })
+            .await?;
         }
         let term = body.seal_chunk(&[]);
-        server_write.write_all(&term).await?;
-        server_write.flush().await?;
-        Ok::<(), anyhow::Error>(())
+        let mut remaining = term.as_slice();
+        let result = super::transport::relay_upload::scope(async {
+            server_write.write_all_buf(&mut remaining).await?;
+            server_write.flush().await
+        })
+        .await;
+        if let Err(error) = result {
+            if peer_end
+                .as_ref()
+                .is_some_and(|proof| proof.omitted(&error, term.len() - remaining.len()))
+            {
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
+        if let Some(uploaded) = uploaded.take() {
+            let _ = uploaded.send(Ok(()));
+        }
+        Ok::<bool, anyhow::Error>(false)
     };
 
     let download = async {
-        read_response_header(&mut server_read, &session).await?;
+        let complete_header = read_response_header(&mut server_read, &session).await?;
 
         let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
-        loop {
+        let marker = loop {
             let mut len_buf = [0u8; 2];
             match server_read.read(&mut len_buf).await? {
-                0 => break,
+                0 => break None,
                 1 => {
                     server_read.read_exact(&mut len_buf[1..]).await?;
                 }
@@ -719,7 +778,9 @@ async fn vmess_relay(
             // size == AEAD overhead is the server's termination chunk
             // (AuthenticationReader.readInternal).
             if chunk_len == GCM_TAG_LEN {
-                break;
+                break peer_end
+                    .as_ref()
+                    .map(|_| (chunk_nonce(&body.iv, body.count), body.ctx));
             }
             if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
                 return Err(crate::proxy::NodeFailure(
@@ -733,22 +794,74 @@ async fn vmess_relay(
             let n = body
                 .open_chunk(&mut ct)
                 .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response body")))?;
-            client_write.write_all(&ct[..n]).await?;
+            let mut remaining = &ct[..n];
+            while tail.is_empty() && !remaining.is_empty() {
+                let write = std::future::poll_fn(|cx| {
+                    match Pin::new(&mut client_write).poll_write(cx, remaining) {
+                        Poll::Pending if omitted.load(Ordering::Relaxed) => Poll::Ready(None),
+                        result => result.map(Some),
+                    }
+                })
+                .await;
+                let Some(write) = write else {
+                    // Only the current record and the closed WS duplex can remain.
+                    tail.reserve_exact(remaining.len() + 65536);
+                    break;
+                };
+                let written = write?;
+                if written == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                }
+                remaining = &remaining[written..];
+            }
+            tail.extend_from_slice(remaining);
+        };
+        if !omitted.load(Ordering::Relaxed) {
+            client_write.shutdown().await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<_, anyhow::Error>((complete_header, marker))
     };
 
-    // Upload EOF only half-closes the request body — the response must
-    // still be drained (HTTP: the reply arrives after the request ends).
-    tokio::pin!(upload);
-    tokio::pin!(download);
-    tokio::select! {
-        r = &mut download => r,
-        r = &mut upload => {
-            r?;
-            download.await
+    let (peer_ended, (complete_header, marker)) = {
+        let mut upload = std::pin::pin!(upload);
+        let mut download = std::pin::pin!(download);
+        tokio::select! {
+            result = &mut upload => {
+                let peer_ended = result?;
+                if peer_ended {
+                    omitted.store(true, Ordering::Relaxed);
+                }
+                // Repoll even if download last waited for space in the application duplex.
+                (peer_ended, download.await?)
+            }
+            result = &mut download => {
+                let response = result?;
+                (upload.await?, response)
+            }
+        }
+    };
+    if peer_ended {
+        if !complete_header {
+            return Err(crate::proxy::NodeFailure(anyhow::anyhow!(
+                "invalid VMess response header command length"
+            ))
+            .into());
+        }
+        if let Some((nonce, cipher)) = marker {
+            // Ordinary VMess readers accept the length alone as EOF. Only the
+            // peer-close exception needs proof of the entire empty record.
+            let mut tag = [0u8; GCM_TAG_LEN];
+            server_read.read_exact(&mut tag).await?;
+            cipher
+                .open_in_place(&nonce, &mut [], &tag, b"")
+                .map_err(|error| {
+                    crate::proxy::NodeFailure(anyhow::anyhow!(
+                        "VMess response terminator decrypt failed: {error}"
+                    ))
+                })?;
         }
     }
+    Ok(())
 }
 
 /// `DecodeResponseHeader`: AEAD-sealed length then AEAD-sealed payload,
@@ -756,7 +869,7 @@ async fn vmess_relay(
 async fn read_response_header<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     session: &Session,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut len_ct = [0u8; 2 + GCM_TAG_LEN];
     let received = reader.read(&mut len_ct).await.map_err(|error| {
         crate::proxy::NodeFailure(anyhow::Error::new(error).context("VMess response header"))
@@ -798,11 +911,14 @@ async fn read_response_header<R: AsyncReadExt + Unpin>(
         // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
         // command data rides inside the same header block and carries nothing
         // a plain TCP outbound needs.
-        Ok::<(), anyhow::Error>(())
+        Ok::<bool, anyhow::Error>(hdr[2] == 0 || hdr.len() >= 4 + usize::from(hdr[3]))
     }
     .await
     .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response header")).into())
 }
+
+#[cfg(test)]
+pub(super) mod test_support;
 
 #[cfg(test)]
 mod tests;

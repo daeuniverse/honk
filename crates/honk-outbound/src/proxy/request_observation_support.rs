@@ -4,7 +4,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use tokio::io::DuplexStream;
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::oneshot;
 
 use crate::runtime::flow_observation::{
     FlowContext, FlowEvent, FlowObserver, Milestone, RequestDelivery, RequestWrite,
@@ -107,6 +109,68 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for DeferringCarrier<T> {
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Stop the sole short binary frame of this length before admitting any
+/// of its bytes. Admission is signalled only after unmasking the exact payload.
+pub(super) fn gated_ws_frame(
+    expected: Vec<u8>,
+) -> (
+    Box<dyn super::AsyncReadWrite>,
+    DuplexStream,
+    oneshot::Receiver<()>,
+    oneshot::Sender<()>,
+) {
+    assert!(expected.len() <= 125);
+    let (client, peer) = tokio::io::duplex(4096);
+    let (rd, inner) = tokio::io::split(client);
+    let (seen, blocked) = oneshot::channel();
+    let (release, open) = oneshot::channel();
+    let gate = MaskedFrameGate {
+        inner,
+        expected,
+        seen: Some(seen),
+        open,
+    };
+    (Box::new(tokio::io::join(rd, gate)), peer, blocked, release)
+}
+
+#[derive(Debug)]
+struct MaskedFrameGate {
+    inner: tokio::io::WriteHalf<DuplexStream>,
+    expected: Vec<u8>,
+    seen: Option<oneshot::Sender<()>>,
+    open: oneshot::Receiver<()>,
+}
+
+impl AsyncWrite for MaskedFrameGate {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        data: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if !self.open.is_terminated() && data.starts_with(&[0x82, 0x80 | self.expected.len() as u8])
+        {
+            assert!(
+                data[6..]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, byte)| byte ^ data[2 + i % 4])
+                    .eq(self.expected.iter().copied())
+            );
+            if let Some(seen) = self.seen.take() {
+                seen.send(()).unwrap();
+            }
+            std::task::ready!(Pin::new(&mut self.open).poll(cx)).unwrap();
+        }
+        Pin::new(&mut self.inner).poll_write(cx, data)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.inner).poll_shutdown(cx)
     }
