@@ -14,6 +14,7 @@ pub mod dns;
 pub mod error;
 pub mod experimental;
 pub mod group;
+pub mod inbound;
 pub mod node;
 pub mod options;
 pub mod parser;

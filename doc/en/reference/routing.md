@@ -45,6 +45,7 @@ routing {
 | `mac(...)` | Matches the source MAC address as `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff` or `aabbccddeeff`, in any case. | `mac` |
 | `ipversion(...)` | Matches `4`/`ipv4` or `6`/`ipv6`, in any case. | `ip_version` |
 | `dscp(...)` | Matches a decimal or `0x`/`0X`-prefixed hexadecimal DSCP value; packets carry values `0` to `63`. | `dscp` |
+| [`user(...)`](#user) | Matches the exact authenticated username of an `inbound` session. | `user` |
 
 Every positive field has a matching list under `RoutingCondition.not`, where the parser sends `!matcher(...)`. Within one field, listed values are alternatives.
 
@@ -91,6 +92,20 @@ Without runtime BTF offsets or verifier-safe kernel argv access, the cgroup hook
 ```dae
 routing {
     pname(NetworkManager, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+}
+```
+
+### user
+
+`user(...)` matches the exact username of an authenticated `inbound` session, SOCKS5 or HTTP(S) (the mihomo `in-user` analogue).
+
+Intercepted traffic never carries a username, so a positive `user(...)` never matches it and `!user(...)` always matches it. The kernel datapath never sees a username, so `user(...)` selects the outbound in the userspace control plane only: a rule that requires one is unreachable in the eBPF matcher, and its negation imposes no kernel-side constraint. Only TCP flows can match `user(...)`.
+
+```dae
+routing {
+    user(alice) -> hk
+    user(bob) -> proxy
+    fallback: direct
 }
 ```
 

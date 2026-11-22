@@ -45,6 +45,7 @@ routing {
 | `mac(...)` | 匹配源 MAC 地址，写作 `aa:bb:cc:dd:ee:ff`、`aa-bb-cc-dd-ee-ff`、`aabb.ccdd.eeff` 或 `aabbccddeeff`，不区分大小写。 | `mac` |
 | `ipversion(...)` | 匹配 `4`/`ipv4` 或 `6`/`ipv6`，不区分大小写。 | `ip_version` |
 | `dscp(...)` | 匹配十进制或带 `0x`/`0X` 前缀的十六进制 DSCP 值；数据包的取值为 `0` 到 `63`。 | `dscp` |
+| [`user(...)`](#user) | 匹配 `inbound` 会话认证后的精确用户名。 | `user` |
 
 每个正向字段在 `RoutingCondition.not` 下都有对应列表；解析器把 `!matcher(...)` 放入该列表。同一字段中的多个值互为备选。
 
@@ -91,6 +92,20 @@ routing {
 ```dae
 routing {
     pname(NetworkManager, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+}
+```
+
+### user
+
+`user(...)` 匹配通过认证的入站会话（SOCKS5 或 HTTP(S)）的精确用户名，对应 mihomo 的 `in-user`。
+
+透明接管的流量从不携带用户名，因此正向 `user(...)` 不可能匹配接管流量，`!user(...)` 恒匹配接管流量。内核数据路径看不到用户名，`user(...)` 仅在用户态控制平面参与选择出站：要求用户名的规则在 eBPF 匹配器中不可达，其否定形式也不在内核侧构成约束。只有 TCP 流能命中 `user(...)`。
+
+```dae
+routing {
+    user(alice) -> hk
+    user(bob) -> proxy
+    fallback: direct
 }
 ```
 

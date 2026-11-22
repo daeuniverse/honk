@@ -24,6 +24,7 @@ pub(crate) fn connection() -> ConnectionInfo {
         process_name: None,
         mac: None,
         dscp: Some(0),
+        user: None,
     }
 }
 

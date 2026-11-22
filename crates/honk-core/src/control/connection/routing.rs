@@ -50,6 +50,9 @@ pub(super) fn build_connection_info(
         process_name: handoff.and_then(|ho| ho.process_name()),
         mac: handoff.and_then(|ho| ho.mac_address()),
         dscp: handoff.map(|ho| ho.dscp),
+        // Transparently intercepted traffic has no inbound user; only the
+        // authenticated SOCKS5 server constructs flows that carry one.
+        user: None,
     }
 }
 

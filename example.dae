@@ -101,6 +101,17 @@ dns {
     }
 }
 
+# SOCKS5 入站（可选）：用户名/密码认证后走与透明接管相同的路由与出站。
+# users 至少一个，匿名监听会在校验阶段被拒绝；只中继 TCP CONNECT。
+# inbound {
+#     socks5 {
+#         bind: '0.0.0.0:7894'
+#         users {
+#             alice: 'replace-me-alice'
+#         }
+#     }
+# }
+
 routing {
     # 本机 DNS/系统服务直连，防止回环
     pname(dnsmasq, systemd-resolved) && l4proto(udp) && dport(53) -> direct(must)
@@ -115,6 +126,9 @@ routing {
     domain(geosite: geolocation-cn) -> direct
     domain(suffix: internal.example.com) -> direct
     domain(geosite: google) -> auto
+
+    # SOCKS5 入站按用户分流（配合上方 inbound 段，对应 mihomo 的 in-user）
+    # user(alice) -> auto
 
     # 其余流量
     fallback: manual

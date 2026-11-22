@@ -92,8 +92,101 @@ fn test_empty_router() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
+    assert_eq!(router.route(&conn), "direct");
+}
+
+#[test]
+fn user_predicate_matches_authenticated_flows_only() {
+    let rules = vec![
+        RoutingRule {
+            name: "alice-proxy".into(),
+            condition: RoutingCondition {
+                user: vec!["alice".into(), "carol".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("proxy".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        },
+        RoutingRule {
+            name: "bob-block".into(),
+            condition: RoutingCondition {
+                user: vec!["bob".into()],
+                ..Default::default()
+            },
+            outbound: RoutingOutbound::Simple("block".into()),
+            priority: 0,
+            must: false,
+            mark: 0,
+        },
+    ];
+    let router = Router::new(&rules, "direct").unwrap();
+    let mut conn = ConnectionInfo {
+        domain: None,
+        dst_ip: "1.1.1.1".parse().unwrap(),
+        dst_port: 443,
+        src_ip: "192.168.1.1".parse().unwrap(),
+        src_port: 12345,
+        protocol: "tcp",
+        process_name: None,
+        mac: None,
+        dscp: None,
+        user: None,
+    };
+    // Intercepted flows carry no user and reach the fallback.
+    assert_eq!(router.route(&conn), "direct");
+    conn.user = Some("alice".into());
+    assert_eq!(router.route(&conn), "proxy");
+    conn.user = Some("carol".into());
+    assert_eq!(router.route(&conn), "proxy");
+    conn.user = Some("bob".into());
+    assert_eq!(router.route(&conn), "block");
+    // Exact match, never a prefix or case-insensitive lookup.
+    conn.user = Some("Alice".into());
+    assert_eq!(router.route(&conn), "direct");
+    conn.user = Some("alice2".into());
+    assert_eq!(router.route(&conn), "direct");
+}
+
+#[test]
+fn negated_user_matches_intercepted_and_other_users() {
+    use honk_config::routing::RoutingNotCondition;
+    let rules = vec![RoutingRule {
+        name: "not-alice".into(),
+        condition: RoutingCondition {
+            not: RoutingNotCondition {
+                user: vec!["alice".into()],
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("proxy".into()),
+        priority: 0,
+        must: false,
+        mark: 0,
+    }];
+    let router = Router::new(&rules, "direct").unwrap();
+    let mut conn = ConnectionInfo {
+        domain: None,
+        dst_ip: "1.1.1.1".parse().unwrap(),
+        dst_port: 443,
+        src_ip: "192.168.1.1".parse().unwrap(),
+        src_port: 12345,
+        protocol: "tcp",
+        process_name: None,
+        mac: None,
+        dscp: None,
+        user: None,
+    };
+    // Missing user and other users satisfy the negation; alice alone misses.
+    assert_eq!(router.route(&conn), "proxy");
+    conn.user = Some("bob".into());
+    assert_eq!(router.route(&conn), "proxy");
+    conn.user = Some("alice".into());
     assert_eq!(router.route(&conn), "direct");
 }
 
@@ -124,6 +217,7 @@ fn test_domain_suffix_route() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     assert_eq!(router.route(&conn), "proxy");
@@ -166,6 +260,7 @@ fn test_sniffed_domain_miss_falls_through_to_ip_rule() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     assert_eq!(router.route(&conn), "direct");
@@ -197,6 +292,7 @@ fn test_ip_cidr_route() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     let public_conn = ConnectionInfo {
@@ -209,6 +305,7 @@ fn test_ip_cidr_route() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     assert_eq!(router.route(&private_conn), "direct");
@@ -241,6 +338,7 @@ fn test_port_route() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     let ssh_conn = ConnectionInfo {
@@ -253,6 +351,7 @@ fn test_port_route() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     assert_eq!(router.route(&web_conn), "proxy");
@@ -298,6 +397,7 @@ fn test_priority_ordering() {
         process_name: None,
         mac: None,
         dscp: None,
+        user: None,
     };
 
     // Should match the higher-priority rule (priority 0)
@@ -348,6 +448,7 @@ fn test_geosite_cn_route() {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         assert_eq!(router.route(&conn), "direct", "failed for {}", domain);
     }
@@ -384,6 +485,7 @@ fn make_conn(process_name: Option<&str>, mac: Option<&str>) -> ConnectionInfo {
         process_name: process_name.map(|s| s.to_string()),
         mac: mac.map(|s| s.to_string()),
         dscp: None,
+        user: None,
     }
 }
 
@@ -1392,6 +1494,7 @@ mod negation {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         }
     }
 
@@ -1641,6 +1744,7 @@ fn bare_ip_in_dip_sip_parses_as_host_route() {
             process_name: None,
             mac: None,
             dscp: None,
+            user: None,
         };
         router.route(&conn).to_string()
     };

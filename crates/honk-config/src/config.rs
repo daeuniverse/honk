@@ -54,6 +54,8 @@ pub struct Config {
     pub experimental: ExperimentalConfig,
     #[serde(default)]
     pub assets: crate::assets::AssetsConfig,
+    #[serde(default)]
+    pub inbound: crate::inbound::InboundConfig,
 }
 
 /// Global configuration matching dae `global { ... }` section.
@@ -949,6 +951,22 @@ impl Config {
         Ok(())
     }
 
+    fn validate_inbound_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        if let Err(failure) = self.inbound.validate() {
+            let mut error = config_validation_error(
+                source,
+                SettingPath::new("inbound")
+                    .index(failure.index + 1)
+                    .field(failure.kind.as_str()),
+                "invalid-config-value",
+                failure.reason,
+            );
+            error.diagnostic.entry_index = Some(failure.index);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn validate_reserved_names_detailed(
         &self,
         source: &SourceRef,
@@ -1132,6 +1150,7 @@ impl Config {
     pub fn validate_detailed(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
+        self.validate_inbound_detailed(&source)?;
         crate::node::validate_node_collection(&self.nodes)?;
         self.validate_reserved_names_detailed(&source)?;
         self.validate_references_detailed(&source)
@@ -1145,6 +1164,7 @@ impl Config {
     pub fn validate_assembled(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
+        self.validate_inbound_detailed(&source)?;
         crate::node::validate_node_collection(&self.nodes)?;
         // Provider display names are not operator declarations of reserved builtins.
         self.validate_references_detailed(&source)?;
