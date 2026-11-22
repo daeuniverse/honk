@@ -525,6 +525,7 @@ impl ControlPlane {
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
+        let health_targets = health_registrations(&new_config, &new_outbound_id_map);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -736,6 +737,9 @@ impl ControlPlane {
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();
+                // A node can retain its runtime while leaving all health-checked groups.
+                // Publish its registration under the same fence as the runtime swap.
+                self.alive_set.sync_registrations(health_targets);
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.
@@ -858,7 +862,6 @@ impl ControlPlane {
             .await;
         {
             let config = self.config.read().await;
-            let _ = sync_health_check_nodes(&self.alive_set, &config);
             self.alive_set
                 .sync_urltest_groups(&urltest_group_registrations(&config));
             self.alive_set

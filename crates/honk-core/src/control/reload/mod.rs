@@ -27,10 +27,12 @@ pub(in crate::control) use warm::{
 #[cfg(test)]
 pub(in crate::control) use subscription::config_with_subscription_nodes;
 
+#[cfg(test)]
+pub(in crate::control) use connectivity::sync_health_check_nodes;
 pub(in crate::control) use connectivity::{
     build_outbound_id_map, group_check_url_registrations, group_connectivity_snapshot,
-    group_datapath_alive, install_interrupt_callback, install_selector_warm_callback,
-    open_group_connectivity, publish_group_connectivity, sync_health_check_nodes,
+    group_datapath_alive, health_registrations, install_interrupt_callback,
+    install_selector_warm_callback, open_group_connectivity, publish_group_connectivity,
     urltest_group_registrations,
 };
 

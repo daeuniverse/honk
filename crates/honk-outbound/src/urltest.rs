@@ -17,12 +17,15 @@
 //! Native probes use a caller-owned absolute deadline and cancellation signal;
 //! cold probes include connection setup and do not publish legacy health/Score feedback.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement};
+use crate::alive::{
+    AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement, ProbeTicket,
+};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
 };
 use crate::proxy::{ProxyRegistry, TcpOutbound};
+use crate::runtime::SharedRuntimeRegistry;
 use anyhow::{Context, anyhow};
 use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
 use honk_config::node::Node;
@@ -557,14 +560,16 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record measured TCP latency. An arbitrary measurement
-/// target failing does not establish a real dial failure or node-wide outage.
+/// alive set: successful measurements from current tickets record TCP latency.
+/// An arbitrary measurement target failing does not establish a real dial
+/// failure or node-wide outage.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 #[allow(clippy::too_many_arguments)]
 pub async fn urltest_group_with_feedback(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -575,6 +580,7 @@ pub async fn urltest_group_with_feedback(
     urltest_group_impl(
         members,
         generation,
+        published,
         registry,
         alive_set,
         url,
@@ -587,8 +593,9 @@ pub async fn urltest_group_with_feedback(
 
 #[allow(clippy::too_many_arguments)]
 async fn urltest_group_impl(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -600,9 +607,11 @@ async fn urltest_group_impl(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
     let url = url.to_string();
     let mut join_set = tokio::task::JoinSet::new();
-    for node in members {
-        let node = node.clone();
+    for (node, ticket) in members {
+        let node = (*node).clone();
+        let ticket = ticket.clone();
         let generation = Arc::clone(generation);
+        let published = Arc::clone(published);
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -633,7 +642,7 @@ async fn urltest_group_impl(
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
             if let Ok(latency) = &result {
-                alive_set.record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, *latency);
+                alive_set.record_urltest_latency(&published, &generation, &ticket, *latency);
             }
             (node.name.clone(), result)
         });
@@ -649,7 +658,7 @@ async fn urltest_group_impl(
     let order: std::collections::HashMap<&str, usize> = members
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.name.as_str(), i))
+        .map(|(i, (node, _))| (node.name.as_str(), i))
         .collect();
     results.sort_by_key(|(name, _)| order.get(name.as_str()).copied().unwrap_or(usize::MAX));
     results

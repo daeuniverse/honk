@@ -22,6 +22,9 @@ use std::{
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
+#[cfg(feature = "clash-api")]
+mod clash_delay;
+
 #[derive(Debug)]
 struct DirectConnectHandler;
 

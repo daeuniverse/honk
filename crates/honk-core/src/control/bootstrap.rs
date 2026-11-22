@@ -96,9 +96,8 @@ impl ControlPlane {
         // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
         alive_set.set_direct_check_addr(direct_target.clone());
-        // Register health checks per the config's group membership; reload
-        // re-runs the same sync via `reload_group_manager`.
-        let (added, _) = sync_health_check_nodes(&alive_set, &config);
+        let reachable = build_outbound_id_map(&config);
+        let (added, _) = alive_set.sync_registrations(health_registrations(&config, &reachable));
         info!(
             "Registered {}/{} nodes for health check ({} skipped: not in any group)",
             added,
@@ -111,7 +110,7 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
+        let outbound_id_map = Arc::new(parking_lot::RwLock::new(reachable));
         {
             let map = outbound_id_map.clone();
             alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {

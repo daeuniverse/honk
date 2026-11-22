@@ -1119,6 +1119,25 @@ impl OutboundRuntimeRegistry {
         self.nodes.get(id).map(Arc::clone)
     }
 
+    /// Chains rebuild their wrapper at every publication. Their physical owners
+    /// survive only when every hop is the same runtime, in the same order.
+    pub(crate) fn retains_dial_path(&self, previous: &Self, id: &uuid::Uuid) -> bool {
+        let (Some(current), Some(captured)) = (self.nodes.get(id), previous.nodes.get(id)) else {
+            return false;
+        };
+        if Arc::ptr_eq(current, captured) {
+            return true;
+        }
+        let hops = current.chain_hops();
+        let prior = captured.chain_hops();
+        !hops.is_empty()
+            && hops.len() == prior.len()
+            && hops
+                .iter()
+                .zip(prior)
+                .all(|(current, captured)| Arc::ptr_eq(current, captured))
+    }
+
     /// Iterate every runtime of this generation (observability/gauges).
     pub fn values(&self) -> impl Iterator<Item = &Arc<NodeRuntime>> {
         self.nodes.values()

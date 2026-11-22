@@ -2,6 +2,7 @@ use super::{AliveDialerSet, IpVersion, ProbeDomain, RegisteredNode};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 use uuid::Uuid;
 
@@ -71,11 +72,12 @@ pub struct GroupProbeContext {
     pub member_id: Uuid,
 }
 
-/// Registration and group-target identity captured before a native probe starts.
+/// Registration and group-target identity captured before a probe starts.
 #[derive(Debug, Clone)]
 pub struct ProbeTicket {
     node: Uuid,
     registration: Option<Arc<RegisteredNode>>,
+    direct_removals: u64,
     group_epoch: Option<Uuid>,
 }
 
@@ -192,10 +194,19 @@ impl HealthHistory {
         self.group_recent.clear();
     }
 
-    /// Dropping rows shifts indices, so the marks restart; they only bias replacement.
     pub(super) fn remove_node(&mut self, node: Uuid) {
         self.nodes.remove(&node);
-        self.groups.retain(|sample| sample.node_id != node);
+        self.remove_group_rows(|id| *id == node);
+    }
+
+    pub(super) fn remove_nodes(&mut self, removed: impl Fn(&Uuid) -> bool) {
+        self.nodes.retain(|id, _| !removed(id));
+        self.remove_group_rows(removed);
+    }
+
+    /// Dropping rows shifts indices, so the marks restart; they only bias replacement.
+    fn remove_group_rows(&mut self, removed: impl Fn(&Uuid) -> bool) {
+        self.groups.retain(|sample| !removed(&sample.node_id));
         self.group_recent.clear();
         self.group_recent.resize(self.groups.len(), false);
     }
@@ -266,8 +277,59 @@ impl AliveDialerSet {
         ProbeTicket {
             node,
             registration: registered.get(&node).cloned(),
+            direct_removals: if node == honk_config::config::DIRECT_NODE_ID {
+                self.direct_removals.load(Ordering::Relaxed)
+            } else {
+                0
+            },
             group_epoch: self.health_epoch(),
         }
+    }
+
+    /// A retained node keeps its delay evidence across an unrelated reload.
+    /// Both its physical dial path and its health registration must still match.
+    pub fn record_urltest_latency(
+        &self,
+        published: &crate::runtime::SharedRuntimeRegistry,
+        generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+        ticket: &ProbeTicket,
+        latency: Duration,
+    ) {
+        let current = || {
+            let runtime = published.read();
+            if !runtime.retains_dial_path(generation, &ticket.node) {
+                return None;
+            }
+            let registered =
+                self.lock_probe_registration(ticket.node, ticket.registration.as_ref())?;
+            if ticket.node == honk_config::config::DIRECT_NODE_ID
+                && self.direct_removals.load(Ordering::Relaxed) != ticket.direct_removals
+            {
+                return None;
+            }
+            Some((runtime, registered))
+        };
+        let Some(authority) = current() else {
+            return;
+        };
+        let domain = ProbeDomain::Tcp;
+        let family = IpVersion::V4;
+        let revived = self.record_probe_latency_state(ticket.node, domain, family, latency, false);
+        drop(authority);
+        if revived {
+            self.notify_health_change(ticket.node, domain, family, true, || current().is_some());
+        }
+    }
+
+    fn lock_probe_registration(
+        &self,
+        node: Uuid,
+        captured: Option<&Arc<RegisteredNode>>,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, HashMap<Uuid, Arc<RegisteredNode>>>> {
+        let registered = self.registered.read();
+        (Self::same_registration(registered.get(&node), captured)
+            && (captured.is_some() || node == honk_config::config::DIRECT_NODE_ID))
+            .then_some(registered)
     }
 
     /// Retain the exact typed sample, without changing legacy liveness or latency.
@@ -343,12 +405,9 @@ impl AliveDialerSet {
         required_epoch: Option<Uuid>,
         observation: HealthObservation,
     ) -> bool {
-        let registered = self.registered.read();
-        if !Self::same_registration(registered.get(&node), registration)
-            || (registration.is_none() && node != honk_config::config::DIRECT_NODE_ID)
-        {
+        let Some(_registered) = self.lock_probe_registration(node, registration) else {
             return false;
-        }
+        };
         let mut retained = self.health_observations.write();
         let Some(retained) = retained.as_mut() else {
             return false;
@@ -439,12 +498,9 @@ impl AliveDialerSet {
         epoch: Uuid,
         observation: HealthObservation,
     ) -> bool {
-        let registered = self.registered.read();
-        if !Self::same_registration(registered.get(&node), registration)
-            || (registration.is_none() && node != honk_config::config::DIRECT_NODE_ID)
-        {
+        let Some(_registered) = self.lock_probe_registration(node, registration) else {
             return false;
-        }
+        };
         let mut retained = self.health_observations.write();
         let Some(retained) = retained
             .as_mut()
