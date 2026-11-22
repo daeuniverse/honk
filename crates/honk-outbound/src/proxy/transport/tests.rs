@@ -274,25 +274,25 @@ fn ws_tls_server_name_prefers_the_host_header() {
     let mut node = transport_node(443);
     node.tls_mut().unwrap().enabled = true;
     node.transport_mut().unwrap().transport = "ws".into();
-    assert_eq!(tls_server_name(&node), "127.0.0.1");
+    assert_eq!(node.tls_server_name(), "127.0.0.1");
 
     node.transport_mut().unwrap().ws_host = Some("cdn.example".into());
-    assert_eq!(tls_server_name(&node), "cdn.example");
+    assert_eq!(node.tls_server_name(), "cdn.example");
 
     node.transport_mut().unwrap().ws_host = Some("cdn.example:8443".into());
-    assert_eq!(tls_server_name(&node), "cdn.example");
+    assert_eq!(node.tls_server_name(), "cdn.example");
 
     node.transport_mut().unwrap().ws_host = Some("[2001:db8::1]:8443".into());
-    assert_eq!(tls_server_name(&node), "2001:db8::1");
+    assert_eq!(node.tls_server_name(), "2001:db8::1");
 
     node.transport_mut().unwrap().ws_host = Some(String::new());
-    assert_eq!(tls_server_name(&node), "127.0.0.1");
+    assert_eq!(node.tls_server_name(), "127.0.0.1");
 
     node.tls_mut().unwrap().sni = Some("sni.example".into());
-    assert_eq!(tls_server_name(&node), "sni.example");
+    assert_eq!(node.tls_server_name(), "sni.example");
 
     node.tls_mut().unwrap().sni = None;
     node.transport_mut().unwrap().transport = "grpc".into();
     node.transport_mut().unwrap().ws_host = Some("cdn.example".into());
-    assert_eq!(tls_server_name(&node), "127.0.0.1");
+    assert_eq!(node.tls_server_name(), "127.0.0.1");
 }

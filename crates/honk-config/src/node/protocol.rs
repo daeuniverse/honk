@@ -21,6 +21,13 @@ pub struct TlsOptions {
     pub alpn: Vec<String>,
 }
 
+/// DNS can publish an ECHConfigList for a hostname, not an IP literal.
+pub fn ech_discovery_name(server_name: &str) -> Option<&str> {
+    let name = server_name.trim_end_matches('.');
+    let host = name.trim_start_matches('[').trim_end_matches(']');
+    (!name.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(name)
+}
+
 impl TlsOptions {
     /// Resolve key presence without turning incomplete REALITY intent into ordinary TLS.
     /// Decoding the key and short ID belongs to the outbound handshake parser.
@@ -35,6 +42,10 @@ impl TlsOptions {
     /// True when the dial speaks TLS or authenticated REALITY.
     pub fn is_secure(&self) -> bool {
         self.enabled || matches!(self.effective_reality_public_key(), Ok(Some(_)))
+    }
+
+    pub fn uses_ech_discovery(&self) -> bool {
+        self.ech_enabled && self.ech_config.is_none() && self.ech_config_path.is_none()
     }
 
     pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {

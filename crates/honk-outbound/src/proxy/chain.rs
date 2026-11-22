@@ -173,21 +173,24 @@ impl TcpOutbound for ChainHandler {
             );
         }
         let deadline = Instant::now() + connect_timeout * 3;
+        let scope = crate::runtime::capture_dial_scope();
+        let attempt = |reality_key_shares| {
+            // Retain physical dial credits through this attempt's handshakes.
+            // A serial retry drops the failed carrier and owns fresh credits.
+            scope.physical_setup().scope(self.dial_hops(
+                hops,
+                target,
+                target_domain,
+                connect_timeout,
+                deadline,
+                reality_key_shares,
+            ))
+        };
         let dial = async {
-            match self
-                .dial_hops(hops, target, target_domain, connect_timeout, deadline, true)
-                .await
-            {
+            let first = attempt(true).await;
+            match first {
                 Err((hop, error)) if hop > 0 && reality_mask_certificate(&error) => {
-                    self.dial_hops(
-                        hops,
-                        target,
-                        target_domain,
-                        connect_timeout,
-                        deadline,
-                        false,
-                    )
-                    .await
+                    attempt(false).await
                 }
                 result => result,
             }

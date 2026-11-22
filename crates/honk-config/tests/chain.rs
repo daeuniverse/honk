@@ -455,4 +455,30 @@ mod assembled {
             assert_eq!(error.setting.to_string(), "nodes[3].hops[2]");
         }
     }
+
+    #[test]
+    fn ech_discovery_depends_on_the_hop_position_and_effective_tls_name() {
+        for (link, allowed_as_exit) in [
+            ("trojan://p@land.test:443?ech=1", false),
+            (
+                "trojan://p@127.0.0.1:443?ech=1&type=ws&host=land.test",
+                false,
+            ),
+            ("trojan://p@land.test:443?ech=1&sni=127.0.0.1", true),
+            ("trojan://p@land.test:443?ech_config=QUJDMTIz", true),
+        ] {
+            let nodes = format!(" peer: '{link}'\n socks: '{SOCKS}'\n");
+            let (front, _) = parse(&format!("{nodes} via: peer -> socks\n")).unwrap();
+            front.assemble(resolve_group_filters).unwrap();
+            let (exit, _) = parse(&format!("{nodes} via: socks -> peer\n")).unwrap();
+            let result = exit.assemble(resolve_group_filters);
+            if allowed_as_exit {
+                result.unwrap();
+            } else {
+                let diagnostic = result.unwrap_err().diagnostic;
+                assert_eq!(diagnostic.code, "unsupported-chain-hop");
+                assert_eq!(diagnostic.setting.to_string(), "nodes[3].hops[2]");
+            }
+        }
+    }
 }

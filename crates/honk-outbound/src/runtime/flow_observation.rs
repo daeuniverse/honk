@@ -207,7 +207,7 @@ impl FlowObserver {
             & bit
             == 0
         {
-            self.publish(FlowEvent::Milestone { milestone });
+            (self.callback)(self.context, FlowEvent::Milestone { milestone });
         }
     }
 
@@ -367,7 +367,9 @@ async fn scoped<T, E>(
 pub(crate) async fn request_write<T, E>(
     future: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
 ) -> Result<T, E> {
-    let Some(observer) = current() else {
+    let Some(observer) =
+        current().filter(|flow| flow.dropped & Milestone::TargetRequestSent.bit() == 0)
+    else {
         return future.await;
     };
     scoped(RequestWrite::new(RequestTarget::Flow(observer)), future).await

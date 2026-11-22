@@ -1,4 +1,5 @@
 use super::*;
+use crate::group::ScoreOutcome;
 use crate::proxy::{AsyncReadWrite, ProtocolEntry, ProxyRegistry, node_failure};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{
@@ -442,6 +443,64 @@ async fn dropping_the_dial_after_the_first_hop_releases_everything() {
     }
 }
 
+#[tokio::test]
+async fn cancelling_a_socks_chain_releases_its_credit_while_the_parent_scope_is_alive() {
+    use futures_util::FutureExt as _;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let entry = socks5_relay(Vec::new(), false).await;
+        let front = socks5("front", "127.0.0.1", entry.addr.port());
+        let exit = socks5("exit", "127.0.0.1", listener.local_addr().unwrap().port());
+        let via = chain(&[&front, &exit]);
+        let via_id = via.id;
+        let (generation, _) = OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
+            &[via, front, exit],
+            1,
+            1,
+            1,
+            false,
+            None,
+        )
+        .unwrap();
+        let generation = Arc::new(generation);
+        let scope = generation.dial_scope(|| {});
+        let dial = tokio::spawn({
+            let scope = Arc::clone(&scope);
+            let generation = Arc::clone(&generation);
+            async move {
+                let registry = ProxyRegistry::default_resolver().unwrap();
+                scope
+                    .scope(registry.dial_runtime(
+                        generation,
+                        via_id,
+                        target(),
+                        None,
+                        Duration::from_secs(10),
+                    ))
+                    .await
+            }
+        });
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        peer.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        assert!(generation.acquire_dial_permit().now_or_never().is_none());
+
+        dial.abort();
+        assert!(dial.await.unwrap_err().is_cancelled());
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(generation.acquire_dial_permit().now_or_never().is_some());
+        assert_eq!(
+            entry.requests(),
+            [listener.local_addr().unwrap().to_string()]
+        );
+        drop(scope);
+    })
+    .await
+    .unwrap();
+}
+
 /// Selector warm-up and preconnect pass over a chain: it has no session of
 /// its own to warm and no bare socket to pool, and asking to warm it leaves
 /// its session-protocol front cold.
@@ -506,6 +565,30 @@ async fn the_chain_deadline_bounds_every_hop_together() {
             .map(std::io::Error::kind),
         Some(std::io::ErrorKind::TimedOut)
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn reality_retry_uses_the_original_chain_deadline() {
+    let delay = Duration::from_millis(80);
+    let fakes = Fakes::new(
+        FakeHop {
+            delay,
+            ..Default::default()
+        },
+        FakeHop {
+            delay,
+            masked: true,
+            ..Default::default()
+        },
+    );
+    let started = Instant::now();
+    let error = fakes.dial(Duration::from_millis(100)).await.unwrap_err();
+    assert_eq!(started.elapsed(), Duration::from_millis(300));
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::Timeout);
+    let calls = fakes.calls();
+    assert_eq!(calls.len(), 4);
+    assert_eq!(calls[3].key_shares, Some(false));
+    assert_eq!(calls[3].timeout, Duration::from_millis(60));
 }
 
 /// The whole chain runs inside the generation's dial scope. A generation that

@@ -269,6 +269,29 @@ mod relayed_request {
     use crate::proxy::vmess::VmessHandler;
     use crate::runtime::flow_observation::Milestone;
 
+    #[tokio::test]
+    async fn a_masked_hop_does_not_claim_an_outer_requests_bytes() {
+        use crate::proxy::request_observation_support::DeferringCarrier;
+        use crate::runtime::flow_observation::{request_write, without_target_milestones};
+
+        let (client, mut peer) = tokio::io::duplex(8);
+        let (mut carrier, pending) = DeferringCarrier::new(client);
+        let (observer, events) = observed();
+        observer
+            .scope(async {
+                let nested = without_target_milestones(write_request(&mut carrier, b"last"));
+                request_write(std::pin::pin!(nested)).await.unwrap();
+            })
+            .await;
+        assert!(events.lock().is_empty(), "not delivered yet");
+        let mut bytes = [0; 4];
+        peer.read_exact(&mut bytes).await.unwrap();
+        assert_eq!(&bytes, b"last");
+        let (request, position) = pending.lock().take().unwrap();
+        request.delivered(position);
+        assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
+    }
+
     fn vmess_over_websocket() -> Node {
         let mut node = Node {
             name: "vmess-ws".into(),

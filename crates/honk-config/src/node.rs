@@ -140,6 +140,14 @@ impl Node {
     /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
     /// in step with this table.
     pub fn supports_tunneled_dial(&self) -> bool {
+        if let Some(tls) = self.tls()
+            && tls.enabled
+            && tls.uses_ech_discovery()
+            && matches!(tls.effective_reality_public_key(), Ok(None))
+            && ech_discovery_name(&self.tls_server_name()).is_some()
+        {
+            return false;
+        }
         match &self.outbound {
             OutboundConfig::Socks5(_) | OutboundConfig::Shadowsocks(_) => true,
             OutboundConfig::Trojan(_) | OutboundConfig::Vmess(_) => !self.is_xhttp(),
@@ -157,6 +165,29 @@ impl Node {
             | OutboundConfig::Block
             | OutboundConfig::Chain(_) => false,
         }
+    }
+
+    /// Explicit SNI precedes the WebSocket Host authority and the configured endpoint.
+    pub fn tls_server_name(&self) -> Cow<'_, str> {
+        if let Some(sni) = self.tls().and_then(|tls| tls.sni.as_deref()) {
+            return Cow::Borrowed(sni);
+        }
+        if let Some(authority) = self
+            .transport()
+            .filter(|transport| transport.transport == "ws")
+            .and_then(|transport| transport.ws_host.as_deref())
+            .and_then(|host| host.parse::<http::uri::Authority>().ok())
+        {
+            // The TLS connector recognizes an IPv6 literal only without brackets.
+            return Cow::Owned(
+                authority
+                    .host()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned(),
+            );
+        }
+        Cow::Borrowed(self.host())
     }
 
     pub fn is_xhttp(&self) -> bool {
