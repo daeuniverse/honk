@@ -1024,6 +1024,7 @@ runtime 准入會驗證這些繫結。`build_reusing_with_admission` 先建置�
 
 鏈在 `without_target_milestones` 中執行出口之前的各跳，遮蔽它們的 `TargetRequestSent` 和 `TargetConfirmed`，保留 `TransportAttached`、`TransportReady` 等傳輸事件。`TransportAttached` 對應實體入口的連線。
 末跳的 `TargetRequestSent` 跟隨請求通過 WS、VMess 中繼和 gRPC 驅動程式。入口為 Hysteria2、TUIC 或 Juicity 時，必須確認此請求在該 QUIC 串流上已接受的所有位元組區間都已提交給本機 UDP 通訊端；對端 ACK 或其他串流的資料報不能取代這項證據。若提交結果不確定（包括與請求交錯寫出的控制訊框），即使對端已收到資料，也可能沒有這筆紀錄；不會因此重送。首跳 AnyTLS、VLESS 多工和 XHTTP 仍可在工作階段寫入器接受位元組時回報交付。`TargetConfirmed` 仍須由協定確認目標。
+啟用觀測時，Hysteria2 仍在同一次寫入中送出待寫的協定標頭和第一段承載資料。回執只追蹤已接受的資料位元組；僅送出標頭不算末跳請求已傳送。
 
 出口之前的某一跳拒絕連線至下一跳時，失敗歸於鏈式節點。即使拒絕延遲到後續的讀取、寫入、送出緩衝資料或關閉串流時才回傳，也會保留出錯的跳、原始 I/O 錯誤及同一次共用失敗的識別碼。出口對實際目的地的拒絕仍是目標失敗。本機策略拒絕、容量不足和取消保留各自的分類。
 

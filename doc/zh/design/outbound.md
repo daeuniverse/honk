@@ -1025,6 +1025,7 @@ runtime 准入校验这些绑定。`build_reusing_with_admission` 先构建或�
 
 链在 `without_target_milestones` 中运行出口之前的各跳，屏蔽它们的 `TargetRequestSent` 和 `TargetConfirmed`，保留 `TransportAttached`、`TransportReady` 等传输事件。`TransportAttached` 对应实体入口的物理连接。
 末跳的 `TargetRequestSent` 跟随请求穿过 WS、VMess 中继和 gRPC 驱动。入口为 Hysteria2、TUIC 或 Juicity 时，必须确认本请求在该 QUIC 流上已接受的所有字节区间都已提交给本地 UDP 套接字；对端 ACK 或其他流的数据报不能替代这项证据。若提交结果不确定（包括与请求交错写出的控制帧），即使对端收到了数据，也可能没有这条记录；不会因此重发。首跳 AnyTLS、VLESS 多路复用和 XHTTP 仍可在会话写入器接受字节时报告交付。`TargetConfirmed` 仍须由协议确认目标。
+启用观测时，Hysteria2 仍在一次写入中提交待写的协议头和首段负载。回执只跟踪已接受的负载字节；仅发出协议头不能算作末跳请求已发送。
 
 出口之前的某一跳拒绝连接下一跳时，失败归于链式节点。即使拒绝延迟到后续的读、写、刷新缓冲区或关闭流时才返回，也会保留出错的跳、原始 I/O 错误及同一次共享失败的标识。出口对实际目的地的拒绝仍是目标失败。本地策略拒绝、容量不足和取消保留各自的分类。
 

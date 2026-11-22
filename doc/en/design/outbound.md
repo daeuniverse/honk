@@ -1300,6 +1300,7 @@ uncertain submission, including control output interleaved with the request,
 can leave the milestone absent even if the peer receives the bytes. This
 does not cause a resend. First-hop AnyTLS, VLESS mux, and XHTTP session
 writers may report delivery when they accept the bytes.
+Hysteria2 offers its pending opener and the first payload together even with observation enabled. Only accepted payload bytes are tracked; sending the opener alone cannot report the final request.
 
 A typed refusal to open the next hop counts as a failure of the chain. The
 intermediate carrier tags this refusal during setup and when it surfaces on a

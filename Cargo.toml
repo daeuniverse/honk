@@ -182,5 +182,5 @@ strip = true
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
 # The maintained 0.11 fork bounds receive fragmentation and provides flow-control,
 # BBRv3 pacing and per-write local UDP submission evidence.
-quinn = { git = "https://github.com/Glassyiris/quinn", rev = "1b7db16bb829137b5adf3cea84397a47b1974033" }
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "1b7db16bb829137b5adf3cea84397a47b1974033" }
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }
