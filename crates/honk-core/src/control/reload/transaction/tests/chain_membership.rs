@@ -265,6 +265,51 @@ async fn chain_reload_preserves_health_on_rename_and_dials_the_replacement() -> 
 }
 
 #[tokio::test]
+async fn provider_chain_indexes_only_physical_hostnames_for_subtag() {
+    let config = honk_config::parser::parse_dae_config(
+        "global { nfqueue_enable: false }\nsubscription {\n P: 'https://sub.invalid/'\n}\n\
+         dns {\n upstream {\n  via: 'udp://192.0.2.53:53' -> direct\n }\n\
+         routing {\n  request {\n   subtag(P) -> via\n   fallback: via\n  }\n }\n}",
+    )
+    .unwrap();
+    let provider = config.subscriptions[0].id;
+    let auth = crate::subscription::SubscriptionAuthorizations::new(&config.subscriptions).unwrap();
+    let revision = auth.revision(provider).unwrap();
+    let cp = crate::control::tests::support::control_plane(config);
+    let front = Node::from_share_link("socks5://front.example:1080#front").unwrap();
+    let exit = Node::from_share_link("socks5://192.0.2.1:1081#exit").unwrap();
+    let hop_ids = [front.id, exit.id];
+    let nodes = vec![
+        front,
+        exit,
+        Node::chain("via", vec!["front".into(), "exit".into()]),
+    ];
+    let outcome = cp
+        .merge_authorized_subscription_nodes_with_drain(
+            provider,
+            revision,
+            &auth,
+            nodes,
+            Vec::new(),
+            &DrainTracker::new(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ReloadOutcome::Committed { .. }));
+    let mut merged = cp.config.read().await.as_ref().clone();
+    assert_eq!(
+        named_node(&merged, "via").resolved_chain_hops().unwrap(),
+        hop_ids
+    );
+    assert_eq!(
+        crate::dns::node_host::index(&merged),
+        std::collections::HashMap::from([("front.example".to_owned(), vec!["P".to_owned()])]),
+    );
+    merged.dns.routing.request.rules.clear();
+    assert!(crate::dns::node_host::index(&merged).is_empty());
+}
+
+#[tokio::test]
 async fn chain_provider_refresh_rebinds_before_rebase_and_rejects_a_missing_hop() {
     use crate::control::tests::support::control_plane;
     use crate::subscription::{SubscriptionAuthorizations, parse_subscription_content};

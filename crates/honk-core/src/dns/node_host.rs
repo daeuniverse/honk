@@ -38,7 +38,7 @@ pub(crate) fn index(config: &Config) -> NodeHosts {
         let download = node.xhttp_download_view();
         for host in std::iter::once(node.host()).chain(download.as_ref().map(Node::host)) {
             let host = host.trim_end_matches('.').to_ascii_lowercase();
-            if host.parse::<IpAddr>().is_ok() {
+            if host.is_empty() || host.parse::<IpAddr>().is_ok() {
                 continue;
             }
             let entry = hosts.entry(host).or_default();
