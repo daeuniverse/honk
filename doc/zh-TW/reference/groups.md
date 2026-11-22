@@ -40,7 +40,7 @@ group {
 | `exit` | `null` | 實驗性。在選定路徑的末端加入一個[支援隧道撥號的代理節點](./nodes.md#鏈式節點)。該跳不支援 VLESS 的 TCP 多工或依網域名稱探索 ECH 設定。見[多跳 UDP 路徑要求](#經出口的-udp)。明確指定的 `block` 仍是終止動作。 |
 | `check_url` | `null` | 給非 Selector 策略用的依群組 TCP 健康檢查目標，見 [`check_url`](#check_url)。 |
 | `tolerance` | `50` | URLTest 切換門檻，單位為毫秒，見 [`tolerance`](#tolerance)。 |
-| `idle_timeout` | `null` | URLTest 群組連續多少秒沒有被選用後暫停成員探測，見 [`idle_timeout`](#idle_timeout)。 |
+| `idle_timeout` | `null` | 群組連續多少秒沒有被選用後暫停成員探測，見 [`idle_timeout`](#idle_timeout)。 |
 | `interrupt_connections` | `false` | 選擇變化時關閉受影響的使用者態傳輸，見 [`interrupt_connections`](#interrupt_connections)。 |
 | `icon` | `null` | 原生群組讀取傳回的群組圖示，見 [`icon`](#icon)。 |
 | —（`check_interval`，dae 中不可設定） | `null` | 依群組的間隔欄位，單位為秒。目前的執行時不讀取該欄位，而使用全域間隔。 |
@@ -107,13 +107,13 @@ group {
 
 ### idle_timeout
 
-URLTest 群組連續多少秒沒有被選用後暫停成員探測；作用類似 Clash 的 `lazy`。
+群組連續多少秒沒有被選用後暫停成員探測；作用類似 Clash 的 `lazy`。
 
 該值寫成純整數：`idle_timeout: 1800`，不能寫 `30m`。`idle_timeout: 0` 表示兩次選擇之間就進入閒置，它不是連線逾時。
 
 預設 `null`，此時使用 1800 秒。
 
-URLTest 群組在第一次被選中之前保持閒置，之後只要連續 `idle_timeout` 秒沒有流量選中它，就再次轉入閒置。閒置期間暫停成員的週期探測，下一次選中時恢復。只要還有非 URLTest 群組，或者有活躍的 URLTest 群組能到達某個節點，該節點就繼續接受探測。
+群組在第一次被選中之前保持閒置，之後只要連續 `idle_timeout` 秒沒有流量選中它，就再次轉入閒置。閒置期間暫停成員的週期探測，下一次選中時恢復；選擇或固定成員切換到被暫停的節點時，會立即探測該節點。Selector 目前選中的節點（TCP 與 UDP 選擇）、自動群組中手動固定的節點以及群組的 `final` 節點在所屬群組閒置時仍持續探測。節點只有在所屬群組全部閒置時才會暫停探測。
 
 ```dae
 group {

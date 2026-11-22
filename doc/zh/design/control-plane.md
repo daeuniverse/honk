@@ -291,7 +291,7 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
    用户态接着在同一串行边界内发布替代的 outbound registry、DNS runtime pointer、
    Router、配置、组和 projection snapshot。节点的健康检查登记与运行时注册表一起发布。
    root 已提交后，mode reset 失败会把新 generation 标为 degraded 并保持 admission fence。
-   发布完成后，退役旧 generation，替换 UDP 与 Selector warm coordinator，并同步 URLTest 组和自定义检查 URL。
+   发布完成后，退役旧 generation，替换 UDP 与 Selector warm coordinator，并同步组的空闲探测注册表和自定义检查 URL。
    已提交的 degraded generation 也会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
    赖另一个 coordinator 的 retention-reconciliation 等待；coordinator 退出之前，
    仍会 abort 并 join 自己派发的子任务。QUIC warm 释放和终止关闭在 client 槽位上

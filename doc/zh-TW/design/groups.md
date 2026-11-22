@@ -185,7 +185,7 @@ Clash 將 Score 群組表示為 `type: "url_test"`，在 `now` 中報告目前�
 
 權威 URLTest 建立失敗保留既有的單輪前三名候選重賽。重賽的新 deadline 不會建立另一份原始 Score 業務，即使首輪在自己的 deadline 之後才結束。Score 所屬建立失敗則至多依序嘗試一個不同葉節點，在排名前排除失敗 `NodeId`，不要求普通評分先改選。Score 兩次嘗試共享一個絕對建立 deadline 和實體撥號預算；規範解析保留 Selector 選擇，只允許首選真正經過的 final 群組邊，顯示名稱不授權備援。型別化本機拒絕、未通過 admission 時容量耗盡、取消和 generation 關閉均為終態；應用負載寫入後不重試。
 
-群組的 `check_url` 會建立獨立的 TCP-only 存活性和延遲狀態，key 為 `(member tag, check_url)`。失敗只會從使用該目標的群組中排除該成員。Selector 群組忽略 `check_url` 並印出 warning。URLTest 在超過 `idle_timeout` 後暫停探測；未設定時使用健康層預設的 30 分鐘，下一次真實選擇會立即喚醒探測。
+群組的 `check_url` 會建立獨立的 TCP-only 存活性和延遲狀態，key 為 `(member tag, check_url)`。失敗只會從使用該目標的群組中排除該成員。Selector 群組忽略 `check_url` 並印出 warning。任何策略的群組在超過 `idle_timeout` 後暫停週期探測；未設定時使用健康層預設的 30 分鐘，下一次真實選擇會立即喚醒探測。Selector 目前選中的節點（TCP 與 UDP 選擇）、自動群組中手動固定的節點以及 `final` 節點在所屬群組閒置時仍持續探測。
 
 ## 巢狀代理群組與成員身分
 

@@ -185,7 +185,7 @@ Clash 将 Score 组表示为 `type: "url_test"`，在 `now` 中报告当前聚�
 
 权威 URLTest 建立失败保留既有的一轮前三候选重赛。重赛的新 deadline 不会创建另一份原始 Score 业务，即使首轮在自己的 deadline 之后才结束。Score 所属建立失败则至多顺序尝试一个不同叶节点，在排名前排除失败 `NodeId`，不要求普通评分先改选。Score 两次尝试共享一个绝对建立 deadline 和物理拨号预算；规范解析保留 Selector 选择，只允许首选真正经过的 final 组边，显示名称不授权兜底。类型化本地拒绝、未通过 admission 时容量耗尽、取消和 generation 关闭均为终态；应用负载写入后不重试。
 
-组的 `check_url` 会建立独立的 TCP-only 存活性和延迟状态，key 为 `(member tag, check_url)`。失败只会从使用该目标的组中排除该成员。Selector 组忽略 `check_url` 并打印 warning。URLTest 在超过 `idle_timeout` 后暂停探测；未设置时使用健康层默认的 30 分钟，下一次真实选择会立即唤醒探测。
+组的 `check_url` 会建立独立的 TCP-only 存活性和延迟状态，key 为 `(member tag, check_url)`。失败只会从使用该目标的组中排除该成员。Selector 组忽略 `check_url` 并打印 warning。任何策略的组在超过 `idle_timeout` 后暂停周期探测；未设置时使用健康层默认的 30 分钟，下一次真实选择会立即唤醒探测。Selector 当前选中的节点（TCP 和 UDP 选择）、自动组中手动固定的节点以及 `final` 节点在所属组空闲时仍持续探测。
 
 ## 嵌套代理组与成员身份
 
