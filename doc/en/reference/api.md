@@ -906,7 +906,7 @@ A node-targeted `tcp_connect` probe of `direct`, `block`, or a [proxy chain](./n
 
 Native HTTP and framed TCP DNS probes of a chain use private runtimes for both the chain and its physical hops. They share the generation and process dial limits and applicable VLESS carrier budget, without borrowing or populating live sessions. The captured DNS configuration pins the entry server address separately from the configured probe destination. Later hop hostnames are passed to the preceding proxy. The operation joins private runtime cleanup, including after cancellation or expiry.
 
-A hosts alias for an upload or split-download peer follows [the alias target's node-host policy](./dns.md#node-server-hosts). A check URL with the same hostname still uses the probe destination's DNS policy; the two lookups do not share an alias result.
+A hosts alias for an upload or split-download peer follows [the alias target's node-host policy](./dns.md#node-server-hosts). A check URL with the same hostname still uses the probe destination's DNS policy; the two lookups do not share an alias result. If the destination has no address in the requested IP family, the probe does not look up either physical peer.
 
 For native HTTP, `cold` times the dial, target TLS when used, and one validated request. `warm` times the configured request after a validated HEAD on the privately opened connection and can return that first sample on an eligible transport failure. The chain uses private hop runtimes in either mode.
 

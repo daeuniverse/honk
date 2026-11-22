@@ -464,7 +464,8 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
             .map(|ip| SocketAddr::new(ip, port));
         // Only the physical entry dials a node server locally. Later hops are
         // reached through their preceding hop, which handles any domain name.
-        let needs_server = context.spec.kind != Kind::TcpConnect
+        let needs_server = addr.is_some()
+            && context.spec.kind != Kind::TcpConnect
             && candidate.node.protocol() != honk_config::types::NodeProtocol::Direct;
         let servers = if needs_server {
             let chain = if is_chain(&candidate.node) {

@@ -769,7 +769,7 @@ async fn check_url_alias_request_rejection_has_no_bootstrap_or_dial() {
     let upload = TcpListener::bind((LIVE, 0)).await.unwrap();
     let download = TcpListener::bind((LIVE, 0)).await.unwrap();
     let (mut config, _, via) = split_config(
-        "127.0.0.1",
+        CHECK,
         upload.local_addr().unwrap().port(),
         "127.0.0.1",
         download.local_addr().unwrap().port(),
