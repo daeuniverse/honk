@@ -182,19 +182,22 @@ impl PinnedNameResolver {
     }
 
     async fn resolve_domain(&self, domain: &str, alias_first: bool) -> anyhow::Result<Vec<IpAddr>> {
+        let mut operation = self.service.operation();
+        let claim = || claimed_upstream(&self.forwarder, domain);
+        // Destinations select before admission; a physical alias selects its own target instead.
+        let destination_claim = (!alias_first).then(claim);
         let lookup = std::pin::pin!(async {
             if alias_first && let Some(alias) = self.forwarder.node_host_alias(domain)? {
                 let addresses = self.resolve_pinned_alias(alias).await?;
                 return self.select_fallback_families(domain, addresses);
             }
-            match claimed_upstream(&self.forwarder, domain) {
+            match destination_claim.unwrap_or_else(claim) {
                 Some(upstream) => {
                     resolve_claimed(&self.service, &self.forwarder, domain, upstream).await
                 }
                 None => self.resolve_unclaimed(domain).await,
             }
         });
-        let mut operation = self.service.operation();
         let resolve = std::pin::pin!(operation.run(lookup));
         match &self.runtime {
             Some(runtime) => {
