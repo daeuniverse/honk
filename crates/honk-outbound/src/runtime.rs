@@ -375,7 +375,7 @@ pub struct NodeRuntime {
 
 impl NodeRuntime {
     pub(crate) fn matches_config(&self, node: &Node) -> bool {
-        self.node.as_ref() == node || same_node_config(&self.node, node)
+        same_node_config(&self.node, node)
     }
 
     fn build_xhttp(node: &Node) -> Option<Arc<crate::proxy::transport::xhttp::XhttpRuntime>> {
@@ -770,10 +770,30 @@ impl Drop for EphemeralRuntimeGuard {
 /// the parse-time `created_at`/`updated_at` stamps (metadata, not dial
 /// configuration).
 fn same_node_config(a: &Node, b: &Node) -> bool {
-    let mut a = a.clone();
-    a.created_at = b.created_at;
-    a.updated_at = b.updated_at;
-    &a == b
+    let Node {
+        id,
+        name,
+        address,
+        host,
+        port,
+        outbound,
+        mark,
+        tags,
+        subscription_id,
+        group_id,
+        created_at: _,
+        updated_at: _,
+    } = a;
+    id == &b.id
+        && name == &b.name
+        && address == &b.address
+        && host == &b.host
+        && port == &b.port
+        && outbound == &b.outbound
+        && mark == &b.mark
+        && tags == &b.tags
+        && subscription_id == &b.subscription_id
+        && group_id == &b.group_id
 }
 
 /// Registry build/validation errors. A failure here aborts the reload
