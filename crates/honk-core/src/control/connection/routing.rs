@@ -390,17 +390,11 @@ mod sniffed_domain_routing_tests;
 #[cfg(test)]
 mod chains_tests {
     use super::connection_chains;
-    use honk_config::node::{Node, OutboundConfig};
+    use honk_config::node::Node;
 
     #[test]
     fn chain_hops_follow_the_selected_node_with_the_exit_first() {
-        let node = Node {
-            name: "via".into(),
-            outbound: OutboundConfig::Chain {
-                hops: vec!["front".into(), "land".into()],
-            },
-            ..Node::default()
-        };
+        let node = Node::chain("via", vec!["front".into(), "land".into()]);
         assert_eq!(
             connection_chains(vec!["proxy".into(), "via".into()], &node),
             ["land", "front", "via", "proxy"]

@@ -597,14 +597,7 @@ async fn a_group_tcp_connect_probe_reports_its_chain_member_unavailable() {
     front.name = "front".into();
     let mut land = Node::from_share_link("socks5://127.0.0.1:1081").unwrap();
     land.name = "land".into();
-    let mut via = Node {
-        name: "via".into(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: vec!["front".into(), "land".into()],
-        },
-        ..Node::default()
-    };
-    via.id = via.derive_id();
+    let via = Node::chain_from_nodes("via", &[&front, &land]).unwrap();
     let (front_id, via_id) = (front.id, via.id);
     let mut config = Config::default();
     config.nodes.extend([front, land, via]);

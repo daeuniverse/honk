@@ -880,9 +880,7 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
 fn udp_selection_skips_chain_nodes() {
     let front = make_node(nid("front"), "front");
     let mut chain = make_node(nid("via"), "via");
-    chain.outbound = honk_config::node::OutboundConfig::Chain {
-        hops: vec!["front".into(), "land".into()],
-    };
+    chain.outbound = Node::chain(&chain.name, vec!["front".into(), "land".into()]).outbound;
     let nodes = vec![chain.clone(), front.clone()];
     let m = GroupManager::with_alive_set(
         &[make_group(

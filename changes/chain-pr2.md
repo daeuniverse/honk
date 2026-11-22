@@ -1,3 +1,3 @@
 Added
 
-- Chain nodes: `via: front -> mid -> land` in `node {}` sends TCP, not UDP, through two to four nodes in turn. Hops after the first must be SOCKS5, Shadowsocks, Trojan, VMess or VLESS, without XHTTP, Vision, VLESS Encryption or TCP multiplexing. A chain keeps its own ID, health and Score, and the APIs list it with protocol `chain`.
+- Define a TCP proxy chain of two to four supported nodes with `via: front -> mid -> land` in `node {}`. Groups can select a chain, and the APIs list it as `chain` with its own health and Score. Its ID stays stable when only display names change and changes when a hop's physical identity or order changes.

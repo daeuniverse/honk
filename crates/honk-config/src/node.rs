@@ -10,7 +10,8 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::{MAX_CHAIN_HOPS, ResolvedChain, resolve_chain_hops, validate_node_collection};
+pub(crate) use validation::bind_node_collection;
+pub use validation::{MAX_CHAIN_HOPS, validate_node_collection, validate_partial_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
@@ -60,9 +61,8 @@ pub const NODE_ID_NAMESPACE: uuid::Uuid =
 /// outbounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
-    /// Stable identity derived from the node's content by [`Node::derive_id`]
-    /// at every construction entry (nil until then — the runtime registry
-    /// rejects nil IDs, so a missed entry fails loudly).
+    /// Stable identity derived by [`Node::derive_id`]. Chain declarations
+    /// receive their canonical ID when assembled with their physical hops.
     pub id: uuid::Uuid,
     pub name: String,
     pub address: String,
@@ -110,6 +110,31 @@ impl Node {
         self.outbound.chain_hops()
     }
 
+    /// Declare a chain whose hop names will be bound during snapshot assembly.
+    pub fn chain(name: &str, hops: Vec<String>) -> Self {
+        Self {
+            name: name.to_owned(),
+            outbound: OutboundConfig::Chain(ChainConfig::new(hops)),
+            ..Self::default()
+        }
+    }
+
+    /// Physical hop IDs of a bound chain, entry first.
+    pub fn resolved_chain_hops(&self) -> Option<&[uuid::Uuid]> {
+        match &self.outbound {
+            OutboundConfig::Chain(config) => config.resolved.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn bind_chain(&mut self, hops: std::sync::Arc<[uuid::Uuid]>) {
+        let OutboundConfig::Chain(config) = &mut self.outbound else {
+            unreachable!("only a chain can bind hops");
+        };
+        config.resolved = Some(hops);
+        self.id = self.derive_id();
+    }
+
     /// Whether this node's handshake can run over a stream tunneled through
     /// an earlier chain hop. A chain's first hop dials as usual; every later
     /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
@@ -130,7 +155,7 @@ impl Node {
             | OutboundConfig::AnyTls(_)
             | OutboundConfig::Direct
             | OutboundConfig::Block
-            | OutboundConfig::Chain { .. } => false,
+            | OutboundConfig::Chain(_) => false,
         }
     }
 
@@ -350,7 +375,24 @@ impl Node {
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
+    /// Chains use their ordered physical hop IDs and have a nil derivation until bound.
     pub fn derive_id(&self) -> uuid::Uuid {
+        if let OutboundConfig::Chain(chain) = &self.outbound {
+            let Some(hops) = chain.resolved.as_deref() else {
+                return uuid::Uuid::nil();
+            };
+            const PREFIX: &[u8] = b"chain|";
+            let mut material = [0; PREFIX.len() + 16 * MAX_CHAIN_HOPS];
+            let (prefix, tail) = material.split_at_mut(PREFIX.len());
+            prefix.copy_from_slice(PREFIX);
+            for (slot, id) in tail.as_chunks_mut::<16>().0.iter_mut().zip(hops) {
+                *slot = *id.as_bytes();
+            }
+            return uuid::Uuid::new_v5(
+                &NODE_ID_NAMESPACE,
+                &material[..PREFIX.len() + 16 * hops.len()],
+            );
+        }
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
@@ -429,7 +471,7 @@ pub struct Group {
     /// Serialized only when `own.interrupt_connections` is set.
     #[serde(skip_serializing)]
     pub interrupt_connections: bool,
-    /// Which defaulted options the group's own source sets.
+    /// Source metadata used when resolving group defaults.
     #[serde(skip)]
     pub own: OwnOptions,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -458,11 +500,14 @@ impl Default for Group {
     }
 }
 
-/// Group options whose effective value otherwise comes from a default or `global`.
+/// Source metadata for inherited group options and implicit membership.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnOptions {
     pub tolerance: bool,
     pub interrupt_connections: bool,
+    /// Whether source resolution opted this unfiltered group into all proxy nodes.
+    #[doc(hidden)]
+    pub implicit_all_nodes: bool,
 }
 
 impl Serialize for Group {
@@ -543,6 +588,7 @@ impl<'de> Deserialize<'de> for Group {
             own: OwnOptions {
                 tolerance: wire.tolerance.is_some(),
                 interrupt_connections: wire.interrupt_connections.is_some(),
+                ..Default::default()
             },
             created_at: wire.created_at,
         })

@@ -2,8 +2,8 @@
 
 use honk_config::Config;
 use honk_config::diagnostic::DetailedDiagnostic;
-use honk_config::node::{Node, OutboundConfig};
-use honk_config::parser::parse_dae_config_with_detailed_diagnostics;
+use honk_config::node::{Group, Node, validate_node_collection};
+use honk_config::parser::{parse_dae_config_with_detailed_diagnostics, resolve_group_filters};
 use honk_config::types::NodeProtocol;
 
 const SOCKS: &str = "socks5://127.0.0.1:1080";
@@ -31,21 +31,13 @@ fn chain<'a>(config: &'a Config, name: &str) -> &'a Node {
 }
 
 fn chain_node(name: &str, hops: &[&str]) -> Node {
-    let mut node = Node {
-        name: name.into(),
-        outbound: OutboundConfig::Chain {
-            hops: hops.iter().map(|hop| hop.to_string()).collect(),
-        },
-        ..Node::default()
-    };
-    node.id = node.derive_id();
-    node
+    Node::chain(name, hops.iter().map(|hop| hop.to_string()).collect())
 }
 
 #[test]
-fn two_and_three_hop_chains_parse_in_entry_to_exit_order() {
+fn two_to_four_hop_chains_parse_in_entry_to_exit_order() {
     let (config, diagnostics) = parse(&format!(
-        " front: '{SOCKS}'\n mid: '{SS}'\n land: '{TROJAN}'\n via: front -> land\n far: front->mid -> land\n"
+        " front: '{SOCKS}'\n mid: '{SS}'\n land: '{TROJAN}'\n spare: 'socks5://127.0.0.1:1081'\n via: front -> land\n far: front->mid -> land\n furthest: front -> mid -> spare -> land\n"
     ))
     .unwrap();
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -57,7 +49,12 @@ fn two_and_three_hop_chains_parse_in_entry_to_exit_order() {
         chain(&config, "far").chain_hops().unwrap(),
         ["front", "mid", "land"]
     );
-    assert_eq!(via.id, via.derive_id());
+    assert_eq!(
+        chain(&config, "furthest").chain_hops().unwrap(),
+        ["front", "mid", "spare", "land"]
+    );
+    assert!(via.id.is_nil() && via.derive_id().is_nil());
+    assert!(via.resolved_chain_hops().is_none());
 }
 
 #[test]
@@ -161,36 +158,149 @@ fn intrinsic_checks_bound_hops_and_endpoint() {
 }
 
 #[test]
-fn identity_follows_protocol_and_ordered_hops_only() {
-    let base = chain_node("via", &["a", "b"]);
-    assert_eq!(base.id, chain_node("renamed", &["a", "b"]).id);
-    assert_ne!(base.id, chain_node("via", &["b", "a"]).id);
-    assert_ne!(base.id, chain_node("via", &["a", "c"]).id);
-    assert_ne!(base.id, chain_node("via", &["a", "b", "c"]).id);
-    assert_ne!(
-        chain_node("via", &["a|b", "c"]).id,
-        chain_node("via", &["a", "b|c"]).id
+fn checked_constructor_refuses_invalid_hops() {
+    let front = Node::from_share_link(&format!("{SOCKS}#front")).unwrap();
+    let mut land = Node::from_share_link(&format!("{TROJAN}#land")).unwrap();
+    assert!(Node::chain_from_nodes("via", &[]).is_err());
+    assert!(Node::chain_from_nodes("via", &[&front; 5]).is_err());
+    assert!(Node::chain_from_nodes("via", &[&front, &Config::builtin_direct_node()]).is_err());
+    land.id = front.id;
+    let error = Node::chain_from_nodes("via", &[&front, &land]).unwrap_err();
+    assert_eq!(error.diagnostic.code, "noncanonical-node-id");
+}
+
+#[test]
+fn identity_follows_physical_contents_and_hop_order() {
+    let assemble = |source: String| {
+        parse(&source)
+            .unwrap()
+            .0
+            .assemble(resolve_group_filters)
+            .unwrap()
+    };
+    let original = assemble(format!(
+        " front: '{SOCKS}'\n land: '{TROJAN}'\n via: front -> land"
+    ));
+    let renamed_hop = assemble(format!(
+        " via: 'front|new' -> land\n land: '{TROJAN}'\n 'front|new': '{SOCKS}'"
+    ));
+    let renamed_chain = assemble(format!(
+        " front: '{SOCKS}'\n land: '{TROJAN}'\n renamed: front -> land"
+    ));
+    let reversed = assemble(format!(
+        " front: '{SOCKS}'\n land: '{TROJAN}'\n via: land -> front"
+    ));
+    let replaced = assemble(format!(
+        " front: '{SOCKS}'\n land: 'trojan://different@trojan.example:443'\n via: front -> land"
+    ));
+    let extended = assemble(format!(
+        " front: '{SOCKS}'\n mid: '{SS}'\n land: '{TROJAN}'\n via: front -> mid -> land"
+    ));
+
+    let base = chain(&original, "via");
+    assert!(!base.id.is_nil());
+    assert_eq!(base.id, base.derive_id());
+    assert_eq!(base.id, chain(&renamed_hop, "via").id);
+    assert_eq!(base.id, chain(&renamed_chain, "renamed").id);
+    assert_ne!(base.id, chain(&reversed, "via").id);
+    assert_ne!(base.id, chain(&replaced, "via").id);
+    assert_ne!(base.id, chain(&extended, "via").id);
+    assert_eq!(
+        chain(&original, "front").id,
+        chain(&renamed_hop, "front|new").id
     );
-    // Pinned so an accidental change to identity material is noticed.
-    assert_eq!(base.id.to_string(), "10002d11-ee0e-5576-a7d2-f4b258ad02f1");
+    assert_ne!(chain(&original, "land").id, chain(&replaced, "land").id);
 }
 
 #[test]
 fn structured_formats_round_trip_hops() {
-    let node = chain_node("via", &["front", "hk: east", "land"]);
+    let front = Node::from_share_link(&format!("{SOCKS}#front")).unwrap();
+    let middle = Node::from_share_link(&format!("{SS}#middle")).unwrap();
+    let mut land = Node::from_share_link(TROJAN).unwrap();
+    land.name = "hk: east".into();
+    let node = Node::chain_from_nodes("via", &[&front, &land, &middle]).unwrap();
     let json = serde_json::to_value(&node).unwrap();
     assert_eq!(json["protocol"], "chain");
     assert_eq!(
         json["hops"],
-        serde_json::json!(["front", "hk: east", "land"])
+        serde_json::json!(["front", "hk: east", "middle"])
     );
+    assert!(json.get("resolved").is_none());
     let from_json: Node = serde_json::from_value(json).unwrap();
     let from_yaml: Node = serde_yaml::from_str(&serde_yaml::to_string(&node).unwrap()).unwrap();
     let from_toml: Node = toml::from_str(&toml::to_string(&node).unwrap()).unwrap();
     for decoded in [from_json, from_yaml, from_toml] {
-        assert_eq!(decoded.outbound, node.outbound);
+        assert_eq!(decoded.chain_hops(), node.chain_hops());
+        assert!(decoded.resolved_chain_hops().is_none());
+        assert!(decoded.derive_id().is_nil());
+        assert_ne!(decoded, node);
         assert_eq!(decoded.id, node.id);
     }
+}
+
+#[test]
+fn structured_explicit_member_follows_the_rebound_chain_in_each_format() {
+    let (mut source, _) = parse(&format!(
+        " via: front -> land\n front: '{SOCKS}'\n land: '{TROJAN}'"
+    ))
+    .unwrap();
+    // Normalization must keep the two distinct source aliases distinct.
+    let stored_chain = source.nodes[1].id;
+    let stored_front = uuid::Uuid::from_u128(43);
+    source.nodes[0].id = stored_chain;
+    source.nodes[1].id = stored_front;
+    source.groups.push(Group {
+        name: "chosen".into(),
+        nodes: vec![stored_chain, stored_front, stored_chain],
+        groups: vec!["fallback".into()],
+        ..Default::default()
+    });
+    source.groups.push(Group {
+        name: "fallback".into(),
+        filters: vec!["name(land)".into()],
+        ..Default::default()
+    });
+    let directory = tempfile::tempdir().unwrap();
+    for format in ["json", "yaml", "toml"] {
+        let path = directory.path().join(format!("config.{format}"));
+        source.to_file(path.to_str().unwrap()).unwrap();
+        let partial = Config::from_file(path.to_str().unwrap()).unwrap();
+        partial.validate_detailed().unwrap();
+        assert!(chain(&partial, "via").resolved_chain_hops().is_none());
+        let config = partial.assemble(resolve_group_filters).unwrap();
+        let front = chain(&config, "front").id;
+        let via = chain(&config, "via");
+        let land = chain(&config, "land").id;
+        assert_eq!(via.resolved_chain_hops().unwrap(), [front, land]);
+        assert_eq!(config.groups[0].nodes, [via.id, front]);
+        assert_eq!(config.groups[1].nodes, [land]);
+        assert_eq!(front, stored_chain);
+        assert_ne!(via.id, stored_chain);
+        assert_ne!(front, stored_front);
+    }
+}
+
+#[test]
+fn structured_ambiguous_chain_alias_rejects_explicit_membership() {
+    let (mut source, _) = parse(&format!(
+        " via: front -> land\n front: '{SOCKS}'\n land: '{TROJAN}'"
+    ))
+    .unwrap();
+    let alias = source.nodes[1].id;
+    source.nodes[0].id = alias;
+    source.groups.push(Group {
+        name: "chosen".into(),
+        nodes: vec![alias],
+        ..Default::default()
+    });
+    let mut diagnostics = Vec::new();
+    let error = Config::from_json_str_with_detailed_diagnostics(
+        &source.to_json_string().unwrap(),
+        &mut diagnostics,
+    )
+    .unwrap_err();
+    assert_eq!(error.diagnostic.code, "ambiguous-group-node-reference");
+    assert_eq!(error.diagnostic.setting.to_string(), "groups[1].nodes[1]");
 }
 
 #[test]
@@ -206,14 +316,16 @@ fn ordinary_nodes_do_not_serialize_hops() {
 
 mod assembled {
     use super::*;
-    use honk_config::node::{ResolvedChain, resolve_chain_hops};
 
     const HY2: &str = "hysteria2://auth@hy2.example:443";
     const VISION: &str = "vless://00000000-0000-4000-8000-000000000001@vless.example:443?security=tls&flow=xtls-rprx-vision";
 
     fn rejection(nodes: &str) -> DetailedDiagnostic {
         let (config, _) = parse(nodes).unwrap();
-        *config.validate_assembled().unwrap_err().diagnostic
+        *config
+            .assemble(resolve_group_filters)
+            .unwrap_err()
+            .diagnostic
     }
 
     #[test]
@@ -223,6 +335,7 @@ mod assembled {
                 " front: '{front}'\n mid: '{SS}'\n land: '{TROJAN}'\n via: front -> mid -> land\n"
             ))
             .unwrap();
+            let config = config.assemble(resolve_group_filters).unwrap();
             config.validate_assembled().unwrap();
         }
     }
@@ -233,27 +346,73 @@ mod assembled {
             " via: land -> front\n front: '{SOCKS}'\n land: '{TROJAN}'\n back: front -> land\n"
         ))
         .unwrap();
-        let index = |name| {
-            config
-                .nodes
-                .iter()
-                .position(|node| node.name == name)
-                .unwrap()
-        };
-        let id = |name| config.nodes[index(name)].id;
+        let config = config.assemble(resolve_group_filters).unwrap();
+        let front = chain(&config, "front").id;
+        let land = chain(&config, "land").id;
         assert_eq!(
-            resolve_chain_hops(&config.nodes).unwrap(),
-            [
-                ResolvedChain {
-                    index: index("via"),
-                    hops: vec![id("land"), id("front")],
-                },
-                ResolvedChain {
-                    index: index("back"),
-                    hops: vec![id("front"), id("land")],
-                },
-            ]
+            chain(&config, "via").resolved_chain_hops().unwrap(),
+            [land, front]
         );
+        assert_eq!(
+            chain(&config, "back").resolved_chain_hops().unwrap(),
+            [front, land]
+        );
+        assert!(chain(&config, "front").resolved_chain_hops().is_none());
+    }
+
+    #[test]
+    fn partial_collections_defer_multiple_chains_and_reject_final_duplicates() {
+        let (mut config, _) = parse(&format!(
+            " via: front -> land\n far: land -> front\n front: '{SOCKS}'"
+        ))
+        .unwrap();
+        config.validate_detailed().unwrap();
+        assert!(chain(&config, "via").id.is_nil() && chain(&config, "far").id.is_nil());
+        let mut land = Node::from_share_link(TROJAN).unwrap();
+        land.name = "land".into();
+        config.nodes.push(land);
+        config.groups.push(Group {
+            name: "chosen".into(),
+            filters: vec!["name(via)".into()],
+            ..Default::default()
+        });
+        let bound = config.clone().assemble(resolve_group_filters).unwrap();
+        assert_eq!(bound.groups[0].nodes, [chain(&bound, "via").id]);
+
+        config
+            .nodes
+            .push(chain_node("duplicate", &["front", "land"]));
+        config.validate_detailed().unwrap();
+        let error = config
+            .assemble(|_, _, _| panic!("members rebuilt before ID admission"))
+            .unwrap_err();
+        assert_eq!(error.diagnostic.code, "duplicate-node-id");
+    }
+
+    #[test]
+    fn direct_admission_rejects_stale_bound_and_serialized_hops() {
+        let (partial, _) = parse(&format!(
+            " via: front -> land\n front: '{SOCKS}'\n land: '{TROJAN}'"
+        ))
+        .unwrap();
+        let bound = partial.assemble(resolve_group_filters).unwrap();
+        validate_node_collection(&bound.nodes).unwrap();
+
+        let mut stale = bound.clone();
+        stale.nodes[2] = Node::from_share_link("trojan://new@trojan.example:443#land").unwrap();
+        let error = validate_node_collection(&stale.nodes).unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-chain-binding");
+        let rebound = stale.assemble(resolve_group_filters).unwrap();
+        assert_ne!(rebound.nodes[0].id, bound.nodes[0].id);
+
+        let mut serialized = bound.clone();
+        serialized.nodes[0] =
+            serde_json::from_value(serde_json::to_value(&bound.nodes[0]).unwrap()).unwrap();
+        assert_eq!(serialized.nodes[0].id, bound.nodes[0].id);
+        assert_ne!(serialized, bound);
+        let error = validate_node_collection(&serialized.nodes).unwrap_err();
+        assert_eq!(error.diagnostic.code, "invalid-chain-binding");
+        assert_eq!(serialized.assemble(resolve_group_filters).unwrap(), bound);
     }
 
     #[test]

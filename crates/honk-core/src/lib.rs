@@ -132,15 +132,10 @@ pub(crate) mod test_support {
             node.id = node.derive_id();
             node
         };
-        let mut via = Node {
-            name: "via".into(),
-            outbound: OutboundConfig::Chain {
-                hops: vec!["front".into(), "land".into()],
-            },
-            ..Default::default()
-        };
-        via.id = via.derive_id();
-        [via, socks5("front", front), socks5("land", land)]
+        let front = socks5("front", front);
+        let land = socks5("land", land);
+        let via = Node::chain_from_nodes("via", &[&front, &land]).unwrap();
+        [via, front, land]
     }
 }
 
@@ -1111,18 +1106,8 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
     .await?;
     let startup_diagnostics = subscription_supervisor.take_startup_diagnostics();
 
-    // Resolve group filters into concrete node IDs. This must run for every
-    // config — not just when subscriptions delivered nodes — because groups
-    // defined with `filter:` (or with no filter at all, meaning "all nodes")
-    // would otherwise end up with an empty member list for static configs.
-    // Filter-backed membership is rebuilt from the current node provenance.
-    honk_config::parser::resolve_group_filters(
-        &mut config.groups,
-        &config.nodes,
-        &config.subscriptions,
-    );
-    config
-        .validate_assembled()
+    config = config
+        .assemble(honk_config::parser::resolve_group_filters)
         .map_err(|error| anyhow::anyhow!("invalid assembled configuration: {error}"))?;
     for group in &config.groups {
         info!(

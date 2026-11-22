@@ -10,6 +10,11 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
         drop(dns_resolver);
+        let config = if config.nodes.iter().any(|node| node.chain_hops().is_some()) {
+            config.assemble(honk_config::parser::resolve_programmatic_groups)?
+        } else {
+            config
+        };
         let dns_router = dns_forwarder.routing_snapshot();
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
@@ -36,6 +41,7 @@ impl ControlPlane {
         )
     }
 
+    /// The supplied DNS pool and forwarder must use the assembled configuration.
     pub fn new_with_upstream_pool(
         config: Config,
         ebpf: Box<dyn EbpfBackend>,

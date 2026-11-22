@@ -93,7 +93,7 @@ impl NodeRuntime {
             ProtocolRuntime::AnyTls(runtime) => Some(runtime),
             #[cfg(any(feature = "rprx", test))]
             ProtocolRuntime::Vless(runtime) => Some(runtime),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
+            ProtocolRuntime::None | ProtocolRuntime::Quic(_) | ProtocolRuntime::Chain(_) => None,
         }
     }
 

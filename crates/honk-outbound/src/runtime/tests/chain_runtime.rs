@@ -1,27 +1,18 @@
 use super::*;
 
-fn chain(name: &str, hops: &[&str]) -> Node {
-    let mut node = Node {
-        name: name.to_string(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: hops.iter().map(|hop| hop.to_string()).collect(),
-        },
-        ..Default::default()
-    };
-    node.id = node.derive_id();
-    node
-}
-
-fn nodes() -> Vec<Node> {
-    vec![
-        chain("via", &["front", "land"]),
-        node("front", NodeProtocol::Socks5),
-        node("land", NodeProtocol::Trojan),
+fn nodes() -> [Node; 3] {
+    let front = node("front", NodeProtocol::Socks5);
+    let land = node("land", NodeProtocol::Trojan);
+    [
+        Node::chain_from_nodes("via", &[&front, &land]).unwrap(),
+        front,
+        land,
     ]
 }
 
 fn assert_holds_hops_of(generation: &OutboundRuntimeRegistry, chain: &Node, hops: &[&Node]) {
     let runtime = generation.get(&chain.id).unwrap();
+    runtime.validate_for_probe().unwrap();
     assert_eq!(runtime.chain_hops().len(), hops.len());
     for (held, hop) in runtime.chain_hops().iter().zip(hops) {
         assert!(Arc::ptr_eq(held, &generation.get(&hop.id).unwrap()));
@@ -36,7 +27,7 @@ fn chain_runtime_holds_the_hops_built_in_the_same_pass() {
     assert_holds_hops_of(&generation, &nodes[0], &[&nodes[1], &nodes[2]]);
     let runtime = generation.get(&nodes[0].id).unwrap();
     assert!(!runtime.udp_capable);
-    assert!(matches!(runtime.runtime, ProtocolRuntime::None));
+    assert!(matches!(&runtime.runtime, ProtocolRuntime::Chain(_)));
     assert!(
         generation
             .get(&nodes[1].id)
@@ -63,9 +54,19 @@ fn chain_is_rebuilt_even_when_its_hops_are_reused() {
 #[test]
 fn chain_follows_a_replaced_hop_into_the_new_generation() {
     let mut nodes = nodes();
+    let original_chain = nodes[0].clone();
+    let original_exit = nodes[2].clone();
     let first = OutboundRuntimeRegistry::build(&nodes).unwrap();
     nodes[2] = node("land", NodeProtocol::SS);
+    assert!(matches!(
+        OutboundRuntimeRegistry::build_reusing(&nodes, 64, Some(&first)),
+        Err(RuntimeRegistryError::Admission(_))
+    ));
+    nodes[0] = Node::chain_from_nodes("via", &[&nodes[1], &nodes[2]]).unwrap();
+    assert_ne!(nodes[0].id, original_chain.id);
     let (second, _) = OutboundRuntimeRegistry::build_reusing(&nodes, 64, Some(&first)).unwrap();
+    assert!(second.get(&original_chain.id).is_none());
+    assert_holds_hops_of(&first, &original_chain, &[&nodes[1], &original_exit]);
     assert_holds_hops_of(&second, &nodes[0], &[&nodes[1], &nodes[2]]);
 }
 
@@ -83,6 +84,11 @@ fn dns_fork_chains_hold_the_fork_hops() {
 
 #[test]
 fn unresolved_hops_fail_admission() {
-    let error = OutboundRuntimeRegistry::build(&[chain("via", &["front", "land"])]).unwrap_err();
-    assert!(matches!(error, RuntimeRegistryError::Admission(_)));
+    let mut nodes = nodes();
+    assert!(NodeRuntime::try_ephemeral(&nodes[0]).is_err());
+    nodes[0] = Node::chain("via", vec!["front".into(), "land".into()]);
+    assert!(matches!(
+        OutboundRuntimeRegistry::build(&nodes),
+        Err(RuntimeRegistryError::Admission(_))
+    ));
 }

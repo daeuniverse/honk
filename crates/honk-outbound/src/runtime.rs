@@ -94,7 +94,13 @@ pub enum ProtocolRuntime {
     /// Type-erased TUIC, Juicity, or Hysteria2 client slot. Policy warm
     /// ownership may release the cached client before generation retirement.
     Quic(QuicRuntime),
+    /// Entry-first hop runtimes admitted together with this chain.
+    Chain(ChainRuntime),
 }
+
+/// Opaque chain binding holding exactly the hop runtimes for its snapshot.
+#[derive(Debug)]
+pub struct ChainRuntime(Box<[Arc<NodeRuntime>]>);
 
 /// A protocol client stored in [`QuicRuntime`]. Implemented by the
 /// TUIC/Juicity/Hysteria2 per-server clients so a terminating generation
@@ -363,9 +369,6 @@ pub struct NodeRuntime {
     warm_retention: Arc<tokio::sync::Mutex<u8>>,
     #[cfg(any(feature = "rprx", test))]
     vless_carriers: Arc<tokio::sync::Semaphore>,
-    /// A proxy chain's hop runtimes from the same generation, entry first.
-    /// Empty for every other node and for a chain outside any generation.
-    chain_hops: Vec<Arc<NodeRuntime>>,
 }
 
 impl NodeRuntime {
@@ -382,16 +385,19 @@ impl NodeRuntime {
         ephemeral: bool,
         #[cfg(feature = "owned-tasks")] task_owner: Option<Arc<tasks::TaskOwner>>,
         #[cfg(any(feature = "rprx", test))] vless_carriers: Arc<tokio::sync::Semaphore>,
-        chain_hops: Vec<Arc<NodeRuntime>>,
+        hops: Option<Box<[Arc<NodeRuntime>]>>,
     ) -> Arc<Self> {
         let transport_quality = Arc::new(crate::transport_quality::TransportQuality::default());
         let build = || {
             Arc::new(Self {
                 node: Arc::new(node.clone()),
                 udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
-                runtime: crate::descriptor::descriptor(node.protocol())
-                    .generation_runtime
-                    .build(node, !ephemeral, Arc::clone(&transport_quality)),
+                runtime: match hops {
+                    Some(hops) => ProtocolRuntime::Chain(ChainRuntime(hops)),
+                    None => crate::descriptor::descriptor(node.protocol())
+                        .generation_runtime
+                        .build(node, !ephemeral, Arc::clone(&transport_quality)),
+                },
                 xhttp: Self::build_xhttp(node),
                 ephemeral,
                 transport_quality,
@@ -400,7 +406,6 @@ impl NodeRuntime {
                 warm_retention: Arc::new(tokio::sync::Mutex::new(0)),
                 #[cfg(any(feature = "rprx", test))]
                 vless_carriers,
-                chain_hops,
             })
         };
         #[cfg(feature = "owned-tasks")]
@@ -420,7 +425,7 @@ impl NodeRuntime {
             Some(Arc::new(tasks::TaskOwner::default())),
             #[cfg(any(feature = "rprx", test))]
             vless_carriers,
-            Vec::new(),
+            None,
         )
     }
 
@@ -436,6 +441,29 @@ impl NodeRuntime {
     pub(crate) fn validate_for_ephemeral(node: &Node) -> Result<(), RuntimeRegistryError> {
         honk_config::node::validate_node_collection(std::slice::from_ref(node))
             .map_err(RuntimeRegistryError::Admission)
+    }
+
+    pub(crate) fn validate_for_probe(&self) -> Result<(), RuntimeRegistryError> {
+        let ProtocolRuntime::Chain(chain) = &self.runtime else {
+            return Self::validate_for_ephemeral(&self.node);
+        };
+        let node = &self.node;
+        let names = node
+            .chain_hops()
+            .ok_or(RuntimeRegistryError::ChainBinding)?;
+        let ids = node
+            .resolved_chain_hops()
+            .ok_or(RuntimeRegistryError::ChainBinding)?;
+        if node.validate().is_err()
+            || node.id != node.derive_id()
+            || !names
+                .iter()
+                .zip(ids)
+                .eq(chain.0.iter().map(|hop| (&hop.node.name, &hop.node.id)))
+        {
+            return Err(RuntimeRegistryError::ChainBinding);
+        }
+        Ok(())
     }
 
     /// Admit a canonical node and build a generation-free one-shot runtime.
@@ -491,7 +519,10 @@ impl NodeRuntime {
 
     /// A proxy chain's hop runtimes, entry first; empty for other nodes.
     pub fn chain_hops(&self) -> &[Arc<NodeRuntime>] {
-        &self.chain_hops
+        match &self.runtime {
+            ProtocolRuntime::Chain(chain) => &chain.0,
+            _ => &[],
+        }
     }
 
     /// Advisory evidence belongs to this runtime, not merely its reusable node ID.
@@ -639,7 +670,7 @@ impl NodeRuntime {
     pub(crate) fn tls_connector_loaded(&self) -> bool {
         match &self.runtime {
             ProtocolRuntime::AnyTls(runtime) => runtime.tls.is_loaded(),
-            ProtocolRuntime::None | ProtocolRuntime::Vless(_) | ProtocolRuntime::Quic(_) => false,
+            _ => false,
         }
     }
 }
@@ -743,6 +774,8 @@ pub enum RuntimeRegistryError {
     Admission(#[source] honk_config::error::DetailedConfigError),
     #[error("node TLS configuration rejected")]
     Tls(#[source] Option<std::io::Error>),
+    #[error("proxy chain does not match the admitted runtime binding")]
+    ChainBinding,
 }
 
 /// The single owner of per-node session runtimes for one config
@@ -789,8 +822,20 @@ impl OutboundRuntimeRegistry {
         .map(|(registry, _)| registry)
     }
 
-    /// Admit a cold one-shot runtime using this generation's shared carrier budget.
-    /// The caller must scope dials to this registry and close the returned guard.
+    pub(crate) fn admitted_chain_runtime(
+        &self,
+        node: &Node,
+    ) -> Result<Arc<NodeRuntime>, RuntimeRegistryError> {
+        self.get(&node.id)
+            .filter(|runtime| {
+                matches!(&runtime.runtime, ProtocolRuntime::Chain(_))
+                    && runtime.node.resolved_chain_hops() == node.resolved_chain_hops()
+                    && (runtime.node.as_ref() == node || same_node_config(&runtime.node, node))
+            })
+            .ok_or(RuntimeRegistryError::ChainBinding)
+    }
+
+    /// Admit a private one-shot runtime using this generation's carrier budget.
     #[cfg(feature = "owned-tasks")]
     pub fn try_ephemeral_guarded(
         &self,
@@ -915,8 +960,6 @@ impl OutboundRuntimeRegistry {
     ) -> Result<(Self, HashSet<uuid::Uuid>), RuntimeRegistryError> {
         honk_config::node::validate_node_collection(nodes)
             .map_err(RuntimeRegistryError::Admission)?;
-        let chains = honk_config::node::resolve_chain_hops(nodes)
-            .map_err(RuntimeRegistryError::Admission)?;
         let own_tasks = cfg!(feature = "owned-tasks") && own_tasks;
         let mut map = HashMap::with_capacity(nodes.len());
         let mut reused = HashSet::new();
@@ -963,16 +1006,18 @@ impl OutboundRuntimeRegistry {
                     own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
                     #[cfg(any(feature = "rprx", test))]
                     Arc::clone(&vless_carrier_semaphore),
-                    Vec::new(),
+                    None,
                 ),
             };
             map.insert(node.id, runtime);
         }
         // A chain holds its hops' runtimes from this pass, so it is rebuilt in
         // every generation and never keeps a predecessor's hops alive.
-        for chain in chains {
-            let node = &nodes[chain.index];
-            let hops = chain.hops.iter().map(|hop| Arc::clone(&map[hop])).collect();
+        for node in nodes {
+            let Some(ids) = node.resolved_chain_hops() else {
+                continue;
+            };
+            let hops = ids.iter().map(|id| Arc::clone(&map[id])).collect();
             let runtime = NodeRuntime::build(
                 node,
                 false,
@@ -980,7 +1025,7 @@ impl OutboundRuntimeRegistry {
                 own_tasks.then(|| Arc::new(tasks::TaskOwner::production())),
                 #[cfg(any(feature = "rprx", test))]
                 Arc::clone(&vless_carrier_semaphore),
-                hops,
+                Some(hops),
             );
             map.insert(node.id, runtime);
         }

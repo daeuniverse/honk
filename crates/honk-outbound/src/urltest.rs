@@ -151,8 +151,7 @@ fn urltest_timeout(timeout: Duration) -> Duration {
 }
 
 fn validate_runtime(runtime: &Arc<crate::runtime::NodeRuntime>) -> anyhow::Result<()> {
-    crate::runtime::NodeRuntime::validate_for_ephemeral(runtime.node.as_ref())
-        .map_err(anyhow::Error::new)
+    runtime.validate_for_probe().map_err(anyhow::Error::new)
 }
 
 /// Optional resolver for check-URL hosts: `(host, port) → Result<addrs>`.
@@ -252,6 +251,11 @@ pub fn try_probe_runtime(
     ),
     crate::runtime::RuntimeRegistryError,
 > {
+    if node.chain_hops().is_some() {
+        return generation
+            .admitted_chain_runtime(node)
+            .map(|runtime| (runtime, None));
+    }
     // Validate before looking up a warm runtime: a stale ID must not buy a
     // warm-path shortcut or cause feedback/resources to be initialized.
     crate::runtime::NodeRuntime::validate_for_ephemeral(node)?;

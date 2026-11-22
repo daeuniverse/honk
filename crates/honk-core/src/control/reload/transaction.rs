@@ -61,11 +61,6 @@ pub(crate) fn rebase_subscription_nodes(
     }
 
     candidate.nodes = static_nodes;
-    honk_config::parser::resolve_group_filters(
-        &mut candidate.groups,
-        &candidate.nodes,
-        &candidate.subscriptions,
-    );
     retained_providers
 }
 
@@ -250,10 +245,27 @@ impl ControlPlane {
             warn!("reload rejected: subscription worker changes require the control command path");
             return Ok(ReloadOutcome::Rejected);
         }
-        // Same proof as at the public entry: equality with the admitted active
-        // configuration is admission. Anything else is verified before any shortcut.
+        // Equality covers the private chain binding as well as the public node ID.
         if new_config != *current_config.as_ref() {
-            new_config.validate_assembled()?;
+            match &diagnostic_update {
+                DiagnosticUpdate::Rebase { .. } => {
+                    new_config = new_config.assemble(honk_config::parser::resolve_group_filters)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                    if new_config
+                        .nodes
+                        .iter()
+                        .any(|node| node.chain_hops().is_some()) =>
+                {
+                    new_config =
+                        new_config.assemble(honk_config::parser::resolve_programmatic_groups)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                | DiagnosticUpdate::Preserve
+                | DiagnosticUpdate::ReplaceProvider { .. } => {
+                    new_config.validate_assembled()?;
+                }
+            }
         }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);

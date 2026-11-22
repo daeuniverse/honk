@@ -31,15 +31,7 @@ pub(crate) fn socks5(name: &str, host: &str, port: u16) -> Node {
 }
 
 pub(crate) fn chain(hops: &[&Node]) -> Node {
-    let mut node = Node {
-        name: "via".into(),
-        outbound: OutboundConfig::Chain {
-            hops: hops.iter().map(|hop| hop.name.clone()).collect(),
-        },
-        ..Default::default()
-    };
-    node.id = node.derive_id();
-    node
+    Node::chain_from_nodes("via", hops).unwrap()
 }
 
 /// A no-auth SOCKS5 server that relays CONNECT over real sockets, resolving

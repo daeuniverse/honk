@@ -777,6 +777,39 @@ fn cached_presence_and_rebased_active_semantics_are_both_required() {
 }
 
 #[test]
+fn offline_chain_admission_binds_the_effective_provider_snapshot() {
+    let temp = tempfile::tempdir().unwrap();
+    let loaded = fixture(
+        temp.path(),
+        "subscription { provider: 'https://example.invalid/feed' }\nnode {\n via: front -> land\n front: 'socks5://127.0.0.1:1080'\n}\ngroup { pool { filter: name(via) } }",
+    );
+    let mut active = loaded.config.clone();
+    let sub = loaded.config.subscriptions[0].clone();
+    let error = admit(loaded.clone(), &active).err().unwrap();
+    assert_eq!(error.diagnostic.code, "invalid-chain-hop-reference");
+
+    const CACHED: &str = "socks5://127.0.0.1:1081#land";
+    const LIVE: &str = "socks5://127.0.0.1:1082#land";
+    let _cache = cache_body(Path::new(&active.global.data_dir), &sub, CACHED);
+    let cached = admit(loaded.clone(), &active).unwrap().config;
+    active
+        .nodes
+        .extend(parse_subscription_content_with_diagnostics(&sub, LIVE, &mut Vec::new()).unwrap());
+    let live = admit(loaded, &active).unwrap().config;
+
+    let cached_id = cached.groups[0].nodes[0];
+    let live_id = live.groups[0].nodes[0];
+    assert_ne!(cached_id, live_id);
+    for (config, via, body) in [(cached, cached_id, CACHED), (live, live_id, LIVE)] {
+        let expected_land = honk_config::node::Node::from_share_link(body).unwrap().id;
+        let via = config.nodes.iter().find(|node| node.id == via).unwrap();
+        assert_eq!(via.name, "via");
+        assert_eq!(via.resolved_chain_hops().unwrap()[1], expected_land);
+        config.validate_assembled().unwrap();
+    }
+}
+
+#[test]
 fn revalidation_detects_a_new_higher_priority_dependency() {
     let working = std::env::current_dir().unwrap();
     let temp = tempfile::tempdir_in(&working).unwrap();

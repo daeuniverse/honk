@@ -123,13 +123,7 @@ async fn a_chain_without_its_generation_refuses_to_dial() {
             .await
             .is_err()
     );
-    let runtime = NodeRuntime::try_ephemeral(&via).unwrap();
-    assert!(
-        handler
-            .dial_runtime(runtime, target(), None, Duration::from_secs(1))
-            .await
-            .is_err()
-    );
+    assert!(NodeRuntime::try_ephemeral(&via).is_err());
 }
 
 /// Records how the chain drives each hop and answers with a pass-through stream.
