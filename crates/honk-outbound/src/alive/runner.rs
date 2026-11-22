@@ -363,10 +363,9 @@ impl AliveDialerSet {
             .collect();
         let cancel = permit.cancellation();
 
+        // Idle groups still recover dead members: the datapath drops traffic
+        // to a dead group before userspace could mark it active again.
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            if self.is_probe_suspended(id) {
-                return None;
-            }
             let tcp_due = [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
                 !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
                     && self.should_probe(id, ProbeDomain::Tcp, ipver)

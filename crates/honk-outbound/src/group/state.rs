@@ -501,8 +501,9 @@ impl GroupManager {
         alive.set_selected_nodes(nodes)
     }
 
-    /// After a selection change, probe newly selected idle nodes at once.
-    fn wake_selected_probe_nodes(&self) {
+    /// After a selection change or reload, probe newly selected idle nodes
+    /// at once.
+    pub fn wake_selected_probe_nodes(&self) {
         if let Some(alive) = &self.alive_set {
             for node in self.publish_selected_probe_nodes() {
                 alive.trigger_probe(node);
