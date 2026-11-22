@@ -1,5 +1,9 @@
+use std::io;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -11,6 +15,7 @@ use honk_config::types::NodeProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::wrap_tunnel;
+use crate::group::ScoreOutcome;
 use crate::proxy::{
     ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported, tunnel_unsupported,
 };
@@ -144,6 +149,195 @@ async fn websocket_runs_over_tls_on_a_tunneled_carrier() {
     server.await.unwrap();
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WsFailureSide {
+    Read,
+    Flush,
+}
+
+#[derive(Debug)]
+struct FailingWsCarrier {
+    inner: DuplexStream,
+    side: WsFailureSide,
+    failure: Option<(io::Error, tokio::sync::oneshot::Sender<()>)>,
+    upgraded: Arc<AtomicBool>,
+}
+
+impl FailingWsCarrier {
+    fn fail(&mut self) -> Option<io::Error> {
+        let (error, receipt) = self.failure.take()?;
+        let _ = receipt.send(());
+        Some(error)
+    }
+}
+
+impl tokio::io::AsyncRead for FailingWsCarrier {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if self.side == WsFailureSide::Read
+            && matches!(result, Poll::Ready(Ok(())))
+            && buf.remaining() != 0
+            && buf.filled().len() == before
+            && let Some(error) = self.fail()
+        {
+            return Poll::Ready(Err(error));
+        }
+        result
+    }
+}
+
+impl tokio::io::AsyncWrite for FailingWsCarrier {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.side == WsFailureSide::Flush
+            && self.upgraded.load(Relaxed)
+            && let Some(error) = self.fail()
+        {
+            return Poll::Ready(Err(error));
+        }
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+async fn ws_relay_failure(side: WsFailureSide, failure: io::Error, expected: ScoreOutcome) {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+
+    tokio::time::timeout(TIMEOUT, async {
+        let kind = failure.kind();
+        let mut node = tls_node(TlsOptions::default());
+        node.transport_mut().unwrap().transport = "ws".into();
+        let (client, peer) = tokio::io::duplex(256 * 1024);
+        let upgraded = Arc::new(AtomicBool::new(false));
+        let (receipt, failed) = tokio::sync::oneshot::channel();
+        let carrier = FailingWsCarrier {
+            inner: client,
+            side,
+            failure: Some((failure, receipt)),
+            upgraded: Arc::clone(&upgraded),
+        };
+        let (stream, peer) = tokio::join!(
+            wrap_tunnel(&node, Box::new(carrier), TunnelDialOptions::new(TIMEOUT)),
+            tokio_tungstenite::accept_async(peer),
+        );
+        let mut stream = stream.unwrap();
+        let mut peer = peer.unwrap();
+        upgraded.store(true, Relaxed);
+
+        let payload = match side {
+            WsFailureSide::Read => bytes::Bytes::from_static(b"buffered reply"),
+            // Larger than the relay pipe so part of this decoded frame is still
+            // held by the relay when the upload fails.
+            WsFailureSide::Flush => bytes::Bytes::from(vec![0x5a; 128 * 1024]),
+        };
+        peer.send(Message::Binary(payload.clone())).await.unwrap();
+        let mut received = Vec::new();
+        match side {
+            WsFailureSide::Read => peer.get_mut().shutdown().await.unwrap(),
+            WsFailureSide::Flush => {
+                let mut first = [0];
+                stream.read_exact(&mut first).await.unwrap();
+                received.extend_from_slice(&first);
+                stream.write_all(b"next request").await.unwrap();
+            }
+        }
+        failed.await.unwrap();
+
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+        let error = stream.read_to_end(&mut received).await.unwrap_err();
+        assert_eq!(received.as_slice(), payload.as_ref());
+        assert_eq!(error.kind(), kind);
+        assert_eq!(ScoreOutcome::from_io_error(&error), expected);
+        for error in [
+            stream.write(b"later").await.unwrap_err(),
+            stream
+                .write_vectored(&[io::IoSlice::new(b"later")])
+                .await
+                .unwrap_err(),
+            stream.flush().await.unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), kind);
+            assert_eq!(ScoreOutcome::from_io_error(&error), expected);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn websocket_relay_retains_lower_failures_after_delivery() {
+    use crate::proxy::error::IntermediateTargetFailure;
+    use crate::proxy::{NodeFailure, PacketRejection, TargetFailure};
+
+    for side in [WsFailureSide::Read, WsFailureSide::Flush] {
+        let shared = crate::SharedError::fanout(TargetFailure(anyhow::anyhow!("refused")).into());
+        let expected = ScoreOutcome::SharedNodeFailure(shared.episode().unwrap());
+        let kind = io::ErrorKind::ConnectionRefused;
+        let failure = IntermediateTargetFailure::io(1, io::Error::new(kind, shared));
+        ws_relay_failure(side, failure, expected).await;
+        ws_relay_failure(
+            side,
+            PacketRejection::Cancelled.into(),
+            ScoreOutcome::Cancelled,
+        )
+        .await;
+        let target = TargetFailure(anyhow::anyhow!("target refused"));
+        let failure = io::Error::new(kind, target);
+        ws_relay_failure(side, failure, ScoreOutcome::TargetFailure).await;
+        let node = NodeFailure(anyhow::anyhow!("carrier closed"));
+        let failure = io::Error::new(kind, node);
+        ws_relay_failure(side, failure, ScoreOutcome::NodeFailure).await;
+    }
+}
+
+#[tokio::test]
+async fn websocket_relay_keeps_pong_and_graceful_close() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+
+    tokio::time::timeout(TIMEOUT, async {
+        let mut node = tls_node(TlsOptions::default());
+        node.transport_mut().unwrap().transport = "ws".into();
+        let (client, peer) = tokio::io::duplex(4096);
+        let (stream, peer) = tokio::join!(
+            wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
+            tokio_tungstenite::accept_async(peer),
+        );
+        let mut stream = stream.unwrap();
+        let mut peer = peer.unwrap();
+        let ping = bytes::Bytes::from_static(b"still here");
+        peer.send(Message::Ping(ping.clone())).await.unwrap();
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::Pong(ping));
+        peer.send(Message::Binary(bytes::Bytes::from_static(b"reply")))
+            .await
+            .unwrap();
+        peer.send(Message::Close(None)).await.unwrap();
+        assert_eq!(peer.next().await.unwrap().unwrap(), Message::Close(None));
+        drop(peer);
+        let mut received = Vec::new();
+        stream.read_to_end(&mut received).await.unwrap();
+        assert_eq!(&received, b"reply");
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn reality_mask_certificate_error_keeps_its_type() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -218,6 +412,31 @@ async fn shapes_that_need_more_than_the_carrier_are_refused() {
         server.read_to_end(&mut written).await.unwrap();
         assert!(written.is_empty(), "{reason} wrote to the carrier");
     }
+}
+
+#[tokio::test]
+async fn websocket_upgrade_preserves_a_lower_carriers_cancellation() {
+    use crate::proxy::{PacketRejection, packet_rejection};
+
+    #[derive(Debug)]
+    struct CancelledRead;
+    impl tokio::io::AsyncRead for CancelledRead {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(PacketRejection::Cancelled.into()))
+        }
+    }
+
+    let mut node = tls_node(TlsOptions::default());
+    node.transport_mut().unwrap().transport = "ws".into();
+    let carrier = tokio::io::join(CancelledRead, tokio::io::sink());
+    let error = wrap_tunnel(&node, Box::new(carrier), TunnelDialOptions::new(TIMEOUT))
+        .await
+        .unwrap_err();
+    assert_eq!(packet_rejection(&error), Some(PacketRejection::Cancelled));
 }
 
 struct DialOnly;

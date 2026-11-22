@@ -188,7 +188,7 @@ async fn vmess_json_empty_ws_host_uses_endpoint_in_handshake() {
             .unwrap();
         host.unwrap()
     };
-    let (stream, host) = tokio::join!(wrap_ws(&node, Box::new(client)), receive);
+    let (stream, host) = tokio::join!(wrap_ws(&node, Box::new(client), false), receive);
     let _stream = stream.unwrap();
     assert_eq!(host, "example.invalid");
 }
@@ -227,10 +227,11 @@ async fn websocket_request_event_waits_for_real_frame_flush() {
         .await;
         let (client, server) = tokio::io::duplex(65536);
         let pipe = crate::runtime::flow_observation::RelayedPipe::new();
-        let bridge = tokio::spawn(ws_bridge_relay(websocket, server, pipe.clone()));
+        let bridge = tokio::spawn(ws_bridge_relay(websocket, server, pipe.clone(), None));
         let mut stream = ObservedWs {
             inner: client,
             pipe,
+            failure: None,
         };
         let request = vec![0x5a; 4096];
         observer

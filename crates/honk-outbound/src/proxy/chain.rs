@@ -4,25 +4,32 @@
 use async_trait::async_trait;
 use honk_config::node::Node;
 use honk_config::types::NodeProtocol;
+use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
-use super::{
-    NodeFailure, ProxyStream, TcpOutbound, TunnelDialOptions, is_packet_rejection, target_failure,
-};
+use super::error::IntermediateTargetFailure;
+use super::{AsyncReadWrite, ProtocolEntry, ProxyStream, TcpOutbound, TunnelDialOptions};
 use crate::runtime::NodeRuntime;
 use crate::runtime::flow_observation::without_target_milestones;
 
 /// Dials a chain through the hop runtimes of its own generation, using the
 /// same handler instances the registry dispatches to.
-pub struct ChainHandler {
+pub(super) struct ChainHandler {
     handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>,
 }
 
 impl ChainHandler {
-    pub fn new(handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>) -> Self {
+    pub(super) fn new(entries: &[ProtocolEntry]) -> Self {
+        let handlers = entries
+            .iter()
+            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
+            .collect();
         Self { handlers }
     }
 
@@ -49,7 +56,7 @@ impl ChainHandler {
         let (first, rest) = hops.split_first().expect("a chain has at least two hops");
         let (server, server_domain) = server_target(&rest[0].node);
         let handler = self.handler(&first.node).map_err(at(0))?;
-        let mut carrier = hop_scope(
+        let entry = hop_scope(
             first,
             without_target_milestones(handler.dial_runtime(
                 Arc::clone(first),
@@ -58,9 +65,8 @@ impl ChainHandler {
                 budget(),
             )),
         )
-        .await
-        .map_err(|error| (0, earlier_hop_error(error)))?
-        .stream;
+        .await;
+        let mut carrier = intermediate_carrier(0, entry)?;
         for (index, hop) in rest.iter().enumerate() {
             let handler = self.handler(&hop.node).map_err(at(index + 1))?;
             let options = TunnelDialOptions {
@@ -76,7 +82,7 @@ impl ChainHandler {
                 .map_err(at(index + 1));
             };
             let (server, server_domain) = server_target(&next.node);
-            carrier = hop_scope(
+            let result = hop_scope(
                 hop,
                 without_target_milestones(handler.dial_over(
                     Arc::clone(hop),
@@ -86,9 +92,8 @@ impl ChainHandler {
                     options,
                 )),
             )
-            .await
-            .map_err(|error| (index + 1, earlier_hop_error(error)))?
-            .stream;
+            .await;
+            carrier = intermediate_carrier(index + 1, result)?;
         }
         unreachable!("the last hop returns from the loop")
     }
@@ -99,10 +104,10 @@ impl ChainHandler {
 /// traffic therefore lands on the hops, the entry's node included, and the
 /// chain runtime's own `TransportQuality` stays empty. The first hop's
 /// physical connection inherits the chain's dial admission scope.
-fn hop_scope<T>(
+fn hop_scope(
     hop: &Arc<NodeRuntime>,
-    dial: impl Future<Output = anyhow::Result<T>>,
-) -> impl Future<Output = anyhow::Result<T>> {
+    dial: impl Future<Output = anyhow::Result<ProxyStream>>,
+) -> impl Future<Output = anyhow::Result<ProxyStream>> {
     hop.scope_tasks(hop.transport_quality().scope(dial))
 }
 
@@ -123,13 +128,75 @@ fn server_target(node: &Node) -> (SocketAddr, Option<&str>) {
     }
 }
 
-/// An earlier hop's target is the next hop's server, so its target failure is
-/// a failure of the chain itself. Packet policy rejections keep their class.
-fn earlier_hop_error(error: anyhow::Error) -> anyhow::Error {
-    if is_packet_rejection(&error) || !target_failure(&error) {
-        return error;
+fn intermediate_carrier(
+    index: usize,
+    result: anyhow::Result<ProxyStream>,
+) -> Result<Box<dyn AsyncReadWrite>, (usize, anyhow::Error)> {
+    let hop = index + 1;
+    let ProxyStream { stream, .. } =
+        result.map_err(|error| (index, IntermediateTargetFailure::dial(hop, error)))?;
+    // Bare sockets can still use splice. Pass-through hops can reuse the wrapper.
+    let concrete = (*stream).as_any();
+    if concrete.is::<tokio::net::TcpStream>() || concrete.is::<IntermediateCarrier>() {
+        return Ok(stream);
     }
-    NodeFailure(anyhow::anyhow!("{error:#}")).into()
+    Ok(Box::new(IntermediateCarrier { hop, stream }))
+}
+
+#[derive(Debug)]
+struct IntermediateCarrier {
+    hop: usize,
+    stream: Box<dyn AsyncReadWrite>,
+}
+
+impl AsyncRead for IntermediateCarrier {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_read(cx, buf)
+            .map_err(|error| IntermediateTargetFailure::io(self.hop, error))
+    }
+}
+
+impl AsyncWrite for IntermediateCarrier {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream)
+            .poll_write(cx, buf)
+            .map_err(|error| IntermediateTargetFailure::io(self.hop, error))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream)
+            .poll_write_vectored(cx, bufs)
+            .map_err(|error| IntermediateTargetFailure::io(self.hop, error))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_flush(cx)
+            .map_err(|error| IntermediateTargetFailure::io(self.hop, error))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_shutdown(cx)
+            .map_err(|error| IntermediateTargetFailure::io(self.hop, error))
+    }
 }
 
 fn reality_mask_certificate(error: &anyhow::Error) -> bool {

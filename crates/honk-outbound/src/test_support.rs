@@ -34,6 +34,72 @@ pub(crate) fn chain(hops: &[&Node]) -> Node {
     Node::chain_from_nodes("via", hops).unwrap()
 }
 
+pub(crate) fn assert_score_failure_scope(
+    via: &Node,
+    outcomes: &[crate::group::ScoreOutcome],
+    setup_completed: bool,
+    exact_failures: usize,
+    aggregate_failures: usize,
+) {
+    use crate::alive::{IpVersion, ProbeDomain};
+    use crate::group::{GroupManager, ScoreOutcome, ScoreSelectionContext, SelectionNetwork};
+    use honk_config::group::{Group, GroupPolicy};
+
+    let alternate = socks5("alternate", "127.0.0.1", 1);
+    let group = Group {
+        name: "score".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![via.id, alternate.id],
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&[group], &[via.clone(), alternate]);
+    let same_target = ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(TCP_TARGET.parse::<SocketAddr>().unwrap().into()),
+    };
+    let other_target = ScoreSelectionContext {
+        target: Some("198.51.100.2:80".parse::<SocketAddr>().unwrap().into()),
+        ..same_target.clone()
+    };
+    let feedback = manager
+        .feedback_for_group_node("score", via.id, same_target.clone())
+        .unwrap();
+    let report = |outcome, completed| {
+        let reporter = feedback.start();
+        if completed {
+            reporter.setup_succeeded();
+        }
+        reporter.finish(outcome);
+    };
+    for &outcome in outcomes {
+        report(outcome, setup_completed);
+    }
+
+    // First add exact-only failures, then calibrate aggregate failures using the
+    // other target. Neither check can cross the threshold via the other scope.
+    let exclusions = || manager.score_reason_snapshot()[0].tcp.fail_streak_excluded;
+    for (context, failures, calibration) in [
+        (&same_target, exact_failures, ScoreOutcome::TargetFailure),
+        (&other_target, aggregate_failures, ScoreOutcome::NodeFailure),
+    ] {
+        for added in 0..=3 {
+            let before = exclusions();
+            let plan = manager.selection_plan_for_target("score", context);
+            let excluded = failures + added >= 3;
+            assert_eq!(exclusions() - before, u64::from(excluded), "{context:?}");
+            if excluded {
+                assert_ne!(plan.entries[0].node.id, via.id);
+            }
+            if added != 3 {
+                report(calibration, true);
+            }
+        }
+    }
+}
+
 /// A no-auth SOCKS5 server that relays CONNECT over real sockets, resolving
 /// domains through `hosts`, or refuses every request with "connection
 /// refused" while `refuse` is set. Records each requested target as written

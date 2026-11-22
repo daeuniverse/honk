@@ -1,6 +1,6 @@
 use super::*;
 use crate::group::ScoreOutcome;
-use crate::proxy::{AsyncReadWrite, ProtocolEntry, ProxyRegistry, node_failure};
+use crate::proxy::{ProxyRegistry, TargetFailure, node_failure, target_failure};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{
     TCP_TARGET as TARGET, TCP_TARGET_HEADER, assert_legacy_bulk_echo, chain,
@@ -10,6 +10,8 @@ use honk_config::node::OutboundConfig;
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
+
+mod failure_provenance;
 
 fn target() -> SocketAddr {
     TARGET.parse().unwrap()
@@ -97,6 +99,8 @@ async fn an_earlier_hop_target_failure_is_a_chain_failure() {
         .unwrap_err();
     assert!(!target_failure(&error), "{error:#}");
     assert!(node_failure(&error), "{error:#}");
+    assert_eq!(ScoreOutcome::from_error(&error), ScoreOutcome::NodeFailure);
+    assert!(error.chain().any(|cause| cause.is::<TargetFailure>()));
 }
 
 #[tokio::test]
@@ -109,6 +113,10 @@ async fn the_last_hop_target_failure_stays_a_target_failure() {
         .await
         .unwrap_err();
     assert!(target_failure(&error), "{error:#}");
+    assert_eq!(
+        ScoreOutcome::from_error(&error),
+        ScoreOutcome::TargetFailure
+    );
     assert_eq!(refusing.requests(), [TARGET]);
 }
 
@@ -117,7 +125,7 @@ async fn a_chain_without_its_generation_refuses_to_dial() {
     let front = socks5("front", "127.0.0.1", 1080);
     let land = shadowsocks("land", "127.0.0.1", 8388);
     let via = chain(&[&front, &land]);
-    let handler = ChainHandler::new(Vec::new());
+    let handler = ChainHandler::new(&[]);
     assert!(
         handler
             .dial(&via, target(), None, Duration::from_secs(1))
@@ -273,15 +281,9 @@ impl Fakes {
     }
 
     fn handler(&self) -> ChainHandler {
-        ChainHandler::new(vec![
-            (
-                NodeProtocol::AnyTLS,
-                self.front.clone() as Arc<dyn TcpOutbound>,
-            ),
-            (
-                NodeProtocol::Trojan,
-                self.land.clone() as Arc<dyn TcpOutbound>,
-            ),
+        ChainHandler::new(&[
+            ProtocolEntry::new(NodeProtocol::AnyTLS, self.front.clone()),
+            ProtocolEntry::new(NodeProtocol::Trojan, self.land.clone()),
         ])
     }
 

@@ -10,8 +10,8 @@ use honk_config::node::Node;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -105,6 +105,7 @@ struct IoProgress {
     flushed: AtomicBool,
     read: AtomicWaker,
     write: AtomicWaker,
+    carrier_error: OnceLock<Option<Arc<io::Error>>>,
 }
 
 impl ArcWake for IoProgress {
@@ -122,6 +123,13 @@ impl FlushProgress for IoProgress {
         if !self.flushed.swap(true, Ordering::AcqRel) {
             self.write.wake();
         }
+    }
+
+    fn io_failed(&self, error: &io::Error) {
+        // h2's connection driver reduces custom I/O errors to text.
+        let _ = self
+            .carrier_error
+            .get_or_init(|| crate::proxy::retain_typed_io_error(error).map(Arc::new));
     }
 }
 
@@ -192,8 +200,15 @@ impl GrpcStream {
             && let Poll::Ready(result) = self.request.drive(|| connection.as_mut().poll(cx))
         {
             if let Err(error) = result {
-                self.connection_error
-                    .get_or_insert_with(|| Arc::new(h2_error(error)));
+                self.connection_error.get_or_insert_with(|| {
+                    if let Some(io) = error.get_io()
+                        && let Some(Some(cause)) = self.progress.carrier_error.get()
+                        && io.kind() == cause.kind()
+                    {
+                        return Arc::clone(cause);
+                    }
+                    Arc::new(h2_error(error))
+                });
             }
             self.connection = None;
         }

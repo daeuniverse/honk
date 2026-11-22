@@ -252,6 +252,13 @@ impl TlsConnector {
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
                 }
+                if let Some(cause) = e
+                    .as_io_error()
+                    .and_then(crate::proxy::retain_typed_io_error)
+                {
+                    return Err(anyhow::Error::new(cause)
+                        .context(format!("TLS handshake with {domain} failed")));
+                }
                 Err(anyhow::anyhow!("TLS handshake with {domain} failed: {e}"))
             }
         }

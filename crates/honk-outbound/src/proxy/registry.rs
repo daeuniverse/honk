@@ -195,15 +195,9 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
-        // A chain dials its hops through the handlers registered above.
-        let hop_handlers = registry
-            .entries
-            .iter()
-            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
-            .collect();
         registry.register(ProtocolEntry::new(
             NodeProtocol::Chain,
-            Arc::new(ChainHandler::new(hop_handlers)),
+            Arc::new(ChainHandler::new(&registry.entries)),
         ));
         for entry in &registry.entries {
             entry.validate_consistency();

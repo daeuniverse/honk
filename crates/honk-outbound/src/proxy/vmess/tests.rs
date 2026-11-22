@@ -508,7 +508,7 @@ async fn rejected_response_header_surfaces_as_stream_error() {
 }
 
 #[derive(Debug)]
-struct ErrorOnEof(tokio::io::DuplexStream, io::ErrorKind);
+struct ErrorOnEof(tokio::io::DuplexStream, Option<io::Error>);
 
 impl AsyncRead for ErrorOnEof {
     fn poll_read(
@@ -519,11 +519,7 @@ impl AsyncRead for ErrorOnEof {
         let before = buf.filled().len();
         match Pin::new(&mut self.0).poll_read(cx, buf) {
             Poll::Ready(Ok(())) if buf.filled().len() == before && buf.remaining() != 0 => {
-                Poll::Ready(Err(if self.1 == io::ErrorKind::ConnectionReset {
-                    io::Error::from_raw_os_error(libc::ECONNRESET)
-                } else {
-                    self.1.into()
-                }))
+                Poll::Ready(self.1.take().map_or(Ok(()), Err))
             }
             result => result,
         }
@@ -559,11 +555,15 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
     ] {
         let kind = failure.unwrap_or(io::ErrorKind::UnexpectedEof);
         let (physical, mut peer) = tokio::io::duplex(4096);
-        let physical: Box<dyn AsyncReadWrite> = if let Some(kind) = failure {
-            Box::new(ErrorOnEof(physical, kind))
-        } else {
-            Box::new(physical)
-        };
+        let failure = failure.map(|kind| {
+            if kind == io::ErrorKind::ConnectionReset {
+                io::Error::from_raw_os_error(libc::ECONNRESET)
+            } else {
+                kind.into()
+            }
+        });
+        let clean_eof = failure.is_none();
+        let physical = Box::new(ErrorOnEof(physical, failure));
         let uuid = uuid::Uuid::parse_str(UUID).unwrap();
         let target = "93.184.216.34:53".parse().unwrap();
         let mut stream =
@@ -583,7 +583,7 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         .expect_err("an absent or partial response header must not read as clean EOF");
         assert_eq!(error.kind(), kind);
         let outcome = crate::group::ScoreOutcome::from_io_error(&error);
-        if prefix_len == 0 && failure.is_none() {
+        if prefix_len == 0 && clean_eof {
             assert_eq!(outcome, crate::group::ScoreOutcome::Io(kind));
         } else {
             assert!(outcome.is_node_failure(), "{outcome:?}");
@@ -594,6 +594,118 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         if kind == io::ErrorKind::ConnectionReset {
             assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
         }
+    }
+}
+
+#[tokio::test]
+async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() {
+    use crate::group::ScoreOutcome;
+    use crate::proxy::error::IntermediateTargetFailure;
+    use crate::proxy::{NodeFailure, PacketRejection, TargetFailure};
+
+    let lower_refusal = crate::SharedError::fanout(
+        TargetFailure(io::Error::from(io::ErrorKind::ConnectionRefused).into()).into(),
+    );
+    let episode = lower_refusal.episode().unwrap();
+    let intermediate = IntermediateTargetFailure::io(
+        2,
+        io::Error::new(io::ErrorKind::ConnectionRefused, lower_refusal.clone()),
+    );
+    let target = io::Error::new(io::ErrorKind::ConnectionRefused, lower_refusal);
+    let node_failure = || {
+        io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            NodeFailure(io::Error::from_raw_os_error(libc::ECONNRESET).into()),
+        )
+    };
+
+    for (failure, expected, length_prefix, terminal_chunk) in [
+        (
+            Some(intermediate),
+            Some(ScoreOutcome::SharedNodeFailure(episode)),
+            false,
+            false,
+        ),
+        (Some(target), Some(ScoreOutcome::TargetFailure), true, false),
+        (
+            Some(node_failure()),
+            Some(ScoreOutcome::NodeFailure),
+            true,
+            false,
+        ),
+        (
+            Some(PacketRejection::Cancelled.into()),
+            Some(ScoreOutcome::Cancelled),
+            false,
+            false,
+        ),
+        (None, None, false, false),
+        (
+            None,
+            Some(ScoreOutcome::Io(io::ErrorKind::UnexpectedEof)),
+            true,
+            false,
+        ),
+        (
+            Some(io::Error::from_raw_os_error(libc::ECONNRESET)),
+            Some(ScoreOutcome::Io(io::ErrorKind::ConnectionReset)),
+            false,
+            false,
+        ),
+        (Some(node_failure()), None, false, true),
+    ] {
+        let kind = failure.as_ref().map(io::Error::kind);
+        let (physical, mut peer) = tokio::io::duplex(4096);
+        let (inner, relay_half) = tokio::io::duplex(4096);
+        let failure_state = RelayFailure::default();
+        let pipe = crate::runtime::flow_observation::RelayedPipe::new();
+        let relay = tokio::spawn(vmess_relay_recorded(
+            Box::new(ErrorOnEof(physical, failure)),
+            relay_half,
+            hex(HEADER_WIRE),
+            fixed_session(),
+            failure_state.clone(),
+            pipe.clone(),
+        ));
+        let mut stream = VmessStream {
+            inner,
+            relay: relay.abort_handle(),
+            failure: failure_state,
+            pipe,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            peer.write_all(&hex(RESP_HEADER_WIRE)).await.unwrap();
+            let session = fixed_session();
+            let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv).unwrap();
+            let payload = b"HTTP/1.1 200 OK";
+            peer.write_all(&body.seal_chunk(payload)).await.unwrap();
+            let mut received = [0; b"HTTP/1.1 200 OK".len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
+
+            if terminal_chunk {
+                peer.write_all(&body.seal_chunk(b"")).await.unwrap();
+            } else if length_prefix {
+                peer.write_all(&body.seal_chunk(b"next")[..1])
+                    .await
+                    .unwrap();
+            }
+            // Keep the request side open so the lower read determines the result.
+            peer.shutdown().await.unwrap();
+
+            let result = stream.read(&mut [0; 1]).await;
+            if let Some(expected) = expected {
+                let error = result.expect_err("response length failure became EOF");
+                assert_eq!(error.kind(), kind.unwrap_or(io::ErrorKind::UnexpectedEof));
+                assert_eq!(ScoreOutcome::from_io_error(&error), expected);
+            } else {
+                assert_eq!(result.unwrap(), 0);
+            }
+            relay.await.unwrap();
+        })
+        .await
+        .expect("VMess payload and terminal read must settle");
     }
 }
 

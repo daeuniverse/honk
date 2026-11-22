@@ -5,7 +5,7 @@
 pub(crate) mod addr;
 pub mod anytls;
 pub mod block;
-pub mod chain;
+mod chain;
 pub mod direct;
 pub mod hysteria2;
 pub mod juicity;
@@ -33,7 +33,7 @@ pub use error::{
 };
 pub(crate) use error::{
     io_packet_rejection, io_target_failure, node_failure_episode, quic_carrier_error,
-    quic_carrier_io_error, send_size_refusal,
+    quic_carrier_io_error, retain_typed_io_error, send_size_refusal,
 };
 pub use outbound::{
     PacketOutbound, ProbeableOutbound, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,

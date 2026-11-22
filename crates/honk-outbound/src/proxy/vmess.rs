@@ -178,8 +178,7 @@ impl Session {
     }
 }
 
-/// How the relay task ended, when it failed: a rejected response header or
-/// an invalid chunk reads as that error, not as EOF.
+/// The terminal relay failure, surfaced after any buffered application data.
 type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
 struct VmessStream {
@@ -709,8 +708,12 @@ async fn vmess_relay(
         let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
         loop {
             let mut len_buf = [0u8; 2];
-            if server_read.read_exact(&mut len_buf).await.is_err() {
-                break;
+            match server_read.read(&mut len_buf).await? {
+                0 => break,
+                1 => {
+                    server_read.read_exact(&mut len_buf[1..]).await?;
+                }
+                _ => {}
             }
             let chunk_len = body.decode_len(len_buf) as usize;
             // size == AEAD overhead is the server's termination chunk
