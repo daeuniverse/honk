@@ -1,3 +1,5 @@
+mod drain;
+
 use super::*;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;

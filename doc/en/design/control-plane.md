@@ -247,7 +247,7 @@ one-byte tail; only the first frame is small. Idle and chatty flows never grow,
 so a held connection costs 16 KiB of copy buffers instead of 128 KiB. Buffering never
 requires the application to send another request or close before its current request leaves.
 
-Both relay paths half-close the peer at first EOF and bound only idle drain time: `DRAIN_DEADLINE` is 30 seconds without a byte of progress. An active survivor may run longer than 30 seconds; a silent survivor cannot pin accepted sockets indefinitely.
+The copy relay starts a 30-second idle window at the first source EOF, before the final flush and write-side shutdown. It samples copy progress every 100 ms but measures idle time with a monotonic clock. If polling is delayed past the deadline, the next poll ends the drain unless it observes a nonempty read or a destination-accepted write. Either renews the window; activity inside a pending transport flush does not. On expiry the totals include only destination-accepted bytes, and cleanup does not wait again for graceful shutdown. Native splice keeps its existing half-close and idle-drain policy.
 
 A client that disappears without FIN or RST is bounded separately: the TPROXY TCP listeners enable TCP keepalive (3600 s idle, 15 s interval, 4 probes) and accepted sockets inherit it. A silent client ends its relay after about an hour; a live idle client answers the probes, so long idle connections stay open. Its error is a client-side `TimedOut`, or `HostUnreachable`/`NetworkUnreachable` when the kernel had a pending ICMP/ARP soft error; all settle Score as cancellation.
 
@@ -265,7 +265,7 @@ After a real relay completes, the TCP owner settles its actual Score outcome and
 
 `splice.rs`: `relay_splice` uses bidirectional zero-copy `splice(2)` and half-close propagation between plain `TcpStream`s. The first splice in each direction probes capability. EINVAL/ENOSYS/EXDEV/EPERM before any bytes are staged trigger lossless copy fallback and set the process-wide latch. Pipe creation failure falls back to copying without setting the latch. **Never restore unidirectional splice**, which caused timeouts.
 
-`relay_auto` uses the same select-based copy loop for TLS/protocol-wrapped streams. `vision.rs` lends a Direct Vision carrier's socket to the same bidirectional engine. Both paths half-close the peer at first EOF and bound remaining drain by the idle `DRAIN_DEADLINE`: 30s without byte progress, never cutting an active survivor. This prevents silent peers pinning tasks/sockets in CLOSE-WAIT. UDP uses `UdpEndpointPool`.
+`relay_auto` copies TLS or protocol-wrapped streams in userspace. A Direct Vision carrier can lend its socket to the same bidirectional splice engine. UDP uses `UdpEndpointPool`.
 
 ## Reload and runtime generations
 

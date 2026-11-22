@@ -251,7 +251,7 @@ copy pump 在讀取新輸入之前，先 flush 嗅探或協定設定階段已經
 會擴容，所以一條空閒連線的 copy 緩衝區是 16 KiB，不是 128 KiB。應用不必再發一個
 請求，也不必關閉連線，就能把當前請求送出去。
 
-首次 EOF 之後，兩條中繼路徑只限制空閒排空的時間：`DRAIN_DEADLINE` 是沒有任何位元組進展的 30 秒。活躍的 survivor 可以持續超過 30 秒；靜默的 survivor 不能一直佔用 accepted socket。
+使用者空間的複製中繼從任一來源首次傳回 EOF 時啟動 30 秒閒置計時，涵蓋最後一次清空緩衝區與寫入端半關閉。中繼每 100 毫秒取樣複製進度，但用單調時鐘計算閒置時間。如果工作直到期限過後才再次獲得排程，這次輪詢就結束排空，除非觀察到新的非空讀取或目的端新接受的位元組。這兩種進展都會延長期限；傳輸層自行清空緩衝區不算進度。逾時後只計入目的端已接受的位元組，清理不再等候正常關閉。原生 `splice` 的半關閉與閒置排空策略不變。
 
 用戶端不發 FIN 或 RST 就消失的情況，另外單獨限制：TPROXY TCP listener 啟用 TCP keepalive，空閒 3600 秒、間隔 15 秒、探測 4 次，accepted socket 繼承這套設定。靜默用戶端大約一小時後結束它的 relay；仍線上的空閒用戶端會應答探測，所以長時間空閒的連線保持開啟。這種情況會回報為用戶端側的 `TimedOut`；核心有待處理的 ICMP/ARP 軟錯誤時，則是 `HostUnreachable` 或 `NetworkUnreachable`。兩種都依取消結算 Score。
 
@@ -269,7 +269,7 @@ NFQUEUE 冷 cell 重建會在同一個讀鎖 guard 內保留 conn-state 快照�
 
 `splice.rs` 的 `relay_splice` 在普通 `TcpStream` 之間用雙向零複製 `splice(2)`，並傳播半關閉。每個方向的首次 splice 都會探測 capability。在任何位元組進入管線之前，EINVAL、ENOSYS、EXDEV、EPERM 會觸發無損 copy 回退，並設定行程級停用標誌；建立管線失敗也會回退到 copy，但不設這個標誌。不要還原單向 splice，它曾導致逾時。
 
-`relay_auto` 對 TLS 或協定封裝的流用同一個基於 select 的 copy loop。`vision.rs` 把 Direct Vision carrier 的 socket 借給同一個雙向引擎。兩條路徑都會在首次 EOF 時半關閉對端，剩下的排空時間只受空閒期限 `DRAIN_DEADLINE` 限制：連續 30 秒沒有位元組進展才結束，不會截斷仍在傳輸的另一方向。這樣，一個不發資料的對端就無法讓任務和 socket 長期停在 CLOSE-WAIT。UDP 走 `UdpEndpointPool`。
+TLS 或協定封裝的串流走 `relay_auto` 的使用者空間複製路徑；進入 Direct 模式的 Vision 可以把底層通訊端交給同一套雙向 `splice` 引擎。UDP 走 `UdpEndpointPool`。
 
 ## Reload 與執行時 generation
 
