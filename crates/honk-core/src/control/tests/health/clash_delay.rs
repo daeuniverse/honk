@@ -830,7 +830,7 @@ async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild(
     let mut delay = ClashDelay::new(api, Some(old_exit), "/group/pool/delay", "old");
     let generation = control.runtime_registry.read().generation();
     let (unlocked, resume_tx) = pause_after_publication(&control);
-    let (response, rebuild) = delay
+    let (response, (rebuild, resume_tx)) = delay
         .measure("204 No Content", async {
             Arc::make_mut(&mut *control.config.write().await).groups[0].nodes = vec![new_id];
             let runtime = tokio::runtime::Handle::current();
@@ -839,7 +839,7 @@ async fn clash_group_delay_cannot_credit_or_reselect_after_manager_only_rebuild(
                 runtime.block_on(plane.reload_group_manager());
             });
             unlocked.notified().await;
-            rebuild
+            (rebuild, resume_tx)
         })
         .await;
     delay.success(response);
