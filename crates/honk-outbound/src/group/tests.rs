@@ -549,7 +549,7 @@ fn test_select_marks_group_active() {
     let n = nid("a");
     let nodes = vec![make_node(n, "a")];
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
+    alive.register_idle_group("g", &[nid("a")], Some(Duration::from_secs(3600)));
     let m = GroupManager::with_alive_set(
         &[make_group("g", GroupPolicy::URLTest, vec![n])],
         &nodes,
@@ -557,20 +557,43 @@ fn test_select_marks_group_active() {
     );
 
     // Lazy start: idle before first use, active after selection.
-    assert!(alive.is_urltest_group_idle("g"));
+    assert!(alive.is_group_idle("g"));
     m.select_node("g");
-    assert!(!alive.is_urltest_group_idle("g"));
+    assert!(!alive.is_group_idle("g"));
 
     // The parallel-dial path also counts as activity.
-    alive.register_urltest_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
+    alive.register_idle_group("g2", &[nid("a")], Some(Duration::from_millis(50)));
     let m2 = GroupManager::with_alive_set(
         &[make_group("g2", GroupPolicy::URLTest, vec![n])],
         &nodes,
         Some(alive.clone()),
     );
-    assert!(alive.is_urltest_group_idle("g2"));
+    assert!(alive.is_group_idle("g2"));
     m2.select_nodes_in_order_for_domain("g2", ProbeDomain::Tcp, IpVersion::V4);
-    assert!(!alive.is_urltest_group_idle("g2"));
+    assert!(!alive.is_group_idle("g2"));
+}
+
+/// An idle Selector keeps probing only its selected member.
+#[test]
+fn idle_selector_suspends_all_but_selected_member() {
+    let (a, b) = (nid("a"), nid("b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.register_idle_group("sel", &[a, b], None);
+    let m = GroupManager::with_alive_set(
+        &[make_group("sel", GroupPolicy::Selector, vec![a, b])],
+        &nodes,
+        Some(alive.clone()),
+    );
+    m.publish_selected_probe_nodes();
+    assert!(alive.is_group_idle("sel"));
+    assert!(!alive.is_probe_suspended(a));
+    assert!(alive.is_probe_suspended(b));
+
+    m.set_selector_choice("sel", "b", crate::group::SelectorNetworks::Both)
+        .unwrap();
+    assert!(alive.is_probe_suspended(a));
+    assert!(!alive.is_probe_suspended(b));
 }
 
 /// Authoritative selection (sing-box semantics): the dial path returns
@@ -2017,15 +2040,15 @@ fn peek_selection_plan_keeps_cold_urltest_idle_and_cache_empty() {
     let nodes = vec![make_node(node_id, "cold")];
     let group = make_group("cold", GroupPolicy::URLTest, vec![node_id]);
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
+    alive.register_idle_group("cold", &[nid("cold")], Some(Duration::from_secs(60)));
     let manager = GroupManager::with_alive_set(&[group], &nodes, Some(Arc::clone(&alive)));
 
-    assert!(alive.is_urltest_group_idle("cold"));
+    assert!(alive.is_group_idle("cold"));
     let plan = manager.peek_selection_plan_for_domain("cold", ProbeDomain::DataUdp, IpVersion::V4);
 
     assert_eq!(plan.mode, SelectionPlanMode::ColdUrlTest);
     assert_eq!(plan.nodes[0].name, "cold");
-    assert!(alive.is_urltest_group_idle("cold"));
+    assert!(alive.is_group_idle("cold"));
     assert_eq!(manager.get_urltest_selection("cold"), None);
 }
 
@@ -2151,7 +2174,7 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["child"]);
     let alive = Arc::new(AliveDialerSet::new());
     for group in ["child", "parent"] {
-        alive.register_urltest_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
+        alive.register_idle_group(group, &[nid("a"), nid("b")], Some(Duration::from_secs(60)));
     }
     let manager = GroupManager::with_alive_set(&[child, parent], &nodes, Some(Arc::clone(&alive)));
     alive.record_probe_latency(
@@ -2171,8 +2194,8 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let plan =
         manager.peek_selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(plan.nodes[0].name, "a");
-    assert!(alive.is_urltest_group_idle("parent"));
-    assert!(alive.is_urltest_group_idle("child"));
+    assert!(alive.is_group_idle("parent"));
+    assert!(alive.is_group_idle("child"));
     assert_eq!(
         manager.get_urltest_selection_for_network("child", SelectionNetwork::Udp),
         None
@@ -2184,7 +2207,7 @@ fn peek_selection_plan_keeps_nested_child_idle_and_only_reads_tcp_mirror() {
     let plan =
         manager.peek_selection_plan_for_domain("parent", ProbeDomain::DataUdp, IpVersion::V4);
     assert_eq!(plan.nodes[0].name, "a");
-    assert!(alive.is_urltest_group_idle("parent"));
+    assert!(alive.is_group_idle("parent"));
     assert_eq!(
         manager.get_urltest_selection_for_network("child", SelectionNetwork::Udp),
         None

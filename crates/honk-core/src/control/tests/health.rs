@@ -145,6 +145,9 @@ async fn c28_health_reload_retains_old_period_after_rejection() {
             "HEAD".into(),
         )
         .await;
+    // Measure the period alone: without idle suspension, and without the
+    // wake-up probes that marking the group active would queue.
+    alive.sync_idle_groups(&[]);
     let task = alive.spawn_health_check_loop(Duration::from_secs(30), Duration::from_secs(1));
     let first = observations.recv().await.unwrap();
     // Both registered leaves are probed in each cycle.
@@ -230,6 +233,7 @@ async fn reject_http_change(change: fn(&mut Config)) {
         !cp.reload_runtime_config(candidate, Default::default())
             .await
     );
+    cp.alive_set().mark_group_active("score");
     cp.alive_set()
         .run_health_check_cycle(Duration::from_secs(1))
         .await;

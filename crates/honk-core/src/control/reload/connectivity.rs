@@ -87,35 +87,25 @@ pub(in crate::control) fn sync_health_check_nodes(
     alive_set.sync_registrations(health_registrations(config, &leaves))
 }
 
-/// URLTest group registrations for the alive set's idle-suspension table:
-/// `(group name, member NodeIds, idle timeout)` per URLTest group.
-/// Leaves shared with any non-URLTest group are probed unconditionally.
-/// Membership and explicit final edges both participate, since health state
-/// lives on real nodes. Used identically at startup and on config reload.
-pub(in crate::control) fn urltest_group_registrations(
+/// Group registrations for the alive set's idle-suspension table:
+/// `(group name, member NodeIds, idle timeout)` per group, for every policy.
+/// A leaf stays probed while any of its groups is active or a group holds
+/// it fixed (`GroupManager::publish_selected_probe_nodes`). Membership and
+/// explicit final edges both participate, since health state lives on real
+/// nodes. Used identically at startup and on config reload.
+pub(in crate::control) fn idle_group_registrations(
     config: &Config,
 ) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
     let graph = GroupGraph::new(&config.groups, &config.nodes);
-    let always_probed_node_ids: BTreeSet<uuid::Uuid> = config
-        .groups
-        .iter()
-        .enumerate()
-        .filter(|(_, g)| g.policy != GroupPolicy::URLTest)
-        .flat_map(|(index, _)| group_leaf_ids(&graph, index))
-        .collect();
     config
         .groups
         .iter()
         .enumerate()
-        .filter(|(_, g)| g.policy == GroupPolicy::URLTest)
         .map(|(index, group)| {
-            let members: Vec<uuid::Uuid> = group_leaf_ids(&graph, index)
-                .into_iter()
-                .filter(|id| !always_probed_node_ids.contains(id))
-                .collect();
+            let members = group_leaf_ids(&graph, index);
             (
                 group.name.clone(),
-                members,
+                members.into_iter().collect(),
                 group.idle_timeout.map(std::time::Duration::from_secs),
             )
         })
@@ -435,9 +425,10 @@ impl ControlPlane {
             changes
         };
 
-        // Refresh the URLTest idle table to match the published membership.
+        // Refresh the idle table to match the published membership.
         self.alive_set
-            .sync_urltest_groups(&urltest_group_registrations(&config));
+            .sync_idle_groups(&idle_group_registrations(&config));
+        self.group_manager.read().publish_selected_probe_nodes();
         self.alive_set
             .sync_group_check_urls(&group_check_url_registrations(&config));
         info!(

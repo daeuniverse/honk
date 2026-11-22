@@ -900,7 +900,7 @@ mod native_probe_tests {
             ..Default::default()
         };
         let alive = Arc::new(AliveDialerSet::new());
-        alive.register_urltest_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
+        alive.register_idle_group(&group.name, &group.nodes, Some(Duration::from_secs(60)));
         let manager = GroupManager::with_alive_set(&[group], &nodes, Some(alive.clone()));
         let member = GroupMember::Group(manager.group("urltest").unwrap());
         assert!(
@@ -925,7 +925,7 @@ mod native_probe_tests {
                 .probe_leaf(member, ProbeDomain::DataUdp, IpVersion::V4)
                 .is_none()
         );
-        assert!(alive.is_urltest_group_idle("urltest"));
+        assert!(alive.is_group_idle("urltest"));
         assert_eq!(
             manager.get_urltest_selection_for_network("urltest", SelectionNetwork::Udp),
             None

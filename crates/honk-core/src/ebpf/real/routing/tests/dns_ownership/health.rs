@@ -715,8 +715,11 @@ async fn check_routed_udp_health() {
     );
 
     // Drive the real recovery scheduler without letting ordinary TCP checks
-    // consume the scripted peers' accepts.
-    alive.sync_urltest_groups(&[("ordinary health probes".into(), raw_nodes, Some(WAIT))]);
+    // consume the scripted peers' accepts. Every raw node is a selector pick
+    // or a final here, and held nodes keep probing while idle, so the
+    // exemption is cleared as well.
+    alive.sync_idle_groups(&[("ordinary health probes".into(), raw_nodes, Some(WAIT))]);
+    alive.set_selected_nodes(Default::default());
     let cycle = tokio::spawn({
         let alive = alive.clone();
         async move { alive.run_health_check_cycle_concurrent(WAIT, 1).await }

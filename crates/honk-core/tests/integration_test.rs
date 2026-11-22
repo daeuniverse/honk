@@ -371,7 +371,7 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     assert!(registered.contains_key(&c.id));
     // The new URLTest group is registered for idle suspension (lazy
     // start: never active → idle).
-    assert!(cp.alive_set().is_urltest_group_idle("ut"));
+    assert!(cp.alive_set().is_group_idle("ut"));
 
     // v3: "proxy" shrinks to a only; "extra" and "ut" removed — the
     // stale choice for "b" and the old registrations disappear.
@@ -397,7 +397,7 @@ async fn test_reload_rebuilds_group_manager_preserving_choices() {
     assert!(!registered.contains_key(&b.id));
     assert!(!registered.contains_key(&c.id));
     // Removed URLTest groups are no longer registered (never idle).
-    assert!(!cp.alive_set().is_urltest_group_idle("ut"));
+    assert!(!cp.alive_set().is_group_idle("ut"));
 }
 
 #[tokio::test]

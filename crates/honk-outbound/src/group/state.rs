@@ -285,6 +285,9 @@ impl GroupManager {
         }
         let revision = state.revision;
         drop(state);
+        if !changed_networks.is_empty() {
+            self.wake_selected_probe_nodes();
+        }
         Ok(SelectorUpdate {
             revision,
             changed_networks,
@@ -381,6 +384,9 @@ impl GroupManager {
         }
         let revision = state.revision;
         drop(state);
+        if !changed_networks.is_empty() {
+            self.wake_selected_probe_nodes();
+        }
         Ok(SelectorUpdate {
             revision,
             changed_networks,
@@ -464,10 +470,43 @@ impl GroupManager {
             .any(|entry| entry.group.interrupt_connections)
     }
 
-    /// Wake URLTest health checks when a group serves traffic.
+    /// Wake idle-suspended health checks when a group serves traffic.
     pub(super) fn mark_used(&self, group_name: &str) {
         if let Some(alive) = &self.alive_set {
             alive.mark_group_active(group_name);
+        }
+    }
+
+    /// Publish the nodes groups hold fixed to the alive set, which keeps
+    /// probing them while their groups are idle: every Selector's current
+    /// TCP and UDP member, an automatic group's pin, and a node `final`.
+    /// Returns the nodes this took out of idle suspension.
+    pub fn publish_selected_probe_nodes(&self) -> Vec<uuid::Uuid> {
+        let Some(alive) = &self.alive_set else {
+            return Vec::new();
+        };
+        let mut nodes = HashSet::new();
+        {
+            let state = self.selector_choice.read();
+            for group in self.groups.values().map(|managed| &managed.group) {
+                let selected = [SelectionNetwork::Tcp, SelectionNetwork::Udp]
+                    .map(|network| self.selector_member_in(group, network, &state));
+                for member in selected.into_iter().chain([self.final_member(group)]) {
+                    if let Some(GroupMember::Node(node)) = member {
+                        nodes.insert(node.id);
+                    }
+                }
+            }
+        }
+        alive.set_selected_nodes(nodes)
+    }
+
+    /// After a selection change, probe newly selected idle nodes at once.
+    fn wake_selected_probe_nodes(&self) {
+        if let Some(alive) = &self.alive_set {
+            for node in self.publish_selected_probe_nodes() {
+                alive.trigger_probe(node);
+            }
         }
     }
 

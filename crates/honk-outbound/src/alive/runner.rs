@@ -425,10 +425,10 @@ impl AliveDialerSet {
         let has_registered_nodes = !nodes.is_empty();
 
         let due = nodes.into_iter().filter_map(|(id, registration)| {
-            // URLTest idle suspension: skip nodes whose groups are all idle
+            // Idle suspension: skip nodes whose groups are all idle
             // (lazy start: never-active groups start suspended).
             if self.is_probe_suspended(id) {
-                tracing::trace!("Skipping health check for '{}' (URLTest groups idle)", id);
+                tracing::trace!("Skipping health check for '{}' (groups idle)", id);
                 return None;
             }
             // Stopped nodes are probed too — on their slow max_cooldown
@@ -466,7 +466,7 @@ impl AliveDialerSet {
         // so nested groups rank correctly even as sub-picks change.
         let native_epoch = self.health_epoch();
         for (group, url) in self.group_check_urls() {
-            if self.is_urltest_group_idle(&group) {
+            if self.is_group_idle(&group) {
                 tracing::trace!(
                     "Skipping custom-URL health checks for idle group '{}'",
                     group

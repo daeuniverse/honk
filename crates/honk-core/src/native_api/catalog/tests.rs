@@ -248,7 +248,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
     })
     .collect();
     let alive = Arc::new(AliveDialerSet::new());
-    alive.register_urltest_group(
+    alive.register_idle_group(
         "urltest",
         &config.groups[1].nodes,
         Some(Duration::from_secs(60)),
@@ -267,7 +267,7 @@ fn native_reads_do_not_rotate_load_balance_wake_urltest_or_train_score() {
             group_value(&manager, group, &identity, &alive, true);
         }
     }
-    assert!(alive.is_urltest_group_idle("urltest"));
+    assert!(alive.is_group_idle("urltest"));
     assert!(
         manager
             .peek_selection("urltest", SelectionNetwork::Tcp)

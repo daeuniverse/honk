@@ -189,7 +189,7 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     set.mark_group_active("untracked");
     assert!(set.group_last_active.read().is_empty());
 
-    set.sync_urltest_groups(&[(
+    set.sync_idle_groups(&[(
         "tracked".to_owned(),
         Vec::new(),
         Some(Duration::from_secs(60)),
@@ -361,7 +361,7 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
         "HEAD".into(),
     )
     .await;
-    set.register_urltest_group("idle", &[node_id], Some(Duration::from_secs(3600)));
+    set.register_idle_group("idle", &[node_id], Some(Duration::from_secs(3600)));
     for ipver in [IpVersion::V4, IpVersion::V6] {
         set.states.write().get_mut(&node_id).unwrap()[alive_index(ProbeDomain::Tcp, ipver)]
             .cooldown_until = Instant::now() + Duration::from_secs(300);
@@ -412,16 +412,16 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
 
 #[test]
 fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
-    // Reload takes urltest_group_timeout first and node_urltest_groups last.
+    // Reload takes idle_group_timeout first and node_idle_groups last.
     // A suspension check reads them in the opposite order, so it must release
     // the node groups before consulting the timeouts or the two orders form a
     // cycle. With the timeouts held here the check cannot finish; the node
     // groups must still be free for reload's next acquisition.
     let set = std::sync::Arc::new(AliveDialerSet::new());
     set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
+    set.register_idle_group("g", &[id(1)], Some(Duration::from_millis(50)));
 
-    let timeouts = set.urltest_group_timeout.write();
+    let timeouts = set.idle_group_timeout.write();
     let (entered, started) = std::sync::mpsc::channel();
     let prober = {
         let set = std::sync::Arc::clone(&set);
@@ -438,7 +438,7 @@ fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     let mut node_groups_free = false;
     while std::time::Instant::now() < deadline {
-        if set.node_urltest_groups.try_write().is_some() {
+        if set.node_idle_groups.try_write().is_some() {
             node_groups_free = true;
             break;
         }
@@ -449,7 +449,7 @@ fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
 
     assert!(
         node_groups_free,
-        "the suspension check held node_urltest_groups while waiting for urltest_group_timeout"
+        "the suspension check held node_idle_groups while waiting for idle_group_timeout"
     );
 }
 
@@ -457,22 +457,22 @@ fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();
     set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
+    set.register_idle_group("g", &[id(1)], Some(Duration::from_millis(50)));
 
     // Lazy start: a never-active group is idle → probing suspended.
-    assert!(set.is_urltest_group_idle("g"));
+    assert!(set.is_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
 
     set.mark_group_active("g");
-    assert!(!set.is_urltest_group_idle("g"));
+    assert!(!set.is_group_idle("g"));
     assert!(!set.is_probe_suspended(id(1)));
 
     tokio::time::sleep(Duration::from_millis(60)).await;
-    assert!(set.is_urltest_group_idle("g"));
+    assert!(set.is_group_idle("g"));
     assert!(set.is_probe_suspended(id(1)));
 
     // Unregistered groups are never idle; ungrouped nodes never suspended.
-    assert!(!set.is_urltest_group_idle("nope"));
+    assert!(!set.is_group_idle("nope"));
     assert!(!set.is_probe_suspended(id(99)));
 }
 
@@ -482,7 +482,7 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
     // 127.0.0.1:1 refuses connections → a probe records a failure.
     set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.register_node(id(2), "n2".into(), Some("127.0.0.1:1".into()));
-    set.register_urltest_group("g", &[id(1)], Some(Duration::from_secs(3600)));
+    set.register_idle_group("g", &[id(1)], Some(Duration::from_secs(3600)));
 
     // n1's group was never active → suspended → cycle never probes it.
     set.run_health_check_cycle(Duration::from_millis(200)).await;
@@ -546,20 +546,20 @@ fn test_push_ebpf_uses_outbound_resolver() {
 }
 
 #[test]
-fn test_sync_urltest_groups_full_refresh() {
+fn test_sync_idle_groups_full_refresh() {
     let set = AliveDialerSet::new();
     for (i, n) in ["n1", "n2", "n3"].into_iter().enumerate() {
         set.register_node(id(i as u128 + 1), n.into(), Some("127.0.0.1:1".into()));
     }
     // Re-registering the same group twice duplicates the node→groups
     // index; the full refresh must rebuild it cleanly.
-    set.register_urltest_group("g1", &[id(1)], Some(Duration::from_secs(10)));
-    set.register_urltest_group("g1", &[id(1)], Some(Duration::from_secs(10)));
-    set.register_urltest_group("g2", &[id(2)], Some(Duration::from_secs(20)));
+    set.register_idle_group("g1", &[id(1)], Some(Duration::from_secs(10)));
+    set.register_idle_group("g1", &[id(1)], Some(Duration::from_secs(10)));
+    set.register_idle_group("g2", &[id(2)], Some(Duration::from_secs(20)));
     set.mark_group_active("g1");
 
     // Reload: g1 survives with new members/timeout, g2 removed, g3 new.
-    set.sync_urltest_groups(&[
+    set.sync_idle_groups(&[
         (
             "g1".into(),
             vec![id(2), id(3)],
@@ -570,11 +570,11 @@ fn test_sync_urltest_groups_full_refresh() {
 
     // g1 keeps its activity timestamp (not idle despite the new 30s
     // timeout because it was just active).
-    assert!(!set.is_urltest_group_idle("g1"));
+    assert!(!set.is_group_idle("g1"));
     // g2 is gone → treated as unregistered (never idle).
-    assert!(!set.is_urltest_group_idle("g2"));
+    assert!(!set.is_group_idle("g2"));
     // g3 registered with the default timeout, never active → idle.
-    assert!(set.is_urltest_group_idle("g3"));
+    assert!(set.is_group_idle("g3"));
 
     // Node → groups index rebuilt: n1 now belongs only to g3, n2/n3 to g1.
     assert!(set.is_probe_suspended(id(1))); // g3 idle
@@ -582,8 +582,8 @@ fn test_sync_urltest_groups_full_refresh() {
     assert!(!set.is_probe_suspended(id(3))); // g1 active
 
     // Wake-up membership follows the new table.
-    set.sync_urltest_groups(&[("g3".into(), vec![id(1)], None)]);
-    assert!(!set.is_urltest_group_idle("g1")); // removed → never idle
+    set.sync_idle_groups(&[("g3".into(), vec![id(1)], None)]);
+    assert!(!set.is_group_idle("g1")); // removed → never idle
     assert!(!set.is_probe_suspended(id(2))); // no groups → not suspended
 }
 struct MockHttpProber {

@@ -1,6 +1,6 @@
 use super::collection::DialerCollection;
 use super::{
-    AliveDialerSet, DEFAULT_URLTEST_IDLE_TIMEOUT, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
+    AliveDialerSet, DEFAULT_GROUP_IDLE_TIMEOUT, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
     UrlMemberResolver, UrlProbeMember, UrlProbeState, probe_backoff, probe_failure_threshold,
 };
 use std::collections::HashSet;
@@ -10,26 +10,25 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 impl AliveDialerSet {
-    /// Register a URLTest group for idle-aware probe suspension.
+    /// Register a group for idle-aware probe suspension.
     ///
-    /// `members` are NodeIds; callers should exclude members that also
-    /// belong to Selector groups (those are probed unconditionally).
-    /// `idle_timeout` defaults to [`DEFAULT_URLTEST_IDLE_TIMEOUT`] when
-    /// `None`. Re-callable on config reload.
-    pub fn register_urltest_group(
+    /// `members` are the group's leaf NodeIds. `idle_timeout` defaults to
+    /// [`DEFAULT_GROUP_IDLE_TIMEOUT`] when `None`. Re-callable on config
+    /// reload.
+    pub fn register_idle_group(
         &self,
         group: &str,
         members: &[Uuid],
         idle_timeout: Option<Duration>,
     ) {
-        let timeout = idle_timeout.unwrap_or(DEFAULT_URLTEST_IDLE_TIMEOUT);
-        self.urltest_group_timeout
+        let timeout = idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
+        self.idle_group_timeout
             .write()
             .insert(group.to_string(), timeout);
-        self.urltest_group_members
+        self.idle_group_members
             .write()
             .insert(group.to_string(), members.to_vec());
-        let mut node_groups = self.node_urltest_groups.write();
+        let mut node_groups = self.node_idle_groups.write();
         for member in members {
             node_groups
                 .entry(*member)
@@ -39,7 +38,7 @@ impl AliveDialerSet {
     }
 
     /// Replace the whole custom check-URL table (config reload), same
-    /// shape as [`AliveDialerSet::sync_urltest_groups`]: `groups` is
+    /// shape as [`AliveDialerSet::sync_idle_groups`]: `groups` is
     /// `(group name, check_url)` for every group that has a custom
     /// `check_url`. Entries for groups absent from `groups` are dropped;
     /// per-(tag, url) probe state and latency data survive as long as the
@@ -218,27 +217,27 @@ impl AliveDialerSet {
         Ok(ips)
     }
 
-    /// Replace the whole URLTest group table (config reload).
+    /// Replace the whole idle-group table (config reload).
     ///
     /// `groups` is `(group name, member NodeIds, idle timeout)` per
-    /// URLTest group — the same shape [`register_urltest_group`] takes.
+    /// group — the same shape [`register_idle_group`] takes.
     /// Entries for groups absent from `groups` are dropped, and the
     /// node → groups index is rebuilt from scratch (so stale memberships
     /// and duplicate entries from repeated registration disappear).
     /// `group_last_active` timestamps survive for groups that still exist,
     /// keeping the idle-suspension state across the reload.
-    pub fn sync_urltest_groups(&self, groups: &[(String, Vec<Uuid>, Option<Duration>)]) {
+    pub fn sync_idle_groups(&self, groups: &[(String, Vec<Uuid>, Option<Duration>)]) {
         {
-            let mut timeouts = self.urltest_group_timeout.write();
-            let mut members_map = self.urltest_group_members.write();
-            let mut node_groups = self.node_urltest_groups.write();
+            let mut timeouts = self.idle_group_timeout.write();
+            let mut members_map = self.idle_group_members.write();
+            let mut node_groups = self.node_idle_groups.write();
             timeouts.clear();
             members_map.clear();
             node_groups.clear();
             for (group, members, idle_timeout) in groups {
                 timeouts.insert(
                     group.clone(),
-                    idle_timeout.unwrap_or(DEFAULT_URLTEST_IDLE_TIMEOUT),
+                    idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
                 );
                 members_map.insert(group.clone(), members.clone());
                 for member in members {
@@ -246,8 +245,7 @@ impl AliveDialerSet {
                 }
             }
         }
-        let surviving: HashSet<String> =
-            self.urltest_group_timeout.read().keys().cloned().collect();
+        let surviving: HashSet<String> = self.idle_group_timeout.read().keys().cloned().collect();
         self.group_last_active
             .write()
             .retain(|group, _| surviving.contains(group));
@@ -255,11 +253,11 @@ impl AliveDialerSet {
 
     /// Record activity for a group (called from group selection paths).
     ///
-    /// When a suspended URLTest group becomes active again, health checks
+    /// When a suspended group becomes active again, health checks
     /// resume and member probes are kicked off immediately so latency data
     /// is fresh for the next selection.
     pub fn mark_group_active(&self, group: &str) {
-        let Some(timeout) = self.urltest_group_timeout.read().get(group).copied() else {
+        let Some(timeout) = self.idle_group_timeout.read().get(group).copied() else {
             return;
         };
         let was_idle = {
@@ -277,16 +275,13 @@ impl AliveDialerSet {
         };
         if was_idle {
             let members = self
-                .urltest_group_members
+                .idle_group_members
                 .read()
                 .get(group)
                 .cloned()
                 .unwrap_or_default();
             if !members.is_empty() {
-                tracing::debug!(
-                    "URLTest group '{}' active again — resuming member probes",
-                    group
-                );
+                tracing::debug!("Group '{}' active again — resuming member probes", group);
                 for member in members {
                     self.trigger_probe(member);
                 }
@@ -294,12 +289,12 @@ impl AliveDialerSet {
         }
     }
 
-    /// Whether a registered URLTest group has been inactive for longer than
+    /// Whether a registered group has been inactive for longer than
     /// its idle timeout. A never-active group counts as idle (lazy start:
     /// no probes run before the first selection). Unregistered groups are
     /// never idle.
-    pub fn is_urltest_group_idle(&self, group: &str) -> bool {
-        let timeout = match self.urltest_group_timeout.read().get(group) {
+    pub fn is_group_idle(&self, group: &str) -> bool {
+        let timeout = match self.idle_group_timeout.read().get(group) {
             Some(t) => *t,
             None => return false,
         };
@@ -311,15 +306,40 @@ impl AliveDialerSet {
     }
 
     /// Whether periodic probing of this node is suspended because every
-    /// URLTest group it belongs to is idle. Nodes outside URLTest groups
-    /// are never suspended.
+    /// group it belongs to is idle. Nodes outside any group and nodes a
+    /// group holds fixed (see [`Self::set_selected_nodes`]) are never
+    /// suspended.
     pub fn is_probe_suspended(&self, node_id: Uuid) -> bool {
-        // Reload takes `urltest_group_timeout` first and this map last, so the
+        if self.selected_nodes.read().contains(&node_id) {
+            return false;
+        }
+        // Reload takes `idle_group_timeout` first and this map last, so the
         // names are copied out rather than held across the idle checks.
-        let groups = match self.node_urltest_groups.read().get(&node_id) {
+        let groups = match self.node_idle_groups.read().get(&node_id) {
             Some(groups) if !groups.is_empty() => groups.clone(),
             _ => return false,
         };
-        groups.iter().all(|group| self.is_urltest_group_idle(group))
+        groups.iter().all(|group| self.is_group_idle(group))
+    }
+
+    /// Replace the nodes groups hold fixed: a manual selection (Selector
+    /// choice, an automatic group's pin) or a node `final`. They keep
+    /// periodic probing while idle, so a manually selected dead node can
+    /// still recover. Returns the nodes this took out of idle suspension.
+    pub fn set_selected_nodes(&self, nodes: HashSet<Uuid>) -> Vec<Uuid> {
+        let added: Vec<Uuid> = {
+            let current = self.selected_nodes.read();
+            nodes
+                .iter()
+                .filter(|id| !current.contains(id))
+                .copied()
+                .collect()
+        };
+        let woken = added
+            .into_iter()
+            .filter(|id| self.is_probe_suspended(*id))
+            .collect();
+        *self.selected_nodes.write() = nodes;
+        woken
     }
 }

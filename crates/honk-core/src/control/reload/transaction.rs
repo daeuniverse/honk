@@ -953,7 +953,8 @@ impl ControlPlane {
         {
             let config = self.config.read().await;
             self.alive_set
-                .sync_urltest_groups(&urltest_group_registrations(&config));
+                .sync_idle_groups(&idle_group_registrations(&config));
+            self.group_manager.read().publish_selected_probe_nodes();
             self.alive_set
                 .sync_group_check_urls(&group_check_url_registrations(&config));
         }
