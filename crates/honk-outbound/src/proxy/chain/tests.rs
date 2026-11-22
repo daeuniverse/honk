@@ -2,15 +2,13 @@ use super::*;
 use crate::proxy::{AsyncReadWrite, ProtocolEntry, ProxyRegistry, node_failure};
 use crate::runtime::OutboundRuntimeRegistry;
 use crate::test_support::{
-    assert_legacy_bulk_echo, chain, mock_legacy_tcp_server, node, socks5, socks5_relay,
+    TCP_TARGET as TARGET, TCP_TARGET_HEADER, assert_legacy_bulk_echo, chain,
+    mock_legacy_tcp_server, node, socks5, socks5_relay,
 };
 use honk_config::node::OutboundConfig;
 use std::sync::Mutex;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
-
-/// The Shadowsocks mock skips a 7-byte IPv4 target header.
-const TARGET: &str = "93.184.216.34:80";
 
 fn target() -> SocketAddr {
     TARGET.parse().unwrap()
@@ -35,7 +33,7 @@ async fn shadowsocks_server() -> SocketAddr {
     tokio::spawn(async move {
         loop {
             let (stream, _) = listener.accept().await.unwrap();
-            tokio::spawn(mock_legacy_tcp_server(stream));
+            tokio::spawn(mock_legacy_tcp_server(stream, &TCP_TARGET_HEADER));
         }
     });
     addr

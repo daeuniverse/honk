@@ -448,6 +448,22 @@ fn tunnel_runtime(
 
 #[tokio::test]
 async fn dial_over_sends_the_plain_request_through_the_carrier() {
+    assert_plain_tunnel_request(tunnel_runtime(|_| {})).await;
+}
+
+#[tokio::test]
+async fn dial_over_uses_plain_tcp_with_udp_only_xray_mux() {
+    let runtime = tunnel_runtime(|vless| {
+        vless.multiplex = honk_config::node::VlessMultiplex::Xray {
+            tcp: None,
+            udp: honk_config::node::VlessUdpMux::Separate(std::num::NonZeroU16::new(8).unwrap()),
+            udp443: honk_config::node::Udp443Policy::Reject,
+        };
+    });
+    assert_plain_tunnel_request(runtime).await;
+}
+
+async fn assert_plain_tunnel_request(runtime: Arc<crate::runtime::NodeRuntime>) {
     let (client, mut server) = tokio::io::duplex(4096);
     let server = tokio::spawn(async move {
         let mut head = [0u8; 19 + 7];
@@ -469,7 +485,7 @@ async fn dial_over_sends_the_plain_request_through_the_carrier() {
 
     let mut stream = VLessHandler::new()
         .dial_over(
-            tunnel_runtime(|_| {}),
+            runtime,
             Box::new(client),
             "93.184.216.34:80".parse().unwrap(),
             None,
@@ -493,6 +509,8 @@ async fn dial_over_sends_the_plain_request_through_the_carrier() {
 
 #[tokio::test]
 async fn dial_over_refuses_shapes_that_need_a_physical_dial() {
+    use crate::proxy::TunnelUnsupported;
+
     type Configure = fn(&mut honk_config::node::VlessConfig);
     let shapes: [(&str, Configure); 5] = [
         ("vless vision", |vless| {
@@ -536,10 +554,10 @@ async fn dial_over_refuses_shapes_that_need_a_physical_dial() {
             .await
             .expect("a refused shape must not wait on the carrier")
             .unwrap_err();
-        assert!(crate::proxy::tunnel_unsupported(&error), "{error:#}");
         assert_eq!(
-            error.to_string(),
-            format!("{shape} cannot run over a tunneled stream")
+            error.downcast_ref::<TunnelUnsupported>(),
+            Some(&TunnelUnsupported(shape)),
+            "{error:#}"
         );
         let mut written = Vec::new();
         server.read_to_end(&mut written).await.unwrap();

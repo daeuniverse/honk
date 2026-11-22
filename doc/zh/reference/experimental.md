@@ -60,6 +60,8 @@ experimental {
 
 原生 API 需要显式启用的 `native-api` Cargo feature。用 `--features native-api` 或 `--features native-ui` 构建，或直接用 full 发布版本、名字里带 `-native-api` 的发布版本。它不依赖 `clash-api`。listener 默认关闭；没编译该 feature 却在配置里启用时，启动会报错。
 
+字段直接写在 `experimental` 下时，启动会报 `native API setting belongs inside native_api { }`；把字段移进嵌套块。`unknown experimental setting` 表示该 key 不属于任何 experimental 小节；`enabled` 和 `secret` 也会报这个错误，因为它们属于多个块。`native-api feature is required` 表示构建缺少该 feature，而 `enabled` 为 true。
+
 未知字段、标量字段里嵌块、无效布尔值，以及白名单里的空成员，都会报错。
 
 布尔键写 `true` 或 `false`；加载器也接受 `yes`/`no`、`1`/`0` 和 `on`/`off`，不区分大小写。其他写法会报 `invalid-config-value` 错误，例如 `t`。采用严格解析的设置清单见[配置方言参考](./dialect.md#标量与列表)。
@@ -191,7 +193,7 @@ Host 和 Origin 的检查独立于认证：
 
 ### 内嵌 UI
 
-单文件部署可以用 full 发布产物，也可以执行 `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui` 自行构建，然后把 `ui` 设为 `embedded` 或 `embedded-lite`。`native-ui` 隐含 `native-api`，不需要 Clash。构建里没有 `native-ui` 却启用内嵌托管，启动会失败。静态资源里不注入凭据；客户端通过公共 discovery 选择静态 token 输入或密码 setup/login。产物与源码的身份、对应源码的分发方式和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
+单文件部署可以用 full 发布产物，也可以执行 `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui` 自行构建，然后把 `ui` 设为 `embedded` 或 `embedded-lite`。`native-ui` 隐含 `native-api`，不需要 Clash。构建里没有 `native-ui` 却启用内嵌托管，启动会失败。静态资源里不注入凭据；登录和管理员设置见 [doona 手册](https://daeuniverse.org/doona/)。产物与源码的身份、对应源码的分发方式和管理契约见 [API 参考](./api.md#内嵌-doona-来源)。
 
 ### Geodata 来源
 

@@ -74,7 +74,8 @@ pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {
     find_cause::<NodeFailure>(error).is_some()
 }
 
-/// Whether a tunneled dial was refused because the hop cannot be tunneled.
+/// Whether any cause of `error`, including one inside an `io::Error`, is a
+/// [`TunnelUnsupported`] refusal.
 pub fn tunnel_unsupported(error: &anyhow::Error) -> bool {
     find_cause::<TunnelUnsupported>(error.as_ref()).is_some()
 }

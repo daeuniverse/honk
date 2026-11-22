@@ -1620,17 +1620,6 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-01"
-source = { file = "doc/en/how-to-start.md", fence = 1 }
-wrap = ""
-layer = "structure"
-honk = "accept"
-dae = "accept"
-honk_diagnostics = []
-compare = "equal"
-unknown_sections = 0
-
-[[case]]
-id = "honk-doc-en-how-to-start-02"
 source = { file = "doc/en/how-to-start.md", fence = 2 }
 wrap = ""
 layer = "structure"
@@ -1641,8 +1630,19 @@ compare = "equal"
 unknown_sections = 0
 
 [[case]]
-id = "honk-doc-en-how-to-start-03"
+id = "honk-doc-en-how-to-start-02"
 source = { file = "doc/en/how-to-start.md", fence = 3 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-en-how-to-start-03"
+source = { file = "doc/en/how-to-start.md", fence = 4 }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -1653,7 +1653,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-en-how-to-start-04"
-source = { file = "doc/en/how-to-start.md", fence = 7 }
+source = { file = "doc/en/how-to-start.md", fence = 9 }
 wrap = ""
 layer = "structure"
 honk = "accept"
@@ -2084,17 +2084,6 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-01"
-source = { file = "doc/zh/how-to-start.md", fence = 1 }
-wrap = ""
-layer = "structure"
-honk = "accept"
-dae = "accept"
-honk_diagnostics = []
-compare = "equal"
-unknown_sections = 0
-
-[[case]]
-id = "honk-doc-zh-how-to-start-02"
 source = { file = "doc/zh/how-to-start.md", fence = 2 }
 wrap = ""
 layer = "structure"
@@ -2105,8 +2094,19 @@ compare = "equal"
 unknown_sections = 0
 
 [[case]]
-id = "honk-doc-zh-how-to-start-03"
+id = "honk-doc-zh-how-to-start-02"
 source = { file = "doc/zh/how-to-start.md", fence = 3 }
+wrap = ""
+layer = "structure"
+honk = "accept"
+dae = "accept"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+
+[[case]]
+id = "honk-doc-zh-how-to-start-03"
+source = { file = "doc/zh/how-to-start.md", fence = 4 }
 wrap = "global"
 layer = "structure"
 honk = "accept"
@@ -2117,7 +2117,7 @@ unknown_sections = 0
 
 [[case]]
 id = "honk-doc-zh-how-to-start-04"
-source = { file = "doc/zh/how-to-start.md", fence = 7 }
+source = { file = "doc/zh/how-to-start.md", fence = 9 }
 wrap = ""
 layer = "structure"
 honk = "accept"

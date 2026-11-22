@@ -81,6 +81,7 @@ pub(super) async fn wrap_grpc(
         write_closed: false,
         write_pending: false,
         failure: None,
+        request: crate::runtime::flow_observation::DriverRequest::new(),
     };
     // The protocol request body may be needed before the peer sends response headers.
     poll_fn(|cx| {
@@ -147,6 +148,9 @@ struct GrpcStream {
     // h2 can release a copied DATA buffer before flushing its encoded bytes.
     write_pending: bool,
     failure: Option<Arc<io::Error>>,
+    // Either side of a split stream may drive the connection that writes
+    // queued DATA.
+    request: crate::runtime::flow_observation::DriverRequest,
 }
 
 impl std::fmt::Debug for GrpcStream {
@@ -163,8 +167,15 @@ impl GrpcStream {
     }
 
     fn fail(&mut self, error: io::Error) -> io::Error {
+        self.request.release();
         let error = self.failure.get_or_insert_with(|| Arc::new(error));
         io::Error::new(error.kind(), error.clone())
+    }
+
+    /// Every queued DATA buffer has been written to the carrier and flushed.
+    fn queued_written(&self) -> bool {
+        self.progress.pending.load(Ordering::Acquire) == 0
+            && self.progress.flushed.load(Ordering::Acquire)
     }
 
     fn io_error(&self, error: h2::Error) -> io::Error {
@@ -178,13 +189,18 @@ impl GrpcStream {
 
     fn poll_connection(&mut self, cx: &mut Context<'_>) {
         if let Some(connection) = &mut self.connection
-            && let Poll::Ready(result) = connection.as_mut().poll(cx)
+            && let Poll::Ready(result) = self.request.drive(|| connection.as_mut().poll(cx))
         {
             if let Err(error) = result {
                 self.connection_error
                     .get_or_insert_with(|| Arc::new(h2_error(error)));
             }
             self.connection = None;
+        }
+        // Control frames the driver writes after the DATA are not part of
+        // the request.
+        if self.connection.is_none() || self.queued_written() {
+            self.request.release();
         }
         if self.connection_error.is_none()
             && let Poll::Ready(Err(error)) = self.sender.poll_ready(cx)
@@ -280,9 +296,7 @@ impl GrpcStream {
         if let Some(error) = self.failure_error() {
             return Poll::Ready(Err(error));
         }
-        if self.progress.pending.load(Ordering::Acquire) == 0
-            && self.progress.flushed.load(Ordering::Acquire)
-        {
+        if self.queued_written() {
             self.write_pending = false;
             Poll::Ready(Ok(()))
         } else {
@@ -292,6 +306,7 @@ impl GrpcStream {
 
     fn queue(&mut self, bytes: Bytes, end_stream: bool) -> io::Result<()> {
         self.write_pending = true;
+        self.request.capture();
         self.progress.pending.fetch_add(1, Ordering::AcqRel);
         self.progress.flushed.store(false, Ordering::Release);
         self.send

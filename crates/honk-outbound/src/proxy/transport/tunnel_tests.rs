@@ -11,7 +11,9 @@ use honk_config::types::NodeProtocol;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 
 use super::wrap_tunnel;
-use crate::proxy::{ProxyStream, TcpOutbound, TunnelDialOptions, tunnel_unsupported};
+use crate::proxy::{
+    ProxyStream, TcpOutbound, TunnelDialOptions, TunnelUnsupported, tunnel_unsupported,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -70,36 +72,44 @@ async fn ping_pong(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWri
     assert_eq!(&reply, b"pong");
 }
 
-async fn answer_ping(stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin)) {
-    let mut request = [0; 4];
-    stream.read_exact(&mut request).await.unwrap();
-    assert_eq!(&request, b"ping");
-    stream.write_all(b"pong").await.unwrap();
-    stream.flush().await.unwrap();
-}
-
 async fn tls_server(stream: DuplexStream) -> tokio_boring::SslStream<DuplexStream> {
     tokio_boring::accept(&acceptor(), stream).await.unwrap()
 }
 
 #[tokio::test]
 async fn tls_runs_over_a_tunneled_carrier() {
-    let (client, server) = tokio::io::duplex(64 * 1024);
-    let server = tokio::spawn(async move {
-        let mut tls = tls_server(server).await;
-        answer_ping(&mut tls).await;
-    });
+    // A literal IP gives ECH discovery no name to query, so it is allowed.
+    let ech_with_sni = |sni: &str| TlsOptions {
+        ech_enabled: true,
+        sni: Some(sni.into()),
+        ..skip_verify_tls()
+    };
+    for tls in [
+        skip_verify_tls(),
+        ech_with_sni("127.0.0.1"),
+        ech_with_sni("[::1]"),
+    ] {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut tls = tls_server(server).await;
+            let mut request = [0; 4];
+            tls.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"ping");
+            tls.write_all(b"pong").await.unwrap();
+            tls.flush().await.unwrap();
+        });
 
-    let node = tls_node(skip_verify_tls());
-    let mut stream = tokio::time::timeout(
-        TIMEOUT,
-        wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    ping_pong(&mut stream).await;
-    server.await.unwrap();
+        let node = tls_node(tls);
+        let mut stream = tokio::time::timeout(
+            TIMEOUT,
+            wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        ping_pong(&mut stream).await;
+        server.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -170,32 +180,43 @@ async fn reality_mask_certificate_error_keeps_its_type() {
 }
 
 #[tokio::test]
-async fn xhttp_is_refused_over_a_tunneled_carrier() {
-    let (client, _server) = tokio::io::duplex(1024);
-    let mut node = tls_node(skip_verify_tls());
-    node.transport_mut().unwrap().transport = "xhttp".into();
-    let error = wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT))
+async fn shapes_that_need_more_than_the_carrier_are_refused() {
+    let mut xhttp = tls_node(skip_verify_tls());
+    xhttp.transport_mut().unwrap().transport = "xhttp".into();
+    let ech_discovery = tls_node(TlsOptions {
+        ech_enabled: true,
+        ..skip_verify_tls()
+    });
+    let without_stream_transport = |protocol: NodeProtocol| Node {
+        outbound: OutboundConfig::from_protocol(protocol),
+        ..tls_node(skip_verify_tls())
+    };
+    let cases = [
+        (xhttp, "xhttp"),
+        (ech_discovery, "tls ech discovery"),
+        (without_stream_transport(NodeProtocol::SS), "ss"),
+        (
+            without_stream_transport(NodeProtocol::Hysteria2),
+            "hysteria2",
+        ),
+    ];
+    for (node, reason) in cases {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let error = tokio::time::timeout(
+            TIMEOUT,
+            wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT)),
+        )
         .await
+        .unwrap()
         .unwrap_err();
-    assert!(tunnel_unsupported(&error), "{error:#}");
-}
-
-#[tokio::test]
-async fn a_protocol_without_a_stream_transport_is_refused() {
-    for protocol in [NodeProtocol::SS, NodeProtocol::Hysteria2] {
-        let (client, _server) = tokio::io::duplex(1024);
-        let node = Node {
-            outbound: OutboundConfig::from_protocol(protocol),
-            ..tls_node(skip_verify_tls())
-        };
-        let error = wrap_tunnel(&node, Box::new(client), TunnelDialOptions::new(TIMEOUT))
-            .await
-            .unwrap_err();
         assert!(tunnel_unsupported(&error), "{error:#}");
         assert_eq!(
-            error.to_string(),
-            format!("{} cannot run over a tunneled stream", protocol.as_str())
+            error.downcast_ref::<TunnelUnsupported>(),
+            Some(&TunnelUnsupported(reason))
         );
+        let mut written = Vec::new();
+        server.read_to_end(&mut written).await.unwrap();
+        assert!(written.is_empty(), "{reason} wrote to the carrier");
     }
 }
 
@@ -232,7 +253,105 @@ async fn default_dial_over_refuses_the_tunnel() {
         .unwrap_err();
     assert!(tunnel_unsupported(&error), "{error:#}");
     assert_eq!(
-        error.to_string(),
-        "trojan cannot run over a tunneled stream"
+        error.downcast_ref::<TunnelUnsupported>(),
+        Some(&TunnelUnsupported("trojan"))
     );
+}
+
+#[cfg(all(feature = "rprx", feature = "flow-observation"))]
+mod relayed_request {
+    use futures_util::StreamExt;
+    use honk_config::node::VmessConfig;
+
+    use super::*;
+    use crate::proxy::request_observation_support::{milestones, observed};
+    use crate::proxy::transport::write_request;
+    use crate::proxy::vmess::VmessHandler;
+    use crate::runtime::flow_observation::Milestone;
+
+    fn vmess_over_websocket() -> Node {
+        let mut node = Node {
+            name: "vmess-ws".into(),
+            address: "198.51.100.1:443".into(),
+            host: "must-not-resolve.invalid".into(),
+            port: 443,
+            outbound: OutboundConfig::Vmess(VmessConfig {
+                uuid: Some("b831381d-6324-4d53-ad4f-8cda48b30811".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let transport = node.transport_mut().unwrap();
+        transport.transport = "ws".into();
+        transport.ws_path = Some("/".into());
+        node.id = node.derive_id();
+        node
+    }
+
+    /// The last hop writes its request into a VMess hop whose relay task
+    /// feeds a WebSocket bridge task, which writes to a physical connection
+    /// the peer stops reading. The request counts as sent only once the
+    /// physical write completes, and never if it fails.
+    #[tokio::test]
+    async fn request_sent_waits_for_every_relay_below_it() {
+        for physical_write_completes in [true, false] {
+            // Room for the WebSocket upgrade, but not for the request below.
+            let (client, server) = tokio::io::duplex(4096);
+            let (open, opened) = tokio::sync::oneshot::channel::<bool>();
+            let peer = tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(server).await.unwrap();
+                if opened.await.unwrap() {
+                    while let Some(Ok(_)) = ws.next().await {}
+                }
+            });
+
+            let runtime =
+                crate::runtime::NodeRuntime::try_ephemeral(&vmess_over_websocket()).unwrap();
+            let handler = VmessHandler::new();
+            let hop = handler.dial_over(
+                runtime,
+                Box::new(client),
+                "192.0.2.1:443".parse().unwrap(),
+                None,
+                TunnelDialOptions::new(TIMEOUT),
+            );
+            let mut hop =
+                tokio::time::timeout(TIMEOUT, crate::runtime::flow_observation::without(hop))
+                    .await
+                    .unwrap()
+                    .unwrap();
+
+            let (observer, events) = observed();
+            observer
+                .scope(write_request(&mut hop.stream, &[0x42; 16 * 1024]))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert!(events.lock().is_empty(), "sent before the physical write");
+
+            open.send(physical_write_completes).unwrap();
+            if physical_write_completes {
+                tokio::time::timeout(TIMEOUT, async {
+                    while events.lock().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                let events = events.lock();
+                assert_eq!(events.len(), 1, "{events:?}");
+                assert_eq!(milestones(&events, Milestone::TargetRequestSent), 1);
+            } else {
+                // The failed physical write tears down both relays.
+                let _ = tokio::time::timeout(TIMEOUT, hop.stream.read(&mut [0; 1]))
+                    .await
+                    .unwrap();
+                assert!(
+                    events.lock().is_empty(),
+                    "sent after a failed physical write"
+                );
+            }
+            peer.abort();
+        }
+    }
 }

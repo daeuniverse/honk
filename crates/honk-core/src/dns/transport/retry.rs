@@ -75,6 +75,7 @@ mod tests {
     use honk_outbound::group::{
         GroupManager, ScoreOutcome, ScoreSelectionContext, ScoreTarget, SelectionNetwork,
     };
+    use std::cell::Cell;
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -138,49 +139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_retry_does_not_penalize_score_candidate() {
-        let nodes = ["a", "b"].map(|name| Node {
-            id: uuid::Uuid::new_v4(),
-            name: name.into(),
-            ..Default::default()
-        });
-        let group = Group {
-            name: "score".into(),
-            policy: GroupPolicy::Score,
-            nodes: nodes.iter().map(|node| node.id).collect(),
-            ..Default::default()
-        };
-        let manager = GroupManager::new(&[group], &nodes);
-        let context = ScoreSelectionContext {
-            network: SelectionNetwork::Tcp,
-            probe_domain: ProbeDomain::Tcp,
-            target_family: Some(IpVersion::V4),
-            health_family: IpVersion::V4,
-            target: Some(ScoreTarget::from(
-                "8.8.8.8:443".parse::<std::net::SocketAddr>().unwrap(),
-            )),
-        };
-
-        for node in &nodes {
-            let feedback = manager
-                .feedback_for_node(node.id, context.clone())
-                .expect("Score candidate feedback");
-            for _ in 0..32 {
-                let reporter = feedback.start();
-                reporter.setup_succeeded();
-                reporter.tx(1);
-                reporter.first_response();
-                reporter.rx(1);
-                reporter.finish(ScoreOutcome::Success);
-            }
-        }
-
-        let plan = manager.selection_plan_for_target("score", &context);
-        let incumbent = plan.entries[0].node.id;
-        let feedback = manager
-            .feedback_for_group_node("score", incumbent, context.clone())
-            .unwrap();
-        let calls = AtomicUsize::new(0);
+    async fn dns_retry_settles_score_trial_once() {
         let query = vec![
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, b'e',
             b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00, 0x01, 0x00,
@@ -189,36 +148,99 @@ mod tests {
         let mut response = query.clone();
         response[2..4].copy_from_slice(&0x8180_u16.to_be_bytes());
 
-        for _ in 0..32 {
-            super::exchange_with_retry(
+        for exhausted in [false, true] {
+            let nodes = [
+                Node::from_share_link("socks5://127.0.0.1:1080#seed").unwrap(),
+                Node::from_share_link("socks5://127.0.0.1:1081#challenger").unwrap(),
+            ];
+            let group = Group {
+                name: "score".into(),
+                policy: GroupPolicy::Score,
+                nodes: nodes.iter().map(|node| node.id).collect(),
+                ..Default::default()
+            };
+            let manager = GroupManager::new(&[group], &nodes);
+            let context = ScoreSelectionContext {
+                network: SelectionNetwork::Tcp,
+                probe_domain: ProbeDomain::Tcp,
+                target_family: Some(IpVersion::V4),
+                health_family: IpVersion::V4,
+                target: Some(ScoreTarget::from(
+                    "192.0.2.53:443".parse::<std::net::SocketAddr>().unwrap(),
+                )),
+            };
+
+            // The cold challenger can receive a trial once the ordinary leaf completes a flow.
+            let seed = manager
+                .feedback_for_node(
+                    nodes[0].id,
+                    ScoreSelectionContext::aggregate(
+                        context.network,
+                        context.probe_domain,
+                        context.health_family,
+                    ),
+                )
+                .expect("seed feedback")
+                .start();
+            seed.setup_succeeded();
+            seed.tx(1);
+            seed.rx(1);
+            seed.finish(ScoreOutcome::Success);
+
+            let plan = manager.selection_plan_for_target("score", &context);
+            let guard = plan.entries[0]
+                .feedback
+                .as_ref()
+                .expect("planned Score trial")
+                .begin()
+                .expect("admitted Score trial");
+            let outcomes = || {
+                let c = manager.score_budget_counters("score", context.network);
+                (c.trial_success, c.trial_failure, c.trial_cancelled)
+            };
+            let calls = Cell::new(0);
+            let result = super::exchange_with_retry(
                 "test",
                 &query,
                 |reporter| async {
                     let reporter = reporter.expect("Score reporter");
                     reporter.setup_succeeded();
-                    if calls.fetch_add(1, Ordering::SeqCst).is_multiple_of(2) {
+                    let first_attempt = calls.replace(calls.get() + 1) == 0;
+                    if first_attempt || exhausted {
                         return Err(io::Error::new(
                             io::ErrorKind::ConnectionReset,
                             "stale session",
                         )
                         .into());
                     }
-                    reporter.tx(1);
+                    reporter.tx(query.len() as u64);
                     reporter.first_response();
-                    reporter.rx(1);
+                    reporter.rx(response.len() as u64);
                     Ok(response.clone())
                 },
-                |_| async {},
-                Some(feedback.business().begin().unwrap()),
+                |_| async {
+                    assert_eq!(outcomes(), (0, 0, 0), "the first reset settled the trial");
+                },
+                Some(guard),
             )
-            .await
-            .expect("retry succeeds");
-        }
+            .await;
 
-        let selected = manager.selection_plan_for_target("score", &context).entries[0]
-            .node
-            .id;
-        assert_eq!(selected, incumbent);
+            assert_eq!(calls.get(), 2);
+            if exhausted {
+                let error = result.expect_err("retry also resets");
+                assert_eq!(
+                    error.downcast_ref::<io::Error>().expect("I/O error").kind(),
+                    io::ErrorKind::ConnectionReset,
+                );
+            } else {
+                assert_eq!(result.expect("retry succeeds"), response);
+            }
+            assert_eq!(
+                outcomes(),
+                (u64::from(!exhausted), u64::from(exhausted), 0),
+                "retry exhausted: {exhausted}",
+            );
+        }
     }
 
     #[tokio::test]

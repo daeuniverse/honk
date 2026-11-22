@@ -1137,7 +1137,7 @@ An unadvertised option, such as `cache` without its store, returns `422 unsuppor
 
 `201` with the live node or provider and its `Location` is returned only after activation and subscription reconciliation. HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
 
-Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters of ASCII letters, digits, `_`, `.` or `-`, with an HTTP(S) URL of at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
+Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters without control characters; a name outside `[A-Za-z0-9_.-]` is written quoted, and one the configuration cannot quote returns `422 unsupported_value`. Provider URLs are HTTP(S) and at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
 
 Duplicate names return 409. Structurally valid but unsupported links, identities, provider URL schemes or options return 422. New providers start with zero nodes, stale status and no update time, even if an old cached body exists.
 
@@ -1279,6 +1279,30 @@ If every URL fails, the details describe the last attempted URL:
 
 `asset: geoip, stage: checksum_unavailable, http_status: 403` means the server refused the `.sha256sum`, not the file.
 
+`stage` is one of the following:
+
+| Stage | Meaning |
+| --- | --- |
+| `invalid_source` | The URL cannot be parsed, or it has no host or port. |
+| `download_timeout` | No response headers within 30 seconds, no body progress for 30 seconds, the whole download exceeded 10 minutes, or the checksum request exceeded its 10-second deadline. |
+| `connection_failed` | The connection or tunnel could not be established. |
+| `tls_failed` | TLS setup or certificate verification failed. |
+| `http_failed` | The HTTP exchange failed after the connection was established, such as a malformed response or a body read error. |
+| `http_not_found` | The file URL answered 404. |
+| `http_status_rejected` | The file URL answered a status other than 200, or the checksum URL answered a status other than 200 or 404; `http_status` carries the code. |
+| `content_encoding_rejected` | The server sent a content encoding other than identity. |
+| `asset_too_large` | The body exceeds 256 MiB, or the checksum body exceeds 1 KiB. |
+| `route_blocked` | The download route sent the request to `block`. |
+| `group_unavailable` | The route or its group has no usable outbound or node. |
+| `checksum_unavailable` | The checksum request failed with a status other than 404, or with another error. |
+| `checksum_mismatch` | The published digest differs from the file's SHA-256. |
+| `asset_validation_failed` | The downloaded file cannot satisfy the active configuration's geodata requirements, for example because it lacks a required category. |
+| `candidate_validation_failed` | The candidate configuration with the new asset fails validation. |
+| `staging_failed` | The verified bytes could not be staged for replacement. |
+| `replacement_failed` | The replacement was refused or failed before writing; that asset's bytes on disk are unchanged. |
+| `directory_sync_failed` | The bytes were written but the directory entry could not be confirmed durable. |
+| `written_asset_conflict` | The installed file changed before the final check. |
+
 Configured, stored and built-in geodata URLs, including their checksum requests, have no address or port allowlist.
 
 `verify_checksum` is `true` by default. When set to `false`, manual and automatic updates request no `.sha256sum` and use every downloaded file unverified. `verified` is `false`, and `sha256` is still reported. The setting suits mirrors that answer a missing checksum with a status other than 404 or with a page that is not a checksum.
@@ -1347,10 +1371,6 @@ From the repository root, run `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`. The 
 
 Full release builds include the embedded UI. The lean `-clash-api` and `-native-api` artifacts do not. The binary embeds each edition's own notices, and every full release tarball carries them under `doona/` and `doona-lite/`, respectively.
 
-Lite uses system fonts. The Noto Sans TC and SC fonts are not embedded. Doona's CSS declares those fonts with `font-display: optional`, so the browser falls back to system fonts when the font requests return 404.
-
-To use Noto Sans, extract `doona-<version>.tar.gz` and `doona-fonts-<version>.tar.gz` from the [doona release](https://github.com/Zakkaus/doona/releases) into one directory and point `ui` at it, or install the `doona` and `doona-fonts` packages and set `ui: /usr/share/doona`. Both editions share the corresponding GPL-3.0-only source at the doona tag [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5).
-
 The release workflow attaches `doona-source-0.1.0-rc.5.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
 
 To reproduce the assets, extract the source archive into its own directory, use Node matching `^22.13.0 || ^24.0.0 || >=26.0.0` and `pnpm@11.15.1`. From the extracted source directory:
@@ -1365,6 +1385,8 @@ The epoch is the pinned upstream commit's timestamp. The source archive has no G
 Another gzip implementation can produce different archive hashes from identical tar bytes. Cargo builds embed only the files in `HONK_DOONA_DIR` and its `-lite` sibling and never build or download the frontend. That source's checker is `tools/conformance.mjs`.
 
 Its live walk is read-only and skips controls, diagnostics and missing observed IDs. Check base and management contracts, and exercise browser actions separately: schema passes alone are not full UI, kernel or platform acceptance.
+
+For fonts, UI installation and packaging, see the [doona manual](https://daeuniverse.org/doona/).
 
 ### Native logs and runtime settings
 

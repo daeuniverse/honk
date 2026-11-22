@@ -128,9 +128,13 @@ pub(crate) async fn socks5_relay(
     }
 }
 
-/// Mock legacy-AEAD TCP server (salt + chunk codec): echoes every payload
-/// byte uppercased after skipping the 7-byte IPv4 target header.
-pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S) {
+pub(crate) const TCP_TARGET: &str = "93.184.216.34:80";
+pub(crate) const TCP_TARGET_HEADER: [u8; 7] = [1, 93, 184, 216, 34, 0, 80];
+
+pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
+    mut server: S,
+    mut expected_target: &[u8],
+) {
     let method = "aes-128-gcm";
     let password = "test-password";
     let conf = CipherConf::for_method(method).unwrap();
@@ -151,9 +155,6 @@ pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mu
     let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
     let mut s2c_nonce = vec![0u8; conf.nonce_len];
 
-    // The first plaintext bytes are the target header (own chunk).
-    let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
-    let mut skip = header_len;
     let mut buf = vec![0u8; 262144];
     let mut carry = 0usize;
     let mut pending_len = None;
@@ -173,8 +174,9 @@ pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mu
         )
         .unwrap();
         if out_len > 0 {
-            let start = skip.min(out_len);
-            skip -= start;
+            let start = expected_target.len().min(out_len);
+            assert_eq!(&buf[..start], &expected_target[..start], "target address");
+            expected_target = &expected_target[start..];
             if start < out_len {
                 let upper: Vec<u8> = buf[start..out_len]
                     .iter()

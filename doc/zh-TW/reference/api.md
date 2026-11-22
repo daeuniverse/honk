@@ -1089,7 +1089,7 @@ GET 與成功的 PATCH 回應中有唯讀的 `recording`：`flows`、`logs`、`d
 
 只有啟用與訂閱協調都完成之後，才以 `201` 回傳目前的 Node 或 Provider 與 `Location`。HTTP 斷線不會取消已經入佇列的工作。使用 `--store db` 時，這些操作記錄新修訂，不重寫主檔案。
 
-節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個 ASCII 字母、數字或 `_.-`，HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
+節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個字元，不含控制字元；`[A-Za-z0-9_.-]` 以外的名稱加引號寫入，設定無法加引號的名稱回傳 `422 unsupported_value`。HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
 
 重名回傳 409。結構合法但不支援的連結、身分、provider URL scheme 或選項回傳 422。新 provider 即使有舊的快取內容，也從零節點、`stale`、沒有更新時間的狀態開始。
 
@@ -1211,7 +1211,33 @@ loopback 主體不能修改 `geodata`，會收到 `403 permission_denied`。所�
 
 回傳 404 視為沒有發布校驗檔案，檔案依未校驗處理。其他狀態或失敗，都會讓這個 URL 失敗。某個資產的所有 URL 都失敗時，失敗詳情描述最後嘗試的那個 URL，給出 `stage` 與失敗的資產 `asset`（`geosite` 或 `geoip`）。
 
-如果這個 URL 是因為伺服器回應而失敗，還會給出該回應的 `http_status`，也就是檔案回傳非 200，或校驗檔案回傳非 200 且非 404 的那個狀態。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示伺服器拒絕的是 `.sha256sum`，不是檔案本身。設定檔、已儲存與內建的 geodata URL，包括校驗檔案請求，都不設位址或連接埠白名單。
+如果這個 URL 是因為伺服器回應而失敗，還會給出該回應的 `http_status`，也就是檔案回傳非 200，或校驗檔案回傳非 200 且非 404 的那個狀態。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示伺服器拒絕的是 `.sha256sum`，不是檔案本身。
+
+`stage` 取以下值之一：
+
+| Stage | 說明 |
+| --- | --- |
+| `invalid_source` | URL 無法解析，或缺少 host、連接埠。 |
+| `download_timeout` | 30 秒內沒有回應標頭，回應內容連續 30 秒沒有進展，整個下載超過 10 分鐘，或校驗請求超過 10 秒期限。 |
+| `connection_failed` | 連線或隧道無法建立。 |
+| `tls_failed` | TLS 建立或憑證驗證失敗。 |
+| `http_failed` | 連線建立後 HTTP 交換失敗，例如回應格式錯誤或讀取回應內容出錯。 |
+| `http_not_found` | 檔案 URL 回傳 404。 |
+| `http_status_rejected` | 檔案 URL 回傳 200 以外的狀態，或校驗 URL 回傳 200、404 以外的狀態；`http_status` 給出狀態碼。 |
+| `content_encoding_rejected` | 伺服器回傳 identity 以外的 content encoding。 |
+| `asset_too_large` | 回應內容超過 256 MiB，或校驗回應內容超過 1 KiB。 |
+| `route_blocked` | 下載路由把請求交給 `block`。 |
+| `group_unavailable` | 路由或其代理群組沒有可用的出站或節點。 |
+| `checksum_unavailable` | 校驗請求回傳 404 以外的狀態，或出現其他失敗。 |
+| `checksum_mismatch` | 發布的摘要與檔案的 SHA-256 不一致。 |
+| `asset_validation_failed` | 下載的檔案無法滿足目前設定的 geodata 要求，例如缺少需要的分類。 |
+| `candidate_validation_failed` | 換上新資產的候選設定未通過驗證。 |
+| `staging_failed` | 已驗證的位元組無法暫存為替換檔案。 |
+| `replacement_failed` | 替換在寫入前被拒絕或失敗；該資產在磁碟上的位元組未改變。 |
+| `directory_sync_failed` | 位元組已寫入磁碟，但無法確認目錄項目已持久化。 |
+| `written_asset_conflict` | 最終檢查前，已寫入的檔案發生變化。 |
+
+設定檔、已儲存與內建的 geodata URL，包括校驗檔案請求，都不設位址或連接埠白名單。
 
 `verify_checksum` 預設為 `true`。設成 `false` 後，手動與自動更新都不再請求 `.sha256sum`，下載的檔案一律依未校驗處理：`verified` 為 `false`，`sha256` 照常回報。這個設定用於那些缺少校驗檔案時會回傳非 404 狀態、或回傳非校驗內容頁面的鏡像站。
 
@@ -1281,13 +1307,6 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 
 完整發行產物包含內嵌 UI，精簡的 `-clash-api` 與 `-native-api` 產物不包含。二進位檔中內嵌兩個版本各自的宣告；每個完整發行壓縮檔也會在 `doona/` 與 `doona-lite/` 目錄中附帶這些檔案。lite 版使用系統字型。
 
-內嵌產物不含 Noto Sans TC 與 SC 字型。doona 的 CSS 用 `font-display: optional` 宣告這些字型，因此字型請求回傳 404 時，瀏覽器會使用系統字型。
-
-需要 Noto Sans 時，可以從以下兩種方式中選一種：
-
-- 從 [doona 發行頁](https://github.com/Zakkaus/doona/releases)下載 `doona-<version>.tar.gz` 與 `doona-fonts-<version>.tar.gz`，解壓到同一目錄，並讓 `ui` 指向該目錄。
-- 安裝 `doona` 與 `doona-fonts` 套件，並設定 `ui: /usr/share/doona`。
-
 兩個版本共用的 GPL-3.0-only 原始碼，是 doona 標籤 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。發行流程會把 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式標籤發行與滾動 Debug 發行上。這個包由 `ci/fetch-doona.sh --source` 產生：先確認標籤仍指向固定的提交，再執行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`，使用 GNU gzip。
 
 再散布 `native-ui` 二進位檔時，要保留宣告，並依 GPL-3.0 第 6 條允許的方式提供對應的原始碼。
@@ -1304,6 +1323,8 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 換成別的 gzip 實作，即使壓縮的是同樣的 tar 位元組，也可能得到不同的包摘要。Cargo 建置只內嵌 `HONK_DOONA_DIR` 與它 `-lite` 同級目錄中的檔案，既不建置也不下載前端。這份原始碼的檢查器是 `tools/conformance.mjs`。
 
 即時 walk 是唯讀的，會跳過控制、診斷與缺少已觀測 ID 的資源。基礎契約與管理契約要分別核對，瀏覽器操作另外驗收。模式檢查通過，不等於完整的 UI、核心或部署矩陣都通過了。
+
+字型、UI 安裝與打包見 [doona 手冊](https://daeuniverse.org/doona/)。
 
 ### 連線關閉、模式與資料面生命週期
 

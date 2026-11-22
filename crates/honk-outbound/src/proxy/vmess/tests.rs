@@ -269,6 +269,7 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
             &mut relay_client,
             header.to_vec(),
             fixed_session(),
+            &crate::runtime::flow_observation::RelayedPipe::new(),
         )
         .await
     });
@@ -673,6 +674,10 @@ async fn dial_over_relays_through_the_carrier() {
             &auth_id,
         )
         .unwrap();
+        assert_eq!(
+            &header[37..45],
+            &[CMD_TCP, 0x00, 0x50, addr::ATYP_VMESS.ipv4, 93, 184, 216, 34]
+        );
         let req_iv: [u8; 16] = header[1..17].try_into().unwrap();
         let req_key: [u8; 16] = header[17..33].try_into().unwrap();
         let resp_key: [u8; 16] = Sha256::digest(req_key)[..16].try_into().unwrap();

@@ -58,6 +58,8 @@ CONFIG_NFT_QUEUE=y|m
 CONFIG_NETFILTER_NETLINK_QUEUE=y|m
 ```
 
+`nfnetlink_queue` 和 `nft_queue` 由内核的模块自动加载机制加载。如果系统关闭了自动加载，用 `modprobe` 手动加载这两个模块，并写进 `/etc/modules-load.d/`。
+
 必须启用 cgroup v2 和 `CONFIG_CGROUP_BPF`。真实数据路径会在根 cgroup 上挂接 socket 身份 hook 和 TCP `sock_ops` 程序 `honk_tcp_passive`。两项缺任何一项，启动都会失败。根 cgroup 的 `sock_ops` 槽位如果已经被 flags=0 的旧式程序占着，启动同样会失败，用 `bpftool cgroup attach` 挂上的程序也算。
 
 `honk_tcp_passive` 会收到主机上每次 TCP `sock_ops` 回调，每条连接若干次；遇到不属于 honk 命名空间的 socket 就直接返回。TCP 归属证明不需要内核自带 BTF、ftrace 或内置 IPv6，有外部原始 BTF 文件就够了。
@@ -106,7 +108,7 @@ bpf /sys/fs/bpf bpf defaults 0 0
 | clash-api | `-clash-api` | `clashapi` | 仅 Clash API；不含原生 API 与内嵌 UI，只发布 musl 包 |
 | native-api | `-native-api` | `nativeapi` | 仅原生 API；不含 Clash API 与内嵌 UI，只发布 musl 包 |
 
-musl 包是静态二进制，适合网关部署。
+musl 包是静态二进制，适合网关部署。GNU 版本在 glibc 较旧的主机上启动时会报缺少 `GLIBC_*` 版本；改用同架构的 musl 版本。
 
 | 内存分配器变体 | 发布标签 | 适用场景 |
 | --- | --- | --- |
@@ -142,6 +144,35 @@ sudo systemctl enable --now honk-core
 ```
 
 升级软件包会重启正在运行的 `honk-core.service`，卸载软件包会停止并禁用该服务。honk 与 dae 挂接到同一批网卡上，不能同时运行：该服务声明了 `Conflicts=dae.service`，启动其中一个就会停止另一个。从 dae 切换过来时，还要执行 `sudo systemctl disable dae`，避免 dae 开机自启。
+
+### OpenWrt
+
+[daeuniverse feed](https://daeuniverse.org/openwrt/) 支持 OpenWrt 和 ImmortalWrt 25.12 及更新版本。它提供后端软件包 `honk` 和 LuCI 应用 `luci-app-honk`；自带服务脚本是 `/etc/init.d/honk`，数据目录是 `/etc/honk/data`。按 feed 的说明启用和升级，不要再创建第二个服务。
+
+```shell
+apk add honk@daeuniverse luci-app-honk@daeuniverse
+/etc/init.d/honk enable
+/etc/init.d/honk start
+```
+
+honk 需要 Linux `6.12+`。官方 OpenWrt 镜像还要安装 `vmlinux-btf` 软件包。
+
+没有 feed 时，把 musl 发布版本安装到 `/usr/bin/honk-core`，再把 `global.data_dir` 设为持久目录：
+
+```shell
+install -m 0755 honk-core /usr/bin/honk-core
+/usr/bin/honk-core --version
+```
+
+```dae
+global {
+    data_dir: '/etc/honk/data'
+}
+```
+
+OpenWrt 的 `/var` 是易失的：配置放在 `/etc/honk/`，数据目录放在 `/etc/honk/data`。本页其余部分使用 `/usr/local/bin/honk-core` 和 `/var/lib/honk`，在 OpenWrt 上换成这两个路径。
+
+apk 会把从文件安装的软件包固定在 `/etc/apk/world` 中。软件仓库出现另一个版本后，所有 `apk add` 都会失败并报 `breaks: world[...]`，即使安装的是无关工具。改用 feed 时执行 `apk add honk@daeuniverse`，并在同一条命令里列出其他软件包；要保留本地构建，就在同一条命令里再次写出该文件。
 
 ### 从源码构建
 
@@ -234,6 +265,8 @@ sudo install -m 0600 /path/to/config.dae /etc/honk/config.dae
 sudo /usr/local/bin/honk-core --config /etc/honk/config.dae
 ```
 
+honk 不提供 OpenRC 服务脚本。OpenRC 主机用这条前台命令完成首次登录；Ctrl+C 停止进程，命令不会设置开机启动。启动服务包装前要先停掉前台进程。
+
 日志出现 `honk-core is running` 后，先用真实 LAN 客户端确认能上网，再添加节点、订阅、代理组、路由和 DNS。按下面几步换成最小代理配置：
 
 1. 保留仅直连配置的 `global` 小节。
@@ -265,6 +298,21 @@ bootstrap_resolver: '1.1.1.1:53'
 ```
 
 完整配置方法见[中文配置指南](configuration.md)。仓库中的 `config.dae`、`config.min.dae` 和 `example.dae` 包含示例接口或节点，部署前必须按实际网络修改。
+
+### 独立 LAN 接口的旁路由
+
+这类旁路由的 `lan_interface` 面向客户端，WAN 出口由另一台主路由承担。把 `lan_interface` 设为面向客户端的接口，并在每个客户端上、或在主路由的 DHCP 设置里，把客户端网关和 DNS 服务器指向旁路由的 LAN 地址。
+
+```dae
+global {
+    lan_interface: br-lan
+    wan_interface: auto
+}
+```
+
+`lan_interface: auto` 不会选中 LAN：它选择的是 IPv4 默认路由 metric 最低的接口，通常就是 WAN。要明确写出 LAN 接口。
+
+这种部署有独立的 LAN 接口。下一节的[单臂部署](#旁路由)把 LAN 和 WAN 放在同一个接口或网桥上，honk 不支持那种部署。
 
 ### 旁路由
 
@@ -334,7 +382,7 @@ experimental {
 启动后打开 `http://127.0.0.1:9527/ui/`。
 
 - `enabled` 启用原生 API listener；`listen` 指定监听地址和端口。
-- `password_auth` 启用密码登录。首次访问时创建管理员账号，账号保存在 `data_dir` 下的 `state/honk.db` 里，不在配置文件中。
+- `password_auth` 启用密码登录。按 doona 手册的[首次登录](https://daeuniverse.org/doona/first-sign-in)创建管理员账号；账号保存在 `data_dir` 下的 `state/honk.db` 里，不在配置文件中。
 - `config_write` 允许通过认证的用户写入配置并 reload。含 listener 凭据的源文件仍然只读。
 - `ui: 'embedded'` 提供二进制程序内嵌的标准版 doona，启动时不下载面板。
 
@@ -391,6 +439,16 @@ sudo curl -fL --retry 3 -o /var/lib/honk/geoip.dat \
 8. `/usr/share/dae/<name>`
 9. `/etc/dae/<name>`
 
+OpenWrt 上，`v2ray-geosite` 和 `v2ray-geoip` 软件包把文件装在 `/usr/share/v2ray`，honk 不搜索这个目录。把文件链接到 `/usr/share/dae`：
+
+```shell
+mkdir -p /usr/share/dae
+ln -s ../v2ray/geosite.dat /usr/share/dae/geosite.dat
+ln -s ../v2ray/geoip.dat /usr/share/dae/geoip.dat
+```
+
+配置的 `data_dir` 里已有的文件优先于这些链接。
+
 ## 使用 systemd 运行
 
 创建 `/etc/systemd/system/honk-core.service`：
@@ -429,6 +487,54 @@ sudo journalctl -xefu honk-core
 ```
 
 严格的 capability bounding、只读 `/proc/sys` 和 `NoNewPrivileges=yes` 都要先验证再加。启动需要 BPF、网络管理、网络命名空间、挂载、sysctl 和透明 socket 权限。
+
+## 使用 OpenWrt procd 运行
+
+手动安装的路由器要创建 `/etc/init.d/honk-core`。[daeuniverse feed](#openwrt) 已经提供 `/etc/init.d/honk`，不要再创建第二个服务。
+
+```shell
+cat > /etc/init.d/honk-core <<'EOF'
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+    procd_open_instance
+    procd_set_param command /usr/bin/honk-core --config /etc/honk/config.dae --disable-timestamp
+    procd_set_param limits nofile="1048576 1048576"
+    procd_set_param respawn
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_close_instance
+}
+
+reload_service() {
+    /usr/bin/honk-core reload
+}
+EOF
+chmod 0755 /etc/init.d/honk-core
+```
+
+在配置中把 `global.data_dir` 设为 `/etc/honk/data`。procd 把服务的 stdout 和 stderr 交给 `logread`。
+
+```shell
+/etc/init.d/honk-core enable
+/etc/init.d/honk-core start
+/etc/init.d/honk-core status
+```
+
+启动后 `status` 报告 `running`。停止、重启和禁用使用同名子命令；`disable` 只取消开机启动，不停止正在运行的进程。
+
+常规 sysupgrade 会保留备份清单中的路径。确认 `/etc/sysupgrade.conf` 列出的路径包含配置、数据文件和 init 脚本：
+
+```shell
+printf '%s\n' '/etc/honk/' '/etc/init.d/honk-core' >> /etc/sysupgrade.conf
+sysupgrade -l
+```
+
+备份不会恢复 `/usr/bin/honk-core`、内核模块或 geodata 软件包；升级后要重新安装。
 
 ## 使用 Docker 运行
 
@@ -482,6 +588,24 @@ sudo docker compose up -d
 
 在仓库检出目录里执行 `sudo docker compose build`，可以直接用已发布的版本构建同一个镜像，不必拉取。
 
+## 读取服务日志
+
+systemd 把服务输出写进 journal。procd 服务写入系统日志，由 `logread` 读取。
+
+```shell
+sudo journalctl -u honk-core -e
+sudo journalctl -u honk-core -f
+```
+
+```shell
+logread -e honk-core
+logread -f -e honk-core
+```
+
+journal 里可能还有服务的历次运行记录。判断本次启动，从最后一条 `honk-core <version> starting` 开始看，它也给出运行的版本。
+
+成功启动时，启用原生 API 的构建先记录 `native API listener ready`，再记录 `honk-core is running.`；在终端里运行时，最后一行是 `honk-core is running. Press Ctrl+C to stop.`。`/api` 或 `/ui/` 可访问，不能证明 eBPF 后端能转发流量，见[检查运行状态](#检查运行状态)。
+
 ## 检查运行状态
 
 进程启动不等于数据路径可用。日志应显示真实 eBPF 后端、接口 hook、listener 和控制面均已就绪。
@@ -522,7 +646,29 @@ sudo systemctl reload honk-core
 sudo /usr/local/bin/honk-core reload
 ```
 
-是否应用成功，看运行日志里的 `applied` 或 `rejected`。接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS 绑定、Clash API listener/secret、缓存等进程级设置发生变化时，需要重启。运行期间出现或消失的接口不用 reload，接口观察器会自动绑定和释放它们。
+运行中的进程会记录结果：
+
+| 日志 | 含义 |
+| --- | --- |
+| `SIGHUP reload applied` | 候选配置通过校验并已生效。 |
+| `SIGHUP reload rejected` | 候选配置被拒绝；`stage` 字段和随附错误说明原因。因需重启而拒绝时，说明改动了进程级设置；要在主机上修改该设置并重启。 |
+| `SIGHUP reload committed with degraded datapath` | 配置已生效，但数据路径仍有降级；阅读随附错误后再判断服务是否健康。 |
+
+控制面还会为同一请求记录 `SIGHUP reload request <id> started`，以及 `SIGHUP reload request <id> applied` 或 `SIGHUP reload request <id> rejected`。
+
+`honk-core reload` 向持有 `/run/honk-core.lock` 的进程发送信号。没有进程持有时，命令报告 `no running honk-core instance` 并以非零状态退出；前台 `--mock-ebpf` 进程不持有该锁。命令只负责发送信号；候选配置是否通过校验，应查看进程日志。
+
+| 操作 | systemd | OpenWrt procd |
+| --- | --- | --- |
+| 启动 | `sudo systemctl start honk-core` | `/etc/init.d/honk-core start` |
+| reload 配置 | `sudo systemctl reload honk-core` | `/etc/init.d/honk-core reload` |
+| 重启 | `sudo systemctl restart honk-core` | `/etc/init.d/honk-core restart` |
+| 停止 | `sudo systemctl stop honk-core` | `/etc/init.d/honk-core stop` |
+| 取消开机启动 | `sudo systemctl disable honk-core` | `/etc/init.d/honk-core disable` |
+
+取消开机启动不会停止正在运行的服务。要让 honk 在重启后保持停止，要同时执行停止和取消开机启动。
+
+接口、TPROXY、`data_dir`、NFQUEUE 开关、DNS 绑定、Clash API listener/secret、缓存等进程级设置发生变化时，需要重启。运行期间出现或消失的接口不用 reload，接口观察器会自动绑定和释放它们。
 
 正常停止：
 
@@ -577,6 +723,8 @@ cargo run --release -p honk-core -- \
 | pin map 报 `Invalid argument` | `/sys/fs/bpf` 不是 bpffs；按上文重新挂载。 |
 | mock 启动成功但流量不经过 honk | 这是预期行为；改用含 `ebpf` feature 的构建，并以 root 启动。 |
 | NFQUEUE disabled 或 queue busy | 检查 nftables/NFQUEUE 内核支持、队列 320 的占用者和残留的 honk 实例；确实不需要时设置 `nfqueue_enable: false`。 |
+| 停止 OpenWrt 防火墙后流量不通 | 停止防火墙可能删掉 honk 的 `inet honk_nfqueue` table 和 `udp_decision` chain。重新启动防火墙，然后重启 honk 服务。honk 运行期间，防火墙管理器必须保留这两个对象。 |
+| NFQUEUE 启动警告为 `nfnetlink_queue is unavailable; the module may need loading` | 内核没能加载该模块。执行 `modprobe nfnetlink_queue nft_queue`，并把这两个模块写进 `/etc/modules-load.d/`；模块不存在时启用 `CONFIG_NETFILTER_NETLINK_QUEUE`。 |
 | LAN 流量未被代理 | `lan_interface` 为空或接口名错误；honk 不会自动改用 `lo`。接口名无误时看下一项。 |
 | `GET /runtime` 出现 `interface_binding` 降级 | 某个已配置的接口还没绑定，日志里有接口名。`pending`：接口不存在，或 `auto` 条目没有 IPv4 默认路由。`unsupported_type`：链路类型被拒绝，例如 `lo`、VRF 设备或 `dae0`，请改成受支持的接口或其成员。`attach_failed`：TCX link 无法创建、更新或校验，原因见日志中的 warning。接口状态字段见[原生 API 参考](./reference/api.md#原生-api)。 |
 | 旁路由的客户端绕过 honk，或转发的流量被丢弃 | 把 `all` 和 LAN 接口的 `send_redirects` 设为 `0`，并把 `net.ipv4.conf.all.rp_filter` 设为 `0`，见[旁路由](#旁路由)；直连流量仍不通时，见[直连流量不通](#直连流量不通)。 |
