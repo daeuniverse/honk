@@ -1139,6 +1139,8 @@ XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包�
 
 摘要和完整视图均包含 `cross_worker_handoffs`：本次捕获中，另一 worker 的队列成功接收的包封装数，以十进制字符串表示，到上限后不再增长。入队失败或本地处理不计数；成功入队不等于包已送达。仅可比较同一次捕获的读数。
 
+`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`shadow_active`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 是采样到的内核累计影子命中数（十进制字符串，不可用时为 null），不计原生转发。`dns_projection_counters` 描述采样的 bank；完整视图在可用时还包含 `dns_realm_revocations`，每项为数字 realm ID 与撤销次数。不导出域名或 IP。
+
 每队列保留真实 `namespace_cookie`、`attachment_generation`、`ifindex`、`queue_id`、实际 `mode`（`copy` 或 `zerocopy`）、`ring_capacity` 以及 RX/control/bulk frame 容量。一个物理队列可服务多个逻辑 realm。`sequence`、`attempted_at_unix_ms` 和 `last_success_at_unix_ms` 分别标识采样次数、最近尝试与最近成功的 socket 读取；时间为十进制 Unix 毫秒字符串，所有完整宽度整数均为十进制字符串，序列和错误计数饱和。`socket` 保存六项原始累计 XDP_STATISTICS：`rx_dropped`、`rx_invalid_descs`、`tx_invalid_descs`、`rx_ring_full`、`rx_fill_ring_empty_descs`、`tx_ring_empty_descs`。`rings` 保存 `rx`、`tx`、`fill`、`cq` 的原始 u32 `producer`/`consumer` 索引；索引会回绕，单位为 descriptor，不是包数。
 
 采样不受 DEBUG 过滤影响，只在既有 owner turn 中至多每秒执行一次，正常 socket 关闭前另取最终样本。不增加空闲 timer，安静队列可能保留较旧样本。Socket、ring、各队列均顺序读取，不是跨计数器/ring/队列的原子快照。`socket_available: false` 且 `socket: null` 表示尚未观测或不可用，不代表零丢包；尝试失败后 `socket_error` 为 `statistics_unavailable`，`socket_errno` 有值时保留数字 errno，即使错误无 errno 也增加 `socket_read_errors`。失败可保留旧 `last_success_at_unix_ms`，但不会将旧成功计数冒充本次数据。统计读取失败不终止 capture。`rx_fill_ring_empty_descs` 是内核空 FILL 事件，不是丢包率；当前 FILL 有内容不能否定历史饥饿。不会相加为总丢包，也不推导速率或增量。
@@ -1321,7 +1323,7 @@ URLTest、LoadBalance、Fallback 与 Score 拒绝手动选择。
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
-  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, truncated, queues },
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

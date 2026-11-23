@@ -1252,6 +1252,8 @@ XDP additionally publishes `x-honk.xdp` from the capture owner's latest observat
 
 The summary and full view also include `cross_worker_handoffs`: a saturating decimal-string count of packet envelopes accepted by the other worker's queue in this capture. Failed enqueues and locally processed packets do not count. A handoff is not proof that the packet was delivered. Compare readings from the same capture only.
 
+`dns_projection_state` distinguishes `disabled_by_config`, `inactive_no_domain_rules`, `staged_closed`, `shadow_active`, `degraded_fallback` (with `dns_projection_reason`), and `closed`. `would_pass_dns` is the sampled cumulative kernel shadow counter (a decimal string, or null when unavailable); it does not count native forwarding. `dns_projection_counters` describes the sampled bank. When available, the full view also includes `dns_realm_revocations`, pairs of numeric realm ID and revocation count. No domain or IP is exposed.
+
 Each queue identifies its actual `namespace_cookie`, `attachment_generation`, `ifindex` and `queue_id`, actual `mode` (`copy` or `zerocopy`), `ring_capacity` and RX/control/bulk frame capacities. A physical queue can serve several logical realms. `sequence`, `attempted_at_unix_ms` and `last_success_at_unix_ms` identify sampling attempts and the latest successful socket read; timestamps are decimal Unix milliseconds, and all full-width integers are decimal strings. Sequence and read-error counts saturate. Queue `socket` contains the six raw cumulative XDP_STATISTICS counters: `rx_dropped`, `rx_invalid_descs`, `tx_invalid_descs`, `rx_ring_full`, `rx_fill_ring_empty_descs` and `tx_ring_empty_descs`. `rings` contains raw `producer`/`consumer` u32 indices for `rx`, `tx`, `fill` and `cq`; these wrap and are descriptor indices, not packet counts.
 
 Sampling runs outside DEBUG filtering, at most once per second on existing owner turns, plus a final sample before normal socket close. There is no new idle timer: a quiet queue may retain an old observation. Socket and ring reads are sequential, not an atomic snapshot across counters, rings or queues. `socket_available: false` with null `socket` means unobserved or unavailable, never zero loss; after an attempted failure `socket_error` is `statistics_unavailable`, optional `socket_errno` preserves the numeric errno, and `socket_read_errors` increases even without an errno. `last_success_at_unix_ms` may remain older after failure, but stale successful counters are not returned as current data. Errors remain nonfatal. `rx_fill_ring_empty_descs` records kernel empty-FILL events, not a packet-loss rate; a populated current FILL ring does not disprove earlier starvation. Counters are neither summed into total loss nor converted to rates/deltas.
@@ -1453,7 +1455,7 @@ Download or extraction failures are logged and do not stop the engine.
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
-  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, truncated, queues },
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

@@ -129,6 +129,11 @@ impl DesiredState {
         self.compact_owner_heaps_if_needed();
         let now = Instant::now();
         let mut deadline = self.expiry_deadlines.peek().map(|entry| entry.0.at);
+        #[cfg(target_os = "linux")]
+        if self.gateway_bank().is_some_and(|bank| bank.needs_reclaim()) {
+            let next = now + Duration::from_millis(250);
+            deadline = Some(deadline.map_or(next, |current| current.min(next)));
+        }
         for ip in &self.dirty_ips {
             if let Some(next) = self.next_attempt_at(*ip, now) {
                 if next == now {

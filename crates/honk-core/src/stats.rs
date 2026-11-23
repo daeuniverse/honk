@@ -536,11 +536,44 @@ pub(crate) mod xdp {
         }
     }
 
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub(crate) enum DnsProjectionState {
+        #[default]
+        Disabled,
+        NoDomainRules,
+        Staged,
+        Active,
+        Closed,
+        Fallback(&'static str),
+    }
+
+    impl DnsProjectionState {
+        fn label(self) -> &'static str {
+            match self {
+                Self::Disabled => "disabled_by_config",
+                Self::NoDomainRules => "inactive_no_domain_rules",
+                Self::Staged => "staged_closed",
+                Self::Active => "shadow_active",
+                Self::Closed => "closed",
+                Self::Fallback(_) => "degraded_fallback",
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Default)]
+    struct DnsObservation {
+        state: DnsProjectionState,
+        counters: Option<crate::xdp::gateway::dns::GatewayDnsCounters>,
+        would_pass: Option<u64>,
+    }
+
     #[derive(Debug)]
     struct State {
         lifecycle: Lifecycle,
         changed_at: SystemTime,
         queues: Box<[QueueObservation]>,
+        dns: DnsObservation,
+        dns_bank: std::sync::Weak<crate::xdp::gateway::dns::GatewayDnsBank>,
     }
 
     #[derive(Debug)]
@@ -579,11 +612,46 @@ pub(crate) mod xdp {
                     lifecycle: Lifecycle::Starting,
                     changed_at: SystemTime::now(),
                     queues: storage.into_boxed_slice(),
+                    dns: DnsObservation::default(),
+                    dns_bank: std::sync::Weak::new(),
                 }),
                 count,
                 cross_worker_handoffs: AtomicU64::new(0),
                 _memory: memory,
             }))
+        }
+
+        pub(crate) fn dns_state(&self, status: DnsProjectionState) {
+            let mut state = self.state.lock();
+            if state.dns.state != status && state.dns.state != DnsProjectionState::Closed {
+                state.dns = DnsObservation {
+                    state: status,
+                    ..Default::default()
+                };
+                state.dns_bank = std::sync::Weak::new();
+                if let DnsProjectionState::Fallback(reason) = status {
+                    tracing::warn!(
+                        reason,
+                        "XDP DNS shadow unavailable; using static D1 and Endpoint"
+                    );
+                }
+            }
+        }
+
+        pub(crate) fn sample_dns(
+            &self,
+            bank: &Arc<crate::xdp::gateway::dns::GatewayDnsBank>,
+            would_pass: Option<u64>,
+        ) {
+            let counters = bank.stats();
+            let mut state = self.state.lock();
+            if state.dns.state == DnsProjectionState::Active {
+                state.dns.counters = Some(counters);
+                if !std::ptr::eq(state.dns_bank.as_ptr(), Arc::as_ptr(bank)) {
+                    state.dns_bank = Arc::downgrade(bank);
+                }
+                state.dns.would_pass = would_pass;
+            }
         }
 
         pub(crate) fn sample(
@@ -614,8 +682,17 @@ pub(crate) mod xdp {
         }
 
         pub(crate) fn json(&self, full: bool) -> Value {
+            let (lifecycle, changed_at, dns, bank) = {
+                let state = self.state.lock();
+                (
+                    state.lifecycle,
+                    state.changed_at,
+                    state.dns,
+                    full.then(|| state.dns_bank.upgrade()).flatten(),
+                )
+            };
             let mut rows = Vec::new();
-            let mut remaining = 64 * 1024 - 1024;
+            let mut remaining = 64 * 1024 - if bank.is_some() { 4096 } else { 1024 };
             if full {
                 let mut encoded = Vec::new();
                 for index in 0..self.count {
@@ -632,16 +709,21 @@ pub(crate) mod xdp {
                     rows.push(row);
                 }
             }
-            let (lifecycle, changed_at) = {
-                let state = self.state.lock();
-                (state.lifecycle, state.changed_at)
-            };
             let mut value = json!({
                 "state": lifecycle.as_str(), "queue_count": self.count,
                 "cross_worker_handoffs": self.cross_worker_handoffs.load(Ordering::Relaxed).to_string(),
+                "dns_projection_state": dns.state.label(),
+                "dns_projection_reason": if let DnsProjectionState::Fallback(reason) = dns.state { Some(reason) } else { None },
+                "dns_projection_counters": dns.counters,
+                "would_pass_dns": dns.would_pass.map(|v| v.to_string()),
                 "state_changed_at_unix_ms": changed_at.duration_since(SystemTime::UNIX_EPOCH).ok().map(|at| at.as_millis().to_string()),
             });
             if full {
+                if let Some(bank) = bank {
+                    let mut realms = [(0u32, 0u64); 64];
+                    let count = bank.realm_revocations(&mut realms);
+                    value["dns_realm_revocations"] = json!(&realms[..count]);
+                }
                 value["truncated"] = json!(rows.len() != self.count);
                 value["queues"] = json!(rows);
             }

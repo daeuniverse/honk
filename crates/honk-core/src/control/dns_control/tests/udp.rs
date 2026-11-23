@@ -176,6 +176,7 @@ async fn truncated_upstream_response_is_not_cached_or_projected() {
             family: honk_outbound::alive::IpVersion::V4,
             ips: &[learned_ip],
             expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            source: Default::default(),
         },
     );
     let projected = controller.project_routes(&snapshot);
@@ -260,6 +261,7 @@ async fn projection_follows_query_family_until_nxdomain() {
             family: honk_outbound::alive::IpVersion::V6,
             ips: &[v6],
             expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+            source: Default::default(),
         },
     );
     // The A answer, HTTPS NODATA and AAAA NODATA a dual-stack browser sees,

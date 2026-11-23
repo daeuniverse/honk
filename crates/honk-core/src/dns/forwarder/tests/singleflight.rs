@@ -54,6 +54,70 @@ async fn identical_concurrent_queries_share_one_exchange_and_render_each_txid() 
     assert_eq!(flights.active_len(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn unwritten_positive_keeps_configured_route_and_published_waiter_deadline() {
+    use crate::dns::cache::CacheInvalidation;
+    use crate::dns::outcome::Provenance;
+
+    for cache_enabled in [false, true] {
+        let upstream = Arc::new(GatedUpstream {
+            response: make_a_response([192, 0, 2, 1], 30),
+            call_count: AtomicUsize::new(0),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router())
+            .with_cache_ttl(600)
+            .with_cache_enabled(cache_enabled);
+        let query = make_a_query();
+        let mut leader = Box::pin(forwarder.resolve_outcome(&query));
+        let mut waiter = Box::pin(forwarder.resolve_outcome(&query));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(leader.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert_eq!(upstream.call_count.load(Ordering::SeqCst), 1);
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert_eq!(forwarder.singleflight().counters().waiters, 1);
+
+        let cache = forwarder.cache_service().await;
+        if cache_enabled {
+            cache
+                .invalidate(CacheInvalidation::All)
+                .await
+                .expect("fence in-flight cache write");
+        }
+        let published = tokio::time::Instant::now();
+        upstream.release.notify_one();
+        let leader = leader.await.expect("leader answer");
+        let leader_observed = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let waiter = waiter.await.expect("waiter answer");
+        let wire_ttl = if cache_enabled { 600 } else { 30 };
+        for (outcome, route_ttl, at) in [
+            (leader, 600, leader_observed),
+            (waiter, wire_ttl, tokio::time::Instant::now()),
+        ] {
+            assert_eq!(outcome.provenance(), Provenance::Upstream);
+            let lifetime = outcome.routing_lifetime(at);
+            assert_eq!(
+                lifetime.expires_at,
+                published + Duration::from_secs(route_ttl)
+            );
+            assert_eq!(lifetime.source.cache_revision(), None);
+            assert_eq!(u64::from(extract_min_ttl(outcome.rendered())), wire_ttl);
+        }
+        assert!(cache.is_empty());
+    }
+}
+
 #[tokio::test]
 async fn newly_constructed_forwarder_does_not_join_predecessor_flight() {
     for (cache_enabled, fixed_ttl) in [(false, None), (true, Some(0))] {

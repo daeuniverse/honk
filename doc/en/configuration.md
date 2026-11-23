@@ -49,7 +49,7 @@ Every relative include, including one in a nested included file, resolves agains
 
 The entry file's own sections merge first regardless of where its `include` block appears, followed by each included file and its descendants. Later scalar keys override earlier values. Collection entries such as nodes, subscriptions, groups, DNS upstreams, fixed TTLs, and routing rules append in merge order.
 
-The strict `datapath` section is an exception to scalar override merging: its `backend`, `direct`, `xsk_mode`, `interface`, `firewall`, and `nat` declarations may each occur at most once across all merged sections, including included files. Duplicate declarations reject the configuration rather than overriding or appending.
+The strict `datapath` section is an exception to scalar override merging. Each setting or nested block, including `dns_projection`, may occur at most once across all merged sections and included files.
 
 For an XDP Endpoint gateway, configure the logical LAN interface (a numbered Ethernet interface or bond is allowed) and optionally select Auto per member:
 
@@ -68,6 +68,8 @@ routing {
 ```
 
 The DNS rule is only needed when that address and local listener should receive port 53; put it before domain rules. See [gateway admission and limits](./design/datapath.md#full-xdp-startup).
+
+Physical LAN XDP Endpoint enables DNS shadow evaluation by default. It counts `WouldPassDns` decisions while retaining the existing packet actions. To disable it, set `dns_projection: false` in `datapath` and restart. This setting is available only for configurations with physical LAN XDP Endpoint capture. See the [DNS projection reference](./reference/global.md#xdp-endpoint-dns-projection).
 
 ## Runtime data directory
 

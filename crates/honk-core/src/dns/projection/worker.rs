@@ -69,12 +69,28 @@ async fn flush_after_snapshot(
     after_snapshot: impl FnOnce(),
 ) {
     let now = Instant::now();
+    #[cfg(target_os = "linux")]
+    let gateway;
     let batch = {
         let mut state = projection.state.lock();
         state.expire(now);
+        #[cfg(target_os = "linux")]
+        {
+            gateway = state.gateway_bank().cloned();
+        }
         state.batch(now)
     };
     after_snapshot();
+    #[cfg(target_os = "linux")]
+    if let Some(bank) = gateway {
+        let pending = bank.pending.lock().take();
+        if let Some(fill) = pending {
+            projection.write_gateway_dns(&bank, fill);
+        }
+        if bank.reclaim_due(now) {
+            bank.reclaim();
+        }
+    }
     if batch.sets.is_empty() && batch.removes.is_empty() {
         return;
     }

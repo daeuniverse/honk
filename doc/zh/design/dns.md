@@ -304,6 +304,10 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
+符合条件的物理 XDP LAN 能以影子模式计算依赖 DNS 的有序直连决策。只有已准入的 IP、1–32 个未过期 owner 且贡献相同完整位图（可为已知全零）才可导出，取最早到期时间。DNS 参与的结果永不授权端口 53；WAN 和 HOST 不能导出。内核命中时只计 `WouldPassDns`，包仍走原有 Endpoint 路径，不新增 DNS 应答缓存或原生转发路径。
+
+每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不延长也不缩短原许可。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint；计数不是原生放行包数。
+
 Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
 
 新建数值目标的 packet TCP/UDP 路由通过 canonical Router 消费同一 scope 尚未过期的 bitmap，不虚构 hostname，并保留规则顺序、mode 与终态 `must`/`block` 语义。已接纳的 transport 保留原有路由所有权；配置允许的真实嗅探名称重路由仍使用既有语义。软件查询要求已提交的 routing generation 与 policy fingerprint 同时匹配，不匹配时失败，而不是当作缺失域名事实回退。
@@ -316,7 +320,7 @@ Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提�
 
 由 DNS 缓存返回的正应答使用该缓存项的精确剩余寿命。地址集合未变时重新提交只刷新 TTL 与 LRU 新近度，不重建集合。HOST 缓存命中还可跳过投影的 publication fence 与 state lock：前提是距上次加锁提交不到一秒，且 policy generation、owner 结构和规范化地址集合都相同，报告的到期时间不晚于已应用值、最多早一秒。被合并的 HOST 命中会跳过最多一秒的寿命缩短，且不会安排后续更新，因此路由到期时间最多可比缓存报告的到期时间晚一秒；LRU 新近度也可能滞后同样的窗口。Packet scope 的缓存命中不合并缩短的 expiry，而是精确应用，并按需撤销此前准备中的权威。新增、删除、重建键或因容量被省略的 owner、更新的 generation，以及新鲜、过期或上游应答始终走加锁路径。
 
-每个正应答 observation 在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命，不会重新开始计时；reload 被拒绝后也是如此。如果实际应用时已经到期，只清除所查询地址族的 owner，不插入可被后续 reload 预填的过期 owner。
+每个正应答在首次提交前固定绝对到期时间。等待发布与重试都会消耗原有寿命；reload 被拒绝也不会重新计时。权威应答到期时只清除所查询的地址族。未命中缓存的 singleflight 等待者仍向客户端交付已发布的应答，但模板到期后既不再发布路由事实，也不撤销后来建立的 owner。
 
 被省略的 key 按普通的缺失域名事实处理，而不是伪造零 bitmap。现有 dial-mode 和终态 `must`/`block` 语义仍然有效：符合条件的未确定 direct 结果进入 control-plane routing，但该容量策略不会把所有未知事实都强制送入慢路径，也不改变 `ip` 模式。Sniff 写入共享物理 map，仍可能耗尽其预留空间；backend 写入失败继续可观测，并在适用路径中重试。
 

@@ -58,6 +58,48 @@ impl EffectiveExpiry {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProjectionSource {
+    #[default]
+    Fresh,
+    CacheEntry(u64),
+    SharedFlight,
+}
+
+impl ProjectionSource {
+    pub(crate) const fn cache_revision(self) -> Option<u64> {
+        match self {
+            Self::CacheEntry(revision) => Some(revision),
+            Self::Fresh | Self::SharedFlight => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProjectionLifetime {
+    pub(crate) expires_at: tokio::time::Instant,
+    pub(crate) source: ProjectionSource,
+}
+
+impl ProjectionLifetime {
+    pub(super) fn from_wire(wire: &[u8], observed_at: tokio::time::Instant) -> Self {
+        let ttl = super::forwarder::extract_min_ttl(wire);
+        Self {
+            expires_at: observed_at + Duration::from_secs(u64::from(ttl)),
+            source: ProjectionSource::Fresh,
+        }
+    }
+}
+
+impl From<super::cache::FreshCacheEntry> for ProjectionLifetime {
+    fn from(entry: super::cache::FreshCacheEntry) -> Self {
+        Self {
+            expires_at: entry.expires_at,
+            source: ProjectionSource::CacheEntry(entry.revision),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "native-api", derive(serde::Serialize))]
 pub(crate) enum RouteSource {
@@ -87,6 +129,7 @@ pub struct DnsOutcome {
     qtype: u16,
     answer_ips: Vec<IpAddr>,
     expiry: EffectiveExpiry,
+    projection_lifetime: Option<ProjectionLifetime>,
     logical_upstream: Option<String>,
     final_upstream: Option<String>,
     requery_history: Vec<String>,
@@ -159,6 +202,7 @@ impl DnsOutcome {
             response_class: parts.response_class,
             provenance: parts.provenance,
             expiry: parts.expiry,
+            projection_lifetime: None,
             logical_upstream: parts.logical_upstream,
             domain: parts.domain,
             qtype: parts.qtype,
@@ -217,6 +261,34 @@ impl DnsOutcome {
 
     pub const fn expiry(&self) -> EffectiveExpiry {
         self.expiry
+    }
+
+    pub(crate) const fn projection_lifetime(&self) -> Option<ProjectionLifetime> {
+        self.projection_lifetime
+    }
+
+    pub(crate) fn routing_lifetime(&self, observed_at: tokio::time::Instant) -> ProjectionLifetime {
+        self.projection_lifetime.unwrap_or_else(|| {
+            if self.expiry.is_cacheable() {
+                ProjectionLifetime {
+                    expires_at: observed_at + self.expiry.ttl(),
+                    source: ProjectionSource::Fresh,
+                }
+            } else {
+                ProjectionLifetime::from_wire(self.reusable(), observed_at)
+            }
+        })
+    }
+
+    pub(crate) fn with_projection_lifetime(mut self, lifetime: Option<ProjectionLifetime>) -> Self {
+        if lifetime.is_some()
+            && self.status == OutcomeStatus::Accepted
+            && self.response_class == ResponseClass::Positive
+            && !super::response::is_truncated(&self.reusable)
+        {
+            self.projection_lifetime = lifetime;
+        }
+        self
     }
 
     pub fn domain(&self) -> &str {

@@ -4,9 +4,24 @@ use crate::datapath::{
     InterfaceRole, PollCalibration, PollMode, TunConfig, XdpInterface, XskMode,
     canonical_tun_capture, default_tun_mtu, parse_tun_address4, parse_tun_address6,
 };
+use crate::diagnostic::{SettingPath, Severity};
+use crate::error::{DetailedConfigError, ErrorCategory};
 
 fn invalid(message: &str) -> ParseFailure {
     crate::ConfigError::Parse(format!("datapath: {message}")).into()
+}
+
+fn invalid_dns_projection(text: read::Text<'_, '_>, message: &'static str) -> ParseFailure {
+    let mut diagnostic =
+        text.source
+            .diagnostic(text.span, Severity::Error, "config-parse", message);
+    diagnostic.setting = SettingPath::new("datapath").field("dns_projection");
+    diagnostic.terminal = true;
+    DetailedConfigError {
+        category: ErrorCategory::Parse,
+        diagnostic: Box::new(diagnostic),
+    }
+    .into()
 }
 
 pub(super) fn parse_section(
@@ -14,7 +29,8 @@ pub(super) fn parse_section(
     diagnostics: &mut ParserDiagnostics<'_>,
 ) -> Result<DatapathConfig, ParseFailure> {
     let mut config = DatapathConfig::default();
-    let mut seen = [false; 11];
+    let mut seen = [false; 12];
+    let mut dns_projection_source = None;
     for section in sections {
         for child in section.body().ok_or_else(|| invalid("expected block"))? {
             if let Some(header) = read::block_header(&child) {
@@ -92,9 +108,16 @@ pub(super) fn parse_section(
                     "xsk_mode" => 5,
                     "poll_mode" => 6,
                     "workers" => 10,
+                    "dns_projection" => 11,
                     _ => return Err(invalid("unknown setting")),
                 };
                 if std::mem::replace(&mut seen[index], true) {
+                    if index == 11 {
+                        return Err(invalid_dns_projection(
+                            key,
+                            "duplicate dns_projection setting",
+                        ));
+                    }
                     return Err(invalid("duplicate setting"));
                 }
                 match index {
@@ -137,6 +160,16 @@ pub(super) fn parse_section(
                             _ => return Err(invalid("workers must be 1 or 2")),
                         });
                     }
+                    11 => {
+                        config.dns_projection =
+                            Some(value.unquote().raw().parse().map_err(|_| {
+                                invalid_dns_projection(
+                                    value,
+                                    "dns_projection must be true or false",
+                                )
+                            })?);
+                        dns_projection_source = Some(key);
+                    }
                     _ => unreachable!(),
                 }
             }
@@ -144,6 +177,11 @@ pub(super) fn parse_section(
     }
     if config.backend == Backend::Tun && seen[2] {
         return Err(invalid("TUN does not accept an interface block"));
+    }
+    if let Some(source) = dns_projection_source {
+        config
+            .validate_dns_projection()
+            .map_err(|message| invalid_dns_projection(source, message))?;
     }
     config.validate()?;
     Ok(config)

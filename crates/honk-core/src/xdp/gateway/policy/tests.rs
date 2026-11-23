@@ -301,7 +301,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
         assert_eq!(plan.rules.len(), 2);
         assert!(plan.rules.iter().all(|rule| rule.action.outbound == 2));
         assert_eq!(plan.fallback.outbound, 0);
-        let policy = GatewayPolicy::prepare(&plan)?;
+        let policy = GatewayPolicy::prepare(&plan, false)?;
         let conntrack = ConntrackKfuncs::read()?;
         let maps = GatewayMaps::new(
             &[(
@@ -336,6 +336,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
                 routing: &policy.bytecode.insns,
                 maps: &maps,
                 conntrack: &conntrack,
+                dns: None,
             },
         )?;
         assert_ne!(metadata.discover_prog_id(), 0);
@@ -354,6 +355,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
                 routing: &policy.bytecode.insns,
                 maps: &maps,
                 conntrack: &conntrack,
+                dns: None,
             },
         )?;
         for (index, program) in [programs.discover_fd(), programs.data_fd()]

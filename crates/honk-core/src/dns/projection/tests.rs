@@ -63,6 +63,7 @@ fn positive<'a>(
         family: ips.first().map_or(IpVersion::V4, |ip| family_of(*ip)),
         ips,
         expires_at,
+        source: Default::default(),
     }
 }
 
@@ -260,6 +261,7 @@ async fn positive_refresh_uses_advertised_ttl_and_retain_keeps_owner() {
             family: IpVersion::V4,
             ips: &[ip],
             expires_at: now + Duration::from_secs(3),
+            source: Default::default(),
         },
         now + Duration::from_secs(1),
     );
@@ -779,10 +781,7 @@ async fn cache_hit_refresh_is_coalesced_only_inside_its_bounds() {
         assert!(projection.try_submit_cache_hit(
             honk_datapath::ScopeId::HOST,
             &snapshot(1, 1, 2),
-            "a.test",
-            IpVersion::V4,
-            &[ip],
-            tokio::time::Instant::now() + ttl
+            positive("a.test", &[ip], tokio::time::Instant::now() + ttl),
         ))
     };
     submit(Duration::from_secs(60));
@@ -826,10 +825,11 @@ async fn cache_hit_after_owner_change_is_never_coalesced() {
         assert!(projection.try_submit_cache_hit(
             honk_datapath::ScopeId::HOST,
             &snapshot(generation, 1, 2),
-            "a.test",
-            IpVersion::V4,
-            ips,
-            tokio::time::Instant::now() + Duration::from_secs(60),
+            positive(
+                "a.test",
+                ips,
+                tokio::time::Instant::now() + Duration::from_secs(60)
+            ),
         ))
     };
     hit(1, &[ip]);
@@ -865,10 +865,7 @@ async fn ordinary_ttl_change_invalidates_the_cache_hit_hint() {
         assert!(projection.try_submit_cache_hit(
             honk_datapath::ScopeId::HOST,
             &snapshot(1, 1, 2),
-            "a.test",
-            IpVersion::V4,
-            &ip,
-            tokio::time::Instant::now() + ttl
+            positive("a.test", &ip, tokio::time::Instant::now() + ttl),
         ))
     };
     hit(Duration::from_secs(600));

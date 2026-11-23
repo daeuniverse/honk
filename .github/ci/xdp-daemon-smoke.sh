@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable-virtme-guest gate. Never invoke on the host; no downloads/builds.
-# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon]
+# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon|dns-shadow]
 set -euo pipefail
 
 fail() { printf 'xdp-daemon-smoke: %s\n' "$*" >&2; exit 1; }
@@ -33,11 +33,15 @@ case $smoke_scope in
     all) ;;
     runtime) [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]] || fail 'runtime scope requires the complete Core test executable' ;;
     daemon) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'daemon scope cannot ignore supplied test executables' ;;
+    dns-shadow)
+        [[ -n ${HONK_XDP_CORE_TEST_BIN:-} && -n ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'dns-shadow requires the current Core and XSK test executables'
+        ;;
     *) fail 'unknown smoke scope' ;;
 esac
 read -r smoke_started _ </proc/uptime
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 export HONK_XDP_PROBE="$script_dir/xdp-ipv4-options.py"
+export HONK_XDP_DNS_PROBE="$script_dir/xdp-dns-shadow.py"
 current_netns=$(stat -Lc %i /proc/self/ns/net)
 [[ $current_netns != "${HONK_XDP_PARENT_NETNS:?missing outer guest guard}" &&
    $current_netns != "$(stat -Lc %i /proc/1/ns/net)" ]] || fail 'refusing initial network namespace'
@@ -309,6 +313,158 @@ if mode == 'data':
     assert counter['packets'] == expected, ('unexpected native forwarding during consumer proof', expected, counter)
     print('independent native-forward fence:', counter, flush=True)
 PY
+run_dns_shadow_tests() {
+    local binary=$1 suite=$2 test
+    shift 2
+    [[ $binary == /* && -x $binary ]] || fail "invalid DNS shadow $suite executable"
+    for test in "$@"; do
+        [[ $(ip netns exec dut "$binary" "$test" --exact --ignored --list --format terse) == "$test: test" ]] || fail "missing ignored DNS shadow regression: $test"
+        local output="$work/dns-shadow-$suite/${test##*::}"
+        mkdir -p "$output"
+        timeout -k 5 180 ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$output" \
+            "$binary" "$test" --exact --ignored --test-threads=1 --nocapture 2>&1 | tee "$output/result.log"
+        [[ $(grep -c '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured;' "$output/result.log") == 1 ]] || fail "missing exact DNS shadow test result: $test"
+    done
+}
+
+run_dns_shadow_wire() {
+    local old_namespace_count=${#namespaces[@]} ready profile dns_switch attempt address
+    local proof="$work/dns-shadow-wire"
+    mkdir "$proof"
+    # Keep the real WAN ingress and put the independent echo peer behind the normal uplink.
+    ip netns add shadow-wan
+    namespaces+=(shadow-wan)
+    ip -n server link set s0 netns shadow-wan
+    ip -n shadow-wan link set lo up
+    ip -n shadow-wan link set s0 addrgenmode none up
+    ip -n shadow-wan -4 addr flush dev s0 scope global
+    ip -n shadow-wan -6 addr flush dev s0 scope global
+    ip -n shadow-wan addr add 198.51.100.3/32 dev s0
+    ip -n dut route replace 198.51.100.3/32 dev dut1
+    ip -n dut neigh replace 198.51.100.3 lladdr 02:00:00:00:00:21 nud permanent dev dut1
+    for address in 198.51.100.2 198.51.100.99; do
+        ip -n shadow-wan route replace "$address/32" dev s0
+        ip -n shadow-wan neigh replace "$address" lladdr 02:00:00:00:00:11 nud permanent dev s0
+    done
+    for address in 198.51.100.4 198.51.100.6; do
+        ip -n client route replace "$address/32" dev c0
+        ip -n client neigh replace "$address" lladdr 02:00:00:00:00:10 nud permanent dev c0
+        ip -n dut route replace "$address/32" dev dut1
+    done
+    ip -n dut route replace 198.51.100.99/32 dev dut1
+    ip -n server addr add 198.51.100.2/32 dev lo
+    ip -n server addr add 198.51.100.4/32 dev lo
+    ip -n server addr add 198.51.100.6/32 dev lo
+    ip -n server -6 addr add fd00:2::2/128 dev lo nodad
+
+    for profile in static shadow; do
+        dns_switch=
+        if [[ $profile == static ]]; then dns_switch='dns_projection: false'; fi
+        mkdir -m 700 "/run/honk-xdp-state/dns-$profile"
+        cat >"$proof/$profile.dae" <<EOF
+global {
+    dial_mode: domain+
+    nfqueue_enable: false
+    so_mark_from_dae: 0x100
+    data_dir: '/run/honk-xdp-state/dns-$profile'
+    tcp_check_url: 'http://127.0.0.1:1/'
+    udp_check_dns: '127.0.0.1:9'
+}
+dns {
+    bind: ''
+    optimistic_cache_ttl: 0
+    upstream { default: 'udp://10.77.0.2:15353' }
+}
+datapath {
+    backend: xdp
+    direct: endpoint
+    xsk_mode: copy
+    $dns_switch
+    interface {
+        dut0: lan
+        dut1: wan
+    }
+}
+routing {
+    dip(198.51.100.6/32) && dport(53) -> direct(must)
+    domain(suffix: pass-shadow.test) -> direct(must)
+    fallback: direct
+}
+EOF
+        ip netns exec dut nft add rule inet honk_smoke_native forward counter drop
+        mark_phase "dns-$profile" readiness-begin
+        ip netns exec dut "$daemon" -c "$proof/$profile.dae" --bpf-pin-root "$work/bpf" >"$proof/$profile.daemon.log" 2>&1 &
+        daemon_pid=$!
+        ready=false
+        for ((attempt=0; attempt<200; attempt++)); do
+            kill -0 "$daemon_pid" 2>/dev/null || fail "DNS shadow $profile daemon exited; see $proof/$profile.daemon.log"
+            if grep -q 'XDP datapath ready' "$proof/$profile.daemon.log"; then ready=true; break; fi
+            sleep 0.1
+        done
+        [[ $ready == true ]] || fail "DNS shadow $profile readiness deadline"
+        ip netns exec dut python3 "$work/check.py" data
+        timeout -k 5 120 python3 "$HONK_XDP_DNS_PROBE" wire "$profile" | tee "$proof/$profile.jsonl"
+        ip netns exec dut python3 "$work/check.py" data 1
+        ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$proof/$profile.native-fence.json"
+        kill -TERM "$daemon_pid"
+        timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail "DNS shadow $profile shutdown deadline"
+        wait "$daemon_pid"
+        daemon_pid=
+        ip netns exec dut python3 "$work/check.py" absent
+        [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'DNS shadow left persistent physical pins'
+        ip netns exec dut nft flush chain inet honk_smoke_native forward
+        mark_phase "dns-$profile" detached
+    done
+    python3 "$HONK_XDP_DNS_PROBE" compare "$proof/static.jsonl" "$proof/shadow.jsonl" | tee "$proof/result.json"
+
+    ip -n shadow-wan -4 addr flush dev s0 scope global
+    ip -n shadow-wan link set s0 netns server
+    ip -n server link set s0 up
+    ip netns del shadow-wan
+    namespaces=("${namespaces[@]:0:old_namespace_count}")
+    ip -n server addr del 198.51.100.2/32 dev lo
+    ip -n server addr del 198.51.100.4/32 dev lo
+    ip -n server addr del 198.51.100.6/32 dev lo
+    ip -n server -6 addr del fd00:2::2/128 dev lo
+    for address in 198.51.100.4 198.51.100.6; do
+        ip -n client route del "$address/32" dev c0
+        ip -n client neigh del "$address" dev c0
+        ip -n dut route del "$address/32" dev dut1
+    done
+    ip -n dut neigh del 198.51.100.3 dev dut1
+    ip -n dut route del 198.51.100.3/32 dev dut1
+    ip -n dut route del 198.51.100.99/32 dev dut1
+    provision_routes c0 s0 dut0 dut1
+}
+
+if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
+    modprobe nf_conntrack
+    command -v objdump >/dev/null || fail 'native GNU objdump is required for the actual kernel JIT'
+    generated_test=generated_dns_shadow_policy_verifies_and_jits
+    run_dns_shadow_tests "$HONK_XDP_CORE_TEST_BIN" core \
+        "xdp::tests::driven_kernel::gateway::dns::$generated_test" \
+        dns::projection::tests::scoped::kernel_gateway_dns_canonical_publication \
+        xdp::tests::driven_kernel::gateway::dns_reload::shadow_hosts_reload_keeps_kernel_bank_and_rebinds_generation \
+        xdp::tests::driven_kernel::gateway::dns_reload::shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch \
+        xdp::tests::driven_kernel::gateway::dns_reload::shadow_late_gateway_registration_waits_for_final_flags \
+        xdp::tests::driven_kernel::gateway::dns_reload::shadow_optional_preparation_retains_complete_static_policy \
+        xdp::tests::driven_kernel::gateway::dns_reload::shadow_committed_degraded_closes_kernel_bank
+    proof_dir="$work/dns-shadow-core/$generated_test"
+    python3 "$HONK_XDP_DNS_PROBE" budget "$proof_dir/result.log" | tee "$proof_dir/verifier.json"
+fi
+if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
+    run_dns_shadow_tests "$HONK_XDP_XSK_TEST_BIN" xsk \
+        bpf::general::tests::gateway::kernel_gateway_dns_shadow_counts_only_authorized_data_and_keeps_xsk_fragment \
+        bpf::general::tests::gateway::kernel_gateway_dns_shadow_concurrent_epoch_reuse \
+        bpf::gateway::tests::kernel_gateway_dns_maps_pressure_epoch_stride_and_reclaim_lookahead
+fi
+if [[ $smoke_scope != runtime ]]; then
+    run_dns_shadow_wire
+fi
+if [[ $smoke_scope == dns-shadow ]]; then
+    exit 0
+fi
+
 if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
     [[ $HONK_XDP_XSK_TEST_BIN == /* && -x $HONK_XDP_XSK_TEST_BIN ]] || fail 'invalid XSK test executable'
     for test in \
@@ -337,7 +493,7 @@ if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
     done
     ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" bpf::general::tests::kernel_ --ignored --test-threads=1 --nocapture | tee "$work/xsk-kernel.log"
     for prefix in bpf::general::tests::gateway::kernel_ bpf::gateway::tests::kernel_ bpf::attachment::tests::kernel_owned_; do
-        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$prefix" --ignored --test-threads=1 --nocapture | tee "$work/${prefix//::/-}.log"
+        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$prefix" --skip kernel_gateway_dns_ --ignored --test-threads=1 --nocapture | tee "$work/${prefix//::/-}.log"
     done
     vlan_test=device::features::kernel_vlan_tests::kernel_vlan_no_upper_normal_failure_and_sigkill_boundaries
     [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$vlan_test" --exact --ignored --list --format terse) == "$vlan_test: test" ]] || fail "missing ignored XSK regression: $vlan_test"

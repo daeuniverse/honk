@@ -237,6 +237,7 @@ pub struct CaptureRealm {
     pub realm_id: u32,
     pub name: String,
     pub logical_ifindex: u32,
+    pub root_ifindex: u32,
     pub mtu: u32,
     pub mac: [u8; 6],
     pub vlan_count: u32,
@@ -359,6 +360,7 @@ fn capture_layout_snapshot(snapshot: &Snapshot, names: &[String]) -> io::Result<
             realm_id: (realms.len() + 1) as u32,
             name: name.clone(),
             logical_ifindex: root.index,
+            root_ifindex: root.index,
             mtu: root.mtu.ok_or_else(|| malformed("missing capture MTU"))?,
             mac: root.mac,
             vlan_count: 0,
@@ -393,6 +395,7 @@ fn capture_layout_snapshot(snapshot: &Snapshot, names: &[String]) -> io::Result<
                     realm_id: (realms.len() + 1) as u32,
                     name: link_name(link)?,
                     logical_ifindex: link.index,
+                    root_ifindex: root.index,
                     mtu: parent
                         .mtu
                         .min(link.mtu.ok_or_else(|| malformed("missing VLAN MTU"))?),
@@ -2339,9 +2342,11 @@ mod tests {
         let realms = capture_layout_snapshot(&snapshot, &["bond0".into()]).unwrap();
         assert_eq!(realms.len(), 2);
         assert_eq!(realms[0].logical_ifindex, 10);
+        assert_eq!(realms[0].root_ifindex, 10);
         assert_eq!(realms[0].members, ["member0", "member1"]);
         assert_eq!(realms[1].members, realms[0].members);
         assert_eq!(realms[1].logical_ifindex, 13);
+        assert_eq!(realms[1].root_ifindex, 10);
         assert_eq!(realms[1].vlan_count, 1);
         assert_eq!(realms[1].tpid, [0x8100, 0]);
         assert_eq!(realms[1].vid, [7, 0]);

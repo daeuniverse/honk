@@ -1012,6 +1012,7 @@ async fn admitted_udp_keeps_route_after_fact_withdrawal() {
                 family: IpVersion::V4,
                 ips: &[destination.ip()],
                 expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+                source: Default::default(),
             },
         );
         let mut snapshot = handle

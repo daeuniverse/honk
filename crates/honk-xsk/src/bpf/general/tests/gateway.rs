@@ -1,8 +1,9 @@
 use super::*;
 use aya_obj::generated::bpf_insn;
 use honk_ebpf_common::xdp_gateway::{
-    CaptureRealmKey, EndpointHold, FRAGMENT_TTL_NS, FragmentKey, FragmentVerdict, GatewayKey,
-    GatewayReason, HOLD_REFRESH_NS, LocalAddressKey,
+    CaptureRealmKey, EndpointHold, FRAGMENT_TTL_NS, FragmentKey, FragmentVerdict,
+    GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS, GatewayDnsKey,
+    GatewayDnsValue, GatewayKey, GatewayReason, HOLD_REFRESH_NS, LocalAddressKey,
 };
 use honk_ebpf_common::{DATAPATH_FLAG_OFFLOAD_ALL, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT};
 use honk_ebpf_common::{IpVersionType, L4ProtoType, RoutingInput};
@@ -67,6 +68,7 @@ impl Fixture {
                 routing: &routing,
                 maps: &self.maps,
                 conntrack: &self.ct,
+                dns: None,
             },
         )
         .unwrap();
@@ -853,6 +855,197 @@ fn insert_conntrack_aliases(key: GatewayKey, reply: GatewayKey) {
     );
 }
 
+fn load_dns_fixture(fixture: &Fixture, dns: &crate::GatewayDnsMaps) -> Programs {
+    // A reachable domain condition in both calls. The last bitmap word catches partial copies.
+    let routing = [
+        instruction(JNE_K, 3, 0, 2, GATEWAY_DNS_READY),
+        instruction(LDX_W, 0, 2, GATEWAY_DNS_BITMAP_OFFSET as i16 + 28, 0),
+        instruction(JA, 0, 0, 1, 0),
+        instruction(MOV_K, 0, 0, 0, GATEWAY_ROUTE_NEED_DNS),
+        instruction(EXIT, 0, 0, 0, 0),
+    ];
+    Programs::load_general_gateway(
+        &capture(),
+        1,
+        &[],
+        GatewayLoad {
+            routing: &routing,
+            maps: &fixture.maps,
+            conntrack: &fixture.ct,
+            dns: Some(dns),
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires root in a disposable virtme guest private netns"]
+fn kernel_gateway_dns_shadow_counts_only_authorized_data_and_keeps_xsk_fragment() {
+    let fixture = Fixture::new();
+    let dns = crate::GatewayDnsMaps::new(9).unwrap();
+    let programs = load_dns_fixture(&fixture, &dns);
+    let other = crate::GatewayDnsMaps::new(9).unwrap();
+    for (fd, id) in [
+        (&programs.discover, programs.discover_id),
+        (&programs.data, programs.data_id),
+    ] {
+        let error = other.validate_program(fd.as_fd(), id).unwrap_err();
+        assert_eq!(
+            crate::gateway_dns_load_failure(&error),
+            Some("map_identity")
+        );
+    }
+    let key = GatewayDnsKey {
+        canonical_dst: udp(43080).0.dst,
+        realm_id: 7,
+        export_epoch: 1,
+        reserved: 0,
+    };
+    let mut live = GatewayDnsValue {
+        valid_before_mono_ns: u64::MAX,
+        ..Default::default()
+    };
+    live.bitmap.bitmap[7] = 1;
+    dns.set_epoch(7, 1);
+    dns.insert(&GatewayDnsKey { realm_id: 8, ..key }, &live)
+        .unwrap();
+    let check = |port, count| {
+        let (tuple, frame) = udp(port);
+        assert_eq!(run(&programs.data, &frame, 0).0, XDP_DROP as u32); // empty XSK
+        assert!(fixture.maps.lookup_hold(&tuple).unwrap().is_some());
+        assert_eq!(
+            fixture
+                .maps
+                .reason_count(GatewayReason::WouldPassDns)
+                .unwrap(),
+            count
+        );
+    };
+    check(43080, 0); // same IP exported in a different realm
+    dns.insert(&key, &live).unwrap();
+    dns.set_epoch(7, 0);
+    check(43081, 0);
+    dns.set_epoch(7, 2);
+    check(43082, 0); // old epoch still resident
+    dns.insert(
+        &GatewayDnsKey {
+            export_epoch: 2,
+            ..key
+        },
+        &GatewayDnsValue {
+            valid_before_mono_ns: now(),
+            ..live
+        },
+    )
+    .unwrap();
+    check(43083, 0); // matching epoch but expired permit
+    dns.set_epoch(7, 3);
+    dns.insert(
+        &GatewayDnsKey {
+            export_epoch: 3,
+            ..key
+        },
+        &GatewayDnsValue {
+            valid_before_mono_ns: u64::MAX,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    check(43084, 0); // known zero is evaluated and returns Endpoint
+    dns.set_epoch(7, 4);
+    dns.insert(
+        &GatewayDnsKey {
+            export_epoch: 4,
+            ..key
+        },
+        &live,
+    )
+    .unwrap();
+    let (tuple, mut frame) = udp(43085);
+    ipv4_fragment(&mut frame, 123, 0x2000);
+    assert_eq!(run(&programs.discover, &frame, 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.stat(GatewayReason::WouldPassDns), 0);
+    assert_eq!(run(&programs.data, &frame, 0).0, XDP_DROP as u32);
+    assert!(fixture.maps.lookup_hold(&tuple).unwrap().is_some());
+    assert_eq!(fixture.stat(GatewayReason::WouldPassDns), 1);
+    assert_eq!(run(&programs.data, &frame, 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.stat(GatewayReason::XskEndpointHold), 1);
+    ipv4_fragment(&mut frame, 123, 1);
+    assert_eq!(run(&programs.data, &frame, 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.stat(GatewayReason::XskFragment), 1);
+    assert_eq!(fixture.stat(GatewayReason::PassD1), 0);
+    assert_eq!(fixture.stat(GatewayReason::WouldPassDns), 1);
+    assert!(fixture.scratch().iter().all(|slot| slot[0] == 0));
+}
+
+#[test]
+#[ignore = "requires root in a disposable virtme guest private netns"]
+fn kernel_gateway_dns_shadow_concurrent_epoch_reuse() {
+    let fixture = Fixture::new();
+    let dns = crate::GatewayDnsMaps::new(9).unwrap();
+    let programs = load_dns_fixture(&fixture, &dns);
+    let mut key = GatewayDnsKey {
+        realm_id: 7,
+        export_epoch: 1,
+        canonical_dst: udp(45000).0.dst,
+        reserved: 0,
+    };
+    // The only reusable slot alternates between a live zero bitmap and an expired one bitmap.
+    // Neither complete value authorizes the packet. A torn copy could combine the two authorities.
+    let zero = GatewayDnsValue {
+        valid_before_mono_ns: u64::MAX,
+        ..Default::default()
+    };
+    let mut expired = GatewayDnsValue::default();
+    expired.bitmap.bitmap[7] = 1;
+    for i in 0..4095u32 {
+        dns.insert(
+            &GatewayDnsKey {
+                realm_id: 8,
+                canonical_dst: std::net::Ipv4Addr::from(i).to_ipv6_mapped().octets(),
+                ..key
+            },
+            &zero,
+        )
+        .unwrap();
+    }
+    let live = GatewayDnsValue {
+        valid_before_mono_ns: u64::MAX,
+        ..expired
+    };
+    dns.insert(&key, &live).unwrap();
+    dns.set_epoch(7, 1);
+    assert_eq!(run(&programs.data, &udp(44999).1, 0).0, XDP_DROP as u32);
+    assert_eq!(fixture.stat(GatewayReason::WouldPassDns), 1);
+    std::thread::scope(|scope| {
+        let (step, reached) = std::sync::mpsc::sync_channel(0);
+        let dns = &dns;
+        scope.spawn(move || {
+            let facts = dns.object_fds()[0];
+            for next in 2..=4097 {
+                dns.set_epoch(7, next);
+                remove(facts, &key);
+                key.export_epoch = next;
+                dns.insert(&key, if next % 2 == 0 { &expired } else { &zero })
+                    .unwrap();
+                if next == 2 || next == 2049 {
+                    step.send(()).unwrap();
+                }
+            }
+        });
+        reached.recv().unwrap();
+        for port in 45000..45512 {
+            assert_eq!(run(&programs.data, &udp(port).1, 0).0, XDP_DROP as u32);
+            if port == 45255 {
+                reached.recv().unwrap();
+            }
+        }
+    });
+    assert_eq!(fixture.stat(GatewayReason::XskNewFlow), 513);
+    assert_eq!(fixture.stat(GatewayReason::WouldPassDns), 1);
+    assert_eq!(fixture.stat(GatewayReason::PassD1), 0);
+}
+
 #[test]
 #[ignore = "requires root in a disposable virtme guest private netns"]
 fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
@@ -873,6 +1066,7 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
             routing: &endpoint,
             maps: &fixture.maps,
             conntrack: &fixture.ct,
+            dns: None,
         },
     )
     .unwrap();
@@ -883,6 +1077,7 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
             routing: &direct,
             maps: &fixture.maps,
             conntrack: &fixture.ct,
+            dns: None,
         })
         .unwrap();
     #[repr(C)]
@@ -896,10 +1091,14 @@ fn kernel_gateway_reload_preserves_xsk_and_counter_map_identity() {
         object_info(fd, &mut info).unwrap();
         (info.kind, info.id)
     };
-    assert_eq!(identity(old.xsks.as_fd()), identity(next.xsks.as_fd()));
+    assert!(std::sync::Arc::ptr_eq(old.queue_maps(), next.queue_maps()));
     assert_eq!(
-        identity(old.counters.as_fd()),
-        identity(next.counters.as_fd())
+        identity(old.queue_maps.xsks.as_fd()),
+        identity(next.queue_maps.xsks.as_fd())
+    );
+    assert_eq!(
+        identity(old.queue_maps.counters.as_fd()),
+        identity(next.queue_maps.counters.as_fd())
     );
     assert_ne!(old.data_id, next.data_id);
     assert_ne!(old.discover_id, next.discover_id);

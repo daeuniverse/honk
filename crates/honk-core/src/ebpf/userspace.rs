@@ -7,6 +7,16 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+#[cfg(target_os = "linux")]
+#[derive(PartialEq, Eq)]
+enum GatewayDnsReload {
+    Initial,
+    Pending(u64),
+    Ready(u64),
+    Degraded,
+    Closed,
+}
+
 pub struct UserspaceBackend {
     policy: PolicyState,
     admission: Arc<AtomicBool>,
@@ -14,6 +24,10 @@ pub struct UserspaceBackend {
     mode_flags: u32,
     #[cfg(target_os = "linux")]
     gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
+    #[cfg(target_os = "linux")]
+    gateway_capture_started: bool,
+    #[cfg(target_os = "linux")]
+    gateway_dns_reload: GatewayDnsReload,
 }
 
 impl UserspaceBackend {
@@ -27,11 +41,20 @@ impl UserspaceBackend {
             mode_flags: 0,
             #[cfg(target_os = "linux")]
             gateway: None,
+            #[cfg(target_os = "linux")]
+            gateway_capture_started: false,
+            #[cfg(target_os = "linux")]
+            gateway_dns_reload: GatewayDnsReload::Initial,
         }
     }
 
     pub(crate) fn mode_flags(&self) -> u32 {
         self.mode_flags
+    }
+
+    #[cfg(all(target_os = "linux", test, feature = "ebpf"))]
+    pub(crate) fn gateway(&self) -> Option<&Arc<crate::xdp::gateway::GatewayPublisher>> {
+        self.gateway.as_ref()
     }
 
     #[cfg(target_os = "linux")]
@@ -40,10 +63,93 @@ impl UserspaceBackend {
         gateway: Option<Arc<crate::xdp::gateway::GatewayPublisher>>,
     ) -> anyhow::Result<()> {
         if let Some(publisher) = &gateway {
+            anyhow::ensure!(
+                self.gateway_dns_reload != GatewayDnsReload::Closed,
+                "userspace backend is closed"
+            );
             publisher.set_mode_flags(self.mode_flags)?;
+        }
+        if let Some(previous) = &self.gateway
+            && gateway
+                .as_ref()
+                .is_none_or(|next| !Arc::ptr_eq(previous, next))
+        {
+            previous.stop_dns();
+            self.gateway_capture_started = false;
+        }
+        if self.gateway_dns_reload == GatewayDnsReload::Degraded
+            && let Some(publisher) = &gateway
+        {
+            publisher.degrade_dns();
         }
         self.gateway = gateway;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn activate_gateway_start(
+        &mut self,
+        publisher: &Arc<crate::xdp::gateway::GatewayPublisher>,
+        fingerprint: [u8; 32],
+        generation: u64,
+    ) {
+        if self.gateway_capture_started
+            || self
+                .gateway
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(current, publisher))
+        {
+            return;
+        }
+        match self.gateway_dns_reload {
+            GatewayDnsReload::Pending(current) | GatewayDnsReload::Ready(current)
+                if current != generation =>
+            {
+                return;
+            }
+            GatewayDnsReload::Closed => return,
+            _ => {}
+        }
+        self.gateway_capture_started = true;
+        if matches!(self.gateway_dns_reload, GatewayDnsReload::Initial)
+            || self.gateway_dns_reload == GatewayDnsReload::Ready(generation)
+        {
+            publisher.activate_dns(fingerprint, generation);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn stage_gateway_dns_reload(&mut self, generation: u64) {
+        // Capture can register after canonical commit releases the backend lock.
+        if self.gateway_dns_reload != GatewayDnsReload::Closed {
+            self.gateway_dns_reload = GatewayDnsReload::Pending(generation);
+            if let Some(publisher) = &self.gateway {
+                publisher.stage_dns_reload();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn finish_gateway_dns_reload(&mut self, generation: u64, fingerprint: [u8; 32]) {
+        if self.gateway_dns_reload != GatewayDnsReload::Pending(generation) {
+            return;
+        }
+        self.gateway_dns_reload = GatewayDnsReload::Ready(generation);
+        if self.gateway_capture_started
+            && let Some(publisher) = &self.gateway
+        {
+            publisher.activate_dns(fingerprint, generation);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn degrade_gateway_dns(&mut self) {
+        if self.gateway_dns_reload != GatewayDnsReload::Closed {
+            self.gateway_dns_reload = GatewayDnsReload::Degraded;
+            if let Some(publisher) = &self.gateway {
+                publisher.degrade_dns();
+            }
+        }
     }
 }
 
@@ -159,11 +265,11 @@ impl PolicyBackend for UserspaceBackend {
                 == 0,
             "packet software policy cannot enable NFQUEUE or kernel route witnesses"
         );
-        self.mode_flags = flags;
         #[cfg(target_os = "linux")]
         if let Some(gateway) = &self.gateway {
             gateway.set_mode_flags(flags)?;
         }
+        self.mode_flags = flags;
         Ok(())
     }
 
@@ -178,6 +284,14 @@ impl PolicyBackend for UserspaceBackend {
 
     async fn cleanup(&mut self) -> anyhow::Result<()> {
         self.admission.store(false, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        {
+            self.gateway_dns_reload = GatewayDnsReload::Closed;
+            self.gateway_capture_started = false;
+            if let Some(gateway) = self.gateway.take() {
+                gateway.stop_dns();
+            }
+        }
         *self.pname_support.write() = PnameSupport::Unavailable;
         self.policy.clear();
         Ok(())

@@ -1,10 +1,20 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use super::{
-    CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, NegativeCacheHit, NegativeEntry,
-    PublicationEpoch, lock,
+    CacheKey, CacheSlot, CacheValue, CachedEntry, DnsCacheService, FreshCacheEntry,
+    NegativeCacheHit, NegativeEntry, PublicationEpoch, lock,
 };
+
+static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+
+fn next_revision() -> u64 {
+    NEXT_REVISION
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |revision| {
+            revision.checked_add(1)
+        })
+        .expect("DNS cache revision exhausted")
+}
 
 pub(crate) enum ExactLookup {
     Negative {
@@ -193,7 +203,7 @@ impl DnsCacheService {
         response: Vec<u8>,
         min_ttl: u32,
         refreshing: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<FreshCacheEntry> {
         let ttl = min_ttl.max(1);
         let response = bytes::Bytes::from(response);
         let retained = self.put_slot(
@@ -222,7 +232,7 @@ impl DnsCacheService {
         response: Vec<u8>,
         min_ttl: u32,
         refreshing: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<FreshCacheEntry> {
         let publication = lock(&self.publication);
         if !publication.accepting || publication.epoch != epoch.0 {
             return None;
@@ -252,19 +262,16 @@ impl DnsCacheService {
         min_ttl: u32,
         strict_reusable: bool,
         refreshing: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Option<FreshCacheEntry> {
         if response.len() > super::service::MAX_ANSWER_BYTES
             || crate::dns::response::is_truncated(&response)
         {
             return None;
         }
-        let ttl = min_ttl.max(1);
-        let entry = CachedEntry {
-            response,
-            expires_at: Instant::now() + Duration::from_secs(u64::from(ttl)),
-            min_ttl,
-            strict_reusable,
-        };
+        let ttl = Duration::from_secs(u64::from(min_ttl.max(1)));
+        let expires_at = Instant::now() + ttl;
+        // Projection follows Tokio time, which can advance independently in tests.
+        let projection_expires_at = tokio::time::Instant::now() + ttl;
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
         if refreshing.is_some_and(|revision| {
@@ -274,9 +281,19 @@ impl DnsCacheService {
         }) {
             return None;
         }
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
-        shard.put(key, CacheValue::positive(entry, revision));
-        Some(revision)
+        let fresh = FreshCacheEntry {
+            revision: next_revision(),
+            expires_at: projection_expires_at,
+        };
+        let entry = CachedEntry {
+            response,
+            expires_at,
+            min_ttl,
+            strict_reusable,
+            fresh,
+        };
+        shard.put(key, CacheValue::positive(entry, fresh.revision));
+        Some(fresh)
     }
 
     #[cfg(test)]
@@ -284,7 +301,7 @@ impl DnsCacheService {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = next_revision();
         shard.put(
             key,
             CacheValue::positive(
@@ -293,6 +310,10 @@ impl DnsCacheService {
                     expires_at: Instant::now() - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    fresh: FreshCacheEntry {
+                        revision,
+                        expires_at: tokio::time::Instant::now() - Duration::from_secs(1),
+                    },
                 },
                 revision,
             ),
@@ -309,7 +330,7 @@ impl DnsCacheService {
         let key = CacheSlot::Exact(key);
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = next_revision();
         shard.put(
             key,
             CacheValue::positive(
@@ -318,6 +339,10 @@ impl DnsCacheService {
                     expires_at: Instant::now() - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    fresh: FreshCacheEntry {
+                        revision,
+                        expires_at: tokio::time::Instant::now() - Duration::from_secs(1),
+                    },
                 },
                 revision,
             ),
@@ -341,10 +366,9 @@ impl DnsCacheService {
             rcode,
         };
         let mut shard = lock(&self.shards[index]);
-        let revision = shard.peek(&key).map_or_else(
-            || self.next_revision.fetch_add(1, Ordering::Relaxed),
-            |value| value.revision,
-        );
+        let revision = shard
+            .peek(&key)
+            .map_or_else(next_revision, |value| value.revision);
         shard.put_negative(key, negative, revision);
     }
 
@@ -358,7 +382,7 @@ impl DnsCacheService {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = next_revision();
         shard.put(
             key,
             CacheValue::positive(
@@ -369,6 +393,10 @@ impl DnsCacheService {
                         - Duration::from_secs(1),
                     min_ttl,
                     strict_reusable: true,
+                    fresh: FreshCacheEntry {
+                        revision,
+                        expires_at: tokio::time::Instant::now() - Duration::from_secs(1),
+                    },
                 },
                 revision,
             ),
@@ -383,7 +411,7 @@ impl DnsCacheService {
         let key = CacheSlot::Legacy(key);
         let index = self.shard_index(&key);
         let mut shard = lock(&self.shards[index]);
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = next_revision();
         shard.put(
             key,
             CacheValue::negative(negative_entry(ttl, rcode), revision),
@@ -418,7 +446,7 @@ impl DnsCacheService {
         if refreshing.is_some() && rcode == 3 {
             shard.drop_positive(&key);
         }
-        let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
+        let revision = next_revision();
         shard.put_negative(key, negative, revision);
         Some(revision)
     }
@@ -459,9 +487,7 @@ impl DnsCacheService {
         }) {
             return;
         }
-        if shard.pop(&key).is_some() {
-            self.next_revision.fetch_add(1, Ordering::Relaxed);
-        }
+        shard.pop(&key);
     }
 
     pub fn negative_rcode(&self, key: &str) -> Option<u8> {

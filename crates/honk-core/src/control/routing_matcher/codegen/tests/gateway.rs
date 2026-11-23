@@ -1,6 +1,7 @@
 use super::*;
+use crate::mode::ModeState;
 use crate::routing::{ConnectionInfo, GeoSourceSet};
-use honk_ebpf_common::{DomainRouting, LpmKey, OutboundIndex};
+use honk_ebpf_common::{DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, DomainRouting, LpmKey, OutboundIndex};
 use std::net::IpAddr;
 
 const FDS: RoutingMapFds = RoutingMapFds {
@@ -14,6 +15,12 @@ const FDS: RoutingMapFds = RoutingMapFds {
 const INPUT: usize = 512;
 const OUTPUT: usize = 1024;
 const MAP_VALUE: usize = 3072;
+const DIAL_MODES: [DialMode; 4] = [
+    DialMode::Ip,
+    DialMode::Domain,
+    DialMode::DomainPlus,
+    DialMode::DomainPlusPlus,
+];
 
 fn load(memory: &[u8], address: usize, width: usize) -> u64 {
     let mut bytes = [0; 8];
@@ -23,6 +30,12 @@ fn load(memory: &[u8], address: usize, width: usize) -> u64 {
 
 fn store(memory: &mut [u8], address: usize, value: u64, width: usize) {
     memory[address..address + width].copy_from_slice(&value.to_le_bytes()[..width]);
+}
+
+fn store_bitmap(memory: &mut [u8], address: usize, bitmap: DomainRouting) {
+    for (word, value) in bitmap.bitmap.into_iter().enumerate() {
+        store(memory, address + word * 4, value.into(), 4);
+    }
 }
 
 fn lpm(entries: &[(LpmKey, DomainRouting)], key: &[u8]) -> Option<DomainRouting> {
@@ -50,6 +63,17 @@ fn execute(
     domain: Option<DomainRouting>,
     gateway: bool,
 ) -> (i64, RoutingDecision, Vec<i32>) {
+    execute_with_pointers(insns, plan, input, domain, gateway, [INPUT, OUTPUT])
+}
+
+fn execute_with_pointers(
+    insns: &[bpf_insn],
+    plan: &RoutingPushPlan,
+    input: &RoutingInput,
+    domain: Option<DomainRouting>,
+    gateway: bool,
+    [in_ptr, out_ptr]: [usize; 2],
+) -> (i64, RoutingDecision, Vec<i32>) {
     let mut memory = [0xa5; 4096];
     memory[INPUT..INPUT + 128].fill(0);
     for (offset, bytes) in [
@@ -74,8 +98,12 @@ fn execute(
     }
     let original_input = memory[INPUT..INPUT + 128].to_vec();
     let mut registers = [0u64; 11];
-    registers[R1 as usize] = INPUT as u64;
-    registers[R2 as usize] = OUTPUT as u64;
+    registers[R1 as usize] = in_ptr as u64;
+    registers[R2 as usize] = out_ptr as u64;
+    if let (true, Some(bitmap)) = (gateway, domain) {
+        store_bitmap(&mut memory, OUTPUT + GATEWAY_DNS_BITMAP_OFFSET, bitmap);
+        registers[R3 as usize] = GATEWAY_DNS_READY as u64;
+    }
     registers[R10 as usize] = 2560;
     let mut calls = Vec::new();
     let mut pc = 0;
@@ -148,9 +176,7 @@ fn execute(
                         _ => panic!("unexpected map fd {fd}"),
                     };
                     registers[0] = bitmap.map_or(0, |bitmap| {
-                        for (word, value) in bitmap.bitmap.iter().enumerate() {
-                            store(&mut memory, MAP_VALUE + word * 4, (*value).into(), 4);
-                        }
+                        store_bitmap(&mut memory, MAP_VALUE, bitmap);
                         MAP_VALUE as u64
                     });
                     registers[1..=5].fill(0);
@@ -261,14 +287,9 @@ fn input(connection: &ConnectionInfo, allow: bool) -> RoutingInput {
 fn differential(policy: &str, connection: ConnectionInfo, allow: bool, expected: bool) {
     let router = router(policy);
     let ids = ids();
-    for dial in [
-        DialMode::Ip,
-        DialMode::Domain,
-        DialMode::DomainPlus,
-        DialMode::DomainPlusPlus,
-    ] {
+    for dial in DIAL_MODES {
         let plan = RoutingPushPlan::compile(&router, &ids, dial).unwrap();
-        let gateway = emit_gateway_routing_program(&plan, FDS).unwrap();
+        let gateway = emit_gateway_routing_program(&plan, FDS, false).unwrap();
         let tc = emit_routing_program(&plan, FDS).unwrap();
         let canonical_input = input(&connection, allow);
         let mut lan_input = canonical_input;
@@ -462,10 +483,10 @@ fn gateway_full_negation_and_inherited_geoip_prefixes() {
 }
 
 #[test]
-fn gateway_fingerprint_reuses_policy_identity_and_ignores_fd_numbers() {
+fn gateway_fingerprint_identifies_full_plan_and_ignores_fd_numbers() {
     let policy_router = router("dip(geoip:lab) -> direct\ndefault: proxy");
     let plan = RoutingPushPlan::compile(&policy_router, &ids(), DialMode::Domain).unwrap();
-    let first = emit_gateway_routing_program(&plan, FDS).unwrap();
+    let first = emit_gateway_routing_program(&plan, FDS, false).unwrap();
     let second = emit_gateway_routing_program(
         &plan,
         RoutingMapFds {
@@ -474,36 +495,47 @@ fn gateway_fingerprint_reuses_policy_identity_and_ignores_fd_numbers() {
             domain: -1,
             ..FDS
         },
+        false,
     )
     .unwrap();
-    assert_eq!(first.policy_fingerprint, policy_router.policy_fingerprint());
-    assert_eq!(first.policy_fingerprint, second.policy_fingerprint);
+    assert_eq!(first.fingerprint, plan.fingerprint);
+    assert_eq!(first.fingerprint, second.fingerprint);
     assert!(!first.source_lines.is_empty());
-    let changed = router("dip(geoip:lab) -> block\ndefault: proxy");
-    assert_ne!(first.policy_fingerprint, changed.policy_fingerprint());
-    assert!(emit_gateway_routing_program(&plan, RoutingMapFds { mac: -1, ..FDS }).is_err());
+    let changed_mode = RoutingPushPlan::compile(&policy_router, &ids(), DialMode::Ip).unwrap();
+    let mut changed_ids = ids();
+    changed_ids.insert("proxy".into(), OutboundIndex::UserBase as u8 + 1);
+    let changed_binding =
+        RoutingPushPlan::compile(&policy_router, &changed_ids, DialMode::Domain).unwrap();
+    for changed in [&changed_mode, &changed_binding] {
+        assert_eq!(changed.policy_fingerprint, plan.policy_fingerprint);
+        assert_ne!(
+            emit_gateway_routing_program(changed, FDS, false)
+                .unwrap()
+                .fingerprint,
+            first.fingerprint,
+        );
+    }
+    assert!(emit_gateway_routing_program(&plan, RoutingMapFds { mac: -1, ..FDS }, false).is_err());
 }
 
 #[test]
 fn gateway_preserves_canonical_nonmust_finality_after_an_excluded_domain_rule() {
     let router = router("domain(lab.test) && dport(80) -> proxy\ndefault: direct");
-    for dial in [
-        DialMode::Ip,
-        DialMode::Domain,
-        DialMode::DomainPlus,
-        DialMode::DomainPlusPlus,
-    ] {
+    for dial in DIAL_MODES {
         let plan = RoutingPushPlan::compile(&router, &ids(), dial).unwrap();
-        let gateway = emit_gateway_routing_program(&plan, FDS).unwrap();
+        let static_gateway = emit_gateway_routing_program(&plan, FDS, false).unwrap();
+        let shadow_gateway = emit_gateway_routing_program(&plan, FDS, true).unwrap();
         let tc = emit_routing_program(&plan, FDS).unwrap();
         let input = input(&sample(), true);
         let (_, canonical, _) = execute(&tc.insns, &plan, &input, None, false);
-        let (pass, _, _) = execute(&gateway.insns, &plan, &input, None, true);
-        assert_eq!(pass != 0, canonical.domain_final != 0);
-        assert_eq!(
-            pass != 0,
-            matches!(dial, DialMode::Ip | DialMode::DomainPlus)
-        );
+        for gateway in [&static_gateway, &shadow_gateway] {
+            let (pass, _, _) = execute(&gateway.insns, &plan, &input, None, true);
+            assert_eq!(pass != 0, canonical.domain_final != 0);
+            assert_eq!(
+                pass != 0,
+                matches!(dial, DialMode::Ip | DialMode::DomainPlus)
+            );
+        }
     }
 }
 
@@ -513,7 +545,7 @@ fn gateway_completes_positive_and_negative_ports_before_looking_up_facts() {
         "dip(geoip:lab) && sip(10.0.0.0/8) && dport(80, 443-445) && sport(1024-65535) && !dport(444) && !sport(2000-3000) -> direct\ndefault: proxy",
     );
     let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
-    let gateway = emit_gateway_routing_program(&plan, FDS).unwrap();
+    let gateway = emit_gateway_routing_program(&plan, FDS, false).unwrap();
     for (port, source, pass) in [
         (443, 12345, true),
         (445, 12345, true),
@@ -550,6 +582,222 @@ fn gateway_generated_jump_overflow_is_an_io_error() {
                 .collect(),
         ),
     }];
-    let error = emit_gateway_routing_program(&plan, FDS).unwrap_err();
+    let error = emit_gateway_routing_program(&plan, FDS, false).unwrap_err();
     assert!(error.to_string().contains("routing jump out of range"));
+}
+
+#[test]
+fn gateway_dns_shadow_preserves_static_decisions_until_a_reachable_domain() {
+    for (policy, port, static_result) in [
+        (
+            "dport(53) -> direct(must)\ndomain(lab.test) -> block\ndefault: proxy",
+            53,
+            1,
+        ),
+        (
+            "dport(443) -> proxy\ndomain(lab.test) -> direct(must)\ndefault: block",
+            443,
+            0,
+        ),
+        (
+            "domain(lab.test) && dport(80) -> block\n!pname(rogue) -> direct(must)\ndefault: proxy",
+            53,
+            1,
+        ),
+        (
+            "pname(rogue) && !domain(full:lab.test) -> block\ndefault: direct(must)",
+            443,
+            1,
+        ),
+    ] {
+        let router = router(policy);
+        for dial in DIAL_MODES {
+            let plan = RoutingPushPlan::compile(&router, &ids(), dial).unwrap();
+            let mut connection = sample();
+            connection.dst_port = port;
+            let mut lan = input(&connection, true);
+            lan.pname[..5].copy_from_slice(b"rogue");
+            lan.pname_len = 5;
+            for enabled in [false, true] {
+                let gateway = emit_gateway_routing_program(&plan, FDS, enabled).unwrap();
+                let (status, _, calls) = execute(&gateway.insns, &plan, &lan, None, true);
+                assert_eq!(status, static_result, "{dial:?} {enabled} {policy}");
+                assert!(calls.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn gateway_dns_shadow_terminal_matches_canonical_action_with_mode_and_port_gates() {
+    let ids = ids();
+    for action in [
+        "direct",
+        "direct(must)",
+        "direct(must, mark: 0)",
+        "direct(must, mark: 7)",
+        "block",
+        "proxy",
+    ] {
+        for policy in [
+            format!("domain(full:lab.test) -> {action}\ndefault: block"),
+            format!("domain(full:lab.test) -> block\nl4proto(tcp) -> {action}\ndefault: proxy"),
+            format!("!domain(full:lab.test) -> block\ndefault: {action}"),
+        ] {
+            let router = router(&policy);
+            for dial in DIAL_MODES {
+                let plan = RoutingPushPlan::compile(&router, &ids, dial).unwrap();
+                let gateway = emit_gateway_routing_program(&plan, FDS, true).unwrap();
+                let tc = emit_routing_program(&plan, FDS).unwrap();
+                for mode in ["Rule", "Global", "Direct"] {
+                    let mode_bits = ModeState::new(mode, "direct").direct_offload_mode_bits();
+                    let allow = mode_bits & DATAPATH_FLAG_OFFLOAD_RULE_DIRECT != 0;
+                    assert_eq!(allow, mode == "Rule");
+                    for port in [53, 443] {
+                        let mut connection = sample();
+                        connection.dst_port = port;
+                        let input = input(&connection, allow);
+                        let (first, _, calls) = execute(&gateway.insns, &plan, &input, None, true);
+                        assert_eq!(first, i64::from(GATEWAY_ROUTE_NEED_DNS), "{policy}");
+                        assert!(calls.is_empty());
+                        for name in ["lab.test", "other.test"] {
+                            connection.domain = Some(name.into());
+                            let bitmap = router.domain_bitmap(name).unwrap();
+                            assert_eq!(bitmap == DomainRouting::default(), name == "other.test");
+                            let (endpoint, matched) = router.route_action(&connection);
+                            let (tc_status, canonical, _) =
+                                execute(&tc.insns, &plan, &input, Some(bitmap), false);
+                            let (result, decision, calls) =
+                                execute(&gateway.insns, &plan, &input, Some(bitmap), true);
+                            assert_eq!(tc_status, 0);
+                            assert!(calls.is_empty());
+                            assert_eq!(decision.rule_id, matched.map_or(u32::MAX, |r| r.rule_id));
+                            assert_eq!(decision.outbound, u32::from(ids[&endpoint.outbound]));
+                            assert_eq!(decision.mark, endpoint.mark.unwrap_or(0));
+                            assert_eq!(decision.must != 0, endpoint.must);
+                            assert_eq!(
+                                (
+                                    decision.rule_id,
+                                    decision.outbound,
+                                    decision.mark,
+                                    decision.must
+                                ),
+                                (
+                                    canonical.rule_id,
+                                    canonical.outbound,
+                                    canonical.mark,
+                                    canonical.must
+                                ),
+                            );
+                            let would_pass = endpoint.outbound == "direct"
+                                && endpoint.mark.unwrap_or(0) == 0
+                                && port != 53
+                                && (endpoint.must || (dial == DialMode::Ip && mode == "Rule"));
+                            assert_eq!(
+                                result,
+                                i64::from(would_pass),
+                                "{dial:?} {mode} {port} {name} {policy}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn gateway_dns_shadow_uses_the_canonical_domain_bitmap() {
+    for (matcher, name) in [
+        ("full:exact.test", "exact.test"),
+        ("suffix:suffix.test", "sub.suffix.test"),
+        (r#"regex: "^rx[0-9]+[.]test$""#, "rx42.test"),
+        ("geosite:lab", "lab.test"),
+    ] {
+        for not in ["", "!"] {
+            let router = router(&format!(
+                "{not}domain({matcher}) -> direct(must)\ndefault: block"
+            ));
+            let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
+            let fds = RoutingMapFds { domain: -1, ..FDS };
+            let gateway = emit_gateway_routing_program(&plan, fds, true).unwrap();
+            let input = input(&sample(), false);
+            let (missing, _, calls) = execute(&gateway.insns, &plan, &input, None, true);
+            assert_eq!(missing, i64::from(GATEWAY_ROUTE_NEED_DNS));
+            assert!(calls.is_empty());
+            for (name, matched) in [(name, true), ("other.test", false)] {
+                let bitmap = router.domain_bitmap(name).unwrap();
+                let (status, _, calls) = execute(&gateway.insns, &plan, &input, Some(bitmap), true);
+                assert_eq!(
+                    status,
+                    i64::from(matched == not.is_empty()),
+                    "{matcher} {name}"
+                );
+                assert!(calls.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn gateway_dns_shadow_keeps_ready_across_lazy_fact_lookups() {
+    let router = router(
+        "dip(geoip:lab) && sip(10.0.0.0/8) && mac(02:00:00:00:00:01) && !domain(suffix:test) -> block\n\
+         pname(rogue) -> block\n\
+         dip(geoip:lab) && sip(10.0.0.0/8) && mac(02:00:00:00:00:01) && !pname(rogue) -> direct(must)\n\
+         default: block",
+    );
+    let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
+    let gateway = emit_gateway_routing_program(&plan, FDS, true).unwrap();
+    for (port, expected) in [(53, 0), (443, 1)] {
+        let mut connection = sample();
+        connection.dst_port = port;
+        let mut lan = input(&connection, false);
+        lan.pname[..5].copy_from_slice(b"rogue");
+        lan.pname_len = 5;
+        let (status, _, calls) = execute(&gateway.insns, &plan, &lan, None, true);
+        assert_eq!(status, i64::from(GATEWAY_ROUTE_NEED_DNS));
+        assert_eq!(calls, [FDS.destination_v4, FDS.source_v4, FDS.mac]);
+        let (status, decision, calls) = execute(
+            &gateway.insns,
+            &plan,
+            &lan,
+            router.domain_bitmap("lab.test"),
+            true,
+        );
+        assert_eq!(status, expected);
+        assert_eq!(decision.rule_id, 2);
+        assert_eq!(calls, [FDS.destination_v4, FDS.source_v4, FDS.mac]);
+    }
+}
+
+#[test]
+fn gateway_dns_shadow_without_domains_emits_identical_instructions() {
+    let router = router("dip(geoip:lab) -> direct\ndefault: direct(must)");
+    let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
+    let disabled = emit_gateway_routing_program(&plan, FDS, false).unwrap();
+    let enabled = emit_gateway_routing_program(&plan, FDS, true).unwrap();
+    assert!(
+        disabled
+            .insns
+            .iter()
+            .map(fields)
+            .eq(enabled.insns.iter().map(fields))
+    );
+}
+
+#[test]
+fn gateway_dns_shadow_retains_negative_null_pointer_error_in_both_passes() {
+    let router = router("domain(full:lab.test) -> direct(must)\ndefault: block");
+    let plan = RoutingPushPlan::compile(&router, &ids(), DialMode::Ip).unwrap();
+    let gateway = emit_gateway_routing_program(&plan, FDS, true).unwrap();
+    let input = input(&sample(), true);
+    for bitmap in [None, router.domain_bitmap("lab.test")] {
+        for args in [[0, OUTPUT], [INPUT, 0]] {
+            let (status, _, calls) =
+                execute_with_pointers(&gateway.insns, &plan, &input, bitmap, true, args);
+            assert_eq!(status, -i64::from(libc::EFAULT));
+            assert!(calls.is_empty());
+        }
+    }
 }

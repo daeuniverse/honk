@@ -335,7 +335,7 @@ impl ControlPlane {
         Arc::clone(&self.degradations)
     }
 
-    #[cfg(feature = "native-api")]
+    #[cfg(any(target_os = "linux", feature = "native-api"))]
     pub(crate) fn datapath_health_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.datapath_healthy)
     }
@@ -464,6 +464,13 @@ impl ControlPlane {
 
     pub fn dns_service(&self) -> crate::dns::DnsService {
         self.dns_controller.dns_service()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn packet_routing_projection(
+        &self,
+    ) -> Arc<crate::dns::projection::RoutingProjection> {
+        self.dns_controller.routing_projection()
     }
 
     pub(crate) fn command_sender(&self) -> mpsc::Sender<ControlCommand> {

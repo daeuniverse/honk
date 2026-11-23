@@ -65,6 +65,17 @@ async fn scoped_ip_and_zero_fact_capacities_are_global() {
         assert!(state.bitmap(second, ips[0]).is_some());
         assert!(state.bitmap(first, *ips.last().unwrap()).is_none());
         assert!(state.bitmap(second, *ips.last().unwrap()).is_none());
+        #[cfg(target_os = "linux")]
+        for scope in [first, second] {
+            let omitted = *ips.last().unwrap();
+            assert!(
+                state
+                    .reverse
+                    .contains_key(&super::super::state::ProjectionIp::new(scope, omitted))
+            );
+            assert!(state.gateway_fact(scope, omitted, now).is_none());
+            assert!(state.gateway_fact(scope, ips[0], now).is_some());
+        }
         assert!(state.project(&snapshot(1, 1, 2)).is_empty());
         assert!(state.batch(now).sets.is_empty());
         assert!(state.dirty_ips.is_empty());
@@ -83,10 +94,7 @@ async fn cache_hit_hints_are_scoped_and_packet_answers_ignore_a_kernel_fence() {
     assert!(projection.try_submit_cache_hit(
         ScopeId::HOST,
         &current,
-        "a.test",
-        IpVersion::V4,
-        &[ip],
-        expires_at,
+        positive("a.test", &[ip], expires_at),
     ));
     assert!(
         projection
@@ -99,10 +107,7 @@ async fn cache_hit_hints_are_scoped_and_packet_answers_ignore_a_kernel_fence() {
         assert!(projection.try_submit_cache_hit(
             scope,
             &current,
-            "a.test",
-            IpVersion::V4,
-            &[ip],
-            expires_at,
+            positive("a.test", &[ip], expires_at),
         ));
         assert_eq!(
             projection
@@ -343,10 +348,7 @@ async fn packet_cache_hit_shortening_is_applied_exactly() {
         assert!(projection.try_submit_cache_hit(
             scope,
             &current,
-            "a.test",
-            IpVersion::V4,
-            &ips,
-            now + ttl
+            positive("a.test", &ips, now + ttl),
         ));
     }
     tokio::time::advance(Duration::from_millis(1600)).await;
@@ -638,5 +640,227 @@ async fn packet_scope_registration_is_funded_atomic_and_set_once() {
     );
     assert_eq!(budget.used(), registered);
     drop(projection);
+    assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn packet_cache_reuse_preserves_only_the_original_owner_deadline() {
+    let current = fact_snapshot(1);
+    let scope = ScopeId::allocate().unwrap();
+    let (projection, _wake, _backend) = registered_projection(&current, &[scope]);
+    let ips = ["192.0.2.9".parse().unwrap(); 2];
+    let now = tokio::time::Instant::now();
+    let row = |revision, seconds| ProjectionObservation::Positive {
+        domain: "a.test",
+        family: IpVersion::V4,
+        ips: &ips,
+        expires_at: now + Duration::from_secs(seconds),
+        source: crate::dns::outcome::ProjectionSource::CacheEntry(revision),
+    };
+    projection.submit(scope, Arc::clone(&current), row(7, 15));
+    let original = stamp(&projection, &current, scope, ips[0]);
+    for jittered in [14, 16] {
+        assert!(projection.try_submit_cache_hit(scope, &current, row(7, jittered)));
+        assert_eq!(stamp(&projection, &current, scope, ips[0]), original);
+    }
+    assert!(projection.try_submit_cache_hit(scope, &current, row(8, 9)));
+    assert!(!projection.packet_facts().is_current(original));
+    let shorter = stamp(&projection, &current, scope, ips[0]);
+    assert!(projection.try_submit_cache_hit(scope, &current, row(8, 20)));
+    assert_eq!(stamp(&projection, &current, scope, ips[0]), shorter);
+    tokio::time::advance(Duration::from_secs(9)).await;
+    assert!(!projection.packet_facts().is_current(shorter));
+    assert!(
+        projection
+            .packet_bitmap(scope, ips[0], &current.matcher, 1)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(start_paused = true)]
+async fn gateway_fact_requires_present_unanimous_bounded_owners() {
+    let scope = ScopeId::allocate().unwrap();
+    let ip = "192.0.2.90".parse().unwrap();
+    let ips = [ip];
+    let now = tokio::time::Instant::now();
+    let until = now + Duration::from_secs(30);
+    let earlier = now + Duration::from_secs(2);
+    let mut state = DesiredState::new(snapshot(1, 1, 2), 64);
+    assert!(state.gateway_fact(scope, ip, now).is_none());
+    for i in 0..32 {
+        state.observe(
+            scope,
+            positive(
+                &format!("zero-{i}.example"),
+                &ips,
+                if i == 1 { earlier } else { until },
+            ),
+            now,
+        );
+    }
+    let (zero, expires_at) = state.gateway_fact(scope, ip, now).unwrap();
+    assert_eq!(zero.bitmap, [0; 8]);
+    assert_eq!(expires_at, earlier);
+    assert!(state.gateway_fact(scope, ip, earlier).is_none());
+    state.observe(scope, positive("33.example", &ips, until), now);
+    assert!(state.gateway_fact(scope, ip, now).is_none());
+    state.observe(scope, clear_v4("33.example"), now);
+    state.observe(scope, clear_v4("zero-0.example"), now);
+    state.observe(scope, positive("a.test", &ips, until), now);
+    assert!(state.gateway_fact(scope, ip, now).is_none());
+    state.observe(scope, clear_v4("a.test"), now);
+    assert_eq!(state.gateway_fact(scope, ip, now).unwrap().0.bitmap, [0; 8]);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires disposable XDP VM and real BPF maps"]
+async fn kernel_gateway_dns_canonical_publication() {
+    use crate::xdp::gateway::dns::GatewayDnsBank;
+    use honk_ebpf_common::xdp_gateway::{GatewayDnsKey, LocalAddressKey};
+    use std::os::unix::fs::MetadataExt;
+
+    // SAFETY: geteuid takes no arguments and reads the calling process's credentials.
+    assert_eq!(unsafe { libc::geteuid() }, 0);
+    assert!(
+        std::fs::read_to_string("/proc/cmdline")
+            .unwrap()
+            .contains("virtme.")
+    );
+    let netns = std::fs::metadata("/proc/self/ns/net").unwrap().ino();
+    assert_ne!(netns, std::fs::metadata("/proc/1/ns/net").unwrap().ino());
+    assert_ne!(
+        netns.to_string(),
+        std::env::var("HONK_XDP_PARENT_NETNS").unwrap()
+    );
+    assert_eq!(netns, std::fs::metadata("/run/netns/dut").unwrap().ino());
+    assert!(matches!(
+        std::env::var("HONK_CI_VM_LANE").as_deref(),
+        Ok("floor" | "recent")
+    ));
+    assert_eq!(
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .unwrap()
+            .trim(),
+        std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap()
+    );
+    let budget = honk_netstack::MemoryBudget::new(16 * 1024 * 1024);
+    let lan = ScopeId::allocate().unwrap();
+    let wan = ScopeId::allocate().unwrap();
+    let current = snapshot(1, 1, 2);
+    let (projection, _wake, backend) = registered_projection(&current, &[lan, wan]);
+    let denied = honk_netstack::MemoryBudget::new(1);
+    let unfunded = GatewayDnsBank::new(&denied, [42; 32], &[(lan, 1)]);
+    assert!(matches!(unfunded, Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory));
+    assert_eq!(denied.used(), 0);
+    let bank = GatewayDnsBank::new(&budget, [42; 32], &[(lan, 1)]).unwrap();
+    assert!(bank.ticket(lan).is_none());
+    assert!(projection.activate_gateway_dns(Some(Arc::clone(&bank)), 1, || true));
+    assert!(bank.ticket(wan).is_none());
+    assert!(bank.ticket(ScopeId::HOST).is_none());
+    let ips: Vec<_> = (1..=17).map(|i| IpAddr::from([192, 0, 2, i])).collect();
+    let until = tokio::time::Instant::now() + Duration::from_secs(60);
+    projection.submit(lan, Arc::clone(&current), positive("a.test", &ips, until));
+    let (_, epoch) = bank.ticket(lan).unwrap();
+    let row = |epoch, ip| {
+        bank.maps()
+            .lookup(&GatewayDnsKey {
+                export_epoch: epoch,
+                realm_id: 1,
+                reserved: 0,
+                canonical_dst: LocalAddressKey::from(ip).address,
+            })
+            .unwrap()
+    };
+    for ip in &ips[..16] {
+        assert_eq!(row(epoch, *ip).unwrap().bitmap.bitmap[0], 1);
+    }
+    let tail = ips[16];
+    assert!(row(epoch, tail).is_none());
+    let lookup = || {
+        projection
+            .packet_domain_bitmap(lan, tail, &current.matcher, 1)
+            .unwrap()
+    };
+    projection.hot_fill_packet_domain(lookup());
+    worker::flush_for_test(&projection, &backend).await;
+    assert_eq!(row(epoch, tail).unwrap().bitmap.bitmap[0], 1);
+    let stale = lookup();
+    projection.submit(
+        lan,
+        Arc::clone(&current),
+        positive("b.test", &[tail], until),
+    );
+    let (_, conflicting) = bank.ticket(lan).unwrap();
+    assert!(conflicting > epoch);
+    projection.hot_fill_packet_domain(stale);
+    tokio::time::sleep(Duration::from_millis(260)).await;
+    worker::flush_for_test(&projection, &backend).await;
+    assert!(row(conflicting, tail).is_none());
+    assert!(row(epoch, tail).is_none());
+    let next = snapshot(2, 2, 1);
+    projection
+        .prepare_snapshot_publication()
+        .commit(Arc::clone(&next), None);
+    assert!(bank.ticket(lan).is_none());
+    assert!(projection.activate_gateway_dns(Some(Arc::clone(&bank)), 2, || true));
+    let (_, advanced) = bank.ticket(lan).unwrap();
+    assert!(advanced > conflicting);
+    assert!(!projection.activate_gateway_dns(Some(Arc::clone(&bank)), 1, || true));
+    assert_eq!(bank.ticket(lan), Some((1, advanced)));
+    let (closed, generation) = projection.close_gateway_dns().unwrap();
+    assert!(bank.ticket(lan).is_none());
+    assert!(projection.activate_gateway_dns(Some(closed), generation, || true));
+    assert!(bank.ticket(lan).unwrap().1 > advanced);
+    let late = projection
+        .packet_domain_bitmap(lan, ips[0], &next.matcher, 2)
+        .unwrap();
+    let fresh_bank = GatewayDnsBank::new(&budget, [43; 32], &[(lan, 1)]).unwrap();
+    let next = snapshot(3, 2, 1);
+    projection
+        .prepare_snapshot_publication()
+        .commit(Arc::clone(&next), None);
+    assert!(bank.ticket(lan).is_none());
+    assert!(projection.activate_gateway_dns(Some(Arc::clone(&fresh_bank)), 3, || true));
+    projection.hot_fill_packet_domain(late);
+    worker::flush_for_test(&projection, &backend).await;
+    assert_eq!(fresh_bank.stats().inserted, 0);
+    projection.hot_fill_packet_domain(
+        projection
+            .packet_domain_bitmap(lan, ips[0], &next.matcher, 3)
+            .unwrap(),
+    );
+    worker::flush_for_test(&projection, &backend).await;
+    assert_eq!(fresh_bank.stats().inserted, 1);
+    let (_, before_host) = fresh_bank.ticket(lan).unwrap();
+    projection.state.lock().capacity = 2;
+    projection.submit(
+        ScopeId::HOST,
+        Arc::clone(&next),
+        positive("host.test", &ips[..1], until),
+    );
+    assert!(fresh_bank.ticket(lan).unwrap().1 > before_host);
+    assert!(
+        projection
+            .packet_domain_bitmap(lan, ips[0], &next.matcher, 3)
+            .unwrap()
+            .bitmap
+            .is_none()
+    );
+    projection
+        .prepare_snapshot_publication()
+        .commit(snapshot(4, 2, 1), None);
+    assert!(
+        !projection.activate_gateway_dns(Some(Arc::clone(&fresh_bank)), 4, || {
+            assert!(projection.state.try_lock().is_none());
+            false
+        })
+    );
+    assert!(fresh_bank.ticket(lan).is_none());
+    drop(fresh_bank);
+    assert!(bank.ticket(lan).is_none());
+    drop(bank);
     assert_eq!(budget.used(), 0);
 }

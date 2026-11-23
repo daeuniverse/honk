@@ -1,5 +1,30 @@
 //! Shared XDP gateway map keys and values.
 
+use crate::{DomainRouting, KernelRouteOutput};
+
+pub const GATEWAY_REALM_CAPACITY: u32 = 4096;
+pub const GATEWAY_DNS_READY: i32 = 8;
+pub const GATEWAY_ROUTE_NEED_DNS: i32 = 2;
+/// Domain bitmap relative to the routing output, in the compiler's map-backed frame.
+pub const GATEWAY_DNS_BITMAP_OFFSET: usize =
+    core::mem::offset_of!(KernelRouteOutput, input) + 3 * size_of::<DomainRouting>() + 32 + 16;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct GatewayDnsKey {
+    pub export_epoch: u64,
+    pub realm_id: u32,
+    pub reserved: u32,
+    pub canonical_dst: [u8; 16],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GatewayDnsValue {
+    pub valid_before_mono_ns: u64,
+    pub bitmap: DomainRouting,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct CaptureRealmKey {
@@ -98,12 +123,19 @@ pub enum GatewayReason {
     FragmentVerdictInsertFailed,
     IcmpQuoteUnresolved,
     D1Evaluated,
+    WouldPassDns,
 }
 
-pub const GATEWAY_REASON_COUNT: u32 = GatewayReason::D1Evaluated as u32 + 1;
+pub const GATEWAY_REASON_COUNT: u32 = GatewayReason::WouldPassDns as u32 + 1;
 
 const _: () = {
     use core::mem::{offset_of, size_of};
+    assert!(size_of::<GatewayDnsKey>() == 32);
+    assert!(offset_of!(GatewayDnsKey, realm_id) == 8);
+    assert!(offset_of!(GatewayDnsKey, reserved) == 12);
+    assert!(offset_of!(GatewayDnsKey, canonical_dst) == 16);
+    assert!(size_of::<GatewayDnsValue>() == 40);
+    assert!(offset_of!(GatewayDnsValue, bitmap) == 8);
     assert!(size_of::<CaptureRealmKey>() == 16);
     assert!(offset_of!(CaptureRealmKey, physical_ifindex) == 0);
     assert!(offset_of!(CaptureRealmKey, vlan_count) == 4);

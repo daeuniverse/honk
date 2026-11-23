@@ -1509,6 +1509,7 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
                 family: honk_outbound::alive::IpVersion::V4,
                 ips: &ips,
                 expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+                source: Default::default(),
             },
         );
         let start = Instant::now() - Duration::from_secs(31);
@@ -1621,6 +1622,7 @@ async fn generated_reassembly_error_keeps_scoped_nat_and_funding_through_complet
                 family: honk_outbound::alive::IpVersion::V4,
                 ips: &ips,
                 expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+                source: Default::default(),
             },
         );
         assert!(

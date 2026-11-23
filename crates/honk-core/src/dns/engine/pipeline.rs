@@ -16,39 +16,68 @@ mod flight {
 
     use super::{CacheAccess, ExecutionContext, cache};
     use crate::dns::forwarder::DnsForwardError;
-    use crate::dns::outcome::{DnsOutcome, EffectiveExpiry, OutcomeStatus, Provenance};
-    use crate::dns::response::ResponseTemplate;
-    use crate::dns::singleflight::FlightLeader;
+    use crate::dns::outcome::{
+        DnsOutcome, EffectiveExpiry, OutcomeStatus, ProjectionLifetime, Provenance, ResponseClass,
+    };
+    use crate::dns::singleflight::{FlightAnswer, FlightLeader};
 
     pub(super) fn publish_outcome(leader: FlightLeader, outcome: DnsOutcome) -> DnsOutcome {
         if let Some(template) = outcome.template() {
-            leader.publish(Ok(Arc::new(template.clone())));
+            leader.publish(Ok(Arc::new(FlightAnswer {
+                template: template.clone(),
+                // A waiter without a cache hit receives this template, not the leader's cache policy.
+                projection_expires_at: outcome
+                    .projection_lifetime()
+                    .map(|lifetime| lifetime.expires_at)
+                    .or_else(|| {
+                        (outcome.status() == OutcomeStatus::Accepted
+                            && outcome.response_class() == ResponseClass::Positive
+                            && outcome.provenance() != Provenance::Stale
+                            && !crate::dns::response::is_truncated(outcome.reusable()))
+                        .then(|| {
+                            ProjectionLifetime::from_wire(
+                                outcome.reusable(),
+                                tokio::time::Instant::now(),
+                            )
+                            .expires_at
+                        })
+                    }),
+            })));
         }
         outcome
     }
 
     pub(super) async fn waiter_outcome(
         context: &ExecutionContext<'_>,
-        template: Arc<ResponseTemplate>,
+        answer: Arc<FlightAnswer>,
     ) -> Result<DnsOutcome, DnsForwardError> {
         if context.options.cache == CacheAccess::Normal
             && let Some(outcome) = cache::lookup(context, false).await?
         {
             return Ok(outcome);
         }
-        context.forwarder.outcome_from_wire(
-            context.engine,
-            context.prepared,
-            template.wire(),
-            None,
-            OutcomeStatus::Accepted,
-            Provenance::Upstream,
-            EffectiveExpiry::do_not_cache(),
-            None,
-            None,
-            Vec::new(),
-            context.mode,
-        )
+        let lifetime = answer
+            .projection_expires_at
+            .map(|expires_at| ProjectionLifetime {
+                expires_at,
+                source: crate::dns::outcome::ProjectionSource::SharedFlight,
+            });
+        context
+            .forwarder
+            .outcome_from_wire(
+                context.engine,
+                context.prepared,
+                answer.template.wire(),
+                None,
+                OutcomeStatus::Accepted,
+                Provenance::Upstream,
+                EffectiveExpiry::do_not_cache(),
+                None,
+                None,
+                Vec::new(),
+                context.mode,
+            )
+            .map(|outcome| outcome.with_projection_lifetime(lifetime))
     }
 }
 mod operation;

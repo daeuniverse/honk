@@ -245,6 +245,11 @@ impl ControlPlane {
         }
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        #[cfg(target_os = "linux")]
+        let gateway_dns_enabled = current_config
+            .datapath
+            .as_ref()
+            .is_some_and(|datapath| datapath.effective_dns_projection());
         let same_datapath_setup = match (&current_config.datapath, &new_config.datapath) {
             (None, None) => true,
             (Some(current), Some(candidate)) => current.same_device_setup(candidate),
@@ -670,8 +675,13 @@ impl ControlPlane {
             self.close_and_drain_pending_udp_admission().await;
             // Nothing was torn down yet: restore the old flags and keep
             // serving instead of rejecting new connections forever.
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         drain.start_rejecting();
@@ -681,8 +691,13 @@ impl ControlPlane {
         }
         if !self.udp_pool.cancel_initializers_and_wait().await {
             warn!("UDP initializers did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "ebpf")]
@@ -691,8 +706,13 @@ impl ControlPlane {
         }
         if !self.udp_pool.wait_for_retirements().await {
             warn!("UDP endpoint retirements did not drain before reload commit");
-            self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                .await;
+            self.restore_datapath_flags_after_rejected_reload(
+                &datapath_flags,
+                drain,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+            )
+            .await;
             return Ok(ReloadOutcome::Rejected);
         }
         #[cfg(feature = "native-api")]
@@ -892,18 +912,26 @@ impl ControlPlane {
                 }
                 // The projection worker takes eBPF before its generation fence;
                 // publish under both locks so an old batch cannot enter this snapshot.
-                projection_publication.commit(
-                    projection_snapshot,
-                    routing_publication_needed.then_some(new_projection),
-                );
+                let published = routing_publication_needed.then_some(new_projection);
+                projection_publication.commit(projection_snapshot, published);
+                #[cfg(target_os = "linux")]
+                if gateway_dns_enabled && let Ok(backend) = ebpf.userspace_mut() {
+                    // Even without NFQUEUE, the final composed flags write can fail after commit.
+                    backend.stage_gateway_dns_reload(generation.get());
+                }
                 Ok(old_registry)
             }
         };
         let old_registry = match old_registry_result {
             Ok(old_registry) => old_registry,
             Err(()) => {
-                self.restore_datapath_flags_after_rejected_reload(&datapath_flags, drain)
-                    .await;
+                self.restore_datapath_flags_after_rejected_reload(
+                    &datapath_flags,
+                    drain,
+                    #[cfg(target_os = "linux")]
+                    gateway_dns_enabled,
+                )
+                .await;
                 return Ok(ReloadOutcome::Rejected);
             }
         };
@@ -937,8 +965,12 @@ impl ControlPlane {
         }
         #[cfg(feature = "native-api")]
         if mode_reset_failed {
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.settle_reload_datapath(
+                None,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+            )
+            .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
             return Ok(ReloadOutcome::CommittedDegraded {
@@ -954,8 +986,12 @@ impl ControlPlane {
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after reload");
             self.close_and_drain_pending_udp_admission().await;
-            self.datapath_healthy
-                .store(false, std::sync::atomic::Ordering::Release);
+            self.settle_reload_datapath(
+                None,
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+            )
+            .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
             return Ok(ReloadOutcome::CommittedDegraded {
@@ -970,8 +1006,12 @@ impl ControlPlane {
 
         // A completed slow path has republished everything a latch could
         // have torn; re-arm.
-        self.datapath_healthy
-            .store(true, std::sync::atomic::Ordering::Release);
+        self.settle_reload_datapath(
+            Some((generation.get(), new_plan.fingerprint)),
+            #[cfg(target_os = "linux")]
+            gateway_dns_enabled,
+        )
+        .await;
         self.stop_reload_rejection_if_healthy(drain);
         Ok(ReloadOutcome::Committed {
             generation: generation.get(),
@@ -982,8 +1022,11 @@ impl ControlPlane {
         &self,
         datapath_flags: &crate::mode::DatapathFlagsHandle,
         drain: &DrainTracker,
+        #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
     ) {
         if !self.is_datapath_healthy() {
+            #[cfg(target_os = "linux")]
+            self.close_degraded_gateway_dns(gateway_dns_enabled).await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
             return;
@@ -996,6 +1039,8 @@ impl ControlPlane {
             .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::ReopenNfqueue);
         if let Err(error) = datapath_flags.reopen_nfqueue().await {
             error!(%error, "failed to reopen NFQUEUE after rejected reload");
+            #[cfg(target_os = "linux")]
+            self.close_degraded_gateway_dns(gateway_dns_enabled).await;
             self.close_and_drain_pending_udp_admission().await;
             self.datapath_healthy
                 .store(false, std::sync::atomic::Ordering::Release);
@@ -1004,6 +1049,39 @@ impl ControlPlane {
             return;
         }
         drain.stop_rejecting();
+    }
+
+    async fn settle_reload_datapath(
+        &self,
+        completed: Option<(u64, [u8; 32])>,
+        #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
+    ) {
+        #[cfg(target_os = "linux")]
+        let mut backend = if gateway_dns_enabled {
+            Some(self.ebpf.write().await)
+        } else {
+            None
+        };
+        self.datapath_healthy
+            .store(completed.is_some(), std::sync::atomic::Ordering::Release);
+        #[cfg(target_os = "linux")]
+        if let Some(backend) = backend
+            .as_mut()
+            .and_then(|backend| backend.userspace_mut().ok())
+        {
+            if let Some((generation, fingerprint)) = completed {
+                backend.finish_gateway_dns_reload(generation, fingerprint);
+            } else {
+                backend.degrade_gateway_dns();
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn close_degraded_gateway_dns(&self, enabled: bool) {
+        if enabled && let Ok(backend) = self.ebpf.write().await.userspace_mut() {
+            backend.degrade_gateway_dns();
+        }
     }
 
     fn open_pending_udp_admission(&self) {

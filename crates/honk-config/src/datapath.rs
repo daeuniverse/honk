@@ -387,6 +387,7 @@ pub struct DatapathConfig {
     pub xsk_mode: Option<XskMode>,
     pub workers: Option<u8>,
     pub poll_mode: Option<PollMode>,
+    pub dns_projection: Option<bool>,
     pub busy_poll: Option<BusyPollConfig>,
     pub interfaces: Vec<XdpInterface>,
     pub firewall: Option<FirewallConfig>,
@@ -405,6 +406,7 @@ impl Serialize for DatapathConfig {
             + usize::from(firewall)
             + usize::from(interfaces)
             + usize::from(self.poll_mode.is_some())
+            + usize::from(self.dns_projection.is_some())
             + usize::from(self.busy_poll.is_some())
             + usize::from(self.tun.is_some())
             + usize::from(self.workers.is_some())
@@ -420,6 +422,9 @@ impl Serialize for DatapathConfig {
         }
         if let Some(poll_mode) = &self.poll_mode {
             output.serialize_field("poll_mode", poll_mode)?;
+        }
+        if let Some(dns_projection) = self.dns_projection {
+            output.serialize_field("dns_projection", &dns_projection)?;
         }
         if let Some(busy_poll) = &self.busy_poll {
             output.serialize_field("busy_poll", busy_poll)?;
@@ -457,6 +462,8 @@ impl<'de> Deserialize<'de> for DatapathConfig {
             #[serde(default, deserialize_with = "present")]
             poll_mode: Option<PollMode>,
             #[serde(default, deserialize_with = "present")]
+            dns_projection: Option<bool>,
+            #[serde(default, deserialize_with = "present")]
             busy_poll: Option<BusyPollConfig>,
             #[serde(default, deserialize_with = "present")]
             interfaces: Option<Vec<XdpInterface>>,
@@ -484,6 +491,7 @@ impl<'de> Deserialize<'de> for DatapathConfig {
             xsk_mode: wire.xsk_mode.flatten(),
             workers: wire.workers,
             poll_mode: wire.poll_mode,
+            dns_projection: wire.dns_projection,
             busy_poll: wire.busy_poll,
             interfaces: wire.interfaces.unwrap_or_default(),
             firewall: wire.firewall.flatten(),
@@ -497,6 +505,7 @@ impl<'de> Deserialize<'de> for DatapathConfig {
 impl DatapathConfig {
     pub fn validate(&self) -> Result<(), crate::ConfigError> {
         let invalid = |message: &str| crate::ConfigError::Parse(format!("datapath: {message}"));
+        self.validate_dns_projection().map_err(invalid)?;
         let has_nat = !self.nat.is_empty();
         if self.workers.is_some()
             && (self.backend != Backend::Xdp || !matches!(self.workers, Some(1 | 2)))
@@ -597,11 +606,32 @@ impl DatapathConfig {
         self.xsk_mode.unwrap_or_default()
     }
 
+    fn supports_dns_projection(&self) -> bool {
+        self.backend == Backend::Xdp
+            && self.direct == Some(DirectProfile::Endpoint)
+            && self
+                .interfaces
+                .iter()
+                .any(|interface| interface.role == InterfaceRole::Lan)
+    }
+
+    pub(crate) fn validate_dns_projection(&self) -> Result<(), &'static str> {
+        if self.dns_projection.is_some() && !self.supports_dns_projection() {
+            return Err("dns_projection requires XDP Endpoint with a physical LAN interface");
+        }
+        Ok(())
+    }
+
+    pub fn effective_dns_projection(&self) -> bool {
+        self.dns_projection.unwrap_or(true) && self.supports_dns_projection()
+    }
+
     pub fn same_device_setup(&self, other: &Self) -> bool {
         self.backend == other.backend
             && self.direct == other.direct
             && self.effective_xsk_mode() == other.effective_xsk_mode()
             && self.effective_workers() == other.effective_workers()
+            && self.effective_dns_projection() == other.effective_dns_projection()
             && self.interfaces == other.interfaces
             && self.tun == other.tun
             && self.host == other.host

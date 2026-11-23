@@ -11,6 +11,10 @@ use aya_obj::generated::{
     BPF_JGT, BPF_JMP, BPF_JNE, BPF_JSET, BPF_K, BPF_LD, BPF_LDX, BPF_MEM, BPF_MOV, BPF_OR, BPF_ST,
     BPF_STX, BPF_W, BPF_X, bpf_insn,
 };
+use honk_config::types::DialMode;
+use honk_ebpf_common::xdp_gateway::{
+    GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS,
+};
 use honk_ebpf_common::{
     KernelRouteOutput, ROUTE_FACT_PRESENT_SHIFT, ROUTE_TRACE_COMPLETE, ROUTE_TRACE_ENABLED,
     ROUTE_TRACE_MATCHED, ROUTE_TRACE_NOT_MATCHED, ROUTE_TRACE_OVERFLOW, ROUTE_TRACE_VALUES,
@@ -63,6 +67,10 @@ const TRACE_INPUT: i16 = std::mem::offset_of!(KernelRouteOutput, input) as i16;
 const TRACE_DOMAIN: i16 = std::mem::offset_of!(KernelRouteOutput, domain_bitmap) as i16;
 const TRACE_OUTCOMES: i16 = std::mem::offset_of!(KernelRouteOutput, outcomes) as i16;
 const DIRECT_MARK_INDEX: i16 = std::mem::offset_of!(RoutingDecision, direct_mark_index) as i16;
+const HOST_SCRATCH_END: i16 = TRACE_INPUT - STACK_DOMAIN_KEY;
+const _: () = assert!(HOST_SCRATCH_END as usize <= std::mem::size_of::<KernelRouteOutput>());
+const _: () =
+    assert!(GATEWAY_DNS_BITMAP_OFFSET == (HOST_SCRATCH_END + FactKind::Domain.area()) as usize);
 
 /// One lookup category. Each owns a 32-byte stack area holding its
 /// `DomainRouting` bitmap once resolved: domain at [-32, -1], destination at
@@ -76,7 +84,7 @@ enum FactKind {
 }
 
 impl FactKind {
-    fn area(self) -> i16 {
+    const fn area(self) -> i16 {
         -(self as i16 + 1) * FACT_BYTES
     }
 }
@@ -105,13 +113,15 @@ pub struct RoutingBytecode {
     pub trace_layout: Option<KernelTraceLayout>,
 }
 
-/// Gateway function body: R1 is LAN input, R2 is caller-guarded host scratch.
-/// Return 1 for a proven static direct, 0 for Endpoint, or a negative input error.
+/// Gateway function body: R1 is LAN input and R2 is caller-guarded scratch.
+/// With DNS shadow, R3 is zero on the first pass and `GATEWAY_DNS_READY` with a bitmap.
+/// Return 1 for proven direct, 0 for Endpoint, `GATEWAY_ROUTE_NEED_DNS` for the
+/// first reachable domain predicate without a bitmap, or a negative input error.
 #[derive(Debug, Clone)]
 pub struct GatewayBytecode {
     pub insns: Vec<bpf_insn>,
     pub source_lines: Vec<RoutingSourceLine>,
-    pub policy_fingerprint: [u8; 32],
+    pub fingerprint: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -283,8 +293,9 @@ impl Assembler {
 /// (Destination/Source/MAC). Kept in R8, which callee-saves across the
 /// lookup helper; it says this call already resolved the category, not
 /// that the emitter merely emitted a lookup somewhere.
+/// Gateway DNS shadow reserves bit 3 for its caller-provided domain bitmap.
 ///
-/// The verifier must not see its initial value as a constant. Initialized
+/// Outside gateway DNS shadow, the verifier must not see an initial constant:
 /// with `mov 0` it is one precise value per resolution history, states
 /// with different values cannot subsume each other, and every later
 /// process-name chain is walked once per value: the #280 policy cost
@@ -304,7 +315,7 @@ pub fn emit_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, false, false)
+    emit_routing_program_inner(plan, fds, false, false, false)
 }
 
 /// Host callers reserve the output's unused trace payload as scratch under their busy guard.
@@ -313,7 +324,7 @@ pub fn emit_host_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
 ) -> anyhow::Result<RoutingBytecode> {
-    emit_routing_program_inner(plan, fds, true, false)
+    emit_routing_program_inner(plan, fds, true, false, false)
 }
 
 /// Emit LAN gateway classification using canonical predicates and map-backed scratch.
@@ -323,17 +334,24 @@ pub fn emit_host_routing_program(
 pub fn emit_gateway_routing_program(
     plan: &RoutingPushPlan,
     fds: RoutingMapFds,
+    dns_shadow: bool,
 ) -> std::io::Result<GatewayBytecode> {
     let bytecode =
-        emit_routing_program_inner(plan, fds, true, true).map_err(std::io::Error::other)?;
+        emit_routing_program_inner(plan, fds, true, true, dns_shadow && plan.has_domain_rules)
+            .map_err(std::io::Error::other)?;
     Ok(GatewayBytecode {
         insns: bytecode.insns,
         source_lines: bytecode.lines,
-        policy_fingerprint: plan.policy_fingerprint,
+        fingerprint: plan.fingerprint,
     })
 }
 
-fn emit_gateway_terminal(asm: &mut Assembler, action: KernelAction) -> anyhow::Result<()> {
+fn emit_gateway_terminal(
+    asm: &mut Assembler,
+    action: KernelAction,
+    dial_mode: DialMode,
+    dns_shadow: bool,
+) -> anyhow::Result<()> {
     let direct = action.outbound == honk_ebpf_common::OutboundIndex::Direct as u8
         && !action.mark.is_some_and(|mark| mark != 0);
     if !direct {
@@ -341,18 +359,41 @@ fn emit_gateway_terminal(asm: &mut Assembler, action: KernelAction) -> anyhow::R
         return asm.exit();
     }
     let denied = asm.label();
+    let check_port = !action.must || dns_shadow;
+    let allowed = asm.label();
+    if action.must && dns_shadow {
+        let dns = asm.label();
+        asm.jump(BPF_JSET, READY, GATEWAY_DNS_READY, dns)?;
+        asm.ja(allowed)?;
+        asm.bind(dns);
+    }
     if !action.must {
         asm.ldx_w(R0, R6, INPUT_FLAGS)?;
         asm.and_imm(R0, ROUTING_INPUT_ALLOW_DIRECT_FINALITY as i32)?;
         asm.jump(BPF_JEQ, R0, 0, denied)?;
+        let skip_domain_final = (dns_shadow && dial_mode == DialMode::Ip).then(|| asm.label());
+        if dns_shadow {
+            asm.jump(
+                BPF_JSET,
+                READY,
+                GATEWAY_DNS_READY,
+                skip_domain_final.unwrap_or(denied),
+            )?;
+        }
         asm.ldx_w(R0, R7, DOMAIN_FINAL)?;
         asm.jump(BPF_JEQ, R0, 0, denied)?;
+        if let Some(skip) = skip_domain_final {
+            asm.bind(skip);
+        }
+    }
+    if check_port {
         asm.ldx_w(R0, R6, INPUT_DST_PORT)?;
         asm.jump(BPF_JEQ, R0, 53, denied)?;
     }
+    asm.bind(allowed);
     asm.mov_imm(R0, 1)?;
     asm.exit()?;
-    if !action.must {
+    if check_port {
         asm.bind(denied);
         asm.mov_imm(R0, 0)?;
         asm.exit()?;
@@ -383,6 +424,7 @@ fn emit_routing_program_inner(
     fds: RoutingMapFds,
     host_scratch: bool,
     gateway: bool,
+    dns_shadow: bool,
 ) -> anyhow::Result<RoutingBytecode> {
     validate_plan(plan)?;
     validate_map_fds(&fds, !gateway)?;
@@ -405,10 +447,8 @@ fn emit_routing_program_inner(
     asm.mov_reg(R6, R1)?;
     asm.mov_reg(R7, R2)?;
     if asm.host_scratch {
-        const END: i16 = TRACE_INPUT - STACK_DOMAIN_KEY;
-        const _: () = assert!(END as usize <= std::mem::size_of::<KernelRouteOutput>());
         asm.mov_reg(R9, R2)?;
-        asm.add_imm(R9, i32::from(END))?;
+        asm.add_imm(R9, i32::from(HOST_SCRATCH_END))?;
     }
     asm.st_imm(R7, DIRECT_MARK_INDEX, u32::MAX as i32)?;
     asm.st_imm(R7, OUTBOUND, plan.fallback.outbound as i32)?;
@@ -421,7 +461,12 @@ fn emit_routing_program_inner(
         (!plan.has_domain_rules || plan.features & ROUTING_FEATURE_DOMAIN_REROUTE == 0) as i32,
     )?;
     asm.st_imm(R7, RULE_ID, u32::MAX as i32)?;
-    asm.ldx_w(READY, R7, MARK)?;
+    if dns_shadow {
+        // The trusted call sites pass constants so the verifier can prune the DNS branches.
+        asm.mov_reg(READY, R3)?;
+    } else {
+        asm.ldx_w(READY, R7, MARK)?;
+    }
     for kind in [FactKind::Destination, FactKind::Source, FactKind::Mac] {
         for word in 0..FACT_BYTES / 8 {
             asm.ldx_w(R1, R7, MARK)?;
@@ -459,8 +504,16 @@ fn emit_routing_program_inner(
             if gateway {
                 match condition.predicate {
                     KernelPredicate::Domain(_) => {
-                        domain_barrier = true;
-                        break;
+                        if dns_shadow {
+                            let ready = asm.label();
+                            asm.jump(BPF_JSET, READY, GATEWAY_DNS_READY, ready)?;
+                            asm.mov_imm(R0, GATEWAY_ROUTE_NEED_DNS)?;
+                            asm.exit()?;
+                            asm.bind(ready);
+                        } else {
+                            domain_barrier = true;
+                            break;
+                        }
                     }
                     KernelPredicate::ProcessName(_) => {
                         if !condition.not {
@@ -502,7 +555,7 @@ fn emit_routing_program_inner(
             )?;
             emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
             if gateway {
-                emit_gateway_terminal(&mut asm, rule.action)?;
+                emit_gateway_terminal(&mut asm, rule.action, plan.dial_mode, dns_shadow)?;
             } else {
                 asm.mov_imm(R0, 0)?;
                 asm.exit()?;
@@ -515,7 +568,7 @@ fn emit_routing_program_inner(
         emit_trace_outcome(&mut asm, rule_slot, ROUTE_TRACE_NOT_MATCHED)?;
     }
 
-    // The prologue's zero MARK seeds READY, so fallback options are stored only here.
+    // Keep the prologue's zero MARK available to seed lazy fact areas.
     asm.source(0, "fallback");
     emit_trace_outcome(&mut asm, trace_slot, ROUTE_TRACE_MATCHED)?;
     emit_action(
@@ -526,7 +579,7 @@ fn emit_routing_program_inner(
     )?;
     emit_trace_or(&mut asm, TRACE_FLAGS, ROUTE_TRACE_COMPLETE)?;
     if gateway {
-        emit_gateway_terminal(&mut asm, plan.fallback)?;
+        emit_gateway_terminal(&mut asm, plan.fallback, plan.dial_mode, dns_shadow)?;
     } else {
         asm.mov_imm(R0, 0)?;
         asm.exit()?;

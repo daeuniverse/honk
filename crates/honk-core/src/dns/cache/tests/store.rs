@@ -104,10 +104,65 @@ fn maximum_answer_is_admitted_and_same_key_oversize_preserves_it() {
     assert!(matches!(
         service.lookup_exact(&key, true),
         ExactLookup::Positive { entry, revision: current }
-            if entry.response.as_ref() == response.as_slice() && current == revision
+            if entry.response.as_ref() == response.as_slice() && current == revision.revision
     ));
     assert_eq!(service.len(), 1);
     assert_eq!(cache.retained_bytes(), 65_535);
+}
+
+#[tokio::test(start_paused = true)]
+async fn positive_identity_survives_negative_overlay_and_is_unique_across_caches() {
+    let key = CacheKey::for_test(
+        vec![0, 0, 1],
+        IngressProfile::Internal,
+        RequestScope::Upstream(UpstreamTag::new("default").expect("scope")),
+        OperationKind::Resolve,
+    );
+    let cache = DnsCache::new(1).service();
+    let other = DnsCache::new(1).service();
+    let epoch = cache.publication_epoch();
+    let response = make_test_response([192, 0, 2, 1], 300);
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    let stored = cache
+        .put_exact_if_current(epoch, key.clone(), response.clone(), 300, None)
+        .expect("first stored answer");
+    let other_stored = other
+        .put_exact_if_current(other.publication_epoch(), key.clone(), response, 300, None)
+        .expect("same key in a different cache");
+    assert_ne!(stored.revision, other_stored.revision);
+    assert_eq!(stored.expires_at, deadline);
+
+    let overlay = cache
+        .put_negative_if_current(epoch, key.clone(), 60, 2, None)
+        .expect("negative overlay");
+    assert!(matches!(
+        cache.lookup_exact(&key, true),
+        ExactLookup::Negative { .. }
+    ));
+    cache.insert_expired_negative_exact_for_test(key.clone(), 2);
+    tokio::time::advance(Duration::from_secs(5)).await;
+    let ExactLookup::Positive { entry, revision } = cache.lookup_exact(&key, true) else {
+        panic!("retained positive answer after the overlay expires");
+    };
+    assert_eq!(
+        revision, overlay,
+        "refresh must still use the current slot revision"
+    );
+    assert_eq!(entry.fresh.revision, stored.revision);
+    assert_eq!(entry.fresh.expires_at, deadline);
+
+    let refreshed = cache
+        .put_exact_if_current(
+            epoch,
+            key,
+            make_test_response([192, 0, 2, 1], 60),
+            60,
+            Some(revision),
+        )
+        .expect("refresh with the current slot revision");
+    assert_ne!(refreshed.revision, stored.revision);
+    assert!(refreshed.expires_at < deadline);
 }
 
 #[test]

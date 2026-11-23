@@ -184,6 +184,7 @@ pub struct RoutingPushPlan {
     pub(crate) rules: Vec<KernelRule>,
     pub(crate) facts: RoutingFactMaps,
     pub(crate) fallback: KernelAction,
+    pub(crate) dial_mode: DialMode,
     pub(crate) features: u32,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) policy_fingerprint: [u8; 32],
@@ -195,6 +196,7 @@ pub struct RoutingPushPlan {
 impl RoutingPushPlan {
     pub fn semantically_eq(&self, other: &Self) -> bool {
         self.fallback == other.fallback
+            && self.dial_mode == other.dial_mode
             && self.features == other.features
             && self.trace_enabled == other.trace_enabled
             && self.fingerprint == other.fingerprint
@@ -434,6 +436,7 @@ impl RoutingPushPlan {
             rules,
             facts,
             fallback,
+            dial_mode,
             features,
             fingerprint: hash.finalize().into(),
             policy_fingerprint: router.policy_fingerprint(),

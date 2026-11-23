@@ -109,13 +109,15 @@ impl HostPrograms {
         )?;
         Ok(Self {
             programs: Programs {
-                counters,
-                xsks,
+                queue_maps: Arc::new(ProgramQueueMaps {
+                    counters,
+                    xsks,
+                    queues: 1,
+                }),
                 discover,
                 data,
                 discover_id,
                 data_id,
-                queues: 1,
                 _gateway_fds: Vec::new(),
                 gateway_config: None,
             },
@@ -134,8 +136,8 @@ impl HostPrograms {
     /// Read the kernel's cold memory charge before the capture owner pins or admits these FDs.
     pub fn memory_bytes(&self) -> io::Result<usize> {
         [
-            self.programs.counters.as_raw_fd(),
-            self.programs.xsks.as_raw_fd(),
+            self.programs.queue_maps.counters.as_raw_fd(),
+            self.programs.queue_maps.xsks.as_raw_fd(),
             self.programs.discover.as_raw_fd(),
             self.programs.data.as_raw_fd(),
             self.terminal.as_raw_fd(),

@@ -272,6 +272,12 @@ mod storage {
 
     pub(super) const STALE_RETENTION: Duration = Duration::from_secs(3600);
 
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct FreshCacheEntry {
+        pub(crate) revision: u64,
+        pub(crate) expires_at: tokio::time::Instant,
+    }
+
     /// A cached DNS response entry.
     ///
     /// Contains the raw response bytes along with TTL metadata
@@ -280,11 +286,13 @@ mod storage {
     pub struct CachedEntry {
         /// Raw DNS response bytes (full wire-format message).
         pub response: Bytes,
-        /// Absolute wall-clock time after which this entry is stale.
+        /// Absolute monotonic time after which this entry is stale.
         pub expires_at: Instant,
         /// Minimum TTL from the DNS record set, in seconds.
         pub min_ttl: u32,
         pub(crate) strict_reusable: bool,
+        // A negative overlay changes the slot revision while retaining this positive.
+        pub(crate) fresh: FreshCacheEntry,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,6 +377,7 @@ pub use counters::CacheCounters;
 pub(crate) use key::{CacheKey, KeyIdentity, OperationKind};
 pub(crate) use service::PublicationEpoch;
 pub(crate) use service::{CacheSlot, DnsCacheService};
+pub(crate) use storage::FreshCacheEntry;
 pub use storage::{CachedEntry, NegativeCacheHit};
 pub(crate) use store::ExactLookup;
 

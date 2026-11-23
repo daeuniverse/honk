@@ -266,6 +266,21 @@ Core Direct 要求 `dial_mode: ip`；域名谓词使用 packet 入口 scope 内�
 
 Core 的输入上下文 FIB 契约拒绝非零 IPv6 flow label 及无法保持语义的路由器扩展头/options；Endpoint 支持 IPv6 不证明 Core 对这些组合具有等价授权。
 
+### XDP Endpoint DNS 投影
+
+`datapath.dns_projection` 是可选布尔值，仅适用于 `backend: xdp`、
+`direct: endpoint` 且至少将一个物理接口声明为 `lan` 的配置。省略或显式写
+`true` 都会启用 DNS 影子判定，写 `false` 可关闭。有效值变更需要重启。TC、
+TUN、XDP Core 和没有物理 LAN 的 XDP Endpoint 必须省略该字段，显式写任一
+布尔值均会被拒绝。跨合并分段或 include 重复声明，以及结构化输入中的显式
+`null` 也会被拒绝。
+
+影子判定使用同一逻辑 LAN realm 内接受的透明 DNS 应答，统计新流的
+`WouldPassDns` 次数。bond 成员共用 bond 的 realm，每个 VLAN 使用自己的
+realm，并沿用配置中的根接口角色。WAN 和 Host 均不为影子判定提供事实，
+独立 `dns.bind` 也不参与。数据包继续走既有 Endpoint 和静态 D1 路径。若
+可选的影子判定无法安全启动，honk 会记录告警并沿用这些数据包路径。
+
 ### XDP Host Endpoint
 
 捕获 Host 发起的 TCP/UDP 必须显式配置 `host` 块，并使用启用 `ebpf` 的构建。
@@ -345,8 +360,8 @@ routing {
 | `capture { ... }` | 必填，1–64 条已配置地址族内的规范 CIDR 网络。拒绝 host bits 及互相包含的冗余前缀；排序并去重。仅接受裸前缀，不接受键值条目或嵌套块。 |
 
 TUN 必须恰有一个 `tun` 块；TC/XDP 拒绝该块。TUN 拒绝 `interface`、
-`xsk_mode`、显式 `poll_mode`、`busy_poll`、`firewall`、非空 `nat` 及
-`direct: core`。未知字段以及
+`xsk_mode`、显式 `poll_mode`、`dns_projection`、`busy_poll`、`firewall`、
+非空 `nat` 及 `direct: core`。未知字段以及
 合并 sections/includes 后重复的标量/块均拒绝；结构化输入使用同一校验。
 这是新增的显式选择，既有配置不改变含义，无须 TUN 迁移。
 

@@ -315,8 +315,8 @@ fn kernel_native_destinations_and_metadata_counter_are_distinct() {
     selected(
         &mut b,
         1,
-        programs.counters.as_raw_fd(),
-        programs.xsks.as_raw_fd(),
+        programs.queue_maps.counters.as_raw_fd(),
+        programs.queue_maps.xsks.as_raw_fd(),
         true,
         true,
     );

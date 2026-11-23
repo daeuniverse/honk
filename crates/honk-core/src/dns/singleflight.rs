@@ -78,7 +78,12 @@ struct CounterSet {
     refreshes: AtomicU64,
 }
 
-pub(crate) type FlightResult = Result<Arc<ResponseTemplate>, Arc<DnsForwardError>>;
+pub(crate) struct FlightAnswer {
+    pub(crate) template: ResponseTemplate,
+    pub(crate) projection_expires_at: Option<tokio::time::Instant>,
+}
+
+pub(crate) type FlightResult = Result<Arc<FlightAnswer>, Arc<DnsForwardError>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct Singleflight {

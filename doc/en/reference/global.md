@@ -277,6 +277,24 @@ Core Direct requires `dial_mode: ip`; domain predicates use facts learned in the
 
 Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-specific extension/options execution it cannot preserve; Endpoint IPv6 support does not establish equivalent Core authority.
 
+### XDP Endpoint DNS projection
+
+`datapath.dns_projection` is an optional boolean for `backend: xdp` with
+`direct: endpoint` and at least one physical interface declared `lan`. Omission
+and `true` both enable DNS shadow evaluation. Set `false` to turn it off. A
+change to the effective value requires a restart. TC, TUN, XDP Core and XDP
+Endpoint without a physical LAN require omission. Either explicit boolean is
+rejected in those configurations. Duplicate declarations across merged sections
+or includes and explicit null in structured input are also rejected.
+
+Shadow evaluation uses accepted transparent DNS answers from the same logical
+LAN realm to count `WouldPassDns` decisions for new flows. A bond's members share
+the bond's realm, while each VLAN has its own realm and inherits the role of its
+configured root. WAN and Host supply no facts for this evaluation. Standalone
+`dns.bind` remains independent. Packet actions continue to follow Endpoint and
+static D1. If the optional evaluation cannot start safely, honk warns and
+continues with those packet actions.
+
 ### XDP Host Endpoint
 
 Host-originated TCP/UDP capture requires an explicit `host` block and a build with
@@ -362,8 +380,8 @@ routing {
 | `capture { ... }` | Required, 1–64 canonical CIDR networks in configured address families. Host bits and mutually containing redundant prefixes are rejected; entries are sorted and deduplicated. Only bare prefixes are accepted, without keyed entries or nested blocks. |
 
 TUN requires exactly one `tun` block; TC/XDP reject that block. TUN rejects
-`interface`, `xsk_mode`, explicit `poll_mode`, `busy_poll`, `firewall`, nonempty
-`nat`, and `direct: core`.
+`interface`, `xsk_mode`, explicit `poll_mode`, `dns_projection`, `busy_poll`,
+`firewall`, nonempty `nat`, and `direct: core`.
 Unknown fields and duplicate scalars/blocks reject across merged sections and
 includes. Structured input uses the same validation. This is an opt-in addition;
 existing configurations do not change meaning and need no TUN migration.

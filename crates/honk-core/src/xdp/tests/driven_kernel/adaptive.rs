@@ -922,8 +922,16 @@ async fn serve(
     let publication = plane.config_handle();
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
-    let (mut runtime, mut owner) =
-        start_runtime(plane, &config, &pins, &artifacts, admission, pname_support).await?;
+    let (mut runtime, mut owner) = start_runtime(
+        plane,
+        &config,
+        &pins,
+        &artifacts,
+        admission,
+        pname_support,
+        false,
+    )
+    .await?;
     let binding_failure = record_bindings(&runtime, &config, &namespace, &artifacts).err();
     let control = runtime.polling.test_control();
     let budget = runtime.polling.budget.as_ref().unwrap().clone();

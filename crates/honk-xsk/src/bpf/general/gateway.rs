@@ -1,5 +1,8 @@
 use super::*;
-use honk_ebpf_common::xdp_gateway::{FRAGMENT_TTL_NS, GatewayReason, HOLD_REFRESH_NS};
+use honk_ebpf_common::xdp_gateway::{
+    FRAGMENT_TTL_NS, GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS,
+    GatewayReason, HOLD_REFRESH_NS,
+};
 use honk_ebpf_common::{
     DATAPATH_FLAG_OFFLOAD_RULE_DIRECT, IpVersionType, L4ProtoType,
     ROUTING_INPUT_ALLOW_DIRECT_FINALITY, ROUTING_INPUT_MAC_PRESENT,
@@ -14,6 +17,7 @@ const JLT_X: u8 = 0xad;
 const JLE_X: u8 = 0xbd;
 const JLE_K: u8 = 0xb5;
 const CMPXCHG: i32 = 0xf1;
+const XCHG: i32 = 0xe1;
 const MAX_INSNS: usize = 1_000_000;
 const MAX_EXTENSION_HEADERS: usize = 8;
 const MAX_EXTENSION_BYTES: i32 = 256;
@@ -47,6 +51,12 @@ const QUOTE_AVAILABLE: i16 = -320;
 const CURSOR: i16 = -316;
 const SCRATCH_INPUT: i16 = 8;
 const SCRATCH_OUTPUT: i16 = 136;
+const _: () = assert!(
+    SCRATCH_OUTPUT as usize
+        + GATEWAY_DNS_BITMAP_OFFSET
+        + size_of::<honk_ebpf_common::DomainRouting>()
+        <= size_of::<[u64; 64]>()
+);
 
 #[derive(Clone, Copy)]
 struct Target(usize);
@@ -202,7 +212,7 @@ impl GatewayBuilder {
     fn finish(
         mut self,
         routing: &[aya_obj::generated::bpf_insn],
-        call: usize,
+        calls: impl Iterator<Item = usize>,
     ) -> io::Result<Program> {
         validate_routing(routing)?;
         let start = self.program.insns.len();
@@ -210,12 +220,14 @@ impl GatewayBuilder {
             .checked_add(routing.len())
             .filter(|n| *n <= MAX_INSNS)
             .ok_or_else(|| invalid_data("gateway instruction count exceeds limit"))?;
-        self.program.insns[call].imm = i32::try_from(
-            start
-                .checked_sub(call + 1)
-                .ok_or_else(|| invalid_data("invalid gateway routing call"))?,
-        )
-        .map_err(|_| invalid_data("gateway routing call exceeds i32"))?;
+        for call in calls {
+            self.program.insns[call].imm = i32::try_from(
+                start
+                    .checked_sub(call + 1)
+                    .ok_or_else(|| invalid_data("invalid gateway routing call"))?,
+            )
+            .map_err(|_| invalid_data("gateway routing call exceeds i32"))?;
+        }
         for instruction in routing {
             self.program.insns.push(Insn::new(
                 instruction.code,
@@ -756,6 +768,74 @@ fn conntrack(
     b.goto(error);
 }
 
+fn release_dns_scratch(b: &mut GatewayBuilder, double_exchange: bool) {
+    b.imm(1, 0);
+    if double_exchange {
+        // Hold busy across both exchanges. XCHG returns the old value in its source register.
+        b.imm(2, 1);
+        b.emit(ATOMIC_ADD_DW, 8, 2, 0, XCHG);
+    }
+    b.emit(ATOMIC_ADD_DW, 8, 1, 0, XCHG);
+}
+
+fn dns_shadow(
+    b: &mut GatewayBuilder,
+    dns: &crate::GatewayDnsMaps,
+    maps: &GatewayMaps,
+    data: bool,
+    new_flow: Target,
+    bad: Target,
+) -> usize {
+    // CT has released its reference; its tuple buffer is now private stack space for the DNS key.
+    let miss = b.target();
+    b.lookup(dns.epochs.as_raw_fd(), KEY);
+    b.jump(JEQ_K, 0, 0, 0, miss);
+    b.load(LDX_DW, 1, 0, 0);
+    b.jump(JEQ_K, 1, 0, 0, miss);
+    b.store(STX_DW, 10, TUPLE, 1);
+    b.load(LDX_W, 0, 10, KEY);
+    b.store(STX_W, 10, TUPLE + 8, 0);
+    b.word(TUPLE + 12, 0);
+    b.copy(10, TUPLE + 16, 10, KEY + 24, 16);
+    b.lookup(dns.facts.as_raw_fd(), TUPLE);
+    b.jump(JEQ_K, 0, 0, 0, miss);
+    b.mov(1, 0);
+    b.load(LDX_DW, 7, 1, 0);
+    b.copy(
+        8,
+        SCRATCH_OUTPUT + GATEWAY_DNS_BITMAP_OFFSET as i16,
+        1,
+        8,
+        32,
+    );
+    // R7 is callee-saved and contains the copied deadline. Neither read borrows a hash row again.
+    b.mov(1, 8);
+    b.add(1, i32::from(SCRATCH_INPUT));
+    b.mov(2, 8);
+    b.add(2, i32::from(SCRATCH_OUTPUT));
+    b.imm(3, GATEWAY_DNS_READY);
+    let call = b.emit(CALL, 0, 1, 0, 0);
+    release_dns_scratch(b, cfg!(target_arch = "aarch64"));
+    b.jump(JEQ_K, 0, 0, 0, new_flow);
+    b.jump(JNE_K, 0, 0, 1, bad);
+    // After the barrier only the invocation's stack, copied deadline, and independent epoch are live.
+    b.lookup(dns.epochs.as_raw_fd(), KEY);
+    b.jump(JEQ_K, 0, 0, 0, new_flow);
+    b.load(LDX_DW, 0, 0, 0);
+    b.load(LDX_DW, 1, 10, TUPLE);
+    b.jump(JNE_X, 0, 1, 0, new_flow);
+    b.helper(5);
+    b.jump(JLE_X, 7, 0, 0, new_flow);
+    if data {
+        b.stat(maps, GatewayReason::WouldPassDns);
+    }
+    b.goto(new_flow);
+    b.bind(miss);
+    b.emit(ST_DW, 8, 0, 0, 0);
+    b.goto(new_flow);
+    call
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(in crate::bpf) fn build(
     capture: &GeneralCapture,
@@ -1142,12 +1222,21 @@ pub(in crate::bpf) fn build(
     b.mov(2, 8);
     b.add(2, i32::from(SCRATCH_OUTPUT));
     let routing_call = b.emit(CALL, 0, 1, 0, 0);
+    let dns_path = gateway.dns.map(|dns| {
+        let target = b.target();
+        b.jump(JEQ_K, 0, 0, GATEWAY_ROUTE_NEED_DNS, target);
+        (dns, target)
+    });
     b.emit(ST_DW, 8, 0, 0, 0);
     b.jump(JEQ_K, 0, 0, 1, d1_pass);
     b.jump(JNE_K, 0, 0, 0, bad);
     b.goto(new_flow);
     b.bind(d1_pass);
     b.reason(GatewayReason::PassD1, pass);
+    let dns_call = dns_path.map(|(dns, target)| {
+        b.bind(target);
+        dns_shadow(&mut b, dns, maps, data, new_flow, bad)
+    });
     b.bind(new_flow);
     if data {
         b.helper(5);
@@ -1265,12 +1354,51 @@ pub(in crate::bpf) fn build(
     b.bind(drop);
     b.imm(0, XDP_DROP);
     b.emit(EXIT, 0, 0, 0, 0);
-    b.finish(gateway.routing, routing_call)
+    b.finish(
+        gateway.routing,
+        std::iter::once(routing_call).chain(dns_call),
+    )
+    .map_err(|error| {
+        if gateway.dns.is_some() {
+            crate::bpf::gateway::dns_load_error("verifier_budget", error)
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn dns_bytecode_retains_busy_until_the_final_exchange() {
+        for (double_exchange, expected) in [(false, &[0][..]), (true, &[1, 0][..])] {
+            let mut builder = GatewayBuilder::new();
+            release_dns_scratch(&mut builder, double_exchange);
+            let mut registers = [None; 11];
+            let mut busy = 1;
+            let mut writes = Vec::new();
+            for insn in builder.program.insns {
+                let dst = usize::from(insn.regs & 15);
+                let src = usize::from(insn.regs >> 4);
+                match insn.code {
+                    MOV_K => registers[dst] = Some(insn.imm),
+                    ATOMIC_ADD_DW => {
+                        assert_eq!((dst, insn.off, insn.imm), (8, 0, XCHG));
+                        let register = registers[src]
+                            .as_mut()
+                            .expect("uninitialized exchange source");
+                        std::mem::swap(&mut busy, register);
+                        writes.push(busy);
+                    }
+                    _ => panic!("unexpected DNS release instruction {insn:?}"),
+                }
+            }
+            assert_eq!(writes, expected);
+        }
+    }
 
     #[test]
     fn conntrack_calls_keep_independent_module_offsets() {

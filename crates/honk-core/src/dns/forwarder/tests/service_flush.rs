@@ -27,14 +27,35 @@ async fn explicit_ingress_profiles_do_not_share_cache_entries() {
     let forwarder = DnsForwarder::new(upstream.clone(), test_cache(), test_router());
     let query = make_a_query();
 
-    forwarder
-        .resolve_with_profile(&query, IngressProfile::Internal)
+    let resolve = |ingress| {
+        forwarder.resolve_outcome_with_context_and_profile(&query, DnsRequestMeta::EMPTY, ingress)
+    };
+    let internal = resolve(IngressProfile::Internal)
         .await
-        .expect("internal response");
-    forwarder
-        .resolve_with_profile(&query, IngressProfile::Api)
+        .expect("internal response")
+        .projection_lifetime()
+        .expect("internal deadline");
+    let api = resolve(IngressProfile::Api)
         .await
-        .expect("API response");
+        .expect("API response")
+        .projection_lifetime()
+        .expect("API deadline");
+    assert!(internal.source.cache_revision().is_some());
+    assert!(api.source.cache_revision().is_some());
+    assert_ne!(
+        internal.source.cache_revision(),
+        api.source.cache_revision()
+    );
+    let hit = resolve(IngressProfile::Internal)
+        .await
+        .expect("internal cache hit")
+        .projection_lifetime()
+        .expect("internal cached deadline");
+    assert_eq!(
+        hit.source.cache_revision(),
+        internal.source.cache_revision()
+    );
+    assert_eq!(hit.expires_at, internal.expires_at);
 
     assert_eq!(upstream.call_count.load(Ordering::SeqCst), 2);
 }

@@ -254,12 +254,19 @@ impl DnsController {
         ip: std::net::IpAddr,
         router: &crate::routing::Router,
         generation: u64,
-    ) -> anyhow::Result<Option<honk_ebpf_common::DomainRouting>> {
-        if !self.owns_packet_scope(scope) {
-            return Ok(None);
-        }
+    ) -> anyhow::Result<crate::dns::projection::PacketDomainBitmap> {
         self.routing_projection
-            .packet_bitmap(scope, ip, router, generation)
+            .packet_domain_bitmap(scope, ip, router, generation)
+    }
+
+    pub(in crate::control) fn hot_fill_packet_domain(
+        &self,
+        facts: crate::dns::projection::PacketDomainBitmap,
+    ) {
+        #[cfg(target_os = "linux")]
+        self.routing_projection.hot_fill_packet_domain(facts);
+        #[cfg(not(target_os = "linux"))]
+        let _ = facts;
     }
 
     fn owns_packet_scope(&self, scope: ScopeId) -> bool {
@@ -473,31 +480,18 @@ impl DnsController {
         } else {
             match (outcome.status(), outcome.response_class(), family) {
                 (OutcomeStatus::Accepted, ResponseClass::Positive, Some(family)) => {
-                    // Uncacheable does not mean the accepted address has no routing lifetime.
-                    let advertised_ttl = if outcome.expiry().is_cacheable() {
-                        outcome.expiry().ttl()
-                    } else {
-                        Duration::from_secs(u64::from(crate::dns::forwarder::extract_min_ttl(
-                            outcome.reusable(),
-                        )))
-                    };
-                    let expires_at = observed_at + advertised_ttl;
-                    if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
-                        return projection.try_submit_cache_hit(
-                            scope,
-                            snapshot,
-                            domain,
-                            family,
-                            outcome.answer_ips(),
-                            expires_at,
-                        );
-                    }
-                    ProjectionObservation::Positive {
+                    let lifetime = outcome.routing_lifetime(observed_at);
+                    let positive = ProjectionObservation::Positive {
                         domain,
                         family,
                         ips: outcome.answer_ips(),
-                        expires_at,
+                        expires_at: lifetime.expires_at,
+                        source: lifetime.source,
+                    };
+                    if outcome.provenance() == crate::dns::outcome::Provenance::Cache {
+                        return projection.try_submit_cache_hit(scope, snapshot, positive);
                     }
+                    positive
                 }
                 (OutcomeStatus::Accepted, ResponseClass::Nodata, Some(family)) => {
                     ProjectionObservation::Clear { domain, family }

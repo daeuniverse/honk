@@ -95,6 +95,7 @@ fn positive_fact<'a>(name: &'a str, ips: &'a [IpAddr]) -> ProjectionObservation<
         family: IpVersion::V4,
         ips,
         expires_at: tokio::time::Instant::now() + Duration::from_secs(30),
+        source: Default::default(),
     }
 }
 
@@ -556,6 +557,7 @@ async fn cached_core_rechecks_original_expiry_at_the_writer_boundary() {
             family: IpVersion::V4,
             ips: &[ip],
             expires_at: tokio::time::Instant::now() + Duration::from_secs(2),
+            source: Default::default(),
         },
     );
     core.after_fact_read = Some(Box::new(|| {

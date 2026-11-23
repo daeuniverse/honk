@@ -308,12 +308,14 @@ async fn start_runtime(
     artifacts: &Path,
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
+    defer_gateway: bool,
 ) -> anyhow::Result<(Runtime, PacketEndpointOwner)> {
     let (polling_publication, process_polling) =
         plane.polling_runtime().expect("explicit XDP fixture");
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
     let active_plan = plane.active_routing_plan_handle();
+    let diagnostics_generation = plane.diagnostics_handle();
     let prepared = prepare(&plane, config, pins, Arc::clone(&admission)).await?;
     #[cfg(feature = "ebpf")]
     let host = prepared.host;
@@ -465,46 +467,31 @@ async fn start_runtime(
     )
     .await?;
     for device in &mut runtime.devices {
+        let id = device.publish_programs(
+            runtime.gateway.as_deref(),
+            runtime.topology.get_ref().ipv4_broadcasts(),
+        )?;
         std::fs::write(
             artifacts.join(format!("driven-runtime.{}.data-id", device.info.name)),
-            device.programs.data_prog_id().to_string(),
+            id.to_string(),
         )?;
-        device
-            .attachment
-            .as_ref()
-            .context("owned XDP link")?
-            .replace(device.programs.discover_fd(), device.programs.data_fd())?;
-        if let Some(publisher) = &runtime.gateway {
-            publisher.register(
-                device.info.ifindex,
-                device.attachment.take().context("owned XDP link")?,
-                Arc::clone(&device.programs),
-                GatewayReload {
-                    capture: device.capture.clone(),
-                    queues: device.info.queues.last().copied().context("RX queues")? + 1,
-                    ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
-                },
-            )?;
-        }
-        device.active = true;
     }
-    runtime.diagnostics.lifecycle(Lifecycle::Active);
     let topology = runtime.admit_final_topology()?;
     ensure!(topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts());
     // SAFETY: production and the fixture retain the watcher's stable descriptor.
     runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
-    for device in &runtime.devices {
-        runtime
-            .topology
-            .get_mut()
-            .expect_program(device.info.ifindex, device.programs.data_prog_id());
+    if runtime.gateway.is_none() {
+        for device in &runtime.devices {
+            runtime.topology.get_mut().expect_program(
+                device.info.ifindex,
+                device.unpublished_programs()?.data_prog_id(),
+            );
+        }
     }
-    if let Some(publisher) = &runtime.gateway {
+    if !defer_gateway && let Some(publisher) = &runtime.gateway {
         let mut backend = backend.write().await;
         let plan = active_plan.read().clone();
-        if plan.policy_fingerprint != publisher.fingerprint() {
-            publisher.publish(&plan)?;
-        }
+        publisher.prepare_start(&plan)?;
         backend
             .userspace_mut()?
             .install_gateway(Some(Arc::clone(publisher)))?;
@@ -544,13 +531,40 @@ async fn start_runtime(
         }
         host.admit(&runtime.pname_support)?;
     }
-    runtime.activate_capture(
-        &shutdown,
-        config
-            .datapath
-            .as_ref()
-            .and_then(|datapath| datapath.direct),
-    )?;
+    if defer_gateway {
+        return Ok((runtime, owner));
+    }
+    let direct = config
+        .datapath
+        .as_ref()
+        .and_then(|datapath| datapath.direct);
+    if let Some(publisher) = &runtime.gateway {
+        let mut backend = backend.write().await;
+        runtime.activate_capture(&shutdown, direct)?;
+        backend.userspace_mut()?.activate_gateway_start(
+            publisher,
+            active_plan.read().fingerprint,
+            diagnostics_generation.read().generation,
+        );
+        publisher.validate_programs(|programs| {
+            for &(ifindex, id) in programs {
+                if let Some(device) = runtime
+                    .devices
+                    .iter()
+                    .find(|device| device.info.ifindex == ifindex)
+                {
+                    std::fs::write(
+                        artifacts.join(format!("driven-runtime.{}.data-id", device.info.name)),
+                        id.to_string(),
+                    )?;
+                }
+            }
+            Ok(())
+        })?;
+    } else {
+        runtime.activate_capture(&shutdown, direct)?;
+    }
+    runtime.diagnostics.lifecycle(Lifecycle::Active);
     Ok((runtime, owner))
 }
 
@@ -717,7 +731,8 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         let publication = plane.config_handle();
         let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_intent();
-        let (mut runtime, mut owner) = start_runtime(plane, &config, &pins, &artifacts, admission, pname_support).await?;
+        let (mut runtime, mut owner) =
+            start_runtime(plane, &config, &pins, &artifacts, admission, pname_support, false).await?;
         let authority = runtime.core.as_ref().unwrap().authority();
         let acquire = || authority.read_policy();
         let reader = None;

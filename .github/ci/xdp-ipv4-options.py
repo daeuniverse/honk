@@ -339,8 +339,8 @@ libc.syscall.restype = C.c_long
 
 def bpf(operation, attr):
     require_live_namespace()
-    assert os.uname().machine == 'x86_64', 'this BPF syscall fixture is x86_64 only'
-    result = libc.syscall(321, operation, C.byref(attr), C.sizeof(attr))
+    number = {'x86_64': 321, 'aarch64': 280}[os.uname().machine]
+    result = libc.syscall(number, operation, C.byref(attr), C.sizeof(attr))
     if result < 0:
         raise OSError(C.get_errno(), os.strerror(C.get_errno()))
     return result

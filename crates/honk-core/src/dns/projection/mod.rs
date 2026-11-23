@@ -8,6 +8,7 @@ use honk_datapath::ScopeId;
 use honk_ebpf_common::DomainRouting;
 use honk_outbound::alive::IpVersion;
 
+use crate::dns::outcome::ProjectionSource;
 use crate::ebpf::PolicyBackend;
 use crate::routing::Router;
 
@@ -76,6 +77,12 @@ mod lifecycle {
         }
     }
 }
+#[cfg(target_os = "linux")]
+mod gateway;
+#[cfg(target_os = "linux")]
+use crate::xdp::gateway::dns::GatewayDnsBank;
+#[cfg(target_os = "linux")]
+pub(crate) use gateway::GatewayDnsFill;
 mod reconcile;
 mod state;
 mod worker;
@@ -130,6 +137,7 @@ pub(crate) enum ProjectionObservation<'a> {
         family: IpVersion,
         ips: &'a [IpAddr],
         expires_at: tokio::time::Instant,
+        source: ProjectionSource,
     },
     Clear {
         domain: &'a str,
@@ -207,6 +215,13 @@ impl FactStamp {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct PacketDomainBitmap {
+    pub(crate) bitmap: Option<DomainRouting>,
+    #[cfg(target_os = "linux")]
+    fill: Option<(Arc<GatewayDnsBank>, GatewayDnsFill)>,
+}
+
 /// Synchronous fact mutation serialization; never held across an await.
 pub(crate) struct PacketFacts<'a>(parking_lot::MutexGuard<'a, DesiredState>);
 
@@ -267,6 +282,9 @@ impl PreparedProjectionPublication<'_> {
         published: Option<BTreeMap<IpAddr, DomainRouting>>,
     ) {
         let mut state = self.projection.state.lock();
+        if snapshot.generation() < state.snapshot.generation() {
+            return;
+        }
         if let Some(published) = published {
             // A reload pre-fills the map outside the incremental worker. Record
             // that exact set, including owners that expired while it loaded.
@@ -274,8 +292,12 @@ impl PreparedProjectionPublication<'_> {
             state.dirty_ips.clear();
             state.retries.clear();
         }
+        #[cfg(target_os = "linux")]
+        let previous = state.close_gateway_dns();
         state.update_snapshot(&snapshot);
         drop(state);
+        #[cfg(target_os = "linux")]
+        drop(previous);
         self.projection.notify_worker();
     }
 }
@@ -383,6 +405,27 @@ impl RoutingProjection {
         self.state.try_lock().map(PacketFacts)
     }
 
+    pub(crate) fn packet_domain_bitmap(
+        &self,
+        scope: ScopeId,
+        ip: IpAddr,
+        router: &Router,
+        generation: u64,
+    ) -> anyhow::Result<PacketDomainBitmap> {
+        let mut state = self.state.lock();
+        if !state.owns_packet_scope(scope) {
+            return Ok(PacketDomainBitmap::default());
+        }
+        check_packet_authority(&state, router, generation)?;
+        let bitmap = state.try_bitmap(scope, ip)?;
+        Ok(PacketDomainBitmap {
+            bitmap,
+            #[cfg(target_os = "linux")]
+            fill: state.gateway_packet_fill(scope, ip, bitmap),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn packet_bitmap(
         &self,
         scope: ScopeId,
@@ -403,7 +446,19 @@ impl RoutingProjection {
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) -> bool {
-        self.try_mutate(scope, snapshot.generation(), |state| {
+        self.submit_observation(scope, snapshot, observation, false)
+    }
+
+    fn submit_observation(
+        &self,
+        scope: ScopeId,
+        snapshot: &Arc<RoutingProjectionSnapshot>,
+        observation: ProjectionObservation<'_>,
+        cache_hit: bool,
+    ) -> bool {
+        #[cfg(target_os = "linux")]
+        let mut export = None;
+        let submitted = self.try_mutate(scope, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
@@ -414,13 +469,34 @@ impl RoutingProjection {
                 );
                 return 0;
             }
+            let now = tokio::time::Instant::now();
+            // A delayed waiter may outlive both its template and the flight that replaced it.
+            if matches!(observation, ProjectionObservation::Positive { source: ProjectionSource::SharedFlight, expires_at, .. } if expires_at <= now) {
+                return state.observe(scope, ProjectionObservation::Retain, now);
+            }
             // A same-set positive changes expiry without a structure bump;
             // drop the hint so it cannot coalesce against the old expiry.
             if let ProjectionObservation::Positive { domain, family, .. } = observation {
                 self.hints[family as usize].remove(domain);
             }
-            state.observe(scope, observation, tokio::time::Instant::now())
-        })
+            let evictions = if cache_hit {
+                state.observe_cache_hit(scope, observation, now)
+            } else {
+                state.observe(scope, observation, now)
+            };
+            #[cfg(target_os = "linux")]
+            if let ProjectionObservation::Positive { domain, family, .. } = observation {
+                export = state.gateway_answer_fills(scope, domain, family, now);
+            }
+            evictions
+        });
+        #[cfg(target_os = "linux")]
+        if let Some((bank, rows)) = export {
+            for row in rows.into_iter().flatten() {
+                self.write_gateway_dns(&bank, row);
+            }
+        }
+        submitted
     }
 
     /// Submits a DNS-cache observation. Only HOST refreshes may coalesce within
@@ -430,23 +506,21 @@ impl RoutingProjection {
         &self,
         scope: ScopeId,
         snapshot: &Arc<RoutingProjectionSnapshot>,
-        domain: &str,
-        family: IpVersion,
-        ips: &[IpAddr],
-        expires_at: tokio::time::Instant,
+        observation: ProjectionObservation<'_>,
     ) -> bool {
         if scope != ScopeId::HOST {
-            return self.try_submit(
-                scope,
-                snapshot,
-                ProjectionObservation::Positive {
-                    domain,
-                    family,
-                    ips,
-                    expires_at,
-                },
-            );
+            return self.submit_observation(scope, snapshot, observation, true);
         }
+        let ProjectionObservation::Positive {
+            domain,
+            family,
+            ips,
+            expires_at,
+            ..
+        } = observation
+        else {
+            return self.try_submit(scope, snapshot, observation);
+        };
         let now = tokio::time::Instant::now();
         let hints = &self.hints[family as usize];
         let structure = self.structure.load(Ordering::Acquire);
@@ -458,6 +532,7 @@ impl RoutingProjection {
                 && now.saturating_duration_since(hint.applied_at) < CACHE_HIT_COALESCE
                 && expires_at <= hint.expires_at
                 && expires_at + CACHE_HIT_COALESCE >= hint.expires_at
+                && hint.ips.len() == ips.len()
                 && state::same_address_set(hint.ips.iter(), ips)
         });
         if coalesced {
@@ -471,16 +546,7 @@ impl RoutingProjection {
                 return 0;
             }
             let applied_at = tokio::time::Instant::now();
-            let evicted = state.observe(
-                scope,
-                ProjectionObservation::Positive {
-                    domain,
-                    family,
-                    ips,
-                    expires_at,
-                },
-                applied_at,
-            );
+            let evicted = state.observe(scope, observation, applied_at);
             let structure = state.structure.load(Ordering::Acquire);
             if self.hints_epoch.swap(structure, Ordering::Relaxed) != structure {
                 for family_hints in &self.hints {
@@ -526,6 +592,8 @@ impl RoutingProjection {
     }
 
     pub(crate) async fn shutdown(&self, timeout: Duration) {
+        #[cfg(target_os = "linux")]
+        self.close_gateway_dns();
         self.wake.lock().take();
         let handle = self.worker.lock().take();
         if let Some(mut handle) = handle {
@@ -573,7 +641,17 @@ impl RoutingProjection {
             // worker batch. Reload commits snapshots under its own fence, so
             // a submission only gets here outside one, briefly.
             let exclusive = self.publication_fence.write();
-            let delta = operation(&mut self.state.lock());
+            let mut state = self.state.lock();
+            #[cfg(target_os = "linux")]
+            let retired = if generation > state.snapshot.generation() {
+                state.close_gateway_dns()
+            } else {
+                None
+            };
+            let delta = operation(&mut state);
+            drop(state);
+            #[cfg(target_os = "linux")]
+            drop(retired);
             drop(exclusive);
             self.publication_released.notify_waiters();
             delta
@@ -662,6 +740,7 @@ impl ProjectionReplacementBenchmark {
                 family: state::family_of(self.ip),
                 ips: std::slice::from_ref(&self.ip),
                 expires_at: self.now + Duration::from_secs(300),
+                source: ProjectionSource::Fresh,
             },
             self.now,
         );
@@ -671,6 +750,8 @@ impl ProjectionReplacementBenchmark {
 
 impl Drop for RoutingProjection {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        self.state.get_mut().close_gateway_dns();
         self.wake.get_mut().take();
         if let Some(handle) = self.worker.get_mut().take() {
             handle.abort();

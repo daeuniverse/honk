@@ -49,6 +49,107 @@ fn bond_interface_with_auto_round_trips_and_requires_restart() {
 }
 
 #[test]
+fn dns_projection_is_strict_and_compares_effective_restart_identity() {
+    use honk_config::parser::parse_dae_config;
+    for (settings, supported) in [
+        (
+            "backend: xdp\ndirect: endpoint\ninterface { lan0: lan }",
+            true,
+        ),
+        (
+            "backend: xdp\ndirect: endpoint\ninterface {\nlan0: lan\nwan0: wan\n}\nhost {\nxsk_mode: copy\ninterface { host0 }\n}",
+            true,
+        ),
+        ("backend: tc", false),
+        (
+            "backend: tun\ndirect: endpoint\ntun {\nname: honk0\naddress4: 198.18.0.1/32\ntable: 202\nrule_priority: 10000\ncapture { 0.0.0.0/0 }\n}",
+            false,
+        ),
+        ("backend: xdp\ndirect: core\ninterface { lan0: lan }", false),
+        (
+            "backend: xdp\ndirect: endpoint\ninterface { wan0: wan }",
+            false,
+        ),
+        (
+            "backend: xdp\ndirect: endpoint\nhost {\nxsk_mode: copy\ninterface { host0 }\n}",
+            false,
+        ),
+    ] {
+        let source = |claim: &str| format!("datapath {{\n{settings}\n{claim}\n}}");
+        let config = parse_dae_config(&source("")).unwrap();
+        let omitted = config.datapath.as_ref().unwrap();
+        assert_eq!(omitted.dns_projection, None);
+        assert_eq!(omitted.effective_dns_projection(), supported, "{settings}");
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert!(serialized["datapath"].get("dns_projection").is_none());
+        let round_trip = Config::from_json_str(&serialized.to_string()).unwrap();
+        round_trip.validate().unwrap();
+        assert_eq!(round_trip.datapath, config.datapath);
+
+        for enabled in [true, false] {
+            let mut structured = serialized.clone();
+            structured["datapath"]["dns_projection"] = enabled.into();
+            let decoded = Config::from_json_str(&structured.to_string()).unwrap();
+            let dae = parse_dae_config(&source(&format!("dns_projection: {enabled}")));
+            assert_eq!(dae.is_ok(), supported, "{settings}");
+            assert_eq!(decoded.validate().is_ok(), supported, "{settings}");
+            let configured = decoded.datapath.as_ref().unwrap();
+            assert_eq!(configured.dns_projection, Some(enabled));
+            assert_eq!(configured.effective_dns_projection(), supported && enabled);
+            if supported {
+                assert_eq!(dae.unwrap().datapath, decoded.datapath);
+                assert_eq!(omitted.same_device_setup(configured), enabled);
+                assert_eq!(configured.same_device_setup(omitted), enabled);
+                assert_eq!(
+                    serde_json::to_value(configured).unwrap()["dns_projection"],
+                    enabled
+                );
+            }
+        }
+        assert!(parse_dae_config(&source("dns_projection: null")).is_err());
+        let mut with_null = serialized;
+        with_null["datapath"]["dns_projection"] = serde_json::Value::Null;
+        assert!(Config::from_json_str(&with_null.to_string()).is_err());
+    }
+    assert!(
+        Config::from_json_str(
+            r#"{"datapath":{"backend":"xdp","direct":"endpoint","interfaces":[{"name":"lan0","role":"lan"}],"dns_projection":true,"dns_projection":false}}"#,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn dns_projection_rejections_point_to_the_included_claim() {
+    use honk_config::parser::parse_dae_config_file_with_detailed_diagnostics;
+
+    let directory = tempfile::tempdir().unwrap();
+    let entry = directory.path().join("main.dae");
+    let child = directory.path().join("child.dae");
+    std::fs::write(&child, "datapath {\n dns_projection: false\n}").unwrap();
+    for settings in [
+        "backend: xdp\ndirect: endpoint\ninterface { lan0: lan }\ndns_projection: true",
+        "backend: xdp\ndirect: endpoint\ninterface { wan0: wan }",
+    ] {
+        std::fs::write(
+            &entry,
+            format!("include {{ child.dae }}\ndatapath {{\n{settings}\n}}"),
+        )
+        .unwrap();
+        let error =
+            parse_dae_config_file_with_detailed_diagnostics(&entry, &mut Vec::new()).unwrap_err();
+        let diagnostic = error.diagnostic;
+        assert_eq!(diagnostic.setting.to_string(), "datapath.dns_projection");
+        assert_eq!(diagnostic.line, Some(2));
+        let sources = diagnostic.source.sources().metadata();
+        assert_eq!(
+            sources[diagnostic.source.index()].path.as_deref(),
+            Some(child.canonicalize().unwrap().as_path())
+        );
+    }
+}
+
+#[test]
 fn workers_are_strict_xdp_presence_and_restart_identity() {
     let source = |setting: &str| {
         format!(

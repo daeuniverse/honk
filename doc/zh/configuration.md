@@ -49,7 +49,7 @@ include {
 
 入口文件自身的分段始终最先合并，不受 `include` 块位置影响；之后依次合并每个被包含文件及其后代。后出现的标量键覆盖先前值。节点、订阅、组、DNS 上游、固定 TTL 与路由规则等集合条目按合并顺序追加。
 
-严格的 `datapath` 配置段不采用标量覆盖合并：在所有合并的分段中（包括被包含文件），`backend`、`direct`、`xsk_mode`、`interface`、`firewall`、`nat` 各最多声明一次。重复声明会导致配置被拒绝，而非覆盖或追加。
+严格的 `datapath` 配置段不采用标量覆盖合并。每个配置项或子块（包括 `dns_projection`）在所有合并分段和被包含文件中最多声明一次。
 
 XDP Endpoint 网关配置逻辑 LAN 接口（允许带地址的以太网接口或 bond），也可为每个成员选择 Auto：
 
@@ -68,6 +68,8 @@ routing {
 ```
 
 只有该地址的本机 listener 应接收 53 流量时才需要 DNS 规则，并须放在域名规则之前。见[网关准入与限制](./design/datapath.md#full-xdp-启动)。
+
+物理 LAN XDP Endpoint 默认启用 DNS 影子判定，统计 `WouldPassDns` 次数，数据包仍按既有动作处理。若要关闭，在 `datapath` 中设置 `dns_projection: false` 后重启。只有启用了物理 LAN XDP Endpoint 捕获的配置才接受该字段。详见 [DNS 投影参考](./reference/global.md#xdp-endpoint-dns-投影)。
 
 ## 运行时数据目录
 

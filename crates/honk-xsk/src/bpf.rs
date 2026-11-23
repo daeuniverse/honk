@@ -4,6 +4,7 @@ use std::net::Ipv4Addr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aya_obj::btf::{Btf, BtfKind};
@@ -204,25 +205,39 @@ fn map_attr(fd: BorrowedFd<'_>, key: &u32, value: u64) -> MapElemAttr {
 
 struct GatewayProgramConfig {
     capture: crate::capture::GeneralCapture,
-    queues: u32,
     ipv4_broadcasts: Vec<Ipv4Addr>,
 }
 
-pub struct Programs {
+/// Queue registrations and capture counters survive replacement of either XDP program.
+pub struct ProgramQueueMaps {
     counters: OwnedFd,
     xsks: OwnedFd,
+    queues: u32,
+}
+
+pub struct Programs {
+    queue_maps: Arc<ProgramQueueMaps>,
     discover: OwnedFd,
     data: OwnedFd,
     discover_id: u32,
     data_id: u32,
-    queues: u32,
     _gateway_fds: Vec<OwnedFd>,
     gateway_config: Option<std::sync::Arc<GatewayProgramConfig>>,
 }
 
 impl Programs {
+    pub fn queue_maps(&self) -> &Arc<ProgramQueueMaps> {
+        &self.queue_maps
+    }
+
     pub fn object_fds(&self) -> [BorrowedFd<'_>; 4] {
-        [&self.counters, &self.xsks, &self.discover, &self.data].map(AsFd::as_fd)
+        [
+            &self.queue_maps.counters,
+            &self.queue_maps.xsks,
+            &self.discover,
+            &self.data,
+        ]
+        .map(AsFd::as_fd)
     }
 
     pub fn load_general_gateway(
@@ -243,13 +258,15 @@ impl Programs {
         }
         let config = std::sync::Arc::new(GatewayProgramConfig {
             capture: capture.clone(),
-            queues,
             ipv4_broadcasts: ipv4_broadcasts.to_vec(),
         });
         Self::load_gateway_with_maps(
             config,
-            create_map(2, 8, queues + 4, b"honk_xdp_count")?,
-            create_map(17, 4, queues, b"honk_xdp_xsks")?,
+            Arc::new(ProgramQueueMaps {
+                counters: create_map(2, 8, queues + 4, b"honk_xdp_count")?,
+                xsks: create_map(17, 4, queues, b"honk_xdp_xsks")?,
+                queues,
+            }),
             gateway,
         )
     }
@@ -261,16 +278,14 @@ impl Programs {
             .ok_or_else(|| invalid_data("not a gateway program"))?;
         Self::load_gateway_with_maps(
             std::sync::Arc::clone(config),
-            self.counters.try_clone()?,
-            self.xsks.try_clone()?,
+            Arc::clone(&self.queue_maps),
             gateway,
         )
     }
 
     fn load_gateway_with_maps(
         config: std::sync::Arc<GatewayProgramConfig>,
-        counters: OwnedFd,
-        xsks: OwnedFd,
+        queue_maps: Arc<ProgramQueueMaps>,
         gateway: gateway::GatewayLoad<'_>,
     ) -> io::Result<Self> {
         let retained = gateway.validate_and_retain()?;
@@ -293,9 +308,9 @@ impl Programs {
             let mut program = general::build_gateway(
                 capture,
                 &config.ipv4_broadcasts,
-                config.queues,
-                counters.as_raw_fd(),
-                xsks.as_raw_fd(),
+                queue_maps.queues,
+                queue_maps.counters.as_raw_fd(),
+                queue_maps.xsks.as_raw_fd(),
                 data,
                 vlan_kfunc,
                 &gateway,
@@ -306,7 +321,8 @@ impl Programs {
                 .as_ref()
                 .map(OwnedFd::try_clone)
                 .transpose()?;
-            load_program(
+            program.dns_shadow = gateway.dns.is_some();
+            let (fd, id) = load_program(
                 &program,
                 if data {
                     b"honk_gw_data"
@@ -314,18 +330,35 @@ impl Programs {
                     b"honk_gw_boot"
                 },
                 &mut log,
-            )
+            )?;
+            if let Some(dns) = gateway.dns {
+                dns.validate_program(fd.as_fd(), id)?;
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let text = std::ffi::CStr::from_bytes_until_nul(&log)
+                        .ok()
+                        .and_then(|s| s.to_str().ok());
+                    if let Some(stats) = text
+                        .and_then(|s| s.lines().rev().find(|line| line.starts_with("processed ")))
+                    {
+                        tracing::debug!(
+                            program_id = id,
+                            data,
+                            stats,
+                            "gateway DNS shadow verifier"
+                        );
+                    }
+                }
+            }
+            Ok((fd, id))
         };
         let (discover, discover_id) = build(false)?;
         let (data, data_id) = build(true)?;
         Ok(Self {
-            counters,
-            xsks,
+            queue_maps,
             discover,
             data,
             discover_id,
             data_id,
-            queues: config.queues,
             _gateway_fds: retained,
             gateway_config: Some(config),
         })
@@ -392,13 +425,15 @@ impl Programs {
             &mut log,
         )?;
         Ok(Self {
-            counters,
-            xsks,
+            queue_maps: Arc::new(ProgramQueueMaps {
+                counters,
+                xsks,
+                queues,
+            }),
             discover,
             data,
             discover_id,
             data_id,
-            queues,
             _gateway_fds: Vec::new(),
             gateway_config: None,
         })
@@ -442,13 +477,15 @@ impl Programs {
             &mut log,
         )?;
         Ok(Self {
-            counters,
-            xsks,
+            queue_maps: Arc::new(ProgramQueueMaps {
+                counters,
+                xsks,
+                queues,
+            }),
             discover,
             data,
             discover_id,
             data_id,
-            queues,
             _gateway_fds: Vec::new(),
             gateway_config: None,
         })
@@ -471,6 +508,24 @@ impl Programs {
     }
 
     pub fn counters(&self) -> io::Result<CaptureCounters> {
+        self.queue_maps.counters()
+    }
+
+    pub fn metadata_failures(&self) -> io::Result<u64> {
+        self.queue_maps.metadata_failures()
+    }
+
+    pub fn insert_xsk(&self, queue: u32, fd: BorrowedFd<'_>) -> io::Result<()> {
+        self.queue_maps.insert_xsk(queue, fd)
+    }
+
+    pub fn delete_xsk(&self, queue: u32) -> io::Result<()> {
+        self.queue_maps.delete_xsk(queue)
+    }
+}
+
+impl ProgramQueueMaps {
+    fn counters(&self) -> io::Result<CaptureCounters> {
         let mut per_queue = Vec::with_capacity(self.queues as usize);
         for queue in 0..self.queues {
             per_queue.push(self.counter(queue)?);
@@ -498,7 +553,7 @@ impl Programs {
         Ok(value)
     }
 
-    pub fn insert_xsk(&self, queue: u32, fd: BorrowedFd<'_>) -> io::Result<()> {
+    fn insert_xsk(&self, queue: u32, fd: BorrowedFd<'_>) -> io::Result<()> {
         self.check_queue(queue)?;
         let value = fd.as_raw_fd() as u32;
         bpf(
@@ -567,7 +622,7 @@ fn load_typed_program(
             .map_err(|_| invalid_data("XDP instruction count overflow"))?,
         insns: program.insns.as_ptr() as u64,
         license: c"GPL".as_ptr() as u64,
-        log_level: 1,
+        log_level: if program.dns_shadow { 4 } else { 1 }, // BPF_LOG_STATS for the shadow budget gate.
         log_size: log.len() as u32,
         log_buf: log.as_mut_ptr() as u64,
         kern_version: 0,
@@ -593,14 +648,19 @@ fn load_typed_program(
     };
     let fd = bpf_fd(BPF_PROG_LOAD, &mut attr).map_err(|error| {
         let length = log.iter().position(|&byte| byte == 0).unwrap_or(log.len());
-        io::Error::new(
+        let error = io::Error::new(
             error.kind(),
             format!(
                 "BPF_PROG_LOAD {}: {error}\n{}",
                 String::from_utf8_lossy(name),
                 String::from_utf8_lossy(&log[..length]),
             ),
-        )
+        );
+        if program.dns_shadow {
+            gateway::dns_load_error("verifier_budget", error)
+        } else {
+            error
+        }
     })?;
     let mut info = ProgInfo::default();
     object_info(fd.as_fd(), &mut info)?;
@@ -1156,6 +1216,7 @@ struct Program {
     insns: Vec<Insn>,
     len: usize,
     flags: u32,
+    dns_shadow: bool,
     ifindex: u32,
     pub(super) kfunc_btf: Option<OwnedFd>,
 }
@@ -1175,6 +1236,7 @@ impl Builder {
                 insns: Vec::with_capacity(4096),
                 len: 0,
                 flags: 0,
+                dns_shadow: false,
                 ifindex: 0,
                 kfunc_btf: None,
             },

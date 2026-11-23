@@ -321,6 +321,8 @@ async fn projection_rollback_preserves_cached_deadline() {
         let ingress = IngressProfile::Udp {
             advertised_size: 512,
         };
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let started_at = tokio::time::Instant::now();
         let warm = controller
             .dns_service
             .resolve_client_outcome_with_runtime(
@@ -334,7 +336,11 @@ async fn projection_rollback_preserves_cached_deadline() {
             .unwrap();
         let lifetime = warm.expiry().ttl();
         assert!(lifetime > Duration::from_secs(2));
-        let original_deadline = tokio::time::Instant::now() + lifetime;
+        let original_deadline = started_at + lifetime;
+        let stored = warm.projection_lifetime().expect("stored deadline");
+        assert_eq!(stored.expires_at, original_deadline);
+        assert!(stored.source.cache_revision().is_some());
+        tokio::time::advance(lifetime / 4).await;
         let publication = controller.prepare_projection_publication();
         let mut answer =
             Box::pin(controller.answer_query(&admission, &query, DnsRequestMeta::EMPTY, ingress));
@@ -358,6 +364,9 @@ async fn projection_rollback_preserves_cached_deadline() {
             .unwrap();
         let outcome = answer.0.unwrap();
         assert_eq!(outcome.provenance(), crate::dns::outcome::Provenance::Cache);
+        let hit = outcome.projection_lifetime().expect("cache-hit deadline");
+        assert_eq!(hit.expires_at, original_deadline);
+        assert_eq!(hit.source.cache_revision(), stored.source.cache_revision());
         if expire_while_waiting {
             assert!(
                 controller.project_routes(&snapshot).is_empty(),
@@ -369,8 +378,7 @@ async fn projection_rollback_preserves_cached_deadline() {
                 "192.0.2.10".parse::<std::net::IpAddr>().unwrap()
             );
             tokio::time::advance(
-                original_deadline.saturating_duration_since(tokio::time::Instant::now())
-                    + Duration::from_secs(1),
+                original_deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await;
             controller.routing_projection.submit(

@@ -11,10 +11,12 @@ pub mod device;
 mod port;
 pub mod topology;
 
-pub use bpf::gateway::{GatewayLoad, GatewayMaps, HoldValue};
+pub use bpf::gateway::{
+    GatewayDnsMaps, GatewayLoad, GatewayMaps, HoldValue, gateway_dns_load_failure,
+};
 pub use bpf::{
-    Attachment, CaptureCounters, ConntrackKfuncs, OwnedXdpLink, PersistentAttachment, Programs,
-    XdpState, kernel_memory_bytes, xdp_absent, xdp_state,
+    Attachment, CaptureCounters, ConntrackKfuncs, OwnedXdpLink, PersistentAttachment,
+    ProgramQueueMaps, Programs, XdpState, kernel_memory_bytes, xdp_absent, xdp_state,
 };
 #[cfg(feature = "host")]
 pub use bpf::{

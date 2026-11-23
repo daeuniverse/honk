@@ -76,15 +76,13 @@ async fn test_prefer_ipv4_suppresses_aaaa_when_a_exists() {
     assert!(answer_count(&a_resp) > 0);
 
     // AAAA is forwarded to upstream but suppressed at response time.
-    let aaaa_resp = forwarder
-        .resolve(&build_dns_query("example.com", 28))
-        .await
-        .unwrap();
-    assert_eq!(
-        answer_count(&aaaa_resp),
-        0,
-        "AAAA must be suppressed when A answers exist"
-    );
+    let query = build_dns_query("example.com", 28);
+    for _ in 0..2 {
+        let suppressed = forwarder.resolve_outcome(&query).await.unwrap();
+        assert_eq!(answer_count(suppressed.rendered()), 0);
+        assert_eq!(suppressed.response_class(), ResponseClass::Nodata);
+        assert!(suppressed.projection_lifetime().is_none());
+    }
     assert_eq!(
         mock.call_count.load(Ordering::SeqCst),
         2,
@@ -168,6 +166,11 @@ async fn cached_prefer_expiry_excludes_sibling_wait() {
     assert_eq!(outcome.provenance(), Provenance::Cache);
     assert_eq!(outcome.response_class(), ResponseClass::Positive);
     assert!(outcome.expiry().is_cacheable());
+    let lifetime = outcome
+        .projection_lifetime()
+        .expect("positive cache deadline");
+    assert_eq!(lifetime.expires_at, entry.fresh.expires_at);
+    assert_eq!(lifetime.source.cache_revision(), Some(entry.fresh.revision));
     assert!(
         outcome.expiry().ttl() <= remaining_after_wait,
         "cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",
@@ -214,6 +217,7 @@ async fn cached_negative_prefer_expiry_excludes_sibling_wait() {
     assert_eq!(outcome.provenance(), Provenance::Cache);
     assert_eq!(outcome.response_class(), ResponseClass::Nxdomain);
     assert!(outcome.expiry().is_cacheable());
+    assert!(outcome.projection_lifetime().is_none());
     assert!(
         outcome.expiry().ttl() <= remaining_after_wait,
         "negative cache-hit expiry {:?} includes the sibling wait; remaining afterward is {remaining_after_wait:?}",

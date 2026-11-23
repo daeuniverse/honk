@@ -856,12 +856,14 @@ async fn packet_scoped_bound_dns_keeps_udp_and_each_tcp_frame_current() {
             let bitmap = controller
                 .packet_domain_bitmap(fact_scope, ip, &router, 1)
                 .unwrap()
+                .bitmap
                 .unwrap();
             assert_ne!(bitmap.bitmap[0], 0);
             assert!(
                 controller
                     .packet_domain_bitmap(scopes[1].scope(), ip, &router, 1)
                     .unwrap()
+                    .bitmap
                     .is_none()
             );
             assert!(

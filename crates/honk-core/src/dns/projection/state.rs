@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::time::Instant;
 
-use super::{ProjectionObservation, RoutingProjectionSnapshot, or_bitmap};
+use super::{ProjectionObservation, ProjectionSource, RoutingProjectionSnapshot, or_bitmap};
 type OwnerKey = Arc<str>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -142,6 +142,7 @@ pub(super) struct DomainOwner {
     /// domain predicate exists, unlike a present-zero bitmap.
     pub(super) bitmap: Option<DomainRouting>,
     pub(super) expires_at: Instant,
+    cache_revision: Option<u64>,
     pub(super) sequence: u64,
     // Queued entries survive refreshes; these fence removed/re-added owners.
     expiry_sequence: u64,
@@ -188,16 +189,37 @@ impl PacketFactScope {
     }
 }
 
-fn advance_revision(scopes: &mut [PacketFactScope], scope: u64) {
-    if let Some(entry) = scopes
-        .iter_mut()
-        .find(|entry| entry.scope.as_u64() == scope)
-        && entry.revision != u64::MAX
-    {
+#[derive(Default)]
+struct PacketScopes {
+    entries: Box<[PacketFactScope]>,
+    #[cfg(target_os = "linux")]
+    bank: Option<Arc<super::GatewayDnsBank>>,
+}
+
+impl PacketScopes {
+    fn withdraw(&mut self, scope: u64) {
+        #[cfg(target_os = "linux")]
+        if let Some(bank) = &self.bank {
+            bank.revoke(scope);
+        }
+        let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.scope.as_u64() == scope)
+        else {
+            return;
+        };
+        Self::advance_revision(entry);
+    }
+
+    fn advance_revision(entry: &mut PacketFactScope) {
+        if entry.revision == u64::MAX {
+            return;
+        }
         entry.revision += 1;
         if entry.revision == u64::MAX {
             tracing::error!(
-                scope,
+                scope = entry.scope.as_u64(),
                 "packet DNS fact revision exhausted; fact-dependent Core decisions now drop"
             );
         }
@@ -223,7 +245,7 @@ pub(super) struct DesiredState {
     /// cache-hit hints can detect owner changes without taking the state lock.
     pub(super) structure: Arc<AtomicU64>,
     /// Set once: removing the table would allow a retained stamp's revision to be reissued.
-    packet_scopes: Box<[PacketFactScope]>,
+    packet_scopes: PacketScopes,
     _packet_scope_charge: Option<honk_netstack::MemoryReservation>,
 }
 
@@ -244,7 +266,7 @@ impl DesiredState {
             expiry_deadlines: BinaryHeap::new(),
             eviction_order: BinaryHeap::new(),
             structure: Arc::new(AtomicU64::new(0)),
-            packet_scopes: Box::default(),
+            packet_scopes: PacketScopes::default(),
             _packet_scope_charge: None,
         }
     }
@@ -254,18 +276,23 @@ impl DesiredState {
         scopes: Box<[PacketFactScope]>,
         charge: honk_netstack::MemoryReservation,
     ) -> anyhow::Result<()> {
-        if !self.packet_scopes.is_empty() {
+        if !self.packet_scopes.entries.is_empty() {
             // Parameters otherwise drop the charge before the rejected table.
             drop(scopes);
             anyhow::bail!("packet DNS scopes are already registered");
         }
-        self.packet_scopes = scopes;
+        self.packet_scopes.entries = scopes;
         self._packet_scope_charge = Some(charge);
         Ok(())
     }
 
     pub(super) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
-        scope != ScopeId::HOST && self.packet_scopes.iter().any(|entry| entry.scope == scope)
+        scope != ScopeId::HOST
+            && self
+                .packet_scopes
+                .entries
+                .iter()
+                .any(|entry| entry.scope == scope)
     }
 
     pub(super) fn packet_fact(
@@ -277,6 +304,7 @@ impl DesiredState {
         self.try_expire(now)?;
         let revision = self
             .packet_scopes
+            .entries
             .iter()
             .find(|entry| entry.scope == scope)
             .map(|entry| entry.revision)
@@ -286,7 +314,10 @@ impl DesiredState {
             "packet DNS fact revision is exhausted"
         );
         let key = ProjectionIp::new(scope, ip);
-        let expires_at = self.fact_expiry(&key);
+        let expires_at = self
+            .reverse
+            .get(&key)
+            .and_then(|owners| self.fact_expiry(key.scope, owners));
         Ok((
             self.desired.get(&key).copied(),
             super::FactStamp {
@@ -297,18 +328,83 @@ impl DesiredState {
         ))
     }
 
-    fn fact_expiry(&self, key: &ProjectionIp) -> Option<Instant> {
-        self.reverse
-            .get(key)
-            .into_iter()
-            .flat_map(|owners| &owners.members)
-            .filter_map(|(domain, family)| {
+    #[cfg(target_os = "linux")]
+    pub(super) fn gateway_bank(&self) -> Option<&Arc<super::GatewayDnsBank>> {
+        self.packet_scopes.bank.as_ref()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn close_gateway_dns(&mut self) -> Option<Arc<super::GatewayDnsBank>> {
+        let bank = self.packet_scopes.bank.take()?;
+        bank.close();
+        Some(bank)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn bind_gateway_dns(
+        &mut self,
+        bank: Option<&Arc<super::GatewayDnsBank>>,
+        allowed: impl FnOnce() -> bool,
+    ) -> bool {
+        debug_assert!(self.gateway_bank().is_none());
+        let Some(bank) = bank else { return false };
+        if !allowed() || !bank.scopes().all(|scope| self.owns_packet_scope(scope)) {
+            bank.close();
+            return false;
+        }
+        if !bank.activate() {
+            return false;
+        }
+        self.packet_scopes.bank = Some(Arc::clone(bank));
+        true
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn gateway_fact(
+        &self,
+        scope: ScopeId,
+        ip: IpAddr,
+        now: Instant,
+    ) -> Option<(DomainRouting, Instant)> {
+        let key = ProjectionIp::new(scope, ip);
+        let bitmap = *self.desired.get(&key)?;
+        self.gateway_expiry(key, bitmap, now)
+            .map(|until| (bitmap, until))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn gateway_expiry(
+        &self,
+        key: ProjectionIp,
+        bitmap: DomainRouting,
+        now: Instant,
+    ) -> Option<Instant> {
+        let owners = self.reverse.get(&key)?;
+        let [(shared, count)] = owners.contributions.as_slice() else {
+            return None;
+        };
+        if !(1..=32).contains(&owners.members.len())
+            || *count as usize != owners.members.len()
+            || *shared != bitmap
+        {
+            return None;
+        }
+        let until = self.fact_expiry(key.scope, owners)?;
+        (now < until).then_some(until)
+    }
+
+    fn fact_expiry(&self, scope: u64, owners: &IpOwners) -> Option<Instant> {
+        owners
+            .members
+            .iter()
+            .map(|(domain, family)| {
                 self.owners[*family]
-                    .get(&key.scope)
+                    .get(&scope)
                     .and_then(|owners| owners.get(domain))
                     .map(|owner| owner.expires_at)
             })
             .min()
+            .flatten()
     }
 
     pub(super) fn fact_is_current(&mut self, stamp: super::FactStamp, now: Instant) -> bool {
@@ -318,6 +414,7 @@ impl DesiredState {
         stamp.revision != u64::MAX
             && self
                 .packet_scopes
+                .entries
                 .iter()
                 .any(|entry| entry.scope == stamp.scope && entry.revision == stamp.revision)
             && stamp.is_unexpired_at(now)
@@ -326,6 +423,7 @@ impl DesiredState {
     #[cfg(test)]
     pub(super) fn set_packet_fact_revision_for_test(&mut self, scope: ScopeId, revision: u64) {
         self.packet_scopes
+            .entries
             .iter_mut()
             .find(|entry| entry.scope == scope)
             .expect("registered test scope")
@@ -336,9 +434,41 @@ impl DesiredState {
         if snapshot.generation() <= self.snapshot.generation() {
             return snapshot.generation() == self.snapshot.generation();
         }
+        #[cfg(target_os = "linux")]
+        debug_assert!(
+            self.gateway_bank().is_none(),
+            "gateway authority must be withdrawn before rebuilding"
+        );
         self.snapshot = Arc::clone(snapshot);
         self.rebuild_all();
         true
+    }
+
+    pub(super) fn observe_cache_hit(
+        &mut self,
+        scope: ScopeId,
+        mut observation: ProjectionObservation<'_>,
+        now: Instant,
+    ) -> u64 {
+        if let ProjectionObservation::Positive {
+            domain,
+            family,
+            ips,
+            ref mut expires_at,
+            source: ProjectionSource::CacheEntry(revision),
+        } = observation
+            && *expires_at > now
+            && let Some(owner) = self.owners[family as usize]
+                .get(&scope.as_u64())
+                .and_then(|owners| owners.get(domain))
+            && owner.cache_revision == Some(revision)
+            && owner.expires_at != *expires_at
+            && same_address_set(owner.ips.iter(), ips)
+        {
+            // An exact fresh hit can refresh recency, but it cannot move the entry's original deadline.
+            *expires_at = owner.expires_at;
+        }
+        self.observe(scope, observation, now)
     }
 
     pub(super) fn observe(
@@ -355,9 +485,17 @@ impl DesiredState {
                 family,
                 ips,
                 expires_at,
+                source,
             } => {
                 if expires_at > now {
-                    self.replace(scope, family as usize, domain, ips, expires_at)
+                    self.replace(
+                        scope,
+                        family as usize,
+                        domain,
+                        ips,
+                        expires_at,
+                        source.cache_revision(),
+                    )
                 } else {
                     // Reload prefill can run before the expiry worker does.
                     self.remove_owner(scope, family as usize, domain);
@@ -396,7 +534,8 @@ impl DesiredState {
             .get(&scope)
             .and_then(|owners| owners.get(domain))
             .filter(|owner| {
-                same_address_set(owner.ips.iter(), ips)
+                (scope != ScopeId::HOST.as_u64() || owner.ips.len() == ips.len())
+                    && same_address_set(owner.ips.iter(), ips)
                     && owner
                         .ips
                         .iter()
@@ -411,6 +550,7 @@ impl DesiredState {
         domain: &str,
         ips: &[IpAddr],
         expires_at: Instant,
+        cache_revision: Option<u64>,
     ) -> u64 {
         self.sequence = self.sequence.wrapping_add(1);
         let sequence = self.sequence;
@@ -427,7 +567,7 @@ impl DesiredState {
             let key = Arc::clone(key);
             let shortened = expires_at < owner.expires_at;
             if shortened {
-                advance_revision(&mut self.packet_scopes, scope);
+                self.packet_scopes.withdraw(scope);
             }
             let owner = self.owners[family]
                 .get_mut(&scope)
@@ -438,6 +578,7 @@ impl DesiredState {
                 owner.expiry_sequence = sequence;
             }
             owner.expires_at = expires_at;
+            owner.cache_revision = cache_revision;
             owner.sequence = sequence;
             if shortened {
                 self.expiry_deadlines.push(Reverse(DeadlineEntry {
@@ -455,7 +596,7 @@ impl DesiredState {
             .iter()
             .map(|ip| ip.to_canonical())
             .collect::<BTreeSet<_>>();
-        advance_revision(&mut self.packet_scopes, scope);
+        self.packet_scopes.withdraw(scope);
         self.structure.fetch_add(1, Ordering::Release);
         let existing = self.owners[family]
             .get(&scope)
@@ -519,6 +660,7 @@ impl DesiredState {
                 owner.expiry_sequence = sequence;
             }
             owner.expires_at = expires_at;
+            owner.cache_revision = cache_revision;
             owner.sequence = sequence;
         } else {
             affected.reserve(ips.len());
@@ -535,6 +677,7 @@ impl DesiredState {
                     ips,
                     bitmap,
                     expires_at,
+                    cache_revision,
                     sequence,
                     expiry_sequence: sequence,
                     eviction_sequence: sequence,
@@ -604,7 +747,7 @@ impl DesiredState {
         if !owners.contains_key(domain) {
             return;
         }
-        advance_revision(&mut self.packet_scopes, scope);
+        self.packet_scopes.withdraw(scope);
         let (owner_key, owner) = owners
             .remove_entry(domain)
             .expect("existing projection owner");
@@ -640,7 +783,7 @@ impl DesiredState {
             }
             let evicted = if let Some(next) = next {
                 insert_bounded(&mut self.desired, &mut self.zero_ips, ip, next, |victim| {
-                    advance_revision(&mut self.packet_scopes, victim.scope);
+                    self.packet_scopes.withdraw(victim.scope);
                 })
             } else {
                 self.desired.remove(&ip);
@@ -665,9 +808,8 @@ impl DesiredState {
     }
 
     fn rebuild_all(&mut self) {
-        for entry in &mut self.packet_scopes {
-            let scope = entry.scope.as_u64();
-            advance_revision(std::slice::from_mut(entry), scope);
+        for entry in &mut self.packet_scopes.entries {
+            PacketScopes::advance_revision(entry);
         }
         self.structure.fetch_add(1, Ordering::Release);
         self.refresh_owner_bitmaps();
@@ -749,10 +891,12 @@ impl DesiredState {
     fn refresh_owner_bitmaps(&mut self) {
         let [v4, v6] = &mut self.owners;
         for (domain, owner) in v4.values_mut().flat_map(HashMap::iter_mut) {
+            owner.cache_revision = None;
             owner.bitmap = self.snapshot.bitmap_for(domain);
         }
         for (scope, owners) in v6.iter_mut() {
             for (domain, owner) in owners {
+                owner.cache_revision = None;
                 owner.bitmap = v4
                     .get(scope)
                     .and_then(|owners| owners.get(domain))
@@ -933,10 +1077,9 @@ pub(super) fn same_address_set<'a>(
     known: impl ExactSizeIterator<Item = &'a IpAddr> + Clone,
     ips: &[IpAddr],
 ) -> bool {
-    // Answers are usually tiny; a large one sorts once instead of comparing
-    // quadratically. Duplicates break the strict ascending match.
+    // Answers are usually tiny; a large one sorts once instead of comparing quadratically.
     const SMALL_SET: usize = 16;
-    if known.len() != ips.len() {
+    if known.len() > ips.len() {
         return false;
     }
     if ips.len() <= SMALL_SET {
@@ -949,5 +1092,6 @@ pub(super) fn same_address_set<'a>(
     }
     let mut sorted = ips.iter().map(IpAddr::to_canonical).collect::<Vec<_>>();
     sorted.sort_unstable();
+    sorted.dedup();
     sorted.iter().eq(known)
 }

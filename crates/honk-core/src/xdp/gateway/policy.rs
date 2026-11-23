@@ -14,7 +14,6 @@ mod tests;
 
 pub(crate) struct GatewayPolicy {
     pub(crate) bytecode: GatewayBytecode,
-    pub(crate) fingerprint: [u8; 32],
     facts: [OwnedFd; 5],
 }
 
@@ -88,7 +87,7 @@ fn fact_map(entries: &[(LpmKey, DomainRouting)]) -> io::Result<OwnedFd> {
 }
 
 impl GatewayPolicy {
-    pub(crate) fn prepare(plan: &RoutingPushPlan) -> io::Result<Self> {
+    pub(crate) fn prepare(plan: &RoutingPushPlan, dns_shadow: bool) -> io::Result<Self> {
         let facts = [
             fact_map(&plan.facts.destination_v4)?,
             fact_map(&plan.facts.destination_v6)?,
@@ -104,12 +103,8 @@ impl GatewayPolicy {
             mac: facts[4].as_raw_fd(),
             domain: -1,
         };
-        let bytecode = emit_gateway_routing_program(plan, fds)?;
-        Ok(Self {
-            bytecode,
-            facts,
-            fingerprint: plan.policy_fingerprint,
-        })
+        let bytecode = emit_gateway_routing_program(plan, fds, dns_shadow)?;
+        Ok(Self { bytecode, facts })
     }
 
     pub(crate) fn fact_fds(&self) -> impl Iterator<Item = std::os::fd::BorrowedFd<'_>> {

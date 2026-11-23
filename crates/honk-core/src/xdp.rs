@@ -248,7 +248,8 @@ struct Queue {
 struct Device {
     info: Arc<DeviceInfo>,
     capture: GeneralCapture,
-    programs: Arc<Programs>,
+    queue_maps: Arc<honk_xsk::ProgramQueueMaps>,
+    programs: Option<(Programs, MemoryReservation)>,
     attachment: Option<OwnedXdpLink>,
     vlan_offload: VlanOffload,
     queues: Vec<Queue>,
@@ -991,6 +992,9 @@ impl Runtime {
                         .is_none_or(|scope| endpoints.retains_source(*scope, source))
                 })?;
         }
+        if let Some(publisher) = &self.gateway {
+            publisher.sample_dns();
+        }
         self.core_maintenance_checked = now;
         Ok(())
     }
@@ -1057,6 +1061,9 @@ impl Runtime {
     ) -> anyhow::Result<()> {
         let deadline = Instant::now() + DETACH_BUDGET;
         self.workers.begin_close();
+        if let Some(publisher) = &self.gateway {
+            publisher.stop_dns();
+        }
         if self.topology_lost {
             for device in &mut self.devices {
                 device.vlan_offload.abandon();
@@ -1100,18 +1107,14 @@ impl Runtime {
             );
         }
         for device in &mut self.devices {
-            if let Some(link) = &device.attachment {
-                let program = if device.active {
-                    device.programs.data_prog_id()
-                } else {
-                    device.programs.discover_prog_id()
-                };
-                fold_capture_result(&mut failure, link.verify(program).map_err(Into::into));
+            if device.attachment.is_some() {
+                let verified = device.core_link().and_then(|(link, id)| link.verify(id));
+                fold_capture_result(&mut failure, verified.map_err(Into::into));
             }
             for id in &device.info.queues {
                 fold_capture_result(
                     &mut failure,
-                    device.programs.delete_xsk(*id).map_err(Into::into),
+                    device.queue_maps.delete_xsk(*id).map_err(Into::into),
                 );
             }
             for queue in &mut device.queues {
@@ -1267,7 +1270,7 @@ impl Runtime {
                 && device.capture.vlan_metadata
                 && let Err(error) =
                     check_metadata(&mut device.metadata_checked, now, &device.info.name, || {
-                        device.programs.metadata_failures()
+                        device.queue_maps.metadata_failures()
                     })
             {
                 return Poll::Ready(Err(error));
@@ -2412,15 +2415,62 @@ fn return_header(
 }
 
 impl Device {
+    fn unpublished_programs(&self) -> io::Result<&Programs> {
+        self.programs
+            .as_ref()
+            .map(|(programs, _)| programs)
+            .ok_or_else(|| io::Error::other("XDP device transferred its program generation"))
+    }
+
+    fn publish_programs(
+        &mut self,
+        publisher: Option<&GatewayPublisher>,
+        ipv4_broadcasts: &[std::net::Ipv4Addr],
+    ) -> anyhow::Result<u32> {
+        let programs = self.unpublished_programs()?;
+        let id = programs.data_prog_id();
+        self.attachment
+            .as_ref()
+            .context("XDP link already detached")?
+            .replace(programs.discover_fd(), programs.data_fd())?;
+        self.active = true;
+        if let Some(publisher) = publisher {
+            let queues = self
+                .info
+                .queues
+                .last()
+                .copied()
+                .context("XDP queues vanished")?
+                .checked_add(1)
+                .context("XDP queue overflow")?;
+            publisher.register(
+                self.info.ifindex,
+                self.attachment
+                    .take()
+                    .context("XDP link already detached")?,
+                self.programs
+                    .take()
+                    .context("XDP program generation already transferred")?,
+                GatewayReload {
+                    capture: self.capture.clone(),
+                    queues,
+                    ipv4_broadcasts: ipv4_broadcasts.to_vec(),
+                },
+            )?;
+        }
+        Ok(id)
+    }
+
     fn core_link(&self) -> io::Result<(&OwnedXdpLink, u32)> {
         let link = self
             .attachment
             .as_ref()
             .ok_or_else(|| io::Error::other("Core XDP link already detached"))?;
+        let programs = self.unpublished_programs()?;
         let program = if self.active {
-            self.programs.data_prog_id()
+            programs.data_prog_id()
         } else {
-            self.programs.discover_prog_id()
+            programs.discover_prog_id()
         };
         Ok((link, program))
     }
@@ -2753,6 +2803,7 @@ async fn run_capture(
     let shutdown = plane.shutdown_intent();
     let backend = plane.policy_backend_handle();
     let active_routing_plan = plane.active_routing_plan_handle();
+    let diagnostics_generation = plane.diagnostics_handle();
     let (polling_publication, process_polling) = plane
         .polling_runtime()
         .expect("validated XDP polling consumer");
@@ -2975,46 +3026,19 @@ async fn run_capture(
             // SAFETY: the watcher owns a stable descriptor until AsyncFd drops it.
             runtime.topology = unsafe { AsyncFd::register(topology) }.map_err(io::Error::from)?;
             for device in &mut runtime.devices {
-                let link = device
-                    .attachment
-                    .as_ref()
-                    .context("XDP link already detached")?;
-                link.replace(device.programs.discover_fd(), device.programs.data_fd())?;
+                let id = device.publish_programs(
+                    runtime.gateway.as_deref(),
+                    runtime.topology.get_ref().ipv4_broadcasts(),
+                )?;
                 runtime
                     .topology
                     .get_mut()
-                    .expect_program(device.info.ifindex, device.programs.data_prog_id());
-                device.active = true;
-                if let Some(publisher) = &runtime.gateway {
-                    let queues = device
-                        .info
-                        .queues
-                        .last()
-                        .copied()
-                        .context("XDP queues vanished")?
-                        .checked_add(1)
-                        .context("XDP queue overflow")?;
-                    publisher.register(
-                        device.info.ifindex,
-                        device
-                            .attachment
-                            .take()
-                            .context("XDP link already detached")?,
-                        Arc::clone(&device.programs),
-                        GatewayReload {
-                            capture: device.capture.clone(),
-                            queues,
-                            ipv4_broadcasts: runtime.topology.get_ref().ipv4_broadcasts().to_vec(),
-                        },
-                    )?;
-                }
+                    .expect_program(device.info.ifindex, id);
             }
             if let Some(publisher) = &runtime.gateway {
                 let mut backend = backend.write().await;
                 let plan = active_routing_plan.read().clone();
-                if plan.policy_fingerprint != publisher.fingerprint() {
-                    publisher.publish(&plan)?;
-                }
+                publisher.prepare_start(&plan)?;
                 backend
                     .userspace_mut()?
                     .install_gateway(Some(Arc::clone(publisher)))?;
@@ -3055,7 +3079,18 @@ async fn run_capture(
                         .widen_startup_output(base_bulk_frames);
                 }
             }
-            runtime.activate_capture(&shutdown, direct)
+            if let Some(publisher) = &runtime.gateway {
+                let mut backend = backend.write().await;
+                runtime.activate_capture(&shutdown, direct)?;
+                backend.userspace_mut()?.activate_gateway_start(
+                    publisher,
+                    active_routing_plan.read().fingerprint,
+                    diagnostics_generation.read().generation,
+                );
+                Ok(())
+            } else {
+                runtime.activate_capture(&shutdown, direct)
+            }
         }
         .await
     };
@@ -3358,12 +3393,7 @@ async fn prepare(
         XskMode::Copy => Some(BindMode::Copy),
         XskMode::ZeroCopy => Some(BindMode::ZeroCopy),
     };
-    let names: Vec<_> = datapath
-        .interfaces
-        .iter()
-        .map(|interface| interface.name.clone())
-        .collect();
-    let plan = match CapturePlan::discover(&names) {
+    let plan = match CapturePlan::discover(&datapath.interfaces) {
         Ok(plan) => Some(plan),
         Err(error) => {
             for (reason, details) in layout_admission_issues(&error) {
@@ -3372,7 +3402,8 @@ async fn prepare(
             None
         }
     };
-    let gateway_enabled = datapath.direct == Some(DirectProfile::Endpoint) && !names.is_empty();
+    let gateway_enabled =
+        datapath.direct == Some(DirectProfile::Endpoint) && !datapath.interfaces.is_empty();
     if gateway_enabled
         && let Some((reason, details)) =
             gateway_time_namespace_issue(timens::monotonic_namespace_offset())
@@ -3602,9 +3633,9 @@ async fn prepare(
         None
     };
     let policy = if gateway_enabled {
-        Some(GatewayPolicy::prepare(
-            &plane.active_routing_plan_handle().read(),
-        )?)
+        let policy = GatewayPolicy::prepare(&plane.active_routing_plan_handle().read(), false)?;
+        let charge = gateway::reserve_objects(&budget, policy.fact_fds())?;
+        Some((policy, charge))
     } else {
         None
     };
@@ -3681,34 +3712,29 @@ async fn prepare(
             .context("XDP device has no RX queues")?
             .checked_add(1)
             .context("XDP queue identity overflow")?;
-        let programs =
-            if let (Some(policy), Some(maps), Some(ct)) = (&policy, &gateway_maps, &conntrack) {
-                Programs::load_general_gateway(
-                    &capture,
-                    queues,
-                    topology.get_ref().ipv4_broadcasts(),
-                    honk_xsk::GatewayLoad {
-                        routing: &policy.bytecode.insns,
-                        maps,
-                        conntrack: ct,
-                    },
-                )?
-            } else {
-                Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?
-            };
-        let bytes = programs.object_fds().into_iter().try_fold(
-            0usize,
-            |total, fd| -> io::Result<usize> {
-                total
-                    .checked_add(honk_xsk::kernel_memory_bytes(fd)?)
-                    .ok_or_else(|| io::Error::other("XDP program memory overflow"))
-            },
-        )?;
-        kernel_memory.push(
-            budget
-                .reserve(bytes)
-                .context("XDP program memory capacity")?,
-        );
+        let programs = if let (Some((policy, _)), Some(maps), Some(ct)) =
+            (&policy, &gateway_maps, &conntrack)
+        {
+            Programs::load_general_gateway(
+                &capture,
+                queues,
+                topology.get_ref().ipv4_broadcasts(),
+                honk_xsk::GatewayLoad {
+                    routing: &policy.bytecode.insns,
+                    maps,
+                    conntrack: ct,
+                    dns: None,
+                },
+            )?
+        } else {
+            Programs::load_general(&capture, queues, topology.get_ref().ipv4_broadcasts())?
+        };
+        let objects = programs.object_fds();
+        kernel_memory.push(gateway::reserve_objects(
+            &budget,
+            objects[..2].iter().copied(),
+        )?);
+        let program_memory = gateway::reserve_objects(&budget, objects[2..].iter().copied())?;
         let attachment = OwnedXdpLink::create(info.ifindex, programs.discover_fd())?;
         let ports =
             info.open_ports::<Retained>(binding_mode, port_config, metadata_len, &budget)?;
@@ -3744,7 +3770,8 @@ async fn prepare(
         devices.push(Device {
             info: Arc::new(info),
             capture,
-            programs: Arc::new(programs),
+            queue_maps: Arc::clone(programs.queue_maps()),
+            programs: Some((programs, program_memory)),
             attachment: Some(attachment),
             vlan_offload,
             queues,
@@ -3752,25 +3779,14 @@ async fn prepare(
             metadata_checked: Instant::now(),
             features,
             port_config,
-            role: datapath
-                .interfaces
+            role: plan
+                .realms()
                 .iter()
-                .find(|interface| {
-                    interface.name == plan.realm_name(plan.members()[device_index].realm_id)
-                })
+                .find(|realm| realm.realm_id == plan.members()[device_index].realm_id)
                 .context("capture member role missing")?
                 .role,
         });
     }
-    let gateway = match (policy, gateway_maps.as_ref(), conntrack) {
-        (Some(policy), Some(maps), Some(ct)) => Some(Arc::new(GatewayPublisher::new(
-            policy,
-            Arc::clone(maps),
-            ct,
-            Arc::clone(&budget),
-        )?)),
-        _ => None,
-    };
     #[cfg(feature = "ebpf")]
     let host = if let Some(host) = &datapath.host {
         let source_xdp_capacity = devices.len() * 2;
@@ -3779,8 +3795,9 @@ async fn prepare(
             .context("Host source XDP identity memory capacity")?;
         let mut source_xdp = Vec::with_capacity(source_xdp_capacity);
         for device in devices.iter() {
-            source_xdp.push((device.info.ifindex, device.programs.discover_prog_id()));
-            source_xdp.push((device.info.ifindex, device.programs.data_prog_id()));
+            let programs = device.unpublished_programs()?;
+            source_xdp.push((device.info.ifindex, programs.discover_prog_id()));
+            source_xdp.push((device.info.ifindex, programs.data_prog_id()));
         }
         let attachment = ScopeId::allocate()
             .context("Host attachment identity exhausted")?
@@ -3923,6 +3940,33 @@ async fn prepare(
         Some(core)
     } else {
         None
+    };
+    let gateway = match (policy, gateway_maps.as_ref(), conntrack) {
+        (Some(policy), Some(maps), Some(ct)) => {
+            let enabled = datapath.effective_dns_projection();
+            let lan = plan
+                .realms()
+                .iter()
+                .filter(|realm| enabled && realm.role == honk_config::datapath::InterfaceRole::Lan)
+                .map(|realm| (realm_scopes[&realm.realm_id], realm.realm_id));
+            let shadow = gateway::GatewayShadow::new(
+                lan,
+                &plane.packet_routing_projection(),
+                Arc::clone(&diagnostics),
+                Arc::clone(&admission),
+                plane.datapath_health_handle(),
+                plane.shutdown_intent(),
+                &budget,
+            );
+            Some(Arc::new(GatewayPublisher::new(
+                policy,
+                Arc::clone(maps),
+                ct,
+                Arc::clone(&budget),
+                shadow,
+            )))
+        }
+        _ => None,
     };
     Ok(PreparedRuntime {
         devices: std::mem::take(&mut devices.0),

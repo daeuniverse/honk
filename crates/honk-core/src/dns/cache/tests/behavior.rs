@@ -1,7 +1,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{CacheCounters, CachedEntry, DnsCache, make_test_response};
+use super::{CacheCounters, CachedEntry, DnsCache, FreshCacheEntry, make_test_response};
 
 #[test]
 fn cache_counters_are_exact_for_hit_miss_and_stale_paths() {
@@ -52,6 +52,10 @@ fn test_stale_retention_exceeded() {
         response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(7200),
         min_ttl: 1,
+        fresh: FreshCacheEntry {
+            revision: 1,
+            expires_at: tokio::time::Instant::now(),
+        },
         strict_reusable: true,
     };
     assert!(entry.is_stale_retention_exceeded());
@@ -59,6 +63,7 @@ fn test_stale_retention_exceeded() {
         response: bytes::Bytes::new(),
         expires_at: Instant::now() - Duration::from_secs(10),
         min_ttl: 1,
+        fresh: entry.fresh,
         strict_reusable: true,
     };
     assert!(!fresh.is_stale_retention_exceeded());
@@ -71,6 +76,10 @@ fn test_remaining_ttl() {
         expires_at: Instant::now() + Duration::from_secs(45),
         min_ttl: 45,
         strict_reusable: true,
+        fresh: FreshCacheEntry {
+            revision: 1,
+            expires_at: tokio::time::Instant::now() + Duration::from_secs(45),
+        },
     };
     let remaining = entry.remaining_ttl_secs();
     assert!(

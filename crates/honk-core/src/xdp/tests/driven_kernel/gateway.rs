@@ -1,5 +1,8 @@
 use super::*;
 
+mod dns;
+mod dns_reload;
+
 pub(in crate::xdp::tests) fn guard() {
     // SAFETY: geteuid has no arguments or memory preconditions.
     assert_eq!(unsafe { libc::geteuid() }, 0);
@@ -36,19 +39,32 @@ struct Fixture {
 
 impl Fixture {
     async fn start(direct: DirectProfile) -> anyhow::Result<Self> {
-        guard();
-        let pins = guarded_pin_root();
-        let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
         let profile = match direct {
             DirectProfile::Core => "core",
             DirectProfile::Endpoint => "endpoint",
         };
-        let mut config = honk_config::parser::parse_dae_config(&format!(
+        let config = honk_config::parser::parse_dae_config(&format!(
             "global {{ dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }}\n\
              dns {{ bind: '' }}\n\
              datapath {{ backend: xdp\n direct: {profile}\n xsk_mode: copy\n interface {{ dut0: lan\n dut1: wan }} }}\n\
              routing {{ fallback: direct }}",
         ))?;
+        Self::start_config(config).await
+    }
+
+    async fn start_config(config: Config) -> anyhow::Result<Self> {
+        Self::start_config_inner(config, false).await
+    }
+
+    async fn start_config_inner(mut config: Config, defer_gateway: bool) -> anyhow::Result<Self> {
+        guard();
+        let pins = guarded_pin_root();
+        let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
+        let direct = config
+            .datapath
+            .as_ref()
+            .and_then(|d| d.direct)
+            .context("fixture requires a Direct profile")?;
         config.ensure_builtin_nodes();
         config.global.tcp_check_url.clear();
         config.global.udp_check_dns = vec!["127.0.0.1:9".into()];
@@ -89,8 +105,16 @@ impl Fixture {
         let shutdown = plane.shutdown_intent();
         let router = plane.traffic_router();
         let authority = plane.core_forward_policy(Execution::MixedEndpoints).await?;
-        let (runtime, owner) =
-            start_runtime(plane, &config, &pins, &artifacts, admission, pname).await?;
+        let (runtime, owner) = start_runtime(
+            plane,
+            &config,
+            &pins,
+            &artifacts,
+            admission,
+            pname,
+            defer_gateway,
+        )
+        .await?;
         ensure!(runtime.gateway.is_some() == (direct == DirectProfile::Endpoint));
         ensure!(runtime.core.is_some() == (direct == DirectProfile::Core));
         Ok(Self {
@@ -457,7 +481,7 @@ async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyh
         for device in &fixture.runtime.devices {
             let state = honk_xsk::xdp_state(device.info.ifindex)
                 .with_context(|| format!("reading {} XDP state before close", device.info.name))?;
-            let expected = device.programs.data_prog_id();
+            let expected = fixture_program_id(fixture.runtime.gateway.as_deref(), device)?;
             ensure!(
                 expected != 0 && state.prog_id == expected,
                 "{} XDP program before close: expected {expected}, got {state:?}",
@@ -506,10 +530,26 @@ async fn gateway_close_detaches_links_after_backend_unregister_timeout() -> anyh
     .context("bounded gateway unregister timeout fixture")?
 }
 
+fn fixture_program_id(publisher: Option<&GatewayPublisher>, device: &Device) -> io::Result<u32> {
+    match publisher {
+        Some(publisher) => publisher.validate_programs(|members| {
+            members
+                .iter()
+                .find(|(idx, _)| *idx == device.info.ifindex)
+                .map(|(_, prog)| *prog)
+                .ok_or_else(|| io::Error::other("fixture gateway member missing"))
+        }),
+        None => Ok(device.unpublished_programs()?.data_prog_id()),
+    }
+}
+
 // Use the fixture's own link, independently of where Gateway or Core stores its FD.
-fn revoke_fixture_link(device: &Device) -> anyhow::Result<()> {
+fn revoke_fixture_link(
+    publisher: Option<&GatewayPublisher>,
+    device: &Device,
+) -> anyhow::Result<()> {
     let ifindex = format!("ifindex:\t{}", device.info.ifindex);
-    let program = format!("prog_id:\t{}", device.programs.data_prog_id());
+    let program = format!("prog_id:\t{}", fixture_program_id(publisher, device)?);
     let mut owned = None;
     for entry in std::fs::read_dir("/proc/self/fdinfo")? {
         let entry = entry?;
@@ -616,7 +656,7 @@ async fn quiet_link_loss(direct: DirectProfile) -> anyhow::Result<()> {
             .iter()
             .find(|d| d.info.name == "dut0")
             .context("dut0")?;
-        revoke_fixture_link(device)?;
+        revoke_fixture_link(f.runtime.gateway.as_deref(), device)?;
         let error = tokio::time::timeout_at((due + Duration::from_secs(1)).into(), async {
             loop {
                 match owner_step(

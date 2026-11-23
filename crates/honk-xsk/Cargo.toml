@@ -14,3 +14,4 @@ aya-obj.workspace = true
 honk-ebpf-common.workspace = true
 honk-datapath.workspace = true
 honk-netstack.workspace = true
+tracing.workspace = true

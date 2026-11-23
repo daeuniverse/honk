@@ -1948,6 +1948,7 @@ dependencies = [
  "honk-ebpf-common",
  "honk-netstack",
  "libc",
+ "tracing",
 ]
 
 [[package]]

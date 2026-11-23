@@ -1,9 +1,12 @@
 use super::*;
 use honk_ebpf_common::xdp_gateway::{
-    CaptureRealmKey, EndpointHold, FragmentKey, FragmentVerdict, GATEWAY_REASON_COUNT, GatewayKey,
+    CaptureRealmKey, EndpointHold, FragmentKey, FragmentVerdict, GATEWAY_REALM_CAPACITY,
+    GATEWAY_REASON_COUNT, GatewayDnsKey, GatewayDnsValue, GatewayKey, GatewayReason,
     LocalAddressKey,
 };
+use std::ptr::NonNull;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type HoldValue = EndpointHold;
 
@@ -11,6 +14,7 @@ pub struct GatewayLoad<'a> {
     pub routing: &'a [aya_obj::generated::bpf_insn],
     pub maps: &'a GatewayMaps,
     pub conntrack: &'a ConntrackKfuncs,
+    pub dns: Option<&'a GatewayDnsMaps>,
 }
 
 #[repr(C)]
@@ -22,6 +26,7 @@ struct MapInfo {
     value_size: u32,
     entries: u32,
     flags: u32,
+    name: [u8; 16],
 }
 
 impl GatewayLoad<'_> {
@@ -111,6 +116,291 @@ impl GatewayLoad<'_> {
         Ok(retained)
     }
 }
+
+#[derive(Debug)]
+struct DnsLoadError {
+    reason: &'static str,
+    error: io::Error,
+}
+
+impl std::fmt::Display for DnsLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.reason, self.error)
+    }
+}
+
+impl std::error::Error for DnsLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+pub(super) fn dns_load_error(reason: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), DnsLoadError { reason, error })
+}
+
+pub fn gateway_dns_load_failure(error: &io::Error) -> Option<&'static str> {
+    Some(error.get_ref()?.downcast_ref::<DnsLoadError>()?.reason)
+}
+
+const DNS_FACTS: u32 = 4096;
+const BPF_F_MMAPABLE: u32 = 1 << 10;
+
+#[repr(C, align(64))]
+struct EpochSlot {
+    epoch: AtomicU64,
+    _pad: [u8; 56],
+}
+const _: () = assert!(size_of::<EpochSlot>() == 64);
+
+pub struct GatewayDnsMaps {
+    pub(super) facts: OwnedFd,
+    pub(super) epochs: OwnedFd,
+    ids: [u32; 2],
+    slots: NonNull<EpochSlot>,
+    capacity: u32,
+    cursor: Mutex<Option<GatewayDnsKey>>,
+}
+
+// SAFETY: the mapping stays alive with this owner, and only atomic stores access it.
+unsafe impl Send for GatewayDnsMaps {}
+unsafe impl Sync for GatewayDnsMaps {}
+
+impl Drop for GatewayDnsMaps {
+    fn drop(&mut self) {
+        // SAFETY: sole owner of the original mmap address and length.
+        unsafe {
+            libc::munmap(
+                self.slots.as_ptr().cast(),
+                self.capacity as usize * size_of::<EpochSlot>(),
+            )
+        };
+    }
+}
+
+impl GatewayDnsMaps {
+    pub fn new(realm_capacity: u32) -> io::Result<Self> {
+        if !(2..=GATEWAY_REALM_CAPACITY + 1).contains(&realm_capacity) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid gateway DNS realm capacity",
+            ));
+        }
+        if !cfg!(all(
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "unsupported gateway DNS atomic architecture",
+            ));
+        }
+        let facts = create::<GatewayDnsKey, GatewayDnsValue>(1, DNS_FACTS, b"dns_facts", -1)?;
+        let epochs = create_with_flags::<u32, EpochSlot>(
+            2,
+            realm_capacity,
+            b"dns_epochs",
+            -1,
+            BPF_F_MMAPABLE,
+        )?;
+        let mut ids = [0; 2];
+        for (id, (fd, kind, key_size, value_size, entries, flags, name)) in ids.iter_mut().zip([
+            (&facts, 1, 32, 40, DNS_FACTS, 0, &b"dns_facts"[..]),
+            (
+                &epochs,
+                2,
+                4,
+                64,
+                realm_capacity,
+                BPF_F_MMAPABLE,
+                &b"dns_epochs"[..],
+            ),
+        ]) {
+            let mut info = MapInfo::default();
+            object_info(fd.as_fd(), &mut info)?;
+            if info.id == 0
+                || info.kind != kind
+                || info.key_size != key_size
+                || info.value_size != value_size
+                || info.entries != entries
+                || info.flags != flags
+                || info.name != object_name(name)
+            {
+                return Err(invalid_data("gateway DNS map layout mismatch"));
+            }
+            *id = info.id;
+        }
+        let bytes = realm_capacity as usize * size_of::<EpochSlot>();
+        // SAFETY: array offset zero is the first value; kernel rounds the bounded length to pages.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                epochs.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let Some(slots) = NonNull::new(ptr.cast::<EpochSlot>()).filter(|p| p.as_ptr().is_aligned())
+        else {
+            // SAFETY: mmap succeeded, but its address is unsuitable for Rust atomic access.
+            unsafe { libc::munmap(ptr, bytes) };
+            return Err(invalid_data("invalid gateway DNS epoch mapping address"));
+        };
+        Ok(Self {
+            facts,
+            epochs,
+            ids,
+            slots,
+            capacity: realm_capacity,
+            cursor: Mutex::new(None),
+        })
+    }
+
+    pub(super) fn validate_program(&self, fd: BorrowedFd<'_>, id: u32) -> io::Result<()> {
+        // bpf_prog_info through map_ids. A prefix also works on the kernel floor.
+        #[repr(C)]
+        #[derive(Default)]
+        struct Info {
+            kind: u32,
+            id: u32,
+            tag: [u8; 8],
+            jited_prog_len: u32,
+            xlated_prog_len: u32,
+            jited_prog_insns: u64,
+            xlated_prog_insns: u64,
+            load_time: u64,
+            created_by_uid: u32,
+            nr_map_ids: u32,
+            map_ids: u64,
+        }
+        let identity_error = |err| dns_load_error("map_identity", err);
+        let mut info = Info::default();
+        object_info(fd, &mut info).map_err(identity_error)?;
+        if info.id != id || info.kind != BPF_PROG_TYPE_XDP {
+            return Err(identity_error(invalid_data(
+                "gateway DNS program identity mismatch",
+            )));
+        }
+        if info.jited_prog_len == 0 {
+            return Err(dns_load_error(
+                "jit_disabled",
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "gateway DNS program has no JIT image",
+                ),
+            ));
+        }
+        let mut ids = Vec::<u32>::new();
+        ids.try_reserve_exact(info.nr_map_ids as usize)
+            .map_err(|_| {
+                identity_error(io::Error::other("gateway DNS program map ID allocation"))
+            })?;
+        ids.resize(info.nr_map_ids as usize, 0);
+        let mut info = Info {
+            nr_map_ids: info.nr_map_ids,
+            map_ids: ids.as_mut_ptr() as u64,
+            ..Info::default()
+        };
+        object_info(fd, &mut info).map_err(identity_error)?;
+        if info.nr_map_ids as usize != ids.len() || !self.ids.iter().all(|id| ids.contains(id)) {
+            return Err(identity_error(invalid_data(
+                "gateway program does not own both DNS map IDs",
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn object_fds(&self) -> [BorrowedFd<'_>; 2] {
+        [self.facts.as_fd(), self.epochs.as_fd()]
+    }
+
+    pub fn memory_bytes(&self) -> usize {
+        // The mapping aliases kernel array pages already charged by kernel_memory_bytes.
+        size_of::<Self>()
+    }
+
+    pub fn set_epoch(&self, realm: u32, epoch: u64) {
+        assert!(
+            realm != 0 && realm < self.capacity,
+            "invalid gateway DNS epoch index"
+        );
+        // SAFETY: this in-bounds cache-line aligned slot remains mapped for the borrow.
+        unsafe { &(*self.slots.as_ptr().add(realm as usize)).epoch }.store(epoch, Ordering::SeqCst);
+    }
+
+    pub fn insert(&self, key: &GatewayDnsKey, value: &GatewayDnsValue) -> io::Result<()> {
+        if key.realm_id == 0
+            || key.realm_id >= self.capacity
+            || key.reserved != 0
+            || key.export_epoch == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid gateway DNS fact key",
+            ));
+        }
+        update(self.facts.as_fd(), key, value, 1)
+    }
+
+    pub fn lookup(&self, key: &GatewayDnsKey) -> io::Result<Option<GatewayDnsValue>> {
+        lookup(self.facts.as_fd(), key)
+    }
+
+    fn next_key(&self, key: Option<&GatewayDnsKey>) -> io::Result<Option<GatewayDnsKey>> {
+        let mut next = GatewayDnsKey::default();
+        let mut attr = MapElemAttr {
+            map_fd: self.facts.as_raw_fd() as u32,
+            reserved: 0,
+            key: key.map_or(0, |key| std::ptr::from_ref(key) as u64),
+            value: std::ptr::from_mut(&mut next) as u64,
+            flags: 0,
+        };
+        match bpf(4, &mut attr) {
+            Ok(_) => Ok(Some(next)),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn reclaim(
+        &self,
+        should_remove: impl Fn(&GatewayDnsKey) -> bool,
+    ) -> io::Result<(usize, usize, bool)> {
+        let mut cursor = self
+            .cursor
+            .lock()
+            .map_err(|_| invalid_data("gateway DNS cursor poisoned"))?;
+        if cursor.is_none() {
+            *cursor = self.next_key(None)?;
+        }
+        let mut scanned = 0;
+        let mut deleted = 0;
+        while scanned < 256 {
+            let Some(key) = *cursor else { break };
+            // Fetch the successor before deleting: get_next_key restarts if its input vanished.
+            let successor = self.next_key(Some(&key))?;
+            scanned += 1;
+            if should_remove(&key) {
+                match bpf(
+                    BPF_MAP_DELETE_ELEM,
+                    &mut elem(self.facts.as_fd(), &key, 0, 0),
+                ) {
+                    Ok(_) => deleted += 1,
+                    Err(error) if error.raw_os_error() == Some(libc::ENOENT) => (),
+                    Err(error) => return Err(error),
+                }
+            }
+            *cursor = successor;
+        }
+        Ok((scanned, deleted, cursor.is_none()))
+    }
+}
+
 pub struct GatewayMaps {
     pub(super) realms: OwnedFd,
     pub(super) local_root: OwnedFd,
@@ -125,6 +415,16 @@ pub struct GatewayMaps {
 }
 
 fn create<K, V>(kind: u32, entries: u32, name: &[u8], inner: RawFd) -> io::Result<OwnedFd> {
+    create_with_flags::<K, V>(kind, entries, name, inner, 0)
+}
+
+fn create_with_flags<K, V>(
+    kind: u32,
+    entries: u32,
+    name: &[u8],
+    inner: RawFd,
+    flags: u32,
+) -> io::Result<OwnedFd> {
     bpf_fd(
         BPF_MAP_CREATE,
         &mut MapCreateAttr {
@@ -134,7 +434,7 @@ fn create<K, V>(kind: u32, entries: u32, name: &[u8], inner: RawFd) -> io::Resul
             value_size: u32::try_from(size_of::<V>())
                 .map_err(|_| invalid_data("gateway value too large"))?,
             max_entries: entries,
-            map_flags: 0,
+            map_flags: flags,
             inner_map_fd: inner.max(0) as u32,
             numa_node: 0,
             map_name: object_name(name),
@@ -239,18 +539,22 @@ impl GatewayMaps {
         self.stats.as_fd()
     }
     pub fn lookup_errors(&self) -> io::Result<u64> {
+        self.reason_count(GatewayReason::CtLookupError)
+    }
+
+    pub fn reason_count(&self, reason: GatewayReason) -> io::Result<u64> {
         let mut values = self
             .lookup_scratch
             .lock()
             .map_err(|_| invalid_data("gateway counter lock poisoned"))?;
-        let key = honk_ebpf_common::xdp_gateway::GatewayReason::CtLookupError as u32;
+        let key = reason as u32;
         bpf(
             BPF_MAP_LOOKUP_ELEM,
             &mut elem(self.stats.as_fd(), &key, values.as_mut_ptr() as u64, 0),
         )?;
         values.iter().try_fold(0u64, |sum, value| {
             sum.checked_add(*value)
-                .ok_or_else(|| invalid_data("gateway lookup error count overflow"))
+                .ok_or_else(|| invalid_data("gateway reason count overflow"))
         })
     }
 
@@ -265,7 +569,7 @@ impl GatewayMaps {
         addresses: &[LocalAddressKey],
     ) -> io::Result<Self> {
         if realms.is_empty()
-            || realms.len() > 4096
+            || realms.len() > GATEWAY_REALM_CAPACITY as usize
             || realms.iter().any(|(key, id)| {
                 key.physical_ifindex == 0
                     || key.vlan_count > 2
@@ -287,7 +591,8 @@ impl GatewayMaps {
             .map_err(|_| io::Error::other("gateway per-CPU scratch capacity"))?;
         lookup_scratch.resize(cpus, 0);
         let lookup_scratch_bytes = lookup_scratch.capacity() * size_of::<u64>();
-        let realms_fd = create::<CaptureRealmKey, u32>(1, 4096, b"honk_gw_realms", -1)?;
+        let realms_fd =
+            create::<CaptureRealmKey, u32>(1, GATEWAY_REALM_CAPACITY, b"honk_gw_realms", -1)?;
         for (key, realm) in realms {
             update(realms_fd.as_fd(), key, realm, 1)?;
         }
@@ -407,6 +712,78 @@ fn is_idle(value: EndpointHold, now_ns: u64, idle_ns: u64) -> bool {
 mod tests {
     use super::*;
     use honk_ebpf_common::xdp_gateway::HOLD_IDLE_NS;
+
+    #[test]
+    fn dns_capacity_rejects_out_of_range_before_map_creation() {
+        for capacity in [0, 1, 4098, u32::MAX] {
+            let error = GatewayDnsMaps::new(capacity)
+                .err()
+                .expect("invalid capacity admitted");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires disposable VM root and private network namespace"]
+    fn kernel_gateway_dns_maps_pressure_epoch_stride_and_reclaim_lookahead() {
+        require_vm();
+        let dns = GatewayDnsMaps::new(3).unwrap();
+        let epoch_slot =
+            |realm: u32| -> [u64; 8] { lookup(dns.epochs.as_fd(), &realm).unwrap().unwrap() };
+        assert_eq!(epoch_slot(0), [0; 8]);
+        assert_eq!(epoch_slot(1), [0; 8]);
+        dns.set_epoch(1, 7);
+        dns.set_epoch(2, 3);
+        assert_eq!(epoch_slot(1), [7, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(epoch_slot(2), [3, 0, 0, 0, 0, 0, 0, 0]);
+        let key = |i: u32| GatewayDnsKey {
+            realm_id: if i == 0 { 2 } else { 1 },
+            export_epoch: if i == 0 { 3 } else { 7 },
+            canonical_dst: std::net::Ipv4Addr::from(i).to_ipv6_mapped().octets(),
+            reserved: 0,
+        };
+        let value = GatewayDnsValue {
+            valid_before_mono_ns: u64::MAX,
+            ..Default::default()
+        };
+        for i in 0..DNS_FACTS {
+            dns.insert(&key(i), &value).unwrap();
+        }
+        assert_eq!(
+            dns.insert(&key(0), &Default::default())
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EEXIST)
+        );
+        assert_eq!(dns.lookup(&key(0)).unwrap(), Some(value));
+        assert!(matches!(
+            dns.insert(&key(DNS_FACTS), &value)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::E2BIG | libc::ENOSPC)
+        ));
+        dns.set_epoch(1, 8);
+        let mut deleted = 0;
+        for batch in 1..=DNS_FACTS / 256 {
+            let (scanned, removed, end) = dns
+                .reclaim(|k| k.realm_id == 1 && k.export_epoch < 8)
+                .unwrap();
+            assert_eq!(scanned, 256);
+            assert_eq!(end, batch == DNS_FACTS / 256);
+            deleted += removed;
+        }
+        assert_eq!(deleted, DNS_FACTS as usize - 1);
+        assert_eq!(dns.lookup(&key(0)).unwrap(), Some(value));
+        assert_eq!(dns.reclaim(|_| false).unwrap(), (1, 0, true));
+        dns.insert(
+            &GatewayDnsKey {
+                export_epoch: 8,
+                ..key(DNS_FACTS)
+            },
+            &value,
+        )
+        .unwrap();
+    }
 
     #[test]
     fn possible_cpu_ranges_count_sparse_possible_cpus_and_reject_overlap() {

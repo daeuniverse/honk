@@ -1,3 +1,4 @@
+pub(crate) mod dns;
 pub(crate) mod hold;
 pub(crate) mod policy;
 pub(crate) mod zones;
@@ -6,13 +7,26 @@ pub(crate) use hold::HoldCollector;
 pub(crate) use policy::GatewayPolicy;
 pub(crate) use zones::ZoneAdmission;
 
+use crate::control::ShutdownIntent;
 use crate::control::routing_matcher::RoutingPushPlan;
+use crate::dns::projection::RoutingProjection;
+use crate::stats::xdp::{Diagnostics, DnsProjectionState};
+use dns::GatewayDnsBank;
+use honk_datapath::ScopeId;
+use honk_ebpf_common::xdp_gateway::GatewayReason;
 use honk_netstack::{MemoryBudget, MemoryReservation};
 use honk_xsk::{ConntrackKfuncs, GatewayLoad, GatewayMaps, GeneralCapture, OwnedXdpLink, Programs};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
-use std::{io, net::Ipv4Addr, sync::Arc};
+use std::{
+    io,
+    net::Ipv4Addr,
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
-fn reserve_objects<'a>(
+pub(super) fn reserve_objects<'a>(
     budget: &Arc<MemoryBudget>,
     fds: impl IntoIterator<Item = std::os::fd::BorrowedFd<'a>>,
 ) -> io::Result<MemoryReservation> {
@@ -23,7 +37,7 @@ fn reserve_objects<'a>(
     })?;
     budget
         .reserve(bytes)
-        .ok_or_else(|| io::Error::other("gateway kernel memory capacity"))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "gateway kernel memory capacity"))
 }
 
 pub(crate) struct GatewayReload {
@@ -34,20 +48,67 @@ pub(crate) struct GatewayReload {
 
 struct Member {
     ifindex: u32,
-    programs: Arc<Programs>,
+    programs: Programs,
     reload: GatewayReload,
 }
 
-struct Previous {
+struct Generation {
     policy: GatewayPolicy,
-    programs: Vec<Arc<Programs>>,
+    bank: Option<Arc<GatewayDnsBank>>,
+    status: DnsProjectionState,
     memory: Vec<MemoryReservation>,
 }
 
+enum PreparedGeneration {
+    KeepStatic(DnsProjectionState),
+    Replace(Generation, Vec<Programs>),
+}
+
+enum PrepareError {
+    Policy(io::Error),
+    Candidate(io::Error),
+    Authority(io::Error),
+}
+
+impl PrepareError {
+    fn into_error(self) -> io::Error {
+        match self {
+            Self::Policy(error) | Self::Candidate(error) | Self::Authority(error) => error,
+        }
+    }
+
+    fn shadow_failure(self) -> Result<(&'static str, io::Error), io::Error> {
+        match self {
+            Self::Policy(error) | Self::Candidate(error)
+                if error.kind() == io::ErrorKind::OutOfMemory =>
+            {
+                Ok(("memory_budget", error))
+            }
+            Self::Policy(error) | Self::Candidate(error)
+                if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+            {
+                Ok(("candidate_fds", error))
+            }
+            Self::Policy(error) => Ok(("policy_prepare", error)),
+            Self::Candidate(error) => match honk_xsk::gateway_dns_load_failure(&error) {
+                Some(reason) => Ok((reason, error)),
+                None => Err(error),
+            },
+            Self::Authority(error) => Err(error),
+        }
+    }
+}
+
+struct Previous {
+    // Kernel programs must release their map references before the charge is refunded.
+    programs: Vec<Programs>,
+    generation: Generation,
+    suspended: Option<(Arc<GatewayDnsBank>, u64)>,
+}
+
 struct PublisherInner {
-    policy: GatewayPolicy,
     members: Vec<Member>,
-    memory: Vec<MemoryReservation>,
+    current: Generation,
     previous: Option<Previous>,
 }
 
@@ -121,28 +182,116 @@ fn publisher_busy() -> io::Error {
     io::Error::new(io::ErrorKind::WouldBlock, "gateway publisher is busy")
 }
 
+pub(super) struct GatewayShadow {
+    projection: Weak<RoutingProjection>,
+    diagnostics: Arc<Diagnostics>,
+    admission: Arc<AtomicBool>,
+    healthy: Arc<AtomicBool>,
+    shutdown: Arc<ShutdownIntent>,
+    stopped: AtomicBool,
+    realms: Box<[(ScopeId, u32)]>,
+    base_status: DnsProjectionState,
+    _bindings_memory: Option<MemoryReservation>,
+}
+
+impl GatewayShadow {
+    pub(super) fn new(
+        realms: impl Iterator<Item = (ScopeId, u32)> + Clone,
+        projection: &Arc<RoutingProjection>,
+        diagnostics: Arc<Diagnostics>,
+        admission: Arc<AtomicBool>,
+        healthy: Arc<AtomicBool>,
+        shutdown: Arc<ShutdownIntent>,
+        budget: &Arc<MemoryBudget>,
+    ) -> Self {
+        let count = realms.clone().count();
+        let (realms, base_status, memory) = if count == 0 {
+            (Box::default(), DnsProjectionState::Disabled, None)
+        } else if let Some(charge) = budget.reserve(count * size_of::<(ScopeId, u32)>()) {
+            let mut bound = Vec::with_capacity(count);
+            bound.extend(realms);
+            (
+                bound.into_boxed_slice(),
+                DnsProjectionState::NoDomainRules,
+                Some(charge),
+            )
+        } else {
+            (
+                Box::default(),
+                DnsProjectionState::Fallback("memory_budget"),
+                None,
+            )
+        };
+        diagnostics.dns_state(base_status);
+        Self {
+            projection: Arc::downgrade(projection),
+            diagnostics,
+            admission,
+            healthy,
+            shutdown,
+            stopped: AtomicBool::new(false),
+            realms,
+            base_status,
+            _bindings_memory: memory,
+        }
+    }
+
+    fn allowed(&self) -> bool {
+        !self.stopped.load(Ordering::Acquire)
+            && self.admission.load(Ordering::Acquire)
+            && self.healthy.load(Ordering::Acquire)
+    }
+
+    fn suspend(&self) -> Option<(Arc<GatewayDnsBank>, u64)> {
+        self.projection.upgrade()?.close_gateway_dns()
+    }
+
+    fn activate(&self, bank: Arc<GatewayDnsBank>, generation: u64) {
+        let Ok(_start) = self.shutdown.lock_capture_start() else {
+            return;
+        };
+        if self.allowed()
+            && let Some(projection) = self.projection.upgrade()
+            && projection.activate_gateway_dns(Some(bank), generation, || self.allowed())
+        {
+            self.diagnostics.dns_state(DnsProjectionState::Active);
+        }
+    }
+
+    fn resume(&self, suspended: Option<(Arc<GatewayDnsBank>, u64)>) {
+        if let Some((bank, generation)) = suspended {
+            self.activate(bank, generation);
+        }
+    }
+}
+
 pub(crate) struct GatewayPublisher {
     state: PublisherState<PublisherInner, OwnedXdpLink>,
     maps: Arc<GatewayMaps>,
     conntrack: Arc<ConntrackKfuncs>,
     budget: Arc<MemoryBudget>,
-    _initial_memory: MemoryReservation,
+    shadow: GatewayShadow,
 }
 
 impl GatewayPublisher {
-    pub(crate) fn new(
-        policy: GatewayPolicy,
+    pub(super) fn new(
+        initial: (GatewayPolicy, MemoryReservation),
         maps: Arc<GatewayMaps>,
         conntrack: Arc<ConntrackKfuncs>,
         budget: Arc<MemoryBudget>,
-    ) -> io::Result<Self> {
-        let initial_memory = reserve_objects(&budget, policy.fact_fds())?;
-        Ok(Self {
+        shadow: GatewayShadow,
+    ) -> Self {
+        let (policy, initial_memory) = initial;
+        Self {
             state: PublisherState {
                 inner: Mutex::new(PublisherInner {
-                    policy,
                     members: Vec::new(),
-                    memory: Vec::new(),
+                    current: Generation {
+                        policy,
+                        bank: None,
+                        status: shadow.base_status,
+                        memory: vec![initial_memory],
+                    },
                     previous: None,
                 }),
                 links: Mutex::new(LinkCustody::Open(Vec::new())),
@@ -150,29 +299,32 @@ impl GatewayPublisher {
             maps,
             conntrack,
             budget,
-            _initial_memory: initial_memory,
-        })
+            shadow,
+        }
     }
 
     pub(crate) fn set_mode_flags(&self, flags: u32) -> io::Result<()> {
-        drop(self.state.open_links()?);
+        let _links = self.state.open_links()?;
         self.maps.set_mode_flags(flags)
     }
 
+    #[cfg(all(test, feature = "ebpf"))]
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
-        self.state.inner.lock().policy.fingerprint
+        self.state.inner.lock().current.policy.bytecode.fingerprint
     }
 
     pub(crate) fn register(
         &self,
         ifindex: u32,
         link: OwnedXdpLink,
-        programs: Arc<Programs>,
+        programs: (Programs, MemoryReservation),
         reload: GatewayReload,
     ) -> io::Result<()> {
         // The startup link is already live. Refuse contention before taking custody.
         let mut inner = self.state.inner.try_lock().ok_or_else(publisher_busy)?;
         let mut links = self.state.open_links()?;
+        let (programs, charge) = programs;
+        inner.current.memory.push(charge);
         inner.members.push(Member {
             ifindex,
             programs,
@@ -182,9 +334,97 @@ impl GatewayPublisher {
         Ok(())
     }
 
+    fn build_generation(
+        &self,
+        inner: &PublisherInner,
+        plan: &RoutingPushPlan,
+        bank: Option<Arc<GatewayDnsBank>>,
+        status: DnsProjectionState,
+    ) -> Result<(Generation, Vec<Programs>), PrepareError> {
+        let policy = GatewayPolicy::prepare(plan, bank.is_some()).map_err(PrepareError::Policy)?;
+        let mut memory = Vec::with_capacity(inner.members.len() + 1);
+        memory.push(
+            reserve_objects(&self.budget, policy.fact_fds()).map_err(PrepareError::Candidate)?,
+        );
+        let mut candidates = Vec::with_capacity(inner.members.len());
+        for member in &inner.members {
+            drop(self.state.open_links().map_err(PrepareError::Authority)?);
+            let program = member
+                .programs
+                .reload_general_gateway(GatewayLoad {
+                    routing: &policy.bytecode.insns,
+                    maps: &self.maps,
+                    conntrack: &self.conntrack,
+                    dns: bank.as_ref().map(|bank| bank.maps()),
+                })
+                .map_err(PrepareError::Candidate)?;
+            memory.push(
+                reserve_objects(&self.budget, program.object_fds().into_iter().skip(2))
+                    .map_err(PrepareError::Candidate)?,
+            );
+            candidates.push(program);
+        }
+        Ok((
+            Generation {
+                policy,
+                bank,
+                status,
+                memory,
+            },
+            candidates,
+        ))
+    }
+
+    fn prepare_generation(
+        &self,
+        inner: &PublisherInner,
+        plan: &RoutingPushPlan,
+        keep_static: bool,
+    ) -> io::Result<PreparedGeneration> {
+        let build_static = |status| {
+            if keep_static {
+                Ok(PreparedGeneration::KeepStatic(status))
+            } else {
+                self.build_generation(inner, plan, None, status)
+                    .map(|(generation, programs)| PreparedGeneration::Replace(generation, programs))
+                    .map_err(PrepareError::into_error)
+            }
+        };
+        let shadow = &self.shadow;
+        if !plan.has_domain_rules || shadow.realms.is_empty() {
+            return build_static(shadow.base_status);
+        }
+        let (reason, error) =
+            match GatewayDnsBank::new(&self.budget, plan.fingerprint, &shadow.realms) {
+                Err(error) => {
+                    let reason = match error.kind() {
+                        io::ErrorKind::Unsupported => "unsupported_arch",
+                        io::ErrorKind::OutOfMemory => "memory_budget",
+                        _ if error.raw_os_error() == Some(libc::ENOMEM) => "memory_budget",
+                        _ => "map_admission",
+                    };
+                    (reason, error)
+                }
+                Ok(bank) => {
+                    match self.build_generation(inner, plan, Some(bank), DnsProjectionState::Staged)
+                    {
+                        Ok((generation, programs)) => {
+                            return Ok(PreparedGeneration::Replace(generation, programs));
+                        }
+                        Err(error) => error.shadow_failure()?,
+                    }
+                }
+            };
+        tracing::debug!(reason, %error, "gateway DNS shadow candidate unavailable");
+        build_static(DnsProjectionState::Fallback(reason))
+    }
+
     pub(crate) fn publish(&self, plan: &RoutingPushPlan) -> io::Result<()> {
+        self.publish_inner(plan, false)
+    }
+
+    fn publish_inner(&self, plan: &RoutingPushPlan, initial_static: bool) -> io::Result<()> {
         drop(self.state.open_links()?);
-        let policy = GatewayPolicy::prepare(plan)?;
         let mut inner = self.state.inner.lock();
         drop(self.state.open_links()?);
         if inner.previous.is_some() {
@@ -192,7 +432,6 @@ impl GatewayPublisher {
                 "gateway publication is awaiting commit or rollback",
             ));
         }
-        let mut candidates = Vec::with_capacity(inner.members.len());
         for member in &inner.members {
             if member.reload.capture.authority.ifindex != member.ifindex
                 || member.reload.queues == 0
@@ -203,24 +442,29 @@ impl GatewayPublisher {
                     "gateway reload identity mismatch",
                 ));
             }
-            drop(self.state.open_links()?);
-            candidates.push(Arc::new(member.programs.reload_general_gateway(
-                GatewayLoad {
-                    routing: &policy.bytecode.insns,
-                    maps: &self.maps,
-                    conntrack: &self.conntrack,
-                },
-            )?));
         }
+        let keep_static = initial_static
+            && inner.current.bank.is_none()
+            && inner.current.policy.bytecode.fingerprint == plan.fingerprint;
+        let (generation, mut candidates) =
+            match self.prepare_generation(&inner, plan, keep_static)? {
+                PreparedGeneration::Replace(generation, programs) => (generation, programs),
+                PreparedGeneration::KeepStatic(status) => {
+                    for (index, member) in inner.members.iter().enumerate() {
+                        self.state.open_links()?[index].verify(member.programs.data_prog_id())?;
+                    }
+                    let _links = self.state.open_links()?;
+                    inner.current.status = status;
+                    self.shadow.diagnostics.dns_state(status);
+                    return Ok(());
+                }
+            };
         drop(self.state.open_links()?);
-        let mut memory = Vec::with_capacity(candidates.len() + 1);
-        memory.push(reserve_objects(&self.budget, policy.fact_fds())?);
-        for candidate in &candidates {
-            memory.push(reserve_objects(
-                &self.budget,
-                candidate.object_fds().into_iter().skip(2),
-            )?);
-        }
+        let suspended = if inner.current.bank.is_some() {
+            self.shadow.suspend()
+        } else {
+            None
+        };
         for (index, candidate) in candidates.iter().enumerate() {
             let member = &inner.members[index];
             let replaced = self.state.open_links()?[index]
@@ -253,6 +497,8 @@ impl GatewayPublisher {
                         )));
                     }
                 }
+                let _links = self.state.open_links()?;
+                self.shadow.resume(suspended);
                 return Err(error);
             }
         }
@@ -260,12 +506,12 @@ impl GatewayPublisher {
         for (member, programs) in inner.members.iter_mut().zip(&mut candidates) {
             std::mem::swap(&mut member.programs, programs);
         }
-        let previous_policy = std::mem::replace(&mut inner.policy, policy);
-        let previous_memory = std::mem::replace(&mut inner.memory, memory);
+        let previous = std::mem::replace(&mut inner.current, generation);
+        self.shadow.diagnostics.dns_state(inner.current.status);
         inner.previous = Some(Previous {
-            policy: previous_policy,
             programs: candidates,
-            memory: previous_memory,
+            generation: previous,
+            suspended,
         });
         Ok(())
     }
@@ -308,9 +554,63 @@ impl GatewayPublisher {
         for (member, programs) in inner.members.iter_mut().zip(&mut previous.programs) {
             std::mem::swap(&mut member.programs, programs);
         }
-        std::mem::swap(&mut inner.policy, &mut previous.policy);
-        std::mem::swap(&mut inner.memory, &mut previous.memory);
+        std::mem::swap(&mut inner.current, &mut previous.generation);
+        self.shadow.diagnostics.dns_state(inner.current.status);
+        self.shadow.resume(previous.suspended.take());
         Ok(())
+    }
+
+    pub(crate) fn prepare_start(&self, plan: &RoutingPushPlan) -> io::Result<()> {
+        self.publish_inner(plan, true)
+    }
+
+    pub(crate) fn activate_dns(&self, fingerprint: [u8; 32], generation: u64) {
+        let inner = self.state.inner.lock();
+        let Ok(_links) = self.state.open_links() else {
+            return;
+        };
+        if let Some(bank) = &inner.current.bank
+            && bank.fingerprint() == fingerprint
+        {
+            self.shadow.activate(Arc::clone(bank), generation);
+        }
+    }
+
+    pub(crate) fn stage_dns_reload(&self) {
+        let status = self.state.inner.lock().current.status;
+        self.shadow.diagnostics.dns_state(status);
+    }
+
+    pub(crate) fn degrade_dns(&self) {
+        let _custody = self.state.links.lock();
+        if !self.shadow.realms.is_empty() && !self.shadow.stopped.load(Ordering::Acquire) {
+            self.shadow.suspend();
+            self.shadow
+                .diagnostics
+                .dns_state(DnsProjectionState::Fallback("committed_degraded"));
+        }
+    }
+
+    pub(super) fn sample_dns(&self) {
+        if !self.shadow.realms.is_empty()
+            && let Some(inner) = self.state.inner.try_lock()
+            && let Some(bank) = &inner.current.bank
+        {
+            self.shadow.diagnostics.sample_dns(
+                bank,
+                self.maps.reason_count(GatewayReason::WouldPassDns).ok(),
+            );
+        }
+    }
+
+    pub(crate) fn stop_dns(&self) {
+        let _custody = self.state.links.lock();
+        if !self.shadow.stopped.swap(true, Ordering::AcqRel) {
+            self.shadow.suspend();
+            self.shadow
+                .diagnostics
+                .dns_state(DnsProjectionState::Closed);
+        }
     }
 
     pub(crate) fn validate_programs<T>(
@@ -356,6 +656,7 @@ impl GatewayPublisher {
     }
 
     pub(crate) fn detach_all(&self) -> io::Result<()> {
+        self.stop_dns();
         self.state.detach_all(OwnedXdpLink::detach)
     }
 }
@@ -364,6 +665,23 @@ impl GatewayPublisher {
 mod tests {
     use super::*;
     use std::{io::Read, os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
+
+    #[test]
+    fn optional_candidate_fd_pressure_keeps_authority_error_fatal() {
+        for errno in [libc::EMFILE, libc::ENFILE] {
+            for stage in [PrepareError::Policy, PrepareError::Candidate] {
+                let (reason, error) = stage(io::Error::from_raw_os_error(errno))
+                    .shadow_failure()
+                    .unwrap();
+                assert_eq!(reason, "candidate_fds");
+                assert_eq!(error.raw_os_error(), Some(errno));
+            }
+            let error = PrepareError::Authority(io::Error::from_raw_os_error(errno))
+                .shadow_failure()
+                .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(errno));
+        }
+    }
 
     #[test]
     fn withdrawal_closes_owned_fds_while_policy_is_busy() {

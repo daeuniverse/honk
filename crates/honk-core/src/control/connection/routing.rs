@@ -313,7 +313,7 @@ impl ControlPlaneHandle {
                 .and_then(crate::control::netstack::SourceWork::source_mac)
                 .map(crate::xdp::routing_input::mac_string);
         }
-        let decision = {
+        let (decision, facts) = {
             let router = self.router.read().await;
             let current = self.config.read().await;
             anyhow::ensure!(
@@ -321,23 +321,25 @@ impl ControlPlaneHandle {
                 "packet routing generation changed"
             );
             let generation = self.diagnostics.read().generation;
-            let bitmap = self.dns_controller.packet_domain_bitmap(
+            let facts = self.dns_controller.packet_domain_bitmap(
                 scope,
                 destination.ip(),
                 &router,
                 generation,
             )?;
-            RoutingDecision::from_router(
+            let decision = RoutingDecision::from_router(
                 &router,
                 &input,
-                bitmap.as_ref(),
+                facts.bitmap.as_ref(),
                 #[cfg(feature = "native-api")]
                 self.native
                     .as_deref()
                     .filter(|_| record_route)
                     .map(|native| (native, generation)),
-            )
+            );
+            (decision, facts)
         };
+        self.dns_controller.hot_fill_packet_domain(facts);
         let current = self.config.read().await;
         anyhow::ensure!(
             Arc::ptr_eq(&config, &current),

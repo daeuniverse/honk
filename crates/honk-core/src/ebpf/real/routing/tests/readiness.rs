@@ -130,6 +130,7 @@ fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
             direct_mark_index: None,
         },
         features: 0,
+        dial_mode: honk_config::types::DialMode::Ip,
         fingerprint: [0; 32],
         policy_fingerprint: [0; 32],
         has_domain_rules: false,
