@@ -421,7 +421,7 @@ NFT
 
 run_dns_shadow_wire() {
     local old_namespace_count=${#namespaces[@]} ready profile attempt address
-    local workers protocol wan other_lan earlier_policy dns_switch spec ns dev
+    local workers protocol wan other_lan earlier_group earlier_policy dns_switch spec ns dev
     local wan_target=198.51.100.7
     local proof="$work/dns-shadow-wire"
     mkdir "$proof"
@@ -478,10 +478,12 @@ run_dns_shadow_wire() {
     for profile in udp-static-1 udp-dns-1 udp-static-2 udp-dns-2 tcp-static-1 tcp-dns-1 tcp-static-2 tcp-dns-2; do
         protocol=${profile%%-*}
         workers=${profile##*-}
-        dns_switch= other_lan= earlier_policy= wan='dut1: wan'
+        dns_switch= other_lan= earlier_group= earlier_policy= wan='dut1: wan'
         if [[ $profile == *-static-* ]]; then dns_switch='dns_projection: false'; fi
         if [[ $protocol == udp ]]; then
-            earlier_policy='dip(198.51.100.2/32) && dport(18155) -> direct(mark: 0x100)'
+            earlier_group="group { udp_endpoint { filter: name('direct')
+                final: direct } }"
+            earlier_policy='dip(198.51.100.2/32) && dport(18155) -> udp_endpoint'
             if [[ $workers == 1 ]]; then other_lan='dut2: lan'; fi
         fi
         if [[ $workers == 1 ]]; then
@@ -518,6 +520,7 @@ datapath {
         $other_lan
     }
 }
+$earlier_group
 routing {
     dip(198.51.100.6/32) && dport(53) -> direct(must)
     $earlier_policy
