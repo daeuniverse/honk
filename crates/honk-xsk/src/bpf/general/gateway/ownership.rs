@@ -119,7 +119,7 @@ impl<'a> Owner<'a> {
         b.bind(guard);
         self.acquire(b, gateway.maps, drop);
         self.read_owner(b, gateway.maps);
-        // The initial miss may straddle another SYN's complete pending -> CT handoff.
+        // The initial miss may straddle another packet's complete pending -> CT handoff.
         let miss = b.target();
         conntrack(
             b,
@@ -230,21 +230,16 @@ impl<'a> Owner<'a> {
         let failed = b.target();
         let retry = b.target();
         if gateway.dns.is_some() {
-            let shadow = b.target();
             let unauthorized = b.target();
             b.goto(unauthorized);
             b.bind(self.qualified);
             b.load(LDX_H, 0, 10, KEY + 42);
             b.jump(JEQ_K, 0, 0, u16::from_be(53) as i32, unauthorized);
-            b.load(LDX_B, 0, 10, KEY + 44);
-            b.jump(JNE_K, 0, 0, 6, shadow);
             b.load(LDX_W, 0, 10, PENDING);
             b.jump(JNE_K, 0, 0, 0, retry);
             b.load(LDX_DW, 0, 10, TUPLE);
             b.store(STX_DW, 10, DNS_EPOCH, 0);
             b.goto(allocate);
-            b.bind(shadow);
-            b.stat(gateway.maps, GatewayReason::WouldPassDns);
             b.bind(unauthorized);
             self.pending_conflicts(b);
             b.emit(ST_DW, 10, 0, DNS_EPOCH, 0);
@@ -383,7 +378,7 @@ mod tests {
         b.imm(0, 3);
         b.emit(EXIT, 0, 0, 0, 0);
         let mut writes = writes.iter();
-        let result = interpret(&b, &mut cell, |cell| {
+        let result = interpret(&b, &mut cell, &[], |cell| {
             if let Some(&value) = writes.next() {
                 *cell = value;
             }
@@ -394,6 +389,7 @@ mod tests {
     fn interpret(
         b: &GatewayBuilder,
         cell: &mut u64,
+        stack: &[u8],
         mut before_atomic: impl FnMut(&mut u64),
     ) -> u64 {
         let mut registers = [0u64; 11];
@@ -407,6 +403,16 @@ mod tests {
                     pc += 1;
                     registers[dst] =
                         u64::from(i.imm as u32) | (u64::from(b.program.insns[pc].imm as u32) << 32);
+                    false
+                }
+                LDX_B | LDX_W => {
+                    assert_eq!(src, 10);
+                    let at = stack.len().checked_add_signed(isize::from(i.off)).unwrap();
+                    registers[dst] = if i.code == LDX_B {
+                        u64::from(stack[at])
+                    } else {
+                        u64::from(u32::from_le_bytes(stack[at..at + 4].try_into().unwrap()))
+                    };
                     false
                 }
                 LDX_DW => {
@@ -445,11 +451,13 @@ mod tests {
                     }
                     false
                 }
+                JEQ_K => registers[dst] == i.imm as u64,
+                JNE_K => registers[dst] != i.imm as u64,
                 JLE_X => registers[dst] <= registers[src],
                 JEQ_X => registers[dst] == registers[src],
                 JA => true,
                 EXIT => return registers[0],
-                _ => panic!("unexpected allocation instruction {i:?}"),
+                _ => panic!("unexpected gateway test instruction {i:?}"),
             };
             if branch {
                 let target = b.jumps.iter().find(|(at, _)| *at == pc).unwrap().1;
@@ -457,6 +465,46 @@ mod tests {
             } else {
                 pc += 1;
             }
+        }
+    }
+
+    #[test]
+    fn only_complete_udp_reaches_dns_arbitration() {
+        let mut b = GatewayBuilder::new();
+        let miss = b.target();
+        skip_incomplete_udp(&mut b, miss);
+        b.imm(0, 1);
+        b.emit(EXIT, 0, 0, 0, 0);
+        b.bind(miss);
+        b.imm(0, 0);
+        b.emit(EXIT, 0, 0, 0, 0);
+
+        let mut frame = [0u8; 512];
+        let flags = frame
+            .len()
+            .checked_add_signed(isize::from(FRAG_STATE))
+            .unwrap();
+        let proto = frame
+            .len()
+            .checked_add_signed(isize::from(KEY + 44))
+            .unwrap();
+        for (protocol, state, allowed) in [
+            (17, 0u32, 1),
+            (17, 1, 0),
+            (17, 2, 0),
+            (17, 4, 1),
+            (17, 5, 0),
+            (17, 6, 0),
+            (6, 0, 1),
+            (6, 1, 1),
+        ] {
+            frame[flags..flags + 4].copy_from_slice(&state.to_le_bytes());
+            frame[proto] = protocol;
+            assert_eq!(
+                interpret(&b, &mut 0, &frame, |_| unreachable!()),
+                allowed,
+                "{protocol}/{state}"
+            );
         }
     }
 
@@ -483,20 +531,23 @@ mod tests {
         b.emit(EXIT, 0, 0, 0, 0);
 
         let mut counter = 0;
-        let stamp = interpret(&b, &mut counter, |counter| {
-            assert_eq!(interpret(&b, counter, |_| {}), 1);
-            assert_eq!(interpret(&b, counter, |_| {}), 2);
+        let stamp = interpret(&b, &mut counter, &[], |counter| {
+            assert_eq!(interpret(&b, counter, &[], |_| {}), 1);
+            assert_eq!(interpret(&b, counter, &[], |_| {}), 2);
         });
         assert_eq!((stamp, counter), (3, 3));
 
         counter = HOLD_SEQUENCE_MAX - 1;
-        let stamp = interpret(&b, &mut counter, |counter| {
-            assert_eq!(interpret(&b, counter, |_| {}), HOLD_SEQUENCE_MAX);
+        let stamp = interpret(&b, &mut counter, &[], |counter| {
+            assert_eq!(interpret(&b, counter, &[], |_| {}), HOLD_SEQUENCE_MAX);
         });
         assert_eq!((stamp, counter), (0, HOLD_SEQUENCE_MAX + 1));
         for mut counter in [HOLD_SEQUENCE_MAX, HOLD_SEQUENCE_MAX + 1] {
             let prior = counter;
-            assert_eq!(interpret(&b, &mut counter, |_| panic!("exhausted RMW")), 0);
+            assert_eq!(
+                interpret(&b, &mut counter, &[], |_| panic!("exhausted RMW")),
+                0
+            );
             assert_eq!(counter, prior);
         }
     }

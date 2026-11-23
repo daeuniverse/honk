@@ -780,6 +780,17 @@ fn release_dns_scratch(b: &mut GatewayBuilder, double_exchange: bool) {
     b.emit(ATOMIC_ADD_DW, 8, 1, 0, XCHG);
 }
 
+fn skip_incomplete_udp(b: &mut GatewayBuilder, miss: Target) {
+    let eligible = b.target();
+    b.load(LDX_W, 0, 10, FRAG_STATE);
+    b.jump(JEQ_K, 0, 0, 0, eligible);
+    b.load(LDX_B, 1, 10, KEY + 44);
+    b.jump(JNE_K, 1, 0, 17, eligible);
+    // Only an IPv6 atomic fragment header describes a complete fragmented-form datagram.
+    b.jump(JNE_K, 0, 0, 4, miss);
+    b.bind(eligible);
+}
+
 fn dns_shadow(
     b: &mut GatewayBuilder,
     dns: &crate::GatewayDnsMaps,
@@ -791,6 +802,9 @@ fn dns_shadow(
 ) -> usize {
     // CT has released its reference; its tuple buffer is now private stack space for the DNS key.
     let miss = b.target();
+    if qualified.is_some() {
+        skip_incomplete_udp(b, miss);
+    }
     b.lookup(dns.epochs.as_raw_fd(), KEY);
     b.jump(JEQ_K, 0, 0, 0, miss);
     b.load(LDX_DW, 1, 0, 0);

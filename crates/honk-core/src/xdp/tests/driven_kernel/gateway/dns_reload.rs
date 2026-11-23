@@ -1,6 +1,8 @@
 #![cfg(feature = "ebpf")]
 
+mod batch_udp;
 mod pending;
+mod quic_udp;
 
 use super::{Config, ControlPlane, Fixture};
 use crate::{
@@ -464,6 +466,24 @@ async fn native_pending_survives_static_downshift_until_idle_retirement() -> any
     timeout(Duration::from_secs(100), pending::downshift())
         .await
         .context("bounded pending downshift and real idle sweep")?
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable gateway guest with both real UDP peer paths"]
+async fn udp_quic_early_native_and_revoke() -> anyhow::Result<()> {
+    super::guard();
+    timeout(Duration::from_secs(120), quic_udp::run())
+        .await
+        .context("bounded QUIC early-data and DNS revocation cases")?
+}
+
+#[tokio::test]
+#[ignore = "requires the disposable gateway guest, DUT NAPI tracing and the real attached owner maps"]
+async fn udp_native_one_queue_batch_and_quota_delivery() -> anyhow::Result<()> {
+    super::guard();
+    timeout(Duration::from_secs(140), batch_udp::run())
+        .await
+        .context("bounded UDP batch and Endpoint delivery at capacity")?
 }
 
 fn freeze_mode_map(id: u32) -> anyhow::Result<()> {

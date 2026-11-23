@@ -304,7 +304,7 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
-符合条件的物理 XDP LAN 只导出已准入的 IP：1–32 个未过期 owner 须贡献相同的完整位图（含已知全零），以最早到期时间为准。WAN 和 HOST 不授予导出权，DNS 永不授权端口 53。符合条件的 TCP SYN 须先[确定唯一归属](../reference/global.md#xdp-endpoint-dns-投影)才可走原生路由；UDP 仍只做影子观察。两者按原有序策略求值，不另建 DNS 缓存。
+符合条件的物理 XDP LAN 只导出已准入的 IP：1–32 个未过期 owner 须贡献相同的完整位图（含已知全零），以最早到期时间为准。WAN 和 HOST 不授予导出权，DNS 永不授权端口 53。符合条件的 TCP SYN 或完整 UDP 数据报须先[确定唯一归属](../reference/global.md#xdp-endpoint-dns-投影)才可走原生路由。两者按原有序策略求值，不另建 DNS 缓存。
 
 每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不改变原截止时间。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint。关闭 bank 不会将仍待 conntrack 接管的原生流改归 Endpoint。
 

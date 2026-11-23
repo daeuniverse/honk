@@ -360,6 +360,63 @@ impl GatewayPublisher {
         self.state.inner.lock().current.policy.bytecode.fingerprint
     }
 
+    #[cfg(all(test, feature = "ebpf"))]
+    pub(super) fn unbound_quota_programs(
+        &self,
+        ifindex: u32,
+        attached_id: u32,
+    ) -> anyhow::Result<(Programs, MemoryReservation)> {
+        use anyhow::{Context, ensure};
+
+        let inner = self.state.inner.lock();
+        ensure!(
+            inner.previous.is_none(),
+            "gateway generation is uncommitted"
+        );
+        let (index, member) = inner
+            .members
+            .iter()
+            .enumerate()
+            .find(|(_, member)| member.ifindex == ifindex)
+            .context("gateway quota member")?;
+        let reload = &member.reload;
+        ensure!(
+            member.programs.data_prog_id() == attached_id
+                && reload.capture.authority.ifindex == ifindex
+                && reload.capture.vlan_metadata,
+            "expected the attached VLAN-metadata LAN program"
+        );
+        self.state.open_links()?[index].verify(attached_id)?;
+        let generation = &inner.current;
+        let bank = generation
+            .bank
+            .as_ref()
+            .context("committed gateway DNS bank")?;
+        let arb = generation
+            .arbitration
+            .as_ref()
+            .context("committed gateway arbitration")?;
+        // TEST_RUN rejects device-bound programs. Keep the real capture authority,
+        // policy instructions (including fact-map FDs), and gateway decision maps.
+        let mut capture = reload.capture.clone();
+        capture.vlan_metadata = false;
+        let programs = Programs::load_general_gateway(
+            &capture,
+            reload.queues,
+            &reload.ipv4_broadcasts,
+            GatewayLoad {
+                routing: &generation.policy.bytecode.insns,
+                maps: &self.maps,
+                conntrack: &self.conntrack,
+                dns: Some(bank.maps()),
+                arbitration: Some(&arb.kernel),
+            },
+        )?;
+        let charge = reserve_objects(&self.budget, programs.object_fds())?;
+        self.state.open_links()?[index].verify(attached_id)?;
+        Ok((programs, charge))
+    }
+
     pub(crate) fn register(
         &self,
         ifindex: u32,

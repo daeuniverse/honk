@@ -277,9 +277,11 @@ TUN、XDP Core 和没有物理 LAN 的 XDP Endpoint 必须省略该字段，显�
 
 只有在同一逻辑 LAN realm 接受的透明 DNS 应答才能提供事实。bond 成员共用 bond 的 realm；每个 VLAN 使用自己的 realm 并继承配置根接口的角色。WAN、Host 和独立 `dns.bind` 均不为 LAN 提供事实。
 
-对于目的端口非 53 的纯 TCP SYN，有序策略选中无 mark 的 `direct(must)`，或在 `dial_mode: ip` 且为 Rule 模式时选中普通无 mark 的 `direct`，才可交给内核原生转发。UDP 只计 `WouldPassDns`。事实缺失、过期或冲突不能授权新的原生流；既有静态 D1（含 `:53 direct(must)`）不变。
+对于目的端口非 53 的纯 TCP SYN 或完整 UDP 数据报，有序策略选中无 mark 的 `direct(must)`，或在 `dial_mode: ip` 且为 Rule 模式时选中普通无 mark 的 `direct`，才可交内核路由。事实缺失、过期或冲突不能授权新的原生流；既有静态 D1（含 `:53 direct(must)`）不变。
 
-最多 8,192 个 DNS 原生流可以等待对应的 conntrack 证据。满额时新流改为争取 Endpoint 归属。尚未命中 conntrack 的重传仍须满足当前策略；许可撤回就丢当前包，不把同一连接拆给 Endpoint。同一流竞争且有界复查仍不能确定归属时，也只丢当前包。命中同键 conntrack 或满足 30 秒空闲回收条件可退役 pending 记录；30 秒不是删除期限。
+UDP 数据报可以是零长度 payload，也可以带无需重组的 IPv6 atomic fragment 头。真正需要重组的第一片不能建立或续签 DNS 原生归属：新流走 Endpoint；已有原生 pending 且未命中 conntrack 时，只丢当前包。后续片没有端口，只沿用既有分片判定，不另查 DNS。静态 Direct 和已确认的 conntrack 匹配保持原行为。
+
+TCP 与 UDP 共享 8,192 个等待对应 conntrack 证据的 DNS 原生名额。满额时新流改为争取 Endpoint 归属。conntrack 接管之前，重复 SYN 或同流后续 UDP 报文仍须满足当下的策略；许可撤回就丢当前包，不拆分同一条流。同键竞争且有界复查仍无法确定归属时，也只丢当前包。命中同键 conntrack 或满足 30 秒空闲回收条件可退役 pending 记录；30 秒不是删除期限。
 
 一旦观测到 `notrack`，honk 会告警，并在本次 capture 的剩余时间关闭 DNS 许可。静态 D1 和 Endpoint 继续工作。运行期 legacy raw 表是周期抽查，不能与并发防火墙更改构成原子屏障。采样计数和回退原因见 [XDP 诊断](./api.md)。
 

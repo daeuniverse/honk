@@ -554,7 +554,7 @@ pub(crate) mod xdp {
                 Self::Disabled => "disabled_by_config",
                 Self::NoDomainRules => "inactive_no_domain_rules",
                 Self::Staged => "staged_closed",
-                Self::Active => "active_tcp",
+                Self::Active => "active_tcp_udp",
                 Self::Closed => "closed",
                 Self::Fallback(_) => "degraded_fallback",
             }

@@ -1139,7 +1139,7 @@ XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包�
 
 摘要和完整视图均包含 `cross_worker_handoffs`：本次捕获中，另一 worker 的队列成功接收的包封装数，以十进制字符串表示，到上限后不再增长。入队失败或本地处理不计数；成功入队不等于包已送达。仅可比较同一次捕获的读数。
 
-`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`active_tcp`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 统计影子判定，不是原生流量。`dns_projection_counters` 描述采样的 bank；完整视图还可包含 `dns_realm_revocations`（数字 realm ID 与撤销次数）。不导出域名或 IP。
+`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`active_tcp_udp`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 统计影子判定，不是原生流量。`dns_projection_counters` 描述采样的 bank；完整视图还可包含 `dns_realm_revocations`（数字 realm ID 与撤销次数）。不导出域名或 IP。
 
 `dns_decisions` 是本次捕获累计计数的低频采样。`pass_dns_d1` 计首次原生授权；`pass_dns_d1_pending_retry` 计命中 conntrack 前仍获授权的包。两者都不含 CT 命中，也不证明已送达。`drop_native_pending_conflict` 计已有 pending 但无法重新授权而丢弃的包；`dns_native_pending_capped` 是原生名额已满，不等于丢包。`drop_hold_contention`、`drop_hold_unavailable`、`hold_guard_release_failed` 分别表示同键竞争未决、归属保护资源不可用、已持有的 guard 释放失败。计数以十进制字符串表示，null 表示未取得读数，不是零。
 `hold_retire_failed` 独立记录 pending 清理或计费失败；已确认的 CT 放行不是原生名额已归还的证据。
