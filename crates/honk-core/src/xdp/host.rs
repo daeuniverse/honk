@@ -162,7 +162,8 @@ impl HostCapture {
                 *out = byte as libc::c_char;
             }
             ensure!(
-                unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFMTU, &mut request) } == 0,
+                unsafe { libc::ioctl(socket.as_raw_fd(), libc::SIOCGIFMTU as _, &mut request) }
+                    == 0,
                 "Host source MTU readback: {}",
                 std::io::Error::last_os_error()
             );

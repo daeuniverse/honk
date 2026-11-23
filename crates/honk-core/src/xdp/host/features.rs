@@ -104,7 +104,13 @@ impl Features {
         request.ifr_ifru.ifru_data = words.as_mut_ptr().cast();
         // SFEATURES returns nonnegative flags; configure verifies the actual active bits.
         ensure!(
-            unsafe { libc::ioctl(self.socket.as_raw_fd(), libc::SIOCETHTOOL, &mut request) } >= 0,
+            unsafe {
+                libc::ioctl(
+                    self.socket.as_raw_fd(),
+                    libc::SIOCETHTOOL as _,
+                    &mut request,
+                )
+            } >= 0,
             "Host ethtool: {}",
             std::io::Error::last_os_error()
         );

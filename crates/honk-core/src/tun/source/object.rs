@@ -404,7 +404,7 @@ impl Object {
             serde_json::json!({"ifindex":config.ifindex,"attachment":config.attachment}),
         )?;
         // The ioctl copies the u32 FD and takes its own program reference.
-        let result = unsafe { libc::ioctl(fd, 0x800454e1u64 as libc::c_ulong, &filter_fd) };
+        let result = unsafe { libc::ioctl(fd, libc::TUNSETFILTEREBPF, &filter_fd) };
         ensure!(
             result == 0,
             "TUNSETFILTEREBPF: {}",
