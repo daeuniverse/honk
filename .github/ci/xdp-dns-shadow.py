@@ -183,11 +183,12 @@ def check_exchange(arch, xlated, disassembly, enabled):
     for index, source in [(j, 'x1'), (l, 'x0')]:
         offset, load = rows[index]
         assert load in (f'ldxr {source}, [x21]', f'ldaxr {source}, [x21]'), rows[index - 1:index + 4]
-        copy = re.fullmatch(rf'mov (x\d+), {source}', rows[index - 1][1])
-        store = re.fullmatch(r'stlxr (w\d+), (x\d+), \[x21\]', rows[index + 1][1])
-        retry = re.fullmatch(r'cbnz (w\d+), (?:0x)?([0-9a-f]+)', rows[index + 2][1])
-        assert copy and store and retry and copy[1] == store[2] and store[1] == retry[1]
-        assert int(retry[2], 16) == offset and rows[index + 3][1] == 'dmb ish', rows[index - 1:index + 4]
+        # Other temporaries can alias the live verdict, deadline or epoch key.
+        copy = rows[index - 1][1]
+        assert copy in (f'mov x11, {source}', f'add x11, {source}, #0x0'), rows[index - 1:index + 2]
+        assert rows[index + 1][1] == 'stlxr w12, x11, [x21]', rows[index:index + 3]
+        retry = re.fullmatch(r'cbnz w12, (?:0x)?([0-9a-f]+)', rows[index + 2][1])
+        assert retry and int(retry[1], 16) == offset and rows[index + 3][1] == 'dmb ish', rows[index - 1:index + 4]
     return 'arm64 LL/SC and DMB ISH pair'
 
 
