@@ -233,7 +233,7 @@ def possible_cpus():
     return count
 
 
-def snapshot(device, enabled):
+def snapshot(device, enabled, *, tcp=False):
     with namespace('dut'):
         program = probe.program_fd(device, 'data')
         try:
@@ -241,14 +241,20 @@ def snapshot(device, enabled):
             maps = program_maps(program)
             assert SHADOW_MAPS.intersection(maps) == (SHADOW_MAPS if enabled else set()), maps
             stats = maps['honk_gw_stats']
-            assert stats[1:5] == (6, 4, 8, 19), stats
+            assert stats[1:5] == (6, 4, 8, 27), stats
             counter = maps['honk_xdp_count']
             length = 8 * possible_cpus()
-            counters = {label: sum(x[0] for x in struct.iter_unpack('=Q', map_value(stats, struct.pack('=I', key), length)))
-                        for label, key in [('pass_d1', 8), ('xsk_new', 9), ('would_pass_dns', 18)]}
+            reasons = [('pass_d1', 8), ('xsk_new', 9), ('would_pass_dns', 18), ('pass_dns_d1', 19), ('dns_retry', 20)]
+            if tcp:
+                reasons.extend(zip(('pending_conflict', 'pending_capped', 'hold_contention', 'hold_unavailable',
+                                    'release_failed', 'retire_failed'), range(21, 27), strict=True))
+            per_cpu = {label: [x[0] for x in struct.iter_unpack('=Q', map_value(stats, struct.pack('=I', key), length))]
+                       for label, key in reasons}
+            counters = {label: sum(values) for label, values in per_cpu.items()}
             assert counter[1:4] == (2, 4, 8) and 5 <= counter[4] <= 260, counter
-            counters['capture'] = sum(struct.unpack('=Q', map_value(counter, struct.pack('=I', queue), 8))[0]
-                                      for queue in range(counter[4] - 4))
+            queues = [struct.unpack('=Q', map_value(counter, struct.pack('=I', queue), 8))[0]
+                      for queue in range(counter[4] - 4)]
+            counters['capture'] = sum(queues)
             realm = struct.unpack('=I', map_value(maps['honk_gw_realms'],
                                                  struct.pack('=I12x', socket.if_nametoindex(device)), 4))[0]
             assert 0 < realm <= 64, (device, realm)
@@ -262,7 +268,8 @@ def snapshot(device, enabled):
                 epoch = struct.unpack_from('=Q', value)[0]
                 assert (epoch > 0) == (device == 'dut0'), (device, realm, epoch)
             return {'program': identity, 'maps': maps, 'realm': realm, 'epoch': epoch, 'counters': counters,
-                    'forward': probe.forward_fence_packets()}
+                    'queues': queues, 'dns_by_cpu': per_cpu.get('pass_dns_d1'),
+                    'forward': None if tcp else probe.forward_fence_packets()}
         finally:
             os.close(program)
 
@@ -286,13 +293,17 @@ def address_bytes(address):
     return socket.inet_pton(family(address), address)
 
 
-def live_dns_fact(state, ip, nonzero):
+def dns_fact(state, ip):
     canonical = address_bytes(ip)
     if family(ip) == socket.AF_INET:
         canonical = b'\0' * 10 + b'\xff\xff' + canonical
     key = struct.pack('=QII', state['epoch'], state['realm'], 0) + canonical
     with namespace('dut'):
-        fact = map_value(state['maps']['dns_facts'], key, 40)
+        return map_value(state['maps']['dns_facts'], key, 40)
+
+
+def live_dns_fact(state, ip, nonzero):
+    fact = dns_fact(state, ip)
     assert fact is not None, ('missing current DNS fact', ip, state)
     deadline, bitmap = struct.unpack('=Q32s', fact)
     now = time.monotonic_ns()
@@ -304,7 +315,17 @@ def name_wire(name):
     return b''.join(bytes([len(label)]) + label.encode('ascii') for label in name.split('.')) + b'\0'
 
 
-def endpoint_peer(owned):
+def verify_answer(result, question, serial, qtype, ip, maximum_ttl):
+    identifier, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', result)
+    assert identifier == serial and flags & 0x800f == 0x8000 and questions == answers == 1
+    assert result[12:12 + len(question)] == question
+    start = probe.dns_name_end(result, 12 + len(question))
+    rtype, rclass, ttl, size = struct.unpack_from('!HHIH', result, start)
+    assert (rtype, rclass) == (qtype, 1) and 0 < ttl <= maximum_ttl
+    assert result[start + 10:start + 10 + size] == address_bytes(ip)
+
+
+def endpoint_peer(owned, answer=answer_ip):
     sockets = {}
     with namespace('server'):
         uplink = socket.if_nametoindex('su')
@@ -350,7 +371,7 @@ def endpoint_peer(owned):
                                                          'zero.test', 'expire.pass-shadow.test')
                                     if question == name_wire(label) + struct.pack('!HH', qtype, 1))
                         assert qclass == 1
-                        address, ttl = answer_ip(name, qtype)
+                        address, ttl = answer(name, qtype)
                         body = address_bytes(address)
                         response = (data[:2] + struct.pack('!HHHHH', 0x8180, 1, 1, 0, 0) + question
                                     + b'\xc0\x0c' + struct.pack('!HHIH', qtype, 1, ttl, len(body)) + body)
@@ -425,7 +446,7 @@ def wire(enabled):
                 assert (after['realm'], after['epoch']) == (before['realm'], before['epoch']), (label, before, after)
             delta = {key: value - before['counters'][key] for key, value in after['counters'].items()}
             assert delta == {'pass_d1': int(static), 'xsk_new': int(not static), 'capture': int(not static),
-                             'would_pass_dns': int(enabled and hit)}, (label, delta, before, after)
+                             'would_pass_dns': int(enabled and hit), 'pass_dns_d1': 0, 'dns_retry': 0}, (label, delta, before, after)
             forward = after['forward'] - before['forward']
             assert forward == int(static), (label, before, after)
             branches = events[event_count:]
@@ -449,14 +470,8 @@ def wire(enabled):
             serial = 0xa000 + len(expected_rows)
             request = struct.pack('!HHHHHH', serial, 0x0100, 1, 0, 0, 0) + question
             result = trial(label, DNS, request, realm=realm, source=source)
-            identifier, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', result)
-            assert identifier == serial and flags & 0x800f == 0x8000 and questions == answers == 1
-            assert result[12:12 + len(question)] == question
-            start = probe.dns_name_end(result, 12 + len(question))
-            rtype, rclass, ttl, size = struct.unpack_from('!HHIH', result, start)
             ip, maximum_ttl = answer_ip(name, qtype)
-            assert (rtype, rclass) == (qtype, 1) and 0 < ttl <= maximum_ttl
-            assert result[start + 10:start + 10 + size] == address_bytes(ip)
+            verify_answer(result, question, serial, qtype, ip, maximum_ttl)
             assert expected_rows[-1]['peer']['name'] == name and expected_rows[-1]['peer']['qtype'] == qtype
             return time.monotonic_ns() + maximum_ttl * 1_000_000_000
 
@@ -517,6 +532,13 @@ def main(args):
         [profile] = values
         assert profile in ('static', 'shadow')
         wire(profile == 'shadow')
+    elif mode == 'tcp-wire':
+        from xdp_dns_tcp import wire as tcp_wire
+        profile, pid, log = values
+        tcp_wire(sys.modules[__name__], profile, int(pid), Path(log))
+    elif mode == 'tcp-compare':
+        from xdp_dns_tcp import compare as compare_tcp
+        compare_tcp(*map(Path, values))
     elif mode == 'compare':
         compare(*map(Path, values))
     else:

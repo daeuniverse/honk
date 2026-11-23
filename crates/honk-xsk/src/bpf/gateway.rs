@@ -1,20 +1,25 @@
 use super::*;
+#[cfg(test)]
+use honk_ebpf_common::xdp_gateway::HOLD_MANAGED;
 use honk_ebpf_common::xdp_gateway::{
-    CaptureRealmKey, EndpointHold, FragmentKey, FragmentVerdict, GATEWAY_REALM_CAPACITY,
-    GATEWAY_REASON_COUNT, GatewayDnsKey, GatewayDnsValue, GatewayKey, GatewayReason,
-    LocalAddressKey,
+    CaptureRealmKey, FragmentKey, FragmentVerdict, GATEWAY_REALM_CAPACITY, GATEWAY_REASON_COUNT,
+    GatewayDnsKey, GatewayDnsValue, GatewayHold, GatewayKey, GatewayReason, LocalAddressKey,
 };
 use std::ptr::NonNull;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type HoldValue = EndpointHold;
+mod arbitration;
+pub use arbitration::GatewayArbitration;
+
+pub type HoldValue = GatewayHold;
 
 pub struct GatewayLoad<'a> {
     pub routing: &'a [aya_obj::generated::bpf_insn],
     pub maps: &'a GatewayMaps,
     pub conntrack: &'a ConntrackKfuncs,
     pub dns: Option<&'a GatewayDnsMaps>,
+    pub arbitration: Option<&'a GatewayArbitration>,
 }
 
 #[repr(C)]
@@ -54,6 +59,10 @@ impl GatewayLoad<'_> {
             &self.maps.mode_flags,
         ] {
             retained.push(fd.try_clone()?);
+        }
+        if let Some(arbitration) = self.arbitration {
+            retained.push(arbitration.guards.try_clone()?);
+            retained.push(arbitration.control.try_clone()?);
         }
         if let Some(fd) = &self.conntrack.btf {
             retained.push(fd.try_clone()?);
@@ -230,27 +239,7 @@ impl GatewayDnsMaps {
             }
             *id = info.id;
         }
-        let bytes = realm_capacity as usize * size_of::<EpochSlot>();
-        // SAFETY: array offset zero is the first value; kernel rounds the bounded length to pages.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                epochs.as_raw_fd(),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            return Err(io::Error::last_os_error());
-        }
-        let Some(slots) = NonNull::new(ptr.cast::<EpochSlot>()).filter(|p| p.as_ptr().is_aligned())
-        else {
-            // SAFETY: mmap succeeded, but its address is unsuitable for Rust atomic access.
-            unsafe { libc::munmap(ptr, bytes) };
-            return Err(invalid_data("invalid gateway DNS epoch mapping address"));
-        };
+        let slots = mmap_slots::<EpochSlot>(epochs.as_fd(), realm_capacity)?;
         Ok(Self {
             facts,
             epochs,
@@ -399,6 +388,30 @@ impl GatewayDnsMaps {
         }
         Ok((scanned, deleted, cursor.is_none()))
     }
+}
+
+fn mmap_slots<T>(fd: BorrowedFd<'_>, count: u32) -> io::Result<NonNull<T>> {
+    let bytes = count as usize * size_of::<T>();
+    // SAFETY: callers map the array's bounded value area, starting at its page-aligned first slot.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            bytes,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error());
+    }
+    let Some(slots) = NonNull::new(ptr.cast::<T>()).filter(|p| p.as_ptr().is_aligned()) else {
+        // SAFETY: mmap succeeded, but its address is unsuitable for Rust atomic access.
+        unsafe { libc::munmap(ptr, bytes) };
+        return Err(invalid_data("invalid gateway array mapping address"));
+    };
+    Ok(slots)
 }
 
 pub struct GatewayMaps {
@@ -603,7 +616,7 @@ impl GatewayMaps {
         Ok(Self {
             realms: realms_fd,
             local_root,
-            hold: create::<GatewayKey, EndpointHold>(1, 65536, b"honk_gw_hold", -1)?,
+            hold: create::<GatewayKey, GatewayHold>(1, 65536, b"honk_gw_hold", -1)?,
             fragments: create::<FragmentKey, FragmentVerdict>(9, 4096, b"honk_gw_frag", -1)?,
             stats: create::<u32, u64>(6, GATEWAY_REASON_COUNT, b"honk_gw_stats", -1)?,
             scratch: create::<u32, [u64; 64]>(6, 1, b"honk_gw_scratch", -1)?,
@@ -628,13 +641,21 @@ impl GatewayMaps {
         )
     }
 
-    pub fn lookup_hold(&self, key: &GatewayKey) -> io::Result<Option<EndpointHold>> {
+    /// A lookup is an observation. Coordinated retirement confirms the stamp under the key's guard.
+    pub fn lookup_hold(&self, key: &GatewayKey) -> io::Result<Option<GatewayHold>> {
         lookup(self.hold.as_fd(), key)
     }
 
-    pub fn insert_hold(&self, key: &GatewayKey, now_ns: u64) -> io::Result<()> {
-        let value = EndpointHold {
-            first_seen_ns: now_ns,
+    #[cfg(test)]
+    pub(in crate::bpf) fn insert_hold(&self, key: &GatewayKey, now_ns: u64) -> io::Result<()> {
+        if now_ns & HOLD_MANAGED != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid Endpoint birth time",
+            ));
+        }
+        let value = GatewayHold {
+            stamp: now_ns,
             last_seen_ns: now_ns,
         };
         match update(self.hold.as_fd(), key, &value, 1) {
@@ -648,6 +669,7 @@ impl GatewayMaps {
         &self,
         now_ns: u64,
         idle: Duration,
+        arbitration: Option<&GatewayArbitration>,
         mut retained: impl FnMut(&GatewayKey) -> bool,
     ) -> io::Result<usize> {
         let idle_ns = u64::try_from(idle.as_nanos())
@@ -680,29 +702,60 @@ impl GatewayMaps {
             let Some(before) = self.lookup_hold(&next)? else {
                 continue;
             };
-            if !is_idle(before, now_ns, idle_ns) || retained(&next) {
+            if !is_idle(before, now_ns, idle_ns) || (!before.is_native_pending() && retained(&next))
+            {
                 continue;
             }
-            if self.lookup_hold(&next)? != Some(before) {
-                continue;
-            }
-            match bpf(
-                BPF_MAP_DELETE_ELEM,
-                &mut elem(self.hold.as_fd(), &next, 0, 0),
-            ) {
-                Ok(_) => {
-                    removed += 1;
-                    *cursor = previous;
-                }
-                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
-                Err(error) => return Err(error),
+            if self.retire_observed(&next, before, now_ns, idle_ns, arbitration)? {
+                removed += 1;
+                *cursor = previous;
             }
         }
         Ok(removed)
     }
+
+    fn retire_observed(
+        &self,
+        key: &GatewayKey,
+        before: GatewayHold,
+        now_ns: u64,
+        idle_ns: u64,
+        arbitration: Option<&GatewayArbitration>,
+    ) -> io::Result<bool> {
+        let retire = || {
+            let Some(latest) = self.lookup_hold(key)? else {
+                return Ok(false);
+            };
+            if latest != before || !is_idle(latest, now_ns, idle_ns) {
+                return Ok(false);
+            }
+            let refund = if latest.is_native_pending() {
+                Some(
+                    arbitration
+                        .ok_or_else(|| invalid_data("native gateway hold without arbitration"))?,
+                )
+            } else {
+                None
+            };
+            match bpf(BPF_MAP_DELETE_ELEM, &mut elem(self.hold.as_fd(), key, 0, 0)) {
+                Ok(_) => {
+                    if let Some(arbitration) = refund {
+                        arbitration.refund()?;
+                    }
+                    Ok(true)
+                }
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(false),
+                Err(error) => Err(error),
+            }
+        };
+        match arbitration {
+            Some(arbitration) => arbitration.with_guard(key, retire),
+            None => retire(),
+        }
+    }
 }
 
-fn is_idle(value: EndpointHold, now_ns: u64, idle_ns: u64) -> bool {
+fn is_idle(value: GatewayHold, now_ns: u64, idle_ns: u64) -> bool {
     now_ns
         .checked_sub(value.last_seen_ns)
         .is_some_and(|elapsed| elapsed > idle_ns)
@@ -872,19 +925,19 @@ mod tests {
         let idle = Duration::from_secs(30);
         for _owner in ["queued", "exported", "cq"] {
             assert_eq!(
-                maps.retire_if_unretained(31_000_000_001, idle, |_| true)
+                maps.retire_if_unretained(31_000_000_001, idle, None, |_| true)
                     .unwrap(),
                 0
             );
             assert!(maps.lookup_hold(&key).unwrap().is_some());
         }
         assert_eq!(
-            maps.retire_if_unretained(31_000_000_001, idle, |_| {
+            maps.retire_if_unretained(31_000_000_001, idle, None, |_| {
                 update(
                     maps.hold.as_fd(),
                     &key,
-                    &EndpointHold {
-                        first_seen_ns: 1,
+                    &GatewayHold {
+                        stamp: 1,
                         last_seen_ns: 31_000_000_001,
                     },
                     2,
@@ -897,19 +950,19 @@ mod tests {
         );
         assert!(maps.lookup_hold(&key).unwrap().is_some());
         assert_eq!(
-            maps.retire_if_unretained(62_000_000_002, idle, |_| false)
+            maps.retire_if_unretained(62_000_000_002, idle, None, |_| false)
                 .unwrap(),
             1
         );
         assert!(maps.lookup_hold(&key).unwrap().is_none());
         maps.insert_hold(&key, 1).unwrap();
         assert_eq!(
-            maps.retire_if_unretained(31_000_000_001, idle, |_| {
+            maps.retire_if_unretained(31_000_000_001, idle, None, |_| {
                 update(
                     maps.hold.as_fd(),
                     &key,
-                    &EndpointHold {
-                        first_seen_ns: 2,
+                    &GatewayHold {
+                        stamp: 2,
                         last_seen_ns: 1,
                     },
                     2,
@@ -920,7 +973,197 @@ mod tests {
             .unwrap(),
             0
         );
-        assert_eq!(maps.lookup_hold(&key).unwrap().unwrap().first_seen_ns, 2);
+        assert_eq!(maps.lookup_hold(&key).unwrap().unwrap().stamp, 2);
+    }
+
+    #[test]
+    #[ignore = "requires disposable VM root and private network namespace"]
+    fn kernel_hold_sweep_native_reuse_guard_and_single_refund() {
+        use honk_ebpf_common::xdp_gateway::{HOLD_NATIVE, HOLD_SEQUENCE_MAX};
+
+        require_vm();
+        let maps = maps();
+        let key = GatewayKey {
+            proto: 6,
+            ..key(1234)
+        };
+        let arb = GatewayArbitration::new(3).unwrap();
+        assert_eq!((arb.pending(), arb.last_issued()), (0, 3));
+        update(arb.control.as_fd(), &0u32, &[1u64, 3, 0, 0, 0, 0, 0, 0], 0).unwrap();
+        let native = GatewayHold {
+            stamp: HOLD_MANAGED | HOLD_NATIVE | 1,
+            last_seen_ns: 1,
+        };
+        let reused = GatewayHold {
+            stamp: HOLD_MANAGED | HOLD_NATIVE | 2,
+            ..native
+        };
+        update(maps.hold.as_fd(), &key, &native, 1).unwrap();
+        let observed = maps.lookup_hold(&key).unwrap().unwrap();
+        bpf(
+            BPF_MAP_DELETE_ELEM,
+            &mut elem(maps.hold.as_fd(), &key, 0, 0),
+        )
+        .unwrap();
+        update(maps.hold.as_fd(), &key, &reused, 1).unwrap();
+        let now = HOLD_IDLE_NS + 2;
+        assert!(
+            !maps
+                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb))
+                .unwrap()
+        );
+        assert_eq!(maps.lookup_hold(&key).unwrap(), Some(reused));
+        assert_eq!(arb.pending(), 1);
+
+        let sweep = |now| {
+            maps.retire_if_unretained(now, Duration::from_nanos(HOLD_IDLE_NS), Some(&arb), |_| {
+                panic!("native pending must ignore application retention")
+            })
+        };
+        assert_eq!(sweep(now - 1).unwrap(), 0);
+        update(arb.guards.as_fd(), &key, &7u32, 1).unwrap();
+        assert_eq!(sweep(now).unwrap(), 0);
+        assert_eq!(lookup(arb.guards.as_fd(), &key).unwrap(), Some(7u32));
+        assert_eq!(arb.pending(), 1);
+        bpf(
+            BPF_MAP_DELETE_ELEM,
+            &mut elem(arb.guards.as_fd(), &key, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(sweep(now).unwrap(), 1);
+        assert_eq!(maps.lookup_hold(&key).unwrap(), None);
+        assert_eq!(arb.pending(), 0);
+        assert!(
+            !maps
+                .retire_observed(&key, reused, now, HOLD_IDLE_NS, Some(&arb))
+                .unwrap()
+        );
+        assert_eq!(arb.pending(), 0);
+
+        // An Endpoint at the same tuple keeps ordinary retention and never refunds native credit.
+        let endpoint = GatewayHold {
+            stamp: HOLD_MANAGED | 3,
+            ..native
+        };
+        update(maps.hold.as_fd(), &key, &endpoint, 1).unwrap();
+        let idle = Duration::from_nanos(HOLD_IDLE_NS);
+        assert_eq!(
+            maps.retire_if_unretained(now, idle, Some(&arb), |_| true)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            maps.retire_if_unretained(now, idle, Some(&arb), |_| false)
+                .unwrap(),
+            1
+        );
+        assert_eq!(arb.pending(), 0);
+        update(
+            arb.control.as_fd(),
+            &0u32,
+            &[0u64, HOLD_SEQUENCE_MAX + 1, 0, 0, 0, 0, 0, 0],
+            0,
+        )
+        .unwrap();
+        arb.synchronize_readers().unwrap();
+        let highwater = arb.last_issued();
+        assert_eq!(highwater, HOLD_SEQUENCE_MAX);
+        drop(arb);
+        let next = GatewayArbitration::new(highwater).unwrap();
+        assert_eq!(next.last_issued(), HOLD_SEQUENCE_MAX);
+    }
+
+    #[test]
+    #[ignore = "requires disposable VM root and private network namespace"]
+    fn kernel_hold_sweep_rechecks_activity_and_releases_guard_on_refund_error() {
+        use honk_ebpf_common::xdp_gateway::HOLD_NATIVE;
+
+        require_vm();
+        let maps = maps();
+        let arb = GatewayArbitration::new(1).unwrap();
+        let key = GatewayKey {
+            proto: 6,
+            ..key(1234)
+        };
+        let observed = GatewayHold {
+            stamp: HOLD_MANAGED | HOLD_NATIVE | 1,
+            last_seen_ns: 1,
+        };
+        let now = HOLD_IDLE_NS + 2;
+        let refreshed = GatewayHold {
+            last_seen_ns: now,
+            ..observed
+        };
+        update(maps.hold.as_fd(), &key, &refreshed, 1).unwrap();
+        assert!(
+            !maps
+                .retire_observed(&key, observed, now, HOLD_IDLE_NS, Some(&arb))
+                .unwrap()
+        );
+        assert_eq!(maps.lookup_hold(&key).unwrap(), Some(refreshed));
+        // Both observations now qualify as idle, but this turn witnessed a refresh.
+        let later = now + HOLD_IDLE_NS + 1;
+        assert!(
+            !maps
+                .retire_observed(&key, observed, later, HOLD_IDLE_NS, Some(&arb))
+                .unwrap()
+        );
+        assert_eq!(lookup::<_, u32>(arb.guards.as_fd(), &key).unwrap(), None);
+
+        // The row outlives the idle horizon with a deliberately inconsistent zero credit.
+        let error = maps
+            .retire_if_unretained(
+                later,
+                Duration::from_nanos(HOLD_IDLE_NS),
+                Some(&arb),
+                |_| true,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(arb.pending(), 0);
+        assert_eq!(maps.lookup_hold(&key).unwrap(), None);
+        assert_eq!(lookup::<_, u32>(arb.guards.as_fd(), &key).unwrap(), None);
+    }
+
+    #[test]
+    #[ignore = "requires disposable VM root and private network namespace"]
+    fn kernel_hold_sweep_full_guard_reports_error_without_evicting_other_keys() {
+        require_vm();
+        let maps = maps();
+        let arb = GatewayArbitration::new(0).unwrap();
+        let mut info = MapInfo::default();
+        object_info(arb.guards.as_fd(), &mut info).unwrap();
+        let possible = std::fs::read_to_string("/sys/devices/system/cpu/possible").unwrap();
+        let cpus = possible_cpu_count(&possible).unwrap();
+        assert_eq!(
+            (info.kind, info.flags, info.entries as usize),
+            (1, 0, cpus + 1)
+        );
+        let tuple = |id: u32| GatewayKey {
+            realm_id: id,
+            ..key(1234)
+        };
+        for id in 1..=info.entries {
+            update(arb.guards.as_fd(), &tuple(id), &id, 1).unwrap();
+        }
+        let idle_key = tuple(info.entries + 1);
+        maps.insert_hold(&idle_key, 1).unwrap();
+        let error = maps
+            .retire_if_unretained(
+                HOLD_IDLE_NS + 2,
+                Duration::from_nanos(HOLD_IDLE_NS),
+                Some(&arb),
+                |_| false,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::E2BIG | libc::ENOSPC)
+        ));
+        assert!(maps.lookup_hold(&idle_key).unwrap().is_some());
+        for id in 1..=info.entries {
+            assert_eq!(lookup(arb.guards.as_fd(), &tuple(id)).unwrap(), Some(id));
+        }
     }
 
     #[test]
@@ -933,13 +1176,13 @@ mod tests {
         }
         let mut visited = std::collections::HashSet::new();
         let idle = Duration::from_secs(30);
-        maps.retire_if_unretained(31_000_000_001, idle, |key| {
+        maps.retire_if_unretained(31_000_000_001, idle, None, |key| {
             assert!(visited.insert(*key));
             true
         })
         .unwrap();
         assert_eq!(visited.len(), 64);
-        maps.retire_if_unretained(31_000_000_001, idle, |key| {
+        maps.retire_if_unretained(31_000_000_001, idle, None, |key| {
             assert!(visited.insert(*key));
             true
         })
@@ -967,8 +1210,8 @@ mod tests {
             update(
                 maps.hold.as_fd(),
                 &key,
-                &EndpointHold {
-                    first_seen_ns: 1,
+                &GatewayHold {
+                    stamp: 1,
                     last_seen_ns,
                 },
                 1,
@@ -977,7 +1220,7 @@ mod tests {
         }
         let mut queried = std::collections::HashSet::new();
         assert_eq!(
-            maps.retire_if_unretained(now_ns, idle, |key| {
+            maps.retire_if_unretained(now_ns, idle, None, |key| {
                 queried.insert(*key);
                 *key == retained
             })
@@ -990,7 +1233,7 @@ mod tests {
         assert!(maps.lookup_hold(&retained).unwrap().is_some());
         assert_eq!(maps.lookup_hold(&unowned).unwrap(), None);
         assert_eq!(
-            maps.retire_if_unretained(now_ns + 1, idle, |_| false)
+            maps.retire_if_unretained(now_ns + 1, idle, None, |_| false)
                 .unwrap(),
             2
         );
@@ -1001,14 +1244,14 @@ mod tests {
 
     #[test]
     fn retirement_uses_last_seen_and_strict_idle_horizon() {
-        let old = EndpointHold {
-            first_seen_ns: 1,
+        let old = GatewayHold {
+            stamp: 1,
             last_seen_ns: 1,
         };
         assert!(!is_idle(old, 29_000_000_001, HOLD_IDLE_NS));
         assert!(!is_idle(old, 30_000_000_001, HOLD_IDLE_NS));
         assert!(is_idle(old, 31_000_000_001, HOLD_IDLE_NS));
-        let hit = EndpointHold {
+        let hit = GatewayHold {
             last_seen_ns: 30_000_000_001,
             ..old
         };

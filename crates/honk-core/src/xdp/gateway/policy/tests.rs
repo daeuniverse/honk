@@ -337,6 +337,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
                 maps: &maps,
                 conntrack: &conntrack,
                 dns: None,
+                arbitration: None,
             },
         )?;
         assert_ne!(metadata.discover_prog_id(), 0);
@@ -356,6 +357,7 @@ fn kernel_gateway_full_program_adaptive_endpoint_verifies_and_preserves_packets(
                 maps: &maps,
                 conntrack: &conntrack,
                 dns: None,
+                arbitration: None,
             },
         )?;
         for (index, program) in [programs.discover_fd(), programs.data_fd()]

@@ -69,7 +69,7 @@ routing {
 
 只有该地址的本机 listener 应接收 53 流量时才需要 DNS 规则，并须放在域名规则之前。见[网关准入与限制](./design/datapath.md#full-xdp-启动)。
 
-物理 LAN XDP Endpoint 默认启用 DNS 影子判定，统计 `WouldPassDns` 次数，数据包仍按既有动作处理。若要关闭，在 `datapath` 中设置 `dns_projection: false` 后重启。只有启用了物理 LAN XDP Endpoint 捕获的配置才接受该字段。详见 [DNS 投影参考](./reference/global.md#xdp-endpoint-dns-投影)。
+物理 XDP Endpoint LAN 默认可用本 LAN 学到的 DNS 应答，将符合条件的新 TCP SYN 交给内核原生转发。UDP 只统计 DNS 判定，不改变包去向。设置 `datapath.dns_projection: false` 并重启可关闭两者。详见 [DNS 投影参考](./reference/global.md#xdp-endpoint-dns-投影)。
 
 ## 运行时数据目录
 

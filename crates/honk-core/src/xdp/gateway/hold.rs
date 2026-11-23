@@ -1,4 +1,4 @@
-use honk_xsk::GatewayMaps;
+use honk_xsk::{GatewayArbitration, GatewayMaps};
 use std::io;
 use std::net::{IpAddr, Ipv6Addr};
 use std::time::Duration;
@@ -20,9 +20,10 @@ impl HoldCollector {
         &mut self,
         maps: &GatewayMaps,
         now_ns: u64,
+        arbitration: Option<&GatewayArbitration>,
         retains: &mut dyn FnMut(u32, IpAddr) -> bool,
     ) -> io::Result<usize> {
-        maps.retire_if_unretained(now_ns, HOLD_IDLE, |key| {
+        maps.retire_if_unretained(now_ns, HOLD_IDLE, arbitration, |key| {
             retains(
                 key.realm_id,
                 IpAddr::V6(Ipv6Addr::from(key.src)).to_canonical(),

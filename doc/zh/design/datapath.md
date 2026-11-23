@@ -194,9 +194,9 @@ L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和
 
 没有 VLAN upper 时，honk 关闭它所修改的两个 RX VLAN stripping feature，并在正常停止或启动失败时恢复。SIGKILL 后这两位保持关闭，内核软件处理 VLAN。设备身份失权时不再恢复，以免写入已替换的设备。veth 仍需 VLAN metadata。
 
-Endpoint 判定顺序为本机非 53、Endpoint hold、zone-0 conntrack、分片判定、D1、XSK。hold 优先于 CT；CT lookup 合同错误丢包并导致致命退出。TCP 仅纯 SYN 进入 D1，非 SYN miss 交内核；UDP 每个 hold/CT miss 包都求 D1。非 TCP/UDP 通常交内核；ICMP 错误检查引用的流。无法分类的传输层头丢弃。首片判定保存 30 秒，后片先于首片到达时没有判定，会被丢弃。
+本机非 53 流量先交内核，本机目的端口 53 仍须走策略。Endpoint hold 优先于 zone-0 conntrack。DNS 原生 pending 与之不同：确认 CT 命中则交给 CT；没有 CT 时，匹配的 SYN 仍须获得当下有效的 DNS 许可才能再次放行，pending 本身不授权转发。没有 hold 或 CT 时，TCP 仅纯 SYN 进入 D1，非 SYN miss 交内核；UDP 在 hold/CT miss 时求 D1。非 TCP/UDP 通常交内核；ICMP 错误检查引用的流。无法分类的传输层头丢弃。首片判定保存 30 秒；后片先于首片到达则丢弃。见[网关 DNS 路由](../reference/global.md#xdp-endpoint-dns-投影)。
 
-仅支持 zone 0：启动拒绝非零或无法证明安全的 nft 和 legacy zone。运行期监测 nft 变化，不安全时退出；不监测 legacy zone 变化，修改前须停止 honk，修改后重启。
+仅支持 zone 0。启动拒绝非零或无法证明安全的 nft 和 legacy zone。运行期不安全的 nft zone 或 CT 查询合同错误仍是致命错误。legacy raw 表的周期采样可以关闭 DNS 原生转发，但不是完整的运行期 legacy zone 准入；修改 legacy zone 前应停止 honk，修改后重启。
 
 准入的 802.3ad bond 是一个逻辑 realm，XDP 挂在物理以太网或 veth 成员上；其他 bond 模式或不支持的哈希策略被拒绝。同 realm 的 peer 可以换成员，已导出输出保持原成员。多成员 realm 使用 CPU 输出而不使用 generated output，有性能代价；单成员 bond 可以使用 generated output。realm worker 数受成员中最小队列数限制。捕获身份变化、新成员加入 bond、ENOBUFS 或 `Desynchronized` 为致命错误；carrier、LACP 状态、统计及其他设备变化忽略。地址更新刷新本机集合；成功重同步前保持已发布 map，重同步失败为致命错误。FIB dump 中断在三轮同步内重试。
 

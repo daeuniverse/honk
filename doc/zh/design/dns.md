@@ -304,9 +304,9 @@ deadline。只有 socket-fatal 接收错误会停止池并结束其余等待者�
 
 每个 policy generation 内，HOST 域名关联仍与客户端来源无关。Packet endpoint 注册自己拥有的非 HOST `ScopeId`，每个 scope 分别保留学到的 owner 与 IP 事实；packet observation 不会成为 HOST domain-map 条目，也不借用其他 scope 的事实。DNS 交换/缓存 scope 仍不会在同一个 packet scope 或 HOST 内按客户端划分流量路由。投影独立于其他条件逐一计算全部域名谓词，包括用于否定的谓词；已知域名没有匹配项时可投影为存在的零 bitmap。
 
-符合条件的物理 XDP LAN 能以影子模式计算依赖 DNS 的有序直连决策。只有已准入的 IP、1–32 个未过期 owner 且贡献相同完整位图（可为已知全零）才可导出，取最早到期时间。DNS 参与的结果永不授权端口 53；WAN 和 HOST 不能导出。内核命中时只计 `WouldPassDns`，包仍走原有 Endpoint 路径，不新增 DNS 应答缓存或原生转发路径。
+符合条件的物理 XDP LAN 只导出已准入的 IP：1–32 个未过期 owner 须贡献相同的完整位图（含已知全零），以最早到期时间为准。WAN 和 HOST 不授予导出权，DNS 永不授权端口 53。符合条件的 TCP SYN 须先[确定唯一归属](../reference/global.md#xdp-endpoint-dns-投影)才可走原生路由；UDP 仍只做影子观察。两者按原有序策略求值，不另建 DNS 缓存。
 
-每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不延长也不缩短原许可。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint；计数不是原生放行包数。
+每代 bank 的 epoch 初始关闭。重载在换链或重建事实前撤销旧许可；启动或最终 flags 发布成功后，只有匹配已提交代才开门。降级提交保持关闭。同一缓存 revision 与地址集的命中不改变原截止时间。容量、JIT 或 verifier 拒绝时退回静态 D1 加 Endpoint。关闭 bank 不会将仍待 conntrack 接管的原生流改归 Endpoint。
 
 Packet scope 注册由嵌入方的同一共享预算计费，一次性原子提交；重复、HOST 或外部预算的 scope 不会部分注册。注册表及计费保留到最后一个真实 projection/authority owner 释放，与 projection worker 关闭相互独立。每个注册 scope 使用不回绕的撤销 revision；耗尽后永久拒绝其 fact 权威，不回绕重用。
 

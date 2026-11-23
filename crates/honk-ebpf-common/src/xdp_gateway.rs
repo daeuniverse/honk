@@ -50,9 +50,21 @@ pub struct GatewayKey {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EndpointHold {
-    pub first_seen_ns: u64,
+pub struct GatewayHold {
+    /// Pristine Endpoint programs use first-seen monotonic time; coordinated programs use a tagged incarnation.
+    pub stamp: u64,
     pub last_seen_ns: u64,
+}
+
+pub const HOLD_MANAGED: u64 = 1 << 63;
+pub const HOLD_NATIVE: u64 = 1 << 62;
+pub const HOLD_SEQUENCE_MAX: u64 = HOLD_NATIVE - 1;
+pub const NATIVE_PENDING_CAP: u64 = 8192;
+
+impl GatewayHold {
+    pub const fn is_native_pending(self) -> bool {
+        self.stamp & (HOLD_MANAGED | HOLD_NATIVE) == HOLD_MANAGED | HOLD_NATIVE
+    }
 }
 
 pub const HOLD_REFRESH_NS: u64 = 1_000_000_000;
@@ -124,9 +136,17 @@ pub enum GatewayReason {
     IcmpQuoteUnresolved,
     D1Evaluated,
     WouldPassDns,
+    PassDnsD1,
+    PassDnsD1PendingRetry,
+    DropNativePendingConflict,
+    DnsNativePendingCapped,
+    DropHoldContention,
+    DropHoldUnavailable,
+    HoldGuardReleaseFailed,
+    HoldRetireFailed,
 }
 
-pub const GATEWAY_REASON_COUNT: u32 = GatewayReason::WouldPassDns as u32 + 1;
+pub const GATEWAY_REASON_COUNT: u32 = GatewayReason::HoldRetireFailed as u32 + 1;
 
 const _: () = {
     use core::mem::{offset_of, size_of};
@@ -150,8 +170,9 @@ const _: () = {
     assert!(offset_of!(GatewayKey, dport) == 42);
     assert!(offset_of!(GatewayKey, proto) == 44);
     assert!(offset_of!(GatewayKey, reserved) == 45);
-    assert!(size_of::<EndpointHold>() == 16);
-    assert!(offset_of!(EndpointHold, last_seen_ns) == 8);
+    assert!(size_of::<GatewayHold>() == 16);
+    assert!(offset_of!(GatewayHold, stamp) == 0);
+    assert!(offset_of!(GatewayHold, last_seen_ns) == 8);
     assert!(size_of::<LocalAddressKey>() == 20);
     assert!(size_of::<FragmentKey>() == 48);
     assert!(offset_of!(FragmentKey, id) == 40);
@@ -166,7 +187,7 @@ unsafe impl aya::Pod for CaptureRealmKey {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for GatewayKey {}
 #[cfg(not(target_arch = "bpf"))]
-unsafe impl aya::Pod for EndpointHold {}
+unsafe impl aya::Pod for GatewayHold {}
 #[cfg(not(target_arch = "bpf"))]
 unsafe impl aya::Pod for LocalAddressKey {}
 #[cfg(not(target_arch = "bpf"))]

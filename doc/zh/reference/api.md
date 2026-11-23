@@ -1139,7 +1139,10 @@ XDP 另以 `x-honk.xdp` 返回 capture owner 最新观测。默认 summary 包�
 
 摘要和完整视图均包含 `cross_worker_handoffs`：本次捕获中，另一 worker 的队列成功接收的包封装数，以十进制字符串表示，到上限后不再增长。入队失败或本地处理不计数；成功入队不等于包已送达。仅可比较同一次捕获的读数。
 
-`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`shadow_active`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 是采样到的内核累计影子命中数（十进制字符串，不可用时为 null），不计原生转发。`dns_projection_counters` 描述采样的 bank；完整视图在可用时还包含 `dns_realm_revocations`，每项为数字 realm ID 与撤销次数。不导出域名或 IP。
+`dns_projection_state` 区分 `disabled_by_config`、`inactive_no_domain_rules`、`staged_closed`、`active_tcp`、`degraded_fallback`（原因见 `dns_projection_reason`）和 `closed`。`would_pass_dns` 统计影子判定，不是原生流量。`dns_projection_counters` 描述采样的 bank；完整视图还可包含 `dns_realm_revocations`（数字 realm ID 与撤销次数）。不导出域名或 IP。
+
+`dns_decisions` 是本次捕获累计计数的低频采样。`pass_dns_d1` 计首次原生授权；`pass_dns_d1_pending_retry` 计命中 conntrack 前仍获授权的包。两者都不含 CT 命中，也不证明已送达。`drop_native_pending_conflict` 计已有 pending 但无法重新授权而丢弃的包；`dns_native_pending_capped` 是原生名额已满，不等于丢包。`drop_hold_contention`、`drop_hold_unavailable`、`hold_guard_release_failed` 分别表示同键竞争未决、归属保护资源不可用、已持有的 guard 释放失败。计数以十进制字符串表示，null 表示未取得读数，不是零。
+`hold_retire_failed` 独立记录 pending 清理或计费失败；已确认的 CT 放行不是原生名额已归还的证据。
 
 每队列保留真实 `namespace_cookie`、`attachment_generation`、`ifindex`、`queue_id`、实际 `mode`（`copy` 或 `zerocopy`）、`ring_capacity` 以及 RX/control/bulk frame 容量。一个物理队列可服务多个逻辑 realm。`sequence`、`attempted_at_unix_ms` 和 `last_success_at_unix_ms` 分别标识采样次数、最近尝试与最近成功的 socket 读取；时间为十进制 Unix 毫秒字符串，所有完整宽度整数均为十进制字符串，序列和错误计数饱和。`socket` 保存六项原始累计 XDP_STATISTICS：`rx_dropped`、`rx_invalid_descs`、`tx_invalid_descs`、`rx_ring_full`、`rx_fill_ring_empty_descs`、`tx_ring_empty_descs`。`rings` 保存 `rx`、`tx`、`fill`、`cq` 的原始 u32 `producer`/`consumer` 索引；索引会回绕，单位为 descriptor，不是包数。
 
@@ -1323,7 +1326,7 @@ URLTest、LoadBalance、Fallback 与 Score 拒绝手动选择。
 ```text
 {
   outbounds: [{ name, totalConns, activeConns, upload, download, errors }],
-  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_projection_counters, dns_realm_revocations?, truncated, queues },
+  xdp: null | { state, state_changed_at_unix_ms, queue_count, cross_worker_handoffs, dns_projection_state, dns_projection_reason, would_pass_dns, dns_decisions, dns_projection_counters, dns_realm_revocations?, truncated, queues },
   pool: { readyHits, readyMisses, entries },
   dns: {
     socketAdmission: { refused, timeouts },

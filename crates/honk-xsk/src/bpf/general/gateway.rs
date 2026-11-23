@@ -1,3 +1,5 @@
+mod ownership;
+
 use super::*;
 use honk_ebpf_common::xdp_gateway::{
     FRAGMENT_TTL_NS, GATEWAY_DNS_BITMAP_OFFSET, GATEWAY_DNS_READY, GATEWAY_ROUTE_NEED_DNS,
@@ -782,7 +784,8 @@ fn dns_shadow(
     b: &mut GatewayBuilder,
     dns: &crate::GatewayDnsMaps,
     maps: &GatewayMaps,
-    data: bool,
+    shadow_count: bool,
+    qualified: Option<Target>,
     new_flow: Target,
     bad: Target,
 ) -> usize {
@@ -826,10 +829,14 @@ fn dns_shadow(
     b.jump(JNE_X, 0, 1, 0, new_flow);
     b.helper(5);
     b.jump(JLE_X, 7, 0, 0, new_flow);
-    if data {
-        b.stat(maps, GatewayReason::WouldPassDns);
+    if let Some(qualified) = qualified {
+        b.goto(qualified);
+    } else {
+        if shadow_count {
+            b.stat(maps, GatewayReason::WouldPassDns);
+        }
+        b.goto(new_flow);
     }
-    b.goto(new_flow);
     b.bind(miss);
     b.emit(ST_DW, 8, 0, 0, 0);
     b.goto(new_flow);
@@ -905,6 +912,9 @@ pub(in crate::bpf) fn build(
     let fragment_pass = b.target();
     let fragment_xsk = b.target();
     let nd = b.target();
+    let owner = gateway
+        .arbitration
+        .map(|arb| ownership::Owner::new(&mut b, arb));
     b.mov(9, 1);
     b.load(LDX_W, 0, 9, 12);
     b.jump(JNE32_K, 0, 0, capture.authority.ifindex as i32, unknown);
@@ -1034,8 +1044,10 @@ pub(in crate::bpf) fn build(
     b.helper(1);
     b.jump(JNE_K, 0, 0, 0, local);
     b.bind(hold_lookup);
-    b.lookup(maps.hold.as_raw_fd(), KEY);
-    b.jump(JNE_K, 0, 0, 0, held);
+    if owner.is_none() {
+        b.lookup(maps.hold.as_raw_fd(), KEY);
+        b.jump(JNE_K, 0, 0, 0, held);
+    }
     let ct = b.target();
     b.goto(ct);
 
@@ -1097,52 +1109,58 @@ pub(in crate::bpf) fn build(
     b.store(STX_H, 10, KEY + 42, 0);
     b.load(LDX_H, 0, 6, 2);
     b.store(STX_H, 10, KEY + 40, 0);
-    b.lookup(maps.hold.as_raw_fd(), KEY);
-    b.jump(JNE_K, 0, 0, 0, held);
-    b.goto(ct);
-    b.bind(ct);
-    conntrack(
-        &mut b,
-        gateway.conntrack,
-        ct_miss,
-        ct_error,
-        ct_original,
-        ct_reply,
-    );
-    b.bind(ct_miss);
-    b.load(LDX_W, 0, 10, IS_QUOTE);
-    b.jump(JNE_K, 0, 0, 0, quote_unresolved);
-    b.load(LDX_B, 0, 10, KEY + 44);
-    b.jump(JEQ_K, 0, 0, 17, d1);
-    b.load(LDX_W, 0, 10, TCP_FLAGS);
-    b.emit(AND_K, 0, 0, 0, 0x17);
-    b.jump(JNE_K, 0, 0, 2, non_syn);
-    b.goto(d1);
-    b.bind(held);
-    let refreshed = b.target();
-    refresh_hold(&mut b, refreshed);
-    b.bind(refreshed);
-    b.reason(GatewayReason::XskEndpointHold, xsk);
-    b.bind(ct_original);
-    b.reason(GatewayReason::PassCtOriginal, pass);
-    b.bind(ct_reply);
-    b.reason(GatewayReason::PassCtReply, pass);
-    b.bind(ct_error);
-    b.stat(maps, GatewayReason::CtLookupError);
-    b.goto(drop);
-    b.bind(non_syn);
-    b.reason(GatewayReason::PassTcpNonSynMiss, pass);
+    if let Some(owner) = &owner {
+        b.bind(ct);
+        owner.observe(&mut b, gateway, data, d1, pass, drop);
+    } else {
+        b.lookup(maps.hold.as_raw_fd(), KEY);
+        b.jump(JNE_K, 0, 0, 0, held);
+        b.goto(ct);
+        b.bind(ct);
+        conntrack(
+            &mut b,
+            gateway.conntrack,
+            ct_miss,
+            ct_error,
+            ct_original,
+            ct_reply,
+        );
+        b.bind(ct_miss);
+        b.load(LDX_W, 0, 10, IS_QUOTE);
+        b.jump(JNE_K, 0, 0, 0, quote_unresolved);
+        b.load(LDX_B, 0, 10, KEY + 44);
+        b.jump(JEQ_K, 0, 0, 17, d1);
+        b.load(LDX_W, 0, 10, TCP_FLAGS);
+        b.emit(AND_K, 0, 0, 0, 0x17);
+        b.jump(JNE_K, 0, 0, 2, non_syn);
+        b.goto(d1);
+        b.bind(held);
+        let refreshed = b.target();
+        refresh_hold(&mut b, refreshed);
+        b.bind(refreshed);
+        b.reason(GatewayReason::XskEndpointHold, xsk);
+        b.bind(ct_original);
+        b.reason(GatewayReason::PassCtOriginal, pass);
+        b.bind(ct_reply);
+        b.reason(GatewayReason::PassCtReply, pass);
+        b.bind(ct_error);
+        b.stat(maps, GatewayReason::CtLookupError);
+        b.goto(drop);
+        b.bind(non_syn);
+        b.reason(GatewayReason::PassTcpNonSynMiss, pass);
+    }
 
     b.bind(d1);
+    let classify_bad = owner.as_ref().map_or(bad, |owner| owner.bad);
     b.stat(maps, GatewayReason::D1Evaluated);
     b.word(INDEX, 0);
     b.lookup(maps.scratch.as_raw_fd(), INDEX);
-    b.jump(JEQ_K, 0, 0, 0, bad);
+    b.jump(JEQ_K, 0, 0, 0, classify_bad);
     b.mov(8, 0);
     b.imm(0, 0);
     b.imm(1, 1);
     b.emit(ATOMIC_ADD_DW, 8, 1, 0, CMPXCHG);
-    b.jump(JNE_K, 0, 0, 0, bad);
+    b.jump(JNE_K, 0, 0, 0, classify_bad);
     // Only cold classification initializes the canonical input. The callee owns output initialization.
     for offset in (0..128).step_by(4) {
         b.emit(ST_W, 8, 0, SCRATCH_INPUT + offset, 0);
@@ -1187,7 +1205,7 @@ pub(in crate::bpf) fn build(
     let flags_present = b.target();
     b.jump(JNE_K, 0, 0, 0, flags_present);
     b.emit(ST_DW, 8, 0, 0, 0);
-    b.goto(bad);
+    b.goto(classify_bad);
     b.bind(flags_present);
     b.load(LDX_W, 0, 0, 0);
     b.emit(AND_K, 0, 0, 0, DATAPATH_FLAG_OFFLOAD_RULE_DIRECT as i32);
@@ -1229,35 +1247,44 @@ pub(in crate::bpf) fn build(
     });
     b.emit(ST_DW, 8, 0, 0, 0);
     b.jump(JEQ_K, 0, 0, 1, d1_pass);
-    b.jump(JNE_K, 0, 0, 0, bad);
+    b.jump(JNE_K, 0, 0, 0, classify_bad);
     b.goto(new_flow);
     b.bind(d1_pass);
-    b.reason(GatewayReason::PassD1, pass);
+    if let Some(owner) = &owner {
+        owner.static_pass(&mut b);
+    } else {
+        b.reason(GatewayReason::PassD1, pass);
+    }
     let dns_call = dns_path.map(|(dns, target)| {
         b.bind(target);
-        dns_shadow(&mut b, dns, maps, data, new_flow, bad)
+        let qualified = owner.as_ref().filter(|_| data).map(|owner| owner.qualified);
+        dns_shadow(&mut b, dns, maps, data, qualified, new_flow, classify_bad)
     });
     b.bind(new_flow);
-    if data {
-        b.helper(5);
-        b.store(STX_DW, 10, VALUE, 0);
-        b.store(STX_DW, 10, VALUE + 8, 0);
-        b.update(maps.hold.as_raw_fd(), KEY, VALUE, 1);
-        let inserted = b.target();
-        b.jump(JEQ_K, 0, 0, 0, inserted);
-        b.jump(JNE32_K, 0, 0, -libc::EEXIST, insert_failed);
-        b.lookup(maps.hold.as_raw_fd(), KEY);
-        b.jump(JEQ_K, 0, 0, 0, insert_failed);
-        let raced = b.target();
-        refresh_hold(&mut b, raced);
-        b.bind(raced);
-        b.bind(inserted);
-    }
-    b.reason(GatewayReason::XskNewFlow, xsk);
-    if data {
-        b.bind(insert_failed);
-        b.stat(maps, GatewayReason::HoldInsertFailed);
-        b.goto(drop);
+    if let Some(owner) = &owner {
+        owner.finish(&mut b, gateway, data, final_pass, drop);
+    } else {
+        if data {
+            b.helper(5);
+            b.store(STX_DW, 10, VALUE, 0);
+            b.store(STX_DW, 10, VALUE + 8, 0);
+            b.update(maps.hold.as_raw_fd(), KEY, VALUE, 1);
+            let inserted = b.target();
+            b.jump(JEQ_K, 0, 0, 0, inserted);
+            b.jump(JNE32_K, 0, 0, -libc::EEXIST, insert_failed);
+            b.lookup(maps.hold.as_raw_fd(), KEY);
+            b.jump(JEQ_K, 0, 0, 0, insert_failed);
+            let raced = b.target();
+            refresh_hold(&mut b, raced);
+            b.bind(raced);
+            b.bind(inserted);
+        }
+        b.reason(GatewayReason::XskNewFlow, xsk);
+        if data {
+            b.bind(insert_failed);
+            b.stat(maps, GatewayReason::HoldInsertFailed);
+            b.goto(drop);
+        }
     }
 
     b.bind(later);

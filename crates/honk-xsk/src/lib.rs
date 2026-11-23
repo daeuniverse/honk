@@ -12,7 +12,8 @@ mod port;
 pub mod topology;
 
 pub use bpf::gateway::{
-    GatewayDnsMaps, GatewayLoad, GatewayMaps, HoldValue, gateway_dns_load_failure,
+    GatewayArbitration, GatewayDnsMaps, GatewayLoad, GatewayMaps, HoldValue,
+    gateway_dns_load_failure,
 };
 pub use bpf::{
     Attachment, CaptureCounters, ConntrackKfuncs, OwnedXdpLink, PersistentAttachment,

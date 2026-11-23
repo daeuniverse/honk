@@ -3,7 +3,8 @@ use crate::{control::ControlPlane, routing::Router, xdp::gateway::GatewayPolicy}
 use anyhow::ensure;
 use honk_ebpf_common::{xdp::CaptureAuthority, xdp_gateway::CaptureRealmKey};
 use honk_xsk::{
-    ConntrackKfuncs, GatewayDnsMaps, GatewayLoad, GatewayMaps, GeneralCapture, Programs,
+    ConntrackKfuncs, GatewayArbitration, GatewayDnsMaps, GatewayLoad, GatewayMaps, GeneralCapture,
+    Programs,
 };
 use std::{path::PathBuf, process::Command};
 
@@ -74,6 +75,7 @@ fn generated_dns_shadow_policy_verifies_and_jits() -> anyhow::Result<()> {
         &[],
     )?;
     let dns = GatewayDnsMaps::new(2)?;
+    let arbitration = GatewayArbitration::new(0)?;
     let conntrack = ConntrackKfuncs::read()?;
     let capture = GeneralCapture {
         authority: CaptureAuthority {
@@ -98,6 +100,7 @@ fn generated_dns_shadow_policy_verifies_and_jits() -> anyhow::Result<()> {
                 maps: &maps,
                 conntrack: &conntrack,
                 dns: enabled.then_some(&dns),
+                arbitration: enabled.then_some(&arbitration),
             },
         )?;
         for (id, role) in [

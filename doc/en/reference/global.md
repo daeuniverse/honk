@@ -281,19 +281,19 @@ Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-sp
 
 `datapath.dns_projection` is an optional boolean for `backend: xdp` with
 `direct: endpoint` and at least one physical interface declared `lan`. Omission
-and `true` both enable DNS shadow evaluation. Set `false` to turn it off. A
+and `true` both enable DNS projection. Set `false` to turn it off. A
 change to the effective value requires a restart. TC, TUN, XDP Core and XDP
 Endpoint without a physical LAN require omission. Either explicit boolean is
 rejected in those configurations. Duplicate declarations across merged sections
 or includes and explicit null in structured input are also rejected.
 
-Shadow evaluation uses accepted transparent DNS answers from the same logical
-LAN realm to count `WouldPassDns` decisions for new flows. A bond's members share
-the bond's realm, while each VLAN has its own realm and inherits the role of its
-configured root. WAN and Host supply no facts for this evaluation. Standalone
-`dns.bind` remains independent. Packet actions continue to follow Endpoint and
-static D1. If the optional evaluation cannot start safely, honk warns and
-continues with those packet actions.
+Only transparent DNS answers accepted on the same logical LAN realm supply facts. A bond's members share its realm; each VLAN has its own realm and inherits its configured root's role. Neither WAN, Host nor standalone `dns.bind` supplies LAN facts.
+
+A pure TCP SYN to a port other than 53 can take the kernel route when the ordered policy selects unmarked `direct(must)`, or ordinary unmarked `direct` in `dial_mode: ip` and Rule mode. UDP only increments `WouldPassDns`. Missing, expired or conflicting facts do not authorize a new native flow; static D1 rules, including `:53 direct(must)`, are unchanged.
+
+Honk tracks at most 8,192 DNS-native flows awaiting matching conntrack evidence. At capacity, a fresh flow competes for Endpoint ownership instead. A retransmission without conntrack must still qualify under the current policy; loss of that permission drops the packet rather than splitting the connection. If bounded checks cannot determine the owner during a same-flow race, only that packet is dropped. A matching conntrack entry or collection after 30 seconds of inactivity can retire a pending record; 30 seconds is not a guaranteed deletion time.
+
+If honk observes `notrack`, it closes DNS permission for the rest of this capture and warns. Static D1 and Endpoint remain available. Runtime legacy raw-table checks are periodic, not an atomic fence against concurrent firewall edits. See [XDP diagnostics](./api.md) for the sampled counters and fallback reason.
 
 ### XDP Host Endpoint
 

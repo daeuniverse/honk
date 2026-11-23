@@ -957,15 +957,27 @@ impl Runtime {
         Ok(())
     }
 
+    fn revalidate_gateway_zones(&mut self) -> io::Result<()> {
+        let Some(zones) = &mut self.zones else {
+            return Ok(());
+        };
+        let result = zones.revalidate(&self.polling_budget);
+        // A notification can supply evidence before a hard inventory failure.
+        if zones.notrack_seen()
+            && let Some(publisher) = &self.gateway
+        {
+            publisher.latch_notrack();
+        }
+        result
+    }
+
     fn maintain_gateway(&mut self, now: Instant) -> anyhow::Result<()> {
         if self.gateway_maps.is_none()
             || now.duration_since(self.core_maintenance_checked) < Duration::from_secs(1)
         {
             return Ok(());
         }
-        if let Some(zones) = &mut self.zones {
-            zones.revalidate(&self.polling_budget)?;
-        }
+        self.revalidate_gateway_zones()?;
         self.refresh_local_addresses()?;
         let mut clock = std::mem::MaybeUninit::<libc::timespec>::uninit();
         // SAFETY: clock_gettime initializes one timespec on success.
@@ -983,17 +995,15 @@ impl Runtime {
                 maps.lookup_errors()? == 0,
                 "conntrack lookup contract failure"
             );
-            let scopes = &self.realm_scopes;
-            let endpoints = &self.endpoints;
-            self.hold_collector
-                .sweep(maps, now_ns, &mut |realm, source| {
-                    scopes
-                        .get(&realm)
-                        .is_none_or(|scope| endpoints.retains_source(*scope, source))
-                })?;
         }
         if let Some(publisher) = &self.gateway {
-            publisher.sample_dns();
+            let scopes = &self.realm_scopes;
+            let endpoints = &self.endpoints;
+            publisher.maintain_holds(&mut self.hold_collector, now_ns, &mut |realm, source| {
+                scopes
+                    .get(&realm)
+                    .is_none_or(|scope| endpoints.retains_source(*scope, source))
+            })?;
         }
         self.core_maintenance_checked = now;
         Ok(())
@@ -1197,6 +1207,13 @@ impl Runtime {
         let mut queue_zero_batch = BATCH;
         if !self.closing {
             if !self.admission.load(Ordering::Acquire) {
+                if let Some(error) = self
+                    .gateway
+                    .as_deref()
+                    .and_then(GatewayPublisher::capture_error)
+                {
+                    return Poll::Ready(Err(error.into()));
+                }
                 return Poll::Ready(Err(anyhow::anyhow!("XDP publication admission closed")));
             }
             let readable =
@@ -3015,9 +3032,7 @@ async fn run_capture(
         Ok(())
     } else {
         async {
-            if let Some(zones) = &mut runtime.zones {
-                zones.revalidate(&runtime.polling_budget)?;
-            }
+            runtime.revalidate_gateway_zones()?;
             let topology = runtime.admit_final_topology()?;
             ensure!(
                 topology.ipv4_broadcasts() == runtime.topology.get_ref().ipv4_broadcasts(),
@@ -3411,8 +3426,9 @@ async fn prepare(
         record(reason, "namespace", details);
     }
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let dns_projection = datapath.effective_dns_projection();
     let mut zones = if gateway_enabled {
-        match ZoneAdmission::read(&budget) {
+        match ZoneAdmission::read(&budget, dns_projection) {
             Ok(zones) => Some(zones),
             Err(error) => {
                 record("conntrack_zones", "namespace", error.to_string());
@@ -3724,6 +3740,7 @@ async fn prepare(
                     maps,
                     conntrack: ct,
                     dns: None,
+                    arbitration: None,
                 },
             )?
         } else {
@@ -3943,20 +3960,20 @@ async fn prepare(
     };
     let gateway = match (policy, gateway_maps.as_ref(), conntrack) {
         (Some(policy), Some(maps), Some(ct)) => {
-            let enabled = datapath.effective_dns_projection();
             let lan = plan
                 .realms()
                 .iter()
-                .filter(|realm| enabled && realm.role == honk_config::datapath::InterfaceRole::Lan)
+                .filter(|realm| {
+                    dns_projection && realm.role == honk_config::datapath::InterfaceRole::Lan
+                })
                 .map(|realm| (realm_scopes[&realm.realm_id], realm.realm_id));
             let shadow = gateway::GatewayShadow::new(
                 lan,
-                &plane.packet_routing_projection(),
+                plane,
                 Arc::clone(&diagnostics),
                 Arc::clone(&admission),
-                plane.datapath_health_handle(),
-                plane.shutdown_intent(),
                 &budget,
+                zones.as_ref().is_some_and(ZoneAdmission::notrack_seen),
             );
             Some(Arc::new(GatewayPublisher::new(
                 policy,
@@ -3964,6 +3981,7 @@ async fn prepare(
                 ct,
                 Arc::clone(&budget),
                 shadow,
+                plane.active_routing_plan_handle(),
             )))
         }
         _ => None,

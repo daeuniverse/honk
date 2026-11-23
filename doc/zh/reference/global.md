@@ -270,16 +270,18 @@ Core 的输入上下文 FIB 契约拒绝非零 IPv6 flow label 及无法保持�
 
 `datapath.dns_projection` 是可选布尔值，仅适用于 `backend: xdp`、
 `direct: endpoint` 且至少将一个物理接口声明为 `lan` 的配置。省略或显式写
-`true` 都会启用 DNS 影子判定，写 `false` 可关闭。有效值变更需要重启。TC、
+`true` 都会启用 DNS 投影，写 `false` 可关闭。有效值变更需要重启。TC、
 TUN、XDP Core 和没有物理 LAN 的 XDP Endpoint 必须省略该字段，显式写任一
 布尔值均会被拒绝。跨合并分段或 include 重复声明，以及结构化输入中的显式
 `null` 也会被拒绝。
 
-影子判定使用同一逻辑 LAN realm 内接受的透明 DNS 应答，统计新流的
-`WouldPassDns` 次数。bond 成员共用 bond 的 realm，每个 VLAN 使用自己的
-realm，并沿用配置中的根接口角色。WAN 和 Host 均不为影子判定提供事实，
-独立 `dns.bind` 也不参与。数据包继续走既有 Endpoint 和静态 D1 路径。若
-可选的影子判定无法安全启动，honk 会记录告警并沿用这些数据包路径。
+只有在同一逻辑 LAN realm 接受的透明 DNS 应答才能提供事实。bond 成员共用 bond 的 realm；每个 VLAN 使用自己的 realm 并继承配置根接口的角色。WAN、Host 和独立 `dns.bind` 均不为 LAN 提供事实。
+
+对于目的端口非 53 的纯 TCP SYN，有序策略选中无 mark 的 `direct(must)`，或在 `dial_mode: ip` 且为 Rule 模式时选中普通无 mark 的 `direct`，才可交给内核原生转发。UDP 只计 `WouldPassDns`。事实缺失、过期或冲突不能授权新的原生流；既有静态 D1（含 `:53 direct(must)`）不变。
+
+最多 8,192 个 DNS 原生流可以等待对应的 conntrack 证据。满额时新流改为争取 Endpoint 归属。尚未命中 conntrack 的重传仍须满足当前策略；许可撤回就丢当前包，不把同一连接拆给 Endpoint。同一流竞争且有界复查仍不能确定归属时，也只丢当前包。命中同键 conntrack 或满足 30 秒空闲回收条件可退役 pending 记录；30 秒不是删除期限。
+
+一旦观测到 `notrack`，honk 会告警，并在本次 capture 的剩余时间关闭 DNS 许可。静态 D1 和 Endpoint 继续工作。运行期 legacy raw 表是周期抽查，不能与并发防火墙更改构成原子屏障。采样计数和回退原因见 [XDP 诊断](./api.md)。
 
 ### XDP Host Endpoint
 

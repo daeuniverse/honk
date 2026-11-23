@@ -3,6 +3,8 @@ use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 
+const XT_CT_NOTRACK_FLAGS: usize = 0x03;
+
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -81,10 +83,30 @@ fn native_u16(bytes: &[u8], offset: usize) -> io::Result<usize> {
     Ok(u16::from_ne_bytes([value[0], value[1]]) as usize)
 }
 
-fn legacy_entries(mut bytes: &[u8], ipv6: bool, expected: u32) -> io::Result<()> {
+fn xt_ct_notrack(revision: u32, info: &[u8], legacy: bool) -> io::Result<bool> {
+    // Revision 2 reuses xt_ct_target_info_v1. Legacy entries include the aligned kernel
+    // pointer slot after the userspace fields, which the nft compat payload can omit.
+    let usersize = match revision {
+        0 => 32,
+        1 | 2 => 64,
+        _ => return Err(invalid("unknown xt CT target revision")),
+    };
+    let minimum = usersize + if legacy { 8 } else { 0 };
+    if info.len() < minimum {
+        return Err(invalid("truncated xt CT target info"));
+    }
+    let flags = native_u16(info, 0)?;
+    if flags & 16 != 0 || native_u16(info, 2)? != 0 {
+        return Err(invalid("nonzero or dynamic xt CT target zone"));
+    }
+    Ok(flags & XT_CT_NOTRACK_FLAGS != 0)
+}
+
+fn legacy_entries(mut bytes: &[u8], ipv6: bool, expected: u32) -> io::Result<bool> {
     // ip6t_ip6 is 136 bytes; nfcache precedes offsets, counters align to eight.
     let (target_field, entry_size) = if ipv6 { (140, 168) } else { (88, 112) };
     let mut count = 0u32;
+    let mut notrack_seen = false;
     while !bytes.is_empty() {
         if bytes.len() < entry_size {
             return Err(invalid("truncated xtables entry"));
@@ -104,16 +126,10 @@ fn legacy_entries(mut bytes: &[u8], ipv6: bool, expected: u32) -> io::Result<()>
             .iter()
             .position(|&b| b == 0)
             .ok_or_else(|| invalid("invalid xtables target name"))?;
-        if &name[..end] == b"CT" {
-            let minimum = if entry[31] == 0 { 72 } else { 104 };
-            if entry[31] > 1 || size < minimum {
-                return Err(invalid("unknown or truncated CT target revision"));
-            }
-            let flags = native_u16(entry, 32)?;
-            let zone = native_u16(entry, 34)?;
-            if flags & 16 != 0 || zone != 0 {
-                return Err(invalid("nonzero or dynamic legacy CT zone"));
-            }
+        match &name[..end] {
+            b"CT" => notrack_seen |= xt_ct_notrack(u32::from(entry[31]), &entry[32..], true)?,
+            b"NOTRACK" => notrack_seen = true,
+            _ => {}
         }
         count = count
             .checked_add(1)
@@ -123,7 +139,7 @@ fn legacy_entries(mut bytes: &[u8], ipv6: bool, expected: u32) -> io::Result<()>
     if count != expected {
         return Err(invalid("xtables entry count mismatch"));
     }
-    Ok(())
+    Ok(notrack_seen)
 }
 
 fn attr_value(bytes: &[u8], wanted: u16) -> io::Result<Option<&[u8]>> {
@@ -166,10 +182,11 @@ fn nft_string(bytes: &[u8]) -> io::Result<&[u8]> {
     Ok(value)
 }
 
-fn nft_rule(bytes: &[u8], mut check_set: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+fn nft_rule(bytes: &[u8], mut check_set: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<bool> {
     let expressions = required(bytes, 4)?;
     let mut known_zero = [false; 24];
     let mut sets: [Option<&[u8]>; 24] = [None; 24];
+    let mut notrack_seen = false;
     attrs(expressions, |kind, expression| {
         if kind != 1 {
             return Err(invalid("invalid nft expression list"));
@@ -221,26 +238,26 @@ fn nft_rule(bytes: &[u8], mut check_set: impl FnMut(&[u8]) -> io::Result<()>) ->
                 }
             }
             b"target" => {
-                if nft_string(required(data, 1)?)? == b"CT" {
-                    let revision = be32(required(data, 2)?)?;
-                    let info = required(data, 3)?;
-                    if revision > 1 || info.len() < 4 {
-                        return Err(invalid("unknown nft CT target revision"));
+                match nft_string(required(data, 1)?)? {
+                    b"CT" => {
+                        let revision = be32(required(data, 2)?)?;
+                        notrack_seen |= xt_ct_notrack(revision, required(data, 3)?, false)?;
                     }
-                    if native_u16(info, 0)? & 16 != 0 || native_u16(info, 2)? != 0 {
-                        return Err(invalid("nonzero or dynamic nft CT target zone"));
-                    }
+                    b"NOTRACK" => notrack_seen = true,
+                    _ => {}
                 }
                 known_zero.fill(false);
                 sets.fill(None);
             }
             _ => {
+                notrack_seen |= name == b"notrack";
                 known_zero.fill(false);
                 sets.fill(None);
             }
         }
         Ok(())
-    })
+    })?;
+    Ok(notrack_seen)
 }
 
 fn nft_set_elements(bytes: &[u8]) -> io::Result<()> {
@@ -262,7 +279,7 @@ fn nft_set_elements(bytes: &[u8]) -> io::Result<()> {
     })
 }
 
-fn legacy_table(ipv6: bool, budget: &Arc<MemoryBudget>) -> io::Result<()> {
+fn legacy_table(ipv6: bool, budget: &Arc<MemoryBudget>) -> io::Result<bool> {
     let family = if ipv6 { libc::AF_INET6 } else { libc::AF_INET };
     let level = if ipv6 {
         libc::IPPROTO_IPV6
@@ -299,7 +316,7 @@ fn legacy_table(ipv6: bool, budget: &Arc<MemoryBudget>) -> io::Result<()> {
         let error = io::Error::last_os_error();
         // ENOPROTOOPT is nf_sockopt_find's result when no legacy handler exists.
         if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENOPROTOOPT)) {
-            return Ok(());
+            return Ok(false);
         }
         return Err(error);
     }
@@ -619,7 +636,8 @@ fn generation(net: &mut Netfilter) -> io::Result<u32> {
     be32(required(&replies.entries[0].1, 1)?)
 }
 
-fn nft_inventory(net: &mut Netfilter) -> io::Result<()> {
+fn nft_inventory(net: &mut Netfilter) -> io::Result<bool> {
+    let mut notrack_seen = false;
     for _ in 0..3 {
         let before = generation(net)?;
         for operation in [1u16, 4, 10] {
@@ -632,7 +650,7 @@ fn nft_inventory(net: &mut Netfilter) -> io::Result<()> {
         for (family, rule, _) in &rules.entries {
             let table = required(rule, 1)?;
             nft_string(table)?;
-            nft_rule(rule, |set| {
+            notrack_seen |= nft_rule(rule, |set| {
                 let _name_memory = reserve_scan(&net.budget, set.len() + 1)?;
                 let mut name = Vec::with_capacity(set.len() + 1);
                 name.extend_from_slice(set);
@@ -658,7 +676,7 @@ fn nft_inventory(net: &mut Netfilter) -> io::Result<()> {
             })?;
         }
         if before == generation(net)? {
-            return Ok(());
+            return Ok(notrack_seen);
         }
     }
     Err(invalid("nft ruleset changed during zone inventory"))
@@ -666,10 +684,12 @@ fn nft_inventory(net: &mut Netfilter) -> io::Result<()> {
 
 pub(crate) struct ZoneAdmission {
     notifications: OwnedFd,
+    observe_notrack: bool,
+    notrack_seen: bool,
 }
 
 impl ZoneAdmission {
-    pub(crate) fn read(budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+    pub(crate) fn read(budget: &Arc<MemoryBudget>, observe_notrack: bool) -> io::Result<Self> {
         let _receive_memory = reserve_scan(budget, 1024 * 1024)?;
         let notifications = netfilter_socket(1 << 6, true)?;
         let mut net = Netfilter::open(budget)?;
@@ -679,10 +699,13 @@ impl ZoneAdmission {
                 conntrack_zones(entry, expectation)?;
             }
         }
-        legacy_table(false, budget)?;
-        legacy_table(true, budget)?;
-        nft_inventory(&mut net)?;
-        Ok(Self { notifications })
+        let notrack_seen =
+            legacy_table(false, budget)? | legacy_table(true, budget)? | nft_inventory(&mut net)?;
+        Ok(Self {
+            notifications,
+            observe_notrack,
+            notrack_seen: observe_notrack && notrack_seen,
+        })
     }
 
     pub(crate) fn revalidate(&mut self, budget: &Arc<MemoryBudget>) -> io::Result<()> {
@@ -697,10 +720,29 @@ impl ZoneAdmission {
                 if kind >> 8 != 10 || payload.len() < 4 {
                     return Err(invalid("invalid nft notification"));
                 }
-                attrs(&payload[4..], |_, _| Ok(()))
+                let attributes = &payload[4..];
+                attrs(attributes, |_, _| Ok(()))?;
+                if self.observe_notrack && !self.notrack_seen && kind == (10 << 8) | 6 {
+                    // A committed new rule may have been removed before the inventory dump.
+                    // Only the current inventory can reject the gateway on its zone checks.
+                    self.notrack_seen = nft_rule(attributes, |_| Ok(())).unwrap_or(true);
+                }
+                Ok(())
             })?;
         }
-        nft_inventory(&mut Netfilter::open(budget)?)
+        let nft_notrack = nft_inventory(&mut Netfilter::open(budget)?)?;
+        if self.observe_notrack && !self.notrack_seen {
+            // Legacy tables have no nft notifications. Runtime failures here leave DNS
+            // without an absence proof. Legacy zone validation is mandatory at startup.
+            self.notrack_seen = nft_notrack
+                || legacy_table(false, budget).unwrap_or(true)
+                || legacy_table(true, budget).unwrap_or(true);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn notrack_seen(&self) -> bool {
+        self.notrack_seen
     }
 }
 
@@ -733,11 +775,16 @@ mod tests {
     fn zone_scan_rejects_missing_receive_budget() {
         let budget = MemoryBudget::new(0);
         assert_eq!(
-            ZoneAdmission::read(&budget).err().unwrap().to_string(),
+            ZoneAdmission::read(&budget, true)
+                .err()
+                .unwrap()
+                .to_string(),
             "zone scan memory capacity"
         );
         let mut admission = ZoneAdmission {
             notifications: std::fs::File::open("/dev/null").unwrap().into(),
+            observe_notrack: true,
+            notrack_seen: false,
         };
         assert_eq!(
             admission.revalidate(&budget).unwrap_err().to_string(),
@@ -785,11 +832,69 @@ mod tests {
 
     #[test]
     fn nft_zone_constants_and_map_values_are_checked() {
-        assert!(nft_rule(&rule(0), |_| Ok(())).is_ok());
+        assert!(!nft_rule(&rule(0), |_| Ok(())).unwrap());
         assert!(nft_rule(&rule(1), |_| Ok(())).is_err());
         let element = |zone| attr(3, &attr(1, &attr(2, &attr(1, &[0, zone]))));
         assert!(nft_set_elements(&element(0)).is_ok());
         assert!(nft_set_elements(&element(1)).is_err());
+    }
+
+    #[test]
+    fn nft_notrack_is_reported_without_masking_zone_errors() {
+        let native = attr(1, &attr(1, b"notrack\0"));
+        let xt_ct = |revision: u32, size: usize, flags: u16, zone: u16| {
+            let mut data = attr(1, b"CT\0");
+            data.extend(attr(2, &revision.to_be_bytes()));
+            let mut info = [0; 72];
+            info[..2].copy_from_slice(&flags.to_ne_bytes());
+            info[2..4].copy_from_slice(&zone.to_ne_bytes());
+            data.extend(attr(3, &info[..size]));
+            expression(b"target", &data)
+        };
+        for expr in [
+            native.clone(),
+            expression(b"notrack", &[]),
+            expression(b"target", &attr(1, b"NOTRACK\0")),
+            xt_ct(0, 40, 1, 0),
+            xt_ct(1, 72, 2, 0),
+            xt_ct(2, 72, 3, 0),
+            xt_ct(2, 64, 3, 0),
+        ] {
+            assert!(nft_rule(&attr(4, &expr), |_| Ok(())).unwrap());
+        }
+        assert!(!nft_rule(&attr(4, &xt_ct(2, 72, 0, 0)), |_| Ok(())).unwrap());
+        for (expr, expected) in [
+            (xt_ct(2, 72, 3, 7), "nonzero or dynamic xt CT target zone"),
+            (
+                xt_ct(2, 72, 0x13, 0),
+                "nonzero or dynamic xt CT target zone",
+            ),
+            (xt_ct(3, 72, 3, 0), "unknown xt CT target revision"),
+            (xt_ct(2, 63, 3, 0), "truncated xt CT target info"),
+        ] {
+            assert_eq!(
+                nft_rule(&attr(4, &expr), |_| Ok(()))
+                    .unwrap_err()
+                    .to_string(),
+                expected
+            );
+        }
+        let mut expressions = native.clone();
+        expressions.extend(required(&rule(7), 4).unwrap());
+        assert_eq!(
+            nft_rule(&attr(4, &expressions), |_| Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "nonzero or unproven nft CT zone"
+        );
+        let mut expressions = native;
+        expressions.extend(attr(2, &[]));
+        assert_eq!(
+            nft_rule(&attr(4, &expressions), |_| Ok(()))
+                .unwrap_err()
+                .to_string(),
+            "invalid nft expression list"
+        );
     }
 
     #[test]
@@ -831,17 +936,53 @@ mod tests {
     #[test]
     fn legacy_ct_zone_and_mark_are_rejected() {
         for (ipv6, field, size) in [(false, 88, 112), (true, 140, 168)] {
-            let mut entry = vec![0; size + 72];
-            entry[field..field + 2].copy_from_slice(&(size as u16).to_ne_bytes());
-            entry[field + 2..field + 4].copy_from_slice(&((size + 72) as u16).to_ne_bytes());
-            entry[size..size + 2].copy_from_slice(&72u16.to_ne_bytes());
-            entry[size + 2..size + 4].copy_from_slice(b"CT");
-            assert!(legacy_entries(&entry, ipv6, 1).is_ok());
-            entry[size + 34..size + 36].copy_from_slice(&1u16.to_ne_bytes());
-            assert!(legacy_entries(&entry, ipv6, 1).is_err());
-            entry[size + 34..size + 36].fill(0);
-            entry[size + 32..size + 34].copy_from_slice(&16u16.to_ne_bytes());
-            assert!(legacy_entries(&entry, ipv6, 1).is_err());
+            let entry = |target_size: u16, revision, name: &[u8]| {
+                let next = (size as u16 + target_size).to_ne_bytes();
+                let mut entry = vec![0; size + usize::from(target_size)];
+                entry[field..field + 2].copy_from_slice(&(size as u16).to_ne_bytes());
+                entry[field + 2..field + 4].copy_from_slice(&next);
+                entry[size..size + 2].copy_from_slice(&target_size.to_ne_bytes());
+                entry[size + 2..size + 2 + name.len()].copy_from_slice(name);
+                entry[size + 31] = revision;
+                entry
+            };
+            let notrack = entry(32, 0, b"NOTRACK");
+            assert!(legacy_entries(&notrack, ipv6, 1).unwrap());
+
+            for (revision, target_size) in [(0, 72), (1, 104), (2, 104)] {
+                let mut ct = entry(target_size, revision, b"CT");
+                assert!(!legacy_entries(&ct, ipv6, 1).unwrap());
+                for flags in [1u16, 2, 3] {
+                    ct[size + 32..size + 34].copy_from_slice(&flags.to_ne_bytes());
+                    assert!(legacy_entries(&ct, ipv6, 1).unwrap());
+                }
+                ct[size + 34..size + 36].copy_from_slice(&1u16.to_ne_bytes());
+                assert_eq!(
+                    legacy_entries(&ct, ipv6, 1).unwrap_err().to_string(),
+                    "nonzero or dynamic xt CT target zone"
+                );
+                let mut rules = notrack.clone();
+                rules.extend_from_slice(&ct);
+                assert!(legacy_entries(&rules, ipv6, 2).is_err());
+                ct[size + 34..size + 36].fill(0);
+                ct[size + 32..size + 34].copy_from_slice(&0x13u16.to_ne_bytes());
+                assert_eq!(
+                    legacy_entries(&ct, ipv6, 1).unwrap_err().to_string(),
+                    "nonzero or dynamic xt CT target zone"
+                );
+            }
+            assert_eq!(
+                legacy_entries(&entry(104, 3, b"CT"), ipv6, 1)
+                    .unwrap_err()
+                    .to_string(),
+                "unknown xt CT target revision"
+            );
+            assert_eq!(
+                legacy_entries(&entry(103, 2, b"CT"), ipv6, 1)
+                    .unwrap_err()
+                    .to_string(),
+                "truncated xt CT target info"
+            );
         }
     }
 
@@ -954,9 +1095,10 @@ mod tests {
                 legacy_jump: false,
             };
             let budget = MemoryBudget::new(128 * 1024 * 1024);
-            let mut admission = ZoneAdmission::read(&budget).map_err(|error| {
+            let mut admission = ZoneAdmission::read(&budget, true).map_err(|error| {
                 io::Error::other(format!("NOT_EXERCISED: clean zone admission: {error}"))
             })?;
+            assert!(!admission.notrack_seen());
             fixture_command("nft", &["add", "table", "inet", &fixture.table])?;
             fixture.nft = true;
             fixture_command(
@@ -972,6 +1114,15 @@ mod tests {
             )?;
             fixture_command(
                 "nft",
+                &["add", "rule", "inet", &fixture.table, "raw", "notrack"],
+            )?;
+            assert!(ZoneAdmission::read(&budget, true)?.notrack_seen());
+            assert!(!ZoneAdmission::read(&budget, false)?.notrack_seen());
+            fixture_command("nft", &["flush", "chain", "inet", &fixture.table, "raw"])?;
+            admission.revalidate(&budget)?;
+            assert!(admission.notrack_seen());
+            fixture_command(
+                "nft",
                 &[
                     "add",
                     "rule",
@@ -985,7 +1136,7 @@ mod tests {
                 ],
             )?;
             assert!(
-                ZoneAdmission::read(&budget).is_err(),
+                ZoneAdmission::read(&budget, true).is_err(),
                 "startup admitted nft zone 7"
             );
             assert!(
@@ -994,6 +1145,8 @@ mod tests {
             );
             fixture.remove_nft()?;
             admission.revalidate(&budget)?;
+            let mut admission = ZoneAdmission::read(&budget, true)?;
+            assert!(!admission.notrack_seen());
             fixture_command(
                 "iptables-legacy",
                 &["-w", "2", "-t", "raw", "-N", "HONK_ZONE_TEST"],
@@ -1029,18 +1182,47 @@ mod tests {
                 ],
             )?;
             assert!(
-                ZoneAdmission::read(&budget).is_err(),
+                ZoneAdmission::read(&budget, true).is_err(),
                 "startup admitted legacy zone 7"
             );
             admission
                 .revalidate(&budget)
                 .expect("legacy runtime edits must not trigger nft rejection");
+            assert!(admission.notrack_seen());
+            fixture_command(
+                "iptables-legacy",
+                &["-w", "2", "-t", "raw", "-F", "HONK_ZONE_TEST"],
+            )?;
+            admission.revalidate(&budget)?;
+            assert!(admission.notrack_seen());
+            let mut admission = ZoneAdmission::read(&budget, true)?;
+            assert!(!admission.notrack_seen());
+            fixture_command(
+                "iptables-legacy",
+                &[
+                    "-w",
+                    "2",
+                    "-t",
+                    "raw",
+                    "-A",
+                    "HONK_ZONE_TEST",
+                    "-j",
+                    "CT",
+                    "--notrack",
+                ],
+            )?;
+            assert!(ZoneAdmission::read(&budget, true)?.notrack_seen());
+            admission.revalidate(&budget)?;
+            assert!(admission.notrack_seen());
             fixture.cleanup()?;
-            ZoneAdmission::read(&budget).map_err(|error| {
+            admission.revalidate(&budget)?;
+            assert!(admission.notrack_seen());
+            let clean = ZoneAdmission::read(&budget, true).map_err(|error| {
                 io::Error::other(format!(
                     "zone fixture cleanup left failed admission: {error}"
                 ))
             })?;
+            assert!(!clean.notrack_seen());
             Ok(())
         })
         .join()
