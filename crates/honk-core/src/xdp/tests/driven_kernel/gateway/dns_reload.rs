@@ -309,6 +309,7 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
         let wan = realm(&fixture, "dut1")?;
         let budget = fixture.runtime.polling_budget.clone();
         assert_eq!(Attached::read(&fixture)?.bank, None);
+        fixture.runtime.endpoints.reap_completed_udp_tasks();
         let static_used = budget.used();
         let mut domain_config = baseline.clone();
         domain_config.routing = domain.routing;
@@ -390,8 +391,13 @@ async fn shadow_staged_rollback_retires_memory_and_reopens_fresh_epoch() -> anyh
 
         reload(&mut fixture, baseline).await?;
         assert_eq!(Attached::read(&fixture)?.bank, None);
+        // A delivered DNS reply can leave its completed task charged until the next ingress joins it.
+        let before_join = budget.used();
+        fixture.runtime.endpoints.reap_completed_udp_tasks();
+        let after_join = budget.used();
+        println!("static capture budget: original={static_used} before_udp_join={before_join} after_udp_join={after_join}");
         assert_eq!(
-            budget.used(),
+            after_join,
             static_used,
             "retired static or shadow generations retained capture memory"
         );
