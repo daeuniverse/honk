@@ -152,7 +152,7 @@ fn config(hosts: &tempfile::NamedTempFile) -> anyhow::Result<Config> {
         "global { dial_mode: ip\n nfqueue_enable: false\n so_mark_from_dae: 0x100 }
          dns { bind: '' }
          datapath { backend: xdp\n direct: endpoint\n xsk_mode: copy\n interface { dut0: lan\n dut1: wan } }
-         routing { domain(full: shadow-reload.test) -> direct(must)\n fallback: block }",
+         routing { domain(full: shadow-reload.test) -> direct(must)\n dip(198.51.100.99/32) && dport(53) -> direct\n fallback: block }",
     )?;
     config.dns.hosts = vec![hosts.path().to_str().context("hosts path encoding")?.into()];
     Ok(config)
@@ -632,11 +632,12 @@ async fn shadow_optional_preparation_retains_complete_static_policy() -> anyhow:
         // Static D1 stops at the domain barrier. Shadow must emit the later rule,
         // whose port ranges exceed the assembler's 16-bit jump distance.
         let mut long_rule = config.routing.rules[0].clone();
-        long_rule.priority += 1;
+        long_rule.priority = config.routing.rules.last().unwrap().priority + 1;
         long_rule.condition = honk_config::routing::RoutingCondition {
             port: (1000..10000).map(|port| port.to_string()).collect(),
             ..Default::default()
         };
+        let long_rule_index = config.routing.rules.len();
         config.routing.rules.push(long_rule);
         let mut fixture = Fixture::start_config_inner(config, true).await?;
         let initial = compile(&fixture.config)?;
@@ -667,7 +668,7 @@ async fn shadow_optional_preparation_retains_complete_static_policy() -> anyhow:
         );
 
         let mut candidate = fixture.config.clone();
-        candidate.routing.rules[1].condition.port[0] = "10000".into();
+        candidate.routing.rules[long_rule_index].condition.port[0] = "10000".into();
         let next = compile(&candidate)?;
         assert_ne!(next.fingerprint, initial.fingerprint);
         reload(&mut fixture, candidate.clone()).await?;
@@ -681,8 +682,8 @@ async fn shadow_optional_preparation_retains_complete_static_policy() -> anyhow:
         );
 
         // The same rule now precedes the domain barrier and is required in static D1.
-        candidate.routing.rules[1].priority = candidate.routing.rules[0].priority;
-        candidate.routing.rules.swap(0, 1);
+        candidate.routing.rules[long_rule_index].priority = candidate.routing.rules[0].priority;
+        candidate.routing.rules.swap(0, long_rule_index);
         let generation = fixture.diagnostics.read().generation;
         let reply = begin_reload(&fixture, candidate).await?;
         assert_eq!(
