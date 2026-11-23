@@ -13,11 +13,11 @@ impl PacketEndpoints {
         &self,
         scope: ScopeId,
         view: PacketView<'_>,
-    ) -> io::Result<&PacketScope> {
+    ) -> io::Result<(&PacketScope, Option<TcpClaim>)> {
         let realm = self
             .realm(scope)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unowned packet realm"))?;
-        Ok(&realm.owners()[realm.worker_for_packet(view)])
+        realm.dispatch_owner(0, view)
     }
 
     fn check_owner(&self, owner: &PacketScope) -> io::Result<()> {
@@ -120,15 +120,19 @@ impl PacketEndpoints {
 }
 
 impl PacketRealm {
-    pub(crate) fn worker_for_packet(&self, view: PacketView<'_>) -> usize {
+    pub(crate) fn dispatch_owner(
+        &self,
+        local: usize,
+        view: PacketView<'_>,
+    ) -> io::Result<(&PacketScope, Option<TcpClaim>)> {
         if self.owners().len() == 1 {
-            return 0;
+            return Ok((&self.owners()[0], None));
         }
         let Ok(ip) = view.parse_ip() else {
-            return 0;
+            return Ok((&self.owners()[0], None));
         };
-        match ip.proto {
-            wire::PROTO_UDP => self.worker_for_udp(ip.src),
+        let (worker, claim) = match ip.proto {
+            wire::PROTO_UDP => (self.worker_for_udp(ip.src), None),
             wire::PROTO_TCP => {
                 let mut ports = [0; 4];
                 if ip.payload.len() < ports.len()
@@ -136,51 +140,61 @@ impl PacketRealm {
                         .copy_to(ip.payload.start..ip.payload.start + 4, &mut ports)
                         .is_none()
                 {
-                    return 0;
+                    return Ok((&self.owners()[0], None));
                 }
-                self.worker_for_tcp(
+                self.tcp_dispatch(
+                    local,
                     SocketAddr::new(ip.src, u16::from_be_bytes([ports[0], ports[1]])),
                     SocketAddr::new(ip.dst, u16::from_be_bytes([ports[2], ports[3]])),
-                )
+                )?
             }
-            wire::PROTO_ICMP | wire::PROTO_ICMPV6 => {
-                if view.transport_ports(&ip).is_err() || ip.payload.len() < 8 {
-                    return 0;
-                }
-                let mut kind = [0; 2];
-                if view
-                    .copy_to(ip.payload.start..ip.payload.start + 2, &mut kind)
-                    .is_none()
-                    || !matches!((ip.src.is_ipv4(), kind[0]), (true, 3) | (false, 1 | 2))
-                {
-                    return 0;
-                }
-                let mut quote = [0; 40 + 8 * 2048 + 8];
-                let count = (ip.payload.len() - 8).min(quote.len());
-                if view
-                    .copy_to(
-                        ip.payload.start + 8..ip.payload.start + 8 + count,
-                        &mut quote[..count],
-                    )
-                    .is_none()
-                {
-                    return 0;
-                }
-                let Some(quote) = wire::icmp::parse_quoted(&quote[..count]) else {
-                    return 0;
-                };
-                if quote.proto != wire::PROTO_TCP
-                    || quote.seq.is_none()
-                    || quote.src.is_ipv4() != ip.src.is_ipv4()
-                {
-                    return 0;
-                }
-                self.worker_for_tcp(
-                    SocketAddr::new(quote.dst, quote.dst_port),
-                    SocketAddr::new(quote.src, quote.src_port),
-                )
-            }
-            _ => 0,
+            wire::PROTO_ICMP | wire::PROTO_ICMPV6 => (self.quoted_worker(view, &ip), None),
+            _ => (0, None),
+        };
+        Ok((&self.owners()[worker], claim))
+    }
+
+    fn quoted_worker(&self, view: PacketView<'_>, ip: &wire::IpPacket) -> usize {
+        if view.transport_ports(ip).is_err() || ip.payload.len() < 8 {
+            return 0;
+        }
+        let mut kind = [0; 2];
+        if view
+            .copy_to(ip.payload.start..ip.payload.start + 2, &mut kind)
+            .is_none()
+            || !matches!((ip.src.is_ipv4(), kind[0]), (true, 3) | (false, 1 | 2))
+        {
+            return 0;
+        }
+        let mut quote = [0; 40 + 8 * 2048 + 8];
+        let count = (ip.payload.len() - 8).min(quote.len());
+        if view
+            .copy_to(
+                ip.payload.start + 8..ip.payload.start + 8 + count,
+                &mut quote[..count],
+            )
+            .is_none()
+        {
+            return 0;
+        }
+        let Some(quote) = wire::icmp::parse_quoted(&quote[..count]) else {
+            return 0;
+        };
+        if quote.proto != wire::PROTO_TCP
+            || quote.seq.is_none()
+            || quote.src.is_ipv4() != ip.src.is_ipv4()
+        {
+            return 0;
+        }
+        let source = SocketAddr::new(quote.dst, quote.dst_port);
+        let destination = SocketAddr::new(quote.src, quote.src_port);
+        if self.queue_affine() {
+            self.owners()
+                .iter()
+                .position(|owner| owner.retains_tcp(source, destination))
+                .unwrap_or(0)
+        } else {
+            self.worker_for_tcp(source, destination)
         }
     }
 }

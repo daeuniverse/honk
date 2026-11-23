@@ -26,8 +26,8 @@ use crate::control::{
         PolicyRead, Requirements, RoutedCore, socket_namespace,
     },
     netstack::{
-        CAPTURE_MEMORY, DirectRelayFence, MaterializedOutput, OutputLease, OutputOwner,
-        PacketDriver, PacketRealm, PacketScope, capture_realm,
+        CAPTURE_MEMORY, CAPTURE_WIDE_BULK_FRAMES, DirectRelayFence, MaterializedOutput,
+        OutputLease, OutputOwner, PacketDriver, PacketRealm, PacketScope, capture_realm,
     },
     packet_endpoint::{EndpointAdmission, PacketEndpointOwner, PacketEndpoints, PacketReceive},
 };
@@ -196,15 +196,17 @@ enum QueueIo {
 }
 
 impl QueueIo {
-    fn register(self) -> io::Result<Self> {
-        match self {
-            Self::Prepared(port) => {
-                // The socket is closed only after this registration is consumed.
-                unsafe { AsyncFd::register(port) }
-                    .map(Self::Registered)
-                    .map_err(io::Error::from)
+    fn register(self) -> (Self, io::Result<()>) {
+        let Self::Prepared(port) = self else {
+            return (self, Ok(()));
+        };
+        // SAFETY: the socket stays owned until this registration is consumed.
+        match unsafe { AsyncFd::register(port) } {
+            Ok(io) => (Self::Registered(io), Ok(())),
+            Err(error) => {
+                let (port, error) = error.into_parts();
+                (Self::Prepared(port), Err(error))
             }
-            registered => Ok(registered),
         }
     }
     fn get_ref(&self) -> &Port<Retained> {
@@ -292,6 +294,7 @@ struct Waiting {
     mac: [u8; 6],
     retry: Instant,
     scope: ScopeId,
+    ingress_worker: usize,
     path: ReturnPath,
     ingress_at: Instant,
     cell: Option<worker::Cell>,
@@ -876,6 +879,42 @@ struct Runtime {
 }
 
 impl Runtime {
+    fn relay_candidates(
+        &self,
+        direct: Option<DirectProfile>,
+    ) -> impl Iterator<Item = (&PacketRealm, usize, &DeviceInfo)> {
+        self.realms.iter().filter_map(move |realm| {
+            let packet = self
+                .endpoints
+                .realm(realm.driver.scope())
+                .expect("prepared physical realm");
+            let info = self.devices[realm.device].info.as_ref();
+            let members = realm.members.len();
+            direct_relay_eligible(
+                direct,
+                self.workers.workers,
+                packet.owners().len(),
+                members,
+                info.direct_relay_physical,
+            )
+            .then_some((packet, members, info))
+        })
+    }
+
+    fn activate_capture(
+        &self,
+        shutdown: &crate::control::ShutdownIntent,
+        direct: Option<DirectProfile>,
+    ) -> anyhow::Result<()> {
+        self.workers.activate(
+            shutdown,
+            &self.endpoints,
+            direct,
+            self.relay_candidates(direct)
+                .map(|(packet, members, info)| (packet, members, info.supports_direct_relay_now())),
+        )
+    }
+
     fn admit_final_topology(&self) -> io::Result<CaptureTopology> {
         CaptureTopology::admit(
             self.capture_plan
@@ -1355,7 +1394,7 @@ impl Runtime {
                                         Ok(Some((packet, peer))) => {
                                             let ingress_at = packet.received_at();
                                             let path = peer.as_ref().map(worker::PeerHold::original_path).unwrap_or(path);
-                                            waiting.push_back(Waiting { packet, mac: path.mac, retry: now, scope, path, ingress_at, cell: None, peer });
+                                            waiting.push_back(Waiting { packet, mac: path.mac, retry: now, scope, ingress_worker: 0, path, ingress_at, cell: None, peer });
                                         }
                                         Ok(None) => {}
                                         Err(error) if error.downcast_ref::<honk_datapath::forward::ForwardError>().is_some() => pressure.core_ingress_refused = pressure.core_ingress_refused.saturating_add(1),
@@ -1372,41 +1411,29 @@ impl Runtime {
                                 Err(error) => { failure = Some(error.into()); return; }
                             }
                         }
-                        let bytes = if count == 1 { l3[0] } else {
-                            batch.take();
-                            if decoded.l3_len > staging.len() { return; }
-                            if view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return; }
-                            &staging[..decoded.l3_len]
-                        };
                         let result = (|| {
-                            let owner = match realm.driver.sole_owner() {
-                                Some(owner) => owner,
-                                None => endpoints.execution_owner(scope, PacketView::from_slice(bytes))?,
+                            let Some(owner) = realm.driver.sole_owner() else {
+                                let physical = endpoints.realm(scope).ok_or_else(|| io::Error::other("unregistered physical realm"))?;
+                                return workers.physical_endpoint(batch, endpoints, physical, 0, ingress, &l3[..count], view, staging, (now, Instant::now()), path, core.is_some());
                             };
-                            if owner.worker() == 0 {
-                                if matches!(wire::parse_ip(bytes), Err(wire::ParseError::Fragment)) {
-                                    batch.take();
-                                    return workers.endpoint(0, endpoints, scope, bytes, now, path, None, None);
-                                }
-                                // Keep the scalar pre-lock timestamp even when batch admission falls back.
-                                let service_at = Instant::now();
-                                if core.is_none() && count == 1
-                                    && let Some(report) = workers.established(batch, owner, bytes, (now, service_at), path, endpoints)
-                                {
-                                    return Ok(report);
-                                }
+                            let bytes = if count == 1 { l3[0] } else {
                                 batch.take();
-                                return workers.receive(endpoints, owner, bytes, now, service_at, path, None);
+                                if decoded.l3_len > staging.len() || view.copy_to(0..decoded.l3_len, &mut staging[..decoded.l3_len]).is_none() { return Ok(PacketReceive::default()); }
+                                &staging[..decoded.l3_len]
+                            };
+                            if matches!(wire::parse_ip(bytes), Err(wire::ParseError::Fragment)) {
+                                batch.take();
+                                return workers.endpoint_fragment(endpoints, scope, bytes, now, path);
+                            }
+                            // Keep the scalar pre-lock timestamp even when batch admission falls back.
+                            let service_at = Instant::now();
+                            if core.is_none() && count == 1
+                                && let Some(report) = workers.established(batch, owner, bytes, (now, service_at), path, endpoints)
+                            {
+                                return Ok(report);
                             }
                             batch.take();
-                            let cell = workers.copy(segments, metadata)?;
-                            workers.send(1, worker::Envelope {
-                                ingress, scope, path, ingress_at: now, cell,
-                                body: None, peer: None,
-                                l3_offset: decoded.l3_offset, l3_length: decoded.l3_len,
-                                payload: worker::Payload::Endpoint { owner: owner.clone(), admission: None },
-                            }).map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-                            Ok(PacketReceive::default())
+                            workers.receive(endpoints, owner, bytes, now, service_at, path, None)
                         })();
                         match result {
                             Ok(report) if report.qualified_rx => qualify_packet(qualified_rx, qualification_unavailable),
@@ -1775,6 +1802,7 @@ impl Runtime {
                     self.workers.endpoint_packet(
                         &self.endpoints,
                         work.scope,
+                        work.ingress_worker,
                         work.packet,
                         work.ingress_at,
                         work.path,
@@ -1811,6 +1839,7 @@ impl Runtime {
                     retry: now + Duration::from_millis(10),
                     mac: work.mac,
                     scope: work.scope,
+                    ingress_worker: work.ingress_worker,
                     path: work.path,
                     ingress_at: work.ingress_at,
                     cell: work.cell,
@@ -1822,6 +1851,7 @@ impl Runtime {
                         self.workers.endpoint_packet(
                             &self.endpoints,
                             work.scope,
+                            work.ingress_worker,
                             packet,
                             work.ingress_at,
                             work.path,
@@ -2499,6 +2529,30 @@ fn check_metadata(
     Ok(())
 }
 
+async fn wait_capture_startup(
+    workers: &worker::Shared,
+    queues_only: bool,
+    shutdown: &crate::control::ShutdownIntent,
+    mut endpoint: impl FnMut(&mut Context<'_>) -> Poll<anyhow::Result<()>>,
+    mut service: impl FnMut(&mut Context<'_>) -> Poll<()>,
+) -> anyhow::Result<()> {
+    let mut endpoint_ready = false;
+    loop {
+        tokio::select! {
+            ready = poll_fn(|cx| {
+                let queues = workers.poll_ready(cx, queues_only)?;
+                if !endpoint_ready {
+                    std::task::ready!(endpoint(cx))?;
+                    endpoint_ready = true;
+                }
+                queues.map(Ok)
+            }) => return ready,
+            () = shutdown.wait() => anyhow::bail!("shutdown requested during XDP startup"),
+            () = poll_fn(&mut service) => tokio::task::yield_now().await,
+        }
+    }
+}
+
 async fn drain_before_detach(
     deadline: Instant,
     mut outstanding: impl FnMut() -> io::Result<bool>,
@@ -2692,7 +2746,7 @@ async fn run_capture(
     admission: Arc<AtomicBool>,
     pname_support: crate::ebpf::PnameSupportCell,
     shared_runtime: tokio::runtime::Handle,
-    relay_fence: &mut Option<Arc<DirectRelayFence>>,
+    capture: &mut Option<(Arc<worker::Shared>, PacketEndpoints)>,
 ) -> (Option<ControlPlane>, anyhow::Result<()>) {
     *pname_support.write() = crate::ebpf::PnameSupport::Unavailable;
     let config = plane.config_handle().read().await.as_ref().clone();
@@ -2769,6 +2823,9 @@ async fn run_capture(
             return (None, Err(error));
         }
     };
+    // The outer coordinator retains every relay registration and the endpoint close authority
+    // even if the rest of capture unwinds or must retain its actual NIC owners.
+    *capture = Some((Arc::clone(&workers), endpoints.clone()));
     let mut local_realms = Vec::with_capacity(realms.len());
     let mut remote_realms = Vec::with_capacity(realms.len());
     for (ingress, device, link, scope) in realms {
@@ -2779,11 +2836,8 @@ async fn run_capture(
             else {
                 continue;
             };
-            // One statement per lock: a guard inside the struct literal would live to its end
-            // and the next lock() on the same non-reentrant mutex would self-deadlock.
             let members: Vec<usize> = workers
-                .placements
-                .lock()
+                .placements()
                 .iter()
                 .filter(|placement| placement.realm.scope() == scope)
                 .map(|placement| placement.device)
@@ -2870,6 +2924,13 @@ async fn run_capture(
         context_revision: 0,
         _memory: Some(memory),
     };
+    let direct = config
+        .datapath
+        .as_ref()
+        .and_then(|datapath| datapath.direct);
+    let relay_candidate = runtime.relay_candidates(direct).next().is_some();
+    let mut relay_setup =
+        (relay_candidate && workers.workers == 2).then(|| workers.defer_secondary_ready());
     if workers.workers == 2 {
         match worker::Worker::start(
             Arc::clone(&workers),
@@ -2890,16 +2951,15 @@ async fn run_capture(
     let timer = None;
     tokio::pin!(timer);
     // The drivers already exist: a failed start's supervisor cleanup waits on their service.
-    let ready = loop {
-        tokio::select! {
-            ready = async {
-                poll_fn(|cx| owner.poll_ready(cx)).await?;
-                poll_fn(|cx| workers.all_ready(cx)).await
-            } => break ready,
-            () = poll_fn(|cx| runtime.poll_scopes(cx, timer.as_mut())) => tokio::task::yield_now().await,
-        }
-    };
-    let startup_failure = ready.err();
+    let startup_failure = wait_capture_startup(
+        &workers,
+        relay_setup.is_some(),
+        &shutdown,
+        |cx| owner.poll_ready(cx),
+        |cx| runtime.poll_scopes(cx, timer.as_mut()),
+    )
+    .await
+    .err();
     let activate = if startup_failure.is_some() {
         Ok(())
     } else {
@@ -2974,37 +3034,32 @@ async fn run_capture(
                 }
                 host.admit(&runtime.pname_support)?;
             }
-            let direct = config
-                .datapath
-                .as_ref()
-                .and_then(|datapath| datapath.direct);
-            for realm in &runtime.realms {
-                if direct_relay_eligible(direct, workers.workers, realm.members.len(), || {
-                    runtime.devices[realm.device]
-                        .info
-                        .supports_direct_relay_now()
-                }) && let Some(scope) = realm.driver.sole_owner()
-                {
-                    let fence = match relay_fence {
-                        Some(fence) => fence,
-                        None => match DirectRelayFence::new(&scope.budget()) {
-                            Ok(fence) => relay_fence.insert(fence),
-                            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => break,
-                            Err(error) => return Err(error.into()),
-                        },
-                    };
-                    scope.publish_direct_relay_runtime(
-                        tokio::runtime::Handle::current(),
-                        Arc::clone(fence),
-                    )?;
+            if relay_candidate {
+                workers.prepare_relays(&runtime.polling_budget)?;
+            }
+            if let Some(setup) = relay_setup.take() {
+                setup.send(()).map_err(|_| {
+                    anyhow::anyhow!("XDP secondary stopped before relay registration")
+                })?;
+                poll_fn(|cx| workers.all_ready(cx)).await?;
+            }
+            // Mandatory startup reservations must fit before either output window grows.
+            if workers.workers == 2 && !runtime.endpoints.is_closing() {
+                for realm in &runtime.realms {
+                    let (_, base_bulk_frames) =
+                        device_sizing(runtime.devices[realm.device].info.mtu);
+                    runtime
+                        .endpoints
+                        .realm(realm.driver.scope())
+                        .expect("prepared driver retains its packet realm")
+                        .widen_startup_output(base_bulk_frames);
                 }
             }
-            runtime.admission.store(true, Ordering::Release);
-            runtime.endpoints.capture_ready()?;
-            Ok(())
+            runtime.activate_capture(&shutdown, direct)
         }
         .await
     };
+    drop(relay_setup);
     let mut failure = startup_failure.or_else(|| activate.err());
     runtime.capture_plan.take();
     runtime.capture_plan_memory.take();
@@ -3024,6 +3079,10 @@ async fn run_capture(
     let reader = None;
     tokio::pin!(reader);
     let joined = loop {
+        if owner.is_joined() {
+            // Failed endpoint readiness already collected the supervisor and its startup error.
+            break Some(None);
+        }
         if failure.is_some() || shutdown.requested() {
             break None;
         }
@@ -3184,9 +3243,9 @@ fn queue_sizing(mtu: u32, eligible_queues: usize, remaining: usize) -> (PortConf
         && remaining.saturating_sub(CAPTURE_MEMORY / 2)
             >= eligible_queues * 2 * (RX_TIER + 32 + 480) * FRAME_SIZE
     {
-        (RX_TIER, 480, 1024, 256)
+        (RX_TIER, 480, 1024, CAPTURE_WIDE_BULK_FRAMES)
     } else {
-        (256, 480, 512, 256)
+        (256, 480, 512, CAPTURE_WIDE_BULK_FRAMES)
     };
     (
         PortConfig {
@@ -3258,10 +3317,15 @@ fn realm_worker_count(workers: usize, queues: impl Iterator<Item = usize>) -> us
 fn direct_relay_eligible(
     direct: Option<DirectProfile>,
     workers: u8,
+    owners: usize,
     members: usize,
-    supported_device: impl FnOnce() -> bool,
+    physical: bool,
 ) -> bool {
-    direct == Some(DirectProfile::Endpoint) && workers == 1 && members == 1 && supported_device()
+    direct == Some(DirectProfile::Endpoint)
+        && (1..=2).contains(&workers)
+        && owners == usize::from(workers)
+        && members == 1
+        && physical
 }
 
 async fn prepare(
@@ -3515,6 +3579,8 @@ async fn prepare(
     let plan_memory = plan_memory.context("capture plan budget was not checked")?;
     let memory = memory.context("capture metadata budget was not checked")?;
     let (workers, inboxes) = workers.context("capture workers were not checked")?;
+    let realm_keys = plan.realm_keys();
+    let mut placements = worker::Placements::new(realm_keys.len(), &budget)?;
     let (namespace, links) = fib?;
     let topology = topology.context("capture topology was not checked")?;
     // SAFETY: the watcher keeps its descriptor until AsyncFd drops it.
@@ -3547,7 +3613,7 @@ async fn prepare(
     local_addresses.dedup();
     let gateway_maps = if policy.is_some() {
         Some(Arc::new(honk_xsk::GatewayMaps::new(
-            &plan.realm_keys(),
+            &realm_keys,
             &local_addresses,
         )?))
     } else {
@@ -3660,15 +3726,18 @@ async fn prepare(
             let zero_copy = port.zerocopy();
             let observed = port.counters();
             let observed_rings = port.rings();
+            let io = if id % u32::from(datapath.effective_workers()) == 0 {
+                let (io, registered) = QueueIo::Prepared(port).register();
+                registered?;
+                io
+            } else {
+                QueueIo::Prepared(port)
+            };
             queues.push(Queue {
                 id,
                 observed,
                 observed_rings,
-                io: if id % u32::from(datapath.effective_workers()) == 0 {
-                    QueueIo::Prepared(port).register()?
-                } else {
-                    QueueIo::Prepared(port)
-                },
+                io,
             });
             tracing::info!(interface = %info.name, ifindex = info.ifindex, queue = id, zero_copy, vlan_metadata = capture.vlan_metadata, "XDP queue bound");
         }
@@ -3742,7 +3811,6 @@ async fn prepare(
         None
     };
     let mut realm_scopes = std::collections::HashMap::new();
-    let realm_keys = plan.realm_keys();
     for logical in plan.realms() {
         let members: Vec<_> = devices
             .iter()
@@ -3788,6 +3856,7 @@ async fn prepare(
             realm_count,
             scope_bulk_frames,
             worker_count,
+            members.len(),
             &budget,
         )?;
         realm.install_admission_fence(Arc::clone(&admission))?;
@@ -3796,7 +3865,7 @@ async fn prepare(
         for member in members {
             let mut member_link = link;
             member_link.path.physical_ifindex = devices[member].info.ifindex;
-            workers.placements.lock().push(worker::Placement {
+            placements.entries.push(worker::Placement {
                 realm_id: logical.realm_id,
                 realm: realm.clone(),
                 ingress,
@@ -3806,6 +3875,8 @@ async fn prepare(
         }
         scope_pairs.push((realm, owners));
     }
+    // Worker 1 takes its immutable reference before registering its queues.
+    assert!(workers.placements.set(Arc::new(placements)).is_ok());
     #[cfg(feature = "ebpf")]
     let host = match host {
         Some((host, (scope, owner))) => {
@@ -3819,7 +3890,10 @@ async fn prepare(
     #[cfg(not(feature = "ebpf"))]
     let host_observation = None;
     let diagnostics = diagnostics(&devices, &budget, host_observation)?;
-    *workers.diagnostics.lock() = Some(Arc::clone(&diagnostics));
+    workers
+        .diagnostics
+        .set(Arc::clone(&diagnostics))
+        .expect("one diagnostics owner per capture");
     tracing::debug!(used = budget.used(), "XDP prepare: after diagnostics");
     let ingresses: Vec<_> = realms.iter().map(|(ingress, ..)| *ingress).collect();
     let core = if let Some(authority) = authority {
@@ -3891,23 +3965,23 @@ mod tests {
     }
 
     #[test]
-    fn direct_relay_requires_one_global_worker_and_one_physical_endpoint_member() {
+    fn direct_relay_requires_matching_physical_owners_and_one_endpoint_member() {
         let endpoint = Some(DirectProfile::Endpoint);
-        let unexpected_device_check = || panic!("ineligible realm queried device capability");
-        assert!(direct_relay_eligible(endpoint, 1, 1, || true));
-        assert!(!direct_relay_eligible(endpoint, 1, 1, || false));
-        for (profile, workers, members) in [
-            (endpoint, 2, 1),
-            (endpoint, 1, 2),
-            (endpoint, 1, 0),
-            (Some(DirectProfile::Core), 1, 1),
-            (None, 1, 1),
+        assert!(direct_relay_eligible(endpoint, 1, 1, 1, true));
+        assert!(direct_relay_eligible(endpoint, 2, 2, 1, true));
+        for (profile, workers, owners, members, physical) in [
+            (endpoint, 1, 1, 1, false),
+            (endpoint, 2, 2, 1, false),
+            (endpoint, 2, 1, 1, true),
+            (endpoint, 3, 3, 1, true),
+            (endpoint, 0, 0, 1, true),
+            (endpoint, 2, 2, 2, true),
+            (endpoint, 1, 1, 0, true),
+            (Some(DirectProfile::Core), 2, 2, 1, true),
+            (None, 1, 1, 1, true),
         ] {
             assert!(!direct_relay_eligible(
-                profile,
-                workers,
-                members,
-                unexpected_device_check
+                profile, workers, owners, members, physical
             ));
         }
     }

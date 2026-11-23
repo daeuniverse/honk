@@ -37,7 +37,7 @@ pub(in crate::control) use fragment_peer::{FragmentPeer, fragment_offset_zero};
 #[cfg(target_os = "linux")]
 pub(crate) use realm::capture_realm;
 use realm::{HalfOpenHold, RealmResources};
-pub(crate) use realm::{PacketRealm, PacketRealmPlan};
+pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
 #[cfg(target_os = "linux")]
 pub(crate) use realm_receive::RealmRxBatch;
 
@@ -58,6 +58,10 @@ const READINESS_FALLBACK: std::time::Duration = std::time::Duration::from_millis
 
 #[cfg(target_os = "linux")]
 pub(crate) const CAPTURE_MEMORY: usize = 384 << 20;
+#[cfg(target_os = "linux")]
+const CAPTURE_CONTROL_FRAMES: usize = 32;
+#[cfg(target_os = "linux")]
+pub(crate) const CAPTURE_WIDE_BULK_FRAMES: usize = 256;
 
 #[cfg(all(target_os = "linux", any(test, feature = "ebpf")))]
 pub(crate) fn capture_scope(
@@ -93,7 +97,7 @@ pub(crate) fn capture_scope_with_output(
         output_capacity,
         caps,
         budget,
-        false,
+        0,
     )?;
     Ok((
         scopes.pop().expect("singleton realm scope"),
@@ -187,14 +191,15 @@ impl DirectRelayFence {
     }
 
     #[cfg(any(target_os = "linux", test))]
-    pub(crate) async fn close_and_join(&self) {
+    pub(crate) fn close(&self) {
         let previous = self.state.fetch_or(RELAY_CLOSED, Ordering::AcqRel);
-        if previous & !RELAY_CLOSED == 0 {
-            return;
-        }
-        if previous & RELAY_CLOSED == 0 {
+        if previous != 0 && previous & RELAY_CLOSED == 0 {
             self.changed.notify_waiters();
         }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) async fn join_closed(&self) {
         loop {
             let notified = self.changed.notified();
             if self.state.load(Ordering::Acquire) == RELAY_CLOSED {
@@ -202,6 +207,12 @@ impl DirectRelayFence {
             }
             notified.await;
         }
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(crate) async fn close_and_join(&self) {
+        self.close();
+        self.join_closed().await;
     }
 }
 
@@ -221,7 +232,7 @@ struct Shared {
             tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
-    // Includes the Arc allocation, mutex/notify, slots, queues and frame pointer array.
+    // Includes the Arc allocation, shared state and the frame-independent arrays.
     _metadata: MemoryReservation,
 }
 
@@ -310,8 +321,142 @@ struct Inner {
     aborted: bool,
     finished: bool,
     endpoint_prepared: bool,
-    // Frame bytes are freed before this reservation, including bytes returned by OutputLease.
+    // Backs CPU frame bytes and their dependent arrays through the final output return.
     _storage: MemoryReservation,
+}
+
+struct ScopeFrameLayout {
+    config: FrameConfig,
+    aliases: usize,
+    #[cfg(target_os = "linux")]
+    peer_capacity: usize,
+    #[cfg(target_os = "linux")]
+    output_peer_capacity: usize,
+    metadata_bytes: usize,
+    storage_bytes: usize,
+}
+
+impl ScopeFrameLayout {
+    fn new(
+        limits: RuntimeLimits,
+        frame_size: usize,
+        worker: usize,
+        workers: usize,
+        capture: bool,
+    ) -> io::Result<Self> {
+        let frames = limits
+            .control_frames
+            .checked_add(limits.bulk_frames)
+            .ok_or_else(|| invalid("frame count overflow"))?;
+        let aliases = limits
+            .max_slots
+            .checked_add(frames)
+            .ok_or_else(|| invalid("flow retention capacity overflow"))?;
+        let peer_capacity = if capture {
+            aliases
+                .checked_mul(2)
+                .and_then(|n| n.checked_add(frames))
+                .and_then(|n| n.checked_add(128 / workers + usize::from(worker < 128 % workers)))
+                .and_then(|n| n.checked_add(if worker == 0 { 64 } else { 0 }))
+                .ok_or_else(|| invalid("peer retention capacity overflow"))?
+                .min(4096)
+        } else {
+            0
+        };
+        let output_peer_capacity = if capture { frames } else { 0 };
+        let config = FrameConfig {
+            base_address: 0,
+            frame_size,
+            rx_frames: 0,
+            control_frames: limits.control_frames,
+            bulk_frames: limits.bulk_frames,
+            fill_capacity: 0,
+            rx_capacity: 0,
+            control_descriptors: limits.control_frames,
+            bulk_descriptors: limits.bulk_frames,
+            tx_capacity: frames,
+            completion_capacity: frames,
+        };
+        // Validate the ledger before reserving or allocating its backing.
+        FrameLedger::<Option<FlowId>>::metadata_bytes(config).map_err(io::Error::other)?;
+        let storage_bytes = frame_size
+            .checked_mul(frames)
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(|| invalid("frame storage overflow"))?;
+        let metadata_bytes = aliases
+            .checked_mul(size_of::<Option<FlowSlot>>())
+            .and_then(|n| {
+                n.checked_add(PacketScope::peer_bytes(
+                    peer_capacity.checked_add(output_peer_capacity)?,
+                )?)
+            })
+            .and_then(|n| n.checked_add(frames.checked_mul(size_of::<Option<Box<[u8]>>>())?))
+            .and_then(|n| n.checked_add(frames.checked_mul(size_of::<Option<IpAddr>>())?))
+            .and_then(|n| n.checked_add(Sources::bytes(aliases)?))
+            .and_then(|n| n.checked_add(frames.checked_mul(size_of::<Option<Queued>>())?))
+            .filter(|&n| n <= isize::MAX as usize)
+            .ok_or_else(|| invalid("runtime metadata overflow"))?;
+        Ok(Self {
+            config,
+            aliases,
+            #[cfg(target_os = "linux")]
+            peer_capacity,
+            #[cfg(target_os = "linux")]
+            output_peer_capacity,
+            metadata_bytes,
+            storage_bytes,
+        })
+    }
+
+    fn allocate(&self, retained_frames: usize) -> ScopeFrames {
+        let frame_count = self.config.tx_capacity;
+        let frame_size = self.config.frame_size;
+        ScopeFrames {
+            frames: (0..retained_frames)
+                .map(|_| None)
+                .chain(
+                    (retained_frames..frame_count)
+                        .map(|_| Some(vec![0; frame_size].into_boxed_slice())),
+                )
+                .collect(),
+            output_peers: (0..frame_count).map(|_| None).collect(),
+            #[cfg(target_os = "linux")]
+            output_peer_holds: (0..self.output_peer_capacity).map(|_| None).collect(),
+            source_work: Sources::new(self.aliases),
+            queue: (0..frame_count).map(|_| None).collect(),
+            slots: (0..self.aliases).map(|_| None).collect(),
+            #[cfg(target_os = "linux")]
+            peers: (0..self.peer_capacity).map(|_| None).collect(),
+        }
+    }
+}
+
+struct ScopeFrames {
+    frames: Box<[Option<Box<[u8]>>]>,
+    output_peers: Box<[Option<IpAddr>]>,
+    #[cfg(target_os = "linux")]
+    output_peer_holds: Box<[Option<crate::xdp::worker::PeerHold>]>,
+    source_work: Sources,
+    queue: Box<[Option<Queued>]>,
+    slots: Box<[Option<FlowSlot>]>,
+    #[cfg(target_os = "linux")]
+    peers: Box<[Option<crate::xdp::worker::PeerHold>]>,
+}
+
+#[cfg(target_os = "linux")]
+impl ScopeFrames {
+    fn exchange(mut self, inner: &mut Inner) -> Self {
+        // Keep the original frame bytes. The closed capture gate guarantees there is no lease.
+        self.frames[..inner.frames.len()].swap_with_slice(&mut inner.frames);
+        std::mem::swap(&mut self.frames, &mut inner.frames);
+        std::mem::swap(&mut self.output_peers, &mut inner.output_peers);
+        std::mem::swap(&mut self.output_peer_holds, &mut inner.output_peer_holds);
+        std::mem::swap(&mut self.source_work, &mut inner.source_work);
+        std::mem::swap(&mut self.queue, &mut inner.queue);
+        std::mem::swap(&mut self.slots, &mut inner.slots);
+        std::mem::swap(&mut self.peers, &mut inner.peers);
+        self
+    }
 }
 
 struct OutputReservation<'a> {
@@ -382,48 +527,9 @@ impl PacketScope {
         if frame_size < usize::from(cfg.mtu.max(1280)) {
             return Err(invalid("output capacity is below logical MTU"));
         }
-        let tx_frames = limits
-            .control_frames
-            .checked_add(limits.bulk_frames)
-            .ok_or_else(|| invalid("frame count overflow"))?;
-        let frame_count = tx_frames;
-        let aliases = limits
-            .max_slots
-            .checked_add(tx_frames)
-            .ok_or_else(|| invalid("flow retention capacity overflow"))?;
-        let peer_capacity = if capture {
-            aliases
-                .checked_mul(2)
-                .and_then(|n| n.checked_add(frame_count))
-                .and_then(|n| n.checked_add(128 / workers + usize::from(worker < 128 % workers)))
-                .and_then(|n| n.checked_add(if worker == 0 { 64 } else { 0 }))
-                .ok_or_else(|| invalid("peer retention capacity overflow"))?
-                .min(4096)
-        } else {
-            0
-        };
-        let frame_config = FrameConfig {
-            base_address: 0,
-            frame_size,
-            rx_frames: 0,
-            control_frames: limits.control_frames,
-            bulk_frames: limits.bulk_frames,
-            fill_capacity: 0,
-            rx_capacity: 0,
-            control_descriptors: limits.control_frames,
-            bulk_descriptors: limits.bulk_frames,
-            tx_capacity: tx_frames,
-            completion_capacity: tx_frames,
-        };
-        // Validate the ledger before allocating any runtime backing.
-        FrameLedger::<Option<FlowId>>::metadata_bytes(frame_config).map_err(io::Error::other)?;
-        let storage_bytes = frame_size
-            .checked_mul(frame_count)
-            .filter(|&n| n <= isize::MAX as usize)
-            .ok_or_else(|| invalid("frame storage overflow"))?;
+        let layout = ScopeFrameLayout::new(limits, frame_size, worker, workers, capture)?;
         let metadata_bytes = size_of::<Shared>()
             .checked_add(2 * size_of::<usize>())
-            .and_then(|n| n.checked_add(aliases.checked_mul(size_of::<Option<FlowSlot>>())?))
             .and_then(|n| {
                 n.checked_add(
                     resources
@@ -432,16 +538,7 @@ impl PacketScope {
                         .checked_mul(size_of::<Option<(FlowId, HalfOpenHold)>>())?,
                 )
             })
-            .and_then(|n| {
-                n.checked_add(Self::peer_bytes(
-                    peer_capacity + if capture { frame_count } else { 0 },
-                )?)
-            })
             .and_then(|n| n.checked_add(Self::fragment_peer_bytes(capture && worker == 0)))
-            .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<Box<[u8]>>>())?))
-            .and_then(|n| n.checked_add(frame_count.checked_mul(size_of::<Option<IpAddr>>())?))
-            .and_then(|n| n.checked_add(Sources::bytes(aliases)?))
-            .and_then(|n| n.checked_add(tx_frames.checked_mul(size_of::<Option<Queued>>())?))
             .and_then(|n| {
                 n.checked_add(
                     limits
@@ -449,11 +546,16 @@ impl PacketScope {
                         .checked_mul(size_of::<Option<Registration>>())?,
                 )
             })
-            .filter(|&n| n <= isize::MAX as usize)
+            .filter(|&n| {
+                n.checked_add(layout.metadata_bytes)
+                    .is_some_and(|total| total <= isize::MAX as usize)
+            })
             .ok_or_else(|| invalid("runtime metadata overflow"))?;
         let metadata = budget.reserve(metadata_bytes).ok_or_else(capacity)?;
-        let storage = budget.reserve(storage_bytes).ok_or_else(capacity)?;
-        let ledger = FrameLedger::new(frame_config, &budget).map_err(io::Error::other)?;
+        let storage = budget
+            .reserve(layout.storage_bytes + layout.metadata_bytes)
+            .ok_or_else(capacity)?;
+        let ledger = FrameLedger::new(layout.config, &budget).map_err(io::Error::other)?;
         cfg.shared_budget = Some(Arc::clone(&budget));
         let stack = match &resources {
             Some(shared) => Stack::new_accounted_shard(
@@ -467,9 +569,7 @@ impl PacketScope {
             None => Stack::new_accounted(cfg, now, limits.max_slots),
         }
         .map_err(io::Error::other)?;
-        let frames = (0..frame_count)
-            .map(|_| Some(vec![0; frame_size].into_boxed_slice()))
-            .collect();
+        let frames = layout.allocate(0);
         let shared = Arc::new(Shared {
             scope,
             worker,
@@ -479,25 +579,23 @@ impl PacketScope {
                 rights: Rights::Task,
                 stack: Some(stack),
                 ledger,
-                frames,
-                output_peers: (0..frame_count).map(|_| None).collect(),
+                frames: frames.frames,
+                output_peers: frames.output_peers,
                 #[cfg(target_os = "linux")]
-                output_peer_holds: (0..if capture { frame_count } else { 0 })
-                    .map(|_| None)
-                    .collect(),
-                source_work: Sources::new(aliases),
-                queue: (0..tx_frames).map(|_| None).collect(),
+                output_peer_holds: frames.output_peer_holds,
+                source_work: frames.source_work,
+                queue: frames.queue,
                 head: 0,
                 queued: 0,
                 frame_size,
                 cpu_tx_caps: caps,
                 next_tx: TxClass::Control,
-                slots: (0..aliases).map(|_| None).collect(),
+                slots: frames.slots,
                 half_open: (0..resources.as_ref().map_or(0, |_| limits.max_slots))
                     .map(|_| None)
                     .collect(),
                 #[cfg(target_os = "linux")]
-                peers: (0..peer_capacity).map(|_| None).collect(),
+                peers: frames.peers,
                 #[cfg(target_os = "linux")]
                 peer_end: 0,
                 #[cfg(target_os = "linux")]
@@ -591,6 +689,11 @@ impl PacketScope {
 
     pub(crate) fn same_owner(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn direct_relay_published(&self) -> bool {
+        self.0.direct_relay_runtime.get().is_some()
     }
 
     #[cfg(target_os = "linux")]
@@ -690,11 +793,7 @@ impl PacketScope {
         })
     }
 
-    pub(in crate::control) fn retains_tcp(
-        &self,
-        source: SocketAddr,
-        destination: SocketAddr,
-    ) -> bool {
+    pub(crate) fn retains_tcp(&self, source: SocketAddr, destination: SocketAddr) -> bool {
         self.retains_tcp_with_lineage(source, destination, None)
     }
 
@@ -1729,6 +1828,12 @@ impl PacketDriver {
     /// The protocol or conditional refund-readiness deadline found by the last service.
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn protocol_deadline(&self) -> Option<Instant> {
+        // A deadline shared with the credit retry is not an independent protocol witness.
+        self.deadline.filter(|&due| self.fallback != Some(due))
     }
 
     /// Complete CPU service for startup-only driving and realms using the CPU/SG path.

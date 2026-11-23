@@ -436,6 +436,7 @@ pub(crate) mod xdp {
     use honk_xsk::{RingSnapshot, SocketStats};
     use parking_lot::Mutex;
     use serde_json::{Value, json};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::{io, sync::Arc, time::SystemTime};
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,6 +547,7 @@ pub(crate) mod xdp {
     pub(crate) struct Diagnostics {
         state: Mutex<State>,
         count: usize,
+        cross_worker_handoffs: AtomicU64,
         _memory: MemoryReservation,
     }
 
@@ -579,6 +581,7 @@ pub(crate) mod xdp {
                     queues: storage.into_boxed_slice(),
                 }),
                 count,
+                cross_worker_handoffs: AtomicU64::new(0),
                 _memory: memory,
             }))
         }
@@ -591,6 +594,12 @@ pub(crate) mod xdp {
             rings: RingSnapshot,
         ) {
             self.state.lock().queues[index].sample(at, socket, rings);
+        }
+
+        pub(crate) fn record_worker_handoff(&self) {
+            let _ =
+                self.cross_worker_handoffs
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1));
         }
 
         pub(crate) fn lifecycle(&self, lifecycle: Lifecycle) {
@@ -629,6 +638,7 @@ pub(crate) mod xdp {
             };
             let mut value = json!({
                 "state": lifecycle.as_str(), "queue_count": self.count,
+                "cross_worker_handoffs": self.cross_worker_handoffs.load(Ordering::Relaxed).to_string(),
                 "state_changed_at_unix_ms": changed_at.duration_since(SystemTime::UNIX_EPOCH).ok().map(|at| at.as_millis().to_string()),
             });
             if full {

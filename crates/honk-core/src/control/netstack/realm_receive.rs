@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::xdp::worker::{PeerAuthority, PeerHold, PeerObservation, PeerPathChanged};
 
 #[cfg(target_os = "linux")]
 pub(crate) struct RealmRxBatch<'a> {
@@ -6,7 +8,7 @@ pub(crate) struct RealmRxBatch<'a> {
     inner: Option<parking_lot::MutexGuard<'a, Inner>>,
     path: crate::xdp::ReturnPath,
     service_at: Instant,
-    checked: Option<crate::xdp::worker::PeerObservation<'a>>,
+    checked: Option<PeerObservation<'a>>,
     // Indices remain pinned by the scope guard; protocol generation still gets checked on every input.
     last: Option<(usize, usize)>,
 }
@@ -20,9 +22,89 @@ impl<'a> RealmRxBatch<'a> {
         packet: &[u8],
         (ingress_at, service_at): (Instant, Instant),
         path: crate::xdp::ReturnPath,
-        peers: &'a crate::xdp::worker::PeerAuthority,
+        peers: &'a PeerAuthority,
         can_batch: impl FnOnce() -> bool,
     ) -> Option<super::super::packet_endpoint::PacketReceive> {
+        Self::receive_with(
+            batch,
+            owner,
+            packet,
+            service_at,
+            path,
+            can_batch,
+            |stack, peer, checked| {
+                let (_, report) = stack.receive_with_realm_admission(
+                    ingress_at,
+                    service_at,
+                    packet,
+                    RxMeta::VERIFY,
+                    |source| {
+                        peers
+                            .confirm_tcp::<false>(
+                                peer,
+                                owner.scope(),
+                                source,
+                                path,
+                                ingress_at,
+                                checked,
+                            )
+                            .unwrap_or(false)
+                    },
+                    |_| false,
+                );
+                Ok::<_, std::convert::Infallible>(report)
+            },
+        )
+        .transpose()
+        .unwrap()
+    }
+
+    /// A moved path retries with the scalar pending-output check, after unlocking the batch.
+    pub(crate) fn receive_sharded(
+        batch: &mut Option<Self>,
+        owner: &'a PacketScope,
+        packet: &[u8],
+        (ingress_at, service_at): (Instant, Instant),
+        path: crate::xdp::ReturnPath,
+        peers: &'a PeerAuthority,
+        can_batch: impl FnOnce() -> bool,
+    ) -> Result<Option<super::super::packet_endpoint::PacketReceive>, PeerPathChanged> {
+        Self::receive_with(
+            batch,
+            owner,
+            packet,
+            service_at,
+            path,
+            can_batch,
+            |stack, peer, checked| {
+                stack.try_receive_realm_tcp(ingress_at, service_at, packet, |source| {
+                    peers.confirm_tcp::<true>(
+                        peer,
+                        owner.scope(),
+                        source,
+                        path,
+                        ingress_at,
+                        checked,
+                    )
+                })
+            },
+        )
+        .transpose()
+    }
+
+    fn receive_with<E>(
+        batch: &mut Option<Self>,
+        owner: &'a PacketScope,
+        packet: &[u8],
+        service_at: Instant,
+        path: crate::xdp::ReturnPath,
+        can_batch: impl FnOnce() -> bool,
+        receive: impl FnOnce(
+            &mut Stack,
+            &PeerHold,
+            &mut Option<PeerObservation<'a>>,
+        ) -> Result<honk_netstack::ReceiveReport, E>,
+    ) -> Option<Result<super::super::packet_endpoint::PacketReceive, E>> {
         use honk_netstack::wire::{self, tcp};
 
         if batch
@@ -59,8 +141,6 @@ impl<'a> RealmRxBatch<'a> {
                 || inner.queued != 0
                 || inner.source_work.is_host()
                 || inner.resources.is_none()
-                // Exported output owns its path. A sole owner still checks the full RX path below.
-                || (owner.0.workers != 1 && inner.output_peers.iter().any(Option::is_some))
                 || inner.slots.iter().all(Option::is_some))
             || inner
                 .capture_admission
@@ -107,28 +187,15 @@ impl<'a> RealmRxBatch<'a> {
             return None;
         }
         let _unwind = AdmissionUnwind(inner.capture_admission.as_deref());
-        let (_, report) = stack.receive_with_realm_admission(
-            ingress_at,
-            service_at,
-            packet,
-            RxMeta::VERIFY,
-            |source| {
-                peers.confirm_tcp(
-                    peer,
-                    owner.scope(),
-                    source,
-                    path,
-                    ingress_at,
-                    &mut run.checked,
-                )
-            },
-            |_| false,
-        );
+        let report = match receive(stack, peer, &mut run.checked) {
+            Ok(report) => report,
+            Err(reason) => return Some(Err(reason)),
+        };
         run.service_at = service_at;
         run.last = Some((flow_index, peer_index));
         let original =
             (report.outcome == honk_netstack::ReceiveOutcome::TcpAccepted(id)).then_some(slot);
-        Some(Inner::receive_from_slot(report, original))
+        Some(Ok(Inner::receive_from_slot(report, original)))
     }
 }
 
@@ -597,7 +664,7 @@ mod fragment_tests {
 
     fn physical_scope(budget: &Arc<MemoryBudget>) -> (PacketScope, PacketOwner) {
         let (mut scopes, mut owners) =
-            realm::capture_partition(1280, 1, 16, 1, 1280, TxCaps::NONE, budget, true).unwrap();
+            realm::capture_partition(1280, 1, 16, 1, 1280, TxCaps::NONE, budget, 1).unwrap();
         (scopes.pop().unwrap(), owners.pop().unwrap())
     }
 

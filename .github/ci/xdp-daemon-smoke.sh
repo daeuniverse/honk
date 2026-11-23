@@ -404,6 +404,7 @@ if [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]]; then
         if [[ $test == "$multiqueue_test" ]]; then
             driven_work="$work/multiqueue"
             mkdir "$driven_work"
+            ip netns exec client tc qdisc add dev c0 root mqprio num_tc 2 map 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 queues 1@0 1@1 hw 0
         fi
     ip netns exec dut env HONK_XDP_ARTIFACT_ROOT="$driven_work" "$HONK_XDP_CORE_TEST_BIN" "$test" --exact --ignored --test-threads=1 --nocapture | tee "$driven_work/driven-runtime.log"
     ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$driven_work/driven-runtime.native-fence.json"
@@ -419,6 +420,9 @@ PY
         ip netns exec dut python3 "$HONK_XDP_PROBE" xdp-absent "$dev"
     done
     [[ -z $(find "$work/bpf" -type f -print -quit) ]] || fail 'driven runtime left physical program pins'
+        if [[ $test == "$multiqueue_test" ]]; then
+            ip netns exec client tc qdisc del dev c0 root
+        fi
     done
     ip netns exec client nft delete table inet honk_smoke_driven
     ip netns exec dut nft flush chain inet honk_smoke_native forward
@@ -686,7 +690,34 @@ def polling_case(sock, payload, original, flagged):
         assert re.search(r'\bbusy_entries=0\b', settled), 'unflagged candidate entered Busy'
         print('real matching candidate remains Event without the laboratory process flag', flush=True)
 
+two_queue = mode == 'endpoint-2q'
+if two_queue:
+    assert os.sched_getaffinity(0) == {0, 1}, 'expected both disposable guest CPUs'
+    daemon = pathlib.Path(f'/proc/{int(sys.argv[4])}')
+    worker_threads = {}
+    for task in (daemon / 'task').iterdir():
+        try:
+            name = (task / 'comm').read_text().strip()
+        except FileNotFoundError:
+            continue
+        if name in ('honk-xdp-0', 'honk-xdp-1'):
+            assert name not in worker_threads, name
+            worker_threads[name] = int(task.name)
+    assert set(worker_threads) == {'honk-xdp-0', 'honk-xdp-1'}, worker_threads
+    queues = [pathlib.Path(f'/sys/class/net/c0/queues/tx-{i}/xps_cpus') for i in (0, 1)]
+    saved_masks = [path.read_text() for path in queues]
+    for i, path in enumerate(queues):
+        path.write_text(f'{1 << i:x}\n')
+    masks = [int(path.read_text().replace(',', ''), 16) for path in queues]
+    assert masks == [1, 2], masks
+    running_sha = hashlib.sha256((daemon / 'exe').read_bytes()).hexdigest()
+    pathlib.Path(sys.argv[2]).with_suffix('.workers.json').write_text(json.dumps({
+        'worker_threads': worker_threads, 'daemon_sha256': running_sha, 'xps_cpu_masks': masks,
+    }) + '\n')
 for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd00:2::2')):
+    if two_queue:
+        rx_queue = int(family == socket.AF_INET6)
+        os.sched_setaffinity(0, {rx_queue})
     for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
         payload = f'{mode}/{family}/{kind}:'.encode() + bytes(range(256)) * (32 if 'jumbo' in mode else 4)
         before = captures() if mode != 'tc' else None
@@ -758,6 +789,15 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
                 delta = {dev: sum(after[dev]) - sum(before[dev]) for dev in devices}
                 assert all(value > 0 for value in delta.values()), ('flow lacks actual capture witness', mode, family, kind, delta)
                 print(mode, family, kind, 'actual capture and consumer payload verified', delta, flush=True)
+                if two_queue and kind == socket.SOCK_STREAM:
+                    assert len(before['dut0']) == len(after['dut0']) == 2
+                    captured = after['dut0'][rx_queue] - before['dut0'][rx_queue]
+                    assert captured > 0, (rx_queue, before, after)
+                    print(json.dumps({'two_queue_tcp': {
+                        'family': 6 if family == socket.AF_INET6 else 4, 'rx_queue': rx_queue,
+                        'capture_delta': captured, 'payload_sha256': hashlib.sha256(data).hexdigest(),
+                        'before': before['dut0'], 'after': after['dut0'],
+                    }}), flush=True)
             if mode == 'tc' and family == socket.AF_INET and kind == socket.SOCK_DGRAM:
                 original = pathlib.Path(sys.argv[2]).read_text()
                 for outbound in ('block', 'direct'):
@@ -799,9 +839,13 @@ for family, address in ((socket.AF_INET, '198.51.100.2'), (socket.AF_INET6, 'fd0
                         assert outbound == 'direct' and reply == payload, 'retained NAT binding bypassed current Block'
                 print('retained SNAT flow honors Block and restored Direct', flush=True)
         print(mode, family, kind, 'echo verified', flush=True)
+if two_queue:
+    for path, mask in zip(queues, saved_masks, strict=True):
+        path.write_text(mask)
 PY
 write_config() {
     local file=$1 backend=$2 direct=$3 security= action= binding= packet_policy= polling= extra= log_level=info dns="dns { bind: '' }"
+    if [[ ${4:-} == endpoint-2q ]]; then backend+=$'\n    workers: 2'; fi
     if [[ -n ${5:-} ]]; then binding="xsk_mode: $5"; fi
     if [[ ${4:-} == snat || ${4:-} == masquerade ]]; then
         # Separate daemon profiles must not reuse the peer's retained TIME_WAIT tuple.
@@ -976,7 +1020,7 @@ for profile in endpoint core; do
 done
 ip -n dut link del lowmtu
 mark_phase admission complete
-profiles=(endpoint endpoint-candidate-unflagged endpoint-crash core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo)
+profiles=(endpoint endpoint-candidate-unflagged endpoint-crash endpoint-2q core snat masquerade endpoint-vlan core-vlan endpoint-vlan-offload core-vlan-offload endpoint-vlan-single-offload core-vlan-single-offload endpoint-jumbo core-jumbo)
 for profile in "${profiles[@]}"; do
     mark_phase "$profile" setup-begin
     for spec in 'client c0' 'server s0' 'server su'; do
@@ -1095,6 +1139,9 @@ PY
     fi
     mark_phase "$profile" probes-complete
     ip netns exec dut python3 "$work/check.py" "$check_mode" "$native_fence_expected"
+    if [[ $profile == endpoint-2q ]]; then
+        ip netns exec dut nft -j list chain inet honk_smoke_native forward >"$work/$profile.native-fence.json"
+    fi
     mark_phase "$profile" shutdown-begin
     if [[ $profile == endpoint-crash ]]; then kill -KILL "$daemon_pid"; else kill -TERM "$daemon_pid"; fi
     timeout 20s tail --pid="$daemon_pid" -f /dev/null || fail 'daemon shutdown deadline'

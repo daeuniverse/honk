@@ -370,7 +370,7 @@ fn direct_relay_runtime_belongs_to_the_original_flow_scope() {
     let coordinator = Builder::new_current_thread().build().unwrap();
     let shared = Builder::new_current_thread().build().unwrap();
     let budget = MemoryBudget::new(32 << 20);
-    let (realm, mut owners) = super::capture_realm(1280, 64, 1, 1, &budget).unwrap();
+    let (realm, mut owners) = super::capture_realm(1280, 64, 1, 1, 1, &budget).unwrap();
     let coordinator_owner = owners.pop().unwrap();
     let driver = coordinator_owner.hand_off();
     let scope = realm.owner(0).unwrap();

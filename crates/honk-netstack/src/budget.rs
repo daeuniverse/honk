@@ -51,6 +51,12 @@ impl MemoryReservation {
         self.bytes
     }
 
+    /// Transfers another live charge from the same budget without refunding either one.
+    pub fn absorb(&mut self, mut other: Self) {
+        assert!(other.belongs_to(&self.budget));
+        self.bytes += std::mem::take(&mut other.bytes);
+    }
+
     pub(crate) fn belongs_to(&self, budget: &Arc<MemoryBudget>) -> bool {
         Arc::ptr_eq(&self.budget, budget)
     }

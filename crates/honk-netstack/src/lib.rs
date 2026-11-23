@@ -54,6 +54,8 @@
 //! [`Stack::retains_source`] also covers stateless controls, UDP fragments and reassembly
 //! replies for peer-path reclamation. [`Stack::retains_source_output`] distinguishes
 //! pending replies from an idle live flow; exported output remains the adapter's duty.
+//! [`Stack::try_receive_realm_tcp`] can defer a verified complete TCP input at the source
+//! gate so a physical shard can resolve pending output before receiving that input once.
 //!
 //! Reads drain buffered data before EOF or a sticky terminal error. Shutdown closes only
 //! the write half; close releases the handle immediately and finishes the protocol in

@@ -98,19 +98,35 @@ impl Runtime {
 
     #[cfg(test)]
     fn polling_test_pending(&self, reading: bool, timer: Pin<&Option<tokio::time::Sleep>>) {
-        self.polling
-            .test_control
-            .note_pending(super::testing::PendingWait {
-                reading,
-                driver_deadline: self.scope_deadline(),
-                armed_deadline: timer.get_ref().as_ref().map(tokio::time::Sleep::deadline),
-                idle_ports: self.queues().all(|queue| {
-                    let port = queue.io.get_ref();
-                    port.counters().submitted == port.counters().completed
-                        && !port.needs_service_retry()
-                }),
-                pending_outputs: self.has_pending_outputs(),
-            });
+        let wait = super::testing::PendingWait {
+            reading,
+            driver_deadline: self.scope_deadline(),
+            armed_deadline: timer.get_ref().as_ref().map(tokio::time::Sleep::deadline),
+            idle_ports: self
+                .queues()
+                .all(|queue| !queue.io.get_ref().needs_service_retry()),
+            pending_outputs: self.has_pending_outputs(),
+        };
+        let control = &self.polling.test_control;
+        if reading {
+            let deadlines = self
+                .realms
+                .iter()
+                .filter_map(|realm| realm.driver.protocol_deadline());
+            #[cfg(feature = "ebpf")]
+            let deadlines = deadlines.chain(
+                self.host
+                    .as_ref()
+                    .and_then(|host| host.driver.protocol_deadline()),
+            );
+            control.note_driver_timer_wait(
+                deadlines.min(),
+                wait.armed_deadline,
+                wait.idle_ports,
+                wait.pending_outputs,
+            );
+        }
+        control.note_pending(wait);
     }
 
     pub(in crate::xdp) fn refresh_polling_context(&mut self) {

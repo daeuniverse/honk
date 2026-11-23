@@ -744,6 +744,45 @@ impl Stack {
         )
     }
 
+    /// Established physical TCP receive with a source gate that can defer to ordinary RX.
+    /// Reassembly may already hold fragment state when the gate runs. `Err` leaves a complete
+    /// TCP input and its accounting untouched, and applies only to stacks without source context.
+    pub fn try_receive_realm_tcp<E>(
+        &mut self,
+        ingress_at: Instant,
+        service_at: Instant,
+        packet: &[u8],
+        mut on_source: impl FnMut(ValidatedSource) -> Result<bool, E>,
+    ) -> Result<ReceiveReport, E> {
+        let now = self.now;
+        let mut deferred = None;
+        let (rx, report) = self.receive_with_realm_admission(
+            ingress_at,
+            service_at,
+            packet,
+            RxMeta::VERIFY,
+            |source| {
+                on_source(source).unwrap_or_else(|reason| {
+                    deferred = Some(reason);
+                    false
+                })
+            },
+            |_| false,
+        );
+        if let Some(reason) = deferred
+            && matches!(rx, Rx::Dropped(DropReason::NotForUs))
+            && !self.table.has_sources()
+            && wire::parse_ip(packet).is_ok_and(|ip| ip.proto == wire::PROTO_TCP)
+        {
+            // Complete TCP source refusal precedes all protocol state mutation.
+            self.now = now;
+            self.counters.rx_packets -= 1;
+            self.counters.drops[DropReason::NotForUs as usize] -= 1;
+            return Err(reason);
+        }
+        Ok(report)
+    }
+
     /// Owner zero reassembles before selecting the completed datagram's transport owner.
     /// Complete bytes remain charged; this method never mutates TCP or UDP state.
     pub fn reassemble_for_dispatch(

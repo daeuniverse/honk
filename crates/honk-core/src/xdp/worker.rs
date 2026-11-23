@@ -1,14 +1,17 @@
 use super::*;
-use crate::control::netstack::RealmRxBatch;
+use crate::control::netstack::{RealmRxBatch, TcpClaim};
 use futures::FutureExt as _;
 mod adaptive;
 mod runtime;
 #[cfg(test)]
+mod startup_tests;
+#[cfg(test)]
 mod tests;
 use parking_lot::Mutex;
+use std::sync::OnceLock;
 use tokio::sync::{Notify, mpsc};
 
-const CELLS: usize = 64;
+pub(crate) const CELLS: usize = 64;
 pub(super) const THREAD_STACK: usize = 2 << 20;
 const DESTINATION: usize = 32;
 
@@ -89,6 +92,9 @@ pub(crate) struct PeerObservation<'a> {
     ingress_at: Instant,
     revision: u64,
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PeerPathChanged;
 
 #[derive(Debug)]
 pub(crate) struct PeerHold {
@@ -182,6 +188,12 @@ impl PeerAuthority {
             .store(revision.saturating_add(1), Ordering::Release);
     }
 
+    #[cfg(test)]
+    pub(crate) fn saturate_revision_for_test(&self) {
+        let _slots = self.slots.lock();
+        self.revision.store(u64::MAX, Ordering::Release);
+    }
+
     pub(crate) fn retain(
         self: &Arc<Self>,
         scope: ScopeId,
@@ -265,7 +277,8 @@ impl PeerAuthority {
     }
 
     /// A live realm hold pins this exact generation. Other workers can still change its path.
-    pub(crate) fn confirm_tcp<'a>(
+    #[inline]
+    pub(crate) fn confirm_tcp<'a, const SHARDED: bool>(
         &'a self,
         held: &PeerHold,
         scope: ScopeId,
@@ -273,7 +286,7 @@ impl PeerAuthority {
         path: ReturnPath,
         now: Instant,
         checked: &mut Option<PeerObservation<'a>>,
-    ) -> bool {
+    ) -> Result<bool, PeerPathChanged> {
         if !std::ptr::eq(self, held.authority.as_ref())
             || !held.learned()
             || held.address != source.src.ip()
@@ -284,7 +297,7 @@ impl PeerAuthority {
                     == wire::tcp::ACK
             })
         {
-            return false;
+            return Ok(false);
         }
         if checked.as_ref().is_some_and(|previous| {
             std::ptr::eq(previous.authority, self)
@@ -296,16 +309,27 @@ impl PeerAuthority {
                 && previous.revision != u64::MAX
                 && previous.revision == self.revision.load(Ordering::Acquire)
         }) {
-            return true;
+            return Ok(true);
         }
         let mut peers = self.slots.lock();
         let peer = &mut peers[held.slot];
-        if peer.scope != scope
-            || peer.generation != held.generation
-            || !peer.observe(self, path, now, false, false, false)
-            || peer.holds == usize::MAX
-        {
-            return false;
+        if peer.scope != scope || peer.generation != held.generation {
+            return Ok(false);
+        }
+        if SHARDED {
+            if peer.address != held.address
+                || peer.holds == 0
+                || peer.holds == usize::MAX
+                || peer.conflict.is_some()
+            {
+                return Ok(false);
+            }
+            if peer.path != path {
+                return Err(PeerPathChanged);
+            }
+            peer.last_seen = peer.last_seen.max(now);
+        } else if !peer.observe(self, path, now, false, false, false) || peer.holds == usize::MAX {
+            return Ok(false);
         }
         *checked = Some(PeerObservation {
             authority: self,
@@ -316,7 +340,7 @@ impl PeerAuthority {
             ingress_at: now,
             revision: self.revision.load(Ordering::Relaxed),
         });
-        true
+        Ok(true)
     }
 
     fn pin_fragment(
@@ -412,7 +436,6 @@ impl CellPool {
                         + size_of::<Shared>()
                         + size_of::<PeerAuthority>()
                         + PEERS * size_of::<PeerSlot>()
-                        + 64 * size_of::<Placement>()
                         + 65536,
                 )
             })
@@ -444,7 +467,6 @@ impl CellPool {
         })
     }
 }
-#[derive(Clone)]
 pub(super) struct Placement {
     pub(super) realm_id: u32,
     pub(super) realm: crate::control::netstack::PacketRealm,
@@ -453,10 +475,34 @@ pub(super) struct Placement {
     pub(super) link: LogicalLink,
 }
 
+pub(super) struct Placements {
+    pub(super) entries: Vec<Placement>,
+    _memory: MemoryReservation,
+}
+
+impl Placements {
+    pub(super) fn new(count: usize, budget: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let bytes = count
+            .checked_mul(size_of::<Placement>())
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 2 * size_of::<usize>()))
+            .ok_or_else(|| io::Error::other("XDP placement storage overflow"))?;
+        let memory = budget
+            .reserve(bytes)
+            .ok_or_else(|| io::Error::other("XDP placement storage capacity"))?;
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(count).map_err(io::Error::other)?;
+        Ok(Self {
+            entries,
+            _memory: memory,
+        })
+    }
+}
+
 pub(super) enum Payload {
     Ingress,
     Endpoint {
         owner: PacketScope,
+        check_output: bool,
         admission: Option<EndpointAdmission>,
     },
 }
@@ -478,6 +524,7 @@ pub(super) struct Envelope {
     pub(super) l3_offset: usize,
     pub(super) l3_length: usize,
     pub(super) payload: Payload,
+    _claim: Option<TcpClaim>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -501,10 +548,18 @@ impl Drain {
 #[derive(Default)]
 struct State {
     ready: bool,
+    queues_registered: bool,
+    relay_setup: Option<tokio::sync::oneshot::Receiver<()>>,
+    activated: bool,
     drain: Drain,
     stop: bool,
     exited: bool,
     failure: Option<anyhow::Error>,
+}
+
+struct RelayOwners {
+    primary: (tokio::runtime::Handle, Arc<DirectRelayFence>),
+    secondary: Option<(OnceLock<tokio::runtime::Handle>, Arc<DirectRelayFence>)>,
 }
 
 pub(super) struct Shared {
@@ -513,14 +568,17 @@ pub(super) struct Shared {
     states: [Mutex<State>; 2],
     wake: [Arc<Notify>; 2],
     admission: Arc<AtomicBool>,
+    relays: OnceLock<RelayOwners>,
     closing: AtomicBool,
     peers: Arc<PeerAuthority>,
     pub(super) workers: u8,
-    pub(super) placements: Mutex<Vec<Placement>>,
+    pub(super) placements: OnceLock<Arc<Placements>>,
     wakers: [futures::task::AtomicWaker; 2],
-    pub(super) diagnostics: Mutex<Option<Arc<Diagnostics>>>,
+    pub(super) diagnostics: OnceLock<Arc<Diagnostics>>,
     contexts: Mutex<[Option<Result<String, &'static str>>; 2]>,
     context_changed: [AtomicBool; 2],
+    #[cfg(test)]
+    secondary_test_control: OnceLock<Arc<polling::testing::Control>>,
 }
 
 impl Shared {
@@ -541,16 +599,106 @@ impl Shared {
                 wake: std::array::from_fn(|_| Arc::new(Notify::new())),
                 peers: PeerAuthority::new(Arc::clone(&admission)),
                 admission,
+                relays: OnceLock::new(),
                 closing: AtomicBool::new(false),
                 workers,
-                placements: Mutex::new(Vec::with_capacity(64)),
+                placements: OnceLock::new(),
                 wakers: std::array::from_fn(|_| futures::task::AtomicWaker::new()),
-                diagnostics: Mutex::new(None),
+                diagnostics: OnceLock::new(),
                 contexts: Mutex::new([None, None]),
                 context_changed: std::array::from_fn(|_| AtomicBool::new(true)),
+                #[cfg(test)]
+                secondary_test_control: OnceLock::new(),
             }),
             [receive0, receive1],
         ))
+    }
+
+    #[cfg(test)]
+    fn secondary_test_control(&self) -> &Arc<polling::testing::Control> {
+        self.secondary_test_control
+            .get()
+            .expect("registered secondary polling participant")
+    }
+
+    // Reserve the complete set before handing any fence to a worker or publishing a scope.
+    pub(super) fn prepare_relays(&self, budget: &Arc<MemoryBudget>) -> io::Result<()> {
+        let reserve = || -> io::Result<RelayOwners> {
+            let primary = (
+                tokio::runtime::Handle::current(),
+                DirectRelayFence::new(budget)?,
+            );
+            let secondary = match self.workers {
+                1 => None,
+                2 => Some((OnceLock::new(), DirectRelayFence::new(budget)?)),
+                _ => return Err(io::Error::other("invalid XDP relay owner count")),
+            };
+            Ok(RelayOwners { primary, secondary })
+        };
+        match reserve() {
+            Ok(owners) => self
+                .relays
+                .set(owners)
+                .map_err(|_| io::Error::other("XDP relay owners already reserved")),
+            Err(error) if error.kind() == io::ErrorKind::OutOfMemory => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn publish_relays(
+        &self,
+        realm: &PacketRealm,
+        shutdown: &crate::control::ShutdownIntent,
+    ) -> io::Result<()> {
+        let Some(relays) = self.relays.get() else {
+            return Ok(());
+        };
+        let owners = realm.owners();
+        if owners.len() != usize::from(self.workers) {
+            return Ok(());
+        }
+        let secondary = relays
+            .secondary
+            .as_ref()
+            .map(|(handle, fence)| {
+                handle
+                    .get()
+                    .map(|handle| (handle, fence))
+                    .ok_or_else(|| io::Error::other("XDP secondary relay owner not ready"))
+            })
+            .transpose()?;
+        // Only the coordinator publishes during startup, with capture admission still closed.
+        if owners.iter().any(PacketScope::direct_relay_published) {
+            return Err(io::Error::other("XDP relay scope already published"));
+        }
+        let _start = shutdown.lock_capture_start()?;
+        owners[0].publish_direct_relay_runtime(
+            relays.primary.0.clone(),
+            Arc::clone(&relays.primary.1),
+        )?;
+        if let Some((handle, fence)) = secondary {
+            owners[1].publish_direct_relay_runtime(handle.clone(), Arc::clone(fence))?;
+        }
+        Ok(())
+    }
+
+    fn close_relays(&self) {
+        if let Some(relays) = self.relays.get() {
+            relays.primary.1.close();
+            if let Some((_, fence)) = &relays.secondary {
+                fence.close();
+            }
+        }
+    }
+
+    async fn close_and_join_relays(&self) {
+        self.close_relays();
+        if let Some(relays) = self.relays.get() {
+            relays.primary.1.join_closed().await;
+            if let Some((_, fence)) = &relays.secondary {
+                fence.join_closed().await;
+            }
+        }
     }
 
     // Boxing the returned envelope would allocate when packet dispatch is full.
@@ -558,6 +706,9 @@ impl Shared {
     pub(super) fn send(&self, destination: usize, mut envelope: Envelope) -> Result<(), Envelope> {
         match self.senders[destination].try_send(envelope) {
             Ok(()) => {
+                if let Some(diagnostics) = self.diagnostics.get() {
+                    diagnostics.record_worker_handoff();
+                }
                 self.wake[destination].notify_one();
                 self.wakers[destination].wake();
                 Ok(())
@@ -583,20 +734,93 @@ impl Shared {
         self.wakers[worker].wake();
     }
 
+    async fn join_secondary_relays(&self) {
+        if let Some((_, fence)) = self
+            .relays
+            .get()
+            .and_then(|relays| relays.secondary.as_ref())
+        {
+            fence.close_and_join().await;
+        }
+    }
+
     fn is_closing(&self) -> bool {
         self.closing.load(Ordering::Acquire)
     }
 
+    pub(super) fn defer_secondary_ready(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        self.states[1].lock().relay_setup = Some(receive);
+        send
+    }
+
+    pub(super) fn activate<'a>(
+        &self,
+        shutdown: &crate::control::ShutdownIntent,
+        endpoints: &PacketEndpoints,
+        direct: Option<DirectProfile>,
+        candidates: impl Iterator<Item = (&'a PacketRealm, usize, bool)>,
+    ) -> anyhow::Result<()> {
+        // The worker close/failure state precedes ShutdownIntent's cold commit lock.
+        let starting = || -> anyhow::Result<parking_lot::MutexGuard<'_, State>> {
+            let state = self.states[1].lock();
+            ensure!(
+                !state.activated
+                    && !self.is_closing()
+                    && !state.stop
+                    && !state.exited
+                    && state.failure.is_none()
+                    && matches!(state.drain, Drain::Unarmed)
+                    && (self.workers == 1 || state.ready)
+                    && !endpoints.is_closing(),
+                "XDP capture closed or already activated"
+            );
+            Ok(state)
+        };
+        if self.relays.get().is_some() {
+            // Probe the PF outside status locks. A close during any probe invalidates the
+            // entire startup: neither publishing this pair nor opening capture may revive it.
+            for (realm, members, physical) in candidates {
+                if direct_relay_eligible(
+                    direct,
+                    self.workers,
+                    realm.owners().len(),
+                    members,
+                    physical,
+                ) {
+                    let _state = starting()?;
+                    self.publish_relays(realm, shutdown)?;
+                }
+            }
+        }
+        let mut state = starting()?;
+        shutdown.open_capture(&self.admission)?;
+        state.activated = true;
+        drop(state);
+        if let Err(error) = endpoints.capture_ready() {
+            self.begin_close();
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub(super) fn begin_close(&self) {
+        self.fence_admission(self.states[1].lock());
+    }
+
+    fn fence_admission(&self, state: parking_lot::MutexGuard<'_, State>) {
         self.closing.store(true, Ordering::Release);
         self.admission.store(false, Ordering::Release);
+        drop(state);
         self.wake_worker(0);
         self.wake_worker(1);
+        self.close_relays();
     }
 
     pub(super) fn close(&self) {
-        self.states[1].lock().drain = Drain::Revoked;
-        self.begin_close();
+        let mut state = self.states[1].lock();
+        state.drain = Drain::Revoked;
+        self.fence_admission(state);
     }
 
     pub(super) fn quiesce(&self, deadline: Instant) {
@@ -604,8 +828,7 @@ impl Shared {
         if matches!(state.drain, Drain::Unarmed) {
             state.drain = Drain::Until(deadline);
         }
-        drop(state);
-        self.begin_close();
+        self.fence_admission(state);
     }
 
     fn can_kick_outstanding(&self) -> bool {
@@ -651,15 +874,25 @@ impl Shared {
     }
 
     pub(super) fn failed(&self, worker: u8, error: anyhow::Error) {
-        self.states[worker as usize]
-            .lock()
-            .failure
-            .get_or_insert(error);
-        self.close();
+        let mut secondary = self.states[1].lock();
+        if worker == 1 {
+            secondary.failure.get_or_insert(error);
+        } else {
+            self.states[usize::from(worker)]
+                .lock()
+                .failure
+                .get_or_insert(error);
+        }
+        secondary.drain = Drain::Revoked;
+        self.fence_admission(secondary);
     }
 }
 
 pub(super) fn admit(workers: u8, infos: &[DeviceInfo]) -> anyhow::Result<()> {
+    ensure!(
+        (1..=2).contains(&workers),
+        "XDP requires one or two physical owners"
+    );
     if workers == 1 {
         return Ok(());
     }
@@ -682,6 +915,34 @@ impl Envelope {
             Some(PacketBody::Reassembled(packet)) => packet.as_ref(),
             None => &self.cell.packet()[self.l3_offset..self.l3_offset + self.l3_length],
         }
+    }
+
+    fn receive_endpoint(
+        &mut self,
+        shared: &Shared,
+        endpoints: &PacketEndpoints,
+        now: Instant,
+    ) -> io::Result<PacketReceive> {
+        let Payload::Endpoint {
+            owner,
+            admission,
+            check_output,
+        } = std::mem::replace(&mut self.payload, Payload::Ingress)
+        else {
+            return Err(io::Error::other(
+                "worker 1 received coordinator-only ingress",
+            ));
+        };
+        shared.receive_with_output_check(
+            endpoints,
+            &owner,
+            self.ip(),
+            self.ingress_at,
+            now,
+            self.path,
+            admission,
+            check_output,
+        )
     }
 }
 
@@ -709,12 +970,18 @@ pub(super) fn receive_batch<'a>(
 }
 
 impl Shared {
-    pub(super) fn placement(&self, scope: ScopeId) -> io::Result<Placement> {
-        self.placements
-            .lock()
+    pub(super) fn placements(&self) -> &[Placement] {
+        &self
+            .placements
+            .get()
+            .expect("published physical placements")
+            .entries
+    }
+
+    pub(super) fn placement(&self, scope: ScopeId) -> io::Result<&Placement> {
+        self.placements()
             .iter()
             .find(|placement| placement.realm.scope() == scope)
-            .cloned()
             .ok_or_else(|| io::Error::other("unregistered physical realm"))
     }
 
@@ -732,6 +999,20 @@ impl Shared {
         })
     }
 
+    pub(super) fn established_sharded<'a>(
+        &'a self,
+        batch: &mut Option<RealmRxBatch<'a>>,
+        owner: &'a PacketScope,
+        packet: &[u8],
+        times: (Instant, Instant),
+        path: ReturnPath,
+        endpoints: &PacketEndpoints,
+    ) -> Result<Option<PacketReceive>, PeerPathChanged> {
+        RealmRxBatch::receive_sharded(batch, owner, packet, times, path, &self.peers, || {
+            endpoints.can_batch_tcp()
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn receive(
         &self,
@@ -743,13 +1024,32 @@ impl Shared {
         path: ReturnPath,
         admission: Option<EndpointAdmission>,
     ) -> io::Result<PacketReceive> {
+        self.receive_with_output_check(
+            endpoints, owner, packet, ingress_at, service_at, path, admission, false,
+        )
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn receive_with_output_check(
+        &self,
+        endpoints: &PacketEndpoints,
+        owner: &PacketScope,
+        packet: &[u8],
+        ingress_at: Instant,
+        service_at: Instant,
+        path: ReturnPath,
+        admission: Option<EndpointAdmission>,
+        force_output_check: bool,
+    ) -> io::Result<PacketReceive> {
         let previous = wire::packet_addresses(packet)
             .ok()
             .and_then(|(source, _)| owner.peer_hold(source));
-        let check_output = previous
-            .as_ref()
-            .and_then(PeerHold::path)
-            .is_some_and(|old| old != path);
+        let check_output = force_output_check
+            || previous
+                .as_ref()
+                .and_then(PeerHold::path)
+                .is_some_and(|old| old != path);
         endpoints.receive_on_timed(
             owner,
             packet,
@@ -775,126 +1075,238 @@ impl Shared {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn endpoint(
-        &self,
-        worker: usize,
+    pub(super) fn physical_endpoint<'a>(
+        &'a self,
+        batch: &mut Option<RealmRxBatch<'a>>,
         endpoints: &PacketEndpoints,
+        realm: &'a PacketRealm,
+        local: usize,
+        ingress: Ingress,
+        segments: &[&[u8]],
+        view: PacketView<'_>,
+        staging: &mut [u8],
+        times: (Instant, Instant),
+        path: ReturnPath,
+        mixed: bool,
+    ) -> io::Result<PacketReceive> {
+        let fixed = if realm.queue_affine() {
+            None
+        } else {
+            Some(realm.dispatch_owner(local, view)?)
+        };
+        let tentative = fixed.as_ref().map_or(local, |(owner, _)| owner.worker());
+        let mut check_output = false;
+        if tentative == local
+            && !mixed
+            && let [packet] = segments
+        {
+            match self.established_sharded(
+                batch,
+                &realm.owners()[local],
+                packet,
+                times,
+                path,
+                endpoints,
+            ) {
+                Ok(Some(report)) => return Ok(report),
+                Ok(None) => {}
+                Err(_) => check_output = true,
+            }
+        }
+        batch.take();
+        let (owner, claim) = match fixed {
+            Some(route) => route,
+            None => realm.dispatch_owner(local, view)?,
+        };
+        if owner.worker() != local {
+            // The coordinator rechecks Core ownership when delegated mixed ingress arrives.
+            let payload = if (mixed && local == 1)
+                || matches!(view.parse_ip(), Err(wire::ParseError::Fragment))
+            {
+                Payload::Ingress
+            } else {
+                Payload::Endpoint {
+                    owner: owner.clone(),
+                    admission: None,
+                    check_output,
+                }
+            };
+            return self.handoff_segments(
+                owner.worker(),
+                ingress,
+                realm.scope(),
+                segments,
+                times.0,
+                path,
+                payload,
+                claim,
+            );
+        }
+        let packet = if let [packet] = segments {
+            *packet
+        } else {
+            let bytes = staging
+                .get_mut(..view.len())
+                .ok_or(io::ErrorKind::InvalidData)?;
+            view.copy_to(0..view.len(), bytes)
+                .ok_or(io::ErrorKind::InvalidData)?;
+            bytes
+        };
+        if matches!(wire::parse_ip(packet), Err(wire::ParseError::Fragment)) {
+            return self.endpoint_fragment(endpoints, realm.scope(), packet, times.0, path);
+        }
+        self.receive_with_output_check(
+            endpoints,
+            owner,
+            packet,
+            times.0,
+            times.1,
+            path,
+            None,
+            check_output,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handoff_segments(
+        &self,
+        target: usize,
+        ingress: Ingress,
         scope: ScopeId,
-        packet: &[u8],
+        segments: &[&[u8]],
         ingress_at: Instant,
         path: ReturnPath,
-        admission: Option<EndpointAdmission>,
-        cell: Option<Cell>,
+        payload: Payload,
+        claim: Option<TcpClaim>,
+    ) -> io::Result<PacketReceive> {
+        let cell = self.copy(segments, &[])?;
+        let peer = if matches!(payload, Payload::Ingress)
+            && matches!(
+                wire::parse_ip(cell.packet()),
+                Err(wire::ParseError::Fragment)
+            ) {
+            self.fragment_peer(scope, cell.packet(), path)?
+        } else {
+            None
+        };
+        let envelope = Envelope {
+            ingress,
+            scope,
+            path,
+            ingress_at,
+            l3_offset: 0,
+            l3_length: cell.packet().len(),
+            cell,
+            body: None,
+            peer,
+            payload,
+            _claim: claim,
+        };
+        self.send(target, envelope)
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
+        Ok(PacketReceive::default())
+    }
+
+    pub(super) fn endpoint_fragment(
+        &self,
+        endpoints: &PacketEndpoints,
+        scope: ScopeId,
+        fragment: &[u8],
+        ingress_at: Instant,
+        path: ReturnPath,
     ) -> io::Result<PacketReceive> {
         let realm = endpoints
             .realm(scope)
             .ok_or_else(|| io::Error::other("unregistered physical realm"))?;
-        if matches!(wire::parse_ip(packet), Err(wire::ParseError::Fragment)) {
-            let peer = self.fragment_peer(scope, packet, path)?;
-            let (packet, peer) = match endpoints.reassemble_for_dispatch_on(
-                realm.owner(0).expect("owner zero"),
-                packet,
-                ingress_at,
-                Instant::now(),
-                peer.clone(),
-            ) {
-                Ok(Some(packet)) => packet,
-                Ok(None) | Err(_) => return Ok(PacketReceive::default()),
-            };
-            let path = peer.as_ref().map(PeerHold::original_path).unwrap_or(path);
-            let ingress_at = packet.completion_ingress();
-            let owner =
-                &realm.owners()[realm.worker_for_packet(PacketView::from_slice(packet.as_ref()))];
-            if owner.worker() == worker {
-                return self.receive(
-                    endpoints,
-                    owner,
-                    packet.as_ref(),
-                    ingress_at,
-                    Instant::now(),
-                    path,
-                    admission,
-                );
-            }
-            let cell = cell
-                .or_else(|| self.pool.take())
-                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
-            let envelope = Envelope {
-                ingress: self.placement(scope)?.ingress,
-                scope,
-                path,
-                ingress_at,
-                cell,
-                body: Some(PacketBody::Reassembled(packet)),
-                peer,
-                l3_offset: 0,
-                l3_length: 0,
-                payload: Payload::Endpoint {
-                    owner: owner.clone(),
-                    admission,
-                },
-            };
-            self.send(owner.worker(), envelope)
-                .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
-            return Ok(PacketReceive::default());
-        }
-        let owner = &realm.owners()[realm.worker_for_packet(PacketView::from_slice(packet))];
-        if owner.worker() == worker {
+        let peer = self.fragment_peer(scope, fragment, path)?;
+        let (packet, peer) = match endpoints.reassemble_for_dispatch_on(
+            &realm.owners()[0],
+            fragment,
+            ingress_at,
+            Instant::now(),
+            peer,
+        ) {
+            Ok(Some(packet)) => packet,
+            Ok(None) | Err(_) => return Ok(PacketReceive::default()),
+        };
+        let path = peer.as_ref().map(PeerHold::original_path).unwrap_or(path);
+        let ingress_at = packet.completion_ingress();
+        let (owner, claim) = realm.dispatch_owner(0, PacketView::from_slice(packet.as_ref()))?;
+        if owner.worker() == 0 {
             return self.receive(
                 endpoints,
                 owner,
-                packet,
+                packet.as_ref(),
                 ingress_at,
                 Instant::now(),
                 path,
-                admission,
+                None,
             );
         }
-        let mut cell = match cell {
-            Some(cell) => cell,
-            None => self
-                .pool
-                .take()
-                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?,
-        };
-        cell.copy(&[packet], &[])?;
         let envelope = Envelope {
             ingress: self.placement(scope)?.ingress,
             scope,
             path,
             ingress_at,
+            cell: self.pool.take().ok_or(io::ErrorKind::WouldBlock)?,
+            body: Some(PacketBody::Reassembled(packet)),
+            peer,
             l3_offset: 0,
-            l3_length: packet.len(),
-            cell,
-            body: None,
-            peer: None,
+            l3_length: 0,
             payload: Payload::Endpoint {
                 owner: owner.clone(),
-                admission,
+                admission: None,
+                check_output: false,
             },
+            _claim: claim,
         };
         self.send(owner.worker(), envelope)
-            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+            .map_err(|_| io::ErrorKind::WouldBlock)?;
         Ok(PacketReceive::default())
     }
 
     pub(super) fn ready(&self, worker: u8) {
+        if worker == 1
+            && let Some((handle, _)) = self
+                .relays
+                .get()
+                .and_then(|relays| relays.secondary.as_ref())
+        {
+            handle
+                .set(tokio::runtime::Handle::current())
+                .expect("one secondary runtime");
+        }
         self.states[worker as usize].lock().ready = true;
-        self.wake[0].notify_one();
+        self.wake_worker(0);
     }
 
     pub(super) fn all_ready(&self, cx: &mut Context<'_>) -> Poll<anyhow::Result<()>> {
+        self.poll_ready(cx, false)
+    }
+
+    pub(super) fn poll_ready(
+        &self,
+        cx: &mut Context<'_>,
+        queues_only: bool,
+    ) -> Poll<anyhow::Result<()>> {
+        self.wakers[0].register(cx.waker());
+        let mut ready = true;
+        let mut exited = false;
         for state in self.states.iter().take(usize::from(self.workers)) {
             let state = state.lock();
-            if state.failure.is_some() || state.exited {
-                return Poll::Ready(Err(anyhow::anyhow!("XDP worker failed before readiness")));
+            if let Some(error) = &state.failure {
+                return Poll::Ready(Err(anyhow::anyhow!("{error:#}")));
             }
-            if !state.ready {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+            exited |= state.exited;
+            ready &= state.ready || queues_only && state.queues_registered;
         }
-        Poll::Ready(Ok(()))
+        if self.is_closing() || exited {
+            Poll::Ready(Err(anyhow::anyhow!("XDP worker closed before readiness")))
+        } else if ready {
+            Poll::Ready(Ok(()))
+        } else {
+            Poll::Pending
+        }
     }
 
     pub(super) fn check_failure(&self) -> anyhow::Result<()> {
@@ -905,10 +1317,6 @@ impl Shared {
         }
         Ok(())
     }
-}
-
-fn selected_worker(realm: &crate::control::netstack::PacketRealm, view: PacketView<'_>) -> usize {
-    realm.worker_for_packet(view)
 }
 
 struct WorkerDevice {
@@ -926,6 +1334,7 @@ pub(super) struct Worker {
 
 struct WorkerRuntime {
     shared: Arc<Shared>,
+    placements: Arc<Placements>,
     devices: Vec<WorkerDevice>,
     realms: Vec<Realm>,
     endpoints: PacketEndpoints,
@@ -961,6 +1370,19 @@ impl Worker {
         polling_budget: Arc<MemoryBudget>,
         shutdown: Arc<crate::control::ShutdownIntent>,
     ) -> io::Result<Self> {
+        let placements = Arc::clone(
+            shared
+                .placements
+                .get()
+                .expect("published physical placements"),
+        );
+        #[cfg(test)]
+        assert!(
+            shared
+                .secondary_test_control
+                .set(polling.test_control())
+                .is_ok()
+        );
         let mut owned = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter_mut().enumerate() {
             let mut queues = Vec::new();
@@ -1010,6 +1432,7 @@ impl Worker {
                 runtime.block_on(async move {
                     let mut worker = WorkerRuntime {
                         shared: Arc::clone(&thread_shared),
+                        placements,
                         devices: owned,
                         realms,
                         endpoints,
@@ -1034,25 +1457,21 @@ impl Worker {
                     let result = std::panic::AssertUnwindSafe(worker.run())
                         .catch_unwind()
                         .await;
-                    match result {
-                        Ok(Ok(())) => {
-                            thread_shared.states[1].lock().exited = true;
-                            thread_shared.wake_worker(0);
-                        }
-                        Ok(Err(error)) => {
-                            thread_shared.failed(1, error);
-                            std::mem::forget(worker);
-                            std::future::pending::<()>().await;
-                        }
-                        Err(_) => {
-                            thread_shared.failed(
-                                1,
-                                anyhow::anyhow!("XDP worker 1 panicked; retaining actual owners"),
-                            );
-                            std::mem::forget(worker);
-                            std::future::pending::<()>().await;
-                        }
+                    let failure = match result {
+                        Ok(Ok(())) => None,
+                        Ok(Err(error)) => Some(error),
+                        Err(_) => Some(anyhow::anyhow!(
+                            "XDP worker 1 panicked; retaining actual owners"
+                        )),
+                    };
+                    if let Some(error) = failure {
+                        thread_shared.failed(1, error);
+                        thread_shared.join_secondary_relays().await;
+                        std::mem::forget(worker);
+                        std::future::pending::<()>().await;
                     }
+                    thread_shared.states[1].lock().exited = true;
+                    thread_shared.wake_worker(0);
                 });
             });
         let thread = match thread {
@@ -1068,13 +1487,18 @@ impl Worker {
         })
     }
 
+    #[cfg(test)]
+    pub(super) fn test_control(&self) -> Arc<polling::testing::Control> {
+        Arc::clone(self.shared.secondary_test_control())
+    }
+
     pub(super) async fn join(&mut self) -> anyhow::Result<()> {
         {
             let mut state = self.shared.states[1].lock();
-            self.shared.closing.store(true, Ordering::Release);
+            // Stop and close admission before notifying either reactor.
             state.stop = true;
+            self.shared.fence_admission(state);
         }
-        self.shared.wake_worker(1);
         poll_fn(|cx| {
             self.shared.wakers[0].register(cx.waker());
             let state = self.shared.states[1].lock();
@@ -1104,6 +1528,7 @@ impl Shared {
         &self,
         endpoints: &PacketEndpoints,
         scope: ScopeId,
+        ingress_worker: usize,
         packet: Packet,
         ingress_at: Instant,
         path: ReturnPath,
@@ -1111,7 +1536,16 @@ impl Shared {
         cell: Option<Cell>,
         peer: Option<PeerHold>,
     ) -> io::Result<PacketReceive> {
-        let owner = endpoints.execution_owner(scope, PacketView::from_slice(packet.as_ref()))?;
+        let realm = endpoints
+            .realm(scope)
+            .ok_or_else(|| io::Error::other("unregistered physical realm"))?;
+        let preferred = if packet.is_reassembled() {
+            0
+        } else {
+            ingress_worker
+        };
+        let (owner, claim) =
+            realm.dispatch_owner(preferred, PacketView::from_slice(packet.as_ref()))?;
         if owner.worker() == 0 {
             return self.receive(
                 endpoints,
@@ -1128,6 +1562,7 @@ impl Shared {
             .or_else(|| self.pool.take())
             .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
         let envelope = Envelope {
+            _claim: claim,
             ingress: placement.ingress,
             scope,
             path,
@@ -1140,6 +1575,7 @@ impl Shared {
             payload: Payload::Endpoint {
                 owner: owner.clone(),
                 admission,
+                check_output: false,
             },
         };
         self.send(1, envelope)
@@ -1175,8 +1611,12 @@ impl Shared {
             envelope.ingress_at = packet.completion_ingress();
             envelope.body = Some(PacketBody::Reassembled(packet));
         }
-        let owner =
-            endpoints.execution_owner(envelope.scope, PacketView::from_slice(envelope.ip()))?;
+        let realm = endpoints
+            .realm(envelope.scope)
+            .ok_or_else(|| io::Error::other("unregistered physical realm"))?;
+        let preferred = usize::from(envelope.body.is_none()); // Raw coordinator handoffs came from queue owner 1.
+        let (owner, claim) =
+            realm.dispatch_owner(preferred, PacketView::from_slice(envelope.ip()))?;
         if owner.worker() == 0 {
             return self.receive(
                 endpoints,
@@ -1188,9 +1628,11 @@ impl Shared {
                 None,
             );
         }
+        envelope._claim = claim;
         envelope.payload = Payload::Endpoint {
             owner: owner.clone(),
             admission: None,
+            check_output: false,
         };
         self.send(1, envelope)
             .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
@@ -1216,17 +1658,10 @@ impl Runtime {
                 progress += 1;
                 continue;
             }
-            let payload = std::mem::replace(&mut envelope.payload, Payload::Ingress);
-            let result = match payload {
-                Payload::Endpoint { owner, admission } => self.workers.receive(
-                    &self.endpoints,
-                    &owner,
-                    envelope.ip(),
-                    envelope.ingress_at,
-                    now,
-                    envelope.path,
-                    admission,
-                ),
+            let result = match envelope.payload {
+                Payload::Endpoint { .. } => {
+                    envelope.receive_endpoint(&self.workers, &self.endpoints, now)
+                }
                 Payload::Ingress => {
                     if let Some(core) = &mut self.core
                         && !retained_endpoint(
@@ -1269,6 +1704,7 @@ impl Runtime {
                                     mac: path.mac,
                                     retry: now,
                                     scope: envelope.scope,
+                                    ingress_worker: 1,
                                     path,
                                     ingress_at,
                                     cell: Some(envelope.cell),
@@ -1314,8 +1750,8 @@ struct CoordinatorJoin {
 impl Drop for CoordinatorJoin {
     fn drop(&mut self) {
         if let Some(thread) = self.thread.take() {
-            self.admission.store(false, Ordering::Release);
             self.shutdown.request();
+            self.admission.store(false, Ordering::Release);
             if let Some(completion) = self.completion.take() {
                 self.shared_runtime.spawn(async move {
                     match completion.await {
@@ -1331,6 +1767,36 @@ impl Drop for CoordinatorJoin {
             }
         }
     }
+}
+
+async fn finish_coordinator(
+    outcome: std::thread::Result<(Option<ControlPlane>, anyhow::Result<()>)>,
+    capture: Option<&(Arc<Shared>, PacketEndpoints)>,
+) -> (Option<ControlPlane>, anyhow::Result<()>) {
+    let mut result = outcome.unwrap_or_else(|_| {
+        (
+            None,
+            Err(anyhow::anyhow!(
+                "XDP coordinator panicked; retaining actual owners"
+            )),
+        )
+    });
+    if let Some((workers, endpoints)) = capture {
+        if result.0.is_none() && result.1.is_err() {
+            workers.close();
+            // Closing a scope can deliver application wakers. Even a panicking wake must
+            // leave this reactor driving its admitted TCP children until their parents join.
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| endpoints.close())).is_err()
+            {
+                result.1 = result.1.map_err(|error| {
+                    error.context("packet endpoint close panicked while retaining capture")
+                });
+            }
+        }
+        // The shared TCP parent holds its lease until it collects the actual owner task.
+        workers.close_and_join_relays().await;
+    }
+    result
 }
 
 pub(super) async fn run_coordinator(
@@ -1365,7 +1831,7 @@ pub(super) async fn run_coordinator(
                     return;
                 }
             };
-            let mut relay_fence = None;
+            let mut capture = None;
             let outcome = runtime.block_on(
                 std::panic::AssertUnwindSafe(super::run_capture(
                     plane,
@@ -1373,26 +1839,12 @@ pub(super) async fn run_coordinator(
                     thread_admission,
                     pname_support,
                     runtime_handle,
-                    &mut relay_fence,
+                    &mut capture,
                 ))
                 .catch_unwind(),
             );
-            let retained = match &outcome {
-                Ok((plane, result)) => plane.is_none() && result.is_err(),
-                Err(_) => true,
-            };
-            if retained && let Some(fence) = relay_fence {
-                // Command quiescence can precede socket cleanup on the shared runtime.
-                runtime.block_on(fence.close_and_join());
-            }
-            let result = outcome.unwrap_or_else(|_| {
-                (
-                    None,
-                    Err(anyhow::anyhow!(
-                        "XDP coordinator panicked; retaining actual owners"
-                    )),
-                )
-            });
+            let result = runtime.block_on(finish_coordinator(outcome, capture.as_ref()));
+            let retained = result.0.is_none() && result.1.is_err();
             let _ = send.send(result);
             if retained {
                 runtime.block_on(std::future::pending::<()>());

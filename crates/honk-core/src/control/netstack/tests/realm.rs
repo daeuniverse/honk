@@ -1,5 +1,8 @@
 use super::*;
-use crate::xdp::{ReturnPath, worker::PeerAuthority};
+use crate::xdp::{
+    ReturnPath,
+    worker::{PeerAuthority, PeerPathChanged},
+};
 
 fn client_for(realm: &PacketRealm, worker: usize) -> SocketAddr {
     let destination = "203.0.113.9:443".parse().unwrap();
@@ -48,7 +51,7 @@ fn physical_synack(
 #[tokio::test]
 async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+    let (realm, owners) = capture_realm(1280, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let now = Instant::now();
     let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
@@ -211,9 +214,10 @@ async fn physical_tcp_batch_checks_each_ack_and_flushes_before_reset() {
 
 #[tokio::test]
 async fn physical_tcp_batch_preserves_exported_output() {
-    for workers in [1, 2] {
+    for (workers, members) in [(1, 1), (2, 1), (2, 2)] {
         let budget = MemoryBudget::new(CAPTURE_MEMORY);
-        let (realm, owners) = capture_realm(1280, 1, 16, workers, &budget).unwrap();
+        let (realm, owners) = capture_realm(1280, 1, 16, workers, members, &budget).unwrap();
+        assert_eq!(realm.queue_affine(), workers == 2 && members == 1);
         let scope = realm.owner(0).unwrap();
         assert_eq!(scope.0.workers, workers);
         let now = Instant::now();
@@ -238,7 +242,20 @@ async fn physical_tcp_batch_preserves_exported_output() {
 
         let data = segment(client, 101, server, tcp::ACK, b"data");
         let receive = |path| {
-            RealmRxBatch::receive(&mut None, scope, &data, (now, now), path, &peers, || true)
+            if workers == 1 {
+                RealmRxBatch::receive(&mut None, scope, &data, (now, now), path, &peers, || true)
+            } else {
+                RealmRxBatch::receive_sharded(
+                    &mut None,
+                    scope,
+                    &data,
+                    (now, now),
+                    path,
+                    &peers,
+                    || true,
+                )
+                .unwrap()
+            }
         };
         scope
             .datagram_sender(flow.local_addr())
@@ -278,20 +295,12 @@ async fn physical_tcp_batch_preserves_exported_output() {
                     .is_none_or(|due| due > now)
             );
         }
-        let report = receive(path);
-        if workers == 1 {
-            let report = report.expect("single owner must batch with an exported output lease");
-            assert!(report.taken_over && report.qualified_rx);
-        } else {
-            assert!(report.is_none(), "sharded scope must wait for the export");
-        }
+        let report = receive(path).expect("the exported lease keeps its own path");
+        assert!(report.taken_over && report.qualified_rx);
         assert_eq!(synack.packet(), original);
         assert_eq!(synack.flow_id(), Some(flow.flow_id()));
         assert_eq!(synack.peer_hold().unwrap().original_path(), path);
         synack.release();
-        if workers == 2 {
-            assert!(receive(path).unwrap().qualified_rx);
-        }
         let mut bytes = [0; 4];
         let mut buf = tokio::io::ReadBuf::new(&mut bytes);
         assert!(matches!(
@@ -307,9 +316,172 @@ async fn physical_tcp_batch_preserves_exported_output() {
 }
 
 #[tokio::test]
+async fn physical_tcp_batch_retries_moved_peer_with_pending_output_once() {
+    for saturated in [false, true] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
+        let scope = realm.owner(0).unwrap();
+        let peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let now = Instant::now();
+        let (path, mut flow, synack) = physical_synack(&realm, &peers, now);
+        let server = decode(&synack).0.seq.wrapping_add(1);
+        let client = flow.peer_addr();
+        let ack = segment(client, 101, server, tcp::ACK, &[]);
+        scope
+            .receive_realm_timed(&ack, now, now, &mut None, false, |source, pending| {
+                peers.retain(scope.scope(), source, path, now, pending)
+            })
+            .unwrap();
+        scope.after_receive();
+        flow.mark_rx_admitted();
+        let now = now + honk_netstack::MAX_DEFERRED;
+        scope.drive(now);
+        while let Poll::Ready(Some(output)) = scope.poll_output(&mut context()) {
+            output.release();
+        }
+        assert!(matches!(
+            std::pin::Pin::new(&mut flow).poll_write(&mut context(), b"pending"),
+            Poll::Ready(Ok(7))
+        ));
+
+        if saturated {
+            peers.saturate_revision_for_test();
+        }
+        let before = scope.stats().unwrap();
+        let foreign_peers = PeerAuthority::new(Arc::new(std::sync::atomic::AtomicBool::new(true)));
+        let mut batch = None;
+        let warm = RealmRxBatch::receive_sharded(
+            &mut batch,
+            scope,
+            &ack,
+            (now, now),
+            path,
+            &peers,
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(warm.qualified_rx);
+        let source = warm.source.unwrap();
+        let moved = ReturnPath {
+            device: 1,
+            vlan_tci: [path.vlan_tci[0] | (5 << 13), 0],
+            ..path
+        };
+        drop(
+            peers
+                .retain(
+                    realm.owner(1).unwrap().scope(),
+                    source,
+                    moved,
+                    now + Duration::from_millis(1),
+                    false,
+                )
+                .unwrap(),
+        );
+
+        let data = segment(client, 101, server, tcp::ACK, b"data");
+        let mut corrupt = data.clone();
+        let offset = wire::parse_ip(&data).unwrap().payload.start;
+        corrupt[offset + 16] ^= 1;
+        assert_eq!(
+            RealmRxBatch::receive_sharded(
+                &mut batch,
+                scope,
+                &corrupt,
+                (now, now),
+                path,
+                &peers,
+                || true
+            ),
+            Ok(Some(Default::default()))
+        );
+        let refused = RealmRxBatch::receive_sharded(
+            &mut batch,
+            scope,
+            &data,
+            (now, now),
+            path,
+            &foreign_peers,
+            || true,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(refused.source, Some(source));
+        assert!(!refused.taken_over && !refused.qualified_rx);
+        assert_eq!(
+            RealmRxBatch::receive_sharded(
+                &mut batch,
+                scope,
+                &data,
+                (now, now),
+                path,
+                &peers,
+                || true
+            ),
+            Err(PeerPathChanged)
+        );
+        drop(batch.take());
+        let after_batch = scope.stats().unwrap();
+        assert_eq!(after_batch.rx_packets, before.rx_packets + 3);
+        let mut expected_drops = before.drops;
+        expected_drops[DropReason::Checksum as usize] += 1;
+        expected_drops[DropReason::NotForUs as usize] += 1;
+        assert_eq!(after_batch.drops, expected_drops);
+        let mut bytes = [0; 4];
+        let mut buf = tokio::io::ReadBuf::new(&mut bytes);
+        assert!(
+            std::pin::Pin::new(&mut flow)
+                .poll_read(&mut context(), &mut buf)
+                .is_pending()
+        );
+
+        let previous = scope.peer_hold(client.ip()).unwrap();
+        assert_eq!(previous.original_path(), path);
+        let (rx, report, _) = scope
+            .receive_realm_timed(&data, now, now, &mut None, true, |source, pending| {
+                assert!(pending, "unmaterialized TCP output still owns the old path");
+                let authoritative = peers.retain(scope.scope(), source, path, now, pending)?;
+                assert_eq!(authoritative.original_path(), moved);
+                Some(previous.clone())
+            })
+            .unwrap();
+        scope.after_receive();
+        assert_eq!(rx, Rx::Consumed);
+        assert!(report.qualified_rx);
+        let after_scalar = scope.stats().unwrap();
+        assert_eq!(after_scalar.rx_packets, after_batch.rx_packets + 1);
+        assert_eq!(after_scalar.drops, expected_drops);
+
+        assert!(matches!(
+            std::pin::Pin::new(&mut flow).poll_read(&mut context(), &mut buf),
+            Poll::Ready(Ok(()))
+        ));
+        assert_eq!(buf.filled(), b"data");
+        scope.drive(now);
+        let mut pending_sent = false;
+        while let Poll::Ready(Some(output)) = scope.poll_output(&mut context()) {
+            if output.packet().ends_with(b"pending") {
+                assert_eq!(output.flow_id(), Some(flow.flow_id()));
+                assert_eq!(output.peer_hold().unwrap().original_path(), path);
+                pending_sent = true;
+            }
+            output.release();
+        }
+        assert!(pending_sent);
+        assert_eq!(synack.peer_hold().unwrap().original_path(), path);
+        synack.release();
+        drop((flow, previous));
+        for owner in owners {
+            owner.shutdown().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn identical_local_flow_ids_and_completions_keep_exact_realm_owners() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 16, 2, &budget).unwrap();
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     let now = Instant::now();
     let clients = [client_for(&realm, 0), client_for(&realm, 1)];
     let mut flows = Vec::new();
@@ -350,7 +522,7 @@ async fn identical_local_flow_ids_and_completions_keep_exact_realm_owners() {
 #[tokio::test]
 async fn half_open_source_limit_is_shared_and_shutdown_refunds_only_its_owner() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 16, 2, &budget).unwrap();
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     let now = Instant::now();
     let destination = "203.0.113.9:443".parse().unwrap();
     let mut per_worker = [0; 2];
@@ -388,7 +560,7 @@ async fn half_open_source_limit_is_shared_and_shutdown_refunds_only_its_owner() 
 #[tokio::test]
 async fn realm_reply_sender_selects_client_owner_and_shares_pending_fragment_ceiling() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 16, 2, &budget).unwrap();
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     let clients = udp_clients(&realm);
     let sender = realm.datagram_sender("203.0.113.9:53".parse().unwrap());
     for (worker, client) in clients.into_iter().enumerate() {
@@ -423,5 +595,237 @@ async fn realm_reply_sender_selects_client_owner_and_shares_pending_fragment_cei
     }
     for owner in owners {
         owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn simultaneous_syn_dispatch_holds_one_owner_until_the_last_handoff_returns() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
+    let client = client_for(&realm, 0);
+    let packet = segment(client, 100, 0, tcp::SYN, &[]);
+    let view = wire::PacketView::from_slice(&packet);
+    let barrier = std::sync::Barrier::new(2);
+    let [(first, first_claim), (second, second_claim)] = std::thread::scope(|threads| {
+        [0, 1]
+            .map(|local| {
+                threads.spawn({
+                    let realm = &realm;
+                    let barrier = &barrier;
+                    move || {
+                        barrier.wait();
+                        let (owner, claim) = realm.dispatch_owner(local, view).unwrap();
+                        (owner.worker(), claim.unwrap())
+                    }
+                })
+            })
+            .map(|join| join.join().unwrap())
+    });
+    assert_eq!(first, second);
+    let other = 1 - first;
+    drop(first_claim);
+    assert_eq!(realm.dispatch_owner(other, view).unwrap().0.worker(), first);
+    drop(second_claim);
+    assert_eq!(realm.dispatch_owner(other, view).unwrap().0.worker(), other);
+
+    let destination = "203.0.113.9:443".parse().unwrap();
+    let capacity = crate::xdp::worker::CELLS + 2;
+    let mut held = Vec::new();
+    for port in 1..=capacity {
+        let source = SocketAddr::new(client.ip(), port as u16);
+        held.push(
+            realm
+                .tcp_dispatch(1, source, destination)
+                .unwrap()
+                .1
+                .unwrap(),
+        );
+    }
+    assert!(realm.tcp_dispatch(0, client, destination).is_err());
+    let retained = SocketAddr::new(client.ip(), 1);
+    assert_eq!(realm.tcp_dispatch(0, retained, destination).unwrap().0, 1);
+    drop(held);
+
+    let scope = &realm.owners()[first];
+    let now = Instant::now();
+    for local in [first, other] {
+        let (owner, _claim) = realm.dispatch_owner(local, view).unwrap();
+        assert_eq!(owner.worker(), first);
+        assert_eq!(owner.receive(&packet, now), Rx::Consumed);
+    }
+    let (_, flow) = scope.poll_accept().unwrap();
+    assert!(scope.poll_accept().is_none());
+    assert!(realm.owners()[other].poll_accept().is_none());
+    drop(flow);
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn migrated_fin_and_syn_keep_the_compact_time_wait_and_exported_ack_owner() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
+    let client = client_for(&realm, 0);
+    let now = Instant::now();
+    let scope = &realm.owners()[1];
+    let (flow, server) = handshake(scope, now, client, 100);
+    drop(flow);
+    scope.drive(now);
+    let fin = output(scope);
+    assert_eq!(decode(&fin).0.flags, tcp::FIN | tcp::ACK);
+    fin.release();
+    let server = server.wrapping_add(1);
+    let late_fin = segment(client, 101, server, tcp::FIN | tcp::ACK, &[]);
+    scope.receive(&segment(client, 101, server, tcp::ACK, &[]), now);
+    scope.receive(&late_fin, now);
+    scope.drive(now);
+    output(scope).release();
+    assert_eq!(scope.stats().unwrap().timewait_entries, 1);
+    for packet in [&late_fin, &segment(client, 100, 0, tcp::SYN, &[])] {
+        let (owner, _claim) = realm
+            .dispatch_owner(0, wire::PacketView::from_slice(packet))
+            .unwrap();
+        assert_eq!(owner.worker(), 1);
+        owner.receive(packet, now);
+    }
+    scope.drive(now);
+    let final_ack = output(scope);
+    assert_eq!(decode(&final_ack).0.flags, tcp::ACK);
+    scope.shutdown(true);
+    let view = wire::PacketView::from_slice(&late_fin);
+    assert_eq!(realm.dispatch_owner(0, view).unwrap().0.worker(), 1);
+    final_ack.release();
+    assert_eq!(realm.dispatch_owner(0, view).unwrap().0.worker(), 0);
+    for owner in owners {
+        owner.shutdown().await;
+    }
+}
+
+fn assert_output_window(scope: &PacketScope, control: usize, bulk: usize) {
+    let mut inner = scope.0.inner.lock();
+    assert_eq!(inner.frames.len(), control + bulk);
+    let mut leases = Vec::with_capacity(control + bulk);
+    for (class, count) in [(TxClass::Control, control), (TxClass::Bulk, bulk)] {
+        for _ in 0..count {
+            let lease = inner.ledger.reserve_tx(class).unwrap();
+            let index = inner.index(lease);
+            assert_eq!(
+                inner.frames[index].as_ref().unwrap().len(),
+                inner.frame_size
+            );
+            leases.push(lease);
+        }
+        assert_eq!(
+            inner.ledger.reserve_tx(class),
+            Err(honk_datapath::buffer::LedgerError::NoDescriptor)
+        );
+    }
+    for lease in leases {
+        inner.ledger.cancel_tx(lease).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn sharded_output_window_funds_both_owners_and_refunds_the_overlap() {
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let (realm, owners) = capture_realm(1500, 1, 256, 2, 1, &budget).unwrap();
+    assert!(!realm.widen_startup_output(256));
+    let admission = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    realm
+        .install_admission_fence(Arc::clone(&admission))
+        .unwrap();
+    let narrow_used = budget.used();
+    let mut peak = 0;
+    let mut steady_growth = 0;
+    for scope in realm.owners() {
+        let inner = scope.0.inner.lock();
+        let wide = ScopeFrameLayout::new(
+            RuntimeLimits {
+                max_slots: inner.half_open.len(),
+                control_frames: 32,
+                bulk_frames: 256,
+                max_waiters: inner.waiters.len(),
+            },
+            inner.frame_size,
+            scope.worker(),
+            2,
+            true,
+        )
+        .unwrap();
+        let new_ledger = FrameLedger::<Option<FlowId>>::metadata_bytes(wide.config).unwrap();
+        peak += wide.storage_bytes - 144 * 1500 + wide.metadata_bytes + new_ledger;
+        steady_growth += wide.storage_bytes + wide.metadata_bytes + new_ledger
+            - inner._storage.bytes()
+            - inner.ledger.charged_bytes();
+    }
+    let first_frame =
+        |scope: &PacketScope| scope.0.inner.lock().frames[0].as_ref().unwrap().as_ptr();
+    let originals = [
+        first_frame(&realm.owners()[0]),
+        first_frame(&realm.owners()[1]),
+    ];
+
+    // One byte below the joint peak can fund the first replacement, but not both.
+    let pressure = budget
+        .reserve(CAPTURE_MEMORY - narrow_used - peak + 1)
+        .unwrap();
+    let pressured = budget.used();
+    assert!(!realm.widen_startup_output(256));
+    assert_eq!(budget.used(), pressured);
+    for scope in realm.owners() {
+        assert_output_window(scope, 16, 128);
+    }
+    drop(pressure);
+
+    let pressure = budget.reserve(CAPTURE_MEMORY - narrow_used - peak).unwrap();
+    assert!(realm.widen_startup_output(256));
+    assert_eq!(
+        budget.used(),
+        narrow_used + pressure.bytes() + steady_growth
+    );
+    let client = "192.0.2.10:40000".parse().unwrap();
+    let syn = segment(client, 100, 0, tcp::SYN, &[]);
+    for (scope, original_frame) in realm.owners().iter().zip(originals) {
+        assert_output_window(scope, 32, 256);
+        assert_eq!(first_frame(scope), original_frame);
+        assert_eq!(
+            scope.receive(&syn, Instant::now()),
+            Rx::Dropped(DropReason::Stale)
+        );
+    }
+    for owner in owners {
+        owner.shutdown().await;
+    }
+    drop(realm);
+    assert_eq!(budget.used(), pressure.bytes());
+    drop(pressure);
+    assert_eq!(budget.used(), 0);
+}
+
+#[tokio::test]
+async fn sharded_output_window_keeps_other_capture_layouts() {
+    for (mtu, base, workers, members, control, bulk) in [
+        (1500, 256, 1, 1, 32, 256),
+        (1500, 256, 2, 2, 16, 128),
+        (9000, 128, 2, 1, 16, 64),
+        (1500, 16, 2, 1, 16, 8),
+    ] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (realm, owners) = capture_realm(mtu, 1, base, workers, members, &budget).unwrap();
+        realm
+            .install_admission_fence(Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .unwrap();
+        let before = budget.used();
+        assert!(!realm.widen_startup_output(base));
+        assert_eq!(budget.used(), before);
+        for scope in realm.owners() {
+            assert_output_window(scope, control, bulk);
+        }
+        for owner in owners {
+            owner.shutdown().await;
+        }
+        drop(realm);
+        assert_eq!(budget.used(), 0);
     }
 }

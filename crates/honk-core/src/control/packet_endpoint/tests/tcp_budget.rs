@@ -143,7 +143,7 @@ async fn dispatch_charge(
     hold_to_dial: bool,
 ) -> usize {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1280, 1, 2, 1, &budget).unwrap();
+    let (realm, owners) = capture_realm(1280, 1, 2, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap().clone();
     let (plane, _health) = local_plane_with(|config| config.groups.clear()).await;
     assert!(plane.proxy_registry.has_stock_direct());

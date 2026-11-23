@@ -87,6 +87,7 @@ pub(in crate::xdp) struct Control {
     clock_fault: Mutex<ClockFault>,
     armed: Mutex<Option<Arc<PauseState>>>,
     pending: Mutex<Option<PendingWait>>,
+    driver_timer_waits: std::sync::atomic::AtomicU64,
     exit: Mutex<Option<Exit>>,
     clock_events: Mutex<ClockEvents>,
     serviced_revision: std::sync::atomic::AtomicU64,
@@ -171,6 +172,29 @@ impl Control {
 
     pub fn note_pending(&self, wait: PendingWait) {
         *self.pending.lock().unwrap() = Some(wait);
+    }
+
+    pub fn note_driver_timer_wait(
+        &self,
+        driver_deadline: Option<Instant>,
+        armed_deadline: Option<tokio::time::Instant>,
+        idle_ports: bool,
+        pending_outputs: bool,
+    ) {
+        if idle_ports
+            && !pending_outputs
+            && let Some(due) = driver_deadline
+            && armed_deadline == Some(tokio::time::Instant::from_std(due))
+            && due > Instant::now()
+        {
+            self.driver_timer_waits
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    pub fn driver_timer_waits(&self) -> u64 {
+        self.driver_timer_waits
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn note_exit(&self, exit: Exit) {

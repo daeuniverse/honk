@@ -978,6 +978,68 @@ async fn tun_dual_capture_cold_start_fits_with_retained_producer_charge() {
     .expect("real dual capture scopes and the shared supervisor must fit and join");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn xdp_sharded_startup_funds_required_owners_before_optional_output() {
+    use crate::control::netstack::{CAPTURE_MEMORY, DirectRelayFence, capture_realm};
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut required = None;
+        for widened in [true, false] {
+            let budget = MemoryBudget::new(CAPTURE_MEMORY);
+            let pressure = required.map(|bytes| budget.reserve(CAPTURE_MEMORY - bytes).unwrap());
+            let producer_bytes = pressure.as_ref().map_or(0, |grant| grant.bytes());
+            let (realm, owners) = capture_realm(1500, 1, 256, 2, 1, &budget).unwrap();
+            let admission = Arc::new(AtomicBool::new(false));
+            realm
+                .install_admission_fence(Arc::clone(&admission))
+                .unwrap();
+            let (plane, _health) = packet_plane(Backend::Xdp, "Rule", "block").await;
+            let projection = plane.dns_controller.routing_projection();
+            let capacity = plane.packet_udp_capacity();
+            let (endpoints, mut owner, mut drivers) = PacketEndpoints::start_driven(
+                plane,
+                vec![(realm.clone(), owners)],
+                capacity,
+                None,
+                ScopeId::HOST,
+            )
+            .await
+            .unwrap();
+            std::future::poll_fn(|cx| {
+                for driver in &mut drivers {
+                    driver.service(cx, Instant::now());
+                }
+                owner.poll_ready(cx)
+            })
+            .await
+            .unwrap();
+            let fences = [
+                DirectRelayFence::new(&budget).unwrap(),
+                DirectRelayFence::new(&budget).unwrap(),
+            ];
+            let before = budget.used();
+            if widened {
+                required = Some(before);
+            } else {
+                assert_eq!(before, CAPTURE_MEMORY);
+            }
+            assert_eq!(realm.widen_startup_output(256), widened);
+            assert_eq!(budget.used() > before, widened);
+            admission.store(true, Ordering::Release);
+            endpoints.capture_ready().unwrap();
+            join_packet(endpoints, owner, drivers).await;
+            projection.shutdown(Duration::from_secs(1)).await;
+            drop((projection, realm, fences));
+            assert_eq!(budget.used(), producer_bytes);
+            drop(pressure);
+            assert_eq!(budget.used(), 0);
+        }
+    })
+    .await
+    .expect("two original scope owners and their funded supervisor must join");
+}
+
 #[tokio::test]
 async fn tun_driven_startup_requires_configured_host_and_plain_dns_identity() {
     tokio::time::timeout(Duration::from_secs(10), async {

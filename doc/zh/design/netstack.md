@@ -150,23 +150,21 @@ CPU 与直接生成输出共用 `Retained::Endpoint(OutputOwner)`，在同一 CQ
 物理 XDP 关停时，driver 可丢弃仍在 CPU 队列、尚未发布的输出，不再向设备补包。已发布的描述符保留原 owner，只有真实 CQ 才能归还；停止 worker 不能代替完成。
 
 物理 XDP 的每个逻辑入口在同一 `PacketRealm` 下使用一个或两个独立 Stack owner。
-队列永久归属 `queue_id % workers`；TCP 按不可变 keyed tuple 分片，UDP 按
-client 地址分片。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与
+队列固定归 `queue_id % workers`。单物理成员、两个 owner 时，新 TCP 流优先归收包队列。队列变化不会迁移活跃流、`TIME_WAIT` 或已导出的输出：逐包回退在把报文交给任一 Stack 前先查实际持有者。同时分派的同一四元组共用一个临时、有界的归属记录。多成员 realm 仍按 TCP 四元组哈希；UDP 仍按客户端地址哈希。peer、DNS 和 UDP source 身份仍属于逻辑 realm，应用、退休与
 CQ 则保留精确 owner 和 FlowId。跨 worker 交接共用 64 个已计费 cell，每个目的
 队列最多等待 32 项，借用 RX 不会逃出 callback。Core 与 Host 协调留在 worker 0；
 drain 确认绑定该轮开始前观察到的 epoch，不能借用后来发布的 barrier。
 
 物理 Endpoint RX 可在同一个 scope 锁下处理队列本轮剩余额度内的报文，上限为 32 个。每个已建立连接的 TCP 报文仍须通过报头、校验和、来源准入及 Stack 对原始 FlowId 的判定。对于已持有的同一 peer，完整返回路径和 ingress 时间相同时，首个通过校验的报文执行 `last_seen = max(last_seen, ingress_at)`。同时间的后续报文重复更新会得到相同结果，因此每包在来源校验后读取 peer 权威的版本，版本相同即可复用。路径或冲突变化后必须加锁复查，版本饱和后始终加锁。批末不写回路径，因而保留其他 worker 更新的成员设备和 VLAN 优先级。
 
-物理 realm 只有一个 Stack owner 时，已导出的输出不阻止当前已学习回程路径上的新 RX 批次；输出在实际归还前仍持有原流和路径。CPU 队列非空或回程路径改变时仍逐包接收；有多个 owner 的 realm 在输出尚未归还时也保持逐包接收。
+单 owner 和分片物理 realm 都可在输出已导出时沿当前已学习的回程路径批量接收已建立连接的 TCP 报文。输出在实际归还前仍持有原流和路径。CPU 队列非空时走逐包接收。若另一 shard 已更新权威路径，加锁复查会把报文和路径原样保留。释放批次并重新定位 owner 后，逐包接收即使发现来包路径和本地快照相同，也会检查待处理输出。
 
 两个 worker 都保留报文的原始 ingress 时间。对于普通本地包，worker 0 在等待 scope 锁之前读取一次服务时钟，TCP 处理、定时期限检查和逐包回退共用这个时间。worker 1 沿用本轮服务时间。定时器到期则结束前一批次，在处理下一包之前推进定时器。每个候选报文在 scope 锁内检查准入是否正在关闭，以及已完成的 UDP 任务是否仍占用共享预算。命中任一条件就解锁并走逐包接收。已完成的 UDP 任务在报文准入前以及 TCP supervisor 为新流任务预留预算前回收。即使没有后续流量，定期维护及关停也会回收已完成的工作。
 
 重组通过本地不回绕 incarnation 将身份保留到完成包及 timeout 输出。最早输入
 时间控制原 fragment deadline 和返回快照；最晚实际分片输入时间才是完整报文
 开始协议处理及原两秒 Core 路由等待窗的时间。排队服务不会重启任一期限。
-realm 的半开、control、UDP 与 ICMP 总限额仍共享；下述 singleton capture
-helper 保留原总量，物理 capture 仅在其 Stack owner 之间分配，不复制上限。
+realm 的半开、UDP 与 ICMP 限额仍共享；各 owner 分摊流槽、Stack 内存和 waiter。control 与 bulk 输出窗口另按下述捕获预算准入。
 
 XDP owner 先注册 readiness，再重查设备与输出状态，按本轮服务后计算的最早实际义务等待。未归还 CQ、TX consumer 可见性延迟及未读/不完整 RX 保留有条件的 1ms 重试；仅已投递 FILL 不产生该重试。需要 metadata 的设备保留每秒故障检查，仍持有状态的 Core/firewall history 保留有界维护。阻塞 scope 保留原有 100ms 共享预算后备，已设期限直到服务才重置，不被无关轮询延后。shutdown intent 在阻塞的控制命令完成前即可唤醒 capture；不承诺整个进程零唤醒。
 
@@ -176,7 +174,9 @@ AF_XDP TX 仍逐包立即发布。具体的同步设备轮次只把逐包 NEED_W
 
 `control::packet_endpoint::PacketEndpoints` 消费未启动的控制面及共享同一预算的显式 scopes。supervisor 会 join scope、TCP、UDP 和退休工作；取消 shutdown 等待者不会取消已接纳清理。TCP 复用既有路由/dial/Score 路径，采用 copy relay，不伪造内核接纳或 splice。UDP 复用同一个 endpoint/source pool 和捕获的 packet reply sender，不占 reply FD。endpoint/source/foreign-reply/sniffer 键均包含 scope；packet 退休不能修改碰巧相同的内核状态。DNS 仍先执行流量策略，must/Block 保持终端性。
 
-本次私有单 worker XDP Endpoint 实验仅对唯一成员已核实为 Intel `i40e` PCI 物理功能（PF）的 realm，把已连接的 Direct TCP 流放到 XDP 事件循环转发。启动期硬件检查只界定实验范围，不授予 TCP 所有权，也不拒绝其他网卡。路由、候选拨号和连接跟踪仍在共享 runtime。内建 Direct 处理器胜出后，父任务把已连接的普通 socket 与原 packet flow 一次性交给它们的确切 owner，而非逐包交接。owner 把同一 socket 注册到自己的 reactor，先写出已嗅探的前缀，再双向转发。交接预算不足或选中其他传输时仍由共享 runtime 转发。取消须等待 owner 结束再退还 TCP 任务额度；即便捕获致命失败，也只等已交接 socket 的真实 join，不等 selector 或已导出包的 CQ。
+当 realm 只有一个已核验的 Intel `i40e` PCI 物理功能，且每个配置的 worker 都有独立 Stack owner（一个或两个）时，XDP Endpoint 可在流所属 worker 的事件循环转发已连接的 Direct TCP。路由、拨号和连接跟踪仍在共享 runtime。内建 Direct 处理器胜出后，父任务将已连接的普通 socket 和 packet flow 一次性交给确切 owner；owner 注册 socket，先写出已嗅探的前缀，再双向转发。其他传输、其他设备或可选预算不足时，仍走共享 relay。
+
+协调线程在开放捕获准入前持有两个 worker 的 relay fence。故障时两端都停止接纳 relay，并保持 runtime 运行到实际任务 join 完成。这不释放网卡尚未归还的描述符，也不把被保留的 worker 线程视为已经退出。
 
 在共享 runtime 接纳可选的 relay 父任务前，supervisor 先为原 packet flow 的退役回调预留额度。如果预算不能同时容纳回调和可选任务，占用更小的普通任务仍可接手同一条流。回调安装后持有这份额度，直到该流实际退役。
 
@@ -192,11 +192,13 @@ TUN 向 driven supervisor 传入保留的 DNS bind 候选和明确的 plain 独�
 
 XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢出且不超过 4096 字节时，TX 可用单帧（Ethernet 加最多两层 VLAN 标签）。这不代表 RX 也一定是单帧；仍须校验分散聚集（SG）能力和实际绑定。
 
-| 物理 Port | RX / control / bulk 帧数 | 每个 AF_XDP ring 的项数 | 每队列 UMEM | 每个 realm 的 bulk 帧数 |
+| 物理 Port | RX / control / bulk 帧数 | 每个 AF_XDP ring 的项数 | 每队列 UMEM | 每个 realm 的基础 bulk 帧数 |
 |---|---:|---:|---:|---:|
 | 单帧，较大 RX 档 | 512 / 32 / 480 | 1024 | 4 MiB | 256 |
 | 其他单帧设备 | 256 / 32 / 480 | 512 | 3 MiB | 256 |
 | 超过 MTU 界限，即使逻辑 realm 较小 | 256 / 32 / 224 | 256 | 2 MiB | 128 |
+
+单物理成员、两个 owner 且基础 bulk 帧数为 256 时，启动先为每个 owner 预留 128 个 bulk 和 16 个 control 帧。在开放准入之前，仅当共享预算能同时承担两侧新增帧、两个新 ledger 和数组替换峰值时，才将两侧分别升至 256 个 bulk 和 32 个 control 帧。否则两侧都保持原窗口。两种情况下 Stack 内存和流数上限均不增加。
 
 较大 RX 档仅用于 `direct: endpoint` 网关：一个物理成员、一个逻辑 realm、强制 ZeroCopy（不能是 Auto）、无 `datapath.host`，且有 1–8 个队列。从 384 MiB 捕获预算中为协议栈留出一半后，每队列还须有至少 8 MiB 余量。这是启动筛选条件，不是实际分配 8 MiB UMEM：每个 Port 的 UMEM、元数据和 ring 各按实际额度预留。打开设备前重新选择档位，运行中不调整。UMEM 保留至进程退出。网卡硬件 ring 和每轮每 realm 每类别 32 个输出的限制不变。单帧 scope 的 256 个 bulk owner 会留下 224 个 Port bulk 帧，其他 realm 和 Core 输出也可使用，不承诺吞吐或公平性。
 

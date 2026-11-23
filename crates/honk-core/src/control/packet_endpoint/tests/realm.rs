@@ -6,7 +6,7 @@ async fn physical_syn_admission_reclaims_completed_udp_task_credit() {
     use crate::xdp::{ReturnPath, worker::PeerAuthority};
 
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, mut owners) = capture_realm(1280, 1, 16, 1, &budget).unwrap();
+    let (realm, mut owners) = capture_realm(1280, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let (plane, _health) = local_plane().await;
     let (endpoints, supervisor) =
@@ -58,7 +58,7 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
     tokio::time::timeout(Duration::from_secs(15), async {
         let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
         let (realm, owners) =
-            super::super::super::netstack::capture_realm(1280, 1, 16, 2, &budget).unwrap();
+            super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
         let clients: [SocketAddr; 2] = std::array::from_fn(|worker| {
             (1..=254)
                 .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
@@ -95,7 +95,7 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
             let mut bytes = [0; 128];
             let len =
                 wire::udp::emit_packet(&mut bytes, client, destination, &[worker as u8]).unwrap();
-            let selected = endpoints
+            let (selected, _claim) = endpoints
                 .execution_owner(realm.scope(), wire::PacketView::from_slice(&bytes[..len]))
                 .unwrap();
             assert!(selected.same_owner(&realm.owners()[worker]));
@@ -127,7 +127,7 @@ async fn one_logical_realm_drives_two_owners_through_the_shared_udp_pool() {
 async fn realm_start_refuses_swapped_original_owner_capabilities() {
     let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
     let (realm, mut owners) =
-        super::super::super::netstack::capture_realm(1280, 1, 16, 2, &budget).unwrap();
+        super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     owners.swap(0, 1);
     let (plane, _health) = local_plane().await;
     let result = PacketEndpoints::start(
@@ -155,7 +155,7 @@ async fn realm_start_refuses_swapped_original_owner_capabilities() {
 async fn shared_reply_factory_resolves_each_foreign_client_to_its_actual_owner() {
     let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
     let (realm, owners) =
-        super::super::super::netstack::capture_realm(1280, 1, 16, 2, &budget).unwrap();
+        super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     let factory = Replies(Arc::from([realm.clone()]));
     let ReplySocketFd::Packet(sender) = factory
         .create(realm.scope(), "203.0.113.9:53".parse().unwrap(), None)
@@ -190,7 +190,7 @@ async fn shared_reply_factory_resolves_each_foreign_client_to_its_actual_owner()
 async fn exact_udp_source_refuses_another_worker_and_another_client() {
     let budget = MemoryBudget::new(super::super::super::netstack::CAPTURE_MEMORY);
     let (realm, owners) =
-        super::super::super::netstack::capture_realm(1280, 1, 16, 2, &budget).unwrap();
+        super::super::super::netstack::capture_realm(1280, 1, 16, 2, 1, &budget).unwrap();
     let client = (1..=254)
         .map(|last| SocketAddr::from(([192, 0, 2, last], 41000)))
         .find(|client| realm.worker_for_udp(client.ip()) == 0)

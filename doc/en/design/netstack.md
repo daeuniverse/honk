@@ -150,8 +150,7 @@ CPU and generated output share `Retained::Endpoint(OutputOwner)` and the same ex
 During physical XDP shutdown the driver discards queued, unpublished CPU output without filling the device. Published descriptors keep their original owners until a real completion; stopping a worker is not a substitute.
 
 Each physical XDP logical ingress uses one `PacketRealm` with one or two independent Stack owners.
-Queues belong permanently to `queue_id % workers`; TCP uses immutable keyed tuple
-placement and UDP uses client-address placement. Peer, DNS and UDP source identity
+Queues belong permanently to `queue_id % workers`. With two owners and one physical member, new TCP flows prefer the receiving queue. A queue change does not move a live flow, its `TIME_WAIT` state or its exported output: the scalar path checks for the retained owner before passing the packet to either Stack. Concurrent dispatches of one tuple share a bounded, temporary claim. Multi-member realms still hash the TCP tuple; UDP still hashes the client address. Peer, DNS and UDP source identity
 remain realm-scoped, while application, retirement and CQ retain the exact owner
 and FlowId. Cross-worker handoff has 64 funded cells overall and 32 queued entries
 per destination; borrowed RX never escapes its callback. Core and Host coordination
@@ -160,7 +159,7 @@ pass, not a later barrier.
 
 Physical Endpoint RX can process up to the queue's remaining allowance (at most 32 packets) under one scope lock. Each established TCP packet still goes through header and checksum validation, source admission and the Stack's verdict for its original FlowId. For a pinned peer with the same complete return path and ingress timestamp, the first validated packet updates `last_seen = max(last_seen, ingress_at)`. Repeating that update with the same timestamp gives the same result. Each subsequent validated source checks the peer authority's revision before reusing the observation. Path or conflict changes force a locked recheck, and revision saturation makes every check take the lock. No path is written back at batch end, so a later member or VLAN priority update survives.
 
-In a single-owner physical realm, an exported output lease does not prevent a new RX batch on the currently learned return path. The lease keeps its original flow and path until return. Queued CPU output or a changed return path still requires per-packet RX; a sharded realm also keeps that fallback while output is exported.
+Both single-owner and sharded physical realms can batch established TCP on the currently learned return path while output is exported. Each lease keeps its original flow and path until return. Queued CPU output requires scalar receive. If another shard changes the authoritative path, the locked recheck leaves the packet and path untouched. After releasing the batch and resolving the owner again, scalar receive checks pending output even when the incoming path matches the local snapshot.
 
 Both workers preserve each packet’s original ingress time. Worker 0 samples the service clock once for an ordinary local packet before waiting for the scope lock. TCP processing, deadline checks and scalar fallback use that same timestamp. Worker 1 uses its existing turn timestamp. A due deadline ends the preceding batch so timers run before the next packet. Under the scope lock, each candidate checks whether admission is closing or a completed UDP task may still hold shared memory. Either condition sends the packet through scalar receive after unlocking. Completed UDP tasks are joined before receive admission and before the TCP supervisor funds a stream task. Periodic maintenance and shutdown reclaim completed work even when no further packet arrives.
 
@@ -168,9 +167,7 @@ Reassembly keeps a local nonwrapping incarnation through completion and timeout
 output. Its earliest input time controls the original fragment deadline and return
 snapshot; the latest actual fragment input time starts complete-datagram protocol
 processing and the existing two-second Core route wait. Queue service never restarts
-either deadline. Realm-wide half-open, control, UDP and ICMP limits remain shared;
-the singleton capture helpers below retain their existing totals, which physical
-capture partitions between its Stack owners rather than duplicating.
+either deadline. Realm-wide half-open, UDP and ICMP limits remain shared. Flow slots, Stack memory and waiters are split between the owners. Control and bulk output windows use the capture-budget rule below.
 
 The XDP owner arms readiness before rechecking device and output state, then waits for the earliest actual obligation computed after service. Unreturned CQ, delayed TX-consumer visibility and unread/incomplete RX retain a conditional 1ms retry; posted FILL alone does not. Metadata-required devices retain their one-second failure monitor, and retained Core/firewall history keeps bounded maintenance. A blocked scope keeps its existing 100ms shared-budget fallback, armed until serviced rather than postponed by unrelated polls. Shutdown intent wakes capture before blocked command processing completes. This does not promise zero whole-process wakeups.
 
@@ -180,7 +177,9 @@ Class output export fills at most 64 caller-owned empty lease cells, preserving 
 
 `control::packet_endpoint::PacketEndpoints` consumes an unstarted control plane and explicit scopes sharing one budget. Its supervisor joins scope, TCP, UDP and retirement work; cancelling a shutdown waiter does not cancel admitted cleanup. TCP uses the existing routing/dial/Score path with copy relay, not kernel adoption or splice. UDP reuses the one endpoint/source pool and captured packet reply sender, with no reply FD. Endpoint/source/foreign-reply/sniffer keys include scope; packet retirement cannot mutate coincident kernel state. DNS still follows traffic policy before controller admission, and must/Block remain final.
 
-The private single-worker XDP Endpoint experiment runs an established Direct TCP relay on the XDP event loop only for a realm with one validated Intel `i40e` PCI physical function. The startup hardware check scopes this experiment; it does not grant TCP ownership or reject another NIC. Routing, candidate dials and connection tracking stay on the shared runtime. After the stock Direct handler wins, the parent hands the connected plain socket and the original packet flow to their exact owner once, not once per packet. The owner registers the same socket with its reactor and writes any sniffed prefix before relaying. An unfunded handoff or a different transport keeps the shared relay. Cancellation joins the owner before refunding the TCP task; even fatal capture failure waits for outstanding socket joins, not for the selector or an exported packet's CQ.
+An XDP Endpoint can run an established Direct TCP relay on its flow owner's event loop when the realm has one verified Intel `i40e` PCI physical function and one Stack owner for each configured worker (one or two). Routing, dialing and connection tracking remain on the shared runtime. After the built-in Direct handler wins, the parent hands the connected plain socket and packet flow to that specific owner, which registers the socket and writes any sniffed prefix before relaying. Other transports, devices or insufficient optional memory keep the shared relay.
+
+The coordinator retains both workers' relay fences before opening capture admission. On failure, both stop accepting relay work and their runtimes continue driving actual task joins. This does not release outstanding NIC descriptors or turn a retained worker into a joined thread.
 
 Before admitting the optional relay task on the shared runtime, the supervisor reserves the original packet flow's retirement callback. If the callback and the optional task do not both fit, the smaller ordinary task can still serve that same flow. Once installed, the callback keeps its reservation through actual flow retirement.
 
@@ -196,11 +195,13 @@ TUN passes retained DNS bind candidates and an explicit plain standalone DNS sco
 
 XDP sizes each physical Port at startup. A device qualifies for single-frame TX when `physical_mtu + 22` does not overflow and fits in 4096 bytes (Ethernet plus up to two VLAN tags). This does not prove single-frame RX; scatter/gather and bind checks still apply.
 
-| Physical Port | RX / control / bulk frames | Entries per AF_XDP ring | UMEM per queue | Bulk frames per realm |
+| Physical Port | RX / control / bulk frames | Entries per AF_XDP ring | UMEM per queue | Base bulk frames per realm |
 |---|---:|---:|---:|---:|
 | Single-frame, larger RX tier | 512 / 32 / 480 | 1024 | 4 MiB | 256 |
 | Other single-frame | 256 / 32 / 480 | 512 | 3 MiB | 256 |
 | Above the MTU bound, even with a smaller logical realm | 256 / 32 / 224 | 256 | 2 MiB | 128 |
+
+For a single-member, two-owner realm with a base of 256 bulk frames, startup first funds 128 bulk and 16 control frames per owner. Before admission opens, both windows may grow to 256 bulk and 32 control frames each if the shared budget can fund the extra frames, both ledgers and the peak array storage. Otherwise both keep the smaller windows. Neither path increases the Stack memory or flow limit.
 
 The larger RX tier requires a `direct: endpoint` gateway with one physical member, one logical realm, forced ZeroCopy (not Auto), no `datapath.host`, and 1–8 queues. After setting aside half the 384 MiB capture budget for the stack, at least 8 MiB per queue must remain. This is a startup screen, not an 8 MiB UMEM allocation: each Port reserves its actual UMEM, metadata and rings separately. Sizing is re-evaluated before opening the device, not while it is running. UMEM is retained until process exit. NIC rings and the 32-output class/realm turn limit are unchanged. A sole single-frame scope's 256 bulk owners leave 224 Port bulk frames; other realms and Core output can use that headroom. No throughput or fairness guarantee follows.
 

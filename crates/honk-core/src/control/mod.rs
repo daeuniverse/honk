@@ -143,6 +143,9 @@ pub(crate) enum EnginePhase {
 #[derive(Default)]
 pub(crate) struct ShutdownIntent {
     requested: std::sync::atomic::AtomicBool,
+    // Orders XDP relay binding and capture admission against shutdown.
+    #[cfg(target_os = "linux")]
+    capture_start: parking_lot::Mutex<()>,
     changed: tokio::sync::Notify,
 }
 
@@ -152,9 +155,34 @@ impl ShutdownIntent {
     }
 
     pub(crate) fn request(&self) {
-        self.requested
-            .store(true, std::sync::atomic::Ordering::Release);
+        {
+            #[cfg(target_os = "linux")]
+            let _start = self.capture_start.lock();
+            self.requested
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         self.changed.notify_waiters();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn lock_capture_start(&self) -> std::io::Result<parking_lot::MutexGuard<'_, ()>> {
+        let start = self.capture_start.lock();
+        if self.requested() {
+            return Err(std::io::Error::other(
+                "shutdown requested before XDP activation",
+            ));
+        }
+        Ok(start)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_capture(
+        &self,
+        admission: &std::sync::atomic::AtomicBool,
+    ) -> anyhow::Result<()> {
+        let _start = self.lock_capture_start()?;
+        admission.store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     pub(crate) async fn wait(&self) {

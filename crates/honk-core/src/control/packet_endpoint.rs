@@ -9,7 +9,7 @@ use super::dns_control::DnsUdpReply;
 use super::dns_listener::{BoundDnsListener, PreparedDnsBind};
 use super::netstack::{
     FlowIo, HostIngress, PacketDriver, PacketOwner, PacketRealm, PacketRealmPlan, PacketScope,
-    SourceWork,
+    SourceWork, TcpClaim,
 };
 use super::task_registry::TaskRegistry;
 use super::udp_endpoint::{
@@ -383,12 +383,11 @@ impl PacketEndpoints {
         let Some(realm) = self.realm(scope) else {
             return false;
         };
-        let owned = &realm.owners()[realm.worker_for_tcp(source, destination)];
         match protocol {
-            6 => match packet_lineage {
+            6 => realm.owners().iter().any(|owned| match packet_lineage {
                 None => owned.retains_tcp(source, destination),
                 Some(_) => owned.retains_tcp_with_lineage(source, destination, packet_lineage),
-            },
+            }),
             17 => self
                 .shared
                 .udp_pool
@@ -879,7 +878,7 @@ impl PacketEndpoints {
                 Ok(None) | Err(_) => Ok(PacketReceive::default()),
             };
         }
-        let scope =
+        let (scope, _claim) =
             self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
         self.shared.udp_pool.reap_tasks();
         let mut receive = |admission: &mut Option<EndpointAdmission>| -> io::Result<_> {

@@ -3,6 +3,8 @@ use honk_netstack::wire::tcp;
 use std::net::SocketAddr;
 use std::sync::{Barrier, mpsc as sync_channel};
 
+mod direct_relay;
+
 fn path() -> ReturnPath {
     ReturnPath {
         realm: 1,
@@ -17,7 +19,7 @@ fn path() -> ReturnPath {
 #[tokio::test]
 async fn physical_udp_close_during_source_validation_retires_cleanly() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let plane = crate::control::tests::support::control_plane(Config::default());
     let (endpoints, supervisor) =
@@ -65,7 +67,7 @@ async fn physical_peer_slots_reap_across_a_hole_and_relearn() {
     use futures::FutureExt as _;
 
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap();
     let plane = crate::control::tests::support::control_plane(Config::default());
     let (endpoints, supervisor) =
@@ -215,6 +217,7 @@ fn envelope(shared: &Shared, number: u8, scope: ScopeId, at: Instant) -> Envelop
         ingress_at: at,
         cell,
         body: None,
+        _claim: None,
         peer: None,
         l3_offset: 0,
         l3_length: 7,
@@ -227,6 +230,9 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
     let budget = MemoryBudget::new(32 << 20);
     let (shared, [mut first, mut second]) =
         Shared::new(2, 128, 2, &budget, Arc::new(AtomicBool::new(false))).unwrap();
+    let diagnostics = Diagnostics::new(&budget, 0, std::iter::empty()).unwrap();
+    shared.diagnostics.set(Arc::clone(&diagnostics)).unwrap();
+    assert_eq!(diagnostics.json(false)["cross_worker_handoffs"], "0");
     let scope = ScopeId::allocate().unwrap();
     let at = Instant::now();
     for number in 0..64 {
@@ -277,6 +283,7 @@ fn whole_scatter_handoff_is_fifo_and_processing_keeps_the_global_cell() {
         "a full destination returns the actual owned envelope"
     );
     drop(refused);
+    assert_eq!(diagnostics.json(true)["cross_worker_handoffs"], "96");
 }
 
 #[test]
@@ -401,19 +408,22 @@ fn checked_peer_reuses_one_timestamp_until_another_worker_moves_the_path() {
         .retain(scope, source(4000, Some(tcp::SYN)), path(), now, false)
         .unwrap();
     let mut checked = None;
-    assert!(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked));
+    assert_eq!(
+        peers.confirm_tcp::<true>(&original, scope, ack, path(), now, &mut checked),
+        Ok(true)
+    );
 
     // A validated steady ACK completes even while another thread owns the authority mutex.
     let (sent, received) = sync_channel::channel();
     std::thread::scope(|threads| {
         let guard = peers.slots.lock();
         threads.spawn(|| {
-            sent.send(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked))
+            sent.send(peers.confirm_tcp::<true>(&original, scope, ack, path(), now, &mut checked))
                 .unwrap()
         });
         let result = received.recv_timeout(Duration::from_secs(3));
         drop(guard);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(Ok(true)));
     });
     let later = now + Duration::from_millis(1);
     let mut moved = path();
@@ -421,30 +431,62 @@ fn checked_peer_reuses_one_timestamp_until_another_worker_moves_the_path() {
     moved.vlan_tci[0] |= 5 << 13;
     for saturated in [false, true] {
         if saturated {
-            let _slots = peers.slots.lock();
-            peers.revision.store(u64::MAX, Ordering::Release);
+            peers.saturate_revision_for_test();
         }
-        // The second move exercises a proof that was itself issued at saturation.
-        for _ in 0..2 {
-            std::thread::scope(|threads| {
-                threads
-                    .spawn(|| drop(peers.retain(scope, ack, moved, later, false).unwrap()))
-                    .join()
-                    .unwrap();
-            });
-            assert_eq!(peers.slots.lock()[original.slot].path, moved);
-            assert!(!peers.confirm_tcp(&original, scope, ack, moved, now, &mut checked));
-            assert!(peers.confirm_tcp(&original, scope, ack, path(), now, &mut checked));
+        assert_eq!(
+            peers.confirm_tcp::<true>(&original, scope, ack, path(), now, &mut checked),
+            Ok(true)
+        );
+        std::thread::scope(|threads| {
+            threads
+                .spawn(|| drop(peers.retain(scope, ack, moved, later, false).unwrap()))
+                .join()
+                .unwrap();
+        });
+        assert_eq!(
+            peers.confirm_tcp::<true>(&original, scope, ack, moved, now, &mut checked),
+            Ok(false)
+        );
+        assert_eq!(
+            peers.confirm_tcp::<true>(&original, scope, ack, path(), now, &mut checked),
+            Err(PeerPathChanged)
+        );
+        {
             let slots = peers.slots.lock();
-            assert_eq!(slots[original.slot].path, path());
+            assert_eq!(slots[original.slot].path, moved);
             assert_eq!(slots[original.slot].last_seen, later);
             assert_eq!(slots[original.slot].holds, 1);
         }
+        assert_eq!(
+            peers.confirm_tcp::<false>(&original, scope, ack, path(), now, &mut checked),
+            Ok(true)
+        );
+        assert_eq!(peers.slots.lock()[original.slot].path, path());
     }
+    {
+        let mut slots = peers.slots.lock();
+        slots[original.slot].conflict = Some(later);
+        peers.invalidate();
+    }
+    assert_eq!(
+        peers.confirm_tcp::<true>(&original, scope, ack, path(), now, &mut checked),
+        Ok(false)
+    );
 }
 
 fn syn(client: SocketAddr, destination: SocketAddr) -> Vec<u8> {
-    let mut packet = vec![0; 128];
+    tcp_segment(client, destination, 100, 0, tcp::SYN, &[])
+}
+
+fn tcp_segment(
+    client: SocketAddr,
+    destination: SocketAddr,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut packet = vec![0; 128 + payload.len()];
     let length = tcp::emit_packet(
         &mut packet,
         client.ip(),
@@ -452,27 +494,268 @@ fn syn(client: SocketAddr, destination: SocketAddr) -> Vec<u8> {
         &tcp::Header {
             src_port: client.port(),
             dst_port: destination.port(),
-            seq: 100,
-            ack: 0,
-            flags: tcp::SYN,
+            seq,
+            ack,
+            flags,
             window: 60000,
             urgent: 0,
             options: tcp::Options {
-                mss: Some(1460),
+                mss: (flags & tcp::SYN != 0).then_some(1460),
                 ..Default::default()
             },
         },
-        [&[], &[]],
+        [payload, &[]],
     )
     .unwrap();
     packet.truncate(length);
     packet
 }
 
+fn ipv4_halves(packet: &[u8]) -> [Vec<u8>; 2] {
+    std::array::from_fn(|part| {
+        let (offset, end, flags) = if part == 0 {
+            (0, 16, 0x2000u16)
+        } else {
+            (16, packet.len() - 20, 2)
+        };
+        let mut fragment = packet[..20].to_vec();
+        fragment.extend_from_slice(&packet[20 + offset..20 + end]);
+        let len = fragment.len() as u16;
+        fragment[2..4].copy_from_slice(&len.to_be_bytes());
+        fragment[6..8].copy_from_slice(&flags.to_be_bytes());
+        fragment[10..12].fill(0);
+        let sum = wire::checksum::checksum(&fragment[..20]);
+        fragment[10..12].copy_from_slice(&sum.to_be_bytes());
+        fragment
+    })
+}
+
+#[tokio::test]
+async fn physical_tcp_placement_follows_rx_and_recovers_migrated_scatter_quotes_and_fragments() {
+    use futures::FutureExt as _;
+    use tokio::io::AsyncReadExt;
+    for members in [1, 2] {
+        let budget = MemoryBudget::new(CAPTURE_MEMORY);
+        let (shared, mut inboxes) =
+            Shared::new(2, 1600, 2, &budget, Arc::new(AtomicBool::new(true))).unwrap();
+        let (realm, owners) = capture_realm(1500, 1, 16, 2, members, &budget).unwrap();
+        let plane = crate::control::tests::support::control_plane(Config::default());
+        let slots = crate::control::tests::support::tcp_slots(&plane);
+        let (endpoints, mut supervisor, mut drivers) = PacketEndpoints::start_driven(
+            plane,
+            vec![(realm.clone(), owners)],
+            4,
+            None,
+            ScopeId::HOST,
+        )
+        .await
+        .unwrap();
+        poll_fn(|cx| supervisor.poll_ready(cx)).await.unwrap();
+        let _held = slots
+            .clone()
+            .try_acquire_many_owned(slots.available_permits() as u32)
+            .unwrap();
+        let at = Instant::now();
+        let scope = realm.scope();
+        let ingress = Ingress {
+            scope,
+            namespace: 1,
+            ifindex: 2,
+            attachment: 1,
+            mark: MarkProvenance::BeforeSkb,
+        };
+        let path = path();
+        let mut placements = Placements::new(1, &budget).unwrap();
+        placements.entries.push(Placement {
+            realm: realm.clone(),
+            realm_id: path.realm,
+            ingress,
+            device: path.device,
+            link: LogicalLink {
+                ifindex: 2,
+                mtu: 1500,
+                mac: [4; 6],
+                path: LinkPath {
+                    physical_ifindex: 2,
+                    vlan_tci: path.vlan_tci,
+                    vlan_proto: path.vlan_proto,
+                    vlan_count: path.vlan_count,
+                },
+            },
+        });
+        assert!(shared.placements.set(Arc::new(placements)).is_ok());
+        let destination = SocketAddr::from(([198, 51, 100, 1], 443));
+        let mut clients = (41000..60000)
+            .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+            .filter(|client| realm.worker_for_tcp(*client, destination) == 0);
+        let client = clients.next().unwrap();
+        let input = |local, segments: &[&[u8]]| {
+            shared
+                .physical_endpoint(
+                    &mut None,
+                    &endpoints,
+                    &realm,
+                    local,
+                    ingress,
+                    segments,
+                    PacketView::new(segments).unwrap(),
+                    &mut [0; 1500],
+                    (at, at),
+                    path,
+                    false,
+                )
+                .unwrap()
+        };
+        let deliver = |inboxes: &mut [mpsc::Receiver<Envelope>; 2],
+                       worker: usize,
+                       original: &[u8]| {
+            let mut queued = inboxes[worker].try_recv().unwrap();
+            if matches!(queued.body, Some(PacketBody::Reassembled(_))) {
+                let ip = wire::parse_ip(queued.ip()).unwrap();
+                let expected = wire::parse_ip(original).unwrap();
+                assert_eq!(
+                    (ip.src, ip.dst, ip.proto),
+                    (expected.src, expected.dst, expected.proto)
+                );
+                assert_eq!(&queued.ip()[ip.payload], &original[expected.payload]);
+            } else {
+                assert_eq!(queued.ip(), original);
+            }
+            assert!(
+                matches!(&queued.payload, Payload::Endpoint { owner, .. } if owner.worker() == worker)
+            );
+            queued.receive_endpoint(&shared, &endpoints, at).unwrap();
+        };
+        let owner = usize::from(members == 1);
+        let first = syn(client, destination);
+        input(1, &[&first[..21], &first[21..]]);
+        if owner == 0 {
+            deliver(&mut inboxes, owner, &first);
+        }
+        assert!(inboxes.iter_mut().all(|inbox| inbox.try_recv().is_err()));
+        let actual = &realm.owners()[owner];
+        let other = &realm.owners()[1 - owner];
+        assert!(endpoints.retains_with_lineage(scope, client, destination, wire::PROTO_TCP, None));
+        assert!(!endpoints.retains_with_lineage(
+            scope,
+            client,
+            destination,
+            wire::PROTO_TCP,
+            std::num::NonZeroU64::new(1)
+        ));
+        assert!(other.poll_accept().is_none());
+        let (_, mut flow) = actual.poll_accept().unwrap();
+        actual.drive(at);
+        let reply = actual.next_output().await.unwrap();
+        let ip = wire::parse_ip(reply.packet()).unwrap();
+        let (header, _) = tcp::parse(&reply.packet()[ip.payload]).unwrap();
+        assert_eq!(header.flags, tcp::SYN | tcp::ACK);
+        let server = header.seq.wrapping_add(1);
+        let mut ptb = [0; 256];
+        let n = wire::icmp::emit_packet_too_big(
+            &mut ptb,
+            "198.51.100.2".parse().unwrap(),
+            destination.ip(),
+            1280,
+            reply.packet(),
+        )
+        .unwrap();
+        reply.release();
+        let quoted = [&ptb[..21], &ptb[21..n]];
+        assert!(retained_endpoint(
+            &endpoints,
+            scope,
+            PacketView::new(&quoted).unwrap()
+        ));
+        input(1 - owner, &quoted);
+        deliver(&mut inboxes, owner, &ptb[..n]);
+        let ack = tcp_segment(client, destination, 101, server, tcp::ACK, &[]);
+        input(1 - owner, &[&ack]);
+        deliver(&mut inboxes, owner, &ack);
+        let data = tcp_segment(client, destination, 101, server, tcp::ACK, b"physical data");
+        let [head, tail] = ipv4_halves(&data);
+        input(1, &[&head]);
+        let head = inboxes[0].try_recv().unwrap();
+        shared.dispatch_envelope(&endpoints, head).unwrap();
+        input(0, &[&tail]);
+        if owner != 0 {
+            deliver(&mut inboxes, owner, &data);
+        }
+        let mut bytes = [0; 13];
+        flow.read_exact(&mut bytes).now_or_never().unwrap().unwrap();
+        assert_eq!(&bytes, b"physical data");
+        other.drive(at);
+        assert!(
+            other
+                .poll_output(&mut Context::from_waker(std::task::Waker::noop()))
+                .is_pending()
+        );
+
+        let next_client = clients.next().unwrap();
+        let next = syn(next_client, destination);
+        assert!(!retained_endpoint(
+            &endpoints,
+            scope,
+            PacketView::from_slice(&next)
+        ));
+        let mut core =
+            honk_datapath::forward::CoreForward::new(&[ingress], Arc::clone(&budget), 1).unwrap();
+        let packet = core.receive(ingress, at, &next).unwrap().unwrap();
+        shared
+            .endpoint_packet(&endpoints, scope, 1, packet, at, path, None, None, None)
+            .unwrap();
+        if owner == 1 {
+            let duplicate = core.receive(ingress, at, &next).unwrap().unwrap();
+            shared
+                .endpoint_packet(&endpoints, scope, 0, duplicate, at, path, None, None, None)
+                .unwrap();
+            let late_ack = tcp_segment(next_client, destination, 1, 1, tcp::ACK, &[]);
+            input(0, &[&late_ack]);
+            deliver(&mut inboxes, owner, &next);
+            deliver(&mut inboxes, owner, &next);
+            let tail = inboxes[owner].try_recv().unwrap();
+            assert_eq!(tail.ip(), &late_ack);
+            assert!(
+                matches!(&tail.payload, Payload::Endpoint { owner, .. } if owner.worker() == 1)
+            );
+        }
+        assert!(actual.poll_accept().is_some());
+        assert!(actual.poll_accept().is_none());
+        assert!(other.poll_accept().is_none());
+
+        if members == 1 {
+            let fresh = (41000..60000)
+                .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
+                .find(|client| realm.worker_for_tcp(*client, destination) == 1)
+                .unwrap();
+            let [head, tail] = ipv4_halves(&syn(fresh, destination));
+            assert!(core.receive(ingress, at, &head).unwrap().is_none());
+            let complete = core.receive(ingress, at, &tail).unwrap().unwrap();
+            assert!(complete.is_reassembled());
+            shared
+                .endpoint_packet(&endpoints, scope, 1, complete, at, path, None, None, None)
+                .unwrap();
+            assert_eq!(realm.owners()[0].poll_accept().unwrap().0.client, fresh);
+            assert!(inboxes[1].try_recv().is_err());
+        }
+        drop(flow);
+        endpoints.close();
+        let (_, joined) = poll_fn(|cx| {
+            for driver in &mut drivers {
+                driver.service(cx, Instant::now());
+            }
+            supervisor.poll_join_plane(cx)
+        })
+        .await
+        .unwrap();
+        joined.unwrap();
+    }
+}
+
 #[test]
 fn two_runtime_stack_owners_join_only_after_their_exact_output_returns() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
-    let (realm, owners) = capture_realm(1500, 1, 256, 2, &budget).unwrap();
+    let (realm, owners) = capture_realm(1500, 1, 256, 2, 1, &budget).unwrap();
     let destination = SocketAddr::from(([198, 51, 100, 1], 443));
     let rendezvous = Arc::new(Barrier::new(3));
     let (send, receive) = sync_channel::channel();
@@ -606,7 +889,13 @@ async fn quiescence_waits_for_worker_to_seal_its_mailbox() {
     let budget = MemoryBudget::new(CAPTURE_MEMORY);
     let admission = Arc::new(AtomicBool::new(true));
     let (shared, [_, receiver]) = Shared::new(2, 128, 2, &budget, Arc::clone(&admission)).unwrap();
-    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, &budget).unwrap();
+    assert!(
+        shared
+            .placements
+            .set(Arc::new(Placements::new(0, &budget).unwrap()))
+            .is_ok()
+    );
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, 1, &budget).unwrap();
     let scope = realm.owner(0).unwrap().clone();
     let config = Config::default();
     let polling = AdaptivePoll::new(polling::PollingPublication::new(&config), None);
@@ -748,4 +1037,111 @@ async fn failed_retained_worker_reports_before_joining_its_live_thread() {
         "failure keeps the actual live thread in its owner"
     );
     assert!(!shared.admission.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn worker_one_panic_rejects_readiness_and_join_while_retained() {
+    // A real retained worker outlives this test, so give it its own process.
+    if crate::test_support::run_exact_in_child(
+        "HONK_XDP_WORKER_PANIC_CHILD",
+        "xdp::worker::tests::worker_one_panic_rejects_readiness_and_join_while_retained",
+    ) {
+        return;
+    }
+
+    const WAIT: Duration = Duration::from_secs(5);
+    let budget = MemoryBudget::new(CAPTURE_MEMORY);
+    let admission = Arc::new(AtomicBool::new(false));
+    let (shared, [_, receiver]) = Shared::new(2, 128, 2, &budget, Arc::clone(&admission)).unwrap();
+    assert!(
+        shared
+            .placements
+            .set(Arc::new(Placements::new(0, &budget).unwrap()))
+            .is_ok()
+    );
+    let (realm, mut owners) = capture_realm(1500, 1, 16, 1, 1, &budget).unwrap();
+    let scope = realm.owner(0).unwrap().clone();
+    let config = Config::default();
+    let polling = AdaptivePoll::new(polling::PollingPublication::new(&config), None);
+    let plane = crate::control::tests::support::control_plane(config);
+    let shutdown = plane.shutdown_intent();
+    let (endpoints, supervisor) = tokio::time::timeout(
+        WAIT,
+        PacketEndpoints::new(plane, vec![(scope.clone(), owners.pop().unwrap())], 1),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    shared.ready(0);
+    assert!(
+        shared
+            .all_ready(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    );
+    let mut worker = Worker::start(
+        Arc::clone(&shared),
+        &mut [],
+        Vec::new(),
+        endpoints.clone(),
+        receiver,
+        false,
+        polling,
+        budget,
+        shutdown,
+    )
+    .unwrap();
+    tokio::time::timeout(WAIT, poll_fn(|cx| shared.all_ready(cx)))
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Fault the internal envelope extent after the real worker has published readiness.
+    let mut fault = envelope(&shared, 1, scope.scope(), Instant::now());
+    fault.payload = Payload::Endpoint {
+        owner: scope,
+        admission: None,
+        check_output: false,
+    };
+    fault.l3_length += 1;
+    admission.store(true, Ordering::Release);
+    assert!(shared.send(1, fault).is_ok());
+    let failure = tokio::time::timeout(WAIT, poll_fn(|cx| shared.poll_quiesced(cx)))
+        .await
+        .expect("the actual worker panic must wake the coordinator")
+        .unwrap_err();
+    assert!(failure.to_string().contains("XDP worker 1 panicked"));
+    tokio::time::timeout(WAIT, async {
+        while admission.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("worker panic must close capture admission");
+    assert!(matches!(
+        shared.all_ready(&mut Context::from_waker(std::task::Waker::noop())),
+        Poll::Ready(Err(_))
+    ));
+    let joined = tokio::time::timeout(WAIT, worker.join())
+        .await
+        .expect("join must report failure without waiting for the retained thread")
+        .unwrap_err();
+    assert_eq!(joined.to_string(), failure.to_string());
+    assert!(!shared.states[1].lock().exited);
+    assert!(
+        worker
+            .thread
+            .as_ref()
+            .is_some_and(|thread| !thread.is_finished())
+    );
+
+    endpoints.close();
+    tokio::time::timeout(WAIT, supervisor.run())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        !shared.senders[1].is_closed(),
+        "the retained worker still owns its mailbox"
+    );
 }

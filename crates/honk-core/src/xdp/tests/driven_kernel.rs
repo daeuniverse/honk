@@ -1,6 +1,6 @@
 use super::*;
 use crate::control::core_forward::PolicyRead;
-use std::{os::unix::fs::MetadataExt, path::PathBuf, process::Stdio};
+use std::{net::SocketAddr, os::unix::fs::MetadataExt, path::PathBuf, process::Stdio};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines},
     process::{Child, ChildStdin, ChildStdout, Command},
@@ -33,6 +33,15 @@ with namespace('client'):
         (0x28, 0, 0, 12), (0x15, 0, 5, 0x0800), (0x30, 0, 0, 23), (0x15, 0, 3, 6),
         (0x20, 0, 0, 26), (0x15, 0, 1, 0xc6336402), (0x06, 0, 0, 0x40000), (0x06, 0, 0, 0))))
     client.setsockopt(socket.SOL_SOCKET, 26, struct.pack('HL', 8, ctypes.addressof(witness)))
+    transmit = {}
+    if sys.argv[1] == 'steer':
+        # The kernel can cache the TX queue per socket.
+        for label, priority in [('router', 0), ('config', 1)]:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+            sock.bind(('c0', 0))
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_PRIORITY, priority)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+            transmit[label] = sock
 with namespace('server'):
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -41,7 +50,7 @@ with namespace('server'):
     transit = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
     transit.bind(('s0', 0))
     transit.setsockopt(263, 23, 1) # PACKET_IGNORE_OUTGOING: the independent WAN pump is not this peer.
-for sock in (client, listener, transit):
+for sock in (client, listener, transit, *transmit.values()):
     sock.settimeout(8)
 os.close(home)
 
@@ -59,7 +68,8 @@ def send(protocol, body, source='192.0.2.99'):
     body = body[:offset] + struct.pack('!H', checksum(pseudo + body) or 65535) + body[offset + 2:]
     ip = struct.pack('!BBHHHBBH4s4s', 0x45, 0, 20 + len(body), 1234, 0, 64, protocol, 0, source, destination)
     ip = ip[:10] + struct.pack('!H', checksum(ip)) + ip[12:]
-    client.send(bytes.fromhex('0200000000100200000000200800') + ip + body)
+    sender = transmit[label] if transmit else client
+    sender.send(bytes.fromhex('0200000000100200000000200800') + ip + body)
 
 def backlog_drops():
     with open('/proc/net/softnet_stat') as stat:
@@ -118,18 +128,11 @@ def exact(sock, expected):
 print('READY', flush=True)
 connection = None
 connections = 0
-selected_ports = {}
 for line in sys.stdin:
     command, label = line.strip().split()
-    if command == 'PORT':
-        name, number = label.split(':')
-        selected_ports[name] = int(number)
-        print('PORT ' + label, flush=True)
-        continue
     if command == 'CONNECT':
         connections += 1
         port = 41084 if label == 'router' else 41085 if label == 'config' else 42000 + connections
-        port = selected_ports.get(label, port)
         sequence, acknowledgment = 100 if label == 'router' else 10000 if label == 'config' else connections * 20000, 0
         tcp(2)
         print(label + ': SYN sent', file=sys.stderr, flush=True)
@@ -222,7 +225,7 @@ for line in sys.stdin:
         print('FORWARDED ' + label, flush=True)
     elif command == 'STOP':
         assert connection is None
-        for sock in (client, listener, transit):
+        for sock in (client, listener, transit, *transmit.values()):
             sock.close()
         print('STOPPED ' + label, flush=True)
         break
@@ -239,9 +242,10 @@ struct Peer {
 }
 
 impl Peer {
-    fn spawn() -> anyhow::Result<Self> {
+    fn spawn(steer_queues: bool) -> anyhow::Result<Self> {
         let mut child = Command::new("python3")
             .args(["-u", "-c", PEER])
+            .arg(if steer_queues { "steer" } else { "default" })
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -352,8 +356,7 @@ async fn start_runtime(
                 continue;
             };
             let members: Vec<usize> = workers
-                .placements
-                .lock()
+                .placements()
                 .iter()
                 .filter(|placement| placement.realm.scope() == scope)
                 .map(|placement| placement.device)
@@ -446,22 +449,21 @@ async fn start_runtime(
             runtime.core.is_some(),
             runtime.polling.participant(),
             Arc::clone(&runtime.polling_budget),
-            shutdown,
+            Arc::clone(&shutdown),
         )?);
     }
     runtime.workers.ready(0);
     let readiness = Arc::clone(&runtime.workers);
     let timer = None;
     tokio::pin!(timer);
-    loop {
-        tokio::select! {
-            ready = async {
-                poll_fn(|cx| owner.poll_ready(cx)).await?;
-                poll_fn(|cx| readiness.all_ready(cx)).await
-            } => { ready?; break; }
-            () = poll_fn(|cx| runtime.poll_scopes(cx, timer.as_mut())) => tokio::task::yield_now().await,
-        }
-    }
+    wait_capture_startup(
+        &readiness,
+        false,
+        &shutdown,
+        |cx| owner.poll_ready(cx),
+        |cx| runtime.poll_scopes(cx, timer.as_mut()),
+    )
+    .await?;
     for device in &mut runtime.devices {
         std::fs::write(
             artifacts.join(format!("driven-runtime.{}.data-id", device.info.name)),
@@ -542,8 +544,13 @@ async fn start_runtime(
         }
         host.admit(&runtime.pname_support)?;
     }
-    runtime.admission.store(true, Ordering::Release);
-    runtime.endpoints.capture_ready()?;
+    runtime.activate_capture(
+        &shutdown,
+        config
+            .datapath
+            .as_ref()
+            .and_then(|datapath| datapath.direct),
+    )?;
     Ok((runtime, owner))
 }
 
@@ -582,21 +589,7 @@ where
     tokio::pin!(notification);
     let mut output = None;
     let mut pending_reader = false;
-    let mut armed_driver_timer = false;
-    let control = runtime.polling.test_control();
-    if hold != Hold::Released {
-        control.clear_pending();
-    }
     loop {
-        if let Some(wait) = control.pending_wait()
-            && wait.reading
-            && wait.idle_ports
-            && !wait.pending_outputs
-            && let Some(due) = wait.driver_deadline
-            && wait.armed_deadline == Some(tokio::time::Instant::from_std(due))
-        {
-            armed_driver_timer = true;
-        }
         let finished = match hold {
             Hold::Released => policy.reader.is_none(),
             Hold::Contend => false,
@@ -607,10 +600,6 @@ where
                 assert!(
                     pending_reader,
                     "the real Core reader must contend during stream work"
-                );
-                assert!(
-                    armed_driver_timer,
-                    "a drained real port must sleep on the live stream timer"
                 );
                 assert!(
                     policy.reader.is_some(),
@@ -626,7 +615,7 @@ where
                 futures::poll!(read).is_pending(),
                 "actual publication reader escaped its writer"
             );
-            if pending_reader {
+            if pending_reader || hold == Hold::Held {
                 assert_eq!(policy.blocked, Some(policy.started));
             } else {
                 policy.blocked = Some(policy.started);
@@ -685,7 +674,7 @@ async fn two_worker_publication_keeps_real_endpoint_app_timer_and_close_owned() 
 async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
     let pins = guarded_pin_root();
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
-    let mut peer = Peer::spawn()?;
+    let mut peer = Peer::spawn(workers == 2)?;
     let result = tokio::time::timeout(Duration::from_secs(45), async {
         peer.expect("READY").await?;
         let mut config = honk_config::parser::parse_dae_config(
@@ -729,18 +718,6 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
         let backend = plane.policy_backend_handle();
         let shutdown = plane.shutdown_intent();
         let (mut runtime, mut owner) = start_runtime(plane, &config, &pins, &artifacts, admission, pname_support).await?;
-        let mut selected_ports = [41084u16, 41085];
-        if workers == 2 {
-            let scope = runtime.realms.iter().find(|realm| realm.link.path.physical_ifindex == runtime.devices[0].info.ifindex).unwrap().driver.scope();
-            let realm = runtime.workers.placement(scope)?.realm;
-            for (worker, selected) in selected_ports.iter_mut().enumerate() {
-                *selected = (41084..60000).find(|port| realm.worker_for_tcp(
-                    format!("192.0.2.99:{port}").parse().unwrap(), "198.51.100.2:18084".parse().unwrap()) == worker).unwrap();
-                let request = format!("{}:{}", ["router", "config"][worker], selected);
-                peer.command("PORT", &request).await?;
-                peer.expect(&format!("PORT {request}")).await?;
-            }
-        }
         let authority = runtime.core.as_ref().unwrap().authority();
         let acquire = || authority.read_policy();
         let reader = None;
@@ -754,12 +731,41 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
             blocked: None,
             resumed: None,
         };
-        for label in ["router", "config"] {
+        for (label, port) in [("router", 41084), ("config", 41085)] {
             peer.command("CONNECT", label).await?;
             drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, peer.expect(&format!("CONNECTED {label}")), Hold::Released).await?;
-            let client = format!("192.0.2.99:{}", selected_ports[usize::from(label == "config")]).parse().unwrap();
-            let destination = "198.51.100.2:18084".parse().unwrap();
-            assert!(runtime.realms.iter().any(|realm| runtime.endpoints.retains(realm.driver.scope(), client, destination, 6)), "real captured TCP belongs to Endpoint, not native/Core forwarding");
+            let client = SocketAddr::from(([192, 0, 2, 99], port));
+            let destination = SocketAddr::from(([198, 51, 100, 2], 18084));
+            let mut retained_owners = runtime
+                .workers
+                .placements()
+                .iter()
+                .find(|placement| runtime.devices[placement.device].info.name == "dut0")
+                .context("missing real LAN Endpoint realm")?
+                .realm
+                .owners()
+                .iter()
+                .filter(|scope| scope.retains_tcp(client, destination));
+            let actual_owner = retained_owners
+                .next()
+                .with_context(|| {
+                    format!("{label}: no Endpoint owner retained {client} -> {destination}")
+                })?
+                .worker();
+            assert!(
+                retained_owners.next().is_none(),
+                "{label}: multiple Endpoint owners retained {client} -> {destination}"
+            );
+            let expected_owner = usize::from(workers == 2 && label == "config");
+            assert_eq!(
+                actual_owner, expected_owner,
+                "{label}: wrong Endpoint owner for {client} -> {destination}"
+            );
+            let control = if actual_owner == 0 {
+                runtime.polling.test_control()
+            } else {
+                runtime.worker.as_ref().unwrap().test_control()
+            };
             let router_writer = if label == "router" { Some(router.write().await) } else { None };
             let config_writer = if label == "config" { Some(publication.write().await) } else { None };
             let cold = async {
@@ -780,17 +786,26 @@ async fn publication_owned_case(workers: u8) -> anyhow::Result<()> {
                     runtime.pressure.counters,
                 )
             })??;
+            let queued = policy.blocked.expect("the publication writer queued a real reader");
             let active = async {
+                let waits_before = control.driver_timer_waits();
                 peer.command("APP", label).await?;
                 peer.expect(&format!("APP {label}")).await?;
                 peer.command("RETRANSMIT", label).await?;
                 peer.expect(&format!("RETRANSMITTED {label}")).await?;
+                let waits_after = control.driver_timer_waits();
+                assert!(
+                    waits_after > waits_before,
+                    "{label}: owner {actual_owner} driver timer waits did not increase ({waits_before} -> {waits_after}) during the held exchange"
+                );
+                println!(
+                    "\nheld-stream-timer label={label} owner={actual_owner} before={waits_before} after={waits_after}"
+                );
                 peer.command("CLOSE", label).await?;
                 peer.expect(&format!("CLOSED {label}")).await
             };
             drive_until(&mut runtime, &mut owner, &mut policy, &acquire, &shutdown, active, Hold::Held).await?;
             assert_eq!(runtime.waiting.len(), 1, "the captured cold Core packet remains behind publication while the stream finishes");
-            let queued = policy.blocked.expect("the publication writer queued a real reader");
             assert_eq!(policy.started, queued);
             assert!(policy.reader.is_some());
             assert_ne!(policy.resumed, Some(queued));

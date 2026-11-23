@@ -3,34 +3,52 @@ use super::*;
 impl WorkerRuntime {
     pub(super) async fn run(&mut self) -> anyhow::Result<()> {
         for device in &mut self.devices {
-            let prepared = std::mem::take(&mut device.queues);
-            for queue in prepared {
+            for i in 0..device.queues.len() {
                 if self.shared.is_closing() {
-                    device.queues.push(queue);
-                    continue;
+                    break;
                 }
-                let Queue {
-                    id,
-                    io,
-                    observed,
-                    observed_rings,
-                } = queue;
-                let mut io = io.register()?;
+                // Registration takes the Port by value. Restore its original slot, including
+                // on failure, before any fallible FILL or kick; the thread retains every FD.
+                let queue = device.queues.swap_remove(i);
+                let (io, registered) = queue.io.register();
+                let last = device.queues.len();
+                device.queues.push(Queue { io, ..queue });
+                device.queues.swap(i, last);
+                registered?;
+                let port = device.queues[i].io.get_mut();
                 if !self.shared.is_closing() {
-                    io.get_mut().refill()?;
+                    port.refill()?;
                 }
                 if !self.shared.is_closing() {
-                    io.get_mut().kick()?;
+                    port.kick()?;
                 }
-                device.queues.push(Queue {
-                    id,
-                    io,
-                    observed,
-                    observed_rings,
-                });
             }
         }
-        self.shared.ready(1);
+        let shared = Arc::clone(&self.shared);
+        let setup = {
+            let mut state = shared.states[1].lock();
+            state.queues_registered = true;
+            state.relay_setup.take()
+        };
+        // Keep serving even while the supervisor is starting. Its failed startup needs these
+        // drivers, and optional fences must wait for the last mandatory capture reservation.
+        let drive = self.drive();
+        tokio::pin!(drive);
+        if let Some(setup) = setup {
+            shared.wake_worker(0);
+            let permission = tokio::select! {
+                result = &mut drive => return result,
+                permission = setup => permission,
+            };
+            if permission.is_err() {
+                return drive.await;
+            }
+        }
+        shared.ready(1);
+        drive.await
+    }
+
+    async fn drive(&mut self) -> anyhow::Result<()> {
         let wake = Arc::clone(&self.shared.wake[1]);
         let notification = wake.notified();
         tokio::pin!(notification);
@@ -48,7 +66,6 @@ impl WorkerRuntime {
                     let (progress, outstanding, mailbox_closed) =
                         self.poll_closing(cx, draining)?;
                     if stop && !outstanding && mailbox_closed {
-                        self.close_sockets()?;
                         return Poll::Ready(Ok(false));
                     }
                     (progress, outstanding)
@@ -73,11 +90,33 @@ impl WorkerRuntime {
                     .into_iter()
                     .chain(drain_until.filter(|&deadline| outstanding && now < deadline))
                     .min();
-                poll_deadline(timer.as_mut(), deadline, now, cx).map(|()| Ok(true))
+                let result = poll_deadline(timer.as_mut(), deadline, now, cx).map(|()| Ok(true));
+                #[cfg(test)]
+                if !closing && !retry && result.is_pending() {
+                    let driver_deadline = self
+                        .realms
+                        .iter()
+                        .filter_map(|realm| realm.driver.protocol_deadline())
+                        .min();
+                    self.shared.secondary_test_control().note_driver_timer_wait(
+                        driver_deadline,
+                        timer
+                            .as_ref()
+                            .get_ref()
+                            .as_ref()
+                            .map(tokio::time::Sleep::deadline),
+                        !self.needs_service_retry(),
+                        self.realms
+                            .iter()
+                            .any(|realm| realm.pending.iter().any(Option::is_some)),
+                    );
+                }
+                result
             })
             .await?;
             if !serviced {
-                return Ok(());
+                self.shared.join_secondary_relays().await;
+                return self.close_sockets();
             }
             tokio::task::yield_now().await;
         }
@@ -191,20 +230,7 @@ impl WorkerRuntime {
                 Poll::Ready(Some(envelope)) => envelope,
                 _ => break,
             };
-            let payload = std::mem::replace(&mut envelope.payload, Payload::Ingress);
-            let (owner, admission) = match payload {
-                Payload::Endpoint { owner, admission } => (owner, admission),
-                _ => anyhow::bail!("worker 1 received coordinator-only ingress"),
-            };
-            match self.shared.receive(
-                &self.endpoints,
-                &owner,
-                envelope.ip(),
-                envelope.ingress_at,
-                now,
-                envelope.path,
-                admission,
-            ) {
+            match envelope.receive_endpoint(&self.shared, &self.endpoints, now) {
                 Ok(report) if report.qualified_rx => {
                     qualify_packet(&mut self.qualified_rx, &mut self.qualification_unavailable);
                 }
@@ -246,6 +272,7 @@ impl WorkerRuntime {
                 if self.shared.admission.load(Ordering::Acquire) && !self.shared.is_closing() {
                     let shared = &self.shared;
                     let endpoints = &self.endpoints;
+                    let placements = &self.placements.entries;
                     let staging = &mut self.staging;
                     let mixed = self.mixed;
                     let qualified = &mut self.qualified_rx;
@@ -266,26 +293,21 @@ impl WorkerRuntime {
                                         .capture
                                         .decode(segments, metadata, queue.id)
                                         .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-                                let placement = shared
-                                    .placements
-                                    .lock()
-                                    .iter()
-                                    .find(|placement| {
-                                        placement.device == device.index
-                                            && placement.link.mac == decoded.destination_mac
-                                            && placement.link.path.vlan_count == decoded.vlan_count
-                                            && placement.link.path.vlan_proto == decoded.vlan_proto
-                                            && placement
-                                                .link
-                                                .path
-                                                .vlan_tci
-                                                .iter()
-                                                .zip(decoded.vlan_tci)
-                                                .all(|(configured, captured)| {
-                                                    configured & 0x0fff == captured & 0x0fff
-                                                })
-                                    })
-                                    .cloned();
+                                let placement = placements.iter().find(|placement| {
+                                    placement.device == device.index
+                                        && placement.link.mac == decoded.destination_mac
+                                        && placement.link.path.vlan_count == decoded.vlan_count
+                                        && placement.link.path.vlan_proto == decoded.vlan_proto
+                                        && placement
+                                            .link
+                                            .path
+                                            .vlan_tci
+                                            .iter()
+                                            .zip(decoded.vlan_tci)
+                                            .all(|(configured, captured)| {
+                                                configured & 0x0fff == captured & 0x0fff
+                                            })
+                                });
                                 let Some(placement) = placement else {
                                     batch.take();
                                     return Ok(());
@@ -303,81 +325,36 @@ impl WorkerRuntime {
                                     .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))?;
                                 let view =
                                     PacketView::new(&l3[..count]).map_err(io::Error::other)?;
-                                let worker = if mixed
-                                    && !retained_endpoint(endpoints, placement.realm.scope(), view)
-                                {
-                                    0
-                                } else {
-                                    selected_worker(&placement.realm, view)
-                                };
-                                if worker == 1 {
-                                    let bytes = if count == 1 {
-                                        l3[0]
-                                    } else {
-                                        batch.take();
-                                        view.copy_to(
-                                            0..decoded.l3_len,
-                                            &mut staging[..decoded.l3_len],
-                                        )
-                                        .ok_or_else(
-                                            || io::Error::from(io::ErrorKind::InvalidData),
-                                        )?;
-                                        &staging[..decoded.l3_len]
-                                    };
-                                    let owner = endpoints
-                                        .realm(placement.realm.scope())
-                                        .and_then(|realm| realm.owner(1))
-                                        .ok_or_else(|| {
-                                            io::Error::other("unregistered physical worker")
-                                        })?;
-                                    if !mixed
-                                        && count == 1
-                                        && let Some(report) = shared.established(
-                                            batch,
-                                            owner,
-                                            bytes,
-                                            (now, now),
-                                            path,
-                                            endpoints,
-                                        )
-                                    {
-                                        if report.qualified_rx {
-                                            qualify_packet(qualified, unavailable);
-                                        }
-                                        return Ok(());
-                                    }
+                                let scope = placement.realm.scope();
+                                if mixed && !retained_endpoint(endpoints, scope, view) {
                                     batch.take();
-                                    let report = shared
-                                        .receive(endpoints, owner, bytes, now, now, path, None)?;
-                                    if report.qualified_rx {
-                                        qualify_packet(qualified, unavailable);
-                                    }
-                                } else {
-                                    batch.take();
-                                    let cell = shared.copy(segments, metadata)?;
-                                    let ip = &cell.packet()
-                                        [decoded.l3_offset..decoded.l3_offset + decoded.l3_len];
-                                    let peer = if matches!(
-                                        wire::parse_ip(ip),
-                                        Err(wire::ParseError::Fragment)
-                                    ) {
-                                        shared.fragment_peer(placement.realm.scope(), ip, path)?
-                                    } else {
-                                        None
-                                    };
-                                    let envelope = Envelope {
-                                        ingress: placement.ingress,
-                                        scope: placement.realm.scope(),
+                                    shared.handoff_segments(
+                                        0,
+                                        placement.ingress,
+                                        scope,
+                                        &l3[..count],
+                                        now,
                                         path,
-                                        ingress_at: now,
-                                        body: None,
-                                        peer,
-                                        l3_offset: decoded.l3_offset,
-                                        l3_length: decoded.l3_len,
-                                        cell,
-                                        payload: Payload::Ingress,
-                                    };
-                                    let _ = shared.send(0, envelope);
+                                        Payload::Ingress,
+                                        None,
+                                    )?;
+                                    return Ok(());
+                                }
+                                let report = shared.physical_endpoint(
+                                    batch,
+                                    endpoints,
+                                    &placement.realm,
+                                    1,
+                                    placement.ingress,
+                                    &l3[..count],
+                                    view,
+                                    staging,
+                                    (now, now),
+                                    path,
+                                    mixed,
+                                )?;
+                                if report.qualified_rx {
+                                    qualify_packet(qualified, unavailable);
                                 }
                                 Ok(())
                             })();
@@ -479,7 +456,7 @@ impl WorkerRuntime {
         }
         if now.saturating_duration_since(self.sampled) >= Duration::from_secs(1) {
             self.sampled = now;
-            if let Some(diagnostics) = self.shared.diagnostics.lock().as_ref() {
+            if let Some(diagnostics) = self.shared.diagnostics.get() {
                 let mut base = 0;
                 for device in &self.devices {
                     for queue in &device.queues {

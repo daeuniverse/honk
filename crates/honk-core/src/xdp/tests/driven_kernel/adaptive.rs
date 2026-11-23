@@ -1761,7 +1761,7 @@ struct TcpPeer {
 impl TcpPeer {
     async fn spawn(deadline: Instant) -> anyhow::Result<Self> {
         let mut tcp = Self {
-            peer: Peer::spawn()?,
+            peer: Peer::spawn(false)?,
             deadline,
         };
         let ready = within(deadline, "actual TCP peer READY", tcp.peer.expect("READY")).await;
