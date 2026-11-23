@@ -1446,3 +1446,129 @@ fn direct_paced_none_refreshes_deadline_without_consuming_the_next_payload() {
     drop(next);
     driver.finish_turn(&mut cx, due);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_old_retirement_guard_cannot_abort_reused_flow_id() {
+    let root = MemoryBudget::new(4 << 20);
+    let (scope, owner) = auxiliary_scope(1420, &root).unwrap();
+    let mut driver = owner.hand_off();
+    let client = "192.0.2.4:40000".parse().unwrap();
+    driver.resume_auxiliary(1420, || true).unwrap();
+    let (old_flow, _) = handshake(&scope, Instant::now(), client, 1);
+    let guard = old_flow.retirement();
+    let old_id = old_flow.flow_id();
+    driver.begin_auxiliary_pause().unwrap();
+    {
+        let mut drain = pin!(driver.drain_auxiliary());
+        assert!(futures::poll!(&mut drain).is_pending());
+        drop(old_flow);
+        drain.await.unwrap();
+    }
+    driver.resume_auxiliary(1500, || true).unwrap();
+    let (new_flow, _) = handshake(&scope, Instant::now(), client, 2);
+    assert_eq!(old_id, new_flow.flow_id());
+    assert!(guard.on_retired(|| panic!("stale registration")).is_err());
+    drop(guard);
+    assert_eq!(
+        scope
+            .0
+            .inner
+            .lock()
+            .stack
+            .as_ref()
+            .unwrap()
+            .tcp_state(old_id),
+        Some(honk_netstack::TcpState::Established)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_rebind_waits_for_output_and_invalidates_retained_senders() {
+    let root = MemoryBudget::new(8 << 20);
+    let (scope, owner) = auxiliary_scope(1280, &root).unwrap();
+    let record = scope
+        .auxiliary_budget()
+        .unwrap()
+        .reserve(crate::tun::MAX_IP_BYTES + 11)
+        .unwrap();
+    let (other, other_owner) = auxiliary_scope(1500, &root).unwrap();
+    assert_eq!(root.used(), 8 << 20);
+    assert!(Arc::ptr_eq(&scope.budget(), &root));
+    let mut driver = owner.hand_off();
+    let mut other_driver = other_owner.hand_off();
+    let realm = PacketRealm::singleton(scope.clone()).unwrap();
+    let source = "203.0.113.9:443".parse().unwrap();
+    let client = "192.0.2.1:43000".parse().unwrap();
+    let offline = realm.datagram_sender(source);
+    assert!(offline.send_to(b"offline", client).await.is_err());
+    driver.resume_auxiliary(1280, || true).unwrap();
+    other_driver.resume_auxiliary(1500, || true).unwrap();
+    let old = realm.datagram_sender(source);
+    let unaffected = other.datagram_sender(source);
+    old.send_to(b"exported", client).await.unwrap();
+    let exported = output(&scope);
+    let waiting = loop {
+        let mut send = Box::pin(old.send_to(b"waiting for credit", client));
+        match futures::poll!(&mut send) {
+            Poll::Ready(result) => {
+                result.unwrap();
+            }
+            Poll::Pending => break send,
+        }
+    };
+    let work = scope.auxiliary_work().unwrap().unwrap();
+    driver.begin_auxiliary_pause().unwrap();
+    work.cancelled().await;
+    {
+        let mut drain = pin!(driver.drain_auxiliary());
+        assert!(futures::poll!(&mut drain).is_pending());
+        unaffected.send_to(b"sibling", client).await.unwrap();
+        assert!(output(&other).packet().ends_with(b"sibling"));
+        assert!(exported.packet().ends_with(b"exported"));
+        drop(exported);
+        assert!(futures::poll!(&mut drain).is_pending());
+        drop(work);
+        assert!(futures::poll!(&mut drain).is_pending());
+        let error = waiting.await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
+        assert!(error.get_ref().unwrap().is::<AuxiliaryBindingRetired>());
+        drain.await.unwrap();
+    }
+    driver.resume_auxiliary(9000, || true).unwrap();
+    assert!(offline.send_to(b"late", client).await.is_err());
+    assert!(old.send_to(b"late", client).await.is_err());
+    scope
+        .datagram_sender(source)
+        .send_to(b"replacement", client)
+        .await
+        .unwrap();
+    assert!(output(&scope).packet().ends_with(b"replacement"));
+    let last = scope.auxiliary_work().unwrap().unwrap();
+    scope.shutdown(true);
+    assert!(driver.resume_auxiliary(1500, || true).is_err());
+    driver.service_closing(&mut context(), Instant::now());
+    assert!(driver.is_returned());
+    {
+        let mut done = pin!(driver.wait_auxiliary_work());
+        assert!(futures::poll!(&mut done).is_pending());
+        drop(last);
+        done.await.unwrap();
+    }
+    drop((
+        driver,
+        other_driver,
+        old,
+        offline,
+        unaffected,
+        realm,
+        scope,
+        other,
+        owner,
+        other_owner,
+    ));
+    assert_eq!(root.used(), 4 << 20);
+    drop(record);
+    assert_eq!(root.used(), 0);
+}

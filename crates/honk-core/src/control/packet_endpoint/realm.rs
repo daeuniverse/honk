@@ -35,6 +35,38 @@ impl PacketEndpoints {
     }
 
     #[cfg(target_os = "linux")]
+    fn auxiliary_driver_scope(&self, driver: &PacketDriver) -> io::Result<ScopeId> {
+        let owner = driver
+            .sole_owner()
+            .filter(|owner| owner.is_auxiliary())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "auxiliary driver required")
+            })?;
+        self.check_owner(owner)?;
+        Ok(owner.scope())
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Retire one binding while continuing to drive its original scope.
+    pub(crate) async fn pause_auxiliary(&self, driver: &mut PacketDriver) -> io::Result<()> {
+        let scope = self.auxiliary_driver_scope(driver)?;
+        driver.begin_auxiliary_pause()?;
+        self.shared.udp_pool.retire_auxiliary_scope(scope);
+        driver.drain_auxiliary().await
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Open a fresh binding after scoped work and its output have drained.
+    pub(crate) fn resume_auxiliary(&self, driver: &mut PacketDriver, mtu: u32) -> io::Result<()> {
+        let scope = self.auxiliary_driver_scope(driver)?;
+        driver.resume_auxiliary(mtu, || {
+            // Old initializers have returned and the next binding cannot admit packets yet.
+            self.shared.sniffer_pool.clear_scope(scope);
+            self.shared.auxiliary_admission_open()
+        })
+    }
+
+    #[cfg(target_os = "linux")]
     pub(crate) fn reassemble_for_dispatch_on(
         &self,
         owner: &PacketScope,
@@ -51,6 +83,9 @@ impl PacketEndpoints {
     > {
         self.check_owner(owner)
             .map_err(|_| honk_netstack::DropReason::NotForUs)?;
+        if owner.is_auxiliary() {
+            return Err(honk_netstack::DropReason::NotForUs);
+        }
         owner.reassemble_for_dispatch_with_peer(packet, ingress_at, service_at, peer)
     }
 
@@ -72,10 +107,10 @@ impl PacketEndpoints {
         on_source: impl FnMut(ValidatedSource, bool) -> Option<crate::xdp::worker::PeerHold>,
     ) -> io::Result<PacketReceive> {
         self.check_owner(owner)?;
-        if owner.is_host() {
+        if owner.is_host() || owner.is_auxiliary() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "physical receive cannot use a Host owner",
+                "physical receive requires a physical owner",
             ));
         }
         self.shared.udp_pool.reap_tasks();
@@ -106,6 +141,7 @@ impl PacketEndpoints {
             admission,
             None,
             physical.as_ref(),
+            None,
         ) {
             Err(error)
                 if error

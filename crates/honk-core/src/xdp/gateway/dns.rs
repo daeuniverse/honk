@@ -103,6 +103,7 @@ impl Sweep {
 
 struct BankState {
     epochs: Box<[Epoch]>,
+    pending: Option<GatewayDnsFill>,
     sweep: Sweep,
     saturated_until: Option<Instant>,
     counters: GatewayDnsCounters,
@@ -128,7 +129,6 @@ pub(crate) struct GatewayDnsBank {
     bindings: Box<[(ScopeId, u32)]>,
     watermarks: Box<[AtomicU64]>,
     state: Mutex<BankState>,
-    pub(crate) pending: Mutex<Option<GatewayDnsFill>>,
     _memory: MemoryReservation,
 }
 
@@ -194,6 +194,7 @@ impl GatewayDnsBank {
             watermarks: (0..capacity).map(|_| AtomicU64::new(0)).collect(),
             state: Mutex::new(BankState {
                 epochs: vec![Epoch::default(); capacity as usize].into_boxed_slice(),
+                pending: None,
                 sweep: Sweep::default(),
                 saturated_until: None,
                 counters: GatewayDnsCounters {
@@ -202,7 +203,6 @@ impl GatewayDnsBank {
                     ..Default::default()
                 },
             }),
-            pending: Mutex::new(None),
             _memory: memory,
         }))
     }
@@ -232,22 +232,68 @@ impl GatewayDnsBank {
         state.epochs[realm as usize].rotate(watermark, |next| self.maps.set_epoch(realm, next))
     }
 
-    pub(crate) fn activate(&self) -> bool {
-        let mut state = self.state.lock();
-        let mut opened = false;
-        for &(_, realm) in &self.bindings {
-            opened |= self.rotate(&mut state, realm).is_some();
+    fn close_realm(&self, state: &mut BankState, realm: u32) {
+        let i = realm as usize;
+        if state.epochs[i].current != 0 {
+            state.epochs[i].publish(0, &self.watermarks[i], |next| {
+                self.maps.set_epoch(realm, next)
+            });
+            state.sweep.requested = true;
         }
-        opened
+        if state.pending.is_some_and(|row| row.realm == realm) {
+            state.pending = None;
+        }
+    }
+
+    pub(crate) fn activate(&self, active: impl Fn(ScopeId) -> bool) -> bool {
+        let mut state = self.state.lock();
+        let mut eligible = false;
+        let mut opened = false;
+        for &(scope, realm) in &self.bindings {
+            if active(scope) {
+                eligible = true;
+                opened |= self.rotate(&mut state, realm).is_some();
+            } else {
+                self.close_realm(&mut state, realm);
+            }
+        }
+        // An auxiliary-only bank can commit before its first link appears.
+        opened || !eligible
+    }
+
+    pub(crate) fn set_binding(&self, scope: ScopeId, active: bool) -> io::Result<()> {
+        let Some(realm) = self.realm(scope.as_u64()) else {
+            return Ok(());
+        };
+        let mut state = self.state.lock();
+        if active {
+            self.rotate(&mut state, realm)
+                .ok_or_else(|| io::Error::other("gateway DNS export epoch exhausted"))?;
+        } else {
+            self.close_realm(&mut state, realm);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn queue_fill(&self, fill: GatewayDnsFill) -> bool {
+        let Some(mut state) = self.state.try_lock() else {
+            return false;
+        };
+        if state.pending.is_some() || !state.epochs[fill.realm as usize].accepts(fill.epoch) {
+            return false;
+        }
+        state.pending = Some(fill);
+        true
+    }
+
+    pub(crate) fn take_fill(&self) -> Option<GatewayDnsFill> {
+        self.state.lock().pending.take()
     }
 
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         for &(_, realm) in &self.bindings {
-            let i = realm as usize;
-            state.epochs[i].publish(0, &self.watermarks[i], |next| {
-                self.maps.set_epoch(realm, next)
-            });
+            self.close_realm(&mut state, realm);
         }
     }
 
@@ -365,7 +411,12 @@ impl GatewayDnsBank {
         let result = self.maps.reclaim(|key| {
             self.watermarks
                 .get(key.realm_id as usize)
-                .is_some_and(|watermark| key.export_epoch < watermark.load(Ordering::Acquire))
+                .is_some_and(|watermark| {
+                    let latest = watermark.load(Ordering::Acquire);
+                    key.export_epoch < latest
+                        || (key.export_epoch == latest
+                            && self.state.lock().epochs[key.realm_id as usize].current == 0)
+                })
         });
         let mut state = self.state.lock();
         state.sweep.in_flight = false;

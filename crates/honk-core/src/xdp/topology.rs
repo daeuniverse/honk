@@ -125,6 +125,7 @@ impl CapturePlan {
     pub(crate) fn discover(interfaces: &[XdpInterface]) -> io::Result<Self> {
         let names: Vec<_> = interfaces
             .iter()
+            .filter(|interface| interface.role != InterfaceRole::L3Lan)
             .map(|interface| interface.name.clone())
             .collect();
         let realms = Self::bind_realms(capture_layout(&names)?, interfaces)?;
@@ -260,6 +261,17 @@ impl AsRawFd for CaptureTopology {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auxiliary_names_are_not_physical_capture_roots() {
+        let plan = CapturePlan::discover(&[XdpInterface {
+            name: "aux0".into(),
+            role: InterfaceRole::L3Lan,
+        }])
+        .unwrap();
+        assert!(plan.realms().is_empty());
+        assert!(plan.members().is_empty());
+    }
 
     #[test]
     fn bond_members_map_to_one_logical_vlan_realm() {

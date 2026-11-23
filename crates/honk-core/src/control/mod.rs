@@ -39,6 +39,8 @@ pub use poll_budget::{PollBudgetBinding, PollBudgetPublisher, ProcessPollBudget}
 mod runtime;
 mod shutdown;
 mod task_registry;
+#[cfg(target_os = "linux")]
+pub(crate) use task_registry::TASK_BOOKKEEPING;
 #[cfg(test)]
 pub(crate) mod tests;
 #[cfg(test)]

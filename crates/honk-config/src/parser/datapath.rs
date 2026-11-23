@@ -57,7 +57,7 @@ pub(super) fn parse_section(
                                     entry.header_span(),
                                     crate::diagnostic::Severity::Error,
                                     "nested-interface-block",
-                                    "interface entries must be name: lan or wan without a body",
+                                    "interface entries must be name: lan, wan or l3_lan without a body",
                                 );
                                 diagnostic.setting =
                                     crate::diagnostic::SettingPath::new("datapath")
@@ -71,10 +71,11 @@ pub(super) fn parse_section(
                             }
                             let (name, role) = read::Text::segment(&entry)
                                 .kv()
-                                .ok_or_else(|| invalid("expected interface: lan or wan"))?;
+                                .ok_or_else(|| invalid("expected interface: lan, wan or l3_lan"))?;
                             let role = match role.unquote().raw() {
                                 "lan" => InterfaceRole::Lan,
                                 "wan" => InterfaceRole::Wan,
+                                "l3_lan" => InterfaceRole::L3Lan,
                                 _ => return Err(invalid("unknown interface role")),
                             };
                             config.interfaces.push(XdpInterface {

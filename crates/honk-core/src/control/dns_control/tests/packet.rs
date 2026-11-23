@@ -167,3 +167,159 @@ async fn packet_dns_registration_requires_one_shared_budget_without_partial_owne
         controller.shutdown(Duration::from_secs(1)).await;
     }
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn auxiliary_rebind_fences_a_cached_query_waiting_for_publication() {
+    use crate::dns::runtime::{
+        DnsRuntime, DnsRuntimeParts, RoutingProjectionSnapshot, RuntimeGeneration,
+    };
+
+    let ip = [192, 0, 2, 17];
+    let query = query_with_txid("example.com", 1);
+    let (controller, upstream) = test_controller(a_response(&query, ip), Duration::ZERO);
+    let router = Arc::new(
+        Router::from_config(
+            &honk_config::parser::parse_dae_config(
+                "routing { domain(suffix: example.com) -> block\n fallback: direct }",
+            )
+            .unwrap()
+            .routing,
+        )
+        .unwrap(),
+    );
+    let provider = controller.runtime_provider();
+    let publish_runtime = |generation| {
+        let snapshot = Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            Arc::clone(&router),
+        ));
+        provider.publish(DnsRuntime::new(DnsRuntimeParts {
+            generation: RuntimeGeneration::new(generation),
+            forwarder: controller.forwarder(),
+            routing_projection: Arc::clone(&snapshot),
+            outbound_runtime: None,
+            transport: Arc::new(NoopRuntimeTransport),
+        }));
+        snapshot
+    };
+    let projection = &controller.routing_projection;
+    let aux = ScopeId::allocate().unwrap();
+    let lan = ScopeId::allocate().unwrap();
+    let root = honk_netstack::MemoryBudget::new(4096);
+    projection.register_aux_scopes(&[aux], &root).unwrap();
+    projection
+        .register_packet_scopes([lan, aux].into_iter(), &root)
+        .unwrap();
+    assert!(controller.try_admit_packet_query(false, aux).is_err());
+    projection.set_aux_binding(aux, true).unwrap();
+    let initial = publish_runtime(1);
+    projection
+        .prepare_snapshot_publication()
+        .commit(initial, None);
+    for scope in [lan, aux] {
+        let admission = controller.try_admit_packet_query(false, scope).unwrap();
+        let answer = controller
+            .answer_query(
+                &admission,
+                &query,
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Tcp,
+            )
+            .await;
+        assert!(answer.wire().ends_with(&ip));
+    }
+    let fact = |scope, generation| {
+        projection
+            .packet_facts()
+            .lookup(scope, ip.into(), &router, generation)
+            .unwrap()
+    };
+    let (Some(_), physical_stamp) = fact(lan, 1) else {
+        panic!("missing physical fact")
+    };
+    let (Some(_), old_stamp) = fact(aux, 1) else {
+        panic!("missing auxiliary fact")
+    };
+
+    let next = publish_runtime(2);
+    let held = controller.try_admit_packet_query(false, aux).unwrap();
+    let outcome = controller
+        .dns_service()
+        .resolve_client_outcome_with_runtime(
+            &held.runtime,
+            &query,
+            DnsRequestMeta::EMPTY,
+            IngressProfile::Tcp,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.provenance(), crate::dns::outcome::Provenance::Cache);
+    let delayed = controller.project_answer(&held.runtime, held.projection_scope, outcome);
+    tokio::pin!(delayed);
+    assert!(futures::poll!(delayed.as_mut()).is_pending());
+    let address = "192.0.2.53:53".parse().unwrap();
+    let peer = "192.0.2.1:41000".parse().unwrap();
+    let (mut packet_client, mut packet_stream) = tokio::io::duplex(512);
+    crate::dns::transport::write_length_prefixed(&mut packet_client, &query)
+        .await
+        .unwrap();
+    let packet_tcp = controller.handle_packet_tcp_dns(&mut packet_stream, peer, address, aux);
+    tokio::pin!(packet_tcp);
+    assert!(futures::poll!(packet_tcp.as_mut()).is_pending());
+    projection.set_aux_binding(aux, false).unwrap();
+    assert!(!projection.packet_facts().is_current(old_stamp));
+    assert!(projection.packet_facts().is_current(physical_stamp));
+    let (_offline_client, mut offline_stream) = tokio::io::duplex(512);
+    let error = controller
+        .handle_packet_tcp_dns(&mut offline_stream, peer, address, aux)
+        .await
+        .unwrap_err();
+    assert!(error.is::<PacketDnsScopeRetired>());
+    projection.set_aux_binding(aux, true).unwrap();
+    assert!(
+        controller
+            .try_admit_bound_query(false, Some(held.projection_scope))
+            .is_err()
+    );
+    let (mut client, mut stream) = tcp_pair().await;
+    let peer = stream.peer_addr().unwrap();
+    write_tcp_query(&mut client, &query).await;
+    tokio::io::AsyncWriteExt::shutdown(&mut client)
+        .await
+        .unwrap();
+    controller
+        .serve_bound_tcp_dns(&mut stream, peer, held.projection_scope)
+        .await
+        .unwrap();
+    drop(stream);
+    let mut reply = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut client, &mut reply)
+        .await
+        .unwrap();
+    assert!(reply.is_empty());
+    projection.prepare_snapshot_publication().commit(next, None);
+    let error = tokio::time::timeout(Duration::from_secs(1), packet_tcp)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(error.is::<PacketDnsScopeRetired>());
+    let mut byte = [0; 1];
+    let mut read = std::pin::pin!(tokio::io::AsyncReadExt::read(&mut packet_client, &mut byte));
+    assert!(futures::poll!(&mut read).is_pending());
+    assert!(delayed.await.unwrap().wire().ends_with(&ip));
+    assert!(fact(aux, 2).0.is_none());
+    let late = controller
+        .answer_query(&held, &query, DnsRequestMeta::EMPTY, IngressProfile::Tcp)
+        .await;
+    assert!(late.wire().ends_with(&ip));
+    assert!(fact(aux, 2).0.is_none());
+    assert!(fact(lan, 2).0.is_some());
+    let fresh = controller.try_admit_packet_query(false, aux).unwrap();
+    controller
+        .answer_query(&fresh, &query, DnsRequestMeta::EMPTY, IngressProfile::Tcp)
+        .await;
+    assert!(fact(aux, 2).0.is_some());
+    assert_eq!(upstream.calls.load(Ordering::SeqCst), 1);
+}

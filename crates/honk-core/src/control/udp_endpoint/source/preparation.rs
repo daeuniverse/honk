@@ -35,7 +35,9 @@ impl SourcePreparation {
     ) -> anyhow::Result<SourceAttachment> {
         match self {
             Self::Reused(attachment) => {
-                if attachment.owner.is_ready() {
+                if attachment.owner.is_ready()
+                    && packet_binding_active(attachment.owner.packet_source.as_ref())
+                {
                     attachment.owner.transport.observe_reuse();
                     Ok(attachment)
                 } else {
@@ -57,7 +59,9 @@ impl SourcePreparation {
                 let mut prepared = Some(prepared);
                 let mut transport = None;
                 loop {
-                    if pool.terminal.load(Ordering::Acquire) {
+                    if pool.terminal.load(Ordering::Acquire)
+                        || !packet_binding_active(packet_source.as_ref())
+                    {
                         return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                     }
                     let changed = pool.source_changed.notified();
@@ -97,7 +101,11 @@ impl SourcePreparation {
                         if tasks.closed || pool.terminal.load(Ordering::Acquire) {
                             return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
                         }
-                        match pool.sources.entry(scope.clone()) {
+                        let entry = pool.sources.entry(scope.clone());
+                        if !packet_binding_active(packet_source.as_ref()) {
+                            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+                        }
+                        match entry {
                             dashmap::mapref::entry::Entry::Occupied(entry) => {
                                 let owner = Arc::clone(entry.get());
                                 drop(entry);

@@ -181,17 +181,31 @@ pub(super) struct DeadlineEntry {
 pub(super) struct PacketFactScope {
     scope: ScopeId,
     revision: u64,
+    // Zero is a permanent scope. Auxiliary incarnations start offline (odd).
+    // Every close/open advances it. The last representable value is closed.
+    binding: u64,
 }
 
 impl PacketFactScope {
     pub(super) fn new(scope: ScopeId) -> Self {
-        Self { scope, revision: 0 }
+        Self {
+            scope,
+            revision: 0,
+            binding: 0,
+        }
     }
+}
+
+struct AuxiliaryRegistration {
+    scopes: Box<[ScopeId]>,
+    root: Arc<honk_netstack::MemoryBudget>,
+    _charge: honk_netstack::MemoryReservation,
 }
 
 #[derive(Default)]
 struct PacketScopes {
     entries: Box<[PacketFactScope]>,
+    auxiliary_registration: Option<AuxiliaryRegistration>,
     #[cfg(target_os = "linux")]
     bank: Option<Arc<super::GatewayDnsBank>>,
 }
@@ -271,17 +285,73 @@ impl DesiredState {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn register_aux_scopes(
+        &mut self,
+        scopes: &[ScopeId],
+        budget: &Arc<honk_netstack::MemoryBudget>,
+    ) -> std::io::Result<()> {
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        if !self.packet_scopes.entries.is_empty()
+            || self.packet_scopes.auxiliary_registration.is_some()
+            || scopes
+                .iter()
+                .enumerate()
+                .any(|(i, scope)| *scope == ScopeId::HOST || scopes[..i].contains(scope))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid auxiliary DNS scope registration",
+            ));
+        }
+        let charge = budget
+            .reserve(std::mem::size_of_val(scopes))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    "auxiliary DNS scope registration memory capacity",
+                )
+            })?;
+        self.packet_scopes.auxiliary_registration = Some(AuxiliaryRegistration {
+            scopes: scopes.into(),
+            root: Arc::clone(budget),
+            _charge: charge,
+        });
+        Ok(())
+    }
+
     pub(super) fn register_packet_scopes(
         &mut self,
-        scopes: Box<[PacketFactScope]>,
-        charge: honk_netstack::MemoryReservation,
+        scopes: impl ExactSizeIterator<Item = ScopeId>,
+        budget: &Arc<honk_netstack::MemoryBudget>,
     ) -> anyhow::Result<()> {
         if !self.packet_scopes.entries.is_empty() {
-            // Parameters otherwise drop the charge before the rejected table.
-            drop(scopes);
             anyhow::bail!("packet DNS scopes are already registered");
         }
-        self.packet_scopes.entries = scopes;
+        let bytes = std::alloc::Layout::array::<PacketFactScope>(scopes.len())?.size();
+        let charge = budget
+            .reserve(bytes)
+            .ok_or_else(|| anyhow::anyhow!("packet DNS scope registration memory capacity"))?;
+        let mut table: Box<[_]> = scopes.map(PacketFactScope::new).collect();
+        if let Some(aux) = &self.packet_scopes.auxiliary_registration {
+            anyhow::ensure!(
+                Arc::ptr_eq(&aux.root, budget),
+                "auxiliary DNS scopes must share the capture budget"
+            );
+            for scope in &aux.scopes {
+                let entry = table
+                    .iter_mut()
+                    .find(|entry| entry.scope == *scope)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("auxiliary DNS scope missing from packet registration")
+                    })?;
+                entry.binding = 1;
+            }
+            self.packet_scopes.auxiliary_registration.take();
+        }
+        self.packet_scopes.entries = table;
         self._packet_scope_charge = Some(charge);
         Ok(())
     }
@@ -295,6 +365,66 @@ impl DesiredState {
                 .any(|entry| entry.scope == scope)
     }
 
+    pub(super) fn packet_query_scope(&self, scope: ScopeId) -> Option<super::QueryScope> {
+        let entry = self
+            .packet_scopes
+            .entries
+            .iter()
+            .find(|entry| entry.scope == scope)?;
+        (entry.binding & 1 == 0).then_some(super::QueryScope {
+            scope,
+            binding: entry.binding,
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_aux_binding(&mut self, scope: ScopeId, active: bool) -> std::io::Result<()> {
+        let entry = self
+            .packet_scopes
+            .entries
+            .iter_mut()
+            .find(|entry| entry.scope == scope && entry.binding != 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unregistered auxiliary DNS scope",
+                )
+            })?;
+        if (entry.binding & 1 == 0) == active {
+            return Ok(());
+        }
+        let next = entry
+            .binding
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("auxiliary DNS binding identity exhausted"))?;
+        if let Some(bank) = &self.packet_scopes.bank {
+            bank.set_binding(scope, active)?;
+        }
+        entry.binding = next;
+        if !active {
+            PacketScopes::advance_revision(entry);
+            let scope = scope.as_u64();
+            for family in &mut self.owners {
+                if let Some(owners) = family.remove(&scope) {
+                    for owner in owners.into_values() {
+                        for ip in owner.ips {
+                            let key = ProjectionIp::in_scope(scope, ip);
+                            if self.reverse.remove(&key).is_some() {
+                                self.desired.remove(&key);
+                                self.zero_ips.remove(&key);
+                            }
+                        }
+                    }
+                }
+            }
+            self.expiry_deadlines
+                .retain(|Reverse(row)| row.scope != scope);
+            self.eviction_order
+                .retain(|Reverse((_, owner_scope, _, _))| *owner_scope != scope);
+        }
+        Ok(())
+    }
+
     pub(super) fn packet_fact(
         &mut self,
         scope: ScopeId,
@@ -306,9 +436,9 @@ impl DesiredState {
             .packet_scopes
             .entries
             .iter()
-            .find(|entry| entry.scope == scope)
+            .find(|entry| entry.scope == scope && entry.binding & 1 == 0)
             .map(|entry| entry.revision)
-            .ok_or_else(|| anyhow::anyhow!("packet DNS fact scope is not registered"))?;
+            .ok_or_else(|| anyhow::anyhow!("packet DNS fact scope is unavailable"))?;
         anyhow::ensure!(
             revision != u64::MAX,
             "packet DNS fact revision is exhausted"
@@ -352,7 +482,7 @@ impl DesiredState {
             bank.close();
             return false;
         }
-        if !bank.activate() {
+        if !bank.activate(|scope| self.packet_query_scope(scope).is_some()) {
             return false;
         }
         self.packet_scopes.bank = Some(Arc::clone(bank));

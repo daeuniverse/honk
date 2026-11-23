@@ -1,6 +1,37 @@
 use super::*;
 use crate::config_diagnostics::DiagnosticUpdate;
 
+// After the first real flags write, cancellation must force the next reload through full
+// publication. Only that writer may restore flags and reopen the previous or committed generation.
+struct AuxiliaryReload<'a> {
+    admission: Option<(&'a ControlPlane, &'a DrainTracker)>,
+}
+
+impl AuxiliaryReload<'_> {
+    fn finish(mut self, outcome: ReloadOutcome) -> ReloadOutcome {
+        self.admission = None;
+        outcome
+    }
+}
+
+impl Drop for AuxiliaryReload<'_> {
+    fn drop(&mut self) {
+        if let Some((plane, request)) = self.admission {
+            // The publisher checks health and replaces its neutral TCX program under this
+            // same gate. If shutdown has already started, no future bind can acquire it.
+            #[cfg(target_os = "linux")]
+            let _start = plane.shutdown_requested.lock_capture_start().ok();
+            plane
+                .datapath_healthy
+                .store(false, std::sync::atomic::Ordering::Release);
+            #[cfg(target_os = "linux")]
+            plane.packet_routing_projection().close_gateway_dns();
+            plane.drain_tracker.start_rejecting();
+            request.start_rejecting();
+        }
+    }
+}
+
 #[cfg(test)]
 pub(in crate::control) struct PreDnsPublicationHookGuard<'a> {
     hook: &'a parking_lot::Mutex<Option<PreDnsPublicationHook>>,
@@ -246,10 +277,20 @@ impl ControlPlane {
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
         #[cfg(target_os = "linux")]
-        let gateway_dns_enabled = current_config
-            .datapath
-            .as_ref()
-            .is_some_and(|datapath| datapath.effective_dns_projection());
+        let gateway_auxiliary = current_config.datapath.as_ref().is_some_and(|datapath| {
+            datapath
+                .interfaces
+                .iter()
+                .any(|interface| interface.role == honk_config::datapath::InterfaceRole::L3Lan)
+        });
+        #[cfg(all(not(target_os = "linux"), feature = "native-api"))]
+        let gateway_auxiliary = false;
+        #[cfg(target_os = "linux")]
+        let gateway_dns_enabled = gateway_auxiliary
+            || current_config
+                .datapath
+                .as_ref()
+                .is_some_and(|datapath| datapath.effective_dns_projection());
         let same_datapath_setup = match (&current_config.datapath, &new_config.datapath) {
             (None, None) => true,
             (Some(current), Some(candidate)) => current.same_device_setup(candidate),
@@ -366,16 +407,53 @@ impl ControlPlane {
                 {
                     return Ok(ReloadOutcome::Rejected);
                 }
+                let generation = self.diagnostics.read().generation;
                 #[cfg(feature = "native-api")]
-                if replaces_sources && let Some(flags) = &self.datapath_flags {
-                    let mut mode = flags.publication().await;
+                let reset = self.datapath_flags.as_ref().filter(|_| replaces_sources);
+                #[cfg(feature = "native-api")]
+                let needs_datapath = reset.is_some() || gateway_auxiliary;
+                #[cfg(all(not(feature = "native-api"), target_os = "linux"))]
+                let needs_datapath = gateway_auxiliary;
+                #[cfg(any(feature = "native-api", target_os = "linux"))]
+                if needs_datapath {
+                    #[cfg(feature = "native-api")]
+                    let mut mode = match reset {
+                        Some(flags) => Some(flags.publication().await),
+                        None => None,
+                    };
                     let mut backend = self.ebpf.write().await;
-                    if let Err(error) = mode.reset_for_activation(backend.as_mut()) {
-                        warn!(%error, "reload rejected: runtime mode reset failed");
+                    #[cfg(target_os = "linux")]
+                    let verified = if gateway_auxiliary {
+                        let fingerprint = self.active_routing_plan.read().fingerprint;
+                        backend.userspace_mut().and_then(|gateway| {
+                            gateway
+                                .verify_gateway_auxiliary(fingerprint, generation)
+                                .map_err(Into::into)
+                        })
+                    } else {
+                        Ok(())
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let verified: anyhow::Result<()> = Ok(());
+                    #[cfg(feature = "native-api")]
+                    let verified = verified.and_then(|()| match &mut mode {
+                        Some(publication) => publication.reset_for_activation(backend.as_mut()),
+                        None => Ok(()),
+                    });
+                    if let Err(error) = verified {
+                        warn!(%error, "unchanged reload failed gateway verification or mode reset");
+                        #[cfg(target_os = "linux")]
+                        if gateway_auxiliary {
+                            if let Ok(gateway) = backend.userspace_mut() {
+                                gateway.degrade_gateway_dns();
+                            }
+                            self.datapath_healthy
+                                .store(false, std::sync::atomic::Ordering::Release);
+                            self.stop_reload_rejection_if_healthy(drain);
+                        }
                         return Ok(ReloadOutcome::Rejected);
                     }
                 }
-                let generation = self.diagnostics.read().generation;
                 if !matches!(&diagnostic_update, DiagnosticUpdate::Preserve) {
                     self.diagnostics.write().buckets.apply(diagnostic_update);
                     #[cfg(feature = "native-api")]
@@ -670,7 +748,14 @@ impl ControlPlane {
             .write()
             .await
             .mark_datapath_flags_write_origin(crate::ebpf::DatapathFlagsWriteOrigin::FenceNfqueue);
-        if let Err(error) = datapath_flags.fence_nfqueue().await {
+        let fenced = datapath_flags.fence_nfqueue().await;
+        let completion = AuxiliaryReload {
+            #[cfg(target_os = "linux")]
+            admission: gateway_auxiliary.then_some((self, drain)),
+            #[cfg(not(target_os = "linux"))]
+            admission: None,
+        };
+        if let Err(error) = fenced {
             error!(error = %format_args!("{error:#}"), "failed to fence NFQUEUE before reload");
             self.close_and_drain_pending_udp_admission().await;
             // Nothing was torn down yet: restore the old flags and keep
@@ -680,9 +765,11 @@ impl ControlPlane {
                 drain,
                 #[cfg(target_os = "linux")]
                 gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
             )
             .await;
-            return Ok(ReloadOutcome::Rejected);
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         drain.start_rejecting();
         #[cfg(feature = "ebpf")]
@@ -696,9 +783,11 @@ impl ControlPlane {
                 drain,
                 #[cfg(target_os = "linux")]
                 gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
             )
             .await;
-            return Ok(ReloadOutcome::Rejected);
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         #[cfg(feature = "ebpf")]
         if let Some(pending) = self.pending_udp_verdicts.as_ref() {
@@ -711,9 +800,11 @@ impl ControlPlane {
                 drain,
                 #[cfg(target_os = "linux")]
                 gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
             )
             .await;
-            return Ok(ReloadOutcome::Rejected);
+            return Ok(completion.finish(ReloadOutcome::Rejected));
         }
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
@@ -763,6 +854,11 @@ impl ControlPlane {
                 drop(old_projection);
                 let provider = self.dns_controller.runtime_provider();
 
+                #[cfg(target_os = "linux")]
+                if gateway_auxiliary && let Ok(backend) = ebpf.userspace_mut() {
+                    // No await from suspending this generation to its canonical commit or rejection.
+                    backend.pause_gateway_auxiliary();
+                }
                 let transition_group_count =
                     current_config.groups.len().max(new_config.groups.len());
                 if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
@@ -930,9 +1026,11 @@ impl ControlPlane {
                     drain,
                     #[cfg(target_os = "linux")]
                     gateway_dns_enabled,
+                    #[cfg(target_os = "linux")]
+                    gateway_auxiliary,
                 )
                 .await;
-                return Ok(ReloadOutcome::Rejected);
+                return Ok(completion.finish(ReloadOutcome::Rejected));
             }
         };
         if !old_plan.semantically_eq(&new_plan) && (old_has_direct_marks || new_has_direct_marks) {
@@ -969,13 +1067,15 @@ impl ControlPlane {
                 None,
                 #[cfg(target_os = "linux")]
                 gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
             )
             .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return Ok(ReloadOutcome::CommittedDegraded {
+            return Ok(completion.finish(ReloadOutcome::CommittedDegraded {
                 generation: generation.get(),
-            });
+            }));
         }
         self.open_pending_udp_admission();
         #[cfg(test)]
@@ -990,13 +1090,15 @@ impl ControlPlane {
                 None,
                 #[cfg(target_os = "linux")]
                 gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
             )
             .await;
             drain.start_rejecting();
             self.drain_tracker.start_rejecting();
-            return Ok(ReloadOutcome::CommittedDegraded {
+            return Ok(completion.finish(ReloadOutcome::CommittedDegraded {
                 generation: generation.get(),
-            });
+            }));
         }
         info!("Configuration applied — {} routes active", route_count);
         #[cfg(feature = "ebpf")]
@@ -1006,16 +1108,27 @@ impl ControlPlane {
 
         // A completed slow path has republished everything a latch could
         // have torn; re-arm.
-        self.settle_reload_datapath(
-            Some((generation.get(), new_plan.fingerprint)),
-            #[cfg(target_os = "linux")]
-            gateway_dns_enabled,
-        )
-        .await;
+        let ready = self
+            .settle_reload_datapath(
+                Some((generation.get(), new_plan.fingerprint)),
+                #[cfg(target_os = "linux")]
+                gateway_dns_enabled,
+                #[cfg(target_os = "linux")]
+                gateway_auxiliary,
+            )
+            .await;
         self.stop_reload_rejection_if_healthy(drain);
-        Ok(ReloadOutcome::Committed {
-            generation: generation.get(),
-        })
+        let outcome = if ready {
+            ReloadOutcome::Committed {
+                generation: generation.get(),
+            }
+        } else {
+            self.close_and_drain_pending_udp_admission().await;
+            ReloadOutcome::CommittedDegraded {
+                generation: generation.get(),
+            }
+        };
+        Ok(completion.finish(outcome))
     }
 
     async fn restore_datapath_flags_after_rejected_reload(
@@ -1023,6 +1136,7 @@ impl ControlPlane {
         datapath_flags: &crate::mode::DatapathFlagsHandle,
         drain: &DrainTracker,
         #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
+        #[cfg(target_os = "linux")] gateway_auxiliary: bool,
     ) {
         if !self.is_datapath_healthy() {
             #[cfg(target_os = "linux")]
@@ -1048,6 +1162,31 @@ impl ControlPlane {
             self.drain_tracker.start_rejecting();
             return;
         }
+        #[cfg(target_os = "linux")]
+        if gateway_auxiliary {
+            let mut ebpf = self.ebpf.write().await;
+            let generation = self.diagnostics.read().generation;
+            let fingerprint = self.active_routing_plan.read().fingerprint;
+            let restored = ebpf.userspace_mut().and_then(|backend| {
+                backend.restore_gateway_auxiliary()?;
+                backend
+                    .verify_gateway_auxiliary(fingerprint, generation)
+                    .map_err(Into::into)
+            });
+            if let Err(error) = restored {
+                error!(%error, "rejected gateway reload could not restore prior authority");
+                if let Ok(backend) = ebpf.userspace_mut() {
+                    backend.degrade_gateway_dns();
+                }
+                self.datapath_healthy
+                    .store(false, std::sync::atomic::Ordering::Release);
+                drain.start_rejecting();
+                self.drain_tracker.start_rejecting();
+                drop(ebpf);
+                self.close_and_drain_pending_udp_admission().await;
+                return;
+            }
+        }
         drain.stop_rejecting();
     }
 
@@ -1055,26 +1194,50 @@ impl ControlPlane {
         &self,
         completed: Option<(u64, [u8; 32])>,
         #[cfg(target_os = "linux")] gateway_dns_enabled: bool,
-    ) {
+        #[cfg(target_os = "linux")] gateway_auxiliary: bool,
+    ) -> bool {
         #[cfg(target_os = "linux")]
         let mut backend = if gateway_dns_enabled {
             Some(self.ebpf.write().await)
         } else {
             None
         };
-        self.datapath_healthy
-            .store(completed.is_some(), std::sync::atomic::Ordering::Release);
         #[cfg(target_os = "linux")]
-        if let Some(backend) = backend
-            .as_mut()
-            .and_then(|backend| backend.userspace_mut().ok())
-        {
-            if let Some((generation, fingerprint)) = completed {
-                backend.finish_gateway_dns_reload(generation, fingerprint);
-            } else {
-                backend.degrade_gateway_dns();
+        if let Some(backend) = backend.as_mut() {
+            let result: anyhow::Result<()> = match backend.userspace_mut() {
+                Ok(gateway) => match completed {
+                    Some((generation, fingerprint)) => gateway
+                        .finish_gateway_dns_reload(generation, fingerprint)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|published| {
+                            anyhow::ensure!(
+                                published || !gateway_auxiliary,
+                                "gateway final verdict has no matching staged generation"
+                            );
+                            Ok(())
+                        }),
+                    None => {
+                        gateway.degrade_gateway_dns();
+                        Ok(())
+                    }
+                },
+                Err(error) if gateway_auxiliary => Err(error),
+                Err(_) => Ok(()),
+            };
+            if let Err(error) = result {
+                error!(%error, "committed gateway failed final verification");
+                if let Ok(gateway) = backend.userspace_mut() {
+                    gateway.degrade_gateway_dns();
+                }
+                self.datapath_healthy
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return false;
             }
         }
+        let ready = completed.is_some();
+        self.datapath_healthy
+            .store(ready, std::sync::atomic::Ordering::Release);
+        ready
     }
 
     #[cfg(target_os = "linux")]

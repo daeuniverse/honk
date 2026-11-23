@@ -17,11 +17,15 @@ use generation::Arbitration;
 use honk_datapath::ScopeId;
 use honk_ebpf_common::xdp_gateway::GatewayReason;
 use honk_netstack::{MemoryBudget, MemoryReservation};
-use honk_xsk::{ConntrackKfuncs, GatewayLoad, GatewayMaps, GeneralCapture, OwnedXdpLink, Programs};
+use honk_xsk::{
+    AuxDevicePair, AuxGatewayProgram, AuxReaderGrace, AuxTcxLink, ConntrackKfuncs, GatewayLoad,
+    GatewayMaps, GeneralCapture, OwnedXdpLink, Programs, SkbConntrackKfuncs,
+};
 use parking_lot::{MappedMutexGuard, Mutex, MutexGuard};
 use std::{
     io,
     net::Ipv4Addr,
+    os::fd::AsFd,
     sync::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
@@ -56,17 +60,62 @@ struct Member {
     reload: GatewayReload,
 }
 
+struct AuxProgram {
+    program: AuxGatewayProgram,
+    _memory: MemoryReservation,
+}
+
+struct AuxMember {
+    realm: u32,
+    scope: ScopeId,
+    pair: Arc<AuxDevicePair>,
+    broadcasts: [Ipv4Addr; 64],
+    broadcast_count: usize,
+    link: Option<(AuxTcxLink, MemoryReservation)>,
+    program: Option<AuxProgram>,
+    key_bound: bool,
+}
+
+struct Auxiliary {
+    conntrack: SkbConntrackKfuncs,
+    grace: AuxReaderGrace,
+    members: Vec<AuxMember>,
+    _objects: MemoryReservation,
+    _allocation: MemoryReservation,
+}
+
+impl Auxiliary {
+    fn new(budget: &Arc<MemoryBudget>) -> io::Result<Box<Self>> {
+        // Eight explicit L3 interfaces is the configuration limit. Keep rebinds allocation-free.
+        let capacity = 8;
+        let allocation = budget
+            .reserve(size_of::<Self>() + capacity * size_of::<AuxMember>())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+        let conntrack = SkbConntrackKfuncs::read_accounted(budget)?;
+        let grace = AuxReaderGrace::new()?;
+        let objects = reserve_objects(budget, grace.object_fds())?;
+        Ok(Box::new(Self {
+            conntrack,
+            grace,
+            members: Vec::with_capacity(capacity),
+            _objects: objects,
+            _allocation: allocation,
+        }))
+    }
+}
+
+struct Candidates {
+    physical: Vec<Programs>,
+    auxiliary: Vec<(u32, AuxProgram)>,
+    _auxiliary_memory: Option<MemoryReservation>,
+}
+
 struct Generation {
     policy: GatewayPolicy,
     bank: Option<Arc<GatewayDnsBank>>,
     arbitration: Option<Arc<Arbitration>>,
     status: DnsProjectionState,
     memory: Vec<MemoryReservation>,
-}
-
-enum PreparedGeneration {
-    KeepStatic(DnsProjectionState),
-    Replace(Generation, Vec<Programs>),
 }
 
 enum PrepareError {
@@ -106,13 +155,16 @@ impl PrepareError {
 
 struct Previous {
     // Kernel programs must release their map references before the charge is refunded.
-    programs: Vec<Programs>,
+    programs: Candidates,
     generation: Generation,
     suspended: Option<(Arc<GatewayDnsBank>, u64)>,
 }
 
 struct PublisherInner {
     members: Vec<Member>,
+    auxiliary: Option<Box<Auxiliary>>,
+    final_publication: Option<([u8; 32], u64)>,
+    flags_fenced: bool,
     current: Generation,
     previous: Option<Previous>,
     last_issued: u64,
@@ -270,11 +322,15 @@ impl GatewayShadow {
         self.diagnostics.dns_state(NOTRACK_FALLBACK);
     }
 
-    fn allowed(&self) -> bool {
+    fn capture_ready(&self) -> bool {
         !self.stopped.load(Ordering::Acquire)
-            && !self.notrack_latched()
+            && !self.shutdown.requested()
             && self.admission.load(Ordering::Acquire)
             && self.healthy.load(Ordering::Acquire)
+    }
+
+    fn allowed(&self) -> bool {
+        self.capture_ready() && !self.notrack_latched()
     }
 
     fn suspend(&self) -> Option<(Arc<GatewayDnsBank>, u64)> {
@@ -297,8 +353,11 @@ impl GatewayShadow {
         }
     }
 
-    fn resume(&self, suspended: Option<(Arc<GatewayDnsBank>, u64)>) {
-        if let Some((bank, generation)) = suspended {
+    fn resume(&self, inner: &PublisherInner, suspended: Option<(Arc<GatewayDnsBank>, u64)>) {
+        if !inner.flags_fenced
+            && let Some((bank, generation)) = suspended
+            && inner.final_publication == Some((bank.fingerprint(), generation))
+        {
             self.activate(bank, generation);
         }
     }
@@ -311,6 +370,8 @@ pub(crate) struct GatewayPublisher {
     budget: Arc<MemoryBudget>,
     active_plan: Arc<parking_lot::RwLock<Arc<RoutingPushPlan>>>,
     failure: std::sync::OnceLock<Arc<io::Error>>,
+    #[cfg(all(test, feature = "ebpf"))]
+    pub(super) replace_tcx_before_final: AtomicBool,
     // Link custody orders the notrack latch against DNS activation and status publication.
     shadow: GatewayShadow,
 }
@@ -329,6 +390,9 @@ impl GatewayPublisher {
             state: PublisherState {
                 inner: Mutex::new(PublisherInner {
                     members: Vec::new(),
+                    auxiliary: None,
+                    final_publication: None,
+                    flags_fenced: false,
                     current: Generation {
                         policy,
                         bank: None,
@@ -347,6 +411,8 @@ impl GatewayPublisher {
             shadow,
             active_plan,
             failure: Default::default(),
+            #[cfg(all(test, feature = "ebpf"))]
+            replace_tcx_before_final: AtomicBool::new(false),
         }
     }
 
@@ -358,6 +424,51 @@ impl GatewayPublisher {
     #[cfg(all(test, feature = "ebpf"))]
     pub(crate) fn fingerprint(&self) -> [u8; 32] {
         self.state.inner.lock().current.policy.bytecode.fingerprint
+    }
+
+    #[cfg(all(test, feature = "ebpf"))]
+    pub(super) fn auxiliary_program(&self, outer: u32) -> io::Result<Option<u32>> {
+        let inner = self.state.inner.lock();
+        let Some(member) = inner
+            .auxiliary
+            .as_ref()
+            .and_then(|aux| aux.members.iter().find(|m| m.pair.outer_ifindex() == outer))
+        else {
+            return Ok(None);
+        };
+        let Some((link, _)) = &member.link else {
+            return Ok(None);
+        };
+        let id = member.program.as_ref().unwrap().program.id();
+        link.verify(id)?;
+        Ok(Some(id))
+    }
+
+    #[cfg(all(test, feature = "ebpf"))]
+    pub(super) fn check_unhealthy_auxiliary_retry(&self) -> io::Result<()> {
+        let (realm, scope, pair) = {
+            let inner = self.state.inner.lock();
+            let member = inner
+                .auxiliary
+                .as_ref()
+                .and_then(|aux| aux.members.first())
+                .ok_or_else(lost_capture)?;
+            (member.realm, member.scope, Arc::clone(&member.pair))
+        };
+        let outer = pair.outer_ifindex();
+        let was_healthy = {
+            let _start = self.shadow.shutdown.lock_capture_start()?;
+            self.shadow.healthy.swap(false, Ordering::AcqRel)
+        };
+        // A legitimate published member would otherwise report AlreadyExists. Busy proves
+        // cancellation was observed before the membership check, program load or TCX attach.
+        let attempt = self.bind_auxiliary(realm, scope, outer, pair, &[]);
+        {
+            let _start = self.shadow.shutdown.lock_capture_start()?;
+            self.shadow.healthy.store(was_healthy, Ordering::Release);
+        }
+        assert_eq!(attempt.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        Ok(())
     }
 
     #[cfg(all(test, feature = "ebpf"))]
@@ -442,28 +553,345 @@ impl GatewayPublisher {
         self.publish_inner(plan, true)
     }
 
-    pub(crate) fn activate_dns(&self, fingerprint: [u8; 32], generation: u64) {
-        let inner = self.state.inner.lock();
-        let Ok(_links) = self.state.open_links() else {
-            return;
-        };
-        if self.failure.get().is_none()
-            && inner.previous.is_none()
-            && let Some(bank) = &inner.current.bank
-            && bank.fingerprint() == fingerprint
+    pub(super) fn prepare_auxiliary(&mut self) -> io::Result<()> {
+        self.state.inner.get_mut().auxiliary = Some(Auxiliary::new(&self.budget)?);
+        Ok(())
+    }
+
+    pub(crate) fn pause_auxiliary(&self) {
+        let mut inner = self.state.inner.lock();
+        let _custody = self.state.links.lock();
+        inner.flags_fenced = true;
+        self.shadow.suspend();
+    }
+
+    pub(crate) fn restore_auxiliary(&self) -> io::Result<()> {
+        let mut inner = self.state.inner.lock();
+        if let Some(error) = self.capture_error() {
+            return Err(error);
+        }
+        inner.flags_fenced = false;
+        if let Some((fingerprint, generation)) = inner.final_publication {
+            self.activate_final(&mut inner, fingerprint, generation, false)?;
+        }
+        Ok(())
+    }
+
+    fn load_auxiliary(
+        &self,
+        pair: &Arc<AuxDevicePair>,
+        realm: u32,
+        broadcasts: &[Ipv4Addr],
+        load: GatewayLoad<'_>,
+        ct: &SkbConntrackKfuncs,
+    ) -> io::Result<AuxProgram> {
+        let program = AuxGatewayProgram::load(pair, realm, broadcasts, load, ct)?;
+        let memory = reserve_objects(&self.budget, program.object_fds())?;
+        Ok(AuxProgram {
+            program,
+            _memory: memory,
+        })
+    }
+
+    pub(crate) fn bind_auxiliary(
+        &self,
+        realm: u32,
+        scope: ScopeId,
+        outer: u32,
+        pair: Arc<AuxDevicePair>,
+        ipv4_broadcasts: &[Ipv4Addr],
+    ) -> io::Result<()> {
+        let plan = self.active_plan.try_read().ok_or_else(publisher_busy)?;
+        let mut inner = self.state.inner.try_lock().ok_or_else(publisher_busy)?;
+        drop(self.state.try_open_links()?);
+        if let Some(error) = self.capture_error() {
+            return Err(error);
+        }
+        if inner.previous.is_some()
+            || !self.shadow.capture_ready()
+            || inner.flags_fenced
+            || inner
+                .final_publication
+                .is_none_or(|(fingerprint, _)| fingerprint != plan.fingerprint)
+            || inner.current.policy.bytecode.fingerprint != plan.fingerprint
         {
+            return Err(publisher_busy());
+        }
+        if pair.outer_ifindex() != outer
+            || self
+                .shadow
+                .realms
+                .iter()
+                .any(|&(s, r)| (s == scope || r == realm) && (s, r) != (scope, realm))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auxiliary device or DNS realm mismatch",
+            ));
+        }
+        let aux = inner
+            .auxiliary
+            .as_ref()
+            .ok_or_else(|| io::Error::other("auxiliary capture was not prepared"))?;
+        let mut broadcasts = [Ipv4Addr::UNSPECIFIED; 64];
+        let addresses = broadcasts.get_mut(..ipv4_broadcasts.len()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "auxiliary broadcast capacity exceeded",
+            )
+        })?;
+        addresses.copy_from_slice(ipv4_broadcasts);
+        if aux.members.len() == aux.members.capacity()
+            || aux.members.iter().any(|member| {
+                member.realm == realm
+                    || member.scope == scope
+                    || (member.key_bound && member.pair.outer_ifindex() == outer)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "gateway auxiliary binding still owned",
+            ));
+        }
+        pair.verify()?;
+        let generation = &inner.current;
+        let program = self.load_auxiliary(
+            &pair,
+            realm,
+            ipv4_broadcasts,
+            GatewayLoad {
+                routing: &generation.policy.bytecode.insns,
+                maps: &self.maps,
+                conntrack: &self.conntrack,
+                dns: generation.bank.as_ref().map(|b| b.maps()),
+                arbitration: generation.arbitration.as_ref().map(|a| &a.kernel),
+            },
+            &aux.conntrack,
+        )?;
+        let _links = self.state.open_links()?;
+        let _start = self.shadow.shutdown.lock_capture_start()?;
+        if !self.shadow.capture_ready() {
+            return Err(publisher_busy());
+        }
+        let projection = self.shadow.projection.upgrade().ok_or_else(lost_capture)?;
+        if pair.unavailable()? {
+            pair.verify()?;
+            return Err(publisher_busy());
+        }
+        // Keep the neutral-to-data replacement inside the same authority as the gate open.
+        let (link, charge) = AuxTcxLink::outer(&pair, program.program.as_fd(), &self.budget)?;
+        self.maps.bind_aux_realm(&pair, realm)?;
+        let aux = inner.auxiliary.as_mut().unwrap();
+        aux.members.push(AuxMember {
+            realm,
+            scope,
+            pair,
+            broadcasts,
+            broadcast_count: ipv4_broadcasts.len(),
+            link: Some((link, charge)),
+            program: Some(program),
+            key_bound: true,
+        });
+        let member = aux.members.last_mut().unwrap();
+        let opened = projection
+            .set_aux_binding(scope, true)
+            .and_then(|()| member.pair.set_open(true));
+        if let Err(error) = opened {
+            tracing::debug!(realm, errno = ?error.raw_os_error(), %error, "auxiliary gate activation failed");
+            drop(_start);
+            drop(_links);
+            self.close_member(member, &aux.grace)?;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn close_member(&self, member: &mut AuxMember, grace: &AuxReaderGrace) -> io::Result<()> {
+        if member.program.is_none() {
+            return Ok(());
+        }
+        let gate = member.pair.set_open(false);
+        let dns = self
+            .shadow
+            .projection
+            .upgrade()
+            .map_or(Ok(()), |projection| {
+                projection.set_aux_binding(member.scope, false)
+            });
+        let detached = member
+            .link
+            .as_ref()
+            .map_or(Ok(()), |(link, _)| link.detach());
+        if detached.is_ok() {
+            member.link.take();
+        }
+        let key = if member.key_bound {
+            self.maps
+                .unbind_aux_realm(&member.pair, member.realm)
+                .map(|()| member.key_bound = false)
+        } else {
+            Ok(())
+        };
+        let readers = grace.synchronize();
+        gate.and(dns).and(detached).and(key).and(readers)?;
+        member.program.take();
+        Ok(())
+    }
+
+    pub(crate) fn verify_auxiliary(&self, realm: u32, pair: &Arc<AuxDevicePair>) -> io::Result<()> {
+        let inner = self.state.inner.lock();
+        let missing = || io::Error::from_raw_os_error(libc::ENODEV);
+        let member = inner
+            .auxiliary
+            .as_ref()
+            .and_then(|aux| {
+                aux.members
+                    .iter()
+                    .find(|member| member.realm == realm && Arc::ptr_eq(&member.pair, pair))
+            })
+            .ok_or_else(missing)?;
+        let (link, _) = member.link.as_ref().ok_or_else(missing)?;
+        let program = member.program.as_ref().ok_or_else(lost_capture)?;
+        link.verify(program.program.id())
+    }
+
+    pub(crate) fn close_auxiliary(&self, realm: u32) -> io::Result<()> {
+        let mut inner = self.state.inner.lock();
+        if let Some(aux) = inner.auxiliary.as_mut()
+            && let Some(member) = aux.members.iter_mut().find(|m| m.realm == realm)
+        {
+            self.close_member(member, &aux.grace)?;
+        }
+        Ok(())
+    }
+
+    /// The scope owner has now closed its old TUN FD and joined every application and output.
+    pub(crate) fn unbind_auxiliary(&self, realm: u32) -> io::Result<()> {
+        let mut inner = self.state.inner.lock();
+        let Some(aux) = inner.auxiliary.as_deref() else {
+            return Ok(());
+        };
+        let Some(index) = aux.members.iter().position(|m| m.realm == realm) else {
+            return Ok(());
+        };
+        if aux.members[index].key_bound || aux.members[index].link.is_some() {
+            return Err(io::Error::other(
+                "gateway auxiliary binding has not been closed",
+            ));
+        }
+        if aux.members[index].program.is_some() {
+            return Err(io::Error::other(
+                "gateway auxiliary readers have not drained",
+            ));
+        }
+        if !aux.members[index].pair.inner_gone()? {
+            return Err(io::Error::other(
+                "gateway auxiliary TUN device is still registered",
+            ));
+        }
+        self.maps.clear_aux_realm(
+            realm,
+            inner.current.arbitration.as_ref().map(|a| &a.kernel),
+            &self.budget,
+        )?;
+        if let Some(previous) = &mut inner.previous {
+            previous.programs.auxiliary.retain(|(r, _)| *r != realm);
+        }
+        let aux = inner.auxiliary.as_mut().unwrap();
+        aux.members.swap_remove(index);
+        Ok(())
+    }
+
+    pub(crate) fn activate_dns(
+        &self,
+        fingerprint: [u8; 32],
+        generation: u64,
+        recover: bool,
+    ) -> io::Result<()> {
+        self.activate_final(
+            &mut self.state.inner.lock(),
+            fingerprint,
+            generation,
+            recover,
+        )
+    }
+
+    pub(crate) fn verify_committed(
+        &self,
+        fingerprint: [u8; 32],
+        generation: u64,
+    ) -> io::Result<()> {
+        let mut inner = self.state.inner.lock();
+        if let Some(error) = self.capture_error() {
+            return Err(error);
+        }
+        if inner.flags_fenced
+            || inner.previous.is_some()
+            || inner.final_publication != Some((fingerprint, generation))
+            || inner.current.policy.bytecode.fingerprint != fingerprint
+        {
+            return Err(io::Error::other("auxiliary publication has not settled"));
+        }
+        drop(self.state.open_links()?);
+        self.verify_auxiliary_targets(inner.auxiliary.as_deref_mut(), None)
+            .map_err(|error| self.fail_capture(error))
+    }
+
+    fn activate_final(
+        &self,
+        inner: &mut PublisherInner,
+        fingerprint: [u8; 32],
+        generation: u64,
+        recover: bool,
+    ) -> io::Result<()> {
+        if let Some(error) = self.capture_error() {
+            return Err(error);
+        }
+        if inner.previous.is_some() || inner.current.policy.bytecode.fingerprint != fingerprint {
+            return Err(io::Error::other(
+                "gateway final publication identity mismatch",
+            ));
+        }
+        if inner.flags_fenced {
+            // Startup can complete while a reload is still restoring the previous flags.
+            inner.final_publication = Some((fingerprint, generation));
+            return Ok(());
+        }
+        #[cfg(all(test, feature = "ebpf"))]
+        let replacement = if recover && self.replace_tcx_before_final.swap(false, Ordering::AcqRel)
+        {
+            Some(tests::replace_final_target(self, inner)?)
+        } else {
+            None
+        };
+        let verified = self.verify_auxiliary_targets(inner.auxiliary.as_deref_mut(), None);
+        #[cfg(all(test, feature = "ebpf"))]
+        if let Some((realm, replacement)) = replacement {
+            tests::restore_and_check_withdrawal(self, inner, realm, replacement)?;
+        }
+        verified.map_err(|error| self.fail_capture(error))?;
+        let _links = self.state.open_links()?;
+        if recover {
+            self.shadow.healthy.store(true, Ordering::Release);
+        }
+        inner.final_publication = Some((fingerprint, generation));
+        if let Some(bank) = &inner.current.bank {
             self.shadow.activate(Arc::clone(bank), generation);
         }
+        Ok(())
     }
 
     pub(crate) fn stage_dns_reload(&self) {
-        let inner = self.state.inner.lock();
+        let mut inner = self.state.inner.lock();
+        inner.final_publication = None;
         if let Ok(_links) = self.state.open_links() {
             self.shadow.report_status(inner.current.status);
         }
     }
 
     pub(crate) fn degrade_dns(&self) {
+        let mut inner = self.state.inner.lock();
+        inner.final_publication = None;
         let _custody = self.state.links.lock();
         if !self.shadow.realms.is_empty()
             && !self.shadow.stopped.load(Ordering::Acquire)
@@ -579,6 +1007,71 @@ impl GatewayPublisher {
 mod tests {
     use super::*;
     use std::{io::Read, os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
+
+    // The guarded guest changes the actual link target while the publication lock excludes
+    // the watcher. Both programs have identical policy, fact maps, DNS and arbitration.
+    #[cfg(feature = "ebpf")]
+    pub(super) fn replace_final_target(
+        publisher: &GatewayPublisher,
+        inner: &PublisherInner,
+    ) -> io::Result<(u32, AuxProgram)> {
+        let aux = inner.auxiliary.as_ref().ok_or_else(lost_capture)?;
+        let member = aux
+            .members
+            .iter()
+            .find(|member| member.link.is_some())
+            .ok_or_else(lost_capture)?;
+        let current = member.program.as_ref().ok_or_else(lost_capture)?;
+        let next = publisher.load_auxiliary(
+            &member.pair,
+            member.realm,
+            &member.broadcasts[..member.broadcast_count],
+            GatewayLoad {
+                routing: &inner.current.policy.bytecode.insns,
+                maps: &publisher.maps,
+                conntrack: &publisher.conntrack,
+                dns: inner.current.bank.as_ref().map(|bank| bank.maps()),
+                arbitration: inner.current.arbitration.as_ref().map(|arb| &arb.kernel),
+            },
+            &aux.conntrack,
+        )?;
+        member
+            .link
+            .as_ref()
+            .unwrap()
+            .0
+            .replace(current.program.as_fd(), next.program.as_fd())?;
+        Ok((member.realm, next))
+    }
+
+    #[cfg(feature = "ebpf")]
+    pub(super) fn restore_and_check_withdrawal(
+        publisher: &GatewayPublisher,
+        inner: &mut PublisherInner,
+        realm: u32,
+        replacement: AuxProgram,
+    ) -> io::Result<()> {
+        let aux = inner.auxiliary.as_mut().ok_or_else(lost_capture)?;
+        let member = aux
+            .members
+            .iter_mut()
+            .find(|member| member.realm == realm)
+            .ok_or_else(lost_capture)?;
+        let (link, _) = member.link.as_ref().ok_or_else(lost_capture)?;
+        let original = member.program.as_ref().ok_or_else(lost_capture)?;
+        link.replace(replacement.program.as_fd(), original.program.as_fd())?;
+        // Force key removal to fail after the actual TCX detach, then restore the key so
+        // the real withdrawal can be retried. The charge stays with the still-held program.
+        member.pair.set_open(false)?;
+        publisher.maps.unbind_aux_realm(&member.pair, realm)?;
+        let error = publisher.close_member(member, &aux.grace).unwrap_err();
+        assert_eq!(error.to_string(), "foreign auxiliary binding");
+        assert!(member.link.is_none() && member.program.is_some());
+        publisher.maps.bind_aux_realm(&member.pair, realm)?;
+        publisher.close_member(member, &aux.grace)?;
+        assert!(member.program.is_none());
+        Ok(())
+    }
 
     #[test]
     fn optional_candidate_fd_pressure_keeps_authority_error_fatal() {

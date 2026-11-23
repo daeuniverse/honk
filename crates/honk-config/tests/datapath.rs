@@ -71,6 +71,10 @@ fn dns_projection_is_strict_and_compares_effective_restart_identity() {
             false,
         ),
         (
+            "backend: xdp\ndirect: endpoint\ninterface { wan0: wan\nwg0: l3_lan }",
+            true,
+        ),
+        (
             "backend: xdp\ndirect: endpoint\nhost {\nxsk_mode: copy\ninterface { host0 }\n}",
             false,
         ),
@@ -803,3 +807,6 @@ mod tun;
 
 #[path = "datapath/host.rs"]
 mod host;
+
+#[path = "datapath/auxiliary.rs"]
+mod auxiliary;

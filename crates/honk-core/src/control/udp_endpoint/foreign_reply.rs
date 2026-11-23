@@ -75,24 +75,39 @@ impl ForeignReplySockets {
         source: SocketAddr,
         packet_source: Option<&SourceWork>,
     ) -> io::Result<Arc<ReplySocket>> {
-        let packet_source = packet_source.filter(|source| source.optional_context().is_some());
+        let reply_source = packet_source.filter(|source| source.optional_context().is_some());
         let key = (
             scope,
-            packet_source.and_then(SourceWork::optional_context),
+            reply_source.and_then(SourceWork::optional_context),
             source,
         );
         let now = tokio::time::Instant::now();
-        if let Some((socket, used)) = self.cache.lock().get_mut(&key) {
-            *used = now;
-            return Ok(Arc::clone(socket));
+        {
+            let mut cache = self.cache.lock();
+            if !packet_binding_active(packet_source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    AuxiliaryBindingRetired,
+                ));
+            }
+            if let Some((socket, used)) = cache.get_mut(&key) {
+                *used = now;
+                return Ok(Arc::clone(socket));
+            }
         }
         let mut created = Some(Arc::new(self.create_with_reclaim(
             scope,
             source,
-            packet_source,
+            reply_source,
         )?));
         let (socket, displaced, overflow) = {
             let mut cache = self.cache.lock();
+            if !packet_binding_active(packet_source) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    AuxiliaryBindingRetired,
+                ));
+            }
             let (socket, displaced) = if let Some((socket, used)) = cache.get_mut(&key) {
                 *used = now;
                 (Arc::clone(socket), None)
@@ -143,6 +158,18 @@ impl ForeignReplySockets {
             expired
         };
         expired.len()
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn clear_scope(&self, scope: ScopeId) {
+        let mut cache = self.cache.lock();
+        let keys: Vec<_> = cache
+            .iter()
+            .filter_map(|(key, _)| (key.0 == scope).then_some(*key))
+            .collect();
+        for key in keys {
+            cache.pop(&key);
+        }
     }
 
     pub(super) fn clear(&self) {

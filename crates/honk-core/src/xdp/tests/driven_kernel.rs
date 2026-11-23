@@ -330,6 +330,7 @@ async fn start_runtime(
         local_memory,
         kernel_memory,
         realm_scopes,
+        auxiliary,
         plan_memory,
         realms: plans,
         scope_pairs: scopes,
@@ -344,6 +345,10 @@ async fn start_runtime(
         diagnostics,
         ..
     } = prepared;
+    ensure!(
+        !defer_gateway || auxiliary.is_empty(),
+        "deferred physical-only fixture cannot activate auxiliary TUNs"
+    );
     plane.stats_handle().install_xdp(Arc::clone(&diagnostics));
     let (endpoints, mut owner, mut drivers) =
         PacketEndpoints::start_driven(plane, scopes, 64, None, ScopeId::HOST).await?;
@@ -389,7 +394,6 @@ async fn start_runtime(
     }
     #[cfg(feature = "ebpf")]
     let host = host.map(|host| host.start(&mut drivers));
-    assert!(drivers.is_empty());
     let [inbox, remote_inbox] = inboxes;
     let mut runtime = Runtime {
         devices,
@@ -441,6 +445,9 @@ async fn start_runtime(
         context_revision: 0,
         _memory: Some(memory),
     };
+    let aux_startup =
+        runtime.start_auxiliary(auxiliary, &mut drivers, &tokio::runtime::Handle::current());
+    assert!(drivers.is_empty());
     if runtime.workers.workers == 2 {
         runtime.worker = Some(worker::Worker::start(
             Arc::clone(&runtime.workers),
@@ -545,7 +552,7 @@ async fn start_runtime(
             publisher,
             active_plan.read().fingerprint,
             diagnostics_generation.read().generation,
-        );
+        )?;
         publisher.validate_programs(|programs| {
             for &(ifindex, id) in programs {
                 if let Some(device) = runtime
@@ -564,6 +571,7 @@ async fn start_runtime(
     } else {
         runtime.activate_capture(&shutdown, direct)?;
     }
+    runtime.activate_auxiliary(aux_startup, &shutdown).await?;
     runtime.diagnostics.lifecycle(Lifecycle::Active);
     Ok((runtime, owner))
 }

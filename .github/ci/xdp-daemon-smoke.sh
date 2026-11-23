@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Disposable-virtme-guest gate. Never invoke on the host; no downloads/builds.
-# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon|dns-shadow]
+# Usage: bash .github/ci/xdp-daemon-smoke.sh /absolute/path/to/fresh/honk-core [all|runtime|daemon|dns-shadow|l3-lan]
 set -euo pipefail
 
 fail() { printf 'xdp-daemon-smoke: %s\n' "$*" >&2; exit 1; }
@@ -30,11 +30,19 @@ fi
 daemon=$2
 smoke_scope=$3
 case $smoke_scope in
-    all) ;;
     runtime) [[ -n ${HONK_XDP_CORE_TEST_BIN:-} ]] || fail 'runtime scope requires the complete Core test executable' ;;
     daemon) [[ -z ${HONK_XDP_CORE_TEST_BIN:-} && -z ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'daemon scope cannot ignore supplied test executables' ;;
     dns-shadow)
         [[ -n ${HONK_XDP_CORE_TEST_BIN:-} && -n ${HONK_XDP_XSK_TEST_BIN:-} ]] || fail 'dns-shadow requires the current Core and XSK test executables'
+        ;;
+    all|l3-lan)
+        [[ ${HONK_XDP_CORE_TEST_BIN:-} == /* && -x $HONK_XDP_CORE_TEST_BIN &&
+           ${HONK_XDP_XSK_TEST_BIN:-} == /* && -x $HONK_XDP_XSK_TEST_BIN ]] ||
+            fail "$smoke_scope requires the current Core and XSK test executables"
+        [[ ${HONK_CI_VM_LANE:-} == floor || ${HONK_CI_VM_LANE:-} == recent ]] || fail 'L3 LAN requires a floor/recent guest'
+        [[ $(uname -r) == "${HONK_CI_EXPECTED_KERNEL:-}" ]] || fail 'L3 LAN requires the launcher-verified guest kernel'
+        command -v wg >/dev/null || fail 'L3 LAN requires provisioned wireguard-tools (wg)'
+        command -v modprobe >/dev/null || fail 'L3 LAN requires guest modprobe'
         ;;
     *) fail 'unknown smoke scope' ;;
 esac
@@ -172,8 +180,10 @@ cleanup() {
         cp -a /run/honk-tc-state "$work/tc-state" 2>/dev/null || true
         exit "$status"
     fi
-    ip netns exec dut nft -j list ruleset >"$work/final.nft.json" 2>"$work/final.nft.stderr" || true
-    ip -n dut -j -d link show >"$work/final.links.json" 2>"$work/final.links.stderr" || true
+    if [[ -e /run/netns/dut ]]; then
+        ip netns exec dut nft -j list ruleset >"$work/final.nft.json" 2>"$work/final.nft.stderr" || true
+        ip -n dut -j -d link show >"$work/final.links.json" 2>"$work/final.links.stderr" || true
+    fi
     if [[ -n $daemon_pid ]]; then
         kill -TERM "$daemon_pid" 2>/dev/null || true
         timeout 20s tail --pid="$daemon_pid" -f /dev/null 2>/dev/null || kill -KILL "$daemon_pid" 2>/dev/null || true
@@ -191,6 +201,17 @@ cleanup() {
     exit "$status"
 }
 trap cleanup EXIT
+if [[ $smoke_scope == all || $smoke_scope == l3-lan ]]; then
+    mark_phase l3-lan begin
+    modprobe nf_conntrack
+    mkdir "$work/l3-lan"
+    timeout -k 30s 430s python3 "$script_dir/xdp-l3-lan.py" "$daemon" "$HONK_XDP_CORE_TEST_BIN" \
+        "$HONK_XDP_XSK_TEST_BIN" "$work/l3-lan" 2>&1 | tee "$work/l3-lan/result.log"
+    mark_phase l3-lan complete
+    if [[ $smoke_scope == l3-lan ]]; then
+        exit 0
+    fi
+fi
 for ns in dut client server; do
     ip netns add "$ns"
     namespaces+=("$ns")
@@ -671,7 +692,7 @@ if [[ -n ${HONK_XDP_XSK_TEST_BIN:-} ]]; then
     done
     ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" bpf::general::tests::kernel_ --ignored --test-threads=1 --nocapture | tee "$work/xsk-kernel.log"
     for prefix in bpf::general::tests::gateway::kernel_ bpf::gateway::tests::kernel_ bpf::attachment::tests::kernel_owned_; do
-        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$prefix" --skip kernel_gateway_dns_ --ignored --test-threads=1 --nocapture | tee "$work/${prefix//::/-}.log"
+        ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$prefix" --skip kernel_gateway_dns_ --skip kernel_aux_ --ignored --test-threads=1 --nocapture | tee "$work/${prefix//::/-}.log"
     done
     vlan_test=device::features::kernel_vlan_tests::kernel_vlan_no_upper_normal_failure_and_sigkill_boundaries
     [[ $(ip netns exec dut "$HONK_XDP_XSK_TEST_BIN" "$vlan_test" --exact --ignored --list --format terse) == "$vlan_test: test" ]] || fail "missing ignored XSK regression: $vlan_test"

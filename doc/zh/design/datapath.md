@@ -202,6 +202,10 @@ L2 group 地址不能让单播 IP 获得原生 socket 豁免。原生 ARP/ND 和
 
 内核 map/program 内存与 UMEM 一同计入共享 384 MiB 捕获预算；重载期间新旧 generation 同时计费。见[重载限制](./control-plane.md#reload-与运行时-generation)。
 
+[辅助 L3 LAN](../reference/global.md#辅助-l3-lan) 从 TCX ingress 进入同一策略，不提供 MAC 事实。原生判定继续执行内核链；选中 Endpoint 的包重定向到该绑定独占、无地址的 TUN。TCX 使用独立的 per-CPU scratch 和 skb conntrack 查询；解析同时受 IP 声明长度和 skb 线性区长度约束，只有必需首部不在线性区时才拉取。已知归属 Endpoint 的 ICMP 错误交给 Stack 核查引用；未知传输流的引用不会建立新归属。
+
+读写内部 TUN 和驱动 packet scope 的任务在共享运行时执行，不占物理 AF_XDP 队列循环。两个方向均检查本次绑定的设备对；ifindex 数字被复用不构成重定向许可。即使 FD 托管的回向程序先关闭，内 TUN 随设备持有的终态丢弃仍生效。更换绑定时先注销旧 TUN 并退役其在途业务和 DNS 许可，再准入新绑定；`writev` 成功不能证明内核旧队列已空。重载按顺序替换物理和在役辅助 link，失败按逆序回滚；Linux 不提供所有 link 在同一包边界同时切换的保证。
+
 SG/multi-buffer 能力通告和 bind 成功都不等于 jumbo 实测。手动 veth smoke
 在 Copy 模式覆盖 MTU 1500 和 9000：每次 UDP 回复必须是单个完整数据报，
 jumbo 用例还要求在客户端接口的收发两个方向观察到大于 4096 字节、完整且

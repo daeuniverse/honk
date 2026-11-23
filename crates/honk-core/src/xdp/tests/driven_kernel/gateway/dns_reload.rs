@@ -597,7 +597,7 @@ fn activate_capture(
             .as_ref()
             .and_then(|datapath| datapath.direct),
     )?;
-    backend.activate_gateway_start(publisher, plan.fingerprint, generation);
+    backend.activate_gateway_start(publisher, plan.fingerprint, generation)?;
     fixture
         .runtime
         .diagnostics
@@ -685,9 +685,9 @@ async fn shadow_late_gateway_registration_waits_for_final_flags() -> anyhow::Res
             {
                 let mut writer = fixture.backend.write().await;
                 let backend = writer.userspace_mut()?;
-                backend.finish_gateway_dns_reload(generation - 1, plan.fingerprint);
-                backend.finish_gateway_dns_reload(generation, plan.fingerprint);
-                backend.activate_gateway_start(publisher, plan.fingerprint, generation);
+                backend.finish_gateway_dns_reload(generation - 1, plan.fingerprint)?;
+                backend.finish_gateway_dns_reload(generation, plan.fingerprint)?;
+                backend.activate_gateway_start(publisher, plan.fingerprint, generation)?;
             }
             assert_eq!(bank.epoch(lan)?, epoch, "settled generation reopened");
             assert_eq!(bank.epoch(wan)?, 0);

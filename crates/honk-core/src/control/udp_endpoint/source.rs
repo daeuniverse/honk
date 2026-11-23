@@ -320,6 +320,7 @@ impl SourceOwner {
         let changed = {
             let mut state = self.state.lock();
             if state.retirement.is_some()
+                || !packet_binding_active(self.packet_source.as_ref())
                 || !self.sent.load(Ordering::Acquire)
                 || self.has_reply.load(Ordering::Acquire)
             {
@@ -423,7 +424,9 @@ impl SourceOwner {
 
     fn idle_expired(&self) {
         if let Some(pool) = self.pool.upgrade() {
-            if !self.sent.load(Ordering::Acquire) {
+            if !packet_binding_active(self.packet_source.as_ref())
+                || !self.sent.load(Ordering::Acquire)
+            {
                 pool.retire_source_neutral(self, ScoreOutcome::Cancelled);
             } else if self.has_reply.load(Ordering::Acquire) {
                 pool.retire_replied_source(self);
@@ -605,14 +608,14 @@ impl SourceEndpoint {
         let mut active = {
             let mut state = self.owner.state.lock();
             if self.retired.load(Ordering::Acquire) {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
+                return Err(retired_send(
+                    self.packet_source(),
                     "UDP flow retired before source send",
                 ));
             }
             if state.retirement.is_some() {
-                return Err(io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
+                return Err(retired_send(
+                    self.packet_source(),
                     "UDP source retired before send",
                 ));
             }
@@ -734,11 +737,31 @@ impl Drop for SourceReplyLease {
     }
 }
 
-async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>) {
-    let _reply_lease = SourceReplyLease {
-        pool: Arc::clone(&pool),
-        owner: Arc::clone(&owner),
+#[cfg(feature = "rprx")]
+fn xudp_packet_source(source: Option<&SourceWork>) -> Option<[u8; 16]> {
+    let source = source?;
+    let (lineage, snapshot) = match source.optional_context() {
+        Some(context) => (context.lineage.get(), context.snapshot.get()),
+        // Host lineages are nonzero. A new binding must not reclaim the peer's old XUDP association.
+        None if source.owner().is_auxiliary() => (0, source.owner().binding()),
+        None => return None,
     };
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&lineage.to_be_bytes());
+    bytes[8..].copy_from_slice(&snapshot.to_be_bytes());
+    Some(bytes)
+}
+
+async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>) {
+    let lease = SourceReplyLease { pool, owner };
+    run_while_bound(
+        lease.owner.packet_source.as_ref(),
+        receive_source_replies(&lease.pool, &lease.owner),
+    )
+    .await;
+}
+
+async fn receive_source_replies(pool: &UdpEndpointPool, owner: &SourceOwner) {
     // Heap, not inline: an inline array adds 64 KiB to every source task.
     let mut buf = vec![0u8; super::budget::RECEIVE_BYTES];
 
@@ -782,7 +805,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
                         return;
                     }
                 };
-                match deliver_source_reply(&pool, &owner, peer, &buf[..len]).await {
+                match deliver_source_reply(pool, owner, peer, &buf[..len]).await {
                     SourceReplyDisposition::Delivered if owner.is_ready() => {
                         owner.report_available();
                         reply_idle_timeout
@@ -808,6 +831,15 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
 }
 
 impl UdpEndpointPool {
+    #[cfg(any(target_os = "linux", test))]
+    pub(super) fn retire_scope_sources(&self, domain: ScopeId) {
+        for entry in self.sources.iter() {
+            if entry.key().domain == domain {
+                entry.start_retiring(SourceRetirement::Neutral(ScoreOutcome::Cancelled));
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(in crate::control) async fn prepare_source(
         self: &Arc<Self>,
@@ -846,7 +878,10 @@ impl UdpEndpointPool {
                 .and_then(SourceWork::optional_context),
         );
         loop {
-            if generation.is_shutdown() || self.terminal.load(Ordering::Acquire) {
+            if generation.is_shutdown()
+                || self.terminal.load(Ordering::Acquire)
+                || !packet_binding_active(packet_source.as_ref())
+            {
                 return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
             }
             let changed = self.source_changed.notified();
@@ -885,13 +920,7 @@ impl UdpEndpointPool {
                                 scope.client,
                                 path,
                                 reply_destination,
-                                scope.packet_source.map(|source| {
-                                    let mut bytes = [0u8; 16];
-                                    bytes[..8].copy_from_slice(&source.lineage.get().to_be_bytes());
-                                    bytes[8..]
-                                        .copy_from_slice(&source.snapshot.get().to_be_bytes());
-                                    bytes
-                                }),
+                                xudp_packet_source(packet_source.as_ref()),
                             )?;
                             VLessHandler::prepare_source_udp(
                                 Arc::clone(&runtime),
@@ -1005,6 +1034,10 @@ impl UdpEndpointPool {
     }
 
     fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome) {
+        if !packet_binding_active(owner.packet_source.as_ref()) {
+            self.retire_interrupted_source(owner);
+            return;
+        }
         let outcome = if outcome == ScoreOutcome::NodeFailure {
             ScoreOutcome::shared_node_failure()
         } else {

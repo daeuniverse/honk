@@ -204,6 +204,8 @@ XDP 在启动时为每个物理 Port 选择容量。`physical_mtu + 22` 不溢�
 
 优化后的 Port 与 scope 预留更大，因此在 384 MiB 预算下，大量所选 queue/realm 的启动余量会降低。成功映射的 UMEM 会持续计费直到进程退出，即使后续启动步骤失败也不归还，并继续占用原有进程级 512 MiB retained-UMEM 上限。在同一进程中重启 capture 不会回收它。
 
+每个已配置的 `l3_lan` 从同一 384 MiB 预算独立预留 4 MiB，等待设备时也保留。其 Stack 有 16 个 TCP 槽（包括保留的 TIME_WAIT）、512 KiB TCP 池、2 个 control 和 6 个 bulk CPU 帧，以及 32 个等待者。完整 TUN 接收记录与待写输出数组也在该份额内。设备 map、link 与程序各代另计入共享根预算。这些是容量界限，不是吞吐或内核 RSS 的实测值。
+
 TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个 realm，true 使用两个。每个 scope 的 160 个 CPU frame 各计费 65,535 字节（总计 10,485,600 字节）；共用 384 MiB 预算和一个 UDP pool，不改变 MSS/PMTU 或普通 UDP MTU。
 
 [TUN owner](./datapath.md#fd-报文管线) 保留 CPU-backed `OutputLease` 及原始 `Transmit`。setup 要求独占、单队列、非 persistent 的 `IFF_TUN|IFF_NO_PI|IFF_VNET_HDR`，设置并回读 10 字节小端 vnet 头，仅启用 `TUN_F_CSUM|TUN_F_TSO4|TUN_F_TSO6`；内核不支持时明确拒绝。RX 预留 65,586 字节：10 字节 vnet 头、普通 IPv6 最大 65,575 字节以及一个截断 sentinel。读满 buffer、不完整/带填充 IP record、未知 flag、不支持的 GSO 类型/地址族及非法首部/校验和范围，均在组合 metadata/source/admission 路径之前拒绝。GSO `hdr_len` 是 Linux 线性头部范围提示，可包含载荷，必须覆盖解析后的 TCP 头且不超过 IP record。普通 UDP `CHECKSUM_PARTIAL` 无需 USO 也能接收。在回收唯一 RX buffer 前接纳/复制借用 UDP。

@@ -237,7 +237,7 @@ async fn run_endpoint_driver(
             first,
             followers: Vec::new(),
         },
-        first_ack,
+        |result| drop(first_ack.send(result)),
     )
     .await
     .result
@@ -2192,7 +2192,7 @@ async fn local_reply_failures_do_not_become_upstream_failures() {
                     first: lease.take_first().unwrap(),
                     followers: Vec::new(),
                 },
-                first_ack,
+                |result| drop(first_ack.send(result)),
             ),
         )
         .await

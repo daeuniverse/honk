@@ -245,8 +245,8 @@ XDP 不可同时配置
 后端、Direct 方式、有效 AF_XDP 绑定模式及接口/分区变更需要重启；受支持的
 防火墙/NAT 规则沿用事务式发布。未知字段及不支持的非零标记续送请求会被拒绝，
 不会被静默忽略。
-接口条目只能是 `名称: lan` 或 `名称: wan`；携带子块（包括空子块）会被拒绝，
-不会忽略其中的设置。
+物理接口声明为 `名称: lan` 或 `名称: wan`。XDP Endpoint 还可用 `名称: l3_lan`
+声明[辅助 IP 接口](#辅助-l3-lan)。接口条目不接受子块，包括空子块。
 
 物理捕获的 `datapath.xsk_mode` 接受 `copy`、`zerocopy` 或 `auto`。省略仍强制 ZeroCopy；Auto 按每个成员的能力与所需 segment 选择。每次 bind 均回读验证，选定模式失败不会重试其他模式。省略与显式 `zerocopy` 在重载时等价，模式变更需重启。TC 和 TUN 拒绝显式模式；Host 私有 queue 独立要求 Copy。
 
@@ -266,16 +266,42 @@ Core Direct 要求 `dial_mode: ip`；域名谓词使用 packet 入口 scope 内�
 
 Core 的输入上下文 FIB 契约拒绝非零 IPv6 flow label 及无法保持语义的路由器扩展头/options；Endpoint 支持 IPv6 不证明 Core 对这些组合具有等价授权。
 
+### 辅助 L3 LAN
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    interface {
+        eth1: lan
+        wg0: l3_lan
+    }
+}
+```
+
+至少配置一个物理 XDP `lan` 或 `wan` 后，可额外声明最多八个名称不同的
+`l3_lan`。辅助口不算物理 worker 或 RX 队列。按实际链路判断：只接收裸 IP
+设备（`ARPHRD_NONE`），MTU 至少 1280，且不得作为默认路由的出口。以太网、
+PPP、GRE 不会因接口名而获准。TC、TUN、Core Direct 和旧 XDP Host 块均不能
+与该角色组合。物理口 XDP 准入失败也不会降级成 TCX。
+
+尚不存在的辅助口可进入 `waiting_link`；启动时已存在却不合规的接口会拒绝
+启动。在役绑定使用 TCX ingress 与专有、无地址、非持久的 `honk-l3-<n>` TUN。
+不要把这些生成名用作配置的接口名。honk 不为内口添加地址、路由或策略规则，
+也不删除既有入向过滤器：若 Endpoint 重定向会跳过传统 ingress 分类器，则不
+绑定该口。若 WireGuard 服务在**被物理捕获的接口**上监听 UDP 53，须为该监听
+显式配置静态 `direct(must)` 流量规则；端口 53 不享受本机服务豁免。
+
 ### XDP Endpoint DNS 投影
 
 `datapath.dns_projection` 是可选布尔值，仅适用于 `backend: xdp`、
-`direct: endpoint` 且至少将一个物理接口声明为 `lan` 的配置。省略或显式写
+`direct: endpoint` 且至少有一个 `lan` 或 `l3_lan` 的配置。省略或显式写
 `true` 都会启用 DNS 投影，写 `false` 可关闭。有效值变更需要重启。TC、
-TUN、XDP Core 和没有物理 LAN 的 XDP Endpoint 必须省略该字段，显式写任一
+TUN、XDP Core 和没有这两种 LAN 角色的 XDP Endpoint 必须省略该字段，显式写任一
 布尔值均会被拒绝。跨合并分段或 include 重复声明，以及结构化输入中的显式
 `null` 也会被拒绝。
 
-只有在同一逻辑 LAN realm 接受的透明 DNS 应答才能提供事实。bond 成员共用 bond 的 realm；每个 VLAN 使用自己的 realm 并继承配置根接口的角色。WAN、Host 和独立 `dns.bind` 均不为 LAN 提供事实。
+只有在同一逻辑 LAN realm 接受的透明 DNS 应答才能提供事实。bond 成员共用 bond 的 realm；每个 VLAN 使用自己的 realm 并继承配置根接口的角色。每个辅助 LAN 的 scope 独立，绑定失效时撤回该域的事实。WAN、Host 和独立 `dns.bind` 均不为 LAN 提供事实。
 
 对于目的端口非 53 的纯 TCP SYN 或完整 UDP 数据报，有序策略选中无 mark 的 `direct(must)`，或在 `dial_mode: ip` 且为 Rule 模式时选中普通无 mark 的 `direct`，才可交内核路由。事实缺失、过期或冲突不能授权新的原生流；既有静态 D1（含 `:53 direct(must)`）不变。
 

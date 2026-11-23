@@ -28,6 +28,8 @@ pub struct UserspaceBackend {
     gateway_capture_started: bool,
     #[cfg(target_os = "linux")]
     gateway_dns_reload: GatewayDnsReload,
+    #[cfg(target_os = "linux")]
+    auxiliary_fenced: bool,
 }
 
 impl UserspaceBackend {
@@ -45,6 +47,8 @@ impl UserspaceBackend {
             gateway_capture_started: false,
             #[cfg(target_os = "linux")]
             gateway_dns_reload: GatewayDnsReload::Initial,
+            #[cfg(target_os = "linux")]
+            auxiliary_fenced: false,
         }
     }
 
@@ -68,6 +72,9 @@ impl UserspaceBackend {
                 "userspace backend is closed"
             );
             publisher.set_mode_flags(self.mode_flags)?;
+            if self.auxiliary_fenced {
+                publisher.pause_auxiliary();
+            }
         }
         if let Some(previous) = &self.gateway
             && gateway
@@ -92,30 +99,74 @@ impl UserspaceBackend {
         publisher: &Arc<crate::xdp::gateway::GatewayPublisher>,
         fingerprint: [u8; 32],
         generation: u64,
-    ) {
+    ) -> std::io::Result<()> {
         if self.gateway_capture_started
             || self
                 .gateway
                 .as_ref()
                 .is_none_or(|current| !Arc::ptr_eq(current, publisher))
         {
-            return;
+            return Ok(());
         }
         match self.gateway_dns_reload {
             GatewayDnsReload::Pending(current) | GatewayDnsReload::Ready(current)
                 if current != generation =>
             {
-                return;
+                return Ok(());
             }
-            GatewayDnsReload::Closed => return,
+            GatewayDnsReload::Closed => return Ok(()),
             _ => {}
         }
-        self.gateway_capture_started = true;
         if matches!(self.gateway_dns_reload, GatewayDnsReload::Initial)
             || self.gateway_dns_reload == GatewayDnsReload::Ready(generation)
         {
-            publisher.activate_dns(fingerprint, generation);
+            publisher.activate_dns(fingerprint, generation, false)?;
         }
+        self.gateway_capture_started = true;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn pause_gateway_auxiliary(&mut self) {
+        self.auxiliary_fenced = true;
+        if let Some(publisher) = &self.gateway {
+            publisher.pause_auxiliary();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restore_gateway_auxiliary(&mut self) -> std::io::Result<()> {
+        if self.auxiliary_fenced
+            && let Some(publisher) = &self.gateway
+        {
+            publisher.restore_auxiliary()?;
+        }
+        self.auxiliary_fenced = false;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_gateway_auxiliary(
+        &self,
+        fingerprint: [u8; 32],
+        generation: u64,
+    ) -> std::io::Result<()> {
+        if self.auxiliary_fenced
+            || matches!(
+                self.gateway_dns_reload,
+                GatewayDnsReload::Pending(_)
+                    | GatewayDnsReload::Degraded
+                    | GatewayDnsReload::Closed
+            )
+        {
+            return Err(std::io::Error::other("gateway publication is not ready"));
+        }
+        if self.gateway_capture_started
+            && let Some(publisher) = &self.gateway
+        {
+            publisher.verify_committed(fingerprint, generation)?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -130,16 +181,22 @@ impl UserspaceBackend {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn finish_gateway_dns_reload(&mut self, generation: u64, fingerprint: [u8; 32]) {
+    pub(crate) fn finish_gateway_dns_reload(
+        &mut self,
+        generation: u64,
+        fingerprint: [u8; 32],
+    ) -> std::io::Result<bool> {
         if self.gateway_dns_reload != GatewayDnsReload::Pending(generation) {
-            return;
+            return Ok(false);
         }
-        self.gateway_dns_reload = GatewayDnsReload::Ready(generation);
+        self.restore_gateway_auxiliary()?;
         if self.gateway_capture_started
             && let Some(publisher) = &self.gateway
         {
-            publisher.activate_dns(fingerprint, generation);
+            publisher.activate_dns(fingerprint, generation, true)?;
         }
+        self.gateway_dns_reload = GatewayDnsReload::Ready(generation);
+        Ok(true)
     }
 
     #[cfg(target_os = "linux")]

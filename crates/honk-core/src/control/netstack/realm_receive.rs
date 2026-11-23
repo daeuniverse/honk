@@ -241,10 +241,11 @@ impl PacketScope {
             return Err(DropReason::NotForUs);
         }
         self.0.with(|inner| {
-            if inner
-                .capture_admission
-                .as_ref()
-                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+            if inner.aborted
+                || inner
+                    .capture_admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
             {
                 return Err(DropReason::Stale);
             }
@@ -276,10 +277,11 @@ impl PacketScope {
             return Err(DropReason::NotForUs);
         }
         self.0.with(|inner| {
-            if inner
-                .capture_admission
-                .as_ref()
-                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+            if inner.aborted
+                || inner
+                    .capture_admission
+                    .as_ref()
+                    .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
             {
                 return Err(DropReason::Stale);
             }
@@ -481,10 +483,11 @@ impl Inner {
         service_at: Instant,
         on_source: impl FnMut(honk_netstack::ValidatedSource) -> bool,
     ) -> (Rx, honk_netstack::ReceiveReport) {
-        if self
-            .capture_admission
-            .as_ref()
-            .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
+        if self.aborted
+            || self
+                .capture_admission
+                .as_ref()
+                .is_some_and(|admission| !admission.load(std::sync::atomic::Ordering::Acquire))
         {
             return (Rx::Dropped(DropReason::Stale), Default::default());
         }

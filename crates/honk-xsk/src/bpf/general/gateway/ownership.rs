@@ -6,13 +6,14 @@ use honk_ebpf_common::xdp_gateway::{
 // These slots are dead after the local-address check. CT reuses TUPLE on a lost insertion.
 const DNS_EPOCH: i16 = LOCAL;
 const PENDING: i16 = LOCAL + 8;
-const REDIRECT: i32 = 4;
 const JEQ_X: u8 = 0x1d;
 const FETCH_ADD: i32 = 1;
 
 pub(super) struct Owner<'a> {
     arb: &'a crate::GatewayArbitration,
+    ct: &'a ConntrackKfuncs,
     pub(super) bad: Target,
+    pub(super) stale: Option<Target>,
     pub(super) qualified: Target,
     held: Target,
     ct_original: Target,
@@ -24,10 +25,16 @@ pub(super) struct Owner<'a> {
 }
 
 impl<'a> Owner<'a> {
-    pub(super) fn new(b: &mut GatewayBuilder, arb: &'a crate::GatewayArbitration) -> Self {
+    pub(super) fn new(
+        b: &mut GatewayBuilder,
+        arb: &'a crate::GatewayArbitration,
+        ct: &'a ConntrackKfuncs,
+    ) -> Self {
         Self {
             arb,
+            ct,
             bad: b.target(),
+            stale: b.auxiliary.map(|_| b.target()),
             qualified: b.target(),
             held: b.target(),
             ct_original: b.target(),
@@ -107,7 +114,7 @@ impl<'a> Owner<'a> {
         b.lookup(gateway.maps.hold.as_raw_fd(), KEY);
         b.jump(JNE_K, 0, 0, 0, guard);
         // Established native traffic needs no guard update and no second lookup.
-        conntrack(b, gateway.conntrack, guard, error, original, reply);
+        conntrack(b, self.ct, guard, error, original, reply);
         b.bind(original);
         b.reason(GatewayReason::PassCtOriginal, pass);
         b.bind(reply);
@@ -123,34 +130,42 @@ impl<'a> Owner<'a> {
         let miss = b.target();
         conntrack(
             b,
-            gateway.conntrack,
+            self.ct,
             miss,
             self.ct_error,
             self.ct_original,
             self.ct_reply,
         );
         b.bind(miss);
-        if !data || gateway.dns.is_none() {
+        let reject_pending = !data || gateway.dns.is_none();
+        if b.auxiliary.is_none() && reject_pending {
             self.pending_conflicts(b);
         }
         let ordinary = b.target();
         b.load(LDX_W, 0, 10, IS_QUOTE);
         b.jump(JEQ_K, 0, 0, 0, ordinary);
-        self.pending_conflicts(b);
-        self.verdict(b, GatewayReason::IcmpQuoteUnresolved, REDIRECT);
+        if b.auxiliary.is_some() {
+            self.verdict(b, GatewayReason::IcmpQuoteUnresolved, VERDICT_DROP);
+        } else {
+            self.pending_conflicts(b);
+            self.verdict(b, GatewayReason::IcmpQuoteUnresolved, VERDICT_ENDPOINT);
+        }
         b.bind(ordinary);
+        if b.auxiliary.is_some() && reject_pending {
+            self.pending_conflicts(b);
+        }
         b.load(LDX_B, 0, 10, KEY + 44);
         b.jump(JEQ_K, 0, 0, 17, d1);
         b.load(LDX_W, 0, 10, TCP_FLAGS);
         b.emit(AND_K, 0, 0, 0, 0x17);
         b.jump(JEQ_K, 0, 0, 2, d1);
         self.pending_conflicts(b);
-        self.verdict(b, GatewayReason::PassTcpNonSynMiss, XDP_PASS);
+        self.verdict(b, GatewayReason::PassTcpNonSynMiss, VERDICT_PASS);
     }
 
     pub(super) fn static_pass(&self, b: &mut GatewayBuilder) {
         self.pending_conflicts(b);
-        self.verdict(b, GatewayReason::PassD1, XDP_PASS);
+        self.verdict(b, GatewayReason::PassD1, VERDICT_PASS);
     }
 
     pub(super) fn finish(
@@ -164,13 +179,13 @@ impl<'a> Owner<'a> {
         if data {
             self.insert(b, gateway);
         } else {
-            self.verdict(b, GatewayReason::XskNewFlow, REDIRECT);
+            self.verdict(b, GatewayReason::XskNewFlow, VERDICT_ENDPOINT);
         }
         b.bind(self.held);
         let refreshed = b.target();
         refresh_hold(b, refreshed);
         b.bind(refreshed);
-        self.verdict(b, GatewayReason::XskEndpointHold, REDIRECT);
+        self.verdict(b, GatewayReason::XskEndpointHold, VERDICT_ENDPOINT);
 
         let hit = b.target();
         let pass = b.target();
@@ -194,18 +209,22 @@ impl<'a> Owner<'a> {
         b.bind(retire_failed);
         b.stat(gateway.maps, GatewayReason::HoldRetireFailed);
         b.bind(pass);
-        b.word(VERDICT, XDP_PASS);
+        b.word(VERDICT, VERDICT_PASS);
         b.goto(self.unlock);
         b.bind(self.ct_error);
-        self.verdict(b, GatewayReason::CtLookupError, XDP_DROP);
+        self.verdict(b, GatewayReason::CtLookupError, VERDICT_DROP);
         b.bind(self.bad);
         self.pending_conflicts(b);
-        self.verdict(b, GatewayReason::UnclassifiableHeader, XDP_DROP);
+        self.verdict(b, GatewayReason::UnclassifiableHeader, VERDICT_DROP);
+        if let Some(stale) = self.stale {
+            b.bind(stale);
+            self.verdict(b, GatewayReason::UnknownRealm, VERDICT_DROP);
+        }
         b.bind(self.conflict);
-        self.verdict(b, GatewayReason::DropNativePendingConflict, XDP_DROP);
+        self.verdict(b, GatewayReason::DropNativePendingConflict, VERDICT_DROP);
         if data {
             b.bind(self.unavailable);
-            self.verdict(b, GatewayReason::DropHoldUnavailable, XDP_DROP);
+            self.verdict(b, GatewayReason::DropHoldUnavailable, VERDICT_DROP);
         }
 
         b.bind(self.unlock);
@@ -216,7 +235,7 @@ impl<'a> Owner<'a> {
         b.goto(drop);
         b.bind(released);
         b.load(LDX_W, 0, 10, VERDICT);
-        b.jump(JNE_K, 0, 0, XDP_DROP, final_pass);
+        b.jump(JNE_K, 0, 0, VERDICT_DROP, final_pass);
         b.load(LDX_W, 0, 10, REASON);
         b.store(STX_W, 10, INDEX, 0);
         b.stat_index(gateway.maps.stats.as_raw_fd());
@@ -273,7 +292,7 @@ impl<'a> Owner<'a> {
             b.store(STX_DW, 10, VALUE, 1);
             b.goto(endpoint);
             b.bind(inserted);
-            self.verdict(b, GatewayReason::PassDnsD1, XDP_PASS);
+            self.verdict(b, GatewayReason::PassDnsD1, VERDICT_PASS);
             b.bind(capped);
             b.jump(JNE_K, 0, 0, NATIVE_PENDING_CAP as i32, self.unavailable);
             b.stat(gateway.maps, GatewayReason::DnsNativePendingCapped);
@@ -282,14 +301,14 @@ impl<'a> Owner<'a> {
         b.update(gateway.maps.hold.as_raw_fd(), KEY, VALUE, 1);
         b.jump(JEQ32_K, 0, 0, -libc::EEXIST, raced);
         b.jump(JNE_K, 0, 0, 0, failed);
-        self.verdict(b, GatewayReason::XskNewFlow, REDIRECT);
+        self.verdict(b, GatewayReason::XskNewFlow, VERDICT_ENDPOINT);
 
         b.bind(raced);
         self.read_owner(b, gateway.maps);
         let miss = b.target();
         conntrack(
             b,
-            gateway.conntrack,
+            self.ct,
             miss,
             self.ct_error,
             self.ct_original,
@@ -309,7 +328,7 @@ impl<'a> Owner<'a> {
             b.helper(5);
             b.jump(JLE_X, 7, 0, 0, self.conflict);
             b.bind(retry);
-            self.verdict(b, GatewayReason::PassDnsD1PendingRetry, XDP_PASS);
+            self.verdict(b, GatewayReason::PassDnsD1PendingRetry, VERDICT_PASS);
         } else {
             b.goto(self.conflict);
         }

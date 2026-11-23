@@ -155,11 +155,14 @@ where
     T::deserialize(deserializer).map(Some)
 }
 
+pub const MAX_L3_LANS: usize = 8;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterfaceRole {
     Lan,
     Wan,
+    L3Lan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -512,8 +515,28 @@ impl DatapathConfig {
         {
             return Err(invalid("workers requires XDP and must be 1 or 2"));
         }
-        if self.effective_workers() == 2 && self.interfaces.is_empty() {
+        let auxiliary = self
+            .interfaces
+            .iter()
+            .filter(|interface| interface.role == InterfaceRole::L3Lan)
+            .count();
+        let physical = self.interfaces.len() - auxiliary;
+        if self.effective_workers() == 2 && physical == 0 {
             return Err(invalid("workers: 2 requires physical XDP interfaces"));
+        }
+        if auxiliary != 0 {
+            if self.backend != Backend::Xdp
+                || self.direct != Some(DirectProfile::Endpoint)
+                || self.host.is_some()
+                || physical == 0
+            {
+                return Err(invalid(
+                    "l3_lan requires XDP Endpoint with a physical LAN or WAN and without Host",
+                ));
+            }
+            if auxiliary > MAX_L3_LANS {
+                return Err(invalid("XDP accepts at most eight l3_lan interfaces"));
+            }
         }
         if let Some(host) = &self.host {
             if self.backend != Backend::Xdp || self.direct != Some(DirectProfile::Endpoint) {
@@ -547,10 +570,9 @@ impl DatapathConfig {
                         "XDP requires explicit direct: core or direct: endpoint",
                     ));
                 }
-                if (self.interfaces.is_empty() && self.host.is_none()) || self.interfaces.len() > 16
-                {
+                if (physical == 0 && self.host.is_none()) || physical > 16 {
                     return Err(invalid(
-                        "XDP requires between one and sixteen explicit interfaces",
+                        "XDP requires between one and sixteen explicit physical interfaces",
                     ));
                 }
                 for (index, interface) in self.interfaces.iter().enumerate() {
@@ -609,15 +631,14 @@ impl DatapathConfig {
     fn supports_dns_projection(&self) -> bool {
         self.backend == Backend::Xdp
             && self.direct == Some(DirectProfile::Endpoint)
-            && self
-                .interfaces
-                .iter()
-                .any(|interface| interface.role == InterfaceRole::Lan)
+            && self.interfaces.iter().any(|interface| {
+                matches!(interface.role, InterfaceRole::Lan | InterfaceRole::L3Lan)
+            })
     }
 
     pub(crate) fn validate_dns_projection(&self) -> Result<(), &'static str> {
         if self.dns_projection.is_some() && !self.supports_dns_projection() {
-            return Err("dns_projection requires XDP Endpoint with a physical LAN interface");
+            return Err("dns_projection requires XDP Endpoint with a LAN or l3_lan interface");
         }
         Ok(())
     }

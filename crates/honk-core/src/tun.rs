@@ -16,7 +16,8 @@ use honk_netstack::{
     Csum, GsoKind, GsoRx, MemoryBudget, MemoryReservation, RxMeta, Transmit, TxCaps, TxCsum, wire,
 };
 use honk_xsk::topology::Topology;
-use setup::{TunDevice, TunSetup};
+pub(crate) use setup::TunDevice;
+use setup::TunSetup;
 use std::{
     future::poll_fn,
     io,
@@ -31,11 +32,11 @@ use std::{
 };
 use tokio::io::unix::AsyncFd;
 
-const BATCH: usize = 32;
+pub(crate) const BATCH: usize = 32;
 const VNET_BYTES: usize = 10;
-const MAX_IP_BYTES: usize = 40 + u16::MAX as usize;
-const RX_BYTES: usize = VNET_BYTES + MAX_IP_BYTES + 1;
-const TX_CAPS: TxCaps = TxCaps {
+pub(crate) const MAX_IP_BYTES: usize = 40 + u16::MAX as usize;
+pub(crate) const RX_BYTES: usize = VNET_BYTES + MAX_IP_BYTES + 1;
+pub(crate) const TX_CAPS: TxCaps = TxCaps {
     tso4: true,
     tso6: true,
     uso4: false,
@@ -421,7 +422,7 @@ impl Drop for Runtime {
     }
 }
 
-fn admit_packet(
+pub(crate) fn admit_packet(
     endpoints: &PacketEndpoints,
     scope: honk_datapath::ScopeId,
     packet: &[u8],
@@ -444,7 +445,7 @@ fn admit_packet(
     }
 }
 
-fn poll_topology<T: AsRawFd>(
+pub(crate) fn poll_topology<T: AsRawFd>(
     io: &mut AsyncFd<T>,
     cx: &mut Context<'_>,
     mut changed: impl FnMut(&mut T) -> io::Result<bool>,
@@ -463,7 +464,7 @@ fn poll_topology<T: AsRawFd>(
     Ok(Poll::Ready(false))
 }
 
-fn turn_limit(attempts: usize, bytes: usize, started: Instant, maximum: usize) -> bool {
+pub(crate) fn turn_limit(attempts: usize, bytes: usize, started: Instant, maximum: usize) -> bool {
     attempts >= maximum
         || bytes >= TURN_BYTES
         || (attempts != 0 && attempts.is_multiple_of(8) && started.elapsed() >= TURN_TIME)
@@ -499,7 +500,7 @@ fn exact_record(packet: &[u8]) -> bool {
     }
 }
 
-fn decode_record(record: &[u8]) -> Option<(&[u8], RxMeta)> {
+pub(crate) fn decode_record(record: &[u8]) -> Option<(&[u8], RxMeta)> {
     if record.len() >= RX_BYTES {
         return None;
     }
@@ -590,7 +591,7 @@ fn vnet_header(packet: &[u8], transmit: Transmit) -> io::Result<[u8; VNET_BYTES]
     Ok(header)
 }
 
-fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
+pub(crate) fn read_packet(fd: RawFd, buffer: &mut [u8]) -> io::Result<usize> {
     // SAFETY: buffer is a unique writable slice and fd remains owned across this call.
     let count = unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) };
     if count < 0 {
@@ -620,7 +621,7 @@ fn write_packet(fd: RawFd, header: &[u8; VNET_BYTES], packet: &[u8]) -> io::Resu
     }
 }
 
-fn poll_flush<T: AsRawFd>(
+pub(crate) fn poll_flush<T: AsRawFd>(
     io: &AsyncFd<T>,
     cx: &mut Context<'_>,
     pending: &mut [Option<OutputLease>; BATCH],
@@ -707,7 +708,7 @@ fn flush_pending(
     Ok((false, false))
 }
 
-fn poll_deadline(
+pub(crate) fn poll_deadline(
     mut timer: Pin<&mut Option<tokio::time::Sleep>>,
     deadline: Option<Instant>,
     cx: &mut Context<'_>,

@@ -14,6 +14,13 @@ use honk_netstack::{MemoryBudget, MemoryReservation};
 
 use crate::bpf::{attributes, wait_netlink};
 
+mod auxiliary;
+pub use auxiliary::{AuxLinkInfo, AuxLinkWatch};
+
+const IFLA_GSO_IPV4_MAX_SIZE: u16 = 63;
+const IFLA_GRO_IPV4_MAX_SIZE: u16 = 64;
+const LEGACY_OFFLOAD_MAX_SIZE: u32 = 65_536;
+
 const MAX_OBJECTS: usize = 65_536;
 const RTNL_BUFFER_BYTES: usize = 65_536;
 pub(crate) const MAX_BROADCASTS: usize = 64;
@@ -296,6 +303,25 @@ pub fn check_gateway_defaults(captured: &[u32]) -> io::Result<()> {
 
 fn check_gateway_defaults_snapshot(snapshot: &Snapshot, captured: &[u32]) -> io::Result<()> {
     snapshot.gateway_defaults(captured)
+}
+
+pub(crate) fn auxiliary_up(ifindex: u32) -> io::Result<bool> {
+    let fd = route_socket(false)?;
+    let mut observed = Snapshot::default();
+    dump(
+        fd.as_fd(),
+        1,
+        libc::RTM_GETLINK,
+        16,
+        &mut observed,
+        Instant::now() + Duration::from_secs(2),
+    )?;
+    observed
+        .links
+        .iter()
+        .find(|link| link.index == ifindex)
+        .map(|link| link.flags & libc::IFF_UP as u32 != 0)
+        .ok_or_else(|| io::Error::from_raw_os_error(libc::ENODEV))
 }
 
 fn capture_layout_snapshot(snapshot: &Snapshot, names: &[String]) -> io::Result<Vec<CaptureRealm>> {
@@ -1111,22 +1137,27 @@ fn route_socket(watch: bool) -> io::Result<OwnedFd> {
     {
         return Err(io::Error::last_os_error());
     }
-    let ipv6_rules: libc::c_int = 19;
-    // SAFETY: the supplied option is a live integer, for RTNLGRP_IPV6_RULE.
-    if watch
-        && unsafe {
-            libc::setsockopt(
-                raw,
-                270,
-                1,
-                (&ipv6_rules as *const libc::c_int).cast(),
-                size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        } < 0
+    if watch {
+        join_route_group(fd.as_fd(), libc::RTNLGRP_IPV6_RULE)?;
+    }
+    Ok(fd)
+}
+
+fn join_route_group(fd: BorrowedFd<'_>, group: libc::c_uint) -> io::Result<()> {
+    // SAFETY: the supplied option points to a live group number.
+    if unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_NETLINK,
+            libc::NETLINK_ADD_MEMBERSHIP,
+            (&group as *const libc::c_uint).cast(),
+            size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    } < 0
     {
         return Err(io::Error::last_os_error());
     }
-    Ok(fd)
+    Ok(())
 }
 
 fn dump(
@@ -1157,12 +1188,33 @@ fn dump_with_buffer(
     deadline: Instant,
     buffer: &mut [u8],
 ) -> io::Result<()> {
-    let mut request = [0u8; 32];
-    let length = 16 + body_len;
+    dump_request(
+        fd,
+        sequence,
+        kind,
+        &[0; 16][..body_len],
+        deadline,
+        buffer,
+        |message, body| snapshot.push(message, body),
+    )
+}
+
+fn dump_request(
+    fd: BorrowedFd<'_>,
+    sequence: u32,
+    kind: u16,
+    request_body: &[u8],
+    deadline: Instant,
+    buffer: &mut [u8],
+    mut receive: impl FnMut(u16, &[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    let mut request = [0u8; 36];
+    let length = 16 + request_body.len();
     request[..4].copy_from_slice(&(length as u32).to_ne_bytes());
     request[4..6].copy_from_slice(&kind.to_ne_bytes());
     request[6..8].copy_from_slice(&0x301u16.to_ne_bytes());
     request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    request[16..length].copy_from_slice(request_body);
     // SAFETY: zero is valid initialization for sockaddr_nl.
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -1274,9 +1326,7 @@ fn dump_with_buffer(
                     done = true;
                 }
                 4 => return Err(malformed("topology netlink overrun")),
-                16 | 20 | 24 | 32 | 104 if !done && message == kind - 2 && flags & 2 != 0 => {
-                    snapshot.push(message, body)?
-                }
+                _ if !done && message == kind - 2 && flags & 2 != 0 => receive(message, body)?,
                 _ => return Err(malformed("unexpected topology dump message")),
             }
             let advance = (length + 3) & !3;
@@ -1316,7 +1366,23 @@ struct Link {
     tx_queues: u32,
     vlan: Option<(u16, u16)>,
     bond: Option<(u8, u8)>,
+    big_tcp: bool,
+    has_hardware_address: bool,
 }
+
+impl Link {
+    fn is_owned_tun(&self, name: [u8; 16], mtu: u32) -> bool {
+        // tun_net_initialize sets POINTOPOINT|NOARP|MULTICAST. An attached,
+        // administratively up queue also reports RUNNING|LOWER_UP.
+        self.name == Some(name)
+            && self.mtu == Some(mtu)
+            && self.kind == interface_name(b"tun").ok()
+            && self.arphrd == libc::ARPHRD_NONE
+            && self.flags == 0x110d1
+            && self.master == 0
+    }
+}
+
 #[derive(Clone)]
 struct Address {
     family: u8,
@@ -1341,6 +1407,7 @@ struct Rule {
     mask: u32,
     action: u8,
     iif: Option<[u8; 16]>,
+    oif: Option<[u8; 16]>,
     flags: u32,
     unsupported: bool,
 }
@@ -1349,6 +1416,7 @@ struct Route {
     family: u8,
     table: u32,
     output: u32,
+    input: u32,
     default: bool,
     kind: u8,
     simple: bool,
@@ -1554,9 +1622,12 @@ impl Snapshot {
                     tx_queues: 0,
                     vlan: None,
                     bond: None,
+                    big_tcp: false,
+                    has_hardware_address: false,
                 };
                 let mut parent = index;
                 let mut seen = 0;
+                let mut seen_offload = 0;
                 let mut info_data = None;
                 attributes(&body[16..], |kind, value| {
                     match kind {
@@ -1570,11 +1641,23 @@ impl Snapshot {
                             }
                             link.mac.copy_from_slice(value);
                         }
+                        1 if arphrd == libc::ARPHRD_NONE => {
+                            link.has_hardware_address = !value.is_empty();
+                        }
                         31 => link.tx_queues = exact_u32(value)?,
                         32 => link.rx_queues = exact_u32(value)?,
                         3 => link.name = Some(netlink_name(value)?),
                         4 => link.mtu = Some(exact_u32(value)?),
                         5 => parent = exact_u32(value)?,
+                        libc::IFLA_GSO_MAX_SIZE
+                        | libc::IFLA_GRO_MAX_SIZE
+                        | IFLA_GSO_IPV4_MAX_SIZE
+                        | IFLA_GRO_IPV4_MAX_SIZE
+                            if arphrd == libc::ARPHRD_NONE =>
+                        {
+                            unique_attribute(&mut seen_offload, kind - libc::IFLA_GSO_MAX_SIZE)?;
+                            link.big_tcp |= exact_u32(value)? > LEGACY_OFFLOAD_MAX_SIZE;
+                        }
                         10 => {
                             link.master = exact_u32(value)?;
                         }
@@ -1713,6 +1796,7 @@ impl Snapshot {
                     mask: 0,
                     action: body[7],
                     iif: None,
+                    oif: None,
                     flags,
                     unsupported: body[1..4] != [0, 0, 0] || body[5..7] != [0, 0],
                 };
@@ -1727,6 +1811,10 @@ impl Snapshot {
                         10 => rule.mark = Some(exact_u32(value)?),
                         15 => rule.table = exact_u32(value)?,
                         16 => rule.mask = exact_u32(value)?,
+                        17 => {
+                            rule.oif = Some(netlink_name(value)?);
+                            rule.unsupported = true;
+                        }
                         14 if exact_u32(value)? == u32::MAX => {}
                         18 if value.is_empty() => {}
                         21 if value.len() == 1 => {}
@@ -1746,6 +1834,7 @@ impl Snapshot {
                     family: body[0],
                     table: u32::from(body[4]),
                     output: 0,
+                    input: 0,
                     default: body[1] == 0,
                     kind: body[7],
                     simple: body[2] == 0 && body[3] == 0,
@@ -1785,6 +1874,12 @@ impl Snapshot {
                                         .map_err(|_| malformed("invalid IPv4 route destination"))?,
                                 ));
                             }
+                        }
+                        3 => {
+                            route.input = exact_u32(value)?;
+                            route.simple = false;
+                            route.unsupported = true;
+                            route.gateway_unsupported = true;
                         }
                         4 => route.output = exact_u32(value)?,
                         9 => {
@@ -2069,17 +2164,12 @@ impl Snapshot {
     }
 
     fn tun_link(&self, spec: &TunSpec<'_>, index: u32) -> bool {
-        // tun_net_initialize sets POINTOPOINT|NOARP|MULTICAST; an attached,
-        // administratively up queue also reports RUNNING|LOWER_UP.
-        self.links.iter().any(|link| {
-            link.index == index
-                && interface_name(spec.name.as_bytes()).ok() == link.name
-                && link.mtu == Some(spec.mtu)
-                && link.kind == interface_name(b"tun").ok()
-                && link.arphrd == 0xfffe
-                && link.flags == 0x110d1
-                && link.master == 0
-        })
+        let Ok(name) = interface_name(spec.name.as_bytes()) else {
+            return false;
+        };
+        self.links
+            .iter()
+            .any(|link| link.index == index && link.is_owned_tun(name, spec.mtu))
     }
 
     fn system_tun_rule(rule: &Rule) -> bool {
@@ -2287,7 +2377,7 @@ mod tests {
 
     mod tun;
 
-    fn capture_notification(kind: u16, body: &[u8]) -> Vec<u8> {
+    pub(super) fn capture_notification(kind: u16, body: &[u8]) -> Vec<u8> {
         let length = 16 + body.len();
         let mut bytes = vec![0; 16];
         bytes[..4].copy_from_slice(&(length as u32).to_ne_bytes());
@@ -2641,7 +2731,7 @@ mod tests {
         assert!(tun_notifications(&[1, 2, 3], &spec, 9).is_err());
     }
 
-    fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    pub(super) fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
         let length = value.len() + 4;
         bytes.extend_from_slice(&(length as u16).to_ne_bytes());
         bytes.extend_from_slice(&kind.to_ne_bytes());

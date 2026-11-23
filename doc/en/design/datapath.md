@@ -236,6 +236,10 @@ An admitted 802.3ad bond is one logical realm, with XDP on its physical Ethernet
 
 Kernel map/program memory is charged alongside UMEM to the shared 384 MiB capture budget; reload temporarily charges old and new generations. See [reload limitations](./control-plane.md#reload-and-runtime-generations).
 
+A configured [auxiliary L3 LAN](../reference/global.md#auxiliary-l3-lan) enters this policy at TCX ingress without a MAC fact. Native decisions continue the kernel chain; Endpoint redirects go to the binding's exclusive, unnumbered TUN. The TCX program uses its own per-CPU scratch and skb conntrack lookup. It bounds header reads by both the declared IP extent and the linear skb extent, pulling only missing header bytes. ICMP errors with a known Endpoint owner reach the Stack for quote validation; an unresolved transport quote does not create an owner.
+
+The shared-runtime TUN task owns the reads, writes and packet driver; it does not service a physical AF_XDP queue. Both directions check the binding's device pair, so a reused numeric ifindex is not permission to redirect. A device-owned terminal drop on the private TUN remains effective if its FD-owned return program disappears first. Replacement unregisters the old TUN and retires that binding's packet work and DNS permissions before admitting a new one. A successful `writev` is not evidence that the old kernel backlog was empty. Reload replaces physical and active auxiliary links in order, with reverse-order rollback; Linux does not change all links at a single packet boundary.
+
 SG/multi-buffer capability advertisement and successful binding are not runtime
 proof of jumbo traffic. The manual veth smoke exercises MTU 1500 and 9000 in Copy
 mode: each UDP reply must arrive as one complete datagram, and the jumbo cases

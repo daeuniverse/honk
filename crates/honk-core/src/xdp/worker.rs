@@ -569,6 +569,7 @@ pub(super) struct Shared {
     wake: [Arc<Notify>; 2],
     admission: Arc<AtomicBool>,
     relays: OnceLock<RelayOwners>,
+    pub(super) auxiliary: OnceLock<super::aux_tasks::AuxTasks>,
     closing: AtomicBool,
     peers: Arc<PeerAuthority>,
     pub(super) workers: u8,
@@ -600,6 +601,7 @@ impl Shared {
                 peers: PeerAuthority::new(Arc::clone(&admission)),
                 admission,
                 relays: OnceLock::new(),
+                auxiliary: OnceLock::new(),
                 closing: AtomicBool::new(false),
                 workers,
                 placements: OnceLock::new(),
@@ -797,7 +799,9 @@ impl Shared {
         shutdown.open_capture(&self.admission)?;
         state.activated = true;
         drop(state);
-        if let Err(error) = endpoints.capture_ready() {
+        if self.auxiliary.get().is_none()
+            && let Err(error) = endpoints.capture_ready()
+        {
             self.begin_close();
             return Err(error.into());
         }
@@ -1790,6 +1794,17 @@ async fn finish_coordinator(
             {
                 result.1 = result.1.map_err(|error| {
                     error.context("packet endpoint close panicked while retaining capture")
+                });
+            }
+        }
+        if let Some(auxiliary) = workers.auxiliary.get() {
+            auxiliary.stop();
+            if let Err(aux) = auxiliary.join().await {
+                result.1 = Err(match result.1 {
+                    Ok(()) => aux,
+                    Err(error) => {
+                        error.context(format!("auxiliary TUN teardown also failed: {aux:#}"))
+                    }
                 });
             }
         }

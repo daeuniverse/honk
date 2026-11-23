@@ -201,6 +201,20 @@ pub(crate) struct RoutingProjection {
     publication_released: tokio::sync::Notify,
 }
 
+/// The binding admitted for a DNS query, retained through asynchronous publication.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QueryScope {
+    scope: ScopeId,
+    binding: u64,
+}
+
+impl QueryScope {
+    pub(crate) const HOST: Self = Self {
+        scope: ScopeId::HOST,
+        binding: 0,
+    };
+}
+
 /// One scope's withdrawal identity and original applicable expiry in tokio time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FactStamp {
@@ -344,7 +358,7 @@ impl RoutingProjection {
     #[cfg(test)]
     pub(crate) fn update_snapshot(&self, snapshot: Arc<RoutingProjectionSnapshot>) {
         assert!(
-            self.try_mutate(ScopeId::HOST, snapshot.generation(), |state| {
+            self.try_mutate(QueryScope::HOST, snapshot.generation(), |state| {
                 state.update_snapshot(&snapshot);
                 0
             })
@@ -358,8 +372,14 @@ impl RoutingProjection {
         snapshot: Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) {
+        let query = if self.owns_packet_scope(scope) {
+            self.packet_query_scope(scope)
+                .expect("test DNS scope is offline")
+        } else {
+            QueryScope { scope, binding: 0 }
+        };
         assert!(
-            self.try_submit(scope, &snapshot, observation),
+            self.try_submit(query, &snapshot, observation),
             "test submission met a held publication fence"
         );
     }
@@ -385,12 +405,32 @@ impl RoutingProjection {
                 }),
             "packet DNS scopes must be distinct non-HOST scopes"
         );
-        let bytes = std::alloc::Layout::array::<state::PacketFactScope>(scopes.len())?.size();
-        let charge = budget
-            .reserve(bytes)
-            .ok_or_else(|| anyhow::anyhow!("packet DNS scope registration memory capacity"))?;
-        let table = scopes.map(state::PacketFactScope::new).collect();
-        self.state.lock().register_packet_scopes(table, charge)
+        self.state.lock().register_packet_scopes(scopes, budget)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn register_aux_scopes(
+        &self,
+        scopes: &[ScopeId],
+        budget: &Arc<honk_netstack::MemoryBudget>,
+    ) -> std::io::Result<()> {
+        self.state.lock().register_aux_scopes(scopes, budget)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_aux_binding(&self, scope: ScopeId, active: bool) -> std::io::Result<()> {
+        self.state.lock().set_aux_binding(scope, active)?;
+        self.publication_released.notify_waiters();
+        self.notify_worker();
+        Ok(())
+    }
+
+    pub(crate) fn packet_query_scope(&self, scope: ScopeId) -> Option<QueryScope> {
+        self.state.lock().packet_query_scope(scope)
+    }
+
+    pub(crate) fn query_scope_is_current(&self, query: QueryScope) -> bool {
+        query.binding == 0 || self.packet_query_scope(query.scope) == Some(query)
     }
 
     pub(crate) fn owns_packet_scope(&self, scope: ScopeId) -> bool {
@@ -442,23 +482,24 @@ impl RoutingProjection {
     /// until their exact snapshot is committed, without taking the HOST fence.
     pub(crate) fn try_submit(
         &self,
-        scope: ScopeId,
+        query: QueryScope,
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) -> bool {
-        self.submit_observation(scope, snapshot, observation, false)
+        self.submit_observation(query, snapshot, observation, false)
     }
 
     fn submit_observation(
         &self,
-        scope: ScopeId,
+        query: QueryScope,
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
         cache_hit: bool,
     ) -> bool {
         #[cfg(target_os = "linux")]
         let mut export = None;
-        let submitted = self.try_mutate(scope, snapshot.generation(), |state| {
+        let scope = query.scope;
+        let submitted = self.try_mutate(query, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
@@ -504,12 +545,13 @@ impl RoutingProjection {
     /// Returns `false` until the matching publication can accept the observation.
     pub(crate) fn try_submit_cache_hit(
         &self,
-        scope: ScopeId,
+        query: QueryScope,
         snapshot: &Arc<RoutingProjectionSnapshot>,
         observation: ProjectionObservation<'_>,
     ) -> bool {
+        let scope = query.scope;
         if scope != ScopeId::HOST {
-            return self.submit_observation(scope, snapshot, observation, true);
+            return self.submit_observation(query, snapshot, observation, true);
         }
         let ProjectionObservation::Positive {
             domain,
@@ -519,7 +561,7 @@ impl RoutingProjection {
             ..
         } = observation
         else {
-            return self.try_submit(scope, snapshot, observation);
+            return self.try_submit(query, snapshot, observation);
         };
         let now = tokio::time::Instant::now();
         let hints = &self.hints[family as usize];
@@ -538,7 +580,7 @@ impl RoutingProjection {
         if coalesced {
             return true;
         }
-        self.try_mutate(scope, snapshot.generation(), |state| {
+        self.try_mutate(query, snapshot.generation(), |state| {
             if !state.update_snapshot(snapshot) {
                 crate::stats::record_dns_event(
                     crate::stats::DnsStatEvent::ProjectionStaleGeneration,
@@ -613,12 +655,15 @@ impl RoutingProjection {
     /// use the committed snapshot under the state lock and cannot advance it.
     fn try_mutate(
         &self,
-        scope: ScopeId,
+        query: QueryScope,
         generation: u64,
         operation: impl FnOnce(&mut DesiredState) -> u64,
     ) -> bool {
-        if scope != ScopeId::HOST {
+        if query.scope != ScopeId::HOST {
             let mut state = self.state.lock();
+            if query.binding != 0 && state.packet_query_scope(query.scope) != Some(query) {
+                return true;
+            }
             if generation > state.snapshot.generation() {
                 return false;
             }

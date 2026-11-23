@@ -41,6 +41,11 @@ pub(crate) use realm::{PacketRealm, PacketRealmPlan, TcpClaim};
 #[cfg(target_os = "linux")]
 pub(crate) use realm_receive::RealmRxBatch;
 
+mod auxiliary;
+use auxiliary::Auxiliary;
+pub(in crate::control) use auxiliary::AuxiliaryWork;
+#[cfg(target_os = "linux")]
+pub(crate) use auxiliary::auxiliary_scope;
 mod source;
 pub use source::HostIngress;
 pub(in crate::control) use source::SourceWork;
@@ -221,6 +226,7 @@ struct Shared {
     worker: usize,
     workers: usize,
     budget: Arc<MemoryBudget>,
+    auxiliary: Option<Arc<Auxiliary>>,
     inner: Mutex<Inner>,
     owner_wake: Notify,
     #[cfg(target_os = "linux")]
@@ -498,7 +504,7 @@ impl PacketScope {
     ) -> io::Result<(Self, PacketOwner)> {
         let scope = ScopeId::allocate().ok_or_else(|| invalid("scope identities exhausted"))?;
         Self::new_partition(
-            cfg, budget, limits, now, caps, frame_size, scope, 0, 1, None, false,
+            cfg, budget, limits, now, caps, frame_size, scope, 0, 1, None, false, None,
         )
     }
 
@@ -515,6 +521,7 @@ impl PacketScope {
         workers: usize,
         resources: Option<Arc<RealmResources>>,
         capture: bool,
+        auxiliary: Option<Arc<Auxiliary>>,
     ) -> io::Result<(Self, PacketOwner)> {
         if !matches!(cfg.mode, Mode::Transparent { .. }) {
             return Err(invalid(
@@ -557,7 +564,7 @@ impl PacketScope {
             .ok_or_else(capacity)?;
         let ledger = FrameLedger::new(layout.config, &budget).map_err(io::Error::other)?;
         cfg.shared_budget = Some(Arc::clone(&budget));
-        let stack = match &resources {
+        let mut stack = match &resources {
             Some(shared) => Stack::new_accounted_shard(
                 cfg,
                 now,
@@ -569,12 +576,17 @@ impl PacketScope {
             None => Stack::new_accounted(cfg, now, limits.max_slots),
         }
         .map_err(io::Error::other)?;
+        let paused = auxiliary.is_some();
+        if paused {
+            stack.set_accepting(false);
+        }
         let frames = layout.allocate(0);
         let shared = Arc::new(Shared {
             scope,
             worker,
             workers,
             budget,
+            auxiliary,
             inner: Mutex::new(Inner {
                 rights: Rights::Task,
                 stack: Some(stack),
@@ -616,7 +628,7 @@ impl PacketScope {
                 turn_needs_scan: None,
                 abort_wake_end: 0,
                 closing: false,
-                aborted: false,
+                aborted: paused,
                 finished: false,
                 endpoint_prepared: false,
                 _storage: storage,
@@ -656,7 +668,9 @@ impl PacketScope {
             if inner.closing || !allowed() {
                 return Err(closed());
             }
-            inner.stack.as_mut().ok_or_else(closed)?.set_accepting(true);
+            if self.auxiliary_active() {
+                inner.stack.as_mut().ok_or_else(closed)?.set_accepting(true);
+            }
             Ok(())
         })
     }
@@ -737,13 +751,21 @@ impl PacketScope {
     }
 
     pub fn budget(&self) -> Arc<MemoryBudget> {
-        Arc::clone(&self.0.budget)
+        Arc::clone(
+            self.0
+                .auxiliary
+                .as_ref()
+                .map_or(&self.0.budget, |aux| &aux.root),
+        )
     }
 
     /// Borrowed `Rx` ranges index `packet`: consume/copy them before recycling input storage.
     /// Closing admission does not stop delivery to existing TCP/TIME_WAIT incarnations.
     pub fn receive(&self, packet: &[u8], now: Instant) -> Rx {
         self.0.with(|inner| {
+            if inner.aborted {
+                return Rx::Dropped(DropReason::Stale);
+            }
             if inner.source_work.is_host() {
                 return Rx::Dropped(DropReason::NotForUs);
             }
@@ -965,6 +987,7 @@ impl PacketScope {
     pub fn datagram_sender(&self, source: SocketAddr) -> DatagramSender {
         DatagramSender {
             scope: self.clone(),
+            binding: self.binding(),
             source,
             packet_source: None,
             realm: None,
@@ -985,6 +1008,9 @@ impl PacketScope {
         let mut inner = self.0.inner.lock();
         let wake_credit = !inner.closing && inner.credit_waiters != 0;
         inner.closing = true;
+        if let Some(aux) = &self.0.auxiliary {
+            aux.close();
+        }
         if let Some(stack) = &mut inner.stack {
             stack.set_accepting(false);
         }
@@ -2238,9 +2264,14 @@ impl Drop for OutputOwner {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("auxiliary packet binding retired")]
+pub(in crate::control) struct AuxiliaryBindingRetired;
+
 #[derive(Clone, Debug)]
 pub struct DatagramSender {
     scope: PacketScope,
+    binding: u64,
     source: SocketAddr,
     packet_source: Option<SourceWork>,
     realm: Option<PacketRealm>,
@@ -2275,7 +2306,14 @@ impl DatagramSender {
         let mut waiter = Waiter::new(scope);
         poll_fn(|cx| {
             scope.0.with(|inner| {
-                if inner.closing {
+                let current = scope.binding();
+                if self.binding != current || current & 1 != 0 {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        AuxiliaryBindingRetired,
+                    )));
+                }
+                if inner.closing || inner.aborted {
                     return Poll::Ready(Err(closed()));
                 }
                 if self.packet_source.is_none() && inner.source_work.is_host() {
@@ -2392,8 +2430,16 @@ impl Drop for Waiter<'_> {
             let mut inner = self.scope.0.inner.lock();
             let registration = inner.waiters[index].take().expect("registered waiter");
             inner.credit_waiters -= usize::from(registration.reason == WaitFor::Credit);
+            let device = (inner.aborted && !inner.closing).then(|| inner.device_wake());
+            let terminal = inner.closing;
             drop(inner);
             drop(registration);
+            if let Some(device) = device {
+                self.scope.0.wake_owner(device);
+            }
+            if terminal && let Some(aux) = &self.scope.0.auxiliary {
+                aux.released.notify_one();
+            }
         }
     }
 }

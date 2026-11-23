@@ -1008,11 +1008,8 @@ impl ControlPlaneHandle {
         if let Some(conn_id) = tracker_id {
             self.spawn_process_path_enrichment(conn_id, handoff.as_ref());
         }
-        if let Err(error) = driver.wait_first_ack().await {
-            // First-send failures are terminal for this endpoint; once the
-            // transport call starts, the packet is never replayed.
-            outbound_tracker.increment_errors();
-            return Err(error.into());
+        if !driver.confirm_first_send(&outbound_tracker).await? {
+            return Ok(());
         }
         debug!(
             network = "udp",

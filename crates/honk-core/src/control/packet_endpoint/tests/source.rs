@@ -322,7 +322,7 @@ async fn udp_qualification_requires_ready_enqueue_not_pending_or_refused_work() 
         assert_eq!(receive(&packet[..length]), PacketReceive::default());
         assert_eq!(
             endpoints
-                .queue_datagram(&scope, source, dns, 0, None, None, |budget| {
+                .queue_datagram(&scope, source, dns, 0, None, None, None, |budget| {
                     FundedDatagram::copy_from(&[], budget)
                 })
                 .unwrap_err()
@@ -548,6 +548,7 @@ async fn host_dns_rejects_routing_captured_before_source_cell_reuse() {
                 context,
                 facts: &facts,
             }),
+            None,
             |budget| FundedDatagram::copy_from(&query, budget),
         );
         drop((replacement, pressure));

@@ -8,8 +8,8 @@ use super::connection::{ConnectionGuard, ControlPlaneHandle};
 use super::dns_control::DnsUdpReply;
 use super::dns_listener::{BoundDnsListener, PreparedDnsBind};
 use super::netstack::{
-    FlowIo, HostIngress, PacketDriver, PacketOwner, PacketRealm, PacketRealmPlan, PacketScope,
-    SourceWork, TcpClaim,
+    AuxiliaryWork, FlowIo, HostIngress, PacketDriver, PacketOwner, PacketRealm, PacketRealmPlan,
+    PacketScope, SourceWork, TcpClaim,
 };
 use super::task_registry::TaskRegistry;
 use super::udp_endpoint::{
@@ -43,6 +43,20 @@ fn report_tcp_completion(result: Result<(), tokio::task::JoinError>) {
         && !error.is_cancelled()
     {
         tracing::error!(%error, "packet TCP connection task panicked");
+    }
+}
+
+pub(super) async fn run_until_auxiliary_pause<F: Future>(
+    auxiliary: Option<&AuxiliaryWork>,
+    operation: F,
+) -> Option<F::Output> {
+    match auxiliary {
+        Some(binding) => tokio::select! {
+            biased;
+            _ = binding.cancelled() => None,
+            result = operation => binding.is_active().then_some(result),
+        },
+        None => Some(operation.await),
     }
 }
 
@@ -108,6 +122,12 @@ struct Datagram {
     bytes: FundedDatagram,
     routing: Option<EndpointAdmission>,
     source_work: SourceWork,
+    auxiliary: Option<AuxiliaryWork>,
+}
+
+struct QueuedInitializer {
+    lease: UdpInitLease,
+    auxiliary: Option<AuxiliaryWork>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -140,7 +160,7 @@ impl PacketSource<'_> {
 
 #[allow(clippy::large_enum_variant)]
 enum Work {
-    Tcp(FlowIo, OwnedSemaphorePermit),
+    Tcp(FlowIo, OwnedSemaphorePermit, Option<AuxiliaryWork>),
     Udp(Datagram),
 }
 
@@ -149,6 +169,8 @@ struct Shared {
     realms: Arc<[PacketRealm]>,
     budget: Arc<MemoryBudget>,
     udp_pool: Arc<UdpEndpointPool>,
+    #[cfg(target_os = "linux")]
+    sniffer_pool: Arc<super::packet_sniffer::PacketSnifferPool>,
     tcp_slots: Arc<tokio::sync::Semaphore>,
     udp_slots: Arc<tokio::sync::Semaphore>,
     stats: Arc<crate::stats::StatsManager>,
@@ -166,6 +188,10 @@ struct Shared {
 impl Shared {
     fn is_closing(&self) -> bool {
         self.admission.load(Ordering::Acquire) == CLOSING
+    }
+
+    fn auxiliary_admission_open(&self) -> bool {
+        self.admission.load(Ordering::Acquire) == READY && !self.shutdown.requested()
     }
 
     fn close(&self) {
@@ -301,7 +327,7 @@ pub struct PacketReceive {
 pub struct PacketEndpoints {
     shared: Arc<Shared>,
     sender: mpsc::Sender<Work>,
-    initializers: mpsc::Sender<UdpInitLease>,
+    initializers: mpsc::Sender<QueuedInitializer>,
 }
 
 /// Join handle for the supervisor. Dropping it requests cleanup, never aborts cleanup.
@@ -315,7 +341,7 @@ struct EndpointRuntime {
     shared: Arc<Shared>,
     plane: ControlPlane,
     receiver: mpsc::Receiver<Work>,
-    initializers: mpsc::Receiver<UdpInitLease>,
+    initializers: mpsc::Receiver<QueuedInitializer>,
     owners: Vec<PacketOwner>,
     // Driven scopes park their original owners until the device returns or abandons them.
     driven: bool,
@@ -605,7 +631,7 @@ impl PacketEndpoints {
             )
         })?;
         let bytes = (INGRESS_CAPACITY + 32)
-            .checked_mul(4 * (size_of::<Work>() + size_of::<UdpInitLease>()))
+            .checked_mul(4 * (size_of::<Work>() + size_of::<QueuedInitializer>()))
             .and_then(|n| {
                 n.checked_add(
                     MAX_OWNERS
@@ -648,6 +674,8 @@ impl PacketEndpoints {
             realms,
             budget,
             udp_pool: Arc::clone(&plane.udp_pool),
+            #[cfg(target_os = "linux")]
+            sniffer_pool: Arc::clone(&plane.sniffer_pool),
             tcp_slots: Arc::clone(&plane.concurrency_limit),
             udp_slots: Arc::clone(&plane.udp_concurrency_limit),
             stats: Arc::clone(&plane.stats),
@@ -880,6 +908,13 @@ impl PacketEndpoints {
         }
         let (scope, _claim) =
             self.execution_owner(scope, honk_netstack::wire::PacketView::from_slice(packet))?;
+        let auxiliary = scope.auxiliary_work()?;
+        if auxiliary.is_some() && !self.shared.auxiliary_admission_open() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                DatagramAdmissionClosed,
+            ));
+        }
         self.shared.udp_pool.reap_tasks();
         let mut receive = |admission: &mut Option<EndpointAdmission>| -> io::Result<_> {
             Ok(if let Some(ingress) = host {
@@ -930,7 +965,15 @@ impl PacketEndpoints {
         };
         scope.after_receive();
         self.dispatch_received::<REPORT>(
-            scope, packet, rx, received, completion, admission, host, None,
+            scope,
+            packet,
+            rx,
+            received,
+            completion,
+            admission,
+            host,
+            None,
+            auxiliary.as_ref(),
         )
     }
 
@@ -945,6 +988,7 @@ impl PacketEndpoints {
         mut admission: Option<EndpointAdmission>,
         host: Option<&HostIngress>,
         physical: Option<&SourceWork>,
+        auxiliary: Option<&AuxiliaryWork>,
     ) -> io::Result<PacketReceive> {
         if host.is_some()
             && received.source_context.is_none()
@@ -978,6 +1022,7 @@ impl PacketEndpoints {
                 dscp,
                 admission.take(),
                 captured(),
+                auxiliary,
                 |budget| FundedDatagram::copy_from(&packet[payload], budget),
             ),
             Rx::TransparentOwned {
@@ -996,9 +1041,16 @@ impl PacketEndpoints {
                     }
                     None => physical.cloned().map(PacketSource::Completed),
                 };
-                self.queue_datagram(scope, src, dst, dscp, admission.take(), source, |budget| {
-                    FundedDatagram::from_packet(packet, payload, budget)
-                })
+                self.queue_datagram(
+                    scope,
+                    src,
+                    dst,
+                    dscp,
+                    admission.take(),
+                    source,
+                    auxiliary,
+                    |budget| FundedDatagram::from_packet(packet, payload, budget),
+                )
             }
             Rx::TransparentSplit {
                 src,
@@ -1018,6 +1070,7 @@ impl PacketEndpoints {
                         dscp,
                         admission.take(),
                         captured(),
+                        auxiliary,
                         |budget| FundedDatagram::copy_from(payload, budget),
                     ) {
                         Ok((enqueued, owned)) => {
@@ -1033,7 +1086,7 @@ impl PacketEndpoints {
             }
             _ => Ok((received.qualified_rx, received.taken_over)),
         };
-        self.accept_ready(scope);
+        self.accept_ready(scope, auxiliary);
         result.map(|(qualified_rx, taken_over)| {
             received.qualified_rx = REPORT && qualified_rx;
             received.taken_over = taken_over;
@@ -1050,6 +1103,7 @@ impl PacketEndpoints {
         dscp: u8,
         mut routing: Option<EndpointAdmission>,
         packet_source: Option<PacketSource<'_>>,
+        auxiliary: Option<&AuxiliaryWork>,
         make: impl FnOnce(&Arc<MemoryBudget>) -> Option<FundedDatagram>,
     ) -> io::Result<(bool, bool)> {
         if self.shared.is_closing() {
@@ -1057,6 +1111,9 @@ impl PacketEndpoints {
                 io::ErrorKind::BrokenPipe,
                 DatagramAdmissionClosed,
             ));
+        }
+        if auxiliary.is_some_and(|binding| !binding.is_active()) {
+            return Ok((false, false));
         }
         let permit = self.sender.try_reserve().map_err(|_| {
             io::Error::new(io::ErrorKind::WouldBlock, "packet ingress queue is full")
@@ -1068,7 +1125,7 @@ impl PacketEndpoints {
             let packet_lineage = packet_source.as_ref().and_then(PacketSource::lineage);
             let pool = &self.shared.udp_pool;
             let now = super::udp_endpoint::queue_now();
-            if let Some(reservation) = pool.fast_path_enqueue_payload_at(
+            if let Some((reservation, _)) = pool.enqueue_bound_payload_at(
                 scope.scope(),
                 source,
                 destination,
@@ -1077,6 +1134,8 @@ impl PacketEndpoints {
                 now,
                 &self.shared.stats,
                 packet_lineage,
+                None,
+                auxiliary,
             ) {
                 let enqueued = matches!(reservation, EndpointReservation::Enqueued);
                 return Ok((enqueued, enqueued));
@@ -1104,6 +1163,7 @@ impl PacketEndpoints {
                 &self.shared.stats,
                 packet_lineage,
                 Some(epoch),
+                auxiliary,
             ) {
                 let enqueued = matches!(reservation, EndpointReservation::Enqueued);
                 return Ok((ready && enqueued, enqueued));
@@ -1134,7 +1194,10 @@ impl PacketEndpoints {
                 EndpointReservation::Initializing(mut lease) => {
                     lease.packet_routing = routing.map(EndpointAdmission::into_snapshot);
                     lease.packet_dscp = Some(dscp);
-                    initializer.send(lease);
+                    initializer.send(QueuedInitializer {
+                        lease,
+                        auxiliary: auxiliary.cloned(),
+                    });
                     Ok((false, true))
                 }
                 EndpointReservation::Enqueued => Ok((false, true)),
@@ -1163,13 +1226,17 @@ impl PacketEndpoints {
                 routing: routing.take(),
                 bytes,
                 source_work,
+                auxiliary: auxiliary.cloned(),
             })?;
         permit.send(Work::Udp(datagram));
         Ok((false, true))
     }
 
-    fn accept_ready(&self, scope: &PacketScope) {
-        if self.shared.is_closing() || !scope.has_pending_accept() {
+    fn accept_ready(&self, scope: &PacketScope, auxiliary: Option<&AuxiliaryWork>) {
+        if self.shared.is_closing()
+            || auxiliary.is_some_and(|binding| !binding.is_active())
+            || !scope.has_pending_accept()
+        {
             return;
         }
         for _ in 0..INGRESS_CAPACITY {
@@ -1182,7 +1249,7 @@ impl PacketEndpoints {
             let Some((_, flow)) = scope.poll_accept() else {
                 break;
             };
-            permit.send(Work::Tcp(flow, slot));
+            permit.send(Work::Tcp(flow, slot, auxiliary.cloned()));
         }
     }
 
@@ -1598,15 +1665,21 @@ impl EndpointRuntime {
                 Some(result) = self.tcp_tasks.join_next(), if !self.tcp_tasks.is_empty() => {
                     report_tcp_completion(result);
                 }
-                Some(lease) = self.initializers.recv() => self.dispatch_lease(&handle, lease),
+                Some(initializer) = self.initializers.recv() => self.dispatch_lease(&handle, initializer),
                 work = self.receiver.recv() => match work {
-                    Some(Work::Tcp(flow, permit)) => {
+                    Some(Work::Tcp(flow, permit, auxiliary)) => {
+                        if auxiliary.as_ref().is_some_and(|binding| !binding.is_active()) {
+                            drop((flow, permit, auxiliary));
+                            continue;
+                        }
                         while let Some(result) = self.tcp_tasks.try_join_next() {
                             report_tcp_completion(result);
                         }
                         self.plane.udp_pool.reap_tasks();
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
+                        let mut auxiliary = auxiliary;
                         let owner = flow.direct_relay_runtime()
+                            .filter(|_| auxiliary.is_none())
                             .and_then(|owner| owner.with_completion_credit(&self.shared.budget));
                         let mut connection = Some((handle.clone(), permit, guard, flow));
                         let buffers = crate::relay::COPY_BUFFER_MEMORY + crate::sniffing::SNIFF_MEMORY;
@@ -1631,6 +1704,25 @@ impl EndpointRuntime {
                             Some(Ok(())) => Ok(()),
                             Some(Err(error)) if error.kind() != io::ErrorKind::OutOfMemory => {
                                 Err(error)
+                            }
+                            _ if auxiliary.is_some() => {
+                                self.tcp_tasks
+                                    .spawn_scoped_with(
+                                        |registration| {
+                                            let (handle, permit, guard, flow) = connection.take().unwrap();
+                                            let auxiliary = auxiliary.take().unwrap();
+                                            async move {
+                                                let (_permit, _guard) = (permit, guard);
+                                                if let Err(error) = handle
+                                                    .serve_auxiliary_packet_connection(flow, &auxiliary, registration)
+                                                    .await
+                                                {
+                                                    tracing::debug!(%error, "packet TCP endpoint ended");
+                                                }
+                                            }
+                                        },
+                                        buffers,
+                                    )
                             }
                             _ => {
                                 self.tcp_tasks
@@ -1749,7 +1841,15 @@ impl EndpointRuntime {
     }
 
     async fn dispatch_datagram(&self, handle: &ControlPlaneHandle, datagram: Datagram) {
+        if datagram
+            .auxiliary
+            .as_ref()
+            .is_some_and(|binding| !binding.is_active())
+        {
+            return;
+        }
         let Datagram {
+            auxiliary,
             scope,
             source,
             destination,
@@ -1787,8 +1887,8 @@ impl EndpointRuntime {
             #[cfg_attr(not(feature = "native-api"), allow(unused_mut))]
             let mut snapshot = match packet_routing.take() {
                 Some(snapshot) => snapshot,
-                None => match handle
-                    .prepare_packet_routing_snapshot(
+                None => {
+                    let prepare = handle.prepare_packet_routing_snapshot(
                         scope,
                         source,
                         destination,
@@ -1797,16 +1897,29 @@ impl EndpointRuntime {
                         packet_source,
                         #[cfg(feature = "native-api")]
                         packet_observation.as_ref().unwrap().is_recording(),
-                    )
-                    .await
-                {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => {
-                        tracing::debug!(%error, "packet DNS policy admission failed");
-                        return;
+                    );
+                    match run_until_auxiliary_pause(auxiliary.as_ref(), prepare).await {
+                        Some(Ok(snapshot)) => snapshot,
+                        Some(Err(error)) => {
+                            tracing::debug!(%error, "packet DNS policy admission failed");
+                            return;
+                        }
+                        None => {
+                            #[cfg(feature = "native-api")]
+                            finish_packet_dns(packet_observation.as_ref().unwrap(), None);
+                            return;
+                        }
                     }
-                },
+                }
             };
+            if auxiliary
+                .as_ref()
+                .is_some_and(|binding| !binding.is_active())
+            {
+                #[cfg(feature = "native-api")]
+                finish_packet_dns(packet_observation.as_ref().unwrap(), None);
+                return;
+            }
             if snapshot.mode.name == "block" {
                 #[cfg(feature = "native-api")]
                 if let Some(mut observation) = packet_observation.take() {
@@ -1848,35 +1961,50 @@ impl EndpointRuntime {
                     );
                     return;
                 };
-                match dns.try_admit_packet_query(true, scope) {
+                let admission = dns.try_admit_packet_query(true, scope);
+                if auxiliary.as_ref().is_some_and(|binding| {
+                    !binding.is_active() || (admission.is_err() && dns.query_scope(scope).is_none())
+                }) {
+                    #[cfg(feature = "native-api")]
+                    finish_packet_dns(&observation, None);
+                    return;
+                }
+                match admission {
                     Ok(admission) => {
                         self.plane.stats.record_udp_slow_permit_accepted();
                         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                         pool.spawn_slow_path(async move {
-                            let _guard = guard;
-                            let _response_memory = response_memory;
-                            let _source_work = source_work;
-                            let operation = dns.handle_udp_dns_admitted(
-                                &admission,
-                                &bytes,
-                                source,
-                                destination,
-                                validated,
-                                DnsUdpReply::Packet(&sender),
-                            );
-                            #[cfg(feature = "native-api")]
-                            {
+                            let operation = async move {
+                                let _guard = guard;
+                                let _response_memory = response_memory;
+                                let _source_work = source_work;
+                                let operation = dns.handle_udp_dns_admitted(
+                                    &admission,
+                                    &bytes,
+                                    source,
+                                    destination,
+                                    validated,
+                                    DnsUdpReply::Packet(&sender),
+                                );
+                                #[cfg(feature = "native-api")]
                                 match observer {
                                     Some(observer) => observer.scope(operation).await,
                                     None => operation.await,
                                 }
-                                observation.finish(
-                                    crate::observe::vocab::ConnectionState::Closed,
-                                    "dns_query_completed",
-                                );
-                            }
+                                #[cfg(not(feature = "native-api"))]
+                                operation.await;
+                            };
+                            let completed =
+                                run_until_auxiliary_pause(auxiliary.as_ref(), operation)
+                                    .await
+                                    .is_some();
+                            #[cfg(feature = "native-api")]
+                            finish_packet_dns(
+                                &observation,
+                                completed.then_some("dns_query_completed"),
+                            );
                             #[cfg(not(feature = "native-api"))]
-                            operation.await;
+                            let _ = completed;
                         });
                     }
                     Err(error) => {
@@ -1884,56 +2012,75 @@ impl EndpointRuntime {
                             self.plane.stats.record_udp_slow_permit_accepted();
                             let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
                             pool.spawn_slow_path(async move {
-                                let _guard = guard;
-                                let (_response_memory, _permit) = (response_memory, permit);
-                                let _source_work = source_work;
-                                #[cfg(feature = "native-api")]
-                                let started = Instant::now();
-                                let response = crate::dns::response::build_dns_refused(&bytes);
-                                let operation = async {
-                                    crate::observe::flows::dns::decision(
-                                        "rejected",
-                                        Some("admission_refused"),
-                                    );
-                                    let delivery =
-                                        runtime.run_reply(sender.send_to(&response, source)).await;
-                                    crate::observe::flows::dns::reply_delivery(
-                                        &delivery,
-                                        |length| *length == response.len(),
-                                        "client_send_failed",
-                                    );
-                                };
-                                #[cfg(feature = "native-api")]
-                                {
-                                    let operation = std::pin::pin!(operation);
-                                    let operation = crate::observe::flows::dns::client_scope(
-                                        &bytes,
-                                        validated.ingress(),
-                                        crate::dns::query::DnsRequestMeta::new(
-                                            Some(source.ip()),
-                                            Some(destination),
-                                        ),
-                                        operation,
-                                    );
-                                    match observer {
-                                        Some(observer) => observer.scope(operation).await,
-                                        None => operation.await,
+                                let binding = auxiliary.as_ref();
+                                let operation = async move {
+                                    let _guard = guard;
+                                    let (_response_memory, _permit) = (response_memory, permit);
+                                    let _source_work = source_work;
+                                    #[cfg(feature = "native-api")]
+                                    let started = Instant::now();
+                                    let response = crate::dns::response::build_dns_refused(&bytes);
+                                    let reply = async {
+                                        crate::observe::flows::dns::decision(
+                                            "rejected",
+                                            Some("admission_refused"),
+                                        );
+                                        let delivery = runtime
+                                            .run_reply(sender.send_to(&response, source))
+                                            .await;
+                                        if binding.is_some_and(|binding| !binding.is_active()) {
+                                            crate::observe::flows::dns::delivery(
+                                                "cancelled",
+                                                Some("intentional_retirement"),
+                                            );
+                                        } else {
+                                            crate::observe::flows::dns::reply_delivery(
+                                                &delivery,
+                                                |length| *length == response.len(),
+                                                "client_send_failed",
+                                            );
+                                        }
+                                    };
+                                    #[cfg(feature = "native-api")]
+                                    {
+                                        let reply = std::pin::pin!(reply);
+                                        let reply = crate::observe::flows::dns::client_scope(
+                                            &bytes,
+                                            validated.ingress(),
+                                            crate::dns::query::DnsRequestMeta::new(
+                                                Some(source.ip()),
+                                                Some(destination),
+                                            ),
+                                            reply,
+                                        );
+                                        match observer {
+                                            Some(observer) => observer.scope(reply).await,
+                                            None => reply.await,
+                                        }
+                                        if binding.is_none_or(AuxiliaryWork::is_active) {
+                                            dns.dns_service().observer.observe_client(
+                                                &bytes,
+                                                validated.ingress(),
+                                                Some(source),
+                                                None,
+                                                &response,
+                                                started.elapsed(),
+                                            );
+                                        }
                                     }
-                                    observation.finish(
-                                        crate::observe::vocab::ConnectionState::Closed,
-                                        "dns_query_refused",
-                                    );
-                                    dns.dns_service().observer.observe_client(
-                                        &bytes,
-                                        validated.ingress(),
-                                        Some(source),
-                                        None,
-                                        &response,
-                                        started.elapsed(),
-                                    );
-                                }
+                                    #[cfg(not(feature = "native-api"))]
+                                    reply.await;
+                                };
+                                let completed = run_until_auxiliary_pause(binding, operation)
+                                    .await
+                                    .is_some();
+                                #[cfg(feature = "native-api")]
+                                finish_packet_dns(
+                                    &observation,
+                                    completed.then_some("dns_query_refused"),
+                                );
                                 #[cfg(not(feature = "native-api"))]
-                                operation.await;
+                                let _ = completed;
                             });
                         } else {
                             self.plane.stats.record_udp_slow_permit_rejected();
@@ -1962,7 +2109,7 @@ impl EndpointRuntime {
             packet_routing = Some(snapshot);
         }
         if pool
-            .fast_path_enqueue_payload_at(
+            .enqueue_bound_payload_at(
                 scope,
                 source,
                 destination,
@@ -1973,6 +2120,8 @@ impl EndpointRuntime {
                 packet_source
                     .and_then(SourceWork::optional_context)
                     .map(|source| source.lineage),
+                None,
+                auxiliary.as_ref(),
             )
             .is_some()
         {
@@ -1984,10 +2133,8 @@ impl EndpointRuntime {
                         honk_outbound::runtime::flow_observation::GapReason::NotInstrumented,
                     );
                 }
-                observation.finish(
-                    crate::observe::vocab::ConnectionState::Closed,
-                    "existing_udp_endpoint",
-                );
+                let active = auxiliary.as_ref().is_none_or(AuxiliaryWork::is_active);
+                finish_packet_dns(&observation, active.then_some("existing_udp_endpoint"));
             }
             return;
         }
@@ -2016,20 +2163,53 @@ impl EndpointRuntime {
             {
                 lease.packet_observation = packet_observation.take();
             }
-            self.dispatch_lease(handle, lease);
+            self.dispatch_lease(handle, QueuedInitializer { lease, auxiliary });
+        } else {
+            #[cfg(feature = "native-api")]
+            if auxiliary
+                .as_ref()
+                .is_some_and(|binding| !binding.is_active())
+                && let Some(observation) = packet_observation
+            {
+                finish_packet_dns(&observation, None);
+            }
         }
     }
 
-    fn dispatch_lease(&self, handle: &ControlPlaneHandle, lease: UdpInitLease) {
+    fn dispatch_lease(&self, handle: &ControlPlaneHandle, initializer: QueuedInitializer) {
+        if initializer
+            .auxiliary
+            .as_ref()
+            .is_some_and(|binding| !binding.is_active())
+        {
+            #[cfg(feature = "native-api")]
+            if let Some(observation) = &initializer.lease.packet_observation {
+                finish_packet_dns(observation, None);
+            }
+            return;
+        }
+        let QueuedInitializer { auxiliary, lease } = initializer;
         let handle = handle.clone();
         let guard = ConnectionGuard::new(Arc::clone(&self.plane.drain_tracker));
         self.plane.udp_pool.spawn_slow_path(async move {
+            let _binding = auxiliary;
             let _guard = guard;
             if let Err(error) = handle.serve_udp_connection(lease).await {
                 tracing::debug!(%error, "packet UDP endpoint ended");
             }
         });
     }
+}
+
+#[cfg(feature = "native-api")]
+fn finish_packet_dns(
+    observation: &super::connection::observation::ConnectionObservation,
+    completed: Option<&'static str>,
+) {
+    observation.finish(
+        crate::observe::vocab::ConnectionState::Closed,
+        completed.unwrap_or("intentional_retirement"),
+    );
 }
 
 mod maintenance;

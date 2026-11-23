@@ -714,7 +714,7 @@ async fn late_reserved_tcp_ingress_is_disposed_before_scope_join() {
         }
         let mut closing = Box::pin(endpoints.shutdown());
         assert!(futures::poll!(&mut closing).is_pending());
-        producer.send(Work::Tcp(flow, slot));
+        producer.send(Work::Tcp(flow, slot, None));
         closing.await.unwrap();
         owner.run().await.unwrap();
         drop(endpoints);
@@ -764,7 +764,11 @@ async fn refused_tcp_task_resets_instead_of_gracefully_closing() {
             .try_acquire_owned()
             .unwrap();
         let ceiling = budget.reserve(budget.limit() - budget.used()).unwrap();
-        endpoints.sender.send(Work::Tcp(flow, slot)).await.unwrap();
+        endpoints
+            .sender
+            .send(Work::Tcp(flow, slot, None))
+            .await
+            .unwrap();
         let reply = scope.next_output().await.unwrap();
         let ip = wire::parse_ip(reply.packet()).unwrap();
         let (header, _) = wire::tcp::parse(&reply.packet()[ip.payload]).unwrap();
@@ -886,7 +890,11 @@ async fn connection_panic_does_not_stop_unrelated_packet_udp() {
         let slot = Arc::clone(&endpoints.shared.tcp_slots)
             .try_acquire_owned()
             .unwrap();
-        endpoints.sender.send(Work::Tcp(flow, slot)).await.unwrap();
+        endpoints
+            .sender
+            .send(Work::Tcp(flow, slot, None))
+            .await
+            .unwrap();
         panicked.notified().await;
         let upstream = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let client = "192.0.2.10:42000".parse().unwrap();

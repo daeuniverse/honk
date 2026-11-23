@@ -1,6 +1,10 @@
 use super::*;
 use honk_datapath::ScopeId;
 
+fn permanent(scope: ScopeId) -> QueryScope {
+    QueryScope { scope, binding: 0 }
+}
+
 #[tokio::test(start_paused = true)]
 async fn scoped_owners_share_eviction_and_never_publish_packet_facts_to_host() {
     let now = tokio::time::Instant::now();
@@ -92,7 +96,7 @@ async fn cache_hit_hints_are_scoped_and_packet_answers_ignore_a_kernel_fence() {
     let ip = "192.0.2.91".parse().unwrap();
     let expires_at = tokio::time::Instant::now() + Duration::from_secs(30);
     assert!(projection.try_submit_cache_hit(
-        ScopeId::HOST,
+        QueryScope::HOST,
         &current,
         positive("a.test", &[ip], expires_at),
     ));
@@ -105,7 +109,7 @@ async fn cache_hit_hints_are_scoped_and_packet_answers_ignore_a_kernel_fence() {
     let publication = projection.prepare_snapshot_publication();
     for scope in [first, second] {
         assert!(projection.try_submit_cache_hit(
-            scope,
+            permanent(scope),
             &current,
             positive("a.test", &[ip], expires_at),
         ));
@@ -119,7 +123,7 @@ async fn cache_hit_hints_are_scoped_and_packet_answers_ignore_a_kernel_fence() {
         );
     }
     assert_eq!(projection.state.lock().owner_domains().len(), 3);
-    assert!(projection.try_submit(first, &current, clear_v4("a.test")));
+    assert!(projection.try_submit(permanent(first), &current, clear_v4("a.test")));
     assert!(
         projection
             .packet_bitmap(first, ip, &current.matcher, 1)
@@ -152,7 +156,11 @@ async fn packet_projection_requires_exact_published_generation_and_rebuilds_pred
         positive("a.test", &[ip], expires_at),
     );
     let publication = projection.prepare_snapshot_publication();
-    assert!(!projection.try_submit(scope, &next, positive("b.test", &[late], expires_at)));
+    assert!(!projection.try_submit(
+        permanent(scope),
+        &next,
+        positive("b.test", &[late], expires_at)
+    ));
     assert_eq!(
         projection
             .packet_bitmap(scope, ip, &old.matcher, 1)
@@ -186,7 +194,11 @@ async fn packet_projection_requires_exact_published_generation_and_rebuilds_pred
             .packet_bitmap(scope, ip, &old.matcher, 1)
             .is_err()
     );
-    assert!(projection.try_submit(scope, &old, positive("a.test", &[late], expires_at)));
+    assert!(projection.try_submit(
+        permanent(scope),
+        &old,
+        positive("a.test", &[late], expires_at)
+    ));
     assert!(
         projection
             .packet_bitmap(scope, late, &next.matcher, 2)
@@ -228,10 +240,10 @@ async fn pending_packet_observation_keeps_its_absolute_expiry() {
         std::slice::from_ref(&ip),
         now + Duration::from_secs(1),
     );
-    assert!(!projection.try_submit(scope, &next, pending));
+    assert!(!projection.try_submit(permanent(scope), &next, pending));
     tokio::time::advance(Duration::from_secs(2)).await;
     publication.commit(Arc::clone(&next), None);
-    assert!(projection.try_submit(scope, &next, pending));
+    assert!(projection.try_submit(permanent(scope), &next, pending));
     assert!(
         projection
             .packet_bitmap(scope, ip, &next.matcher, 2)
@@ -346,7 +358,7 @@ async fn packet_cache_hit_shortening_is_applied_exactly() {
     let now = tokio::time::Instant::now();
     for ttl in [Duration::from_secs(2), Duration::from_millis(1500)] {
         assert!(projection.try_submit_cache_hit(
-            scope,
+            permanent(scope),
             &current,
             positive("a.test", &ips, now + ttl),
         ));
@@ -648,6 +660,7 @@ async fn packet_cache_reuse_preserves_only_the_original_owner_deadline() {
     let current = fact_snapshot(1);
     let scope = ScopeId::allocate().unwrap();
     let (projection, _wake, _backend) = registered_projection(&current, &[scope]);
+    let admitted = projection.packet_query_scope(scope).unwrap();
     let ips = ["192.0.2.9".parse().unwrap(); 2];
     let now = tokio::time::Instant::now();
     let row = |revision, seconds| ProjectionObservation::Positive {
@@ -660,13 +673,13 @@ async fn packet_cache_reuse_preserves_only_the_original_owner_deadline() {
     projection.submit(scope, Arc::clone(&current), row(7, 15));
     let original = stamp(&projection, &current, scope, ips[0]);
     for jittered in [14, 16] {
-        assert!(projection.try_submit_cache_hit(scope, &current, row(7, jittered)));
+        assert!(projection.try_submit_cache_hit(admitted, &current, row(7, jittered)));
         assert_eq!(stamp(&projection, &current, scope, ips[0]), original);
     }
-    assert!(projection.try_submit_cache_hit(scope, &current, row(8, 9)));
+    assert!(projection.try_submit_cache_hit(admitted, &current, row(8, 9)));
     assert!(!projection.packet_facts().is_current(original));
     let shorter = stamp(&projection, &current, scope, ips[0]);
-    assert!(projection.try_submit_cache_hit(scope, &current, row(8, 20)));
+    assert!(projection.try_submit_cache_hit(admitted, &current, row(8, 20)));
     assert_eq!(stamp(&projection, &current, scope, ips[0]), shorter);
     tokio::time::advance(Duration::from_secs(9)).await;
     assert!(!projection.packet_facts().is_current(shorter));
@@ -749,13 +762,27 @@ async fn kernel_gateway_dns_canonical_publication() {
     let budget = honk_netstack::MemoryBudget::new(16 * 1024 * 1024);
     let lan = ScopeId::allocate().unwrap();
     let wan = ScopeId::allocate().unwrap();
+    let aux = ScopeId::allocate().unwrap();
     let current = snapshot(1, 1, 2);
-    let (projection, _wake, backend) = registered_projection(&current, &[lan, wan]);
+    let (projection, _wake, backend) = projection_for_test(Arc::clone(&current));
+    projection.register_aux_scopes(&[aux], &budget).unwrap();
+    projection
+        .register_packet_scopes([lan, wan, aux].into_iter(), &budget)
+        .unwrap();
     let denied = honk_netstack::MemoryBudget::new(1);
     let unfunded = GatewayDnsBank::new(&denied, [42; 32], &[(lan, 1)]);
     assert!(matches!(unfunded, Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory));
     assert_eq!(denied.used(), 0);
-    let bank = GatewayDnsBank::new(&budget, [42; 32], &[(lan, 1)]).unwrap();
+    // A physical WAN plus an absent auxiliary LAN can commit an entirely dormant bank.
+    let waiting = GatewayDnsBank::new(&budget, [41; 32], &[(aux, 3)]).unwrap();
+    assert!(projection.activate_gateway_dns(Some(Arc::clone(&waiting)), 1, || true));
+    assert!(waiting.ticket(aux).is_none());
+    projection.set_aux_binding(aux, true).unwrap();
+    assert!(waiting.ticket(aux).is_some());
+    projection.set_aux_binding(aux, false).unwrap();
+    drop(projection.close_gateway_dns());
+    drop(waiting);
+    let bank = GatewayDnsBank::new(&budget, [42; 32], &[(lan, 1), (aux, 3)]).unwrap();
     assert!(bank.ticket(lan).is_none());
     assert!(projection.activate_gateway_dns(Some(Arc::clone(&bank)), 1, || true));
     assert!(bank.ticket(wan).is_none());
@@ -807,6 +834,24 @@ async fn kernel_gateway_dns_canonical_publication() {
     assert!(bank.ticket(lan).is_none());
     assert!(projection.activate_gateway_dns(Some(Arc::clone(&bank)), 2, || true));
     let (_, advanced) = bank.ticket(lan).unwrap();
+    assert!(bank.ticket(aux).is_none());
+    projection.set_aux_binding(aux, true).unwrap();
+    let admission = projection.packet_query_scope(aux).unwrap();
+    assert!(projection.try_submit(admission, &next, positive("a.test", &ips, until)));
+    let (_, original_aux) = bank.ticket(aux).unwrap();
+    let hot = || {
+        projection
+            .packet_domain_bitmap(aux, tail, &next.matcher, 2)
+            .unwrap()
+    };
+    let delayed_fill = hot();
+    projection.hot_fill_packet_domain(hot());
+    projection.set_aux_binding(aux, false).unwrap();
+    assert!(bank.ticket(aux).is_none());
+    assert!(bank.take_fill().is_none());
+    projection.hot_fill_packet_domain(delayed_fill);
+    assert!(bank.take_fill().is_none());
+    assert_eq!(bank.ticket(lan), Some((1, advanced)));
     assert!(advanced > conflicting);
     assert!(!projection.activate_gateway_dns(Some(Arc::clone(&bank)), 1, || true));
     assert_eq!(bank.ticket(lan), Some((1, advanced)));
@@ -814,10 +859,16 @@ async fn kernel_gateway_dns_canonical_publication() {
     assert!(bank.ticket(lan).is_none());
     assert!(projection.activate_gateway_dns(Some(closed), generation, || true));
     assert!(bank.ticket(lan).unwrap().1 > advanced);
+    assert!(bank.ticket(aux).is_none());
+    projection.set_aux_binding(aux, true).unwrap();
+    let (_, replacement_aux) = bank.ticket(aux).unwrap();
+    assert!(replacement_aux > original_aux);
+    assert!(hot().bitmap.is_none());
+    projection.set_aux_binding(aux, false).unwrap();
     let late = projection
         .packet_domain_bitmap(lan, ips[0], &next.matcher, 2)
         .unwrap();
-    let fresh_bank = GatewayDnsBank::new(&budget, [43; 32], &[(lan, 1)]).unwrap();
+    let fresh_bank = GatewayDnsBank::new(&budget, [43; 32], &[(lan, 1), (aux, 3)]).unwrap();
     let next = snapshot(3, 2, 1);
     projection
         .prepare_snapshot_publication()
@@ -859,8 +910,11 @@ async fn kernel_gateway_dns_canonical_publication() {
         })
     );
     assert!(fresh_bank.ticket(lan).is_none());
+    projection.set_aux_binding(aux, true).unwrap();
+    assert!(fresh_bank.ticket(aux).is_none());
     drop(fresh_bank);
     assert!(bank.ticket(lan).is_none());
     drop(bank);
+    drop(projection);
     assert_eq!(budget.used(), 0);
 }

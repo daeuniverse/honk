@@ -101,6 +101,56 @@ async fn overlapping_scopes_keep_real_associations_replies_and_close_independent
 }
 
 #[tokio::test]
+async fn retiring_one_scope_fences_initializers_sources_and_cached_replies() {
+    let retiring = ScopeId::allocate().unwrap();
+    let other = ScopeId::allocate().unwrap();
+    let f = Fixture::with_scopes(QuicUdpMode::Hysteria2, false, &[retiring, other]).await;
+    let target = f.target(0);
+    let old = f.reserve(retiring, f.client(), target, b"old");
+    let survivor = f.reserve(other, f.client(), target, b"survivor");
+    let attachment = f
+        .prepare(retiring, f.client(), target, None, false)
+        .await
+        .commit(&f.pool)
+        .await
+        .unwrap();
+    let foreign = f.target(1);
+    for scope in [retiring, other] {
+        f.pool.foreign_replies.get(scope, foreign, None).unwrap();
+    }
+    let (tx, mut removals) = mpsc::channel(4);
+    f.pool.set_remove_sink(tx);
+    let epoch = f.pool.initialization_epoch();
+    f.pool.retire_auxiliary_scope(retiring);
+    tokio::time::timeout(TEST_TIMEOUT, old.wait_cancellation())
+        .await
+        .unwrap();
+    let removal = removals.try_recv().unwrap();
+    f.pool.retire_auxiliary_scope(retiring);
+    assert!(removals.try_recv().is_err());
+    assert_eq!(
+        (removal.scope, removal.generation),
+        (retiring, old.generation())
+    );
+    assert!(f.pool.contains(retiring, f.client(), target, None));
+    assert!(
+        SourcePreparation::Reused(attachment)
+            .commit(&f.pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(f.pool.foreign_replies.cached(), [(other, foreign)]);
+    assert_eq!(f.pool.initialization_epoch(), epoch);
+    assert!(survivor.still_initializing());
+    drop(old);
+    f.pool.finish_removal(&removal, true);
+    assert!(!f.pool.contains(retiring, f.client(), target, None));
+    drop(survivor);
+    f.pool.finish_removal(&removals.try_recv().unwrap(), true);
+    f.shutdown().await;
+}
+
+#[tokio::test]
 async fn source_attachment_cannot_publish_in_another_scope() {
     let f = Fixture::new(QuicUdpMode::Hysteria2, false).await;
     let domain = ScopeId::allocate().unwrap();

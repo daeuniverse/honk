@@ -37,35 +37,72 @@ fn optional_map_failure(error: io::Error) -> (&'static str, io::Error) {
 impl GatewayPublisher {
     fn build_generation(
         &self,
-        inner: &PublisherInner,
+        inner: &mut PublisherInner,
         plan: &RoutingPushPlan,
         bank: Option<Arc<GatewayDnsBank>>,
         arbitration: Option<Arc<Arbitration>>,
         status: DnsProjectionState,
-    ) -> Result<(Generation, Vec<Programs>), PrepareError> {
+    ) -> Result<(Generation, Candidates), PrepareError> {
         let policy = GatewayPolicy::prepare(plan, bank.is_some()).map_err(PrepareError::Policy)?;
         let mut memory = Vec::with_capacity(inner.members.len() + 1);
         memory.push(
             reserve_objects(&self.budget, policy.fact_fds()).map_err(PrepareError::Candidate)?,
         );
         let mut candidates = Vec::with_capacity(inner.members.len());
+        let load = || GatewayLoad {
+            routing: &policy.bytecode.insns,
+            maps: &self.maps,
+            conntrack: &self.conntrack,
+            dns: bank.as_ref().map(|bank| bank.maps()),
+            arbitration: arbitration.as_ref().map(|arb| &arb.kernel),
+        };
         for member in &inner.members {
             drop(self.state.open_links().map_err(PrepareError::Authority)?);
             let program = member
                 .programs
-                .reload_general_gateway(GatewayLoad {
-                    routing: &policy.bytecode.insns,
-                    maps: &self.maps,
-                    conntrack: &self.conntrack,
-                    dns: bank.as_ref().map(|bank| bank.maps()),
-                    arbitration: arbitration.as_ref().map(|arb| &arb.kernel),
-                })
+                .reload_general_gateway(load())
                 .map_err(PrepareError::Candidate)?;
             memory.push(
                 reserve_objects(&self.budget, program.object_fds().into_iter().skip(2))
                     .map_err(PrepareError::Candidate)?,
             );
             candidates.push(program);
+        }
+        let mut auxiliary = Vec::new();
+        let mut auxiliary_memory = None;
+        if let Some(aux) = inner.auxiliary.as_mut() {
+            let count = aux.members.iter().filter(|m| m.link.is_some()).count();
+            if count != 0 {
+                auxiliary_memory = Some(
+                    self.budget
+                        .reserve(count * size_of::<(u32, AuxProgram)>())
+                        .ok_or_else(|| {
+                            PrepareError::Candidate(io::ErrorKind::OutOfMemory.into())
+                        })?,
+                );
+                auxiliary.reserve_exact(count);
+            }
+            for member in &mut aux.members {
+                if member.link.is_none() {
+                    continue;
+                }
+                drop(self.state.open_links().map_err(PrepareError::Authority)?);
+                match self.load_auxiliary(
+                    &member.pair,
+                    member.realm,
+                    &member.broadcasts[..member.broadcast_count],
+                    load(),
+                    &aux.conntrack,
+                ) {
+                    Ok(program) => auxiliary.push((member.realm, program)),
+                    Err(error) if Self::device_gone(&member.pair) => {
+                        tracing::debug!(realm = member.realm, errno = ?error.raw_os_error(), %error, "auxiliary device left during gateway preparation");
+                        self.close_member(member, &aux.grace)
+                            .map_err(PrepareError::Authority)?;
+                    }
+                    Err(error) => return Err(PrepareError::Candidate(error)),
+                }
+            }
         }
         Ok((
             Generation {
@@ -75,20 +112,25 @@ impl GatewayPublisher {
                 status,
                 memory,
             },
-            candidates,
+            Candidates {
+                physical: candidates,
+                auxiliary,
+                _auxiliary_memory: auxiliary_memory,
+            },
         ))
     }
 
-    fn prepare_generation(
+    /// Returns the static fallback status only when a DNS candidate was not staged.
+    fn try_stage_dns(
         &self,
-        inner: &PublisherInner,
+        inner: &mut PublisherInner,
         plan: &RoutingPushPlan,
-    ) -> io::Result<PreparedGeneration> {
+    ) -> io::Result<Option<DnsProjectionState>> {
         if self.shadow.notrack_latched() {
-            return Ok(PreparedGeneration::KeepStatic(NOTRACK_FALLBACK));
+            return Ok(Some(NOTRACK_FALLBACK));
         }
         if self.shadow.realms.is_empty() || !plan.has_domain_rules {
-            return Ok(PreparedGeneration::KeepStatic(self.shadow.base_status));
+            return Ok(Some(self.shadow.base_status));
         }
         let candidate = GatewayDnsBank::new(&self.budget, plan.fingerprint, &self.shadow.realms)
             .and_then(|bank| {
@@ -108,22 +150,36 @@ impl GatewayPublisher {
                 DnsProjectionState::Staged,
             ) {
                 Ok((generation, programs)) => {
-                    return Ok(PreparedGeneration::Replace(generation, programs));
+                    let suspended = inner
+                        .current
+                        .bank
+                        .as_ref()
+                        .and_then(|_| self.shadow.suspend());
+                    self.stage(
+                        inner,
+                        Previous {
+                            generation,
+                            programs,
+                            suspended,
+                        },
+                    )?;
+                    return Ok(None);
                 }
                 Err(PrepareError::Authority(error)) => return Err(self.fail_capture(error)),
                 Err(error) => error.shadow_failure()?,
             },
         };
         tracing::debug!(reason, %error, "gateway DNS candidate unavailable");
-        Ok(PreparedGeneration::KeepStatic(
-            DnsProjectionState::Fallback(reason),
-        ))
+        Ok(Some(DnsProjectionState::Fallback(reason)))
     }
 
     pub(in crate::xdp) fn capture_error(&self) -> Option<io::Error> {
-        self.failure
-            .get()
-            .map(|error| io::Error::new(error.kind(), Arc::clone(error)))
+        self.failure.get().map(|error| {
+            error.raw_os_error().map_or_else(
+                || io::Error::new(error.kind(), Arc::clone(error)),
+                io::Error::from_raw_os_error,
+            )
+        })
     }
 
     pub(super) fn check_hold_custody(&self) -> io::Result<()> {
@@ -148,10 +204,10 @@ impl GatewayPublisher {
 
     pub(super) fn fail_capture(&self, error: io::Error) -> io::Error {
         // Keep both generations charged until terminal withdrawal has taken the physical links.
-        let failure = self.failure.get_or_init(|| Arc::new(error));
+        self.failure.get_or_init(|| Arc::new(error));
         self.shadow.admission.store(false, Ordering::Release);
         self.stop_dns();
-        io::Error::new(failure.kind(), Arc::clone(failure))
+        self.capture_error().unwrap()
     }
 
     fn static_arbitration(&self, inner: &PublisherInner) -> io::Result<Option<Arc<Arbitration>>> {
@@ -198,9 +254,14 @@ impl GatewayPublisher {
                 return Err(self.fail_capture(error));
             }
         }
-        let candidate = self.prepare_generation(&inner, plan)?;
-        if let PreparedGeneration::KeepStatic(status) = &candidate
-            && initial_static
+        let Some(status) = self.try_stage_dns(&mut inner, plan)? else {
+            return Ok(());
+        };
+        if initial_static
+            && inner
+                .auxiliary
+                .as_ref()
+                .is_none_or(|aux| aux.members.is_empty())
             && inner.current.arbitration.is_none()
             && inner.current.policy.bytecode.fingerprint == plan.fingerprint
         {
@@ -210,8 +271,8 @@ impl GatewayPublisher {
                 verified.map_err(|error| self.fail_capture(error))?;
             }
             let _links = self.state.open_links()?;
-            inner.current.status = *status;
-            self.shadow.report_status(*status);
+            inner.current.status = status;
+            self.shadow.report_status(status);
             return Ok(());
         }
         let suspended = inner
@@ -219,21 +280,17 @@ impl GatewayPublisher {
             .bank
             .as_ref()
             .and_then(|_| self.shadow.suspend());
-        let (generation, programs) = match candidate {
-            PreparedGeneration::Replace(generation, programs) => (generation, programs),
-            PreparedGeneration::KeepStatic(status) => {
-                let arb = self.static_arbitration(&inner)?;
-                match self.build_generation(&inner, plan, None, arb, status) {
-                    Ok(candidate) => candidate,
-                    Err(PrepareError::Authority(error)) => return Err(self.fail_capture(error)),
-                    Err(error) => {
-                        let _links = self.state.open_links()?;
-                        self.shadow.resume(suspended);
-                        return Err(error.into_error());
-                    }
+        let arb = self.static_arbitration(&inner)?;
+        let (generation, programs) =
+            match self.build_generation(&mut inner, plan, None, arb, status) {
+                Ok(candidate) => candidate,
+                Err(PrepareError::Authority(error)) => return Err(self.fail_capture(error)),
+                Err(error) => {
+                    let _links = self.state.open_links()?;
+                    self.shadow.resume(&inner, suspended);
+                    return Err(error.into_error());
                 }
-            }
-        };
+            };
         self.stage(
             &mut inner,
             Previous {
@@ -248,32 +305,47 @@ impl GatewayPublisher {
     fn stage(&self, inner: &mut PublisherInner, candidate: Previous) -> io::Result<()> {
         inner.previous = Some(candidate);
         let previous = inner.previous.as_ref().unwrap();
-        for (index, program) in previous.programs.iter().enumerate() {
+        for (index, program) in previous.programs.physical.iter().enumerate() {
             let old = &inner.members[index].programs;
             let replaced =
                 self.state.open_links()?[index].replace(old.data_fd(), program.data_fd());
             if let Err(error) = replaced {
                 let changed = {
                     let links = self.state.open_links()?;
-                    if links[index].verify(old.data_prog_id()).is_ok() {
+                    if links[index].verify_fd(old.data_prog_id()).is_ok() {
                         Some(index)
-                    } else if links[index].verify(program.data_prog_id()).is_ok() {
+                    } else if links[index].verify_fd(program.data_prog_id()).is_ok() {
                         Some(index + 1)
                     } else {
                         None
                     }
                 };
                 let Some(changed) = changed else {
-                    return Err(self.fail_capture(io::Error::other(format!(
-                        "gateway link identity lost after update: {error}"
-                    ))));
+                    self.restore_links(inner, index, 0, false)?;
+                    tracing::error!(errno = ?error.raw_os_error(), %error, "gateway XDP program identity lost after update");
+                    return Err(self.fail_capture(error));
                 };
-                self.restore_links(inner, changed)?;
-                self.finish_transition(inner, false)?;
-                let _links = self.state.open_links()?;
-                let discarded = inner.previous.take().unwrap();
-                self.shadow.resume(discarded.suspended);
-                return Err(error);
+                return self.reject_update(inner, changed, 0, error);
+            }
+        }
+        let physical = inner.members.len();
+        for (index, (realm, target)) in previous.programs.auxiliary.iter().enumerate() {
+            drop(self.state.open_links()?);
+            let aux = inner.auxiliary.as_mut().unwrap();
+            match self.update_auxiliary(aux, *realm, target, true) {
+                Ok(None) => {}
+                Ok(Some((error, changed))) => {
+                    return self.reject_update(
+                        inner,
+                        physical,
+                        index + usize::from(changed),
+                        error,
+                    );
+                }
+                Err(error) => {
+                    self.restore_links(inner, physical, index, false)?;
+                    return Err(self.fail_capture(error));
+                }
             }
         }
         self.finish_transition(inner, true)?;
@@ -283,14 +355,153 @@ impl GatewayPublisher {
         Ok(())
     }
 
-    fn restore_links(&self, inner: &mut PublisherInner, changed: usize) -> io::Result<()> {
-        let staged = inner.previous.as_ref().unwrap();
-        for index in (0..changed).rev() {
-            let old = &inner.members[index].programs;
-            let replaced = self.state.open_links()?[index]
-                .replace(staged.programs[index].data_fd(), old.data_fd());
+    fn reject_update(
+        &self,
+        inner: &mut PublisherInner,
+        physical: usize,
+        auxiliary: usize,
+        error: io::Error,
+    ) -> io::Result<()> {
+        self.restore_links(inner, physical, auxiliary, false)?;
+        for (index, member) in inner.members.iter().enumerate() {
+            let verified = self.state.open_links()?[index].verify(member.programs.data_prog_id());
+            verified.map_err(|error| self.fail_capture(error))?;
+        }
+        self.finish_transition(inner, false)?;
+        let _links = self.state.open_links()?;
+        let discarded = inner.previous.take().unwrap();
+        self.shadow.resume(inner, discarded.suspended);
+        Err(error)
+    }
+
+    fn device_gone(pair: &AuxDevicePair) -> bool {
+        matches!(pair.unavailable(), Ok(true))
+    }
+
+    // An UPDATE can succeed before its readback fails. Record the exact installed prefix.
+    fn update_auxiliary(
+        &self,
+        aux: &mut Auxiliary,
+        realm: u32,
+        staged: &AuxProgram,
+        to_staged: bool,
+    ) -> io::Result<Option<(io::Error, bool)>> {
+        let member = aux
+            .members
+            .iter_mut()
+            .find(|m| m.realm == realm)
+            .ok_or_else(lost_capture)?;
+        let Some((link, _)) = &member.link else {
+            return Ok(None);
+        };
+        let current = &member.program.as_ref().unwrap().program;
+        let (old, new) = if to_staged {
+            (current, &staged.program)
+        } else {
+            (&staged.program, current)
+        };
+        match link
+            .replace(old.as_fd(), new.as_fd())
+            .and_then(|()| member.pair.verify())
+        {
+            Ok(()) => Ok(None),
+            Err(error) => {
+                let changed = if link.verify_fd(old.id()).is_ok() {
+                    Some(false)
+                } else if link.verify_fd(new.id()).is_ok() {
+                    Some(true)
+                } else {
+                    None
+                };
+                if Self::device_gone(&member.pair) {
+                    tracing::debug!(realm, errno = ?error.raw_os_error(), %error, "auxiliary device left during gateway update");
+                    self.close_member(member, &aux.grace)?;
+                    return Ok(None);
+                }
+                match changed {
+                    Some(changed) => Ok(Some((error, changed))),
+                    None => {
+                        tracing::error!(realm, errno = ?error.raw_os_error(), %error, "auxiliary TCX program identity lost after update");
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    fn restore_links(
+        &self,
+        inner: &mut PublisherInner,
+        physical: usize,
+        auxiliary: usize,
+        to_staged: bool,
+    ) -> io::Result<()> {
+        let staged = &inner.previous.as_ref().unwrap().programs;
+        let mut failure = None;
+        for (realm, target) in staged.auxiliary[..auxiliary].iter().rev() {
+            drop(self.state.open_links()?);
+            match self.update_auxiliary(
+                inner.auxiliary.as_mut().unwrap(),
+                *realm,
+                target,
+                to_staged,
+            ) {
+                Err(error) | Ok(Some((error, false))) => {
+                    failure.get_or_insert(error);
+                }
+                Ok(_) => {}
+            }
+        }
+        for index in (0..physical).rev() {
+            let current = &inner.members[index].programs;
+            let target = &staged.physical[index];
+            let (old, new) = if to_staged {
+                (current, target)
+            } else {
+                (target, current)
+            };
+            let replaced = {
+                let links = self.state.open_links()?;
+                links[index]
+                    .replace(old.data_fd(), new.data_fd())
+                    .or_else(|error| links[index].verify(new.data_prog_id()).map_err(|_| error))
+            };
             if let Err(error) = replaced {
-                return Err(self.fail_capture(error));
+                failure.get_or_insert(error);
+            }
+        }
+        failure.map_or(Ok(()), |error| Err(self.fail_capture(error)))
+    }
+
+    pub(super) fn verify_auxiliary_targets(
+        &self,
+        aux: Option<&mut Auxiliary>,
+        targets: Option<&[(u32, AuxProgram)]>,
+    ) -> io::Result<()> {
+        let Some(aux) = aux else { return Ok(()) };
+        for member in &mut aux.members {
+            let Some((link, _)) = &member.link else {
+                continue;
+            };
+            let target = match targets {
+                Some(programs) => programs
+                    .iter()
+                    .find(|(r, _)| *r == member.realm)
+                    .map(|(_, program)| program),
+                None => member.program.as_ref(),
+            }
+            .ok_or_else(lost_capture)?;
+            let verified = member.pair.unavailable().and_then(|unavailable| {
+                if unavailable {
+                    Ok(false)
+                } else {
+                    link.verify(target.program.id()).map(|()| true)
+                }
+            });
+            match verified {
+                Ok(true) => continue,
+                Err(error) if !Self::device_gone(&member.pair) => return Err(error),
+                _ => self.close_member(member, &aux.grace)?,
             }
         }
         Ok(())
@@ -298,22 +509,34 @@ impl GatewayPublisher {
 
     // `to_previous` names the generation now attached to every link, before the userspace swap.
     fn finish_transition(&self, inner: &mut PublisherInner, to_previous: bool) -> io::Result<()> {
-        let staged = &inner.previous.as_ref().unwrap().generation.arbitration;
+        let previous = inner.previous.as_ref().unwrap();
+        let targets = to_previous.then_some(previous.programs.auxiliary.as_slice());
+        self.verify_auxiliary_targets(inner.auxiliary.as_deref_mut(), targets)
+            .map_err(|error| self.fail_capture(error))?;
+        let staged = &previous.generation.arbitration;
         let current = &inner.current.arbitration;
-        if let Some(arb) = current.as_ref().xor(staged.as_ref()) {
-            // Wait outside link custody, so terminal withdrawal can always take the FDs.
-            if let Err(error) = arb.kernel.synchronize_readers() {
-                return Err(self.fail_capture(error));
+        let departing = if to_previous { current } else { staged };
+        let arriving = if to_previous { staged } else { current };
+        if inner.auxiliary.is_some() || current.is_some() != staged.is_some() {
+            // Synchronize outside physical link custody so terminal withdrawal can take its FDs.
+            if let Some(arb) = current.as_ref().or(staged.as_ref()) {
+                arb.kernel
+                    .synchronize_readers()
+                    .map_err(|error| self.fail_capture(error))?;
+            } else if let Some(aux) = &inner.auxiliary {
+                aux.grace
+                    .synchronize()
+                    .map_err(|error| self.fail_capture(error))?;
             }
-            if (to_previous && staged.is_none()) || (!to_previous && current.is_none()) {
-                inner.last_issued = arb.kernel.last_issued();
-                self.shadow.diagnostics.sample_dns_decisions(&self.maps);
-                self.check_hold_custody()?;
-                if arb.kernel.pending() != 0 {
-                    return Err(self.fail_capture(io::Error::other(
-                        "gateway arbitration still owns pending tuples",
-                    )));
-                }
+        }
+        if let Some(arb) = departing.as_ref().filter(|_| arriving.is_none()) {
+            inner.last_issued = arb.kernel.last_issued();
+            self.shadow.diagnostics.sample_dns_decisions(&self.maps);
+            self.check_hold_custody()?;
+            if arb.kernel.pending() != 0 {
+                return Err(self.fail_capture(io::Error::other(
+                    "gateway arbitration still owns pending tuples",
+                )));
             }
         }
         Ok(())
@@ -321,16 +544,32 @@ impl GatewayPublisher {
 
     fn exchange(inner: &mut PublisherInner) {
         let previous = inner.previous.as_mut().unwrap();
-        for (member, programs) in inner.members.iter_mut().zip(&mut previous.programs) {
+        for (member, programs) in inner
+            .members
+            .iter_mut()
+            .zip(&mut previous.programs.physical)
+        {
             std::mem::swap(&mut member.programs, programs);
+        }
+        if let Some(aux) = &mut inner.auxiliary {
+            for (realm, program) in &mut previous.programs.auxiliary {
+                if let Some(active) = aux
+                    .members
+                    .iter_mut()
+                    .find(|m| m.realm == *realm)
+                    .and_then(|m| m.program.as_mut())
+                {
+                    std::mem::swap(active, program);
+                }
+            }
         }
         std::mem::swap(&mut inner.current, &mut previous.generation);
     }
 
     pub(crate) fn commit(&self) {
         let mut inner = self.state.inner.lock();
-        if self.failure.get().is_none() {
-            inner.previous.take();
+        if self.failure.get().is_none() && inner.previous.take().is_some() {
+            inner.final_publication = None;
         }
     }
 
@@ -345,22 +584,18 @@ impl GatewayPublisher {
                 "gateway rollback has no previous generation",
             )));
         };
-        if previous.programs.len() != inner.members.len() {
+        if previous.programs.physical.len() != inner.members.len() {
             return Err(self.fail_capture(io::Error::other("gateway rollback member mismatch")));
         }
-        for index in (0..inner.members.len()).rev() {
-            let current = &inner.members[index].programs;
-            let restored = self.state.open_links()?[index]
-                .replace(current.data_fd(), previous.programs[index].data_fd());
-            if let Err(error) = restored {
-                return Err(self.fail_capture(error));
-            }
-        }
+        let physical = inner.members.len();
+        let auxiliary = previous.programs.auxiliary.len();
+        self.restore_links(&mut inner, physical, auxiliary, true)?;
         self.finish_transition(&mut inner, true)?;
         let _links = self.state.open_links()?;
         Self::exchange(&mut inner);
         self.shadow.report_status(inner.current.status);
-        self.shadow.resume(inner.previous.take().unwrap().suspended);
+        let suspended = inner.previous.take().unwrap().suspended;
+        self.shadow.resume(&inner, suspended);
         Ok(())
     }
 

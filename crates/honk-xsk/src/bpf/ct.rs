@@ -1,11 +1,15 @@
 use super::{bpf, bpf_fd, invalid_data, object_info};
+use honk_netstack::{MemoryBudget, MemoryReservation};
 use std::io::{self, Read as _};
 use std::mem::size_of;
 use std::os::fd::{AsFd, OwnedFd};
+use std::sync::{Arc, OnceLock};
 
 const BTF_LIMIT: usize = 256 << 20;
+const BTF_RECORD_HEADER: usize = 12;
 const VMLINUX: &str = "/sys/kernel/btf/vmlinux";
 const CONNTRACK: &str = "/sys/kernel/btf/nf_conntrack";
+static TCX_STRUCT_SIZES: OnceLock<[usize; 3]> = OnceLock::new();
 
 struct Bounds {
     base: usize,
@@ -30,6 +34,12 @@ impl Bounds {
         }
         Ok(Self { base, module })
     }
+
+    fn construction_bytes(&self) -> usize {
+        let base = btf_footprint(self.base);
+        // The module readback or merged image can coexist with the base parser and module bytes.
+        base + self.module.map_or(0, |module| self.base + 2 * module)
+    }
 }
 
 fn admitted_size(size: u64) -> io::Result<usize> {
@@ -37,6 +47,23 @@ fn admitted_size(size: u64) -> io::Result<usize> {
         .ok()
         .filter(|size| (24..=BTF_LIMIT).contains(size))
         .ok_or_else(|| invalid_data("kernel BTF size outside construction bound"))
+}
+
+fn record_capacity(bytes: usize) -> usize {
+    1 + bytes / BTF_RECORD_HEADER
+}
+
+fn btf_footprint(bytes: usize) -> usize {
+    bytes + record_capacity(bytes) * size_of::<usize>()
+}
+
+fn reserve_btf(root: &Arc<MemoryBudget>, bytes: usize) -> io::Result<MemoryReservation> {
+    root.reserve(bytes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::OutOfMemory,
+            "kernel BTF construction capacity",
+        )
+    })
 }
 
 fn read_bounded(path: &str, admitted: usize) -> io::Result<Vec<u8>> {
@@ -54,6 +81,24 @@ fn read_bounded(path: &str, admitted: usize) -> io::Result<Vec<u8>> {
         return Err(invalid_data("kernel BTF grew beyond admitted read"));
     }
     Ok(bytes)
+}
+
+pub(super) fn tcx_struct_sizes() -> io::Result<[usize; 3]> {
+    TCX_STRUCT_SIZES
+        .get()
+        .copied()
+        .ok_or_else(|| invalid_data("kernel TCX object sizes were not admitted"))
+}
+
+pub(super) fn tcx_struct_sizes_accounted(root: &Arc<MemoryBudget>) -> io::Result<[usize; 3]> {
+    if let Some(&sizes) = TCX_STRUCT_SIZES.get() {
+        return Ok(sizes);
+    }
+    let size = admitted_size(std::fs::metadata(VMLINUX)?.len())?;
+    let _memory = reserve_btf(root, btf_footprint(size))?;
+    let sizes = Types::parse(read_bounded(VMLINUX, size)?)?.tcx_struct_sizes()?;
+    let _ = TCX_STRUCT_SIZES.set(sizes);
+    Ok(sizes)
 }
 
 #[repr(C)]
@@ -109,12 +154,42 @@ pub struct ConntrackKfuncs {
     pub btf: Option<OwnedFd>,
 }
 
+/// Conntrack lookup authority for a `SCHED_CLS` skb context.
+pub struct SkbConntrackKfuncs(pub(super) ConntrackKfuncs);
+
+impl SkbConntrackKfuncs {
+    /// Resolve the running kernel's TC conntrack lookup and release ABI.
+    pub fn read() -> io::Result<Self> {
+        Self::read_with_bounds(Bounds::read()?)
+    }
+
+    /// Charge the temporary BTF images and type indexes to the shared capture budget.
+    pub fn read_accounted(root: &Arc<MemoryBudget>) -> io::Result<Self> {
+        let bounds = Bounds::read()?;
+        let _memory = reserve_btf(root, bounds.construction_bytes())?;
+        Self::read_with_bounds(bounds)
+    }
+
+    fn read_with_bounds(bounds: Bounds) -> io::Result<Self> {
+        ConntrackKfuncs::read_lookup(bounds, "bpf_skb_ct_lookup", "__sk_buff").map(Self)
+    }
+}
+
 impl ConntrackKfuncs {
     /// Resolve the running kernel's XDP conntrack lookup and release ABI.
     pub fn read() -> io::Result<Self> {
-        let bounds = Bounds::read()?;
-        let (btf, module, base_types) =
-            Types::parse(read_bounded(VMLINUX, bounds.base)?)?.with_conntrack(bounds.module)?;
+        Self::read_lookup(Bounds::read()?, "bpf_xdp_ct_lookup", "xdp_md")
+    }
+
+    fn read_lookup(bounds: Bounds, lookup_name: &str, context: &str) -> io::Result<Self> {
+        let base = Types::parse(read_bounded(VMLINUX, bounds.base)?)?;
+        if context == "__sk_buff"
+            && TCX_STRUCT_SIZES.get().is_none()
+            && let Ok(sizes) = base.tcx_struct_sizes()
+        {
+            let _ = TCX_STRUCT_SIZES.set(sizes);
+        }
+        let (btf, module, base_types) = base.with_conntrack(bounds.module, lookup_name)?;
         let (_, opts) = btf.named("bpf_ct_opts", 4)?;
         if btf.word(opts + 8)? as usize != size_of::<CtOptions>() {
             return Err(io::Error::new(
@@ -127,8 +202,8 @@ impl ConntrackKfuncs {
                 return Err(invalid_data("conntrack options layout mismatch"));
             }
         }
-        let lookup = btf.function("bpf_xdp_ct_lookup", 5)?;
-        let release = btf.function("bpf_ct_release", 1)?;
+        let lookup = btf.function(lookup_name, Some(context))?;
+        let release = btf.function("bpf_ct_release", None)?;
         Ok(Self {
             lookup,
             release,
@@ -204,6 +279,21 @@ impl Types {
             io::ErrorKind::Unsupported,
             format!("conntrack requires kernel BTF {name}"),
         ))
+    }
+
+    fn tcx_struct_sizes(&self) -> io::Result<[usize; 3]> {
+        let mut sizes = [0; 3];
+        for (name, size) in ["tcx_link", "tcx_entry", "file"]
+            .into_iter()
+            .zip(&mut sizes)
+        {
+            let (_, at) = self.named(name, 4)?;
+            *size = self.word(at + 8)? as usize;
+            if *size == 0 {
+                return Err(invalid_data("zero-sized kernel TCX object"));
+            }
+        }
+        Ok(sizes)
     }
 
     fn member(&self, at: usize, name: &str, depth: usize) -> io::Result<Option<(u32, u32)>> {
@@ -290,16 +380,17 @@ impl Types {
         Ok(())
     }
 
-    fn function(&self, name: &str, parameters: usize) -> io::Result<u32> {
+    fn function(&self, name: &str, context: Option<&str>) -> io::Result<u32> {
         let (id, at) = self.named(name, 12)?;
         let proto = self.resolve(self.word(at + 8)?)?;
         let info = self.word(proto + 4)?;
+        let parameters = if context.is_some() { 5 } else { 1 };
         if info >> 24 & 31 != 13 || info & 0xffff != parameters as u32 {
             return Err(invalid_data("conntrack kfunc prototype mismatch"));
         }
-        if parameters == 5 {
+        if let Some(context) = context {
             self.pointer(self.word(proto + 8)?, "nf_conn", 4)?;
-            self.pointer(self.word(proto + 16)?, "xdp_md", 4)?;
+            self.pointer(self.word(proto + 16)?, context, 4)?;
             self.pointer(self.word(proto + 24)?, "bpf_sock_tuple", 4)?;
             self.pointer(self.word(proto + 40)?, "bpf_ct_opts", 4)?;
             for parameter in [2, 4] {
@@ -321,7 +412,7 @@ impl Types {
         admitted_size(bytes.len() as u64)?;
         let mut result = Self {
             bytes,
-            records: vec![usize::MAX],
+            records: Vec::new(),
             strings: 0,
             strings_end: 0,
         };
@@ -348,8 +439,13 @@ impl Types {
         if header < 24 || end > result.strings || result.strings_end > result.bytes.len() {
             return Err(invalid_data("BTF section exceeds file or overlaps strings"));
         }
+        result
+            .records
+            .try_reserve_exact(record_capacity(end - at))
+            .map_err(io::Error::other)?;
+        result.records.push(usize::MAX);
         while at < end {
-            if end - at < 12 {
+            if end - at < BTF_RECORD_HEADER {
                 return Err(invalid_data("short BTF type record"));
             }
             result.records.push(at);
@@ -364,7 +460,7 @@ impl Types {
                 _ => return Err(invalid_data("unsupported BTF type kind")),
             };
             at = at
-                .checked_add(12 + extra)
+                .checked_add(BTF_RECORD_HEADER + extra)
                 .ok_or_else(|| invalid_data("BTF type extent overflow"))?;
         }
         if at != end {
@@ -373,10 +469,14 @@ impl Types {
         Ok(result)
     }
 
-    fn with_conntrack(self, admitted: Option<usize>) -> io::Result<(Self, Option<OwnedFd>, u32)> {
+    fn with_conntrack(
+        self,
+        admitted: Option<usize>,
+        lookup_name: &str,
+    ) -> io::Result<(Self, Option<OwnedFd>, u32)> {
         let base_types = u32::try_from(self.records.len() - 1)
             .map_err(|_| invalid_data("BTF type count overflow"))?;
-        if self.named("bpf_xdp_ct_lookup", 12).is_ok() && self.named("bpf_ct_release", 12).is_ok() {
+        if self.named(lookup_name, 12).is_ok() && self.named("bpf_ct_release", 12).is_ok() {
             return Ok((self, None, base_types));
         }
         let admitted = admitted.ok_or_else(|| {
@@ -459,6 +559,8 @@ impl Types {
         merged.extend_from_slice(module_types);
         merged.extend_from_slice(base_strings);
         merged.extend_from_slice(module_strings);
+        drop(module);
+        drop(self);
         Ok((Self::parse(merged)?, Some(fd), base_types))
     }
 }

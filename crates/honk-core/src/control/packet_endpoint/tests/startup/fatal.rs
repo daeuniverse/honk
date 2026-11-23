@@ -60,7 +60,7 @@ async fn fatal_selector_releases_real_config_and_subscription_shutdown_before_cq
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (flow, _) = established_tcp(&scope, upstream.local_addr().unwrap()).await;
         let permit = Arc::clone(&endpoints.shared.tcp_slots).acquire_owned().await.unwrap();
-        endpoints.sender.send(Work::Tcp(flow, permit)).await.unwrap();
+        endpoints.sender.send(Work::Tcp(flow, permit, None)).await.unwrap();
         let (mut server, _) = upstream.accept().await.unwrap();
         server.write_all(b"CQ-held selector reply").await.unwrap();
         let output = loop {

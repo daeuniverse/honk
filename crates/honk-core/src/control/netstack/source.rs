@@ -425,7 +425,8 @@ impl PacketScope {
     /// Bind and fund authenticated Host intake before handing this scope to Endpoint.
     pub fn prepare_host(&self) -> io::Result<()> {
         self.0.with(|inner| {
-            if inner.endpoint_prepared
+            if self.is_auxiliary()
+                || inner.endpoint_prepared
                 || inner.closing
                 || inner.finished
                 || !inner.stack.as_ref().is_some_and(Stack::is_quiescent)
@@ -486,6 +487,7 @@ impl PacketScope {
         }
         Ok(DatagramSender {
             scope: self.clone(),
+            binding: self.binding(),
             source,
             packet_source: Some(source_work),
             realm: None,
@@ -508,7 +510,7 @@ impl SourceWork {
         inner: &mut Inner,
         address: IpAddr,
     ) -> io::Result<Self> {
-        if inner.closing || inner.finished {
+        if inner.closing || inner.aborted || inner.finished {
             return Err(closed());
         }
         Ok(Self {

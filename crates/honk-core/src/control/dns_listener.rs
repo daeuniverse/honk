@@ -460,6 +460,8 @@ async fn run_udp_supervisor(
                     continue;
                 }
                 let received = batch.len();
+                // Pin all datagrams in this receive before an earlier reply can yield.
+                let batch_scope = controller.query_scope(fact_scope);
                 for index in 0..received {
                     let (query, client_addr, meta) = match batch.packet(index) {
                         Ok(packet) => packet,
@@ -505,11 +507,7 @@ async fn run_udp_supervisor(
                         continue;
                     }
 
-                    let admission = match if fact_scope == ScopeId::HOST {
-                        controller.try_admit_query(true)
-                    } else {
-                        controller.try_admit_packet_query(true, fact_scope)
-                    } {
+                    let admission = match controller.try_admit_bound_query(true, batch_scope) {
                         Ok(admission) => {
                             stats.record_udp_slow_permit_accepted();
                             admission
@@ -739,6 +737,7 @@ async fn run_tcp_supervisor(
                 if *phase.borrow() != ListenerPhase::Running || drain.should_reject() {
                     continue;
                 }
+                let Some(connection_scope) = controller.query_scope(fact_scope) else { continue };
                 let standalone_permit = match Arc::clone(&standalone_tcp_limit).try_acquire_owned() {
                     Ok(permit) => permit,
                     Err(_) => {
@@ -768,7 +767,7 @@ async fn run_tcp_supervisor(
                     let _permit = permit;
                     let _standalone_permit = standalone_permit;
                     let _guard = guard;
-                    let operation = child_controller.serve_bound_tcp_dns(&mut stream, client_addr, fact_scope);
+                    let operation = child_controller.serve_bound_tcp_dns(&mut stream, client_addr, connection_scope);
                     #[cfg(feature = "native-api")]
                     let result = match observer {
                         Some(observer) => observer.scope(operation).await,

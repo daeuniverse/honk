@@ -709,7 +709,7 @@ async fn quic_stall_terminal_invalidates_aggregate_without_changing_alive_conges
             first,
             followers: Vec::new(),
         },
-        first_ack,
+        |result| drop(first_ack.send(result)),
     )
     .await;
     endpoint.finish_score(terminal.outcome);

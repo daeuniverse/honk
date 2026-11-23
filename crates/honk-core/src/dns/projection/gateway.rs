@@ -11,8 +11,8 @@ use super::{DesiredState, GatewayDnsBank, PacketDomainBitmap, RoutingProjection}
 #[derive(Clone, Copy)]
 pub(crate) struct GatewayDnsFill {
     scope: ScopeId,
-    realm: u32,
-    epoch: u64,
+    pub(crate) realm: u32,
+    pub(crate) epoch: u64,
     ip: IpAddr,
     bitmap: DomainRouting,
     expires_at: Instant,
@@ -121,11 +121,7 @@ impl RoutingProjection {
         let Some((bank, fill)) = facts.fill else {
             return;
         };
-        if let Some(mut pending) = bank.pending.try_lock()
-            && pending.is_none()
-        {
-            *pending = Some(fill);
-            drop(pending);
+        if bank.queue_fill(fill) {
             self.notify_worker();
         } else {
             bank.skip(1);

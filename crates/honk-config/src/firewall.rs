@@ -3,6 +3,18 @@ use std::net::Ipv4Addr;
 use crate::routing::{RoutingCondition, RoutingNotCondition};
 use serde::{Deserialize, Serialize};
 
+fn deserialize_ingress<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::datapath::InterfaceRole>, D::Error> {
+    let role = Option::deserialize(deserializer)?;
+    if role == Some(crate::datapath::InterfaceRole::L3Lan) {
+        return Err(serde::de::Error::custom(
+            "firewall ingress must be lan or wan",
+        ));
+    }
+    Ok(role)
+}
+
 fn deserialize_condition<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<RoutingCondition, D::Error> {
@@ -40,7 +52,7 @@ pub enum FirewallVerdict {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FirewallRule {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_ingress")]
     pub ingress: Option<crate::datapath::InterfaceRole>,
     #[serde(deserialize_with = "deserialize_condition")]
     pub condition: RoutingCondition,
@@ -166,11 +178,14 @@ pub fn validate(
                 .rules
                 .iter()
                 .chain(&fw.forward.rules)
-                .map(|rule| &rule.condition)
+                .map(|rule| (&rule.condition, rule.ingress))
         })
-        .chain(nat.prerouting.iter().map(|rule| &rule.condition))
-        .chain(nat.postrouting.iter().map(|rule| &rule.condition));
-    for condition in conditions {
+        .chain(nat.prerouting.iter().map(|rule| (&rule.condition, None)))
+        .chain(nat.postrouting.iter().map(|rule| (&rule.condition, None)));
+    for (condition, ingress) in conditions {
+        if ingress == Some(crate::datapath::InterfaceRole::L3Lan) {
+            return Err(invalid("firewall ingress must be lan or wan"));
+        }
         // No socket/process/domain authority exists for transit packets. Negation must
         // never turn missing authority into an allow rule either.
         if [

@@ -9,7 +9,7 @@
 
 #[cfg(test)]
 use self::driver::TRANSPORT_SEND_TIMEOUT;
-use crate::control::netstack::SourceWork;
+use crate::control::netstack::{AuxiliaryBindingRetired, AuxiliaryWork, SourceWork};
 use crate::control::task_registry::TaskRegistry;
 use crate::ebpf::UdpFlowOwner;
 use crate::stats::{ActiveConnectionGuard, OutboundTracker, StatsManager};
@@ -145,6 +145,40 @@ pub(in crate::control) use admission::{
 use admission::{EndpointEntry, EndpointKey, FLOW_QUEUE_CAPACITY, GLOBAL_PAYLOAD_CAPACITY};
 #[cfg(test)]
 use admission::{ReservationGateHook, ReservationPublicationHook};
+
+// A SourceWork keeps its original Stack alive through the auxiliary drain.
+fn packet_binding_active(source: Option<&SourceWork>) -> bool {
+    source.is_none_or(|source| source.owner().auxiliary_active())
+}
+
+fn is_auxiliary_retirement(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<AuxiliaryBindingRetired>())
+}
+
+fn retired_send(source: Option<&SourceWork>, reason: &'static str) -> io::Error {
+    if packet_binding_active(source) {
+        io::Error::new(io::ErrorKind::ConnectionAborted, reason)
+    } else {
+        io::Error::new(io::ErrorKind::ConnectionAborted, AuxiliaryBindingRetired)
+    }
+}
+
+async fn run_while_bound(source: Option<&SourceWork>, run: impl Future<Output = ()>) -> bool {
+    match source.map_or(Ok(None), |source| source.owner().auxiliary_work()) {
+        Ok(None) => {
+            run.await;
+            true
+        }
+        Ok(Some(work)) => tokio::select! {
+            biased;
+            _ = work.cancelled() => false,
+            () = run => true,
+        },
+        Err(_) => false,
+    }
+}
 
 const DEFAULT_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on pooled endpoints. A unique-tuple UDP flood must not be able
@@ -464,6 +498,10 @@ impl UdpEndpoint {
         self.ref_count.fetch_sub(1, Ordering::Relaxed);
     }
 
+    fn retired(&self) -> bool {
+        self.dead.load(Ordering::Acquire) || !packet_binding_active(self.packet_source())
+    }
+
     pub fn kill(&self, fence_peer: bool) {
         // A retirement ordered before `begin_send_attempt` must prevent the
         // transport call; an attempt already admitted remains ambiguous.
@@ -480,8 +518,8 @@ impl UdpEndpoint {
     fn begin_send_attempt(&self) -> io::Result<()> {
         let _send_gate = self.send_gate.lock();
         if self.dead.load(Ordering::Acquire) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
+            return Err(retired_send(
+                self.packet_source(),
                 "UDP endpoint was retired before transport send",
             ));
         }

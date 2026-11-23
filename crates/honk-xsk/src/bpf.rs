@@ -18,9 +18,12 @@ mod general;
 use gateway::{GatewayLoad, GatewayMaps};
 #[cfg(feature = "host")]
 mod host;
-pub use ct::ConntrackKfuncs;
+pub use ct::{ConntrackKfuncs, SkbConntrackKfuncs};
+pub use general::AuxGatewayProgram;
 #[cfg(feature = "host")]
 mod source;
+mod tcx_aux;
+pub use tcx_aux::{AuxDevicePair, AuxReturnLink, AuxTcxLink, AuxTunGuard};
 #[cfg(feature = "host")]
 mod tun;
 

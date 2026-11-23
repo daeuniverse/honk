@@ -17,8 +17,7 @@ const _: () = {
 pub struct GatewayArbitration {
     pub(in crate::bpf) guards: OwnedFd,
     pub(in crate::bpf) control: OwnedFd,
-    grace_root: OwnedFd,
-    grace_inner: OwnedFd,
+    grace: AuxReaderGrace,
     slot: NonNull<Control>,
 }
 
@@ -30,6 +29,36 @@ impl Drop for GatewayArbitration {
     fn drop(&mut self) {
         // SAFETY: this is the original mmap address and length.
         unsafe { libc::munmap(self.slot.as_ptr().cast(), size_of::<Control>()) };
+    }
+}
+
+pub struct AuxReaderGrace {
+    root: OwnedFd,
+    inner: OwnedFd,
+}
+
+impl AuxReaderGrace {
+    pub fn new() -> io::Result<Self> {
+        let inner = create::<u32, u32>(2, 1, b"honk_gw_grace_i", -1)?;
+        let root = create::<u32, u32>(12, 1, b"honk_gw_grace_r", inner.as_raw_fd())?;
+        update(root.as_fd(), &0u32, &inner.as_raw_fd(), 0)?;
+        let mut info = MapInfo::default();
+        object_info(inner.as_fd(), &mut info)?;
+        if info.id == 0 || lookup(root.as_fd(), &0u32)? != Some(info.id) {
+            return Err(invalid_data(
+                "gateway grace root inner map identity mismatch",
+            ));
+        }
+        Ok(Self { root, inner })
+    }
+
+    pub fn object_fds(&self) -> [BorrowedFd<'_>; 2] {
+        [self.root.as_fd(), self.inner.as_fd()]
+    }
+
+    pub fn synchronize(&self) -> io::Result<()> {
+        // Updating an occupied map-in-map slot waits for pre-existing non-sleepable BPF readers.
+        update(self.root.as_fd(), &0u32, &self.inner.as_raw_fd(), 0)
     }
 }
 
@@ -61,22 +90,12 @@ impl GatewayArbitration {
             .ok_or_else(|| invalid_data("gateway guard capacity overflow"))?;
         let guards = create::<GatewayKey, u32>(1, entries, b"honk_gw_guards", -1)?;
         let control = create_with_flags::<u32, Control>(2, 1, b"honk_gw_ctl", -1, BPF_F_MMAPABLE)?;
-        let grace_inner = create::<u32, u32>(2, 1, b"honk_gw_grace_i", -1)?;
-        let grace_root = create::<u32, u32>(12, 1, b"honk_gw_grace_r", grace_inner.as_raw_fd())?;
-        update(grace_root.as_fd(), &0u32, &grace_inner.as_raw_fd(), 0)?;
-        let mut inner_info = MapInfo::default();
-        object_info(grace_inner.as_fd(), &mut inner_info)?;
-        if inner_info.id == 0 || lookup(grace_root.as_fd(), &0u32)? != Some(inner_info.id) {
-            return Err(invalid_data(
-                "gateway grace root inner map identity mismatch",
-            ));
-        }
+        let grace = AuxReaderGrace::new()?;
         let slot = mmap_slots::<Control>(control.as_fd(), 1)?;
         let arbitration = Self {
             guards,
             control,
-            grace_root,
-            grace_inner,
+            grace,
             slot,
         };
         arbitration
@@ -87,13 +106,8 @@ impl GatewayArbitration {
     }
 
     pub fn object_fds(&self) -> [BorrowedFd<'_>; 4] {
-        [
-            &self.guards,
-            &self.control,
-            &self.grace_root,
-            &self.grace_inner,
-        ]
-        .map(AsFd::as_fd)
+        let [root, inner] = self.grace.object_fds();
+        [self.guards.as_fd(), self.control.as_fd(), root, inner]
     }
 
     fn slot(&self) -> &Control {
@@ -115,14 +129,7 @@ impl GatewayArbitration {
     }
 
     pub fn synchronize_readers(&self) -> io::Result<()> {
-        // Replacing an occupied map-in-map slot synchronously waits for old BPF readers,
-        // including when the new inner FD identifies the very same map.
-        update(
-            self.grace_root.as_fd(),
-            &0u32,
-            &self.grace_inner.as_raw_fd(),
-            0,
-        )
+        self.grace.synchronize()
     }
 
     pub(super) fn with_guard(

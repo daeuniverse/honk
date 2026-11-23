@@ -393,6 +393,8 @@ pub(super) fn build(
     b.finish()
 }
 
+mod aux_program;
+pub use aux_program::AuxGatewayProgram;
 mod gateway;
 pub(super) use gateway::build as build_gateway;
 

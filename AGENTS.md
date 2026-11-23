@@ -13,6 +13,7 @@ Re-read it when a conversation grows long or context is trimmed: a rule read onc
 | honk-config, honk-tool, `doc/*/reference`, `dialect.md`, or a core/outbound consumer of `Config`, `Node`, `derive_id`, group filters, DNS routing | `.agents/rules/configuration.md`; skill [`honk-config-change`](.agents/skills/honk-config-change/SKILL.md) |
 | real-kernel or eBPF work, `crates/honk-ebpf*`, `crates/honk-core/src/ebpf/`, mock-eBPF development | `.agents/rules/real-ebpf.md`; skill [`honk-real-ebpf-tests`](.agents/skills/honk-real-ebpf-tests/SKILL.md) |
 | `crates/honk-netstack`, `crates/honk-outbound/src/proxy/wireguard/`, WireGuard node runtime or tunnel behavior | `.agents/rules/netstack.md`; `doc/en/design/netstack.md`; `just outbound-ci` |
+| XDP gateway, `l3_lan` auxiliary TCX/TUN capture or hot rebind | `.agents/rules/netstack.md`; `.agents/rules/real-ebpf.md`; `doc/en/design/datapath.md` |
 | placing or finding tests, benchmarks | `.agents/rules/test-locations.md` |
 | releases, CI workflows | `.agents/rules/release.md`; skill [`honk-release`](.agents/skills/honk-release/SKILL.md) |
 | deployment, security-sensitive paths | `.agents/rules/deployment.md`, `.agents/rules/security.md` |

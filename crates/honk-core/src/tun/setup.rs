@@ -36,7 +36,7 @@ static INCARNATION: AtomicU64 = AtomicU64::new(0);
 
 /// The only descriptor of the daemon's TUN device; the non-persistent link
 /// exists exactly while it stays open. Never cloned or duplicated.
-pub(super) struct TunDevice {
+pub(crate) struct TunDevice {
     fd: OwnedFd,
     ifindex: u32,
     incarnation: u64,
@@ -98,6 +98,43 @@ impl TunDevice {
             ifindex,
             incarnation,
         })
+    }
+
+    pub(crate) fn new_auxiliary(name: &str) -> io::Result<Self> {
+        Self::open(name, 0).map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    pub(crate) fn verify_auxiliary(&self, name: &str) -> anyhow::Result<()> {
+        same_namespace(&self.fd)?;
+        verify_attachment(&self.fd, name)?;
+        ensure!(
+            nix::net::if_::if_nametoindex(name)? == self.ifindex,
+            "private TUN ifindex changed"
+        );
+        Ok(())
+    }
+
+    pub(crate) fn configure_auxiliary(&self, name: &str, mtu: u32) -> anyhow::Result<()> {
+        self.verify_auxiliary(name)?;
+        // Open the device's sysctl first; a later rename cannot retarget this write.
+        let path = format!("/proc/sys/net/ipv6/conf/{name}/disable_ipv6");
+        let mut knob = std::fs::OpenOptions::new().write(true).open(&path)?;
+        self.verify_auxiliary(name)?;
+        knob.write_all(b"1")?;
+        ensure!(
+            std::fs::read_to_string(path)?.trim() == "1",
+            "private TUN IPv6 disable readback"
+        );
+        let mut netlink = NlSock::new()?;
+        self.verify_auxiliary(name)?;
+        netlink.set_link_mtu(self.ifindex, mtu)?;
+        self.verify_auxiliary(name)?;
+        netlink.set_tun_link_up(self.ifindex)?;
+        self.verify_auxiliary(name)
     }
 }
 

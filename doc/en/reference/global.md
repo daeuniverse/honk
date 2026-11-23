@@ -254,8 +254,9 @@ Do not also set `global.lan_interface` or `global.wan_interface` for XDP.
 The backend, Direct profile, effective AF_XDP binding mode, and interface/zone setup
 require restart. Supported firewall/NAT rules use transactional policy publication.
 Unknown settings and unsupported marked continuation requests are rejected, not ignored.
-Interface entries are plain `name: lan` or `name: wan` declarations; bodies,
-including empty nested blocks, are rejected rather than ignored.
+Use `name: lan` or `name: wan` for physical capture. XDP Endpoint also accepts
+`name: l3_lan` for an [auxiliary IP interface](#auxiliary-l3-lan). Interface
+declarations with a nested body, even an empty one, are rejected.
 
 `datapath.xsk_mode` accepts `copy`, `zerocopy`, or `auto` for physical capture. Omission remains forced ZeroCopy; Auto selects per member from its capabilities and required segments. Every bind is read back; a failed selected bind does not retry another mode. Omitted and explicit `zerocopy` are equivalent for reload; changing mode requires restart. TC and TUN reject an explicit mode. The private Host queue requires Copy independently.
 
@@ -277,17 +278,48 @@ Core Direct requires `dial_mode: ip`; domain predicates use facts learned in the
 
 Core's input-context FIB contract rejects nonzero IPv6 flow labels and router-specific extension/options execution it cannot preserve; Endpoint IPv6 support does not establish equivalent Core authority.
 
+### Auxiliary L3 LAN
+
+```dae
+datapath {
+    backend: xdp
+    direct: endpoint
+    interface {
+        eth1: lan
+        wg0: l3_lan
+    }
+}
+```
+
+`l3_lan` adds a raw-IP ingress beside at least one physical XDP `lan` or `wan`.
+Configure up to eight distinct auxiliary names. They do not count as physical
+workers or RX queues. The interface must actually carry bare IP (`ARPHRD_NONE`),
+have an MTU of at least 1280, and not be used by a default route. An Ethernet,
+PPP or GRE device is not admitted merely because of its name. The role is not
+available with TC, TUN, Core Direct, or the legacy XDP Host block. A physical
+interface that fails XDP admission never falls back to TCX.
+
+An absent auxiliary interface can start in `waiting_link`. A present but
+incompatible interface rejects startup. An active binding uses TCX ingress
+and its own unnumbered, nonpersistent `honk-l3-<n>` TUN. Do not use those
+generated names for configured interfaces. honk creates no routes, policy
+rules or addresses for the internal TUN. It does not remove existing ingress
+filters: if Endpoint redirection would skip an existing legacy classifier,
+the auxiliary cannot bind. A WireGuard server listening on UDP port 53 on a
+*physical capture interface* needs an explicit static `direct(must)` traffic
+rule for that listener; the local-service exemption does not include port 53.
+
 ### XDP Endpoint DNS projection
 
 `datapath.dns_projection` is an optional boolean for `backend: xdp` with
-`direct: endpoint` and at least one physical interface declared `lan`. Omission
+`direct: endpoint` and at least one `lan` or `l3_lan` interface. Omission
 and `true` both enable DNS projection. Set `false` to turn it off. A
 change to the effective value requires a restart. TC, TUN, XDP Core and XDP
-Endpoint without a physical LAN require omission. Either explicit boolean is
+Endpoint without either LAN role require omission. Either explicit boolean is
 rejected in those configurations. Duplicate declarations across merged sections
 or includes and explicit null in structured input are also rejected.
 
-Only transparent DNS answers accepted on the same logical LAN realm supply facts. A bond's members share its realm; each VLAN has its own realm and inherits its configured root's role. Neither WAN, Host nor standalone `dns.bind` supplies LAN facts.
+Only transparent DNS answers accepted on the same logical LAN realm supply facts. A bond's members share its realm; each VLAN has its own realm and inherits its configured root's role. Each auxiliary LAN has its own scope; losing the binding withdraws its facts. Neither WAN, Host nor standalone `dns.bind` supplies LAN facts.
 
 A pure TCP SYN or complete UDP datagram to a port other than 53 can take the kernel route when the ordered policy selects unmarked `direct(must)`, or ordinary unmarked `direct` in `dial_mode: ip` and Rule mode. Missing, expired or conflicting facts do not authorize a new native flow; static D1 rules, including `:53 direct(must)`, are unchanged.
 

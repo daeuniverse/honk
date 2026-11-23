@@ -1,10 +1,16 @@
 use super::handoff::RetireAck;
 use super::overall_dial_timeout;
 use super::routing::{PacketRoutingSnapshot, build_connection_info, connection_chains};
+use crate::control::dns_control::PacketDnsScopeRetired;
+use crate::control::netstack::{AuxiliaryWork, FlowIo};
+use crate::control::packet_endpoint::run_until_auxiliary_pause;
 use crate::control::*;
 use crate::group::{SelectionNetwork, SelectionPlanMode};
 
-use futures::{FutureExt, StreamExt};
+use futures::{
+    FutureExt, StreamExt,
+    future::{AbortRegistration, Abortable},
+};
 use std::collections::HashMap;
 
 use crate::connection_tracker::{
@@ -177,28 +183,55 @@ impl ControlPlaneHandle {
             }
         };
         debug!("Original destination: {}", original_dst);
-        self.serve_tcp_input(TcpInput::Kernel(stream), client_addr, original_dst, None)
-            .await
+        self.serve_tcp_input(
+            TcpInput::Kernel(stream),
+            client_addr,
+            original_dst,
+            None,
+            None,
+        )
+        .await
     }
 
     pub(in crate::control) async fn serve_packet_connection(
         &self,
-        stream: crate::control::netstack::FlowIo,
+        stream: FlowIo,
     ) -> anyhow::Result<()> {
         let client = stream.peer_addr();
         let destination = stream.local_addr();
-        self.serve_tcp_input(TcpInput::Packet(stream), client, destination, None)
+        self.serve_tcp_input(TcpInput::Packet(stream), client, destination, None, None)
             .await
+    }
+
+    pub(in crate::control) async fn serve_auxiliary_packet_connection(
+        &self,
+        stream: FlowIo,
+        binding: &AuxiliaryWork,
+        cancel: AbortRegistration,
+    ) -> anyhow::Result<()> {
+        if !binding.is_active() {
+            return Ok(());
+        }
+        let client = stream.peer_addr();
+        let destination = stream.local_addr();
+        self.serve_tcp_input(
+            TcpInput::Packet(stream),
+            client,
+            destination,
+            None,
+            Some((binding, cancel)),
+        )
+        .await
     }
 
     pub(in crate::control) async fn serve_owned_packet_connection(
         &self,
-        stream: crate::control::netstack::FlowIo,
+        stream: FlowIo,
         (owner, credit): (
             crate::control::netstack::DirectRelayOwner,
             honk_netstack::MemoryReservation,
         ),
-        cancel: futures::future::AbortRegistration,
+        cancel: AbortRegistration,
     ) -> anyhow::Result<()> {
         let client = stream.peer_addr();
         let destination = stream.local_addr();
@@ -210,11 +243,9 @@ impl ControlPlaneHandle {
                 client,
                 destination,
                 Some((&mut relay, credit)),
+                None,
             ));
-            let mut stop = std::pin::pin!(futures::future::Abortable::new(
-                std::future::pending::<()>(),
-                cancel,
-            ));
+            let mut stop = std::pin::pin!(Abortable::new(std::future::pending::<()>(), cancel));
             let mut stopping = false;
             std::future::poll_fn(|cx| {
                 if !stopping && stop.as_mut().poll(cx).is_ready() {
@@ -250,8 +281,10 @@ impl ControlPlaneHandle {
         client_addr: SocketAddr,
         original_dst: SocketAddr,
         direct: Option<(&mut DirectRelay<'_>, honk_netstack::MemoryReservation)>,
+        auxiliary: Option<(&AuxiliaryWork, AbortRegistration)>,
     ) -> anyhow::Result<()> {
         let (direct, credit) = direct.unzip();
+        let (auxiliary, task_cancel) = auxiliary.unzip();
         let admitted_route = match &mut input {
             TcpInput::Packet(stream) => stream.take_routing(),
             TcpInput::Kernel(_) => None,
@@ -460,6 +493,9 @@ impl ControlPlaneHandle {
                 } else {
                     sniffing::sniff_tcp(&mut flow).await
                 };
+                if auxiliary.is_some_and(|binding| !binding.is_active()) {
+                    return Ok(());
+                }
                 let sniffed_domain = sniff_result.domain.clone();
                 if let Some(ref domain) = sniffed_domain {
                     debug!("SNI sniffed domain: {}", domain);
@@ -1049,6 +1085,10 @@ impl ControlPlaneHandle {
                 else {
                     return Ok(());
                 };
+                // The relay can observe a local stream reset during the cancellation poll.
+                if auxiliary.is_some_and(|binding| !binding.is_active()) {
+                    return Ok(());
+                }
                 #[cfg(feature = "native-api")]
                 {
                     terminal = Some(match &relay_result {
@@ -1134,15 +1174,34 @@ impl ControlPlaneHandle {
                 Ok(())
             };
             #[cfg(feature = "native-api")]
-            {
+            let operation = async {
                 let operation = std::pin::pin!(operation);
                 match &native_observer {
                     Some(observer) => observer.scope(operation).await,
                     None => operation.await,
                 }
+            };
+            let operation = std::pin::pin!(operation);
+            match task_cancel {
+                Some(cancel) => {
+                    Abortable::new(run_until_auxiliary_pause(auxiliary, operation), cancel)
+                        .await
+                        .ok()
+                        .flatten()
+                }
+                None => Some(operation.await),
             }
-            #[cfg(not(feature = "native-api"))]
-            operation.await
+        };
+        let result = match result {
+            Some(Ok(())) => Ok(()),
+            Some(Err(error)) if !error.is::<PacketDnsScopeRetired>() => Err(error),
+            Some(Err(_)) | None => {
+                #[cfg(feature = "native-api")]
+                {
+                    terminal = Some(TcpTerminal::IntentionalRetirement);
+                }
+                Ok(())
+            }
         };
         if let Some(close) = &close {
             close.0.finish(result.is_ok());

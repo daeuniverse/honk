@@ -14,6 +14,7 @@ use super::{PacketScope, RetirementCallback, WaitFor, Waiter, capacity, closed, 
 #[derive(Debug)]
 pub struct FlowIo {
     scope: PacketScope,
+    binding: u64,
     id: FlowId,
     local: SocketAddr,
     peer: SocketAddr,
@@ -26,6 +27,7 @@ pub struct FlowIo {
 impl FlowIo {
     pub(super) fn new(scope: PacketScope, syn: SynInfo) -> Self {
         Self {
+            binding: scope.binding(),
             scope,
             id: syn.id,
             local: syn.original_dst,
@@ -75,7 +77,7 @@ impl FlowIo {
     /// Mark only a successfully selected non-Block outbound stream, never pending routing.
     pub(in crate::control) fn mark_rx_admitted(&self) {
         self.scope.0.with(|inner| {
-            if inner.closing || inner.finished {
+            if inner.closing || inner.finished || self.binding != self.scope.binding() {
                 return;
             }
             if let Some(slot) = inner.slot(self.id)
@@ -115,6 +117,7 @@ impl FlowIo {
     pub fn retirement(&self) -> FlowRetirement {
         FlowRetirement {
             scope: self.scope.clone(),
+            binding: self.binding,
             id: self.id,
             completed: false,
         }
@@ -135,7 +138,7 @@ impl FlowIo {
         credit: Option<MemoryReservation>,
         callback: F,
     ) -> io::Result<()> {
-        set_callback(&self.scope, self.id, credit, callback)
+        set_callback(&self.scope, self.id, self.binding, credit, callback)
     }
 
     fn close(&mut self) {
@@ -158,7 +161,9 @@ impl FlowIo {
 
     pub fn abort(&mut self) {
         self.scope.0.with(|inner| {
-            if let Some(stack) = &mut inner.stack {
+            if self.binding == self.scope.binding()
+                && let Some(stack) = &mut inner.stack
+            {
                 stack.tcp_abort(self.id);
             }
         });
@@ -169,7 +174,7 @@ impl FlowIo {
     /// Cancellation leaves a runtime-owned callback/alias, not a detached cleanup task.
     pub async fn retire(&mut self) -> io::Result<()> {
         self.close();
-        wait(&self.scope, self.id).await
+        wait(&self.scope, self.id, self.binding).await
     }
 }
 
@@ -183,6 +188,7 @@ impl Drop for FlowIo {
 #[derive(Debug)]
 pub struct FlowRetirement {
     scope: PacketScope,
+    binding: u64,
     id: FlowId,
     completed: bool,
 }
@@ -190,6 +196,9 @@ pub struct FlowRetirement {
 impl FlowRetirement {
     pub fn abort(&self) {
         let mut inner = self.scope.0.inner.lock();
+        if self.binding >> 1 != self.scope.binding() >> 1 {
+            return;
+        }
         if let Some(stack) = &mut inner.stack {
             stack.tcp_abort(self.id);
         }
@@ -201,11 +210,11 @@ impl FlowRetirement {
     }
 
     pub fn on_retired<F: FnOnce() + Send + 'static>(&self, callback: F) -> io::Result<()> {
-        set_callback(&self.scope, self.id, None, callback)
+        set_callback(&self.scope, self.id, self.binding, None, callback)
     }
 
     pub async fn wait(&mut self) -> io::Result<()> {
-        wait(&self.scope, self.id).await?;
+        wait(&self.scope, self.id, self.binding).await?;
         self.completed = true;
         Ok(())
     }
@@ -222,6 +231,7 @@ impl Drop for FlowRetirement {
 fn set_callback<F: FnOnce() + Send + 'static>(
     scope: &PacketScope,
     id: FlowId,
+    binding: u64,
     credit: Option<MemoryReservation>,
     callback: F,
 ) -> io::Result<()> {
@@ -241,6 +251,9 @@ fn set_callback<F: FnOnce() + Send + 'static>(
         _memory: memory,
     });
     scope.0.with(|inner| {
+        if scope.binding() >> 1 != binding >> 1 {
+            return Err(closed());
+        }
         let slot = inner.slot(id).ok_or_else(closed)?;
         if slot.callback.is_some() || slot.retiring {
             return Err(io::Error::new(
@@ -253,11 +266,11 @@ fn set_callback<F: FnOnce() + Send + 'static>(
     })
 }
 
-async fn wait(scope: &PacketScope, id: FlowId) -> io::Result<()> {
+async fn wait(scope: &PacketScope, id: FlowId, binding: u64) -> io::Result<()> {
     let mut waiter = Waiter::new(scope);
     poll_fn(|cx| {
         scope.0.with_silent(|inner| {
-            if inner.slot(id).is_none() {
+            if scope.binding() >> 1 != binding >> 1 || inner.slot(id).is_none() {
                 Poll::Ready(Ok(()))
             } else {
                 waiter.pending(inner, cx, WaitFor::Retirement(id))
@@ -289,6 +302,9 @@ impl AsyncRead for FlowIo {
             return Poll::Ready(Ok(()));
         }
         self.scope.0.with(|inner| {
+            if self.binding != self.scope.binding() {
+                return Poll::Ready(Err(closed()));
+            }
             let Some(stack) = &mut inner.stack else {
                 return Poll::Ready(Err(closed()));
             };
@@ -316,6 +332,9 @@ impl AsyncWrite for FlowIo {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.scope.0.with(|inner| {
+            if self.binding != self.scope.binding() {
+                return Poll::Ready(Err(closed()));
+            }
             let Some(stack) = &mut inner.stack else {
                 return Poll::Ready(Err(closed()));
             };
@@ -343,6 +362,9 @@ impl AsyncWrite for FlowIo {
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.scope.0.with(|inner| {
+            if self.binding != self.scope.binding() {
+                return Poll::Ready(Err(closed()));
+            }
             let Some(stack) = &mut inner.stack else {
                 return Poll::Ready(Err(closed()));
             };

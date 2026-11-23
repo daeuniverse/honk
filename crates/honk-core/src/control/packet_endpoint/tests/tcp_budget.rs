@@ -185,7 +185,11 @@ async fn dispatch_charge(
     let baseline = budget.used();
     let pressure = headroom.map(|bytes| budget.reserve(budget.limit() - baseline - bytes).unwrap());
     let before_dispatch = budget.used();
-    endpoints.sender.send(Work::Tcp(flow, slot)).await.unwrap();
+    endpoints
+        .sender
+        .send(Work::Tcp(flow, slot, None))
+        .await
+        .unwrap();
     // On this current-thread runtime the synchronous Work::Tcp arm completes
     // before the test can regain every queue slot. Keep packet service stopped
     // and routing blocked so only the funded task can change the charge.
@@ -265,6 +269,153 @@ fn owned_packet_scoped_task_budget_refusal_relays_original_tcp_on_shared() {
         .await
         .expect("the original Direct flow must exchange bytes and retire with the owner unpolled");
     });
+}
+
+#[tokio::test]
+async fn auxiliary_pause_cancels_active_tcp_and_dns_and_drains_late_ingress() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+        let (plane, _health) = local_plane().await;
+        let router = Arc::clone(&plane.router);
+        let (endpoints, mut supervisor, mut drivers) = PacketEndpoints::start_driven(
+            plane,
+            vec![(scope.clone(), owner)],
+            2,
+            None,
+            ScopeId::HOST,
+        )
+        .await
+        .unwrap();
+        let driver = drivers.first_mut().unwrap();
+        drive(driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+            .await
+            .unwrap();
+        endpoints.resume_auxiliary(driver, 1500).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = [0; 128];
+        let length = syn_packet(upstream.local_addr().unwrap(), &mut packet);
+        endpoints
+            .receive(scope.scope(), &packet[..length], Instant::now())
+            .unwrap();
+        let (mut peer, _) = drive(driver, upstream.accept()).await.unwrap();
+
+        let producer = endpoints.sender.try_reserve().unwrap();
+        let permit = Arc::clone(&endpoints.shared.tcp_slots)
+            .try_acquire_owned()
+            .unwrap();
+        let late_flow = pending_tcp(&scope, "203.0.113.9:443".parse().unwrap());
+        let late_binding = scope.auxiliary_work().unwrap().unwrap();
+        let route_gate = router.write().await;
+        let length = wire::udp::emit_packet(
+            &mut packet,
+            "192.0.2.10:41001".parse().unwrap(),
+            "198.51.100.53:53".parse().unwrap(),
+            &crate::control::tests::support::dns_query_payload(),
+        )
+        .unwrap();
+        endpoints
+            .receive(scope.scope(), &packet[..length], Instant::now())
+            .unwrap();
+        // The supervisor must take the DNS query and park on routing before pause.
+        drop(
+            endpoints
+                .sender
+                .reserve_many(INGRESS_CAPACITY - 1)
+                .await
+                .unwrap(),
+        );
+
+        let epoch = endpoints.shared.udp_pool.initialization_epoch();
+        {
+            let mut pause = std::pin::pin!(endpoints.pause_auxiliary(driver));
+            assert!(futures::poll!(&mut pause).is_pending());
+            assert!(!late_binding.is_active());
+            assert!(
+                endpoints
+                    .receive(scope.scope(), &packet[..length], Instant::now())
+                    .is_err()
+            );
+            assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+            producer.send(Work::Tcp(late_flow, permit, Some(late_binding)));
+            pause.await.unwrap();
+        }
+        drop(route_gate);
+        assert_eq!(endpoints.shared.udp_pool.initialization_epoch(), epoch);
+        endpoints.resume_auxiliary(driver, 1280).unwrap();
+        endpoints.close();
+        assert!(endpoints.resume_auxiliary(driver, 1500).is_err());
+        let (_, result) = drive(driver, poll_fn(|cx| supervisor.poll_join_plane(cx)))
+            .await
+            .unwrap();
+        result.unwrap();
+    })
+    .await
+    .expect("pause must release old auxiliary work while routing is blocked");
+}
+
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn terminal_shutdown_retires_active_auxiliary_tcp_neutrally() {
+    use crate::control::ControlCommand;
+    use crate::native_api::observation::NativeObservation;
+    use crate::observe::flows::Filters;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let budget = MemoryBudget::new(32 << 20);
+        let (scope, owner) = crate::control::netstack::auxiliary_scope(1500, &budget).unwrap();
+        let id = scope.scope();
+        let (mut plane, _health) = local_plane_with(|config| {
+            config.experimental.native_api.record_flows = true;
+        })
+        .await;
+        let native = NativeObservation::attach(&mut plane).await;
+        native.attach_for_test();
+        let commands = plane.command_sender();
+        let (endpoints, mut supervisor, mut drivers) =
+            PacketEndpoints::start_driven(plane, vec![(scope, owner)], 1, None, ScopeId::HOST)
+                .await
+                .unwrap();
+        let driver = drivers.first_mut().unwrap();
+        drive(driver, poll_fn(|cx| supervisor.poll_ready(cx)))
+            .await
+            .unwrap();
+        endpoints.resume_auxiliary(driver, 1500).unwrap();
+
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut packet = [0; 128];
+        let length = syn_packet(upstream.local_addr().unwrap(), &mut packet);
+        endpoints
+            .receive(id, &packet[..length], Instant::now())
+            .unwrap();
+        let (mut peer, _) = drive(driver, upstream.accept()).await.unwrap();
+        commands.send(ControlCommand::Shutdown).await.unwrap();
+        let (_, result) = drive(driver, poll_fn(|cx| supervisor.poll_join_plane(cx)))
+            .await
+            .unwrap();
+        result.unwrap();
+        assert_eq!(peer.read(&mut [0; 1]).await.unwrap(), 0);
+
+        let flows = &native.core.flows;
+        let page = flows
+            .page(
+                Filters::new("tcp".into(), "all".into(), None, false, 1),
+                None,
+            )
+            .unwrap();
+        let detail = flows.test_detail(page["flows"][0]["id"].as_str().unwrap());
+        assert_eq!(detail["state"], "closed");
+        let terminal = detail["trace"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["data"]["milestone"] == "terminal")
+            .unwrap();
+        assert_eq!(terminal["data"]["reason"], "intentional_retirement");
+    })
+    .await
+    .expect("shutdown must join the observing TCP task and close its real upstream");
 }
 
 #[test]

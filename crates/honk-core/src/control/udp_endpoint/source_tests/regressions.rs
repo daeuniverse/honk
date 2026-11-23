@@ -217,7 +217,7 @@ async fn admitted_source_transport_timeout_still_demotes_health() {
             first,
             followers: Vec::new(),
         },
-        first_ack_tx,
+        |result| drop(first_ack_tx.send(result)),
     ));
     {
         let _timer_context = timer_runtime.enter();

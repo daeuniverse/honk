@@ -290,7 +290,11 @@ async fn elastic_tcp_admission_has_funded_task_slots_beyond_the_initial_floor() 
             .acquire_owned()
             .await
             .unwrap();
-        endpoints.sender.send(Work::Tcp(flow, slot)).await.unwrap();
+        endpoints
+            .sender
+            .send(Work::Tcp(flow, slot, None))
+            .await
+            .unwrap();
         let (_first_peer, _) = first.accept().await.unwrap();
         let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (flow, _) = established_tcp(&scope, second.local_addr().unwrap()).await;
@@ -299,7 +303,11 @@ async fn elastic_tcp_admission_has_funded_task_slots_beyond_the_initial_floor() 
             .acquire_owned()
             .await
             .unwrap();
-        endpoints.sender.send(Work::Tcp(flow, slot)).await.unwrap();
+        endpoints
+            .sender
+            .send(Work::Tcp(flow, slot, None))
+            .await
+            .unwrap();
         let (mut peer, _) = second.accept().await.unwrap();
         peer.write_all(b"elastic").await.unwrap();
         loop {
@@ -353,7 +361,7 @@ async fn normal_close_aborts_packet_protocol_before_waiting_for_selector_retirem
             .unwrap();
         endpoints
             .sender
-            .send(Work::Tcp(flow, permit))
+            .send(Work::Tcp(flow, permit, None))
             .await
             .unwrap();
         let (mut server, _) = upstream.accept().await.unwrap();
@@ -571,14 +579,17 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
             let late_source = "192.0.2.10:41002".parse().unwrap();
             let queue_initializer = |source| {
                 endpoints
-                    .queue_datagram(&scope, source, destination, 0, None, None, |budget| {
+                    .queue_datagram(&scope, source, destination, 0, None, None, None, |budget| {
                         FundedDatagram::copy_from(b"cancelled", budget)
                     })
                     .unwrap();
                 assert!(endpoints.retains(scope.scope(), source, destination, 17));
             };
             queue_initializer(source);
-            endpoints.sender.try_send(Work::Tcp(flow, slot)).unwrap();
+            endpoints
+                .sender
+                .try_send(Work::Tcp(flow, slot, None))
+                .unwrap();
             for payload in [b"first".as_slice(), b"second".as_slice()] {
                 endpoints
                     .sender
@@ -590,6 +601,7 @@ async fn xdp_reload_drains_queued_initializers_across_its_epoch_without_losing_o
                         routing: None,
                         bytes: FundedDatagram::copy_from(payload, &budget).unwrap(),
                         source_work: scope.hold_source("192.0.2.10".parse().unwrap()).unwrap(),
+                        auxiliary: None,
                     }))
                     .unwrap();
             }

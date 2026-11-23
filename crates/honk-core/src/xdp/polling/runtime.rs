@@ -157,6 +157,7 @@ impl Runtime {
                 context.number(match device.role {
                     InterfaceRole::Lan => 1,
                     InterfaceRole::Wan => 2,
+                    InterfaceRole::L3Lan => return Err("context_unavailable"),
                 });
                 context.number(device.port_config.rx_frames as u64);
                 context.number(device.port_config.control_frames as u64);

@@ -482,7 +482,11 @@ fn tun_parser_refuses_unrepresented_route_and_rule_execution() {
     for kind in [17, 19, 20, 22, 23, 99] {
         let mut snapshot = fixture(&spec, Some(TunStage::Active));
         let mut body = rule_body(spec.rules()[0], spec.name);
-        attribute(&mut body, kind, &[0; 8]);
+        attribute(
+            &mut body,
+            kind,
+            if kind == 17 { b"wan0\0" } else { &[0; 8] },
+        );
         snapshot.rules.retain(|rule| rule.priority != 10000);
         snapshot.push(32, &body).unwrap();
         assert!(
@@ -490,6 +494,9 @@ fn tun_parser_refuses_unrepresented_route_and_rule_execution() {
             "rule attribute {kind}"
         );
     }
+    let mut malformed_oif = rule_body(spec.rules()[0], spec.name);
+    attribute(&mut malformed_oif, 17, &[0; 8]);
+    assert!(Snapshot::default().push(32, &malformed_oif).is_err());
     let mut duplicate = rule_body(spec.rules()[0], spec.name);
     attribute(&mut duplicate, 10, &0x100u32.to_ne_bytes());
     assert!(Snapshot::default().push(32, &duplicate).is_err());

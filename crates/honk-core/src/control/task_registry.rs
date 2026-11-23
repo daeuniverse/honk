@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 // Tokio task headers, JoinSet links and alignment; the future and buffers are charged separately.
-pub(super) const TASK_BOOKKEEPING: usize = 512;
+pub(crate) const TASK_BOOKKEEPING: usize = 512;
 
 // The abort pair shares an Arc allocation for the waker and flag, including header and padding.
 const ABORT_PAIR_MEMORY: usize = size_of::<AtomicWaker>() + 5 * size_of::<usize>();
