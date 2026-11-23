@@ -677,8 +677,7 @@ fn direct_reservation_refusals_preserve_unsent_bytes_and_other_class_progress() 
     assert_eq!(packet, original);
     {
         let inner = scope.0.inner.lock();
-        assert_eq!(inner._storage.bytes(), 2 * 1280);
-        assert!(budget.used() >= inner._storage.bytes());
+        assert_plain_frame_charge(&inner, &budget, 2 * 1280);
         assert_eq!(
             inner
                 .frames
@@ -906,8 +905,7 @@ fn direct_scope_unwind_cancels_only_unpublished_credit_without_relocking() {
     {
         let mut inner = scope.0.inner.lock();
         assert!(inner.frames.iter().all(Option::is_some));
-        assert_eq!(inner._storage.bytes(), 2 * 1280);
-        assert!(budget.used() >= inner._storage.bytes());
+        assert_plain_frame_charge(&inner, &budget, 2 * 1280);
         assert_eq!(inner.ledger.outstanding_tx().count(), 0);
         assert!(inner.output_peers.iter().all(Option::is_none));
         assert!(inner.slots.iter().all(Option::is_none));

@@ -42,6 +42,22 @@ fn runtime(now: Instant) -> (PacketScope, PacketOwner, Arc<MemoryBudget>) {
     (scope, owner, budget)
 }
 
+fn assert_plain_frame_charge(inner: &Inner, budget: &MemoryBudget, expected_payload: usize) {
+    let payload: usize = inner
+        .frames
+        .iter()
+        .map(|frame| frame.as_ref().unwrap().len())
+        .sum();
+    assert_eq!(payload, expected_payload);
+    let arrays = size_of_val(inner.frames.as_ref())
+        + size_of_val(inner.output_peers.as_ref())
+        + size_of_val(inner.queue.as_ref())
+        + size_of_val(inner.slots.as_ref())
+        + Sources::bytes(inner.slots.len()).unwrap();
+    assert_eq!(inner._storage.bytes(), payload + arrays);
+    assert!(budget.used() >= inner._storage.bytes());
+}
+
 fn context() -> Context<'static> {
     Context::from_waker(Waker::noop())
 }
@@ -409,8 +425,7 @@ fn mixed_direct_cpu_batch_retains_original_flows_through_reuse_and_close() {
                 .map(|frame| frame.as_ref().unwrap().as_ptr() as usize)
                 .collect();
             assert_eq!(restored, backing);
-            assert_eq!(inner._storage.bytes(), 4 * 1280);
-            assert!(budget.used() >= inner._storage.bytes());
+            assert_plain_frame_charge(&inner, &budget, 4 * 1280);
         }
         scope.shutdown(true);
         drop(new_io);
