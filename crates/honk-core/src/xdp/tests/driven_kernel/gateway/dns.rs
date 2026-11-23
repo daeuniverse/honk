@@ -1,5 +1,5 @@
 use super::guard;
-use crate::{control::ControlPlane, netlink::NlSock, routing::Router, xdp::gateway::GatewayPolicy};
+use crate::{control::ControlPlane, routing::Router, xdp::gateway::GatewayPolicy};
 use anyhow::ensure;
 use honk_ebpf_common::{xdp::CaptureAuthority, xdp_gateway::CaptureRealmKey};
 use honk_xsk::{
@@ -51,78 +51,69 @@ fn generated_dns_shadow_policy_verifies_and_jits() -> anyhow::Result<()> {
     guard();
     let probe = PathBuf::from(std::env::var_os("HONK_XDP_DNS_PROBE").unwrap());
     let artifacts = PathBuf::from(std::env::var_os("HONK_XDP_ARTIFACT_ROOT").unwrap());
-    std::thread::spawn(move || -> anyhow::Result<()> {
-        nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNET)?;
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::DEBUG)
-            .without_time()
-            .with_ansi(false)
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-        let mut netlink = NlSock::new()?;
-        netlink.add_veth_pair("dnsjit0", "dnsjit1")?;
-        let ifindex = nix::net::if_::if_nametoindex("dnsjit0")?;
-        let peer = nix::net::if_::if_nametoindex("dnsjit1")?;
-        netlink.set_link_up(ifindex, true)?;
-        netlink.set_link_up(peer, true)?;
-        let config = honk_config::parser::parse_dae_config(POLICY)?;
-        let router = Router::from_config(&config.routing)?;
-        let plan = ControlPlane::compile_routing_plan(&config, &router)?;
-        ensure!(plan.rules.len() >= 28 && plan.has_domain_rules);
-        let maps = GatewayMaps::new(
-            &[(
-                CaptureRealmKey {
-                    physical_ifindex: ifindex,
-                    ..Default::default()
-                },
-                1,
-            )],
-            &[],
-        )?;
-        let dns = GatewayDnsMaps::new(2)?;
-        let conntrack = ConntrackKfuncs::read()?;
-        let capture = GeneralCapture {
-            authority: CaptureAuthority {
-                namespace_cookie: 1,
-                attachment_generation: 2,
-                scope: 5,
-                config_generation: 2,
-                ifindex,
-                reserved: 0,
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .without_time()
+        .with_ansi(false)
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    // The fixture loads programs without attaching them; guard() already authenticated dut0.
+    let ifindex = nix::net::if_::if_nametoindex("dut0")?;
+    let config = honk_config::parser::parse_dae_config(POLICY)?;
+    let router = Router::from_config(&config.routing)?;
+    let plan = ControlPlane::compile_routing_plan(&config, &router)?;
+    ensure!(plan.rules.len() >= 28 && plan.has_domain_rules);
+    let maps = GatewayMaps::new(
+        &[(
+            CaptureRealmKey {
+                physical_ifindex: ifindex,
+                ..Default::default()
             },
-            bypass_mark: 0x100,
-            vlan_metadata: true,
-        };
-        for (enabled, mode) in [(false, "static"), (true, "shadow")] {
-            let policy = GatewayPolicy::prepare(&plan, enabled)?;
-            let programs = Programs::load_general_gateway(
-                &capture,
-                2,
-                &[],
-                GatewayLoad {
-                    routing: &policy.bytecode.insns,
-                    maps: &maps,
-                    conntrack: &conntrack,
-                    dns: enabled.then_some(&dns),
-                },
-            )?;
-            for (id, role) in [
-                (programs.discover_prog_id(), "boot"),
-                (programs.data_prog_id(), "data"),
-            ] {
-                let status = Command::new("python3")
-                    .arg(&probe)
-                    .args(["jit", mode, role, &id.to_string()])
-                    .arg(&artifacts)
-                    .status()?;
-                ensure!(
-                    status.success(),
-                    "JIT evidence failed for {mode}/{role}/{id}"
-                );
-            }
+            1,
+        )],
+        &[],
+    )?;
+    let dns = GatewayDnsMaps::new(2)?;
+    let conntrack = ConntrackKfuncs::read()?;
+    let capture = GeneralCapture {
+        authority: CaptureAuthority {
+            namespace_cookie: 1,
+            attachment_generation: 2,
+            scope: 5,
+            config_generation: 2,
+            ifindex,
+            reserved: 0,
+        },
+        bypass_mark: 0x100,
+        vlan_metadata: true,
+    };
+    for (enabled, mode) in [(false, "static"), (true, "shadow")] {
+        let policy = GatewayPolicy::prepare(&plan, enabled)?;
+        let programs = Programs::load_general_gateway(
+            &capture,
+            2,
+            &[],
+            GatewayLoad {
+                routing: &policy.bytecode.insns,
+                maps: &maps,
+                conntrack: &conntrack,
+                dns: enabled.then_some(&dns),
+            },
+        )?;
+        for (id, role) in [
+            (programs.discover_prog_id(), "boot"),
+            (programs.data_prog_id(), "data"),
+        ] {
+            let status = Command::new("python3")
+                .arg(&probe)
+                .args(["jit", mode, role, &id.to_string()])
+                .arg(&artifacts)
+                .status()?;
+            ensure!(
+                status.success(),
+                "JIT evidence failed for {mode}/{role}/{id}"
+            );
         }
-        Ok(())
-    })
-    .join()
-    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    }
+    Ok(())
 }
