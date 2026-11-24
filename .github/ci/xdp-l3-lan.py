@@ -24,6 +24,8 @@ from xdp_dns_tcp import owners, read_exact
 
 OUTER, INNER, REUSED = 'wg0', 'honk-l3-0', 'wg-unrelated'
 WG, LAN, UPLINK = ('10.79.0.2', 'fd00:79::2'), (dns.LAN4, dns.LAN6), (dns.UP4, dns.UP6)
+WG_PEER_ALLOWED_IPS = '10.79.0.1/32,fd00:79::1/128,198.51.100.0/24,fd00:2::/64'
+WG_PEER_ENDPOINT = '10.78.0.1:51820'
 TARGETS = ((dns.TARGET4, dns.TARGET6), (dns.EXPIRING, 'fd00:2::4'))
 STATIC, NEXT_STATIC = dns.STATIC, '198.51.100.8'
 ROLLBACK = 'xdp::tests::driven_kernel::gateway::kernel_gateway_auxiliary_mixed_rollback'
@@ -165,10 +167,16 @@ def wg_peer(keys, peer):
     ip('wgpeer', 'link', 'add', 'wpeer0', 'type', 'wireguard')
     add_address('wgpeer', 'wpeer0', WG[0] + '/24')
     add_address('wgpeer', 'wpeer0', WG[1] + '/64')
-    wg_set('wgpeer', 'wpeer0', peer, 51821, keys,
-           '10.79.0.1/32,fd00:79::1/128,198.51.100.0/24,fd00:2::/64', '10.78.0.1:51820')
+    wg_set('wgpeer', 'wpeer0', peer, 51821, keys, WG_PEER_ALLOWED_IPS, WG_PEER_ENDPOINT)
     for subnet in ('198.51.100.0/24', 'fd00:2::/64'):
         ip('wgpeer', 'route', 'add', subnet, 'dev', 'wpeer0')
+
+
+def wg_reset_peer(keys):
+    # A recreated DUT has no session for packets encrypted by the surviving peer.
+    inside('wgpeer', 'wg', 'set', 'wpeer0', 'peer', keys[1], 'remove')
+    inside('wgpeer', 'wg', 'set', 'wpeer0', 'peer', keys[1],
+           'allowed-ips', WG_PEER_ALLOWED_IPS, 'endpoint', WG_PEER_ENDPOINT)
 
 
 def wg_stats():
@@ -929,6 +937,7 @@ def delete_reload_reuse(artifacts, state, process, log, config, workers, keys, p
                 progress('delete-offline-second-progress')
                 offset = len(log.read_text())
                 wg_outer(keys, peer_keys)
+                wg_reset_peer(keys)
                 rebound = binding(process, log, offset, 1420, previous=current)
                 assert rebound['index'] != reused['ifindex']
                 payload = os.urandom(53)
@@ -1015,6 +1024,8 @@ def matrix(daemon, core, xsk, workers, artifacts, pins):
             progress('physical-up-with-wg-missing')
             offset = len(log.read_text())
             wg_outer(keys, peer_keys)
+            if workers == 1:
+                wg_reset_peer(keys)
             current = binding(process, log, offset, 1420)
             assert [ip('dut', family, '-j', 'rule', 'show') for family in ('-4', '-6')] == rules
             trial('wg-static-control', 'wgpeer', STATIC, socket.SOCK_STREAM, 'static')
@@ -1071,6 +1082,7 @@ def matrix(daemon, core, xsk, workers, artifacts, pins):
                 reload_policy(process, log, config, initial, 3)
                 offset = len(log.read_text())
                 wg_outer(keys, peer_keys)
+                wg_reset_peer(keys)
                 current = binding(process, log, offset, 1420, previous=current)
                 record('wireguard-moved', other_netns=Path('/run/netns/wgmoved').stat().st_ino,
                        moved_index=links('wgmoved')[OUTER]['ifindex'], current_index=current['index'])
