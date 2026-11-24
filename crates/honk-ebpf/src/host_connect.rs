@@ -6,31 +6,54 @@ use aya_ebpf::{
 };
 use aya_ebpf_bindings::{
     bindings::{BPF_SK_STORAGE_GET_F_CREATE, bpf_sock},
-    helpers::{bpf_loop, bpf_sk_storage_get},
+    helpers::bpf_sk_storage_get,
 };
-use core::{ffi::c_void, ptr};
+use core::ptr;
 use honk_ebpf_common::{ROUTING_PROCESS_MAX_LEN, TASK_COMM_LEN, host::HostSkIdentity, routing_policy::ProcessNameNormalizer};
 use crate::host_maps::HOST_SK_IDENTITY;
 
-struct NameScan {
-    raw: [u8; TASK_COMM_LEN],
-    output: [u8; ROUTING_PROCESS_MAX_LEN],
-    state: ProcessNameNormalizer,
+/// # Safety
+/// Non-null pointers must address valid, non-overlapping state and byte arrays.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn honk_normalize_process_step(
+    state: *mut ProcessNameNormalizer,
+    input: *const [u8; TASK_COMM_LEN],
+    output: *mut [u8; ROUTING_PROCESS_MAX_LEN],
+) -> i32 {
+    if state.is_null() || input.is_null() || output.is_null() {
+        return 1;
+    }
+    let advance = unsafe { (*state).advance(&*input, &mut *output) };
+    i32::from(!advance)
 }
 
-extern "C" fn normalize_step(_: u32, data: *mut c_void) -> i32 {
-    let scan = unsafe { &mut *data.cast::<NameScan>() };
-    i32::from(!scan.state.advance(&scan.raw, &mut scan.output))
+/// A global call boundary lets the verifier check decoding independently of capture.
+///
+/// # Safety
+/// Non-null input and output must address valid, non-overlapping byte arrays.
+#[unsafe(no_mangle)]
+#[inline(never)]
+pub unsafe extern "C" fn honk_normalize_process_name(
+    input: *const [u8; TASK_COMM_LEN],
+    output: *mut [u8; ROUTING_PROCESS_MAX_LEN],
+) -> u32 {
+    if input.is_null() || output.is_null() {
+        return 0;
+    }
+    unsafe { (*output).fill(0) };
+    let mut state = ProcessNameNormalizer::default();
+    for _ in 0..TASK_COMM_LEN {
+        if unsafe { honk_normalize_process_step(&mut state, input, output) } != 0 {
+            break;
+        }
+    }
+    state.normalized_len() as u32
 }
 
 #[inline(never)]
-fn normalized(raw: [u8; TASK_COMM_LEN], identity: &mut HostSkIdentity) -> bool {
-    let mut scan = NameScan { raw, output: [0; ROUTING_PROCESS_MAX_LEN], state: Default::default() };
-    if unsafe { bpf_loop(TASK_COMM_LEN as _, normalize_step as *mut _, ptr::from_mut(&mut scan).cast(), 0) } < 0 {
-        return false;
-    }
-    identity.pname = scan.output;
-    identity.pname_len = scan.state.normalized_len() as u8;
+fn normalized(raw: &[u8; TASK_COMM_LEN], identity: &mut HostSkIdentity) -> bool {
+    identity.pname_len = unsafe { honk_normalize_process_name(raw, &mut identity.pname) } as u8;
     identity.pname_len != 0
 }
 
@@ -58,10 +81,10 @@ pub unsafe extern "C" fn honk_host_name(out: *mut HostSkIdentity) -> i32 {
     if raw.pid == 0 { return 0; }
     let identity = unsafe { &mut *out };
     identity.pid = raw.pid;
-    if normalized(raw.pname, identity) { return 1; }
+    if normalized(&raw.pname, identity) { return 1; }
     if !argv0 { return 0; }
     let Some(comm) = crate::process_name::capture(false, false, 0, 0) else { return 0 };
-    i32::from(normalized(comm.pname, identity))
+    i32::from(normalized(&comm.pname, identity))
 }
 
 #[inline(never)]
