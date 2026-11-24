@@ -214,6 +214,8 @@ TUN 选择 bulk 128 和配置的逻辑 MTU（默认 1500）；false 使用一个
 
 每个 [Host 出口](./datapath.md#host-来源托管) 使用与辅助 LAN 相同的 4 MiB 私有 TUN/Stack 份额，不创建 Copy Port。元数据、设备对象、程序以及重载时两代并存的开销计入同一 384 MiB 根预算。两张 socket storage 的动态元素由内核按活动 socket 分配；它们及未来外部创建的 cgroup 的增量不属于 honk 的内存硬上限。流的 PID 和规范化进程名来自其精确 Endpoint 归属记录，不是最近一个发送者或 TUN HostFacts 收据。
 
+每个 Host 接口从自己的 4 MiB 份额中为私有 TUN 队列和读环预留 1 MiB + 4 KiB，重绑时继续使用这份预算。在 4 KiB 和 64 KiB 页上，这笔预留都能容纳两个 FIFO 槽位。其余容量用于包缓冲、协议栈重建和运行期流量。
+
 `PacketScope::receive_with_source` 在既有输出互斥锁内调用 source callback；callback
 不得重入该 scope 或阻塞 I/O。设备可先安装当前包的 reverse L2 关联，再让输出
 消费者继续；关联冲突则在协议状态变更前拒绝。source-aware scope 与 `PacketEndpoints`

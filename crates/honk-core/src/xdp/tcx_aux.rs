@@ -36,6 +36,13 @@ const CUSTODY_CHECK: Duration = Duration::from_secs(1);
 const PUBLISH_RETRY: Duration = Duration::from_millis(100);
 const RESYNC_DELAY: Duration = Duration::from_secs(1);
 
+fn reserve_host_fifo_budget(auxiliary: &Arc<MemoryBudget>) -> anyhow::Result<Arc<MemoryBudget>> {
+    // Two slots and their rings need 1 MiB on 64 KiB pages. The child also charges metadata.
+    auxiliary
+        .child((1 << 20) + (4 << 10))
+        .context("reserve private Host FIFO budget")
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("auxiliary TUN service panicked: {message}")]
 struct ServicePanic {
@@ -287,7 +294,9 @@ impl PreparedAux {
             .auxiliary_budget()
             .context("missing auxiliary slice")?;
         let records = Records::new(auxiliary_budget, inner_name.capacity() + name.len())?;
-        let host_budget = host.then(|| Arc::clone(auxiliary_budget));
+        let host_budget = host
+            .then(|| reserve_host_fifo_budget(auxiliary_budget))
+            .transpose()?;
         let virgin = PrivateTun::new(&inner_name, mtu, root, host_budget.as_ref(), &watch)?;
         virgin.verify(&inner_name, &watch)?;
         Ok((
@@ -946,6 +955,71 @@ fn device_gone(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "ebpf")]
+    #[tokio::test]
+    async fn host_fifo_leaves_room_for_stack_rebind() -> anyhow::Result<()> {
+        use honk_datapath::buffer::TxClass;
+        use honk_xsk::HostFifo;
+
+        let root = MemoryBudget::new(32 << 20);
+        let (scope, owner) = auxiliary_scope(1500, &root)?;
+        let auxiliary = scope.auxiliary_budget().unwrap();
+        let _records = Records::new(auxiliary, "honk-host-0".len() + "up".len())?;
+        let fifo_budget = reserve_host_fifo_budget(auxiliary)?;
+        let mut fifo = HostFifo::reserve(&fifo_budget)?;
+        assert!(fifo.slots() >= 2);
+        assert_eq!(root.used(), 4 << 20);
+
+        let plane = crate::control::tests::support::control_plane(honk_config::Config::default());
+        let scopes = vec![(scope.clone(), owner)];
+        let (endpoints, mut supervisor, mut drivers) =
+            PacketEndpoints::start_driven(plane, scopes, 1, None, ScopeId::HOST).await?;
+        let driver = &mut drivers[0];
+        poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            supervisor.poll_ready(cx)
+        })
+        .await?;
+        endpoints.resume_auxiliary(driver, 1500)?;
+
+        for mtu in [12_274, 1500, 1400, 1280] {
+            let previous = scope.binding();
+            drop(fifo);
+            endpoints.pause_auxiliary(driver).await?;
+            fifo = HostFifo::reserve(&fifo_budget)?;
+            endpoints
+                .resume_auxiliary(driver, mtu)
+                .with_context(|| format!("rebind Host Stack at MTU {mtu}"))?;
+            assert!(scope.binding() > previous);
+            assert!(fifo.slots() >= 2);
+            let headroom = auxiliary.limit() - auxiliary.used();
+            assert!(headroom >= 1 << 20, "MTU {mtu}: {headroom} bytes available");
+            println!(
+                "MTU {mtu}: {} FIFO slots, {headroom} bytes available",
+                fifo.slots()
+            );
+
+            let client = "192.0.2.2:41000".parse()?;
+            let payload = mtu.to_be_bytes();
+            let sender = scope.datagram_sender("192.0.2.1:53".parse()?);
+            assert_eq!(sender.send_to(&payload, client).await?, payload.len());
+            let mut outputs = [None];
+            let count =
+                poll_fn(|cx| driver.poll_outputs_class(cx, TxClass::Bulk, &mut outputs)).await;
+            assert_eq!(count, Some(1));
+            let packet = outputs[0].take().unwrap();
+            assert!(packet.packet().ends_with(&payload));
+            packet.release();
+        }
+        endpoints.close();
+        let (_, joined) = poll_fn(|cx| {
+            driver.service(cx, Instant::now());
+            supervisor.poll_join_plane(cx)
+        })
+        .await?;
+        joined
+    }
 
     #[test]
     fn host_ethernet_return_budget_leaves_room_for_the_mac_header() {

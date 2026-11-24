@@ -217,6 +217,8 @@ Each scope/class retains at most 32 pending leases. One `writev` submits each im
 
 Each [Host egress](./datapath.md#host-source-custody) uses the same 4 MiB private TUN/Stack partition as an auxiliary LAN, not a Copy Port. Metadata, device objects, programs and overlapping reload generations are charged to the same 384 MiB root. The kernel allocates the two socket-storage elements against live sockets; these dynamic charges and future externally created cgroups are not a process-wide memory bound. A flow's PID and normalized name come from its exact Endpoint ownership record, not from the most recent sender or a TUN HostFacts receipt.
 
+Within each Host interface's 4 MiB partition, 1 MiB + 4 KiB is reserved for the private TUN queue and read ring across rebinds. This funds two FIFO slots on 4 KiB and 64 KiB pages. The remaining capacity funds packet buffers, the rebuilt Stack and live traffic.
+
 `PacketScope::receive_with_source` invokes the source callback under the existing
 output mutex; it must not re-enter the scope or block on I/O. A device can install
 the current packet's reverse L2 association before any output consumer proceeds,
