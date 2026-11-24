@@ -95,12 +95,16 @@ impl AliveDialerSet {
         idle_timeout: Option<Duration>,
     ) {
         let mut idle = self.idle_groups.write();
-        let last_active_ns = idle
-            .groups
-            .get(group)
-            .filter(|old| old.kind == IdleGroupKind::Automatic)
-            .map(|old| old.last_active_ns.load(Ordering::Relaxed))
-            .unwrap_or(0);
+        let timeout = idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
+        let last_active_ns = if timeout.is_zero() {
+            0
+        } else {
+            idle.groups
+                .get(group)
+                .filter(|old| old.kind == IdleGroupKind::Automatic)
+                .map(|old| old.last_active_ns.load(Ordering::Relaxed))
+                .unwrap_or(0)
+        };
         if let Some(old) = idle.groups.remove(group) {
             for member in old.members {
                 if let Some(list) = idle.node_groups.get_mut(&member) {
@@ -124,7 +128,7 @@ impl AliveDialerSet {
         idle.groups.insert(
             group.to_string(),
             IdleGroupEntry {
-                timeout: idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
+                timeout,
                 members: dedup_members,
                 kind: IdleGroupKind::Automatic,
                 last_active_ns: AtomicU64::new(last_active_ns),
@@ -147,7 +151,13 @@ impl AliveDialerSet {
             }
             self.reset_group_health_observations();
         }
-        let active_urls: HashSet<String> = self.group_check_urls.read().values().cloned().collect();
+        let (active_groups, active_urls): (HashSet<String>, HashSet<String>) = {
+            let map = self.group_check_urls.read();
+            (map.keys().cloned().collect(), map.values().cloned().collect())
+        };
+        self.pending_url_group_wakes
+            .lock()
+            .retain(|group| active_groups.contains(group));
         self.url_check_ips
             .write()
             .retain(|url, _| active_urls.contains(url));
@@ -324,7 +334,11 @@ impl AliveDialerSet {
         idle.node_groups.clear();
         let mut new_groups = HashMap::with_capacity(groups.len());
         for registration in groups {
-            let last_active_ns = if registration.kind == IdleGroupKind::Selector {
+            let timeout = registration
+                .idle_timeout
+                .unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
+            let last_active_ns = if registration.kind == IdleGroupKind::Selector || timeout.is_zero()
+            {
                 0
             } else {
                 old_groups
@@ -342,9 +356,7 @@ impl AliveDialerSet {
             new_groups.insert(
                 registration.name.clone(),
                 IdleGroupEntry {
-                    timeout: registration
-                        .idle_timeout
-                        .unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
+                    timeout,
                     members: dedup_members,
                     kind: registration.kind,
                     last_active_ns: AtomicU64::new(last_active_ns),
@@ -388,29 +400,32 @@ impl AliveDialerSet {
             let members = entry.members.clone();
             drop(idle);
             let custom_url = self.group_check_urls.read().get(group).cloned();
-            let custom_leaves: Vec<Uuid> = if let Some(url) = custom_url {
-                let url_members = self.url_members_for(group);
+            let has_custom_url = if let Some(url) = custom_url {
                 let now = Instant::now();
                 {
                     let mut url_states = self.url_states.write();
-                    for member in &url_members {
-                        if let Some(state) = url_states.get_mut(&(member.tag.clone(), url.clone()))
-                        {
+                    for ((_, state_url), state) in url_states.iter_mut() {
+                        if state_url == &url {
                             state.cooldown_until = now;
                         }
                     }
                 }
-                url_members.into_iter().map(|m| m.leaf).collect()
+                self.enqueue_url_group_wake(group);
+                true
             } else {
-                Vec::new()
+                false
             };
-            if !members.is_empty() || !custom_leaves.is_empty() {
+            let wake_members: Vec<Uuid> = members
+                .into_iter()
+                .filter(|id| {
+                    *id != honk_config::config::BLOCK_NODE_ID
+                        && *id != honk_config::config::DIRECT_NODE_ID
+                })
+                .collect();
+            if !wake_members.is_empty() || has_custom_url {
                 tracing::debug!("Group '{}' active again — resuming member probes", group);
-                for member in members {
+                for member in wake_members {
                     self.trigger_probe(member);
-                }
-                for leaf in custom_leaves {
-                    self.trigger_probe(leaf);
                 }
             }
         }
@@ -523,11 +538,7 @@ impl AliveDialerSet {
             if let Some(state) = self.url_states.write().get_mut(&(tag.clone(), url)) {
                 state.cooldown_until = now;
             }
-            for member in self.url_members_for(group) {
-                if member.tag == *tag {
-                    self.trigger_probe(member.leaf);
-                }
-            }
+            self.enqueue_url_group_wake(group);
         }
     }
 
