@@ -935,13 +935,15 @@ def large_udp_reply(fixture):
             assert delivered == reply and source == target, ('original socket missed exact UDP reassembly', source, len(delivered))
 
             wire = list(ipv4_udp_frames(capture, target[0], (UPLINK[0], LOCAL[0])))
-            [carrier] = [row for address, row in wire if address == UPLINK[0]]
+            # AF_PACKET sees the carrier and reinjected fragments before reverse SNAT.
+            assert all(address == UPLINK[0] for address, _ in wire), 'unexpected reply destination at uplink ingress'
+            [carrier] = [row for _, row in wire if row[1] == 0 and not row[2]]
             _, offset, more, size, vnet, datagram = carrier
             assert (offset, more, size, vnet[1], vnet[3]) == (0, False, len(reply) + 28, 0, 0), carrier[:-1]
             assert struct.unpack_from('!HHH', datagram) == (target[1], outbound[1], len(reply) + 8)
             assert datagram[8:] == reply
 
-            fragments = sorted((row for address, row in wire if address == LOCAL[0]), key=lambda item: item[1])
+            fragments = sorted((row for _, row in wire if row[1] > 0 or row[2]), key=lambda item: item[1])
             assert len(fragments) >= 2 and len({row[0] for row in fragments}) == 1
             reassembled = bytearray()
             for index, (_, offset, more, size, vnet, data) in enumerate(fragments):
