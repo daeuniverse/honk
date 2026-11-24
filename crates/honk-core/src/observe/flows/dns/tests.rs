@@ -168,7 +168,7 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
     });
     let provider = Arc::new(DnsServiceProvider::new(runtime));
     let service = DnsService::with_provider(provider.clone());
-    let pinned = service.pin_name_resolution().unwrap();
+    let pinned = service.pin_name_resolution(None).unwrap();
     let hook = crate::dns::node_host::resolver(&service);
 
     assert!(hook.lookup("node.private.example").is_some());

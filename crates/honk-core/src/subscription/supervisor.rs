@@ -193,11 +193,15 @@ pub(crate) fn drop_nodes_published_elsewhere(
 ) {
     let owners: HashMap<_, _> = published
         .iter()
+        .filter(|node| node.chain_hops().is_none())
         .filter_map(|node| Some((node.id, node.subscription_id.filter(|id| *id != provider)?)))
         .collect();
     let mut dropped = Vec::new();
     let mut dropped_owners = Vec::new();
     nodes.retain(|node| {
+        if node.chain_hops().is_some() {
+            return true;
+        }
         let Some(owner) = owners.get(&node.id) else {
             return true;
         };

@@ -836,11 +836,17 @@ honk 不接受呼叫方指定的 URL。探測用途由 `kind` 決定，不用在
 
 HTTP 使用設定中的檢查 URL，不跟隨重新導向。DNS 執行真實的 UDP 交換或帶長度幀的 TCP 交換。探測目標只來自已接受的設定；honk 不對目標或節點伺服器施加位址、連接埠策略。
 
-目標主機名稱依目前 DNS 設定解析；這份設定答不上來時，例如用了 `asis` 路由，就退回 bootstrap DNS。私網、loopback 位址與非預設設定連接埠不需要額外放行。IPv4-mapped IPv6 會正規化成 IPv4；選中的 IP 保持固定，HTTP Host 與 TLS SNI 保留設定中的名稱，不能交給代理重新解析。探測、geodata 與共用下載都使用設定中的目標，不設位址或連接埠白名單。
+探測目標和節點伺服器名稱使用接納探測時的 DNS 設定。若這份設定無法回答（例如使用 `asis` 路由），探測使用同一份設定的 bootstrap DNS，不會改用重載後的解析器。IPv4-mapped IPv6 會正規化成 IPv4；選中的 IP 保持固定，HTTP Host 與 TLS SNI 保留設定中的名稱。探測、geodata 和共用下載都使用設定中的目標，不設位址或連接埠白名單，私網、loopback 位址和非預設連接埠也無需額外放行。
 
 能夠寫入設定或控制訂閱內容的人，決定這些目標是什麼。provider 內容屬於可信的設定。
 
-對 `direct` 或 `block` 節點做 `tcp_connect`，或對不支援 UDP 的節點做 UDP 探測，會在這項測量開始之前回傳 `422 unsupported_value`。
+對 `direct`、`block` 節點做 `tcp_connect`、以[鏈式節點](./nodes.md#鏈式節點)為目標做 `tcp_connect`，或對不支援 UDP 的節點做 UDP 探測，會在這項測量開始之前回傳 `422 unsupported_value`。對群組做 `tcp_connect` 探測時，其他成員照常測量；鏈式節點成員結果列的 `state` 為 `unavailable`，`error` 為 `no_node_address`，因為鏈式節點沒有自己的伺服器位址。
+
+原生介面的鏈式 HTTP 探測（`cold` 和 `warm`）及採用長度訊框的 TCP DNS 探測，每次測量都會建立由清理守衛管理的私有鏈執行環境和各實體跳的私有執行環境。它們共用當代與行程的撥號額度，以及 VLESS 載體額度。探測不借用業務工作階段，也不會將工作階段放入業務連線池。準備時會用任務擷取的 DNS 世代分別固定探測目標 IP 和實體入口伺服器 IP。後續跳的伺服器網域名稱仍由前一跳解析。
+
+上傳或分流下載伺服器的 hosts 別名會依[別名目標的節點網域規則](./dns.md#節點伺服器網域)解析。即使檢查 URL 使用相同網域，仍依探測目的地的 DNS 原則解析，兩者不共用別名結果。如果目的地沒有所要求 IP 位址族的位址，探測不會查詢上傳或下載伺服器的網域。
+
+HTTP `cold` 從撥號開始計時，包含適用的目標 TLS 交握，以及一次依設定送出的 HTTP 請求和回應驗證。`warm` 在同一條連線上先送出並驗證 HEAD，再對隨後依設定送出的請求計時。符合退回條件的傳輸失敗可以回報已驗證的 HEAD 樣本。回應無效或收到不完整的 HTTP/1 回應標頭時，測量失敗。探測完成、取消或逾期後，操作均會等候私有執行環境清理完畢。
 
 | 探測預算 | 上限 |
 | --- | --- |
@@ -1099,7 +1105,7 @@ GET 與成功的 PATCH 回應中有唯讀的 `recording`：`flows`、`logs`、`d
 
 DELETE 不接受請求內容與查詢參數：帶了任意一個就回傳 `400 invalid_request`；內容超限回傳 `413 request_too_large`。兩種都不帶 `Retry-After`。未知 ID 回傳 `{"deleted":0}`，不寫入。成功刪除則在啟用之後回傳 `{"deleted":1}`。
 
-內建節點、訂閱派生節點、非主檔案項目，以及不支援或有歧義的歸屬，都回傳 `404 capability_not_supported`。靜態 include 仍然在 inline 檢視中可見。固定的用戶端契約沒有逐節點的 `writable` 欄位，所以介面上的刪除按鈕仍可能被拒絕。
+內建節點、鏈式節點、訂閱派生節點、非主檔案項目，以及不支援或有歧義的歸屬，都回傳 `404 capability_not_supported`。靜態 include 仍然在 inline 檢視中可見。固定的用戶端契約沒有逐節點的 `writable` 欄位，所以介面上的刪除按鈕仍可能被拒絕。
 
 刪除被某個群組用作 `final` 的節點回傳 `409 state_conflict`，`details.groups` 列出這些群組的 ID。其他仍被引用的項目要先改掉引用，否則寫入前的驗證會失敗。主檔案讀取之後又在磁碟上被改動時，回傳 `409 state_conflict`。
 
@@ -1451,11 +1457,11 @@ Clash listener 允許任意 CORS 來源，沒有原生 API 那樣的 Host 與 Or
 
 `GET /proxies` 回傳 `{"proxies":{"<name>":<document>}}`；`GET /proxies/{name}` 回傳單一文件。節點文件含 `name`、`type`、`udp: true` 與 `history`。群組文件含 `name`、`type`、成員名稱清單 `all`、TCP 選擇 `now` 與 `history`；Score 另含 `scoreVerification`。`GLOBAL` 含 `type: "selector"`、`all` 與 `now`，沒有 `history`。
 
-節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。
+節點 `type` 為 `Shadowsocks`、`Trojan`、`Vmess`、`Vless`、`Socks5`、`Hysteria2`、`Tuic`、`Juicity`、`AnyTLS`、`Chain`、`Direct` 或 `Reject`，其中 `Reject` 對應 `block`。群組 `type` 為 `selector`、`url_test`、`load_balance` 或 `fallback`；Score 回報為 `url_test`。`history` 項目為 `{time,delay}`，取最近一次真實 TCP IPv4 測量。
 
 `GET /rules` 回傳 `{"rules":[{"type","payload","proxy"}]}`，由設定的路由規則產生，不含原生規則 ID，也沒有 fallback 列。
 
-`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。
+`GET /connections` 回傳 `{downloadTotal,uploadTotal,connections,memory}`。兩個總量是目前各列之和，`memory` 是行程 RSS 位元組數。每列為 `{id,metadata,upload,download,start,chains,rule,rulePayload}`。`metadata` 含 `network`、`type`、字串形式的 `sourceIP`、`destinationIP`、`sourcePort` 與 `destinationPort`、`host`、`dnsMode: "normal"`、`process` 與 `processPath`；未知值為 `""`。`chains` 從撥號的節點倒推到規則的目標：先是節點，再是選中它的各層群組。[鏈式節點](./nodes.md#鏈式節點)前面先列出它的各跳，出口在前。
 
 WebSocket 連線上，`?interval=` 設定推送間隔，單位毫秒，預設 1000。它會向上取整到 100、200、500、1000、2000、5000、10000、30000 或 60000，最大 60000。
 
@@ -1525,15 +1531,17 @@ bucket 的順序列出已通過 admission 的非 worker 訂閱；各來源表內
 
 兩輪最終回應的解碼狀態都必須是有效的 200–499。第二輪傳輸失敗或逾時時，可以退回已經驗證過的第一輪樣本。HTTP/1 的部分回應即使逾時也不退回；正常的 HTTP/2 GOAWAY 則可以退回。
 
-每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。session 預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。針對冷的可重用 generation 的探測，使用帶 guard 的臨時執行時，結束後關閉。
+每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。工作階段預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。一般可重用節點尚未預熱時，使用帶清理守衛的臨時執行環境，結束後關閉。Clash 延遲測試、舊版 URLTest 和週期 HTTP 健康檢查借用當代已准入的鏈，因此可能重用實體入口的現有工作階段。原生介面使用自己的私有執行環境，見[有界探測](#有界探測)。
+
+鏈式節點的 TCP IPv4 健康狀態已判為失效時，Clash 延遲測試可在連續兩次探測成功後恢復該位址族的健康狀態。
 
 HTTP/2 驅動任務在完成或取消後釋放，因此群組掃描不會為每個已測試節點留下新的常駐可重用執行時。
 
-測量成功會更新節點的延遲歷史。單一節點失敗回傳 `503`；群組測量會省略失敗的成員；任意手動測試目標的失敗，都不會增加真實撥號失敗的連續計數。
+重載前已接納的測量仍可回傳結果。已登記節點只有在健康登記和實際撥號路徑都未變時才更新健康歷程。對未登記的一般節點，`/proxies/{name}/delay` 成功後只更新 Clash 顯示的歷程，不改變健康狀態或 Score。只要同一實體節點始終未登記，無關的重載會保留它的樣本，進行中的測量仍可寫入結果。單一節點失敗回傳 `503`；群組測量省略失敗成員。手動測試失敗不會增加實際撥號的連續失敗次數。
 
-`/proxies/{name}/delay` 回傳 `{"delay":12}`；`/group/{name}/delay` 回傳 `{"<member>":12,...}`。延遲以毫秒計，上限 65535。對 URLTest 群組，兩個介面都可能依新測量切換其選擇。
+`/proxies/{name}/delay` 回傳 `{"delay":12}`；`/group/{name}/delay` 回傳 `{"<member>":12,...}`。延遲以毫秒計，上限 65535。只有原群組管理器仍在使用時，這兩個介面才可能依測量結果重新選擇 URLTest 成員。
 
-按需的 delay exchange 會保留 Alive/API 的延遲歷史，但不回報業務結果，也不填充設定中 Score 的比較 cohort。實際的 server 或 session 前置準備可以回報聚合的預熱建立情況；honk 不會把呼叫方的 URL 虛構成預熱自身的目標，也不提供晉升證明。
+隨選延遲測量不回報業務結果，也不填充設定中 Score 的比較 cohort。實際的 server 或 session 前置準備可以回報聚合的預熱建立情況；honk 不會把呼叫方的 URL 虛構成預熱自身的目標，也不提供晉升證明。
 
 兩個延遲介面都會一直持有已接納的任務，直到測量清理結束，即使 HTTP 用戶端已經斷開。owner 接納失敗時回傳 `503`，這個回應會區分容量耗盡、檢查已停止與 worker 失敗。
 

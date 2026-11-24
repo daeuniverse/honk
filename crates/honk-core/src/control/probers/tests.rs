@@ -692,7 +692,7 @@ async fn native_health_distinguishes_connect_and_http_for_duplicate_names() {
     prober.proxy_registry = Arc::new(registry);
     let alive = AliveDialerSet::new();
     alive.enable_health_history();
-    alive.register_node(node.id, node.name.clone(), node.address.clone());
+    alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     let before = std::time::SystemTime::now();
     assert!(alive.probe_node(node.id, Duration::from_secs(1)).await);
     drop(listener.accept().await.unwrap());
@@ -798,7 +798,7 @@ async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
         let (prober, node) = test_prober("HEAD");
         let alive = Arc::new(AliveDialerSet::new());
         alive.enable_health_history();
-        alive.register_node(node, "probe".into(), addr.to_string());
+        alive.register_node(node, "probe".into(), Some(addr.to_string()));
         alive
             .set_http_probe(Arc::new(prober), format!("http://{addr}/"), "HEAD".into())
             .await;

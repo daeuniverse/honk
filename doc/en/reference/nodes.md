@@ -15,15 +15,15 @@ node {
 
 ## Fields
 
-The Node model exposes the fields below. Share links fill the operator-facing fields from the scheme, userinfo, authority, fragment and query; structured loaders, import and runtime fill the rest. None of these fields is a separate key inside dae `node {}`: declare nodes as links under [`node {}` declarations](#node--declarations).
+The Node model exposes the fields below. Share links fill the operator-facing fields from the scheme, userinfo, authority, fragment and query; structured loaders, import and runtime fill the rest. None of these fields is a separate key inside dae `node {}`: declare nodes as links or [proxy chains](#proxy-chains) under [`node {}` declarations](#node--declarations).
 
-Flat structured input requires `name`, `protocol`, `address` and `port`, even when `host` is set. Defaults in the table are model defaults.
+Flat structured input requires `name`, `protocol`, `address` and `port`, even when `host` is set. A chain gives `protocol: chain`, `address: ""`, `port: 0` and a `hops` list. Defaults in the table are model defaults.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `id` | UUID | derived | Stable content identity; nil is invalid at runtime. See [Node identity](#node-identity). |
 | `name` | string | `""` | Dae tag, decoded fragment, `remark` query, VMess `ps`, or the credential-free `{scheme}-{host}` fallback. |
-| `protocol` | enum | `ss` | Derived from the share-link scheme. |
+| `protocol` | enum | `ss` | Derived from the share-link scheme; `chain` for a proxy chain. |
 | `address` | string | `""` | `host:port` parsed from the link; it does not supply a missing port. |
 | `host` | string | `""` | Explicit server host; otherwise `Node::host()` derives it from `address`. |
 | `port` | u16 | `0` | Server port; a URL-shaped link uses `443` when it omits the port, and a v2rayN VMess payload requires a valid port. |
@@ -64,12 +64,13 @@ Flat structured input requires `name`, `protocol`, `address` and `port`, even wh
 | `anytls_min_idle_session` | usize? | `null` | Requested idle-session floor from `min_idle_session`; effective default `0`, bounded by the eight-session pool cap. |
 | `anytls_idle_session_check_interval` | u64? | `null` | Parsed `idle_session_check_interval` seconds; current runtime janitor cadence remains fixed at 30 s. |
 | `anytls_idle_session_timeout` | u64? | `null` | Idle eviction from `idle_session_timeout`; effective default 30 s. |
+| `hops` | string[] | omitted | Chain hop node names from entry to exit. Other protocols discard the field and warn if the list is nonempty. |
 | `mark` | u32? | `null` | Structured-model outbound `SO_MARK`; not a dae share-link query. |
 | `tags` | string[] | `[]` | Classification metadata; not a dae share-link query. |
 | `subscription_id` / `group_id` | UUID? | `null` | Import and runtime ownership metadata. |
 | `created_at` / `updated_at` | datetime | current time | Runtime metadata. |
 
-Intrinsic validation requires a nonempty node name, effective host, and explicit nonzero `port`. `address` does not supply a missing port; address-only IPv6 requires an explicit `host`. Only exact injected `direct`/`block` identities are endpoint-exempt.
+All nodes require a nonempty name. Physical proxies require an effective host and an explicit nonzero `port`. `address` does not supply a missing port, and address-only IPv6 requires an explicit `host`. The injected `direct` and `block` nodes are endpoint-exempt. A [chain](#proxy-chains) requires an empty host and address and port `0`.
 
 In URL userinfo, Trojan, AnyTLS, VLESS and VMess use the password part of `user:pass`, or the whole userinfo when it has no colon. Hysteria2 keeps `user:pass` whole, TUIC and Juicity read `uuid:password`, and SOCKS5 keeps both parts. Credentials are percent-decoded and must be valid UTF-8. Write a literal `:` or `@` inside a secret as `%3A` or `%40`.
 
@@ -261,7 +262,7 @@ In the legacy `ss://base64(method:password@host:port)` form, honk treats decoded
 
 ## Node identity
 
-`Node::derive_id()` is the only identity derivation path. It computes UUID v5 over:
+`Node::derive_id()` is the only identity derivation path. For ordinary nodes it computes UUID v5 over the fields below. [Proxy chains](#proxy-chains) use their resolved hop IDs.
 
 ```text
 protocol|host|port|credential-fingerprint|dial-shape
@@ -321,6 +322,7 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 | `anytls` | — | Yes | Yes* | Multiplexed TLS sessions and UoT v2 |
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
+| `chain` | — | Yes | No | Dials through other nodes in turn; no share-link scheme; see [Proxy chains](#proxy-chains) |
 
 `network` can disable packet dialing for Trojan, AnyTLS and VLESS independently of their stream transport. VMess UDP is not implemented.
 
@@ -826,6 +828,64 @@ Per-node ECH controls are:
 
 A static config offers real ECH, and ECH rejection fails the handshake closed. Discovery is best-effort and fail-open. If no ECHConfigList is found, the handshake continues without real ECH, and `utls` still emits ECH GREASE. Discovery uses the bootstrap resolver or the first system nameserver and caches results by domain. The same controls apply to QUIC protocols.
 
+## Proxy chains
+
+A chain node reaches its destination through other nodes in turn. List its hop names from entry to exit, separated by `->`:
+
+```dae
+node {
+    front: 'socks5://127.0.0.1:1080'
+    'hk: east': 'ss://YWVzLTI1Ni1nY206cGFzc3dvcmQ@hk.example.com:8388'
+    land: 'trojan://secret@land.example.com:443?sni=land.example.com'
+
+    via_hk: front -> 'hk: east' -> land
+}
+```
+
+honk connects to the entry's server as for any other proxy. Each later hop runs its handshake inside the stream opened by the preceding hops, and the exit connects to the destination. Groups select a chain through `filter` or the group's `final`, and routing rules reach it through a group.
+
+The entry syntax is a honk extension; see the [dialect reference](./dialect.md#node-and-subscription-entries).
+
+| Input | Result |
+| --- | --- |
+| `->` outside quotes | A chain. Spaces around `->` are optional. |
+| A hop name containing `->`, `://` or a `#` after whitespace | Quote that hop: `front -> 'a->b'`. Unquoted, `->` splits the hop, `://` makes the value a share link and ` #` starts a comment. A `:` or a space inside a hop name needs no quotes. |
+| An unquoted `://` in the value | A share link even when it contains `->`. For example, `land: trojan://…#hk->jp` declares a Trojan node. See [Share-link schemes](#share-link-schemes). |
+| The whole value quoted, `via: 'front -> land'` | A malformed link. The entry is dropped with `invalid-node-entry`. |
+| No unquoted `->`, `via: front` | Not a chain: the value is read as a share link, and the entry is dropped with `invalid-node-entry`. |
+| No tag, more than four hops, an empty hop, or the chain's own name as a hop | Reject the configuration. Unlike a malformed share link, an invalid chain entry is not skipped. |
+
+Hops resolve by name after honk assembles the static and subscription nodes. A configuration, reload, or subscription refresh that fails a check is rejected. The active configuration stays in place.
+
+| Check | Diagnostic code |
+| --- | --- |
+| Each hop names exactly one node | `invalid-chain-hop-reference` when none matches, `ambiguous-chain-hop-reference` when several do |
+| A hop is not `direct`, `block`, or another chain | `unsupported-chain-hop` |
+| Every hop after the entry supports tunneled dial (table below) | `unsupported-chain-hop` |
+
+Each hop must name a node. A subscription refresh is rejected if it removes a referenced name or makes that name ambiguous.
+
+| Position | Supported nodes |
+| --- | --- |
+| Entry | Any supported physical proxy, dialed as usual |
+| Later hops, including the exit | SOCKS5, Shadowsocks, Trojan or VMess without XHTTP, and VLESS without Vision, Encryption, XHTTP, or active TCP multiplexing (H2MUX or Mux.Cool) |
+
+Hysteria2, TUIC, Juicity and AnyTLS can only be the entry. VMess and VLESS require a build with `rprx` at any position.
+
+honk resolves the entry server as usual. For a later hop it passes a server hostname to the preceding proxy for resolution. For an ordinary TLS hop after the entry, both configuration admission and dial time refuse ECH discovery when the effective TLS server name is a hostname. An otherwise supported hop can use a static ECH configuration. An IP-literal TLS server name needs no ECH DNS query, and REALITY uses its own handshake.
+
+A chain has no server endpoint, credential, or share-link scheme. JSON, YAML, and TOML store `protocol: chain` and the two to four hop names in entry-to-exit order under `hops`. The admitted snapshot exposes a [chain ID](#node-identity) derived from `chain` and the ordered, resolved physical node UUIDs. A chain display rename or a hop display rename with references updated keeps that ID. Changing a hop's physical UUID, for example by replacing its endpoint, credentials, or protocol under the same name, rekeys the chain. Reordering distinct hops or adding or removing a hop also changes the ID. Two chains with the same ordered physical UUIDs fail admission with `duplicate-node-id`. The ordinary node ID rules stay the same.
+
+### Selection, pooling, and health
+
+- TCP only. Groups skip chain nodes when selecting for UDP, and a UDP flow routed to one is refused, as with VMess.
+- A chain has no pool or preconnect of its own. Each dial opens a logical entry stream and repeats every later handshake. The physical first-hop runtime can reuse a suitable session.
+- A dae group with neither node filters nor subgroups includes both the chain and its physical hops. Use `filter` to exclude an exit that cannot be reached directly.
+- If either snapshot contains a chain, a subscription refresh rebinds an explicit, unfiltered member list and removes vanished members without adding unrelated nodes. Between two chain-free snapshots, an unfiltered group without subgroups keeps its legacy behavior: it also takes new ordinary nodes. That refresh does not declare a wildcard for a later chain.
+- Dial results, health, and Score use the chain's own ID. With an HTTP check target, health probes dial through the whole chain. With `tcp_check_url` empty, raw TCP health checks are inapplicable to a chain and leave its health alone. Ordinary nodes, including flat nodes with an empty `address`, keep the existing raw probe behavior. Successful traffic that still reaches a dead chain can revive it. Two consecutive successful manual Clash delay checks can restore its TCP IPv4 health. A reload that rekeys the chain starts a new live health registration. See [native probes](./api.md#bounded-probes), [Clash delay](./api.md#delay-measurement), and [CLI delay](./cli.md#delay).
+- Transport-quality evidence belongs to the physical hops. Chain traffic can put pressure on the entry node, while the chain has no transport pressure signal of its own. See [Outbound design](../design/outbound.md#proxy-chains).
+- Manage chains in the configuration. See [native node entry management](./api.md#managed-entries-and-geodata) and [Clash connection reporting](./api.md#endpoint-map).
+
 ## Share-link schemes
 
 Outside XHTTP, unknown query keys are ignored, so a misspelled key produces no error. XHTTP links reject unknown keys, and VLESS rejects the third-party spellings listed above.
@@ -848,7 +908,7 @@ honk runs no Shadowsocks plugins. `plugin=name;options`, `plugin-opts` and `plug
 
 SOCKS5 offers username/password authentication only when the link has both; each must fit in 255 bytes.
 
-For a chain written as `a -> b`, only `a` is parsed. Node names come from the dae tag, `#fragment`, `remark`, VMess `ps` or `{scheme}-{host}`, never from the raw URI or userinfo, so credentials do not leak into them.
+A share link ignores its text from the first `->` on. Node names come from the dae tag, `#fragment`, `remark`, VMess `ps` or `{scheme}-{host}`, never from the raw URI or userinfo, so credentials do not leak into them.
 
 ## Related docs
 

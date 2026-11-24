@@ -114,6 +114,16 @@ fn parse_node_entry(
         (None, value)
     };
 
+    if let Some(hops) = chain_hops(uri) {
+        let node = Node::chain(tag.map_or("", |tag| tag.raw()), hops);
+        diagnostics
+            .validate_entry_node(&node)
+            .map_err(super::ParseFailure::Detailed)?;
+        on_entry(&node, text.source.span(text.span.start, text.span.end));
+        nodes.push(node);
+        return Ok(());
+    }
+
     let Some((uri, end)) = complete_quoted_value(uri, diagnostics) else {
         return Ok(());
     };
@@ -148,6 +158,21 @@ fn parse_node_entry(
         }
     }
     Ok(())
+}
+
+/// Split on unquoted `->`. An unquoted `://` takes precedence as a share link,
+/// so a hop name containing `://` must be quoted.
+fn chain_hops(value: Text<'_, '_>) -> Option<Vec<String>> {
+    value.find("->")?;
+    if value.find("://").is_some() {
+        return None;
+    }
+    Some(
+        value
+            .split("->")
+            .map(|hop| hop.unquote().raw().to_owned())
+            .collect(),
+    )
 }
 
 fn complete_quoted_value<'d, 'a>(

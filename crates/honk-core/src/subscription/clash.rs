@@ -375,7 +375,9 @@ fn apply_protocol(mapping: &Mapping, node: &mut Node) -> Result<(), &'static str
             config.idle_session_timeout =
                 yaml_duration_alias(mapping, &["idle-session-timeout", "idle_session_timeout"])?;
         }
-        OutboundConfig::Direct | OutboundConfig::Block => unreachable!(),
+        OutboundConfig::Direct | OutboundConfig::Block | OutboundConfig::Chain(_) => {
+            unreachable!()
+        }
     }
     Ok(())
 }

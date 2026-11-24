@@ -42,6 +42,7 @@ honk 使用 dae 設定語法的一個方言。同一段文字在兩者中解析�
 | 訂閱區塊：`paid: {` 之後各佔一行的 `url: …`、`ua: …`、`interval: …` 與 `}` | `ID ':' '{'` 不是宣告 | honk 擴充：訂閱也可以寫成區塊，設定和其他區塊一樣每行一條。 | [dialect-entries-04-block](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-04-block.dae) |
 | 帶引號的訂閱連結後接區塊：`paid: 'url' {` 之後各佔一行的 `ua: …`、`interval: …`、`cache: …` 或 `route: …` 與 `}` | `ID ':' literal` 已結束宣告 | honk 擴充：條目選項，未設定的項取自 `assets.subscription` 和 `assets.route`。`route` 取代舊區塊形式裡的 `download_detour`；兩者同時設定會回報 `conflicting-subscription-route`。 | |
 | `node` 裡冒號前帶空格的裸標籤，`edge : 'socks5://…'` | 標籤為 `edge` | 冒號兩側的空白會被正規化：節點保留下來，標籤為 `edge`，並產生 `entry-tag-normalized` 資訊等級診斷。`edge: …` 和帶引號的標籤也仍然接受。 | [dialect-entries-05-spaced-tag](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-05-spaced-tag.dae) |
+| 鏈式節點，`via: front -> land` | 在 `->` 處報語法錯誤；節點值只能是一個字面值 | honk 擴充。引號外的 `->` 讓條目成為依入口到出口順序列出節點名的[鏈式節點](./nodes.md#鏈式節點)；跳名含 `->`、`://` 或空白之後的 `#` 時加引號。值中有引號外的 `://` 時仍是分享連結。 | [dialect-entries-06-proxy-chain](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-06-proxy-chain.dae)、[鏈式節點測試](../../../crates/honk-config/tests/chain.rs) |
 | VLESS 分享連結或扁平序列化 VLESS 節點中的 `vless_mode` | 舊 VLESS mode 選擇器 | 已移除，不接受為別名。分享連結要改用獨立的 `udp=`、`packetEncoding=` 和 `mux=` 查詢參數。扁平 VLESS 節點拒絕任何形式的 `vless_mode`，包括 `null`，請改用 `network`、`packet_encoding` 和 `multiplex`。 | |
 | 扁平序列化非 VLESS 節點上的 `vless_mode: legacy` | VLESS 之外的舊欄位 | 這只是序列化配接器讀寫用的相容佔位欄位，不影響行為。它是非 VLESS 序列化中唯一的例外，不屬於文件支援的 dae 語法或分享連結語法。 | |
 

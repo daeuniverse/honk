@@ -181,6 +181,8 @@ struct FlatNode {
     #[serde(default)]
     anytls_idle_session_timeout: Option<u64>,
     #[serde(default)]
+    hops: Vec<String>,
+    #[serde(default)]
     mark: Option<u32>,
     #[serde(default)]
     tags: Vec<String>,
@@ -325,7 +327,10 @@ impl FlatNode {
         );
         strip!(
             self.password.is_some()
-                && matches!(self.protocol, NodeProtocol::Direct | NodeProtocol::Block),
+                && matches!(
+                    self.protocol,
+                    NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Chain
+                ),
             password
         );
         strip!(
@@ -357,6 +362,10 @@ impl FlatNode {
         strip!(
             self.plugin.is_some() && self.protocol != NodeProtocol::SS,
             plugin
+        );
+        strip!(
+            !self.hops.is_empty() && self.protocol != NodeProtocol::Chain,
+            hops
         );
         strip!(
             self.plugin_opts.is_some() && self.protocol != NodeProtocol::SS,
@@ -681,6 +690,9 @@ impl FlatNode {
             }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
+            NodeProtocol::Chain => {
+                OutboundConfig::Chain(super::ChainConfig::new(std::mem::take(&mut flat.hops)))
+            }
         };
         if !flat.tls_alpn.is_empty() {
             return Err(semantic_error(
@@ -779,6 +791,8 @@ struct WireOptions<'a> {
     anytls_min_idle_session: Option<usize>,
     anytls_idle_session_check_interval: Option<u64>,
     anytls_idle_session_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hops: Option<&'a [String]>,
     mark: Option<u32>,
     tags: &'a [String],
     subscription_id: Option<uuid::Uuid>,
@@ -910,6 +924,7 @@ impl<'a> WireOptions<'a> {
                 wire.anytls_idle_session_timeout = config.idle_session_timeout;
                 wire.set_tls(&config.tls);
             }
+            OutboundConfig::Chain(config) => wire.hops = Some(&config.hops),
             OutboundConfig::Direct | OutboundConfig::Block => {}
         }
         wire

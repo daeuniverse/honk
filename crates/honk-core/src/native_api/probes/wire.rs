@@ -237,8 +237,6 @@ async fn attempt_wire(
     let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
     };
-    // Disposable runtime identity remains the canonical node's identity. Only its
-    // inherited dial scope pins the previously validated physical server address.
     let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
         return AttemptOutcome::refused();
     };
@@ -291,18 +289,12 @@ async fn attempt_wire(
             .await?
         }
     };
-    let result = if let Some(server) = attempt.server {
-        runtime
-            .scope_tasks(
-                plan.registry
-                    .scope_pinned_dials(candidate.node.host(), server, operation),
-            )
-            .await
-    } else {
-        runtime
-            .scope_tasks(plan.registry.scope_dials(operation))
-            .await
-    };
+    let result = runtime
+        .scope_tasks(
+            plan.registry
+                .scope_server_pins(attempt.servers.clone(), operation),
+        )
+        .await;
     let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver

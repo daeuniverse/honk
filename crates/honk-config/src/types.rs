@@ -18,6 +18,8 @@ pub enum NodeProtocol {
     Direct,
     /// Built-in reject outbound; reserved, not a configurable protocol.
     Block,
+    /// Proxy chain: an ordered list of other nodes dialed hop by hop.
+    Chain,
 }
 
 impl NodeProtocol {
@@ -34,6 +36,7 @@ impl NodeProtocol {
             NodeProtocol::AnyTLS => "anytls",
             NodeProtocol::Direct => "direct",
             NodeProtocol::Block => "block",
+            NodeProtocol::Chain => "chain",
         }
     }
 }
@@ -54,6 +57,7 @@ impl std::str::FromStr for NodeProtocol {
             "anytls" => Ok(NodeProtocol::AnyTLS),
             "direct" => Ok(NodeProtocol::Direct),
             "block" => Ok(NodeProtocol::Block),
+            "chain" => Ok(NodeProtocol::Chain),
             _ => Err(crate::ConfigError::UnknownProtocol(s.to_string())),
         }
     }

@@ -478,6 +478,76 @@ fn config_validation_error(
     )
 }
 
+fn remap_group_node_ids(
+    groups: &mut [Group],
+    node_ids: impl Iterator<Item = (uuid::Uuid, uuid::Uuid, bool)>,
+    source: &SourceRef,
+) -> Result<(), DetailedConfigError> {
+    struct Identity {
+        canonical: uuid::Uuid,
+        ambiguous: bool,
+        includes_chain: bool,
+    }
+
+    let mut stored = std::collections::HashMap::<_, Identity>::new();
+    let mut changed = false;
+    let mut ambiguous_chain = false;
+    for (previous, canonical, chain) in node_ids {
+        changed |= previous != canonical;
+        if previous.is_nil() {
+            continue;
+        }
+        stored
+            .entry(previous)
+            .and_modify(|identity| {
+                identity.ambiguous = true;
+                identity.includes_chain |= chain;
+                ambiguous_chain |= identity.includes_chain;
+            })
+            .or_insert(Identity {
+                canonical,
+                ambiguous: false,
+                includes_chain: chain,
+            });
+    }
+    if !changed && !ambiguous_chain {
+        return Ok(());
+    }
+
+    for (group_index, group) in groups.iter_mut().enumerate() {
+        let mut members = Vec::with_capacity(if changed { group.nodes.len() } else { 0 });
+        for (member_index, id) in group.nodes.iter().enumerate() {
+            let id = match stored.get(id) {
+                Some(identity) if !identity.ambiguous => identity.canonical,
+                Some(identity) if identity.includes_chain => {
+                    let ordinal = group_index + 1;
+                    let mut error = config_validation_error(
+                        source,
+                        SettingPath::new("groups")
+                            .index(ordinal)
+                            .field("nodes")
+                            .index(member_index + 1),
+                        "ambiguous-group-node-reference",
+                        "group references an ID shared by several node declarations",
+                    );
+                    error.diagnostic.value = crate::diagnostic::SafeValue::Ordinal(ordinal);
+                    error.diagnostic.entry_index = Some(ordinal);
+                    return Err(error);
+                }
+                // Preserve the existing policy for ambiguous physical aliases.
+                _ => *id,
+            };
+            if changed && !members.contains(&id) {
+                members.push(id);
+            }
+        }
+        if changed {
+            group.nodes = members;
+        }
+    }
+    Ok(())
+}
+
 impl Config {
     /// The built-in `direct` node name (usable as a group member without
     /// being declared in the config).
@@ -599,9 +669,7 @@ impl Config {
         limits: crate::parser::SourceLimits,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
-        let mut loaded = crate::parser::load_dae_sources(path, overlay, limits, diagnostics)?;
-        loaded.config.derive_node_ids();
-        Ok(loaded)
+        crate::parser::load_dae_sources(path, overlay, limits, diagnostics)
     }
 
     /// Load a dae tree held entirely in memory; see
@@ -612,10 +680,7 @@ impl Config {
         limits: crate::parser::SourceLimits,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<crate::parser::LoadedConfig, DetailedConfigError> {
-        let mut loaded =
-            crate::parser::load_dae_sources_in_memory(path, sources, limits, diagnostics)?;
-        loaded.config.derive_node_ids();
-        Ok(loaded)
+        crate::parser::load_dae_sources_in_memory(path, sources, limits, diagnostics)
     }
 
     fn load_file_attempt(
@@ -644,10 +709,7 @@ impl Config {
                     &mut semantic,
                 );
                 match result {
-                    Ok(mut config) => {
-                        config.derive_node_ids();
-                        return Ok(config);
-                    }
+                    Ok(config) => return Ok(config),
                     Err(error) => {
                         let stop = matches!(
                             error.category,
@@ -672,10 +734,10 @@ impl Config {
         for (index, format) in formats.iter().enumerate() {
             let attempt_start = diagnostics.len();
             let source = DiagnosticSources::new(Some(path.into())).root();
-            match parse_structured(&content, *format, diagnostics, source) {
+            match parse_structured(&content, *format, diagnostics, source.clone()) {
                 Ok(mut config) => {
                     diagnostics.drain(start..attempt_start);
-                    config.derive_node_ids();
+                    config.derive_physical_node_ids(&source)?;
                     return Ok(config);
                 }
                 Err(error) => {
@@ -749,65 +811,75 @@ impl Config {
         s: &str,
         diagnostics: &mut Vec<DetailedDiagnostic>,
     ) -> Result<Self, DetailedConfigError> {
-        let result = parse_structured(
-            s,
-            ConfigFormat::Json,
-            diagnostics,
-            DiagnosticSources::new(None).root(),
-        )
-        .map(|mut config| {
-            config.derive_node_ids();
-            config
-        });
+        let source = DiagnosticSources::new(None).root();
+        let result = parse_structured(s, ConfigFormat::Json, diagnostics, source.clone()).and_then(
+            |mut config| {
+                config.derive_physical_node_ids(&source)?;
+                Ok(config)
+            },
+        );
         finish_attempt(result, diagnostics)
     }
 
-    /// Re-derive every node's content-based ID ([`Node::derive_id`]) after
-    /// load. Stored/serde-default IDs are discarded so identity always
-    /// reflects the current content; the built-in direct/block nodes keep
-    /// their fixed IDs. Explicit group members that named a node by its stored
-    /// ID follow it to the re-derived one, so an identity change cannot leave a
-    /// structured configuration with dangling members.
-    fn derive_node_ids(&mut self) {
-        // `None` marks a stored ID shared by several nodes, which no member can
-        // follow: it names whichever node already holds it as much as the one
-        // being re-derived away from it.
-        let mut stored: std::collections::HashMap<uuid::Uuid, Option<uuid::Uuid>> =
-            std::collections::HashMap::new();
-        let mut changed = false;
-        for node in &mut self.nodes {
-            if matches!(
-                node.outbound,
-                crate::node::OutboundConfig::Direct | crate::node::OutboundConfig::Block
-            ) {
-                continue;
-            }
-            let derived = node.derive_id();
-            if !node.id.is_nil() {
-                stored
-                    .entry(node.id)
-                    .and_modify(|followed| *followed = None)
-                    .or_insert(Some(derived));
-            }
-            changed |= node.id != derived;
-            node.id = derived;
+    /// Keep structured chain IDs as membership aliases until their hops bind.
+    fn derive_physical_node_ids(&mut self, source: &SourceRef) -> Result<(), DetailedConfigError> {
+        let preserve_aliases = self.groups.iter().any(|group| !group.nodes.is_empty())
+            && self
+                .nodes
+                .iter()
+                .any(|node| !node.id.is_nil() && node.chain_hops().is_some());
+        let identities = self.nodes.iter_mut().filter_map(|node| {
+            let previous = node.id;
+            let chain = match node.outbound {
+                crate::node::OutboundConfig::Direct | crate::node::OutboundConfig::Block => {
+                    return None;
+                }
+                crate::node::OutboundConfig::Chain(_) => true,
+                _ => {
+                    node.id = node.derive_id();
+                    false
+                }
+            };
+            Some((node, previous, chain))
+        });
+        let remap =
+            |(node, previous, chain): (&mut Node, uuid::Uuid, bool)| (previous, node.id, chain);
+        if !preserve_aliases {
+            return remap_group_node_ids(&mut self.groups, identities.map(remap), source);
         }
-        if !changed {
-            return;
-        }
-        for group in &mut self.groups {
-            let mut members = Vec::with_capacity(group.nodes.len());
-            for id in &group.nodes {
-                let id = match stored.get(id) {
-                    Some(Some(derived)) => *derived,
-                    _ => *id,
-                };
-                if !members.contains(&id) {
-                    members.push(id);
+
+        let mut identities: Vec<_> = identities.collect();
+        let physical_ids: std::collections::HashSet<_> = identities
+            .iter()
+            .filter_map(|(node, _, chain)| (!*chain).then_some(node.id))
+            .collect();
+        if identities
+            .iter()
+            .any(|(node, _, chain)| *chain && physical_ids.contains(&node.id))
+        {
+            // Keep a chain's stored alias distinct even when normalization
+            // gives a formerly different physical node that same ID.
+            let used: std::collections::HashSet<_> = identities
+                .iter()
+                .map(|(_, previous, _)| *previous)
+                .chain(
+                    self.groups
+                        .iter()
+                        .flat_map(|group| group.nodes.iter())
+                        .copied(),
+                )
+                .collect();
+            let mut aliases = (1..=u128::MAX)
+                .rev()
+                .map(uuid::Uuid::from_u128)
+                .filter(|id| !physical_ids.contains(id) && !used.contains(id));
+            for (node, _, chain) in &mut identities {
+                if *chain && physical_ids.contains(&node.id) {
+                    node.id = aliases.next().expect("unused stored membership alias");
                 }
             }
-            group.nodes = members;
         }
+        remap_group_node_ids(&mut self.groups, identities.into_iter().map(remap), source)
     }
 
     fn validate_globals_detailed(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
@@ -1132,22 +1204,47 @@ impl Config {
     pub fn validate_detailed(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
-        crate::node::validate_node_collection(&self.nodes)?;
+        crate::node::validate_partial_node_collection(&self.nodes)?;
         self.validate_reserved_names_detailed(&source)?;
         self.validate_references_detailed(&source)
     }
-    /// Validate a fully assembled runtime snapshot.
-    ///
-    /// This retains the operator validator's global, DNS, routing, and
-    /// subscription checks, then verifies references materialized by runtime
-    /// providers. The latter must run after membership rebuilding so a failed
-    /// refresh cannot publish dangling direct or nested-group members.
+
+    /// Assemble an owned candidate with all provider nodes present. Membership
+    /// is rebuilt only after identities and stored member aliases are final.
+    pub fn assemble(
+        mut self,
+        rebuild_membership: impl FnOnce(&mut [Group], &[Node], &[Subscription]),
+    ) -> Result<Self, DetailedConfigError> {
+        let source = DiagnosticSources::new(None).root();
+        self.validate_globals_detailed(&source)?;
+        let mut changed = crate::node::bind_node_collection(&mut self.nodes)?
+            .into_iter()
+            .peekable();
+        if changed.peek().is_some() {
+            let identities = self.nodes.iter().enumerate().map(|(index, node)| {
+                let previous = changed
+                    .next_if(|(changed_index, _)| *changed_index == index)
+                    .map_or(node.id, |(_, id)| id);
+                (previous, node.id, node.chain_hops().is_some())
+            });
+            remap_group_node_ids(&mut self.groups, identities, &source)?;
+        }
+        rebuild_membership(&mut self.groups, &self.nodes, &self.subscriptions);
+        self.validate_assembled_references(&source)?;
+        Ok(self)
+    }
+
+    /// Verify a fully assembled snapshot before admitting it to a runtime.
     pub fn validate_assembled(&self) -> Result<(), DetailedConfigError> {
         let source = DiagnosticSources::new(None).root();
         self.validate_globals_detailed(&source)?;
         crate::node::validate_node_collection(&self.nodes)?;
+        self.validate_assembled_references(&source)
+    }
+
+    fn validate_assembled_references(&self, source: &SourceRef) -> Result<(), DetailedConfigError> {
         // Provider display names are not operator declarations of reserved builtins.
-        self.validate_references_detailed(&source)?;
+        self.validate_references_detailed(source)?;
 
         let node_ids: std::collections::HashSet<_> =
             self.nodes.iter().map(|node| node.id).collect();

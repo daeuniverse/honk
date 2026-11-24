@@ -10,6 +10,9 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+#[cfg(feature = "flow-observation")]
+mod delivery;
+
 #[derive(Debug, Default)]
 struct IoControl {
     mode: AtomicU8,
@@ -72,6 +75,14 @@ impl AsyncWrite for ControlledIo {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        match self.control.mode.load(Ordering::Acquire) {
+            3 => {
+                self.control.waker.register(cx.waker());
+                return Poll::Pending;
+            }
+            4 => return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into())),
+            _ => {}
+        }
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -549,6 +560,61 @@ async fn grpc_read_driver_wakes_a_different_tasks_pending_flush() {
     .expect("read driver failed to wake the flushing task");
 }
 
+#[cfg(feature = "rprx")]
+#[tokio::test(start_paused = true)]
+async fn grpc_reader_preserves_the_terminal_flush_through_websocket() {
+    use super::super::{AsyncReadWrite, ObservedWs, relay_upload};
+    use tokio_tungstenite::{WebSocketStream, tungstenite::protocol::Role};
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let (client, peer) = tokio::io::duplex(4096);
+        let control = Arc::new(IoControl::default());
+        let client = ControlledIo {
+            inner: client,
+            control: control.clone(),
+            dribble: false,
+        };
+        let bridge = async |io: Box<dyn AsyncReadWrite>, role| {
+            ObservedWs::bridge(WebSocketStream::from_raw_socket(io, role, None).await, true)
+                .unwrap()
+        };
+        let carrier = bridge(Box::new(client), Role::Client).await;
+        let mut peer = bridge(Box::new(peer), Role::Server).await;
+        let stream = wrap_grpc(&grpc_node(), Box::new(carrier)).await.unwrap();
+        read_request(&mut peer).await;
+        let mut ready = frame(SETTINGS, 0, 0, &[]);
+        ready.extend(frame(HEADERS, END_HEADERS, 1, &response_headers()));
+        ready.extend(data(b"!"));
+        peer.write_all(&ready).await.unwrap();
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        assert_eq!(reader.read_u8().await.unwrap(), b'!');
+
+        relay_upload::scope(writer.write_all(b"terminal chunk"))
+            .await
+            .unwrap();
+        control.mode.store(1, Ordering::Release);
+        assert!(futures_util::poll!(std::pin::pin!(reader.read_u8())).is_pending());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), writer.flush())
+                .await
+                .is_err(),
+            "flush reported success while the reader's DATA was still buffered in WS"
+        );
+        control.mode.store(0, Ordering::Release);
+        control.waker.wake();
+        writer.flush().await.unwrap();
+        loop {
+            let (kind, _, stream, bytes) = read_frame(&mut peer).await;
+            if kind == DATA {
+                assert_eq!((stream, bytes), (1, gun_message(b"terminal chunk")));
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
 /// DATA a request queued may be written by the read side's poll; the carrier
 /// below still sees that request and can defer its event, and control frames
 /// either side's poll writes afterwards do not extend it.
@@ -623,8 +689,8 @@ async fn grpc_request_written_by_the_read_driver_stays_deferrable() {
         0,
         "sent before the carrier delivered the DATA the read side wrote"
     );
-    let (deferred, position) = pending.lock().take().unwrap();
-    deferred.delivered(position);
+    let (deferred, _) = pending.lock().take().unwrap();
+    deferred.confirm();
     assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
 }
 

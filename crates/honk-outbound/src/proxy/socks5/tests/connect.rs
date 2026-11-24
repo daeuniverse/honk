@@ -282,8 +282,8 @@ mod request_observation {
             0,
             "published before delivery"
         );
-        let (request, position) = request.lock().take().unwrap();
-        request.delivered(position);
+        let (request, _) = request.lock().take().unwrap();
+        request.confirm();
         assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
     }
 }

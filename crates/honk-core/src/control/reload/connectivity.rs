@@ -51,61 +51,27 @@ pub(in crate::control) fn groups_by_name(
 /// Nodes reachable through group membership or explicit finals are probed
 /// for alive display and recovery, including Selector leaves. Ungrouped
 /// nodes are skipped unless no reachable leaves exist.
-/// Returns `(NodeId, node name, address)` triples.
-pub(in crate::control) fn health_check_targets(
-    config: &Config,
-) -> Vec<(uuid::Uuid, String, String)> {
-    let by_name = groups_by_name(config);
-    let group_node_ids: std::collections::BTreeSet<uuid::Uuid> = config
-        .groups
-        .iter()
-        .flat_map(|g| {
-            let mut ids = std::collections::BTreeSet::new();
-            collect_group_leaf_ids(g, config, &by_name, 0, &mut Vec::new(), &mut ids);
-            ids
-        })
-        .collect();
+pub(in crate::control) fn health_registrations<'a>(
+    config: &'a Config,
+    reachable: &std::collections::HashMap<uuid::Uuid, u8>,
+) -> std::collections::HashMap<uuid::Uuid, (&'a str, Option<&'a str>)> {
     config
         .nodes
         .iter()
-        .filter(|n| group_node_ids.is_empty() || group_node_ids.contains(&n.id))
-        .map(|n| (n.id, n.name.clone(), n.address.clone()))
+        .filter(|node| reachable.is_empty() || reachable.contains_key(&node.id))
+        .map(|node| {
+            let address = (node.protocol() != NodeProtocol::Chain).then_some(node.address.as_str());
+            (node.id, (node.name.as_str(), address))
+        })
         .collect()
 }
 
-/// Synchronize alive-set health-check registrations with the config's
-/// group membership: register nodes that are new or whose name/address
-/// changed, remove nodes that left the checked set. Unchanged
-/// registrations keep their probe state and grace period. Returns
-/// `(added, removed)` counts.
+#[cfg(test)]
 pub(in crate::control) fn sync_health_check_nodes(
     alive_set: &AliveDialerSet,
     config: &Config,
 ) -> (usize, usize) {
-    let desired: std::collections::HashMap<uuid::Uuid, (String, String)> =
-        health_check_targets(config)
-            .into_iter()
-            .map(|(id, name, addr)| (id, (name, addr)))
-            .collect();
-    let current = alive_set.registered_nodes();
-    let mut added = 0usize;
-    for (id, (name, addr)) in &desired {
-        let unchanged = current
-            .get(id)
-            .is_some_and(|r| &r.name == name && &r.address == addr);
-        if !unchanged {
-            alive_set.register_node(*id, name.clone(), addr.clone());
-            added += 1;
-        }
-    }
-    let mut removed = 0usize;
-    for id in current.keys() {
-        if !desired.contains_key(id) {
-            alive_set.remove_node(*id);
-            removed += 1;
-        }
-    }
-    (added, removed)
+    alive_set.sync_registrations(health_registrations(config, &build_outbound_id_map(config)))
 }
 
 /// URLTest group registrations for the alive set's idle-suspension table:
@@ -340,13 +306,10 @@ impl ControlPlane {
     /// (`outbound_id_map`, already refreshed by the reload path) is built
     /// from the same config, keeping the two consistent.
     pub async fn reload_group_manager(&self) {
-        let (groups, nodes) = {
-            let config = self.config.read().await;
-            (config.groups.clone(), config.nodes.clone())
-        };
+        let config = self.config.read().await;
         let new_gm = GroupManager::with_alive_set_and_score_state(
-            &groups,
-            &nodes,
+            &config.groups,
+            &config.nodes,
             Some(self.alive_set.clone()),
             self.group_manager.read().score_state(),
         );
@@ -357,7 +320,7 @@ impl ControlPlane {
         new_gm.migrate_selector_choices_from(&self.group_manager.read());
         install_interrupt_callback(
             &new_gm,
-            &groups,
+            &config.groups,
             &self.connection_tracker,
             &self.diagnostics,
             self.diagnostics.read().generation,
@@ -370,16 +333,21 @@ impl ControlPlane {
                 db_cb.save_network_selector(group, network, member);
             })));
         }
-        {
+        let targets = health_registrations(&config, &build_outbound_id_map(&config));
+        let (added, removed) = {
+            // Drop in reverse declaration order so the paused test observes an unlocked manager.
+            #[cfg(all(test, feature = "clash-api"))]
+            let _after_unlock = self.clash_publication_pause.lock().take();
             let mut group_manager = self.group_manager.write();
             new_gm.publish_score_membership();
             *group_manager = Arc::new(new_gm);
-        }
+            self.alive_set
+                .sync_registrations_retaining_delays(targets, |id| {
+                    group_manager.retains_manual_delay(id, &runtimes)
+                })
+        };
 
-        // Refresh health-check registrations and the URLTest idle table to
-        // match the new group membership.
-        let config = self.config.read().await;
-        let (added, removed) = sync_health_check_nodes(&self.alive_set, &config);
+        // Refresh the URLTest idle table to match the published membership.
         self.alive_set
             .sync_urltest_groups(&urltest_group_registrations(&config));
         self.alive_set

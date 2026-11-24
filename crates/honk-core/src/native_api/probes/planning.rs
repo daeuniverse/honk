@@ -2,6 +2,7 @@ use super::*;
 use crate::dns::PinnedNameResolver;
 use crate::observe::catalog::member_id;
 use honk_config::group::GroupPolicy;
+use honk_outbound::runtime::PinnedServers;
 
 pub(super) struct Specification {
     pub(super) target: Target,
@@ -19,7 +20,7 @@ pub(super) struct Candidate {
 pub(super) struct Attempt {
     pub(super) candidate: Candidate,
     pub(super) addr: SocketAddr,
-    pub(super) server: Option<IpAddr>,
+    pub(super) servers: PinnedServers,
 }
 pub(super) struct AddressUnavailable {
     pub(super) rows: Vec<usize>,
@@ -93,7 +94,9 @@ pub(super) async fn capture(state: &NativeState, request: ProbeRequest) -> Resul
     let identity = state.observation.core.catalog.snapshot();
     let dns = state
         .dns
-        .pin_name_resolution()
+        .pin_name_resolution(honk_outbound::bootstrap::BootstrapResolver::parse(
+            &config.global.bootstrap_resolver,
+        ))
         .map_err(|_| state.require_running().err().unwrap_or_else(unavailable))?;
     let result = plan(state, request, config, manager, registry, identity, dns);
     drop(config_guard);
@@ -197,14 +200,8 @@ fn plan(
     for member in members {
         let member_id = member_id(member, &identity).ok_or_else(not_found)?;
         if let GroupMember::Node(node) = member {
-            if request.kind == Kind::TcpConnect
-                && matches!(
-                    node.protocol(),
-                    honk_config::types::NodeProtocol::Direct
-                        | honk_config::types::NodeProtocol::Block
-                )
-            {
-                return Err(direct_or_block());
+            if request.kind == Kind::TcpConnect && (group.is_none() || !is_chain(node)) {
+                tcp_connect_target(node)?;
             }
             if request.transport.contains(&Transport::Udp)
                 && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
@@ -220,6 +217,15 @@ fn plan(
                     ProbeDomain::DnsUdp
                 };
                 let leaf = manager.probe_leaf(member, domain, family.ip());
+                // A chain in a group gets its own row rather than failing the
+                // other members' TCP connect probes.
+                let unavailable = match leaf {
+                    None => Some("no_eligible_leaf"),
+                    Some(node) if request.kind == Kind::TcpConnect && is_chain(node) => {
+                        Some("no_node_address")
+                    }
+                    Some(_) => None,
+                };
                 let index = rows.len();
                 rows.push(ResultRow {
                     member_id: member_id.clone(),
@@ -229,29 +235,19 @@ fn plan(
                     transport,
                     ip_version: family,
                     warmth: "unknown",
-                    state: if leaf.is_some() {
-                        "unknown"
-                    } else {
+                    state: if unavailable.is_some() {
                         "unavailable"
+                    } else {
+                        "unknown"
                     },
                     latency_ms: None,
                     health_updated: false,
-                    error: Some(if leaf.is_some() {
-                        "not_started"
-                    } else {
-                        "no_eligible_leaf"
-                    }),
+                    error: Some(unavailable.unwrap_or("not_started")),
                     observed_at: timestamp(SystemTime::now()),
                 });
-                if let Some(node) = leaf {
-                    if request.kind == Kind::TcpConnect
-                        && matches!(
-                            node.protocol(),
-                            honk_config::types::NodeProtocol::Direct
-                                | honk_config::types::NodeProtocol::Block
-                        )
-                    {
-                        return Err(direct_or_block());
+                if let Some(node) = leaf.filter(|_| unavailable.is_none()) {
+                    if request.kind == Kind::TcpConnect {
+                        tcp_connect_target(node)?;
                     }
                     if request.kind != Kind::TcpConnect {
                         let entry =
@@ -381,6 +377,23 @@ fn direct_or_block() -> ApiError {
     )
 }
 
+fn tcp_connect_target(node: &honk_config::node::Node) -> Result<(), ApiError> {
+    match node.protocol() {
+        honk_config::types::NodeProtocol::Direct | honk_config::types::NodeProtocol::Block => {
+            Err(direct_or_block())
+        }
+        honk_config::types::NodeProtocol::Chain => Err(unsupported(
+            "TCP connect probes need a node address, which chain nodes do not have",
+            json!({"field":"kind","allowed":["http","dns"]}),
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn is_chain(node: &honk_config::node::Node) -> bool {
+    node.protocol() == honk_config::types::NodeProtocol::Chain
+}
+
 fn tcp_only() -> ApiError {
     unsupported(
         "The probed node does not carry UDP",
@@ -409,13 +422,19 @@ pub(super) fn selections(
     }
 }
 
+#[derive(Default)]
+struct ResolvedHosts {
+    ordinary: HashMap<String, Vec<IpAddr>>,
+    physical: HashMap<String, Option<IpAddr>>,
+}
+
 pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
     let Plan {
         context,
         result,
         candidates,
     } = plan;
-    let mut resolved = HashMap::new();
+    let mut resolved = ResolvedHosts::default();
     let mut attempts = Vec::with_capacity(candidates.len());
     let mut skipped = Vec::new();
     for candidate in candidates {
@@ -430,31 +449,35 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 json!({"check":"port"}),
             ));
         }
-        let ips = resolve(
-            &context.dns,
-            &mut resolved,
-            host,
-            "Resolving the probe destination was refused locally",
-        )
-        .await?;
+        let ips = resolve_destination(&context.dns, &mut resolved, host).await?;
         let addr = ips
             .iter()
             .copied()
             .find(|&ip| candidate.family.matches(ip))
             .map(|ip| SocketAddr::new(ip, port));
-        let needs_server = context.spec.kind != Kind::TcpConnect
+        // Only the physical entry dials a node server locally. Later hops are
+        // reached through their preceding hop, which handles any domain name.
+        let needs_server = addr.is_some()
+            && context.spec.kind != Kind::TcpConnect
             && candidate.node.protocol() != honk_config::types::NodeProtocol::Direct;
-        let server = if needs_server {
-            let ips = resolve(
-                &context.dns,
-                &mut resolved,
-                candidate.node.host(),
-                "Resolving the probed node's server was refused locally",
-            )
-            .await?;
-            ips.first().copied()
+        let servers = if needs_server {
+            let chain = if is_chain(&candidate.node) {
+                Some(
+                    context
+                        .registry
+                        .get(&candidate.node.id)
+                        .ok_or_else(missing_entry)?,
+                )
+            } else {
+                None
+            };
+            let entry = match &chain {
+                Some(chain) => chain.chain_entry_node().ok_or_else(missing_entry)?,
+                None => &candidate.node,
+            };
+            resolve_servers(&context.dns, &mut resolved, entry).await?
         } else {
-            None
+            Some(PinnedServers::default())
         };
         if candidate.transport == Transport::Udp
             && !honk_outbound::descriptor::udp_target_allowed(&candidate.node, port)
@@ -464,14 +487,12 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
                 json!({"field":"transport","allowed":["tcp"]}),
             ));
         }
-        match addr {
-            Some(addr) if !needs_server || server.is_some() => {
-                attempts.push(Attempt {
-                    candidate,
-                    addr,
-                    server,
-                });
-            }
+        match (addr, servers) {
+            (Some(addr), Some(servers)) => attempts.push(Attempt {
+                candidate,
+                addr,
+                servers,
+            }),
             _ => skipped.push(AddressUnavailable {
                 rows: candidate.rows,
                 observed_at: SystemTime::now(),
@@ -486,26 +507,56 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
     })
 }
 
-async fn resolve<'a>(
+fn missing_entry() -> ApiError {
+    unsupported(
+        "The probed chain has no admitted entry node",
+        json!({"field":"target"}),
+    )
+}
+
+async fn resolve_servers(
     dns: &PinnedNameResolver,
-    resolved: &'a mut HashMap<String, Vec<IpAddr>>,
+    resolved: &mut ResolvedHosts,
+    entry: &Node,
+) -> Result<Option<PinnedServers>, ApiError> {
+    let upload = entry.host();
+    let upload_ip = resolve_server(dns, resolved, upload).await?;
+    let download = entry.xhttp_download().map(|peer| peer.address.as_str());
+    // Physical server families are chosen by the resolver, independently of the
+    // requested application destination family and of one another.
+    let download_pin = match download {
+        Some(host)
+            if host
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case(upload.trim_end_matches('.')) =>
+        {
+            upload_ip.map(|ip| (host, ip))
+        }
+        Some(host) => {
+            let Some(ip) = resolve_server(dns, resolved, host).await? else {
+                return Ok(None);
+            };
+            Some((host, ip))
+        }
+        None => None,
+    };
+    Ok(upload_ip.map(|ip| PinnedServers::new((upload, ip), download_pin)))
+}
+
+async fn resolve_destination<'a>(
+    dns: &PinnedNameResolver,
+    resolved: &'a mut ResolvedHosts,
     host: &str,
-    refused: &'static str,
 ) -> Result<&'a [IpAddr], ApiError> {
-    if !resolved.contains_key(host) {
+    if !resolved.ordinary.contains_key(host) {
         let addresses = if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
             vec![ip]
         } else {
-            match dns.resolve_node_server(host).await {
-                Ok(addresses) => addresses,
-                Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
-                    return Err(unsupported(refused, json!({"check":"resolution"})));
-                }
-                Err(error) => {
-                    tracing::warn!(host, error = %format_args!("{error:#}"), "probe target resolution failed");
-                    Vec::new()
-                }
-            }
+            resolution_result(
+                host,
+                dns.resolve_node_server(host).await,
+                "Resolving the probe destination was refused locally",
+            )?
         };
         let mut unique = Vec::with_capacity(addresses.len());
         for ip in addresses.into_iter().map(|ip| ip.to_canonical()) {
@@ -513,7 +564,45 @@ async fn resolve<'a>(
                 unique.push(ip);
             }
         }
-        resolved.insert(host.to_owned(), unique);
+        resolved.ordinary.insert(host.to_owned(), unique);
     }
-    Ok(&resolved[host])
+    Ok(&resolved.ordinary[host])
+}
+
+async fn resolve_server(
+    dns: &PinnedNameResolver,
+    resolved: &mut ResolvedHosts,
+    host: &str,
+) -> Result<Option<IpAddr>, ApiError> {
+    if let Some(&ip) = resolved.physical.get(host) {
+        return Ok(ip);
+    }
+    let destination_ip = resolved
+        .ordinary
+        .get(host)
+        .and_then(|ips| ips.first().copied());
+    let ip = resolution_result(
+        host,
+        dns.resolve_physical_server(host, destination_ip).await,
+        "Resolving the probed node's server was refused locally",
+    )?;
+    resolved.physical.insert(host.to_owned(), ip);
+    Ok(ip)
+}
+
+fn resolution_result<T: Default>(
+    host: &str,
+    result: anyhow::Result<T>,
+    refused: &'static str,
+) -> Result<T, ApiError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(error) if honk_outbound::proxy::is_packet_rejection(&error) => {
+            Err(unsupported(refused, json!({"check":"resolution"})))
+        }
+        Err(error) => {
+            tracing::warn!(host, error = %format_args!("{error:#}"), "probe target resolution failed");
+            Ok(T::default())
+        }
+    }
 }

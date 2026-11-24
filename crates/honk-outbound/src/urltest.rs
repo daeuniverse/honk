@@ -17,12 +17,15 @@
 //! Native probes use a caller-owned absolute deadline and cancellation signal;
 //! cold probes include connection setup and do not publish legacy health/Score feedback.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement};
+use crate::alive::{
+    AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement, ProbeTicket,
+};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
 };
 use crate::proxy::{ProxyRegistry, TcpOutbound};
+use crate::runtime::SharedRuntimeRegistry;
 use anyhow::{Context, anyhow};
 use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
 use honk_config::node::Node;
@@ -151,8 +154,7 @@ fn urltest_timeout(timeout: Duration) -> Duration {
 }
 
 fn validate_runtime(runtime: &Arc<crate::runtime::NodeRuntime>) -> anyhow::Result<()> {
-    crate::runtime::NodeRuntime::validate_for_ephemeral(runtime.node.as_ref())
-        .map_err(anyhow::Error::new)
+    runtime.validate_for_probe().map_err(anyhow::Error::new)
 }
 
 /// Optional resolver for check-URL hosts: `(host, port) → Result<addrs>`.
@@ -191,6 +193,7 @@ pub async fn urltest_node(
         &ProbeCancellation::default(),
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 async fn urltest_request_impl(
@@ -199,7 +202,7 @@ async fn urltest_request_impl(
     request: &http::Request<()>,
     timeout: Duration,
     cancel: &ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let host = target.host();
@@ -218,7 +221,6 @@ async fn urltest_request_impl(
         None,
     )
     .await
-    .map(|measurement| measurement.latency)
 }
 
 async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -252,6 +254,11 @@ pub fn try_probe_runtime(
     ),
     crate::runtime::RuntimeRegistryError,
 > {
+    if node.chain_hops().is_some() {
+        return generation
+            .admitted_chain_runtime(node)
+            .map(|runtime| (runtime, None));
+    }
     // Validate before looking up a warm runtime: a stale ID must not buy a
     // warm-path shortcut or cause feedback/resources to be initialized.
     crate::runtime::NodeRuntime::validate_for_ephemeral(node)?;
@@ -326,7 +333,7 @@ pub async fn urltest_node_in_generation_with_feedback(
     timeout: Duration,
     group_manager: &GroupManager,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     urltest_node_in_generation_impl(
         generation,
         node,
@@ -350,7 +357,7 @@ async fn urltest_node_in_generation_impl(
     timeout: Duration,
     group_manager: Option<&GroupManager>,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     if cancel.is_cancelled() {
         return Err(crate::proxy::PacketRejection::Cancelled.into());
     }
@@ -553,14 +560,16 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record measured TCP latency. An arbitrary measurement
-/// target failing does not establish a real dial failure or node-wide outage.
+/// alive set: successful measurements from current tickets record TCP latency.
+/// An arbitrary measurement target failing does not establish a real dial
+/// failure or node-wide outage.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 #[allow(clippy::too_many_arguments)]
 pub async fn urltest_group_with_feedback(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -571,6 +580,7 @@ pub async fn urltest_group_with_feedback(
     urltest_group_impl(
         members,
         generation,
+        published,
         registry,
         alive_set,
         url,
@@ -583,8 +593,9 @@ pub async fn urltest_group_with_feedback(
 
 #[allow(clippy::too_many_arguments)]
 async fn urltest_group_impl(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -596,9 +607,11 @@ async fn urltest_group_impl(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
     let url = url.to_string();
     let mut join_set = tokio::task::JoinSet::new();
-    for node in members {
-        let node = node.clone();
+    for (node, ticket) in members {
+        let node = (*node).clone();
+        let ticket = ticket.clone();
         let generation = Arc::clone(generation);
+        let published = Arc::clone(published);
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -628,9 +641,10 @@ async fn urltest_group_impl(
                 }
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
-            if let Ok(latency) = &result {
-                alive_set.record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, *latency);
-            }
+            let result = result.map(|measurement| {
+                alive_set.record_urltest_latency(&published, &generation, &ticket, measurement);
+                measurement.latency
+            });
             (node.name.clone(), result)
         });
     }
@@ -645,7 +659,7 @@ async fn urltest_group_impl(
     let order: std::collections::HashMap<&str, usize> = members
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.name.as_str(), i))
+        .map(|(i, (node, _))| (node.name.as_str(), i))
         .collect();
     results.sort_by_key(|(name, _)| order.get(name.as_str()).copied().unwrap_or(usize::MAX));
     results

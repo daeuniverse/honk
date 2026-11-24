@@ -357,3 +357,169 @@ async fn copy_errors_preserve_endpoint_origin_original_error_and_accepted_bytes(
     .await
     .expect("copy failure did not terminate relay");
 }
+
+#[tokio::test(start_paused = true)]
+async fn websocket_copy_drains_after_client_eof_but_not_after_client_error() {
+    use futures_util::StreamExt;
+    use honk_config::node::{Node, OutboundConfig, TrojanConfig};
+    use honk_outbound::proxy::{TcpOutbound, TunnelDialOptions, trojan::TrojanHandler};
+    use honk_outbound::runtime::NodeRuntime;
+    use tokio::sync::oneshot;
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[derive(Debug)]
+    struct FinalFrameWriter {
+        inner: tokio::io::WriteHalf<DuplexStream>,
+        blocked: Option<oneshot::Sender<()>>,
+        release: oneshot::Receiver<()>,
+        drip: Option<Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl AsyncWrite for FinalFrameWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            // The only masked four-byte application frame is "last".
+            if bytes.starts_with(&[0x82, 0x84]) {
+                if let Some(blocked) = self.blocked.take() {
+                    blocked.send(()).unwrap();
+                }
+                if !self.release.is_terminated() {
+                    std::task::ready!(Pin::new(&mut self.release).poll(cx)).unwrap();
+                }
+            }
+            if self.blocked.is_none()
+                && let Some(delay) = &mut self.drip
+            {
+                std::task::ready!(delay.as_mut().poll(cx));
+                delay
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + DRAIN_DEADLINE / 4);
+                return Pin::new(&mut self.inner).poll_write(cx, &bytes[..1]);
+            }
+            Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    let mut node = Node {
+        name: "ws".into(),
+        address: "127.0.0.1:80".into(),
+        host: "127.0.0.1".into(),
+        port: 80,
+        outbound: OutboundConfig::Trojan(TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    node.transport_mut().unwrap().transport = "ws".into();
+    node.id = node.derive_id();
+    let runtime = NodeRuntime::try_ephemeral(&node).unwrap();
+    let addr = "127.0.0.1:80".parse().unwrap();
+    #[derive(Clone, Copy, PartialEq)]
+    enum End {
+        Released,
+        Idle,
+        ClientError,
+        CarrierDrip,
+    }
+    for end in [End::Released, End::Idle, End::ClientError, End::CarrierDrip] {
+        tokio::time::timeout(DRAIN_DEADLINE * 4, async {
+            let (physical, peer) = tokio::io::duplex(4096);
+            let (rd, wr) = tokio::io::split(physical);
+            let (blocked, reached) = oneshot::channel();
+            let (release, open) = oneshot::channel();
+            let gate = FinalFrameWriter {
+                inner: wr,
+                blocked: Some(blocked),
+                release: open,
+                drip: (end == End::CarrierDrip)
+                    .then(|| Box::pin(tokio::time::sleep(DRAIN_DEADLINE / 4))),
+            };
+            let (proxy, peer) = tokio::join!(
+                TrojanHandler.dial_over(
+                    runtime.clone(),
+                    Box::new(tokio::io::join(rd, gate)),
+                    addr,
+                    None,
+                    TunnelDialOptions::new(Duration::from_secs(2))
+                ),
+                tokio_tungstenite::accept_async(peer),
+            );
+            let mut peer = peer.unwrap();
+            let header = peer.next().await.unwrap().unwrap().into_data();
+            assert_eq!(&header[56..], b"\r\n\x01\x01\x7f\0\0\x01\0\x50\r\n");
+
+            let (mut client, relay_client) = tokio::io::duplex(64);
+            let relay_client = FailAfter {
+                inner: relay_client,
+                remaining: 5,
+                point: FailurePoint::Read,
+                error: Some(io::Error::from_raw_os_error(libc::ECONNRESET)),
+            };
+            let relay = tokio::spawn(relay_tcp(relay_client, proxy.unwrap().stream, addr, addr));
+            client.write_all(b"last").await.unwrap();
+            reached.await.unwrap();
+            let start = tokio::time::Instant::now();
+            if end == End::ClientError {
+                client.write_all(b"!").await.unwrap();
+            } else {
+                client.shutdown().await.unwrap();
+            }
+
+            if end == End::Released {
+                tokio::time::sleep(DRAIN_DEADLINE / 2).await;
+                assert!(!relay.is_finished());
+                release.send(()).unwrap();
+                let stats = relay.await.unwrap().unwrap();
+                assert_eq!(stats.client_to_proxy, 4);
+                assert_eq!(
+                    peer.next().await.unwrap().unwrap().into_data().as_ref(),
+                    b"last"
+                );
+                assert_eq!(peer.next().await.unwrap().unwrap(), Message::Close(None));
+            } else if end == End::CarrierDrip {
+                // The WS worker is writing one real byte per quarter-deadline,
+                // but the copy directions have made no new byte progress.
+                release.send(()).unwrap();
+                let stats = relay.await.unwrap().unwrap();
+                assert_eq!(stats.client_to_proxy, 4);
+                let mut raw = Vec::new();
+                peer.get_mut().read_to_end(&mut raw).await.unwrap();
+                assert!(raw.starts_with(&[0x82, 0x84]));
+                assert!(
+                    raw.len() < 10,
+                    "the entire frame drained despite an idle copy"
+                );
+            } else {
+                let result = relay.await.unwrap();
+                if end == End::ClientError {
+                    let err = result.unwrap_err();
+                    assert!(err.is::<ClientIoError>());
+                    assert_eq!(
+                        err.downcast_ref::<io::Error>().unwrap().raw_os_error(),
+                        Some(libc::ECONNRESET)
+                    );
+                    assert!(start.elapsed() < DRAIN_DEADLINE);
+                } else {
+                    assert_eq!(result.unwrap().client_to_proxy, 4);
+                    assert!(start.elapsed() >= DRAIN_DEADLINE);
+                }
+                assert!(release.send(()).is_err());
+                let mut wire = Vec::new();
+                peer.get_mut().read_to_end(&mut wire).await.unwrap();
+                assert!(wire.is_empty());
+            }
+        })
+        .await
+        .expect("copy relay outlived the existing drain deadline");
+    }
+}

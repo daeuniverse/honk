@@ -1244,24 +1244,16 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
 
 #[test]
 fn subscription_merge_replaces_only_that_subscription() {
-    fn node(name: &str, sub: Option<uuid::Uuid>) -> Node {
-        Node {
-            id: uuid::Uuid::new_v4(),
-            name: name.into(),
-            address: "127.0.0.1:1".into(),
-            host: "127.0.0.1".into(),
-            port: 1,
-            subscription_id: sub,
-            ..Default::default()
-        }
+    fn node(name: &str, port: u16, sub: Option<uuid::Uuid>) -> Node {
+        support::canonical_socks5(name, &format!("127.0.0.1:{port}"), port, sub)
     }
 
     let sub_a = uuid::Uuid::new_v4();
     let sub_b = uuid::Uuid::new_v4();
-    let static_node = node("static", None);
-    let old_a1 = node("a-old-1", Some(sub_a));
-    let old_a2 = node("a-old-2", Some(sub_a));
-    let b_node = node("b-1", Some(sub_b));
+    let static_node = node("static", 1, None);
+    let old_a1 = node("a-old-1", 2, Some(sub_a));
+    let old_a2 = node("a-old-2", 3, Some(sub_a));
+    let b_node = node("b-1", 4, Some(sub_b));
 
     let mut current = Config {
         nodes: vec![
@@ -1285,8 +1277,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     );
     assert_eq!(current.groups[0].nodes.len(), 4);
 
-    let new_a1 = node("a-new-1", Some(sub_a));
-    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1.clone()]);
+    let new_a1 = node("a-new-1", 5, Some(sub_a));
+    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1]).unwrap();
 
     // Old sub-A nodes are gone; static and other-subscription nodes stay.
     let names: Vec<&str> = merged.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -1301,8 +1293,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     assert!(!merged.groups[0].nodes.contains(&old_a2.id));
 
     // Re-merging the same subscription replaces instead of duplicating.
-    let new_a1b = node("a-new-1", Some(sub_a));
-    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]);
+    let new_a1b = node("a-new-1", 5, Some(sub_a));
+    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]).unwrap();
     assert_eq!(remerged.nodes.len(), 3);
     assert_eq!(remerged.groups[0].nodes.len(), 3);
     assert_eq!(remerged.nodes[2].id, new_a1b.id);
@@ -1322,7 +1314,7 @@ fn empty_subscription_merge_preserves_previous_nodes() {
         ..Default::default()
     };
 
-    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new());
+    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new()).unwrap();
 
     assert_eq!(merged.nodes.len(), 1);
     assert_eq!(merged.nodes[0].id, old.id);
@@ -1725,6 +1717,71 @@ async fn tcp_proxy_protocols_pass_domain_without_local_resolution() -> anyhow::R
         );
         retirement.join(&handle).await?;
     }
+    Ok(())
+}
+
+/// A transparently proxied TCP flow selected onto a chain reaches its
+/// destination through each hop in order, and its bytes count once.
+#[tokio::test]
+async fn tcp_flow_over_a_chain_crosses_every_hop() -> anyhow::Result<()> {
+    use crate::test_support::{socks5_chain, socks5_relay};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let destination = listener.local_addr()?;
+    let mut client = TcpStream::connect(destination).await?;
+    let (accepted, peer) = listener.accept().await?;
+    let front = socks5_relay().await;
+    let land = socks5_relay().await;
+    let mut config = Config::default();
+    config.ensure_builtin_nodes();
+    config.nodes.extend(socks5_chain(&front, &land));
+    config.global.dial_mode = "ip".into();
+    config.routing.default_outbound = "G".into();
+    config.groups.push(Group {
+        name: "G".into(),
+        nodes: config.nodes.iter().map(|node| node.id).collect(),
+        ..Default::default()
+    });
+    let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+    let plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+        udp_test_forwarder(),
+    )?;
+    plane
+        .group_manager()
+        .read()
+        .set_selector_choice("G", "via", honk_outbound::group::SelectorNetworks::Both)
+        .unwrap();
+    let handle = plane.spawn_handle();
+    let retirement = support::TestRetirement::start(&handle);
+    store_active_tcp_flow(&handle, destination, peer).await?;
+    let worker = handle.clone();
+    let task = tokio::spawn(async move { worker.serve_connection(accepted, peer).await });
+    let (mut upstream, _) =
+        tokio::time::timeout(Duration::from_secs(5), listener.accept()).await??;
+
+    client.write_all(b"upload").await?;
+    let mut received = [0; 6];
+    upstream.read_exact(&mut received).await?;
+    assert_eq!(&received, b"upload");
+    upstream.write_all(b"download").await?;
+    let mut received = [0; 8];
+    client.read_exact(&mut received).await?;
+    assert_eq!(&received, b"download");
+    assert_eq!(*front.requests.lock(), [land.addr]);
+    assert_eq!(*land.requests.lock(), [destination]);
+
+    drop(client);
+    drop(upstream);
+    tokio::time::timeout(Duration::from_secs(5), task).await???;
+    let totals = handle.stats.snapshot();
+    assert_eq!((totals["G"].tx_bytes, totals["G"].rx_bytes), (6, 8));
+    retirement.join(&handle).await?;
     Ok(())
 }
 
@@ -4370,6 +4427,30 @@ fn preconnect_candidates_prefer_group_selections_then_config_order() {
         picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
         vec!["trojan", "ss", "vmess"],
         "the group's current pick leads; config order fills the rest"
+    );
+}
+
+/// A selected proxy chain is passed over; its hops stay eligible on their own.
+#[test]
+fn preconnect_candidates_skip_chain_nodes() {
+    let ss = Node::from_share_link("ss://YWVzLTEyOC1nY206cGFzcw@ss.example:8388#ss").unwrap();
+    let trojan = Node::from_share_link("trojan://secret@trojan.example:443#trojan").unwrap();
+    let via = Node::chain_from_nodes("via", &[&ss, &trojan]).unwrap();
+    let config = Config {
+        nodes: vec![via.clone(), ss, trojan],
+        groups: vec![preconnect_test_group(
+            "g",
+            GroupPolicy::Selector,
+            vec![via.id],
+        )],
+        ..Default::default()
+    };
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+
+    let picked = preconnect_candidates(&config, &manager, 8);
+    assert_eq!(
+        picked.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(),
+        vec!["ss", "trojan"]
     );
 }
 

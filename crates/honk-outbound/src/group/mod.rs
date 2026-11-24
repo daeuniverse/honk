@@ -547,6 +547,20 @@ impl GroupManager {
             .and_then(|g| g.final_outbound.clone())
     }
 
+    /// Standalone manager publication keeps the runtime registry. A surviving
+    /// manual delay must still describe the configured physical leaf.
+    pub fn retains_manual_delay(
+        &self,
+        id: &uuid::Uuid,
+        runtimes: &crate::runtime::OutboundRuntimeRegistry,
+    ) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            runtimes
+                .get_ref(id)
+                .is_some_and(|runtime| runtime.matches_config(node))
+        })
+    }
+
     /// First declared node with this display name; finals and API lookups agree
     /// with config order. Sub-group tags and unknown names yield `None`.
     pub fn node_by_name(&self, name: &str) -> Option<&Node> {

@@ -329,3 +329,68 @@ fn shared_milestones_are_once_per_causal_context_not_once_per_carrier() {
     assert_eq!(events[1].0, observer.context());
     assert_eq!(events[2].0, context);
 }
+
+fn milestones(events: &Events) -> Vec<(FlowContext, Milestone)> {
+    events
+        .lock()
+        .iter()
+        .filter_map(|(context, event)| match event {
+            FlowEvent::Milestone { milestone } => Some((*context, *milestone)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_chain_hop_drops_target_milestones_without_spending_them() {
+    let (observer, events) = recorder();
+    observer
+        .scope(async {
+            without_target_milestones(async {
+                milestone(Milestone::TargetRequestSent);
+                milestone(Milestone::TargetConfirmed);
+                milestone(Milestone::TransportReady);
+            })
+            .await
+        })
+        .await;
+    observer
+        .scope(async {
+            milestone(Milestone::TransportReady);
+            milestone(Milestone::TargetRequestSent);
+            milestone(Milestone::TargetConfirmed);
+        })
+        .await;
+    let context = observer.context();
+    assert_eq!(
+        milestones(&events),
+        [
+            (context, Milestone::TransportReady),
+            (context, Milestone::TargetRequestSent),
+            (context, Milestone::TargetConfirmed),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_chain_hop_keeps_dropping_target_milestones_in_derived_observers() {
+    let (observer, events) = recorder();
+    let mut context = observer.context();
+    context.generation += 1;
+    observer
+        .scope(async {
+            without_target_milestones(async {
+                let hop = current().unwrap();
+                hop.publish(FlowEvent::Milestone {
+                    milestone: Milestone::TargetConfirmed,
+                });
+                let derived = hop.with_context(context);
+                derived.milestone_once(Milestone::TargetRequestSent);
+                derived.milestone_once(Milestone::TransportReady);
+                observe_resolution(async { milestone(Milestone::TargetConfirmed) }).await;
+            })
+            .await
+        })
+        .await;
+    assert_eq!(milestones(&events), [(context, Milestone::TransportReady)]);
+}

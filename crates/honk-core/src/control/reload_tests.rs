@@ -565,6 +565,88 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
 }
 
 #[test]
+fn bulk_health_resync_preserves_retained_and_unregistered_direct_history() {
+    use honk_outbound::alive::{GroupProbeContext, HealthMeasurement, HealthObservation};
+
+    let mut config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let extra = config.nodes[2].id;
+    let direct = honk_config::config::DIRECT_NODE_ID;
+    let group = config.groups[0].id;
+    config.groups[2].nodes.push(extra);
+    let alive = AliveDialerSet::new();
+    alive.enable_health_history();
+    sync_health_check_nodes(&alive, &config);
+    assert!(!alive.registered_nodes().contains_key(&direct));
+
+    let leaves = [(backup, 1), (direct, 2), (extra, 3), (primary, 4)];
+    let context = |node| GroupProbeContext {
+        group_id: group,
+        member_id: node,
+    };
+    let sample = |ms| {
+        HealthObservation::probe(
+            ProbeDomain::Tcp,
+            HealthMeasurement::HttpHeaders,
+            IpVersion::V4,
+            Some(Duration::from_millis(ms)),
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(ms),
+        )
+    };
+    let domains = [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp];
+    let families = [IpVersion::V4, IpVersion::V6];
+    for (node, ms) in leaves {
+        let ticket = alive.probe_ticket(node);
+        assert!(alive.complete_probe(&ticket, None, sample(ms)));
+        assert!(alive.complete_probe(&ticket, Some(context(node)), sample(ms)));
+        for domain in domains {
+            for family in families {
+                alive.record_probe_latency(node, domain, family, Duration::from_millis(ms));
+            }
+        }
+    }
+
+    config.groups[2].final_outbound = None;
+    config.groups[2].nodes.clear();
+    sync_health_check_nodes(&alive, &config);
+
+    let rows = alive.group_health_observations(group);
+    assert_eq!(
+        rows.iter().map(|row| row.node_id).collect::<Vec<_>>(),
+        [direct, primary]
+    );
+    for (node, ms) in leaves {
+        let kept = node == direct || node == primary;
+        let global = alive.health_observations(node);
+        if kept {
+            assert_eq!(global, [sample(ms)]);
+            assert!(
+                rows.iter()
+                    .any(|row| row.member_id == node && row.observation == sample(ms))
+            );
+        } else {
+            assert!(global.is_empty());
+        }
+        for domain in domains {
+            for family in families {
+                let history = alive.get_probe_history(node, domain, family);
+                assert_eq!(history.len(), usize::from(kept));
+                let expected = kept.then_some(Duration::from_millis(ms));
+                assert_eq!(history.first().and_then(|row| row.latency), expected);
+                assert_eq!(alive.get_last_latency(node, domain, family), expected);
+            }
+        }
+    }
+    let current = alive.probe_ticket(primary);
+    assert!(alive.complete_probe(&current, Some(context(primary)), sample(5)));
+    assert_eq!(
+        alive.group_health_observations(group)[1].observation,
+        sample(5)
+    );
+}
+
+#[test]
 fn nested_final_keeps_datapath_group_alive_without_reviving_dead_members() {
     let mut config = nested_final_config();
     let primary = config.nodes[0].id;

@@ -27,7 +27,7 @@ use boring::ssl::{
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use foreign_types::ForeignTypeRef;
-use honk_config::node::Node;
+use honk_config::node::{Node, ech_discovery_name};
 
 /// TLS client stream produced by [`TlsConnector::connect`].
 pub type TlsStream<S> = tokio_boring::SslStream<S>;
@@ -212,7 +212,7 @@ impl TlsConnector {
 
     /// Whether `connect` to `domain` may query DNS for its ECHConfigList.
     pub(crate) fn discovers_ech(&self, domain: &str) -> bool {
-        self.ech_discovery && ech_discoverable(domain)
+        self.ech_discovery && ech_discovery_name(domain).is_some()
     }
 
     /// TLS client handshake over `stream`, verifying the peer against
@@ -251,6 +251,13 @@ impl TlsConnector {
                         sni = domain,
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
+                }
+                if let Some(cause) = e
+                    .as_io_error()
+                    .and_then(crate::proxy::retain_typed_io_error)
+                {
+                    return Err(anyhow::Error::new(cause)
+                        .context(format!("TLS handshake with {domain} failed")));
                 }
                 Err(anyhow::anyhow!("TLS handshake with {domain} failed: {e}"))
             }
@@ -436,22 +443,12 @@ static ECH_DISCOVERY_CACHE: LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, EchCacheEntry>>,
 > = LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-/// DNS can publish an ECHConfigList only for a domain name, not an address.
-fn ech_discoverable(domain: &str) -> bool {
-    let name = domain.trim_end_matches('.');
-    let host = name.trim_start_matches('[').trim_end_matches(']');
-    !name.is_empty() && host.parse::<std::net::IpAddr>().is_err()
-}
-
 /// Discover a domain's ECHConfigList via DNS HTTPS records (RFC 9460),
 /// cached per domain (positive: record TTL clamped to 60s..1d; negative:
 /// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
 /// explicit `ech_config` which is fail-closed.
 pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
-    if !ech_discoverable(domain) {
-        return None;
-    }
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
+    let key = ech_discovery_name(domain)?.to_ascii_lowercase();
     if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
         && hit.expires > std::time::Instant::now()
     {
@@ -661,7 +658,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         connector,
         chrome,
         alps,
-        ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
+        ech_discovery: tls.uses_ech_discovery(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
 }

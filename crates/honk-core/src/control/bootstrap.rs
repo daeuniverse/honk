@@ -10,6 +10,11 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
         drop(dns_resolver);
+        let config = if config.nodes.iter().any(|node| node.chain_hops().is_some()) {
+            config.assemble(honk_config::parser::resolve_programmatic_groups)?
+        } else {
+            config
+        };
         let dns_router = dns_forwarder.routing_snapshot();
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
@@ -36,6 +41,7 @@ impl ControlPlane {
         )
     }
 
+    /// The supplied DNS pool and forwarder must use the assembled configuration.
     pub fn new_with_upstream_pool(
         config: Config,
         ebpf: Box<dyn EbpfBackend>,
@@ -90,9 +96,8 @@ impl ControlPlane {
         // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
         alive_set.set_direct_check_addr(direct_target.clone());
-        // Register health checks per the config's group membership; reload
-        // re-runs the same sync via `reload_group_manager`.
-        let (added, _) = sync_health_check_nodes(&alive_set, &config);
+        let reachable = build_outbound_id_map(&config);
+        let (added, _) = alive_set.sync_registrations(health_registrations(&config, &reachable));
         info!(
             "Registered {}/{} nodes for health check ({} skipped: not in any group)",
             added,
@@ -105,7 +110,7 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
+        let outbound_id_map = Arc::new(parking_lot::RwLock::new(reachable));
         {
             let map = outbound_id_map.clone();
             alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
@@ -322,6 +327,8 @@ impl ControlPlane {
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             pre_dns_publication_hook: parking_lot::Mutex::new(None),
+            #[cfg(all(test, feature = "clash-api"))]
+            clash_publication_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "ebpf")]
             iface_watcher: None,
         };

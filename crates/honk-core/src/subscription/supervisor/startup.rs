@@ -176,12 +176,18 @@ impl SupervisorState {
         super::drop_nodes_published_elsewhere(current, subscriptions, subscription.id, &mut nodes);
         let mut ids: HashSet<_> = current
             .iter()
-            .filter(|node| node.subscription_id != Some(subscription.id))
+            .filter(|node| {
+                node.chain_hops().is_none() && node.subscription_id != Some(subscription.id)
+            })
             .map(|node| node.id)
             .collect();
         let mut observations = self.observations.write();
         let load = &mut observations.get_mut(&subscription.id).unwrap().load;
-        if nodes.iter().any(|node| !ids.insert(node.id)) {
+        if nodes
+            .iter()
+            .filter(|node| node.chain_hops().is_none())
+            .any(|node| !ids.insert(node.id))
+        {
             warn!(
                 subscription = %subscription.name,
                 "Subscription node ID duplicates another node; provider rejected"

@@ -79,7 +79,7 @@ async fn resolver_hook_rejection_skips_system_fallback_and_health_penalty() {
     assert!(crate::proxy::is_packet_rejection(&error));
 
     let node = id(9);
-    set.register_node(node, "denied".into(), "localhost:9".into());
+    set.register_node(node, "denied".into(), Some("localhost:9".into()));
     set.node_registered_at
         .write()
         .insert(node, Instant::now() - GRACE_PERIOD);
@@ -151,7 +151,7 @@ fn test_alive_set_basic() {
 #[test]
 fn test_alive_set_per_protocol() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     assert!(set.is_alive_for(id(1), ProbeDomain::Tcp, IpVersion::V4));
     assert!(set.is_alive_for(id(1), ProbeDomain::DnsUdp, IpVersion::V4));
     // Use forced death to bypass grace period for registered nodes.
@@ -208,7 +208,7 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
 #[test]
 fn test_traffic_failures_ignored_during_grace() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     let threshold = 50;
     for _ in 0..threshold {
         set.report_unavailable_traffic(id(1), ProbeDomain::Tcp, IpVersion::V4);
@@ -222,7 +222,7 @@ fn test_traffic_failures_ignored_during_grace() {
 #[test]
 fn test_probe_cooldown_backoff() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     assert!(set.should_probe(id(1), ProbeDomain::Tcp, IpVersion::V4));
     // Use forced death to bypass grace period and trigger backoff.
     set.report_unavailable_forced(id(1), ProbeDomain::Tcp, IpVersion::V4);
@@ -233,7 +233,7 @@ fn test_probe_cooldown_backoff() {
 fn test_network_change_bypasses_backoff_but_requires_fresh_success() {
     let set = AliveDialerSet::new();
     let node_id = id(1);
-    set.register_node(node_id, "n1".into(), "127.0.0.1:1".into());
+    set.register_node(node_id, "n1".into(), Some("127.0.0.1:1".into()));
     set.report_unavailable_forced(node_id, ProbeDomain::Tcp, IpVersion::V4);
     {
         let mut states = set.states.write();
@@ -267,7 +267,7 @@ async fn test_recovery_cycle_probes_due_dead_nodes() {
     set.register_node(
         node_id,
         "n2".into(),
-        listener.local_addr().unwrap().to_string(),
+        Some(listener.local_addr().unwrap().to_string()),
     );
     set.report_unavailable_forced(node_id, ProbeDomain::Tcp, IpVersion::V4);
     {
@@ -288,7 +288,7 @@ async fn test_recovery_cycle_probes_due_dead_nodes() {
 async fn test_recovery_cycle_probes_due_dead_udp_nodes() {
     let set = Arc::new(AliveDialerSet::new());
     let node_id = id(3);
-    set.register_node(node_id, "n3".into(), "127.0.0.1:1".into());
+    set.register_node(node_id, "n3".into(), Some("127.0.0.1:1".into()));
     set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
     set.report_unavailable_forced(node_id, ProbeDomain::DataUdp, IpVersion::V4);
     assert!(!set.is_alive_for(node_id, ProbeDomain::DataUdp, IpVersion::V4));
@@ -305,7 +305,7 @@ async fn test_periodic_cycle_tcp_cooldown_keeps_due_udp_probe() {
     for (tcp_cooling, udp_cooling) in [(true, false), (false, true), (true, true)] {
         let set = Arc::new(AliveDialerSet::new());
         let node_id = id(4);
-        set.register_node(node_id, "n4".into(), "127.0.0.1:1".into());
+        set.register_node(node_id, "n4".into(), Some("127.0.0.1:1".into()));
         set.set_http_probe(
             Arc::new(MockHttpProber {
                 result: HttpProbeResult::WarmSuccess(Duration::from_millis(7)),
@@ -352,7 +352,7 @@ async fn test_periodic_cycle_tcp_cooldown_keeps_due_udp_probe() {
 async fn test_emergency_probe_keeps_udp_cooldown() {
     let set = Arc::new(AliveDialerSet::new());
     let node_id = id(5);
-    set.register_node(node_id, "n5".into(), "127.0.0.1:1".into());
+    set.register_node(node_id, "n5".into(), Some("127.0.0.1:1".into()));
     set.set_http_probe(
         Arc::new(MockHttpProber {
             result: HttpProbeResult::WarmSuccess(Duration::from_millis(7)),
@@ -418,7 +418,7 @@ fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
     // cycle. With the timeouts held here the check cannot finish; the node
     // groups must still be free for reload's next acquisition.
     let set = std::sync::Arc::new(AliveDialerSet::new());
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
 
     let timeouts = set.urltest_group_timeout.write();
@@ -456,7 +456,7 @@ fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
 #[tokio::test]
 async fn test_urltest_idle_suspension() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.register_urltest_group("g", &[id(1)], Some(Duration::from_millis(50)));
 
     // Lazy start: a never-active group is idle → probing suspended.
@@ -480,8 +480,8 @@ async fn test_urltest_idle_suspension() {
 async fn test_health_cycle_skips_idle_urltest_nodes() {
     let set = std::sync::Arc::new(AliveDialerSet::new());
     // 127.0.0.1:1 refuses connections → a probe records a failure.
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
-    set.register_node(id(2), "n2".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
+    set.register_node(id(2), "n2".into(), Some("127.0.0.1:1".into()));
     set.register_urltest_group("g", &[id(1)], Some(Duration::from_secs(3600)));
 
     // n1's group was never active → suspended → cycle never probes it.
@@ -549,7 +549,7 @@ fn test_push_ebpf_uses_outbound_resolver() {
 fn test_sync_urltest_groups_full_refresh() {
     let set = AliveDialerSet::new();
     for (i, n) in ["n1", "n2", "n3"].into_iter().enumerate() {
-        set.register_node(id(i as u128 + 1), n.into(), "127.0.0.1:1".into());
+        set.register_node(id(i as u128 + 1), n.into(), Some("127.0.0.1:1".into()));
     }
     // Re-registering the same group twice duplicates the node→groups
     // index; the full refresh must rebuild it cleanly.
@@ -668,7 +668,7 @@ async fn invalid_http_check_url_falls_back_before_probe_cycles() {
 #[tokio::test]
 async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.set_http_probe(
         Arc::new(MockHttpProber {
             result: HttpProbeResult::WarmSuccess(Duration::from_millis(42)),
@@ -718,7 +718,7 @@ async fn warm_http_probe_is_the_only_result_recorded_as_latency() {
 #[tokio::test]
 async fn v4_only_check_url_leaves_v6_family_untouched() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     // Age the node out of the registration grace period so failures count.
     set.node_registered_at
         .write()
@@ -744,7 +744,7 @@ async fn v4_only_check_url_leaves_v6_family_untouched() {
 #[tokio::test]
 async fn raw_tcp_probe_with_v4_only_node_address_leaves_v6_untouched() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:9".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:9".into()));
     set.node_registered_at
         .write()
         .insert(id(1), Instant::now() - GRACE_PERIOD);
@@ -910,7 +910,7 @@ impl UdpProber for DelayedUdpProber {
 #[tokio::test]
 async fn local_carrier_capacity_does_not_demote_or_revive_probe_health() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "capacity".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "capacity".into(), Some("127.0.0.1:1".into()));
     set.node_registered_at
         .write()
         .insert(id(1), Instant::now() - GRACE_PERIOD);
@@ -948,7 +948,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
     for re_register in [false, true] {
         let set = Arc::new(AliveDialerSet::new());
         let node = id(1);
-        set.register_node(node, "same".into(), "127.0.0.1:1".into());
+        set.register_node(node, "same".into(), Some("127.0.0.1:1".into()));
         set.enable_health_history();
         set.record_probe_latency(
             node,
@@ -983,7 +983,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
 
         if re_register {
             // Identical metadata is a different registration, not the old owner.
-            set.register_node(node, "same".into(), "127.0.0.1:1".into());
+            set.register_node(node, "same".into(), Some("127.0.0.1:1".into()));
         }
         set.record_probe_latency(
             node,
@@ -1037,7 +1037,7 @@ async fn late_http_probe_preserves_unregistered_traffic_health() {
     ] {
         let set = Arc::new(AliveDialerSet::new());
         let node = id(1);
-        set.register_node(node, "old".into(), "127.0.0.1:1".into());
+        set.register_node(node, "old".into(), Some("127.0.0.1:1".into()));
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         set.set_http_probe(
@@ -1095,7 +1095,7 @@ async fn late_raw_tcp_probe_preserves_replacement_health() {
     let addr = listener.local_addr().unwrap();
     let set = Arc::new(AliveDialerSet::new());
     let node = id(1);
-    set.register_node(node, "same".into(), addr.to_string());
+    set.register_node(node, "same".into(), Some(addr.to_string()));
     set.enable_health_history();
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
@@ -1118,7 +1118,7 @@ async fn late_raw_tcp_probe_preserves_replacement_health() {
     });
     started.notified().await;
     set.remove_node(node);
-    set.register_node(node, "same".into(), addr.to_string());
+    set.register_node(node, "same".into(), Some(addr.to_string()));
     set.record_probe_latency(
         node,
         ProbeDomain::Tcp,
@@ -1145,7 +1145,7 @@ async fn late_raw_tcp_probe_preserves_replacement_health() {
 async fn scheduled_udp_probe_does_not_become_an_unregistered_probe() {
     let set = Arc::new(AliveDialerSet::new());
     let node = id(1);
-    set.register_node(node, "old".into(), "127.0.0.1:1".into());
+    set.register_node(node, "old".into(), Some("127.0.0.1:1".into()));
     let started = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     set.set_http_probe(
@@ -1233,7 +1233,7 @@ async fn reentrant_probe_callbacks_cannot_update_replacement_registration() {
     for retire_in_resolver in [false, true] {
         let set = Arc::new(AliveDialerSet::new());
         let node = id(1);
-        set.register_node(node, "same".into(), "127.0.0.1:1".into());
+        set.register_node(node, "same".into(), Some("127.0.0.1:1".into()));
         set.node_registered_at
             .write()
             .insert(node, Instant::now() - GRACE_PERIOD);
@@ -1245,7 +1245,7 @@ async fn reentrant_probe_callbacks_cannot_update_replacement_registration() {
             move || {
                 let set = set.upgrade().unwrap();
                 set.remove_node(node);
-                set.register_node(node, "same".into(), "127.0.0.1:1".into());
+                set.register_node(node, "same".into(), Some("127.0.0.1:1".into()));
                 set.set_ebpf_callback(Box::new(|_, _, _, _, _| {}));
                 set.set_outbound_resolver(None);
                 set.record_probe_latency(
@@ -1354,7 +1354,7 @@ async fn test_probe_node_udp_dns_skip_updates_only_measured_data_path() {
 #[tokio::test]
 async fn test_probe_node_udp_success_marks_udp_domains_alive() {
     let set = AliveDialerSet::new();
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(42))));
 
     assert!(!set.has_udp_state(id(1)));
@@ -1450,7 +1450,7 @@ async fn test_probe_node_udp_skipped_targets_are_neutral() {
 async fn test_tcp_probe_failure_does_not_touch_udp() {
     let set = AliveDialerSet::new();
     // 127.0.0.1:1 refuses connections → the TCP probe fails.
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     assert!(!set.probe_node(id(1), Duration::from_millis(100)).await);
     // The failure was recorded for TCP (history is written even inside
     // the registration grace period)…
@@ -1467,7 +1467,7 @@ async fn test_tcp_probe_failure_does_not_touch_udp() {
 #[tokio::test]
 async fn test_health_cycle_runs_udp_probe_after_tcp() {
     let set = std::sync::Arc::new(AliveDialerSet::new());
-    set.register_node(id(1), "n1".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.set_udp_probe(Arc::new(MockUdpProber::ok(Duration::from_millis(5))));
 
     set.run_health_check_cycle(Duration::from_millis(200)).await;
@@ -1757,7 +1757,7 @@ fn test_sync_group_check_urls_prunes_unused_urls() {
 #[tokio::test]
 async fn test_block_probe_exempt() {
     let set = AliveDialerSet::new();
-    set.register_node(BLOCK_NODE_ID, "block".into(), String::new());
+    set.register_node(BLOCK_NODE_ID, "block".into(), Some(String::new()));
     assert!(
         set.probe_node(BLOCK_NODE_ID, Duration::from_millis(1))
             .await
@@ -1785,7 +1785,7 @@ async fn test_block_probe_exempt() {
 #[test]
 fn test_block_ignores_traffic_failures() {
     let set = AliveDialerSet::new();
-    set.register_node(BLOCK_NODE_ID, "block".into(), String::new());
+    set.register_node(BLOCK_NODE_ID, "block".into(), Some(String::new()));
     for _ in 0..20 {
         set.report_unavailable_traffic(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
         set.report_unavailable_forced(BLOCK_NODE_ID, ProbeDomain::Tcp, IpVersion::V4);
@@ -1803,7 +1803,7 @@ fn test_block_ignores_traffic_failures() {
 #[test]
 fn test_direct_ignores_failure_marks() {
     let set = AliveDialerSet::new();
-    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    set.register_node(DIRECT_NODE_ID, "direct".into(), Some(String::new()));
     // Age out of the registration grace period so non-forced failures count
     // (the incident vector was the traffic-failure threshold).
     set.node_registered_at
@@ -1862,7 +1862,7 @@ async fn test_direct_probe_uses_direct_check_addr() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let set = AliveDialerSet::new();
-    set.register_node(DIRECT_NODE_ID, "direct".into(), String::new());
+    set.register_node(DIRECT_NODE_ID, "direct".into(), Some(String::new()));
     set.set_direct_check_addr(format!("127.0.0.1:{port}"));
     assert!(set.probe_node(DIRECT_NODE_ID, Duration::from_secs(2)).await);
     assert!(set.is_alive_for(DIRECT_NODE_ID, ProbeDomain::Tcp, IpVersion::V4));
@@ -2085,8 +2085,8 @@ fn test_report_dial_latency_ignores_builtin_nodes() {
 fn native_observations_exclude_legacy_and_preserve_zero_and_failures() {
     let set = AliveDialerSet::new();
     let node = id(1);
-    set.register_node(node, "node".into(), "127.0.0.1:1".into());
-    let registration = set.registered.read().get(&node).cloned().unwrap();
+    set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
+    let registration = set.registered.read().nodes.get(&node).cloned().unwrap();
     // In the past, so a later failure is not mistaken for a pre-step sample.
     let at = std::time::SystemTime::now() - Duration::from_secs(60);
     let zero = HealthObservation::probe(
@@ -2169,7 +2169,7 @@ async fn native_udp_observations_precede_legacy_family_fanout() {
     }
     let set = AliveDialerSet::new();
     let node = id(1);
-    set.register_node(node, "node".into(), "127.0.0.1:1".into());
+    set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
     set.enable_health_history();
     set.set_udp_probe(Arc::new(QualifiedUdp));
     assert!(set.probe_node_udp(node, Duration::from_secs(1)).await);
@@ -2201,8 +2201,8 @@ async fn native_custom_probe_retains_sampled_leaf_and_rejects_old_config() {
     for reload in [false, true] {
         let set = Arc::new(AliveDialerSet::new());
         set.enable_health_history();
-        set.register_node(id(1), "old".into(), "127.0.0.1:1".into());
-        set.register_node(id(2), "new".into(), "127.0.0.1:2".into());
+        set.register_node(id(1), "old".into(), Some("127.0.0.1:1".into()));
+        set.register_node(id(2), "new".into(), Some("127.0.0.1:2".into()));
         let url = "http://127.0.0.1/";
         set.sync_group_check_urls(&[("group".into(), url.into())]);
         let epoch = set.health_epoch().unwrap();
@@ -2273,8 +2273,8 @@ fn native_group_retention_has_a_fixed_slot_bound() {
     set.enable_health_history();
     let node = id(1);
     let group = id(2);
-    set.register_node(node, "node".into(), "127.0.0.1:1".into());
-    let registration = set.registered.read().get(&node).cloned().unwrap();
+    set.register_node(node, "node".into(), Some("127.0.0.1:1".into()));
+    let registration = set.registered.read().nodes.get(&node).cloned().unwrap();
     let epoch = set.health_epoch().unwrap();
     let observation = HealthObservation::probe(
         ProbeDomain::Tcp,
@@ -2306,9 +2306,9 @@ fn native_group_retention_has_a_fixed_slot_bound() {
 fn native_group_publication_invalidates_evidence_before_target_sync() {
     let set = AliveDialerSet::new();
     set.enable_health_history();
-    set.register_node(id(1), "node".into(), "127.0.0.1:1".into());
+    set.register_node(id(1), "node".into(), Some("127.0.0.1:1".into()));
     set.sync_group_check_urls(&[("group".into(), "http://old.example/".into())]);
-    let registration = set.registered.read().get(&id(1)).cloned().unwrap();
+    let registration = set.registered.read().nodes.get(&id(1)).cloned().unwrap();
     let context = GroupProbeContext {
         group_id: id(2),
         member_id: id(1),
@@ -2423,7 +2423,7 @@ async fn health_shutdown_drains_nested_probe_and_stops_loop() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let set = Arc::new(AliveDialerSet::new());
-        set.register_node(id(1), "first".into(), addr.to_string());
+        set.register_node(id(1), "first".into(), Some(addr.to_string()));
         set.enable_health_history();
         let ticket = set.probe_ticket(id(1));
         let sample = HealthObservation::probe(
@@ -2465,7 +2465,7 @@ async fn health_shutdown_drains_nested_probe_and_stops_loop() {
             1,
         );
         let (mut peer, _) = listener.accept().await.unwrap();
-        set.register_node(id(2), "queued".into(), addr.to_string());
+        set.register_node(id(2), "queued".into(), Some(addr.to_string()));
         set.trigger_probe(id(2));
         let shutdown = tokio::spawn({
             let set = Arc::clone(&set);
@@ -2595,7 +2595,7 @@ async fn health_shutdown_preserves_completed_failure_before_cancelled_retry() {
     tokio::time::timeout(Duration::from_secs(2), async {
         let set = Arc::new(AliveDialerSet::new());
         let started = Arc::new(tokio::sync::Notify::new());
-        set.register_node(id(1), "retry".into(), "127.0.0.1:1".into());
+        set.register_node(id(1), "retry".into(), Some("127.0.0.1:1".into()));
         set.set_http_probe(
             Arc::new(RetryProbe(Arc::clone(&started), Default::default())),
             "http://127.0.0.1,127.0.0.2".into(),
@@ -2706,4 +2706,119 @@ async fn health_shutdown_deadline_joins_blocking_resolver_before_returning_error
         };
         assert!(matches!(set.acquire_health_probe(), Err(error) if error == expected));
     }
+}
+
+#[tokio::test]
+async fn test_raw_probe_keeps_chain_health() {
+    let set = AliveDialerSet::new();
+    let node = Uuid::new_v4();
+    set.register_node(node, "via".into(), None);
+    set.set_resolver(Arc::new(|_, _| panic!("a chain has no raw TCP endpoint")));
+    set.node_registered_at
+        .write()
+        .insert(node, Instant::now() - GRACE_PERIOD);
+    let probe = || set.probe_node(node, Duration::from_millis(10));
+    let families = [IpVersion::V4, IpVersion::V6];
+    for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+        assert!(probe().await);
+    }
+    for family in families {
+        assert!(set.is_alive_for(node, ProbeDomain::Tcp, family));
+        assert!(
+            set.get_probe_history(node, ProbeDomain::Tcp, family)
+                .is_empty()
+        );
+    }
+
+    set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V4);
+    assert!(probe().await);
+    set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V6);
+    assert!(!probe().await);
+    for family in families {
+        assert!(!set.is_alive_for(node, ProbeDomain::Tcp, family));
+        assert_eq!(
+            set.get_probe_history(node, ProbeDomain::Tcp, family).len(),
+            1
+        );
+    }
+}
+
+/// Use a successful chain dial as the HTTP probe's sample.
+struct GenerationDialProber {
+    registry: Arc<crate::proxy::ProxyRegistry>,
+    generation: Arc<crate::runtime::OutboundRuntimeRegistry>,
+}
+
+impl HttpProber for GenerationDialProber {
+    fn probe_http(
+        &self,
+        node_id: Uuid,
+        addr: std::net::SocketAddr,
+        _url: &str,
+        timeout: Duration,
+        _cancel: ProbeCancellation,
+    ) -> Pin<Box<dyn Future<Output = HttpProbeOutcome> + Send + 'static>> {
+        let registry = Arc::clone(&self.registry);
+        let generation = Arc::clone(&self.generation);
+        Box::pin(async move {
+            match registry
+                .dial_runtime(generation, node_id, addr, None, timeout)
+                .await
+            {
+                Ok(_) => HttpProbeResult::WarmSuccess(Duration::from_millis(1)).into(),
+                Err(error) => HttpProbeResult::SetupFailure(format!("{error:#}")).into(),
+            }
+        })
+    }
+}
+
+/// Exit refusal and a subsequent successful dial are liveness evidence.
+#[tokio::test]
+async fn test_http_probe_moves_a_chain_between_dead_and_alive() {
+    use crate::test_support::{chain, socks5, socks5_relay};
+    use std::sync::atomic::Ordering;
+
+    let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let check = target.local_addr().unwrap();
+    let exit = socks5_relay(Vec::new(), true).await;
+    let entry = socks5_relay(Vec::new(), false).await;
+    let front = socks5("front", "127.0.0.1", entry.addr.port());
+    let land = socks5("land", "127.0.0.1", exit.addr.port());
+    let via = chain(&[&front, &land]);
+    let generation = Arc::new(
+        crate::runtime::OutboundRuntimeRegistry::build(&[via.clone(), front, land]).unwrap(),
+    );
+    let set = AliveDialerSet::new();
+    set.set_http_probe(
+        Arc::new(GenerationDialProber {
+            registry: Arc::new(crate::proxy::ProxyRegistry::default_resolver().unwrap()),
+            generation,
+        }),
+        format!("http://{check}/"),
+        "HEAD".into(),
+    )
+    .await;
+    set.register_node(via.id, via.name.clone(), None);
+    set.node_registered_at
+        .write()
+        .insert(via.id, Instant::now() - GRACE_PERIOD);
+    let alive = || set.is_alive_for(via.id, ProbeDomain::Tcp, IpVersion::V4);
+    let probe = || set.probe_node(via.id, Duration::from_secs(1));
+
+    for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+        assert!(!probe().await);
+    }
+    assert!(!alive());
+
+    exit.refuse.store(false, Ordering::SeqCst);
+    for _ in 0..RECOVERY_SUCCESSES_NEEDED {
+        assert!(probe().await);
+    }
+    assert!(alive());
+
+    exit.refuse.store(true, Ordering::SeqCst);
+    for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+        assert!(!probe().await);
+    }
+    assert!(!alive());
 }

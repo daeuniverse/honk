@@ -1,9 +1,14 @@
 use super::handoff::HandoffResult;
 use crate::control::*;
-pub(super) fn connection_chains(mut selection_chain: Vec<String>, node_name: &str) -> Vec<String> {
-    if selection_chain.last().map(String::as_str) != Some(node_name) {
-        selection_chain.push(node_name.to_owned());
+/// Clash-style `chains` lists the hops exit first, then the selected node and its groups.
+pub(super) fn connection_chains(
+    mut selection_chain: Vec<String>,
+    node: &honk_config::node::Node,
+) -> Vec<String> {
+    if selection_chain.last() != Some(&node.name) {
+        selection_chain.push(node.name.clone());
     }
+    selection_chain.extend(node.chain_hops().into_iter().flatten().cloned());
     selection_chain.reverse();
     selection_chain
 }
@@ -379,6 +384,29 @@ pub(in crate::control) fn domain_reality_outcome(
 #[cfg(test)]
 #[path = "sniffed_domain_routing_tests.rs"]
 mod sniffed_domain_routing_tests;
+
+#[cfg(test)]
+mod chains_tests {
+    use super::connection_chains;
+    use honk_config::node::Node;
+
+    #[test]
+    fn chain_hops_follow_the_selected_node_with_the_exit_first() {
+        let node = Node::chain("via", vec!["front".into(), "land".into()]);
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "via".into()], &node),
+            ["land", "front", "via", "proxy"]
+        );
+        let leaf = Node {
+            name: "hk".into(),
+            ..Node::default()
+        };
+        assert_eq!(
+            connection_chains(vec!["proxy".into()], &leaf),
+            ["hk", "proxy"]
+        );
+    }
+}
 
 #[cfg(all(test, feature = "native-api"))]
 mod native_tests {

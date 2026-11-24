@@ -155,7 +155,7 @@ async fn closed_proxy_stream_is_node_failure_but_end_to_end_quic_is_not() {
         ScoreOutcome::NodeFailure
     );
     let mut chunks = [bytes::Bytes::from_static(b"request")];
-    let error = std::future::poll_fn(|cx| stream.poll_write_chunks(cx, &mut chunks))
+    let error = std::future::poll_fn(|cx| stream.poll_write_chunks(cx, &mut chunks, 0))
         .await
         .unwrap_err();
     assert_eq!(

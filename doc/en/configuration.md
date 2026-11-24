@@ -245,7 +245,7 @@ See the [global reference](./reference/global.md).
 
 ## Declaring nodes
 
-Each `node` line is a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link. A bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. A malformed link is skipped with a diagnostic. An unknown or removed scheme, the removed VLESS `vless_mode` parameter, or a standalone `mux` line is a configuration error. Set `mux=` on each VLESS link instead.
+A `node` line is usually a share link: `tag: 'scheme://...'` or a bare quoted link. An explicit tag becomes the routing/API name and overrides a name embedded in the link. A bare link uses its fragment or a generated protocol/host name. Keep credentials, TLS/REALITY, transport, and protocol tuning in the link's userinfo and query parameters. A malformed link is skipped with a diagnostic. An unknown or removed scheme, the removed VLESS `vless_mode` parameter, or a standalone `mux` line is a configuration error. Set `mux=` on each VLESS link instead. A tagged line of node names joined by unquoted `->`, such as `via: front -> land`, declares a [proxy chain](./reference/nodes.md#proxy-chains) instead; an invalid chain is a configuration error.
 
 `direct` and `block` are reserved for the built-in outbounds and cannot name a node. A group cannot share a name with a node.
 

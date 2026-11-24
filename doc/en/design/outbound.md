@@ -120,6 +120,7 @@ the Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | AnyTLS | when `network` is absent or contains `udp` | no | no | `AnyTls` | `anytls` |
 | Direct | yes | no | no | `None` | none |
 | Block | no | no | yes | `None` | none |
+| Chain | no | no | no | `None` | none |
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP pooling
 stores only a connected proxy-server socket; `dial_with_tcp` then performs the
@@ -172,6 +173,7 @@ is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
+| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | No packet slot; TCP only |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server and
@@ -324,6 +326,12 @@ the WebSocket `Host` authority with any port dropped, otherwise the endpoint
 hostname: a CDN-fronted node keeps the edge IP as its address and names the
 distribution only in that header. The shared path therefore gives Trojan,
 VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
+
+If a physical WebSocket peer closes normally before VMess can send its empty
+upload terminator, the relay can finish cleanly only after validating the
+complete response and confirming that it forwarded all application bytes.
+The omitted terminator is not counted as sent. A writable carrier must still
+send and flush it.
 
 Cold and pooled-bare Trojan streams use that same complete transport stack. TLS
 batching returns bytes already read before surfacing a later I/O error on the
@@ -1246,6 +1254,67 @@ sends only enqueue, and `admitted` is set when the frame is queued to the
 session writer. The queue and credit limits are those of a single transport, so
 queue saturation or EOF retires every destination sharing the SID. Domain-target
 flows (`RewriteTo`) keep one scope per original destination.
+
+## Proxy chains
+
+A chain node (`OutboundConfig::Chain`) uses the registry's ordinary TCP
+handler instances. See the [node reference](../reference/nodes.md#proxy-chains)
+for syntax and hop eligibility.
+
+Configuration assembly resolves the hop names after adding subscription nodes,
+binds their ordered physical IDs, and derives the chain ID before rebuilding
+group membership. Runtime admission verifies the binding against the exact
+snapshot. The registry builds or reuses physical node runtimes first, then
+rebuilds every chain using the hops in that generation. DNS runtime forks
+follow the same path. A plain `dial` without a generation runtime refuses a
+chain.
+
+The entry uses its ordinary `dial_runtime` to reach the second hop's server.
+Each subsequent `dial_over` takes the existing stream and runs that hop's
+handshake. The last hop targets the application destination. A later hop's IP
+is passed as an address. A later hop's hostname is passed as `target_domain`
+with an unspecified address carrying the port for the preceding proxy to use.
+
+Each hop scopes its tasks and transport-quality observations to its own
+runtime. The entry may reuse a physical session. Later hops open no sockets
+and inherit the chain's dial scope, so only the entry needs physical dial
+admission. Carrier pressure belongs to the hop runtimes. The chain's own
+`TransportQuality` stays empty, so Score sees no transport pressure for the
+chain.
+
+An absolute deadline of `connect_timeout × 3` bounds the whole chain. The
+base timeout passed to each hop is the smaller of `connect_timeout` and the
+remaining time. Protocol-specific setup limits still apply to that value,
+including the tunneled REALITY handshake's `× 3`. If the chain deadline
+expires, setup returns a timed-out I/O error.
+
+`dial_over` leaves target milestone filtering to the chain. Intermediate hops
+run under `without_target_milestones`, which drops `TargetRequestSent` and
+`TargetConfirmed` while forwarding transport events and other milestones.
+`TransportAttached` and `TransportReady` describe the physical carrier.
+The final `TargetRequestSent` follows the request through WS and VMess relays
+and the gRPC driver. With a Hysteria2, TUIC, or Juicity entry, every accepted
+range of that request on its QUIC stream needs a successful local UDP
+submission. An ACK or another stream's datagram is not evidence for it. An
+uncertain submission, including control output interleaved with the request,
+can leave the milestone absent even if the peer receives the bytes. This
+does not cause a resend. First-hop AnyTLS, VLESS mux, and XHTTP session
+writers may report delivery when they accept the bytes.
+Hysteria2 offers its pending opener and the first payload together even with observation enabled. Only accepted payload bytes are tracked; sending the opener alone cannot report the final request.
+
+A typed refusal to open the next hop counts as a failure of the chain. The
+intermediate carrier tags this refusal during setup and when it surfaces on a
+later read, write, flush, or shutdown. The tag preserves the cause, I/O kind,
+and shared failure episode for attribution. The exit's refusal of the actual
+application target stays target-scoped. Local policy, capacity and cancellation
+keep their original classifications.
+
+A tunneled `RealityMaskCertificate` error redials the chain once from the entry
+with hybrid key shares disabled. The failed attempt drops its carrier and
+retained dial credits. The retry owns fresh credits and shares the same
+admission limits, pinned entry address, logical dial start and progress, and
+absolute deadline. A REALITY entry performs its ordinary retry inside
+`dial_runtime`.
 
 ## Cold URLTest speculative preparation
 

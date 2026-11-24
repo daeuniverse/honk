@@ -42,7 +42,7 @@ impl AliveDialerSet {
         latency: Option<Duration>,
     ) {
         let registered = self.registered.read();
-        if !Self::same_registration(registered.get(&node_id), registration) {
+        if !Self::same_registration(registered.nodes.get(&node_id), registration) {
             return;
         }
         let changed = match latency {
@@ -60,7 +60,7 @@ impl AliveDialerSet {
         drop(registered);
         if changed {
             self.notify_health_change(node_id, domain, ipver, latency.is_some(), || {
-                Self::same_registration(self.registered.read().get(&node_id), registration)
+                Self::same_registration(self.registered.read().nodes.get(&node_id), registration)
             });
         }
     }
@@ -87,20 +87,20 @@ impl AliveDialerSet {
         // latency ranking but never the liveness verdict (see
         // mark_unavailable_internal).
         if node_id == honk_config::config::DIRECT_NODE_ID {
-            let registration = self.registered.read().get(&node_id).cloned();
+            let registration = self.registered.read().nodes.get(&node_id).cloned();
             let target = self.direct_check_addr.read().clone();
             return self
                 .probe_node_tcp(
                     node_id,
                     "direct",
-                    &target,
+                    Some(&target),
                     timeout,
                     registration.as_ref(),
                     &cancel,
                 )
                 .await;
         }
-        let registered = self.registered.read().get(&node_id).cloned();
+        let registered = self.registered.read().nodes.get(&node_id).cloned();
         let Some(registered) = registered else {
             return false;
         };
@@ -114,7 +114,7 @@ impl AliveDialerSet {
             self.probe_node_tcp(
                 node_id,
                 &registered.name,
-                &registered.address,
+                registered.raw_probe_address.as_deref(),
                 timeout,
                 Some(&registered),
                 &cancel,
@@ -135,25 +135,12 @@ impl AliveDialerSet {
     ) -> bool {
         let node_name = registered.name.as_str();
         let check_url = self.check_url.read().clone();
-        if check_url.is_empty() {
-            return self
-                .probe_node_tcp(
-                    node_id,
-                    node_name,
-                    &registered.address,
-                    timeout,
-                    Some(registered),
-                    cancel,
-                )
-                .await;
-        }
-
         let Ok(target) = honk_config::check::decode_health_http_target(&check_url) else {
             return self
                 .probe_node_tcp(
                     node_id,
                     node_name,
-                    &registered.address,
+                    registered.raw_probe_address.as_deref(),
                     timeout,
                     Some(registered),
                     cancel,
@@ -290,7 +277,7 @@ impl AliveDialerSet {
                 "Node '{}' failed HTTP health check for '{}' through proxy endpoint {}",
                 node_name,
                 check_url,
-                registered.address
+                registered.raw_probe_address.as_deref().unwrap_or_default()
             );
         }
 
@@ -328,7 +315,7 @@ impl AliveDialerSet {
             self.mark_url_probe_succeeded(tag, url);
             return true;
         }
-        let registration = self.registered.read().get(&leaf).cloned();
+        let registration = self.registered.read().nodes.get(&leaf).cloned();
         let prober_opt = self.http_prober.read().clone();
         let Some(ref prober) = prober_opt else {
             return false;
@@ -428,25 +415,28 @@ impl AliveDialerSet {
         any_ok
     }
 
-    /// Raw TCP connect health check (fallback when no HTTP prober configured).
+    /// Raw TCP connect health check when no HTTP prober or check URL is configured.
     async fn probe_node_tcp(
         &self,
         node_id: Uuid,
         node_name: &str,
-        node_addr: &str,
+        node_addr: Option<&str>,
         timeout: Duration,
         registration: Option<&Arc<RegisteredNode>>,
         cancel: &ProbeCancellation,
     ) -> bool {
-        let addr = node_addr.to_string();
-        let (host, port) = match addr.rsplit_once(':') {
-            Some((h, p)) => match p.parse::<u16>() {
-                Ok(port) => (h.to_string(), port),
-                Err(_) => (addr.clone(), 80),
-            },
-            None => (addr.clone(), 80),
+        // A virtual chain has no endpoint of its own. With no raw target,
+        // leave both families' health state alone.
+        let Some(addr) = node_addr else {
+            return [IpVersion::V4, IpVersion::V6]
+                .into_iter()
+                .any(|ipver| self.is_alive_for(node_id, ProbeDomain::Tcp, ipver));
         };
-        let addrs = match self.resolve_host(&host, port).await {
+        let (host, port) = match addr.rsplit_once(':') {
+            Some((host, port)) => port.parse::<u16>().map_or((addr, 80), |port| (host, port)),
+            None => (addr, 80),
+        };
+        let addrs = match self.resolve_host(host, port).await {
             Ok(addrs) if !addrs.is_empty() => addrs,
             Ok(_) => {
                 tracing::debug!(
@@ -623,7 +613,7 @@ impl AliveDialerSet {
     /// legacy TCP-fallback selection semantics (see
     /// [`AliveDialerSet::has_udp_state`]).
     pub async fn probe_node_udp(&self, node_id: Uuid, timeout: Duration) -> bool {
-        let registration = self.registered.read().get(&node_id).cloned();
+        let registration = self.registered.read().nodes.get(&node_id).cloned();
         self.probe_node_udp_registered(node_id, timeout, registration)
             .await
     }
@@ -637,7 +627,10 @@ impl AliveDialerSet {
         let Ok(permit) = self.acquire_health_probe() else {
             return false;
         };
-        if !Self::same_registration(self.registered.read().get(&node_id), registration.as_ref()) {
+        if !Self::same_registration(
+            self.registered.read().nodes.get(&node_id),
+            registration.as_ref(),
+        ) {
             return false;
         }
         // direct/block UDP liveness carries no verdict: the builtins are

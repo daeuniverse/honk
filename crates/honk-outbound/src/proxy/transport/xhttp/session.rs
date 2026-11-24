@@ -79,7 +79,7 @@ pub(super) struct QueueProgress {
 }
 
 impl DataProgress for QueueProgress {
-    fn released(&self) {
+    fn released(&self, _remaining: usize) {
         // DATA ownership can end before the encoded frame reaches physical I/O.
         self.io.writing();
         self.pending.fetch_sub(1, Ordering::AcqRel);

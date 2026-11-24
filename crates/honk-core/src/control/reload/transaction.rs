@@ -61,11 +61,6 @@ pub(crate) fn rebase_subscription_nodes(
     }
 
     candidate.nodes = static_nodes;
-    honk_config::parser::resolve_group_filters(
-        &mut candidate.groups,
-        &candidate.nodes,
-        &candidate.subscriptions,
-    );
     retained_providers
 }
 
@@ -250,10 +245,27 @@ impl ControlPlane {
             warn!("reload rejected: subscription worker changes require the control command path");
             return Ok(ReloadOutcome::Rejected);
         }
-        // Same proof as at the public entry: equality with the admitted active
-        // configuration is admission. Anything else is verified before any shortcut.
+        // Equality covers the private chain binding as well as the public node ID.
         if new_config != *current_config.as_ref() {
-            new_config.validate_assembled()?;
+            match &diagnostic_update {
+                DiagnosticUpdate::Rebase { .. } => {
+                    new_config = new_config.assemble(honk_config::parser::resolve_group_filters)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                    if new_config
+                        .nodes
+                        .iter()
+                        .any(|node| node.chain_hops().is_some()) =>
+                {
+                    new_config =
+                        new_config.assemble(honk_config::parser::resolve_programmatic_groups)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                | DiagnosticUpdate::Preserve
+                | DiagnosticUpdate::ReplaceProvider { .. } => {
+                    new_config.validate_assembled()?;
+                }
+            }
         }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
@@ -513,6 +525,7 @@ impl ControlPlane {
             }
         };
         let new_outbound_id_map = build_outbound_id_map(&new_config);
+        let health_targets = health_registrations(&new_config, &new_outbound_id_map);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -625,6 +638,8 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
         let old_registry_result = {
+            #[cfg(all(test, feature = "clash-api"))]
+            let _after_unlock = self.clash_publication_pause.lock().take();
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
             #[cfg(feature = "native-api")]
@@ -724,6 +739,12 @@ impl ControlPlane {
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();
+                // A node can retain its runtime while leaving all health-checked groups.
+                // Publish its registration under the same fence as the runtime swap.
+                self.alive_set
+                    .sync_registrations_retaining_delays(health_targets, |id| {
+                        reused_runtime_ids.contains(id)
+                    });
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.
@@ -846,7 +867,6 @@ impl ControlPlane {
             .await;
         {
             let config = self.config.read().await;
-            let _ = sync_health_check_nodes(&self.alive_set, &config);
             self.alive_set
                 .sync_urltest_groups(&urltest_group_registrations(&config));
             self.alive_set

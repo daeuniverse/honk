@@ -30,7 +30,7 @@ use honk_config::Config;
 use honk_config::group::GroupPolicy;
 use honk_config::node::{Group, Node};
 use honk_config::types::NodeProtocol;
-use honk_outbound::alive::{AliveDialerSet, HealthCheckError, IpVersion, ProbeDomain};
+use honk_outbound::alive::{AliveDialerSet, HealthCheckError, IpVersion, ProbeDomain, ProbeTicket};
 use honk_outbound::group::SelectionNetwork;
 use honk_outbound::group::{GroupManager, SharedGroupManager};
 use honk_outbound::urltest::{
@@ -418,6 +418,7 @@ fn clash_protocol_type(protocol: NodeProtocol) -> &'static str {
         NodeProtocol::AnyTLS => "AnyTLS",
         NodeProtocol::Direct => "Direct",
         NodeProtocol::Block => "Reject",
+        NodeProtocol::Chain => "Chain",
     }
 }
 
@@ -500,16 +501,18 @@ fn build_group_proxy_info(
 ///
 /// Includes the per-node delay history (clash `{time, delay}` shape) so
 /// dashboards can render per-node latencies — group members included.
-fn build_node_proxy_info(node: &Node, alive_set: &AliveDialerSet) -> serde_json::Value {
+fn build_node_proxy_info(
+    node: &Node,
+    alive: &AliveDialerSet,
+    registry: &honk_outbound::runtime::OutboundRuntimeRegistry,
+) -> serde_json::Value {
     let mut info = serde_json::json!({
         "name": node.name,
         "type": clash_protocol_type(node.protocol()),
         "udp": true,
         "history": [],
     });
-    if let Some((latency, at)) =
-        alive_set.get_last_real_sample(node.id, ProbeDomain::Tcp, IpVersion::V4)
-    {
+    if let Some((latency, at)) = alive.clash_node_latency(node.id, registry) {
         let ms = latency.as_millis() as u64;
         info["history"] = serde_json::json!([delay_history_entry(ms, at)]);
     }
@@ -563,9 +566,14 @@ async fn get_proxies(State(s): State<Arc<ClashState>>) -> Json<serde_json::Value
     // Emit every node as a top-level proxy — including group members. Clash
     // dashboards resolve group members through these entries to display node
     // names and per-node delay history (real Clash behaves the same way).
+    let registry = s.runtime_registry.read();
     for node in &config.nodes {
-        proxies.insert(node.name.clone(), build_node_proxy_info(node, &s.alive_set));
+        proxies.insert(
+            node.name.clone(),
+            build_node_proxy_info(node, &s.alive_set, &registry),
+        );
     }
+    drop(registry);
 
     for group in &config.groups {
         proxies.insert(
@@ -596,7 +604,12 @@ async fn get_proxy(State(s): State<Arc<ClashState>>, Path(name): Path<String>) -
     }
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name) {
-        return Json(build_node_proxy_info(node, &s.alive_set)).into_response();
+        return Json(build_node_proxy_info(
+            node,
+            &s.alive_set,
+            &s.runtime_registry.read(),
+        ))
+        .into_response();
     }
 
     error_response(StatusCode::NOT_FOUND, "proxy not found")
@@ -721,9 +734,30 @@ fn health_probe_error(error: HealthCheckError) -> Response {
     error_response(StatusCode::SERVICE_UNAVAILABLE, &error.to_string())
 }
 
+fn capture_delay_leaves<'a>(
+    alive_set: &AliveDialerSet,
+    members: &'a [(String, Node)],
+) -> Vec<(&'a Node, ProbeTicket)> {
+    members
+        .iter()
+        .map(|(_, leaf)| (leaf, alive_set.probe_ticket(leaf.id)))
+        .collect()
+}
+
+fn reselect_urltest(s: &ClashState, captured: &Arc<GroupManager>, name: &str) {
+    if captured.get_group_policy(name) != Some(GroupPolicy::URLTest) {
+        return;
+    }
+    // Keep the manager published through selection and its activity update.
+    let published = s.group_manager.read();
+    if Arc::ptr_eq(&published, captured) {
+        let _ = captured.select_node_for_domain(name, ProbeDomain::Tcp, IpVersion::V4);
+    }
+}
+
 /// GET /proxies/{name}/delay — live latency measurement (HEAD request
-/// through the node / group members). Successes refresh the alive-set
-/// history; errors return 503 without changing real dial failure streaks.
+/// through the node / group members). Successful scalar measurements of an
+/// unregistered ordinary leaf are display-only. Errors return 503.
 async fn get_proxy_delay(
     State(s): State<Arc<ClashState>>,
     Path(name): Path<String>,
@@ -745,6 +779,11 @@ async fn proxy_delay(
     let config = s.config.read().await;
 
     if let Some(node) = config.nodes.iter().find(|n| n.name == name).cloned() {
+        let (group_manager, generation, ticket) = {
+            let manager = s.group_manager.read();
+            let (generation, ticket) = s.alive_set.clash_node_ticket(&node, &s.runtime_registry);
+            (Arc::clone(&manager), generation, ticket)
+        };
         drop(config);
         let Some(entry) = s.proxy_registry.find(node.protocol()) else {
             return error_response(
@@ -754,26 +793,26 @@ async fn proxy_delay(
         };
         let tcp = entry.tcp.clone();
         let warmable = entry.warmable.clone();
-        let generation = s.runtime_registry.read().clone();
-        let measured = {
-            let group_manager = s.group_manager.read().clone();
-            urltest_node_in_generation_with_feedback(
-                &generation,
-                &node,
-                tcp.as_ref(),
-                warmable.as_deref(),
-                &query.url,
-                query.timeout(),
-                &group_manager,
-                cancel.clone(),
-            )
-            .await
-        };
+        let measured = urltest_node_in_generation_with_feedback(
+            &generation,
+            &node,
+            tcp.as_ref(),
+            warmable.as_deref(),
+            &query.url,
+            query.timeout(),
+            &group_manager,
+            cancel.clone(),
+        )
+        .await;
         return match measured {
-            Ok(latency) => {
-                s.alive_set
-                    .record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, latency);
-                Json(serde_json::json!({"delay": delay_ms(latency)})).into_response()
+            Ok(measurement) => {
+                s.alive_set.record_urltest_latency(
+                    &s.runtime_registry,
+                    &generation,
+                    &ticket,
+                    measurement,
+                );
+                Json(serde_json::json!({"delay": delay_ms(measurement.latency)})).into_response()
             }
             Err(e) => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -782,67 +821,7 @@ async fn proxy_delay(
         };
     }
 
-    let is_group = config.groups.iter().any(|group| group.name == name);
-    drop(config);
-    if is_group {
-        let members = {
-            let gm = s.group_manager.read();
-            gm.delay_test_members(&name)
-        };
-        if members.is_empty() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
-        }
-        let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
-        let generation = s.runtime_registry.read().clone();
-        let results = {
-            let group_manager = s.group_manager.read().clone();
-            urltest_group_with_feedback(
-                &leaves,
-                &generation,
-                &s.proxy_registry,
-                &s.alive_set,
-                &query.url,
-                query.timeout(),
-                group_manager,
-                cancel.clone(),
-            )
-            .await
-        };
-        if cancel.is_cancelled() {
-            return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
-        }
-        // sing-box performUpdateCheck: an explicit delay test immediately
-        // re-evaluates the URLTest selection with the fresh measurements
-        // (tolerance hysteresis applies). Without this the group's `now`
-        // would only update on the next real dial.
-        {
-            let gm = s.group_manager.read().clone();
-            if gm.get_group_policy(&name) == Some(GroupPolicy::URLTest) {
-                let _ = gm.select_node_for_domain(&name, ProbeDomain::Tcp, IpVersion::V4);
-            }
-        }
-        // The current selection is a member TAG (node name or sub-group
-        // tag); its delay is the measurement of that member's leaf.
-        let current = {
-            let gm = s.group_manager.read();
-            gm.get_selector_choice(&name, SelectionNetwork::Tcp)
-                .or_else(|| gm.get_urltest_selection(&name))
-                .or_else(|| gm.get_score_selection_for_network(&name, SelectionNetwork::Tcp))
-        }
-        .or_else(|| members.first().map(|(tag, _)| tag.clone()));
-        if let Some(current) = current
-            && let Some((_, leaf)) = members.iter().find(|(tag, _)| tag == &current)
-            && let Some((_, Ok(latency))) = results.iter().find(|(n, _)| n == &leaf.name)
-        {
-            return Json(serde_json::json!({"delay": delay_ms(*latency)})).into_response();
-        }
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "An error occurred in the delay test",
-        );
-    }
-
-    error_response(StatusCode::NOT_FOUND, "proxy not found")
+    group_delay(&s, config, &name, &query, cancel, GroupDelayView::Selected).await
 }
 
 /// GET /group/{name}/delay — clash-meta group delay test: measures every
@@ -857,60 +836,84 @@ async fn get_group_delay(
 ) -> Response {
     let owner = Arc::clone(&s.alive_set);
     owner
-        .run_external_probe(move |cancel| async move { group_delay(s, name, query, cancel).await })
+        .run_external_probe(move |cancel| async move {
+            let config = s.config.read().await;
+            group_delay(&s, config, &name, &query, cancel, GroupDelayView::Members).await
+        })
         .await
         .unwrap_or_else(health_probe_error)
 }
 
-async fn group_delay(
-    s: Arc<ClashState>,
-    name: String,
-    query: DelayQuery,
-    cancel: honk_outbound::alive::ProbeCancellation,
-) -> Response {
-    let exists = {
-        let config = s.config.read().await;
-        config.groups.iter().any(|group| group.name == name)
-    };
-    if !exists {
-        return error_response(StatusCode::NOT_FOUND, "group not found");
-    }
-    let members = {
-        let gm = s.group_manager.read();
-        gm.delay_test_members(&name)
-    };
+enum GroupDelayView {
+    Selected,
+    Members,
+}
 
-    let leaves: Vec<Node> = members.iter().map(|(_, leaf)| leaf.clone()).collect();
-    let generation = s.runtime_registry.read().clone();
-    let results = {
-        let group_manager = s.group_manager.read().clone();
-        urltest_group_with_feedback(
-            &leaves,
-            &generation,
-            &s.proxy_registry,
-            &s.alive_set,
-            &query.url,
-            query.timeout(),
-            group_manager,
-            cancel.clone(),
-        )
-        .await
+async fn group_delay(
+    s: &ClashState,
+    config: tokio::sync::RwLockReadGuard<'_, Arc<Config>>,
+    name: &str,
+    query: &DelayQuery,
+    cancel: honk_outbound::alive::ProbeCancellation,
+    view: GroupDelayView,
+) -> Response {
+    if !config.groups.iter().any(|group| group.name == name) {
+        let reason = match view {
+            GroupDelayView::Selected => "proxy not found",
+            GroupDelayView::Members => "group not found",
+        };
+        return error_response(StatusCode::NOT_FOUND, reason);
+    }
+    let members;
+    let (group_manager, generation, leaves) = {
+        let manager = s.group_manager.read();
+        let registry = s.runtime_registry.read();
+        members = manager.delay_test_members(name);
+        let leaves = capture_delay_leaves(&s.alive_set, &members);
+        (Arc::clone(&manager), Arc::clone(&registry), leaves)
     };
+    if members.is_empty() && matches!(view, GroupDelayView::Selected) {
+        return error_response(StatusCode::SERVICE_UNAVAILABLE, "group has no members");
+    }
+    drop(config);
+    let results = urltest_group_with_feedback(
+        &leaves,
+        &generation,
+        &s.runtime_registry,
+        &s.proxy_registry,
+        &s.alive_set,
+        &query.url,
+        query.timeout(),
+        Arc::clone(&group_manager),
+        cancel.clone(),
+    )
+    .await;
     if cancel.is_cancelled() {
         return error_response(StatusCode::SERVICE_UNAVAILABLE, "delay test was cancelled");
     }
-    // sing-box performUpdateCheck: re-evaluate the URLTest selection with
-    // the fresh measurements (see get_proxy_delay's group branch).
-    {
-        let gm = s.group_manager.read().clone();
-        if gm.get_group_policy(&name) == Some(GroupPolicy::URLTest) {
-            let _ = gm.select_node_for_domain(&name, ProbeDomain::Tcp, IpVersion::V4);
+    reselect_urltest(s, &group_manager, name);
+    if matches!(view, GroupDelayView::Selected) {
+        // The selected tag may name a subgroup; the latency belongs to its leaf.
+        let current = group_manager
+            .get_selector_choice(name, SelectionNetwork::Tcp)
+            .or_else(|| group_manager.get_urltest_selection(name))
+            .or_else(|| group_manager.get_score_selection_for_network(name, SelectionNetwork::Tcp))
+            .or_else(|| members.first().map(|(tag, _)| tag.clone()));
+        if let Some(current) = current
+            && let Some((_, leaf)) = members.iter().find(|(tag, _)| tag == &current)
+            && let Some((_, Ok(latency))) = results.iter().find(|(n, _)| n == &leaf.name)
+        {
+            return Json(serde_json::json!({"delay": delay_ms(*latency)})).into_response();
         }
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "An error occurred in the delay test",
+        );
     }
     let mut delays = serde_json::Map::new();
-    for (tag, leaf) in &members {
+    for (tag, leaf) in members {
         if let Some((_, Ok(latency))) = results.iter().find(|(n, _)| n == &leaf.name) {
-            delays.insert(tag.clone(), serde_json::json!(delay_ms(*latency)));
+            delays.insert(tag, serde_json::json!(delay_ms(*latency)));
         }
     }
     Json(serde_json::Value::Object(delays)).into_response()
@@ -1728,6 +1731,7 @@ async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_jso
     let config = s.config.read().await;
     let gm = s.group_manager.read().clone();
     let mut providers = serde_json::Map::new();
+    let registry = s.runtime_registry.read();
 
     for group in &config.groups {
         let members = gm.delay_test_members(&group.name);
@@ -1738,7 +1742,7 @@ async fn get_proxy_providers(State(s): State<Arc<ClashState>>) -> Json<serde_jso
         let proxies: Vec<serde_json::Value> = members
             .iter()
             .map(|(tag, leaf)| {
-                let mut info = build_node_proxy_info(leaf, &s.alive_set);
+                let mut info = build_node_proxy_info(leaf, &s.alive_set, &registry);
                 info["name"] = serde_json::Value::String(tag.clone());
                 info
             })

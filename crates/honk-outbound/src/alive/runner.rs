@@ -304,6 +304,7 @@ impl AliveDialerSet {
         let nodes: Vec<_> = self
             .registered
             .read()
+            .nodes
             .iter()
             .map(|(id, node)| (*id, Arc::clone(node)))
             .collect();
@@ -372,6 +373,7 @@ impl AliveDialerSet {
         let nodes: Vec<_> = self
             .registered
             .read()
+            .nodes
             .iter()
             .map(|(id, node)| (*id, Arc::clone(node)))
             .collect();

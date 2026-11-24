@@ -15,6 +15,24 @@ struct Location {
     byte_column: Option<usize>,
 }
 
+/// Node tags are not schema fields: every diagnostic about a node written in
+/// an entry, from its share link or its own validation, belongs to that entry.
+fn locate_entry(location: &Location, entry: Option<usize>, diagnostic: &mut DetailedDiagnostic) {
+    diagnostic.source = location.source.clone();
+    diagnostic.line = location.line;
+    diagnostic.span = location.span.clone();
+    diagnostic.byte_column = location.byte_column;
+    diagnostic.entry_index = entry;
+    if let Some(SettingSegment::Field(root)) = diagnostic.setting.0.first_mut()
+        && *root == "config"
+    {
+        *root = "nodes";
+    }
+    if let Some(index) = entry {
+        diagnostic.setting.0.insert(1, SettingSegment::Index(index));
+    }
+}
+
 #[derive(Clone)]
 struct FilterLocation {
     location: Location,
@@ -81,32 +99,23 @@ impl<'a> ParserDiagnostics<'a> {
         let source = self.source();
         let location = &self.current;
         let entry = self.entry;
-        // Node tags are not schema fields: every link diagnostic belongs to this entry.
-        let locate_entry = |diagnostic: &mut DetailedDiagnostic| {
-            diagnostic.source = source.clone();
-            diagnostic.line = location.line;
-            diagnostic.span = location.span.clone();
-            diagnostic.byte_column = location.byte_column;
-            diagnostic.entry_index = entry;
-            if let Some(crate::diagnostic::SettingSegment::Field(root)) =
-                diagnostic.setting.0.first_mut()
-                && *root == "config"
-            {
-                *root = "nodes";
-            }
-            if let Some(index) = entry {
-                diagnostic
-                    .setting
-                    .0
-                    .insert(1, crate::diagnostic::SettingSegment::Index(index));
-            }
-        };
         crate::node::Node::parse_share_link(link, &source, &mut |mut diagnostic| {
-            locate_entry(&mut diagnostic);
+            locate_entry(location, entry, &mut diagnostic);
             self.output.push(diagnostic);
         })
         .map_err(|mut error| {
-            locate_entry(error.diagnostic.as_mut());
+            locate_entry(location, entry, error.diagnostic.as_mut());
+            error
+        })
+    }
+
+    /// Locate validation failures at the current entry, as for share links.
+    pub fn validate_entry_node(
+        &self,
+        node: &crate::node::Node,
+    ) -> Result<(), crate::error::DetailedConfigError> {
+        node.validate_detailed().map_err(|mut error| {
+            locate_entry(&self.current, self.entry, error.diagnostic.as_mut());
             error
         })
     }

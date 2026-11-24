@@ -144,6 +144,9 @@ pub struct FlowObserver {
     context: FlowContext,
     callback: Arc<dyn Fn(FlowContext, FlowEvent) + Send + Sync>,
     milestones: Arc<std::sync::atomic::AtomicU8>,
+    /// Milestones this view drops before they reach the shared once-state.
+    dropped: u8,
+    request_lifetime: Option<std::sync::Weak<QuicSubmissions>>,
 }
 
 #[cfg(feature = "flow-observation")]
@@ -166,6 +169,8 @@ impl FlowObserver {
             context,
             callback,
             milestones: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            dropped: 0,
+            request_lifetime: None,
         }
     }
 
@@ -177,23 +182,35 @@ impl FlowObserver {
         if context == self.context {
             return self.clone();
         }
-        Self::new(context, Arc::clone(&self.callback))
+        Self {
+            request_lifetime: self.request_lifetime.clone(),
+            dropped: self.dropped,
+            ..Self::new(context, Arc::clone(&self.callback))
+        }
     }
 
     /// Callbacks must remain bounded, synchronous and non-reentrant, with no I/O.
     pub fn publish(&self, event: FlowEvent) {
+        if let FlowEvent::Milestone { milestone } = event
+            && self.dropped & milestone.bit() != 0
+        {
+            return;
+        }
         (self.callback)(self.context, event);
     }
 
     pub fn milestone_once(&self, milestone: Milestone) {
         let bit = milestone.bit();
+        if self.dropped & bit != 0 {
+            return;
+        }
         if self
             .milestones
             .fetch_or(bit, std::sync::atomic::Ordering::Relaxed)
             & bit
             == 0
         {
-            self.publish(FlowEvent::Milestone { milestone });
+            (self.callback)(self.context, FlowEvent::Milestone { milestone });
         }
     }
 
@@ -241,6 +258,20 @@ pub fn without<F: Future>(future: F) -> impl Future<Output = F::Output> {
     SUPPRESSED.scope(true, scope(None, future))
 }
 
+/// Run a proxy chain hop other than the last. Its target is the next hop's
+/// server, so its target milestones are dropped; transport events and
+/// `TransportReady` still reach the flow, deduplicated with the other hops.
+#[cfg(feature = "flow-observation")]
+pub(crate) fn without_target_milestones<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    let observer = current().map(|flow| FlowObserver {
+        dropped: flow.dropped
+            | Milestone::TargetRequestSent.bit()
+            | Milestone::TargetConfirmed.bit(),
+        ..flow
+    });
+    scope(observer, future)
+}
+
 #[cfg(feature = "flow-observation")]
 pub fn milestone(milestone: Milestone) {
     if let Some(observer) = current() {
@@ -249,211 +280,13 @@ pub fn milestone(milestone: Milestone) {
 }
 
 #[cfg(feature = "flow-observation")]
-#[derive(Clone, Debug)]
-pub(crate) struct RequestWrite {
-    target: RequestTarget,
-    state: Arc<parking_lot::Mutex<RequestWriteState>>,
-}
-
-/// Who learns that every byte of a request write has been delivered.
+mod request;
+#[cfg(all(feature = "flow-observation", test))]
+pub(crate) use request::RequestDelivery;
 #[cfg(feature = "flow-observation")]
-#[derive(Clone, Debug)]
-enum RequestTarget {
-    Flow(FlowObserver),
-    /// A relay task carrying an upper request's bytes up to this position.
-    Relay(Arc<RequestWrite>, u64),
-}
-
-#[cfg(feature = "flow-observation")]
-#[derive(Debug, Default)]
-struct RequestWriteState {
-    required: u64,
-    delivered: u64,
-    finished: bool,
-}
-
-#[cfg(feature = "flow-observation")]
-impl RequestWrite {
-    fn new(target: RequestTarget) -> Self {
-        Self {
-            target,
-            state: Arc::default(),
-        }
-    }
-
-    pub(crate) fn current() -> Option<Self> {
-        if is_suppressed() {
-            return None;
-        }
-        REQUEST_WRITE.try_with(Clone::clone).ok().flatten()
-    }
-
-    pub(crate) fn defer(&self, position: u64) {
-        self.state.lock().required = position;
-    }
-
-    pub(crate) fn delivered(&self, position: u64) {
-        let publish = {
-            let mut state = self.state.lock();
-            state.delivered = state.delivered.max(position);
-            state.finished && state.delivered >= state.required
-        };
-        if publish {
-            self.publish();
-        }
-    }
-
-    fn finish(&self) {
-        let publish = {
-            let mut state = self.state.lock();
-            state.finished = true;
-            state.delivered >= state.required
-        };
-        if publish {
-            self.publish();
-        }
-    }
-
-    fn publish(&self) {
-        match &self.target {
-            RequestTarget::Flow(observer) => observer.milestone_once(Milestone::TargetRequestSent),
-            RequestTarget::Relay(upper, position) => upper.delivered(*position),
-        }
-    }
-}
-
-#[cfg(feature = "flow-observation")]
-async fn scoped<T, E>(
-    request: RequestWrite,
-    write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
-) -> Result<T, E> {
-    let result = REQUEST_WRITE.scope(Some(request.clone()), write).await;
-    if result.is_ok() {
-        request.finish();
-    }
-    result
-}
-
-#[cfg(feature = "flow-observation")]
-/// A buffered transport may defer the event until the actual frame writer flushes.
-pub(crate) async fn request_write<T, E>(
-    future: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
-) -> Result<T, E> {
-    let Some(observer) = current() else {
-        return future.await;
-    };
-    scoped(RequestWrite::new(RequestTarget::Flow(observer)), future).await
-}
-
-/// Request delivery across an in-memory pipe drained by a relay task. A write
-/// accepted by the pipe is delivered only once the relay has handed its bytes
-/// to the carrier below and that carrier has delivered them in turn.
-#[cfg(feature = "flow-observation")]
-#[derive(Clone, Debug)]
-pub(crate) struct RelayedPipe(Arc<RelayedPipeState>);
-
-#[cfg(feature = "flow-observation")]
-#[derive(Debug, Default)]
-struct RelayedPipeState {
-    accepted: std::sync::atomic::AtomicU64,
-    request: parking_lot::Mutex<Option<RelayedRequest>>,
-}
-
-#[cfg(feature = "flow-observation")]
-impl RelayedPipe {
-    pub(crate) fn new() -> Self {
-        Self(Arc::default())
-    }
-
-    /// Writer side: `write` puts bytes into the pipe.
-    pub(crate) fn poll_write(
-        &self,
-        write: impl FnOnce() -> std::task::Poll<std::io::Result<usize>>,
-    ) -> std::task::Poll<std::io::Result<usize>> {
-        use std::sync::atomic::Ordering::Relaxed;
-        let Some(request) = RequestWrite::current() else {
-            let result = write();
-            if let std::task::Poll::Ready(Ok(size)) = result {
-                self.0.accepted.fetch_add(size as u64, Relaxed);
-            }
-            return result;
-        };
-        // Held across the write so the relay cannot drain these bytes before
-        // it can see the request they belong to.
-        let mut pending = self.0.request.lock();
-        let result = write();
-        if let std::task::Poll::Ready(Ok(size)) = result
-            && size != 0
-        {
-            let end = self.0.accepted.fetch_add(size as u64, Relaxed) + size as u64;
-            request.defer(end);
-            *pending = Some(RelayedRequest { request, end });
-        }
-        result
-    }
-
-    /// Relay side, after draining the pipe's bytes through `relayed`: the
-    /// request those bytes complete, if any.
-    pub(crate) fn take(&self, relayed: u64) -> Option<RelayedRequest> {
-        let mut pending = self.0.request.lock();
-        if pending.as_ref()?.end <= relayed {
-            return pending.take();
-        }
-        None
-    }
-}
-
-/// A request whose last bytes a relay task is handing to its carrier.
-#[cfg(feature = "flow-observation")]
-#[derive(Debug)]
-pub(crate) struct RelayedRequest {
-    request: RequestWrite,
-    end: u64,
-}
-
-#[cfg(feature = "flow-observation")]
-impl RelayedRequest {
-    /// `write` must leave those bytes with the carrier, flushed: a carrier
-    /// that defers their delivery defers the request.
-    pub(crate) async fn write<T, E>(
-        self,
-        write: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
-    ) -> Result<T, E> {
-        let upper = RequestTarget::Relay(Arc::new(self.request), self.end);
-        scoped(RequestWrite::new(upper), write).await
-    }
-}
-
-/// Request delivery through a connection driver that either side of a split
-/// stream may poll: bytes queued while a request is current are written to
-/// the carrier with that request current, so the carrier can defer it, and
-/// nothing else the driver writes is attributed to the poller's request.
-#[cfg(feature = "flow-observation")]
-#[derive(Debug)]
-pub(crate) struct DriverRequest(Option<RequestWrite>);
-
-#[cfg(feature = "flow-observation")]
-impl DriverRequest {
-    pub(crate) const fn new() -> Self {
-        Self(None)
-    }
-
-    /// Before queueing bytes for the driver.
-    pub(crate) fn capture(&mut self) {
-        if let Some(request) = RequestWrite::current() {
-            self.0 = Some(request);
-        }
-    }
-
-    pub(crate) fn drive<T>(&self, poll: impl FnOnce() -> T) -> T {
-        REQUEST_WRITE.sync_scope(self.0.clone(), poll)
-    }
-
-    /// Once every queued byte has been written to the carrier and flushed.
-    pub(crate) fn release(&mut self) {
-        self.0 = None;
-    }
-}
+pub(crate) use request::{
+    DriverRequest, QuicSubmissions, RelayedPipe, RequestWrite, observe_chain_request, request_write,
+};
 
 #[expect(
     clippy::large_enum_variant,
@@ -548,7 +381,7 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
     ));
     let captured = Arc::clone(&lookups);
     let output = observer.clone();
-    let nested = FlowObserver::new(
+    let mut nested = FlowObserver::new(
         context,
         Arc::new(move |source, event| {
             if let FlowEvent::Dns(lookup) = &event
@@ -575,6 +408,8 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
             (output.callback)(source, event);
         }),
     );
+    nested.dropped = observer.dropped;
+    nested.request_lifetime = observer.request_lifetime.clone();
     let result = nested.scope(future).await;
     (result, Some(LookupSelection { observer, lookups }))
 }
@@ -704,6 +539,11 @@ mod inert {
     }
 
     #[inline]
+    pub(crate) fn without_target_milestones<F: Future>(future: F) -> F {
+        future
+    }
+
+    #[inline]
     pub fn milestone(_milestone: Milestone) {}
 
     #[derive(Clone, Debug)]
@@ -756,10 +596,18 @@ mod inert {
 
         #[inline]
         pub(crate) fn release(&mut self) {}
+
+        #[inline]
+        pub(crate) fn discard(&mut self) {}
     }
 
     #[inline]
     pub(crate) fn request_write<F: Future>(future: Pin<&mut F>) -> Pin<&mut F> {
+        future
+    }
+
+    #[inline]
+    pub(crate) fn observe_chain_request<F: Future>(future: F) -> F {
         future
     }
 
@@ -805,7 +653,10 @@ mod inert {
 #[cfg(all(not(feature = "flow-observation"), feature = "rprx"))]
 pub(crate) use inert::scope;
 #[cfg(not(feature = "flow-observation"))]
-pub(crate) use inert::{DriverRequest, RelayedPipe, is_suppressed, request_write};
+pub(crate) use inert::{
+    DriverRequest, RelayedPipe, is_suppressed, observe_chain_request, request_write,
+    without_target_milestones,
+};
 #[cfg(not(feature = "flow-observation"))]
 pub use inert::{
     FlowObserver, LookupSelection, TransportAttempt, current, milestone, observe_resolution,

@@ -11,16 +11,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub(crate) trait FlushProgress {
     fn writing(&self);
     fn flushed(&self);
+
+    #[inline]
+    fn io_failed(&self, _error: &io::Error) {}
 }
 
 pub(crate) trait DataProgress {
-    fn released(&self);
-}
-
-impl<P: DataProgress> DataProgress for Arc<P> {
-    fn released(&self) {
-        self.as_ref().released();
-    }
+    fn released(&self, remaining: usize);
 }
 
 #[derive(Debug)]
@@ -35,7 +32,9 @@ impl<P: FlushProgress> AsyncRead for TrackedIo<P> {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_read(cx, buf)
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map(|result| result.inspect_err(|error| self.progress.io_failed(error)))
     }
 }
 
@@ -46,7 +45,9 @@ impl<P: FlushProgress> AsyncWrite for TrackedIo<P> {
         bytes: &[u8],
     ) -> Poll<io::Result<usize>> {
         self.progress.writing();
-        Pin::new(&mut self.inner).poll_write(cx, bytes)
+        Pin::new(&mut self.inner)
+            .poll_write(cx, bytes)
+            .map(|result| result.inspect_err(|error| self.progress.io_failed(error)))
     }
     fn poll_write_vectored(
         mut self: Pin<&mut Self>,
@@ -54,18 +55,23 @@ impl<P: FlushProgress> AsyncWrite for TrackedIo<P> {
         bytes: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         self.progress.writing();
-        Pin::new(&mut self.inner).poll_write_vectored(cx, bytes)
+        Pin::new(&mut self.inner)
+            .poll_write_vectored(cx, bytes)
+            .map(|result| result.inspect_err(|error| self.progress.io_failed(error)))
     }
     fn is_write_vectored(&self) -> bool {
         self.inner.is_write_vectored()
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        ready!(Pin::new(&mut self.inner).poll_flush(cx))?;
+        ready!(Pin::new(&mut self.inner).poll_flush(cx))
+            .inspect_err(|error| self.progress.io_failed(error))?;
         self.progress.flushed();
         Poll::Ready(Ok(()))
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
+        Pin::new(&mut self.inner)
+            .poll_shutdown(cx)
+            .map(|result| result.inspect_err(|error| self.progress.io_failed(error)))
     }
 }
 
@@ -91,6 +97,6 @@ impl<P: DataProgress> Buf for QueuedData<P> {
 
 impl<P: DataProgress> Drop for QueuedData<P> {
     fn drop(&mut self) {
-        self.progress.released();
+        self.progress.released(self.bytes.len());
     }
 }

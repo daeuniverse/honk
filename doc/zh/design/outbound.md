@@ -118,6 +118,7 @@ native socket 包在 `PacketTransport` 后面；tunnel 协议在自己的真实 
 | AnyTLS | `network` 缺省或包含 `udp` 时 | 否 | 否 | `AnyTls` | `anytls` |
 | Direct | 是 | 否 | 否 | `None` | 无 |
 | Block | 否 | 否 | 是 | `None` | 无 |
+| Chain | 否 | 否 | 否 | `None` | 无 |
 
 Ready-stream pooling 保存已完成、已绑定目标的握手。Bare-TCP pooling 只保存已经连
 到代理服务器的 socket，目标握手留给之后的 `dial_with_tcp` 完成。TCP multiplex 和
@@ -161,6 +162,7 @@ capability 拒绝，调用方可以继续回退到配置中的冷候选。显式
 | `anytls` | AnyTLS 逻辑 stream | UoT v2 逻辑 stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagram 或 uni-stream fallback |
 | `juicity` | Juicity QUIC stream | 每个客户端源一条长度分帧 QUIC bi stream，承载所有目的地 |
+| `chain` | 经各跳的 handler 逐跳拨号；见[链式节点](#链式节点) | 没有 packet slot；只支持 TCP |
 
 Shadowsocks 的传统 AEAD 和 2022 版本用一个 `MultiTargetTransport` 承载同一客户端
 source 的所有目的地。它只有一个连到服务端的带 mark socket 和一份加密状态。2022
@@ -291,6 +293,10 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 把显式 `sni`、WebSocket `Host` 授权（去掉端口）、节点主机名作为 SNI：CDN 前置节点
 以边缘 IP 为地址，分发域名只出现在该 header 中。因此，同一条共享路径为 Trojan、
 VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立过程。
+
+如果物理 WebSocket 连接的对端先正常关闭，VMess 就无法再发送空的上行结束记录。
+只有在完整响应通过校验、所有业务字节都已转发时，中继才将其视为正常结束。
+未发送的结束记录不会计为已发送；连接仍可写时，仍须发送并刷出该记录。
 
 Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
 
@@ -997,6 +1003,33 @@ setup 或破坏逻辑 stream 之前失败。这样既避免了一次原本为空
 即 `confirmed`；稳态发送只入队，`admitted` 在 frame 进入 session writer 队列时设
 置。队列和 credit 上限仍是单个 transport 的上限，因此队列饱和或 EOF 会退役共享该
 SID 的所有目的地。域名目标流，即 `RewriteTo`，仍按原始目的地各自成 scope。
+
+## 链式节点
+
+链式节点（`OutboundConfig::Chain`）经同一 generation 中的其他节点拨号；语法、校验与限制见[节点参考](../reference/nodes.md#链式节点)。
+`ProxyRegistry::default_resolver` 最后注册 `ChainHandler`（`src/proxy/chain.rs`），并把此前注册的每个协议的 TCP handler 交给它，
+因此每一跳使用的都是 registry 分派时的同一个 handler 实例。
+
+静态节点和订阅节点组装后，配置准入将各跳的名称绑定为有序实体节点 ID，并由 `Node::derive_id()` 派生链 ID。
+runtime 准入校验这些绑定。`build_reusing_with_admission` 先构建或复用实体节点，再按绑定的 ID 取本代 runtime 组装链。
+每代都重建链的 runtime，DNS runtime 分叉走同一路径。没有 generation runtime 的普通 `dial` 拒绝链式节点。
+
+`ChainHandler::dial_runtime` 逐跳拨号：
+
+1. 入口用它原本的 `dial_runtime` 连接第二跳的服务器。服务器是 IP 时直接作为地址传入；
+   是域名时放进 `target_domain`，地址只携带端口、IP 为未指定地址，由入口的服务器解析，与其他经代理的目标域名相同。
+2. 之后每一跳在前面各跳建立的 stream 上调用 `dial_over`。只有最后一跳以真正的目的地为目标。
+3. 每跳的任务和传输质量证据归该跳的 runtime。入口可按原协议复用会话，后续各跳使用传入的流，因此只有入口可能新建物理连接并占用物理拨号额度。链自身的 `TransportQuality` 为空。
+
+整条链及其重试共用从首次尝试开始计算的绝对期限 `connect_timeout × 3`，与调用方的单候选上限相同。传入每跳的基础预算为剩余时间与 `connect_timeout` 中较小者。协议仍可应用自身规则，例如 REALITY 的三倍预算，外层期限继续约束整个链拨号。超期返回超时 I/O 错误。
+
+链在 `without_target_milestones` 中运行出口之前的各跳，屏蔽它们的 `TargetRequestSent` 和 `TargetConfirmed`，保留 `TransportAttached`、`TransportReady` 等传输事件。`TransportAttached` 对应实体入口的物理连接。
+末跳的 `TargetRequestSent` 跟随请求穿过 WS、VMess 中继和 gRPC 驱动。入口为 Hysteria2、TUIC 或 Juicity 时，必须确认本请求在该 QUIC 流上已接受的所有字节区间都已提交给本地 UDP 套接字；对端 ACK 或其他流的数据报不能替代这项证据。若提交结果不确定（包括与请求交错写出的控制帧），即使对端收到了数据，也可能没有这条记录；不会因此重发。首跳 AnyTLS、VLESS 多路复用和 XHTTP 仍可在会话写入器接受字节时报告交付。`TargetConfirmed` 仍须由协议确认目标。
+启用观测时，Hysteria2 仍在一次写入中提交待写的协议头和首段负载。回执只跟踪已接受的负载字节；仅发出协议头不能算作末跳请求已发送。
+
+出口之前的某一跳拒绝连接下一跳时，失败归于链式节点。即使拒绝延迟到后续的读、写、刷新缓冲区或关闭流时才返回，也会保留出错的跳、原始 I/O 错误及同一次共享失败的标识。出口对实际目的地的拒绝仍是目标失败。本地策略拒绝、容量不足和取消保留各自的分类。
+
+只有经隧道拨号的一跳返回 `RealityMaskCertificate` 才触发整链重拨。从入口重试一次，关闭 hybrid key share。失败尝试交还载体和它所持的物理拨号额度，下一次尝试独立获取和持有额度，并沿用原始拨号的准入范围、固定地址、开始时间、进度和绝对期限。入口自身的 REALITY 重试仍由它的 `dial_runtime` 处理。
 
 ## 冷 URLTest speculative preparation
 

@@ -74,9 +74,29 @@ impl QuicBiStream {
         &mut self,
         cx: &mut Context<'_>,
         chunks: &mut [Bytes],
+        unobserved_prefix: usize,
     ) -> Poll<io::Result<usize>> {
         use std::future::Future;
 
+        #[cfg(feature = "flow-observation")]
+        if let Some(request) = crate::runtime::flow_observation::RequestWrite::current() {
+            // Hy2's lazy opener belongs to the intermediate hop. Only the accepted suffix
+            // can provide evidence for the final request.
+            let (written, receipt) = std::task::ready!(
+                std::pin::pin!(
+                    self.send
+                        .write_chunks_with_receipt_after(chunks, unobserved_prefix)
+                )
+                .poll(cx)
+            )
+            .map_err(|error| quic_carrier_io_error(io::Error::other(error)))?;
+            if written.bytes > unobserved_prefix {
+                request.track(receipt);
+            }
+            return Poll::Ready(Ok(written.bytes));
+        }
+        #[cfg(not(feature = "flow-observation"))]
+        let _ = unobserved_prefix;
         let result = std::pin::pin!(self.send.write_chunks(chunks)).poll(cx);
         result.map(|result| {
             result
@@ -111,6 +131,16 @@ impl AsyncWrite for QuicBiStream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        #[cfg(feature = "flow-observation")]
+        if let Some(request) = crate::runtime::flow_observation::RequestWrite::current() {
+            let (n, receipt) =
+                std::task::ready!(std::pin::pin!(self.send.write_with_receipt(buf)).poll(cx))
+                    .map_err(|error| quic_carrier_io_error(error.into()))?;
+            if n != 0 {
+                request.track(receipt);
+            }
+            return Poll::Ready(Ok(n));
+        }
         AsyncWrite::poll_write(Pin::new(&mut self.send), cx, buf).map_err(quic_carrier_io_error)
     }
 

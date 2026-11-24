@@ -704,7 +704,7 @@ cargo run --release -p honk-core -- \
 
 ## 目前 capability 與限制
 
-- 出站支援 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。
+- 出站支援 Direct、Block、SOCKS5、Shadowsocks/2022、Trojan、AnyTLS、Hysteria2、TUIC、Juicity、VMess 和 VLESS。[鏈式節點](reference/nodes.md#鏈式節點)僅支援 TCP，由兩到四個代理節點組成，各跳須符合連結所列的協定和位置限制。
 - UDP 支援 Direct、SOCKS5、Shadowsocks、Trojan、AnyTLS、Hysteria2、TUIC、Juicity，以及獨立 packet permission 已開啟的 VLESS。VLESS 的回退編碼和多工 carrier 是兩個獨立選擇；VMess 仍只支援 TCP。見 [VLESS 節點參考](reference/nodes.md#vless-udp-and-multiplexing)。
 - 群組支援 Selector、URLTest、LoadBalance、Fallback 和 Score。
 - DNS 上游支援 UDP、TCP、DoT、DoH、DoH3 和 DoQ，也可經由 node/group 出站。

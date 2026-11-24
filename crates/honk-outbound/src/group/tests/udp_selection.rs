@@ -251,7 +251,7 @@ fn score_udp_capability_filters_selection_verification_and_nested_finals() {
     let groups = [score, incapable, terminal, parent];
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
 
     for alive_set in [Some(alive), None] {
@@ -330,7 +330,7 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["selector"]);
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
     for alive_set in [Some(alive), None] {
         let manager =
@@ -873,4 +873,26 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     let manager = GroupManager::new(&chain, &[]);
     assert_udp_selection(&manager, "level-0", None);
     assert_udp_selection(&manager, "level-1", Some("direct"));
+}
+
+#[test]
+fn udp_selection_skips_chain_nodes() {
+    let front = make_node(nid("front"), "front");
+    let mut chain = make_node(nid("via"), "via");
+    chain.outbound = Node::chain(&chain.name, vec!["front".into(), "land".into()]).outbound;
+    let nodes = vec![chain.clone(), front.clone()];
+    let m = GroupManager::with_alive_set(
+        &[make_group(
+            "relay",
+            GroupPolicy::Fallback,
+            vec![chain.id, front.id],
+        )],
+        &nodes,
+        None,
+    );
+    for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+        assert!(!m.is_node_selectable_for_domain(chain.id, domain, IpVersion::V4));
+        assert!(m.is_node_selectable_for_domain(front.id, domain, IpVersion::V4));
+    }
+    assert!(m.is_node_selectable_for_domain(chain.id, ProbeDomain::Tcp, IpVersion::V4));
 }

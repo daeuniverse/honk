@@ -1,3 +1,6 @@
+use std::io;
+use std::sync::Arc;
+
 /// A proxy's explicit failure to open the requested target, not its carrier.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -8,6 +11,57 @@ pub struct TargetFailure(#[source] pub anyhow::Error);
 #[error("{0}")]
 pub struct NodeFailure(#[source] pub anyhow::Error);
 
+/// A target refusal from a hop that was asked to reach the next proxy.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum IntermediateTargetFailure {
+    #[error("chain hop {hop} could not reach the next hop: {cause}")]
+    Dial {
+        hop: usize,
+        #[source]
+        cause: anyhow::Error,
+    },
+    #[error("chain hop {hop} could not reach the next hop: {cause}")]
+    Io {
+        hop: usize,
+        #[source]
+        cause: Arc<io::Error>,
+    },
+}
+
+impl IntermediateTargetFailure {
+    pub(super) fn dial(hop: usize, error: anyhow::Error) -> anyhow::Error {
+        if !is_packet_rejection(&error) && target_failure(&error) {
+            Self::Dial { hop, cause: error }.into()
+        } else {
+            error
+        }
+    }
+
+    /// Preserve typed causes while the intermediate boundary owns the I/O error.
+    pub(super) fn io(hop: usize, error: io::Error) -> io::Error {
+        if io_packet_rejection(&error).is_none() && io_target_failure(&error) {
+            io::Error::new(
+                error.kind(),
+                Self::Io {
+                    hop,
+                    cause: Arc::new(error),
+                },
+            )
+        } else if let Some(cause) = error.get_ref()
+            && !cause.is::<crate::SharedError>()
+            && !cause.is::<IntermediateTargetFailure>()
+            && !cause.is::<Arc<io::Error>>()
+            && io_node_failure(&error)
+        {
+            // TLS and h2 can only borrow this error before reducing it to text.
+            // This copyable wrapper adds no episode to an independent failure.
+            io::Error::new(error.kind(), Arc::new(error))
+        } else {
+            error
+        }
+    }
+}
+
 /// A protocol or transport whose handshake cannot run over a stream tunneled
 /// through an earlier hop.
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
@@ -17,11 +71,21 @@ pub struct TunnelUnsupported(pub &'static str);
 fn next_cause<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> Option<&'a (dyn std::error::Error + 'static)> {
-    error
-        .downcast_ref::<std::io::Error>()
-        .and_then(|error| error.get_ref())
-        .map(|source| source as &(dyn std::error::Error + 'static))
-        .or_else(|| error.source())
+    if let Some(error) = error.downcast_ref::<io::Error>()
+        && let Some(source) = error.get_ref()
+    {
+        return Some(source);
+    }
+    // Arc's Error::source skips the payload, and h2 exposes no I/O cause there.
+    if let Some(error) = error.downcast_ref::<Arc<io::Error>>() {
+        return Some(error.as_ref());
+    }
+    if let Some(error) = error.downcast_ref::<h2::Error>()
+        && let Some(source) = error.get_io()
+    {
+        return Some(source);
+    }
+    error.source()
 }
 
 fn find_cause<'a, T: std::error::Error + 'static>(
@@ -42,9 +106,18 @@ pub(crate) fn node_failure_episode(
     mut error: &(dyn std::error::Error + 'static),
 ) -> Option<Option<u64>> {
     let mut episode = None;
+    let mut node = None;
+    let mut intermediate = false;
     loop {
-        if error.is::<NodeFailure>() {
+        // Codecs can add node context before the original shared refusal.
+        // Keep its episode when the target was another hop of the chain.
+        intermediate |= error.is::<IntermediateTargetFailure>();
+        if intermediate && error.is::<TargetFailure>() {
             return Some(episode);
+        }
+        // A codec can also wrap a lower node marker that owns the actual episode.
+        if error.is::<NodeFailure>() {
+            node = Some(episode);
         }
         if let Some(fanout) = error
             .downcast_ref::<crate::SharedError>()
@@ -52,26 +125,75 @@ pub(crate) fn node_failure_episode(
         {
             episode = Some(fanout);
         }
-        error = next_cause(error)?;
+        let Some(cause) = next_cause(error) else {
+            return node;
+        };
+        error = cause;
+    }
+}
+
+fn is_target_failure(mut error: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if error.is::<TargetFailure>() {
+            return true;
+        }
+        if error.is::<IntermediateTargetFailure>() {
+            return false;
+        }
+        let Some(cause) = next_cause(error) else {
+            return false;
+        };
+        error = cause;
     }
 }
 
 /// Recover target provenance through anyhow, I/O and shared error wrappers.
 pub fn target_failure(error: &anyhow::Error) -> bool {
-    find_cause::<TargetFailure>(error.as_ref()).is_some()
+    is_target_failure(error.as_ref())
 }
 
 pub(crate) fn io_target_failure(error: &std::io::Error) -> bool {
-    find_cause::<TargetFailure>(error).is_some()
+    is_target_failure(error)
 }
 
 /// Recover explicit carrier provenance without inferring it from error text.
 pub fn node_failure(error: &anyhow::Error) -> bool {
-    find_cause::<NodeFailure>(error.as_ref()).is_some()
+    node_failure_episode(error.as_ref()).is_some()
 }
 
 pub(crate) fn io_node_failure(error: &std::io::Error) -> bool {
-    find_cause::<NodeFailure>(error).is_some()
+    node_failure_episode(error).is_some()
+}
+
+/// Recover an owned copy of a shareable typed cause from borrowed I/O.
+pub(crate) fn retain_typed_io_error(error: &io::Error) -> Option<io::Error> {
+    let kind = error.kind();
+    let mut source: &(dyn std::error::Error + 'static) = error;
+    loop {
+        if let Some(cause) = source.downcast_ref::<crate::SharedError>() {
+            return Some(io::Error::new(kind, cause.clone()));
+        }
+        if let Some(cause) = source.downcast_ref::<Arc<io::Error>>()
+            && io_node_failure(cause)
+        {
+            return Some(io::Error::new(kind, Arc::clone(cause)));
+        }
+        if let Some(IntermediateTargetFailure::Io { hop, cause }) =
+            source.downcast_ref::<IntermediateTargetFailure>()
+        {
+            return Some(io::Error::new(
+                kind,
+                IntermediateTargetFailure::Io {
+                    hop: *hop,
+                    cause: Arc::clone(cause),
+                },
+            ));
+        }
+        if let Some(rejection) = source.downcast_ref::<PacketRejection>() {
+            return Some(io::Error::new(kind, *rejection));
+        }
+        source = next_cause(source)?;
+    }
 }
 
 /// Whether any cause of `error`, including one inside an `io::Error`, is a

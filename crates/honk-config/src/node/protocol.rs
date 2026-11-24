@@ -21,6 +21,13 @@ pub struct TlsOptions {
     pub alpn: Vec<String>,
 }
 
+/// DNS can publish an ECHConfigList for a hostname, not an IP literal.
+pub fn ech_discovery_name(server_name: &str) -> Option<&str> {
+    let name = server_name.trim_end_matches('.');
+    let host = name.trim_start_matches('[').trim_end_matches(']');
+    (!name.is_empty() && host.parse::<std::net::IpAddr>().is_err()).then_some(name)
+}
+
 impl TlsOptions {
     /// Resolve key presence without turning incomplete REALITY intent into ordinary TLS.
     /// Decoding the key and short ID belongs to the outbound handshake parser.
@@ -35,6 +42,10 @@ impl TlsOptions {
     /// True when the dial speaks TLS or authenticated REALITY.
     pub fn is_secure(&self) -> bool {
         self.enabled || matches!(self.effective_reality_public_key(), Ok(Some(_)))
+    }
+
+    pub fn uses_ech_discovery(&self) -> bool {
+        self.ech_enabled && self.ech_config.is_none() && self.ech_config_path.is_none()
     }
 
     pub(super) fn check_xhttp_alpn(&self) -> Result<(), &'static str> {
@@ -243,6 +254,22 @@ pub struct AnyTlsConfig {
     pub tls: TlsOptions,
 }
 
+/// A chain declaration and its snapshot-local binding, both entry first.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChainConfig {
+    pub(super) hops: Vec<String>,
+    pub(super) resolved: Option<std::sync::Arc<[uuid::Uuid]>>,
+}
+
+impl ChainConfig {
+    pub(super) fn new(hops: Vec<String>) -> Self {
+        Self {
+            hops,
+            resolved: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboundConfig {
     Shadowsocks(ShadowsocksConfig),
@@ -256,6 +283,7 @@ pub enum OutboundConfig {
     AnyTls(AnyTlsConfig),
     Direct,
     Block,
+    Chain(ChainConfig),
 }
 
 impl Default for OutboundConfig {
@@ -278,6 +306,7 @@ impl OutboundConfig {
             NodeProtocol::AnyTLS => Self::AnyTls(AnyTlsConfig::default()),
             NodeProtocol::Direct => Self::Direct,
             NodeProtocol::Block => Self::Block,
+            NodeProtocol::Chain => Self::Chain(ChainConfig::new(Vec::new())),
         }
     }
 
@@ -294,6 +323,7 @@ impl OutboundConfig {
             Self::AnyTls(_) => NodeProtocol::AnyTLS,
             Self::Direct => NodeProtocol::Direct,
             Self::Block => NodeProtocol::Block,
+            Self::Chain(_) => NodeProtocol::Chain,
         }
     }
 
@@ -306,7 +336,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&config.quic.tls),
             Self::Juicity(config) => Some(&config.quic.tls),
             Self::AnyTls(config) => Some(&config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 
@@ -319,7 +353,11 @@ impl OutboundConfig {
             Self::Tuic(config) => Some(&mut config.quic.tls),
             Self::Juicity(config) => Some(&mut config.quic.tls),
             Self::AnyTls(config) => Some(&mut config.tls),
-            Self::Shadowsocks(_) | Self::Socks5(_) | Self::Direct | Self::Block => None,
+            Self::Shadowsocks(_)
+            | Self::Socks5(_)
+            | Self::Direct
+            | Self::Block
+            | Self::Chain(_) => None,
         }
     }
 
@@ -347,6 +385,14 @@ impl OutboundConfig {
             Self::Vmess(config) => config.network.as_deref(),
             Self::Vless(config) => config.network.as_deref(),
             Self::AnyTls(config) => config.network.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Hop names of a proxy chain, entry first.
+    pub fn chain_hops(&self) -> Option<&[String]> {
+        match self {
+            Self::Chain(config) => Some(&config.hops),
             _ => None,
         }
     }
@@ -392,7 +438,7 @@ impl OutboundConfig {
                 config.password.as_deref().unwrap_or(""),
             ]),
             Self::AnyTls(config) => identity_join(&[config.password.as_deref().unwrap_or("")]),
-            Self::Direct | Self::Block => String::new(),
+            Self::Direct | Self::Block | Self::Chain(_) => String::new(),
         }
     }
 

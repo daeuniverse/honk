@@ -289,11 +289,10 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
    完整的 256 位谓词值，把生成函数挂到每个相关 target，最后切换
    `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活会用自己的 backend 重置 mode；
    用户态接着在同一串行边界内发布替代的 outbound registry、DNS runtime pointer、
-   Router、配置、组和 projection snapshot。root 已经提交之后，如果 mode reset 失
-   败，就把新 generation 提交为 degraded，并保持 admission fence。发布完成后，退
-   役旧 generation，替换它的 UDP 与 Selector warm coordinator，并同步健康检查节
-   点、URLTest 组和自定义组的检查 URL。已经提交但处于 degraded 的 generation 也
-   会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
+   Router、配置、组和 projection snapshot。节点的健康检查登记与运行时注册表一起发布。
+   root 已提交后，mode reset 失败会把新 generation 标为 degraded 并保持 admission fence。
+   发布完成后，退役旧 generation，替换 UDP 与 Selector warm coordinator，并同步 URLTest 组和自定义检查 URL。
+   已提交的 degraded generation 也会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
    赖另一个 coordinator 的 retention-reconciliation 等待；coordinator 退出之前，
    仍会 abort 并 join 自己派发的子任务。QUIC warm 释放和终止关闭在 client 槽位上
    串行，即使没启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能
@@ -301,6 +300,8 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
 5. 开放 pending admission，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
 `control/reload/transaction.rs` 在候选准备和提交之外持有 `reload_lock`。新 generation 发布时，依次取得 `router` → `config` → `datapath_flags.publication()`，这一项只在原生显式源激活时取，然后是 `ebpf`；随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 会等到 backend staging 完成后再取，紧挨着 registry 权限替换之前，并一直持有到原来的 DNS pointer 提交点。所以 backend staging 不再占着 provider admission 锁，而 registry 转移、回调安装和 Score 权限发布仍会阻止新的旧 generation DNS admission。原生 no-op 激活取 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 的独立 mode/fence 更新按 flags mutex → `ebpf` 取锁；`reset_for_activation` 不会重新取这两个锁，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 之外运行。这里只是记录现有的锁边，不代表允许新增锁边；改动仍要遵守 CONTRIBUTING §2/§11 和人工审查。
+
+完整重载在持有运行时注册表和 provider 发布锁时取得健康登记写锁。单独重建组则先释放注册表读锁，再在组管理器写锁内取得健康登记写锁。Clash 延迟测量完成时依次核对物理运行时和健康登记，释放两把锁后才通知健康状态变更，并在反馈前重新核对权限。只有原组管理器仍在使用时，URLTest 才能重选成员。
 
 `RoutingPushPlan::compile` 是唯一一条用户态 lowering 路径；调用方不选 slot，也没有独立的 domain-publication 握手。`routing_policy.rs` 的 ABI 是：`RoutingInput` 128 字节、`RoutingDecision` 24 字节、`RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取之前检查 `pname_len`，以符合 6.12 的 verifier。已加载路由 slot 的 BTF 必须暴露当前的输出布局。
 

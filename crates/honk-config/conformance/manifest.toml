@@ -612,6 +612,17 @@ compare = "equal"
 unknown_sections = 0
 
 [[case]]
+id = "dialect-entries-06-proxy-chain"
+input = "crates/honk-config/conformance/cases/dialect/dialect-entries-06-proxy-chain.dae"
+layer = "typed:two_to_four_hop_chains_parse_in_entry_to_exit_order"
+honk = "accept"
+dae = "reject"
+honk_diagnostics = []
+compare = "equal"
+unknown_sections = 0
+reason = "A node entry may list named TCP hops in order; the pinned dae parser rejects the arrow."
+
+[[case]]
 id = "dialect-routing-01-geosite-prefix"
 input = "crates/honk-config/conformance/cases/dialect/dialect-routing-01-geosite-prefix.dae"
 layer = "structure"

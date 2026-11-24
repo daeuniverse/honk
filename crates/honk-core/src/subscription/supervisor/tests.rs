@@ -2,6 +2,8 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+mod chain;
+
 fn authorized(id: uuid::Uuid, revision: u64, url: String) -> AuthorizedSubscription {
     AuthorizedSubscription {
         subscription: Subscription {

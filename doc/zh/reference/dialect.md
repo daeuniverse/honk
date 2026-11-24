@@ -42,6 +42,7 @@ honk 使用 dae 配置语法的一个方言。同一段文本在两者中解析�
 | 订阅块：`paid: {` 之后各占一行的 `url: …`、`ua: …`、`interval: …` 与 `}` | `ID ':' '{'` 不是声明 | honk 扩展：订阅也可以写成块，设置和其他块一样每行一条。 | [dialect-entries-04-block](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-04-block.dae) |
 | 带引号的订阅链接后接块：`paid: 'url' {` 之后各占一行的 `ua: …`、`interval: …`、`cache: …` 或 `route: …` 与 `}` | `ID ':' literal` 已结束声明 | honk 扩展：条目选项，未设置的项取 `assets.subscription` 和 `assets.route`。`route` 取代旧块形式里的 `download_detour`；两者同时设置会报 `conflicting-subscription-route`。 | |
 | `node` 里冒号前带空格的裸标签，`edge : 'socks5://…'` | 标签为 `edge` | 冒号两侧的空白会被规范化：节点保留下来，标签为 `edge`，并产生 `entry-tag-normalized` 信息级诊断。`edge: …` 和带引号的标签也仍然接受。 | [dialect-entries-05-spaced-tag](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-05-spaced-tag.dae) |
+| 链式节点，`via: front -> land` | 在 `->` 处报语法错误；节点值只能是一个字面量 | honk 扩展。引号外的 `->` 让条目成为按入口到出口顺序列出节点名的[链式节点](./nodes.md#链式节点)；跳名含 `->`、`://` 或空白之后的 `#` 时加引号。值中有引号外的 `://` 时仍是分享链接。 | [dialect-entries-06-proxy-chain](../../../crates/honk-config/conformance/cases/dialect/dialect-entries-06-proxy-chain.dae)、[链式节点测试](../../../crates/honk-config/tests/chain.rs) |
 | VLESS 分享链接或扁平序列化 VLESS 节点中的 `vless_mode` | 旧 VLESS mode 选择器 | 已移除，不接受为别名。分享链接要改用独立的 `udp=`、`packetEncoding=` 和 `mux=` query 参数。扁平 VLESS 节点拒绝任何形式的 `vless_mode`，包括 `null`，请改用 `network`、`packet_encoding` 和 `multiplex`。 | |
 | 扁平序列化非 VLESS 节点上的 `vless_mode: legacy` | VLESS 之外的旧字段 | 这只是序列化适配器读写用的兼容占位字段，不影响行为。它是非 VLESS 序列化中唯一的例外，不属于文档支持的 dae 语法或分享链接语法。 | |
 

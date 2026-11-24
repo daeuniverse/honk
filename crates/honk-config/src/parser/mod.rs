@@ -703,6 +703,7 @@ fn parse_documents(
         &mut config.groups,
         &config.nodes,
         &config.subscriptions,
+        true,
         Some(diagnostics),
     );
 
@@ -720,7 +721,16 @@ fn parse_documents(
 /// into `Group.groups` at parse time.
 pub fn resolve_group_filters(groups: &mut [Group], nodes: &[Node], subscriptions: &[Subscription]) {
     // Runtime re-resolution: the filters were reported when the config was parsed.
-    resolve_group_filters_inner(groups, nodes, subscriptions, None);
+    resolve_group_filters_inner(groups, nodes, subscriptions, true, None);
+}
+
+/// Resolve filters and source-derived wildcards while retaining explicit member lists.
+pub fn resolve_programmatic_groups(
+    groups: &mut [Group],
+    nodes: &[Node],
+    subscriptions: &[Subscription],
+) {
+    resolve_group_filters_inner(groups, nodes, subscriptions, false, None);
 }
 
 /// Normalize a geosite list name.

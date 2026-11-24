@@ -3,6 +3,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use honk_config::dns::DnsStrategy;
+use honk_outbound::bootstrap::{self, BootstrapResolver};
 use tracing::debug;
 
 use super::{DnsService, DnsServiceBackend, OperationToken};
@@ -74,17 +75,43 @@ pub(crate) struct PinnedNameResolver {
     service: DnsService,
     runtime: Option<crate::dns::runtime::RuntimeLease>,
     forwarder: Arc<DnsForwarder>,
+    bootstrap: Option<BootstrapResolver>,
 }
 
 #[cfg(feature = "native-api")]
 impl PinnedNameResolver {
-    /// Resolve through the captured generation and, when it cannot answer,
-    /// through bootstrap DNS as [`DnsService::resolve_name`] does.
-    pub(crate) async fn resolve(&self, domain: &str) -> anyhow::Result<Vec<IpAddr>> {
-        let domain = normalize_domain(domain)?;
-        if let Ok(ip) = domain.parse::<IpAddr>() {
-            return Ok(vec![ip]);
+    async fn resolve_pinned_alias(&self, alias: NodeHostAlias) -> anyhow::Result<Vec<IpAddr>> {
+        resolve_alias(
+            &self.forwarder,
+            alias,
+            || self.bootstrap,
+            async |target, upstream| {
+                resolve_claimed(&self.service, &self.forwarder, target, upstream).await
+            },
+        )
+        .await
+    }
+
+    fn select_fallback_families(
+        &self,
+        domain: &str,
+        mut addresses: Vec<IpAddr>,
+    ) -> anyhow::Result<Vec<IpAddr>> {
+        addresses.retain(|ip| match self.forwarder.strategy {
+            DnsStrategy::Ipv4Only => ip.is_ipv4(),
+            DnsStrategy::Ipv6Only => ip.is_ipv6(),
+            _ => true,
+        });
+        if addresses.is_empty() {
+            return Err(NameResolutionError::NoAddresses {
+                domain: domain.to_owned(),
+            }
+            .into());
         }
+        Ok(addresses)
+    }
+
+    async fn resolve_unclaimed(&self, domain: &str) -> anyhow::Result<Vec<IpAddr>> {
         let mut responses = FamilyResponses {
             ipv4_eligible: self.forwarder.strategy != DnsStrategy::Ipv6Only,
             ipv6_eligible: self.forwarder.strategy != DnsStrategy::Ipv4Only,
@@ -92,13 +119,12 @@ impl PinnedNameResolver {
             ipv6: None,
         };
         if responses.ipv4_eligible {
-            responses.ipv4 = Some(self.resolve_family(&domain, 1).await);
+            responses.ipv4 = Some(self.resolve_family(domain, 1).await);
         }
         if responses.ipv6_eligible {
-            responses.ipv6 = Some(self.resolve_family(&domain, 28).await);
+            responses.ipv6 = Some(self.resolve_family(domain, 28).await);
         }
         let responses = responses.fail_on_packet_rejection()?;
-        let (ipv4_eligible, ipv6_eligible) = (responses.ipv4_eligible, responses.ipv6_eligible);
         let answered = responses
             .ipv4
             .iter()
@@ -109,43 +135,85 @@ impl PinnedNameResolver {
             addresses.extend_from_slice(outcome.answer_ips());
         }
         if !answered {
-            addresses = self
-                .service
-                .operation()
-                .run(honk_outbound::bootstrap::resolve(&domain))
-                .await?
-                .map_err(|source| NameResolutionError::Bootstrap {
-                    domain: domain.clone(),
-                    source: source.into(),
-                })?;
-            addresses.retain(|ip| {
-                if ip.is_ipv4() {
-                    ipv4_eligible
-                } else {
-                    ipv6_eligible
-                }
-            });
-            if addresses.is_empty() {
-                return Err(NameResolutionError::NoAddresses { domain }.into());
-            }
+            let addresses = match self.forwarder.node_host_alias(domain)? {
+                Some(alias) => self.resolve_pinned_alias(alias).await?,
+                None => resolve_bootstrap(self.bootstrap, domain).await?,
+            };
+            return self.select_fallback_families(domain, addresses);
         }
         Ok(addresses)
     }
 
-    /// A node server host: through its claiming `subtag()` rule in the
-    /// captured generation, else like [`Self::resolve`].
+    /// One captured generation owns the lookup through any bootstrap fallback.
     pub(crate) async fn resolve_node_server(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
         let domain = normalize_domain(host)?;
-        let Some(upstream) = claimed_upstream(&self.forwarder, &domain) else {
-            return self.resolve(host).await;
-        };
-        let resolve = resolve_claimed(&self.service, &self.forwarder, &domain, upstream);
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(vec![ip]);
+        }
+        self.resolve_domain(&domain, false).await
+    }
+
+    pub(crate) async fn resolve_physical_server(
+        &self,
+        host: &str,
+        destination_ip: Option<IpAddr>,
+    ) -> anyhow::Result<Option<IpAddr>> {
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            return Ok(Some(ip.to_canonical()));
+        }
+        // Only a hosts alias can give a shared hostname different DNS authority
+        // from its lookup as a destination.
+        if let Some(ip) = destination_ip
+            && !self.forwarder.has_hosts_aliases()
+        {
+            return Ok(Some(ip));
+        }
+        let domain = normalize_domain(host)?;
+        if let Ok(ip) = domain.parse::<IpAddr>() {
+            return Ok(Some(ip.to_canonical()));
+        }
+        if let Some(ip) = destination_ip
+            && !self.forwarder.is_hosts_alias(&domain)
+        {
+            return Ok(Some(ip));
+        }
+        let addresses = self.resolve_domain(&domain, true).await?;
+        Ok(addresses.first().map(IpAddr::to_canonical))
+    }
+
+    async fn resolve_domain(&self, domain: &str, alias_first: bool) -> anyhow::Result<Vec<IpAddr>> {
+        let mut operation = self.service.operation();
+        let claim = || claimed_upstream(&self.forwarder, domain);
+        // Destinations select before admission; a physical alias selects its own target instead.
+        let destination_claim = (!alias_first).then(claim);
+        let lookup = std::pin::pin!(async {
+            if alias_first && let Some(alias) = self.forwarder.node_host_alias(domain)? {
+                let addresses = self.resolve_pinned_alias(alias).await?;
+                return self.select_fallback_families(domain, addresses);
+            }
+            match destination_claim.unwrap_or_else(claim) {
+                Some(upstream) => {
+                    resolve_claimed(&self.service, &self.forwarder, domain, upstream).await
+                }
+                None => self.resolve_unclaimed(domain).await,
+            }
+        });
+        let resolve = std::pin::pin!(operation.run(lookup));
         match &self.runtime {
             Some(runtime) => {
-                let _permit = runtime.runtime().try_acquire_query()?;
-                runtime.run(std::pin::pin!(resolve)).await?
+                use honk_outbound::proxy::PacketRejection;
+                use tokio::sync::TryAcquireError;
+                let _permit =
+                    runtime
+                        .runtime()
+                        .try_acquire_query()
+                        .map_err(|error| match error {
+                            TryAcquireError::NoPermits => PacketRejection::Capacity,
+                            TryAcquireError::Closed => PacketRejection::Cancelled,
+                        })?;
+                runtime.run(resolve).await??
             }
-            None => resolve.await,
+            None => resolve.await?,
         }
     }
 
@@ -155,28 +223,23 @@ impl PinnedNameResolver {
         qtype: u16,
     ) -> anyhow::Result<crate::dns::outcome::DnsOutcome> {
         let query = build_dns_query(domain, qtype);
-        let mut operation = self.service.operation();
-        let resolve = self.forwarder.resolve_outcome_with_context_and_profile(
-            &query,
-            DnsRequestMeta::EMPTY,
-            IngressProfile::Api,
-        );
-        let outcome = match &self.runtime {
-            Some(runtime) => {
-                let _permit = runtime.runtime().try_acquire_query()?;
-                operation
-                    .run(runtime.run(std::pin::pin!(resolve)))
-                    .await??
-            }
-            None => operation.run(resolve).await?,
-        };
-        outcome.map_err(Into::into)
+        self.forwarder
+            .resolve_outcome_with_context_and_profile(
+                &query,
+                DnsRequestMeta::EMPTY,
+                IngressProfile::Api,
+            )
+            .await
+            .map_err(Into::into)
     }
 }
 
 impl DnsService {
     #[cfg(feature = "native-api")]
-    pub(crate) fn pin_name_resolution(&self) -> anyhow::Result<PinnedNameResolver> {
+    pub(crate) fn pin_name_resolution(
+        &self,
+        bootstrap: Option<BootstrapResolver>,
+    ) -> anyhow::Result<PinnedNameResolver> {
         let runtime = self
             .provider()
             .map(|provider| provider.try_acquire())
@@ -189,6 +252,7 @@ impl DnsService {
             service: self.clone(),
             runtime,
             forwarder,
+            bootstrap,
         })
     }
 
@@ -378,38 +442,24 @@ impl DnsService {
             return Ok(None);
         };
         let resolve = async {
+            let claimed = async |name: &str, upstream: &str| {
+                self.operation()
+                    .run(std::pin::pin!(resolve_claimed(
+                        self, &forwarder, name, upstream
+                    )))
+                    .await?
+            };
             if let NodeHostClaim::Upstream(upstream) = claim {
-                return resolve_claimed(self, &forwarder, &domain, upstream)
-                    .await
-                    .map(Some);
+                return claimed(&domain, upstream).await.map(Some);
             }
-            Box::pin(async {
-                let target = match forwarder.node_host_alias(&domain)? {
-                    Some(NodeHostAlias::Addresses(addresses)) => return Ok(Some(addresses)),
-                    Some(NodeHostAlias::Name(target)) => target,
-                    // The claim and the alias walk read the same snapshot, so
-                    // this arm is unreachable; leave the host unclaimed if not.
-                    None => return Ok(None),
-                };
-                if let Some(upstream) = claimed_upstream(&forwarder, &target) {
-                    return resolve_claimed(self, &forwarder, &target, upstream)
+            match forwarder.node_host_alias(&domain)? {
+                Some(alias) => {
+                    Box::pin(resolve_alias(&forwarder, alias, bootstrap::global, claimed))
                         .await
-                        .map(Some);
+                        .map(Some)
                 }
-                let result = honk_outbound::bootstrap::resolve_with(
-                    honk_outbound::bootstrap::global(),
-                    &target,
-                )
-                .await;
-                result.map(Some).map_err(|source| {
-                    NameResolutionError::Bootstrap {
-                        domain: target,
-                        source: source.into(),
-                    }
-                    .into()
-                })
-            })
-            .await
+                None => Ok(None),
+            }
         };
         match lease {
             Some(Ok(lease)) => lease.run(std::pin::pin!(resolve)).await?,
@@ -453,6 +503,36 @@ fn claimed_upstream<'f>(forwarder: &'f DnsForwarder, domain: &str) -> Option<&'f
     upstream.as_deref()
 }
 
+async fn resolve_alias(
+    forwarder: &DnsForwarder,
+    alias: NodeHostAlias,
+    bootstrap: impl FnOnce() -> Option<BootstrapResolver>,
+    claimed: impl AsyncFnOnce(&str, &str) -> anyhow::Result<Vec<IpAddr>>,
+) -> anyhow::Result<Vec<IpAddr>> {
+    match alias {
+        NodeHostAlias::Addresses(addresses) => Ok(addresses),
+        NodeHostAlias::Name(target) => match claimed_upstream(forwarder, &target) {
+            Some(upstream) => claimed(&target, upstream).await,
+            None => resolve_bootstrap(bootstrap(), &target).await,
+        },
+    }
+}
+
+async fn resolve_bootstrap(
+    resolver: Option<BootstrapResolver>,
+    domain: &str,
+) -> anyhow::Result<Vec<IpAddr>> {
+    bootstrap::resolve_with(resolver, domain)
+        .await
+        .map_err(|source| {
+            NameResolutionError::Bootstrap {
+                domain: domain.to_owned(),
+                source: source.into(),
+            }
+            .into()
+        })
+}
+
 /// Query only `upstream` for a node server host: uncached like the bootstrap
 /// resolver it replaces, since a shared entry would mix answers that skipped
 /// response rules with ones that ran them.
@@ -467,11 +547,9 @@ async fn resolve_claimed(
         forced_upstream: Some(UpstreamTag::new(upstream)?),
         node_host: true,
     };
-    let mut operation = service.operation();
-    let mut responses =
-        resolve_with_forwarder(service, &mut operation, forwarder, domain, None, &options)
-            .await?
-            .fail_on_packet_rejection()?;
+    let mut responses = exchange_families(service, forwarder, domain, None, &options)
+        .await
+        .fail_on_packet_rejection()?;
     // Without a fallback, an exchange failure is the dial's error, not an empty answer.
     let failure = [&mut responses.ipv4, &mut responses.ipv6]
         .into_iter()
@@ -518,44 +596,49 @@ async fn resolve_with_forwarder(
     metadata: Option<(DnsRequestMeta, SocketAddr)>,
     options: &ResolveOptions,
 ) -> anyhow::Result<FamilyResponses> {
+    operation
+        .run(std::pin::pin!(exchange_families(
+            service, forwarder, domain, metadata, options
+        )))
+        .await
+        .map_err(Into::into)
+}
+
+async fn exchange_families(
+    service: &DnsService,
+    forwarder: &DnsForwarder,
+    domain: &str,
+    metadata: Option<(DnsRequestMeta, SocketAddr)>,
+    options: &ResolveOptions,
+) -> FamilyResponses {
     let ipv4_query = build_dns_query(domain, 1);
     let ipv6_query = build_dns_query(domain, 28);
-    let operation_future = async {
-        match &forwarder.strategy {
-            DnsStrategy::Both | DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 => {
-                let (ipv4, ipv6) = tokio::join!(
-                    resolve_family(service, forwarder, &ipv4_query, metadata, options),
-                    resolve_family(service, forwarder, &ipv6_query, metadata, options),
-                );
-                FamilyResponses {
-                    ipv4: Some(ipv4),
-                    ipv6: Some(ipv6),
-                    ipv4_eligible: true,
-                    ipv6_eligible: true,
-                }
-            }
-            DnsStrategy::Ipv4Only => FamilyResponses {
-                ipv4: Some(
-                    resolve_family(service, forwarder, &ipv4_query, metadata, options).await,
-                ),
-                ipv6: None,
+    match &forwarder.strategy {
+        DnsStrategy::Both | DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 => {
+            let (ipv4, ipv6) = tokio::join!(
+                resolve_family(service, forwarder, &ipv4_query, metadata, options),
+                resolve_family(service, forwarder, &ipv6_query, metadata, options),
+            );
+            FamilyResponses {
+                ipv4: Some(ipv4),
+                ipv6: Some(ipv6),
                 ipv4_eligible: true,
-                ipv6_eligible: false,
-            },
-            DnsStrategy::Ipv6Only => FamilyResponses {
-                ipv4: None,
-                ipv6: Some(
-                    resolve_family(service, forwarder, &ipv6_query, metadata, options).await,
-                ),
-                ipv4_eligible: false,
                 ipv6_eligible: true,
-            },
+            }
         }
-    };
-    operation
-        .run(operation_future)
-        .await
-        .map_err(anyhow::Error::from)
+        DnsStrategy::Ipv4Only => FamilyResponses {
+            ipv4: Some(resolve_family(service, forwarder, &ipv4_query, metadata, options).await),
+            ipv6: None,
+            ipv4_eligible: true,
+            ipv6_eligible: false,
+        },
+        DnsStrategy::Ipv6Only => FamilyResponses {
+            ipv4: None,
+            ipv6: Some(resolve_family(service, forwarder, &ipv6_query, metadata, options).await),
+            ipv4_eligible: false,
+            ipv6_eligible: true,
+        },
+    }
 }
 
 fn resolve_family<'a>(

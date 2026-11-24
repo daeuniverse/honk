@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use super::anytls::AnyTlsHandler;
 use super::block::BlockHandler;
+use super::chain::ChainHandler;
 use super::direct::DirectHandler;
 use super::hysteria2::Hysteria2Handler;
 use super::juicity::JuicityHandler;
@@ -194,6 +195,10 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
+        registry.register(ProtocolEntry::new(
+            NodeProtocol::Chain,
+            Arc::new(ChainHandler::new(&registry.entries)),
+        ));
         for entry in &registry.entries {
             entry.validate_consistency();
         }

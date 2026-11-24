@@ -190,7 +190,7 @@ pub fn append_node_source(
     let [node] = config.nodes.as_slice() else {
         return Err(SourceEditError::default());
     };
-    if node.name != name {
+    if node.name != name || node.chain_hops().is_some() {
         return Err(SourceEditError::default());
     }
     let document = managed_document(source)?;
@@ -229,7 +229,7 @@ pub fn remove_node_source(
     let mut target = None;
     let mut duplicate = false;
     super::entries::parse_node_section_indexed(&sections, &mut diagnostics, |node, span| {
-        if node.id == id {
+        if !id.is_nil() && node.id == id {
             duplicate |= target.replace(span.start..span.end).is_some();
         }
     })

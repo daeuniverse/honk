@@ -1,12 +1,6 @@
+use super::test_support::{HEADER_WIRE, fixed_session, hex};
 use super::*;
 use std::io;
-
-fn hex(s: &str) -> Vec<u8> {
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-        .collect()
-}
 
 // Byte-level regression vectors produced by running the actual
 // Xray-core/sing-vmess Go code (aead/kdf.go, aead/authid.go,
@@ -16,26 +10,13 @@ const CMD_KEY: &str = "b50d916ac0cec067981af8e5f38a758f";
 const AUTH_ID_KEY: &str = "1415ba74ca8b3d041a8f583fb4116315";
 const AUTH_ID: &str = "7997d3314952dc37e0b284331b6bb2e7"; // ts=1700000000, rand=deadbeef
 const HEADER_PLAIN: &str = "0122222222222222222222222222222222111111111111111111111111111111115a053300010050015db8d822aabbcc15eba2f4";
-const HEADER_WIRE: &str = "7997d3314952dc37e0b284331b6bb2e71a963074b6c9f5cd7c0825ace93c69df311f0102030405060708301fcaedd9021cf0eaab9deb25afab08b13d78f0b0ff69acfc123dd0ba0d9b6c24d5edbfbcd20d23d7fd0a9f3d59a64835ccd0253af09feb22cc2affb2942c159c5acdc2";
 const CHUNK0: &str = "cce0f4cf6e664ef12db2501e5fc2333f0d54118144ce186c4913a9a33a";
 const CHUNK1: &str = "821e7f5df60be7f0159bdf89de3bda5c55c920d471fda4d17d24ddb5fd";
 const CHUNK_TERM: &str = "f25f875b48011300760c657294fca053c869";
-const RESP_KEY: &str = "b8f12ea8c9a95d4b4641b03d9fa5a71a";
-const RESP_IV: &str = "3dc30fbac8417f76943e9c10e15eeacb";
 const RESP_HEADER_WIRE: &str =
     "1ed5e218e618e8c5350363b980c93de5efa06015b5dc7a63f67ab72353ff9aa4f47a9ee044da";
 const RCHUNK0: &str = "a519478d162a2f176b9d3e71216983fc910451176407bbc97aa4daccb61c4740c0";
 const RCHUNK1: &str = "7baab45ea2ec0a90ad19bc5cacb263341906c9224a32ff3ce1dd65f2c0f7817120";
-
-fn fixed_session() -> Session {
-    Session {
-        req_key: [0x11; 16],
-        req_iv: [0x22; 16],
-        resp_key: hex(RESP_KEY).try_into().unwrap(),
-        resp_iv: hex(RESP_IV).try_into().unwrap(),
-        resp_header: 0x5a,
-    }
-}
 
 fn fixed_cmd_key() -> [u8; 16] {
     hex(CMD_KEY).try_into().unwrap()
@@ -269,7 +250,9 @@ async fn upload_batches_a_queued_burst_and_flushes_when_input_goes_idle() {
             &mut relay_client,
             header.to_vec(),
             fixed_session(),
-            &crate::runtime::flow_observation::RelayedPipe::new(),
+            &super::super::transport::relay_upload::pipe().1,
+            &mut None,
+            &mut Vec::new(),
         )
         .await
     });
@@ -508,7 +491,7 @@ async fn rejected_response_header_surfaces_as_stream_error() {
 }
 
 #[derive(Debug)]
-struct ErrorOnEof(tokio::io::DuplexStream, io::ErrorKind);
+struct ErrorOnEof(tokio::io::DuplexStream, Option<io::Error>);
 
 impl AsyncRead for ErrorOnEof {
     fn poll_read(
@@ -519,11 +502,7 @@ impl AsyncRead for ErrorOnEof {
         let before = buf.filled().len();
         match Pin::new(&mut self.0).poll_read(cx, buf) {
             Poll::Ready(Ok(())) if buf.filled().len() == before && buf.remaining() != 0 => {
-                Poll::Ready(Err(if self.1 == io::ErrorKind::ConnectionReset {
-                    io::Error::from_raw_os_error(libc::ECONNRESET)
-                } else {
-                    self.1.into()
-                }))
+                Poll::Ready(self.1.take().map_or(Ok(()), Err))
             }
             result => result,
         }
@@ -559,11 +538,15 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
     ] {
         let kind = failure.unwrap_or(io::ErrorKind::UnexpectedEof);
         let (physical, mut peer) = tokio::io::duplex(4096);
-        let physical: Box<dyn AsyncReadWrite> = if let Some(kind) = failure {
-            Box::new(ErrorOnEof(physical, kind))
-        } else {
-            Box::new(physical)
-        };
+        let failure = failure.map(|kind| {
+            if kind == io::ErrorKind::ConnectionReset {
+                io::Error::from_raw_os_error(libc::ECONNRESET)
+            } else {
+                kind.into()
+            }
+        });
+        let clean_eof = failure.is_none();
+        let physical = Box::new(ErrorOnEof(physical, failure));
         let uuid = uuid::Uuid::parse_str(UUID).unwrap();
         let target = "93.184.216.34:53".parse().unwrap();
         let mut stream =
@@ -583,7 +566,7 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         .expect_err("an absent or partial response header must not read as clean EOF");
         assert_eq!(error.kind(), kind);
         let outcome = crate::group::ScoreOutcome::from_io_error(&error);
-        if prefix_len == 0 && failure.is_none() {
+        if prefix_len == 0 && clean_eof {
             assert_eq!(outcome, crate::group::ScoreOutcome::Io(kind));
         } else {
             assert!(outcome.is_node_failure(), "{outcome:?}");
@@ -594,6 +577,113 @@ async fn response_header_eof_and_transport_failures_keep_scope_and_cause() {
         if kind == io::ErrorKind::ConnectionReset {
             assert_eq!(cause.raw_os_error(), Some(libc::ECONNRESET));
         }
+    }
+}
+
+#[tokio::test]
+async fn response_chunk_length_preserves_typed_carrier_failures_after_payload() {
+    use crate::group::ScoreOutcome;
+    use crate::proxy::error::IntermediateTargetFailure;
+    use crate::proxy::{NodeFailure, PacketRejection, TargetFailure};
+
+    let lower_refusal = crate::SharedError::fanout(
+        TargetFailure(io::Error::from(io::ErrorKind::ConnectionRefused).into()).into(),
+    );
+    let episode = lower_refusal.episode().unwrap();
+    let intermediate = IntermediateTargetFailure::io(
+        2,
+        io::Error::new(io::ErrorKind::ConnectionRefused, lower_refusal.clone()),
+    );
+    let target = io::Error::new(io::ErrorKind::ConnectionRefused, lower_refusal);
+    let node_failure = || {
+        io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            NodeFailure(io::Error::from_raw_os_error(libc::ECONNRESET).into()),
+        )
+    };
+
+    for (failure, expected, length_prefix, terminal_chunk) in [
+        (
+            Some(intermediate),
+            Some(ScoreOutcome::SharedNodeFailure(episode)),
+            false,
+            false,
+        ),
+        (Some(target), Some(ScoreOutcome::TargetFailure), true, false),
+        (
+            Some(node_failure()),
+            Some(ScoreOutcome::NodeFailure),
+            true,
+            false,
+        ),
+        (
+            Some(PacketRejection::Cancelled.into()),
+            Some(ScoreOutcome::Cancelled),
+            false,
+            false,
+        ),
+        (None, None, false, false),
+        (
+            None,
+            Some(ScoreOutcome::Io(io::ErrorKind::UnexpectedEof)),
+            true,
+            false,
+        ),
+        (
+            Some(io::Error::from_raw_os_error(libc::ECONNRESET)),
+            Some(ScoreOutcome::Io(io::ErrorKind::ConnectionReset)),
+            false,
+            false,
+        ),
+        (Some(node_failure()), None, false, true),
+    ] {
+        let kind = failure.as_ref().map(io::Error::kind);
+        let (physical, mut peer) = tokio::io::duplex(4096);
+        let mut stream = VmessStream::start(
+            Box::new(ErrorOnEof(physical, failure)),
+            hex(HEADER_WIRE),
+            fixed_session(),
+        )
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            peer.write_all(&hex(RESP_HEADER_WIRE)).await.unwrap();
+            let session = fixed_session();
+            let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv).unwrap();
+            let payload = b"HTTP/1.1 200 OK";
+            peer.write_all(&body.seal_chunk(payload)).await.unwrap();
+            let mut received = [0; b"HTTP/1.1 200 OK".len()];
+            stream.read_exact(&mut received).await.unwrap();
+            assert_eq!(&received, payload);
+
+            if terminal_chunk {
+                peer.write_all(&body.seal_chunk(b"")).await.unwrap();
+            } else if length_prefix {
+                peer.write_all(&body.seal_chunk(b"next")[..1])
+                    .await
+                    .unwrap();
+            }
+            // Keep the request side open so the lower read determines the result.
+            peer.shutdown().await.unwrap();
+
+            let result = stream.read(&mut [0; 1]).await;
+            if let Some(expected) = expected {
+                let error = result.expect_err("response length failure became EOF");
+                assert_eq!(error.kind(), kind.unwrap_or(io::ErrorKind::UnexpectedEof));
+                assert_eq!(ScoreOutcome::from_io_error(&error), expected);
+            } else {
+                assert_eq!(result.unwrap(), 0);
+                stream.shutdown().await.unwrap();
+                let mut expected = hex(HEADER_WIRE);
+                let mut upload = BodyChunks::new(&session.req_key, &session.req_iv).unwrap();
+                expected.extend(upload.seal_chunk(&[]));
+                let mut sent = Vec::new();
+                peer.read_to_end(&mut sent).await.unwrap();
+                assert_eq!(sent, expected);
+            }
+        })
+        .await
+        .expect("VMess payload and terminal read must settle");
     }
 }
 
@@ -754,3 +844,5 @@ async fn dial_over_relays_through_the_carrier() {
         .unwrap()
         .unwrap();
 }
+
+mod websocket;
