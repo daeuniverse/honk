@@ -396,6 +396,13 @@ class Router:
     def text(self, rules='', hosts=None):
         devices = '\n '.join(self.hosts if hosts is None else hosts)
         physical = 'xsk_mode: copy\n workers: 2\n interface {\n dut0: lan\n wg0: l3_lan\n }' if self.mixed else ''
+        relay_group = """group { endpoint_relay {
+    filter: name('direct')
+    policy: select
+    final: direct
+} }
+""" if self.mixed else ''
+        relay = 'endpoint_relay' if self.mixed else 'direct'
         return f'''global {{
  nfqueue_enable: false
  log_level: debug
@@ -411,7 +418,7 @@ group {{ proxy {{
  filter: name(fixture)
  policy: select
 }} }}
-datapath {{
+{relay_group}datapath {{
  backend: xdp
  direct: endpoint
  dns_projection: true
@@ -439,12 +446,12 @@ routing {{
  dport({DIRECT}, 18101, 18107, 18110) -> direct(must)
  dport({SERVICE}) -> direct
  dport({BLOCK}, 67, 547) -> block(must)
- dport(18106) -> direct
+ dport(18106) -> {relay}
  sport(51820) -> block(must)
  dip({FILL_META}/32) -> block(must)
  dip({', '.join(address + '/32' for address in FILL_HOLD)}) -> direct(must)
  dport(18102) && domain(suffix: host-ci.test) -> direct(must)
- fallback: direct
+ fallback: {relay}
 }}
 '''
 
@@ -1389,11 +1396,24 @@ def binding_udp(fixture, binding, address, target, action):
 def coexistence(fixture):
     wg.wait_log(fixture.process, fixture.log, 'Host egress waiting_link')
     assert HOSTS[2] not in wg.links(), 'unexpected Host WAN before fixture link creation'
+
+    def wg0_ingress():
+        chain = wg.tcx('dut', 'wg0')
+        return chain[0] if chain and chain[0][2] == 'honk_aux_gw' else None
+
+    previous = wg0_ingress()
+    assert previous is not None, 'missing wg0 ingress before creating wwan0'
     start = len(fixture.log.read_text())
     wan_wg(*fixture.wan_keys)
     physical, maps, index = wg.physical()
     assert wg.links()['dut0']['num_rx_queues'] == maps['honk_xdp_count'][4] - 4 == 2
-    assert wg.tcx('dut', 'wg0')[0][2] == 'honk_aux_gw'
+
+    def rebound():
+        assert fixture.process.poll() is None, ('daemon exited waiting for wg0 rebind', fixture.log)
+        return 'L3 LAN active interface=wg0 ' in fixture.log.read_text()[start:] and wg0_ingress()
+
+    current = wg.until(rebound, 'wg0 ingress rebound after wwan0 creation')
+    record('wg0-coexistence-rebind', previous=previous, current=current)
     nat = nft_count('masquerade')
     with contextlib.ExitStack() as owned:
         server = wg.socket_at(owned, 'server', (wg.STATIC, 0), socket.SOCK_DGRAM)
