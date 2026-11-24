@@ -1,6 +1,6 @@
 use super::*;
 use super::{UdpTerminal, UplinkStall};
-use honk_outbound::proxy::QuicSendAttempt;
+use honk_outbound::proxy::{DialFailureScope, QuicSendAttempt, dial_failure_scope};
 
 mod reply;
 use reply::{is_local_reply_error, receive_loop};
@@ -326,27 +326,59 @@ pub(super) fn score_driver_outcome(
     {
         return ScoreOutcome::Cancelled;
     }
-    if endpoint.quic_path_stalled() {
-        return ScoreOutcome::NodeFailure;
-    }
-    match result {
-        Ok(()) => ScoreOutcome::Success,
-        Err(error)
-            if matches!(
-                honk_outbound::proxy::packet_error_class(error),
-                honk_outbound::proxy::PacketErrorClass::Congestion
-            ) =>
-        {
-            ScoreOutcome::Cancelled
-        }
-        Err(error) if is_reply_idle_timeout(error) => {
-            if endpoint.has_reply() {
-                ScoreOutcome::Success
-            } else {
-                ScoreOutcome::Timeout
+    let outcome = if endpoint.quic_path_stalled() {
+        ScoreOutcome::NodeFailure
+    } else {
+        match result {
+            Ok(()) => ScoreOutcome::Success,
+            Err(error)
+                if matches!(
+                    honk_outbound::proxy::packet_error_class(error),
+                    honk_outbound::proxy::PacketErrorClass::Congestion
+                ) =>
+            {
+                ScoreOutcome::Cancelled
             }
+            Err(error) if is_reply_idle_timeout(error) => {
+                if endpoint.has_reply() {
+                    ScoreOutcome::Success
+                } else {
+                    ScoreOutcome::Timeout
+                }
+            }
+            Err(error) => ScoreOutcome::from_io_error(error),
         }
-        Err(error) => ScoreOutcome::from_io_error(error),
+    };
+    if let Some(evidence) = &endpoint.evidence
+        && evidence.is_route()
+    {
+        let scope = result
+            .as_ref()
+            .err()
+            .map_or(DialFailureScope::Unattributed, |error| {
+                dial_failure_scope(error)
+            });
+        return evidence.score_failure(outcome, scope);
+    }
+    outcome
+}
+
+fn report_flow_failure(
+    endpoint: &UdpEndpoint,
+    alive_set: &honk_outbound::alive::AliveDialerSet,
+    family: honk_outbound::alive::IpVersion,
+    error: &io::Error,
+) {
+    if let Some(evidence) = &endpoint.evidence
+        && evidence.is_route()
+    {
+        evidence.report_failure(error);
+    } else {
+        alive_set.report_unavailable_traffic(
+            endpoint.node_id,
+            honk_outbound::alive::ProbeDomain::DataUdp,
+            family,
+        );
     }
 }
 
@@ -525,12 +557,12 @@ pub(super) async fn run_endpoint_driver(
         let outcome = score_driver_outcome(&endpoint, &result);
         #[cfg(feature = "native-api")]
         endpoint.finish_native_driver(&result);
-        if !neutral && !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
-            alive_set.report_unavailable_traffic(
-                endpoint.node_id,
-                honk_outbound::alive::ProbeDomain::DataUdp,
-                health_family,
-            );
+        if let Err(error) = &result
+            && !neutral
+            && !endpoint.is_source()
+            && !endpoint.dead.load(Ordering::Acquire)
+        {
+            report_flow_failure(&endpoint, &alive_set, health_family, error);
         }
         let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
         return UdpDriverResult { result, outcome };
@@ -567,12 +599,11 @@ pub(super) async fn run_endpoint_driver(
                 let outcome = score_driver_outcome(&endpoint, &result);
                 #[cfg(feature = "native-api")]
                 endpoint.finish_native_driver(&result);
-                if !endpoint.is_source() && !endpoint.dead.load(Ordering::Acquire) {
-                    alive_set.report_unavailable_traffic(
-                        endpoint.node_id,
-                        honk_outbound::alive::ProbeDomain::DataUdp,
-                        health_family,
-                    );
+                if let Err(error) = &result
+                    && !endpoint.is_source()
+                    && !endpoint.dead.load(Ordering::Acquire)
+                {
+                    report_flow_failure(&endpoint, &alive_set, health_family, error);
                 }
                 let _ = first_ack.send(result.as_mut().map(|_| ()).map_err(duplicate_send_error));
                 return UdpDriverResult { result, outcome };
@@ -633,11 +664,7 @@ pub(super) async fn run_endpoint_driver(
         )
         && !(is_reply_idle_timeout(error) && endpoint.has_reply())
     {
-        alive_set.report_unavailable_traffic(
-            endpoint.node_id,
-            honk_outbound::alive::ProbeDomain::DataUdp,
-            health_family,
-        );
+        report_flow_failure(&endpoint, &alive_set, health_family, error);
     }
     UdpDriverResult { result, outcome }
 }
@@ -746,11 +773,11 @@ async fn send_one(
             QUEUED_PACKET_EXPIRED,
         )));
     }
-    if let Err(error) = endpoint.begin_send_attempt() {
+    if let Err(error) = endpoint.begin_send_attempt(first) {
         endpoint
             .native
             .dropped("endpoint_retired", Some("send_cancelled"));
-        return Err(PacketSendFailure::Transport(error));
+        return Err(classify_send_error(endpoint, error));
     }
     let mut attempt = endpoint.flow_transport().map(QuicSendAttempt::new);
     let source_admitted = endpoint.is_source().then(|| AtomicBool::new(false));
@@ -825,11 +852,7 @@ async fn send_one(
         && !endpoint_retired
         && let Err(PacketSendFailure::Transport(error)) = &result
     {
-        endpoint.fail_source(if is_reply_idle_timeout(error) {
-            ScoreOutcome::Timeout
-        } else {
-            ScoreOutcome::from_io_error(error)
-        });
+        endpoint.fail_source(ScoreOutcome::from_io_error(error), error);
     }
     if let Some(started) = started {
         stats.record_udp_first_send_latency(started.elapsed());
@@ -838,13 +861,13 @@ async fn send_one(
         Ok(started_at) => {
             endpoint.refresh();
             endpoint.tracker_upload(packet.data.len() as u64);
-            if let Some(reporter) = &endpoint.score_reporter {
+            endpoint.with_score(|reporter| {
                 if let Some(started_at) = started_at {
                     reporter.tx_completed(packet.data.len() as u64, started_at);
                 } else {
                     reporter.tx(packet.data.len() as u64);
                 }
-            }
+            });
             outbound_tracker.add_bytes(packet.data.len() as u64, 0);
             Ok(())
         }

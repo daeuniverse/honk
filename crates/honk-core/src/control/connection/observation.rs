@@ -545,16 +545,16 @@ impl ConnectionObservation {
         configured: DialMode,
         domain: Option<&str>,
         verification: &'static str,
-        selected: Option<(&Node, Option<&str>)>,
+        selected: Option<(&honk_outbound::group::OwnedTarget, Option<&str>)>,
     ) {
         let Some(record) = &self.recorded else { return };
         let (generation, target, reason) = match selected {
-            Some((node, target)) => (
+            Some((outbound, target)) => (
                 record
                     .selection
                     .as_ref()
                     .map(|selection| selection.generation),
-                target_kind(node, target),
+                target_kind(outbound, target),
                 "leaf_target_selected",
             ),
             None => (
@@ -583,7 +583,6 @@ impl ConnectionObservation {
     pub(super) fn selected<'a>(&self, chain: &[String], dialed: impl Into<Dialed<'a>>) {
         let Some(record) = &self.recorded else { return };
         let dialed = dialed.into();
-        let node = dialed.node;
         if matches!(
             dialed.protocol(),
             NodeProtocol::Direct | NodeProtocol::Block
@@ -594,16 +593,15 @@ impl ConnectionObservation {
         let Some(selection) = &record.selection else {
             return;
         };
-        let count = chain
-            .len()
-            .saturating_sub(usize::from(chain.last() == Some(&node.name)));
+        let (member_id, _) = dialed.selected_member();
+        let count = chain.len().saturating_sub(1);
         let groups: Option<Vec<_>> = chain
             .iter()
             .take(count)
             .map(|name| selection.catalog.groups.get(name).cloned())
             .collect();
         if let Some(mut chain) = groups {
-            chain.push(node.id.to_string());
+            chain.push(member_id.to_string());
             record.flow.selected(chain);
         }
     }
@@ -643,7 +641,7 @@ impl ConnectionObservation {
             } else {
                 "global"
             },
-            selection_path: selection_path(selection, chain, node),
+            selection_path: selection_path(selection, chain, dialed),
             leaf_node_id: Some(node.id.to_string()),
             leaf_node_name: Some(node.name.clone()),
             target: match target_kind {
@@ -789,24 +787,28 @@ fn tcp_domain_source(sniff: &crate::sniffing::SniffResult) -> Option<DomainSourc
 #[derive(Clone, Copy)]
 pub(super) struct Dialed<'a> {
     node: &'a Node,
-    routed: bool,
+    target: Option<&'a honk_outbound::group::OwnedTarget>,
 }
 
 impl Dialed<'_> {
     fn protocol(&self) -> NodeProtocol {
-        match self.routed {
+        match self.target.is_some_and(|target| target.route.is_some()) {
             true => NodeProtocol::Chain,
             false => self.node.protocol(),
         }
+    }
+
+    fn selected_member(&self) -> (uuid::Uuid, &str) {
+        self.target
+            .map_or((self.node.id, self.node.name.as_str()), |target| {
+                target.selected_member()
+            })
     }
 }
 
 impl<'a> From<&'a Node> for Dialed<'a> {
     fn from(node: &'a Node) -> Self {
-        Self {
-            node,
-            routed: false,
-        }
+        Self { node, target: None }
     }
 }
 
@@ -814,7 +816,7 @@ impl<'a> From<&'a honk_outbound::group::OwnedTarget> for Dialed<'a> {
     fn from(target: &'a honk_outbound::group::OwnedTarget) -> Self {
         Self {
             node: &target.node,
-            routed: target.route.is_some(),
+            target: Some(target),
         }
     }
 }
@@ -941,23 +943,22 @@ impl Drop for ConnectionAttempt {
 fn selection_path(
     selection: &SelectionGeneration,
     chain: &[String],
-    node: &Node,
+    dialed: Dialed<'_>,
 ) -> Vec<Selection> {
     let catalog = &selection.catalog;
-    chain
+    let (member_id, member_name) = dialed.selected_member();
+    let Some((_, groups)) = chain.split_last() else {
+        return Vec::new();
+    };
+    groups
         .iter()
         .enumerate()
         .filter_map(|(index, name)| {
             let group_id = catalog.groups.get(name)?;
-            let next = chain
-                .get(index + 1)
-                .and_then(|name| {
-                    catalog
-                        .groups
-                        .get(name)
-                        .map(|id| (id.clone(), name.clone()))
-                })
-                .unwrap_or_else(|| (node.id.to_string(), node.name.clone()));
+            let next = match groups.get(index + 1) {
+                Some(group) => (catalog.groups.get(group)?.clone(), group.clone()),
+                None => (member_id.to_string(), member_name.to_owned()),
+            };
             if let Some(captured) = crate::observe::flows::producer::captured_selection(
                 &selection.decisions,
                 group_id,

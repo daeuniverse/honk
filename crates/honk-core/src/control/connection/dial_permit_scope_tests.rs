@@ -69,7 +69,9 @@ async fn dns_wait_timeout_remains_retryable_with_free_admission() {
             Duration::from_millis(100),
             tokio::time::Instant::now() + Duration::from_secs(10),
             Arc::clone(&generation),
+            &manager,
             IpVersion::V4,
+            Default::default(),
             &feedback,
             false,
             #[cfg(feature = "native-api")]
@@ -244,7 +246,9 @@ async fn feedback_does_not_start_while_waiting_for_dial_admission() {
                 Duration::from_millis(5),
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Arc::clone(&generation),
+                &manager,
                 IpVersion::V4,
+                Default::default(),
                 &feedback,
                 false,
                 #[cfg(feature = "native-api")]
@@ -437,6 +441,7 @@ async fn direct_race_preserves_per_flow_marks() {
     let control = crate::control::tests::support::control_plane(config);
     let handle = control.spawn_handle();
     let generation = handle.runtime_registry.read().clone();
+    let manager = handle.group_manager.read().clone();
     for ip in ["127.0.0.1", "::1"] {
         let listener = tokio::net::TcpListener::bind(SocketAddr::new(ip.parse().unwrap(), 0))
             .await
@@ -459,11 +464,13 @@ async fn direct_race_preserves_per_flow_marks() {
                     Duration::from_secs(1),
                     tokio::time::Instant::now() + Duration::from_secs(2),
                     Arc::clone(&generation),
+                    &manager,
                     if target.is_ipv4() {
                         IpVersion::V4
                     } else {
                         IpVersion::V6
                     },
+                    Default::default(),
                     &HashMap::new(),
                     false,
                     #[cfg(feature = "native-api")]

@@ -1,16 +1,14 @@
 use super::handoff::HandoffResult;
 use crate::control::*;
-/// Clash-style `chains`, in reverse dial order. A proxy chain node's hops
-/// extend the selection chain, so after the reversal the exit leads, then come
-/// the node and its groups, and the whole path stays visible.
-/// A route through group exits lists the hop names captured with its
-/// selection; a leaf that is its own first hop appears once.
+
+/// Clash lists captured hops exit first. A collapsed exit and the selected `direct` remain distinct.
 pub(super) fn connection_chains(
     mut selection_chain: Vec<String>,
     node: &honk_config::node::Node,
     route_hops: Option<&[String]>,
+    collapsed_from_direct: bool,
 ) -> Vec<String> {
-    if selection_chain.last() != Some(&node.name) {
+    if collapsed_from_direct || selection_chain.last() != Some(&node.name) {
         selection_chain.push(node.name.clone());
     }
     match route_hops {
@@ -211,6 +209,7 @@ impl ControlPlaneHandle {
         conn_info: &ConnectionInfo,
         domain_verified: bool,
         handoff: Option<&HandoffResult>,
+        handoff_group: Option<&str>,
         #[cfg(feature = "native-api")] record_route: bool,
     ) -> RoutingDecision {
         let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
@@ -219,13 +218,19 @@ impl ControlPlaneHandle {
             domain_verified,
             handoff,
         );
+        let handoff_name = |index| async move {
+            match handoff_group {
+                Some(name) => name.to_owned(),
+                None => self.outbound_index_to_name(index).await,
+            }
+        };
         if let Some(handoff) = handoff
             && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
             && !reroute_by_sniffed_domain
             && !self.connection_tracker.needs_rule_details()
         {
             return RoutingDecision {
-                outbound: self.outbound_index_to_name(handoff.outbound).await,
+                outbound: handoff_name(handoff.outbound).await,
                 must: handoff.must != 0,
                 mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
                 matched_rule: None,
@@ -312,7 +317,7 @@ impl ControlPlaneHandle {
                     (userspace_outbound, userspace_must, userspace_mark)
                 } else {
                     (
-                        self.outbound_index_to_name(ho.outbound).await,
+                        handoff_name(ho.outbound).await,
                         ho.must != 0,
                         honk_outbound::proxy::DirectMark::new(ho.mark),
                     )
@@ -406,15 +411,9 @@ mod chains_tests {
 
     #[test]
     fn chain_hops_follow_the_selected_node_with_the_exit_first() {
-        let node = Node {
-            name: "via".into(),
-            outbound: OutboundConfig::Chain {
-                hops: vec!["front".into(), "land".into()],
-            },
-            ..Node::default()
-        };
+        let node = Node::chain("via", vec!["front".into(), "land".into()]);
         assert_eq!(
-            connection_chains(vec!["proxy".into(), "via".into()], &node, None),
+            connection_chains(vec!["proxy".into(), "via".into()], &node, None, false),
             ["land", "front", "via", "proxy"]
         );
         let leaf = Node {
@@ -422,18 +421,40 @@ mod chains_tests {
             ..Node::default()
         };
         assert_eq!(
-            connection_chains(vec!["proxy".into()], &leaf, None),
+            connection_chains(vec!["proxy".into()], &leaf, None, false),
             ["hk", "proxy"]
         );
         let route_hops = ["hk".to_owned(), "land".to_owned()];
         assert_eq!(
-            connection_chains(vec!["proxy".into(), "hk".into()], &leaf, Some(&route_hops)),
+            connection_chains(
+                vec!["proxy".into(), "hk".into()],
+                &leaf,
+                Some(&route_hops),
+                false,
+            ),
             ["land", "hk", "proxy"]
         );
         let chain_hops = ["front".to_owned(), "land".to_owned(), "exit".to_owned()];
         assert_eq!(
-            connection_chains(vec!["proxy".into()], &node, Some(&chain_hops)),
+            connection_chains(vec!["proxy".into()], &node, Some(&chain_hops), false),
             ["exit", "land", "front", "via", "proxy"]
+        );
+    }
+
+    #[test]
+    fn collapsed_direct_keeps_a_same_name_exit_in_the_clash_chain() {
+        let exit = Node {
+            name: "direct".into(),
+            outbound: OutboundConfig::Socks5(Default::default()),
+            ..Node::default()
+        };
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "direct".into()], &exit, None, true),
+            ["direct", "direct", "proxy"]
+        );
+        assert_eq!(
+            connection_chains(vec!["proxy".into(), "direct".into()], &exit, None, false),
+            ["direct", "proxy"]
         );
     }
 }
@@ -467,7 +488,7 @@ mod native_tests {
         let _router = handle.router.write().await;
         let decision = tokio::time::timeout(
             Duration::from_millis(100),
-            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), false),
+            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), None, false),
         )
         .await
         .expect("native observation must not repeat routing");

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Outbound connection management — proxy handlers, alive tracking, group selection.
 //!
 //! ## Modules

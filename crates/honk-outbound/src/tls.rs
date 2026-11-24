@@ -27,7 +27,7 @@ use boring::ssl::{
 use boring::x509::X509;
 use boring::x509::store::X509StoreBuilder;
 use foreign_types::ForeignTypeRef;
-use honk_config::node::Node;
+use honk_config::node::{Node, ech_discovery_name};
 
 /// TLS client stream produced by [`TlsConnector::connect`].
 pub type TlsStream<S> = tokio_boring::SslStream<S>;
@@ -210,6 +210,11 @@ impl TlsConnector {
         Ok(cfg)
     }
 
+    /// Whether `connect` to `domain` may query DNS for its ECHConfigList.
+    pub(crate) fn discovers_ech(&self, domain: &str) -> bool {
+        self.ech_discovery && ech_discovery_name(domain).is_some()
+    }
+
     /// TLS client handshake over `stream`, verifying the peer against
     /// `domain` (unless the node skips verification).
     pub async fn connect<S>(&self, domain: &str, stream: S) -> anyhow::Result<TlsStream<S>>
@@ -246,6 +251,13 @@ impl TlsConnector {
                         sni = domain,
                         "ECH rejected; server offered retry ECH configs (not persisted)"
                     );
+                }
+                if let Some(cause) = e
+                    .as_io_error()
+                    .and_then(crate::proxy::retain_typed_io_error)
+                {
+                    return Err(anyhow::Error::new(cause)
+                        .context(format!("TLS handshake with {domain} failed")));
                 }
                 Err(anyhow::anyhow!("TLS handshake with {domain} failed: {e}"))
             }
@@ -436,10 +448,7 @@ static ECH_DISCOVERY_CACHE: LazyLock<
 /// 5 min). Best-effort and fail-open: any failure yields `None`, unlike
 /// explicit `ech_config` which is fail-closed.
 pub async fn discover_ech_config(domain: &str) -> Option<Vec<u8>> {
-    let key = domain.trim_end_matches('.').to_ascii_lowercase();
-    if key.is_empty() || key.parse::<std::net::IpAddr>().is_ok() {
-        return None;
-    }
+    let key = ech_discovery_name(domain)?.to_ascii_lowercase();
     if let Some(hit) = ECH_DISCOVERY_CACHE.lock().unwrap().get(&key)
         && hit.expires > std::time::Instant::now()
     {
@@ -649,7 +658,7 @@ pub fn build_connector(node: &Node) -> anyhow::Result<TlsConnector> {
         connector,
         chrome,
         alps,
-        ech_discovery: tls.ech_enabled && ech_config_list.is_none(),
+        ech_discovery: tls.uses_ech_discovery(),
         ech_config_list: ech_config_list.map(Arc::new),
     })
 }

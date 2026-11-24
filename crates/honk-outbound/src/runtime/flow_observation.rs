@@ -146,6 +146,7 @@ pub struct FlowObserver {
     milestones: Arc<std::sync::atomic::AtomicU8>,
     /// Milestones this view drops before they reach the shared once-state.
     dropped: u8,
+    request_lifetime: Option<std::sync::Weak<QuicSubmissions>>,
 }
 
 #[cfg(feature = "flow-observation")]
@@ -169,6 +170,7 @@ impl FlowObserver {
             callback,
             milestones: Arc::new(std::sync::atomic::AtomicU8::new(0)),
             dropped: 0,
+            request_lifetime: None,
         }
     }
 
@@ -181,6 +183,7 @@ impl FlowObserver {
             return self.clone();
         }
         Self {
+            request_lifetime: self.request_lifetime.clone(),
             dropped: self.dropped,
             ..Self::new(context, Arc::clone(&self.callback))
         }
@@ -207,7 +210,7 @@ impl FlowObserver {
             & bit
             == 0
         {
-            self.publish(FlowEvent::Milestone { milestone });
+            (self.callback)(self.context, FlowEvent::Milestone { milestone });
         }
     }
 
@@ -224,7 +227,7 @@ impl FlowObserver {
 tokio::task_local! {
     static FLOW_OBSERVER: Option<FlowObserver>;
     static SUPPRESSED: bool;
-    static REQUEST_WRITE: RequestWrite;
+    static REQUEST_WRITE: Option<RequestWrite>;
 }
 
 #[cfg(feature = "flow-observation")]
@@ -277,74 +280,14 @@ pub fn milestone(milestone: Milestone) {
 }
 
 #[cfg(feature = "flow-observation")]
-#[derive(Clone, Debug)]
-pub(crate) struct RequestWrite {
-    observer: FlowObserver,
-    state: Arc<parking_lot::Mutex<RequestWriteState>>,
-}
-
+mod request;
+#[cfg(all(feature = "flow-observation", test))]
+pub(crate) use request::RequestDelivery;
 #[cfg(feature = "flow-observation")]
-#[derive(Debug, Default)]
-struct RequestWriteState {
-    required: u64,
-    delivered: u64,
-    finished: bool,
-}
+pub(crate) use request::{
+    DriverRequest, QuicSubmissions, RelayedPipe, RequestWrite, observe_chain_request, request_write,
+};
 
-#[cfg(feature = "flow-observation")]
-impl RequestWrite {
-    pub(crate) fn current() -> Option<Self> {
-        if is_suppressed() {
-            return None;
-        }
-        REQUEST_WRITE.try_with(Clone::clone).ok()
-    }
-
-    pub(crate) fn defer(&self, position: u64) {
-        self.state.lock().required = position;
-    }
-
-    pub(crate) fn delivered(&self, position: u64) {
-        let publish = {
-            let mut state = self.state.lock();
-            state.delivered = state.delivered.max(position);
-            state.finished && state.delivered >= state.required
-        };
-        if publish {
-            self.observer.milestone_once(Milestone::TargetRequestSent);
-        }
-    }
-
-    fn finish(&self) {
-        let publish = {
-            let mut state = self.state.lock();
-            state.finished = true;
-            state.delivered >= state.required
-        };
-        if publish {
-            self.observer.milestone_once(Milestone::TargetRequestSent);
-        }
-    }
-}
-
-#[cfg(feature = "flow-observation")]
-/// A buffered transport may defer the event until the actual frame writer flushes.
-pub(crate) async fn request_write<T, E>(
-    future: std::pin::Pin<&mut impl Future<Output = Result<T, E>>>,
-) -> Result<T, E> {
-    let Some(observer) = current() else {
-        return future.await;
-    };
-    let request = RequestWrite {
-        observer,
-        state: Arc::new(parking_lot::Mutex::new(RequestWriteState::default())),
-    };
-    let result = REQUEST_WRITE.scope(request.clone(), future).await;
-    if result.is_ok() {
-        request.finish();
-    }
-    result
-}
 #[expect(
     clippy::large_enum_variant,
     reason = "Synchronous callbacks avoid a separate allocation for every DNS event"
@@ -466,6 +409,7 @@ pub async fn observe_resolution<F: Future>(future: F) -> (F::Output, Option<Look
         }),
     );
     nested.dropped = observer.dropped;
+    nested.request_lifetime = observer.request_lifetime.clone();
     let result = nested.scope(future).await;
     (result, Some(LookupSelection { observer, lookups }))
 }
@@ -603,27 +547,67 @@ mod inert {
     pub fn milestone(_milestone: Milestone) {}
 
     #[derive(Clone, Debug)]
-    pub(crate) enum RequestWrite {}
+    pub(crate) struct RelayedPipe;
 
-    impl RequestWrite {
+    impl RelayedPipe {
         #[inline]
-        pub(crate) fn current() -> Option<Self> {
+        pub(crate) const fn new() -> Self {
+            Self
+        }
+
+        #[inline]
+        pub(crate) fn poll_write(
+            &self,
+            write: impl FnOnce() -> std::task::Poll<std::io::Result<usize>>,
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            write()
+        }
+
+        #[inline]
+        pub(crate) fn take(&self, _relayed: u64) -> Option<RelayedRequest> {
             None
         }
+    }
 
+    pub(crate) enum RelayedRequest {}
+
+    impl RelayedRequest {
+        pub(crate) async fn write<F: Future>(self, _write: Pin<&mut F>) -> F::Output {
+            match self {}
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct DriverRequest;
+
+    impl DriverRequest {
         #[inline]
-        pub(crate) fn defer(&self, _position: u64) {
-            match *self {}
+        pub(crate) const fn new() -> Self {
+            Self
         }
 
         #[inline]
-        pub(crate) fn delivered(&self, _position: u64) {
-            match *self {}
+        pub(crate) fn capture(&mut self) {}
+
+        #[inline]
+        pub(crate) fn drive<T>(&self, poll: impl FnOnce() -> T) -> T {
+            poll()
         }
+
+        #[inline]
+        pub(crate) fn release(&mut self) {}
+
+        #[inline]
+        pub(crate) fn discard(&mut self) {}
     }
 
     #[inline]
     pub(crate) fn request_write<F: Future>(future: Pin<&mut F>) -> Pin<&mut F> {
+        future
+    }
+
+    #[inline]
+    pub(crate) fn observe_chain_request<F: Future>(future: F) -> F {
         future
     }
 
@@ -662,17 +646,22 @@ mod inert {
 
     const _: () = assert!(size_of::<Option<FlowObserver>>() == 0);
     const _: () = assert!(size_of::<Option<TransportAttempt>>() == 0);
+    const _: () = assert!(size_of::<RelayedPipe>() == 0);
+    const _: () = assert!(size_of::<DriverRequest>() == 0);
 }
 
 #[cfg(all(not(feature = "flow-observation"), feature = "rprx"))]
 pub(crate) use inert::scope;
 #[cfg(not(feature = "flow-observation"))]
+pub(crate) use inert::{
+    DriverRequest, RelayedPipe, is_suppressed, observe_chain_request, request_write,
+    without_target_milestones,
+};
+#[cfg(not(feature = "flow-observation"))]
 pub use inert::{
     FlowObserver, LookupSelection, TransportAttempt, current, milestone, observe_resolution,
     without,
 };
-#[cfg(not(feature = "flow-observation"))]
-pub(crate) use inert::{RequestWrite, is_suppressed, request_write, without_target_milestones};
 
 #[cfg(all(test, feature = "flow-observation"))]
 mod tests;

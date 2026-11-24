@@ -1,4 +1,5 @@
 use super::*;
+use honk_outbound::alive::RouteHealthRevision;
 use honk_outbound::group::{DialKey, OwnedTarget};
 use std::collections::HashSet;
 
@@ -17,6 +18,7 @@ type UnpackedTcpScorePlan = (
     HashMap<DialKey, Vec<String>>,
     HashMap<DialKey, Vec<String>>,
     IpVersion,
+    RouteHealthRevision,
 );
 
 pub(super) fn tcp_score_context(
@@ -76,22 +78,20 @@ pub(super) fn unpack_tcp_score_plan(
         selection_chains,
         final_owners,
         plan.health_family,
+        plan.route_revision,
     )
 }
 
 pub(super) fn timeout_started_score_reporters(
-    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
+    reporters: &parking_lot::Mutex<Vec<(crate::group::ScoreReporter, bool)>>,
 ) {
-    for reporter in reporters.lock().iter() {
-        reporter.setup_failed(crate::group::ScoreOutcome::Timeout);
+    for (reporter, routed) in reporters.lock().iter() {
+        reporter.setup_failed(if *routed {
+            crate::group::ScoreOutcome::RouteFailure
+        } else {
+            crate::group::ScoreOutcome::Timeout
+        });
     }
-}
-
-#[cfg(test)]
-pub(super) fn started_score_reporter_count(
-    reporters: &parking_lot::Mutex<Vec<crate::group::ScoreReporter>>,
-) -> usize {
-    reporters.lock().len()
 }
 
 pub(super) const COLD_URLTEST_STAGGER: Duration = Duration::from_millis(200);

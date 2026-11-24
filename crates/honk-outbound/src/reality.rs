@@ -128,7 +128,14 @@ where
     let tls = tokio_boring::connect(cfg, &config.server_name, stream)
         .await
         .map_err(|e| {
-            anyhow::anyhow!("REALITY handshake with {} failed: {e}", config.server_name)
+            let context = format!("REALITY handshake with {} failed", config.server_name);
+            match e
+                .as_io_error()
+                .and_then(crate::proxy::retain_typed_io_error)
+            {
+                Some(cause) => anyhow::Error::new(cause).context(context),
+                None => anyhow::anyhow!("{context}: {e}"),
+            }
         })?;
     let state = unsafe {
         boring_sys::SSL_get_ex_data(tls.ssl().as_ptr(), reality_ex_index())

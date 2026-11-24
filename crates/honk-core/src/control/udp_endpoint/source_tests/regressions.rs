@@ -580,7 +580,7 @@ async fn shared_source_failure_finishes_every_flow_before_death_cleanup() {
             honk_outbound::alive::IpVersion::V4,
         );
     }
-    owner.fail(honk_outbound::group::ScoreOutcome::NodeFailure);
+    owner.fail(honk_outbound::group::ScoreOutcome::NodeFailure, None);
     assert_eq!(deaths.load(Ordering::Relaxed), 1);
     assert_eq!(
         manager_a
@@ -675,6 +675,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
             node_id,
             node_name,
             health_family,
+            evidence,
         } = prepared_a
         else {
             panic!("first source preparation must be fresh");
@@ -692,6 +693,7 @@ async fn post_admission_view_cancel_is_health_neutral() {
             node_id,
             node_name,
             health_family,
+            evidence,
         }
         .commit(&pool)
         .await
@@ -907,7 +909,7 @@ async fn shared_source_failure_wins_late_cleanup_but_preserves_local_cancellatio
             // without blocking a different endpoint's local finalizer.
             let first_binding = first.hold_binding_for_test();
             let retirer = threads.spawn(|| {
-                owner.fail(ScoreOutcome::NodeFailure);
+                owner.fail(ScoreOutcome::NodeFailure, None);
             });
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(wait_source_removed(&pool, &scope));

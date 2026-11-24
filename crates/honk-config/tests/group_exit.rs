@@ -2,8 +2,9 @@
 
 use honk_config::Config;
 use honk_config::diagnostic::DetailedDiagnostic;
+use honk_config::error::DetailedConfigError;
 use honk_config::group::Group;
-use honk_config::parser::parse_dae_config;
+use honk_config::parser::{parse_dae_config, resolve_group_filters};
 
 const SOCKS: &str = "socks5://127.0.0.1:1080";
 const SS: &str = "ss://YWVzLTEyOC1nY206cGFzcw@ss.example:8388";
@@ -25,11 +26,35 @@ fn group<'a>(config: &'a Config, name: &str) -> &'a Group {
         .unwrap()
 }
 
+fn admit(mut partial: Config) -> Result<(), DetailedConfigError> {
+    match partial.clone().assemble(resolve_group_filters) {
+        Ok(config) => config.validate_assembled(),
+        Err(error) => {
+            // Bind and rebuild with the exits temporarily removed, then
+            // verify the same exit refusal when checking an immutable snapshot.
+            let exits: Vec<_> = partial
+                .groups
+                .iter_mut()
+                .map(|group| group.exit.take())
+                .collect();
+            let mut assembled = partial.assemble(resolve_group_filters).unwrap();
+            for (group, exit) in assembled.groups.iter_mut().zip(exits) {
+                group.exit = exit;
+            }
+            let immutable = assembled.validate_assembled().unwrap_err();
+            assert_eq!(immutable.diagnostic.code, error.diagnostic.code);
+            assert_eq!(immutable.diagnostic.setting, error.diagnostic.setting);
+            assert_eq!(
+                immutable.diagnostic.entry_index,
+                error.diagnostic.entry_index
+            );
+            Err(error)
+        }
+    }
+}
+
 fn rejection(nodes: &str, exit: &str) -> DetailedDiagnostic {
-    *config(nodes, exit)
-        .validate_assembled()
-        .unwrap_err()
-        .diagnostic
+    *admit(config(nodes, exit)).unwrap_err().diagnostic
 }
 
 #[test]
@@ -37,7 +62,7 @@ fn exit_parses_and_validates() {
     let config = config(&format!(" front: '{SOCKS}'\n land: '{TROJAN}'\n"), "land");
     assert_eq!(group(&config, "proxy").exit.as_deref(), Some("land"));
     assert_eq!(group(&config, "other").exit, None);
-    config.validate_assembled().unwrap();
+    admit(config).unwrap();
 }
 
 #[test]
@@ -89,9 +114,7 @@ fn chain_member_plus_exit_is_capped_at_four_hops() {
             " a: '{SOCKS}'\n b: '{SS}'\n c: 'socks5://127.0.0.1:1081'\n d: 'socks5://127.0.0.1:1082'\n land: '{TROJAN}'\n front: {front}\n"
         )
     };
-    config(&hops("a -> b -> c"), "land")
-        .validate_assembled()
-        .unwrap();
+    admit(config(&hops("a -> b -> c"), "land")).unwrap();
     let error = rejection(&hops("a -> b -> c -> d"), "land");
     assert_eq!(error.code, "group-exit-route-too-long");
     assert_eq!(error.setting.to_string(), "groups[2].exit");
@@ -100,11 +123,11 @@ fn chain_member_plus_exit_is_capped_at_four_hops() {
 #[test]
 fn a_final_behind_an_exit_counts_toward_the_four_hops() {
     let config = |last: &str| {
-        parse_dae_config(&format!(
+        let partial = parse_dae_config(&format!(
             "node {{\n a: '{SOCKS}'\n b: '{SS}'\n c: 'socks5://127.0.0.1:1081'\n d: 'socks5://127.0.0.1:1082'\n land: '{TROJAN}'\n long: a -> b -> {last}\n}}\ngroup {{\n proxy {{\n  filter: name(a)\n  policy: fixed(0)\n  final: long\n  exit: land\n }}\n}}\nrouting {{\n fallback: proxy\n}}\n"
         ))
-        .unwrap()
-        .validate_assembled()
+        .unwrap();
+        admit(partial)
     };
     config("c").unwrap();
     let error = *config("c -> d").unwrap_err().diagnostic;
@@ -118,18 +141,16 @@ fn a_hop_the_next_exit_repeats_counts_once() {
             " a: '{SOCKS}'\n b: '{SS}'\n c: 'socks5://127.0.0.1:1081'\n land: '{TROJAN}'\n front: {front}\n"
         )
     };
-    config(&hops("a -> b -> c -> land"), "land")
-        .validate_assembled()
-        .unwrap();
+    admit(config(&hops("a -> b -> c -> land"), "land")).unwrap();
     let error = rejection(&hops("a -> b -> c -> land"), "a");
     assert_eq!(error.code, "group-exit-route-too-long");
 
     let nested = |inner_exit: &str| {
-        parse_dae_config(&format!(
+        let partial = parse_dae_config(&format!(
             "node {{\n a: '{SOCKS}'\n b: '{SS}'\n c: 'socks5://127.0.0.1:1081'\n land: '{TROJAN}'\n front: a -> b -> c\n}}\ngroup {{\n inner {{\n  filter: name(front)\n  policy: fixed(0)\n  exit: {inner_exit}\n }}\n proxy {{\n  filter: group(inner)\n  policy: fixed(0)\n  exit: land\n }}\n}}\nrouting {{\n fallback: proxy\n}}\n"
         ))
-        .unwrap()
-        .validate_assembled()
+        .unwrap();
+        admit(partial)
     };
     nested("land").unwrap();
     let error = *nested("b").unwrap_err().diagnostic;

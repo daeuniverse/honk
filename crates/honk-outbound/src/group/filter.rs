@@ -15,9 +15,16 @@ impl GroupManager {
     ) -> bool {
         if matches!(domain, ProbeDomain::DataUdp | ProbeDomain::DnsUdp)
             && let Some(node) = self.nodes.get(&node_id)
-            && !self.leaf_carries_udp(node)
+            && node.protocol() != honk_config::types::NodeProtocol::Block
         {
-            return false;
+            if !self.node_carries_udp(node) {
+                return false;
+            }
+            if let Some(hops) = node.resolved_chain_hops()
+                && !self.udp_route_path_available(node_id, hops, domain, ipver)
+            {
+                return false;
+            }
         }
         self.is_node_alive_for_domain(node_id, domain, ipver)
     }
@@ -36,49 +43,26 @@ impl GroupManager {
             return true;
         };
         if domain == ProbeDomain::DataUdp {
-            return if alive.has_udp_state(node_id) {
-                alive.is_alive_for(node_id, ProbeDomain::DataUdp, ipver)
-                    || alive.is_alive_for(node_id, ProbeDomain::DnsUdp, ipver)
-            } else {
-                alive.is_alive_for(node_id, ProbeDomain::Tcp, ipver)
-            };
+            return alive.data_udp_available(node_id, ipver);
         }
         alive.is_alive_for(node_id, domain, ipver)
     }
 
-    /// [`Self::node_carries_udp`] with `block` passing: it ends the flow
-    /// itself. One protocol match and one descriptor lookup for any node
-    /// but a chain without its own UDP.
+    /// Whether the node carries UDP itself or through its bound chain exit.
     #[inline]
-    pub(super) fn leaf_carries_udp(&self, node: &Node) -> bool {
-        let protocol = node.protocol();
-        protocol == honk_config::types::NodeProtocol::Block
-            || (crate::descriptor::descriptor(protocol).supports_udp)(node)
-            || (protocol == honk_config::types::NodeProtocol::Chain
-                && self.chain_carries_udp(node.id))
-    }
-
-    /// Whether `node` carries UDP over its own protocol or, for a configured
-    /// chain, tunneled by its exit, which the chain's own descriptor cannot
-    /// see.
     pub fn node_carries_udp(&self, node: &Node) -> bool {
-        let protocol = node.protocol();
-        (crate::descriptor::descriptor(protocol).supports_udp)(node)
-            || (protocol == honk_config::types::NodeProtocol::Chain
-                && self.chain_carries_udp(node.id))
-    }
+        use crate::descriptor::{UdpPath, builtin_tunneled_udp_available, carries_udp};
 
-    /// Out of line so selection paths without chain nodes inline no lookup.
-    #[inline(never)]
-    fn chain_carries_udp(&self, chain: uuid::Uuid) -> bool {
-        self.chain_udp
-            .as_deref()
-            .is_some_and(|chains| chains.binary_search(&chain).is_ok())
+        if node.protocol() == honk_config::types::NodeProtocol::Chain {
+            return node
+                .resolved_chain_hops()
+                .is_some_and(|hops| builtin_tunneled_udp_available(hops, |id| self.nodes.get(id)));
+        }
+        carries_udp(UdpPath::Own(node))
     }
 
     /// Keep only capable, alive leaves; absent health tracking skips only health.
-    /// UDP capability belongs to what a candidate dials, its route when it
-    /// has one; health stays on the leaf.
+    /// UDP capability belongs to the route when a candidate dials through an exit.
     ///
     /// When the group has a custom `check_url` (sing-box urltest `url`
     /// option), TCP liveness and ranking come from the per-(node, url)
@@ -93,47 +77,53 @@ impl GroupManager {
     /// so no exit on any candidate's path needs checking.
     pub(super) fn filter_alive_candidates<'a>(
         &self,
-        candidates: Vec<Candidate<'a>>,
+        mut candidates: Vec<Candidate<'a>>,
         domain: ProbeDomain,
         ipver: IpVersion,
+        group: &Group,
         ancestors: &[&str],
-        group: &Group,
-        routes: bool,
+        rules: score::selection::ScoreSelectionRules<'_>,
     ) -> Vec<Candidate<'a>> {
-        if routes {
-            // Exit liveness and, for UDP, the capability of the route each
-            // candidate dials are settled there; the leaf needs only health.
-            let candidates =
-                self.retain_exit_selectable(candidates, ancestors, group, domain, ipver);
-            return self.retain_eligible(candidates, domain, group, |node| {
-                self.is_node_alive_for_domain(node, domain, ipver)
+        if rules.routes && self.has_exits() {
+            // Children already checked the complete path with these ancestors.
+            let udp = domain != ProbeDomain::Tcp;
+            candidates.retain(|candidate| {
+                let eligible = candidate.via.is_some()
+                    || self.leaf_route_available(
+                        candidate.node,
+                        group,
+                        ancestors,
+                        domain,
+                        Some(ipver),
+                        rules.node_targets_only,
+                    );
+                if !eligible || udp {
+                    observation::candidate(
+                        candidate,
+                        eligible,
+                        if eligible {
+                            "eligible"
+                        } else {
+                            "exit_unavailable"
+                        },
+                    );
+                }
+                eligible
             });
+            if udp {
+                return candidates;
+            }
+        } else {
+            debug_assert!(group.exit.is_none(), "group '{}' has an exit", group.name);
+            debug_assert!(
+                candidates.iter().all(|candidate| self
+                    .dials_its_leaf(candidate, SelectionNetwork::from_probe_domain(domain))),
+                "group '{}' has a candidate that does not dial its leaf",
+                group.name
+            );
         }
-        debug_assert!(group.exit.is_none(), "group '{}' has an exit", group.name);
-        debug_assert!(
-            candidates.iter().all(|candidate| self
-                .dials_its_leaf(candidate, SelectionNetwork::from_probe_domain(domain))),
-            "group '{}' has a candidate that does not dial its leaf",
-            group.name
-        );
-        self.retain_eligible(candidates, domain, group, |node| {
-            self.is_node_selectable_for_domain(node, domain, ipver)
-        })
-    }
-
-    /// Inlined into both branches above, so the exit-free one tests no
-    /// route flag per candidate.
-    #[inline(always)]
-    fn retain_eligible<'a>(
-        &self,
-        candidates: Vec<Candidate<'a>>,
-        domain: ProbeDomain,
-        group: &Group,
-        eligible: impl Fn(uuid::Uuid) -> bool,
-    ) -> Vec<Candidate<'a>> {
-        let check_url = group.check_url.as_deref();
         if domain == ProbeDomain::Tcp
-            && let Some(url) = check_url
+            && let Some(url) = group.check_url.as_deref()
             && let Some(alive) = &self.alive_set
         {
             // Per-URL state is keyed by member TAG (sing-box RealTag
@@ -144,7 +134,8 @@ impl GroupManager {
             return candidates
                 .into_iter()
                 .filter(|c| {
-                    let eligible = alive.is_alive_for_url(c.tag(), url);
+                    let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                        || alive.is_alive_for_url(c.tag(), url);
                     observation::candidate(
                         c,
                         eligible,
@@ -161,7 +152,8 @@ impl GroupManager {
         candidates
             .into_iter()
             .filter(|c| {
-                let eligible = eligible(c.node.id);
+                let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                    || self.is_node_selectable_for_domain(c.node.id, domain, ipver);
                 observation::candidate(
                     c,
                     eligible,

@@ -1,4 +1,9 @@
 use super::*;
+use honk_outbound::alive::{RouteHttpProber, RouteProbeTicket};
+use honk_outbound::group::DialKey;
+use honk_outbound::proxy::{DialRef, is_packet_rejection};
+use honk_outbound::runtime::OutboundRuntimeRegistry;
+use tokio::time::Instant as Deadline;
 
 fn http_probe_context(request: &::http::Request<()>, addr: SocketAddr) -> ScoreSelectionContext {
     let family = target_family(addr);
@@ -34,6 +39,7 @@ pub(in crate::control) struct ProxyHttpProber {
     pub(super) runtime_registry: honk_outbound::runtime::SharedRuntimeRegistry,
     check_method: String,
     group_manager: SharedGroupManager,
+    udp_recovery_resolver: Option<crate::outbound::ResolveHook>,
 }
 
 impl ProxyHttpProber {
@@ -50,7 +56,16 @@ impl ProxyHttpProber {
             runtime_registry,
             check_method,
             group_manager,
+            udp_recovery_resolver: None,
         }
+    }
+
+    pub(in crate::control) fn with_udp_recovery_resolver(
+        mut self,
+        resolver: crate::outbound::ResolveHook,
+    ) -> Self {
+        self.udp_recovery_resolver = Some(resolver);
+        self
     }
 
     /// Find the exact admitted node; display names need not be unique.
@@ -260,5 +275,195 @@ impl honk_outbound::alive::HttpProber for ProxyHttpProber {
                 observation,
             }
         })
+    }
+}
+
+impl ProxyHttpProber {
+    fn route_probe_is_current(
+        &self,
+        ticket: &RouteProbeTicket,
+        generation: &Arc<OutboundRuntimeRegistry>,
+    ) -> bool {
+        let manager = self.group_manager.read();
+        let active = self.runtime_registry.read();
+        Arc::ptr_eq(&active, generation)
+            && !generation.is_shutdown()
+            && ticket.is_current_for(&manager)
+    }
+}
+
+#[async_trait::async_trait]
+impl RouteHttpProber for ProxyHttpProber {
+    async fn probe_route_http(
+        &self,
+        alive: &AliveDialerSet,
+        ticket: &RouteProbeTicket,
+        deadline: Deadline,
+    ) -> anyhow::Result<Option<ProbeMeasurement>> {
+        // Capture the registry and HTTP method under the accepted publication
+        // order. The ticket already owns the root's effective URL and witness.
+        let (generation, config) = {
+            let Ok(config) = self.config.try_read() else {
+                return Ok(None);
+            };
+            let manager = self.group_manager.read();
+            let generation = self.runtime_registry.read();
+            if !ticket.is_current_for(&manager) || generation.is_shutdown() {
+                return Ok(None);
+            }
+            (Arc::clone(&generation), Arc::clone(&config))
+        };
+        let Ok(request) = honk_outbound::urltest::health_http_probe_request(
+            ticket.url(),
+            &config.global.tcp_check_http_method,
+        ) else {
+            return Ok(None);
+        };
+        let connect_timeout = Duration::from_millis(config.global.connect_timeout_ms);
+        if Deadline::now() >= deadline || !self.route_probe_is_current(ticket, &generation) {
+            return Ok(None);
+        }
+        let addrs = alive.route_probe_addrs(ticket).await?;
+        let target = ticket.target();
+        let dial = match &target {
+            DialKey::Node(id) => DialRef::Node(*id),
+            DialKey::Route(route) => DialRef::Route(route),
+        };
+        let mut last_error = None;
+        for addr in addrs {
+            let remaining = deadline.saturating_duration_since(Deadline::now());
+            if remaining.is_zero() || !self.route_probe_is_current(ticket, &generation) {
+                return Ok(None);
+            }
+            // The pinned IP determines the destination family; the request
+            // still supplies the configured HTTP Host and verified TLS name.
+            let stream = match self
+                .proxy_registry
+                .dial_ref(
+                    Arc::clone(&generation),
+                    dial,
+                    addr,
+                    None,
+                    connect_timeout.min(remaining),
+                )
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) if is_packet_rejection(&error) => return Err(error),
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let remaining = deadline.saturating_duration_since(Deadline::now());
+            if remaining.is_zero() || !self.route_probe_is_current(ticket, &generation) {
+                return Ok(None);
+            }
+            // Once the HTTP exchange starts, never replay the configured method.
+            let sample =
+                honk_outbound::urltest::validate_routed_http_probe(stream, &request, remaining)
+                    .await?;
+            return Ok(self
+                .route_probe_is_current(ticket, &generation)
+                .then_some(sample));
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
+    }
+
+    async fn probe_route_udp(
+        &self,
+        alive: &AliveDialerSet,
+        ticket: &RouteProbeTicket,
+        deadline: Deadline,
+        cancel: honk_outbound::alive::ProbeCancellation,
+    ) -> anyhow::Result<()> {
+        let (generation, connect_timeout) = {
+            let Ok(config) = self.config.try_read() else {
+                return Ok(());
+            };
+            let manager = self.group_manager.read();
+            let generation = self.runtime_registry.read();
+            if !ticket.is_current_for(&manager) || generation.is_shutdown() {
+                return Ok(());
+            }
+            (
+                Arc::clone(&generation),
+                Duration::from_millis(config.global.connect_timeout_ms),
+            )
+        };
+        let current = || {
+            !cancel.is_cancelled()
+                && Deadline::now() < deadline
+                && self.route_probe_is_current(ticket, &generation)
+        };
+        let exchange = async {
+            let key = ticket.target();
+            let dial = match &key {
+                DialKey::Node(id) => DialRef::Node(*id),
+                DialKey::Route(route) => DialRef::Route(route),
+            };
+            let terminal = self.proxy_registry.udp_framing_node(&generation, dial)?;
+            let address = cancel
+                .scope_resolution(alive.route_udp_probe_addr(
+                    ticket,
+                    |port| honk_outbound::descriptor::udp_target_allowed(terminal, port),
+                    self.udp_recovery_resolver.as_ref(),
+                ))
+                .await?;
+            let Some(address) = address.filter(|_| current()) else {
+                return Ok(None);
+            };
+            let budget = connect_timeout.min(deadline.saturating_duration_since(Deadline::now()));
+            let transport = match dial {
+                DialRef::Node(id) => {
+                    self.proxy_registry
+                        .dial_udp_transport_runtime(
+                            Arc::clone(&generation),
+                            id,
+                            address,
+                            None,
+                            budget,
+                        )
+                        .await?
+                }
+                DialRef::Route(route) => {
+                    self.proxy_registry
+                        .dial_udp_route(Arc::clone(&generation), route, address, None, budget)
+                        .await?
+                }
+            };
+            if !current() {
+                return Ok(None);
+            }
+            use crate::dns::forwarder::{UdpProbeSend, udp_dns_probe_exchange};
+            let send = UdpProbeSend::recovery(dial, terminal.id, &current);
+            udp_dns_probe_exchange(transport.as_ref(), send).await?;
+            Ok::<_, anyhow::Error>(Some(()))
+        };
+        let result = tokio::time::timeout_at(deadline, exchange)
+            .await
+            .unwrap_or_else(|error| Err(error.into()));
+        let success = match &result {
+            Ok(Some(())) => true,
+            Ok(None) => return Ok(()),
+            Err(error) if udp_probe_local_refusal(error) => return Ok(()),
+            Err(_) => false,
+        };
+        let notifications = {
+            let manager = self.group_manager.read();
+            let active = self.runtime_registry.read();
+            if !Arc::ptr_eq(&active, &generation)
+                || generation.is_shutdown()
+                || !ticket.is_current_for(&manager)
+            {
+                return Ok(());
+            }
+            ticket.settle_udp(success, deadline, &cancel)
+        };
+        notifications.notify();
+        result.map(|_| ())
     }
 }

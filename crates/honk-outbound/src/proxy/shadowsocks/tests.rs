@@ -1,5 +1,7 @@
 use super::*;
-use crate::test_support::{assert_legacy_bulk_echo, mock_legacy_tcp_server};
+use crate::test_support::{
+    TCP_TARGET, TCP_TARGET_HEADER, assert_legacy_bulk_echo, mock_legacy_tcp_server,
+};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 #[test]
@@ -111,6 +113,41 @@ async fn udp_send_waits_for_cipher_instead_of_reporting_a_drop_as_success() {
     assert!(received > b"retained".len());
 }
 
+#[tokio::test]
+async fn checked_udp_send_rechecks_while_waiting_for_cipher() {
+    use crate::proxy::{PacketRejection, io_packet_rejection};
+    use std::task::{Context, Poll, Waker};
+    use tokio::net::UdpSocket;
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(socket.local_addr().unwrap()).await.unwrap();
+    let target = "127.0.0.1:53".parse().unwrap();
+    let transport = legacy_transport(socket, target);
+    let _cipher = transport.crypto.lock().await;
+    let admitted = AtomicBool::new(false);
+    let allowed = AtomicBool::new(true);
+    let current = || allowed.load(Ordering::Acquire);
+    let mut send = std::pin::pin!(transport.send_to_checked(
+        target,
+        None,
+        b"waiting",
+        Some(&admitted),
+        &current,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(send.as_mut().poll(&mut cx).is_pending());
+
+    allowed.store(false, Ordering::Release);
+    let Poll::Ready(result) = send.as_mut().poll(&mut cx) else {
+        panic!("withdrawal must settle a send waiting for the cipher");
+    };
+    assert_eq!(
+        io_packet_rejection(&result.unwrap_err()),
+        Some(PacketRejection::Cancelled)
+    );
+    assert!(!admitted.load(Ordering::Acquire));
+}
+
 #[test]
 fn test_legacy_udp_roundtrip_chacha() {
     let crypto = LegacyUdpCrypto::new("chacha20-ietf-poly1305", "test-password").unwrap();
@@ -213,7 +250,7 @@ async fn test_dial_tcp_legacy_end_to_end() {
     let server_addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (server, _) = listener.accept().await.unwrap();
-        mock_legacy_tcp_server(server).await;
+        mock_legacy_tcp_server(server, &TCP_TARGET_HEADER).await;
     });
 
     let node = Node {
@@ -230,7 +267,7 @@ async fn test_dial_tcp_legacy_end_to_end() {
         ..Default::default()
     };
     let handler = ShadowsocksHandler::new();
-    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = handler
         .dial(&node, target, None, std::time::Duration::from_secs(3))
         .await
@@ -238,13 +275,11 @@ async fn test_dial_tcp_legacy_end_to_end() {
     assert_legacy_bulk_echo(&mut stream.stream).await;
 }
 
-/// The legacy dial over a non-TCP carrier: same wire codec, no physical
-/// socket underneath.
 #[tokio::test]
 async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     // Large enough to hold the whole echo while the client is still writing.
     let (client, server) = tokio::io::duplex(4 << 20);
-    tokio::spawn(mock_legacy_tcp_server(server));
+    tokio::spawn(mock_legacy_tcp_server(server, &TCP_TARGET_HEADER));
 
     let mut node = Node {
         name: "test-ss-tunnel".into(),
@@ -262,7 +297,7 @@ async fn legacy_tcp_relay_runs_over_a_non_tcp_stream() {
     };
     node.id = node.derive_id();
     let runtime = crate::runtime::NodeRuntime::try_ephemeral(&node).unwrap();
-    let target: SocketAddr = "93.184.216.34:80".parse().unwrap();
+    let target: SocketAddr = TCP_TARGET.parse().unwrap();
     let mut stream = ShadowsocksHandler::new()
         .dial_over(
             runtime,
@@ -330,8 +365,7 @@ mod tunneled_request_observation {
             .unwrap()
     }
 
-    /// The request is sent only once the carrier has flushed it, so a
-    /// buffered carrier holds no part of the prologue when the event fires.
+    /// After `dial_over` returns, the request event is present and the peer can read the salt.
     #[tokio::test]
     async fn request_sent_follows_the_buffered_carrier_flush() {
         for (method, password) in METHODS {
@@ -369,8 +403,8 @@ mod tunneled_request_observation {
                 events.lock().is_empty(),
                 "{method}: published before delivery"
             );
-            let (request, position) = request.lock().take().expect(method);
-            request.delivered(position);
+            let (request, _) = request.lock().take().expect(method);
+            request.confirm();
             assert!(request_sent(&events.lock()), "{method}");
         }
     }

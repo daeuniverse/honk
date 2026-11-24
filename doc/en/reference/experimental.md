@@ -60,6 +60,8 @@ experimental {
 
 The `native_api` section requires the opt-in `native-api` Cargo feature. Build with `--features native-api` or `--features native-ui`, or use a full release or a release whose name contains `-native-api`. It does not require `clash-api`. The listener is off by default, and enabling it in a build without the feature fails startup.
 
+These startup errors point at a misplaced setting. `native API setting belongs inside native_api { }` means the field sits directly under `experimental`; move it into the nested block. `unknown experimental setting` means the key is not part of any experimental section; `enabled` and `secret` also produce it because they belong to several blocks. `native-api feature is required` means the build lacks the feature while `enabled` is true.
+
 Unknown fields, nested scalar blocks, malformed booleans and empty security-list members are errors.
 
 Boolean keys take `true` or `false`; the loader also accepts `yes`/`no`, `1`/`0` and `on`/`off` in any case. Any other spelling, such as `t`, produces an `invalid-config-value` error. The [dialect reference](./dialect.md#scalars-and-lists) lists the strict settings.
@@ -191,7 +193,7 @@ A relative `ui` path follows the existing dependency search: an existing path un
 
 ### Embedded UI
 
-To serve the UI from a single binary, use a full release build. Alternatively, build with `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, then set `ui: embedded` or `ui: embedded-lite`. The `native-ui` feature includes `native-api` without requiring Clash. Enabled embedded hosting fails startup in a build without it. The assets receive no injected credentials; clients use public discovery to select static-token entry or password setup/login. The [API reference](./api.md#embedded-doona-provenance) documents asset and source identities, corresponding-source distribution, and the management contract.
+To serve the UI from a single binary, use a full release build. Alternatively, build with `HONK_DOONA_DIR=$(ci/fetch-doona.sh) cargo build -p honk-core --features native-ui`, then set `ui: embedded` or `ui: embedded-lite`. The `native-ui` feature includes `native-api` without requiring Clash. Enabled embedded hosting fails startup in a build without it. The assets receive no injected credentials; sign-in and administrator setup are described in the [doona manual](https://daeuniverse.org/doona/). The [API reference](./api.md#embedded-doona-provenance) documents asset and source identities, corresponding-source distribution, and the management contract.
 
 ### Geodata sources
 

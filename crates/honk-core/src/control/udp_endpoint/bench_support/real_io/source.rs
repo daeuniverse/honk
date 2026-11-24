@@ -228,6 +228,7 @@ impl IoHarness {
                 node_id: source.node.id,
                 node_name: source.node.name.clone(),
                 health_family: IpVersion::V4,
+                evidence: None,
             }
         };
         self.install_source(destination, preparation).await

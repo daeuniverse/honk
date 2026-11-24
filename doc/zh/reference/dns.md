@@ -228,7 +228,7 @@ upstream {
 | DoQ | 支持经出站的 UDP-capable `PacketTransport`。 |
 | DoH3 | 支持经出站的 UDP-capable `PacketTransport`。 |
 
-带 [`exit`](./groups.md#出口) 的组经它的路由传输上表中基于 TCP 的上游。DoQ 和 DoH3 上游不经过这类路由，DNS 传输层会拒绝这类拨号。
+带 [`exit`](./groups.md#出口) 的组通过路由的 TCP 流传输 TCP、DoT、DoH 和经代理的 UDP 上游。DoQ 和 DoH3 在组选路前排除由组出口组成的多跳路由。支持 UDP 且符合条件的节点可以承载这两种上游，包括支持 UDP 的配置链和折叠为一个合格节点的路由。选中的 `block` 仍是终止动作。
 
 ## DNS 路由
 
@@ -299,6 +299,7 @@ dns {
 }
 ```
 
+- 代理链本身没有服务器域名；各物理节点的域名保留各自的订阅标签。
 - 节点域名只匹配含 `subtag()` 的规则；普通规则、fallback 和没匹配上的域名仍走 bootstrap 解析。其他查询不带订阅，对它们来说 `subtag()` 和 `!subtag()` 都是 false。
 - 被接管的查询只发往选中的上游，遵守 `strategy` 和 `use_host`，不走缓存和 response 规则，也不回退：查询失败就表示物理节点连接或探测连接失败。
 - 接管按域名生效，不是端到端的下载目标解析策略。下载时为选路而预先解析 URL 域名，只是尽力而为；代理下载的 URL 域名仍由代理解析，而承载代理自身的节点服务器解析遵守这条规则。显式使用 bootstrap 解析器的下载绕过这个 hook。

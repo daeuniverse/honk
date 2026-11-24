@@ -228,7 +228,7 @@ Only unquoted `->` and `outbound:` suffixes select detours. Inside a quoted URI 
 | DoQ | Supported through the outbound's UDP-capable `PacketTransport`. |
 | DoH3 | Supported through the outbound's UDP-capable `PacketTransport`. |
 
-A group with an [`exit`](./groups.md#exit) carries the TCP-based upstreams above over its route. DoQ and DoH3 upstreams do not go through such a route: the DNS transport rejects the dial.
+A group with an [`exit`](./groups.md#exit) carries TCP, DoT, DoH and proxied UDP upstreams over the route's TCP stream. DoQ and DoH3 filter out synthesized multi-hop routes before group selection. An eligible UDP-capable node, including a configured chain with UDP support or a route that collapses to one eligible node, can serve them. A selected `block` remains terminal.
 
 ## DNS routing
 
@@ -299,6 +299,7 @@ dns {
 }
 ```
 
+- A chain has no server hostname of its own. Its physical hops keep their own subscription tags.
 - Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts still use the bootstrap resolver. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
 - A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, and skips the cache and response rules. It never falls back, so its failure fails the physical node or probe connection.
 - A claim applies to the hostname. It is not an end-to-end policy for the download destination. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.

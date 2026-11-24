@@ -16,6 +16,8 @@ use honk_outbound::runtime::{NodeRuntime, OutboundRuntimeRegistry};
 use std::collections::HashMap;
 use std::sync::Weak;
 
+mod composed;
+
 const TARGETS: usize = MAX_REPLY_SOCKETS_PER_ENDPOINT + 1;
 
 type Reply = io::Result<(Vec<u8>, SocketAddr)>;
@@ -34,6 +36,7 @@ struct MemoryTransport {
     live: Arc<AtomicUsize>,
     sent: Mutex<Vec<Sent>>,
     fixed_target_sends: AtomicUsize,
+    first_send_credit: Semaphore,
     fail_send: AtomicBool,
     stall_before_admission: AtomicBool,
     cancelled_sends: AtomicUsize,
@@ -51,6 +54,7 @@ impl MemoryTransport {
             live: Arc::clone(live),
             sent: Mutex::new(Vec::new()),
             fixed_target_sends: AtomicUsize::new(0),
+            first_send_credit: Semaphore::new(1),
             fail_send: AtomicBool::new(false),
             stall_before_admission: AtomicBool::new(false),
             cancelled_sends: AtomicUsize::new(0),
@@ -116,6 +120,15 @@ impl PacketTransport for MemoryTransport {
         Err(io::Error::other("shared source must use send_to"))
     }
 
+    async fn send_packet_checked(
+        &self,
+        data: &[u8],
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        self.send_to_checked(self.relay_addr(), None, data, None, current)
+            .await
+    }
+
     async fn recv_packet(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let reply = self.replies.lock().await.recv().await;
         let (data, peer) = reply.ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))??;
@@ -162,6 +175,21 @@ impl MultiTargetTransport for MemoryTransport {
         }
 
         Ok(())
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        let _credit = self.first_send_credit.acquire().await.unwrap();
+        if !current() {
+            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+        }
+        self.send_to(target, domain, data, true, admitted).await
     }
 
     fn carrier_addr(&self) -> Option<SocketAddr> {
@@ -279,6 +307,7 @@ impl Fixture {
             node_id: self.node.id,
             node_name: self.node.name.clone(),
             health_family: self.family,
+            evidence: None,
         }
     }
 
@@ -324,7 +353,7 @@ impl Fixture {
         else {
             panic!("expected vacant endpoint");
         };
-        assert!(lease.bind_selected_node(self.node.id));
+        assert!(lease.bind_selected(self.node.id, None));
         lease
     }
 
@@ -419,6 +448,109 @@ impl Fixture {
         assert!(!self.generation.tasks_failed());
         assert_eq!(self.live.load(Ordering::SeqCst), 0, "transport leaked");
     }
+}
+
+#[tokio::test]
+async fn bare_source_reply_does_not_reset_a_later_terminal_failure() {
+    let fixture = Fixture::new(false, 4).await;
+    let node = fixture.node.id;
+    let domain = ProbeDomain::DataUdp;
+    let family = IpVersion::V4;
+    let manager = Arc::new(GroupManager::with_alive_set(
+        &[honk_config::group::Group {
+            name: "collapsed".into(),
+            nodes: vec![node],
+            exit: Some(fixture.node.name.clone()),
+            ..Default::default()
+        }],
+        std::slice::from_ref(&fixture.node),
+        Some(Arc::clone(&fixture.alive)),
+    ));
+    manager.publish_route_health();
+    let evidence = UdpTrafficEvidence::capture_bare(&manager, &fixture.generation, node, family)
+        .expect("the physical exit also carries standalone UDP");
+    let client = fixture.client();
+    let target = fixture.target(0);
+    let attachment = fixture
+        .fresh(client, None)
+        .with_evidence(Some(Arc::new(evidence)))
+        .commit(&fixture.pool)
+        .await
+        .unwrap();
+    let owner = attachment.owner();
+    let lease = fixture.reserve(client, target, b"request");
+    let (endpoint, mut driver) = fixture
+        .install(lease, attachment, client, target, target)
+        .await;
+    tokio::time::timeout(TEST_TIMEOUT, driver.wait_first_ack())
+        .await
+        .unwrap()
+        .unwrap();
+
+    fixture
+        .alive
+        .report_unavailable_forced(node, domain, family);
+    assert!(!fixture.alive.is_alive_for(node, domain, family));
+    let (published, notification) = oneshot::channel();
+    let published = Mutex::new(Some(published));
+    let weak_alive = Arc::downgrade(&fixture.alive);
+    let weak_owner = Arc::downgrade(&owner);
+    fixture.alive.set_routed_udp_connectivity_callback(
+        move |id, observed_domain, observed_family| {
+            assert_eq!(
+                (id, observed_domain, observed_family),
+                (node, domain, family)
+            );
+            let alive = weak_alive.upgrade().unwrap();
+            assert!(alive.routed_udp_node_proven(node, domain, family));
+            assert!(alive.is_alive_for(node, domain, family));
+
+            // Force retirement before returning to the reply path. A bounded
+            // wait detects a callback that still holds the source lock.
+            let owner = weak_owner.upgrade().unwrap();
+            let (done, completed) = std::sync::mpsc::channel();
+            let reporter = std::thread::spawn(move || {
+                let error = io::Error::from(io::ErrorKind::ConnectionReset);
+                owner.fail(ScoreOutcome::from_io_error(&error), Some(&error));
+                let _ = done.send(());
+            });
+            completed
+                .recv_timeout(TEST_TIMEOUT)
+                .expect("retirement blocked behind the reply callback");
+            reporter.join().unwrap();
+            published
+                .lock()
+                .take()
+                .expect("one scoped reply notification")
+                .send(())
+                .unwrap();
+        },
+    );
+    fixture.transport().reply(target, b"answer");
+    assert_eq!(
+        received(&fixture.client).await,
+        (b"answer".to_vec(), target)
+    );
+    tokio::time::timeout(TEST_TIMEOUT, notification)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(endpoint.has_reply());
+    assert!(fixture.pool.get(client, target).is_none());
+
+    for _ in 0..48 {
+        fixture
+            .alive
+            .report_unavailable_traffic(node, domain, family);
+    }
+    assert!(fixture.alive.is_alive_for(node, domain, family));
+    fixture
+        .alive
+        .report_unavailable_traffic(node, domain, family);
+    assert!(!fixture.alive.is_alive_for(node, domain, family));
+    drop(owner);
+    drop(endpoint);
+    fixture.shutdown().await;
 }
 
 #[tokio::test]

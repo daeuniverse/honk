@@ -274,7 +274,8 @@ async fn cold_quic_warm_time_is_not_reported() {
             Default::default(),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .latency;
 
         assert!(elapsed < Duration::from_millis(50), "{name}: {elapsed:?}");
     }
@@ -887,14 +888,18 @@ async fn test_urltest_group_does_not_penalize_resolver_rejection() {
     ));
     let registry = Arc::new(registry);
     let alive_set = Arc::new(AliveDialerSet::new());
-    let runtime = Arc::new(
-        crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&member)).unwrap(),
-    );
+    alive_set.register_node(member.id, member.name.clone(), Some(member.address.clone()));
+    let members = [(&member, alive_set.probe_ticket(member.id))];
+    let published = crate::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&member))
+        .unwrap()
+        .into_shared();
+    let runtime = published.read().clone();
 
     for _ in 0..2 {
         let results = urltest_group_impl(
-            std::slice::from_ref(&member),
+            &members,
             &runtime,
+            &published,
             &registry,
             &alive_set,
             "https://rejected.invalid/",
@@ -928,6 +933,7 @@ async fn urltest_group_failures_do_not_advance_real_dial_streaks() {
     let alive_set = Arc::new(AliveDialerSet::new());
     let members = vec![make_node("good"), make_node("bad")];
     for member in &members {
+        alive_set.register_node(member.id, member.name.clone(), Some(member.address.clone()));
         alive_set.record_probe_latency(
             member.id,
             ProbeDomain::Tcp,
@@ -935,11 +941,19 @@ async fn urltest_group_failures_do_not_advance_real_dial_streaks() {
             Duration::from_millis(999),
         );
     }
-    let runtime = Arc::new(crate::runtime::OutboundRuntimeRegistry::build(&members).unwrap());
+    let published = crate::runtime::OutboundRuntimeRegistry::build(&members)
+        .unwrap()
+        .into_shared();
+    let runtime = published.read().clone();
+    let tickets: Vec<_> = members
+        .iter()
+        .map(|member| (member, alive_set.probe_ticket(member.id)))
+        .collect();
     for _ in 0..3 {
         let results = urltest_group_impl(
-            &members,
+            &tickets,
             &runtime,
+            &published,
             &registry,
             &alive_set,
             &url,

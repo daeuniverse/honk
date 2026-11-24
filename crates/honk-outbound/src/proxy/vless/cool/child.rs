@@ -6,6 +6,7 @@ use super::{
     SessionPermit, SocketAddr, TCP_QUEUE_CAPACITY, UDP_QUEUE_CAPACITY, UdpDestination,
     VlessCoolSession, WriterCommand, async_trait, connect, io, mpsc,
 };
+use crate::proxy::packet::send_with_admission_check;
 
 pub(super) type IoFuture = Pin<Box<dyn Future<Output = io::Result<()>> + Send>>;
 pub(super) type ReserveFuture = Pin<
@@ -474,6 +475,27 @@ impl VlessXudpTransport {
             }
         }
     }
+
+    /// Check selection authority until the writer owns the command, then
+    /// await that command's acknowledgement. A supplied marker starts false
+    /// and belongs to this send alone.
+    pub async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        payload: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        let local_admitted = AtomicBool::new(false);
+        let admitted = admitted.unwrap_or(&local_admitted);
+        send_with_admission_check(
+            self.send_to(target, target_domain, payload, Some(admitted)),
+            admitted,
+            current,
+        )
+        .await
+    }
 }
 
 impl Drop for VlessXudpTransport {
@@ -618,4 +640,89 @@ pub(crate) async fn connect_single_xudp(
                 error
             }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::{PacketRejection, io_packet_rejection};
+    use std::task::Waker;
+
+    #[tokio::test]
+    async fn checked_xudp_waits_for_ack_only_after_queue_admission() {
+        for driver_marker in [false, true] {
+            let (stream, _peer) = tokio::io::duplex(1);
+            let session = connect(Box::new(stream), 1);
+            let target = "127.0.0.1:5353".parse().unwrap();
+            let mut udp = open_xudp(
+                Arc::clone(&session),
+                session.try_reserve().unwrap(),
+                target,
+                None,
+                [0; 8],
+            )
+            .await
+            .unwrap_or_else(|_| panic!("XUDP child must open"));
+            // Intercept queue admission without a driver or a wire writer.
+            let (tx, mut rx) = mpsc::channel(1);
+            Arc::get_mut(&mut udp).unwrap().writer.tx = tx;
+            let blocker = udp.writer.tx.try_reserve().unwrap();
+            let admitted = AtomicBool::new(false);
+            let admission = driver_marker.then_some(&admitted);
+            let allowed = AtomicBool::new(true);
+            let current = || allowed.load(Ordering::Acquire);
+            let mut cx = Context::from_waker(Waker::noop());
+            {
+                let mut send = std::pin::pin!(udp.send_to_checked(
+                    target,
+                    None,
+                    b"withdrawn",
+                    admission,
+                    &current,
+                ));
+                assert!(send.as_mut().poll(&mut cx).is_pending());
+                assert!(udp.write.try_lock().is_err());
+                allowed.store(false, Ordering::Release);
+                drop(blocker);
+                let Poll::Ready(result) = send.as_mut().poll(&mut cx) else {
+                    panic!("withdrawal must settle the pending reservation");
+                };
+                assert_eq!(
+                    io_packet_rejection(&result.unwrap_err()),
+                    Some(PacketRejection::Cancelled)
+                );
+            }
+            assert!(!admitted.load(Ordering::Acquire));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(udp.destination.lock().is_none());
+            assert!(udp.source_send_usable().await);
+
+            let other = "127.0.0.1:5354".parse().unwrap();
+            allowed.store(true, Ordering::Release);
+            let mut send =
+                std::pin::pin!(udp.send_to_checked(other, None, b"admitted", admission, &current,));
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(admitted.load(Ordering::Acquire), driver_marker);
+            allowed.store(false, Ordering::Release);
+            assert!(send.as_mut().poll(&mut cx).is_pending());
+
+            let command = rx.try_recv().unwrap();
+            assert!(command.flush);
+            assert_eq!(
+                command.frame,
+                udp_frame(udp.id, true, other, None, [0; 8], b"admitted").unwrap()
+            );
+            command.done.unwrap().send(Ok(())).unwrap();
+            assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+            assert!(matches!(
+                rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert!(udp.source_send_usable().await);
+            session.close();
+        }
+    }
 }

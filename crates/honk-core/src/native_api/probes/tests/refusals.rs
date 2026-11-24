@@ -7,19 +7,12 @@ async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
     let proxy_id = proxy.id.to_string();
     let mut land = Node::from_share_link("socks5://127.0.0.1:1081").unwrap();
     land.name = "land".into();
-    let mut chain = Node {
-        name: "via".into(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: vec!["front".into(), "land".into()],
-        },
-        ..Node::default()
-    };
-    chain.id = chain.derive_id();
+    let chain = Node::chain_from_nodes("via", &[&proxy, &land]).unwrap();
     let chain_id = chain.id.to_string();
     let mut config = Config::default();
     config.nodes.extend([proxy, land, chain]);
     config.global.tcp_check_url = vec!["http://127.0.0.1:8080/PRIVATE".into()];
-    config.global.udp_check_dns = Vec::new();
+    config.global.udp_check_dns = Some(Vec::new());
     let state = state(config).await;
     let direct = state
         .config

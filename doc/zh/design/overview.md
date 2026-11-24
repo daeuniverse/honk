@@ -68,7 +68,7 @@ flowchart LR
 - `src/node/wire.rs` 是唯一的扁平 serde 适配器。VLESS 输入只要含有已移除的旧字段，即使值为 `null`，也会被拒绝。同一字段在非 VLESS 输入上仅为兼容而保留。`VlessConfig.network`、`udp_encoding` 与 `multiplex` 参与身份派生，因此切换规范模型会改变 VLESS `Node.id`，但不会改变 VMess 的行为或身份。
 - 行为概要见[出站设计](./outbound.md#vless-wire-契约)，字段语法见[节点参考](../reference/nodes.md)。
 - `src/experimental.rs`：`ExperimentalConfig` 持有 `clash_api: ClashApiConfig`、`cache_file: CacheFileConfig` 和 `native_api`。原生设置严格校验、独立启用，而且都需要重启。`native-api` 要显式编译，可用 `--features native-api` 或 `native-ui` 构建，full 与 `-native-api` 发布产物都包含它。它提供用户态观测、有界历史、由源文件管理的组 PATCH 和主文件条目管理，以及已验证 geodata 的激活。listener 仍默认关闭。`.dae` 仍是唯一的配置权威。原文披露与写入权限各自独立。带凭据的来源只读。接口返回正文时会遮蔽 listener secret 的值，而不是省略整段正文。按网络的自动策略 pin/clear 已启用；pin 归属于当前 `GroupManager`，激活后失效。原生 mode 与完整内核透明仍未开放。`native-ui` 默认关闭，打包时通过 `ci/fetch-doona.sh` 和 `.github/ci/pins.env` 获取带许可及版本记录的 doona 发行资产。`build.rs` 读取绝对路径 `HONK_DOONA_DIR`，运行时不会获取资产或构建前端。dae 解析器目前显式允许 `clash_api` 和 `cache_file` 这两个嵌套节。旧的 `udp_nfqueue` 只作为迁移输入：解析时发出 warning，且只在没有配置 `global.nfqueue_enable` 时，把 `enabled` 复制到 `GlobalConfig::nfqueue_enable`。
-- `src/subscription.rs`、`src/types.rs`、`src/error.rs`。`src/types.rs` 里 `NodeProtocol` 有 12 个变体，Direct/Block 留给内置节点，Chain 用于链式节点；`DialMode` 为 ip/domain/domain+/domain++；还有 `SubscriptionType`、`DnsProtocol` 以及共享的 `default_true`/`parse_duration_secs` helper。`src/error.rs` 定义 `ConfigError`。
+- `src/subscription.rs`、`src/types.rs`、`src/error.rs`。`src/types.rs` 里 `NodeProtocol` 的 `Direct` 和 `Block` 留给内置节点，`Chain` 用于链式节点。`DialMode` 为 `ip`、`domain`、`domain+` 或 `domain++`。该文件还定义 `SubscriptionType`、`DnsProtocol` 以及共享的 `default_true`/`parse_duration_secs` helper。`src/error.rs` 定义 `ConfigError`。
 
 ## 高层数据路径
 
@@ -114,9 +114,9 @@ flowchart TB
 - NFQUEUE readiness 与所有权：启用但尚未 ready 时，只丢弃需要暂存的新流。honk 独占队列 `320` 和 nftables `inet honk_nfqueue` / `udp_decision`。ready 变更必须经过 fence，生命周期有歧义就是 fatal，同一 netns 的防火墙管理器不得修改这些对象。
 - Token 校验终态：暂存 UDP token 必须在 skb mark、内核状态、handoff、redirect track、用户态 verdict 状态、lease/endpoint 和后端转换之间保持一致。Direct 遵循 Arm → 全部带标记 verdict → Activate；proxy 在唯一的规范拨号/发送路径之前发布最终状态。
 - `must`/`block` 终结性：Clash 模式覆盖永远不会替换 `block` 结果或 dae `(must)` 结果。
-- 失活出站 fail-closed：`lan_ingress` 丢弃路由到失活出站的新流。未配置 `final` 且只有一个叶节点的 TCP 组，会让同一个代理继续作为用户态的最后尝试。UDP 以及叶节点全部失活的多叶节点组仍保持 fail-closed。含有 `direct`/`block` 内置成员的组永远不会失活：内置节点不会被判定失活，因此 group-OR 槽保持开放。TCP 与 UDP 端口 `53` 不受该健康检查丢包影响，但仍遵循用户的终局 `must` 结果。
+- `lan_ingress` 丢弃路由到失活出站的新流。只有一个叶节点且未配置 `final` 的 TCP 组可以在用户态对同一代理作最后一次尝试。LAN 入站和 WAN 出站的 TCP、UDP 目的端口 `53` 豁免健康检查丢包，仍遵循终局 `must` 规则。
 - 显式本地路由：网关管理访问由用户[显式配置](../reference/routing.md#显式本地路由)，不会自动生成接口规则。WAN egress 仍会旁路目的地址匹配 `PARAM.local_ip` 的流量，但这不保证一般管理访问可达。`PARAM.local_ip` 是启动时的快照。选取过程如下：先选出第一个已解析、存在且能绑定到规范根接口的 LAN 项，没有则选 WAN；跳过被拒绝的根接口，再取该根接口的第一个 IPv4 地址。规范化遵循接口计划器：bond/bridge 成员使用其规范 master，`vrf`/`openvswitch` 成员保持自身。没有可选的根接口，或所选根接口没有 IPv4 地址时，该值为 0，该旁路保持关闭。之后的接口或地址变化不会更新快照；LAN 缺席时选中的 WAN 地址也会在整个进程生命周期内保持不变。接口观察仍用于拓扑、ECS 和健康检查；非 DNS TCP 纯 SYN 的现有本地探测跳过策略不变。
-- 组 OR 连通性：一个组的 eBPF alive slot 是组内全部叶节点成员状态的 OR，并包含上面单叶 TCP 最后尝试的例外。多叶节点组中的单个成员失活，不得使整个组 fail-closed。
+- 普通组将符合条件的叶节点状态取 OR 后发布到 eBPF 槽。带出口路由的组，以及包含可承载 UDP 的配置链的 UDP 组，按当前策略允许的路径发布连通性。选中 `block` 时槽保持开放，由用户态拒绝流量。详见[出站存活状态](datapath.md#出站存活状态)。
 - Score 隔离与原因：健康过滤与业务目标地址族保持独立。首次选择的 utility 仍是启发式的。健康晋升会在一个评估集内比较所有合格挑战者与固定现任：评估集有界，大小按需确定；比较依据共同的目标与时间证据，而不是无关的聚合值或 setup 均值。可选试用共享一份保留的组／网络／地址族预算，额度由原始业务开始赚取，时间流逝不产生额度；试用不会取得已提交现任的身份。真实业务的连续失败保留退避与三连败排除。精确证据与聚合证据各有一个 4,096 项 LRU；比较存储最多 512 个 cell、1 MiB 逻辑分配，这不是进程 RSS。重叠计数不相加。reload 保留已通过 admission 的业务结果，并撤销近期可用性与探测基线。公开摘要与计数始终有明确范围，不导出原始目标 key。详见[组设计](./groups.md#score-评分与生命周期)。
 - Score 按需反馈：setup／首响应与有界的分方向进展可以在终态前发布，不会增加 Beta 完成次数。业务、配置健康和预热三种来源承担不同作用；任意手动 delay 测量都不会变成业务可靠性或配置基线。Score 的 TCP 建立失败可以在原 deadline 内通过另一个合格叶节点恢复一次，不打开新的 final、不绕过 Selector、也不重放负载。
 - 条件性验证接口：Score 代理组会发布聚合的临时／可用状态、新鲜的成对挑战者响应关系、证据问题与等待原因，这些内容与同一次只读选择出的成员一致。不存在全组范围的比较结论。`/stats` 增加固定的组／网络验证以及预算／成本字段，还有经嵌套去重的根业务计数；观察到的试用失败不会被计为额外的因果失败。两者都不导出原始目标 key 或最优概率。详见 [API 验证](../reference/api.md#score-验证信息)。

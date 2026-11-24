@@ -491,14 +491,7 @@ async fn sing_box_shared_source_eim_eif_and_domain_matrix() {
             .clone()
     };
     let (front, exit) = (hop("socks5"), hop("trojan"));
-    let mut via = Node {
-        name: "via".into(),
-        outbound: OutboundConfig::Chain {
-            hops: vec![front.name.clone(), exit.name.clone()],
-        },
-        ..Default::default()
-    };
-    via.id = via.derive_id();
+    let via = Node::chain_from_nodes("via", &[&front, &exit]).expect("bind UDP chain");
     cases.push(("trojan via socks5 chain", vec![via, front, exit]));
 
     let mut matrix = Vec::new();

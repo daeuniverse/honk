@@ -14,14 +14,14 @@ use quinn::ClientConfig;
 use tokio::sync::Mutex;
 use tracing::debug;
 
-use super::DialContext;
 use super::framing::force_dns_id_zero;
 use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::owned_task::OwnedTask;
 use super::quic::{QuicEndpoint, with_packet_cause};
+use super::{DialContext, RouteExchange};
 use super::{
     DnsMessageBody, SharedQuicEndpoint, build_doh_request, check_doh_status, dns_quic_config,
-    doh_content_length, exchange_with_retry, finish_doh_response, quic_connect_endpoint,
+    doh_content_length, finish_doh_response, quic_connect_endpoint,
 };
 
 type H3Sender = SendRequest<h3_quinn::OpenStreams, Bytes>;
@@ -67,13 +67,21 @@ impl Doh3Client {
         active_tasks: Arc<AtomicUsize>,
     ) -> anyhow::Result<Arc<Self>> {
         let quic_config = dns_quic_config(&[b"h3"]).await?;
-        Ok(Arc::new(Self {
+        Ok(Self::with_quic_config(dial, quic_config, active_tasks))
+    }
+
+    pub(super) fn with_quic_config(
+        dial: DialContext,
+        quic_config: ClientConfig,
+        active_tasks: Arc<AtomicUsize>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
             dial,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
             session: LifecycleSlot::new(),
             active_tasks,
-        }))
+        })
     }
 
     pub async fn exchange(
@@ -81,7 +89,16 @@ impl Doh3Client {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
+        self.exchange_routed(raw_query, feedback, None).await
+    }
+
+    pub(crate) async fn exchange_routed(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route: Option<RouteExchange<'_>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        super::retry::exchange_with_route_retry(
             "DoH3",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
@@ -94,6 +111,7 @@ impl Doh3Client {
                 }
             },
             feedback,
+            route,
         )
         .await
     }
@@ -265,6 +283,12 @@ impl Doh3Client {
             .await;
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.session.is_inactive(|session| {
+            session.connection.close_reason().is_some() || session.driver.is_finished()
+        })
+    }
+
     pub(crate) fn tasks_failed(&self) -> bool {
         self.quic_ep.tasks_failed()
     }
@@ -279,7 +303,7 @@ impl Doh3Client {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::{
         DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, exchange_with_retry,
         is_valid_response,
@@ -451,7 +475,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn respond_h3(
+    pub(in crate::dns::transport) async fn respond_h3(
         h3: &mut h3::server::Connection<h3_quinn::Connection, Bytes>,
         status: u16,
         body: Vec<u8>,

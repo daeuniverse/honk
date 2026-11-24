@@ -812,7 +812,7 @@ pub(crate) fn selection_evaluated(
 pub(crate) fn selection_path(
     selections: &[super::record::Selection],
     chain: &[String],
-    node: &honk_config::node::Node,
+    dialed: &honk_outbound::group::OwnedTarget,
     family: honk_outbound::alive::IpVersion,
 ) -> SelectionPath {
     let Some(observer) = flow_observation::current() else {
@@ -823,24 +823,23 @@ pub(crate) fn selection_path(
         return Vec::new();
     };
     let family = Some(super::producer::ip_family(family));
-    if chain.len() > MAX_RULE_VALUES {
+    let (member_id, member_name) = dialed.selected_member();
+    let Some((_, groups)) = chain.split_last() else {
+        return Vec::new();
+    };
+    if groups.len() > MAX_RULE_VALUES {
         observer.publish(FlowEvent::Gap(GapReason::BufferOverflow));
     }
-    chain
+    groups
         .iter()
         .take(MAX_RULE_VALUES)
         .enumerate()
         .filter_map(|(index, name)| {
             let group_id = catalog.groups.get(name)?;
-            let (member_id, member_name) = chain
-                .get(index + 1)
-                .and_then(|name| {
-                    catalog
-                        .groups
-                        .get(name)
-                        .map(|id| (id.clone(), bounded(name)))
-                })
-                .unwrap_or_else(|| (node.id.to_string(), bounded(&node.name)));
+            let (member_id, member_name) = match groups.get(index + 1) {
+                Some(group) => (catalog.groups.get(group)?.clone(), bounded(group)),
+                None => (member_id.to_string(), bounded(member_name)),
+            };
             let Some(captured) = captured_selection(selections, group_id, family, &member_id)
             else {
                 observer.publish(FlowEvent::Gap(GapReason::NotInstrumented));
@@ -866,8 +865,6 @@ pub(crate) fn outbound_evidence(
     selection_path: SelectionPath,
 ) -> Option<super::record::OutboundAttempt> {
     let observer = flow_observation::current()?;
-    // A route's leaf is the captured member; it dials a proxy whatever the
-    // leaf's own protocol.
     let node = dialed.map(|dialed| &dialed.node);
     let direct = dialed.is_none_or(|dialed| {
         dialed.route.is_none() && dialed.node.protocol() == honk_config::types::NodeProtocol::Direct

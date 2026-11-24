@@ -17,12 +17,15 @@
 //! Native probes use a caller-owned absolute deadline and cancellation signal;
 //! cold probes include connection setup and do not publish legacy health/Score feedback.
 
-use crate::alive::{AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement};
+use crate::alive::{
+    AliveDialerSet, IpVersion, ProbeCancellation, ProbeDomain, ProbeMeasurement, ProbeTicket,
+};
 use crate::group::{
     GroupManager, ScoreFeedback, ScoreOutcome, ScoreReporter, ScoreSelectionContext, ScoreSource,
     SelectionNetwork,
 };
-use crate::proxy::{ProxyRegistry, TcpOutbound};
+use crate::proxy::{AsyncReadWrite, ProxyRegistry, ProxyStream, TcpOutbound};
+use crate::runtime::SharedRuntimeRegistry;
 use anyhow::{Context, anyhow};
 use honk_config::check::{HttpCheckTarget, decode_health_http_target, decode_http_check_target};
 use honk_config::node::Node;
@@ -33,7 +36,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 mod exchange;
-use exchange::{exchange_http1, exchange_http2};
+use exchange::{exchange_http1, exchange_http2, exchange_routed_http1};
+
+enum HttpProbeMode {
+    Warm,
+    Cold,
+    Routed,
+}
 
 fn start_feedback(feedback: Option<ScoreFeedback>) -> Option<ScoreReporter> {
     feedback.map(|feedback| feedback.start())
@@ -151,8 +160,7 @@ fn urltest_timeout(timeout: Duration) -> Duration {
 }
 
 fn validate_runtime(runtime: &Arc<crate::runtime::NodeRuntime>) -> anyhow::Result<()> {
-    crate::runtime::NodeRuntime::validate_for_ephemeral(runtime.node.as_ref())
-        .map_err(anyhow::Error::new)
+    runtime.validate_for_probe().map_err(anyhow::Error::new)
 }
 
 /// Optional resolver for check-URL hosts: `(host, port) → Result<addrs>`.
@@ -191,6 +199,7 @@ pub async fn urltest_node(
         &ProbeCancellation::default(),
     )
     .await
+    .map(|measurement| measurement.latency)
 }
 
 async fn urltest_request_impl(
@@ -199,7 +208,7 @@ async fn urltest_request_impl(
     request: &http::Request<()>,
     timeout: Duration,
     cancel: &ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     validate_runtime(runtime)?;
     let target = request_target(request)?;
     let host = target.host();
@@ -218,7 +227,6 @@ async fn urltest_request_impl(
         None,
     )
     .await
-    .map(|measurement| measurement.latency)
 }
 
 async fn resolve_urltest_address(host: &str, port: u16) -> anyhow::Result<SocketAddr> {
@@ -252,6 +260,11 @@ pub fn try_probe_runtime(
     ),
     crate::runtime::RuntimeRegistryError,
 > {
+    if node.chain_hops().is_some() {
+        return generation
+            .admitted_chain_runtime(node)
+            .map(|runtime| (runtime, None));
+    }
     // Validate before looking up a warm runtime: a stale ID must not buy a
     // warm-path shortcut or cause feedback/resources to be initialized.
     crate::runtime::NodeRuntime::validate_for_ephemeral(node)?;
@@ -326,7 +339,7 @@ pub async fn urltest_node_in_generation_with_feedback(
     timeout: Duration,
     group_manager: &GroupManager,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     urltest_node_in_generation_impl(
         generation,
         node,
@@ -350,7 +363,7 @@ async fn urltest_node_in_generation_impl(
     timeout: Duration,
     group_manager: Option<&GroupManager>,
     cancel: ProbeCancellation,
-) -> anyhow::Result<Duration> {
+) -> anyhow::Result<ProbeMeasurement> {
     if cancel.is_cancelled() {
         return Err(crate::proxy::PacketRejection::Cancelled.into());
     }
@@ -455,8 +468,6 @@ async fn measure_http_probe_mode(
     let target = request_target(request)?;
     let normalized_request = build_http_probe_request(&target, request.method().clone())?;
     let request = &normalized_request;
-    let host = target.host();
-    let is_https = target.is_https();
     let node = runtime.node.as_ref();
     let reporter = start_feedback(feedback.map(|feedback| {
         feedback.with_probe_identity(&request.uri().to_string(), request.method().as_str())
@@ -476,29 +487,20 @@ async fn measure_http_probe_mode(
             .map_err(|_| phase_timeout("HTTP probe dial timed out"))??;
         reporter_setup(&reporter);
         tracing::debug!(node = %node.name, %addr, "HTTP probe dial established");
-        let stream = proxy.stream;
-        if is_https {
-            let connector = https_connector()?;
-            let tls = tokio::time::timeout(timeout, connector.connect(host, stream))
-                .await
-                .map_err(|_| phase_timeout("HTTP probe TLS handshake timed out"))?
-                .context("HTTP probe TLS handshake failed")?;
-            tracing::debug!(
-                node = %node.name,
-                alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
-                "HTTP probe TLS established"
-            );
-            match tls.ssl().selected_alpn_protocol() {
-                Some(b"h2") => exchange_http2(tls, request, &reporter, timeout, cold).await,
-                _ => {
-                    let mut tls = tls;
-                    exchange_http1(&mut tls, request, &reporter, timeout, cold).await
-                }
-            }
-        } else {
-            let mut stream = stream;
-            exchange_http1(&mut stream, request, &reporter, timeout, cold).await
-        }
+        exchange_http_probe(
+            proxy.stream,
+            &target,
+            request,
+            &reporter,
+            timeout,
+            if cold {
+                HttpProbeMode::Cold
+            } else {
+                HttpProbeMode::Warm
+            },
+            &node.name,
+        )
+        .await
     }
     .await;
     match result {
@@ -513,6 +515,61 @@ async fn measure_http_probe_mode(
             reporter_error(&reporter, &error);
             Err(error)
         }
+    }
+}
+
+/// Validate one configured HTTP request on an already connected route.
+/// The caller retains the absolute deadline. Host and verified TLS identity
+/// come from the request URI independently of the pinned dial address.
+pub async fn validate_routed_http_probe(
+    proxy: ProxyStream,
+    request: &http::Request<()>,
+    timeout: Duration,
+) -> anyhow::Result<ProbeMeasurement> {
+    let target = request_target(request)?;
+    exchange_http_probe(
+        proxy.stream,
+        &target,
+        request,
+        &None,
+        timeout,
+        HttpProbeMode::Routed,
+        "group exit route",
+    )
+    .await
+}
+
+async fn exchange_http_probe(
+    mut stream: Box<dyn AsyncReadWrite>,
+    target: &HttpCheckTarget,
+    request: &http::Request<()>,
+    reporter: &Option<ScoreReporter>,
+    timeout: Duration,
+    mode: HttpProbeMode,
+    node: &str,
+) -> anyhow::Result<ProbeMeasurement> {
+    let cold = !matches!(mode, HttpProbeMode::Warm);
+    let routed = matches!(mode, HttpProbeMode::Routed);
+    if !target.is_https() {
+        if routed {
+            return exchange_routed_http1(stream, request, timeout).await;
+        }
+        return exchange_http1(&mut stream, request, reporter, timeout, cold).await;
+    }
+    let connector = https_connector()?;
+    let mut tls = tokio::time::timeout(timeout, connector.connect(target.host(), stream))
+        .await
+        .map_err(|_| phase_timeout("HTTP probe TLS handshake timed out"))?
+        .context("HTTP probe TLS handshake failed")?;
+    tracing::debug!(
+        %node,
+        alpn = ?tls.ssl().selected_alpn_protocol().map(|p| String::from_utf8_lossy(p).into_owned()),
+        "HTTP probe TLS established"
+    );
+    match tls.ssl().selected_alpn_protocol() {
+        Some(b"h2") => exchange_http2(tls, request, reporter, timeout, cold).await,
+        _ if routed => exchange_routed_http1(tls, request, timeout).await,
+        _ => exchange_http1(&mut tls, request, reporter, timeout, cold).await,
     }
 }
 
@@ -553,14 +610,16 @@ fn https_connector() -> anyhow::Result<crate::tls::TlsConnector> {
 
 /// Measure every member of a group concurrently (at most
 /// [`URLTEST_MAX_CONCURRENT`] at a time) and fold the results into the
-/// alive set: successes record measured TCP latency. An arbitrary measurement
-/// target failing does not establish a real dial failure or node-wide outage.
+/// alive set: successful measurements from current tickets record TCP latency.
+/// An arbitrary measurement target failing does not establish a real dial
+/// failure or node-wide outage.
 ///
 /// Returns one `(node_name, result)` entry per member, in member order.
 #[allow(clippy::too_many_arguments)]
 pub async fn urltest_group_with_feedback(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -571,6 +630,7 @@ pub async fn urltest_group_with_feedback(
     urltest_group_impl(
         members,
         generation,
+        published,
         registry,
         alive_set,
         url,
@@ -583,8 +643,9 @@ pub async fn urltest_group_with_feedback(
 
 #[allow(clippy::too_many_arguments)]
 async fn urltest_group_impl(
-    members: &[Node],
+    members: &[(&Node, ProbeTicket)],
     generation: &Arc<crate::runtime::OutboundRuntimeRegistry>,
+    published: &SharedRuntimeRegistry,
     registry: &Arc<ProxyRegistry>,
     alive_set: &Arc<AliveDialerSet>,
     url: &str,
@@ -596,9 +657,11 @@ async fn urltest_group_impl(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(URLTEST_MAX_CONCURRENT));
     let url = url.to_string();
     let mut join_set = tokio::task::JoinSet::new();
-    for node in members {
-        let node = node.clone();
+    for (node, ticket) in members {
+        let node = (*node).clone();
+        let ticket = ticket.clone();
         let generation = Arc::clone(generation);
+        let published = Arc::clone(published);
         let registry = registry.clone();
         let alive_set = alive_set.clone();
         let url = url.clone();
@@ -628,9 +691,10 @@ async fn urltest_group_impl(
                 }
                 None => Err(anyhow!("no handler for protocol {:?}", node.protocol())),
             };
-            if let Ok(latency) = &result {
-                alive_set.record_probe_latency(node.id, ProbeDomain::Tcp, IpVersion::V4, *latency);
-            }
+            let result = result.map(|measurement| {
+                alive_set.record_urltest_latency(&published, &generation, &ticket, measurement);
+                measurement.latency
+            });
             (node.name.clone(), result)
         });
     }
@@ -645,7 +709,7 @@ async fn urltest_group_impl(
     let order: std::collections::HashMap<&str, usize> = members
         .iter()
         .enumerate()
-        .map(|(i, n)| (n.name.as_str(), i))
+        .map(|(i, (node, _))| (node.name.as_str(), i))
         .collect();
     results.sort_by_key(|(name, _)| order.get(name.as_str()).copied().unwrap_or(usize::MAX));
     results

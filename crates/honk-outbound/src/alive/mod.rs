@@ -5,6 +5,7 @@ mod health;
 pub mod latencies;
 mod observations;
 mod probe;
+pub(crate) mod route_health;
 mod runner;
 mod urltest;
 
@@ -19,12 +20,18 @@ pub use observations::{
     ProbeTicket, UrlProbeMember,
 };
 use parking_lot::{Mutex, RwLock};
+pub use probe::RouteHttpProber;
+pub use route_health::{
+    RouteHealthRevision, RouteHealthStamp, RouteProbeTicket, UdpBareReply, UdpHealthNotifications,
+    UdpHopRole, UdpRouteAdmission,
+};
 pub use runner::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -237,6 +244,8 @@ struct PerProtocolState {
     consecutive_successes: u32,
     /// Traffic-based consecutive failures (separate counter, higher thresholds).
     traffic_failures: u32,
+    /// A TCP traffic down edge confirmed by the routed outcome owner; zero otherwise.
+    route_down_at: u64,
     cooldown_until: Instant,
     /// When true, the node is in deep backoff: probes continue on the slow
     /// max_cooldown cadence until resuscitation.
@@ -251,6 +260,7 @@ impl PerProtocolState {
         self.consecutive_failures = 0;
         self.consecutive_successes = 0;
         self.traffic_failures = 0;
+        self.route_down_at = 0;
         self.stopped = false;
         self.cooldown_until = Instant::now();
     }
@@ -269,6 +279,7 @@ impl PerProtocolState {
             consecutive_failures: 0,
             consecutive_successes: 0,
             traffic_failures: 0,
+            route_down_at: 0,
             cooldown_until: Instant::now(),
             stopped: false,
         }
@@ -281,8 +292,34 @@ impl Default for PerProtocolState {
     }
 }
 
-fn fresh_states() -> [PerProtocolState; ALIVE_STATES_PER_NODE] {
-    std::array::from_fn(|_| PerProtocolState::new())
+fn fresh_states() -> NodeStates {
+    NodeStates {
+        protocols: std::array::from_fn(|_| PerProtocolState::new()),
+        route_tcp: Default::default(),
+        route_udp: None,
+    }
+}
+
+struct NodeStates {
+    protocols: [PerProtocolState; ALIVE_STATES_PER_NODE],
+    route_tcp: [route_health::Evidence; IpVersion::count()],
+    route_udp: Option<
+        Box<[route_health::RoutedUdpNode; (ALIVE_STATES_PER_NODE - IpVersion::count()) * 2]>,
+    >,
+}
+
+impl std::ops::Index<usize> for NodeStates {
+    type Output = PerProtocolState;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.protocols[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for NodeStates {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.protocols[index]
+    }
 }
 
 type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
@@ -294,6 +331,8 @@ type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
 /// node from it. Fires once per domain/ip-version flip — handlers
 /// must be idempotent.
 type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
+type RoutedUdpConnectivityCallback = dyn Fn(Uuid, ProbeDomain, IpVersion) + Send + Sync;
+type RoutedUdpDeathCallback = dyn Fn(Uuid, ProbeDomain, IpVersion, UdpHopRole) + Send + Sync;
 
 /// Resolves custom-check members with concrete leaf IDs and optional captured
 /// native group/member identities; display tags are not node lookup keys.
@@ -316,7 +355,22 @@ pub type OutboundIdResolver = Arc<dyn Fn(Uuid) -> Option<u8> + Send + Sync>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredNode {
     pub name: String,
-    pub address: String,
+    /// Configured raw TCP endpoint. Virtual chains have no endpoint of their own.
+    pub raw_probe_address: Option<String>,
+}
+
+#[derive(Default)]
+struct Registrations {
+    nodes: HashMap<Uuid, Arc<RegisteredNode>>,
+    manual_delays: std::collections::BTreeMap<Uuid, ManualDelay>,
+}
+
+struct ManualDelay {
+    owner: std::sync::Weak<crate::runtime::NodeRuntime>,
+    ticket: Arc<()>,
+    sample: Option<ProbeMeasurement>,
+    /// A legacy sample this slot superseded when the wall clock stepped back.
+    superseded_legacy: Option<(Duration, std::time::SystemTime)>,
 }
 
 /// A single probe record for history/API consumption.
@@ -344,13 +398,23 @@ pub type ResolveHook = Arc<
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
-    states: RwLock<HashMap<Uuid, [PerProtocolState; ALIVE_STATES_PER_NODE]>>,
+    states: RwLock<HashMap<Uuid, NodeStates>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
-    registered: RwLock<HashMap<Uuid, Arc<RegisteredNode>>>,
+    registered: RwLock<Registrations>,
+    route_health: RwLock<route_health::RouteHealth>,
+    /// Fast negative hint; exact domain/family/operation evidence remains in `NodeStates`.
+    udp_faults: AtomicBool,
+    route_http_prober: RwLock<Option<Arc<dyn RouteHttpProber>>>,
+    connectivity_callback: RwLock<Option<Arc<health::ConnectivityCallback>>>,
+    /// DIRECT also accepts delay evidence without a periodic registration.
+    /// Removing its history invalidates those tickets under the registration lock.
+    direct_removals: AtomicU64,
     health_observations: RwLock<Option<observations::HealthHistory>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
+    routed_udp_death_callback: RwLock<Option<Arc<RoutedUdpDeathCallback>>>,
+    routed_udp_connectivity_callback: RwLock<Option<Arc<RoutedUdpConnectivityCallback>>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
@@ -440,10 +504,17 @@ impl AliveDialerSet {
         Self {
             states: RwLock::new(HashMap::new()),
             collections: RwLock::new(HashMap::new()),
-            registered: RwLock::new(HashMap::new()),
+            registered: RwLock::default(),
+            route_health: RwLock::default(),
+            udp_faults: AtomicBool::new(false),
+            route_http_prober: RwLock::default(),
+            connectivity_callback: RwLock::default(),
+            direct_removals: AtomicU64::new(0),
             health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
+            routed_udp_death_callback: RwLock::default(),
+            routed_udp_connectivity_callback: RwLock::default(),
             resolver: RwLock::new(None),
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
@@ -626,6 +697,18 @@ impl AliveDialerSet {
         *self.death_callback.write() = cb.map(Arc::from);
     }
 
+    /// Retire endpoints and source associations bound to this hop operation, domain and family.
+    pub fn set_routed_udp_death_callback(&self, cb: Option<Box<RoutedUdpDeathCallback>>) {
+        *self.routed_udp_death_callback.write() = cb.map(Arc::from);
+    }
+
+    pub fn set_routed_udp_connectivity_callback(
+        &self,
+        callback: impl Fn(Uuid, ProbeDomain, IpVersion) + Send + Sync + 'static,
+    ) {
+        *self.routed_udp_connectivity_callback.write() = Some(Arc::new(callback));
+    }
+
     /// Install the node name → eBPF outbound index resolver used by
     /// `push_ebpf`. Re-callable: honk-core re-installs (or refreshes the
     /// captured map) on config reload. Pass `None` to restore the legacy
@@ -660,7 +743,7 @@ impl AliveDialerSet {
         self.states
             .read()
             .get(&node_id)
-            .is_none_or(|s| s[idx].alive)
+            .is_none_or(|s| s[idx].alive && s.routed_udp_available(domain, idx))
     }
 
     /// Get (or create) the `DialerCollection` for a given node and domain index.
@@ -672,9 +755,26 @@ impl AliveDialerSet {
         Arc::clone(&arr[idx])
     }
 
-    pub fn register_node(&self, node_id: Uuid, name: String, address: String) {
+    pub fn register_node(&self, node_id: Uuid, name: String, raw_probe_address: Option<String>) {
         let mut registered = self.registered.write();
-        registered.insert(node_id, Arc::new(RegisteredNode { name, address }));
+        self.register_node_locked(&mut registered, node_id, name, raw_probe_address);
+    }
+
+    fn register_node_locked(
+        &self,
+        registered: &mut Registrations,
+        node_id: Uuid,
+        name: String,
+        raw_probe_address: Option<String>,
+    ) {
+        registered.manual_delays.remove(&node_id);
+        registered.nodes.insert(
+            node_id,
+            Arc::new(RegisteredNode {
+                name,
+                raw_probe_address,
+            }),
+        );
         self.node_registered_at
             .write()
             .insert(node_id, Instant::now());
@@ -682,15 +782,98 @@ impl AliveDialerSet {
         states.entry(node_id).or_insert_with(fresh_states);
     }
 
+    /// Temporary registration lookup for group-exit selection and traffic reporting.
     pub fn is_registered(&self, node_id: Uuid) -> bool {
-        self.registered.read().contains_key(&node_id)
+        self.registered.read().nodes.contains_key(&node_id)
     }
 
-    /// Snapshot of currently registered nodes (NodeId → name/address), used
-    /// by config reload to diff and re-register only what changed.
+    /// Install the accepted health targets, preserving the exact registration
+    /// and grace period of each unchanged node. Returns `(added, removed)`.
+    pub fn sync_registrations(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+    ) -> (usize, usize) {
+        self.sync_registrations_retaining_delays(targets, |_| true)
+    }
+
+    /// Publish registrations and invalidate manual delays whose ordinary leaf was replaced.
+    /// `retain` uses the caller's immutable publication data under the registration lock.
+    pub fn sync_registrations_retaining_delays(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+        retain: impl FnMut(&Uuid) -> bool,
+    ) -> (usize, usize) {
+        self.sync_registrations_inner(targets, retain, |id| {
+            self.states.write().remove(&id);
+        })
+    }
+
+    /// Stage proven routed hop failures while dropping old probe registrations.
+    /// The accepted manager revalidates their ordered paths at route publication.
+    pub fn sync_registrations_retaining_routes(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+        retain: impl FnMut(&Uuid) -> bool,
+        mut routed: impl FnMut(&Uuid) -> bool,
+    ) -> (usize, usize) {
+        let mut route_health = self.route_health.write();
+        route_health.retire_owner();
+        let changes = self.sync_registrations_inner(targets, retain, |id| {
+            self.clear_registered_route_health(&mut route_health, id, routed(&id));
+        });
+        self.prune_unrouted_uuids(routed);
+        changes
+    }
+
+    fn sync_registrations_inner(
+        &self,
+        targets: HashMap<Uuid, (&str, Option<&str>)>,
+        mut retain: impl FnMut(&Uuid) -> bool,
+        mut remove_state: impl FnMut(Uuid),
+    ) -> (usize, usize) {
+        let mut registered = self.registered.write();
+        registered.manual_delays.retain(|id, _| retain(id));
+        let before = registered.nodes.len();
+        if registered.nodes.keys().any(|id| !targets.contains_key(id)) {
+            if let Some(observations) = self.health_observations.write().as_mut() {
+                // DIRECT can have samples even if it was never registered.
+                observations.remove_nodes(|id| {
+                    registered.nodes.contains_key(id) && !targets.contains_key(id)
+                });
+            }
+            registered.nodes.retain(|id, _| {
+                if targets.contains_key(id) {
+                    return true;
+                }
+                remove_state(*id);
+                self.clear_legacy_node_state(*id);
+                false
+            });
+        }
+        let removed = before - registered.nodes.len();
+        let mut added = 0;
+        for (id, (name, raw_address)) in targets {
+            if registered.nodes.get(&id).is_some_and(|node| {
+                node.name == name && node.raw_probe_address.as_deref() == raw_address
+            }) {
+                continue;
+            }
+            self.register_node_locked(
+                &mut registered,
+                id,
+                name.to_owned(),
+                raw_address.map(str::to_owned),
+            );
+            added += 1;
+        }
+        (added, removed)
+    }
+
+    /// Snapshot of current health-check registrations.
     pub fn registered_nodes(&self) -> HashMap<Uuid, RegisteredNode> {
         self.registered
             .read()
+            .nodes
             .iter()
             .map(|(id, node)| (*id, node.as_ref().clone()))
             .collect()
@@ -701,6 +884,7 @@ impl AliveDialerSet {
     pub fn node_name(&self, node_id: Uuid) -> String {
         self.registered
             .read()
+            .nodes
             .get(&node_id)
             .map(|r| r.name.clone())
             .unwrap_or_else(|| node_id.to_string())
@@ -708,17 +892,28 @@ impl AliveDialerSet {
 
     pub fn remove_node(&self, node_id: Uuid) {
         let mut registered = self.registered.write();
-        registered.remove(&node_id);
-        self.states.write().remove(&node_id);
-        self.collections.write().remove(&node_id);
+        registered.manual_delays.remove(&node_id);
+        registered.nodes.remove(&node_id);
         if let Some(observations) = self.health_observations.write().as_mut() {
             observations.remove_node(node_id);
         }
+        self.states.write().remove(&node_id);
+        self.clear_legacy_node_state(node_id);
+    }
+
+    fn clear_legacy_node_state(&self, node_id: Uuid) {
+        if node_id == honk_config::config::DIRECT_NODE_ID {
+            self.direct_removals.fetch_add(1, Ordering::Relaxed);
+        }
+        self.collections.write().remove(&node_id);
         self.node_registered_at.write().remove(&node_id);
         self.node_urltest_groups.write().remove(&node_id);
-        self.probe_history
-            .write()
-            .retain(|(id, _), _| *id != node_id);
+        {
+            let mut history = self.probe_history.write();
+            for index in 0..ALIVE_STATES_PER_NODE {
+                history.remove(&(node_id, index));
+            }
+        }
         self.last_emergency_tcp.lock().remove(&node_id);
         self.last_emergency_udp.lock().remove(&node_id);
         self.trigger_pending.lock().remove(&node_id);
@@ -729,7 +924,7 @@ impl AliveDialerSet {
     /// fail-closed until a fresh probe succeeds, but let that verified
     /// success satisfy the recovery hysteresis immediately.
     pub fn notify_network_change(&self) {
-        let node_ids: Vec<Uuid> = self.registered.read().keys().copied().collect();
+        let node_ids: Vec<Uuid> = self.registered.read().nodes.keys().copied().collect();
         let now = Instant::now();
         {
             let mut states = self.states.write();
@@ -737,7 +932,7 @@ impl AliveDialerSet {
                 let Some(protocol_states) = states.get_mut(node_id) else {
                     continue;
                 };
-                for state in protocol_states {
+                for state in &mut protocol_states.protocols {
                     state.cooldown_until = now;
                     if !state.alive {
                         state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;

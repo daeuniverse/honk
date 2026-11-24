@@ -158,7 +158,7 @@ impl IoHarness {
             EndpointReservation::Initializing(lease) => lease,
             _ => return Err(io::Error::other("destination already has a mapping")),
         };
-        if !lease.bind_selected_node(node_id) {
+        if !lease.bind_selected(node_id, None) {
             return Err(io::Error::other("lease cancelled"));
         }
         Ok(lease)

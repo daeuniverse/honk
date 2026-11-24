@@ -118,7 +118,7 @@ native socket 包在 `PacketTransport` 后面；tunnel 协议在自己的真实 
 | AnyTLS | `network` 缺省或包含 `udp` 时 | 否 | 否 | `AnyTls` | `anytls` |
 | Direct | 是 | 否 | 否 | `None` | 无 |
 | Block | 否 | 否 | 是 | `None` | 无 |
-| Chain | 否；由 `descriptor::carries_udp` 按出口判断 | 否 | 否 | `None` | 无 |
+| Chain | `Own` 为否，见[链式节点的路径要求](#链式节点) | 否 | 否 | `None` | 无 |
 
 Ready-stream pooling 保存已完成、已绑定目标的握手。Bare-TCP pooling 只保存已经连
 到代理服务器的 socket，目标握手留给之后的 `dial_with_tcp` 完成。TCP multiplex 和
@@ -293,6 +293,10 @@ TCP -> optional TLS or REALITY -> optional WebSocket, gRPC or XHTTP -> protocol 
 把显式 `sni`、WebSocket `Host` 授权（去掉端口）、节点主机名作为 SNI：CDN 前置节点
 以边缘 IP 为地址，分发域名只出现在该 header 中。因此，同一条共享路径为 Trojan、
 VMess 和 VLESS 提供一致的 TLS、REALITY、WS、gRPC 和 XHTTP 建立过程。
+
+如果物理 WebSocket 连接的对端先正常关闭，VMess 就无法再发送空的上行结束记录。
+只有在完整响应通过校验、所有业务字节都已转发时，中继才将其视为正常结束。
+未发送的结束记录不会计为已发送；连接仍可写时，仍须发送并刷出该记录。
 
 Trojan 冷连接和 pool 中取出的裸连接使用同一套完整 transport。
 
@@ -1006,43 +1010,37 @@ SID 的所有目的地。域名目标流，即 `RewriteTo`，仍按原始目的�
 `ProxyRegistry::default_resolver` 最后注册 `ChainHandler`（`src/proxy/chain.rs`），并把此前注册的每个协议的 TCP handler 交给它，
 因此每一跳使用的都是 registry 分派时的同一个 handler 实例。
 
-`build_reusing_with_admission` 先构建或重用所有普通节点，再用这一轮得到的各跳 runtime 构建链式节点的 runtime。
-链式节点的 runtime 不进入重用集合：它在每个 generation 都重建，不会让上一代的跳继续存活。DNS runtime 分叉走同一条路径。
-`honk_config::node::resolve_chain_hops` 把各跳名称解析一次，返回每条链各跳的 ID，构建时按 ID 取各跳 runtime。`Config::validate_assembled` 调用的也是这个函数，因此无法解析的跳会让 runtime 准入失败。
-没有 generation runtime 的普通 `dial` 拒绝链式节点。
+静态节点和订阅节点组装后，配置准入将各跳的名称绑定为有序实体节点 ID，并由 `Node::derive_id()` 派生链 ID。
+runtime 准入校验这些绑定。`build_reusing_with_admission` 先构建或复用实体节点，再按绑定的 ID 取本代 runtime 组装链。
+每代都重建链的 runtime，DNS runtime 分叉走同一路径。没有 generation runtime 的普通 `dial` 拒绝链式节点。
 
 `ChainHandler::dial_runtime` 逐跳拨号：
 
 1. 入口用它原本的 `dial_runtime` 连接第二跳的服务器。服务器是 IP 时直接作为地址传入；
    是域名时放进 `target_domain`，地址只携带端口、IP 为未指定地址，由入口的服务器解析，与其他经代理的目标域名相同。
 2. 之后每一跳在前面各跳建立的 stream 上调用 `dial_over`。只有最后一跳以真正的目的地为目标。
-3. 每一跳都在自己 runtime 的 `scope_tasks` 与 transport quality 范围内执行，与经 registry 的拨号相同。
-   之后各跳不打开 socket，嵌套分派沿用继承的拨号范围，因此整条链只占用入口的拨号准入。
-   链式流量的 carrier 压力因此记在各跳的 runtime 上：它可能标记入口节点，而链式节点 runtime 自己的
-   `TransportQuality` 始终为空，包含该链式节点的 Score 组看不到它的传输压力。
+3. 每跳的任务和传输质量证据归该跳的 runtime。入口可按原协议复用会话，后续各跳使用传入的流，因此只有入口可能新建物理连接并占用物理拨号额度。链自身的 `TransportQuality` 为空。
 
-整条链共用一个期限 `connect_timeout × 3`，即调用方本来对单个候选施加的上限。
-每一跳取剩余时间与 `connect_timeout` 中的较小值。期限到达时拨号以超时 I/O 错误失败。
+整条链及其重试共用从首次尝试开始计算的绝对期限 `connect_timeout × 3`，与调用方的单候选上限相同。传入每跳的基础预算为剩余时间与 `connect_timeout` 中较小者。协议仍可应用自身规则，例如 REALITY 的三倍预算，外层期限继续约束整个链拨号。超期返回超时 I/O 错误。
 
-`dial_over` 自身不屏蔽 milestone，屏蔽由串联各跳的调用方负责：每一跳照常报告自己的目标 milestone。
-最后一跳之前的各跳在 `without_target_milestones` 中执行，它丢弃 `TargetRequestSent` 与 `TargetConfirmed`，
-转发 transport 事件和其他所有 milestone，包括 `TransportReady`。
-因此 `TransportAttached` 指向入口的物理连接，`TargetRequestSent` 标记对真正目的地发出请求的时间。
+链在 `without_target_milestones` 中运行出口之前的各跳，屏蔽它们的 `TargetRequestSent` 和 `TargetConfirmed`，保留 `TransportAttached`、`TransportReady` 等传输事件。`TransportAttached` 对应实体入口的物理连接。
+末跳的 `TargetRequestSent` 跟随请求穿过 WS、VMess 中继和 gRPC 驱动。入口为 Hysteria2、TUIC 或 Juicity 时，必须确认本请求在该 QUIC 流上已接受的所有字节区间都已提交给本地 UDP 套接字；对端 ACK 或其他流的数据报不能替代这项证据。若提交结果不确定（包括与请求交错写出的控制帧），即使对端收到了数据，也可能没有这条记录；不会因此重发。首跳 AnyTLS、VLESS 多路复用和 XHTTP 仍可在会话写入器接受字节时报告交付。`TargetConfirmed` 仍须由协议确认目标。
+启用观测时，Hysteria2 仍在一次写入中提交待写的协议头和首段负载。回执只跟踪已接受的负载字节；仅发出协议头不能算作末跳请求已发送。
 
-最后一跳之前的跳以下一跳的服务器为目标，所以它们的 `TargetFailure` 会改判为链式节点的 `NodeFailure`，消息不变。
-最后一跳的 `TargetFailure` 仍是目标失败；数据包策略拒绝无论出现在哪一跳都保留原类别。
+出口之前的某一跳拒绝连接下一跳时，失败归于链式节点。即使拒绝延迟到后续的读、写、刷新缓冲区或关闭流时才返回，也会保留出错的跳、原始 I/O 错误及同一次共享失败的标识。出口对实际目的地的拒绝仍是目标失败。本地策略拒绝、容量不足和取消保留各自的分类。
 
-经隧道拨号的某一跳以 `RealityMaskCertificate` 失败时，整条链从入口重拨一次并关闭 hybrid key share，与直接 REALITY 拨号重试一次相同。
-重拨共用原来的期限。入口本身是 REALITY 时，由它自己的 `dial_runtime` 重试。
+只有经隧道拨号的一跳返回 `RealityMaskCertificate` 才触发整链重拨。从入口重试一次，关闭 hybrid key share。失败尝试交还载体和它所持的物理拨号额度，下一次尝试独立获取和持有额度，并沿用原始拨号的准入范围、固定地址、开始时间、进度和绝对期限。入口自身的 REALITY 重试仍由它的 `dial_runtime` 处理。
 
-UDP 走同一条路径，只是最后一跳不同：`dial_chain` 执行上述全部规则，再把出口的 carrier 交给 `PacketOutbound::dial_udp_over` 或 `SharedSourceOutbound::prepare_shared_source_over`。两者都在这个 carrier 上返回协议原有的 transport，所以分帧、`FramePoison` 和回复投影都不变，丢弃 transport 会关闭整条链。
-节点或路由能否承载 UDP 只有一个答案：`descriptor::carries_udp(UdpPath)`。普通节点和折叠成单个节点的路由用 `Own(node)`，链式节点和经组出口的多跳路由用 `Tunneled { exit }`。runtime 的 `udp_capable`、组选路、数据面发布和探测规划都调用它；链式节点 descriptor 的 `supports_udp` 保持 `never`，`Own(chain)` 读到的就是它，所以按链式节点自身询问 UDP 时答案为否；链式节点的实际答案来自 `Tunneled { exit }`。端口策略（`udp_target_allowed`）由实际封装 UDP 的节点回答：节点本身，或出口。
-只有当链式节点有跳，且出口协议登记了 `tunneled_shared` slot（Trojan）时，`ProxyRegistry::has_shared_source_for` 才给它 `Shared` 源路径；经组出口的路由一律按单条 flow 处理。
+UDP 复用 `dial_chain` 的逐跳拨号，把最后一跳的载体交给 `PacketOutbound::dial_udp_over` 或 `SharedSourceOutbound::prepare_shared_source_over`。封装节点检查 UDP 目的端口，并执行协议自己的回复校验。符合条件的隧道 VLESS 即使用 `auto` 也采用原生封装。
+
+`descriptor::carries_udp(UdpPath)` 对普通节点和单跳折叠用 `Own(node)`，通过 `Tunneled { exit }` 检查多跳路径的出口封装能力。前序每个实体跳（包括入口）都必须满足 `Node::supports_tunneled_dial()`，绑定路径上的处理器也必须可执行。配置的 Trojan 出口链提供 `tunneled_shared` 槽，安装后的源关联持有唯一接收器和建立时的路径准入，各端点视图结算各自的 Score。组出口多跳路由和隧道 VLESS 按流建立传输。单跳折叠沿用节点自己的源关联规则，路径证据仍归选中该路径的视图。
+
+UDP 健康跟随准入的实体路径、健康域和地址族。准备及发送完成都不会给出 UDP 成功证据，交付回复才确认路径。类型化传输故障可以定位到实体跳或有序前缀，见[出口存活](../reference/groups.md#出口存活)。
 
 ### 经组出口的路由
 
 组的 [`exit`](../reference/groups.md#出口) 把选中的叶节点变成一条路由（`honk_config::route::Route`）。
-`group_graph::compose` 把叶节点自己的各跳（节点本身，或链式节点的各跳）与选中路径上各组的出口按从内到外的顺序接起来，重复的出口只进入一次。
+`group_graph::compose` 从叶节点自身或配置链的各跳开始，按从内到外的顺序附加组出口；只合并相邻的相同跳点。
 路由是选择结果，不是配置中的节点，所以没有 `NodeRuntime`。
 `ProxyRegistry::dial_ref` 把 `DialRef::Route` 交给 `ChainHandler::dial_route_tcp`，`ProxyRegistry::dial_udp_route` 把 UDP 交给 `ChainHandler::dial_route_udp`，两者都在 `RouteRuntime`（`src/runtime/route.rs`）上拨号，
 `RouteRuntime` 借用发起拨号的 generation 中各跳的 runtime。每个 generation 最多缓存 `MAX_ROUTE_RUNTIMES`（4096）个，超出后用不缓存的 runtime 拨号。

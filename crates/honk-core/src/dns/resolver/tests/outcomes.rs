@@ -478,7 +478,7 @@ async fn node_host_lookup_uses_its_subtag_upstream_without_response_requery_or_c
     let provider = Arc::new(DnsServiceProvider::new(runtime(1, forwarder)));
     let service = DnsService::with_provider(provider.clone());
     #[cfg(feature = "native-api")]
-    let pinned = service.pin_name_resolution().unwrap();
+    let pinned = service.pin_name_resolution(None).unwrap();
 
     for _ in 0..2 {
         for host in ["Node.Private.Example.", "shared.private.example"] {

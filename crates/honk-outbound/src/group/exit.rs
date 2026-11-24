@@ -1,22 +1,16 @@
 //! Group `exit`: a leaf selected through groups with an exit dials as a
 //! route, its own hops first and then each group's exit from the innermost
-//! group out. Selection itself is unchanged; only the target a dialing plan
-//! hands out carries the route, so policies, health filtering and Score
-//! feedback keep working on the leaf.
+//! group out. Eligibility includes the full composed path before a policy
+//! reduces its candidates. Ranking and Score attribution use the selected leaf.
 //!
-//! The manager keeps only each group's exit edge and each configured
-//! chain's hop IDs. A route is composed when a candidate is selected, so
-//! the number of routes the configuration could produce, which can grow
-//! with the product of nested exit groups, costs nothing until one is
-//! dialed. A route is a UDP candidate only when it can carry UDP: a route
-//! collapsed to one node through that node's own UDP, a longer one through
-//! its exit tunneling UDP over the stream to it. Candidates that cannot are
-//! dropped before any group policy runs, never refused after a pick.
+//! The manager keeps each group's exit edge and uses the configured chain's
+//! bound hop IDs. UDP capability belongs to the terminal hop of a composed
+//! route. A collapsed route uses the actual node's own UDP transport.
+
+mod health;
 
 use honk_config::group::Group;
-use honk_config::group_graph::{
-    Composed, ExitEdge, GroupGraph, Leaf, Limits, Step, Visitor, compose,
-};
+use honk_config::group_graph::{Composed, ExitEdge, GroupGraph, Leaf, Step, Visitor, compose};
 use honk_config::node::Node;
 use honk_config::route::Route;
 use honk_config::types::NodeProtocol;
@@ -25,15 +19,16 @@ use std::ops::ControlFlow;
 use uuid::Uuid;
 
 use super::target::{OwnedTarget, RoutedTarget, Target};
-use super::{GroupManager, ManagedGroup, SelectionNetwork, observation};
-use crate::descriptor::{UdpPath, carries_udp};
+use super::{
+    GroupManager, GroupMember, IpVersion, MAX_GROUP_DEPTH, ManagedGroup, ProbeDomain,
+    SelectionNetwork,
+};
+use crate::descriptor::{UdpPath, builtin_tunneled_udp_available, builtin_udp_available};
 
-/// Exit edges by group name and configured chain hops by chain ID, built
-/// only when some group has an exit.
+/// Exit edges by group name, built only when some group has an exit.
 #[derive(Debug)]
 pub(super) struct Exits {
     by_group: HashMap<String, ExitEdge>,
-    chains: HashMap<Uuid, Box<[Uuid]>>,
 }
 
 impl Exits {
@@ -55,7 +50,7 @@ impl Exits {
             clear: vec![false; graph.len()],
         };
         let routes: Vec<bool> = (0..graph.len())
-            .map(|group| graph.visit(group, Limits::SELECTION, &mut reach).is_break())
+            .map(|group| graph.visit(group, &mut reach).is_break())
             .collect();
         for (name, entry) in managed.iter_mut() {
             entry.routes = graph.group(name).is_some_and(|group| routes[group]);
@@ -68,13 +63,12 @@ impl Exits {
                 .filter(|group| named(*group))
                 .filter_map(|group| Some((graph.name(group).to_owned(), graph.exit(group)?)))
                 .collect(),
-            chains: graph.chains().map(|(id, hops)| (id, hops.into())).collect(),
         }))
     }
 }
 
 /// Breaks when selection can produce a route: a group with an exit, or a
-/// chain leaf whose hops are unknown, which [`GroupManager::routed`] drops.
+/// chain leaf whose hops are unknown, which [`GroupManager::compose_route`] drops.
 struct Reach<'g, 'a> {
     graph: &'g GroupGraph<'a>,
     /// Groups whose complete subtree has neither.
@@ -96,11 +90,9 @@ impl Visitor for Reach<'_, '_> {
     fn leaf(&mut self, leaf: Leaf, _: &[Uuid]) -> ControlFlow<()> {
         match leaf {
             Leaf::Node(id)
-                if self.graph.chain_hops(id).is_none()
-                    && self
-                        .graph
-                        .node(id)
-                        .is_some_and(|node| node.protocol() == NodeProtocol::Chain) =>
+                if self.graph.node(id).is_some_and(|node| {
+                    node.protocol() == NodeProtocol::Chain && node.resolved_chain_hops().is_none()
+                }) =>
             {
                 ControlFlow::Break(())
             }
@@ -114,102 +106,123 @@ impl Visitor for Reach<'_, '_> {
 }
 
 impl GroupManager {
+    /// Whether membership or a final can dial a UDP chain, route, or exit collapse.
+    /// This checks the compiled transport shape independently of current selection and health.
+    pub fn group_can_compose_udp(&self, name: &str) -> bool {
+        self.groups.get(name).is_some_and(|entry| {
+            entry.udp_chain
+                || (entry.routes
+                    && self.exit_path_can_compose_udp(
+                        &entry.group,
+                        &mut [""; MAX_GROUP_DEPTH],
+                        0,
+                        false,
+                    ))
+        })
+    }
+
+    fn exit_path_can_compose_udp<'a>(
+        &'a self,
+        group: &'a Group,
+        path: &mut [&'a str; MAX_GROUP_DEPTH],
+        depth: usize,
+        exit_on_path: bool,
+    ) -> bool {
+        if depth == path.len() || path[..depth].contains(&group.name.as_str()) {
+            return false;
+        }
+        let exit_on_path = if group.exit.is_some() {
+            let Some(exit_id) = self.group_exit(&group.name) else {
+                return false;
+            };
+            // The outermost exit remains terminal even when composition collapses it.
+            if !exit_on_path
+                && self
+                    .nodes
+                    .get(&exit_id)
+                    .is_none_or(|exit| !builtin_udp_available(UdpPath::Own(exit)))
+            {
+                return false;
+            }
+            true
+        } else {
+            exit_on_path
+        };
+        path[depth] = &group.name;
+        let mut can_compose = |member| match member {
+            GroupMember::Group(child) => {
+                self.exit_path_can_compose_udp(child, path, depth + 1, exit_on_path)
+            }
+            GroupMember::Node(leaf) => {
+                exit_on_path
+                    && leaf.protocol() != NodeProtocol::Block
+                    && self
+                        .compose_route(leaf, &path[..=depth], SelectionNetwork::Udp)
+                        .is_some()
+            }
+        };
+        self.members(group).any(&mut can_compose)
+            || self.final_member(group).is_some_and(can_compose)
+    }
+
     /// The target a candidate dials: its leaf, or the route through the
     /// exits of the groups on `path`, outermost first. `None` drops the
     /// candidate: UDP over a route that cannot carry it, an exit this
     /// manager could not resolve, a chain leaf whose hops it could not
     /// resolve, or a route over `MAX_CHAIN_HOPS`.
     #[inline(never)]
-    pub(super) fn routed<'a, 'p>(
+    fn compose_route<'a>(
         &'a self,
         leaf: &'a Node,
-        path: impl DoubleEndedIterator<Item = &'p str> + Clone,
+        path: &[&str],
         network: SelectionNetwork,
-    ) -> Option<Target<'a>> {
-        let Some(exits) = self.exits.as_deref() else {
-            return Some(Target::node(leaf));
-        };
+    ) -> Option<(&'a Node, Option<Route>)> {
+        let composed = self.compose_path(leaf, path.iter().rev().copied(), |_| true)?;
         let udp = network == SelectionNetwork::Udp;
-        match self.compose_path(exits, leaf, path)? {
-            Composed::Direct => Some(Target::node(leaf)),
-            Composed::Collapsed(node) => self
+        match composed {
+            Composed::Direct => Some((leaf, None)),
+            Composed::Collapsed(id) => self
                 .nodes
-                .get(&node)
-                .filter(|node| !udp || carries_udp(UdpPath::Own(node)))
-                .map(Target::node),
-            Composed::Routed(route) => (!udp || self.route_carries_udp(&route)).then(|| Target {
-                node: leaf,
-                route: Some(Box::new(route)),
-            }),
-            Composed::TooLong => None,
+                .get(&id)
+                .filter(|node| !udp || builtin_udp_available(UdpPath::Own(node)))
+                .map(|node| (node, None)),
+            Composed::Routed(route) if !udp || self.route_carries_udp(&route) => {
+                Some((leaf, Some(route)))
+            }
+            Composed::Routed(_) | Composed::TooLong => None,
         }
     }
 
-    /// What `leaf` dials through the exits of the groups on `path`,
-    /// outermost first. `None` for an exit or chain hops this manager could
-    /// not resolve. Builds no target, so filters can ask it per candidate.
-    /// Inlined into each caller: called, it measured about a hundred more
-    /// instructions per TCP selection through an exit.
-    #[inline(always)]
-    fn compose_path<'p>(
-        &self,
-        exits: &Exits,
-        leaf: &Node,
-        path: impl DoubleEndedIterator<Item = &'p str> + Clone,
-    ) -> Option<Composed> {
-        if leaf.protocol() == NodeProtocol::Block {
-            return Some(Composed::Direct);
+    #[inline]
+    pub(super) fn compose_candidate_route<'a>(
+        &'a self,
+        candidate: &super::Candidate<'a>,
+        network: SelectionNetwork,
+    ) -> Option<(&'a Node, Option<Route>)> {
+        let leaf = candidate.node;
+        if !self.has_exits() || (!candidate.exit_on_path && leaf.protocol() != NodeProtocol::Chain)
+        {
+            return Some((leaf, None));
         }
-        let edges = || {
-            path.clone()
-                .rev()
-                .filter_map(|group| exits.by_group.get(group))
-        };
-        if edges().any(|edge| *edge == ExitEdge::Unresolved) {
-            return None;
-        }
-        let leaf_hops = match leaf.protocol() {
-            NodeProtocol::Direct => &[][..],
-            NodeProtocol::Chain => exits.chains.get(&leaf.id)?,
-            _ => std::slice::from_ref(&leaf.id),
-        };
-        Some(compose(
-            leaf.id,
-            leaf_hops,
-            edges().filter_map(|edge| match edge {
-                ExitEdge::Node(exit) => Some(*exit),
-                ExitEdge::Unresolved => None,
-            }),
-        ))
+        let path = candidate
+            .selection_chain
+            .split_last()
+            .map_or(&[][..], |(_, path)| path);
+        self.compose_route(leaf, path, network)
     }
 
-    /// A route frames UDP at its outermost exit, over the stream to it.
-    fn route_carries_udp(&self, route: &honk_config::route::Route) -> bool {
-        self.nodes
-            .get(&route.exit())
-            .is_some_and(|exit| carries_udp(UdpPath::Tunneled { exit }))
-    }
-
-    /// [`Self::routed`] for a candidate, whose selection chain ends with its
-    /// leaf. Inline, with [`Self::routed`] out of line, so a candidate with
-    /// no exit on its path pays only these tests. A chain leaf still goes
-    /// through [`Self::routed`], which drops it when its hops are unknown.
+    /// A known route is boxed only when it is included in a dial plan.
     #[inline]
     pub(super) fn routed_chain<'a>(
         &'a self,
         candidate: &super::Candidate<'a>,
         network: SelectionNetwork,
     ) -> Option<Target<'a>> {
-        let leaf = candidate.node;
-        if !self.has_exits() || (!candidate.exit_on_path && leaf.protocol() != NodeProtocol::Chain)
-        {
-            return Some(Target::node(leaf));
-        }
-        let path = candidate
-            .selection_chain
-            .split_last()
-            .map_or(&[][..], |(_, path)| path);
-        self.routed(leaf, path.iter().copied(), network)
+        let (node, route) = self.compose_candidate_route(candidate, network)?;
+        Some(Target {
+            node,
+            route: route.map(Box::new),
+        })
     }
 
     /// Whether a candidate dials its own leaf, which every candidate under a
@@ -235,6 +248,7 @@ impl GroupManager {
             Some(route) => OwnedTarget {
                 node: target.node.clone(),
                 route: Some(self.own_route(*route)),
+                collapse: super::ExitCollapse::None,
             },
         }
     }
@@ -255,317 +269,178 @@ impl GroupManager {
         })
     }
 
-    /// Drop the candidates whose routes cross a dead exit, `group`'s own
-    /// included (`block` never goes through an exit and stays), and for UDP
-    /// those whose leaf or route cannot carry it, so the caller checks only
-    /// the leaf's health. Dropping them before any policy runs leaves `final`
-    /// and a parent's other members to serve. `ancestors` are the groups
-    /// above `group`, outermost first. Out of line, like [`Self::routed`], so
-    /// the health filter inlined into every selection path stays its
-    /// exit-free size.
-    #[inline(never)]
-    pub(super) fn retain_exit_selectable<'a>(
+    pub(super) fn compose_path<'a>(
         &self,
-        mut candidates: Vec<super::Candidate<'a>>,
-        ancestors: &[&str],
-        group: &Group,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> Vec<super::Candidate<'a>> {
-        let udp = matches!(
-            domain,
-            super::ProbeDomain::DataUdp | super::ProbeDomain::DnsUdp
-        );
-        if group.exit.is_none()
-            && !candidates.iter().any(|c| c.exit_on_path)
-            && !(udp && ancestors.iter().any(|group| self.group_has_exit(group)))
-        {
-            if udp {
-                candidates.retain(|candidate| {
-                    let capable = self.leaf_carries_udp(candidate.node);
-                    if !capable {
-                        observation::candidate(
-                            candidate,
-                            false,
-                            "capability_or_health_unavailable",
-                        );
-                    }
-                    capable
-                });
+        leaf: &Node,
+        groups: impl Iterator<Item = &'a str>,
+        mut exit_available: impl FnMut(Uuid) -> bool,
+    ) -> Option<Composed> {
+        let Some(exits) = self.exits.as_deref() else {
+            return Some(Composed::Direct);
+        };
+        if leaf.protocol() == NodeProtocol::Block {
+            return Some(Composed::Direct);
+        }
+        let leaf_hops = match leaf.protocol() {
+            NodeProtocol::Direct => &[][..],
+            NodeProtocol::Chain => leaf.resolved_chain_hops()?,
+            _ => std::slice::from_ref(&leaf.id),
+        };
+        let mut available = true;
+        let edges = groups.filter_map(|group| match exits.by_group.get(group)? {
+            ExitEdge::Node(id) => {
+                available &= exit_available(*id);
+                Some(*id)
             }
-            return candidates;
+            ExitEdge::Unresolved => {
+                available = false;
+                None
+            }
+        });
+        let route = compose(leaf.id, leaf_hops, edges);
+        available.then_some(route)
+    }
+
+    /// Validate a direct member against the exits along its complete selection path.
+    /// The root-only sole TCP retry passes no health family, but still needs a valid route.
+    pub(super) fn leaf_route_available(
+        &self,
+        leaf: &Node,
+        group: &Group,
+        ancestors: &[&str],
+        domain: super::ProbeDomain,
+        family: Option<super::IpVersion>,
+        node_targets_only: bool,
+    ) -> bool {
+        if leaf.protocol() == NodeProtocol::Block {
+            return true;
         }
-        if !self.exit_alive(&group.name, domain, ipver) {
-            candidates.retain(|candidate| {
-                let block = candidate.node.protocol() == NodeProtocol::Block;
-                if !block {
-                    observation::candidate(candidate, false, "exit_unavailable");
-                }
-                block
-            });
-            return candidates;
-        }
-        let outer_exit = udp
+        let Some(exits) = self.exits.as_deref() else {
+            return true;
+        };
+        if group.exit.is_none()
             && ancestors
                 .iter()
-                .copied()
-                .chain(std::iter::once(group.name.as_str()))
-                .any(|group| self.group_has_exit(group));
-        candidates.retain(|candidate| {
-            let reason = if !self.candidate_exits_selectable(candidate, domain, ipver) {
-                "exit_unavailable"
-            } else if let Some(reason) = udp
-                .then(|| self.candidate_udp_unavailable(candidate, outer_exit, ancestors, group))
-                .flatten()
-            {
-                reason
-            } else {
-                return true;
-            };
-            observation::candidate(candidate, false, reason);
-            false
-        });
-        candidates
-    }
-
-    /// Drop the candidates `group`'s `final` offers while `group`'s own exit
-    /// is dead: the final goes through that exit too, except `block`. A root
-    /// group has no parent to drop them, so it would dial the dead exit.
-    #[inline(never)]
-    pub(super) fn retain_final_exit_selectable<'a>(
-        &self,
-        mut candidates: Vec<super::Candidate<'a>>,
-        group: &Group,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> Vec<super::Candidate<'a>> {
-        if self.exit_alive(&group.name, domain, ipver) {
-            return candidates;
-        }
-        candidates.retain(|candidate| {
-            let block = candidate.node.protocol() == NodeProtocol::Block;
-            if !block {
-                observation::candidate(candidate, false, "exit_unavailable");
-            }
-            block
-        });
-        candidates
-    }
-
-    /// Whether the exits of the groups a candidate was selected through are
-    /// alive. A nested group's last-resort leaf bypasses that group's own
-    /// exit check, so without this a parent would keep choosing a route
-    /// through a dead exit over a healthy sibling.
-    fn candidate_exits_selectable(
-        &self,
-        candidate: &super::Candidate<'_>,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> bool {
-        candidate.node.protocol() == NodeProtocol::Block
-            || candidate
-                .selection_chain
-                .split_last()
-                .is_none_or(|(_, groups)| {
-                    groups
-                        .iter()
-                        .all(|group| self.exit_alive(group, domain, ipver))
-                })
-    }
-
-    /// Whether a UDP target is still selectable before its flow binds: the
-    /// node itself, or a route that carries UDP with its leaf and its
-    /// outermost exit alive, the same reach as selection's exit check.
-    pub fn target_selectable(
-        &self,
-        target: &OwnedTarget,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> bool {
-        let Some(route) = target.route() else {
-            return self.is_node_selectable_for_domain(target.node.id, domain, ipver);
-        };
-        (domain == super::ProbeDomain::Tcp || self.route_carries_udp(route))
-            && self.is_node_alive_for_domain(route.leaf(), domain, ipver)
-            && self.node_exit_alive(route.exit(), domain, ipver)
-    }
-
-    /// Why a candidate cannot carry UDP, or `None` when it can: its route
-    /// judged on the whole path from the outermost ancestor down to its
-    /// leaf without collecting it, or the leaf's own UDP when the path
-    /// crosses no exit, which under `outer_exit == false` costs no compose.
-    #[inline(never)]
-    fn candidate_udp_unavailable(
-        &self,
-        candidate: &super::Candidate<'_>,
-        outer_exit: bool,
-        ancestors: &[&str],
-        group: &Group,
-    ) -> Option<&'static str> {
-        let leaf = || {
-            (!self.leaf_carries_udp(candidate.node)).then_some("capability_or_health_unavailable")
-        };
-        let Some(exits) = self.exits.as_deref() else {
-            return leaf();
-        };
-        let below = candidate
-            .selection_chain
-            .split_last()
-            .map_or(&[][..], |(_, groups)| groups);
-        if !outer_exit
-            && !below
-                .iter()
-                .any(|group| exits.by_group.contains_key(*group))
+                .all(|name| !exits.by_group.contains_key(*name))
         {
-            return leaf();
+            return if domain == ProbeDomain::Tcp {
+                leaf.protocol() != NodeProtocol::Chain || leaf.resolved_chain_hops().is_some()
+            } else {
+                self.udp_leaf_available(leaf, domain, family)
+            };
         }
-        let path = ancestors
-            .iter()
-            .copied()
-            .chain(std::iter::once(group.name.as_str()))
-            .chain(below.iter().copied());
-        (!self.path_carries_udp(exits, candidate.node, path)).then_some("exit_without_udp")
-    }
-
-    /// Whether what `leaf` dials through the exits of the groups on `path`,
-    /// outermost first, carries UDP: the leaf itself without an exit, the
-    /// one node a route collapses to, or the exit tunneling it otherwise.
-    #[inline(always)]
-    fn path_carries_udp<'p>(
-        &self,
-        exits: &Exits,
-        leaf: &Node,
-        path: impl DoubleEndedIterator<Item = &'p str> + Clone,
-    ) -> bool {
-        match self.compose_path(exits, leaf, path) {
-            Some(Composed::Direct) => self.leaf_carries_udp(leaf),
-            Some(Composed::Collapsed(node)) => self
-                .nodes
-                .get(&node)
-                .is_some_and(|node| carries_udp(UdpPath::Own(node))),
-            Some(Composed::Routed(route)) => self.route_carries_udp(&route),
+        let groups = std::iter::once(group.name.as_str()).chain(ancestors.iter().rev().copied());
+        if domain != ProbeDomain::Tcp {
+            return match self.compose_path(leaf, groups, |_| true) {
+                Some(Composed::Direct) => self.udp_leaf_available(leaf, domain, family),
+                Some(Composed::Collapsed(id)) => self.nodes.get(&id).is_some_and(|node| {
+                    builtin_udp_available(UdpPath::Own(node))
+                        && family
+                            .is_none_or(|ipver| self.is_node_alive_for_domain(id, domain, ipver))
+                }),
+                Some(Composed::Routed(route)) => {
+                    !node_targets_only && self.udp_route_available(&route, domain, family)
+                }
+                Some(Composed::TooLong) | None => false,
+            };
+        }
+        let path = self.compose_path(leaf, groups, |id| {
+            family.is_none_or(|ipver| self.is_node_selectable_for_domain(id, domain, ipver))
+        });
+        match path {
+            Some(Composed::Direct | Composed::Collapsed(_)) => true,
+            Some(Composed::Routed(route)) => {
+                family.is_none_or(|ipver| self.route_prefix_available(&route, ipver))
+            }
             Some(Composed::TooLong) | None => false,
         }
     }
 
-    /// Whether `group`'s `final` node is selectable, judged like a member:
-    /// UDP capability from what it dials through the exits of `ancestors`
-    /// and `group`, health on the node itself.
-    pub(super) fn final_node_selectable(
+    fn udp_leaf_available(
         &self,
-        node: &Node,
-        ancestors: &[&str],
-        group: &Group,
+        leaf: &Node,
         domain: super::ProbeDomain,
-        ipver: super::IpVersion,
+        family: Option<super::IpVersion>,
     ) -> bool {
-        match self.exits.as_deref() {
-            Some(exits)
-                if matches!(
-                    domain,
-                    super::ProbeDomain::DataUdp | super::ProbeDomain::DnsUdp
-                ) =>
-            {
-                let path = ancestors
-                    .iter()
-                    .copied()
-                    .chain(std::iter::once(group.name.as_str()));
-                self.path_carries_udp(exits, node, path)
-                    && self.is_node_alive_for_domain(node.id, domain, ipver)
-            }
-            _ => self.is_node_selectable_for_domain(node.id, domain, ipver),
-        }
+        family.map_or_else(
+            || self.node_carries_udp(leaf),
+            |ipver| self.is_node_selectable_for_domain(leaf.id, domain, ipver),
+        )
     }
 
-    /// Whether a leaf reached through `selection_chain` dials as itself:
-    /// no exit on the path, or one that collapses to the leaf.
-    pub(super) fn dials_as_itself(&self, leaf: &Node, selection_chain: &[&str]) -> bool {
-        let Some(exits) = self.exits.as_deref() else {
-            return true;
-        };
-        let path = selection_chain
-            .split_last()
-            .map_or(&[][..], |(_, path)| path);
-        match self.compose_path(exits, leaf, path.iter().copied()) {
-            Some(Composed::Direct) => true,
-            Some(Composed::Collapsed(node)) => node == leaf.id,
-            _ => false,
-        }
+    /// Whether the captured UDP target is still eligible before its flow binds.
+    pub fn target_selectable(
+        &self,
+        target: &OwnedTarget,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+    ) -> bool {
+        target.node.protocol() == NodeProtocol::Block
+            || target.route().map_or_else(
+                || self.is_node_selectable_for_domain(target.node.id, domain, ipver),
+                |route| self.udp_route_available(route, domain, Some(ipver)),
+            )
     }
 
-    /// Whether `leaf` carries UDP through `exits`, the resolved exits of the
-    /// groups on its path, outermost first, as `GroupGraph::visit` hands
-    /// them over: its own capability without one, the exit's own when the
-    /// route collapses to it, the tunnel otherwise. A chain leaf whose hops
-    /// this manager could not resolve carries none behind an exit.
-    pub fn carries_udp_via(&self, leaf: &Node, exits: &[Uuid]) -> bool {
-        let Some(known) = self.exits.as_deref().filter(|_| !exits.is_empty()) else {
-            return self.node_carries_udp(leaf);
-        };
-        let leaf_hops = match leaf.protocol() {
-            NodeProtocol::Direct => &[][..],
-            NodeProtocol::Chain => match known.chains.get(&leaf.id) {
-                Some(hops) => hops,
-                None => return false,
-            },
-            _ => std::slice::from_ref(&leaf.id),
-        };
-        match compose(leaf.id, leaf_hops, exits.iter().rev().copied()) {
-            Composed::Direct => self.node_carries_udp(leaf),
-            Composed::Collapsed(node) => self
-                .nodes
-                .get(&node)
-                .is_some_and(|node| carries_udp(UdpPath::Own(node))),
-            Composed::Routed(route) => self.route_carries_udp(&route),
-            Composed::TooLong => false,
-        }
+    fn route_carries_udp(&self, route: &Route) -> bool {
+        builtin_tunneled_udp_available(route.hops(), |id| self.nodes.get(id))
     }
 
-    fn group_has_exit(&self, group: &str) -> bool {
-        self.exits
-            .as_deref()
-            .is_some_and(|exits| exits.by_group.contains_key(group))
+    fn udp_route_available(
+        &self,
+        route: &Route,
+        domain: ProbeDomain,
+        family: Option<IpVersion>,
+    ) -> bool {
+        self.route_carries_udp(route)
+            && family.is_none_or(|ipver| {
+                self.udp_route_path_available(route.leaf(), route.hops(), domain, ipver)
+            })
     }
 
-    /// Whether UDP through `group` can be offered at all: the outermost
-    /// exit on the path frames it, so only when no ancestor has an exit
-    /// does `group`'s own exit need to carry UDP, tunneled or, for a route
-    /// that may collapse to it, its own.
+    /// Skip building candidates when a simple exit group cannot offer UDP.
     pub(super) fn exit_offers_udp(&self, group: &Group, ancestors: &[&str]) -> bool {
+        if !group.groups.is_empty() || group.final_outbound.is_some() {
+            return true;
+        }
         let Some(exits) = self.exits.as_deref() else {
             return true;
         };
         if ancestors
             .iter()
-            .any(|ancestor| self.group_has_exit(ancestor))
+            .any(|name| exits.by_group.contains_key(*name))
         {
             return true;
         }
-        match exits.by_group.get(&group.name) {
-            None => true,
-            Some(ExitEdge::Unresolved) => false,
-            Some(ExitEdge::Node(exit)) => self.nodes.get(exit).is_some_and(|node| {
-                carries_udp(UdpPath::Tunneled { exit: node })
-                    || (carries_udp(UdpPath::Own(node)) && self.may_collapse_to(group, *exit))
-            }),
-        }
+        let exit = self
+            .group_exit(&group.name)
+            .and_then(|id| self.nodes.get(&id));
+        exit.is_some_and(|exit| builtin_udp_available(UdpPath::Tunneled { exit }))
+            || group
+                .nodes
+                .iter()
+                .filter_map(|id| self.nodes.get(id))
+                .any(|node| {
+                    node.protocol() == NodeProtocol::Block
+                        || exit.is_some_and(|exit| {
+                            builtin_udp_available(UdpPath::Own(exit))
+                                && (node.id == exit.id || node.protocol() == NodeProtocol::Direct)
+                        })
+                })
     }
 
-    /// Whether a route through `group` may collapse to `exit`, judged
-    /// without building candidates: a direct, `block` or chain member, the
-    /// exit itself, any subgroup or any `final` may.
-    fn may_collapse_to(&self, group: &Group, exit: Uuid) -> bool {
-        !group.groups.is_empty()
-            || group.final_outbound.is_some()
-            || group.nodes.iter().any(|id| {
-                *id == exit
-                    || self.nodes.get(id).is_none_or(|node| {
-                        matches!(
-                            node.protocol(),
-                            NodeProtocol::Direct | NodeProtocol::Block | NodeProtocol::Chain
-                        )
-                    })
-            })
+    /// Warm-up opens the leaf runtime directly. A collapse may reuse that
+    /// runtime when the leaf itself is the node the route dials.
+    pub(super) fn udp_warm_dials_leaf<'g>(
+        &self,
+        leaf: &Node,
+        groups: impl Iterator<Item = &'g str>,
+    ) -> bool {
+        match self.compose_path(leaf, groups, |_| true) {
+            Some(Composed::Direct) => true,
+            Some(Composed::Collapsed(id)) => id == leaf.id,
+            _ => false,
+        }
     }
 
     /// The resolved exit of `group`, for callers that probe it.
@@ -576,85 +451,9 @@ impl GroupManager {
         }
     }
 
-    /// Whether any group has an exit. Every exit check tests this first, so
-    /// a configuration without exits pays no lookup or allocation for them.
+    /// Whether the published group graph contains a configured exit.
     #[inline]
-    pub(super) fn has_exits(&self) -> bool {
+    pub fn has_exits(&self) -> bool {
         self.exits.is_some()
-    }
-
-    /// A route through `group` counts as alive only while its exit is. An
-    /// exit the alive set does not register is never probed, so traffic
-    /// alone could hold it dead; it counts as alive. Health only: whether
-    /// the route carries UDP is the route's answer, and an exit before the
-    /// outermost carries only the stream.
-    fn exit_alive(&self, group: &str, domain: super::ProbeDomain, ipver: super::IpVersion) -> bool {
-        self.group_exit(group)
-            .is_none_or(|exit| self.node_exit_alive(exit, domain, ipver))
-    }
-
-    fn node_exit_alive(
-        &self,
-        exit: Uuid,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> bool {
-        self.alive_set
-            .as_ref()
-            .is_none_or(|alive| !alive.is_registered(exit))
-            || self.is_node_alive_for_domain(exit, domain, ipver)
-    }
-
-    /// Owned dialing targets of a group in plan order, the legacy
-    /// counterpart of [`Self::select_nodes_in_order_for_domain`] for callers
-    /// that dial. Owned here, as those callers keep every target, so no
-    /// borrowed target list is built on the way.
-    pub fn select_targets_in_order_for_domain(
-        &self,
-        group_name: &str,
-        domain: super::ProbeDomain,
-        ipver: super::IpVersion,
-    ) -> Vec<OwnedTarget> {
-        let Some(entry) = self.groups.get(group_name) else {
-            return Vec::new();
-        };
-        if !entry.routes {
-            return self
-                .selection_plan_for_group(
-                    &entry.group,
-                    false,
-                    domain,
-                    ipver,
-                    super::SelectionEffects::Apply,
-                )
-                .nodes
-                .into_iter()
-                .map(|node| OwnedTarget::node(node.clone()))
-                .collect();
-        }
-        let group = &entry.group;
-        self.mark_used(group_name);
-        let context = super::ScoreSelectionContext::aggregate(
-            SelectionNetwork::from_probe_domain(domain),
-            domain,
-            ipver,
-        );
-        let (_, candidates) = self.selection_candidates_for_target(
-            group,
-            &context,
-            &mut Vec::new(),
-            0,
-            super::SelectionEffects::Apply,
-            super::score::selection::ScoreSelectionRules {
-                cold_urltest: true,
-                routes: true,
-                ..Default::default()
-            },
-        );
-        candidates
-            .into_iter()
-            .filter_map(|candidate| self.routed_chain(&candidate, context.network))
-            .map(|target| self.own_target(target))
-            .collect()
     }
 }

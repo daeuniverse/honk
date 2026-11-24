@@ -350,6 +350,207 @@ fn unrelated_target_failures_preserve_healthy_exact_selection_and_probe_support(
 }
 
 #[test]
+fn a_failed_route_counts_the_business_without_blocking_its_leaf() {
+    let leaf = node("front");
+    let nodes = std::slice::from_ref(&leaf);
+    let manager = GroupManager::new(&[group("score", nodes)], nodes);
+    let target = context("origin.example", IpVersion::V4);
+    let now = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", leaf.id, target.clone())
+        .unwrap();
+    feedback
+        .start_at(now)
+        .finish_at(ScoreOutcome::RouteFailure, true, now);
+    let state = manager.score_state();
+    let mut aggregate = target.clone();
+    aggregate.target = None;
+    for scope in [&target, &aggregate] {
+        let score = score_snapshot(&state.inner.lock(), "score", scope, leaf.id, now);
+        assert_eq!(score.completed, 1.0);
+        assert_eq!(score.fail_streak, 0);
+        assert!(!score.explore_backed_off);
+    }
+}
+
+#[tokio::test]
+async fn a_collapsed_exit_keeps_hard_score_only_for_the_fault_owner() {
+    use crate::SharedError;
+    use crate::group::{DialKey, ExitCollapse, OwnedTarget};
+    use crate::proxy::{DialFailureScope, ProxyRegistry, dial_failure_scope};
+    use crate::runtime::OutboundRuntimeRegistry;
+    use crate::test_support::{node as proxy_node, socks5, socks5_relay};
+    use honk_config::node::{OutboundConfig, ShadowsocksConfig};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpSocket};
+
+    #[derive(Clone, Copy, Debug)]
+    enum Fault {
+        Carrier,
+        SharedCarrier,
+        Reset,
+        ConnectRefusal,
+        TargetRefusal,
+    }
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ss = proxy_node(
+            "exit",
+            "127.0.0.1",
+            peer.local_addr().unwrap().port(),
+            OutboundConfig::Shadowsocks(ShadowsocksConfig {
+                password: Some("test-password".into()),
+                encryption: Some("aes-128-gcm".into()),
+                ..Default::default()
+            }),
+        );
+        let closed = TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let unavailable = socks5("exit", "127.0.0.1", closed.local_addr().unwrap().port());
+        let relay = socks5_relay(Vec::new(), true).await;
+        let refusing = socks5("exit", "127.0.0.1", relay.addr.port());
+        let direct = honk_config::Config::builtin_direct_node();
+        let dst: SocketAddr = "127.0.0.1:443".parse().unwrap();
+        let target = ScoreSelectionContext {
+            target: Some(dst.into()),
+            ..context("origin.example", IpVersion::V4)
+        };
+        let other = context("other.example", IpVersion::V4);
+        let registry = ProxyRegistry::default_resolver().unwrap();
+
+        for (fault, exit) in [
+            (Fault::Carrier, &ss),
+            (Fault::SharedCarrier, &ss),
+            (Fault::Reset, &ss),
+            (Fault::ConnectRefusal, &unavailable),
+            (Fault::TargetRefusal, &refusing),
+        ] {
+            let generation =
+                Arc::new(OutboundRuntimeRegistry::build(std::slice::from_ref(exit)).unwrap());
+            for (member, collapse) in [
+                (exit, ExitCollapse::Member),
+                (&direct, ExitCollapse::Direct),
+            ] {
+                let manager = GroupManager::new(
+                    &[Group {
+                        exit: Some(exit.name.clone()),
+                        ..group("score", std::slice::from_ref(member))
+                    }],
+                    &[exit.clone(), direct.clone()],
+                );
+                let plan = manager.selection_plan_for_target("score", &target);
+                let entry = &plan.entries[0];
+                assert!(entry.route.is_none());
+                let dial = OwnedTarget {
+                    collapse: entry.collapse,
+                    ..OwnedTarget::node(entry.node.clone())
+                };
+                assert_eq!(dial.key(), DialKey::Node(exit.id));
+                assert_eq!(dial.collapse, collapse);
+                let attempt = entry.feedback.as_ref().unwrap();
+                assert_eq!(attempt.attributions()[0].node_id, member.id);
+                let reporter = attempt.begin().unwrap().start();
+                let result = registry
+                    .dial_ref(
+                        Arc::clone(&generation),
+                        dial.dial_ref(),
+                        dst,
+                        None,
+                        Duration::from_secs(2),
+                    )
+                    .await;
+                let (error, expected) = match fault {
+                    Fault::ConnectRefusal => {
+                        let error = result.expect_err("refused proxy connection");
+                        assert_eq!(dial_failure_scope(error.as_ref()), DialFailureScope::Hop(0));
+                        (error, ScoreOutcome::Io(io::ErrorKind::ConnectionRefused))
+                    }
+                    Fault::TargetRefusal => (
+                        result.expect_err("refused SOCKS5 target"),
+                        ScoreOutcome::TargetFailure,
+                    ),
+                    Fault::Carrier | Fault::SharedCarrier | Fault::Reset => {
+                        let mut stream = result.unwrap().stream;
+                        reporter.setup_succeeded();
+                        let (mut accepted, _) = peer.accept().await.unwrap();
+                        // Salt and sealed IPv4 target. Drain the request before delivering the fault.
+                        accepted
+                            .read_exact(&mut [0; 16 + 18 + 7 + 16])
+                            .await
+                            .unwrap();
+                        if matches!(fault, Fault::Reset) {
+                            socket2::SockRef::from(&accepted)
+                                .set_linger(Some(Duration::ZERO))
+                                .unwrap();
+                            drop(accepted);
+                        } else {
+                            // Response salt and a length record with an invalid authentication tag.
+                            accepted.write_all(&[0; 16 + 18]).await.unwrap();
+                        }
+                        let error = stream.read_u8().await.unwrap_err();
+                        if matches!(fault, Fault::SharedCarrier) {
+                            let fanout = SharedError::fanout(error.into());
+                            let episode = fanout.episode().unwrap();
+                            (fanout.into(), ScoreOutcome::SharedNodeFailure(episode))
+                        } else if matches!(fault, Fault::Carrier) {
+                            (error.into(), ScoreOutcome::NodeFailure)
+                        } else {
+                            (
+                                error.into(),
+                                ScoreOutcome::Io(io::ErrorKind::ConnectionReset),
+                            )
+                        }
+                    }
+                };
+                let outcome = ScoreOutcome::from_error(&error);
+                assert_eq!(outcome, expected, "{fault:?}");
+                let node_hard = collapse == ExitCollapse::Member
+                    && !matches!(fault, Fault::TargetRefusal | Fault::Reset);
+                let target_hard = node_hard || matches!(fault, Fault::TargetRefusal);
+                let projected = dial.score_failure(outcome, error.as_ref());
+                reporter.finish(projected);
+
+                let state = manager.score_state();
+                assert_eq!(state.root_business_starts(), 1);
+                assert_eq!(
+                    state.exact_useful_failures("score", &target, member.id),
+                    Some(1)
+                );
+                for (context, hard) in [(&target, target_hard), (&other, node_hard)] {
+                    let score = score_snapshot(
+                        &state.inner.lock(),
+                        "score",
+                        context,
+                        member.id,
+                        Instant::now(),
+                    );
+                    assert_eq!(
+                        score.fail_streak,
+                        u32::from(hard),
+                        "{fault:?} via {collapse:?}"
+                    );
+                    assert_eq!(score.node_fail_streak, u32::from(node_hard));
+                }
+                // The shared case must retain the original episode through the projection.
+                assert_eq!(
+                    projected,
+                    if target_hard {
+                        expected
+                    } else {
+                        ScoreOutcome::RouteFailure
+                    }
+                );
+            }
+            generation.shutdown().await;
+        }
+        assert_eq!(relay.requests(), [dst.to_string(), dst.to_string()]);
+    })
+    .await
+    .unwrap();
+}
+
+#[test]
 fn target_refusal_before_setup_or_without_family_never_opens_node_episode() {
     let leaf = node("refused target");
     let nodes = std::slice::from_ref(&leaf);

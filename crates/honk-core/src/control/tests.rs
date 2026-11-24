@@ -60,10 +60,17 @@ async fn health_push_re_resolves_after_reload_writer() {
             },
         ],
     );
-    let config = Arc::new(RwLock::new(Arc::new(old_config.clone())));
+    let old_config = Arc::new(old_config);
+    let config = Arc::new(RwLock::new(Arc::clone(&old_config)));
     let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
+    let compile = |config: &Arc<Config>, generation| {
+        let router = Router::from_config(&config.routing).unwrap();
+        let plan = Arc::new(ControlPlane::compile_routing_plan(config, &router).unwrap());
+        routing_matcher::ActiveRoutingPlan::new(plan, &group_manager.read(), generation, config)
+    };
+    let routing_plan = Arc::new(parking_lot::RwLock::new(compile(&old_config, 1)));
     let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
@@ -71,6 +78,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
         Arc::clone(&ebpf),
         Arc::clone(&config),
+        Arc::clone(&routing_plan),
         Arc::clone(&group_manager),
         Arc::clone(&alive_set),
     ));
@@ -81,8 +89,9 @@ async fn health_push_re_resolves_after_reload_writer() {
     backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
     *config_writer = Arc::new(new_config.clone());
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
+    *routing_plan.write() = compile(&config_writer, 2);
 
-    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(Some(node.id), Some((1, 0))));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
     drop(config_writer);
@@ -1244,24 +1253,16 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
 
 #[test]
 fn subscription_merge_replaces_only_that_subscription() {
-    fn node(name: &str, sub: Option<uuid::Uuid>) -> Node {
-        Node {
-            id: uuid::Uuid::new_v4(),
-            name: name.into(),
-            address: "127.0.0.1:1".into(),
-            host: "127.0.0.1".into(),
-            port: 1,
-            subscription_id: sub,
-            ..Default::default()
-        }
+    fn node(name: &str, port: u16, sub: Option<uuid::Uuid>) -> Node {
+        support::canonical_socks5(name, &format!("127.0.0.1:{port}"), port, sub)
     }
 
     let sub_a = uuid::Uuid::new_v4();
     let sub_b = uuid::Uuid::new_v4();
-    let static_node = node("static", None);
-    let old_a1 = node("a-old-1", Some(sub_a));
-    let old_a2 = node("a-old-2", Some(sub_a));
-    let b_node = node("b-1", Some(sub_b));
+    let static_node = node("static", 1, None);
+    let old_a1 = node("a-old-1", 2, Some(sub_a));
+    let old_a2 = node("a-old-2", 3, Some(sub_a));
+    let b_node = node("b-1", 4, Some(sub_b));
 
     let mut current = Config {
         nodes: vec![
@@ -1285,8 +1286,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     );
     assert_eq!(current.groups[0].nodes.len(), 4);
 
-    let new_a1 = node("a-new-1", Some(sub_a));
-    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1.clone()]);
+    let new_a1 = node("a-new-1", 5, Some(sub_a));
+    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1]).unwrap();
 
     // Old sub-A nodes are gone; static and other-subscription nodes stay.
     let names: Vec<&str> = merged.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -1301,8 +1302,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     assert!(!merged.groups[0].nodes.contains(&old_a2.id));
 
     // Re-merging the same subscription replaces instead of duplicating.
-    let new_a1b = node("a-new-1", Some(sub_a));
-    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]);
+    let new_a1b = node("a-new-1", 5, Some(sub_a));
+    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]).unwrap();
     assert_eq!(remerged.nodes.len(), 3);
     assert_eq!(remerged.groups[0].nodes.len(), 3);
     assert_eq!(remerged.nodes[2].id, new_a1b.id);
@@ -1322,7 +1323,7 @@ fn empty_subscription_merge_preserves_previous_nodes() {
         ..Default::default()
     };
 
-    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new());
+    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new()).unwrap();
 
     assert_eq!(merged.nodes.len(), 1);
     assert_eq!(merged.nodes[0].id, old.id);
@@ -3570,8 +3571,8 @@ fn resolve_udp_score_plan(
     manager: &GroupManager,
     outbound: &str,
     ipver: IpVersion,
-) -> ResolvedUdpPlan {
-    resolve_udp_outbound_plan_for_target(
+) -> ResolvedScorePlan {
+    resolve_outbound_plan_for_target(
         config,
         manager,
         outbound,
@@ -3627,7 +3628,7 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         let context =
             crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
         assert!(
-            super::reload::resolve_outbound_plan_for_target::<honk_outbound::group::OwnedTarget>(
+            resolve_outbound_plan_for_target(
                 &config,
                 &manager,
                 "selector",
@@ -3637,14 +3638,13 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
             .targets
             .is_empty()
         );
-        let plan =
-            super::reload::resolve_outbound_plan_for_target::<honk_outbound::group::OwnedTarget>(
-                &config,
-                &manager,
-                "selector-final",
-                &context,
-                crate::control::reload::OutboundConstraint::Any,
-            );
+        let plan = resolve_outbound_plan_for_target(
+            &config,
+            &manager,
+            "selector-final",
+            &context,
+            OutboundConstraint::Any,
+        );
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(
             plan.targets
@@ -3698,9 +3698,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     assert_eq!(direct.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         direct
-            .nodes()
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["direct"]
     );
@@ -3708,9 +3708,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     let node = resolve_udp_score_plan(&config, &manager, "first", IpVersion::V4);
     assert_eq!(node.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
-        node.nodes()
+        node.targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first"]
     );
@@ -3719,9 +3719,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     assert_eq!(nested.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         nested
-            .nodes()
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first"]
     );
@@ -3733,9 +3733,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     );
     assert_eq!(
         final_plan
-            .nodes()
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first", "second"]
     );
@@ -3791,12 +3791,12 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
         v4_fallback.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
     );
-    assert_eq!(v4_fallback.ipver, IpVersion::V4);
+    assert_eq!(v4_fallback.health_family, IpVersion::V4);
     assert_eq!(
         v4_fallback
-            .nodes()
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["v4-only"]
     );
@@ -3814,9 +3814,9 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
     let unknown = resolve_udp_score_plan(&config, &manager, "not-configured", IpVersion::V4);
     assert_eq!(
         unknown
-            .nodes()
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["direct"]
     );
@@ -3852,12 +3852,11 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     for outbound in ["v4-explicit", "final-to-explicit"] {
         let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
-        assert_eq!(plan.ipver, IpVersion::V4, "{outbound}");
+        assert_eq!(plan.health_family, IpVersion::V4, "{outbound}");
         assert_eq!(
             plan.targets
                 .iter()
-                .map(|target| &target.node)
-                .map(|node| node.name.as_str())
+                .map(|target| target.node.name.as_str())
                 .collect::<Vec<_>>(),
             ["v4-explicit"],
             "{outbound}"
@@ -3866,12 +3865,11 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
 
     for outbound in ["direct", "block"] {
         let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
-        assert_eq!(plan.ipver, IpVersion::V6, "{outbound}");
+        assert_eq!(plan.health_family, IpVersion::V6, "{outbound}");
         assert_eq!(
             plan.targets
                 .iter()
-                .map(|target| &target.node)
-                .map(|node| node.name.as_str())
+                .map(|target| target.node.name.as_str())
                 .collect::<Vec<_>>(),
             [outbound]
         );
@@ -3883,7 +3881,7 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     for outbound in ["v4-explicit", "final-to-explicit"] {
         assert!(
             resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6)
-                .nodes()
+                .targets
                 .is_empty(),
             "{outbound} must stay empty when neither family is selectable"
         );
@@ -4445,13 +4443,9 @@ fn preconnect_candidates_prefer_group_selections_then_config_order() {
 /// A selected proxy chain is passed over; its hops stay eligible on their own.
 #[test]
 fn preconnect_candidates_skip_chain_nodes() {
-    let ss = preconnect_test_node("ss", NodeProtocol::SS);
-    let trojan = preconnect_test_node("trojan", NodeProtocol::Trojan);
-    let mut via = preconnect_test_node("via", NodeProtocol::Chain);
-    via.address = String::new();
-    via.outbound = honk_config::node::OutboundConfig::Chain {
-        hops: vec!["ss".into(), "trojan".into()],
-    };
+    let ss = Node::from_share_link("ss://YWVzLTEyOC1nY206cGFzcw@ss.example:8388#ss").unwrap();
+    let trojan = Node::from_share_link("trojan://secret@trojan.example:443#trojan").unwrap();
+    let via = Node::chain_from_nodes("via", &[&ss, &trojan]).unwrap();
     let config = Config {
         nodes: vec![via.clone(), ss, trojan],
         groups: vec![preconnect_test_group(
@@ -5161,7 +5155,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             )));
             control.start_datapath_flags_coordinator()?;
             {
-                let plan = control.active_routing_plan.read().clone();
+                let plan = control.active_routing_plan.read().plan.clone();
                 let mut ebpf = control.ebpf.write().await;
                 ebpf.publish_routing_plan(&plan, &[])?;
             }

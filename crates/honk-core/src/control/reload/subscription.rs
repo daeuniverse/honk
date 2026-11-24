@@ -4,35 +4,57 @@ use crate::config_diagnostics::DiagnosticUpdate;
 /// Build the config produced by merging one subscription's freshly fetched
 /// nodes. A non-empty result replaces the previous node set for
 /// `subscription_id`; an empty result leaves the current config untouched.
-/// Group memberships derived from replaced nodes are pruned and filter-based
-/// membership is re-resolved against the merged node set. Nodes from other
-/// subscriptions and static config nodes are untouched. Re-merging the same
-/// subscription is idempotent — nodes are replaced, never duplicated.
+/// Explicit membership follows matching provider chains before stale IDs are
+/// pruned and filters are recomputed. Other providers and static nodes retain
+/// their declarations. Re-merging the same subscription is idempotent.
 pub(in crate::control) fn config_with_subscription_nodes(
     current: &Config,
     subscription_id: uuid::Uuid,
-    nodes: Vec<Node>,
-) -> Config {
+    mut nodes: Vec<Node>,
+) -> Result<Config, honk_config::error::DetailedConfigError> {
     if nodes.is_empty() {
-        return current.clone();
+        return Ok(current.clone());
+    }
+    let has_incoming_chain = nodes.iter().any(|node| node.chain_hops().is_some());
+    if has_incoming_chain {
+        // Current declarations have unique bound IDs. An exact duplicate in
+        // the new provider body will also fail the assembled ID check.
+        let prior_chains: std::collections::HashMap<_, _> = current
+            .nodes
+            .iter()
+            .filter(|node| node.subscription_id == Some(subscription_id))
+            .filter_map(|node| Some(((node.name.as_str(), node.chain_hops()?), node.id)))
+            .collect();
+        for node in &mut nodes {
+            if let Some(hops) = node.chain_hops() {
+                // Only the admitted provider snapshot can supply membership aliases.
+                node.id = prior_chains
+                    .get(&(node.name.as_str(), hops))
+                    .copied()
+                    .unwrap_or_default();
+            }
+        }
     }
     let mut config = current.clone();
-    config
-        .nodes
-        .retain(|n| n.subscription_id != Some(subscription_id));
+    let mut preserve_membership =
+        has_incoming_chain || config.groups.iter().any(|group| group.exit.is_some());
+    config.nodes.retain(|node| {
+        // Removing the last chain still has explicit chain memberships to prune.
+        preserve_membership = preserve_membership || node.chain_hops().is_some();
+        node.subscription_id != Some(subscription_id)
+    });
     config.nodes.extend(nodes);
-    // Stable node IDs may survive a rename or move between subscriptions, so
-    // prune dead members and rebuild filter-derived membership from provenance.
-    let live: std::collections::HashSet<uuid::Uuid> = config.nodes.iter().map(|n| n.id).collect();
-    for group in &mut config.groups {
-        group.nodes.retain(|id| live.contains(id));
-    }
-    honk_config::parser::resolve_group_filters(
-        &mut config.groups,
-        &config.nodes,
-        &config.subscriptions,
-    );
-    config
+    config.assemble(|groups, nodes, subscriptions| {
+        let live: std::collections::HashSet<_> = nodes.iter().map(|node| node.id).collect();
+        for group in &mut *groups {
+            group.nodes.retain(|id| live.contains(id));
+        }
+        if preserve_membership {
+            honk_config::parser::resolve_programmatic_groups(groups, nodes, subscriptions);
+        } else {
+            honk_config::parser::resolve_group_filters(groups, nodes, subscriptions);
+        }
+    })
 }
 fn subscription_provenance_error(index: usize) -> honk_config::error::DetailedConfigError {
     let ordinal = index + 1;
@@ -57,7 +79,7 @@ impl ControlPlane {
         mut diagnostics: Vec<honk_config::diagnostic::DetailedDiagnostic>,
         drain: &DrainTracker,
     ) -> Result<ReloadOutcome, honk_config::error::DetailedConfigError> {
-        honk_config::node::validate_node_collection(&nodes)?;
+        honk_config::node::validate_partial_node_collection(&nodes)?;
         if let Some(index) = nodes.iter().position(|node| {
             node.subscription_id
                 .is_some_and(|provider| provider != subscription_id)
@@ -87,8 +109,7 @@ impl ControlPlane {
             });
         }
         let incoming_len = nodes.len();
-        let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes);
-        new_config.validate_assembled()?;
+        let mut new_config = config_with_subscription_nodes(&current, subscription_id, nodes)?;
         if let Some(subscription) = current
             .subscriptions
             .iter()

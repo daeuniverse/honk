@@ -747,60 +747,83 @@ async fn test_tcp_query_pooled() {
     server_handle.await.unwrap();
 }
 
-/// A TCP DNS query routed to a proxy chain reaches the server through each
-/// hop, dialed in the DNS fork of the chain's generation.
 #[tokio::test]
-async fn tcp_query_through_a_chain_crosses_every_hop() {
+async fn tcp_dns_through_a_chain_or_group_exit_crosses_both_hops_after_traffic_retirement() {
+    use crate::dns::transport::{read_length_prefixed_into, write_length_prefixed};
     use crate::test_support::{socks5_chain, socks5_relay};
+    use honk_outbound::group::GroupManager;
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
 
-    let response = mock_dns_response(0x4321);
-    let answer = response.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let length = usize::from(stream.read_u16().await.unwrap());
-        let mut query = vec![0_u8; length];
-        stream.read_exact(&mut query).await.unwrap();
-        stream
-            .write_all(&u16::try_from(answer.len()).unwrap().to_be_bytes())
-            .await
-            .unwrap();
-        stream.write_all(&answer).await.unwrap();
-    });
-    let front = socks5_relay().await;
-    let land = socks5_relay().await;
-    let nodes = socks5_chain(&front, &land).to_vec();
-    let generation =
-        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
-    let pool = UpstreamPool::new_with_proxy(
-        &[make_upstream(
-            "chained",
-            &server_address.to_string(),
-            DnsProtocol::Tcp,
-        )],
-        make_router(),
-        Some(Arc::new(
-            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
-        )),
-        nodes,
-        vec![],
-    )
-    .unwrap()
-    .with_traffic_router(Arc::new(tokio::sync::RwLock::new(
-        Router::new(&[], "via").unwrap(),
-    )));
-    pool.set_runtime_generation(generation).unwrap();
-    assert_eq!(
-        pool.query("chained", &mock_dns_query(0x4321))
-            .await
-            .unwrap(),
-        response
-    );
-    server.await.unwrap();
-    assert_eq!(*front.requests.lock(), [land.addr]);
-    assert_eq!(*land.requests.lock(), [server_address]);
-    pool.close().await;
+    for (outbound, id) in [("via", 0x4321), ("proxy", 0x4322)] {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let front = socks5_relay().await;
+            let land = socks5_relay().await;
+            let [chain, front_node, exit_node] = socks5_chain(&front, &land);
+            let groups = if outbound == "proxy" {
+                vec![Group {
+                    name: outbound.into(),
+                    nodes: vec![front_node.id],
+                    exit: Some(exit_node.name.clone()),
+                    ..Default::default()
+                }]
+            } else {
+                Vec::new()
+            };
+            let mut nodes = vec![front_node, exit_node];
+            if outbound == "via" {
+                nodes.push(chain);
+            }
+            let generation = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
+            let manager = Arc::new(GroupManager::new(&groups, &nodes));
+            let pool = UpstreamPool::new_with_proxy(
+                &[make_upstream(
+                    "private",
+                    &address.to_string(),
+                    DnsProtocol::Tcp,
+                )],
+                make_router(),
+                Some(Arc::new(
+                    crate::proxy::ProxyRegistry::default_resolver().unwrap(),
+                )),
+                nodes,
+                groups,
+            )
+            .unwrap()
+            .with_group_manager_snapshot(manager)
+            .with_traffic_router_snapshot(Arc::new(Router::new(&[], outbound).unwrap()));
+            pool.set_runtime_generation(Arc::clone(&generation))
+                .unwrap();
+            generation.begin_retirement();
+
+            let query = mock_dns_query(id);
+            let response = mock_dns_response(id);
+            let server = async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                read_length_prefixed_into(&mut stream, &mut received, None)
+                    .await
+                    .unwrap();
+                assert_eq!(received[2..], query[2..]);
+                let mut answer = response.clone();
+                answer[..2].copy_from_slice(&received[..2]);
+                write_length_prefixed(&mut stream, &answer).await.unwrap();
+                let mut remaining = [0_u8; 1];
+                assert_eq!(stream.read(&mut remaining).await.unwrap(), 0);
+            };
+            let exchange = async {
+                assert_eq!(pool.query("private", &query).await.unwrap(), response);
+                assert_eq!(*front.requests.lock(), [land.addr]);
+                assert_eq!(*land.requests.lock(), [address]);
+                pool.close().await;
+                assert_eq!(pool.lifecycle_stats().close_count, 1);
+            };
+            tokio::join!(server, exchange);
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{outbound}: DNS exchange or joined close stalled"));
+    }
 }
 
 #[tokio::test]
@@ -916,68 +939,4 @@ fn parses_encrypted_upstream_at_construction() {
     ];
     let pool = UpstreamPool::new(&upstreams, make_router()).unwrap();
     assert_eq!(pool.upstream_count(), 4);
-}
-/// A TCP DNS query routed to a group with an `exit` dials the selected node
-/// first and leaves from the exit.
-#[tokio::test]
-async fn tcp_query_through_a_group_exit_leaves_from_the_exit() {
-    use crate::test_support::{socks5_chain, socks5_relay};
-
-    let response = mock_dns_response(0x4322);
-    let answer = response.clone();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let server_address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let length = usize::from(stream.read_u16().await.unwrap());
-        let mut query = vec![0_u8; length];
-        stream.read_exact(&mut query).await.unwrap();
-        stream
-            .write_all(&u16::try_from(answer.len()).unwrap().to_be_bytes())
-            .await
-            .unwrap();
-        stream.write_all(&answer).await.unwrap();
-    });
-    let front = socks5_relay().await;
-    let land = socks5_relay().await;
-    let nodes = socks5_chain(&front, &land)[1..].to_vec();
-    let group = honk_config::group::Group {
-        name: "proxy".into(),
-        nodes: vec![nodes[0].id],
-        exit: Some("land".into()),
-        ..Default::default()
-    };
-    let manager = Arc::new(honk_outbound::group::GroupManager::new(
-        std::slice::from_ref(&group),
-        &nodes,
-    ));
-    let generation =
-        Arc::new(honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap());
-    let pool = UpstreamPool::new_with_proxy(
-        &[make_upstream(
-            "exited",
-            &server_address.to_string(),
-            DnsProtocol::Tcp,
-        )],
-        make_router(),
-        Some(Arc::new(
-            crate::proxy::ProxyRegistry::default_resolver().unwrap(),
-        )),
-        nodes,
-        vec![group],
-    )
-    .unwrap()
-    .with_group_manager_snapshot(manager)
-    .with_traffic_router(Arc::new(tokio::sync::RwLock::new(
-        Router::new(&[], "proxy").unwrap(),
-    )));
-    pool.set_runtime_generation(generation).unwrap();
-    assert_eq!(
-        pool.query("exited", &mock_dns_query(0x4322)).await.unwrap(),
-        response
-    );
-    server.await.unwrap();
-    assert_eq!(*front.requests.lock(), [land.addr]);
-    assert_eq!(*land.requests.lock(), [server_address]);
-    pool.close().await;
 }

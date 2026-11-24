@@ -1,5 +1,6 @@
+use crate::alive::RouteHealthRevision;
 use crate::group::observation;
-use crate::group::{GroupMember, ScoreView};
+use crate::group::{DialKey, GroupMember, ScoreView, SelectorState, Target};
 
 use super::*;
 
@@ -13,9 +14,16 @@ pub(in crate::group) struct ScoreSelectionRules<'a> {
     pub(in crate::group) cold_urltest: bool,
     pub(in crate::group) allow_trials: bool,
     pub(in crate::group) excluded: Option<&'a ExcludedScoreLeaf<'a>>,
+    pub(in crate::group) selector: Option<&'a SelectorState>,
     /// The root group's `routes`: false when no group the root reaches has
     /// an exit, so nested levels skip their exit checks. True when unknown.
     pub(in crate::group) routes: bool,
+    /// The packet dialer accepts configured nodes and single-hop collapses.
+    pub(in crate::group) node_targets_only: bool,
+    /// Preserve the ordinary walk's first family during packet DNS fallback.
+    pub(in crate::group) packet_initial_family: Option<IpVersion>,
+    /// Follow the sole leaf only on the root's authorized last-resort walk.
+    pub(in crate::group) sole_leaf: bool,
 }
 
 impl Default for ScoreSelectionRules<'_> {
@@ -24,7 +32,11 @@ impl Default for ScoreSelectionRules<'_> {
             cold_urltest: false,
             allow_trials: true,
             excluded: None,
+            selector: None,
             routes: true,
+            node_targets_only: false,
+            packet_initial_family: None,
+            sole_leaf: false,
         }
     }
 }
@@ -141,6 +153,56 @@ impl super::GroupManager {
             })
     }
 
+    /// Connectivity admission for exit routes and UDP-capable configured chains.
+    /// Preview avoids Score membership changes, counters and trial reservations.
+    pub fn routed_group_available(
+        &self,
+        group_name: &str,
+        domain: ProbeDomain,
+        family: IpVersion,
+    ) -> Option<bool> {
+        let entry = self.groups.get(group_name)?;
+        let network = SelectionNetwork::from_probe_domain(domain);
+        let udp = network == SelectionNetwork::Udp;
+        if !(entry.routes || udp && self.group_has_udp_chain(group_name)) {
+            return None;
+        }
+        let selector = if udp {
+            self.route_plan_snapshot(group_name, network).0
+        } else {
+            None
+        };
+        let available = |health_family| {
+            let context = ScoreSelectionContext::aggregate(network, domain, health_family);
+            let (_, candidates) = self.selection_candidates_for_target(
+                &entry.group,
+                &context,
+                &mut Vec::new(),
+                0,
+                super::SelectionEffects::Preview,
+                ScoreSelectionRules {
+                    allow_trials: false,
+                    selector: selector.as_deref(),
+                    routes: entry.routes,
+                    ..Default::default()
+                },
+            );
+            !candidates.is_empty()
+        };
+        Some(available(family) || (family == IpVersion::V6 && available(IpVersion::V4)))
+    }
+
+    fn capture_dial_plan<'a>(
+        &'a self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        select: impl FnOnce(Option<&SelectorState>) -> ScoreSelectionPlan<'a>,
+    ) -> (ScoreSelectionPlan<'a>, RouteHealthRevision) {
+        let (selector, revision) = self.route_plan_snapshot(group_name, context.network);
+        let plan = observation::capture(|| select(selector.as_deref()));
+        (plan, revision)
+    }
+
     /// Target-aware selection with IPv6-target/IPv4-proxy health fallback.
     /// The target family remains unchanged in feedback keys; only the
     /// candidate health filter retries with IPv4.
@@ -150,13 +212,50 @@ impl super::GroupManager {
         context: &ScoreSelectionContext,
         original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
-        observation::capture(|| {
+        self.dial_plan_for_target(group_name, context, original).0
+    }
+
+    /// Each candidate and its health-family fallback use the Selector state named by the revision.
+    pub fn dial_plan_for_target(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.dial_plan_with_routes(group_name, context, original, false)
+    }
+
+    /// Select a target for a packet dialer that can open only a node's own transport.
+    pub fn node_packet_dial_plan(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.dial_plan_with_routes(group_name, context, original, true)
+    }
+
+    fn dial_plan_with_routes(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+        node_targets_only: bool,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        let node_targets_only = node_targets_only && context.network == SelectionNetwork::Udp;
+        self.capture_dial_plan(group_name, context, |selector| {
+            let rules = ScoreSelectionRules {
+                selector,
+                node_targets_only,
+                packet_initial_family: node_targets_only.then_some(context.health_family),
+                ..Default::default()
+            };
             let plan = self.selection_plan_for_target_with_effects(
                 group_name,
                 context,
                 super::SelectionEffects::ApplyWithHealthFallback,
-                None,
                 original,
+                rules,
             );
             if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
                 return plan;
@@ -167,8 +266,8 @@ impl super::GroupManager {
                 group_name,
                 &fallback,
                 super::SelectionEffects::Apply,
-                None,
                 original,
+                rules,
             )
         })
     }
@@ -181,7 +280,18 @@ impl super::GroupManager {
         context: &ScoreSelectionContext,
         original: Option<&ScoreContinuation>,
     ) -> super::ScoreSelectionPlan<'_> {
-        observation::capture(|| {
+        self.urltest_retry_dial_plan(group_name, context, original)
+            .0
+    }
+
+    /// URLTest alternatives and the revision used for this retry round.
+    pub fn urltest_retry_dial_plan(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.capture_dial_plan(group_name, context, |selector| {
             let Some(entry) = self.groups.get(group_name) else {
                 observation::gap();
                 return super::ScoreSelectionPlan {
@@ -193,7 +303,9 @@ impl super::GroupManager {
             };
             let group = &entry.group;
             let pinned = group.policy == honk_config::group::GroupPolicy::URLTest
-                && self.selector_member(group, context.network).is_some();
+                && self
+                    .plan_selector_member(group, context.network, selector)
+                    .is_some();
             if group.policy != honk_config::group::GroupPolicy::URLTest || pinned {
                 return observation::decision(
                     group,
@@ -226,6 +338,7 @@ impl super::GroupManager {
                         ScoreSelectionRules {
                             allow_trials: false,
                             routes: entry.routes,
+                            selector,
                             ..Default::default()
                         },
                     );
@@ -233,35 +346,58 @@ impl super::GroupManager {
                         candidates,
                         context.probe_domain,
                         context.health_family,
-                        &[],
                         group,
-                        entry.routes,
+                        &[],
+                        ScoreSelectionRules {
+                            routes: entry.routes,
+                            ..Default::default()
+                        },
                     );
                     observation::metric("sorting_latency", None);
                     observation::reason("retry_candidates_pending");
-                    let mut seen = std::collections::HashSet::new();
-                    let candidates = self
-                        .order_by_latency(
-                            candidates,
-                            context.network,
-                            context.health_family,
-                            group.check_url.as_deref(),
-                        )
-                        .into_iter()
-                        .filter(|candidate| seen.insert(candidate.node.id))
-                        .take(3)
-                        .map(|mut candidate| {
-                            candidate.selection_chain.insert(0, group.name.as_str());
-                            candidate.exit_on_path |= group.exit.is_some();
-                            candidate
-                        })
-                        .collect();
-                    self.score_selection_plan(
+                    let candidates = self.order_by_latency(
                         candidates,
+                        context.network,
+                        context.health_family,
+                        group.check_url.as_deref(),
+                    );
+                    let root_has_exit = group.exit.is_some();
+                    let mut keys = [DialKey::Node(Uuid::nil()); 3];
+                    let limit = keys.len();
+                    let mut accepted = 0;
+                    let targets = candidates
+                        .into_iter()
+                        .filter_map(|mut candidate| {
+                            if root_has_exit {
+                                candidate.selection_chain.insert(0, group.name.as_str());
+                                candidate.exit_on_path = true;
+                            }
+                            let (node, route) = if entry.routes {
+                                self.compose_candidate_route(&candidate, context.network)?
+                            } else {
+                                (candidate.node, None)
+                            };
+                            let key = DialKey::of(node, route.as_ref());
+                            if keys[..accepted].contains(&key) {
+                                return None;
+                            }
+                            keys[accepted] = key;
+                            accepted += 1;
+                            if !root_has_exit {
+                                candidate.selection_chain.insert(0, group.name.as_str());
+                            }
+                            let target = Target {
+                                node,
+                                route: route.map(Box::new),
+                            };
+                            Some((candidate, target))
+                        })
+                        .take(limit);
+                    self.score_selection_plan_from_targets(
+                        targets,
                         super::SelectionPlanMode::Authoritative,
                         context,
                         original,
-                        entry.routes,
                     )
                 },
             )
@@ -278,7 +414,20 @@ impl super::GroupManager {
         final_owners: &[String],
         original: &ScoreContinuation,
     ) -> super::ScoreSelectionPlan<'_> {
-        observation::capture(|| {
+        self.score_retry_dial_plan(group_name, context, failed_node, final_owners, original)
+            .0
+    }
+
+    /// Score replacement and the revision used for its new selection.
+    pub fn score_retry_dial_plan(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        failed_node: Uuid,
+        final_owners: &[String],
+        original: &ScoreContinuation,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.capture_dial_plan(group_name, context, |selector| {
             let excluded = ExcludedScoreLeaf {
                 node_id: failed_node,
                 final_owners,
@@ -287,8 +436,12 @@ impl super::GroupManager {
                 group_name,
                 context,
                 super::SelectionEffects::Apply,
-                Some(&excluded),
                 Some(original),
+                ScoreSelectionRules {
+                    excluded: Some(&excluded),
+                    selector,
+                    ..Default::default()
+                },
             );
             plan.entries.retain(|entry| entry.feedback.is_some());
             plan
@@ -303,86 +456,89 @@ impl super::GroupManager {
         original: Option<&ScoreContinuation>,
         routes: bool,
     ) -> super::ScoreSelectionPlan<'a> {
+        if routes {
+            let targets = candidates.into_iter().filter_map(|candidate| {
+                let target = self.routed_chain(&candidate, context.network)?;
+                Some((candidate, target))
+            });
+            self.score_selection_plan_from_targets(targets, mode, context, original)
+        } else {
+            debug_assert!(
+                candidates
+                    .iter()
+                    .all(|candidate| self.dials_its_leaf(candidate, context.network)),
+                "a candidate under a root without routes does not dial its leaf"
+            );
+            let targets = candidates.into_iter().map(|candidate| {
+                let target = Target::node(candidate.node);
+                (candidate, target)
+            });
+            self.score_selection_plan_from_targets(targets, mode, context, original)
+        }
+    }
+
+    fn score_selection_plan_from_targets<'a>(
+        &'a self,
+        targets: impl Iterator<Item = (super::Candidate<'a>, Target<'a>)>,
+        mode: super::SelectionPlanMode,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+    ) -> super::ScoreSelectionPlan<'a> {
         let mut opportunity = original.map(|original| Arc::clone(&original.opportunity));
+        // Filtered plans have no exact size, but their candidate count bounds the allocation.
+        let mut entries = Vec::with_capacity(targets.size_hint().1.unwrap_or_default());
+        entries.extend(targets.map(|(candidate, target)| {
+            let attributions: Vec<_> = candidate
+                .attribution
+                .into_iter()
+                .map(|group| ScoreAttribution {
+                    group: group.to_string(),
+                    node_id: candidate.node.id,
+                })
+                .collect();
+            let selection_chain = candidate
+                .selection_chain
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let feedback = (!attributions.is_empty()).then(|| {
+                ScoreAttempt::planned(
+                    ScoreFeedback::new(
+                        Arc::clone(&self.score_state),
+                        Arc::clone(&self.score_authority),
+                        context.clone(),
+                        attributions,
+                    )
+                    .with_pool_bound(candidate.pool_bound),
+                    Arc::clone(
+                        opportunity.get_or_insert_with(|| Arc::new(budget::Opportunity::default())),
+                    ),
+                    candidate.score_work,
+                    if original.is_some() {
+                        ScoreTrialSource::Recovery
+                    } else {
+                        ScoreTrialSource::None
+                    },
+                )
+            });
+            super::ScoreSelectionEntry {
+                node: target.node,
+                collapse: target.collapse(candidate.node, candidate.exit_on_path),
+                route: target.route,
+                feedback,
+                selection_chain,
+                final_owners: candidate
+                    .final_owners
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect(),
+            }
+        }));
         super::ScoreSelectionPlan {
             mode,
             health_family: context.health_family,
             observation: None,
-            entries: {
-                let mut entry =
-                    |candidate: super::Candidate<'a>, target: crate::group::Target<'a>| {
-                        let attributions: Vec<_> = candidate
-                            .attribution
-                            .into_iter()
-                            .map(|group| ScoreAttribution {
-                                group: group.to_string(),
-                                node_id: candidate.node.id,
-                            })
-                            .collect();
-                        let selection_chain = candidate
-                            .selection_chain
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect();
-                        let feedback = (!attributions.is_empty()).then(|| {
-                            ScoreAttempt::planned(
-                                ScoreFeedback::new(
-                                    Arc::clone(&self.score_state),
-                                    Arc::clone(&self.score_authority),
-                                    context.clone(),
-                                    attributions,
-                                )
-                                .with_pool_bound(candidate.pool_bound),
-                                Arc::clone(opportunity.get_or_insert_with(|| {
-                                    Arc::new(budget::Opportunity::default())
-                                })),
-                                candidate.score_work,
-                                if original.is_some() {
-                                    ScoreTrialSource::Recovery
-                                } else {
-                                    ScoreTrialSource::None
-                                },
-                            )
-                        });
-                        super::ScoreSelectionEntry {
-                            node: target.node,
-                            route: target.route,
-                            feedback,
-                            selection_chain,
-                            final_owners: candidate
-                                .final_owners
-                                .into_iter()
-                                .map(str::to_owned)
-                                .collect(),
-                        }
-                    };
-                if routes {
-                    // Sized up front: `filter_map` gives `collect` no exact
-                    // length, so it would grow the Vec instead.
-                    let mut entries = Vec::with_capacity(candidates.len());
-                    entries.extend(candidates.into_iter().filter_map(|candidate| {
-                        let target = self.routed_chain(&candidate, context.network)?;
-                        Some(entry(candidate, target))
-                    }));
-                    entries
-                } else {
-                    // Without a route every candidate dials its leaf, so the
-                    // plan keeps the exact-length collect and no route test.
-                    debug_assert!(
-                        candidates
-                            .iter()
-                            .all(|candidate| self.dials_its_leaf(candidate, context.network)),
-                        "a candidate under a root without routes does not dial its leaf"
-                    );
-                    candidates
-                        .into_iter()
-                        .map(|candidate| {
-                            let target = crate::group::Target::node(candidate.node);
-                            entry(candidate, target)
-                        })
-                        .collect()
-                }
-            },
+            entries,
         }
     }
 
@@ -393,15 +549,19 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
     ) -> super::ScoreSelectionPlan<'_> {
-        observation::capture(|| {
+        self.capture_dial_plan(group_name, context, |selector| {
             self.selection_plan_for_target_with_effects(
                 group_name,
                 context,
                 super::SelectionEffects::Apply,
                 None,
-                None,
+                ScoreSelectionRules {
+                    selector,
+                    ..Default::default()
+                },
             )
         })
+        .0
     }
 
     fn selection_plan_for_target_with_effects(
@@ -409,8 +569,8 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
         effects: super::SelectionEffects,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
         original: Option<&ScoreContinuation>,
+        rules: ScoreSelectionRules<'_>,
     ) -> super::ScoreSelectionPlan<'_> {
         let Some(entry) = self.groups.get(group_name) else {
             observation::gap();
@@ -432,10 +592,12 @@ impl super::GroupManager {
             0,
             effects,
             ScoreSelectionRules {
-                cold_urltest: excluded.is_none(),
-                allow_trials: excluded.is_none() && original.is_none(),
-                excluded,
+                cold_urltest: rules.excluded.is_none(),
+                allow_trials: rules.excluded.is_none() && original.is_none(),
                 routes: entry.routes,
+                node_targets_only: rules.node_targets_only && entry.routes,
+                packet_initial_family: rules.packet_initial_family.filter(|_| entry.routes),
+                ..rules
             },
         );
         self.score_selection_plan(candidates, mode, context, original, entry.routes)
@@ -476,7 +638,10 @@ impl super::GroupManager {
                 ordinary = false;
                 // A business IPv6 target may use an IPv4 proxy. Defer this final
                 // until the outer health-family retry has tried that ordinary path.
-                if effects.health_fallback() && context.health_family == IpVersion::V6 {
+                if (effects.health_fallback()
+                    || (!rules.node_targets_only && rules.packet_initial_family.is_some()))
+                    && context.health_family == IpVersion::V6
+                {
                     let mut ipv4 = context.clone();
                     ipv4.health_family = IpVersion::V4;
                     let preflight = if effects.prepares_score() {
@@ -498,17 +663,27 @@ impl super::GroupManager {
                 }
                 match member {
                     GroupMember::Node(node) => {
-                        let eligible = matches!(
-                            node.protocol(),
-                            honk_config::types::NodeProtocol::Direct
-                                | honk_config::types::NodeProtocol::Block
-                        ) || self.final_node_selectable(
-                            node,
-                            visited,
-                            group,
-                            context.probe_domain,
-                            context.health_family,
-                        );
+                        let routed = self.has_exits() && rules.routes;
+                        let eligible = if routed && context.probe_domain != ProbeDomain::Tcp {
+                            self.leaf_route_available(
+                                node,
+                                group,
+                                visited,
+                                context.probe_domain,
+                                Some(context.health_family),
+                                rules.node_targets_only,
+                            )
+                        } else {
+                            matches!(
+                                node.protocol(),
+                                honk_config::types::NodeProtocol::Direct
+                                    | honk_config::types::NodeProtocol::Block
+                            ) || self.is_node_selectable_for_domain(
+                                node.id,
+                                context.probe_domain,
+                                context.health_family,
+                            )
+                        };
                         observation::member(
                             member,
                             Some(node),
@@ -524,7 +699,13 @@ impl super::GroupManager {
                                 pool_bound: 0,
                                 selection_chain: vec![node.name.as_str()],
                                 exit_on_path: false,
-                                final_owners: Vec::new(),
+                                final_owners: if context.network == SelectionNetwork::Udp
+                                    && (node.chain_hops().is_some() || rules.routes)
+                                {
+                                    vec![group.name.as_str()]
+                                } else {
+                                    Vec::new()
+                                },
                                 score_work: Vec::new(),
                             });
                         }
@@ -540,7 +721,10 @@ impl super::GroupManager {
                             visited,
                             depth + 1,
                             effects,
-                            rules,
+                            ScoreSelectionRules {
+                                sole_leaf: false,
+                                ..rules
+                            },
                         );
                         visited.pop();
                         for candidate in &mut candidates {
@@ -556,13 +740,18 @@ impl super::GroupManager {
                         }
                     }
                 }
-                if group.exit.is_some() {
-                    candidates = self.retain_final_exit_selectable(
-                        candidates,
-                        group,
-                        context.probe_domain,
-                        context.health_family,
-                    );
+                if context.probe_domain == ProbeDomain::Tcp && self.has_exits() && rules.routes {
+                    candidates.retain(|candidate| {
+                        candidate.via.is_some()
+                            || self.leaf_route_available(
+                                candidate.node,
+                                group,
+                                visited,
+                                context.probe_domain,
+                                Some(context.health_family),
+                                rules.node_targets_only,
+                            )
+                    });
                 }
                 if mode == super::SelectionPlanMode::ColdUrlTest && !candidates.is_empty() {
                     observation::selected(None, "final_candidates_pending");
@@ -598,7 +787,7 @@ impl super::GroupManager {
         effects: super::SelectionEffects,
         rules: ScoreSelectionRules<'_>,
     ) -> (super::SelectionPlanMode, Vec<super::Candidate<'a>>, bool) {
-        let selected_member = self.selector_member(group, context.network);
+        let selected_member = self.plan_selector_member(group, context.network, rules.selector);
         if let Some(member) = selected_member {
             observation::previous(member);
         }
@@ -647,7 +836,8 @@ impl super::GroupManager {
         } else {
             self.flatten_candidates_for_target(group, context, visited, depth, effects, rules)
         };
-        let before_filter = (effects.prepares_score()
+        let before_filter = (!rules.node_targets_only
+            && effects.prepares_score()
             && group.policy == honk_config::group::GroupPolicy::Score
             && self.score_state.is_current_authority(&self.score_authority))
         .then(|| super::unique_candidate_ids(&candidates))
@@ -656,9 +846,9 @@ impl super::GroupManager {
             candidates,
             context.probe_domain,
             context.health_family,
-            visited,
             group,
-            self.has_exits() && rules.routes,
+            visited,
+            rules,
         );
         let health_filtered =
             before_filter.and_then(|before| super::removed_unique_candidates(before, &candidates));
@@ -672,15 +862,27 @@ impl super::GroupManager {
             );
         }
         if candidates.is_empty() {
-            let candidate = rules
-                .excluded
-                .is_none()
+            let candidate = (rules.excluded.is_none()
+                && (!rules.routes || !self.has_exits() || depth == 0 || rules.sole_leaf))
                 .then(|| {
                     self.last_resort_candidate_for_target(
                         group, context, visited, depth, effects, rules,
                     )
                 })
                 .flatten();
+            let candidate = candidate.filter(|candidate| {
+                !rules.routes
+                    || !self.has_exits()
+                    || candidate.via.is_some()
+                    || self.leaf_route_available(
+                        candidate.node,
+                        group,
+                        visited,
+                        context.probe_domain,
+                        None,
+                        rules.node_targets_only,
+                    )
+            });
             let candidate = candidate.and_then(|candidate| {
                 if ordinary_score {
                     self.pick_score(
@@ -741,6 +943,11 @@ impl super::GroupManager {
                 false,
             );
         }
+        let pin_effects = if rules.node_targets_only {
+            effects.peek()
+        } else {
+            effects
+        };
         let candidate = match policy {
             honk_config::group::GroupPolicy::Selector => {
                 observation::reason("selector_choice");
@@ -751,15 +958,23 @@ impl super::GroupManager {
                 group,
                 context.network,
                 context.health_family,
-                effects,
+                pin_effects,
             )),
             honk_config::group::GroupPolicy::LoadBalance => {
                 let index = self.pick_load_balance(&candidates, group, context.network, effects);
                 Some(candidates.swap_remove(index))
             }
             honk_config::group::GroupPolicy::Fallback => {
-                let index = self.pick_fallback(&candidates, group, context.network, effects);
+                let index = self.pick_fallback(&candidates, group, context.network, pin_effects);
                 Some(candidates.swap_remove(index))
+            }
+            honk_config::group::GroupPolicy::Score if rules.node_targets_only => {
+                let cold = !self
+                    .score_state
+                    .score_pool_initialized(&group.name, context.network);
+                let bootstrap = cold
+                    .then(|| self.packet_score_bootstrap(group, context, visited, depth, rules));
+                self.pick_packet_score(&candidates, group, context, bootstrap, effects.applies())
             }
             honk_config::group::GroupPolicy::Score => self.pick_score(
                 ScoreView {
@@ -785,6 +1000,55 @@ impl super::GroupManager {
         )
     }
 
+    fn packet_score_bootstrap<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        rules: ScoreSelectionRules<'_>,
+    ) -> (ScoreSelectionContext, Vec<super::Candidate<'a>>) {
+        let mut ordinary = context.clone();
+        ordinary.probe_domain = ProbeDomain::DataUdp;
+        ordinary.health_family = rules.packet_initial_family.unwrap_or(context.health_family);
+        let rules = ScoreSelectionRules {
+            allow_trials: false,
+            node_targets_only: false,
+            ..rules
+        };
+        let mut collect = |context: &ScoreSelectionContext| {
+            observation::decision(
+                group,
+                context.health_family,
+                super::SelectionEffects::Preview,
+                || {
+                    let (candidates, _) = self.flatten_candidates_for_target(
+                        group,
+                        context,
+                        visited,
+                        depth,
+                        super::SelectionEffects::Preview,
+                        rules,
+                    );
+                    self.filter_alive_candidates(
+                        candidates,
+                        context.probe_domain,
+                        context.health_family,
+                        group,
+                        visited,
+                        rules,
+                    )
+                },
+            )
+        };
+        let mut candidates = collect(&ordinary);
+        if candidates.is_empty() && ordinary.health_family == IpVersion::V6 {
+            ordinary.health_family = IpVersion::V4;
+            candidates = collect(&ordinary);
+        }
+        (ordinary, candidates)
+    }
+
     fn last_resort_candidate_for_target<'a>(
         &'a self,
         group: &'a honk_config::group::Group,
@@ -797,11 +1061,13 @@ impl super::GroupManager {
         if depth >= super::MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
-        let selected_member = match self.selector_member(group, context.network) {
-            None if group.policy == honk_config::group::GroupPolicy::Selector => return None,
-            selected_member => selected_member,
-        };
-        let node = self.last_resort_tcp_leaf(group, context.probe_domain, effects)?;
+        let selected_member =
+            match self.plan_selector_member(group, context.network, rules.selector) {
+                None if group.policy == honk_config::group::GroupPolicy::Selector => return None,
+                selected_member => selected_member,
+            };
+        let node =
+            self.last_resort_tcp_leaf(group, context.probe_domain, effects, rules.selector)?;
         if group.nodes.contains(&node.id)
             && selected_member.is_none_or(
                 |member| matches!(member, GroupMember::Node(selected) if selected.id == node.id),
@@ -827,12 +1093,22 @@ impl super::GroupManager {
                 return None;
             }
             let subgroup = &self.groups.get(tag)?.group;
-            self.pick_candidate_for_target(subgroup, context, visited, depth + 1, effects, rules)
-                .filter(|candidate| candidate.node.id == node.id)
-                .map(|mut candidate| {
-                    candidate.via = Some(subgroup);
-                    candidate
-                })
+            self.pick_candidate_for_target(
+                subgroup,
+                context,
+                visited,
+                depth + 1,
+                effects,
+                ScoreSelectionRules {
+                    sole_leaf: true,
+                    ..rules
+                },
+            )
+            .filter(|candidate| candidate.node.id == node.id)
+            .map(|mut candidate| {
+                candidate.via = Some(subgroup);
+                candidate
+            })
         });
         visited.pop();
         candidate
@@ -880,7 +1156,9 @@ impl super::GroupManager {
         // state.
         let sub_effects = if effects.applies()
             && (group.policy == honk_config::group::GroupPolicy::Selector
-                || self.selector_member(group, context.network).is_some())
+                || self
+                    .plan_selector_member(group, context.network, rules.selector)
+                    .is_some())
         {
             effects.peek()
         } else {
@@ -947,7 +1225,8 @@ impl super::GroupManager {
                     Some(false),
                     "empty_member",
                 );
-                if effects.prepares_score()
+                if !rules.node_targets_only
+                    && effects.prepares_score()
                     && group.policy == honk_config::group::GroupPolicy::Score
                     && rules.excluded.is_none()
                 {
@@ -987,9 +1266,12 @@ impl super::GroupManager {
             candidates,
             context.probe_domain,
             context.health_family,
-            &[],
             group,
-            entry.routes,
+            &[],
+            ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
         );
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in &candidates {

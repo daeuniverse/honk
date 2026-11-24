@@ -1,10 +1,20 @@
 use super::*;
+use honk_outbound::alive::{RouteHealthRevision, RouteHealthStamp};
 use honk_outbound::group::DialKey;
+
+#[derive(Clone, Copy)]
+pub(super) struct RouteTraffic {
+    pub(super) stamp: RouteHealthStamp,
+    pub(super) family: IpVersion,
+    pub(super) latency: Option<Duration>,
+    pub(super) confirmed: bool,
+}
 
 pub(super) struct TcpDialWinner {
     pub(super) stream: crate::proxy::ProxyStream,
     pub(super) target: OwnedTarget,
     pub(super) reporter: Option<crate::group::ScoreReporter>,
+    pub(super) route_traffic: Option<RouteTraffic>,
     #[cfg(feature = "native-api")]
     pub(super) attempt_id: Option<uuid::Uuid>,
     #[cfg(feature = "native-api")]
@@ -31,7 +41,9 @@ impl ControlPlaneHandle {
         connect_timeout: Duration,
         dial_deadline: tokio::time::Instant,
         runtime_generation: Arc<honk_outbound::runtime::OutboundRuntimeRegistry>,
+        group_manager: &honk_outbound::group::GroupManager,
         ipver: IpVersion,
+        route_revision: RouteHealthRevision,
         feedback: &HashMap<DialKey, crate::group::ScoreAttempt>,
         cold_urltest: bool,
         #[cfg(feature = "native-api")] selection_chains: &HashMap<DialKey, Vec<String>>,
@@ -97,18 +109,30 @@ impl ControlPlaneHandle {
                             let native = (None, None);
                             #[cfg(not(feature = "native-api"))]
                             let native = ();
-                            return (Err(error), idx, Duration::ZERO, candidate, None, native);
+                            return (
+                                Err(error),
+                                idx,
+                                Duration::ZERO,
+                                candidate,
+                                None,
+                                native,
+                                None,
+                            );
                         }
                     };
+                    let stamp = candidate
+                        .uses_route_evidence()
+                        .then(|| route_revision.admit());
                     let score = Arc::new(parking_lot::Mutex::new((business, None)));
                     let on_start = {
                         let score = Arc::clone(&score);
+                        let routed = candidate.uses_route_evidence();
                         move || {
                             let mut score = score.lock();
                             let started =
                                 score.0.take().map(crate::group::ScoreBusinessGuard::start);
                             if let Some(reporter) = &started {
-                                started_reporters.lock().push(reporter.clone());
+                                started_reporters.lock().push((reporter.clone(), routed));
                             }
                             score.1 = started;
                         }
@@ -159,11 +183,16 @@ impl ControlPlaneHandle {
                             }
                         }
                         Err(error) => {
+                            let outcome = || {
+                                candidate.score_failure(
+                                    score_runtime_outcome(&generation, error),
+                                    error.as_ref(),
+                                )
+                            };
                             if let Some(business) = score.0.take() {
-                                business.finish(score_runtime_outcome(&generation, error));
-                            }
-                            if let Some(reporter) = &reporter {
-                                reporter.setup_failed(score_runtime_outcome(&generation, error));
+                                business.finish(outcome());
+                            } else if let Some(reporter) = &reporter {
+                                reporter.setup_failed(outcome());
                             }
                         }
                     }
@@ -178,7 +207,7 @@ impl ControlPlaneHandle {
                     );
                     #[cfg(not(feature = "native-api"))]
                     let native = ();
-                    (result, idx, elapsed, candidate, reporter, native)
+                    (result, idx, elapsed, candidate, reporter, native, stamp)
                 })
                 .catch_unwind(),
             );
@@ -198,34 +227,34 @@ impl ControlPlaneHandle {
             remaining -= 1;
             match tokio::time::timeout_at(dial_deadline, set.next()).await {
                 Ok(Some(task_result)) => match task_result {
-                    Ok((Ok((stream, fresh)), idx, elapsed, target, reporter, native)) => {
-                        // A route's completed handshake proves its leaf and
-                        // inner exits; its latency belongs to the last exit.
-                        for proven in target.proven() {
+                    Ok((Ok((stream, fresh)), idx, elapsed, target, reporter, native, stamp)) => {
+                        if stamp.is_none() {
+                            let owner = target.node.id;
                             ctx.alive_set
-                                .report_available_traffic(proven, ProbeDomain::Tcp, ipver);
+                                .report_available_traffic(owner, ProbeDomain::Tcp, ipver);
+                            if fresh
+                                && ctx.alive_set.report_dial_latency(
+                                    owner,
+                                    ProbeDomain::Tcp,
+                                    ipver,
+                                    elapsed,
+                                )
+                            {
+                                ctx.alive_set.notify_check_tcp(owner);
+                            }
                         }
-                        let owner = target.success_owner();
-                        ctx.alive_set
-                            .report_available_traffic(owner, ProbeDomain::Tcp, ipver);
-                        // Real-traffic degradation fast path: a fresh
-                        // network dial far above the node's own EMA
-                        // counts toward strike demotion (3 in a row);
-                        // the emergency probe verifies the suspicion.
-                        if fresh
-                            && ctx.alive_set.report_dial_latency(
-                                owner,
-                                ProbeDomain::Tcp,
-                                ipver,
-                                elapsed,
-                            )
-                        {
-                            ctx.alive_set.notify_check_tcp(owner);
-                        }
-                        winner = Some((stream, idx, target, reporter, native));
+                        winner = Some((
+                            stream,
+                            idx,
+                            target,
+                            reporter,
+                            native,
+                            stamp,
+                            fresh.then_some(elapsed),
+                        ));
                         break;
                     }
-                    Ok((Err(e), _idx, _elapsed, target, _reporter, _native)) => {
+                    Ok((Err(e), _idx, _elapsed, target, _reporter, _native, stamp)) => {
                         let node = &target.node;
                         debug!("Parallel dial to {} failed: {}", node.name, e);
                         if node.protocol() != honk_config::types::NodeProtocol::Block {
@@ -237,9 +266,15 @@ impl ControlPlaneHandle {
                             rejection = Some(e);
                             break;
                         }
-                        // A route's failure counts against the hop that
-                        // failed; one no hop owns counts against nothing.
-                        if let Some(owner) = target.failure_owner(&e) {
+                        if let Some(stamp) = stamp {
+                            group_manager.report_route_failure(
+                                outbound_name,
+                                &target,
+                                ipver,
+                                stamp,
+                                e.as_ref(),
+                            );
+                        } else if let Some(owner) = target.failure_owner(&e) {
                             report_dial_failure_if_current(
                                 &runtime_generation,
                                 &ctx.alive_set,
@@ -266,7 +301,7 @@ impl ControlPlaneHandle {
                     #[cfg(feature = "native-api")]
                     native.tcp_deadline();
                     if runtime_generation.is_shutdown() {
-                        for reporter in started_reporters.lock().iter() {
+                        for (reporter, _) in started_reporters.lock().iter() {
                             reporter.finish(crate::group::ScoreOutcome::Shutdown);
                         }
                     } else {
@@ -445,15 +480,39 @@ impl ControlPlaneHandle {
         }
 
         Ok(match winner {
-            Some((stream, _, target, reporter, _native)) => Some(TcpDialWinner {
-                stream,
-                target,
-                reporter,
-                #[cfg(feature = "native-api")]
-                attempt_id: _native.0,
-                #[cfg(feature = "native-api")]
-                observer: _native.1,
-            }),
+            Some((stream, _, target, reporter, _native, stamp, latency)) => {
+                let route_traffic = stamp.map(|stamp| {
+                    let confirmed = latency.is_some()
+                        && ctx
+                            .proxy_registry
+                            .confirms_target_on_open(&runtime_generation, target.dial_ref());
+                    if confirmed && !runtime_generation.is_shutdown() {
+                        group_manager.report_route_response(
+                            outbound_name,
+                            target.key(),
+                            ipver,
+                            stamp,
+                            latency,
+                        );
+                    }
+                    RouteTraffic {
+                        stamp,
+                        family: ipver,
+                        latency,
+                        confirmed,
+                    }
+                });
+                Some(TcpDialWinner {
+                    stream,
+                    target,
+                    reporter,
+                    route_traffic,
+                    #[cfg(feature = "native-api")]
+                    attempt_id: _native.0,
+                    #[cfg(feature = "native-api")]
+                    observer: _native.1,
+                })
+            }
             None => {
                 if let Some((last_msg, last_name)) = last_err {
                     let (first_msg, first_name) =
@@ -721,7 +780,7 @@ impl ControlPlaneHandle {
         let protocol = node.protocol();
         let entry = registry
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(honk_outbound::proxy::MissingProtocolHandler(protocol))?;
 
         if !pool_disabled && (entry.descriptor.pool_ready_streams)(node) {
             let key =

@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
+use super::packet::send_with_admission_check;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
     ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
@@ -630,6 +631,25 @@ impl MultiTargetTransport for Socks5UdpTransport {
         self.send(target, domain, data, admitted).await
     }
 
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        let local_admitted = AtomicBool::new(false);
+        let admitted = admitted.unwrap_or(&local_admitted);
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        send_with_admission_check(
+            self.send(target, domain, data, Some(admitted)),
+            admitted,
+            current,
+        )
+        .await
+    }
+
     fn carrier_addr(&self) -> Option<SocketAddr> {
         self.socket.peer_addr().ok()
     }
@@ -637,6 +657,10 @@ impl MultiTargetTransport for Socks5UdpTransport {
 
 #[async_trait]
 impl TcpOutbound for Socks5Handler {
+    fn confirms_target_on_open(&self) -> bool {
+        true
+    }
+
     async fn dial(
         &self,
         node: &Node,
@@ -646,7 +670,7 @@ impl TcpOutbound for Socks5Handler {
     ) -> anyhow::Result<ProxyStream> {
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("SOCKS5: connecting to {} for target {}", addr, target);
-        let stream = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let stream = crate::util::connect_proxy(&addr, connect_timeout).await?;
         self.dial_with_tcp(node, target, target_domain, stream, connect_timeout)
             .await
     }

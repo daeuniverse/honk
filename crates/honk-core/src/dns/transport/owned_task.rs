@@ -26,6 +26,12 @@ impl OwnedTask {
         }
     }
 
+    pub(super) fn is_finished(&self) -> bool {
+        self.handle
+            .try_lock()
+            .is_ok_and(|slot| slot.as_ref().is_none_or(JoinHandle::is_finished))
+    }
+
     pub(crate) async fn shutdown(&self, timeout: Duration) {
         let mut slot = self.handle.lock().await;
         let Some(handle) = slot.as_mut() else {

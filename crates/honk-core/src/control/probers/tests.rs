@@ -5,6 +5,8 @@ use honk_outbound::alive::{HttpProbeResult, HttpProber, UdpProber};
 use honk_outbound::proxy::{ProtocolEntry, ProxyStream, TcpOutbound};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod route_recovery;
+
 struct LoopbackOutbound;
 
 #[async_trait::async_trait]
@@ -442,8 +444,9 @@ async fn c27_udp_rejects_invalid_nodes_without_data_path() {
                 honk_outbound::alive::ProbeCancellation::default(),
             )
             .await;
-        assert!(matches!(result.dns, Some(Err(_))));
+        assert!(result.dns.is_none());
         assert!(result.data_path.is_none());
+        assert!(result.observations.iter().all(Option::is_none));
         assert!(
             captured.lock().unwrap().is_none(),
             "invalid node reached UDP dial"
@@ -523,8 +526,7 @@ async fn udp_capability_and_policy_gates_skip_target_resolution_and_health_feedb
     }
 }
 
-/// A chain's UDP follows its exit, which only the generation resolves,
-/// so the probe asks the generation rather than the chain's protocol.
+/// The configured chain must have an eligible framing exit before local resolution.
 #[tokio::test]
 async fn a_chain_whose_exit_cannot_carry_udp_is_not_probed_for_udp() {
     let front = udp_test_node();
@@ -536,27 +538,12 @@ async fn a_chain_whose_exit_cannot_carry_udp_is_not_probed_for_udp() {
         ..Default::default()
     });
     exit.id = exit.derive_id();
-    let mut chain = Node {
-        name: "via".into(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: vec![front.name.clone(), exit.name.clone()],
-        },
-        ..Default::default()
-    };
-    chain.id = chain.derive_id();
+    let chain = Node::chain_from_nodes("via", &[&front, &exit]).unwrap();
     let nodes = [chain.clone(), front, exit];
     let generation = Arc::new(parking_lot::RwLock::new(Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(&nodes).unwrap(),
     )));
-    let captured = Arc::new(std::sync::Mutex::new(None));
-    let handler = Arc::new(UdpTestHandler {
-        mode: UdpTestMode::UdpCaptureTarget(captured.clone()),
-    });
-    let mut registry = ProxyRegistry::new();
-    registry.register(
-        honk_outbound::proxy::ProtocolEntry::new(chain.protocol(), handler.clone())
-            .with_packet(handler),
-    );
+    let registry = ProxyRegistry::default_resolver().unwrap();
     let config = Config {
         nodes: nodes.to_vec(),
         ..Config::default()
@@ -592,7 +579,43 @@ async fn a_chain_whose_exit_cannot_carry_udp_is_not_probed_for_udp() {
 
     assert!(outcome.dns.is_none());
     assert!(outcome.data_path.is_none());
-    assert!(captured.lock().unwrap().is_none());
+    assert!(outcome.observations.iter().all(Option::is_none));
+}
+
+#[tokio::test]
+async fn missing_udp_probe_handler_skips_resolution_and_health_samples() {
+    let node = udp_test_node();
+    let mut registry = ProxyRegistry::new();
+    registry.register(ProtocolEntry::new(
+        node.protocol(),
+        Arc::new(LoopbackOutbound),
+    ));
+    let generation =
+        honk_outbound::runtime::OutboundRuntimeRegistry::build(std::slice::from_ref(&node))
+            .unwrap()
+            .into_shared();
+    let config = Config {
+        nodes: vec![node.clone()],
+        ..Default::default()
+    };
+    let resolver: crate::outbound::ResolveHook = Arc::new(|_, _| {
+        panic!("a missing packet handler must refuse before target resolution");
+    });
+    let prober = ProxyUdpProber::new(
+        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(registry),
+        generation,
+        Arc::new(StatsManager::new()),
+        UdpDnsProbeTarget::new(vec!["probe.example:53".into()], Some(resolver)),
+        None,
+        GroupManager::new(&[], std::slice::from_ref(&node)).into_shared(),
+    );
+    let outcome = prober
+        .probe_udp(node.id, Duration::from_secs(1), Default::default())
+        .await;
+    assert!(outcome.dns.is_none());
+    assert!(outcome.data_path.is_none());
+    assert!(outcome.observations.iter().all(Option::is_none));
 }
 
 #[tokio::test]
@@ -764,7 +787,7 @@ async fn native_health_distinguishes_connect_and_http_for_duplicate_names() {
     prober.proxy_registry = Arc::new(registry);
     let alive = AliveDialerSet::new();
     alive.enable_health_history();
-    alive.register_node(node.id, node.name.clone(), node.address.clone());
+    alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     let before = std::time::SystemTime::now();
     assert!(alive.probe_node(node.id, Duration::from_secs(1)).await);
     drop(listener.accept().await.unwrap());
@@ -870,7 +893,7 @@ async fn health_shutdown_closes_real_http_probe_without_failure_evidence() {
         let (prober, node) = test_prober("HEAD");
         let alive = Arc::new(AliveDialerSet::new());
         alive.enable_health_history();
-        alive.register_node(node, "probe".into(), addr.to_string());
+        alive.register_node(node, "probe".into(), Some(addr.to_string()));
         alive
             .set_http_probe(Arc::new(prober), format!("http://{addr}/"), "HEAD".into())
             .await;

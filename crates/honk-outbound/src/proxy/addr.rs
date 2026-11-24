@@ -253,6 +253,10 @@ pub(crate) fn dialed_domain_peer(
         .then_some(target)
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("unknown address type {0:#x}")]
+pub(super) struct UnknownReplyAddressType(u8);
+
 /// Read a SOCKS5 reply address without validating a domain before its frame
 /// can be drained. Only the captured domain/port projects to `target`; an
 /// unknown ATYP stays terminal.
@@ -286,7 +290,7 @@ pub(crate) async fn read_reply_source<R: AsyncReadExt + Unpin>(
         }
         atyp => Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("unknown address type {atyp:#x}"),
+            UnknownReplyAddressType(atyp),
         )),
     }
 }

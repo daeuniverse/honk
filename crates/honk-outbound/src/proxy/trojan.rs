@@ -158,7 +158,8 @@ impl TrojanHandler {
             );
         }
         let (control, preparation) = Self::prepare_transport(node, runtime, None, timeout).await?;
-        let transport = Self::finish_udp_stream(node, target, domain, control).await?;
+        let tls_handoff = super::chain::native_udp_writer_handoff(node);
+        let transport = Self::finish_udp_stream(node, target, domain, control, tls_handoff).await?;
         Ok((transport, preparation))
     }
 
@@ -174,7 +175,7 @@ impl TrojanHandler {
             return Err(super::TunnelUnsupported("trojan udp").into());
         }
         let control = super::transport::wrap_tunnel(node, carrier, options).await?;
-        Self::finish_udp_stream(node, target, domain, control).await
+        Self::finish_udp_stream(node, target, domain, control, None).await
     }
 
     fn commit_udp_stream<T: ?Sized + Send + Sync + 'static>(
@@ -192,6 +193,7 @@ impl TrojanHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         mut control: Box<dyn AsyncReadWrite>,
+        native_tls_handoff: Option<bool>,
     ) -> anyhow::Result<Arc<TrojanUdpTransport>> {
         let password = node.trojan().unwrap().password.as_deref().unwrap_or("");
         let addr_header = addr::encode_address(target, target_domain)?;
@@ -204,6 +206,7 @@ impl TrojanHandler {
         super::transport::write_request(&mut control, &header).await?;
 
         let (rd, wr) = tokio::io::split(control);
+        let exit = super::chain::UDP_EXIT_HOP.try_with(|exit| *exit).ok();
         Ok(Arc::new(TrojanUdpTransport {
             writer: tokio::sync::Mutex::new(wr),
             poison: super::FramePoison::default(),
@@ -211,6 +214,8 @@ impl TrojanHandler {
             addr_header,
             domain: target_domain.map(Box::from),
             relay_addr: target,
+            tls_handoff: exit.map(|exit| exit.tls_handoff).or(native_tls_handoff),
+            exit,
         }))
     }
 }
@@ -611,6 +616,8 @@ struct TrojanUdpTransport {
     addr_header: Vec<u8>,
     domain: Option<Box<str>>,
     relay_addr: SocketAddr,
+    exit: Option<super::chain::UdpExit>,
+    tls_handoff: Option<bool>,
 }
 
 impl std::fmt::Debug for TrojanUdpTransport {
@@ -628,6 +635,7 @@ impl TrojanUdpTransport {
         domain: Option<&str>,
         data: &[u8],
         admitted: Option<&std::sync::atomic::AtomicBool>,
+        current: Option<&(dyn Fn() -> bool + Send + Sync)>,
     ) -> std::io::Result<()> {
         if data.len() > u16::MAX as usize {
             return Err(std::io::Error::new(
@@ -655,6 +663,13 @@ impl TrojanUdpTransport {
         frame.extend_from_slice(&(data.len() as u16).to_be_bytes());
         frame.extend_from_slice(CRLF);
         frame.extend_from_slice(data);
+        if let Some(current) = current {
+            let tls_handoff = self.tls_handoff.ok_or(super::PacketRejection::Policy)?;
+            return self
+                .poison
+                .write_checked(&mut *writer, &frame, admitted, tls_handoff, current)
+                .await;
+        }
         let write = self.poison.begin(admitted)?;
         writer.write_all(&frame).await?;
         writer.flush().await?;
@@ -674,19 +689,57 @@ impl PacketTransport for TrojanUdpTransport {
     }
 
     async fn send_packet(&self, data: &[u8]) -> std::io::Result<()> {
-        self.send_frame(self.relay_addr, self.domain.as_deref(), data, None)
+        self.send_frame(self.relay_addr, self.domain.as_deref(), data, None, None)
             .await
+    }
+
+    async fn send_packet_checked(
+        &self,
+        data: &[u8],
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        self.send_frame(
+            self.relay_addr,
+            self.domain.as_deref(),
+            data,
+            None,
+            Some(current),
+        )
+        .await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let mut rd = self.reader.lock().await;
+        let framing_error = |error: std::io::Error| match self.exit {
+            Some(exit) => {
+                let error = std::io::Error::new(error.kind(), super::NodeFailure(error.into()));
+                super::error::HopIoFailure::io(exit.index, error, false)
+            }
+            None => error,
+        };
         loop {
             // Only the dialed name projects back and no other is resolved; an
             // unknown ATYP has no derivable length, so it stays terminal.
-            let peer =
-                addr::read_reply_source(&mut *rd, self.domain.as_deref(), self.relay_addr).await?;
+            let peer = addr::read_reply_source(&mut *rd, self.domain.as_deref(), self.relay_addr)
+                .await
+                .map_err(|error| {
+                    if error
+                        .get_ref()
+                        .is_some_and(|cause| cause.is::<addr::UnknownReplyAddressType>())
+                    {
+                        framing_error(error)
+                    } else {
+                        error
+                    }
+                })?;
             let mut head = [0u8; 4];
             rd.read_exact(&mut head).await?;
+            if &head[2..] != CRLF {
+                return Err(framing_error(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid trojan udp frame delimiter",
+                )));
+            }
             let len = u16::from_be_bytes([head[0], head[1]]) as usize;
             if let Some(peer) = peer {
                 if len > buf.len() {
@@ -721,7 +774,20 @@ impl MultiTargetTransport for TrojanUdpTransport {
         admitted: Option<&std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
         let domain = addr::dialed_name(self.domain.as_deref(), domain);
-        self.send_frame(target, domain, data, admitted).await
+        self.send_frame(target, domain, data, admitted, None).await
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.domain.as_deref(), domain);
+        self.send_frame(target, domain, data, admitted, Some(current))
+            .await
     }
 
     fn frame_stream_torn(&self) -> bool {

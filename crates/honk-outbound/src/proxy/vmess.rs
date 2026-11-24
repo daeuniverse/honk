@@ -8,9 +8,11 @@ use md5::{Digest, Md5};
 use rand::Rng;
 use rand::RngExt;
 use sha2::Sha256;
+use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -144,6 +146,10 @@ fn fnv1a32(data: &[u8]) -> u32 {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct VmessHandler;
 
+tokio::task_local! {
+    pub(super) static ROUTED_CARRIER: ();
+}
+
 /// Per-connection session material (`encoding.NewClientSession`).
 struct Session {
     req_key: [u8; 16],
@@ -151,10 +157,11 @@ struct Session {
     resp_key: [u8; 16],
     resp_iv: [u8; 16],
     resp_header: u8,
+    ambiguous_header_io: bool,
 }
 
 impl Session {
-    fn new() -> Self {
+    fn new(ambiguous_header_io: bool) -> Self {
         let mut rng = rand::rng();
         let mut req_key = [0u8; 16];
         let mut req_iv = [0u8; 16];
@@ -174,21 +181,54 @@ impl Session {
             resp_key,
             resp_iv,
             resp_header: rng.random(),
+            ambiguous_header_io,
         }
     }
 }
 
-/// How the relay task ended, when it failed: a rejected response header or
-/// an invalid chunk reads as that error, not as EOF.
+/// The terminal relay failure, surfaced after any buffered application data.
 type RelayFailure = std::sync::Arc<std::sync::OnceLock<(std::io::ErrorKind, crate::SharedError)>>;
 
 struct VmessStream {
+    _relay: super::transport::RelayTask,
     inner: tokio::io::DuplexStream,
-    relay: tokio::task::AbortHandle,
     failure: RelayFailure,
+    pipe: super::transport::relay_upload::Writer,
+    upload_done: super::transport::UploadEnd,
 }
 
 impl VmessStream {
+    fn start(
+        stream: Box<dyn AsyncReadWrite>,
+        header_wire: Vec<u8>,
+        session: Session,
+    ) -> anyhow::Result<Self> {
+        let (inner, server) = tokio::io::duplex(65536);
+        let failure = RelayFailure::default();
+        let (pipe, reader) = super::transport::relay_upload::pipe();
+        let (uploaded, upload_done) = super::transport::UploadEnd::channel();
+        let relay = vmess_relay_recorded(
+            stream,
+            server,
+            header_wire,
+            session,
+            failure.clone(),
+            reader,
+            uploaded,
+        );
+        let relay = crate::runtime::flow_observation::scope(
+            crate::runtime::flow_observation::current(),
+            relay,
+        );
+        Ok(Self {
+            _relay: super::transport::RelayTask::spawn(relay)?,
+            inner,
+            failure,
+            pipe,
+            upload_done,
+        })
+    }
+
     fn relay_error(&self) -> Option<std::io::Error> {
         self.failure
             .get()
@@ -204,8 +244,22 @@ async fn vmess_relay_recorded(
     header_wire: Vec<u8>,
     session: Session,
     failure: RelayFailure,
+    pipe: super::transport::relay_upload::Reader,
+    uploaded: tokio::sync::oneshot::Sender<std::io::Result<()>>,
 ) {
-    if let Err(error) = vmess_relay(server, &mut client, header_wire, session).await {
+    let mut uploaded = Some(uploaded);
+    let mut tail = Vec::new();
+    if let Err(error) = vmess_relay(
+        server,
+        &mut client,
+        header_wire,
+        session,
+        &pipe,
+        &mut uploaded,
+        &mut tail,
+    )
+    .await
+    {
         let kind = error
             .chain()
             .find_map(|cause| cause.downcast_ref::<std::io::Error>())
@@ -216,7 +270,18 @@ async fn vmess_relay_recorded(
             crate::SharedError::new(error.context("VMess relay failed")),
         ));
     }
-    drop(client);
+    if let Some(uploaded) = uploaded {
+        let result = match failure.get() {
+            Some((kind, cause)) => Err(std::io::Error::new(*kind, cause.clone())),
+            None => Ok(()),
+        };
+        let _ = uploaded.send(result);
+    }
+    drop(pipe);
+    if !tail.is_empty() {
+        // Shutdown can now return even if the application has yet to read.
+        let _ = client.write_all(&tail).await;
+    }
 }
 
 impl std::fmt::Debug for VmessStream {
@@ -245,17 +310,27 @@ impl AsyncRead for VmessStream {
 
 impl AsyncWrite for VmessStream {
     fn poll_write(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        match Pin::new(&mut self.inner).poll_write(cx, buf) {
-            Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
+        let this = self.get_mut();
+        let inner = &mut this.inner;
+        match this
+            .pipe
+            .poll_write(cx, |cx| Pin::new(inner).poll_write(cx, buf))
+        {
+            Poll::Ready(Err(error)) => Poll::Ready(Err(this.relay_error().unwrap_or(error))),
             other => other,
         }
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if std::task::ready!(self.pipe.poll_flush(cx)).is_err() {
+            std::task::ready!(self.upload_done.poll(cx))
+                .map_err(|error| self.relay_error().unwrap_or(error))?;
+            return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+        }
         match Pin::new(&mut self.inner).poll_flush(cx) {
             Poll::Ready(Err(error)) => Poll::Ready(Err(self.relay_error().unwrap_or(error))),
             other => other,
@@ -263,13 +338,10 @@ impl AsyncWrite for VmessStream {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
-    }
-}
-
-impl Drop for VmessStream {
-    fn drop(&mut self) {
-        self.relay.abort();
+        std::task::ready!(Pin::new(&mut self.inner).poll_shutdown(cx))?;
+        self.upload_done
+            .poll(cx)
+            .map_err(|error| self.relay_error().unwrap_or(error))
     }
 }
 
@@ -422,9 +494,10 @@ impl VmessHandler {
         stream: Box<dyn AsyncReadWrite>,
         target: SocketAddr,
         target_domain: Option<&str>,
+        ambiguous_header_io: bool,
     ) -> anyhow::Result<ProxyStream> {
         let cmd_key = Self::derive_cmd_key(uuid_bytes);
-        let session = Session::new();
+        let session = Session::new(ambiguous_header_io);
 
         let mut rng = rand::rng();
         let ts = SystemTime::now()
@@ -442,23 +515,8 @@ impl VmessHandler {
             Self::build_header_plain(&session, padding_len, &padding, target, target_domain)?;
         let header_wire = Self::seal_request_header(&cmd_key, &auth_id, &conn_nonce, &plain);
 
-        let (client_half, server_half) = tokio::io::duplex(65536);
-        let failure = RelayFailure::default();
-        let relay_future =
-            vmess_relay_recorded(stream, server_half, header_wire, session, failure.clone());
-        let relay_future = crate::runtime::flow_observation::scope(
-            crate::runtime::flow_observation::current(),
-            relay_future,
-        );
-        let relay = crate::runtime::spawn_owned(relay_future)
-            .ok_or(crate::proxy::PacketRejection::Cancelled)?;
-
         Ok(ProxyStream {
-            stream: Box::new(VmessStream {
-                inner: client_half,
-                relay,
-                failure,
-            }),
+            stream: Box::new(VmessStream::start(stream, header_wire, session)?),
             target_addr: target,
             target_domain: target_domain.map(|s| s.to_string()),
         })
@@ -482,7 +540,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, None, connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_with_tcp(
@@ -496,7 +554,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(node)?;
 
         let stream = super::transport::wrap_transport(node, Some(tcp), connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_runtime(
@@ -509,7 +567,7 @@ impl TcpOutbound for VmessHandler {
         let uuid = uuid(&runtime.node)?;
         let stream =
             super::transport::wrap_transport_runtime(&runtime, None, connect_timeout).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain, false)
     }
 
     async fn dial_over(
@@ -522,7 +580,15 @@ impl TcpOutbound for VmessHandler {
     ) -> anyhow::Result<ProxyStream> {
         let uuid = uuid(&runtime.node)?;
         let stream = super::transport::wrap_tunnel(&runtime.node, carrier, options).await?;
-        Self::perform_handshake(uuid.as_bytes(), stream, target, target_domain)
+        // Capture the route context before spawning the relay that reads the header.
+        let ambiguous_header_io = ROUTED_CARRIER.try_with(|_| ()).is_ok();
+        Self::perform_handshake(
+            uuid.as_bytes(),
+            stream,
+            target,
+            target_domain,
+            ambiguous_header_io,
+        )
     }
 }
 
@@ -650,7 +716,12 @@ async fn vmess_relay(
     client: &mut tokio::io::DuplexStream,
     header_wire: Vec<u8>,
     session: Session,
+    pipe: &super::transport::relay_upload::Reader,
+    uploaded: &mut Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    tail: &mut Vec<u8>,
 ) -> anyhow::Result<()> {
+    let peer_end = super::transport::WsPeerEnd::for_stream(server.as_ref());
+    let omitted = AtomicBool::new(false);
     let (mut server_read, mut server_write) = tokio::io::split(server);
     let (mut client_read, mut client_write) = tokio::io::split(client);
 
@@ -659,6 +730,7 @@ async fn vmess_relay(
 
         let mut body = BodyChunks::new(&session.req_key, &session.req_iv)?;
         let mut buf = vec![0u8; CHUNK_MAX_LEN];
+        let mut relayed = 0u64;
         loop {
             let n = match client_read.read(&mut buf).now_or_never() {
                 Some(read) => read?,
@@ -670,29 +742,61 @@ async fn vmess_relay(
             if n == 0 {
                 break;
             }
+            relayed += n as u64;
             let chunk = body.seal_chunk(&buf[..n]);
-            server_write.write_all(&chunk).await?;
+            let writer = &mut server_write;
+            let bytes = &chunk;
+            pipe.forward(relayed, |flush| async move {
+                writer.write_all(bytes).await?;
+                if flush {
+                    writer.flush().await?;
+                }
+                Ok::<_, std::io::Error>(())
+            })
+            .await?;
         }
         let term = body.seal_chunk(&[]);
-        server_write.write_all(&term).await?;
-        server_write.flush().await?;
-        Ok::<(), anyhow::Error>(())
+        let mut remaining = term.as_slice();
+        let result = super::transport::relay_upload::scope(async {
+            server_write.write_all_buf(&mut remaining).await?;
+            server_write.flush().await
+        })
+        .await;
+        if let Err(error) = result {
+            if peer_end
+                .as_ref()
+                .is_some_and(|proof| proof.omitted(&error, term.len() - remaining.len()))
+            {
+                return Ok(true);
+            }
+            return Err(error.into());
+        }
+        if let Some(uploaded) = uploaded.take() {
+            let _ = uploaded.send(Ok(()));
+        }
+        Ok::<bool, anyhow::Error>(false)
     };
 
     let download = async {
-        read_response_header(&mut server_read, &session).await?;
+        let complete_header = read_response_header(&mut server_read, &session).await?;
 
         let mut body = BodyChunks::new(&session.resp_key, &session.resp_iv)?;
-        loop {
+        let marker = loop {
             let mut len_buf = [0u8; 2];
-            if server_read.read_exact(&mut len_buf).await.is_err() {
-                break;
+            match server_read.read(&mut len_buf).await? {
+                0 => break None,
+                1 => {
+                    server_read.read_exact(&mut len_buf[1..]).await?;
+                }
+                _ => {}
             }
             let chunk_len = body.decode_len(len_buf) as usize;
             // size == AEAD overhead is the server's termination chunk
             // (AuthenticationReader.readInternal).
             if chunk_len == GCM_TAG_LEN {
-                break;
+                break peer_end
+                    .as_ref()
+                    .map(|_| (chunk_nonce(&body.iv, body.count), body.ctx));
             }
             if !(chunk_len > GCM_TAG_LEN && chunk_len <= CHUNK_MAX_LEN + GCM_TAG_LEN) {
                 return Err(crate::proxy::NodeFailure(
@@ -706,22 +810,109 @@ async fn vmess_relay(
             let n = body
                 .open_chunk(&mut ct)
                 .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response body")))?;
-            client_write.write_all(&ct[..n]).await?;
+            let mut remaining = &ct[..n];
+            while tail.is_empty() && !remaining.is_empty() {
+                let write = std::future::poll_fn(|cx| {
+                    match Pin::new(&mut client_write).poll_write(cx, remaining) {
+                        Poll::Pending if omitted.load(Ordering::Relaxed) => Poll::Ready(None),
+                        result => result.map(Some),
+                    }
+                })
+                .await;
+                let Some(write) = write else {
+                    // Only the current record and the closed WS duplex can remain.
+                    tail.reserve_exact(remaining.len() + 65536);
+                    break;
+                };
+                let written = write?;
+                if written == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero).into());
+                }
+                remaining = &remaining[written..];
+            }
+            tail.extend_from_slice(remaining);
+        };
+        if !omitted.load(Ordering::Relaxed) {
+            client_write.shutdown().await?;
         }
-        Ok::<(), anyhow::Error>(())
+        Ok::<_, anyhow::Error>((complete_header, marker))
     };
 
-    // Upload EOF only half-closes the request body — the response must
-    // still be drained (HTTP: the reply arrives after the request ends).
-    tokio::pin!(upload);
-    tokio::pin!(download);
-    tokio::select! {
-        r = &mut download => r,
-        r = &mut upload => {
-            r?;
-            download.await
+    let (peer_ended, (complete_header, marker)) = {
+        let mut upload = std::pin::pin!(upload);
+        let mut download = std::pin::pin!(download);
+        tokio::select! {
+            result = &mut upload => {
+                let peer_ended = result?;
+                if peer_ended {
+                    omitted.store(true, Ordering::Relaxed);
+                }
+                // Repoll even if download last waited for space in the application duplex.
+                (peer_ended, download.await?)
+            }
+            result = &mut download => {
+                let response = result?;
+                (upload.await?, response)
+            }
+        }
+    };
+    if peer_ended {
+        if !complete_header {
+            return Err(crate::proxy::NodeFailure(anyhow::anyhow!(
+                "invalid VMess response header command length"
+            ))
+            .into());
+        }
+        if let Some((nonce, cipher)) = marker {
+            // Ordinary VMess readers accept the length alone as EOF. Only the
+            // peer-close exception needs proof of the entire empty record.
+            let mut tag = [0u8; GCM_TAG_LEN];
+            server_read.read_exact(&mut tag).await?;
+            cipher
+                .open_in_place(&nonce, &mut [], &tag, b"")
+                .map_err(|error| {
+                    crate::proxy::NodeFailure(anyhow::anyhow!(
+                        "VMess response terminator decrypt failed: {error}"
+                    ))
+                })?;
         }
     }
+    Ok(())
+}
+
+fn response_header_fault(error: anyhow::Error) -> anyhow::Error {
+    crate::proxy::NodeFailure(error.context("VMess response header")).into()
+}
+
+fn header_read_error(error: io::Error, ambiguous_header_io: bool) -> anyhow::Error {
+    if ambiguous_header_io {
+        // A raw carrier error can come from any preceding hop.
+        error.into()
+    } else {
+        response_header_fault(error.into())
+    }
+}
+
+async fn read_response_header_tail(
+    reader: &mut (impl AsyncRead + Unpin),
+    mut tail: &mut [u8],
+    ambiguous_header_io: bool,
+) -> anyhow::Result<()> {
+    while !tail.is_empty() {
+        let n = reader
+            .read(tail)
+            .await
+            .map_err(|error| header_read_error(error, ambiguous_header_io))?;
+        if n == 0 {
+            let error = io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated VMess response header",
+            );
+            return Err(header_read_error(error, ambiguous_header_io));
+        }
+        tail = &mut tail[n..];
+    }
+    Ok(())
 }
 
 /// `DecodeResponseHeader`: AEAD-sealed length then AEAD-sealed payload,
@@ -729,53 +920,62 @@ async fn vmess_relay(
 async fn read_response_header<R: AsyncReadExt + Unpin>(
     reader: &mut R,
     session: &Session,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let mut len_ct = [0u8; 2 + GCM_TAG_LEN];
-    let received = reader.read(&mut len_ct).await.map_err(|error| {
-        crate::proxy::NodeFailure(anyhow::Error::new(error).context("VMess response header"))
-    })?;
+    let received = reader
+        .read(&mut len_ct)
+        .await
+        .map_err(|error| header_read_error(error, session.ambiguous_header_io))?;
     // sing-vmess writes its response header lazily with the first target data;
     // no response bytes cannot distinguish target closure from a carrier fault.
     if received == 0 {
         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
     }
-    async {
-        reader.read_exact(&mut len_ct[received..]).await?;
-        let len_plain = VmessHandler::open(
-            &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
-            &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
-            &len_ct,
-        )
-        .map_err(|e| anyhow::anyhow!("VMess response header length decrypt failed: {:?}", e))?;
-        let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
-        anyhow::ensure!(
-            (4..=256).contains(&hdr_len),
+    read_response_header_tail(reader, &mut len_ct[received..], session.ambiguous_header_io).await?;
+    let len_plain = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_LEN_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_LEN_IV, &[]),
+        &len_ct,
+    )
+    .map_err(|e| {
+        response_header_fault(anyhow::anyhow!(
+            "VMess response header length decrypt failed: {e:?}"
+        ))
+    })?;
+    let hdr_len = u16::from_be_bytes([len_plain[0], len_plain[1]]) as usize;
+    if !(4..=256).contains(&hdr_len) {
+        return Err(response_header_fault(anyhow::anyhow!(
             "invalid VMess response header length {hdr_len}"
-        );
+        )));
+    }
 
-        let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
-        reader.read_exact(&mut hdr_ct).await?;
-        let hdr = VmessHandler::open(
-            &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
-            &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
-            &hdr_ct,
-        )
-        .map_err(|e| anyhow::anyhow!("VMess response header decrypt failed: {:?}", e))?;
-
-        anyhow::ensure!(
-            hdr[0] == session.resp_header,
+    let mut hdr_ct = vec![0u8; hdr_len + GCM_TAG_LEN];
+    read_response_header_tail(reader, &mut hdr_ct, session.ambiguous_header_io).await?;
+    let hdr = VmessHandler::open(
+        &kdf16(&session.resp_key, KDF_SALT_RESP_KEY, &[]),
+        &kdf12(&session.resp_iv, KDF_SALT_RESP_IV, &[]),
+        &hdr_ct,
+    )
+    .map_err(|e| {
+        response_header_fault(anyhow::anyhow!(
+            "VMess response header decrypt failed: {e:?}"
+        ))
+    })?;
+    if hdr[0] != session.resp_header {
+        return Err(response_header_fault(anyhow::anyhow!(
             "unexpected VMess response header byte {:#x}, expected {:#x}",
             hdr[0],
             session.resp_header
-        );
-        // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
-        // command data rides inside the same header block and carries nothing
-        // a plain TCP outbound needs.
-        Ok::<(), anyhow::Error>(())
+        )));
     }
-    .await
-    .map_err(|error| crate::proxy::NodeFailure(error.context("VMess response header")).into())
+    // hdr[1] option, hdr[2] command id, hdr[3] command data length; the
+    // command data rides inside the same header block and carries nothing
+    // a plain TCP outbound needs.
+    Ok(hdr[2] == 0 || hdr.len() >= 4 + usize::from(hdr[3]))
 }
+
+#[cfg(test)]
+pub(super) mod test_support;
 
 #[cfg(test)]
 mod tests;

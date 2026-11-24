@@ -348,9 +348,9 @@ pub(super) async fn run(
     } else {
         (&mut c2p, &progress.upload)
     };
-    match super::drain_wait(survivor, survivor_cnt).await {
-        Ok(_) => {}
-        Err(e) => return Err(SpliceError::Io(e)),
+    tokio::select! {
+        result = survivor => { result.map_err(SpliceError::Io)?; }
+        _ = super::drain_idle(0, || survivor_cnt.load(Ordering::Relaxed)) => {}
     }
     Ok((
         progress.upload.load(Ordering::Relaxed) - baseline.0,

@@ -59,6 +59,22 @@ pub(crate) fn restart_required_fields(
     log_files: &LogFiles,
     downgrades: &StartupDowngrades,
 ) -> Vec<RestartField> {
+    restart_required_fields_with_udp_dns(
+        current,
+        candidate,
+        log_files,
+        downgrades,
+        current.global.effective_udp_check_dns(),
+    )
+}
+
+pub(super) fn restart_required_fields_with_udp_dns(
+    current: &Config,
+    candidate: &Config,
+    log_files: &LogFiles,
+    downgrades: &StartupDowngrades,
+    current_udp_check_dns: &[String],
+) -> Vec<RestartField> {
     let candidate_log_file =
         crate::resolved_log_file_path(candidate, log_files.cli_override.as_deref());
     let mut changed = restart_required_changes(
@@ -66,6 +82,7 @@ pub(crate) fn restart_required_fields(
         candidate,
         log_files.effective.as_deref(),
         candidate_log_file.as_deref(),
+        current_udp_check_dns,
     );
     if downgrades.nfqueue_unavailable() {
         changed.retain(|field| *field != field!("global.nfqueue_enable"));
@@ -80,6 +97,7 @@ pub(crate) fn restart_required_changes(
     candidate: &Config,
     current_log_file: Option<&Path>,
     candidate_log_file: Option<&Path>,
+    current_udp_check_dns: &[String],
 ) -> Vec<RestartField> {
     let mut changed = Vec::new();
     let dns_bind_changed = match (current.dns.bind_endpoint(), candidate.dns.bind_endpoint()) {
@@ -102,7 +120,7 @@ pub(crate) fn restart_required_changes(
     if old_http.map(|input| input.1) != new_http.map(|input| input.1) {
         changed.push(field!("global.tcp_check_http_method"));
     }
-    if udp_probe_input_changed(&old_global.udp_check_dns, &new_global.udp_check_dns) {
+    if udp_probe_input_changed(current_udp_check_dns, new_global.effective_udp_check_dns()) {
         changed.push(field!("global.udp_check_dns"));
     }
     if old_global.tls_implementation.eq_ignore_ascii_case("utls")
@@ -246,7 +264,13 @@ mod syslog_tests {
         candidate.global.syslog_cee_enabled = true;
         candidate.global.syslog_hostname = "router01".into();
         candidate.global.syslog_app_name = "dns-audit".into();
-        let changed = restart_required_changes(&current, &candidate, None, None);
+        let changed = restart_required_changes(
+            &current,
+            &candidate,
+            None,
+            None,
+            current.global.effective_udp_check_dns(),
+        );
         let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
         assert_eq!(
             paths,
@@ -265,7 +289,13 @@ mod syslog_tests {
         let current = Config::default();
         let mut candidate = current.clone();
         candidate.global.syslog_cee_enabled = true;
-        let changed = restart_required_changes(&current, &candidate, None, None);
+        let changed = restart_required_changes(
+            &current,
+            &candidate,
+            None,
+            None,
+            current.global.effective_udp_check_dns(),
+        );
         let paths: Vec<_> = changed.iter().map(|field| field.path).collect();
         assert_eq!(paths, ["global.syslog_cee_enabled"]);
     }

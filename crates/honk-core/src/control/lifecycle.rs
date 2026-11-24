@@ -41,7 +41,7 @@ pub(super) struct RuntimeEpoch {
     queue: Option<NfqueueRuntime>,
 }
 
-type HealthUpdateKey = (uuid::Uuid, u32, u32);
+type HealthUpdateKey = (Option<uuid::Uuid>, Option<(u32, u32)>);
 
 struct HealthUpdates {
     pending: Arc<parking_lot::Mutex<Option<HashSet<HealthUpdateKey>>>>,
@@ -55,18 +55,34 @@ impl HealthUpdates {
         let wake = Arc::new(tokio::sync::Notify::new());
         let callback_pending = Arc::clone(&pending);
         let callback_wake = Arc::clone(&wake);
+        let enqueue = move |key| {
+            let mut pending = callback_pending.lock();
+            if let Some(pending) = pending.as_mut() {
+                pending.insert(key);
+                callback_wake.notify_one();
+            }
+        };
+        plane.alive_set.set_connectivity_callback({
+            let enqueue = enqueue.clone();
+            // The current manager resolves dependencies at delivery. A manager-only
+            // rebuild can change them without updating the committed slot index.
+            move |node| enqueue((node, None))
+        });
+        plane.alive_set.set_routed_udp_connectivity_callback({
+            let enqueue = enqueue.clone();
+            // Routed evidence has no numeric slot hint. Share the raw event key so
+            // a concurrent update of the same node and slot can coalesce.
+            move |node, domain, family| enqueue((Some(node), Some((domain as u32, family as u32))))
+        });
         plane
             .alive_set
             .set_ebpf_callback(Box::new(move |node, _, domain, family, _| {
-                let mut pending = callback_pending.lock();
-                if let Some(pending) = pending.as_mut() {
-                    pending.insert((node, domain, family));
-                    callback_wake.notify_one();
-                }
+                enqueue((Some(node), Some((domain, family))));
             }));
         let publisher = Arc::new(OutboundHealthPublisher::new(
             plane.ebpf.clone(),
             plane.config.clone(),
+            plane.active_routing_plan.clone(),
             plane.group_manager.clone(),
             plane.alive_set.clone(),
         ));
@@ -82,11 +98,11 @@ impl HealthUpdates {
                     };
                     std::mem::take(pending)
                 };
-                for (node, domain, family) in updates {
+                for (node, raw_slot) in updates {
                     if task_pending.lock().is_none() {
                         return;
                     }
-                    Arc::clone(&publisher).publish(node, domain, family).await;
+                    Arc::clone(&publisher).publish(node, raw_slot).await;
                 }
             }
         });
@@ -236,14 +252,31 @@ impl ControlPlane {
             } else {
                 c.global.tcp_check_http_method.clone()
             };
-            if !check_url.is_empty() {
-                let prober = Arc::new(super::probers::http::ProxyHttpProber::new(
+            let service = self.dns_controller.dns_service();
+            let recovery_resolver: crate::outbound::ResolveHook = Arc::new(move |host, port| {
+                let service = service.clone();
+                Box::pin(async move {
+                    let resolved = service.resolve_name_without_fallback(&host).await?;
+                    Ok(resolved
+                        .ipv4
+                        .into_iter()
+                        .chain(resolved.ipv6)
+                        .map(|ip| SocketAddr::new(ip, port))
+                        .collect())
+                })
+            });
+            let prober = Arc::new(
+                super::probers::http::ProxyHttpProber::new(
                     self.config.clone(),
                     self.proxy_registry.clone(),
                     self.runtime_registry.clone(),
                     check_method.clone(),
                     self.group_manager.clone(),
-                ));
+                )
+                .with_udp_recovery_resolver(recovery_resolver),
+            );
+            alive_set.set_route_http_probe(prober.clone());
+            if !check_url.is_empty() {
                 alive_set
                     .set_http_probe(prober, check_url, check_method)
                     .await;
@@ -262,7 +295,7 @@ impl ControlPlane {
         {
             let dns_raw = {
                 let c = self.config.read().await;
-                c.global.udp_check_dns.clone()
+                c.global.effective_udp_check_dns().to_vec()
             };
             let quic_url = super::probers::quic_probe_url(&*self.config.read().await);
             let resolver: crate::outbound::ResolveHook = {
@@ -437,6 +470,16 @@ impl ControlPlane {
                     ),
             );
             epoch.health_updates = Some(HealthUpdates::start(self));
+            // Persisted Selector choices can change after ControlPlane construction.
+            // Publish their slots before the candidate epoch opens admission.
+            {
+                let _config = self.config.read().await;
+                let mut ebpf = self.ebpf.write().await;
+                let manager = self.group_manager.read();
+                let snapshot =
+                    initial_route_connectivity(&self.active_routing_plan.read().plan, &manager);
+                publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
+            }
             #[cfg(feature = "ebpf")]
             {
                 let sequence_ready = if epoch.listeners.nfqueue_enabled {
@@ -850,6 +893,461 @@ impl ControlPlane {
 
 #[cfg(all(test, feature = "native-api"))]
 mod tests;
+
+#[cfg(test)]
+#[tokio::test]
+async fn nested_exit_failures_and_selector_changes_republish_effective_slots() -> anyhow::Result<()>
+{
+    use crate::control::tests::support::{canonical_socks5, control_plane};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork, SelectorNetworks, Target};
+    use honk_outbound::proxy::{DialFailureScope, DialRef, dial_failure_scope};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let first = canonical_socks5("first", "127.0.0.1", listener.local_addr()?.port(), None);
+    let other = canonical_socks5("other", "127.0.0.1", 11081, None);
+    let near = canonical_socks5("near", "127.0.0.1", 11082, None);
+    let far = canonical_socks5("far", "127.0.0.1", 11083, None);
+    let spare = canonical_socks5("spare", "127.0.0.1", 11084, None);
+    let mut config = Config {
+        nodes: vec![
+            first.clone(),
+            other.clone(),
+            near.clone(),
+            far.clone(),
+            spare.clone(),
+        ],
+        groups: vec![
+            Group {
+                name: "root".into(),
+                policy: GroupPolicy::Selector,
+                nodes: vec![spare.id],
+                groups: vec!["middle".into(), "deny".into()],
+                default: Some("middle".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "middle".into(),
+                policy: GroupPolicy::Score,
+                groups: vec!["choices".into()],
+                exit: Some("far".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "choices".into(),
+                policy: GroupPolicy::URLTest,
+                nodes: vec![first.id, other.id],
+                exit: Some("near".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "deny".into(),
+                exit: Some("near".into()),
+                final_outbound: Some("block".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "via-final".into(),
+                final_outbound: Some("middle".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "first-only".into(),
+                nodes: vec![first.id],
+                exit: Some("near".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "gated".into(),
+                exit: Some("far".into()),
+                final_outbound: Some("first-only".into()),
+                ..Default::default()
+            },
+            Group {
+                name: "fallback".into(),
+                policy: GroupPolicy::Score,
+                groups: vec!["choices".into()],
+                exit: Some("far".into()),
+                final_outbound: Some("block".into()),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    config.global.nfqueue_enable = false;
+    config.ensure_builtin_nodes();
+    let cp = control_plane(config);
+    for family in [IpVersion::V4, IpVersion::V6] {
+        cp.alive_set
+            .report_unavailable_forced(spare.id, ProbeDomain::Tcp, family);
+    }
+    let mut updates = HealthUpdates::start(&cp);
+    let manager = cp.group_manager.read().clone();
+    let generation = cp.runtime_registry.read().clone();
+    let root = OutboundIndex::UserBase as u8;
+    let slot = async |index, domain, family, expected| -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if cp
+                    .ebpf
+                    .read()
+                    .await
+                    .get_outbound_alive(index, domain, family)?
+                    == expected
+                {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?
+    };
+    assert!(!cp.alive_set.is_registered(near.id) && !cp.alive_set.is_registered(far.id));
+    slot(root, 0, 0, true).await?;
+    slot(root + 6, 0, 0, true).await?;
+    slot(root, 2, 0, false).await?;
+    assert_eq!(
+        manager.score_budget_counters("middle", SelectionNetwork::Tcp),
+        Default::default(),
+    );
+    let family = IpVersion::V4;
+    cp.alive_set
+        .record_probe_latency(first.id, ProbeDomain::Tcp, family, Duration::from_millis(1));
+    cp.alive_set.record_probe_latency(
+        other.id,
+        ProbeDomain::Tcp,
+        family,
+        Duration::from_millis(500),
+    );
+    let context = ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, family);
+    let plan = |name| manager.dial_plan_for_target(name, &context, None);
+    let entries = |name| plan(name).0.entries;
+    let (primary, revision) = plan("root");
+    let entry = primary.entries.into_iter().next().unwrap();
+    let target = manager.own_target(Target {
+        node: entry.node,
+        route: entry.route,
+    });
+    let route = target.route().unwrap();
+    assert_eq!(route.hops(), [first.id, near.id, far.id]);
+    let server = tokio::spawn(async move {
+        for _ in 0..10 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for (port, status) in [(11082u16, 0u8), (11083, 5)] {
+                let mut greeting = [0; 2];
+                stream.read_exact(&mut greeting).await.unwrap();
+                let mut methods = vec![0; usize::from(greeting[1])];
+                stream.read_exact(&mut methods).await.unwrap();
+                stream.write_all(&[5, 0]).await.unwrap();
+                let mut request = [0; 10];
+                stream.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[..4], &[5, 1, 0, 1]);
+                assert_eq!(&request[8..], &port.to_be_bytes());
+                stream
+                    .write_all(&[5, status, 0, 1, 0, 0, 0, 0, 0, 0])
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    for _ in 0..10 {
+        let stamp = revision.admit();
+        let err = cp
+            .proxy_registry
+            .dial_ref(
+                Arc::clone(&generation),
+                DialRef::Route(route),
+                "127.0.0.1:9".parse()?,
+                None,
+                Duration::from_secs(2),
+            )
+            .await
+            .expect_err("middle SOCKS hop refuses its next hop");
+        assert_eq!(
+            dial_failure_scope(err.as_ref()),
+            DialFailureScope::Prefix(2)
+        );
+        manager.report_route_failure("root", &target, family, stamp, err.as_ref());
+    }
+    server.await?;
+    for name in ["root", "via-final"] {
+        assert_eq!(
+            entries(name)[0].route.as_deref().unwrap().hops(),
+            [other.id, near.id, far.id]
+        );
+    }
+    assert_eq!(
+        entries("choices")[0].route.as_deref().unwrap().hops(),
+        [first.id, near.id]
+    );
+    assert!(entries("gated").is_empty());
+    slot(root + 6, 0, 0, false).await?;
+    slot(root + 6, 0, 1, true).await?;
+    assert!(
+        [first.id, near.id, far.id]
+            .into_iter()
+            .all(|id| cp.alive_set.is_alive_for(id, ProbeDomain::Tcp, family))
+    );
+
+    for _ in 0..10 {
+        cp.alive_set
+            .report_unavailable_traffic(far.id, ProbeDomain::Tcp, IpVersion::V6);
+    }
+    let v6_context =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V6);
+    for name in ["root", "fallback"] {
+        let (v6, _) = manager.dial_plan_for_target(name, &v6_context, None);
+        assert_eq!(v6.health_family, family);
+        assert_eq!(v6.entries[0].node.id, other.id);
+    }
+    for _ in 0..10 {
+        cp.alive_set
+            .report_unavailable_traffic(far.id, ProbeDomain::Tcp, family);
+    }
+    assert!(entries("root").is_empty() && entries("via-final").is_empty());
+    assert_eq!(entries("fallback")[0].node.protocol(), NodeProtocol::Block);
+    slot(root, 0, 0, false).await?;
+    slot(root, 0, 1, false).await?;
+    slot(root + 4, 0, 0, false).await?;
+    cp.alive_set
+        .report_available_traffic(far.id, ProbeDomain::Tcp, family);
+    slot(root, 0, 1, true).await?;
+    manager.set_selector_choice("root", "deny", SelectorNetworks::Both)?;
+    assert_eq!(
+        manager
+            .select_node_for_domain("root", ProbeDomain::DataUdp, family)
+            .unwrap()
+            .protocol(),
+        NodeProtocol::Block,
+    );
+    slot(root, 2, 0, true).await?;
+    manager.set_selector_choice("root", "middle", SelectorNetworks::Both)?;
+    slot(root, 2, 0, false).await?;
+
+    slot(root, 0, 0, true).await?;
+    manager.set_selector_choice("root", "spare", SelectorNetworks::Both)?;
+    slot(root, 0, 0, false).await?;
+    assert!(
+        manager
+            .select_node_for_domain("root", ProbeDomain::DataUdp, family)
+            .is_none()
+    );
+    cp.alive_set.record_probe_latency(
+        spare.id,
+        ProbeDomain::DnsUdp,
+        IpVersion::V6,
+        Duration::from_millis(1),
+    );
+    slot(root, 2, 0, true).await?;
+    let provider = cp.dns_controller.runtime_provider();
+    let before = provider.current_generation();
+    let mut successor = (**cp.config.read().await).clone();
+    successor.groups[6].name = "gated-successor".into();
+    assert!(
+        cp.reload_runtime_config(successor, Default::default())
+            .await
+    );
+    assert_ne!(provider.current_generation(), before);
+    assert!(
+        cp.group_manager
+            .read()
+            .dial_plan_for_target("gated-successor", &context, None)
+            .0
+            .entries
+            .is_empty()
+    );
+    slot(root + 6, 0, 0, false).await?;
+    updates.stop().await
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn orphaned_udp_hop_republishes_committed_slot_after_manager_rebind() -> anyhow::Result<()> {
+    use crate::control::tests::support::{canonical_socks5, control_plane};
+    use crate::test_support::routed_udp::{
+        PASSWORD, Peer, dns_reply, front as serve_front, trojan_peer,
+    };
+    use honk_outbound::alive::{ProbeCancellation, RouteHttpProber};
+    use honk_outbound::group::{DialKey, ScoreSelectionContext, SelectionNetwork};
+    use honk_outbound::proxy::{ChainHopFailure, NodeFailure};
+
+    let entry = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let exit = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let origin = UdpSocket::bind("127.0.0.1:0").await?;
+    let dns = origin.local_addr()?;
+    let exit_addr = exit.local_addr()?;
+    let front = canonical_socks5("front", "127.0.0.1", entry.local_addr()?.port(), None);
+    let mut land = Node::from_share_link(&format!("trojan://{PASSWORD}@{exit_addr}#land"))?;
+    land.tls_mut().unwrap().enabled = false;
+    land.id = land.derive_id();
+    let chain = Node::chain_from_nodes("via", &[&front, &land])?;
+    let land_id = land.id;
+    let chain_id = chain.id;
+    let chain_key = DialKey::Node(chain_id);
+    let mut config = Config {
+        groups: vec![
+            Group {
+                name: "chosen".into(),
+                nodes: vec![front.id],
+                ..Default::default()
+            },
+            Group {
+                name: "unrelated".into(),
+                nodes: vec![front.id],
+                ..Default::default()
+            },
+        ],
+        nodes: vec![front, land, chain],
+        ..Default::default()
+    };
+    config.global.nfqueue_enable = false;
+    config.global.udp_check_dns = Some(vec![dns.to_string()]);
+    config.ensure_builtin_nodes();
+    let cp = control_plane(config.clone());
+    let compiled = cp.active_routing_plan.read().plan.clone();
+    assert_eq!(compiled.group_slots[0].1, "chosen");
+    let baseline = group_connectivity_snapshot(&config, &cp.group_manager.read(), &cp.alive_set);
+    publish_group_connectivity(cp.ebpf.write().await.as_mut(), &baseline)?;
+    assert!(!cp.outbound_id_map.read().contains_key(&land_id));
+    let mut updates = HealthUpdates::start(&cp);
+
+    config.groups[0].nodes[0] = chain_id;
+    config.groups.swap(0, 1);
+    *cp.config.write().await = Arc::new(config);
+    cp.reload_group_manager().await?;
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert!(!cp.outbound_id_map.read().contains_key(&land_id));
+    assert!(!cp.alive_set.is_registered(land_id));
+
+    let base = OutboundIndex::UserBase as u8;
+    let domain = ProbeDomain::DataUdp;
+    let family = IpVersion::V4;
+    let wait_slot = async |expected| -> anyhow::Result<()> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let backend = cp.ebpf.read().await;
+                if backend.get_outbound_alive(base, domain as u32, family as u32)? == expected {
+                    assert!(backend.get_outbound_alive(base + 1, domain as u32, family as u32)?);
+                    assert!(backend.get_outbound_alive(
+                        base,
+                        domain as u32,
+                        IpVersion::V6 as u32
+                    )?);
+                    assert!(backend.get_outbound_alive(
+                        base,
+                        ProbeDomain::Tcp as u32,
+                        family as u32
+                    )?);
+                    return Ok(());
+                }
+                drop(backend);
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await?
+    };
+    wait_slot(true).await?;
+    let manager = cp.group_manager.read().clone();
+    let config = cp.config.read().await.clone();
+    let context = ScoreSelectionContext::aggregate(SelectionNetwork::Udp, domain, family);
+    let plan = || {
+        resolve_outbound_plan_for_target(
+            &config,
+            &manager,
+            "chosen",
+            &context,
+            OutboundConstraint::Any,
+        )
+    };
+    let fault = ChainHopFailure {
+        hop: 1,
+        node: land_id,
+        error: NodeFailure(anyhow::anyhow!("invalid terminal packet record")).into(),
+    };
+    for _ in 0..50 {
+        let plan = plan();
+        let [target] = plan.targets.as_slice() else {
+            panic!("UDP chain unavailable before the threshold");
+        };
+        assert_eq!(target.key(), chain_key);
+        let attempt = manager
+            .capture_udp_route(
+                target,
+                &plan.selection_chains[0],
+                &plan.final_owners[0],
+                plan.route_revision,
+                domain,
+                plan.health_family,
+            )
+            .expect("active chain evidence");
+        assert!(manager.report_udp_route_failure(&attempt, &fault));
+    }
+    assert!(plan().targets.is_empty());
+    wait_slot(false).await?;
+
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(crate::ebpf::RoutingPushPhase::Root, 1)?;
+    assert_eq!(
+        cp.apply_runtime_config(
+            config.as_ref().clone(),
+            Default::default(),
+            &DrainTracker::new()
+        )
+        .await,
+        ReloadOutcome::Rejected
+    );
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &manager));
+    wait_slot(false).await?;
+
+    let front_peer = Peer::start(entry, move |stream, _| {
+        serve_front(stream, exit_addr, false)
+    });
+    let exit_peer = Peer::start(exit, move |stream, _| async move {
+        trojan_peer(stream, &[dns], dns).await
+    });
+    let prober = crate::control::probers::http::ProxyHttpProber::new(
+        cp.config_handle(),
+        cp.proxy_registry(),
+        cp.runtime_registry(),
+        "HEAD".into(),
+        cp.group_manager(),
+    );
+    let ticket = cp
+        .alive_set
+        .take_route_probe()
+        .expect("original chain must retain its recovery ticket");
+    assert_eq!(ticket.target(), chain_key);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+    let respond = async {
+        let mut query = [0; 512];
+        let (len, peer) = origin.recv_from(&mut query).await?;
+        wait_slot(false).await?;
+        let reply = dns_reply(&query[..len]);
+        assert_eq!(origin.send_to(&reply, peer).await?, reply.len());
+        anyhow::Ok(())
+    };
+    tokio::time::timeout_at(deadline, async {
+        tokio::try_join!(
+            prober.probe_route_udp(
+                &cp.alive_set,
+                &ticket,
+                deadline,
+                ProbeCancellation::default()
+            ),
+            respond
+        )
+    })
+    .await??;
+    assert_eq!(plan().targets[0].key(), chain_key);
+    wait_slot(true).await?;
+    assert!(!cp.outbound_id_map.read().contains_key(&land_id));
+    front_peer.finish(1).await;
+    exit_peer.finish(1).await;
+    updates.stop().await
+}
 
 #[cfg(test)]
 mod reap_tests {

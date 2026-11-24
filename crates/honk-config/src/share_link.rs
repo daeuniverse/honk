@@ -259,7 +259,7 @@ fn node_from_url(url: &url::Url, source: &SourceRef) -> Result<Node, DetailedCon
             OutboundConfig::Shadowsocks(_)
             | OutboundConfig::Direct
             | OutboundConfig::Block
-            | OutboundConfig::Chain { .. } => {}
+            | OutboundConfig::Chain(_) => {}
         }
     }
     Ok(node)

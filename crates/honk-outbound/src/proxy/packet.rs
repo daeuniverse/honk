@@ -132,6 +132,14 @@ pub trait PacketTransport: Send + Sync + Debug {
     async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
         self.send_packet(data).await
     }
+    /// Admit the first datagram under its selecting route's authority.
+    async fn send_packet_checked(
+        &self,
+        _data: &[u8],
+        _current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        Err(super::PacketRejection::Policy.into())
+    }
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)>;
 }
 
@@ -154,6 +162,17 @@ pub trait MultiTargetTransport: PacketTransport {
         confirmed: bool,
         admitted: Option<&std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()>;
+    /// Admit the first datagram of a routed view on this shared source.
+    async fn send_to_checked(
+        &self,
+        _target: SocketAddr,
+        _domain: Option<&str>,
+        _data: &[u8],
+        _admitted: Option<&std::sync::atomic::AtomicBool>,
+        _current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        Err(super::PacketRejection::Policy.into())
+    }
     /// Server address reported when a shared association is reused.
     fn carrier_addr(&self) -> Option<SocketAddr> {
         None
@@ -163,6 +182,23 @@ pub trait MultiTargetTransport: PacketTransport {
     fn frame_stream_torn(&self) -> bool {
         false
     }
+}
+
+/// A single send owns `admitted`. After the backend takes custody, poll the
+/// same future through its acknowledgement even if the selection changes.
+pub(crate) async fn send_with_admission_check(
+    send: impl Future<Output = std::io::Result<()>>,
+    admitted: &std::sync::atomic::AtomicBool,
+    current: &(dyn Fn() -> bool + Send + Sync),
+) -> std::io::Result<()> {
+    let mut send = std::pin::pin!(send);
+    std::future::poll_fn(|cx| {
+        if !admitted.load(std::sync::atomic::Ordering::Acquire) && !current() {
+            return std::task::Poll::Ready(Err(super::PacketRejection::Cancelled.into()));
+        }
+        send.as_mut().poll(cx)
+    })
+    .await
 }
 
 /// Poison flag of a reliable stream that carries every destination's frames.
@@ -195,6 +231,46 @@ impl FramePoison {
             admitted.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(FrameWrite(&self.0))
+    }
+
+    /// The caller serializes the frame writer. TLS can take custody on its
+    /// first poll even if it returns Pending. A byte-counting socket or queue
+    /// takes custody only when it reports a positive write.
+    pub(crate) async fn write_checked<W: tokio::io::AsyncWrite + Unpin>(
+        &self,
+        writer: &mut W,
+        frame: &[u8],
+        admitted: Option<&std::sync::atomic::AtomicBool>,
+        tls_handoff: bool,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        use std::io::{Error, ErrorKind};
+        use tokio::io::AsyncWriteExt;
+
+        self.check()?;
+        let accepted = if tls_handoff {
+            if !current() {
+                return Err(super::PacketRejection::Cancelled.into());
+            }
+            0
+        } else {
+            let n = std::future::poll_fn(|cx| {
+                if !current() {
+                    return std::task::Poll::Ready(Err(super::PacketRejection::Cancelled.into()));
+                }
+                std::pin::Pin::new(&mut *writer).poll_write(cx, frame)
+            })
+            .await?;
+            if n == 0 {
+                return Err(Error::from(ErrorKind::WriteZero));
+            }
+            n
+        };
+        let write = self.begin(admitted)?;
+        writer.write_all(&frame[accepted..]).await?;
+        writer.flush().await?;
+        write.complete();
+        Ok(())
     }
 
     pub(crate) fn is_set(&self) -> bool {
@@ -292,6 +368,14 @@ impl<T: Send + Sync> PacketTransport for RuntimeOwnedPacketTransport<T> {
 
     async fn send_packet_confirmed(&self, data: &[u8]) -> std::io::Result<()> {
         self.inner.send_packet_confirmed(data).await
+    }
+
+    async fn send_packet_checked(
+        &self,
+        data: &[u8],
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        self.inner.send_packet_checked(data, current).await
     }
 
     async fn recv_packet(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {

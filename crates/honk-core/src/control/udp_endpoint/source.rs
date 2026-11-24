@@ -19,6 +19,7 @@ use honk_outbound::proxy::hysteria2::{Hy2UdpTransport, Hysteria2Handler};
 use honk_outbound::proxy::tuic::{TuicHandler, TuicUdpTransport};
 #[cfg(feature = "rprx")]
 use honk_outbound::proxy::vless::{VLessHandler, VlessXudpTransport};
+use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
 use honk_outbound::proxy::{
     MultiTargetTransport, PreparedUdpTransport, ProxyRegistry, QuicSendAttempt,
 };
@@ -79,7 +80,7 @@ fn normalize_socket_addr(addr: SocketAddr) -> SocketAddr {
 #[derive(Clone, Copy)]
 pub(super) enum SourceRetirement {
     Neutral(ScoreOutcome),
-    Failure(ScoreOutcome),
+    Failure(ScoreOutcome, DialFailureScope),
 }
 
 struct SourceState {
@@ -133,6 +134,7 @@ pub(super) struct SourceOwner {
     alive_set: Arc<honk_outbound::alive::AliveDialerSet>,
     node_id: uuid::Uuid,
     health_family: honk_outbound::alive::IpVersion,
+    evidence: Option<Arc<UdpTrafficEvidence>>,
     node_tracker: OutboundTracker,
     stats: Arc<StatsManager>,
     _source_permit: OwnedSemaphorePermit,
@@ -156,6 +158,7 @@ impl SourceOwner {
         node_tracker: OutboundTracker,
         stats: Arc<StatsManager>,
         source_permit: OwnedSemaphorePermit,
+        evidence: Option<Arc<UdpTrafficEvidence>>,
     ) -> Arc<Self> {
         Arc::new(Self {
             id,
@@ -186,6 +189,7 @@ impl SourceOwner {
             alive_set,
             node_id,
             health_family,
+            evidence,
             node_tracker,
             stats,
             _source_permit: source_permit,
@@ -298,7 +302,10 @@ impl SourceOwner {
             {
                 false
             } else {
-                state.retirement = Some(SourceRetirement::Failure(ScoreOutcome::Timeout));
+                state.retirement = Some(SourceRetirement::Failure(
+                    ScoreOutcome::Timeout,
+                    DialFailureScope::Unattributed,
+                ));
                 true
             }
         };
@@ -323,9 +330,9 @@ impl SourceOwner {
         self.uplink_stall.admitted();
     }
 
-    pub(super) fn fail(&self, outcome: ScoreOutcome) {
+    pub(super) fn fail(&self, outcome: ScoreOutcome, error: Option<&io::Error>) {
         if let Some(pool) = self.pool.upgrade() {
-            pool.fail_source(self, outcome);
+            pool.fail_source(self, outcome, error);
         }
     }
     #[cfg(test)]
@@ -379,18 +386,34 @@ impl SourceOwner {
             now + nanos_from_dur(TRAFFIC_ALIVE_REPORT_INTERVAL),
             Ordering::Relaxed,
         );
-        self.alive_set.report_available_traffic(
-            self.node_id,
-            honk_outbound::alive::ProbeDomain::DataUdp,
-            self.health_family,
-        );
+        let evidence = self.evidence.as_deref();
+        let scoped = evidence.and_then(UdpTrafficEvidence::settle_reply);
+        // An accepted bare proof already resets the native health state.
+        // Later bare replies still use ordinary traffic accounting.
+        let ordinary = if scoped.is_none() && evidence.is_none_or(|evidence| !evidence.is_route()) {
+            self.alive_set.settle_available_traffic(
+                self.node_id,
+                honk_outbound::alive::ProbeDomain::DataUdp,
+                self.health_family,
+            )
+        } else {
+            None
+        };
+        // The state changes precede any retirement this notification may trigger.
+        drop(state);
+        if let Some(notifications) = scoped {
+            notifications.notify();
+        }
+        if let Some(notify) = ordinary {
+            notify();
+        }
     }
 
     fn flow_idle_expired(&self) {
         if let Some(pool) = self.pool.upgrade()
             && self.start_retiring_without_reply()
         {
-            pool.finish_source_failure(self, ScoreOutcome::Timeout);
+            pool.finish_source_failure(self, ScoreOutcome::Timeout, None);
         }
     }
 
@@ -401,7 +424,7 @@ impl SourceOwner {
             } else if self.has_reply.load(Ordering::Acquire) {
                 pool.retire_replied_source(self);
             } else {
-                pool.fail_source(self, ScoreOutcome::Timeout);
+                pool.fail_source(self, ScoreOutcome::Timeout, None);
             }
         }
     }
@@ -552,6 +575,7 @@ impl SourceEndpoint {
         self.flow_tracker.add_bytes(0, len);
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn send<'a>(
         &'a self,
         data: &[u8],
@@ -559,6 +583,7 @@ impl SourceEndpoint {
         admitted: Option<&AtomicBool>,
         record_start: bool,
         attempt: &mut Option<QuicSendAttempt<'a>>,
+        first_send: Option<&UdpTrafficEvidence>,
     ) -> io::Result<Option<Instant>> {
         let _send = self.owner.send_gate.lock().await;
         let reusable = match &self.owner.transport {
@@ -587,6 +612,9 @@ impl SourceEndpoint {
             {
                 return Err(honk_outbound::proxy::PacketRejection::InvalidSize.into());
             }
+            if first_send.is_some_and(|evidence| !evidence.current()) {
+                return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+            }
             if reusable {
                 state.intentional_sender = 0;
             }
@@ -603,6 +631,11 @@ impl SourceEndpoint {
         *attempt = Some(QuicSendAttempt::new(self.packet_transport()));
         let started_at = record_start.then(Instant::now);
         self.owner.begin_receive();
+        let current = || {
+            !self.retired.load(Ordering::Acquire)
+                && self.owner.is_ready()
+                && first_send.is_some_and(UdpTrafficEvidence::current)
+        };
         let result = self
             .owner
             .transport
@@ -612,6 +645,9 @@ impl SourceEndpoint {
                 data,
                 confirmed,
                 admitted,
+                first_send
+                    .filter(|evidence| evidence.is_route())
+                    .map(|_| &current as _),
             )
             .await;
         if result.is_ok() {
@@ -638,8 +674,8 @@ impl SourceEndpoint {
         self.owner.transport.packet_transport()
     }
 
-    pub(super) fn fail(&self, outcome: ScoreOutcome) {
-        self.owner.fail(outcome);
+    pub(super) fn fail(&self, outcome: ScoreOutcome, error: &io::Error) {
+        self.owner.fail(outcome, Some(error));
     }
 
     pub(super) fn uplink_stall(&self) -> &UplinkStall {
@@ -742,7 +778,7 @@ async fn run_source_receiver(pool: Arc<UdpEndpointPool>, owner: Arc<SourceOwner>
                     Ok(packet) => packet,
                     Err(error) => {
                         if !owner.handle_transport_error(&error) {
-                            owner.fail(ScoreOutcome::from_io_error(&error));
+                            owner.fail(ScoreOutcome::from_io_error(&error), Some(&error));
                         }
                         return;
                     }
@@ -878,7 +914,26 @@ impl UdpEndpointPool {
                 node_id: runtime.node.id,
                 node_name: runtime.node.name.clone(),
                 health_family,
+                evidence: None,
             });
+        }
+    }
+
+    pub(super) fn retire_sources_matching(&self, matches: impl Fn(&UdpTrafficEvidence) -> bool) {
+        let stale: Vec<_> = self
+            .sources
+            .iter()
+            .filter_map(|entry| {
+                let owner = entry.value();
+                owner
+                    .evidence
+                    .as_deref()
+                    .is_some_and(&matches)
+                    .then(|| Arc::clone(owner))
+            })
+            .collect();
+        for owner in stale {
+            self.retire_source_neutral(&owner, ScoreOutcome::Cancelled);
         }
     }
 
@@ -929,34 +984,54 @@ impl UdpEndpointPool {
         }
     }
 
-    fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome) {
+    fn fail_source(&self, owner: &SourceOwner, outcome: ScoreOutcome, error: Option<&io::Error>) {
         let outcome = if outcome == ScoreOutcome::NodeFailure {
             ScoreOutcome::shared_node_failure()
         } else {
             outcome
         };
-        if owner.start_retiring(SourceRetirement::Failure(outcome)) {
-            self.finish_source_failure(owner, outcome);
+        let scope = error.map_or(DialFailureScope::Unattributed, |error| {
+            dial_failure_scope(error)
+        });
+        if owner.start_retiring(SourceRetirement::Failure(outcome, scope)) {
+            self.finish_source_failure(owner, outcome, error);
         }
     }
 
-    fn finish_source_failure(&self, owner: &SourceOwner, outcome: ScoreOutcome) {
+    fn finish_source_failure(
+        &self,
+        owner: &SourceOwner,
+        outcome: ScoreOutcome,
+        error: Option<&io::Error>,
+    ) {
         let terminal = self.terminal.load(Ordering::Acquire);
         let outcome = if terminal {
             ScoreOutcome::Shutdown
         } else {
             outcome
         };
+        #[cfg(feature = "native-api")]
+        let scope = error.map_or(DialFailureScope::Unattributed, |error| {
+            dial_failure_scope(error)
+        });
         let stale = self.source_settlement_endpoints(owner);
         for (_, _, _, endpoint) in &stale {
             #[cfg(feature = "native-api")]
-            endpoint.finish_native_source(SourceRetirement::Failure(outcome));
+            endpoint.finish_native_source(SourceRetirement::Failure(outcome, scope));
             endpoint.finish_score(outcome);
         }
         for (key, token, generation, _) in stale {
             self.retire_if_same(key, token, generation);
         }
         if !terminal {
+            if let Some(evidence) = &owner.evidence
+                && evidence.is_route()
+            {
+                if let Some(error) = error {
+                    evidence.report_failure(error);
+                }
+                return;
+            }
             owner.alive_set.report_unavailable_traffic(
                 owner.node_id,
                 honk_outbound::alive::ProbeDomain::DataUdp,

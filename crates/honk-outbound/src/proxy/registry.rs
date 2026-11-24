@@ -19,10 +19,20 @@ use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
 use super::{
-    DirectMark, MultiTargetTransport, PacketOutbound, PacketRejection, PacketTransport,
-    PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound,
-    WarmOutcome, WarmRequirement, WarmableOutbound,
+    DirectMark, MissingProtocolHandler, MultiTargetTransport, PacketOutbound, PacketRejection,
+    PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound,
+    TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
 };
+
+macro_rules! rprx_handlers {
+    ($emit:ident $(, $registry:ident)?) => {
+        $emit! {
+            $($registry;)?
+            VLess, VLessHandler, [with_tunneled_tcp, with_packet, with_tunneled_packet, with_shared, with_warmable];
+            VMess, VmessHandler, [with_tunneled_tcp, with_warmable];
+        }
+    };
+}
 
 /// One registered protocol: its descriptor plus the capability objects it
 /// implements. A `None` slot means the implementation lacks that capability;
@@ -30,7 +40,11 @@ use super::{
 pub struct ProtocolEntry {
     pub descriptor: &'static crate::descriptor::ProtocolDescriptor,
     pub tcp: Arc<dyn TcpOutbound>,
+    /// Handshakes with an intermediate hop on a supplied UDP carrier stream.
+    pub(super) tunneled_tcp: Option<Arc<dyn TcpOutbound>>,
     pub packet: Option<Arc<dyn PacketOutbound>>,
+    /// Frames packets on a stream already opened by the preceding hop.
+    pub(super) tunneled_packet: Option<Arc<dyn PacketOutbound>>,
     pub warmable: Option<Arc<dyn WarmableOutbound>>,
     pub probeable: Option<Arc<dyn ProbeableOutbound>>,
     pub shared: Option<Arc<dyn SharedSourceOutbound>>,
@@ -45,7 +59,9 @@ impl ProtocolEntry {
         Self {
             descriptor: crate::descriptor::descriptor(protocol),
             tcp: handler,
+            tunneled_tcp: None,
             packet: None,
+            tunneled_packet: None,
             warmable: None,
             probeable: None,
             shared: None,
@@ -55,6 +71,19 @@ impl ProtocolEntry {
 
     pub fn with_packet<T: PacketOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
         self.packet = Some(handler);
+        self
+    }
+
+    pub(super) fn with_tunneled_tcp<T: TcpOutbound + 'static>(mut self, handler: Arc<T>) -> Self {
+        self.tunneled_tcp = Some(handler);
+        self
+    }
+
+    pub(super) fn with_tunneled_packet<T: PacketOutbound + 'static>(
+        mut self,
+        handler: Arc<T>,
+    ) -> Self {
+        self.tunneled_packet = Some(handler);
         self
     }
 
@@ -98,10 +127,26 @@ impl ProtocolEntry {
                 protocol.as_str()
             );
         }
-        if self.shared.is_some() && self.packet.is_none() {
+        if (self.shared.is_some() || self.tunneled_shared.is_some()) && self.packet.is_none() {
             panic!(
                 "protocol {} declares a shared source without a packet handler",
                 protocol.as_str()
+            );
+        }
+        if crate::descriptor::carries_udp(crate::descriptor::UdpPath::Tunneled {
+            exit: &default_node,
+        }) {
+            assert!(
+                self.tunneled_packet.is_some() && self.packet.is_some(),
+                "protocol {} declares tunneled UDP without a packet handler",
+                protocol.as_str(),
+            );
+        }
+        if default_node.supports_tunneled_dial() {
+            assert!(
+                self.tunneled_tcp.is_some(),
+                "protocol {} declares tunneled TCP without a handler",
+                protocol.as_str(),
             );
         }
         if self.descriptor.generation_runtime != crate::runtime::GenerationRuntime::None
@@ -138,12 +183,25 @@ impl ProxyRegistry {
         }
     }
 
+    pub(crate) const fn builtin_protocol_available(protocol: NodeProtocol) -> bool {
+        macro_rules! available {
+            ($( $name:ident, $handler:ident, [$($slot:ident),*]; )*) => {
+                match protocol {
+                    $(NodeProtocol::$name)|* => cfg!(feature = "rprx"),
+                    _ => true,
+                }
+            };
+        }
+        rprx_handlers!(available)
+    }
+
     pub fn default_resolver() -> anyhow::Result<Self> {
         let mut registry = Self::new();
 
         let socks5 = Arc::new(Socks5Handler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Socks5, socks5.clone())
+                .with_tunneled_tcp(socks5.clone())
                 .with_packet(socks5.clone())
                 .with_shared(socks5.clone())
                 .with_probeable(socks5),
@@ -163,7 +221,9 @@ impl ProxyRegistry {
         let trojan = Arc::new(TrojanHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::Trojan, trojan.clone())
+                .with_tunneled_tcp(trojan.clone())
                 .with_packet(trojan.clone())
+                .with_tunneled_packet(trojan.clone())
                 .with_shared(trojan.clone())
                 .with_tunneled_shared(trojan.clone())
                 .with_warmable(trojan.clone())
@@ -179,26 +239,26 @@ impl ProxyRegistry {
         let shadowsocks = Arc::new(ShadowsocksHandler::new());
         registry.register(
             ProtocolEntry::new(NodeProtocol::SS, shadowsocks.clone())
+                .with_tunneled_tcp(shadowsocks.clone())
                 .with_packet(shadowsocks.clone())
                 .with_shared(shadowsocks.clone())
                 .with_probeable(shadowsocks),
         );
         #[cfg(feature = "rprx")]
         {
-            let vless = Arc::new(VLessHandler::new());
-            registry.register(
-                ProtocolEntry::new(NodeProtocol::VLess, vless.clone())
-                    .with_packet(vless.clone())
-                    .with_shared(vless.clone())
-                    .with_warmable(vless.clone())
-                    .with_probeable(vless),
-            );
-            let vmess = Arc::new(VmessHandler::new());
-            registry.register(
-                ProtocolEntry::new(NodeProtocol::VMess, vmess.clone())
-                    .with_warmable(vmess.clone())
-                    .with_probeable(vmess),
-            );
+            macro_rules! register {
+                ($registry:ident; $( $name:ident, $handler:ident, [$($slot:ident),*]; )*) => {{
+                    $(
+                        let handler = Arc::new($handler::new());
+                        $registry.register(
+                            ProtocolEntry::new(NodeProtocol::$name, Arc::clone(&handler))
+                                $(.$slot(Arc::clone(&handler)))*
+                                .with_probeable(handler),
+                        );
+                    )*
+                }};
+            }
+            rprx_handlers!(register, registry);
         }
         let anytls = Arc::new(AnyTlsHandler::new());
         registry.register(
@@ -223,27 +283,7 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
-        // A chain dials its hops through the handlers registered above.
-        let hop_handlers = registry
-            .entries
-            .iter()
-            .map(|entry| ProtocolEntry {
-                descriptor: entry.descriptor,
-                tcp: Arc::clone(&entry.tcp),
-                packet: entry.packet.clone(),
-                warmable: None,
-                probeable: None,
-                shared: entry.shared.clone(),
-                tunneled_shared: entry.tunneled_shared.clone(),
-            })
-            .collect();
-        let chain = Arc::new(ChainHandler::new(hop_handlers));
-        registry.register(
-            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain))
-                .with_packet(chain.clone())
-                .with_shared(chain.clone()),
-        );
-        registry.chain = Some(chain);
+        registry.register_chain();
         for entry in &registry.entries {
             entry.validate_consistency();
         }
@@ -254,10 +294,76 @@ impl ProxyRegistry {
         self.entries.push(entry);
     }
 
+    pub(super) fn register_chain(&mut self) {
+        let chain = Arc::new(ChainHandler::new(&self.entries));
+        self.register(
+            ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain))
+                .with_packet(Arc::clone(&chain))
+                .with_shared(Arc::clone(&chain)),
+        );
+        self.chain = Some(chain);
+    }
+
     pub fn find(&self, protocol: NodeProtocol) -> Option<&ProtocolEntry> {
         self.entries
             .iter()
             .find(|entry| entry.descriptor.protocol == protocol)
+    }
+
+    /// Preflight the leaf against the installed handlers and return its
+    /// packet handler and the node that owns destination-port policy.
+    pub fn udp_probe_target<'a>(
+        &self,
+        generation: &'a crate::runtime::OutboundRuntimeRegistry,
+        node: &'a Node,
+    ) -> anyhow::Result<(&dyn PacketOutbound, &'a Node)> {
+        let protocol = node.protocol();
+        let packet = self
+            .find(protocol)
+            .and_then(|entry| entry.packet.as_deref())
+            .ok_or(MissingProtocolHandler(protocol))?;
+        if protocol == NodeProtocol::Chain {
+            let runtime = generation.admitted_chain_runtime_ref(node)?;
+            let terminal = self
+                .chain
+                .as_ref()
+                .ok_or(MissingProtocolHandler(protocol))?
+                .udp_terminal(runtime.chain_hops(), runtime.udp_capable)?;
+            return Ok((packet, terminal));
+        }
+        if !generation.udp_capable(node) {
+            return Err(PacketRejection::Policy.into());
+        }
+        Ok((packet, node))
+    }
+
+    /// Resolve the actual framing node and its required handlers before resolving a probe target.
+    pub fn udp_framing_node<'a>(
+        &self,
+        generation: &'a crate::runtime::OutboundRuntimeRegistry,
+        target: DialRef<'_>,
+    ) -> anyhow::Result<&'a Node> {
+        match target {
+            DialRef::Node(id) => {
+                let runtime = generation.get_ref(&id).ok_or(PacketRejection::Cancelled)?;
+                self.udp_probe_target(generation, &runtime.node)
+                    .map(|(_, terminal)| terminal)
+            }
+            DialRef::Route(route) => {
+                let runtime = generation
+                    .route_runtime(route)
+                    .ok_or(PacketRejection::Cancelled)?;
+                let terminal = self
+                    .chain
+                    .as_ref()
+                    .ok_or(MissingProtocolHandler(NodeProtocol::Chain))?
+                    .udp_terminal(runtime.hops(), runtime.udp_capable())?;
+                Ok(&generation
+                    .get_ref(&terminal.id)
+                    .ok_or(PacketRejection::Cancelled)?
+                    .node)
+            }
+        }
     }
 
     pub async fn dial(
@@ -270,7 +376,7 @@ impl ProxyRegistry {
         let protocol = node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
 
         tracing::debug!(
             "Dialing {}:{} via {} ({})",
@@ -327,6 +433,37 @@ impl ProxyRegistry {
         }
     }
 
+    /// After a fresh successful dial, whether its actual handler confirmed the target at open.
+    pub fn confirms_target_on_open(
+        &self,
+        generation: &crate::runtime::OutboundRuntimeRegistry,
+        target: DialRef<'_>,
+    ) -> bool {
+        if generation.is_shutdown() {
+            return false;
+        }
+        match target {
+            DialRef::Node(id) => generation
+                .get_ref(&id)
+                .and_then(|runtime| self.find(runtime.node.protocol()))
+                .is_some_and(|entry| entry.tcp.confirms_target_on_open()),
+            DialRef::Route(route) => {
+                let Some(chain) = &self.chain else {
+                    return false;
+                };
+                let mut handlers = route
+                    .hops()
+                    .iter()
+                    .map(|id| chain.handler(generation.get_ref(id)?.node.protocol()));
+                handlers
+                    .next_back()
+                    .flatten()
+                    .is_some_and(|handler| handler.confirms_target_on_open())
+                    && handlers.all(|handler| handler.is_some())
+            }
+        }
+    }
+
     /// Dial a route over the captured generation's hop runtimes. The dial's
     /// tasks have no owner of their own; each hop scopes its own to its
     /// runtime, as for a configured chain.
@@ -344,17 +481,15 @@ impl ProxyRegistry {
         let chain = self
             .chain
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+            .ok_or(MissingProtocolHandler(NodeProtocol::Chain))?;
         let runtime = generation
             .route_runtime(route)
             .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        // The two task scopes borrow one dial; nesting its state by value grows every dial_ref.
+        let dial =
+            std::pin::pin!(chain.dial_route_tcp(&runtime, target, target_domain, connect_timeout));
         let result = generation
-            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_tcp(
-                &runtime,
-                target,
-                target_domain,
-                connect_timeout,
-            )))
+            .scope_dials(crate::runtime::scope_unowned(dial))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
@@ -403,7 +538,7 @@ impl ProxyRegistry {
         let protocol = runtime.node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
         let quality = runtime.transport_quality();
         let dial = dial(Arc::clone(&runtime), entry)?;
         let result = generation
@@ -506,7 +641,7 @@ impl ProxyRegistry {
         let protocol = node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
         if protocol != NodeProtocol::Block
             && !crate::descriptor::udp_target_allowed(node, target.port())
         {
@@ -543,24 +678,14 @@ impl ProxyRegistry {
         let chain = self
             .chain
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+            .ok_or(MissingProtocolHandler(NodeProtocol::Chain))?;
         let runtime = generation
             .route_runtime(route)
             .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
-        let exit = runtime.hops().last().map(|exit| &exit.node);
-        if !exit.is_some_and(|exit| crate::descriptor::udp_target_allowed(exit, target.port())) {
-            return Err(PacketRejection::Policy.into());
-        }
-        if !runtime.udp_capable {
-            anyhow::bail!("UDP not supported through this route's exit");
-        }
+        let dial =
+            std::pin::pin!(chain.dial_route_udp(&runtime, target, target_domain, connect_timeout));
         let result = generation
-            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_udp(
-                &runtime,
-                target,
-                target_domain,
-                connect_timeout,
-            )))
+            .scope_dials(crate::runtime::scope_unowned(dial))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
@@ -679,7 +804,7 @@ impl ProxyRegistry {
         let protocol = runtime.node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
         Self::packet_for_runtime(&runtime, entry, target.port())?;
         let shared = entry.shared.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
@@ -707,7 +832,7 @@ impl ProxyRegistry {
         let protocol = runtime.node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
         let packet = Self::packet_for_runtime(&runtime, entry, target_port)?;
         Ok((runtime, packet))
     }
@@ -724,6 +849,9 @@ impl ProxyRegistry {
             return Err(PacketRejection::Policy.into());
         }
         if protocol != NodeProtocol::Block && !runtime.udp_capable {
+            if protocol == NodeProtocol::Chain {
+                return Err(PacketRejection::Policy.into());
+            }
             anyhow::bail!("UDP not supported for protocol {}", protocol.as_str());
         }
         entry

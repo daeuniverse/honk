@@ -18,7 +18,8 @@ global {
 
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
+    # 明確列出目的地才會授權路由 UDP 復原。
+    # udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 30s
     check_tolerance: 50ms
 
@@ -163,6 +164,8 @@ TCP syslog 接收端：數字 IP 加連接埠，例如 `192.0.2.10:514` 或 `[20
 
 把有歧義的 LAN 轉發 UDP 原始封包留在 NFQUEUE，直到使用者空間做出最終決策。此功能需要真實 eBPF 後端。
 
+啟動降級會記錄 `NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled`，並帶 `reason` 欄位：`the mock eBPF backend was selected`、`honk-core was built without the ebpf feature`，或固定佇列前置檢查的錯誤。honk 不改寫設定檔，在本行程內保持關閉。
+
 單一執行個體交接後，固定佇列不可用，或資料路徑 admission 之前佇列、規則、健康檢查失敗時，honk 會記一條 warning，並在本行程內關閉該功能，不改寫設定。安裝階段會回收保留的 nftables table。
 
 持久化 token generation 恢復失敗，以及 [admission 後的失敗](../design/nfqueue.md#啟用與範圍)，仍然是 fatal。
@@ -170,6 +173,8 @@ TCP syslog 接收端：數字 IP 加連接埠，例如 `192.0.2.10:514` 或 `[20
 `experimental.udp_nfqueue.enabled` 已棄用，改用 `nfqueue_enable`。舊寫法仍被接受，並產生遷移 warning；兩者同時存在時以 `nfqueue_enable` 為準。
 
 只有確實發生過降級時，寫入和 reload 才能繼續請求 `nfqueue_enable: true`，而 NFQUEUE 的生效值保持關閉。省略該 key、採用預設值 `true`，也算這種請求。降級分兩種：啟動早期的降級（mock、不帶 `ebpf` feature，或固定佇列的前置檢查失敗），以及資料路徑 admission 之前較晚發生的佇列、規則或健康檢查降級。請求的來源文字保持原樣，生效值在本行程的整個生命週期內都是 `false`。honk 不會自動重試啟用，只有重啟才會重試。沒有發生降級時，開關的變更仍需重啟。[通用 reload 流程](../design/control-plane.md#reload-與執行時-generation) 會在指紋/no-op 檢查之前正規化生效設定；原生 API 的寫入前檢查與完整驗證使用同一套重啟策略。
+
+`0.1.0-beta.4` 及更早版本沒有這個豁免：啟動降級後，該欄位仍在需重啟的比較範圍內，所以請求 `true`（包括省略該 key）的寫入和 reload 都會因需重啟而被拒絕，重新啟動後也一樣。只有在來源檔案裡寫 `nfqueue_enable: false` 才能寫入。
 
 `nfqueue_enable` 同時控制 [LAN UDP/53 分片交付](../design/nfqueue.md#lan-dns-分片)：DNS 控制器和 raw group 處理的分片都要求 NFQUEUE 處於 ready，否則直接丟棄，不能繞過 DNS 策略。原生 `direct(must)` 和未分片的 DNS 不變。
 
@@ -197,7 +202,9 @@ global {
 
 括號或連接埠格式錯誤時，驗證失敗並產生含位置的診斷。
 
-優先選擇第一個 IP 常值，沒有就解析第一個網域。解析結果與 Score 共用同一個解碼後的主機和連接埠；網域解析完成後仍保留網域身分。
+一般節點探測優先選擇第一個 IP 常值，沒有就解析第一個網域名稱。解析與 Score 共用解碼後的主機和連接埠，網域名稱解析後仍保留網域身分。省略這個設定時使用上表所列的預設值。
+
+針對[路由 UDP 復原](./groups.md#出口存活)，請列出允許 honk 透過受影響的鏈或群組出口查詢的 DNS 伺服器。省略這個設定或提供空清單時，系統不會送出復原查詢。復原會優先選擇設定中第一個與受影響健康位址族相同的 IP 常值。若沒有，僅使用已設定的 DNS 服務查找已設定網域名稱的同族位址，不退回 bootstrap DNS。封裝 UDP 的跳點必須允許目的連接埠。
 
 ```dae
 global {
@@ -342,7 +349,7 @@ dae 全域純量沿用 honk 既有的十六進位優先規則：`10` 和 `0x10` 
 - `check_interval`。
 - 第一個 `tcp_check_url`，包括其備援位址、路徑和查詢字串。首項缺失或為空都會關閉 HTTP 探測；後續項不參與比較。
 - HTTP 探測啟用時的 `tcp_check_http_method`。空值與 `HEAD` 等價。
-- `udp_check_dns` 選中的目標。處理時會先去除首尾空白、忽略空項，優先取列表裡第一個 IP 常值，沒有就取第一個網域，兩者都沒有時使用 `8.8.8.8:53`。reload 檢查只比較設定中的位址或網域及其連接埠，不解析 DNS。網域比較不區分大小寫，並忽略一個結尾句點，因此 `dns.example:53` 和 `DNS.EXAMPLE.:53` 是同一目標。未選中項的變化仍可 reload。
+- 一般節點探測使用的 `udp_check_dns` 生效目標。選擇時會去除首尾空白、忽略空項，依序取第一個 IP 常值、第一個網域名稱或最後的 `8.8.8.8:53`。reload 檢查只比較設定中的位址或網域名稱及其連接埠，不解析 DNS。網域名稱比較不區分大小寫，並忽略一個結尾句點，因此 `dns.example:53` 和 `DNS.EXAMPLE.:53` 是同一目標。保留該生效目標時，reload 可以更新路由復原用的明確清單。
 - `tls_implementation` 在原生 TLS 與 uTLS 之間的切換。比較 `utls` 時不區分大小寫。
 
 dae 設定中的 `check_tolerance` 仍可透過 reload 更新 URLTest 群組的容差。群組層級的檢查 URL 和直接連線探測仍沿現有路徑動態更新。reload `utls_imitate` 只會儲存相容設定值，不會改變指紋。

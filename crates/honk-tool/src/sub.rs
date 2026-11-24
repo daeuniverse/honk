@@ -98,7 +98,7 @@ pub struct SubArgs {
         long,
         value_name = "HOST[:PORT]",
         value_delimiter = ',',
-        default_values_t = honk_config::config::GlobalConfig::default().udp_check_dns
+        default_values_t = honk_config::config::GlobalConfig::default().effective_udp_check_dns().to_vec()
     )]
     pub udp_check: Vec<String>,
     /// Latency-test URL (defaults to https://www.gstatic.com/generate_204).

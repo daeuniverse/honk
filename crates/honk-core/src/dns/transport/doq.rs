@@ -15,7 +15,7 @@ use super::framing::{
 use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::quic::{QuicEndpoint, with_packet_cause};
 use super::{
-    DialContext, SharedQuicEndpoint, dns_quic_config, exchange_with_retry, quic_connect_endpoint,
+    DialContext, RouteExchange, SharedQuicEndpoint, dns_quic_config, quic_connect_endpoint,
 };
 
 /// One physical DoQ connection and its socket/driver owner.
@@ -44,12 +44,16 @@ pub struct DoqClient {
 impl DoqClient {
     pub async fn new(dial: DialContext) -> anyhow::Result<Arc<Self>> {
         let quic_config = dns_quic_config(&[b"doq"]).await?;
-        Ok(Arc::new(Self {
+        Ok(Self::with_quic_config(dial, quic_config))
+    }
+
+    pub(super) fn with_quic_config(dial: DialContext, quic_config: ClientConfig) -> Arc<Self> {
+        Arc::new(Self {
             dial,
             quic_config,
             quic_ep: SharedQuicEndpoint::new(),
             connection: LifecycleSlot::new(),
-        }))
+        })
     }
 
     pub async fn exchange(
@@ -57,7 +61,16 @@ impl DoqClient {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
+        self.exchange_routed(raw_query, feedback, None).await
+    }
+
+    pub(crate) async fn exchange_routed(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route: Option<RouteExchange<'_>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        super::retry::exchange_with_route_retry(
             "DoQ",
             raw_query,
             |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
@@ -70,6 +83,7 @@ impl DoqClient {
                 }
             },
             feedback,
+            route,
         )
         .await
     }
@@ -177,6 +191,11 @@ impl DoqClient {
         self.connection
             .retire(connection, move |connection| connection.close(timeout))
             .await;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.connection
+            .is_inactive(|connection| connection.connection.close_reason().is_some())
     }
 
     pub(crate) fn tasks_failed(&self) -> bool {

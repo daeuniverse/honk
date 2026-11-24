@@ -251,7 +251,7 @@ fn score_udp_capability_filters_selection_verification_and_nested_finals() {
     let groups = [score, incapable, terminal, parent];
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
 
     for alive_set in [Some(alive), None] {
@@ -330,7 +330,7 @@ fn selector_udp_capability_keeps_the_pin_and_terminal_members() {
     let parent = make_subgroup("parent", GroupPolicy::Selector, &["selector"]);
     let alive = Arc::new(AliveDialerSet::new());
     for node in &nodes {
-        alive.register_node(node.id, node.name.clone(), node.address.clone());
+        alive.register_node(node.id, node.name.clone(), Some(node.address.clone()));
     }
     for alive_set in [Some(alive), None] {
         let manager =
@@ -875,15 +875,12 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     assert_udp_selection(&manager, "level-1", Some("direct"));
 }
 
-/// UDP selection skips a chain whose exit cannot be resolved; TCP selection
-/// still admits it.
+/// Unbound chain nodes have no UDP terminal to select.
 #[test]
 fn udp_selection_skips_chain_nodes() {
     let front = make_node(nid("front"), "front");
     let mut chain = make_node(nid("via"), "via");
-    chain.outbound = honk_config::node::OutboundConfig::Chain {
-        hops: vec!["front".into(), "land".into()],
-    };
+    chain.outbound = Node::chain(&chain.name, vec!["front".into(), "land".into()]).outbound;
     let nodes = vec![chain.clone(), front.clone()];
     let m = GroupManager::with_alive_set(
         &[make_group(
@@ -904,45 +901,34 @@ fn udp_selection_skips_chain_nodes() {
 /// A configured chain's UDP follows its exit, not the chain descriptor.
 #[test]
 fn a_chain_offers_udp_exactly_when_its_exit_carries_it() {
-    use honk_config::node::{OutboundConfig, VlessConfig, VlessUdpEncoding};
-    let front = Node {
-        outbound: OutboundConfig::Socks5(Default::default()),
-        ..make_node(nid("front"), "front")
-    };
-    let trojan = Node {
-        outbound: OutboundConfig::Trojan(Default::default()),
-        ..make_node(nid("trojan"), "trojan")
-    };
-    let xudp = Node {
-        outbound: OutboundConfig::Vless(VlessConfig {
-            udp_encoding: VlessUdpEncoding::Xudp,
-            ..Default::default()
-        }),
-        ..make_node(nid("xudp"), "xudp")
-    };
-    let chain = |name: &str, exit: &str| Node {
-        outbound: OutboundConfig::Chain {
-            hops: vec!["front".into(), exit.into()],
-        },
-        ..make_node(nid(name), name)
-    };
+    let nodes = honk_config::Config {
+        nodes: vec![
+            Node::from_share_link("socks5://127.0.0.1:1080#front").unwrap(),
+            Node::from_share_link("trojan://secret@127.0.0.1:443#trojan").unwrap(),
+            Node::from_share_link(
+                "vless://30882cf1-11d1-4d34-bdf6-44f694c9c591@127.0.0.1:444?packetEncoding=xudp#xudp",
+            )
+            .unwrap(),
+            Node::chain("via-trojan", vec!["front".into(), "trojan".into()]),
+            Node::chain("via-xudp", vec!["front".into(), "xudp".into()]),
+        ],
+        ..Default::default()
+    }
+    .assemble(|_, _, _| {})
+    .unwrap()
+    .nodes;
+    let id = |name: &str| nodes.iter().find(|node| node.name == name).unwrap().id;
     let manager = GroupManager::new(
         &[make_group(
             "g",
             GroupPolicy::LoadBalance,
-            vec![nid("via-trojan"), nid("via-xudp")],
+            vec![id("via-trojan"), id("via-xudp")],
         )],
-        &[
-            front,
-            trojan,
-            xudp,
-            chain("via-trojan", "trojan"),
-            chain("via-xudp", "xudp"),
-        ],
+        &nodes,
     );
     for (name, carries) in [("via-trojan", true), ("via-xudp", false)] {
         assert_eq!(
-            manager.is_node_selectable_for_domain(nid(name), ProbeDomain::DataUdp, IpVersion::V4),
+            manager.is_node_selectable_for_domain(id(name), ProbeDomain::DataUdp, IpVersion::V4),
             carries,
             "{name}"
         );
@@ -951,7 +937,17 @@ fn a_chain_offers_udp_exactly_when_its_exit_carries_it() {
         let plan = manager.selection_plan_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
         assert_eq!(
             plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
-            [nid("via-trojan")]
+            [id("via-trojan")]
         );
+        let target = manager.selection_plan_for_target(
+            "g",
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::Udp,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            ),
+        );
+        assert_eq!(target.entries[0].node.id, id("via-trojan"));
+        assert!(target.entries[0].route.is_none());
     }
 }

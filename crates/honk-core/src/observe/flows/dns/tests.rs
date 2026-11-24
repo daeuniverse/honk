@@ -168,7 +168,7 @@ async fn node_subtag_selection_marks_only_executed_predicates_partial() {
     });
     let provider = Arc::new(DnsServiceProvider::new(runtime));
     let service = DnsService::with_provider(provider.clone());
-    let pinned = service.pin_name_resolution().unwrap();
+    let pinned = service.pin_name_resolution(None).unwrap();
     let hook = crate::dns::node_host::resolver(&service);
 
     assert!(hook.lookup("node.private.example").is_some());
@@ -594,12 +594,9 @@ async fn selection_evidence_keeps_the_consumed_catalog_after_group_recreation() 
                 let rows = selection_evaluated(plan.observation.as_deref());
                 assert_eq!(rows[0].group_id, consumed.groups["dns-root"]);
                 let picked = plan.entries.first().unwrap();
-                let path = selection_path(
-                    &rows,
-                    &picked.selection_chain,
-                    picked.node,
-                    plan.health_family,
-                );
+                let dialed = honk_outbound::group::OwnedTarget::node(picked.node.clone());
+                let path =
+                    selection_path(&rows, &picked.selection_chain, &dialed, plan.health_family);
                 assert_eq!(
                     path[0].member_id.as_deref(),
                     Some(picked.node.id.to_string().as_str())
@@ -810,7 +807,7 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
     use honk_config::types::NodeProtocol;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    for proxied in [false, true] {
+    for (proxied, collapsed) in [(false, false), (true, false), (true, true)] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -845,6 +842,38 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
             ..Default::default()
         };
         node.id = node.derive_id();
+        let node_id = node.id.to_string();
+        let group_name = "dns-root";
+        let groups = if collapsed {
+            vec![honk_config::group::Group {
+                name: group_name.into(),
+                final_outbound: Some("direct".into()),
+                exit: Some(node.name.clone()),
+                ..Default::default()
+            }]
+        } else {
+            Vec::new()
+        };
+        let outbound_config = honk_config::Config {
+            groups: groups.clone(),
+            nodes: vec![node.clone()],
+            ..Default::default()
+        };
+        let catalogs = crate::observe::catalog::Catalog::new(&outbound_config);
+        let catalog = catalogs.snapshot();
+        let manager = collapsed.then(|| {
+            let manager = Arc::new(honk_outbound::group::GroupManager::new(
+                &groups,
+                std::slice::from_ref(&node),
+            ));
+            catalogs.install_prepared(catalogs.prepare(&honk_config::Config::default()));
+            catalogs.install_prepared(catalogs.prepare(&outbound_config));
+            assert_ne!(
+                catalog.groups[group_name],
+                catalogs.snapshot().groups[group_name]
+            );
+            manager
+        });
         let mut config = DnsConfig {
             upstream: vec![DnsUpstream {
                 name: "wire".into(),
@@ -855,7 +884,13 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                 },
                 protocol: DnsProtocol::Tcp,
                 tls_server_name: None,
-                outbound: proxied.then(|| node.name.clone()),
+                outbound: proxied.then(|| {
+                    if collapsed {
+                        group_name.to_owned()
+                    } else {
+                        node.name.clone()
+                    }
+                }),
             }],
             ..Default::default()
         };
@@ -869,10 +904,13 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                     crate::proxy::ProxyRegistry::default_resolver().unwrap(),
                 )),
                 vec![node],
-                Vec::new(),
+                groups,
             )
             .unwrap(),
         );
+        if let Some(manager) = manager {
+            pool.set_group_manager_snapshot(manager);
+        }
         let service = DnsService::with_forwarder(Arc::new(DnsForwarder::new(
             pool.clone(),
             Arc::new(tokio::sync::Mutex::new(DnsCache::new(64))),
@@ -891,7 +929,10 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
             let query = build_dns_query(name, 1);
             let response = tokio::time::timeout(
                 Duration::from_secs(3),
-                observation.scope(service.resolve(&query, IngressProfile::Internal)),
+                scope_catalog(
+                    Some(catalog.clone()),
+                    observation.scope(service.resolve(&query, IngressProfile::Internal)),
+                ),
             )
             .await
             .unwrap()
@@ -919,6 +960,23 @@ async fn dns_proxy_hostname_and_warm_tcp_keep_query_purpose_and_lineage() {
                         && step["data"]["status"] == "started"
                 })
                 .unwrap();
+            if proxied {
+                assert_eq!(leaf["data"]["leaf_node_id"], node_id);
+                assert_eq!(leaf["data"]["leaf_node_name"], "dns-proxy");
+            }
+            let path = leaf["data"]["selection_path"].as_array().unwrap();
+            if collapsed {
+                assert_eq!(path.len(), 1);
+                assert_eq!(path[0]["group_id"], catalog.groups[group_name]);
+                assert_eq!(
+                    path[0]["member_id"],
+                    honk_config::config::DIRECT_NODE_ID.to_string()
+                );
+                assert_eq!(path[0]["member_name"], "direct");
+                assert_eq!(path[0]["reason"], "final_selected");
+            } else {
+                assert!(path.is_empty());
+            }
             let exchange = rows
                 .iter()
                 .find(|row| {

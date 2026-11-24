@@ -71,14 +71,7 @@ async fn official_xray_carries_auto_udp_through_a_chain() {
         land.vless().expect("VLESS config").udp_encoding,
         VlessUdpEncoding::Auto
     );
-    let mut via = Node {
-        name: "via".into(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: vec!["front".into(), "land".into()],
-        },
-        ..Default::default()
-    };
-    via.id = via.derive_id();
+    let via = Node::chain_from_nodes("via", &[&front, &land]).expect("bind UDP chain");
     let generation = std::sync::Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build(&[via.clone(), front, land])
             .expect("build chain generation"),

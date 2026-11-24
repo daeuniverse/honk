@@ -177,6 +177,149 @@ pub struct RoutingFactMaps {
     pub mac: Vec<(LpmKey, DomainRouting)>,
 }
 
+const USER_SLOTS: usize = OutboundIndex::MustRules as usize - OutboundIndex::UserBase as usize;
+
+#[derive(Clone, Copy, Default)]
+struct ColdUdpSlot {
+    // Even an ordinary owner needs a start generation if a later rebind enables chains.
+    owner_since: u64,
+    // Zero accepts generationless handoffs until this slot first requires enforcement.
+    minimum: u64,
+    composed: bool,
+    rebound: bool,
+    pending: bool,
+    interrupted: bool,
+}
+
+/// The compiled policy and the history of its bounded numeric UDP namespace share one writer.
+pub(super) struct ActiveRoutingPlan {
+    pub(super) plan: Arc<RoutingPushPlan>,
+    slots: Box<[ColdUdpSlot; USER_SLOTS]>,
+    rebind_requires_commit: bool,
+    // A weak pointer retains allocation identity without holding old config content.
+    manager_config: std::sync::Weak<honk_config::Config>,
+}
+
+pub(super) type SharedRoutingPlan = Arc<parking_lot::RwLock<ActiveRoutingPlan>>;
+
+impl ActiveRoutingPlan {
+    pub(super) fn new(
+        plan: Arc<RoutingPushPlan>,
+        manager: &honk_outbound::group::GroupManager,
+        generation: u64,
+        config: &Arc<honk_config::Config>,
+    ) -> Self {
+        let mut slots = Box::new([ColdUdpSlot::default(); USER_SLOTS]);
+        for (slot, (_, name)) in slots.iter_mut().zip(&plan.group_slots) {
+            slot.owner_since = generation;
+            slot.composed = manager.group_can_compose_udp(name);
+        }
+        Self {
+            plan,
+            slots,
+            rebind_requires_commit: false,
+            manager_config: Arc::downgrade(config),
+        }
+    }
+
+    pub(super) fn manager_matches(&self, config: &Arc<honk_config::Config>) -> bool {
+        std::ptr::eq(self.manager_config.as_ptr(), Arc::as_ptr(config))
+    }
+
+    pub(super) fn note_manager_config(&mut self, config: &Arc<honk_config::Config>) {
+        self.manager_config = Arc::downgrade(config);
+    }
+
+    pub(super) fn rebind_requires_commit(&self) -> bool {
+        self.rebind_requires_commit
+    }
+
+    pub(super) fn cold_udp_group(&self, outbound: u8, supplied: u64) -> Option<&str> {
+        let index = outbound.checked_sub(OutboundIndex::UserBase as u8)?;
+        let slot = self.slots.get(usize::from(index))?;
+        if slot.pending || supplied < slot.minimum {
+            return None;
+        }
+        self.plan.group_name(outbound)
+    }
+
+    pub(super) fn rebind_manager(
+        &mut self,
+        old: &honk_outbound::group::GroupManager,
+        new: &honk_outbound::group::GroupManager,
+        config: &Arc<honk_config::Config>,
+    ) {
+        self.rebind_requires_commit = false;
+        for (slot, (_, name)) in self.slots.iter_mut().zip(&self.plan.group_slots) {
+            let before = old.group_can_compose_udp(name);
+            let after = new.group_can_compose_udp(name);
+            let presence_changed = old.group(name).is_some() != new.group(name).is_some();
+            slot.interrupted |= presence_changed;
+            if slot.interrupted && (before || after || slot.composed || slot.minimum != 0) {
+                // Without a distinct root generation, a partial rebind cannot prove
+                // that an older handoff belongs to the reintroduced owner.
+                slot.pending = true;
+            } else if before != after {
+                slot.minimum = slot.minimum.max(slot.owner_since);
+            }
+            slot.rebound = after != slot.composed;
+            self.rebind_requires_commit |= slot.pending || slot.rebound;
+        }
+        self.note_manager_config(config);
+    }
+
+    pub(super) fn composition(
+        plan: &RoutingPushPlan,
+        manager: &honk_outbound::group::GroupManager,
+    ) -> [bool; USER_SLOTS] {
+        let mut capable = [false; USER_SLOTS];
+        for (value, (_, name)) in capable.iter_mut().zip(&plan.group_slots) {
+            *value = manager.group_can_compose_udp(name);
+        }
+        capable
+    }
+
+    pub(super) fn needs_udp_publication(&self, capable: &[bool; USER_SLOTS]) -> bool {
+        self.slots
+            .iter()
+            .zip(capable)
+            .any(|(slot, &after)| slot.pending || slot.rebound || slot.composed != after)
+    }
+
+    pub(super) fn publish(
+        &mut self,
+        published_plan: Option<&Arc<RoutingPushPlan>>,
+        capable: &[bool; USER_SLOTS],
+        generation: u64,
+        config: &Arc<honk_config::Config>,
+    ) {
+        if let Some(next) = published_plan {
+            let count = self.plan.group_slots.len().max(next.group_slots.len());
+            for (index, slot) in self.slots[..count].iter_mut().enumerate() {
+                let after = capable[index];
+                let renamed = self.plan.group_slots.get(index) != next.group_slots.get(index);
+                if slot.pending
+                    || slot.rebound
+                    || slot.composed != after
+                    || (renamed && (slot.minimum != 0 || after))
+                {
+                    slot.minimum = generation;
+                }
+                if renamed || slot.interrupted {
+                    slot.owner_since = generation;
+                }
+                slot.composed = after;
+                slot.rebound = false;
+                slot.pending = false;
+                slot.interrupted = false;
+            }
+            self.plan = Arc::clone(next);
+        }
+        self.rebind_requires_commit = false;
+        self.note_manager_config(config);
+    }
+}
+
 /// Immutable, validated inputs for one policy generation.
 #[derive(Debug, Clone)]
 pub struct RoutingPushPlan {
@@ -188,15 +331,40 @@ pub struct RoutingPushPlan {
     pub has_domain_rules: bool,
     pub(crate) domain_predicate_count: usize,
     pub(crate) trace_enabled: bool,
+    /// The control plane's committed layout, in numeric slot order.
+    pub(super) group_slots: Vec<(u8, String)>,
 }
 
 impl RoutingPushPlan {
+    pub(super) fn matches_group_slots(&self, groups: &[honk_config::group::Group]) -> bool {
+        self.group_slots
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .eq(groups.iter().map(|group| group.name.as_str()))
+    }
+
+    pub(super) fn group_name(&self, outbound: u8) -> Option<&str> {
+        let index = outbound.checked_sub(OutboundIndex::UserBase as u8)?;
+        let (slot, name) = self.group_slots.get(usize::from(index))?;
+        (*slot == outbound).then_some(name.as_str())
+    }
+
+    #[cfg(any(feature = "ebpf", test))]
+    pub(super) fn group_index(&self, name: &str) -> Option<u8> {
+        // The compiler uses the last declaration when names repeat.
+        self.group_slots
+            .iter()
+            .rev()
+            .find_map(|(slot, candidate)| (candidate == name).then_some(*slot))
+    }
+
     pub fn semantically_eq(&self, other: &Self) -> bool {
         self.fallback == other.fallback
             && self.features == other.features
             && self.trace_enabled == other.trace_enabled
             && self.fingerprint == other.fingerprint
             && self.has_domain_rules == other.has_domain_rules
+            && self.group_slots == other.group_slots
             && self.domain_predicate_count == other.domain_predicate_count
             && self.rules == other.rules
             && fact_maps_equal(&self.facts, &other.facts)
@@ -436,6 +604,7 @@ impl RoutingPushPlan {
             has_domain_rules: has_domain,
             domain_predicate_count,
             trace_enabled: false,
+            group_slots: Vec::new(),
         })
     }
 }

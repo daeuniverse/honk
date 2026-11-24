@@ -38,6 +38,36 @@ pub(crate) fn build_tuples_key(
     key
 }
 
+/// The original numeric owner survives sniffing and explicitly selected replacements.
+pub(super) struct UdpGroupProof {
+    slot: u8,
+    generation: u64,
+    plan: Arc<routing_matcher::RoutingPushPlan>,
+}
+
+impl UdpGroupProof {
+    pub(super) fn name(&self) -> &str {
+        self.plan
+            .group_name(self.slot)
+            .expect("captured UDP group slot")
+    }
+}
+
+fn check_udp_group(
+    manager: &GroupManager,
+    routing: &routing_matcher::ActiveRoutingPlan,
+    slot: u8,
+    generation: u64,
+    expected_name: Option<&str>,
+) -> anyhow::Result<()> {
+    if routing.cold_udp_group(slot, generation).is_none_or(|name| {
+        expected_name.is_some_and(|expected| name != expected) || manager.group(name).is_none()
+    }) {
+        return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+    }
+    Ok(())
+}
+
 /// Result from the eBPF routing handoff map lookup.
 #[derive(Debug, Clone)]
 pub(in crate::control) struct HandoffResult {
@@ -471,6 +501,101 @@ impl ControlPlaneHandle {
             }
         });
     }
+    /// Resolve an index while the caller holds the backend read for its publication.
+    pub(in crate::control) fn committed_udp_group<'a>(
+        &self,
+        manager: &'a GroupManager,
+        index: u8,
+    ) -> Option<&'a Group> {
+        manager.group(self.active_routing_plan.read().plan.group_name(index)?)
+    }
+
+    #[cfg(test)]
+    pub(in crate::control) fn resolve_udp_handoff_group(
+        &self,
+        backend: &dyn EbpfBackend,
+        outbound: u8,
+        supplied: u64,
+    ) -> anyhow::Result<String> {
+        Ok(self
+            .capture_udp_group(backend, outbound, supplied)?
+            .name()
+            .to_owned())
+    }
+
+    /// Capture the original slot under the backend read that verified the UDP owner.
+    pub(super) fn capture_udp_group(
+        &self,
+        backend: &dyn EbpfBackend,
+        slot: u8,
+        generation: u64,
+    ) -> anyhow::Result<UdpGroupProof> {
+        let manager = self.group_manager.read();
+        let routing = self.active_routing_plan.read();
+        if generation > backend.routing_policy_generation() {
+            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
+        }
+        check_udp_group(&manager, &routing, slot, generation, None)?;
+        Ok(UdpGroupProof {
+            slot,
+            generation,
+            plan: Arc::clone(&routing.plan),
+        })
+    }
+
+    pub(super) fn revalidate_udp_group(
+        &self,
+        manager: &GroupManager,
+        original: &UdpGroupProof,
+    ) -> anyhow::Result<()> {
+        // The upper bound was checked against the monotone kernel generation at capture.
+        let routing = self.active_routing_plan.read();
+        let expected_name = (!Arc::ptr_eq(&routing.plan, &original.plan)).then(|| original.name());
+        check_udp_group(
+            manager,
+            &routing,
+            original.slot,
+            original.generation,
+            expected_name,
+        )
+    }
+
+    /// A staged node has no kernel group slot. Only a selected group can bind a user slot.
+    #[cfg(any(feature = "ebpf", test))]
+    pub(in crate::control) fn staged_udp_outbound(
+        &self,
+        config: &Config,
+        manager: &GroupManager,
+        name: &str,
+        constraint: OutboundConstraint,
+    ) -> anyhow::Result<u8> {
+        match constraint {
+            #[cfg(all(feature = "native-api", any(feature = "clash-api", test)))]
+            OutboundConstraint::Node(_) => return Ok(OutboundIndex::ControlPlaneRouting as u8),
+            #[cfg(feature = "native-api")]
+            OutboundConstraint::Unavailable => anyhow::bail!("UDP selection owner is unavailable"),
+            OutboundConstraint::Any => match name {
+                "direct" => return Ok(OutboundIndex::Direct as u8),
+                "block" => return Ok(OutboundIndex::Block as u8),
+                "must_rules" => return Ok(OutboundIndex::MustRules as u8),
+                "control_plane_routing" => return Ok(OutboundIndex::ControlPlaneRouting as u8),
+                _ if config.nodes.iter().any(|node| node.name == name) => {
+                    return Ok(OutboundIndex::ControlPlaneRouting as u8);
+                }
+                _ => {}
+            },
+            OutboundConstraint::Group => {}
+        }
+        let slot = self.active_routing_plan.read().plan.group_index(name);
+        match (slot, manager.group(name)) {
+            (Some(index), Some(_)) => Ok(index),
+            (None, None) if matches!(constraint, OutboundConstraint::Any) => {
+                Ok(OutboundIndex::ControlPlaneRouting as u8)
+            }
+            _ => anyhow::bail!("UDP selection has no committed group owner"),
+        }
+    }
+
     /// Read immutable UDP admission metadata without consuming tuple ownership.
     /// The caller carries its original incarnation through deferred admission.
     pub(super) async fn lookup_udp_handoff(
@@ -478,25 +603,41 @@ impl ControlPlaneHandle {
         tuples: &TuplesKey,
         owner: crate::ebpf::UdpFlowOwner,
         #[cfg(feature = "native-api")] observation: &ConnectionObservation,
-    ) -> anyhow::Result<Option<HandoffResult>> {
+    ) -> anyhow::Result<(Option<HandoffResult>, Option<UdpGroupProof>)> {
         let backend = self.ebpf.read().await;
-        let entry = backend.verify_udp_admission(tuples, owner)?;
-        Ok(entry
-            .filter(|entry| {
-                tuples.dst_port != 53
-                    || owner.token != 0
-                    || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
-                        && entry.result.must == 0)
-            })
-            .map(|entry| {
-                HandoffResult::captured(
-                    backend.as_ref(),
-                    tuples,
-                    entry,
-                    #[cfg(feature = "native-api")]
-                    observation,
-                )
-            }))
+        let (entry, cached_group) = backend.verify_udp_admission(tuples, owner)?;
+        let entry = entry.filter(|entry| {
+            tuples.dst_port != 53
+                || owner.token != 0
+                || (entry.result.outbound == OutboundIndex::ControlPlaneRouting as u8
+                    && entry.result.must == 0)
+        });
+        let Some(entry) = entry else {
+            // No auxiliary record means no generation proof. Do not manufacture a handoff.
+            let group = cached_group
+                .map(|slot| self.capture_udp_group(backend.as_ref(), slot, 0))
+                .transpose()?;
+            return Ok((None, group));
+        };
+        let group = if (OutboundIndex::UserBase as u8..OutboundIndex::MustRules as u8)
+            .contains(&entry.result.outbound)
+        {
+            Some(self.capture_udp_group(
+                backend.as_ref(),
+                entry.result.outbound,
+                entry.routing_generation,
+            )?)
+        } else {
+            None
+        };
+        let handoff = HandoffResult::captured(
+            backend.as_ref(),
+            tuples,
+            entry,
+            #[cfg(feature = "native-api")]
+            observation,
+        );
+        Ok((Some(handoff), group))
     }
 
     /// sock_ops publishes a child's proof after the kernel queued it; measured on x86 the gap is
@@ -569,29 +710,9 @@ impl ControlPlaneHandle {
         }
     }
 
-    #[cfg(feature = "ebpf")]
-    pub(super) async fn outbound_name_to_index(&self, outbound_name: &str) -> u8 {
-        match outbound_name {
-            "direct" => OutboundIndex::Direct as u8,
-            "block" => OutboundIndex::Block as u8,
-            "must_rules" => OutboundIndex::MustRules as u8,
-            "control_plane_routing" => OutboundIndex::ControlPlaneRouting as u8,
-            _ => {
-                let config = self.config.read().await;
-                config
-                    .groups
-                    .iter()
-                    .position(|group| group.name == outbound_name)
-                    .and_then(|index| u8::try_from(index).ok())
-                    .and_then(|index| (OutboundIndex::UserBase as u8).checked_add(index))
-                    .unwrap_or(OutboundIndex::ControlPlaneRouting as u8)
-            }
-        }
-    }
-
     /// Clash mode override (approximate clash semantics), applied after the
     /// eBPF handoff / userspace Router produced an outbound and before
-    /// `resolve_outbound_nodes`:
+    /// the outbound dial plan is resolved:
     ///
     /// - mode `Direct` forces `direct`;
     /// - mode `Global` forces the current GLOBAL selection (a group or node
@@ -603,18 +724,32 @@ impl ControlPlaneHandle {
     ///
     /// The route's rule mark survives only on a routed `direct` flow that
     /// remains `direct`.
-    pub(super) async fn apply_mode_override(&self, route: &mut RoutingDecision) -> ModeDecision {
-        let decision = self.mode_override(route.outbound.clone(), route.must).await;
+    pub(super) async fn apply_mode_override(
+        &self,
+        route: &mut RoutingDecision,
+        constraint: OutboundConstraint,
+    ) -> ModeDecision {
+        let decision = self
+            .mode_override(route.outbound.clone(), route.must, constraint)
+            .await;
+        if matches!(constraint, OutboundConstraint::Group) {
+            route.mark = None;
+        }
         let replacement = (decision.name != route.outbound).then(|| decision.name.clone());
         route.apply_final_outbound(replacement);
         decision
     }
 
     /// Preserve exact native target identity until the selected generation is pinned.
-    async fn mode_override(&self, outbound_name: String, must: bool) -> ModeDecision {
+    async fn mode_override(
+        &self,
+        outbound_name: String,
+        must: bool,
+        constraint: OutboundConstraint,
+    ) -> ModeDecision {
         let mut result = ModeDecision {
             name: outbound_name,
-            constraint: Default::default(),
+            constraint,
             #[cfg(feature = "native-api")]
             group_id: None,
         };
@@ -631,13 +766,20 @@ impl ControlPlaneHandle {
             let state = mode_state.read().clone();
             let Some(native) = &self.native else {
                 result.name = "block".into();
+                result.constraint = OutboundConstraint::Any;
                 return result;
             };
             let catalog = native.catalog.snapshot();
             match state.native_override(&result.name, must, &config, &catalog.groups) {
                 crate::mode::ModeOverride::Unchanged => {}
-                crate::mode::ModeOverride::Direct => result.name = "direct".into(),
-                crate::mode::ModeOverride::Block => result.name = "block".into(),
+                crate::mode::ModeOverride::Direct => {
+                    result.name = "direct".into();
+                    result.constraint = OutboundConstraint::Any;
+                }
+                crate::mode::ModeOverride::Block => {
+                    result.name = "block".into();
+                    result.constraint = OutboundConstraint::Any;
+                }
                 crate::mode::ModeOverride::Node(id) => {
                     result.name = config
                         .nodes
@@ -650,6 +792,8 @@ impl ControlPlaneHandle {
                 }
                 crate::mode::ModeOverride::Group(name) => {
                     result.group_id = catalog.groups.get(&name).cloned();
+                    // The validated catalog target supersedes any incoming handoff.
+                    result.constraint = OutboundConstraint::Any;
                     result.name = name;
                 }
             }
@@ -665,6 +809,9 @@ impl ControlPlaneHandle {
             false
         };
         result.name = state.override_outbound(&result.name, false, selection_resolvable);
+        if state.is_direct() || selection_resolvable || result.name == "block" {
+            result.constraint = OutboundConstraint::Any;
+        }
         result
     }
 }

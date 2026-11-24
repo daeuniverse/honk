@@ -234,7 +234,7 @@ Behaviour that looks like a defect but is deliberate. Reviewers skip these unles
 | VLESS permits UDP/443 by default, including base Vision | users block QUIC through routing | `.agents/rules/configuration.md` |
 | VLESS Auto keeps native UDP on 53/443 without Vision instead of Single XUDP | Single XUDP measured about half the goodput and 1.9-3.3× the CPU per MB | `.agents/rules/outbound.md` (UDP transport invariant) |
 | A dead outbound drops new flows; there is no implicit `direct` fallback | fail-closed | Runtime invariants: Fail-closed on dead outbounds |
-| A group `exit` is never probed because it is an exit; an exit no probe registered counts as alive, so its group keeps dialing through it after traffic marks it dead | a direct probe can mark dead an exit that is reachable only through the hops in front of it | maintainer, 2026-11-13; `.agents/rules/outbound.md` |
+| A group exit needs no independent direct probe; confirmed faults still gate the affected proxy or path | an exit may be reachable only through a front | [Exit liveness](doc/en/reference/groups.md#exit-liveness) |
 | Real LAN self-protection only warns; it rejects no configuration and synthesizes no rules | advisory, not a connectivity guarantee | `.agents/rules/configuration.md` (Interface modes) |
 | Native probes, geodata and shared downloads have no address or port allowlist | whoever writes the configuration or controls subscription content decides those targets; provider content is trusted configuration | `.agents/rules/configuration.md`, `.agents/rules/security.md` |
 | Listener-secret values shorter than eight bytes are neither masked nor refused | not recorded | `.agents/rules/security.md` (Native source writes) |
@@ -265,7 +265,7 @@ Each item is an invariant named in this file for the High risk class and `CONTRI
   - **Datapath admission:** admission opens after every internal hook, listener and queue is ready, and closes before listener teardown.
   - **NFQUEUE readiness and ownership**, **Fragmented LAN UDP53**, **Token-checked terminal state**, **NFQUEUE lifecycle.**
   - **must/block are final:** Clash mode override leaves `block` and `must` results in force.
-  - **Fail-closed on dead outbounds** and **group-OR connectivity pushes** with the sole-TCP-leaf exception.
+  - **Fail-closed on dead outbounds** and **group connectivity** using ordinary group-OR or routed eligibility, with the sole-TCP-leaf exception.
   - **Internal traffic is never proxied; broadcast/multicast passes through eBPF.**
   - **Reserved outbound indices:** `0 Direct | 1 Block | 2+ user groups | 0xFC MustRules | 0xFD ControlPlaneRouting | 0xFE OR | 0xFF AND`.
 - **UDP transport invariant** and VLESS carrier ownership: [`.agents/rules/outbound.md`](.agents/rules/outbound.md#udp-transport-invariant); gRPC and XHTTP replay no application bytes ([gRPC and XHTTP](.agents/rules/outbound.md#grpc-and-xhttp)).

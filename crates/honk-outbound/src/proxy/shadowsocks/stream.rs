@@ -1,6 +1,6 @@
 //! Shadowsocks TCP stream as an inline codec: `AsyncRead`/`AsyncWrite`
-//! implemented directly over the server socket, no relay task and no
-//! duplex. The control plane's `copy_bidirectional` drives
+//! implemented directly over the carrier without a relay task or duplex bridge.
+//! The control plane's `copy_bidirectional` drives
 //! encryption/decryption in the caller's task, removing two task hops and
 //! two copies per byte from the old `shadowsocks_relay` data path (single
 //! core saturated ~1.15Gbps → target dae's 1.5Gbps+).
@@ -9,6 +9,7 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::proxy::AsyncReadWrite;
 use crate::transport_quality::tcp::TcpPressure;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -25,10 +26,7 @@ use super::{
 const SEND_BUF_CAP: usize = RELAY_BATCH + 8192;
 const RECV_BUF_CAP: usize = RELAY_BATCH + 8192;
 
-/// Response-prologue driver for 2022 connections: read and validate the
-/// server's salt + fixed header (+ first payload chunk) from the read
-/// path, not inline in `dial` — servers only answer after the first client
-/// payload chunk, so reading the response in `dial` deadlocks.
+/// Legacy and 2022 response prologues run on the read path because servers may wait for payload.
 type PrologueFuture<R> = Pin<
     Box<dyn std::future::Future<Output = io::Result<(R, AeadCipher, Vec<u8>, Vec<u8>)>> + Send>,
 >;
@@ -62,10 +60,7 @@ impl SsTransport for TcpStream {
     }
 }
 
-impl<S> SsTransport for Box<S>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + ?Sized + 'static,
-{
+impl SsTransport for Box<dyn AsyncReadWrite> {
     type Read = ReadHalf<Self>;
     type Write = WriteHalf<Self>;
 
@@ -79,14 +74,12 @@ where
     }
 }
 
-/// Stream state for one Shadowsocks TCP connection after the salt/header
-/// prologue (which `dial` completes before returning this type).
-pub(crate) struct SsStream<T: SsTransport = TcpStream> {
+/// Inline Shadowsocks codec over a carrier with a deferred response prologue.
+pub(crate) struct SsStream<T: SsTransport> {
     write_half: T::Write,
     pressure: TcpPressure,
     peer_authenticated: bool,
-    /// Read half, parked inside the pending 2022 prologue future until the
-    /// response header has been consumed.
+    /// The response prologue owns the carrier's read half until it completes.
     read_half: Option<T::Read>,
     send_cipher: AeadCipher,
     send_nonce: Vec<u8>,
@@ -96,7 +89,7 @@ pub(crate) struct SsStream<T: SsTransport = TcpStream> {
     send_off: usize,
     recv_cipher: Option<AeadCipher>,
     recv_nonce: Vec<u8>,
-    /// 2022 only: pending response prologue (salt + fixed header).
+    /// Pending response salt (legacy) or salt, header, and first chunk (2022).
     recv_prologue: Option<PrologueFuture<T::Read>>,
     recv_pending_len: Option<u16>,
     /// Raw inbound bytes: plaintext at the front (`plain_start..plain_end`),
@@ -202,7 +195,7 @@ impl<T: SsTransport> SsStream<T> {
     }
 
     /// Preload decrypted plaintext (the prologue's first response chunk) so
-    /// the first `poll_read` serves it before touching the socket.
+    /// the first `poll_read` serves it before reading from the carrier.
     pub(crate) fn prefill_plaintext(&mut self, data: &[u8]) {
         self.recv_buf[..data.len()].copy_from_slice(data);
         self.plain_start = 0;
@@ -232,7 +225,7 @@ impl<T: SsTransport> AsyncRead for SsStream<T> {
         cx: &mut Context<'_>,
         out: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        // Drive a pending 2022 response prologue first.
+        // The response prologue supplies the cipher before payload decryption.
         if self.recv_prologue.is_some() {
             let this = self.as_mut().get_mut();
             let fut = this.recv_prologue.as_mut().expect("checked above");
@@ -441,7 +434,7 @@ impl<T: SsTransport> AsyncWrite for SsStream<T> {
 }
 
 impl<T: SsTransport> SsStream<T> {
-    /// Drive the sealed buffer toward the socket; `Ok(())` means fully
+    /// Drive the sealed buffer toward the carrier. `Ok(())` means fully
     /// drained (buffer reset).
     fn poll_flush_ciphertext(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         while self.send_off < self.send_buf.len() {
@@ -563,7 +556,6 @@ impl Ss2022Prologue {
     }
 }
 
-/// Flush helper for the legacy prologue path (one-shot sealed write).
 pub(crate) async fn write_all_sealed<W: AsyncWrite + Unpin + ?Sized>(
     inner: &mut W,
     cipher: &AeadCipher,

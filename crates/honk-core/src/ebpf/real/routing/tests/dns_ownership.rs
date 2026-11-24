@@ -271,6 +271,10 @@ fn load_classifier(backend: &mut RealEbpfBackend, name: &str) {
 
 fn run(backend: &RealEbpfBackend, name: &str, packet: &[u8], input: SkbInput) -> Run {
     let object = backend.bpf().unwrap();
+    run_with_object(&object, name, packet, input)
+}
+
+fn run_with_object(object: &aya::Ebpf, name: &str, packet: &[u8], input: SkbInput) -> Run {
     let program: &SchedClassifier = object.program(name).unwrap().try_into().unwrap();
     let mut context: __sk_buff = unsafe { mem::zeroed() };
     context.mark = input.mark;

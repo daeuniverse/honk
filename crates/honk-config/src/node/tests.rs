@@ -557,6 +557,10 @@ fn tunneled_udp_follows_the_exit_protocol_and_vless_path() {
             link("trojan://secret@example.com:443?type=ws&path=%2Fws"),
             true,
         ),
+        (
+            link("trojan://secret@127.0.0.1:443?ech=1&type=ws&host=a.example"),
+            false,
+        ),
         (trojan_tcp, false),
         (
             link("trojan://secret@example.com:443?type=xhttp&path=%2Fx"),

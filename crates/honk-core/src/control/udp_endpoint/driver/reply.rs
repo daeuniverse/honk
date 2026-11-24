@@ -121,6 +121,12 @@ pub(super) async fn receive_loop(
         endpoint.score_reply(n as u64);
         outbound_tracker.add_bytes(0, n as u64);
         if endpoint.take_alive_report_slot() {
+            if let Some(evidence) = &endpoint.evidence {
+                evidence.report_reply();
+                if evidence.is_route() {
+                    continue;
+                }
+            }
             alive_set.report_available_traffic(
                 endpoint.node_id,
                 honk_outbound::alive::ProbeDomain::DataUdp,

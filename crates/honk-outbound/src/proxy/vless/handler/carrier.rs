@@ -95,9 +95,8 @@ impl VLessHandler {
         })
     }
 
-    /// The plain VLESS request over `carrier`, a stream tunneled through
-    /// earlier hops. Vision Direct needs this hop's own TLS socket, and
-    /// Encryption and multiplexing are not tunneled yet.
+    /// Vision needs this hop's own TLS socket. Tunnels refuse VLESS Encryption and TCP mux
+    /// (H2 or Cool). UDP-only mux keeps the plain TCP request over `carrier`.
     pub(super) async fn dial_tunneled(
         &self,
         node: &Node,

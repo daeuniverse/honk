@@ -230,3 +230,177 @@ fn related_context_requires_its_networks_committed_pool() {
         1
     );
 }
+
+fn packet_score_fixture() -> (Node, Node) {
+    (
+        node("front"),
+        Node {
+            outbound: honk_config::node::OutboundConfig::Trojan(Default::default()),
+            ..node("land")
+        },
+    )
+}
+
+#[test]
+fn packet_dns_cannot_replace_an_ordinary_subgroup_representative() {
+    let (front, land) = packet_score_fixture();
+    let child = Group {
+        policy: GroupPolicy::Fallback,
+        exit: Some(land.name.clone()),
+        ..group("child", &[front.clone(), land.clone()])
+    };
+    let parent = Group {
+        final_outbound: Some("block".into()),
+        ..group_with_children("score", &[], &["child"])
+    };
+    let manager = GroupManager::new(&[child, parent], &[front.clone(), land.clone()]);
+    let ordinary = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let ordinary_plan = manager.selection_plan_for_target("score", &ordinary);
+    assert_eq!(ordinary_plan.entries[0].node.id, front.id);
+    let held = ordinary_plan.entries[0].feedback.as_ref().unwrap();
+    let reasons = manager.score_reason_snapshot();
+    let budget = manager.score_budget_counters("score", SelectionNetwork::Udp);
+    let packet = ScoreSelectionContext {
+        target: Some(ScoreTarget::domain("dns.example", 853)),
+        target_family: Some(IpVersion::V4),
+        ..ordinary
+    };
+    let (plan, _) = manager.node_packet_dial_plan("score", &packet, None);
+    assert_eq!(plan.entries[0].node.id, honk_config::config::BLOCK_NODE_ID);
+    assert_eq!(manager.score_reason_snapshot(), reasons);
+    assert_eq!(
+        manager.score_budget_counters("score", SelectionNetwork::Udp),
+        budget
+    );
+    held.begin().unwrap().finish(ScoreOutcome::Cancelled);
+    let state = manager.score_state();
+    let inner = state.inner.lock();
+    let pool = inner.evaluation("score", SelectionNetwork::Udp).unwrap();
+    assert!(pool.evaluates(front.id));
+    assert!(!pool.evaluates(land.id));
+}
+
+#[test]
+fn cold_packet_dns_uses_the_bounded_unrestricted_pool_and_keeps_begin_fenced() {
+    for in_pool in [true, false] {
+        let (front, mut land) = packet_score_fixture();
+        land.id = Uuid::from_u128(if in_pool { 1 } else { u128::MAX });
+        let (front_id, land_id) = (front.id, land.id);
+        let mut nodes = vec![front, land];
+        nodes.extend((0..6).map(|index| node(&format!("other-{index}"))));
+        let routed = Group {
+            exit: Some("land".into()),
+            ..group("score", &nodes)
+        };
+        let ordinary = ScoreSelectionContext::aggregate(
+            SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            IpVersion::V4,
+        );
+        let packet = ScoreSelectionContext {
+            target: Some(ScoreTarget::domain("dns.example", 853)),
+            target_family: Some(IpVersion::V4),
+            ..ordinary.clone()
+        };
+        let ordinary_manager = GroupManager::new(std::slice::from_ref(&routed), &nodes);
+        let ordinary_plan = ordinary_manager.selection_plan_for_target("score", &ordinary);
+        assert_eq!(ordinary_plan.entries[0].node.id, front_id);
+        let members = |manager: &GroupManager| {
+            let state = manager.score_state();
+            let inner = state.inner.lock();
+            let pool = inner.evaluation("score", SelectionNetwork::Udp).unwrap();
+            nodes
+                .iter()
+                .filter(|node| pool.evaluates(node.id))
+                .map(|node| node.id)
+                .collect::<Vec<_>>()
+        };
+        let expected = members(&ordinary_manager);
+        assert_eq!(expected.len(), 3);
+        assert_eq!(expected.contains(&land_id), in_pool);
+        let manager = GroupManager::new(&[routed], &nodes);
+        let (plan, _) = manager.node_packet_dial_plan("score", &packet, None);
+        assert_eq!(members(&manager), expected);
+        assert_eq!(
+            manager
+                .score_budget_counters("score", SelectionNetwork::Udp)
+                .reserved,
+            0
+        );
+        if in_pool {
+            let attempt = plan.entries[0].feedback.as_ref().unwrap();
+            assert_eq!(plan.entries[0].node.id, land_id);
+            attempt.begin().unwrap().finish(ScoreOutcome::Cancelled);
+            *manager
+                .score_state()
+                .inner
+                .lock()
+                .evaluation_mut("score", SelectionNetwork::Udp) = EvaluationSet::default();
+            assert!(matches!(
+                attempt.begin(),
+                Err(crate::proxy::PacketRejection::Cancelled)
+            ));
+        } else {
+            assert!(plan.entries.is_empty());
+        }
+    }
+}
+
+#[test]
+fn packet_ipv4_fallback_cannot_seed_a_pool_that_ordinary_ipv6_would_not_use() {
+    let (front, land) = packet_score_fixture();
+    let safe = node("safe");
+    let child = Group {
+        policy: GroupPolicy::Selector,
+        exit: Some(land.name.clone()),
+        ..group("route", std::slice::from_ref(&front))
+    };
+    let parent = Group {
+        final_outbound: Some("block".into()),
+        ..group_with_children("score", std::slice::from_ref(&safe), &["route"])
+    };
+    let packet = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V6,
+    );
+    let safe_id = safe.id;
+    for ordinary_has_v6 in [true, false] {
+        let alive = Arc::new(crate::alive::AliveDialerSet::new());
+        for domain in [ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(safe_id, domain, IpVersion::V6);
+            if !ordinary_has_v6 {
+                alive.report_unavailable_forced(front.id, domain, IpVersion::V6);
+            }
+        }
+        let manager = GroupManager::with_alive_set(
+            &[child.clone(), parent.clone()],
+            &[front.clone(), land.clone(), safe.clone()],
+            Some(alive),
+        );
+        let (plan, _) = manager.node_packet_dial_plan("score", &packet, None);
+        let entry = &plan.entries[0];
+        if ordinary_has_v6 {
+            assert_eq!(entry.node.id, honk_config::config::BLOCK_NODE_ID);
+            assert!(
+                !manager
+                    .score_state()
+                    .score_pool_initialized("score", SelectionNetwork::Udp)
+            );
+        } else {
+            assert_eq!(entry.node.id, safe_id);
+            assert_eq!(plan.health_family, IpVersion::V4);
+            entry
+                .feedback
+                .as_ref()
+                .unwrap()
+                .begin()
+                .unwrap()
+                .finish(ScoreOutcome::Cancelled);
+        }
+    }
+}

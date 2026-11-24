@@ -454,6 +454,43 @@ impl UdpEndpointPool {
         }
     }
 
+    pub(in crate::control) fn remove_by_routed_hop(
+        &self,
+        node: uuid::Uuid,
+        domain: honk_outbound::alive::ProbeDomain,
+        family: honk_outbound::alive::IpVersion,
+        role: honk_outbound::alive::UdpHopRole,
+    ) {
+        let matches =
+            |evidence: &UdpTrafficEvidence| evidence.depends_on(node, domain, family, role);
+        let _binding_gate = self.node_binding_gate.lock();
+        let stale: Vec<_> = self
+            .endpoints
+            .iter()
+            .filter_map(|entry| {
+                let (owner, generation) = match entry.value() {
+                    EndpointEntry::Ready(ready)
+                        if ready.endpoint.evidence.as_deref().is_some_and(matches) =>
+                    {
+                        (ready.owner, ready.generation)
+                    }
+                    EndpointEntry::Initializing(init)
+                        if init.evidence().as_deref().is_some_and(matches) =>
+                    {
+                        (init.owner, init.generation)
+                    }
+                    _ => return None,
+                };
+                Some((*entry.key(), owner.token, generation))
+            })
+            .collect();
+        for (key, token, generation) in stale {
+            self.close_if_same(key, token, generation);
+        }
+        drop(_binding_gate);
+        self.retire_sources_matching(matches);
+    }
+
     /// The driver owns liveness and removes its mapping on reply timeout or
     /// I/O failure. Keep this janitor as a conservative backstop for entries
     /// whose reply task has already released its reference.

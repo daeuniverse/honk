@@ -324,6 +324,9 @@ impl UdpLoopState {
         enqueued_at: u32,
         #[cfg(feature = "native-api")] packet_priority: Option<u32>,
     ) -> UdpSlowPathWork {
+        if original_dst.port() != 53 {
+            return UdpSlowPathWork::Done;
+        }
         let expected_epoch = self.udp_pool.initialization_epoch();
         // Match reload's router -> config -> backend publication order.
         let router = if route.direct_mark_index().is_some() {
@@ -338,6 +341,7 @@ impl UdpLoopState {
                 "Dropping UDP/53 from a stale routing generation");
             return UdpSlowPathWork::Done;
         }
+        let group_manager;
         let raw_dns_route = if let Some(index) = route.direct_mark_index() {
             let Some(mark) = router.as_ref().and_then(|router| router.direct_mark(index)) else {
                 debug!(%src_addr, %original_dst, index, "Dropping UDP/53 with no direct mark owner");
@@ -347,10 +351,10 @@ impl UdpLoopState {
         } else if route.outbound() == OutboundIndex::ControlPlaneRouting as u8 {
             None
         } else {
-            let Some(group) = route
-                .outbound()
-                .checked_sub(OutboundIndex::UserBase as u8)
-                .and_then(|index| config.groups.get(index as usize))
+            group_manager = self.handle.group_manager.read();
+            let Some(group) = self
+                .handle
+                .committed_udp_group(&group_manager, route.outbound())
             else {
                 debug!(%src_addr, %original_dst, outbound = route.outbound(),
                     "Dropping UDP/53 with no current route owner");
@@ -396,7 +400,8 @@ impl UdpLoopState {
             .is_none()
             .then(|| validate_exact_dns_query(data.as_slice()))
             .flatten();
-        // Config remains guarded through synchronous admission, not through spawned I/O.
+        // Keep the group owner guarded through synchronous reservation. Marked
+        // UDP/53 is stateless, so there is no further conn-state read to await.
         if let Some(validated) = validated_dns {
             let work =
                 begin_udp_dns_query(&self.dns_controller, &self.stats, data, validated, src_addr);
@@ -406,16 +411,37 @@ impl UdpLoopState {
         }
         let work = match data {
             DatagramPayload::Borrowed(data) => {
-                self.admit_datagram_at(
+                if self.drain.should_reject()
+                    || !self.udp_pool.initialization_epoch_is(expected_epoch)
+                {
+                    self.stats.record_udp_slow_permit_closed();
+                    return UdpSlowPathWork::Done;
+                }
+                if udp_fast_path_at(
+                    &self.udp_pool,
+                    &self.stats,
                     data,
                     src_addr,
                     original_dst,
                     None,
                     raw_dns_route,
-                    Some(expected_epoch),
+                    enqueued_at,
+                ) {
+                    return UdpSlowPathWork::Done;
+                }
+                begin_udp_slow_path_at(
+                    &self.udp_pool,
+                    &self.stats,
+                    &self.udp_concurrency_limit,
+                    None,
+                    src_addr,
+                    original_dst,
+                    data,
+                    raw_dns_route,
+                    UdpFlowOwner::new(0, None).expect("stateless UDP owner"),
+                    expected_epoch,
                     enqueued_at,
                 )
-                .await
             }
             #[cfg(feature = "ebpf")]
             DatagramPayload::Owned(data) => {
@@ -440,6 +466,7 @@ impl UdpLoopState {
         };
         #[cfg(feature = "native-api")]
         let work = work.with_packet_route(packet_route);
+        drop(config);
         work
     }
 

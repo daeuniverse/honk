@@ -18,7 +18,8 @@ global {
 
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
+    # List targets explicitly to authorize routed UDP recovery.
+    # udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 30s
     check_tolerance: 50ms
 
@@ -163,13 +164,17 @@ Hosts running systemd-networkd should prefer the explicit `IPv6AcceptRA=yes` in 
 
 Holds ambiguous LAN-forwarded UDP originals in NFQUEUE until userspace reaches a terminal decision. The setting requires the real eBPF backend.
 
+The startup downgrade logs `NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled` with a `reason` field: `the mock eBPF backend was selected`, `honk-core was built without the ebpf feature`, or the fixed-queue preflight error. honk leaves the configuration file unchanged and keeps the setting off for the process.
+
 After the singleton instance handoff, honk logs a warning and disables the setting for the process, without rewriting the configuration, when the fixed queue is unavailable or a pre-admission queue, rules or health check fails. Installing the queue reclaims the reserved nftables table.
 
 Persistent token-generation recovery failures and [post-admission failures](../design/nfqueue.md#activation-and-scope) remain fatal.
 
 `experimental.udp_nfqueue.enabled` is deprecated; use `nfqueue_enable` instead. The old spelling is accepted with a migration warning, and `nfqueue_enable` wins when both are present.
 
-A write or reload may still request `nfqueue_enable: true` while the effective value stays disabled, but only after an actual downgrade. A request that omits the key counts too, because its default is `true`. The downgrade is either an early startup downgrade (mock, no `ebpf` feature, or a failed fixed-queue preflight) or a late queue, rules or health downgrade before datapath admission. The requested source stays unchanged, but effective `false` persists for the process lifetime. Nothing retries activation automatically, so a restart is required to try again. Without a downgrade, toggles remain restart-only. [Common reload normalization](../design/control-plane.md#reload-and-runtime-generations) runs before fingerprint/no-op checks; native pre-write checks and full validation share the same restart policy.
+A write or reload may still request `nfqueue_enable: true` while the effective value stays disabled, but only after an actual downgrade. A request that omits the key counts too, because its default is `true`. The downgrade is either an early startup downgrade (mock, no `ebpf` feature, or a failed fixed-queue preflight) or a late queue, rules or health downgrade before datapath admission. The requested source stays unchanged, but effective `false` persists for the process lifetime. Nothing retries activation automatically, so a restart is required to try again. Without a downgrade, toggles remain restart-only. [Common reload normalization](../design/control-plane.md#reload-and-runtime-generations) runs before fingerprint/no-op checks; native pre-write checks apply the same rule.
+
+In `0.1.0-beta.4` and earlier, an actual startup downgrade did not relax the restart-required check for this field. A write or reload that requested `true`, including one that omitted the key, was refused as needing a restart, also after a restart. Setting `nfqueue_enable: false` in the source was the only way to write.
 
 `nfqueue_enable` also controls [fragmented LAN UDP/53 delivery](../design/nfqueue.md#fragmented-lan-dns): controller/raw-group fragments require ready NFQUEUE and otherwise drop, without bypassing DNS policy. Native `direct(must)` and unfragmented DNS are unchanged.
 
@@ -197,7 +202,9 @@ Sets the comma-separated DNS targets for UDP health checks. Bare IPv4/IPv6, `[IP
 
 Malformed brackets or ports fail validation with a located diagnostic.
 
-The first IP literal wins over domain entries; otherwise the first domain is resolved. Resolution and Score use the same decoded host and port, and a domain keeps its identity after resolution.
+For ordinary node checks, the first IP literal wins over domain entries. Otherwise the first domain is resolved. Resolution and Score use the same decoded host and port, and a domain keeps its identity after resolution. Omitting the setting uses the defaults shown above.
+
+For [routed UDP recovery](./groups.md#exit-liveness), list the DNS servers you authorize honk to query over the affected chain or group exit. An omitted or empty list authorizes no recovery query. Recovery prefers the first configured IP literal in the affected health address family. Otherwise it looks for a same-family address for a configured hostname using the configured DNS service, without bootstrap DNS fallback. The destination port must be allowed by the hop that frames UDP.
 
 ```dae
 global {
@@ -342,7 +349,7 @@ honk captures these inputs at startup. It rejects a reload that changes their ef
 - `check_interval`.
 - The first `tcp_check_url`, including its fallback, path, and query text. A missing or empty first value disables HTTP probing; later values do not affect this comparison.
 - `tcp_check_http_method` while HTTP probing is enabled. Empty and `HEAD` are equivalent.
-- The selected `udp_check_dns` target: trim and ignore empty entries, prefer the first IP literal anywhere in the list, otherwise use the first domain, otherwise `8.8.8.8:53`. Admission compares configured address/domain and port, without resolving DNS. Domains compare case-insensitively and ignore one trailing dot, so `dns.example:53` and `DNS.EXAMPLE.:53` are the same target. Changes to unselected entries remain admissible.
+- The effective `udp_check_dns` target for ordinary node probes. Selection trims whitespace, ignores empty entries and takes the first IP literal, the first domain, or ultimately `8.8.8.8:53`. Admission compares configured addresses or domain names and ports without resolving DNS. Domain names compare case-insensitively and ignore one trailing dot, so `dns.example:53` and `DNS.EXAMPLE.:53` are the same target. A reload that preserves this effective target can change the explicit list used for route recovery.
 - Switching `tls_implementation` between native TLS and uTLS. The `utls` comparison is case-insensitive.
 
 DAE `check_tolerance` still updates URLTest group tolerances on reload. Group-specific check URLs and direct checks retain their existing live-update paths. Reloading `utls_imitate` stores the compatibility value but does not change the fingerprint.

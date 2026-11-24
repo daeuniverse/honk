@@ -37,15 +37,73 @@ pub(crate) fn socks5(name: &str, host: &str, port: u16) -> Node {
 }
 
 pub(crate) fn chain(hops: &[&Node]) -> Node {
-    let mut node = Node {
-        name: "via".into(),
-        outbound: OutboundConfig::Chain {
-            hops: hops.iter().map(|hop| hop.name.clone()).collect(),
-        },
+    Node::chain_from_nodes("via", hops).unwrap()
+}
+
+pub(crate) fn assert_score_failure_scope(
+    via: &Node,
+    outcomes: &[crate::group::ScoreOutcome],
+    setup_completed: bool,
+    exact_failures: usize,
+    aggregate_failures: usize,
+) {
+    use crate::alive::{IpVersion, ProbeDomain};
+    use crate::group::{GroupManager, ScoreOutcome, ScoreSelectionContext, SelectionNetwork};
+    use honk_config::group::{Group, GroupPolicy};
+
+    let alternate = socks5("alternate", "127.0.0.1", 1);
+    let group = Group {
+        name: "score".into(),
+        policy: GroupPolicy::Score,
+        nodes: vec![via.id, alternate.id],
         ..Default::default()
     };
-    node.id = node.derive_id();
-    node
+    let manager = GroupManager::new(&[group], &[via.clone(), alternate]);
+    let same_target = ScoreSelectionContext {
+        network: SelectionNetwork::Tcp,
+        probe_domain: ProbeDomain::Tcp,
+        target_family: Some(IpVersion::V4),
+        health_family: IpVersion::V4,
+        target: Some(TCP_TARGET.parse::<SocketAddr>().unwrap().into()),
+    };
+    let other_target = ScoreSelectionContext {
+        target: Some("198.51.100.2:80".parse::<SocketAddr>().unwrap().into()),
+        ..same_target.clone()
+    };
+    let feedback = manager
+        .feedback_for_group_node("score", via.id, same_target.clone())
+        .unwrap();
+    let report = |outcome, completed| {
+        let reporter = feedback.start();
+        if completed {
+            reporter.setup_succeeded();
+        }
+        reporter.finish(outcome);
+    };
+    for &outcome in outcomes {
+        report(outcome, setup_completed);
+    }
+
+    // First add exact-only failures, then calibrate aggregate failures using the
+    // other target. Neither check can cross the threshold via the other scope.
+    let exclusions = || manager.score_reason_snapshot()[0].tcp.fail_streak_excluded;
+    for (context, failures, calibration) in [
+        (&same_target, exact_failures, ScoreOutcome::TargetFailure),
+        (&other_target, aggregate_failures, ScoreOutcome::NodeFailure),
+    ] {
+        for added in 0..=3 {
+            let before = exclusions();
+            let plan = manager.selection_plan_for_target("score", context);
+            let excluded = failures + added >= 3;
+            assert_eq!(exclusions() - before, u64::from(excluded), "{context:?}");
+            if excluded {
+                assert_ne!(plan.entries[0].node.id, via.id);
+            }
+            if added != 3 {
+                report(calibration, true);
+            }
+        }
+    }
 }
 
 /// A no-auth SOCKS5 server that relays CONNECT over real sockets, resolving
@@ -134,9 +192,13 @@ pub(crate) async fn socks5_relay(
     }
 }
 
-/// Mock legacy-AEAD TCP server (salt + chunk codec): echoes every payload
-/// byte uppercased after skipping the 7-byte IPv4 target header.
-pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mut server: S) {
+pub(crate) const TCP_TARGET: &str = "93.184.216.34:80";
+pub(crate) const TCP_TARGET_HEADER: [u8; 7] = [1, 93, 184, 216, 34, 0, 80];
+
+pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(
+    mut server: S,
+    mut expected_target: &[u8],
+) {
     let method = "aes-128-gcm";
     let password = "test-password";
     let conf = CipherConf::for_method(method).unwrap();
@@ -157,9 +219,6 @@ pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mu
     let s2c_cipher = AeadCipher::new(method, &s2c_subkey).unwrap();
     let mut s2c_nonce = vec![0u8; conf.nonce_len];
 
-    // The first plaintext bytes are the target header (own chunk).
-    let header_len = 7usize; // atyp + v4 + port of 93.184.216.34:80
-    let mut skip = header_len;
     let mut buf = vec![0u8; 262144];
     let mut carry = 0usize;
     let mut pending_len = None;
@@ -179,8 +238,9 @@ pub(crate) async fn mock_legacy_tcp_server<S: AsyncRead + AsyncWrite + Unpin>(mu
         )
         .unwrap();
         if out_len > 0 {
-            let start = skip.min(out_len);
-            skip -= start;
+            let start = expected_target.len().min(out_len);
+            assert_eq!(&buf[..start], &expected_target[..start], "target address");
+            expected_target = &expected_target[start..];
             if start < out_len {
                 let upper: Vec<u8> = buf[start..out_len]
                     .iter()

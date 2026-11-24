@@ -165,7 +165,7 @@ pub(crate) mod flows {
         pub(crate) fn selection_path(
             _selections: &SelectionPath,
             _chain: &[String],
-            _node: &Node,
+            _dialed: &honk_outbound::group::OwnedTarget,
             _family: IpVersion,
         ) -> SelectionPath {
             SelectionPath

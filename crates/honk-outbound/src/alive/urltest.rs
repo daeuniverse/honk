@@ -152,6 +152,8 @@ impl AliveDialerSet {
                 e.alive = true;
                 e.consecutive_successes = 0;
                 e.cooldown_until = Instant::now();
+                drop(states);
+                self.notify_policy_change();
             }
         }
     }
@@ -171,8 +173,10 @@ impl AliveDialerSet {
             e.consecutive_failures,
         );
         e.cooldown_until = Instant::now() + backoff;
-        if e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
+        if e.alive && e.consecutive_failures >= probe_failure_threshold(ProbeDomain::Tcp) {
             e.alive = false;
+            drop(states);
+            self.notify_policy_change();
         }
     }
 

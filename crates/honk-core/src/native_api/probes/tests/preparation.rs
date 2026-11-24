@@ -1,12 +1,5 @@
 use super::*;
-use crate::dns::{
-    cache::DnsCache,
-    forwarder::{DnsForwarder, DnsUpstreamPool, parse_dns_question},
-    routing::DnsRouter,
-    runtime::{
-        DnsRuntime, DnsRuntimeParts, RoutingProjectionSnapshot, RuntimeGeneration, RuntimeTransport,
-    },
-};
+use crate::dns::forwarder::parse_dns_question;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct FamilyPool {
@@ -45,26 +38,6 @@ impl DnsUpstreamPool for FamilyPool {
 #[async_trait::async_trait]
 impl RuntimeTransport for FamilyPool {
     async fn close(&self) {}
-}
-
-fn publish_dns(state: &NativeState, pool: Arc<FamilyPool>, dns: &honk_config::dns::DnsConfig) {
-    let forwarder = Arc::new(DnsForwarder::new(
-        pool.clone(),
-        Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
-        Arc::new(DnsRouter::new_from_dns_config(dns).unwrap()),
-    ));
-    let provider = state.dns.provider().unwrap();
-    let generation = provider.current_generation().get() + 1;
-    provider.publish(DnsRuntime::new(DnsRuntimeParts {
-        generation: RuntimeGeneration::new(generation),
-        forwarder,
-        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
-            generation,
-            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
-        )),
-        outbound_runtime: None,
-        transport: pool,
-    }));
 }
 
 async fn family_preparation(refusal: bool, response_code: u8) {
@@ -176,7 +149,7 @@ async fn negative_dns_answer_addresses_cannot_admit_a_probe() {
 
 #[tokio::test]
 async fn asis_dns_routing_falls_back_to_bootstrap_for_probe_targets() {
-    // Bootstrap DNS is process-global; isolate it from parallel core tests.
+    // Control-plane setup also installs process-wide resolver hooks.
     if crate::test_support::run_exact_in_child(
         "HONK_PROBE_BOOTSTRAP_FALLBACK_CHILD",
         "native_api::probes::tests::preparation::asis_dns_routing_falls_back_to_bootstrap_for_probe_targets",

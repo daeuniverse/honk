@@ -106,6 +106,36 @@ fn concurrent_begin_clones_spend_once_and_cancel_without_refund() {
 }
 
 #[test]
+fn stale_reporter_settles_started_optional_work_once() {
+    let nodes = [node("a"), node("b")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    complete_ordinary(&manager, "score", &nodes[0], 1.0);
+    let target = context("stale-reporter.example", IpVersion::V4);
+    let plan = manager.selection_plan_for_target("score", &target);
+    let reporter = plan.entries[0]
+        .feedback
+        .as_ref()
+        .unwrap()
+        .begin()
+        .unwrap()
+        .start();
+    let clone = reporter.clone();
+    let before = counts(&manager, "score");
+    assert_eq!((before.spent, before.trial_cancelled), (1, 0));
+    reporter.finish_stale();
+    clone.finish_stale();
+    clone.finish(ScoreOutcome::Timeout);
+    drop(reporter);
+    drop(clone);
+    let after = counts(&manager, "score");
+    assert_eq!(
+        (after.spent, after.trial_cancelled, after.refunded),
+        (1, 1, 0)
+    );
+    assert_eq!((after.trial_success, after.trial_failure), (0, 0));
+}
+
+#[test]
 fn stale_generation_start_refunds_and_never_publishes_root_or_scope_counts() {
     let nodes = [node("a"), node("b")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

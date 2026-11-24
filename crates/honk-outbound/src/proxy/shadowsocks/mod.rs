@@ -42,6 +42,7 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 use super::addr;
+use super::packet::send_with_admission_check;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
     ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
@@ -415,7 +416,7 @@ impl TcpOutbound for ShadowsocksHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("Shadowsocks: connecting to {} for target {}", addr, target);
-        let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let server = crate::util::connect_proxy(&addr, connect_timeout).await?;
 
         let header = addr::encode_address(target, target_domain)?;
         crate::runtime::flow_observation::milestone(
@@ -664,6 +665,25 @@ impl SsUdpTransport {
         Ok(())
     }
 
+    async fn send(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+    ) -> std::io::Result<()> {
+        let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
+        if target == self.target && domain == self.target_domain.as_deref() {
+            return self
+                .send_sealed(&self.socks, target.port(), data, admitted)
+                .await;
+        }
+        let mut socks = [0u8; MAX_SOCKS_ADDR_LEN];
+        let len = encode_socks_addr(target, domain, &mut socks)?;
+        self.send_sealed(&socks[..len], target.port(), data, admitted)
+            .await
+    }
+
     /// The reply source a decoded inner address stands for, or `None` for a
     /// domain other than the dialed one (never resolved: it names no IP).
     fn reply_peer(&self, peer: &addr::SocksAddr) -> Option<SocketAddr> {
@@ -760,16 +780,25 @@ impl MultiTargetTransport for SsUdpTransport {
         _confirmed: bool,
         admitted: Option<&AtomicBool>,
     ) -> std::io::Result<()> {
-        let domain = addr::dialed_name(self.target_domain.as_deref(), domain);
-        if target == self.target && domain == self.target_domain.as_deref() {
-            return self
-                .send_sealed(&self.socks, target.port(), data, admitted)
-                .await;
-        }
-        let mut socks = [0u8; MAX_SOCKS_ADDR_LEN];
-        let len = encode_socks_addr(target, domain, &mut socks)?;
-        self.send_sealed(&socks[..len], target.port(), data, admitted)
-            .await
+        self.send(target, domain, data, admitted).await
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> std::io::Result<()> {
+        let local_admitted = AtomicBool::new(false);
+        let admitted = admitted.unwrap_or(&local_admitted);
+        send_with_admission_check(
+            self.send(target, domain, data, Some(admitted)),
+            admitted,
+            current,
+        )
+        .await
     }
 
     fn carrier_addr(&self) -> Option<SocketAddr> {

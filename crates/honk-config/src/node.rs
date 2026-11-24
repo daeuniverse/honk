@@ -10,7 +10,8 @@ mod wire;
 mod xhttp;
 
 pub use protocol::*;
-pub use validation::{MAX_CHAIN_HOPS, ResolvedChain, resolve_chain_hops, validate_node_collection};
+pub(crate) use validation::bind_node_collection;
+pub use validation::{MAX_CHAIN_HOPS, validate_node_collection, validate_partial_node_collection};
 pub use vless::*;
 pub use wire::NodeSeed;
 pub(crate) use wire::RawNodeSeed;
@@ -60,9 +61,8 @@ pub const NODE_ID_NAMESPACE: uuid::Uuid =
 /// outbounds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Node {
-    /// Stable identity derived from the node's content by [`Node::derive_id`]
-    /// at every construction entry (nil until then — the runtime registry
-    /// rejects nil IDs, so a missed entry fails loudly).
+    /// Stable identity derived by [`Node::derive_id`]. Chain declarations
+    /// receive their canonical ID when assembled with their physical hops.
     pub id: uuid::Uuid,
     pub name: String,
     pub address: String,
@@ -110,11 +110,43 @@ impl Node {
         self.outbound.chain_hops()
     }
 
-    /// Whether this node's handshake can run over a stream tunneled through
-    /// an earlier chain hop. A chain's first hop dials as usual; every later
-    /// hop must satisfy this. honk-outbound keeps each handler's `dial_over`
-    /// in step with this table.
+    /// Declare a chain whose hop names will be bound during snapshot assembly.
+    pub fn chain(name: &str, hops: Vec<String>) -> Self {
+        Self {
+            name: name.to_owned(),
+            outbound: OutboundConfig::Chain(ChainConfig::new(hops)),
+            ..Self::default()
+        }
+    }
+
+    /// Physical hop IDs of a bound chain, entry first.
+    pub fn resolved_chain_hops(&self) -> Option<&[uuid::Uuid]> {
+        match &self.outbound {
+            OutboundConfig::Chain(config) => config.resolved.as_deref(),
+            _ => None,
+        }
+    }
+
+    fn bind_chain(&mut self, hops: std::sync::Arc<[uuid::Uuid]>) {
+        let OutboundConfig::Chain(config) = &mut self.outbound else {
+            unreachable!("only a chain can bind hops");
+        };
+        config.resolved = Some(hops);
+        self.id = self.derive_id();
+    }
+
+    /// Whether this node can handshake over an earlier hop's carrier.
+    /// Later hops require this capability. Domain-based TLS ECH discovery
+    /// needs a local DNS lookup, which the tunneled path refuses.
     pub fn supports_tunneled_dial(&self) -> bool {
+        if let Some(tls) = self.tls()
+            && tls.enabled
+            && tls.uses_ech_discovery()
+            && matches!(tls.effective_reality_public_key(), Ok(None))
+            && ech_discovery_name(&self.tls_server_name()).is_some()
+        {
+            return false;
+        }
         match &self.outbound {
             OutboundConfig::Socks5(_) | OutboundConfig::Shadowsocks(_) => true,
             OutboundConfig::Trojan(_) | OutboundConfig::Vmess(_) => !self.is_xhttp(),
@@ -130,47 +162,55 @@ impl Node {
             | OutboundConfig::AnyTls(_)
             | OutboundConfig::Direct
             | OutboundConfig::Block
-            | OutboundConfig::Chain { .. } => false,
+            | OutboundConfig::Chain(_) => false,
         }
     }
 
-    /// Whether this node, as a chain's exit, can carry UDP over the stream
-    /// tunneled to it. honk-outbound keeps each handler's `dial_udp_over` in
-    /// step with this table. A VLESS exit sends native UDP even under `Auto`,
-    /// which would pick XUDP on most ports: XUDP rides a Mux.Cool session the
-    /// tunneled hop does not own. Any multiplexing is refused, since the
-    /// UDP/443 policy lives only there.
+    /// Whether this node can frame UDP over a stream tunneled to it.
+    /// VLESS Auto uses native framing here because the tunnel owns one
+    /// stream and cannot open an XUDP session. Multiplexing is ineligible.
     pub fn supports_tunneled_udp(&self) -> bool {
-        match &self.outbound {
-            OutboundConfig::Trojan(_) => {
-                !self.is_xhttp()
-                    && self.network().is_none_or(|network| {
-                        matches!(
-                            crate::options::vocab::packet_network(network),
-                            Ok(Some(true))
-                        )
-                    })
-            }
+        let can_frame = match &self.outbound {
+            OutboundConfig::Trojan(_) => self.network().is_none_or(|network| {
+                matches!(
+                    crate::options::vocab::packet_network(network),
+                    Ok(Some(true))
+                )
+            }),
             OutboundConfig::Vless(config) => {
-                self.supports_tunneled_dial()
-                    && config.multiplex == VlessMultiplex::Off
+                config.multiplex == VlessMultiplex::Off
                     && config.udp_enabled()
                     && matches!(
                         config.udp_encoding,
                         VlessUdpEncoding::Auto | VlessUdpEncoding::Native
                     )
             }
-            OutboundConfig::Socks5(_)
-            | OutboundConfig::Shadowsocks(_)
-            | OutboundConfig::Vmess(_)
-            | OutboundConfig::Hysteria2(_)
-            | OutboundConfig::Tuic(_)
-            | OutboundConfig::Juicity(_)
-            | OutboundConfig::AnyTls(_)
-            | OutboundConfig::Direct
-            | OutboundConfig::Block
-            | OutboundConfig::Chain { .. } => false,
+            _ => false,
+        };
+        can_frame && self.supports_tunneled_dial()
+    }
+
+    /// Explicit SNI precedes the WebSocket Host authority and the configured endpoint.
+    pub fn tls_server_name(&self) -> Cow<'_, str> {
+        if let Some(sni) = self.tls().and_then(|tls| tls.sni.as_deref()) {
+            return Cow::Borrowed(sni);
         }
+        if let Some(authority) = self
+            .transport()
+            .filter(|transport| transport.transport == "ws")
+            .and_then(|transport| transport.ws_host.as_deref())
+            .and_then(|host| host.parse::<http::uri::Authority>().ok())
+        {
+            // The TLS connector recognizes an IPv6 literal only without brackets.
+            return Cow::Owned(
+                authority
+                    .host()
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .to_owned(),
+            );
+        }
+        Cow::Borrowed(self.host())
     }
 
     pub fn is_xhttp(&self) -> bool {
@@ -196,27 +236,25 @@ impl Node {
         Ok(())
     }
 
+    pub fn xhttp_download(&self) -> Option<&XhttpDownload> {
+        self.transport()?.xhttp.as_ref()?.download.as_deref()
+    }
+
     /// The XHTTP download peer as its own dial target. Only protocol
     /// credentials and upload-only request options carry over; TLS is rebuilt
     /// so upload pins, insecure verification, ECH and REALITY never apply.
     pub fn xhttp_download_view(&self) -> Option<Node> {
-        let download = self
-            .transport()?
-            .xhttp
-            .as_ref()?
-            .download
-            .as_deref()?
-            .clone();
+        self.xhttp_download()?;
         let mut view = self.clone();
-        view.address = format!("{}:{}", download.address, download.port);
-        view.host = download.address;
-        view.port = download.port;
         let options = view.transport_mut()?.xhttp.as_mut()?;
+        let download = options.download.take()?;
         options.path = download.path;
         options.host = download.host;
         options.headers.clear();
         options.x_padding_bytes = download.x_padding_bytes;
-        options.download = None;
+        view.address = format!("{}:{}", download.address, download.port);
+        view.host = download.address;
+        view.port = download.port;
         *view.tls_mut()? = TlsOptions {
             enabled: true,
             sni: download.server_name,
@@ -389,7 +427,24 @@ impl Node {
     /// Content-derived stable identity: UUID v5 over
     /// `protocol|host|port|credential-fingerprint|dial-shape`.
     /// Explicit ALPN derives a child UUID from the legacy ID and an ordered JSON list.
+    /// Chains use their ordered physical hop IDs and have a nil derivation until bound.
     pub fn derive_id(&self) -> uuid::Uuid {
+        if let OutboundConfig::Chain(chain) = &self.outbound {
+            let Some(hops) = chain.resolved.as_deref() else {
+                return uuid::Uuid::nil();
+            };
+            const PREFIX: &[u8] = b"chain|";
+            let mut material = [0; PREFIX.len() + 16 * MAX_CHAIN_HOPS];
+            let (prefix, tail) = material.split_at_mut(PREFIX.len());
+            prefix.copy_from_slice(PREFIX);
+            for (slot, id) in tail.as_chunks_mut::<16>().0.iter_mut().zip(hops) {
+                *slot = *id.as_bytes();
+            }
+            return uuid::Uuid::new_v5(
+                &NODE_ID_NAMESPACE,
+                &material[..PREFIX.len() + 16 * hops.len()],
+            );
+        }
         let material = self.identity_material();
         let legacy_id = uuid::Uuid::new_v5(&NODE_ID_NAMESPACE, material.as_bytes());
         if let Some(tls) = self.tls().filter(|tls| !tls.alpn.is_empty()) {
@@ -452,8 +507,7 @@ pub struct Group {
     /// Explicit fallback for the caller when the group's policy has no available selection.
     /// Can be "direct", "block", another group name, or a node name.
     pub final_outbound: Option<String>,
-    /// Exit node every connection through this group leaves from: the
-    /// selected leaf becomes the first hop of a chain ending at this node.
+    /// Append this proxy to the selected leaf's TCP hops. A terminal `block` never dials it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit: Option<String>,
     /// URL for health checks (overrides global tcp_check_url).
@@ -472,7 +526,7 @@ pub struct Group {
     /// Serialized only when `own.interrupt_connections` is set.
     #[serde(skip_serializing)]
     pub interrupt_connections: bool,
-    /// Which defaulted options the group's own source sets.
+    /// Source metadata used when resolving group defaults.
     #[serde(skip)]
     pub own: OwnOptions,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -502,11 +556,14 @@ impl Default for Group {
     }
 }
 
-/// Group options whose effective value otherwise comes from a default or `global`.
+/// Source metadata for inherited group options and implicit membership.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OwnOptions {
     pub tolerance: bool,
     pub interrupt_connections: bool,
+    /// Whether source resolution opted this unfiltered group into all proxy nodes.
+    #[doc(hidden)]
+    pub implicit_all_nodes: bool,
 }
 
 impl Serialize for Group {
@@ -590,6 +647,7 @@ impl<'de> Deserialize<'de> for Group {
             own: OwnOptions {
                 tolerance: wire.tolerance.is_some(),
                 interrupt_connections: wire.interrupt_connections.is_some(),
+                ..Default::default()
             },
             created_at: wire.created_at,
         })

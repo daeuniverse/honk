@@ -1,13 +1,26 @@
 use super::*;
+use crate::dns::{
+    cache::DnsCache,
+    forwarder::{DnsForwarder, DnsUpstreamPool},
+    routing::DnsRouter,
+    runtime::{
+        DnsRuntime, DnsRuntimeParts, RoutingProjectionSnapshot, RuntimeGeneration, RuntimeTransport,
+    },
+};
 use axum::body::{Body, to_bytes};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod chain;
 mod lifecycle;
 mod preparation;
 mod refusals;
 mod scheduling;
 
-async fn state(mut config: Config) -> Arc<NativeState> {
+async fn state(config: Config) -> Arc<NativeState> {
+    Arc::new(state_with_control(config).await.0)
+}
+
+async fn state_with_control(mut config: Config) -> (NativeState, crate::control::ControlPlane) {
     config.global.nfqueue_enable = false;
     config.experimental.native_api.enabled = true;
     config.experimental.native_api.allow_anonymous_loopback = true;
@@ -33,8 +46,43 @@ async fn state(mut config: Config) -> Arc<NativeState> {
     .await
     .unwrap();
     control.publish_phase(crate::control::EnginePhase::Running);
-    Arc::new(state)
+    (state, control)
 }
+
+fn publish_dns<P>(state: &NativeState, pool: Arc<P>, dns: &honk_config::dns::DnsConfig)
+where
+    P: DnsUpstreamPool + RuntimeTransport + 'static,
+{
+    let provider = state.dns.provider().unwrap();
+    let generation = provider.current_generation().get() + 1;
+    provider.publish(dns_runtime(generation, pool, dns));
+}
+
+fn dns_runtime<P>(
+    generation: u64,
+    pool: Arc<P>,
+    dns: &honk_config::dns::DnsConfig,
+) -> Arc<DnsRuntime>
+where
+    P: DnsUpstreamPool + RuntimeTransport + 'static,
+{
+    let forwarder = Arc::new(DnsForwarder::new(
+        pool.clone(),
+        Arc::new(tokio::sync::Mutex::new(DnsCache::new(8))),
+        Arc::new(DnsRouter::new_from_dns_config(dns).unwrap()),
+    ));
+    DnsRuntime::new(DnsRuntimeParts {
+        generation: RuntimeGeneration::new(generation),
+        forwarder,
+        routing_projection: Arc::new(RoutingProjectionSnapshot::new(
+            generation,
+            Arc::new(crate::routing::Router::new(&[], "direct").unwrap()),
+        )),
+        outbound_runtime: None,
+        transport: pool,
+    })
+}
+
 fn request(target: Value, kind: &str, transport: Value, family: &str) -> Value {
     json!({"target":target,"kind":kind,"transport":transport,"ip_version":family,"warmth":"cold"})
 }
@@ -317,6 +365,56 @@ async fn a_large_group_is_probed_by_member_subset_and_a_child_group_by_its_selec
 }
 
 #[tokio::test]
+async fn native_udp_probe_cannot_measure_a_tcp_only_leaf_via_group_exit() {
+    use honk_outbound::group::ScoreSelectionContext;
+
+    let mut leaf = Node::from_share_link("trojan://entry@127.0.0.1:1080#front").unwrap();
+    leaf.trojan_mut().unwrap().network = Some("tcp".into());
+    leaf.id = leaf.derive_id();
+    let exit = Node::from_share_link("trojan://exit@127.0.0.1:443#land").unwrap();
+    let mut config = Config {
+        groups: [
+            json!({"name":"child","exit":"land","nodes":[leaf.id]}),
+            json!({"name":"parent","groups":["child"]}),
+        ]
+        .into_iter()
+        .map(|group| serde_json::from_value(group).unwrap())
+        .collect(),
+        nodes: vec![leaf, exit],
+        ..Default::default()
+    };
+    config.global.udp_check_dns = Some(vec!["127.0.0.1:53".into()]);
+    let state = state(config).await;
+    {
+        let manager = state.group_manager.read();
+        let routes = manager.selection_plan_for_target(
+            "child",
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::Udp,
+                ProbeDomain::DnsUdp,
+                IpVersion::V4,
+            ),
+        );
+        assert!(routes.entries[0].route.is_some());
+    }
+    let id = state.observation.core.catalog.snapshot().groups["parent"].clone();
+    let input = request(
+        json!({"type":"group","group_id":id}),
+        "dns",
+        json!(["udp"]),
+        "ipv4",
+    );
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
+        .await
+        .unwrap();
+    assert!(plan.candidates.is_empty());
+    assert_eq!(plan.result.results.len(), 1);
+    let row = &plan.result.results[0];
+    assert_eq!(row.error, Some("no_eligible_leaf"));
+    assert!(!row.health_updated);
+}
+
+#[tokio::test]
 async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
     let leaf = honk_config::config::DIRECT_NODE_ID;
     for custom_url in [false, true] {
@@ -482,7 +580,7 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
         udp.send_to(&query[..length], peer).await.unwrap();
     });
     let mut config = Config::default();
-    config.global.udp_check_dns = vec![format!("{host}:{}", address.port())];
+    config.global.udp_check_dns = Some(vec![format!("{host}:{}", address.port())]);
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
@@ -522,8 +620,7 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
     udp_peer.await.unwrap();
 }
 
-/// A chain is probed through its hops' runtimes in this generation: the HTTP
-/// check and the TCP DNS check both cross the front hop to the land hop.
+/// Both probes use a private chain runtime.
 #[tokio::test]
 async fn http_and_tcp_dns_probes_of_a_chain_cross_every_hop() {
     use crate::test_support::{socks5_chain, socks5_relay};
@@ -556,7 +653,7 @@ async fn http_and_tcp_dns_probes_of_a_chain_cross_every_hop() {
     let mut config = Config::default();
     config.nodes.extend(nodes);
     config.global.tcp_check_url = vec![format!("http://{http_addr}/check")];
-    config.global.udp_check_dns = vec![dns_addr.to_string()];
+    config.global.udp_check_dns = Some(vec![dns_addr.to_string()]);
     let state = state(config).await;
 
     for kind in ["http", "dns"] {
@@ -597,14 +694,7 @@ async fn a_group_tcp_connect_probe_reports_its_chain_member_unavailable() {
     front.name = "front".into();
     let mut land = Node::from_share_link("socks5://127.0.0.1:1081").unwrap();
     land.name = "land".into();
-    let mut via = Node {
-        name: "via".into(),
-        outbound: honk_config::node::OutboundConfig::Chain {
-            hops: vec!["front".into(), "land".into()],
-        },
-        ..Node::default()
-    };
-    via.id = via.derive_id();
+    let via = Node::chain_from_nodes("via", &[&front, &land]).unwrap();
     let (front_id, via_id) = (front.id, via.id);
     let mut config = Config::default();
     config.nodes.extend([front, land, via]);

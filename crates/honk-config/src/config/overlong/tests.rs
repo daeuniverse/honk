@@ -1,6 +1,23 @@
+use uuid::Uuid;
+
 use crate::Config;
 use crate::node::Node;
-use crate::parser::parse_dae_config;
+use crate::parser::{parse_dae_config, resolve_group_filters};
+
+// Build the same canonical nodes and members as runtime admission. Restore
+// the exits afterward so the length checker can see invalid routes too.
+fn bind_members(mut config: Config) -> Config {
+    let exits: Vec<_> = config
+        .groups
+        .iter_mut()
+        .map(|group| group.exit.take())
+        .collect();
+    let mut bound = config.assemble(resolve_group_filters).unwrap();
+    for (group, exit) in bound.groups.iter_mut().zip(exits) {
+        group.exit = exit;
+    }
+    bound
+}
 
 /// The validator's route-length walk before the group graph, narrowed to
 /// selection's reach: eight groups on a path, no group twice on one path,
@@ -9,29 +26,27 @@ fn oracle(config: &Config) -> Option<usize> {
     use std::collections::HashMap;
 
     struct Walk<'a> {
-        by_id: HashMap<uuid::Uuid, &'a Node>,
+        by_id: HashMap<Uuid, &'a Node>,
         by_name: HashMap<&'a str, Vec<&'a Node>>,
         groups: HashMap<&'a str, &'a crate::group::Group>,
     }
     impl<'a> Walk<'a> {
-        fn leaf(node: &Node, next: Option<&str>) -> usize {
-            let (hops, last) = match node.protocol() {
+        fn leaf(node: &Node, next: Option<Uuid>) -> usize {
+            let hops = match node.protocol() {
                 crate::types::NodeProtocol::Block | crate::types::NodeProtocol::Direct => {
                     return 0;
                 }
-                _ => match node.chain_hops() {
-                    Some(hops) => (hops.len(), hops.last().map(String::as_str)),
-                    None => (1, Some(node.name.as_str())),
-                },
+                crate::types::NodeProtocol::Chain => node.resolved_chain_hops().unwrap(),
+                _ => std::slice::from_ref(&node.id),
             };
-            hops - usize::from(last.is_some() && last == next)
+            hops.len() - usize::from(hops.last().copied() == next)
         }
 
         fn longest(
             &self,
             group: &'a crate::group::Group,
             path: &[&'a str],
-            next: Option<&str>,
+            next: Option<Uuid>,
         ) -> usize {
             let depth = path.len();
             let path = [path, &[group.name.as_str()]].concat();
@@ -40,7 +55,7 @@ fn oracle(config: &Config) -> Option<usize> {
                     .then(|| self.groups.get(name))
                     .flatten()
             };
-            let exit = group.exit.as_deref();
+            let exit = group.exit.as_deref().map(|name| self.by_name[name][0].id);
             let inner_next = exit.or(next);
             let leaves = group
                 .nodes
@@ -111,17 +126,22 @@ fn random_config(rng: &mut Rng) -> String {
         nodes.push_str(&format!(" {name}: 'socks5://127.0.0.1:{}'\n", 1000 + index));
     }
     let mut chains = Vec::new();
-    for index in 0..rng.below(4) {
+    for _ in 0..rng.below(4) {
         let hops: Vec<&str> = (0..2 + rng.below(3))
             .map(|_| UNIQUE[rng.below(UNIQUE.len())])
             .collect();
-        nodes.push_str(&format!(" chain{index}: {}\n", hops.join(" -> ")));
-        chains.push(format!("chain{index}"));
+        if !chains.contains(&hops) {
+            chains.push(hops);
+        }
     }
     let leaves: Vec<String> = PLAIN[..5]
         .iter()
         .map(|name| name.to_string())
-        .chain(chains)
+        .chain(chains.into_iter().enumerate().map(|(index, hops)| {
+            let name = format!("chain{index}");
+            nodes.push_str(&format!(" {name}: {}\n", hops.join(" -> ")));
+            name
+        }))
         .collect();
     let groups = 1 + rng.below(6);
     let mut text = String::new();
@@ -163,7 +183,8 @@ fn route_length_validation_matches_the_walk_at_selection_reach() {
     let (mut overlong, mut within) = (0, 0);
     for case in 0..4000 {
         let text = random_config(&mut rng);
-        let config = parse_dae_config(&text).unwrap_or_else(|error| panic!("{error}\n{text}"));
+        let partial = parse_dae_config(&text).unwrap_or_else(|error| panic!("{error}\n{text}"));
+        let config = bind_members(partial);
         let expected = oracle(&config);
         assert_eq!(
             config.overlong_group_route(),
@@ -232,9 +253,9 @@ fn a_final_names_the_first_declared_namesake_everywhere() {
         ))
         .unwrap()
     };
-    assert_eq!(config(true).overlong_group_route(), Some(0));
+    assert_eq!(bind_members(config(true)).overlong_group_route(), Some(0));
     // Selection dials the first namesake, so the later one no longer counts.
-    assert_eq!(config(false).overlong_group_route(), None);
+    assert_eq!(bind_members(config(false)).overlong_group_route(), None);
 }
 
 #[test]
