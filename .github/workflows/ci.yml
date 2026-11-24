@@ -838,6 +838,7 @@ jobs:
           path: ${{ runner.temp }}/kernel-floor/*.deb
           key: kernel-floor-${{ steps.pins.outputs.kernel }}
       - name: Run all real-kernel gates on Linux 6.12
+        timeout-minutes: 35
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
         run: .github/ci/run-vm-gate.sh floor
@@ -1156,6 +1157,7 @@ jobs:
           path: ${{ runner.temp }}/kernel-recent/*.deb
           key: kernel-recent-${{ steps.pins.outputs.kernel }}
       - name: Run all real-kernel gates on the recent kernel
+        timeout-minutes: 35
         env:
           CARGO_PROFILE_TEST_DEBUG: 0
         run: .github/ci/run-vm-gate.sh recent

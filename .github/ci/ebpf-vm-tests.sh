@@ -24,6 +24,17 @@ test "$(stat -f -c %T /sys/fs/bpf)" = bpf_fs
 
 log_dir="${GITHUB_WORKSPACE:?}/target/vm-tests/${HONK_CI_VM_LANE:?}"
 mkdir -p "$log_dir"
+# A hung gate prints nothing before the step timeout; record every task's
+# state and kernel stack first so the uploaded guest output shows where.
+(
+  sleep 1500
+  echo 1 > /proc/sys/kernel/sysrq
+  echo t > /proc/sysrq-trigger
+  dmesg > "$log_dir/hang-dmesg.txt"
+  ps -eo pid,ppid,stat,wchan:32,etime,args > "$log_dir/hang-ps.txt"
+) &
+watchdog=$!
+trap 'kill "$watchdog" 2>/dev/null || true' EXIT
 
 "$HONK_CORE_TEST_BIN" ebpf::real::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-real.log"
