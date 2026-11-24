@@ -314,6 +314,57 @@ async fn paused_and_stopped_dns_refuse_literal_and_bootstrap_aliases() {
     honk_outbound::bootstrap::set_global(None);
 }
 
+#[cfg(feature = "native-api")]
+#[tokio::test]
+async fn pinned_probe_fallback_ends_when_its_dns_lease_is_cancelled() {
+    let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (_file, current) = node_host_runtime(1);
+    let provider = Arc::new(DnsServiceProvider::new(current.clone()));
+    provider.enable_lifecycle();
+    let service = DnsService::with_provider(provider.clone());
+    let resolver = BootstrapResolver::parse(&server.local_addr().unwrap().to_string());
+    let pinned = service.pin_name_resolution(resolver).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let held = current
+            .query_limit
+            .try_acquire_many(current.query_limit.available_permits() as u32)
+            .unwrap();
+        let error = pinned
+            .resolve_node_server("bootstrap-alias.example")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Capacity)
+        );
+        assert_eq!(
+            server.try_recv_from(&mut [0; 512]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(held);
+        let query =
+            tokio::spawn(
+                async move { pinned.resolve_node_server("bootstrap-alias.example").await },
+            );
+        for _ in 0..2 {
+            let mut wire = [0; 512];
+            let (n, _) = server.recv_from(&mut wire).await.unwrap();
+            let (name, _) = crate::dns::forwarder::parse_dns_question(&wire[..n]).unwrap();
+            assert_eq!(name.trim_end_matches('.'), "bootstrap-target.example");
+        }
+        provider.begin_pause();
+        let error = query.await.unwrap().unwrap_err();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Cancelled)
+        );
+        provider.finish_pause().await.unwrap();
+        assert_eq!(current.lease_count(), 0);
+    })
+    .await
+    .expect("pause must cancel an unanswered captured bootstrap lookup");
+}
+
 #[tokio::test]
 async fn hosts_alias_bootstrap_uses_target_and_pause_cancels_admitted_query() {
     if crate::test_support::run_exact_in_child(

@@ -1,6 +1,6 @@
-//! The structure of nested groups: member, subgroup, `final` and `exit`
-//! edges resolved once by name, one traversal over them, and the one rule
-//! that composes a leaf with the exits of the groups it is selected through.
+//! The structure of nested groups: member IDs, subgroup, `final` and `exit`
+//! edges resolved once, one traversal over them, and the one rule that
+//! composes a leaf with the exits of the groups it is selected through.
 //!
 //! Only structure lives here. Policies, health and caches stay with their
 //! owners; the validator and group consumers answer their own questions by
@@ -19,13 +19,12 @@ use crate::route::Route;
 
 /// A group's `final` edge. Builtins resolve first, then nodes, then groups,
 /// as group selection resolves it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum FinalEdge {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalEdge {
     Direct,
     Block,
-    /// Every node of that name, in configuration order. Selection dials the
-    /// first.
-    Nodes(Box<[Uuid]>),
+    /// The first node of that name in configuration order.
+    Node(Uuid),
     Group(usize),
 }
 
@@ -54,7 +53,6 @@ pub struct GroupGraph<'a> {
     groups: Vec<Edges<'a>>,
     index: HashMap<&'a str, usize>,
     nodes: HashMap<Uuid, &'a Node>,
-    chains: HashMap<Uuid, Box<[Uuid]>>,
 }
 
 impl<'a> GroupGraph<'a> {
@@ -81,17 +79,6 @@ impl<'a> GroupGraph<'a> {
             [(_, id)] => Some(*id),
             _ => None,
         };
-        let chains = nodes
-            .iter()
-            .filter_map(|node| {
-                let hops = node.chain_hops()?;
-                let ids = hops
-                    .iter()
-                    .map(|hop| unique(hop))
-                    .collect::<Option<Box<[Uuid]>>>()?;
-                Some((node.id, ids))
-            })
-            .collect();
         let groups = groups
             .iter()
             .map(|group| Edges {
@@ -107,7 +94,7 @@ impl<'a> GroupGraph<'a> {
                     Config::BUILTIN_BLOCK_NODE => Some(FinalEdge::Block),
                     _ => match namesakes(name) {
                         [] => index.get(name).map(|index| FinalEdge::Group(*index)),
-                        nodes => Some(FinalEdge::Nodes(nodes.iter().map(|(_, id)| *id).collect())),
+                        [(_, id), ..] => Some(FinalEdge::Node(*id)),
                     },
                 }),
                 exit: group.exit.as_deref().map(|name| {
@@ -122,7 +109,6 @@ impl<'a> GroupGraph<'a> {
             groups,
             index,
             nodes: by_id,
-            chains,
         }
     }
 
@@ -147,64 +133,24 @@ impl<'a> GroupGraph<'a> {
         self.groups[group].exit
     }
 
-    pub fn final_edge(&self, group: usize) -> Option<&FinalEdge> {
-        self.groups[group].final_edge.as_ref()
-    }
-
-    /// Whether any group has an exit.
-    pub fn has_exits(&self) -> bool {
-        self.groups.iter().any(|group| group.exit.is_some())
-    }
-
     pub fn node(&self, id: Uuid) -> Option<&'a Node> {
         self.nodes.get(&id).copied()
     }
 
-    /// A configured chain's hop IDs, entry first; `None` for any other node
-    /// and for a chain whose hops do not each name exactly one node.
-    pub fn chain_hops(&self, id: Uuid) -> Option<&[Uuid]> {
-        self.chains.get(&id).map(|hops| &hops[..])
-    }
-
-    /// Every resolved configured chain, by chain node ID.
-    pub fn chains(&self) -> impl Iterator<Item = (Uuid, &[Uuid])> {
-        self.chains.iter().map(|(id, hops)| (*id, &hops[..]))
-    }
-
-    /// Visit every leaf reachable from `root` through members, subgroups and
-    /// `final`, in that order, within `limits`. The visitor sees the exits of
-    /// the groups on the current path, outermost first.
-    pub fn visit(
-        &self,
-        root: usize,
-        limits: Limits,
-        visitor: &mut impl Visitor,
-    ) -> ControlFlow<()> {
+    /// Visit leaves reachable from `root` through members, subgroups and
+    /// `final`, in that order. The walk visits at most `MAX_GROUP_DEPTH`
+    /// groups per path and never enters a group twice on the same path.
+    /// The visitor sees the exits of that path, outermost first.
+    pub fn visit(&self, root: usize, visitor: &mut impl Visitor) -> ControlFlow<()> {
         let mut walk = Walk {
             graph: self,
-            limits,
-            path: Vec::with_capacity(limits.max_depth),
-            exits: Vec::with_capacity(limits.max_depth),
+            path: Vec::with_capacity(MAX_GROUP_DEPTH),
+            exits: Vec::with_capacity(MAX_GROUP_DEPTH),
             visitor,
         };
         walk.group(root, 0)?;
         ControlFlow::Continue(())
     }
-}
-
-/// How far a traversal goes. A group already on the current path is not
-/// entered again, and a `final` naming several nodes reaches the first.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// Groups on one path; the root is at depth 0.
-    pub(crate) max_depth: usize,
-}
-
-impl Limits {
-    /// What group selection reaches.
-    pub const SELECTION: Self = Self {
-        max_depth: MAX_GROUP_DEPTH,
-    };
 }
 
 /// A leaf reached by a traversal.
@@ -250,7 +196,6 @@ pub trait Visitor {
 
 struct Walk<'g, 'a, 'v, V> {
     graph: &'g GroupGraph<'a>,
-    limits: Limits,
     path: Vec<usize>,
     exits: Vec<Uuid>,
     visitor: &'v mut V,
@@ -258,7 +203,7 @@ struct Walk<'g, 'a, 'v, V> {
 
 impl<V: Visitor> Walk<'_, '_, '_, V> {
     fn group(&mut self, group: usize, depth: usize) -> ControlFlow<(), bool> {
-        if depth >= self.limits.max_depth || self.path.contains(&group) {
+        if depth >= MAX_GROUP_DEPTH || self.path.contains(&group) {
             return ControlFlow::Continue(false);
         }
         if self.visitor.enter(group, depth, &self.exits)? == Step::Skip {
@@ -278,15 +223,15 @@ impl<V: Visitor> Walk<'_, '_, '_, V> {
         for subgroup in &edges.subgroups {
             complete &= self.group(*subgroup, depth + 1)?;
         }
-        match &edges.final_edge {
+        match edges.final_edge {
             None => {}
             Some(FinalEdge::Direct) => self.visitor.leaf(Leaf::Direct, &self.exits)?,
             Some(FinalEdge::Block) => self.visitor.leaf(Leaf::Block, &self.exits)?,
-            Some(FinalEdge::Nodes(nodes)) => {
-                self.visitor.leaf(Leaf::Node(nodes[0]), &self.exits)?;
+            Some(FinalEdge::Node(id)) => {
+                self.visitor.leaf(Leaf::Node(id), &self.exits)?;
             }
             Some(FinalEdge::Group(final_group)) => {
-                complete &= self.group(*final_group, depth + 1)?;
+                complete &= self.group(final_group, depth + 1)?;
             }
         }
         if exit.is_some() {

@@ -109,8 +109,7 @@ impl<'a> ParserDiagnostics<'a> {
         })
     }
 
-    /// Validate a node written as entry syntax rather than a share link and
-    /// locate a failure at the current entry, as share-link failures are.
+    /// Locate validation failures at the current entry, as for share links.
     pub fn validate_entry_node(
         &self,
         node: &crate::node::Node,

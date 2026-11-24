@@ -151,9 +151,9 @@ mod entries {
 
     use honk_config::dns::{DnsStrategy, DnsUpstream};
 
-    use super::transports::{PooledTransport, TransportKey};
+    use super::transports::TransportSlots;
     use crate::dns::endpoint::DnsEndpoint;
-    use crate::dns::transport::{LifecycleSlot, UdpPool};
+    use crate::dns::transport::UdpPool;
 
     pub(super) struct UdpFamily {
         pub(super) address: SocketAddr,
@@ -192,8 +192,7 @@ mod entries {
         pub(super) protocol: honk_config::types::DnsProtocol,
         pub(super) endpoint: DnsEndpoint,
         pub(super) outbound: Option<String>,
-        pub(super) transports:
-            parking_lot::Mutex<HashMap<TransportKey, Arc<LifecycleSlot<PooledTransport>>>>,
+        pub(super) transports: parking_lot::Mutex<TransportSlots>,
         pub(super) udp: parking_lot::Mutex<UdpState>,
         pub(super) udp_creation: [tokio::sync::Mutex<()>; 2],
     }
@@ -225,7 +224,7 @@ mod entries {
                     protocol: upstream.protocol,
                     endpoint,
                     outbound: upstream.outbound.clone(),
-                    transports: parking_lot::Mutex::new(HashMap::new()),
+                    transports: parking_lot::Mutex::default(),
                     udp: parking_lot::Mutex::new(UdpState::default()),
                     udp_creation: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
                 },
@@ -513,6 +512,7 @@ impl UpstreamPool {
 
     pub(crate) fn reap_idle_resources(&self) -> usize {
         self.reap_udp_shards(std::time::Instant::now())
+            + self.idle_resources.reap_idle(false)
             + self
                 .runtime_generation
                 .get()

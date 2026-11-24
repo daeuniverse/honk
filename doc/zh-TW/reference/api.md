@@ -838,11 +838,17 @@ honk 不接受呼叫方指定的 URL。探測用途由 `kind` 決定，不用在
 
 HTTP 使用設定中的檢查 URL，不跟隨重新導向。DNS 執行真實的 UDP 交換或帶長度幀的 TCP 交換。探測目標只來自已接受的設定；honk 不對目標或節點伺服器施加位址、連接埠策略。
 
-目標主機名稱依目前 DNS 設定解析；這份設定答不上來時，例如用了 `asis` 路由，就退回 bootstrap DNS。私網、loopback 位址與非預設設定連接埠不需要額外放行。IPv4-mapped IPv6 會正規化成 IPv4；選中的 IP 保持固定，HTTP Host 與 TLS SNI 保留設定中的名稱，不能交給代理重新解析。探測、geodata 與共用下載都使用設定中的目標，不設位址或連接埠白名單。
+探測目標和節點伺服器名稱使用接納探測時的 DNS 設定。若這份設定無法回答（例如使用 `asis` 路由），探測使用同一份設定的 bootstrap DNS，不會改用重載後的解析器。IPv4-mapped IPv6 會正規化成 IPv4；選中的 IP 保持固定，HTTP Host 與 TLS SNI 保留設定中的名稱。探測、geodata 和共用下載都使用設定中的目標，不設位址或連接埠白名單，私網、loopback 位址和非預設連接埠也無需額外放行。
 
 能夠寫入設定或控制訂閱內容的人，決定這些目標是什麼。provider 內容屬於可信的設定。
 
 對 `direct`、`block` 節點做 `tcp_connect`、以[鏈式節點](./nodes.md#鏈式節點)為目標做 `tcp_connect`，或對不支援 UDP 的節點做 UDP 探測，會在這項測量開始之前回傳 `422 unsupported_value`。對群組做 `tcp_connect` 探測時，其他成員照常測量；鏈式節點成員結果列的 `state` 為 `unavailable`，`error` 為 `no_node_address`，因為鏈式節點沒有自己的伺服器位址。
+
+原生介面的鏈式 HTTP 探測（`cold` 和 `warm`）及採用長度訊框的 TCP DNS 探測，每次測量都會建立由清理守衛管理的私有鏈執行環境和各實體跳的私有執行環境。它們共用當代與行程的撥號額度，以及 VLESS 載體額度。探測不借用業務工作階段，也不會將工作階段放入業務連線池。準備時會用任務擷取的 DNS 世代分別固定探測目標 IP 和實體入口伺服器 IP。後續跳的伺服器網域名稱仍由前一跳解析。
+
+上傳或分流下載伺服器的 hosts 別名會依[別名目標的節點網域規則](./dns.md#節點伺服器網域)解析。即使檢查 URL 使用相同網域，仍依探測目的地的 DNS 原則解析，兩者不共用別名結果。如果目的地沒有所要求 IP 位址族的位址，探測不會查詢上傳或下載伺服器的網域。
+
+HTTP `cold` 從撥號開始計時，包含適用的目標 TLS 交握，以及一次依設定送出的 HTTP 請求和回應驗證。`warm` 在同一條連線上先送出並驗證 HEAD，再對隨後依設定送出的請求計時。符合退回條件的傳輸失敗可以回報已驗證的 HEAD 樣本。回應無效或收到不完整的 HTTP/1 回應標頭時，測量失敗。探測完成、取消或逾期後，操作均會等候私有執行環境清理完畢。
 
 | 探測預算 | 上限 |
 | --- | --- |
@@ -1091,7 +1097,7 @@ GET 與成功的 PATCH 回應中有唯讀的 `recording`：`flows`、`logs`、`d
 
 只有啟用與訂閱協調都完成之後，才以 `201` 回傳目前的 Node 或 Provider 與 `Location`。HTTP 斷線不會取消已經入佇列的工作。使用 `--store db` 時，這些操作記錄新修訂，不重寫主檔案。
 
-節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個 ASCII 字母、數字或 `_.-`，HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
+節點名稱 1–64 字元，連結最多 8192 字元。provider 名稱是 1–64 個字元，不含控制字元；`[A-Za-z0-9_.-]` 以外的名稱加引號寫入，設定無法加引號的名稱回傳 `422 unsupported_value`。HTTP(S) URL 最多 4096 字元。違反結構定義中的長度、匹配模式、列舉或邊界要求時，回傳 `400 invalid_request`。
 
 重名回傳 409。結構合法但不支援的連結、身分、provider URL scheme 或選項回傳 422。新 provider 即使有舊的快取內容，也從零節點、`stale`、沒有更新時間的狀態開始。
 
@@ -1213,7 +1219,33 @@ loopback 主體不能修改 `geodata`，會收到 `403 permission_denied`。所�
 
 回傳 404 視為沒有發布校驗檔案，檔案依未校驗處理。其他狀態或失敗，都會讓這個 URL 失敗。某個資產的所有 URL 都失敗時，失敗詳情描述最後嘗試的那個 URL，給出 `stage` 與失敗的資產 `asset`（`geosite` 或 `geoip`）。
 
-如果這個 URL 是因為伺服器回應而失敗，還會給出該回應的 `http_status`，也就是檔案回傳非 200，或校驗檔案回傳非 200 且非 404 的那個狀態。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示伺服器拒絕的是 `.sha256sum`，不是檔案本身。設定檔、已儲存與內建的 geodata URL，包括校驗檔案請求，都不設位址或連接埠白名單。
+如果這個 URL 是因為伺服器回應而失敗，還會給出該回應的 `http_status`，也就是檔案回傳非 200，或校驗檔案回傳非 200 且非 404 的那個狀態。`asset: geoip, stage: checksum_unavailable, http_status: 403` 表示伺服器拒絕的是 `.sha256sum`，不是檔案本身。
+
+`stage` 取以下值之一：
+
+| Stage | 說明 |
+| --- | --- |
+| `invalid_source` | URL 無法解析，或缺少 host、連接埠。 |
+| `download_timeout` | 30 秒內沒有回應標頭，回應內容連續 30 秒沒有進展，整個下載超過 10 分鐘，或校驗請求超過 10 秒期限。 |
+| `connection_failed` | 連線或隧道無法建立。 |
+| `tls_failed` | TLS 建立或憑證驗證失敗。 |
+| `http_failed` | 連線建立後 HTTP 交換失敗，例如回應格式錯誤或讀取回應內容出錯。 |
+| `http_not_found` | 檔案 URL 回傳 404。 |
+| `http_status_rejected` | 檔案 URL 回傳 200 以外的狀態，或校驗 URL 回傳 200、404 以外的狀態；`http_status` 給出狀態碼。 |
+| `content_encoding_rejected` | 伺服器回傳 identity 以外的 content encoding。 |
+| `asset_too_large` | 回應內容超過 256 MiB，或校驗回應內容超過 1 KiB。 |
+| `route_blocked` | 下載路由把請求交給 `block`。 |
+| `group_unavailable` | 路由或其代理群組沒有可用的出站或節點。 |
+| `checksum_unavailable` | 校驗請求回傳 404 以外的狀態，或出現其他失敗。 |
+| `checksum_mismatch` | 發布的摘要與檔案的 SHA-256 不一致。 |
+| `asset_validation_failed` | 下載的檔案無法滿足目前設定的 geodata 要求，例如缺少需要的分類。 |
+| `candidate_validation_failed` | 換上新資產的候選設定未通過驗證。 |
+| `staging_failed` | 已驗證的位元組無法暫存為替換檔案。 |
+| `replacement_failed` | 替換在寫入前被拒絕或失敗；該資產在磁碟上的位元組未改變。 |
+| `directory_sync_failed` | 位元組已寫入磁碟，但無法確認目錄項目已持久化。 |
+| `written_asset_conflict` | 最終檢查前，已寫入的檔案發生變化。 |
+
+設定檔、已儲存與內建的 geodata URL，包括校驗檔案請求，都不設位址或連接埠白名單。
 
 `verify_checksum` 預設為 `true`。設成 `false` 後，手動與自動更新都不再請求 `.sha256sum`，下載的檔案一律依未校驗處理：`verified` 為 `false`，`sha256` 照常回報。這個設定用於那些缺少校驗檔案時會回傳非 404 狀態、或回傳非校驗內容頁面的鏡像站。
 
@@ -1283,13 +1315,6 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 
 完整發行產物包含內嵌 UI，精簡的 `-clash-api` 與 `-native-api` 產物不包含。二進位檔中內嵌兩個版本各自的宣告；每個完整發行壓縮檔也會在 `doona/` 與 `doona-lite/` 目錄中附帶這些檔案。lite 版使用系統字型。
 
-內嵌產物不含 Noto Sans TC 與 SC 字型。doona 的 CSS 用 `font-display: optional` 宣告這些字型，因此字型請求回傳 404 時，瀏覽器會使用系統字型。
-
-需要 Noto Sans 時，可以從以下兩種方式中選一種：
-
-- 從 [doona 發行頁](https://github.com/Zakkaus/doona/releases)下載 `doona-<version>.tar.gz` 與 `doona-fonts-<version>.tar.gz`，解壓到同一目錄，並讓 `ui` 指向該目錄。
-- 安裝 `doona` 與 `doona-fonts` 套件，並設定 `ui: /usr/share/doona`。
-
 兩個版本共用的 GPL-3.0-only 原始碼，是 doona 標籤 [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5)。發行流程會把 `doona-source-0.1.0-rc.5.tar.gz` 附加到正式標籤發行與滾動 Debug 發行上。這個包由 `ci/fetch-doona.sh --source` 產生：先確認標籤仍指向固定的提交，再執行 `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n`，使用 GNU gzip。
 
 再散布 `native-ui` 二進位檔時，要保留宣告，並依 GPL-3.0 第 6 條允許的方式提供對應的原始碼。
@@ -1306,6 +1331,8 @@ geodata owner 存在時，`GET /geodata` 還會報告下面這些欄位：
 換成別的 gzip 實作，即使壓縮的是同樣的 tar 位元組，也可能得到不同的包摘要。Cargo 建置只內嵌 `HONK_DOONA_DIR` 與它 `-lite` 同級目錄中的檔案，既不建置也不下載前端。這份原始碼的檢查器是 `tools/conformance.mjs`。
 
 即時 walk 是唯讀的，會跳過控制、診斷與缺少已觀測 ID 的資源。基礎契約與管理契約要分別核對，瀏覽器操作另外驗收。模式檢查通過，不等於完整的 UI、核心或部署矩陣都通過了。
+
+字型、UI 安裝與打包見 [doona 手冊](https://daeuniverse.org/doona/)。
 
 ### 連線關閉、模式與資料面生命週期
 
@@ -1506,15 +1533,17 @@ bucket 的順序列出已通過 admission 的非 worker 訂閱；各來源表內
 
 兩輪最終回應的解碼狀態都必須是有效的 200–499。第二輪傳輸失敗或逾時時，可以退回已經驗證過的第一輪樣本。HTTP/1 的部分回應即使逾時也不退回；正常的 HTTP/2 GOAWAY 則可以退回。
 
-每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。session 預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。針對冷的可重用 generation 的探測，使用帶 guard 的臨時執行時，結束後關閉。鏈式節點例外：它的探測經當前 generation 中各跳的執行時撥號，因此冷探測會重用某一跳已預熱的 session。
+每輪 HTTP/1 的臨時回應 header 與最終回應 header 累計上限是 16 KiB，HTTP/2 的回應 header 清單上限也是 16 KiB。工作階段預熱、撥號、目標 TLS、HTTP/2 啟動與每輪請求各自使用階段預算。一般可重用節點尚未預熱時，使用帶清理守衛的臨時執行環境，結束後關閉。Clash 延遲測試、舊版 URLTest 和週期 HTTP 健康檢查借用當代已准入的鏈，因此可能重用實體入口的現有工作階段。原生介面使用自己的私有執行環境，見[有界探測](#有界探測)。
+
+鏈式節點的 TCP IPv4 健康狀態已判為失效時，Clash 延遲測試可在連續兩次探測成功後恢復該位址族的健康狀態。
 
 HTTP/2 驅動任務在完成或取消後釋放，因此群組掃描不會為每個已測試節點留下新的常駐可重用執行時。
 
-測量成功會更新節點的延遲歷史。單一節點失敗回傳 `503`；群組測量會省略失敗的成員；任意手動測試目標的失敗，都不會增加真實撥號失敗的連續計數。
+重載前已接納的測量仍可回傳結果。已登記節點只有在健康登記和實際撥號路徑都未變時才更新健康歷程。對未登記的一般節點，`/proxies/{name}/delay` 成功後只更新 Clash 顯示的歷程，不改變健康狀態或 Score。只要同一實體節點始終未登記，無關的重載會保留它的樣本，進行中的測量仍可寫入結果。單一節點失敗回傳 `503`；群組測量省略失敗成員。手動測試失敗不會增加實際撥號的連續失敗次數。
 
-`/proxies/{name}/delay` 回傳 `{"delay":12}`；`/group/{name}/delay` 回傳 `{"<member>":12,...}`。延遲以毫秒計，上限 65535。對 URLTest 群組，兩個介面都可能依新測量切換其選擇。
+`/proxies/{name}/delay` 回傳 `{"delay":12}`；`/group/{name}/delay` 回傳 `{"<member>":12,...}`。延遲以毫秒計，上限 65535。只有原群組管理器仍在使用時，這兩個介面才可能依測量結果重新選擇 URLTest 成員。
 
-按需的 delay exchange 會保留 Alive/API 的延遲歷史，但不回報業務結果，也不填充設定中 Score 的比較 cohort。實際的 server 或 session 前置準備可以回報聚合的預熱建立情況；honk 不會把呼叫方的 URL 虛構成預熱自身的目標，也不提供晉升證明。
+隨選延遲測量不回報業務結果，也不填充設定中 Score 的比較 cohort。實際的 server 或 session 前置準備可以回報聚合的預熱建立情況；honk 不會把呼叫方的 URL 虛構成預熱自身的目標，也不提供晉升證明。
 
 兩個延遲介面都會一直持有已接納的任務，直到測量清理結束，即使 HTTP 用戶端已經斷開。owner 接納失敗時回傳 `503`，這個回應會區分容量耗盡、檢查已停止與 worker 失敗。
 

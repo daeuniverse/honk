@@ -164,6 +164,18 @@ impl<T> LifecycleSlot<T> {
         self.close_count.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn is_closed(&self) -> bool {
+        matches!(self.inner.lock().state, SlotState::Closed)
+    }
+
+    pub(super) fn is_inactive(&self, unusable: impl FnOnce(&T) -> bool) -> bool {
+        match &self.inner.lock().state {
+            SlotState::Closed | SlotState::Closing { .. } => true,
+            SlotState::Ready(value) => unusable(value),
+            SlotState::Building { .. } => false,
+        }
+    }
+
     async fn finish_close(&self, value: Arc<T>, teardown: Shared<BoxFuture<'static, ()>>) {
         teardown.await;
         let mut inner = self.inner.lock();
@@ -250,8 +262,11 @@ impl<T> LifecycleSlot<T> {
         self.close_observed(None, close).await;
     }
 
+    /// A predicate restricts routine reaping to transports with no reusable
+    /// session. Pressure may reclaim any unborrowed transport (`None`).
     pub(crate) fn retire_idle<F, Fut>(
         self: &Arc<Self>,
+        is_empty: Option<fn(&T) -> bool>,
         close: F,
     ) -> Option<impl Future<Output = ()> + Send + 'static>
     where
@@ -265,7 +280,10 @@ impl<T> LifecycleSlot<T> {
                 return None;
             }
             match &inner.state {
-                SlotState::Ready(value) if Arc::strong_count(value) == 1 => {
+                SlotState::Ready(value)
+                    if Arc::strong_count(value) == 1
+                        && is_empty.is_none_or(|is_empty| is_empty(value)) =>
+                {
                     let value = Arc::clone(value);
                     let resource = Arc::clone(&value);
                     let teardown = async move { close(resource).await }.boxed().shared();
@@ -274,9 +292,11 @@ impl<T> LifecycleSlot<T> {
                         teardown: teardown.clone(),
                     };
                     inner.idle_retiring = true;
-                    crate::stats::record_dns_event(
-                        crate::stats::DnsStatEvent::PressureRetiredTransport,
-                    );
+                    if is_empty.is_none() {
+                        crate::stats::record_dns_event(
+                            crate::stats::DnsStatEvent::PressureRetiredTransport,
+                        );
+                    }
                     (value, teardown)
                 }
                 SlotState::Closing { value, teardown } => {

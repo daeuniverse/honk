@@ -18,6 +18,18 @@ impl GroupManager {
         self.selector_member_in(group, network, &self.selector_choice.read())
     }
 
+    pub(super) fn plan_selector_member<'a>(
+        &'a self,
+        group: &'a Group,
+        network: SelectionNetwork,
+        snapshot: Option<&SelectorState>,
+    ) -> Option<GroupMember<'a>> {
+        match snapshot {
+            Some(state) => self.selector_member_in(group, network, state),
+            None => self.selector_member(group, network),
+        }
+    }
+
     pub(super) fn selector_member_in<'a>(
         &'a self,
         group: &'a Group,

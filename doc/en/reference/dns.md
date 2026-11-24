@@ -299,6 +299,7 @@ dns {
 }
 ```
 
+- A chain has no server hostname of its own. Its physical hops keep their own subscription tags.
 - Only `subtag()` rules are evaluated for node hosts; ordinary rules, the fallback and unmatched hosts still use the bootstrap resolver. Other queries carry no subscription, so `subtag()` and `!subtag()` are false for them.
 - A claimed lookup queries only the selected upstream, honors `strategy` and `use_host`, and skips the cache and response rules. It never falls back, so its failure fails the physical node or probe connection.
 - A claim applies to the hostname. It is not an end-to-end policy for the download destination. A download's preliminary URL lookup for routing is best effort; proxied URL domains are still resolved by the proxy, while that proxy's own node-server lookup obeys the rule. Downloads using an explicit bootstrap resolver bypass the hook.

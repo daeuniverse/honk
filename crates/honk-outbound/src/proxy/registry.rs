@@ -19,9 +19,9 @@ use super::vless::VLessHandler;
 #[cfg(feature = "rprx")]
 use super::vmess::VmessHandler;
 use super::{
-    DirectMark, MultiTargetTransport, PacketOutbound, PacketRejection, PacketTransport,
-    PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound,
-    WarmOutcome, WarmRequirement, WarmableOutbound,
+    DirectMark, MissingProtocolHandler, MultiTargetTransport, PacketOutbound, PacketRejection,
+    PacketTransport, PreparedUdpTransport, ProbeableOutbound, ProxyStream, SharedSourceOutbound,
+    TcpOutbound, WarmOutcome, WarmRequirement, WarmableOutbound,
 };
 
 /// One registered protocol: its descriptor plus the capability objects it
@@ -207,15 +207,7 @@ impl ProxyRegistry {
                 .with_warmable(juicity.clone())
                 .with_probeable(juicity),
         );
-        // A chain dials its hops through the handlers registered above.
-        let hop_handlers = registry
-            .entries
-            .iter()
-            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
-            .collect();
-        let chain = Arc::new(ChainHandler::new(hop_handlers));
-        registry.register(ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)));
-        registry.chain = Some(chain);
+        registry.register_chain();
         for entry in &registry.entries {
             entry.validate_consistency();
         }
@@ -224,6 +216,12 @@ impl ProxyRegistry {
 
     pub fn register(&mut self, entry: ProtocolEntry) {
         self.entries.push(entry);
+    }
+
+    pub(super) fn register_chain(&mut self) {
+        let chain = Arc::new(ChainHandler::new(&self.entries));
+        self.register(ProtocolEntry::new(NodeProtocol::Chain, Arc::clone(&chain)));
+        self.chain = Some(chain);
     }
 
     pub fn find(&self, protocol: NodeProtocol) -> Option<&ProtocolEntry> {
@@ -242,7 +240,7 @@ impl ProxyRegistry {
         let protocol = node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
 
         tracing::debug!(
             "Dialing {}:{} via {} ({})",
@@ -299,6 +297,37 @@ impl ProxyRegistry {
         }
     }
 
+    /// After a fresh successful dial, whether its actual handler confirmed the target at open.
+    pub fn confirms_target_on_open(
+        &self,
+        generation: &crate::runtime::OutboundRuntimeRegistry,
+        target: DialRef<'_>,
+    ) -> bool {
+        if generation.is_shutdown() {
+            return false;
+        }
+        match target {
+            DialRef::Node(id) => generation
+                .get_ref(&id)
+                .and_then(|runtime| self.find(runtime.node.protocol()))
+                .is_some_and(|entry| entry.tcp.confirms_target_on_open()),
+            DialRef::Route(route) => {
+                let Some(chain) = &self.chain else {
+                    return false;
+                };
+                let mut handlers = route
+                    .hops()
+                    .iter()
+                    .map(|id| chain.handler(generation.get_ref(id)?.node.protocol()));
+                handlers
+                    .next_back()
+                    .flatten()
+                    .is_some_and(|handler| handler.confirms_target_on_open())
+                    && handlers.all(|handler| handler.is_some())
+            }
+        }
+    }
+
     /// Dial a route over the captured generation's hop runtimes. The dial's
     /// tasks have no owner of their own; each hop scopes its own to its
     /// runtime, as for a configured chain.
@@ -316,17 +345,15 @@ impl ProxyRegistry {
         let chain = self
             .chain
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", NodeProtocol::Chain))?;
+            .ok_or(MissingProtocolHandler(NodeProtocol::Chain))?;
         let runtime = generation
             .route_runtime(route)
             .ok_or_else(|| anyhow::anyhow!("route is not in runtime generation"))?;
+        // The two task scopes borrow one dial; nesting its state by value grows every dial_ref.
+        let dial =
+            std::pin::pin!(chain.dial_route_tcp(&runtime, target, target_domain, connect_timeout));
         let result = generation
-            .scope_dials(crate::runtime::scope_unowned(chain.dial_route_tcp(
-                &runtime,
-                target,
-                target_domain,
-                connect_timeout,
-            )))
+            .scope_dials(crate::runtime::scope_unowned(dial))
             .await?;
         if generation.is_shutdown() {
             anyhow::bail!("outbound runtime generation shut down during dial");
@@ -375,7 +402,7 @@ impl ProxyRegistry {
         let protocol = runtime.node.protocol();
         let entry = self
             .find(protocol)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", protocol))?;
+            .ok_or(MissingProtocolHandler(protocol))?;
         let quality = runtime.transport_quality();
         let dial = dial(Arc::clone(&runtime), entry)?;
         let result = generation

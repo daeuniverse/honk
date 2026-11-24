@@ -690,9 +690,9 @@ impl FlatNode {
             }
             NodeProtocol::Direct => OutboundConfig::Direct,
             NodeProtocol::Block => OutboundConfig::Block,
-            NodeProtocol::Chain => OutboundConfig::Chain {
-                hops: std::mem::take(&mut flat.hops),
-            },
+            NodeProtocol::Chain => {
+                OutboundConfig::Chain(super::ChainConfig::new(std::mem::take(&mut flat.hops)))
+            }
         };
         if !flat.tls_alpn.is_empty() {
             return Err(semantic_error(
@@ -924,7 +924,7 @@ impl<'a> WireOptions<'a> {
                 wire.anytls_idle_session_timeout = config.idle_session_timeout;
                 wire.set_tls(&config.tls);
             }
-            OutboundConfig::Chain { hops } => wire.hops = Some(hops),
+            OutboundConfig::Chain(config) => wire.hops = Some(&config.hops),
             OutboundConfig::Direct | OutboundConfig::Block => {}
         }
         wire

@@ -21,6 +21,8 @@ pub enum WarmOutcome {
 /// Settings for a hop dialed over a stream tunneled through earlier hops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TunnelDialOptions {
+    /// Base of the REALITY handshake budget (three times this value). Other
+    /// handshakes are bounded by the caller's deadline for the whole chain.
     pub connect_timeout: Duration,
     /// Offer hybrid post-quantum key shares in a REALITY ClientHello. A
     /// caller redials with `false` after a REALITY mask certificate.
@@ -46,6 +48,11 @@ pub trait TcpOutbound: Send + Sync {
         target_domain: Option<&str>,
         connect_timeout: Duration,
     ) -> anyhow::Result<ProxyStream>;
+
+    /// Whether a successful TCP open always includes a proxy reply confirming the target.
+    fn confirms_target_on_open(&self) -> bool {
+        false
+    }
 
     /// The provided `tcp` stream is already connected to the proxy
     /// server. Handlers that support connection pooling override this to
@@ -100,11 +107,16 @@ pub trait TcpOutbound: Send + Sync {
     /// to its server through earlier hops. The carrier's physical connection
     /// owns dial admission and transport observation (`TransportAttached`,
     /// `TransportReady`). This hop still emits its target milestones as a
-    /// direct dial does: `TargetRequestSent` through `request_write`, so a
-    /// carrier that defers delivery defers the event, and `TargetConfirmed`
-    /// directly once a protocol reply confirms the target. A caller chaining
-    /// several hops must suppress them on every hop but the last. Protocols that cannot run over a tunneled
-    /// stream keep the default, a [`TunnelUnsupported`] error.
+    /// direct dial does: `TargetRequestSent` once the carriers below have
+    /// delivered the request, and `TargetConfirmed` once a protocol reply
+    /// confirms the target. Relay tasks of earlier hops (WS bridge, VMess)
+    /// and a gRPC connection driver defer delivery to their physical write;
+    /// a first hop that hands writes to its own session writer (AnyTLS,
+    /// VLESS mux, XHTTP) may report delivery once that writer accepts them.
+    /// A caller chaining several hops suppresses them on every hop but the
+    /// last.
+    /// Protocols that cannot run over a tunneled stream keep the default, a
+    /// [`TunnelUnsupported`] error.
     async fn dial_over(
         &self,
         runtime: Arc<crate::runtime::NodeRuntime>,

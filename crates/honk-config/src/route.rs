@@ -9,9 +9,8 @@ use uuid::Uuid;
 
 /// The nodes a group member dials when the groups it was selected through
 /// have exits: the leaf's own hops, then one hop per exit from the innermost
-/// group out. Two routes are equal when they have the same leaf and dial the
-/// same hops; node IDs derive from node content, so a route keeps its
-/// identity across reloads.
+/// group out. Equality includes the leaf ID, the ordered physical hop IDs,
+/// and how many leading hops belong to the leaf for failure attribution.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Route {
     /// The group member: a plain node, a configured chain or builtin `direct`.
@@ -78,12 +77,15 @@ mod tests {
     }
 
     #[test]
-    fn routes_over_the_same_hops_from_different_leaves_stay_apart() {
-        let [chain, a, b, exit] = [1, 2, 3, 4].map(Uuid::from_u128);
-        let through_chain = Route::new(chain, &[a, b, exit], 2);
-        let through_plain = Route::new(a, &[a, b, exit], 1);
-        assert_ne!(through_chain, through_plain);
-        let set: std::collections::HashSet<_> = [through_chain, through_plain].into();
-        assert_eq!(set.len(), 2);
+    fn route_keys_distinguish_the_leaf_and_its_hop_boundary() {
+        let [leaf, other, a, b, c, exit] = [1, 2, 3, 4, 5, 6].map(Uuid::from_u128);
+        let hops = [a, b, c, exit];
+        let route = Route::new(leaf, &hops, 2);
+        let other_leaf = Route::new(other, &hops, 2);
+        let other_boundary = Route::new(leaf, &hops, 3);
+        assert_ne!(route, other_leaf);
+        assert_ne!(route, other_boundary);
+        let set = std::collections::HashSet::from([route, other_leaf, other_boundary]);
+        assert_eq!(set.len(), 3);
     }
 }

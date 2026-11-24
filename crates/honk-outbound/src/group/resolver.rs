@@ -12,12 +12,14 @@ struct LeafWalk {
     /// Only what UDP selection reaches: it offers nothing from a group
     /// with an exit, as routes carry TCP only.
     udp: bool,
+    exits: bool,
 }
 
 impl LeafWalk {
     const MEMBERS: Self = Self {
         include_final: false,
         udp: false,
+        exits: false,
     };
     const REACHABLE: Self = Self {
         include_final: true,
@@ -361,6 +363,37 @@ impl GroupManager {
         self.group_leaf_nodes(group_name, true)
     }
 
+    /// Exit paths also depend on physical hops of a configured chain. This walk only
+    /// drives invalidation; raw probes and Score attribution remain leaf-owned.
+    pub fn visit_route_health_dependencies(
+        &self,
+        group_name: &str,
+        mut visit: impl FnMut(uuid::Uuid) -> bool,
+    ) -> bool {
+        if !self
+            .groups
+            .get(group_name)
+            .is_some_and(|entry| entry.routes)
+        {
+            return false;
+        }
+        self.visit_group_leaves(
+            group_name,
+            0,
+            &mut [""; MAX_GROUP_DEPTH],
+            LeafWalk {
+                exits: true,
+                ..LeafWalk::REACHABLE
+            },
+            &mut |node| {
+                visit(node.id)
+                    || node
+                        .resolved_chain_hops()
+                        .is_some_and(|hops| hops.iter().copied().any(&mut visit))
+            },
+        )
+    }
+
     /// Whether membership or explicit final edges can reach this health carrier.
     pub fn group_reaches_node(&self, group_name: &str, node_id: uuid::Uuid) -> bool {
         self.visit_group_leaves(
@@ -416,6 +449,7 @@ impl GroupManager {
         group: &'a Group,
         domain: ProbeDomain,
         effects: SelectionEffects,
+        selector: Option<&SelectorState>,
     ) -> Option<&'a Node> {
         if domain != ProbeDomain::Tcp || group.final_outbound.is_some() {
             return None;
@@ -424,7 +458,7 @@ impl GroupManager {
         match leaves.as_slice() {
             [node]
                 if self
-                    .first_leaf(group, &mut Vec::new(), 0, true)
+                    .first_leaf(group, &mut Vec::new(), 0, true, selector)
                     .is_some_and(|selected| selected.id == node.id) =>
             {
                 self.warn_selector_last_resort(group, &node.name, effects);
@@ -450,6 +484,14 @@ impl GroupManager {
         };
         if walk.udp && group.exit.is_some() {
             return false;
+        }
+        if walk.exits
+            && let Some(exit) = self
+                .group_exit(group_name)
+                .and_then(|id| self.nodes.get(&id))
+            && visit(exit)
+        {
+            return true;
         }
         visited[depth] = group.name.as_str();
         group
@@ -487,12 +529,13 @@ impl GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
         respect_selectors: bool,
+        selector: Option<&SelectorState>,
     ) -> Option<&'a Node> {
         if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return None;
         }
         let selected = match respect_selectors
-            .then(|| self.selector_member(group, SelectionNetwork::Tcp))
+            .then(|| self.plan_selector_member(group, SelectionNetwork::Tcp, selector))
             .flatten()
         {
             None if respect_selectors && group.policy == GroupPolicy::Selector => return None,
@@ -502,14 +545,20 @@ impl GroupManager {
         let result = match selected {
             Some(GroupMember::Node(node)) => Some(node),
             Some(GroupMember::Group(sub)) => {
-                self.first_leaf(sub, visited, depth + 1, respect_selectors)
+                self.first_leaf(sub, visited, depth + 1, respect_selectors, selector)
             }
             None => {
                 let mut result = group.nodes.iter().find_map(|id| self.nodes.get(id));
                 if result.is_none() {
                     for tag in &group.groups {
                         if let Some(sub) = self.groups.get(tag).map(|entry| &entry.group) {
-                            result = self.first_leaf(sub, visited, depth + 1, respect_selectors);
+                            result = self.first_leaf(
+                                sub,
+                                visited,
+                                depth + 1,
+                                respect_selectors,
+                                selector,
+                            );
                             if result.is_some() {
                                 break;
                             }
@@ -662,7 +711,7 @@ impl GroupManager {
                 )
                 .or_else(|| {
                     let mut visited = Vec::new();
-                    self.first_leaf(sub, &mut visited, 0, false)
+                    self.first_leaf(sub, &mut visited, 0, false, None)
                 });
             if let Some(leaf) = leaf
                 && !seen.contains(&leaf.id)
@@ -677,8 +726,14 @@ impl GroupManager {
     /// Migrate exact choices, dropping removed members rather than retargeting a
     /// same-named node. The control owner fences writes against this publication.
     pub fn migrate_selector_choices_from(&self, old: &GroupManager) {
-        let mut state = old.selector_choice.read().clone();
-        state.overrides.clear();
+        let mut state = {
+            let source = old.selector_choice.read();
+            SelectorState {
+                choices: source.choices.clone(),
+                revision: source.revision,
+                ..Default::default()
+            }
+        };
         state.choices.retain(|name, choices| {
             let Ok(group) = self.selector_group(name) else {
                 return false;
@@ -693,7 +748,7 @@ impl GroupManager {
             }
             choices.iter().any(Option::is_some)
         });
-        *self.selector_choice.write() = state;
+        self.selector_choice.write().replace(state);
     }
 }
 

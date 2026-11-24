@@ -55,6 +55,7 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
     };
     let control = crate::control::tests::support::control_plane(config);
     let mut handle = control.spawn_handle();
+    let manager = handle.group_manager.read().clone();
     let generation = Arc::new(
         honk_outbound::runtime::OutboundRuntimeRegistry::build_reusing_with_dial_ceiling(
             &nodes, 1, 4, 0, false, None,
@@ -78,7 +79,9 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
                 Duration::from_millis(50),
                 tokio::time::Instant::now() + Duration::from_secs(1),
                 Arc::clone(&generation),
+                &manager,
                 IpVersion::V4,
+                Default::default(),
                 &HashMap::new(),
                 true,
                 #[cfg(feature = "native-api")]
@@ -163,7 +166,9 @@ async fn tcp_carrier_capacity_is_terminal_without_health_demotion() {
             Duration::from_millis(50),
             tokio::time::Instant::now() + Duration::from_secs(1),
             Arc::clone(&generation),
+            &manager,
             IpVersion::V4,
+            Default::default(),
             &HashMap::new(),
             false,
             #[cfg(feature = "native-api")]

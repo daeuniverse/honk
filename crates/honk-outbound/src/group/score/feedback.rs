@@ -677,6 +677,7 @@ impl ScoreReporter {
             && !matches!(
                 outcome,
                 ScoreOutcome::Success
+                    | ScoreOutcome::RouteFailure
                     | ScoreOutcome::Rejected
                     | ScoreOutcome::Cancelled
                     | ScoreOutcome::Shutdown

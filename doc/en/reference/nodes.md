@@ -64,13 +64,13 @@ Flat structured input requires `name`, `protocol`, `address` and `port`, even wh
 | `anytls_min_idle_session` | usize? | `null` | Requested idle-session floor from `min_idle_session`; effective default `0`, bounded by the eight-session pool cap. |
 | `anytls_idle_session_check_interval` | u64? | `null` | Parsed `idle_session_check_interval` seconds; current runtime janitor cadence remains fixed at 30 s. |
 | `anytls_idle_session_timeout` | u64? | `null` | Idle eviction from `idle_session_timeout`; effective default 30 s. |
-| `hops` | string[] | omitted | Chain hop node names from entry to exit; read only for `chain` and stripped with a warning on other protocols. |
+| `hops` | string[] | omitted | Chain hop node names from entry to exit. Other protocols discard the field and warn if the list is nonempty. |
 | `mark` | u32? | `null` | Structured-model outbound `SO_MARK`; not a dae share-link query. |
 | `tags` | string[] | `[]` | Classification metadata; not a dae share-link query. |
 | `subscription_id` / `group_id` | UUID? | `null` | Import and runtime ownership metadata. |
 | `created_at` / `updated_at` | datetime | current time | Runtime metadata. |
 
-Intrinsic validation requires a nonempty node name, effective host, and explicit nonzero `port`. `address` does not supply a missing port; address-only IPv6 requires an explicit `host`. Only exact injected `direct`/`block` identities are endpoint-exempt. A chain node must leave the endpoint empty instead; see [Proxy chains](#proxy-chains).
+All nodes require a nonempty name. Physical proxies require an effective host and an explicit nonzero `port`. `address` does not supply a missing port, and address-only IPv6 requires an explicit `host`. The injected `direct` and `block` nodes are endpoint-exempt. A [chain](#proxy-chains) requires an empty host and address and port `0`.
 
 In URL userinfo, Trojan, AnyTLS, VLESS and VMess use the password part of `user:pass`, or the whole userinfo when it has no colon. Hysteria2 keeps `user:pass` whole, TUIC and Juicity read `uuid:password`, and SOCKS5 keeps both parts. Credentials are percent-decoded and must be valid UTF-8. Write a literal `:` or `@` inside a secret as `%3A` or `%40`.
 
@@ -262,7 +262,7 @@ In the legacy `ss://base64(method:password@host:port)` form, honk treats decoded
 
 ## Node identity
 
-`Node::derive_id()` is the only identity derivation path. It computes UUID v5 over:
+`Node::derive_id()` is the only identity derivation path. For ordinary nodes it computes UUID v5 over the fields below. [Proxy chains](#proxy-chains) use their resolved hop IDs.
 
 ```text
 protocol|host|port|credential-fingerprint|dial-shape
@@ -842,7 +842,7 @@ node {
 }
 ```
 
-honk connects to the entry's server as for any other node. Each later hop runs its handshake inside the stream opened by the hops before it, and the exit connects to the destination. A chain is an ordinary node: groups select it through `filter` or a group's `final`, routing rules reach it through such a group, and the APIs list it with protocol `chain` (Clash type `Chain`).
+honk connects to the entry's server as for any other proxy. Each later hop runs its handshake inside the stream opened by the preceding hops, and the exit connects to the destination. Groups select a chain through `filter` or the group's `final`, and routing rules reach it through a group.
 
 The entry syntax is a honk extension; see the [dialect reference](./dialect.md#node-and-subscription-entries).
 
@@ -850,12 +850,12 @@ The entry syntax is a honk extension; see the [dialect reference](./dialect.md#n
 | --- | --- |
 | `->` outside quotes | A chain. Spaces around `->` are optional. |
 | A hop name containing `->`, `://` or a `#` after whitespace | Quote that hop: `front -> 'a->b'`. Unquoted, `->` splits the hop, `://` makes the value a share link and ` #` starts a comment. A `:` or a space inside a hop name needs no quotes. |
-| An unquoted `://` in the value | A share link even when it contains `->`, so `land: trojan://…#hk->jp` is a Trojan node. A share link ignores its text from the first `->` on. |
-| The whole value quoted, `via: 'front -> land'` | One link with an unknown scheme; the entry is dropped with `invalid-node-entry`. |
+| An unquoted `://` in the value | A share link even when it contains `->`. For example, `land: trojan://…#hk->jp` declares a Trojan node. See [Share-link schemes](#share-link-schemes). |
+| The whole value quoted, `via: 'front -> land'` | A malformed link. The entry is dropped with `invalid-node-entry`. |
 | No unquoted `->`, `via: front` | Not a chain: the value is read as a share link, and the entry is dropped with `invalid-node-entry`. |
 | No tag, more than four hops, an empty hop, or the chain's own name as a hop | Reject the configuration. Unlike a malformed share link, an invalid chain entry is not skipped. |
 
-Hops resolve by name after static and subscription nodes are assembled. A configuration, reload, or subscription refresh that fails one of these checks is rejected and the running configuration stays:
+Hops resolve by name after honk assembles the static and subscription nodes. A configuration, reload, or subscription refresh that fails a check is rejected. The active configuration stays in place.
 
 | Check | Diagnostic code |
 | --- | --- |
@@ -863,27 +863,28 @@ Hops resolve by name after static and subscription nodes are assembled. A config
 | A hop is not `direct`, `block`, or another chain | `unsupported-chain-hop` |
 | Every hop after the entry supports tunneled dial (table below) | `unsupported-chain-hop` |
 
-Hops are nodes, not groups. Subscription refreshes can rename or duplicate nodes, so a chain that names subscription nodes blocks every refresh that changes one of those names.
+Each hop must name a node. A subscription refresh is rejected if it removes a referenced name or makes that name ambiguous.
 
 | Position | Supported nodes |
 | --- | --- |
-| Entry | Any proxy node, dialed as usual |
-| Later hops, including the exit | SOCKS5; Shadowsocks; Trojan and VMess without XHTTP; VLESS without Vision, Encryption, XHTTP, or TCP multiplexing (`mux=h2mux` or Mux.Cool) |
+| Entry | Any supported physical proxy, dialed as usual |
+| Later hops, including the exit | SOCKS5, Shadowsocks, Trojan or VMess without XHTTP, and VLESS without Vision, Encryption, XHTTP, or active TCP multiplexing (H2MUX or Mux.Cool) |
 
-Hysteria2, TUIC, Juicity, and AnyTLS can only be the entry. VMess and VLESS hops need the `rprx` feature, as VMess and VLESS nodes always do.
+Hysteria2, TUIC, Juicity and AnyTLS can only be the entry. VMess and VLESS require a build with `rprx` at any position.
 
-A chain node has no address, port, credential, or share link. Its [identity](#node-identity) is derived from the protocol `chain` and its ordered hop names: renaming the chain keeps its ID, while renaming, reordering, adding, or removing a hop changes it. Two chains with the same hops in the same order therefore share one ID whatever their names, and the configuration is rejected with `duplicate-node-id`, as it is for two identical share links. JSON, YAML, and TOML write it as `protocol: chain` with a `hops` list in entry-to-exit order; a list of fewer than two hops is rejected.
+honk resolves the entry server as usual. For a later hop it passes a server hostname to the preceding proxy for resolution. For an ordinary TLS hop after the entry, both configuration admission and dial time refuse ECH discovery when the effective TLS server name is a hostname. An otherwise supported hop can use a static ECH configuration. An IP-literal TLS server name needs no ECH DNS query, and REALITY uses its own handshake.
 
-Limits:
+A chain has no server endpoint, credential, or share-link scheme. JSON, YAML, and TOML store `protocol: chain` and the two to four hop names in entry-to-exit order under `hops`. The admitted snapshot exposes a [chain ID](#node-identity) derived from `chain` and the ordered, resolved physical node UUIDs. A chain display rename or a hop display rename with references updated keeps that ID. Changing a hop's physical UUID, for example by replacing its endpoint, credentials, or protocol under the same name, rekeys the chain. Reordering distinct hops or adding or removing a hop also changes the ID. Two chains with the same ordered physical UUIDs fail admission with `duplicate-node-id`. The ordinary node ID rules stay the same.
+
+### Selection, pooling, and health
 
 - TCP only. Groups skip chain nodes when selecting for UDP, and a UDP flow routed to one is refused, as with VMess.
-- Nothing is pooled or warmed for a chain. Every connection opens a new first-hop stream and repeats every later hop's handshake, including the exit's.
-- When the server of a hop after the entry is a domain name, honk passes the name to the hop before it, whose server resolves it; honk does not resolve it locally. The entry's server is resolved as for any node.
-- A group without node filters receives every node, so it also receives each chain and its hops. Use `filter` to exclude an exit that cannot be reached directly.
-- Dial results, health, and Score are recorded under the chain node's own ID. With an HTTP check target, probes dial through the whole chain. Without one (`tcp_check_url` empty), the raw TCP probe records nothing for a chain, so a chain marked dead by failed connections recovers only through a connection that still reaches it, two successful Clash delay tests, or a reload that changes its hops and so gives it a new ID; keep an HTTP check when a group holds a chain. The same holds for a flat structured node given only `host` and `port` with an empty `address`: without an HTTP check it gets no raw TCP probe and keeps its state. The native API refuses a `tcp_connect` probe that targets a chain and reports a chain member of a probed group as unavailable, and the `delay` subcommand needs `--url` for one. A native `cold` probe of a chain still dials through the hop runtimes of the running generation, so it reuses any warm session a hop holds, such as an AnyTLS entry's.
-- Transport-quality evidence from chain traffic is recorded on each hop's own node, not on the chain. Chain flows can therefore put pressure on the entry node, while a Score group that holds the chain sees no transport pressure for it.
-- The native API node endpoints create nodes only from share links and refuse to delete a chain; manage chains in the configuration.
-- Clash connection `chains` start with the hops, exit first, followed by the chain node and its groups.
+- A chain has no pool or preconnect of its own. Each dial opens a logical entry stream and repeats every later handshake. The physical first-hop runtime can reuse a suitable session.
+- A dae group with neither node filters nor subgroups includes both the chain and its physical hops. Use `filter` to exclude an exit that cannot be reached directly.
+- If either snapshot contains a chain, a subscription refresh rebinds an explicit, unfiltered member list and removes vanished members without adding unrelated nodes. Between two chain-free snapshots, an unfiltered group without subgroups keeps its legacy behavior: it also takes new ordinary nodes. That refresh does not declare a wildcard for a later chain.
+- Dial results, health, and Score use the chain's own ID. With an HTTP check target, health probes dial through the whole chain. With `tcp_check_url` empty, raw TCP health checks are inapplicable to a chain and leave its health alone. Ordinary nodes, including flat nodes with an empty `address`, keep the existing raw probe behavior. Successful traffic that still reaches a dead chain can revive it. Two consecutive successful manual Clash delay checks can restore its TCP IPv4 health. A reload that rekeys the chain starts a new live health registration. See [native probes](./api.md#bounded-probes), [Clash delay](./api.md#delay-measurement), and [CLI delay](./cli.md#delay).
+- Transport-quality evidence belongs to the physical hops. Chain traffic can put pressure on the entry node, while the chain has no transport pressure signal of its own. See [Outbound design](../design/outbound.md#proxy-chains).
+- Manage chains in the configuration. See [native node entry management](./api.md#managed-entries-and-geodata) and [Clash connection reporting](./api.md#endpoint-map).
 
 ## Share-link schemes
 

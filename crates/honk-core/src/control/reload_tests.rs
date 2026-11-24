@@ -565,6 +565,88 @@ fn nested_final_only_leaf_is_health_registered_and_keeps_probe_ownership() {
 }
 
 #[test]
+fn bulk_health_resync_preserves_retained_and_unregistered_direct_history() {
+    use honk_outbound::alive::{GroupProbeContext, HealthMeasurement, HealthObservation};
+
+    let mut config = nested_final_config();
+    let primary = config.nodes[0].id;
+    let backup = config.nodes[1].id;
+    let extra = config.nodes[2].id;
+    let direct = honk_config::config::DIRECT_NODE_ID;
+    let group = config.groups[0].id;
+    config.groups[2].nodes.push(extra);
+    let alive = AliveDialerSet::new();
+    alive.enable_health_history();
+    sync_health_check_nodes(&alive, &config);
+    assert!(!alive.registered_nodes().contains_key(&direct));
+
+    let leaves = [(backup, 1), (direct, 2), (extra, 3), (primary, 4)];
+    let context = |node| GroupProbeContext {
+        group_id: group,
+        member_id: node,
+    };
+    let sample = |ms| {
+        HealthObservation::probe(
+            ProbeDomain::Tcp,
+            HealthMeasurement::HttpHeaders,
+            IpVersion::V4,
+            Some(Duration::from_millis(ms)),
+            std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(ms),
+        )
+    };
+    let domains = [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp];
+    let families = [IpVersion::V4, IpVersion::V6];
+    for (node, ms) in leaves {
+        let ticket = alive.probe_ticket(node);
+        assert!(alive.complete_probe(&ticket, None, sample(ms)));
+        assert!(alive.complete_probe(&ticket, Some(context(node)), sample(ms)));
+        for domain in domains {
+            for family in families {
+                alive.record_probe_latency(node, domain, family, Duration::from_millis(ms));
+            }
+        }
+    }
+
+    config.groups[2].final_outbound = None;
+    config.groups[2].nodes.clear();
+    sync_health_check_nodes(&alive, &config);
+
+    let rows = alive.group_health_observations(group);
+    assert_eq!(
+        rows.iter().map(|row| row.node_id).collect::<Vec<_>>(),
+        [direct, primary]
+    );
+    for (node, ms) in leaves {
+        let kept = node == direct || node == primary;
+        let global = alive.health_observations(node);
+        if kept {
+            assert_eq!(global, [sample(ms)]);
+            assert!(
+                rows.iter()
+                    .any(|row| row.member_id == node && row.observation == sample(ms))
+            );
+        } else {
+            assert!(global.is_empty());
+        }
+        for domain in domains {
+            for family in families {
+                let history = alive.get_probe_history(node, domain, family);
+                assert_eq!(history.len(), usize::from(kept));
+                let expected = kept.then_some(Duration::from_millis(ms));
+                assert_eq!(history.first().and_then(|row| row.latency), expected);
+                assert_eq!(alive.get_last_latency(node, domain, family), expected);
+            }
+        }
+    }
+    let current = alive.probe_ticket(primary);
+    assert!(alive.complete_probe(&current, Some(context(primary)), sample(5)));
+    assert_eq!(
+        alive.group_health_observations(group)[1].observation,
+        sample(5)
+    );
+}
+
+#[test]
 fn nested_final_keeps_datapath_group_alive_without_reviving_dead_members() {
     let mut config = nested_final_config();
     let primary = config.nodes[0].id;
@@ -691,7 +773,7 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
     let alive = Arc::new(AliveDialerSet::new());
     alive.report_unavailable_forced(primary, ProbeDomain::DataUdp, IpVersion::V4);
     alive.report_unavailable_forced(backup, ProbeDomain::DataUdp, IpVersion::V4);
-    let outbound_ids = build_outbound_id_map(&config);
+    let outbound_ids = build_outbound_id_map(&config, std::convert::identity);
     alive.set_outbound_resolver(Some(Arc::new(move |id| outbound_ids.get(&id).copied())));
     let (updates, received) = std::sync::mpsc::channel();
     alive.set_ebpf_callback(Box::new(move |node_id, _, domain, ipver, _| {
@@ -719,7 +801,10 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
 
     alive.report_available_traffic(backup, ProbeDomain::DataUdp, IpVersion::V4);
     let (node_id, domain, ipver) = received.try_recv().unwrap();
-    publisher.clone().publish(node_id, domain, ipver).await;
+    publisher
+        .clone()
+        .publish(Some(node_id), Some((domain, ipver)))
+        .await;
     for index in 0..affected_count {
         assert!(
             backend
@@ -740,7 +825,9 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
         alive.report_unavailable_traffic(backup, ProbeDomain::DataUdp, IpVersion::V4);
     }
     let (node_id, domain, ipver) = received.try_recv().unwrap();
-    publisher.publish(node_id, domain, ipver).await;
+    publisher
+        .publish(Some(node_id), Some((domain, ipver)))
+        .await;
     for index in 0..affected_count {
         assert!(
             !backend
@@ -3131,7 +3218,7 @@ async fn selector_choice_switch_replaces_bare_tcp_pin_immediately() {
     *cp.config.write().await = Arc::new(config);
     *cp.group_manager.write() = Arc::clone(&manager);
     *cp.runtime_registry.write() = Arc::clone(&generation);
-    install_selector_warm_callback(&manager, &cp.selector_warm_notify);
+    install_selector_warm_callback(&manager, &cp.selector_warm_notify, &cp.alive_set);
 
     cp.start_selector_warm_coordinator(Arc::clone(&generation))
         .await;
@@ -4389,53 +4476,7 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
     assert!(!tracing(&cp), "reload");
 }
 
-/// Routes through group exits carry TCP only, so a group whose every leaf
-/// sits behind an exit publishes no UDP connectivity, as UDP selection
-/// offers it no candidate; its TCP connectivity is unchanged.
-#[test]
-fn an_exit_group_without_udp_routes_publishes_no_udp() {
-    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
-    let exit = canonical_socks5("exit", "127.0.0.2", 1080, None);
-    let group = |name: &str, exit: Option<&str>, groups: Vec<String>| Group {
-        name: name.into(),
-        policy: GroupPolicy::Selector,
-        nodes: if groups.is_empty() {
-            vec![leaf.id]
-        } else {
-            Vec::new()
-        },
-        groups,
-        exit: exit.map(Into::into),
-        ..Default::default()
-    };
-    let config = Config {
-        nodes: vec![leaf.clone(), exit.clone()],
-        groups: vec![
-            group("plain", None, Vec::new()),
-            group("exited", Some("exit"), Vec::new()),
-            group("outer", None, vec!["exited".into()]),
-        ],
-        ..Default::default()
-    };
-    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-    let manager =
-        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
-    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
-    let published = |group: u8, domain: u32| {
-        snapshot.contains(&(OutboundIndex::UserBase as u8 + group, domain, 0, true))
-    };
-    assert!(published(0, 0) && published(0, 1) && published(0, 2));
-    for group in [1, 2] {
-        assert!(published(group, 0), "group {group} keeps TCP");
-        assert!(
-            !published(group, 1) && !published(group, 2),
-            "group {group}"
-        );
-    }
-}
-
-/// UDP publication answers what UDP selection offers: nothing from a group
-/// with an exit, its `final` included, while a sibling outside it counts.
+/// UDP through an exit has no physical route. An explicit block remains executable.
 #[test]
 fn publication_and_selection_agree_on_udp_capability() {
     use honk_outbound::alive::{IpVersion, ProbeDomain};
@@ -4478,33 +4519,172 @@ fn publication_and_selection_agree_on_udp_capability() {
         ..Default::default()
     };
     config.ensure_builtin_nodes();
-    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
-    let manager =
-        GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
-    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
-    let mut published = Vec::new();
-    for (index, group) in config.groups.iter().enumerate() {
-        let outbound = OutboundIndex::UserBase as u8 + index as u8;
-        let udp = snapshot.contains(&(outbound, 2, 0, true));
-        let plan = manager.selection_plan_for_target_with_health_fallback(
-            &group.name,
-            &ScoreSelectionContext {
-                network: SelectionNetwork::Udp,
-                probe_domain: ProbeDomain::DataUdp,
-                target_family: Some(IpVersion::V4),
-                health_family: IpVersion::V4,
-                target: None,
-            },
-            None,
-        );
-        assert_eq!(udp, !plan.entries.is_empty(), "{}", group.name);
-        published.push(udp);
+    let expected = [true, false, false, true, true, false, false];
+    for selector in [false, true] {
+        if selector {
+            for group in &mut config.groups[..3] {
+                group.policy = GroupPolicy::Selector;
+            }
+        }
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+        for (index, group) in config.groups.iter().enumerate() {
+            let outbound = OutboundIndex::UserBase as u8 + index as u8;
+            if index < 3 {
+                assert!(
+                    snapshot.contains(&(outbound, ProbeDomain::Tcp as u32, 0, true)),
+                    "{} keeps TCP",
+                    group.name
+                );
+            }
+            for domain in [ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
+                let mut slot = snapshot
+                    .iter()
+                    .filter(|(id, d, f, _)| (*id, *d, *f) == (outbound, domain as u32, 0));
+                let published = slot
+                    .next()
+                    .expect("an explicit slot for this group and family")
+                    .3;
+                assert!(
+                    slot.next().is_none(),
+                    "duplicate slot for {} {domain:?}",
+                    group.name
+                );
+                let plan = manager.selection_plan_for_target_with_health_fallback(
+                    &group.name,
+                    &ScoreSelectionContext {
+                        network: SelectionNetwork::Udp,
+                        probe_domain: domain,
+                        target_family: Some(IpVersion::V4),
+                        health_family: IpVersion::V4,
+                        target: None,
+                    },
+                    None,
+                );
+                assert_eq!(published, expected[index], "{} {domain:?}", group.name);
+                assert_eq!(
+                    published,
+                    !plan.entries.is_empty(),
+                    "{} {domain:?}",
+                    group.name
+                );
+            }
+        }
     }
+}
+
+#[tokio::test]
+async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow::Result<()> {
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 11081, None);
+    let mut config = Config {
+        nodes: vec![leaf.clone()],
+        groups: vec![
+            Group {
+                name: "live".into(),
+                nodes: vec![leaf.id],
+                ..Default::default()
+            },
+            Group {
+                name: "empty".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.routing.default_outbound = "live".into();
+    let backend = MockEbpfBackend::new();
+    #[cfg(feature = "reload-bench-counters")]
+    let writes = backend.outbound_alive_write_counter();
+    let cp = ControlPlane::new(
+        config.clone(),
+        Box::new(backend),
+        Router::from_config(&config.routing)?,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&config.dns)?,
+        test_dns_forwarder(),
+    )?;
+    let published = Arc::clone(&cp.group_manager.read());
+    let base = OutboundIndex::UserBase as u8;
+    let slots = async || -> anyhow::Result<(bool, bool)> {
+        let backend = cp.ebpf.read().await;
+        Ok((
+            backend.get_outbound_alive(base, 0, 0)?,
+            backend.get_outbound_alive(base + 1, 0, 0)?,
+        ))
+    };
+    publish_group_connectivity(
+        cp.ebpf.write().await.as_mut(),
+        &group_connectivity_snapshot(&config, &published, &cp.alive_set),
+    )?;
+    assert_eq!(slots().await?, (true, false));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id].outbound, base);
+    #[cfg(feature = "reload-bench-counters")]
+    let before = writes.load(std::sync::atomic::Ordering::Relaxed);
+
+    config.groups.swap(0, 1);
+    config.groups[1].policy = GroupPolicy::Fallback;
+    *cp.config.write().await = Arc::new(config);
+    cp.reload_group_manager().await?;
+    let current = Arc::clone(&cp.group_manager.read());
+    assert!(!Arc::ptr_eq(&published, &current));
     assert_eq!(
-        published,
-        [true, false, false, true, false, false, false],
-        "plain, exited, outer, mixed, exited-block, exited-final, unresolved"
+        current.get_group_policy("live"),
+        Some(GroupPolicy::Fallback)
     );
+    assert_eq!(slots().await?, (true, false));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id].outbound, base);
+    #[cfg(feature = "reload-bench-counters")]
+    assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manager_only_reload_rejects_adding_retaining_and_removing_an_exit() {
+    use honk_outbound::group::{SelectionNetwork, SelectorNetworks};
+
+    let a = canonical_socks5("a", "127.0.0.1", 11081, None);
+    let b = canonical_socks5("b", "127.0.0.1", 11082, None);
+    let exit = canonical_socks5("end", "127.0.0.1", 11083, None);
+    for (old_exit, new_exit) in [(false, true), (true, false), (true, true)] {
+        let mut config = Config {
+            nodes: vec![a.clone(), b.clone(), exit.clone()],
+            groups: vec![Group {
+                name: "root".into(),
+                nodes: vec![a.id, b.id],
+                exit: old_exit.then(|| exit.name.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        config.ensure_builtin_nodes();
+        let cp = control_plane(config.clone());
+        let published = Arc::clone(&cp.group_manager.read());
+        let dns = cp.dns_controller.runtime_provider().current();
+        published
+            .set_selector_choice("root", "b", SelectorNetworks::Both)
+            .unwrap();
+        config.groups[0].nodes = vec![a.id];
+        config.groups[0].exit = new_exit.then(|| exit.name.clone());
+        *cp.config.write().await = Arc::new(config);
+
+        assert!(cp.reload_group_manager().await.is_err());
+        let current = cp.group_manager.read();
+        assert!(Arc::ptr_eq(&current, &published));
+        assert!(Arc::ptr_eq(
+            &dns,
+            &cp.dns_controller.runtime_provider().current()
+        ));
+        assert_eq!(
+            current
+                .get_selector_choice("root", SelectionNetwork::Tcp)
+                .as_deref(),
+            Some("b")
+        );
+        assert!(cp.alive_set.is_registered(b.id));
+    }
 }
 
 /// The leaf walk the connectivity tables used before they shared the group
@@ -4566,14 +4746,25 @@ fn assert_connectivity_matches_reference(config: &Config) {
                 .or_insert(OutboundIndex::UserBase as u8 + index as u8);
         }
     }
-    assert_eq!(build_outbound_id_map(config), ids, "{config:?}");
+    assert_eq!(
+        build_outbound_id_map(config, std::convert::identity),
+        ids,
+        "{config:?}"
+    );
 
     let reached: std::collections::BTreeSet<uuid::Uuid> =
         leaves.iter().flatten().copied().collect();
     let checked: std::collections::BTreeSet<uuid::Uuid> = config
         .nodes
         .iter()
-        .filter(|node| reached.is_empty() || reached.contains(&node.id))
+        .filter(|node| {
+            reached.contains(&node.id)
+                || (reached.is_empty()
+                    && !config
+                        .groups
+                        .iter()
+                        .any(|group| group.exit.as_deref() == Some(node.name.as_str())))
+        })
         .map(|node| node.id)
         .collect();
     let alive = crate::outbound::AliveDialerSet::new();
@@ -4647,7 +4838,7 @@ fn connectivity_leaf_sets_are_unchanged_on_a_cyclic_config() {
     };
     let slot = OutboundIndex::UserBase as u8;
     assert_eq!(
-        build_outbound_id_map(&config),
+        build_outbound_id_map(&config, std::convert::identity),
         std::collections::HashMap::from([(a.id, slot), (b.id, slot)])
     );
     assert_connectivity_matches_reference(&config);

@@ -14,39 +14,42 @@ use super::NodeRuntime;
 /// uncached runtime.
 pub const MAX_ROUTE_RUNTIMES: usize = 4096;
 
-/// A route and its generation's hop runtimes. It owns no protocol state,
-/// tasks or transport evidence: each hop's stay with that hop's runtime.
+const _: () = assert!(MAX_CHAIN_HOPS == 4);
+
+/// The ordered hop runtimes owned by this generation. Protocol state, tasks
+/// and transport evidence stay with each hop.
 #[derive(Debug)]
 pub struct RouteRuntime {
-    route: Route,
-    /// Entry first; slots past the route's length repeat its exit, so the
-    /// hops borrow as one slice without a separate allocation.
-    hops: [Arc<NodeRuntime>; MAX_CHAIN_HOPS],
+    hops: RouteHops,
+}
+
+#[derive(Debug)]
+enum RouteHops {
+    Two([Arc<NodeRuntime>; 2]),
+    Three([Arc<NodeRuntime>; 3]),
+    Four([Arc<NodeRuntime>; 4]),
 }
 
 impl RouteRuntime {
     /// `None` when any hop is missing from `nodes`.
     fn build(route: &Route, nodes: &HashMap<uuid::Uuid, Arc<NodeRuntime>>) -> Option<Self> {
-        let ids = route.hops();
-        let exit = nodes.get(&route.exit())?;
-        let mut hops: [Arc<NodeRuntime>; MAX_CHAIN_HOPS] =
-            std::array::from_fn(|_| Arc::clone(exit));
-        for (slot, id) in hops.iter_mut().zip(ids) {
-            *slot = Arc::clone(nodes.get(id)?);
-        }
-        Some(Self {
-            route: *route,
-            hops,
-        })
-    }
-
-    pub fn route(&self) -> &Route {
-        &self.route
+        let get = |id: &uuid::Uuid| nodes.get(id).cloned();
+        let hops = match route.hops() {
+            [a, b] => RouteHops::Two([get(a)?, get(b)?]),
+            [a, b, c] => RouteHops::Three([get(a)?, get(b)?, get(c)?]),
+            [a, b, c, d] => RouteHops::Four([get(a)?, get(b)?, get(c)?, get(d)?]),
+            _ => unreachable!("routes contain two to four hops"),
+        };
+        Some(Self { hops })
     }
 
     /// The hop runtimes, entry first.
     pub fn hops(&self) -> &[Arc<NodeRuntime>] {
-        &self.hops[..self.route.hops().len()]
+        match &self.hops {
+            RouteHops::Two(hops) => hops,
+            RouteHops::Three(hops) => hops,
+            RouteHops::Four(hops) => hops,
+        }
     }
 }
 

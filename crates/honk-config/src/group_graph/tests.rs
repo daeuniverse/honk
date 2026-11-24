@@ -75,28 +75,28 @@ impl Visitor for Leaves {
     }
 }
 
-fn leaves(graph: &GroupGraph<'_>, root: &str, limits: Limits) -> Vec<(Leaf, Vec<Uuid>)> {
+fn leaves(graph: &GroupGraph<'_>, root: &str) -> Vec<(Leaf, Vec<Uuid>)> {
     let mut leaves = Leaves::default();
-    let _ = graph.visit(graph.group(root).unwrap(), limits, &mut leaves);
+    let _ = graph.visit(graph.group(root).unwrap(), &mut leaves);
     leaves.0
 }
 
 #[test]
-fn a_route_key_is_stable_across_reload() {
+fn reparsing_the_same_config_preserves_the_route_key() {
     let text = " outer {\n  filter: group(inner)\n }\n inner {\n  filter: name(e1)\n }";
     let route = || {
         let mut config = config(text);
         set_exit(&mut config, "outer", "e2");
         let graph = GroupGraph::new(&config.groups, &config.nodes);
-        let ((leaf, exits), rest) = leaves(&graph, "outer", Limits::SELECTION)
-            .split_first()
-            .map(|(first, rest)| (first.clone(), rest.len()))
-            .unwrap();
-        assert_eq!(rest, 0);
-        let Leaf::Node(leaf) = leaf else {
-            panic!("expected a node leaf");
+        let leaves = leaves(&graph, "outer");
+        let [(Leaf::Node(leaf), exits)] = leaves.as_slice() else {
+            panic!("expected one node leaf");
         };
-        compose(leaf, &[leaf], exits.iter().rev().copied())
+        compose(
+            *leaf,
+            std::slice::from_ref(leaf),
+            exits.iter().rev().copied(),
+        )
     };
     let first = route();
     assert!(matches!(first, Composed::Routed(_)));
@@ -113,7 +113,7 @@ fn exits_reach_the_visitor_outermost_first() {
     let graph = GroupGraph::new(&config.groups, &config.nodes);
     let [e1, e2] = [node_id(&config, "e1"), node_id(&config, "e2")];
     assert_eq!(
-        leaves(&graph, "outer", Limits::SELECTION),
+        leaves(&graph, "outer"),
         [(Leaf::Node(e1), vec![e2, e1]), (Leaf::Direct, vec![e2, e1]),]
     );
 }
@@ -144,7 +144,7 @@ fn a_final_reaches_its_first_namesake() {
     assert_eq!(namesakes.len(), 2);
     // A node of the final's name wins over a group of that name.
     assert_eq!(
-        leaves(&graph, "g", Limits::SELECTION)
+        leaves(&graph, "g")
             .into_iter()
             .skip(1)
             .map(|(leaf, _)| leaf)
@@ -170,10 +170,7 @@ fn nested(levels: usize) -> Config {
 fn the_depth_limit_counts_groups_from_the_root() {
     let config = nested(10);
     let graph = GroupGraph::new(&config.groups, &config.nodes);
-    assert_eq!(
-        leaves(&graph, "g0", Limits::SELECTION).len(),
-        MAX_GROUP_DEPTH
-    );
+    assert_eq!(leaves(&graph, "g0").len(), MAX_GROUP_DEPTH);
 }
 
 #[derive(Default)]
@@ -195,9 +192,9 @@ fn a_cycle_stops_at_the_path_guard() {
         " a {\n  filter: name(e1)\n  filter: group(b)\n }\n b {\n  filter: name(e2)\n  filter: group(a)\n }",
     );
     let graph = GroupGraph::new(&config.groups, &config.nodes);
-    assert_eq!(leaves(&graph, "a", Limits::SELECTION).len(), 2);
+    assert_eq!(leaves(&graph, "a").len(), 2);
     let mut completeness = Completeness::default();
-    let _ = graph.visit(0, Limits::SELECTION, &mut completeness);
+    let _ = graph.visit(0, &mut completeness);
     assert_eq!(completeness.0, [(1, false), (0, false)]);
 }
 

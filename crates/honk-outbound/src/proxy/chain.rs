@@ -2,108 +2,127 @@
 //! hop runs its handshake over the stream the hops before it opened.
 
 use async_trait::async_trait;
-use honk_config::node::Node;
+#[cfg(feature = "rprx")]
+use futures_util::future::Either;
+use honk_config::node::{MAX_CHAIN_HOPS, Node};
 use honk_config::types::NodeProtocol;
+use std::io::{self, IoSlice};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Instant;
 
+use super::error::{
+    HopIoFailure, IntermediateTargetFailure, hop_io_failure, intermediate_target_hop,
+};
 use super::{
-    ChainHopFailure, NodeFailure, ProxyStream, TcpOutbound, TunnelDialOptions, is_packet_rejection,
-    target_failure,
+    AsyncReadWrite, ChainHopFailure, MissingProtocolHandler, ProtocolEntry, ProxyStream,
+    TcpOutbound, TunnelDialOptions,
 };
 use crate::runtime::flow_observation::without_target_milestones;
 use crate::runtime::{NodeRuntime, RouteRuntime};
 
 /// Dials a chain through the hop runtimes of its own generation, using the
 /// same handler instances the registry dispatches to.
-pub struct ChainHandler {
+pub(super) struct ChainHandler {
     handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>,
 }
 
 impl ChainHandler {
-    pub fn new(handlers: Vec<(NodeProtocol, Arc<dyn TcpOutbound>)>) -> Self {
+    pub(super) fn new(entries: &[ProtocolEntry]) -> Self {
+        let handlers = entries
+            .iter()
+            .map(|entry| (entry.descriptor.protocol, Arc::clone(&entry.tcp)))
+            .collect();
         Self { handlers }
     }
 
-    fn handler(&self, node: &Node) -> anyhow::Result<&Arc<dyn TcpOutbound>> {
+    pub(super) fn handler(&self, protocol: NodeProtocol) -> Option<&dyn TcpOutbound> {
         self.handlers
             .iter()
-            .find(|(protocol, _)| *protocol == node.protocol())
-            .map(|(_, handler)| handler)
-            .ok_or_else(|| anyhow::anyhow!("No handler for protocol {:?}", node.protocol()))
+            .find(|(registered, _)| *registered == protocol)
+            .map(|(_, handler)| handler.as_ref())
     }
 
-    /// On failure, also returns the index of the hop that failed.
+    /// On failure, also returns the index of the executing hop.
     async fn dial_hops(
-        &self,
+        handlers: &[&dyn TcpOutbound; MAX_CHAIN_HOPS],
         hops: &[Arc<NodeRuntime>],
         target: SocketAddr,
         target_domain: Option<&str>,
-        connect_timeout: Duration,
+        options: TunnelDialOptions,
         deadline: Instant,
-        reality_key_shares: bool,
+        routed: bool,
     ) -> Result<ProxyStream, (usize, anyhow::Error)> {
-        let budget = || connect_timeout.min(deadline.saturating_duration_since(Instant::now()));
+        let budget = || {
+            options
+                .connect_timeout
+                .min(deadline.saturating_duration_since(Instant::now()))
+        };
         let at = |hop: usize| move |error| (hop, error);
         let (first, rest) = hops.split_first().expect("a chain has at least two hops");
         let (server, server_domain) = server_target(&rest[0].node);
-        let handler = self.handler(&first.node).map_err(at(0))?;
-        let mut carrier = hop_scope(
+        let entry = hop_scope(
             first,
-            without_target_milestones(handler.dial_runtime(
+            without_target_milestones(handlers[0].dial_runtime(
                 Arc::clone(first),
                 server,
                 server_domain,
                 budget(),
             )),
         )
-        .await
-        .map_err(|error| earlier_hop_error(0, error))?
-        .stream;
-        for (index, hop) in rest.iter().enumerate() {
-            let handler = self.handler(&hop.node).map_err(at(index + 1))?;
+        .await;
+        let mut carrier = intermediate_carrier(0, entry, routed)?;
+        for (index, (hop, handler)) in rest.iter().zip(&handlers[1..]).enumerate() {
             let options = TunnelDialOptions {
                 connect_timeout: budget(),
-                reality_key_shares,
+                ..options
             };
-            let Some(next) = rest.get(index + 1) else {
-                return hop_scope(
-                    hop,
-                    handler.dial_over(Arc::clone(hop), carrier, target, target_domain, options),
-                )
-                .await
-                .map_err(at(index + 1));
+            let next = rest.get(index + 1);
+            let (target, target_domain) =
+                next.map_or((target, target_domain), |next| server_target(&next.node));
+            let dial = handler.dial_over(Arc::clone(hop), carrier, target, target_domain, options);
+            #[cfg(feature = "rprx")]
+            let dial = if routed && hop.node.protocol() == NodeProtocol::VMess {
+                Either::Left(super::vmess::ROUTED_CARRIER.scope((), dial))
+            } else {
+                Either::Right(dial)
             };
-            let (server, server_domain) = server_target(&next.node);
-            carrier = hop_scope(
-                hop,
-                without_target_milestones(handler.dial_over(
-                    Arc::clone(hop),
-                    carrier,
-                    server,
-                    server_domain,
-                    options,
-                )),
-            )
-            .await
-            .map_err(|error| earlier_hop_error(index + 1, error))?
-            .stream;
+            if next.is_none() {
+                let mut result = if matches!(
+                    first.node.protocol(),
+                    NodeProtocol::Hysteria2 | NodeProtocol::Tuic | NodeProtocol::Juicity
+                ) {
+                    hop_scope(
+                        hop,
+                        crate::runtime::flow_observation::observe_chain_request(dial),
+                    )
+                    .await
+                } else {
+                    hop_scope(hop, dial).await
+                }
+                .map_err(at(index + 1))?;
+                if routed {
+                    result.stream = hop_carrier(index + 1, result.stream, true, false);
+                }
+                return Ok(result);
+            }
+            let result = hop_scope(hop, without_target_milestones(dial)).await;
+            carrier = intermediate_carrier(index + 1, result, routed)?;
         }
         unreachable!("the last hop returns from the loop")
     }
 }
 
-/// A hop's background tasks and transport evidence belong to its own runtime,
-/// as for a direct dial through the registry. Carrier pressure from chain
-/// traffic therefore lands on the hops, the entry's node included, and the
-/// chain runtime's own `TransportQuality` stays empty. The first hop's
-/// physical connection inherits the chain's dial admission scope.
-fn hop_scope<T>(
+/// Each hop owns its tasks and transport evidence, leaving the chain's
+/// `TransportQuality` empty. The entry inherits the chain's dial admission scope.
+fn hop_scope(
     hop: &Arc<NodeRuntime>,
-    dial: impl Future<Output = anyhow::Result<T>>,
-) -> impl Future<Output = anyhow::Result<T>> {
+    dial: impl Future<Output = anyhow::Result<ProxyStream>>,
+) -> impl Future<Output = anyhow::Result<ProxyStream>> {
     hop.scope_tasks(hop.transport_quality().scope(dial))
 }
 
@@ -124,17 +143,108 @@ fn server_target(node: &Node) -> (SocketAddr, Option<&str>) {
     }
 }
 
-/// An earlier hop's target is the next hop's server, so its target failure is
-/// a failure of the chain itself, and the failed hop is the next one: `hop`
-/// completed its own handshake and reported that it could not reach that
-/// server. Fronts that send no such reply (Shadowsocks, Trojan, VMess)
-/// surface the same outage as the next hop's handshake failure. Packet
-/// policy rejections keep their class and their hop.
-fn earlier_hop_error(hop: usize, error: anyhow::Error) -> (usize, anyhow::Error) {
-    if is_packet_rejection(&error) || !target_failure(&error) {
-        return (hop, error);
+fn intermediate_carrier(
+    index: usize,
+    result: anyhow::Result<ProxyStream>,
+    routed: bool,
+) -> Result<Box<dyn AsyncReadWrite>, (usize, anyhow::Error)> {
+    let ProxyStream { stream, .. } =
+        result.map_err(|error| (index, IntermediateTargetFailure::dial(index + 1, error)))?;
+    Ok(hop_carrier(index, stream, routed, true))
+}
+
+fn hop_carrier(
+    index: usize,
+    stream: Box<dyn AsyncReadWrite>,
+    routed: bool,
+    targets_next_hop: bool,
+) -> Box<dyn AsyncReadWrite> {
+    // A pass-through hop adds no codec to blame. In particular, a plain
+    // SOCKS5 chain still returns the original socket for splice.
+    let concrete = (*stream).as_any();
+    if concrete.is::<tokio::net::TcpStream>() || concrete.is::<HopCarrier>() {
+        return stream;
     }
-    (hop + 1, NodeFailure(anyhow::anyhow!("{error:#}")).into())
+    // Stock tunneled handlers do not return Vision. A custom handler can
+    // nevertheless return a native spliceable stream instead of a new codec.
+    #[cfg(feature = "rprx")]
+    if !targets_next_hop && ProxyStream::is_vision_splice_stream(concrete) {
+        return stream;
+    }
+    Box::new(HopCarrier {
+        index,
+        routed,
+        targets_next_hop,
+        stream,
+    })
+}
+
+#[derive(Debug)]
+struct HopCarrier {
+    index: usize,
+    routed: bool,
+    targets_next_hop: bool,
+    stream: Box<dyn AsyncReadWrite>,
+}
+
+impl HopCarrier {
+    fn map_error(&self, error: io::Error) -> io::Error {
+        if self.routed {
+            HopIoFailure::io(self.index, error, self.targets_next_hop)
+        } else {
+            IntermediateTargetFailure::io(self.index + 1, error)
+        }
+    }
+}
+
+impl AsyncRead for HopCarrier {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_read(cx, buf)
+            .map_err(|error| self.map_error(error))
+    }
+}
+
+impl AsyncWrite for HopCarrier {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream)
+            .poll_write(cx, buf)
+            .map_err(|error| self.map_error(error))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stream)
+            .poll_write_vectored(cx, bufs)
+            .map_err(|error| self.map_error(error))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_flush(cx)
+            .map_err(|error| self.map_error(error))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stream)
+            .poll_shutdown(cx)
+            .map_err(|error| self.map_error(error))
+    }
 }
 
 fn reality_mask_certificate(error: &anyhow::Error) -> bool {
@@ -171,6 +281,7 @@ impl TcpOutbound for ChainHandler {
             target,
             target_domain,
             connect_timeout,
+            false,
         )
         .await
     }
@@ -178,7 +289,7 @@ impl TcpOutbound for ChainHandler {
 
 impl ChainHandler {
     /// Dial a route through group exits over its generation's hop runtimes.
-    pub async fn dial_route_tcp(
+    pub(super) async fn dial_route_tcp(
         &self,
         route: &RouteRuntime,
         target: SocketAddr,
@@ -191,6 +302,7 @@ impl ChainHandler {
             target,
             target_domain,
             connect_timeout,
+            true,
         )
         .await
     }
@@ -200,8 +312,8 @@ impl ChainHandler {
     /// mask certificate on a tunneled hop redials the chain once without
     /// hybrid key shares, as a direct REALITY dial retries once. The first hop
     /// dials directly and has already had that retry, so its failure stands.
-    /// A failure names its hop through [`ChainHopFailure`]; the deadline
-    /// belongs to no hop.
+    /// Routed dials attach their locator after the retry decision. The
+    /// deadline belongs to no hop.
     async fn dial_chain(
         &self,
         label: &str,
@@ -209,30 +321,56 @@ impl ChainHandler {
         target: SocketAddr,
         target_domain: Option<&str>,
         connect_timeout: Duration,
+        routed: bool,
     ) -> anyhow::Result<ProxyStream> {
         if hops.len() < 2 {
             anyhow::bail!("chain node '{label}' has no hops in this runtime");
         }
         let deadline = Instant::now() + connect_timeout * 3;
+        // A missing backend is knowable before any prefix traffic. Use the
+        // same frozen handlers for both attempts; no allocation is needed.
+        let handler = |hop: &Arc<NodeRuntime>| {
+            let protocol = hop.node.protocol();
+            self.handler(protocol)
+                .ok_or(MissingProtocolHandler(protocol))
+        };
+        let mut handlers = [handler(&hops[0])?; MAX_CHAIN_HOPS];
+        for (slot, hop) in handlers[1..].iter_mut().zip(&hops[1..]) {
+            *slot = handler(hop)?;
+        }
+        let scope = crate::runtime::capture_dial_scope();
+        let attempt = |reality_key_shares| {
+            // Retain physical dial credits through this attempt's handshakes.
+            // A serial retry drops the failed carrier and owns fresh credits.
+            scope.physical_setup().scope(Self::dial_hops(
+                &handlers,
+                hops,
+                target,
+                target_domain,
+                TunnelDialOptions {
+                    connect_timeout,
+                    reality_key_shares,
+                },
+                deadline,
+                routed,
+            ))
+        };
         let dial = async {
-            match self
-                .dial_hops(hops, target, target_domain, connect_timeout, deadline, true)
-                .await
-            {
+            let first = attempt(true).await;
+            match first {
                 Err((hop, error)) if hop > 0 && reality_mask_certificate(&error) => {
-                    self.dial_hops(
-                        hops,
-                        target,
-                        target_domain,
-                        connect_timeout,
-                        deadline,
-                        false,
-                    )
-                    .await
+                    attempt(false).await
                 }
                 result => result,
             }
-            .map_err(|(hop, error)| {
+            .map_err(|(index, error)| {
+                if !routed {
+                    return error;
+                }
+                let source = error.as_ref();
+                let hop = intermediate_target_hop(source)
+                    .or_else(|| hop_io_failure(source))
+                    .unwrap_or(index);
                 ChainHopFailure {
                     hop,
                     node: hops[hop].node.id,

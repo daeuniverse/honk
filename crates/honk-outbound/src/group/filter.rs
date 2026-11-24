@@ -54,10 +54,25 @@ impl GroupManager {
         domain: ProbeDomain,
         ipver: IpVersion,
         group: &Group,
+        ancestors: &[&str],
         routes: bool,
     ) -> Vec<Candidate<'a>> {
-        if routes {
-            candidates = self.retain_exit_selectable(candidates, group, domain, ipver);
+        if routes && self.has_exits() {
+            // Children already checked the complete path with these ancestors.
+            candidates.retain(|candidate| {
+                let eligible = candidate.via.is_some()
+                    || self.leaf_route_available(
+                        candidate.node,
+                        group,
+                        ancestors,
+                        domain,
+                        Some(ipver),
+                    );
+                if !eligible {
+                    observation::candidate(candidate, false, "exit_unavailable");
+                }
+                eligible
+            });
         } else {
             debug_assert!(group.exit.is_none(), "group '{}' has an exit", group.name);
             debug_assert!(
@@ -67,9 +82,8 @@ impl GroupManager {
                 group.name
             );
         }
-        let check_url = group.check_url.as_deref();
         if domain == ProbeDomain::Tcp
-            && let Some(url) = check_url
+            && let Some(url) = group.check_url.as_deref()
             && let Some(alive) = &self.alive_set
         {
             // Per-URL state is keyed by member TAG (sing-box RealTag
@@ -80,7 +94,8 @@ impl GroupManager {
             return candidates
                 .into_iter()
                 .filter(|c| {
-                    let eligible = alive.is_alive_for_url(c.tag(), url);
+                    let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                        || alive.is_alive_for_url(c.tag(), url);
                     observation::candidate(
                         c,
                         eligible,
@@ -97,7 +112,8 @@ impl GroupManager {
         candidates
             .into_iter()
             .filter(|c| {
-                let eligible = self.is_node_selectable_for_domain(c.node.id, domain, ipver);
+                let eligible = c.node.protocol() == honk_config::types::NodeProtocol::Block
+                    || self.is_node_selectable_for_domain(c.node.id, domain, ipver);
                 observation::candidate(
                     c,
                     eligible,

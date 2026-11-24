@@ -10,8 +10,8 @@ use honk_config::node::Node;
 use std::future::{Future, poll_fn};
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, ready};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -80,7 +80,10 @@ pub(super) async fn wrap_grpc(
         read_result: None,
         write_closed: false,
         write_pending: false,
+        #[cfg(feature = "rprx")]
+        terminal_data: false,
         failure: None,
+        request: crate::runtime::flow_observation::DriverRequest::new(),
     };
     // The protocol request body may be needed before the peer sends response headers.
     poll_fn(|cx| {
@@ -98,12 +101,18 @@ pub(super) async fn wrap_grpc(
     Ok(Box::new(stream))
 }
 
+// At most one DATA buffer is queued. h2 may drop it without encoding its suffix.
+const RELEASED: u8 = 0;
+const QUEUED: u8 = 1;
+const DISCARDED: u8 = 2;
+
 #[derive(Debug, Default)]
 struct IoProgress {
-    pending: AtomicUsize,
+    data: AtomicU8,
     flushed: AtomicBool,
     read: AtomicWaker,
     write: AtomicWaker,
+    carrier_error: OnceLock<Option<Arc<io::Error>>>,
 }
 
 impl ArcWake for IoProgress {
@@ -122,11 +131,23 @@ impl FlushProgress for IoProgress {
             self.write.wake();
         }
     }
+
+    fn io_failed(&self, error: &io::Error) {
+        // h2's connection driver reduces custom I/O errors to text.
+        let _ = self
+            .carrier_error
+            .get_or_init(|| crate::proxy::retain_typed_io_error(error).map(Arc::new));
+    }
 }
 
-impl DataProgress for IoProgress {
-    fn released(&self) {
-        self.pending.fetch_sub(1, Ordering::AcqRel);
+impl DataProgress for Arc<IoProgress> {
+    fn released(&self, remaining: usize) {
+        let state = if cfg!(any(feature = "rprx", feature = "flow-observation")) && remaining != 0 {
+            DISCARDED
+        } else {
+            RELEASED
+        };
+        self.data.store(state, Ordering::Release);
         self.write.wake();
     }
 }
@@ -146,7 +167,12 @@ struct GrpcStream {
     write_closed: bool,
     // h2 can release a copied DATA buffer before flushing its encoded bytes.
     write_pending: bool,
+    #[cfg(feature = "rprx")]
+    terminal_data: bool,
     failure: Option<Arc<io::Error>>,
+    // Either side of a split stream may drive the connection that writes
+    // queued DATA.
+    request: crate::runtime::flow_observation::DriverRequest,
 }
 
 impl std::fmt::Debug for GrpcStream {
@@ -163,6 +189,11 @@ impl GrpcStream {
     }
 
     fn fail(&mut self, error: io::Error) -> io::Error {
+        #[cfg(feature = "rprx")]
+        {
+            self.terminal_data = false;
+        }
+        self.request.discard();
         let error = self.failure.get_or_insert_with(|| Arc::new(error));
         io::Error::new(error.kind(), error.clone())
     }
@@ -178,11 +209,27 @@ impl GrpcStream {
 
     fn poll_connection(&mut self, cx: &mut Context<'_>) {
         if let Some(connection) = &mut self.connection
-            && let Poll::Ready(result) = connection.as_mut().poll(cx)
+            && let Poll::Ready(result) = self.request.drive(|| {
+                #[cfg(feature = "rprx")]
+                {
+                    super::relay_upload::drive(self.terminal_data, || connection.as_mut().poll(cx))
+                }
+                #[cfg(not(feature = "rprx"))]
+                {
+                    connection.as_mut().poll(cx)
+                }
+            })
         {
             if let Err(error) = result {
-                self.connection_error
-                    .get_or_insert_with(|| Arc::new(h2_error(error)));
+                self.connection_error.get_or_insert_with(|| {
+                    if let Some(io) = error.get_io()
+                        && let Some(Some(cause)) = self.progress.carrier_error.get()
+                        && io.kind() == cause.kind()
+                    {
+                        return Arc::clone(cause);
+                    }
+                    Arc::new(h2_error(error))
+                });
             }
             self.connection = None;
         }
@@ -191,6 +238,22 @@ impl GrpcStream {
             && !(error.is_go_away() && error.reason() == Some(h2::Reason::NO_ERROR))
         {
             self.connection_error = Some(Arc::new(h2_error(error)));
+        }
+        let data = self.progress.data.load(Ordering::Acquire);
+        // Codec shutdown can flush the last DATA and finish the driver in the same poll.
+        if data == RELEASED && self.progress.flushed.load(Ordering::Acquire) {
+            #[cfg(feature = "rprx")]
+            {
+                self.terminal_data = false;
+            }
+            self.request.release();
+        } else if data == DISCARDED || self.connection.is_none() || self.connection_error.is_some()
+        {
+            #[cfg(feature = "rprx")]
+            {
+                self.terminal_data = false;
+            }
+            self.request.discard();
         }
     }
 
@@ -280,9 +343,14 @@ impl GrpcStream {
         if let Some(error) = self.failure_error() {
             return Poll::Ready(Err(error));
         }
-        if self.progress.pending.load(Ordering::Acquire) == 0
-            && self.progress.flushed.load(Ordering::Acquire)
-        {
+        let data = self.progress.data.load(Ordering::Acquire);
+        if data == DISCARDED {
+            return Poll::Ready(Err(self.fail(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "gRPC DATA discarded before flush",
+            ))));
+        }
+        if data == RELEASED && self.progress.flushed.load(Ordering::Acquire) {
             self.write_pending = false;
             Poll::Ready(Ok(()))
         } else {
@@ -292,7 +360,7 @@ impl GrpcStream {
 
     fn queue(&mut self, bytes: Bytes, end_stream: bool) -> io::Result<()> {
         self.write_pending = true;
-        self.progress.pending.fetch_add(1, Ordering::AcqRel);
+        self.progress.data.store(QUEUED, Ordering::Release);
         self.progress.flushed.store(false, Ordering::Release);
         self.send
             .send_data(
@@ -479,6 +547,11 @@ impl AsyncWrite for GrpcStream {
         push_varint(&mut message, len);
         message.extend_from_slice(&buf[..len]);
         this.queue(message.into(), false)?;
+        this.request.capture();
+        #[cfg(feature = "rprx")]
+        {
+            this.terminal_data = super::relay_upload::is_terminator();
+        }
         Poll::Ready(Ok(len))
     }
 

@@ -94,7 +94,7 @@ TCP relay 在 copy 和 splice 路徑中區分用戶端斷開與上游失敗。�
 
 對仍存活的 endpoint，已證明的 QUIC 通路停滯會退役共享 carrier，因此 Score 依節點故障歸因，即使目前錯誤屬於單包壅塞或已有回包後的空閒到期。拒絕、主動退役和本機回包交付取消保留原有優先順序；Alive 仍獨立分類原始 I/O 錯誤。
 
-Traffic reporter 覆蓋透明 TCP/UDP、受支援的 DNS exchange 和 UI 下載，DNS 歸因跟隨實際 carrier，包括 UDP 截斷後的 TCP 重試。`HealthProbe` 只在全域聚合探測槽記錄設定測量品質，不結算業務可靠度或清除真實連敗；`Warmup` 只記錄 setup 品質。視需要 delay 測量保留 API/Alive 延遲歷史，但不建立沒有消費者的 Score exchange reporter，也不把任意目標失敗計入真實撥號序列；實際 session 準備仍可報告預熱品質。獨立 QUIC 握手提供 DataUdp 探測品質和既有存活性恢復，不虛構吞吐或業務成功。
+Traffic reporter 覆蓋透明 TCP/UDP、受支援的 DNS exchange 和 UI 下載，DNS 歸因跟隨實際 carrier，包括 UDP 截斷後的 TCP 重試。`HealthProbe` 只在全域聚合探測槽記錄設定測量品質，不結算業務可靠度或清除真實連敗；`Warmup` 只記錄 setup 品質。隨選延遲測量不建立 Score exchange reporter，也不把任意目標失敗計入實際撥號序列；實際 session 準備仍可報告預熱品質。獨立 QUIC 握手提供 DataUdp 探測品質和既有存活性恢復，不虛構吞吐或業務成功。
 
 每個保留的 `(group, TCP/UDP, target family)` 預算固定兩件事：首次成員數 `n`，和冷啟動額度 `B`。成員數不超過四個時 `B` 覆蓋全部成員，否則取 `ceil(sqrt(n)) + 1`。額度從原始業務賺得：每開始一次原始業務，計數為 `N`，額度增加 `1/q`。通常 `q = 16`。如果該群組在這個網路上的近期原始業務依五分鐘半衰期換算每秒至少兩筆，並且該作用域近期至少有三個可選試用結果，依十分鐘半衰期、衰減權重超過 2.5，其成功不低於 80%，那麼 `q = 8`。證據需要的試用次數是固定的，所以試用有效的忙碌群組能更快累積額度，空閒群組則維持較小的比例。目標拒絕不計入這裡的試用結果，reload 會清除這些結果。
 

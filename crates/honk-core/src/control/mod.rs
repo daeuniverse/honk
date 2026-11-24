@@ -121,6 +121,24 @@ fn spawn_network_refresh_retry(tx: mpsc::Sender<ControlCommand>) -> tokio::task:
 #[cfg(test)]
 type PreDnsPublicationHook = Box<dyn FnOnce(&Arc<GroupManager>) + Send>;
 
+#[cfg(all(test, feature = "clash-api"))]
+struct ClashPublicationPause {
+    unlocked: Arc<tokio::sync::Notify>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(all(test, feature = "clash-api"))]
+impl Drop for ClashPublicationPause {
+    fn drop(&mut self) {
+        self.unlocked.notify_one();
+        assert_ne!(
+            self.resume.recv_timeout(std::time::Duration::from_secs(15)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout),
+            "Clash delay did not release publication"
+        );
+    }
+}
+
 #[cfg(feature = "native-api")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EnginePhase {
@@ -175,9 +193,8 @@ pub struct ControlPlane {
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.
     quic_score_target: Option<Arc<probers::QuicScoreProbeTarget>>,
-    /// Node name → eBPF outbound id (push_routing_to_ebpf numbering),
-    /// shared with the alive set's outbound resolver; rebuilt on reload.
-    outbound_id_map: Arc<parking_lot::RwLock<std::collections::HashMap<uuid::Uuid, u8>>>,
+    /// Node ID → callback slot and route-dependency flag, published with the manager.
+    outbound_id_map: Arc<parking_lot::RwLock<OutboundHealthIndex>>,
     resource_budget: ResourceBudget,
     dns_socket_budget: crate::dns::transport::DnsSocketBudget,
     concurrency_limit: Arc<tokio::sync::Semaphore>,
@@ -225,6 +242,8 @@ pub struct ControlPlane {
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pre_dns_publication_hook: parking_lot::Mutex<Option<PreDnsPublicationHook>>,
+    #[cfg(all(test, feature = "clash-api"))]
+    clash_publication_pause: parking_lot::Mutex<Option<ClashPublicationPause>>,
     /// Interface watcher, stopped and joined before `detach_hooks` during
     /// shutdown so it cannot re-attach hooks mid-drain.
     #[cfg(feature = "ebpf")]

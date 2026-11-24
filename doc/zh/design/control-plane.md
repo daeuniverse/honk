@@ -251,7 +251,7 @@ copy pump 在读取新输入之前，先 flush 嗅探或协议设置阶段已经
 会扩容，所以一条空闲连接的 copy 缓冲区是 16 KiB，不是 128 KiB。应用不必再发一个
 请求，也不必关闭连接，才能把当前请求送出去。
 
-首次 EOF 之后，两条中继路径只限制空闲排空的时间：`DRAIN_DEADLINE` 是没有任何字节进展的 30 秒。活跃的 survivor 可以跑超过 30 秒；静默的 survivor 不能一直占着 accepted socket。
+用户态复制中继从任一源首次返回 EOF 时启动 30 秒空闲计时，涵盖最后一次刷新和写端半关闭。中继每 100 毫秒采样复制进度，但用单调时钟计算空闲时长。如果任务直到期限过后才再次获得调度，这次轮询就结束排空，除非观察到新的非空读取或目的端新接受的字节。这两种进展都会续期；传输层在刷新过程中自行发送数据不会续期。到期时只统计目的端已接受的字节，清理不再等待正常关闭。原生 `splice` 的半关闭和空闲排空策略不变。
 
 客户端不发 FIN 或 RST 就消失的情况，另外单独限制：TPROXY TCP listener 启用 TCP keepalive，空闲 3600 秒、间隔 15 秒、探测 4 次，accepted socket 继承这套设置。静默客户端大约一小时后结束它的 relay；仍在线的空闲客户端会应答探测，所以长时间空闲的连接保持打开。这种情况报成客户端侧的 `TimedOut`；内核有待处理的 ICMP/ARP 软错误时，则是 `HostUnreachable` 或 `NetworkUnreachable`。两种都按取消结算 Score。
 
@@ -269,7 +269,7 @@ NFQUEUE 冷 cell 重建会在同一个读锁 guard 内保留 conn-state 快照�
 
 `splice.rs` 的 `relay_splice` 在普通 `TcpStream` 之间用双向零拷贝 `splice(2)`，并传播半关闭。每个方向的首次 splice 都会探测 capability。在任何字节进入管道之前，EINVAL、ENOSYS、EXDEV、EPERM 会触发无损 copy 回退，并设置进程级禁用标志；创建管道失败也会回退到 copy，但不设这个标志。不要恢复单向 splice，它曾导致超时。
 
-`relay_auto` 对 TLS 或协议封装的流用同一个基于 select 的 copy loop。`vision.rs` 把 Direct Vision carrier 的 socket 借给同一个双向引擎。两条路径都会在首次 EOF 时半关闭对端，剩下的排空时间只受空闲期限 `DRAIN_DEADLINE` 限制：连续 30 秒没有字节进展才结束，不会截断仍在传输的另一方向。这样，一个不发数据的对端就无法让任务和 socket 长期停在 CLOSE-WAIT。UDP 走 `UdpEndpointPool`。
+TLS 或协议封装的流走 `relay_auto` 的用户态复制路径；进入 Direct 模式的 Vision 可以把底层 socket 交给同一套双向 `splice` 引擎。UDP 走 `UdpEndpointPool`。
 
 ## Reload 与运行时 generation
 
@@ -289,11 +289,10 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
    完整的 256 位谓词值，把生成函数挂到每个相关 target，最后切换
    `ROUTING_POLICY_ROOT`。调用成功后，原生显式激活会用自己的 backend 重置 mode；
    用户态接着在同一串行边界内发布替代的 outbound registry、DNS runtime pointer、
-   Router、配置、组和 projection snapshot。root 已经提交之后，如果 mode reset 失
-   败，就把新 generation 提交为 degraded，并保持 admission fence。发布完成后，退
-   役旧 generation，替换它的 UDP 与 Selector warm coordinator，并同步健康检查节
-   点、URLTest 组和自定义组的检查 URL。已经提交但处于 degraded 的 generation 也
-   会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
+   Router、配置、组和 projection snapshot。节点的健康检查登记与运行时注册表一起发布。
+   root 已提交后，mode reset 失败会把新 generation 标为 degraded 并保持 admission fence。
+   发布完成后，退役旧 generation，替换 UDP 与 Selector warm coordinator，并同步 URLTest 组和自定义检查 URL。
+   已提交的 degraded generation 也会走完这些步骤，只是 admission 继续 fence。停止 warm coordinator 会取消可能依
    赖另一个 coordinator 的 retention-reconciliation 等待；coordinator 退出之前，
    仍会 abort 并 join 自己派发的子任务。QUIC warm 释放和终止关闭在 client 槽位上
    串行，即使没启用原生任务所有权也一样；取消释放不会提前清空槽位，终止关闭仍能
@@ -301,6 +300,10 @@ SIGHUP 为每次尝试单独收集诊断。不管加载和配置校验成功与�
 5. 开放 pending admission，最后重开 NFQUEUE。规则派生 feature bit 存在 policy descriptor 中，不再单独发布到静态 flag map。
 
 `control/reload/transaction.rs` 在候选准备和提交之外持有 `reload_lock`。新 generation 发布时，依次取得 `router` → `config` → `datapath_flags.publication()`，这一项只在原生显式源激活时取，然后是 `ebpf`；随后是 DNS projection-publication guard → `group_manager` → `outbound_id_map` → `active_routing_plan` → `runtime_registry`。在这些 guard 内，provider 的 DNS publication guard 会等到 backend staging 完成后再取，紧挨着 registry 权限替换之前，并一直持有到原来的 DNS pointer 提交点。所以 backend staging 不再占着 provider admission 锁，而 registry 转移、回调安装和 Score 权限发布仍会阻止新的旧 generation DNS admission。原生 no-op 激活取 `config` → flags publication → `ebpf`，不替换 Router。`mode.rs` 的独立 mode/fence 更新按 flags mutex → `ebpf` 取锁；`reset_for_activation` 不会重新取这两个锁，也不 await。NFQUEUE fence/reopen 在 router/config 发布 guard 之外运行。这里只是记录现有的锁边，不代表允许新增锁边；改动仍要遵守 CONTRIBUTING §2/§11 和人工审查。
+
+已发布或待发布的组只要含有 `exit`，Rust 接口 `reload_group_manager()` 就会拒绝单独重建。请把候选配置直接传给 `reload_runtime_config`，或使用 SIGHUP，不要先覆盖运行中的配置。完整事务同时发布组健康状态与 DNS；已接纳的 DNS 查询继续使用原来的一代。
+
+完整重载在持有运行时注册表和 provider 发布锁时取得健康登记写锁。单独重建组则先释放注册表读锁，再在组管理器写锁内取得健康登记写锁。Clash 延迟测量完成时依次核对物理运行时和健康登记，释放两把锁后才通知健康状态变更，并在反馈前重新核对权限。只有原组管理器仍在使用时，URLTest 才能重选成员。
 
 `RoutingPushPlan::compile` 是唯一一条用户态 lowering 路径；调用方不选 slot，也没有独立的 domain-publication 握手。`routing_policy.rs` 的 ABI 是：`RoutingInput` 128 字节、`RoutingDecision` 24 字节、`RoutingPolicyDescriptor` 24 字节。真实 eBPF 要求 Linux 6.12+；生成的进程名匹配代码在固定偏移读取之前检查 `pname_len`，以符合 6.12 的 verifier。已加载路由 slot 的 BTF 必须暴露当前的输出布局。
 

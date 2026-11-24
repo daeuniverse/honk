@@ -5,22 +5,26 @@
 //! Query ID is forced to 0 on the wire (cache-friendly) and restored for the
 //! intercepted client.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use bytes::Bytes;
 use h2::client::{SendRequest, handshake};
+use honk_outbound::SharedError;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::debug;
 
+use super::dial::CarrierIo;
+use super::doh_message::DeterministicResponse;
 use super::framing::force_dns_id_zero;
 use super::lifecycle::{LifecycleSlot, SessionFailure, SessionObservation};
 use super::owned_task::OwnedTask;
+use super::retry::exchange_with_route_retry;
 use super::{
-    DialContext, DnsMessageBody, build_doh_request, check_doh_status, doh_content_length,
-    exchange_with_retry, finish_doh_response,
+    DialContext, DnsMessageBody, RouteExchange, build_doh_request, check_doh_status,
+    doh_content_length, finish_doh_response,
 };
 use honk_outbound::tls::TlsConnector;
 
@@ -31,9 +35,14 @@ type H2Sender = SendRequest<Bytes>;
 struct H2Session {
     sender: Mutex<Option<H2Sender>>,
     driver: OwnedTask,
+    carrier_failure: Option<Arc<OnceLock<SharedError>>>,
 }
 
 impl H2Session {
+    fn h2_error(&self, stage: &str, error: h2::Error) -> anyhow::Error {
+        h2_error(stage, error, self.carrier_failure.as_deref())
+    }
+
     async fn close(self: Arc<Self>, timeout: Duration) {
         self.sender.lock().take();
         self.driver.shutdown(timeout).await;
@@ -71,10 +80,23 @@ impl DohClient {
         raw_query: &[u8],
         feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
     ) -> anyhow::Result<Vec<u8>> {
-        exchange_with_retry(
+        self.exchange_routed(raw_query, feedback, None).await
+    }
+
+    pub(crate) async fn exchange_routed(
+        self: &Arc<Self>,
+        raw_query: &[u8],
+        feedback: Option<honk_outbound::group::ScoreBusinessGuard>,
+        route: Option<RouteExchange<'_>>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let routed = route.is_some();
+        exchange_with_route_retry(
             "DoH",
             raw_query,
-            |reporter| async move { self.exchange_once(raw_query, reporter.as_ref()).await },
+            |reporter| async move {
+                self.exchange_once(raw_query, reporter.as_ref(), routed)
+                    .await
+            },
             |error| {
                 let session = SessionFailure::<H2Session>::session(error);
                 async move {
@@ -84,6 +106,7 @@ impl DohClient {
                 }
             },
             feedback,
+            route,
         )
         .await
     }
@@ -92,8 +115,9 @@ impl DohClient {
         &self,
         raw_query: &[u8],
         reporter: Option<&honk_outbound::group::ScoreReporter>,
+        routed: bool,
     ) -> anyhow::Result<Vec<u8>> {
-        let (session, mut sender) = self.get_sender().await?;
+        let (session, mut sender) = self.get_sender(routed).await?;
         if let Some(reporter) = reporter {
             reporter.setup_succeeded();
         }
@@ -106,31 +130,39 @@ impl DohClient {
 
             let (response_fut, mut send_stream) = sender
                 .send_request(req, false)
-                .map_err(|e| anyhow::anyhow!("DoH send_request: {e}"))?;
+                .map_err(|error| session.h2_error("DoH send_request", error))?;
 
             send_stream
                 .send_data(Bytes::from(wire), true)
-                .map_err(|e| anyhow::anyhow!("DoH send_data: {e}"))?;
+                .map_err(|error| session.h2_error("DoH send_data", error))?;
             if let Some(reporter) = reporter {
                 reporter.tx(raw_query.len() as u64);
             }
 
             let response = response_fut
                 .await
-                .map_err(|e| anyhow::anyhow!("DoH response error: {e}"))?;
+                .map_err(|error| session.h2_error("DoH response error", error))?;
 
             check_doh_status("DoH", response.status())?;
             let content_length = doh_content_length("DoH", response.headers())?;
             let mut body = response.into_body();
             let mut buf = DnsMessageBody::new("DoH", content_length)?;
             while let Some(chunk) = body.data().await {
-                let chunk = chunk.map_err(|e| anyhow::anyhow!("DoH body read: {e}"))?;
+                let chunk = chunk.map_err(|error| session.h2_error("DoH body read", error))?;
                 let n = chunk.len();
                 buf.push(&chunk)?;
                 let _ = body.flow_control().release_capacity(n);
             }
 
-            let response = finish_doh_response("DoH", buf.into_bytes(), orig_id)?;
+            let body = buf.into_bytes();
+            if routed && body.get(..2).is_some_and(|id| id != [0, 0]) {
+                return Err(DeterministicResponse {
+                    transport: "DoH",
+                    reason: "response ID does not match the query".into(),
+                }
+                .into());
+            }
+            let response = finish_doh_response("DoH", body, orig_id)?;
             if let Some(reporter) = reporter
                 && super::is_valid_response(raw_query, &response)
             {
@@ -153,36 +185,46 @@ impl DohClient {
     /// queries (server GOAWAY, idle close), leaving a sender clone that only
     /// fails; `ready` catches that, and the session is rebuilt once before
     /// the query goes out, instead of the query spending its retry on it.
-    async fn get_sender(&self) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
+    async fn get_sender(&self, routed: bool) -> anyhow::Result<(Arc<H2Session>, H2Sender)> {
         let observation = SessionObservation::start();
         let result = async {
             for attempt in 0..2 {
-                let (session, reused) = self.session.acquire(|| self.handshake()).await?;
+                let (session, reused) = self.session.acquire(|| self.handshake(routed)).await?;
                 let sender = session.sender.lock().clone().ok_or_else(|| {
                     SessionFailure::new(
                         Arc::clone(&session),
                         anyhow::anyhow!("DoH session is closing"),
                     )
                 })?;
-                match sender.ready().await {
+                let stale = reused && session.carrier_failure.as_ref().is_some_and(|failure| {
+                    failure.get().is_some()
+                });
+                let ready = if stale {
+                    Err(anyhow::anyhow!("DoH session is closing"))
+                } else {
+                    sender.ready().await.map_err(|error| {
+                        if reused {
+                            anyhow::anyhow!("DoH session unusable: {error}")
+                        } else {
+                            session.h2_error("DoH session unusable", error)
+                        }
+                    })
+                };
+                match ready {
                     Ok(sender) => {
                         if reused {
                             super::lifecycle::attached();
                         }
                         return Ok((session, sender));
                     }
-                    Err(error) if attempt == 0 => {
+                    Err(error) if attempt == 0 && (!routed || reused) => {
                         observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionReadyFailed);
                         observation.record(honk_outbound::runtime::flow_observation::SessionEvent::DnsSessionRetryStarted);
                         debug!(error = %error, transport = "doh", "DoH session is dead; rebuilding");
                         self.retire_session(&session).await;
                     }
                     Err(error) => {
-                        return Err(SessionFailure::new(
-                            session,
-                            anyhow::anyhow!("DoH session unusable: {error}"),
-                        )
-                        .into());
+                        return Err(SessionFailure::new(session, error).into());
                     }
                 }
             }
@@ -195,11 +237,12 @@ impl DohClient {
         )
     }
 
-    async fn handshake(&self) -> anyhow::Result<H2Session> {
+    async fn handshake(&self, routed: bool) -> anyhow::Result<H2Session> {
         let server_name = self.dial.endpoint.sni.clone();
         let via_proxy = self.dial.proxy.is_some();
         let deadline = tokio::time::Instant::now() + self.dial.dial_timeout;
         let tcp = self.dial.dial_tcp_boxed_until(deadline).await?;
+        let (tcp, carrier_failure) = CarrierIo::capture(tcp, routed);
         tokio::time::timeout_at(deadline, async {
             let tls = self
                 .connector
@@ -207,9 +250,14 @@ impl DohClient {
                 .await
                 .map_err(|error| {
                     let route = if via_proxy { " (via proxy)" } else { "" };
-                    anyhow::anyhow!("DoH TLS handshake{route}: {error}")
+                    let context = format!("DoH TLS handshake{route}: {error}");
+                    if routed {
+                        error.context(context)
+                    } else {
+                        anyhow::Error::msg(context)
+                    }
                 })?;
-            spawn_h2(tls, Arc::clone(&self.active_tasks)).await
+            spawn_h2(tls, Arc::clone(&self.active_tasks), carrier_failure).await
         })
         .await
         .map_err(|_| {
@@ -227,6 +275,11 @@ impl DohClient {
             .await;
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.session
+            .is_inactive(|session| session.driver.is_finished())
+    }
+
     pub(crate) async fn close(&self) {
         let timeout = self.dial.query_timeout;
         self.session
@@ -235,13 +288,34 @@ impl DohClient {
     }
 }
 
-async fn spawn_h2<S>(tls: S, active_tasks: Arc<AtomicUsize>) -> anyhow::Result<H2Session>
+fn h2_error(
+    stage: &str,
+    error: h2::Error,
+    carrier_failure: Option<&OnceLock<SharedError>>,
+) -> anyhow::Error {
+    let context = format!("{stage}: {error}");
+    if let Some(carrier_failure) = carrier_failure
+        && error.is_io()
+    {
+        if let Some(cause) = carrier_failure.get() {
+            return anyhow::Error::new(cause.clone()).context(context);
+        }
+        return anyhow::Error::new(error).context(context);
+    }
+    anyhow::Error::msg(context)
+}
+
+async fn spawn_h2<S>(
+    tls: S,
+    active_tasks: Arc<AtomicUsize>,
+    carrier_failure: Option<Arc<OnceLock<SharedError>>>,
+) -> anyhow::Result<H2Session>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let (sender, conn) = handshake(tls)
         .await
-        .map_err(|e| anyhow::anyhow!("HTTP/2 handshake: {e}"))?;
+        .map_err(|error| h2_error("HTTP/2 handshake", error, carrier_failure.as_deref()))?;
     let driver = OwnedTask::spawn(
         async move {
             if let Err(error) = conn.await {
@@ -257,6 +331,7 @@ where
     Ok(H2Session {
         sender: Mutex::new(Some(sender)),
         driver,
+        carrier_failure,
     })
 }
 
@@ -265,6 +340,105 @@ mod tests {
     use super::super::{
         DnsMessageBody, DnsMessageTooLarge, MAX_DNS_MESSAGE_SIZE, doh_content_length,
     };
+    use super::{CarrierIo, spawn_h2};
+    use honk_outbound::group::ScoreOutcome;
+    use honk_outbound::proxy::{DialFailureScope, NodeFailure, dial_failure_scope};
+    use std::io;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::task::{Context, Poll, ready};
+    use std::time::Duration;
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+    use tokio::net::{TcpListener, TcpStream};
+
+    // Drive real H2 multiplexing with the error a proxy codec would emit on read.
+    struct FailedCarrier(TcpStream);
+
+    impl AsyncRead for FailedCarrier {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            let was = buf.filled().len();
+            let cause = match ready!(Pin::new(&mut self.0).poll_read(cx, buf)) {
+                Ok(()) if buf.filled().len() != was => return Poll::Ready(Ok(())),
+                Ok(()) => io::Error::from(io::ErrorKind::UnexpectedEof),
+                Err(error) => error,
+            };
+            Poll::Ready(Err(io::Error::new(cause.kind(), NodeFailure(cause.into()))))
+        }
+    }
+
+    impl AsyncWrite for FailedCarrier {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, bytes)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn h2_streams_retain_one_typed_carrier_failure() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let peer = async {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut connection = h2::server::handshake(socket).await.unwrap();
+                let first = connection.accept().await.unwrap().unwrap();
+                let second = connection.accept().await.unwrap().unwrap();
+                drop(connection);
+                drop((first, second));
+            };
+            let exchange = async {
+                let socket = TcpStream::connect(address).await.unwrap();
+                let (io, failure) = CarrierIo::capture(FailedCarrier(socket), true);
+                let session = spawn_h2(io, Arc::new(AtomicUsize::new(0)), failure)
+                    .await
+                    .unwrap();
+                let session = Arc::new(session);
+                let sender = session.sender.lock().as_ref().unwrap().clone();
+                let mut pending = Vec::new();
+                for _ in 0..2 {
+                    let request = http::Request::post("https://example.test/dns-query")
+                        .body(())
+                        .unwrap();
+                    let mut ready = sender.clone().ready().await.unwrap();
+                    pending.push(ready.send_request(request, true).unwrap().0);
+                }
+                let mut previous = None;
+                for response in pending {
+                    let error = session.h2_error("DoH response error", response.await.unwrap_err());
+                    assert_eq!(
+                        dial_failure_scope(error.as_ref()),
+                        DialFailureScope::Unattributed
+                    );
+                    let outcome = ScoreOutcome::from_error(&error);
+                    assert!(
+                        matches!(outcome, ScoreOutcome::SharedNodeFailure(_)),
+                        "{error:#}"
+                    );
+                    assert_eq!(*previous.get_or_insert(outcome), outcome);
+                }
+                session.close(Duration::from_secs(1)).await;
+            };
+            tokio::join!(peer, exchange);
+        })
+        .await
+        .expect("both H2 streams must retain the same carrier cause");
+    }
 
     #[cfg(feature = "native-api")]
     #[tokio::test]

@@ -163,13 +163,17 @@ TCP syslog 接收端：数字 IP 加端口，例如 `192.0.2.10:514` 或 `[2001:
 
 把有歧义的 LAN 转发 UDP 原始包留在 NFQUEUE，直到用户态给出终态决策。此功能需要真实 eBPF 后端。
 
+启动降级会记录 `NFQUEUE is unavailable at startup; continuing with NFQUEUE staging disabled`，并带 `reason` 字段：`the mock eBPF backend was selected`、`honk-core was built without the ebpf feature`，或固定队列前置检查的错误。honk 不改写配置文件，在本进程内保持关闭。
+
 单实例交接后，固定队列不可用，或数据路径 admission 之前队列、规则、健康检查失败时，honk 会记一条 warning，并在本进程内关闭该功能，不改写配置。安装阶段会回收保留的 nftables table。
 
 持久化 token generation 恢复失败，以及 [admission 后的失败](../design/nfqueue.md#启用与范围)，仍然是 fatal。
 
 `experimental.udp_nfqueue.enabled` 已弃用，改用 `nfqueue_enable`。旧写法仍被接受，并产生迁移 warning；两者同时存在时以 `nfqueue_enable` 为准。
 
-只有确实发生过降级时，写入和 reload 才能继续请求 `nfqueue_enable: true`，而 NFQUEUE 的生效值保持关闭。省略该 key、采用默认值 `true`，也算这种请求。降级分两种：启动早期的降级（mock、不带 `ebpf` feature，或固定队列的前置检查失败），以及数据路径 admission 之前较晚发生的队列、规则或健康检查降级。此时请求的源文本保持原样，生效值在本进程整个生命周期内都是 `false`。honk 不会自动重试启用，只有重启才会重试。没有发生降级时，开关的变更仍需重启。[公共 reload 流程](../design/control-plane.md#reload-与运行时-generation) 在指纹/no-op 检查之前归一化生效配置；原生 API 的写入前检查与完整校验使用同一套重启策略。
+只有确实发生过降级时，写入和 reload 才能继续请求 `nfqueue_enable: true`，而 NFQUEUE 的生效值保持关闭。省略该 key、采用默认值 `true`，也算这种请求。降级分两种：启动早期的降级（mock、不带 `ebpf` feature，或固定队列的前置检查失败），以及数据路径 admission 之前较晚发生的队列、规则或健康检查降级。此时请求的源文本保持原样，生效值在本进程整个生命周期内都是 `false`。honk 不会自动重试启用，只有重启才会重试。没有发生降级时，开关的变更仍需重启。[公共 reload 流程](../design/control-plane.md#reload-与运行时-generation) 在指纹/no-op 检查之前归一化生效配置；原生 API 的写入检查沿用同一规则。
+
+`0.1.0-beta.4` 及更早版本没有这个豁免：启动降级后，该字段仍在需重启的比较范围内，所以请求 `true`（包括省略该 key）的写入和 reload 都会因需重启而被拒绝，重启后也一样。只有在源文件里写 `nfqueue_enable: false` 才能写入。
 
 `nfqueue_enable` 同时控制 [LAN UDP/53 分片交付](../design/nfqueue.md#lan-dns-分片)：DNS 控制器和 raw group 处理的分片都要求 NFQUEUE 处于 ready，否则直接丢弃，不能绕过 DNS 策略。原生 `direct(must)` 和未分片的 DNS 不变。
 

@@ -1,4 +1,5 @@
 use super::*;
+mod chain_membership;
 
 fn subscription(id: u128, name: &str, ua: Option<&str>) -> honk_config::subscription::Subscription {
     honk_config::subscription::Subscription {

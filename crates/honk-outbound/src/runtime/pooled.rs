@@ -93,7 +93,7 @@ impl NodeRuntime {
             ProtocolRuntime::AnyTls(runtime) => Some(runtime),
             #[cfg(any(feature = "rprx", test))]
             ProtocolRuntime::Vless(runtime) => Some(runtime),
-            ProtocolRuntime::None | ProtocolRuntime::Quic(_) => None,
+            ProtocolRuntime::None | ProtocolRuntime::Quic(_) | ProtocolRuntime::Chain(_) => None,
         }
     }
 
@@ -212,19 +212,38 @@ impl NodeRuntime {
         self.release_warm_locked(retention, reason).await;
     }
 
-    /// Close every session-layer resource this runtime owns: AnyTLS or VLESS
-    /// mux pool sessions (connections + drivers), or one cached QUIC client
-    /// (connection + endpoint driver). Terminal for the runtime; idempotent.
-    pub async fn close(&self) {
+    fn owned_runtimes(&self) -> impl Iterator<Item = &Self> {
+        // A generation registry closes its physical entries separately, including
+        // when it transfers ownership of an entry across a reload.
+        let hops = if self.ephemeral {
+            self.chain_hops()
+        } else {
+            &[]
+        };
+        std::iter::once(self).chain(hops.iter().map(Arc::as_ref))
+    }
+
+    pub(super) fn request_close(&self) {
         #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.task_owner {
             owner.abort();
         }
-        self.shutdown_pools();
-        match &self.runtime {
-            ProtocolRuntime::AnyTls(runtime) => runtime.tls.close(),
-            ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
-            _ => {}
+        for runtime in self.owned_runtimes() {
+            runtime.shutdown_pools();
+        }
+    }
+
+    /// Close every session-layer resource this runtime owns: AnyTLS or VLESS
+    /// mux pool sessions (connections + drivers), or one cached QUIC client
+    /// (connection + endpoint driver). Terminal for the runtime; idempotent.
+    pub async fn close(&self) {
+        self.request_close();
+        for runtime in self.owned_runtimes() {
+            match &runtime.runtime {
+                ProtocolRuntime::AnyTls(runtime) => runtime.tls.close(),
+                ProtocolRuntime::Quic(runtime) => runtime.force_close().await,
+                _ => {}
+            }
         }
         #[cfg(feature = "owned-tasks")]
         if let Some(owner) = &self.task_owner {

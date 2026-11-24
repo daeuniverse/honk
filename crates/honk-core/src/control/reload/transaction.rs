@@ -61,11 +61,6 @@ pub(crate) fn rebase_subscription_nodes(
     }
 
     candidate.nodes = static_nodes;
-    honk_config::parser::resolve_group_filters(
-        &mut candidate.groups,
-        &candidate.nodes,
-        &candidate.subscriptions,
-    );
     retained_providers
 }
 
@@ -250,10 +245,27 @@ impl ControlPlane {
             warn!("reload rejected: subscription worker changes require the control command path");
             return Ok(ReloadOutcome::Rejected);
         }
-        // Same proof as at the public entry: equality with the admitted active
-        // configuration is admission. Anything else is verified before any shortcut.
+        // Equality covers the private chain binding as well as the public node ID.
         if new_config != *current_config.as_ref() {
-            new_config.validate_assembled()?;
+            match &diagnostic_update {
+                DiagnosticUpdate::Rebase { .. } => {
+                    new_config = new_config.assemble(honk_config::parser::resolve_group_filters)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                    if new_config
+                        .nodes
+                        .iter()
+                        .any(|node| node.chain_hops().is_some()) =>
+                {
+                    new_config =
+                        new_config.assemble(honk_config::parser::resolve_programmatic_groups)?;
+                }
+                DiagnosticUpdate::Replace(_)
+                | DiagnosticUpdate::Preserve
+                | DiagnosticUpdate::ReplaceProvider { .. } => {
+                    new_config.validate_assembled()?;
+                }
+            }
         }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
@@ -512,7 +524,10 @@ impl ControlPlane {
                 return Ok(ReloadOutcome::Rejected);
             }
         };
-        let new_outbound_id_map = build_outbound_id_map(&new_config);
+        let mut new_outbound_id_map =
+            build_outbound_id_map(&new_config, OutboundHealthDependency::leaf);
+        let health_targets = health_registrations(&new_config, &new_outbound_id_map);
+        extend_route_health_dependencies(&new_config, &new_group_manager, &mut new_outbound_id_map);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
         let direct_target = super::direct_check_addr(&bootstrap);
         let bootstrap_resolver = honk_outbound::bootstrap::BootstrapResolver::parse(&bootstrap);
@@ -625,6 +640,8 @@ impl ControlPlane {
         #[cfg(feature = "native-api")]
         let mut mode_reset_failed = false;
         let old_registry_result = {
+            #[cfg(all(test, feature = "clash-api"))]
+            let _after_unlock = self.clash_publication_pause.lock().take();
             let mut router_guard = self.router.write().await;
             let mut config_guard = self.config.write().await;
             #[cfg(feature = "native-api")]
@@ -649,13 +666,8 @@ impl ControlPlane {
                 {
                     break 'publication Err(());
                 }
-                let old_connectivity = group_connectivity_snapshot(
-                    &current_config,
-                    &old_group_manager,
-                    &self.alive_set,
-                );
-                let new_connectivity =
-                    group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
+                let old_connectivity =
+                    group_connectivity_snapshot(&current_config, &group_guard, &self.alive_set);
                 let old_projection = projection_publication.project(&old_projection_snapshot);
                 let new_projection = projection_publication.project(&projection_snapshot);
                 // Recover a degraded runtime with a complete generation before reopening admission.
@@ -713,17 +725,18 @@ impl ControlPlane {
                     mode_reset_failed = true;
                 }
 
-                if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
-                    warn!(
-                        %error,
-                        "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
-                    );
-                }
                 // Fence DNS admission for authority changes, not the preceding map staging.
                 let publication = provider.prepare_publication(new_runtime);
                 let old_registry =
                     std::mem::replace(&mut *runtime_guard, Arc::clone(&new_runtime_registry));
                 new_runtime_registry.activate_background_dial_admission();
+                // A node can retain its runtime while leaving all health-checked groups.
+                // Publish its registration under the same fence as the runtime swap.
+                self.alive_set.sync_registrations_retaining_routes(
+                    health_targets,
+                    |id| reused_runtime_ids.contains(id),
+                    |id| new_outbound_id_map.contains_key(id),
+                );
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
                 // skip those runtimes at drain/shutdown.
@@ -737,7 +750,11 @@ impl ControlPlane {
                     #[cfg(feature = "native-api")]
                     self.native.as_ref(),
                 );
-                install_selector_warm_callback(&new_group_manager, &self.selector_warm_notify);
+                install_selector_warm_callback(
+                    &new_group_manager,
+                    &self.selector_warm_notify,
+                    &self.alive_set,
+                );
                 if let Some(ref db) = self.cache_db {
                     let db_cb = Arc::clone(db);
                     new_group_manager.set_persist_callback(Some(Arc::new(
@@ -747,6 +764,15 @@ impl ControlPlane {
                     )));
                 }
                 new_group_manager.publish_score_membership();
+                new_group_manager.publish_route_health();
+                let new_connectivity =
+                    group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
+                if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
+                    warn!(
+                        %error,
+                        "Failed to publish exact group connectivity after reload; remaining slots stay fail-open"
+                    );
+                }
                 #[cfg(test)]
                 if let Some(hook) = {
                     let mut hook = self.pre_dns_publication_hook.lock();
@@ -846,7 +872,6 @@ impl ControlPlane {
             .await;
         {
             let config = self.config.read().await;
-            let _ = sync_health_check_nodes(&self.alive_set, &config);
             self.alive_set
                 .sync_urltest_groups(&urltest_group_registrations(&config));
             self.alive_set

@@ -180,8 +180,7 @@ strip = true
 [patch.crates-io]
 # honk rprx fork: preset X25519 keyshare + ClientHello fixup hooks (REALITY)
 boring-sys = { git = "https://github.com/Glassyiris/boring-sys", rev = "3beb573b65ecaa69b7eefe3c2fecd074b97facd2" }
-# honk fork (branch `honk-0.11` = upstream 0.11.x + patches, auto-merged): bound receive fragmentation, expose delivery and flow-control state,
-# allow runtime flow-control window tuning, auto-tune the connection receive window, report per-packet events to congestion controllers,
-# let a controller pace by rate, and provide BBRv3 (Glassyiris/quinn#12).
-quinn = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
-quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "11f1de84c28305a3c98ace6d681c35219a8d1e6c" }
+# The maintained 0.11 fork bounds receive fragmentation and provides flow-control,
+# BBRv3 pacing and per-write local UDP submission evidence.
+quinn = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }
+quinn-proto = { git = "https://github.com/Glassyiris/quinn", rev = "d98acc02b8c26417a84180a366e1eb5b22af2b24" }

@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use crate::alive::{AliveDialerSet, IpVersion, ProbeDomain};
 
-use state::{SelectorState, UrlTestSelections};
+use state::{SelectorState, SelectorStorage, UrlTestSelections};
 
 #[cfg(feature = "flow-observation")]
 pub use resolver::GroupSelection;
@@ -111,7 +111,9 @@ pub struct ScoreSelectionEntry<'a> {
     pub node: &'a Node,
     /// The route through group exits, when `node` dials as its leaf.
     pub route: Option<Box<honk_config::route::Route>>,
+    pub collapse: ExitCollapse,
     pub feedback: Option<ScoreAttempt>,
+    /// Selected groups from outermost to innermost, followed by the selected member name.
     pub selection_chain: Vec<String>,
     /// Owners of group-valued final edges traversed by this entry, valid only
     /// with the manager that produced the plan. Display chains are not authority.
@@ -326,7 +328,7 @@ pub struct GroupManager {
     /// Per-group TCP/UDP Fallback pins.
     fallback_cache: RwLock<HashMap<String, [Option<String>; 2]>>,
     /// One publication barrier for both Selector networks and their revision.
-    selector_choice: RwLock<SelectorState>,
+    selector_choice: RwLock<SelectorStorage>,
     /// Per-group rate limiter for the sole TCP leaf's last-resort warning.
     last_resort_log: RwLock<HashMap<String, Instant>>,
     /// Invoked on selector choice changes (cache.db persistence hook).
@@ -398,8 +400,10 @@ impl GroupManager {
                 );
             }
         }
+        let exits = exit::Exits::build(groups, nodes, &mut managed);
+        let selector_choice = RwLock::new(SelectorStorage::new(exits.is_some()));
         Self {
-            exits: exit::Exits::build(groups, nodes, &mut managed),
+            exits,
             groups: managed,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
             node_order: nodes.iter().map(|node| node.id).collect(),
@@ -415,7 +419,7 @@ impl GroupManager {
                 })
                 .collect(),
             fallback_cache: RwLock::new(HashMap::new()),
-            selector_choice: RwLock::new(SelectorState::default()),
+            selector_choice,
             last_resort_log: RwLock::new(HashMap::new()),
             persist_callback: RwLock::new(None),
             selector_change_callback: RwLock::new(None),
@@ -444,13 +448,14 @@ impl GroupManager {
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
-        if group.policy == GroupPolicy::Selector
+        if !entry.routes
+            && group.policy == GroupPolicy::Selector
             && group.groups.is_empty()
             && group.final_outbound.is_none()
         {
-            return self
-                .pick_direct_selector(group, domain, ipver)
-                .or_else(|| self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply));
+            return self.pick_direct_selector(group, domain, ipver).or_else(|| {
+                self.last_resort_tcp_leaf(group, domain, SelectionEffects::Apply, None)
+            });
         }
         let mut visited = Vec::with_capacity(MAX_GROUP_DEPTH);
         self.pick_in_group(
@@ -535,8 +540,7 @@ impl GroupManager {
         self.selection_plan_for_group(&entry.group, entry.routes, domain, ipver, effects)
     }
 
-    // Inlined into both callers: an out-of-line call here added about 25
-    // instructions to every direct selector plan.
+    // An out-of-line call added about 25 instructions to a direct Selector plan.
     #[inline(always)]
     fn selection_plan_for_group<'a>(
         &'a self,
@@ -549,7 +553,9 @@ impl GroupManager {
         if effects.applies() {
             self.mark_used(&group.name);
         }
-        if group.policy == GroupPolicy::Selector
+        let network = SelectionNetwork::from_probe_domain(domain);
+        if !routes
+            && group.policy == GroupPolicy::Selector
             && group.groups.is_empty()
             && group.final_outbound.is_none()
         {
@@ -557,16 +563,12 @@ impl GroupManager {
                 mode: SelectionPlanMode::Authoritative,
                 nodes: self
                     .pick_direct_selector(group, domain, ipver)
-                    .or_else(|| self.last_resort_tcp_leaf(group, domain, effects))
+                    .or_else(|| self.last_resort_tcp_leaf(group, domain, effects, None))
                     .into_iter()
                     .collect(),
             };
         }
-        let context = ScoreSelectionContext::aggregate(
-            SelectionNetwork::from_probe_domain(domain),
-            domain,
-            ipver,
-        );
+        let context = ScoreSelectionContext::aggregate(network, domain, ipver);
         let (mode, candidates) = self.selection_candidates_for_target(
             group,
             &context,
@@ -598,6 +600,20 @@ impl GroupManager {
         self.groups
             .get(group_name)
             .and_then(|entry| entry.group.final_outbound.clone())
+    }
+
+    /// Standalone manager publication keeps the runtime registry. A surviving
+    /// manual delay must still describe the configured physical leaf.
+    pub fn retains_manual_delay(
+        &self,
+        id: &uuid::Uuid,
+        runtimes: &crate::runtime::OutboundRuntimeRegistry,
+    ) -> bool {
+        self.nodes.get(id).is_some_and(|node| {
+            runtimes
+                .get_ref(id)
+                .is_some_and(|runtime| runtime.matches_config(node))
+        })
     }
 
     /// First declared node with this display name; finals and API lookups agree
@@ -652,10 +668,7 @@ impl GroupManager {
         visited: &mut Vec<&'a str>,
         depth: usize,
     ) -> Vec<&'a Node> {
-        if depth >= MAX_GROUP_DEPTH
-            || visited.contains(&group.name.as_str())
-            || group.exit.is_some()
-        {
+        if depth >= MAX_GROUP_DEPTH || visited.contains(&group.name.as_str()) {
             return Vec::new();
         }
         let mut candidates = self.flatten_candidates(
@@ -666,21 +679,32 @@ impl GroupManager {
             depth,
             SelectionEffects::Peek,
         );
-        if routes {
-            candidates.retain(|candidate| {
-                self.routed_chain(candidate, SelectionNetwork::Udp)
-                    .is_some()
-            });
+        if routes && let Some(selected) = self.selector_member(group, SelectionNetwork::Udp) {
+            candidates.retain(|candidate| Self::same_member(selected, candidate.member()));
         }
-        let candidates =
-            self.filter_alive_candidates(candidates, ProbeDomain::DataUdp, ipver, group, routes);
+        let candidates = self.filter_alive_candidates(
+            candidates,
+            ProbeDomain::DataUdp,
+            ipver,
+            group,
+            visited,
+            routes,
+        );
         if candidates.is_empty() {
             return match self.final_member(group) {
-                Some(GroupMember::Node(node)) => self
-                    .is_node_selectable_for_domain(node.id, ProbeDomain::DataUdp, ipver)
-                    .then_some(node)
-                    .into_iter()
-                    .collect(),
+                Some(GroupMember::Node(node)) => {
+                    let available =
+                        self.is_node_selectable_for_domain(node.id, ProbeDomain::DataUdp, ipver)
+                            && (!routes
+                                || self.leaf_route_available(
+                                    node,
+                                    group,
+                                    visited,
+                                    ProbeDomain::DataUdp,
+                                    Some(ipver),
+                                ));
+                    available.then_some(node).into_iter().collect()
+                }
                 Some(GroupMember::Group(final_group)) => {
                     visited.push(group.name.as_str());
                     let leaves = self.ranked_udp_leaves_in_group(
@@ -724,7 +748,7 @@ mod score;
 mod state;
 mod target;
 
-pub use target::{DialKey, OwnedTarget, RoutedTarget, Target};
+pub use target::{DialKey, ExitCollapse, OwnedTarget, RoutedTarget, Target};
 
 #[cfg(test)]
 mod tests;

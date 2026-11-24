@@ -327,6 +327,12 @@ hostname: a CDN-fronted node keeps the edge IP as its address and names the
 distribution only in that header. The shared path therefore gives Trojan,
 VMess, and VLESS consistent TLS, REALITY, WS, gRPC, and XHTTP setup.
 
+If a physical WebSocket peer closes normally before VMess can send its empty
+upload terminator, the relay can finish cleanly only after validating the
+complete response and confirming that it forwarded all application bytes.
+The omitted terminator is not counted as sent. A writable carrier must still
+send and flush it.
+
 Cold and pooled-bare Trojan streams use that same complete transport stack. TLS
 batching returns bytes already read before surfacing a later I/O error on the
 next non-empty read. It never converts that error into EOF.
@@ -1251,66 +1257,71 @@ flows (`RewriteTo`) keep one scope per original destination.
 
 ## Proxy chains
 
-A chain node (`OutboundConfig::Chain`) dials through other nodes of the same
-generation; the [node reference](../reference/nodes.md#proxy-chains) covers its
-syntax, validation and limits. `ProxyRegistry::default_resolver` registers
-`ChainHandler` (`src/proxy/chain.rs`) last, with the TCP handler of every
-protocol registered before it, so each hop runs on the handler instance the
-registry dispatches to.
+A chain node (`OutboundConfig::Chain`) uses the registry's ordinary TCP
+handler instances. See the [node reference](../reference/nodes.md#proxy-chains)
+for syntax and hop eligibility.
 
-`build_reusing_with_admission` first builds or reuses every ordinary node, then
-builds each chain runtime from that pass's hop runtimes. Chain runtimes never
-enter the reuse set: a chain is rebuilt in every generation and never keeps a
-predecessor's hops alive. DNS runtime forks take the same path.
-`honk_config::node::resolve_chain_hops` resolves the hop names once and returns
-each chain's hop IDs, which the build looks up. `Config::validate_assembled`
-runs the same function, so an unresolved hop fails runtime admission. A plain `dial` without a generation runtime refuses a chain.
+Configuration assembly resolves the hop names after adding subscription nodes,
+binds their ordered physical IDs, and derives the chain ID before rebuilding
+group membership. Runtime admission verifies the binding against the exact
+snapshot. The registry builds or reuses physical node runtimes first, then
+rebuilds every chain using the hops in that generation. DNS runtime forks
+follow the same path. A plain `dial` without a generation runtime refuses a
+chain.
 
-`ChainHandler::dial_runtime` dials hop by hop:
+The entry uses its ordinary `dial_runtime` to reach the second hop's server.
+Each subsequent `dial_over` takes the existing stream and runs that hop's
+handshake. The last hop targets the application destination. A later hop's IP
+is passed as an address. A later hop's hostname is passed as `target_domain`
+with an unspecified address carrying the port for the preceding proxy to use.
 
-1. The entry dials the second hop's server with its ordinary `dial_runtime`.
-   An IP server is passed as the address. A domain goes in `target_domain`
-   with an unspecified address that carries only the port, so the entry's
-   server resolves it, as for any proxied target domain.
-2. Each later hop calls `dial_over` on the stream the hops before it opened.
-   Only the last hop targets the real destination.
-3. Each hop runs inside its own runtime's `scope_tasks` and transport-quality
-   scope, as a registry dial does. Later hops open no socket, and nested
-   dispatch keeps the dial scope it inherits, so the chain holds only the
-   entry's dial admission. Carrier pressure from chain traffic is therefore
-   recorded on the hops' runtimes: it can mark the entry node, and the chain
-   runtime's own `TransportQuality` stays empty, so a Score group holding the
-   chain never sees transport pressure for it.
+Each hop scopes its tasks and transport-quality observations to its own
+runtime. The entry may reuse a physical session. Later hops open no sockets
+and inherit the chain's dial scope, so only the entry needs physical dial
+admission. Carrier pressure belongs to the hop runtimes. The chain's own
+`TransportQuality` stays empty, so Score sees no transport pressure for the
+chain.
 
-One deadline, `connect_timeout × 3`, covers the whole chain; it is the bound
-the caller already applies to one candidate. Each hop gets the smaller of the
-remaining time and `connect_timeout`. Expiry fails the dial with a timed-out
-I/O error.
+An absolute deadline of `connect_timeout × 3` bounds the whole chain. The
+base timeout passed to each hop is the smaller of `connect_timeout` and the
+remaining time. Protocol-specific setup limits still apply to that value,
+including the tunneled REALITY handshake's `× 3`. If the chain deadline
+expires, setup returns a timed-out I/O error.
 
-`dial_over` leaves milestone suppression to the caller that chains it: every
-hop reports its own target milestones. Hops before the last run under
-`without_target_milestones`, which drops `TargetRequestSent` and
-`TargetConfirmed` and forwards transport events and every other milestone,
-including `TransportReady`. `TransportAttached` therefore names the entry's
-physical connection, and `TargetRequestSent` marks the request for the real
-destination.
+`dial_over` leaves target milestone filtering to the chain. Intermediate hops
+run under `without_target_milestones`, which drops `TargetRequestSent` and
+`TargetConfirmed` while forwarding transport events and other milestones.
+`TransportAttached` and `TransportReady` describe the physical carrier.
+The final `TargetRequestSent` follows the request through WS and VMess relays
+and the gRPC driver. With a Hysteria2, TUIC, or Juicity entry, every accepted
+range of that request on its QUIC stream needs a successful local UDP
+submission. An ACK or another stream's datagram is not evidence for it. An
+uncertain submission, including control output interleaved with the request,
+can leave the milestone absent even if the peer receives the bytes. This
+does not cause a resend. First-hop AnyTLS, VLESS mux, and XHTTP session
+writers may report delivery when they accept the bytes.
+Hysteria2 offers its pending opener and the first payload together even with observation enabled. Only accepted payload bytes are tracked; sending the opener alone cannot report the final request.
 
-A hop before the last targets the next hop's server, so a `TargetFailure` from
-it becomes a `NodeFailure` of the chain with the same message. The last hop's
-`TargetFailure` stays a target failure, and a packet policy rejection keeps
-its class wherever it occurs.
+A typed refusal to open the next hop counts as a failure of the chain. The
+intermediate carrier tags this refusal during setup and when it surfaces on a
+later read, write, flush, or shutdown. The tag preserves the cause, I/O kind,
+and shared failure episode for attribution. The exit's refusal of the actual
+application target stays target-scoped. Local policy, capacity and cancellation
+keep their original classifications.
 
-When a tunneled hop fails with `RealityMaskCertificate`, the chain redials once
-from the entry with hybrid key shares disabled, as a direct REALITY dial
-retries once. The redial shares the original deadline. A REALITY entry retries
-inside its own `dial_runtime`.
+A tunneled `RealityMaskCertificate` error redials the chain once from the entry
+with hybrid key shares disabled. The failed attempt drops its carrier and
+retained dial credits. The retry owns fresh credits and shares the same
+admission limits, pinned entry address, logical dial start and progress, and
+absolute deadline. A REALITY entry performs its ordinary retry inside
+`dial_runtime`.
 
 ### Routes through group exits
 
 A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
 (`honk_config::route::Route`). `group_graph::compose` joins the leaf's own hops
 (the node itself, or a chain's hops) with the exits of the groups on its
-selection path, innermost first, and enters a repeated exit once. A route is a
+selection path, innermost first. Only adjacent equal hops collapse. A route is a
 selection result, not a configured node, so it has no `NodeRuntime`.
 `ProxyRegistry::dial_ref` sends `DialRef::Route` to
 `ChainHandler::dial_route_tcp` over a `RouteRuntime` (`src/runtime/route.rs`),

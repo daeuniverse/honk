@@ -190,7 +190,7 @@ jobs:
           key: parser
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: tools/dae-parse/go.mod
           cache-dependency-path: tools/dae-parse/go.sum
@@ -379,7 +379,7 @@ jobs:
         with:
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)
@@ -434,6 +434,15 @@ jobs:
       # root-gated kernel half runs in the ebpf lane from the same tables.
       - name: Routing rule-matching goldens
         run: cargo nextest run -p honk-core --features native-ui,dns-syslog --lib --profile ci --no-tests=fail -E 'test(/^routing::golden::/)'
+      - name: Configured TCP chain interoperability (pinned loopback peers)
+        run: |
+          set -euo pipefail
+          peers="$RUNNER_TEMP/chain-interop"
+          ci/fetch-chain-interop-peers.sh "$peers"
+          HONK_SING_BOX_BIN="$peers/sing-box" \
+          HONK_XRAY_BIN="$peers/xray" \
+          HONK_JUICITY_SERVER_BIN="$peers/juicity-server" \
+            ci/run-exact-ignored-tests.sh --test chain_interop official_peers_carry_configured_tcp_chains
       - run: cargo nextest run --workspace --features honk-core/native-ui,honk-core/dns-syslog --profile ci
       - name: Test DNS syslog feature boundaries independently
         run: |
@@ -811,7 +820,7 @@ jobs:
           set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Run eBPF-feature unit tests
@@ -1129,7 +1138,7 @@ jobs:
           set -euo pipefail
           readelf -S crates/honk-ebpf/target/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
           readelf -S target/honk-ebpf-routing-test/bpfel-unknown-none/release/honk-ebpf | grep -q '\.BTF'
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Run eBPF-feature unit tests
@@ -1226,7 +1235,7 @@ jobs:
           key: ${{ github.job }}-${{ steps.toolchain.outputs.stable }}
           cache-on-failure: true
           save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+      - uses: taiki-e/install-action@75a7c0f87bd666af3cdb75c5b9e9d03ab6044e6f # v2.90.6
         with:
           tool: nextest
       - name: Install boring-sys build deps (cmake + libclang for bindgen)

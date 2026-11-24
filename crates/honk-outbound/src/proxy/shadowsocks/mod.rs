@@ -415,7 +415,7 @@ impl TcpOutbound for ShadowsocksHandler {
 
         let addr = format!("{}:{}", node.host(), node.port);
         debug!("Shadowsocks: connecting to {} for target {}", addr, target);
-        let server = crate::util::connect_outbound(&addr, connect_timeout).await?;
+        let server = crate::util::connect_proxy(&addr, connect_timeout).await?;
 
         let header = addr::encode_address(target, target_domain)?;
         crate::runtime::flow_observation::milestone(

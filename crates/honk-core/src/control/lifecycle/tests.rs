@@ -4,6 +4,26 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const WAIT: Duration = Duration::from_secs(20);
 
+#[cfg(feature = "ebpf")]
+impl ControlPlane {
+    pub(crate) fn tc_health_fixture(
+        config: Config,
+        backend: crate::ebpf::real::RealEbpfBackend,
+    ) -> anyhow::Result<(Self, impl Future<Output = anyhow::Result<()>>)> {
+        let router = Router::new(&config.routing.rules, &config.routing.default_outbound)?;
+        let plane = Self::new(
+            config,
+            Box::new(backend),
+            router,
+            Arc::new(ProxyRegistry::default_resolver()?),
+            DnsResolver::new(&honk_config::dns::DnsConfig::default())?,
+            crate::control::tests::support::udp_test_forwarder(),
+        )?;
+        let mut updates = HealthUpdates::start(&plane);
+        Ok((plane, async move { updates.stop().await }))
+    }
+}
+
 struct Fixture {
     commands: mpsc::Sender<ControlCommand>,
     phase: watch::Receiver<EnginePhase>,

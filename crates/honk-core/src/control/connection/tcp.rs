@@ -419,6 +419,7 @@ impl ControlPlaneHandle {
                     mut selection_chains,
                     final_owners,
                     health_ipver,
+                    route_revision,
                 ) = {
                     let context = tcp_score_context(original_dst, domain.as_deref(), ipver);
                     let select = || {
@@ -505,7 +506,9 @@ impl ControlPlaneHandle {
                         connect_timeout,
                         dial_deadline,
                         Arc::clone(&runtime_generation),
+                        &generation_group_manager,
                         health_ipver,
+                        route_revision,
                         &score_feedback,
                         cold_urltest,
                         #[cfg(feature = "native-api")]
@@ -545,6 +548,7 @@ impl ControlPlaneHandle {
                         {
                             // A Score retry excludes the failed route's leaf.
                             let failed_node = candidates[0].node.id;
+                            let failed_key = candidates[0].key();
                             let context = tcp_score_context(
                                 original_dst,
                                 target_domain.as_deref(),
@@ -560,10 +564,11 @@ impl ControlPlaneHandle {
                             };
                             let mut plan =
                                 observation.observe_tcp_plan(selection_observer.as_ref(), select);
+                            let urltest_retry = !plan.targets.is_empty();
                             // URLTest retains its existing fresh retry-round budget.
                             let mut retry_deadline =
                                 tokio::time::Instant::now() + overall_dial_timeout;
-                            if plan.targets.is_empty()
+                            if !urltest_retry
                                 && let Some(original) = original.as_ref()
                                 && tokio::time::Instant::now() < dial_deadline
                             {
@@ -574,7 +579,7 @@ impl ControlPlaneHandle {
                                         &context,
                                         failed_node,
                                         final_owners
-                                            .get(&candidates[0].key())
+                                            .get(&failed_key)
                                             .map(Vec::as_slice)
                                             .unwrap_or_default(),
                                         original,
@@ -591,11 +596,16 @@ impl ControlPlaneHandle {
                                 retry_chains,
                                 _,
                                 retry_health_ipver,
+                                retry_route_revision,
                             ) = unpack_tcp_score_plan(plan);
                             if retry_nodes.len() > 1
-                                || retry_nodes
-                                    .first()
-                                    .is_some_and(|target| target.node.id != failed_node)
+                                || retry_nodes.first().is_some_and(|target| {
+                                    if urltest_retry {
+                                        target.key() != failed_key
+                                    } else {
+                                        target.node.id != failed_node
+                                    }
+                                })
                             {
                                 let nodes: Vec<_> = retry_nodes.iter().take(3).collect();
                                 retry_feedback.retain(|key, _| {
@@ -612,7 +622,9 @@ impl ControlPlaneHandle {
                                         connect_timeout,
                                         retry_deadline,
                                         Arc::clone(&runtime_generation),
+                                        &generation_group_manager,
                                         retry_health_ipver,
+                                        retry_route_revision,
                                         &retry_feedback,
                                         false,
                                         #[cfg(feature = "native-api")]
@@ -666,6 +678,7 @@ impl ControlPlaneHandle {
                 let target = winner.target;
                 let node = &target.node;
                 let score_reporter = winner.reporter;
+                let route_traffic = winner.route_traffic;
                 #[cfg(feature = "native-api")]
                 let attempt_id = winner.attempt_id;
                 #[cfg(feature = "native-api")]
@@ -699,7 +712,7 @@ impl ControlPlaneHandle {
                             .get(&target.key())
                             .map(Vec::as_slice)
                             .unwrap_or_default(),
-                        &node.name,
+                        target.selected_member().1,
                         &generation_config,
                         {
                             #[cfg(feature = "native-api")]
@@ -735,6 +748,7 @@ impl ControlPlaneHandle {
                                     selection_chains.remove(&target.key()).unwrap_or_default(),
                                     node,
                                     target.hop_names(),
+                                    target.collapse == crate::group::ExitCollapse::Direct,
                                 ),
                                 upload: conn_upload.clone(),
                                 download: conn_download.clone(),
@@ -816,12 +830,26 @@ impl ControlPlaneHandle {
                         if !intentionally_closed {
                             debug!("Failed to write sniffed bytes to proxy: {}", error);
                             self.stats.record_error(&outbound_name, outbound_kind);
+                            if let Some(traffic) = route_traffic
+                                && !runtime_generation.is_shutdown()
+                            {
+                                generation_group_manager.report_route_failure(
+                                    &outbound_name,
+                                    &target,
+                                    traffic.family,
+                                    traffic.stamp,
+                                    &error,
+                                );
+                            }
                         }
                         if let Some(reporter) = &score_reporter {
                             reporter.finish(if intentionally_closed {
                                 crate::group::ScoreOutcome::Cancelled
                             } else {
-                                crate::group::ScoreOutcome::from_io_error(&error)
+                                target.score_failure(
+                                    crate::group::ScoreOutcome::from_io_error(&error),
+                                    &error,
+                                )
                             });
                         }
                         drop(proxy_stream);
@@ -837,11 +865,34 @@ impl ControlPlaneHandle {
                     }
                 };
 
-                let first_response = score_reporter.as_ref().map(|reporter| {
-                    let reporter = reporter.clone();
-                    std::sync::Arc::new(move || reporter.first_response())
-                        as std::sync::Arc<dyn Fn() + Send + Sync>
-                });
+                let first_response = if let Some(traffic) =
+                    route_traffic.filter(|traffic| !traffic.confirmed)
+                {
+                    let reporter = score_reporter.clone();
+                    let manager = Arc::clone(&generation_group_manager);
+                    let generation = Arc::clone(&runtime_generation);
+                    let group = outbound_name.clone();
+                    let key = target.key();
+                    Some(Arc::new(move || {
+                        if !generation.is_shutdown() {
+                            manager.report_route_response(
+                                &group,
+                                key,
+                                traffic.family,
+                                traffic.stamp,
+                                traffic.latency,
+                            );
+                        }
+                        if let Some(reporter) = &reporter {
+                            reporter.first_response();
+                        }
+                    }) as Arc<dyn Fn() + Send + Sync>)
+                } else {
+                    score_reporter.as_ref().map(|reporter| {
+                        let reporter = reporter.clone();
+                        Arc::new(move || reporter.first_response()) as Arc<dyn Fn() + Send + Sync>
+                    })
+                };
                 let first_response = observation.first_response(first_response);
                 let on_transfer = score_reporter.as_ref().map(|reporter| {
                     let reporter = reporter.clone();
@@ -947,8 +998,22 @@ impl ControlPlaneHandle {
                             debug!("Relay error for {} -> {}: {}", client_addr, original_dst, e);
                         }
                         self.stats.record_error(&outbound_name, outbound_kind);
+                        if let Some(traffic) = route_traffic
+                            && !runtime_generation.is_shutdown()
+                            && !e.is::<relay::ClientIoError>()
+                        {
+                            generation_group_manager.report_route_failure(
+                                &outbound_name,
+                                &target,
+                                traffic.family,
+                                traffic.stamp,
+                                e.as_ref(),
+                            );
+                        }
                         if let Some(reporter) = &score_reporter {
-                            reporter.finish(tcp_relay_score_outcome(&e));
+                            reporter.finish(
+                                target.score_failure(tcp_relay_score_outcome(&e), e.as_ref()),
+                            );
                         }
                     }
                 }

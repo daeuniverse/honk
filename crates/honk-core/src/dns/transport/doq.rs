@@ -179,6 +179,11 @@ impl DoqClient {
             .await;
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.connection
+            .is_inactive(|connection| connection.connection.close_reason().is_some())
+    }
+
     pub(crate) fn tasks_failed(&self) -> bool {
         self.quic_ep.tasks_failed()
     }

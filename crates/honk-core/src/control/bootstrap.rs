@@ -10,6 +10,11 @@ impl ControlPlane {
         dns_forwarder: std::sync::Arc<crate::dns::forwarder::DnsForwarder>,
     ) -> anyhow::Result<Self> {
         drop(dns_resolver);
+        let config = if config.nodes.iter().any(|node| node.chain_hops().is_some()) {
+            config.assemble(honk_config::parser::resolve_programmatic_groups)?
+        } else {
+            config
+        };
         let dns_router = dns_forwarder.routing_snapshot();
         let dns_upstream_pool = Arc::new(
             crate::dns::upstream_pool::UpstreamPool::new_with_proxy_and_bootstrap(
@@ -36,6 +41,7 @@ impl ControlPlane {
         )
     }
 
+    /// The supplied DNS pool and forwarder must use the assembled configuration.
     pub fn new_with_upstream_pool(
         config: Config,
         ebpf: Box<dyn EbpfBackend>,
@@ -90,9 +96,8 @@ impl ControlPlane {
         // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
         alive_set.set_direct_check_addr(direct_target.clone());
-        // Register health checks per the config's group membership; reload
-        // re-runs the same sync via `reload_group_manager`.
-        let (added, _) = sync_health_check_nodes(&alive_set, &config);
+        let mut reachable = build_outbound_id_map(&config, OutboundHealthDependency::leaf);
+        let (added, _) = alive_set.sync_registrations(health_registrations(&config, &reachable));
         info!(
             "Registered {}/{} nodes for health check ({} skipped: not in any group)",
             added,
@@ -105,15 +110,16 @@ impl ControlPlane {
         // groups are excluded — those are probed unconditionally.
         alive_set.sync_urltest_groups(&urltest_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
-        let outbound_id_map = Arc::new(parking_lot::RwLock::new(build_outbound_id_map(&config)));
+        let group_manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
+        extend_route_health_dependencies(&config, &group_manager, &mut reachable);
+        let outbound_id_map = Arc::new(parking_lot::RwLock::new(reachable));
         {
             let map = outbound_id_map.clone();
             alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
-                map.read().get(&node_id).copied()
+                map.read().get(&node_id).map(|entry| entry.outbound)
             })));
         }
-        let group_manager =
-            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive_set.clone()));
         // Custom-URL member resolution: a group's members are probed via
         // their current picks (delay_test_members = tag → representative
         // leaf), so sub-group members are measured through whatever leaf
@@ -181,6 +187,9 @@ impl ControlPlane {
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
+        pinned_groups.publish_route_health();
+        let snapshot = initial_route_connectivity(&config, &pinned_groups);
+        publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
@@ -322,6 +331,8 @@ impl ControlPlane {
             reload_slow_path_entries: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             pre_dns_publication_hook: parking_lot::Mutex::new(None),
+            #[cfg(all(test, feature = "clash-api"))]
+            clash_publication_pause: parking_lot::Mutex::new(None),
             #[cfg(feature = "ebpf")]
             iface_watcher: None,
         };
@@ -340,6 +351,7 @@ impl ControlPlane {
         install_selector_warm_callback(
             &control_plane.group_manager.read(),
             &control_plane.selector_warm_notify,
+            &control_plane.alive_set,
         );
         // Node death may race an initializer before the listener/background
         // loops start, so this production lifecycle callback belongs to

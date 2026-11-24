@@ -1,4 +1,6 @@
 use super::*;
+use honk_outbound::alive::RouteHealthRevision;
+use honk_outbound::group::{ExitCollapse, ScoreSelectionPlan};
 mod connectivity;
 mod dns;
 mod fingerprint;
@@ -27,63 +29,15 @@ pub(in crate::control) use warm::{
 #[cfg(test)]
 pub(in crate::control) use subscription::config_with_subscription_nodes;
 
+#[cfg(test)]
+pub(in crate::control) use connectivity::sync_health_check_nodes;
 pub(in crate::control) use connectivity::{
-    build_outbound_id_map, group_check_url_registrations, group_connectivity_snapshot,
-    group_datapath_alive, install_interrupt_callback, install_selector_warm_callback,
-    open_group_connectivity, publish_group_connectivity, sync_health_check_nodes,
-    urltest_group_registrations,
+    OutboundHealthDependency, OutboundHealthIndex, build_outbound_id_map,
+    extend_route_health_dependencies, group_check_url_registrations, group_connectivity_snapshot,
+    group_datapath_alive, health_registrations, initial_route_connectivity,
+    install_interrupt_callback, install_selector_warm_callback, open_group_connectivity,
+    publish_group_connectivity, urltest_group_registrations,
 };
-
-pub(crate) fn resolve_outbound_nodes(
-    config: &Config,
-    group_manager: &GroupManager,
-    outbound_name: &str,
-    domain: ProbeDomain,
-    ipver: IpVersion,
-) -> Vec<honk_outbound::group::OwnedTarget> {
-    if let Some(node) = config.builtin_node(outbound_name) {
-        return vec![honk_outbound::group::OwnedTarget::node(node)];
-    }
-    if let Some(node) = config.nodes.iter().find(|n| n.name == outbound_name) {
-        return vec![honk_outbound::group::OwnedTarget::node(node.clone())];
-    }
-    for group in &config.groups {
-        if group.name == outbound_name {
-            let mut nodes =
-                group_manager.select_targets_in_order_for_domain(&group.name, domain, ipver);
-            // Fallback: IPv6 targets may still be forwarded through nodes that
-            // are only reachable over IPv4 (common for proxy servers with only
-            // an A record). Try IPv4 alive candidates before giving up.
-            if nodes.is_empty() && ipver == IpVersion::V6 {
-                nodes = group_manager.select_targets_in_order_for_domain(
-                    &group.name,
-                    domain,
-                    IpVersion::V4,
-                );
-                if !nodes.is_empty() {
-                    warn!(
-                        "resolve_outbound_nodes: group '{}' has no IPv6 alive node; falling back to IPv4 alive candidates",
-                        group.name
-                    );
-                }
-            }
-            if nodes.is_empty() {
-                warn!(
-                    "resolve_outbound_nodes: group '{}' has no available node (ipver={:?})",
-                    group.name, ipver
-                );
-            }
-            return nodes;
-        }
-    }
-    warn!(
-        "Outbound '{}' not found, falling back to direct",
-        outbound_name
-    );
-    vec![honk_outbound::group::OwnedTarget::node(
-        Config::builtin_direct_node(),
-    )]
-}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(in crate::control) enum OutboundConstraint {
@@ -99,13 +53,17 @@ pub(in crate::control) enum OutboundConstraint {
 /// plan holds nodes, since routes through group exits carry TCP only and
 /// selection offers none for UDP.
 pub(super) trait PlanTarget: Sized {
-    fn node(node: Node) -> Self;
+    fn node(node: Node, collapse: ExitCollapse) -> Self;
     fn own(group_manager: &GroupManager, target: honk_outbound::group::Target<'_>) -> Option<Self>;
 }
 
 impl PlanTarget for honk_outbound::group::OwnedTarget {
-    fn node(node: Node) -> Self {
-        Self::node(node)
+    fn node(node: Node, collapse: ExitCollapse) -> Self {
+        Self {
+            node,
+            route: None,
+            collapse,
+        }
     }
 
     fn own(group_manager: &GroupManager, target: honk_outbound::group::Target<'_>) -> Option<Self> {
@@ -114,7 +72,7 @@ impl PlanTarget for honk_outbound::group::OwnedTarget {
 }
 
 impl PlanTarget for Node {
-    fn node(node: Node) -> Self {
+    fn node(node: Node, _: ExitCollapse) -> Self {
         node
     }
 
@@ -129,6 +87,7 @@ pub(super) struct ResolvedScorePlan<T = honk_outbound::group::OwnedTarget> {
     pub(super) mode: honk_outbound::group::SelectionPlanMode,
     pub(super) targets: Vec<T>,
     pub(super) health_family: IpVersion,
+    pub(super) route_revision: RouteHealthRevision,
     pub(super) feedback: Vec<Option<honk_outbound::group::ScoreAttempt>>,
     pub(super) selection_chains: Vec<Vec<String>>,
     pub(super) final_owners: Vec<Vec<String>>,
@@ -138,7 +97,7 @@ pub(super) struct ResolvedScorePlan<T = honk_outbound::group::OwnedTarget> {
 
 fn own_score_plan<T: PlanTarget>(
     group_manager: &GroupManager,
-    plan: honk_outbound::group::ScoreSelectionPlan<'_>,
+    (plan, route_revision): (ScoreSelectionPlan<'_>, RouteHealthRevision),
 ) -> ResolvedScorePlan<T> {
     let mut targets = Vec::with_capacity(plan.entries.len());
     let mut feedback = Vec::with_capacity(plan.entries.len());
@@ -148,7 +107,7 @@ fn own_score_plan<T: PlanTarget>(
         // A plain node takes the clone-and-push path with no `Option<T>` in
         // between, which would copy the node once more.
         let target = match entry.route {
-            None => T::node(entry.node.clone()),
+            None => T::node(entry.node.clone(), entry.collapse),
             route => {
                 let target = honk_outbound::group::Target {
                     node: entry.node,
@@ -169,6 +128,7 @@ fn own_score_plan<T: PlanTarget>(
         mode: plan.mode,
         targets,
         health_family: plan.health_family,
+        route_revision,
         feedback,
         selection_chains,
         final_owners,
@@ -185,7 +145,7 @@ pub(super) fn resolve_urltest_retry_plan_for_target(
 ) -> ResolvedScorePlan {
     own_score_plan(
         group_manager,
-        group_manager.urltest_retry_plan_for_target(outbound_name, context, original),
+        group_manager.urltest_retry_dial_plan(outbound_name, context, original),
     )
 }
 
@@ -199,7 +159,7 @@ pub(super) fn resolve_score_retry_plan_for_target(
 ) -> ResolvedScorePlan {
     own_score_plan(
         group_manager,
-        group_manager.score_retry_plan_for_target(
+        group_manager.score_retry_dial_plan(
             outbound_name,
             context,
             failed_node,
@@ -227,6 +187,7 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             targets: Vec::new(),
             health_family: context.health_family,
+            route_revision: RouteHealthRevision::default(),
             feedback: Vec::new(),
             selection_chains: Vec::new(),
             final_owners: Vec::new(),
@@ -239,8 +200,9 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
     {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            targets: vec![T::node(node)],
+            targets: vec![T::node(node, ExitCollapse::None)],
             health_family: context.health_family,
+            route_revision: RouteHealthRevision::default(),
             feedback: vec![None],
             selection_chains: vec![vec![outbound_name.to_owned()]],
             final_owners: vec![Vec::new()],
@@ -275,10 +237,11 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
             targets: health_family
-                .map(|_| T::node(node.clone()))
+                .map(|_| T::node(node.clone(), ExitCollapse::None))
                 .into_iter()
                 .collect(),
             health_family: health_family.unwrap_or(context.health_family),
+            route_revision: RouteHealthRevision::default(),
             feedback: health_family.map(|_| None).into_iter().collect(),
             selection_chains: health_family
                 .map(|_| vec![node.name.clone()])
@@ -296,8 +259,9 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
     {
         return ResolvedScorePlan {
             mode: honk_outbound::group::SelectionPlanMode::Authoritative,
-            targets: vec![T::node(Config::builtin_direct_node())],
+            targets: vec![T::node(Config::builtin_direct_node(), ExitCollapse::None)],
             health_family: context.health_family,
+            route_revision: RouteHealthRevision::default(),
             feedback: vec![None],
             selection_chains: vec![vec![Config::BUILTIN_DIRECT_NODE.to_owned()]],
             final_owners: vec![Vec::new()],
@@ -307,7 +271,7 @@ pub(super) fn resolve_outbound_plan_for_target<T: PlanTarget>(
     }
     own_score_plan(
         group_manager,
-        group_manager.selection_plan_for_target_with_health_fallback(outbound_name, context, None),
+        group_manager.dial_plan_for_target(outbound_name, context, None),
     )
 }
 

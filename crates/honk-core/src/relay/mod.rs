@@ -15,6 +15,7 @@
 //!          (TCP)              (SOCKS5)                  (TCP)
 //! ```
 
+mod drain;
 pub mod splice;
 #[cfg(feature = "rprx")]
 mod vision;
@@ -22,6 +23,8 @@ mod vision;
 #[cfg(test)]
 mod progress_tests;
 
+use self::drain::{CopyProgress, drain_idle};
+use futures::FutureExt;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -158,7 +161,7 @@ pub struct RelayProgress {
 
 pub type OptionalRelayProgress = Option<RelayProgress>;
 
-/// Preserve read-based tracker/drain accounting while observing accepted writes.
+/// Preserve read-based live accounting while observing accepted writes.
 pub(crate) struct RelayIo<S> {
     inner: S,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -289,8 +292,7 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for RelayIo<S> {
     }
 }
 
-/// Grace window for the surviving direction after the first EOF, counted
-/// as idle time: any byte of progress resets it. See
+/// Grace window after the first source EOF, counted as idle time. See
 /// [`splice::DRAIN_DEADLINE`] for why the drain must be bounded.
 const DRAIN_DEADLINE: std::time::Duration = splice::DRAIN_DEADLINE;
 
@@ -340,16 +342,16 @@ impl Park<'_> {
 }
 
 /// Copy one direction until EOF, then half-close the destination's write
-/// side (same contract as `copy_bidirectional`). Bytes read are counted
-/// into `progress` so the drain supervisor can tell a stalled survivor
-/// from an active one. A taken `park` returns early without closing.
+/// side. The drain starts at source EOF, before a buffered final flush or
+/// shutdown can block. A taken `park` returns without closing either side.
 async fn copy_way<R, W>(
     rd: &mut R,
     wr: &mut W,
-    progress: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    progress: &CopyProgress,
+    eof: &tokio::sync::Notify,
     upload: bool,
     park: Option<&Park<'_>>,
-) -> Result<u64, RelayError>
+) -> Result<(), RelayError>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
@@ -359,19 +361,18 @@ where
     // Sniffing or protocol setup may already have buffered bytes before the
     // relay starts, independently of bytes read by this copy loop.
     wr.flush().await.map_err(write_error)?;
-    let mut rd = RelayIo::wrap(rd, progress, None, None, None, false);
     let mut buffer = vec![0; RELAY_BUF_MIN];
     let mut n = 0;
     loop {
         if park.is_some_and(|park| park.take(upload)) {
-            return Ok(n);
+            return Ok(());
         }
         let read = std::future::poll_fn(|cx| {
             use std::pin::Pin;
             use std::task::{Poll, ready};
 
             let mut chunk = tokio::io::ReadBuf::new(&mut buffer);
-            match Pin::new(&mut rd).poll_read(cx, &mut chunk) {
+            match Pin::new(&mut *rd).poll_read(cx, &mut chunk) {
                 Poll::Ready(result) => {
                     if let Some(park) = park {
                         park.set_waiting(upload, false);
@@ -391,49 +392,26 @@ where
         })
         .await?;
         if read == 0 {
+            eof.notify_one();
             break;
         }
-        wr.write_all(&buffer[..read]).await.map_err(write_error)?;
-        n += read as u64;
+        progress.read.store(n + read as u64, Ordering::Relaxed);
+        let mut rest = &buffer[..read];
+        while !rest.is_empty() {
+            let written = wr.write(rest).await.map_err(write_error)?;
+            if written == 0 {
+                return Err(write_error(std::io::ErrorKind::WriteZero.into()));
+            }
+            rest = &rest[written..];
+            n += written as u64;
+            progress.written.store(n, Ordering::Relaxed);
+        }
         if read == buffer.len() && read < RELAY_BUF_SIZE {
             buffer = vec![0; RELAY_BUF_SIZE];
         }
     }
     wr.flush().await.map_err(write_error)?;
-    wr.shutdown().await.map_err(write_error)?;
-    Ok(n)
-}
-
-/// Wait out the surviving direction after its peer finished. The survivor
-/// is cut only after a full [`DRAIN_DEADLINE`] without any byte progress —
-/// a slow but active download may far exceed the deadline and must not be
-/// interrupted. A cut survivor reports the counter's final value, so the
-/// bytes it did move are not lost from the stats.
-async fn drain_wait(
-    f: &mut (impl Future<Output = Result<u64, RelayError>> + Unpin),
-    progress: &std::sync::atomic::AtomicU64,
-) -> Result<u64, RelayError> {
-    const CHECK: std::time::Duration = std::time::Duration::from_millis(100);
-    let mut last = 0u64;
-    let mut stalled = std::time::Duration::ZERO;
-    loop {
-        tokio::select! {
-            r = &mut *f => return r,
-            _ = tokio::time::sleep(CHECK) => {
-                let now = progress.load(std::sync::atomic::Ordering::Relaxed);
-                if now != last {
-                    last = now;
-                    stalled = std::time::Duration::ZERO;
-                } else {
-                    stalled += CHECK;
-                    if stalled >= DRAIN_DEADLINE {
-                        debug!("relay drain stalled; closing both directions");
-                        return Ok(now);
-                    }
-                }
-            }
-        }
-    }
+    wr.shutdown().await.map_err(write_error)
 }
 
 /// Relay a TCP connection between client and proxy.
@@ -458,8 +436,10 @@ where
     debug!("TCP relay started: {} → {}", client_addr, target_addr);
 
     let result = copy_phase(&mut client, &mut proxy, None).await;
-    let _ = client.shutdown().await;
-    let _ = proxy.shutdown().await;
+    // A borrowed socket may still need a half-close on exit. Poll once to
+    // bound cleanup even when a protocol shutdown is backpressured.
+    let _ = client.shutdown().now_or_never();
+    let _ = proxy.shutdown().now_or_never();
     relay_outcome(result, start, client_addr, target_addr)
 }
 
@@ -476,31 +456,41 @@ where
 {
     let (mut cr, mut cw) = tokio::io::split(client);
     let (mut pr, mut pw) = tokio::io::split(proxy);
-    let c2p_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let p2c_progress = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let c2p = copy_way(&mut cr, &mut pw, c2p_progress.clone(), true, park);
-    let p2c = copy_way(&mut pr, &mut cw, p2c_progress.clone(), false, park);
-    tokio::pin!(c2p);
-    tokio::pin!(p2c);
+    let upload = CopyProgress::default();
+    let download = CopyProgress::default();
+    let eof = tokio::sync::Notify::new();
+    let c2p = copy_way(&mut cr, &mut pw, &upload, &eof, true, park);
+    let p2c = copy_way(&mut pr, &mut cw, &download, &eof, false, park);
+    tokio::pin!(c2p, p2c);
     let parked = || park.is_some_and(Park::taken);
-
-    // The first direction to finish half-closes the other (inside
-    // copy_way); the survivor then drains until its own EOF or until it
-    // stalls for a full DRAIN_DEADLINE. An error in either direction
-    // cancels the whole relay, mirroring `copy_bidirectional`. A parked
-    // direction left the other suspended in a read, so dropping it is safe.
+    let copy = async {
+        tokio::select! {
+            result = &mut c2p => {
+                result?;
+                if !parked() { p2c.await?; }
+            }
+            result = &mut p2c => {
+                result?;
+                if !parked() { c2p.await?; }
+            }
+        }
+        Ok::<(), RelayError>(())
+    };
+    let cutoff = async {
+        // Reset the idle budget only for byte movement at the copy boundary.
+        eof.notified().await;
+        drain::drain_copy_idle(&upload, &download).await;
+    };
+    // A pending codec can exhaust the copy task's budget before the timer is polled.
     tokio::select! {
-        r = &mut c2p => match r {
-            Err(e) => Err(e),
-            Ok(first_n) if parked() => Ok((first_n, p2c_progress.load(Ordering::Relaxed))),
-            Ok(first_n) => drain_wait(&mut p2c, &p2c_progress).await.map(|second_n| (first_n, second_n)),
-        },
-        r = &mut p2c => match r {
-            Err(e) => Err(e),
-            Ok(first_n) if parked() => Ok((c2p_progress.load(Ordering::Relaxed), first_n)),
-            Ok(first_n) => drain_wait(&mut c2p, &c2p_progress).await.map(|second_n| (second_n, first_n)),
-        },
+        biased;
+        result = copy => result?,
+        () = tokio::task::unconstrained(cutoff) => (),
     }
+    Ok((
+        upload.written.load(Ordering::Relaxed),
+        download.written.load(Ordering::Relaxed),
+    ))
 }
 
 fn relay_outcome(
@@ -591,13 +581,20 @@ mod tests {
                 limit,
                 pending: false,
             };
-            let progress = Arc::new(AtomicU64::new(0));
-            let copied = copy_way(&mut source, &mut writer, Arc::clone(&progress), true, None)
-                .await
-                .unwrap();
+            let progress = CopyProgress::default();
+            copy_way(
+                &mut source,
+                &mut writer,
+                &progress,
+                &tokio::sync::Notify::new(),
+                true,
+                None,
+            )
+            .await
+            .unwrap();
             assert_eq!(writer.bytes, payload);
-            assert_eq!(copied, payload.len() as u64);
-            assert_eq!(progress.load(Ordering::Relaxed), copied);
+            let len = payload.len() as u64;
+            assert_eq!(progress.snapshot(), (len, len));
             if limit == u16::MAX as usize {
                 // One small frame while the flow proves itself bulk, then full ones.
                 let sizes = &writer.sizes;
@@ -644,7 +641,8 @@ mod tests {
         copy_way(
             &mut source,
             &mut tokio::io::sink(),
-            Arc::new(AtomicU64::new(0)),
+            &CopyProgress::default(),
+            &tokio::sync::Notify::new(),
             true,
             None,
         )

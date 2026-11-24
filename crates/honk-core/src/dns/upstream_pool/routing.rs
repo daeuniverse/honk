@@ -1,18 +1,41 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 
 use honk_config::node::Node;
-use honk_config::types::DnsProtocol;
-use honk_outbound::alive::{IpVersion, ProbeDomain};
+use honk_config::types::{DnsProtocol, NodeProtocol};
+use honk_outbound::alive::{IpVersion, ProbeDomain, RouteHealthRevision};
 use honk_outbound::group::GroupManager;
 use honk_outbound::group::{
     OwnedTarget, ScoreAttempt, ScoreContinuation, ScoreSelectionContext, ScoreTarget,
     SelectionNetwork, Target,
 };
+use honk_outbound::proxy::PacketRejection;
 use tracing::debug;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
+use crate::dns::transport::{RouteExchange, RouteFailures};
 use crate::routing::ConnectionInfo;
+
+fn policy_block(reason: &'static str) -> anyhow::Error {
+    crate::observe::flows::dns::decision("rejected", Some("policy_block"));
+    anyhow::Error::new(PacketRejection::Policy).context(reason)
+}
+
+impl UpstreamEntry {
+    pub(super) fn check_explicit_block(&self) -> anyhow::Result<()> {
+        if self
+            .outbound
+            .as_deref()
+            .is_some_and(|tag| tag.eq_ignore_ascii_case("block"))
+        {
+            return Err(policy_block(
+                "DNS upstream outbound 'block' rejected the dial",
+            ));
+        }
+        Ok(())
+    }
+}
 
 pub(super) struct DnsDialRoute {
     pub(super) target: SocketAddr,
@@ -20,21 +43,51 @@ pub(super) struct DnsDialRoute {
     pub(super) node: Option<OwnedTarget>,
     pub(super) feedback: Option<ScoreAttempt>,
     pub(super) observation: Option<crate::observe::flows::record::OutboundAttempt>,
+    health: Option<SelectedRouteHealth>,
+}
+
+struct SelectedRouteHealth {
+    manager: Arc<GroupManager>,
+    group: String,
+    family: IpVersion,
+    revision: RouteHealthRevision,
+}
+
+impl DnsDialRoute {
+    pub(super) fn route_exchange<'a>(
+        &'a self,
+        reported_failures: &'a mut RouteFailures,
+    ) -> Option<RouteExchange<'a>> {
+        let health = self.health.as_ref()?;
+        let target = self.node.as_ref()?;
+        Some(RouteExchange {
+            manager: &health.manager,
+            group: &health.group,
+            family: health.family,
+            revision: health.revision,
+            target,
+            reported_failures,
+        })
+    }
 }
 
 #[derive(Default)]
 struct SelectedLeaf {
     node: Option<OwnedTarget>,
     feedback: Option<ScoreAttempt>,
+    health: Option<SelectedRouteHealth>,
     path: crate::observe::flows::dns::SelectionPath,
 }
 
 impl SelectedLeaf {
-    fn explicit(node: &Node) -> Self {
-        Self {
+    fn explicit(node: &Node) -> anyhow::Result<Self> {
+        if node.protocol() == NodeProtocol::Block {
+            return Err(policy_block("DNS upstream outbound selected block"));
+        }
+        Ok(Self {
             node: Some(OwnedTarget::node(node.clone())),
             ..Self::default()
-        }
+        })
     }
 }
 
@@ -78,42 +131,50 @@ pub(super) fn tcp_target_context(
 }
 
 fn select_group_leaf_for_target(
-    group_manager: &GroupManager,
+    group_manager: &Arc<GroupManager>,
     outbound: &str,
     entry: &UpstreamEntry,
     target: SocketAddr,
     original: Option<&ScoreContinuation>,
-) -> Option<SelectedLeaf> {
-    group_manager.get_group_policy(outbound)?;
-    let select = || {
-        group_manager.selection_plan_for_target_with_health_fallback(
-            outbound,
-            &target_context(entry, target),
-            original,
-        )
-    };
-    let plan = match honk_outbound::runtime::flow_observation::current() {
+) -> anyhow::Result<Option<SelectedLeaf>> {
+    if group_manager.get_group_policy(outbound).is_none() {
+        return Ok(None);
+    }
+    let context = target_context(entry, target);
+    let select = || group_manager.dial_plan_for_target(outbound, &context, original);
+    let (plan, revision) = match honk_outbound::runtime::flow_observation::current() {
         Some(observer) => observer.sync_scope(select),
         None => select(),
     };
     let selections = crate::observe::flows::dns::selection_evaluated(plan.observation.as_deref());
     let family = plan.health_family;
-    plan.entries
-        .into_iter()
-        .next()
-        .map(|selected| SelectedLeaf {
-            path: crate::observe::flows::dns::selection_path(
-                &selections,
-                &selected.selection_chain,
-                selected.node,
-                family,
-            ),
-            node: Some(group_manager.own_target(Target {
-                node: selected.node,
-                route: selected.route,
-            })),
-            feedback: selected.feedback,
-        })
+    let Some(selected) = plan.entries.into_iter().next() else {
+        return Ok(None);
+    };
+    if selected.node.protocol() == NodeProtocol::Block {
+        return Err(policy_block("DNS outbound group selected block"));
+    }
+    let mut dialed = group_manager.own_target(Target {
+        node: selected.node,
+        route: selected.route,
+    });
+    dialed.collapse = selected.collapse;
+    Ok(Some(SelectedLeaf {
+        path: crate::observe::flows::dns::selection_path(
+            &selections,
+            &selected.selection_chain,
+            &dialed,
+            family,
+        ),
+        health: dialed.uses_route_evidence().then(|| SelectedRouteHealth {
+            manager: Arc::clone(group_manager),
+            group: outbound.to_owned(),
+            family,
+            revision,
+        }),
+        node: Some(dialed),
+        feedback: selected.feedback,
+    }))
 }
 
 impl UpstreamPool {
@@ -123,33 +184,33 @@ impl UpstreamPool {
         entry: &UpstreamEntry,
         target: SocketAddr,
         original: Option<&ScoreContinuation>,
-    ) -> SelectedLeaf {
+    ) -> anyhow::Result<SelectedLeaf> {
         if outbound.eq_ignore_ascii_case("direct") {
-            return SelectedLeaf::default();
+            return Ok(SelectedLeaf::default());
         }
 
         if let Some(group_manager) = self.group_manager_snapshot.read().as_ref() {
             if let Some(selected) =
-                select_group_leaf_for_target(group_manager, outbound, entry, target, original)
+                select_group_leaf_for_target(group_manager, outbound, entry, target, original)?
             {
-                return selected;
+                return Ok(selected);
             }
             if group_manager.get_group_policy(outbound).is_some() {
-                return SelectedLeaf::default();
+                return Ok(SelectedLeaf::default());
             }
         } else if let Some(cell) = self.group_manager.read().as_ref() {
             let group_manager = cell.read();
             if group_manager.get_group_policy(outbound).is_some() {
                 if let Some(selected) =
-                    select_group_leaf_for_target(&group_manager, outbound, entry, target, original)
+                    select_group_leaf_for_target(&group_manager, outbound, entry, target, original)?
                 {
-                    return selected;
+                    return Ok(selected);
                 }
                 debug!(
                     "DNS outbound group '{}' has no available node (GroupManager)",
                     outbound
                 );
-                return SelectedLeaf::default();
+                return Ok(SelectedLeaf::default());
             }
         }
 
@@ -169,7 +230,7 @@ impl UpstreamPool {
             return SelectedLeaf::explicit(node);
         }
         debug!("DNS outbound '{}' resolved to no node", outbound);
-        SelectedLeaf::default()
+        Ok(SelectedLeaf::default())
     }
     pub(super) fn tcp_feedback_for_route(
         &self,
@@ -179,7 +240,13 @@ impl UpstreamPool {
         route
             .feedback
             .clone()
-            .map(|feedback| feedback.with_context(tcp_target_context(entry, route.target)))
+            .map(|feedback| {
+                let mut context = tcp_target_context(entry, route.target);
+                if let Some(health) = &route.health {
+                    context.health_family = health.family;
+                }
+                feedback.with_context(context)
+            })
             .transpose()
             .map_err(Into::into)
     }
@@ -200,11 +267,8 @@ impl UpstreamPool {
         original: Option<&ScoreContinuation>,
     ) -> anyhow::Result<DnsDialRoute> {
         if let Some(tag) = entry.outbound.as_deref() {
-            if tag.eq_ignore_ascii_case("block") {
-                crate::observe::flows::dns::decision("rejected", Some("policy_block"));
-                anyhow::bail!("DNS upstream outbound 'block' rejected the dial");
-            }
-            let selected = self.resolve_outbound_for_target(tag, entry, target, original);
+            entry.check_explicit_block()?;
+            let selected = self.resolve_outbound_for_target(tag, entry, target, original)?;
             if selected.node.is_none() && !tag.eq_ignore_ascii_case("direct") {
                 crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
                 anyhow::bail!("DNS upstream outbound '{tag}' has no available node");
@@ -229,6 +293,7 @@ impl UpstreamPool {
                 target,
                 node: selected.node,
                 feedback: selected.feedback,
+                health: selected.health,
             });
         }
 
@@ -267,6 +332,7 @@ impl UpstreamPool {
                         target,
                         node: None,
                         feedback: None,
+                        health: None,
                     });
                 };
                 let router = router.read().await;
@@ -282,8 +348,7 @@ impl UpstreamPool {
             outbound_name
         );
         if outbound_name.eq_ignore_ascii_case("block") {
-            crate::observe::flows::dns::decision("rejected", Some("policy_block"));
-            anyhow::bail!("DNS dial route selected block");
+            return Err(policy_block("DNS dial route selected block"));
         }
         if outbound_name.eq_ignore_ascii_case("direct") {
             return Ok(DnsDialRoute {
@@ -298,9 +363,10 @@ impl UpstreamPool {
                 target,
                 node: None,
                 feedback: None,
+                health: None,
             });
         }
-        let selected = self.resolve_outbound_for_target(&outbound_name, entry, target, original);
+        let selected = self.resolve_outbound_for_target(&outbound_name, entry, target, original)?;
         if selected.node.is_none() {
             crate::observe::flows::dns::decision("rejected", Some("no_available_outbound"));
             anyhow::bail!(
@@ -327,6 +393,7 @@ impl UpstreamPool {
             target,
             node: selected.node,
             feedback: selected.feedback,
+            health: selected.health,
         })
     }
 

@@ -1,6 +1,11 @@
-use std::future::Future;
-use std::sync::Arc;
+use std::io;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
+
+use honk_outbound::SharedError;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use super::super::endpoint::DnsEndpoint;
 use super::budget::DnsSocketBudget;
@@ -33,6 +38,81 @@ pub struct ProxyDial {
     /// a captured generation's hop runtimes, and DNS packet transports
     /// (DoQ, DoH3) reject it.
     pub route: Option<honk_config::route::Route>,
+}
+
+// TLS borrows the carrier error and HTTP/2 fans it out. Keep its provenance and
+// episode before either library has to project it.
+pub(super) struct CarrierIo<S> {
+    inner: S,
+    failure: Option<Arc<OnceLock<SharedError>>>,
+}
+
+impl<S> CarrierIo<S> {
+    pub(super) fn capture(inner: S, routed: bool) -> (Self, Option<Arc<OnceLock<SharedError>>>) {
+        let failure = routed.then(|| Arc::new(OnceLock::new()));
+        let stream = Self {
+            inner,
+            failure: failure.clone(),
+        };
+        (stream, failure)
+    }
+}
+
+fn retain_carrier_error(failure: Option<&OnceLock<SharedError>>, error: io::Error) -> io::Error {
+    let Some(failure) = failure else {
+        return error;
+    };
+    let kind = error.kind();
+    let cause = failure.get_or_init(|| SharedError::fanout(error.into()));
+    io::Error::new(kind, cause.clone())
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CarrierIo<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_read(cx, buf)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CarrierIo<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write(cx, buf)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.inner)
+            .poll_write_vectored(cx, bufs)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner)
+            .poll_flush(cx)
+            .map_err(|error| retain_carrier_error(self.failure.as_deref(), error))
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 pub(super) enum PacketAdmission<'a> {

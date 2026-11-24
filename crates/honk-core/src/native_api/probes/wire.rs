@@ -237,23 +237,10 @@ async fn attempt_wire(
     let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
     };
-    // Disposable runtime identity remains the canonical node's identity. Only its
-    // inherited dial scope pins the previously validated physical server address.
-    // A chain instead dials through its hops' runtimes in this generation: a
-    // disposable chain runtime would have no hops. A cold chain probe therefore
-    // reuses any warm session a hop holds; that is a documented limit.
-    let mut ephemeral = None;
-    let runtime = if candidate.node.protocol() == honk_config::types::NodeProtocol::Chain {
-        let Some(runtime) = plan.registry.get(&candidate.node.id) else {
-            return AttemptOutcome::refused();
-        };
-        runtime
-    } else {
-        let Ok(owner) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
-            return AttemptOutcome::refused();
-        };
-        ephemeral.insert(owner).runtime()
+    let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
+        return AttemptOutcome::refused();
     };
+    let runtime = ephemeral.runtime();
     let operation = async {
         if plan.spec.kind == Kind::Http {
             let timeout = deadline.saturating_duration_since(Instant::now());
@@ -302,25 +289,17 @@ async fn attempt_wire(
             .await?
         }
     };
-    let result = if let Some(server) = attempt.server {
-        runtime
-            .scope_tasks(
-                plan.registry
-                    .scope_pinned_dials(candidate.node.host(), server, operation),
-            )
-            .await
-    } else {
-        runtime
-            .scope_tasks(plan.registry.scope_dials(operation))
-            .await
-    };
+    let result = runtime
+        .scope_tasks(
+            plan.registry
+                .scope_server_pins(attempt.servers.clone(), operation),
+        )
+        .await;
     let mut outcome = AttemptOutcome::completed(result, deadline, &cancel);
     drop(runtime);
     // Never cancel this owner boundary: close must drain every factory/driver
     // admitted before the request deadline, even when the HTTP caller is gone.
-    if let Some(ephemeral) = &mut ephemeral {
-        outcome.cleanup = ephemeral.close().await;
-    }
+    outcome.cleanup = ephemeral.close().await;
     outcome
 }
 

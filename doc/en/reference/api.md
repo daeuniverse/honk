@@ -900,11 +900,17 @@ Targets come only from accepted configuration:
 
 Requests accept no caller URL, and a probe never follows redirects. Probes apply no address or port policy checks to configured targets or node servers.
 
-Target hosts resolve through the running DNS configuration. When that configuration cannot answer, for example under `asis` routing, they fall back to bootstrap DNS. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while the HTTP Host and TLS SNI keep the configured name. Private and loopback addresses and nondefault configured ports need no allowlist entries. Probes, geodata and shared downloads use configured targets without an address or port allowlist.
+Probe targets and node server names resolve with the DNS configuration captured at admission. If it cannot answer, for example under `asis` routing, the probe uses that configuration's bootstrap resolver, not one published by a later reload. IPv4-mapped IPv6 is normalized, and the selected IP is pinned while HTTP Host and TLS SNI keep the configured name. Probes, geodata and shared downloads use configured targets without an address or port allowlist, including private or loopback addresses and nondefault ports.
 
 Whoever can write the configuration or control subscription content decides those targets. Provider content is trusted configuration. Raw TCP permits only the actual configured node port, not an arbitrary caller port.
 
-`tcp_connect` on a `direct` or `block` node or a targeted [chain](./nodes.md#proxy-chains) node, and a UDP probe of a node without UDP, return `422 unsupported_value` before measuring. A group's `tcp_connect` probe still measures its other members; a chain member's row has `state` `unavailable` and `error` `no_node_address`, because a chain has no server address of its own.
+A node-targeted `tcp_connect` probe of `direct`, `block`, or a [proxy chain](./nodes.md#proxy-chains) returns `422 unsupported_value` before measuring. A UDP probe of a node without UDP returns the same error. A group's `tcp_connect` probe still measures its other members. A chain member has `state` `unavailable` and `error` `no_node_address` because the chain has no server endpoint of its own.
+
+Native HTTP and framed TCP DNS probes of a chain use private runtimes for both the chain and its physical hops. They share the generation and process dial limits and applicable VLESS carrier budget, without borrowing or populating live sessions. The captured DNS configuration pins the entry server address separately from the configured probe destination. Later hop hostnames are passed to the preceding proxy. The operation joins private runtime cleanup, including after cancellation or expiry.
+
+A hosts alias for an upload or split-download peer follows [the alias target's node-host policy](./dns.md#node-server-hosts). A check URL with the same hostname still uses the probe destination's DNS policy; the two lookups do not share an alias result. If the destination has no address in the requested IP family, the probe does not look up either physical peer.
+
+For native HTTP, `cold` times the dial, target TLS when used, and one validated request. `warm` times the configured request after a validated HEAD on the privately opened connection and can return that first sample on an eligible transport failure. The chain uses private hop runtimes in either mode.
 
 | Probe budget | Limit |
 | --- | --- |
@@ -1139,7 +1145,7 @@ An unadvertised option, such as `cache` without its store, returns `422 unsuppor
 
 `201` with the live node or provider and its `Location` is returned only after activation and subscription reconciliation. HTTP disconnect does not cancel queued work. With `--store db`, these actions record a new revision instead of rewriting the main file.
 
-Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters of ASCII letters, digits, `_`, `.` or `-`, with an HTTP(S) URL of at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
+Node names are 1–64 characters and links at most 8192 characters. Provider names are 1–64 characters without control characters; a name outside `[A-Za-z0-9_.-]` is written quoted, and one the configuration cannot quote returns `422 unsupported_value`. Provider URLs are HTTP(S) and at most 4096 characters. Schema length, pattern, enum or bound violations return `400 invalid_request`.
 
 Duplicate names return 409. Structurally valid but unsupported links, identities, provider URL schemes or options return 422. New providers start with zero nodes, stale status and no update time, even if an old cached body exists.
 
@@ -1281,6 +1287,30 @@ If every URL fails, the details describe the last attempted URL:
 
 `asset: geoip, stage: checksum_unavailable, http_status: 403` means the server refused the `.sha256sum`, not the file.
 
+`stage` is one of the following:
+
+| Stage | Meaning |
+| --- | --- |
+| `invalid_source` | The URL cannot be parsed, or it has no host or port. |
+| `download_timeout` | No response headers within 30 seconds, no body progress for 30 seconds, the whole download exceeded 10 minutes, or the checksum request exceeded its 10-second deadline. |
+| `connection_failed` | The connection or tunnel could not be established. |
+| `tls_failed` | TLS setup or certificate verification failed. |
+| `http_failed` | The HTTP exchange failed after the connection was established, such as a malformed response or a body read error. |
+| `http_not_found` | The file URL answered 404. |
+| `http_status_rejected` | The file URL answered a status other than 200, or the checksum URL answered a status other than 200 or 404; `http_status` carries the code. |
+| `content_encoding_rejected` | The server sent a content encoding other than identity. |
+| `asset_too_large` | The body exceeds 256 MiB, or the checksum body exceeds 1 KiB. |
+| `route_blocked` | The download route sent the request to `block`. |
+| `group_unavailable` | The route or its group has no usable outbound or node. |
+| `checksum_unavailable` | The checksum request failed with a status other than 404, or with another error. |
+| `checksum_mismatch` | The published digest differs from the file's SHA-256. |
+| `asset_validation_failed` | The downloaded file cannot satisfy the active configuration's geodata requirements, for example because it lacks a required category. |
+| `candidate_validation_failed` | The candidate configuration with the new asset fails validation. |
+| `staging_failed` | The verified bytes could not be staged for replacement. |
+| `replacement_failed` | The replacement was refused or failed before writing; that asset's bytes on disk are unchanged. |
+| `directory_sync_failed` | The bytes were written but the directory entry could not be confirmed durable. |
+| `written_asset_conflict` | The installed file changed before the final check. |
+
 Configured, stored and built-in geodata URLs, including their checksum requests, have no address or port allowlist.
 
 `verify_checksum` is `true` by default. When set to `false`, manual and automatic updates request no `.sha256sum` and use every downloaded file unverified. `verified` is `false`, and `sha256` is still reported. The setting suits mirrors that answer a missing checksum with a status other than 404 or with a page that is not a checksum.
@@ -1349,10 +1379,6 @@ From the repository root, run `export HONK_DOONA_DIR=$(ci/fetch-doona.sh)`. The 
 
 Full release builds include the embedded UI. The lean `-clash-api` and `-native-api` artifacts do not. The binary embeds each edition's own notices, and every full release tarball carries them under `doona/` and `doona-lite/`, respectively.
 
-Lite uses system fonts. The Noto Sans TC and SC fonts are not embedded. Doona's CSS declares those fonts with `font-display: optional`, so the browser falls back to system fonts when the font requests return 404.
-
-To use Noto Sans, extract `doona-<version>.tar.gz` and `doona-fonts-<version>.tar.gz` from the [doona release](https://github.com/Zakkaus/doona/releases) into one directory and point `ui` at it, or install the `doona` and `doona-fonts` packages and set `ui: /usr/share/doona`. Both editions share the corresponding GPL-3.0-only source at the doona tag [`v0.1.0-rc.5`](https://github.com/Zakkaus/doona/tree/v0.1.0-rc.5).
-
 The release workflow attaches `doona-source-0.1.0-rc.5.tar.gz` to the tag release and to the rolling Debug release. `ci/fetch-doona.sh --source` checks that the tag still points at the pinned commit and generates it with `git archive --format=tar --prefix=doona/ v0.1.0-rc.5 | gzip -n` (GNU gzip). Redistributors of a `native-ui` binary must preserve the notices and provide corresponding source through a method permitted by GPL-3.0 section 6.
 
 To reproduce the assets, extract the source archive into its own directory, use Node matching `^22.13.0 || ^24.0.0 || >=26.0.0` and `pnpm@11.15.1`. From the extracted source directory:
@@ -1367,6 +1393,8 @@ The epoch is the pinned upstream commit's timestamp. The source archive has no G
 Another gzip implementation can produce different archive hashes from identical tar bytes. Cargo builds embed only the files in `HONK_DOONA_DIR` and its `-lite` sibling and never build or download the frontend. That source's checker is `tools/conformance.mjs`.
 
 Its live walk is read-only and skips controls, diagnostics and missing observed IDs. Check base and management contracts, and exercise browser actions separately: schema passes alone are not full UI, kernel or platform acceptance.
+
+For fonts, UI installation and packaging, see the [doona manual](https://daeuniverse.org/doona/).
 
 ### Native logs and runtime settings
 
@@ -1611,13 +1639,13 @@ Both final responses must have valid decoded 200–499 statuses. A measured-roun
 
 HTTP/1 informational and final response heads share a 16 KiB per-round cap. HTTP/2 response header lists also have a 16 KiB cap. Session warm-up, dial, target TLS, HTTP/2 startup and each request have separate timeout budgets.
 
-Cold reusable generation probes use guarded temporary runtimes that close afterward. A chain node is the exception: its probe dials through the hop runtimes of the running generation, so a cold probe reuses any warm session a hop holds. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new reusable runtime per tested node.
+For ordinary nodes with reusable transports, a cold generation probe uses a guarded temporary runtime that closes afterward. Clash delay tests and periodic HTTP checks use the admitted live chain runtime for chain nodes, as does legacy generation URLTest. These paths can reuse a session on the physical first hop. HTTP/2 drivers are released on completion or cancellation, so group scans retain no new temporary runtime per tested node. See [native probe ownership](#bounded-probes).
 
-Successful measurements update the node latency history. Failures return `503` for a single node and are omitted from group results. Arbitrary manual test targets do not advance real-dial failure streaks.
+A measurement admitted before reload can still return its result. Registered nodes update health history only while their registration and physical dial path still match. A successful `/proxies/{name}/delay` test of an unregistered ordinary node updates only its Clash display history, not health or Score. The sample and pending tests survive unrelated reloads while the same physical node remains continuously unregistered. Failures return `503` for a single node and are omitted from group results. Manual test failures do not advance real-dial failure streaks.
 
-`/proxies/{name}/delay` returns `{"delay":12}`. `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. On a URLTest group, either route can switch its selection using the new measurements.
+`/proxies/{name}/delay` returns `{"delay":12}`. `/group/{name}/delay` returns `{"<member>":12,...}`. Delays are milliseconds, capped at 65535. Either route can reselect a URLTest group only while its original group manager is still current.
 
-On-demand delay exchanges retain Alive and API latency history but do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server or session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
+On-demand delay exchanges do not report business outcomes or populate configured Score comparison cohorts. Actual preliminary server or session preparation may report aggregate warm-up setup only. It does not fabricate the caller's URL as its own target or provide promotion proof.
 
 Both delay routes retain admitted jobs through measurement cleanup even if the HTTP client disconnects. Owner-admission `503` responses distinguish exhausted capacity, stopped checks and failed workers. A QUIC probe timeout or normal close linger is a measurement result, not a failed health owner. After the bounded peer-notification grace, Quinn drivers and then packet-adapter workers are stopped and joined.
 

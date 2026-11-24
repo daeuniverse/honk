@@ -12,6 +12,8 @@ use std::time::Instant;
 use std::sync::atomic::AtomicBool;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod chain_failure;
+
 const TEST_PASSWORD: &str = "hy2-test-password";
 
 fn test_node(port: u16, password: &str) -> Node {
@@ -1555,4 +1557,5 @@ fn test_hop_state_rotation() {
     assert!(seen.len() > 1, "hops should visit multiple ports: {seen:?}");
 }
 
+mod quic_submission;
 mod source_udp;

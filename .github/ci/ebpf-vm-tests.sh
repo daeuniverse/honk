@@ -59,8 +59,11 @@ for real_test in \
 done
 "$HONK_CORE_TEST_BIN" ebpf::real::receive_trace::tests --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/honk-core-receive-trace.log"
-"$HONK_CORE_TEST_BIN" \
-  ebpf::real::routing::tests \
+route_health_test=ebpf::real::routing::tests::dns_ownership::health::accepted_prefix_failure_updates_real_tc_admission
+test "$("$HONK_CORE_TEST_BIN" "$route_health_test" --exact --ignored --list --format terse)" = "$route_health_test: test"
+"$HONK_CORE_TEST_BIN" "$route_health_test" --exact --ignored --test-threads=1 \
+  2>&1 | tee "$log_dir/honk-core-route-health.log"
+"$HONK_CORE_TEST_BIN" ebpf::real::routing::tests --skip "$route_health_test" \
   --ignored --test-threads=1 2>&1 | tee "$log_dir/honk-core-routing.log"
 "$HONK_DATAPATH_TEST_BIN" --ignored --test-threads=1 \
   2>&1 | tee "$log_dir/ebpf-datapath.log"

@@ -82,7 +82,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     *config_writer = Arc::new(new_config.clone());
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
 
-    let update = tokio::spawn(Arc::clone(&health_publisher).publish(node.id, 1, 0));
+    let update = tokio::spawn(Arc::clone(&health_publisher).publish(Some(node.id), Some((1, 0))));
     tokio::task::yield_now().await;
     assert!(!update.is_finished());
     drop(config_writer);
@@ -1244,24 +1244,16 @@ fn dae0_internal_addr_covers_real_dae0_addresses() {
 
 #[test]
 fn subscription_merge_replaces_only_that_subscription() {
-    fn node(name: &str, sub: Option<uuid::Uuid>) -> Node {
-        Node {
-            id: uuid::Uuid::new_v4(),
-            name: name.into(),
-            address: "127.0.0.1:1".into(),
-            host: "127.0.0.1".into(),
-            port: 1,
-            subscription_id: sub,
-            ..Default::default()
-        }
+    fn node(name: &str, port: u16, sub: Option<uuid::Uuid>) -> Node {
+        support::canonical_socks5(name, &format!("127.0.0.1:{port}"), port, sub)
     }
 
     let sub_a = uuid::Uuid::new_v4();
     let sub_b = uuid::Uuid::new_v4();
-    let static_node = node("static", None);
-    let old_a1 = node("a-old-1", Some(sub_a));
-    let old_a2 = node("a-old-2", Some(sub_a));
-    let b_node = node("b-1", Some(sub_b));
+    let static_node = node("static", 1, None);
+    let old_a1 = node("a-old-1", 2, Some(sub_a));
+    let old_a2 = node("a-old-2", 3, Some(sub_a));
+    let b_node = node("b-1", 4, Some(sub_b));
 
     let mut current = Config {
         nodes: vec![
@@ -1285,8 +1277,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     );
     assert_eq!(current.groups[0].nodes.len(), 4);
 
-    let new_a1 = node("a-new-1", Some(sub_a));
-    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1.clone()]);
+    let new_a1 = node("a-new-1", 5, Some(sub_a));
+    let merged = config_with_subscription_nodes(&current, sub_a, vec![new_a1]).unwrap();
 
     // Old sub-A nodes are gone; static and other-subscription nodes stay.
     let names: Vec<&str> = merged.nodes.iter().map(|n| n.name.as_str()).collect();
@@ -1301,8 +1293,8 @@ fn subscription_merge_replaces_only_that_subscription() {
     assert!(!merged.groups[0].nodes.contains(&old_a2.id));
 
     // Re-merging the same subscription replaces instead of duplicating.
-    let new_a1b = node("a-new-1", Some(sub_a));
-    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]);
+    let new_a1b = node("a-new-1", 5, Some(sub_a));
+    let remerged = config_with_subscription_nodes(&merged, sub_a, vec![new_a1b.clone()]).unwrap();
     assert_eq!(remerged.nodes.len(), 3);
     assert_eq!(remerged.groups[0].nodes.len(), 3);
     assert_eq!(remerged.nodes[2].id, new_a1b.id);
@@ -1322,7 +1314,7 @@ fn empty_subscription_merge_preserves_previous_nodes() {
         ..Default::default()
     };
 
-    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new());
+    let merged = config_with_subscription_nodes(&current, subscription_id, Vec::new()).unwrap();
 
     assert_eq!(merged.nodes.len(), 1);
     assert_eq!(merged.nodes[0].id, old.id);
@@ -4442,13 +4434,9 @@ fn preconnect_candidates_prefer_group_selections_then_config_order() {
 /// A selected proxy chain is passed over; its hops stay eligible on their own.
 #[test]
 fn preconnect_candidates_skip_chain_nodes() {
-    let ss = preconnect_test_node("ss", NodeProtocol::SS);
-    let trojan = preconnect_test_node("trojan", NodeProtocol::Trojan);
-    let mut via = preconnect_test_node("via", NodeProtocol::Chain);
-    via.address = String::new();
-    via.outbound = honk_config::node::OutboundConfig::Chain {
-        hops: vec!["ss".into(), "trojan".into()],
-    };
+    let ss = Node::from_share_link("ss://YWVzLTEyOC1nY206cGFzcw@ss.example:8388#ss").unwrap();
+    let trojan = Node::from_share_link("trojan://secret@trojan.example:443#trojan").unwrap();
+    let via = Node::chain_from_nodes("via", &[&ss, &trojan]).unwrap();
     let config = Config {
         nodes: vec![via.clone(), ss, trojan],
         groups: vec![preconnect_test_group(
