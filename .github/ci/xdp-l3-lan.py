@@ -86,9 +86,9 @@ def topology(owned, workers):
     for local, remote, ns, queues in [('dut0', 'c0', 'client', workers), ('dut1', 's0', 'server', 1),
                                        ('up', 'su', 'server', 1), ('under0', 'under1', 'wgpeer', 1)]:
         channels = ('numrxqueues', queues, 'numtxqueues', queues)
-        ip('dut', 'link', 'add', local, *channels, 'type', 'veth', 'peer', 'name', remote, *channels, 'netns', ns)
+        ip('dut', 'link', 'add', 'name', local, *channels, 'type', 'veth', 'peer', 'name', remote, *channels, 'netns', ns)
         for realm, device in [('dut', local), (ns, remote)]:
-            ip(realm, 'link', 'set', device, 'addrgenmode', 'none')
+            ip(realm, 'link', 'set', 'dev', device, 'addrgenmode', 'none')
             if local == 'under0':
                 inside(realm, 'ethtool', '-K', device, 'gro', 'on')
             elif local == 'dut0':
@@ -99,7 +99,7 @@ def topology(owned, workers):
         ip(ns, 'link', 'set', dev, 'address', '02:00:00:00:00:' + mac)
     for ns, dev in [('dut', 'dut0'), ('dut', 'dut1'), ('dut', 'up'), ('dut', 'under0'),
                     ('client', 'c0'), ('server', 's0'), ('server', 'su'), ('wgpeer', 'under1')]:
-        ip(ns, 'link', 'set', dev, 'up')
+        ip(ns, 'link', 'set', 'dev', dev, 'up')
     if workers == 2:
         inside('client', 'tc', 'qdisc', 'add', 'dev', 'c0', 'root', 'mqprio', 'num_tc', '2',
                'map', '0', '1', *(['0'] * 14), 'queues', '1@0', '1@1', 'hw', '0')
@@ -723,10 +723,15 @@ datapath {{
         {OUTER}: l3_lan
     }}
 }}
+group {{ endpoint_relay {{
+    filter: name('direct')
+    policy: select
+    final: direct
+}} }}
 routing {{
     dip({static}/32) -> direct(must)
     {rule}
-    fallback: direct
+    fallback: endpoint_relay
 }}
 '''
 

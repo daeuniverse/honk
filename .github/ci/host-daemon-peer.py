@@ -906,7 +906,7 @@ def large_udp_reply(fixture):
     external_mtu = 32000
     start = len(fixture.log.read_text())
     wg.ip('server', 'link', 'set', 'su', 'mtu', external_mtu)
-    wg.ip('dut', 'link', 'set', previous['device'], 'mtu', external_mtu)
+    wg.ip('dut', 'link', 'set', 'dev', previous['device'], 'mtu', external_mtu)
     try:
         fixture.primary = fixture.binding(0, after=start, bounded=True)
         binding = fixture.primary
@@ -958,7 +958,7 @@ def large_udp_reply(fixture):
                     response_bytes=len(reply), response_sha256=hashlib.sha256(reply).hexdigest())
     finally:
         start = len(fixture.log.read_text())
-        wg.ip('dut', 'link', 'set', previous['device'], 'mtu', previous['mtu'])
+        wg.ip('dut', 'link', 'set', 'dev', previous['device'], 'mtu', previous['mtu'])
         wg.ip('server', 'link', 'set', 'su', 'mtu', previous['mtu'])
         fixture.primary = fixture.binding(0, after=start)
         fixture.mode('Rule')
@@ -1657,7 +1657,7 @@ def topology_rebind(fixture):
     progress('physical-flow-after-sibling-broadcast-updates')
     previous = fixture.primary = fixture.binding(0)
     new_mac = '02:15:16:17:18:19'
-    wg.ip('dut', 'link', 'set', 'up', 'address', new_mac)
+    wg.ip('dut', 'link', 'set', 'dev', 'up', 'address', new_mac)
     wg.ip('server', 'neigh', 'replace', UPLINK[0], 'lladdr', new_mac, 'nud', 'permanent', 'dev', 'su')
     mac = wg.named_map(previous['return_link'][1], 'honk_host_mac')
     expected_mac = bytes.fromhex(new_mac.replace(':', '')) + b'\x02\x68'
@@ -1666,7 +1666,7 @@ def topology_rebind(fixture):
     after_mac = udp_trial(fixture, UPLINK[0], (TARGET[0], PROXY), 'proxy')
     progress('physical-flow-after-host-mac-change')
     start = len(fixture.log.read_text())
-    wg.ip('dut', 'link', 'set', 'up', 'mtu', 1400)
+    wg.ip('dut', 'link', 'set', 'dev', 'up', 'mtu', 1400)
     fixture.primary = fixture.binding(0, after=start)
     assert fixture.primary['incarnation'] != previous['incarnation'] and fixture.primary['mtu'] == 1400
     assert fixture.primary['tun_index'] != previous['tun_index'] and fixture.primary['ifindex'] == previous['ifindex']
@@ -1793,14 +1793,14 @@ def last_link(fixture):
     active = epoch(fixture)
     assert active > 0
     for binding in (fixture.secondary, fixture.primary, fixture.wan):
-        wg.ip('dut', 'link', 'set', binding['device'], 'down')
+        wg.ip('dut', 'link', 'set', 'dev', binding['device'], 'down')
         offline(binding)
         if binding != fixture.wan:
             assert epoch(fixture) == active
     wg.until(lambda: epoch(fixture) == 0, 'last Host egress did not withdraw shared DNS epoch')
     start = len(fixture.log.read_text())
     for device in HOSTS:
-        wg.ip('dut', 'link', 'set', device, 'up')
+        wg.ip('dut', 'link', 'set', 'dev', device, 'up')
     fixture.primary, fixture.secondary, fixture.wan = (fixture.binding(index, after=start) for index in range(len(HOSTS)))
     rebound = wg.until(lambda: epoch(fixture), 'new Host authority was not published')
     assert rebound != active and fact(fixture, TARGET[0]) is None
