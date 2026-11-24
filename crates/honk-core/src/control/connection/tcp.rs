@@ -54,7 +54,7 @@ impl ControlPlaneHandle {
     /// Emergency probes to recover a group with no available candidate: its
     /// leaves (sub-group tags carry no probe state) and its exit, whose death
     /// empties the group too.
-    fn probe_unavailable_group(&self, group: &str) {
+    pub(super) fn probe_unavailable_group(&self, group: &str) {
         let group_manager = self.group_manager.read().clone();
         for node in group_manager.leaf_nodes_in_group(group) {
             self.alive_set.notify_check_tcp(node.id);
@@ -334,6 +334,7 @@ impl ControlPlaneHandle {
                             &conn_info,
                             domain_verified,
                             handoff.as_ref(),
+                            None,
                             #[cfg(feature = "native-api")]
                             observation.is_recording(),
                         )
@@ -344,7 +345,9 @@ impl ControlPlaneHandle {
                 observation.routed(&mut route);
                 let reroute_by_sniffed_domain = route.reroute_by_sniffed_domain;
                 let matched_rule = route.matched_rule.take();
-                let mode_decision = self.apply_mode_override(&mut route).await;
+                let mode_decision = self
+                    .apply_mode_override(&mut route, OutboundConstraint::Any)
+                    .await;
                 let outbound_name = mode_decision.name;
                 let mode_constraint = mode_decision.constraint;
                 observation.mode_applied(&outbound_name);

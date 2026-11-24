@@ -157,7 +157,7 @@ async fn a_collapsed_exit_counts_only_its_proxy_socket_refusal() {
             let handle = plane.spawn_handle();
             let manager = handle.group_manager.read().clone();
             let generation = handle.runtime_registry.read().clone();
-            let selected = crate::control::reload::resolve_outbound_plan_for_target::<OwnedTarget>(
+            let selected = crate::control::reload::resolve_outbound_plan_for_target(
                 handle.config.read().await.as_ref(),
                 &manager,
                 "proxy",

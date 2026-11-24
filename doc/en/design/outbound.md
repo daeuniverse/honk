@@ -120,7 +120,7 @@ the Trojan transport, affect capability or pooling. Trojan and AnyTLS share
 | AnyTLS | when `network` is absent or contains `udp` | no | no | `AnyTls` | `anytls` |
 | Direct | yes | no | no | `None` | none |
 | Block | no | no | yes | `None` | none |
-| Chain | no | no | no | `None` | none |
+| Chain | no for `Own`; see [chain path requirements](#proxy-chains) | no | no | `None` | none |
 
 Ready-stream pooling stores a completed target-bound handshake. Bare-TCP pooling
 stores only a connected proxy-server socket; `dial_with_tcp` then performs the
@@ -173,7 +173,7 @@ is not interchangeable with missing UDP support.
 | `anytls` | AnyTLS logical stream | UoT v2 logical stream |
 | `tuic` | TUIC v5 QUIC stream | QUIC datagrams or uni-stream fallback |
 | `juicity` | Juicity QUIC stream | One length-framed QUIC bi stream per client source, carrying every destination |
-| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | No packet slot; TCP only |
+| `chain` | Hop by hop over its hops' handlers; see [Proxy chains](#proxy-chains) | The exit's `dial_udp_over` (Trojan, VLESS native) or, with a Trojan exit, its `prepare_shared_source_over` |
 
 Shadowsocks (legacy AEAD and 2022) serves every destination of a client source
 from one `MultiTargetTransport`: one marked socket connected to the server and
@@ -1316,6 +1316,26 @@ admission limits, pinned entry address, logical dial start and progress, and
 absolute deadline. A REALITY entry performs its ordinary retry inside
 `dial_runtime`.
 
+For UDP, `dial_chain` uses the same hop runner and hands the last carrier to
+`PacketOutbound::dial_udp_over` or `SharedSourceOutbound::prepare_shared_source_over`.
+The framing handler checks the requested UDP port and uses its existing reply
+validation. Eligible tunneled VLESS uses native framing even with `auto`.
+
+`descriptor::carries_udp(UdpPath)` checks `Own(node)` for a node or one-hop
+collapse and `Tunneled { exit }` for terminal framing in a multi-hop path.
+Every preceding physical hop, including the entry, must satisfy
+`Node::supports_tunneled_dial()`. The bound path's handlers must be executable.
+Configured Trojan chains expose the `tunneled_shared` slot. Their installed
+source association owns one receiver and its original path admission, while
+endpoint views settle per-flow Score. Multi-hop group routes and tunneled VLESS
+use per-flow transports. A one-hop collapse follows the node's native source
+rules and retains the selecting view's route evidence.
+
+UDP health follows the admitted physical path, domain and family. Setup and
+send completion publish no positive UDP health. Reply delivery supplies path
+evidence, and a typed transport failure can identify a physical hop or ordered
+prefix. See [Exit liveness](../reference/groups.md#exit-liveness).
+
 ### Routes through group exits
 
 A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
@@ -1324,8 +1344,9 @@ A group [`exit`](../reference/groups.md#exit) turns a selected leaf into a route
 selection path, innermost first. Only adjacent equal hops collapse. A route is a
 selection result, not a configured node, so it has no `NodeRuntime`.
 `ProxyRegistry::dial_ref` sends `DialRef::Route` to
-`ChainHandler::dial_route_tcp` over a `RouteRuntime` (`src/runtime/route.rs`),
-which borrows the hop runtimes of the generation that dials it. Each generation
+`ChainHandler::dial_route_tcp`, and `ProxyRegistry::dial_udp_route` sends UDP to
+`ChainHandler::dial_route_udp`, both over a `RouteRuntime`
+(`src/runtime/route.rs`), which borrows the hop runtimes of the generation that dials it. Each generation
 caches at most `MAX_ROUTE_RUNTIMES` (4096) of them and dials past that limit
 over an uncached one. The hop-by-hop rules above apply unchanged. Routes skip
 pool deposit and replenishment.

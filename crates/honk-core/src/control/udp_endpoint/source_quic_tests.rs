@@ -147,7 +147,7 @@ impl Fixture {
         else {
             panic!("expected vacant endpoint");
         };
-        assert!(lease.bind_selected_node(self.peer.node.id));
+        assert!(lease.bind_selected(self.peer.node.id, None));
         lease
     }
 

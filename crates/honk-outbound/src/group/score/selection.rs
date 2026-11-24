@@ -18,6 +18,10 @@ pub(in crate::group) struct ScoreSelectionRules<'a> {
     /// The root group's `routes`: false when no group the root reaches has
     /// an exit, so nested levels skip their exit checks. True when unknown.
     pub(in crate::group) routes: bool,
+    /// The packet dialer accepts configured nodes and single-hop collapses.
+    pub(in crate::group) node_targets_only: bool,
+    /// Preserve the ordinary walk's first family during packet DNS fallback.
+    pub(in crate::group) packet_initial_family: Option<IpVersion>,
     /// Follow the sole leaf only on the root's authorized last-resort walk.
     pub(in crate::group) sole_leaf: bool,
 }
@@ -30,6 +34,8 @@ impl Default for ScoreSelectionRules<'_> {
             excluded: None,
             selector: None,
             routes: true,
+            node_targets_only: false,
+            packet_initial_family: None,
             sole_leaf: false,
         }
     }
@@ -147,17 +153,25 @@ impl super::GroupManager {
             })
     }
 
-    /// Connectivity admission for a group with exit routes. Preview prepares a cold
-    /// Score pool without changing its membership, counters or trial reservations.
-    /// Groups without exits keep their existing per-domain TC group-OR contract.
+    /// Connectivity admission for exit routes and UDP-capable configured chains.
+    /// Preview avoids Score membership changes, counters and trial reservations.
     pub fn routed_group_available(
         &self,
         group_name: &str,
         domain: ProbeDomain,
         family: IpVersion,
     ) -> Option<bool> {
-        let entry = self.groups.get(group_name).filter(|entry| entry.routes)?;
+        let entry = self.groups.get(group_name)?;
         let network = SelectionNetwork::from_probe_domain(domain);
+        let udp = network == SelectionNetwork::Udp;
+        if !(entry.routes || udp && self.group_has_udp_chain(group_name)) {
+            return None;
+        }
+        let selector = if udp {
+            self.route_plan_snapshot(group_name, network).0
+        } else {
+            None
+        };
         let available = |health_family| {
             let context = ScoreSelectionContext::aggregate(network, domain, health_family);
             let (_, candidates) = self.selection_candidates_for_target(
@@ -168,6 +182,8 @@ impl super::GroupManager {
                 super::SelectionEffects::Preview,
                 ScoreSelectionRules {
                     allow_trials: false,
+                    selector: selector.as_deref(),
+                    routes: entry.routes,
                     ..Default::default()
                 },
             );
@@ -206,14 +222,40 @@ impl super::GroupManager {
         context: &ScoreSelectionContext,
         original: Option<&ScoreContinuation>,
     ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.dial_plan_with_routes(group_name, context, original, false)
+    }
+
+    /// Select a target for a packet dialer that can open only a node's own transport.
+    pub fn node_packet_dial_plan(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        self.dial_plan_with_routes(group_name, context, original, true)
+    }
+
+    fn dial_plan_with_routes(
+        &self,
+        group_name: &str,
+        context: &ScoreSelectionContext,
+        original: Option<&ScoreContinuation>,
+        node_targets_only: bool,
+    ) -> (ScoreSelectionPlan<'_>, RouteHealthRevision) {
+        let node_targets_only = node_targets_only && context.network == SelectionNetwork::Udp;
         self.capture_dial_plan(group_name, context, |selector| {
+            let rules = ScoreSelectionRules {
+                selector,
+                node_targets_only,
+                packet_initial_family: node_targets_only.then_some(context.health_family),
+                ..Default::default()
+            };
             let plan = self.selection_plan_for_target_with_effects(
                 group_name,
                 context,
                 super::SelectionEffects::ApplyWithHealthFallback,
-                None,
                 original,
-                selector,
+                rules,
             );
             if !plan.entries.is_empty() || context.health_family != IpVersion::V6 {
                 return plan;
@@ -224,9 +266,8 @@ impl super::GroupManager {
                 group_name,
                 &fallback,
                 super::SelectionEffects::Apply,
-                None,
                 original,
-                selector,
+                rules,
             )
         })
     }
@@ -307,7 +348,10 @@ impl super::GroupManager {
                         context.health_family,
                         group,
                         &[],
-                        entry.routes,
+                        ScoreSelectionRules {
+                            routes: entry.routes,
+                            ..Default::default()
+                        },
                     );
                     observation::metric("sorting_latency", None);
                     observation::reason("retry_candidates_pending");
@@ -392,9 +436,12 @@ impl super::GroupManager {
                 group_name,
                 context,
                 super::SelectionEffects::Apply,
-                Some(&excluded),
                 Some(original),
-                selector,
+                ScoreSelectionRules {
+                    excluded: Some(&excluded),
+                    selector,
+                    ..Default::default()
+                },
             );
             plan.entries.retain(|entry| entry.feedback.is_some());
             plan
@@ -508,8 +555,10 @@ impl super::GroupManager {
                 context,
                 super::SelectionEffects::Apply,
                 None,
-                None,
-                selector,
+                ScoreSelectionRules {
+                    selector,
+                    ..Default::default()
+                },
             )
         })
         .0
@@ -520,9 +569,8 @@ impl super::GroupManager {
         group_name: &str,
         context: &ScoreSelectionContext,
         effects: super::SelectionEffects,
-        excluded: Option<&ExcludedScoreLeaf<'_>>,
         original: Option<&ScoreContinuation>,
-        selector: Option<&SelectorState>,
+        rules: ScoreSelectionRules<'_>,
     ) -> super::ScoreSelectionPlan<'_> {
         let Some(entry) = self.groups.get(group_name) else {
             observation::gap();
@@ -544,12 +592,12 @@ impl super::GroupManager {
             0,
             effects,
             ScoreSelectionRules {
-                cold_urltest: excluded.is_none(),
-                allow_trials: excluded.is_none() && original.is_none(),
-                excluded,
-                selector,
+                cold_urltest: rules.excluded.is_none(),
+                allow_trials: rules.excluded.is_none() && original.is_none(),
                 routes: entry.routes,
-                sole_leaf: false,
+                node_targets_only: rules.node_targets_only && entry.routes,
+                packet_initial_family: rules.packet_initial_family.filter(|_| entry.routes),
+                ..rules
             },
         );
         self.score_selection_plan(candidates, mode, context, original, entry.routes)
@@ -569,6 +617,15 @@ impl super::GroupManager {
                 observation::reason("resolution_limit");
                 return (super::SelectionPlanMode::Authoritative, Vec::new());
             }
+            // Offering none when no route through the exit can carry UDP,
+            // before any policy runs, lets a parent pick a UDP-capable sibling.
+            if context.network == SelectionNetwork::Udp
+                && group.exit.is_some()
+                && !self.exit_offers_udp(group, visited)
+            {
+                observation::reason("exit_without_udp");
+                return (super::SelectionPlanMode::Authoritative, Vec::new());
+            }
             let (mut mode, mut candidates, mut ordinary) =
                 self.normal_candidates_for_target(group, context, visited, depth, effects, rules);
             if candidates.is_empty()
@@ -581,7 +638,10 @@ impl super::GroupManager {
                 ordinary = false;
                 // A business IPv6 target may use an IPv4 proxy. Defer this final
                 // until the outer health-family retry has tried that ordinary path.
-                if effects.health_fallback() && context.health_family == IpVersion::V6 {
+                if (effects.health_fallback()
+                    || (!rules.node_targets_only && rules.packet_initial_family.is_some()))
+                    && context.health_family == IpVersion::V6
+                {
                     let mut ipv4 = context.clone();
                     ipv4.health_family = IpVersion::V4;
                     let preflight = if effects.prepares_score() {
@@ -603,15 +663,27 @@ impl super::GroupManager {
                 }
                 match member {
                     GroupMember::Node(node) => {
-                        let eligible = matches!(
-                            node.protocol(),
-                            honk_config::types::NodeProtocol::Direct
-                                | honk_config::types::NodeProtocol::Block
-                        ) || self.is_node_selectable_for_domain(
-                            node.id,
-                            context.probe_domain,
-                            context.health_family,
-                        );
+                        let routed = self.has_exits() && rules.routes;
+                        let eligible = if routed && context.probe_domain != ProbeDomain::Tcp {
+                            self.leaf_route_available(
+                                node,
+                                group,
+                                visited,
+                                context.probe_domain,
+                                Some(context.health_family),
+                                rules.node_targets_only,
+                            )
+                        } else {
+                            matches!(
+                                node.protocol(),
+                                honk_config::types::NodeProtocol::Direct
+                                    | honk_config::types::NodeProtocol::Block
+                            ) || self.is_node_selectable_for_domain(
+                                node.id,
+                                context.probe_domain,
+                                context.health_family,
+                            )
+                        };
                         observation::member(
                             member,
                             Some(node),
@@ -627,7 +699,13 @@ impl super::GroupManager {
                                 pool_bound: 0,
                                 selection_chain: vec![node.name.as_str()],
                                 exit_on_path: false,
-                                final_owners: Vec::new(),
+                                final_owners: if context.network == SelectionNetwork::Udp
+                                    && (node.chain_hops().is_some() || rules.routes)
+                                {
+                                    vec![group.name.as_str()]
+                                } else {
+                                    Vec::new()
+                                },
                                 score_work: Vec::new(),
                             });
                         }
@@ -662,7 +740,7 @@ impl super::GroupManager {
                         }
                     }
                 }
-                if self.has_exits() && rules.routes {
+                if context.probe_domain == ProbeDomain::Tcp && self.has_exits() && rules.routes {
                     candidates.retain(|candidate| {
                         candidate.via.is_some()
                             || self.leaf_route_available(
@@ -671,6 +749,7 @@ impl super::GroupManager {
                                 visited,
                                 context.probe_domain,
                                 Some(context.health_family),
+                                rules.node_targets_only,
                             )
                     });
                 }
@@ -757,7 +836,8 @@ impl super::GroupManager {
         } else {
             self.flatten_candidates_for_target(group, context, visited, depth, effects, rules)
         };
-        let before_filter = (effects.prepares_score()
+        let before_filter = (!rules.node_targets_only
+            && effects.prepares_score()
             && group.policy == honk_config::group::GroupPolicy::Score
             && self.score_state.is_current_authority(&self.score_authority))
         .then(|| super::unique_candidate_ids(&candidates))
@@ -768,7 +848,7 @@ impl super::GroupManager {
             context.health_family,
             group,
             visited,
-            self.has_exits() && rules.routes,
+            rules,
         );
         let health_filtered =
             before_filter.and_then(|before| super::removed_unique_candidates(before, &candidates));
@@ -800,6 +880,7 @@ impl super::GroupManager {
                         visited,
                         context.probe_domain,
                         None,
+                        rules.node_targets_only,
                     )
             });
             let candidate = candidate.and_then(|candidate| {
@@ -862,6 +943,11 @@ impl super::GroupManager {
                 false,
             );
         }
+        let pin_effects = if rules.node_targets_only {
+            effects.peek()
+        } else {
+            effects
+        };
         let candidate = match policy {
             honk_config::group::GroupPolicy::Selector => {
                 observation::reason("selector_choice");
@@ -872,15 +958,23 @@ impl super::GroupManager {
                 group,
                 context.network,
                 context.health_family,
-                effects,
+                pin_effects,
             )),
             honk_config::group::GroupPolicy::LoadBalance => {
                 let index = self.pick_load_balance(&candidates, group, context.network, effects);
                 Some(candidates.swap_remove(index))
             }
             honk_config::group::GroupPolicy::Fallback => {
-                let index = self.pick_fallback(&candidates, group, context.network, effects);
+                let index = self.pick_fallback(&candidates, group, context.network, pin_effects);
                 Some(candidates.swap_remove(index))
+            }
+            honk_config::group::GroupPolicy::Score if rules.node_targets_only => {
+                let cold = !self
+                    .score_state
+                    .score_pool_initialized(&group.name, context.network);
+                let bootstrap = cold
+                    .then(|| self.packet_score_bootstrap(group, context, visited, depth, rules));
+                self.pick_packet_score(&candidates, group, context, bootstrap, effects.applies())
             }
             honk_config::group::GroupPolicy::Score => self.pick_score(
                 ScoreView {
@@ -904,6 +998,55 @@ impl super::GroupManager {
             candidate.into_iter().collect(),
             ordinary_score,
         )
+    }
+
+    fn packet_score_bootstrap<'a>(
+        &'a self,
+        group: &'a honk_config::group::Group,
+        context: &ScoreSelectionContext,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        rules: ScoreSelectionRules<'_>,
+    ) -> (ScoreSelectionContext, Vec<super::Candidate<'a>>) {
+        let mut ordinary = context.clone();
+        ordinary.probe_domain = ProbeDomain::DataUdp;
+        ordinary.health_family = rules.packet_initial_family.unwrap_or(context.health_family);
+        let rules = ScoreSelectionRules {
+            allow_trials: false,
+            node_targets_only: false,
+            ..rules
+        };
+        let mut collect = |context: &ScoreSelectionContext| {
+            observation::decision(
+                group,
+                context.health_family,
+                super::SelectionEffects::Preview,
+                || {
+                    let (candidates, _) = self.flatten_candidates_for_target(
+                        group,
+                        context,
+                        visited,
+                        depth,
+                        super::SelectionEffects::Preview,
+                        rules,
+                    );
+                    self.filter_alive_candidates(
+                        candidates,
+                        context.probe_domain,
+                        context.health_family,
+                        group,
+                        visited,
+                        rules,
+                    )
+                },
+            )
+        };
+        let mut candidates = collect(&ordinary);
+        if candidates.is_empty() && ordinary.health_family == IpVersion::V6 {
+            ordinary.health_family = IpVersion::V4;
+            candidates = collect(&ordinary);
+        }
+        (ordinary, candidates)
     }
 
     fn last_resort_candidate_for_target<'a>(
@@ -1082,7 +1225,8 @@ impl super::GroupManager {
                     Some(false),
                     "empty_member",
                 );
-                if effects.prepares_score()
+                if !rules.node_targets_only
+                    && effects.prepares_score()
                     && group.policy == honk_config::group::GroupPolicy::Score
                     && rules.excluded.is_none()
                 {
@@ -1124,7 +1268,10 @@ impl super::GroupManager {
             context.health_family,
             group,
             &[],
-            entry.routes,
+            ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
         );
         let mut unique = Vec::with_capacity(candidates.len());
         for candidate in &candidates {

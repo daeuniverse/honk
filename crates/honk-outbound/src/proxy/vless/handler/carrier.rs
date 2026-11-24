@@ -115,23 +115,36 @@ impl VLessHandler {
         if vless.tcp_path() != VlessTcpPath::Direct {
             return Err(TunnelUnsupported("vless mux").into());
         }
+        let stream =
+            Self::start_tunneled(node, carrier, CMD_TCP, target, target_domain, options).await?;
+        Ok(ProxyStream {
+            stream,
+            target_addr: target,
+            target_domain: target_domain.map(str::to_string),
+        })
+    }
+
+    /// Sends a plain VLESS request with `command` over a tunneled `carrier`.
+    pub(super) async fn start_tunneled(
+        node: &Node,
+        carrier: Box<dyn AsyncReadWrite>,
+        command: u8,
+        target: SocketAddr,
+        target_domain: Option<&str>,
+        options: TunnelDialOptions,
+    ) -> anyhow::Result<Box<dyn AsyncReadWrite>> {
+        let vless = node.vless().unwrap();
         let uuid = Self::parse_uuid(vless.uuid.as_deref().unwrap_or(""))?;
         let header = Self::build_request_header(
             &uuid,
-            CMD_TCP,
+            command,
             Some(target),
             target_domain,
             vless.wire_flow(),
         )?;
         let stream = crate::proxy::transport::wrap_tunnel(node, carrier, options).await?;
         let operation = start(stream, &header, None);
-        let stream =
-            crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?;
-        Ok(ProxyStream {
-            stream,
-            target_addr: target,
-            target_domain: target_domain.map(str::to_string),
-        })
+        Ok(crate::runtime::flow_observation::request_write(std::pin::pin!(operation)).await?)
     }
 
     pub(super) async fn prepare_retained_carrier(

@@ -298,7 +298,10 @@ impl DialContext {
             anyhow::bail!("packet transport requested without proxy")
         };
         if proxy.route.is_some() {
-            anyhow::bail!("DNS packet transport does not support a route through group exits")
+            return Err(
+                anyhow::Error::new(honk_outbound::proxy::PacketRejection::Policy)
+                    .context("DNS packet transport requires a node target"),
+            );
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -485,5 +488,57 @@ mod tests {
             assert_eq!(start.elapsed(), Duration::from_millis(1500));
         }
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_packet_transport_refuses_a_route_through_group_exits() {
+        use honk_config::group_graph::{Composed, compose};
+        use honk_config::node::OutboundConfig;
+
+        let socks5 = |name: &str, port: u16| {
+            let mut node = Node {
+                name: name.into(),
+                address: "127.0.0.1".into(),
+                port,
+                outbound: OutboundConfig::Socks5(Default::default()),
+                ..Default::default()
+            };
+            node.id = node.derive_id();
+            node
+        };
+        let (leaf, exit) = (socks5("leaf", 1), socks5("exit", 2));
+        let Composed::Routed(route) = compose(leaf.id, &[leaf.id], [exit.id]) else {
+            panic!("a leaf behind an exit composes a route")
+        };
+        let dial = DialContext {
+            endpoint: crate::dns::endpoint::DnsEndpoint::parse(
+                "192.0.2.1:853",
+                honk_config::types::DnsProtocol::Quic,
+                Some("localhost"),
+            )
+            .unwrap(),
+            query_timeout: Duration::from_secs(1),
+            dial_timeout: Duration::from_secs(1),
+            socket_budget: DnsSocketBudget::new(1),
+            proxy: Some(ProxyDial {
+                registry: Arc::new(ProxyRegistry::new()),
+                generation: None,
+                node: leaf,
+                route: Some(route),
+            }),
+        };
+        let error = dial
+            .dial_packet_transport_until(
+                "192.0.2.1:853".parse().unwrap(),
+                tokio::time::Instant::now() + Duration::from_secs(1),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            honk_outbound::proxy::packet_rejection(&error),
+            Some(honk_outbound::proxy::PacketRejection::Policy),
+        );
     }
 }

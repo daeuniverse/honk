@@ -875,6 +875,7 @@ fn final_chains_preserve_cold_provenance_and_bound_mixed_cycles() {
     assert_udp_selection(&manager, "level-1", Some("direct"));
 }
 
+/// Unbound chain nodes have no UDP terminal to select.
 #[test]
 fn udp_selection_skips_chain_nodes() {
     let front = make_node(nid("front"), "front");
@@ -895,4 +896,58 @@ fn udp_selection_skips_chain_nodes() {
         assert!(m.is_node_selectable_for_domain(front.id, domain, IpVersion::V4));
     }
     assert!(m.is_node_selectable_for_domain(chain.id, ProbeDomain::Tcp, IpVersion::V4));
+}
+
+/// A configured chain's UDP follows its exit, not the chain descriptor.
+#[test]
+fn a_chain_offers_udp_exactly_when_its_exit_carries_it() {
+    let nodes = honk_config::Config {
+        nodes: vec![
+            Node::from_share_link("socks5://127.0.0.1:1080#front").unwrap(),
+            Node::from_share_link("trojan://secret@127.0.0.1:443#trojan").unwrap(),
+            Node::from_share_link(
+                "vless://30882cf1-11d1-4d34-bdf6-44f694c9c591@127.0.0.1:444?packetEncoding=xudp#xudp",
+            )
+            .unwrap(),
+            Node::chain("via-trojan", vec!["front".into(), "trojan".into()]),
+            Node::chain("via-xudp", vec!["front".into(), "xudp".into()]),
+        ],
+        ..Default::default()
+    }
+    .assemble(|_, _, _| {})
+    .unwrap()
+    .nodes;
+    let id = |name: &str| nodes.iter().find(|node| node.name == name).unwrap().id;
+    let manager = GroupManager::new(
+        &[make_group(
+            "g",
+            GroupPolicy::LoadBalance,
+            vec![id("via-trojan"), id("via-xudp")],
+        )],
+        &nodes,
+    );
+    for (name, carries) in [("via-trojan", true), ("via-xudp", false)] {
+        assert_eq!(
+            manager.is_node_selectable_for_domain(id(name), ProbeDomain::DataUdp, IpVersion::V4),
+            carries,
+            "{name}"
+        );
+    }
+    for _ in 0..2 {
+        let plan = manager.selection_plan_for_domain("g", ProbeDomain::DataUdp, IpVersion::V4);
+        assert_eq!(
+            plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [id("via-trojan")]
+        );
+        let target = manager.selection_plan_for_target(
+            "g",
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::Udp,
+                ProbeDomain::DataUdp,
+                IpVersion::V4,
+            ),
+        );
+        assert_eq!(target.entries[0].node.id, id("via-trojan"));
+        assert!(target.entries[0].route.is_none());
+    }
 }

@@ -322,7 +322,7 @@ Identity is stable across rename, reload, and subscription refresh when the dial
 | `anytls` | — | Yes | Yes* | Multiplexed TLS sessions and UoT v2 |
 | `direct` | — | Yes | Yes | Reserved built-in bypass outbound; no share-link scheme |
 | `block` | — | No | No | Reserved built-in reject outbound; no share-link scheme |
-| `chain` | — | Yes | No | Dials through other nodes in turn; no share-link scheme; see [Proxy chains](#proxy-chains) |
+| `chain` | — | Yes | Requires an eligible prefix and exit | Dials through two to four nodes in order. See [Proxy chains](#proxy-chains). |
 
 `network` can disable packet dialing for Trojan, AnyTLS and VLESS independently of their stream transport. VMess UDP is not implemented.
 
@@ -865,12 +865,12 @@ Hops resolve by name after honk assembles the static and subscription nodes. A c
 
 Each hop must name a node. A subscription refresh is rejected if it removes a referenced name or makes that name ambiguous.
 
-| Position | Supported nodes |
+| TCP position | Supported nodes |
 | --- | --- |
 | Entry | Any supported physical proxy, dialed as usual |
 | Later hops, including the exit | SOCKS5, Shadowsocks, Trojan or VMess without XHTTP, and VLESS without Vision, Encryption, XHTTP, or active TCP multiplexing (H2MUX or Mux.Cool) |
 
-Hysteria2, TUIC, Juicity and AnyTLS can only be the entry. VMess and VLESS require a build with `rprx` at any position.
+For TCP chains, Hysteria2, TUIC, Juicity and AnyTLS are entry-only protocols. VMess and VLESS require a build with `rprx` at any position.
 
 honk resolves the entry server as usual. For a later hop it passes a server hostname to the preceding proxy for resolution. For an ordinary TLS hop after the entry, both configuration admission and dial time refuse ECH discovery when the effective TLS server name is a hostname. An otherwise supported hop can use a static ECH configuration. An IP-literal TLS server name needs no ECH DNS query, and REALITY uses its own handshake.
 
@@ -878,11 +878,15 @@ A chain has no server endpoint, credential, or share-link scheme. JSON, YAML, an
 
 ### Selection, pooling, and health
 
-- TCP only. Groups skip chain nodes when selecting for UDP, and a UDP flow routed to one is refused, as with VMess.
+- For multi-hop UDP, every physical hop, including the entry, must meet the requirements above for **later TCP hops**. This includes the restriction on hostname-based ECH discovery for ordinary TLS. A TCP-only chain can serve as the prefix of a [group exit route](./groups.md#udp-through-an-exit) when all its physical hops meet those requirements.
+- The last hop also needs tunneled UDP support. It must be Trojan with UDP allowed, or VLESS with UDP allowed, multiplexing off and UDP encoding `auto` or `native`.
+- A tunneled VLESS exit uses native UDP even under `auto`, for every permitted port. Each flow opens its own transport, with replies limited to its destination peer.
+- A configured chain with a Trojan exit can share one association and receiver across destinations of the same client source, within the same chain runtime and reply-address mode. A synthesized multi-hop group route uses one transport per flow. A route that collapses to one node uses that node's ordinary UDP transport.
 - A chain has no pool or preconnect of its own. Each dial opens a logical entry stream and repeats every later handshake. The physical first-hop runtime can reuse a suitable session.
 - A dae group with neither node filters nor subgroups includes both the chain and its physical hops. Use `filter` to exclude an exit that cannot be reached directly.
 - If either snapshot contains a chain, a subscription refresh rebinds an explicit, unfiltered member list and removes vanished members without adding unrelated nodes. Between two chain-free snapshots, an unfiltered group without subgroups keeps its legacy behavior: it also takes new ordinary nodes. That refresh does not declare a wildcard for a later chain.
-- Dial results, health, and Score use the chain's own ID. With an HTTP check target, health probes dial through the whole chain. With `tcp_check_url` empty, raw TCP health checks are inapplicable to a chain and leave its health alone. Ordinary nodes, including flat nodes with an empty `address`, keep the existing raw probe behavior. Successful traffic that still reaches a dead chain can revive it. Two consecutive successful manual Clash delay checks can restore its TCP IPv4 health. A reload that rekeys the chain starts a new live health registration. See [native probes](./api.md#bounded-probes), [Clash delay](./api.md#delay-measurement), and [CLI delay](./cli.md#delay).
+- TCP dial results and ordinary TCP health use the chain's own ID. Score retains the chain as the selected leaf when the policy selects it. With an HTTP check target, TCP health probes dial through the whole chain. With `tcp_check_url` empty, raw TCP health checks are inapplicable to a chain and leave its TCP health alone. Ordinary nodes, including flat nodes with an empty `address`, keep the existing raw probe behavior. Successful TCP traffic that still reaches a dead chain can revive its TCP health. Two consecutive successful manual Clash delay checks can restore its TCP IPv4 health. A reload that rekeys the chain starts a new live health registration. See [native probes](./api.md#bounded-probes), [Clash delay](./api.md#delay-measurement), and [CLI delay](./cli.md#delay).
+- Routed UDP health follows the bound physical hops and ordered prefixes. A delivered UDP reply can confirm the path. See [Exit liveness](./groups.md#exit-liveness) for scoped failure handling and recovery.
 - Transport-quality evidence belongs to the physical hops. Chain traffic can put pressure on the entry node, while the chain has no transport pressure signal of its own. See [Outbound design](../design/outbound.md#proxy-chains).
 - Manage chains in the configuration. See [native node entry management](./api.md#managed-entries-and-geodata) and [Clash connection reporting](./api.md#endpoint-map).
 

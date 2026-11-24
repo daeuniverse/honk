@@ -18,7 +18,8 @@ global {
 
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
+    # 明確列出目的地才會授權路由 UDP 復原。
+    # udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 30s
     check_tolerance: 50ms
 
@@ -201,7 +202,9 @@ global {
 
 括號或連接埠格式錯誤時，驗證失敗並產生含位置的診斷。
 
-優先選擇第一個 IP 常值，沒有就解析第一個網域。解析結果與 Score 共用同一個解碼後的主機和連接埠；網域解析完成後仍保留網域身分。
+一般節點探測優先選擇第一個 IP 常值，沒有就解析第一個網域名稱。解析與 Score 共用解碼後的主機和連接埠，網域名稱解析後仍保留網域身分。省略這個設定時使用上表所列的預設值。
+
+針對[路由 UDP 復原](./groups.md#出口存活)，請列出允許 honk 透過受影響的鏈或群組出口查詢的 DNS 伺服器。省略這個設定或提供空清單時，系統不會送出復原查詢。復原會優先選擇設定中第一個與受影響健康位址族相同的 IP 常值。若沒有，僅使用已設定的 DNS 服務查找已設定網域名稱的同族位址，不退回 bootstrap DNS。封裝 UDP 的跳點必須允許目的連接埠。
 
 ```dae
 global {
@@ -346,7 +349,7 @@ dae 全域純量沿用 honk 既有的十六進位優先規則：`10` 和 `0x10` 
 - `check_interval`。
 - 第一個 `tcp_check_url`，包括其備援位址、路徑和查詢字串。首項缺失或為空都會關閉 HTTP 探測；後續項不參與比較。
 - HTTP 探測啟用時的 `tcp_check_http_method`。空值與 `HEAD` 等價。
-- `udp_check_dns` 選中的目標。處理時會先去除首尾空白、忽略空項，優先取列表裡第一個 IP 常值，沒有就取第一個網域，兩者都沒有時使用 `8.8.8.8:53`。reload 檢查只比較設定中的位址或網域及其連接埠，不解析 DNS。網域比較不區分大小寫，並忽略一個結尾句點，因此 `dns.example:53` 和 `DNS.EXAMPLE.:53` 是同一目標。未選中項的變化仍可 reload。
+- 一般節點探測使用的 `udp_check_dns` 生效目標。選擇時會去除首尾空白、忽略空項，依序取第一個 IP 常值、第一個網域名稱或最後的 `8.8.8.8:53`。reload 檢查只比較設定中的位址或網域名稱及其連接埠，不解析 DNS。網域名稱比較不區分大小寫，並忽略一個結尾句點，因此 `dns.example:53` 和 `DNS.EXAMPLE.:53` 是同一目標。保留該生效目標時，reload 可以更新路由復原用的明確清單。
 - `tls_implementation` 在原生 TLS 與 uTLS 之間的切換。比較 `utls` 時不區分大小寫。
 
 dae 設定中的 `check_tolerance` 仍可透過 reload 更新 URLTest 群組的容差。群組層級的檢查 URL 和直接連線探測仍沿現有路徑動態更新。reload `utls_imitate` 只會儲存相容設定值，不會改變指紋。

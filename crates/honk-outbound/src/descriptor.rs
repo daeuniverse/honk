@@ -209,7 +209,8 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         generation_runtime: GenerationRuntime::None,
         share_link_schemes: &[],
     },
-    // Each flow builds its own TCP chain. Any reusable sessions belong to the hops.
+    // Reusable sessions belong to the physical hops. UDP capability comes
+    // from the captured exit rather than the chain declaration.
     ProtocolDescriptor {
         protocol: NodeProtocol::Chain,
         supports_udp: never,
@@ -220,6 +221,62 @@ static DESCRIPTORS: &[ProtocolDescriptor] = &[
         share_link_schemes: &[],
     },
 ];
+
+/// How a node's UDP leaves: over its own protocol, or tunneled by `exit`,
+/// the last hop of a configured chain or a multi-hop route, over the stream
+/// the hops before it opened.
+#[derive(Clone, Copy, Debug)]
+pub enum UdpPath<'a> {
+    Own(&'a Node),
+    Tunneled { exit: &'a Node },
+}
+
+/// Whether the configured protocol can carry UDP on this path. Destination-port
+/// policy and installed handler availability are checked separately.
+#[inline]
+pub fn carries_udp(path: UdpPath<'_>) -> bool {
+    match path {
+        UdpPath::Own(node) => (descriptor(node.protocol()).supports_udp)(node),
+        UdpPath::Tunneled { exit } => {
+            exit.supports_tunneled_udp() && (descriptor(exit.protocol()).supports_udp)(exit)
+        }
+    }
+}
+
+/// Composed UDP requires each prefix, including the first hop, to support a
+/// direct handshake on a supplied stream. The terminal must frame UDP.
+pub(crate) fn tunneled_hops_carry_udp<'hops, 'node, T>(
+    hops: &'hops [T],
+    mut lookup: impl FnMut(&'hops T) -> Option<&'node Node>,
+) -> bool {
+    let Some((exit, prefix)) = hops.split_last() else {
+        return false;
+    };
+    !prefix.is_empty()
+        && lookup(exit).is_some_and(|exit| carries_udp(UdpPath::Tunneled { exit }))
+        && prefix
+            .iter()
+            .all(|hop| lookup(hop).is_some_and(Node::supports_tunneled_dial))
+}
+
+/// Statically filter synthesized or configured UDP routes in the default build.
+/// A caller-provided registry still checks its actual slots before I/O.
+pub(crate) fn builtin_tunneled_udp_available<'a>(
+    hops: &[uuid::Uuid],
+    mut lookup: impl FnMut(&uuid::Uuid) -> Option<&'a Node>,
+) -> bool {
+    tunneled_hops_carry_udp(hops, |hop| {
+        lookup(hop)
+            .filter(|node| crate::proxy::ProxyRegistry::builtin_protocol_available(node.protocol()))
+    })
+}
+
+pub(crate) fn builtin_udp_available(path: UdpPath<'_>) -> bool {
+    let node = match path {
+        UdpPath::Own(node) | UdpPath::Tunneled { exit: node } => node,
+    };
+    crate::proxy::ProxyRegistry::builtin_protocol_available(node.protocol()) && carries_udp(path)
+}
 
 /// Target policy only; absent UDP capability is handled separately by callers.
 pub fn udp_target_allowed(node: &Node, port: u16) -> bool {

@@ -115,6 +115,12 @@ pub(in crate::control) enum UdpTestMode {
     DnsResponse {
         dials: Arc<std::sync::atomic::AtomicUsize>,
     },
+    GatedDnsResponse {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        sends: Arc<std::sync::atomic::AtomicUsize>,
+        hold_reply: bool,
+    },
     DnsResponseCaptureTarget(Arc<parking_lot::Mutex<Option<SocketAddr>>>),
     #[cfg(feature = "ebpf")]
     KernelSocket(Arc<UdpSocket>),
@@ -178,6 +184,20 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
                 socket.send_to(_data, self.relay).await?;
                 Ok(())
             }
+            UdpTestMode::GatedDnsResponse {
+                entered,
+                release,
+                sends,
+                hold_reply,
+            } => {
+                if !hold_reply {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                *self.sent.lock().expect("sent query") = Some(_data.to_vec());
+                sends.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
             UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_) => {
                 *self.sent.lock().expect("sent query") = Some(_data.to_vec());
                 Ok(())
@@ -192,9 +212,21 @@ impl honk_outbound::proxy::PacketTransport for UdpTestTransport {
             let (size, _) = socket.recv_from(buf).await?;
             return Ok((size, self.relay));
         }
+        if let UdpTestMode::GatedDnsResponse {
+            entered,
+            release,
+            hold_reply: true,
+            ..
+        } = &self.mode
+        {
+            entered.notify_one();
+            release.notified().await;
+        }
         if matches!(
             self.mode,
-            UdpTestMode::DnsResponse { .. } | UdpTestMode::DnsResponseCaptureTarget(_)
+            UdpTestMode::DnsResponse { .. }
+                | UdpTestMode::DnsResponseCaptureTarget(_)
+                | UdpTestMode::GatedDnsResponse { .. }
         ) {
             // Echo the query as a NOERROR answer (QR set, question intact).
             let sent = self.sent.lock().expect("sent query").take();

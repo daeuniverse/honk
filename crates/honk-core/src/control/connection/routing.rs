@@ -209,6 +209,7 @@ impl ControlPlaneHandle {
         conn_info: &ConnectionInfo,
         domain_verified: bool,
         handoff: Option<&HandoffResult>,
+        handoff_group: Option<&str>,
         #[cfg(feature = "native-api")] record_route: bool,
     ) -> RoutingDecision {
         let reroute_by_sniffed_domain = Self::should_reroute_sniffed_domain(
@@ -217,13 +218,19 @@ impl ControlPlaneHandle {
             domain_verified,
             handoff,
         );
+        let handoff_name = |index| async move {
+            match handoff_group {
+                Some(name) => name.to_owned(),
+                None => self.outbound_index_to_name(index).await,
+            }
+        };
         if let Some(handoff) = handoff
             && handoff.outbound != OutboundIndex::ControlPlaneRouting as u8
             && !reroute_by_sniffed_domain
             && !self.connection_tracker.needs_rule_details()
         {
             return RoutingDecision {
-                outbound: self.outbound_index_to_name(handoff.outbound).await,
+                outbound: handoff_name(handoff.outbound).await,
                 must: handoff.must != 0,
                 mark: honk_outbound::proxy::DirectMark::new(handoff.mark),
                 matched_rule: None,
@@ -310,7 +317,7 @@ impl ControlPlaneHandle {
                     (userspace_outbound, userspace_must, userspace_mark)
                 } else {
                     (
-                        self.outbound_index_to_name(ho.outbound).await,
+                        handoff_name(ho.outbound).await,
                         ho.must != 0,
                         honk_outbound::proxy::DirectMark::new(ho.mark),
                     )
@@ -481,7 +488,7 @@ mod native_tests {
         let _router = handle.router.write().await;
         let decision = tokio::time::timeout(
             Duration::from_millis(100),
-            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), false),
+            handle.prepare_routing(DialMode::Ip, &info, false, Some(&handoff), None, false),
         )
         .await
         .expect("native observation must not repeat routing");

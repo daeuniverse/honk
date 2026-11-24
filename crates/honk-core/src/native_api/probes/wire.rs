@@ -30,7 +30,7 @@ pub(super) async fn execute(
                 if Instant::now() >= deadline {
                     return (attempt, Err("deadline"));
                 }
-                let outcome = attempt_wire(state, context, attempt, deadline, stop).await;
+                let outcome = attempt_wire(context, attempt, deadline, stop).await;
                 (attempt, Ok(outcome))
             });
         }
@@ -176,7 +176,8 @@ impl AttemptOutcome {
                     "cancelled"
                 } else if io == Some(std::io::ErrorKind::TimedOut) && Instant::now() >= deadline {
                     "deadline"
-                } else if honk_outbound::proxy::is_packet_rejection(&error)
+                } else if honk_outbound::proxy::dial_failure_scope(error.as_ref())
+                    == honk_outbound::proxy::DialFailureScope::LocalRejection
                     || io == Some(std::io::ErrorKind::Interrupted)
                 {
                     "local_refusal"
@@ -204,7 +205,6 @@ impl AttemptOutcome {
     }
 }
 async fn attempt_wire(
-    state: &NativeState,
     plan: &Context,
     attempt: &Attempt,
     deadline: Instant,
@@ -234,7 +234,7 @@ async fn attempt_wire(
         .and_then(|result| result);
         return AttemptOutcome::completed(result, deadline, &cancel);
     }
-    let Some(entry) = state.proxy_registry.find(candidate.node.protocol()) else {
+    let Some(entry) = plan.proxy_registry.find(candidate.node.protocol()) else {
         return AttemptOutcome::refused();
     };
     let Ok(mut ephemeral) = plan.registry.try_ephemeral_guarded(&candidate.node) else {
@@ -270,10 +270,9 @@ async fn attempt_wire(
                         tcp_dns(&mut proxy.stream).await
                     }
                     Transport::Udp => {
-                        let packet = entry
-                            .packet
-                            .as_ref()
-                            .ok_or_else(|| anyhow::anyhow!("packet handler unavailable"))?;
+                        let packet = entry.packet.as_ref().ok_or(
+                            honk_outbound::proxy::MissingProtocolHandler(candidate.node.protocol()),
+                        )?;
                         let transport = packet
                             .dial_udp_transport_runtime(
                                 Arc::clone(&runtime),
@@ -332,6 +331,23 @@ mod tests {
         let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
         assert!(outcome.completed);
         assert_eq!(outcome.error, Some("probe_failed"));
+    }
+
+    #[test]
+    fn typed_probe_refusals_are_not_completed_health_samples() {
+        use honk_outbound::proxy::{MissingProtocolHandler, PacketRejection};
+
+        let (_, receiver) = watch::channel(false);
+        for error in [
+            anyhow::Error::new(MissingProtocolHandler(
+                honk_config::types::NodeProtocol::VLess,
+            )),
+            anyhow::Error::new(PacketRejection::Capacity),
+        ] {
+            let outcome = AttemptOutcome::completed(Err(error), Instant::now(), &receiver);
+            assert!(!outcome.completed);
+            assert_eq!(outcome.error, Some("local_refusal"));
+        }
     }
 
     #[tokio::test]

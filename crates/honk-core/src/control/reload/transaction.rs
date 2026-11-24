@@ -230,6 +230,10 @@ impl ControlPlane {
         self.startup_downgrades.apply(&mut new_config);
         let current_router = self.router.read().await.clone();
         let current_config = self.config.read().await.clone();
+        let admitted_udp_check_dns = self.alive_set.admitted_udp_check_dns();
+        let admitted_udp_check_dns = admitted_udp_check_dns.as_deref();
+        let udp_recovery_unchanged =
+            admitted_udp_check_dns == new_config.global.udp_check_dns.as_deref();
         #[cfg(feature = "native-api")]
         let prepared_sources = sources.and_then(|sources| {
             self.configuration
@@ -246,7 +250,17 @@ impl ControlPlane {
             return Ok(ReloadOutcome::Rejected);
         }
         // Equality covers the private chain binding as well as the public node ID.
-        if new_config != *current_config.as_ref() {
+        let (old_plan, manager_matches_config) = {
+            let active = self.active_routing_plan.read();
+            (
+                Arc::clone(&active.plan),
+                active.manager_matches(&current_config),
+            )
+        };
+        if new_config != *current_config.as_ref()
+            || !udp_recovery_unchanged
+            || !manager_matches_config
+        {
             match &diagnostic_update {
                 DiagnosticUpdate::Rebase { .. } => {
                     new_config = new_config.assemble(honk_config::parser::resolve_group_filters)?;
@@ -269,6 +283,28 @@ impl ControlPlane {
         }
 
         let config_unchanged = effective_config_unchanged(current_config.as_ref(), &mut new_config);
+        let group_slots_reusable = old_plan.matches_group_slots(&new_config.groups);
+        let prepare_manager = |config: &Config| {
+            let score = self.group_manager.read().score_state();
+            Arc::new(GroupManager::with_alive_set_and_score_state(
+                &config.groups,
+                &config.nodes,
+                Some(Arc::clone(&self.alive_set)),
+                score,
+            ))
+        };
+        let mut prewritten_manager = None;
+        let mut uncommitted_composition = false;
+        if config_unchanged && group_slots_reusable && !manager_matches_config {
+            // The public config handle may have been edited without rebuilding a manager.
+            let manager = prepare_manager(&new_config);
+            let capable = routing_matcher::ActiveRoutingPlan::composition(&old_plan, &manager);
+            uncommitted_composition = self
+                .active_routing_plan
+                .read()
+                .needs_udp_publication(&capable);
+            prewritten_manager = Some(manager);
+        }
         #[cfg(feature = "native-api")]
         let prepared_catalog = self
             .native
@@ -278,7 +314,12 @@ impl ControlPlane {
         let current_dns_router = current_dns_forwarder.routing_snapshot();
         #[cfg(feature = "native-api")]
         let supplied_geo_sources = sources.and_then(|sources| sources.geo_sources.as_ref());
-        if config_unchanged && self.is_datapath_healthy() {
+        if config_unchanged
+            && udp_recovery_unchanged
+            && group_slots_reusable
+            && !uncommitted_composition
+            && self.is_datapath_healthy()
+        {
             let traffic_geo = current_router.geo_requirements();
             let dns_geo = current_dns_router.geo_requirements_snapshot();
             #[cfg(feature = "native-api")]
@@ -305,13 +346,15 @@ impl ControlPlane {
                         return Ok(ReloadOutcome::Rejected);
                     }
                 };
-            if current_router.geo_fingerprint() == traffic_geo_fingerprint
+            let mut config = self.config.write().await;
+            if Arc::ptr_eq(&config, &current_config)
+                && current_router.geo_fingerprint() == traffic_geo_fingerprint
                 && current_dns_router.geo_fingerprint() == dns_geo_fingerprint
                 && current_dns_forwarder.policy_id().is_some_and(|policy| {
                     policy.matches_artifacts(&hosts_fingerprint, &dns_geo_fingerprint)
                 })
+                && !self.active_routing_plan.read().rebind_requires_commit()
             {
-                let mut config = self.config.write().await;
                 #[cfg(feature = "native-api")]
                 if let Some(prepared) = &prepared_sources
                     && self
@@ -354,8 +397,15 @@ impl ControlPlane {
                 {
                     owner.activate(&new_config);
                 }
-                if declaring_sources_replaced(current_config.as_ref(), &new_config) {
+                let sources_replaced =
+                    declaring_sources_replaced(current_config.as_ref(), &new_config);
+                if sources_replaced {
                     *config = Arc::new(new_config);
+                }
+                if sources_replaced || !manager_matches_config {
+                    self.active_routing_plan
+                        .write()
+                        .note_manager_config(&config);
                 }
                 let group_manager = self.group_manager.read().clone();
                 let cleared: Vec<_> = config
@@ -388,12 +438,25 @@ impl ControlPlane {
                 return Ok(ReloadOutcome::Noop { generation });
             }
         }
-        let restart_required = restart_required_fields(
-            &current_config,
-            &new_config,
-            &self.log_files,
-            &self.startup_downgrades,
-        );
+        let restart_required =
+            if current_config.global.udp_check_dns.as_deref() == admitted_udp_check_dns {
+                restart_required_fields(
+                    &current_config,
+                    &new_config,
+                    &self.log_files,
+                    &self.startup_downgrades,
+                )
+            } else {
+                // A caller may prewrite Config before a manager-only rebind. The
+                // effective ordinary probe target still belongs to the accepted runtime.
+                super::policy::restart_required_fields_with_udp_dns(
+                    &current_config,
+                    &new_config,
+                    &self.log_files,
+                    &self.startup_downgrades,
+                    admitted_udp_check_dns.unwrap_or_default(),
+                )
+            };
         if !restart_required.is_empty() {
             warn!(
                 fields = ?restart_required.iter().map(|field| field.path).collect::<Vec<_>>(),
@@ -431,9 +494,9 @@ impl ControlPlane {
             self.stop_reload_rejection_if_healthy(drain);
             return Ok(ReloadOutcome::Rejected);
         };
-        let old_plan = self.active_routing_plan.read().clone();
         let old_has_direct_marks = current_router.has_direct_marks();
-        let reuse_routing_state = routing_state_reusable(&current_config, &new_config)
+        let reuse_routing_state = group_slots_reusable
+            && routing_state_reusable(&current_config, &new_config)
             && current_router.geo_fingerprint() == traffic_geo_fingerprint;
         // Build the candidate completely before mutating live state. Network lists
         // the live traffic router already holds keep its matchers, even when only
@@ -455,12 +518,7 @@ impl ControlPlane {
         let pinned_router = Arc::new(new_router.clone());
         let new_has_direct_marks = new_router.has_direct_marks();
         let old_group_manager = self.group_manager.read().clone();
-        let new_group_manager = Arc::new(GroupManager::with_alive_set_and_score_state(
-            &new_config.groups,
-            &new_config.nodes,
-            Some(Arc::clone(&self.alive_set)),
-            old_group_manager.score_state(),
-        ));
+        let new_group_manager = prewritten_manager.unwrap_or_else(|| prepare_manager(&new_config));
         new_group_manager.migrate_selector_choices_from(&old_group_manager);
         // Build the outbound generation before DNS so every new runtime
         // snapshot captures its own immutable node/session ownership.
@@ -524,8 +582,7 @@ impl ControlPlane {
                 return Ok(ReloadOutcome::Rejected);
             }
         };
-        let mut new_outbound_id_map =
-            build_outbound_id_map(&new_config, OutboundHealthDependency::leaf);
+        let mut new_outbound_id_map = build_outbound_id_map(&new_config);
         let health_targets = health_registrations(&new_config, &new_outbound_id_map);
         extend_route_health_dependencies(&new_config, &new_group_manager, &mut new_outbound_id_map);
         let bootstrap = new_config.global.bootstrap_resolver.clone();
@@ -543,6 +600,8 @@ impl ControlPlane {
                 }
             }
         };
+        let new_composition =
+            routing_matcher::ActiveRoutingPlan::composition(&new_plan, &new_group_manager);
         let generation = crate::dns::runtime::RuntimeGeneration::new(
             self.dns_controller
                 .runtime_provider()
@@ -666,12 +725,28 @@ impl ControlPlane {
                 {
                     break 'publication Err(());
                 }
-                let old_connectivity =
-                    group_connectivity_snapshot(&current_config, &group_guard, &self.alive_set);
+                let transition_group_count = plan_guard
+                    .plan
+                    .group_slots
+                    .len()
+                    .max(new_config.groups.len());
+                // A manager-only rebind can change liveness without writing the slots.
+                // Restore the installed values on rejection, even when names match.
+                let old_connectivity = match super::connectivity::installed_group_connectivity(
+                    ebpf.as_ref(),
+                    transition_group_count,
+                ) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        warn!(%error, "Failed to snapshot committed group connectivity");
+                        break 'publication Err(());
+                    }
+                };
                 let old_projection = projection_publication.project(&old_projection_snapshot);
                 let new_projection = projection_publication.project(&projection_snapshot);
                 // Recover a degraded runtime with a complete generation before reopening admission.
                 let routing_publication_needed = !self.is_datapath_healthy()
+                    || plan_guard.needs_udp_publication(&new_composition)
                     || !old_plan.semantically_eq(&new_plan)
                     || !old_projection
                         .iter()
@@ -682,8 +757,6 @@ impl ControlPlane {
                 drop(old_projection);
                 let provider = self.dns_controller.runtime_provider();
 
-                let transition_group_count =
-                    current_config.groups.len().max(new_config.groups.len());
                 if let Err(error) = open_group_connectivity(ebpf.as_mut(), transition_group_count) {
                     let restore = publish_group_connectivity(ebpf.as_mut(), &old_connectivity);
                     error!(%error, ?restore, "Failed to open group connectivity for reload transition");
@@ -735,7 +808,10 @@ impl ControlPlane {
                 self.alive_set.sync_registrations_retaining_routes(
                     health_targets,
                     |id| reused_runtime_ids.contains(id),
-                    |id| new_outbound_id_map.contains_key(id),
+                    |id| {
+                        new_outbound_id_map.contains_key(id)
+                            || new_group_manager.retains_udp_route_health_node(*id)
+                    },
                 );
                 // Commit point for runtime reuse: only now, with the successor
                 // published, does the old generation record the transfer and
@@ -764,7 +840,8 @@ impl ControlPlane {
                     )));
                 }
                 new_group_manager.publish_score_membership();
-                new_group_manager.publish_route_health();
+                new_group_manager
+                    .publish_route_health_with_udp(new_config.global.udp_check_dns.as_deref());
                 let new_connectivity =
                     group_connectivity_snapshot(&new_config, &new_group_manager, &self.alive_set);
                 if let Err(error) = publish_group_connectivity(ebpf.as_mut(), &new_connectivity) {
@@ -826,12 +903,15 @@ impl ControlPlane {
                 }
                 *group_guard = Arc::clone(&new_group_manager);
                 *outbound_guard = new_outbound_id_map;
-                if routing_publication_needed {
-                    *plan_guard = Arc::clone(&new_plan);
-                    #[cfg(feature = "native-api")]
-                    if let Some(dictionary) = prepared_dictionary {
-                        ebpf.bind_kernel_trace_dictionary(dictionary);
-                    }
+                plan_guard.publish(
+                    routing_publication_needed.then_some(&new_plan),
+                    &new_composition,
+                    ebpf.routing_policy_generation(),
+                    &config_guard,
+                );
+                #[cfg(feature = "native-api")]
+                if routing_publication_needed && let Some(dictionary) = prepared_dictionary {
+                    ebpf.bind_kernel_trace_dictionary(dictionary);
                 }
                 // The projection worker takes eBPF before its generation fence;
                 // publish under both locks so an old batch cannot enter this snapshot.

@@ -47,6 +47,7 @@ fn uot_pair(
         sock(target),
         domain,
         bytes::Bytes::from_static(request),
+        Some(false),
     );
     (Arc::new(transport), server)
 }
@@ -117,6 +118,86 @@ async fn uot_send_to_addresses_each_datagram_and_sends_the_request_once() {
     transport.send_packet(b"dflt").await.unwrap();
     let ordinary = packet(&A_ADDR, 5301, b"dflt");
     assert_eq!(read_exact(&mut wire, ordinary.len()).await, ordinary);
+}
+
+#[tokio::test]
+async fn checked_uot_send_retains_setup_before_custody_and_completes_after_custody() {
+    for free in [0, 1] {
+        let (mut client, mut wire) = tokio::io::duplex(32);
+        let prior = vec![0xee; 32 - free];
+        client.write_all(&prior).await.unwrap();
+        let transport = VlessUotTransport::new(
+            Box::new(client),
+            sock(A),
+            None,
+            bytes::Bytes::from_static(&A_REQUEST),
+            Some(false),
+        );
+        let current = AtomicBool::new(true);
+        let allowed = || current.load(Ordering::Acquire);
+        let admitted = AtomicBool::new(false);
+        let mut send = std::pin::pin!(transport.send_to_checked(
+            sock(A),
+            None,
+            b"first",
+            Some(&admitted),
+            &allowed,
+        ));
+        assert!(futures_util::poll!(send.as_mut()).is_pending());
+        assert_eq!(admitted.load(Ordering::Acquire), free != 0);
+        current.store(false, Ordering::Release);
+        assert_eq!(read_exact(&mut wire, prior.len()).await, prior);
+
+        let mut sibling = packet(&B_ADDR, 5302, b"sibling");
+        if free == 0 {
+            let error = send.await.unwrap_err();
+            assert_eq!(
+                crate::proxy::io_packet_rejection(&error),
+                Some(PacketRejection::Cancelled),
+            );
+            assert!(!admitted.load(Ordering::Acquire));
+            sibling = [&A_REQUEST[..], &sibling].concat();
+        } else {
+            send.await.unwrap();
+            let first = [&A_REQUEST[..], &packet(&A_ADDR, 5301, b"first")].concat();
+            assert_eq!(read_exact(&mut wire, first.len()).await, first);
+        }
+        assert!(!transport.frame_stream_torn());
+        transport
+            .send_to(sock(B), None, b"sibling", false, None)
+            .await
+            .unwrap();
+        assert_eq!(read_exact(&mut wire, sibling.len()).await, sibling);
+    }
+}
+
+#[cfg(feature = "flow-observation")]
+#[tokio::test]
+async fn checked_uot_first_range_carries_confirmed_request_observation() {
+    use crate::proxy::request_observation_support::{DeferringCarrier, milestones, observed};
+    use crate::runtime::flow_observation::Milestone;
+
+    let (client, mut wire) = tokio::io::duplex(64);
+    let (carrier, pending) = DeferringCarrier::new(client);
+    let transport = VlessUotTransport::new(
+        Box::new(carrier),
+        sock(A),
+        None,
+        bytes::Bytes::from_static(&A_REQUEST),
+        Some(false),
+    );
+    let (observer, events) = observed();
+    observer
+        .scope(transport.send_to_checked(sock(A), None, b"first", None, &|| true))
+        .await
+        .unwrap();
+    let first = [&A_REQUEST[..], &packet(&A_ADDR, 5301, b"first")].concat();
+    assert_eq!(read_exact(&mut wire, first.len()).await, first);
+    assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 0);
+    let (receipt, end) = pending.lock().take().unwrap();
+    assert_eq!(end, first.len() as u64);
+    receipt.confirm();
+    assert_eq!(milestones(&events.lock(), Milestone::TargetRequestSent), 1);
 }
 
 /// A server pins its outbound form by the first destination: the dialed name
@@ -280,6 +361,7 @@ async fn uot_cancelled_partial_write_poisons_the_shared_stream() {
         sock(A),
         None,
         bytes::Bytes::from_static(&A_REQUEST),
+        Some(false),
     );
     let stalled = tokio::time::timeout(
         std::time::Duration::from_millis(50),

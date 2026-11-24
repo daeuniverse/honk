@@ -9,8 +9,6 @@ use super::*;
 #[derive(Clone, Copy)]
 struct LeafWalk {
     include_final: bool,
-    /// Only what UDP selection reaches: it offers nothing from a group
-    /// with an exit, as routes carry TCP only.
     udp: bool,
     exits: bool,
 }
@@ -47,10 +45,6 @@ impl GroupManager {
             .collect();
         honk_config::group_graph::cut_cycles(&mut groups);
         groups
-    }
-
-    pub fn group(&self, name: &str) -> Option<&Group> {
-        self.groups.get(name).map(|entry| &entry.group)
     }
 
     pub fn group_members(&self, name: &str) -> impl Iterator<Item = GroupMember<'_>> {
@@ -146,8 +140,7 @@ impl GroupManager {
             }
         };
         (node.protocol() != honk_config::types::NodeProtocol::Block
-            && (domain == ProbeDomain::Tcp
-                || (crate::descriptor::descriptor(node.protocol()).supports_udp)(node)))
+            && (domain == ProbeDomain::Tcp || self.node_carries_udp(node)))
         .then_some(node)
     }
 
@@ -220,6 +213,10 @@ impl GroupManager {
 }
 
 impl GroupManager {
+    pub fn group(&self, name: &str) -> Option<&Group> {
+        self.groups.get(name).map(|entry| &entry.group)
+    }
+
     /// Resolve a group to the single leaf node its policy selects.
     /// `visited`/`depth` thread the cycle/depth guards through nesting;
     /// `routes` is the root's, as in `ScoreSelectionRules::routes`.
@@ -363,18 +360,17 @@ impl GroupManager {
         self.group_leaf_nodes(group_name, true)
     }
 
-    /// Exit paths also depend on physical hops of a configured chain. This walk only
-    /// drives invalidation; raw probes and Score attribution remain leaf-owned.
+    /// Routed groups and UDP-capable chains also depend on their physical hops.
+    /// The walk drives invalidation, while raw probes and Score stay leaf-owned.
     pub fn visit_route_health_dependencies(
         &self,
         group_name: &str,
         mut visit: impl FnMut(uuid::Uuid) -> bool,
     ) -> bool {
-        if !self
-            .groups
-            .get(group_name)
-            .is_some_and(|entry| entry.routes)
-        {
+        let Some(entry) = self.groups.get(group_name) else {
+            return false;
+        };
+        if !entry.routes && !self.group_has_udp_chain(group_name) {
             return false;
         }
         self.visit_group_leaves(
@@ -382,14 +378,15 @@ impl GroupManager {
             0,
             &mut [""; MAX_GROUP_DEPTH],
             LeafWalk {
-                exits: true,
+                exits: entry.routes,
                 ..LeafWalk::REACHABLE
             },
             &mut |node| {
-                visit(node.id)
-                    || node
-                        .resolved_chain_hops()
-                        .is_some_and(|hops| hops.iter().copied().any(&mut visit))
+                let hops = node.resolved_chain_hops();
+                if !entry.routes && (hops.is_none() || !self.node_carries_udp(node)) {
+                    return false;
+                }
+                visit(node.id) || hops.is_some_and(|hops| hops.iter().copied().any(&mut visit))
             },
         )
     }
@@ -405,8 +402,7 @@ impl GroupManager {
         )
     }
 
-    /// Whether `accept` takes a leaf UDP selection can reach through
-    /// membership or explicit final edges, none of them behind an exit.
+    /// Whether `accept` takes a flat leaf reachable through membership or explicit finals.
     pub fn any_udp_leaf_in_group(
         &self,
         group_name: &str,
@@ -506,16 +502,9 @@ impl GroupManager {
             || (walk.include_final
                 && match self.final_member(group) {
                     Some(GroupMember::Node(node)) => visit(node),
-                    Some(GroupMember::Group(group)) => self.visit_group_leaves(
-                        &group.name,
-                        depth + 1,
-                        visited,
-                        LeafWalk {
-                            include_final: true,
-                            ..walk
-                        },
-                        visit,
-                    ),
+                    Some(GroupMember::Group(group)) => {
+                        self.visit_group_leaves(&group.name, depth + 1, visited, walk, visit)
+                    }
                     None => false,
                 })
     }

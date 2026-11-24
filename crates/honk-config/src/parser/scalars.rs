@@ -434,7 +434,7 @@ pub(super) fn parse_global_section(
         cfg.tcp_check_http_method = value.to_owned();
     }
     if let Some(value) = settings.get("udp_check_dns") {
-        cfg.udp_check_dns = list_value(*value, ListOptions::CHECK_TARGETS, diagnostics);
+        cfg.udp_check_dns = Some(list_value(*value, ListOptions::CHECK_TARGETS, diagnostics));
     }
     if let Some(text) = settings.get("check_interval") {
         let value = text.unquote().raw();
@@ -599,18 +599,20 @@ pub(super) fn parse_global_section(
         })?;
     }
 
-    crate::check::validate_dns_check_targets(&cfg.udp_check_dns).map_err(|mut error| {
-        if let Some(value) = settings.get("udp_check_dns") {
-            let (line, column) = value.source.location(value.span.start);
-            error.diagnostic.source = value.source.reference();
-            error.diagnostic.line = Some(line);
-            error.diagnostic.span = Some(value.span.start..value.span.end);
-            error.diagnostic.byte_column = Some(column);
-        } else {
-            error.diagnostic.source = diagnostics.source();
-        }
-        super::ParseFailure::Detailed(error)
-    })?;
+    crate::check::validate_dns_check_targets(cfg.effective_udp_check_dns()).map_err(
+        |mut error| {
+            if let Some(value) = settings.get("udp_check_dns") {
+                let (line, column) = value.source.location(value.span.start);
+                error.diagnostic.source = value.source.reference();
+                error.diagnostic.line = Some(line);
+                error.diagnostic.span = Some(value.span.start..value.span.end);
+                error.diagnostic.byte_column = Some(column);
+            } else {
+                error.diagnostic.source = diagnostics.source();
+            }
+            super::ParseFailure::Detailed(error)
+        },
+    )?;
     Ok(cfg)
 }
 

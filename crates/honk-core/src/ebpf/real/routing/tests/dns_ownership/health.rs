@@ -89,6 +89,18 @@ fn tcp_health_applies_to_fresh_admission_not_cached_packets_while_udp_stays_gate
 #[test]
 #[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
 fn accepted_prefix_failure_updates_real_tc_admission() {
+    in_routed_health_vm(check_routed_tcp_health);
+}
+
+#[cfg(feature = "native-api")]
+#[test]
+#[ignore = "requires root, Linux 6.12+, and HONK_ROUTING_TEST_OBJECT; disposable VM only"]
+fn accepted_udp_prefix_failure_updates_real_tc_admission() {
+    in_routed_health_vm(check_routed_udp_health);
+}
+
+#[cfg(feature = "native-api")]
+fn in_routed_health_vm<F: Future<Output = ()> + 'static>(test: fn() -> F) {
     let kernel = std::env::var("HONK_CI_EXPECTED_KERNEL").unwrap_or_default();
     assert!(
         std::env::var_os("HONK_CI_VM_LANE").is_some()
@@ -99,7 +111,7 @@ fn accepted_prefix_failure_updates_real_tc_admission() {
                 == kernel,
         "requires the disposable kernel VM gate"
     );
-    isolated(|| {
+    isolated(move || {
         let mut netlink = crate::netlink::NlSock::new().unwrap();
         let (lo, _) = netlink.get_link("lo").unwrap();
         netlink.set_link_up(lo, true).unwrap();
@@ -107,8 +119,29 @@ fn accepted_prefix_failure_updates_real_tc_admission() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(check_routed_tcp_health());
+            .block_on(test());
     });
+}
+
+#[cfg(feature = "native-api")]
+async fn refuse_socks_connects(listener: tokio::net::TcpListener, port: u16, attempts: usize) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    for _ in 0..attempts {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut greeting = [0; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).await.unwrap();
+        let mut request = [0; 10];
+        stream.read_exact(&mut request).await.unwrap();
+        assert_eq!(request[..8], [5, 1, 0, 1, 127, 0, 0, 1]);
+        assert_eq!(request[8..], port.to_be_bytes());
+        stream
+            .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(feature = "native-api")]
@@ -121,7 +154,6 @@ async fn check_routed_tcp_health() {
     use honk_outbound::alive::{IpVersion, ProbeDomain};
     use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork, Target};
     use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
-    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpListener;
 
     const BASE: u8 = OutboundIndex::UserBase as u8;
@@ -258,23 +290,11 @@ async fn check_routed_tcp_health() {
     assert_eq!(admitted.result.outbound, BASE);
     assert_ne!(admitted.incarnation, 0);
 
-    let refused = tokio::spawn(async move {
-        for _ in 0..FAILURE_COUNT {
-            let (mut stream, _) = refusing.accept().await.unwrap();
-            let mut greeting = [0; 3];
-            stream.read_exact(&mut greeting).await.unwrap();
-            assert_eq!(greeting, [5, 1, 0]);
-            stream.write_all(&[5, 0]).await.unwrap();
-            let mut request = [0; 10];
-            stream.read_exact(&mut request).await.unwrap();
-            assert_eq!(request[..8], [5, 1, 0, 1, 127, 0, 0, 1]);
-            assert_eq!(request[8..], exit_addr.port().to_be_bytes());
-            stream
-                .write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0])
-                .await
-                .unwrap();
-        }
-    });
+    let refused = tokio::spawn(refuse_socks_connects(
+        refusing,
+        exit_addr.port(),
+        FAILURE_COUNT,
+    ));
     let (gated, revision) = plan("gated");
     let Ok([entry]) = <[_; 1]>::try_from(gated.entries) else {
         panic!("initial final must resolve to one route");
@@ -398,5 +418,343 @@ async fn check_routed_tcp_health() {
         select("denied").as_slice(),
         [block] if block.node.protocol() == NodeProtocol::Block && block.route.is_none()
     ));
+    stop_updates.await.unwrap();
+}
+
+#[cfg(feature = "native-api")]
+async fn check_routed_udp_health() {
+    use crate::control::ControlPlane;
+    use crate::test_support::routed_udp::{PASSWORD, Peer, dns_reply, front, trojan_peer};
+    use honk_config::Config;
+    use honk_config::node::{Group, GroupPolicy, Node, OutboundConfig, TrojanConfig};
+    use honk_config::types::NodeProtocol;
+    use honk_outbound::alive::{IpVersion, ProbeDomain};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork, SelectorNetworks, Target};
+    use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
+    use tokio::net::{TcpListener, UdpSocket};
+
+    const BASE: u8 = OutboundIndex::UserBase as u8;
+    const FAILURES: usize = 50;
+    const WAIT: Duration = Duration::from_secs(5);
+    const PORT: u16 = 46300;
+    const DOMAIN: ProbeDomain = ProbeDomain::DataUdp;
+    const FAMILY: IpVersion = IpVersion::V4;
+
+    let refusing = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let inner = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let outer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let spare = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dns_origin = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let dns_addr = dns_origin.local_addr().unwrap();
+    let inner_addr = inner.local_addr().unwrap();
+    let outer_addr = outer.local_addr().unwrap();
+    let node = |name: &str, listener: &TcpListener, outbound| {
+        let addr = listener.local_addr().unwrap();
+        let mut node = Node {
+            name: name.into(),
+            address: addr.to_string(),
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            outbound,
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    let socks = || OutboundConfig::from_protocol(NodeProtocol::Socks5);
+    let first = node("first", &refusing, socks());
+    let second = node("second", &spare, socks());
+    let middle = node("middle", &inner, socks());
+    let land = node(
+        "land",
+        &outer,
+        OutboundConfig::Trojan(TrojanConfig {
+            password: Some(PASSWORD.into()),
+            ..Default::default()
+        }),
+    );
+    let chain = Node::chain_from_nodes("configured", &[&first, &middle, &land]).unwrap();
+    let failed_hops = [first.id, middle.id, land.id];
+    let alternate_hops = [second.id, land.id];
+    let raw_nodes = vec![first.id, second.id, land.id, chain.id];
+    let groups = vec![
+        Group {
+            name: "gated".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![second.id],
+            groups: vec!["inner".into()],
+            default: Some("inner".into()),
+            exit: Some("land".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "standalone".into(),
+            final_outbound: Some("configured".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "alternate".into(),
+            nodes: vec![second.id],
+            exit: Some("land".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "denied".into(),
+            policy: GroupPolicy::Fallback,
+            groups: vec!["inner".into()],
+            exit: Some("land".into()),
+            final_outbound: Some("block".into()),
+            ..Default::default()
+        },
+        Group {
+            name: "bare".into(),
+            nodes: vec![land.id],
+            ..Default::default()
+        },
+        Group {
+            name: "inner".into(),
+            final_outbound: Some("first".into()),
+            exit: Some("middle".into()),
+            ..Default::default()
+        },
+    ];
+    let mut config = Config {
+        nodes: vec![first, second, middle, land, chain],
+        groups,
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.global.dial_mode = "ip".into();
+    config.global.nfqueue_enable = false;
+    config.global.udp_check_dns = Some(vec![dns_addr.to_string()]);
+    config.routing.default_outbound = "block".into();
+    config.routing.rules = [
+        ("gated", vec!["53".into(), "443".into()]),
+        ("standalone", vec!["5443".into()]),
+        ("alternate", vec!["8443".into()]),
+        ("denied", vec!["9443".into()]),
+        ("bare", vec!["10443".into()]),
+    ]
+    .into_iter()
+    .map(|(name, port)| {
+        rule(
+            name,
+            RoutingCondition {
+                port,
+                ..Default::default()
+            },
+            name,
+            USER_MARK,
+            true,
+        )
+    })
+    .collect();
+
+    let mut real = RealEbpfBackend::load_routing_test_fixture_with_programs(
+        &object(),
+        fixture_param(),
+        &[crate::ebpf::interface::TcProgram::WanEgressL2],
+    )
+    .unwrap();
+    let listeners = TproxyListeners::new();
+    listeners.publish(&mut real).unwrap();
+    let programs = real.programs.clone().unwrap();
+    let (plane, stop_updates) = ControlPlane::tc_health_fixture(config, real).unwrap();
+    let backend = plane.ebpf_handle();
+    let slot = async |id, domain: ProbeDomain, family: IpVersion| {
+        backend
+            .read()
+            .await
+            .get_outbound_alive(id, domain as u32, family as u32)
+            .unwrap()
+    };
+    backend.write().await.set_datapath_ready(true).unwrap();
+    for (offset, (group, expected)) in [
+        ("gated", true),
+        ("standalone", true),
+        ("alternate", true),
+        ("denied", true),
+        ("bare", true),
+        ("inner", false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let id = BASE + offset as u8;
+        assert_eq!(
+            slot(id, DOMAIN, FAMILY).await,
+            expected,
+            "initial UDPv4 slot {id} for {group}"
+        );
+    }
+    let manager = plane.group_manager().read().clone();
+    manager
+        .set_selector_choice("gated", "second", SelectorNetworks::Tcp)
+        .unwrap();
+    manager
+        .set_selector_choice("gated", "inner", SelectorNetworks::Udp)
+        .unwrap();
+    let alive = plane.alive_set();
+    let registry = plane.proxy_registry();
+    let generation = plane.runtime_registry().read().clone();
+    let context = ScoreSelectionContext::aggregate(SelectionNetwork::Udp, DOMAIN, FAMILY);
+    let plan = |group| manager.dial_plan_for_target(group, &context, None);
+    let src = "192.0.2.84".parse().unwrap();
+    let dst = "198.51.100.84".parse().unwrap();
+    let run_udp = |src_port, dst_port| {
+        let bytes = packet(src, dst, IPPROTO_UDP, src_port, dst_port, 5, 0);
+        run_with_object(
+            &programs.object(),
+            "wan_egress_l2",
+            &bytes,
+            SkbInput::default(),
+        )
+    };
+
+    assert!(
+        !alive.is_registered(failed_hops[1]),
+        "the nested exit is a route dependency only"
+    );
+    assert!(plan("inner").0.entries.is_empty());
+    for dst_port in [443, 5443, 8443, 9443, 10443] {
+        assert_eq!(
+            run_udp(PORT, dst_port).verdict,
+            TC_ACT_REDIRECT,
+            "initial UDP destination port {dst_port}"
+        );
+    }
+
+    let first_peer = Peer::start(refusing, move |stream, index| {
+        front(stream, inner_addr, index < FAILURES)
+    });
+    let inner_peer = Peer::start(inner, move |stream, _| front(stream, outer_addr, false));
+    let exit_peer = Peer::start(outer, move |stream, _| async move {
+        trojan_peer(stream, &[dns_addr], dns_addr).await;
+    });
+    for _ in 0..FAILURES {
+        let (plan, revision) = plan("gated");
+        assert_eq!(plan.health_family, FAMILY);
+        let Ok([entry]) = <[_; 1]>::try_from(plan.entries) else {
+            panic!("the nested final must select one route before the failure threshold");
+        };
+        let target = manager.own_target(Target {
+            node: entry.node,
+            route: entry.route,
+        });
+        let route = target.route().unwrap();
+        assert_eq!(route.hops(), failed_hops);
+        let admission = manager
+            .capture_udp_route(
+                &target,
+                &entry.selection_chain,
+                &entry.final_owners,
+                revision,
+                DOMAIN,
+                FAMILY,
+            )
+            .unwrap();
+        let Err(error) = registry
+            .dial_udp_route(
+                generation.clone(),
+                route,
+                SocketAddr::new(dst, 443),
+                None,
+                WAIT,
+            )
+            .await
+        else {
+            panic!("front must refuse CONNECT to the nested exit");
+        };
+        assert_eq!(
+            dial_failure_scope(error.as_ref()),
+            DialFailureScope::Prefix(1)
+        );
+        assert!(manager.report_udp_route_failure(&admission, error.as_ref()));
+    }
+    assert_eq!(first_peer.count(), FAILURES);
+    assert_eq!(inner_peer.count(), 0);
+    assert_eq!(exit_peer.count(), 0);
+    tokio::time::timeout(WAIT, async {
+        while slot(BASE, DOMAIN, FAMILY).await || slot(BASE + 1, DOMAIN, FAMILY).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("ordered failure must close both committed IPv4 UDP slots");
+
+    for (offset, dst_port) in [443, 5443].into_iter().enumerate() {
+        let id = BASE + offset as u8;
+        assert!(slot(id, DOMAIN, IpVersion::V6).await);
+        assert!(slot(id, ProbeDomain::DnsUdp, FAMILY).await);
+        assert!(slot(id, ProbeDomain::Tcp, FAMILY).await);
+        assert_eq!(run_udp(PORT + 1, dst_port).verdict, TC_ACT_SHOT);
+    }
+    assert!(
+        plan("gated").0.entries.is_empty(),
+        "an unchosen sibling cannot replace the UDP pin"
+    );
+    assert!(plan("standalone").0.entries.is_empty());
+    assert!(matches!(
+        plan("alternate").0.entries.as_slice(),
+        [entry] if entry.route.as_ref().is_some_and(|route| route.hops() == alternate_hops)
+    ));
+    assert!(matches!(
+        plan("denied").0.entries.as_slice(),
+        [entry] if entry.node.protocol() == NodeProtocol::Block && entry.route.is_none()
+    ));
+    for (offset, dst_port) in [8443, 9443, 10443].into_iter().enumerate() {
+        assert!(slot(BASE + 2 + offset as u8, DOMAIN, FAMILY).await);
+        assert_eq!(run_udp(PORT + 1, dst_port).verdict, TC_ACT_REDIRECT);
+    }
+    let dns = run_udp(PORT + 1, 53);
+    assert_eq!(dns.verdict, TC_ACT_REDIRECT);
+    let kernel_generation = backend.read().await.routing_policy_generation();
+    assert_eq!(
+        dns.cb[2],
+        UdpDnsRoute::new(BASE, kernel_generation).unwrap().to_mark()
+    );
+
+    // Drive the real recovery scheduler without letting ordinary TCP checks
+    // consume the scripted peers' accepts.
+    alive.sync_urltest_groups(&[("ordinary health probes".into(), raw_nodes, Some(WAIT))]);
+    let cycle = tokio::spawn({
+        let alive = alive.clone();
+        async move { alive.run_health_check_cycle_concurrent(WAIT, 1).await }
+    });
+    let mut buffer = [0; 512];
+    let (len, peer) = tokio::time::timeout(WAIT, dns_origin.recv_from(&mut buffer))
+        .await
+        .expect("the configured recovery request must reach the DNS origin")
+        .unwrap();
+    assert_eq!(first_peer.count(), FAILURES + 1);
+    assert_eq!(inner_peer.count(), 1);
+    assert_eq!(exit_peer.count(), 1);
+    assert!(!slot(BASE, DOMAIN, FAMILY).await);
+    assert!(!slot(BASE + 1, DOMAIN, FAMILY).await);
+    let reply = dns_reply(&buffer[..len]);
+    assert_eq!(dns_origin.send_to(&reply, peer).await.unwrap(), reply.len());
+    tokio::time::timeout(WAIT, cycle).await.unwrap().unwrap();
+    tokio::time::timeout(WAIT, async {
+        while !slot(BASE, DOMAIN, FAMILY).await || !slot(BASE + 1, DOMAIN, FAMILY).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the validated reply must reopen both committed IPv4 UDP slots");
+    for dst_port in [443, 5443] {
+        assert_eq!(run_udp(PORT + 2, dst_port).verdict, TC_ACT_REDIRECT);
+    }
+    assert!(matches!(
+        plan("gated").0.entries.as_slice(),
+        [entry] if entry.route.as_ref().is_some_and(|route| route.hops() == failed_hops)
+    ));
+    alive.shutdown_health_checks().await.unwrap();
+    first_peer.finish(FAILURES + 1).await;
+    inner_peer.finish(1).await;
+    exit_peer.finish(1).await;
+    assert_eq!(
+        dns_origin.try_recv_from(&mut buffer).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     stop_updates.await.unwrap();
 }

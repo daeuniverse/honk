@@ -44,6 +44,65 @@ impl ScorePolicyState {
         .map(|(index, _)| index)
     }
 
+    pub(in crate::group) fn score_pool_initialized(
+        &self,
+        group: &str,
+        network: crate::group::SelectionNetwork,
+    ) -> bool {
+        self.inner
+            .lock()
+            .evaluation(group, network)
+            .is_some_and(|pool| pool.initialized())
+    }
+
+    /// Rank DNS packets within the ordinary serving pool. A cold pool uses
+    /// an unrestricted business view, including the ordinary subgroup picks.
+    pub(in crate::group) fn rank_packet(
+        &self,
+        authority: &Arc<ScoreAuthority>,
+        group: &str,
+        context: &ScoreSelectionContext,
+        nodes: &[&Node],
+        bootstrap: Option<(&ScoreSelectionContext, &[&Node], ScoreView<'_, '_>)>,
+        commit: bool,
+    ) -> Option<usize> {
+        let mut inner = self.inner.lock();
+        if !inner
+            .active_authority
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, authority))
+            || !inner.valid_groups.contains(group)
+        {
+            return None;
+        }
+        let now = Instant::now();
+        let mut preview = None;
+        if !inner
+            .evaluation(group, context.network)
+            .is_some_and(|pool| pool.initialized())
+        {
+            let (ordinary, full_nodes, origins) = bootstrap?;
+            let view = comparison::View::new(&inner, group, ordinary, full_nodes, now);
+            let (choice, pool) = ordinary_decision(&view, origins, true)?;
+            let mut pool = pool.into_owned();
+            pool.anchor(full_nodes[choice.ordinary.index].id, now);
+            if commit {
+                *inner.evaluation_mut(group, context.network) = pool;
+            } else {
+                preview = Some(pool);
+            }
+        }
+        let pool = preview
+            .as_ref()
+            .or_else(|| inner.evaluation(group, context.network))?;
+        let view = comparison::View::new(&inner, group, context, nodes, now);
+        let (choice, _) =
+            ordinary_decision_with_pool(&view, ScoreView::default(), false, Some(pool))?;
+        observation::metric("score_utility", None);
+        observe_reason(choice.ordinary.reason);
+        Some(choice.ordinary.index)
+    }
+
     #[cfg(test)]
     pub(in crate::group::score) fn peek_rank_at(
         self: &Arc<Self>,

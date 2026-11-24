@@ -51,6 +51,7 @@ fn restart_required_changes(current: &Config, candidate: &Config) -> Vec<&'stati
         candidate,
         current_log_file.as_deref(),
         candidate_log_file.as_deref(),
+        current.global.effective_udp_check_dns(),
     )
     .into_iter()
     .map(|field| field.path)
@@ -348,6 +349,7 @@ fn cli_log_override_shadows_configured_log_file_change() {
             &replacement,
             current_log_file.as_deref(),
             candidate_log_file.as_deref(),
+            current.global.effective_udp_check_dns(),
         )
         .is_empty()
     );
@@ -702,6 +704,267 @@ fn nested_final_keeps_datapath_group_alive_without_reviving_dead_members() {
     }
 }
 
+/// The only member of a group with the given `final`: a configured chain
+/// whose exit sends XUDP, which a chain cannot carry, or Trojan, which it can.
+fn chain_group_config(exit_carries_udp: bool, final_outbound: Option<&str>) -> Config {
+    use honk_config::node::{OutboundConfig, TrojanConfig, VlessConfig, VlessUdpEncoding};
+    let front = canonical_socks5("front", "127.0.0.1", 1080, None);
+    let mut exit = Node {
+        name: "exit".into(),
+        address: "127.0.0.1:443".into(),
+        host: "127.0.0.1".into(),
+        port: 443,
+        outbound: if exit_carries_udp {
+            OutboundConfig::Trojan(TrojanConfig {
+                password: Some("secret".into()),
+                ..Default::default()
+            })
+        } else {
+            OutboundConfig::Vless(VlessConfig {
+                uuid: Some("11111111-1111-4111-8111-111111111111".into()),
+                udp_encoding: VlessUdpEncoding::Xudp,
+                ..Default::default()
+            })
+        },
+        ..Default::default()
+    };
+    exit.id = exit.derive_id();
+    let chain = Node::chain_from_nodes("via", &[&front, &exit]).unwrap();
+    Config {
+        groups: vec![Group {
+            name: "g".into(),
+            policy: GroupPolicy::Selector,
+            nodes: vec![chain.id],
+            final_outbound: final_outbound.map(str::to_owned),
+            ..Default::default()
+        }],
+        nodes: vec![chain, front, exit],
+        ..Default::default()
+    }
+}
+
+fn chain_group_udp_plan(config: &Config) -> ResolvedScorePlan {
+    let manager = GroupManager::new(&config.groups, &config.nodes);
+    let context = honk_outbound::group::ScoreSelectionContext::aggregate(
+        honk_outbound::group::SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    resolve_outbound_plan_for_target(config, &manager, "g", &context, OutboundConstraint::Any)
+}
+
+/// The configured `final` takes the group's UDP exactly when the chain's exit
+/// cannot carry it; there is no implicit fallback. Without a `final`, the
+/// group publishes UDP connectivity exactly when the chain carries it.
+#[test]
+fn a_chain_group_sends_udp_to_the_final_only_when_the_exit_cannot_carry_it() {
+    for (exit_carries_udp, protocol) in [
+        (true, honk_config::types::NodeProtocol::Chain),
+        (false, honk_config::types::NodeProtocol::Direct),
+    ] {
+        let plan = chain_group_udp_plan(&chain_group_config(exit_carries_udp, Some("direct")));
+        let [target] = plan.targets.as_slice() else {
+            panic!("expected one candidate when exit carries UDP: {exit_carries_udp}");
+        };
+        assert_eq!(target.node.protocol(), protocol);
+        assert!(target.route().is_none());
+        let config = chain_group_config(exit_carries_udp, None);
+        let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        let manager =
+            GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
+        let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+        let outbound = OutboundIndex::UserBase as u8;
+        for domain in [1, 2] {
+            assert_eq!(
+                snapshot.contains(&(outbound, domain, 0, true)),
+                exit_carries_udp,
+                "exit carries UDP: {exit_carries_udp}, domain {domain}"
+            );
+        }
+        assert!(snapshot.contains(&(outbound, 0, 0, true)));
+    }
+}
+
+#[tokio::test]
+async fn explicit_udp_chain_uses_current_authority_without_a_group() {
+    let mut config = chain_group_config(true, None);
+    config.groups.clear();
+    config.global.nfqueue_enable = false;
+    let cp = control_plane(config);
+    let config = cp.config.read().await.clone();
+    let chain = config
+        .nodes
+        .iter()
+        .find(|node| node.name == "via")
+        .unwrap()
+        .id;
+    let context = honk_outbound::group::ScoreSelectionContext::aggregate(
+        honk_outbound::group::SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let capture = |manager: &GroupManager| {
+        let plan = resolve_outbound_plan_for_target(
+            &config,
+            manager,
+            "via",
+            &context,
+            OutboundConstraint::Any,
+        );
+        let [target] = plan.targets.as_slice() else {
+            panic!("the explicitly named configured chain must be selectable");
+        };
+        assert_eq!(target.key(), honk_outbound::group::DialKey::Node(chain));
+        manager
+            .capture_udp_route(
+                target,
+                &plan.selection_chains[0],
+                &plan.final_owners[0],
+                plan.route_revision,
+                ProbeDomain::DataUdp,
+                plan.health_family,
+            )
+            .expect("the named chain must have a published evidence owner")
+    };
+
+    let old = cp.group_manager.read().clone();
+    let admission = capture(&old);
+    assert!(old.udp_route_current(&admission));
+    cp.reload_group_manager().await.unwrap();
+    let current = cp.group_manager.read().clone();
+    assert!(!old.udp_route_current(&admission));
+    assert!(current.udp_route_current(&capture(&current)));
+}
+
+#[tokio::test]
+async fn udp_recovery_targets_require_full_config_admission() -> anyhow::Result<()> {
+    let mut initial = chain_group_config(true, None);
+    initial.groups.push(Group {
+        name: "unavailable".into(),
+        ..Default::default()
+    });
+    initial.ensure_builtin_nodes();
+    initial.global.nfqueue_enable = false;
+    initial.routing.default_outbound = "g".into();
+    let mut cp = ControlPlane::new(
+        initial.clone(),
+        Box::new(MockEbpfBackend::new()),
+        Router::from_config(&initial.routing)?,
+        Arc::new(ProxyRegistry::default_resolver()?),
+        DnsResolver::new(&initial.dns)?,
+        test_dns_forwarder(),
+    )?;
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "g"),
+    )));
+    cp.start_datapath_flags_coordinator()?;
+    cp.initialize_datapath_flags(false, false).await?;
+    let kernel_state = async || -> anyhow::Result<(u32, u64)> {
+        let backend = cp.ebpf.read().await;
+        Ok((
+            backend.active_routing_slot()?,
+            backend.routing_policy_generation(),
+        ))
+    };
+    let (kernel_slot, kernel_generation) = kernel_state().await?;
+    let compiled = cp.active_routing_plan.read().plan.clone();
+    let alive = &cp.alive_set;
+    let group_manager = cp.group_manager.read().clone();
+    publish_group_connectivity(
+        cp.ebpf.write().await.as_mut(),
+        &group_connectivity_snapshot(&initial, &group_manager, alive),
+    )?;
+    let slots = async || -> anyhow::Result<(bool, bool)> {
+        let backend = cp.ebpf.read().await;
+        let base = OutboundIndex::UserBase as u8;
+        let domain = ProbeDomain::DataUdp as u32;
+        let family = IpVersion::V4 as u32;
+        Ok((
+            backend.get_outbound_alive(base, domain, family)?,
+            backend.get_outbound_alive(base + 1, domain, family)?,
+        ))
+    };
+    assert_eq!(slots().await?, (true, false));
+    assert!(alive.admitted_udp_check_dns().is_none());
+
+    let mut explicit = initial.clone();
+    let legacy_targets = initial.global.effective_udp_check_dns();
+    explicit.global.udp_check_dns = Some(legacy_targets.to_vec());
+    *cp.config.write().await = Arc::new(explicit.clone());
+    cp.reload_group_manager().await?;
+    assert!(alive.admitted_udp_check_dns().is_none());
+    let rebound = cp.group_manager.read().clone();
+
+    let mut failed = explicit.clone();
+    failed.routing.default_outbound = "block".into();
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(RoutingPushPhase::Root, 1)?;
+    assert_eq!(
+        cp.apply_runtime_config(failed, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected
+    );
+    assert!(alive.admitted_udp_check_dns().is_none());
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &rebound));
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    // Staged UDP quiescence fences old marks before the candidate reaches the root.
+    let fenced_generation = kernel_generation + 1;
+    assert_eq!(kernel_state().await?, (kernel_slot, fenced_generation));
+    assert_eq!(slots().await?, (true, false));
+
+    let mut different_host = explicit.clone();
+    different_host.global.udp_check_dns = Some(vec!["192.0.2.7:53".into()]);
+    *cp.config.write().await = Arc::new(different_host.clone());
+    assert_eq!(
+        cp.apply_runtime_config(
+            different_host.clone(),
+            Default::default(),
+            &DrainTracker::new(),
+        )
+        .await,
+        ReloadOutcome::Rejected,
+        "a draft cannot change the startup-bound ordinary DNS probe target"
+    );
+    assert!(alive.admitted_udp_check_dns().is_none());
+    assert_eq!(kernel_state().await?, (kernel_slot, fenced_generation));
+
+    *cp.config.write().await = Arc::new(explicit.clone());
+    let outcome = cp
+        .apply_runtime_config(explicit, Default::default(), &DrainTracker::new())
+        .await;
+    assert!(
+        matches!(outcome, ReloadOutcome::Committed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        alive.admitted_udp_check_dns().as_deref(),
+        Some(legacy_targets)
+    );
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert_eq!(kernel_state().await?, (kernel_slot, fenced_generation + 1));
+    assert_eq!(slots().await?, (true, false));
+    let accepted = cp.config.read().await.as_ref().clone();
+    assert_eq!(
+        cp.apply_runtime_config(accepted, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Noop {
+            generation: outcome.generation().unwrap(),
+        }
+    );
+    assert_eq!(kernel_state().await?, (kernel_slot, fenced_generation + 1));
+
+    *cp.config.write().await = Arc::new(different_host);
+    cp.reload_group_manager().await?;
+    assert_eq!(
+        alive.admitted_udp_check_dns().as_deref(),
+        Some(legacy_targets)
+    );
+    assert_eq!(slots().await?, (true, false));
+    Ok(())
+}
+
 #[test]
 fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
     let config = nested_final_config();
@@ -719,7 +982,7 @@ fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
         ProbeDomain::DataUdp,
         IpVersion::V4,
     );
-    let plan = resolve_udp_outbound_plan_for_target(
+    let plan = resolve_outbound_plan_for_target(
         &config,
         &manager,
         "root",
@@ -727,7 +990,10 @@ fn parsed_nested_score_udp_plan_uses_healthy_final_chain() {
         crate::control::reload::OutboundConstraint::Any,
     );
     assert_eq!(
-        plan.nodes.iter().map(|node| node.id).collect::<Vec<_>>(),
+        plan.targets
+            .iter()
+            .map(|target| target.node.id)
+            .collect::<Vec<_>>(),
         [backup]
     );
     assert_eq!(
@@ -773,7 +1039,7 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
     let alive = Arc::new(AliveDialerSet::new());
     alive.report_unavailable_forced(primary, ProbeDomain::DataUdp, IpVersion::V4);
     alive.report_unavailable_forced(backup, ProbeDomain::DataUdp, IpVersion::V4);
-    let outbound_ids = build_outbound_id_map(&config, std::convert::identity);
+    let outbound_ids = build_outbound_id_map(&config);
     alive.set_outbound_resolver(Some(Arc::new(move |id| outbound_ids.get(&id).copied())));
     let (updates, received) = std::sync::mpsc::channel();
     alive.set_ebpf_callback(Box::new(move |node_id, _, domain, ipver, _| {
@@ -792,9 +1058,14 @@ async fn final_only_leaf_health_push_updates_all_ancestor_datapath_slots() {
             .set_outbound_alive(outbound + index as u8, 2, 0, false)
             .unwrap();
     }
+    let router = Router::from_config(&config.routing).unwrap();
+    let plan = Arc::new(ControlPlane::compile_routing_plan(&config, &router).unwrap());
+    let config = Arc::new(config);
+    let plan = routing_matcher::ActiveRoutingPlan::new(plan, &manager.read(), 1, &config);
     let publisher = Arc::new(super::runtime::OutboundHealthPublisher::new(
         backend.clone(),
-        Arc::new(RwLock::new(Arc::new(config))),
+        Arc::new(RwLock::new(config)),
+        Arc::new(parking_lot::RwLock::new(plan)),
         manager,
         alive.clone(),
     ));
@@ -2279,7 +2550,7 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
     let cache = forwarder.cache();
     let group_manager = cp.group_manager.read().clone();
     let runtime_registry = cp.runtime_registry.read().clone();
-    let routing_plan = cp.active_routing_plan.read().clone();
+    let routing_plan = cp.active_routing_plan.read().plan.clone();
     cp.ebpf.write().await.clear_datapath_flags_write_log();
     let drain = DrainTracker::new();
 
@@ -2307,7 +2578,10 @@ async fn identical_effective_reload_retains_runtime_identity_and_writes_nothing(
     assert!(Arc::ptr_eq(&cp.dns_controller.forwarder().cache(), &cache));
     assert!(Arc::ptr_eq(&cp.group_manager.read(), &group_manager));
     assert!(Arc::ptr_eq(&cp.runtime_registry.read(), &runtime_registry));
-    assert!(Arc::ptr_eq(&cp.active_routing_plan.read(), &routing_plan));
+    assert!(Arc::ptr_eq(
+        &cp.active_routing_plan.read().plan,
+        &routing_plan
+    ));
     assert!(!drain.should_reject());
 }
 
@@ -2613,7 +2887,7 @@ async fn native_dns_selection_keeps_catalog_ownership_across_reload_and_rejectio
                 lease.run(std::pin::pin!(async {
                     let observer = honk_outbound::runtime::flow_observation::current().unwrap();
                     let plan = observer.sync_scope(|| {
-                        resolve_outbound_plan_for_target::<honk_outbound::group::OwnedTarget>(
+                        resolve_outbound_plan_for_target(
                             config,
                             manager,
                             "catalog-root",
@@ -4457,7 +4731,7 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
         )
         .unwrap()
     };
-    let tracing = |cp: &ControlPlane| cp.active_routing_plan.read().trace_enabled();
+    let tracing = |cp: &ControlPlane| cp.active_routing_plan.read().plan.trace_enabled();
 
     assert!(!tracing(&plane(native_config(80))), "startup");
     let mut cp = plane(native_config(1));
@@ -4476,7 +4750,7 @@ async fn a_trace_dictionary_over_its_bound_turns_kernel_tracing_off() {
     assert!(!tracing(&cp), "reload");
 }
 
-/// UDP through an exit has no physical route. An explicit block remains executable.
+/// A tunneled UDP candidate and an explicit block each keep the group slot open.
 #[test]
 fn publication_and_selection_agree_on_udp_capability() {
     use honk_outbound::alive::{IpVersion, ProbeDomain};
@@ -4485,6 +4759,19 @@ fn publication_and_selection_agree_on_udp_capability() {
     let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
     let other = canonical_socks5("other", "127.0.0.3", 1080, None);
     let exit = canonical_socks5("exit", "127.0.0.2", 1080, None);
+    let dead = canonical_socks5("dead", "127.0.0.5", 1080, None);
+    let mut tunnel = Node {
+        name: "tunnel".into(),
+        address: "127.0.0.4:443".into(),
+        host: "127.0.0.4".into(),
+        port: 443,
+        outbound: honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    tunnel.id = tunnel.derive_id();
     let group = |name: &str, nodes: Vec<uuid::Uuid>, groups: &[&str]| Group {
         name: name.into(),
         policy: GroupPolicy::Fallback,
@@ -4497,7 +4784,13 @@ fn publication_and_selection_agree_on_udp_capability() {
         ..group
     };
     let mut config = Config {
-        nodes: vec![leaf.clone(), other.clone(), exit.clone()],
+        nodes: vec![
+            leaf.clone(),
+            other.clone(),
+            exit.clone(),
+            tunnel,
+            dead.clone(),
+        ],
         groups: vec![
             group("plain", vec![leaf.id], &[]),
             exited(group("exited", vec![leaf.id], &[])),
@@ -4515,11 +4808,19 @@ fn publication_and_selection_agree_on_udp_capability() {
                 exit: Some("missing".into()),
                 ..group("unresolved", vec![leaf.id], &[])
             },
+            Group {
+                exit: Some("tunnel".into()),
+                ..group("tunneled", vec![leaf.id], &[])
+            },
+            Group {
+                final_outbound: Some("block".into()),
+                ..group("plain-block", vec![dead.id], &[])
+            },
         ],
         ..Default::default()
     };
     config.ensure_builtin_nodes();
-    let expected = [true, false, false, true, true, false, false];
+    let expected = [true, false, false, true, true, false, false, true, true];
     for selector in [false, true] {
         if selector {
             for group in &mut config.groups[..3] {
@@ -4527,6 +4828,9 @@ fn publication_and_selection_agree_on_udp_capability() {
             }
         }
         let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+        for domain in [ProbeDomain::Tcp, ProbeDomain::DataUdp, ProbeDomain::DnsUdp] {
+            alive.report_unavailable_forced(dead.id, domain, IpVersion::V4);
+        }
         let manager =
             GroupManager::with_alive_set(&config.groups, &config.nodes, Some(Arc::clone(&alive)));
         let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
@@ -4554,13 +4858,7 @@ fn publication_and_selection_agree_on_udp_capability() {
                 );
                 let plan = manager.selection_plan_for_target_with_health_fallback(
                     &group.name,
-                    &ScoreSelectionContext {
-                        network: SelectionNetwork::Udp,
-                        probe_domain: domain,
-                        target_family: Some(IpVersion::V4),
-                        health_family: IpVersion::V4,
-                        target: None,
-                    },
+                    &ScoreSelectionContext::aggregate(SelectionNetwork::Udp, domain, IpVersion::V4),
                     None,
                 );
                 assert_eq!(published, expected[index], "{} {domain:?}", group.name);
@@ -4577,6 +4875,12 @@ fn publication_and_selection_agree_on_udp_capability() {
 
 #[tokio::test]
 async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow::Result<()> {
+    use super::udp_endpoint::{DatagramPayload, RawDnsRoute, queue_now};
+    use super::udp_ingress::{UdpLoopState, UdpSlowPathWork};
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+
+    const DNS_MARK: u32 = 0x200;
+
     let leaf = canonical_socks5("leaf", "127.0.0.1", 11081, None);
     let mut config = Config {
         nodes: vec![leaf.clone()],
@@ -4594,11 +4898,23 @@ async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow
         ..Default::default()
     };
     config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
     config.routing.default_outbound = "live".into();
+    config.routing.rules.push(RoutingRule {
+        name: "marked DNS".into(),
+        condition: RoutingCondition {
+            port: vec!["53".into()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple("direct".into()),
+        priority: 0,
+        must: true,
+        mark: DNS_MARK,
+    });
     let backend = MockEbpfBackend::new();
     #[cfg(feature = "reload-bench-counters")]
     let writes = backend.outbound_alive_write_counter();
-    let cp = ControlPlane::new(
+    let mut cp = ControlPlane::new(
         config.clone(),
         Box::new(backend),
         Router::from_config(&config.routing)?,
@@ -4607,22 +4923,86 @@ async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow
         test_dns_forwarder(),
     )?;
     let published = Arc::clone(&cp.group_manager.read());
-    let base = OutboundIndex::UserBase as u8;
-    let slots = async || -> anyhow::Result<(bool, bool)> {
+    cp.set_mode_state(Arc::new(parking_lot::RwLock::new(
+        crate::mode::ModeState::new("Rule", "live"),
+    )));
+    cp.start_datapath_flags_coordinator()?;
+    cp.initialize_datapath_flags(false, false).await?;
+    let compiled = Arc::clone(&cp.active_routing_plan.read().plan);
+    let runtimes = Arc::clone(&cp.runtime_registry.read());
+    let kernel_state = async || -> anyhow::Result<(u32, u64)> {
         let backend = cp.ebpf.read().await;
         Ok((
-            backend.get_outbound_alive(base, 0, 0)?,
-            backend.get_outbound_alive(base + 1, 0, 0)?,
+            backend.active_routing_slot()?,
+            backend.routing_policy_generation(),
         ))
     };
+    let (kernel_slot, kernel_generation) = kernel_state().await?;
+    let mark_index = compiled.rules[0].action.direct_mark_index.unwrap();
+    let old_mark = UdpDnsRoute::direct(mark_index, kernel_generation)
+        .unwrap()
+        .to_mark();
+    let udp = UdpLoopState::new(&cp, true);
+    let admit_dns = async |mark: u32| {
+        udp.admit_routed_dns_at(
+            DatagramPayload::Borrowed(b"marked DNS payload"),
+            "10.0.0.2:53000".parse().unwrap(),
+            "203.0.113.53:53".parse().unwrap(),
+            UdpDnsRoute::from_mark(mark).unwrap(),
+            queue_now(),
+            #[cfg(feature = "native-api")]
+            None,
+        )
+        .await
+    };
+    let base = OutboundIndex::UserBase as u8;
+    let slots = async |domain: ProbeDomain| -> anyhow::Result<(bool, bool)> {
+        let backend = cp.ebpf.read().await;
+        Ok((
+            backend.get_outbound_alive(base, domain as u32, 0)?,
+            backend.get_outbound_alive(base + 1, domain as u32, 0)?,
+        ))
+    };
+    cp.alive_set
+        .report_unavailable_forced(leaf.id, ProbeDomain::DataUdp, IpVersion::V4);
     publish_group_connectivity(
         cp.ebpf.write().await.as_mut(),
         &group_connectivity_snapshot(&config, &published, &cp.alive_set),
     )?;
-    assert_eq!(slots().await?, (true, false));
-    assert_eq!(cp.outbound_id_map.read()[&leaf.id].outbound, base);
+    assert_eq!(slots(ProbeDomain::Tcp).await?, (true, false));
+    assert_eq!(slots(ProbeDomain::DataUdp).await?, (false, false));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id], base);
     #[cfg(feature = "reload-bench-counters")]
     let before = writes.load(std::sync::atomic::Ordering::Relaxed);
+
+    let (enqueue, queued) = std::sync::mpsc::channel();
+    cp.alive_set
+        .set_ebpf_callback(Box::new(move |node, slot, domain, family, alive| {
+            enqueue.send((node, slot, domain, family, alive)).unwrap();
+        }));
+    // Forced death seeds the snapshot, but only a normal transition emits
+    // the raw eBPF event this test delays across the manager-only reorder.
+    cp.alive_set
+        .report_available_traffic(leaf.id, ProbeDomain::DataUdp, IpVersion::V4);
+    let (node, slot, domain, family, alive) = queued.try_recv()?;
+    assert_eq!(
+        (node, slot, domain, family),
+        (
+            leaf.id,
+            base,
+            ProbeDomain::DataUdp as u32,
+            IpVersion::V4 as u32
+        )
+    );
+    assert!(alive);
+    assert!(
+        cp.alive_set
+            .is_alive_for(leaf.id, ProbeDomain::DataUdp, IpVersion::V4)
+    );
+    assert!(matches!(
+        queued.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
 
     config.groups.swap(0, 1);
     config.groups[1].policy = GroupPolicy::Fallback;
@@ -4630,15 +5010,379 @@ async fn manager_only_reload_keeps_the_compiled_groups_numeric_slots() -> anyhow
     cp.reload_group_manager().await?;
     let current = Arc::clone(&cp.group_manager.read());
     assert!(!Arc::ptr_eq(&published, &current));
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert!(Arc::ptr_eq(&cp.runtime_registry.read(), &runtimes));
+    assert_eq!(kernel_state().await?, (kernel_slot, kernel_generation));
     assert_eq!(
         current.get_group_policy("live"),
         Some(GroupPolicy::Fallback)
     );
-    assert_eq!(slots().await?, (true, false));
-    assert_eq!(cp.outbound_id_map.read()[&leaf.id].outbound, base);
+    assert_eq!(slots(ProbeDomain::Tcp).await?, (true, false));
+    assert_eq!(slots(ProbeDomain::DataUdp).await?, (false, false));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id], base);
     #[cfg(feature = "reload-bench-counters")]
     assert_eq!(writes.load(std::sync::atomic::Ordering::Relaxed), before);
+
+    let publisher = Arc::new(super::runtime::OutboundHealthPublisher::new(
+        cp.ebpf.clone(),
+        cp.config.clone(),
+        cp.active_routing_plan.clone(),
+        cp.group_manager.clone(),
+        cp.alive_set.clone(),
+    ));
+    publisher.publish(Some(node), Some((domain, family))).await;
+    assert_eq!(slots(ProbeDomain::DataUdp).await?, (true, false));
+    assert!(matches!(
+        admit_dns(old_mark).await,
+        UdpSlowPathWork::Initialize(lease) if lease.raw_dns_route() == Some(RawDnsRoute::Direct(DNS_MARK))
+    ));
+
+    // The caller has already written this order into config. Full activation
+    // must still compile it, and rejection must preserve the old live slots.
+    let candidate = cp.config.read().await.as_ref().clone();
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(RoutingPushPhase::Root, 1)?;
+    assert_eq!(
+        cp.apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected
+    );
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert!(Arc::ptr_eq(&cp.runtime_registry.read(), &runtimes));
+    assert_eq!(cp.router.read().await.fallback().outbound, "live");
+    // The candidate root failed, but quiescence already fenced old UDP marks
+    // by advancing the existing descriptor's generation in place.
+    let fenced_generation = kernel_generation + 1;
+    assert_eq!(kernel_state().await?, (kernel_slot, fenced_generation));
+    assert!(matches!(admit_dns(old_mark).await, UdpSlowPathWork::Done));
+    let fresh_mark = UdpDnsRoute::direct(mark_index, fenced_generation)
+        .unwrap()
+        .to_mark();
+    assert!(matches!(
+        admit_dns(fresh_mark).await,
+        UdpSlowPathWork::Initialize(lease) if lease.raw_dns_route() == Some(RawDnsRoute::Direct(DNS_MARK))
+    ));
+    assert_eq!(slots(ProbeDomain::Tcp).await?, (true, false));
+    assert_eq!(slots(ProbeDomain::DataUdp).await?, (true, false));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id], base);
+
+    let outcome = cp
+        .apply_runtime_config(candidate, Default::default(), &DrainTracker::new())
+        .await;
+    assert!(
+        matches!(outcome, ReloadOutcome::Committed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        kernel_state().await?,
+        (kernel_slot ^ 1, fenced_generation + 2)
+    );
+    assert_eq!(
+        cp.active_routing_plan.read().plan.fallback.outbound,
+        base + 1
+    );
+    assert_eq!(slots(ProbeDomain::Tcp).await?, (false, true));
+    assert_eq!(slots(ProbeDomain::DataUdp).await?, (false, true));
+    assert_eq!(cp.outbound_id_map.read()[&leaf.id], base + 1);
     Ok(())
+}
+
+#[tokio::test]
+async fn rejected_reload_restores_slots_after_same_order_rebind() -> anyhow::Result<()> {
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 11081, None);
+    let mut config = Config {
+        nodes: vec![leaf.clone()],
+        groups: vec![
+            Group {
+                name: "first".into(),
+                nodes: vec![leaf.id],
+                ..Default::default()
+            },
+            Group {
+                name: "second".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    let cp = control_plane(config.clone());
+    let compiled = cp.active_routing_plan.read().plan.clone();
+    let initial = group_connectivity_snapshot(&config, &cp.group_manager.read(), &cp.alive_set);
+    publish_group_connectivity(cp.ebpf.write().await.as_mut(), &initial)?;
+    let base = OutboundIndex::UserBase as u8;
+    let installed = async || -> anyhow::Result<[[bool; 6]; 3]> {
+        let backend = cp.ebpf.read().await;
+        let mut values = [[false; 6]; 3];
+        for (offset, group) in values.iter_mut().enumerate() {
+            for (slot, alive) in group.iter_mut().enumerate() {
+                *alive = backend.get_outbound_alive(
+                    base + offset as u8,
+                    (slot / 2) as u32,
+                    (slot % 2) as u32,
+                )?;
+            }
+        }
+        Ok(values)
+    };
+    let before = [[true; 6], [false; 6], [false; 6]];
+    assert_eq!(installed().await?, before);
+    let (slot, generation) = {
+        let backend = cp.ebpf.read().await;
+        (
+            backend.active_routing_slot()?,
+            backend.routing_policy_generation(),
+        )
+    };
+
+    config.groups[0].nodes.clear();
+    config.groups[1].nodes.push(leaf.id);
+    config.groups[1].policy = GroupPolicy::Fallback;
+    *cp.config.write().await = Arc::new(config.clone());
+    cp.reload_group_manager().await?;
+    let rebound = cp.group_manager.read().clone();
+    assert!(compiled.matches_group_slots(&config.groups));
+    let desired = group_connectivity_snapshot(&config, &rebound, &cp.alive_set);
+    assert!(desired.contains(&(base, ProbeDomain::DataUdp as u32, 0, false)));
+    assert!(desired.contains(&(base + 1, ProbeDomain::DataUdp as u32, 0, true)));
+    assert_eq!(installed().await?, before);
+
+    config.groups.push(Group {
+        name: "third".into(),
+        ..Default::default()
+    });
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(RoutingPushPhase::Root, 1)?;
+    assert_eq!(
+        cp.apply_runtime_config(config, Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected,
+    );
+    assert!(Arc::ptr_eq(&cp.group_manager.read(), &rebound));
+    assert!(Arc::ptr_eq(&cp.active_routing_plan.read().plan, &compiled));
+    assert_eq!(
+        installed().await?,
+        before,
+        "rollback must restore every slot the transition opened"
+    );
+    let backend = cp.ebpf.read().await;
+    assert_eq!(backend.active_routing_slot()?, slot);
+    assert_eq!(backend.routing_policy_generation(), generation + 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn marked_udp_dns_reserves_only_the_committed_group_name() -> anyhow::Result<()> {
+    use super::udp_endpoint::{DatagramPayload, RawDnsRoute, queue_now};
+    use super::udp_ingress::{UdpLoopState, UdpSlowPathWork};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork};
+
+    let mut config = Config {
+        groups: ["north", "south"]
+            .into_iter()
+            .map(|name| Group {
+                name: name.into(),
+                final_outbound: Some("block".into()),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    let cp = control_plane(config.clone());
+    let udp = UdpLoopState::new(&cp, true);
+    let base = OutboundIndex::UserBase as u8;
+    let generation = cp.ebpf.read().await.routing_policy_generation();
+    let admit = async |outbound, generation| {
+        udp.admit_routed_dns_at(
+            DatagramPayload::Borrowed(b"dns reservation"),
+            "10.0.0.2:53000".parse().unwrap(),
+            "203.0.113.53:53".parse().unwrap(),
+            UdpDnsRoute::new(outbound, generation).unwrap(),
+            queue_now(),
+            #[cfg(feature = "native-api")]
+            None,
+        )
+        .await
+    };
+    let assert_north = |work| {
+        let UdpSlowPathWork::Initialize(lease) = work else {
+            panic!("expected a private UDP reservation");
+        };
+        assert_eq!(
+            lease.raw_dns_route(),
+            Some(RawDnsRoute::Group(Arc::from("north")))
+        );
+    };
+    assert_north(admit(base, generation).await);
+
+    config.groups.swap(0, 1);
+    config.groups.push(Group {
+        name: "draft".into(),
+        ..Default::default()
+    });
+    *cp.config.write().await = Arc::new(config.clone());
+    cp.reload_group_manager().await?;
+    assert_north(admit(base, generation).await);
+    assert!(matches!(
+        admit(base + 2, generation).await,
+        UdpSlowPathWork::Done
+    ));
+
+    cp.ebpf
+        .write()
+        .await
+        .inject_routing_fault(RoutingPushPhase::Root, 1)?;
+    assert_eq!(
+        cp.apply_runtime_config(config.clone(), Default::default(), &DrainTracker::new())
+            .await,
+        ReloadOutcome::Rejected,
+    );
+    let fenced = cp.ebpf.read().await.routing_policy_generation();
+    assert_eq!(fenced, generation + 1);
+    assert!(matches!(
+        admit(base, generation).await,
+        UdpSlowPathWork::Done
+    ));
+    assert_north(admit(base, fenced).await);
+
+    let context = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let candidates = || {
+        resolve_group_outbound_plan_for_target(&cp.group_manager.read(), "north", &context).targets
+    };
+    assert!(matches!(
+        candidates().as_slice(),
+        [target] if target.node.protocol() == NodeProtocol::Block
+    ));
+
+    config.groups.retain(|group| group.name != "north");
+    *cp.config.write().await = Arc::new(config);
+    cp.reload_group_manager().await?;
+    assert!(matches!(admit(base, fenced).await, UdpSlowPathWork::Done));
+    assert!(candidates().is_empty());
+    assert!(cp.udp_pool.is_empty());
+    Ok(())
+}
+
+/// Selection, runtime capability, pre-bind validation and publication evaluate the same bound targets.
+#[test]
+fn udp_capability_has_one_answer_per_target() {
+    use honk_config::node::{OutboundConfig, TrojanConfig};
+    use honk_outbound::group::{ScoreSelectionContext, SelectionNetwork};
+    use honk_outbound::runtime::OutboundRuntimeRegistry;
+
+    let leaf = canonical_socks5("leaf", "127.0.0.1", 1080, None);
+    let stream_only = canonical_socks5("stream-only", "127.0.0.2", 1080, None);
+    let trojan = |name: &str, host: &str, network: Option<String>| {
+        let mut node = Node {
+            name: name.into(),
+            address: format!("{host}:443"),
+            host: host.into(),
+            port: 443,
+            outbound: OutboundConfig::Trojan(TrojanConfig {
+                password: Some("secret".into()),
+                network,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        node.id = node.derive_id();
+        node
+    };
+    let tunnel = trojan("tunnel", "127.0.0.3", None);
+    let tcp_leaf = trojan("tcp-leaf", "127.0.0.4", Some("tcp".into()));
+    let chain_udp = Node::chain_from_nodes("chain-udp", &[&leaf, &tunnel]).unwrap();
+    let chain_tcp = Node::chain_from_nodes("chain-tcp", &[&leaf, &stream_only]).unwrap();
+    let cases = [
+        ("plain", leaf.id, None, true, Some(true)),
+        ("with-chain-udp", chain_udp.id, None, true, Some(true)),
+        ("with-chain-tcp", chain_tcp.id, None, false, Some(false)),
+        ("route-udp", leaf.id, Some("tunnel"), true, None),
+        ("route-tcp", leaf.id, Some("stream-only"), false, None),
+        ("unresolved", leaf.id, Some("missing"), false, None),
+        ("flat-tcp-leaf", tcp_leaf.id, None, false, Some(false)),
+        ("tcp-leaf-route", tcp_leaf.id, Some("tunnel"), true, None),
+    ];
+    let mut config = Config {
+        nodes: vec![leaf, stream_only, tunnel, tcp_leaf, chain_udp, chain_tcp],
+        groups: cases
+            .iter()
+            .map(|&(name, member, exit, _, _)| Group {
+                name: name.into(),
+                nodes: vec![member],
+                exit: exit.map(str::to_owned),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    let alive = Arc::new(crate::outbound::AliveDialerSet::new());
+    let manager = GroupManager::with_alive_set(&config.groups, &config.nodes, Some(alive.clone()));
+    let registry = OutboundRuntimeRegistry::build(&config.nodes).unwrap();
+    let snapshot = group_connectivity_snapshot(&config, &manager, &alive);
+    let tcp =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let udp = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+
+    for (index, &(name, _, _, expected, expected_probe)) in cases.iter().enumerate() {
+        let resolve = |context| {
+            resolve_outbound_plan_for_target(
+                &config,
+                &manager,
+                name,
+                context,
+                OutboundConstraint::Any,
+            )
+        };
+        let plan = resolve(&udp);
+        assert_eq!(!plan.targets.is_empty(), expected, "{name}: selection");
+        let outbound = OutboundIndex::UserBase as u8 + index as u8;
+        assert!(
+            snapshot.contains(&(outbound, ProbeDomain::DataUdp as u32, 0, expected)),
+            "{name}: publication"
+        );
+
+        let tcp = resolve(&tcp);
+        if let Some(target) = plan.targets.first() {
+            assert_eq!(plan.health_family, IpVersion::V4, "{name}: selected family");
+            assert_eq!(
+                Some(target.key()),
+                tcp.targets.first().map(|target| target.key()),
+                "{name}: captured target"
+            );
+        }
+        let bindable = tcp.targets.first().is_some_and(|target| {
+            manager.target_selectable(target, ProbeDomain::DataUdp, IpVersion::V4)
+        });
+        assert_eq!(bindable, expected, "{name}: pre-bind validation");
+        let (runtime, probe) = match tcp.targets.first() {
+            Some(target) => match target.route() {
+                Some(route) => (registry.route_runtime(route).unwrap().udp_capable(), None),
+                None => (
+                    registry.get(&target.node.id).unwrap().udp_capable,
+                    Some(registry.udp_capable(&target.node)),
+                ),
+            },
+            None => (false, None),
+        };
+        assert_eq!(runtime, expected, "{name}: runtime");
+        assert_eq!(probe, expected_probe, "{name}: configured-node probe");
+    }
 }
 
 #[tokio::test]
@@ -4746,11 +5490,7 @@ fn assert_connectivity_matches_reference(config: &Config) {
                 .or_insert(OutboundIndex::UserBase as u8 + index as u8);
         }
     }
-    assert_eq!(
-        build_outbound_id_map(config, std::convert::identity),
-        ids,
-        "{config:?}"
-    );
+    assert_eq!(build_outbound_id_map(config), ids, "{config:?}");
 
     let reached: std::collections::BTreeSet<uuid::Uuid> =
         leaves.iter().flatten().copied().collect();
@@ -4838,7 +5578,7 @@ fn connectivity_leaf_sets_are_unchanged_on_a_cyclic_config() {
     };
     let slot = OutboundIndex::UserBase as u8;
     assert_eq!(
-        build_outbound_id_map(&config, std::convert::identity),
+        build_outbound_id_map(&config),
         std::collections::HashMap::from([(a.id, slot), (b.id, slot)])
     );
     assert_connectivity_matches_reference(&config);

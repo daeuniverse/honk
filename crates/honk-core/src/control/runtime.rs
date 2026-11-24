@@ -147,6 +147,7 @@ pub(super) fn disable_nfqueue_for_startup(config: &mut Config, enabled: &mut boo
 pub(super) struct OutboundHealthPublisher {
     ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
     config: Arc<RwLock<Arc<Config>>>,
+    routing_plan: routing_matcher::SharedRoutingPlan,
     group_manager: SharedGroupManager,
     alive_set: Arc<AliveDialerSet>,
     /// Per-group bitmask of datapath slots last computed as not alive, so only
@@ -182,12 +183,14 @@ impl OutboundHealthPublisher {
     pub(super) fn new(
         ebpf: Arc<RwLock<Box<dyn EbpfBackend>>>,
         config: Arc<RwLock<Arc<Config>>>,
+        routing_plan: routing_matcher::SharedRoutingPlan,
         group_manager: SharedGroupManager,
         alive_set: Arc<AliveDialerSet>,
     ) -> Self {
         Self {
             ebpf,
             config,
+            routing_plan,
             group_manager,
             alive_set,
             dead_slots: parking_lot::Mutex::default(),
@@ -199,11 +202,18 @@ impl OutboundHealthPublisher {
         dependency: Option<uuid::Uuid>,
         raw_slot: Option<(u32, u32)>,
     ) {
-        // Reload takes these locks in the same order. Keep the config generation
-        // pinned while waiting so a queued edge cannot update a recycled slot.
+        if raw_slot.is_none() {
+            let manager = self.group_manager.read();
+            if !manager.has_exits() && !manager.has_udp_route_health() {
+                return;
+            }
+        }
+        // The same fence publishes the manager and the compiled numeric slots.
+        // Manager-only reloads may reorder config without changing those slots.
         let config = self.config.read().await;
         let mut backend = self.ebpf.write().await;
         let group_manager = self.group_manager.read().clone();
+        let routing_plan = self.routing_plan.read();
         let mut slots = self.dead_slots.lock();
         let (generation, dead_slots) = &mut *slots;
         // The held Weak keeps the old allocation, so its address cannot be reused.
@@ -211,15 +221,16 @@ impl OutboundHealthPublisher {
             *generation = Arc::downgrade(&*config);
             dead_slots.clear();
         }
-        for (index, group) in config.groups.iter().enumerate() {
+        for &(outbound_idx, ref name) in &routing_plan.plan.group_slots {
+            let Some(group) = group_manager.group(name) else {
+                continue;
+            };
             if dependency.is_some_and(|id| {
-                !group_manager.group_reaches_node(&group.name, id)
-                    && !group_manager
-                        .visit_route_health_dependencies(&group.name, |node| node == id)
+                !group_manager.group_reaches_node(name, id)
+                    && !group_manager.visit_route_health_dependencies(name, |node| node == id)
             }) {
                 continue;
             }
-            let outbound_idx = honk_ebpf_common::OutboundIndex::UserBase as u8 + index as u8;
             // IPv4 health can serve IPv6 targets, and UDP can inherit TCP or its sibling domain.
             for probe_domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
                 for ip_version in [IpVersion::V4, IpVersion::V6] {
@@ -544,6 +555,7 @@ impl ControlPlane {
             group_manager: self.group_manager.clone(),
             stats: self.stats.clone(),
             ebpf: self.ebpf.clone(),
+            active_routing_plan: self.active_routing_plan.clone(),
             udp_pool: self.udp_pool.clone(),
             #[cfg(feature = "ebpf")]
             pending_udp_verdicts: self.pending_udp_verdicts.clone(),

@@ -12,7 +12,7 @@ async fn refusals_name_the_request_field_or_setting_but_not_the_target() {
     let mut config = Config::default();
     config.nodes.extend([proxy, land, chain]);
     config.global.tcp_check_url = vec!["http://127.0.0.1:8080/PRIVATE".into()];
-    config.global.udp_check_dns = Vec::new();
+    config.global.udp_check_dns = Some(Vec::new());
     let state = state(config).await;
     let direct = state
         .config

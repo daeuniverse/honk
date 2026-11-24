@@ -766,8 +766,10 @@ pub fn validate_dns_probe_response(query: &[u8], response: &[u8]) -> anyhow::Res
         query,
         crate::dns::query::IngressProfile::Tcp,
     )?;
-    crate::dns::response::ResponseTemplate::check(&context, response)?;
-    anyhow::ensure!(response[3] & 15 == 0, "DNS response reports failure");
+    anyhow::ensure!(
+        crate::dns::response::checked_response_rcode(Some(&context), response)? == 0,
+        "DNS response reports failure"
+    );
     Ok(())
 }
 
@@ -776,9 +778,56 @@ pub fn validate_dns_probe_response(query: &[u8], response: &[u8]) -> anyhow::Res
 pub async fn udp_dns_probe(
     transport: &dyn honk_outbound::proxy::PacketTransport,
 ) -> anyhow::Result<honk_outbound::alive::ProbeMeasurement> {
+    udp_dns_probe_exchange(transport, UdpProbeSend::Ordinary).await
+}
+
+pub(crate) enum UdpProbeSend<'a> {
+    Ordinary,
+    NativeRecovery(&'a (dyn Fn() -> bool + Send + Sync)),
+    ComposedRecovery(&'a (dyn Fn() -> bool + Send + Sync)),
+}
+
+impl<'a> UdpProbeSend<'a> {
+    pub(crate) fn recovery(
+        dial: honk_outbound::proxy::DialRef<'_>,
+        terminal: uuid::Uuid,
+        current: &'a (dyn Fn() -> bool + Send + Sync),
+    ) -> Self {
+        match dial {
+            honk_outbound::proxy::DialRef::Node(id) if id == terminal => {
+                Self::NativeRecovery(current)
+            }
+            _ => Self::ComposedRecovery(current),
+        }
+    }
+}
+
+pub(crate) async fn udp_dns_probe_exchange(
+    transport: &dyn honk_outbound::proxy::PacketTransport,
+    send: UdpProbeSend<'_>,
+) -> anyhow::Result<honk_outbound::alive::ProbeMeasurement> {
     let query = dns_probe_query();
     let start = std::time::Instant::now();
-    transport.send_packet_confirmed(&query).await?;
+    match send {
+        UdpProbeSend::Ordinary => transport.send_packet_confirmed(&query).await?,
+        UdpProbeSend::ComposedRecovery(current) => {
+            transport.send_packet_checked(&query, current).await?
+        }
+        UdpProbeSend::NativeRecovery(current) => {
+            let mut pending = transport.send_packet_confirmed(&query);
+            // A private probe may drop its send just as on timeout. A native
+            // writer already holding the frame retains custody of that one send.
+            std::future::poll_fn(|cx| {
+                if !current() {
+                    return std::task::Poll::Ready(Err(
+                        honk_outbound::proxy::PacketRejection::Cancelled.into(),
+                    ));
+                }
+                pending.as_mut().poll(cx)
+            })
+            .await?;
+        }
+    }
     let mut response = vec![0; 65535];
     let (length, source) = transport.recv_packet(&mut response).await?;
     let relay = transport.relay_addr();

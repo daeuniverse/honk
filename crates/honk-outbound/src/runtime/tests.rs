@@ -345,11 +345,17 @@ async fn dns_fork_owns_sessions_but_preserves_dial_limits() {
 #[test]
 fn udp_capability_matrix() {
     let anytls = node("x", NodeProtocol::AnyTLS);
-    assert!((crate::descriptor::descriptor(anytls.protocol()).supports_udp)(&anytls));
+    assert!(crate::descriptor::carries_udp(
+        crate::descriptor::UdpPath::Own(&anytls)
+    ));
     let vmess = node("x", NodeProtocol::VMess);
-    assert!(!(crate::descriptor::descriptor(vmess.protocol()).supports_udp)(&vmess));
+    assert!(!crate::descriptor::carries_udp(
+        crate::descriptor::UdpPath::Own(&vmess)
+    ));
     let hy2 = node("x", NodeProtocol::Hysteria2);
-    assert!((crate::descriptor::descriptor(hy2.protocol()).supports_udp)(&hy2));
+    assert!(crate::descriptor::carries_udp(
+        crate::descriptor::UdpPath::Own(&hy2)
+    ));
 }
 
 #[test]

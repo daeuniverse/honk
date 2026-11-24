@@ -24,10 +24,17 @@ pub(crate) fn is_truncated(response: &[u8]) -> bool {
 
 /// Read the full twelve-bit RCODE without allocating a query or record list.
 pub(crate) fn response_rcode(wire: &[u8]) -> Result<u16, ResponseError> {
+    checked_response_rcode(None, wire)
+}
+
+pub(super) fn checked_response_rcode(
+    request: Option<&QueryContext>,
+    wire: &[u8],
+) -> Result<u16, ResponseError> {
     let mut code = read_u16(wire, 2)? & 0x000f;
     let mut seen_opt = false;
     let mut invalid = false;
-    visit_message(None, wire, |record, fields, root_owner| {
+    visit_message(request, wire, |record, fields, root_owner| {
         if read_u16(wire, fields) != Ok(41) {
             return;
         }

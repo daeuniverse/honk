@@ -18,7 +18,8 @@ global {
 
     tcp_check_url: 'https://www.gstatic.com/generate_204'
     tcp_check_http_method: HEAD
-    udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
+    # List targets explicitly to authorize routed UDP recovery.
+    # udp_check_dns: 'dns.google:53', '8.8.8.8', '2001:4860:4860::8888'
     check_interval: 30s
     check_tolerance: 50ms
 
@@ -201,7 +202,9 @@ Sets the comma-separated DNS targets for UDP health checks. Bare IPv4/IPv6, `[IP
 
 Malformed brackets or ports fail validation with a located diagnostic.
 
-The first IP literal wins over domain entries; otherwise the first domain is resolved. Resolution and Score use the same decoded host and port, and a domain keeps its identity after resolution.
+For ordinary node checks, the first IP literal wins over domain entries. Otherwise the first domain is resolved. Resolution and Score use the same decoded host and port, and a domain keeps its identity after resolution. Omitting the setting uses the defaults shown above.
+
+For [routed UDP recovery](./groups.md#exit-liveness), list the DNS servers you authorize honk to query over the affected chain or group exit. An omitted or empty list authorizes no recovery query. Recovery prefers the first configured IP literal in the affected health address family. Otherwise it looks for a same-family address for a configured hostname using the configured DNS service, without bootstrap DNS fallback. The destination port must be allowed by the hop that frames UDP.
 
 ```dae
 global {
@@ -346,7 +349,7 @@ honk captures these inputs at startup. It rejects a reload that changes their ef
 - `check_interval`.
 - The first `tcp_check_url`, including its fallback, path, and query text. A missing or empty first value disables HTTP probing; later values do not affect this comparison.
 - `tcp_check_http_method` while HTTP probing is enabled. Empty and `HEAD` are equivalent.
-- The selected `udp_check_dns` target: trim and ignore empty entries, prefer the first IP literal anywhere in the list, otherwise use the first domain, otherwise `8.8.8.8:53`. Admission compares configured address/domain and port, without resolving DNS. Domains compare case-insensitively and ignore one trailing dot, so `dns.example:53` and `DNS.EXAMPLE.:53` are the same target. Changes to unselected entries remain admissible.
+- The effective `udp_check_dns` target for ordinary node probes. Selection trims whitespace, ignores empty entries and takes the first IP literal, the first domain, or ultimately `8.8.8.8:53`. Admission compares configured addresses or domain names and ports without resolving DNS. Domain names compare case-insensitively and ignore one trailing dot, so `dns.example:53` and `DNS.EXAMPLE.:53` are the same target. A reload that preserves this effective target can change the explicit list used for route recovery.
 - Switching `tls_implementation` between native TLS and uTLS. The `utls` comparison is case-insensitive.
 
 DAE `check_tolerance` still updates URLTest group tolerances on reload. Group-specific check URLs and direct checks retain their existing live-update paths. Reloading `utls_imitate` stores the compatibility value but does not change the fingerprint.

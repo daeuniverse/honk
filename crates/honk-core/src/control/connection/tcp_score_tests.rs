@@ -389,13 +389,7 @@ fn unpack_tcp_score_plan_deduplicates_shared_leaf_metadata() {
     let manager = GroupManager::new(&config.groups, &config.nodes);
     let context = tcp_score_context("192.0.2.1:443".parse().unwrap(), None, IpVersion::V4);
     let resolve = |name| {
-        resolve_outbound_plan_for_target::<OwnedTarget>(
-            &config,
-            &manager,
-            name,
-            &context,
-            OutboundConstraint::Any,
-        )
+        resolve_outbound_plan_for_target(&config, &manager, name, &context, OutboundConstraint::Any)
     };
     let mut plan = resolve("outer");
     plan.mode = SelectionPlanMode::ColdUrlTest;

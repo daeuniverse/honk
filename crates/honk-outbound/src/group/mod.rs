@@ -115,8 +115,8 @@ pub struct ScoreSelectionEntry<'a> {
     pub feedback: Option<ScoreAttempt>,
     /// Selected groups from outermost to innermost, followed by the selected member name.
     pub selection_chain: Vec<String>,
-    /// Owners of group-valued final edges traversed by this entry, valid only
-    /// with the manager that produced the plan. Display chains are not authority.
+    /// Owners of traversed group-valued finals and the node-valued final of a routed UDP plan.
+    /// Only the manager that selected this path can validate its final edges.
     pub final_owners: Vec<String>,
 }
 
@@ -300,6 +300,8 @@ fn removed_unique_candidates(
 struct ManagedGroup {
     group: Group,
     routes: bool,
+    udp_chain: bool,
+    udp_root: Option<Arc<str>>,
 }
 
 impl std::borrow::Borrow<Group> for ManagedGroup {
@@ -340,8 +342,10 @@ pub struct GroupManager {
     score_state: Arc<ScorePolicyState>,
     score_authority: Arc<score::ScoreAuthority>,
     transport_quality: RwLock<Vec<score::TransportQualitySource>>,
-    /// Exit edges and chain hops, only when some group has an `exit`.
+    /// Exit edges, only when some group has an `exit`.
     exits: Option<Box<exit::Exits>>,
+    /// Exact UDP health also applies to these nodes when dialed independently.
+    udp_evidence_nodes: Box<[uuid::Uuid]>,
 }
 
 impl GroupManager {
@@ -387,6 +391,8 @@ impl GroupManager {
                 let entry = ManagedGroup {
                     group: group.clone(),
                     routes: false,
+                    udp_chain: false,
+                    udp_root: None,
                 };
                 (group.name.clone(), entry)
             })
@@ -401,9 +407,13 @@ impl GroupManager {
             }
         }
         let exits = exit::Exits::build(groups, nodes, &mut managed);
-        let selector_choice = RwLock::new(SelectorStorage::new(exits.is_some()));
-        Self {
+        let has_chains = nodes
+            .iter()
+            .any(|node| node.resolved_chain_hops().is_some());
+        let selector_choice = RwLock::new(SelectorStorage::new(exits.is_some() || has_chains));
+        let mut manager = Self {
             exits,
+            udp_evidence_nodes: Box::default(),
             groups: managed,
             nodes: nodes.iter().map(|n| (n.id, n.clone())).collect(),
             node_order: nodes.iter().map(|node| node.id).collect(),
@@ -427,7 +437,45 @@ impl GroupManager {
             score_state,
             score_authority: Arc::new(score::ScoreAuthority),
             transport_quality: RwLock::new(Vec::new()),
+        };
+        if has_chains {
+            for group in groups {
+                let udp_chain = manager.any_udp_leaf_in_group(&group.name, |node| {
+                    node.resolved_chain_hops().is_some() && manager.node_carries_udp(node)
+                });
+                if let Some(entry) = manager.groups.get_mut(&group.name) {
+                    entry.udp_chain = udp_chain;
+                }
+            }
         }
+        if has_chains || manager.has_exits() {
+            for entry in manager
+                .groups
+                .values_mut()
+                .filter(|entry| entry.routes || entry.udp_chain)
+            {
+                entry.udp_root = Some(Arc::from(entry.group.name.as_str()));
+            }
+            let mut dependencies = HashSet::new();
+            for node in nodes {
+                if let Some(hops) = node.resolved_chain_hops()
+                    && manager.node_carries_udp(node)
+                {
+                    dependencies.insert(node.id);
+                    dependencies.extend(hops.iter().copied());
+                }
+            }
+            for group in manager.groups.values().filter(|entry| entry.routes) {
+                manager.visit_route_health_dependencies(&group.group.name, |id| {
+                    dependencies.insert(id);
+                    false
+                });
+            }
+            let mut dependencies: Vec<_> = dependencies.into_iter().collect();
+            dependencies.sort_unstable();
+            manager.udp_evidence_nodes = dependencies.into_boxed_slice();
+        }
+        manager
     }
 
     /// Select a single node from a group (TCP, IPv4).
@@ -679,8 +727,24 @@ impl GroupManager {
             depth,
             SelectionEffects::Peek,
         );
-        if routes && let Some(selected) = self.selector_member(group, SelectionNetwork::Udp) {
-            candidates.retain(|candidate| Self::same_member(selected, candidate.member()));
+        if routes {
+            if let Some(selected) = self.selector_member(group, SelectionNetwork::Udp) {
+                candidates.retain(|candidate| Self::same_member(selected, candidate.member()));
+            }
+            candidates.retain(|candidate| {
+                let path = candidate
+                    .selection_chain
+                    .split_last()
+                    .map_or(&[][..], |(_, path)| path);
+                self.udp_warm_dials_leaf(
+                    candidate.node,
+                    path.iter()
+                        .rev()
+                        .copied()
+                        .chain(std::iter::once(group.name.as_str()))
+                        .chain(visited.iter().rev().copied()),
+                )
+            });
         }
         let candidates = self.filter_alive_candidates(
             candidates,
@@ -688,7 +752,10 @@ impl GroupManager {
             ipver,
             group,
             visited,
-            routes,
+            score::selection::ScoreSelectionRules {
+                routes,
+                ..Default::default()
+            },
         );
         if candidates.is_empty() {
             return match self.final_member(group) {
@@ -696,12 +763,10 @@ impl GroupManager {
                     let available =
                         self.is_node_selectable_for_domain(node.id, ProbeDomain::DataUdp, ipver)
                             && (!routes
-                                || self.leaf_route_available(
+                                || self.udp_warm_dials_leaf(
                                     node,
-                                    group,
-                                    visited,
-                                    ProbeDomain::DataUdp,
-                                    Some(ipver),
+                                    std::iter::once(group.name.as_str())
+                                        .chain(visited.iter().rev().copied()),
                                 ));
                     available.then_some(node).into_iter().collect()
                 }

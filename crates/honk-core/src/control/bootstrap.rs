@@ -96,7 +96,7 @@ impl ControlPlane {
         // URL tests still measure their requested URL.
         let direct_target = direct_check_addr(&config.global.bootstrap_resolver);
         alive_set.set_direct_check_addr(direct_target.clone());
-        let mut reachable = build_outbound_id_map(&config, OutboundHealthDependency::leaf);
+        let mut reachable = build_outbound_id_map(&config);
         let (added, _) = alive_set.sync_registrations(health_registrations(&config, &reachable));
         info!(
             "Registered {}/{} nodes for health check ({} skipped: not in any group)",
@@ -117,7 +117,7 @@ impl ControlPlane {
         {
             let map = outbound_id_map.clone();
             alive_set.set_outbound_resolver(Some(Arc::new(move |node_id: uuid::Uuid| {
-                map.read().get(&node_id).map(|entry| entry.outbound)
+                map.read().get(&node_id).copied()
             })));
         }
         // Custom-URL member resolution: a group's members are probed via
@@ -187,13 +187,21 @@ impl ControlPlane {
         let initial_routing_plan = Arc::new(Self::compile_routing_plan(&config, &router)?);
         ebpf.publish_routing_plan(&initial_routing_plan, &[])
             .map_err(|error| anyhow::anyhow!("publish initial routing policy: {error:#}"))?;
-        pinned_groups.publish_route_health();
-        let snapshot = initial_route_connectivity(&config, &pinned_groups);
+        pinned_groups.publish_route_health_with_udp(config.global.udp_check_dns.as_deref());
+        let snapshot = initial_route_connectivity(&initial_routing_plan, &pinned_groups);
         publish_group_connectivity(ebpf.as_mut(), &snapshot)?;
+        let initial_generation = ebpf.routing_policy_generation();
         let ebpf_arc = Arc::new(RwLock::new(ebpf));
         let router_arc = Arc::new(RwLock::new(router));
         let interrupt_groups = config.groups.clone();
-        let config_arc = Arc::new(RwLock::new(Arc::new(config)));
+        let config = Arc::new(config);
+        let initial_routing_plan = routing_matcher::ActiveRoutingPlan::new(
+            initial_routing_plan,
+            &pinned_groups,
+            initial_generation,
+            &config,
+        );
+        let config_arc = Arc::new(RwLock::new(config));
         let initial_runtime =
             crate::dns::runtime::DnsRuntime::new(crate::dns::runtime::DnsRuntimeParts {
                 generation: crate::dns::runtime::RuntimeGeneration::new(0),
@@ -392,6 +400,14 @@ impl ControlPlane {
                 pool.purge_node(node_addr.as_deref(), generation, node_id);
             },
         )));
+        let routed_pool = Arc::downgrade(&self.udp_pool);
+        self.alive_set.set_routed_udp_death_callback(Some(Box::new(
+            move |node, domain, family, role| {
+                if let Some(pool) = routed_pool.upgrade() {
+                    pool.remove_by_routed_hop(node, domain, family, role);
+                }
+            },
+        )));
     }
 
     /// Makes the engine record into `native`; runs before the engine serves traffic.
@@ -414,7 +430,7 @@ impl ControlPlane {
             provider.current_generation().get(),
             &*self.router.read().await,
             &config,
-            &self.active_routing_plan.read(),
+            &self.active_routing_plan.read().plan,
         );
         if let Some(dictionary) = dictionary {
             self.ebpf

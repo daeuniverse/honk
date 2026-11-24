@@ -365,6 +365,56 @@ async fn a_large_group_is_probed_by_member_subset_and_a_child_group_by_its_selec
 }
 
 #[tokio::test]
+async fn native_udp_probe_cannot_measure_a_tcp_only_leaf_via_group_exit() {
+    use honk_outbound::group::ScoreSelectionContext;
+
+    let mut leaf = Node::from_share_link("trojan://entry@127.0.0.1:1080#front").unwrap();
+    leaf.trojan_mut().unwrap().network = Some("tcp".into());
+    leaf.id = leaf.derive_id();
+    let exit = Node::from_share_link("trojan://exit@127.0.0.1:443#land").unwrap();
+    let mut config = Config {
+        groups: [
+            json!({"name":"child","exit":"land","nodes":[leaf.id]}),
+            json!({"name":"parent","groups":["child"]}),
+        ]
+        .into_iter()
+        .map(|group| serde_json::from_value(group).unwrap())
+        .collect(),
+        nodes: vec![leaf, exit],
+        ..Default::default()
+    };
+    config.global.udp_check_dns = Some(vec!["127.0.0.1:53".into()]);
+    let state = state(config).await;
+    {
+        let manager = state.group_manager.read();
+        let routes = manager.selection_plan_for_target(
+            "child",
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::Udp,
+                ProbeDomain::DnsUdp,
+                IpVersion::V4,
+            ),
+        );
+        assert!(routes.entries[0].route.is_some());
+    }
+    let id = state.observation.core.catalog.snapshot().groups["parent"].clone();
+    let input = request(
+        json!({"type":"group","group_id":id}),
+        "dns",
+        json!(["udp"]),
+        "ipv4",
+    );
+    let plan = capture(&state, serde_json::from_value(input).unwrap())
+        .await
+        .unwrap();
+    assert!(plan.candidates.is_empty());
+    assert_eq!(plan.result.results.len(), 1);
+    let row = &plan.result.results[0];
+    assert_eq!(row.error, Some("no_eligible_leaf"));
+    assert!(!row.health_updated);
+}
+
+#[tokio::test]
 async fn group_probe_health_keeps_inherited_targets_and_expanded_leaf_scope() {
     let leaf = honk_config::config::DIRECT_NODE_ID;
     for custom_url in [false, true] {
@@ -530,7 +580,7 @@ async fn measure_dns_exchange(bind: &str, host: &str, family: &str) {
         udp.send_to(&query[..length], peer).await.unwrap();
     });
     let mut config = Config::default();
-    config.global.udp_check_dns = vec![format!("{host}:{}", address.port())];
+    config.global.udp_check_dns = Some(vec![format!("{host}:{}", address.port())]);
     let state = state(config).await;
     let input = request(
         json!({"type":"node","node_id":honk_config::config::DIRECT_NODE_ID.to_string()}),
@@ -603,7 +653,7 @@ async fn http_and_tcp_dns_probes_of_a_chain_cross_every_hop() {
     let mut config = Config::default();
     config.nodes.extend(nodes);
     config.global.tcp_check_url = vec![format!("http://{http_addr}/check")];
-    config.global.udp_check_dns = vec![dns_addr.to_string()];
+    config.global.udp_check_dns = Some(vec![dns_addr.to_string()]);
     let state = state(config).await;
 
     for kind in ["http", "dns"] {

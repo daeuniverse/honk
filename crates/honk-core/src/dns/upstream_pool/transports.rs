@@ -199,8 +199,8 @@ impl PooledTransport {
             Self::Tcp(transport) => transport.exchange_routed(raw_query, feedback, route).await,
             Self::Dot(transport) => transport.exchange_routed(raw_query, feedback, route).await,
             Self::Doh(transport) => transport.exchange_routed(raw_query, feedback, route).await,
-            Self::Doq(transport) => transport.exchange(raw_query, feedback).await,
-            Self::Doh3(transport) => transport.exchange(raw_query, feedback).await,
+            Self::Doq(transport) => transport.exchange_routed(raw_query, feedback, route).await,
+            Self::Doh3(transport) => transport.exchange_routed(raw_query, feedback, route).await,
         }
     }
 }

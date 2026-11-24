@@ -26,7 +26,8 @@ fn chain_runtime_holds_the_hops_built_in_the_same_pass() {
     let generation = OutboundRuntimeRegistry::build(&nodes).unwrap();
     assert_holds_hops_of(&generation, &nodes[0], &[&nodes[1], &nodes[2]]);
     let runtime = generation.get(&nodes[0].id).unwrap();
-    assert!(!runtime.udp_capable);
+    // A Trojan exit carries UDP over the stream to it.
+    assert!(runtime.udp_capable);
     assert!(matches!(&runtime.runtime, ProtocolRuntime::Chain(_)));
     assert!(
         generation
@@ -35,6 +36,114 @@ fn chain_runtime_holds_the_hops_built_in_the_same_pass() {
             .chain_hops()
             .is_empty()
     );
+}
+
+#[test]
+fn composed_udp_requires_the_entry_to_support_tunneled_dial() {
+    use crate::alive::{IpVersion, ProbeDomain};
+    use crate::group::{GroupManager, ScoreSelectionContext, SelectionNetwork};
+    use crate::proxy::{DialFailureScope, DialRef, ProxyRegistry, dial_failure_scope};
+    use honk_config::group::Group;
+
+    let cases = [
+        ("socks5://127.0.0.1:1080#socks", true),
+        ("anytls://secret@127.0.0.1:443#anytls", false),
+        ("hysteria2://auth@127.0.0.1:443#hy2", false),
+        ("trojan://secret@entry.example:443?ech=1#ech", false),
+        (
+            "trojan://secret@127.0.0.1:443?security=tls&sni=entry.example&type=xhttp&path=%2Fx#xhttp",
+            false,
+        ),
+        #[cfg(feature = "rprx")]
+        (
+            "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?security=tls&flow=xtls-rprx-vision#vision",
+            false,
+        ),
+        #[cfg(feature = "rprx")]
+        (
+            "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?mux=xray#mux",
+            false,
+        ),
+        #[cfg(feature = "rprx")]
+        (
+            "vless://00000000-0000-4000-8000-000000000001@127.0.0.1:443?encryption=mlkem768x25519plus.native.1rtt.AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA#encryption",
+            false,
+        ),
+    ];
+    let tcp =
+        ScoreSelectionContext::aggregate(SelectionNetwork::Tcp, ProbeDomain::Tcp, IpVersion::V4);
+    let udp = ScoreSelectionContext::aggregate(
+        SelectionNetwork::Udp,
+        ProbeDomain::DataUdp,
+        IpVersion::V4,
+    );
+    let proxy = ProxyRegistry::default_resolver().unwrap();
+    for (link, capable) in cases {
+        let front = Node::from_share_link(link).unwrap();
+        let land = Node::from_share_link("trojan://secret@127.0.0.1:444#land").unwrap();
+        let via = Node::chain_from_nodes("via", &[&front, &land]).unwrap();
+        let group = |name: &str, node: &Node, exit: Option<&Node>| Group {
+            name: name.into(),
+            nodes: vec![node.id],
+            exit: exit.map(|node| node.name.clone()),
+            ..Default::default()
+        };
+        let groups = [
+            group("bare", &front, None),
+            group("configured", &via, None),
+            group("route", &front, Some(&land)),
+            group("collapsed", &land, Some(&land)),
+        ];
+        let (front_id, via_id, land_id) = (front.id, via.id, land.id);
+        let nodes = [front, via, land];
+        let generation = OutboundRuntimeRegistry::build(&nodes).unwrap();
+        let manager = GroupManager::new(&groups, &nodes);
+        let eligible = |name, context| manager.selection_plan_for_target(name, context).entries;
+
+        assert_eq!(eligible("bare", &udp)[0].node.id, front_id);
+        let collapsed = eligible("collapsed", &udp);
+        assert_eq!(collapsed[0].node.id, land_id);
+        assert!(collapsed[0].route.is_none());
+        assert_eq!(eligible("configured", &tcp)[0].node.id, via_id);
+        let routed_tcp = eligible("route", &tcp);
+        let route = routed_tcp[0].route.as_deref().unwrap();
+        assert_eq!(route.hops(), [front_id, land_id]);
+        assert_eq!(generation.udp_capable(&nodes[1]), capable, "{link}");
+        assert_eq!(
+            generation.route_runtime(route).unwrap().udp_capable(),
+            capable,
+            "{link}"
+        );
+        assert_eq!(!eligible("configured", &udp).is_empty(), capable, "{link}");
+        assert_eq!(!eligible("route", &udp).is_empty(), capable, "{link}");
+        assert_eq!(
+            manager.routed_group_available("route", ProbeDomain::DataUdp, IpVersion::V4),
+            Some(capable),
+            "{link}"
+        );
+
+        let (_, framing) = proxy.udp_probe_target(&generation, &nodes[0]).unwrap();
+        assert_eq!(framing.id, front_id);
+        let bound = proxy
+            .udp_framing_node(&generation, DialRef::Node(land_id))
+            .unwrap();
+        assert_eq!(bound.id, land_id);
+        for dial in [DialRef::Node(via_id), DialRef::Route(route)] {
+            match proxy.udp_framing_node(&generation, dial) {
+                Ok(framing) => {
+                    assert!(capable, "{link}");
+                    assert_eq!(framing.id, land_id);
+                }
+                Err(error) => {
+                    assert!(!capable, "{link}: {error:#}");
+                    assert_eq!(
+                        dial_failure_scope(error.as_ref()),
+                        DialFailureScope::LocalRejection
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

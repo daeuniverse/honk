@@ -356,6 +356,7 @@ impl WarmRetention {
 pub struct NodeRuntime {
     /// Immutable node config for this generation.
     pub node: Arc<Node>,
+    /// Intrinsic packet support of this node or its bound hop sequence.
     pub udp_capable: bool,
     pub runtime: ProtocolRuntime,
     /// Transport-owned physical H2 sessions, independent of protocol UDP/mux state.
@@ -410,7 +411,12 @@ impl NodeRuntime {
         let build = || {
             Arc::new(Self {
                 node: Arc::new(node.clone()),
-                udp_capable: (crate::descriptor::descriptor(node.protocol()).supports_udp)(node),
+                udp_capable: match hops.as_deref() {
+                    Some(hops) => crate::descriptor::tunneled_hops_carry_udp(hops, |hop| {
+                        Some(hop.node.as_ref())
+                    }),
+                    None => crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node)),
+                },
                 runtime: match hops {
                     Some(hops) => ProtocolRuntime::Chain(ChainRuntime(hops)),
                     None => crate::descriptor::descriptor(node.protocol())
@@ -872,7 +878,14 @@ impl OutboundRuntimeRegistry {
         &self,
         node: &Node,
     ) -> Result<Arc<NodeRuntime>, RuntimeRegistryError> {
-        self.get(&node.id)
+        self.admitted_chain_runtime_ref(node).cloned()
+    }
+
+    pub(crate) fn admitted_chain_runtime_ref(
+        &self,
+        node: &Node,
+    ) -> Result<&Arc<NodeRuntime>, RuntimeRegistryError> {
+        self.get_ref(&node.id)
             .filter(|runtime| {
                 matches!(&runtime.runtime, ProtocolRuntime::Chain(_))
                     && runtime.node.resolved_chain_hops() == node.resolved_chain_hops()
@@ -1183,6 +1196,15 @@ impl OutboundRuntimeRegistry {
                 .iter()
                 .zip(prior)
                 .all(|(current, captured)| Arc::ptr_eq(current, captured))
+    }
+
+    /// Intrinsic packet support from the bound chain or standalone node.
+    /// The proxy registry checks executable handlers at dial admission.
+    pub fn udp_capable(&self, node: &Node) -> bool {
+        match self.nodes.get(&node.id) {
+            Some(runtime) => runtime.udp_capable,
+            None => crate::descriptor::carries_udp(crate::descriptor::UdpPath::Own(node)),
+        }
     }
 
     /// The runtime that dials `route` over this generation's hop runtimes,

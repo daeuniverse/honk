@@ -1,11 +1,7 @@
-use std::alloc::System;
-
-use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
+use stats_alloc::Region;
 
 use super::*;
-
-#[global_allocator]
-static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+use crate::test_support::ALLOCATOR as GLOBAL;
 
 const FRAME_ALLOCATION_CHILD: &str = "HONK_ENCRYPTION_FRAME_ALLOCATION_CHILD";
 

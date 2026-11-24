@@ -1,4 +1,5 @@
 use super::*;
+use honk_config::node::Node;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn candidate(name: &str) -> Node {
@@ -20,7 +21,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
     let permits = Arc::new(tokio::sync::Semaphore::new(1));
     let acquired = Arc::new(tokio::sync::Notify::new());
     let errors = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let permits = Arc::clone(&permits);
         let acquired = Arc::clone(&acquired);
         Arc::new(move |_, _| {
@@ -38,7 +39,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::Relaxed);
             })
         },
@@ -75,7 +76,7 @@ async fn udp_preparation_deadline_drains_pending_candidate() {
 async fn udp_preparation_deadline_prevents_future_stagger_start() {
     let starts = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let starts = Arc::clone(&starts);
         Arc::new(move |_, _| {
             starts.fetch_add(1, Ordering::SeqCst);
@@ -87,7 +88,7 @@ async fn udp_preparation_deadline_prevents_future_stagger_start() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -117,7 +118,7 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
     let permits = Arc::new(tokio::sync::Semaphore::new(3));
     let starts = Arc::new(AtomicUsize::new(0));
     let cancellations = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let permits = Arc::clone(&permits);
         let starts = Arc::clone(&starts);
         Arc::new(move |_, _| {
@@ -133,7 +134,7 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
+        on_dial_error: Arc::new(|_, _| panic!("cancellation is health-neutral")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: {
@@ -183,7 +184,7 @@ async fn udp_preparation_deadline_drains_three_pending_candidates() {
 async fn udp_policy_preflight_does_not_prepare_or_report_failure() {
     let starts = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let starts = Arc::clone(&starts);
         Arc::new(move |_, _| {
             starts.fetch_add(1, Ordering::SeqCst);
@@ -195,7 +196,7 @@ async fn udp_policy_preflight_does_not_prepare_or_report_failure() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -223,7 +224,7 @@ async fn udp_policy_preflight_does_not_prepare_or_report_failure() {
 async fn completed_udp_policy_rejection_does_not_fail_over_or_report_failure() {
     let starts = Arc::new(AtomicUsize::new(0));
     let errors = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let starts = Arc::clone(&starts);
         Arc::new(move |index, _| {
             starts.fetch_add(1, Ordering::SeqCst);
@@ -241,7 +242,7 @@ async fn completed_udp_policy_rejection_does_not_fail_over_or_report_failure() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = Arc::clone(&errors);
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, Ordering::SeqCst);
             })
         },
@@ -267,7 +268,7 @@ async fn completed_udp_policy_rejection_does_not_fail_over_or_report_failure() {
 
 #[tokio::test(start_paused = true)]
 async fn unscheduled_policy_denial_does_not_veto_an_earlier_winner() {
-    let prepare: UdpPrepare<()> = Arc::new(|index, _| {
+    let prepare: UdpPrepare<(), Node> = Arc::new(|index, _| {
         assert_eq!(index, 0, "the later candidate must not start");
         Box::pin(async {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -275,9 +276,9 @@ async fn unscheduled_policy_denial_does_not_veto_an_earlier_winner() {
         })
     });
     let callbacks = UdpStaggerCallbacks {
-        allows_target: Arc::new(|node| node.name != "later-denied"),
+        allows_target: Arc::new(|node: &Node| node.name != "later-denied"),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("no candidate failed")),
+        on_dial_error: Arc::new(|_, _| panic!("no candidate failed")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: Arc::new(|| {}),
@@ -333,7 +334,7 @@ async fn udp_disabled_capability_falls_back_but_explicit_policy_is_terminal() {
             .unwrap(),
         );
         let target = "127.0.0.1:443".parse().unwrap();
-        let prepare: UdpPrepare<()> = Arc::new(move |_, node| {
+        let prepare: UdpPrepare<(), Node> = Arc::new(move |_, node| {
             let registry = registry.clone();
             let generation = generation.clone();
             Box::pin(async move {
@@ -351,13 +352,13 @@ async fn udp_disabled_capability_falls_back_but_explicit_policy_is_terminal() {
         });
         let errors = Arc::new(AtomicUsize::new(0));
         let callbacks = UdpStaggerCallbacks {
-            allows_target: Arc::new(move |node| {
+            allows_target: Arc::new(move |node: &Node| {
                 honk_outbound::descriptor::udp_target_allowed(node, 443)
             }),
             is_eligible: Arc::new(|_| true),
             on_dial_error: {
                 let errors = errors.clone();
-                Arc::new(move |_| {
+                Arc::new(move |_, _| {
                     errors.fetch_add(1, Ordering::SeqCst);
                 })
             },
@@ -394,7 +395,7 @@ async fn unpolled_loser_is_cancelled_without_vetoing_ready_winner() {
     let released = Arc::new(parking_lot::Mutex::new(Some(released)));
     let loser_polls = Arc::new(AtomicUsize::new(0));
     let cancellations = Arc::new(AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> = {
+    let prepare: UdpPrepare<(), Node> = {
         let loser_polls = Arc::clone(&loser_polls);
         Arc::new(move |index, _| {
             if index == 0 {
@@ -414,14 +415,14 @@ async fn unpolled_loser_is_cancelled_without_vetoing_ready_winner() {
     };
     let callbacks = UdpStaggerCallbacks {
         // A wakes while the loser is admitted, before it is pushed.
-        allows_target: Arc::new(move |node| {
+        allows_target: Arc::new(move |node: &Node| {
             if node.name == "loser" {
                 let _ = release.lock().take().unwrap().send(());
             }
             true
         }),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("cancellation is health-neutral")),
+        on_dial_error: Arc::new(|_, _| panic!("cancellation is health-neutral")),
         on_attempt: Arc::new(|| {}),
         on_winner: Arc::new(|| {}),
         on_cancellation: {

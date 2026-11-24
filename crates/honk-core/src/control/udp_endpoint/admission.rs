@@ -189,7 +189,7 @@ pub(super) struct InitializingEndpoint {
     /// Finalized transport winner for this generation. Bound only after
     /// speculative preparation has drained, so a death callback can
     /// generation-safely retire the entry before `commit_ready` publishes Ready.
-    pub(super) selected_node: Mutex<Option<uuid::Uuid>>,
+    selected_node: Mutex<Option<(uuid::Uuid, Option<Arc<UdpTrafficEvidence>>)>>,
     pub(super) cancelled: AtomicBool,
     pub(super) cancel_notify: Notify,
     #[cfg(feature = "native-api")]
@@ -205,8 +205,8 @@ impl InitializingEndpoint {
         self.endpoint_permit.lock().take()
     }
 
-    pub(super) fn bind_selected_node(&self, node_id: uuid::Uuid) {
-        *self.selected_node.lock() = Some(node_id);
+    fn bind_selected_node(&self, node_id: uuid::Uuid, evidence: Option<Arc<UdpTrafficEvidence>>) {
+        *self.selected_node.lock() = Some((node_id, evidence));
     }
 
     pub(super) fn clear_selected_node(&self) {
@@ -214,7 +214,14 @@ impl InitializingEndpoint {
     }
 
     pub(super) fn selected_node_is(&self, node_id: uuid::Uuid) -> bool {
-        *self.selected_node.lock() == Some(node_id)
+        self.selected_node
+            .lock()
+            .as_ref()
+            .is_some_and(|(id, _)| *id == node_id)
+    }
+
+    pub(super) fn evidence(&self) -> Option<Arc<UdpTrafficEvidence>> {
+        self.selected_node.lock().as_ref()?.1.clone()
     }
 
     pub(super) fn cancel(&self) {
@@ -464,7 +471,11 @@ impl UdpInitLease {
     /// generation after speculative preparation drains and before endpoint
     /// setup. Returns false when a newer generation or death/cancel path
     /// retired this entry.
-    pub(in crate::control) fn bind_selected_node(&self, node_id: uuid::Uuid) -> bool {
+    pub(in crate::control) fn bind_selected(
+        &self,
+        node_id: uuid::Uuid,
+        evidence: Option<Arc<UdpTrafficEvidence>>,
+    ) -> bool {
         let _binding_gate = self.pool.node_binding_gate.lock();
         let Some(entry) = self.pool.endpoints.get(&self.key) else {
             return false;
@@ -474,7 +485,7 @@ impl UdpInitLease {
                 if initializing.generation == self.generation
                     && initializing.owner == self.owner =>
             {
-                initializing.bind_selected_node(node_id);
+                initializing.bind_selected_node(node_id, evidence);
                 true
             }
             _ => false,

@@ -367,7 +367,11 @@ impl UpstreamPool {
             {
                 Ok(transport) => {
                     transport
-                        .exchange(raw_query, business, route.route_exchange(route_failures))
+                        .exchange(
+                            raw_query,
+                            business,
+                            route.route_exchange(entry.protocol, route_failures),
+                        )
                         .await
                 }
                 Err(error) => {

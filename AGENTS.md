@@ -118,7 +118,7 @@ The root `rust-toolchain.toml` pins the host compiler; `crates/honk-ebpf/rust-to
 | `cycle`                                                                         | `clean-all` + `build-core`                                                                                                                                                                                                                   |
 | `watch-core`                                                                    | `cargo watch` rebuild                                                                                                                                                                                                                        |
 
-`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the two public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
+`outbound-ci` runs all-target Clippy and crate test suites in separate `rprx`-off and `rprx`-on invocations; the config suite runs once. The weekly/manual `public-vless-loopback` lane separately runs the three public ignored `vless_udp` official-peer cases, the ignored official Vision uplink Direct case and the ignored shared-source sing-box matrix with pinned executables, not the legacy external-mask test.
 
 ## Current validation guidance
 
@@ -265,7 +265,7 @@ Each item is an invariant named in this file for the High risk class and `CONTRI
   - **Datapath admission:** admission opens after every internal hook, listener and queue is ready, and closes before listener teardown.
   - **NFQUEUE readiness and ownership**, **Fragmented LAN UDP53**, **Token-checked terminal state**, **NFQUEUE lifecycle.**
   - **must/block are final:** Clash mode override leaves `block` and `must` results in force.
-  - **Fail-closed on dead outbounds** and **group-OR connectivity pushes** with the sole-TCP-leaf exception.
+  - **Fail-closed on dead outbounds** and **group connectivity** using ordinary group-OR or routed eligibility, with the sole-TCP-leaf exception.
   - **Internal traffic is never proxied; broadcast/multicast passes through eBPF.**
   - **Reserved outbound indices:** `0 Direct | 1 Block | 2+ user groups | 0xFC MustRules | 0xFD ControlPlaneRouting | 0xFE OR | 0xFF AND`.
 - **UDP transport invariant** and VLESS carrier ownership: [`.agents/rules/outbound.md`](.agents/rules/outbound.md#udp-transport-invariant); gRPC and XHTTP replay no application bytes ([gRPC and XHTTP](.agents/rules/outbound.md#grpc-and-xhttp)).

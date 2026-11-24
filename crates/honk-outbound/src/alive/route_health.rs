@@ -14,6 +14,58 @@ use uuid::Uuid;
 
 const TCP: ProbeDomain = ProbeDomain::Tcp;
 
+mod udp;
+pub(super) use udp::RoutedUdpNode;
+pub use udp::{UdpBareReply, UdpHopRole, UdpRouteAdmission};
+pub(crate) use udp::{UdpEdges, UdpWitness};
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+// Two operation slots per (domain, family); the low bit selects interior carrier work.
+pub(crate) struct RouteScope(u8);
+
+impl RouteScope {
+    pub(crate) fn new(domain: ProbeDomain, family: IpVersion) -> Self {
+        Self((alive_index(domain, family) * 2) as u8)
+    }
+
+    fn with_role(self, role: UdpHopRole) -> Self {
+        Self((self.0 & !1) | u8::from(role == UdpHopRole::Carrier))
+    }
+
+    fn role(self) -> UdpHopRole {
+        if self.0 & 1 == 0 {
+            UdpHopRole::Framing
+        } else {
+            UdpHopRole::Carrier
+        }
+    }
+
+    fn udp_index(self) -> usize {
+        usize::from(self.0) - IpVersion::count() * 2
+    }
+
+    fn index(self) -> usize {
+        usize::from(self.0) / 2
+    }
+
+    pub(crate) fn domain(self) -> ProbeDomain {
+        [TCP, ProbeDomain::DnsUdp, ProbeDomain::DataUdp][self.index() / IpVersion::count()]
+    }
+
+    pub(crate) fn family(self) -> IpVersion {
+        [IpVersion::V4, IpVersion::V6][self.index() % IpVersion::count()]
+    }
+}
+
+pub(crate) struct RouteAttempt<'a> {
+    pub manager: &'a GroupManager,
+    pub hops: &'a [Uuid],
+    pub scope: RouteScope,
+    pub selector: u64,
+    pub stamp: RouteHealthStamp,
+    pub grouped: bool,
+}
+
 /// The health generation and Selector revision captured before candidate selection.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RouteHealthRevision {
@@ -81,30 +133,46 @@ impl Evidence {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Prefix {
     hops: [Uuid; MAX_CHAIN_HOPS],
     len: u8,
-    family: u8,
+    scope: RouteScope,
+    // Zero is an ordered-prefix row. A UDP hop witness carries its whole original path
+    // and the one-based position of the physical operation which failed.
+    hop: u8,
 }
 
 impl Prefix {
-    fn new(hops: &[Uuid], family: IpVersion) -> Self {
+    fn new(hops: &[Uuid], scope: RouteScope) -> Self {
         let mut slots = [Uuid::nil(); MAX_CHAIN_HOPS];
         slots[..hops.len()].copy_from_slice(hops);
         Self {
             hops: slots,
             len: hops.len() as u8,
-            family: family as u8,
+            scope,
+            hop: 0,
         }
     }
 
+    fn udp_hop(hops: &[Uuid], index: usize, scope: RouteScope) -> Self {
+        let scope = scope.with_role(UdpHopRole::at(index, hops.len()));
+        Self {
+            hop: (index + 1) as u8,
+            ..Self::new(hops, scope)
+        }
+    }
+
+    fn hops(&self) -> &[Uuid] {
+        &self.hops[..usize::from(self.len)]
+    }
+
     fn last(self) -> Uuid {
-        self.hops[self.len as usize - 1]
+        self.hops[usize::from(if self.hop == 0 { self.len } else { self.hop }) - 1]
     }
 
     fn family(self) -> IpVersion {
-        [IpVersion::V4, IpVersion::V6][self.family as usize]
+        self.scope.family()
     }
 }
 
@@ -123,17 +191,21 @@ pub(crate) fn physical_hops(key: &DialKey) -> &[Uuid] {
 }
 
 struct Witness {
-    root: Arc<str>,
+    root: Option<Arc<str>>,
     target: DialKey,
     custom_url: Option<Arc<str>>,
+    udp: Option<UdpWitness>,
+    active: bool,
 }
 
 impl Witness {
-    fn new(root: &str, target: DialKey, custom_url: Option<&str>) -> Box<Self> {
+    fn new(root: Option<&str>, target: DialKey, custom_url: Option<&str>) -> Box<Self> {
         Box::new(Self {
-            root: root.into(),
+            root: root.map(Arc::from),
             target,
             custom_url: custom_url.map(Arc::from),
+            udp: None,
+            active: true,
         })
     }
 }
@@ -171,14 +243,15 @@ impl Row {
         }
     }
 
-    fn down(&self) -> bool {
-        self.failures >= traffic_failure_threshold(TCP)
+    fn down(&self, key: Prefix) -> bool {
+        self.failures >= traffic_failure_threshold(key.scope.domain())
     }
 
     fn needs_probe(&self, alive: &AliveDialerSet, key: Prefix, started: u64) -> bool {
-        self.down()
+        self.down(key)
             || self.hop_failure.is_some_and(|event| {
-                alive.hop_episode(key, started) == Some(event) && !alive.is_registered(key.last())
+                alive.hop_episode(key, started) == Some(event)
+                    && (key.scope.domain() != TCP || !alive.is_registered(key.last()))
             })
     }
 
@@ -204,6 +277,7 @@ pub(crate) struct RouteHealth {
     /// A confirmed-only prefix needs an ordering fence, not a failure row or probe witness.
     positive: BTreeMap<Prefix, (u64, u64)>,
     cursor: Option<Prefix>,
+    explicit_udp_dns: Option<Arc<[String]>>,
 }
 
 impl RouteHealth {
@@ -219,6 +293,44 @@ impl RouteHealth {
         self.owner_is(manager) && self.generation == stamp.generation && selector == stamp.selector
     }
 
+    fn hops_available(&self, hops: &[Uuid], scope: RouteScope) -> bool {
+        self.rows.is_empty()
+            || (2..=hops.len()).all(|end| {
+                let key = Prefix::new(&hops[..end], scope);
+                !self.rows.get(&key).is_some_and(|row| row.down(key))
+            })
+    }
+
+    pub(crate) fn has_tcp_rows(&self) -> bool {
+        self.rows.keys().any(|key| key.scope.domain() == TCP)
+    }
+
+    pub(crate) fn refresh_udp(
+        &mut self,
+        mut validate: impl FnMut(&UdpWitness, DialKey) -> Option<bool>,
+        mut contains: impl FnMut(&Uuid) -> bool,
+    ) {
+        for (key, row) in self
+            .rows
+            .iter_mut()
+            .filter(|(key, _)| key.scope.domain() != TCP)
+        {
+            // A shared prefix can remain down after the selecting root disappears. Its
+            // replacement may receive business evidence but cannot inherit probe authority.
+            row.admitted = key.hop == 0 && key.hops().iter().all(&mut contains);
+            if let Some(mut witness) = row.previous.take()
+                && let Some(active) = witness
+                    .udp
+                    .as_ref()
+                    .and_then(|path| validate(path, witness.target))
+            {
+                row.admitted = true;
+                witness.active = active;
+                row.witness = Some(witness);
+            }
+        }
+    }
+
     /// Reattach existing rows only. Keep structural membership even while a Selector pin
     /// is elsewhere, but only an authorized path can become the HTTP witness.
     pub(crate) fn admit(
@@ -231,7 +343,8 @@ impl RouteHealth {
         let hops = physical_hops(&target);
         for end in 1..=hops.len() {
             for family in [IpVersion::V4, IpVersion::V6] {
-                let Some(row) = self.rows.get_mut(&Prefix::new(&hops[..end], family)) else {
+                let scope = RouteScope::new(TCP, family);
+                let Some(row) = self.rows.get_mut(&Prefix::new(&hops[..end], scope)) else {
                     continue;
                 };
                 row.admitted = true;
@@ -243,15 +356,14 @@ impl RouteHealth {
                         .as_ref()
                         .is_some_and(|prev| prev.root == w.root && prev.target == w.target)
                 };
-                let original = row
-                    .previous
-                    .as_ref()
-                    .is_some_and(|prev| prev.root.as_ref() == root && prev.target == target);
+                let original = row.previous.as_ref().is_some_and(|prev| {
+                    prev.root.as_deref() == Some(root) && prev.target == target
+                });
                 let preferred = row.witness.as_ref().is_none_or(|w| {
                     !same_path(w) && w.custom_url.is_none() && custom_url.is_some()
                 });
                 if original || preferred {
-                    row.witness = Some(Witness::new(root, target, custom_url));
+                    row.witness = Some(Witness::new(Some(root), target, custom_url));
                 }
             }
         }
@@ -269,18 +381,25 @@ impl AliveDialerSet {
         let Some(slots) = states.remove(&node) else {
             return;
         };
-        if !retain {
+        if retain {
+            for (key, row) in &mut route_health.rows {
+                if key.scope.domain() != TCP || key.last() != node {
+                    continue;
+                }
+                let tcp = &slots[alive_index(TCP, key.family())];
+                let evidence = slots.route_tcp[key.family() as usize];
+                if row.hop_failure == Some(tcp.route_down_at) && !tcp.alive {
+                    row.retained_hop = Some(evidence);
+                }
+            }
+        } else if !slots.has_udp_faults() {
             return;
         }
-        for (key, row) in &mut route_health.rows {
-            if key.last() != node {
-                continue;
-            }
-            let tcp = &slots[alive_index(TCP, key.family())];
-            let evidence = slots.route_tcp[key.family as usize];
-            if row.hop_failure == Some(tcp.route_down_at) && !tcp.alive {
-                row.retained_hop = Some(evidence);
-            }
+        if let Some(udp) = slots.route_udp {
+            states
+                .entry(node)
+                .or_insert_with(super::fresh_states)
+                .route_udp = Some(udp);
         }
     }
 
@@ -289,15 +408,24 @@ impl AliveDialerSet {
         let registered = self.registered.read();
         let mut removed = Vec::new();
         self.states.write().retain(|id, slots| {
-            if slots
+            if (slots
                 .route_tcp
                 .iter()
                 .any(|e| e.failure != 0 || e.recovered != 0)
+                || slots.route_udp.is_some())
                 && !registered.nodes.contains_key(id)
                 && !admitted(id)
             {
                 removed.push(*id);
-                false
+                if slots.has_udp_faults() {
+                    // The next published manager decides whether this UUID still exists as a bare node.
+                    let udp = slots.route_udp.take();
+                    *slots = super::fresh_states();
+                    slots.route_udp = udp;
+                    true
+                } else {
+                    false
+                }
             } else {
                 true
             }
@@ -307,10 +435,16 @@ impl AliveDialerSet {
         }
     }
 
+    pub fn admitted_udp_check_dns(&self) -> Option<Arc<[String]>> {
+        self.route_health.read().explicit_udp_dns.clone()
+    }
+
     pub(crate) fn publish_routes(
         &self,
         manager: &Arc<GroupManager>,
         selector: u64,
+        publish_dns: impl FnOnce(&mut Option<Arc<[String]>>),
+        mut configured: impl FnMut(&Uuid) -> bool,
         walk: impl FnOnce(&mut RouteHealth),
     ) {
         let mut state = self.route_health.write();
@@ -318,15 +452,31 @@ impl AliveDialerSet {
         if state.id == 0 {
             state.id = state.generation;
         }
+        if self.may_have_udp_faults() {
+            let mut pending = false;
+            self.states.write().retain(|id, slots| {
+                if !slots.has_udp_faults() {
+                    return true;
+                }
+                if !configured(id) {
+                    return false;
+                }
+                pending = true;
+                true
+            });
+            self.udp_faults
+                .store(pending, std::sync::atomic::Ordering::Release);
+        }
         state.owner = Arc::downgrade(manager);
         state.selector = selector;
+        publish_dns(&mut state.explicit_udp_dns);
         state.positive.clear();
         // Publication fences every former dial; its recovery tombstones can now go.
         state.rows.retain(|key, row| {
             row.discard_stale_hop(self, *key);
             row.failures != 0 || row.hop_failure.is_some() || row.claim.is_some()
         });
-        Self::refresh_routes(&mut state, walk);
+        self.refresh_routes(&mut state, walk);
         for (key, row) in &mut state.rows {
             if let (Some(episode), Some(evidence)) = (row.hop_failure, row.retained_hop.take()) {
                 let mut states = self.states.write();
@@ -335,12 +485,12 @@ impl AliveDialerSet {
                 tcp.alive = false;
                 tcp.traffic_failures = traffic_failure_threshold(TCP);
                 tcp.route_down_at = episode;
-                slots.route_tcp[key.family as usize] = evidence;
+                slots.route_tcp[key.family() as usize] = evidence;
             }
         }
     }
 
-    fn refresh_routes(state: &mut RouteHealth, walk: impl FnOnce(&mut RouteHealth)) {
+    fn refresh_routes(&self, state: &mut RouteHealth, walk: impl FnOnce(&mut RouteHealth)) {
         if state.rows.is_empty() {
             return;
         }
@@ -365,7 +515,7 @@ impl AliveDialerSet {
         let mut state = self.route_health.write();
         if state.owner_is(manager) && state.selector != selector {
             state.selector = selector;
-            Self::refresh_routes(&mut state, walk);
+            self.refresh_routes(&mut state, walk);
         }
     }
 
@@ -385,26 +535,59 @@ impl AliveDialerSet {
         }
     }
 
+    pub(crate) fn udp_hop_down(
+        &self,
+        manager: &GroupManager,
+        id: Uuid,
+        domain: ProbeDomain,
+        family: IpVersion,
+        role: UdpHopRole,
+    ) -> bool {
+        let owner = self.route_health.read();
+        owner.owner_is(manager) && self.routed_udp_retirable(id, domain, family, role)
+    }
+
     pub(crate) fn prefix_available(&self, route: &Route, family: IpVersion) -> bool {
+        self.hops_available(route.hops(), RouteScope::new(TCP, family))
+    }
+
+    pub(crate) fn accepts_route_attempt(&self, attempt: &RouteAttempt<'_>) -> bool {
+        self.with_route_authority(attempt, |current| current)
+    }
+
+    pub(crate) fn with_route_authority<R>(
+        &self,
+        attempt: &RouteAttempt<'_>,
+        publish: impl FnOnce(bool) -> R,
+    ) -> R {
         let state = self.route_health.read();
-        state.rows.is_empty()
-            || (2..=route.hops().len()).all(|end| {
-                !state
-                    .rows
-                    .get(&Prefix::new(&route.hops()[..end], family))
-                    .is_some_and(Row::down)
-            })
+        publish(state.accepts(attempt.manager, attempt.selector, attempt.stamp))
+    }
+
+    pub(crate) fn hops_available(&self, hops: &[Uuid], scope: RouteScope) -> bool {
+        self.route_health.read().hops_available(hops, scope)
+    }
+
+    pub(crate) fn current_route_eligible(
+        &self,
+        attempt: &RouteAttempt<'_>,
+        nodes_eligible: impl FnOnce() -> bool,
+    ) -> bool {
+        let state = self.route_health.read();
+        state.accepts(attempt.manager, attempt.selector, attempt.stamp)
+            && state.hops_available(attempt.hops, attempt.scope)
+            && nodes_eligible()
     }
 }
 
 pub(crate) struct Failure<'a> {
     pub manager: &'a GroupManager,
-    pub root: &'a str,
-    pub target: DialKey,
-    pub family: IpVersion,
+    pub witness: (Option<&'a str>, DialKey, Option<&'a str>),
+    pub udp: Option<&'a UdpRouteAdmission>,
+    pub scope: RouteScope,
+    pub hops: &'a [Uuid],
     pub selector: u64,
     pub stamp: RouteHealthStamp,
-    pub custom_url: Option<&'a str>,
     pub end: usize,
     pub node: Option<Uuid>,
     pub prefix: bool,
@@ -417,10 +600,13 @@ impl AliveDialerSet {
     fn hop_episode(&self, key: Prefix, started: u64) -> Option<u64> {
         let states = self.states.read();
         let slot = states.get(&key.last())?;
+        if key.scope.domain() != TCP {
+            return slot.udp_hop_episode(key.scope, started);
+        }
         let tcp = &slot[alive_index(TCP, key.family())];
         (!tcp.alive
             && tcp.route_down_at != 0
-            && slot.route_tcp[key.family as usize].failure <= started)
+            && slot.route_tcp[key.family() as usize].failure <= started)
             .then_some(tcp.route_down_at)
     }
 
@@ -430,7 +616,11 @@ impl AliveDialerSet {
         f: Failure<'_>,
         admitted: impl FnOnce() -> bool,
     ) -> Option<(Option<Uuid>, bool, bool)> {
-        let key = Prefix::new(&physical_hops(&f.target)[..=f.end], f.family);
+        let key = if f.scope.domain() != TCP && f.node.is_some() {
+            Prefix::udp_hop(f.hops, f.end, f.scope)
+        } else {
+            Prefix::new(&f.hops[..=f.end], f.scope)
+        };
         let mut state = self.route_health.write();
         if !state.accepts(f.manager, f.selector, f.stamp) {
             return None;
@@ -440,13 +630,12 @@ impl AliveDialerSet {
                 .rows
                 .get(&key)
                 .and_then(|r| r.witness.as_ref())
-                .is_some_and(|w| w.root.as_ref() == f.root && w.target == f.target);
+                .is_some_and(|w| w.root.as_deref() == f.witness.0 && w.target == f.witness.1);
         if !known && !admitted() {
             return None;
         }
         let event = next_episode();
         let health = state.id;
-        let make_witness = || Witness::new(f.root, f.target, f.custom_url);
         let mut counted = None;
         let mut node_changed = false;
         if let Some(node) = f.node {
@@ -455,21 +644,33 @@ impl AliveDialerSet {
                     cause,
                     RouteFailureScope {
                         health,
-                        prefix: Prefix::new(std::slice::from_ref(&node), f.family),
+                        prefix: Prefix::new(std::slice::from_ref(&node), key.scope),
                     },
                 )
             });
-            let accepted = self
+            let domain = f.scope.domain();
+            let family = f.scope.family();
+            if domain != TCP {
+                if let Some(changed) =
+                    self.fail_routed_udp_node(node, key.scope, f.stamp, event, shared)
+                {
+                    counted = Some(node);
+                    node_changed = changed;
+                    if key.scope.role() == UdpHopRole::Framing {
+                        self.record_dial_failure(node, domain, family);
+                    }
+                }
+            } else if self
                 .states
                 .write()
                 .entry(node)
                 .or_insert_with(super::fresh_states)
-                .route_tcp[f.family as usize]
-                .fail(f.stamp, event, shared);
-            if accepted {
+                .route_tcp[family as usize]
+                .fail(f.stamp, event, shared)
+            {
                 counted = Some(node);
-                node_changed = self.mark_routed_unavailable_state(node, f.family, event);
-                self.record_dial_failure(node, TCP, f.family);
+                node_changed = self.mark_routed_unavailable_state(node, family, event);
+                self.record_dial_failure(node, TCP, family);
                 if self.is_registered(node) {
                     self.notify_check_tcp(node);
                 }
@@ -526,13 +727,18 @@ impl AliveDialerSet {
         if new_hop {
             row.hop_failure = Some(event);
         }
-        let was_down = row.down();
+        let was_down = row.down(key);
         if prefix_failed {
             row.failures = row.failures.saturating_add(1);
         }
-        let prefix_changed = prefix_failed && !was_down && row.down();
-        if !known && (new_hop || (prefix_failed && !was_down)) {
-            row.witness = Some(make_witness());
+        let prefix_changed = prefix_failed && !was_down && row.down(key);
+        if f.udp.is_some() && (new_hop || (prefix_failed && row.failures == 1)) {
+            let mut witness = Witness::new(None, f.witness.1, None);
+            witness.udp = f.udp.map(|admission| f.manager.own_udp_witness(admission));
+            row.witness = Some(witness);
+        } else if f.udp.is_none() && !known && (new_hop || (prefix_failed && !was_down)) {
+            let (root, target, url) = f.witness;
+            row.witness = Some(Witness::new(root, target, url));
         }
         (counted.is_some() || prefix_failed).then_some((counted, node_changed, prefix_changed))
     }
@@ -600,15 +806,46 @@ impl AliveDialerSet {
         stamp: RouteHealthStamp,
         dial_latency: Option<Duration>,
     ) -> Vec<(Uuid, bool)> {
+        let attempt = RouteAttempt {
+            manager,
+            hops: physical_hops(&key),
+            scope: RouteScope::new(TCP, family),
+            selector,
+            stamp,
+            grouped: true,
+        };
+        self.confirm_route(
+            &attempt,
+            std::iter::once(key.success_owner())
+                .chain(key.proven())
+                .map(|id| (id, UdpHopRole::Framing)),
+            dial_latency.map(|elapsed| (key.success_owner(), elapsed)),
+        )
+    }
+
+    pub(crate) fn confirm_route(
+        &self,
+        attempt: &RouteAttempt<'_>,
+        owners: impl Iterator<Item = (Uuid, UdpHopRole)>,
+        dial_latency: Option<(Uuid, Duration)>,
+    ) -> Vec<(Uuid, bool)> {
+        let RouteAttempt {
+            manager,
+            hops,
+            scope,
+            selector,
+            stamp,
+            ..
+        } = *attempt;
+        let family = scope.family();
         let mut state = self.route_health.write();
         let mut changes = Vec::new();
         if !state.accepts(manager, selector, stamp) {
             return changes;
         }
         let event = next_episode();
-        let hops = physical_hops(&key);
         for end in 1..=hops.len() {
-            let prefix = Prefix::new(&hops[..end], family);
+            let prefix = Prefix::new(&hops[..end], scope);
             let Some(row) = state.rows.get_mut(&prefix) else {
                 if end > 1 {
                     state.positive.insert(prefix, (event, stamp.clock));
@@ -616,7 +853,7 @@ impl AliveDialerSet {
                 continue;
             };
             if row.evidence.recover(stamp, event) {
-                if row.down() {
+                if row.down(prefix) {
                     changes.push((hops[end - 1], false));
                 }
                 row.failures = 0;
@@ -625,8 +862,20 @@ impl AliveDialerSet {
             }
             row.discard_stale_hop(self, prefix);
         }
-        let exit = key.success_owner();
-        for id in std::iter::once(exit).chain(key.proven()) {
+        for (id, role) in owners {
+            if scope.domain() != TCP {
+                if let Some((flipped, first)) =
+                    self.recover_routed_udp_node(id, scope.with_role(role), stamp, event)
+                    && (flipped || (first && role == UdpHopRole::Framing))
+                {
+                    if let Some((_, physical)) = changes.iter_mut().find(|(node, _)| *node == id) {
+                        *physical = true;
+                    } else {
+                        changes.push((id, true));
+                    }
+                }
+                continue;
+            }
             let Some(changed) = self.recover_node(id, family, stamp, event, None) else {
                 continue;
             };
@@ -634,14 +883,13 @@ impl AliveDialerSet {
                 changes.push((id, true));
                 for (end, &hop) in hops.iter().enumerate() {
                     if hop == id
-                        && let Some(row) = state.rows.get_mut(&Prefix::new(&hops[..=end], family))
+                        && let Some(row) = state.rows.get_mut(&Prefix::new(&hops[..=end], scope))
                     {
                         row.hop_failure = None;
                     }
                 }
             }
-            if id == exit
-                && let Some(elapsed) = dial_latency
+            if let Some((_, elapsed)) = dial_latency.filter(|(exit, _)| *exit == id)
                 && self.report_dial_latency(id, TCP, family, elapsed)
                 && self.is_registered(id)
             {
@@ -680,7 +928,46 @@ pub struct RouteProbeTicket {
     stamp: RouteHealthStamp,
     target: DialKey,
     family: IpVersion,
-    url: Arc<str>,
+    destination: RouteProbeDestination,
+}
+
+enum RouteProbeDestination {
+    Http(Arc<str>),
+    Udp(Arc<[String]>),
+}
+
+/// Notify observers of settled UDP health changes after releasing the caller's guards.
+#[must_use]
+pub struct UdpHealthNotifications<'a> {
+    alive: &'a AliveDialerSet,
+    attempt: RouteAttempt<'a>,
+    changes: Vec<(Uuid, bool)>,
+}
+
+impl<'a> UdpHealthNotifications<'a> {
+    pub(crate) fn new(
+        alive: &'a AliveDialerSet,
+        attempt: RouteAttempt<'a>,
+        changes: Vec<(Uuid, bool)>,
+    ) -> Self {
+        Self {
+            alive,
+            attempt,
+            changes,
+        }
+    }
+
+    pub fn notify(self) {
+        for (id, node) in self.changes {
+            self.alive.notify_udp_route_change(
+                &self.attempt,
+                id,
+                node,
+                self.attempt.scope.role(),
+                true,
+            );
+        }
+    }
 }
 
 impl AliveDialerSet {
@@ -707,10 +994,18 @@ impl AliveDialerSet {
             let bound = state.cursor.map_or(Unbounded, Excluded);
             let due = |(key, row): (&Prefix, &Row)| {
                 let witness = row.witness.as_ref()?;
-                (row.claim.is_none()
+                (witness.active
+                    && row.claim.is_none()
                     && row.due <= now
                     && row.needs_probe(self, *key, u64::MAX)
-                    && (witness.custom_url.is_some() || !global.is_empty()))
+                    && if key.scope.domain() == TCP {
+                        witness.custom_url.is_some() || !global.is_empty()
+                    } else {
+                        state
+                            .explicit_udp_dns
+                            .as_ref()
+                            .is_some_and(|targets| !targets.is_empty())
+                    })
                 .then_some(*key)
             };
             let key = state
@@ -724,13 +1019,20 @@ impl AliveDialerSet {
                 selector,
                 clock: claim,
             };
+            let dns = state.explicit_udp_dns.clone();
             state.cursor = Some(key);
             let row = state.rows.get_mut(&key)?;
             let witness = row.witness.as_ref()?;
-            let url = witness
-                .custom_url
-                .clone()
-                .unwrap_or_else(|| Arc::from(global.as_str()));
+            let destination = if key.scope.domain() == TCP {
+                RouteProbeDestination::Http(
+                    witness
+                        .custom_url
+                        .clone()
+                        .unwrap_or_else(|| Arc::from(global.as_str())),
+                )
+            } else {
+                RouteProbeDestination::Udp(dns?)
+            };
             row.claim = Some(claim);
             row.due = now + self.base_cooldown;
             Some(RouteProbeTicket {
@@ -741,7 +1043,7 @@ impl AliveDialerSet {
                 stamp,
                 target: witness.target,
                 family: key.family(),
-                url,
+                destination,
             })
         })
     }
@@ -757,7 +1059,21 @@ impl RouteProbeTicket {
     }
 
     pub fn url(&self) -> &str {
-        &self.url
+        match &self.destination {
+            RouteProbeDestination::Http(url) => url,
+            RouteProbeDestination::Udp(_) => "",
+        }
+    }
+
+    pub fn domain(&self) -> ProbeDomain {
+        self.key.scope.domain()
+    }
+
+    pub fn udp_check_dns(&self) -> Option<&[String]> {
+        match &self.destination {
+            RouteProbeDestination::Udp(dns) => Some(dns),
+            RouteProbeDestination::Http(_) => None,
+        }
     }
 
     fn matches(&self, state: &RouteHealth, selector: u64) -> bool {
@@ -785,11 +1101,50 @@ impl RouteProbeTicket {
     }
 
     pub fn finish(self, success: bool) {
+        if self.domain() == TCP {
+            let changes = self.settle(success, None);
+            self.alive
+                .notify_route_response(&self.manager, self.stamp, self.family, changes);
+        }
+    }
+
+    /// Core verifies the matching live manager/runtime under its read guards for this call.
+    pub fn settle_udp(
+        &self,
+        success: bool,
+        deadline: tokio::time::Instant,
+        cancel: &super::ProbeCancellation,
+    ) -> UdpHealthNotifications<'_> {
+        let changes = if self.domain() != TCP {
+            self.settle(success, Some((deadline, cancel)))
+        } else {
+            Vec::new()
+        };
+        let attempt = RouteAttempt {
+            manager: &self.manager,
+            hops: self.key.hops(),
+            scope: self.key.scope,
+            selector: self.stamp.selector,
+            stamp: self.stamp,
+            grouped: true,
+        };
+        UdpHealthNotifications::new(&self.alive, attempt, changes)
+    }
+
+    fn settle(
+        &self,
+        success: bool,
+        udp: Option<(tokio::time::Instant, &super::ProbeCancellation)>,
+    ) -> Vec<(Uuid, bool)> {
         let mut changes = Vec::new();
         self.manager.with_route_revision(|selector| {
             let mut state = self.alive.route_health.write();
+            if udp.is_some_and(|(_, cancel)| cancel.is_cancelled()) { return; }
             let mode = self.alive.health_mode.borrow();
-            if *mode != super::runner::HealthMode::Running || !self.matches(&state, selector) {
+            if *mode != super::runner::HealthMode::Running || !self.matches(&state, selector)
+                // A silent, still-authorized exchange finishes at its deadline and backs off.
+                // A reply first committed at or after that same instant cannot revive a path.
+                || (success && udp.is_some_and(|(deadline, _)| tokio::time::Instant::now() >= deadline)) {
                 return;
             }
             let event = next_episode();
@@ -806,14 +1161,18 @@ impl RouteProbeTicket {
                 return;
             }
             let id = self.key.last();
-            if row.down() && row.evidence.recover(self.stamp, event) {
+            if row.down(self.key) && row.evidence.recover(self.stamp, event) {
                 row.failures = 0;
                 changes.push((id, false));
             }
-            if let Some(epoch) = row.hop_failure
-                && self
-                    .alive
-                    .recover_node(id, self.family, self.stamp, event, Some(epoch))
+            if self.domain() != TCP {
+                if row.hop_failure.is_some_and(|epoch| self.alive.hop_episode(self.key, self.stamp.clock) == Some(epoch))
+                    && let Some((changed, _)) = self.alive.recover_routed_udp_node(id, self.key.scope, self.stamp, event) {
+                    row.hop_failure = None;
+                    if changed { changes.push((id, true)); }
+                }
+            } else if let Some(epoch) = row.hop_failure
+                && self.alive.recover_node(id, self.family, self.stamp, event, Some(epoch))
                     == Some(true)
             {
                 row.hop_failure = None;
@@ -823,8 +1182,7 @@ impl RouteProbeTicket {
             }
             row.misses = 0;
         });
-        self.alive
-            .notify_route_response(&self.manager, self.stamp, self.family, changes);
+        changes
     }
 }
 

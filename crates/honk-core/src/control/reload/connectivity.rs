@@ -53,7 +53,7 @@ fn group_leaf_ids(graph: &GroupGraph<'_>, group: usize) -> BTreeSet<uuid::Uuid> 
 /// is never added to the raw probe set by that fallback.
 pub(in crate::control) fn health_registrations<'a>(
     config: &'a Config,
-    reachable: &std::collections::HashMap<uuid::Uuid, impl Sized>,
+    reachable: &OutboundHealthIndex,
 ) -> std::collections::HashMap<uuid::Uuid, (&'a str, Option<&'a str>)> {
     let exits: BTreeSet<_> = if reachable.is_empty() {
         config
@@ -83,7 +83,7 @@ pub(in crate::control) fn sync_health_check_nodes(
     alive_set: &AliveDialerSet,
     config: &Config,
 ) -> (usize, usize) {
-    let leaves = build_outbound_id_map(config, std::convert::identity);
+    let leaves = build_outbound_id_map(config);
     alive_set.sync_registrations(health_registrations(config, &leaves))
 }
 
@@ -205,44 +205,21 @@ pub(in crate::control) fn install_selector_warm_callback(
     })));
 }
 
-/// Build the NodeId → eBPF outbound id map used for
-/// `OUTBOUND_CONNECTIVITY_MAP` pushes. Numbering matches
-/// `push_routing_to_ebpf`: direct=0, block=1, group i → `UserBase + i`;
-/// Reachable leaves inherit their group's id (first group wins), expanding
-/// membership and explicit final edges so final-only health transitions also
-/// update the containing group's slot. Unreachable nodes are absent.
-pub(in crate::control) fn build_outbound_id_map<T>(
-    config: &Config,
-    value: impl Fn(u8) -> T,
-) -> std::collections::HashMap<uuid::Uuid, T> {
+/// The first containing group supplies the raw callback's slot hint. Routed
+/// publication resolves every affected group against the committed routing plan.
+pub(in crate::control) fn build_outbound_id_map(config: &Config) -> OutboundHealthIndex {
     let graph = GroupGraph::new(&config.groups, &config.nodes);
     let mut map = std::collections::HashMap::new();
     for i in 0..config.groups.len() {
         let id = OutboundIndex::UserBase as u8 + i as u8;
         for node_id in group_leaf_ids(&graph, i) {
-            map.entry(node_id).or_insert_with(|| value(id));
+            map.entry(node_id).or_insert(id);
         }
     }
     map
 }
 
-#[derive(Clone, Copy)]
-pub(in crate::control) struct OutboundHealthDependency {
-    pub outbound: u8,
-    pub routed: bool,
-}
-
-impl OutboundHealthDependency {
-    pub fn leaf(outbound: u8) -> Self {
-        Self {
-            outbound,
-            routed: false,
-        }
-    }
-}
-
-pub(in crate::control) type OutboundHealthIndex =
-    std::collections::HashMap<uuid::Uuid, OutboundHealthDependency>;
+pub(in crate::control) type OutboundHealthIndex = std::collections::HashMap<uuid::Uuid, u8>;
 
 /// Extend only the callback dispatch map, after raw probe registrations were derived.
 pub(in crate::control) fn extend_route_health_dependencies(
@@ -253,9 +230,7 @@ pub(in crate::control) fn extend_route_health_dependencies(
     for (index, group) in config.groups.iter().enumerate() {
         let outbound = OutboundIndex::UserBase as u8 + index as u8;
         manager.visit_route_health_dependencies(&group.name, |node| {
-            map.entry(node)
-                .or_insert_with(|| OutboundHealthDependency::leaf(outbound))
-                .routed = true;
+            map.entry(node).or_insert(outbound);
             false
         });
     }
@@ -268,7 +243,7 @@ type GroupConnectivity = (u8, u32, u32, bool);
 pub(in crate::control) fn group_datapath_alive(
     group: &Group,
     group_manager: &GroupManager,
-    alive_set: &crate::outbound::AliveDialerSet,
+    alive_set: &AliveDialerSet,
     domain: ProbeDomain,
     ipver: IpVersion,
 ) -> bool {
@@ -284,8 +259,7 @@ pub(in crate::control) fn group_datapath_alive(
                 .any(|node| alive_set.is_alive_for(node.id, domain, ipver));
     }
     group_manager.any_udp_leaf_in_group(&group.name, |node| {
-        (node.protocol() == NodeProtocol::Block
-            || (honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node))
+        (node.protocol() == NodeProtocol::Block || group_manager.node_carries_udp(node))
             && alive_set.is_alive_for(node.id, domain, ipver)
     })
 }
@@ -295,7 +269,12 @@ pub(crate) fn group_connectivity_snapshot(
     group_manager: &GroupManager,
     alive_set: &AliveDialerSet,
 ) -> Vec<GroupConnectivity> {
-    connectivity_snapshot(config, |group, domain, family| {
+    let groups = config
+        .groups
+        .iter()
+        .enumerate()
+        .map(|(index, group)| (OutboundIndex::UserBase as u8 + index as u8, group));
+    connectivity_snapshot(groups, |group, domain, family| {
         Some(group_datapath_alive(
             group,
             group_manager,
@@ -307,21 +286,24 @@ pub(crate) fn group_connectivity_snapshot(
 }
 
 pub(in crate::control) fn initial_route_connectivity(
-    config: &Config,
+    plan: &routing_matcher::RoutingPushPlan,
     manager: &GroupManager,
 ) -> Vec<GroupConnectivity> {
-    connectivity_snapshot(config, |group, domain, family| {
-        manager.routed_group_available(&group.name, domain, family)
+    let groups = plan
+        .group_slots
+        .iter()
+        .map(|(slot, name)| (*slot, name.as_str()));
+    connectivity_snapshot(groups, |name, domain, family| {
+        manager.routed_group_available(name, domain, family)
     })
 }
 
-fn connectivity_snapshot(
-    config: &Config,
-    mut check: impl FnMut(&Group, ProbeDomain, IpVersion) -> Option<bool>,
+fn connectivity_snapshot<G: Copy>(
+    groups: impl ExactSizeIterator<Item = (u8, G)>,
+    mut check: impl FnMut(G, ProbeDomain, IpVersion) -> Option<bool>,
 ) -> Vec<GroupConnectivity> {
-    let mut snapshot = Vec::with_capacity(config.groups.len() * 6);
-    for (index, group) in config.groups.iter().enumerate() {
-        let outbound = OutboundIndex::UserBase as u8 + index as u8;
+    let mut snapshot = Vec::with_capacity(groups.len() * 6);
+    for (outbound, group) in groups {
         for domain in [ProbeDomain::Tcp, ProbeDomain::DnsUdp, ProbeDomain::DataUdp] {
             for family in [IpVersion::V4, IpVersion::V6] {
                 if let Some(alive) = check(group, domain, family) {
@@ -331,6 +313,19 @@ fn connectivity_snapshot(
         }
     }
     snapshot
+}
+
+pub(super) fn installed_group_connectivity(
+    ebpf: &dyn EbpfBackend,
+    group_count: usize,
+) -> anyhow::Result<Vec<GroupConnectivity>> {
+    let mut snapshot = Vec::with_capacity(group_count * 6);
+    visit_group_connectivity_slots(group_count, |outbound, domain, ipver| {
+        let alive = ebpf.get_outbound_alive(outbound, domain, ipver)?;
+        snapshot.push((outbound, domain, ipver, alive));
+        Ok(())
+    })?;
+    Ok(snapshot)
 }
 
 pub(crate) fn publish_group_connectivity(
@@ -347,6 +342,15 @@ pub(crate) fn open_group_connectivity(
     ebpf: &mut dyn EbpfBackend,
     group_count: usize,
 ) -> anyhow::Result<()> {
+    visit_group_connectivity_slots(group_count, |outbound, domain, ipver| {
+        ebpf.set_outbound_alive(outbound, domain, ipver, true)
+    })
+}
+
+fn visit_group_connectivity_slots(
+    group_count: usize,
+    mut visit: impl FnMut(u8, u32, u32) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     for index in 0..group_count {
         let offset = u8::try_from(index)
             .map_err(|_| anyhow::anyhow!("too many outbound groups: {group_count}"))?;
@@ -355,7 +359,7 @@ pub(crate) fn open_group_connectivity(
             .ok_or_else(|| anyhow::anyhow!("too many outbound groups: {group_count}"))?;
         for domain in 0..3 {
             for ipver in 0..2 {
-                ebpf.set_outbound_alive(outbound, domain, ipver, true)?;
+                visit(outbound, domain, ipver)?;
             }
         }
     }
@@ -375,12 +379,12 @@ impl ControlPlane {
             );
             current.score_state()
         };
-        let new_gm = GroupManager::with_alive_set_and_score_state(
+        let new_gm = Arc::new(GroupManager::with_alive_set_and_score_state(
             &config.groups,
             &config.nodes,
             Some(self.alive_set.clone()),
             score,
-        );
+        ));
         let runtimes = self.runtime_registry.read().clone();
         new_gm.bind_transport_quality(&runtimes);
         // Migrate runtime choices before wiring callbacks: migration must
@@ -395,26 +399,40 @@ impl ControlPlane {
             #[cfg(feature = "native-api")]
             self.native.as_ref(),
         );
+        let owns_udp_routes = new_gm.has_udp_route_health();
+        if owns_udp_routes {
+            install_selector_warm_callback(&new_gm, &self.selector_warm_notify, &self.alive_set);
+        }
         if let Some(ref db) = self.cache_db {
             let db_cb = db.clone();
             new_gm.set_persist_callback(Some(Arc::new(move |group, network, member| {
                 db_cb.save_network_selector(group, network, member);
             })));
         }
-        let targets = health_registrations(
-            &config,
-            &build_outbound_id_map(&config, OutboundHealthDependency::leaf),
-        );
+        let targets = health_registrations(&config, &build_outbound_id_map(&config));
         let (added, removed) = {
             #[cfg(all(test, feature = "clash-api"))]
             let _after_unlock = self.clash_publication_pause.lock().take();
             let mut group_manager = self.group_manager.write();
             new_gm.publish_score_membership();
-            *group_manager = Arc::new(new_gm);
-            self.alive_set
-                .sync_registrations_retaining_delays(targets, |id| {
-                    group_manager.retains_manual_delay(id, &runtimes)
-                })
+            let retain_delay = |id: &uuid::Uuid| new_gm.retains_manual_delay(id, &runtimes);
+            let changes = if owns_udp_routes || group_manager.has_udp_route_health() {
+                let changes = self.alive_set.sync_registrations_retaining_routes(
+                    targets,
+                    retain_delay,
+                    |id| new_gm.retains_udp_route_health_node(*id),
+                );
+                new_gm.republish_route_health();
+                changes
+            } else {
+                self.alive_set
+                    .sync_registrations_retaining_delays(targets, retain_delay)
+            };
+            self.active_routing_plan
+                .write()
+                .rebind_manager(&group_manager, &new_gm, &config);
+            *group_manager = new_gm;
+            changes
         };
 
         // Refresh the URLTest idle table to match the published membership.

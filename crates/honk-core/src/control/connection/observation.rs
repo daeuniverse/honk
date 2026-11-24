@@ -545,16 +545,16 @@ impl ConnectionObservation {
         configured: DialMode,
         domain: Option<&str>,
         verification: &'static str,
-        selected: Option<(&Node, Option<&str>)>,
+        selected: Option<(&honk_outbound::group::OwnedTarget, Option<&str>)>,
     ) {
         let Some(record) = &self.recorded else { return };
         let (generation, target, reason) = match selected {
-            Some((node, target)) => (
+            Some((outbound, target)) => (
                 record
                     .selection
                     .as_ref()
                     .map(|selection| selection.generation),
-                target_kind(node, target),
+                target_kind(outbound, target),
                 "leaf_target_selected",
             ),
             None => (

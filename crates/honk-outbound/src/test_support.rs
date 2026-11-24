@@ -13,6 +13,12 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+/// The test binary's allocator, counting so a test can assert that a path
+/// allocates nothing. Measure in a child process: the counters are global.
+#[global_allocator]
+pub(crate) static ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> =
+    &stats_alloc::INSTRUMENTED_SYSTEM;
+
 pub(crate) fn node(name: &str, host: &str, port: u16, outbound: OutboundConfig) -> Node {
     let mut node = Node {
         name: name.into(),

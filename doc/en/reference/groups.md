@@ -37,7 +37,7 @@ group {
 | `filter: group(...)` | `[]` | Add nested group tags to `groups`; comma-separated arguments and pipe-separated tags are accepted. |
 | `default` | `null` | Initial or fallback member tag for `selector`. |
 | `final` | `null` | Target used when the policy has no eligible selection; see [`final`](#final). |
-| `exit` | `null` | Experimental. Append one proxy to the selected TCP path. It must be a [supported tunneled hop](./nodes.md#proxy-chains), not a group, chain or builtin. VLESS TCP mux and hostname-based ECH discovery are not supported on that hop. An exit provides no UDP forwarding candidate; an explicit `block` remains terminal. See [Exit](#exit). |
+| `exit` | `null` | Experimental. Append one [supported proxy hop](./nodes.md#proxy-chains) to the selected path. VLESS TCP multiplexing and hostname-based ECH discovery are unavailable on that hop. See [UDP path requirements](#udp-through-an-exit). An explicit `block` remains terminal. |
 | `check_url` | `null` | Per-group TCP health-check target for non-Selector policies; see [`check_url`](#check_url). |
 | `tolerance` | `50` | URLTest switch threshold in milliseconds; see [`tolerance`](#tolerance). |
 | `idle_timeout` | `null` | Seconds without a selection after which a URLTest group pauses member probes; see [`idle_timeout`](#idle_timeout). |
@@ -200,7 +200,7 @@ Only missing or no-longer-member choices fall through to `default` or the first 
 
 Each selected subgroup resolves its own explicit `final` before returning an empty result to its parent. This does not allow the parent to choose a different Selector sibling or to retry a terminal protocol refusal. For IPv6 targets, an ordinary selected leaf reachable through IPv4 proxy health is tried before a final route.
 
-UDP eligibility requires protocol/configuration support as well as health. VMess and explicitly TCP-only leaves are excluded before selection and Score comparison; TCP remains unaffected. An incapable Selector choice does not authorize a sibling, and built-in `block` remains terminal. This capability filter does not bypass a selected node's target-specific UDP policy refusal.
+UDP selection and Score comparison require an eligible path and matching health. A TCP-only node such as VMess can be part of a [multi-hop UDP path](#udp-through-an-exit) if it meets the path's TCP-hop requirements and the exit frames UDP. A Selector can proceed from an unavailable choice only through its configured `final`. Built-in `block` and target-specific UDP policy refusals remain terminal.
 
 When distinct nodes share a display tag, name-based defaults and Clash writes bind the first matching member's `NodeId` in declaration order before health filtering. Native member IDs can select a particular direct member. Health cannot retarget either choice to a healthy same-name sibling.
 Named `final` nodes likewise resolve the first matching configuration declaration; a healthy duplicate cannot replace it. Selection and final-node health registration use that same identity.
@@ -320,24 +320,36 @@ Clash-facing group output preserves member tags: the `all` field lists direct no
 A group with `exit: E` dials its selected leaf as a route: the leaf, then the exit of each group it was selected through, from the innermost group out.
 
 - A regular route needs an eligible leaf, reachable exits and a usable path between them. A parent checks the whole path, even when a child returns its `final`. Selector never switches to an unchosen sibling. If no regular path remains, the configured `final` applies; `block` is terminal and never dials an exit. A root with one TCP leaf and no `final` retains its existing last-resort attempt on that selected path.
-- [Exit liveness](#exit-liveness) distinguishes a failed proxy from a failed path to it. Only the outermost exit receives a confirmed fresh dial's setup latency; that latency covers all hops, not the application's response time.
-- DNS upstreams and shared downloads (subscriptions, geodata, the external UI) whose outbound is the group take the route too: UDP, TCP, DoT and DoH upstreams run over the route's TCP stream. DoQ and DoH3 upstreams need UDP, which a group with an `exit` does not offer.
+- [Exit liveness](#exit-liveness) distinguishes a failed proxy from a failed path to it. Only the outermost exit receives a confirmed fresh TCP dial's setup latency, which covers all hops up to the application exchange.
+- Shared downloads (subscriptions, geodata and the external UI) and DNS upstreams using TCP, DoT, DoH or proxied UDP use the route's TCP stream. DoQ and DoH3 require an eligible node target. See [DNS outbound selection](./dns.md#outbound-selection).
 - Probes, delay tests and the latency shown for the group measure the leaf alone. Flows and DNS flows report the leaf captured when the route was selected; the Clash connection chain also lists the route's hops.
 - When `final: direct` collapses to a single exit, the Native TCP and DNS attempt's `selection_path` ends at the built-in `direct` member, and `leaf_node_id` and `leaf_node_name` identify the exit dialed. Health and Score retry exclusion use the exit. The Clash connection chain lists the exit, then `direct`, then the groups.
 - An appended exit equal to the preceding hop is not dialed twice. A later, nonadjacent occurrence is a separate hop; the leaf's own chain is unchanged.
 - Validation rejects a route longer than four hops. It uses selection's limits (eight nested groups at most, each group once on a path, only the first node a `final` names) but is stricter than selection: it walks the groups before cycles are cut, starts from every declared group, shadowed namesakes included, and counts a group's exit stack even when the group has no leaf. So it can reject a route selection never dials.
 
+### UDP through an exit
+
+- A multi-hop UDP route follows the [chain requirements](./nodes.md#proxy-chains). Every physical hop, including the entry, must be eligible as a later TCP hop, and the exit must also support tunneled UDP. A route that collapses to one node, for example with `final: direct`, uses that node's ordinary UDP transport, including source sharing where supported. Explicit `block` is an eligible terminal member and opens no carrier, including under an exit.
+- UDP selection checks the selected leaf, the framing exit, the TCP health of preceding physical hops, and matching UDP hop and prefix health. A proxy needs no independent direct probe to serve as an exit. Existing health and confirmed routed faults still gate its eligibility. Automatic policies can choose another eligible member. A Selector's unavailable choice can proceed only through a configured `final`.
+- A synthesized multi-hop route opens one UDP transport per flow. Honk checks the selected path at bind. If the path changes before the transport accepts the first datagram, honk cancels that send, including on a one-node collapse. Once the writer has accepted bytes or taken ownership of the datagram, it can finish the same send within its original deadline. UDP warm-up targets reusable node transports.
+- A typed hop failure counts against the operation that failed on the physical proxy, either carrying the stream or framing UDP. A refusal to reach the next hop counts against the ordered prefix through that hop. Fifty independent qualifying `DataUdp` failures in the same scope and health address family make it unavailable. A shared fault counts once per scope. An ambiguous disconnect ends the affected flow. Final-target refusals, local refusals and cancellation are neutral for routed UDP health.
+- A delivered reply provides positive evidence for the path it traversed. Preparing or committing a carrier, sending a datagram and receiving a TCP response leave UDP recovery evidence unchanged. A failure scoped to `A → E` leaves `B → E` and bare `E` independent. Eligibility is evaluated for the proxy-health family in use, including the ordinary IPv4 health fallback for IPv6 targets.
+
 ### How many routes
 
 A route is composed only when a candidate is selected, and each runtime generation caches at most 4096 of them; a dial past that limit builds its route without caching it. The number of routes a configuration can produce is not linear in its size: nested exit groups multiply. Three levels of n groups, each group connected to every group of the next level and the lowest level sharing one leaf, give n³ distinct routes.
 
-The runtime cache is not a health-state limit. Honk keeps an ordering record for each physical path prefix and address family that actually returned a response, so late failures cannot erase newer proof. Positive-only records expire when a new configuration or group manager is published; confirmed failures on still-admitted paths are retained.
+The runtime cache is not a health-state limit. honk keeps response ordering by physical path prefix, health domain and address family so late failures cannot erase newer proof. Positive-only records expire when a new configuration or group manager is published. Confirmed failures on still-admitted paths are retained.
 
 ### Exit liveness
 
 An exit does not need to accept a direct connection from honk. If front `A` repeatedly refuses to reach exit `E`, ten qualifying TCP failures on the same health address family close routes starting with `A → E`. This does not close `B → E` or a direct dial to `E`. A fault identified at a physical proxy counts against that proxy; inside a configured chain it counts against the logical chain. A final destination's refusal, an ambiguous downstream disconnect, local admission failure or cancellation does not mark a proxy down.
 
-Recovery checks use an existing HTTP health target through the authorized route. A valid response on the same health address family can reopen a failed prefix if the route traversed that prefix in order; a different front reaching the same exit does not qualify. Writes, a stream without a response, and checks from a retired configuration are not proof. Without an authorized check, the prefix stays closed until eligible traffic supplies that evidence. Independent checks on ordinary registered members are unchanged.
+TCP recovery checks use an existing HTTP health target through the authorized route. A valid response on the same health address family can reopen a failed prefix if the route traversed that prefix in order. Writes, a stream without a response, a different front and checks from a retired configuration do not qualify. Without an authorized check, the prefix stays closed until eligible traffic supplies that evidence.
+
+Active UDP recovery requires explicitly configured [`global.udp_check_dns`](./global.md#udp_check_dns). An omitted or empty list authorizes no routed recovery traffic. Recovery sends a UDP DNS query through the same admitted chain or route to a configured destination in the failed health address family. A valid answer must come from the expected peer address and port and match the DNS transaction ID and question. The configuration and any Selector choice used to authorize the check must still be current. The answer can reopen only the witnessed fault scope. Ordinary node checks continue to use their effective defaults.
+
+Removing the original chain or route ends its active UDP recovery. A reply through a different front provides no recovery evidence for that path.
 
 ### Exit validation
 

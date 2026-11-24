@@ -32,7 +32,7 @@ The `src/group/` facade and its internals are split by responsibility:
 
 Selection obeys one invariant, inherited from sing-box: after resolution and liveness filtering, the dial path uses exactly the policy pick. Selector returns its effective manual choice, URLTest its current winner, LoadBalance its next member, Fallback its pin, and Score its ranked eligible leaf, including deterministic cold exploration. The only multi-candidate exception at selection time is an unmeasured top-level URLTest group; all warm URLTest and non-URLTest plans are authoritative single-leaf plans. Post-failure retry racing belongs to `connection/`, not here, and parallel racing is added nowhere else. If a group with no `final` has exactly one unique leaf and TCP liveness excludes it, that same leaf remains an authoritative last resort only when the current Selector choices reach it. Its health stays dead, but a real dial can prove recovery without leaking to another member or `direct`. UDP keeps normal liveness exclusion. Last-resort serving logs a rate-limited warning (60s per group); warm-up peeks stay silent.
 
-UDP selection first excludes forwarding leaves whose canonical protocol or configuration does not support UDP, before any health evidence exists. A live TCP state cannot qualify VMess or a TCP-only node for UDP. This also removes those leaves from Score verification and from the capable-and-alive leaf witnesses used when publishing group connectivity. Routes through a group `exit` carry TCP only, so UDP selection offers no candidate from a group with an exit or below one, and those leaves are not UDP witnesses either. `block` remains a terminal action; a Selector's incapable choice may use its configured `final`, never an unchosen sibling. Target-specific refusals such as VLESS UDP/443 rejection still terminate at admission rather than being filtered into another route.
+UDP selection checks the composed path before ordinary policy ranking and Score comparison. An ordinary node or a one-hop collapse uses its own capability. A configured chain or multi-hop group route requires every physical prefix hop, including the entry, to qualify for tunneled TCP, and the exit to support tunneled UDP. `block` remains selectable as a terminal action. An unavailable Selector choice can proceed only through its configured `final`. Target-specific refusals such as VLESS UDP/443 rejection are terminal at admission. See [UDP through an exit](../reference/groups.md#udp-through-an-exit).
 
 ## Policy semantics
 
@@ -265,17 +265,17 @@ honk writes the last real TCP delay sample per node to the state db every 60 sec
 
 ## UDP candidate eligibility
 
-`filter_alive_candidates` decides UDP selection per node and address family:
+For ordinary data UDP candidate health, once capability is established:
 
 - `DataUdp` alive or `DnsUdp` alive: selectable.
 - Both UDP domains explicitly dead: excluded, even if TCP is alive.
 - No UDP state has ever been recorded: inherit TCP liveness.
 
-This keeps a TCP-healthy but UDP-broken node from attracting packet flows without penalizing deployments that have not enabled UDP probing yet.
+Routed UDP also checks confirmed physical-hop and ordered-prefix faults for the matching domain and proxy-health family. Preceding stream hops must be healthy for TCP. A reply supplies new UDP route evidence. Active recovery requires an explicitly configured same-family DNS target and ends when the original path is removed. See [Exit liveness](../reference/groups.md#exit-liveness).
 
 ## eBPF connectivity publication
 
-The eBPF alive slot belongs to a group, not to one node. For every domain and address family, publication uses the OR of all reachable leaf-member states, plus the existing TCP admission exception for exactly one unique leaf and no `final`. A callback caused by one node transition recomputes that group value; it never writes the transitioning node's value directly. Admission does not override userspace selection: a chosen empty Selector path still refuses traffic even when this slot remains alive.
+The eBPF alive slot belongs to a group. Ordinary groups publish the OR of eligible reachable leaf states for the slot's domain and family, with the existing sole-leaf TCP admission exception. Groups with exits use the group manager's path eligibility preview. So do UDP slots of groups with a reachable UDP-capable chain. Relevant hop, prefix and Selector changes recalculate affected routed UDP slots in the committed slot numbering. Preview preserves policy counters and trial reservations. See [Outbound liveness](./datapath.md#outbound-liveness).
 
 Reload first sets every slot needed by the old or new group layout to alive, making the transition fail-open. After the new routing generation is published, honk writes the exact new group snapshot. Reordered groups therefore cannot inherit stale ordinal state; if exact publication fails partway, unfilled transition slots remain fail-open rather than falsely killing a group.
 

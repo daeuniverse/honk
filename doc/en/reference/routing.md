@@ -248,7 +248,9 @@ A broad `dip(geoip: private) -> direct(must)` also bypasses LAN private DNS. If 
 
 ## Fail-closed behavior
 
-When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`. It never leaks those flows through `direct`. One case stays dialable: a TCP group with exactly one unique leaf and no `final` keeps that leaf as a last resort, so real traffic can prove recovery. UDP groups and multi-leaf groups with every member dead stay fail-closed. A group containing a `direct`/`block` builtin never goes dead, because the builtins are never marked dead and the group-OR slot stays alive. Destination port `53` is exempt from health drops on LAN ingress and WAN egress, for both TCP and UDP. That exemption does not override a terminal user `must` result; without one, DNS can still reach the control plane.
+When health checking marks an outbound dead, the eBPF datapath normally drops new flows routed to it with `TC_ACT_SHOT`. The configured outbound remains authoritative. A TCP group with one unique leaf and no `final` can still try that proxy so real traffic can prove recovery. A reachable `direct` or `block` keeps an ordinary group's slot open. For exit routes and UDP-capable chains, the current policy must admit a path. A selected `block` reaches userspace for rejection. See [outbound liveness](../design/datapath.md#outbound-liveness).
+
+TCP and UDP destination port `53` are exempt from health drops on LAN ingress and WAN egress. Terminal `must` rules still apply. Other DNS traffic can reach the control plane.
 
 For an outage-tolerant gateway:
 

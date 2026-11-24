@@ -60,10 +60,17 @@ async fn health_push_re_resolves_after_reload_writer() {
             },
         ],
     );
-    let config = Arc::new(RwLock::new(Arc::new(old_config.clone())));
+    let old_config = Arc::new(old_config);
+    let config = Arc::new(RwLock::new(Arc::clone(&old_config)));
     let group_manager: SharedGroupManager = Arc::new(parking_lot::RwLock::new(Arc::new(
         GroupManager::new(&old_config.groups, &old_config.nodes),
     )));
+    let compile = |config: &Arc<Config>, generation| {
+        let router = Router::from_config(&config.routing).unwrap();
+        let plan = Arc::new(ControlPlane::compile_routing_plan(config, &router).unwrap());
+        routing_matcher::ActiveRoutingPlan::new(plan, &group_manager.read(), generation, config)
+    };
+    let routing_plan = Arc::new(parking_lot::RwLock::new(compile(&old_config, 1)));
     let alive_set = Arc::new(AliveDialerSet::new());
     let ebpf: Arc<RwLock<Box<dyn EbpfBackend>>> = Arc::new(RwLock::new(Box::new(
         crate::ebpf::mock::MockEbpfBackend::new(),
@@ -71,6 +78,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     let health_publisher = Arc::new(runtime::OutboundHealthPublisher::new(
         Arc::clone(&ebpf),
         Arc::clone(&config),
+        Arc::clone(&routing_plan),
         Arc::clone(&group_manager),
         Arc::clone(&alive_set),
     ));
@@ -81,6 +89,7 @@ async fn health_push_re_resolves_after_reload_writer() {
     backend_writer.set_outbound_alive(3, 1, 0, false).unwrap();
     *config_writer = Arc::new(new_config.clone());
     *group_manager.write() = Arc::new(GroupManager::new(&new_config.groups, &new_config.nodes));
+    *routing_plan.write() = compile(&config_writer, 2);
 
     let update = tokio::spawn(Arc::clone(&health_publisher).publish(Some(node.id), Some((1, 0))));
     tokio::task::yield_now().await;
@@ -3562,8 +3571,8 @@ fn resolve_udp_score_plan(
     manager: &GroupManager,
     outbound: &str,
     ipver: IpVersion,
-) -> ResolvedUdpPlan {
-    resolve_udp_outbound_plan_for_target(
+) -> ResolvedScorePlan {
+    resolve_outbound_plan_for_target(
         config,
         manager,
         outbound,
@@ -3619,7 +3628,7 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
         let context =
             crate::group::ScoreSelectionContext::aggregate(network, domain, IpVersion::V6);
         assert!(
-            super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
+            resolve_outbound_plan_for_target(
                 &config,
                 &manager,
                 "selector",
@@ -3629,18 +3638,18 @@ fn resolve_selector_refusal_uses_only_explicit_final() {
             .targets
             .is_empty()
         );
-        let plan = super::reload::resolve_outbound_plan_for_target::<honk_config::node::Node>(
+        let plan = resolve_outbound_plan_for_target(
             &config,
             &manager,
             "selector-final",
             &context,
-            crate::control::reload::OutboundConstraint::Any,
+            OutboundConstraint::Any,
         );
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
         assert_eq!(
             plan.targets
                 .iter()
-                .map(|node| node.name.as_str())
+                .map(|target| target.node.name.as_str())
                 .collect::<Vec<_>>(),
             ["block"]
         );
@@ -3689,9 +3698,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     assert_eq!(direct.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         direct
-            .nodes
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["direct"]
     );
@@ -3699,9 +3708,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     let node = resolve_udp_score_plan(&config, &manager, "first", IpVersion::V4);
     assert_eq!(node.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
-        node.nodes
+        node.targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first"]
     );
@@ -3710,9 +3719,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     assert_eq!(nested.mode, crate::group::SelectionPlanMode::Authoritative);
     assert_eq!(
         nested
-            .nodes
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first"]
     );
@@ -3724,9 +3733,9 @@ fn resolve_udp_score_plan_preserves_terminal_provenance() {
     );
     assert_eq!(
         final_plan
-            .nodes
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["first", "second"]
     );
@@ -3782,39 +3791,39 @@ fn resolve_udp_score_plan_tracks_v4_fallback_and_final_resolution_guards() {
         v4_fallback.mode,
         crate::group::SelectionPlanMode::ColdUrlTest
     );
-    assert_eq!(v4_fallback.ipver, IpVersion::V4);
+    assert_eq!(v4_fallback.health_family, IpVersion::V4);
     assert_eq!(
         v4_fallback
-            .nodes
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["v4-only"]
     );
 
     let empty = resolve_udp_score_plan(&config, &manager, "empty", IpVersion::V4);
-    assert!(empty.nodes.is_empty());
+    assert!(empty.targets.is_empty());
     assert_eq!(empty.mode, crate::group::SelectionPlanMode::Authoritative);
 
     let missing = resolve_udp_score_plan(&config, &manager, "missing-final", IpVersion::V4);
     assert!(
-        missing.nodes.is_empty(),
+        missing.targets.is_empty(),
         "an unresolved final must not bypass group policy"
     );
 
     let unknown = resolve_udp_score_plan(&config, &manager, "not-configured", IpVersion::V4);
     assert_eq!(
         unknown
-            .nodes
+            .targets
             .iter()
-            .map(|node| node.name.as_str())
+            .map(|target| target.node.name.as_str())
             .collect::<Vec<_>>(),
         ["direct"]
     );
 
     let cycle = resolve_udp_score_plan(&config, &manager, "cycle-a", IpVersion::V4);
     assert!(
-        cycle.nodes.is_empty(),
+        cycle.targets.is_empty(),
         "final cycles fail closed instead of bypassing policy"
     );
 }
@@ -3843,11 +3852,11 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     for outbound in ["v4-explicit", "final-to-explicit"] {
         let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
         assert_eq!(plan.mode, crate::group::SelectionPlanMode::Authoritative);
-        assert_eq!(plan.ipver, IpVersion::V4, "{outbound}");
+        assert_eq!(plan.health_family, IpVersion::V4, "{outbound}");
         assert_eq!(
-            plan.nodes
+            plan.targets
                 .iter()
-                .map(|node| node.name.as_str())
+                .map(|target| target.node.name.as_str())
                 .collect::<Vec<_>>(),
             ["v4-explicit"],
             "{outbound}"
@@ -3856,11 +3865,11 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
 
     for outbound in ["direct", "block"] {
         let plan = resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6);
-        assert_eq!(plan.ipver, IpVersion::V6, "{outbound}");
+        assert_eq!(plan.health_family, IpVersion::V6, "{outbound}");
         assert_eq!(
-            plan.nodes
+            plan.targets
                 .iter()
-                .map(|node| node.name.as_str())
+                .map(|target| target.node.name.as_str())
                 .collect::<Vec<_>>(),
             [outbound]
         );
@@ -3872,7 +3881,7 @@ fn resolve_udp_score_plan_explicit_node_falls_back_to_v4_through_final() {
     for outbound in ["v4-explicit", "final-to-explicit"] {
         assert!(
             resolve_udp_score_plan(&config, &manager, outbound, IpVersion::V6)
-                .nodes
+                .targets
                 .is_empty(),
             "{outbound} must stay empty when neither family is selectable"
         );
@@ -3891,7 +3900,7 @@ fn resolve_udp_score_plan_excludes_unselectable_explicit_node() {
 
     let plan = resolve_udp_score_plan(&config, &manager, "udp-test", IpVersion::V4);
 
-    assert!(plan.nodes.is_empty());
+    assert!(plan.targets.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -3905,7 +3914,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> = {
+    let prepare: UdpPrepare<String, Node> = {
         let starts = starts.clone();
         let active = active.clone();
         let max_active = max_active.clone();
@@ -3942,7 +3951,7 @@ async fn udp_stagger_uses_absolute_offsets_bounds_inflight_and_drains_losers() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4046,7 +4055,7 @@ async fn udp_stagger_drain_counts_error_but_rejection_prevents_winner() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> = {
+    let prepare: UdpPrepare<String, Node> = {
         let release = release.clone();
         Arc::new(move |_: usize, node: Node| {
             let release = release.clone();
@@ -4068,7 +4077,7 @@ async fn udp_stagger_drain_counts_error_but_rejection_prevents_winner() {
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4121,12 +4130,12 @@ async fn udp_stagger_authoritative_prepares_only_the_current_node_without_delay(
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> =
+    let prepare: UdpPrepare<String, Node> =
         Arc::new(|_: usize, node: Node| Box::pin(async move { Ok(node.name) }));
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
-        on_dial_error: Arc::new(|_| panic!("authoritative success must not report an error")),
+        on_dial_error: Arc::new(|_, _| panic!("authoritative success must not report an error")),
         on_attempt: {
             let attempts = attempts.clone();
             Arc::new(move || {
@@ -4177,14 +4186,14 @@ async fn udp_stagger_authoritative_failure_preserves_fixed_metric_zeros() {
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let winners = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> =
+    let prepare: UdpPrepare<(), Node> =
         Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4236,14 +4245,14 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let errors = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let cancellations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<()> =
+    let prepare: UdpPrepare<(), Node> =
         Arc::new(|_: usize, _: Node| Box::pin(async { Err(anyhow::anyhow!("dial failed")) }));
     let callbacks = UdpStaggerCallbacks {
         allows_target: Arc::new(|_| true),
         is_eligible: Arc::new(|_| true),
         on_dial_error: {
             let errors = errors.clone();
-            Arc::new(move |_| {
+            Arc::new(move |_, _| {
                 errors.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             })
         },
@@ -4288,7 +4297,7 @@ async fn udp_stagger_all_dial_failures_report_health_without_cancellation() {
 async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() {
     let became_ineligible = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let prepare: UdpPrepare<String> = {
+    let prepare: UdpPrepare<String, Node> = {
         let became_ineligible = became_ineligible.clone();
         Arc::new(move |_: usize, node: Node| {
             let became_ineligible = became_ineligible.clone();
@@ -4301,7 +4310,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
         })
     };
     let callbacks = UdpStaggerCallbacks {
-        allows_target: Arc::new(|_| true),
+        allows_target: Arc::new(|_: &Node| true),
         is_eligible: {
             let became_ineligible = became_ineligible.clone();
             Arc::new(move |node| {
@@ -4309,7 +4318,7 @@ async fn udp_stagger_rechecks_eligibility_before_accepting_prepared_transport() 
                     || !became_ineligible.load(std::sync::atomic::Ordering::SeqCst)
             })
         },
-        on_dial_error: Arc::new(|_| panic!("prepared success is not a dial error")),
+        on_dial_error: Arc::new(|_, _| panic!("prepared success is not a dial error")),
         on_attempt: {
             let attempts = attempts.clone();
             Arc::new(move || {
@@ -5146,7 +5155,7 @@ fn nfqueue_tc_netns_direct_proxy_contract() -> anyhow::Result<()> {
             )));
             control.start_datapath_flags_coordinator()?;
             {
-                let plan = control.active_routing_plan.read().clone();
+                let plan = control.active_routing_plan.read().plan.clone();
                 let mut ebpf = control.ebpf.write().await;
                 ebpf.publish_routing_plan(&plan, &[])?;
             }

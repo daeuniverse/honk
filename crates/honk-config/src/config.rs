@@ -127,8 +127,12 @@ pub struct GlobalConfig {
     pub tcp_check_url: Vec<String>,
     #[serde(default = "default_tcp_check_http_method")]
     pub tcp_check_http_method: String,
-    #[serde(default = "default_udp_check_dns")]
-    pub udp_check_dns: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "explicit_udp_check_dns"
+    )]
+    pub udp_check_dns: Option<Vec<String>>,
     #[serde(default = "default_check_interval_secs")]
     pub check_interval_secs: u64,
     #[serde(default = "default_check_tolerance_ms")]
@@ -189,6 +193,13 @@ pub struct GlobalConfig {
 }
 
 impl GlobalConfig {
+    /// Ordinary node and CLI probes use the default targets when the setting is omitted.
+    pub fn effective_udp_check_dns(&self) -> &[String] {
+        static DEFAULT: std::sync::LazyLock<Vec<String>> =
+            std::sync::LazyLock::new(default_udp_check_dns);
+        self.udp_check_dns.as_deref().unwrap_or_else(|| &DEFAULT)
+    }
+
     /// Process socket mark; zero retains the historical bypass mark.
     pub fn effective_so_mark(&self) -> u32 {
         if self.so_mark_from_dae == 0 {
@@ -354,6 +365,11 @@ fn default_tcp_check_urls() -> Vec<String> {
 fn default_tcp_check_http_method() -> String {
     "HEAD".into()
 }
+fn explicit_udp_check_dns<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    Vec::deserialize(deserializer).map(Some)
+}
 fn default_udp_check_dns() -> Vec<String> {
     vec![
         "dns.google:53".into(),
@@ -437,7 +453,7 @@ impl Default for GlobalConfig {
             store_subscribe: default_store_subscribe(),
             tcp_check_url: default_tcp_check_urls(),
             tcp_check_http_method: default_tcp_check_http_method(),
-            udp_check_dns: default_udp_check_dns(),
+            udp_check_dns: None,
             check_interval_secs: default_check_interval_secs(),
             check_tolerance_ms: default_check_tolerance_ms(),
             dial_mode: default_dial_mode(),
@@ -931,7 +947,8 @@ impl Config {
             }
         }
 
-        if let Err(mut error) = crate::check::validate_dns_check_targets(&self.global.udp_check_dns)
+        if let Err(mut error) =
+            crate::check::validate_dns_check_targets(self.global.effective_udp_check_dns())
         {
             error.diagnostic.source = source.clone();
             return Err(error);

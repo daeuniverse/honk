@@ -23,6 +23,12 @@ pub struct ChainHopFailure {
     pub error: anyhow::Error,
 }
 
+/// A UDP entry can fail before a physical connect is attempted. Its locator
+/// identifies the executing hop; attribution still requires a typed cause.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(super) struct UdpEntrySetupFailure(#[source] pub(super) ChainHopFailure);
+
 /// A target refusal from a hop that was asked to reach the next proxy.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum IntermediateTargetFailure {
@@ -292,7 +298,10 @@ pub fn dial_failure_scope(error: &(dyn std::error::Error + 'static)) -> DialFail
         DialFailureScope::Hop(0)
     } else {
         match find_cause::<ChainHopFailure>(error) {
-            Some(failure) if failure.hop == 0 || node_failure_episode(error).is_some() => {
+            Some(failure)
+                if (failure.hop == 0 && find_cause::<UdpEntrySetupFailure>(error).is_none())
+                    || node_failure_episode(error).is_some() =>
+            {
                 DialFailureScope::Hop(failure.hop)
             }
             _ => DialFailureScope::Unattributed,

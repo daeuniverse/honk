@@ -43,6 +43,11 @@ impl RouteRuntime {
         Some(Self { hops })
     }
 
+    /// Intrinsic UDP capability of the entire captured hop sequence.
+    pub fn udp_capable(&self) -> bool {
+        crate::descriptor::tunneled_hops_carry_udp(self.hops(), |hop| Some(hop.node.as_ref()))
+    }
+
     /// The hop runtimes, entry first.
     pub fn hops(&self) -> &[Arc<NodeRuntime>] {
         match &self.hops {

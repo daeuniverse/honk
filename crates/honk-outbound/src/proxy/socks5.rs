@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 use tracing::debug;
 
+use super::packet::send_with_admission_check;
 use super::{
     AsyncReadWrite, MultiTargetTransport, PacketOutbound, PacketTransport, PreparedUdpTransport,
     ProbeableOutbound, ProxyStream, SharedSourceOutbound, TcpOutbound, TunnelDialOptions,
@@ -628,6 +629,25 @@ impl MultiTargetTransport for Socks5UdpTransport {
     ) -> io::Result<()> {
         let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
         self.send(target, domain, data, admitted).await
+    }
+
+    async fn send_to_checked(
+        &self,
+        target: SocketAddr,
+        domain: Option<&str>,
+        data: &[u8],
+        admitted: Option<&AtomicBool>,
+        current: &(dyn Fn() -> bool + Send + Sync),
+    ) -> io::Result<()> {
+        let local_admitted = AtomicBool::new(false);
+        let admitted = admitted.unwrap_or(&local_admitted);
+        let domain = crate::proxy::addr::dialed_name(self.target_domain.as_deref(), domain);
+        send_with_admission_check(
+            self.send(target, domain, data, Some(admitted)),
+            admitted,
+            current,
+        )
+        .await
     }
 
     fn carrier_addr(&self) -> Option<SocketAddr> {

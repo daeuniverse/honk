@@ -97,7 +97,7 @@ fn ordered_prefix_threshold_shared_episode_and_traffic_aba() {
     }
     // The same cause does not consume another ordered prefix's claim.
     assert!(refuse(&gm, "B", &b, V4, &second));
-    let b_prefix = Prefix::new(physical_hops(&b.key()), V4);
+    let b_prefix = Prefix::new(physical_hops(&b.key()), RouteScope::new(TCP, V4));
     assert_eq!(alive.route_health.read().rows[&b_prefix].failures, 1);
     let refusal = crate::proxy::test_prefix_refusal(1);
     for _ in 3..traffic_failure_threshold(TCP) {
@@ -172,7 +172,7 @@ fn ordered_prefix_threshold_shared_episode_and_traffic_aba() {
 
     gm.publish_route_health();
     assert!(!refuse(&gm, "A", &a, V4, &first));
-    let a_prefix = Prefix::new(physical_hops(&a.key()), V4);
+    let a_prefix = Prefix::new(physical_hops(&a.key()), RouteScope::new(TCP, V4));
     assert!(!alive.route_health.read().rows.contains_key(&a_prefix));
 }
 
@@ -335,7 +335,7 @@ fn stale_http_and_business_successes_keep_the_original_hop_witness() {
         let b_revision = gm.route_health_revision("B");
         let (a, b) = (pick(&gm, "A"), pick(&gm, "B"));
         let id = a.key().success_owner();
-        let prefix = Prefix::new(physical_hops(&a.key()), V4);
+        let prefix = Prefix::new(physical_hops(&a.key()), RouteScope::new(TCP, V4));
         let fault = ChainHopFailure {
             node: id,
             hop: 1,
@@ -421,7 +421,7 @@ fn a_ticket_cannot_recover_a_replacement_hop_episode() {
     let revision = gm.route_health_revision("A");
     let a = pick(&gm, "A");
     let id = a.key().success_owner();
-    let prefix = Prefix::new(physical_hops(&a.key()), V4);
+    let prefix = Prefix::new(physical_hops(&a.key()), RouteScope::new(TCP, V4));
     let fault = ChainHopFailure {
         node: id,
         hop: 1,
@@ -616,7 +616,7 @@ fn releasing_old_ticket_during_deregistration_preserves_the_staged_hop() {
         );
         assert!(!alive.is_alive_for(exit.id, TCP, V4));
         assert!(alive.is_alive_for(exit.id, TCP, V6));
-        let prefix = Prefix::new(physical_hops(&a.key()), V4);
+        let prefix = Prefix::new(physical_hops(&a.key()), RouteScope::new(TCP, V4));
         alive
             .route_health
             .write()
@@ -648,12 +648,12 @@ fn selector_change_fences_probe_and_never_borrows_its_custom_url() {
             .route_failed(
                 Failure {
                     manager: &gm,
-                    root: "root",
-                    target: a.key(),
-                    family: V4,
+                    witness: (Some("root"), a.key(), None),
+                    udp: None,
+                    hops: a.route().unwrap().hops(),
+                    scope: RouteScope::new(TCP, V4),
                     selector: stamp.selector,
                     stamp,
-                    custom_url: None,
                     end: 1,
                     node: None,
                     prefix: true,
@@ -827,7 +827,7 @@ fn first_proof_fences_older_attempts_only_on_its_actual_prefix() {
             "proof via {proof_root}"
         );
         if proof_root == "A" {
-            let prefix = Prefix::new(physical_hops(&a.key()), V4);
+            let prefix = Prefix::new(physical_hops(&a.key()), RouteScope::new(TCP, V4));
             {
                 let state = alive.route_health.read();
                 assert!(!state.rows.contains_key(&prefix));
@@ -841,3 +841,5 @@ fn first_proof_fences_older_attempts_only_on_its_actual_prefix() {
         }
     }
 }
+
+mod udp;

@@ -1,4 +1,4 @@
-use super::{assert_route, decision, input, object};
+use super::{DialMode, Router, assert_route, decision, input, object, outbound_ids};
 use crate::control::routing_matcher::{
     KernelAction, KernelCondition, KernelPredicate, KernelRule, RoutingFactMaps, RoutingPushPlan,
 };
@@ -71,70 +71,60 @@ fn mac_key(mac: [u8; 6]) -> LpmKey {
 }
 
 fn readiness_plan(facts: RoutingFactMaps) -> RoutingPushPlan {
-    RoutingPushPlan {
-        rules: vec![
-            // Each failure edge is deliberately reachable: the scalar gate can
-            // fail before any fact, while each fact and the family gate can fail
-            // after a different prefix of the fact categories was computed.
-            kernel_rule(
-                0,
-                vec![
-                    condition(false, KernelPredicate::Protocol(1)),
-                    condition(false, KernelPredicate::DestinationIp(0)),
-                    condition(false, KernelPredicate::SourceIp(0)),
-                    condition(false, KernelPredicate::Mac(0)),
-                    condition(false, KernelPredicate::IpVersion(1)),
-                ],
-                0,
-                0xa00,
-                false,
-            ),
-            kernel_rule(
-                1,
-                vec![
-                    condition(false, KernelPredicate::DestinationIp(1)),
-                    condition(false, KernelPredicate::SourceIp(1)),
-                    condition(false, KernelPredicate::Mac(1)),
-                ],
-                2,
-                0xa01,
-                true,
-            ),
-            kernel_rule(
-                2,
-                vec![condition(true, KernelPredicate::DestinationIp(1))],
-                1,
-                0xa02,
-                false,
-            ),
-            kernel_rule(
-                3,
-                vec![condition(true, KernelPredicate::SourceIp(1))],
-                1,
-                0xa03,
-                false,
-            ),
-            kernel_rule(
-                4,
-                vec![condition(true, KernelPredicate::Mac(1))],
-                1,
-                0xa04,
-                false,
-            ),
-        ],
-        facts,
-        fallback: KernelAction {
-            outbound: 0,
-            must: false,
-            mark: 0,
-            direct_mark_index: None,
-        },
-        features: 0,
-        fingerprint: [0; 32],
-        has_domain_rules: false,
-        domain_predicate_count: 0,
-        trace_enabled: false,
-    }
+    let router = Router::new(&[], "direct").unwrap();
+    let mut plan = RoutingPushPlan::compile(&router, &outbound_ids(), DialMode::Ip).unwrap();
+    plan.rules = vec![
+        // Each failure edge is deliberately reachable: the scalar gate can
+        // fail before any fact, while each fact and the family gate can fail
+        // after a different prefix of the fact categories was computed.
+        kernel_rule(
+            0,
+            vec![
+                condition(false, KernelPredicate::Protocol(1)),
+                condition(false, KernelPredicate::DestinationIp(0)),
+                condition(false, KernelPredicate::SourceIp(0)),
+                condition(false, KernelPredicate::Mac(0)),
+                condition(false, KernelPredicate::IpVersion(1)),
+            ],
+            0,
+            0xa00,
+            false,
+        ),
+        kernel_rule(
+            1,
+            vec![
+                condition(false, KernelPredicate::DestinationIp(1)),
+                condition(false, KernelPredicate::SourceIp(1)),
+                condition(false, KernelPredicate::Mac(1)),
+            ],
+            2,
+            0xa01,
+            true,
+        ),
+        kernel_rule(
+            2,
+            vec![condition(true, KernelPredicate::DestinationIp(1))],
+            1,
+            0xa02,
+            false,
+        ),
+        kernel_rule(
+            3,
+            vec![condition(true, KernelPredicate::SourceIp(1))],
+            1,
+            0xa03,
+            false,
+        ),
+        kernel_rule(
+            4,
+            vec![condition(true, KernelPredicate::Mac(1))],
+            1,
+            0xa04,
+            false,
+        ),
+    ];
+    plan.facts = facts;
+    plan
 }
 
 #[test]

@@ -1,5 +1,6 @@
 //! Shared-source UDP against REAL sing-box inbounds (Shadowsocks legacy and
-//! 2022, Trojan, SOCKS5, AnyTLS, VLESS UoT v2 and H2MUX), through the public
+//! 2022, Trojan, SOCKS5, AnyTLS, VLESS UoT v2 and H2MUX, and Trojan through a
+//! chain fronted by the SOCKS5 inbound), through the public
 //! `ProxyRegistry::prepare_shared_source` entry. Needs only `sing-box` (`HONK_SING_BOX_BIN`
 //! or PATH); every listener and peer is loopback.
 //!
@@ -476,11 +477,27 @@ async fn sing_box_shared_source_eim_eif_and_domain_matrix() {
     };
     let (a, b) = (peers.a.addr, peers.b.addr);
 
+    let mut cases: Vec<(&str, Vec<Node>)> = protos
+        .iter()
+        .map(|proto| (proto.name, vec![proto.node.clone()]))
+        .collect();
+    // sing-box's SOCKS5 inbound fronts its own Trojan inbound.
+    let hop = |name: &str| {
+        protos
+            .iter()
+            .find(|proto| proto.name == name)
+            .unwrap()
+            .node
+            .clone()
+    };
+    let (front, exit) = (hop("socks5"), hop("trojan"));
+    let via = Node::chain_from_nodes("via", &[&front, &exit]).expect("bind UDP chain");
+    cases.push(("trojan via socks5 chain", vec![via, front, exit]));
+
     let mut matrix = Vec::new();
-    for proto in &protos {
-        let nodes = [proto.node.clone()];
-        let registry = Arc::new(OutboundRuntimeRegistry::build(&nodes).unwrap());
-        let runtime = registry.get(&proto.node.id).unwrap();
+    for (name, nodes) in &cases {
+        let registry = Arc::new(OutboundRuntimeRegistry::build(nodes).unwrap());
+        let runtime = registry.get(&nodes[0].id).unwrap();
         let (eim, eif) = eim_eif(&runtime, &peers).await;
         let rows = [
             ("EIM a,b,a,b numeric", eim),
@@ -543,7 +560,7 @@ async fn sing_box_shared_source_eim_eif_and_domain_matrix() {
             ),
         ];
         for (label, result) in rows {
-            matrix.push((proto.name, label, result));
+            matrix.push((*name, label, result));
         }
         registry.shutdown().await;
     }

@@ -15,6 +15,15 @@ pub trait RouteHttpProber: Send + Sync {
         ticket: &RouteProbeTicket,
         deadline: Deadline,
     ) -> anyhow::Result<Option<ProbeMeasurement>>;
+
+    /// The core publisher commits the result under its active manager and runtime guards.
+    async fn probe_route_udp(
+        &self,
+        alive: &AliveDialerSet,
+        ticket: &RouteProbeTicket,
+        deadline: Deadline,
+        cancel: ProbeCancellation,
+    ) -> anyhow::Result<()>;
 }
 
 impl AliveDialerSet {
@@ -70,6 +79,69 @@ impl AliveDialerSet {
         Ok(addrs)
     }
 
+    /// Prefer configured literals in the claimed family. An accepted resolver is the
+    /// only authority for a configured hostname; it cannot redirect the check's port.
+    pub async fn route_udp_probe_addr(
+        &self,
+        ticket: &RouteProbeTicket,
+        allowed_port: impl Fn(u16) -> bool,
+        resolve: Option<&ResolveHook>,
+    ) -> anyhow::Result<Option<SocketAddr>> {
+        use honk_config::check::{DnsCheckTarget, decode_dns_check_target};
+        let Some(values) = ticket.udp_check_dns() else {
+            return Ok(None);
+        };
+        if !ticket.is_current() {
+            return Ok(None);
+        }
+        let entries = || values.iter().filter(|raw| !raw.trim().is_empty());
+        let same_family = |addr: SocketAddr| {
+            let addr = SocketAddr::new(addr.ip().to_canonical(), addr.port());
+            (addr.is_ipv4() == (ticket.family() == IpVersion::V4)).then_some(addr)
+        };
+        for raw in entries() {
+            if let DnsCheckTarget::Literal(addr) = decode_dns_check_target(raw)?
+                && let Some(addr) = same_family(addr)
+            {
+                if !allowed_port(addr.port()) {
+                    return Err(crate::proxy::PacketRejection::Policy.into());
+                }
+                return Ok(ticket.is_current().then_some(addr));
+            }
+        }
+        for raw in entries() {
+            let DnsCheckTarget::Domain { host, port } = decode_dns_check_target(raw)? else {
+                continue;
+            };
+            if !ticket.is_current() {
+                return Ok(None);
+            }
+            if !allowed_port(port) {
+                return Err(crate::proxy::PacketRejection::Policy.into());
+            }
+            let Some(resolve) = resolve else {
+                return Ok(None);
+            };
+            let result = resolve(host.to_owned(), port).await;
+            if !ticket.is_current() {
+                return Ok(None);
+            }
+            match result {
+                Ok(addrs) => {
+                    if let Some(addr) = addrs
+                        .into_iter()
+                        .find_map(|addr| same_family(SocketAddr::new(addr.ip(), port)))
+                    {
+                        return Ok(Some(addr));
+                    }
+                }
+                Err(error) if crate::proxy::is_packet_rejection(&error) => return Err(error),
+                Err(_) => (),
+            }
+        }
+        Ok(None)
+    }
+
     pub(super) async fn probe_failed_route(
         &self,
         prober: &dyn RouteHttpProber,
@@ -78,6 +150,15 @@ impl AliveDialerSet {
         cancel: ProbeCancellation,
     ) {
         if Deadline::now() >= deadline || !ticket.is_current() {
+            return;
+        }
+        if ticket.domain() != ProbeDomain::Tcp {
+            let operation = prober.probe_route_udp(self, &ticket, deadline, cancel.clone());
+            // Core owns the absolute I/O timeout as well as the registry it captured.
+            // Let it commit that timeout under its current manager/runtime guards.
+            if let Some(Err(error)) = cancel.run(operation).await {
+                tracing::debug!(%error, family = ?ticket.family(), "Routed UDP recovery probe failed");
+            }
             return;
         }
         let result = cancel
@@ -92,7 +173,7 @@ impl AliveDialerSet {
         let success = match result {
             Some(Ok(Ok(Some(_)))) => Deadline::now() < deadline,
             Some(Ok(Err(error))) if !crate::proxy::is_packet_rejection(&error) => {
-                tracing::debug!(%error, family = ?ticket.family(), "Routed HTTP recovery probe failed");
+                tracing::debug!(%error, domain = ?ticket.domain(), family = ?ticket.family(), "Routed recovery probe failed");
                 false
             }
             Some(Err(_)) => false,

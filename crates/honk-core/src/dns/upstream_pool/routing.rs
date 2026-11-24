@@ -14,7 +14,7 @@ use tracing::debug;
 
 use super::UpstreamPool;
 use super::entries::UpstreamEntry;
-use crate::dns::transport::{RouteExchange, RouteFailures};
+use crate::dns::transport::{RouteExchange, RouteFailures, TcpRouteExchange};
 use crate::routing::ConnectionInfo;
 
 fn policy_block(reason: &'static str) -> anyhow::Error {
@@ -56,18 +56,24 @@ struct SelectedRouteHealth {
 impl DnsDialRoute {
     pub(super) fn route_exchange<'a>(
         &'a self,
+        protocol: DnsProtocol,
         reported_failures: &'a mut RouteFailures,
     ) -> Option<RouteExchange<'a>> {
-        let health = self.health.as_ref()?;
         let target = self.node.as_ref()?;
-        Some(RouteExchange {
+        let Some(health) = self.health.as_ref() else {
+            return (target.uses_route_evidence()
+                || matches!(protocol, DnsProtocol::Quic | DnsProtocol::H3)
+                    && target.node.resolved_chain_hops().is_some())
+            .then_some(RouteExchange::Packet(target));
+        };
+        Some(RouteExchange::Tcp(TcpRouteExchange {
             manager: &health.manager,
             group: &health.group,
             family: health.family,
             revision: health.revision,
             target,
             reported_failures,
-        })
+        }))
     }
 }
 
@@ -141,7 +147,12 @@ fn select_group_leaf_for_target(
         return Ok(None);
     }
     let context = target_context(entry, target);
-    let select = || group_manager.dial_plan_for_target(outbound, &context, original);
+    let select = || match entry.protocol {
+        DnsProtocol::Quic | DnsProtocol::H3 => {
+            group_manager.node_packet_dial_plan(outbound, &context, original)
+        }
+        _ => group_manager.dial_plan_for_target(outbound, &context, original),
+    };
     let (plan, revision) = match honk_outbound::runtime::flow_observation::current() {
         Some(observer) => observer.sync_scope(select),
         None => select(),
@@ -166,12 +177,14 @@ fn select_group_leaf_for_target(
             &dialed,
             family,
         ),
-        health: dialed.uses_route_evidence().then(|| SelectedRouteHealth {
-            manager: Arc::clone(group_manager),
-            group: outbound.to_owned(),
-            family,
-            revision,
-        }),
+        health: (context.network == SelectionNetwork::Tcp && dialed.uses_route_evidence()).then(
+            || SelectedRouteHealth {
+                manager: Arc::clone(group_manager),
+                group: outbound.to_owned(),
+                family,
+                revision,
+            },
+        ),
         node: Some(dialed),
         feedback: selected.feedback,
     }))
@@ -407,5 +420,18 @@ impl UpstreamPool {
             .await?
             .node
             .map(|target| target.node))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn selected_dial_context_for_test(
+        &self,
+        upstream: &str,
+        target: SocketAddr,
+    ) -> anyhow::Result<crate::dns::transport::DialContext> {
+        let entry = &self.entries[upstream];
+        let route = self
+            .resolve_dial_route_for_address(entry, target, None)
+            .await?;
+        self.dial_context(entry, route.node.as_ref(), route.target)
     }
 }

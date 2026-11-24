@@ -193,7 +193,7 @@ pub struct ControlPlane {
     degradations: Arc<crate::degradations::Degradations>,
     /// Built by `configure_health_loop`; a reload updates whether it is needed.
     quic_score_target: Option<Arc<probers::QuicScoreProbeTarget>>,
-    /// Node ID → callback slot and route-dependency flag, published with the manager.
+    /// First group slot for raw health callbacks, extended with routed dependencies.
     outbound_id_map: Arc<parking_lot::RwLock<OutboundHealthIndex>>,
     resource_budget: ResourceBudget,
     dns_socket_budget: crate::dns::transport::DnsSocketBudget,
@@ -237,7 +237,7 @@ pub struct ControlPlane {
     shutdown_requested: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(feature = "clash-api")]
     ui_download: Arc<tokio::sync::Mutex<Option<crate::clash_api::ui::UiDownloadTask>>>,
-    active_routing_plan: Arc<parking_lot::RwLock<Arc<routing_matcher::RoutingPushPlan>>>,
+    active_routing_plan: routing_matcher::SharedRoutingPlan,
     #[cfg(feature = "reload-bench-counters")]
     reload_slow_path_entries: std::sync::atomic::AtomicU64,
     #[cfg(test)]
@@ -477,6 +477,17 @@ impl ControlPlane {
             .map_err(|_| anyhow::anyhow!("invalid global.dial_mode"))?;
         let mut plan =
             routing_matcher::RoutingPushPlan::compile(router, &outbound_name_to_id, dial_mode)?;
+        plan.group_slots = config
+            .groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                let name = outbound_name_to_id
+                    .remove_entry(group.name.as_str())
+                    .map_or_else(|| group.name.clone(), |(name, _)| name);
+                (OutboundIndex::UserBase as u8 + index as u8, name)
+            })
+            .collect();
         plan.enable_trace(
             cfg!(feature = "native-api")
                 && config.experimental.native_api.enabled

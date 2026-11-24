@@ -8,7 +8,12 @@ use honk_outbound::proxy::{DialFailureScope, dial_failure_scope};
 #[derive(Default)]
 pub(crate) struct RouteFailures(Vec<(DialKey, IpVersion)>);
 
-pub(crate) struct RouteExchange<'a> {
+pub(crate) enum RouteExchange<'a> {
+    Tcp(TcpRouteExchange<'a>),
+    Packet(&'a OwnedTarget),
+}
+
+pub(crate) struct TcpRouteExchange<'a> {
     pub(crate) manager: &'a GroupManager,
     pub(crate) group: &'a str,
     pub(crate) family: IpVersion,
@@ -17,7 +22,7 @@ pub(crate) struct RouteExchange<'a> {
     pub(crate) reported_failures: &'a mut RouteFailures,
 }
 
-impl RouteExchange<'_> {
+impl TcpRouteExchange<'_> {
     fn has_failure_cause(&self, error: &anyhow::Error) -> bool {
         match dial_failure_scope(error.as_ref()) {
             DialFailureScope::Hop(_) | DialFailureScope::Prefix(_) => true,
@@ -29,6 +34,30 @@ impl RouteExchange<'_> {
     }
 }
 
+fn packet_score_failure(
+    target: &OwnedTarget,
+    outcome: ScoreOutcome,
+    error: &anyhow::Error,
+) -> ScoreOutcome {
+    // A configured chain is the selected leaf. The hop locator still needs
+    // to identify a hop within the bound path before Score can debit it.
+    if let Some(hops) = target.node.resolved_chain_hops()
+        && !matches!(
+            outcome,
+            ScoreOutcome::Cancelled | ScoreOutcome::Shutdown | ScoreOutcome::Rejected
+        )
+        && match dial_failure_scope(error.as_ref()) {
+            DialFailureScope::Hop(index) => index >= hops.len(),
+            DialFailureScope::Prefix(index) => index == 0 || index >= hops.len(),
+            DialFailureScope::Unattributed => true,
+            DialFailureScope::LocalRejection | DialFailureScope::Target => false,
+        }
+    {
+        return ScoreOutcome::RouteFailure;
+    }
+    target.score_failure(outcome, error.as_ref())
+}
+
 fn should_retry(error: &anyhow::Error) -> bool {
     !honk_outbound::proxy::is_packet_rejection(error)
         && !error.chain().any(|cause| {
@@ -37,6 +66,7 @@ fn should_retry(error: &anyhow::Error) -> bool {
         })
 }
 
+#[cfg(test)]
 pub(super) async fn exchange_with_retry<Once, Fut, Reset, ResetFut>(
     label: &'static str,
     raw_query: &[u8],
@@ -67,6 +97,11 @@ where
     Reset: FnOnce(&anyhow::Error) -> ResetFut,
     ResetFut: Future<Output = ()>,
 {
+    let (score_target, route) = match route {
+        Some(RouteExchange::Tcp(route)) => (Some(route.target), Some(route)),
+        Some(RouteExchange::Packet(target)) => (Some(target), None),
+        None => (None, None),
+    };
     let first_stamp = route.as_ref().map(|route| route.revision.admit());
     let reporter = feedback.map(honk_outbound::group::ScoreBusinessGuard::start);
     let first_result = {
@@ -102,13 +137,15 @@ where
     if let Some(reporter) = &reporter {
         let outcome = match &result {
             Ok(_) if valid => ScoreOutcome::Success,
-            Ok(_) if route.is_some() => ScoreOutcome::RouteFailure,
+            Ok(_) if score_target.is_some() => ScoreOutcome::RouteFailure,
             Ok(_) => ScoreOutcome::Other,
             Err(error) => {
                 let outcome = ScoreOutcome::from_error(error);
-                route.as_ref().map_or(outcome, |route| {
-                    route.target.score_failure(outcome, error.as_ref())
-                })
+                match (score_target, route.as_ref()) {
+                    (Some(target), Some(_)) => target.score_failure(outcome, error.as_ref()),
+                    (Some(target), None) => packet_score_failure(target, outcome, error),
+                    (None, _) => outcome,
+                }
             }
         };
         reporter.finish(outcome);
@@ -174,6 +211,36 @@ mod tests {
     use std::io;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn packet_score_projection_requires_an_attributable_bound_hop() {
+        use honk_outbound::group::OwnedTarget;
+        use honk_outbound::proxy::{ChainHopFailure, NodeFailure, PacketRejection, TargetFailure};
+
+        let front = Node::from_share_link("socks5://127.0.0.1:1080#front").unwrap();
+        let exit = Node::from_share_link("trojan://secret@127.0.0.1:443#land").unwrap();
+        let chain = OwnedTarget::node(Node::chain_from_nodes("via", &[&front, &exit]).unwrap());
+        let misplaced = ChainHopFailure {
+            hop: 2,
+            node: exit.id,
+            error: NodeFailure(anyhow::anyhow!("missing admitted hop")).into(),
+        };
+        for (error, expected) in [
+            (anyhow::Error::new(misplaced), ScoreOutcome::RouteFailure),
+            (
+                TargetFailure(anyhow::anyhow!("requested target refused")).into(),
+                ScoreOutcome::TargetFailure,
+            ),
+            (PacketRejection::Capacity.into(), ScoreOutcome::Rejected),
+            (PacketRejection::Cancelled.into(), ScoreOutcome::Cancelled),
+        ] {
+            let outcome = ScoreOutcome::from_error(&error);
+            assert_eq!(
+                super::packet_score_failure(&chain, outcome, &error),
+                expected
+            );
+        }
+    }
 
     #[derive(Clone)]
     struct Capture(Arc<Mutex<Vec<u8>>>);

@@ -112,6 +112,7 @@ impl UdpTerminal {
 }
 
 mod admission;
+mod evidence;
 mod foreign_reply;
 #[cfg_attr(not(feature = "native-api"), path = "observation/inert.rs")]
 mod observation;
@@ -123,6 +124,7 @@ mod source_quic_tests;
 mod source_shared_tests;
 #[cfg(all(test, feature = "rprx"))]
 mod source_tests;
+pub(in crate::control) use evidence::UdpTrafficEvidence;
 use foreign_reply::ForeignReplySockets;
 use retirement::{EndpointIoGuard, RetirementIo};
 pub(crate) use retirement::{EndpointRemoval, RemovalReason};
@@ -159,7 +161,7 @@ pub struct UdpEndpoint {
     /// The relay target address (upstream proxy).
     pub relay_addr: SocketAddr,
     target_is_domain: bool,
-    /// NodeId of the proxy node this endpoint dials through.
+    /// Retirement index for the bound node or a composed route's framing exit.
     node_id: uuid::Uuid,
     /// When this endpoint expires (monotonic nanos).
     expires_at: AtomicI64,
@@ -188,6 +190,7 @@ pub struct UdpEndpoint {
     download: Arc<AtomicU64>,
     score_reporter: Option<ScoreReporter>,
     health_family: honk_outbound::alive::IpVersion,
+    evidence: Option<Arc<UdpTrafficEvidence>>,
     #[cfg(test)]
     source_reply_hook: Mutex<Option<Arc<source::ReplyAdmissionHook>>>,
     tracker_id: Mutex<Option<String>>,
@@ -294,9 +297,17 @@ impl UdpEndpoint {
             tracker_id: Mutex::new(None),
             score_reporter,
             health_family,
+            evidence: None,
             native: Default::default(),
             retirement: EndpointIoGuard(RetirementIo::new()),
         }
+    }
+
+    pub(in crate::control) fn set_traffic_evidence(
+        &mut self,
+        evidence: Option<Arc<UdpTrafficEvidence>>,
+    ) {
+        self.evidence = evidence;
     }
 
     #[cfg(feature = "native-api")]
@@ -312,8 +323,9 @@ impl UdpEndpoint {
             SourceRetirement::Neutral(_) => UdpTerminal::IntentionalRetirement,
             SourceRetirement::Failure(
                 ScoreOutcome::Timeout | ScoreOutcome::Io(io::ErrorKind::TimedOut),
+                _,
             ) => UdpTerminal::TransportTimeout,
-            SourceRetirement::Failure(_) => UdpTerminal::TransportError,
+            SourceRetirement::Failure(..) => UdpTerminal::TransportError,
         };
         self.native.finish(outcome);
     }
@@ -340,9 +352,15 @@ impl UdpEndpoint {
     }
 
     fn score_reply(&self, bytes: u64) {
-        if let Some(reporter) = &self.score_reporter {
+        self.with_score(|reporter| {
             reporter.first_response();
             reporter.rx(bytes);
+        });
+    }
+
+    fn with_score(&self, publish: impl FnOnce(&ScoreReporter)) {
+        if let Some(reporter) = &self.score_reporter {
+            UdpTrafficEvidence::publish_score(self.evidence.as_deref(), reporter, publish);
         }
     }
 
@@ -354,15 +372,28 @@ impl UdpEndpoint {
             EndpointTransport::Source(source) if outcome != ScoreOutcome::Shutdown => {
                 match source.score_retirement() {
                     Some(SourceRetirement::Neutral(_)) if self.has_reply() => ScoreOutcome::Success,
-                    Some(
-                        SourceRetirement::Neutral(outcome) | SourceRetirement::Failure(outcome),
-                    ) => outcome,
+                    Some(SourceRetirement::Neutral(outcome)) => outcome,
+                    Some(SourceRetirement::Failure(outcome, scope)) => {
+                        self.score_failure(outcome, scope)
+                    }
                     None => outcome,
                 }
             }
             _ => outcome,
         };
-        reporter.finish(outcome);
+        UdpTrafficEvidence::publish_score(self.evidence.as_deref(), reporter, |reporter| {
+            reporter.finish(outcome)
+        });
+    }
+
+    fn score_failure(
+        &self,
+        outcome: ScoreOutcome,
+        scope: honk_outbound::proxy::DialFailureScope,
+    ) -> ScoreOutcome {
+        self.evidence
+            .as_ref()
+            .map_or(outcome, |evidence| evidence.score_failure(outcome, scope))
     }
 
     /// Take the tracker connection id (on endpoint removal).
@@ -436,13 +467,22 @@ impl UdpEndpoint {
         }
     }
 
-    fn begin_send_attempt(&self) -> io::Result<()> {
+    fn begin_send_attempt(&self, first: bool) -> io::Result<()> {
         let _send_gate = self.send_gate.lock();
         if self.dead.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
                 "UDP endpoint was retired before transport send",
             ));
+        }
+        if first
+            && !self.is_source()
+            && self
+                .evidence
+                .as_ref()
+                .is_some_and(|evidence| !evidence.current())
+        {
+            return Err(honk_outbound::proxy::PacketRejection::Cancelled.into());
         }
         Ok(())
     }
@@ -500,6 +540,17 @@ impl UdpEndpoint {
         let operation = async {
             match &self.transport {
                 EndpointTransport::Flow(transport) if confirmed => {
+                    if let Some(evidence) = self
+                        .evidence
+                        .as_ref()
+                        .filter(|evidence| evidence.is_route())
+                    {
+                        let current = || !self.dead.load(Ordering::Acquire) && evidence.current();
+                        return transport
+                            .send_packet_checked(data, &current)
+                            .await
+                            .map(|()| None);
+                    }
                     transport.send_packet_confirmed(data).await.map(|()| None)
                 }
                 EndpointTransport::Flow(transport) => {
@@ -510,7 +561,18 @@ impl UdpEndpoint {
                         && !data.is_empty()
                         && self.upload.load(Ordering::Relaxed) == 0;
                     source
-                        .send(data, confirmed, admitted, record_start, attempt)
+                        .send(
+                            data,
+                            confirmed,
+                            admitted,
+                            record_start,
+                            attempt,
+                            if confirmed {
+                                self.evidence.as_deref()
+                            } else {
+                                None
+                            },
+                        )
                         .await
                 }
             }
@@ -521,9 +583,9 @@ impl UdpEndpoint {
         operation.await
     }
 
-    fn fail_source(&self, outcome: ScoreOutcome) {
+    fn fail_source(&self, outcome: ScoreOutcome, error: &io::Error) {
         if let EndpointTransport::Source(source) = &self.transport {
-            source.fail(outcome);
+            source.fail(outcome, error);
         }
     }
 

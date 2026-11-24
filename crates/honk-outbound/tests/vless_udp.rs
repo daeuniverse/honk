@@ -1,5 +1,8 @@
 #![cfg(feature = "rprx")]
 
+#[path = "vless_udp/chain.rs"]
+mod chain;
+
 #[path = "vless_udp/reality.rs"]
 mod reality;
 

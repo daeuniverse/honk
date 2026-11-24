@@ -61,9 +61,25 @@ fn ordinary_decision<'a>(
     Decision,
     std::borrow::Cow<'a, super::evaluation::EvaluationSet>,
 )> {
+    ordinary_decision_with_pool(
+        view,
+        origins,
+        apply,
+        view.inner.evaluation(view.group, view.context.network),
+    )
+}
+
+fn ordinary_decision_with_pool<'a>(
+    view: &comparison::View<'a>,
+    origins: super::super::ScoreView<'_, '_>,
+    apply: bool,
+    stored: Option<&'a super::evaluation::EvaluationSet>,
+) -> Option<(
+    Decision,
+    std::borrow::Cow<'a, super::evaluation::EvaluationSet>,
+)> {
     let (inner, group, context, nodes, now) =
         (view.inner, view.group, view.context, view.nodes, view.now);
-    let stored = inner.evaluation(group, context.network);
     let mut failure_key = AggregateKey {
         group: group.to_owned(),
         network: context.network,

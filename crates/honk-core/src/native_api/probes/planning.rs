@@ -32,6 +32,7 @@ pub(super) struct Context {
     pub(super) manager: Arc<GroupManager>,
     pub(super) identity: Arc<CatalogIdentity>,
     pub(super) registry: Arc<OutboundRuntimeRegistry>,
+    pub(super) proxy_registry: Arc<honk_outbound::ProxyRegistry>,
     // Retain the DNS generation until every prepared attempt has completed.
     pub(super) dns: PinnedNameResolver,
     pub(super) group: Option<String>,
@@ -203,9 +204,7 @@ fn plan(
             if request.kind == Kind::TcpConnect && (group.is_none() || !is_chain(node)) {
                 tcp_connect_target(node)?;
             }
-            if request.transport.contains(&Transport::Udp)
-                && !(honk_outbound::descriptor::descriptor(node.protocol()).supports_udp)(node)
-            {
+            if request.transport.contains(&Transport::Udp) && !registry.udp_capable(node) {
                 return Err(tcp_only());
             }
         }
@@ -216,6 +215,7 @@ fn plan(
                 } else {
                     ProbeDomain::DnsUdp
                 };
+                // A group row measures its selected leaf's own transport.
                 let leaf = manager.probe_leaf(member, domain, family.ip());
                 // A chain in a group gets its own row rather than failing the
                 // other members' TCP connect probes.
@@ -257,9 +257,7 @@ fn plan(
                                     json!({"field":"kind","allowed":["tcp_connect"]}),
                                 )
                             })?;
-                        if transport == Transport::Udp
-                            && (!(entry.descriptor.supports_udp)(node) || entry.packet.is_none())
-                        {
+                        if transport == Transport::Udp && entry.packet.is_none() {
                             return Err(tcp_only());
                         }
                     }
@@ -325,9 +323,11 @@ fn plan(
                     &["udp_check_dns"],
                 )
             };
-            match honk_config::check::select_dns_check_target(&config.global.udp_check_dns)
-                .map_err(|_| dns_check_target())?
-                .ok_or_else(dns_check_target)?
+            match honk_config::check::select_dns_check_target(
+                config.global.effective_udp_check_dns(),
+            )
+            .map_err(|_| dns_check_target())?
+            .ok_or_else(dns_check_target)?
             {
                 honk_config::check::DnsCheckTarget::Literal(addr) => {
                     (None, Some((addr.ip().to_string(), addr.port())))
@@ -360,6 +360,7 @@ fn plan(
             manager,
             identity,
             registry,
+            proxy_registry: Arc::clone(&state.proxy_registry),
             dns,
             group,
             http,
@@ -434,6 +435,23 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
         result,
         candidates,
     } = plan;
+    if let Some((_, port)) = context.destination.as_ref().filter(|(_, port)| *port != 0) {
+        for candidate in &candidates {
+            if candidate.transport != Transport::Udp {
+                continue;
+            }
+            let (_, terminal) = context
+                .proxy_registry
+                .udp_probe_target(&context.registry, &candidate.node)
+                .map_err(|_| tcp_only())?;
+            if !honk_outbound::descriptor::udp_target_allowed(terminal, *port) {
+                return Err(unsupported(
+                    "The probed node does not carry UDP to the probe port",
+                    json!({"field":"transport","allowed":["tcp"]}),
+                ));
+            }
+        }
+    }
     let mut resolved = ResolvedHosts::default();
     let mut attempts = Vec::with_capacity(candidates.len());
     let mut skipped = Vec::new();
@@ -479,14 +497,6 @@ pub(super) async fn prepare(plan: Plan) -> Result<PreparedPlan, ApiError> {
         } else {
             Some(PinnedServers::default())
         };
-        if candidate.transport == Transport::Udp
-            && !honk_outbound::descriptor::udp_target_allowed(&candidate.node, port)
-        {
-            return Err(unsupported(
-                "The probed node does not carry UDP to the probe port",
-                json!({"field":"transport","allowed":["tcp"]}),
-            ));
-        }
         match (addr, servers) {
             (Some(addr), Some(servers)) => attempts.push(Attempt {
                 candidate,

@@ -337,10 +337,12 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         let node = canonical_socks5("c28-udp", "127.0.0.1", 9, None);
         let mut config = Config::default();
         config.global.nfqueue_enable = false;
-        config.global.udp_check_dns = vec![old_raw.into()];
+        config.global.udp_check_dns = Some(vec![old_raw.into()]);
         config.nodes = vec![node.clone()];
-        let dns_probe =
-            UdpDnsProbeTarget::new(config.global.udp_check_dns.clone(), Some(resolver.clone()));
+        let dns_probe = UdpDnsProbeTarget::new(
+            config.global.effective_udp_check_dns().to_vec(),
+            Some(resolver.clone()),
+        );
         dns_probe.resolve().await.unwrap();
         let cp = control_plane(config.clone());
         cp.alive_set().set_resolver(resolver);
@@ -365,7 +367,7 @@ async fn c28_udp_reload_preserves_the_configured_probe_target() {
         );
         let generation = cp.runtime_registry().read().generation();
         let mut candidate = config.clone();
-        candidate.global.udp_check_dns = new_raw.into_iter().map(str::to_owned).collect();
+        candidate.global.udp_check_dns = Some(new_raw.into_iter().map(str::to_owned).collect());
         let accepted = cp
             .apply_runtime_config(candidate.clone(), Default::default(), &DrainTracker::new())
             .await
@@ -415,7 +417,7 @@ async fn udp_dns_target_recovers_after_capacity_refusal_and_pins_success() {
     let node = canonical_socks5("udp-resolver-recovery", "127.0.0.1", 9, None);
     let mut config = Config::default();
     config.global.nfqueue_enable = false;
-    config.global.udp_check_dns = vec!["resolver.example:5301".into()];
+    config.global.udp_check_dns = Some(vec!["resolver.example:5301".into()]);
     config.nodes = vec![node.clone()];
     let capacity = Arc::new(tokio::sync::Semaphore::new(1));
     let held = capacity.clone().acquire_owned().await.unwrap();
@@ -435,7 +437,10 @@ async fn udp_dns_target_recovers_after_capacity_refusal_and_pins_success() {
             })
         })
     };
-    let dns_probe = UdpDnsProbeTarget::new(config.global.udp_check_dns.clone(), Some(resolver));
+    let dns_probe = UdpDnsProbeTarget::new(
+        config.global.effective_udp_check_dns().to_vec(),
+        Some(resolver),
+    );
     let startup_error = dns_probe.resolve().await.unwrap_err();
     assert!(honk_outbound::proxy::is_packet_rejection(&startup_error));
     let cp = control_plane(config);
@@ -657,4 +662,374 @@ async fn c28_dae_tolerance_reload_changes_real_urltest_selection() {
         "b",
         "the live URLTest policy must apply the adapted global tolerance"
     );
+}
+
+fn loopback_node(name: &str, port: u16, outbound: honk_config::node::OutboundConfig) -> Node {
+    let mut node = Node {
+        name: name.into(),
+        address: format!("127.0.0.1:{port}"),
+        host: "127.0.0.1".into(),
+        port,
+        outbound,
+        ..Default::default()
+    };
+    node.id = node.derive_id();
+    node
+}
+
+/// Every failed route gets a fresh carrier. Existing siblings must still deliver
+/// through the same framing node after fifty independent truncated responses.
+#[tokio::test]
+async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
+    use honk_config::routing::{RoutingCondition, RoutingOutbound, RoutingRule};
+    use tokio::io::AsyncReadExt;
+
+    let server = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let server_port = server.local_addr().unwrap().port();
+    let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = server.accept().await {
+            if accepted_tx.send(stream).is_err() {
+                break;
+            }
+        }
+    });
+    let relay = crate::test_support::socks5_relay().await;
+    let front = loopback_node(
+        "front",
+        relay.addr.port(),
+        honk_config::node::OutboundConfig::Socks5(Default::default()),
+    );
+    let sibling_relay = crate::test_support::socks5_relay().await;
+    let sibling = loopback_node(
+        "other-front",
+        sibling_relay.addr.port(),
+        honk_config::node::OutboundConfig::Socks5(Default::default()),
+    );
+    let land = loopback_node(
+        "land",
+        server_port,
+        honk_config::node::OutboundConfig::Trojan(honk_config::node::TrojanConfig {
+            password: Some("secret".into()),
+            ..Default::default()
+        }),
+    );
+    let chain = Node::chain_from_nodes("configured", &[&sibling, &land]).unwrap();
+    let configured_id = chain.id;
+    let mut config = Config {
+        nodes: vec![front.clone(), sibling.clone(), land.clone(), chain],
+        groups: [
+            ("g", front.id, Some(land.name.clone())),
+            ("sibling", sibling.id, Some(land.name.clone())),
+            ("bare-exit", land.id, None),
+            ("via-chain", configured_id, None),
+        ]
+        .map(|(name, member, exit)| honk_config::group::Group {
+            name: name.into(),
+            nodes: vec![member],
+            exit,
+            ..Default::default()
+        })
+        .into(),
+        ..Default::default()
+    };
+    config.ensure_builtin_nodes();
+    config.global.nfqueue_enable = false;
+    config.global.dial_mode = "ip".into();
+    config.routing.rules = [
+        (5101, "sibling"),
+        (5102, "bare-exit"),
+        (5103, "via-chain"),
+        (5104, "via-chain"),
+    ]
+    .map(|(port, outbound)| RoutingRule {
+        name: outbound.into(),
+        condition: RoutingCondition {
+            port: vec![port.to_string()],
+            ..Default::default()
+        },
+        outbound: RoutingOutbound::Simple(outbound.into()),
+        priority: 0,
+        must: true,
+        mark: 0,
+    })
+    .into();
+    let config = config.assemble(|_, _, _| {}).unwrap();
+    let router = crate::routing::Router::new(&config.routing.rules, "g").unwrap();
+    let mut plane = ControlPlane::new(
+        config,
+        Box::new(crate::ebpf::mock::MockEbpfBackend::new()),
+        router,
+        Arc::new(ProxyRegistry::default_resolver().unwrap()),
+        crate::dns::DnsResolver::new(&Default::default()).unwrap(),
+        super::support::test_dns_forwarder(),
+    )
+    .unwrap();
+    plane.udp_pool = Arc::new(
+        crate::control::udp_endpoint::UdpEndpointPool::with_reply_socket_factory(
+            16,
+            Arc::new(super::support::UdpTestReplySocketFactory),
+        ),
+    );
+    plane.install_node_death_callback();
+    let handle = plane.spawn_handle();
+    let retirement = super::support::TestRetirement::start(&handle);
+    // Framing faults are counted for an unprobed exit immediately. Startup
+    // grace belongs to periodic-probe registrations, not the wire fixture.
+    handle.alive_set.remove_node(land.id);
+    let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let client = client_socket.local_addr().unwrap();
+    let retired = super::support::addr("192.0.2.1:5000");
+    let land_addr = super::support::addr(&land.address);
+
+    super::support::serve_test_udp_to(&handle, client, retired, b"first")
+        .await
+        .unwrap();
+    assert_eq!(relay.requests.lock()[..], [land_addr]);
+    plane.udp_pool.remove_by_node(front.id);
+    assert!(plane.udp_pool.get(client, retired).is_some());
+    plane.udp_pool.remove_by_node(land.id);
+    assert!(plane.udp_pool.get(client, retired).is_none());
+    drop(accepted.recv().await.unwrap());
+
+    let protected = [
+        super::support::addr("192.0.2.2:5101"),
+        super::support::addr("192.0.2.2:5102"),
+    ];
+    for target in protected {
+        super::support::serve_test_udp_to(&handle, client, target, b"alive")
+            .await
+            .unwrap();
+        let mut stream = accepted.recv().await.unwrap();
+        tokio::spawn(async move {
+            let mut head = [0; 56 + 2 + 1 + 7 + 2];
+            stream.read_exact(&mut head).await.unwrap();
+            assert_eq!(head[58], 3);
+            let (mut reader, mut writer) = stream.split();
+            let _ = tokio::io::copy(&mut reader, &mut writer).await;
+        });
+        let mut reply = [0; 8];
+        let len = tokio::time::timeout(Duration::from_secs(3), client_socket.recv(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&reply[..len], b"alive");
+    }
+    let original_endpoints = protected.map(|target| plane.udp_pool.get(client, target).unwrap());
+    for seq in 0u8..50 {
+        let dst = SocketAddr::new(retired.ip(), 6000 + u16::from(seq));
+        super::support::serve_test_udp_to(&handle, client, dst, &[seq])
+            .await
+            .unwrap();
+        assert!(plane.udp_pool.get(client, dst).is_some());
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), accepted.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut wire = [0; 68 + 11 + 1];
+        stream.read_exact(&mut wire).await.unwrap();
+        assert_eq!(wire[58], 3);
+        assert_eq!(wire[79], seq);
+        stream.write_all(&[1, 192]).await.unwrap();
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while plane.udp_pool.get(client, dst).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("truncated response must close exactly its own flow");
+    }
+    assert_eq!(relay.requests.lock().as_slice(), vec![land_addr; 51]);
+    assert_eq!(sibling_relay.requests.lock()[..], [land_addr]);
+    for (target, original) in protected.into_iter().zip(original_endpoints) {
+        assert!(Arc::ptr_eq(
+            &original,
+            &plane.udp_pool.get(client, target).unwrap()
+        ));
+        super::support::serve_test_udp_to(&handle, client, target, b"")
+            .await
+            .unwrap();
+        let mut reply = [0; 1];
+        let len = tokio::time::timeout(Duration::from_secs(3), client_socket.recv(&mut reply))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            len, 0,
+            "the original sibling must deliver even an empty datagram"
+        );
+    }
+    let shared_dest = [
+        super::support::addr("192.0.2.3:5103"),
+        super::support::addr("192.0.2.4:5104"),
+    ];
+    super::support::serve_test_udp_to(&handle, client, shared_dest[0], b"owner")
+        .await
+        .unwrap();
+    let mut shared_wire = accepted.recv().await.unwrap();
+    let mut head = [0; 68];
+    shared_wire.read_exact(&mut head).await.unwrap();
+    let mut frame = [0; 11 + 5];
+    shared_wire.read_exact(&mut frame).await.unwrap();
+    assert_eq!(&frame[11..], b"owner");
+    super::support::serve_test_udp_to(&handle, client, shared_dest[1], b"reuse")
+        .await
+        .unwrap();
+    shared_wire.read_exact(&mut frame).await.unwrap();
+    assert_eq!(&frame[11..], b"reuse");
+    assert!(accepted.try_recv().is_err());
+
+    let mixed_client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mixed_addr = mixed_client.local_addr().unwrap();
+    let creator = super::support::addr("[2001:db8::3]:5103");
+    let reused = shared_dest[1];
+    super::support::serve_test_udp_to(&handle, mixed_addr, creator, b"v6")
+        .await
+        .unwrap();
+    let mut mixed_wire = accepted.recv().await.unwrap();
+    let mut v6_header_and_frame = [0; 80 + 23 + 2];
+    mixed_wire
+        .read_exact(&mut v6_header_and_frame)
+        .await
+        .unwrap();
+    assert_eq!(&v6_header_and_frame[103..], b"v6");
+    // An IPv6 reply for an IPv4 client cannot be delivered. The second view
+    // has a matching family; its delivered empty frame still proves the creator.
+    mixed_wire
+        .write_all(&v6_header_and_frame[80..])
+        .await
+        .unwrap();
+    super::support::serve_test_udp_to(&handle, mixed_addr, reused, b"v4")
+        .await
+        .unwrap();
+    let mut v4_frame = [0; 11 + 2];
+    mixed_wire.read_exact(&mut v4_frame).await.unwrap();
+    assert_eq!(&v4_frame[11..], b"v4");
+    assert!(!handle.alive_set.routed_udp_node_proven(
+        configured_id,
+        ProbeDomain::DataUdp,
+        IpVersion::V6
+    ));
+    v4_frame[7..9].copy_from_slice(&0u16.to_be_bytes());
+    mixed_wire.write_all(&v4_frame[..11]).await.unwrap();
+    let mut byte = [0];
+    let len = tokio::time::timeout(Duration::from_secs(3), mixed_client.recv(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(len, 0);
+    assert!(handle.alive_set.routed_udp_node_proven(
+        configured_id,
+        ProbeDomain::DataUdp,
+        IpVersion::V6
+    ));
+    assert!(!handle.alive_set.routed_udp_node_proven(
+        configured_id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4
+    ));
+    assert!(accepted.try_recv().is_err());
+
+    let manager = handle.group_manager.read().clone();
+    let generation = handle.runtime_registry.read().clone();
+    let mut bound = Vec::new();
+    for (port, family) in [(5201, IpVersion::V4), (5202, IpVersion::V6)] {
+        let context = crate::group::ScoreSelectionContext::aggregate(
+            crate::group::SelectionNetwork::Udp,
+            ProbeDomain::DataUdp,
+            family,
+        );
+        let config = handle.config.read().await;
+        let plan = crate::control::reload::resolve_outbound_plan_for_target(
+            &config,
+            &manager,
+            "sibling",
+            &context,
+            crate::control::reload::OutboundConstraint::Any,
+        );
+        assert_eq!(plan.health_family, family);
+        let evidence = crate::control::udp_endpoint::UdpTrafficEvidence::capture_route(
+            &manager,
+            &generation,
+            &plan.targets[0],
+            &plan.selection_chains[0],
+            &plan.final_owners[0],
+            plan.route_revision,
+            family,
+        )
+        .unwrap();
+        let permit = Arc::new(tokio::sync::Semaphore::new(1))
+            .try_acquire_owned()
+            .unwrap();
+        let dst = SocketAddr::new(retired.ip(), port);
+        let crate::control::udp_endpoint::EndpointReservation::Initializing(lease) = plane
+            .udp_pool
+            .reserve_or_enqueue(client, dst, b"waiting", permit, &handle.stats)
+        else {
+            panic!("fresh reservation");
+        };
+        assert!(lease.bind_selected(land.id, Some(Arc::new(evidence))));
+        bound.push(lease);
+    }
+
+    // A complete invalid address tag identifies E's framing operation.
+    for seq in 0u8..49 {
+        let dst = SocketAddr::new(retired.ip(), 7000 + u16::from(seq));
+        super::support::serve_test_udp_to(&handle, client, dst, &[seq])
+            .await
+            .unwrap();
+        let mut stream = tokio::time::timeout(Duration::from_secs(3), accepted.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut wire = [0; 68 + 11 + 1];
+        stream.read_exact(&mut wire).await.unwrap();
+        assert_eq!(wire[79], seq);
+        stream.write_all(&[9]).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while plane.udp_pool.get(client, dst).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("typed bad record must terminate its flow");
+        for live in protected.into_iter().chain(shared_dest) {
+            assert!(plane.udp_pool.get(client, live).is_some());
+        }
+    }
+    // One receiver settles the fiftieth independent fault for both of its
+    // bound views; the death callback also retires other affected owners.
+    shared_wire.write_all(&[9]).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while plane.udp_pool.get(client, protected[1]).is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the shared receiver must publish its typed framing failure");
+    for dead in protected.into_iter().chain(shared_dest) {
+        assert!(plane.udp_pool.get(client, dead).is_none());
+    }
+    assert!(plane.udp_pool.get(mixed_addr, creator).is_some());
+    assert!(plane.udp_pool.get(mixed_addr, reused).is_none());
+    assert!(!bound[0].still_initializing());
+    assert!(bound[1].still_initializing());
+    drop(bound);
+    assert!(!handle.group_manager.read().is_node_selectable_for_domain(
+        land.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V4
+    ));
+    assert!(handle.group_manager.read().is_node_selectable_for_domain(
+        land.id,
+        ProbeDomain::DataUdp,
+        IpVersion::V6
+    ));
+    assert!(
+        handle
+            .alive_set
+            .is_alive_for(land.id, ProbeDomain::Tcp, IpVersion::V4)
+    );
+    retirement.join(&handle).await.unwrap();
 }

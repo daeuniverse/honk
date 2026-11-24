@@ -166,6 +166,30 @@ impl Node {
         }
     }
 
+    /// Whether this node can frame UDP over a stream tunneled to it.
+    /// VLESS Auto uses native framing here because the tunnel owns one
+    /// stream and cannot open an XUDP session. Multiplexing is ineligible.
+    pub fn supports_tunneled_udp(&self) -> bool {
+        let can_frame = match &self.outbound {
+            OutboundConfig::Trojan(_) => self.network().is_none_or(|network| {
+                matches!(
+                    crate::options::vocab::packet_network(network),
+                    Ok(Some(true))
+                )
+            }),
+            OutboundConfig::Vless(config) => {
+                config.multiplex == VlessMultiplex::Off
+                    && config.udp_enabled()
+                    && matches!(
+                        config.udp_encoding,
+                        VlessUdpEncoding::Auto | VlessUdpEncoding::Native
+                    )
+            }
+            _ => false,
+        };
+        can_frame && self.supports_tunneled_dial()
+    }
+
     /// Explicit SNI precedes the WebSocket Host authority and the configured endpoint.
     pub fn tls_server_name(&self) -> Cow<'_, str> {
         if let Some(sni) = self.tls().and_then(|tls| tls.sni.as_deref()) {

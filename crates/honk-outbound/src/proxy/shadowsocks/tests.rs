@@ -113,6 +113,41 @@ async fn udp_send_waits_for_cipher_instead_of_reporting_a_drop_as_success() {
     assert!(received > b"retained".len());
 }
 
+#[tokio::test]
+async fn checked_udp_send_rechecks_while_waiting_for_cipher() {
+    use crate::proxy::{PacketRejection, io_packet_rejection};
+    use std::task::{Context, Poll, Waker};
+    use tokio::net::UdpSocket;
+
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket.connect(socket.local_addr().unwrap()).await.unwrap();
+    let target = "127.0.0.1:53".parse().unwrap();
+    let transport = legacy_transport(socket, target);
+    let _cipher = transport.crypto.lock().await;
+    let admitted = AtomicBool::new(false);
+    let allowed = AtomicBool::new(true);
+    let current = || allowed.load(Ordering::Acquire);
+    let mut send = std::pin::pin!(transport.send_to_checked(
+        target,
+        None,
+        b"waiting",
+        Some(&admitted),
+        &current,
+    ));
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(send.as_mut().poll(&mut cx).is_pending());
+
+    allowed.store(false, Ordering::Release);
+    let Poll::Ready(result) = send.as_mut().poll(&mut cx) else {
+        panic!("withdrawal must settle a send waiting for the cipher");
+    };
+    assert_eq!(
+        io_packet_rejection(&result.unwrap_err()),
+        Some(PacketRejection::Cancelled)
+    );
+    assert!(!admitted.load(Ordering::Acquire));
+}
+
 #[test]
 fn test_legacy_udp_roundtrip_chacha() {
     let crypto = LegacyUdpCrypto::new("chacha20-ietf-poly1305", "test-password").unwrap();

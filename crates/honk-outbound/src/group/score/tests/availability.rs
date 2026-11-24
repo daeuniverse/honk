@@ -732,6 +732,86 @@ fn neutral_settlement_flushes_throttled_eligible_rx_at_its_event_time() {
 }
 
 #[test]
+fn stale_udp_settlement_discards_buffered_evidence_and_ignores_late_clones() {
+    let nodes = [node("routed")];
+    let manager = GroupManager::new(&[group("score", &nodes)], &nodes);
+    let mut target = context("routed.example", IpVersion::V4);
+    target.network = SelectionNetwork::Udp;
+    target.probe_domain = ProbeDomain::DataUdp;
+    let started = Instant::now();
+    let feedback = manager
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let stale: Vec<_> = (0..4).map(|_| prepared(&feedback, started)).collect();
+    for reporter in &stale {
+        reporter.first_response_at(started);
+        reporter.transfer_at(0, 1, started);
+    }
+    let failure_at = started + Duration::from_millis(100);
+    feedback
+        .start_at(failure_at)
+        .finish_at(ScoreOutcome::Timeout, true, failure_at);
+    let received = started + Duration::from_millis(200);
+    for reporter in &stale {
+        reporter.transfer_at(0, 65_536, received);
+    }
+
+    let settled = started + Duration::from_secs(1);
+    let state = manager.score_state();
+    let score = |at| score_snapshot(&state.inner.lock(), "score", &target, nodes[0].id, at);
+    let before = score(settled);
+    assert!(before.unresolved_failure);
+    assert!(before.target_performance.download.value.is_none());
+    let mut late = Vec::new();
+    for reporter in stale {
+        late.push(reporter.clone());
+        reporter.finish_stale_at(settled);
+    }
+    let after = score(settled);
+    assert_close(after.completed, before.completed);
+    assert_close(after.useful_completed, before.useful_completed);
+    assert_eq!(after.fail_streak, before.fail_streak);
+    assert!(after.unresolved_failure);
+    assert!(after.target_performance.download.value.is_none());
+    assert_eq!(
+        availability_at(&manager, &nodes, &target, settled).state,
+        ScoreVerificationState::Provisional
+    );
+
+    let replacement = GroupManager::with_alive_set_and_score_state(
+        &[group("score", &nodes)],
+        &nodes,
+        None,
+        Arc::clone(&state),
+    );
+    replacement.publish_score_membership();
+    let fresh = replacement
+        .feedback_for_group_node("score", nodes[0].id, target.clone())
+        .unwrap();
+    let live: Vec<_> = (0..4).map(|_| prepared(&fresh, settled)).collect();
+    let replied = settled + Duration::from_secs(1);
+    for reporter in &live {
+        reporter.first_response_at(replied);
+        reporter.transfer_at(0, 65_536, replied);
+    }
+    let current = score(replied);
+    for reporter in late {
+        reporter.tx_completed_at(1_000_000, replied, replied);
+        reporter.transfer_at(0, 1_000_000, replied);
+        reporter.finish_at(ScoreOutcome::Timeout, true, replied);
+    }
+    let after_late = score(replied);
+    assert_close(after_late.completed, current.completed);
+    assert_eq!(after_late.fail_streak, current.fail_streak);
+    assert_eq!(
+        availability_at(&replacement, &nodes, &target, replied).state,
+        ScoreVerificationState::ObservedUsable
+    );
+    assert_eq!(current.target_performance.download.value, Some(65_536.0));
+    assert_eq!(after_late.target_performance.download.value, Some(65_536.0));
+}
+
+#[test]
 fn reload_requires_new_rx_from_each_surviving_reporter() {
     let nodes = [node("surviving")];
     let manager = GroupManager::new(&[group("score", &nodes)], &nodes);

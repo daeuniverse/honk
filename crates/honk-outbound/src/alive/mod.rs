@@ -21,14 +21,17 @@ pub use observations::{
 };
 use parking_lot::{Mutex, RwLock};
 pub use probe::RouteHttpProber;
-pub use route_health::{RouteHealthRevision, RouteHealthStamp, RouteProbeTicket};
+pub use route_health::{
+    RouteHealthRevision, RouteHealthStamp, RouteProbeTicket, UdpBareReply, UdpHealthNotifications,
+    UdpHopRole, UdpRouteAdmission,
+};
 pub use runner::{HealthCheckError, HealthProbePermit, ProbeCancellation};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -293,12 +296,16 @@ fn fresh_states() -> NodeStates {
     NodeStates {
         protocols: std::array::from_fn(|_| PerProtocolState::new()),
         route_tcp: Default::default(),
+        route_udp: None,
     }
 }
 
 struct NodeStates {
     protocols: [PerProtocolState; ALIVE_STATES_PER_NODE],
     route_tcp: [route_health::Evidence; IpVersion::count()],
+    route_udp: Option<
+        Box<[route_health::RoutedUdpNode; (ALIVE_STATES_PER_NODE - IpVersion::count()) * 2]>,
+    >,
 }
 
 impl std::ops::Index<usize> for NodeStates {
@@ -324,6 +331,8 @@ type EbpfAliveCallback = dyn Fn(Uuid, u8, u32, u32, bool) + Send + Sync;
 /// node from it. Fires once per domain/ip-version flip — handlers
 /// must be idempotent.
 type DeathCallback = dyn Fn(Uuid, &str) + Send + Sync;
+type RoutedUdpConnectivityCallback = dyn Fn(Uuid, ProbeDomain, IpVersion) + Send + Sync;
+type RoutedUdpDeathCallback = dyn Fn(Uuid, ProbeDomain, IpVersion, UdpHopRole) + Send + Sync;
 
 /// Resolves custom-check members with concrete leaf IDs and optional captured
 /// native group/member identities; display tags are not node lookup keys.
@@ -394,6 +403,8 @@ pub struct AliveDialerSet {
     collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
     registered: RwLock<Registrations>,
     route_health: RwLock<route_health::RouteHealth>,
+    /// Fast negative hint; exact domain/family/operation evidence remains in `NodeStates`.
+    udp_faults: AtomicBool,
     route_http_prober: RwLock<Option<Arc<dyn RouteHttpProber>>>,
     connectivity_callback: RwLock<Option<Arc<health::ConnectivityCallback>>>,
     /// DIRECT also accepts delay evidence without a periodic registration.
@@ -402,6 +413,8 @@ pub struct AliveDialerSet {
     health_observations: RwLock<Option<observations::HealthHistory>>,
     ebpf_callback: RwLock<Option<Arc<EbpfAliveCallback>>>,
     death_callback: RwLock<Option<Arc<DeathCallback>>>,
+    routed_udp_death_callback: RwLock<Option<Arc<RoutedUdpDeathCallback>>>,
+    routed_udp_connectivity_callback: RwLock<Option<Arc<RoutedUdpConnectivityCallback>>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
@@ -493,12 +506,15 @@ impl AliveDialerSet {
             collections: RwLock::new(HashMap::new()),
             registered: RwLock::default(),
             route_health: RwLock::default(),
+            udp_faults: AtomicBool::new(false),
             route_http_prober: RwLock::default(),
             connectivity_callback: RwLock::default(),
             direct_removals: AtomicU64::new(0),
             health_observations: RwLock::new(None),
             ebpf_callback: RwLock::new(None),
             death_callback: RwLock::new(None),
+            routed_udp_death_callback: RwLock::default(),
+            routed_udp_connectivity_callback: RwLock::default(),
             resolver: RwLock::new(None),
             base_cooldown: Duration::from_secs(5),
             max_cooldown: Duration::from_secs(300),
@@ -681,6 +697,18 @@ impl AliveDialerSet {
         *self.death_callback.write() = cb.map(Arc::from);
     }
 
+    /// Retire endpoints and source associations bound to this hop operation, domain and family.
+    pub fn set_routed_udp_death_callback(&self, cb: Option<Box<RoutedUdpDeathCallback>>) {
+        *self.routed_udp_death_callback.write() = cb.map(Arc::from);
+    }
+
+    pub fn set_routed_udp_connectivity_callback(
+        &self,
+        callback: impl Fn(Uuid, ProbeDomain, IpVersion) + Send + Sync + 'static,
+    ) {
+        *self.routed_udp_connectivity_callback.write() = Some(Arc::new(callback));
+    }
+
     /// Install the node name → eBPF outbound index resolver used by
     /// `push_ebpf`. Re-callable: honk-core re-installs (or refreshes the
     /// captured map) on config reload. Pass `None` to restore the legacy
@@ -715,7 +743,7 @@ impl AliveDialerSet {
         self.states
             .read()
             .get(&node_id)
-            .is_none_or(|s| s[idx].alive)
+            .is_none_or(|s| s[idx].alive && s.routed_udp_available(domain, idx))
     }
 
     /// Get (or create) the `DialerCollection` for a given node and domain index.

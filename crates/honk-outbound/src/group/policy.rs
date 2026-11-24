@@ -152,16 +152,7 @@ impl GroupManager {
         effects: SelectionEffects,
         allow_trials: bool,
     ) -> Option<Candidate<'a>> {
-        let candidates = view.origins;
-        let mut unique = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            if !unique
-                .iter()
-                .any(|existing: &&Candidate<'a>| existing.node.id == candidate.node.id)
-            {
-                unique.push(candidate);
-            }
-        }
+        let unique = Self::unique_score_candidates(view.origins);
         let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
         let (index, work) = if effects.prepares_score() {
             self.score_state.rank(
@@ -184,6 +175,62 @@ impl GroupManager {
             candidate.score_work.push(work);
         }
         Some(candidate)
+    }
+
+    pub(super) fn pick_packet_score<'a>(
+        &self,
+        candidates: &[Candidate<'a>],
+        group: &Group,
+        context: &ScoreSelectionContext,
+        bootstrap: Option<(ScoreSelectionContext, Vec<Candidate<'a>>)>,
+        commit: bool,
+    ) -> Option<Candidate<'a>> {
+        let unique = Self::unique_score_candidates(candidates);
+        let nodes: Vec<_> = unique.iter().map(|candidate| candidate.node).collect();
+        let full_nodes = bootstrap.as_ref().map(|(_, candidates)| {
+            Self::unique_score_candidates(candidates)
+                .into_iter()
+                .map(|candidate| candidate.node)
+                .collect::<Vec<_>>()
+        });
+        let bootstrap =
+            bootstrap
+                .as_ref()
+                .zip(full_nodes.as_deref())
+                .map(|((context, candidates), nodes)| {
+                    (
+                        context,
+                        nodes,
+                        ScoreView {
+                            origins: candidates,
+                            ..Default::default()
+                        },
+                    )
+                });
+        let index = self.score_state.rank_packet(
+            &self.score_authority,
+            &group.name,
+            context,
+            &nodes,
+            bootstrap,
+            commit,
+        )?;
+        Some(unique[index].clone())
+    }
+
+    fn unique_score_candidates<'view, 'node>(
+        candidates: &'view [Candidate<'node>],
+    ) -> Vec<&'view Candidate<'node>> {
+        let mut unique = Vec::with_capacity(candidates.len());
+        for candidate in candidates {
+            if !unique
+                .iter()
+                .any(|existing: &&Candidate<'node>| existing.node.id == candidate.node.id)
+            {
+                unique.push(candidate);
+            }
+        }
+        unique
     }
 
     /// URLTest policy: lowest-latency alive candidate with tolerance-based
