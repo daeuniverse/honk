@@ -3816,8 +3816,13 @@ async fn test_idle_activity_slot_fast_path_coarse_clock_and_generation_invalidat
     assert!(trigger_rx.try_recv().is_err());
 
     // Sleep past refresh_quantum_ns (20ms) while still < timeout (80ms) to exercise CAS refresh.
+    let before = slot_exact.last_active_ns.load(Ordering::Acquire);
     tokio::time::sleep(Duration::from_millis(35)).await;
     assert!(set.try_touch_activity_slot(&slot_exact));
+    assert!(
+        slot_exact.last_active_ns.load(Ordering::Acquire) > before,
+        "CAS refresh past refresh_quantum_ns must advance last_active_ns"
+    );
     assert!(!set.is_group_idle("g"));
     assert!(trigger_rx.try_recv().is_err());
 

@@ -396,12 +396,36 @@ pub type ResolveHook = Arc<
         + Sync,
 >;
 
+/// Isolates hot lock words and atomics onto dedicated 64-byte cache lines so
+/// concurrent readers do not self-invalidate adjacent map metadata or atomics.
+#[repr(align(64))]
+struct CachePadded<T>(T);
+
+type PaddedRwLock<T> = CachePadded<RwLock<CachePadded<T>>>;
+type NodeCollections = HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>;
+
+impl<T> std::ops::Deref for CachePadded<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CachePadded<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
 pub struct AliveDialerSet {
     /// Uses parking_lot RwLock/Mutex for synchronous, uncontended access on the
     /// async runtime (parking_lot blocks OS threads without runtime awareness).
-    states: RwLock<HashMap<Uuid, NodeStates>>,
+    states: PaddedRwLock<HashMap<Uuid, NodeStates>>,
     /// Per-node-per-domain latency collections (Go `collection` struct).
-    collections: RwLock<HashMap<Uuid, [Arc<DialerCollection>; ALIVE_STATES_PER_NODE]>>,
+    collections: PaddedRwLock<NodeCollections>,
     registered: RwLock<Registrations>,
     route_health: RwLock<route_health::RouteHealth>,
     /// Fast negative hint; exact domain/family/operation evidence remains in `NodeStates`.
@@ -471,7 +495,7 @@ pub struct AliveDialerSet {
     started_at_coarse_ns: u64,
     /// Bumped on every idle-group table mutation to invalidate cached
     /// [`IdleActivitySlot`] handles.
-    idle_generation: AtomicU64,
+    idle_generation: CachePadded<AtomicU64>,
     /// Idle-group membership, timeouts, and per-group activity timestamps.
     idle_groups: RwLock<urltest::IdleGroups>,
     /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
@@ -503,6 +527,13 @@ pub struct AliveDialerSet {
     url_check_ips: RwLock<HashMap<String, Vec<SocketAddr>>>,
 }
 
+const _: () = {
+    assert!(std::mem::align_of::<PaddedRwLock<HashMap<Uuid, NodeStates>>>() >= 64);
+    assert!(std::mem::size_of::<PaddedRwLock<HashMap<Uuid, NodeStates>>>() >= 128);
+    assert!(std::mem::size_of::<PaddedRwLock<NodeCollections>>() >= 128);
+    assert!(std::mem::align_of::<CachePadded<AtomicU64>>() >= 64);
+};
+
 /// Default probe target for the `direct` node when no `bootstrap_resolver`
 /// is configured: a directly-reachable, anycasted resolver.
 pub const DEFAULT_DIRECT_CHECK_ADDR: &str = "223.5.5.5:53";
@@ -519,8 +550,8 @@ impl AliveDialerSet {
         let (tx, rx) = tokio::sync::mpsc::channel(TRIGGER_QUEUE_CAPACITY);
         let (health_mode, _) = tokio::sync::watch::channel(runner::HealthMode::Running);
         Self {
-            states: RwLock::new(HashMap::new()),
-            collections: RwLock::new(HashMap::new()),
+            states: CachePadded(RwLock::new(CachePadded(HashMap::new()))),
+            collections: CachePadded(RwLock::new(CachePadded(HashMap::new()))),
             registered: RwLock::default(),
             route_health: RwLock::default(),
             udp_faults: AtomicBool::new(false),
@@ -559,7 +590,7 @@ impl AliveDialerSet {
             started_at: Instant::now(),
             #[cfg(target_os = "linux")]
             started_at_coarse_ns: urltest::monotonic_coarse_ns(),
-            idle_generation: AtomicU64::new(0),
+            idle_generation: CachePadded(AtomicU64::new(0)),
             idle_groups: RwLock::default(),
             selected_nodes: RwLock::new(HashSet::new()),
             pinned_url_members: RwLock::new(HashMap::new()),
