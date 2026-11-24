@@ -569,8 +569,8 @@ fn test_sync_idle_groups_full_refresh() {
     for (i, n) in ["n1", "n2", "n3"].into_iter().enumerate() {
         set.register_node(id(i as u128 + 1), n.into(), Some("127.0.0.1:1".into()));
     }
-    // Re-registering the same group twice duplicates the node→groups
-    // index; the full refresh must rebuild it cleanly.
+    // Re-registering the same group is idempotent, and full refresh
+    // rebuilds the node→groups index cleanly.
     set.register_idle_group("g1", &[id(1)], Some(Duration::from_secs(10)));
     set.register_idle_group("g1", &[id(1)], Some(Duration::from_secs(10)));
     set.register_idle_group("g2", &[id(2)], Some(Duration::from_secs(20)));

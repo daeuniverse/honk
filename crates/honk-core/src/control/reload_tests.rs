@@ -5475,8 +5475,9 @@ fn reference_leaf_ids(
     path.pop();
 }
 
-/// Assert the outbound id map, health registrations and idle table
-/// against [`reference_leaf_ids`].
+/// Assert the outbound id map and health registrations against [`reference_leaf_ids`],
+/// and verify each idle-group entry's direct members, policy kind, and non-builtin
+/// TCP/UDP recovery leaves.
 fn assert_connectivity_matches_reference(config: &Config) {
     let leaves: Vec<std::collections::BTreeSet<uuid::Uuid>> = config
         .groups
@@ -5588,7 +5589,9 @@ fn assert_connectivity_matches_reference(config: &Config) {
 }
 
 /// GroupManager cuts subgroup cycles, but the eBPF outbound ids, health
-/// registrations and idle table come from the uncut configuration: with
+/// registrations, and automatic-group recovery leaves come from the uncut
+/// configuration (while each group's idle membership records direct members
+/// and direct-node finals only): with
 /// `b` declared before `a` and `a <-> b` as subgroups, `a`'s leaf keeps
 /// `b`'s slot, which a cut `b -> a` edge would move to `a`'s.
 #[test]
