@@ -293,6 +293,12 @@ async fn auxiliary_rebind_fences_a_cached_query_waiting_for_publication() {
         .serve_bound_tcp_dns(&mut stream, peer, held.projection_scope)
         .await
         .unwrap();
+    // Closing with an unread request can reset the client before it observes EOF.
+    let mut unread = Vec::new();
+    crate::dns::transport::read_length_prefixed_into(&mut stream, &mut unread, None)
+        .await
+        .unwrap();
+    assert_eq!(unread, query);
     drop(stream);
     let mut reply = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut client, &mut reply)
