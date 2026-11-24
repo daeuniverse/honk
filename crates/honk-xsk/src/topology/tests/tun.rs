@@ -290,8 +290,15 @@ fn tun_device_readiness_never_retries_foreign_or_conflicting_parsed_state() {
 
 #[test]
 fn tun_device_readback_does_not_refresh_an_expired_deadline() {
-    let fd = std::fs::File::open("/dev/null").unwrap();
-    let error = snapshot(fd.as_fd(), Some(Instant::now())).err().unwrap();
+    let error = with_topology_dump_socket(
+        None,
+        Instant::now(),
+        &mut [],
+        || panic!("expired deadline opened a dump socket"),
+        |dump| dump.snapshot(),
+    )
+    .err()
+    .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
 }
 

@@ -11,7 +11,6 @@ const RTM_NEWCHAIN: u16 = 100;
 const RTM_DELCHAIN: u16 = 101;
 const RTM_NEWNEXTHOP: u16 = 104;
 const RTM_DELNEXTHOP: u16 = 105;
-const RTM_GETNEXTHOP: u16 = 106;
 const RTM_NEWNEXTHOPBUCKET: u16 = 116;
 const RTM_DELNEXTHOPBUCKET: u16 = 117;
 const ARPHRD_IP6GRE: u16 = 823;
@@ -173,16 +172,69 @@ struct WatchState {
     buffer: CaptureBuffer,
     observed: ObservedAuxLink,
     broadcasts: Option<Ipv4Broadcasts>,
+    refused_selector: Option<LinkNotificationSelector>,
 }
 
 type Ipv4Broadcasts = ([Ipv4Addr; MAX_BROADCASTS], usize);
 
+struct OuterRead {
+    selector: LinkNotificationSelector,
+    host_lower: Option<HostLower>,
+    broadcasts: Option<Ipv4Broadcasts>,
+    info: io::Result<Option<AuxLinkInfo>>,
+}
+
+impl OuterRead {
+    fn refuse(mut self, error: io::Error) -> Self {
+        self.info = Err(error);
+        self
+    }
+}
+
+impl WatchState {
+    fn record_outer(&mut self, result: io::Result<OuterRead>) -> io::Result<Option<AuxLinkInfo>> {
+        let read = result?;
+        if read.info.is_ok() {
+            self.observed.selector = read.selector;
+            self.observed.host_lower = read.host_lower;
+            self.broadcasts = read.broadcasts;
+            self.refused_selector = None;
+        } else {
+            self.refused_selector = Some(read.selector);
+        }
+        read.info
+    }
+
+    fn notification_context(
+        &self,
+        previous: Option<AuxLinkInfo>,
+    ) -> (ObservedAuxLink, Option<&Ipv4Broadcasts>) {
+        if previous.is_none()
+            && let Some(selector) = self.refused_selector
+        {
+            return (
+                ObservedAuxLink {
+                    selector,
+                    ..self.observed
+                },
+                None,
+            );
+        }
+        (self.observed, self.broadcasts.as_ref())
+    }
+}
+
 #[derive(Clone, Copy, Default)]
-struct ObservedAuxLink {
+struct LinkNotificationSelector {
     index: Option<u32>,
     ingress: Option<LegacyIngress>,
     default_refused: bool,
     broadcasts_refused: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ObservedAuxLink {
+    selector: LinkNotificationSelector,
     host: bool,
     host_fifo: Option<(u32, u32)>,
     host_lower: Option<HostLower>,
@@ -222,6 +274,7 @@ impl AuxLinkWatch {
                 buffer: CaptureBuffer::new(budget)?,
                 observed: ObservedAuxLink::default(),
                 broadcasts: None,
+                refused_selector: None,
             }),
         })
     }
@@ -263,16 +316,6 @@ impl AuxLinkWatch {
         fresh.host_capture.clone_from(&self.host_capture);
         fresh.state.get_mut().map_err(watch_poisoned)?.observed.host = self.host_capture.is_some();
         Ok(fresh)
-    }
-
-    fn dump_socket(&self) -> io::Result<OwnedFd> {
-        let fd = route_socket(false)?;
-        if netns_cookie(fd.as_fd())? != self.netns_cookie {
-            return Err(unsupported(
-                "auxiliary topology dump crossed network namespaces",
-            ));
-        }
-        Ok(fd)
     }
 
     /// A missing name is waiting. A valid administratively down link has `up == false`.
@@ -317,91 +360,83 @@ impl AuxLinkWatch {
         require_broadcasts: bool,
     ) -> io::Result<Option<AuxLinkInfo>> {
         let name = interface_name(name.as_bytes())?;
-        let fd = self.dump_socket()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + DUMP_TIMEOUT;
         let mut state = self.state.lock().map_err(watch_poisoned)?;
-        let WatchState {
-            buffer,
-            observed,
-            broadcasts,
-        } = &mut *state;
-        let buffer = &mut buffer.bytes;
-        let mut snapshot = Snapshot::default();
-        dump_with_buffer(
-            fd.as_fd(),
-            1,
-            libc::RTM_GETLINK,
-            16,
-            &mut snapshot,
-            deadline,
-            buffer,
-        )?;
-        let link = snapshot.aux_link(name)?;
-        let index = link.map(|link| link.index);
-        if observed.index != index {
-            *observed = ObservedAuxLink {
-                index,
-                host: self.host_capture.is_some(),
-                host_fifo: observed.host_fifo,
-                ..ObservedAuxLink::default()
+        let attempt = |dump: &mut TopologyDump<'_>| {
+            let mut snapshot = Snapshot::default();
+            dump.append(1, libc::RTM_GETLINK, 16, &mut snapshot)?;
+            let link = snapshot.aux_link(name)?;
+            let mut read = OuterRead {
+                selector: LinkNotificationSelector {
+                    index: link.map(|link| link.index),
+                    ..LinkNotificationSelector::default()
+                },
+                host_lower: None,
+                broadcasts: None,
+                info: Ok(None),
             };
-            *broadcasts = None;
-        }
-        let Some(link) = link else {
-            return Ok(None);
-        };
-        let info = if let Some(captures) = &self.host_capture {
-            snapshot.check_host_overlap(link.index, &captures.names)?;
-            observed.host_lower = Some(HostLower::from(link));
-            AuxLinkInfo::from_host_link(link)?
-        } else {
-            AuxLinkInfo::from_link(link)?
-        };
-        dump_with_buffer(
-            fd.as_fd(),
-            2,
-            libc::RTM_GETROUTE,
-            12,
-            &mut snapshot,
-            deadline,
-            buffer,
-        )?;
-        if self.host_capture.is_none()
-            && snapshot
-                .routes
-                .iter()
-                .any(|route| route.is_ip_default() && route.nexthop.is_some())
-        {
-            dump_with_buffer(
-                fd.as_fd(),
-                3,
-                RTM_GETNEXTHOP,
-                8,
-                &mut snapshot,
-                deadline,
-                buffer,
-            )?;
-        }
-        if self.host_capture.is_none() {
-            let defaults = snapshot.check_aux_defaults(info.ifindex);
-            observed.default_refused = defaults.is_err();
-            defaults?;
-            let (ingress, has_filter) = legacy_ingress(fd.as_fd(), info.ifindex, deadline, buffer)?;
-            observed.ingress = ingress;
-            if has_filter {
-                return Err(unsupported(
-                    "l3_lan has a conflicting legacy ingress filter",
-                ));
+            let Some(link) = link else {
+                return Ok(read);
+            };
+            let info = if let Some(captures) = &self.host_capture {
+                snapshot
+                    .check_host_overlap(link.index, &captures.names)
+                    .and_then(|()| {
+                        read.host_lower = Some(HostLower::from(link));
+                        AuxLinkInfo::from_host_link(link)
+                    })
+            } else {
+                AuxLinkInfo::from_link(link)
+            };
+            let info = match info {
+                Ok(info) => info,
+                Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                    return Ok(read.refuse(error));
+                }
+                Err(error) => return Err(error),
+            };
+            dump.append(2, libc::RTM_GETROUTE, 12, &mut snapshot)?;
+            if self.host_capture.is_none() {
+                if snapshot
+                    .routes
+                    .iter()
+                    .any(|route| route.is_ip_default() && route.nexthop.is_some())
+                {
+                    dump.append(3, RTM_GETNEXTHOP, 8, &mut snapshot)?;
+                }
+                match snapshot.check_aux_defaults(info.ifindex) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                        read.selector.default_refused = true;
+                        return Ok(read.refuse(error));
+                    }
+                    Err(error) => return Err(error),
+                }
+                let (ingress, refusal) = legacy_ingress(dump, info.ifindex)?;
+                read.selector.ingress = ingress;
+                if let Some(reason) = refusal {
+                    return Ok(read.refuse(unsupported(reason)));
+                }
             }
-        }
-        let verified = snapshot.ipv4_broadcasts();
-        observed.broadcasts_refused = verified.is_err();
-        *broadcasts = if require_broadcasts {
-            Some(verified?)
-        } else {
-            verified.ok()
+            match snapshot.ipv4_broadcasts() {
+                Ok(inventory) => read.broadcasts = Some(inventory),
+                Err(error) => {
+                    read.selector.broadcasts_refused = true;
+                    if require_broadcasts {
+                        return Ok(read.refuse(error));
+                    }
+                }
+            }
+            read.info = Ok(Some(info));
+            Ok(read)
         };
-        Ok(Some(info))
+        let result = with_topology_dump(
+            Some(self.netns_cookie),
+            deadline,
+            &mut state.buffer.bytes,
+            attempt,
+        );
+        state.record_outer(result)
     }
 
     /// Return the canonical local-table broadcast destinations from the latest admitted link read.
@@ -420,34 +455,31 @@ impl AuxLinkWatch {
         }
         let name = interface_name(name.as_bytes())?;
         let tun = interface_name(b"tun")?;
-        let fd = self.dump_socket()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + DUMP_TIMEOUT;
         let mut state = self.state.lock().map_err(watch_poisoned)?;
-        let buffer = &mut state.buffer.bytes;
-        let mut snapshot = Snapshot::default();
-        dump_with_buffer(
-            fd.as_fd(),
-            1,
-            libc::RTM_GETLINK,
-            16,
-            &mut snapshot,
+        with_topology_dump(
+            Some(self.netns_cookie),
             deadline,
-            buffer,
+            &mut state.buffer.bytes,
+            |dump| {
+                let mut snapshot = Snapshot::default();
+                dump.append(1, libc::RTM_GETLINK, 16, &mut snapshot)?;
+                if !snapshot.links.iter().any(|l| {
+                    l.index == index
+                        && l.name == Some(name)
+                        && l.kind == Some(tun)
+                        && l.arphrd == libc::ARPHRD_NONE
+                        && l.master == 0
+                        && l.flags & libc::IFF_UP as u32 == 0
+                        && l.tx_queue_len == Some(slots)
+                }) {
+                    return Err(unsupported(
+                        "private Host FIFO requires its down TUN and admitted ring size",
+                    ));
+                }
+                private_host_qdiscs(dump, index, slots, true)
+            },
         )?;
-        if !snapshot.links.iter().any(|l| {
-            l.index == index
-                && l.name == Some(name)
-                && l.kind == Some(tun)
-                && l.arphrd == libc::ARPHRD_NONE
-                && l.master == 0
-                && l.flags & libc::IFF_UP as u32 == 0
-                && l.tx_queue_len == Some(slots)
-        }) {
-            return Err(unsupported(
-                "private Host FIFO requires its down TUN and admitted ring size",
-            ));
-        }
-        private_host_qdiscs(fd.as_fd(), index, slots, true, deadline, buffer)?;
         state.observed.host_fifo = Some((index, slots));
         Ok(())
     }
@@ -455,59 +487,57 @@ impl AuxLinkWatch {
     /// Confirm the private TUN still has only the daemon-owned link identity.
     pub fn verify_inner(&self, name: &str, ifindex: u32, mtu: u32) -> io::Result<()> {
         let name_key = interface_name(name.as_bytes())?;
-        let fd = self.dump_socket()?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + DUMP_TIMEOUT;
         let mut state = self.state.lock().map_err(watch_poisoned)?;
         let fifo = state.observed.host_fifo;
-        let buffer = &mut state.buffer.bytes;
-        let mut snapshot = snapshot_with_buffer(fd.as_fd(), Some(deadline), buffer)?;
-        if snapshot.routes.iter().any(|route| route.nexthop.is_some()) {
-            dump_with_buffer(
-                fd.as_fd(),
-                5,
-                RTM_GETNEXTHOP,
-                8,
-                &mut snapshot,
-                deadline,
-                buffer,
-            )?;
-        }
-        if !snapshot
-            .links
-            .iter()
-            .any(|link| link.index == ifindex && link.is_owned_tun(name_key, mtu))
-            || snapshot
-                .addresses
-                .iter()
-                .any(|address| address.index == ifindex)
-            || snapshot
-                .rules
-                .iter()
-                .any(|rule| rule.names_interface(name_key))
-        {
-            return Err(unsupported(
-                "private auxiliary TUN identity, addresses or rules changed",
-            ));
-        }
-        for route in &snapshot.routes {
-            if route.input == ifindex || snapshot.route_uses(route, ifindex)? {
-                return Err(unsupported("private auxiliary TUN appears in a route"));
+        let attempt = |dump: &mut TopologyDump<'_>| {
+            let mut snapshot = dump.snapshot()?;
+            if snapshot.routes.iter().any(|route| route.nexthop.is_some()) {
+                dump.append(5, RTM_GETNEXTHOP, 8, &mut snapshot)?;
             }
-        }
-        if self.host_capture.is_some() {
-            let (index, slots) = fifo
-                .filter(|(i, _)| *i == ifindex)
-                .ok_or_else(|| unsupported("private Host TUN FIFO was not admitted"))?;
             if !snapshot
                 .links
                 .iter()
-                .any(|l| l.index == index && l.tx_queue_len == Some(slots))
+                .any(|link| link.index == ifindex && link.is_owned_tun(name_key, mtu))
+                || snapshot
+                    .addresses
+                    .iter()
+                    .any(|address| address.index == ifindex)
+                || snapshot
+                    .rules
+                    .iter()
+                    .any(|rule| rule.names_interface(name_key))
             {
-                return Err(unsupported("private Host TUN FIFO length changed"));
+                return Err(unsupported(
+                    "private auxiliary TUN identity, addresses or rules changed",
+                ));
             }
-            private_host_qdiscs(fd.as_fd(), ifindex, slots, false, deadline, buffer)?;
-        }
-        Ok(())
+            for route in &snapshot.routes {
+                if route.input == ifindex || snapshot.route_uses(route, ifindex)? {
+                    return Err(unsupported("private auxiliary TUN appears in a route"));
+                }
+            }
+            if self.host_capture.is_some() {
+                let (index, slots) = fifo
+                    .filter(|(i, _)| *i == ifindex)
+                    .ok_or_else(|| unsupported("private Host TUN FIFO was not admitted"))?;
+                if !snapshot
+                    .links
+                    .iter()
+                    .any(|l| l.index == index && l.tx_queue_len == Some(slots))
+                {
+                    return Err(unsupported("private Host TUN FIFO length changed"));
+                }
+                private_host_qdiscs(dump, ifindex, slots, false)?;
+            }
+            Ok(())
+        };
+        with_topology_dump(
+            Some(self.netns_cookie),
+            deadline,
+            &mut state.buffer.bytes,
+            attempt,
+        )
     }
 
     /// Drain queued notifications, retaining identity loss even across identical recreation.
@@ -596,19 +626,24 @@ impl AuxLinkWatch {
         let state = self.state.get_mut().map_err(watch_poisoned)?;
         for _ in 0..64 {
             let buffer = &mut state.buffer.bytes;
-            let length = match receive_notification(self.fd.as_fd(), buffer) {
+            let length = match receive_netlink(
+                self.fd.as_fd(),
+                buffer,
+                "invalid auxiliary notification sender or extent",
+            ) {
                 Ok(length) => length,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(changes),
                 Err(error) => return Err(error),
             };
+            let (observed, broadcasts) = state.notification_context(previous);
             changes.inspect(
-                &buffer[..length],
+                &state.buffer.bytes[..length],
                 name,
                 previous,
                 inner,
-                state.observed,
-                state.broadcasts.as_ref(),
+                observed,
+                broadcasts,
             )?;
         }
         Err(malformed("auxiliary notification drain bound exceeded"))
@@ -629,56 +664,6 @@ impl AsRawFd for AuxLinkWatch {
 
 fn watch_poisoned<T>(_: std::sync::PoisonError<T>) -> io::Error {
     io::Error::other("auxiliary topology watch is poisoned")
-}
-
-fn netns_cookie(fd: BorrowedFd<'_>) -> io::Result<u64> {
-    let mut value = 0u64;
-    let mut length = size_of::<u64>() as libc::socklen_t;
-    // SAFETY: value is writable and length names its exact extent.
-    if unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_NETNS_COOKIE,
-            (&mut value as *mut u64).cast(),
-            &mut length,
-        )
-    } < 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    if length as usize != size_of::<u64>() || value == 0 {
-        return Err(malformed("invalid auxiliary RTNL namespace cookie"));
-    }
-    Ok(value)
-}
-
-fn receive_notification(fd: BorrowedFd<'_>, buffer: &mut [u8]) -> io::Result<usize> {
-    // SAFETY: recvfrom writes only the provided buffer and sockaddr extent.
-    let mut source: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    let mut length = size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-    let n = unsafe {
-        libc::recvfrom(
-            fd.as_raw_fd(),
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-            (&mut source as *mut libc::sockaddr_nl).cast(),
-            &mut length,
-        )
-    };
-    if n < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if n == 0
-        || n as usize > buffer.len()
-        || length as usize != size_of::<libc::sockaddr_nl>()
-        || source.nl_family != libc::AF_NETLINK as libc::sa_family_t
-        || source.nl_pid != 0
-    {
-        return Err(malformed("invalid auxiliary notification sender or extent"));
-    }
-    Ok(n as usize)
 }
 
 impl Snapshot {
@@ -911,32 +896,22 @@ fn private_host_qdisc(body: &[u8], slots: u32, initial: bool) -> io::Result<()> 
 }
 
 fn private_host_qdiscs(
-    fd: BorrowedFd<'_>,
+    dump: &mut TopologyDump<'_>,
     index: u32,
     slots: u32,
     initial: bool,
-    deadline: Instant,
-    buffer: &mut [u8],
 ) -> io::Result<()> {
     let mut found = false;
-    dump_request(
-        fd,
-        6,
-        libc::RTM_GETQDISC,
-        &[0; 20],
-        deadline,
-        buffer,
-        |_, body| {
-            if TcTarget::read(body)?.ifindex == index {
-                if found {
-                    return Err(unsupported("additional private Host TUN qdisc"));
-                }
-                private_host_qdisc(body, slots, initial)?;
-                found = true;
+    dump.request(6, libc::RTM_GETQDISC, &[0; 20], |_, body| {
+        if TcTarget::read(body)?.ifindex == index {
+            if found {
+                return Err(unsupported("additional private Host TUN qdisc"));
             }
-            Ok(())
-        },
-    )?;
+            private_host_qdisc(body, slots, initial)?;
+            found = true;
+        }
+        Ok(())
+    })?;
     if !found {
         return Err(unsupported("private Host TUN root queue is absent"));
     }
@@ -944,65 +919,57 @@ fn private_host_qdiscs(
 }
 
 fn legacy_ingress(
-    fd: BorrowedFd<'_>,
+    dump: &mut TopologyDump<'_>,
     index: u32,
-    deadline: Instant,
-    buffer: &mut [u8],
-) -> io::Result<(Option<LegacyIngress>, bool)> {
-    let mut ingress = None;
-    dump_request(
-        fd,
-        4,
-        libc::RTM_GETQDISC,
-        &[0; 20],
-        deadline,
-        buffer,
-        |_, body| {
-            let target = TcTarget::read(body)?;
-            if target.ifindex != index || target.parent != TC_H_INGRESS {
-                return Ok(());
-            }
-            let mut parent = None;
-            let mut shared_block = None;
-            let mut seen = 0;
-            attributes(&body[20..], |kind, value| {
-                match kind {
-                    TCA_KIND => {
-                        unique_attribute(&mut seen, kind)?;
-                        parent = Some(match value {
-                            b"ingress\0" => TC_H_INGRESS,
-                            b"clsact\0" => TC_H_CLSACT_INGRESS,
-                            _ => return Err(unsupported("unrecognized l3_lan ingress qdisc")),
-                        });
-                    }
-                    TCA_INGRESS_BLOCK => {
-                        unique_attribute(&mut seen, kind)?;
-                        let block = exact_u32(value)?;
-                        if block == 0 {
-                            return Err(malformed("invalid l3_lan shared ingress block"));
-                        }
-                        shared_block = Some(block);
-                    }
-                    _ => {}
+) -> io::Result<(Option<LegacyIngress>, Option<&'static str>)> {
+    let mut qdisc = None;
+    dump.request(4, libc::RTM_GETQDISC, &[0; 20], |_, body| {
+        let target = TcTarget::read(body)?;
+        if target.ifindex != index || target.parent != TC_H_INGRESS {
+            return Ok(());
+        }
+        let mut parent = None;
+        let mut shared_block = None;
+        let mut seen = 0;
+        attributes(&body[20..], |kind, value| {
+            match kind {
+                TCA_KIND => {
+                    unique_attribute(&mut seen, kind)?;
+                    parent = Some(match value {
+                        b"ingress\0" => Some(TC_H_INGRESS),
+                        b"clsact\0" => Some(TC_H_CLSACT_INGRESS),
+                        _ => None,
+                    });
                 }
-                Ok(())
-            })?;
-            let parent = parent.ok_or_else(|| malformed("l3_lan ingress qdisc has no kind"))?;
-            if ingress
-                .replace(LegacyIngress {
-                    index,
-                    parent,
-                    shared_block,
-                })
-                .is_some()
-            {
-                return Err(malformed("duplicate l3_lan ingress qdisc"));
+                TCA_INGRESS_BLOCK => {
+                    unique_attribute(&mut seen, kind)?;
+                    let block = exact_u32(value)?;
+                    if block == 0 {
+                        return Err(malformed("invalid l3_lan shared ingress block"));
+                    }
+                    shared_block = Some(block);
+                }
+                _ => {}
             }
             Ok(())
-        },
-    )?;
-    let Some(ingress) = ingress else {
-        return Ok((None, false));
+        })?;
+        let parent = parent.ok_or_else(|| malformed("l3_lan ingress qdisc has no kind"))?;
+        if qdisc
+            .replace(parent.map(|parent| LegacyIngress {
+                index,
+                parent,
+                shared_block,
+            }))
+            .is_some()
+        {
+            return Err(malformed("duplicate l3_lan ingress qdisc"));
+        }
+        Ok(())
+    })?;
+    let ingress = match qdisc {
+        Some(Some(ingress)) => ingress,
+        Some(None) => return Ok((None, Some("unrecognized l3_lan ingress qdisc"))),
+        None => return Ok((None, None)),
     };
     let target = match ingress.shared_block {
         Some(block) => TcTarget {
@@ -1015,23 +982,18 @@ fn legacy_ingress(
         },
     };
     let mut has_filter = false;
-    dump_request(
-        fd,
-        5,
-        libc::RTM_GETTFILTER,
-        &target.body(),
-        deadline,
-        buffer,
-        |_, body| {
-            if !ingress.contains(TcTarget::read(body)?) {
-                return Err(malformed("unexpected l3_lan ingress filter target"));
-            }
-            attributes(&body[20..], |_, _| Ok(()))?;
-            has_filter = true;
-            Ok(())
-        },
-    )?;
-    Ok((Some(ingress), has_filter))
+    dump.request(5, libc::RTM_GETTFILTER, &target.body(), |_, body| {
+        if !ingress.contains(TcTarget::read(body)?) {
+            return Err(malformed("unexpected l3_lan ingress filter target"));
+        }
+        attributes(&body[20..], |_, _| Ok(()))?;
+        has_filter = true;
+        Ok(())
+    })?;
+    Ok((
+        Some(ingress),
+        has_filter.then_some("l3_lan has a conflicting legacy ingress filter"),
+    ))
 }
 
 #[derive(Default)]
@@ -1051,8 +1013,10 @@ impl Changes {
         observed: ObservedAuxLink,
         broadcasts: Option<&Ipv4Broadcasts>,
     ) -> io::Result<()> {
-        let outer_index = previous.map(|info| info.ifindex).or(observed.index);
-        let waiting_for_default = previous.is_none() && observed.default_refused;
+        let outer_index = previous
+            .map(|info| info.ifindex)
+            .or(observed.selector.index);
+        let waiting_for_default = previous.is_none() && observed.selector.default_refused;
         while !bytes.is_empty() {
             if bytes.len() < 16 {
                 return Err(malformed("short auxiliary notification"));
@@ -1067,7 +1031,7 @@ impl Changes {
             }
             let kind = u16::from_ne_bytes([bytes[4], bytes[5]]);
             let flags = u16::from_ne_bytes([bytes[6], bytes[7]]);
-            if flags & 0x10 != 0 {
+            if flags & NLM_F_DUMP_INTR != 0 {
                 return Err(malformed("interrupted auxiliary notification"));
             }
             let body = &bytes[16..length];
@@ -1111,7 +1075,7 @@ impl Changes {
                     parsed.push(libc::RTM_NEWROUTE, body)?;
                     let route = &parsed.routes[0];
                     self.broadcasts_dirty |= outer_index.is_some()
-                        && (broadcasts.is_some() || observed.broadcasts_refused)
+                        && (broadcasts.is_some() || observed.selector.broadcasts_refused)
                         && route.may_change_ipv4_broadcasts(broadcasts);
                     if !observed.host && route.is_ip_default() {
                         self.invalidated |= waiting_for_default
@@ -1167,7 +1131,7 @@ impl Changes {
                             if matches!(kind, libc::RTM_NEWQDISC | libc::RTM_DELQDISC) {
                                 target.ifindex == index && target.parent == TC_H_INGRESS
                             } else {
-                                observed.ingress.is_some_and(|ingress| {
+                                observed.selector.ingress.is_some_and(|ingress| {
                                     ingress.index == index && ingress.contains(target)
                                 })
                             }

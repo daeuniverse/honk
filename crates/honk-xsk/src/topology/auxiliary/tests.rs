@@ -1,4 +1,4 @@
-use super::super::tests::{attribute, capture_notification};
+use super::super::tests::{attribute, capture_notification, dump_message};
 use super::*;
 
 fn link_body(index: u32, mtu: u32, up: bool, arphrd: u16, name: &[u8]) -> Vec<u8> {
@@ -224,12 +224,15 @@ fn auxiliary_defaults_resolve_direct_multipath_and_named_nexthops() {
 fn legacy_ingress_notifications_distinguish_shared_blocks_and_egress() {
     let name = interface_name(b"aux0").unwrap();
     let observed = ObservedAuxLink {
-        index: Some(7),
-        ingress: Some(LegacyIngress {
-            index: 7,
-            parent: TC_H_CLSACT_INGRESS,
-            shared_block: Some(42),
-        }),
+        selector: LinkNotificationSelector {
+            index: Some(7),
+            ingress: Some(LegacyIngress {
+                index: 7,
+                parent: TC_H_CLSACT_INGRESS,
+                shared_block: Some(42),
+            }),
+            ..LinkNotificationSelector::default()
+        },
         ..ObservedAuxLink::default()
     };
     for (ifindex, parent, invalidated) in [
@@ -261,8 +264,11 @@ fn legacy_ingress_notifications_distinguish_shared_blocks_and_egress() {
 fn rejected_default_guard_wakes_on_route_replacement_and_nexthop_change() {
     let name = interface_name(b"aux0").unwrap();
     let observed = ObservedAuxLink {
-        index: Some(7),
-        default_refused: true,
+        selector: LinkNotificationSelector {
+            index: Some(7),
+            default_refused: true,
+            ..LinkNotificationSelector::default()
+        },
         ..ObservedAuxLink::default()
     };
     let mut replacement = route_body(2, 0);
@@ -281,6 +287,97 @@ fn rejected_default_guard_wakes_on_route_replacement_and_nexthop_change() {
             .inspect(&event, name, None, None, observed, None)
             .unwrap();
         assert!(changes.invalidated);
+    }
+}
+
+#[test]
+fn outer_read_preserves_admission_on_refusal_or_interruption() {
+    let mut state = WatchState {
+        buffer: CaptureBuffer::new(&MemoryBudget::new(RTNL_BUFFER_BYTES)).unwrap(),
+        observed: ObservedAuxLink::default(),
+        broadcasts: None,
+        refused_selector: None,
+    };
+    let name = interface_name(b"aux0").unwrap();
+    let mut broadcasts = ([Ipv4Addr::UNSPECIFIED; MAX_BROADCASTS], 1);
+    broadcasts.0[0] = Ipv4Addr::new(192, 0, 2, 255);
+    let admitted = OuterRead {
+        selector: LinkNotificationSelector {
+            index: Some(ACTIVE.ifindex),
+            ..LinkNotificationSelector::default()
+        },
+        host_lower: None,
+        broadcasts: Some(broadcasts),
+        info: Ok(Some(ACTIVE)),
+    };
+    assert_eq!(state.record_outer(Ok(admitted)).unwrap(), Some(ACTIVE));
+
+    for default_refused in [true, false] {
+        let refused = OuterRead {
+            selector: LinkNotificationSelector {
+                index: Some(9),
+                default_refused,
+                broadcasts_refused: !default_refused,
+                ..LinkNotificationSelector::default()
+            },
+            host_lower: None,
+            broadcasts: None,
+            info: Err(unsupported("refused auxiliary topology")),
+        };
+        assert_eq!(
+            state.record_outer(Ok(refused)).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+
+        let done = dump_message(2, 3, NLM_F_DUMP_INTR, &[0; 4]);
+        let interrupted = with_topology_dump_socket(
+            Some(42),
+            Instant::now() + Duration::from_secs(10),
+            &mut state.buffer.bytes,
+            || Ok((std::fs::File::open("/dev/null")?.into(), 42)),
+            |_| {
+                let candidate = OuterRead {
+                    selector: LinkNotificationSelector {
+                        index: Some(10),
+                        ..LinkNotificationSelector::default()
+                    },
+                    host_lower: None,
+                    broadcasts: None,
+                    info: Ok(None),
+                };
+                dump_datagram(&done, 2, libc::RTM_GETROUTE, |_, _| unreachable!())?;
+                Ok(candidate)
+            },
+        );
+        assert_eq!(
+            state.record_outer(interrupted).unwrap_err().to_string(),
+            DUMP_INTERRUPTED
+        );
+        assert_eq!(state.observed.selector.index, Some(ACTIVE.ifindex));
+        assert_eq!(state.broadcasts, Some(broadcasts));
+
+        let mut route = if default_refused {
+            route_body(2, 0)
+        } else {
+            let mut route = route_body(2, 32);
+            route[4] = 255;
+            attribute(&mut route, 1, &[198, 51, 100, 255]);
+            route
+        };
+        attribute(&mut route, 4, &8u32.to_ne_bytes());
+        let event = capture_notification(libc::RTM_NEWROUTE, &route);
+        for previous in [Some(ACTIVE), None] {
+            let (observed, inventory) = state.notification_context(previous);
+            let mut changes = Changes::default();
+            changes
+                .inspect(&event, name, previous, None, observed, inventory)
+                .unwrap();
+            assert_eq!(changes.invalidated, previous.is_none() && default_refused);
+            assert_eq!(
+                changes.broadcasts_dirty,
+                previous.is_none() && !default_refused
+            );
+        }
     }
 }
 
@@ -453,7 +550,10 @@ fn host_mac_notice_rechecks_without_retiring_but_unregister_and_down_are_sticky(
     };
     let observed = ObservedAuxLink {
         host: true,
-        index: Some(7),
+        selector: LinkNotificationSelector {
+            index: Some(7),
+            ..LinkNotificationSelector::default()
+        },
         ..Default::default()
     };
     for (kind, up, invalidated) in [
