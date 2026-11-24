@@ -364,21 +364,24 @@ impl AliveDialerSet {
         let cancel = permit.cancellation();
 
         // Suspended nodes only recover when an owning idle automatic group has
-        // no alive member left on TCP or DataUdp (TC ignores DnsUdp and never
-        // drops traffic while any sibling or family remains usable).
+        // no alive recovery leaf left on `(Tcp, V4)` or `(DataUdp, V4)` (TC
+        // ignores DnsUdp and allows V6→V4 fallback, never V4→V6).
         let due = nodes.into_iter().filter_map(|(id, registration)| {
             let suspended = self.is_probe_suspended(id);
-            let tcp_due = (!suspended || self.needs_idle_recovery(id, ProbeDomain::Tcp))
-                && [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
+            let tcp_due = if suspended {
+                self.needs_idle_recovery(id, ProbeDomain::Tcp)
+                    && !self.is_alive_for(id, ProbeDomain::Tcp, IpVersion::V4)
+                    && self.should_probe(id, ProbeDomain::Tcp, IpVersion::V4)
+            } else {
+                [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
                     !self.is_alive_for(id, ProbeDomain::Tcp, ipver)
                         && self.should_probe(id, ProbeDomain::Tcp, ipver)
-                });
+                })
+            };
             let udp_due = if suspended {
                 self.needs_idle_recovery(id, ProbeDomain::DataUdp)
-                    && [IpVersion::V4, IpVersion::V6].into_iter().any(|ipver| {
-                        !self.is_alive_for(id, ProbeDomain::DataUdp, ipver)
-                            && self.should_probe(id, ProbeDomain::DataUdp, ipver)
-                    })
+                    && !self.is_alive_for(id, ProbeDomain::DataUdp, IpVersion::V4)
+                    && self.should_probe(id, ProbeDomain::DataUdp, IpVersion::V4)
             } else {
                 [ProbeDomain::DataUdp, ProbeDomain::DnsUdp]
                     .into_iter()

@@ -243,6 +243,20 @@ pub fn carries_udp(path: UdpPath<'_>) -> bool {
     }
 }
 
+/// Whether `node` carries UDP itself or through its bound chain exit.
+#[inline]
+pub fn node_carries_udp<'a>(
+    node: &Node,
+    lookup: impl FnMut(&uuid::Uuid) -> Option<&'a Node>,
+) -> bool {
+    if node.protocol() == NodeProtocol::Chain {
+        return node
+            .resolved_chain_hops()
+            .is_some_and(|hops| builtin_tunneled_udp_available(hops, lookup));
+    }
+    carries_udp(UdpPath::Own(node))
+}
+
 /// Composed UDP requires each prefix, including the first hop, to support a
 /// direct handshake on a supplied stream. The terminal must frame UDP.
 pub(crate) fn tunneled_hops_carry_udp<'hops, 'node, T>(

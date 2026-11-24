@@ -720,6 +720,8 @@ async fn check_routed_udp_health() {
     // exemption is cleared as well.
     alive.sync_idle_groups(&[honk_outbound::alive::IdleGroupRegistration {
         name: "ordinary health probes".into(),
+        tcp_recovery_members: raw_nodes.clone(),
+        udp_recovery_members: raw_nodes.clone(),
         members: raw_nodes,
         idle_timeout: Some(WAIT),
         kind: honk_outbound::alive::IdleGroupKind::Automatic,

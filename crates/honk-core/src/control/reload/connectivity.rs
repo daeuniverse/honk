@@ -92,14 +92,19 @@ pub(in crate::control) fn sync_health_check_nodes(
 /// Each entry lists only that group's direct node members and any direct-node
 /// `final` edge so activating an automatic group wakes its own members while
 /// chosen subgroups activate on traversal, and `Selector` groups stay isolated
-/// to their fixed selections.
+/// to their fixed selections. Automatic groups also carry their reachable
+/// non-builtin TCP and UDP recovery leaves for datapath-parity idle recovery.
 pub(in crate::control) fn idle_group_registrations(
     config: &Config,
 ) -> Vec<honk_outbound::alive::IdleGroupRegistration> {
+    let graph = GroupGraph::new(&config.groups, &config.nodes);
+    let node_by_id: std::collections::HashMap<uuid::Uuid, &honk_config::node::Node> =
+        config.nodes.iter().map(|node| (node.id, node)).collect();
     config
         .groups
         .iter()
-        .map(|group| {
+        .enumerate()
+        .map(|(index, group)| {
             let mut members: BTreeSet<uuid::Uuid> = group.nodes.iter().copied().collect();
             match group.final_outbound.as_deref() {
                 None => {}
@@ -115,15 +120,41 @@ pub(in crate::control) fn idle_group_registrations(
                     }
                 }
             }
+            let (kind, tcp_recovery_members, udp_recovery_members) =
+                if group.policy == GroupPolicy::Selector {
+                    (
+                        honk_outbound::alive::IdleGroupKind::Selector,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let tcp: Vec<uuid::Uuid> = group_leaf_ids(&graph, index)
+                        .into_iter()
+                        .filter(|id| {
+                            *id != honk_config::config::DIRECT_NODE_ID
+                                && *id != honk_config::config::BLOCK_NODE_ID
+                        })
+                        .collect();
+                    let udp: Vec<uuid::Uuid> = tcp
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            node_by_id.get(id).is_some_and(|node| {
+                                honk_outbound::descriptor::node_carries_udp(node, |hop| {
+                                    node_by_id.get(hop).copied()
+                                })
+                            })
+                        })
+                        .collect();
+                    (honk_outbound::alive::IdleGroupKind::Automatic, tcp, udp)
+                };
             honk_outbound::alive::IdleGroupRegistration {
                 name: group.name.clone(),
                 members: members.into_iter().collect(),
                 idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
-                kind: if group.policy == GroupPolicy::Selector {
-                    honk_outbound::alive::IdleGroupKind::Selector
-                } else {
-                    honk_outbound::alive::IdleGroupKind::Automatic
-                },
+                kind,
+                tcp_recovery_members,
+                udp_recovery_members,
             }
         })
         .collect()

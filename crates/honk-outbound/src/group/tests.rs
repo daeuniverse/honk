@@ -2259,9 +2259,30 @@ fn ranked_udp_leaves_orders_caps_and_filters() {
     );
 }
 
+fn idle_reg(
+    name: &str,
+    members: Vec<uuid::Uuid>,
+    idle_timeout: Option<Duration>,
+    kind: crate::alive::IdleGroupKind,
+) -> crate::alive::IdleGroupRegistration {
+    let recovery = if kind == crate::alive::IdleGroupKind::Automatic {
+        members.clone()
+    } else {
+        Vec::new()
+    };
+    crate::alive::IdleGroupRegistration {
+        name: name.to_owned(),
+        members,
+        idle_timeout,
+        kind,
+        tcp_recovery_members: recovery.clone(),
+        udp_recovery_members: recovery,
+    }
+}
+
 #[test]
 fn automatic_policies_pause_until_selected_and_ignore_peek() {
-    use crate::alive::{IdleGroupKind, IdleGroupRegistration};
+    use crate::alive::IdleGroupKind;
 
     for policy in [
         GroupPolicy::URLTest,
@@ -2272,12 +2293,12 @@ fn automatic_policies_pause_until_selected_and_ignore_peek() {
         let (a, b) = (nid("auto-a"), nid("auto-b"));
         let nodes = vec![make_node(a, "a"), make_node(b, "b")];
         let alive = Arc::new(AliveDialerSet::new());
-        alive.sync_idle_groups(&[IdleGroupRegistration {
-            name: "g".into(),
-            members: vec![a, b],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        }]);
+        alive.sync_idle_groups(&[idle_reg(
+            "g",
+            vec![a, b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        )]);
         let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
         let manager = GroupManager::with_alive_set(
             &[make_group("g", policy, vec![a, b])],
@@ -2322,7 +2343,7 @@ fn automatic_policies_pause_until_selected_and_ignore_peek() {
 
 #[test]
 fn active_selector_and_pinned_automatic_groups_isolate_unselected_members() {
-    use crate::alive::{IdleGroupKind, IdleGroupRegistration};
+    use crate::alive::IdleGroupKind;
 
     let (a, b, hk1, hk2, jp1, jp2, o1, s1, s2, f1, p1, p2) = (
         nid("a"),
@@ -2377,48 +2398,48 @@ fn active_selector_and_pinned_automatic_groups_isolate_unselected_members() {
     ];
     let alive = Arc::new(AliveDialerSet::new());
     alive.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "proxy".into(),
-            members: vec![a, b],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Selector,
-        },
-        IdleGroupRegistration {
-            name: "auto_hk".into(),
-            members: vec![hk1, hk2],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "auto_jp".into(),
-            members: vec![jp1, jp2],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "outer_auto".into(),
-            members: vec![o1],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "nested_sel".into(),
-            members: vec![s1, s2],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Selector,
-        },
-        IdleGroupRegistration {
-            name: "final_auto".into(),
-            members: vec![f1],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "pinned_score".into(),
-            members: vec![p1, p2],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "proxy",
+            vec![a, b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "auto_hk",
+            vec![hk1, hk2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "auto_jp",
+            vec![jp1, jp2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "outer_auto",
+            vec![o1],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "nested_sel",
+            vec![s1, s2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "final_auto",
+            vec![f1],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "pinned_score",
+            vec![p1, p2],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     let manager = GroupManager::with_alive_set(&groups, &nodes, Some(Arc::clone(&alive)));
     manager.publish_selected_probe_nodes();
@@ -2513,7 +2534,7 @@ fn active_selector_and_pinned_automatic_groups_isolate_unselected_members() {
 
 #[test]
 fn selector_update_defers_probe_wake_and_excludes_builtin_finals() {
-    use crate::alive::{IdleGroupKind, IdleGroupRegistration};
+    use crate::alive::IdleGroupKind;
     use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
 
     let (a, b, c, d, e, f, backup) = (
@@ -2545,24 +2566,24 @@ fn selector_update_defers_probe_wake_and_excludes_builtin_finals() {
 
     let alive = Arc::new(AliveDialerSet::new());
     alive.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "sel".into(),
-            members: vec![a, b, c, BLOCK_NODE_ID],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Selector,
-        },
-        IdleGroupRegistration {
-            name: "auto_g".into(),
-            members: vec![d, e, DIRECT_NODE_ID],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "auto_final".into(),
-            members: vec![f, backup],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "sel",
+            vec![a, b, c, BLOCK_NODE_ID],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "auto_g",
+            vec![d, e, DIRECT_NODE_ID],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "auto_final",
+            vec![f, backup],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
     let manager =
@@ -2618,8 +2639,8 @@ fn selector_update_defers_probe_wake_and_excludes_builtin_finals() {
 #[tokio::test]
 async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() {
     use crate::alive::{
-        HttpProbeOutcome, HttpProbeResult, HttpProber, IdleGroupKind, IdleGroupRegistration,
-        ProbeCancellation, UrlProbeMember,
+        HttpProbeOutcome, HttpProbeResult, HttpProber, IdleGroupKind, ProbeCancellation,
+        UrlProbeMember,
     };
     use parking_lot::Mutex;
     use std::future::Future;
@@ -2658,12 +2679,12 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
         .await;
     alive.register_node(a, "a".into(), Some("127.0.0.1:1".into()));
     alive.register_node(b, "b".into(), Some("127.0.0.1:1".into()));
-    alive.sync_idle_groups(&[IdleGroupRegistration {
-        name: "custom".into(),
-        members: vec![a, b],
-        idle_timeout: Some(Duration::from_secs(3600)),
-        kind: IdleGroupKind::Automatic,
-    }]);
+    alive.sync_idle_groups(&[idle_reg(
+        "custom",
+        vec![a, b],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Automatic,
+    )]);
     alive.sync_group_check_urls(&[("custom".into(), url.into())]);
 
     let manager = Arc::new(GroupManager::with_alive_set(

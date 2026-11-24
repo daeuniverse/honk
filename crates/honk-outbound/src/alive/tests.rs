@@ -183,18 +183,39 @@ fn available_traffic_fast_path_preserves_clean_state_and_resets_dirty_state() {
     assert!(reset.is_clean_alive());
 }
 
+fn idle_reg(
+    name: &str,
+    members: Vec<Uuid>,
+    idle_timeout: Option<Duration>,
+    kind: IdleGroupKind,
+) -> IdleGroupRegistration {
+    let recovery = if kind == IdleGroupKind::Automatic {
+        members.clone()
+    } else {
+        Vec::new()
+    };
+    IdleGroupRegistration {
+        name: name.to_owned(),
+        members,
+        idle_timeout,
+        kind,
+        tcp_recovery_members: recovery.clone(),
+        udp_recovery_members: recovery,
+    }
+}
+
 #[test]
 fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     let set = AliveDialerSet::new();
     set.mark_group_active("untracked");
     assert!(set.idle_groups.read().groups.is_empty());
 
-    set.sync_idle_groups(&[IdleGroupRegistration {
-        name: "tracked".to_owned(),
-        members: Vec::new(),
-        idle_timeout: Some(Duration::from_secs(60)),
-        kind: IdleGroupKind::Automatic,
-    }]);
+    set.sync_idle_groups(&[idle_reg(
+        "tracked",
+        Vec::new(),
+        Some(Duration::from_secs(60)),
+        IdleGroupKind::Automatic,
+    )]);
     set.mark_group_active("tracked");
     let first = set.idle_groups.read().groups["tracked"]
         .last_active_ns
@@ -428,12 +449,12 @@ fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
     let sync_set = std::sync::Arc::clone(&set);
     let syncer = std::thread::spawn(move || {
         for _ in 0..200 {
-            sync_set.sync_idle_groups(&[IdleGroupRegistration {
-                name: "g".to_owned(),
-                members: vec![id(1)],
-                idle_timeout: Some(Duration::from_millis(50)),
-                kind: IdleGroupKind::Automatic,
-            }]);
+            sync_set.sync_idle_groups(&[idle_reg(
+                "g",
+                vec![id(1)],
+                Some(Duration::from_millis(50)),
+                IdleGroupKind::Automatic,
+            )]);
         }
     });
     let active_set = std::sync::Arc::clone(&set);
@@ -557,18 +578,13 @@ fn test_sync_idle_groups_full_refresh() {
 
     // Reload: g1 survives with new members/timeout, g2 removed, g3 new.
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "g1".into(),
-            members: vec![id(2), id(3)],
-            idle_timeout: Some(Duration::from_secs(30)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g3".into(),
-            members: vec![id(1)],
-            idle_timeout: None,
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "g1",
+            vec![id(2), id(3)],
+            Some(Duration::from_secs(30)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg("g3", vec![id(1)], None, IdleGroupKind::Automatic),
     ]);
 
     // g1 keeps its activity timestamp (not idle despite the new 30s
@@ -585,12 +601,7 @@ fn test_sync_idle_groups_full_refresh() {
     assert!(!set.is_probe_suspended(id(3))); // g1 active
 
     // Wake-up membership follows the new table.
-    set.sync_idle_groups(&[IdleGroupRegistration {
-        name: "g3".into(),
-        members: vec![id(1)],
-        idle_timeout: None,
-        kind: IdleGroupKind::Automatic,
-    }]);
+    set.sync_idle_groups(&[idle_reg("g3", vec![id(1)], None, IdleGroupKind::Automatic)]);
     assert!(!set.is_group_idle("g1")); // removed → never idle
     assert!(!set.is_probe_suspended(id(2))); // no groups → not suspended
 }
@@ -2839,18 +2850,18 @@ fn test_idle_timeout_zero_suppresses_per_selection_probe_storm() {
     set.register_node(zero_node, "zero".into(), Some("127.0.0.1:1".into()));
     set.register_node(timed_node, "timed".into(), Some("127.0.0.1:1".into()));
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "zero".into(),
-            members: vec![zero_node],
-            idle_timeout: Some(Duration::ZERO),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "timed".into(),
-            members: vec![timed_node],
-            idle_timeout: Some(Duration::from_secs(60)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "zero",
+            vec![zero_node],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "timed",
+            vec![timed_node],
+            Some(Duration::from_secs(60)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
 
@@ -2884,18 +2895,18 @@ fn test_set_selected_nodes_wakes_only_newly_added_idle_nodes_and_remove_cleans_u
         set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
     }
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "g_idle".into(),
-            members: vec![idle_a, idle_b],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_active".into(),
-            members: vec![active_n],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "g_idle",
+            vec![idle_a, idle_b],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_active",
+            vec![active_n],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     set.mark_group_active("g_active");
 
@@ -3014,36 +3025,36 @@ async fn test_idle_recovery_targets_only_unreachable_automatic_groups() {
         set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
     }
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "g_v4".into(),
-            members: vec![v4_only],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_dns".into(),
-            members: vec![dns_blocked],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_partial".into(),
-            members: vec![dead_sib, alive_sib],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_sel".into(),
-            members: vec![sel_dead],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Selector,
-        },
-        IdleGroupRegistration {
-            name: "g_dead".into(),
-            members: vec![all_dead],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "g_v4",
+            vec![v4_only],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_dns",
+            vec![dns_blocked],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![dead_sib, alive_sib],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_sel",
+            vec![sel_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "g_dead",
+            vec![all_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
 
     let kill_ready = |node: Uuid, domain: ProbeDomain, ipver: IpVersion| {
@@ -3105,30 +3116,30 @@ async fn test_custom_check_url_idle_recovery_and_pinned_exemption() {
         set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
     }
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "g_dead".into(),
-            members: vec![dead_a, dead_b],
-            idle_timeout: Some(Duration::ZERO),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_partial".into(),
-            members: vec![part_dead, part_alive],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_pinned".into(),
-            members: vec![pin_node, pin_other],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_shared_unpinned".into(),
-            members: vec![pin_node],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "g_dead",
+            vec![dead_a, dead_b],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![part_dead, part_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_pinned",
+            vec![pin_node, pin_other],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_shared_unpinned",
+            vec![pin_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     let (url_dead, url_partial, url_pinned, url_other) = (
         "http://127.0.0.1/dead",
@@ -3224,30 +3235,30 @@ fn test_notify_network_change_skips_healthy_idle_nodes_and_resets_url_backoff() 
         set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
     }
     set.sync_idle_groups(&[
-        IdleGroupRegistration {
-            name: "g_idle".into(),
-            members: idle_members.clone(),
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_active".into(),
-            members: vec![active_node],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
-        IdleGroupRegistration {
-            name: "g_sel".into(),
-            members: vec![selected_node],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Selector,
-        },
-        IdleGroupRegistration {
-            name: "g_dead".into(),
-            members: vec![all_dead_node],
-            idle_timeout: Some(Duration::from_secs(3600)),
-            kind: IdleGroupKind::Automatic,
-        },
+        idle_reg(
+            "g_idle",
+            idle_members.clone(),
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_active",
+            vec![active_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_sel",
+            vec![selected_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Selector,
+        ),
+        idle_reg(
+            "g_dead",
+            vec![all_dead_node],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
     ]);
     set.mark_group_active("g_active");
     let _ = set.set_selected_nodes(HashSet::from([selected_node]));

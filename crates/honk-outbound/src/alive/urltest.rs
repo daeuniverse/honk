@@ -31,11 +31,18 @@ pub struct IdleGroupRegistration {
     pub members: Vec<Uuid>,
     pub idle_timeout: Option<Duration>,
     pub kind: IdleGroupKind,
+    /// Non-builtin reachable proxy leaves that keep TCP datapath open for an
+    /// automatic group (including reachable subgroups and non-builtin finals).
+    pub tcp_recovery_members: Vec<Uuid>,
+    /// Subset of `tcp_recovery_members` capable of carrying UDP.
+    pub udp_recovery_members: Vec<Uuid>,
 }
 
 pub(super) struct IdleGroupEntry {
     pub(super) timeout: Duration,
     pub(super) members: Vec<Uuid>,
+    pub(super) tcp_recovery_members: Vec<Uuid>,
+    pub(super) udp_recovery_members: Vec<Uuid>,
     pub(super) kind: IdleGroupKind,
     /// Monotonic nanoseconds since `AliveDialerSet::started_at` + 1 (`0` = never active).
     pub(super) last_active_ns: AtomicU64,
@@ -66,7 +73,24 @@ impl IdleGroups {
                 }
             }
         }
+        for entry in self.groups.values_mut() {
+            entry.tcp_recovery_members.retain(|&id| id != node_id);
+            entry.udp_recovery_members.retain(|&id| id != node_id);
+        }
     }
+}
+
+fn dedup_non_builtin(ids: &[Uuid]) -> Vec<Uuid> {
+    let mut out = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if id != honk_config::config::DIRECT_NODE_ID
+            && id != honk_config::config::BLOCK_NODE_ID
+            && !out.contains(&id)
+        {
+            out.push(id);
+        }
+    }
+    out
 }
 
 fn duration_to_ns(duration: Duration) -> u64 {
@@ -125,11 +149,14 @@ impl AliveDialerSet {
                     .push(group.to_string());
             }
         }
+        let recovery_members = dedup_non_builtin(&dedup_members);
         idle.groups.insert(
             group.to_string(),
             IdleGroupEntry {
                 timeout,
                 members: dedup_members,
+                tcp_recovery_members: recovery_members.clone(),
+                udp_recovery_members: recovery_members,
                 kind: IdleGroupKind::Automatic,
                 last_active_ns: AtomicU64::new(last_active_ns),
             },
@@ -353,11 +380,22 @@ impl AliveDialerSet {
                     dedup_members.push(member);
                 }
             }
+            let (tcp_recovery_members, udp_recovery_members) =
+                if registration.kind == IdleGroupKind::Selector {
+                    (Vec::new(), Vec::new())
+                } else {
+                    (
+                        dedup_non_builtin(&registration.tcp_recovery_members),
+                        dedup_non_builtin(&registration.udp_recovery_members),
+                    )
+                };
             new_groups.insert(
                 registration.name.clone(),
                 IdleGroupEntry {
                     timeout,
                     members: dedup_members,
+                    tcp_recovery_members,
+                    udp_recovery_members,
                     kind: registration.kind,
                     last_active_ns: AtomicU64::new(last_active_ns),
                 },
@@ -479,18 +517,26 @@ impl AliveDialerSet {
         };
         let now_ns = self.now_ns();
         let idx_v4 = alive_index(domain, IpVersion::V4);
-        let idx_v6 = alive_index(domain, IpVersion::V6);
         let states = self.states.read();
         groups.iter().any(|group| {
             let Some(entry) = idle.groups.get(group) else {
                 return false;
             };
-            entry.kind == IdleGroupKind::Automatic
-                && entry.is_idle(now_ns)
-                && !entry.members.iter().any(|member| {
+            if entry.kind != IdleGroupKind::Automatic || !entry.is_idle(now_ns) {
+                return false;
+            }
+            let recovery_members = match domain {
+                ProbeDomain::Tcp => &entry.tcp_recovery_members,
+                ProbeDomain::DataUdp => &entry.udp_recovery_members,
+                ProbeDomain::DnsUdp => return false,
+            };
+            // TC allows V6→V4 fallback but never V4→V6, so an idle automatic
+            // group's IPv4 datapath slot is closed iff no non-builtin reachable
+            // recovery leaf is alive on `(domain, V4)`.
+            recovery_members.contains(&node_id)
+                && !recovery_members.iter().any(|member| {
                     states.get(member).is_none_or(|state| {
-                        (state[idx_v4].alive && state.routed_udp_available(domain, idx_v4))
-                            || (state[idx_v6].alive && state.routed_udp_available(domain, idx_v6))
+                        state[idx_v4].alive && state.routed_udp_available(domain, idx_v4)
                     })
                 })
         })

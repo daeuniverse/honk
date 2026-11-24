@@ -5522,10 +5522,13 @@ fn assert_connectivity_matches_reference(config: &Config) {
         "{config:?}"
     );
 
+    let node_by_id: std::collections::HashMap<uuid::Uuid, &honk_config::node::Node> =
+        config.nodes.iter().map(|node| (node.id, node)).collect();
     let idle: Vec<honk_outbound::alive::IdleGroupRegistration> = config
         .groups
         .iter()
-        .map(|group| {
+        .enumerate()
+        .map(|(index, group)| {
             let mut members: std::collections::BTreeSet<uuid::Uuid> =
                 group.nodes.iter().copied().collect();
             match group.final_outbound.as_deref() {
@@ -5542,15 +5545,42 @@ fn assert_connectivity_matches_reference(config: &Config) {
                     }
                 }
             }
+            let (kind, tcp_recovery_members, udp_recovery_members) =
+                if group.policy == GroupPolicy::Selector {
+                    (
+                        honk_outbound::alive::IdleGroupKind::Selector,
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                } else {
+                    let tcp: Vec<uuid::Uuid> = leaves[index]
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            *id != honk_config::config::DIRECT_NODE_ID
+                                && *id != honk_config::config::BLOCK_NODE_ID
+                        })
+                        .collect();
+                    let udp: Vec<uuid::Uuid> = tcp
+                        .iter()
+                        .copied()
+                        .filter(|id| {
+                            node_by_id.get(id).is_some_and(|node| {
+                                honk_outbound::descriptor::node_carries_udp(node, |hop| {
+                                    node_by_id.get(hop).copied()
+                                })
+                            })
+                        })
+                        .collect();
+                    (honk_outbound::alive::IdleGroupKind::Automatic, tcp, udp)
+                };
             honk_outbound::alive::IdleGroupRegistration {
                 name: group.name.clone(),
                 members: members.into_iter().collect(),
                 idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
-                kind: if group.policy == GroupPolicy::Selector {
-                    honk_outbound::alive::IdleGroupKind::Selector
-                } else {
-                    honk_outbound::alive::IdleGroupKind::Automatic
-                },
+                kind,
+                tcp_recovery_members,
+                udp_recovery_members,
             }
         })
         .collect();
