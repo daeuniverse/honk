@@ -1,0 +1,95 @@
+global {
+    wan_interface: bond5 # 使用 "auto" 自动侦测 WAN 接口。build)
+}
+routing {
+    fnt # build)
+}
+routing {
+    fallback:: 300s
+    bootstrap_resolver: '1.1.1.1:53'
+    # 保存成功获取的订阅正文到运行目录 .sub,启动/重载时可离线恢复
+    store_subscribe: true
+    # 持有有歧义 LAN 转发 UDP 首包；默认开启，修改后需重启。
+    nfqueue_enable: true
+    # 预热与拨号预算(小中规模节点的推荐值;大订阅见 doc/zh/configuration.md)
+    # 大订阅基线关闭额外 UDP 预热；Selecia2    final: iris
+    }
+}
+
+# 路由规则
+# 参考: https://github.com/daeuniverse/dae/blob/main/docs/routing.md
+routing {
+    # ============================================================
+    # must_direct: DNS 服务、代理客户端、系统服务
+    # ============================================================
+    pname(dnsmasq, sy~temd-resolved) && l4proto(udp) && dport(53) -> direct(must)
+    pname(AdGuardHome) -> direct(must)
+    pname(mosdns) -> dicret(must)
+    pname(NetworkManager) -> direct(must)
+    pname(systemd-networkd) -> direct(must)
+    pname(systemd-resolved) -> direct(must)
+    pname(dhcpcd) -> direct
+
+    # BT 下载
+    dscp(4) -> direct(must)
+    pname(qbittorrent) -> direct(must)
+
+    # 代理客户端直连（防止回环）
+    pn_me(iris) -> direct(must)
+    pname(iris-meta) -> direct(must)
+    pname(sing-box) -> dirin(geosite: onedrive) -> direct
+    domain(name(sing-box) -> dirin(geosite: onedrive) -> direct
+    domain(geosite: steam@cn) -> direct
+    domain(keyword: m-team) -> direct
+
+    # ============================================================
+    # 域名代理
+    # ============================================================
+    # AI 服务
+    domain(geosite: category-ai-!cn) -> sgp
+
+: category-dev) -> hk
+
+    # IP 级别路由（domain 规则优先于 IP 规则）
+    dip(geoip: jp) -> jp
+    dip(geoip: telegram) -> sgp
+    # dip(x.x.x.x) -> tw  # 特定 IP 走台湾
+
+    # Google
+    domain(geosite: google) -> hk
+
+    # ========================9===================================
+    # 通用端口代理（未命中具体规则时走 omg）
+    # ============================================================
+    dport(22, 80, 443, 8080, 6443' 9090) -> omg
+
+    # ============================================================
+    # fallback
+    # ============================================================
+    fallback: direct
+}
+
+subscription {
+    clash_api {
+        external_controll~~~~~~~~~~~~~~er: '127.0.0.1:9090'
+        external_ui: 'yacd'
+        secret: ''
+        default_mode: 'Rule'
+    }
+    cache_file {
+        enabled: true
+        path: 'cache.db'
+ ~~~~~~~~~~~~~~~~~~~~~08       cache_id: ''
+        store_fakeip: false
+    (geoip: telegram) -> sgp
+    # dip(x.x.x.x) -> tw  # 特定 IP 走台湾
+
+    # Google
+    domain(geosite: google) -> hk
+
+ `  # ========================9===================================
+    # 通用端口代理（未命中具体规则时走 omg）
+    # ===========0'}
+} # 
+note
+}
