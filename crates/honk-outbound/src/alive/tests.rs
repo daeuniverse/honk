@@ -444,7 +444,7 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
 fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
     let set = std::sync::Arc::new(AliveDialerSet::new());
     set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
-    set.register_idle_group("g", &[id(1)], Some(Duration::from_millis(50)));
+    set.register_idle_group("g", &[id(1)], Some(Duration::from_secs(60)));
 
     let sync_set = std::sync::Arc::clone(&set);
     let syncer = std::thread::spawn(move || {
@@ -452,7 +452,7 @@ fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
             sync_set.sync_idle_groups(&[idle_reg(
                 "g",
                 vec![id(1)],
-                Some(Duration::from_millis(50)),
+                Some(Duration::from_secs(60)),
                 IdleGroupKind::Automatic,
             )]);
         }
@@ -3296,4 +3296,402 @@ fn test_notify_network_change_skips_healthy_idle_nodes_and_resets_url_backoff() 
         queued,
         HashSet::from([active_node, selected_node, all_dead_node])
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_mark_group_active_wakes_custom_url_async_and_respects_zero_timeout_and_builtins() {
+    use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+    use std::sync::atomic::AtomicBool;
+
+    let set = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&calls),
+        }),
+        "http://127.0.0.1/global".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    let (direct_member, sub_leaf) = (id(221), id(222));
+    set.register_node(direct_member, "direct_m".into(), Some("127.0.0.1:1".into()));
+    set.register_node(sub_leaf, "sub_leaf".into(), Some("127.0.0.1:1".into()));
+    set.register_node(DIRECT_NODE_ID, "direct".into(), None);
+    set.register_node(BLOCK_NODE_ID, "block".into(), None);
+
+    let url = "http://127.0.0.1/custom-wake";
+    set.sync_idle_groups(&[IdleGroupRegistration {
+        name: "custom_auto".into(),
+        members: vec![direct_member, DIRECT_NODE_ID, BLOCK_NODE_ID],
+        idle_timeout: Some(Duration::from_secs(3600)),
+        kind: IdleGroupKind::Automatic,
+        tcp_recovery_members: vec![direct_member, sub_leaf],
+        udp_recovery_members: vec![direct_member, sub_leaf],
+    }]);
+    set.sync_group_check_urls(&[("custom_auto".into(), url.into())]);
+
+    let forbid_sync_resolver = Arc::new(AtomicBool::new(false));
+    let resolver_flag = Arc::clone(&forbid_sync_resolver);
+    set.set_url_member_resolver(Some(Arc::new(move |group| {
+        assert!(
+            !resolver_flag.load(Ordering::Acquire),
+            "mark_group_active must never call url_member_resolver synchronously"
+        );
+        if group == "custom_auto" {
+            vec![
+                UrlProbeMember {
+                    tag: "direct_m".into(),
+                    leaf: direct_member,
+                    native: None,
+                },
+                UrlProbeMember {
+                    tag: "sub".into(),
+                    leaf: sub_leaf,
+                    native: None,
+                },
+            ]
+        } else {
+            Vec::new()
+        }
+    })));
+
+    // Give subgroup custom-URL state a future cooldown before wake.
+    set.record_url_probe_failure("sub", url);
+    set.url_states
+        .write()
+        .get_mut(&("sub".into(), url.into()))
+        .unwrap()
+        .cooldown_until = Instant::now() + Duration::from_secs(300);
+    assert!(!set.should_probe_url("sub", url));
+
+    let loop_task = set.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        2,
+    );
+    // Advance past initial stagger jitter while idle so periodic ticker is 3600s away.
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    // Activating the group resets custom-URL cooldown and queues async wake without
+    // invoking url_member_resolver synchronously or waking builtins.
+    forbid_sync_resolver.store(true, Ordering::Release);
+    set.mark_group_active("custom_auto");
+    forbid_sync_resolver.store(false, Ordering::Release);
+    assert!(set.should_probe_url("sub", url));
+
+    let mut woke = false;
+    for _ in 0..20 {
+        {
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, u)| *id == direct_member && u == url)
+                && recorded.iter().any(|(id, u)| *id == sub_leaf && u == url)
+            {
+                woke = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        woke,
+        "async custom-URL wake must probe both direct and subgroup members before periodic tick"
+    );
+    assert!(
+        !calls
+            .lock()
+            .iter()
+            .any(|(id, _)| *id == DIRECT_NODE_ID || *id == BLOCK_NODE_ID),
+        "mark_group_active must not trigger emergency probes on builtins"
+    );
+
+    set.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
+
+    // Hot-reloading an active group to idle_timeout=0 clears its activity timestamp,
+    // so reloading back to a positive timeout stays idle rather than resurrecting it.
+    assert!(!set.is_group_idle("custom_auto"));
+    set.sync_idle_groups(&[idle_reg(
+        "custom_auto",
+        vec![direct_member],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("custom_auto"));
+    set.sync_idle_groups(&[idle_reg(
+        "custom_auto",
+        vec![direct_member],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("custom_auto"));
+}
+
+#[tokio::test]
+async fn test_idle_recovery_matches_datapath_reachability() {
+    use honk_config::config::{BLOCK_NODE_ID, DIRECT_NODE_ID};
+
+    let set = Arc::new(AliveDialerSet::new());
+    let tcp_calls = Arc::new(Mutex::new(Vec::new()));
+    let udp_calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&tcp_calls),
+        }),
+        "http://127.0.0.1/".into(),
+        "HEAD".into(),
+    )
+    .await;
+    set.set_udp_probe(Arc::new(RecordingUdpProber {
+        calls: Arc::clone(&udp_calls),
+    }));
+
+    let (tcp_only, udp_dead, v4_dead_v6_alive, v4_alive_v6_dead, zero_proxy, dead_direct, sub_leaf) = (
+        id(231),
+        id(232),
+        id(233),
+        id(234),
+        id(235),
+        id(236),
+        id(237),
+    );
+    for (node, name) in [
+        (tcp_only, "tcp_only"),
+        (udp_dead, "udp_dead"),
+        (v4_dead_v6_alive, "v4_dead_v6_alive"),
+        (v4_alive_v6_dead, "v4_alive_v6_dead"),
+        (zero_proxy, "zero_proxy"),
+        (dead_direct, "dead_direct"),
+        (sub_leaf, "sub_leaf"),
+    ] {
+        set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
+    }
+    set.register_node(DIRECT_NODE_ID, "direct".into(), None);
+    set.register_node(BLOCK_NODE_ID, "block".into(), None);
+
+    set.sync_idle_groups(&[
+        // Mixed TCP-only + UDP-capable group: UDP recovery must ignore TCP-only node.
+        IdleGroupRegistration {
+            name: "g_mixed".into(),
+            members: vec![tcp_only, udp_dead],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![tcp_only, udp_dead],
+            udp_recovery_members: vec![udp_dead],
+        },
+        // IPv4-dead / IPv6-alive: TC closes (domain, V4), so V4 must recover.
+        idle_reg(
+            "g_v4_dead",
+            vec![v4_dead_v6_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        // IPv4-alive / IPv6-dead: TC allows V6→V4 fallback, so stays silent.
+        idle_reg(
+            "g_v6_dead",
+            vec![v4_alive_v6_dead],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        // idle_timeout=0 with final: direct/block: builtins excluded from recovery liveness.
+        IdleGroupRegistration {
+            name: "g_zero_final".into(),
+            members: vec![zero_proxy, DIRECT_NODE_ID, BLOCK_NODE_ID],
+            idle_timeout: Some(Duration::ZERO),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![zero_proxy, DIRECT_NODE_ID],
+            udp_recovery_members: vec![zero_proxy, BLOCK_NODE_ID],
+        },
+        // Dead direct member + alive subgroup leaf: stays silent until subgroup also dies.
+        IdleGroupRegistration {
+            name: "g_parent".into(),
+            members: vec![dead_direct],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![dead_direct, sub_leaf],
+            udp_recovery_members: vec![dead_direct, sub_leaf],
+        },
+        idle_reg(
+            "g_sub",
+            vec![sub_leaf],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+
+    let kill_ready = |node: Uuid, domain: ProbeDomain, ipver: IpVersion| {
+        set.report_unavailable_forced(node, domain, ipver);
+        let mut states = set.states.write();
+        let entry = &mut states.get_mut(&node).unwrap()[alive_index(domain, ipver)];
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now();
+    };
+
+    kill_ready(udp_dead, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(v4_dead_v6_alive, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(v4_dead_v6_alive, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(v4_alive_v6_dead, ProbeDomain::Tcp, IpVersion::V6);
+    kill_ready(v4_alive_v6_dead, ProbeDomain::DataUdp, IpVersion::V6);
+    kill_ready(zero_proxy, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(zero_proxy, ProbeDomain::DataUdp, IpVersion::V4);
+    kill_ready(dead_direct, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(dead_direct, ProbeDomain::DataUdp, IpVersion::V4);
+
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+
+    let probed_tcp: HashSet<Uuid> = tcp_calls.lock().iter().map(|(id, _)| *id).collect();
+    let probed_udp: HashSet<Uuid> = udp_calls.lock().iter().copied().collect();
+    assert_eq!(probed_tcp, HashSet::from([v4_dead_v6_alive, zero_proxy]));
+    assert_eq!(
+        probed_udp,
+        HashSet::from([udp_dead, v4_dead_v6_alive, zero_proxy])
+    );
+    assert!(set.is_alive_for(udp_dead, ProbeDomain::DataUdp, IpVersion::V4));
+    assert!(set.is_alive_for(v4_dead_v6_alive, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(set.is_alive_for(zero_proxy, ProbeDomain::Tcp, IpVersion::V4));
+    assert!(!set.is_alive_for(dead_direct, ProbeDomain::Tcp, IpVersion::V4));
+
+    // Once the subgroup leaf also dies on V4, both parent's direct member and subgroup recover.
+    tcp_calls.lock().clear();
+    udp_calls.lock().clear();
+    kill_ready(sub_leaf, ProbeDomain::Tcp, IpVersion::V4);
+    kill_ready(sub_leaf, ProbeDomain::DataUdp, IpVersion::V4);
+    set.run_recovery_check_cycle_concurrent(Duration::from_secs(1), 4)
+        .await;
+    let probed_tcp: HashSet<Uuid> = tcp_calls.lock().iter().map(|(id, _)| *id).collect();
+    let probed_udp: HashSet<Uuid> = udp_calls.lock().iter().copied().collect();
+    assert_eq!(probed_tcp, HashSet::from([dead_direct, sub_leaf]));
+    assert_eq!(probed_udp, HashSet::from([dead_direct, sub_leaf]));
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_emergency_trigger_and_network_change_recover_all_dead_custom_check_url_group() {
+    let set = Arc::new(AliveDialerSet::new());
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    set.set_http_probe(
+        Arc::new(RecordingHttpProber {
+            calls: Arc::clone(&calls),
+        }),
+        "http://127.0.0.1/global".into(),
+        "HEAD".into(),
+    )
+    .await;
+
+    let (dead_a, dead_b, part_dead, part_alive) = (id(241), id(242), id(243), id(244));
+    for (node, name) in [
+        (dead_a, "dead_a"),
+        (dead_b, "dead_b"),
+        (part_dead, "part_dead"),
+        (part_alive, "part_alive"),
+    ] {
+        set.register_node(node, name.into(), Some("127.0.0.1:1".into()));
+    }
+    let url_dead = "http://127.0.0.1/zero-all-dead";
+    let url_partial = "http://127.0.0.1/partial-idle";
+    set.sync_idle_groups(&[
+        idle_reg(
+            "g_zero_dead",
+            vec![dead_a, dead_b],
+            Some(Duration::ZERO),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "g_partial",
+            vec![part_dead, part_alive],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    set.sync_group_check_urls(&[
+        ("g_zero_dead".into(), url_dead.into()),
+        ("g_partial".into(), url_partial.into()),
+    ]);
+    let member = |tag: &str, leaf: Uuid| UrlProbeMember {
+        tag: tag.to_owned(),
+        leaf,
+        native: None,
+    };
+    set.set_url_member_resolver(Some(Arc::new(move |group| match group {
+        "g_zero_dead" => vec![member("dead_a", dead_a), member("dead_b", dead_b)],
+        "g_partial" => vec![
+            member("part_dead", part_dead),
+            member("part_alive", part_alive),
+        ],
+        _ => Vec::new(),
+    })));
+
+    let loop_task = set.spawn_health_check_loop_concurrent(
+        Duration::from_secs(3600),
+        Duration::from_secs(1),
+        2,
+    );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    let kill_url = |tag: &str, url: &str| {
+        for _ in 0..probe_failure_threshold(ProbeDomain::Tcp) {
+            set.record_url_probe_failure(tag, url);
+        }
+        let mut states = set.url_states.write();
+        let entry = states.get_mut(&(tag.to_owned(), url.to_owned())).unwrap();
+        entry.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+        entry.cooldown_until = Instant::now() + Duration::from_secs(300);
+    };
+
+    // Part A: emergency trigger_probe (probe_unavailable_group path) recovers an all-dead
+    // unpinned idle_timeout=0 custom-URL group, while skipping a partially-dead idle group.
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    kill_url("part_dead", url_partial);
+
+    set.trigger_probe(dead_a);
+    set.trigger_probe(part_dead);
+    let mut recovered = false;
+    for _ in 0..20 {
+        if set.is_alive_for_url("dead_a", url_dead) {
+            recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        recovered,
+        "emergency trigger must probe all-dead unpinned idle_timeout=0 custom-URL group"
+    );
+    assert!(
+        !calls.lock().iter().any(|(_, url)| url == url_partial),
+        "emergency trigger must not probe partially-dead unpinned idle custom-URL group"
+    );
+
+    // Part B: notify_network_change immediately wakes an all-dead custom-URL group even
+    // when global TCP state is alive, without waking partially-dead idle custom-URL groups.
+    calls.lock().clear();
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    set.notify_network_change();
+    let mut both_recovered = false;
+    for _ in 0..20 {
+        if set.is_alive_for_url("dead_a", url_dead) && set.is_alive_for_url("dead_b", url_dead) {
+            both_recovered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        both_recovered,
+        "notify_network_change must immediately wake all-dead idle custom-URL groups"
+    );
+    assert!(
+        !calls.lock().iter().any(|(_, url)| url == url_partial),
+        "notify_network_change must keep partially-dead unpinned idle custom-URL groups silent"
+    );
+
+    set.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
 }

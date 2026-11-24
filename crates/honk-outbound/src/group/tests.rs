@@ -2636,7 +2636,7 @@ fn selector_update_defers_probe_wake_and_excludes_builtin_finals() {
     assert!(trigger_rx.try_recv().is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() {
     use crate::alive::{
         HttpProbeOutcome, HttpProbeResult, HttpProber, IdleGroupKind, ProbeCancellation,
@@ -2662,11 +2662,21 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
         }
     }
 
-    let (a, b) = (nid("curl-a"), nid("curl-b"));
-    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let (a, b, c, sub_leaf) = (nid("curl-a"), nid("curl-b"), nid("curl-c"), nid("curl-sub"));
+    let nodes = vec![
+        make_node(a, "a"),
+        make_node(b, "b"),
+        make_node(c, "c"),
+        make_node(sub_leaf, "sub_leaf"),
+    ];
     let url = "http://127.0.0.1/custom";
-    let mut group = make_group("custom", GroupPolicy::URLTest, vec![a, b]);
+    let url_sub = "http://127.0.0.1/custom-sub";
+    let mut group = make_group("custom", GroupPolicy::URLTest, vec![a, b, c]);
     group.check_url = Some(url.into());
+    let sub = make_group("sub", GroupPolicy::Fallback, vec![sub_leaf]);
+    let mut custom_sub = make_group("custom_sub", GroupPolicy::URLTest, vec![]);
+    custom_sub.groups = vec!["sub".into()];
+    custom_sub.check_url = Some(url_sub.into());
 
     let alive = Arc::new(AliveDialerSet::new());
     let calls = Arc::new(Mutex::new(Vec::new()));
@@ -2677,18 +2687,36 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
             "HEAD".into(),
         )
         .await;
-    alive.register_node(a, "a".into(), Some("127.0.0.1:1".into()));
-    alive.register_node(b, "b".into(), Some("127.0.0.1:1".into()));
-    alive.sync_idle_groups(&[idle_reg(
-        "custom",
-        vec![a, b],
-        Some(Duration::from_secs(3600)),
-        IdleGroupKind::Automatic,
-    )]);
-    alive.sync_group_check_urls(&[("custom".into(), url.into())]);
+    for (id, name) in [(a, "a"), (b, "b"), (c, "c"), (sub_leaf, "sub_leaf")] {
+        alive.register_node(id, name.into(), Some("127.0.0.1:1".into()));
+    }
+    alive.sync_idle_groups(&[
+        idle_reg(
+            "custom",
+            vec![a, b, c],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "sub",
+            vec![sub_leaf],
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+        idle_reg(
+            "custom_sub",
+            Vec::new(),
+            Some(Duration::from_secs(3600)),
+            IdleGroupKind::Automatic,
+        ),
+    ]);
+    alive.sync_group_check_urls(&[
+        ("custom".into(), url.into()),
+        ("custom_sub".into(), url_sub.into()),
+    ]);
 
     let manager = Arc::new(GroupManager::with_alive_set(
-        &[group],
+        &[group, sub, custom_sub],
         &nodes,
         Some(Arc::clone(&alive)),
     ));
@@ -2706,44 +2734,162 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
     })));
     manager.publish_selected_probe_nodes();
 
-    // Unpinned idle group runs zero custom-URL probes.
+    // Unpinned idle groups run zero custom-URL probes.
     alive
         .run_health_check_cycle_concurrent(Duration::from_secs(1), 2)
         .await;
     assert!(calls.lock().is_empty());
 
-    // Start the health loop so emergency trigger executes probe_triggered_custom_urls.
+    // Start the health loop and advance past initial stagger jitter while unpinned
+    // so the next periodic tick is 3600s away (cannot mask immediate pin wakes).
     let loop_task = alive.spawn_health_check_loop_concurrent(
         Duration::from_secs(3600),
         Duration::from_secs(1),
         2,
     );
+    tokio::time::advance(Duration::from_secs(6)).await;
+    tokio::task::yield_now().await;
+    assert!(calls.lock().is_empty());
+
+    // Pinning both a direct node and a subgroup wakes their custom-URL probes immediately
+    // via SelectedProbeWake -> wake_pinned_url_members, without probing unpinned siblings.
     manager
         .publish_override("custom", &SelectorMember::Node(a), SelectorNetworks::Tcp)
         .unwrap()
         .run_callbacks();
-    tokio::time::timeout(Duration::from_secs(5), async {
-        while !calls
-            .lock()
-            .iter()
-            .any(|(id, target)| *id == a && target == url)
+    manager
+        .publish_override(
+            "custom_sub",
+            &SelectorMember::Group("sub".into()),
+            SelectorNetworks::Tcp,
+        )
+        .unwrap()
+        .run_callbacks();
+    let mut woke = false;
+    for _ in 0..20 {
         {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, target)| *id == a && target == url)
+                && recorded
+                    .iter()
+                    .any(|(id, target)| *id == sub_leaf && target == url_sub)
+            {
+                woke = true;
+                break;
+            }
         }
-    })
-    .await
-    .expect("pinning a custom-URL member immediately triggers a custom-URL probe");
-    alive.shutdown_health_checks().await.unwrap();
-    loop_task.await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        woke,
+        "pinning direct and subgroup custom-URL members must trigger immediate probes before periodic tick"
+    );
+    assert!(
+        !calls.lock().iter().any(|(id, _)| *id == b || *id == c),
+        "unpinned siblings must not be probed"
+    );
 
-    // After unpinning, the idle group skips custom-URL probes again.
+    // While health checks are STILL running: killing both pinned `a` and unpinned `b`
+    // (with `c` alive) recovers only the pinned member `a`.
+    calls.lock().clear();
+    for tag in ["a", "b"] {
+        for _ in 0..3 {
+            alive.record_url_probe_failure(tag, url);
+        }
+        alive.reset_url_backoff_for_recovery(tag, url);
+    }
+    assert!(!alive.is_alive_for_url("a", url));
+    assert!(!alive.is_alive_for_url("b", url));
+    alive
+        .run_recovery_check_cycle_concurrent(Duration::from_secs(1), 2)
+        .await;
+    assert_eq!(calls.lock().as_slice(), &[(a, url.to_owned())]);
+    assert!(alive.is_alive_for_url("a", url));
+    assert!(!alive.is_alive_for_url("b", url));
+
+    // Still BEFORE shutdown: after unpinning, a real periodic cycle skips custom-URL probes.
     calls.lock().clear();
     manager
         .clear_override("custom", SelectorNetworks::Tcp)
         .unwrap()
         .run_callbacks();
+    manager
+        .clear_override("custom_sub", SelectorNetworks::Tcp)
+        .unwrap()
+        .run_callbacks();
+    assert!(alive.acquire_health_probe().is_ok());
     alive
         .run_health_check_cycle_concurrent(Duration::from_secs(1), 2)
         .await;
     assert!(calls.lock().is_empty());
+
+    alive.shutdown_health_checks().await.unwrap();
+    loop_task.await.unwrap();
+}
+
+#[test]
+fn concurrent_publish_selector_choice_and_stage_probe_wake_stay_consistent() {
+    use crate::alive::IdleGroupKind;
+
+    let (a, b) = (nid("conc-a"), nid("conc-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let mut sel = make_group("sel", GroupPolicy::Selector, vec![a, b]);
+    sel.default = Some("a".into());
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[idle_reg(
+        "sel",
+        vec![a, b],
+        Some(Duration::from_secs(3600)),
+        IdleGroupKind::Selector,
+    )]);
+    let manager = Arc::new(GroupManager::with_alive_set(
+        &[sel],
+        &nodes,
+        Some(Arc::clone(&alive)),
+    ));
+    manager.publish_selected_probe_nodes();
+
+    let mut handles = Vec::new();
+    for worker in 0..4 {
+        let gm = Arc::clone(&manager);
+        handles.push(std::thread::spawn(move || {
+            for step in 0..100 {
+                let target = if (worker + step) % 2 == 0 { a } else { b };
+                gm.publish_selector_choice(
+                    "sel",
+                    &SelectorMember::Node(target),
+                    SelectorNetworks::Both,
+                )
+                .unwrap()
+                .run_callbacks();
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let gm = Arc::clone(&manager);
+        let alive = Arc::clone(&alive);
+        handles.push(std::thread::spawn(move || {
+            for _ in 0..100 {
+                gm.stage_selected_probe_wake().wake();
+                let _ = alive.is_probe_suspended(a);
+                let _ = alive.is_probe_suspended(b);
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    let final_choice = manager
+        .selector_member_choice("sel", SelectionNetwork::Tcp)
+        .expect("selector choice");
+    let (selected, other) = if final_choice == SelectorMember::Node(a) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert!(!alive.is_probe_suspended(selected));
+    assert!(alive.is_probe_suspended(other));
 }

@@ -180,7 +180,10 @@ impl AliveDialerSet {
         }
         let (active_groups, active_urls): (HashSet<String>, HashSet<String>) = {
             let map = self.group_check_urls.read();
-            (map.keys().cloned().collect(), map.values().cloned().collect())
+            (
+                map.keys().cloned().collect(),
+                map.values().cloned().collect(),
+            )
         };
         self.pending_url_group_wakes
             .lock()
@@ -321,6 +324,20 @@ impl AliveDialerSet {
             .unwrap_or(true)
     }
 
+    #[cfg(test)]
+    pub(crate) fn reset_url_backoff_for_recovery(&self, node_id: &str, url: &str) {
+        if let Some(state) = self
+            .url_states
+            .write()
+            .get_mut(&(node_id.to_string(), url.to_string()))
+        {
+            state.cooldown_until = Instant::now();
+            if !state.alive {
+                state.consecutive_successes = RECOVERY_SUCCESSES_NEEDED - 1;
+            }
+        }
+    }
+
     /// Cached resolved IPs for a custom check URL, resolving on first use
     /// (same caching + literal-fallback semantics as the global check URL).
     pub(super) async fn check_ips_for_url(&self, url: &str) -> anyhow::Result<Vec<SocketAddr>> {
@@ -364,16 +381,16 @@ impl AliveDialerSet {
             let timeout = registration
                 .idle_timeout
                 .unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
-            let last_active_ns = if registration.kind == IdleGroupKind::Selector || timeout.is_zero()
-            {
-                0
-            } else {
-                old_groups
-                    .get(&registration.name)
-                    .filter(|old| old.kind == IdleGroupKind::Automatic)
-                    .map(|old| old.last_active_ns.load(Ordering::Relaxed))
-                    .unwrap_or(0)
-            };
+            let last_active_ns =
+                if registration.kind == IdleGroupKind::Selector || timeout.is_zero() {
+                    0
+                } else {
+                    old_groups
+                        .get(&registration.name)
+                        .filter(|old| old.kind == IdleGroupKind::Automatic)
+                        .map(|old| old.last_active_ns.load(Ordering::Relaxed))
+                        .unwrap_or(0)
+                };
             let mut dedup_members = Vec::with_capacity(registration.members.len());
             for &member in &registration.members {
                 if !dedup_members.contains(&member) {

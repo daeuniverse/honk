@@ -346,7 +346,7 @@ impl AliveDialerSet {
 
     /// Revisit failed routes and dead protocol families between full cycles.
     /// The delay between configured health sweeps need not delay recovery.
-    pub(super) async fn run_recovery_check_cycle_concurrent(
+    pub(crate) async fn run_recovery_check_cycle_concurrent(
         self: &Arc<Self>,
         timeout: Duration,
         concurrency: usize,
