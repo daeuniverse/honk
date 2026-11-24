@@ -591,6 +591,19 @@ routing {{
         self.process.send_signal(signal.SIGHUP)
         text = wg.wait_log(self.process, self.log, f'SIGHUP reload request {self.generation} applied', offset=offset)
         assert 'degraded' not in text.lower(), text
+        current = self.binding(0)
+        assert current['incarnation'] == self.primary['incarnation'], (self.primary, current)
+        program = current['outer_link'][1]
+        dns_maps = {}
+        for name, previous in self.maps.items():
+            observed = wg.named_map(program, name)
+            if name in ('dns_epochs', 'dns_facts'):
+                assert observed[1:] == previous[1:], (name, previous, observed)
+                dns_maps[name] = observed
+            else:
+                assert observed == previous, (name, previous, observed)
+        self.maps.update(dns_maps)
+        self.primary = current
 
     def mode(self, value):
         with wg.dns.namespace('dut'):
