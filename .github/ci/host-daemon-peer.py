@@ -491,13 +491,29 @@ routing {{
                 return None
             outer = wg.tcx('dut', device, attach_type=TCX_EGRESS)
             inner = wg.tcx('dut', tun_name)
-            return (matches[-1], links, outer, inner) if outer and len(inner) == 2 else None
-        row, links, outer, inner = wg.until(observe, f'active Host egress {device}')
+            if not outer or len(inner) != 2:
+                return None
+            [entry] = outer
+            returned, guard = inner
+            assert entry[0] and entry[2] == 'honk_host_gw'
+            assert returned[0] and returned[2] == 'honk_aux_return' and guard[0] == 0 and guard[2] == 'honk_aux_stop'
+            row = matches[-1]
+            key = struct.pack('=IIQ', int(row['realm']), 0, int(row['binding_id']))
+            try:
+                devices = wg.named_map(entry[1], 'HOST_DEVICES')
+                pair = wg.named_map(entry[1], 'honk_aux_devs')
+                assert devices[1:4] == (13, 16, 4), devices
+                if map_read(devices, key) != struct.pack('=I', pair[0]):
+                    return None
+                return_pair = wg.named_map(returned[1], 'honk_aux_devs')
+            except FileNotFoundError:
+                return None
+            if outer != wg.tcx('dut', device, attach_type=TCX_EGRESS) or inner != wg.tcx('dut', tun_name):
+                return None
+            assert pair == return_pair, (pair, return_pair)
+            return row, links, entry, returned, pair
+        row, links, entry, returned, pair = wg.until(observe, f'active Host egress {device}')
         realm, incarnation, index, mtu, private_mtu = (int(row[field]) for field in ('realm', 'binding_id', 'ifindex', 'mtu', 'private_mtu'))
-        [entry] = outer
-        returned, guard = inner
-        assert entry[0] and entry[2] == 'honk_host_gw'
-        assert returned[0] and returned[2] == 'honk_aux_return' and guard[0] == 0 and guard[2] == 'honk_aux_stop'
         assert realm and incarnation and index == links[device]['ifindex']
         if bounded:
             actual_mtu = int(wg.inside('dut', 'cat', f'/sys/class/net/{tun_name}/mtu'))
@@ -517,8 +533,6 @@ routing {{
         assert not json.loads(wg.ip('dut', '-j', 'addr', 'show', 'dev', tun_name))[0]['addr_info']
         for family in ('-4', '-6'):
             assert not json.loads(wg.ip('dut', '-j', family, 'route', 'show', 'table', 'all', 'dev', tun_name))
-        pair = wg.named_map(entry[1], 'honk_aux_devs')
-        assert pair == wg.named_map(returned[1], 'honk_aux_devs')
         assert (wg.slot(pair, 0), wg.slot(pair, 1)) == (index, tun_link['ifindex'])
         state = dict(device=device, tun=tun_name, ifindex=index, tun_index=tun_link['ifindex'], mtu=mtu, private_mtu=private_mtu, realm=realm,
                      incarnation=incarnation, outer_link=entry, return_link=returned, devmap=pair)
@@ -1842,6 +1856,9 @@ def last_link(fixture):
     start = len(fixture.log.read_text())
     for device in HOSTS:
         wg.ip('dut', 'link', 'set', 'dev', device, 'up')
+    wg.ip('dut', '-4', 'route', 'replace', 'default', 'via', SERVER, 'dev', HOSTS[0])
+    wg.ip('dut', '-6', 'addr', 'replace', f'{UPLINK[1]}/64', 'dev', HOSTS[0], 'nodad')
+    wg.ip('dut', '-6', 'route', 'replace', 'default', 'via', 'fd00:77::2', 'dev', HOSTS[0])
     fixture.primary, fixture.secondary, fixture.wan = (fixture.binding(index, after=start) for index in range(len(HOSTS)))
     rebound = wg.until(lambda: epoch(fixture), 'new Host authority was not published')
     assert rebound != active and fact(fixture, TARGET[0]) is None
