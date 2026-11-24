@@ -263,6 +263,8 @@ def foreign_cgroup(owned):
 
 
 def nft_count(name, ns='dut'):
+    if name in ('snat', 'masquerade'):
+        name = 'ci_' + name
     data = json.loads(wg.inside(ns, 'nft', '-j', 'list', 'counter', 'inet', 'host_ci', name))['nftables']
     counters = [entry['counter'] for entry in data if 'counter' in entry]
     [counter] = counters
@@ -309,8 +311,8 @@ def firewall():
     wg.inside('dut', 'nft', '-f', '-', input=f'''table inet host_ci {{
         counter original {{}}
         counter reply {{}}
-        counter snat {{}}
-        counter masquerade {{}}
+        counter ci_snat {{}}
+        counter ci_masquerade {{}}
         counter returned {{}}
         counter related {{}}
         counter wg_underlay {{}}
@@ -321,8 +323,8 @@ def firewall():
         }}
         chain postrouting {{
             type nat hook postrouting priority srcnat; policy accept;
-            oifname "up" ip saddr {LOCAL[0]} counter name snat snat ip to {UPLINK[0]}
-            oifname "up" ip saddr {wg.LAN[0]} counter name masquerade masquerade
+            oifname "up" ip saddr {LOCAL[0]} counter name ci_snat snat ip to {UPLINK[0]}
+            oifname "up" ip saddr {wg.LAN[0]} counter name ci_masquerade masquerade
         }}
         chain input {{
             type filter hook input priority filter; policy drop;
