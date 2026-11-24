@@ -1037,3 +1037,121 @@ async fn fifty_ambiguous_udp_closures_preserve_sibling_route_and_bare_exit() {
     );
     retirement.join(&handle).await.unwrap();
 }
+
+#[tokio::test]
+async fn control_plane_idle_probe_lifecycle_startup_restore_reload_and_timeout_hot_reload() {
+    use crate::state::StateDb;
+    use crate::state::cache::Maintenance;
+    use honk_config::group::{Group, GroupPolicy};
+
+    let build_config = |sel_nodes: &[&Node], auto_nodes: &[&Node], idle_timeout: Option<u64>| {
+        let mut config = Config::default();
+        config.global.nfqueue_enable = false;
+        config.ensure_builtin_nodes();
+        for node in sel_nodes.iter().chain(auto_nodes.iter()) {
+            if !config.nodes.iter().any(|existing| existing.id == node.id) {
+                config.nodes.push((*node).clone());
+            }
+        }
+        config.groups = vec![
+            Group {
+                name: "proxy".into(),
+                policy: GroupPolicy::Selector,
+                nodes: sel_nodes.iter().map(|n| n.id).collect(),
+                default: sel_nodes.first().map(|n| n.name.clone()),
+                ..Default::default()
+            },
+            Group {
+                name: "auto".into(),
+                policy: GroupPolicy::Score,
+                nodes: auto_nodes.iter().map(|n| n.id).collect(),
+                idle_timeout,
+                ..Default::default()
+            },
+        ];
+        config
+    };
+
+    let n_sel1 = canonical_socks5("sel1", "127.0.0.1", 2001, None);
+    let n_sel2 = canonical_socks5("sel2", "127.0.0.1", 2002, None);
+    let n_auto1 = canonical_socks5("auto1", "127.0.0.1", 2003, None);
+    let n_new = canonical_socks5("new_idle", "127.0.0.1", 2004, None);
+
+    // Persist a Selector choice (`sel2`) to verify quiet startup cache restore.
+    let dir = tempfile::tempdir().unwrap();
+    let state = Arc::new(StateDb::open(dir.path()).unwrap());
+    {
+        let mut seeded = control_plane(build_config(&[&n_sel1, &n_sel2], &[&n_auto1], Some(1800)));
+        seeded.init_cache_db(Some(Arc::clone(&state)), None).await;
+        seeded
+            .group_manager()
+            .read()
+            .set_selector_choice(
+                "proxy",
+                "sel2",
+                honk_outbound::group::SelectorNetworks::Both,
+            )
+            .unwrap();
+        seeded
+            .cache_db()
+            .unwrap()
+            .maintain(Maintenance::default())
+            .unwrap();
+    }
+
+    // Startup + cache restore: default/restored pick is unsuspended without
+    // pre-filling trigger_tx, while unselected Selector and idle Score nodes pause.
+    let mut plane = control_plane(build_config(&[&n_sel1, &n_sel2], &[&n_auto1], Some(1800)));
+    let mut trigger_rx = plane
+        .alive_set()
+        .take_trigger_rx()
+        .expect("trigger receiver");
+    assert!(!plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert!(plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert!(plane.alive_set().is_probe_suspended(n_auto1.id));
+    assert!(trigger_rx.try_recv().is_err());
+
+    plane.init_cache_db(Some(state), None).await;
+    assert!(plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert!(!plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert!(
+        trigger_rx.try_recv().is_err(),
+        "startup cache restore must not pre-fill trigger_tx before health loop stagger"
+    );
+
+    // Reload atomicity + idle_timeout hot reload: hold udp_warm_task so reload
+    // pauses right after publication locks drop, before warm coordinators run.
+    let plane = Arc::new(plane);
+    let next = build_config(&[&n_sel1], &[&n_auto1, &n_new], Some(0));
+    let warm_guard = plane.udp_warm_task.lock().await;
+    let generation = plane.runtime_registry.read().generation();
+    let reload_plane = Arc::clone(&plane);
+    let reload = tokio::spawn(async move {
+        reload_plane
+            .reload_runtime_config(next, Default::default())
+            .await
+    });
+    while plane.runtime_registry.read().generation() == generation {
+        assert!(!reload.is_finished(), "reload exited before publication");
+        tokio::task::yield_now().await;
+    }
+    // Already published before warm coordinators run: new idle node is suspended,
+    // and newly active Selector fallback `sel1` is unsuspended and woken.
+    assert!(plane.alive_set().is_probe_suspended(n_new.id));
+    assert!(!plane.alive_set().is_probe_suspended(n_sel1.id));
+    assert_eq!(trigger_rx.try_recv(), Ok(n_sel1.id));
+    drop(warm_guard);
+    assert!(reload.await.unwrap());
+
+    // Hot-reloaded `idle_timeout: 0` takes effect immediately without storming.
+    plane.alive_set().mark_group_active("auto");
+    assert!(plane.alive_set().is_group_idle("auto"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Manager-only rebuild switches Selector membership and wakes the new selection.
+    let rebuilt = build_config(&[&n_sel2], &[&n_auto1], Some(1800));
+    *plane.config_handle().write().await = Arc::new(rebuilt);
+    plane.reload_group_manager().await.unwrap();
+    assert!(!plane.alive_set().is_probe_suspended(n_sel2.id));
+    assert_eq!(trigger_rx.try_recv(), Ok(n_sel2.id));
+}
