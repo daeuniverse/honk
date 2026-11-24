@@ -36,7 +36,7 @@ pub(in crate::control) use connectivity::{
     group_check_url_registrations, group_connectivity_snapshot, group_datapath_alive,
     health_registrations, idle_group_registrations, initial_route_connectivity,
     install_interrupt_callback, install_selector_warm_callback, open_group_connectivity,
-    publish_group_connectivity,
+    publish_group_connectivity, publish_group_probe_state,
 };
 
 #[derive(Clone, Copy, Debug, Default)]

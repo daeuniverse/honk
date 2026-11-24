@@ -150,6 +150,20 @@ pub(in crate::control) fn group_check_url_registrations(config: &Config) -> Vec<
         .collect()
 }
 
+/// Publish idle-group membership, custom `check_url` targets, and fixed probe
+/// selections under the caller's publication guards. Call `wake()` on the
+/// returned token only after dropping those guards.
+pub(in crate::control) fn publish_group_probe_state(
+    alive_set: &AliveDialerSet,
+    group_manager: &GroupManager,
+    idle_groups: &[honk_outbound::alive::IdleGroupRegistration],
+    check_urls: &[(String, String)],
+) -> honk_outbound::group::SelectedProbeWake {
+    alive_set.sync_idle_groups(idle_groups);
+    alive_set.sync_group_check_urls(check_urls);
+    group_manager.stage_selected_probe_wake()
+}
+
 /// Automatic policy changes cancel captured group/network owners without rebuilding provenance.
 pub(in crate::control) fn install_interrupt_callback(
     group_manager: &GroupManager,
@@ -417,11 +431,16 @@ impl ControlPlane {
             })));
         }
         let targets = health_registrations(&config, &build_outbound_id_map(&config));
-        let (added, removed) = {
+        let idle_groups = idle_group_registrations(&config);
+        let check_urls = group_check_url_registrations(&config);
+        let group_count = config.groups.len();
+        let ((added, removed), probe_wake) = {
             #[cfg(all(test, feature = "clash-api"))]
             let _after_unlock = self.clash_publication_pause.lock().take();
             let mut group_manager = self.group_manager.write();
             new_gm.publish_score_membership();
+            let probe_wake =
+                publish_group_probe_state(&self.alive_set, &new_gm, &idle_groups, &check_urls);
             let retain_delay = |id: &uuid::Uuid| new_gm.retains_manual_delay(id, &runtimes);
             let changes = if owns_udp_routes || group_manager.has_udp_route_health() {
                 let changes = self.alive_set.sync_registrations_retaining_routes(
@@ -439,20 +458,13 @@ impl ControlPlane {
                 .write()
                 .rebind_manager(&group_manager, &new_gm, &config);
             *group_manager = new_gm;
-            changes
+            (changes, probe_wake)
         };
-
-        // Refresh the idle table to match the published membership.
-        self.alive_set
-            .sync_idle_groups(&idle_group_registrations(&config));
-        self.group_manager.read().wake_selected_probe_nodes();
-        self.alive_set
-            .sync_group_check_urls(&group_check_url_registrations(&config));
+        drop(config);
+        probe_wake.wake();
         info!(
             "Group manager rebuilt: {} group(s), health checks +{}/-{} node(s)",
-            config.groups.len(),
-            added,
-            removed,
+            group_count, added, removed,
         );
         Ok(())
     }

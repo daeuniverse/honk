@@ -531,24 +531,38 @@ impl AliveDialerSet {
         }
     }
 
+    /// Atomically replace the fixed probe-node set and return newly added node
+    /// IDs. Holds only the leaf `selected_nodes` lock.
+    pub fn replace_selected_nodes(&self, nodes: HashSet<Uuid>) -> Vec<Uuid> {
+        let mut current = self.selected_nodes.write();
+        let added = nodes
+            .iter()
+            .filter(|id| !current.contains(id))
+            .copied()
+            .collect();
+        *current = nodes;
+        added
+    }
+
+    /// Trigger immediate probes for any node in `nodes` whose owning idle
+    /// groups are all currently idle.
+    pub fn wake_idle_nodes(&self, nodes: &[Uuid]) {
+        for &id in nodes {
+            if self.is_groups_idle_for_node(id) {
+                self.trigger_probe(id);
+            }
+        }
+    }
+
     /// Replace the nodes groups hold fixed: a manual selection (Selector
-    /// choice, an automatic group's pin) or a node `final`. They keep
-    /// periodic probing while idle, so a manually selected dead node can
+    /// choice, an automatic group's pin) or a non-builtin node `final`. They
+    /// keep periodic probing while idle, so a manually selected dead node can
     /// still recover. Returns the nodes this took out of idle suspension.
     pub fn set_selected_nodes(&self, nodes: HashSet<Uuid>) -> Vec<Uuid> {
-        let added: Vec<Uuid> = {
-            let current = self.selected_nodes.read();
-            nodes
-                .iter()
-                .filter(|id| !current.contains(id))
-                .copied()
-                .collect()
-        };
-        let woken = added
+        let added = self.replace_selected_nodes(nodes);
+        added
             .into_iter()
-            .filter(|id| self.is_probe_suspended(*id))
-            .collect();
-        *self.selected_nodes.write() = nodes;
-        woken
+            .filter(|id| self.is_groups_idle_for_node(*id))
+            .collect()
     }
 }

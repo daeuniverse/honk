@@ -156,6 +156,32 @@ pub type SelectorChangeCallback = Arc<dyn Fn() + Send + Sync>;
 /// Invoked for the changed network of a group opting into interruption.
 pub type InterruptCallback = Arc<dyn Fn(&str, SelectionNetwork) + Send + Sync>;
 
+/// Newly added fixed probe targets awaiting wakeup outside publication guards.
+#[must_use = "wake newly selected idle nodes after releasing publication guards"]
+pub struct SelectedProbeWake {
+    alive: Option<Arc<AliveDialerSet>>,
+    nodes: Vec<uuid::Uuid>,
+    url_pins: Vec<(String, String)>,
+}
+
+impl SelectedProbeWake {
+    fn empty() -> Self {
+        Self {
+            alive: None,
+            nodes: Vec::new(),
+            url_pins: Vec::new(),
+        }
+    }
+
+    pub fn wake(self) {
+        let Some(alive) = self.alive else {
+            return;
+        };
+        alive.wake_idle_nodes(&self.nodes);
+        alive.wake_pinned_url_members(&self.url_pins);
+    }
+}
+
 /// Committed selection and callbacks deferred until the caller drops its guards.
 #[must_use = "run callbacks after releasing the publication guards"]
 pub struct SelectorUpdate {
@@ -167,9 +193,17 @@ pub struct SelectorUpdate {
     persist: Option<PersistCallback>,
     changed: Option<SelectorChangeCallback>,
     interrupt: Option<InterruptCallback>,
+    probe_wake: SelectedProbeWake,
 }
 
 impl SelectorUpdate {
+    /// Suppress immediate probe wakeups (used during startup state restore so
+    /// initial probing follows the health loop's stagger).
+    pub fn without_probe_wake(mut self) -> Self {
+        self.probe_wake = SelectedProbeWake::empty();
+        self
+    }
+
     /// The control owner already captured the exact pre-transition close set.
     pub fn run_callbacks_without_interrupt(mut self) {
         self.interrupt = None;
@@ -198,6 +232,7 @@ impl SelectorUpdate {
                 callback(&self.group, network);
             }
         }
+        self.probe_wake.wake();
     }
 }
 
@@ -284,10 +319,12 @@ impl GroupManager {
             state.revision = revision;
         }
         let revision = state.revision;
+        let probe_wake = if !changed_networks.is_empty() {
+            self.publish_fixed_probe_targets_in(&state)
+        } else {
+            SelectedProbeWake::empty()
+        };
         drop(state);
-        if !changed_networks.is_empty() {
-            self.wake_selected_probe_nodes();
-        }
         Ok(SelectorUpdate {
             revision,
             changed_networks,
@@ -300,6 +337,7 @@ impl GroupManager {
                 .interrupt_connections
                 .then(|| self.interrupt_callback.read().clone())
                 .flatten(),
+            probe_wake,
         })
     }
 
@@ -383,10 +421,12 @@ impl GroupManager {
             state.revision = revision;
         }
         let revision = state.revision;
+        let probe_wake = if !changed_networks.is_empty() {
+            self.publish_fixed_probe_targets_in(&state)
+        } else {
+            SelectedProbeWake::empty()
+        };
         drop(state);
-        if !changed_networks.is_empty() {
-            self.wake_selected_probe_nodes();
-        }
         Ok(SelectorUpdate {
             revision,
             changed_networks,
@@ -399,6 +439,7 @@ impl GroupManager {
                 .interrupt_connections
                 .then(|| self.interrupt_callback.read().clone())
                 .flatten(),
+            probe_wake,
         })
     }
 
@@ -477,53 +518,70 @@ impl GroupManager {
         }
     }
 
-    /// Publish the nodes groups hold fixed to the alive set, which keeps
-    /// probing them while their groups are idle: every Selector's current
-    /// TCP and UDP member, an automatic group's pin, and a node `final`.
-    /// Returns the nodes this took out of idle suspension.
-    pub fn publish_selected_probe_nodes(&self) -> Vec<uuid::Uuid> {
-        let Some(alive) = &self.alive_set else {
-            return Vec::new();
-        };
+    fn collect_fixed_probe_targets(
+        &self,
+        state: &SelectorState,
+    ) -> (HashSet<uuid::Uuid>, HashMap<String, HashSet<String>>) {
         let mut nodes = HashSet::new();
         let mut pinned_urls: HashMap<String, HashSet<String>> = HashMap::new();
-        {
-            let state = self.selector_choice.read();
-            for group in self.groups.values().map(|managed| &managed.group) {
-                for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
-                    if let Some(member) = self.selector_member_in(group, network, &state) {
-                        if let GroupMember::Node(node) = member {
-                            nodes.insert(node.id);
-                        }
-                        if network == SelectionNetwork::Tcp
-                            && group.policy != GroupPolicy::Selector
-                            && group.check_url.is_some()
-                        {
-                            pinned_urls
-                                .entry(group.name.clone())
-                                .or_default()
-                                .insert(member.tag().to_owned());
-                        }
+        for group in self.groups.values().map(|managed| &managed.group) {
+            for network in [SelectionNetwork::Tcp, SelectionNetwork::Udp] {
+                if let Some(member) = self.selector_member_in(group, network, state) {
+                    if let GroupMember::Node(node) = member
+                        && node.id != honk_config::config::BLOCK_NODE_ID
+                    {
+                        nodes.insert(node.id);
+                    }
+                    if network == SelectionNetwork::Tcp
+                        && group.policy != GroupPolicy::Selector
+                        && group.check_url.is_some()
+                    {
+                        pinned_urls
+                            .entry(group.name.clone())
+                            .or_default()
+                            .insert(member.tag().to_owned());
                     }
                 }
-                if let Some(GroupMember::Node(node)) = self.final_member(group) {
-                    nodes.insert(node.id);
-                }
+            }
+            if let Some(GroupMember::Node(node)) = self.final_member(group)
+                && !matches!(
+                    node.protocol(),
+                    honk_config::types::NodeProtocol::Direct
+                        | honk_config::types::NodeProtocol::Block
+                )
+            {
+                nodes.insert(node.id);
             }
         }
-        let added_pins = alive.replace_pinned_url_members(pinned_urls);
-        alive.wake_pinned_url_members(&added_pins);
-        alive.set_selected_nodes(nodes)
+        (nodes, pinned_urls)
     }
 
-    /// After a selection change or reload, probe newly selected idle nodes
-    /// at once.
-    pub fn wake_selected_probe_nodes(&self) {
-        if let Some(alive) = &self.alive_set {
-            for node in self.publish_selected_probe_nodes() {
-                alive.trigger_probe(node);
-            }
+    fn publish_fixed_probe_targets_in(&self, state: &SelectorState) -> SelectedProbeWake {
+        let Some(alive) = &self.alive_set else {
+            return SelectedProbeWake::empty();
+        };
+        let (nodes, pinned_urls) = self.collect_fixed_probe_targets(state);
+        let added_nodes = alive.replace_selected_nodes(nodes);
+        let added_pins = alive.replace_pinned_url_members(pinned_urls);
+        SelectedProbeWake {
+            alive: Some(Arc::clone(alive)),
+            nodes: added_nodes,
+            url_pins: added_pins,
         }
+    }
+
+    /// Publish the nodes groups hold fixed to the alive set: every Selector's
+    /// current TCP and UDP member, an automatic group's pin (including
+    /// custom-`check_url` pins), and any non-builtin node `final`.
+    pub fn publish_selected_probe_nodes(&self) {
+        let _ = self.stage_selected_probe_wake();
+    }
+
+    /// Publish fixed probe targets atomically under `selector_choice` and
+    /// defer immediate wakeups until the caller releases publication guards.
+    pub fn stage_selected_probe_wake(&self) -> SelectedProbeWake {
+        let state = self.selector_choice.read();
+        self.publish_fixed_probe_targets_in(&state)
     }
 
     /// Fire the interrupt callback when the group opted into connection

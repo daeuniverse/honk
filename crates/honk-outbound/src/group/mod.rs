@@ -48,8 +48,8 @@ pub use score::{
 #[cfg(test)]
 pub use state::SelectorChoices;
 pub use state::{
-    InterruptCallback, PersistCallback, SelectorChangeCallback, SelectorError, SelectorMember,
-    SelectorNetworks, SelectorUpdate,
+    InterruptCallback, PersistCallback, SelectedProbeWake, SelectorChangeCallback, SelectorError,
+    SelectorMember, SelectorNetworks, SelectorUpdate,
 };
 
 /// Maximum nesting depth for group → sub-group resolution, shared with
