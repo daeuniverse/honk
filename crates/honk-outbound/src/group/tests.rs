@@ -2771,7 +2771,10 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
             let recorded = calls.lock();
             if recorded
                 .iter()
-                .any(|(id, target)| *id == a && target == url)
+                .any(|(id, target)| *id == a && target == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, target)| *id == a && target == url)
                 && recorded
                     .iter()
                     .any(|(id, target)| *id == sub_leaf && target == url_sub)
@@ -2786,10 +2789,31 @@ async fn pinned_custom_check_url_automatic_group_probes_and_recovers_pin_only() 
         woke,
         "pinning direct and subgroup custom-URL members must trigger immediate probes before periodic tick"
     );
-    assert!(
-        !calls.lock().iter().any(|(id, _)| *id == b || *id == c),
-        "unpinned siblings must not be probed"
-    );
+    // Let any in-flight emergency workers settle before asserting exact counts.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    {
+        let recorded = calls.lock();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, target)| *id == a && target == url)
+                .count(),
+            1,
+            "pinning a direct member must probe its custom check_url exactly once"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, target)| *id == sub_leaf && target == url_sub)
+                .count(),
+            1,
+            "pinning a subgroup member must probe its custom check_url exactly once"
+        );
+        assert!(
+            !recorded.iter().any(|(id, _)| *id == b || *id == c),
+            "unpinned siblings must not be probed"
+        );
+    }
 
     // While health checks are STILL running: killing both pinned `a` and unpinned `b`
     // (with `c` alive) recovers only the pinned member `a`.

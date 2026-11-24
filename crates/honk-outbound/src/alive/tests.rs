@@ -410,9 +410,9 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
     );
 
     set.trigger_probe(node_id);
-    assert!(set.trigger_pending.lock().contains(&node_id));
+    assert!(set.trigger_pending.lock().contains_key(&node_id));
     tokio::time::timeout(Duration::from_secs(10), async {
-        while set.trigger_pending.lock().contains(&node_id) {
+        while set.trigger_pending.lock().contains_key(&node_id) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
@@ -998,7 +998,7 @@ async fn removed_node_discards_collections_and_late_probe_results() {
         assert!(!set.node_registered_at.read().contains_key(&node));
         assert!(!set.last_emergency_tcp.lock().contains_key(&node));
         assert!(!set.last_emergency_udp.lock().contains_key(&node));
-        assert!(!set.trigger_pending.lock().contains(&node));
+        assert!(!set.trigger_pending.lock().contains_key(&node));
 
         if re_register {
             // Identical metadata is a different registration, not the old owner.
@@ -3315,6 +3315,32 @@ async fn test_mark_group_active_wakes_custom_url_async_and_respects_zero_timeout
     .await;
 
     let (direct_member, sub_leaf) = (id(221), id(222));
+
+    // Direct trigger-queue check: mark_group_active must queue only non-builtin
+    // members and never enqueue DIRECT_NODE_ID or BLOCK_NODE_ID.
+    {
+        let queue_set = AliveDialerSet::new();
+        queue_set.sync_idle_groups(&[IdleGroupRegistration {
+            name: "custom_auto".into(),
+            members: vec![direct_member, DIRECT_NODE_ID, BLOCK_NODE_ID],
+            idle_timeout: Some(Duration::from_secs(3600)),
+            kind: IdleGroupKind::Automatic,
+            tcp_recovery_members: vec![direct_member],
+            udp_recovery_members: vec![direct_member],
+        }]);
+        let mut trigger_rx = queue_set.take_trigger_rx().expect("trigger receiver");
+        queue_set.mark_group_active("custom_auto");
+        let mut queued = Vec::new();
+        while let Ok(node) = trigger_rx.try_recv() {
+            queued.push(node);
+        }
+        assert_eq!(
+            queued,
+            vec![direct_member],
+            "mark_group_active must queue only direct proxy members, never builtins"
+        );
+    }
+
     set.register_node(direct_member, "direct_m".into(), Some("127.0.0.1:1".into()));
     set.register_node(sub_leaf, "sub_leaf".into(), Some("127.0.0.1:1".into()));
     set.register_node(DIRECT_NODE_ID, "direct".into(), None);
@@ -3388,7 +3414,10 @@ async fn test_mark_group_active_wakes_custom_url_async_and_respects_zero_timeout
             let recorded = calls.lock();
             if recorded
                 .iter()
-                .any(|(id, u)| *id == direct_member && u == url)
+                .any(|(id, u)| *id == direct_member && u == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, u)| *id == direct_member && u == url)
                 && recorded.iter().any(|(id, u)| *id == sub_leaf && u == url)
             {
                 woke = true;
@@ -3401,16 +3430,31 @@ async fn test_mark_group_active_wakes_custom_url_async_and_respects_zero_timeout
         woke,
         "async custom-URL wake must probe both direct and subgroup members before periodic tick"
     );
-    assert!(
-        !calls
-            .lock()
-            .iter()
-            .any(|(id, _)| *id == DIRECT_NODE_ID || *id == BLOCK_NODE_ID),
-        "mark_group_active must not trigger emergency probes on builtins"
-    );
 
     set.shutdown_health_checks().await.unwrap();
     loop_task.await.unwrap();
+
+    // After draining all emergency workers: each member must be probed against
+    // the custom check_url exactly once (no duplicate probe bypassing hysteresis).
+    {
+        let recorded = calls.lock();
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, u)| *id == direct_member && u == url)
+                .count(),
+            1,
+            "direct member must be probed exactly once against custom check_url on wake"
+        );
+        assert_eq!(
+            recorded
+                .iter()
+                .filter(|(id, u)| *id == sub_leaf && u == url)
+                .count(),
+            1,
+            "subgroup member must be probed exactly once against custom check_url on wake"
+        );
+    }
 
     // Hot-reloading an active group to idle_timeout=0 clears its activity timestamp,
     // so reloading back to a positive timeout stays idle rather than resurrecting it.
@@ -3692,6 +3736,57 @@ async fn test_emergency_trigger_and_network_change_recover_all_dead_custom_check
         "notify_network_change must keep partially-dead unpinned idle custom-URL groups silent"
     );
 
+    // Part C: when both global TCP and custom check_url are dead, notify_network_change
+    // wakes global TCP and custom check_url once each (no duplicate custom-URL probes).
+    calls.lock().clear();
+    for node in [dead_a, dead_b] {
+        set.report_unavailable_forced(node, ProbeDomain::Tcp, IpVersion::V4);
+    }
+    kill_url("dead_a", url_dead);
+    kill_url("dead_b", url_dead);
+    set.notify_network_change();
+    let mut both_probed = false;
+    for _ in 0..20 {
+        {
+            let recorded = calls.lock();
+            if recorded
+                .iter()
+                .any(|(id, u)| *id == dead_a && u == "http://127.0.0.1/global")
+                && recorded
+                    .iter()
+                    .any(|(id, u)| *id == dead_b && u == "http://127.0.0.1/global")
+                && set.is_alive_for_url("dead_a", url_dead)
+                && set.is_alive_for_url("dead_b", url_dead)
+            {
+                both_probed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        both_probed,
+        "notify_network_change must probe both global TCP and custom check_url when both are dead"
+    );
+
     set.shutdown_health_checks().await.unwrap();
     loop_task.await.unwrap();
+
+    let recorded = calls.lock();
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|(id, u)| *id == dead_a && u == url_dead)
+            .count(),
+        1,
+        "notify_network_change must probe dead_a against custom check_url exactly once"
+    );
+    assert_eq!(
+        recorded
+            .iter()
+            .filter(|(id, u)| *id == dead_b && u == url_dead)
+            .count(),
+        1,
+        "notify_network_change must probe dead_b against custom check_url exactly once"
+    );
 }

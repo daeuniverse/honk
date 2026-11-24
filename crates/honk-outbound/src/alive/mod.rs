@@ -419,10 +419,13 @@ pub struct AliveDialerSet {
     base_cooldown: Duration,
     max_cooldown: Duration,
     /// Bounded node-deduplicated emergency probe queue. A pending node owns
-    /// at most one entry, so traffic failure storms cannot grow memory.
+    /// at most one entry, so traffic failure storms cannot grow memory. The
+    /// value records whether custom `check_url` probing should also run after
+    /// the global TCP probe (coalesced via `|=` when a failure trigger arrives
+    /// alongside a node-only wake).
     trigger_tx: tokio::sync::mpsc::Sender<Uuid>,
     trigger_rx: Mutex<Option<tokio::sync::mpsc::Receiver<Uuid>>>,
-    trigger_pending: Mutex<HashSet<Uuid>>,
+    trigger_pending: Mutex<HashMap<Uuid, bool>>,
     health_control: Mutex<runner::HealthControl>,
     health_mode: tokio::sync::watch::Sender<runner::HealthMode>,
     health_changed: tokio::sync::Notify,
@@ -527,7 +530,7 @@ impl AliveDialerSet {
             max_cooldown: Duration::from_secs(300),
             trigger_tx: tx,
             trigger_rx: Mutex::new(Some(rx)),
-            trigger_pending: Mutex::new(HashSet::new()),
+            trigger_pending: Mutex::new(HashMap::new()),
             health_control: Mutex::new(runner::HealthControl::default()),
             health_mode,
             health_changed: tokio::sync::Notify::new(),
@@ -965,7 +968,7 @@ impl AliveDialerSet {
             if !self.is_probe_suspended(node_id)
                 || self.needs_idle_recovery(node_id, ProbeDomain::Tcp)
             {
-                self.trigger_probe(node_id);
+                self.trigger_probe_node_only(node_id);
             }
         }
         for (group, url) in self.group_check_urls() {
@@ -996,19 +999,37 @@ impl AliveDialerSet {
     }
 
     pub fn trigger_probe(&self, node_id: Uuid) {
+        self.enqueue_trigger_probe(node_id, true);
+    }
+
+    pub(super) fn trigger_probe_node_only(&self, node_id: Uuid) {
+        self.enqueue_trigger_probe(node_id, false);
+    }
+
+    fn enqueue_trigger_probe(&self, node_id: Uuid, probe_custom_urls: bool) {
         let _control = self.health_control.lock();
         if *self.health_mode.borrow() != runner::HealthMode::Running {
             return;
         }
         let mut pending = self.trigger_pending.lock();
-        if !pending.insert(node_id) {
+        if let Some(existing) = pending.get_mut(&node_id) {
+            *existing |= probe_custom_urls;
             return;
         }
+        pending.insert(node_id, probe_custom_urls);
         if self.trigger_tx.try_send(node_id).is_err() {
             // Queue saturation drops this request (a later traffic failure or
             // periodic sweep retries it), and releases its dedup reservation.
             pending.remove(&node_id);
         }
+    }
+
+    pub(super) fn take_trigger_custom_urls(&self, node_id: Uuid) -> bool {
+        self.trigger_pending
+            .lock()
+            .get_mut(&node_id)
+            .map(|flag| std::mem::replace(flag, false))
+            .unwrap_or(false)
     }
 
     pub(crate) fn finish_trigger_probe(&self, node_id: Uuid) {
@@ -1097,6 +1118,17 @@ mod trigger_tests {
         }
         set.trigger_probe(same);
         assert_eq!(receiver.try_recv(), Ok(same));
+        assert!(set.take_trigger_custom_urls(same));
+        assert!(!set.take_trigger_custom_urls(same));
+        set.finish_trigger_probe(same);
+
+        // A failure trigger coalesces custom-URL probing onto a queued node-only wake.
+        set.trigger_probe_node_only(same);
+        assert_eq!(receiver.try_recv(), Ok(same));
+        set.trigger_probe(same);
+        assert!(receiver.try_recv().is_err());
+        assert!(set.take_trigger_custom_urls(same));
+        set.finish_trigger_probe(same);
     }
 }
 

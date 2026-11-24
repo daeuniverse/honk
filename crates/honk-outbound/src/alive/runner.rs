@@ -816,7 +816,10 @@ impl AliveDialerSet {
                                 if let Ok(permit) = this.acquire_health_probe() {
                                     let cancel = permit.cancellation();
                                     this.probe_node(id, timeout).await;
-                                    this.probe_triggered_custom_urls(id, timeout, &cancel).await;
+                                    if this.take_trigger_custom_urls(id) {
+                                        this.probe_triggered_custom_urls(id, timeout, &cancel)
+                                            .await;
+                                    }
                                 }
                                 this.finish_trigger_probe(id);
                             });

@@ -480,7 +480,7 @@ impl AliveDialerSet {
             if !wake_members.is_empty() || has_custom_url {
                 tracing::debug!("Group '{}' active again — resuming member probes", group);
                 for member in wake_members {
-                    self.trigger_probe(member);
+                    self.trigger_probe_node_only(member);
                 }
             }
         }
@@ -623,7 +623,7 @@ impl AliveDialerSet {
     pub fn wake_idle_nodes(&self, nodes: &[Uuid]) {
         for &id in nodes {
             if self.is_groups_idle_for_node(id) {
-                self.trigger_probe(id);
+                self.trigger_probe_node_only(id);
             }
         }
     }
