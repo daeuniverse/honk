@@ -33,6 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+pub use urltest::IdleGroupKind;
 use uuid::Uuid;
 
 type ScoreFeedbackFactory =
@@ -459,16 +460,12 @@ pub struct AliveDialerSet {
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
-    /// Last activity timestamp per group (lazy start: absent = idle).
-    group_last_active: RwLock<HashMap<String, Instant>>,
-    /// NodeId → groups it belongs to (for idle suspension).
-    node_idle_groups: RwLock<HashMap<Uuid, Vec<String>>>,
-    /// Group → member NodeIds (for wake-up probes).
-    idle_group_members: RwLock<HashMap<String, Vec<Uuid>>>,
-    /// Group → idle timeout (probing pauses past it).
-    idle_group_timeout: RwLock<HashMap<String, Duration>>,
-    /// Nodes a group holds fixed (manual selection or node `final`); they
-    /// keep periodic probing while their groups are idle.
+    /// Monotonic origin for coalesced per-group activity timestamps.
+    started_at: Instant,
+    /// Idle-group membership, timeouts, and per-group activity timestamps.
+    idle_groups: RwLock<urltest::IdleGroups>,
+    /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
+    /// they keep periodic probing while their groups are idle.
     selected_nodes: RwLock<HashSet<Uuid>>,
     /// Group → custom check URL for per-group health check targets
     /// (sing-box urltest `url` option). Members are resolved dynamically
@@ -542,10 +539,8 @@ impl AliveDialerSet {
             node_registered_at: RwLock::new(HashMap::new()),
             probe_history: RwLock::new(HashMap::new()),
             outbound_resolver: RwLock::new(None),
-            group_last_active: RwLock::new(HashMap::new()),
-            node_idle_groups: RwLock::new(HashMap::new()),
-            idle_group_members: RwLock::new(HashMap::new()),
-            idle_group_timeout: RwLock::new(HashMap::new()),
+            started_at: Instant::now(),
+            idle_groups: RwLock::default(),
             selected_nodes: RwLock::new(HashSet::new()),
             group_check_urls: RwLock::new(HashMap::new()),
             url_member_resolver: RwLock::new(None),
@@ -911,7 +906,8 @@ impl AliveDialerSet {
         }
         self.collections.write().remove(&node_id);
         self.node_registered_at.write().remove(&node_id);
-        self.node_idle_groups.write().remove(&node_id);
+        self.idle_groups.write().remove_node(node_id);
+        self.selected_nodes.write().remove(&node_id);
         {
             let mut history = self.probe_history.write();
             for index in 0..ALIVE_STATES_PER_NODE {

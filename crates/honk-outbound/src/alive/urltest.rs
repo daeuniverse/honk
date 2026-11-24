@@ -3,38 +3,123 @@ use super::{
     AliveDialerSet, DEFAULT_GROUP_IDLE_TIMEOUT, ProbeDomain, RECOVERY_SUCCESSES_NEEDED,
     UrlMemberResolver, UrlProbeMember, UrlProbeState, probe_backoff, probe_failure_threshold,
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+const MAX_ACTIVITY_REFRESH_QUANTUM_NS: u64 = 1_000_000_000;
+
+/// How a group participates in idle probe suspension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleGroupKind {
+    /// Automatic policy: wakes its direct members on selection and pauses them
+    /// again after `idle_timeout` without traffic.
+    Automatic,
+    /// Selector policy: always counts as idle so unselected direct members stay
+    /// suspended; only explicitly chosen members stay probed via `selected_nodes`.
+    Selector,
+}
+
+pub(super) struct IdleGroupEntry {
+    pub(super) timeout: Duration,
+    pub(super) members: Vec<Uuid>,
+    pub(super) kind: IdleGroupKind,
+    /// Monotonic nanoseconds since `AliveDialerSet::started_at` + 1 (`0` = never active).
+    pub(super) last_active_ns: AtomicU64,
+}
+
+impl IdleGroupEntry {
+    pub(super) fn is_idle(&self, now_ns: u64) -> bool {
+        if self.kind == IdleGroupKind::Selector || self.timeout.is_zero() {
+            return true;
+        }
+        let last = self.last_active_ns.load(Ordering::Acquire);
+        last == 0 || now_ns.saturating_sub(last) >= duration_to_ns(self.timeout)
+    }
+}
+
+#[derive(Default)]
+pub(super) struct IdleGroups {
+    pub(super) groups: HashMap<String, IdleGroupEntry>,
+    pub(super) node_groups: HashMap<Uuid, Vec<String>>,
+}
+
+impl IdleGroups {
+    pub(super) fn remove_node(&mut self, node_id: Uuid) {
+        if let Some(groups) = self.node_groups.remove(&node_id) {
+            for group in groups {
+                if let Some(entry) = self.groups.get_mut(&group) {
+                    entry.members.retain(|&id| id != node_id);
+                }
+            }
+        }
+    }
+}
+
+fn duration_to_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u64::MAX as u128) as u64
+}
+
 impl AliveDialerSet {
-    /// Register a group for idle-aware probe suspension.
+    pub(super) fn now_ns(&self) -> u64 {
+        (self
+            .started_at
+            .elapsed()
+            .as_nanos()
+            .min(u64::MAX as u128 - 1) as u64)
+            + 1
+    }
+
+    /// Register an automatic group for idle-aware probe suspension.
     ///
-    /// `members` are the group's leaf NodeIds. `idle_timeout` defaults to
-    /// [`DEFAULT_GROUP_IDLE_TIMEOUT`] when `None`. Re-callable on config
-    /// reload.
+    /// `members` are the group's direct member NodeIds. `idle_timeout` defaults
+    /// to [`DEFAULT_GROUP_IDLE_TIMEOUT`] when `None`. Replaces any prior entry
+    /// for `group`; config reload uses [`Self::sync_idle_groups`].
     pub fn register_idle_group(
         &self,
         group: &str,
         members: &[Uuid],
         idle_timeout: Option<Duration>,
     ) {
-        let timeout = idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
-        self.idle_group_timeout
-            .write()
-            .insert(group.to_string(), timeout);
-        self.idle_group_members
-            .write()
-            .insert(group.to_string(), members.to_vec());
-        let mut node_groups = self.node_idle_groups.write();
-        for member in members {
-            node_groups
-                .entry(*member)
-                .or_default()
-                .push(group.to_string());
+        let mut idle = self.idle_groups.write();
+        let last_active_ns = idle
+            .groups
+            .get(group)
+            .filter(|old| old.kind == IdleGroupKind::Automatic)
+            .map(|old| old.last_active_ns.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        if let Some(old) = idle.groups.remove(group) {
+            for member in old.members {
+                if let Some(list) = idle.node_groups.get_mut(&member) {
+                    list.retain(|name| name != group);
+                    if list.is_empty() {
+                        idle.node_groups.remove(&member);
+                    }
+                }
+            }
         }
+        let mut dedup_members = Vec::with_capacity(members.len());
+        for &member in members {
+            if !dedup_members.contains(&member) {
+                dedup_members.push(member);
+                idle.node_groups
+                    .entry(member)
+                    .or_default()
+                    .push(group.to_string());
+            }
+        }
+        idle.groups.insert(
+            group.to_string(),
+            IdleGroupEntry {
+                timeout: idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
+                members: dedup_members,
+                kind: IdleGroupKind::Automatic,
+                last_active_ns: AtomicU64::new(last_active_ns),
+            },
+        );
     }
 
     /// Replace the whole custom check-URL table (config reload), same
@@ -217,69 +302,75 @@ impl AliveDialerSet {
         Ok(ips)
     }
 
-    /// Replace the whole idle-group table (config reload).
+    /// Replace the whole idle-group table atomically.
     ///
-    /// `groups` is `(group name, member NodeIds, idle timeout)` per
-    /// group — the same shape [`register_idle_group`] takes.
-    /// Entries for groups absent from `groups` are dropped, and the
-    /// node → groups index is rebuilt from scratch (so stale memberships
-    /// and duplicate entries from repeated registration disappear).
-    /// `group_last_active` timestamps survive for groups that still exist,
-    /// keeping the idle-suspension state across the reload.
+    /// Entries for groups absent from `groups` are dropped, duplicate group
+    /// names resolve last-definition-wins, and the node → groups index is
+    /// rebuilt from the deduplicated entries. Activity timestamps survive for
+    /// automatic groups that still exist.
     pub fn sync_idle_groups(&self, groups: &[(String, Vec<Uuid>, Option<Duration>)]) {
-        {
-            let mut timeouts = self.idle_group_timeout.write();
-            let mut members_map = self.idle_group_members.write();
-            let mut node_groups = self.node_idle_groups.write();
-            timeouts.clear();
-            members_map.clear();
-            node_groups.clear();
-            for (group, members, idle_timeout) in groups {
-                timeouts.insert(
-                    group.clone(),
-                    idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
-                );
-                members_map.insert(group.clone(), members.clone());
-                for member in members {
-                    node_groups.entry(*member).or_default().push(group.clone());
+        let mut idle = self.idle_groups.write();
+        let old_groups = std::mem::take(&mut idle.groups);
+        idle.node_groups.clear();
+        let mut new_groups = HashMap::with_capacity(groups.len());
+        for (group, members, idle_timeout) in groups {
+            let last_active_ns = old_groups
+                .get(group)
+                .filter(|old| old.kind == IdleGroupKind::Automatic)
+                .map(|old| old.last_active_ns.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let mut dedup_members = Vec::with_capacity(members.len());
+            for &member in members {
+                if !dedup_members.contains(&member) {
+                    dedup_members.push(member);
                 }
             }
+            new_groups.insert(
+                group.clone(),
+                IdleGroupEntry {
+                    timeout: idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
+                    members: dedup_members,
+                    kind: IdleGroupKind::Automatic,
+                    last_active_ns: AtomicU64::new(last_active_ns),
+                },
+            );
         }
-        let surviving: HashSet<String> = self.idle_group_timeout.read().keys().cloned().collect();
-        self.group_last_active
-            .write()
-            .retain(|group, _| surviving.contains(group));
+        for (name, entry) in &new_groups {
+            for &member in &entry.members {
+                idle.node_groups
+                    .entry(member)
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        idle.groups = new_groups;
     }
 
-    /// Record activity for a group (called from group selection paths).
+    /// Record activity for an automatic group.
     ///
-    /// When a suspended group becomes active again, health checks
-    /// resume and member probes are kicked off immediately so latency data
-    /// is fresh for the next selection.
+    /// When a suspended automatic group becomes active again, health checks
+    /// resume and its direct members are probed immediately. `Selector` groups
+    /// and groups with `idle_timeout == 0` stay idle without firing per-selection
+    /// wake-up probes.
     pub fn mark_group_active(&self, group: &str) {
-        let Some(timeout) = self.idle_group_timeout.read().get(group).copied() else {
+        let idle = self.idle_groups.read();
+        let Some(entry) = idle.groups.get(group) else {
             return;
         };
-        let was_idle = {
-            let mut active = self.group_last_active.write();
-            let now = Instant::now();
-            let was_idle = active
-                .get(group)
-                .is_none_or(|last| now.duration_since(*last) >= timeout);
-            if let Some(last) = active.get_mut(group) {
-                *last = now;
-            } else {
-                active.insert(group.to_owned(), now);
-            }
-            was_idle
-        };
-        if was_idle {
-            let members = self
-                .idle_group_members
-                .read()
-                .get(group)
-                .cloned()
-                .unwrap_or_default();
+        if entry.kind == IdleGroupKind::Selector || entry.timeout.is_zero() {
+            return;
+        }
+        let now_ns = self.now_ns();
+        let timeout_ns = duration_to_ns(entry.timeout);
+        let refresh_quantum_ns = (timeout_ns / 4).clamp(1, MAX_ACTIVITY_REFRESH_QUANTUM_NS);
+        let prev = entry.last_active_ns.load(Ordering::Relaxed);
+        if prev != 0 && now_ns.saturating_sub(prev) < refresh_quantum_ns {
+            return;
+        }
+        let prev = entry.last_active_ns.fetch_max(now_ns, Ordering::AcqRel);
+        if prev == 0 || now_ns.saturating_sub(prev) >= timeout_ns {
+            let members = entry.members.clone();
+            drop(idle);
             if !members.is_empty() {
                 tracing::debug!("Group '{}' active again — resuming member probes", group);
                 for member in members {
@@ -289,20 +380,31 @@ impl AliveDialerSet {
         }
     }
 
-    /// Whether a registered group has been inactive for longer than
-    /// its idle timeout. A never-active group counts as idle (lazy start:
-    /// no probes run before the first selection). Unregistered groups are
-    /// never idle.
+    /// Whether a registered group is currently idle. Never-active automatic
+    /// groups, `Selector` groups, and groups with `idle_timeout == 0` count as
+    /// idle. Unregistered groups are never idle.
     pub fn is_group_idle(&self, group: &str) -> bool {
-        let timeout = match self.idle_group_timeout.read().get(group) {
-            Some(t) => *t,
-            None => return false,
+        let idle = self.idle_groups.read();
+        let Some(entry) = idle.groups.get(group) else {
+            return false;
         };
-        self.group_last_active
-            .read()
-            .get(group)
-            .map(|t| t.elapsed() >= timeout)
-            .unwrap_or(true)
+        entry.is_idle(self.now_ns())
+    }
+
+    pub(super) fn is_groups_idle_for_node(&self, node_id: Uuid) -> bool {
+        let idle = self.idle_groups.read();
+        let Some(groups) = idle.node_groups.get(&node_id) else {
+            return false;
+        };
+        if groups.is_empty() {
+            return false;
+        }
+        let now_ns = self.now_ns();
+        groups.iter().all(|group| {
+            idle.groups
+                .get(group)
+                .is_some_and(|entry| entry.is_idle(now_ns))
+        })
     }
 
     /// Whether periodic probing of this node is suspended because every
@@ -313,13 +415,7 @@ impl AliveDialerSet {
         if self.selected_nodes.read().contains(&node_id) {
             return false;
         }
-        // Reload takes `idle_group_timeout` first and this map last, so the
-        // names are copied out rather than held across the idle checks.
-        let groups = match self.node_idle_groups.read().get(&node_id) {
-            Some(groups) if !groups.is_empty() => groups.clone(),
-            _ => return false,
-        };
-        groups.iter().all(|group| self.is_group_idle(group))
+        self.is_groups_idle_for_node(node_id)
     }
 
     /// Replace the nodes groups hold fixed: a manual selection (Selector

@@ -187,7 +187,7 @@ fn available_traffic_fast_path_preserves_clean_state_and_resets_dirty_state() {
 fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     let set = AliveDialerSet::new();
     set.mark_group_active("untracked");
-    assert!(set.group_last_active.read().is_empty());
+    assert!(set.idle_groups.read().groups.is_empty());
 
     set.sync_idle_groups(&[(
         "tracked".to_owned(),
@@ -195,11 +195,19 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
         Some(Duration::from_secs(60)),
     )]);
     set.mark_group_active("tracked");
-    let first = set.group_last_active.read()["tracked"];
+    let first = set.idle_groups.read().groups["tracked"]
+        .last_active_ns
+        .load(Ordering::Acquire);
+    assert!(first > 0);
     set.mark_group_active("tracked");
-    let active = set.group_last_active.read();
-    assert_eq!(active.len(), 1);
-    assert!(active["tracked"] >= first);
+    let idle = set.idle_groups.read();
+    assert_eq!(idle.groups.len(), 1);
+    assert!(
+        idle.groups["tracked"]
+            .last_active_ns
+            .load(Ordering::Acquire)
+            >= first
+    );
 }
 
 /// Traffic failures during the grace period must not mark a fresh node
@@ -411,46 +419,33 @@ async fn test_emergency_probe_keeps_udp_cooldown() {
 }
 
 #[test]
-fn test_suspension_check_releases_node_groups_before_reading_timeouts() {
-    // Reload takes idle_group_timeout first and node_idle_groups last.
-    // A suspension check reads them in the opposite order, so it must release
-    // the node groups before consulting the timeouts or the two orders form a
-    // cycle. With the timeouts held here the check cannot finish; the node
-    // groups must still be free for reload's next acquisition.
+fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
     let set = std::sync::Arc::new(AliveDialerSet::new());
     set.register_node(id(1), "n1".into(), Some("127.0.0.1:1".into()));
     set.register_idle_group("g", &[id(1)], Some(Duration::from_millis(50)));
 
-    let timeouts = set.idle_group_timeout.write();
-    let (entered, started) = std::sync::mpsc::channel();
-    let prober = {
-        let set = std::sync::Arc::clone(&set);
-        std::thread::spawn(move || {
-            let _ = entered.send(());
-            set.is_probe_suspended(id(1))
-        })
-    };
-    started.recv().unwrap();
-    std::thread::sleep(Duration::from_millis(10));
-
-    // The check cannot finish while the timeouts are held, so a map that is
-    // never free within the deadline is one held across the idle lookup.
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    let mut node_groups_free = false;
-    while std::time::Instant::now() < deadline {
-        if set.node_idle_groups.try_write().is_some() {
-            node_groups_free = true;
-            break;
+    let sync_set = std::sync::Arc::clone(&set);
+    let syncer = std::thread::spawn(move || {
+        for _ in 0..200 {
+            sync_set.sync_idle_groups(&[(
+                "g".to_owned(),
+                vec![id(1)],
+                Some(Duration::from_millis(50)),
+            )]);
         }
-        std::thread::sleep(Duration::from_millis(5));
+    });
+    let active_set = std::sync::Arc::clone(&set);
+    let activator = std::thread::spawn(move || {
+        for _ in 0..200 {
+            active_set.mark_group_active("g");
+        }
+    });
+    for _ in 0..200 {
+        let _ = set.is_probe_suspended(id(1));
     }
-    drop(timeouts);
-    prober.join().unwrap();
-
-    assert!(
-        node_groups_free,
-        "the suspension check held node_idle_groups while waiting for idle_group_timeout"
-    );
+    syncer.join().unwrap();
+    activator.join().unwrap();
+    assert!(!set.is_probe_suspended(id(1)));
 }
 
 #[tokio::test]
