@@ -2917,3 +2917,62 @@ fn concurrent_publish_selector_choice_and_stage_probe_wake_stay_consistent() {
     assert!(!alive.is_probe_suspended(selected));
     assert!(alive.is_probe_suspended(other));
 }
+
+#[tokio::test]
+async fn cached_idle_activity_slot_obeys_sync_idle_groups_generation_changes() {
+    use crate::alive::IdleGroupKind;
+
+    let (a, b) = (nid("slot-a"), nid("slot-b"));
+    let nodes = vec![make_node(a, "a"), make_node(b, "b")];
+    let fb = make_group("fb", GroupPolicy::Fallback, vec![a, b]);
+    let alive = Arc::new(AliveDialerSet::new());
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    let mut trigger_rx = alive.take_trigger_rx().expect("trigger receiver");
+    let manager = GroupManager::with_alive_set(&[fb], &nodes, Some(Arc::clone(&alive)));
+
+    // First selection populates ManagedGroup.idle_activity and wakes members once.
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(!alive.is_group_idle("fb"));
+    assert!(manager.groups["fb"].idle_activity.get().is_some());
+    while let Ok(id) = trigger_rx.try_recv() {
+        alive.finish_trigger_probe(id);
+    }
+
+    // Second selection hits lock-free fast path without queuing another wake.
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Re-syncing to idle_timeout=0 invalidates the cached slot; selections keep it idle.
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(alive.is_group_idle("fb"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Re-syncing to a short 50ms exact-clock timeout wakes on selection and expires cleanly.
+    alive.sync_idle_groups(&[idle_reg(
+        "fb",
+        vec![a, b],
+        Some(Duration::from_millis(50)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(alive.is_group_idle("fb"));
+    assert_eq!(manager.select_node("fb").map(|n| n.id), Some(a));
+    assert!(!alive.is_group_idle("fb"));
+    let mut woken = std::collections::HashSet::new();
+    while let Ok(id) = trigger_rx.try_recv() {
+        woken.insert(id);
+    }
+    assert_eq!(woken, std::collections::HashSet::from([a, b]));
+    tokio::time::sleep(Duration::from_millis(65)).await;
+    assert!(alive.is_group_idle("fb"));
+}

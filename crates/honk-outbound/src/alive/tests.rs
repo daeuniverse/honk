@@ -218,6 +218,7 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     )]);
     set.mark_group_active("tracked");
     let first = set.idle_groups.read().groups["tracked"]
+        .activity
         .last_active_ns
         .load(Ordering::Acquire);
     assert!(first > 0);
@@ -226,6 +227,7 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     assert_eq!(idle.groups.len(), 1);
     assert!(
         idle.groups["tracked"]
+            .activity
             .last_active_ns
             .load(Ordering::Acquire)
             >= first
@@ -3789,4 +3791,102 @@ async fn test_emergency_trigger_and_network_change_recover_all_dead_custom_check
         1,
         "notify_network_change must probe dead_b against custom check_url exactly once"
     );
+}
+
+#[tokio::test]
+async fn test_idle_activity_slot_fast_path_coarse_clock_and_generation_invalidation() {
+    let set = AliveDialerSet::new();
+    let n1 = id(251);
+    set.register_node(n1, "n1".into(), Some("127.0.0.1:1".into()));
+
+    // 1. Sub-second exact clock: fast path refreshes active slot without waking,
+    //    then returns false once expired so slow path wakes the group.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_millis(80)),
+        IdleGroupKind::Automatic,
+    )]);
+    let mut trigger_rx = set.take_trigger_rx().expect("trigger receiver");
+    let slot_exact = set.mark_group_active_slot("g").expect("registered slot");
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+    assert!(!set.is_group_idle("g"));
+    assert!(set.try_touch_activity_slot(&slot_exact));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Sleep past refresh_quantum_ns (20ms) while still < timeout (80ms) to exercise CAS refresh.
+    tokio::time::sleep(Duration::from_millis(35)).await;
+    assert!(set.try_touch_activity_slot(&slot_exact));
+    assert!(!set.is_group_idle("g"));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // Sleep past timeout (80ms): slot expires, fast path returns false, slow path wakes.
+    tokio::time::sleep(Duration::from_millis(95)).await;
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_exact));
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_group_idle("g"));
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+
+    // 2. Clock-domain translation across sync_idle_groups: exact (80ms) -> coarse (1800s)
+    //    preserves active state and invalidates old generation handle.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_secs(1800)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(!set.is_group_idle("g"));
+    assert!(
+        !set.try_touch_activity_slot(&slot_exact),
+        "old generation slot must be invalidated after sync_idle_groups"
+    );
+    let slot_coarse = set.mark_group_active_slot("g").expect("coarse slot");
+    assert!(set.try_touch_activity_slot(&slot_coarse));
+    assert!(trigger_rx.try_recv().is_err());
+
+    // 3. Coarse (1800s) -> exact (60ms) preserves fresh activity and then expires on exact clock.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_millis(60)),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(!set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_coarse));
+    tokio::time::sleep(Duration::from_millis(75)).await;
+    assert!(set.is_group_idle("g"));
+
+    // 4. Coarse clock (timeout == 1s) active -> idle transition on Linux CLOCK_MONOTONIC_COARSE.
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::from_secs(1)),
+        IdleGroupKind::Automatic,
+    )]);
+    let slot_1s = set.mark_group_active_slot("g").expect("1s coarse slot");
+    assert!(!set.is_group_idle("g"));
+    assert_eq!(trigger_rx.try_recv(), Ok(n1));
+    set.finish_trigger_probe(n1);
+    assert!(set.try_touch_activity_slot(&slot_1s));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_1s));
+
+    // 5. Hot-reloading to idle_timeout=0 invalidates previous slot and keeps group idle.
+    let _ = set.mark_group_active_slot("g");
+    assert!(!set.is_group_idle("g"));
+    set.sync_idle_groups(&[idle_reg(
+        "g",
+        vec![n1],
+        Some(Duration::ZERO),
+        IdleGroupKind::Automatic,
+    )]);
+    assert!(set.is_group_idle("g"));
+    assert!(!set.try_touch_activity_slot(&slot_1s));
+    let slot_zero = set.mark_group_active_slot("g").expect("zero slot");
+    assert!(set.try_touch_activity_slot(&slot_zero));
+    assert!(set.is_group_idle("g"));
 }

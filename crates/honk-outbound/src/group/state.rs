@@ -512,9 +512,41 @@ impl GroupManager {
     }
 
     /// Wake idle-suspended health checks when a group serves traffic.
-    pub(super) fn mark_used(&self, group_name: &str) {
-        if let Some(alive) = &self.alive_set {
-            alive.mark_group_active(group_name);
+    #[inline]
+    pub(super) fn mark_used(
+        &self,
+        group_name: &str,
+        cached: Option<&std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+    ) {
+        let Some(alive) = &self.alive_set else {
+            return;
+        };
+        let cell = cached.or_else(|| {
+            self.groups
+                .get(group_name)
+                .map(|entry| &entry.idle_activity)
+        });
+        if let Some(cell) = cell
+            && let Some(slot) = cell.get()
+            && alive.try_touch_activity_slot(slot)
+        {
+            return;
+        }
+        self.mark_used_slow(alive, group_name, cell);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn mark_used_slow(
+        &self,
+        alive: &AliveDialerSet,
+        group_name: &str,
+        cell: Option<&std::sync::OnceLock<Arc<crate::alive::IdleActivitySlot>>>,
+    ) {
+        if let Some(slot) = alive.mark_group_active_slot(group_name)
+            && let Some(cell) = cell
+        {
+            let _ = cell.set(slot);
         }
     }
 

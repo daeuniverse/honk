@@ -12,6 +12,30 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MAX_ACTIVITY_REFRESH_QUANTUM_NS: u64 = 1_000_000_000;
+const COARSE_CLOCK_MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+#[cfg(target_os = "linux")]
+#[inline]
+pub(super) fn monotonic_coarse_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `CLOCK_MONOTONIC_COARSE` is supported on Linux and writes into
+    // the stack-allocated `timespec`.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC_COARSE, &mut ts) };
+    if rc != 0 || ts.tv_sec < 0 || ts.tv_nsec < 0 {
+        return 0;
+    }
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+#[inline]
+fn use_coarse_clock_for(timeout: Duration) -> bool {
+    cfg!(target_os = "linux") && timeout >= COARSE_CLOCK_MIN_TIMEOUT
+}
 
 /// How a group participates in idle probe suspension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,24 +62,52 @@ pub struct IdleGroupRegistration {
     pub udp_recovery_members: Vec<Uuid>,
 }
 
-pub(super) struct IdleGroupEntry {
-    pub(super) timeout: Duration,
-    pub(super) members: Vec<Uuid>,
-    pub(super) tcp_recovery_members: Vec<Uuid>,
-    pub(super) udp_recovery_members: Vec<Uuid>,
-    pub(super) kind: IdleGroupKind,
-    /// Monotonic nanoseconds since `AliveDialerSet::started_at` + 1 (`0` = never active).
+/// Cache-line-aligned per-group activity state shared between [`AliveDialerSet`]
+/// and callers caching a direct handle for lock-free steady-state refreshes.
+#[repr(align(64))]
+pub struct IdleActivitySlot {
+    generation: u64,
+    kind: IdleGroupKind,
+    use_coarse_clock: bool,
+    timeout_ns: u64,
+    refresh_quantum_ns: u64,
+    /// Monotonic nanoseconds since the slot's clock origin + 1 (`0` = never active).
     pub(super) last_active_ns: AtomicU64,
 }
 
-impl IdleGroupEntry {
+impl IdleActivitySlot {
+    fn new(generation: u64, kind: IdleGroupKind, timeout: Duration, last_active_ns: u64) -> Self {
+        let timeout_ns = duration_to_ns(timeout);
+        let refresh_quantum_ns = if timeout_ns == 0 {
+            0
+        } else {
+            (timeout_ns / 4).clamp(1, MAX_ACTIVITY_REFRESH_QUANTUM_NS)
+        };
+        Self {
+            generation,
+            kind,
+            use_coarse_clock: use_coarse_clock_for(timeout),
+            timeout_ns,
+            refresh_quantum_ns,
+            last_active_ns: AtomicU64::new(last_active_ns),
+        }
+    }
+
+    #[inline]
     pub(super) fn is_idle(&self, now_ns: u64) -> bool {
-        if self.kind == IdleGroupKind::Selector || self.timeout.is_zero() {
+        if self.kind == IdleGroupKind::Selector || self.timeout_ns == 0 {
             return true;
         }
         let last = self.last_active_ns.load(Ordering::Acquire);
-        last == 0 || now_ns.saturating_sub(last) >= duration_to_ns(self.timeout)
+        last == 0 || now_ns.saturating_sub(last) >= self.timeout_ns
     }
+}
+
+pub(super) struct IdleGroupEntry {
+    pub(super) members: Vec<Uuid>,
+    pub(super) tcp_recovery_members: Vec<Uuid>,
+    pub(super) udp_recovery_members: Vec<Uuid>,
+    pub(super) activity: Arc<IdleActivitySlot>,
 }
 
 #[derive(Default)]
@@ -98,6 +150,7 @@ fn duration_to_ns(duration: Duration) -> u64 {
 }
 
 impl AliveDialerSet {
+    #[inline]
     pub(super) fn now_ns(&self) -> u64 {
         (self
             .started_at
@@ -105,6 +158,66 @@ impl AliveDialerSet {
             .as_nanos()
             .min(u64::MAX as u128 - 1) as u64)
             + 1
+    }
+
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(super) fn coarse_now_ns(&self) -> u64 {
+        monotonic_coarse_ns()
+            .saturating_sub(self.started_at_coarse_ns)
+            .min(u64::MAX - 1)
+            + 1
+    }
+
+    #[inline]
+    pub(super) fn activity_now_ns(&self, use_coarse_clock: bool) -> u64 {
+        #[cfg(target_os = "linux")]
+        if use_coarse_clock {
+            return self.coarse_now_ns();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = use_coarse_clock;
+        self.now_ns()
+    }
+
+    #[inline]
+    fn is_entry_idle(&self, entry: &IdleGroupEntry) -> bool {
+        entry
+            .activity
+            .is_idle(self.activity_now_ns(entry.activity.use_coarse_clock))
+    }
+
+    fn preserve_last_active_ns(
+        &self,
+        old: Option<&IdleGroupEntry>,
+        new_kind: IdleGroupKind,
+        new_timeout: Duration,
+    ) -> u64 {
+        if new_kind == IdleGroupKind::Selector || new_timeout.is_zero() {
+            return 0;
+        }
+        let Some(old) = old else {
+            return 0;
+        };
+        if old.activity.kind != IdleGroupKind::Automatic || old.activity.timeout_ns == 0 {
+            return 0;
+        }
+        let old_last = old.activity.last_active_ns.load(Ordering::Acquire);
+        if old_last == 0 {
+            return 0;
+        }
+        let old_now = self.activity_now_ns(old.activity.use_coarse_clock);
+        let elapsed = old_now.saturating_sub(old_last);
+        if elapsed >= old.activity.timeout_ns || elapsed >= duration_to_ns(new_timeout) {
+            return 0;
+        }
+        let new_use_coarse = use_coarse_clock_for(new_timeout);
+        if old.activity.use_coarse_clock == new_use_coarse {
+            return old_last;
+        }
+        self.activity_now_ns(new_use_coarse)
+            .saturating_sub(elapsed)
+            .max(1)
     }
 
     /// Register an automatic group for idle-aware probe suspension.
@@ -119,16 +232,10 @@ impl AliveDialerSet {
         idle_timeout: Option<Duration>,
     ) {
         let mut idle = self.idle_groups.write();
+        let generation = self.idle_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let timeout = idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
-        let last_active_ns = if timeout.is_zero() {
-            0
-        } else {
-            idle.groups
-                .get(group)
-                .filter(|old| old.kind == IdleGroupKind::Automatic)
-                .map(|old| old.last_active_ns.load(Ordering::Relaxed))
-                .unwrap_or(0)
-        };
+        let last_active_ns =
+            self.preserve_last_active_ns(idle.groups.get(group), IdleGroupKind::Automatic, timeout);
         if let Some(old) = idle.groups.remove(group) {
             for member in old.members {
                 if let Some(list) = idle.node_groups.get_mut(&member) {
@@ -153,12 +260,15 @@ impl AliveDialerSet {
         idle.groups.insert(
             group.to_string(),
             IdleGroupEntry {
-                timeout,
                 members: dedup_members,
                 tcp_recovery_members: recovery_members.clone(),
                 udp_recovery_members: recovery_members,
-                kind: IdleGroupKind::Automatic,
-                last_active_ns: AtomicU64::new(last_active_ns),
+                activity: Arc::new(IdleActivitySlot::new(
+                    generation,
+                    IdleGroupKind::Automatic,
+                    timeout,
+                    last_active_ns,
+                )),
             },
         );
     }
@@ -374,6 +484,7 @@ impl AliveDialerSet {
     /// automatic groups that still exist.
     pub fn sync_idle_groups(&self, groups: &[IdleGroupRegistration]) {
         let mut idle = self.idle_groups.write();
+        let generation = self.idle_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let old_groups = std::mem::take(&mut idle.groups);
         idle.node_groups.clear();
         let mut new_groups = HashMap::with_capacity(groups.len());
@@ -381,16 +492,11 @@ impl AliveDialerSet {
             let timeout = registration
                 .idle_timeout
                 .unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT);
-            let last_active_ns =
-                if registration.kind == IdleGroupKind::Selector || timeout.is_zero() {
-                    0
-                } else {
-                    old_groups
-                        .get(&registration.name)
-                        .filter(|old| old.kind == IdleGroupKind::Automatic)
-                        .map(|old| old.last_active_ns.load(Ordering::Relaxed))
-                        .unwrap_or(0)
-                };
+            let last_active_ns = self.preserve_last_active_ns(
+                old_groups.get(&registration.name),
+                registration.kind,
+                timeout,
+            );
             let mut dedup_members = Vec::with_capacity(registration.members.len());
             for &member in &registration.members {
                 if !dedup_members.contains(&member) {
@@ -409,12 +515,15 @@ impl AliveDialerSet {
             new_groups.insert(
                 registration.name.clone(),
                 IdleGroupEntry {
-                    timeout,
                     members: dedup_members,
                     tcp_recovery_members,
                     udp_recovery_members,
-                    kind: registration.kind,
-                    last_active_ns: AtomicU64::new(last_active_ns),
+                    activity: Arc::new(IdleActivitySlot::new(
+                        generation,
+                        registration.kind,
+                        timeout,
+                        last_active_ns,
+                    )),
                 },
             );
         }
@@ -429,6 +538,38 @@ impl AliveDialerSet {
         idle.groups = new_groups;
     }
 
+    /// Lock-free steady-state activity refresh for a cached [`IdleActivitySlot`].
+    ///
+    /// Returns `true` when `slot` matches the current idle-group generation and
+    /// does not cross an idle→active wake boundary. Returns `false` when the
+    /// caller must fall back to [`Self::mark_group_active_slot`].
+    #[inline]
+    pub fn try_touch_activity_slot(&self, slot: &IdleActivitySlot) -> bool {
+        if slot.generation != self.idle_generation.load(Ordering::Acquire) {
+            return false;
+        }
+        if slot.kind == IdleGroupKind::Selector || slot.timeout_ns == 0 {
+            return true;
+        }
+        let now_ns = self.activity_now_ns(slot.use_coarse_clock);
+        let prev = slot.last_active_ns.load(Ordering::Relaxed);
+        if prev != 0 && now_ns.saturating_sub(prev) < slot.refresh_quantum_ns {
+            return true;
+        }
+        if prev != 0 && now_ns.saturating_sub(prev) < slot.timeout_ns {
+            match slot.last_active_ns.compare_exchange(
+                prev,
+                now_ns,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(cur) => return cur != 0 && now_ns.saturating_sub(cur) < slot.timeout_ns,
+            }
+        }
+        false
+    }
+
     /// Record activity for an automatic group.
     ///
     /// When a suspended automatic group becomes active again, health checks
@@ -436,22 +577,26 @@ impl AliveDialerSet {
     /// and groups with `idle_timeout == 0` stay idle without firing per-selection
     /// wake-up probes.
     pub fn mark_group_active(&self, group: &str) {
+        let _ = self.mark_group_active_slot(group);
+    }
+
+    /// Authoritative slow path for [`Self::mark_group_active`] that also returns
+    /// the group's [`IdleActivitySlot`] for subsequent lock-free refreshes via
+    /// [`Self::try_touch_activity_slot`].
+    pub fn mark_group_active_slot(&self, group: &str) -> Option<Arc<IdleActivitySlot>> {
         let idle = self.idle_groups.read();
-        let Some(entry) = idle.groups.get(group) else {
-            return;
-        };
-        if entry.kind == IdleGroupKind::Selector || entry.timeout.is_zero() {
-            return;
+        let entry = idle.groups.get(group)?;
+        let slot = Arc::clone(&entry.activity);
+        if slot.kind == IdleGroupKind::Selector || slot.timeout_ns == 0 {
+            return Some(slot);
         }
-        let now_ns = self.now_ns();
-        let timeout_ns = duration_to_ns(entry.timeout);
-        let refresh_quantum_ns = (timeout_ns / 4).clamp(1, MAX_ACTIVITY_REFRESH_QUANTUM_NS);
-        let prev = entry.last_active_ns.load(Ordering::Relaxed);
-        if prev != 0 && now_ns.saturating_sub(prev) < refresh_quantum_ns {
-            return;
+        let now_ns = self.activity_now_ns(slot.use_coarse_clock);
+        let prev = slot.last_active_ns.load(Ordering::Relaxed);
+        if prev != 0 && now_ns.saturating_sub(prev) < slot.refresh_quantum_ns {
+            return Some(slot);
         }
-        let prev = entry.last_active_ns.fetch_max(now_ns, Ordering::AcqRel);
-        if prev == 0 || now_ns.saturating_sub(prev) >= timeout_ns {
+        let prev = slot.last_active_ns.fetch_max(now_ns, Ordering::AcqRel);
+        if prev == 0 || now_ns.saturating_sub(prev) >= slot.timeout_ns {
             let members = entry.members.clone();
             drop(idle);
             let custom_url = self.group_check_urls.read().get(group).cloned();
@@ -484,6 +629,7 @@ impl AliveDialerSet {
                 }
             }
         }
+        Some(slot)
     }
 
     /// Whether a registered group is currently idle. Never-active automatic
@@ -494,7 +640,7 @@ impl AliveDialerSet {
         let Some(entry) = idle.groups.get(group) else {
             return false;
         };
-        entry.is_idle(self.now_ns())
+        self.is_entry_idle(entry)
     }
 
     pub(super) fn is_groups_idle_for_node(&self, node_id: Uuid) -> bool {
@@ -505,11 +651,10 @@ impl AliveDialerSet {
         if groups.is_empty() {
             return false;
         }
-        let now_ns = self.now_ns();
         groups.iter().all(|group| {
             idle.groups
                 .get(group)
-                .is_some_and(|entry| entry.is_idle(now_ns))
+                .is_some_and(|entry| self.is_entry_idle(entry))
         })
     }
 
@@ -532,14 +677,13 @@ impl AliveDialerSet {
         let Some(groups) = idle.node_groups.get(&node_id) else {
             return false;
         };
-        let now_ns = self.now_ns();
         let idx_v4 = alive_index(domain, IpVersion::V4);
         let states = self.states.read();
         groups.iter().any(|group| {
             let Some(entry) = idle.groups.get(group) else {
                 return false;
             };
-            if entry.kind != IdleGroupKind::Automatic || !entry.is_idle(now_ns) {
+            if entry.activity.kind != IdleGroupKind::Automatic || !self.is_entry_idle(entry) {
                 return false;
             }
             let recovery_members = match domain {

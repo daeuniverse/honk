@@ -217,6 +217,34 @@ impl GroupManager {
         self.groups.get(name).map(|entry| &entry.group)
     }
 
+    pub(super) fn pick_in_group_entry<'a>(
+        &'a self,
+        entry: &'a ManagedGroup,
+        domain: ProbeDomain,
+        ipver: IpVersion,
+        visited: &mut Vec<&'a str>,
+        depth: usize,
+        effects: SelectionEffects,
+    ) -> Option<&'a Node> {
+        self.pick_candidate_for_entry(
+            &entry.group,
+            Some(&entry.idle_activity),
+            &ScoreSelectionContext::aggregate(
+                SelectionNetwork::from_probe_domain(domain),
+                domain,
+                ipver,
+            ),
+            visited,
+            depth,
+            effects,
+            score::selection::ScoreSelectionRules {
+                routes: entry.routes,
+                ..Default::default()
+            },
+        )
+        .map(|candidate| candidate.node)
+    }
+
     /// Resolve a group to the single leaf node its policy selects.
     /// `visited`/`depth` thread the cycle/depth guards through nesting;
     /// `routes` is the root's, as in `ScoreSelectionRules::routes`.

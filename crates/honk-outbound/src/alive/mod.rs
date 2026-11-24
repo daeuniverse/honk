@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-pub use urltest::{IdleGroupKind, IdleGroupRegistration};
+pub use urltest::{IdleActivitySlot, IdleGroupKind, IdleGroupRegistration};
 use uuid::Uuid;
 
 type ScoreFeedbackFactory =
@@ -463,8 +463,15 @@ pub struct AliveDialerSet {
     outbound_resolver: RwLock<Option<OutboundIdResolver>>,
     /// DNS resolver for check targets (system lookup when unset).
     resolver: RwLock<Option<ResolveHook>>,
-    /// Monotonic origin for coalesced per-group activity timestamps.
+    /// Monotonic origin for exact sub-second per-group activity timestamps.
     started_at: Instant,
+    /// Monotonic coarse origin (Linux `CLOCK_MONOTONIC_COARSE`, ns) for `>= 1s`
+    /// per-group activity timestamps.
+    #[cfg(target_os = "linux")]
+    started_at_coarse_ns: u64,
+    /// Bumped on every idle-group table mutation to invalidate cached
+    /// [`IdleActivitySlot`] handles.
+    idle_generation: AtomicU64,
     /// Idle-group membership, timeouts, and per-group activity timestamps.
     idle_groups: RwLock<urltest::IdleGroups>,
     /// Nodes a group holds fixed (manual selection or non-builtin node `final`);
@@ -550,6 +557,9 @@ impl AliveDialerSet {
             probe_history: RwLock::new(HashMap::new()),
             outbound_resolver: RwLock::new(None),
             started_at: Instant::now(),
+            #[cfg(target_os = "linux")]
+            started_at_coarse_ns: urltest::monotonic_coarse_ns(),
+            idle_generation: AtomicU64::new(0),
             idle_groups: RwLock::default(),
             selected_nodes: RwLock::new(HashSet::new()),
             pinned_url_members: RwLock::new(HashMap::new()),
