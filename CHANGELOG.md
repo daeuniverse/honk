@@ -29,6 +29,7 @@ Entries live in [changes/](changes/) until release.
 - The native API's geodata `auto_update` accepts a `cron` expression in place of `interval_hours` and reports it in `cron`. (#484)
 - Cron schedules skip nonexistent local times and use the first occurrence of a repeated time. Startup and API changes reject a schedule with no future occurrence in the local time zone; a later time-zone change is reported without dropping pending failure retries. (#484)
 - `docker-compose.yml` mounts the host's `/etc/localtime` read-only, so the container uses the host's time zone for log timestamps and the geodata schedule instead of UTC. (#484)
+- Full builds embed doona 0.1.0-rc.7 with both editions. (#536)
 
 ### Fixed
 
