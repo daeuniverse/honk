@@ -460,7 +460,7 @@ fn udp_connectivity_requires_a_live_udp_capable_leaf() {
                 &group_connectivity_snapshot(&config, &manager, &alive),
             )
             .unwrap();
-            for index in 0..config.groups.len() {
+            for (index, group) in config.groups.iter().enumerate() {
                 for domain in 0..3 {
                     for ipver in 0..2 {
                         assert_eq!(
@@ -474,7 +474,7 @@ fn udp_connectivity_requires_a_live_udp_capable_leaf() {
                             domain == 0 || (index != 0 && capable_alive),
                             "protocol={:?}, group={}, domain={domain}, ipver={ipver}, capable_alive={capable_alive}",
                             tcp_only.protocol(),
-                            config.groups[index].name,
+                            group.name,
                         );
                     }
                 }

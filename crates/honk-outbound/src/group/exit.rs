@@ -136,15 +136,11 @@ impl GroupManager {
                 return false;
             };
             // The outermost exit remains terminal even when composition collapses it.
-            if !exit_on_path
-                && self
+            exit_on_path
+                || self
                     .nodes
                     .get(&exit_id)
-                    .is_none_or(|exit| !builtin_udp_available(UdpPath::Own(exit)))
-            {
-                return false;
-            }
-            true
+                    .is_some_and(|exit| builtin_udp_available(UdpPath::Own(exit)))
         } else {
             exit_on_path
         };
