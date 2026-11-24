@@ -331,10 +331,10 @@ def firewall():
             iifname "lo" accept
             iifname "up" ip daddr {LOCAL[0]} ct state established counter name returned accept
             iifname "up" ip daddr {LOCAL[0]} ct state related counter name related accept
+            iifname "under0" udp dport 52820 counter name wg_underlay accept
             ct state {{ established, related }} accept
             iifname "up" tcp dport {SERVICE} accept
             iifname "up" udp dport 51820 accept
-            iifname "under0" udp dport 52820 counter name wg_underlay accept
             iifname "under0" udp dport 51820 accept
             iifname "hvlan.100" udp dport 53 accept
             iifname "hvlan.100" tcp dport 53 accept
