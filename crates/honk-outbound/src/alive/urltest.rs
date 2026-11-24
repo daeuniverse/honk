@@ -23,6 +23,15 @@ pub enum IdleGroupKind {
     Selector,
 }
 
+/// Group entry for [`AliveDialerSet::sync_idle_groups`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdleGroupRegistration {
+    pub name: String,
+    pub members: Vec<Uuid>,
+    pub idle_timeout: Option<Duration>,
+    pub kind: IdleGroupKind,
+}
+
 pub(super) struct IdleGroupEntry {
     pub(super) timeout: Duration,
     pub(super) members: Vec<Uuid>,
@@ -308,29 +317,35 @@ impl AliveDialerSet {
     /// names resolve last-definition-wins, and the node → groups index is
     /// rebuilt from the deduplicated entries. Activity timestamps survive for
     /// automatic groups that still exist.
-    pub fn sync_idle_groups(&self, groups: &[(String, Vec<Uuid>, Option<Duration>)]) {
+    pub fn sync_idle_groups(&self, groups: &[IdleGroupRegistration]) {
         let mut idle = self.idle_groups.write();
         let old_groups = std::mem::take(&mut idle.groups);
         idle.node_groups.clear();
         let mut new_groups = HashMap::with_capacity(groups.len());
-        for (group, members, idle_timeout) in groups {
-            let last_active_ns = old_groups
-                .get(group)
-                .filter(|old| old.kind == IdleGroupKind::Automatic)
-                .map(|old| old.last_active_ns.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let mut dedup_members = Vec::with_capacity(members.len());
-            for &member in members {
+        for registration in groups {
+            let last_active_ns = if registration.kind == IdleGroupKind::Selector {
+                0
+            } else {
+                old_groups
+                    .get(&registration.name)
+                    .filter(|old| old.kind == IdleGroupKind::Automatic)
+                    .map(|old| old.last_active_ns.load(Ordering::Relaxed))
+                    .unwrap_or(0)
+            };
+            let mut dedup_members = Vec::with_capacity(registration.members.len());
+            for &member in &registration.members {
                 if !dedup_members.contains(&member) {
                     dedup_members.push(member);
                 }
             }
             new_groups.insert(
-                group.clone(),
+                registration.name.clone(),
                 IdleGroupEntry {
-                    timeout: idle_timeout.unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
+                    timeout: registration
+                        .idle_timeout
+                        .unwrap_or(DEFAULT_GROUP_IDLE_TIMEOUT),
                     members: dedup_members,
-                    kind: IdleGroupKind::Automatic,
+                    kind: registration.kind,
                     last_active_ns: AtomicU64::new(last_active_ns),
                 },
             );

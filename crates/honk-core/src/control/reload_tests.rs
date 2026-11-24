@@ -5522,20 +5522,39 @@ fn assert_connectivity_matches_reference(config: &Config) {
         "{config:?}"
     );
 
-    let idle: Vec<(String, Vec<uuid::Uuid>)> = config
+    let idle: Vec<honk_outbound::alive::IdleGroupRegistration> = config
         .groups
         .iter()
-        .zip(&leaves)
-        .map(|(group, set)| (group.name.clone(), set.iter().copied().collect()))
+        .map(|group| {
+            let mut members: std::collections::BTreeSet<uuid::Uuid> =
+                group.nodes.iter().copied().collect();
+            match group.final_outbound.as_deref() {
+                None => {}
+                Some(Config::BUILTIN_DIRECT_NODE) => {
+                    members.insert(honk_config::config::DIRECT_NODE_ID);
+                }
+                Some(Config::BUILTIN_BLOCK_NODE) => {
+                    members.insert(honk_config::config::BLOCK_NODE_ID);
+                }
+                Some(name) => {
+                    if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                        members.insert(node.id);
+                    }
+                }
+            }
+            honk_outbound::alive::IdleGroupRegistration {
+                name: group.name.clone(),
+                members: members.into_iter().collect(),
+                idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
+                kind: if group.policy == GroupPolicy::Selector {
+                    honk_outbound::alive::IdleGroupKind::Selector
+                } else {
+                    honk_outbound::alive::IdleGroupKind::Automatic
+                },
+            }
+        })
         .collect();
-    assert_eq!(
-        idle_group_registrations(config)
-            .into_iter()
-            .map(|(name, members, _)| (name, members))
-            .collect::<Vec<_>>(),
-        idle,
-        "{config:?}"
-    );
+    assert_eq!(idle_group_registrations(config), idle, "{config:?}");
 }
 
 /// GroupManager cuts subgroup cycles, but the eBPF outbound ids, health

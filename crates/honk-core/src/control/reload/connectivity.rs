@@ -87,27 +87,44 @@ pub(in crate::control) fn sync_health_check_nodes(
     alive_set.sync_registrations(health_registrations(config, &leaves))
 }
 
-/// Group registrations for the alive set's idle-suspension table:
-/// `(group name, member NodeIds, idle timeout)` per group, for every policy.
-/// A leaf stays probed while any of its groups is active or a group holds
-/// it fixed (`GroupManager::publish_selected_probe_nodes`). Membership and
-/// explicit final edges both participate, since health state lives on real
-/// nodes. Used identically at startup and on config reload.
+/// Direct idle-group registrations for the alive set, covering every policy.
+///
+/// Each entry lists only that group's direct node members and any direct-node
+/// `final` edge so activating an automatic group wakes its own members while
+/// chosen subgroups activate on traversal, and `Selector` groups stay isolated
+/// to their fixed selections.
 pub(in crate::control) fn idle_group_registrations(
     config: &Config,
-) -> Vec<(String, Vec<uuid::Uuid>, Option<Duration>)> {
-    let graph = GroupGraph::new(&config.groups, &config.nodes);
+) -> Vec<honk_outbound::alive::IdleGroupRegistration> {
     config
         .groups
         .iter()
-        .enumerate()
-        .map(|(index, group)| {
-            let members = group_leaf_ids(&graph, index);
-            (
-                group.name.clone(),
-                members.into_iter().collect(),
-                group.idle_timeout.map(std::time::Duration::from_secs),
-            )
+        .map(|group| {
+            let mut members: BTreeSet<uuid::Uuid> = group.nodes.iter().copied().collect();
+            match group.final_outbound.as_deref() {
+                None => {}
+                Some(Config::BUILTIN_DIRECT_NODE) => {
+                    members.insert(honk_config::config::DIRECT_NODE_ID);
+                }
+                Some(Config::BUILTIN_BLOCK_NODE) => {
+                    members.insert(honk_config::config::BLOCK_NODE_ID);
+                }
+                Some(name) => {
+                    if let Some(node) = config.nodes.iter().find(|node| node.name == name) {
+                        members.insert(node.id);
+                    }
+                }
+            }
+            honk_outbound::alive::IdleGroupRegistration {
+                name: group.name.clone(),
+                members: members.into_iter().collect(),
+                idle_timeout: group.idle_timeout.map(std::time::Duration::from_secs),
+                kind: if group.policy == GroupPolicy::Selector {
+                    honk_outbound::alive::IdleGroupKind::Selector
+                } else {
+                    honk_outbound::alive::IdleGroupKind::Automatic
+                },
+            }
         })
         .collect()
 }

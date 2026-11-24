@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-pub use urltest::IdleGroupKind;
+pub use urltest::{IdleGroupKind, IdleGroupRegistration};
 use uuid::Uuid;
 
 type ScoreFeedbackFactory =

@@ -189,11 +189,12 @@ fn group_activity_ignores_untracked_groups_and_reuses_registered_key() {
     set.mark_group_active("untracked");
     assert!(set.idle_groups.read().groups.is_empty());
 
-    set.sync_idle_groups(&[(
-        "tracked".to_owned(),
-        Vec::new(),
-        Some(Duration::from_secs(60)),
-    )]);
+    set.sync_idle_groups(&[IdleGroupRegistration {
+        name: "tracked".to_owned(),
+        members: Vec::new(),
+        idle_timeout: Some(Duration::from_secs(60)),
+        kind: IdleGroupKind::Automatic,
+    }]);
     set.mark_group_active("tracked");
     let first = set.idle_groups.read().groups["tracked"]
         .last_active_ns
@@ -427,11 +428,12 @@ fn test_idle_suspension_and_sync_remain_deadlock_free_under_contention() {
     let sync_set = std::sync::Arc::clone(&set);
     let syncer = std::thread::spawn(move || {
         for _ in 0..200 {
-            sync_set.sync_idle_groups(&[(
-                "g".to_owned(),
-                vec![id(1)],
-                Some(Duration::from_millis(50)),
-            )]);
+            sync_set.sync_idle_groups(&[IdleGroupRegistration {
+                name: "g".to_owned(),
+                members: vec![id(1)],
+                idle_timeout: Some(Duration::from_millis(50)),
+                kind: IdleGroupKind::Automatic,
+            }]);
         }
     });
     let active_set = std::sync::Arc::clone(&set);
@@ -555,12 +557,18 @@ fn test_sync_idle_groups_full_refresh() {
 
     // Reload: g1 survives with new members/timeout, g2 removed, g3 new.
     set.sync_idle_groups(&[
-        (
-            "g1".into(),
-            vec![id(2), id(3)],
-            Some(Duration::from_secs(30)),
-        ),
-        ("g3".into(), vec![id(1)], None),
+        IdleGroupRegistration {
+            name: "g1".into(),
+            members: vec![id(2), id(3)],
+            idle_timeout: Some(Duration::from_secs(30)),
+            kind: IdleGroupKind::Automatic,
+        },
+        IdleGroupRegistration {
+            name: "g3".into(),
+            members: vec![id(1)],
+            idle_timeout: None,
+            kind: IdleGroupKind::Automatic,
+        },
     ]);
 
     // g1 keeps its activity timestamp (not idle despite the new 30s
@@ -577,7 +585,12 @@ fn test_sync_idle_groups_full_refresh() {
     assert!(!set.is_probe_suspended(id(3))); // g1 active
 
     // Wake-up membership follows the new table.
-    set.sync_idle_groups(&[("g3".into(), vec![id(1)], None)]);
+    set.sync_idle_groups(&[IdleGroupRegistration {
+        name: "g3".into(),
+        members: vec![id(1)],
+        idle_timeout: None,
+        kind: IdleGroupKind::Automatic,
+    }]);
     assert!(!set.is_group_idle("g1")); // removed → never idle
     assert!(!set.is_probe_suspended(id(2))); // no groups → not suspended
 }

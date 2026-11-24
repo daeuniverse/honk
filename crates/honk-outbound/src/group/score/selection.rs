@@ -582,9 +582,6 @@ impl super::GroupManager {
                 false,
             );
         };
-        if effects.applies() {
-            self.mark_used(group_name);
-        }
         let (mode, candidates) = self.selection_candidates_for_target(
             &entry.group,
             context,
@@ -711,9 +708,6 @@ impl super::GroupManager {
                         }
                     }
                     GroupMember::Group(final_group) => {
-                        if effects.applies() {
-                            self.mark_used(&final_group.name);
-                        }
                         visited.push(group.name.as_str());
                         (mode, candidates) = self.selection_candidates_for_target(
                             final_group,
@@ -797,13 +791,13 @@ impl super::GroupManager {
         } else {
             group.policy
         };
+        if effects.applies() && policy != honk_config::group::GroupPolicy::Selector {
+            self.mark_used(&group.name);
+        }
         let ordinary_score = policy == honk_config::group::GroupPolicy::Score;
         let (mut candidates, withdrawn) = if policy == honk_config::group::GroupPolicy::Selector
             && let Some(GroupMember::Group(subgroup)) = selected_member
         {
-            if effects.applies() {
-                self.mark_used(&subgroup.name);
-            }
             // Apply must reach the chosen child even when its committed readonly view is empty.
             visited.push(group.name.as_str());
             let candidate = self.pick_candidate_for_target(
@@ -1205,9 +1199,6 @@ impl super::GroupManager {
                 observation::gap();
                 continue;
             };
-            if sub_effects.applies() {
-                self.mark_used(tag);
-            }
             if let Some(mut candidate) = self.pick_candidate_for_target(
                 subgroup,
                 context,

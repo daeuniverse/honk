@@ -718,7 +718,12 @@ async fn check_routed_udp_health() {
     // consume the scripted peers' accepts. Every raw node is a selector pick
     // or a final here, and held nodes keep probing while idle, so the
     // exemption is cleared as well.
-    alive.sync_idle_groups(&[("ordinary health probes".into(), raw_nodes, Some(WAIT))]);
+    alive.sync_idle_groups(&[honk_outbound::alive::IdleGroupRegistration {
+        name: "ordinary health probes".into(),
+        members: raw_nodes,
+        idle_timeout: Some(WAIT),
+        kind: honk_outbound::alive::IdleGroupKind::Automatic,
+    }]);
     alive.set_selected_nodes(Default::default());
     let cycle = tokio::spawn({
         let alive = alive.clone();

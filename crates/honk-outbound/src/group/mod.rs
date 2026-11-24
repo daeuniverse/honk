@@ -492,7 +492,6 @@ impl GroupManager {
     ) -> Option<&Node> {
         let entry = self.groups.get(group_name)?;
         let group = &entry.group;
-        self.mark_used(group_name);
         // The overwhelmingly common selector has only direct members. Avoid
         // constructing its transient candidate/visited vectors; nested
         // groups still take the guarded recursive path below.
@@ -598,9 +597,6 @@ impl GroupManager {
         ipver: IpVersion,
         effects: SelectionEffects,
     ) -> SelectionPlan<'a> {
-        if effects.applies() {
-            self.mark_used(&group.name);
-        }
         let network = SelectionNetwork::from_probe_domain(domain);
         if !routes
             && group.policy == GroupPolicy::Selector
