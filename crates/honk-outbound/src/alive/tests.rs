@@ -486,7 +486,7 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
     assert!(
         set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
             .is_empty(),
-        "idle URLTest node must not be probed"
+        "idle node must not be probed"
     );
     assert!(
         !set.get_probe_history(id(2), ProbeDomain::Tcp, IpVersion::V4)
@@ -499,7 +499,7 @@ async fn test_health_cycle_skips_idle_urltest_nodes() {
     assert!(
         !set.get_probe_history(id(1), ProbeDomain::Tcp, IpVersion::V4)
             .is_empty(),
-        "active URLTest node must be probed"
+        "active node must be probed"
     );
 }
 

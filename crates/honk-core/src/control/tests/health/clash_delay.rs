@@ -247,7 +247,7 @@ async fn reload(control: &ControlPlane, config: Config) {
 }
 
 /// The caller owns the warm coordinator mutex, so publication is observable
-/// before warm work and URLTest idle/target resynchronization finish.
+/// before warm work finishes.
 async fn publish_while_warm_blocked(
     control: &Arc<ControlPlane>,
     config: Config,

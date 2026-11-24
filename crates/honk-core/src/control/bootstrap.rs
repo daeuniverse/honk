@@ -104,10 +104,7 @@ impl ControlPlane {
             config.nodes.len(),
             config.nodes.len().saturating_sub(added),
         );
-        // Register groups for idle-aware probe suspension (lazy start:
-        // probing pauses after `idle_timeout` without group usage and
-        // resumes on the next dial). Nodes a group holds fixed are
-        // published below once the group manager exists.
+        // Fixed probe nodes are published below once GroupManager exists.
         alive_set.sync_idle_groups(&idle_group_registrations(&config));
         alive_set.sync_group_check_urls(&group_check_url_registrations(&config));
         let group_manager =

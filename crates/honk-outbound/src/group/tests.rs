@@ -573,7 +573,6 @@ fn test_select_marks_group_active() {
     assert!(!alive.is_group_idle("g2"));
 }
 
-/// An idle Selector keeps probing only its selected member.
 #[test]
 fn idle_selector_suspends_all_but_selected_member() {
     let (a, b) = (nid("a"), nid("b"));

@@ -340,8 +340,8 @@ type RoutedUdpDeathCallback = dyn Fn(Uuid, ProbeDomain, IpVersion, UdpHopRole) +
 pub type UrlMemberResolver = Arc<dyn Fn(&str) -> Vec<UrlProbeMember> + Send + Sync>;
 
 /// Default group idle timeout when the group config has none (sing-box
-/// default: 30 minutes). Periodic probing of a group's members pauses while
-/// the group is idle and resumes on the next selection.
+/// default: 30 minutes). Periodic probing of an automatic group's direct
+/// members pauses while the group is idle and resumes on the next selection.
 pub const DEFAULT_GROUP_IDLE_TIMEOUT: Duration = Duration::from_secs(1800);
 
 /// Resolves a NodeId to its eBPF outbound index for
